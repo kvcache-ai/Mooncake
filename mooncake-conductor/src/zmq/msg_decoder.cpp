@@ -543,10 +543,7 @@ Result<KVEvent> ParseVllmBlockStored(const object& data,
 
     if (f[2].type == object_type::NIL) {
         event.parent_block_hash = 0;
-    } else if (f[2].type == object_type::POSITIVE_INTEGER &&
-               f[2].via.u64 > 0xFFFFFFFFULL) {
-        // Require a full 8-byte integer marker: minimal-width encoders
-        // only emit this width for values above 2**32.
+    } else if (f[2].type == object_type::POSITIVE_INTEGER) {
         event.parent_block_hash = f[2].via.u64;
     } else {
         return R::Err("expected integer, got " + MsgpackTypeName(f[2]));
@@ -673,7 +670,7 @@ Result<KVEvent> MooncakeParse(const std::string& event_type, const object& raw,
     }
     // BUG: BlockUpdateEvent / RemoveAllEvent not handled (dead code on main
     // branch — schema pending upstream alignment, see docs/KNOWN_ISSUES.md
-    // C.9).
+    // issue 9).
     return Result<KVEvent>::Err("unhandled event: " + event_type);
 }
 

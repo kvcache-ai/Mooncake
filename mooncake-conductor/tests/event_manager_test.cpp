@@ -3,8 +3,11 @@
 // append, event handling, and config file loading.
 
 #include <gtest/gtest.h>
+#include <asio.hpp>
+#include <ylt/coro_http/coro_http_server.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <fstream>
 #include <memory>
@@ -15,6 +18,16 @@
 #include "conductor/kvevent/config.h"
 #include "conductor/kvevent/event_manager.h"
 #include "event_manager_test_peer.h"
+
+namespace conductor {
+namespace kvevent {
+
+uint16_t EventManagerTestPeer::HttpPort(EventManager& mgr) {
+    return mgr.http_server_ ? mgr.http_server_->port() : 0;
+}
+
+}  // namespace kvevent
+}  // namespace conductor
 
 namespace {
 
@@ -83,6 +96,22 @@ TEST(SubscribeToService, MissingEndpointErrors) {
     EXPECT_FALSE(is_new);
 }
 
+TEST(SubscribeToService, ManagerStoppedErrorsWithoutCreatingState) {
+    EventManager mgr({}, 0);
+    mgr.Stop();
+
+    const auto svc = VllmService();
+    const auto [is_new, err] = EventManagerTestPeer::Subscribe(mgr, svc);
+
+    EXPECT_FALSE(is_new);
+    EXPECT_EQ(err, "manager stopped");
+    EXPECT_EQ(EventManagerTestPeer::SubscriberCount(mgr), 0u);
+    EXPECT_EQ(EventManagerTestPeer::ActiveConfigCount(mgr), 0u);
+    EXPECT_EQ(EventManagerTestPeer::ServicesLen(mgr), 0u);
+    EXPECT_FALSE(EventManagerTestPeer::TenantHasInstance(mgr, svc.tenant_id,
+                                                         svc.instance_id));
+}
+
 // ZMQ connect is async, so a subscription succeeds even against a
 // nonexistent endpoint; assert the service-key discrimination directly
 // rather than relying on the connect path.
@@ -122,6 +151,42 @@ TEST(EventManager, StopIsIdempotent) {
     mgr.Stop();
     mgr.Stop();  // second call must return immediately
     EXPECT_TRUE(mgr.IsStopped());
+}
+
+TEST(EventManager, StopWaitsForHttpServerShutdown) {
+    auto mgr = std::make_unique<EventManager>(
+        std::vector<conductor::common::ServiceConfig>{}, 0);
+    ASSERT_TRUE(mgr->StartHTTPServer());
+    const uint16_t port = EventManagerTestPeer::HttpPort(*mgr);
+    ASSERT_NE(port, 0);
+
+    asio::io_context io_context;
+    const asio::ip::tcp::endpoint endpoint(asio::ip::make_address("127.0.0.1"),
+                                           port);
+    asio::ip::tcp::socket client(io_context);
+    asio::error_code ec;
+    client.connect(endpoint, ec);
+    ASSERT_FALSE(ec) << ec.message();
+    const std::string request =
+        "GET /services HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: "
+        "close\r\n\r\n";
+    asio::write(client, asio::buffer(request), ec);
+    ASSERT_FALSE(ec) << ec.message();
+    std::array<char, 1024> response_buffer{};
+    const size_t response_size =
+        client.read_some(asio::buffer(response_buffer), ec);
+    ASSERT_GT(response_size, 0u);
+    const std::string response(response_buffer.data(), response_size);
+    EXPECT_NE(response.find(" 200 "), std::string::npos);
+    client.close();
+
+    mgr->Stop();
+    mgr.reset();
+
+    asio::ip::tcp::socket after_stop(io_context);
+    ec.clear();
+    after_stop.connect(endpoint, ec);
+    EXPECT_TRUE(ec);
 }
 
 // --- KVEventHandler -------------------------------------------------------

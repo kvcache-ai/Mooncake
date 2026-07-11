@@ -25,6 +25,35 @@ using conductor::zmq::ValidateConfig;
 using conductor::zmq::ZMQClient;
 using conductor::zmq::ZMQClientConfig;
 
+}  // namespace
+
+namespace conductor {
+namespace zmq {
+
+class ZMQClientTestPeer {
+   public:
+    static void SetEndpoint(ZMQClient& client, std::string endpoint) {
+        std::unique_lock lock(client.mu_);
+        client.config_.endpoint = std::move(endpoint);
+    }
+
+    static void SetLastSequence(ZMQClient& client, int64_t sequence) {
+        std::unique_lock lock(client.mu_);
+        client.last_seq_ = sequence;
+    }
+
+    static void HandleReconnect(ZMQClient& client) { client.HandleReconnect(); }
+
+    static bool IsConnected(ZMQClient& client) { return client.IsConnected(); }
+};
+
+}  // namespace zmq
+}  // namespace conductor
+
+namespace {
+
+using conductor::zmq::ZMQClientTestPeer;
+
 // --- Mock event handler ---------------------------------------------------
 
 class MockEventHandler : public EventHandler {
@@ -146,9 +175,26 @@ class MockPublisher {
         Send("mooncake", buf.str(), 0);
     }
 
+    void PublishMalformedVllm() {
+        std::stringstream buf;
+        msgpack::packer<std::stringstream> pk(buf);
+        pk.pack_int64(42);  // A vLLM event batch must be an array.
+        Send("vllm", buf.str(), 0);
+    }
+
     size_t ReplayRequestCount() { return replay_requests_.load(); }
 
     uint64_t LastReplayFromSeq() { return last_replay_from_seq_.load(); }
+
+    bool WaitForReplayRequests(size_t count,
+                               std::chrono::milliseconds timeout) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (ReplayRequestCount() < count &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        return ReplayRequestCount() >= count;
+    }
 
    private:
     void Send(const std::string& topic, const std::string& payload,
@@ -386,38 +432,37 @@ TEST(ZMQClient, ReplayRequestedAfterReconnect) {
     const int64_t last_seq = client.GetLastSequence();
     ASSERT_GE(last_seq, 0);
 
-    // Publish a malformed frame set (bad payload) to trip Consume into
-    // the error path -> markDisconnected -> handleReconnect.
-    // Simpler and deterministic: publish garbage payload on the vllm
-    // topic; decode fails, the client marks itself disconnected and
-    // reconnects, then requests replay.
-    {
-        std::stringstream buf;
-        msgpack::packer<std::stringstream> pk(buf);
-        pk.pack_int64(42);  // not an array -> unmarshal-shape error
-        // Manually send with next seq.
-        // (Reuse PublishVllmStored's channel by crafting via the public
-        // API is not possible; send through a fresh PUB socket is not
-        // needed — MockPublisher::Send is private, so publish a valid
-        // topic with an invalid payload via a dedicated helper below.)
-        // For simplicity, publish an event whose parent hash is small —
-        // the decoder rejects it, which also drives the error path.
-    }
-    publisher.PublishVllmStored({2}, /*parent=*/50, {2}, 128);
+    // A deliberately malformed raw payload trips Consume into the
+    // disconnect path without depending on another decoder defect.
+    publisher.PublishMalformedVllm();
 
     // Wait for reconnect + replay request to arrive at the ROUTER.
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (publisher.ReplayRequestCount() == 0 &&
-           std::chrono::steady_clock::now() < deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    }
-    ASSERT_GE(publisher.ReplayRequestCount(), 1u);
+    ASSERT_TRUE(publisher.WaitForReplayRequests(1, std::chrono::seconds(5)));
     // lastSeq updates BEFORE decoding: the sequence advances first, then
     // the decode of this bad message fails, so the bad message's own seq
     // (last_seq+1) is already consumed and replay starts at last_seq+2.
     EXPECT_EQ(publisher.LastReplayFromSeq(),
               static_cast<uint64_t>(last_seq + 2));
+    client.Stop();
+}
+
+TEST(ZMQClient, FailedReconnectDoesNotRequestReplayUntilSuccess) {
+    MockPublisher publisher;
+    auto handler = std::make_shared<MockEventHandler>();
+    ZMQClient client(TestConfig(publisher), handler);
+    ZMQClientTestPeer::SetLastSequence(client, 10);
+
+    ZMQClientTestPeer::SetEndpoint(client, "not-a-valid-zmq-endpoint");
+    ZMQClientTestPeer::HandleReconnect(client);
+    EXPECT_FALSE(ZMQClientTestPeer::IsConnected(client));
+    EXPECT_EQ(publisher.ReplayRequestCount(), 0u);
+
+    ZMQClientTestPeer::SetEndpoint(client, publisher.PubEndpoint());
+    ZMQClientTestPeer::HandleReconnect(client);
+    EXPECT_TRUE(ZMQClientTestPeer::IsConnected(client));
+    ASSERT_TRUE(publisher.WaitForReplayRequests(1, std::chrono::seconds(2)));
+    EXPECT_EQ(publisher.ReplayRequestCount(), 1u);
+    EXPECT_EQ(publisher.LastReplayFromSeq(), 11u);
     client.Stop();
 }
 

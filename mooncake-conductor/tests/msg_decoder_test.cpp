@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 #include <msgpack.hpp>
 
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -48,9 +49,13 @@ std::string PackMooncakeStoreBatch() {
     return buf.str();
 }
 
+enum class ParentEncoding { kUnsigned, kNil, kNegative, kFloat, kArray };
+
 // Packs a vLLM BlockStored batch: the schema needs 7-element events
 // (medium at index 6) and an integer dp_rank.
-std::string PackVllmStoredBatch(uint64_t parent, int64_t dp_rank) {
+std::string PackVllmStoredBatch(
+    uint64_t parent, int64_t dp_rank,
+    ParentEncoding parent_encoding = ParentEncoding::kUnsigned) {
     std::stringstream buf;
     msgpack::packer<std::stringstream> pk(buf);
     pk.pack_array(3);  // [timestamp, events, dp_rank]
@@ -61,7 +66,23 @@ std::string PackVllmStoredBatch(uint64_t parent, int64_t dp_rank) {
     pk.pack_array(2);  // block_hashes
     pk.pack_uint64(100);
     pk.pack_uint64(200);
-    pk.pack_uint64(parent);
+    switch (parent_encoding) {
+        case ParentEncoding::kUnsigned:
+            pk.pack_uint64(parent);
+            break;
+        case ParentEncoding::kNil:
+            pk.pack_nil();
+            break;
+        case ParentEncoding::kNegative:
+            pk.pack_int64(-1);
+            break;
+        case ParentEncoding::kFloat:
+            pk.pack_double(1.5);
+            break;
+        case ParentEncoding::kArray:
+            pk.pack_array(0);
+            break;
+    }
     pk.pack_array(3);  // token_ids
     pk.pack_int32(10000000);
     pk.pack_int32(2);
@@ -119,15 +140,49 @@ TEST(DecodeVllmEventBatch, ParsesBlockStored) {
     EXPECT_EQ(event->medium, "GPU");
 }
 
-// BUG (preserved): the parent hash requires a strict uint64 wire marker;
-// with the minimal-width msgpack encoders every real publisher uses,
-// parents below 2^32 arrive with a narrow marker and are rejected.
-TEST(DecodeVllmEventBatch, SmallParentHashRejectedBugForBug) {
-    const std::string data = PackVllmStoredBatch(50, 0);
+TEST(DecodeVllmEventBatch, AcceptsAllNonNegativeParentHashValues) {
+    const uint64_t values[] = {
+        0,
+        50,
+        std::numeric_limits<uint32_t>::max(),
+        static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) + 1,
+        std::numeric_limits<uint64_t>::max(),
+    };
+    for (const uint64_t parent : values) {
+        const std::string data = PackVllmStoredBatch(parent, 0);
+        const auto result = DecodeVllmEventBatch(data.data(), data.size());
+        ASSERT_TRUE(result.ok) << "parent=" << parent << " " << result.error;
+        ASSERT_EQ(result.batch.events.size(), 1u);
+        const auto* event =
+            std::get_if<BlockStoredEvent>(&result.batch.events[0]);
+        ASSERT_NE(event, nullptr);
+        EXPECT_EQ(event->parent_block_hash, parent);
+    }
+}
+
+TEST(DecodeVllmEventBatch, NilParentHashDecodesAsZero) {
+    const std::string data = PackVllmStoredBatch(0, 0, ParentEncoding::kNil);
     const auto result = DecodeVllmEventBatch(data.data(), data.size());
-    ASSERT_FALSE(result.ok);
-    EXPECT_NE(result.error.find("expected integer"), std::string::npos)
-        << result.error;
+    ASSERT_TRUE(result.ok) << result.error;
+    ASSERT_EQ(result.batch.events.size(), 1u);
+    const auto* event = std::get_if<BlockStoredEvent>(&result.batch.events[0]);
+    ASSERT_NE(event, nullptr);
+    EXPECT_EQ(event->parent_block_hash, 0u);
+}
+
+TEST(DecodeVllmEventBatch, RejectsInvalidParentHashTypes) {
+    const ParentEncoding invalid_encodings[] = {
+        ParentEncoding::kNegative,
+        ParentEncoding::kFloat,
+        ParentEncoding::kArray,
+    };
+    for (const auto encoding : invalid_encodings) {
+        const std::string data = PackVllmStoredBatch(0, 0, encoding);
+        const auto result = DecodeVllmEventBatch(data.data(), data.size());
+        ASSERT_FALSE(result.ok);
+        EXPECT_NE(result.error.find("expected integer"), std::string::npos)
+            << result.error;
+    }
 }
 
 TEST(DecodeMooncakeEventBatch, InvalidArrayLength) {

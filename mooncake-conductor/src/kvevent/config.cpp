@@ -51,7 +51,8 @@ std::vector<common::ServiceConfig> ParseConfig(int* http_server_port) {
     std::ifstream in(config_path, std::ios::binary);
     if (!in) {
         // Warn and continue with empty service list (do not exit).
-        LOG(WARNING) << "Config file does not exist, exiting. path="
+        LOG(WARNING) << "Unable to open config file; continuing with empty "
+                        "service list. path="
                      << config_path;
         return {};
     }

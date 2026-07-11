@@ -16,6 +16,8 @@
 namespace conductor {
 namespace zmq {
 
+class ZMQClientTestPeer;
+
 // EventHandler processes received KV events.
 class EventHandler {
    public:
@@ -60,6 +62,8 @@ class ZMQClient {
     int64_t GetLastSequence() const;
 
    private:
+    friend class ZMQClientTestPeer;
+
     void Loop();
     void HandleReconnect();
     bool IsConnected() const;

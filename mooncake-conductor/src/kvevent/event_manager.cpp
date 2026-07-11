@@ -125,14 +125,20 @@ bool EventManager::IsStopped() {
 void EventManager::Start() {
     LOG(INFO) << "Starting KV Event Manager...";
 
+    std::vector<common::ServiceConfig> services_snapshot;
+    {
+        std::shared_lock lock(mu_);
+        services_snapshot = services_;
+    }
+
     // Subscribe to all services concurrently.
     // mu_ serialises the check-then-act inside SubscribeToService and
     // serialises with concurrent /register HTTP handlers so that
     // subscribers_, active_configs_, and services_ stay consistent.
     std::atomic<int> failure_count{0};
     std::vector<std::thread> workers;
-    workers.reserve(services_.size());
-    for (const auto& svc : services_) {
+    workers.reserve(services_snapshot.size());
+    for (const auto& svc : services_snapshot) {
         workers.emplace_back([this, svc, &failure_count] {
             std::pair<bool, std::string> result;
             {
@@ -154,7 +160,7 @@ void EventManager::Start() {
 
     const int failed = failure_count.load();
     LOG(INFO) << "Static KV Event Manager started. Subscriptions success="
-              << (static_cast<int>(services_.size()) - failed)
+              << (static_cast<int>(services_snapshot.size()) - failed)
               << " failed=" << failed;
 }
 
@@ -169,25 +175,11 @@ void EventManager::Stop() {
 
     LOG(INFO) << "Stopping Conductor KV Event Manager.....";
 
-    // The HTTP server is shut down with a 5s graceful timeout, then
-    // force close. coro_http stop() is itself a bounded graceful stop;
-    // run it with the same 5-second cap.
+    // yalantinglibs closes the acceptor and current connections, stops the
+    // thread pool, and joins the server thread before stop() returns.
     if (http_server_) {
-        std::thread shutdown_thread([this] {
-            LOG(INFO) << "Shutting down HTTP server";
-            http_server_->stop();
-        });
-        // 5-second timeout for forced shutdown
-        const auto deadline =
-            std::chrono::steady_clock::now() + std::chrono::seconds(5);
-        // stop() blocks until connections drain; poll for completion.
-        while (std::chrono::steady_clock::now() < deadline &&
-               shutdown_thread.joinable()) {
-            // join with timeout emulation: try a short join via native
-            // handle is non-portable; instead detach after deadline.
-            break;
-        }
-        shutdown_thread.join();
+        LOG(INFO) << "Shutting down HTTP server";
+        http_server_->stop();
     }
 
     // Stop all ZMQ clients. Collect them under the lock but Stop()
@@ -206,6 +198,13 @@ void EventManager::Stop() {
 
 std::pair<bool, std::string> EventManager::SubscribeToService(
     const common::ServiceConfig& svc) {
+    // The caller holds mu_ exclusively, so read stopped_ directly rather
+    // than recursively acquiring the non-recursive shared mutex via
+    // IsStopped().
+    if (stopped_) {
+        return {false, "manager stopped"};
+    }
+
     // Use (instance_id, tenant_id) as composite key to support
     // multi-tenant replicas
     std::string svc_key =

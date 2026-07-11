@@ -3,7 +3,11 @@
 
 #include <gtest/gtest.h>
 
+#include <barrier>
+#include <memory>
+#include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "conductor/common/types.h"
@@ -26,6 +30,19 @@ class PrefixCacheTableTestPeer {
         if (!data) return 0;
         std::shared_lock lock(data->hashmap_mu);
         return data->proxy_hash_mapping.size();
+    }
+
+    static std::shared_ptr<ContextData> GetContextData(
+        PrefixCacheTable& table, const ModelContext& ctx) {
+        return table.GetContextData(ctx);
+    }
+
+    static std::set<int64_t> DpSize(PrefixCacheTable& table,
+                                    const ModelContext& ctx) {
+        auto data = table.LoadContextData(ctx);
+        if (!data) return {};
+        std::shared_lock lock(data->hashmap_mu);
+        return data->dp_size;
     }
 };
 
@@ -107,6 +124,45 @@ TEST(ProcessStoreEvent, CreatesContextData) {
     PrefixCacheTable table;
     EXPECT_EQ(table.ProcessStoreEvent(TestStoredEvent(), 0), "");
     EXPECT_TRUE(PrefixCacheTableTestPeer::ContextExists(table, TestContext()));
+}
+
+TEST(ProcessStoreEvent, ConcurrentFirstAccessUsesCanonicalContextData) {
+    PrefixCacheTable table;
+    ModelContext ctx = TestContext();
+    // Make candidate initialisation long enough for all barrier-released
+    // workers to observe the initially empty map before insertion.
+    ctx.additional_salt.assign(1 << 20, 's');
+
+    constexpr int kThreads = 16;
+    std::barrier start(kThreads);
+    std::vector<std::shared_ptr<conductor::prefixindex::ContextData>> returned(
+        kThreads);
+    std::vector<std::thread> workers;
+    workers.reserve(kThreads);
+    for (int i = 0; i < kThreads; ++i) {
+        workers.emplace_back([&table, &ctx, &start, &returned, i] {
+            start.arrive_and_wait();
+            auto data = PrefixCacheTableTestPeer::GetContextData(table, ctx);
+            {
+                std::unique_lock lock(data->hashmap_mu);
+                data->dp_size.insert(i);
+            }
+            returned[i] = std::move(data);
+        });
+    }
+    for (auto& worker : workers) worker.join();
+
+    const auto canonical = PrefixCacheTableTestPeer::GetContextData(table, ctx);
+    for (const auto& data : returned) {
+        EXPECT_EQ(data, canonical);
+    }
+
+    const auto dp_size = PrefixCacheTableTestPeer::DpSize(table, ctx);
+    ASSERT_EQ(dp_size.size(), static_cast<size_t>(kThreads));
+    for (int i = 0; i < kThreads; ++i) {
+        EXPECT_TRUE(dp_size.contains(i));
+    }
+    EXPECT_EQ(table.GetGlobalView().context_count, 1);
 }
 
 TEST(ProcessStoreEvent, EmptyBlockHashesIsNoop) {
@@ -372,10 +428,7 @@ TEST(GetGlobalView, ContainsAllContexts) {
     ASSERT_EQ(table.ProcessStoreEvent(other, 0), "");
 
     const auto view = table.GetGlobalView();
-    // BUG (preserved): context_count is only incremented on the
-    // already-present path, never on a real insert, so it stays 0 even
-    // though 2 contexts are live. See docs/KNOWN_ISSUES.md.
-    EXPECT_EQ(view.context_count, 0);
+    EXPECT_EQ(view.context_count, 2);
     ASSERT_EQ(view.model_contexts.size(), 2u);
     ASSERT_EQ(view.proxy_hash_map.size(), 2u);
     for (const auto& mapping : view.proxy_hash_map) {
@@ -400,8 +453,7 @@ TEST(AddDpSize, CreatesContextAndRecordsRank) {
     table.AddDpSize(ctx, 3);
     table.AddDpSize(ctx, 0);  // idempotent
     EXPECT_TRUE(PrefixCacheTableTestPeer::ContextExists(table, ctx));
-    // Bug-for-bug: context_count stays 0 (see ContainsAllContexts).
-    EXPECT_EQ(table.GetGlobalView().context_count, 0);
+    EXPECT_EQ(table.GetGlobalView().context_count, 1);
     EXPECT_EQ(table.GetGlobalView().model_contexts.size(), 1u);
 }
 

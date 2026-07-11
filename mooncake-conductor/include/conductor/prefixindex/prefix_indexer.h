@@ -181,8 +181,6 @@ class PrefixCacheTable {
     // ModelContext -> ContextData, guarded by context_map_mu_.
     std::shared_mutex context_map_mu_;
     std::unordered_map<ModelContext, std::shared_ptr<ContextData>> context_map_;
-
-    std::atomic<int32_t> context_count_{0};
 };
 
 }  // namespace prefixindex

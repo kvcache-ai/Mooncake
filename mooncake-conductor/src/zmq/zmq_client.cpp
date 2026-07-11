@@ -114,9 +114,9 @@ void ZMQClient::HandleReconnect() {
     if (auto err = Connect(); !err.empty()) {
         LOG(ERROR) << "Reconnect failed service=" << config_.cache_pool_key
                    << " error=" << err;
+        return;
     }
 
-    // BUG: Connect error logged but replay request still sent.
     const int64_t last_seq = GetLastSequence();
     if (last_seq >= 0) {
         LOG(INFO) << "Reconnected service=" << config_.cache_pool_key

@@ -20,6 +20,16 @@ class EventManagerTestPeer {
         return mgr.SubscribeToService(svc);
     }
 
+    static std::pair<bool, std::string> Register(
+        EventManager& mgr, const common::ServiceConfig& svc) {
+        std::unique_lock lock(mgr.mu_);
+        auto result = mgr.SubscribeToService(svc);
+        if (result.first) {
+            mgr.services_.push_back(svc);
+        }
+        return result;
+    }
+
     static void Unsubscribe(EventManager& mgr, const std::string& instance_id,
                             const std::string& tenant_id, int dp_rank) {
         mgr.UnsubscribeFromService(instance_id, tenant_id, dp_rank);
@@ -39,6 +49,16 @@ class EventManagerTestPeer {
         return mgr.services_.size();
     }
 
+    static size_t SubscriberCount(EventManager& mgr) {
+        std::shared_lock lock(mgr.mu_);
+        return mgr.subscribers_.size();
+    }
+
+    static size_t ActiveConfigCount(EventManager& mgr) {
+        std::shared_lock lock(mgr.mu_);
+        return mgr.active_configs_.size();
+    }
+
     static void AppendService(EventManager& mgr,
                               const common::ServiceConfig& svc) {
         std::unique_lock lock(mgr.mu_);
@@ -52,6 +72,8 @@ class EventManagerTestPeer {
         return it != mgr.tenant_instance_map_.end() &&
                it->second.count(instance) != 0;
     }
+
+    static uint16_t HttpPort(EventManager& mgr);
 };
 
 class KVEventHandlerTestPeer {

@@ -76,21 +76,13 @@ std::shared_ptr<ContextData> PrefixCacheTable::GetContextData(
     new_context_data->prefix_store.last_access.store(NowUnixSeconds());
 
     // Concurrent insert: another thread may have beaten us to the map.
-    // BUG: LoadOrStore loaded bit unused — may double-init entry.
-    {
-        std::unique_lock lock(context_map_mu_);
-        auto [it, inserted] =
-            context_map_.try_emplace(model_context, new_context_data);
-        if (inserted) {
-            return new_context_data;
-        }
-    }
-
-    context_count_.fetch_add(1);
+    std::unique_lock lock(context_map_mu_);
+    auto [it, inserted] =
+        context_map_.try_emplace(model_context, new_context_data);
     VLOG(1) << "in getContextData modelcontext model="
             << model_context.model_name
             << " instance=" << model_context.instance_id;
-    return new_context_data;
+    return inserted ? new_context_data : it->second;
 }
 
 void PrefixCacheTable::AddDpSize(const ModelContext& model_context,
@@ -175,7 +167,7 @@ CacheHitResult PrefixCacheTable::CacheHitCompute(
             // the empty string that Mooncake-source and nil-medium vLLM
             // blocks carry — logs a warning and does not count as a hit.
             // The DISK field has no assignment path and stays 0 forever.
-            // See docs/KNOWN_ISSUES.md A.1.
+            // See docs/KNOWN_ISSUES.md issue 1.
             if (key == "cpu") {
                 prefix_match_result.cpu += model_context.block_size;
                 cache_hit = true;
@@ -332,7 +324,7 @@ std::string PrefixCacheTable::ProcessRemoveEvent(
 
         // Remove per-instance metadata.
         // BUG: medium_set / dpRankSet / engineLastAccessTime use inconsistent
-        // delete semantics (see docs/KNOWN_ISSUES.md A.3).
+        // delete semantics (see docs/KNOWN_ISSUES.md issue 3).
         cache_store_info.engine_last_access_time.erase(instance_id);
         cache_store_info.dp_rank_set.erase(dp_rank);
 
@@ -367,7 +359,7 @@ void PrefixCacheTable::AddNewPrefixStore(HashMapStore* prefix_store,
     cache_store_info.engine_last_access_time[instance_id] = now;
     cache_store_info.total_replica_nums += 1;
     // BUG: medium_set has no refcount — dirty read after block eviction (see
-    // docs/KNOWN_ISSUES.md A.3).
+    // docs/KNOWN_ISSUES.md issue 3).
     cache_store_info.medium_set.insert(medium);
     cache_store_info.dp_rank_set.insert(dp_rank);
     VLOG(1) << "in addNewPrefixStore conductor_hash=" << hash_value;
@@ -375,7 +367,6 @@ void PrefixCacheTable::AddNewPrefixStore(HashMapStore* prefix_store,
 
 GlobalView PrefixCacheTable::GetGlobalView() {
     GlobalView view;
-    view.context_count = context_count_.load();
 
     // Snapshot context pointers first (iterate under map lock), then
     // copy each context's mapping under its own locks. We copy under lock
@@ -387,6 +378,7 @@ GlobalView PrefixCacheTable::GetGlobalView() {
         for (const auto& [ctx, data] : context_map_) {
             contexts.emplace_back(ctx, data);
         }
+        view.context_count = static_cast<int32_t>(contexts.size());
     }
 
     for (auto& [ctx, context_data] : contexts) {

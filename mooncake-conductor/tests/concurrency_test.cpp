@@ -11,6 +11,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <barrier>
 #include <thread>
 #include <vector>
 
@@ -31,6 +32,18 @@ using conductor::prefixindex::PrefixCacheTable;
 using conductor::zmq::BlockRemovedEvent;
 using conductor::zmq::BlockStoredEvent;
 using conductor::zmq::KVEvent;
+
+ServiceConfig RaceService(const std::string& instance_id) {
+    ServiceConfig svc;
+    svc.endpoint = "tcp://127.0.0.1:59999";
+    svc.replay_endpoint = "tcp://127.0.0.1:59998";
+    svc.type = conductor::common::kServiceTypeVLLM;
+    svc.model_name = "race-model";
+    svc.instance_id = instance_id;
+    svc.tenant_id = "default";
+    svc.block_size = 16;
+    return svc;
+}
 
 // Handlers keep dispatching events while the manager stops. This is the
 // exact interaction behind Go's documented deadlock: HandleEvent takes
@@ -71,6 +84,47 @@ TEST(Concurrency, StopWhileHandlingEvents) {
     done.store(true);
     for (auto& t : workers) t.join();
     EXPECT_TRUE(mgr.IsStopped());
+}
+
+TEST(Concurrency, StartConcurrentWithServiceRegistration) {
+    constexpr int kStaticServices = 8;
+    constexpr int kDynamicServices = 8;
+
+    std::vector<ServiceConfig> services;
+    for (int i = 0; i < kStaticServices; ++i) {
+        services.push_back(RaceService("static-" + std::to_string(i)));
+    }
+    EventManager mgr(std::move(services), 0);
+
+    std::barrier start(2);
+    std::atomic<int> registration_errors{0};
+    std::thread starter([&mgr, &start] {
+        start.arrive_and_wait();
+        mgr.Start();
+    });
+    std::thread registrar([&mgr, &start, &registration_errors] {
+        start.arrive_and_wait();
+        for (int i = 0; i < kDynamicServices; ++i) {
+            const auto result =
+                conductor::kvevent::EventManagerTestPeer::Register(
+                    mgr, RaceService("dynamic-" + std::to_string(i)));
+            if (!result.second.empty()) {
+                registration_errors.fetch_add(1);
+            }
+        }
+    });
+
+    starter.join();
+    registrar.join();
+
+    EXPECT_EQ(registration_errors.load(), 0);
+    EXPECT_EQ(conductor::kvevent::EventManagerTestPeer::ServicesLen(mgr),
+              static_cast<size_t>(kStaticServices + kDynamicServices));
+    EXPECT_EQ(conductor::kvevent::EventManagerTestPeer::SubscriberCount(mgr),
+              static_cast<size_t>(kStaticServices + kDynamicServices));
+    EXPECT_EQ(conductor::kvevent::EventManagerTestPeer::ActiveConfigCount(mgr),
+              static_cast<size_t>(kStaticServices + kDynamicServices));
+    mgr.Stop();
 }
 
 // Concurrent registrations of distinct and duplicate services. ZMQ
