@@ -294,16 +294,18 @@ MasterService::MasterService(const MasterServiceConfig& config)
         LOG(ERROR) << "snapshot_retention_count must be greater than 0";
         throw std::invalid_argument("snapshot_retention_count must be > 0");
     }
-    if (eviction_ratio_ < 0.0 || eviction_ratio_ > 1.0) {
+    const double eviction_ratio = EvictionRatio();
+    if (eviction_ratio < 0.0 || eviction_ratio > 1.0) {
         LOG(ERROR) << "Eviction ratio must be between 0.0 and 1.0, "
-                   << "current value: " << eviction_ratio_;
+                   << "current value: " << eviction_ratio;
         throw std::invalid_argument("Invalid eviction ratio");
     }
-    if (eviction_high_watermark_ratio_ < 0.0 ||
-        eviction_high_watermark_ratio_ > 1.0) {
+    const double eviction_high_watermark_ratio = EvictionHighWatermarkRatio();
+    if (eviction_high_watermark_ratio < 0.0 ||
+        eviction_high_watermark_ratio > 1.0) {
         LOG(ERROR)
             << "Eviction high watermark ratio must be between 0.0 and 1.0, "
-            << "current value: " << eviction_high_watermark_ratio_;
+            << "current value: " << eviction_high_watermark_ratio;
         throw std::invalid_argument("Invalid eviction high watermark ratio");
     }
 
@@ -1864,13 +1866,14 @@ void MasterService::RebuildGroupRoutingIndex() {
 void MasterService::GrantLeaseForGroup(const TenantState& tenant_state,
                                        const std::string& key,
                                        const ObjectMetadata& metadata) const {
+    const uint64_t soft_pin_ttl = DefaultKvSoftPinTtl();
     if (!metadata.IsGrouped()) {
-        metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
+        metadata.GrantLease(default_kv_lease_ttl_, soft_pin_ttl);
         return;
     }
 
-    bool needs_refresh = metadata.NeedsLeaseRefresh(default_kv_lease_ttl_,
-                                                    default_kv_soft_pin_ttl_);
+    bool needs_refresh =
+        metadata.NeedsLeaseRefresh(default_kv_lease_ttl_, soft_pin_ttl);
     if (!needs_refresh) {
         std::shared_lock<std::shared_mutex> lock(group_routing_mutex_);
         needs_refresh = groups_needing_lease_refresh_.find(MakeTenantScopedKey(
@@ -1883,19 +1886,18 @@ void MasterService::GrantLeaseForGroup(const TenantState& tenant_state,
 
     auto group_it = tenant_state.group_members.find(metadata.group_id);
     if (group_it == tenant_state.group_members.end()) {
-        metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
+        metadata.GrantLease(default_kv_lease_ttl_, soft_pin_ttl);
         return;
     }
 
     for (const auto& member_key : group_it->second) {
         auto mit = tenant_state.metadata.find(member_key);
         if (mit != tenant_state.metadata.end()) {
-            mit->second.GrantLease(default_kv_lease_ttl_,
-                                   default_kv_soft_pin_ttl_);
+            mit->second.GrantLease(default_kv_lease_ttl_, soft_pin_ttl);
         }
     }
     if (group_it->second.find(key) == group_it->second.end()) {
-        metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
+        metadata.GrantLease(default_kv_lease_ttl_, soft_pin_ttl);
     }
     {
         std::unique_lock<std::shared_mutex> lock(group_routing_mutex_);
@@ -2388,7 +2390,7 @@ auto MasterService::BatchReplicaClear(
 
         // Safety check: Do not clear an object that has an active lease.
         metadata.FlushDeferredLease(default_kv_lease_ttl_,
-                                    default_kv_soft_pin_ttl_);
+                                    DefaultKvSoftPinTtl());
         if (!metadata.IsLeaseExpired()) {
             LOG(WARNING) << "BatchReplicaClear: key=" << key
                          << " has active lease, skipping";
@@ -3356,7 +3358,7 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
     // 1. Set lease timeout to now, indicating that the object has no lease
     // at beginning. 2. If this object has soft pin enabled, set it to be soft
     // pinned.
-    metadata.GrantLease(0, default_kv_soft_pin_ttl_);
+    metadata.GrantLease(0, DefaultKvSoftPinTtl());
 
     // Register key in prefix radix tree for prefix-aware matching
     prefix_index_.Insert(MakeTenantScopedKey(metadata.tenant_id, key));
@@ -4547,8 +4549,7 @@ auto MasterService::Remove(const std::string& key, const std::string& tenant_id,
     }
 
     auto& metadata = accessor.Get();
-    metadata.FlushDeferredLease(default_kv_lease_ttl_,
-                                default_kv_soft_pin_ttl_);
+    metadata.FlushDeferredLease(default_kv_lease_ttl_, DefaultKvSoftPinTtl());
 
     if (!force && !metadata.IsLeaseExpired()) {
         VLOG(1) << "key=" << key << ", error=object_has_lease";
@@ -4593,6 +4594,7 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const auto normalized_tenant = NormalizeRequestTenantId(tenant_id);
+    const uint64_t soft_pin_ttl = DefaultKvSoftPinTtl();
     for (size_t i = 0; i < kNumShards; ++i) {
         MetadataShardAccessorRW shard(this, i);
         auto tenant_it = shard->tenants.find(normalized_tenant);
@@ -4605,7 +4607,7 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
              it != tenant_state.metadata.end();) {
             if (std::regex_search(it->first, pattern)) {
                 it->second.FlushDeferredLease(default_kv_lease_ttl_,
-                                              default_kv_soft_pin_ttl_);
+                                              soft_pin_ttl);
                 if (!force && !it->second.IsLeaseExpired()) {
                     VLOG(1) << "key=" << it->first
                             << " matched by regex, but has lease. Skipping "
@@ -4659,6 +4661,7 @@ long MasterService::RemoveAll(bool force) {
     uint64_t total_freed_size = 0;
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     auto now = std::chrono::system_clock::now();
+    const uint64_t soft_pin_ttl = DefaultKvSoftPinTtl();
 
     for (size_t i = 0; i < kNumShards; i++) {
         MetadataShardAccessorRW shard(this, i);
@@ -4668,7 +4671,7 @@ long MasterService::RemoveAll(bool force) {
             auto it = tenant_state.metadata.begin();
             while (it != tenant_state.metadata.end()) {
                 it->second.FlushDeferredLease(default_kv_lease_ttl_,
-                                              default_kv_soft_pin_ttl_);
+                                              soft_pin_ttl);
                 if ((force || it->second.IsLeaseExpired(now)) &&
                     it->second.AllReplicas(&Replica::fn_is_completed) &&
                     !tenant_state.replication_tasks.contains(it->first)) {
@@ -5317,7 +5320,8 @@ void MasterService::TryPushPromotionQueue(const ObjectIdentity& object_id) {
     // sample and the actual allocation in PromotionAllocStart).
     const double used_ratio =
         MasterMetricManager::instance().get_global_mem_used_ratio();
-    if (used_ratio >= eviction_high_watermark_ratio_) {
+    const double eviction_high_watermark_ratio = EvictionHighWatermarkRatio();
+    if (used_ratio >= eviction_high_watermark_ratio) {
         MasterMetricManager::instance().inc_promotion_rejected_watermark();
         return;
     }
@@ -5717,9 +5721,12 @@ void MasterService::EvictionThreadFunc() {
         auto schedule_result = adaptive_scheduler_.Schedule();
         if (schedule_result.has_value()) {
             auto& output = schedule_result.value();
-            eviction_high_watermark_ratio_ = output.eviction_high_watermark;
-            eviction_ratio_ = output.eviction_ratio;
-            default_kv_soft_pin_ttl_ = output.soft_pin_ttl_ms;
+            eviction_high_watermark_ratio_.store(output.eviction_high_watermark,
+                                                 std::memory_order_relaxed);
+            eviction_ratio_.store(output.eviction_ratio,
+                                  std::memory_order_relaxed);
+            default_kv_soft_pin_ttl_.store(output.soft_pin_ttl_ms,
+                                           std::memory_order_relaxed);
             LOG(INFO) << "[ADAPTIVE-SCHED] mode="
                       << AdaptiveCacheScheduler::ModeToString(output.mode)
                       << " hit_rate=" << adaptive_scheduler_.getEwmaHitRate()
@@ -5730,18 +5737,21 @@ void MasterService::EvictionThreadFunc() {
 
         double used_ratio =
             MasterMetricManager::instance().get_global_mem_used_ratio();
-        if (used_ratio > eviction_high_watermark_ratio_ ||
-            (need_mem_eviction_ && eviction_ratio_ > 0.0)) {
+        const double eviction_high_watermark_ratio =
+            EvictionHighWatermarkRatio();
+        const double eviction_ratio = EvictionRatio();
+        if (used_ratio > eviction_high_watermark_ratio ||
+            (need_mem_eviction_ && eviction_ratio > 0.0)) {
             LOG(INFO) << "[EVICT-TRIGGER] memory_ratio=" << used_ratio
-                      << " high_watermark=" << eviction_high_watermark_ratio_
+                      << " high_watermark=" << eviction_high_watermark_ratio
                       << " need_mem_eviction=" << need_mem_eviction_
-                      << " eviction_ratio=" << eviction_ratio_;
+                      << " eviction_ratio=" << eviction_ratio;
             double evict_ratio_target = std::max(
-                eviction_ratio_,
-                used_ratio - eviction_high_watermark_ratio_ + eviction_ratio_);
+                eviction_ratio,
+                used_ratio - eviction_high_watermark_ratio + eviction_ratio);
             double evict_ratio_lowerbound =
                 std::max(evict_ratio_target * 0.5,
-                         used_ratio - eviction_high_watermark_ratio_);
+                         used_ratio - eviction_high_watermark_ratio);
             BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
             LOG(INFO) << "[EVICT-DONE] BatchEvict execution completed.";
             last_discard_time = now;
@@ -6800,6 +6810,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     // shards.
     size_t start_idx = RandomIndex(kNumShards);
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    const uint64_t soft_pin_ttl = DefaultKvSoftPinTtl();
 
     // ===== Phase 1: Parallel candidate collection =====
     // N threads each scan a batch of shards, collecting Candidates with
@@ -6829,7 +6840,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     for (auto it = tenant_state.metadata.begin();
                          it != tenant_state.metadata.end(); ++it) {
                         it->second.FlushDeferredLease(default_kv_lease_ttl_,
-                                                      default_kv_soft_pin_ttl_);
+                                                      soft_pin_ttl);
                         if (it->second.IsHardPinned()) continue;
                         bool has_evictable = can_evict_replicas(it->second);
                         if (has_evictable) shard_evictable_count++;
@@ -6927,7 +6938,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 if (it == tenant_state.metadata.end()) continue;
                 // Re-validate: state may have changed since Phase 1
                 it->second.FlushDeferredLease(default_kv_lease_ttl_,
-                                              default_kv_soft_pin_ttl_);
+                                              soft_pin_ttl);
                 if (!it->second.IsLeaseExpired(now) ||
                     it->second.IsSoftPinned(now) ||
                     !can_evict_replicas(it->second)) {
@@ -6993,9 +7004,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         auto it = tenant_state.metadata.begin();
                         while (it != tenant_state.metadata.end() &&
                                target_evict_num > 0) {
-                            it->second.FlushDeferredLease(
-                                default_kv_lease_ttl_,
-                                default_kv_soft_pin_ttl_);
+                            it->second.FlushDeferredLease(default_kv_lease_ttl_,
+                                                          soft_pin_ttl);
                             if (!it->second.IsHardPinned() &&
                                 it->second.IsLeaseExpired(now) &&
                                 it->second.lease_timeout <= target_timeout &&
@@ -7057,9 +7067,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         auto it = tenant_state.metadata.begin();
                         while (it != tenant_state.metadata.end() &&
                                target_evict_num > 0) {
-                            it->second.FlushDeferredLease(
-                                default_kv_lease_ttl_,
-                                default_kv_soft_pin_ttl_);
+                            it->second.FlushDeferredLease(default_kv_lease_ttl_,
+                                                          soft_pin_ttl);
                             if (it->second.IsHardPinned() ||
                                 !it->second.IsLeaseExpired(now) ||
                                 !can_evict_replicas(it->second)) {

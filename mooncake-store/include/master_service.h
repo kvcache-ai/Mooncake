@@ -1599,9 +1599,9 @@ class MasterService {
     }
 
     // Lease related members
-    const uint64_t default_kv_lease_ttl_;  // in milliseconds
-    uint64_t default_kv_soft_pin_ttl_;  // in milliseconds (mutable for adaptive
-                                        // scheduler)
+    const uint64_t default_kv_lease_ttl_;            // in milliseconds
+    std::atomic<uint64_t> default_kv_soft_pin_ttl_;  // in milliseconds (mutable
+                                                     // for adaptive scheduler)
     const bool allow_evict_soft_pinned_objects_;
 
     // Eviction related members
@@ -1609,14 +1609,26 @@ class MasterService {
         false};  // Set to trigger memory eviction when allocation fails
     std::atomic<bool> need_nof_eviction_{
         false};  // Set to trigger NoF eviction when allocation fails
-    const double eviction_ratio_;                     // in range [0.0, 1.0]
-    const double eviction_high_watermark_ratio_;      // in range [0.0, 1.0]
-    const double nof_eviction_ratio_;                 // in range [0.0, 1.0]
-    const double nof_eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
+    std::atomic<double> eviction_ratio_;                 // in range [0.0, 1.0]
+    std::atomic<double> eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
+    const double nof_eviction_ratio_;                    // in range [0.0, 1.0]
+    const double nof_eviction_high_watermark_ratio_;     // in range [0.0, 1.0]
 
     // Adaptive cache scheduler: dynamically tunes eviction parameters
     // based on workload patterns (hit rate, access frequency).
     AdaptiveCacheScheduler adaptive_scheduler_;
+
+    uint64_t DefaultKvSoftPinTtl() const {
+        return default_kv_soft_pin_ttl_.load(std::memory_order_relaxed);
+    }
+
+    double EvictionRatio() const {
+        return eviction_ratio_.load(std::memory_order_relaxed);
+    }
+
+    double EvictionHighWatermarkRatio() const {
+        return eviction_high_watermark_ratio_.load(std::memory_order_relaxed);
+    }
 
     // Eviction thread related members
     std::thread eviction_thread_;
