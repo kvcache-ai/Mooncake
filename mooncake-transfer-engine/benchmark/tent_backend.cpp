@@ -337,8 +337,7 @@ int TENTBenchRunner::runTarget() {
         while (!delayed.empty() && delayed.front().due_us <= now_us) {
             auto release = std::move(delayed.front());
             delayed.pop_front();
-            if (!tracker.release(release.demand.bytes,
-                                 release.demand.slots)) {
+            if (!tracker.release(release.demand.bytes, release.demand.slots)) {
                 ++data_errors;
             } else {
                 completed += release.demand.slots;
