@@ -181,6 +181,26 @@ TEST(ReceiverCreditControl, PeerContextRestartFencesOldCleanup) {
     EXPECT_EQ(snapshot.epoch, 1);
 }
 
+TEST(ReceiverCreditControl, PeerContextRejectsSenderIdentityChange) {
+    CreditPeerContextTable contexts;
+    CreditActivationV1 activation;
+    activation.receiver_session_id = {11, 22};
+    activation.epoch = 7;
+    ASSERT_TRUE(contexts.activate(100, 200, 3, activation).ok());
+
+    activation.epoch = 8;
+    EXPECT_TRUE(contexts.activate(100, 201, 3, activation).IsInvalidEntry());
+    activation.receiver_session_id = {33, 44};
+    activation.epoch = 1;
+    EXPECT_TRUE(contexts.activate(100, 201, 3, activation).IsInvalidEntry());
+
+    CreditPeerContextSnapshot snapshot;
+    ASSERT_TRUE(contexts.lookup(100, 3, snapshot).ok());
+    EXPECT_EQ(snapshot.key.receiver_session, (ReceiverSessionId{11, 22}));
+    EXPECT_EQ(snapshot.key.sender_peer, 200);
+    EXPECT_EQ(snapshot.epoch, 7);
+}
+
 TEST(ReceiverCreditControl, PeerContextCapacityRecoversAfterExactCleanup) {
     CreditPeerContextTable contexts(1);
     CreditActivationV1 activation;

@@ -222,8 +222,8 @@ Status CreditActivationCodecV1::decode(std::string_view wire,
 size_t CreditPeerContextTable::LookupKeyHash::operator()(
     const LookupKey& key) const noexcept {
     size_t h = std::hash<uint64_t>{}(key.target_id);
-    h ^=
-        std::hash<uint32_t>{}(key.qos_class) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    h ^= std::hash<uint32_t>{}(key.qos_class) + 0x9e3779b97f4a7c15ULL +
+         (h << 6) + (h >> 2);
     return h;
 }
 
@@ -253,15 +253,15 @@ Status CreditPeerContextTable::activate(uint64_t target_id,
         return Status::OK();
     }
     const auto& current = it->second;
+    if (current.key.sender_peer != sender_peer)
+        return Status::InvalidEntry(
+            "receiver credit sender identity changed" LOC_MARK);
     if (current.key.receiver_session == activation.receiver_session_id &&
         activation.epoch < current.epoch)
         return Status::InvalidEntry(
             "stale receiver credit peer activation" LOC_MARK);
     if (current.key.receiver_session == activation.receiver_session_id &&
         activation.epoch == current.epoch) {
-        if (current.key.sender_peer != sender_peer)
-            return Status::InvalidEntry(
-                "receiver credit sender identity changed" LOC_MARK);
         return Status::OK();
     }
     it->second = next;
