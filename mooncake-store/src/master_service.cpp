@@ -38,6 +38,7 @@
 #include "ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store.h"
 #include "ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
+#include "ha/snapshot/snapshot_constants.h"
 #include "types.h"
 #include "serialize/serializer.h"
 #include "ha/snapshot/snapshot_logger.h"
@@ -46,25 +47,12 @@
 #include "utils.h"
 #include "kv_event/kv_event_config.h"
 #include "master_snapshot_manager.h"
+#include "master_snapshot_repository.h"
 
 namespace mooncake {
 
-// Snapshot file names
-static const std::string SNAPSHOT_METADATA_FILE = "metadata";
-static const std::string SNAPSHOT_SEGMENTS_FILE = "segments";
-static const std::string SNAPSHOT_TASK_MANAGER_FILE = "task_manager";
-static const std::string SNAPSHOT_MANIFEST_FILE = "manifest.txt";
-static const std::string SNAPSHOT_LATEST_FILE = "latest.txt";
-static const std::string SNAPSHOT_BACKUP_SAVE_DIR =
-    "mooncake_snapshot_save_backup";
-static const std::string SNAPSHOT_BACKUP_RESTORE_DIR =
-    "mooncake_snapshot_restore_backup";
-static const std::string SNAPSHOT_SERIALIZER_VERSION = "1.0.0";
-static const std::string SNAPSHOT_SERIALIZER_TYPE = "messagepack";
-
 namespace {
 
-constexpr size_t kUnlimitedSnapshotList = 0;
 constexpr int kMaxTenantQuotaEvictionRetries = 2;
 
 // Per-cycle offload cap as a fraction of `offloading_queue_limit_`. Used only
@@ -90,12 +78,6 @@ tl::expected<SnapshotCatalogBackendKind, std::string> ParseSnapshotCatalogKind(
     }
     return tl::make_unexpected("unknown snapshot catalog store type: " +
                                std::string(store_type));
-}
-
-int64_t CurrentTimeMs() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-               std::chrono::system_clock::now().time_since_epoch())
-        .count();
 }
 
 size_t RandomIndex(size_t upper_bound) {
@@ -271,6 +253,12 @@ MasterService::MasterService(const MasterServiceConfig& config)
         if (!snapshot_backup_dir_.empty()) {
             use_snapshot_backup_dir_ = true;
         }
+
+        // Initialize repository and codec for both save and restore
+        snapshot_repository_ = std::make_unique<MasterSnapshotRepository>(
+            snapshot_object_store_.get(), snapshot_catalog_store_.get(),
+            snapshot_backup_dir_, use_snapshot_backup_dir_);
+        snapshot_codec_ = std::make_unique<ha::MasterSnapshotCodec>();
     }
 
     if (enable_multi_tenants_) {
@@ -5912,68 +5900,68 @@ void MasterService::RestoreState() {
     LOG(INFO) << "[Restore] Backend info: "
               << snapshot_object_store_->GetConnectionInfo();
 
-    std::vector<ha::SnapshotDescriptor> restore_candidates;
-    std::unordered_set<std::string> candidate_ids;
-    std::optional<std::string> latest_snapshot_id;
-
-    auto latest_result = snapshot_catalog_store->GetLatest();
+    // Phase 1: Find snapshot candidates (repository responsibility)
+    auto latest_result = snapshot_repository_->LoadLatestSnapshot();
+    std::optional<std::string> latest_id;
     if (!latest_result) {
         LOG(WARNING) << "[Restore] Failed to load latest snapshot marker: "
                      << toString(latest_result.error())
                      << ", falling back to published snapshot listing";
-    } else if (latest_result->has_value()) {
-        const auto& latest_snapshot = latest_result->value();
-        latest_snapshot_id = latest_snapshot.snapshot_id;
-        restore_candidates.push_back(latest_snapshot);
-        candidate_ids.emplace(latest_snapshot.snapshot_id);
-    }
-
-    // Snapshot ids use YYYYMMDD_HHMMSS_mmm, so lexicographic order matches
-    // creation order. List() may perform one descriptor read per published
-    // snapshot; retention cleanup keeps that set bounded in practice.
-    auto snapshots_result =
-        snapshot_catalog_store->List(kUnlimitedSnapshotList);
-    if (!snapshots_result) {
-        if (restore_candidates.empty()) {
-            LOG(ERROR) << "[Restore] Failed to list restorable snapshots: "
-                       << toString(snapshots_result.error())
-                       << ", starting fresh";
-            return;
-        }
-        LOG(WARNING) << "[Restore] Failed to list fallback snapshots: "
-                     << toString(snapshots_result.error())
-                     << ", attempting latest marker only";
     } else {
-        for (const auto& snapshot : snapshots_result.value()) {
-            // Snapshot ids are timestamp-derived, so string comparison keeps
-            // only candidates at or before the latest marker chronologically.
-            if (latest_snapshot_id.has_value() &&
-                snapshot.snapshot_id > latest_snapshot_id.value()) {
-                continue;
-            }
-            if (!candidate_ids.emplace(snapshot.snapshot_id).second) {
-                continue;
-            }
-            restore_candidates.push_back(snapshot);
-        }
+        latest_id = latest_result->snapshot_id;
     }
 
-    if (restore_candidates.empty()) {
+    auto candidates_result =
+        snapshot_repository_->LoadRestoreCandidates(latest_id);
+    if (!candidates_result || candidates_result->empty()) {
         LOG(ERROR) << "[Restore] No previous snapshot found, starting fresh";
         return;
     }
 
+    // Phase 2 & 3: Try each candidate
     const auto now = std::chrono::system_clock::now();
-    for (const auto& snapshot : restore_candidates) {
+    for (const auto& snapshot : candidates_result.value()) {
         ResetStateAfterFailedRestoreAttempt();
-        if (TryRestoreStateFromSnapshot(snapshot, now)) {
-            return;
+
+        // Phase 2a: Download payloads (repository responsibility)
+        auto payloads_result =
+            snapshot_repository_->DownloadSnapshotPayloads(snapshot);
+        if (!payloads_result) {
+            LOG(WARNING) << "[Restore] Snapshot candidate "
+                         << snapshot.snapshot_id
+                         << " is unusable: failed to download payloads: "
+                         << payloads_result.error().message;
+            continue;
         }
+
+        // Phase 2b: Decode payloads (codec responsibility)
+        auto decode_result =
+            snapshot_codec_->Decode(this, payloads_result.value());
+        if (!decode_result) {
+            LOG(WARNING) << "[Restore] Snapshot candidate "
+                         << snapshot.snapshot_id
+                         << " is unusable: " << decode_result.error().message;
+            continue;
+        }
+
+        // Phase 3: Apply state (master service responsibility)
+        auto apply_result = ApplySnapshotState(payloads_result.value(), now);
+        if (!apply_result) {
+            LOG(WARNING) << "[Restore] Snapshot candidate "
+                         << snapshot.snapshot_id
+                         << " is unusable: failed to apply state: "
+                         << apply_result.error().message;
+            continue;
+        }
+
+        LOG(INFO) << "[Restore] Successfully restored state from snapshot: "
+                  << snapshot.snapshot_id;
+        return;
     }
 
     ResetStateAfterFailedRestoreAttempt();
     LOG(ERROR) << "[Restore] Failed to restore from all candidate snapshots "
-               << "(count=" << restore_candidates.size() << "), starting fresh";
+               << "(count=" << candidates_result->size() << "), starting fresh";
 }
 
 bool MasterService::TryRestoreStateFromSnapshot(
@@ -5988,7 +5976,7 @@ bool MasterService::TryRestoreStateFromSnapshot(
 
     std::string manifest_path = snapshot.manifest_key;
     if (manifest_path.empty()) {
-        manifest_path = path_prefix + SNAPSHOT_MANIFEST_FILE;
+        manifest_path = path_prefix + ha::kSnapshotManifestFile;
     }
 
     auto fail_restore = [&](const std::string& message) {
@@ -6011,8 +5999,8 @@ bool MasterService::TryRestoreStateFromSnapshot(
         if (use_snapshot_backup_dir_) {
             auto save_result = FileUtil::SaveStringToFile(
                 manifest_content, fs::path(snapshot_backup_dir_) /
-                                      SNAPSHOT_BACKUP_RESTORE_DIR /
-                                      SNAPSHOT_MANIFEST_FILE);
+                                      ha::kSnapshotBackupRestoreDir /
+                                      ha::kSnapshotManifestFile);
             if (!save_result) {
                 LOG(ERROR) << "[Restore] Failed to save manifest to file: "
                            << save_result.error();
@@ -6031,18 +6019,18 @@ bool MasterService::TryRestoreStateFromSnapshot(
         LOG(INFO) << "[Restore] Trying snapshot: " << state_id
                   << " version: " << version << " protocol: " << protocol_type;
 
-        if (protocol_type != SNAPSHOT_SERIALIZER_TYPE) {
+        if (protocol_type != ha::kSnapshotSerializerType) {
             return fail_restore("unsupported protocol type '" + protocol_type +
-                                "', expected '" + SNAPSHOT_SERIALIZER_TYPE +
+                                "', expected '" + ha::kSnapshotSerializerType +
                                 "'");
         }
-        if (version != SNAPSHOT_SERIALIZER_VERSION) {
+        if (version != ha::kSnapshotSerializerVersion) {
             return fail_restore("incompatible snapshot version '" + version +
-                                "', expected '" + SNAPSHOT_SERIALIZER_VERSION +
-                                "'");
+                                "', expected '" +
+                                ha::kSnapshotSerializerVersion + "'");
         }
 
-        std::string metadata_path = path_prefix + SNAPSHOT_METADATA_FILE;
+        std::string metadata_path = path_prefix + ha::kSnapshotMetadataFile;
         std::vector<uint8_t> metadata_content;
         auto download_result = snapshot_object_store_->DownloadBuffer(
             metadata_path, metadata_content);
@@ -6055,8 +6043,8 @@ bool MasterService::TryRestoreStateFromSnapshot(
         if (use_snapshot_backup_dir_) {
             auto save_result = FileUtil::SaveBinaryToFile(
                 metadata_content, fs::path(snapshot_backup_dir_) /
-                                      SNAPSHOT_BACKUP_RESTORE_DIR /
-                                      SNAPSHOT_METADATA_FILE);
+                                      ha::kSnapshotBackupRestoreDir /
+                                      ha::kSnapshotMetadataFile);
             if (!save_result) {
                 LOG(ERROR) << "[Restore] Failed to save metadata to file: "
                            << save_result.error();
@@ -6064,7 +6052,7 @@ bool MasterService::TryRestoreStateFromSnapshot(
         }
         LOG(INFO) << "[Restore] Download metadata file success";
 
-        std::string segments_path = path_prefix + SNAPSHOT_SEGMENTS_FILE;
+        std::string segments_path = path_prefix + ha::kSnapshotSegmentsFile;
         std::vector<uint8_t> segments_content;
         download_result = snapshot_object_store_->DownloadBuffer(
             segments_path, segments_content);
@@ -6076,8 +6064,8 @@ bool MasterService::TryRestoreStateFromSnapshot(
         if (use_snapshot_backup_dir_) {
             auto save_result = FileUtil::SaveBinaryToFile(
                 segments_content, fs::path(snapshot_backup_dir_) /
-                                      SNAPSHOT_BACKUP_RESTORE_DIR /
-                                      SNAPSHOT_SEGMENTS_FILE);
+                                      ha::kSnapshotBackupRestoreDir /
+                                      ha::kSnapshotSegmentsFile);
             if (!save_result) {
                 LOG(ERROR) << "[Restore] Failed to save segments to file: "
                            << save_result.error();
@@ -6086,7 +6074,7 @@ bool MasterService::TryRestoreStateFromSnapshot(
         LOG(INFO) << "[Restore] Download segments file success";
 
         std::string task_manager_path =
-            path_prefix + SNAPSHOT_TASK_MANAGER_FILE;
+            path_prefix + ha::kSnapshotTaskManagerFile;
         std::vector<uint8_t> task_manager_content;
         download_result = snapshot_object_store_->DownloadBuffer(
             task_manager_path, task_manager_content);
@@ -6098,8 +6086,8 @@ bool MasterService::TryRestoreStateFromSnapshot(
         if (use_snapshot_backup_dir_) {
             auto save_result = FileUtil::SaveBinaryToFile(
                 task_manager_content, fs::path(snapshot_backup_dir_) /
-                                          SNAPSHOT_BACKUP_RESTORE_DIR /
-                                          SNAPSHOT_TASK_MANAGER_FILE);
+                                          ha::kSnapshotBackupRestoreDir /
+                                          ha::kSnapshotTaskManagerFile);
             if (!save_result) {
                 LOG(ERROR) << "[Restore] Failed to save task manager to file: "
                            << save_result.error();
@@ -6288,6 +6276,131 @@ void MasterService::ResetStateAfterFailedRestoreAttempt() {
     MasterMetricManager::instance().reset_allocated_mem_size();
     MasterMetricManager::instance().reset_total_mem_capacity();
     MasterMetricManager::instance().reset_cache_total_nums();
+}
+
+tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
+    const ha::MasterSnapshotPayloads& payloads,
+    const std::chrono::system_clock::time_point& now) {
+    // Note: Codec has already called Deserialize() on all payloads,
+    // so the internal state is already restored. This method handles
+    // post-restore cleanup and metrics rebuilding.
+
+    std::vector<std::string> segment_names;
+    {
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
+        segment_access.GetAllSegmentNames(segment_names);
+    }
+
+    // Cleanup expired metadata (unless test environment disables it)
+    {
+        const bool skip_cleanup =
+            std::getenv("MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP");
+        if (!skip_cleanup) {
+            auto cleanup_now = now;
+            for (auto& shard : metadata_shards_) {
+                for (auto tenant_it = shard.tenants.begin();
+                     tenant_it != shard.tenants.end();) {
+                    auto& tenant_state = tenant_it->second;
+                    for (auto it = tenant_state.metadata.begin();
+                         it != tenant_state.metadata.end();) {
+                        if (it->second.HasDiffRepStatus(
+                                ReplicaStatus::COMPLETE) ||
+                            (it->second.IsLeaseExpired(cleanup_now) &&
+                             !it->second.IsSoftPinned(cleanup_now))) {
+                            VLOG(1) << "clear metadata key=" << it->first;
+                            it = EraseMetadata(tenant_state, it,
+                                               tenant_it->first);
+                        } else {
+                            ++it;
+                        }
+                    }
+                    if (tenant_state.Empty()) {
+                        tenant_it = shard.tenants.erase(tenant_it);
+                    } else {
+                        ++tenant_it;
+                    }
+                }
+            }
+        }
+
+        // Rebuild allocated memory metrics
+        MasterMetricManager::instance().reset_allocated_mem_size();
+        RebuildCacheTotalAccounting();
+        for (auto& segment_name : segment_names) {
+            MasterMetricManager::instance().reset_segment_allocated_mem_size(
+                segment_name);
+        }
+
+        for (auto& shard : metadata_shards_) {
+            for (auto& [tenant_id, tenant_state] : shard.tenants) {
+                for (auto it = tenant_state.metadata.begin();
+                     it != tenant_state.metadata.end();) {
+                    for (auto& replica : it->second.GetAllReplicas()) {
+                        if (!replica.get_descriptor().is_memory_replica()) {
+                            continue;
+                        }
+                        auto temp_segment_names = replica.get_segment_names();
+                        if (temp_segment_names.empty()) {
+                            continue;
+                        }
+                        if (!temp_segment_names[0].has_value()) {
+                            continue;
+                        }
+                        auto buffer_descriptor = replica.get_descriptor()
+                                                     .get_memory_descriptor()
+                                                     .buffer_descriptor;
+                        MasterMetricManager::instance().inc_allocated_mem_size(
+                            temp_segment_names[0].value(),
+                            static_cast<int64_t>(buffer_descriptor.size_));
+                    }
+                    ++it;
+                }
+            }
+        }
+
+        LOG(INFO) << "[Restore] Total allocated size after restore: "
+                  << MasterMetricManager::instance().get_allocated_mem_size();
+    }
+
+    // Rebuild total capacity metrics
+    {
+        MasterMetricManager::instance().reset_total_mem_capacity();
+        for (auto& segment_name : segment_names) {
+            MasterMetricManager::instance().reset_segment_total_mem_capacity(
+                segment_name);
+        }
+
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
+        std::vector<std::pair<Segment, UUID>> unready_segments;
+        if (segment_access.GetUnreadySegments(unready_segments) ==
+            ErrorCode::OK) {
+            for (const auto& [segment, client_id] : unready_segments) {
+                UnmountSegment(segment.id, client_id);
+            }
+        }
+
+        std::vector<std::pair<Segment, UUID>> all_segments;
+        auto err = segment_access.GetAllSegments(all_segments);
+
+        if (err == ErrorCode::OK) {
+            int64_t total_size = 0;
+            for (const auto& [segment, client_id] : all_segments) {
+                Ping(client_id);
+                total_size += static_cast<int64_t>(segment.size);
+                MasterMetricManager::instance().inc_total_mem_capacity(
+                    segment.name, segment.size);
+            }
+            LOG(INFO) << "[Restore] Total capacity size after restore: "
+                      << total_size;
+        } else {
+            LOG(ERROR) << "[Restore] Failed to get all segments, error: "
+                       << err;
+        }
+    }
+
+    return {};
 }
 
 ha::SnapshotCatalogStore* MasterService::GetSnapshotCatalogStore() {
