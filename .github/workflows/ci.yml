@@ -261,6 +261,14 @@ jobs:
           echo "✅ Coverage collected successfully"
         fi
 
+    - name: Test mooncake conductor (C++)
+      run: |
+        cd mooncake-conductor
+        cmake -S . -B build -DBUILD_UNIT_TESTS=ON
+        cmake --build build -j4
+        ./build/tests/conductor_test
+      shell: bash
+
     - name: Generate Python version tag
       id: generate_tag_build
       run: |
