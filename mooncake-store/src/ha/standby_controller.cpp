@@ -31,6 +31,11 @@ std::unique_ptr<HotStandbyService> CreateStandbyService(
         .enable_verification = false,
         .enable_snapshot_bootstrap = config.enable_snapshot_restore,
         .enable_oplog_following = capabilities.has_oplog_following,
+        .oplog_store_type = config.oplog_store_type.empty()
+                                ? kDefaultOpLogStoreType
+                                : ParseOpLogStoreType(config.oplog_store_type),
+        .oplog_store_root_dir = config.oplog_store_root_dir,
+        .oplog_poll_interval_ms = config.oplog_poll_interval_ms,
     });
 }
 

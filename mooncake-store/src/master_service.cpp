@@ -14,6 +14,7 @@
 #include <random>
 #include <shared_mutex>
 #include <sstream>
+#include <stdexcept>
 #include <thread>
 #include <regex>
 #include <unordered_set>
@@ -418,6 +419,56 @@ MasterService::MasterService(const MasterServiceConfig& config)
             ? kDefaultOpLogStoreType
             : ParseOpLogStoreType(config.oplog_store_type);
 
+    if (enable_ha_ && !cluster_id_.empty()) {
+        if (use_batch_oplog_) {
+#ifdef STORE_USE_ETCD
+            if (ha_backend_connstring_.empty()) {
+                LOG(INFO) << "Skipping automatic batch-record OpLog writer "
+                             "initialization; no HA backend connstring "
+                             "configured";
+            } else {
+                ErrorCode connect_err = EtcdHelper::ConnectToEtcdStoreClient(
+                    ha_backend_connstring_.c_str());
+                if (connect_err != ErrorCode::OK) {
+                    throw std::runtime_error(fmt::format(
+                        "failed to connect HA batch-record OpLog writer to "
+                        "etcd: {}",
+                        toString(connect_err)));
+                }
+                auto backend = std::make_shared<EtcdHaKvBackend>();
+                ErrorCode err = InitializeBatchOpLogWriter(std::move(backend));
+                if (err != ErrorCode::OK) {
+                    throw std::runtime_error(fmt::format(
+                        "failed to create HA batch-record OpLog writer: {}",
+                        toString(err)));
+                }
+            }
+#else
+            throw std::runtime_error(
+                "failed to create HA batch-record OpLog writer: ETCD support "
+                "not compiled in");
+#endif
+        } else {
+            auto store = OpLogStoreFactory::Create(
+                configured_oplog_store_type, cluster_id_,
+                OpLogStoreRole::WRITER, config.oplog_store_root_dir,
+                config.oplog_poll_interval_ms);
+            if (store) {
+                auto unique_store = std::move(store);
+                std::shared_ptr<OpLogStore> shared_store(
+                    std::move(unique_store));
+                oplog_store_ = shared_store;
+                oplog_manager_.SetOpLogStore(oplog_store_);
+                uint64_t max_seq = 0;
+                if (oplog_store_->GetMaxSequenceId(max_seq) == ErrorCode::OK) {
+                    oplog_manager_.SetInitialSequenceId(max_seq);
+                }
+            } else {
+                LOG(WARNING) << "failed to create HA OpLog writer";
+            }
+        }
+    }
+
     eviction_running_ = true;
     eviction_thread_ = std::thread(&MasterService::EvictionThreadFunc, this);
     VLOG(1) << "action=start_eviction_thread";
@@ -450,41 +501,6 @@ MasterService::MasterService(const MasterServiceConfig& config)
     job_dispatch_thread_ =
         std::thread(&MasterService::JobDispatchThreadFunc, this);
     VLOG(1) << "action=start_job_dispatch_thread";
-
-    if (enable_ha_ && !cluster_id_.empty()) {
-        if (use_batch_oplog_) {
-#ifdef STORE_USE_ETCD
-            auto backend = std::make_shared<EtcdHaKvBackend>();
-            ErrorCode err = InitializeBatchOpLogWriter(std::move(backend));
-            if (err != ErrorCode::OK) {
-                LOG(WARNING)
-                    << "failed to create HA batch-record OpLog writer, err="
-                    << static_cast<int>(err);
-            }
-#else
-            LOG(WARNING) << "failed to create HA batch-record OpLog writer: "
-                            "ETCD support not compiled in";
-#endif
-        } else {
-            auto store = OpLogStoreFactory::Create(
-                configured_oplog_store_type, cluster_id_,
-                OpLogStoreRole::WRITER, config.oplog_store_root_dir,
-                config.oplog_poll_interval_ms);
-            if (store) {
-                auto unique_store = std::move(store);
-                std::shared_ptr<OpLogStore> shared_store(
-                    std::move(unique_store));
-                oplog_store_ = shared_store;
-                oplog_manager_.SetOpLogStore(oplog_store_);
-                uint64_t max_seq = 0;
-                if (oplog_store_->GetMaxSequenceId(max_seq) == ErrorCode::OK) {
-                    oplog_manager_.SetInitialSequenceId(max_seq);
-                }
-            } else {
-                LOG(WARNING) << "failed to create HA OpLog writer";
-            }
-        }
-    }
 
     if (enable_ha_) {
         pending_mutations_running_.store(true);

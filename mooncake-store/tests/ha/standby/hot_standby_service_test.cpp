@@ -15,9 +15,14 @@
 #include "master_service.h"
 #include "ha/kv/ha_kv_backend.h"
 #include "ha/oplog/oplog_batch_codec.h"
+#include "ha/oplog/oplog_batch_storage.h"
 #include "ha/oplog/oplog_manager.h"
 #include "ha/oplog/oplog_store_factory.h"
 #include "ha/oplog/mock_oplog_store.h"
+#ifdef STORE_USE_ETCD
+#include "etcd_helper.h"
+#include "ha/kv/etcd_ha_kv_backend.h"
+#endif
 
 namespace mooncake::test {
 
@@ -638,6 +643,54 @@ class PromotionCatchUpTest : public HotStandbyServiceTest {
 
     std::shared_ptr<MockOpLogStore> mock_store_;
 };
+
+#ifdef STORE_USE_ETCD
+TEST_F(HotStandbyServiceTest,
+       BatchRecordStandbyPollsDurablePrefixInReplicationLoop) {
+    const std::string etcd_endpoints = "127.0.0.1:2379";
+    auto connect_err =
+        EtcdHelper::ConnectToEtcdStoreClient(etcd_endpoints.c_str());
+    if (connect_err != ErrorCode::OK) {
+        GTEST_SKIP() << "etcd is unavailable: " << toString(connect_err);
+    }
+
+    const std::string cluster_id =
+        "batch-standby-loop-" + UuidToString(generate_uuid());
+    EtcdHaKvBackend backend;
+    OpLogBatchStorage storage(cluster_id, backend);
+    DurablePrefix prefix;
+    auto init_err = storage.InitDurablePrefix(prefix);
+    if (init_err != ErrorCode::OK) {
+        GTEST_SKIP() << "etcd is unavailable: " << toString(init_err);
+    }
+    ASSERT_EQ(ErrorCode::OK,
+              storage.WriteBatchAndAdvancePrefix(
+                  MakeBatch(prefix.batch_id + 1, prefix.last_seq + 1,
+                            prefix.last_seq + 1),
+                  prefix));
+
+    HotStandbyConfig config = config_;
+    config.oplog_store_type = OpLogStoreType::ETCD_BATCH_RECORD;
+    config.enable_snapshot_bootstrap = false;
+    config.enable_oplog_following = true;
+    config.oplog_poll_interval_ms = 10;
+
+    auto service = std::make_unique<HotStandbyService>(config);
+    ASSERT_EQ(ErrorCode::OK,
+              service->Start("primary_unused", etcd_endpoints, cluster_id));
+
+    const uint64_t expected_seq = prefix.last_seq + 1;
+    constexpr int kMaxAttempts = 100;
+    for (int i = 0; i < kMaxAttempts &&
+                    service->GetLatestAppliedSequenceId() < expected_seq;
+         ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+
+    EXPECT_GE(service->GetLatestAppliedSequenceId(), expected_seq);
+    service->Stop();
+}
+#endif
 
 TEST_F(PromotionCatchUpTest, EmptyReadBeforeMaxFailsClosed) {
     for (uint64_t s = 1; s <= 5; ++s) {

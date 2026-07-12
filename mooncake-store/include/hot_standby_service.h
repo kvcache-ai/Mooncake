@@ -27,6 +27,7 @@ namespace mooncake {
 class MasterService;
 class ReplicationStream;
 class HaKvBackend;
+class OpLogBatchStandbyReader;
 
 /**
  * @brief Configuration for HotStandbyService
@@ -330,6 +331,8 @@ class HotStandbyService {
     std::shared_ptr<OpLogStore> watcher_oplog_store_;
     std::unique_ptr<OpLogChangeNotifier> oplog_change_notifier_;
     std::unique_ptr<OpLogReplicator> oplog_replicator_;
+    std::shared_ptr<HaKvBackend> batch_standby_kv_backend_;
+    std::unique_ptr<OpLogBatchStandbyReader> batch_standby_reader_;
 
     std::shared_ptr<OpLogStore> catch_up_oplog_store_for_testing_;
     std::shared_ptr<HaKvBackend> catch_up_batch_kv_backend_for_testing_;

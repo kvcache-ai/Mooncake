@@ -17,6 +17,7 @@
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "ha/snapshot/snapshot_constants.h"
 #include "ha/snapshot/snapshot_logger.h"
+#include "ha/oplog/oplog_batch_storage.h"
 #include "serialize/serializer.h"
 #include "segment.h"
 #include "task_manager.h"
@@ -379,6 +380,30 @@ MasterSnapshotManager::ResolveSnapshotSequenceId() const {
         ErrorCode::UNAVAILABLE_IN_CURRENT_MODE,
         "etcd snapshot sequence resolution is unavailable in this build"));
 #else
+    if (master_service_->use_batch_oplog_) {
+        if (!master_service_->batch_oplog_storage_) {
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::INTERNAL_ERROR,
+                "batch-record snapshot sequence resolution requires batch "
+                "OpLog storage"));
+        }
+        DurablePrefix prefix;
+        ErrorCode err =
+            master_service_->batch_oplog_storage_->ReadDurablePrefix(prefix);
+        if (err == ErrorCode::ETCD_KEY_NOT_EXIST ||
+            err == ErrorCode::OPLOG_ENTRY_NOT_FOUND) {
+            return ha::OpLogSequenceId{0};
+        }
+        if (err != ErrorCode::OK) {
+            return tl::make_unexpected(SerializationError(
+                err,
+                fmt::format(
+                    "failed to resolve batch snapshot sequence boundary: {}",
+                    toString(err))));
+        }
+        return static_cast<ha::OpLogSequenceId>(prefix.last_seq);
+    }
+
     auto oplog_store = GetSnapshotBoundaryOpLogStore();
     if (!oplog_store) {
         return tl::make_unexpected(oplog_store.error());

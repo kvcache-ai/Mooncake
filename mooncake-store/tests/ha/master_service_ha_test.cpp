@@ -11,6 +11,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -507,6 +508,21 @@ class MasterServiceHATest : public ::testing::Test {
 };
 
 class MasterServiceBatchRecordE2ETest : public MasterServiceHATest {};
+
+TEST_F(MasterServiceBatchRecordE2ETest,
+       BatchRecordConstructorThrowsWhenProductionWriterInitFails) {
+    auto service_config =
+        MasterServiceConfig::builder()
+            .set_enable_ha(true)
+            .set_cluster_id("test_batch_record_writer_init_fail")
+            .set_ha_backend_type("etcd")
+            .set_ha_backend_connstring("127.0.0.1:1")
+            .set_oplog_store_type("etcd_batch_record")
+            .build();
+
+    EXPECT_THROW(
+        { MasterService service(service_config); }, std::runtime_error);
+}
 
 TEST_F(MasterServiceHATest, GetReplicaListClassifiesRemovedReplicaStates) {
     auto service_config = MasterServiceConfig::builder()
@@ -1494,7 +1510,7 @@ TEST_F(MasterServiceBatchRecordE2ETest,
 }
 
 TEST_F(MasterServiceBatchRecordE2ETest,
-       ProcessingOnlyObjectReturnsReplicaIsNotReady) {
+       ProcessingOnlyObjectExistKeyReturnsFalse) {
     const std::string cluster_id = "test_batch_record_e2e_processing_only";
     auto backend = std::make_shared<FakeBatchHaKvBackend>();
     auto service_config = MasterServiceConfig::builder()
@@ -1525,8 +1541,8 @@ TEST_F(MasterServiceBatchRecordE2ETest,
     EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, replicas.error());
 
     auto exists = service.ExistKey(key, kDefaultTenant);
-    ASSERT_FALSE(exists.has_value());
-    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, exists.error());
+    ASSERT_TRUE(exists.has_value());
+    EXPECT_FALSE(exists.value());
 }
 
 TEST_F(MasterServiceBatchRecordE2ETest,

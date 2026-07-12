@@ -179,8 +179,9 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
     cluster_id_ = cluster_id;
 
     if (config_.enable_oplog_following) {
-        // Connect to etcd only when using ETCD backend
-        if (config_.oplog_store_type == OpLogStoreType::ETCD) {
+        // Connect to etcd only when using ETCD-backed OpLog modes.
+        if (config_.oplog_store_type == OpLogStoreType::ETCD ||
+            config_.oplog_store_type == OpLogStoreType::ETCD_BATCH_RECORD) {
 #ifdef STORE_USE_ETCD
             ErrorCode err =
                 EtcdHelper::ConnectToEtcdStoreClient(oplog_endpoints.c_str());
@@ -328,9 +329,14 @@ ErrorCode HotStandbyService::LoadSnapshotBaselineLocked(
 
 ErrorCode HotStandbyService::StartOplogFollowingLocked(
     uint64_t baseline_seq_id) {
+    const bool batch_record_mode =
+        config_.oplog_store_type == OpLogStoreType::ETCD_BATCH_RECORD;
+    const OpLogStoreType legacy_reader_type =
+        batch_record_mode ? OpLogStoreType::ETCD : config_.oplog_store_type;
+
     // Create OpLogStore, OpLogChangeNotifier, and OpLogReplicator via factory
     watcher_oplog_store_ = OpLogStoreFactory::Create(
-        config_.oplog_store_type, cluster_id_, OpLogStoreRole::READER,
+        legacy_reader_type, cluster_id_, OpLogStoreRole::READER,
         config_.oplog_store_root_dir, config_.oplog_poll_interval_ms);
     if (watcher_oplog_store_) {
         // Wire OpLogStore into OpLogApplier so gap resolution works
@@ -347,6 +353,16 @@ ErrorCode HotStandbyService::StartOplogFollowingLocked(
         LOG(ERROR) << "Failed to create OpLogChangeNotifier for replicator";
         state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
         return ErrorCode::INTERNAL_ERROR;
+    }
+
+    if (batch_record_mode) {
+        if (catch_up_batch_kv_backend_for_testing_) {
+            batch_standby_kv_backend_ = catch_up_batch_kv_backend_for_testing_;
+        } else {
+            batch_standby_kv_backend_ = std::make_shared<EtcdHaKvBackend>();
+        }
+        batch_standby_reader_ = std::make_unique<OpLogBatchStandbyReader>(
+            cluster_id_, *batch_standby_kv_backend_, *oplog_applier_);
     }
 
     static constexpr int kMaxStartRetries = 3;
@@ -566,7 +582,8 @@ ErrorCode HotStandbyService::FinalCatchUpForPromotionLocked(
         if (used_batch_records || batch_err != ErrorCode::OK) {
             return batch_err;
         }
-    } else if (config_.oplog_store_type == OpLogStoreType::ETCD) {
+    } else if (config_.oplog_store_type == OpLogStoreType::ETCD ||
+               config_.oplog_store_type == OpLogStoreType::ETCD_BATCH_RECORD) {
         EtcdHaKvBackend batch_backend;
         ErrorCode batch_err =
             FinalCatchUpBatchRecordsLocked(batch_backend, used_batch_records);
@@ -579,8 +596,12 @@ ErrorCode HotStandbyService::FinalCatchUpForPromotionLocked(
     if (catch_up_oplog_store_for_testing_) {
         catch_up_store = catch_up_oplog_store_for_testing_;
     } else {
+        const OpLogStoreType legacy_reader_type =
+            config_.oplog_store_type == OpLogStoreType::ETCD_BATCH_RECORD
+                ? OpLogStoreType::ETCD
+                : config_.oplog_store_type;
         auto created = OpLogStoreFactory::Create(
-            config_.oplog_store_type, cluster_id_, OpLogStoreRole::READER,
+            legacy_reader_type, cluster_id_, OpLogStoreRole::READER,
             config_.oplog_store_root_dir, config_.oplog_poll_interval_ms);
         if (!created) {
             LOG(ERROR) << "Failed to create oplog_store for final catch-up";
@@ -940,8 +961,12 @@ void HotStandbyService::ReplicationLoop() {
     // Reuse watcher_oplog_store_ if available, otherwise create a new one.
     std::shared_ptr<OpLogStore> repl_oplog_store = watcher_oplog_store_;
     if (!repl_oplog_store && !cluster_id_.empty()) {
+        const OpLogStoreType legacy_reader_type =
+            config_.oplog_store_type == OpLogStoreType::ETCD_BATCH_RECORD
+                ? OpLogStoreType::ETCD
+                : config_.oplog_store_type;
         repl_oplog_store = OpLogStoreFactory::Create(
-            config_.oplog_store_type, cluster_id_, OpLogStoreRole::READER,
+            legacy_reader_type, cluster_id_, OpLogStoreRole::READER,
             config_.oplog_store_root_dir, config_.oplog_poll_interval_ms);
         if (!repl_oplog_store) {
             LOG(ERROR) << "Failed to create oplog_store in replication loop";
@@ -956,6 +981,22 @@ void HotStandbyService::ReplicationLoop() {
             // Not connected - wait a bit before checking again
             std::this_thread::sleep_for(std::chrono::seconds(1));
             continue;
+        }
+
+        if (batch_standby_reader_) {
+            auto result = batch_standby_reader_->PollOnce();
+            if (result.error != ErrorCode::OK) {
+                LOG(ERROR) << "Batch-record standby poll failed, err="
+                           << static_cast<int>(result.error);
+                state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
+                continue;
+            }
+            if (!result.used_legacy_path) {
+                const uint64_t current_primary = primary_seq_id_.load();
+                if (result.durable_prefix.last_seq > current_primary) {
+                    primary_seq_id_.store(result.durable_prefix.last_seq);
+                }
+            }
         }
 
         // Update applied_seq_id from OpLogApplier
@@ -974,7 +1015,10 @@ void HotStandbyService::ReplicationLoop() {
             uint64_t latest_seq = 0;
             ErrorCode err = repl_oplog_store->GetLatestSequenceId(latest_seq);
             if (err == ErrorCode::OK) {
-                primary_seq_id_.store(latest_seq);
+                const uint64_t current_primary = primary_seq_id_.load();
+                if (latest_seq > current_primary) {
+                    primary_seq_id_.store(latest_seq);
+                }
             }
         }
 
