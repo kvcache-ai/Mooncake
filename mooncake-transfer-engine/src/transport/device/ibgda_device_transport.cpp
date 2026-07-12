@@ -335,12 +335,14 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     int allocateControlBuffer(bool host_backed) {
         ctrl_buf_host_ = host_backed;
         if (ctrl_buf_host_) {
-            int ret = posix_memalign(&ctrl_buf_, 4096, kCtrlBufSize);
+            void* ptr = nullptr;
+            int ret = posix_memalign(&ptr, 4096, kCtrlBufSize);
             if (ret != 0) {
                 LOG(ERROR) << "[EP IBGDA] posix_memalign ctrl_buf failed: "
                            << ret;
                 return -1;
             }
+            ctrl_buf_ = ptr;
             std::memset(ctrl_buf_, 0, kCtrlBufSize);
 
             cudaError_t err = cudaHostRegister(
