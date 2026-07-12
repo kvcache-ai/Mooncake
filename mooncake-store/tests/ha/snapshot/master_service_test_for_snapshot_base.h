@@ -160,6 +160,13 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
 
     // ==================== Snapshot Helper Methods ====================
 
+    static void StopEvictionThread(MasterService* service) {
+        service->eviction_running_ = false;
+        if (service->eviction_thread_.joinable()) {
+            service->eviction_thread_.join();
+        }
+    }
+
     // Wrapper method: Call MasterSnapshotManager's PersistState through
     // MasterService This class is a friend of MasterService, so it can access
     // private members
@@ -759,6 +766,8 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
 
     // Test snapshot and restore functionality
     void TestSnapshotAndRestore(std::unique_ptr<MasterService>& service) {
+        StopEvictionThread(service.get());
+
         // ========== Phase 1: Manually persist metadata ==========
         std::string snapshot_id1 = GenerateSnapshotId();
         auto persist_result1 = CallPersistState(service.get(), snapshot_id1);
@@ -769,7 +778,10 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         std::string backup_id = snapshot_id1 + "_backup";
         CopySnapshotToBackup(snapshot_id1, backup_id);
 
-        // ========== Phase 3: Restart MasterService in Restore mode ==========
+        // ========== Phase 3: Capture source state ==========
+        ServiceStateSnapshot state_before = CaptureServiceState(service.get());
+
+        // ========== Phase 4: Restart MasterService in Restore mode ==========
         // Inherit key configurations from original service (e.g., root_fs_dir
         // for SSD support)
         ::setenv("MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP", "1", 1);
@@ -778,13 +790,20 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
                 .set_memory_allocator(BufferAllocatorType::OFFSET)
                 .set_enable_snapshot_restore(true)
                 .set_snapshot_object_store_type("local")
+                .set_default_kv_lease_ttl(service->default_kv_lease_ttl_)
+                .set_default_kv_soft_pin_ttl(service->DefaultKvSoftPinTtl())
+                .set_allow_evict_soft_pinned_objects(
+                    service->allow_evict_soft_pinned_objects_)
+                .set_eviction_ratio(0.0)
+                .set_eviction_high_watermark_ratio(1.0)
                 .set_root_fs_dir(service->root_fs_dir_)
                 .build();
         std::unique_ptr<MasterService> restored_service(
             new MasterService(restore_config));
+        StopEvictionThread(restored_service.get());
         ::unsetenv("MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP");
 
-        // ========== Phase 4: Persist restored metadata again ==========
+        // ========== Phase 5: Persist restored metadata again ==========
         std::string snapshot_id2 = GenerateSnapshotId();
         auto persist_result2 =
             CallPersistState(restored_service.get(), snapshot_id2);
@@ -792,15 +811,10 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
             << "Failed to persist restored state: "
             << persist_result2.error().message;
 
-        // ========== Phase 5: Compare two metadata snapshots ==========
+        // ========== Phase 6: Compare two metadata snapshots ==========
         bool snapshots_match = CompareSnapshotDirectories(
             GetBackupDir(backup_id), GetSnapshotDir(snapshot_id2));
         EXPECT_TRUE(snapshots_match);
-
-        // ========== Phase 6: Capture state before snapshot ==========
-        // Note: Capture state after snapshot to avoid internal state changes
-        // affecting comparison
-        ServiceStateSnapshot state_before = CaptureServiceState(service.get());
 
         // ========== Phase 7: Capture state after restore ==========
         ServiceStateSnapshot state_after =

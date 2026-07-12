@@ -21,9 +21,12 @@
 #include <ylt/util/expected.hpp>
 #include <ylt/util/tl/expected.hpp>
 
+#include "adaptive_cache_scheduler.h"
 #include "allocation_strategy.h"
+#include "bloom_filter.h"
 #include "count_min_sketch.h"
 #include "deadline_scheduler.h"
+#include "prefix_radix_tree.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
 #include "segment.h"
@@ -906,6 +909,12 @@ class MasterService {
         const std::string tenant_id;
         const std::string user_key;
 
+        // Deferred lease touch: set by read paths (lock-free), flushed by
+        // eviction/removal paths. The timestamp preserves TTL semantics even
+        // when the flush happens after the original access.
+        mutable std::atomic<bool> recently_accessed{false};
+        mutable std::atomic<int64_t> recent_access_ms{0};
+
         mutable SpinLock lock;
         // Default constructor, creates a time_point representing
         // the Clock's epoch (i.e., time_since_epoch() is zero).
@@ -1089,6 +1098,42 @@ class MasterService {
             }
         }
 
+        /// Mark as recently accessed (lock-free, used by GetReplicaList).
+        /// The eviction thread calls FlushDeferredLease() to convert this
+        /// flag into an actual lease extension.
+        void TouchDeferred() const {
+            const auto now = std::chrono::system_clock::now();
+            const auto now_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now.time_since_epoch())
+                    .count();
+            recent_access_ms.store(now_ms, std::memory_order_relaxed);
+            recently_accessed.store(true, std::memory_order_relaxed);
+        }
+
+        /// Flush deferred access: if recently_accessed is set, grant a lease
+        /// and clear the flag. Called by eviction thread (holds shard lock).
+        void FlushDeferredLease(const uint64_t ttl,
+                                const uint64_t soft_ttl) const {
+            if (recently_accessed.exchange(false, std::memory_order_relaxed)) {
+                const auto access_ms =
+                    recent_access_ms.load(std::memory_order_relaxed);
+                const auto access_time =
+                    access_ms > 0 ? std::chrono::system_clock::time_point(
+                                        std::chrono::milliseconds(access_ms))
+                                  : std::chrono::system_clock::now();
+                SpinLocker locker(&lock);
+                lease_timeout =
+                    std::max(lease_timeout,
+                             access_time + std::chrono::milliseconds(ttl));
+                if (soft_pin_timeout) {
+                    soft_pin_timeout = std::max(
+                        *soft_pin_timeout,
+                        access_time + std::chrono::milliseconds(soft_ttl));
+                }
+            }
+        }
+
         bool NeedsLeaseRefresh(const uint64_t ttl,
                                const uint64_t soft_ttl) const {
             SpinLocker locker(&lock);
@@ -1237,6 +1282,19 @@ class MasterService {
     };
     std::array<MetadataShard, kNumShards> metadata_shards_;
 
+    // Counting Bloom Filter for fast negative lookups in ExistKey/Query.
+    // 4M slots supports fast negative lookups under KVCache churn.
+    // Keys are added when metadata is created and removed on eviction/erase.
+    BloomFilter bloom_filter_{1 << 22, 3};
+
+    // Prefix-aware Radix Tree index for prefix matching queries.
+    // Enables LongestPrefixMatch in GetReplicaList when exact key is not found.
+    // This allows the Store to return the best available cached prefix for
+    // LLM inference workloads where requests share common prefix tokens
+    // (system prompts, shared conversation context).
+    // Keys are inserted on PutEnd and removed on eviction/erase.
+    PrefixRadixTree prefix_index_;
+
     static bool HasCompletedMemoryCacheReplica(const ObjectMetadata& metadata);
     static bool HasCompletedDiskCacheReplica(const ObjectMetadata& metadata);
     static void SyncCacheTotalAccounting(ObjectMetadata& metadata);
@@ -1382,6 +1440,11 @@ class MasterService {
     // Legacy helper routes plain keys to the default tenant.
     size_t getShardIndex(const std::string& key) const {
         return std::hash<std::string>{}(key) % kNumShards;
+    }
+
+    // Helper to get shard index from precomputed hash (avoids recomputation)
+    size_t getShardIndexFromHash(size_t hash) const {
+        return hash % kNumShards;
     }
 
     size_t getMetadataShardIndex(const std::string& tenant_id,
@@ -1536,8 +1599,9 @@ class MasterService {
     }
 
     // Lease related members
-    const uint64_t default_kv_lease_ttl_;     // in milliseconds
-    const uint64_t default_kv_soft_pin_ttl_;  // in milliseconds
+    const uint64_t default_kv_lease_ttl_;            // in milliseconds
+    std::atomic<uint64_t> default_kv_soft_pin_ttl_;  // in milliseconds (mutable
+                                                     // for adaptive scheduler)
     const bool allow_evict_soft_pinned_objects_;
 
     // Eviction related members
@@ -1545,10 +1609,26 @@ class MasterService {
         false};  // Set to trigger memory eviction when allocation fails
     std::atomic<bool> need_nof_eviction_{
         false};  // Set to trigger NoF eviction when allocation fails
-    const double eviction_ratio_;                     // in range [0.0, 1.0]
-    const double eviction_high_watermark_ratio_;      // in range [0.0, 1.0]
-    const double nof_eviction_ratio_;                 // in range [0.0, 1.0]
-    const double nof_eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
+    std::atomic<double> eviction_ratio_;                 // in range [0.0, 1.0]
+    std::atomic<double> eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
+    const double nof_eviction_ratio_;                    // in range [0.0, 1.0]
+    const double nof_eviction_high_watermark_ratio_;     // in range [0.0, 1.0]
+
+    // Adaptive cache scheduler: dynamically tunes eviction parameters
+    // based on workload patterns (hit rate, access frequency).
+    AdaptiveCacheScheduler adaptive_scheduler_;
+
+    uint64_t DefaultKvSoftPinTtl() const {
+        return default_kv_soft_pin_ttl_.load(std::memory_order_relaxed);
+    }
+
+    double EvictionRatio() const {
+        return eviction_ratio_.load(std::memory_order_relaxed);
+    }
+
+    double EvictionHighWatermarkRatio() const {
+        return eviction_high_watermark_ratio_.load(std::memory_order_relaxed);
+    }
 
     // Eviction thread related members
     std::thread eviction_thread_;
@@ -1669,6 +1749,7 @@ class MasterService {
         }
 
         // Delete current metadata (for PutRevoke or Remove operations)
+        // Also removes from counting bloom filter and prefix index.
         void Erase() NO_THREAD_SAFETY_ANALYSIS {
             service_->EraseMetadata(*tenant_state_, it_, object_id_.tenant_id,
                                     QuotaEraseMode::kFull, &shard_guard_);

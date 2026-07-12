@@ -1,5 +1,5 @@
 [default]
-extend-ignore-words = ["CANN", "ASO", "fre", "wqs", "hsa"]
+extend-ignore-words = ["CANN", "ASO", "fre", "wqs", "hsa", "FPR", "fpr", "Pris"]
 
 [default.extend-words]
 CANN = "CANN"
@@ -10,6 +10,9 @@ wqs = "wqs"
 # ROCm dmabuf MR registration path.
 hsa = "hsa"
 HPE = "HPE"
+FPR = "FPR"
+fpr = "fpr"
+Pris = "Pris"
 
 [files]
 extend-exclude = [
