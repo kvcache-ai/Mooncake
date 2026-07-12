@@ -17,6 +17,7 @@
 #include <bits/stdint-uintn.h>
 #include <glog/logging.h>
 #include <asio/ip/v6_only.hpp>
+#include <asio/steady_timer.hpp>
 
 #include <algorithm>
 #include <cassert>
@@ -26,6 +27,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <optional>
 #include <random>
 
 #include "common.h"
@@ -407,6 +409,25 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     // the transfer becomes terminal.
     bool write_body_in_flight_ = false;
     bool write_abort_requested_ = false;
+    // A v2 status frame is prompt by construction: a READ status precedes
+    // any payload, and a WRITE ack follows at most one chunk's apply after
+    // the body is done. The only peer that never sends one is a legacy
+    // server reached through a stale v2 descriptor — and for requests
+    // shorter than a frame it also keeps the connection open (it streamed
+    // size < 8 bytes of "READ payload" and is waiting for our next header),
+    // so without a deadline both sides wait forever. Bound that wait; the
+    // default is generous so no healthy slow path can trip it, since it only
+    // covers the frame itself, never payload streaming.
+    static int statusFrameTimeoutSec() {
+        const char* env = std::getenv("MC_TCP_STATUS_TIMEOUT_SEC");
+        if (env) {
+            int v = std::atoi(env);
+            if (v > 0) return v;
+        }
+        return 30;
+    }
+    std::optional<asio::steady_timer> status_timer_;
+    bool status_deadline_disarmed_ = false;
     std::function<void(TransferStatusEnum)> on_finalize_;
     // Invoked exactly once per request with clean=true iff the protocol
     // exchange terminated in a well-defined connection state. A socket whose
@@ -426,9 +447,44 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     }
 
    private:
+    // All handlers run on the transport's single io thread, so arm/cancel
+    // and the expiry handler never race. Expiry only closes the socket: the
+    // pending status read then completes with an error and its handler owns
+    // the failure path (including source-buffer quiescence for WRITE).
+    void armStatusDeadline() {
+        auto self(shared_from_this());
+        status_deadline_disarmed_ = false;
+        status_timer_.emplace(socket_->get_executor());
+        status_timer_->expires_after(
+            std::chrono::seconds(statusFrameTimeoutSec()));
+        status_timer_->async_wait([this, self](const asio::error_code& ec) {
+            // The disarmed flag also covers an expiry that was already
+            // queued when cancel() ran (cancel cannot revoke those, and by
+            // then the socket may have been re-pooled).
+            if (ec == asio::error::operation_aborted ||
+                status_deadline_disarmed_) {
+                return;
+            }
+            LOG(ERROR) << "ClientSession: no status frame within "
+                       << statusFrameTimeoutSec()
+                       << "s (peer likely speaks the legacy protocol); "
+                          "dropping connection";
+            if (socket_ && socket_->is_open()) {
+                asio::error_code cec;
+                socket_->close(cec);
+            }
+        });
+    }
+
+    void cancelStatusDeadline() {
+        status_deadline_disarmed_ = true;
+        if (status_timer_) status_timer_->cancel();
+    }
+
     // Single terminal path: finish connection ownership, then report the
     // outcome. Posted so it runs after the invoking callback returns.
     void finalize(TransferStatusEnum status, bool clean) {
+        cancelStatusDeadline();
         auto self(shared_from_this());
         asio::post(
             socket_->get_executor(),
@@ -482,9 +538,11 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     // v2 READ: the server prefixes the data with a status frame.
     void readReadStatus() {
         auto self(shared_from_this());
+        armStatusDeadline();
         asio::async_read(
             *socket_, asio::buffer(&status_frame_, sizeof(status_frame_)),
             [this, self](const asio::error_code& ec, std::size_t len) {
+                cancelStatusDeadline();
                 if (ec || len != sizeof(status_frame_)) {
                     LOG(ERROR)
                         << "ClientSession: failed to read READ status "
@@ -523,6 +581,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         asio::async_read(
             *socket_, asio::buffer(&status_frame_, sizeof(status_frame_)),
             [this, self](const asio::error_code& ec, std::size_t len) {
+                cancelStatusDeadline();
                 if (ec || len != sizeof(status_frame_)) {
                     // The body path may have already finalized a failure and
                     // closed the socket; finalize() is idempotent (moved-from
@@ -655,8 +714,14 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                 // read is already in flight (armed in writeHeader) and may
                 // have finished first.
                 write_body_done_ = true;
-                if (write_acked_ok_)
+                if (write_acked_ok_) {
                     finalize(TransferStatusEnum::COMPLETED, true);
+                } else {
+                    // From here a well-behaved server owes at most one
+                    // chunk's apply plus the frame; a legacy peer behind a
+                    // stale descriptor may owe nothing, ever.
+                    armStatusDeadline();
+                }
             } else {
                 // v1: no acknowledgment exists in the protocol; this only
                 // means the payload left the initiator (#2086).

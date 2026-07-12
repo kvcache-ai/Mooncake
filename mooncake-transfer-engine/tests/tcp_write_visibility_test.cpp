@@ -99,7 +99,12 @@ static_assert(sizeof(TestSessionHeader) == 24,
 // reject the non-status bytes and cancel the body promptly.
 class LegacyReadServer {
    public:
-    LegacyReadServer() {
+    // keep_open=true models the real v1 server loop: after streaming the
+    // "READ payload" it does NOT close, it waits for the next 24-byte
+    // header. For flagged requests shorter than a status frame this is the
+    // configuration that used to hang a v2 initiator forever (fewer than 8
+    // payload bytes ever arrive, no EOF, no deadline).
+    explicit LegacyReadServer(bool keep_open = false) : keep_open_(keep_open) {
         listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
         if (listen_fd_ < 0) return;
         int one = 1;
@@ -167,6 +172,8 @@ class LegacyReadServer {
         timeval timeout{8, 0};
         (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout,
                          sizeof(timeout));
+        (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                         sizeof(timeout));
 
         TestSessionHeader header{};
         if (!recvExact(fd, &header, sizeof(header))) {
@@ -184,12 +191,20 @@ class LegacyReadServer {
             if (n <= 0) break;
             sent += static_cast<uint64_t>(n);
         }
+        if (keep_open_) {
+            // v1 loop: wait for the next header; leaves only when the
+            // client drops the connection (or the test tears down the
+            // listener, which shuts the accepted fd's peer down too).
+            TestSessionHeader next{};
+            (void)recvExact(fd, &next, sizeof(next));
+        }
         close(fd);
     }
 
     int listen_fd_ = -1;
     uint16_t port_ = 0;
     bool ok_ = false;
+    bool keep_open_ = false;
     std::thread thread_;
     std::atomic<bool> saw_flagged_write_{false};
 };
@@ -570,4 +585,54 @@ TEST(TcpWriteVisibilityTest,
 
     legacy_server.join();
     EXPECT_TRUE(legacy_server.sawFlaggedWrite());
+}
+
+// A stale v2 descriptor can also point at a legacy server with a request
+// SHORTER than a status frame (1-7 bytes). The v1 peer treats the flagged
+// opcode as READ, streams fewer than 8 "payload" bytes, and then keeps the
+// connection open waiting for the next header — no EOF ever arrives, and for
+// WRITE it is symmetrically stuck parsing our body bytes as a partial
+// header. Without a status-frame deadline both directions wait forever;
+// with it they must fail, and only after actually waiting the deadline out
+// (an early failure would mean something else broke).
+TEST(TcpWriteVisibilityTest, StaleV2DescriptorShortRequestFailsWithinDeadline) {
+    ScopedEnvVar fast_deadline("MC_TCP_STATUS_TIMEOUT_SEC", "2");
+    const char* env = std::getenv("MC_METADATA_SERVER");
+    std::string metadata_server = env ? env : "P2PHANDSHAKE";
+    EngineHandle h;
+    h.init(metadata_server, "127.0.0.2:17906", 8ull << 20);
+    ASSERT_TRUE(h.ok) << "engine/segment setup failed";
+
+    auto desc = h.engine->getMetadata()->getSegmentDescByID(h.segment_id);
+    ASSERT_NE(desc, nullptr);
+    desc->tcp_proto_version = 2;  // deliberately stale capability advertisement
+
+    char buf[4] = {0x11, 0x22, 0x33, 0x44};
+    for (auto opcode : {TransferRequest::WRITE, TransferRequest::READ}) {
+        // One server per direction: the previous connection was (correctly)
+        // discarded rather than re-pooled, so each request dials anew.
+        LegacyReadServer legacy_server(/*keep_open=*/true);
+        ASSERT_TRUE(legacy_server.ok());
+        desc->tcp_data_port = legacy_server.port();
+
+        TransferRequest r;
+        r.opcode = opcode;
+        r.length = sizeof(buf);
+        r.source = buf;
+        r.target_id = h.segment_id;
+        r.target_offset = h.remote_base;
+
+        auto start = std::chrono::steady_clock::now();
+        EXPECT_EQ(runOne(h.engine.get(), r), TransferStatusEnum::FAILED)
+            << "opcode " << static_cast<int>(opcode);
+        auto elapsed = std::chrono::steady_clock::now() - start;
+        EXPECT_GE(elapsed, std::chrono::seconds(1))
+            << "failure arrived before the status deadline could have fired; "
+               "the wrong path failed (opcode "
+            << static_cast<int>(opcode) << ")";
+        EXPECT_LT(elapsed, std::chrono::seconds(6))
+            << "deadline did not bound the stale-descriptor wait (opcode "
+            << static_cast<int>(opcode) << ")";
+        legacy_server.join();
+    }
 }
