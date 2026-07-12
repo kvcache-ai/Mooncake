@@ -1,5 +1,6 @@
 #include "ha/oplog/oplog_batch_storage.h"
 
+#include <algorithm>
 #include <charconv>
 
 #include <glog/logging.h>
@@ -9,16 +10,6 @@
 
 namespace mooncake {
 namespace {
-
-ErrorCode ParseLatestSequenceId(const std::string& value, uint64_t& out) {
-    const char* begin = value.data();
-    const char* end = begin + value.size();
-    auto result = std::from_chars(begin, end, out);
-    if (result.ec != std::errc() || result.ptr != end) {
-        return ErrorCode::INTERNAL_ERROR;
-    }
-    return ErrorCode::OK;
-}
 
 bool SameBatchRecord(const OpLogBatchRecord& lhs, const OpLogBatchRecord& rhs) {
     if (lhs.schema_version != rhs.schema_version ||
@@ -95,14 +86,8 @@ ErrorCode OpLogBatchStorage::InitDurablePrefix(DurablePrefix& prefix) {
     }
 
     uint64_t latest_seq = 0;
-    std::string latest_value;
-    err = backend_.Get(BuildLatestKey(), latest_value);
-    if (err == ErrorCode::OK) {
-        err = ParseLatestSequenceId(latest_value, latest_seq);
-        if (err != ErrorCode::OK) {
-            return err;
-        }
-    } else if (err != ErrorCode::ETCD_KEY_NOT_EXIST) {
+    err = ReadMaxLegacySequence(latest_seq);
+    if (err != ErrorCode::OK) {
         return err;
     }
 
@@ -231,41 +216,70 @@ ErrorCode OpLogBatchStorage::ReadBatchesAfter(
         return ErrorCode::INVALID_PARAMS;
     }
     auto range = BuildBatchRecordRange(cluster_id_, after_batch_id);
-    std::vector<KvPair> kvs;
-    ErrorCode err =
-        backend_.Range(range.begin_key, range.end_key, /*limit=*/0, kvs);
-    if (err != ErrorCode::OK) {
-        return err;
-    }
-    batches.reserve(kvs.size());
-    for (const auto& kv : kvs) {
-        uint64_t key_batch_id = 0;
-        if (!TryParseBatchIdFromKey(kv.key, key_batch_id)) {
-            continue;
+    std::string begin_key = range.begin_key;
+    do {
+        std::vector<KvPair> kvs;
+        const size_t remaining = limit == 0 ? 0 : limit - batches.size();
+        ErrorCode err =
+            backend_.Range(begin_key, range.end_key, remaining, kvs);
+        if (err != ErrorCode::OK) {
+            return err;
         }
-        OpLogBatchRecord batch;
-        std::string reason;
-        if (!DecodeOpLogBatchRecord(kv.value, &batch, &reason)) {
-            LOG(ERROR) << "Failed to decode OpLog batch record at key="
-                       << kv.key << ": " << reason;
-            return ErrorCode::INTERNAL_ERROR;
+        for (const auto& kv : kvs) {
+            uint64_t key_batch_id = 0;
+            if (!TryParseBatchIdFromKey(kv.key, key_batch_id)) {
+                continue;
+            }
+            OpLogBatchRecord batch;
+            std::string reason;
+            if (!DecodeOpLogBatchRecord(kv.value, &batch, &reason)) {
+                LOG(ERROR) << "Failed to decode OpLog batch record at key="
+                           << kv.key << ": " << reason;
+                return ErrorCode::INTERNAL_ERROR;
+            }
+            if (batch.batch_id != key_batch_id) {
+                LOG(ERROR) << "OpLog batch id does not match key at key="
+                           << kv.key;
+                return ErrorCode::INTERNAL_ERROR;
+            }
+            batches.push_back(std::move(batch));
         }
-        if (batch.batch_id != key_batch_id) {
-            LOG(ERROR) << "OpLog batch id does not match key at key=" << kv.key;
-            return ErrorCode::INTERNAL_ERROR;
-        }
-        batches.push_back(std::move(batch));
-        if (limit != 0 && batches.size() >= limit) {
+        if (limit == 0 || batches.size() >= limit || kvs.size() < remaining) {
             break;
         }
-    }
+        begin_key = kvs.back().key + '\0';
+    } while (begin_key < range.end_key);
     return ErrorCode::OK;
 }
 
 bool OpLogBatchStorage::IsValidClusterId() const { return cluster_id_valid_; }
 
-std::string OpLogBatchStorage::BuildLatestKey() const {
-    return "/oplog/" + cluster_id_ + "/latest";
+ErrorCode OpLogBatchStorage::ReadMaxLegacySequence(uint64_t& sequence_id) {
+    const std::string prefix = "/oplog/" + cluster_id_ + "/";
+    std::vector<KvPair> entries;
+    ErrorCode err =
+        backend_.Range(prefix + "00000000000000000000", prefix + ":",
+                       /*limit=*/0, entries);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+
+    sequence_id = 0;
+    for (const auto& entry : entries) {
+        const std::string_view suffix(entry.key.data() + prefix.size(),
+                                      entry.key.size() - prefix.size());
+        if (suffix.size() != kOpLogBatchIdWidth) {
+            continue;
+        }
+        uint64_t current = 0;
+        auto parsed = std::from_chars(suffix.data(),
+                                      suffix.data() + suffix.size(), current);
+        if (parsed.ec == std::errc() &&
+            parsed.ptr == suffix.data() + suffix.size()) {
+            sequence_id = std::max(sequence_id, current);
+        }
+    }
+    return ErrorCode::OK;
 }
 
 }  // namespace mooncake

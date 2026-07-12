@@ -22,7 +22,8 @@ enum class OpLogStoreType {
 };
 
 #ifdef STORE_USE_ETCD
-static constexpr OpLogStoreType kDefaultOpLogStoreType = OpLogStoreType::ETCD;
+static constexpr OpLogStoreType kDefaultOpLogStoreType =
+    OpLogStoreType::ETCD_BATCH_RECORD;
 #else
 static constexpr OpLogStoreType kDefaultOpLogStoreType =
     OpLogStoreType::LOCAL_FS;

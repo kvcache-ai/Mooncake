@@ -37,6 +37,7 @@ class FakeHaKvBackend : public HaKvBackend {
 
     ErrorCode Range(std::string_view begin_key, std::string_view end_key,
                     size_t limit, std::vector<KvPair>& kvs) override {
+        range_limits_.push_back(limit);
         if (next_range_error_ != ErrorCode::OK) {
             ErrorCode err = next_range_error_;
             next_range_error_ = ErrorCode::OK;
@@ -94,6 +95,7 @@ class FakeHaKvBackend : public HaKvBackend {
     void FailNextGet(ErrorCode err) { next_get_error_ = err; }
     void FailNextRange(ErrorCode err) { next_range_error_ = err; }
     void FailNextTxn(ErrorCode err) { next_txn_error_ = err; }
+    const std::vector<size_t>& range_limits() const { return range_limits_; }
 
    private:
     std::map<std::string, std::string> kvs_;
@@ -104,6 +106,7 @@ class FakeHaKvBackend : public HaKvBackend {
     ErrorCode next_get_error_{ErrorCode::OK};
     ErrorCode next_range_error_{ErrorCode::OK};
     ErrorCode next_txn_error_{ErrorCode::OK};
+    std::vector<size_t> range_limits_;
 };
 
 OpLogEntry MakeEntry(uint64_t seq) {
@@ -135,16 +138,18 @@ OpLogBatchRecord MakeBatch(uint64_t batch_id, uint64_t first_seq,
 
 }  // namespace
 
-TEST(OpLogBatchStorageTest, InitializesDurablePrefixFromLegacyLatest) {
+TEST(OpLogBatchStorageTest, InitializesDurablePrefixFromMaximumLegacyEntry) {
     FakeHaKvBackend backend;
     ASSERT_EQ(ErrorCode::OK, backend.Put("/oplog/clusterA/latest", "42"));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put("/oplog/clusterA/00000000000000000045", "entry"));
     OpLogBatchStorage storage("clusterA", backend);
 
     DurablePrefix prefix;
     EXPECT_EQ(ErrorCode::OK, storage.InitDurablePrefix(prefix));
 
     EXPECT_EQ(0u, prefix.batch_id);
-    EXPECT_EQ(42u, prefix.last_seq);
+    EXPECT_EQ(45u, prefix.last_seq);
     std::string encoded;
     ASSERT_EQ(ErrorCode::OK,
               backend.Get("/oplog/clusterA/durable_prefix", encoded));
@@ -154,9 +159,11 @@ TEST(OpLogBatchStorageTest, InitializesDurablePrefixFromLegacyLatest) {
     EXPECT_EQ(prefix.last_seq, stored.last_seq);
 }
 
-TEST(OpLogBatchStorageTest, NormalizesClusterIdWhenReadingLegacyLatest) {
+TEST(OpLogBatchStorageTest, IgnoresLegacyLatestAboveMaximumEntry) {
     FakeHaKvBackend backend;
-    ASSERT_EQ(ErrorCode::OK, backend.Put("/oplog/clusterA/latest", "42"));
+    ASSERT_EQ(ErrorCode::OK, backend.Put("/oplog/clusterA/latest", "45"));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put("/oplog/clusterA/00000000000000000042", "entry"));
     OpLogBatchStorage storage("clusterA/", backend);
 
     DurablePrefix prefix;
@@ -164,6 +171,18 @@ TEST(OpLogBatchStorageTest, NormalizesClusterIdWhenReadingLegacyLatest) {
 
     EXPECT_EQ(0u, prefix.batch_id);
     EXPECT_EQ(42u, prefix.last_seq);
+}
+
+TEST(OpLogBatchStorageTest, IgnoresLegacyLatestWhenNoEntriesExist) {
+    FakeHaKvBackend backend;
+    ASSERT_EQ(ErrorCode::OK, backend.Put("/oplog/clusterA/latest", "45"));
+    OpLogBatchStorage storage("clusterA", backend);
+
+    DurablePrefix prefix;
+    EXPECT_EQ(ErrorCode::OK, storage.InitDurablePrefix(prefix));
+
+    EXPECT_EQ(0u, prefix.batch_id);
+    EXPECT_EQ(0u, prefix.last_seq);
 }
 
 TEST(OpLogBatchStorageTest, InitDurablePrefixFailsClosedWhenBatchesExist) {
@@ -187,7 +206,6 @@ TEST(OpLogBatchStorageTest, RejectsInvalidClusterId) {
 
 TEST(OpLogBatchStorageTest, RereadsDurablePrefixWhenCreateIfAbsentLosesRace) {
     FakeHaKvBackend backend;
-    ASSERT_EQ(ErrorCode::OK, backend.Put("/oplog/clusterA/latest", "42"));
     backend.CreateBeforeNextTxn(
         "/oplog/clusterA/durable_prefix",
         EncodeDurablePrefix({.batch_id = 7, .last_seq = 99}));
@@ -417,6 +435,9 @@ TEST(OpLogBatchStorageTest, ReadBatchesAfterLimitCountsOnlyBatchKeys) {
     ASSERT_EQ(2u, batches.size());
     EXPECT_EQ(1u, batches[0].batch_id);
     EXPECT_EQ(2u, batches[1].batch_id);
+    ASSERT_EQ(2u, backend.range_limits().size());
+    EXPECT_EQ(2u, backend.range_limits()[0]);
+    EXPECT_EQ(1u, backend.range_limits()[1]);
 }
 
 TEST(OpLogBatchStorageTest, ReadBatchesAfterHonorsLimit) {

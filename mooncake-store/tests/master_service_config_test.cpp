@@ -1,8 +1,17 @@
 #include "master_config.h"
+#include "ha/oplog/oplog_store_factory.h"
 
 #include <gtest/gtest.h>
 
 namespace mooncake::test {
+
+TEST(MasterServiceConfigTest, EmptyOplogStoreTypeUsesDefaultMode) {
+#ifdef STORE_USE_ETCD
+    EXPECT_EQ(OpLogStoreType::ETCD_BATCH_RECORD, ParseOpLogStoreType(""));
+#else
+    EXPECT_EQ(OpLogStoreType::LOCAL_FS, ParseOpLogStoreType(""));
+#endif
+}
 
 TEST(MasterServiceConfigTest, OplogBatchMaxEntriesDefaultsTo1024) {
     MasterConfig master_config;

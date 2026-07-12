@@ -684,19 +684,26 @@ ErrorCode HotStandbyService::FinalCatchUpBatchRecordsLocked(
     HaKvBackend& backend, bool& used_batch_records) {
     used_batch_records = false;
     OpLogBatchStandbyReader reader(cluster_id_, backend, *oplog_applier_);
-    auto result = reader.PollOnce();
-    if (result.used_legacy_path) {
-        return ErrorCode::OK;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    for (;;) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+        }
+        auto result = reader.PollOnce();
+        if (result.used_legacy_path) {
+            return ErrorCode::OK;
+        }
+        used_batch_records = true;
+        if (result.error != ErrorCode::OK ||
+            result.waiting_for_legacy_catch_up) {
+            return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+        }
+        if (GetLocalLastAppliedSequenceIdLocked() >=
+            result.durable_prefix.last_seq) {
+            return ErrorCode::OK;
+        }
     }
-    used_batch_records = true;
-    if (result.error != ErrorCode::OK) {
-        return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
-    }
-    if (GetLocalLastAppliedSequenceIdLocked() <
-        result.durable_prefix.last_seq) {
-        return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
-    }
-    return ErrorCode::OK;
 }
 
 ErrorCode HotStandbyService::FinalCatchUpBestEffortLocked(

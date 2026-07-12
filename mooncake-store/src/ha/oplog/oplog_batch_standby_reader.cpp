@@ -70,7 +70,11 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
             break;
         }
     }
-    if (IsSequenceOlderOrEqual(applier_.GetExpectedSequenceId(),
+    const bool has_more_pages = max_batches != 0 &&
+                                batches.size() >= max_batches &&
+                                last_applied_batch_id_ < prefix.batch_id;
+    if (!has_more_pages &&
+        IsSequenceOlderOrEqual(applier_.GetExpectedSequenceId(),
                                prefix.last_seq)) {
         result.error = ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
     }

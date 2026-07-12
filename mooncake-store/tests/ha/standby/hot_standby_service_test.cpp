@@ -856,6 +856,33 @@ TEST_F(PromotionCatchUpTest, UsesDurablePrefixLastSeqAsCatchUpTarget) {
     EXPECT_EQ(2u, out.oplog_sequence_id);
 }
 
+TEST_F(PromotionCatchUpTest, PaginatesBatchRecords) {
+    constexpr uint64_t kBatchCount = 1025;
+    auto batch_backend = std::make_shared<FakeHaKvBackend>();
+    ASSERT_EQ(
+        ErrorCode::OK,
+        batch_backend->Put(BuildDurablePrefixKey(cluster_id_),
+                           EncodeDurablePrefix({.batch_id = kBatchCount,
+                                                .last_seq = kBatchCount})));
+    for (uint64_t id = 1; id <= kBatchCount; ++id) {
+        ASSERT_EQ(
+            ErrorCode::OK,
+            batch_backend->Put(BuildBatchRecordKey(cluster_id_, id),
+                               EncodeOpLogBatchRecord(MakeBatch(id, id, id))));
+    }
+    service_->SetCatchUpBatchKvBackendForTesting(batch_backend);
+
+    auto err = service_->Start("", oplog_endpoints_, cluster_id_);
+    if (err != ErrorCode::OK) {
+        GTEST_SKIP() << "Service could not reach WATCHING state via LOCAL_FS; "
+                        "skipping promotion test";
+    }
+
+    StandbySnapshot out;
+    ASSERT_EQ(ErrorCode::OK, service_->PromoteAndExportSnapshot(out));
+    EXPECT_EQ(kBatchCount, out.oplog_sequence_id);
+}
+
 TEST_F(PromotionCatchUpTest, FailsPromotionWhenDurablePrefixUnreadable) {
     auto batch_backend = std::make_shared<FakeHaKvBackend>();
     batch_backend->SetGetError(ErrorCode::PERSISTENT_FAIL);
