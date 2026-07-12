@@ -306,7 +306,7 @@ int BarexTransport::registerLocalMemoryBatch(
         if (ret) {
             LOG(ERROR) << "BarexTransport: Failed to register memory: addr "
                        << buffer.addr << " length " << buffer.length;
-            return ERR_ADDRESS_NOT_REGISTERED;
+            return ret;
         }
     }
 
@@ -323,11 +323,16 @@ int BarexTransport::unregisterLocalMemoryBatch(
             }));
     }
 
+    int first_error = 0;
     for (size_t i = 0; i < addr_list.size(); ++i) {
-        if (results[i].get())
+        int ret = results[i].get();
+        if (ret) {
             LOG(WARNING) << "BarexTransport: Failed to unregister memory: addr "
                          << addr_list[i];
+            if (!first_error) first_error = ret;
+        }
     }
+    if (first_error) return first_error;
 
     return metadata_->updateLocalSegmentDesc();
 }

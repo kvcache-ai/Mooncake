@@ -722,7 +722,7 @@ int UBShmemTransport::registerLocalMemoryBatch(
     for (auto &buffer : buffer_list) {
         int rc = registerLocalMemory(buffer.addr, buffer.length, location, true,
                                      false);
-        if (rc < 0) {
+        if (rc) {
             return rc;
         }
     }
@@ -733,7 +733,7 @@ int UBShmemTransport::unregisterLocalMemoryBatch(
     const std::vector<void *> &addr_list) {
     for (auto &addr : addr_list) {
         int rc = unregisterLocalMemory(addr, false);
-        if (rc < 0) {
+        if (rc) {
             return rc;
         }
     }

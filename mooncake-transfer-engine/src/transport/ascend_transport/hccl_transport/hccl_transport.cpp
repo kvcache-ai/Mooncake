@@ -607,14 +607,20 @@ int HcclTransport::allocateLocalSegmentID() {
 int HcclTransport::registerLocalMemoryBatch(
     const std::vector<Transport::BufferEntry> &buffer_list,
     const std::string &location) {
-    for (auto &buffer : buffer_list)
-        registerLocalMemory(buffer.addr, buffer.length, location, true, -1);
+    for (auto &buffer : buffer_list) {
+        int ret = registerLocalMemory(buffer.addr, buffer.length, location,
+                                      true, false);
+        if (ret) return ret;
+    }
     return metadata_->updateLocalSegmentDesc();
 }
 
 int HcclTransport::unregisterLocalMemoryBatch(
     const std::vector<void *> &addr_list) {
-    for (auto &addr : addr_list) unregisterLocalMemory(addr, -1);
+    for (auto &addr : addr_list) {
+        int ret = unregisterLocalMemory(addr, false);
+        if (ret) return ret;
+    }
     return metadata_->updateLocalSegmentDesc();
 }
 

@@ -788,7 +788,7 @@ int TransferEngineImpl::registerLocalMemoryBatch(
 
     for (auto transport : multi_transports_->listTransports()) {
         int ret = transport->registerLocalMemoryBatch(buffer_list, location);
-        if (ret < 0) {
+        if (ret) {
             releaseMemoryRegions(regions);
             return ret;
         }
@@ -802,7 +802,7 @@ int TransferEngineImpl::unregisterLocalMemoryBatch(
     const std::vector<void*>& addr_list) {
     for (auto transport : multi_transports_->listTransports()) {
         int ret = transport->unregisterLocalMemoryBatch(addr_list);
-        if (ret < 0) return ret;
+        if (ret) return ret;
     }
 
     std::unique_lock<std::shared_mutex> lock(mutex_);

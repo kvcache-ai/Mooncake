@@ -366,6 +366,16 @@ TEST_F(TransportTest, FailedRegistrationReleasesReservedRegion) {
               0);
     EXPECT_EQ(engine.unregisterLocalMemory(buffer.data()), 0);
 }
+
+TEST_F(TransportTest, UnregisterLocalMemoryBatchPropagatesTransportError) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    ASSERT_NE(engine.installTransport("tcp", nullptr), nullptr);
+
+    std::array<char, 1> buffer{};
+    EXPECT_EQ(engine.unregisterLocalMemoryBatch({buffer.data()}),
+              ERR_ADDRESS_NOT_REGISTERED);
+}
 }  // namespace mooncake
 
 int main(int argc, char** argv) {

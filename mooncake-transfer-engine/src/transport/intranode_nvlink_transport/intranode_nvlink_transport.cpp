@@ -762,14 +762,20 @@ int IntraNodeNvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
 int IntraNodeNvlinkTransport::registerLocalMemoryBatch(
     const std::vector<Transport::BufferEntry> &buffer_list,
     const std::string &location) {
-    for (auto &buffer : buffer_list)
-        registerLocalMemory(buffer.addr, buffer.length, location, true, false);
+    for (auto &buffer : buffer_list) {
+        int ret = registerLocalMemory(buffer.addr, buffer.length, location,
+                                      true, false);
+        if (ret) return ret;
+    }
     return metadata_->updateLocalSegmentDesc();
 }
 
 int IntraNodeNvlinkTransport::unregisterLocalMemoryBatch(
     const std::vector<void *> &addr_list) {
-    for (auto &addr : addr_list) unregisterLocalMemory(addr, false);
+    for (auto &addr : addr_list) {
+        int ret = unregisterLocalMemory(addr, false);
+        if (ret) return ret;
+    }
     return metadata_->updateLocalSegmentDesc();
 }
 

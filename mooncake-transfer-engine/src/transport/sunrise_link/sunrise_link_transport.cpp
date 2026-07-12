@@ -418,14 +418,19 @@ int SunriseLinkTransport::unregisterLocalMemory(void* addr,
 int SunriseLinkTransport::registerLocalMemoryBatch(
     const std::vector<BufferEntry>& buffer_list, const std::string& location) {
     for (const auto& buffer : buffer_list) {
-        registerLocalMemory(buffer.addr, buffer.length, location, true, false);
+        int ret = registerLocalMemory(buffer.addr, buffer.length, location,
+                                      true, false);
+        if (ret) return ret;
     }
     return metadata_->updateLocalSegmentDesc();
 }
 
 int SunriseLinkTransport::unregisterLocalMemoryBatch(
     const std::vector<void*>& addr_list) {
-    for (auto* addr : addr_list) unregisterLocalMemory(addr, false);
+    for (auto* addr : addr_list) {
+        int ret = unregisterLocalMemory(addr, false);
+        if (ret) return ret;
+    }
     return metadata_->updateLocalSegmentDesc();
 }
 

@@ -636,13 +636,17 @@ int EfaTransport::registerLocalMemoryBatch(
             }));
     }
 
+    int first_error = 0;
     for (size_t i = 0; i < buffer_list.size(); ++i) {
-        if (results[i].get()) {
+        int ret = results[i].get();
+        if (ret) {
             LOG(WARNING) << "EfaTransport: Failed to register memory: addr "
                          << buffer_list[i].addr << " length "
                          << buffer_list[i].length;
+            if (!first_error) first_error = ret;
         }
     }
+    if (first_error) return first_error;
 
     return metadata_->updateLocalSegmentDesc();
 }
@@ -657,11 +661,16 @@ int EfaTransport::unregisterLocalMemoryBatch(
             }));
     }
 
+    int first_error = 0;
     for (size_t i = 0; i < addr_list.size(); ++i) {
-        if (results[i].get())
+        int ret = results[i].get();
+        if (ret) {
             LOG(WARNING) << "EfaTransport: Failed to unregister memory: addr "
                          << addr_list[i];
+            if (!first_error) first_error = ret;
+        }
     }
+    if (first_error) return first_error;
 
     return metadata_->updateLocalSegmentDesc();
 }
