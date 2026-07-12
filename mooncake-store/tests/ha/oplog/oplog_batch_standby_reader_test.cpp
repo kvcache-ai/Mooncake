@@ -199,7 +199,7 @@ TEST(OpLogBatchStandbyReaderTest, AcceptsFirstBatchAtLegacyLatestPlusOne) {
 }
 
 TEST(OpLogBatchStandbyReaderTest,
-     RejectsFirstBatchSequenceGapAfterLegacyLatest) {
+     WaitsWhenLegacyHasNotReachedFirstBatchSequence) {
     FakeHaKvBackend backend;
     ASSERT_EQ(ErrorCode::OK,
               backend.Put(BuildDurablePrefixKey("clusterA"),
@@ -214,8 +214,32 @@ TEST(OpLogBatchStandbyReaderTest,
 
     auto result = reader.PollOnce();
 
-    EXPECT_NE(ErrorCode::OK, result.error);
+    EXPECT_EQ(ErrorCode::OK, result.error);
+    EXPECT_TRUE(result.waiting_for_legacy_catch_up);
     EXPECT_EQ(0u, result.applied_entries);
+    EXPECT_EQ(3u, applier.GetExpectedSequenceId());
+}
+
+TEST(OpLogBatchStandbyReaderTest, FailsWhenLaterBatchHasSequenceGap) {
+    FakeHaKvBackend backend;
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildDurablePrefixKey("clusterA"),
+                          EncodeDurablePrefix({.batch_id = 2, .last_seq = 4})));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildBatchRecordKey("clusterA", 1),
+                          EncodeOpLogBatchRecord(MakeBatch(1, 1, 2))));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildBatchRecordKey("clusterA", 2),
+                          EncodeOpLogBatchRecord(MakeBatch(2, 4, 4))));
+    MockMetadataStore metadata_store;
+    OpLogApplier applier(&metadata_store, "clusterA");
+    OpLogBatchStandbyReader reader("clusterA", backend, applier);
+
+    auto result = reader.PollOnce();
+
+    EXPECT_NE(ErrorCode::OK, result.error);
+    EXPECT_FALSE(result.waiting_for_legacy_catch_up);
+    EXPECT_EQ(2u, result.applied_entries);
     EXPECT_EQ(3u, applier.GetExpectedSequenceId());
 }
 
@@ -288,7 +312,8 @@ TEST(OpLogBatchStandbyReaderTest, BatchRecordModeDoesNotAdvanceAcrossGap) {
     OpLogBatchStandbyReader reader("clusterA", backend, applier);
 
     auto failed = reader.PollOnce();
-    EXPECT_NE(ErrorCode::OK, failed.error);
+    EXPECT_EQ(ErrorCode::OK, failed.error);
+    EXPECT_TRUE(failed.waiting_for_legacy_catch_up);
     EXPECT_EQ(1u, applier.GetExpectedSequenceId());
 
     ASSERT_EQ(ErrorCode::OK,

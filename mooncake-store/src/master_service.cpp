@@ -444,9 +444,15 @@ MasterService::MasterService(const MasterServiceConfig& config)
                 }
             }
 #else
-            throw std::runtime_error(
-                "failed to create HA batch-record OpLog writer: ETCD support "
-                "not compiled in");
+            if (ha_backend_connstring_.empty()) {
+                LOG(INFO) << "Skipping automatic batch-record OpLog writer "
+                             "initialization; no HA backend connstring "
+                             "configured";
+            } else {
+                throw std::runtime_error(
+                    "failed to create HA batch-record OpLog writer: ETCD "
+                    "support not compiled in");
+            }
 #endif
         } else {
             auto store = OpLogStoreFactory::Create(

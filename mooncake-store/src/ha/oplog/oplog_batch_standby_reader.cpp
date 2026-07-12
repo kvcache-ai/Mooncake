@@ -51,6 +51,11 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
                 continue;
             }
             if (IsSequenceNewer(entry.sequence_id, expected)) {
+                if (last_applied_batch_id_ == 0 &&
+                    result.applied_entries == 0) {
+                    result.waiting_for_legacy_catch_up = true;
+                    return result;
+                }
                 result.error = ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
                 return result;
             }

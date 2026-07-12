@@ -985,17 +985,25 @@ void HotStandbyService::ReplicationLoop() {
 
         if (batch_standby_reader_) {
             auto result = batch_standby_reader_->PollOnce();
-            if (result.error != ErrorCode::OK) {
-                LOG(ERROR) << "Batch-record standby poll failed, err="
-                           << static_cast<int>(result.error);
-                state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
-                continue;
-            }
             if (!result.used_legacy_path) {
                 const uint64_t current_primary = primary_seq_id_.load();
                 if (result.durable_prefix.last_seq > current_primary) {
                     primary_seq_id_.store(result.durable_prefix.last_seq);
                 }
+            }
+            if (result.waiting_for_legacy_catch_up) {
+                VLOG(1) << "Batch-record standby waiting for legacy OpLog "
+                           "catch-up to sequence_id="
+                        << oplog_applier_->GetExpectedSequenceId();
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(config_.oplog_poll_interval_ms));
+                continue;
+            }
+            if (result.error != ErrorCode::OK) {
+                LOG(ERROR) << "Batch-record standby poll failed, err="
+                           << static_cast<int>(result.error);
+                state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
+                continue;
             }
         }
 

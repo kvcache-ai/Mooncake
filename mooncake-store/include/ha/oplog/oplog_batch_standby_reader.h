@@ -15,6 +15,7 @@ class OpLogApplier;
 struct OpLogBatchStandbyPollResult {
     ErrorCode error{ErrorCode::OK};
     bool used_legacy_path{false};
+    bool waiting_for_legacy_catch_up{false};
     size_t applied_entries{0};
     DurablePrefix durable_prefix{};
 };
