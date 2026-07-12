@@ -1,0 +1,15 @@
+# ThreadSanitizer suppressions for conductor_test.
+#
+# libzmq is not built with TSAN instrumentation, so TSAN cannot observe
+# its internal synchronization (command pipes between application and IO
+# threads) and reports false-positive races on memory handed off through
+# them. Everything under our own namespaces stays fully checked.
+#
+# Usage: TSAN_OPTIONS="suppressions=$PWD/tsan.supp" ./tests/conductor_test
+race:libzmq.so
+called_from_lib:libzmq.so
+
+# glog (also uninstrumented) computes the GMT offset via libc
+# tzset()/strdup() on first log from each thread; the race is inside
+# libc's timezone cache, not in conductor code.
+race:google::LogMessageTime::CalcGmtOffset

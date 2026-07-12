@@ -1,0 +1,43 @@
+{
+  "cases": [
+    {
+      "input": "",
+      "expected": "17241709254077376921"
+    },
+    {
+      "input": "a",
+      "expected": "15154266338359012955"
+    },
+    {
+      "input": "default",
+      "expected": "14633529491185867926"
+    },
+    {
+      "input": "test-salt",
+      "expected": "3093326237178100292"
+    },
+    {
+      "input": "customer-x",
+      "expected": "1088188355629082276"
+    },
+    {
+      "input": "中文盐值测试",
+      "expected": "6735174366932667753"
+    },
+    {
+      "input": "emoji-🚀-salt",
+      "expected": "12315937581454085048"
+    },
+    {
+      "input": "\n\t special \"chars\" \\ /",
+      "expected": "9156505165659103833"
+    },
+    {
+      "input": "long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-long-salt-0123456789",
+      "expected": "9813968401620399956"
+    }
+  ],
+  "description": "Golden vectors for ContextData seed derivation: seed = xxhash.Sum64String(additionalSalt) = XXH64(bytes(salt), seed=0). Inputs are UTF-8 strings; expected values are XXH64 as decimal strings.",
+  "generator": "GOLDEN_VECTOR_DIR=\u003cdir\u003e go test -run TestExportGoldenVectors ./prefixindex/",
+  "xxhash_module": "github.com/cespare/xxhash/v2 v2.3.0"
+}

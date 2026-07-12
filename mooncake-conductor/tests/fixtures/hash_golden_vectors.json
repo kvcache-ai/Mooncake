@@ -1,0 +1,233 @@
+{
+  "compute_hash_cases": [
+    {
+      "name": "zero_parent_single_zero_token",
+      "parent_hash": "0",
+      "token_ids": [
+        0
+      ],
+      "expected": "17252927351209727994"
+    },
+    {
+      "name": "zero_parent_int32_max",
+      "parent_hash": "0",
+      "token_ids": [
+        2147483647
+      ],
+      "expected": "6389369522363153732"
+    },
+    {
+      "name": "zero_parent_int32_min",
+      "parent_hash": "0",
+      "token_ids": [
+        -2147483648
+      ],
+      "expected": "11922097559946081098"
+    },
+    {
+      "name": "zero_parent_negative_one",
+      "parent_hash": "0",
+      "token_ids": [
+        -1
+      ],
+      "expected": "16245199199750232163"
+    },
+    {
+      "name": "empty_salt_seed_parent_simple_block",
+      "parent_hash": "17241709254077376921",
+      "token_ids": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "expected": "17479108795143759033"
+    },
+    {
+      "name": "test_salt_seed_parent_simple_block",
+      "parent_hash": "3093326237178100292",
+      "token_ids": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "expected": "9426078380181780810"
+    },
+    {
+      "name": "max_uint64_parent",
+      "parent_hash": "18446744073709551615",
+      "token_ids": [
+        42
+      ],
+      "expected": "10811737520595092618"
+    },
+    {
+      "name": "mixed_boundary_tokens",
+      "parent_hash": "1311768467463790320",
+      "token_ids": [
+        1,
+        -1,
+        0,
+        2147483647,
+        -2147483648,
+        7,
+        8,
+        9
+      ],
+      "expected": "14297812555718036751"
+    },
+    {
+      "name": "empty_token_block",
+      "parent_hash": "1",
+      "token_ids": [],
+      "expected": "11468921228449061269"
+    },
+    {
+      "name": "sixteen_token_block",
+      "parent_hash": "14633529491185867926",
+      "token_ids": [
+        100,
+        101,
+        102,
+        103,
+        104,
+        105,
+        106,
+        107,
+        108,
+        109,
+        110,
+        111,
+        112,
+        113,
+        114,
+        115
+      ],
+      "expected": "16676570778039606898"
+    }
+  ],
+  "description": "Golden vectors for conductor computeHash / ComputePrefixHash. computeHash = XXH64(seed=0) over parentHash (8B little-endian) followed by each token id (4B little-endian). Generated from the Go implementation.",
+  "generator": "GOLDEN_VECTOR_DIR=\u003cdir\u003e go test -run TestExportGoldenVectors ./prefixindex/",
+  "prefix_chain_cases": [
+    {
+      "name": "empty_salt_three_blocks",
+      "block_size": 4,
+      "additional_salt": "",
+      "cache_salt": "17241709254077376921",
+      "token_ids": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12
+      ],
+      "expected_chain": [
+        "17479108795143759033",
+        "7381301201260694503",
+        "18337328429285706432"
+      ]
+    },
+    {
+      "name": "test_salt_two_blocks",
+      "block_size": 4,
+      "additional_salt": "test-salt",
+      "cache_salt": "3093326237178100292",
+      "token_ids": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "expected_chain": [
+        "9426078380181780810",
+        "17244436113247910852"
+      ]
+    },
+    {
+      "name": "chinese_salt_negative_tokens",
+      "block_size": 2,
+      "additional_salt": "中文盐值测试",
+      "cache_salt": "6735174366932667753",
+      "token_ids": [
+        -1,
+        -2,
+        -3,
+        -4
+      ],
+      "expected_chain": [
+        "9165633725006739174",
+        "15046282266286516170"
+      ]
+    },
+    {
+      "name": "empty_salt_single_block_bs16",
+      "block_size": 16,
+      "additional_salt": "",
+      "cache_salt": "17241709254077376921",
+      "token_ids": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16
+      ],
+      "expected_chain": [
+        "9404987693367201964"
+      ]
+    },
+    {
+      "name": "partial_trailing_block_dropped",
+      "block_size": 4,
+      "additional_salt": "",
+      "cache_salt": "17241709254077376921",
+      "token_ids": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "expected_chain": [
+        "17479108795143759033"
+      ]
+    },
+    {
+      "name": "zero_block_size_returns_empty",
+      "block_size": 0,
+      "additional_salt": "",
+      "cache_salt": "17241709254077376921",
+      "token_ids": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "expected_chain": []
+    }
+  ],
+  "xxhash_module": "github.com/cespare/xxhash/v2 v2.3.0"
+}
