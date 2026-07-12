@@ -360,3 +360,133 @@ normalizes `BlockStored` and `BlockRemoved` into the internal prefix index.
 Registration metadata supplies fields such as `modelname`, `tenant_id`,
 `instance_id`, `block_size`, and `additionalsalt` when the engine event does
 not carry the full standardized envelope.
+
+### Mooncake Store master publisher
+
+`mooncake_master` can optionally publish RFC #1527 events when
+`enable_kv_events=true`. The publisher binds a ZMQ PUB socket
+(`kv_events_bind_endpoint`) and emits the same three-frame batch format used by
+vLLM/SGLang: empty topic, big-endian sequence number, and a msgpack payload
+`[timestamp, [events], dp_rank]`.
+
+**Per-block events, not global metadata.** Per the
+[Dynamo KV Events for Custom Engines](https://docs.nvidia.com/dynamo/kv-managers/kv-events-for-custom-engines)
+model, each event describes one or more **KV cache blocks** (`seq_hashes`,
+`token_ids`, `parent_hash`, eviction hashes). The master emits **one event per
+Mooncake object key** on `PutEnd` / `Remove` / eviction — each key is treated as
+one pooled block. Block identity comes from the object key (`seq_hashes` when
+the key is decimal/`0x` u64, else `object_key`) and per-object `tenant_id` /
+`medium`. The master does **not** stamp process-wide `model_name`, `block_size`,
+`lora_name`, or `dp_rank` on events; register those dimensions with the indexer
+via `POST /register` (same as decoupled SGLang + storage pool deployments).
+
+Publisher-level config is limited to transport and stream identity:
+`kv_events_bind_endpoint`, `kv_events_backend_id`, and optional compat flags
+(`kv_events_emit_object_key`, `kv_events_emit_legacy_compat`). Legacy master
+flags such as `kv_events_model_name` are retained for compatibility but are not
+written into event payloads.
+
+Each event map uses RFC #1527 field names (`event_type`, `seq_hashes`,
+`backend_id`, `medium`, and so on). When `kv_events_emit_object_key` is enabled
+(default), the map also includes `object_key` with the Mooncake store key so
+Dynamo and other consumers can match on `sha256` + Mooncake key format without
+requiring decimal/`0x` `seq_hash` encoding. When `kv_events_emit_legacy_compat`
+is enabled (default), the map also includes vLLM-compatible aliases such as
+`type` and `block_hashes` so Dynamo relay mode can forward events without an
+adapter.
+
+Object keys may encode the rolling `seq_hash` as a decimal or `0x`-prefixed
+hex string; when `seq_hash` cannot be parsed, events are still published if
+`kv_events_emit_object_key=true` (with an empty `seq_hashes` array). Configure
+`backend_id` to identify the cache owner (for example a per-node storage
+daemon) and register the bind endpoint with the indexer using publisher type
+`Mooncake`.
+
+### Field provenance matrix (SGLang vs master vs indexer registration)
+
+In decoupled deployments (inference workers + Mooncake host/disk pool), the
+global KV indexer merges **three sources of truth**. Use this table when
+splitting publishers or writing PR/integration notes.
+
+**Legend**
+
+| Symbol | Meaning |
+|---|---|
+| **SGLang** | Inference engine ZMQ KV events (`BlockStored` / `BlockRemoved` / `AllBlocksCleared`) |
+| **Master** | `mooncake_master` optional RFC #1527 publisher (`enable_kv_events`) |
+| **Register** | Indexer HTTP `POST /register` (or CLI `--workers`) — not carried on the event wire |
+| **S+M** | Either source may supply; must agree on value for the stream |
+| **—** | Not applicable for that event type |
+
+#### Envelope and stream identity
+
+| Field | SGLang | Master | Register | Notes |
+|---|---|---|---|---|
+| `event_id` | Yes | Yes | — | Each publisher maintains its own monotonic counter per stream. |
+| `timestamp` | Yes | Yes | — | Informational only; not used for ordering. |
+| `event_type` | Yes | Yes | — | `stored` / `removed` / `cleared`. |
+| `model_name` | S+M | — | S+M | Register uses `modelname`. Engine events carry per-block context; master omits (nil). |
+| `block_size` | Yes | — | Yes | Required for token↔block mapping. Register supplies for master publisher. |
+| `additional_salt` | Yes | — | S+M | Register uses `additionalsalt`. Engine per-block; master omits (nil). |
+| `lora_name` | Yes | — | S+M | Per-block on engine events; master has no adapter context. |
+| `tenant_id` | S+M | Yes | Yes | Per-object on master events. Register default `default`. |
+| `backend_id` | S+M | Yes | — | **Master**: storage daemon / pool owner. **SGLang**: often worker id; in decoupled mode prefer master=`daemon`, engine via **Register** `instance_id`. |
+| `medium` | Yes | Partial | — | **SGLang**: `GPU`, `CPU_PINNED`, `DISK`, `EXTERNAL`, etc. **Master**: only `cpu` / `disk` (host/disk pool), never GPU. |
+| `dp_rank` | Yes | — | Yes | Per-batch on engine ZMQ wire. Master batch trailer uses `0`; register dp_rank with indexer. |
+
+#### `stored` payload
+
+| Field | SGLang | Master | Register | Notes |
+|---|---|---|---|---|
+| `seq_hashes` | Yes | Conditional | — | **Required from SGLang** for correct prefix index. Master: single hash when key is decimal/`0x` u64; empty array when only `object_key` is used. |
+| `object_key` | — | Yes | — | Mooncake store key (`kv_events_emit_object_key`, default on). Used by Dynamo for sha256+key matching. |
+| `block_hashes` (legacy) | Yes | Conditional | — | Alias of `seq_hashes` when `kv_events_emit_legacy_compat` is enabled on master. |
+| `parent_hash` | Yes | — | — | Radix parent link; master has no sequence tree. |
+| `parent_block_hash` (legacy) | Yes | — | — | Same as `parent_hash`. |
+| `base_block_idx` | Yes | Partial | — | Depth of first block in batch; master uses `0` for standalone pool blocks. |
+| `token_ids` | Yes | — | — | Required for `/query` by tokens or hash recomputation when engine is non-standard. |
+| `block_size` (in-event) | Yes | — | — | Per-block token count in SGLang `BlockStored`; master uses envelope-level config only. |
+
+#### `removed` payload
+
+| Field | SGLang | Master | Register | Notes |
+|---|---|---|---|---|
+| `seq_hashes` | Yes | Conditional | — | **Required** on wire for strict RFC consumers. Master emits one hash when parseable, else empty with `object_key`. |
+| `base_block_idx` | Yes | — | — | Optional but recommended for observability. |
+
+#### `cleared` payload
+
+| Field | SGLang | Master | Register | Notes |
+|---|---|---|---|---|
+| (no extra fields) | — | — | — | Event is envelope-only. |
+| `cleared` / `AllBlocksCleared` | Yes | — | — | Engine `reset()` / full cache flush. Master does not emit today. |
+
+#### Indexer / router plane (not in KV event JSON)
+
+| Field | SGLang | Master | Register | Notes |
+|---|---|---|---|---|
+| `instance_id` | — | — | Yes | Router-facing schedule target. Distinct from `backend_id`. |
+| `endpoint` | — | — | Yes | ZMQ PUB to subscribe (SGLang or master bind address). |
+| `replay_endpoint` | — | — | Yes | Optional gap replay (engine ROUTER). |
+| `type` | — | — | Yes | Publisher kind: `vLLM`, `SGLang`, `Mooncake`, etc. |
+
+#### Recommended split for Dynamo global KV indexer
+
+```mermaid
+flowchart LR
+  SGLang["SGLang ZMQ"]
+  Master["Mooncake master ZMQ"]
+  Reg["POST /register"]
+  Idx["Global KV indexer"]
+
+  SGLang -->|"GPU + HiCache tiers<br/>tokens, parent_hash, seq_hashes, lora"| Idx
+  Master -->|"Host/Disk pool<br/>backend_id, medium=cpu|disk"| Idx
+  Reg -->|"instance_id, model, block_size"| Idx
+```
+
+| Capability | Primary source |
+|---|---|
+| GPU prefix hits, LoRA-aware hashes, parent chain, multi-block batches | **SGLang** |
+| Pooled host/disk replica visibility | **Master** (if keys encode `seq_hash`) |
+| Request routing target | **Register** (`instance_id`) |
+| Tiered `/query` response (`gpu` / `cpu` / `disk`) | Merge **SGLang** + **Master** events (see RFC #1403) |

@@ -62,6 +62,20 @@ This ensures that:
 - High-priority requests normally never wait behind lower-priority work
 - Low-priority requests eventually get serviced even under continuous high-priority load
 
+**Promotion configuration**:
+
+| Config key | Default | Behavior |
+|---|---|---|
+| `transports/rdma/priority_promotion_timeout_us` | `10000` (10ms) | How long an entry may wait before it is eligible for promotion. |
+| `transports/rdma/priority_promotion_per_entry` | `false` | Selects the promotion policy (see below). |
+
+`priority_promotion_per_entry` controls *which* entries a promotion pass moves up:
+
+- **`false` (default, head-only)**: a pass inspects only the queue head; if the head has timed out, the whole queue is promoted one level. This is the original, lowest-overhead "flush the tier" behavior — coarse, but it never scans the queue.
+- **`true` (per-entry)**: a pass promotes exactly the entries that have themselves timed out, leaving freshly enqueued entries in place, and considers both MEDIUM→HIGH and LOW→MEDIUM in the same tick. This avoids promoting non-starving requests and avoids stalling a starving LOW entry behind an unrelated MEDIUM promotion, at the cost of scanning the drained queue. Behavior is identical to head-only for the all-timed-out / empty cases.
+
+The default is byte-for-byte the historical behavior; set the flag to `true` to opt into finer-grained, fairer promotion.
+
 ### Global Slot Coordination
 
 For multi-process environments, TENT implements global time-sliced coordination using shared memory:

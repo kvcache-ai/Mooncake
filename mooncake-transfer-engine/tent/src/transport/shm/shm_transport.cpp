@@ -132,6 +132,7 @@ void ShmTransport::startTransfer(ShmTask *task, ShmSubBatch *batch) {
     } else {
         task->status_word = TransferStatusEnum::FAILED;
     }
+    batch->notifyProgress();
 }
 
 Status ShmTransport::getTransferStatus(SubBatchRef batch, int task_id,
@@ -262,9 +263,11 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
     RWSpinlock::WriteGuard guard(relocate_lock_);
 
     BufferDesc *buffer;
+    // Owning reference: `buffer` is used after the lambda returns.
+    SegmentDescRef pin;
     auto &segment_manager = metadata_->segmentManager();
-    CHECK_STATUS(
-        segment_manager.withCachedSegment(target_id, [&](SegmentDesc *segment) {
+    CHECK_STATUS(segment_manager.withCachedSegment(
+        target_id, pin, [&](SegmentDesc *segment) {
             buffer = segment->findBuffer(dest_addr, length);
             if (!buffer || buffer->shm_path.empty())
                 return Status::NeedsRefreshCache(

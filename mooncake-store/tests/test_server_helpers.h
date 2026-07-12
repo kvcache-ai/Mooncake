@@ -12,6 +12,7 @@
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 #include "http_metadata_server.h"
+#include "master_admin_service.h"
 #include "master_config.h"
 #include "rpc_service.h"
 #include "types.h"

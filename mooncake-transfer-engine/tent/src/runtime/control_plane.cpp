@@ -226,8 +226,9 @@ Status ControlService::start(uint16_t& port, bool ipv6_) {
 
 void ControlService::onGetSegmentDesc(const std::string_view& request,
                                       std::string& response) {
-    json j = *manager_->getLocal();
-    response = j.dump();
+    // Re-use the cached dump shared across concurrent peer fetches.
+    auto cached = manager_->getLocalDumpedJson();
+    response = *cached;
 }
 
 void ControlService::onBootstrapRdma(const std::string_view& request,
@@ -248,7 +249,7 @@ void ControlService::onSendData(const std::string_view& request,
         return;
     }
     XferDataDesc* desc = (XferDataDesc*)request.data();
-    auto local_desc = manager_->getLocal().get();
+    auto local_desc = manager_->getLocal();
     auto peer_mem_addr = le64toh(desc->peer_mem_addr);
     auto length = le64toh(desc->length);
 
@@ -272,7 +273,7 @@ void ControlService::onRecvData(const std::string_view& request,
         return;
     }
     XferDataDesc* desc = (XferDataDesc*)request.data();
-    auto local_desc = manager_->getLocal().get();
+    auto local_desc = manager_->getLocal();
     auto peer_mem_addr = le64toh(desc->peer_mem_addr);
     auto length = le64toh(desc->length);
 

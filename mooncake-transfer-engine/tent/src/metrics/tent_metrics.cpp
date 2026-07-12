@@ -173,8 +173,8 @@ void TentMetrics::shutdown() {
 void TentMetrics::registerMetrics() {
     // Pre-allocate vectors to avoid reallocation
     counters_.reserve(7);
-    histograms_.reserve(4);
-    histogram_boundaries_.reserve(4);
+    histograms_.reserve(5);
+    histogram_boundaries_.reserve(5);
 
     // Register all counters - add new counters here
     counters_ = {
@@ -186,16 +186,12 @@ void TentMetrics::registerMetrics() {
     // Register all histograms - add new histograms here
     // Note: histogram_boundaries_ must match the order of histograms_
     histograms_ = {
-        &read_latency_,
-        &write_latency_,
-        &read_size_,
-        &write_size_,
+        &read_latency_, &write_latency_, &read_size_,
+        &write_size_,   &deadline_mlu_,
     };
     histogram_boundaries_ = {
-        kLatencyBuckets,
-        kLatencyBuckets,
-        kSizeBuckets,
-        kSizeBuckets,
+        kLatencyBuckets, kLatencyBuckets,     kSizeBuckets,
+        kSizeBuckets,    kMluPerMilleBuckets,
     };
 }
 
@@ -227,6 +223,15 @@ void TentMetrics::recordWriteCompleted(size_t bytes, double latency_seconds) {
         int64_t latency_us = static_cast<int64_t>(latency_seconds * 1000000.0);
         write_latency_.observe(latency_us);
     }
+}
+
+void TentMetrics::recordDeadlineMLU(double mlu) {
+    // Fast path: check runtime switch first
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    if (mlu < 0.0) return;  // defensive: ignore invalid (e.g. window <= 0)
+    // Store in per-mille so the integer histogram can bucket fractional ratios.
+    deadline_mlu_.observe(static_cast<int64_t>(mlu * 1000.0));
 }
 
 void TentMetrics::recordReadFailed(size_t bytes) {
@@ -384,6 +389,7 @@ void TentMetrics::recordWriteCompleted(size_t, double) {}
 void TentMetrics::recordReadFailed(size_t) {}
 void TentMetrics::recordWriteFailed(size_t) {}
 void TentMetrics::recordTransportFailover() {}
+void TentMetrics::recordDeadlineMLU(double) {}
 
 std::string TentMetrics::getPrometheusMetrics() {
     return "# TENT metrics disabled at compile time\n";

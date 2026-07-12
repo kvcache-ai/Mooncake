@@ -242,9 +242,6 @@ MooncakeBackend::MooncakeBackend(
         ctx_.engine, P2PProxy::Options{
                          .is_cpu = isCpu_,
                          .rank = rank_,
-                         // Use max_group_size_ (capacity) rather than the
-                         // initial world size so that P2PProxy can handle
-                         // future peers during elastic extension/recovery.
                          .size = max_group_size_,
                          .cuda_device_index = cuda_device_index,
                          .p2p_timeout_us = &ctx_.p2p_timeout_us,

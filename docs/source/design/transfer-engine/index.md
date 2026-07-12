@@ -256,7 +256,186 @@ The HTTP server should implement three following RESTful APIs, while the metadat
 
 For specific implementation, refer to the demo service implemented in Golang at [mooncake-transfer-engine/example/http-metadata-server](gh-dir:mooncake-transfer-engine/example/http-metadata-server).
 
-## Using Transfer Engine to Your Projects
+## Using Transfer Engine in Your Projects
+
+(using-python-interface)=
+### Using Python Interface
+
+For Python applications, use `mooncake.engine.TransferEngine` directly. Most
+serving-framework users should configure Mooncake through vLLM or SGLang
+instead; this example is for developers who need to call the low-level Transfer
+Engine API.
+
+Install Mooncake from PyPI before running this example. The package selected in
+the [Quick Start installation step](../../getting_started/quick-start.md#installation)
+also provides the Transfer Engine Python bindings and runtime components.
+
+#### Runtime prerequisites
+
+The Python scripts below only import the Python standard library and
+`mooncake.engine`, but the Mooncake package still depends on the system runtime
+libraries used by the transfer stack. On Ubuntu, install them with:
+
+```bash
+sudo apt-get update && sudo apt-get install -y libcurl4 libibverbs1 rdma-core librdmacm1 libnuma1 liburing2
+```
+
+The local TCP example uses `P2PHANDSHAKE`, so it does not require a separate
+metadata service. When using RDMA, make sure RDMA drivers, devices, and device
+permissions are configured; you may need to run with `sudo` or adjust device
+permissions.
+
+The following two-process TCP example keeps the Python-side dependencies minimal
+by using only the Python standard library plus the Mooncake package.
+
+::::{dropdown} Receiver (`receiver.py`)
+
+Save the following as `receiver.py`, then run it in the first terminal:
+
+```python
+import ctypes
+import json
+import socket
+
+from mooncake.engine import TransferEngine
+
+
+HOSTNAME = "localhost"
+METADATA_SERVER = "P2PHANDSHAKE"
+PROTOCOL = "tcp"
+DEVICE_NAME = ""
+BUFFER_SIZE = 1024 * 1024
+
+
+def main():
+    engine = TransferEngine()
+    engine.initialize(HOSTNAME, METADATA_SERVER, PROTOCOL, DEVICE_NAME)
+    session_id = f"{HOSTNAME}:{engine.get_rpc_port()}"
+
+    server_buffer = (ctypes.c_uint8 * BUFFER_SIZE)()
+    server_ptr = ctypes.addressof(server_buffer)
+    server_len = ctypes.sizeof(server_buffer)
+
+    ret = engine.register_memory(server_ptr, server_len)
+    if ret != 0:
+        raise RuntimeError("Mooncake memory registration failed.")
+
+    print(f"Receiver session ID: {session_id}")
+    print(f"Receiver buffer address: {server_ptr}, length: {server_len}")
+
+    listener = None
+    try:
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("0.0.0.0", 5555))
+        listener.listen(1)
+
+        print("Waiting for sender to connect on port 5555...")
+        conn, _ = listener.accept()
+        with conn:
+            payload = {
+                "session_id": session_id,
+                "ptr": server_ptr,
+                "len": server_len,
+            }
+            conn.sendall(json.dumps(payload).encode("utf-8") + b"\n")
+            print("Buffer information sent to sender.")
+
+        input("Press Enter after the sender finishes...")
+        print(f"First byte in receiver buffer: {server_buffer[0]}")
+    finally:
+        ret = engine.unregister_memory(server_ptr)
+        if ret != 0:
+            raise RuntimeError("Mooncake memory deregistration failed.")
+        if listener is not None:
+            listener.close()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+::::
+
+::::{dropdown} Sender (`sender.py`)
+
+Save the following as `sender.py`, then run it in a second terminal:
+
+```python
+import ctypes
+import json
+import socket
+
+from mooncake.engine import TransferEngine
+
+
+HOSTNAME = "localhost"
+METADATA_SERVER = "P2PHANDSHAKE"
+PROTOCOL = "tcp"
+DEVICE_NAME = ""
+BUFFER_SIZE = 1024 * 1024
+
+
+def recv_json_line(sock):
+    chunks = []
+    while True:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        if b"\n" in chunk:
+            break
+    return json.loads(b"".join(chunks).split(b"\n", 1)[0].decode("utf-8"))
+
+
+def main():
+    with socket.create_connection(("localhost", 5555)) as sock:
+        buffer_info = recv_json_line(sock)
+
+    server_session_id = buffer_info["session_id"]
+    server_ptr = buffer_info["ptr"]
+    server_len = buffer_info["len"]
+    print(f"Receiver session ID: {server_session_id}")
+    print(f"Receiver buffer address: {server_ptr}, length: {server_len}")
+
+    engine = TransferEngine()
+    engine.initialize(HOSTNAME, METADATA_SERVER, PROTOCOL, DEVICE_NAME)
+    session_id = f"{HOSTNAME}:{engine.get_rpc_port()}"
+
+    client_buffer = (ctypes.c_uint8 * BUFFER_SIZE)()
+    client_ptr = ctypes.addressof(client_buffer)
+    client_len = ctypes.sizeof(client_buffer)
+    ctypes.memset(client_ptr, 1, client_len)
+
+    ret = engine.register_memory(client_ptr, client_len)
+    if ret != 0:
+        raise RuntimeError("Mooncake memory registration failed.")
+
+    try:
+        print(f"Sender session ID: {session_id}")
+        print("Transferring data to receiver...")
+        ret = engine.transfer_sync_write(
+            server_session_id,
+            client_ptr,
+            server_ptr,
+            min(client_len, server_len),
+        )
+        if ret < 0:
+            raise RuntimeError("Transfer failed.")
+        print("Transfer successful.")
+    finally:
+        ret = engine.unregister_memory(client_ptr)
+        if ret != 0:
+            raise RuntimeError("Mooncake memory deregistration failed.")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+::::
+
+For more Python APIs, see [Transfer Engine Python API](../../python-api-reference/transfer-engine.md).
 
 ### Using C/C++ Interface
 After compiling Mooncake Store, you can move the compiled static library file `libtransfer_engine.a` and the C header file `transfer_engine_c.h` into your own project. There is no need to reference other files under `src/transfer_engine`.
@@ -276,6 +455,7 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_NUM_COMP_CHANNELS_PER_CTX` The number of Completion Channel created per device instance, default value 1
 - `MC_IB_PORT` The IB port number used per device instance, default value 1
 - `MC_IB_TC` Adjust RDMA NIC Traffic Class when switch/NIC defaults differ or for traffic planning. Default value -1
+- `MC_IB_SL` Set the InfiniBand Service Level (0-15) of RDMA QPs. The switch maps SL to a Virtual Lane for QoS isolation, e.g. to steer KV-cache traffic into a different VL than Expert-Parallel all-to-all traffic that shares the same NIC. -1 keeps the default (0). Default value -1
 - `MC_IB_PCI_RELAXED_ORDERING` Setting the PCIe ordering to relaxed for the network adapter sometimes results in better performance. Can set 1 to enable RO function. Default value 0
 - `MC_MLX5_QP_UDP_SPORTS` Comma-separated list of UDP source ports (0-65535) used to override the RoCEv2 UDP source port of each QP, for spreading traffic across different ECMP/LAG paths. QP at index *i* uses `list[i % size]`. Default empty (driver chooses). **Requires** an mlx5 NIC + RoCEv2, and the binary built with `-DUSE_MLX5DV=ON`. Recommend ports in the dynamic range 49152-65535. Example: `MC_MLX5_QP_UDP_SPORTS="49152,49153,49154,49155"`
 - `MC_MLX5_QP_LAG_PORT_BALANCE` Set to `1` or `true` to enable automatic LAG port balancing across bonded physical ports. QP at index *i* is pinned to port `(i % num_lag_ports) + 1`; the number of LAG ports is queried from hardware via `mlx5dv_query_device` at startup and printed in the device log. If the device is not in LAG mode the setting is a no-op. Default: disabled. **Requires** the binary built with `-DUSE_MLX5DV=ON`. Example: `MC_MLX5_QP_LAG_PORT_BALANCE=1`
@@ -291,6 +471,8 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_WORKERS_PER_CTX` The number of asynchronous worker threads corresponding to each device instance
 - `MC_SLICE_SIZE` The segmentation granularity of user requests in Transfer Engine
 - `MC_RETRY_CNT` The maximum number of retries in Transfer Engine
+- `MC_TE_FILTERS` Restrict which RDMA NICs the engine discovers and uses, as a comma-separated allow-list of device names (e.g. `mlx5_bond_0,mlx5_bond_1`). Only the listed NICs are kept; all others are ignored. Unset (default) discovers all NICs. This is the **same env var and semantics as the legacy Transfer Engine's device whitelist** (see below), so a single variable scopes NICs across both engines. Useful on multi-NIC / multi-NUMA hosts to keep the engine (and its rail selection) off NICs that are not routable to the peer.
+- `MC_TE_FILTERS_EXCLUDE` The deny-list counterpart of `MC_TE_FILTERS`: a comma-separated list of device names to exclude from discovery. Ignored if `MC_TE_FILTERS` is set (allow-list takes precedence). Unset (default) excludes nothing. (New; the legacy engine has an allow-list only.)
 - `MC_AUTO_GID_MAX_RETRIES` The maximum number of automatic local GID reprobe retries during classic RDMA handshake recovery. Default value 2. Set to 0 to disable automatic GID retry.
 - `MC_LOG_LEVEL` This option can be set as `TRACE`/`INFO`/`WARNING`/`ERROR` (see [glog doc](https://github.com/google/glog/blob/master/docs/logging.md)), and more detailed logs will be output during runtime
 - `MC_DISABLE_METACACHE` Disable local meta cache to prevent transfer failure due to dynamic memory registrations, which may downgrades the performance
@@ -310,6 +492,7 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_MIN_RPC_PORT` Specifies the minimum port number for RPC service. The default value is 15000.
 - `MC_MAX_RPC_PORT` Specifies the maximum port number for RPC service. The default value is 17000.
 - `MC_PATH_ROUNDROBIN` Use round-robin mode in the RDMA path selection. This may be beneficial for transferring large bulks.
+- `MC_TE_FILTERS` Optional comma-separated whitelist of IB device names (e.g. `mlx5_0,mlx5_2`) for legacy Transfer Engine topology discovery. When unset, all available devices are discovered.
 - `WITH_NVIDIA_PEERMEM` When set to `1`, `ON`, or `TRUE`, Mooncake uses `ibv_reg_mr()` directly for GPU memory registration (requires the `nvidia-peermem` kernel module). By default (unset or `0`), Mooncake uses the DMA-BUF path which does not require `nvidia-peermem`.
 - `MC_ENDPOINT_STORE_TYPE` Choose FIFO Endpoint Store (`FIFO`) or Sieve Endpoint Store (`SIEVE`), default is `SIEVE`.
 - `MC_TCP_ENABLE_CONNECTION_POOL` Enable TCP Connection Pool to avoid excessive sockets.

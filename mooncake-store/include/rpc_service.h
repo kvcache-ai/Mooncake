@@ -1,33 +1,36 @@
 #pragma once
 
 #include <csignal>
-#include <atomic>
-#include <memory>
-#include <mutex>
-#include <optional>
-#include <semaphore>
+
 #include <string>
 #include <boost/functional/hash.hpp>
 #include <cstdint>
-#include <thread>
-#include <ylt/coro_http/coro_http_server.hpp>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/util/tl/expected.hpp>
 
-#include "ha/ha_types.h"
 #include "master_service.h"
 #include "types.h"
 #include "rpc_types.h"
 #include "master_config.h"
+#include "kv_event/kv_event_publisher.h"
 #include "segment.h"
 
 namespace mooncake {
 
-extern const uint64_t kMetricReportIntervalSeconds;
-
+// Forward declaration
+class HttpMetadataServer;
 class WrappedMasterService {
    public:
-    WrappedMasterService(const WrappedMasterServiceConfig& config);
+    // Constructor with optional metadata-cleanup-on-timeout configuration.
+    // - http_metadata_server: in-process pointer used when the HTTP metadata
+    //   server is co-located in the master process (nullptr = not co-located).
+    // - http_metadata_remote_url: http(s) connection string used when the
+    //   metadata server is deployed separately (empty = none). Only consulted
+    //   when http_metadata_server is nullptr. If both are unset, cleanup is
+    //   disabled.
+    WrappedMasterService(const WrappedMasterServiceConfig& config,
+                         HttpMetadataServer* http_metadata_server = nullptr,
+                         const std::string& http_metadata_remote_url = "");
 
     ~WrappedMasterService();
 
@@ -62,6 +65,15 @@ class WrappedMasterService {
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& keys,
                         const std::string& tenant_id = "default");
+
+    // Read-only admin variants: no lease grants, no promotion, no metric
+    // updates.
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
+                                const std::string& tenant_id = "default");
+
+    tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaListForAdmin(
+        const std::string& key, const std::string& tenant_id = "default");
 
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStart(
         const UUID& client_id, const std::string& key,
@@ -175,6 +187,16 @@ class WrappedMasterService {
 
     tl::expected<std::string, ErrorCode> ServiceReady();
 
+    tl::expected<std::vector<TenantQuotaSnapshot>, ErrorCode>
+    ListTenantQuotaSnapshots();
+    tl::expected<TenantQuotaSnapshot, ErrorCode> GetTenantQuotaSnapshot(
+        const std::string& tenant_id);
+    tl::expected<TenantQuotaSnapshot, ErrorCode> UpsertTenantQuotaPolicy(
+        const std::string& tenant_id, uint64_t requested_quota_bytes);
+    tl::expected<std::optional<TenantQuotaSnapshot>, ErrorCode>
+    DeleteTenantQuotaPolicy(const std::string& tenant_id);
+    tl::expected<uint64_t, ErrorCode> GetTenantQuotaAllocatableCapacityBytes();
+
     tl::expected<std::vector<std::string>, ErrorCode> GetAllKeysForAdmin();
 
     tl::expected<std::vector<std::string>, ErrorCode> GetAllSegmentsForAdmin();
@@ -278,62 +300,11 @@ class WrappedMasterService {
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::string& tenant_id, ReplicaType replica_type);
 
+    bool KvEventsEnabled() const;
+    KvEventPublisher::Stats GetKvEventStats() const;
+
    private:
     MasterService master_service_;
-};
-
-class MasterAdminServer {
-   public:
-    MasterAdminServer(uint16_t http_port, bool enable_metric_reporting);
-
-    ~MasterAdminServer();
-
-    bool Start();
-
-    void Stop();
-
-    void SetRuntimeState(ha::MasterRuntimeState state);
-
-    void SetObservedLeader(const std::optional<ha::MasterView>& leader_view);
-
-    void SetServiceDelegate(std::shared_ptr<WrappedMasterService> service);
-
-    void SetServiceAvailable(bool available);
-
-   private:
-    struct RuntimeSnapshot {
-        ha::MasterRuntimeState state = ha::MasterRuntimeState::kStarting;
-        std::optional<ha::MasterView> leader_view;
-        std::shared_ptr<WrappedMasterService> service;
-        bool service_available = false;
-    };
-
-    RuntimeSnapshot SnapshotState() const;
-
-    std::string BuildMetricsText() const;
-
-    std::string BuildMetricsSummaryText() const;
-
-    std::string BuildHealthJson() const;
-
-    std::string BuildLeaderJson() const;
-
-    std::shared_ptr<WrappedMasterService> GetActiveService() const;
-
-    void InitHttpServer();
-
-    uint16_t http_port_;
-    bool enable_metric_reporting_ = false;
-    coro_http::coro_http_server http_server_;
-    std::thread metric_report_thread_;
-    std::atomic<bool> metric_report_running_{false};
-    std::binary_semaphore metric_report_stop_sem_{0};
-    std::atomic<bool> started_{false};
-    mutable std::mutex state_mutex_;
-    ha::MasterRuntimeState state_{ha::MasterRuntimeState::kStarting};
-    std::optional<ha::MasterView> leader_view_;
-    std::shared_ptr<WrappedMasterService> service_;
-    bool service_available_ = false;
 };
 
 void RegisterRpcService(coro_rpc::coro_rpc_server& server,

@@ -284,6 +284,59 @@ TEST(TransferEngineConfigOverrideTest,
 }
 
 TEST(TransferEngineConfigOverrideTest,
+     LegacyRdmaSliceAffinityLogEnvLoadsIntoTentConfig) {
+    EnvVarGuard guard("MC_LOG_RDMA_SLICE_AFFINITY", "true");
+
+    Config config;
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+
+    EXPECT_TRUE(config.get("transports/rdma/log_slice_affinity", false));
+}
+
+TEST(TransferEngineConfigOverrideTest, FilterNicEnvLoadsRdmaWhitelist) {
+    EnvVarGuard guard("MC_TE_FILTERS", "mlx5_0,mlx5_1");
+
+    Config config;
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+
+    std::vector<std::string> expected{"mlx5_0", "mlx5_1"};
+    EXPECT_EQ(config.getArray<std::string>("topology/rdma_whitelist"),
+              expected);
+}
+
+TEST(TransferEngineConfigOverrideTest, FilterNicExcludeEnvLoadsRdmaBlacklist) {
+    EnvVarGuard guard("MC_TE_FILTERS_EXCLUDE", "mlx5_2,mlx5_3");
+
+    Config config;
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+
+    std::vector<std::string> expected{"mlx5_2", "mlx5_3"};
+    EXPECT_EQ(config.getArray<std::string>("topology/rdma_blacklist"),
+              expected);
+}
+
+TEST(TransferEngineConfigOverrideTest, FilterNicEnvTrimsWhitespaceAndEmpties) {
+    // Spaces around names and a trailing comma must be tolerated.
+    EnvVarGuard guard("MC_TE_FILTERS", " mlx5_0 , mlx5_1 ,");
+
+    Config config;
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+
+    std::vector<std::string> expected{"mlx5_0", "mlx5_1"};
+    EXPECT_EQ(config.getArray<std::string>("topology/rdma_whitelist"),
+              expected);
+}
+
+TEST(TransferEngineConfigOverrideTest, FilterNicUnsetLeavesWhitelistEmpty) {
+    // Not setting the env var must leave the default (discover all NICs).
+    Config config;
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+
+    EXPECT_TRUE(
+        config.getArray<std::string>("topology/rdma_whitelist").empty());
+}
+
+TEST(TransferEngineConfigOverrideTest,
      ExplicitMetadataOverridesDriveSuccessfulHttpInitialization) {
 #ifdef _WIN32
     GTEST_SKIP() << "Requires local HTTP metadata server support";
