@@ -33,10 +33,43 @@ class SegmentAllocator {
         return buffer;
     }
 
+    [[nodiscard]] size_t size() const {
+        return allocator_ ? allocator_->size() : 0;
+    }
+
+    [[nodiscard]] size_t capacity() const {
+        return allocator_ ? allocator_->capacity() : 0;
+    }
+
+    [[nodiscard]] size_t getTotalFreeSpace() const {
+        return allocator_ ? allocator_->getTotalFreeSpace()
+                          : kAllocatorUnknownFreeSpace;
+    }
+
+    [[nodiscard]] size_t getLargestFreeRegion() const {
+        return allocator_ ? allocator_->getLargestFreeRegion()
+                          : kAllocatorUnknownFreeSpace;
+    }
+
     [[nodiscard]] bool isAvailable() const { return lifetime_.isAvailable(); }
 
     void setAvailable(bool available) const {
         lifetime_.setAvailable(available);
+    }
+
+    [[nodiscard]] bool wrapsAllocator(
+        const std::shared_ptr<BufferAllocatorBase>& allocator) const {
+        return allocator_ == allocator;
+    }
+
+    bool replaceAllocator(
+        const std::shared_ptr<BufferAllocatorBase>& expected,
+        std::shared_ptr<BufferAllocatorBase> replacement) {
+        if (!replacement || allocator_ != expected) {
+            return false;
+        }
+        allocator_ = std::move(replacement);
+        return true;
     }
 
    private:
@@ -73,62 +106,33 @@ class AllocatorManager {
      */
     SegmentAllocatorRegistration addAllocator(
         const std::string& name,
-        const std::shared_ptr<BufferAllocatorBase>& allocator,
-        SegmentAllocatorRegistration registration = nullptr) {
-        if (!allocators_.contains(name)) {
+        const std::shared_ptr<BufferAllocatorBase>& allocator) {
+        return addRegistration(name,
+                               std::make_shared<SegmentAllocator>(allocator));
+    }
+
+    SegmentAllocatorRegistration addRegistration(
+        const std::string& name, SegmentAllocatorRegistration registration) {
+        if (!registration) {
+            return nullptr;
+        }
+        if (!registrations_.contains(name)) {
             names_.push_back(name);
         }
-        if (!registration) {
-            registration = std::make_shared<SegmentAllocator>(allocator);
-        }
-        allocators_[name].push_back(allocator);
         registrations_[name].push_back(registration);
         return registration;
     }
 
     /**
-     * @brief Remove an allocator of segment `name` from the manager. This
-     *        also removes the name if there are no allocators after the
-     *        removal.
+     * @brief Remove an allocator registration of segment `name` from the
+     *        manager. This also removes the name if there are no registrations
+     *        after the removal.
      * @param name the name of the segment
-     * @param allocator the buffer allocator to remove from the segment
-     * @return true if the allocator is removed, false if the allocator does
-     *         not exist
+     * @param registration the registration to remove from the segment
+     * @param invalidate whether buffers allocated by this registration should
+     *                   become unavailable
+     * @return true if the registration is removed, false if it does not exist
      */
-    bool removeAllocator(
-        const std::string& name,
-        const std::shared_ptr<BufferAllocatorBase>& allocator) {
-        auto it = allocators_.find(name);
-        if (it == allocators_.end()) {
-            return false;
-        }
-
-        // Try removing the allocator.
-        bool allocator_removed = false;
-        auto alloc_it =
-            std::find(it->second.begin(), it->second.end(), allocator);
-        if (alloc_it != it->second.end()) {
-            const size_t index = std::distance(it->second.begin(), alloc_it);
-            registrations_[name][index]->setAvailable(false);
-            it->second.erase(alloc_it);
-            registrations_[name].erase(registrations_[name].begin() + index);
-            allocator_removed = true;
-        }
-
-        if (it->second.empty()) {
-            // If there is no allocator left, remove the name too.
-            allocators_.erase(name);
-            registrations_.erase(name);
-            auto name_it = std::find(names_.begin(), names_.end(), name);
-            if (name_it != names_.end()) {
-                std::swap(*name_it, names_.back());
-                names_.pop_back();
-            }
-        }
-
-        return allocator_removed;
-    }
-
     struct Replacement {
         std::string name;
         std::shared_ptr<BufferAllocatorBase> expected;
@@ -136,29 +140,36 @@ class AllocatorManager {
     };
 
     bool replaceAllocators(const std::vector<Replacement>& replacements) {
-        std::vector<decltype(allocators_)::mapped_type::iterator> targets;
+        std::vector<SegmentAllocatorRegistration> targets;
         targets.reserve(replacements.size());
         for (const auto& replacement : replacements) {
-            auto it = allocators_.find(replacement.name);
-            if (it == allocators_.end() || !replacement.replacement) {
+            auto it = registrations_.find(replacement.name);
+            if (it == registrations_.end() || !replacement.replacement) {
                 return false;
             }
-            auto target = std::find(it->second.begin(), it->second.end(),
-                                    replacement.expected);
+            auto target = std::find_if(
+                it->second.begin(), it->second.end(),
+                [&replacement](const SegmentAllocatorRegistration& candidate) {
+                    return candidate &&
+                           candidate->wrapsAllocator(replacement.expected);
+                });
             if (target == it->second.end()) {
                 return false;
             }
-            targets.push_back(target);
+            targets.push_back(*target);
         }
         for (size_t i = 0; i < replacements.size(); ++i) {
-            *targets[i] = replacements[i].replacement;
+            if (!targets[i]->replaceAllocator(
+                    replacements[i].expected, replacements[i].replacement)) {
+                return false;
+            }
         }
         return true;
     }
 
-    bool removeAllocator(const std::string& name,
-                         const SegmentAllocatorRegistration& registration,
-                         bool invalidate = true) {
+    bool removeRegistration(const std::string& name,
+                            const SegmentAllocatorRegistration& registration,
+                            bool invalidate = true) {
         if (!registration) {
             return false;
         }
@@ -167,9 +178,7 @@ class AllocatorManager {
         }
 
         auto registrations_it = registrations_.find(name);
-        auto allocators_it = allocators_.find(name);
-        if (registrations_it == registrations_.end() ||
-            allocators_it == allocators_.end()) {
+        if (registrations_it == registrations_.end()) {
             return false;
         }
 
@@ -180,12 +189,8 @@ class AllocatorManager {
             return false;
         }
 
-        const size_t index =
-            std::distance(registrations_it->second.begin(), registration_it);
         registrations_it->second.erase(registration_it);
-        allocators_it->second.erase(allocators_it->second.begin() + index);
-        if (allocators_it->second.empty()) {
-            allocators_.erase(allocators_it);
+        if (registrations_it->second.empty()) {
             registrations_.erase(registrations_it);
             auto name_it = std::find(names_.begin(), names_.end(), name);
             if (name_it != names_.end()) {
@@ -203,20 +208,6 @@ class AllocatorManager {
      */
     const std::vector<std::string>& getNames() const { return names_; }
 
-    /**
-     * @brief Get allocators belongs to the given segment name.
-     * @return a vector of allocators belongs to the given segment name
-     */
-    const std::vector<std::shared_ptr<BufferAllocatorBase>>* getAllocators(
-        const std::string& name) const {
-        auto it = allocators_.find(name);
-        if (it != allocators_.end()) {
-            return &it->second;
-        } else {
-            return nullptr;
-        }
-    }
-
     const std::vector<SegmentAllocatorRegistration>* getRegistrations(
         const std::string& name) const {
         auto it = registrations_.find(name);
@@ -224,12 +215,9 @@ class AllocatorManager {
     }
 
    private:
-    // Name array for randomly picking allocators.
+    // Name array for randomly picking allocator registrations.
     std::vector<std::string> names_;
-    // Segment name to allocators mapping.
-    std::unordered_map<std::string,
-                       std::vector<std::shared_ptr<BufferAllocatorBase>>>
-        allocators_;
+    // Segment name to allocator registrations mapping.
     std::unordered_map<std::string, std::vector<SegmentAllocatorRegistration>>
         registrations_;
     friend class SegmentSerializer;  // for fork serialize
@@ -446,7 +434,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
         }
 
         // Check segment existence
-        if (allocator_manager.getAllocators(segment_name) == nullptr) {
+        if (allocator_manager.getRegistrations(segment_name) == nullptr) {
             return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
         }
 
@@ -645,16 +633,16 @@ class FreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
 
     double getSegmentFreeRatio(const AllocatorManager& allocator_manager,
                                const std::string& name) {
-        auto allocators = allocator_manager.getAllocators(name);
-        if (!allocators || allocators->empty()) return 0.0;
+        auto registrations = allocator_manager.getRegistrations(name);
+        if (!registrations || registrations->empty()) return 0.0;
 
         uint64_t total_capacity = 0;
         uint64_t total_free = 0;
-        for (const auto& alloc : *allocators) {
-            if (!alloc) continue;
-            auto cap = static_cast<uint64_t>(alloc->capacity());
+        for (const auto& registration : *registrations) {
+            if (!registration) continue;
+            auto cap = static_cast<uint64_t>(registration->capacity());
             total_capacity += cap;
-            total_free += cap - static_cast<uint64_t>(alloc->size());
+            total_free += cap - static_cast<uint64_t>(registration->size());
         }
 
         if (total_capacity == 0) return 0.0;

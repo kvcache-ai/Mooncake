@@ -64,23 +64,23 @@ class SegmentTest : public ::testing::Test {
 
         total_num = 0;
         for (const auto& name : allocator_manager.getNames()) {
-            auto allocators = allocator_manager.getAllocators(name);
-            ASSERT_NE(allocators, nullptr);
-            total_num += allocators->size();
+            auto registrations = allocator_manager.getRegistrations(name);
+            ASSERT_NE(registrations, nullptr);
+            total_num += registrations->size();
         }
         ASSERT_EQ(total_num, segments.size());
 
         for (const auto& segment : segments) {
-            auto allocators = allocator_manager.getAllocators(segment.name);
-            ASSERT_NE(allocators, nullptr);
+            auto registrations =
+                allocator_manager.getRegistrations(segment.name);
+            ASSERT_NE(registrations, nullptr);
 
-            // validate allocator exist in allocator_manager
+            // Validate registration exists in allocator_manager.
             MountedSegment mounted_segment =
                 segment_manager.mounted_segments_.at(segment.id);
-            auto allocator = mounted_segment.buf_allocator;
-            ASSERT_NE(std::find(allocators->begin(), allocators->end(),
-                                mounted_segment.buf_allocator),
-                      allocators->end());
+            ASSERT_NE(std::find(registrations->begin(), registrations->end(),
+                                mounted_segment.allocator_registration),
+                      registrations->end());
         }
     }
 
@@ -102,15 +102,16 @@ class SegmentTest : public ::testing::Test {
         }
 
         const auto& mounted_segment = mounted_it->second;
-        const auto* allocators =
-            segment_manager.allocator_manager_.getAllocators(
+        const auto* registrations =
+            segment_manager.allocator_manager_.getRegistrations(
                 mounted_segment.segment.name);
-        if (allocators == nullptr) {
+        if (registrations == nullptr) {
             return false;
         }
 
-        return std::find(allocators->begin(), allocators->end(),
-                         mounted_segment.buf_allocator) != allocators->end();
+        return std::find(registrations->begin(), registrations->end(),
+                         mounted_segment.allocator_registration) !=
+               registrations->end();
     }
 
     SegmentAllocatorRegistration GetSegmentAllocator(

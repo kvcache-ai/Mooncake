@@ -530,13 +530,13 @@ class MasterServiceHATest : public ::testing::Test {
     static size_t SegmentAllocatedSizeForTesting(MasterService& service,
                                                  const std::string& name) {
         auto access = service.segment_manager_.getAllocatorAccess();
-        const auto* allocators =
-            access.getAllocatorManager().getAllocators(name);
-        EXPECT_NE(allocators, nullptr);
-        EXPECT_EQ(allocators == nullptr ? 0 : allocators->size(), 1);
-        return allocators == nullptr || allocators->empty()
+        const auto* registrations =
+            access.getAllocatorManager().getRegistrations(name);
+        EXPECT_NE(registrations, nullptr);
+        EXPECT_EQ(registrations == nullptr ? 0 : registrations->size(), 1);
+        return registrations == nullptr || registrations->empty()
                    ? 0
-                   : allocators->front()->size();
+                   : registrations->front()->size();
     }
 
     static void EraseObjectForTesting(MasterService& service,

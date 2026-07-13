@@ -144,6 +144,12 @@ class BufferAllocatorBase {
     virtual std::string getTransportEndpoint() const = 0;
 
     /**
+     * Returns the total free space available in this allocator. Allocators
+     * that cannot report this precisely return kAllocatorUnknownFreeSpace.
+     */
+    virtual size_t getTotalFreeSpace() const = 0;
+
+    /**
      * Returns the largest free region available in this allocator.
      * For CacheLib allocators, this returns kAllocatorUnknownFreeSpace as an
      * approximation. For OffsetAllocator, this returns the actual largest free
@@ -238,6 +244,10 @@ class CachelibBufferAllocator
         return kAllocatorUnknownFreeSpace;
     }
 
+    size_t getTotalFreeSpace() const override {
+        return kAllocatorUnknownFreeSpace;
+    }
+
    private:
     std::unique_ptr<AllocatedBuffer> adoptImportedBuffer(
         const AllocatedBuffer::Descriptor& descriptor);
@@ -307,6 +317,8 @@ class OffsetBufferAllocator
      * Returns the actual largest free region from the offset allocator.
      */
     size_t getLargestFreeRegion() const override;
+
+    size_t getTotalFreeSpace() const override;
 
     // Public method to get offset_allocator
     std::shared_ptr<offset_allocator::OffsetAllocator> getOffsetAllocator()
