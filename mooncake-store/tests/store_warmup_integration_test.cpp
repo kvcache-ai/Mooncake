@@ -1,0 +1,355 @@
+#include <gtest/gtest.h>
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <optional>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "client_buffer.h"
+#include "client_service.h"
+#include "test_server_helpers.h"
+#include "transfer_engine.h"
+#include "transport/transport.h"
+#include "types.h"
+#include "utils.h"
+
+namespace mooncake::test {
+namespace {
+
+constexpr size_t kProbeSize = 64;
+constexpr size_t kProbeAllocatorSize = 4096;
+constexpr size_t kSegmentSize = 4 * 1024 * 1024;
+constexpr auto kTransferTimeout = std::chrono::seconds(5);
+
+class ScopedEnvVar {
+   public:
+    ScopedEnvVar(const char* name, const char* value) : name_(name) {
+        if (const char* old_value = std::getenv(name)) {
+            old_value_ = old_value;
+        }
+        setenv(name, value, 1);
+    }
+
+    ~ScopedEnvVar() {
+        if (old_value_) {
+            setenv(name_.c_str(), old_value_->c_str(), 1);
+        } else {
+            unsetenv(name_.c_str());
+        }
+    }
+
+   private:
+    std::string name_;
+    std::optional<std::string> old_value_;
+};
+
+struct ClientRuntime {
+    std::shared_ptr<TransferEngine> transfer_engine;
+    std::shared_ptr<Client> client;
+    std::shared_ptr<ClientBufferAllocator> probe_allocator;
+    void* segment = nullptr;
+    bool probe_memory_registered = false;
+};
+
+struct ReadResult {
+    bool completed = false;
+    bool batch_freed = false;
+    std::array<uint8_t, kProbeSize> data{};
+};
+
+std::array<uint8_t, kProbeSize> MakeTestPattern() {
+    std::array<uint8_t, kProbeSize> pattern{};
+    for (size_t i = 0; i < pattern.size(); ++i) {
+        pattern[i] = static_cast<uint8_t>(0x40 + i);
+    }
+    return pattern;
+}
+
+ReadResult ReadRemotePrefix(ClientRuntime& requester,
+                            const std::string& remote_endpoint) {
+    ReadResult result;
+    auto buffer = requester.probe_allocator->allocate(kProbeSize);
+    if (!buffer) return result;
+    std::memset(buffer->ptr(), 0, buffer->size());
+
+    const auto target_id =
+        requester.transfer_engine->openSegment(remote_endpoint);
+    if (target_id == static_cast<SegmentHandle>(-1) ||
+        target_id == LOCAL_SEGMENT_ID) {
+        return result;
+    }
+
+    auto metadata = requester.transfer_engine->getMetadata();
+    if (!metadata) return result;
+    auto segment = metadata->getSegmentDescByID(target_id);
+    if (!segment || segment->buffers.empty()) return result;
+
+    const auto batch_id = requester.transfer_engine->allocateBatchID(1);
+    if (batch_id == INVALID_BATCH_ID) return result;
+
+    Transport::TransferRequest request;
+    request.opcode = Transport::TransferRequest::READ;
+    request.source = buffer->ptr();
+    request.target_id = target_id;
+    request.target_offset = segment->buffers.front().addr;
+    request.length = kProbeSize;
+
+    auto submit =
+        requester.transfer_engine->submitTransfer(batch_id, {request});
+    if (!submit.ok()) {
+        result.batch_freed =
+            requester.transfer_engine->freeBatchID(batch_id).ok();
+        return result;
+    }
+
+    Transport::TransferStatus status{};
+    const auto deadline = std::chrono::steady_clock::now() + kTransferTimeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto get_status = requester.transfer_engine->getTransferStatus(
+            batch_id, 0, status);
+        if (!get_status.ok()) break;
+        if (status.s == Transport::COMPLETED ||
+            status.s == Transport::FAILED ||
+            status.s == Transport::INVALID) {
+            result.completed = status.s == Transport::COMPLETED;
+            result.batch_freed =
+                requester.transfer_engine->freeBatchID(batch_id).ok();
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+
+    if (result.completed) {
+        std::memcpy(result.data.data(), buffer->ptr(), result.data.size());
+    }
+    return result;
+}
+
+}  // namespace
+
+class StoreWarmupIntegrationTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+        const auto ports = getFreeTcpPorts(2);
+        ASSERT_EQ(ports.size(), 2);
+        requester_endpoint_ = "127.0.0.1:" + std::to_string(ports[0]);
+        remote_endpoint_ = "127.0.0.1:" + std::to_string(ports[1]);
+    }
+
+    void TearDown() override {
+        for (auto it = node_b_clients_.rbegin();
+             it != node_b_clients_.rend(); ++it) {
+            CleanupRuntime(*it);
+        }
+        for (auto it = node_a_clients_.rbegin();
+             it != node_a_clients_.rend(); ++it) {
+            CleanupRuntime(*it);
+        }
+        CleanupRuntime(remote_);
+        CleanupRuntime(requester_);
+        master_.Stop();
+    }
+
+    void CreateRuntime(ClientRuntime& runtime, const std::string& endpoint,
+                       bool create_probe_allocator) {
+        const auto separator = endpoint.rfind(':');
+        ASSERT_NE(separator, std::string::npos);
+        const auto port = static_cast<uint64_t>(
+            std::stoul(endpoint.substr(separator + 1)));
+
+        runtime.transfer_engine = std::make_shared<TransferEngine>(false);
+        ASSERT_EQ(runtime.transfer_engine->init(
+                      P2PHANDSHAKE, endpoint, "127.0.0.1", port),
+                  0);
+        ASSERT_NE(runtime.transfer_engine->installTransport("tcp", nullptr),
+                  nullptr);
+
+        auto client = Client::Create(endpoint, P2PHANDSHAKE, "tcp",
+                                     std::nullopt, master_.master_address(),
+                                     runtime.transfer_engine);
+        ASSERT_TRUE(client.has_value());
+        runtime.client = std::move(*client);
+
+        if (!create_probe_allocator) return;
+        runtime.probe_allocator =
+            ClientBufferAllocator::create(kProbeAllocatorSize, "tcp");
+        ASSERT_NE(runtime.probe_allocator, nullptr);
+        ASSERT_TRUE(runtime.client
+                        ->RegisterLocalMemory(
+                            runtime.probe_allocator->getBase(),
+                            runtime.probe_allocator->size(), "cpu:0",
+                            /*remote_accessible=*/false,
+                            /*update_metadata=*/false)
+                        .has_value());
+        runtime.probe_memory_registered = true;
+    }
+
+    void MountSegment(ClientRuntime& runtime,
+                      const std::array<uint8_t, kProbeSize>& prefix) {
+        runtime.segment = allocate_buffer_allocator_memory(kSegmentSize);
+        ASSERT_NE(runtime.segment, nullptr);
+        std::memset(runtime.segment, 0, kSegmentSize);
+        std::memcpy(runtime.segment, prefix.data(), prefix.size());
+        ASSERT_TRUE(
+            runtime.client->MountSegment(runtime.segment, kSegmentSize, "tcp")
+                .has_value());
+    }
+
+    void ExpectProbeBufferReleased(ClientRuntime& runtime) {
+        auto whole_allocator =
+            runtime.probe_allocator->allocate(runtime.probe_allocator->size());
+        EXPECT_TRUE(whole_allocator.has_value());
+    }
+
+    void CleanupRuntime(ClientRuntime& runtime) {
+        if (runtime.client && runtime.segment) {
+            EXPECT_TRUE(runtime.client
+                            ->UnmountSegment(runtime.segment, kSegmentSize)
+                            .has_value());
+        }
+        if (runtime.client && runtime.probe_memory_registered) {
+            EXPECT_TRUE(runtime.client
+                            ->unregisterLocalMemory(
+                                runtime.probe_allocator->getBase(), false)
+                            .has_value());
+        }
+
+        runtime.client.reset();
+        runtime.probe_allocator.reset();
+        runtime.transfer_engine.reset();
+        runtime.probe_memory_registered = false;
+        if (runtime.segment) {
+            free_memory("", runtime.segment);
+            runtime.segment = nullptr;
+        }
+    }
+
+    testing::InProcMaster master_;
+    ClientRuntime requester_;
+    ClientRuntime remote_;
+    std::vector<ClientRuntime> node_a_clients_;
+    std::vector<ClientRuntime> node_b_clients_;
+    std::string requester_endpoint_;
+    std::string remote_endpoint_;
+    ScopedEnvVar read_size_{"MC_STORE_WARMUP_READ_SIZE", "64"};
+    ScopedEnvVar timeout_{"MC_STORE_WARMUP_TIMEOUT_MS", "5000"};
+    ScopedEnvVar concurrency_{"MC_STORE_WARMUP_CONCURRENCY", "1"};
+    ScopedEnvVar max_targets_{"MC_STORE_WARMUP_MAX_TARGETS", "0"};
+};
+
+TEST_F(StoreWarmupIntegrationTest,
+       SingleClientWarmupCompletesWithoutRemoteProbe) {
+    CreateRuntime(requester_, requester_endpoint_, true);
+    ASSERT_NE(requester_.client, nullptr);
+
+    std::array<uint8_t, kProbeSize> local_prefix{};
+    local_prefix.fill(0x11);
+    MountSegment(requester_, local_prefix);
+
+    std::memset(requester_.probe_allocator->getBase(), 0xA5,
+                requester_.probe_allocator->size());
+    ASSERT_TRUE(requester_.client->warmup(requester_.probe_allocator)
+                    .has_value());
+
+    const auto* probe_bytes = static_cast<const uint8_t*>(
+        requester_.probe_allocator->getBase());
+    EXPECT_TRUE(std::all_of(probe_bytes, probe_bytes + kProbeSize,
+                            [](uint8_t byte) { return byte == 0xA5; }));
+    ExpectProbeBufferReleased(requester_);
+}
+
+TEST_F(StoreWarmupIntegrationTest, TwoClientTcpWarmupSubmitsReadProbe) {
+    CreateRuntime(requester_, requester_endpoint_, true);
+    CreateRuntime(remote_, remote_endpoint_, false);
+    ASSERT_NE(requester_.client, nullptr);
+    ASSERT_NE(remote_.client, nullptr);
+    ASSERT_NE(requester_.client->getClientId(), remote_.client->getClientId());
+    ASSERT_NE(requester_.client->GetTransportEndpoint(),
+              remote_.client->GetTransportEndpoint());
+
+    const auto pattern = MakeTestPattern();
+    MountSegment(remote_, pattern);
+    std::memset(requester_.probe_allocator->getBase(), 0,
+                requester_.probe_allocator->size());
+
+    ASSERT_TRUE(requester_.client->warmup(requester_.probe_allocator)
+                    .has_value());
+    EXPECT_EQ(std::memcmp(requester_.probe_allocator->getBase(), pattern.data(),
+                          pattern.size()),
+              0);
+    ExpectProbeBufferReleased(requester_);
+
+    const auto normal_read =
+        ReadRemotePrefix(requester_, remote_.client->GetSegmentEndpoint());
+    ASSERT_TRUE(normal_read.completed);
+    EXPECT_TRUE(normal_read.batch_freed);
+    EXPECT_EQ(normal_read.data, pattern);
+    ExpectProbeBufferReleased(requester_);
+}
+
+TEST_F(StoreWarmupIntegrationTest, TwoNodesTenClientsEachSimulateWarmupWave) {
+    constexpr size_t kClientsPerNode = 10;
+    ScopedEnvVar scale_concurrency("MC_STORE_WARMUP_CONCURRENCY", "4");
+    ScopedEnvVar scale_max_targets("MC_STORE_WARMUP_MAX_TARGETS", "10");
+
+    const auto ports = getFreeTcpPorts(2 * kClientsPerNode);
+    ASSERT_EQ(ports.size(), 2 * kClientsPerNode);
+    node_a_clients_.reserve(kClientsPerNode);
+    node_b_clients_.reserve(kClientsPerNode);
+
+    // Model ten clients starting on node A while ten established clients on
+    // node B expose readable segments.
+    const auto pattern = MakeTestPattern();
+    for (size_t i = 0; i < kClientsPerNode; ++i) {
+        node_a_clients_.emplace_back();
+        CreateRuntime(node_a_clients_.back(),
+                      "127.0.0.1:" + std::to_string(ports[i]), true);
+        ASSERT_NE(node_a_clients_.back().client, nullptr);
+
+        node_b_clients_.emplace_back();
+        CreateRuntime(
+            node_b_clients_.back(),
+            "127.0.0.1:" + std::to_string(ports[kClientsPerNode + i]), false);
+        ASSERT_NE(node_b_clients_.back().client, nullptr);
+        MountSegment(node_b_clients_.back(), pattern);
+
+        EXPECT_NE(node_a_clients_.back().client->getClientId(),
+                  node_b_clients_.back().client->getClientId());
+        EXPECT_NE(node_a_clients_.back().client->GetTransportEndpoint(),
+                  node_b_clients_.back().client->GetTransportEndpoint());
+    }
+    ASSERT_EQ(node_a_clients_.size(), kClientsPerNode);
+    ASSERT_EQ(node_b_clients_.size(), kClientsPerNode);
+
+    std::vector<int> warmup_results(kClientsPerNode, -1);
+    std::vector<std::thread> startup_threads;
+    startup_threads.reserve(kClientsPerNode);
+    for (size_t i = 0; i < kClientsPerNode; ++i) {
+        startup_threads.emplace_back([&, i]() {
+            auto result = node_a_clients_[i].client->warmup(
+                node_a_clients_[i].probe_allocator);
+            warmup_results[i] = result.has_value() ? 0 : 1;
+        });
+    }
+    for (auto& thread : startup_threads) {
+        thread.join();
+    }
+
+    for (size_t i = 0; i < kClientsPerNode; ++i) {
+        EXPECT_EQ(warmup_results[i], 0);
+        EXPECT_EQ(std::memcmp(node_a_clients_[i].probe_allocator->getBase(),
+                              pattern.data(), pattern.size()),
+                  0);
+        ExpectProbeBufferReleased(node_a_clients_[i]);
+    }
+}
+
+}  // namespace mooncake::test

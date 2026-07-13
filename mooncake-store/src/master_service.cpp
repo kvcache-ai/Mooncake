@@ -2221,6 +2221,9 @@ auto MasterService::ListWarmupTargets(
     targets.reserve(all_segments.size());
     std::unordered_set<std::string> seen_segment_names;
     for (const auto& [segment, owner_client_id] : all_segments) {
+        // Warmup locality follows Store client ownership. Segments owned by a
+        // different client remain eligible even when both clients share a
+        // host.
         if (owner_client_id == client_id) {
             continue;
         }

@@ -59,6 +59,9 @@ if(ENABLE_KV_EVENTS)
 endif()
 add_store_test(master_service_test master_service_test.cpp)
 add_store_test(store_warmup_test store_warmup_test.cpp)
+add_store_test(store_warmup_integration_test
+               store_warmup_integration_test.cpp)
+set_tests_properties(store_warmup_integration_test PROPERTIES TIMEOUT 90)
 add_store_test(master_service_tenant_quota_test
                master_service_tenant_quota_test.cpp)
 add_store_test(batch_remove_test batch_remove_test.cpp)

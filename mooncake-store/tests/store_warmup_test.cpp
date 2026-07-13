@@ -14,8 +14,7 @@ class StoreWarmupTest : public ::testing::Test {
    protected:
     static Segment MakeSegment(std::string name, uintptr_t base,
                                std::string protocol,
-                               std::string te_endpoint = "",
-                               std::string host_id = "") {
+                               std::string te_endpoint = "") {
         Segment segment;
         segment.id = generate_uuid();
         segment.name = std::move(name);
@@ -23,7 +22,6 @@ class StoreWarmupTest : public ::testing::Test {
         segment.size = 1024 * 1024;
         segment.protocol = std::move(protocol);
         segment.te_endpoint = std::move(te_endpoint);
-        segment.host_id = std::move(host_id);
         return segment;
     }
 
@@ -69,20 +67,25 @@ TEST_F(StoreWarmupTest, SingleNodeReturnsNoWarmupTargets) {
     EXPECT_TRUE(targets->empty());
 }
 
-TEST_F(StoreWarmupTest, DualNodeReturnsOnlyRemoteWarmupTargets) {
+TEST_F(StoreWarmupTest, DifferentClientsReturnRemoteWarmupTargets) {
     MasterService service;
     const UUID requester{2, 1};
     const UUID remote_client_1{3, 1};
     const UUID remote_client_2{4, 1};
 
-    Mount(service,
-          MakeSegment("local-segment", 0x10000000, "tcp", "127.0.0.1:18000"),
-          requester);
-    Mount(service,
-          MakeSegment("remote-segment-1", 0x20000000, "tcp", "127.0.0.1:18001"),
-          remote_client_1);
-    Mount(service, MakeSegment("127.0.0.1:18002", 0x30000000, "tcp"),
-          remote_client_2);
+    auto local_segment =
+        MakeSegment("local-segment", 0x10000000, "tcp", "127.0.0.1:18000");
+    auto remote_segment_1 = MakeSegment(
+        "remote-segment-1", 0x20000000, "tcp", "127.0.0.1:18001");
+    auto remote_segment_2 =
+        MakeSegment("127.0.0.1:18002", 0x30000000, "tcp");
+    local_segment.host_id = "same-host";
+    remote_segment_1.host_id = "same-host";
+    remote_segment_2.host_id = "same-host";
+
+    Mount(service, local_segment, requester);
+    Mount(service, remote_segment_1, remote_client_1);
+    Mount(service, remote_segment_2, remote_client_2);
 
     auto targets = service.ListWarmupTargets(requester, 1, {"tcp"});
     ASSERT_TRUE(targets.has_value());
@@ -163,7 +166,7 @@ TEST_F(StoreWarmupTest, AbnormalSegmentsAreSkipped) {
     EXPECT_FALSE(targets->at(0).is_local);
 }
 
-TEST_F(StoreWarmupTest, DeduplicatesEndpointsButKeepsDistinctSegments) {
+TEST_F(StoreWarmupTest, DeduplicatesWarmupTargetsByEndpoint) {
     MasterService service;
     const UUID requester{11, 1};
     const UUID remote_client{12, 1};
@@ -203,63 +206,23 @@ TEST_F(StoreWarmupTest, MaxTargetsUsesRequesterStableRotation) {
           remote_client);
 
     auto targets_a = service.ListWarmupTargets(requester_a, 2, {"tcp"});
+    auto targets_a_again =
+        service.ListWarmupTargets(requester_a, 2, {"tcp"});
     auto targets_b = service.ListWarmupTargets(requester_b, 2, {"tcp"});
     ASSERT_TRUE(targets_a.has_value());
+    ASSERT_TRUE(targets_a_again.has_value());
     ASSERT_TRUE(targets_b.has_value());
     ASSERT_EQ(targets_a->size(), 2);
+    ASSERT_EQ(targets_a_again->size(), targets_a->size());
     ASSERT_EQ(targets_b->size(), 2);
     ExpectSequentialPriority(*targets_a);
+    ExpectSequentialPriority(*targets_a_again);
     ExpectSequentialPriority(*targets_b);
+    for (size_t i = 0; i < targets_a->size(); ++i) {
+        EXPECT_EQ(targets_a->at(i).segment_name,
+                  targets_a_again->at(i).segment_name);
+    }
     EXPECT_NE(TargetNames(*targets_a), TargetNames(*targets_b));
-}
-
-TEST_F(StoreWarmupTest,
-       DISABLED_SameHostDifferentClientsShouldNotBeWarmupTargets) {
-    MasterService service;
-    const UUID requester{14, 1};
-    const UUID same_host_client{15, 1};
-
-    Mount(service,
-          MakeSegment("local-host-segment", 0x130000000, "tcp",
-                      "127.0.0.1:18011", "host-a"),
-          requester);
-    Mount(service,
-          MakeSegment("same-host-remote-client", 0x140000000, "tcp",
-                      "127.0.0.1:18012", "host-a"),
-          same_host_client);
-
-    auto targets = service.ListWarmupTargets(requester, 0, {"tcp"});
-    ASSERT_TRUE(targets.has_value());
-    EXPECT_TRUE(targets->empty())
-        << "TODO: ListWarmupTargets only compares client_id today. It does not "
-           "use Segment::host_id / client host identity to suppress same-node "
-           "warmup candidates.";
-}
-
-TEST_F(StoreWarmupTest, DISABLED_WarmupFlowSubmitsReadProbe) {
-    GTEST_SKIP()
-        << "TODO: Client::warmup owns concrete MasterClient and TransferEngine "
-           "instances. Add a small injection seam or fake TransferEngine to "
-           "assert that warmup submits a READ request after ListWarmupTargets.";
-}
-
-TEST_F(StoreWarmupTest, DISABLED_TcpWarmupReusesConnectionForNormalRead) {
-    GTEST_SKIP()
-        << "TODO: add a loopback TCP E2E test once connection/endpoint "
-           "creation counters are observable without timing-based assertions.";
-}
-
-TEST_F(StoreWarmupTest, DISABLED_ProtocolTransportWarmupUsesTransportMocks) {
-    GTEST_SKIP()
-        << "TODO: RDMA/UB coverage needs mock transports or observable "
-           "transport counters so it can run without hardware.";
-}
-
-TEST_F(StoreWarmupTest, DISABLED_WarmupBestEffortWithReadFailures) {
-    GTEST_SKIP()
-        << "TODO: use fake TransferEngine submit/status results to verify "
-           "target unreachable, READ failure, partial success, and the current "
-           "no-retry behavior.";
 }
 
 }  // namespace mooncake::test
