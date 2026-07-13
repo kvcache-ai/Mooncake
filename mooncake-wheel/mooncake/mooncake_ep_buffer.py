@@ -703,6 +703,9 @@ class Buffer:
         def current_stream_wait(self):
             torch.cuda.synchronize()
 
+        def synchronize(self):
+            torch.cuda.synchronize()
+
     @staticmethod
     def _fp8_cast(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         assert x.dim() == 2 and x.size(1) % 128 == 0
