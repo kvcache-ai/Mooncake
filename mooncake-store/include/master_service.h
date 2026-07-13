@@ -825,7 +825,6 @@ class MasterService {
      * @return void on success, SerializationError on failure
      */
     tl::expected<void, SerializationError> ApplySnapshotState(
-        const ha::MasterSnapshotPayloads& payloads,
         const std::chrono::system_clock::time_point& now);
 
     // BatchEvict evicts objects in a near-LRU way, i.e., prioritizes to evict

@@ -157,17 +157,14 @@ MasterSnapshotRepository::LoadLatestSnapshot() {
 
 tl::expected<std::vector<ha::SnapshotDescriptor>, ErrorCode>
 MasterSnapshotRepository::LoadRestoreCandidates(
-    const std::optional<std::string>& latest_id) {
+    const std::optional<ha::SnapshotDescriptor>& latest_snapshot) {
     std::vector<ha::SnapshotDescriptor> candidates;
     std::unordered_set<std::string> candidate_ids;
 
     // Add latest snapshot if provided
-    if (latest_id.has_value()) {
-        auto latest_result = LoadLatestSnapshot();
-        if (latest_result) {
-            candidates.push_back(latest_result.value());
-            candidate_ids.emplace(latest_result->snapshot_id);
-        }
+    if (latest_snapshot.has_value()) {
+        candidates.push_back(latest_snapshot.value());
+        candidate_ids.emplace(latest_snapshot->snapshot_id);
     }
 
     // List all snapshots as fallback
@@ -182,7 +179,8 @@ MasterSnapshotRepository::LoadRestoreCandidates(
 
     // Filter by latest_id chronologically (snapshot IDs use timestamp format)
     for (const auto& snapshot : list_result.value()) {
-        if (latest_id.has_value() && snapshot.snapshot_id > latest_id.value()) {
+        if (latest_snapshot.has_value() &&
+            snapshot.snapshot_id > latest_snapshot->snapshot_id) {
             continue;
         }
         if (candidate_ids.emplace(snapshot.snapshot_id).second) {
@@ -199,6 +197,10 @@ MasterSnapshotRepository::DownloadSnapshotPayloads(
     const std::string& snapshot_id = descriptor.snapshot_id;
     std::string path_prefix = descriptor.object_prefix;
     if (path_prefix.empty()) {
+        if (!catalog_store_) {
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::INVALID_PARAMS, "catalog_store is null"));
+        }
         path_prefix = catalog_store_->GetSnapshotRoot() + snapshot_id + "/";
     }
 

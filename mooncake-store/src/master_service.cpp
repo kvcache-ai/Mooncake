@@ -5902,17 +5902,17 @@ void MasterService::RestoreState() {
 
     // Phase 1: Find snapshot candidates (repository responsibility)
     auto latest_result = snapshot_repository_->LoadLatestSnapshot();
-    std::optional<std::string> latest_id;
+    std::optional<ha::SnapshotDescriptor> latest_snapshot;
     if (!latest_result) {
         LOG(WARNING) << "[Restore] Failed to load latest snapshot marker: "
                      << toString(latest_result.error())
                      << ", falling back to published snapshot listing";
     } else {
-        latest_id = latest_result->snapshot_id;
+        latest_snapshot = latest_result.value();
     }
 
     auto candidates_result =
-        snapshot_repository_->LoadRestoreCandidates(latest_id);
+        snapshot_repository_->LoadRestoreCandidates(latest_snapshot);
     if (!candidates_result || candidates_result->empty()) {
         LOG(ERROR) << "[Restore] No previous snapshot found, starting fresh";
         return;
@@ -5945,7 +5945,7 @@ void MasterService::RestoreState() {
         }
 
         // Phase 3: Apply state (master service responsibility)
-        auto apply_result = ApplySnapshotState(payloads_result.value(), now);
+        auto apply_result = ApplySnapshotState(now);
         if (!apply_result) {
             LOG(WARNING) << "[Restore] Snapshot candidate "
                          << snapshot.snapshot_id
@@ -6279,7 +6279,6 @@ void MasterService::ResetStateAfterFailedRestoreAttempt() {
 }
 
 tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
-    const ha::MasterSnapshotPayloads& payloads,
     const std::chrono::system_clock::time_point& now) {
     // Note: Codec has already called Deserialize() on all payloads,
     // so the internal state is already restored. This method handles

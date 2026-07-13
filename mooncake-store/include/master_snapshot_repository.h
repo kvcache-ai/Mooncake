@@ -92,11 +92,13 @@ class MasterSnapshotRepository {
 
     /**
      * @brief Load all restorable snapshot descriptors
-     * @param latest_id Optional latest snapshot ID to filter candidates
+     * @param latest_snapshot Optional latest snapshot descriptor to filter
+     * candidates
      * @return Vector of candidate snapshots in chronological order, or error
      */
     tl::expected<std::vector<ha::SnapshotDescriptor>, ErrorCode>
-    LoadRestoreCandidates(const std::optional<std::string>& latest_id);
+    LoadRestoreCandidates(
+        const std::optional<ha::SnapshotDescriptor>& latest_snapshot);
 
     /**
      * @brief Download snapshot payloads from object storage
