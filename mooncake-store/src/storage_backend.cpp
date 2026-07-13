@@ -165,7 +165,7 @@ OffsetAllocatorBackendConfig OffsetAllocatorBackendConfig::FromEnvironment() {
                           static_cast<int64_t>(cfg.max_evict_per_offload));
     if (max_evict_raw > 0) {
         cfg.max_evict_per_offload = static_cast<size_t>(max_evict_raw);
-    } else if (max_evict_raw == 0) {
+    } else if (max_evict_raw <= 0) {
         LOG(WARNING) << "MOONCAKE_OFFSET_MAX_EVICT_PER_OFFLOAD="
                      << max_evict_raw << " is non-positive; using default "
                      << cfg.max_evict_per_offload;
@@ -3250,8 +3250,13 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
                 uint64_t now_largest =
                     allocator_->get_metrics().largest_free_region_;
                 if (before == evicted_keys.size()) break;  // no victims at all
-                if (now_largest <= prev_largest + record_size / 2)
-                    break;  // largest free region not growing meaningfully
+                // Stop if the largest free region did not grow at all.
+                // Using `prev_largest` (rather than `prev_largest +
+                // record_size / 2`) allows gradual coalescence when
+                // many small victims must be evicted for one large
+                // allocation.  The `fallback_total_evicted` cap still
+                // bounds total eviction per key.
+                if (now_largest <= prev_largest) break;
                 prev_largest = now_largest;
                 allocation = allocator_->allocate(record_size);
             }
