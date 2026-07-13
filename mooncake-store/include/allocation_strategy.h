@@ -28,9 +28,13 @@ class SegmentAllocator {
         }
         auto buffer = allocator_->allocate(size);
         if (buffer) {
-            buffer->bindSegmentLifetime(lifetime_);
+            bindSegmentLifetime(*buffer);
         }
         return buffer;
+    }
+
+    void bindSegmentLifetime(AllocatedBuffer& buffer) const {
+        buffer.bindSegmentLifetime(lifetime_);
     }
 
     [[nodiscard]] size_t size() const {
