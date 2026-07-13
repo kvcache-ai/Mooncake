@@ -60,7 +60,42 @@ All methods are attached to `MooncakeDistributedStore` after
 `import mooncake` (or `from mooncake.store import MooncakeDistributedStore` once
 the store module is loaded).
 
-### Generic file I/O
+### General APIs
+
+`save_tensor` and `load_tensor` are the recommended entry points. They route to
+the specialized file/KV-cache helpers below based on `artifact_kind`.
+
+```python
+# Store only
+store.save_tensor("session/kv", tensor)
+tensor = store.load_tensor("session/kv")
+
+# Store + safetensors export/import
+store.save_tensor(
+    "session/kv",
+    tensor,
+    file_name="/tmp/kv.safetensors",
+    artifact_kind="safetensor",
+)
+tensor = store.load_tensor(
+    "session/kv",
+    file_name="/tmp/kv.safetensors",
+    artifact_kind="safetensor",
+)
+
+# KV cache alias
+store.save_tensor(
+    "session/kv",
+    tensor,
+    file_name="s3://bucket/kv.safetensors",
+    artifact_kind="kv_cache",
+)
+```
+
+`artifact_kind` accepts `tensor`, `kv_cache`, or `safetensor` (plus common
+aliases such as `kvcache` and `safetensors`).
+
+### Specialized file I/O
 
 ```python
 store.save_tensor_to_file(

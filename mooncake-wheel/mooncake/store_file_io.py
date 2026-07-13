@@ -4,7 +4,9 @@ import logging
 import os
 import posixpath
 from importlib import import_module
-from typing import Any
+from typing import Any, Literal
+
+TensorArtifactKind = Literal["tensor", "kv_cache", "safetensor"]
 
 
 LOGGER = logging.getLogger(__name__)
@@ -43,6 +45,24 @@ def _normalize_format(format_name: str, file_name: str) -> str:
         return "torch"
 
     raise ValueError(f"Unsupported file format: {format_name}")
+
+
+def _normalize_artifact_kind(artifact_kind: str | None) -> str:
+    if artifact_kind is None:
+        return "tensor"
+
+    normalized = artifact_kind.lower().replace("-", "_")
+    if normalized in {"tensor", "generic", "file"}:
+        return "tensor"
+    if normalized in {"kv_cache", "kvcache", "kv"}:
+        return "kv_cache"
+    if normalized in {"safetensor", "safetensors", "safe_tensors"}:
+        return "safetensor"
+
+    raise ValueError(
+        f"Unsupported artifact_kind: {artifact_kind!r}; "
+        "expected 'tensor', 'kv_cache', or 'safetensor'"
+    )
 
 
 def _normalize_filesystem(filesystem: str | None) -> str:
@@ -426,6 +446,116 @@ def _load_tensor_from_safetensor(
     )
 
 
+def _save_tensor(
+    self,
+    key: str,
+    tensor: Any | None = None,
+    *,
+    file_name: os.PathLike[str] | str | None = None,
+    artifact_kind: str = "tensor",
+    format: str = "auto",
+    filesystem: str = "auto",
+    storage_options: dict[str, Any] | None = None,
+    tensor_name: str | None = None,
+) -> int:
+    """General save API: write to Store, export to file, or both."""
+    if tensor is not None:
+        rc = self.put_tensor(key, tensor)
+        if rc != 0:
+            return rc
+
+    if file_name is None:
+        if tensor is None:
+            LOGGER.error(
+                "save_tensor requires tensor when file_name is omitted (key=%s)",
+                key,
+            )
+            return INVALID_PARAMS
+        return 0
+
+    kind = _normalize_artifact_kind(artifact_kind)
+    if kind == "safetensor":
+        return self.save_tensor_to_safetensor(
+            key,
+            file_name=file_name,
+            filesystem=filesystem,
+            storage_options=storage_options,
+            tensor_name=tensor_name,
+        )
+    if kind == "kv_cache":
+        return self.save_kv_cache_to_file(
+            key,
+            file_name,
+            format=format,
+            filesystem=filesystem,
+            storage_options=storage_options,
+            tensor_name=tensor_name,
+        )
+    return self.save_tensor_to_file(
+        key,
+        file_name=file_name,
+        format=format,
+        filesystem=filesystem,
+        storage_options=storage_options,
+        tensor_name=tensor_name,
+    )
+
+
+def _load_tensor(
+    self,
+    key: str | None = None,
+    *,
+    file_name: os.PathLike[str] | str | None = None,
+    artifact_kind: str = "tensor",
+    format: str = "auto",
+    filesystem: str = "auto",
+    storage_options: dict[str, Any] | None = None,
+    tensor_name: str | None = None,
+    map_location: Any = None,
+    weights_only: bool = True,
+    allow_unsafe_remote_torch_load: bool = False,
+):
+    """General load API: read from file into Store or fetch from Store."""
+    if file_name is not None:
+        kind = _normalize_artifact_kind(artifact_kind)
+        if kind == "safetensor":
+            return self.load_tensor_from_safetensor(
+                key=key,
+                file_name=file_name,
+                filesystem=filesystem,
+                storage_options=storage_options,
+                tensor_name=tensor_name,
+            )
+        if kind == "kv_cache":
+            return self.load_kv_cache_from_file(
+                key=key,
+                file_name=file_name,
+                format=format,
+                filesystem=filesystem,
+                storage_options=storage_options,
+                tensor_name=tensor_name,
+                map_location=map_location,
+                weights_only=weights_only,
+                allow_unsafe_remote_torch_load=allow_unsafe_remote_torch_load,
+            )
+        return self.load_tensor_from_file(
+            key=key,
+            file_name=file_name,
+            format=format,
+            filesystem=filesystem,
+            storage_options=storage_options,
+            tensor_name=tensor_name,
+            map_location=map_location,
+            weights_only=weights_only,
+            allow_unsafe_remote_torch_load=allow_unsafe_remote_torch_load,
+        )
+
+    if key is None:
+        LOGGER.error("load_tensor requires key when file_name is omitted")
+        return None
+    return self.get_tensor(key)
+
+
 def patch_store_file_io_support() -> None:
     try:
         store_module = import_module("mooncake.store")
@@ -449,4 +579,6 @@ def patch_store_file_io_support() -> None:
     store_cls.load_kv_cache_from_file = _load_tensor_from_file
     store_cls.save_tensor_to_safetensor = _save_tensor_to_safetensor
     store_cls.load_tensor_from_safetensor = _load_tensor_from_safetensor
+    store_cls.save_tensor = _save_tensor
+    store_cls.load_tensor = _load_tensor
     store_cls._mooncake_file_io_patched = True

@@ -2548,6 +2548,110 @@ pip install s3fs                                   # only for s3:// paths
 `fsspec` is a runtime dependency of the wheel. Remote backends need their own
 fsspec implementation package.
 
+#### save_tensor()
+
+General save entry point that unifies in-store writes and file exports.
+
+```python
+def save_tensor(
+    self,
+    key: str,
+    tensor: torch.Tensor | None = None,
+    *,
+    file_name: str | os.PathLike | None = None,
+    artifact_kind: str = "tensor",
+    format: str = "auto",
+    filesystem: str = "auto",
+    storage_options: dict | None = None,
+    tensor_name: str | None = None,
+) -> int
+```
+
+**Behavior:**
+
+| `tensor` | `file_name` | Action |
+|----------|-------------|--------|
+| provided | omitted | `put_tensor(key, tensor)` |
+| provided | provided | `put_tensor`, then export to file |
+| omitted | provided | export existing Store tensor to file |
+| omitted | omitted | error (`INVALID_PARAMS`) |
+
+**`artifact_kind` routing:**
+
+| Value | Export API used |
+|-------|-----------------|
+| `"tensor"` (default) | `save_tensor_to_file` |
+| `"kv_cache"` | `save_kv_cache_to_file` |
+| `"safetensor"` | `save_tensor_to_safetensor` |
+
+**Example:**
+
+```python
+# Store only
+store.save_tensor("weights/demo", tensor)
+
+# Store + export
+store.save_tensor(
+    "weights/demo",
+    tensor,
+    file_name="/tmp/demo.safetensors",
+    artifact_kind="safetensor",
+)
+
+# Export an object that is already in Store
+store.save_tensor("weights/demo", file_name="s3://bucket/demo.safetensors")
+```
+
+#### load_tensor()
+
+General load entry point that unifies file imports and in-store reads.
+
+```python
+def load_tensor(
+    self,
+    key: str | None = None,
+    *,
+    file_name: str | os.PathLike | None = None,
+    artifact_kind: str = "tensor",
+    format: str = "auto",
+    filesystem: str = "auto",
+    storage_options: dict | None = None,
+    tensor_name: str | None = None,
+    map_location=None,
+    weights_only: bool = True,
+    allow_unsafe_remote_torch_load: bool = False,
+) -> torch.Tensor | None
+```
+
+**Behavior:**
+
+| `file_name` | Action |
+|-------------|--------|
+| provided | load from file into Store and return tensor |
+| omitted | `get_tensor(key)` |
+
+**`artifact_kind` routing:**
+
+| Value | Import API used |
+|-------|-----------------|
+| `"tensor"` (default) | `load_tensor_from_file` |
+| `"kv_cache"` | `load_kv_cache_from_file` |
+| `"safetensor"` | `load_tensor_from_safetensor` |
+
+**Example:**
+
+```python
+# Read from Store
+tensor = store.load_tensor("weights/demo")
+
+# Import from file
+tensor = store.load_tensor(
+    "weights/demo",
+    file_name="/tmp/demo.safetensors",
+    artifact_kind="safetensor",
+)
+```
+
 #### save_tensor_to_file()
 
 Export a tensor already stored under `key` to a file.

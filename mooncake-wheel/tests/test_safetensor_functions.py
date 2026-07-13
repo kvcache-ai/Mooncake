@@ -521,6 +521,121 @@ class TestSafetensorFunctions(unittest.TestCase):
             if os.path.exists(temp_filename):
                 os.remove(temp_filename)
 
+    def test_save_tensor_put_only(self):
+        """General save_tensor API can write directly to Store."""
+        import torch
+
+        tensor = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32)
+        key_suffix = uuid.uuid4().hex
+        key = f"test_save_tensor_put_{key_suffix}"
+
+        result = self.store.save_tensor(key, tensor)
+        self.assertEqual(result, 0)
+
+        try:
+            retrieved = self.store.load_tensor(key)
+            self.assertIsNotNone(retrieved)
+            self.assertTrue(torch.allclose(tensor, retrieved))
+        finally:
+            time.sleep(default_kv_lease_ttl / 1000)
+            self.store.remove(key)
+
+    def test_save_tensor_put_and_export(self):
+        """General save_tensor API can write to Store and export in one call."""
+        import torch
+
+        tensor = torch.tensor([4.0, 5.0, 6.0], dtype=torch.float32)
+        key_suffix = uuid.uuid4().hex
+        key = f"test_save_tensor_export_{key_suffix}"
+
+        with tempfile.NamedTemporaryFile(
+            suffix=".safetensors", delete=False
+        ) as temp_file:
+            temp_filename = temp_file.name
+
+        try:
+            result = self.store.save_tensor(
+                key,
+                tensor,
+                file_name=temp_filename,
+                artifact_kind="safetensor",
+                tensor_name="payload",
+            )
+            self.assertEqual(result, 0)
+            self.assertTrue(os.path.exists(temp_filename))
+
+            restored_key = f"{key}_restored"
+            loaded = self.store.load_tensor(
+                restored_key,
+                file_name=temp_filename,
+                artifact_kind="safetensor",
+                tensor_name="payload",
+            )
+            self.assertIsNotNone(loaded)
+            self.assertTrue(torch.allclose(tensor, loaded))
+        finally:
+            if os.path.exists(temp_filename):
+                os.remove(temp_filename)
+
+            time.sleep(default_kv_lease_ttl / 1000)
+            self.store.remove(key)
+            self.store.remove(f"{key}_restored")
+
+    def test_save_tensor_routes_kv_cache_kind(self):
+        """General save_tensor routes kv_cache artifacts through KV cache aliases."""
+        import torch
+
+        tensor = torch.tensor([7.0, 8.0], dtype=torch.float32)
+        key_suffix = uuid.uuid4().hex
+        key = f"test_save_tensor_kv_{key_suffix}"
+
+        with tempfile.NamedTemporaryFile(
+            suffix=".safetensors", delete=False
+        ) as temp_file:
+            temp_filename = temp_file.name
+
+        try:
+            result = self.store.save_tensor(
+                key,
+                tensor,
+                file_name=temp_filename,
+                artifact_kind="kv_cache",
+            )
+            self.assertEqual(result, 0)
+
+            restored_key = f"{key}_restored"
+            loaded = self.store.load_tensor(
+                restored_key,
+                file_name=temp_filename,
+                artifact_kind="kv_cache",
+            )
+            self.assertIsNotNone(loaded)
+            self.assertTrue(torch.allclose(tensor, loaded))
+        finally:
+            if os.path.exists(temp_filename):
+                os.remove(temp_filename)
+
+            time.sleep(default_kv_lease_ttl / 1000)
+            self.store.remove(key)
+            self.store.remove(f"{key}_restored")
+
+    def test_load_tensor_from_store_only(self):
+        """General load_tensor API can read directly from Store."""
+        import torch
+
+        tensor = torch.tensor([9.0, 10.0], dtype=torch.float32)
+        key_suffix = uuid.uuid4().hex
+        key = f"test_load_tensor_store_{key_suffix}"
+
+        self.assertEqual(self.store.put_tensor(key, tensor), 0)
+        try:
+            loaded = self.store.load_tensor(key)
+            self.assertIsNotNone(loaded)
+            self.assertTrue(torch.allclose(tensor, loaded))
+        finally:
+            time.sleep(default_kv_lease_ttl / 1000)
+            self.store.remove(key)
+
 
 if __name__ == "__main__":
     unittest.main()
