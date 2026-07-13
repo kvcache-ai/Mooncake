@@ -5,7 +5,7 @@ from typing import Any, List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
-from .mooncake_ep_buffer import EventOverlap
+from .mooncake_ep_buffer import EventOverlap, _native_current_stream_ptr
 
 
 def _using_musa_backend() -> bool:
@@ -402,6 +402,18 @@ class ElasticBuffer:
     def get_logical_domain_size(self) -> Tuple[int, int]:
         return self.num_scaleout_ranks, self.num_scaleup_ranks
 
+    @staticmethod
+    def _hybrid_num_channels(num_sms: int) -> int:
+        return max(1, num_sms) * 4
+
+    @staticmethod
+    def _hybrid_num_max_tokens_per_channel(
+        num_max_tokens_per_rank: int, num_sms: int
+    ) -> int:
+        return _ceil_div(
+            num_max_tokens_per_rank, ElasticBuffer._hybrid_num_channels(num_sms)
+        )
+
     def barrier(self, use_comm_stream: bool = True, with_cpu_sync: bool = False) -> None:
         if with_cpu_sync:
             torch.cuda.synchronize()
@@ -413,7 +425,7 @@ class ElasticBuffer:
     def capture() -> Any:
         from mooncake import ep
 
-        return ep.EventHandle()
+        return ep.EventHandle(_native_current_stream_ptr())
 
     def get_theoretical_num_sms(self, num_experts: int, num_topk: int) -> int:
         device = torch.cuda.current_device()
@@ -443,6 +455,8 @@ class ElasticBuffer:
                 raise AssertionError("topk_idx and topk_weights must be None when cached handle is provided")
             if do_cpu_sync:
                 raise AssertionError("Cannot do CPU sync with cached handle")
+            if do_expand or handle.do_expand:
+                raise AssertionError("Cached EPHandle currently supports only do_expand=False")
             if handle.native_handle is None:
                 raise RuntimeError("Cached EPHandle is missing its native Mooncake handle")
             topk_idx = handle.topk_idx
@@ -466,72 +480,237 @@ class ElasticBuffer:
 
         x_data = x[0] if isinstance(x, tuple) else x
         sf = x[1] if isinstance(x, tuple) else None
+        assert x_data.dim() == 2 and x_data.is_contiguous()
         if num_experts is None:
             num_experts = int(torch.max(topk_idx).item()) + 1
         if num_max_tokens_per_rank is None:
             num_max_tokens_per_rank = self.num_max_tokens_per_rank or x_data.shape[0]
         if num_sms is None:
             num_sms = self.get_theoretical_num_sms(num_experts, topk_idx.shape[1])
+        num_tokens = int(x_data.shape[0])
+        hidden = int(x_data.shape[1])
+        num_topk = int(topk_idx.shape[1])
+        num_local_experts = num_experts // self.num_ranks
+        num_recv_tokens = num_max_tokens_per_rank * self.num_ranks
+        num_recv_output_capacity = num_recv_tokens * num_topk if do_expand else num_recv_tokens
+        use_hybrid = self.num_scaleout_ranks != 1
+        hybrid_channels = self._hybrid_num_channels(num_sms) if use_hybrid else 0
+        hybrid_max_tokens_per_channel = (
+            self._hybrid_num_max_tokens_per_channel(num_max_tokens_per_rank, num_sms)
+            if use_hybrid
+            else 0
+        )
+        num_sf_packs = int(sf.shape[1]) if sf is not None else 0
+        sf_token_stride = int(sf.stride(0)) if sf is not None else 0
+        sf_hidden_stride = int(sf.stride(1)) if sf is not None else 0
 
         active_ranks = torch.ones(self.num_ranks, dtype=torch.int32, device=x_data.device)
-        output = self.runtime.dispatch(
-            x_data,
-            sf,
-            topk_idx,
-            topk_weights,
-            active_ranks,
+        full_psum_num_recv_tokens_per_expert = (
+            handle.psum_num_recv_tokens_per_expert
+            if handle is not None and do_expand
+            else (
+                torch.cat(
+                    (
+                        torch.zeros(
+                            1, dtype=torch.int32, device=x_data.device
+                        ),
+                        handle.psum_num_recv_tokens_per_expert,
+                    )
+                )
+                if handle is not None
+                else torch.empty(
+                    num_local_experts + 1, dtype=torch.int32, device=x_data.device
+                )
+            )
+        )
+        psum_num_recv_tokens_per_scaleup_rank = (
+            handle.psum_num_recv_tokens_per_scaleup_rank
+            if handle is not None
+            else torch.empty(self.num_scaleup_ranks, dtype=torch.int32, device=x_data.device)
+        )
+        dst_buffer_slot_idx = (
+            handle.dst_buffer_slot_idx
+            if handle is not None
+            else (
+                torch.empty(
+                    (
+                        hybrid_channels,
+                        self.num_scaleout_ranks,
+                        hybrid_max_tokens_per_channel,
+                        num_topk,
+                    ),
+                    dtype=torch.int32,
+                    device=x_data.device,
+                )
+                if use_hybrid
+                else torch.empty((num_tokens, num_topk), dtype=torch.int32, device=x_data.device)
+            )
+        )
+        token_metadata_at_forward = (
+            handle.token_metadata_at_forward
+            if handle is not None
+            else (
+                torch.empty(
+                    (
+                        hybrid_channels,
+                        self.num_scaleout_ranks * hybrid_max_tokens_per_channel + 1,
+                        2 + num_topk * 2,
+                    ),
+                    dtype=torch.int32,
+                    device=x_data.device,
+                )
+                if use_hybrid
+                else None
+            )
+        )
+        channel_linked_list = (
+            handle.channel_linked_list
+            if handle is not None
+            else (
+                torch.empty(
+                    (
+                        hybrid_channels,
+                        self.num_scaleout_ranks * hybrid_max_tokens_per_channel + 1,
+                        self.num_scaleup_ranks,
+                    ),
+                    dtype=torch.int32,
+                    device=x_data.device,
+                )
+                if use_hybrid
+                else None
+            )
+        )
+        recv_x = torch.empty((num_recv_output_capacity, hidden), dtype=x_data.dtype, device=x_data.device)
+        recv_x_scales = (
+            torch.empty((num_recv_output_capacity, num_sf_packs), dtype=sf.dtype, device=sf.device)
+            if sf is not None
+            else None
+        )
+        recv_topk_idx = torch.empty((num_recv_tokens, num_topk), dtype=topk_idx.dtype, device=topk_idx.device)
+        recv_topk_weights = (
+            torch.empty(
+                (num_recv_output_capacity,) if do_expand else (num_recv_tokens, num_topk),
+                dtype=topk_weights.dtype,
+                device=topk_weights.device,
+            )
+            if topk_weights is not None
+            else None
+        )
+        recv_src_metadata = torch.empty(
+            (num_recv_tokens, num_topk + 2), dtype=torch.int32, device=x_data.device
+        )
+        event = self.runtime.dispatch(
+            x_data.data_ptr(),
+            x_data.element_size(),
+            0 if sf is None else sf.data_ptr(),
+            num_tokens,
+            hidden,
+            num_sf_packs,
+            sf_token_stride,
+            sf_hidden_stride,
+            topk_idx.data_ptr(),
+            num_topk,
+            0 if topk_weights is None else topk_weights.data_ptr(),
+            active_ranks.data_ptr(),
             num_experts,
             num_max_tokens_per_rank,
             expert_alignment,
             num_sms,
             do_expand,
-            do_cpu_sync,
             async_with_compute_stream,
-            handle.native_handle if handle is not None else None,
+            _native_current_stream_ptr(),
+            handle is not None,
+            psum_num_recv_tokens_per_scaleup_rank.data_ptr(),
+            full_psum_num_recv_tokens_per_expert.data_ptr(),
+            dst_buffer_slot_idx.data_ptr(),
+            0 if token_metadata_at_forward is None else token_metadata_at_forward.data_ptr(),
+            0 if channel_linked_list is None else channel_linked_list.data_ptr(),
+            recv_x.data_ptr(),
+            0 if recv_x_scales is None else recv_x_scales.data_ptr(),
+            recv_topk_idx.data_ptr(),
+            0 if recv_topk_weights is None else recv_topk_weights.data_ptr(),
+            recv_src_metadata.data_ptr(),
         )
-        native_handle = output.handle
+        handle_psum_num_recv_tokens_per_expert = (
+            full_psum_num_recv_tokens_per_expert
+            if do_expand
+            else full_psum_num_recv_tokens_per_expert[1:]
+        )
+
+        num_recv_tokens_per_expert_list: List[int] = []
+        if do_cpu_sync:
+            scaleup_psum_cpu = psum_num_recv_tokens_per_scaleup_rank.cpu()
+            expert_psum_cpu = full_psum_num_recv_tokens_per_expert.cpu()
+            actual_num_recv_tokens = int(scaleup_psum_cpu[self.num_scaleup_ranks - 1].item())
+            actual_num_output_tokens = actual_num_recv_tokens
+
+            def _align_count(value: int) -> int:
+                return _ceil_div(value, expert_alignment) * expert_alignment
+
+            if do_expand:
+                previous_psum = 0
+                for i in range(num_local_experts):
+                    current_psum = int(expert_psum_cpu[i].item())
+                    count = current_psum - _align_count(previous_psum)
+                    num_recv_tokens_per_expert_list.append(count)
+                    previous_psum = current_psum
+                actual_num_output_tokens = (
+                    0 if num_local_experts == 0 else int(expert_psum_cpu[num_local_experts - 1].item())
+                )
+            else:
+                for i in range(num_local_experts):
+                    count = int(expert_psum_cpu[i + 1].item() - expert_psum_cpu[i].item())
+                    num_recv_tokens_per_expert_list.append(count)
+
+            recv_x = recv_x[:actual_num_output_tokens]
+            if recv_x_scales is not None:
+                recv_x_scales = recv_x_scales[:actual_num_output_tokens]
+            recv_topk_idx = recv_topk_idx[:actual_num_recv_tokens]
+            if recv_topk_weights is not None:
+                recv_topk_weights = recv_topk_weights[:actual_num_output_tokens]
+            recv_src_metadata = recv_src_metadata[:actual_num_recv_tokens]
 
         elastic_handle = EPHandle(
-            do_expand=native_handle.do_expand,
-            num_experts=native_handle.num_experts,
-            expert_alignment=native_handle.expert_alignment,
-            num_max_tokens_per_rank=native_handle.num_max_tokens_per_rank,
-            num_sms=native_handle.num_sms,
-            topk_idx=native_handle.topk_idx,
-            num_recv_tokens_per_expert_list=list(native_handle.num_recv_tokens_per_expert_list),
-            psum_num_recv_tokens_per_scaleup_rank=native_handle.psum_num_recv_tokens_per_scaleup_rank,
-            psum_num_recv_tokens_per_expert=native_handle.psum_num_recv_tokens_per_expert,
-            recv_src_metadata=native_handle.recv_src_metadata,
-            dst_buffer_slot_idx=native_handle.dst_buffer_slot_idx,
-            token_metadata_at_forward=native_handle.token_metadata_at_forward,
-            channel_linked_list=native_handle.channel_linked_list,
-            native_handle=native_handle,
+            do_expand=do_expand,
+            num_experts=num_experts,
+            expert_alignment=expert_alignment,
+            num_max_tokens_per_rank=num_max_tokens_per_rank,
+            num_sms=num_sms,
+            topk_idx=handle.topk_idx if handle is not None else topk_idx.clone(),
+            num_recv_tokens_per_expert_list=num_recv_tokens_per_expert_list,
+            psum_num_recv_tokens_per_scaleup_rank=psum_num_recv_tokens_per_scaleup_rank,
+            psum_num_recv_tokens_per_expert=handle_psum_num_recv_tokens_per_expert,
+            recv_src_metadata=recv_src_metadata,
+            dst_buffer_slot_idx=dst_buffer_slot_idx,
+            token_metadata_at_forward=token_metadata_at_forward,
+            channel_linked_list=channel_linked_list,
+            native_handle=True,
         )
-        recv_x = (output.recv_x, output.recv_x_scales) if output.recv_x_scales is not None else output.recv_x
+        recv_x_out = (recv_x, recv_x_scales) if recv_x_scales is not None else recv_x
         tensors_to_record = (
             x_data,
             topk_idx,
             active_ranks,
-            output.recv_x,
-            output.recv_topk_idx,
-            native_handle.topk_idx,
-            native_handle.psum_num_recv_tokens_per_scaleup_rank,
-            native_handle.psum_num_recv_tokens_per_expert,
-            native_handle.recv_src_metadata,
-            native_handle.dst_buffer_slot_idx,
+            recv_x,
+            recv_topk_idx,
+            elastic_handle.topk_idx,
+            elastic_handle.psum_num_recv_tokens_per_scaleup_rank,
+            elastic_handle.psum_num_recv_tokens_per_expert,
+            elastic_handle.recv_src_metadata,
+            elastic_handle.dst_buffer_slot_idx,
             *(() if sf is None else (sf,)),
             *(() if topk_weights is None else (topk_weights,)),
-            *(() if output.recv_x_scales is None else (output.recv_x_scales,)),
-            *(() if output.recv_topk_weights is None else (output.recv_topk_weights,)),
-            *(() if native_handle.token_metadata_at_forward is None else (native_handle.token_metadata_at_forward,)),
-            *(() if native_handle.channel_linked_list is None else (native_handle.channel_linked_list,)),
+            *(() if recv_x_scales is None else (recv_x_scales,)),
+            *(() if recv_topk_weights is None else (recv_topk_weights,)),
+            *(() if elastic_handle.token_metadata_at_forward is None else (elastic_handle.token_metadata_at_forward,)),
+            *(() if elastic_handle.channel_linked_list is None else (elastic_handle.channel_linked_list,)),
         )
         return (
-            recv_x,
-            output.recv_topk_idx,
-            output.recv_topk_weights,
+            recv_x_out,
+            recv_topk_idx,
+            recv_topk_weights,
             elastic_handle,
-            EventOverlap(output.event, tensors_to_record if async_with_compute_stream else None),
+            EventOverlap(event, tensors_to_record if async_with_compute_stream else None),
         )
 
     def combine(
@@ -546,36 +725,52 @@ class ElasticBuffer:
             raise RuntimeError("ElasticBuffer has been destroyed")
         if handle.native_handle is None:
             raise RuntimeError("Mooncake EPHandle does not contain a native handle")
+        assert x.dim() == 2 and x.is_contiguous()
+        assert x.dtype == torch.bfloat16
         active_ranks = torch.ones(self.num_ranks, dtype=torch.int32, device=x.device)
         if topk_weights is None:
             topk_weights = torch.ones_like(handle.topk_idx, dtype=torch.float32, device=x.device)
-        output = self.runtime.combine(
-            x,
-            handle.native_handle,
-            topk_weights,
-            active_ranks,
+        combined_x = torch.empty(
+            (handle.topk_idx.shape[0], x.shape[1]), dtype=x.dtype, device=x.device
+        )
+        event = self.runtime.combine(
+            x.data_ptr(),
+            x.shape[0],
+            x.shape[1],
+            handle.topk_idx.data_ptr(),
+            handle.topk_idx.shape[0],
+            handle.topk_idx.shape[1],
+            topk_weights.data_ptr(),
+            handle.psum_num_recv_tokens_per_scaleup_rank.data_ptr(),
+            handle.recv_src_metadata.data_ptr(),
+            0 if handle.token_metadata_at_forward is None else handle.token_metadata_at_forward.data_ptr(),
+            0 if handle.channel_linked_list is None else handle.channel_linked_list.data_ptr(),
+            active_ranks.data_ptr(),
+            handle.num_experts,
+            handle.num_max_tokens_per_rank,
+            handle.do_expand,
             num_sms if num_sms is not None else handle.num_sms,
             async_with_compute_stream,
-            None,
+            _native_current_stream_ptr(),
+            combined_x.data_ptr(),
         )
-        native_handle = handle.native_handle
         tensors_to_record = (
             x,
             topk_weights,
             active_ranks,
-            output.combined_x,
-            native_handle.topk_idx,
-            native_handle.psum_num_recv_tokens_per_scaleup_rank,
-            native_handle.psum_num_recv_tokens_per_expert,
-            native_handle.recv_src_metadata,
-            native_handle.dst_buffer_slot_idx,
-            *(() if native_handle.token_metadata_at_forward is None else (native_handle.token_metadata_at_forward,)),
-            *(() if native_handle.channel_linked_list is None else (native_handle.channel_linked_list,)),
+            combined_x,
+            handle.topk_idx,
+            handle.psum_num_recv_tokens_per_scaleup_rank,
+            handle.psum_num_recv_tokens_per_expert,
+            handle.recv_src_metadata,
+            handle.dst_buffer_slot_idx,
+            *(() if handle.token_metadata_at_forward is None else (handle.token_metadata_at_forward,)),
+            *(() if handle.channel_linked_list is None else (handle.channel_linked_list,)),
         )
         return (
-            output.combined_x,
-            output.combined_topk_weights,
-            EventOverlap(output.event, tensors_to_record if async_with_compute_stream else None),
+            combined_x,
+            None,
+            EventOverlap(event, tensors_to_record if async_with_compute_stream else None),
         )
 
 
