@@ -278,6 +278,7 @@ static int encodeMultiProtocolSegmentDesc(
     segmentJSON["buffers"] = buffersJSON;
     segmentJSON["protocol"] = protocolJSON;
     segmentJSON["tcp_data_port"] = desc.tcp_data_port;
+    segmentJSON["tcp_proto_version"] = desc.tcp_proto_version;
     segmentJSON["timestamp"] = getCurrentDateTime();
 
     return 0;
@@ -319,6 +320,7 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
     segmentJSON["name"] = desc.name;
     segmentJSON["protocol"] = desc.protocol;
     segmentJSON["tcp_data_port"] = desc.tcp_data_port;
+    segmentJSON["tcp_proto_version"] = desc.tcp_proto_version;
     segmentJSON["timestamp"] = getCurrentDateTime();
     if (!desc.rdma_server_name.empty()) {
         segmentJSON["rdma_server_name"] = desc.rdma_server_name;
@@ -515,6 +517,9 @@ decodeMultiProtocolSegmentDesc(Json::Value &segmentJSON,
     auto desc = std::make_shared<TransferMetadata::SegmentDesc>();
     desc->name = segmentJSON["name"].asString();
     desc->tcp_data_port = segmentJSON["tcp_data_port"].asInt();
+    desc->tcp_proto_version = segmentJSON.isMember("tcp_proto_version")
+                                  ? segmentJSON["tcp_proto_version"].asInt()
+                                  : 1;
     if (segmentJSON.isMember("timestamp"))
         desc->timestamp = segmentJSON["timestamp"].asString();
     if (segmentJSON.isMember("rdma_server_name"))
@@ -670,6 +675,9 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
     desc->name = segmentJSON["name"].asString();
     desc->protocol = segmentJSON["protocol"].asString();
     desc->tcp_data_port = segmentJSON["tcp_data_port"].asInt();
+    desc->tcp_proto_version = segmentJSON.isMember("tcp_proto_version")
+                                  ? segmentJSON["tcp_proto_version"].asInt()
+                                  : 1;
     if (segmentJSON.isMember("timestamp"))
         desc->timestamp = segmentJSON["timestamp"].asString();
     if (segmentJSON.isMember("rdma_server_name"))

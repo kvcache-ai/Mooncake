@@ -111,6 +111,10 @@ class TransferMetadata {
         RankInfoDesc rank_info;
 
         int tcp_data_port;
+        // TCP data-plane protocol version advertised by this segment's
+        // server. v2 adds acknowledged WRITE framing and status-prefixed
+        // READ responses (#2086); absent/1 = legacy unacknowledged framing.
+        int tcp_proto_version{1};
 
         // In dual-NIC setups (MC_RDMA_BIND_ADDRESS), the RDMA-reachable
         // address may differ from the TCP-routable segment name.  When
