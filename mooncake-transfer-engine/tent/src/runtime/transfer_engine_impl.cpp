@@ -1489,6 +1489,7 @@ Status TransferEngineImpl::commitPreparedSubmit(
         task.staging = false;
         task.start_time =
             prepared.submit_time;  // Record start time for latency tracking
+        task.dispatch_time = prepared.submit_time;  // No queue wait on direct
         task.type = owner.route.transport;
         task.device_mask = owner.route.device_mask;
         if (owner.route.qp_pool) task.qp_pool = *owner.route.qp_pool;
@@ -1502,6 +1503,7 @@ Status TransferEngineImpl::commitPreparedSubmit(
         if (owner.staging) {
             task.staging = true;
             staging_proxy_->submit(&task, (BatchID)batch, owner.staging_params);
+            task.post_time = std::chrono::steady_clock::now();
             continue;
         }
 
@@ -1548,10 +1550,12 @@ Status TransferEngineImpl::commitPreparedSubmit(
         auto status = transport->submitTransferTasks(
             sub_batch, classified_request_list[type]);
         if (!status.ok()) {
-            // LOG(WARNING) << "Failed to submit SubBatch " << type << ":"
-            //              << status.ToString();
             for (auto& task_id : task_id_list[type])
                 batch->task_list[task_id].type = UNSPEC;
+        } else {
+            auto now = std::chrono::steady_clock::now();
+            for (auto& task_id : task_id_list[type])
+                batch->task_list[task_id].post_time = now;
         }
     }
 
@@ -1700,6 +1704,7 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
     const auto queued = queued_it->second;
     auto* batch = queued.batch;
     auto& task = batch->task_list[queued.owner_task_id];
+    task.dispatch_time = std::chrono::steady_clock::now();
     auto route = resolveTransport(task.request, 0);
     task.type = route.transport;
     task.device_mask = route.device_mask;
@@ -1716,6 +1721,7 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
             auto status =
                 staging_proxy_->submit(&task, (BatchID)batch, staging_params);
             if (!status.ok()) return finishQueuedOwner(owner_id, FAILED);
+            task.post_time = std::chrono::steady_clock::now();
             return markQueuedOwnerSubmitted(owner_id);
         }
     }
@@ -1742,6 +1748,7 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
         task.type = UNSPEC;
         return finishQueuedOwner(owner_id, FAILED);
     }
+    task.post_time = std::chrono::steady_clock::now();
     return markQueuedOwnerSubmitted(owner_id);
 }
 
@@ -2368,6 +2375,31 @@ void TransferEngineImpl::recordTaskCompletionMetrics(
                     TentMetrics::instance().recordWriteCompleted(
                         task.request.length, latency_seconds);
                 }
+#if TENT_METRICS_ENABLED
+                // Causal chain stage decomposition
+                if (task.dispatch_time.time_since_epoch().count() > 0) {
+                    double queue_wait_us =
+                        std::chrono::duration<double, std::micro>(
+                            task.dispatch_time - start_time)
+                            .count();
+                    TENT_RECORD_STAGE_LATENCY(TentMetrics::Stage::QueueWait,
+                                              queue_wait_us);
+                    if (task.post_time.time_since_epoch().count() > 0) {
+                        double dispatch_us =
+                            std::chrono::duration<double, std::micro>(
+                                task.post_time - task.dispatch_time)
+                                .count();
+                        double transport_us =
+                            std::chrono::duration<double, std::micro>(
+                                end_time - task.post_time)
+                                .count();
+                        TENT_RECORD_STAGE_LATENCY(TentMetrics::Stage::Dispatch,
+                                                  dispatch_us);
+                        TENT_RECORD_STAGE_LATENCY(TentMetrics::Stage::Transport,
+                                                  transport_us);
+                    }
+                }
+#endif
                 // Observability only (RFC #2519): if this transfer carried a
                 // deadline, emit the post-hoc feasibility ratio MLU =
                 // actual_transfer_time / available_window, where the window is
