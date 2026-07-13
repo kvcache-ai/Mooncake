@@ -12,8 +12,8 @@ use super::super::{
 };
 use super::{
     backend_remove_cold_payload_batch, backend_remove_pending_source,
-    backend_store_cold_payload_batch, backend_store_pending_source, read_local_hot_replica_payload,
-    same_cold_payload,
+    backend_store_cold_payload_batch, backend_store_pending_source, local_hot_replica_checksum,
+    read_local_hot_replica_payload, same_cold_payload,
 };
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -64,7 +64,7 @@ pub(in super::super) fn publish_initial_write_cold_backing(
         storage_owner.sync_route(route);
         return Ok(None);
     };
-    let Some(checksum) = replica.checksum else {
+    let Some(checksum) = checksum_for_cold_backing(storage_owner, route, replica)? else {
         storage_owner.sync_route(route);
         return Ok(None);
     };
@@ -173,7 +173,7 @@ pub(in super::super) fn publish_pending_cold_backing_for_eviction(
         storage_owner.sync_route(route);
         return Ok(None);
     };
-    let Some(checksum) = replica.checksum else {
+    let Some(checksum) = checksum_for_cold_backing(storage_owner, route, replica)? else {
         storage_owner.sync_route(route);
         return Ok(None);
     };
@@ -205,6 +205,35 @@ pub(in super::super) fn publish_pending_cold_backing_for_eviction(
             None => storage_owner.hot_replicas.remove_key(&route.key),
         }
         Ok(None)
+    }
+}
+
+fn checksum_for_cold_backing(
+    storage_owner: &StorageOwnerState,
+    route: &ObjectRoute,
+    replica: &mooncake_store_core::ReplicaRoute,
+) -> Result<Option<u64>> {
+    if let Some(checksum) = replica.checksum {
+        return Ok(Some(checksum));
+    }
+    match local_hot_replica_checksum(
+        &storage_owner.allocator,
+        &storage_owner.state,
+        route,
+        replica,
+    ) {
+        Ok(checksum) => Ok(Some(checksum)),
+        Err(error) => {
+            tracing::warn!(
+                runtime = %storage_owner.runtime,
+                key = %route.key.0,
+                route_version = route.version.0,
+                segment = %replica.segment_name.0,
+                error = %error,
+                "cold_tier_checksum_from_owner_hot_replica_failed"
+            );
+            Ok(None)
+        }
     }
 }
 

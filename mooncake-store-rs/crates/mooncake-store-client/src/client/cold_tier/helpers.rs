@@ -317,6 +317,32 @@ pub(in super::super) fn read_local_hot_replica_payload(
     Ok(payload)
 }
 
+pub(in super::super) fn local_hot_replica_checksum(
+    allocator: &Arc<Mutex<LocalAllocatorState>>,
+    state: &Arc<Mutex<StoreState>>,
+    route: &ObjectRoute,
+    replica: &ReplicaRoute,
+) -> Result<u64> {
+    if let Some(announcement) = allocator.lock().announcement(&replica.segment_name) {
+        if announcement.owner != replica.owner {
+            return Err(StoreError::InvalidState(format!(
+                "segment {} owner mismatch while checksumming {}",
+                replica.segment_name.0, route.key.0
+            )));
+        }
+    }
+    let payload = borrow_replica_payload_from_local_memory(state, replica)?;
+    if payload.len() != replica.length as usize {
+        return Err(StoreError::InvalidState(format!(
+            "route {} local payload length mismatch while checksumming: expected {} actual {}",
+            route.key.0,
+            replica.length,
+            payload.len()
+        )));
+    }
+    Ok(payload_checksum(payload.as_slice()))
+}
+
 fn borrow_replica_payload_from_local_memory(
     state: &Arc<Mutex<StoreState>>,
     replica: &ReplicaRoute,
