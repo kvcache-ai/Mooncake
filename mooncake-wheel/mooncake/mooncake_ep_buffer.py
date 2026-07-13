@@ -21,6 +21,18 @@ _USE_SPLIT_SEND_RECV = (
 )
 
 
+def _native_current_stream_ptr() -> int:
+    return int(torch.cuda.current_stream().cuda_stream)
+
+
+def _wait_native_event_on_current_stream(event: "ep.EventHandle") -> None:
+    stream_ptr = _native_current_stream_ptr()
+    if stream_ptr == 0:
+        event.synchronize()
+        return
+    event.current_stream_wait(stream_ptr)
+
+
 class EventOverlap:
     """
     A wrapper class to manage CUDA events, also for better overlapping convenience.
@@ -53,7 +65,7 @@ class EventOverlap:
         The current stream `torch.cuda.current_stream()` waits for the event to be finished.
         """
         assert self.event is not None
-        self.event.current_stream_wait()
+        _wait_native_event_on_current_stream(self.event)
 
     def __enter__(self) -> Any:
         """
@@ -76,7 +88,7 @@ class EventOverlap:
         Please follow the example in the `__enter__` function.
         """
         if self.event is not None:
-            self.event.current_stream_wait()
+            _wait_native_event_on_current_stream(self.event)
 
 
 class Buffer:
@@ -316,7 +328,7 @@ class Buffer:
             return torch.ones((self.group_size,), dtype=dtype, device=device)
 
         try:
-            from mooncake.ep import get_active_ranks
+            from mooncake.pg import get_active_ranks
 
             return get_active_ranks(self.backend).to(device=device, dtype=dtype)
         except Exception:
@@ -357,6 +369,27 @@ class Buffer:
         EventOverlap,
         Callable,
     ]:
+        assert x.dim() == 2 and x.is_contiguous()
+        assert x.dtype == torch.bfloat16
+        assert topk_idx.dim() == 2 and topk_idx.is_contiguous()
+        assert topk_idx.dtype == torch.int64
+        assert x.size(0) == topk_idx.size(0)
+        assert x.size(0) <= num_max_dispatch_tokens_per_rank
+        assert x.size(1) % 16 == 0 and x.size(1) % 128 == 0
+        assert num_experts % self.group_size == 0
+        caller_active_ranks = active_ranks
+        if active_ranks is None:
+            active_ranks = self._active_ranks_tensor(
+                device=x.device, dtype=torch.int32
+            )
+        else:
+            assert active_ranks.dim() == 1 and active_ranks.is_contiguous()
+            assert active_ranks.dtype == torch.int32
+            if active_ranks.numel() != self.group_size:
+                active_ranks = torch.ones(
+                    (self.group_size,), dtype=torch.int32, device=x.device
+                )
+
         if use_fp8 is None:
             use_fp8 = not _USE_MACA
         elif _USE_MACA and use_fp8:
@@ -400,27 +433,71 @@ class Buffer:
             backend_active_ranks = self._active_ranks_tensor(
                 device=active_ranks.device, dtype=active_ranks.dtype
             )
-            if active_ranks.numel() == backend_active_ranks.numel():
+            if (
+                caller_active_ranks is not None
+                and active_ranks.numel() == backend_active_ranks.numel()
+            ):
                 active_ranks.copy_(backend_active_ranks)
         else:
-            (
-                packed_recv_x,
-                packed_recv_x_scales,
-                packed_recv_count,
-                packed_recv_src_info,
-                packed_recv_layout_range,
-                event,
-                hook,
-            ) = self.runtime.dispatch(
-                x,
-                topk_idx,
-                active_ranks,
+            num_local_experts = num_experts // self.group_size
+            packed_recv_x = torch.empty(
+                (
+                    num_local_experts,
+                    self.group_size * num_max_dispatch_tokens_per_rank,
+                    x.size(1),
+                ),
+                dtype=torch.float8_e4m3fn if use_fp8 else torch.bfloat16,
+                device=x.device,
+            )
+            packed_recv_count = torch.zeros(
+                (num_local_experts,), dtype=torch.int32, device=x.device
+            )
+            packed_recv_src_info = torch.empty(
+                (
+                    num_local_experts,
+                    self.group_size * num_max_dispatch_tokens_per_rank,
+                ),
+                dtype=torch.int32,
+                device=x.device,
+            )
+            packed_recv_layout_range = torch.empty(
+                (num_local_experts, self.group_size),
+                dtype=torch.int64,
+                device=x.device,
+            )
+            packed_recv_x_scales = None
+            if use_fp8:
+                assert (
+                    self.group_size * num_max_dispatch_tokens_per_rank
+                ) % 4 == 0
+                packed_recv_x_scales = torch.empty(
+                    (
+                        num_local_experts,
+                        x.size(1) // 128,
+                        self.group_size * num_max_dispatch_tokens_per_rank,
+                    ),
+                    dtype=torch.float32,
+                    device=x.device,
+                ).transpose(1, 2)
+            event, hook = self.runtime.dispatch(
+                x.data_ptr(),
+                topk_idx.data_ptr(),
+                active_ranks.data_ptr(),
+                x.size(0),
+                x.size(1),
+                topk_idx.size(1),
                 num_max_dispatch_tokens_per_rank,
                 num_experts,
                 timeout_us,
                 use_fp8,
+                packed_recv_x.data_ptr(),
+                0 if packed_recv_x_scales is None else packed_recv_x_scales.data_ptr(),
+                packed_recv_count.data_ptr(),
+                packed_recv_src_info.data_ptr(),
+                packed_recv_layout_range.data_ptr(),
                 async_finish,
                 runtime_return_recv_hook,
+                _native_current_stream_ptr(),
             )
             if _USE_MACA:
                 hook = self._wrap_maca_recv_hook(hook, event)
@@ -465,6 +542,24 @@ class Buffer:
         return_recv_hook: bool = False,
         out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, EventOverlap, Callable]:
+        assert x.dim() == 3 and x.is_contiguous()
+        assert x.dtype == torch.bfloat16
+        assert topk_idx.dim() == 2 and topk_idx.is_contiguous()
+        assert topk_idx.dtype == torch.int64
+        assert topk_weights.dim() == 2 and topk_weights.is_contiguous()
+        assert topk_weights.dtype == torch.float32
+        caller_active_ranks = active_ranks
+        if active_ranks is None:
+            active_ranks = self._active_ranks_tensor(
+                device=x.device, dtype=torch.int32
+            )
+        else:
+            assert active_ranks.dim() == 1 and active_ranks.is_contiguous()
+            assert active_ranks.dtype == torch.int32
+            if active_ranks.numel() != self.group_size:
+                active_ranks = torch.ones(
+                    (self.group_size,), dtype=torch.int32, device=x.device
+                )
         # Same split-kernel behavior as dispatch().
         if _USE_SPLIT_SEND_RECV and async_finish:
             import warnings
@@ -503,23 +598,56 @@ class Buffer:
             backend_active_ranks = self._active_ranks_tensor(
                 device=active_ranks.device, dtype=active_ranks.dtype
             )
-            if active_ranks.numel() == backend_active_ranks.numel():
+            if (
+                caller_active_ranks is not None
+                and active_ranks.numel() == backend_active_ranks.numel()
+            ):
                 active_ranks.copy_(backend_active_ranks)
         else:
-            combined_x, event, hook = self.runtime.combine(
-                x,
-                topk_idx,
-                topk_weights,
-                src_info,
-                layout_range,
-                active_ranks,
+            assert x.size(0) == num_experts // self.group_size
+            assert x.size(1) == self.group_size * num_max_dispatch_tokens_per_rank
+            assert x.size(2) == hidden
+            assert x.size(2) % 16 == 0 and x.size(2) % 128 == 0
+            assert topk_idx.size() == topk_weights.size()
+            assert topk_weights.size(0) <= num_max_dispatch_tokens_per_rank
+            assert src_info.dim() == 2 and src_info.is_contiguous()
+            assert src_info.dtype == torch.int32
+            assert src_info.size(0) == x.size(0)
+            assert layout_range.dim() == 2 and layout_range.is_contiguous()
+            assert layout_range.dtype == torch.int64
+            assert layout_range.size(0) == num_experts // self.group_size
+            assert layout_range.size(1) == self.group_size
+            combined_x = (
+                out
+                if out is not None
+                else torch.empty(
+                    (topk_weights.size(0), hidden), dtype=x.dtype, device=x.device
+                )
+            )
+            if out is not None:
+                assert out.dim() == 2 and out.is_contiguous()
+                assert out.size(0) == topk_weights.size(0)
+                assert out.size(1) == hidden
+                assert out.dtype == x.dtype
+            event, hook = self.runtime.combine(
+                x.data_ptr(),
+                topk_idx.data_ptr(),
+                topk_weights.data_ptr(),
+                src_info.data_ptr(),
+                layout_range.data_ptr(),
+                active_ranks.data_ptr(),
+                x.size(0),
+                topk_weights.size(0),
+                hidden,
+                topk_weights.size(1),
                 num_max_dispatch_tokens_per_rank,
                 num_experts,
                 timeout_us,
                 zero_copy,
+                combined_x.data_ptr(),
                 async_finish,
                 runtime_return_recv_hook,
-                out,
+                _native_current_stream_ptr(),
             )
             if _USE_MACA:
                 hook = self._wrap_maca_recv_hook(hook, event)
@@ -548,29 +676,25 @@ class Buffer:
             hidden,
             num_experts,
         ) = handle
-        if self._use_fallback:
-            if (
-                self._fallback_next_combine_buffer is None
-                or self._fallback_next_combine_buffer.shape
-                != (
+        if (
+            self._fallback_next_combine_buffer is None
+            or self._fallback_next_combine_buffer.shape
+            != (
+                num_experts // self.group_size,
+                num_max_dispatch_tokens_per_rank * self.group_size,
+                hidden,
+            )
+        ):
+            self._fallback_next_combine_buffer = torch.empty(
+                (
                     num_experts // self.group_size,
                     num_max_dispatch_tokens_per_rank * self.group_size,
                     hidden,
-                )
-            ):
-                self._fallback_next_combine_buffer = torch.empty(
-                    (
-                        num_experts // self.group_size,
-                        num_max_dispatch_tokens_per_rank * self.group_size,
-                        hidden,
-                    ),
-                    dtype=torch.bfloat16,
-                    device="cuda",
-                )
-            return self._fallback_next_combine_buffer
-        return self.runtime.get_next_combine_buffer(
-            num_max_dispatch_tokens_per_rank, hidden, num_experts
-        )
+                ),
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+        return self._fallback_next_combine_buffer
 
     # -----------------
     # Fallback helpers

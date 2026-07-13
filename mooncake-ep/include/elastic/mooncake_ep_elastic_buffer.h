@@ -41,38 +41,6 @@ struct ElasticConfig {
     int num_gpu_timeout_secs = 100;
 };
 
-struct ElasticNativeHandle {
-    bool do_expand = false;
-    int num_experts = 0;
-    int expert_alignment = 1;
-    int num_max_tokens_per_rank = 0;
-    int num_sms = 0;
-    torch::Tensor topk_idx;
-    torch::Tensor psum_num_recv_tokens_per_scaleup_rank;
-    torch::Tensor psum_num_recv_tokens_per_expert;
-    torch::Tensor recv_src_metadata;
-    torch::Tensor recv_layout_range;
-    torch::Tensor dst_buffer_slot_idx;
-    std::optional<torch::Tensor> token_metadata_at_forward;
-    std::optional<torch::Tensor> channel_linked_list;
-    std::vector<int> num_recv_tokens_per_expert_list;
-};
-
-struct ElasticDispatchOutput {
-    torch::Tensor recv_x;
-    std::optional<torch::Tensor> recv_x_scales;
-    std::optional<torch::Tensor> recv_topk_idx;
-    std::optional<torch::Tensor> recv_topk_weights;
-    ElasticNativeHandle handle;
-    std::optional<EventHandle> event;
-};
-
-struct ElasticCombineOutput {
-    torch::Tensor combined_x;
-    std::optional<torch::Tensor> combined_topk_weights;
-    std::optional<EventHandle> event;
-};
-
 class MooncakeElasticBuffer {
    public:
     MooncakeElasticBuffer(int rank, int num_ranks, int64_t num_buffer_bytes,
@@ -97,21 +65,30 @@ class MooncakeElasticBuffer {
     std::tuple<int, int> get_logical_domain_size() const;
     int get_theoretical_num_sms(int num_experts, int num_topk) const;
 
-    ElasticDispatchOutput dispatch(
-        const torch::Tensor& x, const std::optional<torch::Tensor>& sf,
-        const torch::Tensor& topk_idx,
-        const std::optional<torch::Tensor>& topk_weights,
-        torch::Tensor& active_ranks, int num_experts,
-        int num_max_tokens_per_rank, int expert_alignment, int num_sms,
-        bool do_expand, bool do_cpu_sync, bool async_with_compute_stream,
-        const std::optional<ElasticNativeHandle>& cached_handle = std::nullopt);
+    std::optional<EventHandle> dispatch(
+        uint64_t x_ptr, int x_element_size, uint64_t sf_ptr, int num_tokens,
+        int hidden, int num_sf_packs, int sf_token_stride, int sf_hidden_stride,
+        uint64_t topk_idx_ptr, int num_topk, uint64_t topk_weights_ptr,
+        uint64_t active_ranks_ptr, int num_experts, int num_max_tokens_per_rank,
+        int expert_alignment, int num_sms, bool do_expand,
+        bool async_with_compute_stream, uint64_t compute_stream_ptr,
+        bool cached_mode, uint64_t psum_num_recv_tokens_per_scaleup_rank_ptr,
+        uint64_t psum_num_recv_tokens_per_expert_ptr,
+        uint64_t dst_buffer_slot_idx_ptr,
+        uint64_t token_metadata_at_forward_ptr,
+        uint64_t channel_linked_list_ptr, uint64_t recv_x_ptr,
+        uint64_t recv_x_scales_ptr, uint64_t recv_topk_idx_ptr,
+        uint64_t recv_topk_weights_ptr, uint64_t recv_src_metadata_ptr);
 
-    ElasticCombineOutput combine(
-        const torch::Tensor& x, const ElasticNativeHandle& handle,
-        const std::optional<torch::Tensor>& topk_weights,
-        torch::Tensor& active_ranks, int num_sms,
-        bool async_with_compute_stream,
-        const std::optional<torch::Tensor>& out);
+    std::optional<EventHandle> combine(
+        uint64_t x_ptr, int num_input_tokens, int hidden, uint64_t topk_idx_ptr,
+        int num_combined_tokens, int num_topk, uint64_t topk_weights_ptr,
+        uint64_t psum_num_recv_tokens_per_scaleup_rank_ptr,
+        uint64_t recv_src_metadata_ptr, uint64_t token_metadata_at_forward_ptr,
+        uint64_t channel_linked_list_ptr, uint64_t active_ranks_ptr,
+        int num_experts, int num_max_tokens_per_rank, bool do_expand,
+        int num_sms, bool async_with_compute_stream,
+        uint64_t compute_stream_ptr, uint64_t combined_x_ptr);
 
     MooncakeEpBuffer& native_buffer() { return *native_buffer_; }
 
