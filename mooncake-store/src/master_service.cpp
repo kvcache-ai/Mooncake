@@ -3237,8 +3237,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
 
 auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
                            const std::string& tenant_id,
-                           ReplicaType replica_type,
-                           const StoreEventInfo* store_event_info)
+                           ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
@@ -3333,7 +3332,7 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
     // at beginning. 2. If this object has soft pin enabled, set it to be soft
     // pinned.
     metadata.GrantLease(0, default_kv_soft_pin_ttl_);
-    PublishKvStored(key, replica_type, metadata, tenant_id, store_event_info);
+    PublishKvStored(key, replica_type, metadata, tenant_id);
     return {};
 }
 
@@ -3475,24 +3474,6 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
     results.reserve(keys.size());
     for (const auto& key : keys) {
         results.emplace_back(PutEnd(client_id, key, tenant_id, replica_type));
-    }
-    return results;
-}
-
-std::vector<tl::expected<void, ErrorCode>>
-MasterService::BatchPutEndWithEventInfo(
-    const UUID& client_id, const std::vector<std::string>& keys,
-    const std::vector<StoreEventInfo>& store_event_infos,
-    const std::string& tenant_id, ReplicaType replica_type) {
-    if (keys.size() != store_event_infos.size()) {
-        return std::vector<tl::expected<void, ErrorCode>>(
-            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
-    }
-    std::vector<tl::expected<void, ErrorCode>> results;
-    results.reserve(keys.size());
-    for (size_t i = 0; i < keys.size(); ++i) {
-        results.emplace_back(PutEnd(client_id, keys[i], tenant_id, replica_type,
-                                    &store_event_infos[i]));
     }
     return results;
 }
@@ -9005,15 +8986,13 @@ std::vector<std::string> MasterService::KvMediaForMetadata(
 void MasterService::PublishKvStored(const std::string& key,
                                     ReplicaType replica_type,
                                     const ObjectMetadata& metadata,
-                                    const std::string& tenant_id,
-                                    const StoreEventInfo* store_event_info) {
+                                    const std::string& tenant_id) {
     (void)replica_type;
     if (!kv_event_publisher_ || !kv_event_publisher_->enabled()) {
         return;
     }
     kv_event_publisher_->PublishCommitted(key, KvMediaForMetadata(metadata),
-                                          tenant_id, metadata.group_id,
-                                          store_event_info);
+                                          tenant_id, metadata.group_id);
 }
 
 void MasterService::SyncKvObjectState(

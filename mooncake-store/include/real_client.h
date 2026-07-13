@@ -238,8 +238,7 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
-        const ReplicateConfig &config = ReplicateConfig{},
-        const std::vector<StoreEventInfo> &store_event_infos = {});
+        const ReplicateConfig &config = ReplicateConfig{});
 
     int put_parts(const std::string &key,
                   std::vector<std::span<const char>> values,
@@ -440,8 +439,7 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<std::vector<uint64_t>> &dummy_all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
-        const ReplicateConfig &config,
-        const std::vector<StoreEventInfo> &store_event_infos, int32_t device_id,
+        const ReplicateConfig &config, int32_t device_id,
         const UUID &client_id);
 
     std::vector<tl::expected<int64_t, ErrorCode>>
@@ -623,8 +621,7 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
-        const ReplicateConfig &config = ReplicateConfig{},
-        const std::vector<StoreEventInfo> &store_event_infos = {});
+        const ReplicateConfig &config = ReplicateConfig{});
 
     tl::expected<void, ErrorCode> put_parts_internal(
         const std::string &key,

@@ -381,8 +381,7 @@ class MasterService {
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
     auto PutEnd(const UUID& client_id, const std::string& key,
-                const std::string& tenant_id, ReplicaType replica_type,
-                const StoreEventInfo* store_event_info = nullptr)
+                const std::string& tenant_id, ReplicaType replica_type)
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -411,12 +410,6 @@ class MasterService {
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::string& tenant_id,
         ReplicaType replica_type = ReplicaType::ALL);
-    std::vector<tl::expected<void, ErrorCode>> BatchPutEndWithEventInfo(
-        const UUID& client_id, const std::vector<std::string>& keys,
-        const std::vector<StoreEventInfo>& store_event_infos,
-        const std::string& tenant_id,
-        ReplicaType replica_type = ReplicaType::ALL);
-
     /**
      * @brief Revoke a batch of put operations
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
@@ -2126,8 +2119,7 @@ class MasterService {
         const ObjectMetadata& metadata);
     void PublishKvStored(const std::string& key, ReplicaType replica_type,
                          const ObjectMetadata& metadata,
-                         const std::string& tenant_id,
-                         const StoreEventInfo* store_event_info = nullptr);
+                         const std::string& tenant_id);
     void SyncKvObjectState(
         const std::string& key, const ObjectMetadata& metadata,
         const std::string& tenant_id,

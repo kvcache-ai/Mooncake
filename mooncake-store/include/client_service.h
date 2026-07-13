@@ -24,7 +24,6 @@
 #include "types.h"
 #include "replica.h"
 #include "master_metric_manager.h"
-#include "kv_event/store_event_info.h"
 #include "count_min_sketch.h"
 #include "local_hot_cache.h"
 #include "pinned_buffer_pool.h"
@@ -214,8 +213,7 @@ class Client {
     std::vector<tl::expected<void, ErrorCode>> BatchPut(
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
-        const ReplicateConfig& config,
-        const std::vector<StoreEventInfo>& store_event_infos = {});
+        const ReplicateConfig& config);
 
     /**
      * @brief Upserts data: inserts if key doesn't exist, updates if it does
@@ -760,8 +758,7 @@ class Client {
      */
     std::vector<PutOperation> CreatePutOperations(
         const std::vector<ObjectKey>& keys,
-        const std::vector<std::vector<Slice>>& batched_slices,
-        const std::vector<StoreEventInfo>& store_event_infos = {});
+        const std::vector<std::vector<Slice>>& batched_slices);
     void StartBatchPut(std::vector<PutOperation>& ops,
                        const ReplicateConfig& config);
     void SubmitTransfers(std::vector<PutOperation>& ops);

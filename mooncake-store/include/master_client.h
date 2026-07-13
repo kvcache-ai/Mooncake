@@ -19,7 +19,6 @@
 #include "rpc_types.h"
 #include "master_metric_manager.h"
 #include "task_manager.h"
-#include "kv_event/store_event_info.h"
 
 namespace mooncake {
 
@@ -234,11 +233,6 @@ class MasterClient {
      */
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
         const std::vector<std::string>& keys,
-        ReplicaType replica_type = ReplicaType::ALL);
-    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>>
-    BatchPutEndWithEventInfo(
-        const std::vector<std::string>& keys,
-        const std::vector<StoreEventInfo>& store_event_infos,
         ReplicaType replica_type = ReplicaType::ALL);
 
     /**

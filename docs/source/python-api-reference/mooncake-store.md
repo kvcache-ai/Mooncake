@@ -2768,14 +2768,8 @@ for ptr in buffer_ptrs:
 Store multiple objects from multiple pre-registered buffers (zero-copy).
 
 ```python
-def batch_put_from_multi_buffers(
-    self,
-    keys: List[str],
-    all_buffer_ptrs: List[List[int]],
-    all_sizes: List[List[int]],
-    config: ReplicateConfig = None,
-    store_event_infos: List[StoreEventInfo] = None,
-) -> List[int]
+def batch_put_from_multi_buffers(self, keys: List[str], all_buffer_ptrs: List[List[int]], all_sizes: List[List[int]],
+                                 config: ReplicateConfig = None) -> List[int]
 ```
 
 **Parameters:**
@@ -2783,10 +2777,6 @@ def batch_put_from_multi_buffers(
 - `all_buffer_ptrs` (List[int]): all List of memory addresses
 - `sizes` (List[int]): all List of buffer sizes
 - `config` (ReplicateConfig, optional): Replication configuration
-- `store_event_infos` (List[StoreEventInfo], optional): Per-key KV Event
-  metadata. The list must be empty or have exactly the same length as `keys`.
-  Each entry can provide `model_name`, `block_size`, `block_hash`,
-  `parent_block_hash`, and `token_ids`.
 
 **Returns:**
 - `List[int]`: List of status codes for each operation (0 = success, negative = error)
@@ -2818,8 +2808,6 @@ List[int]
 <summary>Click to expand: Batch zero-copy put and get for multiple buffers example</summary>
 
 ```python
-from mooncake.store import StoreEventInfo
-
 tensor = torch.ones(10, 61, 128*1024, dtype=torch.int8)
 data_ptr = tensor.data_ptr()
 store.register_buffer(data_ptr, 10*61*128*1024)
@@ -2849,17 +2837,7 @@ for block_i in range(10):
 
 config = ReplicateConfig()
 config.prefer_alloc_in_same_node = True
-event_infos = [
-    StoreEventInfo(
-        model_name="example-model",
-        block_size=128,
-        block_hash=str(block_i),
-    )
-    for block_i in range(len(keys))
-]
-store.batch_put_from_multi_buffers(
-    keys, all_local_addrs, all_sizes, config, event_infos
-)
+store.batch_put_from_multi_buffers(keys, all_local_addrs, all_sizes, config)
 store.batch_get_into_multi_buffers(keys, all_remote_addrs, all_sizes, True)
 
 store.unregister_buffer(tensor.data_ptr())

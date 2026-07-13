@@ -5,10 +5,10 @@
 
 namespace mooncake {
 
-// Publisher transport/identity for the optional KV Events ZMQ socket (RFC
-// #1527). Semantic block fields (model_name, block_size, lora_name,
-// parent_hash, token_ids, dp_rank) belong on each event payload, not here — see
-// https://docs.nvidia.com/dynamo/kv-managers/kv-events-for-custom-engines
+// Publisher transport, identity, and fixed model context for the optional KV
+// Events ZMQ socket (RFC #1527). One publisher serves one model/block-size/
+// LoRA/DP context. Per-object fields such as tenant_id, parent_hash, and
+// token_ids are still derived from each operation when available.
 struct KvEventConfig {
     bool enabled{false};
     // ZMQ PUB bind address, e.g. "tcp://0.0.0.0:5557".
@@ -22,12 +22,17 @@ struct KvEventConfig {
     // Max pending events in the async publisher queue; oldest dropped when full.
     uint32_t queue_capacity{65536};
 
-    // Deprecated: not stamped on events. Indexer registration supplies model,
-    // block_size, dp_rank, and hash namespace for the Mooncake publisher.
+    // Fixed publisher context. A model parsed from an object key takes
+    // precedence over model_name; model_name is also used for keys without a
+    // recognized connector format and for cleared events.
     std::string model_name;
+    // Retained for config compatibility. Published tenant_id comes from each
+    // object operation so one publisher can preserve tenant isolation.
     std::string tenant_id{"default"};
     std::string additional_salt;
+    // Empty means the base model.
     std::string lora_name;
+    // Zero means unknown and is emitted as nil.
     uint32_t block_size{0};
     uint32_t dp_rank{0};
 };

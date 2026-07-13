@@ -15,7 +15,6 @@
 
 #include "kv_event/kv_event_config.h"
 #include "kv_event/key_util.h"
-#include "kv_event/store_event_info.h"
 
 namespace mooncake {
 
@@ -36,8 +35,7 @@ class KvEventPublisher {
     // tenant_id empty defaults to "default" on the wire.
     void PublishStored(const std::string& object_key, const std::string& medium,
                        const std::string& tenant_id = "",
-                       const std::string& group_id = "",
-                       const StoreEventInfo& store_event_info = {});
+                       const std::string& group_id = "");
     void PublishRemoved(const std::string& object_key,
                         const std::string& medium,
                         const std::string& tenant_id = "",
@@ -50,8 +48,7 @@ class KvEventPublisher {
     void PublishCommitted(const std::string& object_key,
                           const std::vector<std::string>& current_media,
                           const std::string& tenant_id = "",
-                          const std::string& group_id = "",
-                          const StoreEventInfo* store_event_info = nullptr);
+                          const std::string& group_id = "");
 
     // Synchronize replica availability after an internal metadata mutation.
     // previous_media_hint is used when the publisher has no in-process state,
@@ -86,10 +83,17 @@ class KvEventPublisher {
     enum class EventKind { kStored, kRemoved, kCleared };
 
     struct EventContext {
+        std::string cache_prefix;
         std::string model_name;
-        uint32_t block_size{0};
+        std::string connector_block_hash;
         std::optional<uint64_t> seq_hash;
-        std::optional<uint64_t> parent_hash;
+        std::optional<int64_t> group_id;
+        std::optional<int64_t> tp_rank;
+        std::optional<int64_t> head_or_tp_rank;
+        std::optional<int64_t> pcp_rank;
+        std::optional<int64_t> dcp_rank;
+        std::optional<int64_t> pp_rank;
+        std::optional<int64_t> layer_id;
         bool has_explicit_block_hash{false};
     };
 
@@ -100,7 +104,6 @@ class KvEventPublisher {
         std::string tenant_id;
         std::string group_id;
         EventContext context;
-        std::vector<uint32_t> token_ids;
     };
 
     struct ObjectEventState {
@@ -137,9 +140,9 @@ class KvEventPublisher {
                        std::unordered_map<std::string, ObjectEventState>>
         object_states_;
 
-    EventContext BuildEventContext(
-        const std::string& object_key,
-        const StoreEventInfo* store_event_info = nullptr);
+    EventContext BuildEventContext(const std::string& object_key);
+    static std::string ResolveGroupId(const std::string& group_id,
+                                      const EventContext& context);
     void RecordInvalidHash(const char* field, const std::string& value);
 };
 
@@ -154,14 +157,12 @@ class KvEventPublisher {
     bool enabled() const { return false; }
 
     void PublishStored(const std::string&, const std::string&,
-                       const std::string& = "", const std::string& = "",
-                       const StoreEventInfo& = {}) {}
+                       const std::string& = "", const std::string& = "") {}
     void PublishRemoved(const std::string&, const std::string&,
                         const std::string& = "", const std::string& = "") {}
     void PublishCleared(const std::string& = "") {}
     void PublishCommitted(const std::string&, const std::vector<std::string>&,
-                          const std::string& = "", const std::string& = "",
-                          const StoreEventInfo* = nullptr) {}
+                          const std::string& = "", const std::string& = "") {}
     void SyncObjectState(const std::string&, const std::vector<std::string>&,
                          const std::string& = "", const std::string& = "",
                          const std::vector<std::string>& = {}) {}

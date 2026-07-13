@@ -100,11 +100,6 @@ class WrappedMasterService {
         const UUID& client_id, const std::vector<std::string>& keys,
         ReplicaType replica_type = ReplicaType::ALL,
         const std::string& tenant_id = "default");
-    std::vector<tl::expected<void, ErrorCode>> BatchPutEndWithEventInfo(
-        const UUID& client_id, const std::vector<std::string>& keys,
-        const std::vector<StoreEventInfo>& store_event_infos,
-        ReplicaType replica_type = ReplicaType::ALL,
-        const std::string& tenant_id = "default");
 
     std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
         const UUID& client_id, const std::vector<std::string>& keys,

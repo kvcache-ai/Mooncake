@@ -433,42 +433,6 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
     return results;
 }
 
-std::vector<tl::expected<void, ErrorCode>>
-WrappedMasterService::BatchPutEndWithEventInfo(
-    const UUID& client_id, const std::vector<std::string>& keys,
-    const std::vector<StoreEventInfo>& store_event_infos,
-    ReplicaType replica_type, const std::string& tenant_id) {
-    ScopedVLogTimer timer(1, "BatchPutEndWithEventInfo");
-    const size_t total_keys = keys.size();
-    timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
-    MasterMetricManager::instance().inc_batch_put_end_requests(total_keys);
-
-    auto results = master_service_.BatchPutEndWithEventInfo(
-        client_id, keys, store_event_infos, tenant_id, replica_type);
-
-    size_t failure_count = 0;
-    for (size_t i = 0; i < results.size(); ++i) {
-        if (!results[i].has_value()) {
-            ++failure_count;
-            LOG(ERROR) << "BatchPutEndWithEventInfo failed for key[" << i
-                       << "] '" << keys[i]
-                       << "': " << toString(results[i].error());
-        }
-    }
-    if (failure_count == total_keys) {
-        MasterMetricManager::instance().inc_batch_put_end_failures(
-            failure_count);
-    } else if (failure_count != 0) {
-        MasterMetricManager::instance().inc_batch_put_end_partial_success(
-            failure_count);
-    }
-
-    timer.LogResponse("total=", results.size(),
-                      ", success=", results.size() - failure_count,
-                      ", failures=", failure_count);
-    return results;
-}
-
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
     const UUID& client_id, const std::vector<std::string>& keys,
     ReplicaType replica_type, const std::string& tenant_id) {
@@ -1328,9 +1292,6 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::BatchPutStart>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchPutEnd>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::BatchPutEndWithEventInfo>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchPutRevoke>(
         &wrapped_master_service);

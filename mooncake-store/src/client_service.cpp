@@ -1795,7 +1795,6 @@ class PutOperation {
     tl::expected<void, ErrorCode> result;
     std::vector<Replica::Descriptor> replicas;
     std::vector<PendingTransferRecord> pending_transfers;
-    std::optional<StoreEventInfo> store_event_info;
 
     size_t requested_memory_replicas = 0;
     size_t requested_nof_replicas = 0;
@@ -1876,15 +1875,11 @@ class PutOperation {
 
 std::vector<PutOperation> Client::CreatePutOperations(
     const std::vector<ObjectKey>& keys,
-    const std::vector<std::vector<Slice>>& batched_slices,
-    const std::vector<StoreEventInfo>& store_event_infos) {
+    const std::vector<std::vector<Slice>>& batched_slices) {
     std::vector<PutOperation> ops;
     ops.reserve(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
         ops.emplace_back(keys[i], batched_slices[i]);
-        if (!store_event_infos.empty()) {
-            ops.back().store_event_info = store_event_infos[i];
-        }
     }
     return ops;
 }
@@ -2129,7 +2124,6 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
     struct BatchFinalizeGroup {
         std::vector<std::string> keys;
         std::vector<size_t> indices;
-        std::vector<StoreEventInfo> store_event_infos;
     };
 
     BatchFinalizeGroup end_all_group;
@@ -2144,14 +2138,10 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
     std::vector<ErrorCode> terminal_errors(ops.size(), ErrorCode::OK);
     std::vector<std::optional<ErrorCode>> finalize_rpc_errors(ops.size());
 
-    auto add_group_entry = [&](BatchFinalizeGroup& group,
-                               const std::string& key, size_t index,
-                               bool include_event_info) {
+    auto add_group_entry = [](BatchFinalizeGroup& group, const std::string& key,
+                              size_t index) {
         group.keys.emplace_back(key);
         group.indices.emplace_back(index);
-        if (include_event_info && ops[index].store_event_info.has_value()) {
-            group.store_event_infos.emplace_back(*ops[index].store_event_info);
-        }
     };
 
     auto add_finalize_action =
@@ -2163,18 +2153,18 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
             switch (*replica_type) {
                 case ReplicaType::ALL:
                     add_group_entry(is_end ? end_all_group : revoke_all_group,
-                                    key, index, is_end);
+                                    key, index);
                     ++pending_finalize_actions[index];
                     break;
                 case ReplicaType::MEMORY:
                     add_group_entry(
                         is_end ? end_memory_group : revoke_memory_group, key,
-                        index, is_end);
+                        index);
                     ++pending_finalize_actions[index];
                     break;
                 case ReplicaType::NOF_SSD:
                     add_group_entry(is_end ? end_nof_group : revoke_nof_group,
-                                    key, index, is_end);
+                                    key, index);
                     ++pending_finalize_actions[index];
                     break;
                 default:
@@ -2222,11 +2212,7 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
         if (group.keys.empty()) {
             return;
         }
-        auto responses =
-            group.store_event_infos.size() == group.keys.size()
-                ? master_client_.BatchPutEndWithEventInfo(
-                      group.keys, group.store_event_infos, replica_type)
-                : master_client_.BatchPutEnd(group.keys, replica_type);
+        auto responses = master_client_.BatchPutEnd(group.keys, replica_type);
         if (responses.size() != group.keys.size()) {
             for (size_t idx : group.indices) {
                 finalize_rpc_errors[idx] = ErrorCode::RPC_FAIL;
@@ -2582,19 +2568,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
 std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
-    const ReplicateConfig& config,
-    const std::vector<StoreEventInfo>& store_event_infos) {
-    if (!store_event_infos.empty() && store_event_infos.size() != keys.size()) {
-        LOG(ERROR) << "store_event_infos size must match keys size";
-        return std::vector<tl::expected<void, ErrorCode>>(
-            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
-    }
+    const ReplicateConfig& config) {
     ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
-    std::vector<PutOperation> ops =
-        CreatePutOperations(keys, batched_slices, store_event_infos);
+    std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
     if (client_cfg.prefer_alloc_in_same_node) {
         if (client_cfg.nof_replica_num > 0) {
             LOG(ERROR) << "prefer_alloc_in_same_node is not supported with "
