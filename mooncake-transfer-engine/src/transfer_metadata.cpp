@@ -76,6 +76,8 @@ struct TransferHandshakeUtil {
         Json::Value qpNums(Json::arrayValue);
         for (const auto &qp : desc.qp_num) qpNums.append(qp);
         root["qp_num"] = qpNums;
+        if (desc.ready_ack_supported || desc.ready_ack)
+            root["ready_ack"] = desc.ready_ack;
         root["reply_msg"] = desc.reply_msg;
 #ifdef USE_EFA
         root["efa_addr"] = desc.efa_addr;  // EFA endpoint address
@@ -113,6 +115,12 @@ struct TransferHandshakeUtil {
 #endif
         for (const auto &qp : root["qp_num"])
             desc.qp_num.push_back(qp.asUInt());
+        desc.ready_ack_supported = root.isMember("ready_ack");
+        if (desc.ready_ack_supported && root["ready_ack"].isBool()) {
+            desc.ready_ack = root["ready_ack"].asBool();
+        } else {
+            desc.ready_ack = false;
+        }
         desc.reply_msg = root["reply_msg"].asString();
 #ifdef USE_EFA
         desc.efa_addr = root["efa_addr"].asString();  // EFA endpoint address
@@ -269,7 +277,7 @@ static int encodeMultiProtocolSegmentDesc(
             bufferJSON["lkey"] = lkeyJSON;
         } else if (buffer.protocol == "tcp") {
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
-        } else if (buffer.protocol == "hip") {
+        } else if (buffer.protocol == "hip" || buffer.protocol == "maca") {
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
             bufferJSON["shm_name"] = buffer.shm_name;
         }
@@ -278,6 +286,7 @@ static int encodeMultiProtocolSegmentDesc(
     segmentJSON["buffers"] = buffersJSON;
     segmentJSON["protocol"] = protocolJSON;
     segmentJSON["tcp_data_port"] = desc.tcp_data_port;
+    segmentJSON["tcp_proto_version"] = desc.tcp_proto_version;
     segmentJSON["timestamp"] = getCurrentDateTime();
 
     return 0;
@@ -297,7 +306,7 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
         is_multi_protocol = true;
         for (const auto &proto : protocols) {
             if (proto != "cxl" && proto != "tcp" && proto != "rdma" &&
-                proto != "hip") {
+                proto != "hip" && proto != "maca") {
                 is_multi_protocol = false;
                 break;
             }
@@ -305,7 +314,8 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
         if (!is_multi_protocol) {
             LOG(ERROR) << "Unsupported multi-protocol combination: "
                        << desc.protocol
-                       << ". Only cxl, tcp, rdma and hip may be combined.";
+                       << ". Only cxl, tcp, rdma, hip and maca may be "
+                          "combined.";
             return ERR_INVALID_ARGUMENT;
         }
     }
@@ -319,6 +329,7 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
     segmentJSON["name"] = desc.name;
     segmentJSON["protocol"] = desc.protocol;
     segmentJSON["tcp_data_port"] = desc.tcp_data_port;
+    segmentJSON["tcp_proto_version"] = desc.tcp_proto_version;
     segmentJSON["timestamp"] = getCurrentDateTime();
     if (!desc.rdma_server_name.empty()) {
         segmentJSON["rdma_server_name"] = desc.rdma_server_name;
@@ -515,6 +526,9 @@ decodeMultiProtocolSegmentDesc(Json::Value &segmentJSON,
     auto desc = std::make_shared<TransferMetadata::SegmentDesc>();
     desc->name = segmentJSON["name"].asString();
     desc->tcp_data_port = segmentJSON["tcp_data_port"].asInt();
+    desc->tcp_proto_version = segmentJSON.isMember("tcp_proto_version")
+                                  ? segmentJSON["tcp_proto_version"].asInt()
+                                  : 1;
     if (segmentJSON.isMember("timestamp"))
         desc->timestamp = segmentJSON["timestamp"].asString();
     if (segmentJSON.isMember("rdma_server_name"))
@@ -608,7 +622,7 @@ decodeMultiProtocolSegmentDesc(Json::Value &segmentJSON,
                 return nullptr;
             }
             desc->buffers.push_back(buffer);
-        } else if (buffer_protocol == "hip") {
+        } else if (buffer_protocol == "hip" || buffer_protocol == "maca") {
             TransferMetadata::BufferDesc buffer;
             buffer.name = bufferJSON["name"].asString();
             buffer.addr = bufferJSON["addr"].asUInt64();
@@ -645,7 +659,7 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             for (const auto &protocolStr : segmentJSON["protocol"]) {
                 std::string proto = protocolStr.asString();
                 if (proto != "cxl" && proto != "tcp" && proto != "rdma" &&
-                    proto != "hip") {
+                    proto != "hip" && proto != "maca") {
                     is_multi_protocol = false;
                     break;
                 }
@@ -654,7 +668,7 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
                 LOG(ERROR)
                     << "Unsupported multi-protocol combination in segment: "
                     << segment_name
-                    << ". Only cxl, tcp, rdma and hip may be combined.";
+                    << ". Only cxl, tcp, rdma, hip and maca may be combined.";
                 return nullptr;
             }
         }
@@ -670,6 +684,9 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
     desc->name = segmentJSON["name"].asString();
     desc->protocol = segmentJSON["protocol"].asString();
     desc->tcp_data_port = segmentJSON["tcp_data_port"].asInt();
+    desc->tcp_proto_version = segmentJSON.isMember("tcp_proto_version")
+                                  ? segmentJSON["tcp_proto_version"].asInt()
+                                  : 1;
     if (segmentJSON.isMember("timestamp"))
         desc->timestamp = segmentJSON["timestamp"].asString();
     if (segmentJSON.isMember("rdma_server_name"))

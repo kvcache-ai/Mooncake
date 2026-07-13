@@ -111,6 +111,10 @@ class TransferMetadata {
         RankInfoDesc rank_info;
 
         int tcp_data_port;
+        // TCP data-plane protocol version advertised by this segment's
+        // server. v2 adds acknowledged WRITE framing and status-prefixed
+        // READ responses (#2086); absent/1 = legacy unacknowledged framing.
+        int tcp_proto_version{1};
 
         // In dual-NIC setups (MC_RDMA_BIND_ADDRESS), the RDMA-reachable
         // address may differ from the TCP-routable segment name.  When
@@ -149,6 +153,10 @@ class TransferMetadata {
         uint16_t barex_port;
 #endif
         std::vector<uint32_t> qp_num;
+        bool ready_ack = false;
+        // Capability marker. Encoded only by transports that opt into
+        // ready_ack; decoded from field presence to detect peer support.
+        bool ready_ack_supported = false;
         std::string reply_msg;  // on error
 #ifdef USE_EFA
         std::string efa_addr;  // EFA endpoint address (hex encoded)

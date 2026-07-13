@@ -31,6 +31,11 @@ class WorkerPool {
     // Add slices to queue, called by Transport
     int submitPostSend(const std::vector<Transport::Slice *> &slice_list);
 
+    void trackPostedSlices(const std::vector<Transport::Slice *> &slice_list,
+                           size_t first, size_t count);
+    void untrackPostedSlices(const std::vector<Transport::Slice *> &slice_list,
+                             size_t first, size_t count);
+
    private:
     void performPostSend(int thread_id);
 
@@ -90,6 +95,17 @@ class WorkerPool {
     std::atomic<bool> workers_running_;
 
     std::atomic<int> parked_worker_count_;
+
+    // The poll worker updates these on every poll pass. The monitor worker
+    // reads them when CQ entries stay outstanding, so a transfer timeout can
+    // be distinguished from a stalled poller.
+    std::atomic<uint64_t> last_poll_ts_ns_{0};
+    std::atomic<uint64_t> last_poll_interval_ns_{0};
+    std::atomic<uint64_t> max_poll_interval_ns_{0};
+
+    std::mutex posted_slices_mutex_;
+    std::unordered_set<Transport::Slice *> posted_slices_;
+
     std::atomic<int> redispatch_counter_;
 
     std::mutex cond_mutex_;
