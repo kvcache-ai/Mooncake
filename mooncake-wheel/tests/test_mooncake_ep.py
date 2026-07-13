@@ -174,11 +174,7 @@ def test_loop(local_rank: int, num_local_ranks: int):
     if local_rank == 0:
         print(f'Allocating buffer size: {num_ep_buffer_bytes / 1e6} MB ...', flush=True)
     buffer = Buffer(group, num_ep_buffer_bytes=num_ep_buffer_bytes)
-    # Mock a broken rank 1 to test effectiveness of EP recovery
-    if local_rank != 1:
-        buffer.update_ep_member()
-    else:
-        buffer = Buffer(group, num_ep_buffer_bytes=num_ep_buffer_bytes)
+    buffer.update_ep_member()
 
     test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, cpu_group, buffer, seed=1)
 
@@ -200,5 +196,5 @@ def test_loop(local_rank: int, num_local_ranks: int):
 
 if __name__ == '__main__':
     # TODO: you may modify NUMA binding for less CPU overhead
-    num_processes = 2
+    num_processes = 8
     torch.multiprocessing.spawn(test_loop, args=(num_processes,), nprocs=num_processes)

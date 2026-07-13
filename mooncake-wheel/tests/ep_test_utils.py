@@ -5,7 +5,7 @@ import torch
 import torch.distributed as dist
 from typing import Optional
 
-import mooncake.pg
+from mooncake import pg
 
 
 def init_dist(local_rank: int, num_local_ranks: int):
@@ -17,6 +17,7 @@ def init_dist(local_rank: int, num_local_ranks: int):
     assert (num_local_ranks < 8 and num_nodes == 1) or num_local_ranks == 8
 
     torch.cuda.set_device(local_rank)
+    pg.set_host_ip("10.12.11.242")
     dist.init_process_group(
         backend='mooncake',
         init_method=f'tcp://{ip}:{port}',
