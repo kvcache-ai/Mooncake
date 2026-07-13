@@ -150,6 +150,44 @@ TEST_P(AllocationStrategyParameterizedTest, PreferredSegmentAllocation) {
     EXPECT_EQ(mem_desc.buffer_descriptor.size_, 1024);
 }
 
+TEST_P(AllocationStrategyParameterizedTest,
+       AllocatedReplicaTracksSegmentLifetime) {
+    auto allocator = CreateTestAllocator("segment1", 0);
+    AllocatorManager allocator_manager;
+    auto registration = allocator_manager.addAllocator("segment1", allocator);
+
+    auto result =
+        strategy_->Allocate(allocator_manager, 1024, 1, {"segment1"}, {});
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(1u, result->size());
+    EXPECT_TRUE(result.value()[0].get_available_descriptor().has_value());
+
+    registration->lifetime.setAvailable(false);
+    EXPECT_FALSE(result.value()[0].get_available_descriptor().has_value());
+    EXPECT_TRUE(result.value()[0].has_invalid_mem_handle());
+}
+
+TEST_P(AllocationStrategyParameterizedTest,
+       CxlAllocationTracksClientSegmentLifetime) {
+    auto allocator = CreateTestAllocator("global_cxl_allocator", 0);
+    AllocatorManager allocator_manager;
+    auto registration =
+        allocator_manager.addAllocator("client_cxl_segment", allocator);
+    CxlAllocationStrategy cxl_strategy;
+
+    auto result = cxl_strategy.Allocate(allocator_manager, 1024, 1,
+                                        {"client_cxl_segment"}, {});
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(1u, result->size());
+    auto descriptor = result.value()[0].get_available_descriptor();
+    ASSERT_TRUE(descriptor.has_value());
+    EXPECT_EQ("client_cxl_segment", descriptor->get_memory_descriptor()
+                                        .buffer_descriptor.transport_endpoint_);
+
+    registration->lifetime.setAvailable(false);
+    EXPECT_FALSE(result.value()[0].get_available_descriptor().has_value());
+}
+
 // Test fallback to random allocation when preferred segment doesn't exist
 TEST_P(AllocationStrategyParameterizedTest, PreferredSegmentNotFound) {
     auto allocator1 = CreateTestAllocator("segment1", 0);

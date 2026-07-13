@@ -12,6 +12,9 @@
 namespace mooncake {
 
 std::string AllocatedBuffer::getSegmentName() const noexcept {
+    if (protocol == "cxl") {
+        return segment_name_;
+    }
     auto alloc = allocator_.lock();
     if (alloc) {
         return alloc->getSegmentName();
@@ -57,6 +60,15 @@ AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor() const {
 
     return {static_cast<uint64_t>(size()),
             reinterpret_cast<uintptr_t>(buffer_ptr_), this->protocol, endpoint};
+}
+
+bool AllocatedBuffer::getDescriptorIfAvailable(Descriptor& descriptor) const {
+    if (!isAllocatorValid()) {
+        return false;
+    }
+
+    descriptor = get_descriptor();
+    return isAllocatorValid();
 }
 
 void AllocatedBuffer::change_to_cxl(std::string client_segment_name) {
