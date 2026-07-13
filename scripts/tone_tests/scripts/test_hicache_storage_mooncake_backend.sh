@@ -20,28 +20,7 @@ run_test()
     return ${PIPESTATUS[0]}
 }
 
-parse()
-{
-    local test_exit_code=$1
-
-    echo "===== Parsing test results ====="
-    if [ $test_exit_code -eq 0 ]; then
-        save_test_result "$test_case_name" "Pass" "${BASE_DIR}/${TEST_CASE_RESULT_PATH}"
-        echo "✓ Test PASSED"
-        return 0
-    else
-        save_test_result "$test_case_name" "Fail" "${BASE_DIR}/${TEST_CASE_RESULT_PATH}"
-        echo "✗ Test FAILED"
-        return 1
-    fi
-}
-
 if [ "${BASH_SOURCE[0]}" == "${0}" ]; then
-    exit_code=0
-    if ! run_test; then
-        exit_code=1
-    fi
-    
-    parse $exit_code
+    run_test_case_with_parse "$test_case_name" run_test
     exit $?
 fi
