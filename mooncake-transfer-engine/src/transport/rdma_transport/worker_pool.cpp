@@ -203,7 +203,11 @@ int WorkerPool::submitPostSend(
             bool found = false;
             for (size_t alt_dev_id = 0;
                  alt_dev_id < peer_segment_desc->devices.size(); ++alt_dev_id) {
-                if (alt_dev_id == (size_t)device_id) continue;
+                if (alt_dev_id == (size_t)device_id ||
+                    alt_dev_id >=
+                        peer_segment_desc->buffers[buffer_id].rkey.size()) {
+                    continue;
+                }
                 auto alt_path =
                     MakeNicPath(peer_segment_desc->name,
                                 peer_segment_desc->devices[alt_dev_id].name);
@@ -269,6 +273,22 @@ int WorkerPool::submitPostSend(
     }
 
     return 0;
+}
+
+void WorkerPool::trackPostedSlices(
+    const std::vector<Transport::Slice *> &slice_list, size_t first,
+    size_t count) {
+    std::lock_guard<std::mutex> lock(posted_slices_mutex_);
+    for (size_t i = first; i < first + count; ++i)
+        posted_slices_.insert(slice_list[i]);
+}
+
+void WorkerPool::untrackPostedSlices(
+    const std::vector<Transport::Slice *> &slice_list, size_t first,
+    size_t count) {
+    std::lock_guard<std::mutex> lock(posted_slices_mutex_);
+    for (size_t i = first; i < first + count; ++i)
+        posted_slices_.erase(slice_list[i]);
 }
 
 void WorkerPool::performPostSend(int thread_id) {
@@ -344,6 +364,11 @@ void WorkerPool::performPostSend(int thread_id) {
         processed_slice_count_.fetch_add(entry.second.size());
         entry.second.clear();
 #else
+        if (!isRailAvailable(entry.first)) {
+            for (auto &slice : entry.second) failed_slice_list.push_back(slice);
+            entry.second.clear();
+            continue;
+        }
 #ifdef CONFIG_CACHE_ENDPOINT
         auto &endpoint = endpoint_map[entry.first];
         if (endpoint == nullptr || !endpoint->active())
@@ -390,6 +415,20 @@ void WorkerPool::performPostSend(int thread_id) {
 }
 
 void WorkerPool::performPollCq(int thread_id) {
+    const uint64_t poll_ts = getCurrentTimeInNano();
+    const uint64_t previous_poll_ts =
+        last_poll_ts_ns_.exchange(poll_ts, std::memory_order_relaxed);
+    if (previous_poll_ts > 0 && poll_ts > previous_poll_ts) {
+        const uint64_t interval = poll_ts - previous_poll_ts;
+        last_poll_interval_ns_.store(interval, std::memory_order_relaxed);
+        uint64_t previous_max =
+            max_poll_interval_ns_.load(std::memory_order_relaxed);
+        while (interval > previous_max &&
+               !max_poll_interval_ns_.compare_exchange_weak(
+                   previous_max, interval, std::memory_order_relaxed)) {
+        }
+    }
+
     int processed_slice_count = 0;
     const static size_t kPollCount = 64;
     std::unordered_map<volatile int *, int> qp_depth_set;
@@ -400,6 +439,14 @@ void WorkerPool::performPollCq(int thread_id) {
         if (nr_poll < 0) {
             LOG(ERROR) << "Worker: Failed to poll completion queues";
             continue;
+        }
+
+        if (nr_poll > 0) {
+            std::lock_guard<std::mutex> lock(posted_slices_mutex_);
+            for (int i = 0; i < nr_poll; ++i) {
+                auto *slice = reinterpret_cast<Transport::Slice *>(wc[i].wr_id);
+                posted_slices_.erase(slice);
+            }
         }
 
         for (int i = 0; i < nr_poll; ++i) {
@@ -503,6 +550,35 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
             auto peer_nic_path =
                 MakeNicPath(peer_segment_desc->nicPathServerName(),
                             peer_segment_desc->devices[device_id].name);
+            if (!isRailAvailable(peer_nic_path)) {
+                bool found = false;
+                for (size_t alt_dev_id = 0;
+                     alt_dev_id < peer_segment_desc->devices.size();
+                     ++alt_dev_id) {
+                    if (alt_dev_id == (size_t)device_id ||
+                        alt_dev_id >=
+                            peer_segment_desc->buffers[buffer_id].rkey.size()) {
+                        continue;
+                    }
+                    auto alt_path =
+                        MakeNicPath(peer_segment_desc->name,
+                                    peer_segment_desc->devices[alt_dev_id].name);
+                    if (isRailAvailable(alt_path)) {
+                        device_id = alt_dev_id;
+                        slice->rdma.dest_rkey =
+                            peer_segment_desc->buffers[buffer_id]
+                                .rkey[device_id];
+                        peer_nic_path = alt_path;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    slice->markFailed();
+                    processed_slice_count_++;
+                    continue;
+                }
+            }
             slice->peer_nic_path = peer_nic_path;
             if (globalConfig().log_rdma_slice_affinity) {
                 VLOG(1) << "RDMA slice affinity: source_location="
@@ -521,6 +597,7 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
                         << ", length=" << slice->length
                         << ", retry_cnt=" << slice->rdma.retry_cnt;
             }
+            slice->ts = 0;
             if (use_local_queue) {
                 collective_slice_queue_[thread_id][peer_nic_path].push_back(
                     slice);
@@ -669,8 +746,13 @@ int WorkerPool::doProcessContextEvents() {
 void WorkerPool::monitorWorker() {
     bindToSocket(numa_socket_id_);
     auto last_reset_ts = getCurrentTimeInNano();
+    uint64_t outstanding_since_ns = 0;
+    uint64_t last_timeout_log_ns = 0;
+    uint64_t last_processed_count =
+        processed_slice_count_.load(std::memory_order_relaxed);
     while (workers_running_) {
-        auto current_ts = getCurrentTimeInNano();
+        const uint64_t current_ts =
+            static_cast<uint64_t>(getCurrentTimeInNano());
         if (current_ts - last_reset_ts > 1000000000ll) {
             // Drain endpoint_store_->waiting_list_ even when no new
             // insertions are happening. Without this, reclaim only runs
@@ -679,6 +761,101 @@ void WorkerPool::monitorWorker() {
             context_.reclaimEndpoints();
             last_reset_ts = current_ts;
         }
+
+        int64_t cq_outstanding = 0;
+        for (int cq_index = 0; cq_index < context_.cqCount(); ++cq_index) {
+            cq_outstanding += *context_.cqOutstandingCount(cq_index);
+        }
+        const uint64_t processed_count =
+            processed_slice_count_.load(std::memory_order_relaxed);
+        if (processed_count != last_processed_count) {
+            last_processed_count = processed_count;
+            outstanding_since_ns =
+                cq_outstanding > 0 ? current_ts : static_cast<uint64_t>(0);
+        }
+        if (cq_outstanding > 0) {
+            if (outstanding_since_ns == 0) outstanding_since_ns = current_ts;
+
+            const uint64_t outstanding_age_ns =
+                current_ts - outstanding_since_ns;
+            const uint64_t last_poll_ts =
+                last_poll_ts_ns_.load(std::memory_order_relaxed);
+            const uint64_t poll_gap_ns =
+                last_poll_ts > 0 && current_ts > last_poll_ts
+                    ? current_ts - last_poll_ts
+                    : 0;
+
+            // Log a stalled poller quickly, and also log at the same 30-second
+            // boundary used by TransferEnginePy when polling continues.
+            const bool poll_stalled = poll_gap_ns >= 5ULL * 1000 * 1000 * 1000;
+            const bool transfer_timed_out =
+                outstanding_age_ns >= 30ULL * 1000 * 1000 * 1000;
+            if ((poll_stalled || transfer_timed_out) &&
+                current_ts - last_timeout_log_ns >= 5ULL * 1000 * 1000 * 1000) {
+                LOG(ERROR)
+                    << "CQ completion timeout diagnostic: context="
+                    << context_.deviceName()
+                    << ", outstanding=" << cq_outstanding
+                    << ", outstanding_age_ms=" << outstanding_age_ns / 1000000
+                    << ", poll_gap_ms=" << poll_gap_ns / 1000000
+                    << ", last_poll_interval_ms="
+                    << last_poll_interval_ns_.load(std::memory_order_relaxed) /
+                           1000000
+                    << ", max_poll_interval_ms="
+                    << max_poll_interval_ns_.load(std::memory_order_relaxed) /
+                           1000000
+                    << ", submitted="
+                    << submitted_slice_count_.load(std::memory_order_relaxed)
+                    << ", processed="
+                    << processed_slice_count_.load(std::memory_order_relaxed);
+
+                struct StuckGroup {
+                    size_t slice_count = 0;
+                    uint64_t total_bytes = 0;
+                    uint64_t oldest_post_ts = 0;
+                    void *sample_source_addr = nullptr;
+                    uint64_t sample_dest_addr = 0;
+                };
+                std::unordered_map<std::string, StuckGroup> stuck_groups;
+                {
+                    std::lock_guard<std::mutex> lock(posted_slices_mutex_);
+                    for (auto *slice : posted_slices_) {
+                        auto &group = stuck_groups[slice->peer_nic_path];
+                        group.slice_count++;
+                        group.total_bytes += slice->length;
+                        if (group.oldest_post_ts == 0 ||
+                            static_cast<uint64_t>(slice->ts) <
+                                group.oldest_post_ts) {
+                            group.oldest_post_ts =
+                                static_cast<uint64_t>(slice->ts);
+                            group.sample_source_addr = slice->source_addr;
+                            group.sample_dest_addr = slice->rdma.dest_addr;
+                        }
+                    }
+                }
+                for (const auto &entry : stuck_groups) {
+                    const auto &group = entry.second;
+                    const uint64_t oldest_age_ms =
+                        group.oldest_post_ts > 0 &&
+                                current_ts > group.oldest_post_ts
+                            ? (current_ts - group.oldest_post_ts) / 1000000
+                            : 0;
+                    LOG(ERROR)
+                        << "CQ stuck transfer group: context="
+                        << context_.deviceName() << ", peer_nic=" << entry.first
+                        << ", slices=" << group.slice_count
+                        << ", bytes=" << group.total_bytes
+                        << ", oldest_post_age_ms=" << oldest_age_ms
+                        << ", sample_source_addr=" << group.sample_source_addr
+                        << ", sample_dest_addr="
+                        << reinterpret_cast<void *>(group.sample_dest_addr);
+                }
+                last_timeout_log_ns = current_ts;
+            }
+        } else {
+            outstanding_since_ns = 0;
+        }
+
         struct epoll_event event;
         int num_events = epoll_wait(context_.eventFd(), &event, 1, 100);
         if (num_events < 0) {

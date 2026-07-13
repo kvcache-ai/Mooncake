@@ -832,9 +832,16 @@ int RdmaEndPoint::submitPostSend(
         ibv_send_wr *bad_wr = nullptr;
         __sync_fetch_and_add(&wr_depth_list_[qp_index], wr_count);
         __sync_fetch_and_add(cq_outstanding_, wr_count);
+        // Register before ringing the doorbell. A fast completion may otherwise
+        // be polled before the diagnostic registry sees the slice.
+        context_.trackPostedSlices(slice_list, start, wr_count);
         int rc = ibv_post_send(qp_list_[qp_index], wr_list.data(), &bad_wr);
         if (rc) {
             PLOG(ERROR) << "Failed to ibv_post_send";
+            const size_t first_failed =
+                bad_wr ? static_cast<size_t>(bad_wr - wr_list.data()) : 0;
+            context_.untrackPostedSlices(slice_list, start + first_failed,
+                                         wr_count - first_failed);
             while (bad_wr) {
                 int i = bad_wr - wr_list.data();
                 failed_slice_list.push_back(slice_list[start + i]);

@@ -1196,4 +1196,16 @@ int RdmaContext::submitPostSend(
     const std::vector<Transport::Slice *> &slice_list) {
     return worker_pool_->submitPostSend(slice_list);
 }
+
+void RdmaContext::trackPostedSlices(
+    const std::vector<Transport::Slice *> &slice_list, size_t first,
+    size_t count) {
+    worker_pool_->trackPostedSlices(slice_list, first, count);
+}
+
+void RdmaContext::untrackPostedSlices(
+    const std::vector<Transport::Slice *> &slice_list, size_t first,
+    size_t count) {
+    worker_pool_->untrackPostedSlices(slice_list, first, count);
+}
 }  // namespace mooncake
