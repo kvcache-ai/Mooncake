@@ -80,6 +80,11 @@ __device__ __forceinline__ mlx5gda_qp_devctx* mc_ibgda_channel(
     return ctx.qp_devctxs + qp_idx;
 }
 
+__device__ __forceinline__ bool mc_ibgda_debug_enabled(mlx5gda_qp_devctx* qp,
+                                                       uint32_t flag) {
+    return (qp->debug_flags & flag) != 0;
+}
+
 __device__ __forceinline__ void mc_ibgda_lock(mlx5gda_qp_devctx* qp) {
 #ifdef MOONCAKE_EP_USE_MUSA
     uint32_t old;
@@ -150,6 +155,15 @@ __device__ __forceinline__ void mc_ibgda_post_send_db(mlx5gda_qp_devctx* qp,
     }
 }
 
+__device__ __forceinline__ void mc_ibgda_post_send_db_locked(
+    mlx5gda_qp_devctx* qp, uint32_t slot) {
+    const uint32_t posted = slot + 1;
+    qp->wq_head_atomic = posted;
+    qp->db_head = posted;
+    qp->wq_head = static_cast<uint16_t>(posted);
+    mc_ibgda_post_send_db(qp, posted);
+}
+
 __device__ __forceinline__ void mc_ibgda_flush_ready_wqes(
     mlx5gda_qp_devctx* qp) {
     mc_ibgda_lock(qp);
@@ -174,8 +188,13 @@ __device__ __forceinline__ void mc_ibgda_write_rdma_write_wqe(
 
     wqe->ctrl = {};
     wqe->ctrl.qpn_ds = mc_bswap32((qp->qpn << 8) | 3);
-    // Debug: data WQEs request CQEs sparsely to estimate CQE overhead.
-    wqe->ctrl.fm_ce_se = ((slot & 0x3f) == 0x3f) ? MLX5_WQE_CTRL_CQ_UPDATE : 0;
+    if (mc_ibgda_debug_enabled(qp, MLX5GDA_DEBUG_SPARSE_CQE)) {
+        // Debug: data WQEs request CQEs sparsely to estimate CQE overhead.
+        wqe->ctrl.fm_ce_se =
+            ((slot & 0x3f) == 0x3f) ? MLX5_WQE_CTRL_CQ_UPDATE : 0;
+    } else {
+        wqe->ctrl.fm_ce_se = MLX5_WQE_CTRL_CQ_UPDATE;
+    }
     wqe->ctrl.opmod_idx_opcode =
         mc_bswap32((wqe_counter << 8) | MLX5_OPCODE_RDMA_WRITE);
 
@@ -233,13 +252,25 @@ __device__ __forceinline__ void mc_ibgda_put(const IbgdaContext& ctx,
                                              uint64_t recv_raddr,
                                              uint32_t nbytes) {
     auto* qp = mc_ibgda_channel(ctx, channel, dst_rank, qps_per_rank);
-    uint32_t slot = mc_ibgda_reserve_wqe(qp);
+    if (mc_ibgda_debug_enabled(qp, MLX5GDA_DEBUG_ATOMIC_RESERVE)) {
+        uint32_t slot = mc_ibgda_reserve_wqe(qp);
+        mc_ibgda_write_rdma_write_wqe(
+            qp, slot, reinterpret_cast<uint64_t>(send_ptr),
+            mc_bswap32(ctx.rkeys[src_rank]), recv_raddr,
+            mc_bswap32(ctx.rkeys[dst_rank]), nbytes);
+        mc_ibgda_mark_wqe_ready(qp, slot);
+        mc_ibgda_flush_ready_wqes(qp);
+        return;
+    }
+
+    mc_ibgda_lock(qp);
+    uint32_t slot = qp->db_head;
     mc_ibgda_write_rdma_write_wqe(qp, slot,
                                   reinterpret_cast<uint64_t>(send_ptr),
                                   mc_bswap32(ctx.rkeys[src_rank]), recv_raddr,
                                   mc_bswap32(ctx.rkeys[dst_rank]), nbytes);
-    mc_ibgda_mark_wqe_ready(qp, slot);
-    mc_ibgda_flush_ready_wqes(qp);
+    mc_ibgda_post_send_db_locked(qp, slot);
+    mc_ibgda_unlock(qp);
 }
 
 __device__ __forceinline__ void mc_ibgda_put_defer_db(
@@ -247,12 +278,31 @@ __device__ __forceinline__ void mc_ibgda_put_defer_db(
     int qps_per_rank, const void* send_ptr, uint64_t recv_raddr,
     uint32_t nbytes) {
     auto* qp = mc_ibgda_channel(ctx, channel, dst_rank, qps_per_rank);
-    uint32_t slot = mc_ibgda_reserve_wqe(qp);
+    if (!mc_ibgda_debug_enabled(qp, MLX5GDA_DEBUG_DEFER_DB)) {
+        mc_ibgda_put(ctx, channel, dst_rank, src_rank, qps_per_rank, send_ptr,
+                     recv_raddr, nbytes);
+        return;
+    }
+
+    if (mc_ibgda_debug_enabled(qp, MLX5GDA_DEBUG_ATOMIC_RESERVE)) {
+        uint32_t slot = mc_ibgda_reserve_wqe(qp);
+        mc_ibgda_write_rdma_write_wqe(
+            qp, slot, reinterpret_cast<uint64_t>(send_ptr),
+            mc_bswap32(ctx.rkeys[src_rank]), recv_raddr,
+            mc_bswap32(ctx.rkeys[dst_rank]), nbytes);
+        mc_ibgda_mark_wqe_ready(qp, slot);
+        return;
+    }
+
+    mc_ibgda_lock(qp);
+    uint32_t slot = qp->wq_head_atomic;
     mc_ibgda_write_rdma_write_wqe(qp, slot,
                                   reinterpret_cast<uint64_t>(send_ptr),
                                   mc_bswap32(ctx.rkeys[src_rank]), recv_raddr,
                                   mc_bswap32(ctx.rkeys[dst_rank]), nbytes);
+    qp->wq_head_atomic = slot + 1;
     mc_ibgda_mark_wqe_ready(qp, slot);
+    mc_ibgda_unlock(qp);
 }
 
 // RDMA ATOMIC ADD: add `value` to the 32-bit word at `recv_raddr` on
@@ -264,12 +314,23 @@ __device__ __forceinline__ void mc_ibgda_red_add(
     uint64_t recv_raddr,  // remote VA of the signal word
     int32_t value) {
     auto* qp = mc_ibgda_channel(ctx, channel, dst_rank, qps_per_rank);
-    uint32_t slot = mc_ibgda_reserve_wqe(qp);
+    if (mc_ibgda_debug_enabled(qp, MLX5GDA_DEBUG_ATOMIC_RESERVE)) {
+        uint32_t slot = mc_ibgda_reserve_wqe(qp);
+        mc_ibgda_write_rdma_atomic_add_wqe(
+            qp, slot, value, laddr, mc_bswap32(ctx.rkeys[src_rank]), recv_raddr,
+            mc_bswap32(ctx.rkeys[dst_rank]));
+        mc_ibgda_mark_wqe_ready(qp, slot);
+        mc_ibgda_flush_ready_wqes(qp);
+        return;
+    }
+
+    mc_ibgda_lock(qp);
+    uint32_t slot = qp->db_head;
     mc_ibgda_write_rdma_atomic_add_wqe(
         qp, slot, value, laddr, mc_bswap32(ctx.rkeys[src_rank]), recv_raddr,
         mc_bswap32(ctx.rkeys[dst_rank]));
-    mc_ibgda_mark_wqe_ready(qp, slot);
-    mc_ibgda_flush_ready_wqes(qp);
+    mc_ibgda_post_send_db_locked(qp, slot);
+    mc_ibgda_unlock(qp);
 }
 
 }  // namespace device

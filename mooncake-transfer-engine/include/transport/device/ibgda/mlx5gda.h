@@ -14,6 +14,12 @@
 
 #define MAX_QP_COUNT 256
 
+enum mlx5gda_debug_flags : uint32_t {
+    MLX5GDA_DEBUG_SPARSE_CQE = 1u << 0,
+    MLX5GDA_DEBUG_ATOMIC_RESERVE = 1u << 1,
+    MLX5GDA_DEBUG_DEFER_DB = 1u << 2,
+};
+
 struct mlx5gda_cq_dbr {
     uint64_t unused;
 };
@@ -79,6 +85,7 @@ struct mlx5gda_qp_devctx {
     uint32_t qpn;         // QP number
     uint32_t wqeid_mask;  // = num_wqebb - 1
     uint32_t mutex;       // doorbell flush mutex
+    uint32_t debug_flags;
     struct mlx5gda_wqebb *wq;
     uint32_t *wq_ready;
     struct mlx5_cqe64 *cq;
