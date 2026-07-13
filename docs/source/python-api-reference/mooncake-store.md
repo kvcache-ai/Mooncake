@@ -2523,6 +2523,142 @@ def batch_upsert_pub_tensor(self, keys: List[str], tensors_list: List[torch.Tens
 
 **Note:** This function requires `torch` to be installed and available in the environment. Not supported for dummy client.
 
+---
+
+### Tensor File I/O
+
+Persist tensors to external files or load them into Mooncake Store from local
+paths, `file://` URIs, or remote schemes such as `s3://` (via
+[fsspec](https://filesystem-spec.readthedocs.io/)).
+
+These methods are provided by `mooncake.store_file_io` and attached to
+`MooncakeDistributedStore` when the `mooncake` package is imported. They extend
+the C++ local-only safetensor helpers with filesystem-aware I/O.
+
+See also: [Artifact File I/O design](../design/artifact-file-io) and
+[RFC #2868](https://github.com/kvcache-ai/Mooncake/issues/2868).
+
+**Dependencies:**
+
+```bash
+pip install "mooncake-transfer-engine[file-io]"   # safetensors + torch
+pip install s3fs                                   # only for s3:// paths
+```
+
+`fsspec` is a runtime dependency of the wheel. Remote backends need their own
+fsspec implementation package.
+
+#### save_tensor_to_file()
+
+Export a tensor already stored under `key` to a file.
+
+```python
+def save_tensor_to_file(
+    self,
+    key: str,
+    file_name: str | os.PathLike | None = None,
+    format: str = "auto",
+    filesystem: str = "auto",
+    storage_options: dict | None = None,
+    tensor_name: str | None = None,
+) -> int
+```
+
+**Parameters:**
+
+- `key` (str): Store key of the tensor to export.
+- `file_name` (str, optional): Destination path or URI. Defaults to `key` when
+  omitted.
+- `format` (str): `auto`, `safetensors`, or `torch` (`.pt`/`.pth`). With
+  `auto`, `.safetensors` suffix selects safetensors; otherwise torch is used.
+- `filesystem` (str): `auto`, `file`, or a fsspec protocol name (`s3`, ...).
+  When `file_name` already contains `://`, the URI scheme is used as-is.
+- `storage_options` (dict, optional): Backend credentials/options forwarded to
+  fsspec (for example S3 access keys).
+- `tensor_name` (str, optional): Entry name written inside a safetensors file.
+  Defaults to `key`.
+
+**Returns:** `0` on success; non-zero error code otherwise.
+
+#### load_tensor_from_file()
+
+Load a tensor from a file and store it under a Store key.
+
+```python
+def load_tensor_from_file(
+    self,
+    key: str | None = None,
+    file_name: str | os.PathLike | None = None,
+    format: str = "auto",
+    filesystem: str = "auto",
+    storage_options: dict | None = None,
+    tensor_name: str | None = None,
+    map_location=None,
+    weights_only: bool = True,
+) -> torch.Tensor | None
+```
+
+**Parameters:**
+
+- `key` (str, optional): Store key to write. Defaults to `file_name` when
+  omitted.
+- `file_name` (str): Source path or URI (**required**).
+- `format`, `filesystem`, `storage_options`, `tensor_name`: Same semantics as
+  `save_tensor_to_file()`.
+- `map_location`: Passed to `torch.load` for torch files; applied with `.to()`
+  after safetensors decode.
+- `weights_only` (bool): Passed to `torch.load` (default `True`).
+
+**Returns:** Loaded `torch.Tensor` on success; `None` on failure.
+
+**Example (local safetensors):**
+
+```python
+import torch
+from mooncake.store import MooncakeDistributedStore
+
+store = MooncakeDistributedStore()
+store.setup("localhost", "http://localhost:8080/metadata",
+            512 * 1024 * 1024, 128 * 1024 * 1024,
+            "tcp", "", "localhost:50051")
+
+tensor = torch.randn(64, 64)
+store.put_tensor("weights/demo", tensor)
+store.save_tensor_to_file("weights/demo", "/tmp/demo.safetensors", format="safetensors")
+
+store.remove("weights/demo")
+loaded = store.load_tensor_from_file("weights/demo", "/tmp/demo.safetensors")
+assert loaded is not None and torch.allclose(tensor, loaded)
+```
+
+**Example (`file://` URI):**
+
+```python
+from pathlib import Path
+
+path = Path("/tmp/nested/kv.safetensors")
+store.save_tensor_to_safetensor(
+    "kv/layer0",
+    path.as_uri(),
+    filesystem="file",
+    tensor_name="kv_cache",
+)
+store.load_tensor_from_safetensor("kv/restored", path.as_uri(), tensor_name="kv_cache")
+```
+
+#### save_tensor_to_safetensor() / load_tensor_from_safetensor()
+
+Safetensors-specific wrappers around `save_tensor_to_file` /
+`load_tensor_from_file`. They accept `filesystem` and `storage_options` in
+addition to the original local-path parameters.
+
+When the Python patch is **not** loaded, the C++ bindings still support
+**local paths only** for these two methods.
+
+#### save_kv_cache_to_file() / load_kv_cache_from_file()
+
+Aliases of `save_tensor_to_file` / `load_tensor_from_file` for KV cache
+persistence call sites. Parameters and return values are identical.
 
 ---
 
