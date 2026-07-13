@@ -230,6 +230,14 @@ class MasterServiceTest : public ::testing::Test {
                 .has_value());
     }
 
+    void ResetMasterMetricsForUnitTest() const {
+        auto& metrics = MasterMetricManager::instance();
+        metrics.reset_allocated_mem_size();
+        metrics.reset_total_mem_capacity();
+        metrics.reset_cache_total_nums();
+        metrics.reset_hidden_allocated_mem_size();
+    }
+
     bool ExecutePendingMoveTasks(MasterService& service,
                                  const UUID& client_id) const {
         auto fetched = service.FetchTasks(client_id, /*batch_size=*/16);
@@ -7131,6 +7139,418 @@ TEST_F(MasterServiceTest, HardPinWithSoftPinEvictionOrder) {
         << "Hard-pinned object was evicted";
 
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
+    service_->RemoveAll();
+}
+
+TEST_F(MasterServiceTest,
+       HiddenLogicalBudgetEvictsExpiredSoftPinnedHiddenBeforeKv) {
+    ResetMasterMetricsForUnitTest();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(5000)
+                              .set_default_kv_soft_pin_ttl(60000)
+                              .set_allow_evict_soft_pinned_objects(false)
+                              .set_eviction_ratio(0.5)
+                              .set_eviction_high_watermark_ratio(0.0)
+                              .set_enable_hidden_type_aware_eviction(true)
+                              .set_hidden_memory_budget_ratio(0.10)
+                              .set_hidden_memory_high_watermark_ratio(0.90)
+                              .set_allow_hidden_in_global_eviction(false)
+                              .set_default_hidden_lease_ttl(0)
+                              .set_soft_pinned_hidden_lease_ttl(0)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    const UUID client_id = generate_uuid();
+
+    constexpr size_t segment_size = 8 * 1024 * 1024;
+    constexpr size_t value_size = 1024 * 1024;
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(
+        *service_, "hidden_budget_segment", kDefaultSegmentBase, segment_size);
+    ASSERT_EQ(MasterMetricManager::instance().get_total_mem_capacity(),
+              static_cast<int64_t>(segment_size));
+
+    ReplicateConfig hidden_config;
+    hidden_config.replica_num = 1;
+    hidden_config.with_soft_pin = true;
+    hidden_config.data_type = ObjectDataType::HIDDEN_STATE;
+
+    PutCompletedObject(*service_, client_id,
+                       "hidden@model:qwen@mm_encoder:a@parallel:p@layout:l@a",
+                       hidden_config, value_size);
+    PutCompletedObject(*service_, client_id,
+                       "hidden@model:qwen@mm_encoder:a@parallel:p@layout:l@b",
+                       hidden_config, value_size);
+
+    ReplicateConfig kv_config;
+    kv_config.replica_num = 1;
+    kv_config.data_type = ObjectDataType::KVCACHE;
+    PutCompletedObject(*service_, client_id, "kv-public-prefix", kv_config,
+                       value_size);
+    ASSERT_TRUE(
+        service_->GetReplicaList("kv-public-prefix", "default").has_value());
+
+    WaitUntil([&] {
+        return !service_
+                    ->ExistKey(
+                        "hidden@model:qwen@mm_encoder:a@parallel:p@layout:l@a",
+                        "default")
+                    .value_or(true) &&
+               !service_
+                    ->ExistKey(
+                        "hidden@model:qwen@mm_encoder:a@parallel:p@layout:l@b",
+                        "default")
+                    .value_or(true);
+    });
+    EXPECT_TRUE(
+        service_->ExistKey("kv-public-prefix", "default").value_or(false));
+
+    service_->RemoveAll();
+}
+
+TEST_F(MasterServiceTest, HiddenAllocatedMemoryMetricTracksCompletedReplicas) {
+    ResetMasterMetricsForUnitTest();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(5000)
+                              .set_enable_hidden_type_aware_eviction(true)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    const UUID client_id = generate_uuid();
+
+    constexpr size_t segment_size = 8 * 1024 * 1024;
+    constexpr size_t value_size = 1024 * 1024;
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(
+        *service_, "hidden_metric_segment", kDefaultSegmentBase, segment_size);
+    ASSERT_EQ(MasterMetricManager::instance().get_total_mem_capacity(),
+              static_cast<int64_t>(segment_size));
+
+    const int64_t base_hidden_bytes =
+        MasterMetricManager::instance().get_hidden_allocated_mem_size();
+    ASSERT_EQ(base_hidden_bytes, 0);
+
+    ReplicateConfig hidden_config;
+    hidden_config.replica_num = 1;
+    hidden_config.data_type = ObjectDataType::HIDDEN_STATE;
+    const std::string hidden_key =
+        "hidden@model:qwen@mm_encoder:image@parallel:p@layout:l@metric";
+    PutCompletedObject(*service_, client_id, hidden_key, hidden_config,
+                       value_size);
+
+    EXPECT_EQ(MasterMetricManager::instance().get_hidden_allocated_mem_size(),
+              base_hidden_bytes + static_cast<int64_t>(value_size));
+
+    ReplicateConfig tensor_config;
+    tensor_config.replica_num = 1;
+    tensor_config.data_type = ObjectDataType::TENSOR;
+    PutCompletedObject(*service_, client_id, "ordinary_tensor_metric",
+                       tensor_config, value_size);
+
+    EXPECT_EQ(MasterMetricManager::instance().get_hidden_allocated_mem_size(),
+              base_hidden_bytes + static_cast<int64_t>(value_size));
+
+    ASSERT_TRUE(
+        service_->Remove(hidden_key, "default", /*force=*/true).has_value());
+    EXPECT_EQ(MasterMetricManager::instance().get_hidden_allocated_mem_size(),
+              base_hidden_bytes);
+
+    service_->RemoveAll();
+}
+
+TEST_F(MasterServiceTest,
+       HiddenPrivateSessionEvictsColdHiddenAndKeepsActiveHiddenAndKv) {
+    ResetMasterMetricsForUnitTest();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(5000)
+                              .set_default_kv_soft_pin_ttl(60000)
+                              .set_allow_evict_soft_pinned_objects(false)
+                              .set_eviction_ratio(0.5)
+                              .set_eviction_high_watermark_ratio(0.0)
+                              .set_enable_hidden_type_aware_eviction(true)
+                              .set_hidden_memory_budget_ratio(0.10)
+                              .set_hidden_memory_high_watermark_ratio(0.90)
+                              .set_allow_hidden_in_global_eviction(false)
+                              .set_default_hidden_lease_ttl(250)
+                              .set_soft_pinned_hidden_lease_ttl(600)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    const UUID client_id = generate_uuid();
+
+    constexpr size_t segment_size = 10 * 1024 * 1024;
+    constexpr size_t value_size = 1024 * 1024;
+    [[maybe_unused]] const auto context =
+        PrepareSimpleSegment(*service_, "hidden_private_session_segment",
+                             kDefaultSegmentBase, segment_size);
+    ASSERT_EQ(MasterMetricManager::instance().get_total_mem_capacity(),
+              static_cast<int64_t>(segment_size));
+
+    ReplicateConfig hidden_config;
+    hidden_config.replica_num = 1;
+    hidden_config.data_type = ObjectDataType::HIDDEN_STATE;
+
+    const std::vector<std::string> hidden_keys = {
+        "hidden@model:qwen@mm_encoder:image@parallel:p@layout:l@private0",
+        "hidden@model:qwen@mm_encoder:image@parallel:p@layout:l@private1",
+        "hidden@model:qwen@mm_encoder:image@parallel:p@layout:l@active0",
+        "hidden@model:qwen@mm_encoder:image@parallel:p@layout:l@active1",
+    };
+    for (const auto& key : hidden_keys) {
+        PutCompletedObject(*service_, client_id, key, hidden_config,
+                           value_size);
+        if (key.find("@active") != std::string::npos) {
+            ASSERT_TRUE(service_->GetReplicaList(key, "default").has_value());
+        }
+    }
+    ASSERT_EQ(MasterMetricManager::instance().get_hidden_allocated_mem_size(),
+              static_cast<int64_t>(hidden_keys.size() * value_size));
+
+    ReplicateConfig kv_config;
+    kv_config.replica_num = 1;
+    kv_config.data_type = ObjectDataType::KVCACHE;
+    PutCompletedObject(*service_, client_id, "kv-system-prompt-prefix",
+                       kv_config, value_size);
+    ASSERT_TRUE(service_->GetReplicaList("kv-system-prompt-prefix", "default")
+                    .has_value());
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    WaitUntil([&] {
+        return !service_->ExistKey(hidden_keys[0], "default").value_or(true) &&
+               !service_->ExistKey(hidden_keys[1], "default").value_or(true);
+    });
+    EXPECT_TRUE(service_->ExistKey(hidden_keys[2], "default").value_or(false));
+    EXPECT_TRUE(service_->ExistKey(hidden_keys[3], "default").value_or(false));
+    EXPECT_TRUE(service_->ExistKey("kv-system-prompt-prefix", "default")
+                    .value_or(false));
+
+    service_->RemoveAll();
+}
+
+TEST_F(MasterServiceTest, HiddenBelowBudgetIsExcludedFromGlobalEviction) {
+    ResetMasterMetricsForUnitTest();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(0)
+                              .set_default_kv_soft_pin_ttl(0)
+                              .set_allow_evict_soft_pinned_objects(false)
+                              .set_eviction_ratio(0.5)
+                              .set_eviction_high_watermark_ratio(0.0)
+                              .set_enable_hidden_type_aware_eviction(true)
+                              .set_hidden_memory_budget_ratio(0.50)
+                              .set_hidden_memory_high_watermark_ratio(0.90)
+                              .set_allow_hidden_in_global_eviction(false)
+                              .set_default_hidden_lease_ttl(0)
+                              .set_soft_pinned_hidden_lease_ttl(0)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    const UUID client_id = generate_uuid();
+
+    constexpr size_t segment_size = 8 * 1024 * 1024;
+    constexpr size_t value_size = 1024 * 1024;
+    [[maybe_unused]] const auto context =
+        PrepareSimpleSegment(*service_, "hidden_under_budget_segment",
+                             kDefaultSegmentBase, segment_size);
+    ASSERT_EQ(MasterMetricManager::instance().get_total_mem_capacity(),
+              static_cast<int64_t>(segment_size));
+
+    ReplicateConfig hidden_config;
+    hidden_config.replica_num = 1;
+    hidden_config.data_type = ObjectDataType::HIDDEN_STATE;
+    const std::string hidden_key =
+        "hidden@model:qwen@mm_encoder:image@parallel:p@layout:l@under-budget";
+    PutCompletedObject(*service_, client_id, hidden_key, hidden_config,
+                       value_size);
+
+    ReplicateConfig kv_config;
+    kv_config.replica_num = 1;
+    kv_config.data_type = ObjectDataType::KVCACHE;
+    for (int i = 0; i < 4; i++) {
+        PutCompletedObject(*service_, client_id,
+                           "kv-under-budget-" + std::to_string(i), kv_config,
+                           value_size);
+    }
+
+    WaitUntil([&] {
+        bool any_kv_evicted = false;
+        for (int i = 0; i < 4; i++) {
+            any_kv_evicted =
+                any_kv_evicted ||
+                !service_
+                     ->ExistKey("kv-under-budget-" + std::to_string(i),
+                                "default")
+                     .value_or(true);
+        }
+        return any_kv_evicted &&
+               service_->ExistKey(hidden_key, "default").value_or(false);
+    });
+    EXPECT_TRUE(service_->ExistKey(hidden_key, "default").value_or(false));
+
+    service_->RemoveAll();
+}
+
+TEST_F(MasterServiceTest,
+       HiddenBelowBudgetCanJoinGlobalEvictionWhenConfigured) {
+    ResetMasterMetricsForUnitTest();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(0)
+                              .set_default_kv_soft_pin_ttl(0)
+                              .set_allow_evict_soft_pinned_objects(false)
+                              .set_eviction_ratio(0.5)
+                              .set_eviction_high_watermark_ratio(0.0)
+                              .set_enable_hidden_type_aware_eviction(true)
+                              .set_hidden_memory_budget_ratio(0.50)
+                              .set_hidden_memory_high_watermark_ratio(0.90)
+                              .set_allow_hidden_in_global_eviction(true)
+                              .set_default_hidden_lease_ttl(0)
+                              .set_soft_pinned_hidden_lease_ttl(0)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    const UUID client_id = generate_uuid();
+
+    constexpr size_t segment_size = 8 * 1024 * 1024;
+    constexpr size_t value_size = 1024 * 1024;
+    [[maybe_unused]] const auto context =
+        PrepareSimpleSegment(*service_, "hidden_global_allowed_segment",
+                             kDefaultSegmentBase, segment_size);
+    ASSERT_EQ(MasterMetricManager::instance().get_total_mem_capacity(),
+              static_cast<int64_t>(segment_size));
+
+    ReplicateConfig hidden_config;
+    hidden_config.replica_num = 1;
+    hidden_config.data_type = ObjectDataType::HIDDEN_STATE;
+    const std::string hidden_key =
+        "hidden@model:qwen@mm_encoder:image@parallel:p@layout:l@global";
+    PutCompletedObject(*service_, client_id, hidden_key, hidden_config,
+                       value_size);
+
+    WaitUntil([&] {
+        return !service_->ExistKey(hidden_key, "default").value_or(true);
+    });
+    EXPECT_FALSE(service_->ExistKey(hidden_key, "default").value_or(true));
+
+    service_->RemoveAll();
+}
+
+TEST_F(MasterServiceTest, HiddenBudgetRatioOneUsesGlobalEviction) {
+    ResetMasterMetricsForUnitTest();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(0)
+                              .set_default_kv_soft_pin_ttl(0)
+                              .set_allow_evict_soft_pinned_objects(false)
+                              .set_eviction_ratio(0.5)
+                              .set_eviction_high_watermark_ratio(0.0)
+                              .set_enable_hidden_type_aware_eviction(true)
+                              .set_hidden_memory_budget_ratio(1.0)
+                              .set_hidden_memory_high_watermark_ratio(0.90)
+                              .set_allow_hidden_in_global_eviction(false)
+                              .set_default_hidden_lease_ttl(0)
+                              .set_soft_pinned_hidden_lease_ttl(0)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    const UUID client_id = generate_uuid();
+
+    constexpr size_t segment_size = 4 * 1024 * 1024;
+    constexpr size_t value_size = 1024 * 1024;
+    [[maybe_unused]] const auto context =
+        PrepareSimpleSegment(*service_, "hidden_budget_ratio_one_segment",
+                             kDefaultSegmentBase, segment_size);
+    ASSERT_EQ(MasterMetricManager::instance().get_total_mem_capacity(),
+              static_cast<int64_t>(segment_size));
+
+    ReplicateConfig hidden_config;
+    hidden_config.replica_num = 1;
+    hidden_config.data_type = ObjectDataType::HIDDEN_STATE;
+    const std::string hidden_key =
+        "hidden@model:qwen@mm_encoder:image@parallel:p@layout:l@budget-one";
+    PutCompletedObject(*service_, client_id, hidden_key, hidden_config,
+                       value_size);
+
+    WaitUntil([&] {
+        return !service_->ExistKey(hidden_key, "default").value_or(true);
+    });
+    EXPECT_FALSE(service_->ExistKey(hidden_key, "default").value_or(true));
+
+    service_->RemoveAll();
+}
+
+TEST_F(MasterServiceTest, HiddenBudgetRatioAboveOneIsRejected) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_enable_hidden_type_aware_eviction(true)
+                              .set_hidden_memory_budget_ratio(1.01)
+                              .build();
+
+    EXPECT_THROW(
+        { MasterService service(service_config); }, std::invalid_argument);
+}
+
+TEST_F(MasterServiceTest, HiddenSoftPinExtendsLeaseDuringHiddenBudgetEviction) {
+    ResetMasterMetricsForUnitTest();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(60000)
+                              .set_default_kv_soft_pin_ttl(60000)
+                              .set_allow_evict_soft_pinned_objects(false)
+                              .set_eviction_ratio(0.5)
+                              .set_eviction_high_watermark_ratio(0.0)
+                              .set_enable_hidden_type_aware_eviction(true)
+                              .set_hidden_memory_budget_ratio(0.10)
+                              .set_hidden_memory_high_watermark_ratio(0.90)
+                              .set_allow_hidden_in_global_eviction(false)
+                              .set_default_hidden_lease_ttl(0)
+                              .set_soft_pinned_hidden_lease_ttl(60000)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    const UUID client_id = generate_uuid();
+
+    constexpr size_t segment_size = 10 * 1024 * 1024;
+    constexpr size_t value_size = 1024 * 1024;
+    [[maybe_unused]] const auto context =
+        PrepareSimpleSegment(*service_, "hidden_soft_pin_session_segment",
+                             kDefaultSegmentBase, segment_size);
+    ASSERT_EQ(MasterMetricManager::instance().get_total_mem_capacity(),
+              static_cast<int64_t>(segment_size));
+
+    ReplicateConfig pinned_hidden_config;
+    pinned_hidden_config.replica_num = 1;
+    pinned_hidden_config.with_soft_pin = true;
+    pinned_hidden_config.data_type = ObjectDataType::HIDDEN_STATE;
+
+    const std::string hot_video =
+        "hidden@model:qwen@mm_encoder:video@parallel:p@layout:l@hot-video";
+    PutCompletedObject(*service_, client_id, hot_video, pinned_hidden_config,
+                       value_size);
+    ASSERT_TRUE(service_->GetReplicaList(hot_video, "default").has_value());
+
+    ReplicateConfig image_hidden_config;
+    image_hidden_config.replica_num = 1;
+    image_hidden_config.data_type = ObjectDataType::HIDDEN_STATE;
+    const std::string private_image0 =
+        "hidden@model:qwen@mm_encoder:image@parallel:p@layout:l@image0";
+    const std::string private_image1 =
+        "hidden@model:qwen@mm_encoder:image@parallel:p@layout:l@image1";
+    const std::string pressure_image =
+        "hidden@model:qwen@mm_encoder:image@parallel:p@layout:l@pressure";
+    PutCompletedObject(*service_, client_id, private_image0,
+                       image_hidden_config, value_size);
+    PutCompletedObject(*service_, client_id, private_image1,
+                       image_hidden_config, value_size);
+
+    ReplicateConfig kv_config;
+    kv_config.replica_num = 1;
+    kv_config.data_type = ObjectDataType::KVCACHE;
+    PutCompletedObject(*service_, client_id, "kv-shared-template", kv_config,
+                       value_size);
+
+    ASSERT_TRUE(
+        service_->GetReplicaList("kv-shared-template", "default").has_value());
+
+    ASSERT_TRUE(service_->GetReplicaList(hot_video, "default").has_value());
+    PutCompletedObject(*service_, client_id, pressure_image,
+                       image_hidden_config, value_size);
+
+    WaitUntil([&] {
+        return service_->ExistKey(hot_video, "default").value_or(false) &&
+               !service_->ExistKey(private_image0, "default").value_or(true) &&
+               !service_->ExistKey(private_image1, "default").value_or(true);
+    });
+    EXPECT_TRUE(service_->ExistKey(hot_video, "default").value_or(false));
+    EXPECT_TRUE(
+        service_->ExistKey("kv-shared-template", "default").value_or(false));
+
     service_->RemoveAll();
 }
 

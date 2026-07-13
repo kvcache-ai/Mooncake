@@ -39,6 +39,8 @@ static_assert(mooncake::DEFAULT_KV_SOFT_PIN_TTL_MS == 30 * 60 * 1000,
 
 constexpr char kDefaultKvLeaseTtlFlagValue[] = "5000";
 constexpr char kDefaultKvSoftPinTtlFlagValue[] = "1800000";
+constexpr char kDefaultHiddenLeaseTtlFlagValue[] = "5000";
+constexpr char kDefaultSoftPinnedHiddenLeaseTtlFlagValue[] = "1800000";
 
 namespace {
 
@@ -134,6 +136,30 @@ DEFINE_double(eviction_ratio, mooncake::DEFAULT_EVICTION_RATIO,
 DEFINE_double(eviction_high_watermark_ratio,
               mooncake::DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
               "Ratio of high watermark trigger eviction in Memory");
+DEFINE_bool(enable_hidden_type_aware_eviction,
+            mooncake::DEFAULT_ENABLE_HIDDEN_TYPE_AWARE_EVICTION,
+            "Enable Hidden State type-aware lease and eviction policy");
+DEFINE_double(hidden_memory_budget_ratio,
+              mooncake::DEFAULT_HIDDEN_MEMORY_BUDGET_RATIO,
+              "Logical memory budget ratio for Hidden State objects");
+DEFINE_double(hidden_memory_high_watermark_ratio,
+              mooncake::DEFAULT_HIDDEN_MEMORY_HIGH_WATERMARK_RATIO,
+              "High watermark inside the Hidden State logical memory budget");
+DEFINE_bool(allow_hidden_in_global_eviction,
+            mooncake::DEFAULT_ALLOW_HIDDEN_IN_GLOBAL_EVICTION,
+            "Allow Hidden State objects to participate in the original global "
+            "memory eviction pass after Hidden-aware eviction");
+DEFINE_string(default_hidden_lease_ttl, kDefaultHiddenLeaseTtlFlagValue,
+              "Default lease time for Hidden State objects. Supports raw "
+              "milliseconds or duration strings with ms, s, m, or h suffixes");
+DEFINE_string(soft_pinned_hidden_lease_ttl,
+              kDefaultSoftPinnedHiddenLeaseTtlFlagValue,
+              "Lease time selected for Hidden State objects while they are "
+              "soft-pinned. This does not control the soft-pin marker TTL. "
+              "Supports raw milliseconds or duration strings with ms, s, m, "
+              "or h suffixes");
+DEFINE_validator(default_hidden_lease_ttl, ValidateDurationFlag);
+DEFINE_validator(soft_pinned_hidden_lease_ttl, ValidateDurationFlag);
 DEFINE_double(nof_eviction_ratio, mooncake::DEFAULT_NOF_EVICTION_RATIO,
               "Ratio of objects to evict when NoF SSD space is full");
 DEFINE_double(nof_eviction_high_watermark_ratio,
@@ -166,6 +192,24 @@ DEFINE_validator(eviction_ratio, [](const char* flagname, double value) {
 DEFINE_validator(nof_eviction_ratio, [](const char* flagname, double value) {
     if (value < 0.0 || value > 1.0) {
         LOG(FATAL) << "NoF eviction ratio must be between 0.0 and 1.0";
+        return false;
+    }
+    return true;
+});
+DEFINE_validator(hidden_memory_budget_ratio,
+                 [](const char* flagname, double value) {
+                     if (value < 0.0 || value > 1.0) {
+                         LOG(FATAL) << "Hidden memory budget ratio must be "
+                                       "between 0.0 and 1.0";
+                         return false;
+                     }
+                     return true;
+                 });
+DEFINE_validator(hidden_memory_high_watermark_ratio, [](const char* flagname,
+                                                        double value) {
+    if (value < 0.0 || value > 1.0) {
+        LOG(FATAL) << "Hidden memory high watermark ratio must be "
+                      "between 0.0 and 1.0";
         return false;
     }
     return true;
@@ -456,6 +500,25 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetDouble("eviction_high_watermark_ratio",
                              &master_config.eviction_high_watermark_ratio,
                              FLAGS_eviction_high_watermark_ratio);
+    default_config.GetBool("enable_hidden_type_aware_eviction",
+                           &master_config.enable_hidden_type_aware_eviction,
+                           FLAGS_enable_hidden_type_aware_eviction);
+    default_config.GetDouble("hidden_memory_budget_ratio",
+                             &master_config.hidden_memory_budget_ratio,
+                             FLAGS_hidden_memory_budget_ratio);
+    default_config.GetDouble("hidden_memory_high_watermark_ratio",
+                             &master_config.hidden_memory_high_watermark_ratio,
+                             FLAGS_hidden_memory_high_watermark_ratio);
+    default_config.GetBool("allow_hidden_in_global_eviction",
+                           &master_config.allow_hidden_in_global_eviction,
+                           FLAGS_allow_hidden_in_global_eviction);
+    default_config.GetDurationMs("default_hidden_lease_ttl",
+                                 &master_config.default_hidden_lease_ttl,
+                                 mooncake::DEFAULT_HIDDEN_LEASE_TTL_MS);
+    default_config.GetDurationMs(
+        "soft_pinned_hidden_lease_ttl",
+        &master_config.soft_pinned_hidden_lease_ttl,
+        mooncake::DEFAULT_HIDDEN_SOFT_PIN_LEASE_TTL_MS);
     default_config.GetDouble("nof_eviction_ratio",
                              &master_config.nof_eviction_ratio,
                              FLAGS_nof_eviction_ratio);
@@ -787,6 +850,46 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.eviction_high_watermark_ratio =
             FLAGS_eviction_high_watermark_ratio;
+    }
+    if ((google::GetCommandLineFlagInfo("enable_hidden_type_aware_eviction",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_hidden_type_aware_eviction =
+            FLAGS_enable_hidden_type_aware_eviction;
+    }
+    if ((google::GetCommandLineFlagInfo("hidden_memory_budget_ratio", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.hidden_memory_budget_ratio =
+            FLAGS_hidden_memory_budget_ratio;
+    }
+    if ((google::GetCommandLineFlagInfo("hidden_memory_high_watermark_ratio",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.hidden_memory_high_watermark_ratio =
+            FLAGS_hidden_memory_high_watermark_ratio;
+    }
+    if ((google::GetCommandLineFlagInfo("allow_hidden_in_global_eviction",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.allow_hidden_in_global_eviction =
+            FLAGS_allow_hidden_in_global_eviction;
+    }
+    if ((google::GetCommandLineFlagInfo("default_hidden_lease_ttl", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.default_hidden_lease_ttl = ParseDurationFlagOrDie(
+            "default_hidden_lease_ttl", FLAGS_default_hidden_lease_ttl);
+    }
+    if ((google::GetCommandLineFlagInfo("soft_pinned_hidden_lease_ttl",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.soft_pinned_hidden_lease_ttl = ParseDurationFlagOrDie(
+            "soft_pinned_hidden_lease_ttl", FLAGS_soft_pinned_hidden_lease_ttl);
     }
     if ((google::GetCommandLineFlagInfo("nof_eviction_ratio", &info) &&
          !info.is_default) ||
@@ -1375,6 +1478,18 @@ int main(int argc, char* argv[]) {
         << ", eviction_ratio=" << master_config.eviction_ratio
         << ", eviction_high_watermark_ratio="
         << master_config.eviction_high_watermark_ratio
+        << ", enable_hidden_type_aware_eviction="
+        << master_config.enable_hidden_type_aware_eviction
+        << ", hidden_memory_budget_ratio="
+        << master_config.hidden_memory_budget_ratio
+        << ", hidden_memory_high_watermark_ratio="
+        << master_config.hidden_memory_high_watermark_ratio
+        << ", allow_hidden_in_global_eviction="
+        << master_config.allow_hidden_in_global_eviction
+        << ", default_hidden_lease_ttl="
+        << master_config.default_hidden_lease_ttl
+        << ", soft_pinned_hidden_lease_ttl="
+        << master_config.soft_pinned_hidden_lease_ttl
         << ", enable_ha=" << master_config.enable_ha
         << ", enable_offload=" << master_config.enable_offload
         << ", enable_kv_events=" << master_config.enable_kv_events
