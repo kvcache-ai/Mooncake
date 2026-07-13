@@ -453,6 +453,14 @@ void loadGlobalConfig(GlobalConfig& config) {
                            config.log_rdma_slice_affinity);
     }
 
+    const char* track_rdma_posted_slices_env =
+        std::getenv("MC_TRACK_RDMA_POSTED_SLICES");
+    if (track_rdma_posted_slices_env) {
+        parseBoolConfigEnv(track_rdma_posted_slices_env,
+                           "MC_TRACK_RDMA_POSTED_SLICES",
+                           config.track_rdma_posted_slices);
+    }
+
     const char* enable_parallel_reg_mr =
         std::getenv("MC_ENABLE_PARALLEL_REG_MR");
     if (enable_parallel_reg_mr) {
@@ -645,6 +653,8 @@ void dumpGlobalConfig() {
               << (config.mlx5_qp_lag_port_balance ? "true" : "false");
     LOG(INFO) << "log_rdma_slice_affinity = "
               << (config.log_rdma_slice_affinity ? "true" : "false");
+    LOG(INFO) << "track_rdma_posted_slices = "
+              << (config.track_rdma_posted_slices ? "true" : "false");
 }
 
 GlobalConfig& globalConfig() {

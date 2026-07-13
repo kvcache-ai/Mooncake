@@ -278,6 +278,8 @@ int WorkerPool::submitPostSend(
 void WorkerPool::trackPostedSlices(
     const std::vector<Transport::Slice *> &slice_list, size_t first,
     size_t count) {
+    if (!globalConfig().track_rdma_posted_slices) return;
+
     std::lock_guard<std::mutex> lock(posted_slices_mutex_);
     for (size_t i = first; i < first + count; ++i)
         posted_slices_.insert(slice_list[i]);
@@ -286,6 +288,8 @@ void WorkerPool::trackPostedSlices(
 void WorkerPool::untrackPostedSlices(
     const std::vector<Transport::Slice *> &slice_list, size_t first,
     size_t count) {
+    if (!globalConfig().track_rdma_posted_slices) return;
+
     std::lock_guard<std::mutex> lock(posted_slices_mutex_);
     for (size_t i = first; i < first + count; ++i)
         posted_slices_.erase(slice_list[i]);
@@ -441,7 +445,7 @@ void WorkerPool::performPollCq(int thread_id) {
             continue;
         }
 
-        if (nr_poll > 0) {
+        if (nr_poll > 0 && globalConfig().track_rdma_posted_slices) {
             std::lock_guard<std::mutex> lock(posted_slices_mutex_);
             for (int i = 0; i < nr_poll; ++i) {
                 auto *slice = reinterpret_cast<Transport::Slice *>(wc[i].wr_id);
@@ -809,46 +813,49 @@ void WorkerPool::monitorWorker() {
                     << ", processed="
                     << processed_slice_count_.load(std::memory_order_relaxed);
 
-                struct StuckGroup {
-                    size_t slice_count = 0;
-                    uint64_t total_bytes = 0;
-                    uint64_t oldest_post_ts = 0;
-                    void *sample_source_addr = nullptr;
-                    uint64_t sample_dest_addr = 0;
-                };
-                std::unordered_map<std::string, StuckGroup> stuck_groups;
-                {
-                    std::lock_guard<std::mutex> lock(posted_slices_mutex_);
-                    for (auto *slice : posted_slices_) {
-                        auto &group = stuck_groups[slice->peer_nic_path];
-                        group.slice_count++;
-                        group.total_bytes += slice->length;
-                        if (group.oldest_post_ts == 0 ||
-                            static_cast<uint64_t>(slice->ts) <
-                                group.oldest_post_ts) {
-                            group.oldest_post_ts =
-                                static_cast<uint64_t>(slice->ts);
-                            group.sample_source_addr = slice->source_addr;
-                            group.sample_dest_addr = slice->rdma.dest_addr;
+                if (globalConfig().track_rdma_posted_slices) {
+                    struct StuckGroup {
+                        size_t slice_count = 0;
+                        uint64_t total_bytes = 0;
+                        uint64_t oldest_post_ts = 0;
+                        void *sample_source_addr = nullptr;
+                        uint64_t sample_dest_addr = 0;
+                    };
+                    std::unordered_map<std::string, StuckGroup> stuck_groups;
+                    {
+                        std::lock_guard<std::mutex> lock(posted_slices_mutex_);
+                        for (auto *slice : posted_slices_) {
+                            auto &group = stuck_groups[slice->peer_nic_path];
+                            group.slice_count++;
+                            group.total_bytes += slice->length;
+                            if (group.oldest_post_ts == 0 ||
+                                static_cast<uint64_t>(slice->ts) <
+                                    group.oldest_post_ts) {
+                                group.oldest_post_ts =
+                                    static_cast<uint64_t>(slice->ts);
+                                group.sample_source_addr = slice->source_addr;
+                                group.sample_dest_addr = slice->rdma.dest_addr;
+                            }
                         }
                     }
-                }
-                for (const auto &entry : stuck_groups) {
-                    const auto &group = entry.second;
-                    const uint64_t oldest_age_ms =
-                        group.oldest_post_ts > 0 &&
-                                current_ts > group.oldest_post_ts
-                            ? (current_ts - group.oldest_post_ts) / 1000000
-                            : 0;
-                    LOG(ERROR)
-                        << "CQ stuck transfer group: context="
-                        << context_.deviceName() << ", peer_nic=" << entry.first
-                        << ", slices=" << group.slice_count
-                        << ", bytes=" << group.total_bytes
-                        << ", oldest_post_age_ms=" << oldest_age_ms
-                        << ", sample_source_addr=" << group.sample_source_addr
-                        << ", sample_dest_addr="
-                        << reinterpret_cast<void *>(group.sample_dest_addr);
+                    for (const auto &entry : stuck_groups) {
+                        const auto &group = entry.second;
+                        const uint64_t oldest_age_ms =
+                            group.oldest_post_ts > 0 &&
+                                    current_ts > group.oldest_post_ts
+                                ? (current_ts - group.oldest_post_ts) / 1000000
+                                : 0;
+                        LOG(ERROR)
+                            << "CQ stuck transfer group: context="
+                            << context_.deviceName()
+                            << ", peer_nic=" << entry.first
+                            << ", slices=" << group.slice_count
+                            << ", bytes=" << group.total_bytes
+                            << ", oldest_post_age_ms=" << oldest_age_ms
+                            << ", sample_source_addr="
+                            << group.sample_source_addr << ", sample_dest_addr="
+                            << reinterpret_cast<void *>(group.sample_dest_addr);
+                    }
                 }
                 last_timeout_log_ns = current_ts;
             }
