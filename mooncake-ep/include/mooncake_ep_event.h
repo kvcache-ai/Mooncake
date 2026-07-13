@@ -11,7 +11,14 @@ struct EventHandle {
     std::shared_ptr<void> keepalive;
 
     EventHandle() {
-        event = std::make_shared<cudaEvent_t>();
+        event = std::shared_ptr<cudaEvent_t>(new cudaEvent_t(nullptr),
+                                             [](cudaEvent_t* p) {
+                                                 if (p != nullptr) {
+                                                     if (*p != nullptr)
+                                                         cudaEventDestroy(*p);
+                                                     delete p;
+                                                 }
+                                             });
         CUDA_CHECK(
             cudaEventCreateWithFlags(event.get(), cudaEventDisableTiming));
     }
@@ -25,13 +32,6 @@ struct EventHandle {
     }
 
     EventHandle(const EventHandle& other) = default;
-
-    ~EventHandle() {
-        if (event && event.use_count() == 1 && *event != nullptr) {
-            cudaEventDestroy(*event);
-            *event = nullptr;
-        }
-    }
 
     void current_stream_wait(uint64_t stream_ptr) const {
         auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);

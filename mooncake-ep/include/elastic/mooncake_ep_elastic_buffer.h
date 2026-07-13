@@ -134,12 +134,15 @@ class MooncakeElasticBuffer {
     int64_t host_workspace_bytes_ = 0;
     void* host_workspace_ = nullptr;
     void* mapped_host_workspace_ = nullptr;
+    std::shared_ptr<void> deterministic_rank_count_buffer_;
+    int64_t deterministic_rank_count_buffer_bytes_ = 0;
 
     static ElasticLaunchContext make_launch_context(
         MooncakeEpBuffer& buffer, const ElasticTopology& topology,
         void* mapped_host_workspace, int64_t timeout_cycles);
     static ElasticTopology discover_topology(int rank, int num_ranks,
                                              bool allow_hybrid_mode);
+    std::shared_ptr<void> ensure_deterministic_rank_count_buffer(int num_sms);
 };
 
 }  // namespace mooncake
