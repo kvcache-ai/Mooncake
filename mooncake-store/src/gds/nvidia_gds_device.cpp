@@ -87,6 +87,10 @@ class NvidiaGdsDeviceOps final : public GdsDeviceOps {
     void CopyDeviceToDevice(void* dst, const void* src, size_t size) override {
         cudaMemcpy(dst, src, size, cudaMemcpyDeviceToDevice);
     }
+
+    void CopyDeviceToHost(void* dst, const void* src, size_t size) override {
+        cudaMemcpy(dst, src, size, cudaMemcpyDeviceToHost);
+    }
 };
 
 }  // namespace
