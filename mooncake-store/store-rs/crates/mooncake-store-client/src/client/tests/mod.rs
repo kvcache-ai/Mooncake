@@ -11976,6 +11976,66 @@ fn clean_eviction_victim_lookup_uses_bounded_route_read() {
 }
 
 #[test]
+fn eviction_materializes_missing_replica_checksum_from_owner_hot_payload() {
+    let _cold_tier_env = enable_cold_tier_for_test();
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("evict-missing-checksum-segment"));
+    let client = StoreClientBuilder::new(metadata, "evict-missing-checksum")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(64))
+        .cold_tier_target(cold_tier_test_config("evict-missing-checksum"))
+        .cold_tier_offload_mode(ColdTierOffloadMode::EvictTriggered)
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let payload = b"0123456789abcdef";
+    let route = client
+        .put("evict-missing-checksum-key", payload)
+        .expect("initial put should succeed");
+    wait_for_storage_clock_route(&client, &route, false);
+
+    let mut missing_checksum = route.clone();
+    missing_checksum.version = route.version.next();
+    missing_checksum.replicas[0].checksum = None;
+    let cas = client
+        .route_directory
+        .compare_and_swap_object_route(
+            &client.lease,
+            &route.key,
+            Some(route.version),
+            Some(&missing_checksum),
+        )
+        .expect("missing-checksum route CAS should succeed");
+    assert!(cas.applied, "missing-checksum route CAS should apply");
+    client.storage_owner.track_route(&missing_checksum);
+
+    let materialized = client
+        .storage_owner
+        .ensure_materialized_cold_backing_for_eviction(&missing_checksum)
+        .expect("owner should materialize missing-checksum route")
+        .expect("missing-checksum route should materialize");
+    let cold_backing = materialized
+        .cold_backing
+        .as_ref()
+        .expect("materialized route should include cold backing");
+    assert_eq!(
+        cold_backing.state,
+        mooncake_store_core::ColdBackingState::Materialized
+    );
+    assert_eq!(
+        cold_backing.checksum,
+        Some(payload_checksum(payload)),
+        "owner should compute the cold backing checksum from its local hot payload"
+    );
+}
+
+#[test]
 fn eviction_stale_prepass_error_falls_back_to_live_clock_eviction() {
     let metadata = Arc::new(RecoverableMetadataBackend::new(Arc::new(
         InMemoryMetadataBackend::new(),
