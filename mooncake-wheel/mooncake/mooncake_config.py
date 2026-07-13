@@ -313,7 +313,6 @@ class MooncakeConfig:
         for field in required_fields:
             if field not in config:
                 raise ValueError(f"Missing required config field: {field}")
-        ssd_offload_path = config.get("ssd_offload_path")
         tenant_id = config.get("tenant_id")
         return MooncakeConfig(
             local_hostname=config.get("local_hostname"),
@@ -332,7 +331,6 @@ class MooncakeConfig:
             etcd_ca_file=str(config.get("etcd_ca_file", "")),
             etcd_cert_file=str(config.get("etcd_cert_file", "")),
             etcd_key_file=str(config.get("etcd_key_file", "")),
-            ssd_offload_path=str(ssd_offload_path) if ssd_offload_path is not None else "",
             tenant_id=str(tenant_id) if tenant_id is not None else "default",
         )
 

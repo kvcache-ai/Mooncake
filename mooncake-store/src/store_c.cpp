@@ -109,7 +109,12 @@ void set_etcd_tls_config_internal(const char *ca_file, const char *cert_file,
     }
 
     if (ca.empty() && cert.empty() && key.empty()) {
-        // No TLS configured
+        // No TLS configured — also reset the explicitly_set flag so that
+        // mooncake_store_setup can re-trigger the env-var fallback path in
+        // a later call (fixes test isolation across TEST() boundaries).
+        if (use_fallback) {
+            etcd_tls_explicitly_set = false;
+        }
         return;
     }
 
