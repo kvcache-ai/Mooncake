@@ -3239,7 +3239,8 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
                 EvictToMakeRoom(static_cast<int64_t>(record_size),
                                 cfg_.fallback_evict_batch, batch_keys,
                                 evicted_keys);
-                fallback_total_evicted += (evicted_keys.size() - before);
+                size_t evicted_this_turn = evicted_keys.size() - before;
+                fallback_total_evicted += evicted_this_turn;
 
                 // Notify master of fallback victims before retrying.
                 if (eviction_handler && !evicted_keys.empty()) {
@@ -3249,7 +3250,7 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
 
                 uint64_t now_largest =
                     allocator_->get_metrics().largest_free_region_;
-                if (before == evicted_keys.size()) break;  // no victims at all
+                if (evicted_this_turn == 0) break;  // no victims at all
                 // Stop if the largest free region did not grow at all.
                 // Using `prev_largest` (rather than `prev_largest +
                 // record_size / 2`) allows gradual coalescence when
