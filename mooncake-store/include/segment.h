@@ -55,6 +55,7 @@ struct MountedSegment {
     Segment segment;
     SegmentStatus status;
     std::shared_ptr<BufferAllocatorBase> buf_allocator;
+    SegmentAllocatorRegistration allocator_registration;
 };
 
 struct MountedNoFSegment {
@@ -62,6 +63,7 @@ struct MountedNoFSegment {
     UUID client_id;
     SegmentStatus status;
     std::shared_ptr<BufferAllocatorBase> buf_allocator;
+    SegmentAllocatorRegistration allocator_registration;
 };
 
 struct MountedNoFSegmentSnapshot {

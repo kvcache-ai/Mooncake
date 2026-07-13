@@ -209,7 +209,7 @@ class MasterService {
      * @brief Fetch all keys for a single tenant.
      * @return ErrorCode::OK if exists
      */
-    auto GetAllKeys(const std::string& tenant_id)
+    auto GetAllKeys(const std::string& tenant_id, bool filter_invalid = true)
         -> tl::expected<std::vector<std::string>, ErrorCode>;
 
     /**
@@ -839,6 +839,10 @@ class MasterService {
     void ClearInvalidHandles();
     void ClearInvalidHandles(
         const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients);
+    struct ObjectMetadata;
+    bool HasVisibleCompletedReplica(const ObjectMetadata& metadata) const;
+    std::vector<Replica::Descriptor> GetVisibleReplicaDescriptors(
+        const ObjectMetadata& metadata) const;
 
     std::string FormatTimestamp(
         const std::chrono::system_clock::time_point& tp);
@@ -1568,6 +1572,28 @@ class MasterService {
     // Used to wake task cleanup thread immediately during shutdown.
     std::mutex task_cleanup_mutex_;
     std::condition_variable task_cleanup_cv_;
+
+    class InvalidHandleCleanup {
+       public:
+        explicit InvalidHandleCleanup(MasterService* service)
+            : service_(service) {}
+        ~InvalidHandleCleanup();
+
+        void Start();
+        void Stop();
+        void Schedule();
+
+       private:
+        void ThreadFunc();
+
+        MasterService* service_;
+        std::thread thread_;
+        bool running_{false};
+        bool requested_{false};
+        std::mutex mutex_;
+        std::condition_variable cv_;
+    };
+    InvalidHandleCleanup invalid_handle_cleanup_{this};
 
     // Helper class for accessing metadata with automatic locking and cleanup
     class MetadataAccessorRW {

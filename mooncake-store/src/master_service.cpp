@@ -437,6 +437,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
         std::thread(&MasterService::TaskCleanupThreadFunc, this);
     VLOG(1) << "action=start_task_cleanup_thread";
 
+    invalid_handle_cleanup_.Start();
+
     // NOTE: The async HTTP metadata cleanup worker is started lazily in
     // setHttpMetadataRemoteUrl() once http_metadata_remote_ is initialized,
     // since that happens after this constructor returns (in
@@ -543,6 +545,7 @@ MasterService::~MasterService() {
     job_dispatch_running_ = false;
     http_metadata_cleanup_running_ = false;
     graceful_unmount_scheduler_.Stop();
+    invalid_handle_cleanup_.Stop();
 #ifdef USE_NOF
     nof_heartbeat_running_ = false;
 #endif
@@ -1935,6 +1938,76 @@ void MasterService::ClearInvalidHandles(
     }
 }
 
+MasterService::InvalidHandleCleanup::~InvalidHandleCleanup() { Stop(); }
+
+void MasterService::InvalidHandleCleanup::Start() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (running_) {
+        return;
+    }
+    running_ = true;
+    thread_ = std::thread(&InvalidHandleCleanup::ThreadFunc, this);
+}
+
+void MasterService::InvalidHandleCleanup::Stop() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        running_ = false;
+    }
+    cv_.notify_all();
+    if (thread_.joinable()) {
+        thread_.join();
+    }
+}
+
+void MasterService::InvalidHandleCleanup::Schedule() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!running_) {
+            return;
+        }
+        requested_ = true;
+    }
+    cv_.notify_one();
+}
+
+void MasterService::InvalidHandleCleanup::ThreadFunc() {
+    LOG(INFO) << "Invalid handle cleanup thread started";
+    while (true) {
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            cv_.wait(lock, [&] { return !running_ || requested_; });
+            if (!running_) {
+                break;
+            }
+            requested_ = false;
+        }
+
+        std::shared_lock<std::shared_mutex> snapshot_lock(
+            service_->snapshot_mutex_);
+        service_->ClearInvalidHandles();
+    }
+    LOG(INFO) << "Invalid handle cleanup thread stopped";
+}
+
+bool MasterService::HasVisibleCompletedReplica(
+    const ObjectMetadata& metadata) const {
+    return metadata.HasReplica(&Replica::fn_is_completed_and_available);
+}
+
+std::vector<Replica::Descriptor> MasterService::GetVisibleReplicaDescriptors(
+    const ObjectMetadata& metadata) const {
+    std::vector<Replica::Descriptor> descriptors;
+    metadata.VisitReplicas(
+        &Replica::fn_is_completed, [&descriptors](const Replica& replica) {
+            auto descriptor = replica.get_available_descriptor();
+            if (descriptor) {
+                descriptors.emplace_back(std::move(*descriptor));
+            }
+        });
+    return descriptors;
+}
+
 void MasterService::TaskCleanupThreadFunc() {
     LOG(INFO) << "Task cleanup thread started";
     while (task_cleanup_running_) {
@@ -1977,22 +2050,21 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
         if (err != ErrorCode::OK) {
             return tl::make_unexpected(err);
         }
-    }  // Release the segment mutex before long-running step 2 and avoid
-       // deadlocks
+    }
 
-    // 2. Remove the metadata of the related objects
-    ClearInvalidHandles();
-
-    // 3. Commit the unmount operation
+    // The lifetime flag makes replicas unavailable immediately. Physical
+    // metadata cleanup is deferred so this RPC does not scan every shard.
     {
         ScopedSegmentAccess segment_access =
             segment_manager_.getSegmentAccess();
         auto err = segment_access.CommitUnmountSegment(segment_id, client_id,
                                                        metrics_dec_capacity);
         if (err != ErrorCode::OK) {
+            invalid_handle_cleanup_.Schedule();
             return tl::make_unexpected(err);
         }
     }
+    invalid_handle_cleanup_.Schedule();
     RecomputeTenantEffectiveQuotas();
     return {};
 }
@@ -2092,7 +2164,7 @@ auto MasterService::ExistKey(const std::string& key,
     }
 
     const auto& metadata = accessor.Get();
-    if (metadata.HasReplica(&Replica::fn_is_completed)) {
+    if (HasVisibleCompletedReplica(metadata)) {
         // Grant a lease to the object as it may be further used by the
         // client.
         auto* ts = accessor.GetTenantState();
@@ -2165,7 +2237,7 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
             }
 
             const auto& metadata = it->second;
-            if (metadata.HasReplica(&Replica::fn_is_completed)) {
+            if (HasVisibleCompletedReplica(metadata)) {
                 GrantLeaseForGroup(tenant_state, key, metadata);
                 results[i] = true;
             } else {
@@ -2176,7 +2248,8 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
     return results;
 }
 
-auto MasterService::GetAllKeys(const std::string& tenant_id)
+auto MasterService::GetAllKeys(const std::string& tenant_id,
+                               bool filter_invalid)
     -> tl::expected<std::vector<std::string>, ErrorCode> {
     std::vector<std::string> all_keys;
     const auto normalized_tenant = NormalizeRequestTenantId(tenant_id);
@@ -2187,6 +2260,9 @@ auto MasterService::GetAllKeys(const std::string& tenant_id)
             continue;
         }
         for (const auto& item : tenant_it->second.metadata) {
+            if (filter_invalid && !HasVisibleCompletedReplica(item.second)) {
+                continue;
+            }
             all_keys.push_back(item.second.user_key.empty()
                                    ? item.first
                                    : item.second.user_key);
@@ -2501,12 +2577,7 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
         }
         for (const auto& [key, metadata] : tenant_it->second.metadata) {
             if (std::regex_search(key, pattern)) {
-                std::vector<Replica::Descriptor> replica_list;
-                metadata.VisitReplicas(
-                    &Replica::fn_is_completed,
-                    [&replica_list](const Replica& replica) {
-                        replica_list.emplace_back(replica.get_descriptor());
-                    });
+                auto replica_list = GetVisibleReplicaDescriptors(metadata);
 
                 if (replica_list.empty()) {
                     LOG(WARNING)
@@ -2543,13 +2614,12 @@ auto MasterService::GetReplicaList(const std::string& key,
         }
         const auto& metadata = accessor.Get();
 
-        std::vector<Replica::Descriptor> replica_list;
-        metadata.VisitReplicas(
-            &Replica::fn_is_completed, [&replica_list](const Replica& replica) {
-                replica_list.emplace_back(replica.get_descriptor());
-            });
+        auto replica_list = GetVisibleReplicaDescriptors(metadata);
 
         if (replica_list.empty()) {
+            if (metadata.HasReplica(&Replica::fn_is_completed)) {
+                return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+            }
             LOG(WARNING) << "key=" << key << ", error=replica_not_ready";
             return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
         }
@@ -2612,13 +2682,12 @@ auto MasterService::GetReplicaListForAdmin(const std::string& key,
     }
     const auto& metadata = accessor.Get();
 
-    std::vector<Replica::Descriptor> replica_list;
-    metadata.VisitReplicas(
-        &Replica::fn_is_completed, [&replica_list](const Replica& replica) {
-            replica_list.emplace_back(replica.get_descriptor());
-        });
+    auto replica_list = GetVisibleReplicaDescriptors(metadata);
 
     if (replica_list.empty()) {
+        if (metadata.HasReplica(&Replica::fn_is_completed)) {
+            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        }
         LOG(WARNING) << "key=" << key << ", error=replica_not_ready";
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
@@ -2696,14 +2765,14 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                 }
 
                 const auto& metadata = metadata_it->second;
-                std::vector<Replica::Descriptor> replica_list;
-                metadata.VisitReplicas(
-                    &Replica::fn_is_completed,
-                    [&replica_list](const Replica& replica) {
-                        replica_list.emplace_back(replica.get_descriptor());
-                    });
+                auto replica_list = GetVisibleReplicaDescriptors(metadata);
 
                 if (replica_list.empty()) {
+                    if (metadata.HasReplica(&Replica::fn_is_completed)) {
+                        results[original_idx] =
+                            tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+                        continue;
+                    }
                     LOG(WARNING)
                         << "key=" << key << ", error=replica_not_ready";
                     results[original_idx] =
@@ -2813,14 +2882,14 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
                 }
 
                 const auto& metadata = metadata_it->second;
-                std::vector<Replica::Descriptor> replica_list;
-                metadata.VisitReplicas(
-                    &Replica::fn_is_completed,
-                    [&replica_list](const Replica& replica) {
-                        replica_list.emplace_back(replica.get_descriptor());
-                    });
+                auto replica_list = GetVisibleReplicaDescriptors(metadata);
 
                 if (replica_list.empty()) {
+                    if (metadata.HasReplica(&Replica::fn_is_completed)) {
+                        results[original_idx] =
+                            tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+                        continue;
+                    }
                     results[original_idx] =
                         tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
                     continue;

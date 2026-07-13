@@ -305,6 +305,7 @@ class Replica {
     }
 
     [[nodiscard]] Descriptor get_descriptor() const;
+    [[nodiscard]] std::optional<Descriptor> get_available_descriptor() const;
 
     [[nodiscard]] ReplicaID id() const { return id_; }
 
@@ -382,6 +383,16 @@ class Replica {
             return !nof_data.buffer->isAllocatorValid();
         }
         return false;
+    }
+
+    [[nodiscard]] bool is_completed_and_available() const {
+        return is_completed() && !has_invalid_mem_handle() &&
+               !has_invalid_nof_handle();
+    }
+
+    [[nodiscard]] static bool fn_is_completed_and_available(
+        const Replica& replica) {
+        return replica.is_completed_and_available();
     }
 
     /**
@@ -631,6 +642,40 @@ inline Replica::Descriptor Replica::get_descriptor() const {
     }
 
     return desc;
+}
+
+inline std::optional<Replica::Descriptor> Replica::get_available_descriptor()
+    const {
+    if (!is_memory_replica() && !is_nof_replica()) {
+        return get_descriptor();
+    }
+
+    AllocatedBuffer* buffer = nullptr;
+    if (is_memory_replica()) {
+        buffer = std::get<MemoryReplicaData>(data_).buffer.get();
+    } else {
+        buffer = std::get<NoFReplicaData>(data_).buffer.get();
+    }
+    if (buffer == nullptr) {
+        return std::nullopt;
+    }
+
+    AllocatedBuffer::Descriptor buffer_descriptor;
+    if (!buffer->getDescriptorIfAvailable(buffer_descriptor)) {
+        return std::nullopt;
+    }
+
+    Descriptor descriptor;
+    descriptor.id = id_;
+    descriptor.status = status_;
+    if (is_memory_replica()) {
+        descriptor.descriptor_variant =
+            MemoryDescriptor{std::move(buffer_descriptor)};
+    } else {
+        descriptor.descriptor_variant =
+            NoFDescriptor{std::move(buffer_descriptor)};
+    }
+    return descriptor;
 }
 
 inline std::vector<std::optional<std::string>> Replica::get_segment_names()

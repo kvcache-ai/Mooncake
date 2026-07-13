@@ -16,6 +16,17 @@
 
 namespace mooncake {
 
+struct SegmentAllocator {
+    explicit SegmentAllocator(
+        std::shared_ptr<BufferAllocatorBase> buffer_allocator)
+        : allocator(std::move(buffer_allocator)) {}
+
+    std::shared_ptr<BufferAllocatorBase> allocator;
+    SegmentLifetime lifetime;
+};
+
+using SegmentAllocatorRegistration = std::shared_ptr<SegmentAllocator>;
+
 /**
  * @brief A container for managing valid allocators.
  *
@@ -41,12 +52,19 @@ class AllocatorManager {
      * @param name the name of the segment
      * @param allocator the buffer allocator to add for the segment
      */
-    void addAllocator(const std::string& name,
-                      const std::shared_ptr<BufferAllocatorBase>& allocator) {
+    SegmentAllocatorRegistration addAllocator(
+        const std::string& name,
+        const std::shared_ptr<BufferAllocatorBase>& allocator,
+        SegmentAllocatorRegistration registration = nullptr) {
         if (!allocators_.contains(name)) {
             names_.push_back(name);
         }
+        if (!registration) {
+            registration = std::make_shared<SegmentAllocator>(allocator);
+        }
         allocators_[name].push_back(allocator);
+        registrations_[name].push_back(registration);
+        return registration;
     }
 
     /**
@@ -71,13 +89,17 @@ class AllocatorManager {
         auto alloc_it =
             std::find(it->second.begin(), it->second.end(), allocator);
         if (alloc_it != it->second.end()) {
+            const size_t index = std::distance(it->second.begin(), alloc_it);
+            registrations_[name][index]->lifetime.setAvailable(false);
             it->second.erase(alloc_it);
+            registrations_[name].erase(registrations_[name].begin() + index);
             allocator_removed = true;
         }
 
         if (it->second.empty()) {
             // If there is no allocator left, remove the name too.
             allocators_.erase(name);
+            registrations_.erase(name);
             auto name_it = std::find(names_.begin(), names_.end(), name);
             if (name_it != names_.end()) {
                 std::swap(*name_it, names_.back());
@@ -86,6 +108,46 @@ class AllocatorManager {
         }
 
         return allocator_removed;
+    }
+
+    bool removeAllocator(const std::string& name,
+                         const SegmentAllocatorRegistration& registration,
+                         bool invalidate = true) {
+        if (!registration) {
+            return false;
+        }
+        if (invalidate) {
+            registration->lifetime.setAvailable(false);
+        }
+
+        auto registrations_it = registrations_.find(name);
+        auto allocators_it = allocators_.find(name);
+        if (registrations_it == registrations_.end() ||
+            allocators_it == allocators_.end()) {
+            return false;
+        }
+
+        auto registration_it =
+            std::find(registrations_it->second.begin(),
+                      registrations_it->second.end(), registration);
+        if (registration_it == registrations_it->second.end()) {
+            return false;
+        }
+
+        const size_t index =
+            std::distance(registrations_it->second.begin(), registration_it);
+        registrations_it->second.erase(registration_it);
+        allocators_it->second.erase(allocators_it->second.begin() + index);
+        if (allocators_it->second.empty()) {
+            allocators_.erase(allocators_it);
+            registrations_.erase(registrations_it);
+            auto name_it = std::find(names_.begin(), names_.end(), name);
+            if (name_it != names_.end()) {
+                std::swap(*name_it, names_.back());
+                names_.pop_back();
+            }
+        }
+        return true;
     }
 
     /**
@@ -109,6 +171,12 @@ class AllocatorManager {
         }
     }
 
+    const std::vector<SegmentAllocatorRegistration>* getRegistrations(
+        const std::string& name) const {
+        auto it = registrations_.find(name);
+        return it == registrations_.end() ? nullptr : &it->second;
+    }
+
    private:
     // Name array for randomly picking allocators.
     std::vector<std::string> names_;
@@ -116,6 +184,8 @@ class AllocatorManager {
     std::unordered_map<std::string,
                        std::vector<std::shared_ptr<BufferAllocatorBase>>>
         allocators_;
+    std::unordered_map<std::string, std::vector<SegmentAllocatorRegistration>>
+        registrations_;
     friend class SegmentSerializer;  // for fork serialize
 };
 
@@ -353,15 +423,20 @@ class RandomAllocationStrategy : public AllocationStrategy {
     std::unique_ptr<AllocatedBuffer> allocateSingle(
         const AllocatorManager& allocator_manager, const std::string& name,
         const size_t slice_length, std::mt19937& generator) {
-        const auto allocators = allocator_manager.getAllocators(name);
-        if (allocators == nullptr || allocators->size() == 0) {
+        const auto registrations = allocator_manager.getRegistrations(name);
+        if (registrations == nullptr || registrations->empty()) {
             return nullptr;
         }
 
-        const auto num_segs = allocators->size();
+        const auto num_segs = registrations->size();
         if (num_segs == 1) {
             // Fast path for single segment
-            return (*allocators)[0]->allocate(slice_length);
+            const auto& registration = (*registrations)[0];
+            auto buffer = registration->allocator->allocate(slice_length);
+            if (buffer) {
+                buffer->bindSegmentLifetime(registration->lifetime);
+            }
+            return buffer;
         }
 
         // Randomly select a start point to distribute
@@ -370,8 +445,10 @@ class RandomAllocationStrategy : public AllocationStrategy {
         size_t seg_offset =
             dist(generator);  // select a start segment to place replica
         for (size_t i = 0; i < num_segs; i++) {  // only allocate one replica
-            auto& allocator = (*allocators)[(i + seg_offset) % num_segs];
-            if (auto buffer = allocator->allocate(slice_length)) {
+            const auto& registration =
+                (*registrations)[(i + seg_offset) % num_segs];
+            if (auto buffer = registration->allocator->allocate(slice_length)) {
+                buffer->bindSegmentLifetime(registration->lifetime);
                 return buffer;
             }
         }
@@ -731,14 +808,14 @@ class CxlAllocationStrategy : public AllocationStrategy {
 
         VLOG(1) << "Do cxl allocate, overwritten segment=" << cxl_segment_name;
 
-        const auto cxl_allocators =
-            allocator_manager.getAllocators(cxl_segment_name);
+        const auto cxl_registrations =
+            allocator_manager.getRegistrations(cxl_segment_name);
 
-        if (cxl_allocators == nullptr || cxl_allocators->size() == 0) {
+        if (cxl_registrations == nullptr || cxl_registrations->empty()) {
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
         std::shared_ptr<BufferAllocatorBase> cxl_allocator =
-            (*cxl_allocators)[0];
+            (*cxl_registrations)[0]->allocator;
         if (!cxl_allocator) {
             LOG(ERROR) << "No CXL allocator in preferred_segment";
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
@@ -753,6 +830,7 @@ class CxlAllocationStrategy : public AllocationStrategy {
         }
 
         buffer->change_to_cxl(cxl_segment_name);
+        buffer->bindSegmentLifetime((*cxl_registrations)[0]->lifetime);
         replicas.emplace_back(std::move(buffer), ReplicaStatus::PROCESSING,
                               replica_type);
 

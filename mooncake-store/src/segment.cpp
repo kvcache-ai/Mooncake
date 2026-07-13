@@ -8,18 +8,17 @@
 namespace mooncake {
 namespace {
 
-bool HasAllocator(const AllocatorManager& allocator_manager,
-                  const std::string& segment_name,
-                  const std::shared_ptr<BufferAllocatorBase>& allocator) {
-    if (!allocator) {
+bool HasRegistration(const AllocatorManager& allocator_manager,
+                     const std::string& segment_name,
+                     const SegmentAllocatorRegistration& registration) {
+    if (!registration) {
         return false;
     }
-    const auto* allocators = allocator_manager.getAllocators(segment_name);
-    if (allocators == nullptr) {
-        return false;
-    }
-    return std::find(allocators->begin(), allocators->end(), allocator) !=
-           allocators->end();
+    const auto* registrations =
+        allocator_manager.getRegistrations(segment_name);
+    return registrations != nullptr &&
+           std::find(registrations->begin(), registrations->end(),
+                     registration) != registrations->end();
 }
 
 bool IsMsgpackInteger(const msgpack::object& object) {
@@ -124,11 +123,12 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
                 LOG(ERROR) << "Cxl global allocator has not been initialized.";
                 return ErrorCode::INTERNAL_ERROR;
             }
-            segment_manager_->allocator_manager_.addAllocator(segment.name,
-                                                              allocator);
+            auto registration =
+                segment_manager_->allocator_manager_.addAllocator(segment.name,
+                                                                  allocator);
             segment_manager_->client_segments_[client_id].push_back(segment.id);
             segment_manager_->mounted_segments_[segment.id] = {
-                segment, SegmentStatus::OK, allocator};
+                segment, SegmentStatus::OK, allocator, registration};
             segment_manager_->client_by_name_[segment.name] = client_id;
             segment_manager_->segment_id_by_name_[segment.name] = segment.id;
             AddHostSegment(segment_manager_->segments_by_host_, segment);
@@ -207,10 +207,11 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
         return ErrorCode::INVALID_PARAMS;
     }
 
-    segment_manager_->allocator_manager_.addAllocator(segment.name, allocator);
+    auto registration = segment_manager_->allocator_manager_.addAllocator(
+        segment.name, allocator);
     segment_manager_->client_segments_[client_id].push_back(segment.id);
     segment_manager_->mounted_segments_[segment.id] = {
-        segment, SegmentStatus::OK, std::move(allocator)};
+        segment, SegmentStatus::OK, std::move(allocator), registration};
     segment_manager_->client_by_name_[segment.name] = client_id;
     segment_manager_->segment_id_by_name_[segment.name] = segment.id;
     AddHostSegment(segment_manager_->segments_by_host_, segment);
@@ -281,20 +282,20 @@ ErrorCode ScopedSegmentAccess::PrepareUnmountSegment(
     auto& segment = mounted_segment.segment;
     metrics_dec_capacity = segment.size;
 
-    // Remove the allocator from the segment manager
-    std::shared_ptr<BufferAllocatorBase> allocator =
-        mounted_segment.buf_allocator;
-
     // 1. Remove from allocators if the segment is still allocatable.
-    if (HasAllocator(segment_manager_->allocator_manager_, segment.name,
-                     allocator)) {
+    auto& registration = mounted_segment.allocator_registration;
+    if (registration) {
         segment_manager_->allocator_manager_.removeAllocator(segment.name,
-                                                             allocator);
+                                                             registration);
+    } else if (mounted_segment.buf_allocator) {
+        segment_manager_->allocator_manager_.removeAllocator(
+            segment.name, mounted_segment.buf_allocator);
     }
     RemoveHostSegment(segment_manager_->segments_by_host_, segment);
 
     // 2. Remove from mounted_segment
     mounted_segment.buf_allocator.reset();
+    mounted_segment.allocator_registration.reset();
 
     // Set the segment status to UNMOUNTING
     mounted_segment.status = SegmentStatus::UNMOUNTING;
@@ -329,13 +330,10 @@ ErrorCode ScopedSegmentAccess::PrepareGracefulUnmountSegment(
     auto& mounted_segment = it->second;
     auto& segment = mounted_segment.segment;
 
-    // Remove the allocator from the segment manager
-    std::shared_ptr<BufferAllocatorBase> allocator =
-        mounted_segment.buf_allocator;
-    if (HasAllocator(segment_manager_->allocator_manager_, segment.name,
-                     allocator)) {
-        segment_manager_->allocator_manager_.removeAllocator(segment.name,
-                                                             allocator);
+    if (HasRegistration(segment_manager_->allocator_manager_, segment.name,
+                        mounted_segment.allocator_registration)) {
+        segment_manager_->allocator_manager_.removeAllocator(
+            segment.name, mounted_segment.allocator_registration, false);
     }
     RemoveHostSegment(segment_manager_->segments_by_host_, segment);
     // Set the segment status to GRACEFULLY_UNMOUNTING
@@ -949,8 +947,9 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
             if (mounted_segment.segment.name == name &&
                 mounted_segment.status == SegmentStatus::OK &&
                 mounted_segment.buf_allocator) {
-                segment_manager_->allocator_manager_.addAllocator(
-                    name, mounted_segment.buf_allocator);
+                mounted_segment.allocator_registration =
+                    segment_manager_->allocator_manager_.addAllocator(
+                        name, mounted_segment.buf_allocator);
                 break;
             }
         }
@@ -1190,14 +1189,16 @@ ErrorCode ScopedSegmentAccess::SetSegmentStatusByName(
     const auto& allocator = mounted_segment.buf_allocator;
     const auto& name = mounted_segment.segment.name;
     const bool should_be_allocatable = status == SegmentStatus::OK;
-    const bool is_allocatable =
-        HasAllocator(allocator_manager, name, allocator);
+    const bool is_allocatable = HasRegistration(
+        allocator_manager, name, mounted_segment.allocator_registration);
     if (should_be_allocatable && !is_allocatable && allocator) {
-        allocator_manager.addAllocator(name, allocator);
+        mounted_segment.allocator_registration = allocator_manager.addAllocator(
+            name, allocator, mounted_segment.allocator_registration);
         AddHostSegment(segment_manager_->segments_by_host_,
                        mounted_segment.segment);
     } else if (!should_be_allocatable && is_allocatable) {
-        allocator_manager.removeAllocator(name, allocator);
+        allocator_manager.removeAllocator(
+            name, mounted_segment.allocator_registration, false);
         RemoveHostSegment(segment_manager_->segments_by_host_,
                           mounted_segment.segment);
     }
@@ -1290,11 +1291,12 @@ ErrorCode ScopedNoFSegmentAccess::MountSegment(const NoFSegment& segment,
         return ErrorCode::INVALID_PARAMS;
     }
 
-    nof_segment_manager_->allocator_manager_.addAllocator(segment.name,
-                                                          allocator);
+    auto registration = nof_segment_manager_->allocator_manager_.addAllocator(
+        segment.name, allocator);
     nof_segment_manager_->client_segments_[client_id].push_back(segment.id);
     nof_segment_manager_->mounted_segments_[segment.id] = {
-        segment, client_id, SegmentStatus::OK, std::move(allocator)};
+        segment, client_id, SegmentStatus::OK, std::move(allocator),
+        registration};
     nof_segment_manager_->client_by_name_[segment.name] = client_id;
     MasterMetricManager::instance().inc_total_nof_capacity(segment.name, size);
 
@@ -1346,13 +1348,14 @@ ErrorCode ScopedNoFSegmentAccess::PrepareUnmountSegment(
 
     std::shared_ptr<BufferAllocatorBase> allocator =
         mounted_segment.buf_allocator;
-    if (HasAllocator(nof_segment_manager_->allocator_manager_, segment.name,
-                     allocator)) {
+    auto& registration = mounted_segment.allocator_registration;
+    if (registration) {
         nof_segment_manager_->allocator_manager_.removeAllocator(segment.name,
-                                                                 allocator);
+                                                                 registration);
     }
 
     mounted_segment.buf_allocator.reset();
+    mounted_segment.allocator_registration.reset();
     mounted_segment.status = SegmentStatus::UNMOUNTING;
     return ErrorCode::OK;
 }

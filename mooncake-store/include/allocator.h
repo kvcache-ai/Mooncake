@@ -30,6 +30,22 @@ enum class ReplicaType {
 static constexpr size_t kAllocatorUnknownFreeSpace =
     std::numeric_limits<size_t>::max();
 
+class SegmentLifetime {
+   public:
+    SegmentLifetime() : available_(std::make_shared<std::atomic<bool>>(true)) {}
+
+    [[nodiscard]] bool isAvailable() const {
+        return available_->load(std::memory_order_acquire);
+    }
+
+    void setAvailable(bool available) const {
+        available_->store(available, std::memory_order_release);
+    }
+
+   private:
+    std::shared_ptr<std::atomic<bool>> available_;
+};
+
 // Forward declarations
 class BufferAllocatorBase;
 
@@ -61,8 +77,14 @@ class AllocatedBuffer {
     [[nodiscard]] std::size_t size() const noexcept { return this->size_; }
 
     [[nodiscard]] bool isAllocatorValid() const {
-        return !allocator_.expired();
+        return !allocator_.expired() && segment_lifetime_.isAvailable();
     }
+
+    void bindSegmentLifetime(SegmentLifetime lifetime) {
+        segment_lifetime_ = std::move(lifetime);
+    }
+
+    [[nodiscard]] bool getDescriptorIfAvailable(Descriptor& descriptor) const;
 
     // Serialize the buffer into a descriptor for transfer
     [[nodiscard]] Descriptor get_descriptor() const;
@@ -88,6 +110,7 @@ class AllocatedBuffer {
 
    private:
     std::weak_ptr<BufferAllocatorBase> allocator_;
+    SegmentLifetime segment_lifetime_;
     std::string segment_name_;
     void* buffer_ptr_{nullptr};
     std::size_t size_{0};

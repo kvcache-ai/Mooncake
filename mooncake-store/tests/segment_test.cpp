@@ -113,6 +113,12 @@ class SegmentTest : public ::testing::Test {
                          mounted_segment.buf_allocator) != allocators->end();
     }
 
+    SegmentLifetime GetSegmentLifetime(const SegmentManager& segment_manager,
+                                       const UUID& segment_id) {
+        return segment_manager.mounted_segments_.at(segment_id)
+            .allocator_registration->lifetime;
+    }
+
     void ValidateMountedLocalDiskSegments(
         const SegmentManager& segment_manager,
         const std::vector<std::shared_ptr<LocalDiskSegment>>& segments,
@@ -208,6 +214,33 @@ TEST_F(SegmentTest, MountSegmentDuplicate) {
     std::vector<Segment> segments = {segment, segment2};
     std::vector<UUID> client_ids = {client_id, client_id};
     ValidateMountedSegments(segment_manager, segments, client_ids);
+}
+
+TEST_F(SegmentTest, PrepareUnmountInvalidatesOnlyMatchingSegmentLifetime) {
+    SegmentManager segment_manager;
+    UUID client_id = generate_uuid();
+
+    Segment segment1;
+    segment1.id = generate_uuid();
+    segment1.name = "shared_name";
+    segment1.size = 1024 * 1024 * 16;
+    segment1.base = 0x100000000;
+
+    Segment segment2 = segment1;
+    segment2.id = generate_uuid();
+    segment2.base += segment1.size;
+
+    auto segment_access = segment_manager.getSegmentAccess();
+    ASSERT_EQ(ErrorCode::OK, segment_access.MountSegment(segment1, client_id));
+    ASSERT_EQ(ErrorCode::OK, segment_access.MountSegment(segment2, client_id));
+
+    auto lifetime1 = GetSegmentLifetime(segment_manager, segment1.id);
+    auto lifetime2 = GetSegmentLifetime(segment_manager, segment2.id);
+    size_t metrics_dec_capacity = 0;
+    ASSERT_EQ(ErrorCode::OK, segment_access.PrepareUnmountSegment(
+                                 segment1.id, metrics_dec_capacity));
+    EXPECT_FALSE(lifetime1.isAvailable());
+    EXPECT_TRUE(lifetime2.isAvailable());
 }
 
 // UnmountSegmentSuccess:
