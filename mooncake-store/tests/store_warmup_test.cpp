@@ -30,13 +30,41 @@ class StoreWarmupTest : public ::testing::Test {
         auto result = service.MountSegment(segment, client_id);
         ASSERT_TRUE(result.has_value());
     }
+
+    static std::unordered_set<std::string> TargetNames(
+        const std::vector<WarmupTarget>& targets) {
+        std::unordered_set<std::string> names;
+        for (const auto& target : targets) {
+            names.insert(target.segment_name);
+        }
+        return names;
+    }
 };
 
-TEST_F(StoreWarmupTest, ListWarmupTargetsFiltersLocalBeforeMaxTargets) {
+TEST_F(StoreWarmupTest, SingleNodeReturnsNoWarmupTargets) {
     MasterService service;
     const UUID requester{1, 1};
-    const UUID remote_client_1{2, 1};
-    const UUID remote_client_2{3, 1};
+
+    Mount(service,
+          MakeSegment("local-segment-1", 0x10000000, "tcp", "127.0.0.1:18000"),
+          requester);
+    Mount(service, MakeSegment("127.0.0.1:18001", 0x20000000, "tcp"),
+          requester);
+
+    auto targets = service.ListWarmupTargets(requester, 0, {"tcp"});
+    ASSERT_TRUE(targets.has_value());
+    EXPECT_TRUE(targets->empty());
+
+    targets = service.ListWarmupTargets(requester, 1, {});
+    ASSERT_TRUE(targets.has_value());
+    EXPECT_TRUE(targets->empty());
+}
+
+TEST_F(StoreWarmupTest, DualNodeReturnsOnlyRemoteWarmupTargets) {
+    MasterService service;
+    const UUID requester{2, 1};
+    const UUID remote_client_1{3, 1};
+    const UUID remote_client_2{4, 1};
 
     Mount(service,
           MakeSegment("local-segment", 0x10000000, "tcp", "127.0.0.1:18000"),
@@ -57,23 +85,22 @@ TEST_F(StoreWarmupTest, ListWarmupTargetsFiltersLocalBeforeMaxTargets) {
     targets = service.ListWarmupTargets(requester, 2, {"tcp"});
     ASSERT_TRUE(targets.has_value());
     ASSERT_EQ(targets->size(), 2);
-    std::unordered_set<std::string> target_names;
     for (const auto& target : *targets) {
         EXPECT_FALSE(target.is_local);
         EXPECT_TRUE(target.allow_warmup);
         EXPECT_NE(target.client_id, requester);
-        target_names.insert(target.segment_name);
     }
+    const auto target_names = TargetNames(*targets);
     EXPECT_TRUE(target_names.contains("127.0.0.1:18001"));
     EXPECT_TRUE(target_names.contains("127.0.0.1:18002"));
 }
 
 TEST_F(StoreWarmupTest, ListWarmupTargetsUsesExactProtocolTokens) {
     MasterService service;
-    const UUID requester{4, 1};
-    const UUID remote_client_1{5, 1};
-    const UUID remote_client_2{6, 1};
-    const UUID remote_client_3{7, 1};
+    const UUID requester{5, 1};
+    const UUID remote_client_1{6, 1};
+    const UUID remote_client_2{7, 1};
+    const UUID remote_client_3{8, 1};
 
     Mount(service,
           MakeSegment("remote-token-list", 0x40000000, "tcp,rdma",
