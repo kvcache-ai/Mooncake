@@ -197,6 +197,23 @@ std::tuple<int, int> MooncakeElasticBuffer::get_logical_domain_size() const {
     return {topology_.num_scaleout_ranks, topology_.num_scaleup_ranks};
 }
 
+std::shared_ptr<void>
+MooncakeElasticBuffer::ensure_deterministic_rank_count_buffer(int num_sms) {
+    const int64_t required_bytes = static_cast<int64_t>(sizeof(int)) * num_sms *
+                                   topology_.num_scaleup_ranks;
+    if (deterministic_rank_count_buffer_ != nullptr &&
+        deterministic_rank_count_buffer_bytes_ >= required_bytes) {
+        return deterministic_rank_count_buffer_;
+    }
+
+    void* buffer_ptr = nullptr;
+    CUDA_CHECK(cudaMalloc(&buffer_ptr, required_bytes));
+    deterministic_rank_count_buffer_ =
+        std::shared_ptr<void>(buffer_ptr, [](void* p) { cudaFree(p); });
+    deterministic_rank_count_buffer_bytes_ = required_bytes;
+    return deterministic_rank_count_buffer_;
+}
+
 int MooncakeElasticBuffer::get_theoretical_num_sms(int num_experts,
                                                    int num_topk) const {
     int device = 0;
@@ -298,12 +315,8 @@ std::optional<EventHandle> MooncakeElasticBuffer::dispatch(
         config_.deterministic && !cached_mode && !use_hybrid;
 #endif
     if (run_deterministic_prologue) {
-        void* deterministic_rank_count_buffer_ptr = nullptr;
-        CUDA_CHECK(
-            cudaMalloc(&deterministic_rank_count_buffer_ptr,
-                       sizeof(int) * num_sms * topology_.num_scaleup_ranks));
-        deterministic_rank_count_buffer.reset(
-            deterministic_rank_count_buffer_ptr, [](void* p) { cudaFree(p); });
+        deterministic_rank_count_buffer =
+            ensure_deterministic_rank_count_buffer(num_sms);
         launch_elastic_dispatch_deterministic_prologue(
             topk_idx, static_cast<int*>(deterministic_rank_count_buffer.get()),
             dst_buffer_slot_idx, num_tokens, num_max_tokens_per_rank,
