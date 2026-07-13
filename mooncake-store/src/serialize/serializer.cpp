@@ -643,7 +643,14 @@ auto Serializer<AllocatedBuffer>::deserialize(const msgpack::object &obj,
     // Create AllocatedBuffer object
     auto buffer = std::make_unique<AllocatedBuffer>(allocator, buffer_ptr, size,
                                                     std::move(offsetHandle));
-    // buffer->status = status;
+    if (!mountedSegment.allocator_registration) {
+        return tl::unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL,
+            fmt::format("deserialize_msgpack AllocatedBuffer missing allocator "
+                        "registration for segment {}",
+                        segment_id)));
+    }
+    mountedSegment.allocator_registration->bindSegmentLifetime(*buffer);
 
     return buffer;
 }

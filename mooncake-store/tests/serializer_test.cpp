@@ -217,6 +217,74 @@ TEST_F(SerializerTest, MountedSegmentDeserializesLegacyFormatWithoutHostId) {
     EXPECT_EQ(restored->status, SegmentStatus::OK);
 }
 
+TEST_F(SerializerTest, RestoredReplicaTracksRestoredSegmentLifetime) {
+    SegmentManager source_manager(BufferAllocatorType::OFFSET);
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "snapshot_segment";
+    segment.base = 0x300000000;
+    segment.size = 16 * 1024 * 1024;
+    segment.te_endpoint = segment.name;
+    const UUID client_id = generate_uuid();
+
+    {
+        auto segment_access = source_manager.getSegmentAccess();
+        ASSERT_EQ(ErrorCode::OK,
+                  segment_access.MountSegment(segment, client_id));
+    }
+
+    std::vector<Replica> replicas;
+    {
+        auto allocator_access = source_manager.getAllocatorAccess();
+        RandomAllocationStrategy strategy;
+        auto result = strategy.Allocate(allocator_access.getAllocatorManager(),
+                                        1024, 1, {segment.name}, {});
+        ASSERT_TRUE(result.has_value());
+        replicas = std::move(*result);
+    }
+    ASSERT_EQ(1u, replicas.size());
+    replicas[0].mark_complete();
+
+    msgpack::sbuffer replica_buffer;
+    MsgpackPacker replica_packer(&replica_buffer);
+    SegmentView source_view(&source_manager);
+    ASSERT_TRUE(
+        Serializer<Replica>::serialize(replicas[0], source_view, replica_packer)
+            .has_value());
+
+    SegmentSerializer source_serializer(&source_manager);
+    auto segment_snapshot = source_serializer.Serialize();
+    ASSERT_TRUE(segment_snapshot.has_value());
+
+    SegmentManager restored_manager(BufferAllocatorType::OFFSET);
+    SegmentSerializer restored_serializer(&restored_manager);
+    ASSERT_TRUE(restored_serializer.Deserialize(*segment_snapshot).has_value());
+
+    auto replica_object =
+        msgpack::unpack(replica_buffer.data(), replica_buffer.size());
+    SegmentView restored_view(&restored_manager);
+    auto restored_replica =
+        Serializer<Replica>::deserialize(replica_object.get(), restored_view);
+    ASSERT_TRUE(restored_replica.has_value());
+    ASSERT_TRUE((*restored_replica)->get_available_descriptor().has_value());
+
+    // Keep the allocator alive so this assertion specifically verifies the
+    // restored lifetime binding instead of weak_ptr expiration.
+    MountedSegment restored_segment;
+    ASSERT_EQ(ErrorCode::OK,
+              restored_view.GetMountedSegment(segment.id, restored_segment));
+    ASSERT_TRUE(restored_segment.buf_allocator);
+
+    size_t metrics_dec_capacity = 0;
+    {
+        auto segment_access = restored_manager.getSegmentAccess();
+        ASSERT_EQ(ErrorCode::OK, segment_access.PrepareUnmountSegment(
+                                     segment.id, metrics_dec_capacity));
+    }
+
+    EXPECT_FALSE((*restored_replica)->get_available_descriptor().has_value());
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {
