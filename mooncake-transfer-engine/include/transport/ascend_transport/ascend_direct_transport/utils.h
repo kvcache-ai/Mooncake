@@ -86,6 +86,16 @@ bool IsRoceModeEnabled();
 // Parse ASCEND_GLOBAL_RESOURCE_CONFIG JSON for roce protocol_desc only.
 bool HasRoceProtocolDescInGlobalResourceConfig(const char *config_str);
 
+// Resolve the effective ASCEND_GLOBAL_RESOURCE_CONFIG for the current TE role.
+// Schema: the top-level object is the default config (passed verbatim to adxl
+// for normal/P2P TEs); an optional "store" sub-object overrides it for a
+// Store-init TE (globalConfig().ascend_store_te_init == true).
+//   - null/empty or no "store" key  -> returned verbatim (backward compatible)
+//   - has "store" and store-init TE  -> the "store" sub-object, serialized
+//   - has "store" and normal TE      -> root with "store" removed, serialized
+// A Store TE with no "store" key falls back to the default config.
+std::string ResolveAscendGlobalResourceConfig(const char *config_str);
+
 int SetDeviceAndGetContext(int32_t device_id, aclrtContext *out_context);
 
 /**

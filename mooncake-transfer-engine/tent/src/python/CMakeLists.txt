@@ -23,8 +23,7 @@ set_target_properties(tentpy PROPERTIES OUTPUT_NAME "tent" INSTALL_RPATH
 
 find_package(
   Python3
-  COMPONENTS Interpreter Development
+  COMPONENTS Interpreter Development.Module
   REQUIRED)
-target_link_libraries(tentpy PRIVATE ${Python3_LIBRARIES})
 target_include_directories(tentpy PRIVATE ${Python3_INCLUDE_DIRS})
 target_link_libraries(tentpy PUBLIC tent_link_group)

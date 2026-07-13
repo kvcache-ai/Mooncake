@@ -181,6 +181,7 @@ class RdmaContext {
     uint8_t numLagPorts() const { return num_lag_ports_; }
 
     int activeSpeed() const { return active_speed_; }
+    int activeWidth() const { return active_width_; }
 
     ibv_mtu activeMTU() const { return active_mtu_; }
 
@@ -232,6 +233,7 @@ class RdmaContext {
     uint16_t lid_ = 0;
     int gid_index_ = -1;
     int active_speed_ = -1;
+    int active_width_ = 1;
     ibv_mtu active_mtu_;
     uint8_t num_lag_ports_ = 0;  // 0/1 = not in LAG; ≥2 = LAG active
     ibv_gid gid_;

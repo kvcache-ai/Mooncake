@@ -19,9 +19,86 @@
 #include <cstdlib>
 #include <filesystem>
 #include <sstream>
+#include <strings.h>
 #include <unistd.h>
 
 namespace mooncake {
+namespace {
+
+std::string trimConfigToken(const std::string& value) {
+    const auto begin = value.find_first_not_of(" \t\n\r");
+    if (begin == std::string::npos) return "";
+    const auto end = value.find_last_not_of(" \t\n\r");
+    return value.substr(begin, end - begin + 1);
+}
+
+std::vector<std::string> splitConfigString(const std::string& value,
+                                           char delim) {
+    std::vector<std::string> result;
+    std::stringstream stream(value);
+    std::string item;
+    while (std::getline(stream, item, delim)) {
+        result.push_back(trimConfigToken(item));
+    }
+    return result;
+}
+
+bool parseBoolConfigEnv(const char* value, const char* env_name, bool& output) {
+    if (strcmp(value, "1") == 0 || strcasecmp(value, "true") == 0) {
+        output = true;
+        return true;
+    }
+    if (strcmp(value, "0") == 0 || strcasecmp(value, "false") == 0) {
+        output = false;
+        return true;
+    }
+    LOG(WARNING) << "Ignore value from environment variable " << env_name
+                 << ", it should be 0|1|true|false";
+    return false;
+}
+
+void parseNicPeerAffinity(
+    const char* env,
+    std::unordered_map<std::string, std::vector<std::string>>& affinity) {
+    affinity.clear();
+    if (!env || env[0] == '\0') return;
+
+    for (const auto& raw_rule : splitConfigString(env, ';')) {
+        const auto rule = trimConfigToken(raw_rule);
+        if (rule.empty()) continue;
+
+        auto delim = rule.find('=');
+        if (delim == std::string::npos) {
+            LOG(WARNING) << "Invalid MC_NIC_PEER_AFFINITY rule '" << rule
+                         << "'. Expected local_hca=peer_hca[,peer_hca].";
+            continue;
+        }
+
+        auto local_hca = trimConfigToken(rule.substr(0, delim));
+        if (local_hca.empty()) {
+            LOG(WARNING) << "Invalid MC_NIC_PEER_AFFINITY rule '" << rule
+                         << "': local HCA is empty.";
+            continue;
+        }
+
+        std::vector<std::string> peer_hcas;
+        for (const auto& peer_hca :
+             splitConfigString(rule.substr(delim + 1), ',')) {
+            if (!peer_hca.empty()) peer_hcas.push_back(peer_hca);
+        }
+
+        if (peer_hcas.empty()) {
+            LOG(WARNING) << "Invalid MC_NIC_PEER_AFFINITY rule '" << rule
+                         << "': peer HCA list is empty.";
+            continue;
+        }
+
+        affinity[local_hca] = std::move(peer_hcas);
+    }
+}
+
+}  // namespace
+
 void loadGlobalConfig(GlobalConfig& config) {
     const char* num_cq_per_ctx_env = std::getenv("MC_NUM_CQ_PER_CTX");
     if (num_cq_per_ctx_env) {
@@ -348,6 +425,34 @@ void loadGlobalConfig(GlobalConfig& config) {
         config.enable_dest_device_affinity = true;
     }
 
+    const char* enable_hca_peer_affinity_env =
+        std::getenv("MC_ENABLE_HCA_PEER_AFFINITY");
+    if (enable_hca_peer_affinity_env) {
+        parseBoolConfigEnv(enable_hca_peer_affinity_env,
+                           "MC_ENABLE_HCA_PEER_AFFINITY",
+                           config.enable_hca_peer_affinity);
+    }
+
+    parseNicPeerAffinity(std::getenv("MC_NIC_PEER_AFFINITY"),
+                         config.nic_peer_affinity);
+
+    if (config.enable_hca_peer_affinity && config.enable_dest_device_affinity) {
+        LOG(ERROR) << "MC_ENABLE_HCA_PEER_AFFINITY and "
+                      "MC_ENABLE_DEST_DEVICE_AFFINITY cannot be enabled at "
+                      "the same time; falling back to default peer device "
+                      "selection.";
+        config.enable_hca_peer_affinity = false;
+        config.enable_dest_device_affinity = false;
+    }
+
+    const char* log_rdma_slice_affinity_env =
+        std::getenv("MC_LOG_RDMA_SLICE_AFFINITY");
+    if (log_rdma_slice_affinity_env) {
+        parseBoolConfigEnv(log_rdma_slice_affinity_env,
+                           "MC_LOG_RDMA_SLICE_AFFINITY",
+                           config.log_rdma_slice_affinity);
+    }
+
     const char* enable_parallel_reg_mr =
         std::getenv("MC_ENABLE_PARALLEL_REG_MR");
     if (enable_parallel_reg_mr) {
@@ -387,6 +492,24 @@ void loadGlobalConfig(GlobalConfig& config) {
         } catch (const std::exception& e) {
             LOG(WARNING) << "Invalid MC_IB_TC environment value: "
                          << traffic_class_env << ". Error: " << e.what();
+        }
+    }
+
+    const char* service_level_env = std::getenv("MC_IB_SL");
+    if (service_level_env) {
+        try {
+            int val = std::stoi(service_level_env);
+            if (val >= 0 && val <= 15) {
+                config.ib_service_level = val;
+            } else {
+                LOG(WARNING)
+                    << "Ignore value from environment variable MC_IB_SL, "
+                    << "value " << service_level_env
+                    << " out of range (should be 0-15)";
+            }
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Invalid MC_IB_SL environment value: "
+                         << service_level_env << ". Error: " << e.what();
         }
     }
 
@@ -507,6 +630,7 @@ void dumpGlobalConfig() {
     LOG(INFO) << "mtu_length = " << mtuLengthToString(config.mtu_length);
     LOG(INFO) << "parallel_reg_mr = " << config.parallel_reg_mr;
     LOG(INFO) << "ib_traffic_class = " << config.ib_traffic_class;
+    LOG(INFO) << "ib_service_level = " << config.ib_service_level;
     {
         std::ostringstream oss;
         for (size_t i = 0; i < config.mlx5_qp_udp_sports.size(); ++i) {
@@ -519,6 +643,8 @@ void dumpGlobalConfig() {
     }
     LOG(INFO) << "mlx5_qp_lag_port_balance = "
               << (config.mlx5_qp_lag_port_balance ? "true" : "false");
+    LOG(INFO) << "log_rdma_slice_affinity = "
+              << (config.log_rdma_slice_affinity ? "true" : "false");
 }
 
 GlobalConfig& globalConfig() {

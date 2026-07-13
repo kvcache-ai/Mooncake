@@ -10,23 +10,11 @@
 namespace mooncake {
 
 /**
- * @brief Send a file descriptor + data payload over a Unix socket (SCM_RIGHTS).
- * @return bytes sent on success, -1 on error.
- */
-int ipc_send_fd(int socket, int fd, void *data, size_t data_len);
-
-/**
- * @brief Receive a file descriptor + data payload from a Unix socket.
- * @return the received fd on success, -1 on error.
- */
-int ipc_recv_fd(int socket, void *data, size_t data_len);
-
-/**
  * @brief Manages anonymous shared memory segments backed by memfd.
  *
- * Each segment is created via memfd_create + mmap. The fd can be passed
- * to other processes (via Unix socket SCM_RIGHTS) for cross-process
- * zero-copy sharing.
+ * Each segment is created via memfd_create + mmap. The fd can be passed to
+ * other processes via UdsConnection::sendFd() for cross-process zero-copy
+ * sharing.
  *
  * Thread-safe singleton; all operations are mutex-protected.
  */

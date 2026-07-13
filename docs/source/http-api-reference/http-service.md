@@ -91,7 +91,7 @@ curl "http://localhost:8080/query_key?key=my_object"
 ```
 
 #### `/batch_query_keys`
-Retrieve replica information for multiple keys in a single request, including memory locations and transport endpoints for each key.
+Retrieve replica information for multiple keys in a single request, including memory locations and transport endpoints for each key. The endpoint performs a read-only metadata lookup and does not grant leases, trigger promotion, or update cache-hit metrics.
 
 **Method**: `GET`
 **Parameters**: `keys` (query parameter) - Comma-separated list of object keys to query (format: key1,key2,key3)
@@ -115,6 +115,25 @@ curl "http://localhost:8080/batch_query_keys?keys=key1,key2,key3"
           "transport_endpoint_": "hostname:port",
           "buffer_descriptor": {...}
         }
+      ],
+      "disk_values": [
+        {
+          "file_path": "/path/to/object",
+          "object_size": 4096
+        }
+      ],
+      "local_disk_values": [
+        {
+          "client_id": "12345-67890",
+          "object_size": 4096,
+          "transport_endpoint": "hostname:port"
+        }
+      ],
+      "nof_values": [
+        {
+          "transport_endpoint_": "hostname:port",
+          "buffer_descriptor": {...}
+        }
       ]
     },
     "key2": {
@@ -124,6 +143,8 @@ curl "http://localhost:8080/batch_query_keys?keys=key1,key2,key3"
   }
 }
 ```
+
+The `values` field is always present (empty array when no memory replica exists). The `disk_values`, `local_disk_values`, and `nof_values` fields are optional and only appear when the corresponding replica type is present for the key.
 
 #### `/get_all_keys`
 List all keys currently stored in the distributed system.

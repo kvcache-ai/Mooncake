@@ -15,7 +15,7 @@
 namespace mooncake {
 namespace py = pybind11;
 
-class py_rpc_context {
+class __attribute__((visibility("hidden"))) py_rpc_context {
    public:
     void response_msg(py::buffer msg, py::object done) {
         py::buffer_info info = msg.request();
@@ -33,7 +33,12 @@ class py_rpc_context {
     coro_rpc::context<void> context_;
 };
 
-RpcCommunicator::RpcCommunicator() {}
+struct __attribute__((visibility("hidden"))) RpcCommunicator::PyCallbackHolder {
+    py::handle callback;
+};
+
+RpcCommunicator::RpcCommunicator()
+    : py_callback_(std::make_unique<PyCallbackHolder>()) {}
 
 RpcCommunicator::~RpcCommunicator() { stopServer(); }
 
@@ -395,7 +400,7 @@ void RpcCommunicator::handleDataTransferWithAttachment(
     auto view =
         py::memoryview::from_buffer(data.data(), {data.size()}, {sizeof(char)});
 
-    py_callback_(std::move(t), view);
+    py_callback_->callback(std::move(t), view);
 }
 
 void RpcCommunicator::handleTensorTransferWithAttachment(
@@ -412,7 +417,7 @@ void RpcCommunicator::handleTensorTransferWithAttachment(
     auto view = py::memoryview::from_buffer(
         attachment.data(), {attachment.size()}, {sizeof(int8_t)});
 
-    py_callback_(std::move(t), view);
+    py_callback_->callback(std::move(t), view);
 }
 
 }  // namespace mooncake

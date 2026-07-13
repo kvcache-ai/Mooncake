@@ -76,10 +76,14 @@ class Workers {
 
    private:
     struct RouteHint {
+        // Owning reference to the segment snapshot; keeps all raw pointers
+        // below valid for the lifetime of this hint.
+        SegmentDescRef pin;
         SegmentDesc *segment;
         BufferDesc *buffer;
         const Topology::MemEntry *topo_entry;
         const Topology *topo;
+        std::string location;
     };
 
     Status getRouteHint(RouteHint &hint, SegmentID segment_id, uint64_t addr,
@@ -211,8 +215,16 @@ class Workers {
     WorkerContext *worker_context_;
     uint64_t slice_timeout_ns_;
     uint64_t priority_promotion_timeout_ns_;  // Timeout for priority promotion
+    // Opt-in (issue #2528): when true, a promotion pass promotes exactly the
+    // entries that have themselves timed out, instead of promoting the whole
+    // queue whenever only the head has timed out. Default false keeps the
+    // historical "flush the tier" behavior.
+    bool priority_promotion_per_entry_ = false;
 
     std::unique_ptr<DeviceSelector> device_selector_;
+    // File contents loaded once from workers.rail_topo_path and shared by all
+    // per-worker/per-peer RailMonitor instances.
+    std::string rail_topo_json_;
     bool always_tier1_ = false;
 };
 }  // namespace tent

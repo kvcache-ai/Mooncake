@@ -19,7 +19,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     py::class_<EventHandle>(m, "EventHandle")
         .def(py::init<>())
-        .def("current_stream_wait", &EventHandle::current_stream_wait);
+        .def("current_stream_wait", &EventHandle::current_stream_wait)
+        .def("synchronize", &EventHandle::synchronize);
 
     py::class_<ElasticNativeHandle>(m, "ElasticNativeHandle")
         .def(py::init<>())

@@ -202,6 +202,27 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     int ret = metadata_->addRpcMetaEntry(local_server_name_, desc);
     if (ret) return ret;
 
+    // Universal TCP force mechanism: if MC_FORCE_TCP is set, skip all other
+    // transport installation logic and use TCP transport only. This allows
+    // running metadata-only instances without requiring specialized hardware
+    // (e.g., NPU for Ascend Direct, RDMA HCAs, etc.).
+    if (getenv("MC_FORCE_TCP")) {
+#ifdef USE_TCP
+        Transport* tcp_transport =
+            multi_transports_->installTransport("tcp", nullptr);
+        if (!tcp_transport) {
+            LOG(ERROR)
+                << "MC_FORCE_TCP is set but failed to install TCP transport";
+            return -1;
+        }
+        LOG(INFO) << "MC_FORCE_TCP is set, using TCP transport only";
+        return 0;
+#else
+        LOG(ERROR) << "MC_FORCE_TCP is set but USE_TCP is not compiled in";
+        return -1;
+#endif
+    }
+
 #if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
     Transport* ascend_transport =
         multi_transports_->installTransport("ascend", local_topology_);
@@ -444,7 +465,8 @@ int TransferEngineImpl::uninstallTransport(const std::string& proto) {
     return 0;
 }
 
-#if defined(USE_CUDA) || defined(USE_MUSA)
+#if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
+    !defined(USE_CXI)
 device::P2pTransport* TransferEngineImpl::getOrCreateP2pTransport(
     int num_ranks) {
     if (!p2p_transport_) {
@@ -720,7 +742,32 @@ int TransferEngineImpl::mp_unregisterLocalMemory(
 
 int TransferEngineImpl::registerLocalMemoryBatch(
     const std::vector<BufferEntry>& buffer_list, const std::string& location) {
-    for (auto& buffer : buffer_list) {
+    std::vector<BufferEntry> sorted_buffers = buffer_list;
+    std::sort(sorted_buffers.begin(), sorted_buffers.end(),
+              [](const BufferEntry& lhs, const BufferEntry& rhs) {
+                  return reinterpret_cast<uintptr_t>(lhs.addr) <
+                         reinterpret_cast<uintptr_t>(rhs.addr);
+              });
+
+    for (size_t i = 0; i < sorted_buffers.size(); ++i) {
+        const auto& buffer = sorted_buffers[i];
+        if (buffer.length == 0) {
+            LOG(ERROR)
+                << "Transfer Engine does not support zero length memory region";
+            return ERR_INVALID_ARGUMENT;
+        }
+
+        if (i > 0) {
+            const auto& previous = sorted_buffers[i - 1];
+            auto address = reinterpret_cast<uintptr_t>(buffer.addr);
+            auto previous_address = reinterpret_cast<uintptr_t>(previous.addr);
+            if (address - previous_address < previous.length) {
+                LOG(ERROR) << "Transfer Engine does not support overlapped "
+                              "memory region";
+                return ERR_ADDRESS_OVERLAPPED;
+            }
+        }
+
         if (checkOverlap(buffer.addr, buffer.length)) {
             LOG(ERROR)
                 << "Transfer Engine does not support overlapped memory region";

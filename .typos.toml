@@ -9,8 +9,8 @@ wqs = "wqs"
 # AMD HSA runtime symbol prefix (hsa_*, hsaRes, hsaErr, etc.) — used by the
 # ROCm dmabuf MR registration path.
 hsa = "hsa"
-# NVIDIA CUDA attribute suffix.
 Optin = "Optin"
+HPE = "HPE"
 
 [files]
 extend-exclude = [
