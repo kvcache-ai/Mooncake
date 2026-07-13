@@ -83,7 +83,7 @@ inline bool IsValidClusterIdComponent(const std::string& cluster_id) {
     return true;
 }
 static constexpr uint64_t DEFAULT_DEFAULT_KV_LEASE_TTL =
-    5000;  // in milliseconds
+    10000;  // in milliseconds
 static constexpr uint64_t DEFAULT_KV_SOFT_PIN_TTL_MS =
     30 * 60 * 1000;  // 30 minutes
 static constexpr bool DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS = true;

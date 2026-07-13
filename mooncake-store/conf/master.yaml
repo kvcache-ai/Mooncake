@@ -1,13 +1,13 @@
 enable_metric_reporting: true
 metrics_port: 9003
 rpc_port: 50051
-rpc_thread_num: 4
+rpc_thread_num: 16
 rpc_address: "0.0.0.0"
 rpc_interface: ""
 rpc_conn_timeout_seconds: 0
 rpc_enable_tcp_no_delay: true
 
-default_kv_lease_ttl: 5000
+default_kv_lease_ttl: 10000
 default_kv_soft_pin_ttl: 1800000
 allow_evict_soft_pinned_objects: true
 eviction_ratio: 0.1
