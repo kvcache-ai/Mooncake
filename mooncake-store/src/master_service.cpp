@@ -2219,6 +2219,7 @@ auto MasterService::ListWarmupTargets(
 
     std::vector<WarmupTarget> targets;
     targets.reserve(all_segments.size());
+    std::unordered_set<std::string> seen_segment_names;
     for (const auto& [segment, owner_client_id] : all_segments) {
         if (owner_client_id == client_id) {
             continue;
@@ -2236,6 +2237,9 @@ auto MasterService::ListWarmupTargets(
         if (!protocol_allowed(segment.protocol)) {
             continue;
         }
+        if (!seen_segment_names.insert(segment_name).second) {
+            continue;
+        }
 
         WarmupTarget target;
         target.segment_name = segment_name;
@@ -2244,12 +2248,18 @@ auto MasterService::ListWarmupTargets(
         target.protocol = segment.protocol;
         target.is_local = false;
         target.allow_warmup = true;
-        target.priority = targets.size();
         targets.emplace_back(std::move(target));
+    }
 
-        if (max_targets > 0 && targets.size() >= max_targets) {
-            break;
-        }
+    if (max_targets > 0 && targets.size() > max_targets) {
+        const size_t offset =
+            static_cast<size_t>(client_id.first ^ client_id.second) %
+            targets.size();
+        std::rotate(targets.begin(), targets.begin() + offset, targets.end());
+        targets.resize(static_cast<size_t>(max_targets));
+    }
+    for (size_t i = 0; i < targets.size(); ++i) {
+        targets[i].priority = i;
     }
     return targets;
 }
