@@ -1,0 +1,7 @@
+torch>=2.0
+mooncake-transfer-engine
+numpy
+Pillow
+pyyaml
+requests
+aiohttp

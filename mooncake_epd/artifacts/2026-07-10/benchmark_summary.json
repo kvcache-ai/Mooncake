@@ -1,0 +1,101 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-07-10",
+  "scope": "Artifact-backed results collected on one 8x RTX A6000 host",
+  "environment": {
+    "gpus": "8 x NVIDIA RTX A6000 (49140 MiB each)",
+    "cpus": "2 x Intel Xeon Gold 6226R (64 logical CPUs)",
+    "ram_gib": 503,
+    "python": "3.10.12",
+    "pytorch": "2.11.0",
+    "vllm": "0.23.0",
+    "transformers": "5.12.1",
+    "cuda_runtime": "13.0",
+    "nvidia_driver": "580.159.03",
+    "mooncake_python": "0.3.11.post1"
+  },
+  "verification": {
+    "epd_tests_passed": 371,
+    "epd_tests_skipped": 1,
+    "mooncake_store_api_tests_passed": 72,
+    "runtime_security_boundary_tests_passed": 52,
+    "strict_real_epd_gate_passed": true,
+    "compile_and_document_checks_passed": true
+  },
+  "results": {
+    "real_multimodal_epd": {
+      "model": "Qwen3-VL-8B-Instruct",
+      "topology": "1 encoder + 1 prefill + 2 decode GPUs",
+      "transport": "Mooncake direct peer-buffer over TCP",
+      "measured_requests": 16,
+      "warmup_requests": 8,
+      "concurrency": 8,
+      "request_throughput_rps": 8.143146976066681,
+      "output_throughput_tokens_per_second": 232.07968881790043,
+      "mean_latency_ms": 953.0752755017602,
+      "mean_ttft_ms": 288.8172838174796,
+      "p95_ttft_ms": 344.0068922645878,
+      "http_successes": 16,
+      "epd_route_successes": 16,
+      "vision_encoder_skip_observed": true,
+      "p_to_d_peer_buffer_batches": 46,
+      "p_to_d_peer_buffer_bytes": 301989888,
+      "transfer_fallback_batches": 0,
+      "layered_transfer_failed_batches": 0,
+      "layered_receive_failures": 0,
+      "strict_real_epd_gate_passed": true,
+      "source_artifact_id": "real-multimodal-epd",
+      "source_sha256": "2ef83636ab1b6ddb09b5983a29f0ddee7ea601eed171d42719fdfb149afc3c8d"
+    },
+    "scale_out_capacity_comparison": {
+      "model": "Qwen3-VL-8B-Instruct",
+      "workload": "Same request fingerprint; approximately 1970 prompt tokens; unique prefixes; max_tokens=32; 16 measured and 8 warmup requests; concurrency=8",
+      "baseline_topology": "Single colocated vLLM instance on 1 GPU",
+      "epd_topology": "2 prefill + 2 decode instances on 4 GPUs",
+      "interpretation": "Scale-out capacity comparison only; not an equal-resource efficiency comparison",
+      "baseline": {
+        "request_throughput_rps": 2.5803857342965366,
+        "output_throughput_tokens_per_second": 74.83118629459956,
+        "mean_latency_ms": 2917.685884000093,
+        "mean_ttft_ms": 1271.709685872338,
+        "p95_ttft_ms": 2006.3865974952932,
+        "source_artifact_id": "single-gpu-colocated-baseline",
+        "source_sha256": "68416afc83d4394e5b12284162fd5ce41a47a99d0ee6ffe5dd573735032a7b7c"
+      },
+      "epd": {
+        "request_throughput_rps": 3.684713300364707,
+        "output_throughput_tokens_per_second": 108.23845319821326,
+        "mean_latency_ms": 2143.0905340639583,
+        "mean_ttft_ms": 1413.9338517488795,
+        "p95_ttft_ms": 1481.2633847468533,
+        "transfer_fallback_batches": 0,
+        "layered_transfer_failed_batches": 0,
+        "source_artifact_id": "scale-out-2p2d-epd",
+        "source_sha256": "a6fe23c1d2fc2773400823393138376f6f68ff03a5013519a4d5e150366a1df4"
+      },
+      "relative_change_percent": {
+        "request_throughput": 42.8,
+        "output_throughput": 44.6,
+        "mean_latency": -26.5,
+        "mean_ttft": 11.2,
+        "p95_ttft": -26.2
+      },
+      "exact_output_matches": "12/16"
+    },
+    "agent_state_clone": {
+      "device": "CPU",
+      "pages": 32,
+      "branches": 8,
+      "deep_copy_mean_ms": 1.6996368722175248,
+      "page_reference_clone_mean_ms": 0.16944025992415845,
+      "mean_speedup": 10.030891554216709,
+      "deep_copy_bytes": 67108864,
+      "page_reference_clone_bytes": 0,
+      "cow_bytes_upper_bound": 262144,
+      "states_after_release": 0,
+      "directory_orphans_after_release": 0,
+      "source_artifact_id": "agent-state-clone",
+      "source_sha256": "8a73f3280e0dc95054d323a3942cd7f70c967380eed4863536478099f380672c"
+    }
+  }
+}

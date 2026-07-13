@@ -150,6 +150,49 @@ static cudaEvent_t getCallerSyncEvent() {
     return tl_device_event_pool.getOrCreate(current_device);
 }
 
+// The normal vLLM path records from the same source GPU as the registered KV
+// pointer. Enqueueing a stream dependency preserves ordering without blocking
+// the CPU sender before the P2P batch is submitted. Keep the old host wait for
+// uncommon cross-device callers, where event interoperability is backend- and
+// topology-dependent.
+static bool enqueueCallerStreamDependency(const CudaStreamEntry& stream_entry) {
+    int caller_device = 0;
+    cudaError_t err = cudaGetDevice(&caller_device);
+    if (err != cudaSuccess) {
+        LOG(ERROR) << "IntraNodeNvlinkTransport: cudaGetDevice failed: "
+                   << cudaGetErrorString(err);
+        return false;
+    }
+
+    cudaEvent_t sync_event = getCallerSyncEvent();
+    if (!sync_event) return false;
+    err = cudaEventRecord(sync_event, cudaStreamPerThread);
+    if (err != cudaSuccess) {
+        LOG(ERROR) << "IntraNodeNvlinkTransport: cudaEventRecord failed: "
+                   << cudaGetErrorString(err);
+        return false;
+    }
+
+    if (caller_device == stream_entry.device_id) {
+        err = cudaStreamWaitEvent(stream_entry.stream, sync_event, 0);
+        if (err != cudaSuccess) {
+            LOG(ERROR) << "IntraNodeNvlinkTransport: cudaStreamWaitEvent failed: "
+                       << cudaGetErrorString(err);
+            return false;
+        }
+        return true;
+    }
+
+    err = cudaEventSynchronize(sync_event);
+    if (err != cudaSuccess) {
+        LOG(ERROR)
+            << "IntraNodeNvlinkTransport: cross-device cudaEventSynchronize failed: "
+            << cudaGetErrorString(err);
+        return false;
+    }
+    return true;
+}
+
 static int getDeviceForPointer(const void *ptr) {
     cudaPointerAttributes attr;
     if (cudaPointerGetAttributes(&attr, ptr) != cudaSuccess) {
@@ -437,23 +480,8 @@ Status IntraNodeNvlinkTransport::submitTransfer(
         getStreamForRequest(entries.empty() ? nullptr : entries[0].source);
     cudaStream_t stream = stream_entry.stream;
     if (!stream) return Status::Context("Failed to create NVLink CUDA stream");
-    // Synchronize with caller's GPU work via cudaEventSynchronize
-    // (CPU-blocking) to avoid expensive cross-device cudaStreamWaitEvent on
-    // non-NVIDIA GPUs.
-    cudaEvent_t sync_event = getCallerSyncEvent();
-    cudaError_t sync_err = cudaEventRecord(sync_event, cudaStreamPerThread);
-    if (sync_err != cudaSuccess) {
-        LOG(ERROR) << "IntraNodeNvlinkTransport: cudaEventRecord failed: "
-                   << cudaGetErrorString(sync_err);
-        return Status::Context("cudaEventRecord failed: " +
-                               std::string(cudaGetErrorString(sync_err)));
-    }
-    sync_err = cudaEventSynchronize(sync_event);
-    if (sync_err != cudaSuccess) {
-        LOG(ERROR) << "IntraNodeNvlinkTransport: cudaEventSynchronize failed: "
-                   << cudaGetErrorString(sync_err);
-        return Status::Context("cudaEventSynchronize failed: " +
-                               std::string(cudaGetErrorString(sync_err)));
+    if (!enqueueCallerStreamDependency(stream_entry)) {
+        return Status::Context("failed to enqueue caller-stream dependency");
     }
 
     // Phase 1: Prepare slices and collect memcpy parameters
@@ -556,20 +584,8 @@ Status IntraNodeNvlinkTransport::submitTransferTask(
         task_list.empty() ? nullptr : task_list[0]->request->source);
     cudaStream_t stream = stream_entry.stream;
     if (!stream) return Status::Context("Failed to create NVLink CUDA stream");
-    cudaEvent_t sync_event = getCallerSyncEvent();
-    cudaError_t sync_err = cudaEventRecord(sync_event, cudaStreamPerThread);
-    if (sync_err != cudaSuccess) {
-        LOG(ERROR) << "IntraNodeNvlinkTransport: cudaEventRecord failed: "
-                   << cudaGetErrorString(sync_err);
-        return Status::Context("cudaEventRecord failed: " +
-                               std::string(cudaGetErrorString(sync_err)));
-    }
-    sync_err = cudaEventSynchronize(sync_event);
-    if (sync_err != cudaSuccess) {
-        LOG(ERROR) << "IntraNodeNvlinkTransport: cudaEventSynchronize failed: "
-                   << cudaGetErrorString(sync_err);
-        return Status::Context("cudaEventSynchronize failed: " +
-                               std::string(cudaGetErrorString(sync_err)));
+    if (!enqueueCallerStreamDependency(stream_entry)) {
+        return Status::Context("failed to enqueue caller-stream dependency");
     }
 
     // Phase 1: Prepare slices and collect memcpy parameters

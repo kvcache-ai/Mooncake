@@ -96,11 +96,16 @@ class FakeStore:
 
 
 class FakeRequest:
-    def __init__(self, body):
+    def __init__(self, body, *, match_info=None, raw_body=None):
         self.body = body
+        self.match_info = dict(match_info or {})
+        self._raw_body = raw_body
 
     async def json(self):
         return self.body
+
+    async def read(self):
+        return self._raw_body if self._raw_body is not None else self.body
 
 
 class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
@@ -353,7 +358,7 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
     async def test_handle_put_missing_value(self):
         self.fake_store.put = lambda key, value: 0
         resp = await self.service.handle_put(FakeRequest({"key": "k"}))
-        self.assertEqual(resp.status, 500)
+        self.assertEqual(resp.status, 400)
 
     async def test_handle_put_store_failure(self):
         self.fake_store.put = lambda key, value: -1
@@ -368,6 +373,26 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.status, 400)
         body = json.loads(resp.text)
         self.assertIn("Missing key or value", body["error"])
+
+    async def test_handle_put_bytes_success(self):
+        captured = {}
+
+        def put(key, value):
+            captured["key"] = key
+            captured["value"] = value
+            return 0
+
+        self.fake_store.put = put
+        resp = await self.service.handle_put_bytes(
+            FakeRequest({}, match_info={"key": "raw-key"}, raw_body=b"\x00raw\xff")
+        )
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(captured, {"key": "raw-key", "value": b"\x00raw\xff"})
+
+    async def test_handle_put_bytes_missing_key(self):
+        self.fake_store.put = lambda key, value: 0
+        resp = await self.service.handle_put_bytes(FakeRequest({}, match_info={"key": ""}, raw_body=b"payload"))
+        self.assertEqual(resp.status, 400)
 
     # ==================== /api/get/{key} tests ====================
 
@@ -604,7 +629,7 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         self.service.mounted_segment_ids = [sid]
         resp = await self.service.handle_reconfigure(FakeRequest({"mode": "prefill"}))
         self.assertEqual(resp.status, 200)
-        self.assertEqual(self.fake_store.unmount_calls, [[sid]])
+        self.assertEqual(self.fake_store.unmount_calls, [([sid], 0)])
         self.assertEqual(self.service.mounted_segment_ids, [])
         self.assertEqual(self.service.current_mode, "prefill")
 
@@ -645,7 +670,7 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
             )
         )
         self.assertEqual(resp.status, 200)
-        self.assertEqual(self.fake_store.unmount_calls, [[old_id]])
+        self.assertEqual(self.fake_store.unmount_calls, [([old_id], 0)])
         self.assertEqual(self.service.current_mode, "decode")
 
     # ==================== /api/mount edge cases ====================
@@ -742,7 +767,7 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.status, 200)
         self.assertEqual(
             self.fake_store.unmount_calls,
-            [["00000000-0000-0000-0000-000000000001"]],
+            [(["00000000-0000-0000-0000-000000000001"], 0)],
         )
 
     async def test_unmount_shm_empty_list(self):
