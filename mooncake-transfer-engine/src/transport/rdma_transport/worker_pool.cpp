@@ -560,9 +560,9 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
                             peer_segment_desc->buffers[buffer_id].rkey.size()) {
                         continue;
                     }
-                    auto alt_path =
-                        MakeNicPath(peer_segment_desc->name,
-                                    peer_segment_desc->devices[alt_dev_id].name);
+                    auto alt_path = MakeNicPath(
+                        peer_segment_desc->name,
+                        peer_segment_desc->devices[alt_dev_id].name);
                     if (isRailAvailable(alt_path)) {
                         device_id = alt_dev_id;
                         slice->rdma.dest_rkey =
