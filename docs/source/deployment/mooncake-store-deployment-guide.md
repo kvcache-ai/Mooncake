@@ -811,7 +811,6 @@ Local hot cache provides a DRAM read cache on top of SSD-resident objects for fa
 |----------|---------|-------------|
 | `MC_STORE_USE_HUGEPAGE` | unset | Set `1` to request HugeTLB-backed `mmap()` |
 | `MC_STORE_HUGEPAGE_SIZE` | `2MB` | Supported: `2MB`, `1GB` |
-| `MC_DISABLE_RDMA_PRE_TOUCH` | `false` | Disable the RDMA transport's register/deregister pre-touch pass. Accepts `1`/`true`/`yes`/`on`; use with `MC_ENABLE_PARALLEL_REG_MR=1` when Store already populated the mapping and parallel MR registration should remain enabled |
 | `MC_MMAP_ARENA_POOL_SIZE` | unset | Pre-allocated arena pool size (e.g., `8gb`). Explicitly set to enable the arena |
 | `MC_DISABLE_MMAP_ARENA` | unset | Disable arena, fall back to per-call `mmap()`. Accepts `1`/`true`/`yes`/`on` (or `0`/`false`/`no`/`off`) |
 
@@ -822,14 +821,6 @@ required:
 ```bash
 export MC_STORE_USE_HUGEPAGE=1
 export MC_STORE_HUGEPAGE_SIZE=2MB
-```
-
-To skip the transfer engine's separate register/deregister pre-touch pass while
-retaining parallel MR registration, optionally set:
-
-```bash
-export MC_DISABLE_RDMA_PRE_TOUCH=1
-export MC_ENABLE_PARALLEL_REG_MR=1
 ```
 
 For direct mappings, workers divide the mapping into page ranges. For

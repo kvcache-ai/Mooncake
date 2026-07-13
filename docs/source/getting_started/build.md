@@ -130,20 +130,10 @@ export MC_STORE_USE_HUGEPAGE=1
 export MC_STORE_HUGEPAGE_SIZE=2MB
 ```
 
-The transfer engine's separate register/deregister pre-touch pass can be
-skipped while retaining parallel MR registration with:
-
-```bash
-export MC_DISABLE_RDMA_PRE_TOUCH=1
-export MC_ENABLE_PARALLEL_REG_MR=1
-```
-
 Direct mappings use a generic worker pool. NUMA-segmented mappings bind each
 worker to the node associated with its memory region. The mmap arena keeps its
 eager population behavior; set `MC_DISABLE_MMAP_ARENA=1` if an arena was
-otherwise enabled and deferred direct-mmap population is desired. Explicitly
-enabling parallel MR registration preserves the transport's parallel
-registration path when its own pre-touch pass is disabled.
+otherwise enabled and deferred direct-mmap population is desired.
 
 ## Advanced Compile Options
 The following options can be passed to `cmake ..`.
