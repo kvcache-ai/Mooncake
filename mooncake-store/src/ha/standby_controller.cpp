@@ -36,6 +36,7 @@ std::unique_ptr<HotStandbyService> CreateStandbyService(
                                 : ParseOpLogStoreType(config.oplog_store_type),
         .oplog_store_root_dir = config.oplog_store_root_dir,
         .oplog_poll_interval_ms = config.oplog_poll_interval_ms,
+        .batch_oplog_retry_timeout_sec = config.batch_oplog_retry_timeout_sec,
     });
 }
 
@@ -135,9 +136,20 @@ class CapabilityDrivenStandbyController final : public StandbyController {
         }
 
         standby_service_->SetSyncStatusCallback(
-            [this](const StandbySyncStatus&) {
+            [this](const StandbySyncStatus& status) {
+                if (status.state == StandbyState::FAILED ||
+                    status.state == StandbyState::STOPPED) {
+                    std::lock_guard<std::mutex> lock(state_mutex_);
+                    standby_running_ = false;
+                    last_standby_error_ = status.last_error;
+                }
                 NotifyRuntimeStateIfChanged();
             });
+    }
+
+    ~CapabilityDrivenStandbyController() override {
+        standby_service_->SetSyncStatusCallback({});
+        standby_service_->Stop();
     }
 
     ErrorCode StartStandby(
@@ -162,11 +174,20 @@ class CapabilityDrivenStandbyController final : public StandbyController {
         ErrorCode err = standby_service_->Start(
             observed_leader.has_value() ? observed_leader->leader_address : "",
             oplog_connstring_, config_.cluster_id);
+        const StandbySyncStatus status = standby_service_->GetSyncStatus();
 
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
-            standby_running_ = err == ErrorCode::OK;
-            last_standby_error_ = err;
+            standby_running_ = err == ErrorCode::OK &&
+                               status.state != StandbyState::FAILED &&
+                               status.state != StandbyState::STOPPED;
+            if (standby_running_) {
+                last_standby_error_ = ErrorCode::OK;
+            } else if (status.last_error != ErrorCode::OK) {
+                last_standby_error_ = status.last_error;
+            } else {
+                last_standby_error_ = err;
+            }
         }
         if (err == ErrorCode::OK) {
             NotifyRuntimeStateIfChanged();
@@ -175,13 +196,6 @@ class CapabilityDrivenStandbyController final : public StandbyController {
     }
 
     void StopStandby() override {
-        {
-            std::lock_guard<std::mutex> lock(state_mutex_);
-            if (!standby_running_) {
-                return;
-            }
-        }
-
         standby_service_->Stop();
         {
             std::lock_guard<std::mutex> lock(state_mutex_);

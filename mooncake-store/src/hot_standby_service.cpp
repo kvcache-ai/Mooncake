@@ -2,6 +2,7 @@
 
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <chrono>
 #include <thread>
 
@@ -15,6 +16,16 @@
 #include "ha/oplog/oplog_store_factory.h"
 
 namespace mooncake {
+
+namespace {
+
+bool IsRetryableBatchStandbyError(ErrorCode error) {
+    return error == ErrorCode::ETCD_OPERATION_ERROR ||
+           error == ErrorCode::ETCD_CTX_CANCELLED ||
+           error == ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+}
+
+}  // namespace
 
 HotStandbyService::HotStandbyService(const HotStandbyConfig& config)
     : config_(config) {
@@ -166,6 +177,27 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
         LOG(WARNING) << "HotStandbyService is already running";
         return ErrorCode::OK;
     }
+
+    // A failed asynchronous run leaves joinable worker threads behind. Reap
+    // them before constructing the next run's readers and workers.
+    replication_loop_running_.store(false, std::memory_order_release);
+    replication_loop_cv_.notify_all();
+    if (oplog_replicator_) {
+        oplog_replicator_->Stop();
+        oplog_replicator_.reset();
+    }
+    if (replication_thread_.joinable()) {
+        replication_thread_.join();
+    }
+    if (verification_thread_.joinable()) {
+        verification_thread_.join();
+    }
+    oplog_change_notifier_.reset();
+    watcher_oplog_store_.reset();
+    batch_standby_reader_.reset();
+    batch_standby_kv_backend_.reset();
+
+    last_error_.store(ErrorCode::OK, std::memory_order_release);
 
     // Trigger START event
     auto result = state_machine_.ProcessEvent(StandbyEvent::START);
@@ -507,6 +539,7 @@ StandbySyncStatus HotStandbyService::GetSyncStatus() const {
     // Use state machine for connection status
     status.is_connected = IsConnected();
     status.state = GetState();
+    status.last_error = last_error_.load(std::memory_order_acquire);
     status.time_in_state = state_machine_.GetTimeInCurrentState();
 
     if (status.primary_seq_id > status.applied_seq_id) {
@@ -1040,6 +1073,14 @@ void HotStandbyService::ReplicationLoop() {
 
     uint64_t last_reported_applied_seq_id = applied_seq_id_.load();
     uint64_t last_reported_primary_seq_id = primary_seq_id_.load();
+    const auto retry_base =
+        std::chrono::milliseconds(std::max(config_.oplog_poll_interval_ms, 1));
+    const auto retry_limit =
+        std::chrono::seconds(config_.batch_oplog_retry_timeout_sec);
+    const auto max_retry_delay =
+        std::max(retry_base, std::chrono::milliseconds(5000));
+    auto retry_delay = retry_base;
+    std::optional<std::chrono::steady_clock::time_point> retry_started;
 
     auto wait_for_next_poll = [this](std::chrono::milliseconds delay) {
         std::unique_lock<std::mutex> lock(replication_loop_mutex_);
@@ -1056,6 +1097,8 @@ void HotStandbyService::ReplicationLoop() {
         }
 
         if (batch_standby_reader_) {
+            const uint64_t expected_before =
+                oplog_applier_->GetExpectedSequenceId();
             auto result = batch_standby_reader_->PollOnce();
             if (result.used_legacy_path) {
                 uint64_t legacy_max = 0;
@@ -1066,9 +1109,19 @@ void HotStandbyService::ReplicationLoop() {
                 if (err != ErrorCode::OK &&
                     err != ErrorCode::OPLOG_ENTRY_NOT_FOUND) {
                     result.error = err;
+                    result.disposition =
+                        IsRetryableBatchStandbyError(err)
+                            ? OpLogBatchStandbyPollDisposition::RETRYABLE
+                            : OpLogBatchStandbyPollDisposition::FATAL;
                 } else if (err == ErrorCode::OK) {
                     result.error =
                         CatchUpLegacyTo(*repl_oplog_store, legacy_max);
+                    if (result.error != ErrorCode::OK) {
+                        result.disposition =
+                            IsRetryableBatchStandbyError(result.error)
+                                ? OpLogBatchStandbyPollDisposition::RETRYABLE
+                                : OpLogBatchStandbyPollDisposition::FATAL;
+                    }
                     primary_seq_id_.store(legacy_max);
                 }
             } else {
@@ -1080,17 +1133,61 @@ void HotStandbyService::ReplicationLoop() {
             if (result.waiting_for_legacy_catch_up) {
                 if (!repl_oplog_store) {
                     result.error = ErrorCode::INTERNAL_ERROR;
+                    result.disposition =
+                        OpLogBatchStandbyPollDisposition::FATAL;
                 } else {
                     result.error = CatchUpLegacyTo(
                         *repl_oplog_store, result.legacy_catch_up_target);
+                    if (result.error != ErrorCode::OK) {
+                        result.disposition =
+                            IsRetryableBatchStandbyError(result.error)
+                                ? OpLogBatchStandbyPollDisposition::RETRYABLE
+                                : OpLogBatchStandbyPollDisposition::FATAL;
+                    }
                 }
             }
+
+            const uint64_t expected_after =
+                oplog_applier_->GetExpectedSequenceId();
+            if (expected_after > 0) {
+                applied_seq_id_.store(expected_after - 1);
+            }
             if (result.error != ErrorCode::OK) {
-                LOG(ERROR) << "Batch-record standby poll failed, err="
-                           << static_cast<int>(result.error);
+                last_error_.store(result.error, std::memory_order_release);
+                const bool made_progress = expected_after > expected_before;
+                if (result.disposition ==
+                    OpLogBatchStandbyPollDisposition::RETRYABLE) {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (!retry_started || made_progress) {
+                        retry_started = now;
+                        retry_delay = retry_base;
+                    }
+                    if (now - *retry_started < retry_limit) {
+                        LOG(WARNING)
+                            << "Transient batch-record standby poll failure, "
+                            << "retrying in " << retry_delay.count()
+                            << " ms, err=" << static_cast<int>(result.error);
+                        NotifySyncStatus();
+                        wait_for_next_poll(retry_delay);
+                        retry_delay =
+                            std::min(retry_delay * 2, max_retry_delay);
+                        continue;
+                    }
+                    LOG(ERROR)
+                        << "Batch-record standby retry timeout after "
+                        << config_.batch_oplog_retry_timeout_sec
+                        << " seconds, err=" << static_cast<int>(result.error);
+                } else {
+                    LOG(ERROR) << "Fatal batch-record standby poll failure, "
+                               << "err=" << static_cast<int>(result.error);
+                }
                 state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
+                replication_loop_cv_.notify_all();
                 break;
             }
+            retry_started.reset();
+            retry_delay = retry_base;
+            last_error_.store(ErrorCode::OK, std::memory_order_release);
         }
 
         // Update applied_seq_id from OpLogApplier
@@ -1133,8 +1230,20 @@ void HotStandbyService::VerificationLoop() {
     LOG(INFO) << "Verification loop started";
 
     while (IsRunning()) {
-        std::this_thread::sleep_for(
-            std::chrono::seconds(config_.verification_interval_sec));
+        std::unique_lock<std::mutex> lock(replication_loop_mutex_);
+        replication_loop_cv_.wait_for(
+            lock, std::chrono::seconds(config_.verification_interval_sec),
+            [this] {
+                return !replication_loop_running_.load(
+                           std::memory_order_acquire) ||
+                       !IsRunning();
+            });
+        lock.unlock();
+
+        if (!IsRunning() ||
+            !replication_loop_running_.load(std::memory_order_acquire)) {
+            break;
+        }
 
         if (!IsConnected()) {
             continue;

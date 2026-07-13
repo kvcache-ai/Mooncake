@@ -21,11 +21,9 @@ bool SameBatchRecord(const OpLogBatchRecord& lhs, const OpLogBatchRecord& rhs) {
     for (size_t i = 0; i < lhs.entries.size(); ++i) {
         const auto& a = lhs.entries[i];
         const auto& b = rhs.entries[i];
-        if (a.sequence_id != b.sequence_id ||
-            a.timestamp_ms != b.timestamp_ms || a.op_type != b.op_type ||
+        if (a.sequence_id != b.sequence_id || a.op_type != b.op_type ||
             a.tenant_id != b.tenant_id || a.object_key != b.object_key ||
-            a.payload != b.payload || a.checksum != b.checksum ||
-            a.prefix_hash != b.prefix_hash) {
+            a.payload != b.payload) {
             return false;
         }
     }

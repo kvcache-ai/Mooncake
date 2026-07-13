@@ -54,6 +54,7 @@ struct HotStandbyConfig {
     OpLogStoreType oplog_store_type{kDefaultOpLogStoreType};
     std::string oplog_store_root_dir{kDefaultOpLogRootDir};
     int oplog_poll_interval_ms{kDefaultOpLogPollIntervalMs};
+    uint32_t batch_oplog_retry_timeout_sec{180};
 
     // Programmatic migration escape hatch (default: fail-closed).
     // When true, FinalCatchUpForPromotionLocked returns
@@ -82,6 +83,7 @@ struct StandbySyncStatus {
     StandbyState state{StandbyState::STOPPED};
     std::chrono::milliseconds time_in_state{0};
     size_t unresolved_gap_count{0};
+    ErrorCode last_error{ErrorCode::OK};
 };
 
 /**
@@ -348,6 +350,7 @@ class HotStandbyService {
     std::shared_ptr<ReplicationStream> replication_stream_;
     std::atomic<uint64_t> applied_seq_id_{0};
     std::atomic<uint64_t> primary_seq_id_{0};
+    std::atomic<ErrorCode> last_error_{ErrorCode::OK};
 
     // State machine for managing service lifecycle
     StandbyStateMachine state_machine_;

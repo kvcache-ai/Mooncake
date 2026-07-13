@@ -523,7 +523,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
         }
     }
 
-    if (enable_snapshot_) {
+    if (enable_snapshot_ && !use_batch_oplog_) {
         if (memory_allocator_type_ == BufferAllocatorType::OFFSET) {
             // Initialize and start snapshot manager
             MasterSnapshotManagerOptions snapshot_options;
@@ -550,6 +550,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
                 snapshot_object_store_.get(), snapshot_catalog_store_.get());
             snapshot_manager_->Start();
         }
+    } else if (enable_snapshot_ && use_batch_oplog_) {
+        LOG(INFO) << "Skipping primary snapshot generation in batch-record "
+                     "OpLog mode; snapshots are owned by standby";
     }
 
     if (enable_cxl_) {
@@ -11058,12 +11061,18 @@ MasterService::AppendOpLogVisibleBeforeDurable(OpType type,
         return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
+    const std::string resolved_tenant =
+        enable_multi_tenants_ ? tenant_id : std::string("default");
+    if (!IsValidTenantId(resolved_tenant)) {
+        return tl::unexpected(ErrorCode::TENANT_NOT_REGISTERED);
+    }
+
     auto reservation = ordered_oplog_writer_->Reserve();
     if (!reservation) {
         return tl::unexpected(reservation.error());
     }
     OpLogEntry entry =
-        oplog_manager_.AllocateEntry(type, tenant_id, key, payload);
+        oplog_manager_.AllocateEntry(type, resolved_tenant, key, payload);
     auto pending = ordered_oplog_writer_->Commit(std::move(reservation.value()),
                                                  std::move(entry), nullptr);
     if (!pending) {
@@ -11116,8 +11125,13 @@ MasterService::AppendReservedOpLogWithDurableFinalize(
     if (!use_batch_oplog_) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+    const std::string resolved_tenant =
+        enable_multi_tenants_ ? tenant_id : std::string("default");
+    if (!IsValidTenantId(resolved_tenant)) {
+        return tl::unexpected(ErrorCode::TENANT_NOT_REGISTERED);
+    }
     OpLogEntry entry =
-        oplog_manager_.AllocateEntry(type, tenant_id, key, payload);
+        oplog_manager_.AllocateEntry(type, resolved_tenant, key, payload);
     auto pending = ordered_oplog_writer_->Commit(std::move(reservation), entry,
                                                  std::move(callback));
     if (!pending) {

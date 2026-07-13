@@ -19,6 +19,11 @@ namespace {
 class FakeHaKvBackend : public HaKvBackend {
    public:
     ErrorCode Get(std::string_view key, std::string& value) override {
+        if (next_get_error_ != ErrorCode::OK) {
+            auto error = next_get_error_;
+            next_get_error_ = ErrorCode::OK;
+            return error;
+        }
         auto it = values_.find(std::string(key));
         if (it == values_.end()) {
             return ErrorCode::ETCD_KEY_NOT_EXIST;
@@ -32,6 +37,11 @@ class FakeHaKvBackend : public HaKvBackend {
     }
     ErrorCode Range(std::string_view begin_key, std::string_view end_key,
                     size_t limit, std::vector<KvPair>& kvs) override {
+        if (next_range_error_ != ErrorCode::OK) {
+            auto error = next_range_error_;
+            next_range_error_ = ErrorCode::OK;
+            return error;
+        }
         kvs.clear();
         ++range_calls_;
         for (const auto& [key, value] : values_) {
@@ -47,10 +57,14 @@ class FakeHaKvBackend : public HaKvBackend {
 
     int range_calls() const { return range_calls_; }
     void Erase(std::string_view key) { values_.erase(std::string(key)); }
+    void FailNextGet(ErrorCode error) { next_get_error_ = error; }
+    void FailNextRange(ErrorCode error) { next_range_error_ = error; }
 
    private:
     std::map<std::string, std::string> values_;
     int range_calls_{0};
+    ErrorCode next_get_error_{ErrorCode::OK};
+    ErrorCode next_range_error_{ErrorCode::OK};
 };
 
 OpLogEntry MakeEntry(uint64_t sequence_id) {
@@ -112,6 +126,54 @@ TEST(OpLogBatchStandbyReaderTest, MissingPrefixAfterBatchCutoverFailsClosed) {
 
     EXPECT_NE(ErrorCode::OK, result.error);
     EXPECT_FALSE(result.used_legacy_path);
+    EXPECT_EQ(OpLogBatchStandbyPollDisposition::FATAL, result.disposition);
+}
+
+TEST(OpLogBatchStandbyReaderTest, PrefixTransportErrorIsRetryable) {
+    FakeHaKvBackend backend;
+    MockMetadataStore metadata_store;
+    OpLogApplier applier(&metadata_store, "clusterA");
+    OpLogBatchStandbyReader reader("clusterA", backend, applier);
+
+    backend.FailNextGet(ErrorCode::ETCD_OPERATION_ERROR);
+    auto result = reader.PollOnce();
+
+    EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR, result.error);
+    EXPECT_EQ(OpLogBatchStandbyPollDisposition::RETRYABLE, result.disposition);
+}
+
+TEST(OpLogBatchStandbyReaderTest, RangeTransportErrorIsRetryable) {
+    FakeHaKvBackend backend;
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildDurablePrefixKey("clusterA"),
+                          EncodeDurablePrefix({.batch_id = 1, .last_seq = 1})));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildBatchRecordKey("clusterA", 1),
+                          EncodeOpLogBatchRecord(MakeBatch(1, 1, 1))));
+    MockMetadataStore metadata_store;
+    OpLogApplier applier(&metadata_store, "clusterA");
+    OpLogBatchStandbyReader reader("clusterA", backend, applier);
+    backend.FailNextRange(ErrorCode::ETCD_OPERATION_ERROR);
+
+    auto result = reader.PollOnce();
+
+    EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR, result.error);
+    EXPECT_EQ(OpLogBatchStandbyPollDisposition::RETRYABLE, result.disposition);
+}
+
+TEST(OpLogBatchStandbyReaderTest, MissingTargetBatchIsFatal) {
+    FakeHaKvBackend backend;
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildDurablePrefixKey("clusterA"),
+                          EncodeDurablePrefix({.batch_id = 1, .last_seq = 1})));
+    MockMetadataStore metadata_store;
+    OpLogApplier applier(&metadata_store, "clusterA");
+    OpLogBatchStandbyReader reader("clusterA", backend, applier);
+
+    auto result = reader.PollOnce();
+
+    EXPECT_EQ(OpLogBatchStandbyPollDisposition::FATAL, result.disposition);
+    EXPECT_EQ(ErrorCode::ETCD_KEY_NOT_EXIST, result.error);
 }
 
 TEST(OpLogBatchStandbyReaderTest, DurablePrefixRegressionFailsClosed) {

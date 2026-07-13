@@ -4,8 +4,16 @@
 #include <gtest/gtest.h>
 #include <xxhash.h>
 
+#include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
+
+#if __has_include(<jsoncpp/json/json.h>)
+#include <jsoncpp/json/json.h>
+#else
+#include <json/json.h>
+#endif
 
 namespace mooncake::test {
 
@@ -34,6 +42,22 @@ OpLogBatchRecord MakeBatch(uint64_t batch_id, std::vector<OpLogEntry> entries) {
     batch.first_seq = batch.entries.front().sequence_id;
     batch.last_seq = batch.entries.back().sequence_id;
     return batch;
+}
+
+Json::Value ParseJson(const std::string& value) {
+    Json::Value root;
+    Json::CharReaderBuilder builder;
+    std::string errors;
+    std::istringstream stream(value);
+    EXPECT_TRUE(Json::parseFromStream(builder, stream, &root, &errors))
+        << errors;
+    return root;
+}
+
+std::string WriteJson(const Json::Value& root) {
+    Json::StreamWriterBuilder builder;
+    builder["indentation"] = "";
+    return Json::writeString(builder, root);
 }
 
 }  // namespace
@@ -194,6 +218,46 @@ TEST(OpLogBatchRecordCodecTest, RoundTripsSingleEntryBatch) {
     EXPECT_TRUE(reason.empty());
 }
 
+TEST(OpLogBatchRecordCodecTest, EncodesCompactArraySchema) {
+    const auto encoded = EncodeOpLogBatchRecord(MakeBatch(
+        3,
+        {MakeEntry(10, OpType::PUT_END, "key", std::string("\0binary", 7))}));
+    const auto root = ParseJson(encoded);
+
+    ASSERT_TRUE(root.isArray());
+    ASSERT_EQ(6u, root.size());
+    EXPECT_EQ(kOpLogBatchRecordSchemaVersion, root[0].asUInt());
+    EXPECT_EQ(3u, root[1].asUInt64());
+    EXPECT_EQ(10u, root[2].asUInt64());
+    EXPECT_EQ(10u, root[3].asUInt64());
+    ASSERT_TRUE(root[4].isArray());
+    ASSERT_EQ(1u, root[4].size());
+    ASSERT_TRUE(root[4][0].isArray());
+    EXPECT_EQ(4u, root[4][0].size());
+    EXPECT_EQ(static_cast<uint8_t>(OpType::PUT_END), root[4][0][0].asUInt());
+    EXPECT_EQ("tenant", root[4][0][1].asString());
+    EXPECT_EQ("key", root[4][0][2].asString());
+    EXPECT_EQ("AGJpbmFyeQ==", root[4][0][3].asString());
+    EXPECT_EQ(std::string::npos, encoded.find("timestamp_ms"));
+    EXPECT_EQ(std::string::npos, encoded.find("prefix_hash"));
+    EXPECT_EQ(std::string::npos, encoded.find("sequence_id"));
+}
+
+TEST(OpLogBatchRecordCodecTest, RebuildsNonPersistedEntryFields) {
+    auto in = MakeBatch(3, {MakeEntry(10)});
+    ASSERT_NE(0u, in.entries[0].timestamp_ms);
+    ASSERT_NE(0u, in.entries[0].prefix_hash);
+
+    OpLogBatchRecord out;
+    std::string reason;
+    ASSERT_TRUE(
+        DecodeOpLogBatchRecord(EncodeOpLogBatchRecord(in), &out, &reason));
+    ASSERT_EQ(1u, out.entries.size());
+    EXPECT_EQ(0u, out.entries[0].timestamp_ms);
+    EXPECT_EQ(0u, out.entries[0].prefix_hash);
+    EXPECT_TRUE(OpLogManager::VerifyChecksum(out.entries[0]));
+}
+
 TEST(OpLogBatchRecordCodecTest, RoundTripsMultiEntryBatch) {
     auto in = MakeBatch(
         3, {MakeEntry(10), MakeEntry(11, OpType::REMOVE, "dead-key", "")});
@@ -212,65 +276,74 @@ TEST(OpLogBatchRecordCodecTest, RoundTripsMultiEntryBatch) {
 }
 
 TEST(OpLogBatchRecordCodecTest, RejectsCorruptedChecksum) {
-    auto encoded = EncodeOpLogBatchRecord(MakeBatch(3, {MakeEntry(10)}));
-    auto pos = encoded.find("\"checksum\"");
-    ASSERT_NE(std::string::npos, pos);
-    pos = encoded.find_first_of("0123456789", pos);
-    ASSERT_NE(std::string::npos, pos);
-    encoded[pos] = encoded[pos] == '0' ? '1' : '0';
+    auto root =
+        ParseJson(EncodeOpLogBatchRecord(MakeBatch(3, {MakeEntry(10)})));
+    ASSERT_TRUE(root.isArray());
+    ASSERT_EQ(6u, root.size());
+    root[5] = root[5].asUInt() + 1;
 
     OpLogBatchRecord out;
     std::string reason;
-    EXPECT_FALSE(DecodeOpLogBatchRecord(encoded, &out, &reason));
+    EXPECT_FALSE(DecodeOpLogBatchRecord(WriteJson(root), &out, &reason));
     EXPECT_FALSE(reason.empty());
 }
 
 TEST(OpLogBatchRecordCodecTest, RejectsMalformedTypedFieldsWithoutThrowing) {
     OpLogBatchRecord out;
     std::string reason;
-    EXPECT_NO_THROW(EXPECT_FALSE(DecodeOpLogBatchRecord(
-        R"({"schema_version":"x","batch_id":"x","first_seq":"x","last_seq":"x","entries":[],"checksum":"x"})",
-        &out, &reason)));
+    EXPECT_NO_THROW(EXPECT_FALSE(
+        DecodeOpLogBatchRecord(R"(["x","x","x","x",[],"x"])", &out, &reason)));
     EXPECT_FALSE(reason.empty());
 }
 
-TEST(OpLogBatchRecordCodecTest, RejectsMissingRequiredFieldsBeforeChecksum) {
-    auto encoded = EncodeOpLogBatchRecord(MakeBatch(3, {MakeEntry(10)}));
-    auto pos = encoded.find("\"batch_id\":3,");
-    ASSERT_NE(std::string::npos, pos);
-    encoded.erase(pos, std::string("\"batch_id\":3,").size());
-
+TEST(OpLogBatchRecordCodecTest, RejectsWrongElementCount) {
     OpLogBatchRecord out;
     std::string reason;
-    EXPECT_FALSE(DecodeOpLogBatchRecord(encoded, &out, &reason));
-    EXPECT_NE(std::string::npos, reason.find("missing"));
+    EXPECT_FALSE(DecodeOpLogBatchRecord(R"([1,3,10,10,[]])", &out, &reason));
+    EXPECT_FALSE(reason.empty());
 }
 
 TEST(OpLogBatchRecordCodecTest, RejectsCorruptedSequenceContinuity) {
     auto in = MakeBatch(3, {MakeEntry(10), MakeEntry(11)});
-    auto encoded = EncodeOpLogBatchRecord(in);
-    auto pos = encoded.find("\"last_seq\":11");
-    ASSERT_NE(std::string::npos, pos);
-    encoded.replace(pos, std::string("\"last_seq\":11").size(),
-                    "\"last_seq\":12");
+    auto root = ParseJson(EncodeOpLogBatchRecord(in));
+    ASSERT_TRUE(root.isArray());
+    root[3] = Json::UInt64(12);
 
     OpLogBatchRecord out;
     std::string reason;
-    EXPECT_FALSE(DecodeOpLogBatchRecord(encoded, &out, &reason));
+    EXPECT_FALSE(DecodeOpLogBatchRecord(WriteJson(root), &out, &reason));
     EXPECT_FALSE(reason.empty());
 }
 
 TEST(OpLogBatchRecordCodecTest, RejectsUnsupportedSchemaVersion) {
-    auto encoded = EncodeOpLogBatchRecord(MakeBatch(3, {MakeEntry(10)}));
-    auto pos = encoded.find("\"schema_version\":1");
-    ASSERT_NE(std::string::npos, pos);
-    encoded.replace(pos, std::string("\"schema_version\":1").size(),
-                    "\"schema_version\":2");
+    auto root =
+        ParseJson(EncodeOpLogBatchRecord(MakeBatch(3, {MakeEntry(10)})));
+    ASSERT_TRUE(root.isArray());
+    root[0] = kOpLogBatchRecordSchemaVersion + 1;
 
     OpLogBatchRecord out;
     std::string reason;
-    EXPECT_FALSE(DecodeOpLogBatchRecord(encoded, &out, &reason));
+    EXPECT_FALSE(DecodeOpLogBatchRecord(WriteJson(root), &out, &reason));
     EXPECT_FALSE(reason.empty());
+}
+
+TEST(OpLogBatchRecordCodecTest, RejectsInvalidBase64Payload) {
+    auto root =
+        ParseJson(EncodeOpLogBatchRecord(MakeBatch(3, {MakeEntry(10)})));
+    ASSERT_TRUE(root.isArray());
+    root[4][0][3] = "%%%";
+    Json::Value checksum_payload(Json::arrayValue);
+    for (Json::ArrayIndex i = 0; i < 5; ++i) {
+        checksum_payload.append(root[i]);
+    }
+    const auto serialized = WriteJson(checksum_payload);
+    root[5] =
+        static_cast<Json::UInt>(XXH32(serialized.data(), serialized.size(), 0));
+
+    OpLogBatchRecord out;
+    std::string reason;
+    EXPECT_FALSE(DecodeOpLogBatchRecord(WriteJson(root), &out, &reason));
+    EXPECT_NE(std::string::npos, reason.find("base64"));
 }
 
 }  // namespace mooncake::test

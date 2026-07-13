@@ -13,7 +13,15 @@ namespace mooncake {
 class HaKvBackend;
 class OpLogApplier;
 
+enum class OpLogBatchStandbyPollDisposition {
+    OK,
+    RETRYABLE,
+    FATAL,
+};
+
 struct OpLogBatchStandbyPollResult {
+    OpLogBatchStandbyPollDisposition disposition{
+        OpLogBatchStandbyPollDisposition::OK};
     ErrorCode error{ErrorCode::OK};
     bool used_legacy_path{false};
     bool waiting_for_legacy_catch_up{false};

@@ -34,6 +34,9 @@ struct OpLogBatchRecord {
 bool ValidateOpLogBatchRecordShape(const OpLogBatchRecord& batch,
                                    std::string* reason = nullptr);
 
+bool ValidateOpLogBatchEntry(const OpLogEntry& entry,
+                             std::string* reason = nullptr);
+
 bool ValidateOpLogBatchClusterId(const std::string& cluster_id,
                                  std::string* reason = nullptr);
 

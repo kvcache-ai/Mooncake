@@ -38,8 +38,16 @@ bool ValidateOpLogBatchRecordShape(const OpLogBatchRecord& batch,
     if (reason != nullptr) {
         reason->clear();
     }
-    if (batch.schema_version == 0) {
-        SetReason(reason, "schema_version must be non-zero");
+    if (batch.schema_version != kOpLogBatchRecordSchemaVersion) {
+        SetReason(reason, "unsupported schema_version");
+        return false;
+    }
+    if (batch.batch_id == 0) {
+        SetReason(reason, "batch_id must be non-zero");
+        return false;
+    }
+    if (batch.first_seq == 0) {
+        SetReason(reason, "first_seq must be non-zero");
         return false;
     }
     if (batch.entries.empty()) {
@@ -54,14 +62,38 @@ bool ValidateOpLogBatchRecordShape(const OpLogBatchRecord& batch,
         SetReason(reason, "last_seq does not match last entry sequence");
         return false;
     }
+    if (batch.last_seq < batch.first_seq ||
+        batch.last_seq - batch.first_seq != batch.entries.size() - 1) {
+        SetReason(reason, "batch sequence range does not match entry count");
+        return false;
+    }
     for (size_t i = 0; i < batch.entries.size(); ++i) {
         const uint64_t expected = batch.first_seq + i;
         if (batch.entries[i].sequence_id != expected) {
             SetReason(reason, "entry sequences must be contiguous");
             return false;
         }
+        if (!ValidateOpLogBatchEntry(batch.entries[i], reason)) {
+            return false;
+        }
     }
     return true;
+}
+
+bool ValidateOpLogBatchEntry(const OpLogEntry& entry, std::string* reason) {
+    if (reason != nullptr) {
+        reason->clear();
+    }
+    const auto op_type = static_cast<uint32_t>(entry.op_type);
+    if (op_type == 0 || op_type >= static_cast<uint32_t>(OpType::OP_TYPE_MAX)) {
+        SetReason(reason, "op_type is outside the valid enum range");
+        return false;
+    }
+    if (!IsValidTenantId(entry.tenant_id)) {
+        SetReason(reason, "tenant_id is empty or invalid");
+        return false;
+    }
+    return OpLogManager::ValidateEntrySize(entry, reason);
 }
 
 bool ValidateOpLogBatchClusterId(const std::string& cluster_id,

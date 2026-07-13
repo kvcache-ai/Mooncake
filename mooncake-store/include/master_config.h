@@ -60,6 +60,7 @@ struct MasterConfig {
     std::string oplog_store_root_dir = "/tmp/mooncake_oplog";
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
+    uint32_t batch_oplog_retry_timeout_sec = 180;
 
     std::string cluster_id;
     std::string root_fs_dir;
@@ -193,6 +194,7 @@ class MasterServiceSupervisorConfig {
     std::string oplog_store_root_dir = "/tmp/mooncake_oplog";
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
+    uint32_t batch_oplog_retry_timeout_sec = 180;
     std::string local_hostname = "0.0.0.0:50051";
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
@@ -318,6 +320,7 @@ class MasterServiceSupervisorConfig {
         oplog_store_root_dir = config.oplog_store_root_dir;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
+        batch_oplog_retry_timeout_sec = config.batch_oplog_retry_timeout_sec;
         local_hostname = rpc_address + ":" + std::to_string(rpc_port);
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;

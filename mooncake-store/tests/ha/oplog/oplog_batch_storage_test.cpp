@@ -365,9 +365,7 @@ TEST(OpLogBatchStorageTest, ReadBatchRejectsCorruptedRecord) {
     FakeHaKvBackend backend;
     auto batch = MakeBatch(/*batch_id=*/1, /*first_seq=*/1, /*count=*/1);
     std::string encoded = EncodeOpLogBatchRecord(batch);
-    auto pos = encoded.find("\"checksum\"");
-    ASSERT_NE(std::string::npos, pos);
-    pos = encoded.find_first_of("0123456789", pos);
+    auto pos = encoded.find_first_of("0123456789", encoded.rfind(',') + 1);
     ASSERT_NE(std::string::npos, pos);
     encoded[pos] = encoded[pos] == '0' ? '1' : '0';
     ASSERT_EQ(

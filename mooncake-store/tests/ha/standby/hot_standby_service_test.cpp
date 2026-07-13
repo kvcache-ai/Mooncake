@@ -570,6 +570,11 @@ std::string MakeValidPayload(uint64_t client_id_first = 1,
 class FakeHaKvBackend : public HaKvBackend {
    public:
     ErrorCode Get(std::string_view key, std::string& value) override {
+        if (next_get_error_ != ErrorCode::OK) {
+            auto error = next_get_error_;
+            next_get_error_ = ErrorCode::OK;
+            return error;
+        }
         if (get_error_ != ErrorCode::OK) {
             return get_error_;
         }
@@ -602,11 +607,13 @@ class FakeHaKvBackend : public HaKvBackend {
     ErrorCode Txn(const KvTxn&) override { return ErrorCode::OK; }
     void SetGetError(ErrorCode err) { get_error_ = err; }
     void SetRangeError(ErrorCode err) { range_error_ = err; }
+    void FailNextGet(ErrorCode err) { next_get_error_ = err; }
 
    private:
     std::map<std::string, std::string> values_;
     ErrorCode get_error_{ErrorCode::OK};
     ErrorCode range_error_{ErrorCode::OK};
+    ErrorCode next_get_error_{ErrorCode::OK};
 };
 
 OpLogBatchRecord MakeBatch(uint64_t batch_id, uint64_t first_seq,
@@ -662,6 +669,103 @@ TEST_F(HotStandbyServiceTest,
 
     EXPECT_EQ(StandbyState::WATCHING, service->GetState());
     EXPECT_EQ(3u, service->GetLatestAppliedSequenceId());
+    service->Stop();
+}
+
+TEST_F(HotStandbyServiceTest, BatchRecordRetriesTransientBackendFailure) {
+    const std::string cluster_id = "batch-standby-transient-retry";
+    auto legacy_store = std::make_shared<MockOpLogStore>();
+    auto batch_backend = std::make_shared<FakeHaKvBackend>();
+    ASSERT_EQ(ErrorCode::OK,
+              batch_backend->Put(
+                  BuildDurablePrefixKey(cluster_id),
+                  EncodeDurablePrefix({.batch_id = 1, .last_seq = 1})));
+    ASSERT_EQ(ErrorCode::OK,
+              batch_backend->Put(BuildBatchRecordKey(cluster_id, 1),
+                                 EncodeOpLogBatchRecord(MakeBatch(1, 1, 1))));
+    batch_backend->FailNextGet(ErrorCode::ETCD_OPERATION_ERROR);
+
+    HotStandbyConfig config = config_;
+    config.oplog_store_type = OpLogStoreType::ETCD_BATCH_RECORD;
+    config.enable_snapshot_bootstrap = false;
+    config.oplog_poll_interval_ms = 1;
+    config.batch_oplog_retry_timeout_sec = 1;
+
+    auto service = std::make_unique<HotStandbyService>(config);
+    service->SetCatchUpOpLogStoreForTesting(legacy_store);
+    service->SetCatchUpBatchKvBackendForTesting(batch_backend);
+    ASSERT_EQ(ErrorCode::OK,
+              service->Start("primary_unused", "unused", cluster_id));
+
+    for (int i = 0;
+         i < 100 && (service->GetLatestAppliedSequenceId() < 1 ||
+                     service->GetSyncStatus().last_error != ErrorCode::OK);
+         ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    EXPECT_EQ(StandbyState::WATCHING, service->GetState());
+    EXPECT_EQ(1u, service->GetLatestAppliedSequenceId());
+    EXPECT_EQ(ErrorCode::OK, service->GetSyncStatus().last_error);
+    service->Stop();
+}
+
+TEST_F(HotStandbyServiceTest, BatchRecordRetryTimeoutTransitionsToFailed) {
+    auto legacy_store = std::make_shared<MockOpLogStore>();
+    auto batch_backend = std::make_shared<FakeHaKvBackend>();
+    batch_backend->SetGetError(ErrorCode::ETCD_OPERATION_ERROR);
+
+    HotStandbyConfig config = config_;
+    config.oplog_store_type = OpLogStoreType::ETCD_BATCH_RECORD;
+    config.enable_snapshot_bootstrap = false;
+    config.oplog_poll_interval_ms = 1;
+    config.batch_oplog_retry_timeout_sec = 0;
+
+    auto service = std::make_unique<HotStandbyService>(config);
+    service->SetCatchUpOpLogStoreForTesting(legacy_store);
+    service->SetCatchUpBatchKvBackendForTesting(batch_backend);
+    ASSERT_EQ(ErrorCode::OK, service->Start("primary_unused", "unused",
+                                            "batch-standby-timeout"));
+
+    for (int i = 0; i < 100 && service->GetState() != StandbyState::FAILED;
+         ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    EXPECT_EQ(StandbyState::FAILED, service->GetState());
+    EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR,
+              service->GetSyncStatus().last_error);
+    service->Stop();
+}
+
+TEST_F(HotStandbyServiceTest, BatchRecordCanRestartAfterRetryTimeout) {
+    auto legacy_store = std::make_shared<MockOpLogStore>();
+    auto batch_backend = std::make_shared<FakeHaKvBackend>();
+    batch_backend->SetGetError(ErrorCode::ETCD_OPERATION_ERROR);
+
+    HotStandbyConfig config = config_;
+    config.oplog_store_type = OpLogStoreType::ETCD_BATCH_RECORD;
+    config.enable_snapshot_bootstrap = false;
+    config.oplog_poll_interval_ms = 1;
+    config.batch_oplog_retry_timeout_sec = 0;
+
+    auto service = std::make_unique<HotStandbyService>(config);
+    service->SetCatchUpOpLogStoreForTesting(legacy_store);
+    service->SetCatchUpBatchKvBackendForTesting(batch_backend);
+    ASSERT_EQ(ErrorCode::OK, service->Start("primary_unused", "unused",
+                                            "batch-standby-restart"));
+    for (int i = 0; i < 100 && service->GetState() != StandbyState::FAILED;
+         ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    ASSERT_EQ(StandbyState::FAILED, service->GetState());
+
+    batch_backend->SetGetError(ErrorCode::OK);
+    ASSERT_EQ(ErrorCode::OK, service->Start("primary_unused", "unused",
+                                            "batch-standby-restart"));
+
+    EXPECT_EQ(StandbyState::WATCHING, service->GetState());
+    EXPECT_EQ(ErrorCode::OK, service->GetSyncStatus().last_error);
     service->Stop();
 }
 

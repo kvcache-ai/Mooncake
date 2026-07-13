@@ -175,6 +175,56 @@ TEST(OrderedOpLogWriterAdmissionTest, CommitAssignsContiguousSequences) {
 }
 
 TEST(OrderedOpLogWriterAdmissionTest,
+     InvalidEntryDoesNotConsumeSequenceOrInvokeCallback) {
+    FakeBatchWriter storage;
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{.max_entries_per_batch = 2},
+        [&](const OpLogBatchRecord& batch,
+            const DurablePrefix& expected_prefix) {
+            return storage.Write(batch, expected_prefix);
+        });
+
+    auto invalid_reservation = writer.Reserve();
+    ASSERT_TRUE(invalid_reservation.has_value());
+    auto invalid = MakeEntry("bad");
+    invalid.tenant_id.clear();
+    bool callback_called = false;
+    auto rejected =
+        writer.Commit(std::move(*invalid_reservation), std::move(invalid),
+                      [&](const OpLogEntry&) { callback_called = true; });
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, rejected.error());
+    EXPECT_FALSE(callback_called);
+
+    auto valid_reservation = writer.Reserve();
+    ASSERT_TRUE(valid_reservation.has_value());
+    auto accepted = writer.Commit(std::move(*valid_reservation), MakeEntry(),
+                                  [](const OpLogEntry&) {});
+    ASSERT_TRUE(accepted.has_value());
+    EXPECT_EQ(1u, accepted->sequence_id());
+}
+
+TEST(OrderedOpLogWriterAdmissionTest, RejectsOpTypeOutsideEnumRange) {
+    FakeBatchWriter storage;
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{.max_entries_per_batch = 1},
+        [&](const OpLogBatchRecord& batch,
+            const DurablePrefix& expected_prefix) {
+            return storage.Write(batch, expected_prefix);
+        });
+
+    auto reservation = writer.Reserve();
+    ASSERT_TRUE(reservation.has_value());
+    auto invalid = MakeEntry();
+    invalid.op_type = static_cast<OpType>(255);
+    auto rejected = writer.Commit(std::move(*reservation), std::move(invalid),
+                                  [](const OpLogEntry&) {});
+
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, rejected.error());
+}
+
+TEST(OrderedOpLogWriterAdmissionTest,
      ReserveFailsWhenOpenWaitingSlotsReachMax) {
     FakeBatchWriter storage;
     OrderedOpLogWriter writer(

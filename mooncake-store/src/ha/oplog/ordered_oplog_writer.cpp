@@ -141,8 +141,18 @@ OrderedOpLogWriter::Commit(Reservation&& reservation, OpLogEntry entry,
         reservation.id_ = 0;
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
+    std::string reason;
+    if (!ValidateOpLogBatchEntry(entry, &reason)) {
+        --impl_->open_waiting_slots;
+        reservation.writer_ = nullptr;
+        reservation.id_ = 0;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     reservation.writer_ = nullptr;
     reservation.id_ = 0;
+    entry.timestamp_ms = 0;
+    entry.checksum = OpLogManager::ComputeChecksum(entry.payload);
+    entry.prefix_hash = 0;
     entry.sequence_id = impl_->next_sequence_id++;
     const uint64_t sequence_id = entry.sequence_id;
     impl_->committed_entries.push_back(

@@ -7,6 +7,22 @@
 
 namespace mooncake {
 
+namespace {
+
+bool IsRetryableBackendError(ErrorCode error) {
+    return error == ErrorCode::ETCD_OPERATION_ERROR ||
+           error == ErrorCode::ETCD_CTX_CANCELLED;
+}
+
+void SetPollError(OpLogBatchStandbyPollResult& result, ErrorCode error,
+                  bool retryable) {
+    result.error = error;
+    result.disposition = retryable ? OpLogBatchStandbyPollDisposition::RETRYABLE
+                                   : OpLogBatchStandbyPollDisposition::FATAL;
+}
+
+}  // namespace
+
 OpLogBatchStandbyReader::OpLogBatchStandbyReader(std::string cluster_id,
                                                  HaKvBackend& backend,
                                                  OpLogApplier& applier)
@@ -19,14 +35,14 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
     ErrorCode err = storage_.ReadDurablePrefix(prefix);
     if (err == ErrorCode::ETCD_KEY_NOT_EXIST) {
         if (batch_format_seen_) {
-            result.error = ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+            SetPollError(result, ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, false);
             return result;
         }
         result.used_legacy_path = true;
         return result;
     }
     if (err != ErrorCode::OK) {
-        result.error = err;
+        SetPollError(result, err, IsRetryableBackendError(err));
         return result;
     }
     batch_format_seen_ = true;
@@ -39,7 +55,7 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
           prefix.last_seq != last_observed_prefix_->last_seq) ||
          (prefix.batch_id > last_observed_prefix_->batch_id &&
           prefix.last_seq == last_observed_prefix_->last_seq))) {
-        result.error = ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+        SetPollError(result, ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, false);
         return result;
     }
 
@@ -55,8 +71,12 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
 
     OpLogBatchRecord target_batch;
     err = storage_.ReadBatch(prefix.batch_id, target_batch);
-    if (err != ErrorCode::OK || target_batch.last_seq != prefix.last_seq) {
-        result.error = ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+    if (err != ErrorCode::OK) {
+        SetPollError(result, err, IsRetryableBackendError(err));
+        return result;
+    }
+    if (target_batch.last_seq != prefix.last_seq) {
+        SetPollError(result, ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, false);
         return result;
     }
     last_observed_prefix_ = prefix;
@@ -68,20 +88,20 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
     err =
         storage_.ReadBatchesAfter(last_applied_batch_id_, max_batches, batches);
     if (err != ErrorCode::OK) {
-        result.error = err;
+        SetPollError(result, err, IsRetryableBackendError(err));
         return result;
     }
     for (const auto& batch : batches) {
         if (last_scanned_batch_last_seq_ &&
             (last_applied_batch_id_ == UINT64_MAX ||
              batch.batch_id != last_applied_batch_id_ + 1)) {
-            result.error = ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+            SetPollError(result, ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, false);
             return result;
         }
         if (last_scanned_batch_last_seq_ &&
             (*last_scanned_batch_last_seq_ == UINT64_MAX ||
              batch.first_seq != *last_scanned_batch_last_seq_ + 1)) {
-            result.error = ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+            SetPollError(result, ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, false);
             return result;
         }
         for (const auto& entry : batch.entries) {
@@ -99,11 +119,13 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
                     result.legacy_catch_up_target = entry.sequence_id - 1;
                     return result;
                 }
-                result.error = ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+                SetPollError(result, ErrorCode::INCOMPLETE_OPLOG_CATCH_UP,
+                             false);
                 return result;
             }
             if (!applier_.ApplyOpLogEntry(entry)) {
-                result.error = ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+                SetPollError(result, ErrorCode::INCOMPLETE_OPLOG_CATCH_UP,
+                             false);
                 return result;
             }
             ++result.applied_entries;
@@ -120,7 +142,7 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
     if (!has_more_pages &&
         IsSequenceOlderOrEqual(applier_.GetExpectedSequenceId(),
                                prefix.last_seq)) {
-        result.error = ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+        SetPollError(result, ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, false);
     }
     return result;
 }

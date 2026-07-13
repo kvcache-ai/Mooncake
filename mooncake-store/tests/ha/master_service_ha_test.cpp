@@ -431,6 +431,10 @@ class MasterServiceHATest : public ::testing::Test {
         return service.oplog_manager_.GetLastSequenceId();
     }
 
+    static bool SnapshotWorkerJoinableForTesting(const MasterService& service) {
+        return service.snapshot_thread_.joinable();
+    }
+
     static tl::expected<uint64_t, ErrorCode> AppendVisibleForTesting(
         MasterService& service, OpType type, const std::string& tenant_id,
         const std::string& key, const std::string& payload) {
@@ -519,6 +523,37 @@ class MasterServiceHATest : public ::testing::Test {
 };
 
 class MasterServiceBatchRecordE2ETest : public MasterServiceHATest {};
+
+TEST_F(MasterServiceHATest, BatchPrimaryDoesNotStartSnapshotWorker) {
+    auto config =
+        MasterServiceConfig::builder()
+            .set_enable_ha(true)
+            .set_cluster_id("batch_snapshot_gate")
+            .set_oplog_store_type("etcd_batch_record")
+            .set_enable_snapshot(true)
+            .set_snapshot_backup_dir(LegacyOpLogRootDir() + "/batch_snapshot")
+            .set_snapshot_object_store_type("local")
+            .build();
+
+    MasterService service(config);
+    EXPECT_FALSE(SnapshotWorkerJoinableForTesting(service));
+}
+
+TEST_F(MasterServiceHATest, LegacyPrimaryStillStartsSnapshotWorker) {
+    auto config =
+        MasterServiceConfig::builder()
+            .set_enable_ha(true)
+            .set_cluster_id("legacy_snapshot_gate")
+            .set_oplog_store_type("local_fs")
+            .set_oplog_store_root_dir(LegacyOpLogRootDir())
+            .set_enable_snapshot(true)
+            .set_snapshot_backup_dir(LegacyOpLogRootDir() + "/legacy_snapshot")
+            .set_snapshot_object_store_type("local")
+            .build();
+
+    MasterService service(config);
+    EXPECT_TRUE(SnapshotWorkerJoinableForTesting(service));
+}
 
 TEST_F(MasterServiceBatchRecordE2ETest,
        BatchRecordConstructorThrowsWhenProductionWriterInitFails) {
@@ -767,6 +802,31 @@ TEST_F(MasterServiceHATest, BatchRecordSubmissionHelpersUseOrderedWriter) {
     ASSERT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(prefix));
     EXPECT_EQ(2u, prefix.batch_id);
     EXPECT_EQ(2u, prefix.last_seq);
+}
+
+TEST_F(MasterServiceHATest,
+       BatchRecordWriterResolvesEmptyTenantWhenMultiTenantDisabled) {
+    const std::string cluster_id = "test_batch_record_default_tenant";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_store_type("etcd_batch_record")
+                              .set_oplog_batch_max_entries(1)
+                              .set_enable_multi_tenants(false)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    auto appended = AppendFinalizeForTesting(service, OpType::REMOVE, "",
+                                             "default_tenant_key", {}, nullptr);
+    ASSERT_TRUE(appended.has_value());
+
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+    ASSERT_EQ(1u, batch.entries.size());
+    EXPECT_EQ("default", batch.entries[0].tenant_id);
 }
 
 TEST_F(MasterServiceBatchRecordE2ETest,
