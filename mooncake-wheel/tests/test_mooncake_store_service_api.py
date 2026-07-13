@@ -249,6 +249,30 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.service.current_mode, "decode")
 
     async def test_reconfigure_decode_mount_failure_rolls_back_to_prefill(self):
+        # Fresh prefill -> decode mount that fails: there are no previously
+        # serving segments to preserve, so the node still rolls back to prefill.
+        self.service.current_mode = "prefill"
+        self.service.mounted_segment_ids = []
+        self.service.last_mount_info = {}
+        self.fake_store.fail_mount = True
+
+        resp = await self.service.handle_reconfigure(
+            FakeRequest({"mode": "decode", "path": "/dev/shm/new", "size": 4096})
+        )
+
+        self.assertEqual(resp.status, 500)
+        body = json.loads(resp.text)
+        self.assertEqual(body["mode"], "prefill")
+        self.assertIn("rolled back to prefill", body["error"])
+        self.assertEqual(self.fake_store.unmount_calls, [])
+        self.assertEqual(self.service.mounted_segment_ids, [])
+        self.assertEqual(self.service.current_mode, "prefill")
+        self.assertEqual(self.service.last_mount_info, {})
+
+    async def test_reconfigure_decode_remount_failure_keeps_previous_segments(self):
+        # A remount to a DIFFERENT path that fails to mount must not destroy the
+        # still-healthy previous segments: the node keeps serving from them and
+        # stays in decode mode (make-before-break).
         old_id = "00000000-0000-0000-0000-000000000001"
         self.service.current_mode = "decode"
         self.service.mounted_segment_ids = [old_id]
@@ -267,12 +291,87 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(resp.status, 500)
         body = json.loads(resp.text)
+        self.assertEqual(body["mode"], "decode")
+        self.assertIn("keeping previous decode segments", body["error"])
+        # Nothing was unmounted, capacity preserved, mode unchanged.
+        self.assertEqual(self.fake_store.unmount_calls, [])
+        self.assertEqual(self.service.mounted_segment_ids, [old_id])
+        self.assertEqual(self.service.current_mode, "decode")
+        # last_mount_info still points at the previous (working) path so a
+        # subsequent same-path detection keeps working.
+        self.assertEqual(self.service.last_mount_info["path"], "/dev/shm/old")
+
+    async def test_reconfigure_decode_same_path_remount_falls_back_to_prefill(self):
+        # Remounting the SAME path stays destroy-first (to avoid a
+        # SEGMENT_ALREADY_EXISTS collision): the old segment is unmounted first,
+        # so a subsequent mount failure has nothing to fall back to and the node
+        # rolls back to prefill exactly as before.
+        old_id = "00000000-0000-0000-0000-000000000001"
+        self.service.current_mode = "decode"
+        self.service.mounted_segment_ids = [old_id]
+        self.service.last_mount_info = {
+            "path": "/dev/shm/same",
+            "offset": 0,
+            "size": 4096,
+            "protocol": "tcp",
+            "location": "",
+        }
+        self.fake_store.fail_mount = True
+
+        resp = await self.service.handle_reconfigure(
+            FakeRequest({"mode": "decode", "path": "/dev/shm/same", "size": 4096})
+        )
+
+        self.assertEqual(resp.status, 500)
+        body = json.loads(resp.text)
         self.assertEqual(body["mode"], "prefill")
         self.assertIn("rolled back to prefill", body["error"])
         self.assertEqual(self.fake_store.unmount_calls, [([old_id], 0)])
         self.assertEqual(self.service.mounted_segment_ids, [])
         self.assertEqual(self.service.current_mode, "prefill")
-        self.assertEqual(self.service.last_mount_info, {})
+
+    async def test_reconfigure_decode_remount_success_is_make_before_break(self):
+        # A successful remount to a DIFFERENT path must mount the new segment
+        # BEFORE retiring the old one (make-before-break), then leave only the
+        # new segment serving. Distinct ids let old and new be told apart.
+        old_id = "00000000-0000-0000-0000-000000000001"
+        new_id = "00000000-0000-0000-0000-000000000002"
+        self.service.current_mode = "decode"
+        self.service.mounted_segment_ids = [old_id]
+        self.service.last_mount_info = {
+            "path": "/dev/shm/old",
+            "offset": 0,
+            "size": 4096,
+            "protocol": "tcp",
+            "location": "",
+        }
+
+        order = {"old_still_mounted_at_new_mount": None}
+
+        def mount_new(path, size, offset, protocol, location):
+            # The old segment must still be serving when the new one is mounted.
+            order["old_still_mounted_at_new_mount"] = (
+                old_id in self.service.mounted_segment_ids
+            )
+            return {"ret": 0, "segment_ids": [new_id]}
+
+        self.fake_store.mount_segment = mount_new
+
+        resp = await self.service.handle_reconfigure(
+            FakeRequest({"mode": "decode", "path": "/dev/shm/new", "size": 8192})
+        )
+
+        self.assertEqual(resp.status, 200)
+        body = json.loads(resp.text)
+        self.assertEqual(body["mode"], "decode")
+        # Make-before-break: the old segment was still mounted when the new one
+        # was created, and it is retired only after the new mount succeeds.
+        self.assertTrue(order["old_still_mounted_at_new_mount"])
+        self.assertEqual(self.fake_store.unmount_calls, [([old_id], 0)])
+        # Only the new segment is left serving; the old one is gone.
+        self.assertEqual(self.service.mounted_segment_ids, [new_id])
+        self.assertEqual(self.service.current_mode, "decode")
+        self.assertEqual(self.service.last_mount_info["path"], "/dev/shm/new")
 
     async def test_mount_allocates_and_frees_on_unmount(self):
         mount_resp = await self.service.handle_mount(

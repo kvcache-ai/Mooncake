@@ -231,12 +231,26 @@ class MooncakeStoreService:
                     )
 
                 async with self._state_lock:
-                    # If already in decode mode with mounted segments, unmount them first
-                    if self.mounted_segment_ids:
+                    # Make-before-break remount: capture the currently serving
+                    # segments so a failed remount can keep them alive instead of
+                    # dropping all capacity.
+                    previous_segment_ids = list(self.mounted_segment_ids)
+                    previous_path = self.last_mount_info.get("path")
+                    # Remounting the *same* path before unmounting would collide
+                    # (SEGMENT_ALREADY_EXISTS), so the same-path case must stay
+                    # destroy-first; a distinct path can mount-then-destroy.
+                    same_segment = (
+                        bool(previous_segment_ids)
+                        and previous_path is not None
+                        and path == previous_path
+                    )
+
+                    if same_segment:
                         logging.info(
-                            "Reconfigure decode: unmounting previous segments before remount"
+                            "Reconfigure decode: unmounting previous segments "
+                            "before same-path remount"
                         )
-                        ret = self.store.unmount_segment(self.mounted_segment_ids)
+                        ret = self.store.unmount_segment(previous_segment_ids)
                         if ret != 0:
                             return web.Response(
                                 status=500,
@@ -248,11 +262,35 @@ class MooncakeStoreService:
                                 content_type="application/json",
                             )
                         self.mounted_segment_ids.clear()
+                        previous_segment_ids = []
 
                     result = self.store.mount_segment(
                         path, size, offset, protocol, location
                     )
                     if result["ret"] != 0:
+                        if previous_segment_ids:
+                            # New mount failed but the previous segments are still
+                            # healthy; keep serving from them instead of demoting.
+                            logging.warning(
+                                "Reconfigure decode: mount of %s failed (ret=%s); "
+                                "keeping previous decode segments",
+                                path,
+                                result["ret"],
+                            )
+                            return web.Response(
+                                status=500,
+                                text=json.dumps(
+                                    {
+                                        "error": (
+                                            f"Mount failed, ret={result['ret']}; "
+                                            "keeping previous decode segments"
+                                        ),
+                                        "mode": self.current_mode,
+                                    }
+                                ),
+                                content_type="application/json",
+                            )
+                        # Nothing healthy to fall back to; roll back to prefill.
                         self.current_mode = "prefill"
                         self.mounted_segment_ids.clear()
                         self.last_mount_info.clear()
@@ -269,6 +307,19 @@ class MooncakeStoreService:
                             ),
                             content_type="application/json",
                         )
+
+                    # New mount succeeded; retire any previously serving segments.
+                    if previous_segment_ids:
+                        ret = self.store.unmount_segment(previous_segment_ids)
+                        if ret != 0:
+                            # The new segment is already live, so a failed cleanup
+                            # only leaks the old ids; warn but keep the new capacity.
+                            logging.warning(
+                                "Reconfigure decode: new mount succeeded but unmount of "
+                                "previous segments %s failed (ret=%s); leaking them",
+                                previous_segment_ids,
+                                ret,
+                            )
 
                     self.mounted_segment_ids = list(result["segment_ids"])
                     self.current_mode = "decode"
