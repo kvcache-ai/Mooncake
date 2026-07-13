@@ -83,6 +83,11 @@ struct RpcNameTraits<&WrappedMasterService::BatchPutEnd> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::BatchPutEndWithEventInfo> {
+    static constexpr const char* value = "BatchPutEndWithEventInfo";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::PutRevoke> {
     static constexpr const char* value = "PutRevoke";
 };
@@ -618,6 +623,21 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutEnd(
 
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutEnd, void>(
         keys.size(), client_id_, keys, replica_type, tenant_id_);
+    timer.LogResponse("result=", result.size(), " operations");
+    return result;
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+MasterClient::BatchPutEndWithEventInfo(
+    const std::vector<std::string>& keys,
+    const std::vector<StoreEventInfo>& store_event_infos,
+    ReplicaType replica_type) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchPutEndWithEventInfo");
+    timer.LogRequest("keys_count=", keys.size());
+    auto result =
+        invoke_batch_rpc<&WrappedMasterService::BatchPutEndWithEventInfo, void>(
+            keys.size(), client_id_, keys, store_event_infos, replica_type,
+            tenant_id_);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }

@@ -4222,7 +4222,9 @@ RealClient::batch_put_from_multi_buffers_dummy_helper(
     const std::vector<std::string> &keys,
     const std::vector<std::vector<uint64_t>> &dummy_all_buffers,
     const std::vector<std::vector<size_t>> &all_sizes,
-    const ReplicateConfig &config, int32_t device_id, const UUID &client_id) {
+    const ReplicateConfig &config,
+    const std::vector<StoreEventInfo> &store_event_infos, int32_t device_id,
+    const UUID &client_id) {
 #ifdef USE_ASCEND_DIRECT
     if (!ContextManager::getInstance().setCurrentContextByPhysicalId(
             device_id)) {
@@ -4249,7 +4251,8 @@ RealClient::batch_put_from_multi_buffers_dummy_helper(
     }
 
     return batch_put_from_multi_buffers_internal(
-        keys, real_buffers_result.value(), all_sizes, config);
+        keys, real_buffers_result.value(), all_sizes, config,
+        store_event_infos);
 }
 
 std::vector<tl::expected<int64_t, ErrorCode>>
@@ -4741,12 +4744,13 @@ std::vector<int> RealClient::batch_put_from_multi_buffers(
     const std::vector<std::string> &keys,
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &sizes,
-    const ReplicateConfig &config) {
+    const ReplicateConfig &config,
+    const std::vector<StoreEventInfo> &store_event_infos) {
     auto internal_results =
         execute_timed_operation<std::vector<tl::expected<void, ErrorCode>>>(
             [&]() {
-                return batch_put_from_multi_buffers_internal(keys, all_buffers,
-                                                             sizes, config);
+                return batch_put_from_multi_buffers_internal(
+                    keys, all_buffers, sizes, config, store_event_infos);
             },
             [](const auto &) { return true; },
             [&](uint64_t latency_us, const auto &ret) {
@@ -4775,7 +4779,8 @@ RealClient::batch_put_from_multi_buffers_internal(
     const std::vector<std::string> &keys,
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &all_sizes,
-    const ReplicateConfig &config) {
+    const ReplicateConfig &config,
+    const std::vector<StoreEventInfo> &store_event_infos) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return std::vector<tl::expected<void, ErrorCode>>(
@@ -4785,6 +4790,11 @@ RealClient::batch_put_from_multi_buffers_internal(
     if ((keys.size() != all_buffers.size()) ||
         (all_buffers.size() != all_sizes.size())) {
         LOG(ERROR) << "Mismatched sizes for keys, buffers, and sizes";
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    if (!store_event_infos.empty() && store_event_infos.size() != keys.size()) {
+        LOG(ERROR) << "store_event_infos size must match keys size";
         return std::vector<tl::expected<void, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
@@ -4804,7 +4814,7 @@ RealClient::batch_put_from_multi_buffers_internal(
         }
     }
     // Call client BatchPut and return the vector<expected> directly
-    return client_->BatchPut(keys, batched_slices, config);
+    return client_->BatchPut(keys, batched_slices, config, store_event_infos);
 }
 
 std::vector<int> RealClient::batch_get_into_multi_buffers(

@@ -372,13 +372,17 @@ vLLM/SGLang: empty topic, big-endian sequence number, and a msgpack payload
 **Per-block events, not global metadata.** Per the
 [Dynamo KV Events for Custom Engines](https://docs.nvidia.com/dynamo/kv-managers/kv-events-for-custom-engines)
 model, each event describes one or more **KV cache blocks** (`seq_hashes`,
-`token_ids`, `parent_hash`, eviction hashes). The master emits **one event per
-Mooncake object key** on `PutEnd` / `Remove` / eviction — each key is treated as
-one pooled block. Block identity comes from the object key (`seq_hashes` when
-the key is decimal/`0x` u64, else `object_key`) and per-object `tenant_id` /
-`medium`. The master does **not** stamp process-wide `model_name`, `block_size`,
-`lora_name`, or `dp_rank` on events; register those dimensions with the indexer
-via `POST /register` (same as decoupled SGLang + storage pool deployments).
+`token_ids`, `parent_hash`, eviction hashes). The master emits one event per
+Mooncake object key and available medium; each key is treated as one pooled
+block. Block identity comes from optional per-Put `StoreEventInfo`, or from the
+object key (`seq_hashes` when the key is decimal/`0x` u64, else `object_key`).
+The master always supplies per-object `tenant_id` and `medium`. It leaves
+`additional_salt`, `lora_name`, and `dp_rank` unset; register those dimensions
+with the indexer when required.
+
+An Upsert of an existing object is represented as `removed` when the old value
+becomes unreadable, followed by `stored` for every completed medium after the
+new value commits. There is no separate update event type.
 
 Publisher-level config is limited to transport and stream identity:
 `kv_events_bind_endpoint`, `kv_events_backend_id`, and optional compat flags
@@ -401,6 +405,9 @@ hex string; when `seq_hash` cannot be parsed, events are still published if
 `backend_id` to identify the cache owner (for example a per-node storage
 daemon) and register the bind endpoint with the indexer using publisher type
 `Mooncake`.
+
+See the [KV Event publisher design](../kv-event/index) for publication points,
+medium transition rules, and the Python `StoreEventInfo` API.
 
 ### Field provenance matrix (SGLang vs master vs indexer registration)
 
@@ -425,8 +432,8 @@ splitting publishers or writing PR/integration notes.
 | `event_id` | Yes | Yes | — | Each publisher maintains its own monotonic counter per stream. |
 | `timestamp` | Yes | Yes | — | Informational only; not used for ordering. |
 | `event_type` | Yes | Yes | — | `stored` / `removed` / `cleared`. |
-| `model_name` | S+M | — | S+M | Register uses `modelname`. Engine events carry per-block context; master omits (nil). |
-| `block_size` | Yes | — | Yes | Required for token↔block mapping. Register supplies for master publisher. |
+| `model_name` | S+M | Conditional | S+M | Master receives optional per-block context through `StoreEventInfo`; otherwise nil. |
+| `block_size` | Yes | Conditional | Yes | Master receives optional per-block context through `StoreEventInfo`; otherwise nil. |
 | `additional_salt` | Yes | — | S+M | Register uses `additionalsalt`. Engine per-block; master omits (nil). |
 | `lora_name` | Yes | — | S+M | Per-block on engine events; master has no adapter context. |
 | `tenant_id` | S+M | Yes | Yes | Per-object on master events. Register default `default`. |
@@ -441,11 +448,11 @@ splitting publishers or writing PR/integration notes.
 | `seq_hashes` | Yes | Conditional | — | **Required from SGLang** for correct prefix index. Master: single hash when key is decimal/`0x` u64; empty array when only `object_key` is used. |
 | `object_key` | — | Yes | — | Mooncake store key (`kv_events_emit_object_key`, default on). Used by Dynamo for sha256+key matching. |
 | `block_hashes` (legacy) | Yes | Conditional | — | Alias of `seq_hashes` when `kv_events_emit_legacy_compat` is enabled on master. |
-| `parent_hash` | Yes | — | — | Radix parent link; master has no sequence tree. |
-| `parent_block_hash` (legacy) | Yes | — | — | Same as `parent_hash`. |
+| `parent_hash` | Yes | Conditional | — | Master parses optional `StoreEventInfo.parent_block_hash` as a u64. |
+| `parent_block_hash` (legacy) | Yes | Conditional | — | Legacy alias of `parent_hash` when compatibility fields are enabled. |
 | `base_block_idx` | Yes | Partial | — | Depth of first block in batch; master uses `0` for standalone pool blocks. |
-| `token_ids` | Yes | — | — | Required for `/query` by tokens or hash recomputation when engine is non-standard. |
-| `block_size` (in-event) | Yes | — | — | Per-block token count in SGLang `BlockStored`; master uses envelope-level config only. |
+| `token_ids` | Yes | Conditional | — | Master includes optional token IDs only on the original committed `stored` event; it does not retain them for later medium transitions. |
+| `block_size` (in-event) | Yes | Conditional | — | Same optional per-block value carried in the event envelope. |
 
 #### `removed` payload
 
@@ -459,7 +466,7 @@ splitting publishers or writing PR/integration notes.
 | Field | SGLang | Master | Register | Notes |
 |---|---|---|---|---|
 | (no extra fields) | — | — | — | Event is envelope-only. |
-| `cleared` / `AllBlocksCleared` | Yes | — | — | Engine `reset()` / full cache flush. Master does not emit today. |
+| `cleared` / `AllBlocksCleared` | Yes | Yes | — | Master emits a tenant-scoped event after `RemoveAll` leaves that tenant empty. |
 
 #### Indexer / router plane (not in KV event JSON)
 

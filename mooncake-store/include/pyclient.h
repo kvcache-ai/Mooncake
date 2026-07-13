@@ -289,7 +289,8 @@ class PyClient {
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
-        const ReplicateConfig &config = ReplicateConfig{}) = 0;
+        const ReplicateConfig &config = ReplicateConfig{},
+        const std::vector<StoreEventInfo> &store_event_infos = {}) = 0;
 
     virtual std::shared_ptr<BufferHandle> get_buffer(
         const std::string &key) = 0;

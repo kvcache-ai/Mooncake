@@ -1151,14 +1151,16 @@ std::vector<int> DummyClient::batch_put_from_multi_buffers(
     const std::vector<std::string>& keys,
     const std::vector<std::vector<void*>>& all_buffer_ptrs,
     const std::vector<std::vector<size_t>>& all_sizes,
-    const ReplicateConfig& config) {
+    const ReplicateConfig& config,
+    const std::vector<StoreEventInfo>& store_event_infos) {
     std::vector<std::vector<uint64_t>> dummy_nested =
         void_ptr_rows_to_u64_nested(all_buffer_ptrs);
     const auto start_time = std::chrono::steady_clock::now();
     auto internal_results =
         invoke_batch_rpc<&RealClient::batch_put_from_multi_buffers_dummy_helper,
                          void>(keys.size(), keys, dummy_nested, all_sizes,
-                               config, device_id_, client_id_);
+                               config, store_event_infos, device_id_,
+                               client_id_);
     std::vector<int> results;
     results.reserve(internal_results.size());
     for (const auto& result : internal_results) {

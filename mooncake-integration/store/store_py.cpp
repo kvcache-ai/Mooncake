@@ -1848,6 +1848,31 @@ PYBIND11_MODULE(store, m) {
             return oss.str();
         });
 
+    py::class_<StoreEventInfo>(m, "StoreEventInfo")
+        .def(py::init([](std::string model_name, uint32_t block_size,
+                         std::string block_hash, std::string parent_block_hash,
+                         std::vector<uint32_t> token_ids) {
+                 return StoreEventInfo{
+                     std::move(model_name), block_size, std::move(block_hash),
+                     std::move(parent_block_hash), std::move(token_ids)};
+             }),
+             py::arg("model_name") = "", py::arg("block_size") = 0,
+             py::arg("block_hash") = "", py::arg("parent_block_hash") = "",
+             py::arg("token_ids") = std::vector<uint32_t>{})
+        .def_readwrite("model_name", &StoreEventInfo::model_name)
+        .def_readwrite("block_size", &StoreEventInfo::block_size)
+        .def_readwrite("block_hash", &StoreEventInfo::block_hash)
+        .def_readwrite("parent_block_hash", &StoreEventInfo::parent_block_hash)
+        .def_readwrite("token_ids", &StoreEventInfo::token_ids)
+        .def("__repr__", [](const StoreEventInfo &info) {
+            return "StoreEventInfo(model_name='" + info.model_name +
+                   "', block_size=" + std::to_string(info.block_size) +
+                   ", block_hash='" + info.block_hash +
+                   "', parent_block_hash='" + info.parent_block_hash +
+                   "', token_count=" + std::to_string(info.token_ids.size()) +
+                   ")";
+        });
+
     py::enum_<ReplicaStatus>(m, "ReplicaStatus")
         .value("UNDEFINED", ReplicaStatus::UNDEFINED)
         .value("INITIALIZED", ReplicaStatus::INITIALIZED)
@@ -2885,17 +2910,20 @@ PYBIND11_MODULE(store, m) {
                const std::vector<std::string> &keys,
                const std::vector<std::vector<uintptr_t>> &all_buffer_ptrs,
                const std::vector<std::vector<size_t>> &all_sizes,
-               const ReplicateConfig &config = ReplicateConfig{}) {
+               const ReplicateConfig &config = ReplicateConfig{},
+               const std::vector<StoreEventInfo> &store_event_infos = {}) {
                 if (!self.is_client_initialized()) {
                     LOG(ERROR) << "Client is not initialized";
                     return std::vector<int>{};
                 }
                 py::gil_scoped_release release;
                 return self.store_->batch_put_from_multi_buffers(
-                    keys, CastAddrs2Ptrs(all_buffer_ptrs), all_sizes, config);
+                    keys, CastAddrs2Ptrs(all_buffer_ptrs), all_sizes, config,
+                    store_event_infos);
             },
             py::arg("keys"), py::arg("all_buffer_ptrs"), py::arg("all_sizes"),
             py::arg("config") = ReplicateConfig{},
+            py::arg("store_event_infos") = std::vector<StoreEventInfo>{},
             "Put object data directly from multiple pre-allocated buffers for "
             "multiple "
             "keys")

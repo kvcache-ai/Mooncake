@@ -1,8 +1,10 @@
 #pragma once
 
+#include <charconv>
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace mooncake {
 
@@ -12,25 +14,24 @@ inline std::optional<uint64_t> ParseSeqHashFromObjectKey(
     if (object_key.empty()) {
         return std::nullopt;
     }
-    try {
-        size_t idx = 0;
-        if (object_key.size() >= 2 &&
-            (object_key[0] == '0' &&
-             (object_key[1] == 'x' || object_key[1] == 'X'))) {
-            uint64_t value = std::stoull(object_key, &idx, 16);
-            if (idx == object_key.size()) {
-                return value;
-            }
-            return std::nullopt;
-        }
-        uint64_t value = std::stoull(object_key, &idx, 10);
-        if (idx == object_key.size()) {
-            return value;
-        }
-    } catch (const std::exception&) {
+    std::string_view encoded = object_key;
+    int base = 10;
+    if (encoded.size() >= 2 && encoded[0] == '0' &&
+        (encoded[1] == 'x' || encoded[1] == 'X')) {
+        encoded.remove_prefix(2);
+        base = 16;
+    }
+    if (encoded.empty()) {
         return std::nullopt;
     }
-    return std::nullopt;
+
+    uint64_t value = 0;
+    const auto [end, error] = std::from_chars(
+        encoded.data(), encoded.data() + encoded.size(), value, base);
+    if (error != std::errc{} || end != encoded.data() + encoded.size()) {
+        return std::nullopt;
+    }
+    return value;
 }
 
 }  // namespace mooncake
