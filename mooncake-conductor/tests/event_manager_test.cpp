@@ -4,20 +4,28 @@
 
 #include <gtest/gtest.h>
 #include <asio.hpp>
+#include <json/json.h>
+#include <ylt/coro_http/coro_http_client.hpp>
 #include <ylt/coro_http/coro_http_server.hpp>
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstdio>
 #include <fstream>
+#include <limits>
+#include <map>
 #include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "conductor/common/types.h"
 #include "conductor/kvevent/config.h"
 #include "conductor/kvevent/event_manager.h"
 #include "event_manager_test_peer.h"
+#include "prefix_indexer_test_peer.h"
 
 namespace conductor {
 namespace kvevent {
@@ -37,6 +45,8 @@ using conductor::kvevent::EventManagerTestPeer;
 using conductor::kvevent::KVEventHandler;
 using conductor::kvevent::KVEventHandlerTestPeer;
 using conductor::kvevent::MakeServiceKey;
+using conductor::prefixindex::ModelContext;
+using conductor::prefixindex::PrefixCacheTableTestPeer;
 using conductor::zmq::BlockStoredEvent;
 
 ServiceConfig VllmService(const std::string& instance_id = "instance-1",
@@ -51,6 +61,43 @@ ServiceConfig VllmService(const std::string& instance_id = "instance-1",
     svc.dp_rank = dp_rank;
     svc.block_size = 16;
     return svc;
+}
+
+struct HttpResponse {
+    int status = 0;
+    std::string body;
+    std::map<std::string, std::string> headers;
+};
+
+std::string LowerAscii(std::string_view value) {
+    std::string out(value);
+    std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return out;
+}
+
+HttpResponse HttpPostJson(uint16_t port, const std::string& path,
+                          const std::string& body) {
+    coro_http::coro_http_client client;
+    const std::string url = "http://127.0.0.1:" + std::to_string(port) + path;
+    auto result = client.post(url, body, coro_http::req_content_type::json);
+
+    HttpResponse response;
+    response.status = result.status;
+    response.body = std::string(result.resp_body);
+    for (const auto& header : result.resp_headers) {
+        response.headers[LowerAscii(header.name)] = std::string(header.value);
+    }
+    return response;
+}
+
+bool ParseJsonDocument(const std::string& document, Json::Value* value,
+                       std::string* errors) {
+    Json::CharReaderBuilder builder;
+    std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
+    return reader->parse(document.data(), document.data() + document.size(),
+                         value, errors);
 }
 
 // --- makeServiceKey ------------------------------------------------------
@@ -187,6 +234,174 @@ TEST(EventManager, StopWaitsForHttpServerShutdown) {
     ec.clear();
     after_stop.connect(endpoint, ec);
     EXPECT_TRUE(ec);
+}
+
+class QueryHttpTest : public ::testing::Test {
+   protected:
+    static constexpr int64_t kLastAccessSentinel = -424242;
+
+    void SetUp() override {
+        manager_ = std::make_unique<EventManager>(
+            std::vector<conductor::common::ServiceConfig>{}, 0);
+        ASSERT_TRUE(manager_->StartHTTPServer());
+        port_ = EventManagerTestPeer::HttpPort(*manager_);
+        ASSERT_NE(port_, 0);
+
+        conductor::common::StoredEvent event;
+        event.block_hashes = {100};
+        event.block_size = 2;
+        event.model_name = "test-model";
+        event.instance_id = "instance-1";
+        event.token_ids = {std::numeric_limits<int32_t>::min(),
+                           std::numeric_limits<int32_t>::max()};
+        event.medium = "cpu";
+        ASSERT_EQ(manager_->GetIndexer()->ProcessStoreEvent(event, 0), "");
+
+        query_context_.model_name = event.model_name;
+        query_context_.block_size = event.block_size;
+        query_context_.tenant_id = "default";
+        query_context_.instance_id = event.instance_id;
+    }
+
+    void TearDown() override {
+        if (manager_) {
+            manager_->Stop();
+        }
+    }
+
+    std::string QueryBody(const std::string& token_ids_json) const {
+        return R"({"model":"test-model","instance_id":"instance-1","block_size":2,"token_ids":)" +
+               token_ids_json + "}";
+    }
+
+    HttpResponse Post(const std::string& body) const {
+        return HttpPostJson(port_, "/query", body);
+    }
+
+    void ExpectJsonResponse(const HttpResponse& response, int status,
+                            Json::Value* body) const {
+        EXPECT_EQ(response.status, status);
+        const auto content_type = response.headers.find("content-type");
+        ASSERT_NE(content_type, response.headers.end());
+        EXPECT_EQ(content_type->second, "application/json");
+        ASSERT_FALSE(response.body.empty());
+
+        std::string errors;
+        ASSERT_TRUE(ParseJsonDocument(response.body, body, &errors)) << errors;
+        ASSERT_TRUE(body->isObject());
+    }
+
+    void ExpectJsonError(const HttpResponse& response, const char* reason,
+                         bool expect_field,
+                         std::optional<size_t> index = std::nullopt) const {
+        Json::Value body;
+        ASSERT_NO_FATAL_FAILURE(ExpectJsonResponse(response, 400, &body));
+        ASSERT_TRUE(body.isMember("error"));
+        ASSERT_TRUE(body["error"].isString());
+        EXPECT_FALSE(body["error"].asString().empty());
+        ASSERT_TRUE(body.isMember("reason"));
+        EXPECT_EQ(body["reason"].asString(), reason);
+        if (expect_field) {
+            ASSERT_TRUE(body.isMember("field"));
+            EXPECT_EQ(body["field"].asString(), "token_ids");
+        } else {
+            EXPECT_FALSE(body.isMember("field"));
+        }
+        if (index.has_value()) {
+            ASSERT_TRUE(body.isMember("index"));
+            ASSERT_TRUE(body["index"].isIntegral());
+            EXPECT_EQ(body["index"].asUInt64(), *index);
+        } else {
+            EXPECT_FALSE(body.isMember("index"));
+        }
+    }
+
+    std::unique_ptr<EventManager> manager_;
+    uint16_t port_ = 0;
+    ModelContext query_context_;
+};
+
+TEST_F(QueryHttpTest, RejectsInvalidTokensAtomicallyAndRemainsLive) {
+    struct Case {
+        const char* name;
+        std::string body;
+        const char* reason;
+        bool expect_field;
+        std::optional<size_t> index;
+    };
+
+    const std::vector<Case> cases = {
+        {"malformed json",
+         R"({"model":"test-model","instance_id":"instance-1","block_size":2,"token_ids":[-2147483648,2147483647],"bad":})",
+         "invalid_json", false, std::nullopt},
+        {"trailing garbage",
+         R"({"model":"test-model","instance_id":"instance-1","block_size":2,"token_ids":[-2147483648,2147483647]} trailing)",
+         "invalid_json", false, std::nullopt},
+        {"comment syntax",
+         R"({"model":"test-model","instance_id":"instance-1","block_size":2,/* invalid JSON */"token_ids":[-2147483648,2147483647]})",
+         "invalid_json", false, std::nullopt},
+        {"trailing comma",
+         R"({"model":"test-model","instance_id":"instance-1","block_size":2,"token_ids":[-2147483648,2147483647],})",
+         "invalid_json", false, std::nullopt},
+        {"top-level array", "[]", "invalid_json", false, std::nullopt},
+        {"missing token_ids",
+         R"({"model":"test-model","instance_id":"instance-1","block_size":2})",
+         "missing", true, std::nullopt},
+        {"token_ids not array", QueryBody("1"), "not_array", true,
+         std::nullopt},
+        {"string element", QueryBody(R"(["1"])"), "invalid_type", true, 0},
+        {"boolean element", QueryBody("[true]"), "invalid_type", true, 0},
+        {"null element", QueryBody("[null]"), "invalid_type", true, 0},
+        {"object element", QueryBody("[{}]"), "invalid_type", true, 0},
+        {"array element", QueryBody("[[]]"), "invalid_type", true, 0},
+        {"decimal real", QueryBody("[1.0]"), "invalid_type", true, 0},
+        {"exponent real", QueryBody("[1e0]"), "invalid_type", true, 0},
+        {"below int32", QueryBody("[-2147483649]"), "out_of_range", true, 0},
+        {"above int32", QueryBody("[2147483648]"), "out_of_range", true, 0},
+        {"mixed invalid type", QueryBody("[1,2,false]"), "invalid_type", true,
+         2},
+        {"mixed out of range", QueryBody("[1,-2,2147483648]"), "out_of_range",
+         true, 2},
+    };
+
+    for (const auto& test_case : cases) {
+        SCOPED_TRACE(test_case.name);
+        PrefixCacheTableTestPeer::SetLastAccess(
+            *manager_->GetIndexer(), query_context_, kLastAccessSentinel);
+
+        const auto invalid_response = Post(test_case.body);
+        ASSERT_NO_FATAL_FAILURE(
+            ExpectJsonError(invalid_response, test_case.reason,
+                            test_case.expect_field, test_case.index));
+        EXPECT_EQ(PrefixCacheTableTestPeer::GetLastAccess(
+                      *manager_->GetIndexer(), query_context_),
+                  kLastAccessSentinel);
+
+        Json::Value valid_body;
+        const auto valid_response = Post(QueryBody("[]"));
+        ASSERT_NO_FATAL_FAILURE(
+            ExpectJsonResponse(valid_response, 200, &valid_body));
+        EXPECT_NE(PrefixCacheTableTestPeer::GetLastAccess(
+                      *manager_->GetIndexer(), query_context_),
+                  kLastAccessSentinel);
+    }
+}
+
+TEST_F(QueryHttpTest, AcceptsEmptyArrayAndFullInt32Range) {
+    Json::Value empty_body;
+    ASSERT_NO_FATAL_FAILURE(
+        ExpectJsonResponse(Post(QueryBody("[]")), 200, &empty_body));
+    ASSERT_TRUE(empty_body.isMember("default"));
+    ASSERT_TRUE(empty_body["default"].isMember("instance-1"));
+    EXPECT_EQ(empty_body["default"]["instance-1"]["longest_matched"].asInt64(),
+              0);
+
+    Json::Value boundary_body;
+    ASSERT_NO_FATAL_FAILURE(ExpectJsonResponse(
+        Post(QueryBody("[-2147483648,2147483647]")), 200, &boundary_body));
+    const Json::Value& result = boundary_body["default"]["instance-1"];
+    EXPECT_EQ(result["longest_matched"].asInt64(), 2);
+    EXPECT_EQ(result["CPU"].asInt64(), 2);
 }
 
 // --- KVEventHandler -------------------------------------------------------

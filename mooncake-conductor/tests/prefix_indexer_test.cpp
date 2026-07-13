@@ -4,7 +4,9 @@
 #include <gtest/gtest.h>
 
 #include <barrier>
+#include <limits>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <thread>
@@ -12,42 +14,7 @@
 
 #include "conductor/common/types.h"
 #include "conductor/prefixindex/prefix_indexer.h"
-
-namespace conductor {
-namespace prefixindex {
-
-// Test-only access to the table's internal context map / hash mapping.
-class PrefixCacheTableTestPeer {
-   public:
-    static bool ContextExists(PrefixCacheTable& table,
-                              const ModelContext& ctx) {
-        return table.LoadContextData(ctx) != nullptr;
-    }
-
-    static size_t ProxyHashMappingSize(PrefixCacheTable& table,
-                                       const ModelContext& ctx) {
-        auto data = table.LoadContextData(ctx);
-        if (!data) return 0;
-        std::shared_lock lock(data->hashmap_mu);
-        return data->proxy_hash_mapping.size();
-    }
-
-    static std::shared_ptr<ContextData> GetContextData(
-        PrefixCacheTable& table, const ModelContext& ctx) {
-        return table.GetContextData(ctx);
-    }
-
-    static std::set<int64_t> DpSize(PrefixCacheTable& table,
-                                    const ModelContext& ctx) {
-        auto data = table.LoadContextData(ctx);
-        if (!data) return {};
-        std::shared_lock lock(data->hashmap_mu);
-        return data->dp_size;
-    }
-};
-
-}  // namespace prefixindex
-}  // namespace conductor
+#include "prefix_indexer_test_peer.h"
 
 namespace {
 
@@ -55,6 +22,7 @@ using conductor::common::RemovedEvent;
 using conductor::common::StoredEvent;
 using conductor::prefixindex::ModelContext;
 using conductor::prefixindex::PrefixCacheTable;
+using conductor::prefixindex::PrefixCacheTableSnapshot;
 using conductor::prefixindex::PrefixCacheTableTestPeer;
 
 std::vector<int32_t> Seq(int32_t from, int32_t to) {
@@ -86,6 +54,132 @@ StoredEvent TestStoredEvent() {
     event.token_ids = Seq(1, 8);
     event.medium = "cpu";
     return event;
+}
+
+ModelContext ContextForEvent(const StoredEvent& event) {
+    ModelContext context;
+    context.model_name = event.model_name;
+    context.lora_name = event.lora_name;
+    context.block_size = event.block_size;
+    context.tenant_id = "default";
+    context.additional_salt = "";
+    context.instance_id = event.instance_id;
+    return context;
+}
+
+struct InvalidStoreCase {
+    const char* name;
+    StoredEvent event;
+    std::optional<size_t> expected_token_count;
+    const char* error_fragment;
+};
+
+StoredEvent StoreEventWithLayout(size_t hash_count, size_t token_count,
+                                 int64_t block_size = 4) {
+    StoredEvent event = TestStoredEvent();
+    event.block_hashes.resize(hash_count);
+    for (size_t i = 0; i < hash_count; ++i) {
+        event.block_hashes[i] = 100 + i;
+    }
+    event.token_ids.resize(token_count);
+    for (size_t i = 0; i < token_count; ++i) {
+        event.token_ids[i] = static_cast<int32_t>(i + 1);
+    }
+    event.block_size = block_size;
+    return event;
+}
+
+StoredEvent MultiplicationOverflowEvent() {
+    constexpr size_t kHashCount = 3;
+    const size_t block_size =
+        std::numeric_limits<size_t>::max() / kHashCount + 1;
+    EXPECT_LE(block_size,
+              static_cast<size_t>(std::numeric_limits<int64_t>::max()));
+
+    StoredEvent event = StoreEventWithLayout(kHashCount, 1);
+    event.block_size = static_cast<int64_t>(block_size);
+    return event;
+}
+
+std::vector<InvalidStoreCase> InvalidStoreCases() {
+    return {
+        {"single block short", StoreEventWithLayout(1, 3), 4,
+         "token count mismatch"},
+        {"single block long", StoreEventWithLayout(1, 5), 4,
+         "token count mismatch"},
+        {"multiple blocks short", StoreEventWithLayout(2, 7), 8,
+         "token count mismatch"},
+        {"multiple blocks long", StoreEventWithLayout(2, 9), 8,
+         "token count mismatch"},
+        {"hashes only", StoreEventWithLayout(1, 0), 4,
+         "must both be empty or both be non-empty"},
+        {"tokens only", StoreEventWithLayout(0, 4), 0,
+         "must both be empty or both be non-empty"},
+        {"zero block size", StoreEventWithLayout(1, 1, 0), std::nullopt,
+         "greater than zero"},
+        {"negative block size", StoreEventWithLayout(1, 1, -4), std::nullopt,
+         "greater than zero"},
+        {"token count multiplication overflow", MultiplicationOverflowEvent(),
+         std::nullopt, "overflow"},
+    };
+}
+
+void ExpectErrorContains(const std::string& error, const std::string& value) {
+    EXPECT_NE(error.find(value), std::string::npos) << "error=" << error;
+}
+
+void ExpectRejectedWithoutCreatingContext(const InvalidStoreCase& test_case) {
+    PrefixCacheTable table;
+    const std::string error = table.ProcessStoreEvent(test_case.event, 0);
+
+    ASSERT_FALSE(error.empty()) << "case=" << test_case.name;
+    ExpectErrorContains(error, test_case.error_fragment);
+    ExpectErrorContains(
+        error,
+        "hash_count=" + std::to_string(test_case.event.block_hashes.size()));
+    ExpectErrorContains(
+        error, "block_size=" + std::to_string(test_case.event.block_size));
+    ExpectErrorContains(
+        error, "actual=" + std::to_string(test_case.event.token_ids.size()));
+    if (test_case.expected_token_count.has_value()) {
+        ExpectErrorContains(
+            error,
+            "expected=" + std::to_string(*test_case.expected_token_count));
+    } else {
+        EXPECT_EQ(error.find("expected="), std::string::npos)
+            << "error=" << error;
+    }
+
+    EXPECT_FALSE(PrefixCacheTableTestPeer::ContextExists(
+        table, ContextForEvent(test_case.event)));
+    const PrefixCacheTableSnapshot snapshot =
+        PrefixCacheTableTestPeer::Snapshot(table);
+    EXPECT_EQ(snapshot.global_view.context_count, 0);
+    EXPECT_TRUE(snapshot.global_view.model_contexts.empty());
+    EXPECT_TRUE(snapshot.global_view.proxy_hash_map.empty());
+    EXPECT_TRUE(snapshot.contexts.empty());
+}
+
+void PopulateCompleteTableState(PrefixCacheTable& table) {
+    StoredEvent event = TestStoredEvent();
+    ASSERT_EQ(table.ProcessStoreEvent(event, 0), "");
+
+    event.medium = "GPU";
+    ASSERT_EQ(table.ProcessStoreEvent(event, 2), "");
+    table.AddDpSize(TestContext(), 0);
+    table.AddDpSize(TestContext(), 2);
+
+    StoredEvent other = TestStoredEvent();
+    other.model_name = "other-model";
+    other.instance_id = "instance-2";
+    other.block_hashes = {300};
+    other.token_ids = Seq(9, 12);
+    ASSERT_EQ(table.ProcessStoreEvent(other, 7), "");
+    table.AddDpSize(ContextForEvent(other), 7);
+
+    PrefixCacheTableTestPeer::SetLastAccess(table, TestContext(), 123456789);
+    PrefixCacheTableTestPeer::SetLastAccess(table, ContextForEvent(other),
+                                            987654321);
 }
 
 // --- ComputePrefixHash ---------------------------------------------------
@@ -165,32 +259,103 @@ TEST(ProcessStoreEvent, ConcurrentFirstAccessUsesCanonicalContextData) {
     EXPECT_EQ(table.GetGlobalView().context_count, 1);
 }
 
-TEST(ProcessStoreEvent, EmptyBlockHashesIsNoop) {
+TEST(ProcessStoreEvent, FullyEmptyEventIsNoopBeforeBlockSizeValidation) {
     PrefixCacheTable table;
+    PopulateCompleteTableState(table);
+    const auto before = PrefixCacheTableTestPeer::Snapshot(table);
+
     StoredEvent event = TestStoredEvent();
-    event.block_hashes = {};
-    event.token_ids = Seq(1, 4);
+    event.instance_id = "never-created";
+    event.block_hashes.clear();
+    event.token_ids.clear();
+    event.block_size = std::numeric_limits<int64_t>::min();
+
     EXPECT_EQ(table.ProcessStoreEvent(event, 0), "");
+    EXPECT_FALSE(
+        PrefixCacheTableTestPeer::ContextExists(table, ContextForEvent(event)));
+    EXPECT_TRUE(PrefixCacheTableTestPeer::Snapshot(table) == before);
 }
 
-// Spec scenario: length mismatch (and more than one block hash) rejected.
-TEST(ProcessStoreEvent, LengthMismatchRejected) {
-    PrefixCacheTable table;
-    StoredEvent event = TestStoredEvent();
-    event.token_ids = Seq(1, 7);  // 2 blocks * 4 != 7
-    EXPECT_NE(table.ProcessStoreEvent(event, 0), "");
-    // Index unchanged: nothing stored for these tokens.
-    const auto result = table.CacheHitCompute(TestContext(), Seq(1, 8));
-    EXPECT_EQ(result.longest_match_tokens, 0);
+TEST(ProcessStoreEvent, SingleBlockShortTokensRejected) {
+    ExpectRejectedWithoutCreatingContext(InvalidStoreCases()[0]);
 }
 
-// Quirk retained: a single block hash bypasses the length check.
-TEST(ProcessStoreEvent, SingleBlockHashBypassesLengthCheck) {
+TEST(ProcessStoreEvent, SingleBlockLongTokensRejected) {
+    ExpectRejectedWithoutCreatingContext(InvalidStoreCases()[1]);
+}
+
+TEST(ProcessStoreEvent, MultipleBlocksShortTokensRejected) {
+    ExpectRejectedWithoutCreatingContext(InvalidStoreCases()[2]);
+}
+
+TEST(ProcessStoreEvent, MultipleBlocksLongTokensRejected) {
+    ExpectRejectedWithoutCreatingContext(InvalidStoreCases()[3]);
+}
+
+TEST(ProcessStoreEvent, HashesWithoutTokensRejected) {
+    ExpectRejectedWithoutCreatingContext(InvalidStoreCases()[4]);
+}
+
+TEST(ProcessStoreEvent, TokensWithoutHashesRejected) {
+    ExpectRejectedWithoutCreatingContext(InvalidStoreCases()[5]);
+}
+
+TEST(ProcessStoreEvent, ZeroBlockSizeRejected) {
+    ExpectRejectedWithoutCreatingContext(InvalidStoreCases()[6]);
+}
+
+TEST(ProcessStoreEvent, NegativeBlockSizeRejected) {
+    ExpectRejectedWithoutCreatingContext(InvalidStoreCases()[7]);
+}
+
+TEST(ProcessStoreEvent, TokenCountMultiplicationOverflowRejected) {
+    ExpectRejectedWithoutCreatingContext(InvalidStoreCases()[8]);
+}
+
+TEST(ProcessStoreEvent, InvalidLayoutsPreserveCompleteExistingState) {
     PrefixCacheTable table;
-    StoredEvent event = TestStoredEvent();
-    event.block_hashes = {100};
-    event.token_ids = Seq(1, 8);  // 1 block * 4 != 8, but len==1 -> allowed
-    EXPECT_EQ(table.ProcessStoreEvent(event, 0), "");
+    PopulateCompleteTableState(table);
+    const PrefixCacheTableSnapshot before =
+        PrefixCacheTableTestPeer::Snapshot(table);
+
+    ASSERT_EQ(before.global_view.context_count, 2);
+    ASSERT_EQ(before.global_view.model_contexts.size(), 2u);
+    ASSERT_EQ(before.global_view.proxy_hash_map.size(), 2u);
+    ASSERT_EQ(before.contexts.size(), 2u);
+
+    const auto target = before.contexts.find(TestContext());
+    ASSERT_NE(target, before.contexts.end());
+    EXPECT_EQ(target->second.proxy_hash_mapping.size(), 2u);
+    EXPECT_EQ(target->second.prefix_entries.size(), 2u);
+    EXPECT_EQ(target->second.total_prefixes, 2);
+    EXPECT_EQ(target->second.dp_size, (std::set<int64_t>{0, 2}));
+    EXPECT_EQ(target->second.last_access, 123456789);
+    for (const auto& [hash, entry] : target->second.prefix_entries) {
+        SCOPED_TRACE(hash);
+        EXPECT_EQ(entry.total_replica_nums, 2);
+        EXPECT_EQ(entry.medium_set, (std::set<std::string>{"GPU", "cpu"}));
+        EXPECT_EQ(entry.dp_rank_set, (std::set<int64_t>{0, 2}));
+        EXPECT_EQ(entry.engine_last_access_time.size(), 1u);
+        EXPECT_TRUE(entry.engine_last_access_time.contains("instance-1"));
+    }
+
+    ModelContext other_context = TestContext("instance-2");
+    other_context.model_name = "other-model";
+    const auto other = before.contexts.find(other_context);
+    ASSERT_NE(other, before.contexts.end());
+    EXPECT_EQ(other->second.last_access, 987654321);
+
+    for (const auto& test_case : InvalidStoreCases()) {
+        SCOPED_TRACE(test_case.name);
+        const std::string error = table.ProcessStoreEvent(test_case.event, 0);
+        ASSERT_FALSE(error.empty());
+
+        const PrefixCacheTableSnapshot after =
+            PrefixCacheTableTestPeer::Snapshot(table);
+        EXPECT_TRUE(after == before);
+        EXPECT_EQ(PrefixCacheTableTestPeer::GetLastAccess(table, TestContext()),
+                  123456789);
+    }
 }
 
 // --- ProcessRemoveEvent --------------------------------------------------

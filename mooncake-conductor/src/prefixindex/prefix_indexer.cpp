@@ -10,6 +10,10 @@
 
 #include <chrono>
 #include <cstring>
+#include <limits>
+#include <optional>
+#include <sstream>
+#include <utility>
 
 namespace conductor {
 namespace prefixindex {
@@ -20,6 +24,33 @@ int64_t NowUnixSeconds() {
     return std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
+}
+
+std::optional<size_t> SafeExpectedTokenCount(const common::StoredEvent& event) {
+    if (event.block_size <= 0 || !std::in_range<size_t>(event.block_size)) {
+        return std::nullopt;
+    }
+
+    const size_t block_size = static_cast<size_t>(event.block_size);
+    if (event.block_hashes.size() >
+        std::numeric_limits<size_t>::max() / block_size) {
+        return std::nullopt;
+    }
+    return event.block_hashes.size() * block_size;
+}
+
+std::string StoreEventLayoutError(
+    const char* reason, const common::StoredEvent& event,
+    std::optional<size_t> expected_token_count = std::nullopt) {
+    std::ostringstream error;
+    error << "StoredEvent layout invalid: " << reason
+          << " hash_count=" << event.block_hashes.size()
+          << " block_size=" << event.block_size;
+    if (expected_token_count.has_value()) {
+        error << " expected=" << *expected_token_count;
+    }
+    error << " actual=" << event.token_ids.size();
+    return error.str();
 }
 
 }  // namespace
@@ -195,9 +226,41 @@ CacheHitResult PrefixCacheTable::CacheHitCompute(
 
 std::string PrefixCacheTable::ProcessStoreEvent(
     const common::StoredEvent& event, int64_t dp_rank) {
-    if (event.block_hashes.empty()) {
+    if (event.block_hashes.empty() && event.token_ids.empty()) {
         return "";
     }
+
+    if (event.block_hashes.empty() != event.token_ids.empty()) {
+        return StoreEventLayoutError(
+            "block_hashes and token_ids must both be empty or both be "
+            "non-empty",
+            event, SafeExpectedTokenCount(event));
+    }
+    if (event.block_size <= 0) {
+        return StoreEventLayoutError("block_size must be greater than zero",
+                                     event);
+    }
+    if (!std::in_range<size_t>(event.block_size)) {
+        return StoreEventLayoutError(
+            "token count overflow: block_size is not representable by "
+            "size_t",
+            event);
+    }
+
+    const size_t block_size = static_cast<size_t>(event.block_size);
+    const size_t hash_count = event.block_hashes.size();
+    if (hash_count > std::numeric_limits<size_t>::max() / block_size) {
+        return StoreEventLayoutError(
+            "token count overflow: hash_count * block_size exceeds size_t",
+            event);
+    }
+
+    const size_t expected_token_count = hash_count * block_size;
+    if (event.token_ids.size() != expected_token_count) {
+        return StoreEventLayoutError("token count mismatch", event,
+                                     expected_token_count);
+    }
+
     const std::string tenant_id = "default";
 
     VLOG(1) << "In ProcessStoreEvent modelName=" << event.model_name
@@ -215,13 +278,6 @@ std::string PrefixCacheTable::ProcessStoreEvent(
     // Lock order: hashmap_mu, then prefix_mu below.
     std::unique_lock hashmap_lock(context_data->hashmap_mu);
     auto& proxy_hash_map = context_data->proxy_hash_mapping;
-
-    if (event.block_hashes.size() * static_cast<size_t>(event.block_size) !=
-        event.token_ids.size()) {
-        if (event.block_hashes.size() != 1) {
-            return "block hashes and tokens length mismatch";
-        }
-    }
 
     struct NewPrefix {
         uint64_t hash_value;
@@ -253,9 +309,7 @@ std::string PrefixCacheTable::ProcessStoreEvent(
         }
         // if not exists, compute hash
         const uint64_t hash_value = ComputeBlockHash(
-            parent_hash,
-            event.token_ids.data() + i * static_cast<size_t>(event.block_size),
-            static_cast<size_t>(event.block_size));
+            parent_hash, event.token_ids.data() + i * block_size, block_size);
         parent_hash = hash_value;
 
         proxy_hash_map[block_hash] = hash_value;

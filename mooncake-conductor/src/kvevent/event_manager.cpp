@@ -6,6 +6,8 @@
 #include <ylt/coro_http/coro_http_server.hpp>
 
 #include <chrono>
+#include <limits>
+#include <optional>
 #include <thread>
 #include <utility>
 
@@ -28,28 +30,124 @@ void HttpError(coro_http_response& resp, status_type status,
     resp.set_status_and_content(status, message + "\n");
 }
 
-void HttpJson(coro_http_response& resp, const Json::Value& value) {
+void HttpJson(coro_http_response& resp, status_type status,
+              const Json::Value& value) {
     Json::StreamWriterBuilder wb;
     wb["indentation"] = "";
     // JSON-encoded output terminates with a trailing '\n' (wire contract).
     resp.add_header("Content-Type", kApplicationJson);
-    resp.set_status_and_content(status_type::ok,
-                                Json::writeString(wb, value) + "\n");
+    resp.set_status_and_content(status, Json::writeString(wb, value) + "\n");
+}
+
+void HttpJson(coro_http_response& resp, const Json::Value& value) {
+    HttpJson(resp, status_type::ok, value);
+}
+
+void HttpJsonError(coro_http_response& resp, const char* reason,
+                   const std::string& message, const char* field = nullptr,
+                   std::optional<size_t> index = std::nullopt) {
+    Json::Value error(Json::objectValue);
+    error["error"] = message;
+    error["reason"] = reason;
+    if (field != nullptr) {
+        error["field"] = field;
+    }
+    if (index.has_value()) {
+        error["index"] = Json::Value::UInt64(*index);
+    }
+    HttpJson(resp, status_type::bad_request, error);
+}
+
+bool ParseJsonObject(coro_http_request& req, Json::Value* out,
+                     std::string* errors, bool strict = false) {
+    Json::CharReaderBuilder rb;
+    if (strict) {
+        rb["allowComments"] = false;
+        rb["allowTrailingCommas"] = false;
+        rb["failIfExtra"] = true;
+    }
+    const auto body = req.get_body();
+    std::unique_ptr<Json::CharReader> reader(rb.newCharReader());
+    if (!reader->parse(body.data(), body.data() + body.size(), out, errors)) {
+        return false;
+    }
+    if (!out->isObject()) {
+        *errors = "request body must be a JSON object";
+        return false;
+    }
+    return true;
 }
 
 // Parses a request body as a JSON object. Returns false (and writes the
 // 400 response) on malformed JSON.
 bool ParseJsonBody(coro_http_request& req, coro_http_response& resp,
                    const char* what, Json::Value* out) {
-    Json::CharReaderBuilder rb;
     std::string errs;
-    const auto body = req.get_body();
-    std::unique_ptr<Json::CharReader> reader(rb.newCharReader());
-    if (!reader->parse(body.data(), body.data() + body.size(), out, &errs) ||
-        !out->isObject()) {
+    if (!ParseJsonObject(req, out, &errs)) {
         LOG(ERROR) << "Failed to decode " << what << " JSON err=" << errs;
         HttpError(resp, status_type::bad_request, "Invalid JSON");
         return false;
+    }
+    return true;
+}
+
+bool ParseQueryJsonBody(coro_http_request& req, coro_http_response& resp,
+                        Json::Value* out) {
+    std::string errs;
+    if (!ParseJsonObject(req, out, &errs, true)) {
+        LOG(ERROR) << "Failed to decode query JSON err=" << errs;
+        HttpJsonError(resp, "invalid_json", "Invalid JSON object");
+        return false;
+    }
+    return true;
+}
+
+bool ParseQueryTokenIds(const Json::Value& body, coro_http_response& resp,
+                        std::vector<int32_t>* token_ids) {
+    if (!body.isMember("token_ids")) {
+        HttpJsonError(resp, "missing", "token_ids is required", "token_ids");
+        return false;
+    }
+
+    const Json::Value& values = body["token_ids"];
+    if (!values.isArray()) {
+        HttpJsonError(resp, "not_array", "token_ids must be an array",
+                      "token_ids");
+        return false;
+    }
+
+    token_ids->clear();
+    token_ids->reserve(values.size());
+    for (Json::ArrayIndex index = 0; index < values.size(); ++index) {
+        const Json::Value& value = values[index];
+        int32_t token_id = 0;
+        if (value.type() == Json::intValue) {
+            const Json::Int64 signed_value = value.asInt64();
+            if (signed_value < std::numeric_limits<int32_t>::min() ||
+                signed_value > std::numeric_limits<int32_t>::max()) {
+                HttpJsonError(resp, "out_of_range",
+                              "token_ids element is outside the int32 range",
+                              "token_ids", index);
+                return false;
+            }
+            token_id = static_cast<int32_t>(signed_value);
+        } else if (value.type() == Json::uintValue) {
+            const Json::UInt64 unsigned_value = value.asUInt64();
+            if (unsigned_value > static_cast<Json::UInt64>(
+                                     std::numeric_limits<int32_t>::max())) {
+                HttpJsonError(resp, "out_of_range",
+                              "token_ids element is outside the int32 range",
+                              "token_ids", index);
+                return false;
+            }
+            token_id = static_cast<int32_t>(unsigned_value);
+        } else {
+            HttpJsonError(resp, "invalid_type",
+                          "token_ids element must be a JSON integer",
+                          "token_ids", index);
+            return false;
+        }
+        token_ids->push_back(token_id);
     }
     return true;
 }
@@ -318,7 +416,12 @@ void EventManager::RegisterHttpHandlers() {
         VLOG(1) << "receive req method=POST path=/query";
 
         Json::Value body;
-        if (!ParseJsonBody(req, resp, "query", &body)) {
+        if (!ParseQueryJsonBody(req, resp, &body)) {
+            return;
+        }
+
+        std::vector<int32_t> token_ids;
+        if (!ParseQueryTokenIds(body, resp, &token_ids)) {
             return;
         }
 
@@ -330,13 +433,6 @@ void EventManager::RegisterHttpHandlers() {
             body.isMember("block_size") && body["block_size"].isNumeric()
                 ? body["block_size"].asInt64()
                 : 0;
-
-        std::vector<int32_t> token_ids;
-        if (body.isMember("token_ids") && body["token_ids"].isArray()) {
-            for (const auto& t : body["token_ids"]) {
-                token_ids.push_back(t.asInt());
-            }
-        }
 
         auto make_context = [&](const std::string& instance_id) {
             prefixindex::ModelContext ctx;
