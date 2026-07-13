@@ -811,12 +811,12 @@ TEST(AdmissionQueueTest, PromotionCoexistsWithStep3Drop) {
                                [] { return uint64_t{1000}; });
 
     std::vector<QueueOwnerId> ids;
-    auto status =
-        queue.tryAdmit(makeSubmit(1, 3,
-                                  {makeOwnerWithDeadline(0, 16, 1010),
-                                   makeOwnerWithDeadline(1, 16, 1400),
-                                   makeOwnerWithDeadline(2, 16, 5000)}),
-                       ids);
+    auto status = queue.tryAdmit(
+        makeSubmit(1, 3,
+                   {makeDegradationEligibleOwnerWithDeadline(0, 16, 1010),
+                    makeDegradationEligibleOwnerWithDeadline(1, 16, 1400),
+                    makeDegradationEligibleOwnerWithDeadline(2, 16, 5000)}),
+        ids);
     ASSERT_EQ(status.code(), Status::Code::kOk);
 
     std::vector<QueueOwnerId> dropped;
