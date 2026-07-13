@@ -285,11 +285,8 @@ ErrorCode ScopedSegmentAccess::PrepareUnmountSegment(
     // 1. Remove from allocators if the segment is still allocatable.
     auto& registration = mounted_segment.allocator_registration;
     if (registration) {
-        segment_manager_->allocator_manager_.removeAllocator(segment.name,
-                                                             registration);
-    } else if (mounted_segment.buf_allocator) {
-        segment_manager_->allocator_manager_.removeAllocator(
-            segment.name, mounted_segment.buf_allocator);
+        segment_manager_->allocator_manager_.removeRegistration(segment.name,
+                                                                registration);
     }
     RemoveHostSegment(segment_manager_->segments_by_host_, segment);
 
@@ -332,7 +329,7 @@ ErrorCode ScopedSegmentAccess::PrepareGracefulUnmountSegment(
 
     if (HasRegistration(segment_manager_->allocator_manager_, segment.name,
                         mounted_segment.allocator_registration)) {
-        segment_manager_->allocator_manager_.removeAllocator(
+        segment_manager_->allocator_manager_.removeRegistration(
             segment.name, mounted_segment.allocator_registration, false);
     }
     RemoveHostSegment(segment_manager_->segments_by_host_, segment);
@@ -480,11 +477,11 @@ ErrorCode ScopedSegmentAccess::QuerySegments(const std::string& segment,
                                              size_t& used, size_t& capacity) {
     size_t total_used = 0, total_capacity = 0;
     const auto& allocator_manager = segment_manager_->allocator_manager_;
-    const auto& allocators = allocator_manager.getAllocators(segment);
-    if (allocators != nullptr) {
-        for (const auto& allocator : *allocators) {
-            total_used += allocator->size();
-            total_capacity += allocator->capacity();
+    const auto& registrations = allocator_manager.getRegistrations(segment);
+    if (registrations != nullptr) {
+        for (const auto& registration : *registrations) {
+            total_used += registration->size();
+            total_capacity += registration->capacity();
         }
     }
 
@@ -1192,12 +1189,17 @@ ErrorCode ScopedSegmentAccess::SetSegmentStatusByName(
     const bool is_allocatable = HasRegistration(
         allocator_manager, name, mounted_segment.allocator_registration);
     if (should_be_allocatable && !is_allocatable && allocator) {
-        mounted_segment.allocator_registration = allocator_manager.addAllocator(
-            name, allocator, mounted_segment.allocator_registration);
+        if (mounted_segment.allocator_registration) {
+            allocator_manager.addRegistration(
+                name, mounted_segment.allocator_registration);
+        } else {
+            mounted_segment.allocator_registration =
+                allocator_manager.addAllocator(name, allocator);
+        }
         AddHostSegment(segment_manager_->segments_by_host_,
                        mounted_segment.segment);
     } else if (!should_be_allocatable && is_allocatable) {
-        allocator_manager.removeAllocator(
+        allocator_manager.removeRegistration(
             name, mounted_segment.allocator_registration, false);
         RemoveHostSegment(segment_manager_->segments_by_host_,
                           mounted_segment.segment);
@@ -1346,12 +1348,10 @@ ErrorCode ScopedNoFSegmentAccess::PrepareUnmountSegment(
     auto& segment = mounted_segment.segment;
     metrics_dec_capacity = segment.size;
 
-    std::shared_ptr<BufferAllocatorBase> allocator =
-        mounted_segment.buf_allocator;
     auto& registration = mounted_segment.allocator_registration;
     if (registration) {
-        nof_segment_manager_->allocator_manager_.removeAllocator(segment.name,
-                                                                 registration);
+        nof_segment_manager_->allocator_manager_.removeRegistration(
+            segment.name, registration);
     }
 
     mounted_segment.buf_allocator.reset();
@@ -1444,11 +1444,11 @@ ErrorCode ScopedNoFSegmentAccess::QuerySegments(const std::string& segment,
                                                 size_t& capacity) {
     size_t total_used = 0, total_capacity = 0;
     const auto& allocator_manager = nof_segment_manager_->allocator_manager_;
-    const auto& allocators = allocator_manager.getAllocators(segment);
-    if (allocators != nullptr) {
-        for (const auto& allocator : *allocators) {
-            total_used += allocator->size();
-            total_capacity += allocator->capacity();
+    const auto& registrations = allocator_manager.getRegistrations(segment);
+    if (registrations != nullptr) {
+        for (const auto& registration : *registrations) {
+            total_used += registration->size();
+            total_capacity += registration->capacity();
         }
     }
 
