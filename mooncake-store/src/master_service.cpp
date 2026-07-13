@@ -201,8 +201,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
       ha_backend_type_(config.ha_backend_type),
       ha_backend_connstring_(config.ha_backend_connstring),
       oplog_batch_max_entries_(config.oplog_batch_max_entries),
-      use_batch_oplog_(ParseOpLogStoreType(config.oplog_store_type) ==
-                       OpLogStoreType::ETCD_BATCH_RECORD),
+      use_batch_oplog_(config.enable_ha &&
+                       ParseOpLogStoreType(config.oplog_store_type) ==
+                           OpLogStoreType::ETCD_BATCH_RECORD),
       cluster_id_(config.cluster_id),
       root_fs_dir_(config.root_fs_dir),
       global_file_segment_size_(config.global_file_segment_size),

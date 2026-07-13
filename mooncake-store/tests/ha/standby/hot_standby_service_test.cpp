@@ -1000,6 +1000,26 @@ TEST_F(PromotionCatchUpTest, UsesDurablePrefixLastSeqAsCatchUpTarget) {
     EXPECT_EQ(2u, out.oplog_sequence_id);
 }
 
+TEST_F(PromotionCatchUpTest, RetriesTransientDurablePrefixReadFailure) {
+    auto batch_backend = std::make_shared<FakeHaKvBackend>();
+    ASSERT_EQ(ErrorCode::OK,
+              batch_backend->Put(
+                  BuildDurablePrefixKey(cluster_id_),
+                  EncodeDurablePrefix({.batch_id = 1, .last_seq = 1})));
+    ASSERT_EQ(ErrorCode::OK,
+              batch_backend->Put(BuildBatchRecordKey(cluster_id_, 1),
+                                 EncodeOpLogBatchRecord(MakeBatch(1, 1, 1))));
+    service_->SetCatchUpBatchKvBackendForTesting(batch_backend);
+
+    ASSERT_EQ(ErrorCode::OK,
+              service_->Start("", oplog_endpoints_, cluster_id_));
+    batch_backend->FailNextGet(ErrorCode::ETCD_OPERATION_ERROR);
+
+    StandbySnapshot out;
+    EXPECT_EQ(ErrorCode::OK, service_->PromoteAndExportSnapshot(out));
+    EXPECT_EQ(1u, out.oplog_sequence_id);
+}
+
 TEST_F(PromotionCatchUpTest, CompletesLegacyPrefixBeforeFirstBatch) {
     ASSERT_EQ(ErrorCode::OK,
               mock_store_->WriteOpLog(MakeEntry(1, OpType::PUT_END, "legacy_1",

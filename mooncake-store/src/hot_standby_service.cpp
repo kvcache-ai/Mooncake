@@ -21,8 +21,7 @@ namespace {
 
 bool IsRetryableBatchStandbyError(ErrorCode error) {
     return error == ErrorCode::ETCD_OPERATION_ERROR ||
-           error == ErrorCode::ETCD_CTX_CANCELLED ||
-           error == ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+           error == ErrorCode::ETCD_CTX_CANCELLED;
 }
 
 }  // namespace
@@ -725,14 +724,23 @@ ErrorCode HotStandbyService::FinalCatchUpForPromotionLocked(
     return ErrorCode::OK;
 }
 
-ErrorCode HotStandbyService::CatchUpLegacyTo(OpLogStore& store,
-                                             uint64_t target_sequence_id) {
+ErrorCode HotStandbyService::CatchUpLegacyTo(
+    OpLogStore& store, uint64_t target_sequence_id,
+    OpLogBatchStandbyPollDisposition& disposition) {
     static constexpr size_t kBatchSize = 1000;
+    disposition = OpLogBatchStandbyPollDisposition::OK;
     while (GetLocalLastAppliedSequenceIdLocked() < target_sequence_id) {
         const uint64_t current = GetLocalLastAppliedSequenceIdLocked();
         std::vector<OpLogEntry> entries;
         ErrorCode err = store.ReadOpLogSince(current, kBatchSize, entries);
-        if (err != ErrorCode::OK || entries.empty()) {
+        if (err != ErrorCode::OK) {
+            disposition = IsRetryableBatchStandbyError(err)
+                              ? OpLogBatchStandbyPollDisposition::RETRYABLE
+                              : OpLogBatchStandbyPollDisposition::FATAL;
+            return err;
+        }
+        if (entries.empty()) {
+            disposition = OpLogBatchStandbyPollDisposition::RETRYABLE;
             return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
         }
 
@@ -743,11 +751,13 @@ ErrorCode HotStandbyService::CatchUpLegacyTo(OpLogStore& store,
             }
             if (entry.sequence_id != oplog_applier_->GetExpectedSequenceId() ||
                 !oplog_applier_->ApplyOpLogEntry(entry)) {
+                disposition = OpLogBatchStandbyPollDisposition::FATAL;
                 return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
             }
             ++applied;
         }
         if (applied == 0) {
+            disposition = OpLogBatchStandbyPollDisposition::RETRYABLE;
             return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
         }
     }
@@ -766,6 +776,22 @@ ErrorCode HotStandbyService::FinalCatchUpBatchRecordsLocked(
     }
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    const auto initial_retry_delay =
+        std::chrono::milliseconds(std::max(config_.oplog_poll_interval_ms, 1));
+    const auto max_retry_delay =
+        std::max(initial_retry_delay, std::chrono::milliseconds(1000));
+    auto retry_delay = initial_retry_delay;
+    auto wait_to_retry = [&] {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            return false;
+        }
+        std::this_thread::sleep_for(std::min(
+            retry_delay, std::chrono::duration_cast<std::chrono::milliseconds>(
+                             deadline - now)));
+        retry_delay = std::min(retry_delay * 2, max_retry_delay);
+        return true;
+    };
     for (;;) {
         if (std::chrono::steady_clock::now() >= deadline) {
             return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
@@ -776,16 +802,30 @@ ErrorCode HotStandbyService::FinalCatchUpBatchRecordsLocked(
         }
         used_batch_records = true;
         if (result.error != ErrorCode::OK) {
-            return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+            if (result.disposition !=
+                    OpLogBatchStandbyPollDisposition::RETRYABLE ||
+                !wait_to_retry()) {
+                return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+            }
+            continue;
         }
+        retry_delay = initial_retry_delay;
         if (result.waiting_for_legacy_catch_up) {
             auto legacy_store = catch_up_oplog_store_for_testing_
                                     ? catch_up_oplog_store_for_testing_
                                     : watcher_oplog_store_;
-            if (!legacy_store ||
-                CatchUpLegacyTo(*legacy_store, result.legacy_catch_up_target) !=
-                    ErrorCode::OK) {
+            if (!legacy_store) {
                 return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+            }
+            OpLogBatchStandbyPollDisposition disposition;
+            ErrorCode err = CatchUpLegacyTo(
+                *legacy_store, result.legacy_catch_up_target, disposition);
+            if (err != ErrorCode::OK) {
+                if (disposition !=
+                        OpLogBatchStandbyPollDisposition::RETRYABLE ||
+                    !wait_to_retry()) {
+                    return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+                }
             }
             continue;
         }
@@ -1114,14 +1154,8 @@ void HotStandbyService::ReplicationLoop() {
                             ? OpLogBatchStandbyPollDisposition::RETRYABLE
                             : OpLogBatchStandbyPollDisposition::FATAL;
                 } else if (err == ErrorCode::OK) {
-                    result.error =
-                        CatchUpLegacyTo(*repl_oplog_store, legacy_max);
-                    if (result.error != ErrorCode::OK) {
-                        result.disposition =
-                            IsRetryableBatchStandbyError(result.error)
-                                ? OpLogBatchStandbyPollDisposition::RETRYABLE
-                                : OpLogBatchStandbyPollDisposition::FATAL;
-                    }
+                    result.error = CatchUpLegacyTo(
+                        *repl_oplog_store, legacy_max, result.disposition);
                     primary_seq_id_.store(legacy_max);
                 }
             } else {
@@ -1137,13 +1171,8 @@ void HotStandbyService::ReplicationLoop() {
                         OpLogBatchStandbyPollDisposition::FATAL;
                 } else {
                     result.error = CatchUpLegacyTo(
-                        *repl_oplog_store, result.legacy_catch_up_target);
-                    if (result.error != ErrorCode::OK) {
-                        result.disposition =
-                            IsRetryableBatchStandbyError(result.error)
-                                ? OpLogBatchStandbyPollDisposition::RETRYABLE
-                                : OpLogBatchStandbyPollDisposition::FATAL;
-                    }
+                        *repl_oplog_store, result.legacy_catch_up_target,
+                        result.disposition);
                 }
             }
 

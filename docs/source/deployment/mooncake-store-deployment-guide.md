@@ -271,11 +271,13 @@ HA uses two related but separate backends:
 
 
 - `--oplog_store_type`: Backend for OpLog storage.
-  - `etcd`: Use etcd as the OpLog store (requires `STORE_USE_ETCD` at compile time).
+  - `etcd_batch_record`: Use etcd ordered batch records (requires `STORE_USE_ETCD` at compile time).
+  - `etcd`: Use legacy per-entry etcd OpLog storage (requires `STORE_USE_ETCD` at compile time).
   - `localfs`: Use a filesystem path shared by the primary and standby masters.
-  - Empty string: Use the compile-time default (`etcd` when built with etcd support, otherwise `localfs`).
+  - Empty string: Use the compile-time default (`etcd_batch_record` when built with etcd support, otherwise `localfs`).
 - `--oplog_store_root_dir`: Root directory for the localfs OpLog store. Only used when `oplog_store_type=localfs`.
-- `--oplog_poll_interval_ms`: Polling interval in milliseconds for the localfs OpLog store.
+- `--oplog_poll_interval_ms`: Polling interval in milliseconds for localfs and the base polling/retry delay for batch standby.
+- `--batch_oplog_retry_timeout_sec`: Maximum consecutive retryable batch-standby failure window in seconds (default `180`).
 
 For snapshot-based standby bootstrap, also configure:
 
@@ -637,9 +639,10 @@ mooncake_master \
 | `--ha_backend_connstring` | empty | HA backend connection string |
 | `--etcd_endpoints` | empty | Backward-compatible etcd HA endpoints, used only for `ha_backend_type=etcd` when `--ha_backend_connstring` is empty |
 | `--cluster_id` | `mooncake_cluster` | Cluster ID for HA persistence |
-| `--oplog_store_type` | empty | OpLog store type: `etcd`, `localfs`, or empty for compile-time default (`etcd` with etcd support, otherwise `localfs`) |
+| `--oplog_store_type` | empty | OpLog store type: `etcd_batch_record`, `etcd`, `localfs`, or empty for compile-time default (`etcd_batch_record` with etcd support, otherwise `localfs`) |
 | `--oplog_store_root_dir` | `/tmp/mooncake_oplog` | Root directory for localfs OpLog store; must be shared between primary and standby when using `localfs` |
-| `--oplog_poll_interval_ms` | `1000` | Poll interval in milliseconds for localfs OpLog store |
+| `--oplog_poll_interval_ms` | `1000` | Poll interval in milliseconds for localfs and base polling/retry delay for batch standby |
+| `--batch_oplog_retry_timeout_sec` | `180` | Maximum consecutive retryable batch-standby failure window in seconds |
 
 ```{caution}
 Metadata Snapshot And Restore is experimental feature.

@@ -174,10 +174,10 @@ class CapabilityDrivenStandbyController final : public StandbyController {
         ErrorCode err = standby_service_->Start(
             observed_leader.has_value() ? observed_leader->leader_address : "",
             oplog_connstring_, config_.cluster_id);
-        const StandbySyncStatus status = standby_service_->GetSyncStatus();
 
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
+            const StandbySyncStatus status = standby_service_->GetSyncStatus();
             standby_running_ = err == ErrorCode::OK &&
                                status.state != StandbyState::FAILED &&
                                status.state != StandbyState::STOPPED;

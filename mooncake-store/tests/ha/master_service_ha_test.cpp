@@ -164,6 +164,11 @@ class MasterServiceHATest : public ::testing::Test {
     static constexpr uint64_t kStrictTenantQuotaBytes = 4 * 1024 * 1024;
     static constexpr const char* kDefaultTenant = "default";
 
+    void SetUp() override {
+        ::setenv("MOONCAKE_SNAPSHOT_LOCAL_PATH", LegacyOpLogRootDir().c_str(),
+                 1);
+    }
+
     void TearDown() override {
         for (const auto& path : policy_files_) {
             std::error_code ec;
@@ -172,6 +177,7 @@ class MasterServiceHATest : public ::testing::Test {
         policy_files_.clear();
         std::error_code ec;
         std::filesystem::remove_all(LegacyOpLogRootDir(), ec);
+        ::unsetenv("MOONCAKE_SNAPSHOT_LOCAL_PATH");
     }
 
     std::string LegacyOpLogRootDir() const {
@@ -431,8 +437,8 @@ class MasterServiceHATest : public ::testing::Test {
         return service.oplog_manager_.GetLastSequenceId();
     }
 
-    static bool SnapshotWorkerJoinableForTesting(const MasterService& service) {
-        return service.snapshot_thread_.joinable();
+    static bool SnapshotManagerCreatedForTesting(const MasterService& service) {
+        return service.snapshot_manager_ != nullptr;
     }
 
     static tl::expected<uint64_t, ErrorCode> AppendVisibleForTesting(
@@ -536,7 +542,7 @@ TEST_F(MasterServiceHATest, BatchPrimaryDoesNotStartSnapshotWorker) {
             .build();
 
     MasterService service(config);
-    EXPECT_FALSE(SnapshotWorkerJoinableForTesting(service));
+    EXPECT_FALSE(SnapshotManagerCreatedForTesting(service));
 }
 
 TEST_F(MasterServiceHATest, LegacyPrimaryStillStartsSnapshotWorker) {
@@ -552,7 +558,7 @@ TEST_F(MasterServiceHATest, LegacyPrimaryStillStartsSnapshotWorker) {
             .build();
 
     MasterService service(config);
-    EXPECT_TRUE(SnapshotWorkerJoinableForTesting(service));
+    EXPECT_TRUE(SnapshotManagerCreatedForTesting(service));
 }
 
 TEST_F(MasterServiceBatchRecordE2ETest,

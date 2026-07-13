@@ -29,6 +29,7 @@ class MasterService;
 class ReplicationStream;
 class HaKvBackend;
 class OpLogBatchStandbyReader;
+enum class OpLogBatchStandbyPollDisposition;
 
 /**
  * @brief Configuration for HotStandbyService
@@ -246,7 +247,8 @@ class HotStandbyService {
     ErrorCode FinalCatchUpForPromotionLocked(uint64_t current_applied_seq_id);
     ErrorCode FinalCatchUpBatchRecordsLocked(HaKvBackend& backend,
                                              bool& used_batch_records);
-    ErrorCode CatchUpLegacyTo(OpLogStore& store, uint64_t target_sequence_id);
+    ErrorCode CatchUpLegacyTo(OpLogStore& store, uint64_t target_sequence_id,
+                              OpLogBatchStandbyPollDisposition& disposition);
     void StopReplicationLoop();
 
     // Legacy best-effort variant of FinalCatchUpForPromotionLocked, only
