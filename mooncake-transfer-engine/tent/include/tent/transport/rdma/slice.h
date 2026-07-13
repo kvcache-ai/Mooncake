@@ -57,9 +57,13 @@ struct RdmaTask {
     std::string qp_pool;
     volatile TransferStatusEnum status_word;
     volatile size_t transferred_bytes;
-    volatile int success_slices;
-    volatile int resolved_slices;
+    std::atomic<int> success_slices{0};
+    std::atomic<int> resolved_slices{0};
     volatile TransferStatusEnum first_error = PENDING;
+
+    // Set by the control thread. Workers observe this flag before posting or
+    // retrying a slice. Already-posted WRs are allowed to drain normally.
+    std::atomic<bool> cancel_requested{false};
 
     // Reference counting for UAF protection
     std::atomic<int> ref_count{0};
@@ -92,6 +96,9 @@ struct RdmaSlice {
     int qp_index = 0;
     int retry_count = 0;
     bool failed = false;
+    // True while DeviceSelector accounts this slice against source_dev_id.
+    // The worker clears it exactly once on completion, failure, or cancel.
+    bool quota_charged = false;
     uint64_t enqueue_ts = 0;
     uint64_t submit_ts = 0;
     // Non-owning pointer to the per-worker RailMonitor for this slice's
@@ -111,15 +118,18 @@ static inline void updateSliceStatus(RdmaSlice* slice,
     if (!__sync_bool_compare_and_swap(&slice->word, PENDING, status)) return;
     if (status == COMPLETED) {
         __sync_fetch_and_add(&task->transferred_bytes, slice->length);
-        __sync_fetch_and_add(&task->success_slices, 1);
+        task->success_slices.fetch_add(1, std::memory_order_acq_rel);
     } else {
         __sync_bool_compare_and_swap(&task->first_error, PENDING, status);
     }
-    int resolved = __sync_add_and_fetch(&task->resolved_slices, 1);
+    int resolved =
+        task->resolved_slices.fetch_add(1, std::memory_order_acq_rel) + 1;
     if (resolved >= task->num_slices) {
-        TransferStatusEnum final_st = (task->success_slices == task->num_slices)
-                                          ? COMPLETED
-                                          : task->first_error;
+        TransferStatusEnum final_st =
+            (task->success_slices.load(std::memory_order_acquire) ==
+             task->num_slices)
+                ? COMPLETED
+                : task->first_error;
         if (final_st == PENDING) final_st = FAILED;
         __sync_bool_compare_and_swap(&task->status_word, PENDING, final_st);
     }
