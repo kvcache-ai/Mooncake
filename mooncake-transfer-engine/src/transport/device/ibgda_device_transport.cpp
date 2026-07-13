@@ -25,6 +25,8 @@
 #include <infiniband/mlx5dv.h>
 #include <infiniband/verbs.h>
 
+#include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -39,6 +41,28 @@ namespace mooncake {
 namespace device {
 
 static constexpr size_t kCtrlBufSize = 1024ULL * 1024 * 1024;  // 1 GiB
+
+static bool parseBoolEnvWithDefault(const char* name, bool default_value) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') return default_value;
+    std::string lower(value);
+    std::transform(
+        lower.begin(), lower.end(), lower.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return !(lower == "0" || lower == "false" || lower == "off" ||
+             lower == "no");
+}
+
+static uint32_t ibgdaDebugFlagsFromEnv() {
+    uint32_t flags = 0;
+    if (parseBoolEnvWithDefault("MOONCAKE_EP_IBGDA_SPARSE_CQE", true))
+        flags |= MLX5GDA_DEBUG_SPARSE_CQE;
+    if (parseBoolEnvWithDefault("MOONCAKE_EP_IBGDA_ATOMIC_RESERVE", true))
+        flags |= MLX5GDA_DEBUG_ATOMIC_RESERVE;
+    if (parseBoolEnvWithDefault("MOONCAKE_EP_IBGDA_DEFER_DB", true))
+        flags |= MLX5GDA_DEBUG_DEFER_DB;
+    return flags;
+}
 
 // Check if IPv6 address is IPv4-mapped (::ffff:x.x.x.x)
 static bool isIpv4Mapped(const struct in6_addr* a) {
@@ -87,7 +111,8 @@ static std::string autoDetectNic(const std::vector<std::string>& filter) {
 class IbgdaDeviceTransportImpl : public RdmaTransport {
    public:
     explicit IbgdaDeviceTransportImpl(std::vector<std::string> filter)
-        : device_filter_(std::move(filter)) {}
+        : debug_flags_(ibgdaDebugFlagsFromEnv()),
+          device_filter_(std::move(filter)) {}
 
     ~IbgdaDeviceTransportImpl() override { teardown(); }
 
@@ -100,6 +125,12 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         }
         num_ranks_ = num_ranks;
         num_qps_ = num_qps;
+        LOG(INFO) << "[EP IBGDA] debug toggles: sparse_cqe="
+                  << ((debug_flags_ & MLX5GDA_DEBUG_SPARSE_CQE) != 0)
+                  << " atomic_reserve="
+                  << ((debug_flags_ & MLX5GDA_DEBUG_ATOMIC_RESERVE) != 0)
+                  << " defer_db="
+                  << ((debug_flags_ & MLX5GDA_DEBUG_DEFER_DB) != 0);
 
         std::string nic =
             device_name.empty() ? autoDetectNic(device_filter_) : device_name;
@@ -225,6 +256,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
             mlx5gda_qp_devctx devctx{
                 .qpn = qp->qpn,
                 .wqeid_mask = qp->num_wqebb - 1,
+                .debug_flags = debug_flags_,
                 .wq = reinterpret_cast<mlx5gda_wqebb*>(
                     static_cast<char*>(ctrl_buf_dev_) + qp->wq_offset),
                 .wq_ready = reinterpret_cast<uint32_t*>(
@@ -481,6 +513,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     uint16_t lid_ = 0;
     bool is_roce_ = false;
     std::string device_name_;
+    uint32_t debug_flags_ = 0;
     std::vector<std::string> device_filter_;
 
     // Control buffer
