@@ -379,6 +379,37 @@ Status LocalTransferAdmissionQueue::complete(
     return Status::OK();
 }
 
+Status LocalTransferAdmissionQueue::cancel(QueueOwnerId owner_id) {
+    if (owner_id == 0) {
+        return Status::InvalidArgument("invalid queue owner id" LOC_MARK);
+    }
+    auto owner_it = owners_.find(owner_id);
+    if (owner_it == owners_.end()) {
+        return Status::InvalidEntry("queue owner not found" LOC_MARK);
+    }
+    auto& owner = owner_it->second;
+    if (owner.state == QueueState::Terminal) {
+        return owner.terminal_status == TransferStatusEnum::CANCELED
+                   ? Status::OK()
+                   : Status::InvalidEntry(
+                         "queue owner is already terminal" LOC_MARK);
+    }
+    if (owner.state != QueueState::Queued) {
+        return Status::InvalidEntry(
+            "queue owner is already dispatching" LOC_MARK);
+    }
+
+    owner.state = QueueState::Terminal;
+    owner.terminal_status = TransferStatusEnum::CANCELED;
+    --outstanding_owners_;
+    outstanding_bytes_ -= owner.request.length;
+    if (owner.kind == QueueOwnerKind::User) {
+        --outstanding_user_owners_;
+        outstanding_user_bytes_ -= owner.request.length;
+    }
+    return Status::OK();
+}
+
 Status LocalTransferAdmissionQueue::retireBatch(uint64_t batch_token) {
     if (batch_token == 0) {
         return Status::InvalidArgument("invalid batch token" LOC_MARK);

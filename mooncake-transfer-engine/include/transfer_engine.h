@@ -15,12 +15,15 @@
 #ifndef MULTI_TRANSFER_ENGINE_H_
 #define MULTI_TRANSFER_ENGINE_H_
 
+#include <memory>
+
 #include "memory_location.h"
 #include "multi_transport.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
 
 namespace mooncake {
+class ShutdownToken;
 class TransferEngineImpl;
 namespace tent {
 class TransferEngine;
@@ -72,9 +75,9 @@ class TransferEngine {
 
     TransferEngine(bool auto_discover, const std::vector<std::string>& filter);
 
-    TransferEngine(TransferEngine&&) = default;
+    TransferEngine(TransferEngine&& other) noexcept;
 
-    TransferEngine& operator=(TransferEngine&&) = default;
+    TransferEngine& operator=(TransferEngine&& other) noexcept;
 
     ~TransferEngine();
 
@@ -198,11 +201,13 @@ class TransferEngine {
 
     std::shared_ptr<Topology> getLocalTopology();
 
+    void enableGracefulShutdown();
     std::string showLinks(bool json = false) const;
 
    private:
     std::shared_ptr<TransferEngineImpl> impl_;
     std::shared_ptr<mooncake::tent::TransferEngine> impl_tent_;
+    std::shared_ptr<ShutdownToken> shutdown_token_;
     bool use_tent_{false};
 };
 }  // namespace mooncake

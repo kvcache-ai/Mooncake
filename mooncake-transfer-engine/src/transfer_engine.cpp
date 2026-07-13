@@ -16,9 +16,52 @@
 #include "transfer_engine.h"
 #include "show_links.h"
 #include "transfer_engine_impl.h"
+#include "graceful_shutdown.h"
+#include <mutex>
 #include <utility>
 
 namespace mooncake {
+namespace {
+
+class TransferEngineShutdownToken : public ShutdownToken {
+   public:
+    explicit TransferEngineShutdownToken(TransferEngine* engine)
+        : engine_(engine) {}
+
+    void shutdown() override {
+        TransferEngine* engine = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            engine = engine_;
+            engine_ = nullptr;
+        }
+        if (engine) engine->freeEngine();
+    }
+
+    void detach() override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        engine_ = nullptr;
+    }
+
+   private:
+    std::mutex mutex_;
+    TransferEngine* engine_;
+};
+
+std::shared_ptr<ShutdownToken> registerTransferEngineShutdownToken(
+    TransferEngine* engine) {
+    auto token = std::make_shared<TransferEngineShutdownToken>(engine);
+    registerTokenForShutdown(token);
+    return token;
+}
+
+void detachShutdownToken(std::shared_ptr<ShutdownToken>& token) {
+    if (!token) return;
+    token->detach();
+    token.reset();
+}
+
+}  // namespace
 
 TransferEngine::TransferEngine(bool auto_discover)
     : impl_(std::make_shared<TransferEngineImpl>(auto_discover)) {}
@@ -26,6 +69,33 @@ TransferEngine::TransferEngine(bool auto_discover)
 TransferEngine::TransferEngine(bool auto_discover,
                                const std::vector<std::string>& filter)
     : impl_(std::make_shared<TransferEngineImpl>(auto_discover, filter)) {}
+
+TransferEngine::TransferEngine(TransferEngine&& other) noexcept
+    : impl_(std::move(other.impl_)),
+      impl_tent_(std::move(other.impl_tent_)),
+      use_tent_(other.use_tent_) {
+    const bool shutdown_enabled = static_cast<bool>(other.shutdown_token_);
+    detachShutdownToken(other.shutdown_token_);
+    if (shutdown_enabled) {
+        shutdown_token_ = registerTransferEngineShutdownToken(this);
+        installGracefulShutdownHandlers();
+    }
+}
+
+TransferEngine& TransferEngine::operator=(TransferEngine&& other) noexcept {
+    if (this == &other) return *this;
+    freeEngine();
+    impl_ = std::move(other.impl_);
+    impl_tent_ = std::move(other.impl_tent_);
+    use_tent_ = other.use_tent_;
+    const bool shutdown_enabled = static_cast<bool>(other.shutdown_token_);
+    detachShutdownToken(other.shutdown_token_);
+    if (shutdown_enabled) {
+        shutdown_token_ = registerTransferEngineShutdownToken(this);
+        installGracefulShutdownHandlers();
+    }
+    return *this;
+}
 
 TransferEngine::~TransferEngine() { freeEngine(); }
 
@@ -38,6 +108,7 @@ int TransferEngine::init(const std::string& metadata_conn_string,
 }
 
 int TransferEngine::freeEngine() {
+    detachShutdownToken(shutdown_token_);
     if (impl_) {
         impl_->freeEngine();
         impl_.reset();
@@ -222,6 +293,13 @@ std::shared_ptr<Topology> TransferEngine::getLocalTopology() {
     return impl_->getLocalTopology();
 }
 
+void TransferEngine::enableGracefulShutdown() {
+    if (!shutdown_token_) {
+        shutdown_token_ = registerTransferEngineShutdownToken(this);
+    }
+    installGracefulShutdownHandlers();
+}
+
 std::string TransferEngine::showLinks(bool json) const {
     if (!impl_) return "{}";
     return json ? buildShowLinksJson(impl_.get())
@@ -235,10 +313,53 @@ std::string TransferEngine::showLinks(bool json) const {
 #include "tent/transfer_engine.h"
 #include "tent/common/config.h"
 
+#include <mutex>
 #include <utility>
+#include "graceful_shutdown.h"
 #include "show_links.h"
 
 namespace mooncake {
+namespace {
+
+class TransferEngineShutdownToken : public ShutdownToken {
+   public:
+    explicit TransferEngineShutdownToken(TransferEngine* engine)
+        : engine_(engine) {}
+
+    void shutdown() override {
+        TransferEngine* engine = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            engine = engine_;
+            engine_ = nullptr;
+        }
+        if (engine) engine->freeEngine();
+    }
+
+    void detach() override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        engine_ = nullptr;
+    }
+
+   private:
+    std::mutex mutex_;
+    TransferEngine* engine_;
+};
+
+std::shared_ptr<ShutdownToken> registerTransferEngineShutdownToken(
+    TransferEngine* engine) {
+    auto token = std::make_shared<TransferEngineShutdownToken>(engine);
+    registerTokenForShutdown(token);
+    return token;
+}
+
+void detachShutdownToken(std::shared_ptr<ShutdownToken>& token) {
+    if (!token) return;
+    token->detach();
+    token.reset();
+}
+
+}  // namespace
 
 TransferEngine::TransferEngine(bool auto_discover) {
     if (getenv("MC_USE_TENT") || getenv("MC_USE_TEV1")) {
@@ -257,6 +378,34 @@ TransferEngine::TransferEngine(bool auto_discover,
     if (!use_tent_) {
         impl_ = std::make_shared<TransferEngineImpl>(auto_discover, filter);
     }
+}
+
+TransferEngine::TransferEngine(TransferEngine&& other) noexcept
+    : impl_(std::move(other.impl_)),
+      impl_tent_(std::move(other.impl_tent_)),
+      shutdown_token_(nullptr),
+      use_tent_(other.use_tent_) {
+    const bool shutdown_enabled = static_cast<bool>(other.shutdown_token_);
+    detachShutdownToken(other.shutdown_token_);
+    if (shutdown_enabled) {
+        shutdown_token_ = registerTransferEngineShutdownToken(this);
+        installGracefulShutdownHandlers();
+    }
+}
+
+TransferEngine& TransferEngine::operator=(TransferEngine&& other) noexcept {
+    if (this == &other) return *this;
+    freeEngine();
+    impl_ = std::move(other.impl_);
+    impl_tent_ = std::move(other.impl_tent_);
+    use_tent_ = other.use_tent_;
+    const bool shutdown_enabled = static_cast<bool>(other.shutdown_token_);
+    detachShutdownToken(other.shutdown_token_);
+    if (shutdown_enabled) {
+        shutdown_token_ = registerTransferEngineShutdownToken(this);
+        installGracefulShutdownHandlers();
+    }
+    return *this;
 }
 
 TransferEngine::~TransferEngine() { freeEngine(); }
@@ -308,6 +457,7 @@ int TransferEngine::init(const std::string& metadata_conn_string,
 }
 
 int TransferEngine::freeEngine() {
+    detachShutdownToken(shutdown_token_);
     if (!use_tent_ && impl_) {
         impl_->freeEngine();
         impl_.reset();
@@ -676,6 +826,13 @@ void* TransferEngine::getBaseAddr() {
         return nullptr;
     } else
         return impl_->getBaseAddr();
+}
+
+void TransferEngine::enableGracefulShutdown() {
+    if (!shutdown_token_) {
+        shutdown_token_ = registerTransferEngineShutdownToken(this);
+    }
+    installGracefulShutdownHandlers();
 }
 
 std::string TransferEngine::showLinks(bool json) const {

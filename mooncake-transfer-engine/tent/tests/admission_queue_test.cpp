@@ -298,6 +298,40 @@ TEST(AdmissionQueueTest, RequiresDispatchBeforeTerminalCompletion) {
     EXPECT_EQ(status.code(), Status::Code::kInvalidEntry);
 }
 
+TEST(AdmissionQueueTest, CancelsQueuedOwnerAndReleasesAccounting) {
+    LocalTransferAdmissionQueue queue({2, 128, 0, 0});
+    std::vector<QueueOwnerId> admitted_ids;
+    ASSERT_TRUE(
+        queue.tryAdmit(makeSubmit(1, 1, {makeOwner(0, 16)}), admitted_ids)
+            .ok());
+    ASSERT_EQ(admitted_ids.size(), 1u);
+
+    EXPECT_TRUE(queue.cancel(admitted_ids[0]).ok());
+    EXPECT_TRUE(queue.cancel(admitted_ids[0]).ok());
+    EXPECT_EQ(queue.outstandingOwners(), 0u);
+    EXPECT_EQ(queue.outstandingBytes(), 0u);
+    EXPECT_TRUE(queue.pickForDispatch(1, 16).empty());
+
+    TransferStatusEnum status = PENDING;
+    ASSERT_TRUE(queue.getPublicStatus(1, 0, status).ok());
+    EXPECT_EQ(status, CANCELED);
+    EXPECT_TRUE(queue.retireBatch(1).ok());
+}
+
+TEST(AdmissionQueueTest, RejectsQueueCancelAfterDispatchStarts) {
+    LocalTransferAdmissionQueue queue({2, 128, 0, 0});
+    std::vector<QueueOwnerId> admitted_ids;
+    ASSERT_TRUE(
+        queue.tryAdmit(makeSubmit(1, 1, {makeOwner(0, 16)}), admitted_ids)
+            .ok());
+    auto picked = queue.pickForDispatch(1, 16);
+    ASSERT_EQ(picked.size(), 1u);
+
+    EXPECT_TRUE(queue.cancel(picked[0]).IsInvalidEntry());
+    EXPECT_EQ(queue.outstandingOwners(), 1u);
+    EXPECT_TRUE(queue.complete(picked[0], COMPLETED).ok());
+}
+
 TEST(AdmissionQueueTest, RetainsTerminalStatusUntilBatchRetire) {
     LocalTransferAdmissionQueue queue({2, 128, 0, 0});
     std::vector<QueueOwnerId> admitted_ids;

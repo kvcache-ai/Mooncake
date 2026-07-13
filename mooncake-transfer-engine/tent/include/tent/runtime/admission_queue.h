@@ -136,6 +136,11 @@ class LocalTransferAdmissionQueue {
 
     Status complete(QueueOwnerId owner_id, TransferStatusEnum terminal_status);
 
+    // Cancel an owner that has not entered the dispatch window. Idempotent for
+    // an owner already canceled; dispatching owners must be canceled through
+    // their selected transport instead.
+    Status cancel(QueueOwnerId owner_id);
+
     Status retireBatch(uint64_t batch_token);
 
     Status resolveOwner(uint64_t batch_token, size_t public_task_id,
