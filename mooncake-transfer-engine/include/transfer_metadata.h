@@ -153,6 +153,10 @@ class TransferMetadata {
         uint16_t barex_port;
 #endif
         std::vector<uint32_t> qp_num;
+        bool ready_ack = false;
+        // Capability marker. Encoded only by transports that opt into
+        // ready_ack; decoded from field presence to detect peer support.
+        bool ready_ack_supported = false;
         std::string reply_msg;  // on error
 #ifdef USE_EFA
         std::string efa_addr;  // EFA endpoint address (hex encoded)
