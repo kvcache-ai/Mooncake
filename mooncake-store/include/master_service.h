@@ -3,12 +3,14 @@
 #include <algorithm>
 #include <boost/functional/hash.hpp>
 #include <functional>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
 #include <ylt/util/tl/expected.hpp>
 
+#include "ha/oplog/oplog_manager.h"
 #include "types.h"
 #include "rpc_types.h"
 #include "replica.h"
@@ -47,13 +49,13 @@ class MasterService {
     /**
      * @brief Register a client with its segments.
      */
-    auto RegisterClient(const RegisterClientRequest& req)
+    virtual auto RegisterClient(const RegisterClientRequest& req)
         -> tl::expected<RegisterClientResponse, ErrorCode>;
 
     /**
      * @brief Unregister a client, removing all its routing metadata
      */
-    auto UnregisterClient(const UnregisterClientRequest& req)
+    virtual auto UnregisterClient(const UnregisterClientRequest& req)
         -> tl::expected<UnregisterClientResponse, ErrorCode>;
 
     /**
@@ -76,7 +78,7 @@ class MasterService {
      * @return ErrorCode::SEGMENT_ALREADY_EXISTS if it is already mounted.
      *         ErrorCode::CLIENT_UNHEALTHY if the client is unhealthy.
      */
-    auto MountSegment(const Segment& segment, const UUID& client_id)
+    virtual auto MountSegment(const Segment& segment, const UUID& client_id)
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -85,7 +87,7 @@ class MasterService {
      *         ErrorCode::SEGMENT_NOT_FOUND if the segment doesn't exist
      *         ErrorCode::CLIENT_UNHEALTHY if the client is unhealthy
      */
-    auto UnmountSegment(const UUID& segment_id, const UUID& client_id)
+    virtual auto UnmountSegment(const UUID& segment_id, const UUID& client_id)
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -206,6 +208,8 @@ class MasterService {
      * @return The count of keys
      */
     size_t GetKeyCount() const;
+
+    OpLogManager* GetOpLogManager() const { return oplog_manager_.get(); }
 
    protected:
     struct ObjectMetadata {
@@ -577,6 +581,7 @@ class MasterService {
     // if high availability features enabled
     const bool enable_ha_;
     ViewVersionId view_version_;
+    std::unique_ptr<OpLogManager> oplog_manager_;
 
     friend class MetadataAccessorRW;
     friend class MetadataAccessorRO;

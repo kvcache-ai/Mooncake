@@ -127,6 +127,12 @@ DEFINE_string(cxl_path, mooncake::DEFAULT_CXL_PATH,
 DEFINE_uint64(cxl_size, mooncake::DEFAULT_CXL_SIZE, "CXL memory size in bytes");
 DEFINE_bool(enable_cxl, false, "Whether to enable CXL memory support");
 
+DEFINE_bool(enable_oplog, false, "Enable OpLog recording for master metadata");
+DEFINE_string(oplog_store_type, "localfs",
+              "OpLog store backend type. Currently supports localfs");
+DEFINE_string(oplog_data_dir, "/tmp/mooncake_oplog",
+              "Root directory for localfs OpLog data");
+
 // Redis election backend configuration
 DEFINE_string(election_backend, "etcd",
               "Election backend for HA leader election: 'etcd' (default) or "
@@ -190,6 +196,13 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
 
     default_config.GetBool("enable_ha", &master_config.enable_ha,
                            FLAGS_enable_ha);
+    default_config.GetBool("enable_oplog", &master_config.enable_oplog,
+                           FLAGS_enable_oplog);
+    default_config.GetString("oplog_store_type",
+                             &master_config.oplog_store_type,
+                             FLAGS_oplog_store_type);
+    default_config.GetString("oplog_data_dir", &master_config.oplog_data_dir,
+                             FLAGS_oplog_data_dir);
     default_config.GetBool("enable_offload", &master_config.enable_offload,
                            FLAGS_enable_offload);
     default_config.GetString("etcd_endpoints", &master_config.etcd_endpoints,
@@ -383,6 +396,21 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.enable_ha = FLAGS_enable_ha;
+    }
+    if ((google::GetCommandLineFlagInfo("enable_oplog", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_oplog = FLAGS_enable_oplog;
+    }
+    if ((google::GetCommandLineFlagInfo("oplog_store_type", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.oplog_store_type = FLAGS_oplog_store_type;
+    }
+    if ((google::GetCommandLineFlagInfo("oplog_data_dir", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.oplog_data_dir = FLAGS_oplog_data_dir;
     }
     if ((google::GetCommandLineFlagInfo("enable_offload", &info) &&
          !info.is_default) ||
@@ -684,6 +712,9 @@ int main(int argc, char* argv[]) {
         << ", eviction_high_watermark_ratio="
         << master_config.eviction_high_watermark_ratio
         << ", enable_ha=" << master_config.enable_ha
+        << ", enable_oplog=" << master_config.enable_oplog
+        << ", oplog_store_type=" << master_config.oplog_store_type
+        << ", oplog_data_dir=" << master_config.oplog_data_dir
         << ", enable_offload=" << master_config.enable_offload
         << ", etcd_endpoints=" << master_config.etcd_endpoints
         << ", client_ttl=" << master_config.client_live_ttl_sec
