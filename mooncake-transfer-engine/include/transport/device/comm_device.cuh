@@ -95,8 +95,8 @@ __device__ __forceinline__ void mc_rdma_put(
             ctx.ibgda.raddrs[dst_rank] +
             (reinterpret_cast<const char*>(recv_ptr) -
              reinterpret_cast<const char*>(ctx.p2p.local_base));
-        mc_ibgda_put(ctx.ibgda, channel, dst_rank, ctx.rank, qps_per_rank,
-                     send_ptr, recv_raddr, nbytes);
+        mc_ibgda_put_defer_db(ctx.ibgda, channel, dst_rank, ctx.rank,
+                              qps_per_rank, send_ptr, recv_raddr, nbytes);
     }
 }
 

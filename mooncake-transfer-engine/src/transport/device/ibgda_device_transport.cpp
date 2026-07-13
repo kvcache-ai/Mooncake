@@ -227,6 +227,8 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                 .wqeid_mask = qp->num_wqebb - 1,
                 .wq = reinterpret_cast<mlx5gda_wqebb*>(
                     static_cast<char*>(ctrl_buf_dev_) + qp->wq_offset),
+                .wq_ready = reinterpret_cast<uint32_t*>(
+                    static_cast<char*>(ctrl_buf_dev_) + qp->ready_offset),
                 .cq = reinterpret_cast<mlx5_cqe64*>(
                     static_cast<char*>(ctrl_buf_dev_) + qp->send_cq->cq_offset),
                 .dbr = reinterpret_cast<mlx5gda_wq_dbr*>(
