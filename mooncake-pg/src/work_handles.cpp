@@ -1,61 +1,30 @@
 #include <work_handles.h>
+#include <mooncake_backend.h>
 #include <mooncake_worker.cuh>
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDAGraphsUtils.cuh>
-#include <cuda_runtime.h>
 #include "pg_utils.h"
 
 namespace mooncake {
 
-FailedRanksHint FailedRanksHint::allocate(int n, bool isCpu) {
-    if (isCpu) {
-        return {torch::zeros({n}, torch::kInt32), nullptr,
-                torch::zeros({n}, torch::kInt32), nullptr};
-    }
-    auto alloc_mapped = [n](at::Tensor& tensor, int*& host_ptr, int*& dev_ptr) {
-        cudaError_t err =
-            cudaHostAlloc(&host_ptr, n * sizeof(int), cudaHostAllocMapped);
-        TORCH_CHECK(err == cudaSuccess,
-                    "cudaHostAlloc failed: ", cudaGetErrorString(err));
-        err = cudaHostGetDevicePointer(reinterpret_cast<void**>(&dev_ptr),
-                                       host_ptr, 0);
-        TORCH_CHECK(err == cudaSuccess, "cudaHostGetDevicePointer failed: ",
-                    cudaGetErrorString(err));
-        std::memset(host_ptr, 0, n * sizeof(int));
-        auto deleter = [](void* ptr) { cudaFreeHost(ptr); };
-        tensor = torch::from_blob(host_ptr, {n}, deleter,
-                                  torch::TensorOptions().dtype(torch::kInt32));
-    };
-
-    at::Tensor failed_tensor;
-    int* failed_host = nullptr;
-    int* failed_dev = nullptr;
-    alloc_mapped(failed_tensor, failed_host, failed_dev);
-
-    at::Tensor attempted_tensor;
-    int* attempted_host = nullptr;
-    int* attempted_dev = nullptr;
-    alloc_mapped(attempted_tensor, attempted_host, attempted_dev);
-
-    return {failed_tensor, failed_dev, attempted_tensor, attempted_dev};
+FailedRanksHint FailedRanksHint::allocate(int n) {
+    auto options =
+        torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU);
+    return {torch::zeros({n}, options), torch::zeros({n}, options)};
 }
 
 bool MooncakeWorkCpu::wait(std::chrono::milliseconds timeout) {
     future_->wait();
     bool ok = future_->completed() && !future_->hasError();
-    if (ok) {
-        bool all_ok = true;
-        int* data = failedRanksHint_.data();
-        for (int i = 0; i < meta_->size; ++i) {
-            if (data[i] != 0) {
-                all_ok = false;
-                break;
-            }
+
+    if (meta_->autoSyncOnFailure) {
+        if (ok && !getLocalSuccess()) {
+            LOG(INFO) << "Local failure detected on cpu work, triggering "
+                         "syncAfterFailure";
+            meta_->backend->syncAfterFailure();
         }
-        failedRanksHint_.local_success = all_ok;
-    } else {
-        failedRanksHint_.local_success = false;
     }
+
     return ok;
 }
 
@@ -134,16 +103,15 @@ bool MooncakeWorkCuda::wait(std::chrono::milliseconds timeout) {
     auto current_stream = at::cuda::getCurrentCUDAStream();
     event_->block(current_stream);
 
-    // Compute local_success: true iff no peer failed in this operation.
-    bool all_ok = true;
-    int* data = failedRanksHint_.data();
-    for (int i = 0; i < meta_->size; ++i) {
-        if (data[i] != 0) {
-            all_ok = false;
-            break;
+    // Auto sync-on-failure.
+    // WARNING: getLocalSuccess() synchronizes the GPU event, blocking the
+    // calling thread.  With autoSyncOnFailure=true, every collective is
+    // effectively synchronous (async_op=True is defeated).
+    if (meta_->autoSyncOnFailure) {
+        if (!getLocalSuccess()) {
+            meta_->backend->syncAfterFailure();
         }
     }
-    failedRanksHint_.local_success = all_ok;
 
     return true;
 }
@@ -163,17 +131,34 @@ bool MooncakeBarrierWorkCuda::wait(std::chrono::milliseconds timeout) {
 
     if (timeout == kNoTimeout) {
         event_->synchronize();
+        if (!getLocalSuccess()) {
+            if (meta_->autoSyncOnFailure) {
+                meta_->backend->syncAfterFailure();
+            }
+        }
         return true;
     }
 
     BackoffWaiter waiter(
         BackoffWaiterConfig::constantSleep(std::chrono::microseconds(10)));
-    return waiter.wait_for(timeout, [this] { return event_->query(); });
+    bool ok = waiter.wait_for(timeout, [this] { return event_->query(); });
+
+    if (ok && meta_->autoSyncOnFailure) {
+        if (!getLocalSuccess()) {
+            meta_->backend->syncAfterFailure();
+        }
+    }
+
+    return ok;
+}
+
+at::Tensor MooncakeWorkCpu::getFailedRanksHint() const {
+    return failedRanksHint_.tensor;
 }
 
 at::Tensor MooncakeWorkCuda::getFailedRanksHint() const {
-    // Ensure the worker thread has completed the task and set
-    // failedRanksHintHost before returning the tensor.
+    // Ensure the worker thread has completed the task and written
+    // the failed-ranks bitmap before returning the tensor.
     if (event_ && at::cuda::currentStreamCaptureStatus() ==
                       c10::cuda::CaptureStatus::None) {
         event_->synchronize();
@@ -181,9 +166,19 @@ at::Tensor MooncakeWorkCuda::getFailedRanksHint() const {
     return failedRanksHint_.tensor;
 }
 
-bool MooncakeWorkCuda::getLocalSuccess() const {
-    return failedRanksHint_.local_success;
+bool MooncakeWorkCpu::getLocalSuccess() const {
+    return failedRanksHint_.isLocalSuccess(meta_->maxGroupSize);
 }
+
+bool MooncakeWorkCuda::getLocalSuccess() const {
+    if (event_ && at::cuda::currentStreamCaptureStatus() ==
+                      c10::cuda::CaptureStatus::None) {
+        event_->synchronize();
+    }
+    return failedRanksHint_.isLocalSuccess(meta_->maxGroupSize);
+}
+
+bool MooncakeP2PWork::getLocalSuccess() const { return isSuccess(); }
 
 bool MooncakeP2PWork::isCompleted() {
     return status_->load(std::memory_order_acquire) !=

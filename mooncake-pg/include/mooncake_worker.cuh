@@ -38,11 +38,10 @@ class MooncakeBackend;
 struct TransferGroupMeta {
     InGroupRank rank;
     GlobalRank globalRank;
-    // rank_order maps InGroupRank (0 .. size-1) to GlobalRank.
+    // rank_order maps InGroupRank (0 .. maxGroupSize-1) to GlobalRank.
     GlobalRank rank_order[kMaxNumRanks];
 
-    int size;        // capacity: number of in-group slots allocated
-    int activeSize;  // Number of in-group slots that is active
+    int maxGroupSize;  // capacity: number of in-group slots allocated
     int taskCount;
 
     GroupId group_id;
@@ -52,19 +51,20 @@ struct TransferGroupMeta {
     bool* activeRanksDevice;
 #if !defined(__MUSA__)
     at::Tensor
-        activeRanksTensor;  // length = this->size, ordered by InGroupRank
+        activeRanksTensor;  // length = maxGroupSize, ordered by InGroupRank
 #endif
     TransferEngine* engine;
     // segmentIDs and segmentInfos are indexed by InGroupRank (size
-    // kMaxNumRanks, but only slots 0 .. size-1 are valid). Collective code and
-    // the P2P proxy can index them directly by the local peer's in-group rank.
-    // The segment ID values themselves are global TransferEngine handles,
-    // resolved from the corresponding GlobalRank by the control plane.
+    // kMaxNumRanks, but only slots 0 .. maxGroupSize-1 are valid). Collective
+    // code and the P2P proxy can index them directly by the local peer's
+    // in-group rank. The segment ID values themselves are global TransferEngine
+    // handles, resolved from the corresponding GlobalRank by the control plane.
     TransferMetadata::SegmentID
         segmentIDs[kMaxNumRanks];  // synced by control plane
     GroupEndpointInfo segmentInfos[kMaxNumRanks];
     const size_t* collectiveTimeoutUs = nullptr;
     MooncakeBackend* backend = nullptr;  // for failure reporting / link check
+    bool autoSyncOnFailure = true;  // per-group, set at backend construction
 };
 
 #if defined(__CUDACC__) || defined(__MUSA__)
@@ -80,19 +80,15 @@ __global__
     uint64_t submitSequence = 0;
     BatchID batchID;
     void* transferGroupMeta;
-    int* failedRanksHintHost = nullptr;  // per-op bitmap indexed by InGroupRank
-    int* attemptedRanksHintHost =
-        nullptr;  // per-op bitmap indexed by InGroupRank
 };
 
 #if !defined(__MUSA__)
 void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
                         size_t numRanks, c10d::ReduceOp op, bool* activeRanks,
-                        int* failedRanksHint, cudaStream_t stream);
+                        cudaStream_t stream);
 
 void launchReduceCpu(at::Tensor dst, size_t pos, size_t realSize, void* src,
-                     size_t numRanks, c10d::ReduceOp op, bool* activeRanks,
-                     int* failedRanksHint);
+                     size_t numRanks, c10d::ReduceOp op, bool* activeRanks);
 void preloadReduceKernels();
 
 class MooncakeWorker {
@@ -158,6 +154,11 @@ class MooncakeWorker {
     int cudaTaskCount = 0;
     std::atomic<uint64_t> next_cuda_task_sequence_{1};
     std::atomic<uint64_t> submitted_task_sequence_[kNumTasks_]{};
+
+    // Per-slot tensor references keep the bitmap memory alive until the
+    // worker is done.
+    at::Tensor task_failed_tensor_[kNumTasks_];
+    at::Tensor task_attempted_tensor_[kNumTasks_];
 
     std::thread worker_thread_;
 };

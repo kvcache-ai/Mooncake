@@ -87,21 +87,18 @@ class AgentInterface {
 
     virtual void pushTransferObservation(
         std::vector<uint8_t> attempted_ranks,
-        std::vector<uint8_t> failed_ranks_hint,
-        std::vector<uint8_t> succeeded_ranks) = 0;
+        std::vector<uint8_t> failed_ranks_hint) = 0;
 
     virtual SyncAfterFailureResponse syncAfterFailure(GroupId group_id) = 0;
 
     // Accessors.
     virtual uint64_t getAgentSessionEpoch() = 0;
 
-    // Thread-safe: process-level rank state.
     virtual RankState getRankState(GlobalRank rank) = 0;
 
-    // Thread-safe: rank is active in the given group.
     virtual bool isRankActive(GroupId group_id, InGroupRank rank) = 0;
 
-    // Best-effort: Healthy + isMember + hasEndpoint (thread-safe).
+    // Best-effort: Healthy + isMember + hasEndpoint
     virtual bool maybeActivatable(GroupId group_id, InGroupRank rank) = 0;
 };
 
@@ -157,9 +154,9 @@ class AgentHost : public AgentInterface {
     ProposeViewUpdateResponse proposeDeactivate(
         GroupId group_id, const std::vector<GlobalRank>& ranks) override;
 
-    void pushTransferObservation(std::vector<uint8_t> attempted_ranks,
-                                 std::vector<uint8_t> failed_ranks_hint,
-                                 std::vector<uint8_t> succeeded_ranks) override;
+    void pushTransferObservation(
+        std::vector<uint8_t> attempted_ranks,
+        std::vector<uint8_t> failed_ranks_hint) override;
 
     SyncAfterFailureResponse syncAfterFailure(GroupId group_id) override;
 

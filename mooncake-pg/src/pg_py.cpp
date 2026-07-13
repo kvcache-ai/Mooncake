@@ -56,9 +56,6 @@ static AgentHost& initControlPlane(const c10::intrusive_ptr<c10d::Store>& store,
     std::call_once(g_init_control_plane_once, [&] {
         g_ctx.max_world_size = max_world_size;
 
-        LOG(INFO) << "initControlPlane BEGIN rank=" << rank
-                  << " store_ptr=" << store.get();
-
         // Ordering constraint: AgentHost::start() sends registerAgent
         // immediately, which includes LinkManager's localServerName() and
         // getWarmupRecvAddr().  These must be non-empty, so the engine and
@@ -322,14 +319,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     py::class_<MooncakeBackend::MooncakeBackendOptions,
                c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>>(
         m, "MooncakeBackendOptions")
+        // Recommended
+        .def(py::init<int>(), py::arg("max_group_size"))
+        .def(py::init<int, bool, bool>(), py::arg("max_group_size"),
+             py::arg("auto_deactivate_on_failure") = true,
+             py::arg("auto_sync_on_failure") = true)
+        // Deprecated (retained for compatibility)
         .def(py::init<at::Tensor>(), py::arg("active_ranks"))
         .def(py::init<at::Tensor, bool>(), py::arg("active_ranks"),
              py::arg("is_extension"))
         .def(py::init<at::Tensor, bool, int>(), py::arg("active_ranks"),
-             py::arg("is_extension"), py::arg("max_group_size"))
-        .def(py::init<at::Tensor, bool, int, bool>(), py::arg("active_ranks"),
-             py::arg("is_extension"), py::arg("max_group_size"),
-             py::arg("auto_deactivate_on_failure"));
+             py::arg("is_extension"), py::arg("max_group_size"));
 }
 
 }  // namespace mooncake

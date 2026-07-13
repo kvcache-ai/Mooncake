@@ -172,21 +172,20 @@ class RpcClient {
             auto send_lazy = co_await client->template send_request<Func, Req>(
                 std::move(req));
             auto res = co_await std::move(send_lazy);
+            if (state->shutdown.load(std::memory_order_acquire)) co_return;
             if (res) {
                 cb(std::move(res.value().result()));
             } else {
-                if (!state->shutdown.load(std::memory_order_acquire)) {
-                    VLOG(1) << "RpcClient: async rpc to " << addr
-                            << " failed: " << res.error().msg;
-                }
+                VLOG(1) << "RpcClient: async rpc to " << addr
+                        << " failed: " << res.error().msg;
                 cb(ResponseType{});
             }
         } catch (const std::exception& e) {
             if (!state->shutdown.load(std::memory_order_acquire)) {
                 VLOG(1) << "RpcClient: async rpc caught exception: "
                         << e.what();
+                cb(ResponseType{});
             }
-            cb(ResponseType{});
         }
     }
 

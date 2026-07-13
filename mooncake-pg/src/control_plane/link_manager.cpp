@@ -77,8 +77,7 @@ void LinkManager::init(GlobalRank rank, int max_world_size,
                                               max_world_size_ * sizeof(int32_t),
                                               kWildcardLocation);
         if (rc != 0) {
-            warmup_send_region_.reset();
-            LOG(ERROR) << "LinkManager: failed to register warmup send region";
+            LOG(FATAL) << "LinkManager: failed to register warmup send region";
         }
 
         warmup_recv_region_ = std::make_unique<int32_t[]>(max_world_size_);
@@ -88,10 +87,9 @@ void LinkManager::init(GlobalRank rank, int max_world_size,
                                           max_world_size_ * sizeof(int32_t),
                                           kWildcardLocation);
         if (rc != 0) {
-            LOG(ERROR)
+            LOG(FATAL)
                 << "LinkManager: failed to register warmup recv region, rc="
                 << rc;
-            warmup_recv_region_.reset();
         }
     }
 

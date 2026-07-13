@@ -18,9 +18,7 @@ namespace mooncake {
 __global__ void enqueueTaskKernel(int opType, size_t tensorSize,
                                   int64_t broadcastRoot, int bufferOffset,
                                   uint64_t submitSequence, void* meta,
-                                  Task* tasks, int* failedRanksHintHostPtr,
-                                  int* attemptedRanksHintHostPtr,
-                                  size_t taskId) {
+                                  Task* tasks, size_t taskId) {
     // Copy task into slot
     tasks[taskId].opType = opType;
     tasks[taskId].tensorSize = tensorSize;
@@ -28,8 +26,6 @@ __global__ void enqueueTaskKernel(int opType, size_t tensorSize,
     tasks[taskId].bufferOffset = bufferOffset;
     tasks[taskId].submitSequence = submitSequence;
     tasks[taskId].transferGroupMeta = meta;
-    tasks[taskId].failedRanksHintHost = failedRanksHintHostPtr;
-    tasks[taskId].attemptedRanksHintHost = attemptedRanksHintHostPtr;
 
     // Publish task metadata before notifying the host worker thread.
     __threadfence_system();
@@ -44,7 +40,7 @@ __global__ void enqueueTaskKernel(int opType, size_t tensorSize,
 template <typename scalar_t>
 __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
                              size_t numElements, size_t numRanks, int op,
-                             bool* activeRanks, int* failedRanksHint) {
+                             bool* activeRanks) {
     size_t thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
     size_t stride = blockDim.x * gridDim.x;
 
@@ -65,10 +61,13 @@ __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
         acc_t acc = 0;
         for (size_t rank = 0; rank < numRanks; ++rank) {
             // activeRanks is indexed by InGroupRank, just like the loop rank.
-            bool shouldInclude =
-                activeRanks[rank] &&
-                (!failedRanksHint || failedRanksHint[rank] == 0);
-            if (shouldInclude) {
+            // Note: failedRanksHint is intentionally NOT checked here.
+            // When a peer fails mid-operation its recv-buffer data may be
+            // garbage, so the reduce result is only guaranteed correct when
+            // no peers failed (failedRanks == 0).  The work handle reports
+            // local_success = false on any failure so the application knows
+            // to discard and retry.
+            if (activeRanks[rank]) {
                 if (!valid) {
                     if constexpr (kIsBf16) {
                         acc = (float)src[rank * numElements + elem_idx];
@@ -142,22 +141,18 @@ namespace mooncake {
 void launchEnqueueTaskKernel(int opType, size_t tensorSize,
                              int64_t broadcastRoot, int bufferOffset,
                              uint64_t submitSequence, void* meta, Task* tasks,
-                             int* failedRanksHintHostPtr,
-                             int* attemptedRanksHintHostPtr, size_t taskId,
-                             cudaStream_t stream) {
-    enqueueTaskKernel<<<1, 1, 0, stream>>>(
-        opType, tensorSize, broadcastRoot, bufferOffset, submitSequence, meta,
-        tasks, failedRanksHintHostPtr, attemptedRanksHintHostPtr, taskId);
+                             size_t taskId, cudaStream_t stream) {
+    enqueueTaskKernel<<<1, 1, 0, stream>>>(opType, tensorSize, broadcastRoot,
+                                           bufferOffset, submitSequence, meta,
+                                           tasks, taskId);
 }
 
 #define DEF_LAUNCH_REDUCE(scalar_t, suffix)                                   \
     void launchReduceKernel_##suffix(                                         \
         scalar_t* dst, const scalar_t* src, size_t numElements,               \
-        size_t numRanks, int op, bool* activeRanks, int* failedRanksHint,     \
-        cudaStream_t stream) {                                                \
+        size_t numRanks, int op, bool* activeRanks, cudaStream_t stream) {    \
         reduceKernel<<<64, 256, 0, stream>>>(dst, src, numElements, numRanks, \
-                                             op, activeRanks,                 \
-                                             failedRanksHint);                \
+                                             op, activeRanks);                \
     }
 
 DEF_LAUNCH_REDUCE(uint8_t, uint8)
@@ -173,15 +168,15 @@ DEF_LAUNCH_REDUCE(bool, bool)
 
 void launchReduceKernel_bf16(void* dst, const void* src, size_t numElements,
                              size_t numRanks, int op, bool* activeRanks,
-                             int* failedRanksHint, cudaStream_t stream) {
+                             cudaStream_t stream) {
 #ifdef __MUSA__
-    reduceKernel<<<64, 256, 0, stream>>>(
-        (mt_bfloat16*)dst, (const mt_bfloat16*)src, numElements, numRanks, op,
-        activeRanks, failedRanksHint);
+    reduceKernel<<<64, 256, 0, stream>>>((mt_bfloat16*)dst,
+                                         (const mt_bfloat16*)src, numElements,
+                                         numRanks, op, activeRanks);
 #else
-    reduceKernel<<<64, 256, 0, stream>>>(
-        (at::BFloat16*)dst, (const at::BFloat16*)src, numElements, numRanks, op,
-        activeRanks, failedRanksHint);
+    reduceKernel<<<64, 256, 0, stream>>>((at::BFloat16*)dst,
+                                         (const at::BFloat16*)src, numElements,
+                                         numRanks, op, activeRanks);
 #endif
 }
 

@@ -53,6 +53,7 @@ AgentApplyResult AgentStateMachine::handlePeerJoined(
     auto old = rank_connections_[push.rank];
     if (old.has_value() && old->te_server_name != push.te_server_name) {
         effects.push_back(DisconnectLink{push.rank});
+        effects.push_back(NotifyLinkRefreshed{push.rank});
     }
 
     rank_connections_[push.rank] = RankConnectionMetadata{
@@ -60,8 +61,7 @@ AgentApplyResult AgentStateMachine::handlePeerJoined(
         .te_server_name = push.te_server_name,
         .warmup_recv_addr = push.warmup_recv_addr,
     };
-    // Seed so the first observation of any kind triggers a report.
-    last_reported_peer_status_[push.rank] = true;
+    last_reported_peer_status_[push.rank] = false;
 
     effects.push_back(
         EnablePeerProbe{push.rank, push.te_server_name, push.warmup_recv_addr});
@@ -98,6 +98,7 @@ AgentApplyResult AgentStateMachine::handleRankStateUpdate(
         push.new_state == static_cast<uint8_t>(RankState::Offline)) {
         effects.push_back(DisconnectLink{push.rank});
         effects.push_back(StopReconnect{push.rank});
+        effects.push_back(NotifyLinkRefreshed{push.rank});
     }
 
     return effects;
@@ -114,8 +115,14 @@ AgentApplyResult AgentStateMachine::handleViewUpdate(
         return effects;
     }
 
-    // Detect endpoint updates.
     const auto& old_view = it->second;
+
+    // Collect peers whose segment caches must be refreshed.
+    // This should be done after ApplyViewToBackend updates each
+    // backend's rank_order, since refreshSegmentID requires rank_order.
+    std::vector<GlobalRank> need_segment_refresh;
+
+    // Detect endpoint updates.
     for (size_t r = 0; r < push.view.members.size(); ++r) {
         if (r == static_cast<size_t>(rank_)) continue;
         if (!push.view.members[r].isMember()) continue;
@@ -129,6 +136,7 @@ AgentApplyResult AgentStateMachine::handleViewUpdate(
         }
         if (new_epoch != 0 && new_epoch != old_epoch) {
             effects.push_back(RefreshPeerLink{r});
+            need_segment_refresh.push_back(static_cast<GlobalRank>(r));
         }
     }
 
@@ -163,6 +171,13 @@ AgentApplyResult AgentStateMachine::handleViewUpdate(
     }
 
     effects.push_back(ApplyViewToBackend{push.group_id, push.view});
+
+    // Must come AFTER ApplyViewToBackend: refreshSegmentID requires
+    // latest meta_->rank_order.
+    for (auto gr : need_segment_refresh) {
+        effects.push_back(NotifyLinkRefreshed{gr});
+    }
+
     return effects;
 }
 
@@ -179,13 +194,8 @@ AgentApplyResult AgentStateMachine::handleLinkStateChange(GlobalRank peer,
     if (!connected) {
         effects.push_back(NotifyTEUnreachable{peer});
     } else {
-        // Link came up: re-apply current Ready views so backends refresh their
-        // cached segment IDs for this peer.
-        for (const auto& [group_id, view] : groups_) {
-            if (view.status == GroupStatus::Ready) {
-                effects.push_back(ApplyViewToBackend{group_id, view});
-            }
-        }
+        // Link came up: refresh all backends' cached segment IDs for this peer.
+        effects.push_back(NotifyLinkRefreshed{peer});
     }
     return effects;
 }
@@ -268,7 +278,6 @@ AgentStateMachine::processTransferObservation(
     if (rank_state_ == RankState::Offline) return std::nullopt;
 
     if (event.attempted_ranks.size() != static_cast<size_t>(max_world_size_) ||
-        event.succeeded_ranks.size() != static_cast<size_t>(max_world_size_) ||
         event.failed_ranks_hint.size() !=
             static_cast<size_t>(max_world_size_)) {
         LOG(WARNING)
@@ -281,17 +290,16 @@ AgentStateMachine::processTransferObservation(
     report.reporter_rank = rank_;
     report.attempted_ranks.assign(max_world_size_, 0);
     report.failed_ranks_hint.assign(max_world_size_, 0);
-    report.succeeded_ranks.assign(max_world_size_, 0);
 
     bool has_changed = false;
 
     for (int peer = 0; peer < max_world_size_; ++peer) {
         if (!event.attempted_ranks[peer]) continue;
-        bool current = event.succeeded_ranks[peer];
+        // succeeded = attempted && !failed
+        bool current = !event.failed_ranks_hint[peer];
         if (current != last_reported_peer_status_[peer]) {
             last_reported_peer_status_[peer] = current;
             report.attempted_ranks[peer] = 1;
-            report.succeeded_ranks[peer] = current ? 1 : 0;
             report.failed_ranks_hint[peer] = current ? 0 : 1;
             has_changed = true;
         }
@@ -306,7 +314,6 @@ void AgentStateMachine::mergeObservationEvent(
     for (int peer = 0; peer < max_world_size_; ++peer) {
         if (!next.attempted_ranks[peer]) continue;
         acc.attempted_ranks[peer] = 1;
-        acc.succeeded_ranks[peer] = next.succeeded_ranks[peer];
         acc.failed_ranks_hint[peer] = next.failed_ranks_hint[peer];
     }
 }

@@ -284,11 +284,10 @@ ProposeViewUpdateResponse AgentHost::proposeDeactivate(
 }
 
 void AgentHost::pushTransferObservation(std::vector<uint8_t> attempted_ranks,
-                                        std::vector<uint8_t> failed_ranks,
-                                        std::vector<uint8_t> succeeded_ranks) {
+                                        std::vector<uint8_t> failed_ranks) {
     TransferObservationEvent event{std::move(attempted_ranks),
-                                   std::move(failed_ranks),
-                                   std::move(succeeded_ranks)};
+                                   std::move(failed_ranks)};
+
     std::lock_guard<std::mutex> lock(pending_observation_mutex_);
     if (!pending_observation_.has_value()) {
         pending_observation_ = std::move(event);
@@ -513,6 +512,19 @@ void AgentHost::runEffects(const AgentApplyResult& effects) {
                 },
                 [this](const RefreshPeerLink& e) {
                     link_manager_.refreshPeerSegment(e.peer);
+                },
+                [this](const NotifyLinkRefreshed& e) {
+                    for (auto& [group_id, backend] : backends_) {
+                        auto view = agent_.getGroupView(group_id);
+                        for (int lr = 0;
+                             lr < static_cast<int>(view.rank_order.size());
+                             ++lr) {
+                            if (view.rank_order[lr] == e.peer) {
+                                backend->refreshSegmentID(lr);
+                                break;
+                            }
+                        }
+                    }
                 },
                 [this](const DisconnectAllLinks&) {
                     for (int i = 0; i < max_world_size_; ++i) {

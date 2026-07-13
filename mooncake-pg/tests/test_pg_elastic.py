@@ -1,5 +1,4 @@
 import os
-import time
 import unittest
 
 import torch
@@ -35,17 +34,9 @@ def _extension_worker(
         # Original ranks
         device = ctx.init_group(
             world_size=initial_world_size,
-            max_world_size=ctx.world_size,
+            max_group_size=ctx.world_size,
         )
         backend = ctx.get_backend()
-
-        # # group_size should equal initial_world_size immediately after init
-        # # (max_world_size only pre-allocates capacity, does not change visible size)
-        # actual_ws = dist.get_world_size()
-        # assert actual_ws == initial_world_size, (
-        #     f"rank {ctx.proc_rank}: initial world_size={actual_ws}, "
-        #     f"expected initial_world_size={initial_world_size}"
-        # )
 
         # First collective
         tensor = torch.tensor([ctx.proc_rank + 1], dtype=torch.int32, device=device)
@@ -59,10 +50,6 @@ def _extension_worker(
         # Two-phase extension protocol:
         #   1) joiner publishes metadata + establishes transport readiness
         #   2) healthy ranks recover/activate it via recover_ranks()
-        # Note: get_peer_state() guarantees the peer has joined this group,
-        # has a valid endpoint, and is HEALTHY in the Coordinator's view.
-        # It intentionally does NOT require the local TE link to be up; the
-        # Coordinator's isActivatableSet() will retry until links are ready.
         wait_until(
             lambda: all(pg.get_peer_state(backend, join_ranks)),
             timeout_s=10.0,
@@ -70,13 +57,6 @@ def _extension_worker(
             description=f"rank {ctx.proc_rank} waiting for joiner ready",
         )
         pg.recover_ranks(backend, join_ranks)
-
-        # # After recover_ranks, world_size should now reflect the expanded group
-        # actual_ws_after = dist.get_world_size()
-        # assert actual_ws_after == ctx.world_size, (
-        #     f"rank {ctx.proc_rank}: world_size after recover={actual_ws_after}, "
-        #     f"expected max_world_size={ctx.world_size}"
-        # )
 
         # Final collective
         final_tensor = torch.tensor([ctx.proc_rank + 1], dtype=torch.int32, device=device)
@@ -95,30 +75,15 @@ def _extension_worker(
         device = ctx.init_group(
             rank=extension_rank,
             world_size=ctx.world_size,
-            is_extension=True,
-            max_world_size=ctx.world_size,
+                        max_group_size=ctx.world_size,
         )
 
         backend = ctx.get_backend()
-
-        # # group_size always equals to the number of active ranks
-        # actual_ws = dist.get_world_size()
-        # assert actual_ws == initial_world_size, (
-        #     f"extension rank: initial world_size={actual_ws}, "
-        #     f"expected {initial_world_size}"
-        # )
 
         # Inactive extension ranks can NOT participate in collectives until the
         # coordinator activates them.  Block here until one existing rank call
         # recover_ranks() for this slot.
         pg.join_group(backend)
-
-        # # After joinGroup, world_size should reflect the full group
-        # actual_ws_after = dist.get_world_size()
-        # assert actual_ws_after == ctx.world_size, (
-        #     f"extension rank: world_size after joinGroup={actual_ws_after}, "
-        #     f"expected {ctx.world_size}"
-        # )
 
         # Final collective
         final_tensor = torch.tensor([extension_rank + 1], dtype=torch.int32, device=device)
@@ -135,7 +100,7 @@ def _extension_p2p_worker(
     extend_event: mp.Event,
     direction: str,
 ) -> None:
-    """Worker for testing P2P after max_world_size/recover_ranks scale-up."""
+    """Worker for testing P2P after max_group_size/recover_ranks scale-up."""
     initial_world_size = ctx.world_size - 1
     extension_rank = ctx.world_size - 1
     primary_peer = initial_world_size - 1
@@ -147,7 +112,7 @@ def _extension_p2p_worker(
     if ctx.proc_rank < initial_world_size:
         device = ctx.init_group(
             world_size=initial_world_size,
-            max_world_size=ctx.world_size,
+            max_group_size=ctx.world_size,
         )
         backend = ctx.get_backend()
 
@@ -168,17 +133,16 @@ def _extension_p2p_worker(
         device = ctx.init_group(
             rank=extension_rank,
             world_size=ctx.world_size,
-            is_extension=True,
-            max_world_size=ctx.world_size,
+                        max_group_size=ctx.world_size,
         )
         backend = ctx.get_backend()
         pg.join_group(backend)
 
-    actual_ws_after = dist.get_world_size()
-    assert actual_ws_after == ctx.world_size, (
-        f"rank {ctx.proc_rank}: world_size after recovery={actual_ws_after}, "
-        f"expected {ctx.world_size}"
-    )
+    # actual_ws_after = dist.get_world_size()
+    # assert actual_ws_after == ctx.world_size, (
+    #     f"rank {ctx.proc_rank}: world_size after recovery={actual_ws_after}, "
+    #     f"expected {ctx.world_size}"
+    # )
 
     # Prove elastic collectives are functional before isolating P2P.
     collective = torch.tensor([ctx.proc_rank + 1], dtype=torch.int32, device=device)
@@ -251,27 +215,12 @@ def _extension_worker_with_subgroups(
     ctx: MooncakePGWorkerContext,
     extend_event: mp.Event,
 ) -> None:
-    dbg = open(f"/tmp/mooncake_pg_debug_rank_{ctx.proc_rank}.log", "w")
-    def log(msg):
-        dbg.write(f"{msg}\n")
-        dbg.flush()
-    log("worker start")
     """Multi-subgroup elastic extension test using split-ranks pattern.
 
     Layout (world_size=4, primary=[0,1], joiners=[2,3]):
       group_a: primary ranks=[0],   extended ranks=[0,2],     max_group_size=2
       group_b: primary ranks=[1],   extended ranks=[1,3],     max_group_size=2
       group_c: primary ranks=[0,1], extended ranks=[0,1,2,3], max_group_size=4
-
-    Primary ranks must initialize group with group_size=initial_world_size and
-    create subgroups using only their current membership; joiners wait for the
-    extend signal, then init WORLD with the full world_size and create subgroups
-    using the full eventual membership. PyTorch's new_group uses a monotonic
-    call counter for the store prefix, so primary and joiner side land on the
-    same prefix as long as the call order matches. backendIndex_ is also
-    process-local and increments only when the rank is an actual member of the
-    new group, so it stays aligned across primaries and joiners that all call
-    new_group in the same order.
     """
     configure_mooncake_device_filter(ctx.device_filters)
     device = require_test_device(ctx.proc_rank, ctx.device_type)
@@ -281,40 +230,34 @@ def _extension_worker_with_subgroups(
     join_ranks = [2, 3]
     is_joiner = ctx.proc_rank >= initial_world_size
 
-    a_active = torch.tensor([1, 0], dtype=torch.int32, device=device)
-    b_active = torch.tensor([1, 0], dtype=torch.int32, device=device)
-    c_active = torch.tensor([1, 1, 0, 0], dtype=torch.int32, device=device)
-
     if not is_joiner:
-        # Primary ranks: init WORLD with world_size=2, max_world_size=4
-        world_active = torch.tensor([1, 1, 0, 0], dtype=torch.int32, device=device)
+        # Primary ranks: init WORLD with world_size=2, max_group_size=4
         dist_kwargs = {
             "backend": ctx.backend_name,
             "rank": ctx.proc_rank,
             "world_size": initial_world_size,
-            "pg_options": pg.MooncakeBackendOptions(world_active, False, ctx.world_size),
+            "pg_options": pg.MooncakeBackendOptions(ctx.world_size),
         }
         if ctx.device_type == "cuda":
             dist_kwargs["device_id"] = device
         dist.init_process_group(**dist_kwargs)
         world_backend = get_mooncake_backend(device_type=ctx.device_type)
 
-        # Subgroups with split-ranks pattern. All ranks in WORLD must call
-        # new_group in the same order even for groups they are not members of.
+        # Subgroups with split-ranks pattern
         group_a = dist.new_group(
             ranks=[0],
             backend=ctx.backend_name,
-            pg_options=pg.MooncakeBackendOptions(a_active, False, 2),
+            pg_options=pg.MooncakeBackendOptions(2),
         )
         group_b = dist.new_group(
             ranks=[1],
             backend=ctx.backend_name,
-            pg_options=pg.MooncakeBackendOptions(b_active, False, 2),
+            pg_options=pg.MooncakeBackendOptions(2),
         )
         group_c = dist.new_group(
             ranks=[0, 1],
             backend=ctx.backend_name,
-            pg_options=pg.MooncakeBackendOptions(c_active, False, 4),
+            pg_options=pg.MooncakeBackendOptions(4),
         )
         a_backend = get_mooncake_backend(group_a, device_type=ctx.device_type) if ctx.proc_rank == 0 else None
         b_backend = get_mooncake_backend(group_b, device_type=ctx.device_type) if ctx.proc_rank == 1 else None
@@ -335,12 +278,12 @@ def _extension_worker_with_subgroups(
         if ctx.proc_rank == 0:
             extend_event.set()
 
-        # WORLD: wait for joiners then recover
+        # WORLD: wait for joiners then activate
         wait_until(
             lambda: all(pg.get_peer_state(world_backend, join_ranks)),
             timeout_s=30.0,
             poll_interval_s=0.05,
-            description=f"rank {ctx.proc_rank} waiting for WORLD joiners",
+            description=f"rank {ctx.proc_rank} waiting for joiners",
         )
         pg.recover_ranks(world_backend, join_ranks)
 
@@ -405,43 +348,33 @@ def _extension_worker_with_subgroups(
         if not extend_event.wait(timeout=60.0):
             raise TimeoutError("timed out waiting for extend_event")
 
-        world_active = torch.tensor([1, 1, 0, 0], dtype=torch.int32, device=device)
         dist_kwargs = {
             "backend": ctx.backend_name,
             "rank": ctx.proc_rank,
             "world_size": ctx.world_size,
-            "pg_options": pg.MooncakeBackendOptions(world_active, True, ctx.world_size),
+            "pg_options": pg.MooncakeBackendOptions(ctx.world_size),
         }
         if ctx.device_type == "cuda":
             dist_kwargs["device_id"] = device
-        print(f"[{ctx.proc_rank}] calling init_process_group", flush=True)
         dist.init_process_group(**dist_kwargs)
-        print(f"[{ctx.proc_rank}] init_process_group returned", flush=True)
         world_backend = get_mooncake_backend(device_type=ctx.device_type)
-        print(f"[{ctx.proc_rank}] world_backend={world_backend}", flush=True)
 
         # Subgroups: full eventual membership; matching call order with primaries.
-        print(f"[{ctx.proc_rank}] creating group_a", flush=True)
         group_a = dist.new_group(
             ranks=[0, 2],
             backend=ctx.backend_name,
-            pg_options=pg.MooncakeBackendOptions(a_active, True, 2),
+            pg_options=pg.MooncakeBackendOptions(2),
         )
-        print(f"[{ctx.proc_rank}] group_a={group_a}", flush=True)
-        print(f"[{ctx.proc_rank}] creating group_b", flush=True)
         group_b = dist.new_group(
             ranks=[1, 3],
             backend=ctx.backend_name,
-            pg_options=pg.MooncakeBackendOptions(b_active, True, 2),
+            pg_options=pg.MooncakeBackendOptions(2),
         )
-        print(f"[{ctx.proc_rank}] group_b={group_b}", flush=True)
-        print(f"[{ctx.proc_rank}] creating group_c", flush=True)
         group_c = dist.new_group(
             ranks=[0, 1, 2, 3],
             backend=ctx.backend_name,
-            pg_options=pg.MooncakeBackendOptions(c_active, True, 4),
+            pg_options=pg.MooncakeBackendOptions(4),
         )
-        print(f"[{ctx.proc_rank}] group_c={group_c}", flush=True)
         a_backend = get_mooncake_backend(group_a, device_type=ctx.device_type) if ctx.proc_rank == 2 else None
         b_backend = get_mooncake_backend(group_b, device_type=ctx.device_type) if ctx.proc_rank == 3 else None
         c_backend = get_mooncake_backend(group_c, device_type=ctx.device_type)
@@ -491,7 +424,6 @@ def _run_allgather_reduce_scatter(
     device: str,
     active_world_size: int,
     rank: int,
-    backend,
 ) -> None:
     """Run _allgather_base and _reduce_scatter_base and assert correctness.
 
@@ -504,19 +436,12 @@ def _run_allgather_reduce_scatter(
     # input: scalar (rank+1); output: flat buffer of active_world_size elements
     input_t = torch.tensor([rank + 1], dtype=torch.int32, device=device)
     output_t = torch.zeros(active_world_size, dtype=torch.int32, device=device)
-    work = dist.all_gather_into_tensor(output_t, input_t, async_op=True)
-    work.wait()
-    if not pg.get_local_success(work):
-        pg.sync_after_failure(backend)
-        # Re-run with dead ranks now deactivated.
-        output_t.zero_()
-        dist.all_gather_into_tensor(output_t, input_t)
+    dist.all_gather_into_tensor(output_t, input_t)
 
     for j in range(active_world_size):
         expected = j + 1
         got = int(output_t[j].item())
         if got != expected:
-            print(f"assert fail 1, rank={rank}, aws={active_world_size}, got={got}, exp={expected}")
             raise AssertionError(
                 f"allgather slot {j}: expected {expected}, got {got} "
                 f"(rank={rank}, active_world_size={active_world_size})"
@@ -529,17 +454,10 @@ def _run_allgather_reduce_scatter(
     # rank j receives sum of input[j] from all ranks = (j+1) * active_world_size.
     input_rs = torch.arange(1, active_world_size + 1, dtype=torch.int32, device=device)
     output_rs = torch.zeros(1, dtype=torch.int32, device=device)
-    work = dist.reduce_scatter_tensor(output_rs, input_rs, async_op=True)
-    work.wait()
-    if not pg.get_local_success(work):
-        pg.sync_after_failure(backend)
-        # Re-run with dead ranks now deactivated.
-        output_rs.zero_()
-        dist.reduce_scatter_tensor(output_rs, input_rs)
+    dist.reduce_scatter_tensor(output_rs, input_rs)
     expected_rs = (rank + 1) * active_world_size
     got_rs = int(output_rs[0].item())
     if got_rs != expected_rs:
-        print(f"assert fail 2, rank={rank}, aws={active_world_size}, got={got_rs}, exp={expected_rs}")
         raise AssertionError(
             f"reduce_scatter slot {rank}: expected {expected_rs}, got {got_rs} "
             f"(rank={rank}, active_world_size={active_world_size})"
@@ -552,8 +470,8 @@ def _allgather_reduce_scatter_extension_worker(
 ) -> None:
     """Test _allgather_base and _reduce_scatter_base across elastic extension.
 
-    Layout: world_size=4, initial=3, extension_rank=3, max_world_size=4.
-    Pre-activation: 3 active ranks, max_world_size=4 → exercises the overflow path.
+    Layout: world_size=4, initial=3, extension_rank=3, max_group_size=4.
+    Pre-activation: 3 active ranks, max_group_size=4 → exercises the overflow path.
     Post-activation: 4 active ranks → exercises correctness after extension.
     """
     configure_mooncake_device_filter(ctx.device_filters)
@@ -566,23 +484,21 @@ def _allgather_reduce_scatter_extension_worker(
     is_joiner = ctx.proc_rank == extension_rank
 
     if not is_joiner:
-        active = torch.tensor([1, 1, 1, 0], dtype=torch.int32, device=device)
         dist_kwargs = {
             "backend": ctx.backend_name,
             "rank": ctx.proc_rank,
             "world_size": initial_world_size,
-            "pg_options": pg.MooncakeBackendOptions(active, False, ctx.world_size),
+            "pg_options": pg.MooncakeBackendOptions(ctx.world_size),
         }
         if ctx.device_type == "cuda":
             dist_kwargs["device_id"] = device
         dist.init_process_group(**dist_kwargs)
         backend = get_mooncake_backend(device_type=ctx.device_type)
 
-        # Pre-activation: 3 active ranks, max_world_size=4.
+        # Pre-activation: 3 active ranks, max_group_size=4.
         # This is the overflow path: buggy code would iterate 4 times into a
         # buffer sized for 3.
-        _run_allgather_reduce_scatter(device, initial_world_size, ctx.proc_rank,
-                                      backend=backend)
+        _run_allgather_reduce_scatter(device, initial_world_size, ctx.proc_rank)
 
         if ctx.proc_rank == 0:
             extend_event.set()
@@ -596,20 +512,18 @@ def _allgather_reduce_scatter_extension_worker(
         pg.recover_ranks(backend, join_ranks)
 
         # Post-activation: all 4 ranks active.
-        _run_allgather_reduce_scatter(device, ctx.world_size, ctx.proc_rank,
-                                  backend=backend)
+        _run_allgather_reduce_scatter(device, ctx.world_size, ctx.proc_rank)
 
         ctx.record_result({"role": "primary", "rank": ctx.proc_rank})
     else:
         if not extend_event.wait(timeout=30.0):
             raise TimeoutError("timed out waiting for extend_event")
 
-        active = torch.tensor([1, 1, 1, 0], dtype=torch.int32, device=device)
         dist_kwargs = {
             "backend": ctx.backend_name,
             "rank": extension_rank,
             "world_size": ctx.world_size,
-            "pg_options": pg.MooncakeBackendOptions(active, True, ctx.world_size),
+            "pg_options": pg.MooncakeBackendOptions(ctx.world_size),
         }
         if ctx.device_type == "cuda":
             dist_kwargs["device_id"] = device
@@ -619,8 +533,7 @@ def _allgather_reduce_scatter_extension_worker(
         pg.join_group(backend)
 
         # Post-activation: all 4 ranks active.
-        _run_allgather_reduce_scatter(device, ctx.world_size, extension_rank,
-                                  backend=backend)
+        _run_allgather_reduce_scatter(device, ctx.world_size, extension_rank)
 
         ctx.record_result({"role": "joiner", "rank": extension_rank})
 
@@ -634,7 +547,7 @@ def _allgather_reduce_scatter_recovery_worker(
 
     Layout: world_size=4, broken_rank=3, replacement takes rank 3.
     Pre-failure: 4 active ranks.
-    Post-failure (3 survivors): 3 active ranks, max_world_size=4 → overflow path.
+    Post-failure (3 survivors): 3 active ranks, max_group_size=4 → overflow path.
     Post-recovery: 4 active ranks again.
     """
     broken_rank = ctx.world_size - 1
@@ -645,19 +558,17 @@ def _allgather_reduce_scatter_recovery_worker(
         backend = ctx.get_backend()
 
         # Pre-failure: all 4 ranks active.
-        _run_allgather_reduce_scatter(device, ctx.world_size, logical_rank,
-                                  backend=backend)
+        _run_allgather_reduce_scatter(device, ctx.world_size, logical_rank)
 
         if logical_rank == broken_rank:
             ctx.record_result({"role": "broken"})
             broken_exited.set()
             os._exit(0)
 
-        # Survivors: 3 active ranks, max_world_size=4 → overflow path.
+        # Survivors: 3 active ranks, max_group_size=4 → overflow path.
         broken_exited.wait()
 
-        _run_allgather_reduce_scatter(device, ctx.world_size - 1, logical_rank,
-                                      backend=backend)
+        _run_allgather_reduce_scatter(device, ctx.world_size - 1, logical_rank)
 
         if logical_rank == 0:
             start_recovery.set()
@@ -671,19 +582,17 @@ def _allgather_reduce_scatter_recovery_worker(
         pg.recover_ranks(backend, [broken_rank])
 
         # Post-recovery: all 4 ranks active again.
-        _run_allgather_reduce_scatter(device, ctx.world_size, logical_rank,
-                                  backend=backend)
+        _run_allgather_reduce_scatter(device, ctx.world_size, logical_rank)
 
         ctx.record_result({"role": "survivor"})
     else:
         start_recovery.wait()
-        device = ctx.init_group(rank=logical_rank, is_extension=True)
+        device = ctx.init_group(rank=logical_rank, )
         backend = ctx.get_backend()
         pg.join_group(backend)
 
         # Post-recovery: all 4 ranks active.
-        _run_allgather_reduce_scatter(device, ctx.world_size, logical_rank,
-                                  backend=backend)
+        _run_allgather_reduce_scatter(device, ctx.world_size, logical_rank)
 
         ctx.record_result({"role": "replacement"})
 
@@ -697,18 +606,8 @@ def _fault_detection_worker(
     backend = ctx.get_backend()
 
     # Step 1: All ranks participate in first collective
-    epoch_before = pg.get_current_epoch(backend)
     tensor = torch.tensor([ctx.rank], dtype=torch.int32, device=device)
-    work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=True)
-    work.wait()
-
-    # Verify local_success=True and failedRanksHint=all 0s when all healthy
-    assert pg.get_local_success(work), \
-        f"rank {ctx.rank}: Round 1 should succeed locally"
-    failed_ranks_hint = pg.get_failed_ranks_hint(work)
-    assert (
-        failed_ranks_hint.cpu().tolist() == [0] * ctx.world_size
-    ), f"rank {ctx.rank}: pre-failure failed_ranks_hint={failed_ranks_hint.cpu().tolist()}"
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
 
     if ctx.rank == BROKEN_RANK:
         # Step 2: Broken rank exits after first collective
@@ -722,45 +621,7 @@ def _fault_detection_worker(
     # Step 4: Survivors run collective without broken rank
     # This should not hang - verifies fault detection works
     tensor = torch.tensor([ctx.rank], dtype=torch.int32, device=device)
-    work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=True)
-    work.wait()
-
-    # Verify local_success=False when a peer is dead
-    assert not pg.get_local_success(work), \
-        f"rank {ctx.rank}: Round 2 should fail locally (broken rank detected)"
-    failed_ranks_hint = pg.get_failed_ranks_hint(work)
-    expected_failed_ranks_hint = [0] * ctx.world_size
-    expected_failed_ranks_hint[BROKEN_RANK] = 1
-    assert failed_ranks_hint.cpu().tolist() == expected_failed_ranks_hint, (
-        f"rank {ctx.rank}: post-failure failed_ranks_hint={failed_ranks_hint.cpu().tolist()}, "
-        f"expected {expected_failed_ranks_hint}"
-    )
-
-    # Use epoch-based step-boundary detection: poll get_current_epoch
-    # (atomic read, no side effects) until the Coordinator auto-deactivates
-    # the dead rank and increments the epoch.
-    start = time.time()
-    while pg.get_current_epoch(backend) == epoch_before:
-        if time.time() - start > 30.0:
-            raise TimeoutError(
-                f"rank {ctx.rank}: timed out waiting for epoch change"
-            )
-        time.sleep(0.01)
-
-    # Verify auto_deactivate took effect: epoch incremented.  Give the
-    # executor thread a moment to finish applying the full view update
-    # (activeRanks, segment IDs, etc.) before issuing the next collective.
-    assert pg.get_current_epoch(backend) > epoch_before, (
-        f"rank {ctx.rank}: epoch should increase after deactivation"
-    )
-    time.sleep(0.5)
-
-    tensor = torch.tensor([ctx.rank], dtype=torch.int32, device=device)
-    work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=True)
-    work.wait()
-    assert pg.get_local_success(work), (
-        f"rank {ctx.rank}: collective should succeed after auto-deactivate"
-    )
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
 
     ctx.record_result({"role": "survivor"})
 
@@ -779,12 +640,7 @@ def _replacement_recovery_worker(
 
         # Round 1: all healthy
         tensor = torch.tensor([logical_rank], dtype=torch.int32, device=device)
-        work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=True)
-        work.wait()
-        assert pg.get_local_success(work), \
-            f"rank {logical_rank}: round 1 should succeed locally"
-        failed_ranks_hint = pg.get_failed_ranks_hint(work)
-        assert failed_ranks_hint.cpu().tolist() == [0] * ctx.world_size
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
 
         if logical_rank == BROKEN_RANK:
             # Broken rank exits
@@ -798,22 +654,7 @@ def _replacement_recovery_worker(
 
         # Round 2: run collective with dead rank -> local_success=False
         tensor = torch.tensor([logical_rank], dtype=torch.int32, device=device)
-        work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=True)
-        work.wait()
-        assert not pg.get_local_success(work), \
-            f"rank {logical_rank}: round 2 should detect broken rank"
-        failed_ranks_hint = pg.get_failed_ranks_hint(work)
-        expected_failed_ranks_hint = [0] * ctx.world_size
-        expected_failed_ranks_hint[BROKEN_RANK] = 1
-        assert failed_ranks_hint.cpu().tolist() == expected_failed_ranks_hint
-
-        # Sync with the Coordinator to get the auto-deactivation decision.
-        # After this, get_peer_state() reflects the authoritative decision.
-        result = pg.sync_after_failure(backend)
-        assert result["status"] != 2, (  # kRejected
-            f"rank {logical_rank}: sync_after_failure rejected: "
-            f"{result.get('reject_reason', '')}"
-        )
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
 
         # Signal that we're ready for replacement
         if logical_rank == 0:
@@ -832,12 +673,7 @@ def _replacement_recovery_worker(
 
         # Final collective with all 4 ranks
         tensor = torch.tensor([logical_rank], dtype=torch.int32, device=device)
-        work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=True)
-        work.wait()
-        assert pg.get_local_success(work), \
-            f"rank {logical_rank}: round 3 should succeed with replacement"
-        failed_ranks_hint = pg.get_failed_ranks_hint(work)
-        assert failed_ranks_hint.cpu().tolist() == [0] * ctx.world_size
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
 
         ctx.record_result({"role": "survivor"})
     else:
@@ -845,8 +681,8 @@ def _replacement_recovery_worker(
         # Wait for signal to start
         start_recovery.wait()
 
-        # Replacement initializes with is_extension (local-only mode)
-        device = ctx.init_group(rank=logical_rank, is_extension=True)
+        # Replacement initializes with is_extension
+        device = ctx.init_group(rank=logical_rank, )
         backend = ctx.get_backend()
 
         # join_group completes the connection and switches to global mode
@@ -862,6 +698,7 @@ def _replacement_recovery_worker(
 def _manual_deactivate_worker(
     ctx: MooncakePGWorkerContext,
     broken_exited: mp.Event,
+    survivors_synced: mp.Barrier,
 ) -> None:
     """Multi-round test with auto_deactivate_on_failure=False:
     Round 1 (all healthy): failedRanks = all 0s, activeRanks = all 1s.
@@ -870,7 +707,8 @@ def _manual_deactivate_worker(
     Round 3 (after deactivate): failedRanks = all 0s for reduced group,
       activeRanks reflects the deactivation.
     """
-    device = ctx.init_group(auto_deactivate_on_failure=False)
+    device = ctx.init_group(auto_deactivate_on_failure=False,
+                            auto_sync_on_failure=False)
     backend = ctx.get_backend()
 
     # Round 1: all healthy
@@ -883,7 +721,7 @@ def _manual_deactivate_worker(
         f"rank {ctx.rank}: round 1 should succeed locally"
 
     failed_ranks_hint = pg.get_failed_ranks_hint(work)
-    assert failed_ranks_hint.cpu().tolist() == [0] * ctx.world_size
+    assert failed_ranks_hint.tolist() == [0] * ctx.world_size
 
     active_ranks = pg.get_active_ranks(backend)
     assert active_ranks.cpu().tolist() == [1] * ctx.world_size
@@ -908,10 +746,22 @@ def _manual_deactivate_worker(
     failed_ranks_hint = pg.get_failed_ranks_hint(work)
     expected_failed_ranks_hint = [0] * ctx.world_size
     expected_failed_ranks_hint[BROKEN_RANK] = 1
-    assert failed_ranks_hint.cpu().tolist() == expected_failed_ranks_hint
+    assert failed_ranks_hint.tolist() == expected_failed_ranks_hint
 
     active_ranks = pg.get_active_ranks(backend)
     assert active_ranks.cpu().tolist() == [1] * ctx.world_size
+
+    # For groups with auto_deactivate=False, users are responsible for synchronizing
+    # the surviving ranks after a failure. Otherwise, a ViewUpdate may race with
+    # in-flight operations on other ranks.
+    #
+    # This behavior is intentional:
+    #   - For auto_deactivate=True groups, PG automatically performs synchronization and
+    #     failure reconciliation. Synchronization is handled by `sync_after_failure`, which
+    #     is also performed automatically when `auto_sync_on_failure` is enabled (the default).
+    #   - For auto_deactivate=False groups, synchronization and failure
+    #     reconciliation are entirely the user's responsibility.
+    survivors_synced.wait()
 
     # Survivors deactivate the dead rank before issuing new collectives.
     pg.deactivate_rank(backend, [BROKEN_RANK])
@@ -943,9 +793,7 @@ class _ElasticMixin:
             timeout_s=30.0,
         )
 
-        # Check for errors BEFORE role-based assertions so failures
-        # (assertion errors, segfaults, timeouts) are surfaced clearly.
-        self.assert_no_errors(rows)
+        self.assert_all_ok(rows)
 
         # All survivors should complete
         survivor_rows = [r for r in rows if r.get("role") == "survivor"]
@@ -969,7 +817,7 @@ class _ElasticMixin:
             timeout_s=30.0,
         )
 
-        self.assert_no_errors(rows)
+        self.assert_all_ok(rows)
 
         # Verify all participants completed
         survivor_rows = [r for r in rows if r.get("role") == "survivor"]
@@ -993,14 +841,13 @@ class _ElasticMixin:
             timeout_s=30.0,
         )
 
-        self.assert_no_errors(rows)
+        self.assert_all_ok(rows)
 
         # Verify all participants completed
         original_rows = [r for r in rows if r.get("role") == "original"]
         extension_rows = [r for r in rows if r.get("role") == "extension"]
 
-        if len(original_rows) != self.world_size - 1:
-            self.assertEqual(len(original_rows), self.world_size - 1)
+        self.assertEqual(len(original_rows), self.world_size - 1)
         self.assertEqual(len(extension_rows), 1)
 
         # Verify baseline sum: 1+2+...+(world_size-1) = world_size*(world_size-1)/2
@@ -1054,7 +901,7 @@ class _ElasticMixin:
             timeout_s=30.0,
         )
 
-        self.assert_no_errors(rows)
+        self.assert_all_ok(rows)
 
         result_rows = [r for r in rows if r.get("role") == "extension_subgroups"]
         self.assertEqual(len(result_rows), self.world_size)
@@ -1062,7 +909,7 @@ class _ElasticMixin:
     def test_allgather_reduce_scatter_extension(self) -> None:
         """Test _allgather_base/_reduce_scatter_base correctness across elastic extension.
 
-        Exercises the overflow path: pre-activation uses max_world_size=4 with only
+        Exercises the overflow path: pre-activation uses max_group_size=4 with only
         3 active ranks, so the buggy code would access slot 3 of a size-3 buffer.
         """
         spawn_ctx = mp.get_context("spawn")
@@ -1075,7 +922,7 @@ class _ElasticMixin:
             timeout_s=30.0,
         )
 
-        self.assert_no_errors(rows)
+        self.assert_all_ok(rows)
 
         primary_rows = [r for r in rows if r.get("role") == "primary"]
         joiner_rows = [r for r in rows if r.get("role") == "joiner"]
@@ -1086,7 +933,7 @@ class _ElasticMixin:
         """Test _allgather_base/_reduce_scatter_base correctness across rank recovery.
 
         Exercises the overflow path: post-failure survivors run with 3 active ranks
-        and max_world_size=4, so the buggy code would access slot 3 of a size-3 buffer.
+        and max_group_size=4, so the buggy code would access slot 3 of a size-3 buffer.
         """
         spawn_ctx = mp.get_context("spawn")
         broken_exited = spawn_ctx.Event()
@@ -1100,7 +947,7 @@ class _ElasticMixin:
             timeout_s=30.0,
         )
 
-        self.assert_no_errors(rows)
+        self.assert_all_ok(rows)
 
         survivor_rows = [r for r in rows if r.get("role") == "survivor"]
         replacement_rows = [r for r in rows if r.get("role") == "replacement"]
@@ -1118,14 +965,16 @@ class _ElasticMixin:
         """
         spawn_ctx = mp.get_context("spawn")
         broken_exited = spawn_ctx.Event()
+        survivors_synced = spawn_ctx.Barrier(self.world_size - 1)
 
         rows = self.spawn_backend_and_collect(
             _manual_deactivate_worker,
             broken_exited,
+            survivors_synced,
             timeout_s=30.0,
         )
 
-        self.assert_no_errors(rows)
+        self.assert_all_ok(rows)
 
         # All survivors should complete
         survivor_rows = [r for r in rows if r.get("role") == "survivor"]

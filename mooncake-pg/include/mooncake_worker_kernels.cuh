@@ -17,14 +17,12 @@ namespace mooncake {
 __global__ void enqueueTaskKernel(int opType, size_t tensorSize,
                                   int64_t broadcastRoot, int bufferOffset,
                                   uint64_t submitSequence, void* meta,
-                                  Task* tasks, int* failedRanksHintHostPtr,
-                                  int* attemptedRanksHintHostPtr,
-                                  size_t taskId);
+                                  Task* tasks, size_t taskId);
 
 template <typename scalar_t>
 __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
                              size_t numElements, size_t numRanks, int op,
-                             bool* activeRanks, int* failedRanksHint);
+                             bool* activeRanks);
 #endif
 
 // Host-callable kernel launch wrappers (compiled by mcc/nvcc, callable from
@@ -36,41 +34,35 @@ __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
 void launchEnqueueTaskKernel(int opType, size_t tensorSize,
                              int64_t broadcastRoot, int bufferOffset,
                              uint64_t submitSequence, void* meta, Task* tasks,
-                             int* failedRanksHintHostPtr,
-                             int* attemptedRanksHintHostPtr, size_t taskId,
-                             cudaStream_t stream);
+                             size_t taskId, cudaStream_t stream);
 
 void launchReduceKernel_uint8(uint8_t* dst, const uint8_t* src,
                               size_t numElements, size_t numRanks, int op,
-                              bool* activeRanks, int* failedRanksHint,
-                              cudaStream_t stream);
+                              bool* activeRanks, cudaStream_t stream);
 void launchReduceKernel_int8(int8_t* dst, const int8_t* src, size_t numElements,
                              size_t numRanks, int op, bool* activeRanks,
-                             int* failedRanksHint, cudaStream_t stream);
+                             cudaStream_t stream);
 void launchReduceKernel_int16(int16_t* dst, const int16_t* src,
                               size_t numElements, size_t numRanks, int op,
-                              bool* activeRanks, int* failedRanksHint,
-                              cudaStream_t stream);
+                              bool* activeRanks, cudaStream_t stream);
 void launchReduceKernel_int32(int* dst, const int* src, size_t numElements,
                               size_t numRanks, int op, bool* activeRanks,
-                              int* failedRanksHint, cudaStream_t stream);
+                              cudaStream_t stream);
 void launchReduceKernel_int64(int64_t* dst, const int64_t* src,
                               size_t numElements, size_t numRanks, int op,
-                              bool* activeRanks, int* failedRanksHint,
-                              cudaStream_t stream);
+                              bool* activeRanks, cudaStream_t stream);
 void launchReduceKernel_float(float* dst, const float* src, size_t numElements,
                               size_t numRanks, int op, bool* activeRanks,
-                              int* failedRanksHint, cudaStream_t stream);
+                              cudaStream_t stream);
 void launchReduceKernel_double(double* dst, const double* src,
                                size_t numElements, size_t numRanks, int op,
-                               bool* activeRanks, int* failedRanksHint,
-                               cudaStream_t stream);
+                               bool* activeRanks, cudaStream_t stream);
 void launchReduceKernel_bool(bool* dst, const bool* src, size_t numElements,
                              size_t numRanks, int op, bool* activeRanks,
-                             int* failedRanksHint, cudaStream_t stream);
+                             cudaStream_t stream);
 void launchReduceKernel_bf16(void* dst, const void* src, size_t numElements,
                              size_t numRanks, int op, bool* activeRanks,
-                             int* failedRanksHint, cudaStream_t stream);
+                             cudaStream_t stream);
 
 void preloadReduceKernels();
 

@@ -234,7 +234,7 @@ class _P2PMixin:
             timeout_s=30.0,
         )
 
-        self.assert_no_errors(rows)
+        self.assert_all_ok(rows)
 
         survivor_rows = [r for r in rows if r.get("role") == "survivor"]
         broken_rows = [r for r in rows if r.get("role") == "broken"]

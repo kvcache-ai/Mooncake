@@ -116,40 +116,15 @@ def require_test_device(rank: int, device_type: str) -> torch.device:
 
 
 def mooncake_backend_options(
-    world_size: int,
-    device_type: str,
+    max_group_size: int,
     *,
-    active_value: int = 0,
-    is_extension: bool = False,
-    max_world_size: int | None = None,
     auto_deactivate_on_failure: bool = True,
+    auto_sync_on_failure: bool = True,
 ) -> pg.MooncakeBackendOptions:
-    device = torch.device(device_type)
-    tensor_size = world_size if max_world_size is None else int(max_world_size)
-    active_ranks = torch.full(
-        (tensor_size,),
-        int(active_value),
-        dtype=torch.int32,
-        device=device,
-    )
     return pg.MooncakeBackendOptions(
-        active_ranks,
-        bool(is_extension),
-        tensor_size,
+        int(max_group_size),
         bool(auto_deactivate_on_failure),
-    )
-
-
-def mooncake_cpu_options(world_size: int) -> pg.MooncakeBackendOptions:
-    return mooncake_backend_options(world_size, "cpu", active_value=0)
-
-
-def mooncake_extension_cpu_options(world_size: int) -> pg.MooncakeBackendOptions:
-    return mooncake_backend_options(
-        world_size,
-        "cpu",
-        active_value=1,
-        is_extension=True,
+        bool(auto_sync_on_failure),
     )
 
 
@@ -161,10 +136,9 @@ def init_mooncake_group(
     device_type: str,
     device_filters: Sequence[str] | None = None,
     use_pg_options: bool = True,
-    is_extension: bool = False,
-    active_value: int | None = None,
-    max_world_size: int | None = None,
+    max_group_size: int | None = None,
     auto_deactivate_on_failure: bool = True,
+    auto_sync_on_failure: bool = True,
 ) -> torch.device:
     device = require_test_device(rank, device_type)
     configure_mooncake_device_filter(device_filters)
@@ -174,36 +148,13 @@ def init_mooncake_group(
         "world_size": world_size,
     }
     if use_pg_options:
-        resolved_active_value = (
-            1 if is_extension else 0 if active_value is None else active_value
-        )
         kwargs["pg_options"] = mooncake_backend_options(
-            world_size,
-            device_type,
-            active_value=resolved_active_value,
-            is_extension=is_extension,
-            max_world_size=max_world_size,
+            max_group_size if max_group_size is not None else world_size,
             auto_deactivate_on_failure=auto_deactivate_on_failure,
+            auto_sync_on_failure=auto_sync_on_failure,
         )
     dist.init_process_group(**kwargs)
     return device
-
-
-def init_mooncake_cpu_group(
-    rank: int,
-    world_size: int,
-    *,
-    device_filters: Sequence[str] | None = None,
-    use_pg_options: bool = True,
-) -> None:
-    init_mooncake_group(
-        rank,
-        world_size,
-        backend_name="mooncake-cpu",
-        device_type="cpu",
-        device_filters=device_filters,
-        use_pg_options=use_pg_options,
-    )
 
 
 def get_mooncake_backend(group=None, device_type: str = "cpu"):
@@ -239,10 +190,9 @@ class MooncakePGWorkerContext:
         world_size: int | None = None,
         device_filters: Sequence[str] | None = None,
         use_pg_options: bool = True,
-        is_extension: bool = False,
-        active_value: int | None = None,
-        max_world_size: int | None = None,
+        max_group_size: int | None = None,
         auto_deactivate_on_failure: bool = True,
+        auto_sync_on_failure: bool = True,
     ) -> torch.device:
         self._device = init_mooncake_group(
             self.proc_rank if rank is None else rank,
@@ -253,10 +203,9 @@ class MooncakePGWorkerContext:
             if device_filters is None
             else device_filters,
             use_pg_options=use_pg_options,
-            is_extension=is_extension,
-            active_value=active_value,
-            max_world_size=max_world_size,
+            max_group_size=max_group_size,
             auto_deactivate_on_failure=auto_deactivate_on_failure,
+            auto_sync_on_failure=auto_sync_on_failure,
         )
         return self._device
 
@@ -413,16 +362,7 @@ def _capture_signal_deaths(ctx, result_map) -> None:
     AssertionError from a survivor) that happened before the crash.
     """
     for rank_idx, process in enumerate(ctx.processes):
-        # ProcessContext in torch.multiprocessing.spawn wraps a
-        # multiprocessing.Process.  The exitcode attribute name varies
-        # across PyTorch versions; try the public attribute first, then
-        # fall back to the internal _process.exitcode.
-        exitcode = getattr(process, "exitcode", None)
-        if exitcode is None:
-            wrapped = getattr(process, "_process", None)
-            if wrapped is not None:
-                exitcode = getattr(wrapped, "exitcode", None)
-
+        exitcode = process.exitcode
         if exitcode is not None and exitcode < 0:
             # Only fill in missing results; don't overwrite existing ones
             if rank_idx in result_map:
@@ -573,71 +513,26 @@ class MultiProcessTestCase(unittest.TestCase):
         )
 
     def assert_all_ok(self, rows: list[dict]) -> None:
-        for row in rows:
-            if not row.get("ok", False):
-                self.fail(
-                    f"rank {row.get('rank', '?')} failed with "
-                    f"{row.get('error_type', 'UnknownError')}: {row.get('error', '')}"
-                )
-
-    def assert_no_errors(
-        self,
-        rows: list[dict],
-        *,
-        allow_missing: set[int] | None = None,
-        allow_error_types: set[str] | None = None,
-    ) -> None:
-        """Fail with a detailed report if any rank reported an error or died.
-
-        Unlike assert_all_ok which fails on the first error, this collects ALL
-        errors across ALL ranks and reports them together so you can see the
-        full failure picture (crashes, assertion failures, timeouts) at once.
-
-        *allow_missing*: set of rank indices whose absence is expected
-        (e.g. ``{1}`` for intentionally-killed rank 1).  These ranks are
-        allowed to be missing from the result set without triggering a failure.
-
-        *allow_error_types*: set of error type names (e.g. ``{"MissingResult"}``)
-        that should not trigger a failure.  Use sparingly — prefer fixing the
-        root cause.
-        """
         failures: list[str] = []
-        allowed_ranks = allow_missing or set()
-        allowed_types = allow_error_types or set()
-
         for row in rows:
+            if row.get("ok", False):
+                continue
             rank = row.get("rank", "?")
-            ok = row.get("ok", False)
-
-            if ok:
-                continue  # healthy rank
-
             error_type = row.get("error_type", "UnknownError")
             error_msg = row.get("error", "")
-
-            # Allow intentional missing ranks
-            if isinstance(rank, int) and rank in allowed_ranks:
-                continue
-            if error_type in allowed_types:
-                continue
-
             failures.append(
                 f"  rank {rank}: {error_type}"
-                + (f" — {error_msg}" if error_msg else "")
+                + (f" -- {error_msg}" if error_msg else "")
             )
 
         if not failures:
-            return  # all clean
+            return
 
-        # Build a summary that includes the healthy ranks for context
-        healthy = [r for r in rows if r.get("ok", False)]
-        healthy_ranks = sorted(r.get("rank", "?") for r in healthy)
+        healthy_ranks = sorted(
+            r.get("rank", "?") for r in rows if r.get("ok", False)
+        )
         failed_ranks = sorted(
-            r.get("rank", "?")
-            for r in rows
-            if not r.get("ok", False)
-            and (not isinstance(r.get("rank"), int) or r.get("rank") not in allowed_ranks)
-            and r.get("error_type", "UnknownError") not in allowed_types
+            r.get("rank", "?") for r in rows if not r.get("ok", False)
         )
 
         report = [

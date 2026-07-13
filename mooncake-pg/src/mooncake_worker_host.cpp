@@ -17,7 +17,7 @@ namespace mooncake {
 
 void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
                         size_t numRanks, c10d::ReduceOp op, bool* activeRanks,
-                        int* failedRanksHint, cudaStream_t stream) {
+                        cudaStream_t stream) {
     TORCH_CHECK(op == c10d::ReduceOp::SUM || op == c10d::ReduceOp::MIN ||
                     op == c10d::ReduceOp::MAX || op == c10d::ReduceOp::PRODUCT,
                 "Only support SUM/MIN/MAX/PRODUCT for reduction.");
@@ -27,47 +27,39 @@ void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
     switch (dst.scalar_type()) {
         case c10::kByte:
             launchReduceKernel_uint8((uint8_t*)ptr, (uint8_t*)src, num,
-                                     numRanks, (int)op, activeRanks,
-                                     failedRanksHint, stream);
+                                     numRanks, (int)op, activeRanks, stream);
             break;
         case c10::kChar:
             launchReduceKernel_int8((int8_t*)ptr, (int8_t*)src, num, numRanks,
-                                    (int)op, activeRanks, failedRanksHint,
-                                    stream);
+                                    (int)op, activeRanks, stream);
             break;
         case c10::kShort:
             launchReduceKernel_int16((int16_t*)ptr, (int16_t*)src, num,
-                                     numRanks, (int)op, activeRanks,
-                                     failedRanksHint, stream);
+                                     numRanks, (int)op, activeRanks, stream);
             break;
         case c10::kInt:
             launchReduceKernel_int32((int*)ptr, (int*)src, num, numRanks,
-                                     (int)op, activeRanks, failedRanksHint,
-                                     stream);
+                                     (int)op, activeRanks, stream);
             break;
         case c10::kLong:
             launchReduceKernel_int64((int64_t*)ptr, (int64_t*)src, num,
-                                     numRanks, (int)op, activeRanks,
-                                     failedRanksHint, stream);
+                                     numRanks, (int)op, activeRanks, stream);
             break;
         case c10::kFloat:
             launchReduceKernel_float((float*)ptr, (float*)src, num, numRanks,
-                                     (int)op, activeRanks, failedRanksHint,
-                                     stream);
+                                     (int)op, activeRanks, stream);
             break;
         case c10::kDouble:
             launchReduceKernel_double((double*)ptr, (double*)src, num, numRanks,
-                                      (int)op, activeRanks, failedRanksHint,
-                                      stream);
+                                      (int)op, activeRanks, stream);
             break;
         case c10::kBool:
             launchReduceKernel_bool((bool*)ptr, (bool*)src, num, numRanks,
-                                    (int)op, activeRanks, failedRanksHint,
-                                    stream);
+                                    (int)op, activeRanks, stream);
             break;
         case c10::kBFloat16:
             launchReduceKernel_bf16(ptr, src, num, numRanks, (int)op,
-                                    activeRanks, failedRanksHint, stream);
+                                    activeRanks, stream);
             break;
         default:
             TORCH_CHECK(false, c10::str("Unsupported reduce dtype: ",
@@ -93,16 +85,15 @@ T applyReduceOp(const T& a, const T& b, c10d::ReduceOp op) {
 
 template <typename T>
 void reduceCpu(T* dst, const T* src, size_t numElements, size_t numRanks,
-               c10d::ReduceOp op, bool* activeRanks, int* failedRanksHint) {
+               c10d::ReduceOp op, bool* activeRanks) {
     at::parallel_for(0, numElements, 1024, [&](int64_t begin, int64_t end) {
         for (int64_t i = begin; i < end; ++i) {
             bool valid = false;
             T acc{};
             for (int64_t rank = 0; rank < numRanks; ++rank) {
-                bool shouldInclude =
-                    activeRanks[rank] &&
-                    (!failedRanksHint || failedRanksHint[rank] == 0);
-                if (shouldInclude) {
+                // Note: failedRanksHint is intentionally NOT checked here
+                // (same rationale as the GPU reduceKernel).
+                if (activeRanks[rank]) {
                     if (!valid) {
                         acc = src[i + rank * numElements];
                         valid = true;
@@ -118,43 +109,39 @@ void reduceCpu(T* dst, const T* src, size_t numElements, size_t numRanks,
 }
 
 void launchReduceCpu(at::Tensor dst, size_t pos, size_t realSize, void* src,
-                     size_t numRanks, c10d::ReduceOp op, bool* activeRanks,
-                     int* failedRanksHint) {
+                     size_t numRanks, c10d::ReduceOp op, bool* activeRanks) {
     auto ptr = (char*)dst.data_ptr() + pos;
     size_t num = realSize / dst.element_size();
 
     switch (dst.scalar_type()) {
         case c10::kByte:
             reduceCpu((uint8_t*)ptr, (uint8_t*)src, num, numRanks, op,
-                      activeRanks, failedRanksHint);
+                      activeRanks);
             break;
         case c10::kChar:
             reduceCpu((int8_t*)ptr, (int8_t*)src, num, numRanks, op,
-                      activeRanks, failedRanksHint);
+                      activeRanks);
             break;
         case c10::kShort:
             reduceCpu((int16_t*)ptr, (int16_t*)src, num, numRanks, op,
-                      activeRanks, failedRanksHint);
+                      activeRanks);
             break;
         case c10::kInt:
-            reduceCpu((int*)ptr, (int*)src, num, numRanks, op, activeRanks,
-                      failedRanksHint);
+            reduceCpu((int*)ptr, (int*)src, num, numRanks, op, activeRanks);
             break;
         case c10::kLong:
             reduceCpu((int64_t*)ptr, (int64_t*)src, num, numRanks, op,
-                      activeRanks, failedRanksHint);
+                      activeRanks);
             break;
         case c10::kFloat:
-            reduceCpu((float*)ptr, (float*)src, num, numRanks, op, activeRanks,
-                      failedRanksHint);
+            reduceCpu((float*)ptr, (float*)src, num, numRanks, op, activeRanks);
             break;
         case c10::kDouble:
             reduceCpu((double*)ptr, (double*)src, num, numRanks, op,
-                      activeRanks, failedRanksHint);
+                      activeRanks);
             break;
         case c10::kBool:
-            reduceCpu((bool*)ptr, (bool*)src, num, numRanks, op, activeRanks,
-                      failedRanksHint);
+            reduceCpu((bool*)ptr, (bool*)src, num, numRanks, op, activeRanks);
             break;
         default:
             TORCH_CHECK(false, c10::str("Unsupported reduce dtype: ",
@@ -194,7 +181,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
         tensorToBuffer,
     const std::function<void(void* src, size_t pos, size_t realSize)>&
         bufferToTensor) {
-    size_t chunkSize = ((kBufferSize - 1) / meta->size) & ~(size_t)7;
+    size_t chunkSize = ((kBufferSize - 1) / meta->maxGroupSize) & ~(size_t)7;
     auto future = c10::make_intrusive<c10::ivalue::Future>(
         c10::ListType::create(c10::TensorType::get()));
 
@@ -207,13 +194,12 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
     std::weak_ptr<std::function<void()>> weakProcessNextChunk =
         processNextChunk;
 
-    int* failedRanksHintPtr = failed_ranks_hint.data();
-    int* attemptedRanksHintPtr = failed_ranks_hint.attemptedData();
+    auto failed_t = failed_ranks_hint.tensor;
+    auto attempted_t = failed_ranks_hint.attempted_tensor;
 
     *processNextChunk = [this, weakProcessNextChunk, state, opType, tensorSize,
                          chunkSize, broadcastRoot, meta, tensorToBuffer,
-                         bufferToTensor, future, failedRanksHintPtr,
-                         attemptedRanksHintPtr]() {
+                         bufferToTensor, future, failed_t, attempted_t]() {
         auto processNextChunk = weakProcessNextChunk.lock();
 
         if (state->currentPos >= tensorSize) {
@@ -224,6 +210,9 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
         int taskId = cpuTaskCount % 2;
         TORCH_CHECK(!tasks_[taskId].active);
 
+        task_failed_tensor_[taskId] = failed_t;
+        task_attempted_tensor_[taskId] = attempted_t;
+
         size_t realSize = std::min(chunkSize, tensorSize - state->currentPos);
         int bufferOffset = meta->taskCount % 2;
         tasks_[taskId].opType = (int)opType;
@@ -231,20 +220,17 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
         tasks_[taskId].broadcastRoot = broadcastRoot;
         tasks_[taskId].bufferOffset = bufferOffset;
         tasks_[taskId].transferGroupMeta = meta.get();
-        tasks_[taskId].failedRanksHintHost = failedRanksHintPtr;
-        tasks_[taskId].attemptedRanksHintHost = attemptedRanksHintPtr;
         tensorToBuffer(
             (void*)meta->segmentInfos[meta->rank].send_buffer[bufferOffset],
             state->currentPos, realSize);
 
         hasCallback_[taskId] = true;
 
-        callbacks_[taskId] = [this, processNextChunk, state, meta,
-                              bufferToTensor, bufferOffset, realSize,
-                              future]() {
+        callbacks_[taskId] = [processNextChunk, state, meta, bufferToTensor,
+                              bufferOffset, realSize, future]() {
             if (meta->activeRanksTensor.device().is_cpu()) {
                 // activeRanks is InGroupRank-indexed, same order as the tensor.
-                for (int i = 0; i < meta->size; ++i) {
+                for (int i = 0; i < meta->maxGroupSize; ++i) {
                     meta->activeRanksTensor[i] = meta->activeRanks[i] ? 1 : 0;
                 }
             }
@@ -276,7 +262,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
                              const at::cuda::CUDAStream&)>& tensorToBuffer,
     const std::function<void(void* src, size_t pos, size_t realSize,
                              const at::cuda::CUDAStream&)>& bufferToTensor) {
-    size_t chunkSize = ((kBufferSize - 1) / meta->size) & ~(size_t)7;
+    size_t chunkSize = ((kBufferSize - 1) / meta->maxGroupSize) & ~(size_t)7;
 
     at::cuda::CUDAStream enq_stream =
         at::cuda::getStreamFromPool(false, issue_stream.device_index());
@@ -284,6 +270,9 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
     auto event_start = std::make_shared<torch::Event>(torch::kCUDA);
     event_start->record(issue_stream);
     event_start->block(enq_stream);
+
+    auto failed_t = failed_ranks_hint.tensor;
+    auto attempted_t = failed_ranks_hint.attempted_tensor;
 
     std::vector<CudaTaskSubmissionToken> submitted_tasks;
     submitted_tasks.reserve((tensorSize + chunkSize - 1) / chunkSize);
@@ -301,10 +290,13 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
             pos, realSize, enq_stream);
 
         hasCallback_[taskId] = false;
-        launchEnqueueTaskKernel(
-            (int)opType, realSize, broadcastRoot, bufferOffset, taskSequence,
-            meta.get(), tasks_device_, failed_ranks_hint.data(),
-            failed_ranks_hint.attemptedData(), taskId, enq_stream.stream());
+
+        task_failed_tensor_[taskId] = failed_t;
+        task_attempted_tensor_[taskId] = attempted_t;
+
+        launchEnqueueTaskKernel((int)opType, realSize, broadcastRoot,
+                                bufferOffset, taskSequence, meta.get(),
+                                tasks_device_, taskId, enq_stream.stream());
         bufferToTensor(
             (void*)meta->segmentInfos[meta->rank].recv_buffer[bufferOffset],
             pos, realSize, enq_stream);

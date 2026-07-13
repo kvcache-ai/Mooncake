@@ -210,13 +210,12 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
 
     // --- Fault reconciliation ---
 
-    void openReconciliationWindow();
+    void tryOpenReconciliationWindow();
 
     // Apply transfer observation bit-vectors to a reporter's link_status.
     // Returns true when at least one peer was reported as failed.
     bool applyLinkStatusUpdate(RankInfo& reporter,
                                const std::vector<uint8_t>& attempted,
-                               const std::vector<uint8_t>& succeeded,
                                const std::vector<uint8_t>& failed);
 
     // --- Healthy set computation ---

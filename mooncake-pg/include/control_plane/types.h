@@ -138,7 +138,6 @@ struct GroupView {
 struct TransferObservationEvent {
     std::vector<uint8_t> attempted_ranks;
     std::vector<uint8_t> failed_ranks_hint;
-    std::vector<uint8_t> succeeded_ranks;
 };
 
 }  // namespace mooncake

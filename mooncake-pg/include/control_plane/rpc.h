@@ -109,12 +109,13 @@ struct UnregisterGroupRequest {
     uint64_t agent_session_epoch = 0;
 };
 
+// succeeded_ranks is intentionally omitted: it is always derived as
+// (attempted_ranks && !failed_ranks_hint).
 struct TransferObservationReport {
     GlobalRank reporter_rank = kInvalidGlobalRank;
     uint64_t agent_session_epoch = 0;
     std::vector<uint8_t> attempted_ranks;
     std::vector<uint8_t> failed_ranks_hint;
-    std::vector<uint8_t> succeeded_ranks;
 };
 
 // Agent -> Coordinator: per-peer link state change, triggered by LinkManager
@@ -241,6 +242,15 @@ struct RefreshPeerLink {
     GlobalRank peer = kInvalidGlobalRank;
 };
 
+// After RefreshPeerLink or DisconnectLink changes the shared read_state_
+// segment ID for `peer`, this effect propagates the current segment ID
+// (or -1 if the link is down) into every registered backend that has
+// `peer` in its rank_order.  This keeps all backend caches in sync with
+// the LinkManager's authoritative state.
+struct NotifyLinkRefreshed {
+    GlobalRank peer = kInvalidGlobalRank;
+};
+
 struct NotifyGroupReady {
     GroupId group_id;
 };
@@ -254,7 +264,7 @@ using AgentEffect =
     std::variant<EnablePeerProbe, DisconnectLink, StopReconnect,
                  ClearPeerMetadata, DisconnectAllLinks, ClearAllPeerMetadata,
                  ApplyViewToBackend, NotifyTEUnreachable, RefreshPeerLink,
-                 NotifyGroupReady, NotifyRanksActivated>;
+                 NotifyLinkRefreshed, NotifyGroupReady, NotifyRanksActivated>;
 
 // Results produced by the Coordinator/Agent state machine
 

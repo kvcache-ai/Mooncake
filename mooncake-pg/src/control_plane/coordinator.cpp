@@ -332,17 +332,18 @@ CentralizedCoordinatorStateMachine::handleTransferObservation(
     }
     auto& reporter = ranks_[req.reporter_rank];
 
-    bool has_negative =
-        applyLinkStatusUpdate(reporter, req.attempted_ranks,
-                              req.succeeded_ranks, req.failed_ranks_hint);
+    bool has_negative = applyLinkStatusUpdate(reporter, req.attempted_ranks,
+                                              req.failed_ranks_hint);
 
     if (has_negative) {
-        openReconciliationWindow();
+        LOG(INFO) << "[COORD] TransferObservation has negative → opening "
+                     "reconciliation window";
+        tryOpenReconciliationWindow();
     }
     return result;
 }
 
-void CentralizedCoordinatorStateMachine::openReconciliationWindow() {
+void CentralizedCoordinatorStateMachine::tryOpenReconciliationWindow() {
     if (!reconciliation_ctx_.active) {
         reconciliation_ctx_.active = true;
         reconciliation_ctx_.deadline =
@@ -352,16 +353,17 @@ void CentralizedCoordinatorStateMachine::openReconciliationWindow() {
 
 bool CentralizedCoordinatorStateMachine::applyLinkStatusUpdate(
     RankInfo& reporter, const std::vector<uint8_t>& attempted,
-    const std::vector<uint8_t>& succeeded, const std::vector<uint8_t>& failed) {
+    const std::vector<uint8_t>& failed) {
     bool has_negative = false;
     for (int32_t peer = 0; peer < max_world_size_; ++peer) {
         if (peer >= static_cast<int32_t>(attempted.size()) || !attempted[peer])
             continue;
-        if (peer < static_cast<int32_t>(succeeded.size()) && succeeded[peer])
-            reporter.link_status[peer] = 1;
+        // succeeded = attempted && !failed
         if (peer < static_cast<int32_t>(failed.size()) && failed[peer]) {
             reporter.link_status[peer] = 0;
             has_negative = true;
+        } else {
+            reporter.link_status[peer] = 1;
         }
     }
     return has_negative;
@@ -407,15 +409,23 @@ CentralizedCoordinatorStateMachine::handleSyncAfterFailure(
         return result;
     }
 
+    // sync_after_failure is only meaningful for auto_deactivate groups.
+    if (!view_it->second.auto_deactivate) {
+        result.effects.push_back(ReplySyncEffect{
+            sync_id,
+            {SyncAfterFailureStatus::Rejected, view_it->second.epoch,
+             "group has auto_deactivate=false"}});
+        return result;
+    }
+
     // Apply piggybacked observation inline.
     if (req.observation.has_value()) {
         bool has_negative =
             applyLinkStatusUpdate(reporter, req.observation->attempted_ranks,
-                                  req.observation->succeeded_ranks,
                                   req.observation->failed_ranks_hint);
 
         if (has_negative) {
-            openReconciliationWindow();
+            tryOpenReconciliationWindow();
         }
     }
 
@@ -522,6 +532,8 @@ CoordinatorApplyResult<void> CentralizedCoordinatorStateMachine::tick() {
 
     // Fault reconciliation window.
     if (reconciliation_ctx_.active && now >= reconciliation_ctx_.deadline) {
+        LOG(INFO) << "[COORD] Reconciliation window expired, triggering "
+                     "auto_deactivate";
         reconciliation_ctx_.active = false;
         updateRankStates(result.effects);
         applyAutoDeactivate(result.effects);
@@ -662,11 +674,9 @@ void CentralizedCoordinatorStateMachine::updateRankStates(
                                     i) != healthy_set.end();
 
         if (in_healthy && ranks_[i].state != RankState::Healthy) {
-            LOG(INFO) << "[COORD] rank=" << i << " transitioning to Healthy";
             ranks_[i].state = RankState::Healthy;
             effects.push_back(makeRankStateEffect(i));
         } else if (!in_healthy && ranks_[i].state == RankState::Healthy) {
-            LOG(INFO) << "[COORD] rank=" << i << " transitioning to Synced";
             ranks_[i].state = RankState::Synced;
             effects.push_back(makeRankStateEffect(i));
         }

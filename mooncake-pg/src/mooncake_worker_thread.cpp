@@ -97,18 +97,6 @@ void MooncakeWorker::startWorker() {
                 if (task_status[i].load(std::memory_order_acquire) == IDLE) {
                     const auto submit_sequence = task.submitSequence;
                     if (skipTransfer) {
-                        // Even though we skip the data-transfer phase, we must
-                        // still mark active peers as "attempted" so the signal
-                        // phase will create per-peer sync entries and wait for
-                        // the root's signal before consuming the recv buffer.
-                        // Without this, non-root broadcast/scatter ranks race
-                        // past the root's RDMA writes and copy stale data.
-                        for (int j = 0; j < group->size; ++j) {
-                            if (!group->activeRanks[j]) continue;
-                            if (task.attemptedRanksHintHost) {
-                                task.attemptedRanksHintHost[j] = 1;
-                            }
-                        }
                         submitted_task_sequence_[i].store(
                             submit_sequence, std::memory_order_release);
                         task_status[i].store(TRANSFERRED_1,
@@ -119,11 +107,9 @@ void MooncakeWorker::startWorker() {
                         rankToTaskId[i][j] = kInvalidTaskId;
                     }
                     std::vector<TransferRequest> entries;
-                    for (int j = 0; j < group->size; ++j) {
-                        // j is InGroupRank; segment arrays are also
-                        // InGroupRank-indexed.
-
-                        if (!group->activeRanks[j]) {
+                    for (int j = 0; j < group->maxGroupSize; ++j) {
+                        if (!group->activeRanks[j] ||
+                            task_failed_tensor_[i][j].item<int>()) {
                             continue;
                         }
                         if (((c10d::OpType)task.opType ==
@@ -133,15 +119,6 @@ void MooncakeWorker::startWorker() {
                             j != task.broadcastRoot) {
                             continue;
                         }
-
-                        if (task.attemptedRanksHintHost) {
-                            task.attemptedRanksHintHost[j] = 1;
-                        }
-
-                        // Use cached segment ID from TransferGroupMeta.
-                        // Control plane syncs this via applyViewUpdate.
-                        TransferMetadata::SegmentID target_id =
-                            group->segmentIDs[j];
 
                         uint64_t source = group->segmentInfos[group->rank]
                                               .send_buffer[task.bufferOffset];
@@ -189,10 +166,13 @@ void MooncakeWorker::startWorker() {
                         entries.push_back(TransferRequest{
                             .opcode = TransferRequest::WRITE,
                             .source = (void*)source,
-                            .target_id = target_id,
+                            .target_id = group->segmentIDs[j],
                             .target_offset = target_offset,
                             .length = task.tensorSize,
                         });
+
+                        // Attempted to transfer to this peer
+                        task_attempted_tensor_[i][j] = 1;
                     }
                     task.batchID =
                         group->engine->allocateBatchID(entries.size());
@@ -211,15 +191,12 @@ void MooncakeWorker::startWorker() {
                         auto now = clock::now();
                         auto diff = std::chrono::duration_cast<
                             std::chrono::microseconds>(now - activeTime[i]);
-                        for (int j = 0; j < group->size; ++j) {
-                            if (task.failedRanksHintHost[j]) {
+                        for (int j = 0; j < group->maxGroupSize; ++j) {
+                            if (!group->activeRanks[j] ||
+                                task_failed_tensor_[i][j].item<int>()) {
                                 continue;
                             }
-                            // Use the per-op attempted bitmap as the source of
-                            // truth. A peer that was attempted in the data
-                            // phase must be accounted for even if the
-                            // coordinator later deactivates it.
-                            if (!task.attemptedRanksHintHost[j]) {
+                            if (rankToTaskId[i][j] == kInvalidTaskId) {
                                 continue;
                             }
                             group->engine->getTransferStatus(
@@ -237,11 +214,15 @@ void MooncakeWorker::startWorker() {
                                         PeerLiveness::Alive;
                                 }
                                 if (peer_dead) {
-                                    task.failedRanksHintHost[j] = 1;
-                                    LOG(ERROR) << "Rank " << group->globalRank
-                                               << " transfer to peer " << j
-                                               << " failed for op "
-                                               << (int)task.opType;
+                                    task_failed_tensor_[i][j] = 1;
+                                    LOG(ERROR)
+                                        << "Rank " << group->globalRank
+                                        << " [DATA] transfer to peer " << j
+                                        << " (global=" << group->rank_order[j]
+                                        << ") failed for op "
+                                        << (int)task.opType
+                                        << " status=" << (int)status.s
+                                        << " diff_us=" << diff.count();
                                 } else {
                                     batch_done = false;
                                     break;
@@ -271,33 +252,17 @@ void MooncakeWorker::startWorker() {
                         rankToTaskId[i][j] = kInvalidTaskId;
                     }
                     std::vector<TransferRequest> entries;
-                    for (int j = 0; j < group->size; ++j) {
-                        // Send a completion signal to every active peer.
-                        // The signal phase acts as a bidirectional barrier:
-                        // each rank writes to every peer's recv_sync at its
-                        // own rank-slot and waits for every peer's signal in
-                        // its own recv_sync.  This is independent of the
-                        // data-transfer direction — even ranks that only
-                        // sent data (e.g. REDUCE contributors) or only
-                        // received (e.g. BROADCAST non-roots) must
-                        // participate so every rank sees the global barrier.
-                        if (!group->activeRanks[j]) {
+                    for (int j = 0; j < group->maxGroupSize; ++j) {
+                        if (!group->activeRanks[j] ||
+                            task_failed_tensor_[i][j].item<int>()) {
                             continue;
                         }
-                        if (task.failedRanksHintHost[j]) {
-                            continue;
-                        }
-
-                        // Use cached segment ID from TransferGroupMeta.
-                        TransferMetadata::SegmentID target_id =
-                            group->segmentIDs[j];
-
                         *source_ptr = 1;
                         rankToTaskId[i][j] = entries.size();
                         entries.push_back(TransferRequest{
                             .opcode = TransferRequest::WRITE,
                             .source = (void*)source_ptr,
-                            .target_id = target_id,
+                            .target_id = group->segmentIDs[j],
                             .target_offset = group->segmentInfos[j]
                                                  .recv_sync[task.bufferOffset] +
                                              group->rank * sizeof(int32_t),
@@ -321,27 +286,12 @@ void MooncakeWorker::startWorker() {
                             now - activeTime[i]);
 
                     TransferStatus status;
-                    for (int j = 0; j < group->size; ++j) {
-                        if (task.failedRanksHintHost[j]) {
-                            continue;
-                        }
-                        // Check every active peer, not just data-attempted
-                        // ones. The signal phase is a bidirectional barrier
-                        // independent of data-transfer direction.
-                        if (!group->activeRanks[j]) {
+                    for (int j = 0; j < group->maxGroupSize; ++j) {
+                        if (!group->activeRanks[j] ||
+                            task_failed_tensor_[i][j].item<int>()) {
                             continue;
                         }
                         if (rankToTaskId[i][j] == kInvalidTaskId) {
-                            // The peer was attempted in the data-transfer
-                            // phase, but got deactivated before we could send
-                            // the sync signal. Treat it as a failure so the
-                            // control plane can reconcile the group view.
-                            task.failedRanksHintHost[j] = 1;
-                            LOG(ERROR) << "Rank " << group->globalRank
-                                       << " sync to peer " << j
-                                       << " skipped (peer deactivated before "
-                                          "signal send)"
-                                       << " for op " << (int)task.opType;
                             continue;
                         }
                         group->engine->getTransferStatus(
@@ -359,11 +309,15 @@ void MooncakeWorker::startWorker() {
                                             PeerLiveness::Alive;
                             }
                             if (peer_dead) {
-                                task.failedRanksHintHost[j] = 1;
+                                task_failed_tensor_[i][j] = 1;
                                 LOG(ERROR)
                                     << "Rank " << group->globalRank
-                                    << " sync to peer " << j
-                                    << " failed for op " << (int)task.opType;
+                                    << " [SYNC] sync to peer " << j
+                                    << " (global=" << group->rank_order[j]
+                                    << ") failed for op " << (int)task.opType
+                                    << " status=" << (int)status.s
+                                    << " signal_ptr=" << (int)signal_ptr[j]
+                                    << " diff_us=" << diff.count();
                             } else {
                                 task_done = false;
                                 break;
@@ -375,40 +329,42 @@ void MooncakeWorker::startWorker() {
                         activeTime[i] = clock::now();
                     }
                     if (task_done) {
-                        for (int j = 0; j < group->size; ++j) {
-                            if (!group->activeRanks[j]) continue;
+                        for (int j = 0; j < group->maxGroupSize; ++j) {
                             signal_ptr[j] = 0;
                         }
 
                         // Push transfer observation via backend's Agent.
-                        if (task.attemptedRanksHintHost && group->backend) {
+                        if (group->backend) {
+                            auto& att_tensor = task_attempted_tensor_[i];
+                            auto& fail_tensor = task_failed_tensor_[i];
                             bool has_any_attempted = false;
-                            for (int j = 0; j < group->size; ++j) {
-                                if (task.attemptedRanksHintHost[j]) {
+                            for (int j = 0; j < group->maxGroupSize; ++j) {
+                                if (att_tensor[j].item<int>()) {
                                     has_any_attempted = true;
                                     break;
                                 }
                             }
                             if (has_any_attempted) {
+                                std::string raw_att, raw_fail;
+                                for (int j = 0; j < group->maxGroupSize; ++j) {
+                                    int att = att_tensor[j].item<int>();
+                                    int fail = fail_tensor[j].item<int>();
+                                    raw_att += std::to_string(att) + " ";
+                                    raw_fail += std::to_string(fail) + " ";
+                                }
                                 std::vector<uint8_t> attempted(kMaxNumRanks, 0);
                                 std::vector<uint8_t> failed(kMaxNumRanks, 0);
-                                std::vector<uint8_t> succeeded(kMaxNumRanks, 0);
-                                for (int j = 0; j < group->size; ++j) {
+                                for (int j = 0; j < group->maxGroupSize; ++j) {
                                     int32_t peer_global = group->rank_order[j];
                                     attempted[peer_global] =
-                                        task.attemptedRanksHintHost[j] ? 1 : 0;
+                                        att_tensor[j].item<int>() ? 1 : 0;
                                     failed[peer_global] =
-                                        task.failedRanksHintHost[j] ? 1 : 0;
-                                    succeeded[peer_global] =
-                                        (attempted[peer_global] &&
-                                         !failed[peer_global])
-                                            ? 1
-                                            : 0;
+                                        fail_tensor[j].item<int>() ? 1 : 0;
                                 }
                                 group->backend->getAgent()
                                     .pushTransferObservation(
-                                        std::move(attempted), std::move(failed),
-                                        std::move(succeeded));
+                                        std::move(attempted),
+                                        std::move(failed));
                             }
                         }
 
