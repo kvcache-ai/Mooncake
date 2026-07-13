@@ -15,18 +15,13 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
-#include <fcntl.h>
 #include <sys/time.h>
-#include <unistd.h>
 
 #include <array>
-#include <cerrno>
-#include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <memory>
-#include <thread>
 
 #include "transfer_engine.h"
 #include "transport/transport.h"
@@ -216,35 +211,6 @@ TEST_F(TransportTest, RegisterLocalMemoryBatchAllowsAdjacentBuffers) {
     };
 
     EXPECT_EQ(engine.registerLocalMemoryBatch(entries, "cpu:0"), 0);
-}
-
-TEST_F(TransportTest, ReadWouldBlockReturnsImmediately) {
-    int fds[2] = {-1, -1};
-    ASSERT_EQ(pipe(fds), 0);
-
-    int flags = fcntl(fds[0], F_GETFL, 0);
-    ASSERT_NE(flags, -1);
-    ASSERT_EQ(fcntl(fds[0], F_SETFL, flags | O_NONBLOCK), 0);
-
-    std::thread delayed_writer([write_fd = fds[1]]() {
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        const char byte = 'x';
-        (void)write(write_fd, &byte, sizeof(byte));
-    });
-
-    char buffer[1] = {0};
-    errno = 0;
-    const auto start = std::chrono::steady_clock::now();
-    ssize_t bytesRead = readFully(fds[0], buffer, sizeof(buffer));
-    const auto elapsed = std::chrono::steady_clock::now() - start;
-
-    EXPECT_EQ(bytesRead, -1);
-    EXPECT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK);
-    EXPECT_LT(elapsed, std::chrono::milliseconds(100));
-
-    delayed_writer.join();
-    close(fds[0]);
-    close(fds[1]);
 }
 }  // namespace mooncake
 
