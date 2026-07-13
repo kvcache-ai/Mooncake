@@ -21,16 +21,13 @@ struct RegisterAgentRequest {
     std::string agent_addr;
     std::string te_server_name;
     uint64_t agent_session_epoch = 0;
-    uint64_t warmup_recv_addr = 0;  // local warmup recv region for TE handshake
+    uint64_t warmup_recv_addr = 0;
 };
 
-// Process-level connection metadata for a remote rank.
-// Returned in RegisterAgentResponse so the Agent can feed LinkManager.
 struct RankConnectionMetadata {
     GlobalRank rank = kInvalidGlobalRank;
     std::string agent_addr;
     std::string te_server_name;
-    // Warmup region addresses for LinkManager handshake.
     uint64_t warmup_recv_addr = 0;
 };
 
@@ -73,7 +70,7 @@ struct ProposeViewUpdateRequest {
     GroupId group_id;
     GlobalRank source_rank = kInvalidGlobalRank;
     uint64_t agent_session_epoch = 0;
-    std::vector<GlobalRank> requested_ranks;  // ranks to activate/deactivate
+    std::vector<GlobalRank> requested_ranks;
     bool is_activation = false;
 };
 
@@ -84,9 +81,6 @@ struct ProposeViewUpdateResponse {
     std::string reject_reason;
 };
 
-// Per-(group_id, rank) endpoint publication unit.
-// agent_session_epoch is NOT included here  - the Host fills it in the
-// enclosing PublishEndpointRequest before sending the RPC.
 struct GroupEndpointPublication {
     GroupId group_id;
     GroupEndpointInfo endpoint_info;
@@ -109,8 +103,6 @@ struct UnregisterGroupRequest {
     uint64_t agent_session_epoch = 0;
 };
 
-// succeeded_ranks is intentionally omitted: it is always derived as
-// (attempted_ranks && !failed_ranks_hint).
 struct TransferObservationReport {
     GlobalRank reporter_rank = kInvalidGlobalRank;
     uint64_t agent_session_epoch = 0;
@@ -118,9 +110,6 @@ struct TransferObservationReport {
     std::vector<uint8_t> failed_ranks_hint;
 };
 
-// Agent -> Coordinator: per-peer link state change, triggered by LinkManager
-// LinkUp/LinkDown events.  This is event-driven (not periodic) so it cannot
-// overwrite transfer-observation data with a stale snapshot.
 struct LinkStateChangeReport {
     GlobalRank reporter_rank = kInvalidGlobalRank;
     GlobalRank peer = kInvalidGlobalRank;
@@ -128,16 +117,11 @@ struct LinkStateChangeReport {
     uint64_t agent_session_epoch = 0;
 };
 
-// Agent -> Coordinator: sync-after-failure RPC.  The caller has observed a
-// failure and wants the Coordinator to make a membership decision.  The request
-// may piggyback a transfer observation if one was pending locally; otherwise
-// the observation was already sent asynchronously.
 struct SyncAfterFailureRequest {
     GroupId group_id;
     GlobalRank reporter_rank = kInvalidGlobalRank;
     uint64_t agent_session_epoch = 0;
-    uint64_t current_epoch = 0;  // Agent's local GroupView epoch at call time
-
+    uint64_t current_epoch = 0;
     // Piggybacked observation.
     std::optional<TransferObservationReport> observation;
 };
@@ -183,10 +167,6 @@ struct ViewUpdateAck {
 
 // Coordinator effects
 
-// ViewUpdateEffect tells the Host to push a view update to the group members.
-// Every online member receives the push via callAsync and ACKs back through
-// handleViewUpdateAck.  The State Machine matches ACKs to pending barriers
-// (proposal / bootstrap) and sync-after-failure waiters.
 struct ViewUpdateEffect {
     GroupView view;
 };
@@ -242,11 +222,6 @@ struct RefreshPeerLink {
     GlobalRank peer = kInvalidGlobalRank;
 };
 
-// After RefreshPeerLink or DisconnectLink changes the shared read_state_
-// segment ID for `peer`, this effect propagates the current segment ID
-// (or -1 if the link is down) into every registered backend that has
-// `peer` in its rank_order.  This keeps all backend caches in sync with
-// the LinkManager's authoritative state.
 struct NotifyLinkRefreshed {
     GlobalRank peer = kInvalidGlobalRank;
 };

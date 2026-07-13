@@ -6,40 +6,25 @@
 #include <string>
 #include <vector>
 
-// mooncake-pg uses two rank namespaces that are easy to confuse:
+namespace mooncake {
+
+// There are two rank namespaces that are easy to confuse:
 //
 //   * GlobalRank  - process-wide identifier, range 0 .. max_world_size-1.
-//                   Used for process-level link state, segment IDs, and
-//                   GroupView member slots.
+//                   Used for process-level states
 //   * InGroupRank - group-local identifier, range 0 .. group_size-1.
 //                   Used inside a single process group and mapped to a
 //                   GlobalRank through GroupView::rank_order.
-//
-// Both are plain int32_t.  Callers must take care not to mix them up.
-
-namespace mooncake {
-
-// Rank types.  Both alias int32_t; the names are the documentation.
 using GlobalRank = int32_t;
 using InGroupRank = int32_t;
 
-using GroupId = std::string;  // process group ID (from PyTorch
-                              // DistributedBackendOptions::group_id)
+using GroupId = std::string;
 
 constexpr GlobalRank kInvalidGlobalRank = -1;
 constexpr int kMaxNumRanks = 64;
 
-// Process-level state for a rank.  All transitions are driven by the
-// Coordinator (authoritative); the Agent never self-demotes.
-//
-//   registerAgent()         Coordinator computes TE HealthySet
-//        |                  (heartbeat + transfer observations)
-//        v                         |
-//   Offline -> Synced ---------> Healthy
-//        ^                         |
-//        |   heartbeat timeout     |   excluded from HealthySet
-//        +--- or disconnect -------+-----> Synced
-//
+// Process-level state for a rank.
+// All transitions are driven by the Coordinator.
 enum class RankState : uint8_t {
     Offline = 0,
     Synced = 1,
@@ -48,10 +33,9 @@ enum class RankState : uint8_t {
 
 // Group-level, per-(group_id, rank) buffer/sync/P2P addresses.
 struct GroupEndpointInfo {
-    // Coordinator-assigned endpoint version.  The Agent publishes with 0 (it
-    // does not know the epoch); the Coordinator fills it in before pushing the
-    // ViewUpdate.  A change in this value tells the Agent that the remote
-    // endpoint has been republished and the LinkManager should reconnect.
+    // Coordinator-assigned endpoint version.
+    // The Agent publishes with 0 (it does not know the epoch);
+    // the Coordinator fills it in before pushing the ViewUpdate.
     uint64_t endpoint_epoch = 0;
 
     // collective
@@ -59,6 +43,7 @@ struct GroupEndpointInfo {
     uint64_t recv_buffer[2] = {};
     uint64_t send_sync[2] = {};
     uint64_t recv_sync[2] = {};
+
     // p2p
     uint64_t p2p_credit_region = 0;
     uint64_t p2p_ack_region = 0;
@@ -67,22 +52,17 @@ struct GroupEndpointInfo {
 // Membership state of one rank inside a single GroupView.
 enum class GroupMemberStatus : uint8_t {
     None = 0,      // slot has never belonged to this group
-    Left = 1,      // rank explicitly left the group (called destroy_group)
-    Inactive = 2,  // deactivated
-    Active = 3,    // rank is an active member
+    Left = 1,      // explicitly left the group (called destroy_group)
+    Inactive = 2,  // inactive member
+    Active = 3,    // active member
 };
 
 // Rank state inside a single GroupView.
-//
-// endpoint is an optional GroupEndpointInfo.  When set, the rank has published
-// an endpoint for its current agent session; the Coordinator only keeps it set
-// while agent_session_epoch matches the rank's current session.  This makes
-// endpoint.has_value() authoritative for "endpoint present and fresh".
 struct GroupMember {
     GroupMemberStatus status = GroupMemberStatus::None;
-    std::optional<uint64_t>
-        agent_session_epoch;  // session that published endpoint
     std::optional<GroupEndpointInfo> endpoint;
+    // session that published endpoint
+    std::optional<uint64_t> agent_session_epoch;
 
     bool isActive() const { return status == GroupMemberStatus::Active; }
     bool isMember() const {
@@ -94,18 +74,6 @@ struct GroupMember {
 };
 
 // Group lifecycle status.
-//
-//   registerGroup()
-//          |
-//          v
-//   Bootstrapping  -- all active ranks Healthy + have endpoints -->
-//   BootstrapSyncing
-//       (waiting for       (Coordinator broadcasts ViewUpdate,
-//        publishEndpoint     waits for ACKs from all active ranks)
-//        calls)                        |
-//                                      v  (all ACKs received)
-//                                    Ready
-//                               (group usable for data-plane transfers)
 //
 //   Bootstrapping      - collecting endpoints and waiting for all active ranks
 //                        to become Healthy with valid endpoints.
@@ -121,20 +89,16 @@ enum class GroupStatus : uint8_t {
     Ready = 2,
 };
 
-// Runtime state for a group.  rank_order maps InGroupRank → GlobalRank.
-// epoch is the GroupView version; it starts at 0 and monotonically increases
-// on every membership or endpoint change.
+// Runtime state for a group.
 struct GroupView {
     GroupId group_id;
     GroupStatus status = GroupStatus::Bootstrapping;
     uint64_t epoch = 0;
     bool auto_deactivate = true;
-    std::vector<GlobalRank> rank_order;  // InGroupRank → GlobalRank
+    std::vector<GlobalRank> rank_order;  // InGroupRank -> GlobalRank
     std::vector<GroupMember> members;    // indexed by GlobalRank
 };
 
-// TransferObservationEvent — process-level, worker thread → Agent.
-// Bit-vectors are indexed by GlobalRank.
 struct TransferObservationEvent {
     std::vector<uint8_t> attempted_ranks;
     std::vector<uint8_t> failed_ranks_hint;

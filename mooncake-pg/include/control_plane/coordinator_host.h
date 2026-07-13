@@ -47,13 +47,13 @@ class RpcClient;
 //                              | runEffects()                      |
 //                              |  RankStateUpdatePush -> broadcast |
 //                              |  ViewUpdatePush -> callAsync      |
-//                              |  ReplyProposalEffect -> reply   |
+//                              |  ReplyProposalEffect -> reply     |
 //                              +-----------------------------------+
 //
 
 class CoordinatorHost;
 
-// CoordinatorRpcServiceImpl  - thin RPC handler that forwards all calls
+// CoordinatorRpcServiceImpl - thin RPC handler that forwards all calls
 // to CoordinatorHost::post*().
 class CoordinatorRpcServiceImpl : public CoordinatorRpcService {
    public:
@@ -140,9 +140,9 @@ class CoordinatorHost {
     std::unique_ptr<CoordinatorRpcServiceImpl> rpc_impl_;
 
     // Host maintains the propose_id -> RPC context mapping.
-    // 2PC state is inside CentralizedCoordinatorStateMachine; Host just stores
-    // the RPC context for replying when the state machine emits
-    // ReplyProposalEffect.
+    // 2PC state is inside CentralizedCoordinatorStateMachine;
+    // Host just stores the RPC context for replying when the
+    // state machine emits ReplyProposalEffect.
     uint64_t next_propose_id_{1};
     std::unordered_map<uint64_t, coro_rpc::context<ProposeViewUpdateResponse>>
         pending_rpcs_;

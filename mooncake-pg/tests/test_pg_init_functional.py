@@ -49,6 +49,7 @@ def _subgroup_create_destroy_worker(ctx: MooncakePGWorkerContext) -> None:
         # All ranks collectively create both groups
         even_group = dist.new_group(ranks=even_ranks, backend=ctx.backend_name)
         odd_group = dist.new_group(ranks=odd_ranks, backend=ctx.backend_name)
+
         # Each rank uses its respective group
         if rank in even_ranks and even_group is not None:
             tensor = torch.tensor([rank], dtype=torch.int32, device=device)

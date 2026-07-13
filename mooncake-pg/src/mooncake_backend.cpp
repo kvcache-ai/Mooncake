@@ -358,9 +358,7 @@ MooncakeBackend::MooncakeBackend(
 
     meta_->autoSyncOnFailure = auto_sync_on_failure;
 
-    // Register group is synchronous.  Pass `this` as a raw pointer — the
-    // backend's lifetime is managed by the intrusive_ptr returned from
-    // make_intrusive; backends_ only needs a non-owning lookup key.
+    // Register group is synchronous.
     agent_.registerGroup(initial_group, auto_deactivate, this);
 
     agent_.publishLocalEndpoint(buildEndpointMetadata());
@@ -1023,10 +1021,6 @@ void MooncakeBackend::shutdown() {
 }
 
 void MooncakeBackend::syncActiveRanksTensor() {
-    // activeRanks is indexed by InGroupRank, length = max_group_size_.
-    // The Python-visible tensor must also be max_group_size_ so that it stays
-    // consistent with the shape produced by the constructor and so that the
-    // indices align correctly with the in-group rank space.
     std::vector<int32_t> active_ranks(max_group_size_, 0);
     for (int i = 0; i < meta_->maxGroupSize; ++i) {
         active_ranks[i] = meta_->activeRanks[i] ? 1 : 0;

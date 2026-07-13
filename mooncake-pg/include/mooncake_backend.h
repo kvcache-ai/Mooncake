@@ -26,19 +26,18 @@ namespace mooncake {
 
 static constexpr size_t kDefaultCollectiveTimeoutUs = 100000;  // 100 ms
 static constexpr int64_t kDefaultP2PTimeoutUs = 3000000;       // 3 s
+
+// Must be greater than collective_timeout_us so that timeout-based
+// failure reporters can contribute before the reconciliation window
+// expires. (Some ranks report failures based on timeout, while others
+// report based on failure status.)
 static constexpr int64_t kDefaultFaultReconciliationWindowUs =
-    4 *
-    kDefaultCollectiveTimeoutUs;  // 400 ms — must be &gt; collective_timeout_us
-                                  // so timeout-based failure reporters
-                                  // contribute before the window expires
+    4 * kDefaultCollectiveTimeoutUs;
 
 class AgentInterface;
 class AgentHost;
 
-// MooncakeProcessContext -- process-level container.
-// Owned by pg_py.cpp (file-scope static).
 struct MooncakeProcessContext {
-    // === Configuration (Python setters may modify before first backend) ===
     TransferEngine* external_engine = nullptr;
     std::string host_ip = "127.0.0.1";
     size_t collective_timeout_us = kDefaultCollectiveTimeoutUs;
@@ -46,7 +45,6 @@ struct MooncakeProcessContext {
     int64_t fault_reconciliation_window_us =
         kDefaultFaultReconciliationWindowUs;
 
-    // === Runtime ===
     // Eagerly created so set_device_filter works before init_process_group.
     // engine points to either owned_engine or external_engine.
     std::unique_ptr<TransferEngine> owned_engine =
@@ -55,7 +53,6 @@ struct MooncakeProcessContext {
     bool engine_initialized = false;
     int max_world_size = 0;
 
-    // === Process-level subsystems (no more singletons) ===
     LinkManager link_manager;
     MooncakeWorkerManager worker_manager;
     P2PDeviceWorkerManager p2p_device_worker_manager;
@@ -325,30 +322,27 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
 
     void joinGroup();
 
-    // Atomically update the worker-visible group view (descriptor + members).
-    // Called by AgentHost from the executor thread when a ViewUpdatePush
-    // is received from the Coordinator.
+    // Update the data plane view.
+    // Called by AgentHost when a ViewUpdatePush is received.
     void applyViewUpdate(const GroupView& view);
 
-    /// Returns the current GroupView epoch (monotonically increasing).
-    /// Safe to call from any thread. Epoch starts at 0 (bootstrap) and
-    /// increments on membership changes, auto-deactivation, and recovery.
+    // Returns the current GroupView epoch.
+    // Epoch starts at 0 (bootstrap) and increments on membership changes,
+    // auto-deactivation, and recovery.
     uint64_t getCurrentEpoch() const {
         return meta_ ? meta_->epoch.load(std::memory_order_acquire) : 0;
     }
 
-    // Called by AgentHost when a TE link to `peer` (InGroupRank) goes down.
-    // Resets the per-backend P2PProxy state for the affected peer.
+    // Called by AgentHost when a TE link to peer goes down.
     void onPeerLinkReset(InGroupRank peer);
 
-    /// Called by NotifyLinkRefreshed effect: refresh the cached TE segment
-    /// ID for `local` (InGroupRank) from the shared LinkManager.
-    /// If the link is not up, segmentID is set to -1.
+    // Called by NotifyLinkRefreshed effect: refresh the cached TE segment
+    // ID for `local` (InGroupRank) from the LinkManager.
+    // If the link is not up, segmentID is set to -1.
     void refreshSegmentID(InGroupRank local);
 
-    /// Sync-after-failure: notify the Coordinator of a detected failure and
-    /// block until a membership decision has been made and the Agent has
-    /// ACKed the resulting ViewUpdate.
+    // Notify the Coordinator of a detected failure and block until a membership
+    // decision has been made and the Agent has ACKed the resulting ViewUpdate.
     SyncAfterFailureResponse syncAfterFailure();
 
     // Sync the activeRanksTensor on CPU/GPU from the current GroupView.

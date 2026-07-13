@@ -60,13 +60,6 @@ __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
         bool valid = false;
         acc_t acc = 0;
         for (size_t rank = 0; rank < numRanks; ++rank) {
-            // activeRanks is indexed by InGroupRank, just like the loop rank.
-            // Note: failedRanksHint is intentionally NOT checked here.
-            // When a peer fails mid-operation its recv-buffer data may be
-            // garbage, so the reduce result is only guaranteed correct when
-            // no peers failed (failedRanks == 0).  The work handle reports
-            // local_success = false on any failure so the application knows
-            // to discard and retry.
             if (activeRanks[rank]) {
                 if (!valid) {
                     if constexpr (kIsBf16) {

@@ -16,8 +16,7 @@ namespace mooncake {
 struct TransferGroupMeta;
 class MooncakeWorker;
 
-// Per-operation failedRanksHint / attemptedRanks buffer (non-copyable,
-// movable).
+// Per-operation failedRanksHint / attemptedRanks buffer
 //
 // Both tensors are CPU tensors backed by Torch's refcounted storage.  The
 // worker thread holds a copy of each tensor to keep the memory alive until

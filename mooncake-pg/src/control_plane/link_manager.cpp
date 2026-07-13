@@ -44,8 +44,6 @@ bool LinkManager::supportFabricMem() {
 
 void LinkManager::init(GlobalRank rank, int max_world_size,
                        TransferEngine* engine) {
-    // If already initialized, return.  Also reject init after shutdown
-    // (re-init-after-shutdown is not supported  - create a new process).
     if (initialized_.exchange(true, std::memory_order_acq_rel)) {
         return;
     }
@@ -235,8 +233,6 @@ void LinkManager::refreshPeerSegment(GlobalRank peer) {
     engine_->removeLocalSegment(link.server_name);
     link.target_id = engine_->openSegment(link.server_name);
 
-    // Atomically swap in the new target_id without touching link_connected.
-    // Increment the version so resolvePeer() sees the new value.
     read_state_[peer].target_id.store(link.target_id.value(),
                                       std::memory_order_relaxed);
     read_state_[peer].version.fetch_add(1, std::memory_order_release);
@@ -245,8 +241,6 @@ void LinkManager::refreshPeerSegment(GlobalRank peer) {
 void LinkManager::publishLinkUp(GlobalRank peer,
                                 TransferMetadata::SegmentID target_id) {
     if (!rankInRange(peer)) return;
-    // Order: target_id before link_connected before version increment.
-    // resolvePeer uses the version counter to detect torn reads.
     read_state_[peer].target_id.store(target_id, std::memory_order_relaxed);
     read_state_[peer].link_connected.store(1, std::memory_order_release);
     read_state_[peer].version.fetch_add(1, std::memory_order_release);

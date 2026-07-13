@@ -47,9 +47,7 @@ AgentApplyResult AgentStateMachine::handlePeerJoined(
     if (push.rank == rank_) return effects;
 
     // If the TE server name changed (replacement process), tear down the
-    // old link before probing the new one.  Without this the poller skips
-    // the peer because the old Connected state lingers until the transport
-    // engine detects the peer failure, which can take seconds.
+    // old link before probing the new one.
     auto old = rank_connections_[push.rank];
     if (old.has_value() && old->te_server_name != push.te_server_name) {
         effects.push_back(DisconnectLink{push.rank});
@@ -194,7 +192,6 @@ AgentApplyResult AgentStateMachine::handleLinkStateChange(GlobalRank peer,
     if (!connected) {
         effects.push_back(NotifyTEUnreachable{peer});
     } else {
-        // Link came up: refresh all backends' cached segment IDs for this peer.
         effects.push_back(NotifyLinkRefreshed{peer});
     }
     return effects;
@@ -240,7 +237,6 @@ AgentApplyResult AgentStateMachine::applyRegisterAgentResponse(
     }
 
     // Populate connection metadata and trigger peer probes.
-    // Seed so the first observation of any kind triggers a report.
     for (const auto& conn : resp.rank_connections) {
         if (conn.rank == rank_) continue;
         rank_connections_[conn.rank] = conn;
@@ -295,7 +291,6 @@ AgentStateMachine::processTransferObservation(
 
     for (int peer = 0; peer < max_world_size_; ++peer) {
         if (!event.attempted_ranks[peer]) continue;
-        // succeeded = attempted && !failed
         bool current = !event.failed_ranks_hint[peer];
         if (current != last_reported_peer_status_[peer]) {
             last_reported_peer_status_[peer] = current;

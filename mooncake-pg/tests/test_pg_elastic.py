@@ -652,7 +652,7 @@ def _replacement_recovery_worker(
         broken_exited.wait()
         backend = ctx.get_backend()
 
-        # Round 2: run collective with dead rank -> local_success=False
+        # Round 2: run collective with dead rank
         tensor = torch.tensor([logical_rank], dtype=torch.int32, device=device)
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
 

@@ -60,13 +60,11 @@ class AgentStateMachine {
         return agent_session_epoch_.load(std::memory_order_acquire);
     }
 
-    // Thread-safe: may be called from any thread.
     RankState getRankState(GlobalRank rank) const {
         return static_cast<RankState>(
             global_rank_states_[rank].load(std::memory_order_acquire));
     }
 
-    // Thread-safe: rank is active in the given group per the Coordinator view.
     bool isRankActive(GroupId group_id, InGroupRank rank) const;
 
     // Best-effort local estimate: Healthy && isMember && hasEndpoint.

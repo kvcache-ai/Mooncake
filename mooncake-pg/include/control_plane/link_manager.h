@@ -89,7 +89,6 @@ class LinkManager {
         std::optional<BatchID> warmup_batch_id;
         uint64_t warmup_recv_addr = 0;
 
-        // Low-frequency probe timing
         std::chrono::steady_clock::time_point next_probe_time;
         std::chrono::milliseconds probe_backoff{1000};
         static constexpr auto kProbeBackoffMin =
@@ -102,12 +101,9 @@ class LinkManager {
     mutable std::mutex peers_mutex_;
 
     struct PeerReadState {
-        std::atomic<uint64_t> version{0};        // incremented on every link
-                                                 // state change; resolvePeer
-                                                 // uses it to detect torn reads
-        std::atomic<uint8_t> link_connected{0};  // 1 = TE link is up
-        std::atomic<TransferMetadata::SegmentID>
-            target_id{};  // remote segment handle
+        std::atomic<uint64_t> version{0};
+        std::atomic<uint8_t> link_connected{0};
+        std::atomic<TransferMetadata::SegmentID> target_id{};
     };
 
     std::vector<PeerReadState> read_state_;
@@ -123,7 +119,7 @@ class LinkManager {
     bool skip_warmup_ = false;
 
     EventCallback event_callback_;
-    mutable std::mutex event_callback_mutex_;  // protects event_callback_
+    mutable std::mutex event_callback_mutex_;
 
     // Poller thread
     std::thread poller_thread_;

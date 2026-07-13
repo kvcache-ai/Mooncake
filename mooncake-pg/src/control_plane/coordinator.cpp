@@ -308,9 +308,6 @@ CentralizedCoordinatorStateMachine::handleProposeViewUpdate(
     view.epoch++;
 
     auto required_acks = computeBarrierAckSet(old_view, view, req.group_id);
-
-    // required_acks always includes the proposer (online + active in old
-    // view), so the set is never empty in normal operation.
     pending_barriers_[req.group_id][view.epoch] = PendingViewUpdateBarrier{
         req.group_id, view.epoch,
         std::unordered_set<GlobalRank>(required_acks.begin(),
@@ -688,9 +685,9 @@ void CentralizedCoordinatorStateMachine::applyAutoDeactivate(
     auto healthy_set = extendHealthySet();
 
     // For auto_deactivate groups, remove unhealthy ranks from the active set.
-    // However, during bootstrap / BootstrapSyncing we do NOT do this: we wait
-    // for full mutual connectivity and let waitUntilGroupReady() time out if a
-    // peer is truly dead.
+    // However, during bootstrapwe do NOT do this: we wait for full mutual
+    // connectivity and let waitUntilGroupReady() time out if a peer is truly
+    // dead.
     for (auto& [group_id, view] : group_views_) {
         if (!view.auto_deactivate) continue;
         if (view.status != GroupStatus::Ready) continue;
@@ -724,7 +721,7 @@ void CentralizedCoordinatorStateMachine::applyAutoDeactivate(
 bool CentralizedCoordinatorStateMachine::isActivatableSet(
     GroupId group_id, const std::vector<GlobalRank>& new_ranks,
     const GroupView& old_view) const {
-    // Build the future active set: old active ∪ new ranks.
+    // Build the future active set: old active + new ranks.
     std::vector<GlobalRank> future_active;
     for (int i = 0; i < max_world_size_; ++i) {
         if (old_view.members[i].isActive()) {
@@ -806,32 +803,22 @@ void CentralizedCoordinatorStateMachine::checkGroupTransitions(
                 view.status = GroupStatus::BootstrapSyncing;
                 view.epoch++;
 
-                auto acks_needed = computeBarrierAckSet(view, view, group_id);
-                if (acks_needed.empty()) {
-                    // No online active rank needs to ACK; become Ready
-                    // immediately.
-                    view.status = GroupStatus::Ready;
-                    view.epoch++;
-                    effects.push_back(ViewUpdateEffect{view});
-                } else {
-                    pending_barriers_[group_id][view.epoch] =
-                        PendingViewUpdateBarrier{
-                            group_id, view.epoch,
-                            std::unordered_set<GlobalRank>(acks_needed.begin(),
-                                                           acks_needed.end()),
-                            std::nullopt,
-                            PendingViewUpdateBarrier::BootstrapCommit{}};
+                auto required_acks = computeBarrierAckSet(view, view, group_id);
+                pending_barriers_[group_id][view.epoch] =
+                    PendingViewUpdateBarrier{
+                        group_id, view.epoch,
+                        std::unordered_set<GlobalRank>(required_acks.begin(),
+                                                       required_acks.end()),
+                        std::nullopt,
+                        PendingViewUpdateBarrier::BootstrapCommit{}};
 
-                    effects.push_back(ViewUpdateEffect{view});
-                }
+                effects.push_back(ViewUpdateEffect{view});
             }
         }
         // BootstrapSyncing -> Ready is done in commitBarrier when all required
         // ACKs arrive
     }
 }
-
-// Private: processGroupRegistration
 
 bool CentralizedCoordinatorStateMachine::processGroupRegistration(
     GlobalRank joining_rank, const GroupView& group, bool auto_deactivate,
@@ -900,7 +887,7 @@ bool CentralizedCoordinatorStateMachine::processGroupRegistration(
     //
     // However, extend the existing rank_order with the new ranks now so that
     // every member's ViewUpdate carries the correct rank_order (local->global
-    // mapping).  getPeerState() relies on rank_order to resolve in-group ranks.
+    // mapping).
     if (new_order.size() > existing_order.size()) {
         group_views_[group_id].rank_order = new_order;
     }
