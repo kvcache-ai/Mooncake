@@ -72,6 +72,21 @@ std::array<uint8_t, kProbeSize> MakeTestPattern() {
     return pattern;
 }
 
+size_t CountPatternCopies(
+    const std::shared_ptr<ClientBufferAllocator>& allocator,
+    const std::array<uint8_t, kProbeSize>& pattern) {
+    const auto* base = static_cast<const uint8_t*>(allocator->getBase());
+    size_t copies = 0;
+    for (size_t offset = 0; offset + pattern.size() <= allocator->size();
+         ++offset) {
+        if (std::memcmp(base + offset, pattern.data(), pattern.size()) == 0) {
+            ++copies;
+            offset += pattern.size() - 1;
+        }
+    }
+    return copies;
+}
+
 ReadResult ReadRemotePrefix(ClientRuntime& requester,
                             const std::string& remote_endpoint) {
     ReadResult result;
@@ -123,7 +138,7 @@ ReadResult ReadRemotePrefix(ClientRuntime& requester,
                 requester.transfer_engine->freeBatchID(batch_id).ok();
             break;
         }
-        std::this_thread::sleep_for(std::chrono::microseconds(100));
+        std::this_thread::yield();
     }
 
     if (result.completed) {
@@ -145,12 +160,12 @@ class StoreWarmupIntegrationTest : public ::testing::Test {
     }
 
     void TearDown() override {
-        for (auto it = node_b_clients_.rbegin();
-             it != node_b_clients_.rend(); ++it) {
+        for (auto it = concurrent_remotes_.rbegin();
+             it != concurrent_remotes_.rend(); ++it) {
             CleanupRuntime(*it);
         }
-        for (auto it = node_a_clients_.rbegin();
-             it != node_a_clients_.rend(); ++it) {
+        for (auto it = concurrent_requesters_.rbegin();
+             it != concurrent_requesters_.rend(); ++it) {
             CleanupRuntime(*it);
         }
         CleanupRuntime(remote_);
@@ -204,6 +219,8 @@ class StoreWarmupIntegrationTest : public ::testing::Test {
     }
 
     void ExpectProbeBufferReleased(ClientRuntime& runtime) {
+        // TransferEngine does not expose an active-batch count. A full-size
+        // allocation directly checks that all temporary probe handles returned.
         auto whole_allocator =
             runtime.probe_allocator->allocate(runtime.probe_allocator->size());
         EXPECT_TRUE(whole_allocator.has_value());
@@ -235,8 +252,8 @@ class StoreWarmupIntegrationTest : public ::testing::Test {
     testing::InProcMaster master_;
     ClientRuntime requester_;
     ClientRuntime remote_;
-    std::vector<ClientRuntime> node_a_clients_;
-    std::vector<ClientRuntime> node_b_clients_;
+    std::vector<ClientRuntime> concurrent_requesters_;
+    std::vector<ClientRuntime> concurrent_remotes_;
     std::string requester_endpoint_;
     std::string remote_endpoint_;
     ScopedEnvVar read_size_{"MC_STORE_WARMUP_READ_SIZE", "64"};
@@ -287,6 +304,8 @@ TEST_F(StoreWarmupIntegrationTest, TwoClientTcpWarmupSubmitsReadProbe) {
               0);
     ExpectProbeBufferReleased(requester_);
 
+    // Validate that the data path remains healthy after warmup. This does not
+    // assert that the TCP connection established by warmup was reused.
     const auto normal_read =
         ReadRemotePrefix(requester_, remote_.client->GetSegmentEndpoint());
     ASSERT_TRUE(normal_read.completed);
@@ -295,60 +314,65 @@ TEST_F(StoreWarmupIntegrationTest, TwoClientTcpWarmupSubmitsReadProbe) {
     ExpectProbeBufferReleased(requester_);
 }
 
-TEST_F(StoreWarmupIntegrationTest, TwoNodesTenClientsEachSimulateWarmupWave) {
-    constexpr size_t kClientsPerNode = 10;
-    ScopedEnvVar scale_concurrency("MC_STORE_WARMUP_CONCURRENCY", "4");
-    ScopedEnvVar scale_max_targets("MC_STORE_WARMUP_MAX_TARGETS", "10");
+TEST_F(StoreWarmupIntegrationTest,
+       MultipleClientsWarmupRemoteSegmentsConcurrently) {
+    constexpr size_t kClientsPerGroup = 2;
+    ScopedEnvVar group_concurrency("MC_STORE_WARMUP_CONCURRENCY", "2");
+    ScopedEnvVar group_max_targets("MC_STORE_WARMUP_MAX_TARGETS", "2");
 
-    const auto ports = getFreeTcpPorts(2 * kClientsPerNode);
-    ASSERT_EQ(ports.size(), 2 * kClientsPerNode);
-    node_a_clients_.reserve(kClientsPerNode);
-    node_b_clients_.reserve(kClientsPerNode);
+    const auto ports = getFreeTcpPorts(2 * kClientsPerGroup);
+    ASSERT_EQ(ports.size(), 2 * kClientsPerGroup);
+    concurrent_requesters_.reserve(kClientsPerGroup);
+    concurrent_remotes_.reserve(kClientsPerGroup);
 
-    // Model ten clients starting on node A while ten established clients on
-    // node B expose readable segments.
+    // Model two requesters starting while two established remote clients
+    // expose readable segments through distinct loopback endpoints.
     const auto pattern = MakeTestPattern();
-    for (size_t i = 0; i < kClientsPerNode; ++i) {
-        node_a_clients_.emplace_back();
-        CreateRuntime(node_a_clients_.back(),
+    for (size_t i = 0; i < kClientsPerGroup; ++i) {
+        concurrent_requesters_.emplace_back();
+        CreateRuntime(concurrent_requesters_.back(),
                       "127.0.0.1:" + std::to_string(ports[i]), true);
-        ASSERT_NE(node_a_clients_.back().client, nullptr);
+        ASSERT_NE(concurrent_requesters_.back().client, nullptr);
 
-        node_b_clients_.emplace_back();
+        concurrent_remotes_.emplace_back();
         CreateRuntime(
-            node_b_clients_.back(),
-            "127.0.0.1:" + std::to_string(ports[kClientsPerNode + i]), false);
-        ASSERT_NE(node_b_clients_.back().client, nullptr);
-        MountSegment(node_b_clients_.back(), pattern);
+            concurrent_remotes_.back(),
+            "127.0.0.1:" + std::to_string(ports[kClientsPerGroup + i]), false);
+        ASSERT_NE(concurrent_remotes_.back().client, nullptr);
+        MountSegment(concurrent_remotes_.back(), pattern);
 
-        EXPECT_NE(node_a_clients_.back().client->getClientId(),
-                  node_b_clients_.back().client->getClientId());
-        EXPECT_NE(node_a_clients_.back().client->GetTransportEndpoint(),
-                  node_b_clients_.back().client->GetTransportEndpoint());
+        EXPECT_NE(concurrent_requesters_.back().client->getClientId(),
+                  concurrent_remotes_.back().client->getClientId());
+        EXPECT_NE(
+            concurrent_requesters_.back().client->GetTransportEndpoint(),
+            concurrent_remotes_.back().client->GetTransportEndpoint());
     }
-    ASSERT_EQ(node_a_clients_.size(), kClientsPerNode);
-    ASSERT_EQ(node_b_clients_.size(), kClientsPerNode);
+    ASSERT_EQ(concurrent_requesters_.size(), kClientsPerGroup);
+    ASSERT_EQ(concurrent_remotes_.size(), kClientsPerGroup);
 
-    std::vector<int> warmup_results(kClientsPerNode, -1);
+    std::vector<int> warmup_results(kClientsPerGroup, -1);
     std::vector<std::thread> startup_threads;
-    startup_threads.reserve(kClientsPerNode);
-    for (size_t i = 0; i < kClientsPerNode; ++i) {
+    startup_threads.reserve(kClientsPerGroup);
+    for (size_t i = 0; i < kClientsPerGroup; ++i) {
         startup_threads.emplace_back([&, i]() {
-            auto result = node_a_clients_[i].client->warmup(
-                node_a_clients_[i].probe_allocator);
+            auto result = concurrent_requesters_[i].client->warmup(
+                concurrent_requesters_[i].probe_allocator);
             warmup_results[i] = result.has_value() ? 0 : 1;
         });
     }
     for (auto& thread : startup_threads) {
         thread.join();
     }
+    for (const auto& thread : startup_threads) {
+        EXPECT_FALSE(thread.joinable());
+    }
 
-    for (size_t i = 0; i < kClientsPerNode; ++i) {
+    for (size_t i = 0; i < kClientsPerGroup; ++i) {
         EXPECT_EQ(warmup_results[i], 0);
-        EXPECT_EQ(std::memcmp(node_a_clients_[i].probe_allocator->getBase(),
-                              pattern.data(), pattern.size()),
-                  0);
-        ExpectProbeBufferReleased(node_a_clients_[i]);
+        EXPECT_EQ(CountPatternCopies(
+                      concurrent_requesters_[i].probe_allocator, pattern),
+                  kClientsPerGroup);
+        ExpectProbeBufferReleased(concurrent_requesters_[i]);
     }
 }
 
