@@ -211,15 +211,28 @@ class StoreWarmupIntegrationTest : public ::testing::Test {
         runtime.probe_memory_registered = true;
     }
 
-    void MountSegment(ClientRuntime& runtime,
-                      const std::array<uint8_t, kProbeSize>& prefix) {
-        runtime.segment = allocate_buffer_allocator_memory(kSegmentSize);
-        ASSERT_NE(runtime.segment, nullptr);
-        std::memset(runtime.segment, 0, kSegmentSize);
-        std::memcpy(runtime.segment, prefix.data(), prefix.size());
-        ASSERT_TRUE(
-            runtime.client->MountSegment(runtime.segment, kSegmentSize, "tcp")
-                .has_value());
+    ::testing::AssertionResult MountSegment(
+        ClientRuntime& runtime, const std::array<uint8_t, kProbeSize>& prefix) {
+        void* memory = nullptr;
+        const int ret = posix_memalign(&memory, 4096, kSegmentSize);
+        if (ret != 0 || memory == nullptr) {
+            return ::testing::AssertionFailure()
+                   << "posix_memalign failed: ret=" << ret;
+        }
+
+        std::memset(memory, 0, kSegmentSize);
+        std::memcpy(memory, prefix.data(), prefix.size());
+        auto mount_result =
+            runtime.client->MountSegment(memory, kSegmentSize, "tcp");
+        if (!mount_result.has_value()) {
+            std::free(memory);
+            return ::testing::AssertionFailure()
+                   << "Client::MountSegment failed: "
+                   << toString(mount_result.error());
+        }
+
+        runtime.segment = memory;
+        return ::testing::AssertionSuccess();
     }
 
     void ExpectProbeBufferReleased(ClientRuntime& runtime) {
@@ -248,7 +261,7 @@ class StoreWarmupIntegrationTest : public ::testing::Test {
         runtime.transfer_engine.reset();
         runtime.probe_memory_registered = false;
         if (runtime.segment) {
-            free_memory("", runtime.segment);
+            std::free(runtime.segment);
             runtime.segment = nullptr;
         }
     }
@@ -273,7 +286,8 @@ TEST_F(StoreWarmupIntegrationTest,
 
     std::array<uint8_t, kProbeSize> local_prefix{};
     local_prefix.fill(0x11);
-    MountSegment(requester_, local_prefix);
+    ASSERT_TRUE(MountSegment(requester_, local_prefix))
+        << "requester local Segment registration failed";
 
     std::memset(requester_.probe_allocator->getBase(), 0xA5,
                 requester_.probe_allocator->size());
@@ -296,8 +310,13 @@ TEST_F(StoreWarmupIntegrationTest, TwoClientTcpWarmupSubmitsReadProbe) {
     ASSERT_NE(requester_.client->GetTransportEndpoint(),
               remote_.client->GetTransportEndpoint());
 
+    std::array<uint8_t, kProbeSize> requester_pattern{};
+    requester_pattern.fill(0xA5);
     const auto pattern = MakeTestPattern();
-    MountSegment(remote_, pattern);
+    ASSERT_TRUE(MountSegment(requester_, requester_pattern))
+        << "requester local Segment registration failed";
+    ASSERT_TRUE(MountSegment(remote_, pattern))
+        << "remote Segment registration failed";
     std::memset(requester_.probe_allocator->getBase(), 0,
                 requester_.probe_allocator->size());
 
@@ -337,13 +356,19 @@ TEST_F(StoreWarmupIntegrationTest,
         CreateRuntime(concurrent_requesters_.back(),
                       "127.0.0.1:" + std::to_string(ports[i]), true);
         ASSERT_NE(concurrent_requesters_.back().client, nullptr);
+        std::array<uint8_t, kProbeSize> requester_pattern{};
+        requester_pattern.fill(static_cast<uint8_t>(0xA0 + i));
+        ASSERT_TRUE(
+            MountSegment(concurrent_requesters_.back(), requester_pattern))
+            << "requester local Segment registration failed: index=" << i;
 
         concurrent_remotes_.emplace_back();
         CreateRuntime(
             concurrent_remotes_.back(),
             "127.0.0.1:" + std::to_string(ports[kClientsPerGroup + i]), false);
         ASSERT_NE(concurrent_remotes_.back().client, nullptr);
-        MountSegment(concurrent_remotes_.back(), pattern);
+        ASSERT_TRUE(MountSegment(concurrent_remotes_.back(), pattern))
+            << "remote Segment registration failed: index=" << i;
 
         EXPECT_NE(concurrent_requesters_.back().client->getClientId(),
                   concurrent_remotes_.back().client->getClientId());
