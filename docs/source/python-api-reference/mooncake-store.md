@@ -2595,6 +2595,7 @@ def load_tensor_from_file(
     tensor_name: str | None = None,
     map_location=None,
     weights_only: bool = True,
+    allow_unsafe_remote_torch_load: bool = False,
 ) -> torch.Tensor | None
 ```
 
@@ -2607,7 +2608,20 @@ def load_tensor_from_file(
   `save_tensor_to_file()`.
 - `map_location`: Passed to `torch.load` for torch files; applied with `.to()`
   after safetensors decode.
-- `weights_only` (bool): Passed to `torch.load` (default `True`).
+- `weights_only` (bool): Passed to `torch.load` (default `True`). Requires
+  torch >= 2.0; load fails if the installed torch cannot honor the flag.
+- `allow_unsafe_remote_torch_load` (bool): When `False` (default), `format="torch"`
+  is rejected for remote schemes such as `s3://`. Use `format="safetensors"` for
+  remote artifacts instead.
+
+**Security notes:**
+
+- Prefer `format="safetensors"` for remote or untrusted artifacts.
+- `format="torch"` uses Python pickling semantics and is intended for trusted
+  local single-tensor checkpoints only.
+- Multi-entry safetensors files fail loudly when the requested `tensor_name` and
+  store key do not match any entry. Single-entry files still allow a store-key
+  mismatch and use the sole tensor with a warning.
 
 **Returns:** Loaded `torch.Tensor` on success; `None` on failure.
 

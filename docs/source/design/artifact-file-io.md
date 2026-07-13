@@ -152,6 +152,16 @@ Missing optional packages (`torch`, `safetensors`) raise `ValueError` with an
 install hint; the patch catches these and maps them to error return codes on
 save, or `None` on load.
 
+**Safetensors entry selection:** if a file contains multiple named tensors and
+neither `tensor_name` nor the store key matches an entry, load fails instead of
+silently picking an arbitrary tensor. Single-entry files still accept a store-key
+mismatch and use the only tensor (with a warning).
+
+**Torch format safety:** `format="torch"` is blocked for remote schemes such as
+`s3://` unless callers pass `allow_unsafe_remote_torch_load=True` for a trusted
+source. Torch checkpoints must deserialize to a single `torch.Tensor`; dict or
+state-dict payloads are rejected.
+
 ## Testing
 
 Unit tests live in `mooncake-wheel/tests/test_safetensor_functions.py`. They cover

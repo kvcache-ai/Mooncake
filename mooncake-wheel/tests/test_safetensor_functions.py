@@ -456,6 +456,71 @@ class TestSafetensorFunctions(unittest.TestCase):
             self.store.remove(original_key)
             self.store.remove(restored_key)
 
+    def test_multi_entry_safetensor_rejects_unknown_tensor_name(self):
+        """Multi-entry safetensors files must not silently pick the wrong tensor."""
+        import torch
+        from safetensors.torch import save_file
+
+        tensors = {
+            "tensor_a": torch.tensor([1.0, 2.0], dtype=torch.float32),
+            "tensor_b": torch.tensor([3.0, 4.0], dtype=torch.float32),
+        }
+
+        with tempfile.NamedTemporaryFile(
+            suffix=".safetensors", delete=False
+        ) as temp_file:
+            temp_filename = temp_file.name
+
+        try:
+            save_file(tensors, temp_filename)
+            result = self.store.load_tensor_from_file(
+                "restored_key",
+                temp_filename,
+                format="safetensors",
+                tensor_name="missing_entry",
+            )
+            self.assertIsNone(
+                result,
+                "Unknown tensor_name in multi-entry file should fail loudly",
+            )
+            self.assertIsNone(self.store.get_tensor("restored_key"))
+        finally:
+            if os.path.exists(temp_filename):
+                os.remove(temp_filename)
+
+    def test_remote_torch_load_is_rejected_by_default(self):
+        """Remote torch checkpoints require an explicit unsafe opt-in."""
+        result = self.store.load_tensor_from_file(
+            "remote_key",
+            "s3://example-bucket/checkpoints/model.pt",
+            format="torch",
+        )
+        self.assertIsNone(result)
+        self.assertIsNone(self.store.get_tensor("remote_key"))
+
+    def test_torch_load_rejects_non_tensor_checkpoint(self):
+        """Torch checkpoints must contain a single tensor payload."""
+        import torch
+
+        with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as temp_file:
+            temp_filename = temp_file.name
+
+        try:
+            torch.save(
+                {"weight": torch.tensor([1.0, 2.0], dtype=torch.float32)},
+                temp_filename,
+            )
+            result = self.store.load_tensor_from_file(
+                "bad_checkpoint",
+                temp_filename,
+                format="torch",
+            )
+            self.assertIsNone(result)
+            self.assertIsNone(self.store.get_tensor("bad_checkpoint"))
+        finally:
+            if os.path.exists(temp_filename):
+                os.remove(temp_filename)
+
 
 if __name__ == "__main__":
     unittest.main()

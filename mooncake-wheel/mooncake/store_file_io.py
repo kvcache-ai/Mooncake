@@ -13,6 +13,19 @@ INVALID_PARAMS = -600
 FILE_NOT_FOUND = -1100
 PERSISTENT_FAIL = -1503
 
+_LOCAL_FILESYSTEM_SCHEMES = {"file", ""}
+_OBJECT_STORE_SCHEMES = {
+    "s3",
+    "gs",
+    "gcs",
+    "abfs",
+    "adl",
+    "oss",
+    "http",
+    "https",
+    "ftp",
+}
+
 
 def _normalize_format(format_name: str, file_name: str) -> str:
     if format_name is None:
@@ -54,6 +67,31 @@ def _build_target_url(file_name: os.PathLike[str] | str, filesystem: str | None)
     return f"{normalized_fs}://{target}"
 
 
+def _filesystem_scheme(
+    file_name: os.PathLike[str] | str, filesystem: str | None
+) -> str:
+    target_url = _build_target_url(file_name, filesystem)
+    if "://" not in target_url:
+        return "file"
+    return target_url.split("://", 1)[0].lower()
+
+
+def _is_remote_target(
+    file_name: os.PathLike[str] | str, filesystem: str | None
+) -> bool:
+    return _filesystem_scheme(file_name, filesystem) not in _LOCAL_FILESYSTEM_SCHEMES
+
+
+def _supports_directory_creation(fs, scheme: str) -> bool:
+    if scheme in _LOCAL_FILESYSTEM_SCHEMES:
+        return True
+
+    protocol = getattr(fs, "protocol", scheme)
+    if isinstance(protocol, (tuple, list)):
+        protocol = protocol[0] if protocol else scheme
+    return str(protocol).lower() in _LOCAL_FILESYSTEM_SCHEMES
+
+
 def _open_fs_target(
     file_name: os.PathLike[str] | str,
     filesystem: str | None,
@@ -67,18 +105,28 @@ def _open_fs_target(
     return fs, path
 
 
-def _ensure_parent_dir(fs, path: str) -> None:
-    """Create parent directories, tolerating backends that lack makedirs."""
+def _ensure_parent_dir(
+    fs,
+    path: str,
+    *,
+    file_name: os.PathLike[str] | str,
+    filesystem: str | None,
+) -> None:
+    """Create parent directories for local filesystem backends only."""
+    scheme = _filesystem_scheme(file_name, filesystem)
+    if not _supports_directory_creation(fs, scheme):
+        return
+
     parent_dir = posixpath.dirname(path)
-    if parent_dir:
-        try:
-            fs.makedirs(parent_dir, exist_ok=True)
-        except (AttributeError, NotImplementedError):
-            pass
-        except OSError as exc:
-            LOGGER.warning(
-                "Failed to create directory %s: %s", parent_dir, exc
-            )
+    if not parent_dir:
+        return
+
+    try:
+        fs.makedirs(parent_dir, exist_ok=True)
+    except (AttributeError, NotImplementedError):
+        pass
+    except OSError as exc:
+        LOGGER.warning("Failed to create directory %s: %s", parent_dir, exc)
 
 
 def _write_bytes(
@@ -88,7 +136,7 @@ def _write_bytes(
     storage_options: dict[str, Any] | None,
 ) -> None:
     fs, path = _open_fs_target(file_name, filesystem, storage_options)
-    _ensure_parent_dir(fs, path)
+    _ensure_parent_dir(fs, path, file_name=file_name, filesystem=filesystem)
 
     with fs.open(path, "wb") as handle:
         handle.write(payload)
@@ -118,14 +166,76 @@ def _pick_tensor_entry(
     if fallback_name and fallback_name in loaded_tensors:
         return loaded_tensors[fallback_name]
 
-    first_name = next(iter(loaded_tensors))
-    if preferred_name or fallback_name:
-        LOGGER.warning(
-            "Tensor entry %s was not found in file; using %s instead",
-            preferred_name or fallback_name,
-            first_name,
+    if len(loaded_tensors) == 1:
+        only_name = next(iter(loaded_tensors))
+        if preferred_name or fallback_name:
+            LOGGER.warning(
+                "Tensor entry %s was not found in file; using sole entry %s",
+                preferred_name or fallback_name,
+                only_name,
+            )
+        return loaded_tensors[only_name]
+
+    requested = preferred_name or fallback_name or "<unspecified>"
+    available = ", ".join(sorted(loaded_tensors))
+    raise ValueError(
+        f"Tensor entry {requested!r} was not found in safetensors file; "
+        f"available entries: {available}"
+    )
+
+
+def _coerce_loaded_tensor(loaded: Any) -> Any:
+    try:
+        import torch
+    except ImportError as exc:
+        raise ValueError(
+            "torch package is required for the 'torch' format. "
+            "Install with: pip install torch"
+        ) from exc
+
+    if isinstance(loaded, torch.Tensor):
+        return loaded
+
+    raise ValueError(
+        "torch checkpoint must contain a single tensor; got "
+        f"{type(loaded).__name__}. Use format='safetensors' for remote "
+        "artifacts or save a raw tensor checkpoint."
+    )
+
+
+def _torch_load_from_handle(handle, map_location: Any, weights_only: bool) -> Any:
+    import inspect
+
+    try:
+        import torch
+    except ImportError as exc:
+        raise ValueError(
+            "torch package is required for the 'torch' format. "
+            "Install with: pip install torch"
+        ) from exc
+
+    load_params = inspect.signature(torch.load).parameters
+    if weights_only and "weights_only" not in load_params:
+        raise ValueError(
+            "Installed torch does not support torch.load(weights_only=...); "
+            "upgrade to torch >= 2.0 or use format='safetensors'."
         )
-    return loaded_tensors[first_name]
+
+    try:
+        loaded = torch.load(
+            handle,
+            map_location=map_location,
+            weights_only=weights_only,
+        )
+    except TypeError as exc:
+        if weights_only:
+            raise ValueError(
+                "torch.load rejected weights_only=True; use format='safetensors' "
+                "for untrusted artifacts."
+            ) from exc
+        loaded = torch.load(handle, map_location=map_location)
+
+    return _coerce_loaded_tensor(loaded)
 
 
 def _apply_map_location(tensor, map_location):
@@ -159,7 +269,12 @@ def _save_tensor_to_file(
 
         format_name = _normalize_format(format, os.fspath(resolved_file_name))
         fs, path = _open_fs_target(resolved_file_name, filesystem, storage_options)
-        _ensure_parent_dir(fs, path)
+        _ensure_parent_dir(
+            fs,
+            path,
+            file_name=resolved_file_name,
+            filesystem=filesystem,
+        )
 
         if format_name == "torch":
             try:
@@ -210,6 +325,7 @@ def _load_tensor_from_file(
     tensor_name: str | None = None,
     map_location: Any = None,
     weights_only: bool = True,
+    allow_unsafe_remote_torch_load: bool = False,
 ):
     if file_name is None:
         LOGGER.error("file_name must be provided when loading a tensor")
@@ -219,26 +335,28 @@ def _load_tensor_from_file(
 
     try:
         format_name = _normalize_format(format, os.fspath(file_name))
+        if (
+            format_name == "torch"
+            and _is_remote_target(file_name, filesystem)
+            and not allow_unsafe_remote_torch_load
+        ):
+            scheme = _filesystem_scheme(file_name, filesystem)
+            raise ValueError(
+                f"Refusing to torch.load from remote scheme {scheme!r}. "
+                "Use format='safetensors' for remote artifacts or pass "
+                "allow_unsafe_remote_torch_load=True only for trusted sources."
+            )
+
         fs, path = _open_fs_target(file_name, filesystem, storage_options)
 
         if format_name == "torch":
-            try:
-                import torch
-            except ImportError:
-                raise ValueError(
-                    "torch package is required for the 'torch' format. "
-                    "Install with: pip install torch"
-                )
-            # Stream directly from the fsspec file handle -- avoids
-            # reading the entire file into a bytes buffer first.
             with fs.open(path, "rb") as handle:
-                tensor = torch.load(
+                tensor = _torch_load_from_handle(
                     handle,
                     map_location=map_location,
                     weights_only=weights_only,
                 )
         else:
-            # safetensors requires the full payload as bytes.
             try:
                 from safetensors.torch import load as safetensors_load
             except ImportError:
@@ -252,8 +370,6 @@ def _load_tensor_from_file(
             tensor = _pick_tensor_entry(
                 loaded_tensors, tensor_name, target_store_key
             )
-            # safetensors does not natively support map_location, so
-            # move the tensor to the requested device after loading.
             tensor = _apply_map_location(tensor, map_location)
 
         rc = self.put_tensor(target_store_key, tensor)
@@ -265,6 +381,9 @@ def _load_tensor_from_file(
         return tensor
     except FileNotFoundError:
         LOGGER.exception("Tensor file %s was not found", file_name)
+        return None
+    except ValueError:
+        LOGGER.exception("Invalid tensor file request for %s", file_name)
         return None
     except Exception:
         LOGGER.exception("Failed to load tensor from file %s", file_name)
