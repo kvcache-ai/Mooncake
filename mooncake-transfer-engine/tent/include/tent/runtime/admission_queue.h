@@ -75,9 +75,10 @@ struct QueueOwnerInput {
     Request request{};
     QueueOwnerKind kind{QueueOwnerKind::User};
     // True only when the caller has established that this owner's transfer
-    // time is governed by the installed bandwidth provider. This prevents an
-    // RDMA EWMA from being applied to MNNVL/TCP/staging paths.
-    bool degradation_eligible{true};
+    // time is governed by the installed bandwidth provider. Default false
+    // keeps degradation explicitly opt-in so a new enqueue path cannot
+    // accidentally apply an RDMA EWMA to MNNVL/TCP/staging paths.
+    bool degradation_eligible{false};
 };
 
 struct QueueSubmit {
@@ -161,7 +162,7 @@ class LocalTransferAdmissionQueue {
         uint64_t batch_token{0};
         Request request{};
         QueueOwnerKind kind{QueueOwnerKind::User};
-        bool degradation_eligible{true};
+        bool degradation_eligible{false};
         QueueState state{QueueState::Queued};
         TransferStatusEnum terminal_status{TransferStatusEnum::PENDING};
     };
