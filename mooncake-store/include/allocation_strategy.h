@@ -16,13 +16,32 @@
 
 namespace mooncake {
 
-struct SegmentAllocator {
+class SegmentAllocator {
+   public:
     explicit SegmentAllocator(
         std::shared_ptr<BufferAllocatorBase> buffer_allocator)
-        : allocator(std::move(buffer_allocator)) {}
+        : allocator_(std::move(buffer_allocator)) {}
 
-    std::shared_ptr<BufferAllocatorBase> allocator;
-    SegmentLifetime lifetime;
+    std::unique_ptr<AllocatedBuffer> allocate(size_t size) const {
+        if (!allocator_) {
+            return nullptr;
+        }
+        auto buffer = allocator_->allocate(size);
+        if (buffer) {
+            buffer->bindSegmentLifetime(lifetime_);
+        }
+        return buffer;
+    }
+
+    [[nodiscard]] bool isAvailable() const { return lifetime_.isAvailable(); }
+
+    void setAvailable(bool available) const {
+        lifetime_.setAvailable(available);
+    }
+
+   private:
+    std::shared_ptr<BufferAllocatorBase> allocator_;
+    SegmentLifetime lifetime_;
 };
 
 using SegmentAllocatorRegistration = std::shared_ptr<SegmentAllocator>;
@@ -90,7 +109,7 @@ class AllocatorManager {
             std::find(it->second.begin(), it->second.end(), allocator);
         if (alloc_it != it->second.end()) {
             const size_t index = std::distance(it->second.begin(), alloc_it);
-            registrations_[name][index]->lifetime.setAvailable(false);
+            registrations_[name][index]->setAvailable(false);
             it->second.erase(alloc_it);
             registrations_[name].erase(registrations_[name].begin() + index);
             allocator_removed = true;
@@ -117,7 +136,7 @@ class AllocatorManager {
             return false;
         }
         if (invalidate) {
-            registration->lifetime.setAvailable(false);
+            registration->setAvailable(false);
         }
 
         auto registrations_it = registrations_.find(name);
@@ -432,11 +451,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
         if (num_segs == 1) {
             // Fast path for single segment
             const auto& registration = (*registrations)[0];
-            auto buffer = registration->allocator->allocate(slice_length);
-            if (buffer) {
-                buffer->bindSegmentLifetime(registration->lifetime);
-            }
-            return buffer;
+            return registration->allocate(slice_length);
         }
 
         // Randomly select a start point to distribute
@@ -447,8 +462,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
         for (size_t i = 0; i < num_segs; i++) {  // only allocate one replica
             const auto& registration =
                 (*registrations)[(i + seg_offset) % num_segs];
-            if (auto buffer = registration->allocator->allocate(slice_length)) {
-                buffer->bindSegmentLifetime(registration->lifetime);
+            if (auto buffer = registration->allocate(slice_length)) {
                 return buffer;
             }
         }
@@ -814,23 +828,15 @@ class CxlAllocationStrategy : public AllocationStrategy {
         if (cxl_registrations == nullptr || cxl_registrations->empty()) {
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
-        std::shared_ptr<BufferAllocatorBase> cxl_allocator =
-            (*cxl_registrations)[0]->allocator;
-        if (!cxl_allocator) {
-            LOG(ERROR) << "No CXL allocator in preferred_segment";
-            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
-        }
-
         std::vector<Replica> replicas;
         replicas.reserve(replica_num);
 
-        auto buffer = cxl_allocator->allocate(slice_length);
+        auto buffer = (*cxl_registrations)[0]->allocate(slice_length);
         if (!buffer) {
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
 
         buffer->change_to_cxl(cxl_segment_name);
-        buffer->bindSegmentLifetime((*cxl_registrations)[0]->lifetime);
         replicas.emplace_back(std::move(buffer), ReplicaStatus::PROCESSING,
                               replica_type);
 
