@@ -18,6 +18,10 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
     DurablePrefix prefix;
     ErrorCode err = storage_.ReadDurablePrefix(prefix);
     if (err == ErrorCode::ETCD_KEY_NOT_EXIST) {
+        if (batch_format_seen_) {
+            result.error = ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+            return result;
+        }
         result.used_legacy_path = true;
         return result;
     }
@@ -25,7 +29,37 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
         result.error = err;
         return result;
     }
+    batch_format_seen_ = true;
     result.durable_prefix = prefix;
+
+    if (last_observed_prefix_ &&
+        (prefix.batch_id < last_observed_prefix_->batch_id ||
+         prefix.last_seq < last_observed_prefix_->last_seq ||
+         (prefix.batch_id == last_observed_prefix_->batch_id &&
+          prefix.last_seq != last_observed_prefix_->last_seq) ||
+         (prefix.batch_id > last_observed_prefix_->batch_id &&
+          prefix.last_seq == last_observed_prefix_->last_seq))) {
+        result.error = ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+        return result;
+    }
+
+    const uint64_t expected = applier_.GetExpectedSequenceId();
+    if (prefix.batch_id == 0) {
+        last_observed_prefix_ = prefix;
+        if (IsSequenceOlderOrEqual(expected, prefix.last_seq)) {
+            result.waiting_for_legacy_catch_up = true;
+            result.legacy_catch_up_target = prefix.last_seq;
+        }
+        return result;
+    }
+
+    OpLogBatchRecord target_batch;
+    err = storage_.ReadBatch(prefix.batch_id, target_batch);
+    if (err != ErrorCode::OK || target_batch.last_seq != prefix.last_seq) {
+        result.error = ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+        return result;
+    }
+    last_observed_prefix_ = prefix;
     if (prefix.batch_id <= last_applied_batch_id_) {
         return result;
     }
@@ -38,7 +72,15 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
         return result;
     }
     for (const auto& batch : batches) {
-        if (batch.batch_id != last_applied_batch_id_ + 1) {
+        if (last_scanned_batch_last_seq_ &&
+            (last_applied_batch_id_ == UINT64_MAX ||
+             batch.batch_id != last_applied_batch_id_ + 1)) {
+            result.error = ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+            return result;
+        }
+        if (last_scanned_batch_last_seq_ &&
+            (*last_scanned_batch_last_seq_ == UINT64_MAX ||
+             batch.first_seq != *last_scanned_batch_last_seq_ + 1)) {
             result.error = ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
             return result;
         }
@@ -54,6 +96,7 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
                 if (last_applied_batch_id_ == 0 &&
                     result.applied_entries == 0) {
                     result.waiting_for_legacy_catch_up = true;
+                    result.legacy_catch_up_target = entry.sequence_id - 1;
                     return result;
                 }
                 result.error = ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
@@ -66,6 +109,7 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
             ++result.applied_entries;
         }
         last_applied_batch_id_ = batch.batch_id;
+        last_scanned_batch_last_seq_ = batch.last_seq;
         if (last_applied_batch_id_ >= prefix.batch_id) {
             break;
         }

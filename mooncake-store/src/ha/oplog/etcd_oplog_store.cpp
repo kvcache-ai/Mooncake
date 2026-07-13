@@ -1,5 +1,6 @@
 #include "ha/oplog/etcd_oplog_store.h"
 
+#include <charconv>
 #include <glog/logging.h>
 #include <sstream>
 #include <iomanip>
@@ -18,6 +19,22 @@
 #include "etcd_helper.h"
 
 namespace mooncake {
+
+bool ParseLegacyOpLogEntryKey(std::string_view cluster_id, std::string_view key,
+                              uint64_t& sequence_id) {
+    const std::string prefix = "/oplog/" + std::string(cluster_id) + "/";
+    if (!key.starts_with(prefix)) {
+        return false;
+    }
+    const std::string_view suffix = key.substr(prefix.size());
+    if (suffix.size() != 20) {
+        return false;
+    }
+    const auto parsed = std::from_chars(
+        suffix.data(), suffix.data() + suffix.size(), sequence_id);
+    return parsed.ec == std::errc() &&
+           parsed.ptr == suffix.data() + suffix.size();
+}
 
 EtcdOpLogStore::EtcdOpLogStore(const std::string& cluster_id,
                                bool enable_latest_seq_batch_update,
@@ -425,15 +442,8 @@ ErrorCode EtcdOpLogStore::ReadOpLogSinceWithRevision(
                 continue;
             }
 
-            // Parse seq from key suffix and filter (handles legacy keys too).
-            size_t pos = key.rfind('/');
-            if (pos == std::string::npos || pos + 1 >= key.size()) {
-                continue;
-            }
             uint64_t seq = 0;
-            try {
-                seq = static_cast<uint64_t>(std::stoull(key.substr(pos + 1)));
-            } catch (...) {
+            if (!ParseLegacyOpLogEntryKey(cluster_id_, key, seq)) {
                 continue;
             }
             if (IsSequenceOlderOrEqual(seq, start_sequence_id)) {
@@ -445,6 +455,11 @@ ErrorCode EtcdOpLogStore::ReadOpLogSinceWithRevision(
             if (!mooncake::DeserializeOpLogEntry(value, entry)) {
                 LOG(ERROR) << "Failed to deserialize OpLog entry from key="
                            << key;
+                return ErrorCode::INTERNAL_ERROR;
+            }
+            if (entry.sequence_id != seq) {
+                LOG(ERROR) << "OpLog key sequence mismatch: key_seq=" << seq
+                           << ", entry_seq=" << entry.sequence_id;
                 return ErrorCode::INTERNAL_ERROR;
             }
             entries.push_back(std::move(entry));
@@ -578,24 +593,11 @@ std::optional<uint64_t> EtcdOpLogStore::GetMinSequenceId() const {
         return std::nullopt;
     }
 
-    // Skip non-entry keys if any (e.g. "/latest" or "/snapshot/...").
-    // Entries are expected to be ".../<20-digit-seq>".
-    // If the first key isn't an entry key, fall back to nullopt (safe no-op).
-    if (first_key.find("/latest") != std::string::npos ||
-        first_key.find("/snapshot/") != std::string::npos) {
+    uint64_t sequence_id = 0;
+    if (!ParseLegacyOpLogEntryKey(cluster_id_, first_key, sequence_id)) {
         return std::nullopt;
     }
-
-    size_t pos = first_key.rfind('/');
-    if (pos == std::string::npos || pos + 1 >= first_key.size()) {
-        return std::nullopt;
-    }
-    std::string seq_str = first_key.substr(pos + 1);
-    try {
-        return static_cast<uint64_t>(std::stoull(seq_str));
-    } catch (...) {
-        return std::nullopt;
-    }
+    return sequence_id;
 }
 
 std::optional<uint64_t> EtcdOpLogStore::GetMaxSequenceIdInternal() const {

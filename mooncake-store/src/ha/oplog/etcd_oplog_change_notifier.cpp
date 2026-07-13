@@ -254,9 +254,8 @@ void EtcdOpLogChangeNotifier::HandleWatchEvent(const std::string& key,
         return;
     }
 
-    // Skip the "latest" key and snapshot keys
-    if (key.find("/latest") != std::string::npos ||
-        key.find("/snapshot/") != std::string::npos) {
+    uint64_t key_sequence_id = 0;
+    if (!ParseLegacyOpLogEntryKey(cluster_id_, key, key_sequence_id)) {
         return;
     }
 
@@ -275,6 +274,12 @@ void EtcdOpLogChangeNotifier::HandleWatchEvent(const std::string& key,
                    << ". Possible data corruption. Discarding entry.";
         consecutive_errors_.fetch_add(1);
         HAMetricManager::instance().inc_oplog_checksum_failures();
+        return;
+    }
+    if (entry.sequence_id != key_sequence_id) {
+        LOG(ERROR) << "OpLog key sequence mismatch: key_seq=" << key_sequence_id
+                   << ", entry_seq=" << entry.sequence_id;
+        consecutive_errors_.fetch_add(1);
         return;
     }
 

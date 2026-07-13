@@ -16,6 +16,27 @@ DEFINE_string(etcd_endpoints, "0.0.0.0:2379",
 
 namespace mooncake::test {
 
+TEST(EtcdOpLogKeyTest, ParsesOnlyExactLegacyEntryKeys) {
+    uint64_t sequence_id = 0;
+    EXPECT_TRUE(ParseLegacyOpLogEntryKey(
+        "cluster", "/oplog/cluster/00000000000000000042", sequence_id));
+    EXPECT_EQ(42u, sequence_id);
+
+    EXPECT_FALSE(ParseLegacyOpLogEntryKey(
+        "cluster", "/oplog/cluster/batches/00000000000000000042", sequence_id));
+    EXPECT_FALSE(ParseLegacyOpLogEntryKey(
+        "cluster", "/oplog/cluster/durable_prefix", sequence_id));
+    EXPECT_FALSE(ParseLegacyOpLogEntryKey("cluster", "/oplog/cluster/latest",
+                                          sequence_id));
+    EXPECT_FALSE(ParseLegacyOpLogEntryKey(
+        "cluster", "/oplog/cluster/snapshot/00000000000000000042",
+        sequence_id));
+    EXPECT_FALSE(ParseLegacyOpLogEntryKey(
+        "other", "/oplog/cluster/00000000000000000042", sequence_id));
+    EXPECT_FALSE(
+        ParseLegacyOpLogEntryKey("cluster", "/oplog/cluster/42", sequence_id));
+}
+
 class EtcdOpLogStoreTest : public ::testing::Test {
    protected:
     static void SetUpTestSuite() {

@@ -272,6 +272,112 @@ TEST(OrderedOpLogWriterAdmissionTest,
 }
 
 TEST(OrderedOpLogWriterAdmissionTest,
+     FirstCommitFreesOpenSlotBeforeWriterThreadRuns) {
+    FakeBatchWriter storage;
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{.max_entries_per_batch = 1},
+        [&](const OpLogBatchRecord& batch,
+            const DurablePrefix& expected_prefix) {
+            return storage.Write(batch, expected_prefix);
+        });
+
+    auto first = writer.Reserve();
+    ASSERT_TRUE(first.has_value());
+    ASSERT_TRUE(
+        writer.Commit(std::move(*first), MakeEntry("k1"), [](const auto&) {})
+            .has_value());
+
+    auto second = writer.Reserve();
+    ASSERT_TRUE(second.has_value());
+    ASSERT_TRUE(
+        writer.Commit(std::move(*second), MakeEntry("k2"), [](const auto&) {})
+            .has_value());
+
+    writer.Start();
+    ASSERT_TRUE(storage.WaitForWrites(2));
+    writer.Stop();
+}
+
+TEST(OrderedOpLogWriterAdmissionTest, StopClosesAdmission) {
+    FakeBatchWriter storage;
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{.max_entries_per_batch = 1},
+        [&](const OpLogBatchRecord& batch,
+            const DurablePrefix& expected_prefix) {
+            return storage.Write(batch, expected_prefix);
+        });
+
+    writer.Start();
+    writer.Stop();
+
+    EXPECT_FALSE(writer.IsAccepting());
+    auto reservation = writer.Reserve();
+    ASSERT_FALSE(reservation.has_value());
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, reservation.error());
+}
+
+TEST(OrderedOpLogWriterAdmissionTest, StopRejectsOutstandingReservation) {
+    FakeBatchWriter storage;
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{.max_entries_per_batch = 1},
+        [&](const OpLogBatchRecord& batch,
+            const DurablePrefix& expected_prefix) {
+            return storage.Write(batch, expected_prefix);
+        });
+
+    writer.Start();
+    auto reservation = writer.Reserve();
+    ASSERT_TRUE(reservation.has_value());
+    writer.Stop();
+
+    auto pending =
+        writer.Commit(std::move(*reservation), MakeEntry(), [](const auto&) {});
+    ASSERT_FALSE(pending.has_value());
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, pending.error());
+    EXPECT_TRUE(storage.Batches().empty());
+}
+
+TEST(OrderedOpLogWriterAdmissionTest,
+     OpenBatchCapacityRecoversAfterInflightWrite) {
+    FakeBatchWriter storage;
+    storage.BlockWrites();
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{.max_entries_per_batch = 2},
+        [&](const OpLogBatchRecord& batch,
+            const DurablePrefix& expected_prefix) {
+            return storage.Write(batch, expected_prefix);
+        });
+    writer.Start();
+
+    auto first = writer.Reserve();
+    ASSERT_TRUE(first.has_value());
+    ASSERT_TRUE(
+        writer.Commit(std::move(*first), MakeEntry("k1"), [](const auto&) {})
+            .has_value());
+    ASSERT_TRUE(storage.WaitForBlockedWrite());
+
+    auto second = writer.Reserve();
+    auto third = writer.Reserve();
+    ASSERT_TRUE(second.has_value());
+    ASSERT_TRUE(third.has_value());
+    ASSERT_TRUE(
+        writer.Commit(std::move(*second), MakeEntry("k2"), [](const auto&) {})
+            .has_value());
+    ASSERT_TRUE(
+        writer.Commit(std::move(*third), MakeEntry("k3"), [](const auto&) {})
+            .has_value());
+
+    auto full = writer.Reserve();
+    ASSERT_FALSE(full.has_value());
+    EXPECT_EQ(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED, full.error());
+
+    storage.UnblockWrites();
+    ASSERT_TRUE(storage.WaitForWrites(2));
+    EXPECT_TRUE(writer.Reserve().has_value());
+    writer.Stop();
+}
+
+TEST(OrderedOpLogWriterAdmissionTest,
      ExistingReservationCanCommitAfterAcceptingFalse) {
     FakeBatchWriter storage;
     OrderedOpLogWriter writer(
@@ -358,8 +464,7 @@ TEST(OrderedOpLogWriterLoopTest, ContinuesFromInitialDurablePrefix) {
     writer.Stop();
 }
 
-TEST(OrderedOpLogWriterLoopTest,
-     GroupsEntriesCommittedBeforeDrainIntoOneBatch) {
+TEST(OrderedOpLogWriterLoopTest, CommitWhileReadyBatchExistsFormsNextBatch) {
     FakeBatchWriter storage;
     OrderedOpLogWriter writer(
         OrderedOpLogWriterConfig{.max_entries_per_batch = 4},
@@ -380,12 +485,15 @@ TEST(OrderedOpLogWriterLoopTest,
             .has_value());
     writer.Start();
 
-    ASSERT_TRUE(storage.WaitForWrites(1));
+    ASSERT_TRUE(storage.WaitForWrites(2));
     auto batches = storage.Batches();
-    ASSERT_EQ(1u, batches.size());
-    ASSERT_EQ(2u, batches[0].entries.size());
+    ASSERT_EQ(2u, batches.size());
+    ASSERT_EQ(1u, batches[0].entries.size());
     EXPECT_EQ(1u, batches[0].first_seq);
-    EXPECT_EQ(2u, batches[0].last_seq);
+    EXPECT_EQ(1u, batches[0].last_seq);
+    ASSERT_EQ(1u, batches[1].entries.size());
+    EXPECT_EQ(2u, batches[1].first_seq);
+    EXPECT_EQ(2u, batches[1].last_seq);
     writer.Stop();
 }
 

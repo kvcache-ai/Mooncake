@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -243,6 +244,8 @@ class HotStandbyService {
     ErrorCode FinalCatchUpForPromotionLocked(uint64_t current_applied_seq_id);
     ErrorCode FinalCatchUpBatchRecordsLocked(HaKvBackend& backend,
                                              bool& used_batch_records);
+    ErrorCode CatchUpLegacyTo(OpLogStore& store, uint64_t target_sequence_id);
+    void StopReplicationLoop();
 
     // Legacy best-effort variant of FinalCatchUpForPromotionLocked, only
     // used when config_.fail_closed_on_incomplete_catch_up == false.
@@ -356,6 +359,9 @@ class HotStandbyService {
     // Background threads
     std::thread replication_thread_;
     std::thread verification_thread_;
+    std::atomic<bool> replication_loop_running_{false};
+    std::mutex replication_loop_mutex_;
+    std::condition_variable replication_loop_cv_;
 
     // Synchronization
     mutable std::mutex mutex_;

@@ -27,6 +27,21 @@ struct OrderedOpLogWriter::Impl {
         next_sequence_id = this->config.initial_durable_prefix.last_seq + 1;
     }
 
+    void SealCommittedEntriesIfIdle() {
+        if (batch_busy || committed_entries.empty()) {
+            return;
+        }
+        const size_t count =
+            std::min(committed_entries.size(), config.max_entries_per_batch);
+        ready_entries.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            ready_entries.push_back(std::move(committed_entries.front()));
+            committed_entries.pop_front();
+        }
+        open_waiting_slots -= count;
+        batch_busy = true;
+    }
+
     OrderedOpLogWriterConfig config;
     WriteBatchFn write_batch;
     mutable std::mutex mutex;
@@ -42,6 +57,8 @@ struct OrderedOpLogWriter::Impl {
     size_t open_waiting_slots{0};
     std::unordered_set<uint64_t> active_reservations;
     std::deque<std::pair<OpLogEntry, DurableCallback>> committed_entries;
+    std::vector<std::pair<OpLogEntry, DurableCallback>> ready_entries;
+    bool batch_busy{false};
     std::deque<std::pair<OpLogEntry, DurableCallback>> callback_entries;
     std::thread writer_thread;
     std::thread callback_thread;
@@ -118,12 +135,19 @@ OrderedOpLogWriter::Commit(Reservation&& reservation, OpLogEntry entry,
         impl_->active_reservations.erase(reservation.id_) == 0) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+    if (impl_->stop_requested) {
+        --impl_->open_waiting_slots;
+        reservation.writer_ = nullptr;
+        reservation.id_ = 0;
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     reservation.writer_ = nullptr;
     reservation.id_ = 0;
     entry.sequence_id = impl_->next_sequence_id++;
     const uint64_t sequence_id = entry.sequence_id;
     impl_->committed_entries.push_back(
         std::make_pair(std::move(entry), std::move(callback)));
+    impl_->SealCommittedEntriesIfIdle();
     impl_->cv.notify_all();
     return PendingHandle(sequence_id);
 }
@@ -150,10 +174,9 @@ ErrorCode OrderedOpLogWriter::LastError() const {
 
 void OrderedOpLogWriter::Start() {
     std::lock_guard<std::mutex> lock(impl_->mutex);
-    if (impl_->running) {
+    if (impl_->running || impl_->stop_requested) {
         return;
     }
-    impl_->stop_requested = false;
     impl_->callback_stop_requested = false;
     impl_->running = true;
     impl_->callback_thread = std::thread([this] {
@@ -185,21 +208,13 @@ void OrderedOpLogWriter::Start() {
                 std::unique_lock<std::mutex> lock(impl_->mutex);
                 impl_->cv.wait(lock, [&] {
                     return impl_->stop_requested ||
-                           !impl_->committed_entries.empty();
+                           !impl_->ready_entries.empty();
                 });
-                if (impl_->stop_requested && impl_->committed_entries.empty()) {
+                if (impl_->stop_requested && impl_->ready_entries.empty()) {
                     return;
                 }
-                const size_t count =
-                    std::min(impl_->committed_entries.size(),
-                             impl_->config.max_entries_per_batch);
-                entries.reserve(count);
-                for (size_t i = 0; i < count; ++i) {
-                    entries.push_back(
-                        std::move(impl_->committed_entries.front()));
-                    impl_->committed_entries.pop_front();
-                }
-                impl_->open_waiting_slots -= count;
+                entries = std::move(impl_->ready_entries);
+                impl_->ready_entries.clear();
                 expected_prefix = impl_->durable_prefix;
             }
 
@@ -220,12 +235,14 @@ void OrderedOpLogWriter::Start() {
                         impl_->durable_prefix = {.batch_id = batch.batch_id,
                                                  .last_seq = batch.last_seq};
                         impl_->last_error = ErrorCode::OK;
-                        impl_->accepting = true;
+                        impl_->accepting = !impl_->stop_requested;
                         for (size_t i = 0; i < entries.size(); ++i) {
                             impl_->callback_entries.push_back(
                                 {batch.entries[i],
                                  std::move(entries[i].second)});
                         }
+                        impl_->batch_busy = false;
+                        impl_->SealCommittedEntriesIfIdle();
                     }
                     impl_->cv.notify_all();
                     break;
@@ -248,10 +265,11 @@ void OrderedOpLogWriter::Start() {
 void OrderedOpLogWriter::Stop() {
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
+        impl_->accepting = false;
+        impl_->stop_requested = true;
         if (!impl_->running) {
             return;
         }
-        impl_->stop_requested = true;
     }
     impl_->cv.notify_all();
     if (impl_->writer_thread.joinable()) {

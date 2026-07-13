@@ -170,6 +170,15 @@ class MasterServiceHATest : public ::testing::Test {
             std::filesystem::remove(path, ec);
         }
         policy_files_.clear();
+        std::error_code ec;
+        std::filesystem::remove_all(LegacyOpLogRootDir(), ec);
+    }
+
+    std::string LegacyOpLogRootDir() const {
+        return (std::filesystem::temp_directory_path() /
+                ("mooncake_master_service_ha_oplog_" +
+                 std::to_string(::getpid())))
+            .string();
     }
 
     std::string WriteTenantPolicyFile(
@@ -198,6 +207,8 @@ class MasterServiceHATest : public ::testing::Test {
             .set_default_kv_lease_ttl(50)
             .set_enable_ha(true)
             .set_cluster_id("test_cluster")
+            .set_oplog_store_type("local_fs")
+            .set_oplog_store_root_dir(LegacyOpLogRootDir())
             .set_enable_multi_tenants(true)
             .set_tenant_quota_connector_type("file")
             .set_tenant_quota_connector_uri(
@@ -688,11 +699,12 @@ TEST_F(MasterServiceHATest, BatchExistKeyRequiresCompletedReplica) {
 }
 
 TEST_F(MasterServiceHATest,
-       BatchRecordWriterInitMigratesLegacyLatestAndSetsSequence) {
+       BatchRecordWriterInitUsesMaximumLegacyEntryAndSetsSequence) {
     const std::string cluster_id = "test_batch_record_init_cluster";
     auto backend = std::make_shared<FakeBatchHaKvBackend>();
     ASSERT_EQ(ErrorCode::OK,
-              backend->Put("/oplog/" + cluster_id + "/latest", "42"));
+              backend->Put("/oplog/" + cluster_id + "/00000000000000000042",
+                           "legacy-entry"));
 
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(50)
@@ -807,6 +819,9 @@ TEST_F(MasterServiceBatchRecordE2ETest,
     auto backend = std::make_shared<FakeBatchHaKvBackend>();
     ASSERT_EQ(ErrorCode::OK,
               backend->Put("/oplog/" + cluster_id + "/latest", "42"));
+    ASSERT_EQ(ErrorCode::OK,
+              backend->Put("/oplog/" + cluster_id + "/00000000000000000042",
+                           "legacy-entry"));
 
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(50)
@@ -885,6 +900,9 @@ TEST_F(MasterServiceBatchRecordE2ETest, LegacyLatestCutoverThenBatchRecords) {
     auto backend = std::make_shared<FakeBatchHaKvBackend>();
     ASSERT_EQ(ErrorCode::OK,
               backend->Put("/oplog/" + cluster_id + "/latest", "42"));
+    ASSERT_EQ(ErrorCode::OK,
+              backend->Put("/oplog/" + cluster_id + "/00000000000000000042",
+                           "legacy-entry"));
 
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(50)
@@ -2222,6 +2240,8 @@ TEST_F(MasterServiceHATest,
                               .set_default_kv_lease_ttl(50)
                               .set_enable_ha(true)
                               .set_cluster_id("test_cluster")
+                              .set_oplog_store_type("local_fs")
+                              .set_oplog_store_root_dir(LegacyOpLogRootDir())
                               .build();
     MasterService service(service_config);
 
@@ -3180,6 +3200,8 @@ TEST_F(MasterServiceHATest, LegacySubmissionHelpersDelegateToOpLogStore) {
                               .set_default_kv_lease_ttl(50)
                               .set_enable_ha(true)
                               .set_cluster_id("test_cluster")
+                              .set_oplog_store_type("local_fs")
+                              .set_oplog_store_root_dir(LegacyOpLogRootDir())
                               .build();
     MasterService service(service_config);
     auto mock_store = std::make_shared<MockOpLogStore>();
@@ -3258,6 +3280,8 @@ TEST_F(MasterServiceHATest, RestoreFromStandbySnapshotClearsInvalidEndpoints) {
                               .set_default_kv_lease_ttl(50)
                               .set_enable_ha(true)
                               .set_cluster_id("test_cluster")
+                              .set_oplog_store_type("local_fs")
+                              .set_oplog_store_root_dir(LegacyOpLogRootDir())
                               .build();
     MasterService service(service_config);
     service.SetOpLogStoreForTesting(std::make_shared<MockOpLogStore>());
@@ -3288,6 +3312,8 @@ TEST_F(MasterServiceHATest, RemoveByRegexPublishesRemoveOpLog) {
                               .set_default_kv_lease_ttl(50)
                               .set_enable_ha(true)
                               .set_cluster_id("test_cluster")
+                              .set_oplog_store_type("local_fs")
+                              .set_oplog_store_root_dir(LegacyOpLogRootDir())
                               .build();
     std::unique_ptr<MasterService> service(new MasterService(service_config));
 
@@ -3339,6 +3365,8 @@ TEST_F(MasterServiceHATest,
                               .set_default_kv_lease_ttl(50)
                               .set_enable_ha(true)
                               .set_cluster_id("test_cluster")
+                              .set_oplog_store_type("local_fs")
+                              .set_oplog_store_root_dir(LegacyOpLogRootDir())
                               .build();
     std::unique_ptr<MasterService> service(new MasterService(service_config));
 
@@ -3359,6 +3387,8 @@ TEST_F(MasterServiceHATest, BatchRemovePersistFailureSkipsErase) {
                               .set_default_kv_lease_ttl(50)
                               .set_enable_ha(true)
                               .set_cluster_id("test_cluster")
+                              .set_oplog_store_type("local_fs")
+                              .set_oplog_store_root_dir(LegacyOpLogRootDir())
                               .build();
     std::unique_ptr<MasterService> service(new MasterService(service_config));
 
@@ -3418,6 +3448,8 @@ TEST_F(MasterServiceHATest, PutRevokeSingleReplicaPublishesRemoveOpLog) {
                               .set_default_kv_lease_ttl(50)
                               .set_enable_ha(true)
                               .set_cluster_id("test_cluster")
+                              .set_oplog_store_type("local_fs")
+                              .set_oplog_store_root_dir(LegacyOpLogRootDir())
                               .build();
     std::unique_ptr<MasterService> service(new MasterService(service_config));
 
@@ -3474,6 +3506,8 @@ TEST_F(MasterServiceHATest,
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(50)
                               .set_cluster_id("test_cluster")
+                              .set_oplog_store_type("local_fs")
+                              .set_oplog_store_root_dir(LegacyOpLogRootDir())
                               .build();
     MasterService service(service_config);
 
@@ -3505,6 +3539,8 @@ TEST_F(MasterServiceHATest, PutRevokeKeepsLocalDiskPublishesPutEndOpLog) {
                               .set_default_kv_lease_ttl(50)
                               .set_enable_ha(true)
                               .set_cluster_id("test_cluster")
+                              .set_oplog_store_type("local_fs")
+                              .set_oplog_store_root_dir(LegacyOpLogRootDir())
                               .build();
     std::unique_ptr<MasterService> service(new MasterService(service_config));
 
@@ -3544,6 +3580,8 @@ TEST_F(MasterServiceHATest, EvictDiskReplicaPublishesPutEndOpLog) {
                               .set_default_kv_lease_ttl(50)
                               .set_enable_ha(true)
                               .set_cluster_id("test_cluster")
+                              .set_oplog_store_type("local_fs")
+                              .set_oplog_store_root_dir(LegacyOpLogRootDir())
                               .build();
     std::unique_ptr<MasterService> service(new MasterService(service_config));
 
@@ -3578,6 +3616,8 @@ TEST_F(MasterServiceHATest, BatchReplicaClearAllPublishesRemoveOpLog) {
                               .set_default_kv_lease_ttl(50)
                               .set_enable_ha(true)
                               .set_cluster_id("test_cluster")
+                              .set_oplog_store_type("local_fs")
+                              .set_oplog_store_root_dir(LegacyOpLogRootDir())
                               .build();
     std::unique_ptr<MasterService> service(new MasterService(service_config));
 
@@ -3607,6 +3647,8 @@ TEST_F(MasterServiceHATest, CopyEndPublishesPutEndOpLog) {
                               .set_default_kv_lease_ttl(50)
                               .set_enable_ha(true)
                               .set_cluster_id("test_cluster")
+                              .set_oplog_store_type("local_fs")
+                              .set_oplog_store_root_dir(LegacyOpLogRootDir())
                               .build();
     std::unique_ptr<MasterService> service(new MasterService(service_config));
 
@@ -3641,6 +3683,8 @@ TEST_F(MasterServiceHATest, MoveEndPublishesPutEndOpLog) {
                               .set_default_kv_lease_ttl(50)
                               .set_enable_ha(true)
                               .set_cluster_id("test_cluster")
+                              .set_oplog_store_type("local_fs")
+                              .set_oplog_store_root_dir(LegacyOpLogRootDir())
                               .build();
     std::unique_ptr<MasterService> service(new MasterService(service_config));
 
@@ -3676,6 +3720,8 @@ TEST_F(MasterServiceHATest,
                               .set_default_kv_lease_ttl(50)
                               .set_enable_ha(true)
                               .set_cluster_id("test_cluster")
+                              .set_oplog_store_type("local_fs")
+                              .set_oplog_store_root_dir(LegacyOpLogRootDir())
                               .build();
     std::unique_ptr<MasterService> service(new MasterService(service_config));
 
@@ -3717,6 +3763,8 @@ TEST_F(MasterServiceHATest, CopyEndPersistFailureStillCompletesLocally) {
                               .set_default_kv_lease_ttl(50)
                               .set_enable_ha(true)
                               .set_cluster_id("test_cluster")
+                              .set_oplog_store_type("local_fs")
+                              .set_oplog_store_root_dir(LegacyOpLogRootDir())
                               .build();
     std::unique_ptr<MasterService> service(new MasterService(service_config));
 
@@ -3756,6 +3804,8 @@ TEST_F(MasterServiceHATest, MoveEndPersistFailureSkipsLocalMutation) {
                               .set_default_kv_lease_ttl(50)
                               .set_enable_ha(true)
                               .set_cluster_id("test_cluster")
+                              .set_oplog_store_type("local_fs")
+                              .set_oplog_store_root_dir(LegacyOpLogRootDir())
                               .build();
     std::unique_ptr<MasterService> service(new MasterService(service_config));
 
@@ -3804,6 +3854,8 @@ TEST_F(MasterServiceHATest, PutRevokePersistFailureFinalizesAfterRetry) {
                               .set_default_kv_lease_ttl(50)
                               .set_enable_ha(true)
                               .set_cluster_id("test_cluster")
+                              .set_oplog_store_type("local_fs")
+                              .set_oplog_store_root_dir(LegacyOpLogRootDir())
                               .build();
     std::unique_ptr<MasterService> service(new MasterService(service_config));
 
@@ -3850,6 +3902,8 @@ TEST_F(MasterServiceHATest, BatchEvictPersistFailureSkipsMemReplicaErase) {
                               .set_default_kv_lease_ttl(50)
                               .set_enable_ha(true)
                               .set_cluster_id("test_cluster")
+                              .set_oplog_store_type("local_fs")
+                              .set_oplog_store_root_dir(LegacyOpLogRootDir())
                               .build();
     std::unique_ptr<MasterService> service(new MasterService(service_config));
 
@@ -3902,6 +3956,8 @@ TEST_F(MasterServiceHATest, PutStartOverwritePersistFailureSkipsErase) {
                               .set_default_kv_lease_ttl(50)
                               .set_enable_ha(true)
                               .set_cluster_id("test_cluster")
+                              .set_oplog_store_type("local_fs")
+                              .set_oplog_store_root_dir(LegacyOpLogRootDir())
                               .set_put_start_discard_timeout_sec(1)
                               .set_put_start_release_timeout_sec(2)
                               .build();
@@ -3954,6 +4010,8 @@ TEST_F(MasterServiceHATest,
                               .set_default_kv_lease_ttl(50)
                               .set_enable_ha(true)
                               .set_cluster_id("test_cluster")
+                              .set_oplog_store_type("local_fs")
+                              .set_oplog_store_root_dir(LegacyOpLogRootDir())
                               .set_put_start_discard_timeout_sec(1)
                               .set_put_start_release_timeout_sec(2)
                               .build();
@@ -4090,7 +4148,15 @@ TEST_F(MasterServiceHATest, PutRevokeMemoryPublishesRemoveTenantId) {
     ASSERT_TRUE(res.has_value());
 
     OpLogEntry entry;
-    EXPECT_EQ(ErrorCode::OK, mock_store->FindLatestEntryForKey(key, entry));
+    ErrorCode find_err = ErrorCode::OPLOG_ENTRY_NOT_FOUND;
+    for (int i = 0; i < 50; ++i) {
+        find_err = mock_store->FindLatestEntryForKey(key, entry);
+        if (find_err == ErrorCode::OK) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    EXPECT_EQ(ErrorCode::OK, find_err);
     EXPECT_EQ(OpType::REMOVE, entry.op_type);
     EXPECT_EQ(tenant, entry.tenant_id);
     EXPECT_NE("default", entry.tenant_id);
@@ -4336,6 +4402,8 @@ TEST_F(MasterServiceHATest,
                               .set_default_kv_lease_ttl(50)
                               .set_enable_ha(true)
                               .set_cluster_id("test_cluster")
+                              .set_oplog_store_type("local_fs")
+                              .set_oplog_store_root_dir(LegacyOpLogRootDir())
                               .build();
     std::unique_ptr<MasterService> service(new MasterService(service_config));
 

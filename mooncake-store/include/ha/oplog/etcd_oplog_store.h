@@ -7,6 +7,7 @@
 #include <optional>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -15,6 +16,9 @@
 #include "types.h"
 
 namespace mooncake {
+
+bool ParseLegacyOpLogEntryKey(std::string_view cluster_id, std::string_view key,
+                              uint64_t& sequence_id);
 
 /**
  * @brief Store for OpLog entries in etcd.

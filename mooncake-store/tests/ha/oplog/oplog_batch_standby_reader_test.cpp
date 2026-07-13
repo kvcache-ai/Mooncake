@@ -46,6 +46,7 @@ class FakeHaKvBackend : public HaKvBackend {
     ErrorCode Txn(const KvTxn&) override { return ErrorCode::OK; }
 
     int range_calls() const { return range_calls_; }
+    void Erase(std::string_view key) { values_.erase(std::string(key)); }
 
    private:
     std::map<std::string, std::string> values_;
@@ -91,6 +92,62 @@ TEST(OpLogBatchStandbyReaderTest, LegacyPathIsUsedWhenDurablePrefixIsAbsent) {
     EXPECT_TRUE(result.used_legacy_path);
     EXPECT_EQ(0u, result.applied_entries);
     EXPECT_EQ(1u, applier.GetExpectedSequenceId());
+}
+
+TEST(OpLogBatchStandbyReaderTest, MissingPrefixAfterBatchCutoverFailsClosed) {
+    FakeHaKvBackend backend;
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildDurablePrefixKey("clusterA"),
+                          EncodeDurablePrefix({.batch_id = 1, .last_seq = 1})));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildBatchRecordKey("clusterA", 1),
+                          EncodeOpLogBatchRecord(MakeBatch(1, 1, 1))));
+    MockMetadataStore metadata_store;
+    OpLogApplier applier(&metadata_store, "clusterA");
+    OpLogBatchStandbyReader reader("clusterA", backend, applier);
+    ASSERT_EQ(ErrorCode::OK, reader.PollOnce().error);
+
+    backend.Erase(BuildDurablePrefixKey("clusterA"));
+    auto result = reader.PollOnce();
+
+    EXPECT_NE(ErrorCode::OK, result.error);
+    EXPECT_FALSE(result.used_legacy_path);
+}
+
+TEST(OpLogBatchStandbyReaderTest, DurablePrefixRegressionFailsClosed) {
+    FakeHaKvBackend backend;
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildDurablePrefixKey("clusterA"),
+                          EncodeDurablePrefix({.batch_id = 1, .last_seq = 1})));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildBatchRecordKey("clusterA", 1),
+                          EncodeOpLogBatchRecord(MakeBatch(1, 1, 1))));
+    MockMetadataStore metadata_store;
+    OpLogApplier applier(&metadata_store, "clusterA");
+    OpLogBatchStandbyReader reader("clusterA", backend, applier);
+    ASSERT_EQ(ErrorCode::OK, reader.PollOnce().error);
+
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildDurablePrefixKey("clusterA"),
+                          EncodeDurablePrefix({.batch_id = 0, .last_seq = 0})));
+    EXPECT_NE(ErrorCode::OK, reader.PollOnce().error);
+}
+
+TEST(OpLogBatchStandbyReaderTest, BatchZeroReportsLegacyCatchUpTarget) {
+    FakeHaKvBackend backend;
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend.Put(BuildDurablePrefixKey("clusterA"),
+                    EncodeDurablePrefix({.batch_id = 0, .last_seq = 42})));
+    MockMetadataStore metadata_store;
+    OpLogApplier applier(&metadata_store, "clusterA");
+    OpLogBatchStandbyReader reader("clusterA", backend, applier);
+
+    auto result = reader.PollOnce();
+
+    ASSERT_EQ(ErrorCode::OK, result.error);
+    EXPECT_TRUE(result.waiting_for_legacy_catch_up);
+    EXPECT_EQ(42u, result.legacy_catch_up_target);
 }
 
 TEST(OpLogBatchStandbyReaderTest, RangeReadsBatchesWhenDurablePrefixAdvances) {
@@ -162,7 +219,7 @@ TEST(OpLogBatchStandbyReaderTest, FullPageContinuesOnNextPoll) {
     EXPECT_EQ(4u, applier.GetExpectedSequenceId());
 }
 
-TEST(OpLogBatchStandbyReaderTest, StopsApplyingAtDurablePrefixLastSeq) {
+TEST(OpLogBatchStandbyReaderTest, RejectsPrefixPointingIntoBatch) {
     FakeHaKvBackend backend;
     ASSERT_EQ(ErrorCode::OK,
               backend.Put(BuildDurablePrefixKey("clusterA"),
@@ -176,9 +233,9 @@ TEST(OpLogBatchStandbyReaderTest, StopsApplyingAtDurablePrefixLastSeq) {
 
     auto result = reader.PollOnce();
 
-    ASSERT_EQ(ErrorCode::OK, result.error);
-    EXPECT_EQ(2u, result.applied_entries);
-    EXPECT_EQ(3u, applier.GetExpectedSequenceId());
+    EXPECT_NE(ErrorCode::OK, result.error);
+    EXPECT_EQ(0u, result.applied_entries);
+    EXPECT_EQ(1u, applier.GetExpectedSequenceId());
 }
 
 TEST(OpLogBatchStandbyReaderTest, AppliesExpandedEntriesInSequenceOrder) {
@@ -221,6 +278,26 @@ TEST(OpLogBatchStandbyReaderTest, AcceptsFirstBatchAtLegacyLatestPlusOne) {
     ASSERT_EQ(ErrorCode::OK, result.error);
     EXPECT_EQ(2u, result.applied_entries);
     EXPECT_EQ(5u, applier.GetExpectedSequenceId());
+}
+
+TEST(OpLogBatchStandbyReaderTest, ReportsLegacyTargetBeforeFirstBatch) {
+    FakeHaKvBackend backend;
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend.Put(BuildDurablePrefixKey("clusterA"),
+                    EncodeDurablePrefix({.batch_id = 1, .last_seq = 44})));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildBatchRecordKey("clusterA", 1),
+                          EncodeOpLogBatchRecord(MakeBatch(1, 43, 44))));
+    MockMetadataStore metadata_store;
+    OpLogApplier applier(&metadata_store, "clusterA");
+    OpLogBatchStandbyReader reader("clusterA", backend, applier);
+
+    auto result = reader.PollOnce();
+
+    ASSERT_EQ(ErrorCode::OK, result.error);
+    EXPECT_TRUE(result.waiting_for_legacy_catch_up);
+    EXPECT_EQ(42u, result.legacy_catch_up_target);
 }
 
 TEST(OpLogBatchStandbyReaderTest,
@@ -284,15 +361,38 @@ TEST(OpLogBatchStandbyReaderTest, MissingBatchMarksReaderUnhealthy) {
     EXPECT_EQ(1u, applier.GetExpectedSequenceId());
 }
 
-TEST(OpLogBatchStandbyReaderTest,
-     LaterBatchWithContiguousEntriesStillRequiresPreviousBatch) {
+TEST(OpLogBatchStandbyReaderTest, StartsFromEarliestExistingBatch) {
+    FakeHaKvBackend backend;
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend.Put(BuildDurablePrefixKey("clusterA"),
+                    EncodeDurablePrefix({.batch_id = 42, .last_seq = 44})));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildBatchRecordKey("clusterA", 42),
+                          EncodeOpLogBatchRecord(MakeBatch(42, 43, 44))));
+    MockMetadataStore metadata_store;
+    OpLogApplier applier(&metadata_store, "clusterA");
+    applier.Recover(42);
+    OpLogBatchStandbyReader reader("clusterA", backend, applier);
+
+    auto result = reader.PollOnce();
+
+    EXPECT_EQ(ErrorCode::OK, result.error);
+    EXPECT_EQ(2u, result.applied_entries);
+    EXPECT_EQ(45u, applier.GetExpectedSequenceId());
+}
+
+TEST(OpLogBatchStandbyReaderTest, RejectsSequenceOverlapAcrossBatches) {
     FakeHaKvBackend backend;
     ASSERT_EQ(ErrorCode::OK,
               backend.Put(BuildDurablePrefixKey("clusterA"),
-                          EncodeDurablePrefix({.batch_id = 2, .last_seq = 2})));
+                          EncodeDurablePrefix({.batch_id = 2, .last_seq = 3})));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildBatchRecordKey("clusterA", 1),
+                          EncodeOpLogBatchRecord(MakeBatch(1, 1, 2))));
     ASSERT_EQ(ErrorCode::OK,
               backend.Put(BuildBatchRecordKey("clusterA", 2),
-                          EncodeOpLogBatchRecord(MakeBatch(2, 1, 2))));
+                          EncodeOpLogBatchRecord(MakeBatch(2, 2, 3))));
     MockMetadataStore metadata_store;
     OpLogApplier applier(&metadata_store, "clusterA");
     OpLogBatchStandbyReader reader("clusterA", backend, applier);
@@ -300,8 +400,8 @@ TEST(OpLogBatchStandbyReaderTest,
     auto result = reader.PollOnce();
 
     EXPECT_NE(ErrorCode::OK, result.error);
-    EXPECT_EQ(0u, result.applied_entries);
-    EXPECT_EQ(1u, applier.GetExpectedSequenceId());
+    EXPECT_EQ(2u, result.applied_entries);
+    EXPECT_EQ(3u, applier.GetExpectedSequenceId());
 }
 
 TEST(OpLogBatchStandbyReaderTest, ChecksumFailureMarksReaderUnhealthy) {

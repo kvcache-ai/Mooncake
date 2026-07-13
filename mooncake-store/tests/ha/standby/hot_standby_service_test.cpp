@@ -625,6 +625,46 @@ OpLogBatchRecord MakeBatch(uint64_t batch_id, uint64_t first_seq,
 
 }  // namespace
 
+TEST_F(HotStandbyServiceTest,
+       BatchRecordStandbyPollsInjectedBackendWithoutNotifier) {
+    const std::string cluster_id = "batch-standby-injected-backend";
+    auto legacy_store = std::make_shared<MockOpLogStore>();
+    ASSERT_EQ(ErrorCode::OK,
+              legacy_store->WriteOpLog(MakeEntry(1, OpType::PUT_END, "legacy_1",
+                                                 MakeValidPayload())));
+    ASSERT_EQ(ErrorCode::OK,
+              legacy_store->WriteOpLog(MakeEntry(2, OpType::PUT_END, "legacy_2",
+                                                 MakeValidPayload())));
+    auto batch_backend = std::make_shared<FakeHaKvBackend>();
+    ASSERT_EQ(ErrorCode::OK,
+              batch_backend->Put(
+                  BuildDurablePrefixKey(cluster_id),
+                  EncodeDurablePrefix({.batch_id = 1, .last_seq = 3})));
+    ASSERT_EQ(ErrorCode::OK,
+              batch_backend->Put(BuildBatchRecordKey(cluster_id, 1),
+                                 EncodeOpLogBatchRecord(MakeBatch(1, 3, 3))));
+
+    HotStandbyConfig config = config_;
+    config.oplog_store_type = OpLogStoreType::ETCD_BATCH_RECORD;
+    config.enable_snapshot_bootstrap = false;
+    config.enable_oplog_following = true;
+    config.oplog_poll_interval_ms = 1;
+
+    auto service = std::make_unique<HotStandbyService>(config);
+    service->SetCatchUpOpLogStoreForTesting(legacy_store);
+    service->SetCatchUpBatchKvBackendForTesting(batch_backend);
+    ASSERT_EQ(ErrorCode::OK,
+              service->Start("primary_unused", "unused", cluster_id));
+
+    for (int i = 0; i < 100 && service->GetLatestAppliedSequenceId() < 3; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    EXPECT_EQ(StandbyState::WATCHING, service->GetState());
+    EXPECT_EQ(3u, service->GetLatestAppliedSequenceId());
+    service->Stop();
+}
+
 class PromotionCatchUpTest : public HotStandbyServiceTest {
    protected:
     void SetUp() override {
@@ -854,6 +894,32 @@ TEST_F(PromotionCatchUpTest, UsesDurablePrefixLastSeqAsCatchUpTarget) {
     ErrorCode promote_err = service_->PromoteAndExportSnapshot(out);
     EXPECT_EQ(ErrorCode::OK, promote_err);
     EXPECT_EQ(2u, out.oplog_sequence_id);
+}
+
+TEST_F(PromotionCatchUpTest, CompletesLegacyPrefixBeforeFirstBatch) {
+    ASSERT_EQ(ErrorCode::OK,
+              mock_store_->WriteOpLog(MakeEntry(1, OpType::PUT_END, "legacy_1",
+                                                MakeValidPayload())));
+    ASSERT_EQ(ErrorCode::OK,
+              mock_store_->WriteOpLog(MakeEntry(2, OpType::PUT_END, "legacy_2",
+                                                MakeValidPayload())));
+
+    auto batch_backend = std::make_shared<FakeHaKvBackend>();
+    ASSERT_EQ(ErrorCode::OK,
+              batch_backend->Put(
+                  BuildDurablePrefixKey(cluster_id_),
+                  EncodeDurablePrefix({.batch_id = 1, .last_seq = 3})));
+    ASSERT_EQ(ErrorCode::OK,
+              batch_backend->Put(BuildBatchRecordKey(cluster_id_, 1),
+                                 EncodeOpLogBatchRecord(MakeBatch(1, 3, 3))));
+    service_->SetCatchUpBatchKvBackendForTesting(batch_backend);
+
+    ASSERT_EQ(ErrorCode::OK,
+              service_->Start("", oplog_endpoints_, cluster_id_));
+
+    StandbySnapshot out;
+    ASSERT_EQ(ErrorCode::OK, service_->PromoteAndExportSnapshot(out));
+    EXPECT_EQ(3u, out.oplog_sequence_id);
 }
 
 TEST_F(PromotionCatchUpTest, PaginatesBatchRecords) {
