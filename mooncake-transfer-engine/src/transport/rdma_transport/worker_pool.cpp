@@ -681,7 +681,8 @@ int WorkerPool::doProcessContextEvents() {
 
 void WorkerPool::refreshPublishedLocalTopology() {
     std::lock_guard<std::mutex> guard(context_.engine().local_desc_lock_);
-    auto desc = context_.engine().metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    auto desc =
+        context_.engine().metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     if (!desc || !context_.engine().local_topology_) return;
 
     auto updated_desc = std::make_shared<RdmaTransport::SegmentDesc>(*desc);
