@@ -170,6 +170,12 @@ class RdmaContext {
         const std::vector<AutoGidSelectionIdentity> &tried_selections = {},
         std::string *previous_gid = nullptr, std::string *next_gid = nullptr);
 
+    // Refresh the runtime GID after IBV_EVENT_GID_CHANGE. Auto-GID mode uses
+    // the same candidate filtering/ranking as initial device open; explicit
+    // MC_GID_INDEX keeps the configured index and refreshes only its value.
+    bool refreshCurrentGid(std::string *previous_gid = nullptr,
+                           std::string *next_gid = nullptr);
+
     ibv_context *context() const { return context_; }
 
     RdmaTransport &engine() const { return engine_; }

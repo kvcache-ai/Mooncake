@@ -62,6 +62,8 @@ class WorkerPool {
     // and optionally deletes the endpoint
     void handlePathFailure(const std::string &peer_nic_path,
                            RdmaEndPoint *endpoint = nullptr);
+    void refreshPublishedLocalTopology();
+    bool refreshPublishedLocalGid();
 
     // Context-level health tracking for catastrophic hardware failure.
     // When all rails through a local RNIC are unavailable, increment the
