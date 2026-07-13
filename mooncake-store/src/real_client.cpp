@@ -816,6 +816,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             }
         }
 
+        const bool parallel_hugetlb_population =
+            protocol == "rdma" && should_use_hugepage;
+
         while (global_segment_size > 0) {
             size_t segment_size = std::min(global_segment_size, max_mr_size);
             global_segment_size -= segment_size;
@@ -841,7 +844,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 mapped_size =
                     align_up(segment_size, get_hugepage_size_from_env());
                 ptr = allocate_buffer_mmap_memory(mapped_size,
-                                                  get_hugepage_size_from_env());
+                                                  get_hugepage_size_from_env(),
+                                                  parallel_hugetlb_population);
             } else {
                 ptr = allocate_buffer_allocator_memory(segment_size,
                                                        this->protocol);
@@ -874,6 +878,19 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             } else {
                 segment_ptrs_.emplace_back(ptr);
             }
+
+            // Populate HugeTLB pages in parallel immediately before transfer-
+            // engine registration. NUMA mappings use node-local workers for
+            // each mbind region; direct mappings use the generic worker pool.
+            if (parallel_hugetlb_population) {
+                if (!seg_numa_nodes.empty()) {
+                    populate_hugetlb_numa_mapping(ptr, mapped_size,
+                                                  seg_numa_nodes);
+                } else if (!is_mmap_arena_allocation(ptr)) {
+                    populate_hugetlb_mapping(ptr, mapped_size);
+                }
+            }
+
             auto mount_result =
                 client_->MountSegment(ptr, mapped_size, protocol, seg_location);
             if (!mount_result.has_value()) {

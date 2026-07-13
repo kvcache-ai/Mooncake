@@ -814,6 +814,21 @@ Local hot cache provides a DRAM read cache on top of SSD-resident objects for fa
 | `MC_MMAP_ARENA_POOL_SIZE` | unset | Pre-allocated arena pool size (e.g., `8gb`). Explicitly set to enable the arena |
 | `MC_DISABLE_MMAP_ARENA` | unset | Disable arena, fall back to per-call `mmap()`. Accepts `1`/`true`/`yes`/`on` (or `0`/`false`/`no`/`off`) |
 
+RDMA Store segments backed by HugeTLB are populated in parallel immediately
+before transfer-engine registration. No additional population-mode setting is
+required:
+
+```bash
+export MC_STORE_USE_HUGEPAGE=1
+export MC_STORE_HUGEPAGE_SIZE=2MB
+```
+
+For direct mappings, workers divide the mapping into page ranges. For
+NUMA-segmented mappings, each worker is scheduled on the NUMA node associated
+with its `mbind()` region before touching pages. The mmap arena retains its
+eager `MAP_POPULATE` behavior for DMA safety; set `MC_DISABLE_MMAP_ARENA=1` if
+the deferred direct-mmap path is desired while the arena is otherwise enabled.
+
 #### yalantinglibs Log Level
 
 ```bash
