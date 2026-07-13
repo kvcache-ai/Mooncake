@@ -817,8 +817,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
 
         const bool parallel_hugetlb_population =
-            protocol == "rdma" && should_use_hugepage &&
-            get_hugepage_populate_mode() == HugepagePopulateMode::kParallel;
+            protocol == "rdma" && should_use_hugepage;
 
         while (global_segment_size > 0) {
             size_t segment_size = std::min(global_segment_size, max_mr_size);

@@ -45,25 +45,10 @@ class MmapArenaFallbackTest : public ::testing::Test {
     void TearDown() override {
         unsetenv("MC_DISABLE_MMAP_ARENA");
         unsetenv("MC_MMAP_ARENA_POOL_SIZE");
-        unsetenv("MC_STORE_HUGEPAGE_POPULATE_MODE");
         unsetenv("MC_STORE_HUGEPAGE_SIZE");
         unsetenv("MC_STORE_USE_HUGEPAGE");
     }
 };
-
-TEST_F(MmapArenaFallbackTest, ParsesHugepagePopulateMode) {
-    unsetenv("MC_STORE_HUGEPAGE_POPULATE_MODE");
-    EXPECT_EQ(get_hugepage_populate_mode(), HugepagePopulateMode::kEager);
-
-    setenv("MC_STORE_HUGEPAGE_POPULATE_MODE", "eager", 1);
-    EXPECT_EQ(get_hugepage_populate_mode(), HugepagePopulateMode::kEager);
-
-    setenv("MC_STORE_HUGEPAGE_POPULATE_MODE", "parallel", 1);
-    EXPECT_EQ(get_hugepage_populate_mode(), HugepagePopulateMode::kParallel);
-
-    setenv("MC_STORE_HUGEPAGE_POPULATE_MODE", "invalid", 1);
-    EXPECT_EQ(get_hugepage_populate_mode(), HugepagePopulateMode::kEager);
-}
 
 TEST_F(MmapArenaFallbackTest, PopulateHugetlbMappingUsesConfiguredPageStride) {
     setenv("MC_STORE_USE_HUGEPAGE", "1", 1);

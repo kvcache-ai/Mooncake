@@ -377,19 +377,6 @@ inline size_t align_up(size_t size, size_t alignment) {
     return size;
 }
 
-enum class HugepagePopulateMode {
-    kEager,
-    kParallel,
-};
-
-/**
- * @brief Parse MC_STORE_HUGEPAGE_POPULATE_MODE.
- *
- * "parallel" requests deferred, parallel population immediately before Store
- * segment registration. Unset or invalid values use the eager default.
- */
-[[nodiscard]] HugepagePopulateMode get_hugepage_populate_mode();
-
 /**
  * @brief Fault in a fresh HugeTLB mapping with parallel CPU writes.
  *

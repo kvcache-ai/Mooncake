@@ -811,18 +811,23 @@ Local hot cache provides a DRAM read cache on top of SSD-resident objects for fa
 |----------|---------|-------------|
 | `MC_STORE_USE_HUGEPAGE` | unset | Set `1` to request HugeTLB-backed `mmap()` |
 | `MC_STORE_HUGEPAGE_SIZE` | `2MB` | Supported: `2MB`, `1GB` |
-| `MC_STORE_HUGEPAGE_POPULATE_MODE` | unset | Set `parallel` to populate RDMA Store HugeTLB mappings with parallel CPU writes immediately before transfer-engine registration. NUMA mappings use node-local workers |
 | `MC_DISABLE_RDMA_PRE_TOUCH` | `false` | Disable the RDMA transport's register/deregister pre-touch pass. Accepts `1`/`true`/`yes`/`on`; use with `MC_ENABLE_PARALLEL_REG_MR=1` when Store already populated the mapping and parallel MR registration should remain enabled |
 | `MC_MMAP_ARENA_POOL_SIZE` | unset | Pre-allocated arena pool size (e.g., `8gb`). Explicitly set to enable the arena |
 | `MC_DISABLE_MMAP_ARENA` | unset | Disable arena, fall back to per-call `mmap()`. Accepts `1`/`true`/`yes`/`on` (or `0`/`false`/`no`/`off`) |
 
-For large RDMA Store segments, parallel population avoids blocking in
-`mmap(MAP_POPULATE)` or serially faulting pages during registration:
+RDMA Store segments backed by HugeTLB are populated in parallel immediately
+before transfer-engine registration. No additional population-mode setting is
+required:
 
 ```bash
 export MC_STORE_USE_HUGEPAGE=1
 export MC_STORE_HUGEPAGE_SIZE=2MB
-export MC_STORE_HUGEPAGE_POPULATE_MODE=parallel
+```
+
+To skip the transfer engine's separate register/deregister pre-touch pass while
+retaining parallel MR registration, optionally set:
+
+```bash
 export MC_DISABLE_RDMA_PRE_TOUCH=1
 export MC_ENABLE_PARALLEL_REG_MR=1
 ```

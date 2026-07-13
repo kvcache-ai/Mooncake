@@ -240,23 +240,6 @@ static inline size_t mmap_map_size(size_t total_size, size_t hugepage_size) {
     return align_up(total_size, page_size);
 }
 
-HugepagePopulateMode get_hugepage_populate_mode() {
-    const char *populate_mode = std::getenv("MC_STORE_HUGEPAGE_POPULATE_MODE");
-    if (populate_mode == nullptr) {
-        return HugepagePopulateMode::kEager;
-    }
-    if (std::strcmp(populate_mode, "eager") == 0) {
-        return HugepagePopulateMode::kEager;
-    }
-    if (std::strcmp(populate_mode, "parallel") == 0) {
-        return HugepagePopulateMode::kParallel;
-    }
-    LOG(WARNING) << "Invalid MC_STORE_HUGEPAGE_POPULATE_MODE='" << populate_mode
-                 << "'; supported values: eager, parallel. "
-                 << "Using eager.";
-    return HugepagePopulateMode::kEager;
-}
-
 namespace {
 
 size_t touch_thread_count(size_t page_count) {
