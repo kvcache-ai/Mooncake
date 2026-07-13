@@ -11,7 +11,7 @@ namespace testing {
 namespace {
 
 class GdsBatchPutSmoke : public ::testing::Test {
-protected:
+   protected:
     void SetUp() override {
         std::filesystem::create_directories("/tmp/gds_smoke_test");
         setenv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
@@ -25,19 +25,20 @@ protected:
 
 TEST_F(GdsBatchPutSmoke, PutWithGpuBuffer) {
     auto config = InProcMasterConfigBuilder()
-        .set_enable_offload(true)
-        .set_enable_disk_eviction(true)
-        .set_root_fs_dir("/tmp/gds_smoke_test")
-        .build();
+                      .set_enable_offload(true)
+                      .set_enable_disk_eviction(true)
+                      .set_root_fs_dir("/tmp/gds_smoke_test")
+                      .build();
     InProcMaster master;
     ASSERT_TRUE(master.Start(config));
 
     ConfigDict cfg;
     cfg["local_hostname"] = "127.0.0.1";
-    cfg["metadata_server"] = "http://127.0.0.1:" +
-        std::to_string(master.http_metadata_port()) + "/metadata";
-    cfg["master_server_addr"] = "127.0.0.1:" +
-        std::to_string(master.rpc_port());
+    cfg["metadata_server"] =
+        "http://127.0.0.1:" + std::to_string(master.http_metadata_port()) +
+        "/metadata";
+    cfg["master_server_addr"] =
+        "127.0.0.1:" + std::to_string(master.rpc_port());
     cfg["protocol"] = "tcp";
 
     RealClient client;

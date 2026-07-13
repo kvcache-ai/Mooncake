@@ -9,7 +9,7 @@
 namespace mooncake {
 
 class GdsContextTest : public ::testing::Test {
-protected:
+   protected:
     std::string test_dir_;
 
     void SetUp() override {
@@ -17,9 +17,7 @@ protected:
         std::filesystem::create_directories(test_dir_);
     }
 
-    void TearDown() override {
-        std::filesystem::remove_all(test_dir_);
-    }
+    void TearDown() override { std::filesystem::remove_all(test_dir_); }
 };
 
 // ── Test 1: Init 兼容模式 (无 GDS 硬件) ──
@@ -56,10 +54,8 @@ TEST_F(GdsContextTest, WriteRead_CpuBuffer) {
     std::vector<Slice> slices = {Slice{(void*)value.data(), value.size()}};
 
     // header + key + value 直接 pwrite
-    RecordHeader hdr{
-        .key_len = static_cast<uint32_t>(key.size()),
-        .value_len = static_cast<uint32_t>(value.size())
-    };
+    RecordHeader hdr{.key_len = static_cast<uint32_t>(key.size()),
+                     .value_len = static_cast<uint32_t>(value.size())};
     ASSERT_EQ(::pwrite(fd, &hdr, RecordHeader::SIZE, 0), RecordHeader::SIZE);
     ASSERT_EQ(::pwrite(fd, key.data(), key.size(), RecordHeader::SIZE),
               static_cast<ssize_t>(key.size()));
@@ -69,7 +65,8 @@ TEST_F(GdsContextTest, WriteRead_CpuBuffer) {
 
     // 读回
     RecordHeader read_hdr;
-    ASSERT_EQ(::pread(fd, &read_hdr, RecordHeader::SIZE, 0), RecordHeader::SIZE);
+    ASSERT_EQ(::pread(fd, &read_hdr, RecordHeader::SIZE, 0),
+              RecordHeader::SIZE);
     EXPECT_EQ(read_hdr.key_len, key.size());
     EXPECT_EQ(read_hdr.value_len, value.size());
 

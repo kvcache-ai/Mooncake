@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -32,7 +33,7 @@ struct RecordHeader {
 };
 
 struct GdsContext {
-    bool enabled_ = false;
+    std::atomic<bool> enabled_{false};
     int gds_fd_ = -1;
     void* cu_file_handle_ = nullptr;     // GdsDeviceFileHandle (via ops_)
     std::unique_ptr<GdsDeviceOps> ops_;  // vendor implementation

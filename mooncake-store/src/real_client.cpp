@@ -3770,25 +3770,35 @@ RealClient::batch_put_with_store_reservation(
         return client_->BatchPut(keys, mutable_slices, config);
     }
     auto &resp = reserve_result.value();
-    std::unordered_set<size_t> failed_set(resp.failed_indices.begin(),
-                                          resp.failed_indices.end());
+    // Use shared_ptr so both the DMA thread and main thread can read
+    // failed_set without use-after-move. The set is const — neither
+    // side mutates it.
+    auto failed_set = std::make_shared<const std::unordered_set<size_t>>(
+        resp.failed_indices.begin(), resp.failed_indices.end());
 
+    // Promise carries the set of DMA-succeeded indices.
+    // An empty set means all DMA writes failed (not an error — the
+    // caller treats it as "no keys to complete").
+    // An exception means the DMA thread crashed.
     auto gds_promise =
-        std::make_shared<std::promise<tl::expected<size_t, ErrorCode>>>();
+        std::make_shared<std::promise<std::unordered_set<size_t>>>();
     auto gds_future = gds_promise->get_future();
-    std::thread([this, keys, batched_slices, resp = std::move(resp),
-                 failed_set = std::move(failed_set), p = gds_promise]() {
+    // Capture file_storage_ shared_ptr instead of raw this, so the
+    // detached thread keeps the FileStorage alive for its lifetime.
+    auto fs = file_storage_;
+    std::thread([fs, keys, batched_slices, resp = std::move(resp), failed_set,
+                 p = gds_promise]() {
         try {
             size_t reservation_idx = 0;
-            size_t written = 0;
+            std::unordered_set<size_t> dma_succeeded;
             for (size_t i = 0; i < keys.size(); ++i) {
-                if (failed_set.count(i)) continue;
+                if (failed_set->count(i)) continue;
                 auto &r = resp.reservations[reservation_idx++];
-                auto wr = file_storage_->WriteAtOffset(
-                    keys[i], batched_slices[i], r.offset);
-                if (wr) ++written;
+                auto wr =
+                    fs->WriteAtOffset(keys[i], batched_slices[i], r.offset);
+                if (wr) dma_succeeded.insert(i);
             }
-            p->set_value(written);
+            p->set_value(std::move(dma_succeeded));
         } catch (...) {
             p->set_exception(std::current_exception());
         }
@@ -3796,23 +3806,37 @@ RealClient::batch_put_with_store_reservation(
 
     auto results = client_->BatchPut(keys, mutable_slices, config);
 
+    // Collect DMA-succeeded indices from the GDS thread.
+    // Default-empty set: if the thread times out or crashes, no keys
+    // are considered DMA-complete → none will be completed.
+    std::unordered_set<size_t> dma_succeeded;
     if (gds_future.valid()) {
         auto st = gds_future.wait_for(std::chrono::seconds(120));
         if (st == std::future_status::timeout) {
             LOG(ERROR) << "GDS DMA timed out after 120s.";
         } else {
             try {
-                auto r = gds_future.get();
-                if (!r) LOG(WARNING) << "GDS DMA failed: " << r.error();
+                dma_succeeded = gds_future.get();
+                LOG(INFO) << "GDS DMA completed: " << dma_succeeded.size()
+                          << "/" << (keys.size() - failed_set->size())
+                          << " writes succeeded";
+                if (dma_succeeded.size() < keys.size() - failed_set->size()) {
+                    LOG(WARNING)
+                        << "GDS: some DMA writes failed — "
+                        << "skipping CompleteOffloadSpace for those keys "
+                        << "to keep dirty_=true (heartbeat will retry)";
+                }
             } catch (const std::exception &e) {
                 LOG(ERROR) << "GDS DMA thread crashed: " << e.what();
             }
         }
     }
 
+    // Intersect: reservation succeeded AND DMA succeeded AND RDMA succeeded.
     std::vector<std::string> succeeded_keys;
     for (size_t i = 0; i < keys.size(); ++i) {
-        if (!failed_set.count(i) && results[i].has_value())
+        if (!failed_set->count(i) && dma_succeeded.count(i) &&
+            results[i].has_value())
             succeeded_keys.push_back(keys[i]);
     }
     if (!succeeded_keys.empty()) {
@@ -3907,10 +3931,11 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
     auto gds_cb = [this, &keys, &ordered_batched_slices, tenant = tenant_id_str,
                    p = gds_promise, barrier = notify_barrier]() {
         try {
-            std::thread([this, keys, ordered_batched_slices, tenant, p,
+            auto fs = file_storage_;  // shared_ptr, keeps FileStorage alive
+            std::thread([fs, keys, ordered_batched_slices, tenant, p,
                          barrier]() {
                 try {
-                    auto res = file_storage_->DirectGdsOffload(
+                    auto res = fs->DirectGdsOffload(
                         keys, ordered_batched_slices, tenant, barrier);
                     p->set_value(res);
                 } catch (...) {
@@ -5214,10 +5239,11 @@ RealClient::batch_put_from_multi_buffers_internal(
     auto gds_cb = [this, &keys, &batched_slices, tenant = tenant_id_str,
                    p = gds_promise, barrier = notify_barrier]() {
         try {
-            std::thread([this, keys, batched_slices, tenant, p, barrier]() {
+            auto fs = file_storage_;  // shared_ptr, keeps FileStorage alive
+            std::thread([fs, keys, batched_slices, tenant, p, barrier]() {
                 try {
-                    auto res = file_storage_->DirectGdsOffload(
-                        keys, batched_slices, tenant, barrier);
+                    auto res = fs->DirectGdsOffload(keys, batched_slices,
+                                                    tenant, barrier);
                     p->set_value(res);
                 } catch (...) {
                     p->set_exception(std::current_exception());

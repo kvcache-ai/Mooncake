@@ -21,7 +21,10 @@
 #include <atomic>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
 #include <glog/logging.h>
+
+#include "utils.h"  // GetEnvOr<>
 
 #ifdef USE_GDS_BACKEND
 #include "gds/gds_device_ops.h"
@@ -141,19 +144,31 @@ tl::expected<void, ErrorCode> GdsContext::InitClientDma(
         return tl::make_unexpected(ErrorCode::GDS_NOT_AVAILABLE);
     }
 
-    // DriverOpen — per-context singleton (std::call_once).
-    // NOTE: this is a *separate* call_once from GdsContext::Init() /
+    // DriverOpen — process-level singleton with optional retry.
+    // Uses a manual double-checked lock pattern instead of std::call_once
+    // so that MOONCAKE_GDS_RETRY_DRIVER=1 can force a fresh DriverOpen
+    // attempt after a previous failure (e.g., nvidia-fs.ko loaded late).
+    // NOTE: this is a *separate* singleton from GdsContext::Init() /
     // ProbeGdsAvailable(). If both are called in the same process,
     // DriverOpen() may be invoked twice — this is harmless because
     // cuFileDriverOpen() uses internal reference counting.
-    static std::once_flag driver_once_;
-    static bool driver_ok_ = false;
+    static std::mutex driver_mutex;
+    static bool driver_attempted = false;
+    static bool driver_ok = false;
     auto* raw_ops = ops_.get();
-    std::call_once(driver_once_, [raw_ops]() {
-        driver_ok_ = raw_ops->DriverOpen().IsOk();
-        if (!driver_ok_) LOG(WARNING) << "GDS InitClientDma: DriverOpen failed";
-    });
-    if (!driver_ok_) return tl::make_unexpected(ErrorCode::GDS_NOT_AVAILABLE);
+    {
+        bool should_retry = GetEnvOr<bool>("MOONCAKE_GDS_RETRY_DRIVER", false);
+        std::lock_guard<std::mutex> lock(driver_mutex);
+        if (!driver_attempted || (should_retry && !driver_ok)) {
+            driver_ok = raw_ops->DriverOpen().IsOk();
+            driver_attempted = true;
+            if (!driver_ok)
+                LOG(WARNING) << "GDS InitClientDma: DriverOpen failed";
+            else if (should_retry)
+                LOG(INFO) << "GDS InitClientDma: DriverOpen retry succeeded";
+        }
+    }
+    if (!driver_ok) return tl::make_unexpected(ErrorCode::GDS_NOT_AVAILABLE);
 
     // Open the existing file — no O_CREAT, no O_TRUNC.
     // Guard against double-init: if a previous Init() or InitClientDma()
@@ -166,6 +181,14 @@ tl::expected<void, ErrorCode> GdsContext::InitClientDma(
         }
         ::close(gds_fd_);
         gds_fd_ = -1;
+        // Clear stale buffer registrations — they were registered
+        // against the old cuFile handle and are invalid now.
+        // Without this, EnsureBufferRegistered() returns true for
+        // buffers that are NOT registered with the new handle.
+        {
+            MutexLocker lock(&buf_mutex_);
+            registered_buffers_.clear();
+        }
     }
 
     // Open the existing file — no O_CREAT, no O_TRUNC.
@@ -206,19 +229,29 @@ bool GdsContext::ProbeGdsAvailable(const std::string& data_dir) {
         return false;
     }
 
-    // 2. Driver open — process-level singleton via std::call_once.
-    // If the first call fails the flag is marked "done" and no retry
-    // occurs for the lifetime of this process.
-    static std::once_flag gds_driver_once_;
-    static bool gds_driver_ok_ = false;
+    // 2. Driver open — process-level singleton with optional retry.
+    // Uses a manual double-checked lock pattern so that
+    // MOONCAKE_GDS_RETRY_DRIVER=1 can force a fresh attempt after
+    // a previous failure (e.g., nvidia-fs.ko not yet loaded during
+    // the first probe but loaded later by an admin).
+    static std::mutex probe_driver_mutex;
+    static bool probe_driver_attempted = false;
+    static bool probe_driver_ok = false;
     auto* ops_raw = ops_.get();  // capture by value in lambda
-    std::call_once(gds_driver_once_, [ops_raw]() {
-        gds_driver_ok_ = ops_raw->DriverOpen().IsOk();
-        if (!gds_driver_ok_)
-            LOG(WARNING) << "GDS probe: DriverOpen failed, "
-                         << "GDS will not be available for this process";
-    });
-    if (!gds_driver_ok_) return false;
+    {
+        bool should_retry = GetEnvOr<bool>("MOONCAKE_GDS_RETRY_DRIVER", false);
+        std::lock_guard<std::mutex> lock(probe_driver_mutex);
+        if (!probe_driver_attempted || (should_retry && !probe_driver_ok)) {
+            probe_driver_ok = ops_raw->DriverOpen().IsOk();
+            probe_driver_attempted = true;
+            if (!probe_driver_ok)
+                LOG(WARNING) << "GDS probe: DriverOpen failed, "
+                             << "GDS will not be available for this process";
+            else if (should_retry)
+                LOG(INFO) << "GDS probe: DriverOpen retry succeeded";
+        }
+    }
+    if (!probe_driver_ok) return false;
 
     // 3. End-to-end DMA write/read/verify (RAII cleanup)
     static std::atomic<uint64_t> probe_counter{0};
@@ -521,14 +554,20 @@ void GdsContext::Shutdown() {
         registered_buffers_.clear();
     }
 
-    if (cu_file_handle_) {
-        ops_->FileHandleDeregister(cu_file_handle_);
-        cu_file_handle_ = nullptr;
-    }
+    // Serialize with any in-flight WriteRecord/ReadRecord that holds
+    // io_mutex_. Without this, the I/O thread could be mid-DMA when
+    // we deregister the file handle or close the fd, which is UB in cuFile.
+    {
+        MutexLocker io_lock(&io_mutex_);
+        if (cu_file_handle_) {
+            ops_->FileHandleDeregister(cu_file_handle_);
+            cu_file_handle_ = nullptr;
+        }
 
-    if (gds_fd_ >= 0) {
-        ::close(gds_fd_);
-        gds_fd_ = -1;
+        if (gds_fd_ >= 0) {
+            ::close(gds_fd_);
+            gds_fd_ = -1;
+        }
     }
 
     enabled_ = false;
