@@ -60,6 +60,8 @@ add_store_test(batch_remove_test batch_remove_test.cpp)
 add_store_test(master_service_ssd_test master_service_ssd_test.cpp)
 add_store_test(offload_on_evict_test offload_on_evict_test.cpp)
 add_store_test(promotion_on_hit_test promotion_on_hit_test.cpp)
+add_store_test(promotion_retry_benchmark_test
+               promotion_retry_benchmark_test.cpp)
 add_store_test(file_storage_promotion_test file_storage_promotion_test.cpp)
 add_store_test(master_service_ssd_test_for_snapshot
                ha/snapshot/master_service_ssd_test_for_snapshot.cpp)
