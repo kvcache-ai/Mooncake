@@ -98,6 +98,37 @@ bool submitOne(TransferEngine* engine, SegmentHandle target, void* local,
     return true;
 }
 
+bool expectReadRejected(TransferEngine* engine, SegmentHandle target,
+                        void* local, uint64_t remote) {
+    BatchID batch = engine->allocateBatchID(1);
+    if (batch == mooncake::INVALID_BATCH_ID) return false;
+
+    TransferRequest request{};
+    request.opcode = TransferRequest::READ;
+    request.source = local;
+    request.target_id = target;
+    request.target_offset = remote;
+    request.length = kTransferBytes;
+    auto result = engine->submitTransfer(batch, {request});
+    const bool rejected = result.IsNotSupportedTransport();
+    if (!rejected) {
+        LOG(ERROR) << "NCCL host READ returned " << result.ToString()
+                   << ", expected NotSupportedTransport";
+    }
+
+    TransferStatus status{};
+    auto status_result = engine->getTransferStatus(batch, 0, status);
+    const bool failed =
+        status_result.ok() && status.s == TransferStatusEnum::FAILED;
+    if (!failed) {
+        LOG(ERROR) << "Rejected NCCL host READ did not reach FAILED status";
+    }
+
+    auto free_result = engine->freeBatchID(batch);
+    if (!free_result.ok()) LOG(ERROR) << free_result.ToString();
+    return rejected && failed && free_result.ok();
+}
+
 bool verifyPattern(void* device_ptr, int device, uint8_t expected) {
     std::vector<uint8_t> host(kTransferBytes);
     if (!checkCuda(cudaSetDevice(device), "cudaSetDevice")) return false;
@@ -164,6 +195,12 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    if (!expectReadRejected(engines[0].get(), peer_on_rank0, buffers[0],
+                            reinterpret_cast<uint64_t>(buffers[1]))) {
+        return 1;
+    }
+    LOG(INFO) << "NCCL host READ rejection validation passed";
+
     std::atomic<bool> writes_ok{true};
     std::vector<std::thread> writers;
     if (!checkCuda(cudaSetDevice(0), "cudaSetDevice") ||
@@ -189,17 +226,17 @@ int main(int argc, char** argv) {
 
     if (!checkCuda(cudaSetDevice(1), "cudaSetDevice") ||
         !checkCuda(cudaMemset(buffers[1], 0xa5, kTransferBytes),
-                   "cudaMemset read source") ||
+                   "cudaMemset reverse write source") ||
         !checkCuda(cudaSetDevice(0), "cudaSetDevice") ||
         !checkCuda(cudaMemset(buffers[0], 0, kTransferBytes),
-                   "cudaMemset read destination") ||
-        !submitOne(engines[0].get(), peer_on_rank0, buffers[0],
-                   reinterpret_cast<uint64_t>(buffers[1]),
-                   TransferRequest::READ) ||
+                   "cudaMemset reverse write destination") ||
+        !submitOne(engines[1].get(), peer_on_rank1, buffers[1],
+                   reinterpret_cast<uint64_t>(buffers[0]),
+                   TransferRequest::WRITE) ||
         !verifyPattern(buffers[0], 0, 0xa5)) {
         return 1;
     }
-    LOG(INFO) << "NCCL host READ validation passed";
+    LOG(INFO) << "NCCL host bidirectional WRITE validation passed";
 
     engines[0].reset();
     engines[1].reset();

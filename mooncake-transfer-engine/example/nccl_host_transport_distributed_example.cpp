@@ -125,6 +125,39 @@ bool submitOne(TransferEngine* engine, SegmentHandle target, void* local,
     return result.ok();
 }
 
+bool expectReadRejected(TransferEngine* engine, SegmentHandle target,
+                        void* local, uint64_t remote) {
+    BatchID batch = engine->allocateBatchID(1);
+    if (batch == mooncake::INVALID_BATCH_ID) {
+        LOG(ERROR) << "Failed to allocate READ rejection batch";
+        return false;
+    }
+    TransferRequest request{};
+    request.opcode = TransferRequest::READ;
+    request.source = local;
+    request.target_id = target;
+    request.target_offset = remote;
+    request.length = FLAGS_transfer_bytes;
+    auto result = engine->submitTransfer(batch, {request});
+    const bool rejected = result.IsNotSupportedTransport();
+    if (!rejected) {
+        LOG(ERROR) << "NCCL host READ returned " << result.ToString()
+                   << ", expected NotSupportedTransport";
+    }
+
+    TransferStatus status{};
+    auto status_result = engine->getTransferStatus(batch, 0, status);
+    const bool failed =
+        status_result.ok() && status.s == TransferStatusEnum::FAILED;
+    if (!failed) {
+        LOG(ERROR) << "Rejected NCCL host READ did not reach FAILED status";
+    }
+
+    auto free_result = engine->freeBatchID(batch);
+    if (!free_result.ok()) LOG(ERROR) << free_result.ToString();
+    return rejected && failed && free_result.ok();
+}
+
 bool verifyPattern(void* device_ptr, uint8_t expected) {
     std::vector<uint8_t> host(FLAGS_transfer_bytes);
     if (!checkCuda(cudaMemcpy(host.data(), device_ptr, host.size(),
@@ -229,6 +262,14 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    if (!expectReadRejected(engine.get(), peer_segment, buffer,
+                            peer_buffer_addr)) {
+        return 1;
+    }
+    if (FLAGS_rank == 0) {
+        LOG(INFO) << "NCCL host READ rejection validation passed";
+    }
+
     if (FLAGS_rank == 0) {
         if (!checkCuda(cudaMemset(buffer, 0x5a, FLAGS_transfer_bytes),
                        "cudaMemset write source")) {
@@ -242,24 +283,16 @@ int main(int argc, char** argv) {
         const double first_write_ms = elapsedMilliseconds(first_write_start);
 
         const auto control_start = std::chrono::steady_clock::now();
-        if (!checkCuda(cudaMemset(tx_control, 1, 1), "cudaMemset control") ||
+        if (!checkCuda(cudaMemset(buffer, 0, FLAGS_transfer_bytes),
+                       "cudaMemset reverse write destination") ||
+            !checkCuda(cudaMemset(tx_control, 1, 1), "cudaMemset control") ||
             !submitOne(engine.get(), peer_segment, tx_control,
                        peer_buffer_addr + kBufferBytes + 1, 1,
                        TransferRequest::WRITE) ||
-            !waitForDeviceByte(rx_control, 1) ||
-            !checkCuda(cudaMemset(buffer, 0, FLAGS_transfer_bytes),
-                       "cudaMemset read destination")) {
+            !waitForDeviceByte(rx_control, 1) || !verifyPattern(buffer, 0xa5)) {
             return 1;
         }
-        const double control_ms = elapsedMilliseconds(control_start);
-
-        const auto read_start = std::chrono::steady_clock::now();
-        if (!submitOne(engine.get(), peer_segment, buffer, peer_buffer_addr,
-                       FLAGS_transfer_bytes, TransferRequest::READ) ||
-            !verifyPattern(buffer, 0xa5)) {
-            return 1;
-        }
-        const double read_ms = elapsedMilliseconds(read_start);
+        const double reverse_write_ms = elapsedMilliseconds(control_start);
 
         const auto benchmark_start = std::chrono::steady_clock::now();
         for (int i = 0; i < FLAGS_iterations; ++i) {
@@ -277,8 +310,8 @@ int main(int argc, char** argv) {
         const double usec_per_op =
             seconds * 1.0e6 / std::max(1, FLAGS_iterations);
         LOG(INFO) << "Distributed NCCL host validation passed: cold WRITE "
-                  << first_write_ms << " ms, RMA control sync " << control_ms
-                  << " ms, reverse-PUT READ " << read_ms << " ms; steady WRITE "
+                  << first_write_ms << " ms, reverse WRITE and control sync "
+                  << reverse_write_ms << " ms; steady WRITE "
                   << FLAGS_iterations << " x " << FLAGS_transfer_bytes
                   << " bytes, " << gib / seconds << " GiB/s, " << usec_per_op
                   << " us/op";
@@ -291,7 +324,9 @@ int main(int argc, char** argv) {
     } else {
         if (!waitForDeviceByte(rx_control, 1) || !verifyPattern(buffer, 0x5a) ||
             !checkCuda(cudaMemset(buffer, 0xa5, FLAGS_transfer_bytes),
-                       "cudaMemset read source") ||
+                       "cudaMemset reverse write source") ||
+            !submitOne(engine.get(), peer_segment, buffer, peer_buffer_addr,
+                       FLAGS_transfer_bytes, TransferRequest::WRITE) ||
             !checkCuda(cudaMemset(tx_control, 1, 1), "cudaMemset control") ||
             !submitOne(engine.get(), peer_segment, tx_control,
                        peer_buffer_addr + kBufferBytes + 1, 1,

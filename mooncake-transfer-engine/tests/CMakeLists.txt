@@ -338,8 +338,11 @@ add_executable(show_links_test ${WORKSPACE}/show_links_test.cpp)
 target_link_libraries(show_links_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME show_links_test COMMAND show_links_test)
 
-# Compile-only coverage for the common NCCL/IBGDA remote-put call shape. Keep
-# nvcc optional for host-only DeviceTransport builds that consume JIT kernels.
+# The NCCL transport library target compiles only host-side setup, while the
+# CUDA example that includes the device helpers is opt-in. This probe instantiates
+# one consumer kernel against both header-only NCCL and IBGDA helpers so a
+# call-shape regression fails the build. Keep nvcc optional for host-only
+# DeviceTransport builds that consume JIT kernels.
 if(USE_NCCL_DEVICE AND NOT USE_CXI)
   if(CMAKE_VERSION VERSION_LESS 3.18)
     message(STATUS
