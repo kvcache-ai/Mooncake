@@ -116,9 +116,9 @@ checkpoint class:
 ```
 
 The class thread counts must add up to the fixed `start_num_threads` value.
-An `slo_us` of zero marks a best-effort class. For TENT, a non-zero SLO is also
-sent as the request's relative deadline; the classic backend measures the same
-SLO but ignores the scheduling hint.
+An `slo_us` of zero marks a best-effort class. The SLO is a reporting threshold:
+QoS baseline mode measures whether each completed transfer meets it, without
+changing request scheduling policy on either backend.
 
 The human-readable summary and the optional versioned JSONL record report:
 
