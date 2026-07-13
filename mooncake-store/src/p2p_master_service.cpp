@@ -19,7 +19,7 @@ P2PMasterService::P2PMasterService(const MasterServiceConfig& config)
 }
 
 ErrorCode P2PMasterService::RecordOplog(OpType type, const std::string& key,
-                                        const std::string& payload, bool sync) {
+                                        const std::string& payload) {
     // TODO: Record remaining failover-visible P2P mutations: client crash
     // cleanup, heartbeat state transitions, replica eviction/rebalance, and
     // task metadata.
@@ -28,21 +28,21 @@ ErrorCode P2PMasterService::RecordOplog(OpType type, const std::string& key,
         return ErrorCode::OK;
     }
 
-    if (sync) {
-        auto result = manager->AppendAndPersist(type, key, payload);
-        if (!result.has_value()) {
-            LOG(ERROR) << "P2PMasterService: failed to persist oplog"
-                       << ", op_type=" << static_cast<int>(type)
-                       << ", key=" << key
-                       << ", error=" << toString(result.error());
-            return result.error();
-        }
-    } else {
-        manager->Append(type, key, payload);
+    auto result = manager->AppendAndPersist(type, key, payload);
+    if (!result.has_value()) {
+        LOG(ERROR) << "P2PMasterService: failed to persist oplog"
+                   << ", op_type=" << static_cast<int>(type) << ", key=" << key
+                   << ", error=" << toString(result.error());
+        return result.error();
     }
     return ErrorCode::OK;
 }
 
+// TODO: Make client/segment lifecycle updates transactional with oplog
+// persistence. These wrappers currently call MasterService first, so an oplog
+// persistence failure can leave Primary memory ahead of Standby. A robust fix
+// needs a separate prepare/log/apply flow or durable retry/outbox mechanism;
+// local rollback is fragile because these calls have nested side effects.
 auto P2PMasterService::RegisterClient(const RegisterClientRequest& req)
     -> tl::expected<RegisterClientResponse, ErrorCode> {
     if (GetClientManager().GetClient(req.client_id)) {
@@ -59,6 +59,9 @@ auto P2PMasterService::RegisterClient(const RegisterClientRequest& req)
 
     auto result = MasterService::RegisterClient(req);
     if (!result.has_value()) {
+        LOG(ERROR) << "RegisterClient(P2P): failed"
+                   << ", client_id=" << req.client_id
+                   << ", error=" << result.error();
         return result;
     }
 
@@ -70,6 +73,8 @@ auto P2PMasterService::RegisterClient(const RegisterClientRequest& req)
     auto err =
         RecordOplog(OpType_REGISTER_CLIENT, "", SerializeP2PPayload(payload));
     if (err != ErrorCode::OK) {
+        LOG(ERROR) << "RegisterClient(P2P): failed to record oplog"
+                   << ", client_id=" << req.client_id << ", error=" << err;
         return tl::make_unexpected(err);
     }
     return result;
@@ -79,6 +84,9 @@ auto P2PMasterService::UnregisterClient(const UnregisterClientRequest& req)
     -> tl::expected<UnregisterClientResponse, ErrorCode> {
     auto result = MasterService::UnregisterClient(req);
     if (!result.has_value()) {
+        LOG(ERROR) << "UnregisterClient(P2P): failed"
+                   << ", client_id=" << req.client_id
+                   << ", error=" << result.error();
         return result;
     }
 
@@ -87,6 +95,8 @@ auto P2PMasterService::UnregisterClient(const UnregisterClientRequest& req)
     auto err =
         RecordOplog(OpType_UNREGISTER_CLIENT, "", SerializeP2PPayload(payload));
     if (err != ErrorCode::OK) {
+        LOG(ERROR) << "UnregisterClient(P2P): failed to record oplog"
+                   << ", client_id=" << req.client_id << ", error=" << err;
         return tl::make_unexpected(err);
     }
     return result;
@@ -97,6 +107,11 @@ auto P2PMasterService::MountSegment(const Segment& segment,
     -> tl::expected<void, ErrorCode> {
     auto result = MasterService::MountSegment(segment, client_id);
     if (!result.has_value()) {
+        LOG(ERROR) << "MountSegment(P2P): failed"
+                   << ", client_id=" << client_id
+                   << ", segment_id=" << segment.id
+                   << ", segment_name=" << segment.name
+                   << ", error=" << result.error();
         return result;
     }
 
@@ -106,6 +121,10 @@ auto P2PMasterService::MountSegment(const Segment& segment,
     auto err =
         RecordOplog(OpType_MOUNT_SEGMENT, "", SerializeP2PPayload(payload));
     if (err != ErrorCode::OK) {
+        LOG(ERROR) << "MountSegment(P2P): failed to record oplog"
+                   << ", client_id=" << client_id
+                   << ", segment_id=" << segment.id
+                   << ", segment_name=" << segment.name << ", error=" << err;
         return tl::make_unexpected(err);
     }
     return {};
@@ -116,6 +135,10 @@ auto P2PMasterService::UnmountSegment(const UUID& segment_id,
     -> tl::expected<void, ErrorCode> {
     auto result = MasterService::UnmountSegment(segment_id, client_id);
     if (!result.has_value()) {
+        LOG(ERROR) << "UnmountSegment(P2P): failed"
+                   << ", client_id=" << client_id
+                   << ", segment_id=" << segment_id
+                   << ", error=" << result.error();
         return result;
     }
 
@@ -125,6 +148,9 @@ auto P2PMasterService::UnmountSegment(const UUID& segment_id,
     auto err =
         RecordOplog(OpType_UNMOUNT_SEGMENT, "", SerializeP2PPayload(payload));
     if (err != ErrorCode::OK) {
+        LOG(ERROR) << "UnmountSegment(P2P): failed to record oplog"
+                   << ", client_id=" << client_id
+                   << ", segment_id=" << segment_id << ", error=" << err;
         return tl::make_unexpected(err);
     }
     return {};
@@ -390,6 +416,10 @@ tl::expected<void, ErrorCode> P2PMasterService::InnerAddReplica(
             RecordOplog(OpType_ADD_REPLICA, payload.object_key,
                         SerializeP2PPayload(payload));
         if (record_err != ErrorCode::OK) {
+            LOG(ERROR) << "AddReplica(P2P): failed to record oplog"
+                       << ", key=" << key << ", client_id=" << client_id
+                       << ", segment_id=" << segment_id
+                       << ", error=" << record_err;
             return tl::make_unexpected(record_err);
         }
         AddReplicaToSegmentIndex(shard, it->first, new_replica);
@@ -409,6 +439,10 @@ tl::expected<void, ErrorCode> P2PMasterService::InnerAddReplica(
             RecordOplog(OpType_ADD_REPLICA, payload.object_key,
                         SerializeP2PPayload(payload));
         if (record_err != ErrorCode::OK) {
+            LOG(ERROR) << "AddReplica(P2P): failed to record oplog"
+                       << ", key=" << key << ", client_id=" << client_id
+                       << ", segment_id=" << segment_id
+                       << ", error=" << record_err;
             return tl::make_unexpected(record_err);
         }
         auto emplace_it =
@@ -459,6 +493,10 @@ tl::expected<void, ErrorCode> P2PMasterService::InnerRemoveReplica(
                 RecordOplog(OpType_REMOVE_REPLICA, payload.object_key,
                             SerializeP2PPayload(payload));
             if (record_err != ErrorCode::OK) {
+                LOG(ERROR) << "RemoveReplica(P2P): failed to record oplog"
+                           << ", key=" << key << ", client_id=" << client_id
+                           << ", segment_id=" << segment_id
+                           << ", error=" << record_err;
                 return tl::make_unexpected(record_err);
             }
             RemoveReplicaFromSegmentIndex(shard, it->first, *rit);

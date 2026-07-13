@@ -71,8 +71,7 @@ class P2PMasterService : public MasterService {
     auto SetSyncCompleted(UUID client_id) -> tl::expected<void, ErrorCode>;
 
     ErrorCode RecordOplog(OpType type, const std::string& key,
-                          const std::string& payload = std::string(),
-                          bool sync = true);
+                          const std::string& payload = std::string());
 
     std::vector<Replica::Descriptor> FilterReplicas(
         const GetReplicaListRequestConfig& config,
