@@ -1651,6 +1651,25 @@ Status TransferEngineImpl::finishQueuedOwner(
     return Status::OK();
 }
 
+Status TransferEngineImpl::cancelQueuedOwner(QueueOwnerId owner_id) {
+    auto queued_it = queued_owners_.find(owner_id);
+    if (queued_it == queued_owners_.end()) {
+        return Status::InvalidEntry("queued owner not found" LOC_MARK);
+    }
+    if (queued_it->second.in_dispatch_window) {
+        return Status::InvalidEntry(
+            "queued owner is already dispatching" LOC_MARK);
+    }
+    CHECK_STATUS(runtime_queue_->cancel(owner_id));
+    for (const auto task_id : queued_it->second.public_task_ids) {
+        auto& task = queued_it->second.batch->task_list[task_id];
+        task.cancel_requested = true;
+        task.status = CANCELED;
+    }
+    queued_owners_.erase(queued_it);
+    return Status::OK();
+}
+
 Status TransferEngineImpl::retireQueueForBatch(Batch* batch) {
     if (!batch || batch->queue_token == 0) return Status::OK();
     auto status = runtime_queue_->retireBatch(batch->queue_token);
@@ -1899,6 +1918,75 @@ Status TransferEngineImpl::submitTransfer(
                           QueueOwnerKind::User);
 }
 
+Status TransferEngineImpl::cancelTransfer(BatchID batch_id, size_t task_id) {
+    if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
+    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+    if (!alive_batches_.count(batch_id)) {
+        return Status::InvalidArgument("Batch is not alive" LOC_MARK);
+    }
+    auto* batch = reinterpret_cast<Batch*>(batch_id);
+    if (task_id >= batch->task_list.size()) {
+        return Status::InvalidArgument("Invalid task ID" LOC_MARK);
+    }
+
+    size_t owner_task_id = task_id;
+    if (runtime_queue_config_.enabled && batch->queue_token != 0) {
+        QueueOwnerId owner_id = 0;
+        auto resolve_status =
+            runtime_queue_->resolveOwner(batch->queue_token, task_id, owner_id);
+        if (resolve_status.ok()) {
+            auto queued_it = queued_owners_.find(owner_id);
+            if (queued_it == queued_owners_.end()) {
+                TransferStatusEnum public_status = PENDING;
+                CHECK_STATUS(runtime_queue_->getPublicStatus(
+                    batch->queue_token, task_id, public_status));
+                return public_status != PENDING
+                           ? Status::OK()
+                           : Status::InvalidEntry(
+                                 "queued owner metadata missing" LOC_MARK);
+            }
+            owner_task_id = queued_it->second.owner_task_id;
+            if (!queued_it->second.in_dispatch_window) {
+                CHECK_STATUS(cancelQueuedOwner(owner_id));
+                CHECK_STATUS(refillDispatchWindow());
+                notifyRuntimeQueueReady();
+                return Status::OK();
+            }
+        }
+    }
+
+    auto& owner = batch->task_list[owner_task_id];
+    if (owner.status != PENDING) return Status::OK();
+    if (owner.staging) {
+        return Status::NotImplemented(
+            "staging transfer cancellation is not implemented" LOC_MARK);
+    }
+    if (owner.type == UNSPEC) {
+        owner.cancel_requested = true;
+        owner.status = CANCELED;
+        return Status::OK();
+    }
+    auto& transport = transport_list_[owner.type];
+    auto& sub_batch = batch->sub_batch[owner.type];
+    if (!transport || !sub_batch) {
+        return Status::InvalidArgument("Transport not available" LOC_MARK);
+    }
+    if (!transport->supportsCancellation()) {
+        return Status::NotImplemented(
+            "selected transport does not support cancellation" LOC_MARK);
+    }
+
+    CHECK_STATUS(transport->cancelTransferTask(sub_batch, owner.sub_task_id));
+    // Merged public tasks share one physical transport task. Mark every alias
+    // so polling any of them cannot trigger failover after cancellation.
+    for (auto& task : batch->task_list) {
+        if (task.type == owner.type && task.sub_task_id == owner.sub_task_id) {
+            task.cancel_requested = true;
+        }
+    }
+    return Status::OK();
+}
+
 Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
     auto& task = batch->task_list[task_id];
     auto prev_type = task.type;
@@ -1968,7 +2056,8 @@ void TransferEngineImpl::updateTaskStatusAfterPoll(Batch* batch, size_t task_id,
                                                    bool allow_failover) {
     auto& task = batch->task_list[task_id];
     task.status = task_status.s;
-    if (!allow_failover || task_status.s != FAILED || task.type == UNSPEC)
+    if (!allow_failover || task.cancel_requested || task_status.s != FAILED ||
+        task.type == UNSPEC)
         return;
 
     if (resubmitTransferTask(batch, task_id).ok()) {
