@@ -72,19 +72,23 @@ struct mlx5gda_qp {
     uint32_t num_wqebb;
     size_t wq_offset;
     size_t dbr_offset;
+    size_t ready_offset;
 };
 
 struct mlx5gda_qp_devctx {
     uint32_t qpn;         // QP number
     uint32_t wqeid_mask;  // = num_wqebb - 1
-    uint32_t mutex;
+    uint32_t mutex;       // doorbell flush mutex
     struct mlx5gda_wqebb *wq;
+    uint32_t *wq_ready;
     struct mlx5_cqe64 *cq;
     struct mlx5gda_wq_dbr *dbr;
     char *bf;
     uint32_t bf_offset;  // toggle on every post
-    uint16_t wq_head;    // next free wqeid
-    uint16_t wq_tail;    // last non-completed wqeid
+    uint32_t wq_head_atomic;
+    uint32_t db_head;
+    uint16_t wq_head;  // last doorbelled wqeid, low 16 bits
+    uint16_t wq_tail;  // last non-completed wqeid
 };
 
 struct mlx5gda_create_qp_failure {

@@ -266,6 +266,7 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(struct mlx5dv_pd mpd, void* ctrl_buf,
     struct mlx5dv_devx_obj* mlx5_qp = NULL;
     size_t wq_offset = -1;
     size_t dbr_offset = -1;
+    size_t ready_offset = -1;
 
     struct ibv_context* ctx = pd->context;
     void* qp_context = NULL;
@@ -356,6 +357,25 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(struct mlx5dv_pd mpd, void* ctrl_buf,
         }
     }
 
+    ready_offset =
+        memheap_aligned_alloc(ctrl_buf_heap, num_wqebb * sizeof(uint32_t),
+                              (size_t)1 << MLX5_ADAPTER_PAGE_SHIFT);
+    if (ready_offset == -1) {
+        perror("Failed to allocate WQ ready memory");
+        goto fail;
+    }
+    if (ctrl_host) {
+        memset(static_cast<char*>(ctrl_buf) + ready_offset, 0,
+               num_wqebb * sizeof(uint32_t));
+    } else {
+        if (cudaMemsetAsync(static_cast<char*>(ctrl_buf) + ready_offset, 0,
+                            num_wqebb * sizeof(uint32_t),
+                            stream) != cudaSuccess) {
+            print_cuda_error("Failed to zero WQ ready memory");
+            goto fail;
+        }
+    }
+
     DEVX_SET(create_qp_in, cmd_in, opcode, MLX5_CMD_OP_CREATE_QP);
     DEVX_SET(create_qp_in, cmd_in, wq_umem_id,
              ctrl_buf_umem->umem_id);  // WQ buffer
@@ -409,6 +429,7 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(struct mlx5dv_pd mpd, void* ctrl_buf,
     qp->num_wqebb = num_wqebb;
     qp->wq_offset = wq_offset;
     qp->dbr_offset = dbr_offset;
+    qp->ready_offset = ready_offset;
     return qp;
 
 fail:
@@ -431,6 +452,9 @@ fail:
     if (dbr_offset != -1) {
         memheap_free(ctrl_buf_heap, dbr_offset);
     }
+    if (ready_offset != -1) {
+        memheap_free(ctrl_buf_heap, ready_offset);
+    }
     errno = saved_errno;
     return NULL;
 }
@@ -450,6 +474,9 @@ void mlx5gda_destroy_qp(struct memheap* ctrl_buf_heap, struct mlx5gda_qp* qp) {
     }
     if (qp->dbr_offset != -1) {
         memheap_free(ctrl_buf_heap, qp->dbr_offset);
+    }
+    if (qp->ready_offset != -1) {
+        memheap_free(ctrl_buf_heap, qp->ready_offset);
     }
     if (qp) {
         free(qp);
