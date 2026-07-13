@@ -293,8 +293,11 @@ if(ENABLE_MULTI_PROTOCOL)
   add_test(NAME mp_transport_test COMMAND mp_transport_test)
 endif()
 
-# Compile-only coverage for the common NCCL/IBGDA remote-put call shape. Keep
-# nvcc optional for host-only DeviceTransport builds that consume JIT kernels.
+# The NCCL transport library target compiles only host-side setup, while the
+# CUDA example that includes the device helpers is opt-in. This probe instantiates
+# one consumer kernel against both header-only NCCL and IBGDA helpers so a
+# call-shape regression fails the build. Keep nvcc optional for host-only
+# DeviceTransport builds that consume JIT kernels.
 if(USE_NCCL_DEVICE AND NOT USE_CXI)
   if(CMAKE_VERSION VERSION_LESS 3.18)
     message(STATUS

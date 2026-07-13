@@ -57,8 +57,10 @@ __device__ __forceinline__ void exchange(const typename Ops::Context& ctx,
              lane);
 }
 
-// These kernels are compile probes. They deliberately share the same templated
-// operation and are never executed, so the test needs neither GPUs nor NICs.
+// The NCCL transport library target does not instantiate these header-only
+// device helpers; its CUDA example is opt-in. These compile probes deliberately
+// share the same templated operation and are never executed, so the test needs
+// neither GPUs nor NICs.
 __global__ void instantiateNccl(NcclOps::Context ctx, int channel, int peer,
                                 int qps_per_rank, const void* source,
                                 void* destination, uint32_t bytes, int lane) {

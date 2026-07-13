@@ -114,10 +114,6 @@ bool hasIntField(const Json::Value& value, const char* name) {
     return value.isObject() && value.isMember(name) && value[name].isInt();
 }
 
-bool hasUInt64Field(const Json::Value& value, const char* name) {
-    return value.isObject() && value.isMember(name) && value[name].isUInt64();
-}
-
 bool hasArrayField(const Json::Value& value, const char* name) {
     return value.isObject() && value.isMember(name) && value[name].isArray();
 }
@@ -260,8 +256,6 @@ class NcclSession {
 
     const std::string& uniqueIdString() const { return unique_id_string_; }
     int rank() const { return rank_; }
-    int localDevice() const { return local_device_; }
-    int peerDevice() const { return peer_device_; }
 
     void start() {
         std::lock_guard<std::mutex> lock(state_mutex_);
@@ -334,40 +328,6 @@ class NcclSession {
             return -1;
         }
         return 0;
-    }
-
-    int putAndWait(const void* source, int owner_rank, uint64_t dest_addr,
-                   size_t length, std::string* error) {
-        int saved_device = -1;
-        cudaGetDevice(&saved_device);
-        cudaError_t cuda_result = cudaSetDevice(local_device_);
-        if (cuda_result != cudaSuccess) {
-            if (error) *error = cudaError(cuda_result, "cudaSetDevice");
-            return -1;
-        }
-
-        cudaEvent_t event = nullptr;
-        cuda_result = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
-        if (cuda_result != cudaSuccess) {
-            if (saved_device >= 0) cudaSetDevice(saved_device);
-            if (error) *error = cudaError(cuda_result, "cudaEventCreate");
-            return -1;
-        }
-
-        int result =
-            enqueuePut(source, owner_rank, dest_addr, length, event, error);
-        if (result == 0) {
-            cuda_result = cudaEventSynchronize(event);
-            if (cuda_result != cudaSuccess) {
-                if (error) {
-                    *error = cudaError(cuda_result, "cudaEventSynchronize");
-                }
-                result = -1;
-            }
-        }
-        cudaEventDestroy(event);
-        if (saved_device >= 0) cudaSetDevice(saved_device);
-        return result;
     }
 
    private:
@@ -547,7 +507,7 @@ class NcclHostTransport::Impl {
     explicit Impl(NcclHostTransport* owner) : owner_(owner) {}
 
     ~Impl() {
-        if (metadata_) {
+        if (metadata_ && handshake_handler_registered_) {
             metadata_->unregisterHandshakeHandler(kHandshakeProtocol);
         }
 
@@ -591,10 +551,11 @@ class NcclHostTransport::Impl {
                 return onHandshake(peer, local);
             });
         if (result != 0) return result;
+        handshake_handler_registered_ = true;
 
-        result = metadata_->startHandshakeDaemon(
-            nullptr, metadata_->localRpcMeta().rpc_port,
-            metadata_->localRpcMeta().sockfd);
+        result =
+            metadata_->startHandshakeDaemon(metadata_->localRpcMeta().rpc_port,
+                                            metadata_->localRpcMeta().sockfd);
         if (result != 0) return result;
         return metadata_->updateLocalSegmentDesc();
     }
@@ -697,6 +658,18 @@ class NcclHostTransport::Impl {
             __sync_fetch_and_add(&task->slice_count, 1);
 
             std::string error;
+            if (request.opcode != TransferRequest::WRITE) {
+                error =
+                    "NCCL host transport supports WRITE only; NCCL "
+                    "exposes no public host-side Get operation";
+                slice->markFailed();
+                if (overall.ok()) {
+                    overall = Status::NotSupportedTransport(error);
+                }
+                LOG(ERROR) << "[Host NCCL] submit failed: " << error;
+                continue;
+            }
+
             auto target = metadata_->getSegmentDescByID(request.target_id);
             if (!target) {
                 error = "Target segment metadata is unavailable";
@@ -729,7 +702,7 @@ class NcclHostTransport::Impl {
                                              remote_buffer.device_id, &error);
             }
 
-            if (error.empty() && request.opcode == TransferRequest::WRITE) {
+            if (error.empty()) {
                 int saved_device = -1;
                 cudaGetDevice(&saved_device);
                 cudaSetDevice(local_device);
@@ -749,12 +722,6 @@ class NcclHostTransport::Impl {
                         slice->status = Slice::POSTED;
                     }
                 }
-            } else if (error.empty()) {
-                if (requestReversePut(session, target->name, request.source,
-                                      request.target_offset, request.length,
-                                      &error) == 0) {
-                    slice->markSuccess();
-                }
             }
 
             if (!error.empty()) {
@@ -769,7 +736,7 @@ class NcclHostTransport::Impl {
                 }
                 LOG(ERROR) << "[Host NCCL] submit failed: " << error;
                 slice->markFailed();
-                overall = Status::Context(error);
+                if (overall.ok()) overall = Status::Context(error);
             }
         }
         return overall;
@@ -957,17 +924,6 @@ class NcclHostTransport::Impl {
         return false;
     }
 
-    bool isLocalBuffer(uint64_t addr, size_t length, int device_id) const {
-        std::lock_guard<std::mutex> lock(buffers_mutex_);
-        for (const auto& buffer : local_buffers_) {
-            if (buffer.device_id == device_id &&
-                containsRange(buffer, addr, length)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
     bool selectBootstrapId(const std::string& key,
                            const std::string& proposed_id, bool may_create,
                            ncclUniqueId* unique_id, std::string* encoded_id,
@@ -1128,11 +1084,6 @@ class NcclHostTransport::Impl {
                 if (handleBootstrap(request, &response, &error) != 0) {
                     local_desc.reply_msg = error;
                 }
-            } else if (op == "reverse_put") {
-                if (handleReversePut(request, &error) != 0) {
-                    local_desc.reply_msg = error;
-                }
-                response["status"] = error.empty() ? "ok" : "error";
             } else {
                 local_desc.reply_msg = "Unknown NCCL handshake operation";
             }
@@ -1222,94 +1173,6 @@ class NcclHostTransport::Impl {
         return 0;
     }
 
-    int requestReversePut(const std::shared_ptr<NcclSession>& session,
-                          const std::string& peer_name, void* destination,
-                          uint64_t remote_source, size_t length,
-                          std::string* error) {
-        Json::Value request;
-        request["op"] = "reverse_put";
-        request["peer_name"] = local_server_name_;
-        request["local_device"] = session->localDevice();
-        request["remote_device"] = session->peerDevice();
-        request["source"] = static_cast<Json::UInt64>(remote_source);
-        request["destination"] =
-            static_cast<Json::UInt64>(reinterpret_cast<uint64_t>(destination));
-        request["length"] = static_cast<Json::UInt64>(length);
-
-        HandShakeDesc local_desc;
-        local_desc.protocol = kHandshakeProtocol;
-        local_desc.payload = encodeJson(request);
-        HandShakeDesc peer_desc;
-        int result = metadata_->sendHandshake(peer_name, local_desc, peer_desc);
-        if (result != 0) {
-            if (error) {
-                *error =
-                    "NCCL READ compatibility path failed to issue reverse PUT";
-            }
-            return -1;
-        }
-        Json::Value response;
-        std::string parse_error;
-        if (!decodeJson(peer_desc.payload, &response, &parse_error) ||
-            !hasStringField(response, "status") ||
-            response["status"].asString() != "ok") {
-            if (error) {
-                *error = "Invalid NCCL reverse PUT response";
-                if (!parse_error.empty()) *error += ": " + parse_error;
-            }
-            return -1;
-        }
-        return 0;
-    }
-
-    int handleReversePut(const Json::Value& request, std::string* error) {
-        if (!hasStringField(request, "peer_name") ||
-            !hasIntField(request, "local_device") ||
-            !hasIntField(request, "remote_device") ||
-            !hasUInt64Field(request, "source") ||
-            !hasUInt64Field(request, "destination") ||
-            !hasUInt64Field(request, "length")) {
-            if (error) *error = "Malformed NCCL reverse PUT request";
-            return -1;
-        }
-        const std::string peer_name = request["peer_name"].asString();
-        const int peer_device = request["local_device"].asInt();
-        const int local_device = request["remote_device"].asInt();
-        const uint64_t source = request["source"].asUInt64();
-        const uint64_t destination = request["destination"].asUInt64();
-        const uint64_t encoded_length = request["length"].asUInt64();
-        if (peer_name.empty() || local_device < 0 || peer_device < 0 ||
-            !source || !destination || !encoded_length ||
-            encoded_length > std::numeric_limits<size_t>::max() ||
-            encoded_length > std::numeric_limits<uint64_t>::max() - source ||
-            encoded_length >
-                std::numeric_limits<uint64_t>::max() - destination) {
-            if (error) *error = "Invalid NCCL reverse PUT request";
-            return -1;
-        }
-        const size_t length = static_cast<size_t>(encoded_length);
-        if (!isLocalBuffer(source, length, local_device)) {
-            if (error) *error = "NCCL READ source is not registered";
-            return -1;
-        }
-
-        const std::string key = makeSessionKey(local_server_name_, local_device,
-                                               peer_name, peer_device);
-        std::shared_ptr<NcclSession> session;
-        {
-            std::lock_guard<std::mutex> lock(sessions_mutex_);
-            auto it = sessions_.find(key);
-            if (it == sessions_.end()) {
-                if (error) *error = "NCCL session is unavailable for READ";
-                return -1;
-            }
-            session = it->second;
-        }
-        const int owner_rank = session->rank() == 0 ? 1 : 0;
-        return session->putAndWait(reinterpret_cast<const void*>(source),
-                                   owner_rank, destination, length, error);
-    }
-
     NcclHostTransport* owner_;
     std::string local_server_name_;
     std::shared_ptr<TransferMetadata> metadata_;
@@ -1320,6 +1183,7 @@ class NcclHostTransport::Impl {
     std::mutex sessions_mutex_;
     std::unordered_map<std::string, std::shared_ptr<NcclSession>> sessions_;
     std::unordered_map<std::string, std::string> bootstrap_ids_;
+    bool handshake_handler_registered_ = false;
 };
 
 NcclHostTransport::NcclHostTransport() : impl_(std::make_unique<Impl>(this)) {}

@@ -99,8 +99,13 @@ struct TransferHandshakeUtil {
 
     static int decode(Json::Value root, TransferMetadata::HandShakeDesc &desc) {
         if (!root.isObject()) return ERR_INVALID_ARGUMENT;
-        for (const char *field : {"protocol", "payload", "local_nic_path",
-                                  "local_gid", "peer_nic_path", "reply_msg"}) {
+        for (const char *field : {"protocol", "payload"}) {
+            if (root.isMember(field) && !root[field].isString()) {
+                return ERR_INVALID_ARGUMENT;
+            }
+        }
+        for (const char *field :
+             {"local_nic_path", "local_gid", "peer_nic_path", "reply_msg"}) {
             if (root.isMember(field) && !root[field].isString()) {
                 return ERR_INVALID_ARGUMENT;
             }
@@ -138,8 +143,19 @@ struct TransferHandshakeUtil {
         }
 #endif
 
-        desc.protocol = root["protocol"].asString();
-        desc.payload = root["payload"].asString();
+        if (root.isMember("protocol")) {
+            desc.protocol = root["protocol"].asString();
+        } else {
+            // Older Transfer Engine versions do not send this field. An empty
+            // protocol selects the legacy/default handshake handler.
+            desc.protocol.clear();
+        }
+        if (root.isMember("payload")) {
+            desc.payload = root["payload"].asString();
+        } else {
+            // The legacy handshake schema has no transport-specific payload.
+            desc.payload.clear();
+        }
         desc.local_nic_path = root["local_nic_path"].asString();
         if (root.isMember("local_lid") && root["local_lid"].isUInt()) {
             desc.local_lid = root["local_lid"].asUInt();
@@ -548,6 +564,8 @@ int TransferMetadata::updateSegmentDesc(const std::string &segment_name,
 }
 
 int TransferMetadata::removeSegmentDesc(const std::string &segment_name) {
+    // Serialize teardown with local descriptor publication. Otherwise a
+    // concurrent update can recreate the key after it has been removed.
     std::lock_guard<std::mutex> txn_guard(local_segment_txn_mutex_);
     if (p2p_handshake_mode_) {
         RWSpinlock::WriteGuard guard(segment_lock_);
@@ -1347,29 +1365,7 @@ int TransferMetadata::addRpcMetaEntry(const std::string &server_name,
     local_rpc_meta_ = desc;
 
     if (p2p_handshake_mode_) {
-        handshake_plugin_->registerOnMetadataCallBack(
-            [this](const Json::Value &peer, Json::Value &local) -> int {
-                return receivePeerMetadata(peer, local);
-            });
-        handshake_plugin_->registerOnNotifyCallBack(
-            [this](const Json::Value &peer, Json::Value &local) -> int {
-                return receivePeerNotify(peer, local);
-            });
-        handshake_plugin_->registerOnProbeCallBack(
-            [this](const Json::Value &peer, Json::Value &local) -> int {
-                return receivePeerProbe(peer, local);
-            });
-
-        int rc = handshake_plugin_->startDaemon(desc.rpc_port, desc.sockfd);
-        if (rc != 0) {
-            return rc;
-        }
-        {
-            std::lock_guard<std::mutex> lock(handshake_handler_mutex_);
-            handshake_daemon_started_ = true;
-        }
-
-        return 0;
+        return startHandshakeDaemon(desc.rpc_port, desc.sockfd);
     }
 
     Json::Value rpcMetaJSON;
@@ -1447,79 +1443,86 @@ int TransferMetadata::getRpcMetaEntry(const std::string &server_name,
     return 0;
 }
 
-int TransferMetadata::startHandshakeDaemon(
-    OnReceiveHandShake on_receive_handshake, uint16_t listen_port, int sockfd) {
-    bool start_daemon = false;
-    {
-        std::lock_guard<std::mutex> lock(handshake_handler_mutex_);
-        if (on_receive_handshake) {
-            default_handshake_handler_ = std::move(on_receive_handshake);
-        }
-        if (!handshake_daemon_started_) {
-            handshake_daemon_started_ = true;
-            start_daemon = true;
-        }
-    }
+int TransferMetadata::updateDefaultHandshakeHandler(
+    OnReceiveHandShake on_receive_handshake) {
+    if (!on_receive_handshake) return ERR_INVALID_ARGUMENT;
 
-    handshake_plugin_->registerOnConnectionCallBack(
-        [this](const Json::Value &peer, Json::Value &local) -> int {
-            HandShakeDesc local_desc, peer_desc;
-            try {
-                if (TransferHandshakeUtil::decode(peer, peer_desc) != 0) {
-                    local_desc.reply_msg = "Malformed transfer handshake";
+    std::lock_guard<std::mutex> lock(handshake_handler_mutex_);
+    default_handshake_handler_ = std::move(on_receive_handshake);
+    return 0;
+}
+
+int TransferMetadata::startHandshakeDaemon(uint16_t listen_port, int sockfd) {
+    std::call_once(handshake_callbacks_once_, [this]() {
+        handshake_plugin_->registerOnConnectionCallBack(
+            [this](const Json::Value &peer, Json::Value &local) -> int {
+                HandShakeDesc local_desc, peer_desc;
+                try {
+                    if (TransferHandshakeUtil::decode(peer, peer_desc) != 0) {
+                        local_desc.reply_msg = "Malformed transfer handshake";
+                        local = TransferHandshakeUtil::encode(local_desc);
+                        return 0;
+                    }
+                } catch (const Json::Exception &exception) {
+                    local_desc.reply_msg = "Malformed transfer handshake: " +
+                                           std::string(exception.what());
                     local = TransferHandshakeUtil::encode(local_desc);
                     return 0;
                 }
-            } catch (const Json::Exception &exception) {
-                local_desc.reply_msg = "Malformed transfer handshake: " +
-                                       std::string(exception.what());
+
+                OnReceiveHandShake handler;
+                {
+                    std::lock_guard<std::mutex> lock(handshake_handler_mutex_);
+                    if (!peer_desc.protocol.empty()) {
+                        auto it = handshake_handlers_.find(peer_desc.protocol);
+                        if (it != handshake_handlers_.end()) {
+                            handler = it->second;
+                        }
+                    } else {
+                        handler = default_handshake_handler_;
+                    }
+                }
+
+                local_desc.protocol = peer_desc.protocol;
+                if (handler) {
+                    int ret = handler(peer_desc, local_desc);
+                    if (ret) return ret;
+                } else {
+                    local_desc.reply_msg =
+                        peer_desc.protocol.empty()
+                            ? "No default handshake handler is registered"
+                            : "Unsupported handshake protocol: " +
+                                  peer_desc.protocol;
+                }
                 local = TransferHandshakeUtil::encode(local_desc);
                 return 0;
-            }
-
-            OnReceiveHandShake handler;
-            {
-                std::lock_guard<std::mutex> lock(handshake_handler_mutex_);
-                if (!peer_desc.protocol.empty()) {
-                    auto it = handshake_handlers_.find(peer_desc.protocol);
-                    if (it != handshake_handlers_.end()) handler = it->second;
-                } else {
-                    handler = default_handshake_handler_;
-                }
-            }
-
-            local_desc.protocol = peer_desc.protocol;
-            if (handler) {
-                int ret = handler(peer_desc, local_desc);
-                if (ret) return ret;
-            } else {
-                local_desc.reply_msg =
-                    peer_desc.protocol.empty()
-                        ? "No default handshake handler is registered"
-                        : "Unsupported handshake protocol: " +
-                              peer_desc.protocol;
-            }
-            local = TransferHandshakeUtil::encode(local_desc);
-            return 0;
-        });
-    handshake_plugin_->registerOnNotifyCallBack(
-        [this](const Json::Value &peer, Json::Value &local) -> int {
-            return receivePeerNotify(peer, local);
-        });
-    handshake_plugin_->registerOnProbeCallBack(
-        [this](const Json::Value &peer, Json::Value &local) -> int {
-            return receivePeerProbe(peer, local);
-        });
-
-    if (start_daemon) {
-        int rc = handshake_plugin_->startDaemon(listen_port, sockfd);
-        if (rc != 0) {
-            std::lock_guard<std::mutex> lock(handshake_handler_mutex_);
-            handshake_daemon_started_ = false;
-            return rc;
+            });
+        if (p2p_handshake_mode_) {
+            handshake_plugin_->registerOnMetadataCallBack(
+                [this](const Json::Value &peer, Json::Value &local) -> int {
+                    return receivePeerMetadata(peer, local);
+                });
         }
+        handshake_plugin_->registerOnNotifyCallBack(
+            [this](const Json::Value &peer, Json::Value &local) -> int {
+                return receivePeerNotify(peer, local);
+            });
+        handshake_plugin_->registerOnProbeCallBack(
+            [this](const Json::Value &peer, Json::Value &local) -> int {
+                return receivePeerProbe(peer, local);
+            });
+    });
+
+    return handshake_plugin_->startDaemon(listen_port, sockfd);
+}
+
+int TransferMetadata::startHandshakeDaemon(
+    OnReceiveHandShake on_receive_handshake, uint16_t listen_port, int sockfd) {
+    if (on_receive_handshake) {
+        int rc = updateDefaultHandshakeHandler(std::move(on_receive_handshake));
+        if (rc != 0) return rc;
     }
-    return 0;
+    return startHandshakeDaemon(listen_port, sockfd);
 }
 
 int TransferMetadata::registerHandshakeHandler(

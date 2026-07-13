@@ -27,9 +27,9 @@ namespace mooncake {
 // Each peer pair must register the same number of CUDA VMM buffers, with
 // matching lengths, before its first transfer. Corresponding buffers become
 // one NCCL symmetric window; ncclMemAlloc is the supported allocation path.
-// WRITE uses ncclPutSignal. NCCL 2.30 has no public host Get operation, so READ
-// asks the target's control plane to issue the reverse ncclPutSignal and
-// completes synchronously.
+// Only WRITE is supported; it uses ncclPutSignal. NCCL 2.30 has no public host
+// Get operation, so READ is rejected with Status::NotSupportedTransport before
+// communicator or window setup.
 class NcclHostTransport final : public Transport {
    public:
     NcclHostTransport();

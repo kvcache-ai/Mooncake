@@ -221,6 +221,12 @@ class TransferMetadata {
 
     using OnReceiveHandShake = std::function<int(const HandShakeDesc &peer_desc,
                                                  HandShakeDesc &local_desc)>;
+    int updateDefaultHandshakeHandler(OnReceiveHandShake on_receive_handshake);
+    int startHandshakeDaemon(uint16_t listen_port, int sockfd);
+
+    // Backward-compatible convenience wrapper. New callers that need to
+    // replace the default handler should do so explicitly before starting the
+    // daemon.
     int startHandshakeDaemon(OnReceiveHandShake on_receive_handshake,
                              uint16_t listen_port, int sockfd);
 
@@ -273,9 +279,9 @@ class TransferMetadata {
     std::shared_ptr<HandShakePlugin> handshake_plugin_;
     std::shared_ptr<MetadataStoragePlugin> storage_plugin_;
     std::mutex handshake_handler_mutex_;
+    std::once_flag handshake_callbacks_once_;
     std::unordered_map<std::string, OnReceiveHandShake> handshake_handlers_;
     OnReceiveHandShake default_handshake_handler_;
-    bool handshake_daemon_started_{false};
 };
 
 }  // namespace mooncake
