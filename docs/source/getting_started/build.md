@@ -121,6 +121,20 @@ sudo docker run --gpus all \
 The `64gb` / `56gb` values above are tuned examples for large HiCache deployments, not defaults. The arena remains disabled unless you explicitly enable it, and if you enable it via gflag without an env override the default pool size is `8gb`. On smaller hosts, start with `8gb` or `16gb` and size upward with the helper. When you want the baseline direct-`mmap()` path instead of the arena, set `MC_DISABLE_MMAP_ARENA=1` (also accepts `true`, `yes`, or `on`) and omit `MC_MMAP_ARENA_POOL_SIZE`. Set it before the first Mooncake mmap-buffer allocation in the process. If you build the image from source with `docker/mooncake.Dockerfile`, that source-built image also installs the helper as `mooncake-hicache-sizing`.
 Without `MC_STORE_USE_HUGEPAGE=1`, the arena may opportunistically try hugepages and then retry on regular pages if HugeTLB is unavailable. When `MC_STORE_USE_HUGEPAGE=1` is set, both the arena path and the direct-`mmap()` fallback path require HugeTLB pages. Mooncake will not silently degrade that explicit hugepage request to regular pages.
 
+For RDMA Store segments backed by HugeTLB, page population is automatically
+deferred until immediately before transfer-engine registration and
+parallelized across CPU threads:
+
+```bash
+export MC_STORE_USE_HUGEPAGE=1
+export MC_STORE_HUGEPAGE_SIZE=2MB
+```
+
+Direct mappings use a generic worker pool. NUMA-segmented mappings bind each
+worker to the node associated with its memory region. The mmap arena keeps its
+eager population behavior; set `MC_DISABLE_MMAP_ARENA=1` if an arena was
+otherwise enabled and deferred direct-mmap population is desired.
+
 ## Advanced Compile Options
 The following options can be passed to `cmake ..`.
 
