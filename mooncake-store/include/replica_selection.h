@@ -35,16 +35,16 @@
 namespace mooncake {
 
 // Scores a remote replica candidate; lower score == more preferred.
-using ReplicaScorer = std::function<double(const Replica::Descriptor &)>;
+using ReplicaScorer = std::function<double(const Replica::Descriptor&)>;
 
 namespace detail {
 
-inline std::shared_mutex &ScorerMutex() {
+inline std::shared_mutex& ScorerMutex() {
     static std::shared_mutex mu;
     return mu;
 }
 
-inline ReplicaScorer &ScorerStorage() {
+inline ReplicaScorer& ScorerStorage() {
     static ReplicaScorer scorer;
     return scorer;
 }
@@ -69,9 +69,9 @@ inline void SetRemoteReplicaScorer(ReplicaScorer scorer) {
 
 // Built-in remote-replica score: prefer RDMA over TCP. Purely a function of
 // info the replica already carries (protocol_), so it needs no topology.
-inline double BuiltinRemoteReplicaScore(const Replica::Descriptor &r) {
+inline double BuiltinRemoteReplicaScore(const Replica::Descriptor& r) {
     if (!r.is_memory_replica()) return 100.0;
-    const std::string &proto =
+    const std::string& proto =
         r.get_memory_descriptor().buffer_descriptor.protocol_;
     if (proto == "rdma") return 0.0;
     if (proto == "tcp") return 1.0;
@@ -83,7 +83,7 @@ inline double BuiltinRemoteReplicaScore(const Replica::Descriptor &r) {
 // live so tests / late injection take effect.
 inline bool RemoteReplicaScoringEnabled() {
     static const bool env_enabled = [] {
-        const char *env = std::getenv("MC_STORE_REPLICA_SCORING");
+        const char* env = std::getenv("MC_STORE_REPLICA_SCORING");
         return env && std::string(env) == "1";
     }();
     if (env_enabled) return true;
@@ -94,13 +94,13 @@ inline bool RemoteReplicaScoringEnabled() {
 // Among the remote MEMORY replicas, return the lowest-scoring one (nullptr if
 // none). Ties keep master return order (strictly-less comparison), so a
 // symmetric cluster degrades to the historical "first remote MEMORY" pick.
-inline const Replica::Descriptor *PickBestRemoteMemory(
-    const std::vector<Replica::Descriptor> &replicas,
-    const std::unordered_set<std::string> &local_endpoints) {
+inline const Replica::Descriptor* PickBestRemoteMemory(
+    const std::vector<Replica::Descriptor>& replicas,
+    const std::unordered_set<std::string>& local_endpoints) {
     ReplicaScorer scorer = GetRemoteReplicaScorer();
-    const Replica::Descriptor *best = nullptr;
+    const Replica::Descriptor* best = nullptr;
     double best_score = std::numeric_limits<double>::max();
-    for (const auto &r : replicas) {
+    for (const auto& r : replicas) {
         if (r.status != ReplicaStatus::COMPLETE) continue;
         if (!r.is_memory_replica()) continue;
         if (local_endpoints.count(r.get_memory_descriptor()
@@ -119,12 +119,12 @@ inline const Replica::Descriptor *PickBestRemoteMemory(
 // then LOCAL_DISK, then DISK. Master may return replicas in any order, so we
 // always scan. When scoring is enabled and there are multiple remote MEMORY
 // replicas, the best-scoring one is chosen instead of the first encountered.
-inline const Replica::Descriptor *SelectBestReplica(
-    const std::vector<Replica::Descriptor> &replicas,
-    const std::unordered_set<std::string> &local_endpoints) {
-    const Replica::Descriptor *first_memory = nullptr;
-    const Replica::Descriptor *first_nof = nullptr;
-    for (const auto &r : replicas) {
+inline const Replica::Descriptor* SelectBestReplicaWithoutRemoteScoring(
+    const std::vector<Replica::Descriptor>& replicas,
+    const std::unordered_set<std::string>& local_endpoints) {
+    const Replica::Descriptor* first_memory = nullptr;
+    const Replica::Descriptor* first_nof = nullptr;
+    for (const auto& r : replicas) {
         if (r.status != ReplicaStatus::COMPLETE) continue;
         if (r.is_memory_replica()) {
             if (local_endpoints.count(
@@ -142,19 +142,11 @@ inline const Replica::Descriptor *SelectBestReplica(
             if (!first_nof) first_nof = &r;
         }
     }
-    // No local replica. Among remote MEMORY replicas, optionally pick the
-    // best-scoring one instead of the first encountered (issue #2516).
-    if (first_memory && RemoteReplicaScoringEnabled()) {
-        if (const auto *scored =
-                PickBestRemoteMemory(replicas, local_endpoints)) {
-            return scored;
-        }
-    }
     if (first_memory) return first_memory;
     if (first_nof) return first_nof;
 
-    const Replica::Descriptor *best = nullptr;
-    for (const auto &r : replicas) {
+    const Replica::Descriptor* best = nullptr;
+    for (const auto& r : replicas) {
         if (r.status != ReplicaStatus::COMPLETE) continue;
         if (r.is_local_disk_replica()) {
             best = &r;  // LOCAL_DISK always overrides DISK
@@ -163,6 +155,41 @@ inline const Replica::Descriptor *SelectBestReplica(
         }
     }
     return best;
+}
+
+namespace detail {
+
+// Apply the opt-in V1 remote-memory scorer to an already computed structural
+// baseline. Keeping this step separate lets SHADOW reuse its own structural
+// scan without changing any V1 enablement, scorer, or tie-breaking semantics.
+inline const Replica::Descriptor* ApplyRemoteReplicaScoring(
+    const std::vector<Replica::Descriptor>& replicas,
+    const std::unordered_set<std::string>& local_endpoints,
+    const Replica::Descriptor* baseline) {
+    if (!baseline || !baseline->is_memory_replica()) return baseline;
+
+    const auto& endpoint =
+        baseline->get_memory_descriptor().buffer_descriptor.transport_endpoint_;
+    if (local_endpoints.count(endpoint)) return baseline;
+
+    if (RemoteReplicaScoringEnabled()) {
+        if (const auto* scored =
+                PickBestRemoteMemory(replicas, local_endpoints)) {
+            return scored;
+        }
+    }
+    return baseline;
+}
+
+}  // namespace detail
+
+inline const Replica::Descriptor* SelectBestReplica(
+    const std::vector<Replica::Descriptor>& replicas,
+    const std::unordered_set<std::string>& local_endpoints) {
+    const auto* baseline =
+        SelectBestReplicaWithoutRemoteScoring(replicas, local_endpoints);
+    return detail::ApplyRemoteReplicaScoring(replicas, local_endpoints,
+                                             baseline);
 }
 
 }  // namespace mooncake
