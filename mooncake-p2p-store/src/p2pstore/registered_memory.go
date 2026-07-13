@@ -82,7 +82,6 @@ func (memory *RegisteredMemory) Add(addr uintptr, length uint64, maxShardSize ui
 			if err != nil {
 				select {
 				case errChan <- err:
-					close(errChan)
 					return
 				default:
 				}
@@ -120,8 +119,8 @@ func (memory *RegisteredMemory) Remove(addr uintptr, length uint64, maxShardSize
 	for idx, entry := range memory.bufferList {
 		if entry.addr == addr && entry.length == length {
 			found = true
-			entry.refCount--
-			if entry.refCount == 0 {
+			memory.bufferList[idx].refCount--
+			if memory.bufferList[idx].refCount == 0 {
 				memory.bufferList = append(memory.bufferList[:idx],
 					memory.bufferList[idx+1:]...)
 				break
