@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 import asyncio
 import json
+import logging
+import signal
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -40,7 +44,12 @@ except ModuleNotFoundError:
     store_module.MooncakeDistributedStore = MooncakeDistributedStore
     sys.modules["mooncake.store"] = store_module
 
-from mooncake.mooncake_store_service import MooncakeStoreService, _shm_name_to_path
+from mooncake.mooncake_store_service import (
+    MooncakeStoreService,
+    _install_shutdown_signal_handlers,
+    _shm_name_to_path,
+    main as store_service_main,
+)
 
 
 class FakeStore:
@@ -748,6 +757,134 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
     async def test_unmount_shm_empty_list(self):
         resp = await self.service.handle_unmount_shm(FakeRequest({"segment_ids": []}))
         self.assertEqual(resp.status, 400)
+
+
+class StoreServiceShutdownTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.service = MooncakeStoreService.__new__(MooncakeStoreService)
+        self.service.store = None
+        self.service.config = SimpleNamespace(
+            local_hostname="localhost",
+            metadata_server="P2PHANDSHAKE",
+            global_segment_size=1,
+            local_buffer_size=0,
+            protocol="tcp",
+            device_name="",
+            master_server_address="localhost:50051",
+            enable_ssd_offload=False,
+            ssd_offload_path="",
+            tenant_id="",
+        )
+
+    async def test_shutdown_event_stops_startup_retry_sleep(self):
+        class FailingStore:
+            def setup(self, *_args):
+                raise RuntimeError("setup failed")
+
+        shutdown_event = asyncio.Event()
+
+        async def trigger_shutdown():
+            await asyncio.sleep(0)
+            shutdown_event.set()
+
+        with mock.patch(
+            "mooncake.mooncake_store_service.MooncakeDistributedStore",
+            FailingStore,
+        ):
+            shutdown_task = asyncio.create_task(trigger_shutdown())
+            start_time = time.perf_counter()
+            with self.assertLogs(level=logging.WARNING):
+                result = await self.service.start_store_service(
+                    max_wait_time=2, shutdown_event=shutdown_event
+                )
+            elapsed = time.perf_counter() - start_time
+            await shutdown_task
+
+        self.assertFalse(result)
+        self.assertLess(elapsed, 0.5)
+
+    async def test_shutdown_during_setup_is_observed_before_success(self):
+        shutdown_event = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        class SchedulingStore(FakeStore):
+            def setup(self, *args):
+                ret = super().setup(*args)
+                loop.call_soon(shutdown_event.set)
+                return ret
+
+        with mock.patch(
+            "mooncake.mooncake_store_service.MooncakeDistributedStore",
+            SchedulingStore,
+        ):
+            result = await self.service.start_store_service(
+                max_wait_time=1, shutdown_event=shutdown_event
+            )
+
+        self.assertFalse(result)
+
+    async def test_stop_logs_nonzero_close_return(self):
+        self.service.store = mock.Mock()
+        self.service.store.close.return_value = 7
+
+        with self.assertLogs(level=logging.WARNING) as logs:
+            await self.service.stop()
+
+        self.assertTrue(
+            any("close returned 7" in message for message in logs.output)
+        )
+
+    async def test_signal_handler_requests_shutdown(self):
+        loop = mock.Mock()
+        shutdown_event = asyncio.Event()
+
+        _install_shutdown_signal_handlers(loop, shutdown_event)
+
+        sigterm_call = next(
+            call
+            for call in loop.add_signal_handler.call_args_list
+            if call.args[0] == signal.SIGTERM
+        )
+        sigterm_call.args[1](sigterm_call.args[2])
+        self.assertTrue(shutdown_event.is_set())
+
+    async def test_main_closes_store_when_shutdown_requested_during_startup(self):
+        args = SimpleNamespace(
+            config=None,
+            define=[],
+            max_wait_time=60,
+            port=8080,
+        )
+        service = mock.Mock()
+        service.start_store_service = mock.AsyncMock(return_value=False)
+        service.start_http_service = mock.AsyncMock(return_value=True)
+        service.stop = mock.AsyncMock()
+
+        def request_shutdown(_loop, shutdown_event):
+            shutdown_event.set()
+
+        with (
+            mock.patch(
+                "mooncake.mooncake_store_service.parse_arguments",
+                return_value=args,
+            ),
+            mock.patch(
+                "mooncake.mooncake_store_service.MooncakeStoreService",
+                return_value=service,
+            ),
+            mock.patch(
+                "mooncake.mooncake_store_service._unblock_shutdown_signals"
+            ),
+            mock.patch(
+                "mooncake.mooncake_store_service._install_shutdown_signal_handlers",
+                side_effect=request_shutdown,
+            ),
+        ):
+            await store_service_main()
+
+        service.start_store_service.assert_awaited_once()
+        service.start_http_service.assert_not_awaited()
+        service.stop.assert_awaited_once()
 
 
 class ShmNameToPathTest(unittest.TestCase):
