@@ -49,6 +49,7 @@ class SegmentLifetime {
 
 // Forward declarations
 class BufferAllocatorBase;
+class SegmentAllocator;
 
 class AllocatedBuffer {
    public:
@@ -84,10 +85,6 @@ class AllocatedBuffer {
         return !allocator_.expired() && segment_lifetime_.isAvailable();
     }
 
-    void bindSegmentLifetime(SegmentLifetime lifetime) {
-        segment_lifetime_ = std::move(lifetime);
-    }
-
     [[nodiscard]] bool getDescriptorIfAvailable(Descriptor& descriptor) const;
 
     // Serialize the buffer into a descriptor for transfer
@@ -113,6 +110,10 @@ class AllocatedBuffer {
     void* get_vaddr_from_cxl();
 
    private:
+    void bindSegmentLifetime(SegmentLifetime lifetime) {
+        segment_lifetime_ = std::move(lifetime);
+    }
+
     std::weak_ptr<BufferAllocatorBase> allocator_;
     SegmentLifetime segment_lifetime_;
     std::string segment_name_;
@@ -124,6 +125,7 @@ class AllocatedBuffer {
         std::nullopt};
 
     friend class Serializer<AllocatedBuffer>;
+    friend class SegmentAllocator;
 };
 
 /**

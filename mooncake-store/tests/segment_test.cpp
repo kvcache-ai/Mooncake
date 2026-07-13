@@ -113,10 +113,10 @@ class SegmentTest : public ::testing::Test {
                          mounted_segment.buf_allocator) != allocators->end();
     }
 
-    SegmentLifetime GetSegmentLifetime(const SegmentManager& segment_manager,
-                                       const UUID& segment_id) {
+    SegmentAllocatorRegistration GetSegmentAllocator(
+        const SegmentManager& segment_manager, const UUID& segment_id) {
         return segment_manager.mounted_segments_.at(segment_id)
-            .allocator_registration->lifetime;
+            .allocator_registration;
     }
 
     void ValidateMountedLocalDiskSegments(
@@ -234,13 +234,13 @@ TEST_F(SegmentTest, PrepareUnmountInvalidatesOnlyMatchingSegmentLifetime) {
     ASSERT_EQ(ErrorCode::OK, segment_access.MountSegment(segment1, client_id));
     ASSERT_EQ(ErrorCode::OK, segment_access.MountSegment(segment2, client_id));
 
-    auto lifetime1 = GetSegmentLifetime(segment_manager, segment1.id);
-    auto lifetime2 = GetSegmentLifetime(segment_manager, segment2.id);
+    auto allocator1 = GetSegmentAllocator(segment_manager, segment1.id);
+    auto allocator2 = GetSegmentAllocator(segment_manager, segment2.id);
     size_t metrics_dec_capacity = 0;
     ASSERT_EQ(ErrorCode::OK, segment_access.PrepareUnmountSegment(
                                  segment1.id, metrics_dec_capacity));
-    EXPECT_FALSE(lifetime1.isAvailable());
-    EXPECT_TRUE(lifetime2.isAvailable());
+    EXPECT_FALSE(allocator1->isAvailable());
+    EXPECT_TRUE(allocator2->isAvailable());
 }
 
 // UnmountSegmentSuccess:
