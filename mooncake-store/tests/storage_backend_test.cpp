@@ -507,6 +507,82 @@ TEST_F(StorageBackendTest, OrphanedBucketFileCleanup) {
     ASSERT_TRUE(is_exist.value());
 }
 
+TEST_F(StorageBackendTest, BatchOffloadRollbackOnCompleteHandlerFailure) {
+    std::string test_dir = data_path + "/rollback_test";
+    fs::create_directories(test_dir);
+
+    FileStorageConfig config;
+    config.storage_filepath = test_dir;
+    BucketBackendConfig bucket_config;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    std::shared_ptr<SimpleAllocator> client_buffer_allocator =
+        std::make_shared<SimpleAllocator>(128 * 1024 * 1024);
+
+    // Prepare 3 keys to verify ALL keys are rolled back, not just one
+    std::unordered_map<std::string, std::vector<Slice>> batched_slices;
+    std::vector<std::string> test_keys;
+    for (int i = 0; i < 3; ++i) {
+        std::string key = "rollback_test_key_" + std::to_string(i);
+        std::string data = "test_data_for_rollback_" + std::to_string(i);
+        void* buffer = client_buffer_allocator->allocate(data.size());
+        memcpy(buffer, data.data(), data.size());
+        batched_slices.emplace(key,
+                               std::vector<Slice>{Slice{buffer, data.size()}});
+        test_keys.push_back(key);
+    }
+
+    // Capture pre-offload state
+    auto pre_meta = storage_backend.GetStoreMetadata();
+    ASSERT_TRUE(pre_meta.has_value());
+    int64_t pre_total_size = pre_meta->total_size;
+    int64_t pre_total_keys = pre_meta->total_keys;
+
+    // Trigger rollback via failing complete_handler
+    auto offload_res = storage_backend.BatchOffload(
+        batched_slices, [](const std::vector<std::string>& keys,
+                           std::vector<StorageObjectMetadata>& metadatas) {
+            return ErrorCode::INTERNAL_ERROR;
+        });
+
+    // Assertion 1: Offload returns the handler's error
+    EXPECT_FALSE(offload_res.has_value());
+    EXPECT_EQ(offload_res.error(), ErrorCode::INTERNAL_ERROR);
+
+    // Assertion 2: All keys removed from object_bucket_map_
+    for (const auto& key : test_keys) {
+        auto exist_res = storage_backend.IsExist(key);
+        ASSERT_TRUE(exist_res.has_value());
+        EXPECT_FALSE(exist_res.value())
+            << "Key '" << key << "' should not exist after rollback";
+    }
+
+    // Assertion 3: total_size_ and total_keys restored to pre-offload values
+    auto post_meta = storage_backend.GetStoreMetadata();
+    ASSERT_TRUE(post_meta.has_value());
+    EXPECT_EQ(post_meta->total_size, pre_total_size)
+        << "total_size_ should be restored after rollback";
+    EXPECT_EQ(post_meta->total_keys, pre_total_keys)
+        << "total_keys should be restored after rollback";
+
+    // Assertions 4 & 5: Bucket files deleted from disk.
+    // The bucket ID is generated from a timestamp-based BucketIdGenerator, so
+    // we can't hardcode it. Instead, scan the test directory to confirm no
+    // .bucket or .meta files remain after rollback.
+    int bucket_file_count = 0;
+    for (const auto& entry : fs::directory_iterator(test_dir)) {
+        if (entry.is_regular_file()) {
+            std::string ext = entry.path().extension().string();
+            if (ext == ".bucket" || ext == ".meta") {
+                bucket_file_count++;
+            }
+        }
+    }
+    EXPECT_EQ(bucket_file_count, 0)
+        << "No bucket data or metadata files should remain after rollback";
+}
+
 TEST_F(StorageBackendTest, AdaptorBatchOffloadAndBatchLoad) {
     FileStorageConfig cfg;
 
