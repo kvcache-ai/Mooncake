@@ -4,6 +4,8 @@ add_subdirectory(cachelib_memory_allocator)
 set(MOONCAKE_STORE_SOURCES
     allocator.cpp
     master_service.cpp
+    master_snapshot_manager.cpp
+    master_snapshot_repository.cpp
     client_service.cpp
     client_metric.cpp
     types.cpp

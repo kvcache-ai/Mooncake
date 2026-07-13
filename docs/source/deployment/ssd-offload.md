@@ -4,7 +4,7 @@
 
 Mooncake Store supports offloading KV cache objects from distributed memory to a local filesystem path, typically backed by local SSDs. When memory pressure is high, the master instructs clients to persist selected objects to disk. On a cache miss, the client automatically falls back to reading from the local filesystem-backed offload path.
 
-For measured TTFT and throughput impact in multi-turn workloads, see [Mooncake SSD Offload Benchmark](../performance/ssd-offload-benchmark-results.md).
+For measured TTFT and throughput impact in multi-turn workloads, see [Mooncake SSD Offload Benchmark](../performance/mooncake/ssd-offload-benchmark-results.md).
 
 SSD offload requires the **Real Client** and supports two deployment modes:
 
@@ -94,7 +94,7 @@ store.setup_dummy(
 |------|---------|-------------|
 | `--metadata_server` | `http://127.0.0.1:8080/metadata` | Metadata server connection string |
 | `--master_server_address` | `127.0.0.1:50051` | Master address |
-| `--host` | `0.0.0.0` | This machine's externally reachable IP |
+| `--host` | `0.0.0.0` | This machine's externally reachable IP. Accepts `ip:port` to specify the data plane port for TransferEngine |
 | `--port` | `50052` | Real client RPC listening port |
 | `--device_names` | ` ` | NIC name(s), e.g. `eth0` or `mlx5_0` |
 | `--protocol` | `tcp` | Transport protocol: `tcp` or `rdma` |

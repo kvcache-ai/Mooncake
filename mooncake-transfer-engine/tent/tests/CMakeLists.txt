@@ -27,6 +27,26 @@ target_include_directories(admission_queue_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME admission_queue_test COMMAND admission_queue_test)
 
+# Reproducible hot-path microbenchmark; intentionally not registered with
+# ctest. Run manually when changing deadline promotion partitioning.
+add_executable(deadline_promotion_bench deadline_promotion_bench.cpp
+                                        ../src/runtime/admission_queue.cpp)
+target_link_libraries(deadline_promotion_bench PRIVATE tent_common)
+target_include_directories(deadline_promotion_bench
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+
+add_executable(promotion_policy_test promotion_policy_test.cpp)
+target_link_libraries(promotion_policy_test PRIVATE tent_common gtest gtest_main)
+target_include_directories(promotion_policy_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME promotion_policy_test COMMAND promotion_policy_test)
+
+add_executable(thread_local_storage_test thread_local_storage_test.cpp)
+target_link_libraries(thread_local_storage_test PRIVATE gtest gtest_main)
+target_include_directories(thread_local_storage_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME thread_local_storage_test COMMAND thread_local_storage_test)
+
 add_executable(tent_ip_utils_test ip_utils_test.cpp)
 target_link_libraries(tent_ip_utils_test PRIVATE tent_common gtest gtest_main)
 target_include_directories(tent_ip_utils_test
@@ -183,6 +203,13 @@ target_include_directories(tent_transport_hint_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_transport_hint_test COMMAND tent_transport_hint_test)
 
+add_executable(tent_intent_type_test intent_type_test.cpp)
+target_link_libraries(tent_intent_type_test PRIVATE gtest gtest_main
+                                                    tent_common)
+target_include_directories(tent_intent_type_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_intent_type_test COMMAND tent_intent_type_test)
+
 # ProgressWorker skeleton test: covers default-off behavior, event-driven
 # progress without poll-failover, and freeBatch races (issue #2116).
 add_executable(tent_progress_worker_test progress_worker_test.cpp)
@@ -229,4 +256,18 @@ if(USE_TPU)
     tent_tpu_pjrt_shim_test
     PRIVATE MOCK_TPU_PJRT_LIB="$<TARGET_FILE:mock_tpu_pjrt>")
   add_test(NAME tent_tpu_pjrt_shim_test COMMAND tent_tpu_pjrt_shim_test)
+
+  # Drives TpuTransport's staging hop (interior-offset chunks, and the
+  # exactly-one-device-side guard) against the same mock adapter.
+  add_executable(tent_tpu_transport_test tpu/tpu_transport_test.cpp)
+  add_dependencies(tent_tpu_transport_test mock_tpu_pjrt)
+  target_link_libraries(tent_tpu_transport_test
+                        PRIVATE gtest gtest_main tent_link_group
+                                ${CMAKE_DL_LIBS})
+  target_include_directories(tent_tpu_transport_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_compile_definitions(
+    tent_tpu_transport_test
+    PRIVATE MOCK_TPU_PJRT_LIB="$<TARGET_FILE:mock_tpu_pjrt>")
+  add_test(NAME tent_tpu_transport_test COMMAND tent_tpu_transport_test)
 endif()

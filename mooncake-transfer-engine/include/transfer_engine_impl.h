@@ -342,6 +342,7 @@ class TransferEngineImpl {
     }
 
     Transport* getTransport(const std::string& proto) {
+        if (!multi_transports_) return nullptr;
         return multi_transports_->getTransport(proto);
     }
 

@@ -111,10 +111,9 @@ Mooncake x LMDeploy Integration<getting_started/examples/lmdeploy-integration-v0
 :::{toctree}
 :caption: Performance
 :maxdepth: 1
-
-performance/vllm/index
-performance/sglang/index
 performance/mooncake/index
+performance/sglang/index
+performance/vllm/index
 :::
 
 % Explanation of Mooncake internals

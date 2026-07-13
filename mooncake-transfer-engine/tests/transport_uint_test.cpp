@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 #include <sys/time.h>
 
+#include <array>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
@@ -170,6 +171,46 @@ TEST_F(TransportTest, ReadEmptyFile) {
     EXPECT_EQ(bytesRead, static_cast<ssize_t>(0));
 
     close(fd);
+}
+
+TEST_F(TransportTest, RegisterLocalMemoryBatchRejectsOverlappingBuffers) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+
+    std::array<char, 256> buffer{};
+    std::vector<BufferEntry> entries = {
+        {buffer.data() + 64, 128},
+        {buffer.data(), 128},
+    };
+
+    EXPECT_EQ(engine.registerLocalMemoryBatch(entries, "cpu:0"),
+              ERR_ADDRESS_OVERLAPPED);
+}
+
+TEST_F(TransportTest, RegisterLocalMemoryBatchRejectsZeroLengthBuffer) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+
+    std::array<char, 1> buffer{};
+    std::vector<BufferEntry> entries = {
+        {buffer.data(), 0},
+    };
+
+    EXPECT_EQ(engine.registerLocalMemoryBatch(entries, "cpu:0"),
+              ERR_INVALID_ARGUMENT);
+}
+
+TEST_F(TransportTest, RegisterLocalMemoryBatchAllowsAdjacentBuffers) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+
+    std::array<char, 256> buffer{};
+    std::vector<BufferEntry> entries = {
+        {buffer.data() + 128, 128},
+        {buffer.data(), 128},
+    };
+
+    EXPECT_EQ(engine.registerLocalMemoryBatch(entries, "cpu:0"), 0);
 }
 }  // namespace mooncake
 

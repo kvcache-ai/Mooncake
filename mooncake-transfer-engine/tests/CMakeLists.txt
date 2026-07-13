@@ -77,6 +77,12 @@ if(USE_TCP)
   target_link_libraries(tcp_transport_test PUBLIC transfer_engine gtest
                                                   gtest_main)
   add_test(NAME tcp_transport_test COMMAND tcp_transport_test)
+
+  add_executable(tcp_write_visibility_test
+                 ${WORKSPACE}/tcp_write_visibility_test.cpp)
+  target_link_libraries(tcp_write_visibility_test PUBLIC transfer_engine gtest
+                                                         gtest_main)
+  add_test(NAME tcp_write_visibility_test COMMAND tcp_write_visibility_test)
 endif()
 
 add_executable(tcp_address_validation_test
@@ -292,3 +298,12 @@ if(ENABLE_MULTI_PROTOCOL)
                                                  gtest_main)
   add_test(NAME mp_transport_test COMMAND mp_transport_test)
 endif()
+
+add_executable(graceful_shutdown_test ${WORKSPACE}/graceful_shutdown_test.cpp)
+target_link_libraries(graceful_shutdown_test PUBLIC transfer_engine gtest
+                                                   gtest_main)
+add_test(NAME graceful_shutdown_test COMMAND graceful_shutdown_test)
+
+add_executable(show_links_test ${WORKSPACE}/show_links_test.cpp)
+target_link_libraries(show_links_test PUBLIC transfer_engine gtest gtest_main)
+add_test(NAME show_links_test COMMAND show_links_test)
