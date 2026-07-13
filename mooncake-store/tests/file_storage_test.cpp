@@ -6,6 +6,7 @@
 
 #include "allocator.h"
 #include "storage_backend.h"
+#include "gds/gds_context.h"  // GdsContext complete type for unique_ptr
 #include "file_storage.h"
 #include "utils/common.h"
 #include "client_metric.h"

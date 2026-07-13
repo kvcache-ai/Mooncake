@@ -13,6 +13,7 @@
 #include "client_service.h"
 #include "file_storage.h"
 #include "storage_backend.h"
+#include "gds/gds_context.h"  // GdsContext complete type for unique_ptr
 
 namespace mooncake {
 

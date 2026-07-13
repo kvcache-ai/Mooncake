@@ -1,4 +1,5 @@
 #include "storage_backend.h"
+#include "gds/gds_context.h"  // complete type for unique_ptr<GdsContext>
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
