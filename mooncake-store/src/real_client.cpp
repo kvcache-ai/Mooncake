@@ -816,6 +816,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             }
         }
 
+        const bool parallel_hugetlb_population =
+            protocol == "rdma" && should_use_hugepage &&
+            get_hugepage_populate_mode() == HugepagePopulateMode::kParallel;
+
         while (global_segment_size > 0) {
             size_t segment_size = std::min(global_segment_size, max_mr_size);
             global_segment_size -= segment_size;
@@ -826,9 +830,6 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             size_t mapped_size = segment_size;
             void *ptr = nullptr;
             std::string seg_location = kWildcardLocation;
-            const bool defer_hugetlb_population =
-                should_use_hugepage && seg_numa_nodes.empty() &&
-                should_defer_hugetlb_population();
 
             if (!seg_numa_nodes.empty()) {
                 // NUMA-segmented allocation: contiguous VMA, per-region binding
@@ -845,7 +846,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                     align_up(segment_size, get_hugepage_size_from_env());
                 ptr = allocate_buffer_mmap_memory(mapped_size,
                                                   get_hugepage_size_from_env(),
-                                                  defer_hugetlb_population);
+                                                  parallel_hugetlb_population);
             } else {
                 ptr = allocate_buffer_allocator_memory(segment_size,
                                                        this->protocol);
@@ -879,13 +880,16 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 segment_ptrs_.emplace_back(ptr);
             }
 
-            // The direct HugeTLB path can defer population so mmap() does not
-            // synchronously fault a very large Store segment. Populate it in
-            // parallel immediately before transfer-engine registration. Keep
-            // NUMA-segmented mappings on their existing ibv_reg_mr()-driven
-            // first-touch path so mbind placement is preserved.
-            if (defer_hugetlb_population && !is_mmap_arena_allocation(ptr)) {
-                populate_hugetlb_mapping(ptr, mapped_size);
+            // Populate HugeTLB pages in parallel immediately before transfer-
+            // engine registration. NUMA mappings use node-local workers for
+            // each mbind region; direct mappings use the generic worker pool.
+            if (parallel_hugetlb_population) {
+                if (!seg_numa_nodes.empty()) {
+                    populate_hugetlb_numa_mapping(ptr, mapped_size,
+                                                  seg_numa_nodes);
+                } else if (!is_mmap_arena_allocation(ptr)) {
+                    populate_hugetlb_mapping(ptr, mapped_size);
+                }
             }
 
             auto mount_result =

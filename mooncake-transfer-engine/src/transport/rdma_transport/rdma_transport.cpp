@@ -18,8 +18,10 @@
 #include <sys/mman.h>
 #include <sys/time.h>
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <cctype>
 #include <cstddef>
 #include <cstdlib>
 #include <future>
@@ -40,6 +42,18 @@ namespace mooncake {
 
 static bool MCIbRelaxedOrderingEnabled = false;
 static int MCIbRelaxedOrderingMode = 2;
+
+static bool envVarEnabled(const char *name) {
+    const char *value = std::getenv(name);
+    if (value == nullptr) {
+        return false;
+    }
+    std::string normalized(value);
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return normalized == "1" || normalized == "true" || normalized == "yes" ||
+           normalized == "on";
+}
 
 static std::string resolveBufferLocation(
     const TransferMetadata::BufferDesc &buffer, uint64_t offset) {
@@ -225,7 +239,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     bool do_pre_touch = context_list_.size() > 0 &&
                         std::thread::hardware_concurrency() >= 4 &&
                         length >= (size_t)4 * 1024 * 1024 * 1024;
-    if (do_pre_touch && Environ::GetBool("MC_DISABLE_RDMA_PRE_TOUCH", false)) {
+    if (do_pre_touch && envVarEnabled("MC_DISABLE_RDMA_PRE_TOUCH")) {
         do_pre_touch = false;
     }
     if (do_pre_touch) {

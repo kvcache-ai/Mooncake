@@ -377,22 +377,36 @@ inline size_t align_up(size_t size, size_t alignment) {
     return size;
 }
 
+enum class HugepagePopulateMode {
+    kEager,
+    kParallel,
+};
+
 /**
- * @brief Whether HugeTLB page population should be deferred until the Store
- * segment is about to be registered with the transfer engine.
+ * @brief Parse MC_STORE_HUGEPAGE_POPULATE_MODE.
  *
- * Enabled when MC_STORE_USE_HUGEPAGE is set and
- * MC_STORE_HUGEPAGE_POPULATE_MODE=rdma.
+ * "parallel" requests deferred, parallel population immediately before Store
+ * segment registration. Unset or invalid values use the eager default.
  */
-[[nodiscard]] bool should_defer_hugetlb_population();
+[[nodiscard]] HugepagePopulateMode get_hugepage_populate_mode();
 
 /**
  * @brief Fault in a fresh HugeTLB mapping with parallel CPU writes.
  *
- * Touches one byte per configured hugepage and the final byte of the mapping.
- * Call this only for a newly allocated mapping whose contents may be zeroed.
+ * Touches one byte per configured hugepage. Call this only for a newly
+ * allocated mapping whose contents may be zeroed.
  */
 void populate_hugetlb_mapping(void* ptr, size_t total_size);
+
+/**
+ * @brief Fault in an mbind-partitioned HugeTLB mapping with NUMA-local workers.
+ *
+ * The mapping is divided into equal regions in the same order as numa_nodes.
+ * Workers are scheduled on the corresponding node before touching that
+ * region.
+ */
+void populate_hugetlb_numa_mapping(void* ptr, size_t total_size,
+                                   const std::vector<int>& numa_nodes);
 
 /**
  * Allocate mmap-backed buffer memory for host KV / transfer buffers.
@@ -446,8 +460,9 @@ void free_buffer_mmap_memory(void* ptr, size_t total_size);
  *
  * Reserves a single VMA via mmap, divides it into N equal regions,
  * binds each region to the corresponding NUMA node via mbind(MPOL_BIND).
- * No explicit prefault — ibv_reg_mr() will fault and pin pages respecting
- * the mbind policy, allocating directly on the target NUMA node.
+ * The mapping remains lazy after allocation. The caller may populate it with
+ * NUMA-local workers or let ibv_reg_mr() fault and pin pages while respecting
+ * the mbind policy.
  *
  * @param total_size  Total buffer size in bytes
  * @param numa_nodes  NUMA node IDs to bind regions to (e.g., {1,3,5,7})

@@ -240,13 +240,42 @@ static inline size_t mmap_map_size(size_t total_size, size_t hugepage_size) {
     return align_up(total_size, page_size);
 }
 
-bool should_defer_hugetlb_population() {
+HugepagePopulateMode get_hugepage_populate_mode() {
     const char *populate_mode = std::getenv("MC_STORE_HUGEPAGE_POPULATE_MODE");
-    return get_hugepage_size_from_env() > 0 && populate_mode != nullptr &&
-           std::strcmp(populate_mode, "rdma") == 0;
+    if (populate_mode == nullptr) {
+        return HugepagePopulateMode::kEager;
+    }
+    if (std::strcmp(populate_mode, "eager") == 0) {
+        return HugepagePopulateMode::kEager;
+    }
+    if (std::strcmp(populate_mode, "parallel") == 0) {
+        return HugepagePopulateMode::kParallel;
+    }
+    LOG(WARNING) << "Invalid MC_STORE_HUGEPAGE_POPULATE_MODE='" << populate_mode
+                 << "'; supported values: eager, parallel. "
+                 << "Using eager.";
+    return HugepagePopulateMode::kEager;
 }
 
 namespace {
+
+size_t touch_thread_count(size_t page_count) {
+    const unsigned int hardware_threads = std::thread::hardware_concurrency();
+    const size_t available_threads =
+        hardware_threads == 0 ? 1 : std::min<size_t>(hardware_threads, 16);
+    return std::min(available_threads, page_count);
+}
+
+void touch_page_range(volatile char *data, size_t page_size, size_t begin_page,
+                      size_t end_page, int numa_node) {
+    if (numa_node >= 0 && numa_run_on_node(numa_node) != 0) {
+        LOG(WARNING) << "Failed to bind HugeTLB population worker to NUMA node "
+                     << numa_node << ": " << std::strerror(errno);
+    }
+    for (size_t page = begin_page; page < end_page; ++page) {
+        data[page * page_size] = 0;
+    }
+}
 
 void touch_mmap_pages(void *ptr, size_t map_size, size_t page_size) {
     if (ptr == nullptr || map_size == 0 || page_size == 0) {
@@ -254,21 +283,15 @@ void touch_mmap_pages(void *ptr, size_t map_size, size_t page_size) {
     }
 
     const size_t page_count = (map_size + page_size - 1) / page_size;
-    const unsigned int hardware_threads = std::thread::hardware_concurrency();
-    size_t num_threads =
-        hardware_threads == 0 ? 1 : std::min<size_t>(hardware_threads, 16);
-    num_threads = std::min(num_threads, page_count);
+    const size_t num_threads = touch_thread_count(page_count);
 
     auto *data = static_cast<volatile char *>(ptr);
     if (num_threads <= 1) {
-        for (size_t page = 0; page < page_count; ++page) {
-            data[page * page_size] = 0;
-        }
-        data[map_size - 1] = 0;
+        touch_page_range(data, page_size, 0, page_count, -1);
         return;
     }
 
-    std::vector<std::thread> threads;
+    std::vector<std::jthread> threads;
     threads.reserve(num_threads);
     const size_t pages_per_thread =
         (page_count + num_threads - 1) / num_threads;
@@ -276,16 +299,60 @@ void touch_mmap_pages(void *ptr, size_t map_size, size_t page_size) {
         const size_t begin_page = thread_index * pages_per_thread;
         const size_t end_page =
             std::min(begin_page + pages_per_thread, page_count);
-        threads.emplace_back([data, page_size, begin_page, end_page]() {
-            for (size_t page = begin_page; page < end_page; ++page) {
-                data[page * page_size] = 0;
+        if (begin_page >= end_page) {
+            break;
+        }
+        threads.emplace_back(touch_page_range, data, page_size, begin_page,
+                             end_page, -1);
+    }
+}
+
+void touch_numa_mmap_pages(void *ptr, size_t map_size, size_t page_size,
+                           const std::vector<int> &numa_nodes) {
+    if (ptr == nullptr || map_size == 0 || page_size == 0 ||
+        numa_nodes.empty()) {
+        return;
+    }
+
+    const size_t node_count = numa_nodes.size();
+    if (map_size % node_count != 0 ||
+        (map_size / node_count) % page_size != 0) {
+        LOG(ERROR) << "Invalid NUMA HugeTLB mapping layout: size=" << map_size
+                   << ", page_size=" << page_size << ", nodes=" << node_count;
+        return;
+    }
+
+    const size_t region_size = map_size / node_count;
+    const size_t pages_per_region = region_size / page_size;
+    const size_t page_count = pages_per_region * node_count;
+    const size_t num_threads =
+        std::max(node_count, touch_thread_count(page_count));
+    const size_t base_threads_per_node = num_threads / node_count;
+    const size_t extra_threads = num_threads % node_count;
+
+    auto *data = static_cast<volatile char *>(ptr);
+    std::vector<std::jthread> threads;
+    threads.reserve(num_threads);
+    for (size_t node_index = 0; node_index < node_count; ++node_index) {
+        const size_t node_threads =
+            base_threads_per_node + (node_index < extra_threads ? 1 : 0);
+        const size_t pages_per_thread =
+            (pages_per_region + node_threads - 1) / node_threads;
+        const size_t region_begin_page = node_index * pages_per_region;
+        for (size_t thread_index = 0; thread_index < node_threads;
+             ++thread_index) {
+            const size_t begin_page =
+                region_begin_page + thread_index * pages_per_thread;
+            const size_t end_page =
+                std::min(begin_page + pages_per_thread,
+                         region_begin_page + pages_per_region);
+            if (begin_page >= end_page) {
+                continue;
             }
-        });
+            threads.emplace_back(touch_page_range, data, page_size, begin_page,
+                                 end_page, numa_nodes[node_index]);
+        }
     }
-    for (auto &thread : threads) {
-        thread.join();
-    }
-    data[map_size - 1] = 0;
 }
 
 }  // namespace
@@ -298,6 +365,17 @@ void populate_hugetlb_mapping(void *ptr, size_t total_size) {
 
     touch_mmap_pages(ptr, mmap_map_size(total_size, hugepage_size),
                      hugepage_size);
+}
+
+void populate_hugetlb_numa_mapping(void *ptr, size_t total_size,
+                                   const std::vector<int> &numa_nodes) {
+    const size_t hugepage_size = get_hugepage_size_from_env();
+    if (ptr == nullptr || total_size == 0 || hugepage_size == 0 ||
+        numa_nodes.empty()) {
+        return;
+    }
+
+    touch_numa_mmap_pages(ptr, total_size, hugepage_size, numa_nodes);
 }
 
 void *allocate_buffer_mmap_memory(size_t total_size, size_t alignment) {
@@ -450,10 +528,9 @@ void *allocate_buffer_numa_segments(size_t total_size,
         }
     }
 
-    // No explicit prefault needed — ibv_reg_mr() will call get_user_pages()
-    // which triggers page faults that respect the mbind NUMA policy.
-    // Pages are allocated directly on the target NUMA during MR registration,
-    // avoiding a redundant full-buffer traversal.
+    // Leave the mapping lazy. The caller may explicitly populate it with
+    // NUMA-local workers before registration; otherwise ibv_reg_mr() calls
+    // get_user_pages(), whose faults respect the mbind policy.
 
     LOG(INFO) << "Allocated NUMA-segmented buffer: " << map_size << " bytes, "
               << n << " regions, page_size=" << page_size << ", nodes=[" <<
