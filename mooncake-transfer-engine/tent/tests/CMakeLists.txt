@@ -51,7 +51,6 @@ target_link_libraries(receiver_credit_rpc_harness
                       PRIVATE tent_rpc tent_common asio_shared glog)
 target_include_directories(receiver_credit_rpc_harness
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
-
 # Reproducible hot-path microbenchmark; intentionally not registered with ctest.
 # Run manually when changing deadline promotion partitioning.
 add_executable(deadline_promotion_bench deadline_promotion_bench.cpp
