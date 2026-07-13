@@ -40,6 +40,7 @@ ErrorCode P2PHotStandbyService::Start(uint64_t baseline_sequence_id) {
     auto err = StartOplogFollowingLocked(baseline_sequence_id);
     if (err != ErrorCode::OK) {
         state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
+        ResetOplogFollowingLocked();
         return err;
     }
 
@@ -52,6 +53,8 @@ ErrorCode P2PHotStandbyService::Start(uint64_t baseline_sequence_id) {
 
 ErrorCode P2PHotStandbyService::StartOplogFollowingLocked(
     uint64_t baseline_sequence_id) {
+    ResetOplogFollowingLocked();
+
     watcher_oplog_store_ = OpLogStoreFactory::Create(
         config_.oplog_store_type, config_.cluster_id, OpLogStoreRole::READER,
         config_.oplog_store_root_dir, config_.oplog_poll_interval_ms);
@@ -91,15 +94,19 @@ ErrorCode P2PHotStandbyService::StartOplogFollowingLocked(
     return ErrorCode::INTERNAL_ERROR;
 }
 
-void P2PHotStandbyService::Stop() {
-    std::lock_guard<std::mutex> lock(mutex_);
-
+void P2PHotStandbyService::ResetOplogFollowingLocked() {
     if (oplog_replicator_) {
         oplog_replicator_->Stop();
         oplog_replicator_.reset();
     }
     oplog_change_notifier_.reset();
     watcher_oplog_store_.reset();
+}
+
+void P2PHotStandbyService::Stop() {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    ResetOplogFollowingLocked();
 
     StandbyState state = state_machine_.GetState();
     if (state != StandbyState::STOPPED) {
@@ -143,6 +150,7 @@ ErrorCode P2PHotStandbyService::Promote() {
     auto err = FinalCatchUpForPromotionLocked(applied_before_catch_up);
     if (err != ErrorCode::OK) {
         state_machine_.ProcessEvent(StandbyEvent::PROMOTION_FAILED);
+        ResetOplogFollowingLocked();
         return err;
     }
 
@@ -153,9 +161,7 @@ ErrorCode P2PHotStandbyService::Promote() {
         return ErrorCode::INTERNAL_ERROR;
     }
 
-    oplog_replicator_.reset();
-    oplog_change_notifier_.reset();
-    watcher_oplog_store_.reset();
+    ResetOplogFollowingLocked();
     LOG(INFO) << "P2PHotStandbyService promoted"
               << ", latest_applied_sequence_id="
               << GetLocalLastAppliedSequenceIdLocked();
@@ -276,6 +282,8 @@ void P2PHotStandbyService::OnWatcherEvent(StandbyEvent event) {
                 << ", event=" << StandbyEventToString(event)
                 << ", reason=" << result.reason;
     }
+    // TODO: Add service-level recovery orchestration for RECONNECTING and
+    // RECOVERING states in the follow-up error handling PR.
 }
 
 }  // namespace mooncake

@@ -25,6 +25,7 @@ bool P2PStandbyMetadataStore::Put(const std::string& /*key*/,
 
 std::optional<StandbyObjectMetadata> P2PStandbyMetadataStore::GetMetadata(
     const std::string& key) const {
+    std::lock_guard<std::mutex> lock(mutex_);
     auto it = objects_.find(key);
     if (it == objects_.end()) {
         return std::nullopt;
@@ -33,14 +34,19 @@ std::optional<StandbyObjectMetadata> P2PStandbyMetadataStore::GetMetadata(
 }
 
 bool P2PStandbyMetadataStore::Remove(const std::string& key) {
+    std::lock_guard<std::mutex> lock(mutex_);
     return objects_.erase(key) > 0;
 }
 
 bool P2PStandbyMetadataStore::Exists(const std::string& key) const {
+    std::lock_guard<std::mutex> lock(mutex_);
     return objects_.find(key) != objects_.end();
 }
 
-size_t P2PStandbyMetadataStore::GetKeyCount() const { return objects_.size(); }
+size_t P2PStandbyMetadataStore::GetKeyCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return objects_.size();
+}
 
 // ============================================================================
 // P2P-specific operations
@@ -50,6 +56,7 @@ void P2PStandbyMetadataStore::AddReplica(const std::string& object_key,
                                          const UUID& client_id,
                                          const UUID& segment_id, size_t size,
                                          uint64_t sequence_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
     auto& metadata = objects_[object_key];
     metadata.size = size;
     metadata.last_sequence_id = sequence_id;
@@ -110,6 +117,7 @@ void P2PStandbyMetadataStore::AddReplica(const std::string& object_key,
 void P2PStandbyMetadataStore::RemoveReplica(const std::string& object_key,
                                             const UUID& client_id,
                                             const UUID& segment_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
     auto it = objects_.find(object_key);
     if (it == objects_.end()) {
         VLOG(1) << "P2PStandbyMetadataStore::RemoveReplica key=" << object_key
@@ -146,6 +154,7 @@ void P2PStandbyMetadataStore::RemoveReplica(const std::string& object_key,
 void P2PStandbyMetadataStore::RegisterClient(
     const UUID& client_id, const std::string& ip_address, uint16_t rpc_port,
     const std::vector<Segment>& segments) {
+    std::lock_guard<std::mutex> lock(mutex_);
     auto& info = clients_[client_id];
     info.client_id = client_id;
     info.ip_address = ip_address;
@@ -173,6 +182,7 @@ void P2PStandbyMetadataStore::RegisterClient(
 }
 
 void P2PStandbyMetadataStore::UnRegisterClient(const UUID& client_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
     clients_.erase(client_id);
 
     // Cascade delete: remove all replicas owned by this client.
@@ -204,6 +214,7 @@ void P2PStandbyMetadataStore::UnRegisterClient(const UUID& client_id) {
 
 void P2PStandbyMetadataStore::AddSegment(const UUID& client_id,
                                          const Segment& segment) {
+    std::lock_guard<std::mutex> lock(mutex_);
     auto& info = clients_[client_id];
     info.client_id = client_id;  // In case client wasn't registered yet
 
@@ -225,6 +236,7 @@ void P2PStandbyMetadataStore::AddSegment(const UUID& client_id,
 
 void P2PStandbyMetadataStore::RemoveSegment(const UUID& segment_id,
                                             const UUID& client_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
     // Remove segment from client
     auto client_it = clients_.find(client_id);
     if (client_it != clients_.end()) {
@@ -245,10 +257,12 @@ void P2PStandbyMetadataStore::RemoveSegment(const UUID& segment_id,
 }
 
 void P2PStandbyMetadataStore::RemoveReplicasBySegment(const UUID& segment_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
     RemoveReplicasBySegmentInternal(segment_id);
 }
 
 void P2PStandbyMetadataStore::RemoveAllMetadata() {
+    std::lock_guard<std::mutex> lock(mutex_);
     objects_.clear();
     clients_.clear();
     VLOG(1) << "P2PStandbyMetadataStore::RemoveAllMetadata";
@@ -260,6 +274,7 @@ void P2PStandbyMetadataStore::RemoveAllMetadata() {
 
 P2PStandbyMetadataStore::ExportedMetadata
 P2PStandbyMetadataStore::ExportMetadata() const {
+    std::lock_guard<std::mutex> lock(mutex_);
     ExportedMetadata result;
     result.objects = objects_;
     result.clients = clients_;
@@ -292,10 +307,26 @@ P2PStandbyMetadataStore::ExportMetadata() const {
 // Query helpers
 // ============================================================================
 
-const P2PStandbyClientInfo* P2PStandbyMetadataStore::GetClient(
+std::shared_ptr<const P2PStandbyClientInfo> P2PStandbyMetadataStore::GetClient(
     const UUID& client_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
     auto it = clients_.find(client_id);
-    return it != clients_.end() ? &it->second : nullptr;
+    if (it == clients_.end()) {
+        return nullptr;
+    }
+    return std::make_shared<P2PStandbyClientInfo>(it->second);
+}
+
+std::unordered_map<std::string, StandbyObjectMetadata>
+P2PStandbyMetadataStore::GetObjects() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return objects_;
+}
+
+std::unordered_map<UUID, P2PStandbyClientInfo, boost::hash<UUID>>
+P2PStandbyMetadataStore::GetClients() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return clients_;
 }
 
 // ============================================================================

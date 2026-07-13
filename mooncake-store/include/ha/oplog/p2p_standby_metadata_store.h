@@ -2,6 +2,8 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -38,10 +40,9 @@ struct P2PStandbyClientInfo {
 ///   - objects_: key → replica list (mirrors Primary's object metadata)
 ///   - clients_: client_id → client info (ip, port, segments)
 ///
-/// Thread safety: this class is NOT thread-safe. It is accessed by a single
-/// thread — the OpLogReplicator callback thread writes via P2POpLogApplier,
-/// and ExportMetadata() is called only after Replicator::Stop() has joined
-/// the callback thread during promotion.
+/// Thread safety: public methods protect objects_ and clients_ with an
+/// internal mutex so ExportMetadata() and diagnostic reads can run safely while
+/// the OpLogReplicator callback thread is applying new entries.
 class P2PStandbyMetadataStore : public MetadataStore {
    public:
     P2PStandbyMetadataStore() = default;
@@ -116,19 +117,15 @@ class P2PStandbyMetadataStore : public MetadataStore {
     // ========================================================================
 
     /// Get client info by client_id. Returns nullptr if not found.
-    const P2PStandbyClientInfo* GetClient(const UUID& client_id) const;
+    std::shared_ptr<const P2PStandbyClientInfo> GetClient(
+        const UUID& client_id) const;
 
     /// Get all objects. For testing/diagnostics only.
-    const std::unordered_map<std::string, StandbyObjectMetadata>& GetObjects()
-        const {
-        return objects_;
-    }
+    std::unordered_map<std::string, StandbyObjectMetadata> GetObjects() const;
 
     /// Get all clients. For testing/diagnostics only.
-    const std::unordered_map<UUID, P2PStandbyClientInfo, boost::hash<UUID>>&
-    GetClients() const {
-        return clients_;
-    }
+    std::unordered_map<UUID, P2PStandbyClientInfo, boost::hash<UUID>>
+    GetClients() const;
 
    private:
     // Remove all replicas referencing a segment.
@@ -139,6 +136,8 @@ class P2PStandbyMetadataStore : public MetadataStore {
 
     // Client UUID → client info (ip, port, segments)
     std::unordered_map<UUID, P2PStandbyClientInfo, boost::hash<UUID>> clients_;
+
+    mutable std::mutex mutex_;
 };
 
 }  // namespace mooncake

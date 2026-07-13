@@ -68,6 +68,7 @@ class P2PHotStandbyService {
 
    private:
     ErrorCode StartOplogFollowingLocked(uint64_t baseline_sequence_id);
+    void ResetOplogFollowingLocked();
     ErrorCode FinalCatchUpForPromotionLocked(uint64_t current_applied_seq_id);
     uint64_t GetLocalLastAppliedSequenceIdLocked() const;
     void OnWatcherEvent(StandbyEvent event);
