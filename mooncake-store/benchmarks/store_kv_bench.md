@@ -52,6 +52,58 @@ next phase continues.
 `zcopy` mode automatically allocates temporary user buffers and registers them
 with `register_buffer`.
 
+## Local RPC Scaling Test Record
+
+The following results record a local single-host TCP test. They are useful for
+comparing configurations on that host, but are not intended as portable
+performance baselines. Values were 4 KiB, batches contained 32 objects, and
+each measured phase ran for 5 seconds. The client used 64 synchronous request
+lanes. All measured phases completed without misses or failed objects.
+
+The table reports the median of three runs for selected RPC thread counts with
+jemalloc preloaded in both the Master and benchmark client:
+
+| `rpc_thread_num` | `put_batch` KV/s | `get_batch` KV/s | `batch_get_into` KV/s |
+| ---: | ---: | ---: | ---: |
+| 1 | 30,211 | 127,665 | 44,895 |
+| 8 | 31,193 | 127,374 | 46,551 |
+| 32 | 29,459 | 130,937 | 47,268 |
+
+Increasing RPC workers did not produce linear end-to-end scaling in this
+workload. The data path, client-side processing, and per-batch work dominate
+before the Master RPC worker pool does.
+
+To isolate the Master control plane, a separate client repeatedly called
+`BatchGetReplicaList` for 32 existing keys without transferring object data.
+It used 64 synchronous lanes and preloaded jemalloc in the Master and clients:
+
+| `rpc_thread_num` | Lookups/s | BatchGet RPC/s | P50 latency |
+| ---: | ---: | ---: | ---: |
+| 1 | 0.784 M | 24.5 K | 2.520 ms |
+| 2 | 1.265 M | 39.5 K | 1.601 ms |
+| 4 | 2.126 M | 66.4 K | 0.936 ms |
+| 8 | 3.244 M | 101.4 K | 0.624 ms |
+| 16 | 3.732 M | 116.6 K | 0.519 ms |
+| 32 | 3.870 M | 121.0 K | 0.505 ms |
+
+This control-plane workload scaled by about 4.9x from 1 to 32 workers, with
+most of the gain reached by 16 workers. A second control-plane test alternated
+`BatchGetReplicaList`, `BatchPutStart` plus `BatchPutEnd`, and `BatchExistKey`
+in a 1:1:1 operation mix. With 16 client lanes, batch size 32, jemalloc, and an
+8-second measurement per point, the result was:
+
+| `rpc_thread_num` | Mixed cycles/s | Relative to 1 thread |
+| ---: | ---: | ---: |
+| 1 | 4.20 K | 1.00x |
+| 2 | 6.42 K | 1.53x |
+| 4 | 8.29 K | 1.97x |
+| 8 | 10.27 K | 2.44x |
+| 16 | 13.26 K | 3.15x |
+
+One mixed cycle contains one operation of each type, while the BatchPut
+operation itself contains two Master RPCs. This test excludes Python GIL and
+Transfer Engine data movement, and completed without RPC failures.
+
 ## Key Rules
 
 - Keys are generated deterministically:

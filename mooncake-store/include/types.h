@@ -88,7 +88,7 @@ static constexpr uint64_t DEFAULT_KV_SOFT_PIN_TTL_MS =
     30 * 60 * 1000;  // 30 minutes
 static constexpr bool DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS = true;
 static constexpr double DEFAULT_EVICTION_RATIO = 0.05;
-static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.95;
+static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
 static constexpr double DEFAULT_NOF_EVICTION_RATIO = 0.05;
 static constexpr double DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO = 0.95;
 static constexpr int64_t DEFAULT_MASTER_VIEW_LEASE_TTL_SEC = 5;  // in seconds
