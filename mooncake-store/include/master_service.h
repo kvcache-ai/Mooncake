@@ -632,7 +632,9 @@ class MasterService {
      * @brief Mounts a file storage segment into the master.
      * @param enable_offloading If true, enables offloading (write-to-file).
      */
-    auto MountLocalDiskSegment(const UUID& client_id, bool enable_offloading)
+    auto MountLocalDiskSegment(const UUID& client_id, bool enable_offloading,
+                               const std::string& local_disk_segment_id = {},
+                               const std::string& transport_endpoint = {})
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -1244,6 +1246,7 @@ class MasterService {
 
     static bool HasCompletedMemoryCacheReplica(const ObjectMetadata& metadata);
     static bool HasCompletedDiskCacheReplica(const ObjectMetadata& metadata);
+    static bool HasCompletedLocalDiskReplica(const ObjectMetadata& metadata);
     static void SyncCacheTotalAccounting(ObjectMetadata& metadata);
     void RebuildCacheTotalAccounting();
     static void AccountCacheTotalRemoval(ObjectMetadata& metadata);
@@ -1255,6 +1258,7 @@ class MasterService {
     size_t EraseReplicasWithCacheTotalAccounting(
         ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& pred_fn);
+    size_t EraseDisconnectedLocalDiskReplicas(ObjectMetadata& metadata);
 
     static constexpr size_t kNumTenantQuotaShards = 1024;
     struct TenantQuotaShard {
@@ -1407,6 +1411,7 @@ class MasterService {
         std::unordered_map<std::string, ObjectMetadata>::iterator it,
         const std::string& tenant_id);
     void ReleaseLocalDiskUsage(const std::vector<Replica>& replicas);
+    void AddLocalDiskUsage(const UUID& client_id, int64_t bytes);
     enum class QuotaEraseMode {
         kFull,
         kPreserveOld,
@@ -1459,6 +1464,10 @@ class MasterService {
         ObjectMetadata& metadata,
         const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients,
         MetadataShardAccessorRW* shard = nullptr);
+
+    size_t ReattachDisconnectedLocalDiskReplicas(
+        const std::string& local_disk_segment_id, const UUID& new_client_id,
+        const std::string& transport_endpoint);
 
     // Helper: allocate replicas, create ObjectMetadata, insert into shard,
     // and return descriptor list.  Shared by PutStart and UpsertStart.
@@ -1884,6 +1893,8 @@ class MasterService {
         128 * 1024;  // Size of the client ping queue
     boost::lockfree::queue<PodUUID> client_ping_queue_{kClientPingQueueSize};
     const int64_t client_live_ttl_sec_;
+    const std::chrono::seconds local_disk_rejoin_grace_period_;
+    std::atomic<size_t> disconnected_local_disk_replica_count_{0};
     const std::chrono::seconds nof_heartbeat_interval_sec_;
     const std::chrono::milliseconds nof_heartbeat_probe_timeout_ms_;
     const uint32_t nof_heartbeat_failures_threshold_;

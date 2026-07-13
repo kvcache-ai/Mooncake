@@ -55,12 +55,41 @@ static const std::string SNAPSHOT_SEGMENTS_FILE = "segments";
 static const std::string SNAPSHOT_TASK_MANAGER_FILE = "task_manager";
 static const std::string SNAPSHOT_MANIFEST_FILE = "manifest.txt";
 static const std::string SNAPSHOT_LATEST_FILE = "latest.txt";
+std::string PercentEncodeMetadataKey(const std::string& key) {
+    std::ostringstream oss;
+    static constexpr char kHex[] = "0123456789ABCDEF";
+    for (unsigned char ch : key) {
+        if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+            (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.' ||
+            ch == '~') {
+            oss << ch;
+        } else {
+            oss << '%' << kHex[ch >> 4] << kHex[ch & 0x0F];
+        }
+    }
+    return oss.str();
+}
 static const std::string SNAPSHOT_BACKUP_SAVE_DIR =
     "mooncake_snapshot_save_backup";
 static const std::string SNAPSHOT_BACKUP_RESTORE_DIR =
     "mooncake_snapshot_restore_backup";
 static const std::string SNAPSHOT_SERIALIZER_VERSION = "1.0.0";
 static const std::string SNAPSHOT_SERIALIZER_TYPE = "messagepack";
+
+void AtomicSaturatingSub(std::atomic<size_t>& value, size_t delta) {
+    if (delta == 0) {
+        return;
+    }
+    size_t current = value.load(std::memory_order_relaxed);
+    while (current > 0) {
+        const size_t next = current > delta ? current - delta : 0;
+        if (value.compare_exchange_weak(current, next,
+                                        std::memory_order_relaxed,
+                                        std::memory_order_relaxed)) {
+            return;
+        }
+    }
+}
 
 namespace {
 
@@ -200,6 +229,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
           config.nof_eviction_high_watermark_ratio),
       view_version_(config.view_version),
       client_live_ttl_sec_(config.client_live_ttl_sec),
+      local_disk_rejoin_grace_period_(
+          std::chrono::seconds(config.local_disk_rejoin_grace_sec)),
       nof_heartbeat_interval_sec_(
           std::chrono::seconds(config.nof_heartbeat_interval_sec)),
       nof_heartbeat_probe_timeout_ms_(
@@ -1657,6 +1688,13 @@ bool MasterService::HasCompletedDiskCacheReplica(
     });
 }
 
+bool MasterService::HasCompletedLocalDiskReplica(
+    const ObjectMetadata& metadata) {
+    return metadata.HasReplica([](const Replica& replica) {
+        return replica.is_local_disk_replica() && replica.is_completed();
+    });
+}
+
 void MasterService::SyncCacheTotalAccounting(ObjectMetadata& metadata) {
     const bool has_memory_cache_replica =
         HasCompletedMemoryCacheReplica(metadata);
@@ -1726,6 +1764,17 @@ size_t MasterService::EraseReplicasWithCacheTotalAccounting(
     // No-op for memory/noF replicas, so it is safe to call unconditionally.
     ReleaseLocalDiskUsage(erased_replicas);
     return erased_replicas.size();
+}
+
+size_t MasterService::EraseDisconnectedLocalDiskReplicas(
+    ObjectMetadata& metadata) {
+    const size_t erased = EraseReplicasWithCacheTotalAccounting(
+        metadata, [](const Replica& replica) {
+            return replica.is_local_disk_replica() &&
+                   replica.status() == ReplicaStatus::DISCONNECTED;
+        });
+    AtomicSaturatingSub(disconnected_local_disk_replica_count_, erased);
+    return erased;
 }
 
 std::unordered_map<std::string, MasterService::ObjectMetadata>::iterator
@@ -1828,6 +1877,26 @@ void MasterService::ReleaseLocalDiskUsage(
         if (disk_it != client_segments.end()) {
             disk_it->second->ssd_used_bytes.fetch_sub(
                 bytes, std::memory_order_relaxed);
+        }
+    }
+}
+
+void MasterService::AddLocalDiskUsage(const UUID& client_id, int64_t bytes) {
+    if (bytes == 0) {
+        return;
+    }
+
+    ScopedLocalDiskSegmentAccess ssd_access =
+        segment_manager_.getLocalDiskSegmentAccess();
+    auto& client_segments = ssd_access.getClientLocalDiskSegment();
+    auto disk_it = client_segments.find(client_id);
+    if (disk_it != client_segments.end()) {
+        if (bytes > 0) {
+            disk_it->second->ssd_used_bytes.fetch_add(
+                bytes, std::memory_order_relaxed);
+        } else {
+            disk_it->second->ssd_used_bytes.fetch_sub(
+                -bytes, std::memory_order_relaxed);
         }
     }
 }
@@ -1951,9 +2020,15 @@ void MasterService::TaskCleanupThreadFunc() {
         }
 
         std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-        auto write_access = task_manager_.get_write_access();
-        write_access.prune_expired_tasks();
-        write_access.prune_finished_tasks();
+        {
+            auto write_access = task_manager_.get_write_access();
+            write_access.prune_expired_tasks();
+            write_access.prune_finished_tasks();
+        }
+        if (disconnected_local_disk_replica_count_.load(
+                std::memory_order_relaxed) > 0) {
+            ClearInvalidHandles();
+        }
     }
     LOG(INFO) << "Task cleanup thread stopped";
 }
@@ -3363,23 +3438,50 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
         return true;
     }
 
+    size_t updated_existing = 0;
+    size_t disconnected_completed = 0;
+    const bool had_completed_disk = HasCompletedLocalDiskReplica(metadata);
     metadata.VisitReplicas(
         [client_id](const Replica& rep) {
             return rep.type() == ReplicaType::LOCAL_DISK &&
                    rep.get_descriptor().get_local_disk_descriptor().client_id ==
                        client_id;
         },
-        [&replica](Replica& rep) {
-            rep.get_descriptor()
-                .get_local_disk_descriptor()
-                .transport_endpoint = replica.get_descriptor()
-                                          .get_local_disk_descriptor()
-                                          .transport_endpoint;
-            rep.get_descriptor().get_local_disk_descriptor().object_size =
-                replica.get_descriptor()
-                    .get_local_disk_descriptor()
-                    .object_size;
+        [&replica, &updated_existing, &disconnected_completed](Replica& rep) {
+            const auto desc =
+                replica.get_descriptor().get_local_disk_descriptor();
+            const bool was_disconnected =
+                rep.status() == ReplicaStatus::DISCONNECTED;
+            rep.update_local_disk_metadata(desc.object_size,
+                                           desc.transport_endpoint,
+                                           desc.local_disk_segment_id);
+            if (was_disconnected) {
+                rep.mark_complete();
+                disconnected_completed++;
+            }
+            updated_existing++;
         });
+    if (updated_existing == 0) {
+        std::vector<Replica> replicas;
+        replicas.emplace_back(std::move(replica));
+        metadata.AddReplicas(std::move(replicas));
+        auto& shard = accessor.GetShard();
+        if (!had_completed_disk) {
+            shard.OnDiskReplicaAdded(metadata);
+        }
+        SyncCacheTotalAccounting(metadata);
+        return true;
+    }
+    if (disconnected_completed > 0) {
+        AtomicSaturatingSub(disconnected_local_disk_replica_count_,
+                            disconnected_completed);
+        if (!had_completed_disk) {
+            auto& shard = accessor.GetShard();
+            shard.OnDiskReplicaAdded(metadata);
+        }
+        SyncCacheTotalAccounting(metadata);
+        return true;
+    }
     return false;
 }
 
@@ -3613,13 +3715,30 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                         ErrorCode::OBJECT_HAS_REPLICATION_TASK);
                 }
 
+                {
+                    const bool had_completed_disk =
+                        HasCompletedLocalDiskReplica(metadata);
+                    const size_t removed_disconnected =
+                        EraseDisconnectedLocalDiskReplicas(metadata);
+                    if (removed_disconnected > 0) {
+                        shard.OnDiskReplicaRemoved(had_completed_disk,
+                                                   metadata);
+                        if (!metadata.HasReplica(&Replica::fn_is_completed)) {
+                            EraseMetadata(tenant_state, it, object_id.tenant_id,
+                                          QuotaEraseMode::kFull, &shard);
+                            it = tenant_state.metadata.end();
+                        }
+                    }
+                }
+
                 // Preempt an in-progress Put/Upsert on the same key.  The
                 // previous writer's PROCESSING replicas are moved to
                 // discarded_replicas_ with a TTL so they are not freed while
                 // the old writer may still be doing RDMA writes.  Unlike
                 // PutStart (which only preempts after a timeout), UpsertStart
                 // preempts immediately.
-                if (tenant_state.processing_keys.count(key) > 0) {
+                if (it != tenant_state.metadata.end() &&
+                    tenant_state.processing_keys.count(key) > 0) {
                     auto processing_replicas =
                         metadata.PopReplicas(&Replica::fn_is_processing);
                     if (!processing_replicas.empty()) {
@@ -3747,6 +3866,15 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                         : CompletedMemoryQuotaCharge(metadata);
                 auto old_replicas =
                     PopReplicasWithCacheTotalAccounting(metadata);
+                ReleaseLocalDiskUsage(old_replicas);
+                AtomicSaturatingSub(
+                    disconnected_local_disk_replica_count_,
+                    std::count_if(old_replicas.begin(), old_replicas.end(),
+                                  [](const Replica& replica) {
+                                      return replica.is_local_disk_replica() &&
+                                             replica.status() ==
+                                                 ReplicaStatus::DISCONNECTED;
+                                  }));
                 if (!old_replicas.empty()) {
                     std::lock_guard lock(discarded_replicas_mutex_);
                     discarded_replicas_.emplace_back(
@@ -4505,6 +4633,12 @@ auto MasterService::Remove(const std::string& key, const std::string& tenant_id,
     }
 
     auto& metadata = accessor.Get();
+    if (force && EraseDisconnectedLocalDiskReplicas(metadata) > 0) {
+        if (!metadata.IsValid()) {
+            accessor.Erase();
+            return {};
+        }
+    }
 
     if (!force && !metadata.IsLeaseExpired()) {
         VLOG(1) << "key=" << key << ", error=object_has_lease";
@@ -4723,8 +4857,12 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
             auto tenant_it = shard->tenants.find(normalized_tenant);
             if (tenant_it == shard->tenants.end()) {
                 VLOG(1) << "key=" << key << ", error=object_not_found";
-                results[original_idx] =
-                    tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+                if (force) {
+                    results[original_idx] = {};
+                } else {
+                    results[original_idx] =
+                        tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+                }
                 continue;
             }
             auto& tenant_state = tenant_it->second;
@@ -4758,6 +4896,17 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
             }
 
             auto& metadata = it->second;
+            if (force && EraseDisconnectedLocalDiskReplicas(metadata) > 0) {
+                if (!metadata.IsValid()) {
+                    EraseMetadata(tenant_state, it, normalized_tenant,
+                                  QuotaEraseMode::kFull, &shard);
+                    if (tenant_state.Empty()) {
+                        shard->tenants.erase(tenant_it);
+                    }
+                    results[original_idx] = {};
+                    continue;
+                }
+            }
 
             if (!force && !metadata.IsLeaseExpired(now)) {
                 VLOG(1) << "key=" << key << ", error=object_has_lease";
@@ -4801,16 +4950,45 @@ bool MasterService::CleanupStaleHandles(
     bool had_completed_disk = metadata.HasReplica([](const Replica& r) {
         return r.is_local_disk_replica() && r.is_completed();
     });
-    // Remove those with invalid allocators (memory replicas on unmounted
-    // segments) and local_disk replicas whose owner client is no longer alive.
-    const uint64_t before_charge = CompletedMemoryQuotaCharge(metadata);
-    EraseReplicasWithCacheTotalAccounting(
-        metadata, [&alive_clients](const Replica& replica) {
-            return (replica.has_invalid_mem_handle() ||
-                    replica.has_invalid_nof_handle() ||
-                    replica.has_stale_local_disk_client(alive_clients)) &&
-                   replica.is_completed();
+    size_t disconnected_local_disk = 0;
+    metadata.VisitReplicas(
+        [&alive_clients](const Replica& replica) {
+            return replica.is_local_disk_replica() && replica.is_completed() &&
+                   replica.has_stale_local_disk_client(alive_clients);
+        },
+        [&disconnected_local_disk](Replica& replica) {
+            replica.mark_disconnected();
+            disconnected_local_disk++;
         });
+
+    if (disconnected_local_disk > 0) {
+        disconnected_local_disk_replica_count_.fetch_add(
+            disconnected_local_disk, std::memory_order_relaxed);
+        LOG(INFO) << "action=local_disk_replica_disconnected"
+                  << ", count=" << disconnected_local_disk;
+    }
+
+    // Remove those with invalid allocators (memory replicas on unmounted
+    // segments). LOCAL_DISK replicas are retained as DISCONNECTED so a
+    // returning client can re-adopt them by local_disk_segment_id.
+    const uint64_t before_charge = CompletedMemoryQuotaCharge(metadata);
+    size_t expired_disconnected_local_disk = 0;
+    EraseReplicasWithCacheTotalAccounting(
+        metadata,
+        [this, &expired_disconnected_local_disk](const Replica& replica) {
+            const bool expired_disconnected =
+                replica.local_disk_disconnected_for_at_least(
+                    local_disk_rejoin_grace_period_);
+            if (expired_disconnected) {
+                expired_disconnected_local_disk++;
+            }
+            return (replica.has_invalid_mem_handle() ||
+                    replica.has_invalid_nof_handle() || expired_disconnected) &&
+                   (replica.is_completed() ||
+                    replica.status() == ReplicaStatus::DISCONNECTED);
+        });
+    AtomicSaturatingSub(disconnected_local_disk_replica_count_,
+                        expired_disconnected_local_disk);
     const uint64_t after_charge = CompletedMemoryQuotaCharge(metadata);
     if (before_charge > after_charge) {
         ReleaseCommittedQuotaCharge(metadata, before_charge - after_charge);
@@ -4824,6 +5002,81 @@ bool MasterService::CleanupStaleHandles(
 
     // Return true if no valid replicas remain after cleanup
     return !metadata.IsValid();
+}
+
+size_t MasterService::ReattachDisconnectedLocalDiskReplicas(
+    const std::string& local_disk_segment_id, const UUID& new_client_id,
+    const std::string& transport_endpoint) {
+    if (local_disk_segment_id.empty()) {
+        return 0;
+    }
+
+    size_t reattached = 0;
+    size_t disconnected_reattached = 0;
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    for (size_t i = 0; i < kNumShards; i++) {
+        MetadataShardAccessorRW shard(this, i);
+        for (auto& tenant_pair : shard->tenants) {
+            for (auto& metadata_pair : tenant_pair.second.metadata) {
+                auto& metadata = metadata_pair.second;
+                const bool had_completed_disk =
+                    HasCompletedLocalDiskReplica(metadata);
+                size_t local_count = 0;
+                int64_t local_bytes = 0;
+                metadata.VisitReplicas(
+                    [&local_disk_segment_id,
+                     &new_client_id](const Replica& replica) {
+                        if (!replica.is_local_disk_replica() ||
+                            replica.get_local_disk_segment_id() !=
+                                local_disk_segment_id) {
+                            return false;
+                        }
+                        if (replica.status() == ReplicaStatus::DISCONNECTED) {
+                            return true;
+                        }
+                        const auto owner = replica.get_local_disk_client_id();
+                        return replica.is_completed() && owner.has_value() &&
+                               owner.value() != new_client_id;
+                    },
+                    [this, &new_client_id, &transport_endpoint,
+                     &disconnected_reattached, &local_count,
+                     &local_bytes](Replica& replica) {
+                        const auto desc = replica.get_descriptor()
+                                              .get_local_disk_descriptor();
+                        if (desc.client_id != new_client_id) {
+                            AddLocalDiskUsage(
+                                desc.client_id,
+                                -static_cast<int64_t>(desc.object_size));
+                        }
+                        local_bytes += static_cast<int64_t>(desc.object_size);
+                        if (replica.status() == ReplicaStatus::DISCONNECTED) {
+                            disconnected_reattached++;
+                        }
+                        replica.update_local_disk_owner(new_client_id,
+                                                        transport_endpoint);
+                        replica.mark_complete();
+                        local_count++;
+                    });
+                if (local_count > 0) {
+                    if (!had_completed_disk) {
+                        shard.OnDiskReplicaAdded(metadata);
+                    }
+                    AddLocalDiskUsage(new_client_id, local_bytes);
+                    reattached += local_count;
+                }
+            }
+        }
+    }
+
+    if (reattached > 0) {
+        AtomicSaturatingSub(disconnected_local_disk_replica_count_,
+                            disconnected_reattached);
+        LOG(INFO) << "action=reattach_local_disk_replicas"
+                  << ", local_disk_segment_id=" << local_disk_segment_id
+                  << ", client_id=" << new_client_id
+                  << ", count=" << reattached;
+    }
+    return reattached;
 }
 
 size_t MasterService::GetKeyCount() const {
@@ -4882,36 +5135,42 @@ MasterService::GetStorageConfig() const {
     return GetStorageConfigResponse(fsdir, enable_disk_eviction_, quota_bytes_);
 }
 
-auto MasterService::MountLocalDiskSegment(const UUID& client_id,
-                                          bool enable_offloading)
-    -> tl::expected<void, ErrorCode> {
+auto MasterService::MountLocalDiskSegment(
+    const UUID& client_id, bool enable_offloading,
+    const std::string& local_disk_segment_id,
+    const std::string& transport_endpoint) -> tl::expected<void, ErrorCode> {
     if (!enable_offload_) {
         LOG(ERROR) << "	The offload functionality is not enabled";
         return tl::make_unexpected(ErrorCode::UNABLE_OFFLOAD);
     }
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    {
+        std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
 
-    auto err =
-        segment_access.MountLocalDiskSegment(client_id, enable_offloading);
-    if (err == ErrorCode::SEGMENT_ALREADY_EXISTS) {
-        // Return OK because this is an idempotent operation
-        return {};
-    } else if (err != ErrorCode::OK) {
-        return tl::make_unexpected(err);
+        PodUUID pod_client_id;
+        pod_client_id.first = client_id.first;
+        pod_client_id.second = client_id.second;
+        if (!client_ping_queue_.push(pod_client_id)) {
+            LOG(ERROR) << "client_id=" << client_id
+                       << ", error=client_ping_queue_full";
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+
+        auto err = segment_access.MountLocalDiskSegment(
+            client_id, enable_offloading, local_disk_segment_id,
+            transport_endpoint);
+        if (err != ErrorCode::OK) {
+            return tl::make_unexpected(err);
+        }
     }
 
-    // Notify the client monitor thread to start tracking this client's TTL.
-    // Without this, a client that only mounts a LOCAL_DISK segment (and
-    // doesn't ping) would be considered expired by ClientMonitorFunc, which
-    // would then clear all its LOCAL_DISK replicas.
-    PodUUID pod_client_id;
-    pod_client_id.first = client_id.first;
-    pod_client_id.second = client_id.second;
-    if (!client_ping_queue_.push(pod_client_id)) {
-        LOG(ERROR) << "client_id=" << client_id
-                   << ", error=client_ping_queue_full";
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    const size_t reattached = ReattachDisconnectedLocalDiskReplicas(
+        local_disk_segment_id, client_id, transport_endpoint);
+    if (reattached > 0) {
+        LOG(INFO) << "action=mount_local_disk_segment_reattached"
+                  << ", local_disk_segment_id=" << local_disk_segment_id
+                  << ", count=" << reattached;
     }
 
     return {};
@@ -5059,8 +5318,14 @@ auto MasterService::NotifyOffloadSuccess(
             continue;
         }
 
+        std::string local_disk_segment_id;
+        if (local_disk_segment) {
+            MutexLocker locker(&local_disk_segment->offloading_mutex_);
+            local_disk_segment_id = local_disk_segment->local_disk_segment_id;
+        }
         Replica replica(client_id, metadata.data_size,
-                        metadata.transport_endpoint, ReplicaStatus::COMPLETE);
+                        metadata.transport_endpoint, ReplicaStatus::COMPLETE,
+                        local_disk_segment_id);
         bool handled_existing_object = false;
         bool added_new_local_disk_replica = false;
         {
@@ -5089,6 +5354,8 @@ auto MasterService::NotifyOffloadSuccess(
                     }
                     tenant_state.offloading_tasks.erase(task_it);
 
+                    const bool had_completed_disk =
+                        HasCompletedLocalDiskReplica(obj_metadata);
                     if (!obj_metadata.HasReplica(
                             &Replica::fn_is_local_disk_replica)) {
                         std::vector<Replica> replicas;
@@ -5099,6 +5366,8 @@ auto MasterService::NotifyOffloadSuccess(
                         SyncCacheTotalAccounting(obj_metadata);
                         added_new_local_disk_replica = true;
                     } else {
+                        size_t updated_existing = 0;
+                        size_t disconnected_completed = 0;
                         obj_metadata.VisitReplicas(
                             [client_id](const Replica& rep) {
                                 return rep.type() == ReplicaType::LOCAL_DISK &&
@@ -5106,20 +5375,43 @@ auto MasterService::NotifyOffloadSuccess(
                                                .get_local_disk_descriptor()
                                                .client_id == client_id;
                             },
-                            [&replica](Replica& rep) {
-                                rep.get_descriptor()
-                                    .get_local_disk_descriptor()
-                                    .transport_endpoint =
-                                    replica.get_descriptor()
-                                        .get_local_disk_descriptor()
-                                        .transport_endpoint;
-                                rep.get_descriptor()
-                                    .get_local_disk_descriptor()
-                                    .object_size =
-                                    replica.get_descriptor()
-                                        .get_local_disk_descriptor()
-                                        .object_size;
+                            [&replica, &local_disk_segment_id,
+                             &updated_existing,
+                             &disconnected_completed](Replica& rep) {
+                                auto desc = replica.get_descriptor()
+                                                .get_local_disk_descriptor();
+                                const bool was_disconnected =
+                                    rep.status() == ReplicaStatus::DISCONNECTED;
+                                rep.update_local_disk_metadata(
+                                    desc.object_size, desc.transport_endpoint,
+                                    local_disk_segment_id);
+                                if (was_disconnected) {
+                                    rep.mark_complete();
+                                    disconnected_completed++;
+                                }
+                                updated_existing++;
                             });
+                        if (updated_existing == 0) {
+                            std::vector<Replica> replicas;
+                            replicas.emplace_back(std::move(replica));
+                            obj_metadata.AddReplicas(std::move(replicas));
+                            auto& shard = accessor.GetShard();
+                            if (!had_completed_disk) {
+                                shard.OnDiskReplicaAdded(obj_metadata);
+                            }
+                            SyncCacheTotalAccounting(obj_metadata);
+                            added_new_local_disk_replica = true;
+                        } else if (disconnected_completed > 0) {
+                            AtomicSaturatingSub(
+                                disconnected_local_disk_replica_count_,
+                                disconnected_completed);
+                            if (!had_completed_disk) {
+                                auto& shard = accessor.GetShard();
+                                shard.OnDiskReplicaAdded(obj_metadata);
+                            }
+                            SyncCacheTotalAccounting(obj_metadata);
+                            added_new_local_disk_replica = true;
+                        }
                     }
                     handled_existing_object = true;
                 }
@@ -6257,6 +6549,22 @@ bool MasterService::TryRestoreStateFromSnapshot(
             }
         }
 
+        {
+            std::vector<UUID> local_disk_clients;
+            {
+                ScopedLocalDiskSegmentAccess local_disk_access =
+                    segment_manager_.getLocalDiskSegmentAccess();
+                for (const auto& [client_id, segment] :
+                     local_disk_access.getClientLocalDiskSegment()) {
+                    (void)segment;
+                    local_disk_clients.push_back(client_id);
+                }
+            }
+            for (const auto& client_id : local_disk_clients) {
+                Ping(client_id);
+            }
+        }
+
         LOG(INFO) << "[Restore] Successfully restored state from snapshot: "
                   << state_id;
         return true;
@@ -6314,7 +6622,7 @@ MasterService::EvictTenantMemoryForQuota(const std::string& tenant_id,
         return metadata.HasReplica(is_evictable_memory_replica);
     };
     auto has_local_disk_replica = [](const ObjectMetadata& metadata) {
-        return metadata.HasReplica(&Replica::fn_is_local_disk_replica);
+        return HasCompletedLocalDiskReplica(metadata);
     };
     auto evict_replicas =
         [&, this](ObjectMetadata& metadata,
@@ -6575,7 +6883,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
             : 0;
 
     auto has_local_disk_replica = [](const ObjectMetadata& metadata) {
-        return metadata.HasReplica(&Replica::fn_is_local_disk_replica);
+        return HasCompletedLocalDiskReplica(metadata);
     };
 
     // Returns freed bytes. Returns 0 if offload-queued and no additional
@@ -7909,9 +8217,7 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
         it->second.soft_pin_timeout = metadata_ptr->soft_pin_timeout;
 
         // Recompute disk_object_count for restored metadata
-        if (it->second.HasReplica([](const Replica& r) {
-                return r.is_local_disk_replica() && r.is_completed();
-            })) {
+        if (HasCompletedLocalDiskReplica(it->second)) {
             shard.disk_object_count++;
         }
     }
@@ -9024,6 +9330,14 @@ void MasterService::cleanupHttpMetadata(const std::string& segment_name) {
             http_metadata_prefix_ + "rpc_meta/" + segment_name;
         bool ram_removed = http_metadata_server_->removeKey(ram_key);
         bool rpc_removed = http_metadata_server_->removeKey(rpc_key);
+        if (!ram_removed) {
+            ram_removed = http_metadata_server_->removeKey(
+                PercentEncodeMetadataKey(ram_key));
+        }
+        if (!rpc_removed) {
+            rpc_removed = http_metadata_server_->removeKey(
+                PercentEncodeMetadataKey(rpc_key));
+        }
         LOG(INFO) << "Cleaned up HTTP metadata for segment: " << segment_name
                   << ", ram_key_removed=" << ram_removed
                   << ", rpc_key_removed=" << rpc_removed;

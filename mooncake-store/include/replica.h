@@ -5,6 +5,7 @@
 #include <boost/functional/hash.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -53,6 +54,7 @@ enum class ReplicaStatus {
     INITIALIZED,    // Space allocated, waiting for write
     PROCESSING,     // Write in progress
     COMPLETE,       // Write complete, replica is available
+    DISCONNECTED,   // Local disk replica retained but owner client is offline
     REMOVED,        // Replica has been removed
     FAILED,         // Failed state (can be used for reassignment)
 };
@@ -67,6 +69,7 @@ inline std::ostream& operator<<(std::ostream& os,
                        {ReplicaStatus::INITIALIZED, "INITIALIZED"},
                        {ReplicaStatus::PROCESSING, "PROCESSING"},
                        {ReplicaStatus::COMPLETE, "COMPLETE"},
+                       {ReplicaStatus::DISCONNECTED, "DISCONNECTED"},
                        {ReplicaStatus::REMOVED, "REMOVED"},
                        {ReplicaStatus::FAILED, "FAILED"}};
 
@@ -181,6 +184,8 @@ struct LocalDiskReplicaData {
     UUID client_id;
     uint64_t object_size = 0;
     std::string transport_endpoint;
+    std::string local_disk_segment_id;
+    std::chrono::steady_clock::time_point disconnected_at{};
 };
 
 struct MemoryDescriptor {
@@ -203,7 +208,9 @@ struct LocalDiskDescriptor {
     UUID client_id;
     uint64_t object_size = 0;
     std::string transport_endpoint;
-    YLT_REFL(LocalDiskDescriptor, client_id, object_size, transport_endpoint);
+    std::string local_disk_segment_id;
+    YLT_REFL(LocalDiskDescriptor, client_id, object_size, transport_endpoint,
+             local_disk_segment_id);
 };
 
 class Replica {
@@ -242,10 +249,14 @@ class Replica {
 
     // local disk replica constructor
     Replica(UUID client_id, uint64_t object_size,
-            std::string transport_endpoint, ReplicaStatus status)
+            std::string transport_endpoint, ReplicaStatus status,
+            std::string local_disk_segment_id = {})
         : id_(next_id_.fetch_add(1)),
-          data_(LocalDiskReplicaData{client_id, object_size,
-                                     std::move(transport_endpoint)}),
+          data_(LocalDiskReplicaData{client_id,
+                                     object_size,
+                                     std::move(transport_endpoint),
+                                     std::move(local_disk_segment_id),
+                                     {}}),
           status_(status),
           refcnt_(0) {
         MasterMetricManager::instance().inc_allocated_file_size(object_size);
@@ -428,13 +439,72 @@ class Replica {
         const;
 
     void mark_complete() {
-        if (status_ == ReplicaStatus::PROCESSING) {
+        if (status_ == ReplicaStatus::PROCESSING ||
+            status_ == ReplicaStatus::DISCONNECTED) {
             status_ = ReplicaStatus::COMPLETE;
         } else if (status_ == ReplicaStatus::COMPLETE) {
             LOG(WARNING) << "Replica already marked as complete";
         } else {
             LOG(ERROR) << "Invalid replica status: " << status_;
         }
+    }
+
+    void mark_disconnected() {
+        if (status_ == ReplicaStatus::COMPLETE && is_local_disk_replica()) {
+            status_ = ReplicaStatus::DISCONNECTED;
+            std::get<LocalDiskReplicaData>(data_).disconnected_at =
+                std::chrono::steady_clock::now();
+        } else if (status_ != ReplicaStatus::DISCONNECTED) {
+            LOG(ERROR) << "Cannot mark_disconnected from status: " << status_;
+        }
+    }
+
+    void update_local_disk_owner(const UUID& client_id,
+                                 std::string transport_endpoint) {
+        if (!is_local_disk_replica()) {
+            LOG(ERROR) << "Cannot update local disk owner on type: " << type();
+            return;
+        }
+        auto& disk_data = std::get<LocalDiskReplicaData>(data_);
+        disk_data.client_id = client_id;
+        disk_data.transport_endpoint = std::move(transport_endpoint);
+        disk_data.disconnected_at = {};
+    }
+
+    void update_local_disk_metadata(uint64_t object_size,
+                                    std::string transport_endpoint,
+                                    std::string local_disk_segment_id) {
+        if (!is_local_disk_replica()) {
+            LOG(ERROR) << "Cannot update local disk metadata on type: "
+                       << type();
+            return;
+        }
+        auto& disk_data = std::get<LocalDiskReplicaData>(data_);
+        disk_data.object_size = object_size;
+        disk_data.transport_endpoint = std::move(transport_endpoint);
+        disk_data.local_disk_segment_id = std::move(local_disk_segment_id);
+    }
+
+    [[nodiscard]] std::string get_local_disk_segment_id() const {
+        if (!is_local_disk_replica()) {
+            return {};
+        }
+        return std::get<LocalDiskReplicaData>(data_).local_disk_segment_id;
+    }
+
+    [[nodiscard]] bool local_disk_disconnected_for_at_least(
+        std::chrono::seconds grace_period) const {
+        if (!is_local_disk_replica() ||
+            status_ != ReplicaStatus::DISCONNECTED) {
+            return false;
+        }
+        const auto disconnected_at =
+            std::get<LocalDiskReplicaData>(data_).disconnected_at;
+        if (disconnected_at == std::chrono::steady_clock::time_point{}) {
+            return false;
+        }
+        return std::chrono::steady_clock::now() - disconnected_at >=
+               grace_period;
     }
 
     void mark_processing() {
@@ -627,6 +697,7 @@ inline Replica::Descriptor Replica::get_descriptor() const {
         local_disk_desc.client_id = disk_data.client_id;
         local_disk_desc.object_size = disk_data.object_size;
         local_disk_desc.transport_endpoint = disk_data.transport_endpoint;
+        local_disk_desc.local_disk_segment_id = disk_data.local_disk_segment_id;
         desc.descriptor_variant = std::move(local_disk_desc);
     }
 

@@ -747,8 +747,8 @@ TEST_F(SegmentTest, MountLocalDiskSegmentSuccess) {
 }
 
 // MountLocalDiskSegmentDuplicate Tests:
-// 1. MountLocalDiskSegment with the same segment id. The second mount operation
-// return SEGMENT_ALREADY_EXISTS.
+// 1. MountLocalDiskSegment with the same client id is idempotent and updates
+// the existing local disk segment metadata.
 // 2. MountLocalDiskSegment with different segment id and the same segment name
 // should be considered as different segments. Validate the status of
 // SegmentManager use ValidateMountedLocalDiskSegments function.
@@ -766,9 +766,9 @@ TEST_F(SegmentTest, MountLocalDiskSegmentDuplicate) {
     // Verify first mount
     ValidateMountedLocalDiskSegments(segment_manager, segment, client_id);
 
-    // Test duplicate mount - mount the same segment again
+    // Test duplicate mount - the same client can update its local disk segment
     ASSERT_EQ(segment_access.MountLocalDiskSegment(client_id, true),
-              ErrorCode::SEGMENT_ALREADY_EXISTS);
+              ErrorCode::OK);
 
     // Verify state remains the same after duplicate mount
     ValidateMountedLocalDiskSegments(segment_manager, segment, client_id);

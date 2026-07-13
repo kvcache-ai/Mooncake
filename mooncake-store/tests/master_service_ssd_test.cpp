@@ -37,6 +37,18 @@ std::unique_ptr<MasterService> CreateSsdAwareOffloadService() {
     return std::make_unique<MasterService>(config);
 }
 
+std::unique_ptr<MasterService> CreateSsdRejoinService(
+    int64_t client_live_ttl_sec, int64_t local_disk_rejoin_grace_sec) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.default_kv_lease_ttl = 0;
+    config.client_live_ttl_sec = client_live_ttl_sec;
+    config.local_disk_rejoin_grace_sec = local_disk_rejoin_grace_sec;
+    config.allocation_strategy_type =
+        AllocationStrategyType::SSD_FREE_RATIO_FIRST;
+    return std::make_unique<MasterService>(config);
+}
+
 void MountMemoryAndLocalDisk(MasterService& service, const UUID& client_id,
                              const std::string& segment_name,
                              size_t base_addr) {
@@ -49,6 +61,26 @@ void MountMemoryAndLocalDisk(MasterService& service, const UUID& client_id,
 
     ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
     ASSERT_TRUE(service.MountLocalDiskSegment(client_id, true).has_value());
+    ASSERT_TRUE(service.ReportSsdCapacity(client_id, 1000).has_value());
+}
+
+void MountMemoryAndLocalDisk(MasterService& service, const UUID& client_id,
+                             const std::string& segment_name, size_t base_addr,
+                             const std::string& local_disk_segment_id,
+                             const std::string& transport_endpoint) {
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = segment_name;
+    segment.base = base_addr;
+    segment.size = 64 * 1024 * 1024;
+    segment.te_endpoint = segment.name;
+
+    ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+    ASSERT_TRUE(service
+                    .MountLocalDiskSegment(client_id, true,
+                                           local_disk_segment_id,
+                                           transport_endpoint)
+                    .has_value());
     ASSERT_TRUE(service.ReportSsdCapacity(client_id, 1000).has_value());
 }
 
@@ -70,6 +102,22 @@ void PutAndOffload(MasterService& service, const UUID& client_id,
         .tenant_id = "default", .key = key, .size = object_size};
     ASSERT_TRUE(service.NotifyOffloadSuccess(client_id, {task}, {metadata})
                     .has_value());
+}
+
+void WaitForReplicaNotReady(MasterService& service, const std::string& key,
+                            std::chrono::seconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto result = service.GetReplicaList(key, "default");
+        if (!result.has_value() &&
+            result.error() == ErrorCode::REPLICA_IS_NOT_READY) {
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    auto result = service.GetReplicaList(key, "default");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::REPLICA_IS_NOT_READY);
 }
 
 void ExpectNextAllocationOnSegment(MasterService& service,
@@ -774,6 +822,380 @@ TEST_F(MasterServiceSSDTest, EvictDiskReplicaDecrementsFileCacheNums) {
     // mem_cache_nums_ unchanged (MEMORY replica still present).
     EXPECT_EQ(metrics.get_file_cache_nums(), baseline);
     EXPECT_EQ(metrics.get_mem_cache_nums(), baseline_mem + 1);
+}
+
+TEST_F(MasterServiceSSDTest,
+       LocalDiskReplicaDisconnectInvisibleThenReattachesBySegmentId) {
+    auto service = CreateSsdRejoinService(/*client_live_ttl_sec=*/1,
+                                          /*local_disk_rejoin_grace_sec=*/10);
+    const UUID old_client = generate_uuid();
+    const UUID new_client = generate_uuid();
+    const std::string marker = "local-disk-segment-rejoin-ok";
+    const std::string key = "ssd_rejoin_invisible_then_ok";
+
+    const std::string old_segment = "ssd_rejoin_old";
+    MountMemoryAndLocalDisk(*service, old_client, old_segment, 0xf00000000ULL,
+                            marker, "old_endpoint");
+    PutAndOffload(*service, old_client, key, 256, "old_endpoint");
+
+    auto clear_result =
+        service->BatchReplicaClear({key}, old_client, old_segment);
+    ASSERT_TRUE(clear_result.has_value());
+    ASSERT_EQ(clear_result->size(), 1u);
+    EXPECT_EQ((*clear_result)[0], key);
+    auto before_expiry = service->GetReplicaList(key, "default");
+    ASSERT_TRUE(before_expiry.has_value());
+    ASSERT_EQ(before_expiry->replicas.size(), 1u);
+    ASSERT_TRUE(before_expiry->replicas[0].is_local_disk_replica());
+
+    WaitForReplicaNotReady(*service, key, std::chrono::seconds(4));
+
+    MountMemoryAndLocalDisk(*service, new_client, "ssd_rejoin_new",
+                            0x1000000000ULL, marker, "new_endpoint");
+    auto reattached = service->GetReplicaList(key, "default");
+    ASSERT_TRUE(reattached.has_value());
+    ASSERT_EQ(reattached->replicas.size(), 1u);
+    const auto descriptor = reattached->replicas[0].get_local_disk_descriptor();
+    EXPECT_EQ(descriptor.client_id, new_client);
+    EXPECT_EQ(descriptor.transport_endpoint, "new_endpoint");
+    EXPECT_EQ(descriptor.local_disk_segment_id, marker);
+}
+
+TEST_F(MasterServiceSSDTest,
+       LocalDiskReplicaGraceExpiryRemovesAndMarkerMismatchCannotReattach) {
+    auto service = CreateSsdRejoinService(/*client_live_ttl_sec=*/1,
+                                          /*local_disk_rejoin_grace_sec=*/1);
+    const UUID old_client = generate_uuid();
+    const UUID mismatch_client = generate_uuid();
+    const UUID same_marker_late_client = generate_uuid();
+    const std::string marker = "local-disk-segment-expire";
+    const std::string key = "ssd_rejoin_expire_no_reattach";
+
+    const std::string old_segment = "ssd_expire_old";
+    MountMemoryAndLocalDisk(*service, old_client, old_segment, 0x1100000000ULL,
+                            marker, "old_endpoint");
+    PutAndOffload(*service, old_client, key, 256, "old_endpoint");
+    auto clear_result =
+        service->BatchReplicaClear({key}, old_client, old_segment);
+    ASSERT_TRUE(clear_result.has_value());
+    ASSERT_EQ(clear_result->size(), 1u);
+    EXPECT_EQ((*clear_result)[0], key);
+
+    WaitForReplicaNotReady(*service, key, std::chrono::seconds(4));
+
+    MountMemoryAndLocalDisk(*service, mismatch_client, "ssd_expire_mismatch",
+                            0x1200000000ULL, "different-marker",
+                            "mismatch_endpoint");
+    auto mismatch_result = service->GetReplicaList(key, "default");
+    ASSERT_FALSE(mismatch_result.has_value());
+    EXPECT_EQ(mismatch_result.error(), ErrorCode::REPLICA_IS_NOT_READY);
+
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    auto expired_result = service->GetReplicaList(key, "default");
+    ASSERT_FALSE(expired_result.has_value());
+    EXPECT_EQ(expired_result.error(), ErrorCode::OBJECT_NOT_FOUND);
+
+    MountMemoryAndLocalDisk(*service, same_marker_late_client,
+                            "ssd_expire_same_marker_late", 0x1300000000ULL,
+                            marker, "late_endpoint");
+    auto late_result = service->GetReplicaList(key, "default");
+    ASSERT_FALSE(late_result.has_value());
+    EXPECT_EQ(late_result.error(), ErrorCode::OBJECT_NOT_FOUND);
+}
+
+TEST_F(MasterServiceSSDTest,
+       LocalDiskReplicaReattachesReplacementBeforeOldClientExpires) {
+    auto service = CreateSsdRejoinService(/*client_live_ttl_sec=*/5,
+                                          /*local_disk_rejoin_grace_sec=*/10);
+    const UUID old_client = generate_uuid();
+    const UUID new_client = generate_uuid();
+    const std::string marker = "local-disk-segment-before-ttl";
+    const std::string key = "ssd_rejoin_before_ttl";
+
+    MountMemoryAndLocalDisk(*service, old_client, "ssd_before_ttl_old",
+                            0x1900000000ULL, marker, "old_endpoint");
+    PutAndOffload(*service, old_client, key, 256, "old_endpoint");
+    auto clear_result =
+        service->BatchReplicaClear({key}, old_client, "ssd_before_ttl_old");
+    ASSERT_TRUE(clear_result.has_value());
+    ASSERT_EQ(clear_result->size(), 1u);
+
+    auto before_replacement = service->GetReplicaList(key, "default");
+    ASSERT_TRUE(before_replacement.has_value());
+    ASSERT_EQ(before_replacement->replicas.size(), 1u);
+    EXPECT_EQ(
+        before_replacement->replicas[0].get_local_disk_descriptor().client_id,
+        old_client);
+
+    MountMemoryAndLocalDisk(*service, new_client, "ssd_before_ttl_new",
+                            0x1a00000000ULL, marker, "new_endpoint");
+    auto reattached = service->GetReplicaList(key, "default");
+    ASSERT_TRUE(reattached.has_value());
+    ASSERT_EQ(reattached->replicas.size(), 1u);
+    const auto descriptor = reattached->replicas[0].get_local_disk_descriptor();
+    EXPECT_EQ(descriptor.client_id, new_client);
+    EXPECT_EQ(descriptor.transport_endpoint, "new_endpoint");
+    EXPECT_EQ(descriptor.local_disk_segment_id, marker);
+}
+
+TEST_F(MasterServiceSSDTest, ReattachRestoresLocalDiskUsageTracking) {
+    auto service = CreateSsdRejoinService(/*client_live_ttl_sec=*/1,
+                                          /*local_disk_rejoin_grace_sec=*/10);
+    const UUID old_client = generate_uuid();
+    const UUID new_client = generate_uuid();
+    const UUID other_client = generate_uuid();
+    const std::string marker = "local-disk-segment-usage-restore";
+    const std::string old_segment = "ssd_usage_old";
+    const std::string new_segment = "ssd_usage_new";
+    const std::string other_segment = "ssd_usage_other";
+    const std::string key = "ssd_rejoin_usage_restore";
+
+    MountMemoryAndLocalDisk(*service, old_client, old_segment, 0x1b00000000ULL,
+                            marker, "old_endpoint");
+    PutAndOffload(*service, old_client, key, 800, "old_endpoint");
+
+    auto clear_result =
+        service->BatchReplicaClear({key}, old_client, old_segment);
+    ASSERT_TRUE(clear_result.has_value());
+    ASSERT_EQ(clear_result->size(), 1u);
+    WaitForReplicaNotReady(*service, key, std::chrono::seconds(4));
+
+    MountMemoryAndLocalDisk(*service, other_client, other_segment,
+                            0x1c00000000ULL, "other-marker", "other_endpoint");
+    PutAndOffload(*service, other_client, "ssd_usage_other_baseline", 100,
+                  "other_endpoint");
+
+    MountMemoryAndLocalDisk(*service, new_client, new_segment, 0x1d00000000ULL,
+                            marker, "new_endpoint");
+    auto reattached = service->GetReplicaList(key, "default");
+    ASSERT_TRUE(reattached.has_value());
+
+    ExpectNextAllocationOnSegment(*service, other_client,
+                                  "ssd_usage_restore_probe", other_segment);
+}
+
+TEST_F(MasterServiceSSDTest, UpsertRemovesDisconnectedLocalDiskReplica) {
+    auto service = CreateSsdRejoinService(/*client_live_ttl_sec=*/1,
+                                          /*local_disk_rejoin_grace_sec=*/10);
+    const UUID old_client = generate_uuid();
+    const UUID writer_client = generate_uuid();
+    const UUID rejoin_client = generate_uuid();
+    const std::string marker = "local-disk-segment-upsert-stale";
+    const std::string key = "ssd_rejoin_upsert_stale";
+
+    MountMemoryAndLocalDisk(*service, old_client, "ssd_upsert_old",
+                            0x1e00000000ULL, marker, "old_endpoint");
+    PutAndOffload(*service, old_client, key, 256, "old_endpoint");
+    auto clear_result =
+        service->BatchReplicaClear({key}, old_client, "ssd_upsert_old");
+    ASSERT_TRUE(clear_result.has_value());
+    ASSERT_EQ(clear_result->size(), 1u);
+    WaitForReplicaNotReady(*service, key, std::chrono::seconds(4));
+
+    Segment writer_segment;
+    writer_segment.id = generate_uuid();
+    writer_segment.name = "ssd_upsert_writer";
+    writer_segment.base = 0x1f00000000ULL;
+    writer_segment.size = 64 * 1024 * 1024;
+    writer_segment.te_endpoint = writer_segment.name;
+    ASSERT_TRUE(
+        service->MountSegment(writer_segment, writer_client).has_value());
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto upsert_result =
+        service->UpsertStart(writer_client, key, "default", 256, config);
+    ASSERT_TRUE(upsert_result.has_value());
+    ASSERT_TRUE(
+        service->UpsertEnd(writer_client, key, "default", ReplicaType::MEMORY)
+            .has_value());
+
+    MountMemoryAndLocalDisk(*service, rejoin_client, "ssd_upsert_rejoin",
+                            0x2000000000ULL, marker, "rejoin_endpoint");
+    auto result = service->GetReplicaList(key, "default");
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->replicas.size(), 1u);
+    EXPECT_TRUE(result->replicas[0].is_memory_replica());
+}
+
+TEST_F(MasterServiceSSDTest,
+       ForceBatchRemoveDropsDisconnectedLocalDiskReplica) {
+    auto service = CreateSsdRejoinService(/*client_live_ttl_sec=*/1,
+                                          /*local_disk_rejoin_grace_sec=*/10);
+    const UUID old_client = generate_uuid();
+    const std::string marker = "local-disk-segment-force-remove";
+    const std::string key = "ssd_rejoin_force_remove";
+
+    MountMemoryAndLocalDisk(*service, old_client, "ssd_force_remove_old",
+                            0x2100000000ULL, marker, "old_endpoint");
+    PutAndOffload(*service, old_client, key, 256, "old_endpoint");
+    auto clear_result =
+        service->BatchReplicaClear({key}, old_client, "ssd_force_remove_old");
+    ASSERT_TRUE(clear_result.has_value());
+    ASSERT_EQ(clear_result->size(), 1u);
+    WaitForReplicaNotReady(*service, key, std::chrono::seconds(4));
+
+    auto remove_result = service->BatchRemove({key}, "default", /*force=*/true);
+    ASSERT_EQ(remove_result.size(), 1u);
+    ASSERT_TRUE(remove_result[0].has_value());
+
+    auto get_result = service->GetReplicaList(key, "default");
+    ASSERT_FALSE(get_result.has_value());
+    EXPECT_EQ(get_result.error(), ErrorCode::OBJECT_NOT_FOUND);
+}
+
+TEST_F(MasterServiceSSDTest,
+       OffloadSuccessAddsDiskReplicaWhenOnlyStaleDiskOwnerExists) {
+    auto service = CreateSsdRejoinService(/*client_live_ttl_sec=*/1,
+                                          /*local_disk_rejoin_grace_sec=*/10);
+    const UUID writer_client = generate_uuid();
+    const UUID old_disk_client = generate_uuid();
+    const UUID new_disk_client = generate_uuid();
+    const std::string key = "ssd_rejoin_offload_after_stale";
+
+    Segment writer_segment;
+    writer_segment.id = generate_uuid();
+    writer_segment.name = "ssd_stale_writer";
+    writer_segment.base = 0x2200000000ULL;
+    writer_segment.size = 64 * 1024 * 1024;
+    writer_segment.te_endpoint = writer_segment.name;
+    ASSERT_TRUE(
+        service->MountSegment(writer_segment, writer_client).has_value());
+
+    MountMemoryAndLocalDisk(*service, old_disk_client, "ssd_stale_old_disk",
+                            0x2300000000ULL, "old-stale-marker",
+                            "old_endpoint");
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_TRUE(service->PutStart(writer_client, key, "default", 256, config)
+                    .has_value());
+    ASSERT_TRUE(
+        service->PutEnd(writer_client, key, "default", ReplicaType::MEMORY)
+            .has_value());
+
+    StorageObjectMetadata old_metadata;
+    old_metadata.data_size = 256;
+    old_metadata.transport_endpoint = "old_endpoint";
+    OffloadTaskItem task{.tenant_id = "default", .key = key, .size = 256};
+    ASSERT_TRUE(
+        service->NotifyOffloadSuccess(old_disk_client, {task}, {old_metadata})
+            .has_value());
+
+    for (int i = 0; i < 5; ++i) {
+        ASSERT_TRUE(service->Ping(writer_client).has_value());
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+    MountMemoryAndLocalDisk(*service, new_disk_client, "ssd_stale_new_disk",
+                            0x2400000000ULL, "new-stale-marker",
+                            "new_endpoint");
+
+    StorageObjectMetadata new_metadata;
+    new_metadata.data_size = 256;
+    new_metadata.transport_endpoint = "new_endpoint";
+    ASSERT_TRUE(
+        service->NotifyOffloadSuccess(new_disk_client, {task}, {new_metadata})
+            .has_value());
+
+    auto after_new_offload = service->GetReplicaList(key, "default");
+    ASSERT_TRUE(after_new_offload.has_value());
+    bool found_new_disk = false;
+    for (const auto& replica : after_new_offload->replicas) {
+        if (!replica.is_local_disk_replica()) {
+            continue;
+        }
+        const auto desc = replica.get_local_disk_descriptor();
+        if (desc.client_id == new_disk_client &&
+            desc.transport_endpoint == "new_endpoint") {
+            found_new_disk = true;
+        }
+    }
+    EXPECT_TRUE(found_new_disk);
+}
+
+TEST_F(MasterServiceSSDTest, EmptyLocalDiskSegmentIdDoesNotReattach) {
+    auto service = CreateSsdRejoinService(/*client_live_ttl_sec=*/1,
+                                          /*local_disk_rejoin_grace_sec=*/10);
+    const UUID old_client = generate_uuid();
+    const UUID old_style_client = generate_uuid();
+    const UUID new_client = generate_uuid();
+    const std::string marker = "local-disk-segment-empty-old-style";
+    const std::string key = "ssd_rejoin_empty_marker_no_adopt";
+
+    MountMemoryAndLocalDisk(*service, old_client, "ssd_empty_old",
+                            0x1400000000ULL, marker, "old_endpoint");
+    PutAndOffload(*service, old_client, key, 256, "old_endpoint");
+    auto clear_result =
+        service->BatchReplicaClear({key}, old_client, "ssd_empty_old");
+    ASSERT_TRUE(clear_result.has_value());
+    ASSERT_EQ(clear_result->size(), 1u);
+    EXPECT_EQ((*clear_result)[0], key);
+
+    WaitForReplicaNotReady(*service, key, std::chrono::seconds(4));
+
+    MountMemoryAndLocalDisk(*service, old_style_client, "ssd_empty_old_style",
+                            0x1500000000ULL, "", "old_style_endpoint");
+    auto old_style_result = service->GetReplicaList(key, "default");
+    ASSERT_FALSE(old_style_result.has_value());
+    EXPECT_EQ(old_style_result.error(), ErrorCode::REPLICA_IS_NOT_READY);
+
+    MountMemoryAndLocalDisk(*service, new_client, "ssd_empty_new",
+                            0x1600000000ULL, marker, "new_endpoint");
+    auto reattached = service->GetReplicaList(key, "default");
+    ASSERT_TRUE(reattached.has_value());
+    ASSERT_EQ(reattached->replicas.size(), 1u);
+    const auto descriptor = reattached->replicas[0].get_local_disk_descriptor();
+    EXPECT_EQ(descriptor.client_id, new_client);
+    EXPECT_EQ(descriptor.transport_endpoint, "new_endpoint");
+    EXPECT_EQ(descriptor.local_disk_segment_id, marker);
+}
+
+TEST_F(MasterServiceSSDTest, ReattachFiveThousandLocalDiskReplicasQuickly) {
+    auto service = CreateSsdRejoinService(/*client_live_ttl_sec=*/1,
+                                          /*local_disk_rejoin_grace_sec=*/10);
+    const UUID old_client = generate_uuid();
+    const UUID new_client = generate_uuid();
+    const std::string marker = "local-disk-segment-scale-5k";
+    const std::string old_segment = "ssd_scale_5k_old";
+    constexpr size_t kKeyCount = 5000;
+
+    MountMemoryAndLocalDisk(*service, old_client, old_segment, 0x1700000000ULL,
+                            marker, "old_endpoint");
+
+    std::vector<std::string> keys;
+    keys.reserve(kKeyCount);
+    for (size_t i = 0; i < kKeyCount; ++i) {
+        auto key = "ssd_rejoin_scale_5k_" + std::to_string(i);
+        PutAndOffload(*service, old_client, key, 256, "old_endpoint");
+        keys.emplace_back(std::move(key));
+    }
+
+    auto clear_result =
+        service->BatchReplicaClear(keys, old_client, old_segment);
+    ASSERT_TRUE(clear_result.has_value());
+    ASSERT_EQ(clear_result->size(), kKeyCount);
+
+    WaitForReplicaNotReady(*service, keys.front(), std::chrono::seconds(4));
+
+    const auto start = std::chrono::steady_clock::now();
+    MountMemoryAndLocalDisk(*service, new_client, "ssd_scale_5k_new",
+                            0x1800000000ULL, marker, "new_endpoint");
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start)
+            .count();
+    EXPECT_LT(elapsed_ms, 1000);
+
+    for (const auto& key : {keys.front(), keys[kKeyCount / 2], keys.back()}) {
+        auto reattached = service->GetReplicaList(key, "default");
+        ASSERT_TRUE(reattached.has_value());
+        ASSERT_EQ(reattached->replicas.size(), 1u);
+        const auto descriptor =
+            reattached->replicas[0].get_local_disk_descriptor();
+        EXPECT_EQ(descriptor.client_id, new_client);
+        EXPECT_EQ(descriptor.transport_endpoint, "new_endpoint");
+        EXPECT_EQ(descriptor.local_disk_segment_id, marker);
+    }
 }
 
 // Real-path performance comparison: MasterService PutStart throughput for

@@ -256,6 +256,7 @@ struct FileStorageConfig {
     int64_t total_keys_limit = 10'000'000;  // Maximum total number of keys
     int64_t total_size_limit =
         2ULL * 1024 * 1024 * 1024 * 1024;  // Maximum total storage size (2 TB)
+    std::string local_disk_segment_id;
 
     // Interval between heartbeats sent to the control plane (in seconds)
     uint32_t heartbeat_interval_seconds = 10;
