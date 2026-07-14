@@ -20,6 +20,7 @@
 
 #include "real_client.h"
 #include "client_buffer.h"
+#include "replica_selection.h"
 #include "common.h"
 #include "config.h"
 #include "mutex.h"
@@ -278,46 +279,9 @@ inline tl::expected<void, ErrorCode> scatter_host_to_maybe_device(
     return {};
 }
 
-// Select the best replica from a list: prefer local MEMORY, then any
-// MEMORY, then LOCAL_DISK, then DISK.  Master may return replicas in any
-// order, so we always scan.
-inline const Replica::Descriptor *SelectBestReplica(
-    const std::vector<Replica::Descriptor> &replicas,
-    const std::unordered_set<std::string> &local_endpoints) {
-    const Replica::Descriptor *first_memory = nullptr;
-    const Replica::Descriptor *first_nof = nullptr;
-    for (const auto &r : replicas) {
-        if (r.status != ReplicaStatus::COMPLETE) continue;
-        if (r.is_memory_replica()) {
-            if (local_endpoints.count(
-                    r.get_memory_descriptor()
-                        .buffer_descriptor.transport_endpoint_)) {
-                return &r;  // local MEMORY — best case
-            }
-            if (!first_memory) first_memory = &r;
-        } else if (r.is_nof_replica()) {
-            if (local_endpoints.count(
-                    r.get_nof_descriptor()
-                        .buffer_descriptor.transport_endpoint_)) {
-                return &r;  // local NOF_SSD — also good
-            }
-            if (!first_nof) first_nof = &r;
-        }
-    }
-    if (first_memory) return first_memory;
-    if (first_nof) return first_nof;
-
-    const Replica::Descriptor *best = nullptr;
-    for (const auto &r : replicas) {
-        if (r.status != ReplicaStatus::COMPLETE) continue;
-        if (r.is_local_disk_replica()) {
-            best = &r;  // LOCAL_DISK always overrides DISK
-        } else if (r.is_disk_replica() && !best) {
-            best = &r;
-        }
-    }
-    return best;
-}
+// SelectBestReplica and the replica-scoring helpers live in
+// replica_selection.h (included above) so they can be unit-tested directly.
+using mooncake::SelectBestReplica;
 
 // Build a QueryResult containing only the chosen replica so that
 // Client::Get / Client::BatchGet (which internally call
