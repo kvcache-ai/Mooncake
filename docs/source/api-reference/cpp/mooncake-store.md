@@ -48,11 +48,18 @@ The data structure details of `ReplicateConfig` are as follows:
 ```C++
 struct ReplicateConfig {
     size_t replica_num{1};                    // Total number of replicas for the object
-    bool with_soft_pin{false};               // Whether to enable soft pin mechanism for this object
+    SoftPinAction soft_pin_action{SoftPinAction::PRESERVE};
+    std::optional<uint64_t> soft_pin_ttl_ms{}; // ENABLE override; omitted uses the Master default
     bool with_hard_pin{false};               // Whether to enable hard pin (never evicted)
     std::string preferred_segment{};         // Preferred segment for allocation
 };
 ```
+
+Soft pinning starts when the first replica becomes readable and has a fixed
+lifetime: reads do not extend it. `PRESERVE` keeps the committed deadline on an
+Upsert, `ENABLE` starts a new lifetime, and `DISABLE` removes it when the write
+commits. `soft_pin_ttl_ms` is valid only with `ENABLE`; zero commits ordinary
+cache, and values above the Master's configured maximum are rejected.
 
 ### Upsert
 

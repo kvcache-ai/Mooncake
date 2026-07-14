@@ -131,6 +131,19 @@ DeserializeStandbyObjectMetadata(
         const auto soft_pin_timestamp_ms = array[index++].as<uint64_t>();
         const auto replica_count = array[index++].as<uint32_t>();
 
+        const auto max_timestamp_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::time_point::max().time_since_epoch())
+                .count();
+        if (max_timestamp_ms < 0 ||
+            lease_timestamp_ms > static_cast<uint64_t>(max_timestamp_ms) ||
+            (has_soft_pin_timeout &&
+             soft_pin_timestamp_ms > static_cast<uint64_t>(max_timestamp_ms))) {
+            LOG(ERROR) << "Snapshot metadata timestamp exceeds system_clock "
+                          "range";
+            return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
+        }
+
         // Optional fields are decoded by type for backward/forward
         // compatibility with MasterService::MetadataSerializer, which appends
         // them over time:
