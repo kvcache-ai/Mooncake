@@ -163,47 +163,39 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30, suppress_kineto_output: 
                     fn()
                 prof.step()
 
-    # Parse the profiling table
     assert isinstance(kernel_names, str) or isinstance(kernel_names, tuple)
     is_tupled = isinstance(kernel_names, tuple)
-    prof_lines = prof.key_averages().table(sort_by='cuda_time_total', max_name_column_width=100).split('\n')
     kernel_names = (kernel_names, ) if isinstance(kernel_names, str) else kernel_names
     assert all([isinstance(name, str) for name in kernel_names])
-
-    # In fallback mode, kernels may not appear in profiling table (they're Python functions)
-    # So we check if kernels exist, but don't fail if they don't (fallback mode)
-    for name in kernel_names:
-        count = sum([name in line for line in prof_lines])
-        if count == 0:
-            # Kernel not found - might be fallback mode, return 0 time
-            import warnings
-            warnings.warn(f'Kernel {name} not found in profiling table (might be fallback mode)', UserWarning)
-        elif count != 1:
-            # Multiple matches - this is an error
-            assert False, f'Errors of the kernel {name} in the profiling table: found {count} times'
 
     # Save chrome traces
     if trace_path is not None:
         prof.export_chrome_trace(trace_path)
 
     # Return average kernel times
-    units = {'ms': 1e3, 'us': 1e6}
     kernel_times = []
+    events = prof.key_averages()
+
+    def cuda_time_us(event):
+        return float(getattr(event, "cuda_time_total", getattr(event, "device_time_total", 0.0)))
+
     for name in kernel_names:
-        found = False
-        for line in prof_lines:
-            if name in line:
-                time_str = line.split()[-2]
-                for unit, scale in units.items():
-                    if unit in time_str:
-                        kernel_times.append(float(time_str.replace(unit, '')) / scale)
-                        found = True
-                        break
-                if found:
-                    break
-        if not found:
+        matched_events = [event for event in events if name in event.key and cuda_time_us(event) > 0]
+        if len(matched_events) == 0:
             # Kernel not found (fallback mode), return 0 time
+            import warnings
+            warnings.warn(f'Kernel {name} not found in profiling table (might be fallback mode)', UserWarning)
             kernel_times.append(0.0)
+            continue
+
+        total_cuda_time_us = sum(cuda_time_us(event) for event in matched_events)
+        total_count = sum(getattr(event, "count", 0) for event in matched_events)
+        assert total_count > 0
+        kernel_times.append(total_cuda_time_us / total_count / 1e6)
+
+    if os.getenv("MOONCAKE_EP_KINETO_DUMP", "").upper() in {"1", "ON", "TRUE", "YES"}:
+        prof_lines = prof.key_averages().table(sort_by='cuda_time_total', max_name_column_width=160).split('\n')
+        print("\n".join(prof_lines[:80]), flush=True)
 
     return tuple(kernel_times) if is_tupled else kernel_times[0]
 
