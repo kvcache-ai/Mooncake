@@ -62,6 +62,9 @@ __global__ void wait_phase_ack_kernel(int* ack_buffer, int rank, int num_ranks,
             if (timeout_ticks != -1 && end_time - start_time > timeout_ticks)
                 return;
         }
+        int64_t end_time = static_cast<int64_t>(clock64());
+        printf("[EP DEBUG timing] phase_ack_wait rank=%d peer=%d epoch=%d elapsed_ticks=%lld\n",
+               rank, peer, epoch, static_cast<long long>(end_time - start_time));
     }
 }
 
@@ -97,6 +100,9 @@ __global__ void mark_and_wait_phase_ack_kernel(
             if (timeout_ticks != -1 && end_time - start_time > timeout_ticks)
                 return;
         }
+        int64_t end_time = static_cast<int64_t>(clock64());
+        printf("[EP DEBUG timing] mark_wait_phase_ack rank=%d peer=%d epoch=%d elapsed_ticks=%lld\n",
+               rank, peer, epoch, static_cast<long long>(end_time - start_time));
     }
 }
 
@@ -409,6 +415,11 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                     break;
                 }
             }
+            unsigned long long end_time = clock64();
+            printf("[EP DEBUG timing] dispatch_recv_wait rank=%d src_rank=%d local_expert=%d responsible_expert=%d active=%d raw_signal=%d elapsed_ticks=%llu\n",
+                   rank, src_rank, local_expert_idx, responsible_expert_idx,
+                   active_ranks[src_rank], num_recv_tokens,
+                   end_time - start_time);
             num_recv_tokens = -num_recv_tokens - 1;
             recv_token_begin_idx = atomicAdd(packed_recv_count + local_expert_idx, num_recv_tokens);
             shared_num_recv_tokens[warp_group_id] = num_recv_tokens;
@@ -652,6 +663,12 @@ combine(void* combined_x, int32_t* active_ranks,
                     break;
                 }
             }
+            unsigned long long end_time = clock64();
+            printf("[EP DEBUG timing] combine_recv_wait rank=%d src_rank=%d responsible_expert=%d active=%d signal=%d elapsed_ticks=%llu\n",
+                   rank, src_rank, responsible_expert_idx,
+                   active_ranks[src_rank],
+                   mc_ld_acquire(rdma_recv_signal_buffer + responsible_expert_idx),
+                   end_time - start_time);
         }
     }
 #ifdef MOONCAKE_EP_SPLIT_SEND_RECV
