@@ -82,9 +82,7 @@ struct ClientLease {
     coro_rpc_client* operator->() const { return client.get(); }
 };
 
-CoroRpcAgent::CoroRpcAgent()
-    : async_executor_(
-          std::make_unique<async_simple::executors::SimpleExecutor>(1)) {}
+CoroRpcAgent::CoroRpcAgent() = default;
 
 CoroRpcAgent::~CoroRpcAgent() { stop(); }
 
@@ -226,8 +224,7 @@ Status CoroRpcAgent::call(const std::string& server_addr, int func_id,
 void CoroRpcAgent::callAsync(const std::string& server_addr, int func_id,
                              const std::string& request,
                              AsyncCallback callback) {
-    std::move(callCoroutine(server_addr, func_id, request))
-        .via(async_executor_.get())
+    callCoroutine(server_addr, func_id, request)
         .start([cb = std::move(callback)](auto&& try_result) {
             if (try_result.hasError()) {
                 cb(Status::RpcServiceError("Async RPC exception" LOC_MARK), "");
