@@ -18,8 +18,6 @@
 #include <cassert>
 #include <set>
 
-#include <async_simple/executors/SimpleExecutor.h>
-
 #include "tent/common/status.h"
 #include "tent/common/utils/os.h"
 #include "tent/runtime/platform.h"
@@ -28,20 +26,6 @@
 namespace mooncake {
 namespace tent {
 thread_local CoroRpcAgent tl_rpc_agent;
-
-namespace {
-
-// Credit pulls are intentionally kept off the transport/progress caller. The
-// synchronous RPC path has stable latency under RDMA load, while starting its
-// coroutine without an executor can occasionally delay completion until the
-// TCP retransmission-scale tail. A small shared pool also avoids one thread per
-// refill and keeps per-worker ControlClient connections reusable.
-async_simple::executors::SimpleExecutor& receiverCreditRpcExecutor() {
-    static async_simple::executors::SimpleExecutor executor(2);
-    return executor;
-}
-
-}  // namespace
 
 Status ControlClient::getSegmentDesc(const std::string& server_addr,
                                      std::string& response) {
@@ -136,20 +120,30 @@ void ControlClient::pullReceiverCreditAsync(
                  {});
         return;
     }
-    auto shared_callback =
-        std::make_shared<OnReceiverCreditPull>(std::move(callback));
-    const bool scheduled = receiverCreditRpcExecutor().schedule(
-        [agent, server_addr, request, shared_callback]() mutable {
-            ReceiverCreditPullResponseV1 response;
-            auto status = ControlClient::pullReceiverCredit(server_addr,
-                                                            request, response);
-            (*shared_callback)(std::move(status), std::move(response));
-        });
-    if (!scheduled) {
-        (*shared_callback)(Status::RpcServiceError(
-                               "receiver credit RPC executor stopped" LOC_MARK),
-                           {});
+    std::string request_wire;
+    auto status =
+        ReceiverCreditPullRequestCodecV1::encode(request, request_wire);
+    if (!status.ok()) {
+        callback(std::move(status), {});
+        return;
     }
+    agent->callAsync(server_addr, PullReceiverCredit, request_wire,
+                     [agent, callback = std::move(callback)](
+                         Status rpc_status, std::string response_wire) mutable {
+                         ReceiverCreditPullResponseV1 response;
+                         if (rpc_status.ok()) {
+                             if (response_wire.empty()) {
+                                 rpc_status = Status::NotImplemented(
+                                     "peer does not implement receiver credit "
+                                     "pull" LOC_MARK);
+                             } else {
+                                 rpc_status =
+                                     ReceiverCreditPullResponseCodecV1::decode(
+                                         response_wire, response);
+                             }
+                         }
+                         callback(std::move(rpc_status), std::move(response));
+                     });
 }
 
 inline void to_json(json& j, const Request& r) {
