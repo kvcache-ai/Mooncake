@@ -39,6 +39,9 @@ ErrorCode P2PHotStandbyService::Start(uint64_t baseline_sequence_id) {
 
     auto err = StartOplogFollowingLocked(baseline_sequence_id);
     if (err != ErrorCode::OK) {
+        LOG(ERROR) << "P2PHotStandbyService: failed to start oplog following"
+                   << ", baseline_sequence_id=" << baseline_sequence_id
+                   << ", err=" << err;
         state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
         ResetOplogFollowingLocked();
         return err;
@@ -99,6 +102,9 @@ void P2PHotStandbyService::ResetOplogFollowingLocked() {
         oplog_replicator_->Stop();
         oplog_replicator_.reset();
     }
+    if (oplog_applier_) {
+        oplog_applier_->SetOpLogStore(nullptr);
+    }
     oplog_change_notifier_.reset();
     watcher_oplog_store_.reset();
 }
@@ -149,6 +155,10 @@ ErrorCode P2PHotStandbyService::Promote() {
 
     auto err = FinalCatchUpForPromotionLocked(applied_before_catch_up);
     if (err != ErrorCode::OK) {
+        LOG(ERROR) << "P2PHotStandbyService: final catch-up for promotion "
+                      "failed"
+                   << ", applied_before_catch_up=" << applied_before_catch_up
+                   << ", err=" << err;
         state_machine_.ProcessEvent(StandbyEvent::PROMOTION_FAILED);
         ResetOplogFollowingLocked();
         return err;
@@ -180,6 +190,8 @@ ErrorCode P2PHotStandbyService::FinalCatchUpForPromotionLocked(
 
     static constexpr size_t kBatchSize = 1000;
     static constexpr size_t kMaxCatchUpBatches = 100;
+    // TODO: Add election/readiness gating before allowing promotion: require
+    // initial sync completion, enforce max standby lag, and monitor apply rate.
     uint64_t read_from_seq = current_applied_seq_id;
     size_t total_applied = 0;
     size_t batch_count = 0;
