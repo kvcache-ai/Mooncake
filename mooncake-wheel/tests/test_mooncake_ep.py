@@ -1,5 +1,6 @@
 import random
 import os
+import subprocess
 import torch
 import torch.distributed as dist
 from functools import partial
@@ -26,10 +27,37 @@ _EP_DIAG_NAMES = (
 )
 
 
+def _get_ep_diag_clock_rate_khz() -> int:
+    env_clock = os.getenv("MOONCAKE_EP_DIAG_CLOCK_KHZ")
+    if env_clock:
+        return int(env_clock)
+
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    clock_rate_khz = getattr(props, "clock_rate", 0)
+    if clock_rate_khz:
+        return int(clock_rate_khz)
+
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                f"--id={torch.cuda.current_device()}",
+                "--query-gpu=clocks.sm",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return int(result.stdout.strip().splitlines()[0]) * 1000
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return 0
+
+
 def _print_ep_diag(rank: int, diagnostic: torch.Tensor):
     torch.cuda.synchronize()
     stats = diagnostic.cpu()
-    clock_rate_khz = getattr(torch.cuda.get_device_properties(torch.cuda.current_device()), "clock_rate", 0)
+    clock_rate_khz = _get_ep_diag_clock_rate_khz()
     for idx, name in enumerate(_EP_DIAG_NAMES):
         count = int(stats[idx, 0].item())
         total_ticks = int(stats[idx, 1].item())
