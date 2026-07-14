@@ -72,8 +72,7 @@ add_store_test(master_service_allocation_test
 add_store_test(master_service_eviction_test master_service/retention_test.cpp)
 add_store_test(master_service_replica_cleanup_test
                master_service/replica_cleanup_test.cpp)
-add_store_test(master_service_copy_move_test
-               master_service/copy_move_test.cpp)
+add_store_test(master_service_copy_move_test master_service/copy_move_test.cpp)
 add_store_test(master_service_copy_move_eviction_test
                master_service/copy_move_eviction_test.cpp)
 add_store_test(master_service_copy_move_timeout_test
