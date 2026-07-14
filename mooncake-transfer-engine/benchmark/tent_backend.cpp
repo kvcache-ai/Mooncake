@@ -70,6 +70,18 @@ std::shared_ptr<Config> loadConfig() {
         config->set("receiver_credit/control/freshness_ttl_ms", 60000U);
         config->set("receiver_credit/control/retry_after_us", 100U);
         config->set("receiver_credit/control/poll_interval_us", 100U);
+        config->set("receiver_credit/control/adaptive_dispatch/min_owners",
+                    XferBenchConfig::receiver_credit_adaptive_min_owners);
+        config->set("receiver_credit/control/adaptive_dispatch/initial_owners",
+                    XferBenchConfig::receiver_credit_adaptive_initial_owners);
+        config->set("receiver_credit/control/adaptive_dispatch/max_owners",
+                    XferBenchConfig::receiver_credit_adaptive_max_owners);
+        config->set("receiver_credit/control/adaptive_dispatch/slow_rtt_us",
+                    XferBenchConfig::receiver_credit_adaptive_slow_rtt_us);
+        config->set(
+            "receiver_credit/control/adaptive_dispatch/healthy_pulls_per_"
+            "increase",
+            XferBenchConfig::receiver_credit_adaptive_healthy_pulls);
         config->set("receiver_credit/limits/max_peers", size_t{4096});
     }
 

@@ -83,6 +83,11 @@ struct XferBenchConfig {
     static size_t receiver_credit_capacity_slots;
     static size_t receiver_credit_grant_bytes;
     static size_t receiver_credit_grant_slots;
+    static size_t receiver_credit_adaptive_min_owners;
+    static size_t receiver_credit_adaptive_initial_owners;
+    static size_t receiver_credit_adaptive_max_owners;
+    static uint32_t receiver_credit_adaptive_slow_rtt_us;
+    static uint32_t receiver_credit_adaptive_healthy_pulls;
 
     static int local_gpu_id;
     static int target_gpu_id;

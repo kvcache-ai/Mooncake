@@ -68,6 +68,16 @@ DEFINE_uint64(receiver_credit_grant_bytes, 64UL << 20,
               "tent only: maximum byte grant per pull");
 DEFINE_uint64(receiver_credit_grant_slots, 64,
               "tent only: maximum request-slot grant per pull");
+DEFINE_uint64(receiver_credit_adaptive_min_owners, 1,
+              "tent only: adaptive dispatch lower bound");
+DEFINE_uint64(receiver_credit_adaptive_initial_owners, 2,
+              "tent only: adaptive dispatch startup window");
+DEFINE_uint64(receiver_credit_adaptive_max_owners, 2,
+              "tent only: adaptive dispatch exploration ceiling");
+DEFINE_uint32(receiver_credit_adaptive_slow_rtt_us, 1000,
+              "tent only: credit RPC RTT that triggers backoff");
+DEFINE_uint32(receiver_credit_adaptive_healthy_pulls, 4096,
+              "tent only: healthy pulls required for additive recovery");
 
 namespace mooncake {
 namespace tent {
@@ -100,6 +110,11 @@ size_t XferBenchConfig::receiver_credit_capacity_bytes = 0;
 size_t XferBenchConfig::receiver_credit_capacity_slots = 0;
 size_t XferBenchConfig::receiver_credit_grant_bytes = 0;
 size_t XferBenchConfig::receiver_credit_grant_slots = 0;
+size_t XferBenchConfig::receiver_credit_adaptive_min_owners = 0;
+size_t XferBenchConfig::receiver_credit_adaptive_initial_owners = 0;
+size_t XferBenchConfig::receiver_credit_adaptive_max_owners = 0;
+uint32_t XferBenchConfig::receiver_credit_adaptive_slow_rtt_us = 0;
+uint32_t XferBenchConfig::receiver_credit_adaptive_healthy_pulls = 0;
 
 int XferBenchConfig::local_gpu_id = 0;
 int XferBenchConfig::target_gpu_id = 0;
@@ -135,6 +150,16 @@ void XferBenchConfig::loadFromFlags() {
     receiver_credit_capacity_slots = FLAGS_receiver_credit_capacity_slots;
     receiver_credit_grant_bytes = FLAGS_receiver_credit_grant_bytes;
     receiver_credit_grant_slots = FLAGS_receiver_credit_grant_slots;
+    receiver_credit_adaptive_min_owners =
+        FLAGS_receiver_credit_adaptive_min_owners;
+    receiver_credit_adaptive_initial_owners =
+        FLAGS_receiver_credit_adaptive_initial_owners;
+    receiver_credit_adaptive_max_owners =
+        FLAGS_receiver_credit_adaptive_max_owners;
+    receiver_credit_adaptive_slow_rtt_us =
+        FLAGS_receiver_credit_adaptive_slow_rtt_us;
+    receiver_credit_adaptive_healthy_pulls =
+        FLAGS_receiver_credit_adaptive_healthy_pulls;
 
     local_gpu_id = FLAGS_local_gpu_id;
     target_gpu_id = FLAGS_target_gpu_id;
