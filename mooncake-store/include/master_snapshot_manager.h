@@ -12,6 +12,7 @@
 
 #include "types.h"
 #include "ha/ha_types.h"
+#include "ha/snapshot/master_snapshot_codec.h"
 
 namespace mooncake {
 
