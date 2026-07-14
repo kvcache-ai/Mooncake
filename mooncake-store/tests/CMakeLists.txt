@@ -15,6 +15,11 @@ function(add_store_test name)
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
+function(add_store_unity_test name)
+  add_store_test(${name} ${ARGN})
+  set_target_properties(${name} PROPERTIES UNITY_BUILD ON)
+endfunction()
+
 function(add_ha_test name)
   add_executable(${name} ${ARGN})
   target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -53,16 +58,43 @@ if(ENABLE_KV_EVENTS)
                           PRIVATE ${KV_EVENT_TEST_ZMQ_LIBRARY})
   endif()
 endif()
-add_store_test(master_service_test master_service_test.cpp)
+add_store_unity_test(
+  master_service_test master_service/basic_operations_test.cpp
+  master_service/group_metadata_test.cpp)
+add_store_unity_test(
+  master_service_tenant_isolation_test master_service/tenant_isolation_test.cpp
+  master_service/upsert_test.cpp master_service/replica_cleanup_test.cpp)
+add_store_test(master_service_allocation_test
+               master_service/allocation_test.cpp)
+add_store_test(master_service_eviction_test master_service/retention_test.cpp)
+add_store_test(master_service_copy_move_test master_service/copy_move_test.cpp)
+add_store_test(master_service_copy_move_eviction_test
+               master_service/copy_move_eviction_test.cpp)
+add_store_test(master_service_copy_move_timeout_test
+               master_service/copy_move_timeout_test.cpp)
 add_store_test(master_service_tenant_quota_test
                master_service_tenant_quota_test.cpp)
 add_store_test(batch_remove_test batch_remove_test.cpp)
-add_store_test(master_service_ssd_test master_service_ssd_test.cpp)
-add_store_test(offload_on_evict_test offload_on_evict_test.cpp)
-add_store_test(promotion_on_hit_test promotion_on_hit_test.cpp)
+add_store_unity_test(
+  master_service_ssd_test master_service/ssd/lifecycle_test.cpp
+  master_service/ssd/placement_metrics_test.cpp)
+add_store_test(master_service_ssd_expiration_test
+               master_service/ssd/expiration_test.cpp)
+add_store_unity_test(
+  offload_on_evict_test master_service/offload/on_evict_test.cpp
+  master_service/offload/policy_test.cpp)
+add_store_unity_test(
+  promotion_on_hit_test master_service/promotion/admission_test.cpp
+  master_service/promotion/cleanup_metrics_test.cpp)
+add_store_test(promotion_task_lifecycle_test
+               master_service/promotion/task_lifecycle_test.cpp)
 add_store_test(file_storage_promotion_test file_storage_promotion_test.cpp)
-add_store_test(master_service_ssd_test_for_snapshot
-               ha/snapshot/master_service_ssd_test_for_snapshot.cpp)
+add_store_unity_test(
+  master_service_ssd_test_for_snapshot
+  ha/snapshot/master_service/ssd/lifecycle_test.cpp
+  ha/snapshot/master_service/ssd/metrics_test.cpp)
+add_store_test(master_service_ssd_snapshot_expiration_test
+               ha/snapshot/master_service/ssd/expiration_test.cpp)
 add_store_test(master_service_promotion_test_for_snapshot
                ha/snapshot/master_service_promotion_test_for_snapshot.cpp)
 if(USE_NOF)
@@ -102,8 +134,18 @@ add_store_test(
 add_store_test(file_util_test file_util_test.cpp)
 add_store_test(snapshot_child_process_test
                ha/snapshot/snapshot_child_process_test.cpp)
-add_store_test(master_service_test_for_snapshot
-               ha/snapshot/master_service_test_for_snapshot.cpp)
+add_store_unity_test(
+  master_service_test_for_snapshot
+  ha/snapshot/master_service/basic_operations_test.cpp
+  ha/snapshot/master_service/replica_cleanup_test.cpp)
+add_store_test(master_service_snapshot_allocation_test
+               ha/snapshot/master_service/allocation_test.cpp)
+add_store_test(master_service_snapshot_eviction_test
+               ha/snapshot/master_service/retention_test.cpp)
+add_store_test(master_service_snapshot_copy_move_test
+               ha/snapshot/master_service/copy_move_test.cpp)
+add_store_test(master_service_snapshot_copy_move_eviction_test
+               ha/snapshot/master_service/copy_move_eviction_test.cpp)
 add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)
 add_store_test(storage_backend_test storage_backend_test.cpp)
 add_store_test(mutex_test mutex_test.cpp)
@@ -111,7 +153,13 @@ add_store_test(file_storage_test file_storage_test.cpp)
 add_store_test(task_manager_test task_manager_test.cpp)
 add_store_test(task_executor_test task_executor_test.cpp)
 add_store_test(task_integration_test task_integration_test.cpp)
-add_store_test(dummy_client_get_buffer_test dummy_client_get_buffer_test.cpp)
+add_store_test(
+  dummy_client_get_buffer_test dummy_client/get_buffer_functional_test.cpp
+  dummy_client/main.cpp)
+add_store_unity_test(
+  dummy_client_cache_invalidation_test dummy_client/cache_invalidation_test.cpp
+  dummy_client/get_buffer_performance_test.cpp dummy_client/main.cpp)
+
 add_store_test(uds_transport_test uds_transport_test.cpp)
 add_store_test(health_check_test health_check_test.cpp)
 add_store_test(http_metadata_server_test http_metadata_server_test.cpp)

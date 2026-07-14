@@ -1,41 +1,8 @@
-#include "master_service_test_for_snapshot_base.h"
+#include "fixture.h"
 
 namespace mooncake::test {
-
-class MasterServiceSSDSnapshotTest : public MasterServiceSnapshotTestBase {
-   protected:
-    static bool glog_initialized_;
-
-    void SetUp() override {
-        // Call base class SetUp first to reset MasterMetricManager state
-        MasterServiceSnapshotTestBase::SetUp();
-
-        if (!glog_initialized_) {
-            google::InitGoogleLogging("MasterServiceSSDSnapshotTest");
-            FLAGS_logtostderr = true;
-            glog_initialized_ = true;
-        }
-    }
-
-    // Create MasterService with SSD feature and assign to class member
-    void CreateMasterServiceWithSSDFeat(const std::string& root_fs_dir) {
-        service_ =
-            std::make_unique<MasterService>(MasterServiceConfig::builder()
-                                                .set_root_fs_dir(root_fs_dir)
-                                                .build());
-    }
-
-    // Create MasterService with SSD feature and custom config
-    void CreateMasterServiceWithSSDFeatAndConfig(
-        const MasterServiceConfig& config) {
-        service_ = std::make_unique<MasterService>(config);
-    }
-};
-
-bool MasterServiceSSDSnapshotTest::glog_initialized_ = false;
-
-TEST_F(MasterServiceSSDSnapshotTest, PutEndBothReplica) {
-    CreateMasterServiceWithSSDFeat("/mnt/ssd");
+TEST_F(MasterServiceSSDTest, PutEndBothReplica) {
+    auto service_ = CreateMasterServiceWithSSDFeat("/mnt/ssd");
 
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 64;
@@ -89,67 +56,8 @@ TEST_F(MasterServiceSSDSnapshotTest, PutEndBothReplica) {
     }
 }
 
-TEST_F(MasterServiceSSDSnapshotTest, RestorePreservesCacheTotalMetrics) {
-    MasterMetricManager::instance().reset_cache_total_nums();
-
-    CreateMasterServiceWithSSDFeat("/mnt/ssd");
-    EnsureSnapshotStores(service_.get());
-
-    constexpr size_t buffer = 0x330000000;
-    constexpr size_t size = 1024 * 1024 * 64;
-    Segment segment;
-    segment.id = generate_uuid();
-    segment.name = "test_segment_restore_cache_totals";
-    segment.base = buffer;
-    segment.size = size;
-    segment.te_endpoint = segment.name;
-    UUID client_id = generate_uuid();
-
-    ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
-
-    std::string key = "restore_cache_total_metric_key";
-    ASSERT_TRUE(
-        service_->PutStart(client_id, key, "default", 1024, {.replica_num = 1})
-            .has_value());
-    EXPECT_TRUE(service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY)
-                    .has_value());
-    EXPECT_TRUE(service_->PutEnd(client_id, key, "default", ReplicaType::DISK)
-                    .has_value());
-
-    auto& metrics = MasterMetricManager::instance();
-    using CacheHitStat = MasterMetricManager::CacheHitStat;
-    auto stats = metrics.calculate_cache_stats();
-    ASSERT_EQ(stats[CacheHitStat::MEMORY_TOTAL], 1);
-    ASSERT_EQ(stats[CacheHitStat::SSD_TOTAL], 1);
-
-    std::string snapshot_id = GenerateSnapshotId();
-    auto persist_result = CallPersistState(service_.get(), snapshot_id);
-    ASSERT_TRUE(persist_result.has_value())
-        << "Failed to persist state: " << persist_result.error().message;
-
-    metrics.reset_cache_total_nums();
-
-    ::setenv("MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP", "1", 1);
-    auto restore_config = MasterServiceConfig::builder()
-                              .set_enable_snapshot_restore(true)
-                              .set_snapshot_object_store_type("local")
-                              .set_root_fs_dir("/mnt/ssd")
-                              .build();
-    std::unique_ptr<MasterService> restored_service(
-        new MasterService(restore_config));
-    ::unsetenv("MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP");
-
-    stats = metrics.calculate_cache_stats();
-    EXPECT_EQ(stats[CacheHitStat::MEMORY_TOTAL], 1);
-    EXPECT_EQ(stats[CacheHitStat::SSD_TOTAL], 1);
-
-    auto get_result = restored_service->GetReplicaList(key, "default");
-    ASSERT_TRUE(get_result.has_value());
-    EXPECT_EQ(2, get_result.value().replicas.size());
-}
-
-TEST_F(MasterServiceSSDSnapshotTest, PutRevokeDiskReplica) {
-    CreateMasterServiceWithSSDFeat("/mnt/ssd");
+TEST_F(MasterServiceSSDTest, PutRevokeDiskReplica) {
+    auto service_ = CreateMasterServiceWithSSDFeat("/mnt/ssd");
 
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 64;
@@ -191,8 +99,53 @@ TEST_F(MasterServiceSSDSnapshotTest, PutRevokeDiskReplica) {
     ASSERT_TRUE(get_result.value().replicas[0].is_memory_replica());
 }
 
-TEST_F(MasterServiceSSDSnapshotTest, PutRevokeMemoryReplica) {
-    CreateMasterServiceWithSSDFeat("/mnt/ssd");
+TEST_F(MasterServiceSSDTest, PutRevokeProcessingDiskKeepsSsdTotal) {
+    auto service_ = CreateMasterServiceWithSSDFeat("/mnt/ssd");
+    auto& metrics = MasterMetricManager::instance();
+    using CacheHitStat = MasterMetricManager::CacheHitStat;
+    const auto base_stats = metrics.calculate_cache_stats();
+    const double base_memory_total = base_stats.at(CacheHitStat::MEMORY_TOTAL);
+    const double base_ssd_total = base_stats.at(CacheHitStat::SSD_TOTAL);
+
+    constexpr size_t buffer = 0x310000000;
+    constexpr size_t size = 1024 * 1024 * 64;
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "test_segment_revoke_processing_disk";
+    segment.base = buffer;
+    segment.size = size;
+    segment.te_endpoint = segment.name;
+    UUID client_id = generate_uuid();
+
+    ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+
+    std::string key = "revoke_processing_disk_metric_key";
+    ASSERT_TRUE(
+        service_->PutStart(client_id, key, "default", 1024, {.replica_num = 1})
+            .has_value());
+    EXPECT_TRUE(service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY)
+                    .has_value());
+
+    auto stats = metrics.calculate_cache_stats();
+    EXPECT_EQ(stats[CacheHitStat::MEMORY_TOTAL], base_memory_total + 1);
+    EXPECT_EQ(stats[CacheHitStat::SSD_TOTAL], base_ssd_total);
+
+    EXPECT_TRUE(
+        service_->PutRevoke(client_id, key, "default", ReplicaType::DISK)
+            .has_value());
+
+    stats = metrics.calculate_cache_stats();
+    EXPECT_EQ(stats[CacheHitStat::MEMORY_TOTAL], base_memory_total + 1);
+    EXPECT_EQ(stats[CacheHitStat::SSD_TOTAL], base_ssd_total);
+
+    ASSERT_TRUE(service_->Remove(key, "default", /*force=*/true).has_value());
+    stats = metrics.calculate_cache_stats();
+    EXPECT_EQ(stats[CacheHitStat::MEMORY_TOTAL], base_memory_total);
+    EXPECT_EQ(stats[CacheHitStat::SSD_TOTAL], base_ssd_total);
+}
+
+TEST_F(MasterServiceSSDTest, PutRevokeMemoryReplica) {
+    auto service_ = CreateMasterServiceWithSSDFeat("/mnt/ssd");
 
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 64;
@@ -232,8 +185,8 @@ TEST_F(MasterServiceSSDSnapshotTest, PutRevokeMemoryReplica) {
     ASSERT_TRUE(get_result.value().replicas[0].is_disk_replica());
 }
 
-TEST_F(MasterServiceSSDSnapshotTest, PutRevokeBothReplica) {
-    CreateMasterServiceWithSSDFeat("/mnt/ssd");
+TEST_F(MasterServiceSSDTest, PutRevokeBothReplica) {
+    auto service_ = CreateMasterServiceWithSSDFeat("/mnt/ssd");
 
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 64;
@@ -273,8 +226,8 @@ TEST_F(MasterServiceSSDSnapshotTest, PutRevokeBothReplica) {
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result.error());
 }
 
-TEST_F(MasterServiceSSDSnapshotTest, RemoveKey) {
-    CreateMasterServiceWithSSDFeat("/mnt/ssd");
+TEST_F(MasterServiceSSDTest, RemoveKey) {
+    auto service_ = CreateMasterServiceWithSSDFeat("/mnt/ssd");
 
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 64;
@@ -310,8 +263,8 @@ TEST_F(MasterServiceSSDSnapshotTest, RemoveKey) {
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result.error());
 }
 
-TEST_F(MasterServiceSSDSnapshotTest, EvictObject) {
-    CreateMasterServiceWithSSDFeat("/mnt/ssd");
+TEST_F(MasterServiceSSDTest, EvictObject) {
+    auto service_ = CreateMasterServiceWithSSDFeat("/mnt/ssd");
     // Mount a segment that can hold about 1024 * 16 objects.
     // As the eviction is processed separately for each shard,
     // we need to fill each shard with enough objects to thoroughly
@@ -367,123 +320,93 @@ TEST_F(MasterServiceSSDSnapshotTest, EvictObject) {
 
     std::this_thread::sleep_for(
         std::chrono::milliseconds(DEFAULT_DEFAULT_KV_LEASE_TTL));
-    // service_->RemoveAll();
+    service_->RemoveAll();
 }
 
-TEST_F(MasterServiceSSDSnapshotTest, PutStartExpires) {
-    // Reset storage space metrics.
-    MasterMetricManager::instance().reset_allocated_mem_size();
-    MasterMetricManager::instance().reset_total_mem_capacity();
+TEST_F(MasterServiceSSDTest, EvictDiskReplica_RemovesDiskReplica) {
+    auto service_ = CreateMasterServiceWithSSDFeat("/mnt/ssd");
 
-    MasterServiceConfig master_config;
-    master_config.root_fs_dir = "/mnt/ssd";
-    master_config.put_start_discard_timeout_sec = 3;
-    master_config.put_start_release_timeout_sec = 5;
-    CreateMasterServiceWithSSDFeatAndConfig(master_config);
-
-    constexpr size_t kReplicaCnt = 2;  // 1 memory replica + 1 disk replica
-    constexpr size_t kBaseAddr = 0x300000000;
-    constexpr size_t kSegmentSize = 1024 * 1024 * 16;  // 16MB
-
-    // Mount a segment.
-    std::string segment_name = "test_segment";
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t size = 1024 * 1024 * 64;
     Segment segment;
     segment.id = generate_uuid();
-    segment.name = segment_name;
-    segment.base = kBaseAddr;
-    segment.size = kSegmentSize;
+    segment.name = "test_segment";
+    segment.base = buffer;
+    segment.size = size;
     segment.te_endpoint = segment.name;
-    auto client_id = generate_uuid();
+    UUID client_id = generate_uuid();
+
     auto mount_result = service_->MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
 
-    std::string key = "test_key";
-    uint64_t value_length = 16 * 1024 * 1024;  // 16MB
-    uint64_t slice_length = value_length;
-    ReplicateConfig config;
+    std::string key = "evict_disk_key";
+    auto put_result =
+        service_->PutStart(client_id, key, "default", 1024, {.replica_num = 1});
+    ASSERT_TRUE(put_result.has_value());
 
-    auto test_discard_replica = [&](ReplicaType discard_type) {
-        const auto reserve_type = discard_type == ReplicaType::MEMORY
-                                      ? ReplicaType::DISK
-                                      : ReplicaType::MEMORY;
+    // Complete both replicas
+    EXPECT_TRUE(service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY)
+                    .has_value());
+    EXPECT_TRUE(service_->PutEnd(client_id, key, "default", ReplicaType::DISK)
+                    .has_value());
 
-        // Put key, should success.
-        auto put_start_result =
-            service_->PutStart(client_id, key, "default", slice_length, config);
-        EXPECT_TRUE(put_start_result.has_value());
-        auto replica_list = put_start_result.value();
-        EXPECT_EQ(replica_list.size(), kReplicaCnt);
-        for (size_t i = 0; i < kReplicaCnt; i++) {
-            EXPECT_EQ(ReplicaStatus::PROCESSING, replica_list[i].status);
-        }
+    // Verify we have 2 replicas (MEM + DISK)
+    auto get_result = service_->GetReplicaList(key, "default");
+    ASSERT_TRUE(get_result.has_value());
+    EXPECT_EQ(2, get_result.value().replicas.size());
 
-        // Complete the reserved replica.
-        auto put_end_result =
-            service_->PutEnd(client_id, key, "default", reserve_type);
-        EXPECT_TRUE(put_end_result.has_value());
+    // Evict disk replica
+    auto evict_result = service_->EvictDiskReplica(client_id, key, "default",
+                                                   ReplicaType::DISK);
+    ASSERT_TRUE(evict_result.has_value());
 
-        // Wait for a while until the put-start expired.
-        for (size_t i = 0; i <= master_config.put_start_discard_timeout_sec;
-             i++) {
-            // Keep mounted segments alive.
-            auto result = service_->Ping(client_id);
-            EXPECT_TRUE(result.has_value());
-            // Protect the key from eviction.
-            auto get_result = service_->GetReplicaList(key, "default");
-            EXPECT_TRUE(get_result.has_value());
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-        }
+    // Verify only memory replica remains
+    get_result = service_->GetReplicaList(key, "default");
+    ASSERT_TRUE(get_result.has_value());
+    EXPECT_EQ(1, get_result.value().replicas.size());
+    EXPECT_TRUE(get_result.value().replicas[0].is_memory_replica());
+}
 
-        // Put key again, should fail because the object has had an completed
-        // replica.
-        put_start_result =
-            service_->PutStart(client_id, key, "default", slice_length, config);
-        EXPECT_FALSE(put_start_result.has_value());
-        EXPECT_EQ(put_start_result.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
+TEST_F(MasterServiceSSDTest, EvictDiskReplica_NonExistentKeyReturnsError) {
+    auto service_ = CreateMasterServiceWithSSDFeat("/mnt/ssd");
 
-        // Wait for a while until the discarded replicas are released.
-        for (size_t i = 0; i <= master_config.put_start_release_timeout_sec;
-             i++) {
-            // Keep mounted segments alive.
-            auto result = service_->Ping(client_id);
-            EXPECT_TRUE(result.has_value());
-            // Protect the key from eviction.
-            auto get_result = service_->GetReplicaList(key, "default");
-            EXPECT_TRUE(get_result.has_value());
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-        }
+    UUID client_id = generate_uuid();
+    auto evict_result = service_->EvictDiskReplica(
+        client_id, "nonexistent_key", "default", ReplicaType::DISK);
+    EXPECT_FALSE(evict_result.has_value());
+    EXPECT_EQ(evict_result.error(), ErrorCode::OBJECT_NOT_FOUND);
+}
 
-        // Try PutEnd the discarded replica.
-        put_end_result =
-            service_->PutEnd(client_id, key, "default", discard_type);
-        EXPECT_TRUE(put_end_result.has_value());
+TEST_F(MasterServiceSSDTest, EvictDiskReplica_InvalidReplicaTypeReturnsError) {
+    auto service_ = CreateMasterServiceWithSSDFeat("/mnt/ssd");
 
-        // Check that the key has only one replica.
-        auto get_result = service_->GetReplicaList(key, "default");
-        EXPECT_TRUE(get_result.has_value());
-        EXPECT_EQ(get_result.value().replicas.size(), 1);
-        if (reserve_type == ReplicaType::MEMORY) {
-            EXPECT_TRUE(get_result.value().replicas[0].is_memory_replica());
-        } else {
-            EXPECT_TRUE(get_result.value().replicas[0].is_disk_replica());
-        }
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t size = 1024 * 1024 * 64;
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "test_segment";
+    segment.base = buffer;
+    segment.size = size;
+    segment.te_endpoint = segment.name;
+    UUID client_id = generate_uuid();
 
-        // Wait for the key to expire.
-        for (size_t i = 0; i <= DEFAULT_DEFAULT_KV_LEASE_TTL / 1000; i++) {
-            auto result = service_->Ping(client_id);
-            EXPECT_TRUE(result.has_value());
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-        }
-        // service_->RemoveAll();
-    };
+    auto mount_result = service_->MountSegment(segment, client_id);
+    ASSERT_TRUE(mount_result.has_value());
 
-    test_discard_replica(ReplicaType::DISK);
-    test_discard_replica(ReplicaType::MEMORY);
+    std::string key = "evict_invalid_type_key";
+    auto put_result =
+        service_->PutStart(client_id, key, "default", 1024, {.replica_num = 1});
+    ASSERT_TRUE(put_result.has_value());
+    EXPECT_TRUE(service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY)
+                    .has_value());
+    EXPECT_TRUE(service_->PutEnd(client_id, key, "default", ReplicaType::DISK)
+                    .has_value());
+
+    // Attempting to evict with MEMORY type should fail
+    auto evict_result = service_->EvictDiskReplica(client_id, key, "default",
+                                                   ReplicaType::MEMORY);
+    EXPECT_FALSE(evict_result.has_value());
+    EXPECT_EQ(evict_result.error(), ErrorCode::INVALID_PARAMS);
 }
 
 }  // namespace mooncake::test
-
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
