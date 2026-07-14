@@ -15,7 +15,7 @@
 #include "utils.h"
 
 #include "bench_runner.h"
-#include "qos_metrics.h"
+#include "qos_metrics_adapter.h"
 #include "te_backend.h"
 #ifdef USE_TENT
 #include "tent_backend.h"
@@ -102,7 +102,7 @@ int processBatchSizes(BenchRunner& runner, size_t block_size, size_t batch_size,
     if (rc != 0) return -1;
     printStats(block_size, batch_size, stats, num_threads);
     if (!qos_classes.empty()) {
-        auto report = calculateQosMetrics(
+        auto report = calculateQosMetricsFromBenchStats(
             block_size, batch_size, num_threads, qos_classes, &qos_stats,
             XferBenchConfig::qos_link_capacity_gbps);
         printQosMetrics(report);
@@ -125,22 +125,37 @@ int main(int argc, char* argv[]) {
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     XferBenchConfig::loadFromFlags();
     std::vector<QosClassConfig> qos_classes;
-    if (!XferBenchConfig::qos_classes.empty()) {
+    if (!XferBenchConfig::qos_classes.empty() &&
+        !XferBenchConfig::qos_classes_json.empty()) {
+        LOG(ERROR) << "Use only one of --qos_classes or --qos_classes_json";
+        return EXIT_FAILURE;
+    }
+    if (!XferBenchConfig::qos_classes_json.empty()) {
+        std::string error;
+        if (!parseQosClassesJson(XferBenchConfig::qos_classes_json,
+                                 &qos_classes, &error)) {
+            LOG(ERROR) << "Invalid --qos_classes_json: " << error;
+            return EXIT_FAILURE;
+        }
+    } else if (!XferBenchConfig::qos_classes.empty()) {
         std::string error;
         if (!parseQosClasses(XferBenchConfig::qos_classes, &qos_classes,
                              &error)) {
             LOG(ERROR) << "Invalid --qos_classes: " << error;
             return EXIT_FAILURE;
         }
+    }
+    if (!qos_classes.empty()) {
+        std::string error;
         if (XferBenchConfig::start_num_threads !=
             XferBenchConfig::max_num_threads) {
-            LOG(ERROR) << "--qos_classes requires start_num_threads == "
-                          "max_num_threads";
+            LOG(ERROR)
+                << "QoS metrics require start_num_threads == max_num_threads";
             return EXIT_FAILURE;
         }
         if (!validateQosClasses(qos_classes, XferBenchConfig::start_num_threads,
                                 &error)) {
-            LOG(ERROR) << "Invalid --qos_classes: " << error;
+            LOG(ERROR) << "Invalid QoS classes: " << error;
             return EXIT_FAILURE;
         }
     }

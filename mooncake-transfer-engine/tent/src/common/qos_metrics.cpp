@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "qos_metrics.h"
+#include "tent/common/qos_metrics.h"
 
 #include <algorithm>
 #include <cmath>
@@ -116,6 +116,84 @@ bool parseQosClasses(const std::string& spec,
     return true;
 }
 
+bool parseQosClassesJson(const std::string& spec,
+                         std::vector<QosClassConfig>* classes,
+                         std::string* error) {
+    classes->clear();
+    try {
+        const auto root = nlohmann::json::parse(spec);
+        if (!root.is_array()) {
+            *error = "qos_classes_json must be an array";
+            return false;
+        }
+        std::set<std::string> names;
+        for (size_t i = 0; i < root.size(); ++i) {
+            const auto& node = root[i];
+            const std::string path =
+                "qos_classes_json[" + std::to_string(i) + "]";
+            if (!node.is_object()) {
+                *error = path + " must be an object";
+                return false;
+            }
+            QosClassConfig config;
+            if (!node.contains("name") || !node["name"].is_string()) {
+                *error = path + ".name must be a string";
+                return false;
+            }
+            config.name = node["name"].get<std::string>();
+            if (config.name.empty() || !names.insert(config.name).second) {
+                *error = "qos class names must be non-empty and unique";
+                return false;
+            }
+            if (!node.contains("threads") ||
+                !node["threads"].is_number_integer()) {
+                *error = path + ".threads must be an integer";
+                return false;
+            }
+            config.threads = node["threads"].get<int>();
+            if (config.threads <= 0) {
+                *error = path + ".threads must be positive";
+                return false;
+            }
+            if (!node.contains("slo_us") ||
+                !node["slo_us"].is_number_unsigned()) {
+                *error = path + ".slo_us must be an unsigned integer";
+                return false;
+            }
+            config.slo_us = node["slo_us"].get<uint64_t>();
+            if (!node.contains("weight") || !node["weight"].is_number()) {
+                *error = path + ".weight must be numeric";
+                return false;
+            }
+            config.weight = node["weight"].get<double>();
+            if (config.weight <= 0.0 || !std::isfinite(config.weight)) {
+                *error = path + ".weight must be finite and positive";
+                return false;
+            }
+            if (node.contains("isolated_gbps") &&
+                !node["isolated_gbps"].is_null()) {
+                if (!node["isolated_gbps"].is_number()) {
+                    *error = path + ".isolated_gbps must be numeric or null";
+                    return false;
+                }
+                const double isolated_gbps =
+                    node["isolated_gbps"].get<double>();
+                if (isolated_gbps <= 0.0 || !std::isfinite(isolated_gbps)) {
+                    *error =
+                        path + ".isolated_gbps must be finite and positive";
+                    return false;
+                }
+                config.isolated_throughput_gbps = isolated_gbps;
+            }
+            classes->push_back(std::move(config));
+        }
+        return true;
+    } catch (const std::exception& e) {
+        *error = std::string("failed to parse qos_classes_json: ") + e.what();
+        return false;
+    }
+}
+
 bool validateQosClasses(const std::vector<QosClassConfig>& classes,
                         int num_threads, std::string* error) {
     int configured_threads = 0;
@@ -143,7 +221,7 @@ size_t qosClassForThread(const std::vector<QosClassConfig>& classes,
 QosMetricsReport calculateQosMetrics(size_t block_size, size_t batch_size,
                                      int num_threads,
                                      const std::vector<QosClassConfig>& classes,
-                                     std::vector<XferBenchStats>* stats,
+                                     const std::vector<QosClassSample>& samples,
                                      double link_capacity_gbps) {
     QosMetricsReport report;
     report.block_size = block_size;
@@ -154,17 +232,17 @@ QosMetricsReport calculateQosMetrics(size_t block_size, size_t batch_size,
     std::optional<double> max_leakage;
     for (size_t i = 0; i < classes.size(); ++i) {
         const auto& config = classes[i];
-        auto& class_stats = (*stats)[i];
+        const auto& sample = samples[i];
         QosClassMetrics metrics;
         metrics.name = config.name;
         metrics.threads = config.threads;
         metrics.slo_us = config.slo_us;
         metrics.weight = config.weight;
         metrics.isolated_throughput_gbps = config.isolated_throughput_gbps;
-        metrics.operations = class_stats.transfer_duration.count();
-        metrics.p99_us = class_stats.transfer_duration.p99();
+        metrics.operations = sample.operations;
+        metrics.p99_us = sample.p99_us;
 
-        const double duration_s = class_stats.total_duration.avg() / 1e6;
+        const double duration_s = sample.total_duration_us / 1e6;
         const double bytes =
             static_cast<double>(block_size) * batch_size * metrics.operations;
         if (duration_s > 0.0)
@@ -172,8 +250,7 @@ QosMetricsReport calculateQosMetrics(size_t block_size, size_t batch_size,
 
         double attainment = 1.0;
         if (config.slo_us != 0) {
-            attainment = class_stats.transfer_duration.fractionAtOrBelow(
-                static_cast<double>(config.slo_us));
+            attainment = sample.slo_attainment.value_or(0.0);
             metrics.slo_attainment = attainment;
         }
         metrics.goodput_gbps = metrics.throughput_gbps * attainment;

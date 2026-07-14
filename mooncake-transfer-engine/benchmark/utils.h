@@ -69,6 +69,7 @@ struct XferBenchConfig {
     static int max_num_threads;
     static int start_num_threads;
     static std::string qos_classes;
+    static std::string qos_classes_json;
     static double qos_link_capacity_gbps;
     static std::string qos_output_jsonl;
 

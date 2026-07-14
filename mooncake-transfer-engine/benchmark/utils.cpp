@@ -39,6 +39,9 @@ DEFINE_string(
     qos_classes, "",
     "QoS classes as name:threads:slo_us:weight[:isolated_gbps],...; "
     "enables per-class QoS metrics and requires a fixed thread count.");
+DEFINE_string(qos_classes_json, "",
+              "QoS classes as a JSON array of objects with name, threads, "
+              "slo_us, weight, and optional isolated_gbps fields.");
 DEFINE_double(qos_link_capacity_gbps, 0.0,
               "Link capacity in GB/s for total utilization (0 reports N/A).");
 DEFINE_string(qos_output_jsonl, "",
@@ -79,6 +82,7 @@ int XferBenchConfig::duration = 0;
 int XferBenchConfig::max_num_threads = 0;
 int XferBenchConfig::start_num_threads = 0;
 std::string XferBenchConfig::qos_classes;
+std::string XferBenchConfig::qos_classes_json;
 double XferBenchConfig::qos_link_capacity_gbps = 0.0;
 std::string XferBenchConfig::qos_output_jsonl;
 
@@ -108,6 +112,7 @@ void XferBenchConfig::loadFromFlags() {
     start_num_threads = FLAGS_start_num_threads;
     max_num_threads = FLAGS_max_num_threads;
     qos_classes = FLAGS_qos_classes;
+    qos_classes_json = FLAGS_qos_classes_json;
     qos_link_capacity_gbps = FLAGS_qos_link_capacity_gbps;
     qos_output_jsonl = FLAGS_qos_output_jsonl;
     duration = FLAGS_duration;

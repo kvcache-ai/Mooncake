@@ -12,16 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef TEBENCH_QOS_METRICS_H
-#define TEBENCH_QOS_METRICS_H
+#ifndef TENT_COMMON_QOS_METRICS_H
+#define TENT_COMMON_QOS_METRICS_H
 
 #include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
 #include <vector>
-
-#include "utils.h"
 
 namespace mooncake {
 namespace tent {
@@ -53,6 +51,13 @@ struct QosClassMetrics {
     std::optional<double> isolation_leakage;
 };
 
+struct QosClassSample {
+    size_t operations = 0;
+    double total_duration_us = 0.0;
+    double p99_us = 0.0;
+    std::optional<double> slo_attainment;
+};
+
 struct QosMetricsReport {
     size_t block_size = 0;
     size_t batch_size = 0;
@@ -69,6 +74,10 @@ struct QosMetricsReport {
 bool parseQosClasses(const std::string& spec,
                      std::vector<QosClassConfig>* classes, std::string* error);
 
+bool parseQosClassesJson(const std::string& spec,
+                         std::vector<QosClassConfig>* classes,
+                         std::string* error);
+
 bool validateQosClasses(const std::vector<QosClassConfig>& classes,
                         int num_threads, std::string* error);
 
@@ -78,7 +87,7 @@ size_t qosClassForThread(const std::vector<QosClassConfig>& classes,
 QosMetricsReport calculateQosMetrics(size_t block_size, size_t batch_size,
                                      int num_threads,
                                      const std::vector<QosClassConfig>& classes,
-                                     std::vector<XferBenchStats>* stats,
+                                     const std::vector<QosClassSample>& samples,
                                      double link_capacity_gbps);
 
 void printQosMetrics(const QosMetricsReport& report);
@@ -89,4 +98,4 @@ bool appendQosMetricsJsonl(const std::string& path,
 }  // namespace tent
 }  // namespace mooncake
 
-#endif  // TEBENCH_QOS_METRICS_H
+#endif  // TENT_COMMON_QOS_METRICS_H

@@ -100,6 +100,18 @@ classes:
 name:threads:slo_us:weight[:isolated_gbps],...
 ```
 
+For readability, the same contract can be supplied as JSON with
+`--qos_classes_json`:
+
+```json
+[
+  {"name": "foreground", "threads": 4, "slo_us": 1000, "weight": 4, "isolated_gbps": 12.5},
+  {"name": "checkpoint", "threads": 12, "slo_us": 0, "weight": 1, "isolated_gbps": 10.0}
+]
+```
+
+Use only one of `--qos_classes` and `--qos_classes_json`.
+
 For example, the following closed-loop mixed workload assigns four workers to
 an SLO-constrained foreground class and twelve workers to a best-effort
 checkpoint class:

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "qos_metrics.h"
+#include "qos_metrics_adapter.h"
 
 #include <cstdio>
 #include <fstream>
@@ -57,6 +57,26 @@ TEST(QosMetricsTest, ParsesClassContract) {
     EXPECT_EQ(qosClassForThread(classes, 15), 1);
 }
 
+TEST(QosMetricsTest, ParsesJsonClassContract) {
+    std::vector<QosClassConfig> classes;
+    std::string error;
+    ASSERT_TRUE(parseQosClassesJson(
+        R"json([
+          {"name":"fg","threads":4,"slo_us":1000,"weight":2,"isolated_gbps":12.5},
+          {"name":"bg","threads":12,"slo_us":0,"weight":1}
+        ])json",
+        &classes, &error))
+        << error;
+    ASSERT_EQ(classes.size(), 2);
+    EXPECT_EQ(classes[0].name, "fg");
+    EXPECT_EQ(classes[0].threads, 4);
+    EXPECT_EQ(classes[0].slo_us, 1000);
+    EXPECT_DOUBLE_EQ(classes[0].weight, 2.0);
+    ASSERT_TRUE(classes[0].isolated_throughput_gbps);
+    EXPECT_DOUBLE_EQ(*classes[0].isolated_throughput_gbps, 12.5);
+    EXPECT_FALSE(classes[1].isolated_throughput_gbps);
+}
+
 TEST(QosMetricsTest, RejectsAmbiguousOrInvalidContracts) {
     std::vector<QosClassConfig> classes;
     std::string error;
@@ -84,7 +104,8 @@ TEST(QosMetricsTest, CalculatesSloFairnessIsolationAndUtilization) {
     stats[1].transfer_duration.add(100.0);
     stats[1].transfer_duration.add(100.0);
 
-    const auto report = calculateQosMetrics(1000, 1, 2, classes, &stats, 0.01);
+    const auto report =
+        calculateQosMetricsFromBenchStats(1000, 1, 2, classes, &stats, 0.01);
     ASSERT_EQ(report.classes.size(), 2);
     EXPECT_NEAR(report.aggregate_throughput_gbps, 0.005, 1e-12);
     EXPECT_NEAR(report.weighted_goodput_gbps, 0.006, 1e-12);
@@ -115,7 +136,8 @@ TEST(QosMetricsTest, UsesNullForUnavailableJsonMetrics) {
     std::vector<XferBenchStats> stats(1);
     stats[0].total_duration.add(1000.0);
     stats[0].transfer_duration.add(100.0);
-    const auto report = calculateQosMetrics(1000, 1, 1, classes, &stats, 0.0);
+    const auto report =
+        calculateQosMetricsFromBenchStats(1000, 1, 1, classes, &stats, 0.0);
 
     const std::string path = "tebench_qos_metrics_test.jsonl";
     std::remove(path.c_str());
