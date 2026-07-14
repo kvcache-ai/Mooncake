@@ -37,6 +37,7 @@ TEST(ReceiverCreditConfig, MissingSectionIsStrictlyDefaultOff) {
     EXPECT_EQ(output.adaptive_dispatch_min_owners, 1);
     EXPECT_EQ(output.adaptive_dispatch_initial_owners, 2);
     EXPECT_EQ(output.adaptive_dispatch_max_owners, 2);
+    EXPECT_EQ(output.adaptive_dispatch_slow_rtt_us, 20000);
 }
 
 TEST(ReceiverCreditConfig, LoadsCompleteNestedRequiredConfiguration) {

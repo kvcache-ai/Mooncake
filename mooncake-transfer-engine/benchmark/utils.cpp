@@ -76,7 +76,7 @@ DEFINE_uint64(receiver_credit_adaptive_initial_owners, 2,
               "tent only: adaptive dispatch startup window");
 DEFINE_uint64(receiver_credit_adaptive_max_owners, 2,
               "tent only: adaptive dispatch exploration ceiling");
-DEFINE_uint32(receiver_credit_adaptive_slow_rtt_us, 1000,
+DEFINE_uint32(receiver_credit_adaptive_slow_rtt_us, 20000,
               "tent only: credit RPC RTT that triggers backoff");
 DEFINE_uint32(receiver_credit_adaptive_healthy_pulls, 4096,
               "tent only: healthy pulls required for additive recovery");

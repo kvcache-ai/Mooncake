@@ -23,7 +23,9 @@ struct ReceiverCreditRuntimeConfig {
     static constexpr size_t kDefaultAdaptiveMinOwners = 1;
     static constexpr size_t kDefaultAdaptiveInitialOwners = 2;
     static constexpr size_t kDefaultAdaptiveMaxOwners = 2;
-    static constexpr uint32_t kDefaultAdaptiveSlowRttUs = 1000;
+    // The observed failure mode is a TCP minimum-RTO event (~200 ms). Keep
+    // ample distance from healthy scheduler jitter, which can reach ~10 ms.
+    static constexpr uint32_t kDefaultAdaptiveSlowRttUs = 20000;
     static constexpr uint32_t kDefaultAdaptiveHealthyPulls = 4096;
 
     CreditRolloutMode mode{CreditRolloutMode::Disabled};
