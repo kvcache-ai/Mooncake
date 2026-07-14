@@ -87,6 +87,7 @@ class TENTBenchRunner : public BenchRunner {
     SegmentID handle_;
     SegmentInfo info_;
     TransportType transport_hint_{UNSPEC};
+    IntentType intent_type_{IntentType::INTENT_UNSPEC};
 
     std::vector<std::function<int(int)>> current_task_;
     std::vector<std::thread> threads_;

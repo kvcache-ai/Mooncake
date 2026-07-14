@@ -127,6 +127,8 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
             enable_ssd_offload=False,
             ssd_offload_path="",
             tenant_id="tenant-a",
+            enable_client_http_server=False,
+            client_http_port=9300,
         )
 
         with patch(
@@ -140,17 +142,20 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
             fake_store.setup_calls,
             [
                 (
-                    "localhost",
-                    "P2PHANDSHAKE",
-                    1024,
-                    2048,
-                    "tcp",
-                    "",
-                    "127.0.0.1:50051",
-                    None,
-                    False,
-                    "",
-                    "tenant-a",
+                    {
+                        "local_hostname": "localhost",
+                        "metadata_server": "P2PHANDSHAKE",
+                        "global_segment_size": 1024,
+                        "local_buffer_size": 2048,
+                        "protocol": "tcp",
+                        "rdma_devices": "",
+                        "master_server_addr": "127.0.0.1:50051",
+                        "enable_ssd_offload": False,
+                        "ssd_offload_path": "",
+                        "tenant_id": "tenant-a",
+                        "enable_client_http_server": False,
+                        "client_http_port": 9300,
+                    },
                 )
             ],
         )
