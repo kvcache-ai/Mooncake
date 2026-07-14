@@ -194,6 +194,11 @@ add_ha_test(ha_backend_availability_test
 add_ha_test(leader_label_reconciler_test
             ha/leadership/leader_label_reconciler_test.cpp)
 add_ha_test(oplog_batch_storage_test ha/oplog/oplog_batch_storage_test.cpp)
+add_ha_test(oplog_batch_auditor_test ha/oplog/oplog_batch_auditor_test.cpp)
+target_sources(oplog_batch_auditor_test
+               PRIVATE ../tools/oplog_batch_auditor.cpp)
+target_include_directories(oplog_batch_auditor_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
 add_executable(stress_workload_test stress_workload_test.cpp)
 target_link_libraries(
@@ -223,6 +228,21 @@ add_ha_test(oplog_batch_codec_test ha/oplog/oplog_batch_codec_test.cpp)
 add_ha_test(oplog_batch_standby_reader_test
             ha/oplog/oplog_batch_standby_reader_test.cpp)
 add_ha_test(ordered_oplog_writer_test ha/oplog/ordered_oplog_writer_test.cpp)
+if(MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
+  target_compile_definitions(
+    ha_metric_manager_test PRIVATE MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
+  target_compile_definitions(
+    ordered_oplog_writer_test PRIVATE MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
+endif()
+add_executable(
+  oplog_test_failpoint_test
+  ha/oplog/oplog_test_failpoint_test.cpp
+  ../src/ha/oplog/oplog_test_failpoint.cpp)
+target_compile_definitions(oplog_test_failpoint_test
+                           PRIVATE MOONCAKE_ENABLE_TEST_FAILPOINTS)
+target_link_libraries(oplog_test_failpoint_test PRIVATE glog gtest gtest_main
+                                                        pthread)
+add_test(NAME oplog_test_failpoint_test COMMAND oplog_test_failpoint_test)
 add_ha_test(localfs_oplog_store_test ha/oplog/localfs_oplog_store_test.cpp)
 add_ha_test(ha_recovery_test ha/oplog/ha_recovery_test.cpp)
 add_ha_test(master_service_ha_test ha/master_service_ha_test.cpp)

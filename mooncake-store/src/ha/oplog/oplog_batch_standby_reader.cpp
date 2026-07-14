@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "ha/oplog/oplog_applier.h"
+#include "ha/oplog/oplog_test_failpoint.h"
 
 namespace mooncake {
 
@@ -69,6 +70,7 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
         return result;
     }
 
+    TestFailPoint::Wait("standby_prefix_read_before_batch");
     OpLogBatchRecord target_batch;
     err = storage_.ReadBatch(prefix.batch_id, target_batch);
     if (err != ErrorCode::OK) {

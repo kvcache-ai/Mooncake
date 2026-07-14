@@ -11,6 +11,10 @@
 #include <thread>
 #include <vector>
 
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+#include "ha_metric_manager.h"
+#endif
+
 namespace mooncake::test {
 namespace {
 
@@ -119,6 +123,18 @@ OpLogEntry MakeEntry(std::string key = "key", std::string payload = "value") {
     return entry;
 }
 
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+bool WaitForMetric(const std::function<bool()>& predicate) {
+    for (int i = 0; i < 100; ++i) {
+        if (predicate()) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return false;
+}
+#endif
+
 }  // namespace
 
 TEST(OrderedOpLogWriterAdmissionTest, AbortLeavesNoSequenceGap) {
@@ -173,6 +189,47 @@ TEST(OrderedOpLogWriterAdmissionTest, CommitAssignsContiguousSequences) {
     EXPECT_EQ(2u, p2->sequence_id());
     EXPECT_EQ(3u, p3->sequence_id());
 }
+
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+TEST(OrderedOpLogWriterMetricTest, RecordsDurabilityQueuesAndRetry) {
+    FakeBatchWriter storage;
+    storage.FailNextWrites(1, ErrorCode::ETCD_TRANSACTION_FAIL);
+    auto& metrics = HAMetricManager::instance();
+    const auto batches_before =
+        metrics.get_batch_record_durable_batches_total();
+    const auto entries_before =
+        metrics.get_batch_record_durable_entries_total();
+    const auto retries_before = metrics.get_batch_record_retries_total();
+
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{.max_entries_per_batch = 2},
+        [&](const OpLogBatchRecord& batch,
+            const DurablePrefix& expected_prefix) {
+            return storage.Write(batch, expected_prefix);
+        });
+    writer.Start();
+    auto reservation = writer.Reserve();
+    ASSERT_TRUE(reservation.has_value());
+    std::atomic<bool> callback_done{false};
+    ASSERT_TRUE(writer
+                    .Commit(std::move(*reservation), MakeEntry(),
+                            [&](const OpLogEntry&) { callback_done = true; })
+                    .has_value());
+
+    ASSERT_TRUE(WaitForMetric([&] { return callback_done.load(); }));
+    writer.Stop();
+
+    EXPECT_EQ(batches_before + 1,
+              metrics.get_batch_record_durable_batches_total());
+    EXPECT_EQ(entries_before + 1,
+              metrics.get_batch_record_durable_entries_total());
+    EXPECT_EQ(retries_before + 1, metrics.get_batch_record_retries_total());
+    EXPECT_EQ(1, metrics.get_batch_record_last_batch_id());
+    EXPECT_EQ(1, metrics.get_batch_record_durable_sequence());
+    EXPECT_EQ(0, metrics.get_batch_record_committed_queue_depth());
+    EXPECT_EQ(0, metrics.get_batch_record_callback_queue_depth());
+}
+#endif
 
 TEST(OrderedOpLogWriterAdmissionTest,
      InvalidEntryDoesNotConsumeSequenceOrInvokeCallback) {

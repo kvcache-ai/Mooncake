@@ -7,6 +7,9 @@
 
 #include "ha/oplog/oplog_batch_codec.h"
 #include "ha/oplog/oplog_store.h"
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+#include "ha_metric_manager.h"
+#endif
 
 namespace mooncake {
 namespace {
@@ -157,13 +160,18 @@ ErrorCode OpLogBatchStorage::WriteBatchAndAdvancePrefix(
     }
 
     const std::string durable_key = BuildDurablePrefixKey(cluster_id_);
+    const std::string encoded_batch = EncodeOpLogBatchRecord(batch);
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+    HAMetricManager::instance().observe_batch_record_batch_bytes(
+        encoded_batch.size());
+#endif
     KvTxn txn;
     txn.compares.push_back(
         {.key = durable_key,
          .kind = KvCompareKind::kValueEquals,
          .expected_value = EncodeDurablePrefix(expected_prefix)});
     txn.puts.push_back({.key = BuildBatchRecordKey(cluster_id_, batch.batch_id),
-                        .value = EncodeOpLogBatchRecord(batch)});
+                        .value = encoded_batch});
     txn.puts.push_back(
         {.key = durable_key,
          .value = EncodeDurablePrefix(

@@ -14,6 +14,7 @@
 #include "ha/oplog/oplog_manager.h"
 #include "ha/oplog/oplog_replicator.h"
 #include "ha/oplog/oplog_store_factory.h"
+#include "ha/oplog/oplog_test_failpoint.h"
 
 namespace mooncake {
 
@@ -953,6 +954,7 @@ ErrorCode HotStandbyService::PromoteLockedInternal(
         return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
     }
 
+    TestFailPoint::Wait("promotion_final_catch_up_before_complete");
     uint64_t latest_applied_seq_id = GetLocalLastAppliedSequenceIdLocked();
     applied_seq_id_.store(latest_applied_seq_id, std::memory_order_release);
     primary_seq_id_.store(latest_applied_seq_id, std::memory_order_release);

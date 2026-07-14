@@ -20,6 +20,13 @@ option(WITH_RUST_EXAMPLE "build the Rust interface and sample code for the trans
 option(WITH_STORE_RUST "build the Rust bindings for the Mooncake Store" ON)
 option(WITH_EP "build mooncake with expert parallelism support" OFF)
 option(USE_NOF "build mooncake store with NoF SSD pool support" OFF)
+option(MOONCAKE_ENABLE_TEST_FAILPOINTS
+       "Enable file-handshake failpoints for integration tests" OFF)
+if(MOONCAKE_ENABLE_TEST_FAILPOINTS)
+  add_compile_definitions(MOONCAKE_ENABLE_TEST_FAILPOINTS)
+endif()
+option(MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+       "Enable detailed batch OpLog performance metrics" OFF)
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/mooncake-common/SetupPython.cmake)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/extern/pybind11)

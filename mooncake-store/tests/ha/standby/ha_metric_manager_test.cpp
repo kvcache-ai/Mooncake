@@ -107,6 +107,58 @@ TEST_F(HAMetricManagerTest, TestRecordOpLogApplyLatency) {
     SUCCEED();
 }
 
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+TEST_F(HAMetricManagerTest, TestBatchRecordMetrics) {
+    const auto batches_before = M().get_batch_record_durable_batches_total();
+    const auto entries_before = M().get_batch_record_durable_entries_total();
+    const auto retries_before = M().get_batch_record_retries_total();
+
+    M().inc_batch_record_durable_batches();
+    M().inc_batch_record_durable_entries(8);
+    M().inc_batch_record_retries();
+    M().set_batch_record_committed_queue_depth(3);
+    M().set_batch_record_callback_queue_depth(2);
+    M().set_batch_record_last_batch_id(9);
+    M().set_batch_record_durable_sequence(72);
+    M().observe_batch_record_batch_entries(8);
+    M().observe_batch_record_batch_bytes(1024);
+    M().observe_batch_record_txn_latency_us(500);
+    M().observe_batch_record_commit_to_durable_us(700);
+    M().observe_batch_record_callback_latency_us(20);
+
+    EXPECT_EQ(batches_before + 1, M().get_batch_record_durable_batches_total());
+    EXPECT_EQ(entries_before + 8, M().get_batch_record_durable_entries_total());
+    EXPECT_EQ(retries_before + 1, M().get_batch_record_retries_total());
+    EXPECT_EQ(3, M().get_batch_record_committed_queue_depth());
+    EXPECT_EQ(2, M().get_batch_record_callback_queue_depth());
+    EXPECT_EQ(9, M().get_batch_record_last_batch_id());
+    EXPECT_EQ(72, M().get_batch_record_durable_sequence());
+
+    const std::string text = M().serialize_metrics();
+    for (const char* name : {
+             "ha_batch_record_durable_batches_total",
+             "ha_batch_record_durable_entries_total",
+             "ha_batch_record_retry_total",
+             "ha_batch_record_committed_queue_depth",
+             "ha_batch_record_callback_queue_depth",
+             "ha_batch_record_last_batch_id",
+             "ha_batch_record_durable_sequence",
+             "ha_batch_record_batch_entries",
+             "ha_batch_record_batch_bytes",
+             "ha_batch_record_txn_latency_us",
+             "ha_batch_record_commit_to_durable_us",
+             "ha_batch_record_callback_latency_us",
+         }) {
+        EXPECT_NE(std::string::npos, text.find(name)) << name;
+    }
+}
+#else
+TEST_F(HAMetricManagerTest, BatchRecordMetricsAreAbsentWhenDisabled) {
+    EXPECT_EQ(std::string::npos,
+              M().serialize_metrics().find("ha_batch_record_"));
+}
+#endif
+
 // ========== 7.1.2 Metric serialization tests ==========
 
 TEST_F(HAMetricManagerTest, TestSerializeMetrics) {

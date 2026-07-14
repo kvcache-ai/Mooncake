@@ -68,6 +68,7 @@ set(MOONCAKE_STORE_SOURCES
     ha/oplog/oplog_batch_standby_reader.cpp
     ha/oplog/oplog_batch_types.cpp
     ha/oplog/ordered_oplog_writer.cpp
+    ha/oplog/oplog_test_failpoint.cpp
     ha/oplog/oplog_serializer.cpp
     ha/oplog/oplog_store_factory.cpp
     ha/oplog/oplog_replicator.cpp
@@ -279,6 +280,10 @@ include_directories(${Python3_INCLUDE_DIRS})
 add_library(mooncake_store ${MOONCAKE_STORE_SOURCES})
 if(KV_EVENTS_ZMQ_FOUND)
   target_compile_definitions(mooncake_store PRIVATE MOONCAKE_ENABLE_KV_EVENTS=1)
+endif()
+if(MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
+  target_compile_definitions(
+    mooncake_store PRIVATE MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
 endif()
 target_include_directories(mooncake_store PUBLIC ${XXHASH_INCLUDE_DIR})
 if(USE_NOF)

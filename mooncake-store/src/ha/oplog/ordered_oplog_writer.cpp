@@ -10,9 +10,27 @@
 #include <utility>
 #include <vector>
 
+#include "ha/oplog/oplog_test_failpoint.h"
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+#include "ha_metric_manager.h"
+#endif
+
 namespace mooncake {
 
 struct OrderedOpLogWriter::Impl {
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+    using Clock = std::chrono::steady_clock;
+#endif
+
+    struct PendingEntry {
+        OpLogEntry entry;
+        DurableCallback callback;
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+        Clock::time_point committed_at{};
+        Clock::time_point durable_at{};
+#endif
+    };
+
     explicit Impl(OrderedOpLogWriterConfig config, WriteBatchFn write_batch)
         : config(std::move(config)), write_batch(std::move(write_batch)) {
         if (this->config.max_entries_per_batch == 0) {
@@ -38,6 +56,10 @@ struct OrderedOpLogWriter::Impl {
             ready_entries.push_back(std::move(committed_entries.front()));
             committed_entries.pop_front();
         }
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+        HAMetricManager::instance().set_batch_record_committed_queue_depth(
+            committed_entries.size() + ready_entries.size());
+#endif
         open_waiting_slots -= count;
         batch_busy = true;
     }
@@ -56,10 +78,10 @@ struct OrderedOpLogWriter::Impl {
     DurablePrefix durable_prefix{config.initial_durable_prefix};
     size_t open_waiting_slots{0};
     std::unordered_set<uint64_t> active_reservations;
-    std::deque<std::pair<OpLogEntry, DurableCallback>> committed_entries;
-    std::vector<std::pair<OpLogEntry, DurableCallback>> ready_entries;
+    std::deque<PendingEntry> committed_entries;
+    std::vector<PendingEntry> ready_entries;
     bool batch_busy{false};
-    std::deque<std::pair<OpLogEntry, DurableCallback>> callback_entries;
+    std::deque<PendingEntry> callback_entries;
     std::thread writer_thread;
     std::thread callback_thread;
 };
@@ -155,8 +177,16 @@ OrderedOpLogWriter::Commit(Reservation&& reservation, OpLogEntry entry,
     entry.prefix_hash = 0;
     entry.sequence_id = impl_->next_sequence_id++;
     const uint64_t sequence_id = entry.sequence_id;
-    impl_->committed_entries.push_back(
-        std::make_pair(std::move(entry), std::move(callback)));
+    Impl::PendingEntry pending{.entry = std::move(entry),
+                               .callback = std::move(callback)};
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+    pending.committed_at = Impl::Clock::now();
+#endif
+    impl_->committed_entries.push_back(std::move(pending));
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+    HAMetricManager::instance().set_batch_record_committed_queue_depth(
+        impl_->committed_entries.size() + impl_->ready_entries.size());
+#endif
     impl_->SealCommittedEntriesIfIdle();
     impl_->cv.notify_all();
     return PendingHandle(sequence_id);
@@ -191,7 +221,7 @@ void OrderedOpLogWriter::Start() {
     impl_->running = true;
     impl_->callback_thread = std::thread([this] {
         while (true) {
-            std::pair<OpLogEntry, DurableCallback> callback_entry;
+            Impl::PendingEntry callback_entry;
             {
                 std::unique_lock<std::mutex> lock(impl_->mutex);
                 impl_->cv.wait(lock, [&] {
@@ -204,15 +234,29 @@ void OrderedOpLogWriter::Start() {
                 }
                 callback_entry = std::move(impl_->callback_entries.front());
                 impl_->callback_entries.pop_front();
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+                HAMetricManager::instance()
+                    .set_batch_record_callback_queue_depth(
+                        impl_->callback_entries.size());
+#endif
             }
-            if (callback_entry.second) {
-                callback_entry.second(callback_entry.first);
+            if (callback_entry.callback) {
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+                const auto callback_started_at = Impl::Clock::now();
+                const auto latency_us =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        callback_started_at - callback_entry.durable_at)
+                        .count();
+                HAMetricManager::instance()
+                    .observe_batch_record_callback_latency_us(latency_us);
+#endif
+                callback_entry.callback(callback_entry.entry);
             }
         }
     });
     impl_->writer_thread = std::thread([this] {
         while (true) {
-            std::vector<std::pair<OpLogEntry, DurableCallback>> entries;
+            std::vector<Impl::PendingEntry> entries;
             DurablePrefix expected_prefix;
             {
                 std::unique_lock<std::mutex> lock(impl_->mutex);
@@ -225,21 +269,50 @@ void OrderedOpLogWriter::Start() {
                 }
                 entries = std::move(impl_->ready_entries);
                 impl_->ready_entries.clear();
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+                HAMetricManager::instance()
+                    .set_batch_record_committed_queue_depth(
+                        impl_->committed_entries.size());
+#endif
                 expected_prefix = impl_->durable_prefix;
             }
 
             OpLogBatchRecord batch;
             batch.batch_id = expected_prefix.batch_id + 1;
-            batch.first_seq = entries.front().first.sequence_id;
-            batch.last_seq = entries.back().first.sequence_id;
+            batch.first_seq = entries.front().entry.sequence_id;
+            batch.last_seq = entries.back().entry.sequence_id;
             batch.entries.reserve(entries.size());
             for (auto& entry : entries) {
-                batch.entries.push_back(std::move(entry.first));
+                batch.entries.push_back(std::move(entry.entry));
             }
 
             while (true) {
+                TestFailPoint::Wait("batch_before_txn");
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+                const auto txn_started_at = Impl::Clock::now();
+#endif
                 ErrorCode err = impl_->write_batch(batch, expected_prefix);
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+                const auto txn_latency_us =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        Impl::Clock::now() - txn_started_at)
+                        .count();
+                HAMetricManager::instance().observe_batch_record_txn_latency_us(
+                    txn_latency_us);
+#endif
                 if (err == ErrorCode::OK) {
+                    TestFailPoint::Wait("batch_txn_succeeded_before_callback");
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+                    const auto durable_at = Impl::Clock::now();
+                    for (const auto& entry : entries) {
+                        HAMetricManager::instance()
+                            .observe_batch_record_commit_to_durable_us(
+                                std::chrono::duration_cast<
+                                    std::chrono::microseconds>(
+                                    durable_at - entry.committed_at)
+                                    .count());
+                    }
+#endif
                     {
                         std::lock_guard<std::mutex> lock(impl_->mutex);
                         impl_->durable_prefix = {.batch_id = batch.batch_id,
@@ -247,10 +320,26 @@ void OrderedOpLogWriter::Start() {
                         impl_->last_error = ErrorCode::OK;
                         impl_->accepting = !impl_->stop_requested;
                         for (size_t i = 0; i < entries.size(); ++i) {
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+                            entries[i].durable_at = durable_at;
+#endif
+                            entries[i].entry = batch.entries[i];
                             impl_->callback_entries.push_back(
-                                {batch.entries[i],
-                                 std::move(entries[i].second)});
+                                std::move(entries[i]));
                         }
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+                        auto& metrics = HAMetricManager::instance();
+                        metrics.inc_batch_record_durable_batches();
+                        metrics.inc_batch_record_durable_entries(
+                            batch.entries.size());
+                        metrics.observe_batch_record_batch_entries(
+                            batch.entries.size());
+                        metrics.set_batch_record_last_batch_id(batch.batch_id);
+                        metrics.set_batch_record_durable_sequence(
+                            batch.last_seq);
+                        metrics.set_batch_record_callback_queue_depth(
+                            impl_->callback_entries.size());
+#endif
                         impl_->batch_busy = false;
                         impl_->SealCommittedEntriesIfIdle();
                     }
@@ -260,6 +349,9 @@ void OrderedOpLogWriter::Start() {
 
                 {
                     std::lock_guard<std::mutex> lock(impl_->mutex);
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+                    HAMetricManager::instance().inc_batch_record_retries();
+#endif
                     impl_->last_error = err;
                     impl_->accepting = false;
                     if (impl_->stop_requested) {
