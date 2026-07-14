@@ -530,9 +530,9 @@ TEST_F(StorageTierTest, BucketBackendRejectsOffloadWhenPhysicalSpaceTooLow) {
     auto space_info = fs::space(test_dir, ec);
     ASSERT_FALSE(ec) << "Failed to inspect filesystem space: " << ec.message();
 
-    if (space_info.available >=
+    if (space_info.capacity >=
         static_cast<uintmax_t>(std::numeric_limits<int64_t>::max() - 1)) {
-        GTEST_SKIP() << "filesystem available space is too large to build a "
+        GTEST_SKIP() << "filesystem capacity is too large to build a "
                         "stable int64_t overflow-safe test";
     }
 
@@ -544,7 +544,7 @@ TEST_F(StorageTierTest, BucketBackendRejectsOffloadWhenPhysicalSpaceTooLow) {
     BucketBackendConfig bucket_config;
     bucket_config.bucket_keys_limit = 10;
     bucket_config.bucket_size_limit =
-        static_cast<int64_t>(space_info.available + 1);
+        static_cast<int64_t>(space_info.capacity + 1);
 
     {
         BucketStorageBackend backend(config, bucket_config);
