@@ -31,6 +31,12 @@
 
 namespace mooncake {
 
+namespace internal {
+class WarmupBatchCleanup;
+struct StoreWarmupOptions;
+struct StoreWarmupProbeResult;
+}  // namespace internal
+
 class PutOperation;
 
 /**
@@ -790,6 +796,18 @@ class Client {
         std::unordered_map<std::string, std::vector<Slice>>& slices);
     ReplicateConfig AttachHostId(const ReplicateConfig& config) const;
 
+    internal::StoreWarmupOptions LoadWarmupOptions() const;
+    tl::expected<std::vector<WarmupTarget>, ErrorCode> ListWarmupTargets(
+        const internal::StoreWarmupOptions& options);
+    internal::StoreWarmupProbeResult ProbeWarmupTarget(
+        const WarmupTarget& target, BufferHandle buffer,
+        const internal::StoreWarmupOptions& options,
+        internal::WarmupBatchCleanup& cleanup);
+    internal::WarmupBatchCleanup& GetWarmupBatchCleanup();
+    void DrainPendingWarmupBatches(internal::WarmupBatchCleanup& cleanup,
+                                   std::chrono::milliseconds timeout);
+    void ShutdownWarmupCleanup();
+
     // Client identification
     const UUID client_id_;
 
@@ -800,6 +818,8 @@ class Client {
     std::shared_ptr<TransferEngine> transfer_engine_;
     MasterClient master_client_;
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
+    std::mutex warmup_cleanup_mutex_;
+    std::unique_ptr<internal::WarmupBatchCleanup> warmup_batch_cleanup_;
 
     // Mutex to protect mounted_segments_
     mutable std::mutex mounted_segments_mutex_;

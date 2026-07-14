@@ -2,13 +2,48 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <optional>
 #include <string>
 #include <unordered_set>
 #include <vector>
 
+#include "client_buffer.h"
+#include "store_warmup_internal.h"
 #include "types.h"
 
 namespace mooncake::test {
+namespace {
+
+class ScopedEnvVar {
+   public:
+    ScopedEnvVar(const char* name, std::optional<const char*> value)
+        : name_(name) {
+        if (const char* old_value = std::getenv(name)) old_value_ = old_value;
+        if (value) {
+            setenv(name, *value, 1);
+        } else {
+            unsetenv(name);
+        }
+    }
+
+    ~ScopedEnvVar() {
+        if (old_value_) {
+            setenv(name_.c_str(), old_value_->c_str(), 1);
+        } else {
+            unsetenv(name_.c_str());
+        }
+    }
+
+   private:
+    std::string name_;
+    std::optional<std::string> old_value_;
+};
+
+}  // namespace
 
 class StoreWarmupTest : public ::testing::Test {
    protected:
@@ -75,10 +110,9 @@ TEST_F(StoreWarmupTest, DifferentClientsReturnRemoteWarmupTargets) {
 
     auto local_segment =
         MakeSegment("local-segment", 0x10000000, "tcp", "127.0.0.1:18000");
-    auto remote_segment_1 = MakeSegment(
-        "remote-segment-1", 0x20000000, "tcp", "127.0.0.1:18001");
-    auto remote_segment_2 =
-        MakeSegment("127.0.0.1:18002", 0x30000000, "tcp");
+    auto remote_segment_1 =
+        MakeSegment("remote-segment-1", 0x20000000, "tcp", "127.0.0.1:18001");
+    auto remote_segment_2 = MakeSegment("127.0.0.1:18002", 0x30000000, "tcp");
     local_segment.host_id = "same-host";
     remote_segment_1.host_id = "same-host";
     remote_segment_2.host_id = "same-host";
@@ -206,8 +240,7 @@ TEST_F(StoreWarmupTest, MaxTargetsUsesRequesterStableRotation) {
           remote_client);
 
     auto targets_a = service.ListWarmupTargets(requester_a, 2, {"tcp"});
-    auto targets_a_again =
-        service.ListWarmupTargets(requester_a, 2, {"tcp"});
+    auto targets_a_again = service.ListWarmupTargets(requester_a, 2, {"tcp"});
     auto targets_b = service.ListWarmupTargets(requester_b, 2, {"tcp"});
     ASSERT_TRUE(targets_a.has_value());
     ASSERT_TRUE(targets_a_again.has_value());
@@ -223,6 +256,98 @@ TEST_F(StoreWarmupTest, MaxTargetsUsesRequesterStableRotation) {
                   targets_a_again->at(i).segment_name);
     }
     EXPECT_NE(TargetNames(*targets_a), TargetNames(*targets_b));
+}
+
+TEST_F(StoreWarmupTest, WarmupMaxTargetsUsesSafeDefaultAndExplicitValues) {
+    {
+        ScopedEnvVar max_targets("MC_STORE_WARMUP_MAX_TARGETS", std::nullopt);
+        EXPECT_EQ(internal::LoadStoreWarmupOptions().max_targets,
+                  internal::kDefaultWarmupMaxTargets);
+    }
+    {
+        ScopedEnvVar max_targets("MC_STORE_WARMUP_MAX_TARGETS", "3");
+        EXPECT_EQ(internal::LoadStoreWarmupOptions().max_targets, 3);
+    }
+    {
+        ScopedEnvVar max_targets("MC_STORE_WARMUP_MAX_TARGETS", "0");
+        EXPECT_EQ(internal::LoadStoreWarmupOptions().max_targets, 0);
+    }
+}
+
+TEST_F(StoreWarmupTest, InvalidWarmupMaxTargetsFallsBackToDefault) {
+    for (const char* value :
+         {"-1", "not-a-number", "65537", "18446744073709551616"}) {
+        ScopedEnvVar max_targets("MC_STORE_WARMUP_MAX_TARGETS", value);
+        EXPECT_EQ(internal::LoadStoreWarmupOptions().max_targets,
+                  internal::kDefaultWarmupMaxTargets)
+            << "value=" << value;
+    }
+}
+
+TEST_F(StoreWarmupTest, PendingBatchRetainsProbeBufferUntilReleased) {
+    alignas(64) std::array<std::byte, 64> memory{};
+    auto allocator =
+        ClientBufferAllocator::create(memory.data(), memory.size(), "tcp");
+    auto buffer = allocator->allocate(memory.size());
+    ASSERT_TRUE(buffer.has_value());
+
+    std::atomic<bool> terminal{false};
+    std::atomic<size_t> release_calls{0};
+    internal::WarmupBatchCleanup cleanup(
+        [&](Transport::BatchID) {
+            return terminal.load() ? internal::WarmupBatchState::kTerminal
+                                   : internal::WarmupBatchState::kPending;
+        },
+        [&](Transport::BatchID) {
+            release_calls.fetch_add(1);
+            return Status::OK();
+        });
+
+    cleanup.Track(
+        {1, "test-segment", std::move(*buffer), /*transfer_terminal=*/false});
+    EXPECT_FALSE(cleanup.DrainFor(std::chrono::milliseconds(20)));
+    EXPECT_FALSE(allocator->allocate(memory.size()).has_value());
+    EXPECT_EQ(release_calls.load(), 0);
+
+    terminal.store(true);
+    ASSERT_TRUE(cleanup.DrainFor(std::chrono::seconds(1)));
+    EXPECT_EQ(release_calls.load(), 1);
+    EXPECT_TRUE(allocator->allocate(memory.size()).has_value());
+    cleanup.Shutdown();
+}
+
+TEST_F(StoreWarmupTest, FailedBatchReleaseIsRetriedWithoutDoubleFree) {
+    std::byte memory{};
+    std::atomic<bool> allow_release{false};
+    std::atomic<size_t> buffer_releases{0};
+    std::atomic<size_t> release_calls{0};
+    internal::WarmupBatchCleanup cleanup(
+        [](Transport::BatchID) {
+            return internal::WarmupBatchState::kTerminal;
+        },
+        [&](Transport::BatchID) {
+            release_calls.fetch_add(1);
+            if (!allow_release.load()) {
+                return Status::BatchBusy("injected first release failure");
+            }
+            return Status::OK();
+        });
+
+    internal::PendingWarmupBatch batch{
+        2, "test-segment",
+        BufferHandle(&memory, sizeof(memory),
+                     [&]() { buffer_releases.fetch_add(1); }),
+        /*transfer_terminal=*/true};
+    EXPECT_FALSE(cleanup.ReleaseOrTrack(std::move(batch)));
+    EXPECT_EQ(buffer_releases.load(), 0);
+    EXPECT_GE(release_calls.load(), 1);
+
+    allow_release.store(true);
+    ASSERT_TRUE(cleanup.DrainFor(std::chrono::seconds(1)));
+    EXPECT_EQ(buffer_releases.load(), 1);
+    const size_t calls_after_release = release_calls.load();
+    cleanup.Shutdown();
+    EXPECT_EQ(release_calls.load(), calls_after_release);
 }
 
 }  // namespace mooncake::test
