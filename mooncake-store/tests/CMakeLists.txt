@@ -113,7 +113,17 @@ add_store_test(snapshot_child_process_test
 add_store_test(master_snapshot_codec_test
                ha/snapshot/master_snapshot_codec_test.cpp)
 add_store_test(master_service_test_for_snapshot
-               ha/snapshot/master_service_test_for_snapshot.cpp)
+               ha/snapshot/master_service/basic_operations_test.cpp)
+add_store_test(master_service_snapshot_allocation_test
+               ha/snapshot/master_service/allocation_test.cpp)
+add_store_test(master_service_snapshot_eviction_test
+               ha/snapshot/master_service/retention_test.cpp)
+add_store_test(master_service_snapshot_replica_cleanup_test
+               ha/snapshot/master_service/replica_cleanup_test.cpp)
+add_store_test(master_service_snapshot_copy_move_test
+               ha/snapshot/master_service/copy_move_test.cpp)
+add_store_test(master_service_snapshot_copy_move_eviction_test
+               ha/snapshot/master_service/copy_move_eviction_test.cpp)
 add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)
 add_store_test(storage_backend_test storage_backend_test.cpp)
 add_store_test(mutex_test mutex_test.cpp)
