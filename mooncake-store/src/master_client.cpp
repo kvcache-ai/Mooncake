@@ -926,14 +926,16 @@ MasterClient::GetStorageConfig() {
 }
 
 tl::expected<void, ErrorCode> MasterClient::MountLocalDiskSegment(
-    const UUID& client_id, bool enable_offloading) {
+    const UUID& client_id, bool enable_offloading,
+    const std::string& rpc_endpoint) {
     ScopedVLogTimer timer(1, "MasterClient::MountLocalDiskSegment");
     timer.LogRequest("client_id=", client_id,
-                     ", enable_offloading=", enable_offloading);
+                     ", enable_offloading=", enable_offloading,
+                     ", rpc_endpoint=", rpc_endpoint);
 
     auto result =
         invoke_rpc<&WrappedMasterService::MountLocalDiskSegment, void>(
-            client_id, enable_offloading);
+            client_id, enable_offloading, rpc_endpoint);
     timer.LogResponseExpected(result);
     return result;
 }

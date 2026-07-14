@@ -1749,10 +1749,10 @@ TEST_F(StorageBackendTest,
 }
 
 //-----------------------------------------------------------------------------
-// BucketStorageBackend: Duplicate Key Detection Tests (Phase 0 - D0)
+// BucketStorageBackend: Duplicate Key Overwrite Tests (direct_ssd rewrite)
 //-----------------------------------------------------------------------------
 
-TEST_F(StorageBackendTest, BucketStorageBackend_DuplicateKeyRejected) {
+TEST_F(StorageBackendTest, BucketStorageBackend_DuplicateKeyOverwrites) {
     FileStorageConfig config;
     config.storage_filepath = data_path;
     BucketBackendConfig bucket_config;
@@ -1774,7 +1774,9 @@ TEST_F(StorageBackendTest, BucketStorageBackend_DuplicateKeyRejected) {
            std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
     ASSERT_TRUE(result1.has_value()) << "First write should succeed";
 
-    // Attempt to write the same key again
+    // Writing the same key again overwrites it (direct_ssd in-place upsert,
+    // re-put after remove, write retry). The old copy in the previous bucket
+    // becomes unreachable garbage until that bucket is evicted.
     std::string value2 = "duplicate_value_data";
     auto buf2 = std::make_unique<char[]>(value2.size());
     std::memcpy(buf2.get(), value2.data(), value2.size());
@@ -1786,29 +1788,28 @@ TEST_F(StorageBackendTest, BucketStorageBackend_DuplicateKeyRejected) {
         batch2,
         [](const std::vector<std::string>&,
            std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
-    ASSERT_FALSE(result2.has_value()) << "Duplicate key should be rejected";
-    EXPECT_EQ(result2.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
+    ASSERT_TRUE(result2.has_value()) << "Overwrite should succeed";
 
-    // Verify original data is still readable and not corrupted
+    // The key now resolves to the new value.
     auto is_exist = storage_backend.IsExist(key);
     ASSERT_TRUE(is_exist.has_value());
     EXPECT_TRUE(is_exist.value());
 
-    auto read_buf = std::make_unique<char[]>(value1.size());
+    auto read_buf = std::make_unique<char[]>(value2.size());
     std::unordered_map<std::string, Slice> load_slices;
-    load_slices.emplace(key, Slice{read_buf.get(), value1.size()});
+    load_slices.emplace(key, Slice{read_buf.get(), value2.size()});
 
     auto load_result = storage_backend.BatchLoad(load_slices);
     ASSERT_TRUE(load_result.has_value()) << "Load should succeed";
 
-    std::string loaded(read_buf.get(), value1.size());
-    EXPECT_EQ(loaded, value1) << "Original data should be intact";
+    std::string loaded(read_buf.get(), value2.size());
+    EXPECT_EQ(loaded, value2) << "Read must observe the overwritten value";
 }
 
 //-----------------------------------------------------------------------------
 
 TEST_F(StorageBackendTest,
-       BucketStorageBackend_DuplicateKeyCleanupOrphanedFiles) {
+       BucketStorageBackend_DuplicateKeyOverwriteKeepsOldBucketFiles) {
     FileStorageConfig config;
     config.storage_filepath = data_path;
     BucketBackendConfig bucket_config;
@@ -1831,7 +1832,7 @@ TEST_F(StorageBackendTest,
     ASSERT_TRUE(result1.has_value());
     int64_t bucket1_id = result1.value();
 
-    // Count files before duplicate attempt
+    // Count files before the overwrite
     int file_count_before = 0;
     for (const auto& entry : fs::directory_iterator(data_path)) {
         if (entry.is_regular_file()) {
@@ -1841,8 +1842,9 @@ TEST_F(StorageBackendTest,
     // Should have 1 .bucket + 1 .meta = 2 files
     EXPECT_EQ(file_count_before, 2);
 
-    // Attempt to write duplicate key (this creates bucket files before
-    // detecting duplicate)
+    // Overwrite the key: a new bucket is written; the old bucket's files
+    // stay on disk (its entry is now unreachable garbage reclaimed when the
+    // bucket is evicted).
     std::string value2 = "duplicate_value";
     auto buf2 = std::make_unique<char[]>(value2.size());
     std::memcpy(buf2.get(), value2.data(), value2.size());
@@ -1854,36 +1856,45 @@ TEST_F(StorageBackendTest,
         batch2,
         [](const std::vector<std::string>&,
            std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
-    ASSERT_FALSE(result2.has_value());
-    EXPECT_EQ(result2.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
+    ASSERT_TRUE(result2.has_value());
+    int64_t bucket2_id = result2.value();
+    EXPECT_GT(bucket2_id, bucket1_id);
 
-    // Count files after duplicate attempt - orphaned files should be cleaned up
+    // Both buckets' files exist: 2 .bucket + 2 .meta = 4 files.
     int file_count_after = 0;
     for (const auto& entry : fs::directory_iterator(data_path)) {
         if (entry.is_regular_file()) {
             file_count_after++;
         }
     }
-    // Should still have only 2 files (orphaned bucket 2 files should be cleaned
-    // up)
-    EXPECT_EQ(file_count_after, 2) << "Orphaned bucket files should be cleaned "
-                                      "up after duplicate detection";
+    EXPECT_EQ(file_count_after, 4)
+        << "Old bucket files are kept until eviction; new bucket added";
 
-    // Verify bucket 1 files still exist
-    std::string bucket1_data_path =
-        data_path + "/" + std::to_string(bucket1_id) + ".bucket";
-    std::string bucket1_meta_path =
-        data_path + "/" + std::to_string(bucket1_id) + ".meta";
-    EXPECT_TRUE(fs::exists(bucket1_data_path))
-        << "Original bucket data file should still exist";
-    EXPECT_TRUE(fs::exists(bucket1_meta_path))
-        << "Original bucket metadata file should still exist";
+    // Verify both buckets' files exist on disk.
+    for (int64_t bucket_id : {bucket1_id, bucket2_id}) {
+        std::string bucket_data_path =
+            data_path + "/" + std::to_string(bucket_id) + ".bucket";
+        std::string bucket_meta_path =
+            data_path + "/" + std::to_string(bucket_id) + ".meta";
+        EXPECT_TRUE(fs::exists(bucket_data_path))
+            << "Bucket data file should exist for bucket " << bucket_id;
+        EXPECT_TRUE(fs::exists(bucket_meta_path))
+            << "Bucket metadata file should exist for bucket " << bucket_id;
+    }
+
+    // Reads resolve to the new value.
+    auto read_buf = std::make_unique<char[]>(value2.size());
+    std::unordered_map<std::string, Slice> load_slices;
+    load_slices.emplace(key, Slice{read_buf.get(), value2.size()});
+    auto load_result = storage_backend.BatchLoad(load_slices);
+    ASSERT_TRUE(load_result.has_value());
+    std::string loaded(read_buf.get(), value2.size());
+    EXPECT_EQ(loaded, value2);
 }
 
 //-----------------------------------------------------------------------------
 
-TEST_F(StorageBackendTest,
-       BucketStorageBackend_DuplicateBatchPartialRejection) {
+TEST_F(StorageBackendTest, BucketStorageBackend_DuplicateBatchOverwrites) {
     FileStorageConfig config;
     config.storage_filepath = data_path;
     BucketBackendConfig bucket_config;
@@ -1905,7 +1916,8 @@ TEST_F(StorageBackendTest,
            std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
     ASSERT_TRUE(result1.has_value());
 
-    // Attempt BatchOffload with batch containing ["keyA", "keyB"]
+    // A batch containing an existing key ("keyA") and a new key ("keyB")
+    // commits both: keyA is overwritten, keyB is inserted.
     std::string keyB = "keyB";
     std::string valueA2 = "duplicate_value_A";
     std::string valueB = "value_for_keyB";
@@ -1924,27 +1936,78 @@ TEST_F(StorageBackendTest,
         batch2,
         [](const std::vector<std::string>&,
            std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_TRUE(result2.has_value());
 
-    // Entire batch should be rejected
-    ASSERT_FALSE(result2.has_value());
-    EXPECT_EQ(result2.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
-
-    // Verify "keyB" was NOT written (batch is atomic)
+    // keyB was written.
     auto is_exist_B = storage_backend.IsExist(keyB);
     ASSERT_TRUE(is_exist_B.has_value());
-    EXPECT_FALSE(is_exist_B.value())
-        << "keyB should not exist - batch should be atomic";
+    EXPECT_TRUE(is_exist_B.value());
 
-    // Verify "keyA" still has original value
-    auto read_buf = std::make_unique<char[]>(valueA.size());
+    // keyA resolves to the overwritten value.
+    auto read_buf = std::make_unique<char[]>(valueA2.size());
     std::unordered_map<std::string, Slice> load_slices;
-    load_slices.emplace(keyA, Slice{read_buf.get(), valueA.size()});
+    load_slices.emplace(keyA, Slice{read_buf.get(), valueA2.size()});
 
     auto load_result = storage_backend.BatchLoad(load_slices);
     ASSERT_TRUE(load_result.has_value());
 
-    std::string loaded(read_buf.get(), valueA.size());
-    EXPECT_EQ(loaded, valueA) << "keyA should still have original value";
+    std::string loaded(read_buf.get(), valueA2.size());
+    EXPECT_EQ(loaded, valueA2) << "keyA should read the overwritten value";
+}
+
+//-----------------------------------------------------------------------------
+
+TEST_F(StorageBackendTest,
+       BucketStorageBackend_OverwriteEvictionDoesNotReportSelf) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    // Force eviction on every write: any pre-existing bucket is evicted to
+    // make room for the incoming one.
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+    bucket_config.max_total_size = 1;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    std::string key = "self_evict_key";
+    std::string v1 = "old_value_xxxxxxxxxxxx";
+    std::vector<Slice> slices_v1 = {Slice{v1.data(), v1.size()}};
+    auto write1 = storage_backend.DirectWrite(key, slices_v1);
+    ASSERT_TRUE(write1);
+
+    // Overwrite the same key. This evicts the old bucket (which holds the
+    // key's old copy), but the key itself is re-added by this very write —
+    // it must NOT appear in the evicted-keys report, or the master would
+    // drop the in-flight replica of this write.
+    std::string v2 = "new_value_yyyy";
+    std::vector<Slice> slices_v2 = {Slice{v2.data(), v2.size()}};
+    auto write2 = storage_backend.DirectWrite(key, slices_v2);
+    ASSERT_TRUE(write2);
+    EXPECT_TRUE(write2->second.empty())
+        << "A key overwritten by the current write must not be reported "
+           "as evicted";
+
+    // The key still reads back the new value.
+    auto read_buf = std::make_unique<char[]>(v2.size());
+    std::unordered_map<std::string, Slice> load_slices;
+    load_slices.emplace(key, Slice{read_buf.get(), v2.size()});
+    ASSERT_TRUE(storage_backend.BatchLoad(load_slices));
+    EXPECT_EQ(std::string(read_buf.get(), v2.size()), v2);
+
+    // Cross-key eviction is still reported: writing a DIFFERENT key evicts
+    // the bucket holding `key`, which is genuinely gone this time.
+    std::string other_key = "other_key";
+    std::string v3 = "other_value_zzzz";
+    std::vector<Slice> slices_v3 = {Slice{v3.data(), v3.size()}};
+    auto write3 = storage_backend.DirectWrite(other_key, slices_v3);
+    ASSERT_TRUE(write3);
+    ASSERT_EQ(write3->second.size(), 1u)
+        << "Eviction of other keys must still be reported";
+    EXPECT_EQ(write3->second[0], key);
+
+    auto is_exist = storage_backend.IsExist(key);
+    ASSERT_TRUE(is_exist.has_value());
+    EXPECT_FALSE(is_exist.value()) << "Evicted key should be gone";
 }
 
 //-----------------------------------------------------------------------------

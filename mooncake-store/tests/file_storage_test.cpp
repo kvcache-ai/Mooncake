@@ -58,6 +58,11 @@ class FileStorageTest : public ::testing::Test {
         return fileStorage.AllocateBatch(keys, sizes);
     }
 
+    tl::expected<void, ErrorCode> FileStorageInitBackend(
+        FileStorage& fileStorage) {
+        return fileStorage.storage_backend_->Init();
+    }
+
     tl::expected<void, ErrorCode> FileStorageBatchLoad(
         FileStorage& fileStorage,
         std::unordered_map<std::string, Slice>& batch_object) {
@@ -162,6 +167,78 @@ TEST_F(FileStorageTest, BatchLoad) {
         LOG(INFO) << "key: " << slice_it.first;
         ASSERT_EQ(data, batch_data.at(slice_it.first));
     }
+}
+
+// =========================================================================
+// direct_ssd data path: DirectWrite → BatchLoad read-back
+// =========================================================================
+
+TEST_F(FileStorageTest, DirectWriteReadBack) {
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+    // FileStorage::Init() needs a live master client; initialize just the
+    // storage backend, matching what BatchOffloadUtil does for other tests.
+    ASSERT_TRUE(FileStorageInitBackend(fileStorage));
+
+    // direct_ssd writers store under tenant-scoped storage keys (see
+    // Client::SubmitLocalDiskReplicaWrites), matching what the read path
+    // (batch_get_offload_object → BatchGet/BatchLoad) looks up.
+    const std::string storage_key =
+        MakeTenantScopedStorageKey("default", "direct_ssd_key");
+    std::string value = "direct_ssd_payload_0123456789";
+    std::vector<Slice> slices = {Slice{value.data(), value.size()}};
+
+    auto write_res = fileStorage.DirectWrite(storage_key, slices);
+    ASSERT_TRUE(write_res);
+    // FileStorage::DirectWrite stamps the local RPC endpoint used by remote
+    // readers, and no eviction is expected on an empty store.
+    EXPECT_EQ(write_res->first.transport_endpoint, "localhost:9003");
+    EXPECT_TRUE(write_res->second.empty());
+
+    std::vector<std::string> keys = {storage_key};
+    std::vector<int64_t> sizes = {static_cast<int64_t>(value.size())};
+    auto allocate_res = FileStorageAllocateBatch(fileStorage, keys, sizes);
+    ASSERT_TRUE(allocate_res);
+    ASSERT_TRUE(
+        FileStorageBatchLoad(fileStorage, allocate_res.value()->slices));
+
+    const auto& loaded = allocate_res.value()->slices.at(storage_key);
+    std::string read_back(static_cast<char*>(loaded.ptr), loaded.size);
+    EXPECT_EQ(read_back, value);
+}
+
+TEST_F(FileStorageTest, DirectWriteOverwriteReadsNewValue) {
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+    ASSERT_TRUE(FileStorageInitBackend(fileStorage));
+
+    const std::string storage_key =
+        MakeTenantScopedStorageKey("default", "direct_ssd_overwrite_key");
+    std::string v1 = "old_value_aaaaaaaaaaaaaaaa";
+    std::vector<Slice> slices_v1 = {Slice{v1.data(), v1.size()}};
+    ASSERT_TRUE(fileStorage.DirectWrite(storage_key, slices_v1));
+
+    // Overwriting the same key must succeed (in-place upsert, re-put after
+    // remove, write retry). Before overwrite support in BatchOffload this
+    // returned OBJECT_ALREADY_EXISTS.
+    std::string v2 = "new_value_bbbb";  // different length on purpose
+    std::vector<Slice> slices_v2 = {Slice{v2.data(), v2.size()}};
+    auto second_write = fileStorage.DirectWrite(storage_key, slices_v2);
+    ASSERT_TRUE(second_write)
+        << "DirectWrite overwrite failed: " << second_write.error();
+
+    std::vector<std::string> keys = {storage_key};
+    std::vector<int64_t> sizes = {static_cast<int64_t>(v2.size())};
+    auto allocate_res = FileStorageAllocateBatch(fileStorage, keys, sizes);
+    ASSERT_TRUE(allocate_res);
+    ASSERT_TRUE(
+        FileStorageBatchLoad(fileStorage, allocate_res.value()->slices));
+
+    const auto& loaded = allocate_res.value()->slices.at(storage_key);
+    std::string read_back(static_cast<char*>(loaded.ptr), loaded.size);
+    EXPECT_EQ(read_back, v2);
 }
 
 TEST_F(FileStorageTest, GroupOffloadingKeysByBucket_bucket_keys_limit) {

@@ -91,6 +91,83 @@ Step by step:
 4. **Write to SSD**: `StorageBackend::BatchOffload` serializes and writes the key-value data to disk.
 5. **Notify master**: On success, the `complete_handler` calls `client_->NotifyOffloadSuccess(keys, metadatas)`. The master adds a `LOCAL_DISK` replica entry (carrying the real client's RPC address as `transport_endpoint`) to the object's replica list.
 
+(direct-ssd-write)=
+### Direct SSD Write (`direct_ssd`) — Bypass DRAM
+
+The standard offload path always writes to DRAM first and asynchronously migrates data to SSD. The `direct_ssd` feature reverses this: objects are written directly to SSD during `Put`, bypassing DRAM entirely. This reduces memory pressure and eliminates the heartbeat-driven offload delay.
+
+**Data flow:**
+
+```
+Client                         Master                         Target SSD Nodes
+  │                               │                                   │
+  │─ PutStart(direct_ssd=true) ──▶│                                   │
+  │  replica_num=3                │  Phase C: select 3 SSD nodes      │
+  │                               │  (sorted by free capacity)        │
+  │◀─ 3 LOCAL_DISK replicas ─────│  status=PROCESSING                │
+  │                               │                                   │
+  │  [SubmitTransfers]            │                                   │
+  │  ┌─ local replica ──▶ DirectWrite ──▶ local SSD                  │
+  │  ├─ remote replica ──▶  RPC(control) ──▶ Target: TE READ ──▶ SSD │
+  │  └─ remote replica ──▶  RPC(control) ──▶ Target: TE READ ──▶ SSD │
+  │  (all enqueued in parallel on write_thread_pool_)                │
+  │                               │                                   │
+  │─ PutEnd(LOCAL_DISK) ─────────▶│                                   │
+  │                               │  mark COMPLETE                    │
+  │                               │  ssd_used_bytes += object_size    │
+  │                               │  (skip offload queue)             │
+```
+
+**Key differences from the heartbeat offload path:**
+
+| Aspect | Heartbeat offload | direct_ssd |
+|--------|------------------|------------|
+| Write timing | Async (heartbeat cycle) | Synchronous with `Put` |
+| Memory allocation | Yes (MEMORY replica) | No (only a transient staging buffer) |
+| Memory quota | Consumed | Not consumed |
+| Transport | Read MEMORY locally → write SSD | Local: DirectWrite; Remote: TransferEngine (RDMA/TCP) |
+| Replica allocation | `PutStart` allocates MEMORY; offload creates LOCAL_DISK later | `PutStart` allocates LOCAL_DISK directly (Phase C) |
+| ssd_used_bytes tracking | Incremented in `NotifyOffloadSuccess` | Incremented in `PutEnd` (PROCESSING→COMPLETE) |
+| Eviction | Unified with heartbeat data (same FIFO/LRU via `BucketStorageBackend`) | Same |
+
+**Prerequisites**:
+
+There are two roles in a `direct_ssd` deployment: **SSD storage nodes** that contribute local SSD capacity, and **pure compute nodes** that push data to remote SSDs without a local SSD backend.
+
+| Role | Setup | Purpose |
+|------|-------|---------|
+| Master | `--enable_offload=true` | Allows `LocalDiskSegment` registration |
+| SSD storage node | `enable_ssd_offload=true` + `direct_ssd=true` (optional) at setup | Creates `FileStorage`, mounts local disk segment; optionally defaults Puts to direct SSD |
+| Pure compute node | `direct_ssd=True` at setup (no `enable_ssd_offload` needed) | `ClientRequester` is always injected; remote writes use TransferEngine + `write_offload_from_engine` RPC |
+
+For deployment instructions and full setup examples, see [SSD Offload deployment](../deployment/ssd-offload.md#direct-ssd-write-direct_ssd).
+
+**Per-request control:**
+
+When `direct_ssd=True` is set at client setup, all Puts default to direct SSD writes. Individual calls can override this via `ReplicateConfig`:
+
+```python
+from mooncake.store import ReplicateConfig
+
+# Override to use normal memory path (even with direct_ssd=True at setup)
+config = ReplicateConfig()
+config.direct_ssd = False
+config.replica_num = 1     # MEMORY replicas
+store.put("key", data, config)
+
+# Override to use direct SSD (even with direct_ssd=False at setup)
+config2 = ReplicateConfig()
+config2.direct_ssd = True
+config2.replica_num = 3    # LOCAL_DISK replicas
+store.put("key2", data, config2)
+```
+
+When `direct_ssd=True`, `replica_num` controls the number of **LOCAL_DISK replicas** (not MEMORY replicas). No DRAM quota is consumed. Each replica is written in parallel — locally via `DirectWrite`, remotely via TransferEngine (RDMA/TCP). Evicted data from both `direct_ssd` and the heartbeat-offload path shares the same SSD pool and eviction policy.
+
+**Allocation:** The master selects `replica_num` SSD clients with the largest free capacity (sorted by `(total_capacity - ssd_used_bytes - object_size) / total_capacity` descending). This ensures load-balanced SSD utilization across nodes.
+
+**Fallback:** If `direct_ssd=true` but no SSD clients are registered, `PutStart` returns `NO_AVAILABLE_HANDLE`. If a subset of replicas fail during write, the successful ones are kept and failed ones are revoked via `PutRevoke`.
+
 ### Load (SSD → memory)
 
 The load path involves three parties: the **requesting client**, the **target client** that holds the SSD data, and the **Transfer Engine** for zero-copy data movement.

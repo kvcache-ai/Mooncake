@@ -1,9 +1,11 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <future>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -120,6 +122,42 @@ class EmptyOperationState : public OperationState {
     TransferStrategy get_strategy() const override {
         return TransferStrategy::EMPTY;
     }
+};
+
+/**
+ * @brief Operation state that wraps a std::future for external async I/O
+ *        (used by direct_ssd LOCAL_DISK writes, future GDS, etc).
+ *        On wait_for_completion() the future result is stored in result_
+ *        so the base class get_result() can read it.
+ */
+class FutureOperationState : public OperationState {
+   public:
+    explicit FutureOperationState(std::future<tl::expected<void, ErrorCode>> f)
+        : future_(std::move(f)) {}
+
+    bool is_completed() override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return result_.has_value();
+    }
+
+    void wait_for_completion() override {
+        if (future_.valid()) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto result = future_.get();
+            if (result && result.has_value()) {
+                result_.emplace(ErrorCode::OK);
+            } else {
+                result_.emplace(result.error());
+            }
+        }
+    }
+
+    TransferStrategy get_strategy() const override {
+        return TransferStrategy::FILE_READ;
+    }
+
+   private:
+    std::future<tl::expected<void, ErrorCode>> future_;
 };
 
 /**

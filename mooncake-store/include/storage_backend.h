@@ -277,6 +277,16 @@ class StorageBackendInterface {
     // cursor-based iteration (e.g. BucketStorageBackend).
     virtual void ResetScanIterator() {}
 
+    // Direct (single-key) write for direct_ssd during Put.
+    // Writes key+slices to the storage backend synchronously.
+    // Returns StorageObjectMetadata for LOCAL_DISK replica registration
+    // and any keys evicted during the write to satisfy quota.
+    // Each backend must implement DirectWrite. Backends using BatchOffload
+    // can delegate to it.
+    virtual tl::expected<
+        std::pair<StorageObjectMetadata, std::vector<std::string>>, ErrorCode>
+    DirectWrite(const std::string& key, const std::vector<Slice>& slices) = 0;
+
     // Test-only: Set predicate to force failures for specific keys in
     // BatchOffload. Default implementation does nothing (no failures injected).
     // Concrete backends can override to provide test failure injection.
@@ -631,6 +641,11 @@ class StorageBackendAdaptor : public StorageBackendInterface {
         std::function<void(const std::vector<std::string>& evicted_keys)>
             eviction_handler = nullptr) override;
 
+    tl::expected<std::pair<StorageObjectMetadata, std::vector<std::string>>,
+                 ErrorCode>
+    DirectWrite(const std::string& key,
+                const std::vector<Slice>& slices) override;
+
     tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batched_slices) override;
 
@@ -706,9 +721,14 @@ class BucketStorageBackend : public StorageBackendInterface {
         std::function<void(const std::vector<std::string>& evicted_keys)>
             eviction_handler = nullptr) override;
 
+    tl::expected<std::pair<StorageObjectMetadata, std::vector<std::string>>,
+                 ErrorCode>
+    DirectWrite(const std::string& key,
+                const std::vector<Slice>& slices) override;
+
     /**
      * @brief Retrieves metadata for multiple objects in a single batch
-     * operation.
+     * operation. (BucketStorageBackend)
      * @param keys A list of object keys to query metadata for.
      * @param batch_object_metadata Output parameter that receives the
      * retrieved metadata.
@@ -1018,8 +1038,14 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
         std::function<void(const std::vector<std::string>& evicted_keys)>
             eviction_handler = nullptr) override;
 
+    tl::expected<std::pair<StorageObjectMetadata, std::vector<std::string>>,
+                 ErrorCode>
+    DirectWrite(const std::string& key,
+                const std::vector<Slice>& slices) override;
+
     /**
      * @brief Loads data for multiple objects in a batch operation.
+     * (OffsetAllocator)
      * @param batched_slices A map from object key to a pre-allocated writable
      * buffer (Slice).
      * @return tl::expected<void, ErrorCode> indicating operation status.

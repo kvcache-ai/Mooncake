@@ -91,6 +91,7 @@ struct LocalDiskSegment {
     mutable Mutex offloading_mutex_;
     bool enable_offloading;
     int64_t ssd_total_capacity_bytes = 0;  // last reported by client heartbeat
+    std::string rpc_endpoint;  // RPC address for offload reads/writes
     std::atomic<int64_t> ssd_used_bytes{0};
     std::unordered_map<std::string, OffloadTaskItem> GUARDED_BY(
         offloading_mutex_) offloading_objects;
@@ -132,7 +133,8 @@ class ScopedSegmentAccess {
     ErrorCode MountSegment(const Segment& segment, const UUID& client_id);
 
     ErrorCode MountLocalDiskSegment(const UUID& client_id,
-                                    bool enable_offloading);
+                                    bool enable_offloading,
+                                    const std::string& rpc_endpoint = {});
 
     /**
      * @brief Re-mount a segment. To avoid infinite remount trying, only the

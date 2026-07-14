@@ -420,7 +420,8 @@ class MasterClient {
      * @param enable_offloading If true, enables offloading (write-to-file).
      */
     [[nodiscard]] tl::expected<void, ErrorCode> MountLocalDiskSegment(
-        const UUID& client_id, bool enable_offloading);
+        const UUID& client_id, bool enable_offloading,
+        const std::string& rpc_endpoint = {});
 
     /**
      * @brief Heartbeat call to collect object-level statistics and retrieve the

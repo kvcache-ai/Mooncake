@@ -44,6 +44,8 @@ pub struct ReplicateConfig {
     pub with_soft_pin: bool,
     /// Declare whether the object will never be evicted.
     pub with_hard_pin: bool,
+    /// Write directly to SSD, bypassing DRAM. None = use client default.
+    pub direct_ssd: Option<bool>,
     /// Whitelist of segment names that should host a replica.
     pub preferred_segments: Vec<String>,
 }
@@ -76,6 +78,11 @@ impl ReplicateConfig {
             replica_num: self.replica_num,
             with_soft_pin: i32::from(self.with_soft_pin),
             with_hard_pin: i32::from(self.with_hard_pin),
+            direct_ssd: match self.direct_ssd {
+                Some(true) => 1,
+                Some(false) => 0,
+                None => -1,
+            },
             preferred_segments: if ptrs.is_empty() {
                 std::ptr::null_mut()
             } else {
@@ -615,6 +622,7 @@ mod tests {
             replica_num: 2,
             with_soft_pin: true,
             with_hard_pin: false,
+            direct_ssd: None,
             preferred_segments: Vec::new(),
         };
 
@@ -622,6 +630,7 @@ mod tests {
         assert_eq!(ffi_cfg.replica_num, 2);
         assert_eq!(ffi_cfg.with_soft_pin, 1);
         assert_eq!(ffi_cfg.with_hard_pin, 0);
+        assert_eq!(ffi_cfg.direct_ssd, -1);
         assert!(ffi_cfg.preferred_segments.is_null());
         assert_eq!(ffi_cfg.preferred_segments_count, 0);
         assert!(strings.is_empty());
@@ -634,6 +643,7 @@ mod tests {
             replica_num: 3,
             with_soft_pin: false,
             with_hard_pin: false,
+            direct_ssd: None,
             preferred_segments: vec!["seg-a".to_string(), "seg-b".to_string()],
         };
 
@@ -641,6 +651,7 @@ mod tests {
         assert_eq!(ffi_cfg.replica_num, 3);
         assert_eq!(ffi_cfg.with_soft_pin, 0);
         assert_eq!(ffi_cfg.with_hard_pin, 0);
+        assert_eq!(ffi_cfg.direct_ssd, -1);
         assert!(!ffi_cfg.preferred_segments.is_null());
         assert_eq!(ffi_cfg.preferred_segments_count, 2);
         assert_eq!(strings.len(), 2);
@@ -658,6 +669,7 @@ mod tests {
             replica_num: 1,
             with_soft_pin: false,
             with_hard_pin: false,
+            direct_ssd: None,
             preferred_segments: vec!["bad\0segment".to_string()],
         };
 
@@ -679,6 +691,7 @@ mod tests {
             replica_num: 4,
             with_soft_pin: true,
             with_hard_pin: false,
+            direct_ssd: None,
             preferred_segments: vec!["x".to_string(), "y".to_string()],
         };
 

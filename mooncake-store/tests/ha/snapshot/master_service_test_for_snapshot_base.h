@@ -74,6 +74,7 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
     // LocalDiskSegment state for comparison
     struct LocalDiskSegmentState {
         bool enable_offloading = false;
+        std::string rpc_endpoint;
         std::map<std::string, OffloadTaskItem>
             offloading_objects;  // storage key -> task (sorted)
     };
@@ -294,6 +295,7 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
                  access.getClientLocalDiskSegment()) {
                 LocalDiskSegmentState seg_state;
                 seg_state.enable_offloading = segment->enable_offloading;
+                seg_state.rpc_endpoint = segment->rpc_endpoint;
                 // Copy offloading_objects to sorted map
                 std::lock_guard<Mutex> lock(segment->offloading_mutex_);
                 for (const auto& [key, task] : segment->offloading_objects) {
@@ -400,6 +402,9 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
     bool CompareLocalDiskSegmentState(const LocalDiskSegmentState& a,
                                       const LocalDiskSegmentState& b) const {
         if (a.enable_offloading != b.enable_offloading) {
+            return false;
+        }
+        if (a.rpc_endpoint != b.rpc_endpoint) {
             return false;
         }
         if (a.offloading_objects != b.offloading_objects) {

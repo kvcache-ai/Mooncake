@@ -28,6 +28,7 @@ struct mooncake_replicate_config {
     size_t replica_num;
     int with_soft_pin;
     int with_hard_pin;
+    int direct_ssd;
     const char **preferred_segments;
     size_t preferred_segments_count;
 };

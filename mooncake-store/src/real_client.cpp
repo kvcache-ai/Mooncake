@@ -592,7 +592,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &ipc_socket_path, int local_rpc_port,
     bool enable_ssd_offload, bool start_offload_rpc_server,
     const std::string &ssd_offload_path, const std::string &tenant_id,
-    bool enable_client_http_server, int client_http_port) {
+    bool enable_client_http_server, int client_http_port, bool direct_ssd) {
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
     const bool should_use_hugepage =
@@ -887,6 +887,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             ->register_handler<&RealClient::batch_get_offload_object>(this);
         offload_rpc_server_
             ->register_handler<&RealClient::release_offload_buffer>(this);
+        offload_rpc_server_
+            ->register_handler<&RealClient::write_offload_from_engine>(this);
         offload_rpc_server_->async_start();
         auto err = offload_rpc_server_->get_errc();
         if (err) {
@@ -918,6 +920,24 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
     }
     client_requester_ = std::make_shared<ClientRequester>();
+    // ClientRequester is needed for both SSD offload reads and direct_ssd
+    // cross-node writes (write_offload_from_engine). Pure compute nodes with
+    // direct_ssd=True use remote LOCAL_DISK writes that depend on it.
+    client_->SetClientRequester(client_requester_);
+
+    // Inject storage backend into Client so that direct_ssd Put
+    // (controlled per-request via ReplicateConfig) can write directly
+    // to local SSD. Storage-backend nodes that contribute SSD capacity
+    // must also set enable_ssd_offload=true.
+    if (enable_ssd_offload) {
+        client_->SetLocalDiskStorageBackend(file_storage_->getStorageBackend());
+        LOG(INFO) << "SSD offload: injected StorageBackendInterface "
+                     "into Client";
+    }
+    client_->SetDefaultDirectSsd(direct_ssd);
+    if (direct_ssd) {
+        LOG(INFO) << "direct_ssd: defaulting all Puts to direct SSD write";
+    }
     const bool should_start_http_server =
         enable_client_http_server || FLAGS_enable_http_server;
     const int selected_http_port =
@@ -946,12 +966,12 @@ int RealClient::setup_real(
     const std::shared_ptr<TransferEngine> &transfer_engine,
     const std::string &ipc_socket_path, bool enable_ssd_offload,
     const std::string &ssd_offload_path, const std::string &tenant_id,
-    bool enable_client_http_server, int client_http_port) {
+    bool enable_client_http_server, int client_http_port, bool direct_ssd) {
     return to_py_ret(setup_internal(
         local_hostname, metadata_server, global_segment_size, local_buffer_size,
         protocol, rdma_devices, master_server_addr, transfer_engine,
         ipc_socket_path, 50052, enable_ssd_offload, true, ssd_offload_path,
-        tenant_id, enable_client_http_server, client_http_port));
+        tenant_id, enable_client_http_server, client_http_port, direct_ssd));
 }
 
 namespace {
@@ -1104,6 +1124,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     std::string tenant_id = get_config(config, CONFIG_KEY_TENANT_ID, "default");
     bool enable_ssd_offload =
         get_config_bool(config, "enable_ssd_offload", false);
+    bool direct_ssd = get_config_bool(config, "direct_ssd", false);
     bool enable_client_http_server =
         get_config_bool(config, CONFIG_KEY_ENABLE_CLIENT_HTTP_SERVER, false);
     auto client_http_port_opt = get_config_int(
@@ -1113,11 +1134,11 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
     int client_http_port = client_http_port_opt.value();
 
-    return setup_internal(local_hostname, metadata_server, global_segment_size,
-                          local_buffer_size, protocol, rdma_devices,
-                          master_server_addr, nullptr, ipc_socket_path, 50052,
-                          enable_ssd_offload, true, ssd_offload_path, tenant_id,
-                          enable_client_http_server, client_http_port);
+    return setup_internal(
+        local_hostname, metadata_server, global_segment_size, local_buffer_size,
+        protocol, rdma_devices, master_server_addr, nullptr, ipc_socket_path,
+        50052, enable_ssd_offload, true, ssd_offload_path, tenant_id,
+        enable_client_http_server, client_http_port, direct_ssd);
 }
 
 tl::expected<void, ErrorCode> RealClient::initAll_internal(
@@ -5573,6 +5594,108 @@ bool RealClient::release_offload_buffer(uint64_t batch_id) {
     return file_storage_->ReleaseBuffer(batch_id);
 }
 
+tl::expected<void, ErrorCode> RealClient::write_offload_from_engine(
+    const std::string &engine_addr, uint64_t buffer_addr, uint64_t size,
+    const std::string &key) {
+    if (!file_storage_ || !client_) {
+        LOG(ERROR) << "write_offload_from_engine: not initialized";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    // TE READ from writer's buffer into a local staging buffer.
+    auto allocator = file_storage_->getClientBufferAllocator();
+    if (!allocator) {
+        LOG(ERROR) << "write_offload_from_engine: no client buffer allocator";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    auto alloc_result = allocator->allocate(size);
+    if (!alloc_result) {
+        LOG(ERROR) << "write_offload_from_engine: failed to alloc buffer";
+        return tl::make_unexpected(ErrorCode::BUFFER_OVERFLOW);
+    }
+    auto &handle = *alloc_result;
+    std::vector<Slice> slices = {Slice{handle.ptr(), size}};
+
+    // Open remote segment and do a TE READ.
+    auto seg = client_->GetSegmentEndpoint();
+    auto transfer_engine = client_->GetTransferEngine();
+    if (!transfer_engine) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    uint64_t seg_handle = transfer_engine->openSegment(engine_addr);
+    if (seg_handle == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
+        LOG(ERROR) << "write_offload_from_engine: failed to open segment "
+                   << engine_addr;
+        return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
+    }
+    struct SegGuard {
+        std::shared_ptr<TransferEngine> engine;
+        uint64_t handle;
+        ~SegGuard() { engine->closeSegment(handle); }
+    } seg_guard{transfer_engine, seg_handle};
+
+    TransferRequest req;
+    req.opcode = TransferRequest::READ;
+    req.source = static_cast<char *>(slices[0].ptr);
+    req.target_id = seg_handle;
+    req.target_offset = buffer_addr;
+    req.length = size;
+
+    BatchID batch_id = transfer_engine->allocateBatchID(1);
+    if (batch_id == INVALID_BATCH_ID) {
+        LOG(ERROR) << "write_offload_from_engine: allocateBatchID failed";
+        return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
+    }
+    struct BatchGuard {
+        std::shared_ptr<TransferEngine> engine;
+        BatchID id;
+        ~BatchGuard() { engine->freeBatchID(id); }
+    } batch_guard{transfer_engine, batch_id};
+
+    std::vector<TransferRequest> requests = {req};
+    Status s = transfer_engine->submitTransfer(batch_id, requests);
+    if (!s.ok()) {
+        LOG(ERROR) << "write_offload_from_engine: TE submit failed: "
+                   << s.message();
+        return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
+    }
+
+    TransferStatus status;
+    bool completed = false;
+    auto start = std::chrono::steady_clock::now();
+    static constexpr auto kTimeout = std::chrono::seconds(30);
+    while (!completed) {
+        Status st = transfer_engine->getTransferStatus(batch_id, 0, status);
+        if (!st.ok()) {
+            LOG(ERROR) << "write_offload_from_engine: getTransferStatus error: "
+                       << st.message();
+            return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
+        }
+        if (status.s == TransferStatusEnum::COMPLETED) {
+            completed = true;
+        } else if (status.s == TransferStatusEnum::FAILED ||
+                   status.s == TransferStatusEnum::TIMEOUT) {
+            LOG(ERROR)
+                << "write_offload_from_engine: TE transfer failed with status="
+                << static_cast<int>(status.s);
+            return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
+        } else if (std::chrono::steady_clock::now() - start > kTimeout) {
+            LOG(ERROR) << "write_offload_from_engine: TE read timed out";
+            return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
+        } else {
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+    }
+
+    // Write staged data to local SSD.
+    auto result = file_storage_->DirectWrite(key, slices);
+    if (!result) {
+        LOG(ERROR) << "write_offload_from_engine: DirectWrite failed, key="
+                   << key << ", error=" << result.error();
+        return tl::make_unexpected(result.error());
+    }
+    return {};
+}
+
 tl::expected<void, ErrorCode>
 RealClient::batch_get_into_offload_object_internal(
     const std::string &target_rpc_service_addr,
@@ -5668,6 +5791,20 @@ ClientRequester::batch_get_offload_object(const std::string &client_addr,
         LOG(ERROR)
             << "Failed to invoke batch_get_offload_object, client_addr = "
             << client_addr << ", error is: " << result.error();
+    }
+    return result;
+}
+
+tl::expected<void, ErrorCode> ClientRequester::write_offload_from_engine(
+    const std::string &client_addr, const std::string &engine_addr,
+    uint64_t buffer_addr, uint64_t size, const std::string &key) {
+    auto result = invoke_rpc<&RealClient::write_offload_from_engine, void>(
+        client_addr, engine_addr, buffer_addr, size, key);
+    if (!result) {
+        LOG(ERROR)
+            << "Failed to invoke write_offload_from_engine, client_addr = "
+            << client_addr << ", key=" << key
+            << ", error is: " << result.error();
     }
     return result;
 }

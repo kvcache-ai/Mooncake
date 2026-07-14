@@ -91,7 +91,8 @@ class RealClient : public PyClient {
         const std::string &ssd_offload_path = "",
         const std::string &tenant_id = "default",
         bool enable_client_http_server = false,
-        int client_http_port = DEFAULT_CLIENT_HTTP_PORT);
+        int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
+        bool direct_ssd = false);
 
     int setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                     const std::string &server_address,
@@ -515,7 +516,8 @@ class RealClient : public PyClient {
         const std::string &ssd_offload_path = "",
         const std::string &tenant_id = "default",
         bool enable_client_http_server = false,
-        int client_http_port = DEFAULT_CLIENT_HTTP_PORT);
+        int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
+        bool direct_ssd = false);
 
     // Overload that accepts a configuration dictionary
     tl::expected<void, ErrorCode> setup_internal(const ConfigDict &config);
@@ -695,6 +697,14 @@ class RealClient : public PyClient {
      * @return true if batch was found and released, false otherwise
      */
     bool release_offload_buffer(uint64_t batch_id);
+
+    /**
+     * @brief TransferEngine-based write: TE READ from writer's buffer,
+     *        then DirectWrite to SSD.
+     */
+    tl::expected<void, ErrorCode> write_offload_from_engine(
+        const std::string &engine_addr, uint64_t buffer_addr, uint64_t size,
+        const std::string &key);
 
     /**
      * @brief Retrieves multiple stored objects from a remote service.

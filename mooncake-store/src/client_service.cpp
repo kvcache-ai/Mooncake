@@ -3,10 +3,12 @@
 #include <glog/logging.h>
 
 #include "allocator.h"
+#include "pyclient.h"
 #include "segment.h"
 
 #include <csignal>
 #include <algorithm>
+#include <future>
 #include <cassert>
 #include <cerrno>
 #include <chrono>
@@ -129,10 +131,13 @@ std::optional<ContiguousSliceRange> GetContiguousSliceRange(
 struct ReplicaTransferSummary {
     size_t allocated_memory_replicas = 0;
     size_t allocated_nof_replicas = 0;
+    size_t allocated_local_disk_replicas = 0;
     size_t successful_memory_transfers = 0;
     size_t successful_nof_transfers = 0;
+    size_t successful_local_disk_transfers = 0;
     size_t failed_memory_transfers = 0;
     size_t failed_nof_transfers = 0;
+    size_t failed_local_disk_transfers = 0;
     ErrorCode first_error = ErrorCode::OK;
 
     void RecordAllocatedReplica(const Replica::Descriptor& replica) {
@@ -140,6 +145,8 @@ struct ReplicaTransferSummary {
             ++allocated_memory_replicas;
         } else if (replica.is_nof_replica()) {
             ++allocated_nof_replicas;
+        } else if (replica.is_local_disk_replica()) {
+            ++allocated_local_disk_replicas;
         }
     }
 
@@ -148,6 +155,8 @@ struct ReplicaTransferSummary {
             ++successful_memory_transfers;
         } else if (replica_type == ReplicaType::NOF_SSD) {
             ++successful_nof_transfers;
+        } else if (replica_type == ReplicaType::LOCAL_DISK) {
+            ++successful_local_disk_transfers;
         }
     }
 
@@ -156,15 +165,46 @@ struct ReplicaTransferSummary {
             ++failed_memory_transfers;
         } else if (replica_type == ReplicaType::NOF_SSD) {
             ++failed_nof_transfers;
+        } else if (replica_type == ReplicaType::LOCAL_DISK) {
+            ++failed_local_disk_transfers;
         }
         if (first_error == ErrorCode::OK) {
             first_error = error;
         }
     }
+
+    // True when every allocated replica (of any type) transferred
+    // successfully. This is the safe criterion for finalize paths that can
+    // only end/revoke ALL replica types at once (the upsert paths): ending
+    // with an unwritten replica would mark it COMPLETE without data.
+    bool AllAllocatedSucceeded() const {
+        return failed_memory_transfers == 0 && failed_nof_transfers == 0 &&
+               failed_local_disk_transfers == 0 &&
+               successful_memory_transfers == allocated_memory_replicas &&
+               successful_nof_transfers == allocated_nof_replicas &&
+               successful_local_disk_transfers ==
+                   allocated_local_disk_replicas &&
+               (allocated_memory_replicas + allocated_nof_replicas +
+                allocated_local_disk_replicas) > 0;
+    }
 };
 
 bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
                                   const ReplicaTransferSummary& summary) {
+    // direct_ssd: replica_num controls LOCAL_DISK replicas, no MEMORY replicas
+    if (config.direct_ssd.value_or(false)) {
+        if (config.nof_replica_num == 0) {
+            return summary.allocated_local_disk_replicas > 0;
+        }
+        if (DetermineReplicaWriteMode(config) ==
+            ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
+            return summary.allocated_local_disk_replicas +
+                       summary.allocated_nof_replicas >
+                   0;
+        }
+        return summary.allocated_local_disk_replicas == config.replica_num &&
+               summary.allocated_nof_replicas == config.nof_replica_num;
+    }
     if (config.nof_replica_num == 0) {
         return summary.allocated_memory_replicas > 0;
     }
@@ -201,8 +241,11 @@ FinalizeDecision DetermineFinalizeDecision(
                 summary.allocated_memory_replicas &&
             summary.successful_nof_transfers ==
                 summary.allocated_nof_replicas &&
+            summary.successful_local_disk_transfers ==
+                summary.allocated_local_disk_replicas &&
             summary.failed_memory_transfers == 0 &&
-            summary.failed_nof_transfers == 0;
+            summary.failed_nof_transfers == 0 &&
+            summary.failed_local_disk_transfers == 0;
         if (allocation_satisfied && all_transfers_succeeded) {
             return {.end_type = ReplicaType::ALL,
                     .revoke_type = std::nullopt,
@@ -221,6 +264,8 @@ FinalizeDecision DetermineFinalizeDecision(
 
     const bool memory_succeeded = summary.successful_memory_transfers > 0;
     const bool nof_succeeded = summary.successful_nof_transfers > 0;
+    const bool local_disk_succeeded =
+        summary.successful_local_disk_transfers > 0;
 
     if (memory_succeeded && nof_succeeded) {
         return {.end_type = ReplicaType::ALL,
@@ -228,17 +273,39 @@ FinalizeDecision DetermineFinalizeDecision(
                 .success = true,
                 .error = ErrorCode::OK};
     }
-    if (memory_succeeded) {
-        return {.end_type = ReplicaType::MEMORY,
-                .revoke_type = ReplicaType::NOF_SSD,
-                .success = true,
-                .error = ErrorCode::OK};
-    }
-    if (nof_succeeded) {
-        return {.end_type = ReplicaType::NOF_SSD,
-                .revoke_type = ReplicaType::MEMORY,
-                .success = true,
-                .error = ErrorCode::OK};
+    // direct_ssd: LOCAL_DISK replaces MEMORY in flexible dual-replica mode
+    if (config.direct_ssd.value_or(false)) {
+        if (local_disk_succeeded && nof_succeeded) {
+            return {.end_type = ReplicaType::ALL,
+                    .revoke_type = std::nullopt,
+                    .success = true,
+                    .error = ErrorCode::OK};
+        }
+        if (local_disk_succeeded) {
+            return {.end_type = ReplicaType::LOCAL_DISK,
+                    .revoke_type = ReplicaType::NOF_SSD,
+                    .success = true,
+                    .error = ErrorCode::OK};
+        }
+        if (nof_succeeded) {
+            return {.end_type = ReplicaType::NOF_SSD,
+                    .revoke_type = ReplicaType::LOCAL_DISK,
+                    .success = true,
+                    .error = ErrorCode::OK};
+        }
+    } else {
+        if (memory_succeeded) {
+            return {.end_type = ReplicaType::MEMORY,
+                    .revoke_type = ReplicaType::NOF_SSD,
+                    .success = true,
+                    .error = ErrorCode::OK};
+        }
+        if (nof_succeeded) {
+            return {.end_type = ReplicaType::NOF_SSD,
+                    .revoke_type = ReplicaType::MEMORY,
+                    .success = true,
+                    .error = ErrorCode::OK};
+        }
     }
 
     return {.end_type = std::nullopt,
@@ -1538,6 +1605,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     }
 
     ReplicateConfig client_cfg = AttachHostId(config);
+    client_cfg.direct_ssd = config.direct_ssd.value_or(default_direct_ssd_);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
@@ -1587,6 +1655,12 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         }
     }
 
+    // Submit LOCAL_DISK replica writes (direct_ssd) first so they run in
+    // parallel with the memory/NoF transfers below; futures are drained
+    // after the loop.
+    auto local_disk_transfers =
+        SubmitLocalDiskReplicaWrites(key, slices, start_result.value());
+
     for (const auto& replica : start_result.value()) {
         if (replica.is_memory_replica() || replica.is_nof_replica()) {
             // Transfer data using allocated handles from all replicas
@@ -1602,6 +1676,16 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         }
     }
 
+    // Drain LOCAL_DISK writes and merge results into the summary.
+    for (auto& [replica_type, future] : local_disk_transfers) {
+        ErrorCode transfer_err = future.get();
+        if (transfer_err != ErrorCode::OK) {
+            transfer_summary.RecordFailure(replica_type, transfer_err);
+            continue;
+        }
+        transfer_summary.RecordSuccess(replica_type);
+    }
+
     auto us_put = std::chrono::duration_cast<std::chrono::microseconds>(
                       std::chrono::steady_clock::now() - t0_put)
                       .count();
@@ -1609,8 +1693,10 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         metrics_->transfer_metric.put_latency_us.observe(us_put);
     }
 
+    // Use client_cfg (direct_ssd resolved against the client default) so the
+    // finalize decision matches the config the master allocated with.
     const auto finalize_decision =
-        DetermineFinalizeDecision(config, transfer_summary);
+        DetermineFinalizeDecision(client_cfg, transfer_summary);
 
     if (finalize_decision.end_type.has_value()) {
         auto end_result =
@@ -1648,6 +1734,7 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     }
 
     ReplicateConfig client_cfg = AttachHostId(config);
+    client_cfg.direct_ssd = config.direct_ssd.value_or(default_direct_ssd_);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
@@ -1687,19 +1774,74 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         }
     }
 
-    // Transfer to memory replicas
-    for (const auto& replica : start_result.value()) {
-        if (replica.is_memory_replica()) {
-            ErrorCode transfer_err = TransferWrite(replica, slices);
-            if (transfer_err != ErrorCode::OK) {
-                auto revoke_result =
-                    master_client_.UpsertRevoke(key, ReplicaType::MEMORY);
-                if (!revoke_result) {
-                    LOG(ERROR) << "Failed to revoke upsert operation";
-                    return tl::unexpected(revoke_result.error());
+    const bool direct_ssd_mode = client_cfg.direct_ssd.value_or(false);
+
+    if (!direct_ssd_mode) {
+        // Legacy memory-only path — behavior unchanged.
+        for (const auto& replica : start_result.value()) {
+            if (replica.is_memory_replica()) {
+                ErrorCode transfer_err = TransferWrite(replica, slices);
+                if (transfer_err != ErrorCode::OK) {
+                    auto revoke_result =
+                        master_client_.UpsertRevoke(key, ReplicaType::MEMORY);
+                    if (!revoke_result) {
+                        LOG(ERROR) << "Failed to revoke upsert operation";
+                        return tl::unexpected(revoke_result.error());
+                    }
+                    return tl::unexpected(transfer_err);
                 }
-                return tl::unexpected(transfer_err);
             }
+        }
+    } else {
+        // direct_ssd: write every replica UpsertStart returned. An in-place
+        // (same-size) upsert marks the object's existing replicas PROCESSING
+        // and returns their descriptors — possibly MEMORY (object was memory
+        // resident) and/or stale LOCAL_DISK (object was offloaded) — so all
+        // of them must be rewritten before UpsertEnd(ALL).
+        ReplicaTransferSummary transfer_summary;
+        for (const auto& replica : start_result.value()) {
+            transfer_summary.RecordAllocatedReplica(replica);
+        }
+
+        auto local_disk_transfers =
+            SubmitLocalDiskReplicaWrites(key, slices, start_result.value());
+
+        for (const auto& replica : start_result.value()) {
+            if (replica.is_memory_replica() || replica.is_nof_replica()) {
+                const auto replica_type = replica.is_memory_replica()
+                                              ? ReplicaType::MEMORY
+                                              : ReplicaType::NOF_SSD;
+                ErrorCode transfer_err = TransferWrite(replica, slices);
+                if (transfer_err != ErrorCode::OK) {
+                    transfer_summary.RecordFailure(replica_type, transfer_err);
+                    continue;
+                }
+                transfer_summary.RecordSuccess(replica_type);
+            }
+        }
+
+        // Drain LOCAL_DISK writes and merge results into the summary.
+        for (auto& [replica_type, future] : local_disk_transfers) {
+            ErrorCode transfer_err = future.get();
+            if (transfer_err != ErrorCode::OK) {
+                transfer_summary.RecordFailure(replica_type, transfer_err);
+                continue;
+            }
+            transfer_summary.RecordSuccess(replica_type);
+        }
+
+        // UpsertEnd(ALL) below marks every PROCESSING replica COMPLETE, so
+        // succeed only when every allocated replica was actually written.
+        if (!transfer_summary.AllAllocatedSucceeded()) {
+            auto revoke_result =
+                master_client_.UpsertRevoke(key, ReplicaType::ALL);
+            if (!revoke_result) {
+                LOG(ERROR) << "Failed to revoke upsert operation";
+                return tl::unexpected(revoke_result.error());
+            }
+            return tl::unexpected(transfer_summary.first_error != ErrorCode::OK
+                                      ? transfer_summary.first_error
+                                      : ErrorCode::TRANSFER_FAIL);
         }
     }
 
@@ -1710,8 +1852,10 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         metrics_->transfer_metric.put_latency_us.observe(us);
     }
 
-    // End upsert operation
-    auto end_result = master_client_.UpsertEnd(key, ReplicaType::MEMORY);
+    // End upsert operation. direct_ssd covers every replica type returned
+    // by UpsertStart; the legacy path completes MEMORY replicas as before.
+    auto end_result = master_client_.UpsertEnd(
+        key, direct_ssd_mode ? ReplicaType::ALL : ReplicaType::MEMORY);
     if (!end_result) {
         ErrorCode err = end_result.error();
         LOG(ERROR) << "Failed to end upsert operation: " << err;
@@ -1734,6 +1878,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config) {
     ReplicateConfig client_cfg = AttachHostId(config);
+    client_cfg.direct_ssd = config.direct_ssd.value_or(default_direct_ssd_);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
@@ -1798,6 +1943,7 @@ class PutOperation {
 
     size_t requested_memory_replicas = 0;
     size_t requested_nof_replicas = 0;
+    std::optional<bool> requested_direct_ssd;
     ReplicaTransferSummary transfer_summary;
 
     // Error context for debugging
@@ -1850,12 +1996,14 @@ class PutOperation {
     void InitializeRequestedReplicas(const ReplicateConfig& config) {
         requested_memory_replicas = config.replica_num;
         requested_nof_replicas = config.nof_replica_num;
+        requested_direct_ssd = config.direct_ssd;
     }
 
     ReplicateConfig ToReplicateConfig() const {
         ReplicateConfig config;
         config.replica_num = requested_memory_replicas;
         config.nof_replica_num = requested_nof_replicas;
+        config.direct_ssd = requested_direct_ssd;
         return config;
     }
 
@@ -1997,6 +2145,9 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
                             "Master failed to start upsert operation");
         } else {
             ops[i].replicas = start_responses[i].value();
+            // Populate allocated_* counts so FinalizeBatchUpsert can check
+            // AllAllocatedSucceeded against the transfer results.
+            ops[i].RecordAllocatedReplicas();
             VLOG(1) << "Successfully started upsert for key " << ops[i].key
                     << " with " << ops[i].replicas.size() << " replicas";
         }
@@ -2042,9 +2193,16 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
             }
         }
 
+        // Direct-storage transports (LOCAL_DISK, future GDS, etc).
+        SubmitLocalDiskTransfers(op);
+
         for (size_t replica_idx = 0; replica_idx < op.replicas.size();
              ++replica_idx) {
             const auto& replica = op.replicas[replica_idx];
+            if (replica.is_local_disk_replica()) {
+                // LOCAL_DISK replicas are handled above, skip TransferEngine
+                continue;
+            }
             if (replica.is_memory_replica() || replica.is_nof_replica()) {
                 const auto replica_type = replica.is_memory_replica()
                                               ? ReplicaType::MEMORY
@@ -2090,6 +2248,178 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
     }
 }
 
+std::vector<std::pair<ReplicaType, TransferFuture>>
+Client::SubmitLocalDiskReplicaWrites(
+    const ObjectKey& key, const std::vector<Slice>& slices,
+    const std::vector<Replica::Descriptor>& replicas) {
+    std::vector<std::pair<ReplicaType, TransferFuture>> transfers;
+
+    // Check whether there are any LOCAL_DISK replicas at all.
+    bool has_local_disk = false;
+    for (const auto& replica : replicas) {
+        if (replica.is_local_disk_replica()) {
+            has_local_disk = true;
+            break;
+        }
+    }
+    if (!has_local_disk) return transfers;
+
+    // The SSD storage backend namespaces objects by tenant-scoped storage
+    // keys (same convention as the heartbeat offload path and all read
+    // paths, e.g. batch_get_offload_object). Writing under the raw user
+    // key would make the object unreadable.
+    const std::string storage_key = MakeTenantScopedStorageKey(tenant_id(), key);
+
+    // Concatenate slices once (shared by all replicas).
+    auto staged_data = std::make_shared<std::string>();
+    size_t total_size = 0;
+    for (const auto& slice : slices) total_size += slice.size;
+    staged_data->reserve(total_size);
+    for (const auto& slice : slices) {
+        staged_data->append(static_cast<const char*>(slice.ptr), slice.size);
+    }
+
+    // Register staging buffer with TransferEngine for remote RDMA/TCP reads.
+    // Wrapped in shared_ptr with custom deleter: buffer is unregistered
+    // when all async tasks have finished and dropped their references.
+    bool te_registered = false;
+    std::string te_endpoint;
+    uintptr_t te_buffer_addr = 0;
+    auto te_cleanup = std::shared_ptr<void>(nullptr, [](void*) {});
+
+    if (transfer_engine_) {
+        auto rc = transfer_engine_->registerLocalMemory(
+            const_cast<char*>(staged_data->data()), staged_data->size(),
+            kWildcardLocation, true, false);
+        if (rc == 0) {
+            te_registered = true;
+            te_endpoint = GetSegmentEndpoint();
+            te_buffer_addr = reinterpret_cast<uintptr_t>(staged_data->data());
+            // Capture engine + ptr for deferred unregistration.
+            te_cleanup = std::shared_ptr<void>(
+                staged_data->data(), [engine = transfer_engine_](void* ptr) {
+                    engine->unregisterLocalMemory(ptr);
+                });
+        } else {
+            LOG(WARNING) << "direct_ssd: TE registerLocalMemory failed, "
+                         << "remote LOCAL_DISK writes will fail, key=" << key;
+        }
+    }
+
+    // Enqueue each LOCAL_DISK replica write in parallel.
+    // Wrap futures into TransferFuture via FutureOperationState so they
+    // are waited on uniformly alongside MEMORY/NoF transfers.
+    for (const auto& replica : replicas) {
+        if (!replica.is_local_disk_replica()) continue;
+
+        auto local_disk_desc = replica.get_local_disk_descriptor();
+        auto promise =
+            std::make_shared<std::promise<tl::expected<void, ErrorCode>>>();
+        auto future = promise->get_future();
+
+        if (local_disk_desc.client_id == getClientId()) {
+            // Local SSD write — requires storage backend.
+            if (!local_disk_storage_backend_) {
+                LOG(ERROR) << "direct_ssd: local LOCAL_DISK replica but "
+                           << "no SSD backend available, key=" << key;
+                // Failure is recorded by the caller when the
+                // future resolves — do not RecordFailure here.
+                promise->set_value(
+                    tl::make_unexpected(ErrorCode::UNABLE_OFFLOAD));
+            } else {
+                write_thread_pool_.enqueue(
+                    [this, promise, backend = local_disk_storage_backend_,
+                     storage_key, data = staged_data, cleanup = te_cleanup]() {
+                        std::vector<Slice> slices = {
+                            Slice{const_cast<char*>(data->data()),
+                                  data->size()}};
+                        auto result = backend->DirectWrite(storage_key, slices);
+                        // Report evicted victims before resolving the promise
+                        // (the caller may tear the client down right after all
+                        // futures resolve). Mirrors FileStorage::DirectWrite
+                        // on the remote-write leg.
+                        if (result) {
+                            NotifyLocalDiskEvictions(result->second);
+                        }
+                        promise->set_value(
+                            result ? tl::expected<void, ErrorCode>{}
+                                   : tl::make_unexpected(result.error()));
+                    });
+            }
+        } else if (rpc_client_requester_ &&
+                   !local_disk_desc.transport_endpoint.empty()) {
+            // Remote SSD write via TransferEngine (RDMA/TCP).
+            // Target TE-READs from our registered buffer, then writes to SSD.
+            // Same transport as MEMORY replicas — no RPC fallback needed.
+            if (!te_registered) {
+                LOG(ERROR) << "direct_ssd: TransferEngine unavailable for "
+                           << "remote LOCAL_DISK write, key=" << key;
+                promise->set_value(
+                    tl::make_unexpected(ErrorCode::TRANSFER_FAIL));
+            } else {
+                write_thread_pool_.enqueue(
+                    [promise, requester = rpc_client_requester_,
+                     endpoint = local_disk_desc.transport_endpoint,
+                     engine_addr = te_endpoint, buffer_addr = te_buffer_addr,
+                     size = total_size, storage_key, data = staged_data,
+                     cleanup = te_cleanup]() {
+                        auto result = requester->write_offload_from_engine(
+                            endpoint, engine_addr, buffer_addr, size,
+                            storage_key);
+                        promise->set_value(
+                            result ? tl::expected<void, ErrorCode>{}
+                                   : tl::make_unexpected(result.error()));
+                    });
+            }
+        } else {
+            LOG(WARNING)
+                << "direct_ssd: no RPC requester or empty transport_endpoint"
+                << " for remote LOCAL_DISK replica, key=" << key;
+            promise->set_value(tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+        }
+
+        // Wrap std::future as TransferFuture.
+        auto op_state =
+            std::make_shared<FutureOperationState>(std::move(future));
+        transfers.emplace_back(ReplicaType::LOCAL_DISK,
+                               TransferFuture(std::move(op_state)));
+    }
+    return transfers;
+}
+
+void Client::SubmitLocalDiskTransfers(PutOperation& op) {
+    auto transfers = SubmitLocalDiskReplicaWrites(op.key, op.slices,
+                                                  op.replicas);
+    for (auto& [replica_type, future] : transfers) {
+        op.pending_transfers.emplace_back(replica_type, std::move(future));
+    }
+}
+
+void Client::NotifyLocalDiskEvictions(
+    const std::vector<std::string>& evicted_storage_keys) {
+    if (evicted_storage_keys.empty()) {
+        return;
+    }
+    // Notify master about keys evicted from the local SSD to make room for
+    // this write, grouped by tenant (mirrors FileStorage::DirectWrite).
+    std::unordered_map<std::string, std::vector<std::string>> keys_by_tenant;
+    for (const auto& storage_key : evicted_storage_keys) {
+        auto [tenant_id, user_key] = ParseTenantScopedStorageKey(storage_key);
+        keys_by_tenant[std::move(tenant_id)].push_back(std::move(user_key));
+    }
+    for (const auto& [tenant_id, keys] : keys_by_tenant) {
+        auto results =
+            BatchEvictDiskReplica(keys, tenant_id, ReplicaType::LOCAL_DISK);
+        for (size_t i = 0; i < results.size(); ++i) {
+            if (!results[i]) {
+                LOG(WARNING) << "direct_ssd: failed to notify master about "
+                                "evicted key: "
+                             << keys[i] << ", error: " << results[i].error();
+            }
+        }
+    }
+}
+
 void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
     for (auto& op : ops) {
         // Skip operations that already failed or completed
@@ -2115,8 +2445,12 @@ void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
         VLOG(1) << "Transfers finished for key " << op.key << ", success(mem="
                 << op.transfer_summary.successful_memory_transfers
                 << ", nof=" << op.transfer_summary.successful_nof_transfers
+                << ", local_disk="
+                << op.transfer_summary.successful_local_disk_transfers
                 << "), fail(mem=" << op.transfer_summary.failed_memory_transfers
-                << ", nof=" << op.transfer_summary.failed_nof_transfers << ")";
+                << ", nof=" << op.transfer_summary.failed_nof_transfers
+                << ", local_disk="
+                << op.transfer_summary.failed_local_disk_transfers << ")";
     }
 }
 
@@ -2129,9 +2463,11 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
     BatchFinalizeGroup end_all_group;
     BatchFinalizeGroup end_memory_group;
     BatchFinalizeGroup end_nof_group;
+    BatchFinalizeGroup end_local_disk_group;
     BatchFinalizeGroup revoke_all_group;
     BatchFinalizeGroup revoke_memory_group;
     BatchFinalizeGroup revoke_nof_group;
+    BatchFinalizeGroup revoke_local_disk_group;
 
     std::vector<size_t> pending_finalize_actions(ops.size(), 0);
     std::vector<bool> should_succeed(ops.size(), false);
@@ -2165,6 +2501,12 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
                 case ReplicaType::NOF_SSD:
                     add_group_entry(is_end ? end_nof_group : revoke_nof_group,
                                     key, index);
+                    ++pending_finalize_actions[index];
+                    break;
+                case ReplicaType::LOCAL_DISK:
+                    add_group_entry(
+                        is_end ? end_local_disk_group : revoke_local_disk_group,
+                        key, index);
                     ++pending_finalize_actions[index];
                     break;
                 default:
@@ -2263,9 +2605,11 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
     process_end_group(end_all_group, ReplicaType::ALL);
     process_end_group(end_memory_group, ReplicaType::MEMORY);
     process_end_group(end_nof_group, ReplicaType::NOF_SSD);
+    process_end_group(end_local_disk_group, ReplicaType::LOCAL_DISK);
     process_revoke_group(revoke_all_group, ReplicaType::ALL);
     process_revoke_group(revoke_memory_group, ReplicaType::MEMORY);
     process_revoke_group(revoke_nof_group, ReplicaType::NOF_SSD);
+    process_revoke_group(revoke_local_disk_group, ReplicaType::LOCAL_DISK);
 
     auto append_finalize_error_context = [&](PutOperation& op, size_t index) {
         if (finalize_rpc_errors[index].has_value()) {
@@ -2328,13 +2672,33 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
     failed_keys.reserve(ops.size());
     failed_indices.reserve(ops.size());
 
+    // Per-op terminal error for ops newly classified as transfer-failed here.
+    std::vector<ErrorCode> transfer_errors(ops.size(), ErrorCode::OK);
+
     for (size_t i = 0; i < ops.size(); ++i) {
         auto& op = ops[i];
 
         if (!op.IsResolved() && !op.replicas.empty() &&
             !op.pending_transfers.empty()) {
-            successful_keys.emplace_back(op.key);
-            successful_indices.emplace_back(i);
+            // Classify by actual transfer results, not merely by having
+            // submitted transfers. BatchUpsertEnd/BatchUpsertRevoke operate
+            // on ReplicaType::ALL, so an op may only be finalized as
+            // successful when every allocated replica transferred —
+            // otherwise BatchUpsertEnd would mark replicas that hold no
+            // data as COMPLETE (silent data loss on read). Judged on what
+            // UpsertStart actually returned: an in-place upsert may return
+            // existing MEMORY replicas even when direct_ssd was requested.
+            if (op.transfer_summary.AllAllocatedSucceeded()) {
+                successful_keys.emplace_back(op.key);
+                successful_indices.emplace_back(i);
+            } else {
+                transfer_errors[i] =
+                    op.transfer_summary.first_error != ErrorCode::OK
+                        ? op.transfer_summary.first_error
+                        : ErrorCode::TRANSFER_FAIL;
+                failed_keys.emplace_back(op.key);
+                failed_indices.emplace_back(i);
+            }
         } else if (op.state != PutOperationState::PENDING &&
                    !op.replicas.empty()) {
             failed_keys.emplace_back(op.key);
@@ -2410,6 +2774,19 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
                               << failed_keys[i];
                 }
             }
+        }
+    }
+
+    // Ops classified as transfer-failed above are still PENDING — give them
+    // their terminal transfer error now that revoke has been attempted.
+    // (Ops that were already resolved, or hit a revoke RPC size mismatch,
+    // keep the error set earlier.)
+    for (size_t idx : failed_indices) {
+        if (!ops[idx].IsResolved() && transfer_errors[idx] != ErrorCode::OK) {
+            ops[idx].SetTerminalError(
+                transfer_errors[idx], PutOperationState::TRANSFER_FAILED,
+                ops[idx].failure_context.value_or(
+                    "Replica transfer failed before finalize"));
         }
     }
 
@@ -2570,11 +2947,21 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config) {
     ReplicateConfig client_cfg = AttachHostId(config);
+    client_cfg.direct_ssd = config.direct_ssd.value_or(default_direct_ssd_);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
     if (client_cfg.prefer_alloc_in_same_node) {
+        if (client_cfg.direct_ssd.value_or(false)) {
+            // BatchPutWhenPreferSameNode only supports MEMORY replicas;
+            // direct_ssd allocates LOCAL_DISK ones, which would fail every
+            // op after a wasted master allocate/revoke round trip.
+            LOG(ERROR) << "prefer_alloc_in_same_node is not supported with "
+                          "direct_ssd";
+            return std::vector<tl::expected<void, ErrorCode>>(
+                keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+        }
         if (client_cfg.nof_replica_num > 0) {
             LOG(ERROR) << "prefer_alloc_in_same_node is not supported with "
                           "NoF replicas";
@@ -3016,9 +3403,9 @@ std::vector<tl::expected<bool, ErrorCode>> Client::BatchIsExist(
 void* Client::GetBaseAddr() { return transfer_engine_->getBaseAddr(); }
 
 tl::expected<void, ErrorCode> Client::MountLocalDiskSegment(
-    bool enable_offloading) {
-    auto response =
-        master_client_.MountLocalDiskSegment(client_id_, enable_offloading);
+    bool enable_offloading, const std::string& rpc_endpoint) {
+    auto response = master_client_.MountLocalDiskSegment(
+        client_id_, enable_offloading, rpc_endpoint);
 
     if (!response) {
         LOG(ERROR) << "MountLocalDiskSegment failed, error code is "

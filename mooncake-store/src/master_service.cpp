@@ -120,7 +120,20 @@ uint64_t SaturatingMultiply(uint64_t lhs, uint64_t rhs) {
 
 bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
                                   size_t allocated_memory_replicas,
-                                  size_t allocated_nof_replicas) {
+                                  size_t allocated_nof_replicas,
+                                  size_t allocated_local_disk_replicas = 0) {
+    // direct_ssd: replica_num controls LOCAL_DISK replicas
+    if (config.direct_ssd.value_or(false)) {
+        if (config.nof_replica_num == 0) {
+            return allocated_local_disk_replicas > 0;
+        }
+        if (DetermineReplicaWriteMode(config) ==
+            ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
+            return allocated_local_disk_replicas + allocated_nof_replicas > 0;
+        }
+        return allocated_local_disk_replicas == config.replica_num &&
+               allocated_nof_replicas == config.nof_replica_num;
+    }
     if (config.nof_replica_num == 0) {
         return allocated_memory_replicas > 0;
     }
@@ -1139,6 +1152,8 @@ uint64_t MasterService::CompletedMemoryQuotaCharge(
 
 uint64_t MasterService::RequestedMemoryQuotaCharge(
     uint64_t value_length, const ReplicateConfig& config) const {
+    // direct_ssd uses LOCAL_DISK replicas, no MEMORY quota consumed.
+    if (config.direct_ssd.value_or(false)) return 0;
     const unsigned __int128 charge =
         static_cast<unsigned __int128>(value_length) * config.replica_num;
     if (charge > std::numeric_limits<uint64_t>::max()) {
@@ -1808,6 +1823,13 @@ void MasterService::ReleaseLocalDiskUsage(
     std::unordered_map<UUID, int64_t, boost::hash<UUID>> bytes_by_client;
     for (const auto& replica : replicas) {
         if (!replica.is_local_disk_replica()) {
+            continue;
+        }
+        // Only release bytes for COMPLETE replicas — ssd_used_bytes is
+        // incremented in PutEnd (PROCESSING→COMPLETE) or NotifyOffloadSuccess
+        // (direct COMPLETE). PROCESSING replicas (e.g. failed direct_ssd)
+        // never had their bytes counted.
+        if (!replica.is_completed()) {
             continue;
         }
         const auto descriptor =
@@ -2866,7 +2888,8 @@ auto MasterService::AllocateAndInsertMetadata(
     const auto write_mode = DetermineReplicaWriteMode(config);
     size_t allocated_memory_replicas = 0;
     size_t allocated_nof_replicas = 0;
-    if (config.replica_num > 0) {
+    size_t allocated_local_disk_replicas = 0;
+    if (config.replica_num > 0 && !config.direct_ssd.value_or(false)) {
         const bool use_local_first =
             allocation_strategy_type_ == AllocationStrategyType::LOCAL_FIRST &&
             config.replica_num == 1;
@@ -2978,14 +3001,84 @@ auto MasterService::AllocateAndInsertMetadata(
     }
 #endif
 
+    // Phase C: LOCAL_DISK replicas for direct_ssd.
+    // replica_num controls how many SSD clients to write to.
+    // Must run BEFORE HasExpectedReplicaAllocation below, which validates
+    // allocated_local_disk_replicas for direct_ssd configs.
+    if (config.direct_ssd.value_or(false) && config.replica_num > 0) {
+        ScopedLocalDiskSegmentAccess ssd_access =
+            segment_manager_.getLocalDiskSegmentAccess();
+        auto& client_segments = ssd_access.getClientLocalDiskSegment();
+
+        // Collect available SSD clients, sorted by free ratio descending.
+        struct SsdCandidate {
+            UUID client_id;
+            std::shared_ptr<LocalDiskSegment> segment;
+            double free_ratio;
+        };
+        std::vector<SsdCandidate> candidates;
+        for (const auto& [cid, seg] : client_segments) {
+            if (seg->ssd_total_capacity_bytes > 0) {
+                int64_t used =
+                    seg->ssd_used_bytes.load(std::memory_order_relaxed);
+                int64_t total = seg->ssd_total_capacity_bytes;
+                // Avoid signed overflow when value_length exceeds INT64_MAX.
+                int64_t remaining = total - used;
+                int64_t free_bytes = (remaining <= 0) ? 0 : remaining;
+                if (value_length < static_cast<uint64_t>(
+                                       std::numeric_limits<int64_t>::max())) {
+                    free_bytes = std::max<int64_t>(
+                        0, remaining - static_cast<int64_t>(value_length));
+                }
+                double ratio = static_cast<double>(free_bytes) /
+                               static_cast<double>(total);
+                candidates.push_back({cid, seg, ratio});
+            } else {
+                // Unknown capacity: place at end with neutral ratio.
+                candidates.push_back({cid, seg, 0.5});
+            }
+        }
+
+        if (candidates.empty()) {
+            LOG(WARNING) << "direct_ssd: no LocalDiskSegments registered, "
+                         << "cannot allocate LOCAL_DISK replicas, key=" << key;
+        } else {
+            // Select top N by free ratio, no more than available.
+            size_t to_alloc = std::min(config.replica_num, candidates.size());
+            // Partial sort: only order the top N candidates.
+            std::partial_sort(candidates.begin(), candidates.begin() + to_alloc,
+                              candidates.end(),
+                              [](const SsdCandidate& a, const SsdCandidate& b) {
+                                  return a.free_ratio > b.free_ratio;
+                              });
+            if (to_alloc < config.replica_num) {
+                LOG(WARNING) << "direct_ssd: requested " << config.replica_num
+                             << " LOCAL_DISK replicas but only "
+                             << candidates.size() << " SSD clients available, "
+                             << "allocating " << to_alloc;
+            }
+            for (size_t i = 0; i < to_alloc; ++i) {
+                replicas.emplace_back(candidates[i].client_id, value_length,
+                                      candidates[i].segment->rpc_endpoint,
+                                      ReplicaStatus::PROCESSING);
+                ++allocated_local_disk_replicas;
+            }
+        }
+    }
+
     if (!HasExpectedReplicaAllocation(config, allocated_memory_replicas,
-                                      allocated_nof_replicas)) {
+                                      allocated_nof_replicas,
+                                      allocated_local_disk_replicas)) {
+        // direct_ssd failures stem from SSD-segment shortage; evicting
+        // MEMORY would not help, so skip the mem-eviction signal for them
+        // (the alloc-failure metric is still incremented).
+        const bool direct_ssd_requested = config.direct_ssd.value_or(false);
         if ((config.replica_num > 0 &&
              allocated_memory_replicas != config.replica_num) ||
             (config.nof_replica_num > 0 &&
              allocated_nof_replicas != config.nof_replica_num)) {
             MasterMetricManager::instance().inc_put_start_alloc_failures();
-            if (config.replica_num > 0 &&
+            if (config.replica_num > 0 && !direct_ssd_requested &&
                 allocated_memory_replicas != config.replica_num) {
                 need_mem_eviction_ = true;
             }
@@ -2998,7 +3091,9 @@ auto MasterService::AllocateAndInsertMetadata(
                 << key << ", requested_memory_replicas=" << config.replica_num
                 << ", allocated_memory_replicas=" << allocated_memory_replicas
                 << ", requested_nof_replicas=" << config.nof_replica_num
-                << ", allocated_nof_replicas=" << allocated_nof_replicas;
+                << ", allocated_nof_replicas=" << allocated_nof_replicas
+                << ", allocated_local_disk_replicas="
+                << allocated_local_disk_replicas;
         abort_reserved_quota();
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
@@ -3062,10 +3157,16 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(normalized_tenant_result.error());
     }
     const ObjectIdentity object_id{normalized_tenant_result.value(), key};
+    // replica_num counts LOCAL_DISK replicas when direct_ssd is set, so a
+    // (0, 0) config can never allocate anything regardless of direct_ssd.
     if ((config.replica_num == 0 && config.nof_replica_num == 0) ||
         key.empty() || slice_length == 0) {
         LOG(ERROR) << "key=" << key << ", replica_num=" << config.replica_num
                    << ", nof_replica_num=" << config.nof_replica_num
+                   << ", direct_ssd="
+                   << (config.direct_ssd.has_value()
+                           ? (config.direct_ssd.value() ? "true" : "false")
+                           : "not-set")
                    << ", slice_length=" << slice_length
                    << ", key_size=" << key.size() << ", error=invalid_params";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -3246,7 +3347,8 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
                 return (replica.is_memory_replica() &&
                         !replica.has_invalid_mem_handle()) ||
                        (replica.is_nof_replica() &&
-                        !replica.has_invalid_nof_handle());
+                        !replica.has_invalid_nof_handle()) ||
+                       (replica.is_local_disk_replica());
             }
             if (replica_type == ReplicaType::MEMORY) {
                 return replica.is_memory_replica() &&
@@ -3258,7 +3360,31 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
             }
             return replica.type() == replica_type;
         },
-        [](Replica& replica) { replica.mark_complete(); });
+        [this](Replica& replica) {
+            // For LOCAL_DISK replicas transitioning PROCESSING→COMPLETE,
+            // update ssd_used_bytes (mirrors NotifyOffloadSuccess for
+            // the direct_ssd path). Lock ordering is safe per the
+            // documented convention: snapshot → metadata → segment.
+            bool is_local = replica.is_local_disk_replica();
+            bool was_processing = replica.is_processing();
+            replica.mark_complete();
+            if (is_local && was_processing) {
+                auto client_id = replica.get_local_disk_client_id();
+                if (client_id.has_value()) {
+                    ScopedLocalDiskSegmentAccess ssd_access =
+                        segment_manager_.getLocalDiskSegmentAccess();
+                    auto& segs = ssd_access.getClientLocalDiskSegment();
+                    auto it = segs.find(client_id.value());
+                    if (it != segs.end()) {
+                        auto size = replica.get_descriptor()
+                                        .get_local_disk_descriptor()
+                                        .object_size;
+                        it->second->ssd_used_bytes.fetch_add(
+                            size, std::memory_order_relaxed);
+                    }
+                }
+            }
+        });
 
     const bool has_memory_replica = metadata.HasMemReplica();
     const bool should_settle_quota =
@@ -3285,25 +3411,38 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
     }
 
     if (enable_offload_ && !offload_on_evict_) {
-        auto& tenant_state = accessor.GetTenantState();
-        bool task_created = false;
-        metadata.VisitReplicas(
-            [](const Replica& replica) {
-                return replica.is_completed() && replica.is_memory_replica();
-            },
-            [this, &object_id, &tenant_state, &task_created](Replica& replica) {
-                auto result = PushOffloadingQueue(object_id, replica);
-                if (result) {
-                    if (!task_created) {
-                        replica.inc_refcnt();
-                        tenant_state.offloading_tasks.emplace(
-                            object_id.user_key,
-                            OffloadingTask{replica.id(),
-                                           std::chrono::system_clock::now()});
-                        task_created = true;
-                    }
-                }
+        // Skip offload if the object has a COMPLETED LOCAL_DISK replica
+        // (data is already on SSD via direct_ssd).
+        // Only count COMPLETED replicas — PROCESSING LOCAL_DISK replicas
+        // are from a prior Upsert cycle and should not suppress offload.
+        bool has_completed_local_disk =
+            metadata.HasReplica([](const Replica& r) {
+                return r.is_local_disk_replica() && r.is_completed();
             });
+        if (!has_completed_local_disk) {
+            auto& tenant_state = accessor.GetTenantState();
+            bool task_created = false;
+            metadata.VisitReplicas(
+                [](const Replica& replica) {
+                    return replica.is_completed() &&
+                           replica.is_memory_replica();
+                },
+                [this, &object_id, &tenant_state,
+                 &task_created](Replica& replica) {
+                    auto result = PushOffloadingQueue(object_id, replica);
+                    if (result) {
+                        if (!task_created) {
+                            replica.inc_refcnt();
+                            tenant_state.offloading_tasks.emplace(
+                                object_id.user_key,
+                                OffloadingTask{
+                                    replica.id(),
+                                    std::chrono::system_clock::now()});
+                            task_created = true;
+                        }
+                    }
+                });
+        }
     }
 
     // If the object is completed, remove it from the processing set.
@@ -3402,14 +3541,16 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
 
-    auto processing_rep = metadata.GetFirstReplica([replica_type](
-                                                       const Replica& replica) {
-        if (replica_type == ReplicaType::ALL) {
-            return (replica.is_memory_replica() || replica.is_nof_replica()) &&
-                   !replica.is_processing();
-        }
-        return replica.type() == replica_type && !replica.is_processing();
-    });
+    auto processing_rep =
+        metadata.GetFirstReplica([replica_type](const Replica& replica) {
+            if (replica_type == ReplicaType::ALL) {
+                return (replica.is_memory_replica() ||
+                        replica.is_nof_replica() ||
+                        replica.is_local_disk_replica()) &&
+                       !replica.is_processing();
+            }
+            return replica.type() == replica_type && !replica.is_processing();
+        });
     if (processing_rep != nullptr) {
         LOG(ERROR) << "key=" << key << ", status=" << processing_rep->status()
                    << ", error=invalid_replica_status";
@@ -3420,7 +3561,9 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     EraseReplicasWithCacheTotalAccounting(
         metadata, [replica_type](const Replica& replica) {
             if (replica_type == ReplicaType::ALL) {
-                return replica.is_memory_replica() || replica.is_nof_replica();
+                return replica.is_memory_replica() ||
+                       replica.is_nof_replica() ||
+                       replica.is_local_disk_replica();
             }
             return replica.type() == replica_type;
         });
@@ -3494,6 +3637,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     }
     const ObjectIdentity object_id{normalized_tenant_result.value(), key};
     // --- Parameter validation (same as PutStart) ---
+    // replica_num counts LOCAL_DISK replicas when direct_ssd is set, so a
+    // (0, 0) config can never allocate anything regardless of direct_ssd.
     if ((config.replica_num == 0 && config.nof_replica_num == 0) ||
         key.empty() || slice_length == 0) {
         LOG(ERROR) << "key=" << key << ", replica_num=" << config.replica_num
@@ -3703,6 +3848,14 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     // Mark COMPLETE → PROCESSING so readers won't see stale
                     // data mid-transfer.  The key becomes unreadable until
                     // UpsertEnd.
+                    //
+                    // LOCAL_DISK bytes are accounted only while a replica is
+                    // COMPLETE (see ReleaseLocalDiskUsage), and PutEnd re-adds
+                    // them on the PROCESSING→COMPLETE transition. Release them
+                    // before flipping the status so a successful UpsertEnd(ALL)
+                    // does not double-count and a revoke does not leak the
+                    // previously counted bytes.
+                    ReleaseLocalDiskUsage(metadata.GetAllReplicas());
                     metadata.VisitReplicas(
                         &Replica::fn_is_completed,
                         [](Replica& replica) { replica.mark_processing(); });
@@ -4883,7 +5036,8 @@ MasterService::GetStorageConfig() const {
 }
 
 auto MasterService::MountLocalDiskSegment(const UUID& client_id,
-                                          bool enable_offloading)
+                                          bool enable_offloading,
+                                          const std::string& rpc_endpoint)
     -> tl::expected<void, ErrorCode> {
     if (!enable_offload_) {
         LOG(ERROR) << "	The offload functionality is not enabled";
@@ -4892,10 +5046,11 @@ auto MasterService::MountLocalDiskSegment(const UUID& client_id,
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
 
-    auto err =
-        segment_access.MountLocalDiskSegment(client_id, enable_offloading);
+    auto err = segment_access.MountLocalDiskSegment(
+        client_id, enable_offloading, rpc_endpoint);
     if (err == ErrorCode::SEGMENT_ALREADY_EXISTS) {
-        // Return OK because this is an idempotent operation
+        // Return OK because this is an idempotent operation;
+        // rpc_endpoint was already updated in the SEGMENT_ALREADY_EXISTS path.
         return {};
     } else if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);

@@ -49,6 +49,29 @@ class FileStorage {
      */
     bool ReleaseBuffer(uint64_t batch_id);
 
+    /**
+     * @brief Get the storage backend for direct SSD writes (direct_ssd).
+     */
+    std::shared_ptr<StorageBackendInterface> getStorageBackend() const {
+        return storage_backend_;
+    }
+
+    /**
+     * @brief Direct SSD write for direct_ssd. Writes key+slices synchronously.
+     * @return StorageObjectMetadata for master LOCAL_DISK registration and
+     *         any keys evicted during the write.
+     */
+    tl::expected<std::pair<StorageObjectMetadata, std::vector<std::string>>,
+                 ErrorCode>
+    DirectWrite(const std::string& key, const std::vector<Slice>& slices);
+
+    /**
+     * @brief Get the client buffer allocator (for TE READ staging buffers).
+     */
+    std::shared_ptr<ClientBufferAllocator> getClientBufferAllocator() const {
+        return client_buffer_allocator_;
+    }
+
    private:
     friend class FileStorageTest;
     friend class FileStoragePromotionTest;

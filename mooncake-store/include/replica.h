@@ -92,6 +92,10 @@ struct ReplicateConfig {
     bool prefer_alloc_in_same_node{false};
     ObjectDataType data_type{ObjectDataType::UNKNOWN};
     std::string host_id{};
+    // When true, replica_num controls LOCAL_DISK replicas instead of MEMORY
+    // replicas. Data is written directly to SSD during Put, bypassing the
+    // MEMORY + async offload cycle.
+    std::optional<bool> direct_ssd;
     // Optional per-key routing group IDs. Empty string keeps that key
     // ungrouped. Grouped keys share metadata routing, coalesced lease refresh,
     // and memory eviction behavior.
@@ -134,6 +138,10 @@ struct ReplicateConfig {
         if (!config.host_id.empty()) {
             os << ", host_id: " << config.host_id;
         }
+        os << ", direct_ssd: "
+           << (config.direct_ssd.has_value()
+                   ? (config.direct_ssd.value() ? "true" : "false")
+                   : "not-set");
         if (config.group_ids.has_value()) {
             os << ", group_ids: [";
             for (size_t i = 0; i < config.group_ids->size(); ++i) {
@@ -679,6 +687,11 @@ inline std::ostream& operator<<(std::ostream& os, const Replica& replica) {
         const auto& disk_data = std::get<DiskReplicaData>(replica.data_);
         os << "type: DISK, file_path: " << disk_data.file_path
            << ", object_size: " << disk_data.object_size;
+    } else if (replica.is_local_disk_replica()) {
+        const auto& local_disk_data =
+            std::get<LocalDiskReplicaData>(replica.data_);
+        os << "type: LOCAL_DISK, client_id: " << local_disk_data.client_id
+           << ", object_size: " << local_disk_data.object_size;
     }
 
     os << ", refcnt: " << replica.refcnt_.load() << " }";

@@ -187,6 +187,40 @@ tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
     return static_cast<int64_t>(success_keys.size());
 }
 
+tl::expected<std::pair<StorageObjectMetadata, std::vector<std::string>>,
+             ErrorCode>
+DistributedStorageBackend::DirectWrite(const std::string& key,
+                                       const std::vector<Slice>& slices) {
+    std::unordered_map<std::string, std::vector<Slice>> batch_object;
+    batch_object[key] = slices;
+
+    StorageObjectMetadata result_meta;
+    std::vector<std::string> result_evicted;
+
+    auto complete_handler =
+        [&result_meta](
+            const std::vector<std::string>& /*keys*/,
+            std::vector<StorageObjectMetadata>& metadatas) -> ErrorCode {
+        if (!metadatas.empty()) {
+            result_meta = metadatas[0];
+        }
+        return ErrorCode::OK;
+    };
+
+    auto eviction_handler =
+        [&result_evicted](const std::vector<std::string>& evicted_keys) {
+            result_evicted = evicted_keys;
+        };
+
+    auto offload_result =
+        BatchOffload(batch_object, complete_handler, eviction_handler);
+    if (!offload_result) {
+        return tl::make_unexpected(offload_result.error());
+    }
+
+    return std::make_pair(result_meta, result_evicted);
+}
+
 tl::expected<void, ErrorCode> DistributedStorageBackend::BatchLoad(
     std::unordered_map<std::string, Slice>& batched_slices) {
     if (!initialized_) {

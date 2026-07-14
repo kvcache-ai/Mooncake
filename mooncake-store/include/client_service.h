@@ -31,6 +31,7 @@
 namespace mooncake {
 
 class PutOperation;
+class ClientRequester;
 
 /**
  * @brief Result of a query operation containing replica information and lease
@@ -411,7 +412,8 @@ class Client {
      * @brief Mounts a local disk segment into the master.
      * @param enable_offloading If true, enables offloading (write-to-file).
      */
-    tl::expected<void, ErrorCode> MountLocalDiskSegment(bool enable_offloading);
+    tl::expected<void, ErrorCode> MountLocalDiskSegment(
+        bool enable_offloading, const std::string& rpc_endpoint = {});
 
     /**
      * @brief Heartbeat call to collect object-level statistics and retrieve the
@@ -571,6 +573,10 @@ class Client {
 
     [[nodiscard]] const std::string& GetProtocol() const { return protocol_; }
 
+    [[nodiscard]] std::shared_ptr<TransferEngine> GetTransferEngine() const {
+        return transfer_engine_;
+    }
+
     /**
      * @brief Get the endpoint address for segment operations.
      * @return For P2PHANDSHAKE mode, returns the actual RPC endpoint (IP:Port).
@@ -648,6 +654,26 @@ class Client {
     }
 
     bool IsReplicaOnLocalMemory(const Replica::Descriptor& replica);
+
+    /**
+     * @brief Set storage backend for direct_ssd direct SSD writes.
+     */
+    void SetLocalDiskStorageBackend(
+        std::shared_ptr<StorageBackendInterface> backend) {
+        local_disk_storage_backend_ = std::move(backend);
+    }
+
+    /**
+     * @brief Set client requester for direct_ssd cross-node RPC calls.
+     */
+    void SetClientRequester(std::shared_ptr<ClientRequester> requester) {
+        rpc_client_requester_ = std::move(requester);
+    }
+
+    // If true, all Puts default to direct_ssd (caller can still override
+    // per-request via ReplicateConfig).
+    void SetDefaultDirectSsd(bool val) { default_direct_ssd_ = val; }
+    bool GetDefaultDirectSsd() const { return default_direct_ssd_; }
 
    protected:
     /**
@@ -762,6 +788,19 @@ class Client {
     void StartBatchPut(std::vector<PutOperation>& ops,
                        const ReplicateConfig& config);
     void SubmitTransfers(std::vector<PutOperation>& ops);
+    void SubmitLocalDiskTransfers(PutOperation& op);
+    // Submit LOCAL_DISK replica writes (direct_ssd) for one object and
+    // return the in-flight futures. Shared by the batch path
+    // (SubmitLocalDiskTransfers) and the single-key Put path.
+    std::vector<std::pair<ReplicaType, TransferFuture>>
+    SubmitLocalDiskReplicaWrites(
+        const ObjectKey& key, const std::vector<Slice>& slices,
+        const std::vector<Replica::Descriptor>& replicas);
+    // Report SSD objects evicted by a local DirectWrite to the master so it
+    // drops their LOCAL_DISK replicas (mirrors FileStorage::DirectWrite on
+    // the remote-write leg).
+    void NotifyLocalDiskEvictions(
+        const std::vector<std::string>& evicted_storage_keys);
     void WaitForTransfers(std::vector<PutOperation>& ops);
     void FinalizeBatchPut(std::vector<PutOperation>& ops);
     void StartBatchUpsert(std::vector<PutOperation>& ops,
@@ -828,6 +867,11 @@ class Client {
     std::unique_ptr<PinnedBufferPool> pinned_buffer_pool_;
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;
+    // Injected storage backend for direct_ssd direct LOCAL_DISK writes.
+    std::shared_ptr<StorageBackendInterface> local_disk_storage_backend_;
+    // Injected client requester for direct_ssd cross-node RPC calls.
+    std::shared_ptr<ClientRequester> rpc_client_requester_;
+    bool default_direct_ssd_ = false;
 
     // For high availability
     std::unique_ptr<ha::LeaderCoordinator> leader_coordinator_;

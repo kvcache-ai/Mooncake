@@ -631,8 +631,11 @@ class MasterService {
     /**
      * @brief Mounts a file storage segment into the master.
      * @param enable_offloading If true, enables offloading (write-to-file).
+     * @param rpc_endpoint RPC address of the client, used for direct_ssd
+     * cross-node TransferEngine reads.
      */
-    auto MountLocalDiskSegment(const UUID& client_id, bool enable_offloading)
+    auto MountLocalDiskSegment(const UUID& client_id, bool enable_offloading,
+                               const std::string& rpc_endpoint = {})
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -1045,7 +1048,8 @@ class MasterService {
             return EraseReplicas([replica_type](const Replica& replica) {
                 if (replica_type == ReplicaType::ALL) {
                     return replica.is_memory_replica() ||
-                           replica.is_nof_replica();
+                           replica.is_nof_replica() ||
+                           replica.is_local_disk_replica();
                 }
                 return replica.type() == replica_type;
             });

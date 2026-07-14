@@ -88,6 +88,130 @@ store.setup_dummy(
 
 ---
 
+## Direct SSD Write (`direct_ssd`)
+
+`direct_ssd` writes object data directly to SSD during `Put`, bypassing DRAM entirely. Instead of allocating MEMORY replicas, the master allocates LOCAL_DISK replicas on available SSD nodes.
+
+There are two roles in a `direct_ssd` deployment:
+
+- **SSD storage nodes**: contribute local SSD capacity via `enable_ssd_offload=true`. They receive data (local `DirectWrite` or remote TransferEngine READ → `DirectWrite`) and store it on their local SSDs.
+- **Pure compute nodes** (no local SSD): set `direct_ssd=True` only. They push data to remote SSD nodes via TransferEngine (RDMA/TCP) — no local SSD backend required.
+
+**Prerequisites**:
+
+| Role | Setup | Why |
+|------|-------|-----|
+| Master | `--enable_offload=true` | Allows `LocalDiskSegment` registration |
+| SSD storage node | `enable_ssd_offload=true` + `ssd_offload_path` | Creates `FileStorage` backend, mounts local disk segment |
+| Pure compute node | `direct_ssd=True` (no `enable_ssd_offload` needed) | `ClientRequester` is always injected; remote writes use `write_offload_from_engine` RPC |
+
+**Mode A — Embedded Real Client (SSD storage node that also does Puts):**
+
+Set `enable_ssd_offload=True` and `direct_ssd=True` to both contribute SSD capacity and default Puts to direct SSD writes:
+
+```python
+store = MooncakeDistributedStore()
+store.setup(
+    local_hostname="192.168.1.1",
+    metadata_server="P2PHANDSHAKE",
+    global_segment_size=0,                     # no DRAM contribution
+    local_buffer_size=1024 * 1024 * 1024,      # staging buffer for SSD I/O
+    protocol="rdma",
+    rdma_devices="mlx5_0",                     # RDMA verbs device name (see `ibv_devices`)
+    master_server_addr="127.0.0.1:50051",
+    enable_ssd_offload=True,                   # contribute SSD capacity
+    ssd_offload_path="/nvme/mooncake_offload",
+    direct_ssd=True,                           # default all Puts to direct SSD
+)
+
+# All Puts now use direct SSD by default
+store.put("my_kv_key", data)
+```
+
+Or config dict:
+
+```python
+store.setup({
+    "local_hostname": "192.168.1.1",
+    "metadata_server": "P2PHANDSHAKE",
+    "master_server_addr": "127.0.0.1:50051",
+    "protocol": "rdma",
+    "rdma_devices": "mlx5_0",
+    "global_segment_size": "0",
+    "local_buffer_size": "1073741824",
+    "enable_ssd_offload": "true",
+    "ssd_offload_path": "/nvme/mooncake_offload",
+    "direct_ssd": "true",
+})
+```
+
+**Mode B — Standalone Real Client + DummyClient:**
+
+The standalone `mooncake_client` starts the same way as regular offload (see Step 3B). On the application side (vLLM/SGLang), set `direct_ssd` in `ReplicateConfig`:
+
+```python
+from mooncake.store import ReplicateConfig
+
+config = ReplicateConfig()
+config.replica_num = 2      # controls LOCAL_DISK replicas
+config.direct_ssd = True    # write directly to SSD, bypass DRAM
+store.put("key", data, config)
+```
+
+**Mode C — Pure compute node** (no local SSD, pushes data to remote SSD nodes):
+
+Set only `direct_ssd=True` — no `enable_ssd_offload` or `ssd_offload_path` needed. On each Put the compute node concatenates the slices into a transient staging buffer, registers it with the TransferEngine, and calls `write_offload_from_engine` on the remote SSD nodes selected by the master (the staging buffer is per-Put and independent of `local_buffer_size`):
+
+```python
+store = MooncakeDistributedStore()
+store.setup(
+    local_hostname="192.168.1.2",
+    metadata_server="P2PHANDSHAKE",
+    global_segment_size=0,                     # no DRAM contribution
+    local_buffer_size=1024 * 1024 * 1024,      # for Get-path reads, not direct_ssd staging
+    protocol="rdma",
+    rdma_devices="mlx5_0",                     # RDMA verbs device name (see `ibv_devices`)
+    master_server_addr="192.168.1.1:50051",
+    direct_ssd=True,                           # only this — no SSD backend needed
+)
+
+# Master allocates LOCAL_DISK replicas on storage nodes (Mode A / Step 3A).
+# Compute node concatenates slices → TE registers staging buffer →
+# RPC calls write_offload_from_engine on each target → target TE-READs + DirectWrite.
+store.put("my_key", data)
+```
+
+**Behavior summary:**
+
+| `direct_ssd` at setup | Effect |
+|---|---|
+| `false` (default) | All Puts use the normal memory + async offload path |
+| `true` | All Puts default to direct SSD write; can be overridden per-request via `ReplicateConfig.direct_ssd=False` |
+
+When `direct_ssd=True`, `replica_num` controls LOCAL_DISK replicas instead of MEMORY replicas. No DRAM quota is consumed.
+
+Per-request override via `ReplicateConfig`:
+
+```python
+from mooncake.store import ReplicateConfig
+
+# Override to use normal memory path even when setup default is direct_ssd=True
+config = ReplicateConfig()
+config.direct_ssd = False
+config.replica_num = 1     # MEMORY replicas
+store.put("key", data, config)
+
+# Override to use direct SSD even when setup default is direct_ssd=False
+config2 = ReplicateConfig()
+config2.direct_ssd = True
+config2.replica_num = 3    # LOCAL_DISK replicas
+store.put("key2", data, config2)
+```
+
+For architecture details and data flow, see the "Direct SSD Write" section in the design document.
+
+---
+
 ## Real Client Parameters
 
 | Flag | Default | Description |

@@ -129,6 +129,7 @@ func (s *Store) toCConfig(cfg *ReplicateConfig) (C.mooncake_replicate_config_t, 
 
 	if cfg == nil {
 		cc.replica_num = 1
+		cc.direct_ssd = -1 // unset — use client default
 		return cc, nil, nil
 	}
 
@@ -142,6 +143,15 @@ func (s *Store) toCConfig(cfg *ReplicateConfig) (C.mooncake_replicate_config_t, 
 	}
 	if cfg.WithHardPin {
 		cc.with_hard_pin = 1
+	}
+	if cfg.DirectSsd != nil {
+		if *cfg.DirectSsd {
+			cc.direct_ssd = 1
+		} else {
+			cc.direct_ssd = 0
+		}
+	} else {
+		cc.direct_ssd = -1 // unset — use client default
 	}
 
 	if len(cfg.PreferredSegments) > 0 {

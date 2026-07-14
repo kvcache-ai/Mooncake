@@ -219,18 +219,23 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
     return ErrorCode::OK;
 }
 
-ErrorCode ScopedSegmentAccess::MountLocalDiskSegment(const UUID& client_id,
-                                                     bool enable_offloading) {
+ErrorCode ScopedSegmentAccess::MountLocalDiskSegment(
+    const UUID& client_id, bool enable_offloading,
+    const std::string& rpc_endpoint) {
     auto exist_segment_it =
         segment_manager_->client_local_disk_segment_.find(client_id);
     if (exist_segment_it !=
         segment_manager_->client_local_disk_segment_.end()) {
         LOG(WARNING) << "client_id=" << client_id
                      << ", warn=local_disk_segment_already_exists";
+        // Update rpc_endpoint even if segment already exists (re-registration).
+        exist_segment_it->second->rpc_endpoint = rpc_endpoint;
         return ErrorCode::SEGMENT_ALREADY_EXISTS;
     }
-    segment_manager_->client_local_disk_segment_.emplace(
-        client_id, std::make_shared<LocalDiskSegment>(enable_offloading));
+    auto segment = std::make_shared<LocalDiskSegment>(enable_offloading);
+    segment->rpc_endpoint = rpc_endpoint;
+    segment_manager_->client_local_disk_segment_.emplace(client_id,
+                                                         std::move(segment));
     return ErrorCode::OK;
 }
 
@@ -673,14 +678,17 @@ SegmentSerializer::Serialize() {
         packer.pack(UuidToString(client_uuid));
 
         // Serialize LocalDiskSegment: [enable_offloading, count, storage_key1,
-        // task1, storage_key2, task2, ...] Sort keys to ensure determinism.
+        // task1, storage_key2, task2, ..., rpc_endpoint]
+        // Sort keys to ensure determinism. rpc_endpoint is appended at the
+        // tail so snapshots written before it existed (array size
+        // 2 + count * 2) still deserialize; readers detect it by length.
         std::vector<std::string> sorted_keys;
         for (const auto& [key, _] : segment->offloading_objects) {
             sorted_keys.push_back(key);
         }
         std::sort(sorted_keys.begin(), sorted_keys.end());
 
-        packer.pack_array(2 + sorted_keys.size() * 2);
+        packer.pack_array(2 + sorted_keys.size() * 2 + 1);
         packer.pack(segment->enable_offloading);
         packer.pack(static_cast<uint64_t>(sorted_keys.size()));
 
@@ -692,6 +700,11 @@ SegmentSerializer::Serialize() {
             packer.pack(task.key);
             packer.pack(task.size);
         }
+
+        // Tail field: RPC endpoint used by direct_ssd Phase C placement.
+        // Without it, a master restored from snapshot would hand out
+        // LOCAL_DISK descriptors with an empty transport_endpoint.
+        packer.pack(segment->rpc_endpoint);
     }
 
     // Compress entire data
@@ -1086,6 +1099,25 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
                         OffloadTaskItem{.tenant_id = std::move(tenant_id),
                                         .key = std::move(user_key),
                                         .size = task_obj.as<int64_t>()};
+                }
+            }
+
+            // Tail field (added with direct_ssd): rpc_endpoint. Snapshots
+            // written before it existed have array size 2 + count * 2;
+            // detect the extra element by length. Missing field leaves
+            // rpc_endpoint empty — same as the pre-fix behavior.
+            const size_t endpoint_idx = 2 + count * 2;
+            if (endpoint_idx < client_value.via.array.size) {
+                const auto& endpoint_obj =
+                    client_value.via.array.ptr[endpoint_idx];
+                if (endpoint_obj.type == msgpack::type::STR) {
+                    segment->rpc_endpoint.assign(endpoint_obj.via.str.ptr,
+                                                 endpoint_obj.via.str.size);
+                } else {
+                    return tl::unexpected(SerializationError(
+                        ErrorCode::DESERIALIZE_FAIL,
+                        "deserialize local_disk_segments rpc_endpoint is "
+                        "not string"));
                 }
             }
 

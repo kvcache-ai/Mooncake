@@ -40,6 +40,11 @@ class DistributedStorageBackend : public StorageBackendInterface {
         std::function<void(const std::vector<std::string>& evicted_keys)>
             eviction_handler = nullptr) override;
 
+    tl::expected<std::pair<StorageObjectMetadata, std::vector<std::string>>,
+                 ErrorCode>
+    DirectWrite(const std::string& key,
+                const std::vector<Slice>& slices) override;
+
     tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batched_slices) override;
 

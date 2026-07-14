@@ -1149,13 +1149,15 @@ WrappedMasterService::QuerySegmentForAdmin(const std::string& segment) {
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::MountLocalDiskSegment(
-    const UUID& client_id, bool enable_offloading) {
+    const UUID& client_id, bool enable_offloading,
+    const std::string& rpc_endpoint) {
     ScopedVLogTimer timer(1, "MountLocalDiskSegment");
     timer.LogRequest("action=mount_local_disk_segment");
     LOG(INFO) << "Mount local disk segment with client id is : " << client_id
-              << ", enable offloading is: " << enable_offloading;
-    auto result =
-        master_service_.MountLocalDiskSegment(client_id, enable_offloading);
+              << ", enable offloading is: " << enable_offloading
+              << ", rpc_endpoint=" << rpc_endpoint;
+    auto result = master_service_.MountLocalDiskSegment(
+        client_id, enable_offloading, rpc_endpoint);
 
     timer.LogResponseExpected(result);
     return result;

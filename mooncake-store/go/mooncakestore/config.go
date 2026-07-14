@@ -19,6 +19,7 @@ type ReplicateConfig struct {
 	ReplicaNum        int
 	WithSoftPin       bool
 	WithHardPin       bool
+	DirectSsd         *bool // write directly to SSD, bypassing memory; nil = use client default
 	PreferredSegments []string
 }
 
@@ -28,5 +29,6 @@ func DefaultReplicateConfig() ReplicateConfig {
 		ReplicaNum:  1,
 		WithSoftPin: false,
 		WithHardPin: false,
+		DirectSsd:   nil,
 	}
 }

@@ -1088,6 +1088,41 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
     return static_cast<int64_t>(keys.size());
 }
 
+tl::expected<std::pair<StorageObjectMetadata, std::vector<std::string>>,
+             ErrorCode>
+StorageBackendAdaptor::DirectWrite(const std::string& key,
+                                   const std::vector<Slice>& slices) {
+    // Delegate to BatchOffload with single-key map.
+    std::unordered_map<std::string, std::vector<Slice>> batch_object;
+    batch_object[key] = slices;
+
+    StorageObjectMetadata result_meta;
+    std::vector<std::string> result_evicted;
+
+    auto complete_handler =
+        [&result_meta](
+            const std::vector<std::string>& /*keys*/,
+            std::vector<StorageObjectMetadata>& metadatas) -> ErrorCode {
+        if (!metadatas.empty()) {
+            result_meta = metadatas[0];
+        }
+        return ErrorCode::OK;
+    };
+
+    auto eviction_handler =
+        [&result_evicted](const std::vector<std::string>& evicted_keys) {
+            result_evicted = evicted_keys;
+        };
+
+    auto offload_result =
+        BatchOffload(batch_object, complete_handler, eviction_handler);
+    if (!offload_result) {
+        return tl::make_unexpected(offload_result.error());
+    }
+
+    return std::make_pair(result_meta, result_evicted);
+}
+
 tl::expected<bool, ErrorCode> StorageBackendAdaptor::IsExist(
     const std::string& key) {
     auto path = ResolvePathFromKey(key, file_storage_config_.storage_filepath,
@@ -1316,6 +1351,19 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     const int64_t required_size = bucket->data_size + bucket->meta_size;
     PendingEviction pending = PrepareEviction(required_size);
 
+    // Keys of the current batch may route to an evicted bucket (direct_ssd
+    // overwrite of an existing key). The commit below re-points them to the
+    // new bucket, so they must NOT be reported as evicted — the master would
+    // otherwise erase the very replica this write is fulfilling.
+    if (!pending.keys.empty()) {
+        pending.keys.erase(
+            std::remove_if(pending.keys.begin(), pending.keys.end(),
+                           [&batch_object](const std::string& evicted_key) {
+                               return batch_object.count(evicted_key) > 0;
+                           }),
+            pending.keys.end());
+    }
+
     // Notify master about evicted keys BEFORE touching the files.
     if (eviction_handler && !pending.keys.empty()) {
         eviction_handler(pending.keys);
@@ -1340,34 +1388,24 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
         }
     }
 
-    // Commit to metadata maps under exclusive lock.
-    // Check for duplicate keys and rollback if any found.
+    // Commit to metadata maps under exclusive lock. A key that already
+    // exists (direct_ssd overwrite: in-place upsert, re-put after remove,
+    // write retry) is re-pointed to this newer bucket; the stale entry in
+    // its old bucket becomes unreachable and its space is reclaimed when
+    // that bucket is evicted (PrepareEviction only erases/reports keys
+    // still routed to the evicted bucket).
     {
         SharedMutexLocker lock(&mutex_);
 
-        // Pre-check for duplicates before modifying any state
-        for (const auto& key : bucket->keys) {
-            if (object_bucket_map_.find(key) != object_bucket_map_.end()) {
-                LOG(WARNING)
-                    << "Duplicate key detected in BatchOffload: " << key
-                    << ", bucket_id=" << bucket_id
-                    << ". Returning OBJECT_ALREADY_EXISTS.";
-                lock.unlock();
-                CleanupOrphanedBucket(bucket_id);
-                return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
-            }
-        }
-
-        // No duplicates found, safe to commit
         total_size_ += bucket->data_size + bucket->meta_size;
         object_bucket_map_.reserve(object_bucket_map_.size() +
                                    bucket->keys.size());
         for (size_t i = 0; i < bucket->keys.size(); ++i) {
-            auto [it, inserted] = object_bucket_map_.insert(
-                {bucket->keys[i], std::move(metadatas[i])});
+            auto [it, inserted] = object_bucket_map_.insert_or_assign(
+                bucket->keys[i], std::move(metadatas[i]));
             if (!inserted) {
-                LOG(ERROR) << "Unexpected duplicate key after pre-check: "
-                           << bucket->keys[i] << ", bucket_id=" << bucket_id;
+                VLOG(1) << "Overwriting existing key in BatchOffload: "
+                        << bucket->keys[i] << ", new bucket_id=" << bucket_id;
             }
         }
         buckets_.emplace(bucket_id, std::move(bucket));
@@ -1375,6 +1413,41 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     }
 
     return bucket_id;
+}
+
+tl::expected<std::pair<StorageObjectMetadata, std::vector<std::string>>,
+             ErrorCode>
+BucketStorageBackend::DirectWrite(const std::string& key,
+                                  const std::vector<Slice>& slices) {
+    // Wrap single-key write as a one-element BatchOffload.
+    std::unordered_map<std::string, std::vector<Slice>> batch_object;
+    batch_object[key] = slices;
+
+    StorageObjectMetadata result_meta;
+    std::vector<std::string> result_evicted;
+
+    auto complete_handler =
+        [&result_meta](
+            const std::vector<std::string>& /*keys*/,
+            std::vector<StorageObjectMetadata>& metadatas) -> ErrorCode {
+        if (!metadatas.empty()) {
+            result_meta = metadatas[0];
+        }
+        return ErrorCode::OK;
+    };
+
+    auto eviction_handler =
+        [&result_evicted](const std::vector<std::string>& evicted_keys) {
+            result_evicted = evicted_keys;
+        };
+
+    auto offload_result =
+        BatchOffload(batch_object, complete_handler, eviction_handler);
+    if (!offload_result) {
+        return tl::make_unexpected(offload_result.error());
+    }
+
+    return std::make_pair(result_meta, result_evicted);
 }
 
 tl::expected<void, ErrorCode> BucketStorageBackend::BatchQuery(
@@ -1659,13 +1732,22 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                 total_size_ += metadata_it->second->data_size +
                                metadata_it->second->meta_size;
                 for (size_t i = 0; i < metadata_it->second->keys.size(); i++) {
-                    object_bucket_map_.emplace(
-                        metadata_it->second->keys[i],
-                        StorageObjectMetadata{
-                            metadata_it->first,
-                            metadata_it->second->metadatas[i].offset,
-                            metadata_it->second->metadatas[i].key_size,
-                            metadata_it->second->metadatas[i].data_size, ""});
+                    StorageObjectMetadata object_metadata{
+                        metadata_it->first,
+                        metadata_it->second->metadatas[i].offset,
+                        metadata_it->second->metadatas[i].key_size,
+                        metadata_it->second->metadatas[i].data_size, ""};
+                    auto [obj_it, inserted] = object_bucket_map_.try_emplace(
+                        metadata_it->second->keys[i], object_metadata);
+                    if (!inserted &&
+                        metadata_it->first > obj_it->second.bucket_id) {
+                        // Duplicate key across buckets: a direct_ssd
+                        // overwrite happened before the older bucket was
+                        // evicted. Bucket ids are monotonically increasing
+                        // timestamps, so the newest bucket holds the live
+                        // copy.
+                        obj_it->second = object_metadata;
+                    }
                 }
             }
         }
@@ -2297,22 +2379,24 @@ BucketStorageBackend::PendingEviction BucketStorageBackend::PrepareEviction(
             std::move(evict_it->second);
         buckets_.erase(evict_it);
 
-        // Remove all keys belonging to this bucket from the object map.
+        // Remove keys still routed to this bucket from the object map and
+        // report only those to the master. Keys overwritten by a newer
+        // bucket (direct_ssd) stay live in that bucket and must not be
+        // reported as evicted.
         for (const auto& key : evict_meta->keys) {
             auto obj_it = object_bucket_map_.find(key);
             if (obj_it != object_bucket_map_.end() &&
                 obj_it->second.bucket_id == evict_id) {
-                total_size_ -=
-                    obj_it->second.data_size + obj_it->second.key_size;
                 object_bucket_map_.erase(obj_it);
+                result.keys.push_back(key);
             }
         }
-        total_size_ -= evict_meta->meta_size;
+        // Physical accounting: FinalizeEviction deletes the whole bucket's
+        // files — including entries already overwritten by newer buckets —
+        // so subtract the bucket's full size (equals the amount added at
+        // BatchOffload commit).
+        total_size_ -= evict_meta->data_size + evict_meta->meta_size;
 
-        // Collect for notification and file deletion.
-        for (const auto& key : evict_meta->keys) {
-            result.keys.push_back(key);
-        }
         accumulated_freed_space +=
             static_cast<uint64_t>(evict_meta->data_size) +
             static_cast<uint64_t>(evict_meta->meta_size);
@@ -3022,6 +3106,40 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
     }
 
     return static_cast<int64_t>(keys.size());
+}
+
+tl::expected<std::pair<StorageObjectMetadata, std::vector<std::string>>,
+             ErrorCode>
+OffsetAllocatorStorageBackend::DirectWrite(const std::string& key,
+                                           const std::vector<Slice>& slices) {
+    std::unordered_map<std::string, std::vector<Slice>> batch_object;
+    batch_object[key] = slices;
+
+    StorageObjectMetadata result_meta;
+    std::vector<std::string> result_evicted;
+
+    auto complete_handler =
+        [&result_meta](
+            const std::vector<std::string>& /*keys*/,
+            std::vector<StorageObjectMetadata>& metadatas) -> ErrorCode {
+        if (!metadatas.empty()) {
+            result_meta = metadatas[0];
+        }
+        return ErrorCode::OK;
+    };
+
+    auto eviction_handler =
+        [&result_evicted](const std::vector<std::string>& evicted_keys) {
+            result_evicted = evicted_keys;
+        };
+
+    auto offload_result =
+        BatchOffload(batch_object, complete_handler, eviction_handler);
+    if (!offload_result) {
+        return tl::make_unexpected(offload_result.error());
+    }
+
+    return std::make_pair(result_meta, result_evicted);
 }
 
 //-----------------------------------------------------------------------------

@@ -163,6 +163,10 @@ class ClientRequester {
     void release_offload_buffer(const std::string &client_addr,
                                 uint64_t batch_id);
 
+    tl::expected<void, ErrorCode> write_offload_from_engine(
+        const std::string &client_addr, const std::string &engine_addr,
+        uint64_t buffer_addr, uint64_t size, const std::string &key);
+
    private:
     /**
      * @brief A batch of allocated memory buffers, tracking both handles and
@@ -227,7 +231,8 @@ class PyClient {
         const std::string &ssd_offload_path = "",
         const std::string &tenant_id = "default",
         bool enable_client_http_server = false,
-        int client_http_port = DEFAULT_CLIENT_HTTP_PORT) = 0;
+        int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
+        bool direct_ssd = false) = 0;
 
     virtual int setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                             const std::string &server_address,

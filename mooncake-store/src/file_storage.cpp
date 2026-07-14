@@ -258,7 +258,7 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
         MutexLocker locker(&offloading_mutex_);
         enable_offloading_ = enable_offloading_result.value();
         auto mount_file_storage_result =
-            client_->MountLocalDiskSegment(enable_offloading_);
+            client_->MountLocalDiskSegment(enable_offloading_, local_rpc_addr_);
         if (!mount_file_storage_result) {
             LOG(ERROR) << "Failed to mount file storage: "
                        << mount_file_storage_result.error();
@@ -661,8 +661,8 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                              << "SEGMENT_NOT_FOUND, attempting to "
                              << "re-register local disk segment and "
                              << "re-register object metadata";
-                auto remount_result =
-                    client_->MountLocalDiskSegment(enable_offloading_);
+                auto remount_result = client_->MountLocalDiskSegment(
+                    enable_offloading_, local_rpc_addr_);
                 if (remount_result) {
                     heartbeat_result = client_->OffloadObjectHeartbeat(
                         enable_offloading_, offloading_objects);
@@ -1056,6 +1056,43 @@ bool FileStorage::ReleaseBuffer(uint64_t batch_id) {
     VLOG(1) << "batch_id " << batch_id
             << " not found (may have been GC'd already)";
     return false;
+}
+
+tl::expected<std::pair<StorageObjectMetadata, std::vector<std::string>>,
+             ErrorCode>
+FileStorage::DirectWrite(const std::string& key,
+                         const std::vector<Slice>& slices) {
+    auto result = storage_backend_->DirectWrite(key, slices);
+    if (!result) {
+        return tl::make_unexpected(result.error());
+    }
+    auto& [metadata, evicted_keys] = result.value();
+    metadata.transport_endpoint = local_rpc_addr_;
+
+    // Notify master about any keys evicted during the write.
+    if (!evicted_keys.empty()) {
+        std::unordered_map<std::string, std::vector<std::string>>
+            keys_by_tenant;
+        for (const auto& storage_key : evicted_keys) {
+            auto [tenant_id, user_key] =
+                ParseTenantScopedStorageKey(storage_key);
+            keys_by_tenant[tenant_id].push_back(user_key);
+        }
+        for (const auto& [tenant_id, keys] : keys_by_tenant) {
+            auto results = client_->BatchEvictDiskReplica(
+                keys, tenant_id, ReplicaType::LOCAL_DISK);
+            for (size_t i = 0; i < results.size(); ++i) {
+                if (!results[i]) {
+                    LOG(WARNING)
+                        << "DirectWrite: failed to notify master about evicted "
+                           "key: "
+                        << keys[i] << ", error: " << results[i].error();
+                }
+            }
+        }
+    }
+
+    return std::make_pair(metadata, evicted_keys);
 }
 
 tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
