@@ -66,8 +66,7 @@ add_store_test(master_service_tenant_quota_test
                master_service_tenant_quota_test.cpp)
 add_store_test(batch_remove_test batch_remove_test.cpp)
 add_store_test(master_service_ssd_test master_service_ssd_test.cpp)
-add_store_test(offload_on_evict_test
-               master_service/offload/on_evict_test.cpp)
+add_store_test(offload_on_evict_test master_service/offload/on_evict_test.cpp)
 add_store_test(offload_policy_test master_service/offload/policy_test.cpp)
 add_store_test(promotion_on_hit_test promotion_on_hit_test.cpp)
 add_store_test(file_storage_promotion_test file_storage_promotion_test.cpp)
@@ -123,15 +122,14 @@ add_store_test(file_storage_test file_storage_test.cpp)
 add_store_test(task_manager_test task_manager_test.cpp)
 add_store_test(task_executor_test task_executor_test.cpp)
 add_store_test(task_integration_test task_integration_test.cpp)
-add_store_test(dummy_client_get_buffer_test
-               dummy_client/get_buffer_functional_test.cpp
-               dummy_client/main.cpp)
+add_store_test(
+  dummy_client_get_buffer_test dummy_client/get_buffer_functional_test.cpp
+  dummy_client/main.cpp)
 add_store_test(dummy_client_cache_invalidation_test
-               dummy_client/cache_invalidation_test.cpp
-               dummy_client/main.cpp)
-add_store_test(dummy_client_get_buffer_performance_test
-               dummy_client/get_buffer_performance_test.cpp
-               dummy_client/main.cpp)
+               dummy_client/cache_invalidation_test.cpp dummy_client/main.cpp)
+add_store_test(
+  dummy_client_get_buffer_performance_test
+  dummy_client/get_buffer_performance_test.cpp dummy_client/main.cpp)
 add_store_test(uds_transport_test uds_transport_test.cpp)
 add_store_test(health_check_test health_check_test.cpp)
 add_store_test(http_metadata_server_test http_metadata_server_test.cpp)
