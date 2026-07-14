@@ -81,3 +81,8 @@ target_link_libraries(storage_backend_e2e_test PUBLIC
 )
 
 add_test(NAME storage_backend_e2e_test COMMAND storage_backend_e2e_test)
+
+add_executable(oplog_batch_e2e_test oplog_batch_e2e_test.cpp process_handler.cpp)
+target_link_libraries(oplog_batch_e2e_test PUBLIC glog gtest pthread)
+add_test(NAME oplog_batch_e2e_test COMMAND oplog_batch_e2e_test)
+set_tests_properties(oplog_batch_e2e_test PROPERTIES LABELS oplog_batch_smoke)
