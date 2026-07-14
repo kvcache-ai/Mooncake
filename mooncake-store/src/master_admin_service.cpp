@@ -1114,12 +1114,10 @@ void MasterAdminServer::HandleRemoveAll(coro_http::coro_http_request& req,
     }
 
     WithActiveService(resp, [&](auto service) {
-        long count;
-        if (tenant_id.empty()) {
-            count = service->RemoveAll(force);
-        } else {
-            count = service->RemoveAll(force, tenant_id);
-        }
+        // Empty tenant_id => clear all tenants; pass "" so WrappedMasterService
+        // dispatches to the global (broadcast) RemoveAll, not the "default"
+        // tenant-scoped one.
+        long count = service->RemoveAll(force, tenant_id);
         WriteJsonResponse(resp, coro_http::status_type::ok,
                           HttpRemoveAllResponse{.removed_count = count});
     });

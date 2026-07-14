@@ -641,9 +641,15 @@ tl::expected<long, ErrorCode> WrappedMasterService::RemoveByRegex(
 
 long WrappedMasterService::RemoveAll(bool force, const std::string& tenant_id) {
     ScopedVLogTimer timer(1, "RemoveAll");
-    timer.LogRequest("action=remove_all_objects, force=", force);
+    timer.LogRequest("action=remove_all_objects, force=", force,
+                     ", tenant_id=", tenant_id);
     MasterMetricManager::instance().inc_remove_all_requests();
-    long result = master_service_.RemoveAll(tenant_id, force);
+    // Empty tenant_id => clear all tenants (broadcast SSD signal to every
+    // client, overlapping with metadata deletion). A specific tenant_id =>
+    // scoped clear (only signal clients owning that tenant's disk replicas).
+    long result = tenant_id.empty()
+                      ? master_service_.RemoveAll(force)
+                      : master_service_.RemoveAll(tenant_id, force);
     timer.LogResponse("items_removed=", result);
     return result;
 }
