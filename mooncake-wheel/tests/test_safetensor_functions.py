@@ -636,6 +636,52 @@ class TestSafetensorFunctions(unittest.TestCase):
             time.sleep(default_kv_lease_ttl / 1000)
             self.store.remove(key)
 
+    def test_save_tensor_invalid_artifact_kind(self):
+        """Unsupported artifact_kind should map to INVALID_PARAMS, not raise."""
+        import torch
+        from mooncake.store_file_io import INVALID_PARAMS
+
+        tensor = torch.tensor([1.0], dtype=torch.float32)
+        key_suffix = uuid.uuid4().hex
+        key = f"test_save_tensor_bad_kind_{key_suffix}"
+
+        with tempfile.NamedTemporaryFile(
+            suffix=".safetensors", delete=False
+        ) as temp_file:
+            temp_filename = temp_file.name
+
+        try:
+            result = self.store.save_tensor(
+                key,
+                tensor,
+                file_name=temp_filename,
+                artifact_kind="not-a-real-kind",
+            )
+            self.assertEqual(result, INVALID_PARAMS)
+        finally:
+            if os.path.exists(temp_filename):
+                os.remove(temp_filename)
+            time.sleep(default_kv_lease_ttl / 1000)
+            self.store.remove(key)
+
+    def test_load_tensor_invalid_artifact_kind(self):
+        """Unsupported artifact_kind on load should return None, not raise."""
+        with tempfile.NamedTemporaryFile(
+            suffix=".safetensors", delete=False
+        ) as temp_file:
+            temp_filename = temp_file.name
+
+        try:
+            loaded = self.store.load_tensor(
+                "unused_key",
+                file_name=temp_filename,
+                artifact_kind="not-a-real-kind",
+            )
+            self.assertIsNone(loaded)
+        finally:
+            if os.path.exists(temp_filename):
+                os.remove(temp_filename)
+
 
 if __name__ == "__main__":
     unittest.main()

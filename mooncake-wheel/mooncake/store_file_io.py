@@ -16,17 +16,9 @@ FILE_NOT_FOUND = -1100
 PERSISTENT_FAIL = -1503
 
 _LOCAL_FILESYSTEM_SCHEMES = {"file", ""}
-_OBJECT_STORE_SCHEMES = {
-    "s3",
-    "gs",
-    "gcs",
-    "abfs",
-    "adl",
-    "oss",
-    "http",
-    "https",
-    "ftp",
-}
+
+# Lazily cached: whether torch.load accepts weights_only=.
+_TORCH_LOAD_SUPPORTS_WEIGHTS_ONLY: bool | None = None
 
 
 def _normalize_format(format_name: str, file_name: str) -> str:
@@ -149,29 +141,6 @@ def _ensure_parent_dir(
         LOGGER.warning("Failed to create directory %s: %s", parent_dir, exc)
 
 
-def _write_bytes(
-    file_name: os.PathLike[str] | str,
-    payload: bytes,
-    filesystem: str | None,
-    storage_options: dict[str, Any] | None,
-) -> None:
-    fs, path = _open_fs_target(file_name, filesystem, storage_options)
-    _ensure_parent_dir(fs, path, file_name=file_name, filesystem=filesystem)
-
-    with fs.open(path, "wb") as handle:
-        handle.write(payload)
-
-
-def _read_bytes(
-    file_name: os.PathLike[str] | str,
-    filesystem: str | None,
-    storage_options: dict[str, Any] | None,
-) -> bytes:
-    fs, path = _open_fs_target(file_name, filesystem, storage_options)
-    with fs.open(path, "rb") as handle:
-        return handle.read()
-
-
 def _pick_tensor_entry(
     loaded_tensors: dict[str, Any],
     preferred_name: str | None,
@@ -223,7 +192,12 @@ def _coerce_loaded_tensor(loaded: Any) -> Any:
     )
 
 
-def _torch_load_from_handle(handle, map_location: Any, weights_only: bool) -> Any:
+def _torch_load_supports_weights_only() -> bool:
+    """Return whether the installed torch.load accepts weights_only=."""
+    global _TORCH_LOAD_SUPPORTS_WEIGHTS_ONLY
+    if _TORCH_LOAD_SUPPORTS_WEIGHTS_ONLY is not None:
+        return _TORCH_LOAD_SUPPORTS_WEIGHTS_ONLY
+
     import inspect
 
     try:
@@ -234,8 +208,22 @@ def _torch_load_from_handle(handle, map_location: Any, weights_only: bool) -> An
             "Install with: pip install torch"
         ) from exc
 
-    load_params = inspect.signature(torch.load).parameters
-    if weights_only and "weights_only" not in load_params:
+    _TORCH_LOAD_SUPPORTS_WEIGHTS_ONLY = (
+        "weights_only" in inspect.signature(torch.load).parameters
+    )
+    return _TORCH_LOAD_SUPPORTS_WEIGHTS_ONLY
+
+
+def _torch_load_from_handle(handle, map_location: Any, weights_only: bool) -> Any:
+    try:
+        import torch
+    except ImportError as exc:
+        raise ValueError(
+            "torch package is required for the 'torch' format. "
+            "Install with: pip install torch"
+        ) from exc
+
+    if weights_only and not _torch_load_supports_weights_only():
         raise ValueError(
             "Installed torch does not support torch.load(weights_only=...); "
             "upgrade to torch >= 2.0 or use format='safetensors'."
@@ -311,7 +299,7 @@ def _save_tensor_to_file(
                 torch.save(tensor, handle)
         else:
             # safetensors.torch.save() returns bytes; write them straight
-            # to the open handle to avoid an extra copy through _write_bytes.
+            # to the open handle to avoid an extra intermediate copy.
             try:
                 from safetensors.torch import save as safetensors_save
             except ImportError:
@@ -473,7 +461,16 @@ def _save_tensor(
             return INVALID_PARAMS
         return 0
 
-    kind = _normalize_artifact_kind(artifact_kind)
+    try:
+        kind = _normalize_artifact_kind(artifact_kind)
+    except ValueError:
+        LOGGER.exception(
+            "Invalid artifact_kind %r while saving tensor for key %s",
+            artifact_kind,
+            key,
+        )
+        return INVALID_PARAMS
+
     if kind == "safetensor":
         return self.save_tensor_to_safetensor(
             key,
@@ -517,7 +514,16 @@ def _load_tensor(
 ):
     """General load API: read from file into Store or fetch from Store."""
     if file_name is not None:
-        kind = _normalize_artifact_kind(artifact_kind)
+        try:
+            kind = _normalize_artifact_kind(artifact_kind)
+        except ValueError:
+            LOGGER.exception(
+                "Invalid artifact_kind %r while loading tensor from %s",
+                artifact_kind,
+                file_name,
+            )
+            return None
+
         if kind == "safetensor":
             return self.load_tensor_from_safetensor(
                 key=key,
@@ -559,15 +565,24 @@ def _load_tensor(
 def patch_store_file_io_support() -> None:
     try:
         store_module = import_module("mooncake.store")
-    except (ImportError, OSError):
+    except (ImportError, OSError) as exc:
         # ImportError / OSError covers cases where the native extension
         # exists but fails to load (e.g. missing shared libraries).
-        # Returning here keeps the file-IO patch best-effort without
-        # breaking the package import.
+        # Keep the package importable; callers can check capability with
+        # hasattr(MooncakeDistributedStore, "save_tensor").
+        LOGGER.warning(
+            "Mooncake Store file I/O helpers were not patched because "
+            "mooncake.store could not be imported: %s",
+            exc,
+        )
         return
 
     store_cls = getattr(store_module, "MooncakeDistributedStore", None)
     if store_cls is None:
+        LOGGER.warning(
+            "Mooncake Store file I/O helpers were not patched because "
+            "MooncakeDistributedStore is missing from mooncake.store"
+        )
         return
 
     if getattr(store_cls, "_mooncake_file_io_patched", False):

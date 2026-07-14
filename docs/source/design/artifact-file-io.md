@@ -193,9 +193,18 @@ silently picking an arbitrary tensor. Single-entry files still accept a store-ke
 mismatch and use the only tensor (with a warning).
 
 **Torch format safety:** `format="torch"` is blocked for remote schemes such as
-`s3://` unless callers pass `allow_unsafe_remote_torch_load=True` for a trusted
-source. Torch checkpoints must deserialize to a single `torch.Tensor`; dict or
-state-dict payloads are rejected.
+`s3://` unless callers pass `allow_unsafe_remote_torch_load=True`. That flag is
+intended only for fully trusted internal storage backends; remote `torch.load`
+still uses pickle semantics and can execute arbitrary code. Prefer
+`format="safetensors"` for any remote artifact. Torch checkpoints must
+deserialize to a single `torch.Tensor`; dict or state-dict payloads are
+rejected.
+
+**Patch availability:** `import mooncake` attempts to attach these methods to
+`MooncakeDistributedStore`. If the native `mooncake.store` extension cannot be
+loaded, the patch is skipped (with a warning) so the package remains
+importable. Callers can check capability with
+`hasattr(MooncakeDistributedStore, "save_tensor")`.
 
 ## Testing
 

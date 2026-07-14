@@ -2715,8 +2715,9 @@ def load_tensor_from_file(
 - `weights_only` (bool): Passed to `torch.load` (default `True`). Requires
   torch >= 2.0; load fails if the installed torch cannot honor the flag.
 - `allow_unsafe_remote_torch_load` (bool): When `False` (default), `format="torch"`
-  is rejected for remote schemes such as `s3://`. Use `format="safetensors"` for
-  remote artifacts instead.
+  is rejected for remote schemes such as `s3://`. Setting this to `True` enables
+  remote `torch.load` and must only be used with fully trusted internal backends;
+  prefer `format="safetensors"` for remote artifacts.
 
 **Security notes:**
 
