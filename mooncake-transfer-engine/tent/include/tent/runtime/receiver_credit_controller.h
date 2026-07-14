@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -37,7 +38,8 @@ struct AdaptiveDispatchSnapshot {
 class AdaptiveCreditDispatchLimiter {
    public:
     explicit AdaptiveCreditDispatchLimiter(
-        const ReceiverCreditRuntimeConfig& config);
+        const ReceiverCreditRuntimeConfig& config,
+        size_t hard_max_owners = std::numeric_limits<size_t>::max());
 
     void observe(std::chrono::nanoseconds elapsed, bool rpc_ok,
                  size_t owners_at_start);
@@ -72,7 +74,8 @@ class ReceiverCreditPullController
         const ReceiverCreditRuntimeConfig& config, uint64_t sender_peer,
         std::shared_ptr<CreditPeerContextTable> contexts,
         std::shared_ptr<SenderCreditLedger> ledger,
-        std::shared_ptr<ReceiverCreditPullController>& controller);
+        std::shared_ptr<ReceiverCreditPullController>& controller,
+        size_t dispatch_owner_ceiling = std::numeric_limits<size_t>::max());
 
     ~ReceiverCreditPullController();
 
@@ -121,7 +124,8 @@ class ReceiverCreditPullController
     ReceiverCreditPullController(
         ReceiverCreditRuntimeConfig config, uint64_t sender_peer,
         std::shared_ptr<CreditPeerContextTable> contexts,
-        std::shared_ptr<SenderCreditLedger> ledger);
+        std::shared_ptr<SenderCreditLedger> ledger,
+        size_t dispatch_owner_ceiling);
 
     static Status normalize(
         const CreditCharge& charge,

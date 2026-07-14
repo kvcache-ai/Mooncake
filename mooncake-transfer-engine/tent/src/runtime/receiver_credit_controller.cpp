@@ -32,15 +32,19 @@ bool sameGeneration(const CreditPeerContextSnapshot& context,
 }  // namespace
 
 AdaptiveCreditDispatchLimiter::AdaptiveCreditDispatchLimiter(
-    const ReceiverCreditRuntimeConfig& config)
+    const ReceiverCreditRuntimeConfig& config, size_t hard_max_owners)
     : enabled_(config.adaptive_dispatch_enabled),
-      min_owners_(config.adaptive_dispatch_min_owners),
+      min_owners_(
+          std::min(config.adaptive_dispatch_min_owners, hard_max_owners)),
       slow_rtt_ns_(static_cast<uint64_t>(config.adaptive_dispatch_slow_rtt_us) *
                    1000),
       healthy_pulls_per_increase_(config.adaptive_dispatch_healthy_pulls),
-      current_owners_(enabled_ ? config.adaptive_dispatch_initial_owners
-                               : std::numeric_limits<size_t>::max()),
-      learned_ceiling_(enabled_ ? config.adaptive_dispatch_max_owners
+      current_owners_(enabled_
+                          ? std::min(config.adaptive_dispatch_initial_owners,
+                                     hard_max_owners)
+                          : std::numeric_limits<size_t>::max()),
+      learned_ceiling_(enabled_ ? std::min(config.adaptive_dispatch_max_owners,
+                                           hard_max_owners)
                                 : std::numeric_limits<size_t>::max()) {}
 
 void AdaptiveCreditDispatchLimiter::observe(std::chrono::nanoseconds elapsed,
@@ -107,13 +111,13 @@ size_t ReceiverCreditPullController::PeerKeyHash::operator()(
 ReceiverCreditPullController::ReceiverCreditPullController(
     ReceiverCreditRuntimeConfig config, uint64_t sender_peer,
     std::shared_ptr<CreditPeerContextTable> contexts,
-    std::shared_ptr<SenderCreditLedger> ledger)
+    std::shared_ptr<SenderCreditLedger> ledger, size_t dispatch_owner_ceiling)
     : config_(std::move(config)),
       sender_peer_(sender_peer),
       contexts_(std::move(contexts)),
       ledger_(std::move(ledger)),
       rpc_agent_(std::make_shared<CoroRpcAgent>()),
-      dispatch_limiter_(config_) {}
+      dispatch_limiter_(config_, dispatch_owner_ceiling) {}
 
 ReceiverCreditPullController::~ReceiverCreditPullController() { stop(); }
 
@@ -121,14 +125,17 @@ Status ReceiverCreditPullController::create(
     const ReceiverCreditRuntimeConfig& config, uint64_t sender_peer,
     std::shared_ptr<CreditPeerContextTable> contexts,
     std::shared_ptr<SenderCreditLedger> ledger,
-    std::shared_ptr<ReceiverCreditPullController>& controller) {
+    std::shared_ptr<ReceiverCreditPullController>& controller,
+    size_t dispatch_owner_ceiling) {
     if (config.mode == CreditRolloutMode::Disabled || sender_peer == 0 ||
-        !contexts || !ledger || config.max_peers == 0)
+        !contexts || !ledger || config.max_peers == 0 ||
+        dispatch_owner_ceiling == 0)
         return Status::InvalidArgument(
             "invalid receiver credit pull controller configuration" LOC_MARK);
     auto next = std::shared_ptr<ReceiverCreditPullController>(
-        new ReceiverCreditPullController(
-            config, sender_peer, std::move(contexts), std::move(ledger)));
+        new ReceiverCreditPullController(config, sender_peer,
+                                         std::move(contexts), std::move(ledger),
+                                         dispatch_owner_ceiling));
     controller = std::move(next);
     return Status::OK();
 }

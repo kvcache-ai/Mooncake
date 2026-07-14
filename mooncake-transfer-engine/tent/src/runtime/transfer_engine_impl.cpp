@@ -407,7 +407,8 @@ Status TransferEngineImpl::construct() {
         CHECK_STATUS(ReceiverCreditPullController::create(
             receiver_credit_config_, local_sender_peer_,
             receiver_credit_contexts_, receiver_credit_ledger_,
-            receiver_credit_pull_controller_));
+            receiver_credit_pull_controller_,
+            runtime_queue_config_.max_dispatch_owners));
     }
     if (!hostname_.empty())
         CHECK_STATUS(checkLocalIpAddress(hostname_, ipv6_));

@@ -189,5 +189,16 @@ TEST(AdaptiveCreditDispatchLimiter, DisabledLeavesStaticWindowUnbounded) {
     EXPECT_EQ(limiter.snapshot().slow_or_failed_pulls, 0);
 }
 
+TEST(AdaptiveCreditDispatchLimiter, HonorsSmallerRuntimeQueueCeiling) {
+    auto config = controllerConfig(CreditRolloutMode::Required);
+    config.adaptive_dispatch_min_owners = 1;
+    config.adaptive_dispatch_initial_owners = 4;
+    config.adaptive_dispatch_max_owners = 8;
+    AdaptiveCreditDispatchLimiter limiter(config, 2);
+
+    EXPECT_EQ(limiter.ownerLimit(), 2);
+    EXPECT_EQ(limiter.snapshot().learned_ceiling, 2);
+}
+
 }  // namespace
 }  // namespace mooncake::tent
