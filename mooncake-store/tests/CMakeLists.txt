@@ -65,12 +65,20 @@ add_store_test(master_service_test master_service_test.cpp)
 add_store_test(master_service_tenant_quota_test
                master_service_tenant_quota_test.cpp)
 add_store_test(batch_remove_test batch_remove_test.cpp)
-add_store_test(master_service_ssd_test master_service_ssd_test.cpp)
+add_store_test(master_service_ssd_test master_service/ssd/lifecycle_test.cpp)
+add_store_test(master_service_ssd_expiration_test
+               master_service/ssd/expiration_test.cpp)
+add_store_test(master_service_ssd_placement_metrics_test
+               master_service/ssd/placement_metrics_test.cpp)
 add_store_test(offload_on_evict_test offload_on_evict_test.cpp)
 add_store_test(promotion_on_hit_test promotion_on_hit_test.cpp)
 add_store_test(file_storage_promotion_test file_storage_promotion_test.cpp)
 add_store_test(master_service_ssd_test_for_snapshot
-               ha/snapshot/master_service_ssd_test_for_snapshot.cpp)
+               ha/snapshot/master_service/ssd/lifecycle_test.cpp)
+add_store_test(master_service_ssd_snapshot_expiration_test
+               ha/snapshot/master_service/ssd/expiration_test.cpp)
+add_store_test(master_service_ssd_snapshot_metrics_test
+               ha/snapshot/master_service/ssd/metrics_test.cpp)
 add_store_test(master_service_promotion_test_for_snapshot
                ha/snapshot/master_service_promotion_test_for_snapshot.cpp)
 if(USE_NOF)
