@@ -53,6 +53,19 @@ DEFINE_string(
     tent_transport_hint, "unspec",
     "tent only: per-request transport_hint. "
     "unspec|rdma|tcp|shm|nvlink|gds|io_uring|mnnvl|ascend|sunrise_link");
+DEFINE_bool(enable_runtime_queue, false,
+            "tent only: route submissions through the runtime queue");
+DEFINE_string(
+    receiver_credit_mode, "disabled",
+    "tent only: receiver credit rollout mode: disabled|optional|required");
+DEFINE_uint64(receiver_credit_capacity_bytes, 1UL << 30,
+              "tent only: receiver-wide outstanding byte capacity");
+DEFINE_uint64(receiver_credit_capacity_slots, 1024,
+              "tent only: receiver-wide outstanding request capacity");
+DEFINE_uint64(receiver_credit_grant_bytes, 64UL << 20,
+              "tent only: maximum byte grant per pull");
+DEFINE_uint64(receiver_credit_grant_slots, 64,
+              "tent only: maximum request-slot grant per pull");
 
 namespace mooncake {
 namespace tent {
@@ -78,6 +91,12 @@ std::string XferBenchConfig::xport_type;
 std::string XferBenchConfig::backend;
 bool XferBenchConfig::notifi = false;
 std::string XferBenchConfig::tent_transport_hint;
+bool XferBenchConfig::enable_runtime_queue = false;
+std::string XferBenchConfig::receiver_credit_mode;
+size_t XferBenchConfig::receiver_credit_capacity_bytes = 0;
+size_t XferBenchConfig::receiver_credit_capacity_slots = 0;
+size_t XferBenchConfig::receiver_credit_grant_bytes = 0;
+size_t XferBenchConfig::receiver_credit_grant_slots = 0;
 
 int XferBenchConfig::local_gpu_id = 0;
 int XferBenchConfig::target_gpu_id = 0;
@@ -106,6 +125,12 @@ void XferBenchConfig::loadFromFlags() {
     backend = FLAGS_backend;
     notifi = FLAGS_notifi;
     tent_transport_hint = FLAGS_tent_transport_hint;
+    enable_runtime_queue = FLAGS_enable_runtime_queue;
+    receiver_credit_mode = FLAGS_receiver_credit_mode;
+    receiver_credit_capacity_bytes = FLAGS_receiver_credit_capacity_bytes;
+    receiver_credit_capacity_slots = FLAGS_receiver_credit_capacity_slots;
+    receiver_credit_grant_bytes = FLAGS_receiver_credit_grant_bytes;
+    receiver_credit_grant_slots = FLAGS_receiver_credit_grant_slots;
 
     local_gpu_id = FLAGS_local_gpu_id;
     target_gpu_id = FLAGS_target_gpu_id;

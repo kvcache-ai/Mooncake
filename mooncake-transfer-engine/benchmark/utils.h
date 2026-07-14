@@ -76,6 +76,12 @@ struct XferBenchConfig {
     static std::string backend;
     static bool notifi;
     static std::string tent_transport_hint;
+    static bool enable_runtime_queue;
+    static std::string receiver_credit_mode;
+    static size_t receiver_credit_capacity_bytes;
+    static size_t receiver_credit_capacity_slots;
+    static size_t receiver_credit_grant_bytes;
+    static size_t receiver_credit_grant_slots;
 
     static int local_gpu_id;
     static int target_gpu_id;

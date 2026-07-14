@@ -51,6 +51,23 @@ std::shared_ptr<Config> loadConfig() {
     config->set("metadata_type", XferBenchConfig::metadata_type);
     config->set("metadata_servers", XferBenchConfig::metadata_url_list);
     config->set("rpc_server_port", XferBenchConfig::rpc_server_port);
+    config->set("enable_runtime_queue", XferBenchConfig::enable_runtime_queue);
+    if (XferBenchConfig::receiver_credit_mode != "disabled") {
+        config->set("receiver_credit/mode",
+                    XferBenchConfig::receiver_credit_mode);
+        config->set("receiver_credit/capacity/data_bytes",
+                    XferBenchConfig::receiver_credit_capacity_bytes);
+        config->set("receiver_credit/capacity/request_slots",
+                    XferBenchConfig::receiver_credit_capacity_slots);
+        config->set("receiver_credit/grant_batch/data_bytes",
+                    XferBenchConfig::receiver_credit_grant_bytes);
+        config->set("receiver_credit/grant_batch/request_slots",
+                    XferBenchConfig::receiver_credit_grant_slots);
+        config->set("receiver_credit/control/freshness_ttl_ms", 60000U);
+        config->set("receiver_credit/control/retry_after_us", 100U);
+        config->set("receiver_credit/control/poll_interval_us", 100U);
+        config->set("receiver_credit/limits/max_peers", size_t{4096});
+    }
 
     // Configure transport types based on xport_type parameter
     if (!XferBenchConfig::xport_type.empty()) {
