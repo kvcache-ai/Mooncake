@@ -1051,8 +1051,17 @@ const Replica::Descriptor *RealClient::select_replica_for_read(
     const ReplicaSelectionContext context{
         client_->tenant_id(), key, local_hostname, "", requested_bytes,
         replica_selection_nonce_.fetch_add(1, std::memory_order_relaxed)};
+    const auto selection_start = std::chrono::steady_clock::now();
     const auto decision =
         replica_selector_->Select(replicas, local_endpoints, context);
+    if (decision.mode == ReplicaSelectionMode::SHADOW) {
+        const auto latency_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - selection_start)
+                .count();
+        client_->ObserveReplicaSelection(
+            decision, static_cast<uint64_t>(std::max<int64_t>(latency_ns, 0)));
+    }
     return ResolveReplica(replicas, decision.selected);
 }
 

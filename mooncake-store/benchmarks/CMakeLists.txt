@@ -23,6 +23,13 @@ add_executable(cached_replica_score_provider_bench
 target_link_libraries(cached_replica_score_provider_bench
                       PRIVATE mooncake_store pthread)
 
+# Measure the fixed-label SHADOW metrics observer separately from selector and
+# transport work, including hot-path heap allocations.
+add_executable(replica_selection_metric_bench
+               replica_selection_metric_bench.cpp)
+target_link_libraries(replica_selection_metric_bench
+                      PRIVATE mooncake_store pthread)
+
 # Add file interface benchmark executable
 add_executable(file_interface_bench file_interface_bench.cpp)
 target_link_libraries(file_interface_bench PRIVATE mooncake_store glog::glog)

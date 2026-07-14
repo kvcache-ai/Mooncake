@@ -16,6 +16,7 @@
 #include <ylt/metric/summary.hpp>
 #include "utils.h"
 #include "hybrid_metric.h"
+#include "replica_selector.h"
 
 namespace mooncake {
 
@@ -658,11 +659,29 @@ struct SsdMetric {
     }
 };
 
+// Low-cardinality observability for the opt-in replica-selection shadow path.
+// Labels are derived only from fixed enums. Request keys, tenants, endpoints,
+// and replica IDs must never be added here.
+struct ReplicaSelectionMetric {
+    explicit ReplicaSelectionMetric(
+        const std::map<std::string, std::string>& labels = {});
+
+    // Metrics are observational: allocation or serialization-library failures
+    // must not affect replica selection or the caller's I/O result.
+    void Observe(const ReplicaSelectionDecision& decision,
+                 uint64_t latency_ns) noexcept;
+    void serialize(std::string& str);
+
+    ylt::metric::hybrid_counter_3t decisions;
+    ylt::metric::hybrid_histogram_2t selector_latency_ns;
+};
+
 struct ClientMetric {
     TransferMetric transfer_metric;
     MasterClientMetric master_client_metric;
     TransferOperationMetric transfer_operation_metric;
     SsdMetric ssd_metric;
+    ReplicaSelectionMetric replica_selection_metric;
 
     /**
      * @brief Creates a ClientMetric instance based on environment variables

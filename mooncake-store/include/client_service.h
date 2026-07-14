@@ -551,6 +551,13 @@ class Client {
         }
     }
 
+    void ObserveReplicaSelection(const ReplicaSelectionDecision& decision,
+                                 uint64_t latency_ns) noexcept {
+        if (metrics_ != nullptr) {
+            metrics_->replica_selection_metric.Observe(decision, latency_ns);
+        }
+    }
+
     // For Prometheus-style metrics
     tl::expected<std::string, ErrorCode> SerializeMetrics() {
         if (metrics_ == nullptr) {

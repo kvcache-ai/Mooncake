@@ -11,6 +11,68 @@ namespace mooncake {
 
 namespace {
 
+const char* ReplicaSelectionModeMetricName(ReplicaSelectionMode mode) noexcept {
+    switch (mode) {
+        case ReplicaSelectionMode::LEGACY:
+            return "legacy";
+        case ReplicaSelectionMode::SHADOW:
+            return "shadow";
+        case ReplicaSelectionMode::ACTIVE:
+            return "active";
+    }
+    return "unknown";
+}
+
+const char* ReplicaSelectionOutcomeMetricName(
+    ReplicaSelectionOutcome outcome) noexcept {
+    switch (outcome) {
+        case ReplicaSelectionOutcome::LEGACY_MODE:
+            return "legacy_mode";
+        case ReplicaSelectionOutcome::LOCAL_FAST_PATH:
+            return "local_fast_path";
+        case ReplicaSelectionOutcome::NO_REMOTE_MEMORY:
+            return "no_remote_memory";
+        case ReplicaSelectionOutcome::SCORED_REMOTE_MEMORY:
+            return "scored_remote_memory";
+        case ReplicaSelectionOutcome::SCORED_STORAGE_FALLBACK:
+            return "scored_storage_fallback";
+        case ReplicaSelectionOutcome::NO_SAFE_REPLICA:
+            return "no_safe_replica";
+        case ReplicaSelectionOutcome::FALLBACK_NO_PROVIDER:
+            return "fallback_no_provider";
+        case ReplicaSelectionOutcome::FALLBACK_PROVIDER_EXCEPTION:
+            return "fallback_provider_exception";
+        case ReplicaSelectionOutcome::FALLBACK_SIGNAL_STALE:
+            return "fallback_signal_stale";
+        case ReplicaSelectionOutcome::FALLBACK_MISSING_SIGNAL:
+            return "fallback_missing_signal";
+        case ReplicaSelectionOutcome::FALLBACK_SIGNAL_SOURCE_UNAVAILABLE:
+            return "fallback_signal_source_unavailable";
+        case ReplicaSelectionOutcome::FALLBACK_INVALID_RESULT:
+            return "fallback_invalid_result";
+        case ReplicaSelectionOutcome::FALLBACK_INVALID_SCORE:
+            return "fallback_invalid_score";
+    }
+    return "unknown";
+}
+
+const char* ReplicaSelectionComparisonMetricName(
+    const ReplicaSelectionDecision& decision) noexcept {
+    if (decision.mode != ReplicaSelectionMode::SHADOW) {
+        return "not_applicable";
+    }
+    if (!decision.selected && !decision.recommendation) {
+        return "neither_available";
+    }
+    if (!decision.selected) {
+        return "selected_unavailable";
+    }
+    if (!decision.recommendation) {
+        return "recommendation_unavailable";
+    }
+    return decision.selected == decision.recommendation ? "agree" : "disagree";
+}
+
 std::string toLower(const std::string& str) {
     std::string result = str;
     std::transform(result.begin(), result.end(), result.begin(),
@@ -75,6 +137,46 @@ uint64_t parseMetricsInterval() {
 
 }  // anonymous namespace
 
+ReplicaSelectionMetric::ReplicaSelectionMetric(
+    const std::map<std::string, std::string>& labels)
+    : decisions("mooncake_replica_selection_decisions_total",
+                "Replica selection decisions by fixed outcome", labels,
+                {"mode", "outcome", "comparison"}),
+      selector_latency_ns("mooncake_replica_selection_selector_latency_ns",
+                          "Replica selector latency in nanoseconds",
+                          {100, 250, 500, 1000, 2500, 5000, 10000, 25000, 50000,
+                           100000, 250000, 500000, 1000000},
+                          labels, {"mode", "outcome"}) {}
+
+void ReplicaSelectionMetric::Observe(const ReplicaSelectionDecision& decision,
+                                     uint64_t latency_ns) noexcept {
+    try {
+        // Reuse per-thread buffers so long fixed enum labels do not allocate on
+        // every read. The metric implementation copies a key only when a new
+        // fixed-cardinality series is first created.
+        thread_local std::array<std::string, 3> decision_labels;
+        thread_local std::array<std::string, 2> latency_labels;
+        decision_labels[0] = ReplicaSelectionModeMetricName(decision.mode);
+        decision_labels[1] =
+            ReplicaSelectionOutcomeMetricName(decision.outcome);
+        decision_labels[2] = ReplicaSelectionComparisonMetricName(decision);
+        latency_labels[0] = decision_labels[0];
+        latency_labels[1] = decision_labels[1];
+
+        decisions.inc(decision_labels);
+        selector_latency_ns.observe(
+            latency_labels, static_cast<int64_t>(std::min<uint64_t>(
+                                latency_ns, static_cast<uint64_t>(INT64_MAX))));
+    } catch (...) {
+        // Metrics must never affect the selected replica or I/O result.
+    }
+}
+
+void ReplicaSelectionMetric::serialize(std::string& str) {
+    decisions.serialize(str);
+    selector_latency_ns.serialize(str);
+}
+
 ClientMetric::ClientMetric(uint64_t interval_seconds,
                            const std::map<std::string, std::string>& labels,
                            bool bandwidth_reporting_enabled,
@@ -83,6 +185,7 @@ ClientMetric::ClientMetric(uint64_t interval_seconds,
       master_client_metric(labels),
       transfer_operation_metric(labels),
       ssd_metric(labels),
+      replica_selection_metric(labels),
       should_stop_metrics_thread_(false),
       metrics_interval_seconds_(interval_seconds),
       bandwidth_reporting_enabled_(bandwidth_reporting_enabled),
@@ -128,6 +231,7 @@ void ClientMetric::serialize(std::string& str) {
     }
     transfer_operation_metric.serialize(str);
     ssd_metric.serialize(str);
+    replica_selection_metric.serialize(str);
 }
 
 std::string ClientMetric::summary_metrics() {
