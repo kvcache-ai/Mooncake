@@ -33,6 +33,10 @@ TEST(ReceiverCreditConfig, MissingSectionIsStrictlyDefaultOff) {
     EXPECT_EQ(output.max_grant_per_pull,
               (std::array<uint64_t, kCreditResourceCount>{}));
     EXPECT_EQ(output.max_peers, ReceiverCreditRuntimeConfig::kDefaultMaxPeers);
+    EXPECT_TRUE(output.adaptive_dispatch_enabled);
+    EXPECT_EQ(output.adaptive_dispatch_min_owners, 1);
+    EXPECT_EQ(output.adaptive_dispatch_initial_owners, 2);
+    EXPECT_EQ(output.adaptive_dispatch_max_owners, 2);
 }
 
 TEST(ReceiverCreditConfig, LoadsCompleteNestedRequiredConfiguration) {

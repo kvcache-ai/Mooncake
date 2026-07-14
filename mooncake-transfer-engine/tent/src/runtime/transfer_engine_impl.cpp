@@ -2069,14 +2069,17 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
 Status TransferEngineImpl::refillDispatchWindow() {
     std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
     if (!runtime_queue_config_.enabled) return Status::OK();
-    if (dispatch_inflight_owners_ >=
-            runtime_queue_config_.max_dispatch_owners ||
+    size_t max_dispatch_owners = runtime_queue_config_.max_dispatch_owners;
+    if (receiver_credit_production_enabled_ && receiver_credit_pull_controller_)
+        max_dispatch_owners =
+            std::min(max_dispatch_owners,
+                     receiver_credit_pull_controller_->dispatchOwnerLimit());
+    if (dispatch_inflight_owners_ >= max_dispatch_owners ||
         dispatch_inflight_bytes_ >= runtime_queue_config_.max_dispatch_bytes) {
         return Status::OK();
     }
 
-    const size_t owner_budget =
-        runtime_queue_config_.max_dispatch_owners - dispatch_inflight_owners_;
+    const size_t owner_budget = max_dispatch_owners - dispatch_inflight_owners_;
     const size_t byte_budget =
         runtime_queue_config_.max_dispatch_bytes - dispatch_inflight_bytes_;
     auto picked = runtime_queue_->pickForDispatch(owner_budget, byte_budget);

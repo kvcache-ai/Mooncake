@@ -5,6 +5,7 @@
 #include "tent/runtime/receiver_credit_controller.h"
 
 #include <chrono>
+#include <limits>
 #include <memory>
 #include <string>
 #include <thread>
@@ -121,6 +122,57 @@ TEST(ReceiverCreditController, ExplicitUnsupportedObeysRolloutMode) {
             waitUntil([&] { return controller->peerState(9, 0) == expected; }));
         controller->stop();
     }
+}
+
+TEST(AdaptiveCreditDispatchLimiter,
+     SlowPullReducesAndNeverReprobesLearnedUnsafeLevel) {
+    auto config = controllerConfig(CreditRolloutMode::Required);
+    config.adaptive_dispatch_min_owners = 1;
+    config.adaptive_dispatch_initial_owners = 4;
+    config.adaptive_dispatch_max_owners = 8;
+    config.adaptive_dispatch_slow_rtt_us = 1000;
+    config.adaptive_dispatch_healthy_pulls = 2;
+    AdaptiveCreditDispatchLimiter limiter(config);
+
+    limiter.observe(std::chrono::microseconds(100), true);
+    limiter.observe(std::chrono::microseconds(100), true);
+    ASSERT_EQ(limiter.ownerLimit(), 5);
+
+    limiter.observe(std::chrono::milliseconds(200), true);
+    EXPECT_EQ(limiter.ownerLimit(), 2);
+    auto reduced = limiter.snapshot();
+    EXPECT_EQ(reduced.learned_ceiling, 4);
+    EXPECT_EQ(reduced.slow_or_failed_pulls, 1);
+    EXPECT_EQ(reduced.reductions, 1);
+
+    for (size_t i = 0; i < 20; ++i)
+        limiter.observe(std::chrono::microseconds(100), true);
+    auto recovered = limiter.snapshot();
+    EXPECT_EQ(recovered.current_owners, 4);
+    EXPECT_EQ(recovered.learned_ceiling, 4);
+    EXPECT_EQ(recovered.increases, 3);
+}
+
+TEST(AdaptiveCreditDispatchLimiter, RpcFailureReducesAtAnyLatency) {
+    auto config = controllerConfig(CreditRolloutMode::Required);
+    config.adaptive_dispatch_min_owners = 1;
+    config.adaptive_dispatch_initial_owners = 2;
+    config.adaptive_dispatch_max_owners = 4;
+    AdaptiveCreditDispatchLimiter limiter(config);
+
+    limiter.observe(std::chrono::microseconds(1), false);
+    EXPECT_EQ(limiter.ownerLimit(), 1);
+    EXPECT_EQ(limiter.snapshot().learned_ceiling, 1);
+}
+
+TEST(AdaptiveCreditDispatchLimiter, DisabledLeavesStaticWindowUnbounded) {
+    auto config = controllerConfig(CreditRolloutMode::Required);
+    config.adaptive_dispatch_enabled = false;
+    AdaptiveCreditDispatchLimiter limiter(config);
+
+    limiter.observe(std::chrono::seconds(1), false);
+    EXPECT_EQ(limiter.ownerLimit(), std::numeric_limits<size_t>::max());
+    EXPECT_EQ(limiter.snapshot().slow_or_failed_pulls, 0);
 }
 
 }  // namespace

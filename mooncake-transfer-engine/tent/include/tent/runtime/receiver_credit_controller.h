@@ -5,6 +5,7 @@
 #define TENT_RUNTIME_RECEIVER_CREDIT_CONTROLLER_H
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -19,6 +20,42 @@
 #include "tent/runtime/receiver_credit_protocol.h"
 
 namespace mooncake::tent {
+
+struct AdaptiveDispatchSnapshot {
+    size_t current_owners{0};
+    size_t learned_ceiling{0};
+    uint64_t slow_or_failed_pulls{0};
+    uint64_t reductions{0};
+    uint64_t increases{0};
+};
+
+// Process-lifetime safety controller for the shared RDMA/control path. A slow
+// or failed pull multiplicatively reduces the dispatch window and records the
+// failed level as unsafe. Healthy pulls additively recover, but never probe a
+// level already shown to starve control traffic during this process lifetime.
+class AdaptiveCreditDispatchLimiter {
+   public:
+    explicit AdaptiveCreditDispatchLimiter(
+        const ReceiverCreditRuntimeConfig& config);
+
+    void observe(std::chrono::nanoseconds elapsed, bool rpc_ok);
+    size_t ownerLimit() const;
+    AdaptiveDispatchSnapshot snapshot() const;
+
+   private:
+    const bool enabled_;
+    const size_t min_owners_;
+    const uint64_t slow_rtt_ns_;
+    const uint32_t healthy_pulls_per_increase_;
+
+    std::atomic<size_t> current_owners_;
+    mutable std::mutex mutex_;
+    size_t learned_ceiling_;
+    uint32_t healthy_pulls_{0};
+    uint64_t slow_or_failed_pulls_{0};
+    uint64_t reductions_{0};
+    uint64_t increases_{0};
+};
 
 // Sender-side, nonblocking pull coordinator. At most one RPC is outstanding
 // for each (target, QoS class); callers only publish bounded demand and return.
@@ -47,6 +84,8 @@ class ReceiverCreditPullController
 
     CreditPeerState peerState(uint64_t target_id, uint32_t qos_class) const;
     size_t peerCount() const;
+    size_t dispatchOwnerLimit() const;
+    AdaptiveDispatchSnapshot adaptiveDispatchSnapshot() const;
 
     // Prevents new pulls. Outstanding callbacks retain this object until they
     // finish but become no-ops, avoiding a callback-to-engine lifetime edge.
@@ -98,6 +137,7 @@ class ReceiverCreditPullController
     // Engine-independent client lifetime: an in-flight callback retains the
     // controller, which in turn retains this agent until the coroutine ends.
     const std::shared_ptr<CoroRpcAgent> rpc_agent_;
+    AdaptiveCreditDispatchLimiter dispatch_limiter_;
 
     mutable std::mutex mutex_;
     bool stopped_{false};

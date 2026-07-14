@@ -31,6 +31,61 @@ bool sameGeneration(const CreditPeerContextSnapshot& context,
 
 }  // namespace
 
+AdaptiveCreditDispatchLimiter::AdaptiveCreditDispatchLimiter(
+    const ReceiverCreditRuntimeConfig& config)
+    : enabled_(config.adaptive_dispatch_enabled),
+      min_owners_(config.adaptive_dispatch_min_owners),
+      slow_rtt_ns_(static_cast<uint64_t>(config.adaptive_dispatch_slow_rtt_us) *
+                   1000),
+      healthy_pulls_per_increase_(config.adaptive_dispatch_healthy_pulls),
+      current_owners_(enabled_ ? config.adaptive_dispatch_initial_owners
+                               : std::numeric_limits<size_t>::max()),
+      learned_ceiling_(enabled_ ? config.adaptive_dispatch_max_owners
+                                : std::numeric_limits<size_t>::max()) {}
+
+void AdaptiveCreditDispatchLimiter::observe(std::chrono::nanoseconds elapsed,
+                                            bool rpc_ok) {
+    if (!enabled_) return;
+    const bool unhealthy = !rpc_ok || static_cast<uint64_t>(std::max<int64_t>(
+                                          0, elapsed.count())) >= slow_rtt_ns_;
+
+    std::lock_guard lock(mutex_);
+    size_t current = current_owners_.load(std::memory_order_relaxed);
+    if (unhealthy) {
+        ++slow_or_failed_pulls_;
+        healthy_pulls_ = 0;
+        if (current > min_owners_) {
+            learned_ceiling_ = std::min(learned_ceiling_, current - 1);
+            const size_t reduced = std::max(min_owners_, current / 2);
+            current_owners_.store(reduced, std::memory_order_release);
+            ++reductions_;
+        }
+        return;
+    }
+
+    if (current >= learned_ceiling_) {
+        healthy_pulls_ = 0;
+        return;
+    }
+    if (++healthy_pulls_ < healthy_pulls_per_increase_) return;
+    healthy_pulls_ = 0;
+    current_owners_.store(current + 1, std::memory_order_release);
+    ++increases_;
+}
+
+size_t AdaptiveCreditDispatchLimiter::ownerLimit() const {
+    return current_owners_.load(std::memory_order_acquire);
+}
+
+AdaptiveDispatchSnapshot AdaptiveCreditDispatchLimiter::snapshot() const {
+    std::lock_guard lock(mutex_);
+    return {.current_owners = current_owners_.load(std::memory_order_relaxed),
+            .learned_ceiling = learned_ceiling_,
+            .slow_or_failed_pulls = slow_or_failed_pulls_,
+            .reductions = reductions_,
+            .increases = increases_};
+}
+
 size_t ReceiverCreditPullController::PeerKeyHash::operator()(
     const PeerKey& key) const noexcept {
     size_t h = std::hash<uint64_t>{}(key.target_id);
@@ -47,7 +102,8 @@ ReceiverCreditPullController::ReceiverCreditPullController(
       sender_peer_(sender_peer),
       contexts_(std::move(contexts)),
       ledger_(std::move(ledger)),
-      rpc_agent_(std::make_shared<CoroRpcAgent>()) {}
+      rpc_agent_(std::make_shared<CoroRpcAgent>()),
+      dispatch_limiter_(config_) {}
 
 ReceiverCreditPullController::~ReceiverCreditPullController() { stop(); }
 
@@ -306,6 +362,8 @@ Status ReceiverCreditPullController::applyResponse(
 
 void ReceiverCreditPullController::finish(
     PeerKey key, Status rpc_status, ReceiverCreditPullResponseV1 response) {
+    std::chrono::nanoseconds pull_elapsed{0};
+    bool pull_measured = false;
     {
         const auto now = std::chrono::steady_clock::now();
         std::lock_guard lock(mutex_);
@@ -316,6 +374,8 @@ void ReceiverCreditPullController::finish(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     now - it->second.pull_started_at)
                     .count());
+            pull_elapsed = std::chrono::nanoseconds(elapsed);
+            pull_measured = true;
             it->second.pull_started_at = {};
             ++pulls_completed_;
             pull_latency_ns_sum_ += elapsed;
@@ -327,6 +387,8 @@ void ReceiverCreditPullController::finish(
             ++pull_latency_buckets_[bucket];
         }
     }
+
+    if (pull_measured) dispatch_limiter_.observe(pull_elapsed, rpc_status.ok());
 
     bool request_again = false;
     Status result = std::move(rpc_status);
@@ -366,10 +428,20 @@ size_t ReceiverCreditPullController::peerCount() const {
     return peers_.size();
 }
 
+size_t ReceiverCreditPullController::dispatchOwnerLimit() const {
+    return dispatch_limiter_.ownerLimit();
+}
+
+AdaptiveDispatchSnapshot
+ReceiverCreditPullController::adaptiveDispatchSnapshot() const {
+    return dispatch_limiter_.snapshot();
+}
+
 void ReceiverCreditPullController::stop() {
     std::lock_guard lock(mutex_);
     stopped_ = true;
     if (!summary_logged_) {
+        const auto adaptive = dispatch_limiter_.snapshot();
         const double average_us =
             pulls_completed_ == 0
                 ? 0.0
@@ -386,6 +458,12 @@ void ReceiverCreditPullController::stop() {
                   << " le_10ms=" << pull_latency_buckets_[4]
                   << " le_100ms=" << pull_latency_buckets_[5]
                   << " gt_100ms=" << pull_latency_buckets_[6];
+        LOG(INFO) << "Receiver credit adaptive dispatch summary: owners="
+                  << adaptive.current_owners
+                  << " learned_ceiling=" << adaptive.learned_ceiling
+                  << " slow_or_failed_pulls=" << adaptive.slow_or_failed_pulls
+                  << " reductions=" << adaptive.reductions
+                  << " increases=" << adaptive.increases;
         summary_logged_ = true;
     }
     peers_.clear();
