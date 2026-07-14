@@ -18,6 +18,12 @@ _EP_DIAG_TIMING = os.getenv("MOONCAKE_EP_DIAG_TIMING", "").upper() in {
     "TRUE",
     "YES",
 }
+_EP_PROFILE_NON_HOOK = os.getenv("MOONCAKE_EP_PROFILE_NON_HOOK", "").upper() in {
+    "1",
+    "ON",
+    "TRUE",
+    "YES",
+}
 _EP_DIAG_ITERS = int(os.getenv("MOONCAKE_EP_DIAG_ITERS", "10"))
 _EP_DIAG_NAMES = (
     "phase_ack_wait",
@@ -216,7 +222,8 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
     # Separate profiling
     # Skip profiling in fallback mode as kernels are Python functions, not CUDA kernels
     if not buffer._use_fallback:
-        for return_recv_hook in (False, True):
+        profile_hook_modes = (False, True) if _EP_PROFILE_NON_HOOK else (True,)
+        for return_recv_hook in profile_hook_modes:
             for profile_rank in range(num_ranks):
                 cpu_group.barrier()
                 dispatch_t, combine_t = bench_kineto(
