@@ -12,12 +12,13 @@ use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use super::{
     control_address, control_address_label, control_plane_server_threads_from_env, decode_error,
     ensure_batch_len, fail_stream_session, handle_control_stream_request, normalize_control_uri,
-    pb_cas_result, pb_compatibility, pb_error, pb_object_route, pb_replica_route, pb_replica_tier,
-    pb_route_state, pb_runtime_id, pb_segment_reservation, status_to_store_error,
-    store_error_from_pb, try_cas_result, try_compatibility, try_object_route, try_replica_route,
-    try_replica_tier, try_route_state, try_runtime_id, try_segment_reservation, AllocatorService,
-    AuthorityService, ControlPlaneClient, ControlPlaneHandle, ControlStreamSession,
-    EvictionService, GrpcControlPlaneService, ReleaseOp, ReserveSpecificOp, RouteTrafficReport,
+    pb_cas_result, pb_cold_backing_route, pb_compatibility, pb_error, pb_object_route,
+    pb_replica_route, pb_replica_tier, pb_route_state, pb_runtime_id, pb_segment_reservation,
+    status_to_store_error, store_error_from_pb, try_cas_result, try_cold_backing_route,
+    try_compatibility, try_object_route, try_replica_route, try_replica_tier, try_route_state,
+    try_runtime_id, try_segment_reservation, AllocatorService, AuthorityService,
+    ControlPlaneClient, ControlPlaneHandle, ControlStreamSession, EvictionService,
+    GrpcControlPlaneService, ReleaseOp, ReserveSpecificOp, RouteTrafficReport,
     CONTROL_PLANE_SERVER_THREADS_ENV, CONTROL_PLANE_THREADS_ENV,
 };
 use crate::control_plane::pb;
@@ -25,9 +26,9 @@ use crate::control_plane::pb::control_plane_service_server::ControlPlaneService 
 use crate::observability::{metrics_test_lock, render_prometheus_metrics, reset_metrics};
 use mooncake_store_core::{
     CasResult, ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
-    ClientStableId, CompatibilityDescriptor, NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute,
-    ReplicaTier, RouteCasRequest, RouteState, RouteVersion, SegmentName, SegmentReservation,
-    StoreError,
+    ClientStableId, ColdBackingReplica, ColdBackingRoute, ColdBackingState,
+    CompatibilityDescriptor, NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier,
+    RouteCasRequest, RouteState, RouteVersion, SegmentName, SegmentReservation, StoreError,
 };
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
@@ -311,6 +312,13 @@ impl pb::control_plane_service_server::ControlPlaneService for ClosingStreamServ
         request: Request<pb::AckColdReadCompleteRequest>,
     ) -> std::result::Result<Response<pb::AckColdReadCompleteReply>, Status> {
         self.inner.ack_cold_read_complete(request).await
+    }
+
+    async fn batch_reclaim_cold_backings(
+        &self,
+        request: Request<pb::BatchReclaimColdBackingsRequest>,
+    ) -> std::result::Result<Response<pb::BatchReclaimColdBackingsReply>, Status> {
+        self.inner.batch_reclaim_cold_backings(request).await
     }
 
     async fn pin_for_read(
@@ -598,6 +606,13 @@ impl pb::control_plane_service_server::ControlPlaneService for DelayedUnaryServi
         self.inner.ack_cold_read_complete(request).await
     }
 
+    async fn batch_reclaim_cold_backings(
+        &self,
+        request: Request<pb::BatchReclaimColdBackingsRequest>,
+    ) -> std::result::Result<Response<pb::BatchReclaimColdBackingsReply>, Status> {
+        self.inner.batch_reclaim_cold_backings(request).await
+    }
+
     async fn pin_for_read(
         &self,
         request: Request<pb::PinForReadRequest>,
@@ -882,6 +897,13 @@ impl pb::control_plane_service_server::ControlPlaneService for InvalidMigrationS
         request: Request<pb::AckColdReadCompleteRequest>,
     ) -> std::result::Result<Response<pb::AckColdReadCompleteReply>, Status> {
         self.inner.ack_cold_read_complete(request).await
+    }
+
+    async fn batch_reclaim_cold_backings(
+        &self,
+        request: Request<pb::BatchReclaimColdBackingsRequest>,
+    ) -> std::result::Result<Response<pb::BatchReclaimColdBackingsReply>, Status> {
+        self.inner.batch_reclaim_cold_backings(request).await
     }
 
     async fn pin_for_read(
@@ -1741,6 +1763,29 @@ fn control_plane_helpers_round_trip_and_report_validation_errors() {
         try_replica_route(pb_replica_route(&legacy_replica))
             .expect("legacy replica should round-trip"),
         legacy_replica
+    );
+}
+
+#[test]
+fn cold_backing_route_round_trip_preserves_replicas() {
+    let route = ColdBackingRoute {
+        owner: ClientRuntimeId::new("cold-primary", ClientEpoch(3)),
+        cold_tier_id: "cold-primary-device".to_string(),
+        object_locator: "primary-object".to_string(),
+        length: 4096,
+        checksum: Some(12345),
+        state: ColdBackingState::Materialized,
+        replicas: vec![ColdBackingReplica {
+            owner: ClientRuntimeId::new("cold-replica", ClientEpoch(4)),
+            cold_tier_id: "cold-replica-device".to_string(),
+            object_locator: "replica-object".to_string(),
+        }],
+    };
+
+    assert_eq!(
+        try_cold_backing_route(pb_cold_backing_route(&route))
+            .expect("cold backing should round-trip"),
+        route
     );
 }
 

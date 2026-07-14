@@ -1,4 +1,5 @@
 use super::codec::pb_error;
+use super::cold_tier_codec::try_cold_backing_route;
 use super::*;
 
 const MAX_ADMIN_OFFLOAD_TASKS: u64 = 1024;
@@ -215,6 +216,48 @@ pub(super) async fn handle_batch_read_from_cold(
         spawn_deferred_promote(deferred_promote);
     }
     Ok(Response::new(pb::BatchReadFromColdReply { results }))
+}
+
+pub(super) async fn handle_batch_reclaim_cold_backings(
+    cold_tier: Arc<dyn ColdTierControlService>,
+    request: Request<pb::BatchReclaimColdBackingsRequest>,
+) -> std::result::Result<Response<pb::BatchReclaimColdBackingsReply>, Status> {
+    let request = request.into_inner();
+    let mut cold_backings = Vec::with_capacity(request.cold_backings.len());
+    for cold_backing in request.cold_backings {
+        cold_backings.push(try_cold_backing_route(cold_backing).map_err(|error| {
+            Status::invalid_argument(format!("invalid cold backing reclaim request: {error}"))
+        })?);
+    }
+    let namespace = request.namespace;
+    let authority = request.authority;
+    let results = run_blocking_control("batch_reclaim_cold_backings", move || {
+        cold_tier.batch_reclaim_cold_backings(&namespace, &authority, cold_backings)
+    })
+    .await?
+    .into_iter()
+    .map(cold_reclaim_result_to_pb)
+    .collect();
+    Ok(Response::new(pb::BatchReclaimColdBackingsReply { results }))
+}
+
+fn cold_reclaim_result_to_pb(
+    result: mooncake_store_core::Result<ColdReclaimResult>,
+) -> pb::ReclaimColdBackingReply {
+    match result {
+        Ok(result) => pb::ReclaimColdBackingReply {
+            removed_cold_payload: result.removed_cold_payload,
+            removed_pending_source: result.removed_pending_source,
+            skipped_still_referenced: result.skipped_still_referenced,
+            error: None,
+        },
+        Err(error) => pb::ReclaimColdBackingReply {
+            removed_cold_payload: false,
+            removed_pending_source: false,
+            skipped_still_referenced: false,
+            error: Some(pb_error(error)),
+        },
+    }
 }
 
 pub(super) async fn handle_ack_cold_read_complete(
