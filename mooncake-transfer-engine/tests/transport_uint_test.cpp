@@ -62,6 +62,8 @@ class BatchResultTransport : public Transport {
         : unregister_result_(unregister_result) {}
 
     int unregisterBatchCalls() const { return unregister_batch_calls_; }
+    size_t registeredBufferCount() const { return registered_buffers_.size(); }
+    void setRegisterResult(int result) { register_result_ = result; }
 
     Status submitTransfer(BatchID,
                           const std::vector<TransferRequest>&) override {
@@ -80,20 +82,38 @@ class BatchResultTransport : public Transport {
 
     int unregisterLocalMemory(void*, bool) override { return 0; }
 
-    int registerLocalMemoryBatch(const std::vector<BufferEntry>&,
+    int registerLocalMemoryBatch(const std::vector<BufferEntry>& buffer_list,
                                  const std::string&) override {
+        if (register_result_) {
+            if (!buffer_list.empty()) {
+                registered_buffers_.push_back(buffer_list.front().addr);
+            }
+            return register_result_;
+        }
+        for (const auto& buffer : buffer_list) {
+            registered_buffers_.push_back(buffer.addr);
+        }
         return 0;
     }
 
-    int unregisterLocalMemoryBatch(const std::vector<void*>&) override {
+    int unregisterLocalMemoryBatch(
+        const std::vector<void*>& addr_list) override {
         ++unregister_batch_calls_;
+        for (void* addr : addr_list) {
+            registered_buffers_.erase(
+                std::remove(registered_buffers_.begin(),
+                            registered_buffers_.end(), addr),
+                registered_buffers_.end());
+        }
         return unregister_result_;
     }
 
     const char* getName() const override { return "batch-result"; }
 
+    int register_result_ = 0;
     int unregister_result_;
     int unregister_batch_calls_ = 0;
+    std::vector<void*> registered_buffers_;
 };
 
 class BlockingRegistrationTransport : public Transport {
@@ -473,6 +493,35 @@ TEST_F(TransportTest, UnregisterLocalMemoryBatchContinuesAfterAddressError) {
               ERR_ADDRESS_NOT_REGISTERED);
     EXPECT_FALSE(contains_buffer(registered.data()));
     EXPECT_FALSE(contains_buffer(registered.data() + 1));
+}
+
+TEST_F(TransportTest, RegisterLocalMemoryBatchRollsBackAttemptedTransports) {
+    TransferEngineImpl engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    auto succeeding = std::make_shared<BatchResultTransport>();
+    auto failing = std::make_shared<BatchResultTransport>();
+    failing->setRegisterResult(ERR_MEMORY);
+    TransferEngineImplTestPeer::replaceTransports(
+        engine, {{"a-succeeding", succeeding}, {"b-failing", failing}});
+
+    std::array<char, 2> buffer{};
+    std::vector<BufferEntry> entries = {
+        {buffer.data(), 1},
+        {buffer.data() + 1, 1},
+    };
+    EXPECT_EQ(engine.registerLocalMemoryBatch(entries, "cpu:0"), ERR_MEMORY);
+    EXPECT_EQ(succeeding->registeredBufferCount(), 0);
+    EXPECT_EQ(failing->registeredBufferCount(), 0);
+    EXPECT_EQ(succeeding->unregisterBatchCalls(), 1);
+    EXPECT_EQ(failing->unregisterBatchCalls(), 1);
+
+    failing->setRegisterResult(0);
+    EXPECT_EQ(engine.registerLocalMemoryBatch(entries, "cpu:0"), 0);
+    EXPECT_EQ(succeeding->registeredBufferCount(), entries.size());
+    EXPECT_EQ(failing->registeredBufferCount(), entries.size());
+    EXPECT_EQ(
+        engine.unregisterLocalMemoryBatch({buffer.data(), buffer.data() + 1}),
+        0);
 }
 }  // namespace mooncake
 
