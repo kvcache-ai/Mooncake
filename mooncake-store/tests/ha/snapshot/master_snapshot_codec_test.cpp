@@ -7,6 +7,7 @@
 #include "master_service.h"
 #include "segment.h"
 #include "task_manager.h"
+#include "tenant_id.h"
 
 namespace mooncake::ha {
 
@@ -74,7 +75,7 @@ TEST_F(MasterSnapshotCodecTest, EncodeDecodeRoundTripWithMemoryReplica) {
     constexpr size_t kSegmentBase = 0x300000000;
     constexpr size_t kSegmentSize = 1024 * 1024 * 16;  // 16MB
     const std::string kKey = "memory_replica_key";
-    const std::string kTenant = "default";
+    const TenantId& kTenant = TenantId::Default();
 
     Segment segment;
     segment.id = generate_uuid();
