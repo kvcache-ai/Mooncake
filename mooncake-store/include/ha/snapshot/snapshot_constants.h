@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstddef>
+
 namespace mooncake::ha {
 
 // Snapshot file names
@@ -20,6 +22,6 @@ inline constexpr const char* kSnapshotBackupRestoreDir =
     "mooncake_snapshot_restore_backup";
 
 // List limit
-inline constexpr size_t kUnlimitedSnapshotList = 0;
+inline constexpr std::size_t kUnlimitedSnapshotList = 0;
 
 }  // namespace mooncake::ha

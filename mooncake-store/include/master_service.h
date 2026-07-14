@@ -813,9 +813,6 @@ class MasterService {
 
     // Restore master state
     void RestoreState();
-    bool TryRestoreStateFromSnapshot(
-        const ha::SnapshotDescriptor& snapshot,
-        const std::chrono::system_clock::time_point& now);
     void ResetStateAfterFailedRestoreAttempt();
 
     /**
