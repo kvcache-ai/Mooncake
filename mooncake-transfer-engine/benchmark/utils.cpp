@@ -79,6 +79,10 @@ DEFINE_string(
     tent_transport_hint, "unspec",
     "tent only: per-request transport_hint. "
     "unspec|rdma|tcp|shm|nvlink|gds|io_uring|mnnvl|ascend|sunrise_link");
+DEFINE_string(tent_intent_type, "unspec",
+              "tent only: intent_type attached to every benchmark request. "
+              "unspec|foreground_get|background_prefetch|migration|checkpoint|"
+              "weight_loading|staging_internal");
 
 namespace mooncake {
 namespace tent {
@@ -117,6 +121,7 @@ std::string XferBenchConfig::xport_type;
 std::string XferBenchConfig::backend;
 bool XferBenchConfig::notifi = false;
 std::string XferBenchConfig::tent_transport_hint;
+std::string XferBenchConfig::tent_intent_type;
 
 int XferBenchConfig::local_gpu_id = 0;
 int XferBenchConfig::target_gpu_id = 0;
@@ -159,6 +164,7 @@ void XferBenchConfig::loadFromFlags() {
     backend = FLAGS_backend;
     notifi = FLAGS_notifi;
     tent_transport_hint = FLAGS_tent_transport_hint;
+    tent_intent_type = FLAGS_tent_intent_type;
 
     local_gpu_id = FLAGS_local_gpu_id;
     target_gpu_id = FLAGS_target_gpu_id;

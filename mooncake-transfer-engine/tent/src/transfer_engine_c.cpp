@@ -308,7 +308,7 @@ void tent_free_notifs(tent_notifi_info* info) {
 int tent_task_status(tent_engine_t engine, tent_batch_id_t batch_id,
                      size_t task_id, tent_status_t* xfer_status) {
     CHECK_POINTER(engine);
-    CHECK_POINTER(batch_id);
+    if (!batch_id) return -1;
     CHECK_POINTER(xfer_status);
     mooncake::tent::TransferStatus internal_status;
     auto status =
@@ -322,10 +322,22 @@ int tent_task_status(tent_engine_t engine, tent_batch_id_t batch_id,
     return 0;
 }
 
+int tent_cancel_task(tent_engine_t engine, tent_batch_id_t batch_id,
+                     size_t task_id) {
+    CHECK_POINTER(engine);
+    if (!batch_id) return -1;
+    auto status = CAST(engine)->cancelTransfer(batch_id, task_id);
+    if (!status.ok()) {
+        LOG(ERROR) << "tent_cancel_task: " << status.ToString();
+        return -1;
+    }
+    return 0;
+}
+
 int tent_overall_status(tent_engine_t engine, tent_batch_id_t batch_id,
                         tent_status_t* xfer_status) {
     CHECK_POINTER(engine);
-    CHECK_POINTER(batch_id);
+    if (!batch_id) return -1;
     CHECK_POINTER(xfer_status);
     mooncake::tent::TransferStatus internal_status;
     auto status = CAST(engine)->getTransferStatus(batch_id, internal_status);
@@ -463,7 +475,7 @@ int tent_register_memory_batch_ex(tent_engine_t engine, void** addrs,
 int tent_task_status_list(tent_engine_t engine, tent_batch_id_t batch_id,
                           tent_status_t* statuses, size_t* count) {
     CHECK_POINTER(engine);
-    CHECK_POINTER(batch_id);
+    if (!batch_id) return -1;
     CHECK_POINTER(statuses);
     CHECK_POINTER(count);
     std::vector<mooncake::tent::TransferStatus> status_list;

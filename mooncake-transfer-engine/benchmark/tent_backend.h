@@ -98,6 +98,7 @@ class TENTBenchRunner : public BenchRunner {
     SegmentID handle_;
     SegmentInfo info_;
     TransportType transport_hint_{UNSPEC};
+    IntentType intent_type_{IntentType::INTENT_UNSPEC};
     std::atomic<uint64_t> receiver_credit_request_id_{0};
     struct ReceiverCreditLease {
         uint64_t id{0};
