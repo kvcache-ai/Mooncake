@@ -1,7 +1,7 @@
 import unittest
 import os
 import time
-from mooncake.store import MooncakeDistributedStore, ReplicateConfig
+from mooncake.store import MooncakeDistributedStore, ReplicateConfig, SoftPinAction
 
 # The lease time of the kv object, should be set equal to
 # the master's value.
@@ -173,7 +173,7 @@ class TestDistributedObjectStoreReplication(unittest.TestCase):
         # Test with custom config
         config = ReplicateConfig()
         config.replica_num = self.max_replicate_num
-        config.with_soft_pin = False
+        config.soft_pin_action = SoftPinAction.PRESERVE
         config.with_hard_pin = False
         
         key2 = "test_put_from_config_key2"
@@ -244,7 +244,7 @@ class TestDistributedObjectStoreReplication(unittest.TestCase):
         # Test with custom config
         config = ReplicateConfig()
         config.replica_num = self.max_replicate_num
-        config.with_soft_pin = False
+        config.soft_pin_action = SoftPinAction.PRESERVE
         config.with_hard_pin = False
 
         keys2 = ["test_batch_put_from_config_key4", "test_batch_put_from_config_key5", "test_batch_put_from_config_key6"]

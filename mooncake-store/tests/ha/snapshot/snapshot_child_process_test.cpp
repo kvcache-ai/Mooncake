@@ -875,9 +875,13 @@ TEST_F(SnapshotChildProcessTest,
     ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value())
         << "MountSegment failed";
 
+    const int64_t soft_pin_baseline =
+        MasterMetricManager::instance().get_soft_pin_key_count();
     const std::string key1 = "restore_fallback_key_1";
+    ReplicateConfig soft_pin_config;
+    soft_pin_config.soft_pin_action = SoftPinAction::ENABLE;
     auto put1 = service_->PutStart(client_id, key1, TenantId::Default(), {1024},
-                                   {.replica_num = 1});
+                                   soft_pin_config);
     ASSERT_TRUE(put1.has_value()) << "PutStart for key1 failed";
     ASSERT_TRUE(
         service_
@@ -911,12 +915,16 @@ TEST_F(SnapshotChildProcessTest,
         << "PersistState for snapshot2 failed: "
         << persist_result.error().message;
 
-    const fs::path corrupted_metadata = fs::path(tmp_dir()) /
-                                        default_snapshot_root() / snapshot_id2 /
-                                        "metadata";
-    std::ofstream corrupt_stream(corrupted_metadata, std::ios::binary);
+    // Corrupt task_manager rather than metadata so the first restore attempt
+    // has already materialized metadata and updated soft-pin metrics before it
+    // fails. The fallback Reset must balance those metrics before snapshot1 is
+    // tried.
+    const fs::path corrupted_task_manager = fs::path(tmp_dir()) /
+                                            default_snapshot_root() /
+                                            snapshot_id2 / "task_manager";
+    std::ofstream corrupt_stream(corrupted_task_manager, std::ios::binary);
     ASSERT_TRUE(corrupt_stream.is_open())
-        << "Failed to corrupt latest snapshot metadata";
+        << "Failed to corrupt latest snapshot task manager";
     corrupt_stream << "corrupted-snapshot-payload";
     corrupt_stream.close();
 
@@ -939,6 +947,9 @@ TEST_F(SnapshotChildProcessTest,
     EXPECT_FALSE(
         restored_service->ExistKey(key2, TenantId::Default()).value_or(false))
         << "Corrupted latest snapshot must not be partially restored";
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              soft_pin_baseline + 1)
+        << "Fallback restore must not double-count active soft pins";
 
     restored_service.reset();
 }
@@ -1082,7 +1093,8 @@ TEST_F(SnapshotChildProcessTest, RestoreCleansExpiredLease) {
     ASSERT_TRUE(mount_result.has_value()) << "MountSegment failed";
 
     // Add two complete objects via PutStart + PutEnd
-    // Note: PutEnd calls GrantLease(0, ...) so lease is immediately expired
+    // PutEnd only grants a zero-duration read lease, so it is immediately
+    // expired.
     std::string expired_key = "expired_lease_object";
     auto put_exp =
         service_->PutStart(client_id, expired_key, TenantId::Default(), {1024},
@@ -1104,15 +1116,34 @@ TEST_F(SnapshotChildProcessTest, RestoreCleansExpiredLease) {
                     .has_value())
         << "PutEnd normal failed";
 
+    const int64_t soft_pin_baseline =
+        MasterMetricManager::instance().get_soft_pin_key_count();
+    std::string soft_expired_key = "expired_soft_pin_valid_lease_object";
+    ReplicateConfig soft_pin_config;
+    soft_pin_config.soft_pin_action = SoftPinAction::ENABLE;
+    soft_pin_config.soft_pin_ttl_ms = 20;
+    auto put_soft =
+        service_->PutStart(client_id, soft_expired_key, TenantId::Default(),
+                           {1024}, soft_pin_config);
+    ASSERT_TRUE(put_soft.has_value()) << "PutStart soft pin failed";
+    ASSERT_TRUE(service_
+                    ->PutEnd(client_id, soft_expired_key, TenantId::Default(),
+                             ReplicaType::MEMORY)
+                    .has_value())
+        << "PutEnd soft pin failed";
+
     // ExistKey grants a fresh lease (now + 600s) to normal_key
     EXPECT_TRUE(
         service_->ExistKey(normal_key, TenantId::Default()).value_or(false));
+    EXPECT_TRUE(service_->ExistKey(soft_expired_key, TenantId::Default())
+                    .value_or(false));
     // Do NOT call ExistKey on expired_key, its lease stays expired from PutEnd
 
     // Step 2: Persist state
     auto persist_result = CallPersistState("20240701_120000_001");
     ASSERT_TRUE(persist_result.has_value())
         << "PersistState failed: " << persist_result.error().message;
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
     service_.reset();
 
     // Step 3: Restore into a new service
@@ -1133,6 +1164,12 @@ TEST_F(SnapshotChildProcessTest, RestoreCleansExpiredLease) {
         << "Normal object with valid lease should survive restore";
     EXPECT_FALSE(KeyExistsInMetadata(restored_service.get(), expired_key))
         << "Lease-expired object should be cleaned during restore";
+    EXPECT_TRUE(
+        restored_service->ExistKey(soft_expired_key, "default").value_or(false))
+        << "Expired soft pin with a valid read lease should restore as cache";
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              soft_pin_baseline)
+        << "Expired restored soft pins must not remain in the active gauge";
 
     restored_service.reset();
 }

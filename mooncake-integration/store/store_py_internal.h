@@ -861,8 +861,10 @@ bool parallelism_specs_equal_by_kind(const TensorParallelismSpec &lhs,
 }
 
 bool is_default_replicate_config(const ReplicateConfig &config) {
-    return config.replica_num == 1 && !config.with_soft_pin &&
-           !config.with_hard_pin && config.preferred_segments.empty() &&
+    return config.replica_num == 1 &&
+           config.soft_pin_action == SoftPinAction::PRESERVE &&
+           !config.soft_pin_ttl_ms.has_value() && !config.with_hard_pin &&
+           config.preferred_segments.empty() &&
            config.preferred_segment.empty() &&
            !config.prefer_alloc_in_same_node && !config.group_ids.has_value();
 }

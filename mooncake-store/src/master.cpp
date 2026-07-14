@@ -36,9 +36,13 @@ static_assert(mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL == 10000,
 static_assert(mooncake::DEFAULT_KV_SOFT_PIN_TTL_MS == 30 * 60 * 1000,
               "Update kDefaultKvSoftPinTtlFlagValue when "
               "DEFAULT_KV_SOFT_PIN_TTL_MS changes");
+static_assert(mooncake::DEFAULT_MAX_KV_SOFT_PIN_TTL_MS == 24 * 60 * 60 * 1000,
+              "Update kDefaultMaxKvSoftPinTtlFlagValue when "
+              "DEFAULT_MAX_KV_SOFT_PIN_TTL_MS changes");
 
 constexpr char kDefaultKvLeaseTtlFlagValue[] = "10000";
 constexpr char kDefaultKvSoftPinTtlFlagValue[] = "1800000";
+constexpr char kDefaultMaxKvSoftPinTtlFlagValue[] = "86400000";
 
 namespace {
 
@@ -124,11 +128,16 @@ DEFINE_string(default_kv_lease_ttl, kDefaultKvLeaseTtlFlagValue,
 DEFINE_string(default_kv_soft_pin_ttl, kDefaultKvSoftPinTtlFlagValue,
               "Default soft pin TTL for kv objects. Supports raw milliseconds "
               "or duration strings with ms, s, m, or h suffixes");
+DEFINE_string(max_kv_soft_pin_ttl, kDefaultMaxKvSoftPinTtlFlagValue,
+              "Maximum request-level soft pin TTL for kv objects. Supports "
+              "raw milliseconds or duration strings with ms, s, m, or h "
+              "suffixes");
 DEFINE_bool(allow_evict_soft_pinned_objects,
             mooncake::DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS,
             "Whether to allow eviction of soft pinned objects during eviction");
 DEFINE_validator(default_kv_lease_ttl, ValidateDurationFlag);
 DEFINE_validator(default_kv_soft_pin_ttl, ValidateDurationFlag);
+DEFINE_validator(max_kv_soft_pin_ttl, ValidateDurationFlag);
 DEFINE_double(eviction_ratio, mooncake::DEFAULT_EVICTION_RATIO,
               "Ratio of objects to evict when Memory space is full");
 DEFINE_double(eviction_high_watermark_ratio,
@@ -448,6 +457,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetDurationMs("default_kv_soft_pin_ttl",
                                  &master_config.default_kv_soft_pin_ttl,
                                  mooncake::DEFAULT_KV_SOFT_PIN_TTL_MS);
+    default_config.GetDurationMs("max_kv_soft_pin_ttl",
+                                 &master_config.max_kv_soft_pin_ttl,
+                                 mooncake::DEFAULT_MAX_KV_SOFT_PIN_TTL_MS);
     default_config.GetBool("allow_evict_soft_pinned_objects",
                            &master_config.allow_evict_soft_pinned_objects,
                            FLAGS_allow_evict_soft_pinned_objects);
@@ -768,6 +780,12 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.default_kv_soft_pin_ttl = ParseDurationFlagOrDie(
             "default_kv_soft_pin_ttl", FLAGS_default_kv_soft_pin_ttl);
+    }
+    if ((google::GetCommandLineFlagInfo("max_kv_soft_pin_ttl", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.max_kv_soft_pin_ttl = ParseDurationFlagOrDie(
+            "max_kv_soft_pin_ttl", FLAGS_max_kv_soft_pin_ttl);
     }
     if ((google::GetCommandLineFlagInfo("allow_evict_soft_pinned_objects",
                                         &info) &&
@@ -1370,6 +1388,7 @@ int main(int argc, char* argv[]) {
         << ", metrics_port=" << master_config.metrics_port
         << ", default_kv_lease_ttl=" << master_config.default_kv_lease_ttl
         << ", default_kv_soft_pin_ttl=" << master_config.default_kv_soft_pin_ttl
+        << ", max_kv_soft_pin_ttl=" << master_config.max_kv_soft_pin_ttl
         << ", allow_evict_soft_pinned_objects="
         << master_config.allow_evict_soft_pinned_objects
         << ", eviction_ratio=" << master_config.eviction_ratio
