@@ -120,13 +120,22 @@ Status ReceiverCreditPullController::request(
             it = peers_.emplace(key, Peer{}).first;
         }
         auto& peer = it->second;
+        bool demand_changed = peer.server_addr != server_addr;
         peer.server_addr = server_addr;
-        for (size_t i = 0; i < kCreditResourceCount; ++i)
-            peer.minimum[i] = std::max(peer.minimum[i], minimum[i]);
-        peer.dirty = true;
+        for (size_t i = 0; i < kCreditResourceCount; ++i) {
+            if (minimum[i] > peer.minimum[i]) {
+                peer.minimum[i] = minimum[i];
+                demand_changed = true;
+            }
+        }
         if (!peer.in_flight) {
             peer.in_flight = true;
             should_launch = true;
+        } else if (demand_changed) {
+            // Repeated progress attempts for the same blocked owner must not
+            // create an RPC train behind the outstanding pull. A fresh attempt
+            // after completion can still launch if the refill was insufficient.
+            peer.dirty = true;
         }
     }
     if (should_launch) launch(key);
