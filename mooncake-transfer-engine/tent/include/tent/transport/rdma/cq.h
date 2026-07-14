@@ -19,6 +19,8 @@
 #include <glog/logging.h>
 #include <infiniband/verbs.h>
 
+#include <atomic>
+
 #include "tent/common/status.h"
 
 namespace mooncake {
@@ -29,6 +31,32 @@ class RdmaContext;
 class RdmaCQ {
    public:
     RdmaCQ() : cq_(nullptr), cqe_now_(0), cqe_limit_(-1), context_(nullptr) {}
+    RdmaCQ(const RdmaCQ &other)
+        : cq_(other.cq_),
+          cqe_now_(other.cqe_now_.load(std::memory_order_relaxed)),
+          cqe_limit_(other.cqe_limit_),
+          context_(other.context_) {}
+    RdmaCQ(RdmaCQ &&other) noexcept
+        : cq_(other.cq_),
+          cqe_now_(other.cqe_now_.load(std::memory_order_relaxed)),
+          cqe_limit_(other.cqe_limit_),
+          context_(other.context_) {}
+    RdmaCQ &operator=(const RdmaCQ &other) {
+        cq_ = other.cq_;
+        cqe_now_.store(other.cqe_now_.load(std::memory_order_relaxed),
+                       std::memory_order_relaxed);
+        cqe_limit_ = other.cqe_limit_;
+        context_ = other.context_;
+        return *this;
+    }
+    RdmaCQ &operator=(RdmaCQ &&other) noexcept {
+        cq_ = other.cq_;
+        cqe_now_.store(other.cqe_now_.load(std::memory_order_relaxed),
+                       std::memory_order_relaxed);
+        cqe_limit_ = other.cqe_limit_;
+        context_ = other.context_;
+        return *this;
+    }
 
     ~RdmaCQ();
 
@@ -43,11 +71,13 @@ class RdmaCQ {
 
     void cancelQuota(int num_entries);
 
-    int getQuota() const { return cqe_now_; }
+    int getQuota() const { return cqe_now_.load(std::memory_order_relaxed); }
 
     int maxCqe() const { return cqe_limit_; }
 
-    bool empty() const { return cqe_now_ == 0; }
+    bool empty() const {
+        return cqe_now_.load(std::memory_order_relaxed) == 0;
+    }
 
     int poll(int num_entries, ibv_wc *wc);
 
@@ -57,7 +87,7 @@ class RdmaCQ {
 
    private:
     ibv_cq *cq_;
-    volatile int cqe_now_;
+    std::atomic<int> cqe_now_;
     int cqe_limit_;
     RdmaContext *context_;
 };
