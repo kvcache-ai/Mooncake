@@ -136,6 +136,10 @@ int mooncake_store_setup_ex(
         case MOONCAKE_REPLICA_SELECTION_SHADOW:
             replica_selection.mode = mooncake::ReplicaSelectionMode::SHADOW;
             break;
+        case MOONCAKE_REPLICA_SELECTION_SHADOW_LIVE:
+            replica_selection.mode = mooncake::ReplicaSelectionMode::SHADOW;
+            replica_selection.collect_transfer_signals = true;
+            break;
         default:
             return -1;
     }

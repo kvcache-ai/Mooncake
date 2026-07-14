@@ -49,6 +49,8 @@ add_store_test(replica_selection_config_test
                replica_selection_config_test.cpp)
 add_store_test(cached_replica_score_provider_test
                cached_replica_score_provider_test.cpp)
+add_store_test(replica_transfer_signal_collector_test
+               replica_transfer_signal_collector_test.cpp)
 add_test(
   NAME replica_selector_v2_env_v1_isolation_test
   COMMAND replica_selector_v2_test

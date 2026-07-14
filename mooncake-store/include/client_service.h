@@ -88,7 +88,8 @@ class Client {
         const std::string& master_server_entry = kDefaultMasterAddress,
         const std::shared_ptr<TransferEngine>& transfer_engine = nullptr,
         std::map<std::string, std::string> labels = {},
-        const std::string& tenant_id = "default");
+        const std::string& tenant_id = "default",
+        std::shared_ptr<TransferSignalObserver> signal_observer = nullptr);
 
     /**
      * @brief Retrieves data for a given key
@@ -675,7 +676,8 @@ class Client {
         const std::string& local_hostname,
         const std::string& metadata_connstring, const std::string& protocol,
         const std::optional<std::string>& device_names);
-    void InitTransferSubmitter();
+    void InitTransferSubmitter(
+        std::shared_ptr<TransferSignalObserver> signal_observer = nullptr);
     ErrorCode TransferData(const Replica::Descriptor& replica_descriptor,
                            std::vector<Slice>& slices,
                            TransferRequest::OpCode op_code);

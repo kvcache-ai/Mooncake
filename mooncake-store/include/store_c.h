@@ -27,6 +27,7 @@ typedef void *mooncake_store_t;
 typedef enum mooncake_replica_selection_mode {
     MOONCAKE_REPLICA_SELECTION_LEGACY = 0,
     MOONCAKE_REPLICA_SELECTION_SHADOW = 1,
+    MOONCAKE_REPLICA_SELECTION_SHADOW_LIVE = 2,
 } mooncake_replica_selection_mode_t;
 
 #define MOONCAKE_STORE_SETUP_OPTIONS_VERSION 1u

@@ -18,6 +18,12 @@ TEST(ReplicaSelectionConfigTest, AcceptsOnlyExactPublicModes) {
     const auto shadow = ParseReplicaSelectionOptions("shadow");
     ASSERT_TRUE(shadow.has_value());
     EXPECT_EQ(shadow->mode, ReplicaSelectionMode::SHADOW);
+    EXPECT_FALSE(shadow->collect_transfer_signals);
+
+    const auto shadow_live = ParseReplicaSelectionOptions("shadow-live");
+    ASSERT_TRUE(shadow_live.has_value());
+    EXPECT_EQ(shadow_live->mode, ReplicaSelectionMode::SHADOW);
+    EXPECT_TRUE(shadow_live->collect_transfer_signals);
 
     for (const std::string_view invalid :
          std::array<std::string_view, 8>{"", "active", "LEGACY", "SHADOW",

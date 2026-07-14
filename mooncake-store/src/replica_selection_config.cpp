@@ -12,6 +12,9 @@ std::optional<ReplicaSelectionOptions> ParseReplicaSelectionOptions(
     if (mode == "shadow") {
         return ReplicaSelectionOptions{ReplicaSelectionMode::SHADOW};
     }
+    if (mode == "shadow-live") {
+        return ReplicaSelectionOptions{ReplicaSelectionMode::SHADOW, true};
+    }
     return std::nullopt;
 }
 

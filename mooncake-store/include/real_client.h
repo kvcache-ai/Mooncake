@@ -19,6 +19,7 @@
 #include "utils.h"
 #include "rpc_types.h"
 #include "cached_replica_score_provider.h"
+#include "replica_transfer_signal_collector.h"
 #include "replica_selection_config.h"
 #if defined(USE_SUNRISE)
 #include "sunrise_allocator.h"
@@ -920,6 +921,8 @@ class RealClient : public PyClient {
     std::atomic<bool> closed_{false};
 
     std::shared_ptr<CachedReplicaScoreProvider> replica_score_provider_;
+    std::shared_ptr<ReplicaTransferSignalCollector>
+        replica_transfer_signal_collector_;
     std::unique_ptr<ReplicaSelector> replica_selector_;
     mutable std::atomic<uint64_t> replica_selection_nonce_{0};
 

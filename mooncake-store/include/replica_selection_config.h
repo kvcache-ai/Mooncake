@@ -14,6 +14,7 @@ namespace mooncake {
 // demonstrated an end-to-end benefit and a separate rollout is approved.
 struct ReplicaSelectionOptions {
     ReplicaSelectionMode mode{ReplicaSelectionMode::LEGACY};
+    bool collect_transfer_signals{false};
 };
 
 [[nodiscard]] std::optional<ReplicaSelectionOptions>

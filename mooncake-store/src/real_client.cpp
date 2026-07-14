@@ -616,6 +616,11 @@ tl::expected<void, ErrorCode> RealClient::setup_internal_with_options(
                    << ReplicaSelectionModeName(replica_selection.mode);
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+    if (replica_selection.collect_transfer_signals &&
+        replica_selection.mode != ReplicaSelectionMode::SHADOW) {
+        LOG(ERROR) << "Live replica transfer signals require SHADOW mode";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
 
     if (replica_selection.mode == ReplicaSelectionMode::SHADOW) {
         ReplicaSignalProviderConfig provider_config;
@@ -627,9 +632,15 @@ tl::expected<void, ErrorCode> RealClient::setup_internal_with_options(
             true, false, std::chrono::seconds(30), 1.0};
         replica_score_provider_ =
             std::make_shared<CachedReplicaScoreProvider>(provider_config);
+        replica_transfer_signal_collector_ =
+            replica_selection.collect_transfer_signals
+                ? std::make_shared<ReplicaTransferSignalCollector>(
+                      replica_score_provider_)
+                : nullptr;
         replica_selector_ = std::make_unique<ReplicaSelector>(
             ReplicaSelectionMode::SHADOW, replica_score_provider_);
     } else {
+        replica_transfer_signal_collector_.reset();
         replica_score_provider_.reset();
         replica_selector_ = std::make_unique<ReplicaSelector>(
             ReplicaSelectionMode::LEGACY);
@@ -680,7 +691,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal_with_options(
         auto client_opt = mooncake::Client::Create(
             this->local_hostname, metadata_server, protocol, device_name,
             master_server_addr, transfer_engine, {{"client_mode", "real"}},
-            tenant_id);
+            tenant_id, replica_transfer_signal_collector_);
         if (!client_opt) {
             LOG(ERROR) << "Failed to create client";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -716,7 +727,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal_with_options(
             auto client_opt = mooncake::Client::Create(
                 this->local_hostname, metadata_server, protocol, device_name,
                 master_server_addr, transfer_engine, {{"client_mode", "real"}},
-                tenant_id);
+                tenant_id, replica_transfer_signal_collector_);
             if (client_opt) {
                 client_ = *client_opt;
                 success = true;
@@ -1048,6 +1059,27 @@ const Replica::Descriptor *RealClient::select_replica_for_read(
     }
 
     const auto local_endpoints = client_->GetLocalEndpoints();
+    if (replica_transfer_signal_collector_) {
+        for (const auto& replica : replicas) {
+            if (replica.status != ReplicaStatus::COMPLETE ||
+                !replica.is_memory_replica()) {
+                continue;
+            }
+            const auto& handle =
+                replica.get_memory_descriptor().buffer_descriptor;
+            if (!local_endpoints.contains(handle.transport_endpoint_)) {
+                replica_transfer_signal_collector_->ObserveEndpoint(
+                    handle.transport_endpoint_, handle.protocol_);
+            }
+        }
+        const auto publish_status =
+            replica_transfer_signal_collector_->PublishSnapshotIfNeeded();
+        if (publish_status != ReplicaSignalPublishStatus::PUBLISHED) {
+            LOG_EVERY_N(WARNING, 1000)
+                << "Failed to publish live replica transfer signals: "
+                << static_cast<int>(publish_status);
+        }
+    }
     const ReplicaSelectionContext context{
         client_->tenant_id(), key, local_hostname, "", requested_bytes,
         replica_selection_nonce_.fetch_add(1, std::memory_order_relaxed)};
@@ -1220,7 +1252,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     if (!replica_selection) {
         LOG(ERROR) << "Invalid " << CONFIG_KEY_REPLICA_SELECTION_MODE << ": "
                    << replica_selection_mode
-                   << "; expected exactly 'legacy' or 'shadow'";
+                   << "; expected exactly 'legacy', 'shadow', or "
+                      "'shadow-live'";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     bool enable_ssd_offload =
