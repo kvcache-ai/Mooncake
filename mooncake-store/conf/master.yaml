@@ -11,6 +11,8 @@ default_kv_lease_ttl: 10000
 default_kv_soft_pin_ttl: 1800000
 allow_evict_soft_pinned_objects: true
 eviction_ratio: 0.1
+# Overrides the 0.90 code default. A value of 1.0 disables proactive
+# usage-ratio eviction; allocation-failure-triggered eviction remains enabled.
 eviction_high_watermark_ratio: 1.0
 
 enable_multi_tenants: false
