@@ -177,7 +177,10 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30, suppress_kineto_output: 
     events = prof.key_averages()
 
     def cuda_time_us(event):
-        return float(getattr(event, "cuda_time_total", getattr(event, "device_time_total", 0.0)))
+        cuda_time = float(getattr(event, "cuda_time_total", 0.0))
+        if cuda_time > 0:
+            return cuda_time
+        return float(getattr(event, "device_time_total", 0.0))
 
     for name in kernel_names:
         matched_events = [event for event in events if name in event.key and cuda_time_us(event) > 0]
@@ -194,7 +197,10 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30, suppress_kineto_output: 
         kernel_times.append(total_cuda_time_us / total_count / 1e6)
 
     if os.getenv("MOONCAKE_EP_KINETO_DUMP", "").upper() in {"1", "ON", "TRUE", "YES"}:
-        prof_lines = prof.key_averages().table(sort_by='cuda_time_total', max_name_column_width=160).split('\n')
+        sort_by = "cuda_time_total" if any(
+            float(getattr(event, "cuda_time_total", 0.0)) > 0 for event in events
+        ) else "device_time_total"
+        prof_lines = prof.key_averages().table(sort_by=sort_by, max_name_column_width=160).split('\n')
         print("\n".join(prof_lines[:80]), flush=True)
 
     return tuple(kernel_times) if is_tupled else kernel_times[0]
