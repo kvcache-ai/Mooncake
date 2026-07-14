@@ -55,8 +55,6 @@ static bool parseJsonString(const std::string& json_str, Json::Value& value,
 // throughput and concurrency benefits.
 class PeerClientPerfTest : public ::testing::Test {
    protected:
-    static constexpr uint16_t kTestPort = 50052;
-
     void SetUp() override {
         google::InitGoogleLogging("PeerClientPerfTest");
         FLAGS_logtostderr = 1;
@@ -92,21 +90,20 @@ class PeerClientPerfTest : public ::testing::Test {
 
         rpc_service_ = std::make_unique<ClientRpcService>(*data_manager_);
 
+        // Bind to an ephemeral port (0) so the OS assigns a free one
         server_ = std::make_unique<coro_rpc::coro_rpc_server>(
-            /*thread_num=*/4, kTestPort);
+            /*thread_num=*/4, /*port=*/0);
         RegisterClientRpcService(*server_, *rpc_service_);
 
-        server_thread_ = std::thread([this]() {
-            auto ec = server_->start();
-            if (ec) {
-                LOG(ERROR) << "Server start failed: " << ec.message();
-            }
-        });
+        server_->async_start();
+        ASSERT_FALSE(server_->get_errc())
+            << "Server start failed: " << server_->get_errc().message();
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        uint16_t actual_port = server_->port();
+        ASSERT_NE(actual_port, 0) << "Server did not bind to an ephemeral port";
 
         peer_client_ = std::make_unique<PeerClient>();
-        std::string endpoint = "127.0.0.1:" + std::to_string(kTestPort);
+        std::string endpoint = "127.0.0.1:" + std::to_string(actual_port);
         auto connect_result = peer_client_->Connect(endpoint);
         ASSERT_TRUE(connect_result.has_value()) << "PeerClient::Connect failed";
     }
@@ -115,9 +112,6 @@ class PeerClientPerfTest : public ::testing::Test {
         peer_client_.reset();
         if (server_) {
             server_->stop();
-        }
-        if (server_thread_.joinable()) {
-            server_thread_.join();
         }
         server_.reset();
         rpc_service_.reset();
@@ -286,7 +280,6 @@ class PeerClientPerfTest : public ::testing::Test {
     std::shared_ptr<TransferEngine> transfer_engine_;
     std::unique_ptr<ClientRpcService> rpc_service_;
     std::unique_ptr<coro_rpc::coro_rpc_server> server_;
-    std::thread server_thread_;
     std::unique_ptr<PeerClient> peer_client_;
 };
 
@@ -472,7 +465,6 @@ TEST_F(PeerClientPerfTest, WindowedAsyncConcurrency) {
 // when unavailable.
 class PeerClientRdmaPerfTest : public ::testing::Test {
    protected:
-    static constexpr uint16_t kTestPort = 50053;
     static constexpr uint64_t kRpcPort = 12351;
     static constexpr size_t kRdmaBufSize = 128 * 1024 * 1024;  // 128MB
     static constexpr size_t kBenchIterations = 5;
@@ -557,20 +549,18 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
         rpc_service_ = std::make_unique<ClientRpcService>(*data_manager_);
 
         server_ = std::make_unique<coro_rpc::coro_rpc_server>(
-            /*thread_num=*/4, kTestPort);
+            /*thread_num=*/4, /*port=*/0);
         RegisterClientRpcService(*server_, *rpc_service_);
 
-        server_thread_ = std::thread([this]() {
-            auto ec = server_->start();
-            if (ec) {
-                LOG(ERROR) << "RDMA server start failed: " << ec.message();
-            }
-        });
+        server_->async_start();
+        ASSERT_FALSE(server_->get_errc())
+            << "RDMA server start failed: " << server_->get_errc().message();
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        uint16_t actual_port = server_->port();
+        ASSERT_NE(actual_port, 0) << "Server did not bind to an ephemeral port";
 
         peer_client_ = std::make_unique<PeerClient>();
-        std::string endpoint = "127.0.0.1:" + std::to_string(kTestPort);
+        std::string endpoint = "127.0.0.1:" + std::to_string(actual_port);
         auto connect_result = peer_client_->Connect(endpoint);
         ASSERT_TRUE(connect_result.has_value()) << "PeerClient::Connect failed";
 
@@ -581,9 +571,6 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
         peer_client_.reset();
         if (server_) {
             server_->stop();
-        }
-        if (server_thread_.joinable()) {
-            server_thread_.join();
         }
         server_.reset();
         rpc_service_.reset();
@@ -799,7 +786,6 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
     std::shared_ptr<TransferEngine> transfer_engine_;
     std::unique_ptr<ClientRpcService> rpc_service_;
     std::unique_ptr<coro_rpc::coro_rpc_server> server_;
-    std::thread server_thread_;
     std::unique_ptr<PeerClient> peer_client_;
 };
 

@@ -31,6 +31,7 @@
 #undef protected
 #undef private
 
+#include "default_config.h"
 #include "test_p2p_server_helpers.h"
 #include "types.h"
 
@@ -259,3 +260,9 @@ TEST_F(P2PRegisterConcurrencyTest, DuplicateRegisterIsNoop) {
 
 }  // namespace testing
 }  // namespace mooncake
+
+int main(int argc, char** argv) {
+    ::testing::InitGoogleTest(&argc, argv);
+    mooncake::init_ylt_log_level();
+    return RUN_ALL_TESTS();
+}
