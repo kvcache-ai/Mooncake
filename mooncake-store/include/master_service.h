@@ -415,7 +415,6 @@ class MasterService {
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::string& tenant_id,
         ReplicaType replica_type = ReplicaType::ALL);
-
     /**
      * @brief Revoke a batch of put operations
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
@@ -1456,6 +1455,7 @@ class MasterService {
     // Helper to clean up stale handles pointing to unmounted segments
     // or local_disk replicas whose owner client is no longer alive.
     bool CleanupStaleHandles(
+        const std::string& key, const std::string& tenant_id,
         ObjectMetadata& metadata,
         const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients,
         MetadataShardAccessorRW* shard = nullptr);
@@ -1606,6 +1606,8 @@ class MasterService {
             // ClientMonitorFunc.
             if (tenant_state_ != nullptr &&
                 it_ != tenant_state_->metadata.end()) {
+                const auto previous_kv_media =
+                    service_->KvMediaForMetadata(it_->second);
                 // Erase invalid memory replicas (those with unmounted
                 // segments). No client_mutex_ needed since we only check memory
                 // replicas.
@@ -1621,6 +1623,9 @@ class MasterService {
                     service_->ReleaseCommittedQuotaCharge(
                         it_->second, before_charge - after_charge);
                 }
+                service_->SyncKvObjectState(object_id_.user_key, it_->second,
+                                            object_id_.tenant_id,
+                                            previous_kv_media);
                 // If no valid replicas remain, delete the whole object.
                 if (!it_->second.IsValid()) {
                     const bool had_processing =
@@ -2115,22 +2120,24 @@ class MasterService {
     std::unique_ptr<KvEventPublisher> kv_event_publisher_;
 
     static KvEventConfig BuildKvEventConfig(const MasterServiceConfig& config);
-    static std::string MediumForReplicaType(ReplicaType replica_type);
-    static std::string MediumForMetadata(const ObjectMetadata& metadata);
+    static std::vector<std::string> KvMediaForMetadata(
+        const ObjectMetadata& metadata);
     void PublishKvStored(const std::string& key, ReplicaType replica_type,
                          const ObjectMetadata& metadata,
                          const std::string& tenant_id);
+    void SyncKvObjectState(
+        const std::string& key, const ObjectMetadata& metadata,
+        const std::string& tenant_id,
+        const std::vector<std::string>& previous_media_hint = {});
     void PublishKvRemoved(const std::string& key,
                           const ObjectMetadata& metadata,
                           const std::string& tenant_id);
-    void PublishKvRemoved(const std::string& key, const std::string& medium,
-                          const std::string& tenant_id,
-                          const std::string& group_id);
     void PublishKvRemovedAfterEvict(const std::string& key,
                                     uint64_t freed_bytes,
                                     const std::string& medium,
                                     const ObjectMetadata& metadata,
                                     const std::string& tenant_id);
+    void PublishKvCleared(const std::string& tenant_id);
 };
 
 }  // namespace mooncake

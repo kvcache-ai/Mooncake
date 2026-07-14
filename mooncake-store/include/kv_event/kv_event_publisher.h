@@ -9,6 +9,8 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "kv_event/kv_event_config.h"
@@ -38,12 +40,37 @@ class KvEventPublisher {
                         const std::string& medium,
                         const std::string& tenant_id = "",
                         const std::string& group_id = "");
+    void PublishCleared(const std::string& tenant_id = "");
+
+    // Publish a successful Put/Upsert commit. Every currently available
+    // medium receives a stored event, while media absent from the new state
+    // receive removed events.
+    void PublishCommitted(const std::string& object_key,
+                          const std::vector<std::string>& current_media,
+                          const std::string& tenant_id = "",
+                          const std::string& group_id = "");
+
+    // Synchronize replica availability after an internal metadata mutation.
+    // previous_media_hint is used when the publisher has no in-process state,
+    // for example after restoring metadata from a snapshot.
+    void SyncObjectState(
+        const std::string& object_key,
+        const std::vector<std::string>& current_media,
+        const std::string& tenant_id = "", const std::string& group_id = "",
+        const std::vector<std::string>& previous_media_hint = {});
+
+    // Publish removal of every available medium and release cached context.
+    void PublishObjectRemoved(
+        const std::string& object_key, const std::string& tenant_id = "",
+        const std::string& group_id = "",
+        const std::vector<std::string>& previous_media_hint = {});
 
     struct Stats {
         uint64_t published_batches{0};
         uint64_t published_events{0};
         uint64_t dropped_events{0};
         uint64_t skipped_unparsed_keys{0};
+        uint64_t invalid_event_hashes{0};
     };
     Stats GetStats() const;
 
@@ -53,7 +80,22 @@ class KvEventPublisher {
     }
 
    private:
-    enum class EventKind { kStored, kRemoved };
+    enum class EventKind { kStored, kRemoved, kCleared };
+
+    struct EventContext {
+        std::string cache_prefix;
+        std::string model_name;
+        std::string connector_block_hash;
+        std::optional<uint64_t> seq_hash;
+        std::optional<int64_t> group_id;
+        std::optional<int64_t> tp_rank;
+        std::optional<int64_t> head_or_tp_rank;
+        std::optional<int64_t> pcp_rank;
+        std::optional<int64_t> dcp_rank;
+        std::optional<int64_t> pp_rank;
+        std::optional<int64_t> layer_id;
+        bool has_explicit_block_hash{false};
+    };
 
     struct PendingEvent {
         EventKind kind;
@@ -61,9 +103,15 @@ class KvEventPublisher {
         std::string medium;
         std::string tenant_id;
         std::string group_id;
+        EventContext context;
     };
 
-    void Enqueue(PendingEvent event);
+    struct ObjectEventState {
+        EventContext context;
+        std::unordered_set<std::string> media;
+    };
+
+    void EnqueueBatch(std::vector<PendingEvent> events);
     void WorkerLoop();
     void PublishBatch(const std::vector<PendingEvent>& batch);
     void DrainRemainingQueue(std::vector<PendingEvent>& batch);
@@ -85,6 +133,17 @@ class KvEventPublisher {
     std::atomic<uint64_t> published_events_{0};
     std::atomic<uint64_t> dropped_events_{0};
     std::atomic<uint64_t> skipped_unparsed_keys_{0};
+    std::atomic<uint64_t> invalid_event_hashes_{0};
+
+    mutable std::mutex state_mutex_;
+    std::unordered_map<std::string,
+                       std::unordered_map<std::string, ObjectEventState>>
+        object_states_;
+
+    EventContext BuildEventContext(const std::string& object_key);
+    static std::string ResolveGroupId(const std::string& group_id,
+                                      const EventContext& context);
+    void RecordInvalidHash(const char* field, const std::string& value);
 };
 
 #else
@@ -101,12 +160,22 @@ class KvEventPublisher {
                        const std::string& = "", const std::string& = "") {}
     void PublishRemoved(const std::string&, const std::string&,
                         const std::string& = "", const std::string& = "") {}
+    void PublishCleared(const std::string& = "") {}
+    void PublishCommitted(const std::string&, const std::vector<std::string>&,
+                          const std::string& = "", const std::string& = "") {}
+    void SyncObjectState(const std::string&, const std::vector<std::string>&,
+                         const std::string& = "", const std::string& = "",
+                         const std::vector<std::string>& = {}) {}
+    void PublishObjectRemoved(const std::string&, const std::string& = "",
+                              const std::string& = "",
+                              const std::vector<std::string>& = {}) {}
 
     struct Stats {
         uint64_t published_batches{0};
         uint64_t published_events{0};
         uint64_t dropped_events{0};
         uint64_t skipped_unparsed_keys{0};
+        uint64_t invalid_event_hashes{0};
     };
     Stats GetStats() const { return {}; }
 

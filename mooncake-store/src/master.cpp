@@ -230,19 +230,19 @@ DEFINE_bool(enable_kv_events, false,
 DEFINE_string(kv_events_bind_endpoint, "",
               "ZMQ PUB bind endpoint for KV events, e.g. tcp://0.0.0.0:5557");
 DEFINE_string(kv_events_model_name, "",
-              "Deprecated: not emitted on events; use indexer POST /register");
+              "Fixed model name fallback for published KV events");
 DEFINE_string(kv_events_backend_id, "",
               "backend_id for published KV events (cache owner identity)");
 DEFINE_string(kv_events_tenant_id, "default",
-              "Deprecated: tenant_id comes from each object on events");
+              "Config compatibility default; events use per-object tenant_id");
 DEFINE_string(kv_events_additional_salt, "",
-              "Deprecated: not emitted on events; use indexer POST /register");
+              "Fixed hash namespace salt for published KV events");
 DEFINE_string(kv_events_lora_name, "",
-              "Deprecated: not emitted on events (no LoRA context in master)");
+              "Fixed LoRA name for published KV events; empty means base model");
 DEFINE_uint32(kv_events_block_size, 0,
-              "Deprecated: not emitted on events; use indexer POST /register");
+              "Fixed KV block size for published events; 0 means unknown");
 DEFINE_uint32(kv_events_dp_rank, 0,
-              "Deprecated: not emitted on events; use indexer POST /register");
+              "Fixed data-parallel rank for published KV events");
 DEFINE_bool(kv_events_emit_legacy_compat, true,
             "Include vLLM/SGLang-compatible type/block_hashes fields");
 DEFINE_bool(kv_events_emit_object_key, true,
