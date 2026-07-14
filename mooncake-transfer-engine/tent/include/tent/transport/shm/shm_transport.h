@@ -75,6 +75,8 @@ class ShmTransport : public Transport {
     virtual Status freeLocalMemory(void *addr, size_t size);
 
    private:
+    friend class ShmTransportTestPeer;
+
     void startTransfer(ShmTask *task, ShmSubBatch *batch);
 
     void *createSharedMemory(const std::string &path, size_t size);
@@ -89,7 +91,6 @@ class ShmTransport : public Transport {
     std::shared_ptr<ControlService> metadata_;
 
     struct OpenedShmEntry {
-        int shm_fd;
         void *shm_addr;
         uint64_t length;
     };

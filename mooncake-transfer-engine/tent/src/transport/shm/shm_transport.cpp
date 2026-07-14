@@ -60,11 +60,11 @@ Status ShmTransport::install(std::string &local_segment_name,
 
 Status ShmTransport::uninstall() {
     if (installed_) {
+        RWSpinlock::WriteGuard guard(relocate_lock_);
         metadata_.reset();
         for (auto &relocate_map : relocate_map_) {
             for (auto &entry : relocate_map.second) {
                 munmap(entry.second.shm_addr, entry.second.length);
-                close(entry.second.shm_fd);
             }
         }
         relocate_map_.clear();
@@ -244,13 +244,26 @@ void *ShmTransport::createSharedMemory(const std::string &path, size_t size) {
 Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                                                  uint64_t length,
                                                  uint64_t target_id) {
-    thread_local HashMap tl_relocate_map;
-    if (tl_relocate_map.empty()) {
+    {
         RWSpinlock::ReadGuard guard(relocate_lock_);
-        tl_relocate_map = relocate_map_;
+        auto target = relocate_map_.find(target_id);
+        if (target != relocate_map_.end()) {
+            for (auto &entry : target->second) {
+                if (entry.first <= dest_addr &&
+                    dest_addr + length <= entry.first + entry.second.length) {
+                    auto shm_addr = entry.second.shm_addr;
+                    dest_addr = dest_addr - entry.first + ((uint64_t)shm_addr);
+                    return Status::OK();
+                }
+            }
+        }
     }
 
-    auto &relocate_map = tl_relocate_map[target_id];
+    RWSpinlock::WriteGuard guard(relocate_lock_);
+    auto &relocate_map = relocate_map_[target_id];
+
+    // Another thread may have published this mapping while the writer lock was
+    // pending. Recheck before opening and mapping the same shared-memory file.
     for (auto &entry : relocate_map) {
         if (entry.first <= dest_addr &&
             dest_addr + length <= entry.first + entry.second.length) {
@@ -259,8 +272,6 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
             return Status::OK();
         }
     }
-
-    RWSpinlock::WriteGuard guard(relocate_lock_);
 
     BufferDesc *buffer;
     // Owning reference: `buffer` is used after the lambda returns.
@@ -301,12 +312,12 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                 return Status::InternalError(
                     "Failed to map shared memory " LOC_MARK);
             }
+            close(shm_fd);
             LOG(INFO) << "Original shared memory: " << (void *)buffer->addr
                       << "--" << (void *)(buffer->addr + buffer->length);
             LOG(INFO) << "Remapped shared memory: " << (void *)shm_addr << "--"
                       << (void *)((uintptr_t)shm_addr + buffer->length);
             OpenedShmEntry shm_entry;
-            shm_entry.shm_fd = shm_fd;
             shm_entry.shm_addr = shm_addr;
             shm_entry.length = buffer->length;
             relocate_map[buffer->addr] = shm_entry;
