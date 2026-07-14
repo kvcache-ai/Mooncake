@@ -241,22 +241,28 @@ void *ShmTransport::createSharedMemory(const std::string &path, size_t size) {
     return mapped_addr;
 }
 
+bool ShmTransport::tryResolve(const RelocateMap &relocate_map,
+                              uint64_t &dest_addr, uint64_t length) {
+    for (const auto &entry : relocate_map) {
+        if (entry.first <= dest_addr &&
+            dest_addr + length <= entry.first + entry.second.length) {
+            dest_addr = dest_addr - entry.first +
+                        reinterpret_cast<uint64_t>(entry.second.shm_addr);
+            return true;
+        }
+    }
+    return false;
+}
+
 Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                                                  uint64_t length,
                                                  uint64_t target_id) {
     {
         RWSpinlock::ReadGuard guard(relocate_lock_);
         auto target = relocate_map_.find(target_id);
-        if (target != relocate_map_.end()) {
-            for (auto &entry : target->second) {
-                if (entry.first <= dest_addr &&
-                    dest_addr + length <= entry.first + entry.second.length) {
-                    auto shm_addr = entry.second.shm_addr;
-                    dest_addr = dest_addr - entry.first + ((uint64_t)shm_addr);
-                    return Status::OK();
-                }
-            }
-        }
+        if (target != relocate_map_.end() &&
+            tryResolve(target->second, dest_addr, length))
+            return Status::OK();
     }
 
     RWSpinlock::WriteGuard guard(relocate_lock_);
@@ -264,18 +270,12 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
         return Status::InvalidArgument(
             "SHM transport is not installed" LOC_MARK);
     }
-    auto &relocate_map = relocate_map_[target_id];
-
     // Another thread may have published this mapping while the writer lock was
     // pending. Recheck before opening and mapping the same shared-memory file.
-    for (auto &entry : relocate_map) {
-        if (entry.first <= dest_addr &&
-            dest_addr + length <= entry.first + entry.second.length) {
-            auto shm_addr = entry.second.shm_addr;
-            dest_addr = dest_addr - entry.first + ((uint64_t)shm_addr);
-            return Status::OK();
-        }
-    }
+    auto target = relocate_map_.find(target_id);
+    if (target != relocate_map_.end() &&
+        tryResolve(target->second, dest_addr, length))
+        return Status::OK();
 
     BufferDesc *buffer;
     // Owning reference: `buffer` is used after the lambda returns.
@@ -290,8 +290,17 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
             return Status::OK();
         }));
 
-    if (!relocate_map.count(buffer->addr)) {
-        void *shm_addr = nullptr;
+    void *shm_addr = nullptr;
+    bool mapping_found = false;
+    if (target != relocate_map_.end()) {
+        auto mapping = target->second.find(buffer->addr);
+        if (mapping != target->second.end()) {
+            shm_addr = mapping->second.shm_addr;
+            mapping_found = true;
+        }
+    }
+
+    if (!mapping_found) {
         LocationParser location(buffer->location);
         if (location.type() == "cuda") {
             return Status::NotImplemented(
@@ -324,12 +333,11 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
             OpenedShmEntry shm_entry;
             shm_entry.shm_addr = shm_addr;
             shm_entry.length = buffer->length;
-            relocate_map[buffer->addr] = shm_entry;
+            relocate_map_[target_id][buffer->addr] = shm_entry;
         }
     }
 
-    auto shm_addr = relocate_map[buffer->addr].shm_addr;
-    dest_addr = dest_addr - buffer->addr + ((uint64_t)shm_addr);
+    dest_addr = dest_addr - buffer->addr + reinterpret_cast<uint64_t>(shm_addr);
     return Status::OK();
 }
 

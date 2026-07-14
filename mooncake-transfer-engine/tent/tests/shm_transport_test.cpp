@@ -47,6 +47,12 @@ class ShmTransportTestPeer {
         auto it = transport.relocate_map_.find(target_id);
         return it == transport.relocate_map_.end() ? 0 : it->second.size();
     }
+
+    static bool hasTarget(ShmTransport& transport, SegmentID target_id) {
+        RWSpinlock::ReadGuard guard(transport.relocate_lock_);
+        return transport.relocate_map_.find(target_id) !=
+               transport.relocate_map_.end();
+    }
 };
 
 namespace {
@@ -105,6 +111,12 @@ TEST(ShmTransportTest, SharesAndReleasesRelocationAcrossThreads) {
                     .install(local_segment_name, metadata, nullptr,
                              std::make_shared<Config>())
                     .ok());
+
+    uint64_t missing_address = kRemoteAddress + page_size;
+    EXPECT_TRUE(ShmTransportTestPeer::relocate(transport, missing_address,
+                                               page_size, LOCAL_SEGMENT_ID)
+                    .IsNeedsRefreshCache());
+    EXPECT_FALSE(ShmTransportTestPeer::hasTarget(transport, LOCAL_SEGMENT_ID));
 
     std::atomic<size_t> ready{0};
     std::atomic<bool> start{false};

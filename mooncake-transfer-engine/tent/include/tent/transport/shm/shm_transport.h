@@ -95,9 +95,11 @@ class ShmTransport : public Transport {
         uint64_t length;
     };
 
-    using HashMap =
-        std::unordered_map<SegmentID,
-                           std::unordered_map<uint64_t, OpenedShmEntry>>;
+    using RelocateMap = std::unordered_map<uint64_t, OpenedShmEntry>;
+    using HashMap = std::unordered_map<SegmentID, RelocateMap>;
+
+    static bool tryResolve(const RelocateMap &relocate_map, uint64_t &dest_addr,
+                           uint64_t length);
 
     RWSpinlock relocate_lock_;
     HashMap relocate_map_;
