@@ -38,11 +38,6 @@ class AgentStateMachine {
     std::optional<TransferObservationReport> processTransferObservation(
         const TransferObservationEvent& event);
 
-    // Merge `next` into `acc` for peers where next.attempted_ranks is set.
-    // Later observations override earlier ones for the same peer.
-    void mergeObservationEvent(TransferObservationEvent& acc,
-                               const TransferObservationEvent& next);
-
     GroupView getGroupView(GroupId group_id) const;
 
     enum class CoordinatorConnection {

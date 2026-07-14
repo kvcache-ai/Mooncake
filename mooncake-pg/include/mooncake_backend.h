@@ -124,12 +124,12 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
               autoDeactivateOnFailure_{autoDeactivateOnFailure},
               autoSyncOnFailure_{autoSyncOnFailure} {}
 
-        // Deprecated constructors (retained for compatibility)
-        // isExtension is ignored. If activeRanks is provided, only its storage
-        // is used; its contents are populated by Coordinator.
-
+        // If activeRanks is provided, only its storage is used -- the contents
+        // are populated by the Coordinator.
         explicit MooncakeBackendOptions(at::Tensor activeRanks)
             : activeRanks_{activeRanks} {}
+
+        // Deprecated constructors: isExtension is ignored
         MooncakeBackendOptions(at::Tensor activeRanks, bool /*isExtension*/)
             : activeRanks_{activeRanks} {}
         MooncakeBackendOptions(at::Tensor activeRanks, bool /*isExtension*/,

@@ -294,7 +294,8 @@ void AgentHost::pushTransferObservation(std::vector<uint8_t> attempted_ranks,
     if (!pending_observation_.has_value()) {
         pending_observation_ = std::move(event);
     } else {
-        agent_.mergeObservationEvent(*pending_observation_, event);
+        TransferObservationEvent::merge(*pending_observation_, event,
+                                        max_world_size_);
     }
 }
 

@@ -290,13 +290,4 @@ AgentStateMachine::processTransferObservation(
     return std::nullopt;
 }
 
-void AgentStateMachine::mergeObservationEvent(
-    TransferObservationEvent& acc, const TransferObservationEvent& next) {
-    for (int peer = 0; peer < max_world_size_; ++peer) {
-        if (!next.attempted_ranks[peer]) continue;
-        acc.attempted_ranks[peer] = 1;
-        acc.failed_ranks_hint[peer] = next.failed_ranks_hint[peer];
-    }
-}
-
 }  // namespace mooncake

@@ -826,6 +826,13 @@ bool CentralizedCoordinatorStateMachine::processGroupRegistration(
     RegisterGroupResponse& response, std::vector<CoordinatorEffect>& effects) {
     GroupId group_id = group.group_id;
 
+    // Validate joining_rank
+    if (!rankInRange(joining_rank)) {
+        response.success = false;
+        response.reject_reason = "joining rank is out of valid range";
+        return false;
+    }
+
     // Validate rank_order elements.
     for (GlobalRank r : group.rank_order) {
         if (!rankInRange(r)) {
@@ -844,6 +851,14 @@ bool CentralizedCoordinatorStateMachine::processGroupRegistration(
             response.reject_reason = "rank_order contains duplicate ranks";
             return false;
         }
+    }
+
+    // The joining rank must be one of the ranks it declares in rank_order.
+    if (std::find(group.rank_order.begin(), group.rank_order.end(),
+                  joining_rank) == group.rank_order.end()) {
+        response.success = false;
+        response.reject_reason = "joining rank not in rank_order";
+        return false;
     }
 
     auto it = group_views_.find(group_id);
@@ -893,12 +908,11 @@ bool CentralizedCoordinatorStateMachine::processGroupRegistration(
         group_views_[group_id].rank_order = new_order;
     }
 
-    // The joining rank needs to be able to receive view updates from the
-    // Coordinator, even if it is not yet active.  Promote None to Inactive
-    // so that pushViewUpdate() will deliver the authoritative view to it.
+    // Any rank that (re-)registers with the group needs to receive view
+    // updates from the Coordinator before it becomes active.  Only promote
+    // None -> Inactive: replacement ranks may already be Active.
     auto& view = group_views_[group_id];
-    if (rankInRange(joining_rank) &&
-        view.members[joining_rank].status == GroupMemberState::None) {
+    if (view.members[joining_rank].status == GroupMemberState::None) {
         view.members[joining_rank].status = GroupMemberState::Inactive;
     }
 

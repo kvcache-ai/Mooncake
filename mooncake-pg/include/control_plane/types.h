@@ -102,6 +102,18 @@ struct GroupView {
 struct TransferObservationEvent {
     std::vector<uint8_t> attempted_ranks;
     std::vector<uint8_t> failed_ranks_hint;
+
+    // Merge `next` into `acc` for peers where next.attempted_ranks is set.
+    // Later observations override earlier ones for the same peer.
+    static void merge(TransferObservationEvent& acc,
+                      const TransferObservationEvent& next,
+                      int max_world_size) {
+        for (int peer = 0; peer < max_world_size; ++peer) {
+            if (!next.attempted_ranks[peer]) continue;
+            acc.attempted_ranks[peer] = 1;
+            acc.failed_ranks_hint[peer] = next.failed_ranks_hint[peer];
+        }
+    }
 };
 
 }  // namespace mooncake
