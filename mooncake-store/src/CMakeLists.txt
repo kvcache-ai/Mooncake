@@ -74,6 +74,7 @@ set(MOONCAKE_STORE_SOURCES
     memory_alloc.cpp
     ssd_register_client.cpp
     replica_placement_policy.cpp
+    replica_placement_shadow.cpp
     engram/engram_store.cpp)
 
 set(EXTRA_LIBS "")
