@@ -59,6 +59,12 @@ struct GidSelectionSnapshot {
     int gid_index = -1;
 };
 
+enum class GidRefreshResult {
+    UNCHANGED = 0,
+    CHANGED = 1,
+    FAILED = 2,
+};
+
 struct RdmaCq {
     RdmaCq() : native(nullptr), outstanding(0) {}
     ibv_cq *native;
@@ -173,8 +179,8 @@ class RdmaContext {
     // Refresh the runtime GID after IBV_EVENT_GID_CHANGE. Auto-GID mode uses
     // the same candidate filtering/ranking as initial device open; explicit
     // MC_GID_INDEX keeps the configured index and refreshes only its value.
-    bool refreshCurrentGid(std::string *previous_gid = nullptr,
-                           std::string *next_gid = nullptr);
+    GidRefreshResult refreshCurrentGid(std::string *previous_gid = nullptr,
+                                       std::string *next_gid = nullptr);
 
     ibv_context *context() const { return context_; }
 

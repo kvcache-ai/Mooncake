@@ -655,14 +655,16 @@ int WorkerPool::doProcessContextEvents() {
                   << " is now inactive due to fatal event: "
                   << event.event_type;
     } else if (event.event_type == IBV_EVENT_GID_CHANGE) {
-        bool gid_changed = refreshPublishedLocalGid();
+        auto gid_refresh_result = refreshPublishedLocalGid();
         ibv_ack_async_event(&event);
         event_acked = true;
 
-        if (gid_changed) {
+        if (gid_refresh_result != GidRefreshResult::UNCHANGED) {
             context_.disconnectAllEndpoints();
             LOG(INFO) << "Worker: Context " << context_.deviceName()
-                      << " GID changed, disconnected all endpoints";
+                      << " GID refresh result="
+                      << static_cast<int>(gid_refresh_result)
+                      << ", disconnected all endpoints";
         }
     } else if (event.event_type == IBV_EVENT_PORT_ACTIVE) {
         context_.set_active(true);
@@ -701,20 +703,23 @@ void WorkerPool::refreshPublishedLocalTopology() {
     }
 }
 
-bool WorkerPool::refreshPublishedLocalGid() {
+GidRefreshResult WorkerPool::refreshPublishedLocalGid() {
     std::string previous_gid;
     std::string next_gid;
-    bool changed = context_.refreshCurrentGid(&previous_gid, &next_gid);
-    if (changed) {
+    auto result = context_.refreshCurrentGid(&previous_gid, &next_gid);
+    if (result == GidRefreshResult::CHANGED) {
         LOG(WARNING) << "Worker: refreshed published GID for "
                      << context_.deviceName() << ": " << previous_gid << " -> "
                      << next_gid;
+    } else if (result == GidRefreshResult::UNCHANGED) {
+        LOG(INFO) << "Worker: received GID change event for "
+                  << context_.deviceName() << ", current GID is unchanged";
     } else {
-        LOG(WARNING) << "Worker: received GID change event for "
-                     << context_.deviceName()
-                     << ", but current GID did not change";
+        LOG(ERROR) << "Worker: failed to refresh published GID for "
+                   << context_.deviceName()
+                   << ", disconnecting endpoints to avoid stale GID reuse";
     }
-    return changed;
+    return result;
 }
 
 void WorkerPool::monitorWorker() {
