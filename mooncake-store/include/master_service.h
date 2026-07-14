@@ -1463,7 +1463,9 @@ class MasterService {
     bool CleanupStaleHandles(
         ObjectMetadata& metadata,
         const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients,
-        MetadataShardAccessorRW* shard = nullptr);
+        MetadataShardAccessorRW* shard, TenantState& tenant_state,
+        const std::string& key, const std::string& tenant_id,
+        bool* local_disk_disconnected = nullptr);
 
     size_t ReattachDisconnectedLocalDiskReplicas(
         const std::string& local_disk_segment_id, const UUID& new_client_id,
@@ -1532,22 +1534,13 @@ class MasterService {
      */
     void TryPushPromotionQueue(const ObjectIdentity& object_id);
 
-    // Erase any in-flight PromotionTask for `key`, abort any staged promotion
-    // quota reservation, and decrement the cluster-wide in-flight counter. Safe
-    // no-op if no task exists.
+    // Erase any in-flight PromotionTask for `key`, release pinned replicas,
+    // abort any staged promotion quota reservation, and decrement the
+    // cluster-wide in-flight counter. Safe no-op if no task exists.
     void ErasePromotionTaskIfPresent(
         TenantState& tenant_state, const std::string& key,
-        const std::string& tenant_id) NO_THREAD_SAFETY_ANALYSIS {
-        auto task_it = tenant_state.promotion_tasks.find(key);
-        if (task_it != tenant_state.promotion_tasks.end()) {
-            AbortTenantQuota(tenant_id,
-                             task_it->second.reserved_quota_charge_bytes);
-            tenant_state.promotion_tasks.erase(task_it);
-            promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
-            MasterMetricManager::instance().dec_promotion_in_flight();
-            MasterMetricManager::instance().inc_promotion_cancelled();
-        }
-    }
+        const std::string& tenant_id,
+        ObjectMetadata* metadata = nullptr) NO_THREAD_SAFETY_ANALYSIS;
 
     // Lease related members
     const uint64_t default_kv_lease_ttl_;     // in milliseconds

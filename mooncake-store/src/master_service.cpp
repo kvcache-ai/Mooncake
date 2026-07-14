@@ -1777,6 +1777,49 @@ size_t MasterService::EraseDisconnectedLocalDiskReplicas(
     return erased;
 }
 
+void MasterService::ErasePromotionTaskIfPresent(TenantState& tenant_state,
+                                                const std::string& key,
+                                                const std::string& tenant_id,
+                                                ObjectMetadata* metadata) {
+    auto task_it = tenant_state.promotion_tasks.find(key);
+    if (task_it == tenant_state.promotion_tasks.end()) {
+        return;
+    }
+
+    const auto task = task_it->second;
+    if (metadata != nullptr) {
+        auto* source = metadata->GetReplicaByID(task.source_id);
+        if (source != nullptr) {
+            source->dec_refcnt();
+        }
+        if (task.alloc_id != 0) {
+            EraseReplicasWithCacheTotalAccounting(
+                *metadata, [alloc_id = task.alloc_id](const Replica& replica) {
+                    return replica.id() == alloc_id;
+                });
+        }
+    }
+
+    {
+        ScopedLocalDiskSegmentAccess local_disk_segment_access =
+            segment_manager_.getLocalDiskSegmentAccess();
+        auto& client_local_disk_segment =
+            local_disk_segment_access.getClientLocalDiskSegment();
+        auto segment_it = client_local_disk_segment.find(task.holder_id);
+        if (segment_it != client_local_disk_segment.end()) {
+            MutexLocker locker(&segment_it->second->offloading_mutex_);
+            segment_it->second->promotion_objects.erase(
+                MakeTenantScopedStorageKey(tenant_id, key));
+        }
+    }
+
+    AbortTenantQuota(tenant_id, task.reserved_quota_charge_bytes);
+    tenant_state.promotion_tasks.erase(task_it);
+    promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
+    MasterMetricManager::instance().dec_promotion_in_flight();
+    MasterMetricManager::instance().inc_promotion_cancelled();
+}
+
 std::unordered_map<std::string, MasterService::ObjectMetadata>::iterator
 MasterService::EraseMetadata(
     TenantState& tenant_state,
@@ -1824,7 +1867,7 @@ MasterService::EraseMetadata(
     }
     tenant_state.processing_keys.erase(key);
     tenant_state.replication_tasks.erase(key);
-    ErasePromotionTaskIfPresent(tenant_state, key, tenant_id);
+    ErasePromotionTaskIfPresent(tenant_state, key, tenant_id, &metadata);
 
     ReleaseLocalDiskUsage(metadata.GetAllReplicas());
     AccountCacheTotalRemoval(metadata);
@@ -1983,7 +2026,9 @@ void MasterService::ClearInvalidHandles(
             auto& tenant_state = tenant_it->second;
             auto it = tenant_state.metadata.begin();
             while (it != tenant_state.metadata.end()) {
-                if (CleanupStaleHandles(it->second, alive_clients, &shard)) {
+                if (CleanupStaleHandles(it->second, alive_clients, &shard,
+                                        tenant_state, it->first,
+                                        tenant_it->first)) {
                     // EraseMetadata handles processing_keys,
                     // replication_tasks, offloading_tasks (with
                     // dec_refcnt), and promotion task cleanup.
@@ -3211,7 +3256,9 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
 
             auto it = tenant_state.metadata.find(key);
             if (it != tenant_state.metadata.end()) {
-                if (CleanupStaleHandles(it->second, alive_clients, &shard)) {
+                if (CleanupStaleHandles(it->second, alive_clients, &shard,
+                                        tenant_state, key,
+                                        object_id.tenant_id)) {
                     // EraseMetadata handles processing_keys,
                     // replication_tasks, offloading_tasks (with
                     // dec_refcnt), and promotion task cleanup.
@@ -3462,13 +3509,14 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
             updated_existing++;
         });
     if (updated_existing == 0) {
+        if (had_completed_disk) {
+            return false;
+        }
         std::vector<Replica> replicas;
         replicas.emplace_back(std::move(replica));
         metadata.AddReplicas(std::move(replicas));
         auto& shard = accessor.GetShard();
-        if (!had_completed_disk) {
-            shard.OnDiskReplicaAdded(metadata);
-        }
+        shard.OnDiskReplicaAdded(metadata);
         SyncCacheTotalAccounting(metadata);
         return true;
     }
@@ -3675,7 +3723,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
 
             // --- Step 0: stale handle cleanup ---
             if (it != tenant_state.metadata.end() &&
-                CleanupStaleHandles(it->second, alive_clients, &shard)) {
+                CleanupStaleHandles(it->second, alive_clients, &shard,
+                                    tenant_state, key, object_id.tenant_id)) {
                 // EraseMetadata handles processing_keys, replication_tasks,
                 // offloading_tasks (with dec_refcnt), and promotion task
                 // cleanup.
@@ -4857,12 +4906,8 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
             auto tenant_it = shard->tenants.find(normalized_tenant);
             if (tenant_it == shard->tenants.end()) {
                 VLOG(1) << "key=" << key << ", error=object_not_found";
-                if (force) {
-                    results[original_idx] = {};
-                } else {
-                    results[original_idx] =
-                        tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-                }
+                results[original_idx] =
+                    tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
                 continue;
             }
             auto& tenant_state = tenant_it->second;
@@ -4876,7 +4921,10 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
             }
 
             // Clean up stale replica handles (consistent with single Remove)
-            if (CleanupStaleHandles(it->second, alive_clients, &shard)) {
+            bool disconnected_now = false;
+            if (CleanupStaleHandles(it->second, alive_clients, &shard,
+                                    tenant_state, key, normalized_tenant,
+                                    &disconnected_now)) {
                 // EraseMetadata handles processing_keys,
                 // replication_tasks, offloading_tasks (with
                 // dec_refcnt), and promotion task cleanup.
@@ -4903,7 +4951,12 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                     if (tenant_state.Empty()) {
                         shard->tenants.erase(tenant_it);
                     }
-                    results[original_idx] = {};
+                    if (disconnected_now) {
+                        results[original_idx] =
+                            tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+                    } else {
+                        results[original_idx] = {};
+                    }
                     continue;
                 }
             }
@@ -4946,7 +4999,9 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
 bool MasterService::CleanupStaleHandles(
     ObjectMetadata& metadata,
     const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients,
-    MetadataShardAccessorRW* shard) {
+    MetadataShardAccessorRW* shard, TenantState& tenant_state,
+    const std::string& key, const std::string& tenant_id,
+    bool* local_disk_disconnected) {
     bool had_completed_disk = metadata.HasReplica([](const Replica& r) {
         return r.is_local_disk_replica() && r.is_completed();
     });
@@ -4962,10 +5017,14 @@ bool MasterService::CleanupStaleHandles(
         });
 
     if (disconnected_local_disk > 0) {
+        if (local_disk_disconnected != nullptr) {
+            *local_disk_disconnected = true;
+        }
         disconnected_local_disk_replica_count_.fetch_add(
             disconnected_local_disk, std::memory_order_relaxed);
         LOG(INFO) << "action=local_disk_replica_disconnected"
                   << ", count=" << disconnected_local_disk;
+        ErasePromotionTaskIfPresent(tenant_state, key, tenant_id, &metadata);
     }
 
     // Remove those with invalid allocators (memory replicas on unmounted
@@ -5392,13 +5451,15 @@ auto MasterService::NotifyOffloadSuccess(
                                 updated_existing++;
                             });
                         if (updated_existing == 0) {
+                            if (had_completed_disk) {
+                                handled_existing_object = true;
+                                continue;
+                            }
                             std::vector<Replica> replicas;
                             replicas.emplace_back(std::move(replica));
                             obj_metadata.AddReplicas(std::move(replicas));
                             auto& shard = accessor.GetShard();
-                            if (!had_completed_disk) {
-                                shard.OnDiskReplicaAdded(obj_metadata);
-                            }
+                            shard.OnDiskReplicaAdded(obj_metadata);
                             SyncCacheTotalAccounting(obj_metadata);
                             added_new_local_disk_replica = true;
                         } else if (disconnected_completed > 0) {
