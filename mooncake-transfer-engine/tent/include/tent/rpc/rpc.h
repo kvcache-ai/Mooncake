@@ -28,6 +28,7 @@
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <async_simple/coro/Lazy.h>
+#include <async_simple/executors/SimpleExecutor.h>
 
 #include "tent/common/status.h"
 #include "ylt/coro_io/coro_io.hpp"
@@ -92,6 +93,12 @@ class CoroRpcAgent {
 
     std::mutex pools_mutex_;
     std::unordered_map<std::string, std::shared_ptr<ClientPool>> pools_;
+
+    // Keep asynchronous control RPC progress independent from transport and
+    // application polling threads. Without an assigned executor, callbacks
+    // can inherit a busy caller's scheduling context and suffer long tails
+    // while the data path is saturated.
+    std::unique_ptr<async_simple::executors::SimpleExecutor> async_executor_;
 
     std::mutex func_map_mutex_;
     std::unordered_map<int, Function> func_map_;
