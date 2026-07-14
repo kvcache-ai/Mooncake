@@ -186,19 +186,13 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
             buffer.dispatch(x, topk_idx, active_ranks, num_tokens, num_experts, -1,
                             async_finish=False, return_recv_hook=return_recv_hook,
                             diagnostic=diagnostic)
-        if return_recv_hook:
-            large_gemm_with_hook(hook)
-        else:
-            event.current_stream_wait()
+        large_gemm_with_hook(hook) if return_recv_hook else None
         if zero_copy:
             buffer.get_next_combine_buffer(handle)[:, :, :] = simulated_gemm_x
         combined_x, event, hook = buffer.combine(simulated_gemm_x, topk_idx, topk_weights, active_ranks, -1, handle,
                                                  zero_copy=zero_copy, return_recv_hook=return_recv_hook,
                                                  diagnostic=diagnostic)
-        if return_recv_hook:
-            large_gemm_with_hook(hook)
-        else:
-            event.current_stream_wait()
+        large_gemm_with_hook(hook) if return_recv_hook else None
 
     # Calculate bandwidth
     num_fp8_bytes, num_bf16_bytes = (hidden + hidden / 128 * 4 + 16), hidden * 2
