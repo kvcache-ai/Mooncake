@@ -39,10 +39,33 @@ The finite default target count avoids an all-to-all startup wave. Use explicit
 `MC_STORE_WARMUP_MAX_TARGETS=0` only when the peer set is already bounded.
 
 If a probe times out, its batch and destination buffer remain owned by the
-client cleanup path until Transfer Engine reports a terminal state and accepts
-`freeBatchID()`. Transfer Engine currently has no reliable warmup batch cancel
-operation, so client teardown waits for such pending probes before destroying
-registered memory.
+client cleanup path until Transfer Engine reports a terminal state. Once the
+transfer is terminal, the probe buffer is returned immediately, even if
+`freeBatchID()` temporarily fails; only a lightweight batch-ID record remains
+for retry.
+
+To avoid accumulating several long-running probes in one startup wave, the
+client stops submitting new targets after the first probe enters pending
+cleanup. The summary log reports:
+
+- `discovered`: eligible targets returned by the master.
+- `attempted`: targets for which this warmup invocation started processing.
+- `not_attempted`: discovered targets skipped after pending cleanup stopped
+  new submissions. `discovered = attempted + not_attempted`.
+
+Teardown calls `Client::ShutdownWarmup()` before unregistering probe memory.
+Shutdown stops new warmup calls and uses a fixed five-second deadline to wait
+for transfers that may still write probe buffers. If the deadline expires,
+`RealClient` returns a transfer failure and keeps the client, allocator, and
+memory registration alive for a later teardown retry. Transfer Engine has no
+reliable batch cancel operation, so the implementation does not claim that an
+unfinished transfer was cancelled. A direct `Client` destructor treats an
+unresolved transfer as a fatal unsafe-teardown error.
+
+Lightweight batch-ID records continue retrying during normal cleanup. Once
+shutdown has confirmed that no transfer can write probe memory, any batch ID
+that still cannot be freed is logged and left for final Transfer Engine
+teardown; it does not keep the probe allocation or block memory unregistration.
 
 ## When To Use It
 
@@ -67,8 +90,9 @@ ctest --test-dir build-warmup \
   --output-on-failure
 ```
 
-The tests cover target selection, configuration bounds, pending batch/buffer
-lifetime, batch-release retry, single-client no-target behavior, and TCP
-loopback probes between multiple clients. They do not cover real
-cross-physical-node deployments, RDMA/UB hardware, connection reuse counts, or
-large-scale stress.
+The tests cover target selection, configuration bounds, the three core cleanup
+cases (pending-transfer buffer retention, terminal-transfer buffer release
+while batch-ID cleanup retries, and shutdown-before-unregister ordering),
+single-client no-target behavior, and TCP loopback probes between multiple
+clients. They do not cover real cross-physical-node deployments, RDMA/UB
+hardware, connection reuse counts, or large-scale stress.

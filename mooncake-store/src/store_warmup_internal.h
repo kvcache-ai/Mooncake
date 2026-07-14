@@ -8,6 +8,7 @@
 #include <functional>
 #include <list>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -24,6 +25,7 @@ inline constexpr size_t kMaxWarmupReadSize = 1024 * 1024;
 inline constexpr uint64_t kMaxWarmupTimeoutMs = 60000;
 inline constexpr size_t kMaxWarmupConcurrency = 128;
 inline constexpr size_t kMaxWarmupTargets = 65536;
+inline constexpr auto kWarmupShutdownTimeout = std::chrono::seconds(5);
 
 struct StoreWarmupOptions {
     size_t read_size = kDefaultWarmupReadSize;
@@ -33,19 +35,28 @@ struct StoreWarmupOptions {
 };
 
 struct StoreWarmupStats {
-    size_t target_count = 0;
+    size_t discovered = 0;
+    std::atomic<size_t> attempted{0};
     std::atomic<size_t> succeeded{0};
     std::atomic<size_t> failed{0};
     std::atomic<size_t> timed_out{0};
     std::atomic<size_t> skipped{0};
+    size_t not_attempted = 0;
     size_t pending_cleanup = 0;
+    size_t pending_transfers = 0;
+    size_t pending_batch_id_releases = 0;
 };
 
 struct PendingWarmupBatch {
     Transport::BatchID batch_id;
     std::string segment_name;
-    BufferHandle buffer;
+    std::optional<BufferHandle> buffer;
     bool transfer_terminal = false;
+};
+
+struct PendingWarmupBatchIDRelease {
+    Transport::BatchID batch_id;
+    std::string segment_name;
     size_t release_attempts = 0;
 };
 
@@ -60,9 +71,9 @@ struct StoreWarmupProbeResult {
 
 StoreWarmupOptions LoadStoreWarmupOptions();
 
-// Owns both batch IDs and their destination buffers until Transfer Engine
-// reports a terminal state and accepts freeBatchID(). The worker is started
-// lazily, so disabled warmup adds no thread.
+// Owns destination buffers until Transfer Engine reports a terminal state,
+// then retries batch-ID cleanup without retaining those buffers. The worker is
+// started lazily, so disabled warmup adds no thread.
 class WarmupBatchCleanup {
    public:
     using PollBatchFn = std::function<WarmupBatchState(Transport::BatchID)>;
@@ -74,14 +85,15 @@ class WarmupBatchCleanup {
     WarmupBatchCleanup(const WarmupBatchCleanup&) = delete;
     WarmupBatchCleanup& operator=(const WarmupBatchCleanup&) = delete;
 
-    // This is the only warmup path that invokes freeBatchID(). A false return
-    // means ownership must remain with this cleanup object for a later retry.
-    bool TryReleaseWarmupBatch(PendingWarmupBatch& batch);
+    // This is the only warmup path that invokes freeBatchID().
+    bool TryFreeWarmupBatchID(PendingWarmupBatchIDRelease& batch);
     bool ReleaseOrTrack(PendingWarmupBatch batch);
-    void Track(PendingWarmupBatch batch);
+    void TrackPendingTransfer(PendingWarmupBatch batch);
     bool DrainFor(std::chrono::milliseconds timeout);
     size_t PendingCount() const;
-    void Shutdown();
+    size_t PendingTransferCount() const;
+    size_t PendingBatchIDReleaseCount() const;
+    bool ShutdownFor(std::chrono::milliseconds timeout);
 
    private:
     void WorkerMain();
@@ -90,9 +102,13 @@ class WarmupBatchCleanup {
     ReleaseBatchFn release_batch_;
     mutable std::mutex mutex_;
     std::condition_variable cv_;
-    std::list<PendingWarmupBatch> pending_;
+    std::list<PendingWarmupBatch> pending_transfers_;
+    std::list<PendingWarmupBatchIDRelease> pending_batch_id_releases_;
     std::thread worker_;
-    bool stopping_ = false;
+    size_t processing_transfers_ = 0;
+    size_t processing_batch_id_releases_ = 0;
+    bool stop_requested_ = false;
+    bool stopped_ = false;
 };
 
 }  // namespace mooncake::internal

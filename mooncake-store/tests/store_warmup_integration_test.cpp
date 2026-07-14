@@ -244,6 +244,11 @@ class StoreWarmupIntegrationTest : public ::testing::Test {
     }
 
     void CleanupRuntime(ClientRuntime& runtime) {
+        if (runtime.client) {
+            auto shutdown = runtime.client->ShutdownWarmup();
+            EXPECT_TRUE(shutdown.has_value());
+            if (!shutdown) return;
+        }
         if (runtime.client && runtime.segment) {
             EXPECT_TRUE(
                 runtime.client->UnmountSegment(runtime.segment, kSegmentSize)

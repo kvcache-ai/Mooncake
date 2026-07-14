@@ -1145,6 +1145,16 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         // Not initialized or already cleaned; treat as success for idempotence
         return {};
     }
+
+    auto warmup_shutdown = client_->ShutdownWarmup();
+    if (!warmup_shutdown) {
+        LOG(ERROR) << "Warmup shutdown failed; keeping client probe memory "
+                      "registered for a later teardown retry: "
+                   << toString(warmup_shutdown.error());
+        closed_.store(false, std::memory_order_release);
+        return tl::unexpected(warmup_shutdown.error());
+    }
+
     if (client_buffer_allocator_ && client_buffer_allocator_->size() > 0 &&
         protocol != "cxl") {
         auto unregister_result = client_->unregisterLocalMemory(

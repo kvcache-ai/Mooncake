@@ -590,6 +590,14 @@ class Client {
         const std::shared_ptr<ClientBufferAllocator>& allocator);
 
     /**
+     * @brief Stop new warmup calls and safely drain pending warmup transfers.
+     *
+     * This operation is idempotent. A failure means a transfer may still write
+     * a probe buffer, so callers must keep its memory registered and alive.
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> ShutdownWarmup();
+
+    /**
      * @brief Get the endpoint address for segment operations.
      * @return For P2PHANDSHAKE mode, returns the actual RPC endpoint (IP:Port).
      *         For other modes, returns the logical local hostname used for
@@ -806,7 +814,8 @@ class Client {
     internal::WarmupBatchCleanup& GetWarmupBatchCleanup();
     void DrainPendingWarmupBatches(internal::WarmupBatchCleanup& cleanup,
                                    std::chrono::milliseconds timeout);
-    void ShutdownWarmupCleanup();
+    bool BeginWarmupCall();
+    void EndWarmupCall();
 
     // Client identification
     const UUID client_id_;
@@ -820,6 +829,10 @@ class Client {
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
     std::mutex warmup_cleanup_mutex_;
     std::unique_ptr<internal::WarmupBatchCleanup> warmup_batch_cleanup_;
+    std::mutex warmup_lifecycle_mutex_;
+    std::condition_variable warmup_lifecycle_cv_;
+    bool warmup_shutdown_requested_ = false;
+    size_t active_warmup_calls_ = 0;
 
     // Mutex to protect mounted_segments_
     mutable std::mutex mounted_segments_mutex_;

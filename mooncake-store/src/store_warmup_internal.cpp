@@ -8,6 +8,7 @@
 #include <exception>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 
 namespace mooncake::internal {
 namespace {
@@ -66,11 +67,16 @@ WarmupBatchCleanup::WarmupBatchCleanup(PollBatchFn poll_batch,
     : poll_batch_(std::move(poll_batch)),
       release_batch_(std::move(release_batch)) {}
 
-WarmupBatchCleanup::~WarmupBatchCleanup() { Shutdown(); }
+WarmupBatchCleanup::~WarmupBatchCleanup() {
+    if (!ShutdownFor(kWarmupShutdownTimeout)) {
+        LOG(FATAL) << "warmup: cleanup destroyed with "
+                   << PendingTransferCount()
+                   << " non-terminal transfer(s); refusing unsafe teardown";
+    }
+}
 
-bool WarmupBatchCleanup::TryReleaseWarmupBatch(PendingWarmupBatch& batch) {
-    if (!batch.transfer_terminal) return false;
-
+bool WarmupBatchCleanup::TryFreeWarmupBatchID(
+    PendingWarmupBatchIDRelease& batch) {
     ++batch.release_attempts;
     auto status = release_batch_(batch.batch_id);
     if (status.ok()) return true;
@@ -79,20 +85,36 @@ bool WarmupBatchCleanup::TryReleaseWarmupBatch(PendingWarmupBatch& batch) {
         LOG(WARNING) << "warmup: freeBatchID failed for '" << batch.segment_name
                      << "' on attempt " << batch.release_attempts << ": "
                      << status.message()
-                     << "; retaining batch and probe buffer for retry";
+                     << "; retaining lightweight batch ID for retry";
     }
     return false;
 }
 
 bool WarmupBatchCleanup::ReleaseOrTrack(PendingWarmupBatch batch) {
-    if (TryReleaseWarmupBatch(batch)) return true;
-    Track(std::move(batch));
+    if (!batch.transfer_terminal) {
+        TrackPendingTransfer(std::move(batch));
+        return false;
+    }
+
+    // A terminal transfer can no longer write its destination. Release the
+    // potentially large probe allocation before retrying batch ID cleanup.
+    batch.buffer.reset();
+    PendingWarmupBatchIDRelease batch_id_release{batch.batch_id,
+                                                 std::move(batch.segment_name)};
+    if (TryFreeWarmupBatchID(batch_id_release)) return true;
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    pending_batch_id_releases_.emplace_back(std::move(batch_id_release));
+    if (!worker_.joinable()) {
+        worker_ = std::thread([this]() { WorkerMain(); });
+    }
+    cv_.notify_all();
     return false;
 }
 
-void WarmupBatchCleanup::Track(PendingWarmupBatch batch) {
+void WarmupBatchCleanup::TrackPendingTransfer(PendingWarmupBatch batch) {
     std::lock_guard<std::mutex> lock(mutex_);
-    pending_.emplace_back(std::move(batch));
+    pending_transfers_.emplace_back(std::move(batch));
     if (!worker_.joinable()) {
         worker_ = std::thread([this]() { WorkerMain(); });
     }
@@ -101,50 +123,126 @@ void WarmupBatchCleanup::Track(PendingWarmupBatch batch) {
 
 bool WarmupBatchCleanup::DrainFor(std::chrono::milliseconds timeout) {
     std::unique_lock<std::mutex> lock(mutex_);
-    return cv_.wait_for(lock, timeout, [this]() { return pending_.empty(); });
+    return cv_.wait_for(lock, timeout, [this]() {
+        return pending_transfers_.empty() &&
+               pending_batch_id_releases_.empty() &&
+               processing_transfers_ == 0 && processing_batch_id_releases_ == 0;
+    });
 }
 
 size_t WarmupBatchCleanup::PendingCount() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return pending_.size();
+    return pending_transfers_.size() + pending_batch_id_releases_.size() +
+           processing_transfers_ + processing_batch_id_releases_;
 }
 
-void WarmupBatchCleanup::Shutdown() {
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!worker_.joinable()) return;
-        stopping_ = true;
+size_t WarmupBatchCleanup::PendingTransferCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return pending_transfers_.size() + processing_transfers_;
+}
+
+size_t WarmupBatchCleanup::PendingBatchIDReleaseCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return pending_batch_id_releases_.size() + processing_batch_id_releases_;
+}
+
+bool WarmupBatchCleanup::ShutdownFor(std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (stopped_) return true;
+    if (!worker_.joinable()) {
+        stopped_ = true;
+        return true;
     }
+
+    const bool safe_to_stop = cv_.wait_until(lock, deadline, [this]() {
+        return pending_transfers_.empty() && processing_transfers_ == 0 &&
+               processing_batch_id_releases_ == 0;
+    });
+    if (!safe_to_stop) return false;
+
+    stop_requested_ = true;
     cv_.notify_all();
+    lock.unlock();
     worker_.join();
+    lock.lock();
+    stopped_ = true;
+    return true;
 }
 
 void WarmupBatchCleanup::WorkerMain() {
     constexpr auto kRetryInterval = std::chrono::milliseconds(10);
-    std::unique_lock<std::mutex> lock(mutex_);
     while (true) {
-        if (pending_.empty()) {
-            if (stopping_) return;
-            cv_.wait(lock, [this]() { return stopping_ || !pending_.empty(); });
-            continue;
+        std::optional<PendingWarmupBatch> transfer;
+        std::optional<PendingWarmupBatchIDRelease> batch_id_release;
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            cv_.wait(lock, [this]() {
+                return stop_requested_ || !pending_transfers_.empty() ||
+                       !pending_batch_id_releases_.empty();
+            });
+            if (stop_requested_) {
+                if (!pending_batch_id_releases_.empty()) {
+                    LOG(ERROR) << "warmup: abandoning "
+                               << pending_batch_id_releases_.size()
+                               << " batch ID release(s) at final teardown; "
+                                  "Transfer Engine teardown must reclaim them";
+                    pending_batch_id_releases_.clear();
+                }
+                return;
+            }
+
+            if (!pending_transfers_.empty()) {
+                transfer.emplace(std::move(pending_transfers_.front()));
+                pending_transfers_.pop_front();
+                ++processing_transfers_;
+            } else {
+                batch_id_release.emplace(
+                    std::move(pending_batch_id_releases_.front()));
+                pending_batch_id_releases_.pop_front();
+                ++processing_batch_id_releases_;
+            }
         }
 
-        cv_.wait_for(lock, kRetryInterval);
-        for (auto it = pending_.begin(); it != pending_.end();) {
-            if (!it->transfer_terminal) {
-                const auto state = poll_batch_(it->batch_id);
-                if (state == WarmupBatchState::kTerminal) {
-                    it->transfer_terminal = true;
+        if (transfer) {
+            const auto state = poll_batch_(transfer->batch_id);
+            std::optional<PendingWarmupBatchIDRelease> retry_batch_id;
+            if (state == WarmupBatchState::kTerminal) {
+                transfer->buffer.reset();
+                PendingWarmupBatchIDRelease release{
+                    transfer->batch_id, std::move(transfer->segment_name)};
+                if (!TryFreeWarmupBatchID(release)) {
+                    retry_batch_id.emplace(std::move(release));
                 }
             }
 
-            if (it->transfer_terminal && TryReleaseWarmupBatch(*it)) {
-                it = pending_.erase(it);
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                --processing_transfers_;
+                if (state != WarmupBatchState::kTerminal) {
+                    pending_transfers_.emplace_back(std::move(*transfer));
+                } else if (retry_batch_id) {
+                    pending_batch_id_releases_.emplace_back(
+                        std::move(*retry_batch_id));
+                }
                 cv_.notify_all();
-            } else {
-                ++it;
+            }
+        } else {
+            const bool released = TryFreeWarmupBatchID(*batch_id_release);
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                --processing_batch_id_releases_;
+                if (!released) {
+                    pending_batch_id_releases_.emplace_back(
+                        std::move(*batch_id_release));
+                }
+                cv_.notify_all();
             }
         }
+
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait_for(lock, kRetryInterval,
+                     [this]() { return stop_requested_; });
     }
 }
 

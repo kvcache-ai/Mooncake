@@ -284,7 +284,7 @@ TEST_F(StoreWarmupTest, InvalidWarmupMaxTargetsFallsBackToDefault) {
     }
 }
 
-TEST_F(StoreWarmupTest, PendingBatchRetainsProbeBufferUntilReleased) {
+TEST_F(StoreWarmupTest, PendingTransferRetainsBufferUntilTerminal) {
     alignas(64) std::array<std::byte, 64> memory{};
     auto allocator =
         ClientBufferAllocator::create(memory.data(), memory.size(), "tcp");
@@ -303,7 +303,7 @@ TEST_F(StoreWarmupTest, PendingBatchRetainsProbeBufferUntilReleased) {
             return Status::OK();
         });
 
-    cleanup.Track(
+    cleanup.TrackPendingTransfer(
         {1, "test-segment", std::move(*buffer), /*transfer_terminal=*/false});
     EXPECT_FALSE(cleanup.DrainFor(std::chrono::milliseconds(20)));
     EXPECT_FALSE(allocator->allocate(memory.size()).has_value());
@@ -313,13 +313,17 @@ TEST_F(StoreWarmupTest, PendingBatchRetainsProbeBufferUntilReleased) {
     ASSERT_TRUE(cleanup.DrainFor(std::chrono::seconds(1)));
     EXPECT_EQ(release_calls.load(), 1);
     EXPECT_TRUE(allocator->allocate(memory.size()).has_value());
-    cleanup.Shutdown();
+    EXPECT_TRUE(cleanup.ShutdownFor(std::chrono::seconds(1)));
 }
 
-TEST_F(StoreWarmupTest, FailedBatchReleaseIsRetriedWithoutDoubleFree) {
-    std::byte memory{};
+TEST_F(StoreWarmupTest, TerminalTransferReleasesBufferWhileBatchFreeRetries) {
+    alignas(64) std::array<std::byte, 64> memory{};
+    auto allocator =
+        ClientBufferAllocator::create(memory.data(), memory.size(), "tcp");
+    auto buffer = allocator->allocate(memory.size());
+    ASSERT_TRUE(buffer.has_value());
+
     std::atomic<bool> allow_release{false};
-    std::atomic<size_t> buffer_releases{0};
     std::atomic<size_t> release_calls{0};
     internal::WarmupBatchCleanup cleanup(
         [](Transport::BatchID) {
@@ -333,21 +337,43 @@ TEST_F(StoreWarmupTest, FailedBatchReleaseIsRetriedWithoutDoubleFree) {
             return Status::OK();
         });
 
-    internal::PendingWarmupBatch batch{
-        2, "test-segment",
-        BufferHandle(&memory, sizeof(memory),
-                     [&]() { buffer_releases.fetch_add(1); }),
-        /*transfer_terminal=*/true};
+    internal::PendingWarmupBatch batch{2, "test-segment", std::move(*buffer),
+                                       /*transfer_terminal=*/true};
     EXPECT_FALSE(cleanup.ReleaseOrTrack(std::move(batch)));
-    EXPECT_EQ(buffer_releases.load(), 0);
+    EXPECT_TRUE(allocator->allocate(memory.size()).has_value());
+    EXPECT_EQ(cleanup.PendingTransferCount(), 0);
+    EXPECT_EQ(cleanup.PendingBatchIDReleaseCount(), 1);
     EXPECT_GE(release_calls.load(), 1);
 
     allow_release.store(true);
     ASSERT_TRUE(cleanup.DrainFor(std::chrono::seconds(1)));
-    EXPECT_EQ(buffer_releases.load(), 1);
     const size_t calls_after_release = release_calls.load();
-    cleanup.Shutdown();
+    EXPECT_TRUE(cleanup.ShutdownFor(std::chrono::seconds(1)));
     EXPECT_EQ(release_calls.load(), calls_after_release);
+}
+
+TEST_F(StoreWarmupTest, ShutdownOccursBeforeMemoryUnregistration) {
+    std::byte memory{};
+    std::atomic<int> sequence{0};
+    std::atomic<int> buffer_release_order{0};
+    internal::WarmupBatchCleanup cleanup(
+        [](Transport::BatchID) {
+            return internal::WarmupBatchState::kTerminal;
+        },
+        [](Transport::BatchID) { return Status::OK(); });
+
+    cleanup.TrackPendingTransfer(
+        {3, "test-segment",
+         BufferHandle(
+             &memory, sizeof(memory),
+             [&]() { buffer_release_order.store(sequence.fetch_add(1) + 1); }),
+         /*transfer_terminal=*/false});
+
+    ASSERT_TRUE(cleanup.ShutdownFor(std::chrono::seconds(1)));
+    const int unregister_order = sequence.fetch_add(1) + 1;
+    EXPECT_GT(buffer_release_order.load(), 0);
+    EXPECT_LT(buffer_release_order.load(), unregister_order);
+    EXPECT_EQ(cleanup.PendingTransferCount(), 0);
 }
 
 }  // namespace mooncake::test
