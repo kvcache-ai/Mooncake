@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import numpy as np
 import torch
@@ -190,18 +191,21 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30, suppress_kineto_output: 
         for line in prof_lines:
             if name not in line:
                 continue
-            parts = line.split()
-            if len(parts) < 2:
+            time_matches = re.findall(r"([0-9]+(?:\.[0-9]+)?)(ns|us|ms|s)", line)
+            if len(time_matches) == 0:
                 continue
-            time_str = parts[-2]
-            if time_str.endswith("ms"):
-                return float(time_str[:-2]) / 1e3
-            if time_str.endswith("us"):
-                return float(time_str[:-2]) / 1e6
-            if time_str.endswith("ns"):
-                return float(time_str[:-2]) / 1e9
-            if time_str.endswith("s"):
-                return float(time_str[:-1])
+            # The profiler table has Self CUDA, CUDA total, then CUDA time avg.
+            # Use the last time token on the matching kernel row.
+            value, unit = time_matches[-1]
+            value = float(value)
+            if unit == "ms":
+                return value / 1e3
+            if unit == "us":
+                return value / 1e6
+            if unit == "ns":
+                return value / 1e9
+            if unit == "s":
+                return value
         return 0.0
 
     for name in kernel_names:
@@ -222,6 +226,12 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30, suppress_kineto_output: 
         kernel_times.append(total_cuda_time_us / total_count / 1e6)
 
     if os.getenv("MOONCAKE_EP_KINETO_DUMP", "").upper() in {"1", "ON", "TRUE", "YES"}:
+        for name, kernel_time in zip(kernel_names, kernel_times):
+            event_matches = [
+                (event.key, cuda_time_us(event), getattr(event, "count", 0))
+                for event in events if name in event.key
+            ]
+            print(f"[bench_kineto] name={name!r} result_s={kernel_time} event_matches={event_matches}", flush=True)
         print("\n".join(prof_lines[:80]), flush=True)
 
     return tuple(kernel_times) if is_tupled else kernel_times[0]
