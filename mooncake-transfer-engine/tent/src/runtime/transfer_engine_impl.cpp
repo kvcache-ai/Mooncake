@@ -374,6 +374,30 @@ Status TransferEngineImpl::construct() {
 
     staging_proxy_ = std::make_unique<ProxyManager>(this);
 
+    if (runtime_queue_config_.limits.deadline_aware &&
+        runtime_queue_config_.limits.mlu_local_threshold > 0.0) {
+        auto rdma_xport =
+            transport_list_[static_cast<int>(TransportType::RDMA)];
+        if (rdma_xport) {
+            std::weak_ptr<Transport> weak_rdma = rdma_xport;
+            runtime_queue_->setDegradationPolicy(
+                [weak_rdma]() -> double {
+                    if (auto rdma = weak_rdma.lock()) {
+                        return rdma->getEstimatedBandwidth();
+                    }
+                    return -1.0;
+                },
+                DegradationHooks{}, nullptr);
+            LOG(INFO) << "Admission queue degradation: live RDMA bw"
+                      << ", theta_local="
+                      << runtime_queue_config_.limits.mlu_local_threshold;
+        } else {
+            LOG(WARNING) << "Admission queue degradation requested but RDMA "
+                            "transport is "
+                            "unavailable";
+        }
+    }
+
     if (enable_progress_worker_) {
         progress_worker_ = std::make_unique<ProgressWorker>(
             this, runtime_queue_config_.enabled
@@ -1589,6 +1613,8 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
         input.derived_task_ids = owner.derived_task_ids;
         input.request = owner.request;
         input.kind = owner_kind;
+        input.degradation_eligible =
+            owner.route.transport == RDMA && !owner.staging;
         submit.owners.push_back(std::move(input));
     }
 
