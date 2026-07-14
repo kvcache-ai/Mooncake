@@ -90,6 +90,8 @@ class RealClient : public PyClient {
         bool enable_ssd_offload = false,
         const std::string &ssd_offload_path = "",
         const std::string &tenant_id = "default",
+        bool enable_client_http_server = false,
+        int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
         bool enable_store_warmup = false);
 
     int setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
@@ -513,6 +515,8 @@ class RealClient : public PyClient {
         bool enable_ssd_offload = false, bool start_offload_rpc_server = false,
         const std::string &ssd_offload_path = "",
         const std::string &tenant_id = "default",
+        bool enable_client_http_server = false,
+        int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
         bool enable_store_warmup = false);
 
     // Overload that accepts a configuration dictionary
@@ -911,7 +915,7 @@ class RealClient : public PyClient {
     int stop_ipc_server();
     // Embedded HTTP server for health-check / metrics
     std::unique_ptr<coro_http::coro_http_server> http_server_;
-    int start_http_server();
+    int start_http_server(int port);
     void stop_http_server();
 
     void handle_ipc_shm_register(UdsConnection &connection);

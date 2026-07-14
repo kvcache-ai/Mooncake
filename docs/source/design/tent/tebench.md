@@ -187,6 +187,9 @@ gpu_id + thread_id
 **Transport (TENT only)**
 
 * `--xport_type` : `rdma | shm | mnnvl | gds | iouring`
+* `--tent_intent_type` : attach a standard transfer intent to every request,
+  such as `foreground_get`, `background_prefetch`, or `checkpoint`. This is
+  useful for validating intent-specific transport and QoS policy selection.
 
 **Metadata service**
 

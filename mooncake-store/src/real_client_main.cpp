@@ -3,6 +3,7 @@
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 #include "client_service.h"
+#include "common.h"
 #include "config.h"
 #include "real_client.h"
 
@@ -117,7 +118,7 @@ int main(int argc, char *argv[]) {
         FLAGS_master_server_address, nullptr,
         "@mooncake_client_" + std::to_string(FLAGS_port) + ".sock", FLAGS_port,
         FLAGS_enable_offload, FLAGS_start_offload_rpc_server, "",
-        FLAGS_tenant_id);
+        FLAGS_tenant_id, FLAGS_enable_http_server, FLAGS_http_port);
     if (!res) {
         LOG(FATAL) << "Failed to setup client: " << toString(res.error());
         return -1;
@@ -128,10 +129,11 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
-    coro_rpc::coro_rpc_server server(FLAGS_threads, FLAGS_port, FLAGS_host);
+    auto rpc_bind_host = getHostNameWithoutPort(FLAGS_host);
+    coro_rpc::coro_rpc_server server(FLAGS_threads, FLAGS_port, rpc_bind_host);
     RegisterClientRpcService(server, *client_inst);
 
-    LOG(INFO) << "Starting real client service on " << FLAGS_host << ":"
+    LOG(INFO) << "Starting real client service on " << rpc_bind_host << ":"
               << FLAGS_port;
 
     return server.start();

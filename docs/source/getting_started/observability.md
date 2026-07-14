@@ -165,3 +165,46 @@ The admin HTTP server is configured in the master config file (`master.json` or 
 ```
 
 Set `enable_metric_reporting` to `false` to disable the periodic metrics log. HTTP endpoints (`/metrics`, `/health`, etc.) remain available regardless of this setting.
+
+## Client Metrics Endpoint
+
+Mooncake clients can also expose a client-local HTTP endpoint for health checks
+and client metrics. This is separate from the master admin endpoint above and is
+disabled by default for Python/programmatic clients.
+
+Enable it through the Python setup arguments:
+
+```python
+store.setup(
+    local_hostname,
+    metadata_server,
+    global_segment_size,
+    local_buffer_size,
+    protocol,
+    rdma_devices,
+    master_server_addr,
+    enable_client_http_server=True,
+    client_http_port=9300,
+)
+```
+
+For `mooncake.mooncake_store_service`, set
+`MOONCAKE_ENABLE_CLIENT_HTTP_SERVER=true` and optionally
+`MOONCAKE_CLIENT_HTTP_PORT=<port>`. For the standalone `mooncake_client`, use
+`--enable_http_server=true --http_port=<port>`.
+
+| Endpoint | Content-Type | Description |
+|----------|--------------|-------------|
+| `GET /health` | `application/json` | Client health check |
+| `GET /metrics` | `text/plain; version=0.0.4` | Prometheus-format client metrics |
+| `GET /metrics/summary` | `text/plain` | Human-readable client metrics summary |
+
+```bash
+curl http://<client-host>:9300/health
+curl http://<client-host>:9300/metrics
+curl http://<client-host>:9300/metrics/summary
+```
+
+Set `MC_STORE_CLIENT_METRIC=0` to disable client metric collection. If the
+client HTTP server remains enabled while metrics are disabled, `/metrics` and
+`/metrics/summary` return HTTP 503 with `metrics not available`.

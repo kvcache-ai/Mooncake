@@ -83,14 +83,14 @@ inline bool IsValidClusterIdComponent(const std::string& cluster_id) {
     return true;
 }
 static constexpr uint64_t DEFAULT_DEFAULT_KV_LEASE_TTL =
-    5000;  // in milliseconds
+    10000;  // in milliseconds
 static constexpr uint64_t DEFAULT_KV_SOFT_PIN_TTL_MS =
     30 * 60 * 1000;  // 30 minutes
 static constexpr bool DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS = true;
 static constexpr double DEFAULT_EVICTION_RATIO = 0.05;
-static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.95;
+static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
 static constexpr double DEFAULT_NOF_EVICTION_RATIO = 0.05;
-static constexpr double DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO = 0.95;
+static constexpr double DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
 static constexpr int64_t DEFAULT_MASTER_VIEW_LEASE_TTL_SEC = 5;  // in seconds
 static constexpr int64_t DEFAULT_CLIENT_LIVE_TTL_SEC = 10;       // in seconds
 static constexpr int64_t DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC = 10;
@@ -217,12 +217,16 @@ constexpr const char* CONFIG_KEY_MASTER_SERVER_ADDR = "master_server_addr";
 constexpr const char* CONFIG_KEY_IPC_SOCKET_PATH = "ipc_socket_path";
 constexpr const char* CONFIG_KEY_TENANT_ID = "tenant_id";
 constexpr const char* CONFIG_KEY_ENABLE_STORE_WARMUP = "enable_store_warmup";
+constexpr const char* CONFIG_KEY_ENABLE_CLIENT_HTTP_SERVER =
+    "enable_client_http_server";
+constexpr const char* CONFIG_KEY_CLIENT_HTTP_PORT = "client_http_port";
 
 // Store client configuration defaults
 static constexpr size_t DEFAULT_GLOBAL_SEGMENT_SIZE = 1024 * 1024 * 16;  // 16MB
 static constexpr size_t DEFAULT_LOCAL_BUFFER_SIZE = 1024 * 1024 * 16;    // 16MB
 constexpr const char* DEFAULT_PROTOCOL = "tcp";
 constexpr const char* DEFAULT_MASTER_SERVER_ADDR = "127.0.0.1:50051";
+static constexpr int DEFAULT_CLIENT_HTTP_PORT = 9300;
 
 // Original: returns a new string (copies when tenant_id is non-empty).
 // Kept for backward compatibility with callers that need an owned string.

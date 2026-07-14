@@ -292,7 +292,9 @@ Status DeviceSelector::release(int dev_id, uint64_t length, double latency) {
     auto& dev = it->second;
     dev.releaseInflight(length);
 
-    if (!smart_selection_enabled_) {
+    // Cancellation of an unposted slice must release its inflight charge but
+    // has no latency sample from which to learn bandwidth.
+    if (!smart_selection_enabled_ || latency <= 0.0) {
         return Status::OK();
     }
 
