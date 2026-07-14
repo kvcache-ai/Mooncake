@@ -67,13 +67,19 @@ Transport::TransferStatusEnum from_cufile_transfer_status(
 }
 
 NVMeoFTransport::BatchID NVMeoFTransport::allocateBatchID(size_t batch_size) {
-    auto nvmeof_desc = new NVMeoFBatchDesc();
+    auto nvmeof_desc = std::make_unique<NVMeoFBatchDesc>();
     auto batch_id = Transport::allocateBatchID(batch_size);
+    if (batch_id == static_cast<BatchID>(ERR_MEMORY)) return batch_id;
+
     auto &batch_desc = *((BatchDesc *)(batch_id));
     nvmeof_desc->desc_idx_ = desc_pool_->allocCUfileDesc(batch_size);
+    if (nvmeof_desc->desc_idx_ < 0) {
+        Transport::freeBatchID(batch_id);
+        return static_cast<BatchID>(ERR_MEMORY);
+    }
     nvmeof_desc->transfer_status.reserve(batch_size);
     nvmeof_desc->task_to_slices.reserve(batch_size);
-    batch_desc.context = nvmeof_desc;
+    batch_desc.context = nvmeof_desc.release();
     return batch_id;
 }
 
@@ -96,24 +102,110 @@ Status NVMeoFTransport::getTransferStatus(BatchID batch_id, size_t task_id,
         return Status::InvalidArgument(
             "NVMeoFTransport: Task has no submitted slices");
     }
+    const bool all_tasks_finished =
+        std::all_of(batch_desc.task_list.begin(), batch_desc.task_list.end(),
+                    [](const TransferTask &mapped_task) {
+                        return mapped_task.is_finished;
+                    });
+    if (all_tasks_finished && task.is_finished &&
+        task_id < nvmeof_desc.transfer_status.size()) {
+        status = nvmeof_desc.transfer_status[task_id];
+        return Status::OK();
+    }
 
-    auto [slice_id, slice_num] = nvmeof_desc.task_to_slices[task_id];
+    thread_local CUFileBatchSnapshot snapshot;
+    if (desc_pool_->pollBatch(nvmeof_desc.desc_idx_, snapshot) != 0) {
+        return Status::Context("NVMeoFTransport: Failed to poll cuFile batch");
+    }
+
+    if (snapshot.failure_seen && !snapshot.all_terminal) {
+        if (task.is_finished && task_id < nvmeof_desc.transfer_status.size()) {
+            status = nvmeof_desc.transfer_status[task_id];
+            return Status::OK();
+        }
+        const bool has_pending =
+            std::any_of(snapshot.io_events.begin(), snapshot.io_events.end(),
+                        [](const CUfileIOEvents_t &event) {
+                            return event.status == CUFILE_PENDING;
+                        });
+        status = {.s = has_pending ? PENDING : WAITING, .transferred_bytes = 0};
+        return Status::OK();
+    }
+
     thread_local std::vector<TransferStatus> slice_statuses;
-    slice_statuses.clear();
-    slice_statuses.reserve(slice_num);
-    for (size_t i = slice_id; i < slice_id + slice_num; ++i) {
-        auto event = desc_pool_->getTransferStatus(nvmeof_desc.desc_idx_, i);
-        auto slice_status = from_cufile_transfer_status(event.status);
-        slice_statuses.push_back(TransferStatus{
-            .s = slice_status,
-            .transferred_bytes = slice_status == COMPLETED ? event.ret : 0});
+    auto aggregate_task = [&](size_t current_task_id,
+                              TransferStatus &task_status,
+                              bool &is_finished) -> bool {
+        auto [slice_id, slice_num] =
+            nvmeof_desc.task_to_slices[current_task_id];
+        if (slice_id > snapshot.io_events.size() ||
+            slice_num > snapshot.io_events.size() - slice_id) {
+            return false;
+        }
+
+        slice_statuses.clear();
+        slice_statuses.reserve(slice_num);
+        for (size_t i = slice_id; i < slice_id + slice_num; ++i) {
+            const auto &event = snapshot.io_events[i];
+            auto slice_status = from_cufile_transfer_status(event.status);
+            if (slice_status == CANCELED &&
+                i < snapshot.cancel_requested.size() &&
+                snapshot.cancel_requested[i]) {
+                slice_status = FAILED;
+            }
+            slice_statuses.push_back(
+                TransferStatus{.s = slice_status,
+                               .transferred_bytes =
+                                   slice_status == COMPLETED ? event.ret : 0});
+        }
+
+        task_status = aggregateTransferStatus(slice_statuses, is_finished);
+        return true;
+    };
+
+    if (snapshot.all_terminal) {
+        if (nvmeof_desc.task_to_slices.size() < batch_desc.task_list.size()) {
+            return Status::Context(
+                "NVMeoFTransport: Missing task-to-slice mapping");
+        }
+
+        std::vector<TransferStatus> final_statuses(batch_desc.task_list.size());
+        for (size_t i = 0; i < batch_desc.task_list.size(); ++i) {
+            bool is_finished = false;
+            if (!aggregate_task(i, final_statuses[i], is_finished) ||
+                !is_finished) {
+                return Status::Context(
+                    "NVMeoFTransport: Invalid task-to-slice mapping");
+            }
+        }
+
+        nvmeof_desc.transfer_status = std::move(final_statuses);
+        for (auto &mapped_task : batch_desc.task_list) {
+            mapped_task.is_finished = true;
+        }
+        status = nvmeof_desc.transfer_status[task_id];
+        return Status::OK();
+    }
+
+    if (task.is_finished && task_id < nvmeof_desc.transfer_status.size()) {
+        status = nvmeof_desc.transfer_status[task_id];
+        return Status::OK();
     }
 
     bool is_finished = false;
-    status = aggregateTransferStatus(slice_statuses, is_finished);
-    if (is_finished) {
-        task.is_finished = true;
+    if (!aggregate_task(task_id, status, is_finished)) {
+        return Status::Context(
+            "NVMeoFTransport: Invalid task-to-slice mapping");
     }
+    if (!is_finished) return Status::OK();
+
+    if (nvmeof_desc.transfer_status.size() < batch_desc.task_list.size()) {
+        nvmeof_desc.transfer_status.resize(
+            batch_desc.task_list.size(),
+            TransferStatus{.s = PENDING, .transferred_bytes = 0});
+    }
+    nvmeof_desc.transfer_status[task_id] = status;
+    task.is_finished = true;
     return Status::OK();
 }
 
@@ -188,6 +280,11 @@ Status NVMeoFTransport::submitTransfer(
     auto &batch_desc = *((BatchDesc *)(batch_id));
     auto &nvmeof_desc = *((NVMeoFBatchDesc *)(batch_desc.context));
 
+    if (!desc_pool_->isAcceptingSubmissions(nvmeof_desc.desc_idx_)) {
+        return Status::BatchBusy(
+            "NVMeoFTransport: Batch is draining after a cuFile failure");
+    }
+
     if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
         LOG(ERROR)
             << "NVMeoFTransport: Exceed the limitation of current batch's "
@@ -197,8 +294,24 @@ Status NVMeoFTransport::submitTransfer(
             std::to_string(batch_id));
     }
 
-    size_t task_id = batch_desc.task_list.size();
-    size_t slice_id = desc_pool_->getSliceNum(nvmeof_desc.desc_idx_);
+    const size_t initial_task_count = batch_desc.task_list.size();
+    const size_t initial_status_count = nvmeof_desc.transfer_status.size();
+    const size_t initial_mapping_count = nvmeof_desc.task_to_slices.size();
+    int initial_slice_count = desc_pool_->getSliceNum(nvmeof_desc.desc_idx_);
+    if (initial_slice_count < 0) {
+        return Status::Context(
+            "NVMeoFTransport: Invalid cuFile batch descriptor");
+    }
+
+    auto rollback_unsubmitted = [&]() {
+        desc_pool_->discardUnsubmittedParams(nvmeof_desc.desc_idx_);
+        nvmeof_desc.transfer_status.resize(initial_status_count);
+        nvmeof_desc.task_to_slices.resize(initial_mapping_count);
+        batch_desc.task_list.resize(initial_task_count);
+    };
+
+    size_t task_id = initial_task_count;
+    size_t slice_id = initial_slice_count;
     batch_desc.task_list.resize(task_id + entries.size());
     std::unordered_map<SegmentID, std::shared_ptr<SegmentDesc>>
         segment_desc_map;
@@ -256,9 +369,13 @@ Status NVMeoFTransport::submitTransfer(
                     fh = segment_to_context_.at(buf_key)->getHandle();
                 }
                 // 5. add cufile request
-                addSliceToCUFileBatch(source_addr, file_offset, slice_len,
-                                      nvmeof_desc.desc_idx_, request.opcode,
-                                      fh);
+                if (addSliceToCUFileBatch(source_addr, file_offset, slice_len,
+                                          nvmeof_desc.desc_idx_, request.opcode,
+                                          fh) != 0) {
+                    rollback_unsubmitted();
+                    return Status::Context(
+                        "NVMeoFTransport: Failed to append cuFile request");
+                }
             }
             ++buffer_id;
             current_offset += buffer_desc.length;
@@ -271,22 +388,39 @@ Status NVMeoFTransport::submitTransfer(
         slice_id += task.slice_count;
     }
 
-    desc_pool_->submitBatch(nvmeof_desc.desc_idx_);
+    if (desc_pool_->submitBatch(nvmeof_desc.desc_idx_) != 0) {
+        return Status::Context(
+            "NVMeoFTransport: Failed to submit cuFile batch");
+    }
     // LOG(INFO) << "submit nr " << slice_id << " start " << start_slice_id;
     return Status::OK();
 }
 
 Status NVMeoFTransport::freeBatchID(BatchID batch_id) {
+    if (batch_id == 0) {
+        return Status::InvalidArgument("NVMeoFTransport: Invalid batch ID");
+    }
     auto &batch_desc = *((BatchDesc *)(batch_id));
     auto *nvmeof_desc_ptr = (NVMeoFBatchDesc *)(batch_desc.context);
+    if (nvmeof_desc_ptr == nullptr) {
+        return Status::InvalidArgument(
+            "NVMeoFTransport: Batch was not allocated by this transport");
+    }
+    for (const auto &task : batch_desc.task_list) {
+        if (!task.is_finished) {
+            return Status::BatchBusy(
+                "BatchID cannot be freed until all tasks are done");
+        }
+    }
+
     int desc_idx = nvmeof_desc_ptr->desc_idx_;
-    Status rc = Transport::freeBatchID(batch_id);
-    if (rc != Status::OK()) {
-        return rc;
+    if (desc_pool_->freeCUfileDesc(desc_idx) != 0) {
+        return Status::BatchBusy(
+            "BatchID cannot be freed while cuFile I/O is active");
     }
     delete nvmeof_desc_ptr;
-    desc_pool_->freeCUfileDesc(desc_idx);
-    return Status::OK();
+    batch_desc.context = nullptr;
+    return Transport::freeBatchID(batch_id);
 }
 
 int NVMeoFTransport::install(std::string &local_server_name,
@@ -334,10 +468,12 @@ void NVMeoFTransport::addSliceToTask(void *source_addr, uint64_t slice_len,
     __sync_fetch_and_add(&task.slice_count, 1);
 }
 
-void NVMeoFTransport::addSliceToCUFileBatch(
-    void *source_addr, uint64_t file_offset, uint64_t slice_len,
-    uint64_t desc_id, TransferRequest::OpCode op, CUfileHandle_t fh) {
-    CUfileIOParams_t params;
+int NVMeoFTransport::addSliceToCUFileBatch(void *source_addr,
+                                           uint64_t file_offset,
+                                           uint64_t slice_len, uint64_t desc_id,
+                                           TransferRequest::OpCode op,
+                                           CUfileHandle_t fh) {
+    CUfileIOParams_t params{};
     params.mode = CUFILE_BATCH;
     params.opcode =
         op == Transport::TransferRequest::READ ? CUFILE_READ : CUFILE_WRITE;
@@ -349,6 +485,6 @@ void NVMeoFTransport::addSliceToCUFileBatch(
     params.fh = fh;
     // LOG(INFO) << "params " << "base " << request.source << " offset " <<
     // request.target_offset << " length " << request.length;
-    desc_pool_->pushParams(desc_id, params);
+    return desc_pool_->pushParams(desc_id, params);
 }
 }  // namespace mooncake
