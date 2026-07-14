@@ -5923,40 +5923,54 @@ void MasterService::RestoreState() {
     for (const auto& snapshot : candidates_result.value()) {
         ResetStateAfterFailedRestoreAttempt();
 
-        // Phase 2a: Download payloads (repository responsibility)
-        auto payloads_result =
-            snapshot_repository_->DownloadSnapshotPayloads(snapshot);
-        if (!payloads_result) {
+        try {
+            // Phase 2a: Download payloads (repository responsibility)
+            auto payloads_result =
+                snapshot_repository_->DownloadSnapshotPayloads(snapshot);
+            if (!payloads_result) {
+                LOG(WARNING) << "[Restore] Snapshot candidate "
+                             << snapshot.snapshot_id
+                             << " is unusable: failed to download payloads: "
+                             << payloads_result.error().message;
+                continue;
+            }
+
+            // Phase 2b: Decode payloads (codec responsibility)
+            auto decode_result =
+                snapshot_codec_->Decode(this, payloads_result.value());
+            if (!decode_result) {
+                LOG(WARNING) << "[Restore] Snapshot candidate "
+                             << snapshot.snapshot_id
+                             << " is unusable: " << decode_result.error().message;
+                continue;
+            }
+
+            // Phase 3: Apply state (master service responsibility)
+            auto apply_result = ApplySnapshotState(now);
+            if (!apply_result) {
+                LOG(WARNING) << "[Restore] Snapshot candidate "
+                             << snapshot.snapshot_id
+                             << " is unusable: failed to apply state: "
+                             << apply_result.error().message;
+                continue;
+            }
+
+            LOG(INFO) << "[Restore] Successfully restored state from snapshot: "
+                      << snapshot.snapshot_id;
+            return;
+        } catch (const std::exception& e) {
             LOG(WARNING) << "[Restore] Snapshot candidate "
                          << snapshot.snapshot_id
-                         << " is unusable: failed to download payloads: "
-                         << payloads_result.error().message;
+                         << " is unusable: exception during restore: "
+                         << e.what();
+            // State reset already happened at loop start; continue to next
             continue;
-        }
-
-        // Phase 2b: Decode payloads (codec responsibility)
-        auto decode_result =
-            snapshot_codec_->Decode(this, payloads_result.value());
-        if (!decode_result) {
+        } catch (...) {
             LOG(WARNING) << "[Restore] Snapshot candidate "
                          << snapshot.snapshot_id
-                         << " is unusable: " << decode_result.error().message;
+                         << " is unusable: unknown exception during restore";
             continue;
         }
-
-        // Phase 3: Apply state (master service responsibility)
-        auto apply_result = ApplySnapshotState(now);
-        if (!apply_result) {
-            LOG(WARNING) << "[Restore] Snapshot candidate "
-                         << snapshot.snapshot_id
-                         << " is unusable: failed to apply state: "
-                         << apply_result.error().message;
-            continue;
-        }
-
-        LOG(INFO) << "[Restore] Successfully restored state from snapshot: "
-                  << snapshot.snapshot_id;
-        return;
     }
 
     ResetStateAfterFailedRestoreAttempt();
