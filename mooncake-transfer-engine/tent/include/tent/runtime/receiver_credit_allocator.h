@@ -5,6 +5,7 @@
 #define TENT_RUNTIME_RECEIVER_CREDIT_ALLOCATOR_H
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -31,6 +32,7 @@ struct ReceiverCreditAllocatorSnapshot {
     std::array<uint64_t, kCreditResourceCount> committed{};
     std::array<uint64_t, kCreditResourceCount> free{};
     size_t entries{0};
+    uint64_t pull_requests{0};
 };
 
 // Receiver-wide allocator for a configured ingress budget. Credits represent
@@ -89,6 +91,7 @@ class ReceiverCreditAllocator {
         ReceiverCreditAllocatorSnapshot* snapshot) const;
 
     const ReceiverCreditAllocatorConfig config_;
+    std::atomic<uint64_t> pull_requests_{0};
     mutable std::mutex mutex_;
     std::array<uint64_t, kCreditResourceCount> committed_{};
     std::unordered_map<EntryKey, Entry, EntryKeyHash> entries_;

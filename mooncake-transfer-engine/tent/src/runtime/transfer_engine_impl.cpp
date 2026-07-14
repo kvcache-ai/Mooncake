@@ -1780,14 +1780,20 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
             CreditCharge charge{{{CreditResource::DataBytes, request.length},
                                  {CreditResource::RequestSlots, 1}}};
             const uint32_t qos_class = 0;
-            CHECK_STATUS(receiver_credit_pull_controller_->request(
-                request.target_id, remote->rpc_server_addr, qos_class, charge));
             CreditDispatchSnapshot snapshot;
             auto snapshot_status = receiver_credit_dispatch_gate_->snapshot(
                 request.target_id, qos_class, charge, snapshot);
             if (snapshot_status.ok()) {
                 credit_snapshots[i] = std::move(snapshot);
-            } else if (!snapshot_status.IsInvalidEntry()) {
+            } else if (snapshot_status.IsInvalidEntry()) {
+                // Pull only while the peer has no fresh generation. Available
+                // credit is reserved later by the queue owner; an exhausted
+                // ledger triggers a coalesced refill from that path. Pulling
+                // here unconditionally turns every submit into a control RPC.
+                CHECK_STATUS(receiver_credit_pull_controller_->request(
+                    request.target_id, remote->rpc_server_addr, qos_class,
+                    charge));
+            } else {
                 return snapshot_status;
             }
             credit_charges[i] = std::move(charge);

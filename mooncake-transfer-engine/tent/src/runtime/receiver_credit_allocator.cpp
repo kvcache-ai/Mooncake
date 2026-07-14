@@ -92,6 +92,7 @@ ReceiverCreditPullResponseV1 ReceiverCreditAllocator::makeResponse(
 Status ReceiverCreditAllocator::pull(const ReceiverCreditPullRequestV1& request,
                                      ReceiverCreditPullResponseV1& response) {
     CHECK_STATUS(ReceiverCreditPullRequestCodecV1::validate(request));
+    pull_requests_.fetch_add(1, std::memory_order_relaxed);
 
     std::lock_guard lock(mutex_);
     CHECK_STATUS(validateInvariantsLocked(nullptr));
@@ -282,6 +283,7 @@ Status ReceiverCreditAllocator::validateInvariantsLocked(
     ReceiverCreditAllocatorSnapshot snapshot;
     snapshot.capacity = config_.capacity;
     snapshot.entries = entries_.size();
+    snapshot.pull_requests = pull_requests_.load(std::memory_order_relaxed);
     for (size_t i = 0; i < kCreditResourceCount; ++i) {
         if (recomputed[i] != committed_[i] ||
             committed_[i] > config_.capacity[i])

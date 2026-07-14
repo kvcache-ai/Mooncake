@@ -272,7 +272,21 @@ ControlService::ControlService(const std::string& type,
         });
 }
 
-ControlService::~ControlService() {}
+ControlService::~ControlService() {
+    std::shared_ptr<ReceiverCreditAllocator> allocator;
+    {
+        std::lock_guard lock(receiver_credit_mutex_);
+        allocator = receiver_credit_allocator_;
+    }
+    if (allocator) {
+        ReceiverCreditAllocatorSnapshot snapshot;
+        if (allocator->snapshot(snapshot).ok()) {
+            LOG(INFO) << "Receiver credit control summary: pulls="
+                      << snapshot.pull_requests
+                      << " peers=" << snapshot.entries;
+        }
+    }
+}
 
 Status ControlService::start(uint16_t& port, bool ipv6_) {
     return rpc_server_->start(port, ipv6_);
