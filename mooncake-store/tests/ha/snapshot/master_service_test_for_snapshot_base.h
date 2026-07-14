@@ -165,6 +165,12 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
     // private members
     static tl::expected<void, SerializationError> CallPersistState(
         MasterService* service, const std::string& snapshot_id) {
+        // Production snapshots exclude mutating operations while forking.
+        // Direct persistence in tests needs the same isolation because it
+        // serializes live metadata in the current process.
+        std::unique_lock<std::shared_mutex> snapshot_lock(
+            service->snapshot_mutex_);
+
         // If snapshot_manager_ exists, use it; otherwise create a temporary one
         if (service->snapshot_manager_) {
             return service->snapshot_manager_->PersistState(snapshot_id);
