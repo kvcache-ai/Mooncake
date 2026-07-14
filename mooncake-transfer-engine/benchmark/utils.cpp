@@ -55,6 +55,8 @@ DEFINE_string(
     "unspec|rdma|tcp|shm|nvlink|gds|io_uring|mnnvl|ascend|sunrise_link");
 DEFINE_bool(enable_runtime_queue, false,
             "tent only: route submissions through the runtime queue");
+DEFINE_uint64(runtime_queue_max_dispatch_owners, 64,
+              "tent only: maximum concurrently dispatched queue owners");
 DEFINE_string(
     receiver_credit_mode, "disabled",
     "tent only: receiver credit rollout mode: disabled|optional|required");
@@ -92,6 +94,7 @@ std::string XferBenchConfig::backend;
 bool XferBenchConfig::notifi = false;
 std::string XferBenchConfig::tent_transport_hint;
 bool XferBenchConfig::enable_runtime_queue = false;
+size_t XferBenchConfig::runtime_queue_max_dispatch_owners = 0;
 std::string XferBenchConfig::receiver_credit_mode;
 size_t XferBenchConfig::receiver_credit_capacity_bytes = 0;
 size_t XferBenchConfig::receiver_credit_capacity_slots = 0;
@@ -126,6 +129,7 @@ void XferBenchConfig::loadFromFlags() {
     notifi = FLAGS_notifi;
     tent_transport_hint = FLAGS_tent_transport_hint;
     enable_runtime_queue = FLAGS_enable_runtime_queue;
+    runtime_queue_max_dispatch_owners = FLAGS_runtime_queue_max_dispatch_owners;
     receiver_credit_mode = FLAGS_receiver_credit_mode;
     receiver_credit_capacity_bytes = FLAGS_receiver_credit_capacity_bytes;
     receiver_credit_capacity_slots = FLAGS_receiver_credit_capacity_slots;

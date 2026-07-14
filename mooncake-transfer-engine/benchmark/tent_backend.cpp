@@ -52,6 +52,10 @@ std::shared_ptr<Config> loadConfig() {
     config->set("metadata_servers", XferBenchConfig::metadata_url_list);
     config->set("rpc_server_port", XferBenchConfig::rpc_server_port);
     config->set("enable_runtime_queue", XferBenchConfig::enable_runtime_queue);
+    if (XferBenchConfig::enable_runtime_queue) {
+        config->set("runtime_queue/max_dispatch_owners",
+                    XferBenchConfig::runtime_queue_max_dispatch_owners);
+    }
     if (XferBenchConfig::receiver_credit_mode != "disabled") {
         config->set("receiver_credit/mode",
                     XferBenchConfig::receiver_credit_mode);
