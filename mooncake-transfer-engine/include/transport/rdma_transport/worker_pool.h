@@ -37,11 +37,19 @@ class WorkerPool {
                              size_t first, size_t count);
 
    private:
+    // Enqueue slices that were prepared by another WorkerPool. Used for
+    // local-NIC failure handoff: the original worker keeps the remote path
+    // fixed, updates the local lkey, and pushes the slice to this context's
+    // worker queue.
+    int submitPreparedPostSend(
+        const std::vector<Transport::Slice *> &slice_list);
+
     void performPostSend(int thread_id);
 
     void performPollCq(int thread_id);
 
-    void redispatch(std::vector<Transport::Slice *> &slice_list, int thread_id);
+    void redispatch(std::vector<Transport::Slice *> &slice_list, int thread_id,
+                    bool handoff_to_local_worker = false);
 
     void transferWorker(int thread_id);
 
@@ -68,20 +76,32 @@ class WorkerPool {
     void handlePathFailure(const std::string &peer_nic_path,
                            RdmaEndPoint *endpoint = nullptr);
 
+    static bool isLocalWcFailure(const ibv_wc &wc);
+
+    // Local-side failure handler: degrade current context so retries are
+    // handed off to another local context's worker pool.
+    void handleLocalFailure(const std::string &peer_nic_path,
+                            RdmaEndPoint *endpoint = nullptr);
+
+    bool tryHandoffToAnotherLocalWorker(Transport::Slice *slice);
+
     // Context-level health tracking for catastrophic hardware failure.
     // When all rails through a local RNIC are unavailable, increment the
     // failure counter. Reset on any success. Mark context inactive after
     // consecutive failures exceed threshold.
     bool contextHealthy() const {
-        return context_failure_count_ < kContextFailureThreshold;
+        return context_failure_count_.load(std::memory_order_relaxed) <
+               kContextFailureThreshold;
     }
-    void markContextSuccess() { context_failure_count_ = 0; }
+    void markContextSuccess() {
+        context_failure_count_.store(0, std::memory_order_relaxed);
+    }
     void markContextFailure() {
-        context_failure_count_++;
-        if (context_failure_count_ >= kContextFailureThreshold) {
+        auto failure_count =
+            context_failure_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (failure_count >= kContextFailureThreshold) {
             LOG(WARNING) << "All rails failed for context "
-                         << context_.deviceName() << " for "
-                         << context_failure_count_
+                         << context_.deviceName() << " for " << failure_count
                          << " consecutive attempts, marking inactive";
             context_.set_active(false);
         }
@@ -132,7 +152,7 @@ class WorkerPool {
     const static uint64_t kRailPauseNs = 1000000000ull;  // 1 second pause
 
     // Context-level health tracking
-    int context_failure_count_ = 0;
+    std::atomic<int> context_failure_count_{0};
     const static int kContextFailureThreshold =
         32;  // consecutive all-rails-failed
 };

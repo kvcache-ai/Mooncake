@@ -77,6 +77,7 @@ struct MemoryRegionMeta {
 class RdmaContext {
    public:
     friend class RdmaContextTestPeer;
+    friend class WorkerPool;
 
     RdmaContext(RdmaTransport &engine, const std::string &device_name);
 

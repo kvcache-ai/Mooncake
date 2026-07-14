@@ -17,6 +17,7 @@
 #include <sys/epoll.h>
 
 #include <cassert>
+#include <functional>
 
 #include "config.h"
 #include "memory_location.h"
@@ -295,6 +296,43 @@ void WorkerPool::untrackPostedSlices(
         posted_slices_.erase(slice_list[i]);
 }
 
+int WorkerPool::submitPreparedPostSend(
+    const std::vector<Transport::Slice *> &slice_list) {
+    SliceList slice_list_map[kShardCount];
+    uint64_t submitted_slice_count = 0;
+
+    for (auto &slice : slice_list) {
+        if (slice->peer_nic_path.empty()) {
+            slice->markFailed();
+            continue;
+        }
+        auto shard_id = static_cast<int>(
+            std::hash<std::string>{}(slice->peer_nic_path) % kShardCount);
+        slice_list_map[shard_id].push_back(slice);
+        submitted_slice_count++;
+    }
+
+    for (int shard_id = 0; shard_id < kShardCount; ++shard_id) {
+        if (slice_list_map[shard_id].empty()) continue;
+        slice_queue_lock_[shard_id].lock();
+        for (auto &slice : slice_list_map[shard_id])
+            slice_queue_[shard_id][slice->peer_nic_path].push_back(slice);
+        slice_queue_count_[shard_id].fetch_add(slice_list_map[shard_id].size(),
+                                               std::memory_order_relaxed);
+        slice_queue_lock_[shard_id].unlock();
+    }
+
+    submitted_slice_count_.fetch_add(submitted_slice_count,
+                                     std::memory_order_relaxed);
+    if (submitted_slice_count &&
+        parked_worker_count_.load(std::memory_order_acquire) > 0) {
+        std::lock_guard<std::mutex> lock(cond_mutex_);
+        cond_var_.notify_all();
+    }
+
+    return 0;
+}
+
 void WorkerPool::performPostSend(int thread_id) {
     int post_tid = 0;
     int post_count = 0;
@@ -448,7 +486,8 @@ void WorkerPool::performPollCq(int thread_id) {
     int processed_slice_count = 0;
     const static size_t kPollCount = 64;
     std::unordered_map<volatile int *, int> qp_depth_set;
-    SliceList failed_slice_list;  // Unified: collect all slices for redispatch
+    SliceList failed_slice_list;
+    SliceList local_failed_slice_list;
     for (int cq_index = 0; cq_index < context_.cqCount(); cq_index++) {
         ibv_wc wc[kPollCount];
         int nr_poll = context_.poll(kPollCount, wc, cq_index);
@@ -501,10 +540,17 @@ void WorkerPool::performPollCq(int thread_id) {
                            << ", dest_rkey: " << slice->rdma.dest_rkey
                            << ", retry_cnt: " << slice->rdma.retry_cnt
                            << "): " << ibv_wc_status_str(wc[i].status);
-                // Unified path failure handling
-                handlePathFailure(slice->peer_nic_path, slice->rdma.endpoint);
+                auto *retry_list = &failed_slice_list;
+                if (isLocalWcFailure(wc[i])) {
+                    handleLocalFailure(slice->peer_nic_path,
+                                       slice->rdma.endpoint);
+                    retry_list = &local_failed_slice_list;
+                } else {
+                    handlePathFailure(slice->peer_nic_path,
+                                      slice->rdma.endpoint);
+                }
                 if (shouldRetrySlice(slice)) {
-                    failed_slice_list.push_back(slice);
+                    retry_list->push_back(slice);
                 } else {
                     slice->markFailed();
                     processed_slice_count_++;
@@ -527,22 +573,29 @@ void WorkerPool::performPollCq(int thread_id) {
         markContextSuccess();
     }
 
+    if (!local_failed_slice_list.empty()) {
+        redispatch(local_failed_slice_list, thread_id, true);
+    }
     if (!failed_slice_list.empty()) {
         redispatch(failed_slice_list, thread_id);
     }
 }
 
 void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
-                            int thread_id) {
+                            int thread_id, bool handoff_to_local_worker) {
     std::unordered_map<SegmentID, std::shared_ptr<Transport::SegmentDesc>>
         segment_desc_map;
     const bool use_local_queue = workerCanPost(thread_id);
     int shared_redispatch_count = 0;
-    for (auto &slice : slice_list) {
-        auto target_id = slice->target_id;
-        if (!segment_desc_map.count(target_id)) {
-            segment_desc_map[target_id] =
-                context_.engine().meta()->getSegmentDescByID(target_id, true);
+    if (!handoff_to_local_worker) {
+        for (auto &slice : slice_list) {
+            auto target_id = slice->target_id;
+            if (!segment_desc_map.count(target_id)) {
+                segment_desc_map[target_id] = context_.engine()
+                                                  .meta()
+                                                  ->getSegmentDescByID(
+                                                      target_id, true);
+            }
         }
     }
 
@@ -551,6 +604,21 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
             slice->markFailed();
             processed_slice_count_++;
         } else {
+            if (handoff_to_local_worker) {
+                if (tryHandoffToAnotherLocalWorker(slice)) {
+                    processed_slice_count_++;
+                    continue;
+                }
+                // A local RNIC failure cannot be repaired by keeping this
+                // worker/context and changing the remote rail. If no other
+                // local worker can take the slice, fail it immediately.
+                slice->markFailed();
+                processed_slice_count_++;
+                continue;
+            }
+
+            // Remote-side/default policy: keep local context fixed and switch
+            // remote path.
             auto &peer_segment_desc = segment_desc_map[slice->target_id];
             int buffer_id, device_id;
             if (!peer_segment_desc ||
@@ -635,6 +703,73 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
         std::lock_guard<std::mutex> lock(cond_mutex_);
         cond_var_.notify_all();
     }
+}
+
+bool WorkerPool::tryHandoffToAnotherLocalWorker(Transport::Slice *slice) {
+    auto local_segment_desc =
+        context_.engine().meta()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    auto &contexts = context_.engine().context_list_;
+    if (!local_segment_desc || contexts.size() <= 1) {
+        return false;
+    }
+
+    int current_ctx_id = -1;
+    for (size_t i = 0; i < contexts.size(); ++i) {
+        if (contexts[i] && contexts[i].get() == &context_) {
+            current_ctx_id = static_cast<int>(i);
+            break;
+        }
+    }
+    if (current_ctx_id < 0) {
+        return false;
+    }
+
+    int buffer_id = -1;
+    int device_id = -1;
+    for (int probe = static_cast<int>(slice->rdma.retry_cnt);
+         probe < static_cast<int>(slice->rdma.retry_cnt + contexts.size() + 2);
+         ++probe) {
+        if (RdmaTransport::selectDevice(
+                local_segment_desc.get(),
+                reinterpret_cast<uint64_t>(slice->source_addr), slice->length,
+                buffer_id, device_id, probe)) {
+            continue;
+        }
+        if (device_id < 0 ||
+            device_id >= static_cast<int>(contexts.size()) ||
+            device_id == current_ctx_id) {
+            continue;
+        }
+        auto &alt_ctx = contexts[device_id];
+        if (!alt_ctx || !alt_ctx->active()) {
+            continue;
+        }
+        if (buffer_id < 0 ||
+            buffer_id >= static_cast<int>(local_segment_desc->buffers.size())) {
+            continue;
+        }
+        if (device_id >=
+            static_cast<int>(
+                local_segment_desc->buffers[buffer_id].lkey.size())) {
+            continue;
+        }
+
+        slice->rdma.source_lkey =
+            local_segment_desc->buffers[buffer_id].lkey[device_id];
+        slice->rdma.endpoint = nullptr;
+        slice->ts = 0;
+
+        std::vector<Transport::Slice *> handoff{slice};
+        alt_ctx->worker_pool_->submitPreparedPostSend(handoff);
+
+        VLOG(1) << "Local-side retry handed slice from worker pool on "
+                << context_.deviceName() << " to worker pool on "
+                << alt_ctx->deviceName() << " while keeping remote peer "
+                << slice->peer_nic_path;
+        return true;
+    }
+
+    return false;
 }
 
 bool WorkerPool::hasOutstandingCq(int thread_id) {
@@ -935,6 +1070,48 @@ void WorkerPool::handlePathFailure(const std::string &peer_nic_path,
     if (endpoint) {
         context_.deleteEndpointByPtr(endpoint);
     }
+}
+
+bool WorkerPool::isLocalWcFailure(const ibv_wc &wc) {
+    switch (wc.status) {
+        case IBV_WC_LOC_LEN_ERR:
+        case IBV_WC_LOC_QP_OP_ERR:
+        case IBV_WC_LOC_PROT_ERR:
+        case IBV_WC_MW_BIND_ERR:
+        case IBV_WC_LOC_ACCESS_ERR:
+#ifdef IBV_WC_LOC_RDD_VIOL_ERR
+        case IBV_WC_LOC_RDD_VIOL_ERR:
+#endif
+#ifdef IBV_WC_LOC_EEC_OP_ERR
+        case IBV_WC_LOC_EEC_OP_ERR:
+#endif
+#ifdef IBV_WC_LOC_EEC_STATE_ERR
+        case IBV_WC_LOC_EEC_STATE_ERR:
+#endif
+#ifdef IBV_WC_GENERAL_ERR
+        case IBV_WC_GENERAL_ERR:
+#endif
+            return true;
+
+        default:
+            return false;
+    }
+}
+
+void WorkerPool::handleLocalFailure(const std::string &peer_nic_path,
+                                    RdmaEndPoint *endpoint) {
+    // Local fault: degrade this context so retries are handed off to another
+    // local context's worker pool.
+    markContextFailure();
+    redispatch_counter_++;
+
+    // Endpoint may also be poisoned; retire it for safety.
+    if (endpoint) {
+        context_.deleteEndpointByPtr(endpoint);
+    }
+
+    LOG(WARNING) << "Local-side RDMA failure detected on context "
+                 << context_.deviceName() << ", peer=" << peer_nic_path;
 }
 
 }  // namespace mooncake
