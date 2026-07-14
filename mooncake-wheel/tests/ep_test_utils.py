@@ -175,6 +175,10 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30, suppress_kineto_output: 
     # Return average kernel times
     kernel_times = []
     events = prof.key_averages()
+    sort_by = "cuda_time_total" if any(
+        float(getattr(event, "cuda_time_total", 0.0)) > 0 for event in events
+    ) else "device_time_total"
+    prof_lines = prof.key_averages().table(sort_by=sort_by, max_name_column_width=160).split('\n')
 
     def cuda_time_us(event):
         cuda_time = float(getattr(event, "cuda_time_total", 0.0))
@@ -182,10 +186,31 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30, suppress_kineto_output: 
             return cuda_time
         return float(getattr(event, "device_time_total", 0.0))
 
+    def table_avg_time_s(name):
+        for line in prof_lines:
+            if name not in line:
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            time_str = parts[-2]
+            if time_str.endswith("ms"):
+                return float(time_str[:-2]) / 1e3
+            if time_str.endswith("us"):
+                return float(time_str[:-2]) / 1e6
+            if time_str.endswith("ns"):
+                return float(time_str[:-2]) / 1e9
+            if time_str.endswith("s"):
+                return float(time_str[:-1])
+        return 0.0
+
     for name in kernel_names:
         matched_events = [event for event in events if name in event.key and cuda_time_us(event) > 0]
         if len(matched_events) == 0:
-            # Kernel not found (fallback mode), return 0 time
+            fallback_time = table_avg_time_s(name)
+            if fallback_time > 0:
+                kernel_times.append(fallback_time)
+                continue
             import warnings
             warnings.warn(f'Kernel {name} not found in profiling table (might be fallback mode)', UserWarning)
             kernel_times.append(0.0)
@@ -197,10 +222,6 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30, suppress_kineto_output: 
         kernel_times.append(total_cuda_time_us / total_count / 1e6)
 
     if os.getenv("MOONCAKE_EP_KINETO_DUMP", "").upper() in {"1", "ON", "TRUE", "YES"}:
-        sort_by = "cuda_time_total" if any(
-            float(getattr(event, "cuda_time_total", 0.0)) > 0 for event in events
-        ) else "device_time_total"
-        prof_lines = prof.key_averages().table(sort_by=sort_by, max_name_column_width=160).split('\n')
         print("\n".join(prof_lines[:80]), flush=True)
 
     return tuple(kernel_times) if is_tupled else kernel_times[0]
