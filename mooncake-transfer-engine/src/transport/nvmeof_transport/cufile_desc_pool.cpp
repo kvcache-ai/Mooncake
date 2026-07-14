@@ -135,7 +135,7 @@ int CUFileDescPool::pushParams(int idx, const CUfileIOParams_t& io_params) {
     }
 
     auto* desc = descs_[idx];
-    if (desc->io_params.size() >= desc->io_params.capacity()) {
+    if (desc->io_params.size() >= max_batch_size_) {
         LOG(ERROR) << "Descriptor " << idx << " is full";
         return -1;
     }
@@ -191,6 +191,13 @@ CUfileIOEvents_t CUFileDescPool::getTransferStatus(int idx, int slice_id) {
     }
 
     unsigned nr = desc->io_params.size();
+    if (desc->polled_events.size() < nr) {
+        LOG(ERROR) << "Completion buffer is too small for descriptor " << idx;
+        CUfileIOEvents_t event;
+        event.status = CUFILE_FAILED;
+        event.ret = -1;
+        return event;
+    }
     CUFILE_CHECK(cuFileBatchIOGetStatus(desc->batch_handle->handle, 0, &nr,
                                         desc->polled_events.data(), nullptr));
 

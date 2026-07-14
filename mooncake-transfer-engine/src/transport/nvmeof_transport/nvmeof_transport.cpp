@@ -98,7 +98,8 @@ Status NVMeoFTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     }
 
     auto [slice_id, slice_num] = nvmeof_desc.task_to_slices[task_id];
-    std::vector<TransferStatus> slice_statuses;
+    thread_local std::vector<TransferStatus> slice_statuses;
+    slice_statuses.clear();
     slice_statuses.reserve(slice_num);
     for (size_t i = slice_id; i < slice_id + slice_num; ++i) {
         auto event = desc_pool_->getTransferStatus(nvmeof_desc.desc_idx_, i);
