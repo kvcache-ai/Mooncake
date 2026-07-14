@@ -102,17 +102,45 @@ std::unique_ptr<HotStandbyService> CreateSnapshotOnlyReadyStandby(
 // ========== 6.1.1 Start/Stop tests ==========
 
 TEST_F(HotStandbyServiceTest, TestStart) {
+#ifdef STORE_USE_ETCD
+    // Requires a real etcd cluster and valid cluster configuration; acts as an
+    // integration placeholder
     GTEST_SKIP()
         << "Requires real etcd connection, run in integration environment.";
+#else
+    ErrorCode err =
+        service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
+    EXPECT_EQ(ErrorCode::OK, err);
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+#endif
 }
 
 TEST_F(HotStandbyServiceTest, TestStart_AlreadyRunning) {
+#ifdef STORE_USE_ETCD
     GTEST_SKIP()
         << "Requires real etcd connection to verify double start semantics.";
+#else
+    ErrorCode err1 =
+        service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
+    EXPECT_EQ(ErrorCode::OK, err1);
+    ErrorCode err2 =
+        service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
+    EXPECT_EQ(ErrorCode::OK, err2);
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+#endif
 }
 
 TEST_F(HotStandbyServiceTest, TestStart_InvalidEtcdEndpoints) {
+#ifdef STORE_USE_ETCD
     GTEST_SKIP() << "Requires real etcd to simulate invalid endpoints.";
+#else
+    // LOCAL_FS does not consume remote endpoints.
+    std::string invalid_endpoints = "invalid_endpoint";
+    ErrorCode err =
+        service_->Start("primary_unused", invalid_endpoints, cluster_id_);
+    EXPECT_EQ(ErrorCode::OK, err);
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+#endif
 }
 
 TEST_F(HotStandbyServiceTest, TestStop) {
@@ -131,18 +159,34 @@ TEST_F(HotStandbyServiceTest, TestStop_WhenNotRunning) {
 // ========== 6.1.2 State transition tests ==========
 
 TEST_F(HotStandbyServiceTest, TestStateTransition_StartToWatching) {
+#ifdef STORE_USE_ETCD
     GTEST_SKIP()
         << "Requires real etcd to drive full state transition to WATCHING.";
+#else
+    EXPECT_EQ(StandbyState::STOPPED, service_->GetState());
+    ErrorCode err =
+        service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
+    EXPECT_EQ(ErrorCode::OK, err);
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+#endif
 }
 
 TEST_F(HotStandbyServiceTest, TestStateTransition_ConnectionFailed) {
+#ifdef STORE_USE_ETCD
     GTEST_SKIP()
         << "Connection failure requires real etcd and invalid endpoints.";
+#else
+    GTEST_SKIP() << "LOCAL_FS has no remote connection failure to inject.";
+#endif
 }
 
 TEST_F(HotStandbyServiceTest, TestStateTransition_SyncFailed) {
+#ifdef STORE_USE_ETCD
     GTEST_SKIP()
         << "Sync failure requires real etcd and OpLog watcher behavior.";
+#else
+    GTEST_SKIP() << "LOCAL_FS sync failure requires explicit fault injection.";
+#endif
 }
 
 // ========== 6.1.3 Sync status tests ==========
@@ -158,8 +202,16 @@ TEST_F(HotStandbyServiceTest, TestGetSyncStatus_InitialState) {
 }
 
 TEST_F(HotStandbyServiceTest, TestGetSyncStatus_AfterSync) {
+#ifdef STORE_USE_ETCD
     GTEST_SKIP()
         << "Requires real etcd and OpLog activity to change sync status.";
+#else
+    ASSERT_EQ(ErrorCode::OK,
+              service_->Start("primary_unused", oplog_endpoints_, cluster_id_));
+    StandbySyncStatus status = service_->GetSyncStatus();
+    EXPECT_EQ(StandbyState::WATCHING, status.state);
+    EXPECT_TRUE(status.is_connected);
+#endif
 }
 
 TEST_F(HotStandbyServiceTest, TestGetSyncStatus) {
