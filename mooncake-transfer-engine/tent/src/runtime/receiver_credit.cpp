@@ -100,6 +100,10 @@ Status SenderCreditLedger::applyUpdate(const CreditKey& k,
         disposition = CreditUpdateDisposition::DuplicateOrOld;
         return Status::OK();
     }
+    // `grants` is a partial cumulative update: each resource present in this
+    // message replaces that resource's cumulative grant total, while omitted
+    // resources retain their previous totals. This lets the receiver refresh
+    // only the resources whose available capacity changed.
     for (size_t i = 0; i < kCreditResourceCount; ++i)
         if (present[i] &&
             (proposed[i] < e.grants[i] || proposed[i] < e.consumed[i]))
