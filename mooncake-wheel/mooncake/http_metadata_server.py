@@ -8,6 +8,7 @@ used by Mooncake. It can be used as an alternative to etcd for metadata storage.
 
 import argparse
 import asyncio
+from concurrent.futures import Future
 import logging
 import os
 import signal
@@ -50,8 +51,16 @@ class KVBootstrapServer:
     
     def run(self):
         """Start the server in a background thread."""
-        self.thread = threading.Thread(target=self._run_server, daemon=True)
+        startup: Future[None] = Future()
+        self.thread = threading.Thread(
+            target=self._run_server, args=(startup,), daemon=True
+        )
         self.thread.start()
+        try:
+            startup.result()
+        except BaseException:
+            self.thread.join(timeout=2)
+            raise
         logging.info(f"HTTP Metadata Server started on {self.host}:{self.port}")
         return self.thread
 
@@ -106,8 +115,12 @@ class KVBootstrapServer:
         return web.Response(text='metadata deleted', status=200,
                           content_type='application/json')
                           
-    def _run_server(self):
+    def _run_server(self, startup: Future[None]):
         """Run the server in the current thread."""
+        def notify_started():
+            if not startup.done():
+                startup.set_result(None)
+
         try:
             # Event Loop
             self._loop = asyncio.new_event_loop()
@@ -118,10 +131,19 @@ class KVBootstrapServer:
             
             site = web.TCPSite(self._runner, host=self.host, port=self.port)
             self._loop.run_until_complete(site.start())
+            self._loop.call_soon(notify_started)
             self._loop.run_forever()
-        except Exception as e:
+        except BaseException as e:
+            if not startup.done():
+                startup.set_exception(e)
+            if not isinstance(e, Exception):
+                raise
             logging.error(f"Server error: {str(e)}")
         finally:
+            if not startup.done():
+                startup.set_exception(
+                    RuntimeError("Server exited before startup completed")
+                )
             # Cleanup
             if self._runner is not None:
                 self._loop.run_until_complete(self._runner.cleanup())
