@@ -181,6 +181,13 @@ RdmaContext::~RdmaContext() {
 int RdmaContext::construct(size_t num_cq_list, size_t num_comp_channels,
                            uint8_t port, int gid_index, size_t max_cqe,
                            int max_endpoints) {
+    if (num_cq_list == 0 || num_comp_channels == 0) {
+        LOG(ERROR) << "Invalid RDMA completion configuration for device "
+                   << device_name_ << ": num_cq_list=" << num_cq_list
+                   << ", num_comp_channels=" << num_comp_channels;
+        return ERR_INVALID_ARGUMENT;
+    }
+
     // Create endpoint store based on configuration
     auto &config = globalConfig();
     switch (config.endpoint_store_type) {
@@ -199,6 +206,12 @@ int RdmaContext::construct(size_t num_cq_list, size_t num_comp_channels,
     if (openRdmaDevice(device_name_, port, gid_index)) {
         LOG(ERROR) << "Failed to open device " << device_name_ << " on port "
                    << port << " with GID " << gid_index;
+        return ERR_CONTEXT;
+    }
+
+    if (context_->num_comp_vectors <= 0) {
+        LOG(ERROR) << "RDMA device " << device_name_
+                   << " exposes no completion vectors";
         return ERR_CONTEXT;
     }
 

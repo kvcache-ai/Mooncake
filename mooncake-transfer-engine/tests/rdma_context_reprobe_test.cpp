@@ -53,6 +53,10 @@ class RdmaTransportTestPeer {
 
 class RdmaContextTestPeer {
    public:
+    static bool hasEndpointStore(const RdmaContext &context) {
+        return context.endpoint_store_ != nullptr;
+    }
+
     static void seedAutoGidState(RdmaContext &context, ibv_context *verbs_ctx,
                                  uint8_t port, uint16_t lid, const ibv_gid &gid,
                                  int gid_index) {
@@ -72,6 +76,36 @@ class RdmaContextTestPeer {
 }  // namespace mooncake
 
 namespace {
+
+class RdmaContextConstructionTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        // RdmaTransport teardown requires metadata initialized by install().
+        // These tests only need the constructor reference, so match the
+        // existing uninstalled-transport test setup below.
+        transport_ = new RdmaTransport();
+        MC_LSAN_IGNORE_OBJECT(transport_);
+        context_ =
+            std::make_unique<RdmaContext>(*transport_, "nonexistent-device");
+    }
+
+    RdmaTransport *transport_ = nullptr;
+    std::unique_ptr<RdmaContext> context_;
+};
+
+TEST_F(RdmaContextConstructionTest, RejectsZeroCompletionQueuesBeforeSetup) {
+    EXPECT_EQ(context_->construct(/*num_cq_list=*/0,
+                                  /*num_comp_channels=*/1),
+              ERR_INVALID_ARGUMENT);
+    EXPECT_FALSE(RdmaContextTestPeer::hasEndpointStore(*context_));
+}
+
+TEST_F(RdmaContextConstructionTest, RejectsZeroCompletionChannelsBeforeSetup) {
+    EXPECT_EQ(context_->construct(/*num_cq_list=*/1,
+                                  /*num_comp_channels=*/0),
+              ERR_INVALID_ARGUMENT);
+    EXPECT_FALSE(RdmaContextTestPeer::hasEndpointStore(*context_));
+}
 
 ibv_gid makeGid(const std::array<uint8_t, 16> &bytes) {
     ibv_gid gid = {};
