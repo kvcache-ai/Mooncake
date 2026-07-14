@@ -110,7 +110,9 @@ int CUFileDescPool::allocCUfileDesc(size_t batch_size) {
         desc->batch_handle = batch_handle;
         desc->io_params.clear();
         desc->io_params.reserve(max_batch_size_);
-        desc->io_events.resize(max_batch_size_);
+        desc->io_events.clear();
+        desc->io_events.reserve(max_batch_size_);
+        desc->polled_events.resize(max_batch_size_);
 
         descs_[idx] = desc;
         return idx;
@@ -138,7 +140,13 @@ int CUFileDescPool::pushParams(int idx, const CUfileIOParams_t& io_params) {
         return -1;
     }
 
-    desc->io_params.push_back(io_params);
+    CUfileIOParams_t params = io_params;
+    const size_t slice_id = desc->io_params.size();
+    params.cookie =
+        reinterpret_cast<void*>(static_cast<uintptr_t>(slice_id + 1));
+    desc->io_params.push_back(params);
+    desc->io_events.push_back(CUfileIOEvents_t{
+        .cookie = params.cookie, .status = CUFILE_WAITING, .ret = 0});
     return 0;
 }
 
@@ -184,9 +192,26 @@ CUfileIOEvents_t CUFileDescPool::getTransferStatus(int idx, int slice_id) {
 
     unsigned nr = desc->io_params.size();
     CUFILE_CHECK(cuFileBatchIOGetStatus(desc->batch_handle->handle, 0, &nr,
-                                        desc->io_events.data(), nullptr));
+                                        desc->polled_events.data(), nullptr));
+
+    for (unsigned i = 0; i < nr; ++i) {
+        const auto& event = desc->polled_events[i];
+        if (!cachePolledEvent(desc->io_events, event)) {
+            LOG(ERROR) << "Invalid completion cookie "
+                       << reinterpret_cast<uintptr_t>(event.cookie)
+                       << " for descriptor " << idx;
+        }
+    }
 
     return desc->io_events[slice_id];
+}
+
+bool CUFileDescPool::cachePolledEvent(std::vector<CUfileIOEvents_t>& io_events,
+                                      const CUfileIOEvents_t& event) {
+    const uintptr_t cookie = reinterpret_cast<uintptr_t>(event.cookie);
+    if (cookie == 0 || cookie > io_events.size()) return false;
+    io_events[cookie - 1] = event;
+    return true;
 }
 
 int CUFileDescPool::getSliceNum(int idx) {
