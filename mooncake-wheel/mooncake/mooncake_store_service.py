@@ -309,19 +309,31 @@ class MooncakeStoreService:
                         )
 
                     # New mount succeeded; retire any previously serving segments.
-                    if previous_segment_ids:
-                        ret = self.store.unmount_segment(previous_segment_ids)
+                    # unmount_segment returns the first error for the whole batch,
+                    # so a single call can't tell which ids were actually freed.
+                    # Unmount one id at a time (as handle_unmount_shm does) and keep
+                    # only the ids whose cleanup genuinely failed: this neither leaks
+                    # them (dropping all ids on failure) nor retains stale ids for
+                    # segments that were already removed (keeping all ids on failure).
+                    failed_unmount_ids = []
+                    for sid in previous_segment_ids:
+                        ret = self.store.unmount_segment([sid])
                         if ret != 0:
-                            # The new segment is already live, so a failed cleanup
-                            # only leaks the old ids; warn but keep the new capacity.
-                            logging.warning(
-                                "Reconfigure decode: new mount succeeded but unmount of "
-                                "previous segments %s failed (ret=%s); leaking them",
-                                previous_segment_ids,
-                                ret,
-                            )
+                            failed_unmount_ids.append(sid)
+                    if failed_unmount_ids:
+                        # The new segment is already live; a failed cleanup only
+                        # leaves the old ids around. Keep them tracked so a later
+                        # unmount (or a switch back to prefill) can retry them.
+                        logging.warning(
+                            "Reconfigure decode: new mount succeeded but unmount of "
+                            "previous segments %s failed; keeping them tracked for "
+                            "future cleanup",
+                            failed_unmount_ids,
+                        )
 
-                    self.mounted_segment_ids = list(result["segment_ids"])
+                    self.mounted_segment_ids = (
+                        list(result["segment_ids"]) + failed_unmount_ids
+                    )
                     self.current_mode = "decode"
                     self.last_mount_info = {
                         "path": path,

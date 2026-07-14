@@ -373,6 +373,45 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.service.current_mode, "decode")
         self.assertEqual(self.service.last_mount_info["path"], "/dev/shm/new")
 
+    async def test_reconfigure_decode_partial_unmount_failure_keeps_only_failed_ids(self):
+        # New mount succeeds, but retiring the previous segments only PARTIALLY
+        # fails. unmount_segment reports the first error for a batch, so the old
+        # ids must be unmounted individually; mounted_segment_ids must then hold
+        # the new id plus ONLY the id whose cleanup actually failed -- not the
+        # whole previous set (which would retain a stale, already-freed id) and
+        # not none of it (which would silently leak the still-live old segment).
+        old_ok = "00000000-0000-0000-0000-0000000000a1"
+        old_fail = "00000000-0000-0000-0000-0000000000a2"
+        new_id = "00000000-0000-0000-0000-0000000000b1"
+        self.service.current_mode = "decode"
+        self.service.mounted_segment_ids = [old_ok, old_fail]
+        self.service.last_mount_info = {
+            "path": "/dev/shm/old",
+            "offset": 0,
+            "size": 4096,
+            "protocol": "tcp",
+            "location": "",
+        }
+        self.fake_store.unmount_failures = {old_fail}
+
+        def mount_new(path, size, offset, protocol, location):
+            return {"ret": 0, "segment_ids": [new_id]}
+
+        self.fake_store.mount_segment = mount_new
+
+        resp = await self.service.handle_reconfigure(
+            FakeRequest({"mode": "decode", "path": "/dev/shm/new", "size": 8192})
+        )
+
+        self.assertEqual(resp.status, 200)
+        # Each previous id was unmounted on its own, not as a single batch.
+        self.assertEqual(
+            self.fake_store.unmount_calls, [([old_ok], 0), ([old_fail], 0)]
+        )
+        # New id serves; the freed id is dropped, the un-freed id stays tracked.
+        self.assertEqual(self.service.mounted_segment_ids, [new_id, old_fail])
+        self.assertEqual(self.service.current_mode, "decode")
+
     async def test_mount_allocates_and_frees_on_unmount(self):
         mount_resp = await self.service.handle_mount(
             FakeRequest({"size": 1, "protocol": "tcp", "location": "cpu:0"})
