@@ -5229,13 +5229,14 @@ size_t MasterService::RunPromotionCandidateRetry(size_t max_shards_to_scan) {
                         c.retry_count >= kPromotionCandidateMaxRetries) {
                         VLOG(1) << "promotion_candidate_expired key=" << key
                                 << " retry_count=" << c.retry_count;
+                        const uint32_t saved_retry_count = c.retry_count;
                         cit = tenant_state.promotion_candidates.erase(cit);
                         DecrementCandidateCount();
                         // retry_count == 0: scheduler never reached this
                         // candidate before TTL elapsed — scan budget was
                         // too small. retry_count > 0: scheduler evaluated
                         // it but gave up after retries or TTL.
-                        if (c.retry_count == 0) {
+                        if (saved_retry_count == 0) {
                             MasterMetricManager::instance()
                                 .inc_promotion_candidate_expired_unevaluated();
                         } else {
