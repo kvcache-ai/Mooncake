@@ -16,9 +16,7 @@
 #include "tent/runtime/transfer_engine_impl.h"
 
 #include <cassert>
-#include <chrono>
 #include <set>
-#include <thread>
 
 #include <async_simple/executors/SimpleExecutor.h>
 
@@ -63,13 +61,8 @@ class ReceiverCreditHedgeState {
         callback(std::move(status), std::move(response));
     }
 
-    bool delivered() const {
-        std::lock_guard lock(mutex_);
-        return delivered_;
-    }
-
    private:
-    mutable std::mutex mutex_;
+    std::mutex mutex_;
     size_t remaining_{kReceiverCreditHedgeAttempts};
     bool delivered_{false};
     ControlClient::OnReceiverCreditPull callback_;
@@ -175,11 +168,7 @@ void ControlClient::pullReceiverCreditAsync(
     for (size_t attempt = 0; attempt < kReceiverCreditHedgeAttempts;
          ++attempt) {
         const bool scheduled = receiverCreditRpcExecutor().schedule(
-            [agent, server_addr, request, hedge, attempt]() mutable {
-                if (attempt != 0) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    if (hedge->delivered()) return;
-                }
+            [agent, server_addr, request, hedge]() mutable {
                 ReceiverCreditPullResponseV1 response;
                 auto status = ControlClient::pullReceiverCredit(
                     server_addr, request, response);
