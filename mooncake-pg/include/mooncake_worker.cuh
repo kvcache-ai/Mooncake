@@ -3,26 +3,20 @@
 
 #include <atomic>
 
-#if !defined(__MUSA__)
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/util/intrusive_ptr.h>
 #include <torch/csrc/distributed/c10d/Types.hpp>
 #include <torch/csrc/distributed/c10d/Work.hpp>
-#else
-// MUSA device compilation: minimal includes to avoid mcc compiler crash
-#include <cstddef>
-#include <cstdint>
-#endif
 
 #include "control_plane/types.h"
 
 #include <cuda_alike.h>
 #include <transfer_engine.h>
+#include <mooncake_worker_kernels.cuh>
 #include <work_handles.h>
 
 #include <memory>
-#include <atomic>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -49,9 +43,7 @@ struct TransferGroupMeta {
 
     bool* activeRanks;
     bool* activeRanksDevice;
-#if !defined(__MUSA__)
     at::Tensor activeRanksTensor;
-#endif
     bool* maybeActivatable;
     RankState rankStates[kMaxNumRanks];  // per GlobalRank
     TransferEngine* engine;
@@ -62,29 +54,12 @@ struct TransferGroupMeta {
     bool autoSyncOnFailure = true;
 };
 
-#if defined(__CUDACC__) || defined(__MUSA__)
-__global__
-#endif
-    struct Task {
-    volatile bool active = false;
-    int opType =
-        0;  // c10d::OpType as int, for ABI compatibility with kernel code
-    size_t tensorSize;  // In bytes
-    int64_t broadcastRoot;
-    int bufferOffset;
-    uint64_t submitSequence = 0;
-    BatchID batchID;
-    void* transferGroupMeta;
-};
-
-#if !defined(__MUSA__)
 void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
                         size_t numRanks, c10d::ReduceOp op, bool* activeRanks,
                         cudaStream_t stream);
 
 void launchReduceCpu(at::Tensor dst, size_t pos, size_t realSize, void* src,
                      size_t numRanks, c10d::ReduceOp op, bool* activeRanks);
-void preloadReduceKernels();
 
 class MooncakeWorker {
    public:
@@ -173,7 +148,6 @@ class MooncakeWorkerManager {
     // detached threads must not outlive the MooncakeWorker object.
     std::unordered_map<int, std::shared_ptr<MooncakeWorker>> workers_;
 };
-#endif  // !defined(__MUSA__)
 
 }  // namespace mooncake
 

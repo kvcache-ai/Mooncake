@@ -1,13 +1,29 @@
 #ifndef MOONCAKE_WORKER_KERNELS_CUH
 #define MOONCAKE_WORKER_KERNELS_CUH
 
-// Include the main worker header for struct definitions (Task,
-// GroupEndpointInfo, TransferGroupMeta). When compiled by mcc (__MUSA__
-// defined), the torch-dependent parts are guarded out, making this safe
-// for the MUSA compiler.
-#include <mooncake_worker.cuh>
+#include <cuda_alike.h>
+#include <transfer_engine.h>
+#include <cstddef>
+#include <cstdint>
 
 namespace mooncake {
+
+struct TransferGroupMeta;
+
+#if defined(__CUDACC__) || defined(__MUSA__)
+__global__
+#endif
+    struct Task {
+    volatile bool active = false;
+    int opType =
+        0;  // c10d::OpType as int, for ABI compatibility with kernel code
+    size_t tensorSize;  // In bytes
+    int64_t broadcastRoot;
+    int bufferOffset;
+    uint64_t submitSequence = 0;
+    BatchID batchID;
+    void* transferGroupMeta;
+};
 
 // Kernel function declarations — guarded so g++ doesn't see __global__
 // which it can't parse. Parameters use plain C++ types (int instead of
