@@ -800,10 +800,12 @@ int TransferEngineImpl::registerLocalMemoryBatch(
 
 int TransferEngineImpl::unregisterLocalMemoryBatch(
     const std::vector<void*>& addr_list) {
+    int first_error = 0;
     for (auto transport : multi_transports_->listTransports()) {
         int ret = transport->unregisterLocalMemoryBatch(addr_list);
-        if (ret) return ret;
+        if (ret && !first_error) first_error = ret;
     }
+    if (first_error) return first_error;
 
     std::unique_lock<std::shared_mutex> lock(mutex_);
     for (auto& addr : addr_list) {

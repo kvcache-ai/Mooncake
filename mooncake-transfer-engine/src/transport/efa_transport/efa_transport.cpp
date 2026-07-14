@@ -670,9 +670,8 @@ int EfaTransport::unregisterLocalMemoryBatch(
             if (!first_error) first_error = ret;
         }
     }
-    if (first_error) return first_error;
-
-    return metadata_->updateLocalSegmentDesc();
+    int metadata_ret = metadata_->updateLocalSegmentDesc();
+    return first_error ? first_error : metadata_ret;
 }
 
 int EfaTransport::warmupSegment(const std::string& segment_name) {

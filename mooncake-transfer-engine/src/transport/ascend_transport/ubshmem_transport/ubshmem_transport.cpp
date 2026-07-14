@@ -731,13 +731,13 @@ int UBShmemTransport::registerLocalMemoryBatch(
 
 int UBShmemTransport::unregisterLocalMemoryBatch(
     const std::vector<void *> &addr_list) {
+    int first_error = 0;
     for (auto &addr : addr_list) {
         int rc = unregisterLocalMemory(addr, false);
-        if (rc) {
-            return rc;
-        }
+        if (rc && !first_error) first_error = rc;
     }
-    return metadata_->updateLocalSegmentDesc();
+    int metadata_ret = metadata_->updateLocalSegmentDesc();
+    return first_error ? first_error : metadata_ret;
 }
 
 void *UBShmemTransport::allocatePinnedLocalMemory(size_t size) {

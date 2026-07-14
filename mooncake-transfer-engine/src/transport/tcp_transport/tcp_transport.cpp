@@ -974,11 +974,13 @@ int TcpTransport::registerLocalMemoryBatch(
 
 int TcpTransport::unregisterLocalMemoryBatch(
     const std::vector<void*>& addr_list) {
+    int first_error = 0;
     for (auto& addr : addr_list) {
         int ret = unregisterLocalMemory(addr, false);
-        if (ret) return ret;
+        if (ret && !first_error) first_error = ret;
     }
-    return metadata_->updateLocalSegmentDesc();
+    int metadata_ret = metadata_->updateLocalSegmentDesc();
+    return first_error ? first_error : metadata_ret;
 }
 
 Status TcpTransport::getTransferStatus(BatchID batch_id, size_t task_id,

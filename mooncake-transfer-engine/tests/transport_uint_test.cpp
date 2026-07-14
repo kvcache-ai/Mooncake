@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 #include <sys/time.h>
 
+#include <algorithm>
 #include <array>
 #include <condition_variable>
 #include <cstdlib>
@@ -43,6 +44,56 @@ class TransferEngineImplTestPeer {
         engine.multi_transports_->transport_map_.emplace("blocking",
                                                          std::move(transport));
     }
+
+    static void replaceTransports(
+        TransferEngineImpl& engine,
+        const std::vector<std::pair<std::string, std::shared_ptr<Transport>>>&
+            transports) {
+        engine.multi_transports_->transport_map_.clear();
+        for (const auto& [name, transport] : transports) {
+            engine.multi_transports_->transport_map_.emplace(name, transport);
+        }
+    }
+};
+
+class BatchResultTransport : public Transport {
+   public:
+    explicit BatchResultTransport(int unregister_result = 0)
+        : unregister_result_(unregister_result) {}
+
+    int unregisterBatchCalls() const { return unregister_batch_calls_; }
+
+    Status submitTransfer(BatchID,
+                          const std::vector<TransferRequest>&) override {
+        return Status::OK();
+    }
+
+    Status getTransferStatus(BatchID, size_t, TransferStatus&) override {
+        return Status::OK();
+    }
+
+   private:
+    int registerLocalMemory(void*, size_t, const std::string&, bool,
+                            bool) override {
+        return 0;
+    }
+
+    int unregisterLocalMemory(void*, bool) override { return 0; }
+
+    int registerLocalMemoryBatch(const std::vector<BufferEntry>&,
+                                 const std::string&) override {
+        return 0;
+    }
+
+    int unregisterLocalMemoryBatch(const std::vector<void*>&) override {
+        ++unregister_batch_calls_;
+        return unregister_result_;
+    }
+
+    const char* getName() const override { return "batch-result"; }
+
+    int unregister_result_;
+    int unregister_batch_calls_ = 0;
 };
 
 class BlockingRegistrationTransport : public Transport {
@@ -375,6 +426,53 @@ TEST_F(TransportTest, UnregisterLocalMemoryBatchPropagatesTransportError) {
     std::array<char, 1> buffer{};
     EXPECT_EQ(engine.unregisterLocalMemoryBatch({buffer.data()}),
               ERR_ADDRESS_NOT_REGISTERED);
+}
+
+TEST_F(TransportTest, UnregisterLocalMemoryBatchContinuesAcrossTransports) {
+    TransferEngineImpl engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    auto failing = std::make_shared<BatchResultTransport>(ERR_MEMORY);
+    auto succeeding = std::make_shared<BatchResultTransport>();
+    TransferEngineImplTestPeer::replaceTransports(
+        engine, {{"a-failing", failing}, {"b-succeeding", succeeding}});
+
+    std::array<char, 1> buffer{};
+    EXPECT_EQ(engine.unregisterLocalMemoryBatch({buffer.data()}), ERR_MEMORY);
+    EXPECT_EQ(failing->unregisterBatchCalls(), 1);
+    EXPECT_EQ(succeeding->unregisterBatchCalls(), 1);
+}
+
+TEST_F(TransportTest, UnregisterLocalMemoryBatchContinuesAfterAddressError) {
+    TransferEngineImpl engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    ASSERT_NE(engine.installTransport("tcp", nullptr), nullptr);
+
+    std::array<char, 2> registered{};
+    std::array<char, 1> missing{};
+    std::vector<BufferEntry> entries = {
+        {registered.data(), 1},
+        {registered.data() + 1, 1},
+    };
+    ASSERT_EQ(engine.registerLocalMemoryBatch(entries, "cpu:0"), 0);
+
+    auto metadata = engine.getMetadata();
+    ASSERT_NE(metadata, nullptr);
+    auto contains_buffer = [&](void* addr) {
+        auto desc = metadata->getSegmentDescByID(LOCAL_SEGMENT_ID);
+        if (!desc) return false;
+        auto value = reinterpret_cast<uintptr_t>(addr);
+        return std::any_of(
+            desc->buffers.begin(), desc->buffers.end(),
+            [value](const auto& buffer) { return buffer.addr == value; });
+    };
+    ASSERT_TRUE(contains_buffer(registered.data()));
+    ASSERT_TRUE(contains_buffer(registered.data() + 1));
+
+    EXPECT_EQ(engine.unregisterLocalMemoryBatch(
+                  {missing.data(), registered.data(), registered.data() + 1}),
+              ERR_ADDRESS_NOT_REGISTERED);
+    EXPECT_FALSE(contains_buffer(registered.data()));
+    EXPECT_FALSE(contains_buffer(registered.data() + 1));
 }
 }  // namespace mooncake
 
