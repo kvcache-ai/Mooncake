@@ -14,6 +14,7 @@ from .model_keyspace import (
     model_id_index_key,
     model_index_key,
     model_manifest_key,
+    validate_checkpoint_id,
 )
 
 SCHEMA_VERSION = 1
@@ -111,6 +112,7 @@ class ModelFileCacheClient:
         revision: str,
         source_uri: str,
     ) -> ModelFileManifest:
+        validate_checkpoint_id(checkpoint_id)
         source = Path(source_uri)
         if not source.is_dir():
             raise ValueError(f"source_uri must be a directory: {source_uri}")

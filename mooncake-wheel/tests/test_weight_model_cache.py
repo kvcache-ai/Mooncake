@@ -11,6 +11,7 @@ from mooncake.weight_store.model_keyspace import (
     model_file_key,
     model_index_key,
     model_manifest_key,
+    validate_checkpoint_id,
 )
 
 
@@ -188,6 +189,30 @@ class TestModelFileCacheClient(unittest.TestCase):
             with self.assertRaises(ValueError):
                 client.import_model(
                     checkpoint_id="demo-main",
+                    model_id="demo/model",
+                    revision="main",
+                    source_uri=str(source),
+                )
+
+    def test_checkpoint_id_validation_uses_a_single_segment_whitelist(self) -> None:
+        for valid in ("demo-main", "Qwen3_32B", "model.v2-alpha"):
+            with self.subTest(valid=valid):
+                validate_checkpoint_id(valid)
+
+        for invalid in ("", "a//b", "/a", "a/b/", ".hidden", "a b", "a/b", "a?b"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    validate_checkpoint_id(invalid)
+
+    def test_import_model_rejects_invalid_checkpoint_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp)
+            write_demo_model(source)
+            client = ModelFileCacheClient(FakeStore())
+
+            with self.assertRaises(ValueError):
+                client.import_model(
+                    checkpoint_id="a//b",
                     model_id="demo/model",
                     revision="main",
                     source_uri=str(source),
