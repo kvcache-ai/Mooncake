@@ -28,6 +28,25 @@ using mooncake::device::mc_atomic_add_release;
 using mooncake::device::mc_fence;
 using mooncake::device::mc_fence_barrier_fence;
 
+enum EpDiagKind {
+    EP_DIAG_PHASE_ACK_WAIT = 0,
+    EP_DIAG_MARK_WAIT_PHASE_ACK = 1,
+    EP_DIAG_DISPATCH_RECV_WAIT = 2,
+    EP_DIAG_COMBINE_RECV_WAIT = 3,
+};
+
+constexpr int kEpDiagCols = 3;
+
+__device__ __forceinline__ void ep_diag_record(int64_t* diagnostic, int kind,
+                                               unsigned long long ticks) {
+    if (diagnostic == nullptr)
+        return;
+    auto* row = reinterpret_cast<unsigned long long*>(diagnostic + kind * kEpDiagCols);
+    atomicAdd(row + 0, 1ull);
+    atomicAdd(row + 1, ticks);
+    atomicMax(row + 2, ticks);
+}
+
 __global__ void mark_phase_ack_kernel(void* mxa_buffer,
                                       const int32_t* nvlink_available,
                                       void* const* ipc_peer_ptrs,
@@ -50,7 +69,8 @@ __global__ void mark_phase_ack_kernel(void* mxa_buffer,
 }
 
 __global__ void wait_phase_ack_kernel(int* ack_buffer, int rank, int num_ranks,
-                                      int epoch, int64_t timeout_ticks) {
+                                      int epoch, int64_t timeout_ticks,
+                                      int64_t* diagnostic) {
     for (int peer = static_cast<int>(threadIdx.x); peer < num_ranks;
          peer += static_cast<int>(blockDim.x)) {
         if (peer == rank)
@@ -63,15 +83,15 @@ __global__ void wait_phase_ack_kernel(int* ack_buffer, int rank, int num_ranks,
                 return;
         }
         int64_t end_time = static_cast<int64_t>(clock64());
-        printf("[EP DEBUG timing] phase_ack_wait rank=%d peer=%d epoch=%d elapsed_ticks=%lld\n",
-               rank, peer, epoch, static_cast<long long>(end_time - start_time));
+        ep_diag_record(diagnostic, EP_DIAG_PHASE_ACK_WAIT,
+                       static_cast<unsigned long long>(end_time - start_time));
     }
 }
 
 __global__ void mark_and_wait_phase_ack_kernel(
         void* mxa_buffer, const int32_t* nvlink_available,
         void* const* ipc_peer_ptrs, int* ack_buffer, int rank, int num_ranks,
-        int epoch, int64_t timeout_ticks) {
+        int epoch, int64_t timeout_ticks, int64_t* diagnostic) {
     const CommCtx comm_ctx = make_comm_ctx(
         mxa_buffer, nvlink_available, ipc_peer_ptrs, nullptr, nullptr, nullptr,
         ack_buffer, ack_buffer, rank, num_ranks, MAX_QP_COUNT);
@@ -101,8 +121,8 @@ __global__ void mark_and_wait_phase_ack_kernel(
                 return;
         }
         int64_t end_time = static_cast<int64_t>(clock64());
-        printf("[EP DEBUG timing] mark_wait_phase_ack rank=%d peer=%d epoch=%d elapsed_ticks=%lld\n",
-               rank, peer, epoch, static_cast<long long>(end_time - start_time));
+        ep_diag_record(diagnostic, EP_DIAG_MARK_WAIT_PHASE_ACK,
+                       static_cast<unsigned long long>(end_time - start_time));
     }
 }
 
@@ -115,21 +135,23 @@ void mark_phase_ack(void* mxa_buffer, const int32_t* nvlink_available,
 }
 
 void wait_phase_ack(int* ack_buffer, int rank, int num_ranks, int epoch,
-                    cudaStream_t stream, int64_t timeout_ticks) {
+                    cudaStream_t stream, int64_t timeout_ticks,
+                    int64_t* diagnostic) {
     SETUP_LAUNCH_CONFIG(1, 32, stream);
     LAUNCH_KERNEL(&cfg, wait_phase_ack_kernel, ack_buffer, rank, num_ranks,
-                  epoch, timeout_ticks);
+                  epoch, timeout_ticks, diagnostic);
 }
 
 void mark_and_wait_phase_ack(void* mxa_buffer,
                              const int32_t* nvlink_available,
                              void* const* ipc_peer_ptrs, int* ack_buffer,
                              int rank, int num_ranks, int epoch,
-                             cudaStream_t stream, int64_t timeout_ticks) {
+                             cudaStream_t stream, int64_t timeout_ticks,
+                             int64_t* diagnostic) {
     SETUP_LAUNCH_CONFIG(1, 32, stream);
     LAUNCH_KERNEL(&cfg, mark_and_wait_phase_ack_kernel, mxa_buffer,
                   nvlink_available, ipc_peer_ptrs, ack_buffer, rank, num_ranks,
-                  epoch, timeout_ticks);
+                  epoch, timeout_ticks, diagnostic);
 }
 
 template <bool kUseFP8, int kNumWarpGroups, int kNumWarpsPerGroup, int kHidden>
@@ -149,7 +171,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
          int num_tokens, int num_max_dispatch_tokens_per_rank,
          int num_topk, int num_experts, int rank, int num_ranks,
          int64_t timeout_ticks,
-         int phases) {
+         int phases, int64_t* diagnostic) {
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto thread_id = static_cast<int>(threadIdx.x);
     const auto warp_id = thread_id / 32, lane_id = get_lane_id();
@@ -416,10 +438,8 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                 }
             }
             unsigned long long end_time = clock64();
-            printf("[EP DEBUG timing] dispatch_recv_wait rank=%d src_rank=%d local_expert=%d responsible_expert=%d active=%d raw_signal=%d elapsed_ticks=%llu\n",
-                   rank, src_rank, local_expert_idx, responsible_expert_idx,
-                   active_ranks[src_rank], num_recv_tokens,
-                   end_time - start_time);
+            ep_diag_record(diagnostic, EP_DIAG_DISPATCH_RECV_WAIT,
+                           end_time - start_time);
             num_recv_tokens = -num_recv_tokens - 1;
             recv_token_begin_idx = atomicAdd(packed_recv_count + local_expert_idx, num_recv_tokens);
             shared_num_recv_tokens[warp_group_id] = num_recv_tokens;
@@ -476,7 +496,8 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
               int* next_clean_buffer,
               int num_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
               int num_topk, int num_experts, int rank, int num_ranks, bool use_fp8,
-              void* workspace, cudaStream_t stream, int64_t timeout_ticks, int phases) {
+              void* workspace, cudaStream_t stream, int64_t timeout_ticks, int phases,
+              int64_t* diagnostic) {
     constexpr int kNumMaxTopK = 11;
     constexpr int kNumWarpsPerGroup = 4;
 #ifdef MOONCAKE_EP_USE_MUSA
@@ -513,7 +534,7 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
               atomic_counter_per_expert, atomic_finish_counter_per_expert, \
               next_clean_buffer, \
               num_tokens, num_max_dispatch_tokens_per_rank, \
-              num_topk, num_experts, rank, num_ranks, timeout_ticks, phases); } break
+              num_topk, num_experts, rank, num_ranks, timeout_ticks, phases, diagnostic); } break
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
     SWITCH_HIDDEN(DISPATCH_LAUNCH_CASE);
@@ -537,7 +558,7 @@ combine(void* combined_x, int32_t* active_ranks,
         int num_max_dispatch_tokens_per_rank,
         int num_experts, int rank, int num_ranks,
         int64_t timeout_ticks,
-        int phases, bool zero_copy) {
+        int phases, bool zero_copy, int64_t* diagnostic) {
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto num_sms = static_cast<int>(gridDim.x);
     const auto thread_id = static_cast<int>(threadIdx.x);
@@ -664,11 +685,8 @@ combine(void* combined_x, int32_t* active_ranks,
                 }
             }
             unsigned long long end_time = clock64();
-            printf("[EP DEBUG timing] combine_recv_wait rank=%d src_rank=%d responsible_expert=%d active=%d signal=%d elapsed_ticks=%llu\n",
-                   rank, src_rank, responsible_expert_idx,
-                   active_ranks[src_rank],
-                   mc_ld_acquire(rdma_recv_signal_buffer + responsible_expert_idx),
-                   end_time - start_time);
+            ep_diag_record(diagnostic, EP_DIAG_COMBINE_RECV_WAIT,
+                           end_time - start_time);
         }
     }
 #ifdef MOONCAKE_EP_SPLIT_SEND_RECV
@@ -739,7 +757,8 @@ void combine(void* combined_x, int32_t* active_ranks,
              int num_combined_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
              int num_topk, int num_experts, int rank, int num_ranks,
              void* workspace, cudaStream_t stream,
-             int64_t timeout_ticks, int phases, bool zero_copy) {
+             int64_t timeout_ticks, int phases, bool zero_copy,
+             int64_t* diagnostic) {
     constexpr int kNumWarpsPerGroup = 4;
     constexpr int kNumWarpGroups = 8;
     constexpr int kNumMaxTopk = 11;
@@ -768,7 +787,7 @@ LAUNCH_KERNEL(&cfg, combine_func, \
               num_combined_tokens, hidden, num_topk, \
               num_max_dispatch_tokens_per_rank, \
               num_experts, rank, num_ranks, \
-              timeout_ticks, phases, zero_copy); } break
+              timeout_ticks, phases, zero_copy, diagnostic); } break
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
     SWITCH_HIDDEN(COMBINE_LAUNCH_CASE);

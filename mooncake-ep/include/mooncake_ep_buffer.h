@@ -111,7 +111,8 @@ struct MooncakeEpBuffer {
     dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx,
              torch::Tensor& active_ranks, int num_max_dispatch_tokens_per_rank,
              int num_experts, int timeout_us, bool use_fp8, bool async,
-             bool return_recv_hook);
+             bool return_recv_hook,
+             const std::optional<torch::Tensor>& diagnostic);
 
     std::tuple<torch::Tensor, std::optional<EventHandle>,
                std::optional<std::function<void()>>>
@@ -120,7 +121,8 @@ struct MooncakeEpBuffer {
             const torch::Tensor& layout_range, torch::Tensor& active_ranks,
             int num_max_dispatch_tokens_per_rank, int num_experts,
             int timeout_us, bool zero_copy, bool async, bool return_recv_hook,
-            const std::optional<torch::Tensor>& out);
+            const std::optional<torch::Tensor>& out,
+            const std::optional<torch::Tensor>& diagnostic);
 
     torch::Tensor get_next_combine_buffer(int num_max_dispatch_tokens_per_rank,
                                           int hidden, int num_experts);

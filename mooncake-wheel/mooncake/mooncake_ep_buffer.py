@@ -351,6 +351,7 @@ class Buffer:
         use_fp8: Optional[bool] = None,
         async_finish: bool = False,
         return_recv_hook: bool = False,
+        diagnostic: Optional[torch.Tensor] = None,
     ) -> Tuple[
         Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor],
         torch.Tensor,
@@ -422,6 +423,7 @@ class Buffer:
                 use_fp8,
                 async_finish,
                 runtime_return_recv_hook,
+                diagnostic,
             )
             if _USE_MACA:
                 hook = self._wrap_maca_recv_hook(hook, event)
@@ -465,6 +467,7 @@ class Buffer:
         async_finish: bool = False,
         return_recv_hook: bool = False,
         out: Optional[torch.Tensor] = None,
+        diagnostic: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, EventOverlap, Callable]:
         # Same split-kernel behavior as dispatch().
         if _USE_SPLIT_SEND_RECV and async_finish:
@@ -521,6 +524,7 @@ class Buffer:
                 async_finish,
                 runtime_return_recv_hook,
                 out,
+                diagnostic,
             )
             if _USE_MACA:
                 hook = self._wrap_maca_recv_hook(hook, event)

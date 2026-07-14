@@ -134,7 +134,8 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
                            torch::Tensor& active_ranks,
                            int num_max_dispatch_tokens_per_rank,
                            int num_experts, int timeout_us, bool use_fp8,
-                           bool async, bool return_recv_hook) {
+                           bool async, bool return_recv_hook,
+                           const std::optional<torch::Tensor>& diagnostic) {
     // Tensor checks
     // By default using `ptp128c` FP8 cast
     EP_HOST_ASSERT(x.dim() == 2 and x.is_contiguous() and
@@ -146,6 +147,14 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
     EP_HOST_ASSERT(topk_idx.scalar_type() == torch::kInt64);
     EP_HOST_ASSERT(num_experts % num_ranks == 0);
     EP_HOST_ASSERT(USE_QP_COUNT % num_ranks == 0);
+    int64_t* diagnostic_ptr = nullptr;
+    if (diagnostic.has_value()) {
+        EP_HOST_ASSERT(diagnostic->dim() == 2 && diagnostic->is_contiguous());
+        EP_HOST_ASSERT(diagnostic->size(0) >= 4 && diagnostic->size(1) >= 3);
+        EP_HOST_ASSERT(diagnostic->scalar_type() == torch::kInt64);
+        EP_HOST_ASSERT(diagnostic->device() == x.device());
+        diagnostic_ptr = diagnostic->data_ptr<int64_t>();
+    }
 
     auto num_tokens = static_cast<int>(x.size(0)),
          hidden = static_cast<int>(x.size(1));
@@ -222,15 +231,16 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
 #ifdef MOONCAKE_EP_SPLIT_SEND_RECV
         mooncake::wait_phase_ack(buffer.rdma_send_signal_buffer, rank,
                                  num_ranks, phase_epoch, launch_stream,
-                                 timeout_ticks);
+                                 timeout_ticks, diagnostic_ptr);
 #endif
     };
 
     auto mark_and_wait_peer_send_done = [=]() {
 #ifdef MOONCAKE_EP_SPLIT_SEND_RECV
-        mooncake::mark_and_wait_phase_ack(
-            gdr_buffer, nvlink_avail, ipc_ptrs, buffer.rdma_send_signal_buffer,
-            rank, num_ranks, phase_epoch, launch_stream, timeout_ticks);
+        mooncake::mark_and_wait_phase_ack(gdr_buffer, nvlink_avail, ipc_ptrs,
+                                          buffer.rdma_send_signal_buffer, rank,
+                                          num_ranks, phase_epoch, launch_stream,
+                                          timeout_ticks, diagnostic_ptr);
 #endif
     };
 
@@ -247,7 +257,7 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
             topk_idx.data_ptr<int64_t>(), next_buffer.rdma_recv_signal_buffer,
             num_tokens, hidden, num_max_dispatch_tokens_per_rank, num_topk,
             num_experts, rank, num_ranks, use_fp8, workspace, launch_stream,
-            timeout_ticks, phases);
+            timeout_ticks, phases, diagnostic_ptr);
     };
     if (return_recv_hook) {
         launcher(LOW_LATENCY_SEND_PHASE);
@@ -303,7 +313,8 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
                           int num_max_dispatch_tokens_per_rank, int num_experts,
                           int timeout_us, bool zero_copy, bool async,
                           bool return_recv_hook,
-                          const std::optional<torch::Tensor>& out) {
+                          const std::optional<torch::Tensor>& out,
+                          const std::optional<torch::Tensor>& diagnostic) {
     // Tensor checks
     EP_HOST_ASSERT(x.dim() == 3 and x.is_contiguous() and
                    x.scalar_type() == torch::kBFloat16);
@@ -324,6 +335,14 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
     EP_HOST_ASSERT(layout_range.scalar_type() == torch::kInt64);
     EP_HOST_ASSERT(layout_range.size(0) == num_experts / num_ranks and
                    layout_range.size(1) == num_ranks);
+    int64_t* diagnostic_ptr = nullptr;
+    if (diagnostic.has_value()) {
+        EP_HOST_ASSERT(diagnostic->dim() == 2 && diagnostic->is_contiguous());
+        EP_HOST_ASSERT(diagnostic->size(0) >= 4 && diagnostic->size(1) >= 3);
+        EP_HOST_ASSERT(diagnostic->scalar_type() == torch::kInt64);
+        EP_HOST_ASSERT(diagnostic->device() == x.device());
+        diagnostic_ptr = diagnostic->data_ptr<int64_t>();
+    }
     auto hidden = static_cast<int>(x.size(2));
     auto num_local_experts = num_experts / num_ranks,
          num_topk = static_cast<int>(topk_weights.size(1));
@@ -380,15 +399,16 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
 #ifdef MOONCAKE_EP_SPLIT_SEND_RECV
         mooncake::wait_phase_ack(buffer.rdma_send_signal_buffer, rank,
                                  num_ranks, phase_epoch, launch_stream,
-                                 timeout_ticks);
+                                 timeout_ticks, diagnostic_ptr);
 #endif
     };
 
     auto mark_and_wait_peer_send_done = [=]() {
 #ifdef MOONCAKE_EP_SPLIT_SEND_RECV
-        mooncake::mark_and_wait_phase_ack(
-            gdr_buffer, nvlink_avail, ipc_ptrs, buffer.rdma_send_signal_buffer,
-            rank, num_ranks, phase_epoch, launch_stream, timeout_ticks);
+        mooncake::mark_and_wait_phase_ack(gdr_buffer, nvlink_avail, ipc_ptrs,
+                                          buffer.rdma_send_signal_buffer, rank,
+                                          num_ranks, phase_epoch, launch_stream,
+                                          timeout_ticks, diagnostic_ptr);
 #endif
     };
 
@@ -405,7 +425,7 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
             next_buffer.rdma_recv_signal_buffer, num_combined_tokens, hidden,
             num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank,
             num_ranks, workspace, launch_stream, timeout_ticks, phases,
-            zero_copy);
+            zero_copy, diagnostic_ptr);
     };
     if (return_recv_hook) {
         launcher(LOW_LATENCY_SEND_PHASE);

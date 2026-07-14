@@ -11,6 +11,47 @@ _USE_MACA = (
     os.getenv("MOONCAKE_EP_USE_MACA", "").upper() in {"1", "ON", "TRUE", "YES"}
     or bool(getattr(torch.version, "maca", None))
 )
+_EP_DIAG_TIMING = os.getenv("MOONCAKE_EP_DIAG_TIMING", "").upper() in {
+    "1",
+    "ON",
+    "TRUE",
+    "YES",
+}
+_EP_DIAG_ITERS = int(os.getenv("MOONCAKE_EP_DIAG_ITERS", "10"))
+_EP_DIAG_NAMES = (
+    "phase_ack_wait",
+    "mark_wait_phase_ack",
+    "dispatch_recv_wait",
+    "combine_recv_wait",
+)
+
+
+def _print_ep_diag(rank: int, diagnostic: torch.Tensor):
+    torch.cuda.synchronize()
+    stats = diagnostic.cpu()
+    clock_rate_khz = getattr(torch.cuda.get_device_properties(torch.cuda.current_device()), "clock_rate", 0)
+    for idx, name in enumerate(_EP_DIAG_NAMES):
+        count = int(stats[idx, 0].item())
+        total_ticks = int(stats[idx, 1].item())
+        max_ticks = int(stats[idx, 2].item())
+        if count == 0:
+            continue
+        avg_ticks = total_ticks / count
+        if clock_rate_khz:
+            avg_us = avg_ticks * 1000.0 / clock_rate_khz
+            max_us = max_ticks * 1000.0 / clock_rate_khz
+            print(
+                f"[rank {rank}] EP diag {name}: count={count}, "
+                f"avg={avg_us:.2f} us ({avg_ticks:.0f} ticks), "
+                f"max={max_us:.2f} us ({max_ticks} ticks)",
+                flush=True,
+            )
+        else:
+            print(
+                f"[rank {rank}] EP diag {name}: count={count}, "
+                f"avg={avg_ticks:.0f} ticks, max={max_ticks} ticks",
+                flush=True,
+            )
 
 
 def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
@@ -112,15 +153,17 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
         hook()
 
     # noinspection PyShadowingNames
-    def test_func(zero_copy: bool, return_recv_hook: bool):
+    def test_func(zero_copy: bool, return_recv_hook: bool, diagnostic=None):
         recv_x, recv_count, handle, event, hook = \
             buffer.dispatch(x, topk_idx, active_ranks, num_tokens, num_experts, -1,
-                            async_finish=False, return_recv_hook=return_recv_hook)
+                            async_finish=False, return_recv_hook=return_recv_hook,
+                            diagnostic=diagnostic)
         large_gemm_with_hook(hook) if return_recv_hook else None
         if zero_copy:
             buffer.get_next_combine_buffer(handle)[:, :, :] = simulated_gemm_x
         combined_x, event, hook = buffer.combine(simulated_gemm_x, topk_idx, topk_weights, active_ranks, -1, handle,
-                                                 zero_copy=zero_copy, return_recv_hook=return_recv_hook)
+                                                 zero_copy=zero_copy, return_recv_hook=return_recv_hook,
+                                                 diagnostic=diagnostic)
         large_gemm_with_hook(hook) if return_recv_hook else None
 
     # Calculate bandwidth
@@ -135,6 +178,12 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
     avg_t, min_t, max_t = bench(partial(test_func, zero_copy=False, return_recv_hook=False))
     print(f'[rank {rank}] Dispatch + combine bandwidth: {(num_dispatch_comm_bytes + num_combine_comm_bytes) / 1e9 / avg_t:.2f} GB/s, '
           f'avg_t={avg_t * 1e6:.2f} us, min_t={min_t * 1e6:.2f} us, max_t={max_t * 1e6:.2f} us', flush=True)
+
+    if _EP_DIAG_TIMING:
+        diagnostic = torch.zeros((len(_EP_DIAG_NAMES), 3), dtype=torch.int64, device="cuda")
+        for _ in range(_EP_DIAG_ITERS):
+            test_func(zero_copy=False, return_recv_hook=False, diagnostic=diagnostic)
+        _print_ep_diag(rank, diagnostic)
 
     # Separate profiling
     # Skip profiling in fallback mode as kernels are Python functions, not CUDA kernels
