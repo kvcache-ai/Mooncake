@@ -2990,12 +2990,31 @@ TEST_F(StorageBackendTest,
 
 TEST_F(StorageBackendTest,
        OffsetAllocatorStorageBackend_Eviction_ConcurrentReadSafety) {
-    // Ensure that a concurrently read key is not corrupted when evicted.
-    // The AllocationPtr shared_ptr refcount must keep the extent alive.
+    // Validate the load-bearing safety property: AllocationPtr refcount
+    // must keep an evicted key's physical extent alive (pinned) until
+    // all in-flight BatchLoad calls release their shared_ptr copies.
+    //
+    // Mechanism being tested:
+    //   1. BatchLoad copies entry.allocation (shared_ptr) into its
+    //      ReadPlan, incrementing the refcount.  (storage_backend.cpp
+    //      ~line 3375: "entry.allocation" copy in ReadPlan)
+    //   2. EvictToMakeRoom erases the key from shard.map, decrementing
+    //      the map's shared_ptr.  If no reader holds a copy, the
+    //      RefCountedAllocationHandle destructor calls freeAllocation
+    //      and the extent returns to the allocator.
+    //   3. While a reader holds its shared_ptr copy (refcount >= 1),
+    //      freeAllocation does NOT fire → the extent is still marked
+    //      "used" in the allocator → allocate() cannot re-issue that
+    //      offset.  The reader always sees the original bytes.
+    //
+    // This test interleaves reads and eviction-triggering writes;
+    // any data corruption means the allocator re-issued a still-read
+    // offset, which would be a violation of the refcount contract.
     FileStorageConfig config;
     config.storage_filepath = data_path;
     config.storage_backend_type = StorageBackendType::kOffsetAllocator;
-    config.total_size_limit = 64 * 1024;  // 64 KB — enough for several keys
+    config.total_size_limit =
+        8 * 1024;  // 8 KB — tight enough that 80 keys trigger eviction
     config.total_keys_limit = 500;
 
     OffsetAllocatorBackendConfig evict_cfg;
@@ -3009,21 +3028,36 @@ TEST_F(StorageBackendTest,
         return ErrorCode::OK;
     };
 
-    // Pre-populate with many keys so eviction is likely during reads.
-    std::string data(100, 'A');
+    // Pre-populate with distinct-per-key data so a re-issued offset
+    // is detectable: if key_i's extent is handed to a new key and the
+    // reader still reads from it, read_buf[0] won't match 'A' + i%26.
     std::vector<std::unique_ptr<char[]>> buffers;
     const int kNumKeys = 30;
     for (int i = 0; i < kNumKeys; ++i) {
         std::string key = "ckey_" + std::to_string(i);
-        std::string val(100, 'A' + (i % 26));
+        std::string val(100, static_cast<char>('A' + (i % 26)));
         auto batch = MakeSingleKeyBatch(key, val, buffers);
         storage_backend.BatchOffload(batch, complete_handler);
     }
+    // Confirm pre-populated keys exist before the stress phase.
+    for (int i = 0; i < std::min(kNumKeys, 5); ++i) {
+        EXPECT_TRUE(storage_backend.IsExist("ckey_" + std::to_string(i))
+                        .value_or(false));
+    }
 
-    // Concurrently read and write to trigger eviction during reads.
+    // Eviction handler that tracks victim keys so we can assert post-hoc.
+    std::vector<std::string> all_evicted;
+    std::mutex evict_mtx;
+    auto eviction_handler = [&all_evicted,
+                             &evict_mtx](const std::vector<std::string>& keys) {
+        std::lock_guard<std::mutex> lk(evict_mtx);
+        for (const auto& k : keys) all_evicted.push_back(k);
+    };
+
     std::atomic<bool> stop{false};
     std::atomic<int> read_errors{0};
     std::atomic<int> read_success{0};
+    std::atomic<int> read_not_found{0};
 
     std::thread reader([&]() {
         while (!stop) {
@@ -3035,19 +3069,17 @@ TEST_F(StorageBackendTest,
                 auto res = storage_backend.BatchLoad(load);
                 if (res.has_value()) {
                     read_success++;
-                    // Verify data integrity: first byte should match key id
-                    if (read_buf[0] != 'A' + (i % 26)) {
+                    if (read_buf[0] != static_cast<char>('A' + (i % 26))) {
                         read_errors++;
                     }
+                } else {
+                    read_not_found++;  // expected after eviction
                 }
-                // OBJECT_NOT_FOUND is expected after eviction.
             }
         }
     });
 
     std::thread writer([&]() {
-        auto eviction_handler = [](const std::vector<std::string>&) {
-        };  // no-op
         for (int i = kNumKeys; i < kNumKeys + 50 && !stop; ++i) {
             std::string key = "newkey_" + std::to_string(i);
             std::string val(100, 'Z');
@@ -3062,9 +3094,30 @@ TEST_F(StorageBackendTest,
     writer.join();
     reader.join();
 
+    // Core safety assertion: zero data corruption across all reads.
     EXPECT_EQ(read_errors.load(), 0)
-        << "No read corruption allowed (refcount protects extent)";
-    EXPECT_GT(read_success.load(), 0) << "Some reads should succeed";
+        << "Refcount must prevent allocator from re-issuing in-use extents";
+
+    // Sanity: some reads succeeded and some keys were evicted.
+    EXPECT_GT(read_success.load(), 0);
+    {
+        std::lock_guard<std::mutex> lk(evict_mtx);
+        EXPECT_FALSE(all_evicted.empty())
+            << "Eviction must have occurred during concurrent stress";
+    }
+
+    // Post-condition: at least one evicted key is no longer in the map.
+    {
+        std::lock_guard<std::mutex> lk(evict_mtx);
+        bool any_gone = false;
+        for (const auto& ek : all_evicted) {
+            if (!storage_backend.IsExist(ek).value_or(true)) {
+                any_gone = true;
+                break;
+            }
+        }
+        EXPECT_TRUE(any_gone) << "Evicted keys must be removed from shard.map";
+    }
 }
 
 }  // namespace mooncake::test

@@ -1101,6 +1101,15 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
         test_failure_predicate_ = std::move(predicate);
     }
 
+    // Returns the number of keys skipped after fallback eviction
+    // could not make enough room (fragmentation, extents pinned by
+    // in-flight reads, or allocator node exhaustion).  Monotonically
+    // increasing; useful for distinguishing "watermark working" from
+    // "thrashing but unable to free space".
+    int64_t GetEvictionSkips() const {
+        return eviction_skips_.load(std::memory_order_relaxed);
+    }
+
    private:
     // On-disk record header: [u32 key_len][u32 value_len] (8 bytes total)
     struct RecordHeader {
@@ -1249,6 +1258,10 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
 
     // ===== Eviction-related members =====
     OffsetAllocatorBackendConfig cfg_;
+
+    // Counter for keys skipped due to fallback eviction exhaustion.
+    // See GetEvictionSkips() for the public accessor.
+    std::atomic<int64_t> eviction_skips_{0};
 
     // Mutex protecting fifo_index_ and insert_seq_. Must be acquired BEFORE
     // any shard mutex (shards_[i].mutex) when both are held.

@@ -3079,8 +3079,13 @@ void OffsetAllocatorStorageBackend::EvictToMakeRoom(
             SharedMutexLocker lk(&shard.mutex);
             auto it = shard.map.find(vkey);
             if (it == shard.map.end() || it->second.fifo_seq != vseq) {
-                // Stale orphan slot from overwrite or prior deletion.
-                // Remove it from the index (lazy-repair).
+                // Orphan slot in fifo_index_: the key is no longer in
+                // shard.map, or its fifo_seq was replaced by a newer
+                // overwrite.  Overwrites are cleaned up in BatchOffload
+                // Step-4 (fifo_index_.erase(old_seq) under the lock),
+                // so today this branch is only reachable if a future
+                // per-key delete path neglects to also erase from
+                // fifo_index_.  Keep the lazy-repair as a defense.
                 fifo_index_.erase(oldest);
                 ++n;  // counted toward scan budget
                 continue;
@@ -3111,6 +3116,19 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
         complete_handler,
     std::function<void(const std::vector<std::string>& evicted_keys)>
         eviction_handler) {
+    // ================================================================
+    // SINGLE-WRITER PRECONDITION
+    //
+    // BatchOffload, EvictToMakeRoom, and the watermark accounting on
+    // total_size_ / total_keys_ assume only ONE thread calls
+    // BatchOffload at a time (currently guaranteed by FileStorage's
+    // single heartbeat_thread_).  The atomics make individual loads
+    // and stores atomic, but the read-modify-write sequences (check
+    // watermark → evict → update counters) are NOT atomic across
+    // threads.  If concurrent offload is added, the DCHECK_GE guards
+    // in EvictToMakeRoom must also be re-evaluated.
+    // ================================================================
+
     if (!initialized_.load(std::memory_order_acquire)) {
         LOG(ERROR)
             << "Storage backend is not initialized. Call Init() before use.";
@@ -3266,6 +3284,7 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
         // ---- Handle allocation failure ----
         if (!allocation.has_value()) {
             if (eviction_on) {
+                eviction_skips_.fetch_add(1, std::memory_order_relaxed);
                 LOG(WARNING) << "Skipping key after eviction attempts: " << key;
                 continue;  // eviction enabled: try next key
             } else {
