@@ -58,6 +58,14 @@ struct QueueLimits {
     // dropped instead of dispatched, and on_local_decode_suggested is raised so
     // the caller can recompute locally. Requires deadline_aware = true.
     double mlu_local_threshold{0.0};
+    // Opt-in deadline proximity promotion. When > 0, pickForDispatch promotes
+    // queued owners whose remaining slack (deadline_ns - now) is below this
+    // threshold to the front of the dispatch queue, ahead of owners with more
+    // slack or no deadline. This dynamically boosts urgency as a deadline
+    // approaches, regardless of original admission order. Requires a
+    // NowProvider (via setDegradationPolicy) or defaults to steady_clock.
+    // 0 (default) disables promotion entirely.
+    uint64_t promotion_slack_ns{0};
 };
 
 struct QueueOwnerInput {
@@ -125,6 +133,11 @@ class LocalTransferAdmissionQueue {
                               NowProvider now_provider = nullptr);
 
     Status complete(QueueOwnerId owner_id, TransferStatusEnum terminal_status);
+
+    // Cancel an owner that has not entered the dispatch window. Idempotent for
+    // an owner already canceled; dispatching owners must be canceled through
+    // their selected transport instead.
+    Status cancel(QueueOwnerId owner_id);
 
     Status retireBatch(uint64_t batch_token);
 

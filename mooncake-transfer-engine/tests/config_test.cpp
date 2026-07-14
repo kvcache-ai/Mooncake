@@ -27,6 +27,7 @@ class PkeyIndexEnvTest : public ::testing::Test {
         ::unsetenv("MC_PKEY_INDEX");
         ::unsetenv("MC_AUTO_GID_MAX_RETRIES");
         ::unsetenv("MC_IB_SL");
+        ::unsetenv("MC_TE_METADATA_REFRESH_INTERVAL_SECONDS");
     }
 };
 
@@ -156,6 +157,44 @@ TEST_F(PkeyIndexEnvTest, IbSlNonNumericKeepsDefault) {
     config.ib_service_level = 9;
     loadGlobalConfig(config);
     EXPECT_EQ(config.ib_service_level, 9);
+}
+
+TEST_F(PkeyIndexEnvTest, TeMetadataRefreshIntervalDefaultsToZeroWhenUnset) {
+    ::unsetenv("MC_TE_METADATA_REFRESH_INTERVAL_SECONDS");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.te_metadata_refresh_interval_seconds, 0);
+}
+
+TEST_F(PkeyIndexEnvTest, TeMetadataRefreshIntervalAcceptsValidOverride) {
+    ASSERT_EQ(::setenv("MC_TE_METADATA_REFRESH_INTERVAL_SECONDS", "5", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.te_metadata_refresh_interval_seconds, 5);
+}
+
+TEST_F(PkeyIndexEnvTest, TeMetadataRefreshIntervalAcceptsZeroAsDisabled) {
+    ASSERT_EQ(::setenv("MC_TE_METADATA_REFRESH_INTERVAL_SECONDS", "0", 1), 0);
+    GlobalConfig config;
+    config.te_metadata_refresh_interval_seconds = 123;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.te_metadata_refresh_interval_seconds, 0);
+}
+
+TEST_F(PkeyIndexEnvTest, TeMetadataRefreshIntervalRejectsNegativeOverride) {
+    ASSERT_EQ(::setenv("MC_TE_METADATA_REFRESH_INTERVAL_SECONDS", "-1", 1), 0);
+    GlobalConfig config;
+    config.te_metadata_refresh_interval_seconds = 123;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.te_metadata_refresh_interval_seconds, 123);
+}
+
+TEST_F(PkeyIndexEnvTest, TeMetadataRefreshIntervalRejectsNonNumericOverride) {
+    ASSERT_EQ(::setenv("MC_TE_METADATA_REFRESH_INTERVAL_SECONDS", "abc", 1), 0);
+    GlobalConfig config;
+    config.te_metadata_refresh_interval_seconds = 456;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.te_metadata_refresh_interval_seconds, 456);
 }
 
 }  // namespace

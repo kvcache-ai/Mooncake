@@ -1136,6 +1136,7 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         lid_ = attr.lid;
         active_mtu_ = attr.active_mtu;
         active_speed_ = attr.active_speed;
+        active_width_ = attr.active_width;
         {
             std::lock_guard<std::mutex> guard(gid_lock_);
             gid_index_ = gid_index;
@@ -1194,5 +1195,17 @@ int RdmaContext::poll(int num_entries, ibv_wc *wc, int cq_index) {
 int RdmaContext::submitPostSend(
     const std::vector<Transport::Slice *> &slice_list) {
     return worker_pool_->submitPostSend(slice_list);
+}
+
+void RdmaContext::trackPostedSlices(
+    const std::vector<Transport::Slice *> &slice_list, size_t first,
+    size_t count) {
+    worker_pool_->trackPostedSlices(slice_list, first, count);
+}
+
+void RdmaContext::untrackPostedSlices(
+    const std::vector<Transport::Slice *> &slice_list, size_t first,
+    size_t count) {
+    worker_pool_->untrackPostedSlices(slice_list, first, count);
 }
 }  // namespace mooncake
