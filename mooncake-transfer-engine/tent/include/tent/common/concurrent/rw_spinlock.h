@@ -60,12 +60,12 @@ class RWSpinlock {
         uint32_t count = 0;
         RWTicket increment;
         increment.users = 1;
-        RWTicket old(ticket.fetch_add(increment.whole,
-                                      std::memory_order_acquire));
+        RWTicket old(
+            ticket.fetch_add(increment.whole, std::memory_order_acquire));
         uint16_t val = old.users;
         RWTicket t;
-        while (val != (t.whole = ticket.load(std::memory_order_acquire),
-                       t.write)) {
+        while (val !=
+               (t.whole = ticket.load(std::memory_order_acquire), t.write)) {
             PAUSE();
             if (++count > 1000) std::this_thread::yield();
         }
@@ -93,9 +93,9 @@ class RWSpinlock {
             ++t.read;
             ++t.write;
             new_val = t.whole;
-        } while (!ticket.compare_exchange_weak(
-            expected, new_val, std::memory_order_release,
-            std::memory_order_relaxed));
+        } while (!ticket.compare_exchange_weak(expected, new_val,
+                                               std::memory_order_release,
+                                               std::memory_order_relaxed));
     }
 
     void lockShared() {

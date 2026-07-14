@@ -53,9 +53,7 @@ class RdmaCQ {
 
     int maxCqe() const { return cqe_limit_; }
 
-    bool empty() const {
-        return cqe_now_.load(std::memory_order_relaxed) == 0;
-    }
+    bool empty() const { return cqe_now_.load(std::memory_order_relaxed) == 0; }
 
     int poll(int num_entries, ibv_wc *wc);
 

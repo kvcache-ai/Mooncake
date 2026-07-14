@@ -733,12 +733,11 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
     // Check endpoint status before submitting
     if (status_.load(std::memory_order_relaxed) != EP_READY) return 0;
     auto cq = context_->cq(qp_index % context_->cqCount());
-    int wr_count =
-        std::min(cq->maxCqe() - cq->getQuota(),
-                 std::min(params_->max_qp_wr -
-                              wr_depth_list_[qp_index].value.load(
-                                  std::memory_order_relaxed),
-                          (int)slice_list.size()));
+    int wr_count = std::min(
+        cq->maxCqe() - cq->getQuota(),
+        std::min(params_->max_qp_wr - wr_depth_list_[qp_index].value.load(
+                                          std::memory_order_relaxed),
+                 (int)slice_list.size()));
     int sge_count = wr_count * kSgeEntries;
 
     if (wr_count <= 0 || !reserveQuota(qp_index, wr_count)) return 0;

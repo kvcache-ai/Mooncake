@@ -282,10 +282,9 @@ bool RdmaEndPoint::finishDestroy() {
             }
         }
         if (has_outstanding) {
-            double elapsed =
-                (getCurrentTimeInNano() -
-                 inactive_time_.load(std::memory_order_relaxed)) /
-                1e9;
+            double elapsed = (getCurrentTimeInNano() -
+                              inactive_time_.load(std::memory_order_relaxed)) /
+                             1e9;
             if (elapsed < kFinishDestroyTimeoutSec) return false;
             LOG(WARNING) << "finishDestroy timed out after " << elapsed
                          << "s with outstanding WRs, forcing destruction";
@@ -939,8 +938,7 @@ int RdmaEndPoint::submitPostSend(
          qp_index < num_qp && cq_remaining > 0 && cursor < requested;
          ++qp_index) {
         int qp_avail = max_wr_depth_ -
-                       wr_depth_list_[qp_index].load(
-                           std::memory_order_relaxed);
+                       wr_depth_list_[qp_index].load(std::memory_order_relaxed);
         if (qp_avail <= 0) continue;
 
         size_t remaining_qps = num_qp - qp_index;
@@ -978,8 +976,7 @@ int RdmaEndPoint::submitPostSend(
         }
 
         ibv_send_wr *bad_wr = nullptr;
-        wr_depth_list_[qp_index].fetch_add(wr_count,
-                                           std::memory_order_acq_rel);
+        wr_depth_list_[qp_index].fetch_add(wr_count, std::memory_order_acq_rel);
         cq_outstanding_->fetch_add(wr_count, std::memory_order_acq_rel);
         // Register before ringing the doorbell. A fast completion may otherwise
         // be polled before the diagnostic registry sees the slice.
