@@ -115,8 +115,9 @@ class ControlClient {
 
     using OnReceiverCreditPull =
         std::function<void(Status, ReceiverCreditPullResponseV1)>;
-    // The caller owns `agent`; retaining it in the callback owner makes the
-    // in-flight coroutine independent from thread-local client teardown.
+    // Two reusable worker connections issue the same idempotent sequence; the
+    // first successful response wins, avoiding a TCP retransmission tail from
+    // stalling receiver-credit progress.
     static void pullReceiverCreditAsync(
         const std::shared_ptr<CoroRpcAgent>& agent,
         const std::string& server_addr,

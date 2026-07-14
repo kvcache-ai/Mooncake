@@ -41,6 +41,33 @@ async_simple::executors::SimpleExecutor& receiverCreditRpcExecutor() {
     return executor;
 }
 
+constexpr size_t kReceiverCreditHedgeAttempts = 2;
+
+class ReceiverCreditHedgeState {
+   public:
+    explicit ReceiverCreditHedgeState(
+        ControlClient::OnReceiverCreditPull callback)
+        : callback_(std::move(callback)) {}
+
+    void complete(Status status, ReceiverCreditPullResponseV1 response) {
+        ControlClient::OnReceiverCreditPull callback;
+        {
+            std::lock_guard lock(mutex_);
+            if (delivered_) return;
+            if (!status.ok() && --remaining_ != 0) return;
+            delivered_ = true;
+            callback = std::move(callback_);
+        }
+        callback(std::move(status), std::move(response));
+    }
+
+   private:
+    std::mutex mutex_;
+    size_t remaining_{kReceiverCreditHedgeAttempts};
+    bool delivered_{false};
+    ControlClient::OnReceiverCreditPull callback_;
+};
+
 }  // namespace
 
 Status ControlClient::getSegmentDesc(const std::string& server_addr,
@@ -136,19 +163,23 @@ void ControlClient::pullReceiverCreditAsync(
                  {});
         return;
     }
-    auto shared_callback =
-        std::make_shared<OnReceiverCreditPull>(std::move(callback));
-    const bool scheduled = receiverCreditRpcExecutor().schedule(
-        [agent, server_addr, request, shared_callback]() mutable {
-            ReceiverCreditPullResponseV1 response;
-            auto status = ControlClient::pullReceiverCredit(server_addr,
-                                                            request, response);
-            (*shared_callback)(std::move(status), std::move(response));
-        });
-    if (!scheduled) {
-        (*shared_callback)(Status::RpcServiceError(
-                               "receiver credit RPC executor stopped" LOC_MARK),
-                           {});
+    auto hedge =
+        std::make_shared<ReceiverCreditHedgeState>(std::move(callback));
+    for (size_t attempt = 0; attempt < kReceiverCreditHedgeAttempts;
+         ++attempt) {
+        const bool scheduled = receiverCreditRpcExecutor().schedule(
+            [agent, server_addr, request, hedge]() mutable {
+                ReceiverCreditPullResponseV1 response;
+                auto status = ControlClient::pullReceiverCredit(
+                    server_addr, request, response);
+                hedge->complete(std::move(status), std::move(response));
+            });
+        if (!scheduled) {
+            hedge->complete(
+                Status::RpcServiceError(
+                    "receiver credit RPC executor stopped" LOC_MARK),
+                {});
+        }
     }
 }
 
