@@ -6,6 +6,8 @@
 
 #ifdef __MUSA__
 #include <musa_bf16.h>
+#else
+#include <ATen/ATen.h>
 #endif
 
 namespace mooncake {
