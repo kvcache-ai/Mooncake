@@ -854,7 +854,7 @@ fn reconcile_extent_store_startup(
                     if let Some(next_backing) = next.cold_backing.as_mut() {
                         next_backing.owner = observer.runtime.clone();
                     }
-                    let cas = route_directory.compare_and_swap_local_route(
+                    let cas = route_directory.compare_and_swap_object_route(
                         observer,
                         &route.key,
                         Some(route.version),

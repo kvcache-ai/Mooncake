@@ -447,12 +447,10 @@ pub trait RouteDirectory: Send + Sync {
     /// Compare-and-swap a single route using only the local authority,
     /// bypassing distributed mesh authority selection.
     ///
-    /// Used during startup manifest recovery: the local node has physical
-    /// ownership of the SSD data and should register routes without
-    /// depending on other mesh members being reachable.
-    ///
-    /// The default delegates to [`Self::compare_and_swap_object_route`],
-    /// which is correct for MetadataOnly (routes go to Redis directly).
+    /// This is a low-level escape hatch for route directories that explicitly
+    /// own local-only state. Startup cold-tier recovery should use the normal
+    /// object-route CAS path so rebuilt routes are visible through the same
+    /// authority path as writes/offloads.
     fn compare_and_swap_local_route(
         &self,
         observer: &ClientLease,

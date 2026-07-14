@@ -15433,6 +15433,86 @@ fn runtime_alloc_helper_methods_cover_empty_batches_and_mismatch_paths() {
 }
 
 #[test]
+fn pending_reclaims_split_cold_backing_from_hot_replica_releases() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("split-reclaim-segment"));
+    let client = StoreClientBuilder::new(metadata, "split-reclaim-client")
+        .tenant("tenant-a")
+        .state(ClientLifecycleState::Active)
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(256))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    let hot_owner = client.runtime_id().clone();
+    let cold_owner = ClientRuntimeId::new("split-reclaim-cold-owner", ClientEpoch(7));
+    let route = ObjectRoute {
+        key: ObjectKey::new("tenant-a::cold-delete"),
+        namespace: None,
+        logical_key: None,
+        canonical_key: None,
+        sharing_scope: None,
+        qos_tier: Some("default".to_string()),
+        version: RouteVersion(3),
+        state: mooncake_store_core::RouteState::Active,
+        compatibility: CompatibilityDescriptor::default(),
+        replicas: vec![ReplicaRoute {
+            owner: hot_owner.clone(),
+            segment_name: SegmentName::new("split-reclaim-hot-segment"),
+            offset: Some(8),
+            segment_offset: 8,
+            length: 16,
+            checksum: Some(11),
+            tier: mooncake_store_core::ReplicaTier::Dram,
+            priority: 0,
+        }],
+        cold_backing: Some(mooncake_store_core::ColdBackingRoute {
+            owner: cold_owner.clone(),
+            cold_tier_id: "split-reclaim-ssd".to_string(),
+            object_locator: "split-reclaim-object".to_string(),
+            length: 16,
+            checksum: Some(11),
+            state: mooncake_store_core::ColdBackingState::Materialized,
+            replicas: Vec::new(),
+        }),
+    };
+
+    let pending = client
+        .pending_reclaims_for_route(&route, 123)
+        .expect("pending reclaims should build");
+    assert_eq!(pending.len(), 2, "hot and cold cleanup should be separate");
+    let hot = pending
+        .iter()
+        .find(|reclaim| reclaim.cold_backing.is_none())
+        .expect("hot allocation reclaim should exist");
+    assert_eq!(hot.storage_runtime, hot_owner);
+    assert_eq!(
+        hot.segment_name,
+        SegmentName::new("split-reclaim-hot-segment")
+    );
+    assert_eq!(hot.offset_bytes, 8);
+    assert_eq!(hot.length_bytes, 16);
+
+    let cold = pending
+        .iter()
+        .find(|reclaim| reclaim.cold_backing.is_some())
+        .expect("cold backing cleanup reclaim should exist");
+    assert_eq!(cold.storage_runtime, cold_owner);
+    assert_eq!(
+        cold.segment_name,
+        SegmentName::new("__cold_backing_cleanup__")
+    );
+    assert_eq!(cold.offset_bytes, 0);
+    assert_eq!(cold.length_bytes, 16);
+    assert_eq!(
+        cold.cold_backing
+            .as_ref()
+            .expect("cold reclaim should carry backing")
+            .object_locator,
+        "split-reclaim-object"
+    );
+}
+
+#[test]
 fn flush_due_reclaims_skips_duplicate_remote_release() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let storage_transport = Arc::new(TestTransport::new("remote-reclaim-storage-segment"));

@@ -706,16 +706,16 @@ impl StoreClient {
             let mut state = self.state.lock();
             state.take_due_reclaims(now_ms())
         };
-        let releases = due
-            .into_iter()
-            .map(|reclaim| AllocationReleaseRequest {
-                storage_runtime: reclaim.storage_runtime,
-                segment_name: reclaim.segment_name,
-                offset_bytes: reclaim.offset_bytes,
-                length_bytes: reclaim.length_bytes,
-            })
-            .collect::<Vec<_>>();
-        self.release_reclaim_allocations_best_effort(&releases, true, "flush_due_reclaims")
+        if self.cold_tier_shutdown_mode == ColdTierShutdownMode::Restart
+            && self.lifecycle_state() != ClientLifecycleState::Active
+        {
+            let hot = due
+                .into_iter()
+                .filter(|reclaim| reclaim.cold_backing.is_none())
+                .collect::<Vec<_>>();
+            return self.execute_pending_reclaims(hot, "flush_due_reclaims");
+        }
+        self.execute_pending_reclaims(due.into(), "flush_due_reclaims")
     }
 
     fn flush_all_reclaims(&self) -> Result<()> {
@@ -723,16 +723,7 @@ impl StoreClient {
             let mut state = self.state.lock();
             std::mem::take(&mut state.pending_reclaims)
         };
-        let releases = pending
-            .into_iter()
-            .map(|reclaim| AllocationReleaseRequest {
-                storage_runtime: reclaim.storage_runtime,
-                segment_name: reclaim.segment_name,
-                offset_bytes: reclaim.offset_bytes,
-                length_bytes: reclaim.length_bytes,
-            })
-            .collect::<Vec<_>>();
-        self.release_reclaim_allocations_best_effort(&releases, true, "flush_all_reclaims")
+        self.execute_pending_reclaims(pending.into(), "flush_all_reclaims")
     }
 
     fn flush_all_reclaims_preserve_cold_tier(&self) -> Result<()> {
@@ -740,21 +731,11 @@ impl StoreClient {
             let mut state = self.state.lock();
             std::mem::take(&mut state.pending_reclaims)
         };
-        let releases = pending
+        let hot = pending
             .into_iter()
             .filter(|reclaim| reclaim.cold_backing.is_none())
-            .map(|reclaim| AllocationReleaseRequest {
-                storage_runtime: reclaim.storage_runtime,
-                segment_name: reclaim.segment_name,
-                offset_bytes: reclaim.offset_bytes,
-                length_bytes: reclaim.length_bytes,
-            })
             .collect::<Vec<_>>();
-        self.release_reclaim_allocations_best_effort(
-            &releases,
-            true,
-            "flush_all_reclaims_preserve_cold_tier",
-        )
+        self.execute_pending_reclaims(hot, "flush_all_reclaims_preserve_cold_tier")
     }
 
     fn schedule_route_reclaim(&self, route: &ObjectRoute) -> Result<()> {
@@ -763,16 +744,27 @@ impl StoreClient {
         if grace_ms == 0 {
             return self.release_route_allocations(route);
         }
+        let due_at_ms = now_ms().saturating_add(grace_ms);
+        let pending = self.pending_reclaims_for_route(route, due_at_ms)?;
+        self.state.lock().pending_reclaims.extend(pending);
+        Ok(())
+    }
+
+    fn pending_reclaims_for_route(
+        &self,
+        route: &ObjectRoute,
+        due_at_ms: u64,
+    ) -> Result<Vec<PendingReclaim>> {
         let object_id = mooncake_store_core::route_logical_object_id(route)?;
         let qos_tier = route
             .qos_tier
             .clone()
             .unwrap_or_else(|| mooncake_store_core::DEFAULT_QOS_TIER.to_string());
         let policy_rank = Self::reclaim_policy_rank(&qos_tier);
-        let mut state = self.state.lock();
-        let due_at_ms = now_ms().saturating_add(grace_ms);
-        for replica in &route.replicas {
-            state.pending_reclaims.push_back(PendingReclaim {
+        let mut pending = route
+            .replicas
+            .iter()
+            .map(|replica| PendingReclaim {
                 due_at_ms,
                 policy_rank,
                 tenant: object_id.scope.tenant.clone(),
@@ -782,12 +774,146 @@ impl StoreClient {
                 segment_name: replica.segment_name.clone(),
                 offset_bytes: replica.segment_offset,
                 length_bytes: replica.length,
-                cold_backing: route.cold_backing.clone(),
+                cold_backing: None,
+            })
+            .collect::<Vec<_>>();
+        if let Some(cold_backing) = route.cold_backing.as_ref() {
+            pending.push(PendingReclaim {
+                due_at_ms,
+                policy_rank,
+                tenant: object_id.scope.tenant,
+                qos_tier,
+                route_key: route.key.clone(),
+                storage_runtime: cold_backing.owner.clone(),
+                segment_name: SegmentName::new("__cold_backing_cleanup__"),
+                offset_bytes: 0,
+                length_bytes: cold_backing.length,
+                cold_backing: Some(cold_backing.clone()),
             });
         }
-        Ok(())
+        Ok(pending)
     }
 
+    fn execute_pending_reclaims(
+        &self,
+        pending: Vec<PendingReclaim>,
+        context: &'static str,
+    ) -> Result<()> {
+        let mut releases = Vec::new();
+        for reclaim in pending {
+            if let Some(cold_backing) = reclaim.cold_backing.as_ref() {
+                if !self.cold_reclaim_still_targets_route(&reclaim, cold_backing)? {
+                    registry::record_cold_tier_operation(
+                        "reclaim",
+                        "skipped",
+                        "still_referenced",
+                    );
+                    continue;
+                }
+                let backend = self.storage_owner.cold_tier_devices.backend_for(cold_backing)?;
+                let removed_cold_payload =
+                    match cold_tier::backend_remove_cold_payload(backend.as_ref(), cold_backing) {
+                        Ok(removed) => removed,
+                        Err(error) => {
+                            warn!(
+                                error = %error,
+                                cold_tier_id = %cold_backing.cold_tier_id,
+                                object_locator = %cold_backing.object_locator,
+                                "failed to remove cold payload during reclaim"
+                            );
+                            registry::record_cold_tier_operation(
+                                "reclaim",
+                                "error",
+                                registry::cold_tier_error_kind(&error),
+                            );
+                            return Err(error);
+                        }
+                    };
+                if let Err(error) = cold_tier::backend_remove_pending_source(backend.as_ref(), cold_backing) {
+                    warn!(
+                        error = %error,
+                        cold_tier_id = %cold_backing.cold_tier_id,
+                        object_locator = %cold_backing.object_locator,
+                        "failed to remove pending source during reclaim"
+                    );
+                    registry::record_cold_tier_operation(
+                        "cleanup",
+                        "error",
+                        registry::cold_tier_error_kind(&error),
+                    );
+                }
+                for replica in &cold_backing.replicas {
+                    let replica_backing = mooncake_store_core::ColdBackingRoute {
+                        owner: replica.owner.clone(),
+                        cold_tier_id: replica.cold_tier_id.clone(),
+                        object_locator: replica.object_locator.clone(),
+                        ..cold_backing.clone()
+                    };
+                    if let Ok(replica_backend) =
+                        self.storage_owner.cold_tier_devices.backend_for(&replica_backing)
+                    {
+                        let _ =
+                            cold_tier::backend_remove_cold_payload(replica_backend.as_ref(), &replica_backing);
+                        let _ = cold_tier::backend_remove_pending_source(
+                            replica_backend.as_ref(),
+                            &replica_backing,
+                        );
+                    }
+                }
+                if removed_cold_payload
+                    && cold_backing.state == mooncake_store_core::ColdBackingState::Materialized
+                {
+                    self.storage_owner.apply_cold_tier_usage_delta(
+                        &cold_backing.cold_tier_id,
+                        -(cold_backing.length as i64),
+                        0,
+                    )?;
+                }
+                info!(
+                    runtime = %self.lease.runtime,
+                    route_key = %reclaim.route_key.0,
+                    cold_tier_id = %cold_backing.cold_tier_id,
+                    object_locator = %cold_backing.object_locator,
+                    length = cold_backing.length,
+                    removed_cold_payload,
+                    "cold_reclaim_payload_deleted"
+                );
+                registry::record_cold_tier_operation("reclaim", "cold", "none");
+                continue;
+            }
+            releases.push(AllocationReleaseRequest {
+                storage_runtime: reclaim.storage_runtime,
+                segment_name: reclaim.segment_name,
+                offset_bytes: reclaim.offset_bytes,
+                length_bytes: reclaim.length_bytes,
+            });
+        }
+        let hot_reclaims = releases.len() as u64;
+        let result = self.release_reclaim_allocations_best_effort(&releases, true, context);
+        if result.is_ok() {
+            for _ in 0..hot_reclaims {
+                registry::record_cold_tier_operation("reclaim", "hot", "none");
+            }
+        } else if let Err(error) = &result {
+            registry::record_cold_tier_operation(
+                "reclaim",
+                "error",
+                registry::cold_tier_error_kind(error),
+            );
+        }
+        result
+    }
+
+    fn cold_reclaim_still_targets_route(
+        &self,
+        reclaim: &PendingReclaim,
+        cold_backing: &mooncake_store_core::ColdBackingRoute,
+    ) -> Result<bool> {
+        let Some(current) = self.route_ops().load_route(&reclaim.route_key)? else {
+            return Ok(true);
+        };
+        Ok(current.state != RouteState::Active || current.cold_backing.as_ref() != Some(cold_backing))
+    }
 
     fn reclaim_policy_rank(qos_tier: &str) -> u8 {
         match qos_tier {
@@ -1087,26 +1213,8 @@ impl StoreClient {
 
     fn release_route_allocations(&self, route: &ObjectRoute) -> Result<()> {
         self.storage_owner.untrack_route(route);
-        let releases = route
-            .replicas
-            .iter()
-            .map(|replica| {
-                debug!(
-                    owner = %replica.owner,
-                    segment = %replica.segment_name.0,
-                    offset_bytes = replica.segment_offset,
-                    length_bytes = replica.length,
-                    "releasing route allocation"
-                );
-                AllocationReleaseRequest {
-                    storage_runtime: replica.owner.clone(),
-                    segment_name: replica.segment_name.clone(),
-                    offset_bytes: replica.segment_offset,
-                    length_bytes: replica.length,
-                }
-            })
-            .collect::<Vec<_>>();
-        self.release_segment_allocations_batch(&releases)
+        let pending = self.pending_reclaims_for_route(route, now_ms())?;
+        self.execute_pending_reclaims(pending, "release_route_allocations")
     }
 }
 
