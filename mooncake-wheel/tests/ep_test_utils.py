@@ -1,9 +1,12 @@
+import json
 import os
 import re
 import sys
+import tempfile
 import numpy as np
 import torch
 import torch.distributed as dist
+from pathlib import Path
 from typing import Optional
 
 from mooncake import pg
@@ -148,43 +151,57 @@ class suppress_stdout_stderr:
 
 def bench_kineto(fn, kernel_names, num_tests: int = 30, suppress_kineto_output: bool = False,
                  trace_path: Optional[str] = None, barrier_comm_profiling: bool = False,
-                 profile_enabled: bool = True):
+                 num_kernels_per_period: int = 1, profile_enabled: bool = True):
     assert isinstance(kernel_names, str) or isinstance(kernel_names, tuple)
     is_tupled = isinstance(kernel_names, tuple)
     kernel_names = (kernel_names, ) if isinstance(kernel_names, str) else kernel_names
     assert all([isinstance(name, str) for name in kernel_names])
+    assert num_kernels_per_period >= 1
 
     def run_profile_body(prof=None):
-        for i in range(2):
-            # NOTES: use a large kernel and a barrier to eliminate the unbalanced CPU launch overhead
-            if barrier_comm_profiling:
-                lhs = torch.randn((8192, 8192), dtype=torch.float, device='cuda')
-                rhs = torch.randn((8192, 8192), dtype=torch.float, device='cuda')
-                lhs @ rhs
-                dist.all_reduce(torch.ones(1, dtype=torch.float, device='cuda'))
+        dummy = torch.ones(1, dtype=torch.float, device='cuda')
+        for _ in range(2):
             for _ in range(num_tests):
+                # Match DeepEP's profile window: each measured operation starts
+                # after an L2 flush and a device-side cross-rank rendezvous.
+                torch.empty(int(256e6 // 4), dtype=torch.int, device='cuda').zero_()
+                if barrier_comm_profiling:
+                    torch.cuda._sleep(int(2e7))
+                    dist.all_reduce(dummy)
                 fn()
             torch.cuda.synchronize()
             if prof is not None:
                 prof.step()
 
+    # Prime lazy initialization before the profiler schedule begins.
+    fn()
+    torch.cuda.synchronize()
+
     if not profile_enabled:
         run_profile_body()
-        kernel_times = [0.0 for _ in kernel_names]
+        kernel_times = [
+            [0.0] * num_kernels_per_period
+            if num_kernels_per_period > 1 else 0.0
+            for _ in kernel_names
+        ]
         return tuple(kernel_times) if is_tupled else kernel_times[0]
 
     # Profile
     suppress = suppress_stdout_stderr if suppress_kineto_output else empty_suppress
     with suppress():
         schedule = torch.profiler.schedule(wait=0, warmup=1, active=1, repeat=1)
-        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA], schedule=schedule) as prof:
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CUDA],
+            schedule=schedule,
+            acc_events=True,
+        ) as prof:
             run_profile_body(prof)
 
     # Save chrome traces
     if trace_path is not None:
         prof.export_chrome_trace(trace_path)
 
-    # Return average kernel times
+    # Return average kernel times for the normal, single-kernel path.
     kernel_times = []
     events = prof.key_averages()
     sort_by = "cuda_time_total" if any(
@@ -205,8 +222,6 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30, suppress_kineto_output: 
             time_matches = re.findall(r"([0-9]+(?:\.[0-9]+)?)(ns|us|ms|s)", line)
             if len(time_matches) == 0:
                 continue
-            # The profiler table has Self CUDA, CUDA total, then CUDA time avg.
-            # Use the last time token on the matching kernel row.
             value, unit = time_matches[-1]
             value = float(value)
             if unit == "ms":
@@ -227,7 +242,7 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30, suppress_kineto_output: 
                 kernel_times.append(fallback_time)
                 continue
             import warnings
-            warnings.warn(f'Kernel {name} not found in profiling table (might be fallback mode)', UserWarning)
+            warnings.warn(f'Kernel {name} was not captured by Kineto', UserWarning)
             kernel_times.append(0.0)
             continue
 
@@ -235,6 +250,34 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30, suppress_kineto_output: 
         total_count = sum(getattr(event, "count", 0) for event in matched_events)
         assert total_count > 0
         kernel_times.append(total_cuda_time_us / total_count / 1e6)
+
+    if num_kernels_per_period > 1:
+        with tempfile.NamedTemporaryFile(suffix='.json') as trace_file:
+            prof.export_chrome_trace(trace_file.name)
+            trace_events = json.loads(Path(trace_file.name).read_text()).get('traceEvents', [])
+
+        period_times = []
+        for name in kernel_names:
+            durations = [
+                event['dur'] / 1e6
+                for event in trace_events
+                if f'::{name}' in event.get('name', '') and 'dur' in event
+            ]
+            if len(durations) == 0 or len(durations) % num_kernels_per_period:
+                import warnings
+                warnings.warn(
+                    f'Kineto captured {len(durations)} {name} kernels; expected a multiple of '
+                    f'{num_kernels_per_period} for hook phase timing',
+                    UserWarning,
+                )
+                period_times.append([0.0] * num_kernels_per_period)
+                continue
+            period_count = len(durations) // num_kernels_per_period
+            period_times.append([
+                sum(durations[offset::num_kernels_per_period]) / period_count
+                for offset in range(num_kernels_per_period)
+            ])
+        kernel_times = period_times
 
     if os.getenv("MOONCAKE_EP_KINETO_DUMP", "").upper() in {"1", "ON", "TRUE", "YES"}:
         for name, kernel_time in zip(kernel_names, kernel_times):

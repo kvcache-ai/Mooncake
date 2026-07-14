@@ -18,12 +18,6 @@ _EP_DIAG_TIMING = os.getenv("MOONCAKE_EP_DIAG_TIMING", "").upper() in {
     "TRUE",
     "YES",
 }
-_EP_PROFILE_NON_HOOK = os.getenv("MOONCAKE_EP_PROFILE_NON_HOOK", "").upper() in {
-    "1",
-    "ON",
-    "TRUE",
-    "YES",
-}
 _EP_DIAG_ITERS = int(os.getenv("MOONCAKE_EP_DIAG_ITERS", "10"))
 _EP_DIAG_NAMES = (
     "phase_ack_wait",
@@ -222,30 +216,32 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
     # Separate profiling
     # Skip profiling in fallback mode as kernels are Python functions, not CUDA kernels
     if not buffer._use_fallback:
-        profile_hook_modes = (False, True) if _EP_PROFILE_NON_HOOK else (True,)
-        for return_recv_hook in profile_hook_modes:
-            for profile_rank in range(num_ranks):
-                cpu_group.barrier()
-                dispatch_t, combine_t = bench_kineto(
-                    partial(test_func, zero_copy=True, return_recv_hook=return_recv_hook),
-                    kernel_names=('dispatch', 'combine'), barrier_comm_profiling=True,
-                    suppress_kineto_output=True, profile_enabled=(rank == profile_rank))
-                if rank != profile_rank:
-                    continue
-                if not return_recv_hook:
-                    # In fallback mode, kernels may not be found (they're Python functions)
-                    # So we skip bandwidth calculation if time is 0
-                    if dispatch_t > 0 and combine_t > 0:
-                        print(f'[rank {rank}] Dispatch bandwidth: {num_dispatch_comm_bytes / 1e9 / dispatch_t:.2f} GB/s, avg_t={dispatch_t * 1e6:.2f} us | '
-                              f'Combine bandwidth: {num_combine_comm_bytes / 1e9 / combine_t:.2f} GB/s, avg_t={combine_t * 1e6:.2f} us', flush=True)
-                    else:
-                        print(f'[rank {rank}] Profiling skipped (kernels not found in CUDA profiler)', flush=True)
+        for return_recv_hook in (False, True):
+            # Mooncake PG barrier currently preloads a uint8 reduction kernel,
+            # which is unavailable in this B300 build. This barrier is outside
+            # the measured window, so use the existing CPU control group.
+            cpu_group.barrier()
+            dispatch_t, combine_t = bench_kineto(
+                partial(test_func, zero_copy=True, return_recv_hook=return_recv_hook),
+                kernel_names=('dispatch', 'combine'), barrier_comm_profiling=True,
+                suppress_kineto_output=True,
+                num_kernels_per_period=2 if return_recv_hook else 1)
+            if not return_recv_hook:
+                if dispatch_t > 0 and combine_t > 0:
+                    print(f'[rank {rank}] Dispatch bandwidth: {num_dispatch_comm_bytes / 1e9 / dispatch_t:.2f} GB/s, avg_t={dispatch_t * 1e6:.2f} us | '
+                          f'Combine bandwidth: {num_combine_comm_bytes / 1e9 / combine_t:.2f} GB/s, avg_t={combine_t * 1e6:.2f} us', flush=True)
                 else:
-                    if dispatch_t > 0 and combine_t > 0:
-                        print(f'[rank {rank}] Dispatch send/recv time: {dispatch_t * 2 * 1e6:.2f} us | '
-                              f'Combine send/recv time: {combine_t * 2 * 1e6:.2f} us', flush=True)
-                    else:
-                        print(f'[rank {rank}] Profiling skipped (kernels not found in CUDA profiler)', flush=True)
+                    print(f'[rank {rank}] Profiling skipped (kernels not captured by Kineto)', flush=True)
+            else:
+                dispatch_send_t, dispatch_recv_t = dispatch_t
+                combine_send_t, combine_recv_t = combine_t
+                if min(dispatch_send_t, dispatch_recv_t, combine_send_t, combine_recv_t) > 0:
+                    print(f'[rank {rank}] Dispatch send/recv time: {dispatch_send_t * 1e6:.2f} + {dispatch_recv_t * 1e6:.2f} us '
+                          f'(total {(dispatch_send_t + dispatch_recv_t) * 1e6:.2f} us) | '
+                          f'Combine send/recv time: {combine_send_t * 1e6:.2f} + {combine_recv_t * 1e6:.2f} us '
+                          f'(total {(combine_send_t + combine_recv_t) * 1e6:.2f} us)', flush=True)
+                else:
+                    print(f'[rank {rank}] Profiling skipped (hook kernels not captured by Kineto)', flush=True)
     else:
         if rank == 0:
             print(f'[rank {rank}] Profiling skipped (fallback mode - using Python implementation)', flush=True)
