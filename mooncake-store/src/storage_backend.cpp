@@ -4255,6 +4255,46 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::ScanMeta(
 
 tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
 CreateStorageBackend(const FileStorageConfig& config) {
+    if (!config.storage_filepaths.empty()) {
+        if (config.storage_backend_type == StorageBackendType::kDistributed) {
+            LOG(ERROR) << "Multiple local paths are not supported by the "
+                          "distributed storage backend";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+
+        if (config.storage_filepaths.size() == 1) {
+            FileStorageConfig single_config = config;
+            single_config.storage_filepath = config.storage_filepaths.front();
+            single_config.storage_filepaths.clear();
+            return CreateStorageBackend(single_config);
+        }
+
+        std::vector<std::shared_ptr<StorageBackendInterface>> backends;
+        backends.reserve(config.storage_filepaths.size());
+        const int64_t path_count =
+            static_cast<int64_t>(config.storage_filepaths.size());
+        for (size_t i = 0; i < config.storage_filepaths.size(); ++i) {
+            FileStorageConfig child_config = config;
+            child_config.storage_filepath = config.storage_filepaths[i];
+            child_config.storage_filepaths.clear();
+            child_config.total_size_limit =
+                config.total_size_limit / path_count +
+                (i < static_cast<size_t>(config.total_size_limit % path_count)
+                     ? 1
+                     : 0);
+            child_config.total_keys_limit =
+                config.total_keys_limit / path_count +
+                (i < static_cast<size_t>(config.total_keys_limit % path_count)
+                     ? 1
+                     : 0);
+            auto backend = CreateStorageBackend(child_config);
+            if (!backend) return tl::make_unexpected(backend.error());
+            backends.push_back(std::move(backend.value()));
+        }
+        return std::make_shared<ShardedStorageBackend>(config,
+                                                       std::move(backends));
+    }
+
     switch (config.storage_backend_type) {
         case StorageBackendType::kBucket: {
             auto bucket_backend_config = BucketBackendConfig::FromEnvironment();

@@ -68,6 +68,24 @@ bool GetEnvBoolStringOr(const char* name, bool default_value) {
     return default_value;
 }
 
+std::vector<std::string> ParseStoragePaths(const std::string& value) {
+    std::vector<std::string> paths;
+    size_t start = 0;
+    while (start <= value.size()) {
+        const size_t end = value.find(',', start);
+        std::string path = value.substr(
+            start, end == std::string::npos ? std::string::npos : end - start);
+        const size_t first = path.find_first_not_of(" \t\n\r");
+        const size_t last = path.find_last_not_of(" \t\n\r");
+        if (first != std::string::npos) {
+            paths.push_back(path.substr(first, last - first + 1));
+        }
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    return paths;
+}
+
 std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
     const std::vector<std::string>& storage_keys,
     const std::vector<StorageObjectMetadata>& metadatas) {
@@ -108,6 +126,14 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
 
     config.storage_filepath = GetEnvStringOr(
         "MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", config.storage_filepath);
+    const auto storage_paths =
+        GetEnvStringOr("MOONCAKE_OFFLOAD_FILE_STORAGE_PATHS", "");
+    if (!storage_paths.empty()) {
+        config.storage_filepaths = ParseStoragePaths(storage_paths);
+        if (!config.storage_filepaths.empty()) {
+            config.storage_filepath = config.storage_filepaths.front();
+        }
+    }
 
     config.local_buffer_size = GetEnvOr<int64_t>(
         "MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", config.local_buffer_size);
@@ -216,8 +242,22 @@ bool FileStorageConfig::ValidatePath(std::string path) const {
 }
 
 bool FileStorageConfig::Validate() const {
-    if (!ValidatePath(storage_filepath)) {
-        return false;
+    std::set<std::filesystem::path> unique_paths;
+    std::vector<std::string> paths = storage_filepaths;
+    if (paths.empty()) paths.push_back(storage_filepath);
+    for (const auto& path : paths) {
+        if (!ValidatePath(path)) return false;
+        std::error_code ec;
+        auto normalized = std::filesystem::canonical(path, ec);
+        if (ec) {
+            LOG(ERROR) << "FileStorageConfig: failed to canonicalize path: "
+                       << path << ", error: " << ec.message();
+            return false;
+        }
+        if (!unique_paths.insert(normalized).second) {
+            LOG(ERROR) << "FileStorageConfig: duplicate storage path: " << path;
+            return false;
+        }
     }
     if (total_keys_limit <= 0) {
         LOG(ERROR) << "FileStorageConfig: total_keys_limit must > 0";
@@ -460,6 +500,16 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     if (auto bucket_backend =
             std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_)) {
         auto allocate_res = bucket_backend->AllocateOffloadingBuckets(
+            storage_object_sizes, buckets_keys);
+        if (!allocate_res) {
+            LOG(ERROR) << "AllocateOffloadingBuckets failed with error: "
+                       << allocate_res.error();
+            return allocate_res;
+        }
+    } else if (auto sharded_backend =
+                   std::dynamic_pointer_cast<ShardedStorageBackend>(
+                       storage_backend_)) {
+        auto allocate_res = sharded_backend->AllocateOffloadingBuckets(
             storage_object_sizes, buckets_keys);
         if (!allocate_res) {
             LOG(ERROR) << "AllocateOffloadingBuckets failed with error: "

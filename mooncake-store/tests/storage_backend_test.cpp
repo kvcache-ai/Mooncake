@@ -3,6 +3,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <iostream>
 #include <limits>
@@ -154,6 +155,147 @@ class StorageBackendTest : public ::testing::Test {
         }
     }
 };
+
+TEST_F(StorageBackendTest, ShardsAndRecoversAfterPathConfigurationChanges) {
+    const auto path0 = (fs::path(data_path) / "nvme0").string();
+    const auto path1 = (fs::path(data_path) / "nvme1").string();
+    fs::create_directories(path0);
+    fs::create_directories(path1);
+
+    FileStorageConfig config;
+    config.storage_backend_type = StorageBackendType::kBucket;
+    config.storage_filepath = path0;
+    config.storage_filepaths = {path0, path1};
+    config.total_size_limit = 1024 * 1024 * 1024;
+    config.total_keys_limit = 1024;
+
+    auto backend_result = CreateStorageBackend(config);
+    ASSERT_TRUE(backend_result);
+    auto backend = backend_result.value();
+    ASSERT_NE(std::dynamic_pointer_cast<ShardedStorageBackend>(backend),
+              nullptr);
+    ASSERT_TRUE(backend->Init());
+
+    constexpr size_t kObjectCount = 128;
+    constexpr size_t kObjectSize = 4096;
+    std::vector<std::vector<char>> source_buffers(
+        kObjectCount, std::vector<char>(kObjectSize));
+    std::unordered_map<std::string, std::vector<Slice>> objects;
+    for (size_t i = 0; i < kObjectCount; ++i) {
+        std::fill(source_buffers[i].begin(), source_buffers[i].end(),
+                  static_cast<char>(i));
+        objects.emplace("multipath-key-" + std::to_string(i),
+                        std::vector<Slice>{{source_buffers[i].data(),
+                                            source_buffers[i].size()}});
+    }
+
+    std::vector<std::string> completed_keys;
+    auto offload_result = backend->BatchOffload(
+        objects, [&](const std::vector<std::string>& keys,
+                     std::vector<StorageObjectMetadata>&) {
+            completed_keys = keys;
+            return ErrorCode::OK;
+        });
+    ASSERT_TRUE(offload_result);
+    EXPECT_EQ(offload_result.value(), kObjectCount);
+    EXPECT_EQ(completed_keys.size(), kObjectCount);
+    EXPECT_FALSE(fs::directory_iterator(path0) == fs::directory_iterator{});
+    EXPECT_FALSE(fs::directory_iterator(path1) == fs::directory_iterator{});
+
+    auto verify_load = [&](StorageBackendInterface& storage_backend) {
+        std::vector<std::vector<char>> destination_buffers(
+            kObjectCount, std::vector<char>(kObjectSize));
+        std::unordered_map<std::string, Slice> slices;
+        for (size_t i = 0; i < kObjectCount; ++i) {
+            slices.emplace("multipath-key-" + std::to_string(i),
+                           Slice{destination_buffers[i].data(),
+                                 destination_buffers[i].size()});
+        }
+        ASSERT_TRUE(storage_backend.BatchLoad(slices));
+        for (size_t i = 0; i < kObjectCount; ++i) {
+            EXPECT_EQ(destination_buffers[i], source_buffers[i]);
+        }
+    };
+    verify_load(*backend);
+
+    backend.reset();
+    const auto path2 = (fs::path(data_path) / "nvme2").string();
+    fs::create_directories(path2);
+    config.storage_filepath = path1;
+    config.storage_filepaths = {path1, path2, path0};
+    backend_result = CreateStorageBackend(config);
+    ASSERT_TRUE(backend_result);
+    backend = backend_result.value();
+    ASSERT_TRUE(backend->Init());
+
+    std::vector<std::string> recovered_keys;
+    ASSERT_TRUE(backend->ScanMeta([&](const std::vector<std::string>& keys,
+                                      std::vector<StorageObjectMetadata>&) {
+        recovered_keys.insert(recovered_keys.end(), keys.begin(), keys.end());
+        return ErrorCode::OK;
+    }));
+    EXPECT_EQ(recovered_keys.size(), kObjectCount);
+    verify_load(*backend);
+}
+
+TEST_F(StorageBackendTest, ShardedBackendBalancesRendezvousPlacement) {
+    constexpr size_t kBackendCount = 4;
+    constexpr size_t kObjectCount = 2048;
+    constexpr size_t kObjectSize = 4096;
+
+    FileStorageConfig config;
+    config.storage_backend_type = StorageBackendType::kFilePerKey;
+    config.total_size_limit = 1024 * 1024 * 1024;
+    config.total_keys_limit = kObjectCount * 2;
+
+    FilePerKeyConfig file_per_key_config;
+    file_per_key_config.fsdir = "objects";
+    std::vector<std::shared_ptr<StorageBackendInterface>> children;
+    std::vector<std::string> child_paths;
+    for (size_t i = 0; i < kBackendCount; ++i) {
+        auto child_config = config;
+        child_config.storage_filepath =
+            (fs::path(data_path) / ("balanced-nvme" + std::to_string(i)))
+                .string();
+        fs::create_directories(child_config.storage_filepath);
+        child_paths.push_back(child_config.storage_filepath);
+        children.push_back(std::make_shared<StorageBackendAdaptor>(
+            child_config, file_per_key_config));
+    }
+
+    config.storage_filepath = child_paths.front();
+    ShardedStorageBackend backend(config, children);
+    ASSERT_TRUE(backend.Init());
+
+    std::vector<char> value(kObjectSize, 'x');
+    std::unordered_map<std::string, std::vector<Slice>> objects;
+    for (size_t i = 0; i < kObjectCount; ++i) {
+        objects.emplace("balanced-key-" + std::to_string(i),
+                        std::vector<Slice>{{value.data(), value.size()}});
+    }
+    ASSERT_TRUE(backend.BatchOffload(objects, nullptr));
+
+    std::vector<size_t> counts(kBackendCount, 0);
+    for (const auto& [key, slices] : objects) {
+        size_t placements = 0;
+        for (size_t i = 0; i < children.size(); ++i) {
+            auto exists = children[i]->IsExist(key);
+            ASSERT_TRUE(exists);
+            if (exists.value()) {
+                ++counts[i];
+                ++placements;
+            }
+        }
+        EXPECT_EQ(placements, 1);
+    }
+
+    const size_t expected = kObjectCount / kBackendCount;
+    const size_t tolerance = kObjectCount / 20;  // +/- 5% of all objects.
+    for (size_t count : counts) {
+        EXPECT_GE(count, expected - tolerance);
+        EXPECT_LE(count, expected + tolerance);
+    }
+}
 
 TEST_F(StorageBackendTest, StorageBackendAll) {
     std::shared_ptr<SimpleAllocator> client_buffer_allocator =
