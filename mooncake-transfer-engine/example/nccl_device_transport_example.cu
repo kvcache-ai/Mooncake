@@ -33,7 +33,6 @@
 
 #include "transfer_engine.h"
 #include "transport/device/cuda/cuda_ops.cuh"
-#include "transport/device/device_transport.h"
 #include "transport/device/nccl_device.cuh"
 
 DEFINE_int32(rank, -1, "Rank of this process (0 or 1)");

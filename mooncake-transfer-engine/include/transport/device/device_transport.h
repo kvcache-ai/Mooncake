@@ -14,16 +14,14 @@
 
 #pragma once
 
-// EP DeviceTransport — host-side abstractions for device-initiated
-// communication paths:
+// EP DeviceTransport — platform-agnostic host-side abstraction for the two
+// communication paths used by the EP kernel:
 //
 //   P2pTransport   — intra-node GPU-initiated P2P (NVLink on CUDA, MTLink on
 //                    MUSA).  Manages IPC handle exchange and peer pointer
 //                    table.
 //   RdmaTransport  — inter-node GPU-initiated RDMA (IBGDA / mlx5gda).
 //                    Manages QP lifecycle, MR, and device context table.
-//   NcclTransport  — optional CUDA LSA / GIN backend. Manages NCCL host and
-//                    device communicators plus symmetric windows.
 //
 // EP code includes only this header and calls the abstract interface.
 // Platform-specific implementations live in device/ and are
@@ -32,7 +30,6 @@
 // The header intentionally avoids including cuda_alike.h so it can be included
 // from pure C++ translation units.  Implementations include cuda_alike.h.
 
-#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -154,155 +151,8 @@ class RdmaTransport {
     virtual int gidIndex() const = 0;
 };
 
-#ifdef USE_NCCL_DEVICE
 // ---------------------------------------------------------------------------
-// NcclTransport
-//
-// Owns the native NCCL resources used to implement Mooncake's LSA/GIN device
-// operations. Native communicators and windows are intentionally private.
-// Communicator bootstrap and buffer registration are collective; the caller
-// supplies the control plane used to exchange the unique ID and to order
-// collectives.
-// ---------------------------------------------------------------------------
-enum class NcclGinBackend : uint8_t {
-    kNone = 0,
-    kProxy,
-    kGdaki,
-};
-
-enum class NcclDeviceRoute : uint8_t {
-    kUnavailable = 0,
-    kLocal,
-    kLsa,
-    kGin,
-};
-
-struct NcclTransportConfig {
-    int rank = -1;
-    int num_ranks = 0;
-
-    // Mooncake currently supports either full world-team GIN connectivity or
-    // no GIN. Rail connectivity is intentionally deferred until Mooncake has
-    // a rail-team rank contract.
-    bool enable_gin = true;
-    int gin_context_count = 4;
-    bool gin_exclusive_contexts = false;
-
-    // LSA barriers synchronize only the local LSA team. Cross-LSA/world
-    // synchronization remains the caller's responsibility.
-    int lsa_barrier_count = 0;
-    bool require_lsa_multimem = false;
-};
-
-struct NcclTransportProperties {
-    int runtime_version = 0;
-    int rank = -1;
-    int num_ranks = 0;
-    int cuda_device = -1;
-    bool device_api_supported = false;
-    bool multimem_supported = false;
-    bool lsa_multimem_enabled = false;
-    int lsa_team_count = 0;
-    int lsa_barrier_count = 0;
-    bool gin_enabled = false;
-    NcclGinBackend gin_backend = NcclGinBackend::kNone;
-    int gin_connection_count = 0;
-    int gin_context_count = 0;
-};
-
-namespace detail {
-struct NcclDeviceContextAccess;
-}  // namespace detail
-
-class NcclDeviceTransportImpl;
-
-// Opaque token for one collectively registered symmetric buffer. The token
-// does not own the allocation; deregister it before freeing the buffer.
-class NcclBufferRegistration {
-   public:
-    bool valid() const { return id_ != 0; }
-
-   private:
-    uint64_t id_ = 0;
-
-    friend class NcclDeviceTransportImpl;
-};
-
-// Pass this small Mooncake context by value to kernels. Its native NCCL
-// communicator and registration table remain behind an opaque device pointer.
-class NcclDeviceContext {
-   public:
-    bool valid() const { return native_comm_ != nullptr; }
-
-   private:
-    const void* native_comm_ = nullptr;
-    const void* native_window_ = nullptr;
-    const void* local_base_ = nullptr;
-    int rank_ = -1;
-    int gin_context_count_ = 0;
-    bool gin_enabled_ = false;
-    bool lsa_multimem_enabled_ = false;
-
-    friend class NcclDeviceTransportImpl;
-    friend struct detail::NcclDeviceContextAccess;
-};
-
-// Host calls on one transport instance are not thread-safe and must be
-// externally serialized, matching P2pTransport and RdmaTransport.
-class NcclTransport {
-   public:
-    virtual ~NcclTransport() = default;
-
-    // Generate the NCCL bootstrap ID on one rank. Exchange this int32_t blob
-    // through the caller's existing control plane before initialize().
-    virtual std::vector<int32_t> createUniqueId() = 0;
-
-    // Create the host and device communicators. Every rank must call this with
-    // the same unique ID and compatible config. The NCCL headers used to build
-    // Mooncake and device kernels must exactly match the runtime libnccl;
-    // initialization rejects a mismatch. Rebuild AOT kernels and regenerate
-    // cached JIT kernels after every NCCL upgrade.
-    virtual int initialize(const NcclTransportConfig& config,
-                           const std::vector<int32_t>& unique_id) = 0;
-
-    // NCCL-compatible VMM allocation. These low-level methods are local; every
-    // rank must verify allocation success before entering registerBuffer().
-    virtual void* allocateBuffer(size_t bytes) = 0;
-    virtual int freeBuffer(void* ptr) = 0;
-
-    // Collectively register a symmetric buffer. Calls must occur in the same
-    // order on every rank. Deregistration is local after all device work and
-    // remote access have completed. The registration is invalidated on
-    // successful deregistration.
-    virtual int registerBuffer(void* ptr, size_t bytes,
-                               NcclBufferRegistration* registration) = 0;
-    virtual int deregisterBuffer(NcclBufferRegistration* registration) = 0;
-
-    // Safe common path: every rank allocates, collectively checks that all
-    // allocations succeeded, and only then enters registration. All ranks
-    // must call this method in the same order. On failure, successful local
-    // allocations and registrations are cleaned up before returning.
-    virtual int allocateAndRegisterBuffer(
-        size_t bytes, void** ptr, NcclBufferRegistration* registration) = 0;
-
-    // Snapshot passed by value to a CUDA kernel and bound to one registered
-    // buffer. Device helpers accept local pointers within that buffer and
-    // resolve the private window and peer offsets. The snapshot remains valid
-    // until the registration is removed or the transport is shut down.
-    virtual NcclDeviceContext deviceContext(
-        const NcclBufferRegistration& registration) const = 0;
-
-    virtual NcclTransportProperties properties() const = 0;
-    virtual bool initialized() const = 0;
-
-    // The caller must first ensure that no kernel can access the context or
-    // any registered buffer.
-    virtual int shutdown() = 0;
-};
-#endif
-
-// ---------------------------------------------------------------------------
-// Factory functions — implemented under src/transport/device/.
+// Factory functions — implemented in device_transport.cpp.
 // Returns nullptr if the transport is not available on this platform.
 // ---------------------------------------------------------------------------
 
@@ -315,11 +165,6 @@ std::unique_ptr<P2pTransport> createP2pDeviceTransport(int num_ranks);
 //   Non-empty = restrict discovery to these NICs, then pick the closest one.
 std::unique_ptr<RdmaTransport> createIbgdaDeviceTransport(
     const std::vector<std::string>& device_filter = {});
-
-#ifdef USE_NCCL_DEVICE
-// Create the CUDA-only NCCL LSA/GIN device transport.
-std::unique_ptr<NcclTransport> createNcclDeviceTransport();
-#endif
 
 }  // namespace device
 }  // namespace mooncake

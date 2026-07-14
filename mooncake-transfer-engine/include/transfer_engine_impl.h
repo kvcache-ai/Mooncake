@@ -33,10 +33,12 @@
 #include "transfer_metadata.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
-#if ((defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
-     !defined(USE_CXI)) ||                                            \
-    defined(USE_NCCL_DEVICE)
+#if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
+    !defined(USE_CXI)
 #include "transport/device/device_transport.h"
+#endif
+#ifdef USE_NCCL_DEVICE
+#include "transport/device/nccl_device_transport.h"
 #endif
 #ifdef WITH_METRICS
 #include "ylt/metric/counter.hpp"
@@ -353,7 +355,7 @@ class TransferEngineImpl {
 
 #if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
     !defined(USE_CXI)
-    // Platform P2P/IBGDA transports are unavailable in CXI builds.
+    // Device transport accessors — lazily created, owned by this impl.
     device::P2pTransport* getOrCreateP2pTransport(int num_ranks);
     device::RdmaTransport* getOrCreateRdmaTransport(
         const std::vector<std::string>& device_filter = {});
@@ -445,7 +447,8 @@ class TransferEngineImpl {
 
 #if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
     !defined(USE_CXI)
-    // Platform device transports are lazily created and owned here.
+    // Device transports (P2P + IBGDA) — lazily created, owned by this impl.
+    // Referenced by EP and future CPU-proxy paths.
     std::unique_ptr<device::P2pTransport> p2p_transport_;
     std::unique_ptr<device::RdmaTransport> rdma_transport_;
 #endif

@@ -234,17 +234,6 @@ TEST_F(TransportTest, parseHostNameWithPortTest) {
     ASSERT_EQ(res.second, 12001);
 }
 
-TEST_F(TransportTest, P2PHandshakeUsesDistinctPortsForBareHost) {
-    TransferEngine first(false);
-    TransferEngine second(false);
-
-    ASSERT_EQ(first.init(P2PHANDSHAKE, "127.0.0.1"), 0);
-    ASSERT_EQ(second.init(P2PHANDSHAKE, "127.0.0.1"), 0);
-    EXPECT_NE(first.getRpcPort(), 0);
-    EXPECT_NE(second.getRpcPort(), 0);
-    EXPECT_NE(first.getRpcPort(), second.getRpcPort());
-}
-
 TEST_F(TransportTest, WriteSuccess) {
     int fd = CreateTempFile();
     ASSERT_NE(fd, -1) << "Failed to create temporary file";

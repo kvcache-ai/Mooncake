@@ -24,7 +24,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "transport/device/device_transport.h"
+#include "transport/device/nccl_device_transport.h"
 
 #if NCCL_VERSION_CODE < 23004
 #error "Mooncake NCCL DeviceTransport requires NCCL 2.30.4 or newer"

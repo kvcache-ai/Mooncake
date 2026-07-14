@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "transport/device/device_transport.h"
+#include "transport/device/nccl_device_transport.h"
 
 #include <cuda_runtime.h>
 #include <glog/logging.h>
@@ -52,6 +52,10 @@ NcclGinBackend toGinBackend(ncclGinType_t type) {
             return NcclGinBackend::kProxy;
         case NCCL_GIN_TYPE_GDAKI:
             return NcclGinBackend::kGdaki;
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 30, 6)
+        case NCCL_GIN_TYPE_GPI:
+            return NcclGinBackend::kGpi;
+#endif
         case NCCL_GIN_TYPE_NONE:
         default:
             return NcclGinBackend::kNone;
@@ -64,6 +68,8 @@ const char* ginBackendName(NcclGinBackend backend) {
             return "proxy";
         case NcclGinBackend::kGdaki:
             return "gdaki";
+        case NcclGinBackend::kGpi:
+            return "gpi";
         case NcclGinBackend::kNone:
         default:
             return "none";
