@@ -107,6 +107,7 @@ void MooncakeWorker::startWorker() {
                         rankToTaskId[i][j] = kInvalidTaskId;
                     }
                     std::vector<TransferRequest> entries;
+                    entries.reserve(group->maxGroupSize);
                     for (int j = 0; j < group->maxGroupSize; ++j) {
                         if (!group->activeRanks[j] ||
                             task_failed_tensor_[i][j].item<int>()) {
@@ -252,6 +253,7 @@ void MooncakeWorker::startWorker() {
                         rankToTaskId[i][j] = kInvalidTaskId;
                     }
                     std::vector<TransferRequest> entries;
+                    entries.reserve(group->maxGroupSize);
                     for (int j = 0; j < group->maxGroupSize; ++j) {
                         if (!group->activeRanks[j] ||
                             task_failed_tensor_[i][j].item<int>()) {
@@ -345,13 +347,6 @@ void MooncakeWorker::startWorker() {
                                 }
                             }
                             if (has_any_attempted) {
-                                std::string raw_att, raw_fail;
-                                for (int j = 0; j < group->maxGroupSize; ++j) {
-                                    int att = att_tensor[j].item<int>();
-                                    int fail = fail_tensor[j].item<int>();
-                                    raw_att += std::to_string(att) + " ";
-                                    raw_fail += std::to_string(fail) + " ";
-                                }
                                 std::vector<uint8_t> attempted(kMaxNumRanks, 0);
                                 std::vector<uint8_t> failed(kMaxNumRanks, 0);
                                 for (int j = 0; j < group->maxGroupSize; ++j) {

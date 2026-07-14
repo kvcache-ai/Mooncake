@@ -14,6 +14,7 @@
 #include <mutex>
 #include <random>
 #include <unordered_map>
+#include <vector>
 #include <unistd.h>
 #include "control_plane/types.h"
 #include "memory_location.h"
@@ -271,8 +272,9 @@ MooncakeBackend::MooncakeBackend(
     meta_->backend = this;
     p2p_proxy_->bindMeta(meta_);
 
-    // active ranks will be filled by applyViewUpdate, so here we just
-    // allocate them without initialization.
+    // active ranks will be filled by applyViewUpdate,
+    // so here we just allocate them without initialization.
+    meta_->maybeActivatable = new bool[max_group_size_]{};
     if (isCpu) {
         meta_->activeRanks = new bool[max_group_size_]{};
     } else {
@@ -335,7 +337,7 @@ MooncakeBackend::MooncakeBackend(
     initial_group.rank_order = std::move(initial_rank_order);
     initial_group.members.resize(ctx_.max_world_size);
     for (GlobalRank r : initial_group.rank_order) {
-        initial_group.members[r].status = GroupMemberStatus::Active;
+        initial_group.members[r].status = GroupMemberState::Active;
     }
     bool auto_deactivate = [&]() -> bool {
         if (options_) return options_->autoDeactivateOnFailure_;
@@ -365,8 +367,6 @@ MooncakeBackend::MooncakeBackend(
 
     auto view =
         agent_.waitUntilGroupReady(meta_->group_id, std::chrono::seconds(30));
-
-    applyViewUpdate(view);
 
     // Initialize all peer segment IDs from the LinkManager.
     // Subsequent updates (endpoint changes, disconnects) are handled by
@@ -418,14 +418,12 @@ c10::intrusive_ptr<c10d::Work> MooncakeP2PShim::barrier(
 }
 
 void MooncakeBackend::prepareOp(c10d::OpType op) const {
-    TORCH_CHECK(agent_.getRankState(meta_->globalRank) != RankState::Offline,
+    TORCH_CHECK(meta_->rankStates[meta_->globalRank] != RankState::Offline,
                 "Rank ", meta_->globalRank,
                 " is Offline. Cannot perform operations.");
     // P2P operations don't require the rank to be active in the group.
     if (op != c10d::OpType::SEND && op != c10d::OpType::RECV) {
-        TORCH_CHECK(agent_.isRankActive(meta_->group_id,
-                                        static_cast<InGroupRank>(rank_)),
-                    "Rank ", meta_->globalRank,
+        TORCH_CHECK(meta_->activeRanks[rank_], "Rank ", meta_->globalRank,
                     " is not active in this group. "
                     "Cannot perform collective operations.");
     }
@@ -1003,6 +1001,7 @@ void MooncakeBackend::shutdown() {
                 cudaFree(recv_buffer_[i]);
             }
         }
+        delete[] meta_->maybeActivatable;
         if (isCpu_) {
             delete[] meta_->activeRanks;
         } else {
@@ -1010,6 +1009,7 @@ void MooncakeBackend::shutdown() {
         }
         meta_->activeRanks = nullptr;
         meta_->activeRanksDevice = nullptr;
+        meta_->maybeActivatable = nullptr;
     }
 
     // Prevent zombie P2PProxy workers from dereferencing this backend after
@@ -1043,25 +1043,28 @@ void MooncakeBackend::extendGroupSizeTo(int newSize) {
 }
 
 int MooncakeBackend::getNumSyncedRanks() {
-    if (!meta_) return 0;
+    if (!meta_ || !meta_->maybeActivatable) return 0;
     int count = 0;
     for (int i = 0; i < meta_->maxGroupSize; ++i) {
-        if (agent_.maybeActivatable(meta_->group_id, i)) ++count;
+        if (meta_->maybeActivatable[i]) ++count;
     }
     return count;
 }
 
 std::vector<bool> MooncakeBackend::getPeerState(const std::vector<int>& ranks) {
+    if (!meta_ || !meta_->maybeActivatable)
+        return std::vector(ranks.size(), false);
     std::vector<bool> output;
     output.reserve(ranks.size());
     for (const int rank : ranks) {
-        output.push_back(agent_.maybeActivatable(meta_->group_id, rank));
+        output.push_back(meta_->maybeActivatable[rank]);
     }
     return output;
 }
 
-void MooncakeBackend::recoverRanks(const std::vector<int>& ranks) {
-    activateRanks(ranks);
+ProposeViewUpdateResponse MooncakeBackend::recoverRanks(
+    const std::vector<int>& ranks) {
+    return activateRanks(ranks);
 }
 
 ProposeViewUpdateResponse MooncakeBackend::activateRanks(
@@ -1108,7 +1111,9 @@ SyncAfterFailureResponse MooncakeBackend::syncAfterFailure() {
     return agent_.syncAfterFailure(meta_->group_id);
 }
 
-void MooncakeBackend::applyViewUpdate(const GroupView& view) {
+void MooncakeBackend::applyViewUpdate(const GroupView& view,
+                                      const std::vector<RankState>& rank_states,
+                                      const std::vector<bool>& activatable) {
     if (!meta_) return;
 
     // Ignore stale views that arrive out of order
@@ -1142,6 +1147,16 @@ void MooncakeBackend::applyViewUpdate(const GroupView& view) {
         if (member.endpoint.has_value()) {
             meta_->segmentInfos[local_rank] = *member.endpoint;
         }
+    }
+
+    // Rank states
+    for (size_t i = 0; i < rank_states.size(); ++i) {
+        meta_->rankStates[i] = rank_states[i];
+    }
+
+    // Best-effort Activatable
+    for (size_t i = 0; i < activatable.size(); ++i) {
+        meta_->maybeActivatable[i] = activatable[i];
     }
 
     // Keep the Python-visible activeRanksTensor in sync with the view.

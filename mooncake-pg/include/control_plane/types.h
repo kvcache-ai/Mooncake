@@ -50,7 +50,7 @@ struct GroupEndpointInfo {
 };
 
 // Membership state of one rank inside a single GroupView.
-enum class GroupMemberStatus : uint8_t {
+enum class GroupMemberState : uint8_t {
     None = 0,      // slot has never belonged to this group
     Left = 1,      // explicitly left the group (called destroy_group)
     Inactive = 2,  // inactive member
@@ -59,17 +59,17 @@ enum class GroupMemberStatus : uint8_t {
 
 // Rank state inside a single GroupView.
 struct GroupMember {
-    GroupMemberStatus status = GroupMemberStatus::None;
+    GroupMemberState status = GroupMemberState::None;
     std::optional<GroupEndpointInfo> endpoint;
     // session that published endpoint
     std::optional<uint64_t> agent_session_epoch;
 
-    bool isActive() const { return status == GroupMemberStatus::Active; }
+    bool isActive() const { return status == GroupMemberState::Active; }
     bool isMember() const {
-        return status == GroupMemberStatus::Active ||
-               status == GroupMemberStatus::Inactive;
+        return status == GroupMemberState::Active ||
+               status == GroupMemberState::Inactive;
     }
-    bool hasLeft() const { return status == GroupMemberStatus::Left; }
+    bool hasLeft() const { return status == GroupMemberState::Left; }
     bool hasEndpoint() const { return endpoint.has_value(); }
 };
 

@@ -66,7 +66,7 @@ void AgentHost::start() {
         rpc_impl_.get());
     bool server_started = rpc_server_->start();
     if (!server_started) {
-        LOG(ERROR) << "AgentHost: failed to start RPC server rank=" << rank_;
+        LOG(FATAL) << "AgentHost: failed to start RPC server rank=" << rank_;
     }
 
     BackoffWaiter waiter(BackoffWaiterConfig::constantSleep(
@@ -101,8 +101,10 @@ void AgentHost::start() {
 void AgentHost::shutdown() {
     if (rpc_server_) rpc_server_->shutdown();
     executor_.shutdown();
-    if (rpc_client_) rpc_client_->shutdown();
-    if (rpc_client_) rpc_client_.reset();
+    if (rpc_client_) {
+        rpc_client_->shutdown();
+        rpc_client_.reset();
+    }
     link_manager_.setEventCallback(nullptr);
 }
 
@@ -340,12 +342,14 @@ void AgentHost::postViewUpdate(coro_rpc::context<ViewUpdateAck> ctx,
 
     executor_.post([this, ctx = std::move(ctx), push = std::move(push),
                     group_id, epoch]() mutable {
-        runEffects(agent_.handleViewUpdate(push));
-        ctx.response_msg(ViewUpdateAck{.rank = rank_,
-                                       .group_id = group_id,
-                                       .epoch = epoch,
-                                       .applied = true,
-                                       .error_msg = ""});
+        auto [effects, applied] = agent_.handleViewUpdate(push);
+        runEffects(std::move(effects));
+        ctx.response_msg(
+            ViewUpdateAck{.rank = rank_,
+                          .group_id = group_id,
+                          .epoch = epoch,
+                          .applied = applied,
+                          .error_msg = applied ? "" : "group not found"});
     });
 }
 
@@ -401,8 +405,9 @@ void AgentHost::startAgentRegistration() {
                         agent_registration_promises_.clear();
                     }
 
-                    // Re-publish all local backends' endpoints after (re-)reg.
-                    // (Old session endpoints were cleared by Coordinator.)
+                    // Re-publish all local backends' endpoints after
+                    // (re-)reg. (Old session endpoints were cleared by
+                    // Coordinator.)
                     forEachBackend([&](auto backend) {
                         sendPublishEndpointRpc(
                             backend->buildEndpointMetadata());
@@ -426,13 +431,15 @@ void AgentHost::startAgentRegistration() {
                                      : "") +
                                 " since last print)";
                         }
-                        LOG(ERROR)
-                            << "AgentHost: registerAgent failed: "
-                            << resp.reject_reason
-                            << " (will retry after heartbeat interval; if this "
-                               "persists, the Coordinator may be rejecting a "
-                               "replacement rank before the old one times out)"
-                            << suppressed_msg;
+                        LOG(ERROR) << "AgentHost: registerAgent failed: "
+                                   << resp.reject_reason
+                                   << " (will retry after heartbeat "
+                                      "interval; if this "
+                                      "persists, the Coordinator may be "
+                                      "rejecting a "
+                                      "replacement rank before the old one "
+                                      "times out)"
+                                   << suppressed_msg;
                         last_agent_register_error_log_time_ = now;
                         agent_register_error_log_suppressed_ = 0;
                     } else {
@@ -507,9 +514,6 @@ void AgentHost::runEffects(const AgentApplyResult& effects) {
                 [this](const StopReconnect& e) {
                     link_manager_.stopReconnect(e.peer);
                 },
-                [this](const ClearPeerMetadata& e) {
-                    link_manager_.publishLinkDown(e.peer);
-                },
                 [this](const RefreshPeerLink& e) {
                     link_manager_.refreshPeerSegment(e.peer);
                 },
@@ -542,7 +546,8 @@ void AgentHost::runEffects(const AgentApplyResult& effects) {
                 },
                 [this](const ApplyViewToBackend& e) {
                     withBackend(e.group_id, [&](auto backend) {
-                        backend->applyViewUpdate(e.view);
+                        backend->applyViewUpdate(e.view, e.rank_states,
+                                                 e.activatable);
                     });
                 },
                 [this](const NotifyGroupReady& e) {

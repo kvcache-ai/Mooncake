@@ -1,8 +1,8 @@
 #include "control_plane/coordinator.h"
 
 #include <algorithm>
+#include <cassert>
 #include <limits>
-#include <numeric>
 #include <set>
 
 #include <glog/logging.h>
@@ -94,9 +94,11 @@ CentralizedCoordinatorStateMachine::handleRegisterAgent(
     for (int32_t i = 0; i < max_world_size_; ++i) {
         resp.all_rank_states[i] = ranks_[i].state;
     }
+    resp.groups.reserve(group_views_.size());
     for (const auto& [gid, view] : group_views_) {
         resp.groups.push_back(view);
     }
+    resp.rank_connections.reserve(max_world_size_);
     for (int32_t i = 0; i < max_world_size_; ++i) {
         if (i == req.rank) continue;
         if (ranks_[i].state == RankState::Offline) continue;
@@ -166,7 +168,7 @@ CentralizedCoordinatorStateMachine::handleUnregisterGroup(
         return result;
     }
 
-    member.status = GroupMemberStatus::Left;
+    member.status = GroupMemberState::Left;
     member.agent_session_epoch = std::nullopt;
     member.endpoint = std::nullopt;
     view.epoch++;
@@ -239,7 +241,6 @@ CentralizedCoordinatorStateMachine::handleProposeViewUpdate(
     }
 
     GroupView& view = it->second;
-    GroupView old_view = view;
     bool changed = false;
 
     // Reject stale or offline proposer.
@@ -265,6 +266,9 @@ CentralizedCoordinatorStateMachine::handleProposeViewUpdate(
         }
     }
 
+    // Snapshot old view before mutating
+    GroupView old_view = view;
+
     if (req.is_activation) {
         // Check activatable before applying changes.
         // rank_order is managed exclusively in processGroupRegistration.
@@ -285,13 +289,13 @@ CentralizedCoordinatorStateMachine::handleProposeViewUpdate(
 
         // Apply.
         for (GlobalRank rank : req.requested_ranks) {
-            view.members[rank].status = GroupMemberStatus::Active;
+            view.members[rank].status = GroupMemberState::Active;
         }
     } else {
         // deactivate
         for (GlobalRank rank : req.requested_ranks) {
             if (view.members[rank].isActive()) {
-                view.members[rank].status = GroupMemberStatus::Inactive;
+                view.members[rank].status = GroupMemberState::Inactive;
                 view.members[rank].agent_session_epoch = std::nullopt;
                 view.members[rank].endpoint = std::nullopt;
                 changed = true;
@@ -309,9 +313,7 @@ CentralizedCoordinatorStateMachine::handleProposeViewUpdate(
 
     auto required_acks = computeBarrierAckSet(old_view, view, req.group_id);
     pending_barriers_[req.group_id][view.epoch] = PendingViewUpdateBarrier{
-        req.group_id, view.epoch,
-        std::unordered_set<GlobalRank>(required_acks.begin(),
-                                       required_acks.end()),
+        req.group_id, view.epoch, std::move(required_acks),
         std::chrono::steady_clock::now() + kProposeTimeout,
         PendingViewUpdateBarrier::ProposalCommit{
             propose_id, {ViewUpdateStatus::Applied, view.epoch, {}, ""}}};
@@ -333,7 +335,7 @@ CentralizedCoordinatorStateMachine::handleTransferObservation(
                                               req.failed_ranks_hint);
 
     if (has_negative) {
-        LOG(INFO) << "[COORD] TransferObservation has negative → opening "
+        LOG(INFO) << "[COORD] TransferObservation has negative -> opening "
                      "reconciliation window";
         tryOpenReconciliationWindow();
     }
@@ -557,9 +559,9 @@ void CentralizedCoordinatorStateMachine::transitionToOffline(
     for (auto& [group_id, view] : group_views_) {
         if (!view.auto_deactivate) continue;
         auto& member = view.members[rank];
-        if (member.status != GroupMemberStatus::Active) continue;
+        if (member.status != GroupMemberState::Active) continue;
 
-        member.status = GroupMemberStatus::Inactive;
+        member.status = GroupMemberState::Inactive;
         member.agent_session_epoch = std::nullopt;
         member.endpoint = std::nullopt;
         view.epoch++;
@@ -575,6 +577,7 @@ void CentralizedCoordinatorStateMachine::transitionToOffline(
 
 bool CentralizedCoordinatorStateMachine::isMutuallyConnected(
     GlobalRank a, GlobalRank b) const {
+    assert(rankInRange(a) && rankInRange(b));
     if (a == b) return true;
     if (ranks_[a].state == RankState::Offline ||
         ranks_[b].state == RankState::Offline)
@@ -697,7 +700,7 @@ void CentralizedCoordinatorStateMachine::applyAutoDeactivate(
             bool in_healthy = std::find(healthy_set.begin(), healthy_set.end(),
                                         i) != healthy_set.end();
             if (!in_healthy) {
-                view.members[i].status = GroupMemberStatus::Inactive;
+                view.members[i].status = GroupMemberState::Inactive;
                 view.members[i].agent_session_epoch = std::nullopt;
                 view.members[i].endpoint = std::nullopt;
                 deactivated_ranks.push_back(i);
@@ -806,9 +809,7 @@ void CentralizedCoordinatorStateMachine::checkGroupTransitions(
                 auto required_acks = computeBarrierAckSet(view, view, group_id);
                 pending_barriers_[group_id][view.epoch] =
                     PendingViewUpdateBarrier{
-                        group_id, view.epoch,
-                        std::unordered_set<GlobalRank>(required_acks.begin(),
-                                                       required_acks.end()),
+                        group_id, view.epoch, std::move(required_acks),
                         std::nullopt,
                         PendingViewUpdateBarrier::BootstrapCommit{}};
 
@@ -854,7 +855,7 @@ bool CentralizedCoordinatorStateMachine::processGroupRegistration(
         view.rank_order = group.rank_order;
         view.members.resize(max_world_size_);
         for (GlobalRank r : group.rank_order) {
-            view.members[r].status = GroupMemberStatus::Active;
+            view.members[r].status = GroupMemberState::Active;
         }
         view.status = GroupStatus::Bootstrapping;
         group_views_[group_id] = std::move(view);
@@ -897,8 +898,8 @@ bool CentralizedCoordinatorStateMachine::processGroupRegistration(
     // so that pushViewUpdate() will deliver the authoritative view to it.
     auto& view = group_views_[group_id];
     if (rankInRange(joining_rank) &&
-        view.members[joining_rank].status == GroupMemberStatus::None) {
-        view.members[joining_rank].status = GroupMemberStatus::Inactive;
+        view.members[joining_rank].status == GroupMemberState::None) {
+        view.members[joining_rank].status = GroupMemberState::Inactive;
     }
 
     // A Ready group that receives a registerGroup should push the authoritative
@@ -918,8 +919,8 @@ bool CentralizedCoordinatorStateMachine::canEraseGroup(
     const GroupView& view) const {
     return std::all_of(view.members.begin(), view.members.end(),
                        [](const GroupMember& m) {
-                           return m.status == GroupMemberStatus::None ||
-                                  m.status == GroupMemberStatus::Left;
+                           return m.status == GroupMemberState::None ||
+                                  m.status == GroupMemberState::Left;
                        });
 }
 
@@ -955,7 +956,7 @@ void CentralizedCoordinatorStateMachine::eraseGroup(
 
 CoordinatorEffect CentralizedCoordinatorStateMachine::makeRankStateEffect(
     GlobalRank rank) {
-    return RankStateUpdatePush{rank, static_cast<uint8_t>(ranks_[rank].state)};
+    return RankStateUpdatePush{rank, ranks_[rank].state};
 }
 
 void CentralizedCoordinatorStateMachine::commitBarrier(
@@ -1020,20 +1021,9 @@ void CentralizedCoordinatorStateMachine::rejectPendingSyncs(
     auto group_it = pending_syncs_.find(group_id);
     if (group_it == pending_syncs_.end()) return;
 
-    SyncAfterFailureResponse resp;
-    resp.status = SyncAfterFailureStatus::Rejected;
-    resp.reject_reason = reason;
-    auto view_it = group_views_.find(group_id);
-    if (view_it != group_views_.end()) {
-        resp.new_epoch = view_it->second.epoch;
+    for (const auto& [rank, _] : group_it->second) {
+        rejectPendingSyncs(group_id, rank, reason, effects);
     }
-
-    for (auto& [rank, sync_ids] : group_it->second) {
-        for (uint64_t sync_id : sync_ids) {
-            effects.push_back(ReplySyncEffect{sync_id, resp});
-        }
-    }
-    pending_syncs_.erase(group_it);
 }
 
 // computeBarrierAckSet -- ranks that must ACK before a proposal/bootstrap

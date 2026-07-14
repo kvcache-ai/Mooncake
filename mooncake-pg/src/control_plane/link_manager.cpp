@@ -303,8 +303,8 @@ void LinkManager::pollerLoop() {
                 if (link.state == PeerLinkState::Connected) continue;
                 if (now < link.next_probe_time) continue;
 
-                // Schedule next probe attempt with short delay.
-                link.next_probe_time = now + std::chrono::milliseconds(100);
+                // Schedule next probe attempt with exponential backoff.
+                link.next_probe_time = now + link.probe_backoff;
                 to_probe = peer;
                 break;  // probe one per iteration
             }

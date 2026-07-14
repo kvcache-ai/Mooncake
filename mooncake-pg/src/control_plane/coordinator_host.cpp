@@ -66,7 +66,7 @@ CoordinatorHost::CoordinatorHost(c10::intrusive_ptr<c10d::Store> store,
       max_world_size_(max_world_size),
       rpc_client_(std::make_unique<RpcClient>()) {}
 
-CoordinatorHost::~CoordinatorHost() {}
+CoordinatorHost::~CoordinatorHost() { shutdown(); }
 
 void CoordinatorHost::start() {
     rpc_server_ = std::make_unique<RpcServer>(/*port=*/0, /*thread_num=*/2);
@@ -83,7 +83,10 @@ void CoordinatorHost::start() {
                           &CoordinatorRpcService::syncAfterFailure>(
             rpc_impl_.get());
 
-    rpc_server_->start();
+    bool server_started = rpc_server_->start();
+    if (!server_started) {
+        LOG(FATAL) << "CoordinatorHost: failed to start RPC server";
+    }
 
     std::string addr = rpc_server_->getListenAddr(host_ip_);
     store_->set("coordinator_addr", addr);
@@ -99,6 +102,7 @@ void CoordinatorHost::start() {
 void CoordinatorHost::shutdown() {
     if (rpc_server_) rpc_server_->shutdown();
     executor_.shutdown();
+
     for (auto& [propose_id, ctx] : pending_rpcs_) {
         ctx.response_msg(ProposeViewUpdateResponse{
             ViewUpdateStatus::Rejected, 0, {}, "coordinator shutting down"});
@@ -110,6 +114,8 @@ void CoordinatorHost::shutdown() {
             SyncAfterFailureStatus::Rejected, 0, "coordinator shutting down"});
     }
     pending_sync_ctxs_.clear();
+
+    if (rpc_client_) rpc_client_->shutdown();
 }
 
 void CoordinatorHost::postRegisterAgent(
@@ -255,8 +261,8 @@ void CoordinatorHost::pushViewUpdate(const ViewUpdateEffect& effect) {
 
     for (int32_t i = 0; i < max_world_size_; ++i) {
         const auto& member = effect.view.members[i];
-        if (member.status == GroupMemberStatus::None ||
-            member.status == GroupMemberStatus::Left) {
+        if (member.status == GroupMemberState::None ||
+            member.status == GroupMemberState::Left) {
             continue;
         }
 

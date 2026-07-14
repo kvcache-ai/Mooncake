@@ -21,7 +21,8 @@ class AgentStateMachine {
 
     AgentApplyResult handlePeerJoined(const PeerJoinedPush& push);
     AgentApplyResult handleRankStateUpdate(const RankStateUpdatePush& push);
-    AgentApplyResult handleViewUpdate(const ViewUpdatePush& push);
+    std::pair<AgentApplyResult, bool> handleViewUpdate(
+        const ViewUpdatePush& push);
     AgentApplyResult handleLinkStateChange(GlobalRank peer, bool connected);
 
     HeartbeatRequest buildHeartbeat() const;
@@ -60,16 +61,6 @@ class AgentStateMachine {
         return agent_session_epoch_.load(std::memory_order_acquire);
     }
 
-    RankState getRankState(GlobalRank rank) const {
-        return static_cast<RankState>(
-            global_rank_states_[rank].load(std::memory_order_acquire));
-    }
-
-    bool isRankActive(GroupId group_id, InGroupRank rank) const;
-
-    // Best-effort local estimate: Healthy && isMember && hasEndpoint.
-    bool maybeActivatable(GroupId group_id, InGroupRank rank) const;
-
    private:
     GlobalRank rank_;
     int max_world_size_;
@@ -79,15 +70,10 @@ class AgentStateMachine {
 
     std::unordered_map<GroupId, GroupView> groups_;
 
-    std::vector<std::atomic<uint8_t>> global_rank_states_;
+    std::vector<RankState> global_rank_states_;
     std::vector<bool> link_connected_;
     std::vector<bool> last_reported_peer_status_;
     std::vector<std::optional<RankConnectionMetadata>> rank_connections_;
-
-    std::unordered_map<GroupId, std::vector<std::atomic<bool>>>
-        maybe_activatable_;
-
-    std::unordered_map<GroupId, std::vector<std::atomic<bool>>> group_active_;
 
     CoordinatorConnection coordinator_connection_ =
         CoordinatorConnection::Disconnected;
@@ -95,9 +81,6 @@ class AgentStateMachine {
     bool rankInRange(GlobalRank rank) const {
         return 0 <= rank && rank < max_world_size_;
     }
-
-    void updateMaybeActivatable(GroupId group_id, InGroupRank rank);
-    void updateActive(GroupId group_id, InGroupRank rank);
 };
 
 }  // namespace mooncake

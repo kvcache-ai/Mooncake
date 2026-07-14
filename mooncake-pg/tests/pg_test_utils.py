@@ -528,7 +528,7 @@ class MultiProcessTestCase(unittest.TestCase):
         if not failures:
             return
 
-        healthy_ranks = sorted(
+        succeeded_ranks = sorted(
             r.get("rank", "?") for r in rows if r.get("ok", False)
         )
         failed_ranks = sorted(
@@ -539,7 +539,7 @@ class MultiProcessTestCase(unittest.TestCase):
             f"\n{'='*60}",
             f"RANK ERROR REPORT ({len(failures)} failure(s))",
             f"{'='*60}",
-            f"Healthy ranks: {healthy_ranks or '(none)'}",
+            f"Succeeded ranks: {succeeded_ranks or '(none)'}",
             f"Failed ranks: {failed_ranks or '(none)'}",
             f"{'-'*60}",
             "Failures:",

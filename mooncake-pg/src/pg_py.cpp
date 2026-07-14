@@ -15,7 +15,6 @@ namespace py = pybind11;
 
 namespace mooncake {
 
-// Process-level context -- definition in mooncake_backend.h.
 static MooncakeProcessContext g_ctx;
 
 MooncakeProcessContext::MooncakeProcessContext() {
@@ -163,42 +162,33 @@ std::vector<bool> getPeerState(c10::intrusive_ptr<c10d::ProcessGroup> backend,
     return mooncakeBackend->getPeerState(ranks);
 }
 
-void recoverRanks(c10::intrusive_ptr<c10d::ProcessGroup> backend,
-                  const std::vector<int>& ranks) {
+ProposeViewUpdateResponse recoverRanks(
+    c10::intrusive_ptr<c10d::ProcessGroup> backend,
+    const std::vector<int>& ranks) {
     auto mooncakeBackend =
         c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
-    mooncakeBackend->recoverRanks(ranks);
+    return mooncakeBackend->recoverRanks(ranks);
 }
 
-void deactivateRank(c10::intrusive_ptr<c10d::ProcessGroup> backend,
-                    const std::vector<int>& ranks) {
+ProposeViewUpdateResponse deactivateRanks(
+    c10::intrusive_ptr<c10d::ProcessGroup> backend,
+    const std::vector<int>& ranks) {
     auto mooncakeBackend =
         c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
-    auto resp = mooncakeBackend->deactivateRanks(ranks);
-    if (resp.status == ViewUpdateStatus::Rejected) {
-        throw std::runtime_error("deactivate_rank rejected: " +
-                                 resp.reject_reason);
-    }
+    return mooncakeBackend->deactivateRanks(ranks);
 }
 
-void activateRank(c10::intrusive_ptr<c10d::ProcessGroup> backend,
-                  const std::vector<int>& ranks) {
+ProposeViewUpdateResponse activateRanks(
+    c10::intrusive_ptr<c10d::ProcessGroup> backend,
+    const std::vector<int>& ranks) {
     auto mooncakeBackend =
         c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
-    auto resp = mooncakeBackend->activateRanks(ranks);
-    if (resp.status == ViewUpdateStatus::Rejected) {
-        throw std::runtime_error("activate_rank rejected: " +
-                                 resp.reject_reason);
-    }
+    return mooncakeBackend->activateRanks(ranks);
 }
 
 void joinGroup(c10::intrusive_ptr<c10d::ProcessGroup> backend) {
     auto mooncakeBackend =
         c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
-    if (!mooncakeBackend) {
-        throw std::runtime_error(
-            "join_group: backend is null (C++ object was destroyed)");
-    }
     mooncakeBackend->joinGroup();
 }
 
@@ -284,8 +274,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("extend_group_size_to", &extendGroupSizeTo);
     m.def("get_peer_state", &getPeerState);
     m.def("recover_ranks", &recoverRanks);
-    m.def("activate_rank", &activateRank);
-    m.def("deactivate_rank", &deactivateRank, py::arg("backend"),
+    m.def("activate_ranks", &activateRanks);
+    m.def("deactivate_ranks", &deactivateRanks, py::arg("backend"),
           py::arg("ranks"));
     m.def("join_group", &joinGroup);
     m.def("get_failed_ranks_hint", &getFailedRanksHint, py::arg("work"));
@@ -301,20 +291,34 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         [](c10::intrusive_ptr<c10d::ProcessGroup> backend) {
             auto mooncakeBackend =
                 c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
-            SyncAfterFailureResponse resp = mooncakeBackend->syncAfterFailure();
-            py::dict result;
-            result["status"] = static_cast<uint8_t>(resp.status);
-            result["new_epoch"] = resp.new_epoch;
-            result["reject_reason"] = resp.reject_reason;
-            return result;
+            return mooncakeBackend->syncAfterFailure();
         },
-        py::arg("backend"),
-        "Notify the Coordinator of a detected failure and block until a "
-        "membership decision has been made and the Agent has locally applied "
-        "the resulting ViewUpdate.  After this returns, get_peer_state() "
-        "reflects the Coordinator's authoritative decision.  Returns a dict "
-        "with keys: status (0=decision_applied, 1=no_change, 2=rejected), "
-        "new_epoch, reject_reason.");
+        py::arg("backend"));
+
+    py::enum_<SyncAfterFailureStatus>(m, "SyncAfterFailureStatus")
+        .value("DecisionApplied", SyncAfterFailureStatus::DecisionApplied)
+        .value("NoChange", SyncAfterFailureStatus::NoChange)
+        .value("Rejected", SyncAfterFailureStatus::Rejected);
+
+    py::enum_<ViewUpdateStatus>(m, "ViewUpdateStatus")
+        .value("Rejected", ViewUpdateStatus::Rejected)
+        .value("Applied", ViewUpdateStatus::Applied)
+        .value("AppliedWithDroppedRanks",
+               ViewUpdateStatus::AppliedWithDroppedRanks);
+
+    py::class_<SyncAfterFailureResponse>(m, "SyncAfterFailureResponse")
+        .def_readonly("status", &SyncAfterFailureResponse::status)
+        .def_readonly("new_epoch", &SyncAfterFailureResponse::new_epoch)
+        .def_readonly("reject_reason",
+                      &SyncAfterFailureResponse::reject_reason);
+
+    py::class_<ProposeViewUpdateResponse>(m, "ProposeViewUpdateResponse")
+        .def_readonly("status", &ProposeViewUpdateResponse::status)
+        .def_readonly("new_epoch", &ProposeViewUpdateResponse::new_epoch)
+        .def_readonly("dropped_ranks",
+                      &ProposeViewUpdateResponse::dropped_ranks)
+        .def_readonly("reject_reason",
+                      &ProposeViewUpdateResponse::reject_reason);
 
     py::class_<MooncakeBackend::MooncakeBackendOptions,
                c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>>(

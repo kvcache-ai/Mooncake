@@ -91,15 +91,7 @@ class AgentInterface {
 
     virtual SyncAfterFailureResponse syncAfterFailure(GroupId group_id) = 0;
 
-    // Accessors.
     virtual uint64_t getAgentSessionEpoch() = 0;
-
-    virtual RankState getRankState(GlobalRank rank) = 0;
-
-    virtual bool isRankActive(GroupId group_id, InGroupRank rank) = 0;
-
-    // Best-effort: Healthy + isMember + hasEndpoint
-    virtual bool maybeActivatable(GroupId group_id, InGroupRank rank) = 0;
 };
 
 class AgentHost;
@@ -160,18 +152,8 @@ class AgentHost : public AgentInterface {
 
     SyncAfterFailureResponse syncAfterFailure(GroupId group_id) override;
 
-    // Accessors.
     uint64_t getAgentSessionEpoch() override {
         return agent_.getAgentSessionEpoch();
-    }
-    RankState getRankState(GlobalRank rank) override {
-        return agent_.getRankState(rank);
-    }
-    bool isRankActive(GroupId group_id, InGroupRank rank) override {
-        return agent_.isRankActive(group_id, rank);
-    }
-    bool maybeActivatable(GroupId group_id, InGroupRank rank) override {
-        return agent_.maybeActivatable(group_id, rank);
     }
     void postPeerJoined(PeerJoinedPush push);
     void postRankStateUpdate(RankStateUpdatePush push);

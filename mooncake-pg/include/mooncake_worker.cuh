@@ -52,6 +52,8 @@ struct TransferGroupMeta {
 #if !defined(__MUSA__)
     at::Tensor activeRanksTensor;
 #endif
+    bool* maybeActivatable;
+    RankState rankStates[kMaxNumRanks];  // per GlobalRank
     TransferEngine* engine;
     TransferMetadata::SegmentID segmentIDs[kMaxNumRanks];
     GroupEndpointInfo segmentInfos[kMaxNumRanks];

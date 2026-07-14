@@ -15,7 +15,7 @@ bool RpcServer::start() {
     // thread.
     auto fut = server_->async_start();
     if (fut.hasResult()) {
-        // Listen failed — the future resolved immediately.
+        // Listen failed - the future resolved immediately.
         auto ec = std::move(fut).get();
         LOG(ERROR) << "RpcServer: failed to start: " << ec.message();
         return false;
@@ -94,13 +94,12 @@ bool RpcClient::isConnected(const std::string& addr) const {
 bool RpcClient::tryReconnect(const std::string& addr) {
     // Evict the old entry under the lock.  In-flight coroutines may still
     // hold shared_ptr copies of the old client, so it stays alive until
-    // they complete — no use-after-free.
+    // they complete - no use-after-free.
     {
         std::lock_guard<std::mutex> lock(state_->mutex);
         state_->clients.erase(addr);
     }
 
-    // Reconnect (sync context — use syncAwait).
     coro_rpc::coro_rpc_client::config config;
     config.connect_timeout_duration = std::chrono::seconds(3);
 

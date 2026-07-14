@@ -56,7 +56,9 @@ def _extension_worker(
             poll_interval_s=0.01,
             description=f"rank {ctx.proc_rank} waiting for joiner ready",
         )
-        pg.recover_ranks(backend, join_ranks)
+        resp = pg.recover_ranks(backend, join_ranks)
+        assert resp.status == pg.ViewUpdateStatus.Applied, \
+            f"rank {ctx.proc_rank}: recover_ranks should apply, got {resp.status}"
 
         # Final collective
         final_tensor = torch.tensor([ctx.proc_rank + 1], dtype=torch.int32, device=device)
@@ -75,7 +77,7 @@ def _extension_worker(
         device = ctx.init_group(
             rank=extension_rank,
             world_size=ctx.world_size,
-                        max_group_size=ctx.world_size,
+            max_group_size=ctx.world_size,
         )
 
         backend = ctx.get_backend()
@@ -125,7 +127,9 @@ def _extension_p2p_worker(
             poll_interval_s=0.05,
             description=f"rank {ctx.proc_rank} waiting for joiner ready",
         )
-        pg.recover_ranks(backend, join_ranks)
+        resp = pg.recover_ranks(backend, join_ranks)
+        assert resp.status == pg.ViewUpdateStatus.Applied, \
+            f"rank {ctx.proc_rank}: recover_ranks should apply, got {resp.status}"
     else:
         if not extend_event.wait(timeout=30.0):
             raise TimeoutError("timed out waiting for extend_event")
@@ -133,16 +137,10 @@ def _extension_p2p_worker(
         device = ctx.init_group(
             rank=extension_rank,
             world_size=ctx.world_size,
-                        max_group_size=ctx.world_size,
+            max_group_size=ctx.world_size,
         )
         backend = ctx.get_backend()
         pg.join_group(backend)
-
-    # actual_ws_after = dist.get_world_size()
-    # assert actual_ws_after == ctx.world_size, (
-    #     f"rank {ctx.proc_rank}: world_size after recovery={actual_ws_after}, "
-    #     f"expected {ctx.world_size}"
-    # )
 
     # Prove elastic collectives are functional before isolating P2P.
     collective = torch.tensor([ctx.proc_rank + 1], dtype=torch.int32, device=device)
@@ -285,7 +283,9 @@ def _extension_worker_with_subgroups(
             poll_interval_s=0.05,
             description=f"rank {ctx.proc_rank} waiting for joiners",
         )
-        pg.recover_ranks(world_backend, join_ranks)
+        resp = pg.recover_ranks(world_backend, join_ranks)
+        assert resp.status == pg.ViewUpdateStatus.Applied, \
+            f"rank {ctx.proc_rank}: recover_ranks(world) should apply, got {resp.status}"
 
         # group_a: rank 0 waits for joiner (local rank 1 = global rank 2)
         if ctx.proc_rank == 0:
@@ -295,7 +295,9 @@ def _extension_worker_with_subgroups(
                 poll_interval_s=0.05,
                 description="rank 0 waiting for group_a joiner",
             )
-            pg.recover_ranks(a_backend, [1])
+            resp = pg.recover_ranks(a_backend, [1])
+            assert resp.status == pg.ViewUpdateStatus.Applied, \
+                f"rank 0: recover_ranks(group_a) should apply, got {resp.status}"
 
         # group_b: rank 1 waits for joiner (local rank 1 = global rank 3)
         if ctx.proc_rank == 1:
@@ -305,7 +307,9 @@ def _extension_worker_with_subgroups(
                 poll_interval_s=0.05,
                 description="rank 1 waiting for group_b joiner",
             )
-            pg.recover_ranks(b_backend, [1])
+            resp = pg.recover_ranks(b_backend, [1])
+            assert resp.status == pg.ViewUpdateStatus.Applied, \
+                f"rank 1: recover_ranks(group_b) should apply, got {resp.status}"
 
         # group_c: both primaries wait for both joiners (local ranks 2,3)
         wait_until(
@@ -314,7 +318,9 @@ def _extension_worker_with_subgroups(
             poll_interval_s=0.05,
             description=f"rank {ctx.proc_rank} waiting for group_c joiners",
         )
-        pg.recover_ranks(c_backend, [2, 3])
+        resp = pg.recover_ranks(c_backend, [2, 3])
+        assert resp.status == pg.ViewUpdateStatus.Applied, \
+            f"rank {ctx.proc_rank}: recover_ranks(group_c) should apply, got {resp.status}"
 
         # Post-activation: WORLD all 4 ranks → 1+2+3+4=10
         t = torch.tensor([ctx.proc_rank + 1], dtype=torch.int32, device=device)
@@ -509,7 +515,9 @@ def _allgather_reduce_scatter_extension_worker(
             poll_interval_s=0.05,
             description=f"rank {ctx.proc_rank} waiting for joiner",
         )
-        pg.recover_ranks(backend, join_ranks)
+        resp = pg.recover_ranks(backend, join_ranks)
+        assert resp.status == pg.ViewUpdateStatus.Applied, \
+            f"rank {ctx.proc_rank}: recover_ranks should apply, got {resp.status}"
 
         # Post-activation: all 4 ranks active.
         _run_allgather_reduce_scatter(device, ctx.world_size, ctx.proc_rank)
@@ -579,7 +587,9 @@ def _allgather_reduce_scatter_recovery_worker(
             poll_interval_s=2.0,
             description=f"rank {logical_rank} waiting for replacement",
         )
-        pg.recover_ranks(backend, [broken_rank])
+        resp = pg.recover_ranks(backend, [broken_rank])
+        assert resp.status == pg.ViewUpdateStatus.Applied, \
+            f"rank {logical_rank}: recover_ranks should apply, got {resp.status}"
 
         # Post-recovery: all 4 ranks active again.
         _run_allgather_reduce_scatter(device, ctx.world_size, logical_rank)
@@ -669,7 +679,9 @@ def _replacement_recovery_worker(
         )
 
         # All ranks call recover_ranks to include replacement
-        pg.recover_ranks(backend, [BROKEN_RANK])
+        resp = pg.recover_ranks(backend, [BROKEN_RANK])
+        assert resp.status == pg.ViewUpdateStatus.Applied, \
+            f"rank {logical_rank}: recover_ranks should apply, got {resp.status}"
 
         # Final collective with all 4 ranks
         tensor = torch.tensor([logical_rank], dtype=torch.int32, device=device)
@@ -764,7 +776,17 @@ def _manual_deactivate_worker(
     survivors_synced.wait()
 
     # Survivors deactivate the dead rank before issuing new collectives.
-    pg.deactivate_rank(backend, [BROKEN_RANK])
+    resp = pg.deactivate_ranks(backend, [BROKEN_RANK])
+    assert resp.status in (
+        pg.ViewUpdateStatus.Applied,
+        pg.ViewUpdateStatus.AppliedWithDroppedRanks,
+    ), f"rank {ctx.rank}: deactivate_ranks should apply, got {resp.status}"
+    # If ranks were dropped, they should only be the BROKEN_RANK
+    assert resp.status != pg.ViewUpdateStatus.AppliedWithDroppedRanks or set(
+        resp.dropped_ranks
+    ) == {
+        BROKEN_RANK
+    }, f"rank {ctx.rank}: unexpected dropped ranks {resp.dropped_ranks}"
 
     # Round 3: after deactivate, collective with reduced group succeeds.
     expected_reduced = expected_all - (BROKEN_RANK + 1)

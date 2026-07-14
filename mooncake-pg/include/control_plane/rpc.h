@@ -149,7 +149,7 @@ struct PeerJoinedPush {
 
 struct RankStateUpdatePush {
     GlobalRank rank = kInvalidGlobalRank;
-    uint8_t new_state = 0;
+    RankState new_state = RankState::Offline;
 };
 
 struct ViewUpdatePush {
@@ -201,10 +201,6 @@ struct StopReconnect {
     GlobalRank peer = kInvalidGlobalRank;
 };
 
-struct ClearPeerMetadata {
-    GlobalRank peer = kInvalidGlobalRank;
-};
-
 struct DisconnectAllLinks {};
 
 struct ClearAllPeerMetadata {};
@@ -212,6 +208,8 @@ struct ClearAllPeerMetadata {};
 struct ApplyViewToBackend {
     GroupId group_id;
     GroupView view;
+    std::vector<RankState> rank_states;
+    std::vector<bool> activatable;
 };
 
 struct NotifyTEUnreachable {
@@ -237,9 +235,9 @@ struct NotifyRanksActivated {
 
 using AgentEffect =
     std::variant<EnablePeerProbe, DisconnectLink, StopReconnect,
-                 ClearPeerMetadata, DisconnectAllLinks, ClearAllPeerMetadata,
-                 ApplyViewToBackend, NotifyTEUnreachable, RefreshPeerLink,
-                 NotifyLinkRefreshed, NotifyGroupReady, NotifyRanksActivated>;
+                 DisconnectAllLinks, ClearAllPeerMetadata, ApplyViewToBackend,
+                 NotifyTEUnreachable, RefreshPeerLink, NotifyLinkRefreshed,
+                 NotifyGroupReady, NotifyRanksActivated>;
 
 // Results produced by the Coordinator/Agent state machine
 

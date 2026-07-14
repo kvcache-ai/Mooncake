@@ -130,24 +130,21 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
 
         explicit MooncakeBackendOptions(at::Tensor activeRanks)
             : activeRanks_{activeRanks} {}
-        MooncakeBackendOptions(at::Tensor activeRanks, bool isExtension)
-            : activeRanks_{activeRanks}, isExtension_{isExtension} {}
-        MooncakeBackendOptions(at::Tensor activeRanks, bool isExtension,
+        MooncakeBackendOptions(at::Tensor activeRanks, bool /*isExtension*/)
+            : activeRanks_{activeRanks} {}
+        MooncakeBackendOptions(at::Tensor activeRanks, bool /*isExtension*/,
                                int maxGroupSize)
             : activeRanks_{activeRanks},
-              isExtension_{isExtension},
               maxGroupSize_{maxGroupSize > 0 ? maxGroupSize : -1} {}
-        MooncakeBackendOptions(at::Tensor activeRanks, bool isExtension,
+        MooncakeBackendOptions(at::Tensor activeRanks, bool /*isExtension*/,
                                int maxGroupSize, bool autoDeactivateOnFailure)
             : activeRanks_{activeRanks},
-              isExtension_{isExtension},
               maxGroupSize_{maxGroupSize > 0 ? maxGroupSize : -1},
               autoDeactivateOnFailure_{autoDeactivateOnFailure} {}
-        MooncakeBackendOptions(at::Tensor activeRanks, bool isExtension,
+        MooncakeBackendOptions(at::Tensor activeRanks, bool /*isExtension*/,
                                int maxGroupSize, bool autoDeactivateOnFailure,
                                bool autoSyncOnFailure)
             : activeRanks_{activeRanks},
-              isExtension_{isExtension},
               maxGroupSize_{maxGroupSize > 0 ? maxGroupSize : -1},
               autoDeactivateOnFailure_{autoDeactivateOnFailure},
               autoSyncOnFailure_{autoSyncOnFailure} {}
@@ -155,8 +152,6 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
         ~MooncakeBackendOptions() override = default;
 
         at::Tensor activeRanks_;
-        // Deprecated: unused
-        bool isExtension_ = false;
 
         int maxGroupSize_ = -1;
 
@@ -313,9 +308,9 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
 
     std::vector<bool> getPeerState(const std::vector<int>& ranks);
 
-    void recoverRanks(const std::vector<int>& ranks);
+    // alias to activateRanks
+    ProposeViewUpdateResponse recoverRanks(const std::vector<int>& ranks);
 
-    // alias to recoverRanks
     ProposeViewUpdateResponse activateRanks(const std::vector<int>& ranks);
 
     ProposeViewUpdateResponse deactivateRanks(const std::vector<int>& ranks);
@@ -323,8 +318,12 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     void joinGroup();
 
     // Update the data plane view.
-    // Called by AgentHost when a ViewUpdatePush is received.
-    void applyViewUpdate(const GroupView& view);
+    // Called by AgentHost when a ViewUpdatePush is received or rank states
+    // change.  rank_states and activatable are computed by the state
+    // machine.
+    void applyViewUpdate(const GroupView& view,
+                         const std::vector<RankState>& rank_states,
+                         const std::vector<bool>& activatable);
 
     // Returns the current GroupView epoch.
     // Epoch starts at 0 (bootstrap) and increments on membership changes,
