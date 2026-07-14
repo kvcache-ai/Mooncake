@@ -24,6 +24,7 @@ namespace mooncake::tent {
 struct AdaptiveDispatchSnapshot {
     size_t current_owners{0};
     size_t learned_ceiling{0};
+    size_t suspect_level{0};
     uint64_t slow_or_failed_pulls{0};
     uint64_t reductions{0};
     uint64_t increases{0};
@@ -38,7 +39,8 @@ class AdaptiveCreditDispatchLimiter {
     explicit AdaptiveCreditDispatchLimiter(
         const ReceiverCreditRuntimeConfig& config);
 
-    void observe(std::chrono::nanoseconds elapsed, bool rpc_ok);
+    void observe(std::chrono::nanoseconds elapsed, bool rpc_ok,
+                 size_t owners_at_start);
     size_t ownerLimit() const;
     AdaptiveDispatchSnapshot snapshot() const;
 
@@ -51,6 +53,7 @@ class AdaptiveCreditDispatchLimiter {
     std::atomic<size_t> current_owners_;
     mutable std::mutex mutex_;
     size_t learned_ceiling_;
+    size_t suspect_level_{0};
     uint32_t healthy_pulls_{0};
     uint64_t slow_or_failed_pulls_{0};
     uint64_t reductions_{0};
@@ -112,6 +115,7 @@ class ReceiverCreditPullController
         bool dirty{false};
         CreditPeerState state{CreditPeerState::Negotiating};
         std::chrono::steady_clock::time_point pull_started_at{};
+        size_t pull_dispatch_owners{0};
     };
 
     ReceiverCreditPullController(

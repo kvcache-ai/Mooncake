@@ -134,23 +134,36 @@ TEST(AdaptiveCreditDispatchLimiter,
     config.adaptive_dispatch_healthy_pulls = 2;
     AdaptiveCreditDispatchLimiter limiter(config);
 
-    limiter.observe(std::chrono::microseconds(100), true);
-    limiter.observe(std::chrono::microseconds(100), true);
+    limiter.observe(std::chrono::microseconds(100), true, 4);
+    limiter.observe(std::chrono::microseconds(100), true, 4);
     ASSERT_EQ(limiter.ownerLimit(), 5);
 
-    limiter.observe(std::chrono::milliseconds(200), true);
+    limiter.observe(std::chrono::milliseconds(200), true, 5);
     EXPECT_EQ(limiter.ownerLimit(), 2);
     auto reduced = limiter.snapshot();
-    EXPECT_EQ(reduced.learned_ceiling, 4);
+    EXPECT_EQ(reduced.learned_ceiling, 8);
+    EXPECT_EQ(reduced.suspect_level, 5);
     EXPECT_EQ(reduced.slow_or_failed_pulls, 1);
     EXPECT_EQ(reduced.reductions, 1);
 
+    for (size_t i = 0; i < 6; ++i)
+        limiter.observe(std::chrono::microseconds(100), true,
+                        limiter.ownerLimit());
+    ASSERT_EQ(limiter.ownerLimit(), 5);
+
+    limiter.observe(std::chrono::milliseconds(200), true, 5);
+    EXPECT_EQ(limiter.ownerLimit(), 2);
+    reduced = limiter.snapshot();
+    EXPECT_EQ(reduced.learned_ceiling, 4);
+    EXPECT_EQ(reduced.suspect_level, 0);
+
     for (size_t i = 0; i < 20; ++i)
-        limiter.observe(std::chrono::microseconds(100), true);
+        limiter.observe(std::chrono::microseconds(100), true,
+                        limiter.ownerLimit());
     auto recovered = limiter.snapshot();
     EXPECT_EQ(recovered.current_owners, 4);
     EXPECT_EQ(recovered.learned_ceiling, 4);
-    EXPECT_EQ(recovered.increases, 3);
+    EXPECT_EQ(recovered.increases, 6);
 }
 
 TEST(AdaptiveCreditDispatchLimiter, RpcFailureReducesAtAnyLatency) {
@@ -160,9 +173,10 @@ TEST(AdaptiveCreditDispatchLimiter, RpcFailureReducesAtAnyLatency) {
     config.adaptive_dispatch_max_owners = 4;
     AdaptiveCreditDispatchLimiter limiter(config);
 
-    limiter.observe(std::chrono::microseconds(1), false);
+    limiter.observe(std::chrono::microseconds(1), false, 2);
     EXPECT_EQ(limiter.ownerLimit(), 1);
-    EXPECT_EQ(limiter.snapshot().learned_ceiling, 1);
+    EXPECT_EQ(limiter.snapshot().learned_ceiling, 4);
+    EXPECT_EQ(limiter.snapshot().suspect_level, 2);
 }
 
 TEST(AdaptiveCreditDispatchLimiter, DisabledLeavesStaticWindowUnbounded) {
@@ -170,7 +184,7 @@ TEST(AdaptiveCreditDispatchLimiter, DisabledLeavesStaticWindowUnbounded) {
     config.adaptive_dispatch_enabled = false;
     AdaptiveCreditDispatchLimiter limiter(config);
 
-    limiter.observe(std::chrono::seconds(1), false);
+    limiter.observe(std::chrono::seconds(1), false, 2);
     EXPECT_EQ(limiter.ownerLimit(), std::numeric_limits<size_t>::max());
     EXPECT_EQ(limiter.snapshot().slow_or_failed_pulls, 0);
 }

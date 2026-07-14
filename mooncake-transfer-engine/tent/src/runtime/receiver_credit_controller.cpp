@@ -44,7 +44,8 @@ AdaptiveCreditDispatchLimiter::AdaptiveCreditDispatchLimiter(
                                 : std::numeric_limits<size_t>::max()) {}
 
 void AdaptiveCreditDispatchLimiter::observe(std::chrono::nanoseconds elapsed,
-                                            bool rpc_ok) {
+                                            bool rpc_ok,
+                                            size_t owners_at_start) {
     if (!enabled_) return;
     const bool unhealthy = !rpc_ok || static_cast<uint64_t>(std::max<int64_t>(
                                           0, elapsed.count())) >= slow_rtt_ns_;
@@ -54,8 +55,16 @@ void AdaptiveCreditDispatchLimiter::observe(std::chrono::nanoseconds elapsed,
     if (unhealthy) {
         ++slow_or_failed_pulls_;
         healthy_pulls_ = 0;
+        const size_t failed_level = std::min(owners_at_start, learned_ceiling_);
+        if (failed_level > min_owners_) {
+            if (suspect_level_ == failed_level) {
+                learned_ceiling_ = failed_level - 1;
+                suspect_level_ = 0;
+            } else {
+                suspect_level_ = failed_level;
+            }
+        }
         if (current > min_owners_) {
-            learned_ceiling_ = std::min(learned_ceiling_, current - 1);
             const size_t reduced = std::max(min_owners_, current / 2);
             current_owners_.store(reduced, std::memory_order_release);
             ++reductions_;
@@ -63,7 +72,7 @@ void AdaptiveCreditDispatchLimiter::observe(std::chrono::nanoseconds elapsed,
         return;
     }
 
-    if (current >= learned_ceiling_) {
+    if (owners_at_start != current || current >= learned_ceiling_) {
         healthy_pulls_ = 0;
         return;
     }
@@ -81,6 +90,7 @@ AdaptiveDispatchSnapshot AdaptiveCreditDispatchLimiter::snapshot() const {
     std::lock_guard lock(mutex_);
     return {.current_owners = current_owners_.load(std::memory_order_relaxed),
             .learned_ceiling = learned_ceiling_,
+            .suspect_level = suspect_level_,
             .slow_or_failed_pulls = slow_or_failed_pulls_,
             .reductions = reductions_,
             .increases = increases_};
@@ -260,6 +270,7 @@ void ReceiverCreditPullController::launch(PeerKey key) {
         auto it = peers_.find(key);
         if (stopped_ || it == peers_.end()) return;
         it->second.pull_started_at = std::chrono::steady_clock::now();
+        it->second.pull_dispatch_owners = dispatch_limiter_.ownerLimit();
         ++pulls_started_;
     }
 
@@ -364,6 +375,7 @@ void ReceiverCreditPullController::finish(
     PeerKey key, Status rpc_status, ReceiverCreditPullResponseV1 response) {
     std::chrono::nanoseconds pull_elapsed{0};
     bool pull_measured = false;
+    size_t pull_dispatch_owners = 0;
     {
         const auto now = std::chrono::steady_clock::now();
         std::lock_guard lock(mutex_);
@@ -376,6 +388,7 @@ void ReceiverCreditPullController::finish(
                     .count());
             pull_elapsed = std::chrono::nanoseconds(elapsed);
             pull_measured = true;
+            pull_dispatch_owners = it->second.pull_dispatch_owners;
             it->second.pull_started_at = {};
             ++pulls_completed_;
             pull_latency_ns_sum_ += elapsed;
@@ -388,7 +401,9 @@ void ReceiverCreditPullController::finish(
         }
     }
 
-    if (pull_measured) dispatch_limiter_.observe(pull_elapsed, rpc_status.ok());
+    if (pull_measured)
+        dispatch_limiter_.observe(pull_elapsed, rpc_status.ok(),
+                                  pull_dispatch_owners);
 
     bool request_again = false;
     Status result = std::move(rpc_status);
@@ -461,6 +476,7 @@ void ReceiverCreditPullController::stop() {
         LOG(INFO) << "Receiver credit adaptive dispatch summary: owners="
                   << adaptive.current_owners
                   << " learned_ceiling=" << adaptive.learned_ceiling
+                  << " suspect_level=" << adaptive.suspect_level
                   << " slow_or_failed_pulls=" << adaptive.slow_or_failed_pulls
                   << " reductions=" << adaptive.reductions
                   << " increases=" << adaptive.increases;
