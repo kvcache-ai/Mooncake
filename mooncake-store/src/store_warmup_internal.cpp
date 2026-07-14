@@ -62,6 +62,11 @@ StoreWarmupOptions LoadStoreWarmupOptions() {
     return options;
 }
 
+uint64_t NormalizeWarmupMaxTargets(uint64_t requested) {
+    if (requested == 0) return kMaxWarmupTargetsPerRequest;
+    return std::min(requested, kMaxWarmupTargetsPerRequest);
+}
+
 WarmupBatchCleanup::WarmupBatchCleanup(PollBatchFn poll_batch,
                                        ReleaseBatchFn release_batch)
     : poll_batch_(std::move(poll_batch)),
@@ -192,11 +197,14 @@ void WarmupBatchCleanup::WorkerMain() {
                 return;
             }
 
+            // Claim at most one item from each queue per round so a transfer
+            // that remains pending cannot starve lightweight batch-ID retries.
             if (!pending_transfers_.empty()) {
                 transfer.emplace(std::move(pending_transfers_.front()));
                 pending_transfers_.pop_front();
                 ++processing_transfers_;
-            } else {
+            }
+            if (!pending_batch_id_releases_.empty()) {
                 batch_id_release.emplace(
                     std::move(pending_batch_id_releases_.front()));
                 pending_batch_id_releases_.pop_front();
@@ -227,7 +235,9 @@ void WarmupBatchCleanup::WorkerMain() {
                 }
                 cv_.notify_all();
             }
-        } else {
+        }
+
+        if (batch_id_release) {
             const bool released = TryFreeWarmupBatchID(*batch_id_release);
             {
                 std::lock_guard<std::mutex> lock(mutex_);

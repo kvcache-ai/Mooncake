@@ -25,6 +25,9 @@ inline constexpr size_t kMaxWarmupReadSize = 1024 * 1024;
 inline constexpr uint64_t kMaxWarmupTimeoutMs = 60000;
 inline constexpr size_t kMaxWarmupConcurrency = 128;
 inline constexpr size_t kMaxWarmupTargets = 65536;
+// Defensive Master-side cap. A client request of 0 means "unlimited", but the
+// service still returns at most this many targets.
+inline constexpr uint64_t kMaxWarmupTargetsPerRequest = 1024;
 inline constexpr auto kWarmupShutdownTimeout = std::chrono::seconds(5);
 
 struct StoreWarmupOptions {
@@ -70,6 +73,7 @@ struct StoreWarmupProbeResult {
 };
 
 StoreWarmupOptions LoadStoreWarmupOptions();
+uint64_t NormalizeWarmupMaxTargets(uint64_t requested);
 
 // Owns destination buffers until Transfer Engine reports a terminal state,
 // then retries batch-ID cleanup without retaining those buffers. The worker is

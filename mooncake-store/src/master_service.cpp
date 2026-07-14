@@ -25,6 +25,7 @@
 #include "master_metric_manager.h"
 #include "common.h"
 #include "segment.h"
+#include "store_warmup_internal.h"
 #ifdef USE_HTTP
 #include "transfer_metadata_plugin.h"
 #endif
@@ -2190,6 +2191,8 @@ auto MasterService::ListWarmupTargets(
     if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);
     }
+    const uint64_t effective_max_targets =
+        internal::NormalizeWarmupMaxTargets(max_targets);
 
     auto protocol_allowed = [&](const std::string& protocol) {
         if (preferred_protocols.empty()) return true;
@@ -2218,7 +2221,11 @@ auto MasterService::ListWarmupTargets(
     };
 
     std::vector<WarmupTarget> targets;
-    targets.reserve(all_segments.size());
+    // Never construct more target results than the service-side cap, even if
+    // the caller requests an unlimited or oversized response.
+    targets.reserve(
+        std::min(all_segments.size(),
+                 static_cast<size_t>(internal::kMaxWarmupTargetsPerRequest)));
     std::unordered_set<std::string> seen_segment_names;
     for (const auto& [segment, owner_client_id] : all_segments) {
         // Warmup locality follows Store client ownership. Segments owned by a
@@ -2252,14 +2259,15 @@ auto MasterService::ListWarmupTargets(
         target.is_local = false;
         target.allow_warmup = true;
         targets.emplace_back(std::move(target));
+        if (targets.size() == internal::kMaxWarmupTargetsPerRequest) break;
     }
 
-    if (max_targets > 0 && targets.size() > max_targets) {
+    if (targets.size() > effective_max_targets) {
         const size_t offset =
             static_cast<size_t>(client_id.first ^ client_id.second) %
             targets.size();
         std::rotate(targets.begin(), targets.begin() + offset, targets.end());
-        targets.resize(static_cast<size_t>(max_targets));
+        targets.resize(static_cast<size_t>(effective_max_targets));
     }
     for (size_t i = 0; i < targets.size(); ++i) {
         targets[i].priority = i;
