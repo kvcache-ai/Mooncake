@@ -732,40 +732,17 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
 }
 
 void FileStorage::RemoveAll() {
-    namespace fs = std::filesystem;
-
-    // 1. Drain in-memory metadata via storage_backend_ so that
-    //    concurrent readers/writers can no longer reference stale entries.
+    // Delegate physical cleanup to the storage backend. Each backend owns its
+    // on-disk layout and clears it correctly:
+    //  - OffsetAllocatorStorageBackend truncates+rebuilds its data file
+    //    (fs::remove_all on the dir here would unlink the freshly rebuilt
+    //    file, leaving data_file_ pointing at a dead inode — see PR #2676).
+    //  - BucketStorageBackend deletes all buckets.
+    //  - StorageBackend (FilePerKey) removes all files under root_dir_.
     if (storage_backend_) {
         storage_backend_->RemoveAll();
     }
-
-    // 2. Unconditionally wipe all files under the storage directory.
-    //    This guarantees physical cleanup even if the in-memory map was
-    //    empty (e.g. after a crash or partial ScanMeta).
-    //    Use manual increment with error_code to avoid throwing
-    //    filesystem_error from operator++ in range-for.
-    const auto& storage_dir = config_.storage_filepath;
-    std::error_code ec;
-    if (fs::exists(storage_dir, ec) && !ec) {
-        for (auto it = fs::directory_iterator(storage_dir, ec);
-             it != fs::directory_iterator(); it.increment(ec)) {
-            if (ec) {
-                LOG(WARNING) << "RemoveAll: directory iteration failed: "
-                             << ec.message();
-                break;
-            }
-            const auto& entry = *it;
-            std::error_code remove_ec;
-            fs::remove_all(entry.path(), remove_ec);
-            if (remove_ec &&
-                remove_ec != std::errc::no_such_file_or_directory) {
-                LOG(WARNING) << "RemoveAll: failed to remove " << entry.path()
-                             << ", error: " << remove_ec.message();
-            }
-        }
-    }
-    LOG(INFO) << "FileStorage::RemoveAll: cleaned directory " << storage_dir;
+    LOG(INFO) << "FileStorage::RemoveAll: cleared storage backend";
 }
 
 tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {

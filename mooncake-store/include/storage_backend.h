@@ -1196,8 +1196,12 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     // Thread-safe allocator managing free space within [0, capacity_) range
     std::shared_ptr<offset_allocator::OffsetAllocator> allocator_;
 
-    // File handle wrapper for I/O operations using preadv/pwritev
-    std::unique_ptr<StorageFile> data_file_;
+    // File handle wrapper for I/O operations using preadv/pwritev. Held as a
+    // shared_ptr so that an in-flight BatchLoad (which copies it into its
+    // ReadPlan under the shard lock) keeps the old file alive while RemoveAll
+    // rebinds this member to a freshly rebuilt file. Avoids use-after-free
+    // when RemoveAll runs concurrently with a reader on another thread.
+    std::shared_ptr<StorageFile> data_file_;
 
     // Sharded metadata maps: one map per shard with its own lock (prevents data
     // races)
