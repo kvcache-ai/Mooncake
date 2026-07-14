@@ -23,7 +23,8 @@ enum class CreditReservationState : uint8_t {
     Empty,
     Reserved,
     Committed,
-    RolledBack
+    RolledBack,
+    Released
 };
 
 struct CreditDispatchReservation {
@@ -45,6 +46,9 @@ class ReceiverCreditDispatchGate {
                       CreditDispatchReservation& reservation);
     Status commit(CreditDispatchReservation& reservation);
     Status rollback(CreditDispatchReservation& reservation);
+    // Releases transport-owned capacity at terminal completion. It does not
+    // restore local availability; the receiver must issue the next grant.
+    Status release(CreditDispatchReservation& reservation);
 
    private:
     const CreditPeerContextTable& contexts_;

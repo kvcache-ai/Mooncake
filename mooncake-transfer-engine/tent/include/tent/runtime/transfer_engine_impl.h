@@ -34,6 +34,9 @@
 #include "tent/common/types.h"
 #include "tent/runtime/admission_queue.h"
 #include "tent/runtime/receiver_credit_dispatch.h"
+#include "tent/runtime/receiver_credit_allocator.h"
+#include "tent/runtime/receiver_credit_config.h"
+#include "tent/runtime/receiver_credit_controller.h"
 #include "tent/runtime/transport.h"
 #include "tent/runtime/transport_selector.h"
 
@@ -330,6 +333,9 @@ class TransferEngineImpl {
         bool in_dispatch_window{false};
         std::optional<CreditDispatchSnapshot> credit_snapshot;
         std::optional<CreditDispatchReservation> credit_reservation;
+        std::optional<CreditCharge> credit_charge;
+        std::string credit_server_addr;
+        uint32_t credit_qos_class{0};
     };
 
    private:
@@ -359,11 +365,18 @@ class TransferEngineImpl {
     bool enable_auto_failover_on_poll_{true};
     bool enable_progress_worker_{false};
     RuntimeQueueConfig runtime_queue_config_;
+    ReceiverCreditRuntimeConfig receiver_credit_config_;
+    bool receiver_credit_production_enabled_{false};
+    ReceiverSessionId local_peer_session_;
+    uint64_t local_sender_peer_{0};
     std::unique_ptr<LocalTransferAdmissionQueue> runtime_queue_;
     std::unordered_map<QueueOwnerId, QueuedOwnerState> queued_owners_;
     std::shared_ptr<CreditPeerContextTable> receiver_credit_contexts_;
     std::shared_ptr<SenderCreditLedger> receiver_credit_ledger_;
     std::shared_ptr<ReceiverCreditDispatchGate> receiver_credit_dispatch_gate_;
+    std::shared_ptr<ReceiverCreditAllocator> receiver_credit_allocator_;
+    std::shared_ptr<ReceiverCreditPullController>
+        receiver_credit_pull_controller_;
     CreditQosProvider receiver_credit_qos_provider_;
     size_t dispatch_inflight_owners_{0};
     size_t dispatch_inflight_bytes_{0};

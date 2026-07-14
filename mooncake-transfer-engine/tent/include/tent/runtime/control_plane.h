@@ -28,6 +28,7 @@
 #include <variant>
 
 #include "tent/runtime/metastore.h"
+#include "tent/runtime/receiver_credit_allocator.h"
 #include "tent/runtime/segment.h"
 #include "tent/runtime/segment_manager.h"
 #include "tent/rpc/rpc.h"
@@ -107,6 +108,20 @@ class ControlClient {
     static void notifySegmentUpdatedAsync(
         const std::string& server_addr, const std::string& segment_name,
         const onNotifySegmentUpdateFailure& on_failure);
+
+    static Status pullReceiverCredit(const std::string& server_addr,
+                                     const ReceiverCreditPullRequestV1& request,
+                                     ReceiverCreditPullResponseV1& response);
+
+    using OnReceiverCreditPull =
+        std::function<void(Status, ReceiverCreditPullResponseV1)>;
+    // The caller owns `agent`; retaining it in the callback owner makes the
+    // in-flight coroutine independent from thread-local client teardown.
+    static void pullReceiverCreditAsync(
+        const std::shared_ptr<CoroRpcAgent>& agent,
+        const std::string& server_addr,
+        const ReceiverCreditPullRequestV1& request,
+        OnReceiverCreditPull callback);
 };
 
 class ControlService {
@@ -128,6 +143,9 @@ class ControlService {
     void setNotifyCallback(const OnNotify& callback) {
         notify_callback_ = callback;
     }
+
+    void setReceiverCreditAllocator(
+        std::shared_ptr<ReceiverCreditAllocator> allocator);
 
     Status start(uint16_t& port, bool ipv6_ = false);
 
@@ -160,6 +178,9 @@ class ControlService {
     void onSegmentUpdated(const std::string_view& request,
                           std::string& response);
 
+    void onPullReceiverCredit(const std::string_view& request,
+                              std::string& response);
+
    private:
     std::unique_ptr<SegmentManager> manager_;
     std::shared_ptr<CoroRpcAgent> rpc_server_;
@@ -167,6 +188,8 @@ class ControlService {
     OnReceiveBootstrap bootstrap_callback_;
     OnNotify notify_callback_;
     TransferEngineImpl* impl_;
+    std::mutex receiver_credit_mutex_;
+    std::shared_ptr<ReceiverCreditAllocator> receiver_credit_allocator_;
 };
 
 }  // namespace tent

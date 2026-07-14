@@ -242,7 +242,8 @@ Status CreditPeerContextTable::activate(uint64_t target_id,
     CreditPeerContextSnapshot next{
         {activation.receiver_session_id, sender_peer, qos_class},
         activation.epoch,
-        activation.freshness_ttl_ms};
+        activation.freshness_ttl_ms,
+        std::chrono::steady_clock::now()};
     std::lock_guard lock(mutex_);
     auto it = contexts_.find(lookup_key);
     if (it == contexts_.end()) {
@@ -262,6 +263,11 @@ Status CreditPeerContextTable::activate(uint64_t target_id,
             "stale receiver credit peer activation" LOC_MARK);
     if (current.key.receiver_session == activation.receiver_session_id &&
         activation.epoch == current.epoch) {
+        // A valid pull response is also a freshness heartbeat. Refreshing an
+        // existing generation must not reset ledger consumption, so only the
+        // context timestamp and advertised TTL are updated here.
+        it->second.freshness_ttl_ms = activation.freshness_ttl_ms;
+        it->second.refreshed_at = next.refreshed_at;
         return Status::OK();
     }
     it->second = next;
@@ -277,6 +283,16 @@ Status CreditPeerContextTable::lookup(
         return Status::InvalidEntry(
             "receiver credit peer context not found" LOC_MARK);
     snapshot = it->second;
+    return Status::OK();
+}
+
+Status CreditPeerContextTable::lookupFresh(
+    uint64_t target_id, uint32_t qos_class,
+    CreditPeerContextSnapshot& snapshot) const {
+    CHECK_STATUS(lookup(target_id, qos_class, snapshot));
+    if (!snapshot.isFresh())
+        return Status::InvalidEntry(
+            "receiver credit peer context is stale" LOC_MARK);
     return Status::OK();
 }
 

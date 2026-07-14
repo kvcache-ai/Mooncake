@@ -43,8 +43,72 @@ target_include_directories(receiver_credit_control_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME receiver_credit_control_test COMMAND receiver_credit_control_test)
 
+add_executable(receiver_credit_protocol_test
+               receiver_credit_protocol_test.cpp
+               ../src/runtime/receiver_credit_protocol.cpp)
+target_link_libraries(receiver_credit_protocol_test
+                      PRIVATE tent_common gtest gtest_main)
+target_include_directories(receiver_credit_protocol_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME receiver_credit_protocol_test
+         COMMAND receiver_credit_protocol_test)
+
+add_executable(receiver_credit_allocator_test
+               receiver_credit_allocator_test.cpp
+               ../src/runtime/receiver_credit_protocol.cpp
+               ../src/runtime/receiver_credit_allocator.cpp)
+target_link_libraries(receiver_credit_allocator_test
+                      PRIVATE tent_common gtest gtest_main)
+target_include_directories(receiver_credit_allocator_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME receiver_credit_allocator_test
+         COMMAND receiver_credit_allocator_test)
+
+add_executable(receiver_credit_config_test
+               receiver_credit_config_test.cpp
+               ../src/runtime/receiver_credit_config.cpp)
+target_link_libraries(receiver_credit_config_test
+                      PRIVATE tent_common gtest gtest_main)
+target_include_directories(receiver_credit_config_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME receiver_credit_config_test COMMAND receiver_credit_config_test)
+
+add_executable(receiver_credit_control_service_test
+               receiver_credit_control_service_test.cpp)
+target_link_libraries(receiver_credit_control_service_test
+                      PRIVATE gtest gtest_main tent_link_group)
+if(TARGET asio_shared)
+  target_link_libraries(receiver_credit_control_service_test PRIVATE asio_shared)
+endif()
+target_include_directories(receiver_credit_control_service_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME receiver_credit_control_service_test
+         COMMAND receiver_credit_control_service_test)
+
+add_executable(receiver_credit_controller_test
+               receiver_credit_controller_test.cpp)
+target_link_libraries(receiver_credit_controller_test
+                      PRIVATE gtest gtest_main tent_link_group)
+if(TARGET asio_shared)
+  target_link_libraries(receiver_credit_controller_test PRIVATE asio_shared)
+endif()
+target_include_directories(receiver_credit_controller_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME receiver_credit_controller_test
+         COMMAND receiver_credit_controller_test)
+
+# Manual cross-host benchmark for the production receiver-credit ControlService
+# RPC. It is intentionally not registered with ctest.
+add_executable(receiver_credit_rpc_bench receiver_credit_rpc_bench.cpp)
+target_link_libraries(receiver_credit_rpc_bench PRIVATE tent_link_group)
+if(TARGET asio_shared)
+  target_link_libraries(receiver_credit_rpc_bench PRIVATE asio_shared)
+endif()
+target_include_directories(receiver_credit_rpc_bench
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+
 add_executable(receiver_credit_dispatch_test receiver_credit_dispatch_test.cpp
-                                             ../src/runtime/receiver_credit.cpp
+                                              ../src/runtime/receiver_credit.cpp
                                              ../src/runtime/receiver_credit_control.cpp
                                              ../src/runtime/receiver_credit_dispatch.cpp)
 target_link_libraries(receiver_credit_dispatch_test

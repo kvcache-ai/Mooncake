@@ -178,11 +178,72 @@ TEST(ReceiverCredit, RollbackChecksUnderflowAtomically) {
     grant(l, 1);
     ASSERT_TRUE(l.tryReserve(key(), charge(60, 1)).ok());
     EXPECT_TRUE(
-        l.rollbackReservation(key(), charge(61, 1)).IsInvalidArgument());
+        l.rollbackReservation(key(), 7, charge(61, 1)).IsInvalidArgument());
     uint64_t v;
     ASSERT_TRUE(l.consumed(key(), CreditResource::RequestSlots, v).ok());
     EXPECT_EQ(v, 1);
-    ASSERT_TRUE(l.rollbackReservation(key(), charge(60, 1)).ok());
+    ASSERT_TRUE(l.rollbackReservation(key(), 7, charge(60, 1)).ok());
+}
+
+TEST(ReceiverCredit, CompletionIsCumulativeAndDoesNotMintLocalCredit) {
+    SenderCreditLedger l;
+    ASSERT_TRUE(l.activate(key(), 7).ok());
+    grant(l, 1);
+    ASSERT_TRUE(l.tryReserve(key(), charge(60, 1)).ok());
+
+    CreditLedgerSnapshot before;
+    ASSERT_TRUE(l.snapshot(key(), 7, before).ok());
+    EXPECT_EQ(before.epoch, 7);
+    EXPECT_EQ(before.last_sequence, 1);
+    EXPECT_TRUE(before.has_update);
+    EXPECT_EQ(before.grants[0], 100);
+    EXPECT_EQ(before.consumed[0], 60);
+    EXPECT_EQ(before.completed[0], 0);
+
+    ASSERT_TRUE(l.recordCompletion(key(), 7, charge(60, 1)).ok());
+    uint64_t bytes = 0, slots = 0;
+    ASSERT_TRUE(l.available(key(), CreditResource::DataBytes, bytes).ok());
+    ASSERT_TRUE(l.available(key(), CreditResource::RequestSlots, slots).ok());
+    EXPECT_EQ(bytes, 40);
+    EXPECT_EQ(slots, 1);
+
+    CreditLedgerSnapshot after;
+    ASSERT_TRUE(l.snapshot(key(), 7, after).ok());
+    EXPECT_EQ(after.consumed[0], 60);
+    EXPECT_EQ(after.consumed[1], 1);
+    EXPECT_EQ(after.completed[0], 60);
+    EXPECT_EQ(after.completed[1], 1);
+    EXPECT_TRUE(l.recordCompletion(key(), 7, charge(1, 1)).IsInvalidArgument());
+    EXPECT_TRUE(
+        l.rollbackReservation(key(), 7, charge(1, 1)).IsInvalidArgument());
+}
+
+TEST(ReceiverCredit, OldEpochRollbackAndCompletionCannotMutateNewEpoch) {
+    SenderCreditLedger l;
+    ASSERT_TRUE(l.activate(key(), 7).ok());
+    grant(l, 1);
+    ASSERT_TRUE(l.tryReserve(key(), charge(60, 1)).ok());
+
+    ASSERT_TRUE(l.activate(key(), 8).ok());
+    CreditUpdateDisposition disposition;
+    ASSERT_TRUE(l.applyUpdate(key(),
+                              update(8, 1,
+                                     {{CreditResource::DataBytes, 50},
+                                      {CreditResource::RequestSlots, 2}}),
+                              disposition)
+                    .ok());
+    ASSERT_TRUE(l.tryReserve(key(), charge(10, 1)).ok());
+
+    EXPECT_TRUE(
+        l.rollbackReservation(key(), 7, charge(60, 1)).IsInvalidEntry());
+    EXPECT_TRUE(l.recordCompletion(key(), 7, charge(60, 1)).IsInvalidEntry());
+    CreditLedgerSnapshot current;
+    ASSERT_TRUE(l.snapshot(key(), 8, current).ok());
+    EXPECT_EQ(current.consumed[0], 10);
+    EXPECT_EQ(current.consumed[1], 1);
+    EXPECT_EQ(current.completed[0], 0);
+    EXPECT_EQ(current.completed[1], 0);
+    EXPECT_TRUE(l.snapshot(key(), 7, current).IsInvalidEntry());
 }
 
 TEST(ReceiverCredit, GrantCannotDecreaseOrFallBelowConsumption) {
@@ -213,6 +274,30 @@ TEST(ReceiverCredit, ConcurrentReservationsNeverExceedGrant) {
     uint64_t consumed;
     ASSERT_TRUE(l.consumed(key(), CreditResource::DataBytes, consumed).ok());
     EXPECT_EQ(consumed, 100);
+}
+
+TEST(ReceiverCredit, ConcurrentCompletionsNeverExceedConsumption) {
+    SenderCreditLedger l;
+    ASSERT_TRUE(l.activate(key(), 7).ok());
+    grant(l, 1, 100, 100);
+    ASSERT_TRUE(l.tryReserve(key(), charge(100, 100)).ok());
+    std::atomic<int> completed{0};
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 16; ++i) {
+        threads.emplace_back([&] {
+            for (int j = 0; j < 20; ++j)
+                if (l.recordCompletion(key(), 7, charge(1, 1)).ok())
+                    ++completed;
+        });
+    }
+    for (auto& thread : threads) thread.join();
+    EXPECT_EQ(completed, 100);
+    CreditLedgerSnapshot current;
+    ASSERT_TRUE(l.snapshot(key(), 7, current).ok());
+    EXPECT_EQ(current.consumed[0], 100);
+    EXPECT_EQ(current.consumed[1], 100);
+    EXPECT_EQ(current.completed[0], 100);
+    EXPECT_EQ(current.completed[1], 100);
 }
 }  // namespace
 }  // namespace mooncake::tent

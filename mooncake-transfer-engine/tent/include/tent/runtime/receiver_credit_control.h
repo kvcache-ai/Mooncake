@@ -5,6 +5,7 @@
 #define TENT_RUNTIME_RECEIVER_CREDIT_CONTROL_H
 
 #include <cstddef>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <mutex>
@@ -76,6 +77,14 @@ struct CreditPeerContextSnapshot {
     CreditKey key;
     uint64_t epoch{0};
     uint32_t freshness_ttl_ms{0};
+    std::chrono::steady_clock::time_point refreshed_at{};
+
+    bool isFresh(std::chrono::steady_clock::time_point now =
+                     std::chrono::steady_clock::now()) const {
+        if (freshness_ttl_ms == 0) return true;
+        return now - refreshed_at <=
+               std::chrono::milliseconds(freshness_ttl_ms);
+    }
 };
 
 // Bounded sender-side mapping established by capability activation. Runtime
@@ -90,6 +99,8 @@ class CreditPeerContextTable {
                     uint32_t qos_class, const CreditActivationV1& activation);
     Status lookup(uint64_t target_id, uint32_t qos_class,
                   CreditPeerContextSnapshot& snapshot) const;
+    Status lookupFresh(uint64_t target_id, uint32_t qos_class,
+                       CreditPeerContextSnapshot& snapshot) const;
     Status deactivate(uint64_t target_id, uint32_t qos_class,
                       const ReceiverSessionId& receiver_session,
                       uint64_t epoch);

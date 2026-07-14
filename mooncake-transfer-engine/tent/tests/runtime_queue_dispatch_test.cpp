@@ -202,6 +202,20 @@ std::shared_ptr<Config> makeRuntimeQueueConfig(size_t max_dispatch_owners,
     return cfg;
 }
 
+void enableProductionReceiverCredit(const std::shared_ptr<Config>& cfg,
+                                    uint64_t data_bytes = 1ULL << 20,
+                                    uint64_t request_slots = 16) {
+    cfg->set("receiver_credit/mode", "required");
+    cfg->set("receiver_credit/capacity/data_bytes", data_bytes);
+    cfg->set("receiver_credit/capacity/request_slots", request_slots);
+    cfg->set("receiver_credit/grant_batch/data_bytes", data_bytes);
+    cfg->set("receiver_credit/grant_batch/request_slots", request_slots);
+    cfg->set("receiver_credit/control/freshness_ttl_ms", uint64_t{1000});
+    cfg->set("receiver_credit/control/retry_after_us", uint64_t{100});
+    cfg->set("receiver_credit/control/poll_interval_us", uint64_t{1000});
+    cfg->set("receiver_credit/limits/max_peers", uint64_t{16});
+}
+
 void installFakeRdma(TransferEngineImpl& engine,
                      const std::shared_ptr<FakeTransport>& fake_rdma) {
     std::string seg_name = engine.getSegmentName();
@@ -254,6 +268,80 @@ TEST(RuntimeQueueDispatch, RejectsReceiverCreditWithoutRuntimeQueue) {
     cfg->set("receiver_credit/enabled", true);
     TransferEngineImpl engine(cfg);
     EXPECT_FALSE(engine.available());
+}
+
+TEST(RuntimeQueueDispatch, ProductionCreditPullGatesDirectRemoteRdmaWrite) {
+    auto receiver_config = makeRuntimeQueueConfig(4, 1UL << 20);
+    auto sender_config = makeRuntimeQueueConfig(4, 1UL << 20);
+    enableProductionReceiverCredit(receiver_config, 4096, 1);
+    enableProductionReceiverCredit(sender_config, 4096, 1);
+
+    TransferEngineImpl receiver(receiver_config);
+    TransferEngineImpl sender(sender_config);
+    ASSERT_TRUE(receiver.available());
+    ASSERT_TRUE(sender.available());
+    auto receiver_rdma = std::make_shared<FakeTransport>(RDMA);
+    auto sender_rdma = std::make_shared<FakeTransport>(RDMA);
+    installFakeRdma(receiver, receiver_rdma);
+    installFakeRdma(sender, sender_rdma);
+
+    constexpr size_t kReqLen = 4096;
+    std::vector<uint8_t> source(kReqLen, 0x42);
+    std::vector<uint8_t> target(kReqLen, 0);
+    ASSERT_TRUE(sender.registerLocalMemory(source.data(), source.size()).ok());
+    ASSERT_TRUE(
+        receiver.registerLocalMemory(target.data(), target.size()).ok());
+
+    SegmentID target_id = 0;
+    ASSERT_TRUE(sender.openSegment(target_id, receiver.getSegmentName()).ok());
+    ASSERT_NE(target_id, LOCAL_SEGMENT_ID);
+    Request request;
+    request.opcode = Request::WRITE;
+    request.source = source.data();
+    request.target_id = target_id;
+    request.target_offset = reinterpret_cast<uint64_t>(target.data());
+    request.length = kReqLen;
+    request.transport_hint = RDMA;
+
+    BatchID batch = sender.allocateBatch(1);
+    ASSERT_TRUE(sender.submitTransfer(batch, {request}).ok());
+    TransferStatus status{};
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline) {
+        ASSERT_TRUE(sender.getTransferStatus(batch, 0, status).ok());
+        if (status.s != TransferStatusEnum::PENDING) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(sender_rdma->submit_calls.load(), 1);
+
+    EXPECT_TRUE(sender.freeBatch(batch).ok());
+    EXPECT_TRUE(sender.closeSegment(target_id).ok());
+    EXPECT_TRUE(
+        sender.unregisterLocalMemory(source.data(), source.size()).ok());
+    EXPECT_TRUE(
+        receiver.unregisterLocalMemory(target.data(), target.size()).ok());
+}
+
+TEST(RuntimeQueueDispatch, ProductionCreditBypassesLocalWrite) {
+    auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
+    enableProductionReceiverCredit(cfg, 4096, 1);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    installFakeRdma(engine, fake_rdma);
+
+    std::vector<uint8_t> buffer(4096, 0x43);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    BatchID batch = engine.allocateBatch(1);
+    ASSERT_TRUE(
+        engine.submitTransfer(batch, {makeLocalWrite(buffer.data(), 4096)})
+            .ok());
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
 }
 
 TEST(RuntimeQueueDispatch, RejectsCreditInstallWhenOptInIsDisabled) {

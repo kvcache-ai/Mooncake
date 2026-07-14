@@ -46,6 +46,24 @@ namespace tent {
 namespace {
 constexpr uint8_t kRedisMaxDbIndex = 255;
 constexpr uint8_t kRedisDefaultDbIndex = 0;
+
+bool hasProductionReceiverCreditConfig(const Config& config) {
+    return config.contains("receiver_credit/mode") ||
+           config.contains("receiver_credit/capacity") ||
+           config.contains("receiver_credit/grant_batch") ||
+           config.contains("receiver_credit/control") ||
+           config.contains("receiver_credit/limits");
+}
+
+uint64_t randomNonzero64() {
+    static std::atomic<uint64_t> sequence{1};
+    std::random_device random;
+    uint64_t value = (static_cast<uint64_t>(random()) << 32) ^ random();
+    value ^= static_cast<uint64_t>(getCurrentTimeInNano());
+    value ^= sequence.fetch_add(1, std::memory_order_relaxed) *
+             0x9e3779b97f4a7c15ULL;
+    return value == 0 ? 1 : value;
+}
 }  // namespace
 
 struct Batch {
@@ -270,6 +288,11 @@ Status TransferEngineImpl::setupLocalSegment() {
         segment.type = SegmentType::Memory;
         segment.machine_id = getMachineID();
         segment.rpc_server_addr = buildIpAddrWithPort(hostname_, port_, ipv6_);
+        if (receiver_credit_production_enabled_) {
+            segment.peer_session_high = local_peer_session_.high;
+            segment.peer_session_low = local_peer_session_.low;
+            segment.receiver_credit_versions = {1};
+        }
         auto& detail = std::get<MemorySegmentDesc>(segment.detail);
         detail.topology = *(topology_.get());
         return Status::OK();
@@ -292,10 +315,26 @@ Status TransferEngineImpl::construct() {
         conf_->get("enable_auto_failover_on_poll", true);
     enable_progress_worker_ = conf_->get("enable_progress_worker", false);
     runtime_queue_config_.enabled = conf_->get("enable_runtime_queue", false);
-    runtime_queue_config_.receiver_credit_enabled =
-        conf_->get("receiver_credit/enabled", false);
-    runtime_queue_config_.receiver_credit_default_qos_class =
-        conf_->get("receiver_credit/default_qos_class", uint32_t{0});
+    receiver_credit_production_enabled_ =
+        hasProductionReceiverCreditConfig(*conf_);
+    if (receiver_credit_production_enabled_) {
+        CHECK_STATUS(loadReceiverCreditConfig(
+            *conf_, runtime_queue_config_.enabled, receiver_credit_config_));
+        receiver_credit_production_enabled_ =
+            receiver_credit_config_.mode != CreditRolloutMode::Disabled;
+        runtime_queue_config_.receiver_credit_enabled =
+            receiver_credit_production_enabled_;
+        runtime_queue_config_.receiver_credit_default_qos_class =
+            receiver_credit_config_.default_qos_class;
+    } else {
+        // Compatibility for the stacked dispatch-gate prototype. Production
+        // automatic wiring requires the strict mode/capacity schema above;
+        // the legacy boolean still supports the explicit install test API.
+        runtime_queue_config_.receiver_credit_enabled =
+            conf_->get("receiver_credit/enabled", false);
+        runtime_queue_config_.receiver_credit_default_qos_class =
+            conf_->get("receiver_credit/default_qos_class", uint32_t{0});
+    }
     if (runtime_queue_config_.receiver_credit_enabled &&
         !runtime_queue_config_.enabled) {
         return Status::InvalidArgument(
@@ -323,6 +362,11 @@ Status TransferEngineImpl::construct() {
     runtime_queue_config_.progress_fallback_interval =
         std::chrono::microseconds(
             conf_->get("runtime_queue/progress_fallback_interval_us", 50000UL));
+    if (receiver_credit_production_enabled_) {
+        runtime_queue_config_.progress_fallback_interval =
+            std::chrono::microseconds(
+                receiver_credit_config_.progress_interval_us);
+    }
     if (runtime_queue_config_.enabled &&
         (runtime_queue_config_.max_dispatch_owners == 0 ||
          runtime_queue_config_.max_dispatch_bytes == 0)) {
@@ -331,6 +375,40 @@ Status TransferEngineImpl::construct() {
     }
     runtime_queue_ = std::make_unique<LocalTransferAdmissionQueue>(
         runtime_queue_config_.limits);
+    if (receiver_credit_production_enabled_) {
+        local_peer_session_ = {randomNonzero64(), randomNonzero64()};
+        local_sender_peer_ = local_peer_session_.low;
+
+        ReceiverCreditAllocatorConfig allocator_config;
+        allocator_config.capacity = receiver_credit_config_.capacity;
+        allocator_config.max_grant_per_pull =
+            receiver_credit_config_.max_grant_per_pull;
+        allocator_config.max_entries = receiver_credit_config_.max_peers;
+        allocator_config.ttl_ms = receiver_credit_config_.freshness_ttl_ms;
+        allocator_config.retry_after_us =
+            receiver_credit_config_.retry_after_us;
+        allocator_config.receiver_session_id = local_peer_session_;
+        allocator_config.epoch = 1;
+        std::unique_ptr<ReceiverCreditAllocator> allocator;
+        CHECK_STATUS(
+            ReceiverCreditAllocator::create(allocator_config, allocator));
+        receiver_credit_allocator_ = std::move(allocator);
+
+        receiver_credit_contexts_ = std::make_shared<CreditPeerContextTable>(
+            receiver_credit_config_.max_peers);
+        receiver_credit_ledger_ = std::make_shared<SenderCreditLedger>(
+            receiver_credit_config_.max_peers);
+        receiver_credit_dispatch_gate_ =
+            std::make_shared<ReceiverCreditDispatchGate>(
+                *receiver_credit_contexts_, *receiver_credit_ledger_);
+        receiver_credit_qos_provider_ = [](const Request&) -> uint32_t {
+            return 0;
+        };
+        CHECK_STATUS(ReceiverCreditPullController::create(
+            receiver_credit_config_, local_sender_peer_,
+            receiver_credit_contexts_, receiver_credit_ledger_,
+            receiver_credit_pull_controller_));
+    }
     if (!hostname_.empty())
         CHECK_STATUS(checkLocalIpAddress(hostname_, ipv6_));
     else
@@ -342,6 +420,9 @@ Status TransferEngineImpl::construct() {
 
     metadata_ =
         std::make_shared<ControlService>(metadata_type, metadata_servers, this);
+
+    if (receiver_credit_allocator_)
+        metadata_->setReceiverCreditAllocator(receiver_credit_allocator_);
 
     CHECK_STATUS(metadata_->start(port_, ipv6_));
 
@@ -435,6 +516,11 @@ Status TransferEngineImpl::installReceiverCreditDispatch(
     std::shared_ptr<SenderCreditLedger> ledger,
     CreditQosProvider qos_provider) {
     std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+    if (receiver_credit_production_enabled_) {
+        return Status::InvalidEntry(
+            "production receiver credit control is installed "
+            "automatically" LOC_MARK);
+    }
     if (!runtime_queue_config_.receiver_credit_enabled) {
         return Status::InvalidArgument(
             "receiver credit dispatch is not enabled" LOC_MARK);
@@ -467,6 +553,9 @@ Status TransferEngineImpl::installReceiverCreditDispatch(
 
 Status TransferEngineImpl::deconstruct() {
     // Metrics cleanup is handled automatically by TentMetrics destructor
+
+    if (receiver_credit_pull_controller_)
+        receiver_credit_pull_controller_->stop();
 
     // Stop the progress worker first so it cannot race with batch teardown
     // below (it dereferences BatchID into Batch* via progressBatch). Keep the
@@ -1624,6 +1713,10 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
     submit.owners.reserve(prepared.owners.size());
     std::vector<std::optional<CreditDispatchSnapshot>> credit_snapshots(
         prepared.owners.size());
+    std::vector<std::optional<CreditCharge>> credit_charges(
+        prepared.owners.size());
+    std::vector<std::string> credit_server_addrs(prepared.owners.size());
+    std::vector<uint32_t> credit_qos_classes(prepared.owners.size(), 0);
     for (const auto& owner : prepared.owners) {
         if (owner.request.length > runtime_queue_config_.max_dispatch_bytes) {
             return Status::TooManyRequests(
@@ -1641,7 +1734,67 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
         return Status::InvalidEntry(
             "receiver credit dispatch is enabled but not installed" LOC_MARK);
     }
-    if (receiver_credit_dispatch_gate_) {
+    if (receiver_credit_production_enabled_) {
+        if (!receiver_credit_pull_controller_ ||
+            !receiver_credit_dispatch_gate_)
+            return Status::InvalidEntry(
+                "production receiver credit control is not installed" LOC_MARK);
+        for (size_t i = 0; i < prepared.owners.size(); ++i) {
+            const auto& owner = prepared.owners[i];
+            const auto& request = owner.request;
+            const bool consumes_remote_receiver =
+                request.target_id != LOCAL_SEGMENT_ID &&
+                request.opcode == Request::WRITE;
+            if (!consumes_remote_receiver) continue;
+
+            const bool supported_direct_write =
+                owner_kind == QueueOwnerKind::User && !owner.staging &&
+                owner.route.transport == RDMA;
+            if (!supported_direct_write) {
+                if (receiver_credit_config_.mode == CreditRolloutMode::Required)
+                    return Status::NotImplemented(
+                        "receiver credit required mode currently supports "
+                        "only direct remote RDMA WRITE" LOC_MARK);
+                continue;
+            }
+
+            SegmentDescRef remote;
+            CHECK_STATUS(metadata_->segmentManager().getRemoteCached(
+                remote, request.target_id));
+            const bool supports_v1 =
+                std::find(remote->receiver_credit_versions.begin(),
+                          remote->receiver_credit_versions.end(),
+                          uint16_t{1}) !=
+                remote->receiver_credit_versions.end();
+            if (!supports_v1) {
+                if (receiver_credit_config_.mode == CreditRolloutMode::Required)
+                    return Status::NotImplemented(
+                        "remote peer does not advertise receiver credit "
+                        "v1" LOC_MARK);
+                continue;
+            }
+            if (remote->rpc_server_addr.empty())
+                return Status::InvalidEntry(
+                    "receiver credit peer has no RPC address" LOC_MARK);
+
+            CreditCharge charge{{{CreditResource::DataBytes, request.length},
+                                 {CreditResource::RequestSlots, 1}}};
+            const uint32_t qos_class = 0;
+            CHECK_STATUS(receiver_credit_pull_controller_->request(
+                request.target_id, remote->rpc_server_addr, qos_class, charge));
+            CreditDispatchSnapshot snapshot;
+            auto snapshot_status = receiver_credit_dispatch_gate_->snapshot(
+                request.target_id, qos_class, charge, snapshot);
+            if (snapshot_status.ok()) {
+                credit_snapshots[i] = std::move(snapshot);
+            } else if (!snapshot_status.IsInvalidEntry()) {
+                return snapshot_status;
+            }
+            credit_charges[i] = std::move(charge);
+            credit_server_addrs[i] = remote->rpc_server_addr;
+            credit_qos_classes[i] = qos_class;
+        }
+    } else if (receiver_credit_dispatch_gate_) {
         if (!receiver_credit_qos_provider_)
             return Status::InvalidEntry(
                 "receiver credit QoS provider is missing" LOC_MARK);
@@ -1690,6 +1843,9 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
             prepared.owners[i].derived_task_ids.begin(),
             prepared.owners[i].derived_task_ids.end());
         queued.credit_snapshot = std::move(credit_snapshots[i]);
+        queued.credit_charge = std::move(credit_charges[i]);
+        queued.credit_server_addr = std::move(credit_server_addrs[i]);
+        queued.credit_qos_class = credit_qos_classes[i];
         queued_owners_.emplace(admitted_owner_ids[i], queued);
     }
     return Status::OK();
@@ -1706,6 +1862,17 @@ Status TransferEngineImpl::finishQueuedOwner(
         queued.credit_reservation->state == CreditReservationState::Reserved) {
         CHECK_STATUS(receiver_credit_dispatch_gate_->rollback(
             *queued.credit_reservation));
+    }
+    if (queued.credit_reservation &&
+        queued.credit_reservation->state == CreditReservationState::Committed) {
+        CHECK_STATUS(receiver_credit_dispatch_gate_->release(
+            *queued.credit_reservation));
+        if (receiver_credit_pull_controller_ && queued.credit_charge) {
+            CHECK_STATUS(receiver_credit_pull_controller_->request(
+                queued.credit_reservation->snapshot.target_id,
+                queued.credit_server_addr, queued.credit_qos_class,
+                *queued.credit_charge));
+        }
     }
     if (queued.in_dispatch_window) {
         if (dispatch_inflight_owners_ == 0 ||
@@ -1785,16 +1952,70 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
         return finishQueuedOwner(owner_id, FAILED);
     }
 
+    if (receiver_credit_production_enabled_ && queued.credit_charge &&
+        task.type != RDMA) {
+        if (receiver_credit_config_.mode == CreditRolloutMode::Required)
+            return finishQueuedOwner(owner_id, FAILED);
+        queued.credit_charge.reset();
+        queued.credit_snapshot.reset();
+    }
+
+    if (receiver_credit_production_enabled_ && queued.credit_charge &&
+        !queued.credit_snapshot) {
+        CreditDispatchSnapshot snapshot;
+        auto snapshot_status = receiver_credit_dispatch_gate_->snapshot(
+            task.request.target_id, queued.credit_qos_class,
+            *queued.credit_charge, snapshot);
+        if (snapshot_status.ok()) {
+            queued.credit_snapshot = std::move(snapshot);
+        } else if (snapshot_status.IsInvalidEntry()) {
+            auto peer_state = receiver_credit_pull_controller_->peerState(
+                task.request.target_id, queued.credit_qos_class);
+            if (peer_state == CreditPeerState::Failed)
+                return finishQueuedOwner(owner_id, FAILED);
+            if (peer_state == CreditPeerState::Legacy &&
+                receiver_credit_config_.mode == CreditRolloutMode::Optional) {
+                queued.credit_charge.reset();
+            } else {
+                CHECK_STATUS(receiver_credit_pull_controller_->request(
+                    task.request.target_id, queued.credit_server_addr,
+                    queued.credit_qos_class, *queued.credit_charge));
+                CHECK_STATUS(runtime_queue_->deferDispatch(owner_id));
+                return Status::TooManyRequests(
+                    "waiting for receiver credit" LOC_MARK);
+            }
+        } else {
+            return finishQueuedOwner(owner_id, FAILED);
+        }
+    }
+
     if (queued.credit_snapshot) {
         queued.credit_reservation.emplace();
         auto reserve_status = receiver_credit_dispatch_gate_->tryReserve(
             *queued.credit_snapshot, *queued.credit_reservation);
         if (reserve_status.IsTooManyRequests()) {
             queued.credit_reservation.reset();
+            if (receiver_credit_production_enabled_ && queued.credit_charge)
+                CHECK_STATUS(receiver_credit_pull_controller_->request(
+                    task.request.target_id, queued.credit_server_addr,
+                    queued.credit_qos_class, *queued.credit_charge));
             CHECK_STATUS(runtime_queue_->deferDispatch(owner_id));
             return reserve_status;
         }
-        if (!reserve_status.ok()) return finishQueuedOwner(owner_id, FAILED);
+        if (!reserve_status.ok()) {
+            queued.credit_reservation.reset();
+            if (receiver_credit_production_enabled_ && queued.credit_charge &&
+                reserve_status.IsInvalidEntry()) {
+                queued.credit_snapshot.reset();
+                CHECK_STATUS(receiver_credit_pull_controller_->request(
+                    task.request.target_id, queued.credit_server_addr,
+                    queued.credit_qos_class, *queued.credit_charge));
+                CHECK_STATUS(runtime_queue_->deferDispatch(owner_id));
+                return Status::TooManyRequests(
+                    "receiver credit generation is refreshing" LOC_MARK);
+            }
+            return finishQueuedOwner(owner_id, FAILED);
+        }
     }
 
     if (task.type == TCP) {
@@ -1939,6 +2160,21 @@ Status TransferEngineImpl::submitTransfer(
     const size_t start_task_id = batch_ref.get()->task_list.size();
     PreparedSubmit prepared;
     CHECK_STATUS(prepareSubmit(batch_ref.get(), request_list, prepared));
+
+    if (receiver_credit_production_enabled_ &&
+        receiver_credit_config_.mode == CreditRolloutMode::Required) {
+        for (const auto& owner : prepared.owners) {
+            const bool remote_write =
+                owner.request.target_id != LOCAL_SEGMENT_ID &&
+                owner.request.opcode == Request::WRITE;
+            if (remote_write &&
+                (owner_kind != QueueOwnerKind::User || owner.staging ||
+                 owner.route.transport != RDMA))
+                return Status::NotImplemented(
+                    "receiver credit required mode currently supports only "
+                    "direct remote RDMA WRITE" LOC_MARK);
+        }
+    }
 
     if (shouldQueueSubmit(prepared, owner_kind)) {
         CHECK_STATUS(

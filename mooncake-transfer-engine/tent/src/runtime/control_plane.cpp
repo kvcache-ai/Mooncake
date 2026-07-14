@@ -97,6 +97,55 @@ Status ControlClient::probe(const std::string& server_addr) {
     return tl_rpc_agent.call(server_addr, Probe, request, response);
 }
 
+Status ControlClient::pullReceiverCredit(
+    const std::string& server_addr, const ReceiverCreditPullRequestV1& request,
+    ReceiverCreditPullResponseV1& response) {
+    std::string request_wire, response_wire;
+    CHECK_STATUS(
+        ReceiverCreditPullRequestCodecV1::encode(request, request_wire));
+    CHECK_STATUS(tl_rpc_agent.call(server_addr, PullReceiverCredit,
+                                   request_wire, response_wire));
+    if (response_wire.empty())
+        return Status::NotImplemented(
+            "peer does not implement receiver credit pull" LOC_MARK);
+    return ReceiverCreditPullResponseCodecV1::decode(response_wire, response);
+}
+
+void ControlClient::pullReceiverCreditAsync(
+    const std::shared_ptr<CoroRpcAgent>& agent, const std::string& server_addr,
+    const ReceiverCreditPullRequestV1& request, OnReceiverCreditPull callback) {
+    if (!agent) {
+        callback(Status::InvalidArgument(
+                     "receiver credit pull RPC agent is null" LOC_MARK),
+                 {});
+        return;
+    }
+    std::string request_wire;
+    auto status =
+        ReceiverCreditPullRequestCodecV1::encode(request, request_wire);
+    if (!status.ok()) {
+        callback(std::move(status), {});
+        return;
+    }
+    agent->callAsync(server_addr, PullReceiverCredit, request_wire,
+                     [agent, callback = std::move(callback)](
+                         Status rpc_status, std::string response_wire) mutable {
+                         ReceiverCreditPullResponseV1 response;
+                         if (rpc_status.ok()) {
+                             if (response_wire.empty()) {
+                                 rpc_status = Status::NotImplemented(
+                                     "peer does not implement receiver credit "
+                                     "pull" LOC_MARK);
+                             } else {
+                                 rpc_status =
+                                     ReceiverCreditPullResponseCodecV1::decode(
+                                         response_wire, response);
+                             }
+                         }
+                         callback(std::move(rpc_status), std::move(response));
+                     });
+}
+
 inline void to_json(json& j, const Request& r) {
     j = json{{"opcode", r.opcode == Request::READ ? "READ" : "WRITE"},
              {"source", reinterpret_cast<uintptr_t>(r.source)},
@@ -216,12 +265,23 @@ ControlService::ControlService(const std::string& type,
         [this](const std::string_view& request, std::string& response) {
             onSegmentUpdated(request, response);
         });
+    rpc_server_->registerFunction(
+        PullReceiverCredit,
+        [this](const std::string_view& request, std::string& response) {
+            onPullReceiverCredit(request, response);
+        });
 }
 
 ControlService::~ControlService() {}
 
 Status ControlService::start(uint16_t& port, bool ipv6_) {
     return rpc_server_->start(port, ipv6_);
+}
+
+void ControlService::setReceiverCreditAllocator(
+    std::shared_ptr<ReceiverCreditAllocator> allocator) {
+    std::lock_guard lock(receiver_credit_mutex_);
+    receiver_credit_allocator_ = std::move(allocator);
 }
 
 void ControlService::onGetSegmentDesc(const std::string_view& request,
@@ -342,6 +402,41 @@ void ControlService::onSegmentUpdated(const std::string_view& request,
 
     VLOG(1) << "Invalidated cache for segment " << segment_name
             << " due to remote update notification";
+}
+
+void ControlService::onPullReceiverCredit(const std::string_view& request,
+                                          std::string& response) {
+    ReceiverCreditPullResponseV1 reply;
+    ReceiverCreditPullRequestV1 decoded;
+    auto status = ReceiverCreditPullRequestCodecV1::decode(request, decoded);
+    if (!status.ok()) {
+        ReceiverCreditPullResponseCodecV1::makeZeroPayload(
+            ReceiverCreditPullStatus::Rejected, reply);
+    } else {
+        std::shared_ptr<ReceiverCreditAllocator> allocator;
+        {
+            std::lock_guard lock(receiver_credit_mutex_);
+            allocator = receiver_credit_allocator_;
+        }
+        if (!allocator) {
+            ReceiverCreditPullResponseCodecV1::makeZeroPayload(
+                ReceiverCreditPullStatus::Unsupported, reply);
+        } else {
+            status = allocator->pull(decoded, reply);
+            if (!status.ok())
+                ReceiverCreditPullResponseCodecV1::makeZeroPayload(
+                    ReceiverCreditPullStatus::Rejected, reply);
+        }
+    }
+    auto encode_status =
+        ReceiverCreditPullResponseCodecV1::encode(reply, response);
+    if (!encode_status.ok()) {
+        // An empty response is interpreted as a protocol/RPC failure by new
+        // clients. Never expose decoder text or allocate an unbounded error.
+        response.clear();
+        LOG(ERROR) << "Failed to encode receiver credit pull response: "
+                   << encode_status.ToString();
+    }
 }
 
 void ControlClient::subscribeSegmentUpdateAsync(

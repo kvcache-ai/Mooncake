@@ -216,6 +216,27 @@ TEST(ReceiverCreditControl, PeerContextCapacityRecoversAfterExactCleanup) {
     EXPECT_EQ(contexts.size(), 1);
 }
 
+TEST(ReceiverCreditControl, PeerContextFreshnessExpiresAndRefreshesInPlace) {
+    CreditPeerContextTable contexts;
+    CreditActivationV1 activation;
+    activation.receiver_session_id = {11, 22};
+    activation.epoch = 7;
+    activation.freshness_ttl_ms = 2;
+    ASSERT_TRUE(contexts.activate(9, 3, 4, activation).ok());
+
+    CreditPeerContextSnapshot snapshot;
+    ASSERT_TRUE(contexts.lookupFresh(9, 4, snapshot).ok());
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    EXPECT_TRUE(contexts.lookupFresh(9, 4, snapshot).IsInvalidEntry());
+
+    // A heartbeat for the same generation refreshes only freshness metadata;
+    // it does not create a new key or epoch.
+    ASSERT_TRUE(contexts.activate(9, 3, 4, activation).ok());
+    ASSERT_TRUE(contexts.lookupFresh(9, 4, snapshot).ok());
+    EXPECT_EQ(snapshot.epoch, 7);
+    EXPECT_EQ(contexts.size(), 1);
+}
+
 TEST(ReceiverCreditControl, ConcurrentPeerRestartLookupNeverTearsSnapshot) {
     CreditPeerContextTable contexts;
     CreditActivationV1 initial;

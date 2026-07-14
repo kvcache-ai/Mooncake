@@ -47,6 +47,9 @@ enum RpcFuncID {
     Unpin,
     SubscribeSegmentUpdate,
     NotifySegmentUpdated,
+    // Sender-pull control message for receiver-advertised credits. Keep this
+    // ID append-only so mixed-version peers never reinterpret an existing RPC.
+    PullReceiverCredit = 12,
 };
 
 class ClientPool;
@@ -57,24 +60,24 @@ class CoroRpcAgent {
 
     virtual ~CoroRpcAgent();
 
-    CoroRpcAgent(const CoroRpcAgent &) = delete;
-    CoroRpcAgent &operator=(const CoroRpcAgent &) = delete;
+    CoroRpcAgent(const CoroRpcAgent&) = delete;
+    CoroRpcAgent& operator=(const CoroRpcAgent&) = delete;
 
    public:
-    using Function = std::function<void(const std::string_view & /* request */,
-                                        std::string & /* response */)>;
-    Status registerFunction(int func_id, const Function &func);
+    using Function = std::function<void(const std::string_view& /* request */,
+                                        std::string& /* response */)>;
+    Status registerFunction(int func_id, const Function& func);
 
-    Status start(uint16_t &port, bool ipv6 = false);
+    Status start(uint16_t& port, bool ipv6 = false);
 
     Status stop();
 
-    Status call(const std::string &server_addr, int func_id,
-                const std::string_view &request, std::string &response);
+    Status call(const std::string& server_addr, int func_id,
+                const std::string_view& request, std::string& response);
 
     using AsyncCallback = std::function<void(Status, std::string)>;
-    void callAsync(const std::string &server_addr, int func_id,
-                   const std::string &request, AsyncCallback callback);
+    void callAsync(const std::string& server_addr, int func_id,
+                   const std::string& request, AsyncCallback callback);
 
     async_simple::coro::Lazy<std::pair<Status, std::string>> callCoroutine(
         std::string server_addr, int func_id, std::string request);
@@ -82,10 +85,10 @@ class CoroRpcAgent {
    private:
     void process(int func_id);
 
-    std::shared_ptr<ClientPool> getOrCreatePool(const std::string &server_addr);
+    std::shared_ptr<ClientPool> getOrCreatePool(const std::string& server_addr);
 
    private:
-    coro_rpc::coro_rpc_server *server_ = nullptr;
+    coro_rpc::coro_rpc_server* server_ = nullptr;
 
     std::mutex pools_mutex_;
     std::unordered_map<std::string, std::shared_ptr<ClientPool>> pools_;

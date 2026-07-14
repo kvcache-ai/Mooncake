@@ -12,7 +12,7 @@ Status ReceiverCreditDispatchGate::snapshot(
         return Status::InvalidArgument(
             "invalid receiver credit dispatch snapshot" LOC_MARK);
     CreditPeerContextSnapshot peer;
-    CHECK_STATUS(contexts_.lookup(target_id, qos_class, peer));
+    CHECK_STATUS(contexts_.lookupFresh(target_id, qos_class, peer));
     CreditDispatchSnapshot next;
     next.target_id = target_id;
     next.qos_class = qos_class;
@@ -31,11 +31,12 @@ Status ReceiverCreditDispatchGate::tryReserve(
             "receiver credit reservation token already used" LOC_MARK);
     CreditPeerContextSnapshot current;
     CHECK_STATUS(
-        contexts_.lookup(snapshot.target_id, snapshot.qos_class, current));
+        contexts_.lookupFresh(snapshot.target_id, snapshot.qos_class, current));
     if (!(current.key == snapshot.key) || current.epoch != snapshot.epoch)
         return Status::InvalidEntry(
             "receiver credit dispatch snapshot is stale" LOC_MARK);
-    CHECK_STATUS(ledger_.tryReserve(snapshot.key, snapshot.charge));
+    CHECK_STATUS(
+        ledger_.tryReserve(snapshot.key, snapshot.epoch, snapshot.charge));
     reservation.snapshot = snapshot;
     reservation.state = CreditReservationState::Reserved;
     return Status::OK();
@@ -56,8 +57,21 @@ Status ReceiverCreditDispatchGate::rollback(
         return Status::InvalidEntry(
             "receiver credit reservation is not pending" LOC_MARK);
     CHECK_STATUS(ledger_.rollbackReservation(reservation.snapshot.key,
+                                             reservation.snapshot.epoch,
                                              reservation.snapshot.charge));
     reservation.state = CreditReservationState::RolledBack;
+    return Status::OK();
+}
+
+Status ReceiverCreditDispatchGate::release(
+    CreditDispatchReservation& reservation) {
+    if (reservation.state != CreditReservationState::Committed)
+        return Status::InvalidEntry(
+            "receiver credit reservation is not committed" LOC_MARK);
+    CHECK_STATUS(ledger_.recordCompletion(reservation.snapshot.key,
+                                          reservation.snapshot.epoch,
+                                          reservation.snapshot.charge));
+    reservation.state = CreditReservationState::Released;
     return Status::OK();
 }
 

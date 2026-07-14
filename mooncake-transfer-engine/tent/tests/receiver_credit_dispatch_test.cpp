@@ -63,7 +63,7 @@ TEST(ReceiverCreditDispatch, SubmitFailureRollsBackExactMultiResourceCharge) {
     EXPECT_EQ(slots, 4);
 }
 
-TEST(ReceiverCreditDispatch, SubmitSuccessCommitsAndCannotRollback) {
+TEST(ReceiverCreditDispatch, SubmitSuccessReleasesWithoutMintingCredit) {
     CreditPeerContextTable contexts;
     ASSERT_TRUE(
         contexts.activate(kTarget, kSender, kQos, activation({11, 22}, 7))
@@ -80,6 +80,9 @@ TEST(ReceiverCreditDispatch, SubmitSuccessCommitsAndCannotRollback) {
     ASSERT_TRUE(gate.tryReserve(snapshot, reservation).ok());
     ASSERT_TRUE(gate.commit(reservation).ok());
     EXPECT_TRUE(gate.rollback(reservation).IsInvalidEntry());
+    ASSERT_TRUE(gate.release(reservation).ok());
+    EXPECT_EQ(reservation.state, CreditReservationState::Released);
+    EXPECT_TRUE(gate.release(reservation).IsInvalidEntry());
     uint64_t bytes = 0, slots = 0;
     ASSERT_TRUE(
         ledger.available(peer.key, CreditResource::DataBytes, bytes).ok());
@@ -87,6 +90,47 @@ TEST(ReceiverCreditDispatch, SubmitSuccessCommitsAndCannotRollback) {
         ledger.available(peer.key, CreditResource::RequestSlots, slots).ok());
     EXPECT_EQ(bytes, 40);
     EXPECT_EQ(slots, 2);
+    CreditLedgerSnapshot ledger_snapshot;
+    ASSERT_TRUE(ledger.snapshot(peer.key, peer.epoch, ledger_snapshot).ok());
+    EXPECT_EQ(ledger_snapshot.consumed[0], 60);
+    EXPECT_EQ(ledger_snapshot.consumed[1], 2);
+    EXPECT_EQ(ledger_snapshot.completed[0], 60);
+    EXPECT_EQ(ledger_snapshot.completed[1], 2);
+}
+
+TEST(ReceiverCreditDispatch, OldEpochRollbackAndReleaseLeaveNewEpochUntouched) {
+    CreditPeerContextTable contexts;
+    ASSERT_TRUE(
+        contexts.activate(kTarget, kSender, kQos, activation({11, 22}, 7))
+            .ok());
+    CreditPeerContextSnapshot peer;
+    ASSERT_TRUE(contexts.lookup(kTarget, kQos, peer).ok());
+    SenderCreditLedger ledger;
+    ASSERT_TRUE(ledger.activate(peer.key, peer.epoch).ok());
+    grant(ledger, peer.key, peer.epoch, 100, 4);
+    ReceiverCreditDispatchGate gate(contexts, ledger);
+    CreditDispatchSnapshot snapshot;
+    ASSERT_TRUE(gate.snapshot(kTarget, kQos, charge(20, 1), snapshot).ok());
+    CreditDispatchReservation pending;
+    CreditDispatchReservation committed;
+    ASSERT_TRUE(gate.tryReserve(snapshot, pending).ok());
+    ASSERT_TRUE(gate.tryReserve(snapshot, committed).ok());
+    ASSERT_TRUE(gate.commit(committed).ok());
+
+    ASSERT_TRUE(ledger.activate(peer.key, 8).ok());
+    grant(ledger, peer.key, 8, 50, 2);
+    ASSERT_TRUE(ledger.tryReserve(peer.key, charge(10, 1)).ok());
+
+    EXPECT_TRUE(gate.rollback(pending).IsInvalidEntry());
+    EXPECT_TRUE(gate.release(committed).IsInvalidEntry());
+    EXPECT_EQ(pending.state, CreditReservationState::Reserved);
+    EXPECT_EQ(committed.state, CreditReservationState::Committed);
+    CreditLedgerSnapshot current;
+    ASSERT_TRUE(ledger.snapshot(peer.key, 8, current).ok());
+    EXPECT_EQ(current.consumed[0], 10);
+    EXPECT_EQ(current.consumed[1], 1);
+    EXPECT_EQ(current.completed[0], 0);
+    EXPECT_EQ(current.completed[1], 0);
 }
 
 TEST(ReceiverCreditDispatch, ReceiverRestartRejectsQueuedOldSnapshot) {

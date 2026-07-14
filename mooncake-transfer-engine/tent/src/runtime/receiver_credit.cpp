@@ -117,11 +117,28 @@ Status SenderCreditLedger::applyUpdate(const CreditKey& k,
 
 Status SenderCreditLedger::tryReserve(const CreditKey& k,
                                       const CreditCharge& c) {
+    uint64_t epoch = 0;
+    {
+        std::lock_guard lock(mutex_);
+        auto it = entries_.find(k);
+        if (it == entries_.end())
+            return Status::InvalidEntry("credit unavailable" LOC_MARK);
+        epoch = it->second.epoch;
+    }
+    return tryReserve(k, epoch, c);
+}
+
+Status SenderCreditLedger::tryReserve(const CreditKey& k,
+                                      uint64_t expected_epoch,
+                                      const CreditCharge& c) {
+    if (!expected_epoch)
+        return Status::InvalidArgument("zero expected credit epoch" LOC_MARK);
     std::array<uint64_t, kCreditResourceCount> n;
     CHECK_STATUS(normalize(c, n));
     std::lock_guard lock(mutex_);
     auto it = entries_.find(k);
-    if (it == entries_.end() || !it->second.has_update)
+    if (it == entries_.end() || it->second.epoch != expected_epoch ||
+        !it->second.has_update)
         return Status::InvalidEntry("credit unavailable" LOC_MARK);
     auto& e = it->second;
     for (size_t i = 0; i < kCreditResourceCount; ++i)
@@ -132,19 +149,67 @@ Status SenderCreditLedger::tryReserve(const CreditKey& k,
 }
 
 Status SenderCreditLedger::rollbackReservation(const CreditKey& k,
+                                               uint64_t expected_epoch,
                                                const CreditCharge& c) {
+    if (!expected_epoch)
+        return Status::InvalidArgument("zero expected credit epoch" LOC_MARK);
     std::array<uint64_t, kCreditResourceCount> n;
     CHECK_STATUS(normalize(c, n));
     std::lock_guard lock(mutex_);
     auto it = entries_.find(k);
-    if (it == entries_.end())
-        return Status::InvalidEntry("credit session inactive" LOC_MARK);
+    if (it == entries_.end() || it->second.epoch != expected_epoch)
+        return Status::InvalidEntry(
+            "inactive or stale credit rollback epoch" LOC_MARK);
     for (size_t i = 0; i < kCreditResourceCount; ++i)
-        if (n[i] > it->second.consumed[i])
+        if (it->second.completed[i] > it->second.consumed[i] ||
+            n[i] > it->second.consumed[i] - it->second.completed[i])
             return Status::InvalidArgument(
                 "credit rollback underflow" LOC_MARK);
     for (size_t i = 0; i < kCreditResourceCount; ++i)
         it->second.consumed[i] -= n[i];
+    return Status::OK();
+}
+
+Status SenderCreditLedger::recordCompletion(const CreditKey& k,
+                                            uint64_t expected_epoch,
+                                            const CreditCharge& c) {
+    if (!expected_epoch)
+        return Status::InvalidArgument("zero expected credit epoch" LOC_MARK);
+    std::array<uint64_t, kCreditResourceCount> n;
+    CHECK_STATUS(normalize(c, n));
+    std::lock_guard lock(mutex_);
+    auto it = entries_.find(k);
+    if (it == entries_.end() || it->second.epoch != expected_epoch)
+        return Status::InvalidEntry(
+            "inactive or stale credit completion epoch" LOC_MARK);
+    for (size_t i = 0; i < kCreditResourceCount; ++i) {
+        if (it->second.completed[i] > it->second.consumed[i] ||
+            n[i] > it->second.consumed[i] - it->second.completed[i])
+            return Status::InvalidArgument(
+                "credit completion exceeds consumption" LOC_MARK);
+    }
+    for (size_t i = 0; i < kCreditResourceCount; ++i)
+        it->second.completed[i] += n[i];
+    return Status::OK();
+}
+
+Status SenderCreditLedger::snapshot(const CreditKey& k, uint64_t expected_epoch,
+                                    CreditLedgerSnapshot& output) const {
+    if (!expected_epoch)
+        return Status::InvalidArgument("zero expected credit epoch" LOC_MARK);
+    std::lock_guard lock(mutex_);
+    auto it = entries_.find(k);
+    if (it == entries_.end() || it->second.epoch != expected_epoch)
+        return Status::InvalidEntry(
+            "inactive or stale credit snapshot epoch" LOC_MARK);
+    CreditLedgerSnapshot next;
+    next.epoch = it->second.epoch;
+    next.last_sequence = it->second.last_sequence;
+    next.has_update = it->second.has_update;
+    next.grants = it->second.grants;
+    next.consumed = it->second.consumed;
+    next.completed = it->second.completed;
+    output = next;
     return Status::OK();
 }
 
