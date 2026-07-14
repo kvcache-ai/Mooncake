@@ -116,6 +116,43 @@ int mooncake_store_setup(mooncake_store_t store, const char *local_hostname,
     }
 }
 
+int mooncake_store_setup_ex(
+    mooncake_store_t store, const char *local_hostname,
+    const char *metadata_server, uint64_t global_segment_size,
+    uint64_t local_buffer_size, const char *protocol, const char *device_name,
+    const char *master_server_addr,
+    const mooncake_store_setup_options_t *options) {
+    if (!store || !options ||
+        options->struct_size < sizeof(mooncake_store_setup_options_t) ||
+        options->version != MOONCAKE_STORE_SETUP_OPTIONS_VERSION) {
+        return -1;
+    }
+
+    mooncake::ReplicaSelectionOptions replica_selection;
+    switch (options->replica_selection_mode) {
+        case MOONCAKE_REPLICA_SELECTION_LEGACY:
+            replica_selection.mode = mooncake::ReplicaSelectionMode::LEGACY;
+            break;
+        case MOONCAKE_REPLICA_SELECTION_SHADOW:
+            replica_selection.mode = mooncake::ReplicaSelectionMode::SHADOW;
+            break;
+        default:
+            return -1;
+    }
+
+    try {
+        return as_client(store)->setup_real_with_options(
+            c_str_or(local_hostname, ""), c_str_or(metadata_server, ""),
+            global_segment_size, local_buffer_size, c_str_or(protocol, "tcp"),
+            c_str_or(device_name, ""),
+            c_str_or(master_server_addr, "127.0.0.1:50051"), nullptr, "",
+            false, "", "default", false,
+            mooncake::DEFAULT_CLIENT_HTTP_PORT, replica_selection);
+    } catch (...) {
+        return -1;
+    }
+}
+
 int mooncake_store_init_all(mooncake_store_t store, const char *protocol,
                             const char *device_name,
                             uint64_t mount_segment_size) {

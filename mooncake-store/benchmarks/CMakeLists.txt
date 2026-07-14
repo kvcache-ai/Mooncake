@@ -18,6 +18,11 @@ target_link_libraries(batch_get_replica_bench PRIVATE cachelib_memory_allocator
 add_executable(replica_selector_v2_bench replica_selector_v2_bench.cpp)
 target_link_libraries(replica_selector_v2_bench PRIVATE mooncake_store pthread)
 
+add_executable(cached_replica_score_provider_bench
+               cached_replica_score_provider_bench.cpp)
+target_link_libraries(cached_replica_score_provider_bench
+                      PRIVATE mooncake_store pthread)
+
 # Add file interface benchmark executable
 add_executable(file_interface_bench file_interface_bench.cpp)
 target_link_libraries(file_interface_bench PRIVATE mooncake_store glog::glog)

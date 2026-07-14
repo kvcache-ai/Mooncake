@@ -949,6 +949,10 @@ TEST_F(RealClientTest, SetupWithConfigDict) {
 
     result = py_client_->setup_internal(config);
     ASSERT_TRUE(result.has_value()) << "Setup with ConfigDict should succeed";
+    EXPECT_EQ(py_client_->replica_selection_mode(),
+              ReplicaSelectionMode::LEGACY);
+    EXPECT_EQ(py_client_->publish_replica_signal_snapshot({}),
+              ReplicaSignalPublishStatus::NOT_ENABLED);
 
     const std::string test_data = "Hello, ConfigDict!";
     const std::string key = "test_key_configdict";
@@ -968,6 +972,42 @@ TEST_F(RealClientTest, SetupWithConfigDict) {
     std::string retrieved_data(static_cast<const char*>(buffer_handle->ptr()),
                                buffer_handle->size());
     EXPECT_EQ(retrieved_data, test_data) << "Retrieved data should match";
+}
+
+TEST_F(RealClientTest, SetupWithShadowReplicaSelection) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+
+    ConfigDict config = MakeConfigDict(
+        "localhost:17817", std::to_string(16 * 1024 * 1024),
+        std::to_string(16 * 1024 * 1024));
+    config[CONFIG_KEY_REPLICA_SELECTION_MODE] = "shadow";
+
+    const auto result = py_client_->setup_internal(config);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(py_client_->replica_selection_mode(),
+              ReplicaSelectionMode::SHADOW);
+
+    ReplicaSignalSnapshot snapshot;
+    snapshot.generation = 1;
+    EXPECT_EQ(py_client_->publish_replica_signal_snapshot(std::move(snapshot)),
+              ReplicaSignalPublishStatus::PUBLISHED);
+}
+
+TEST_F(RealClientTest, SetupRejectsNonPublicReplicaSelectionModes) {
+    ConfigDict config = MakeConfigDict(
+        "localhost:17818", std::to_string(16 * 1024 * 1024),
+        std::to_string(16 * 1024 * 1024));
+
+    for (const std::string_view invalid : {"", "active", "SHADOW", "v2"}) {
+        config[CONFIG_KEY_REPLICA_SELECTION_MODE] = std::string(invalid);
+        const auto result = py_client_->setup_internal(config);
+        EXPECT_FALSE(result.has_value()) << invalid;
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+        EXPECT_EQ(py_client_->replica_selection_mode(),
+                  ReplicaSelectionMode::LEGACY);
+    }
 }
 
 TEST_F(RealClientTest, SetupWithConfigDictHumanReadableSizes) {

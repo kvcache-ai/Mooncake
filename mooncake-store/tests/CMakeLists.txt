@@ -45,6 +45,10 @@ set_tests_properties(
   replica_selection_env_opt_in_test
   PROPERTIES ENVIRONMENT "MC_STORE_REPLICA_SCORING=1")
 add_store_test(replica_selector_v2_test replica_selector_v2_test.cpp)
+add_store_test(replica_selection_config_test
+               replica_selection_config_test.cpp)
+add_store_test(cached_replica_score_provider_test
+               cached_replica_score_provider_test.cpp)
 add_test(
   NAME replica_selector_v2_env_v1_isolation_test
   COMMAND replica_selector_v2_test

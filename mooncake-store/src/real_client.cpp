@@ -279,10 +279,6 @@ inline tl::expected<void, ErrorCode> scatter_host_to_maybe_device(
     return {};
 }
 
-// SelectBestReplica and the replica-scoring helpers live in
-// replica_selection.h (included above) so they can be unit-tested directly.
-using mooncake::SelectBestReplica;
-
 // Build a QueryResult containing only the chosen replica so that
 // Client::Get / Client::BatchGet (which internally call
 // FindFirstCompleteReplica) cannot pick a different replica type.
@@ -546,7 +542,8 @@ void ResourceTracker::startSignalThread() {
     });
 }
 
-RealClient::RealClient() {
+RealClient::RealClient()
+    : replica_selector_(std::make_unique<ReplicaSelector>()) {
     // Initialize logging severity (leave as before)
     mooncake::init_ylt_log_level();
     const char *hp = std::getenv("MC_STORE_USE_HUGEPAGE");
@@ -593,6 +590,51 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     bool enable_ssd_offload, bool start_offload_rpc_server,
     const std::string &ssd_offload_path, const std::string &tenant_id,
     bool enable_client_http_server, int client_http_port) {
+    return setup_internal_with_options(
+        local_hostname, metadata_server, global_segment_size,
+        local_buffer_size, protocol, rdma_devices, master_server_addr,
+        transfer_engine, ipc_socket_path, local_rpc_port, enable_ssd_offload,
+        start_offload_rpc_server, ssd_offload_path, tenant_id,
+        enable_client_http_server, client_http_port,
+        ReplicaSelectionOptions{});
+}
+
+tl::expected<void, ErrorCode> RealClient::setup_internal_with_options(
+    const std::string &local_hostname, const std::string &metadata_server,
+    size_t global_segment_size, size_t local_buffer_size,
+    const std::string &protocol, const std::string &rdma_devices,
+    const std::string &master_server_addr,
+    const std::shared_ptr<TransferEngine> &transfer_engine,
+    const std::string &ipc_socket_path, int local_rpc_port,
+    bool enable_ssd_offload, bool start_offload_rpc_server,
+    const std::string &ssd_offload_path, const std::string &tenant_id,
+    bool enable_client_http_server, int client_http_port,
+    ReplicaSelectionOptions replica_selection) {
+    if (replica_selection.mode != ReplicaSelectionMode::LEGACY &&
+        replica_selection.mode != ReplicaSelectionMode::SHADOW) {
+        LOG(ERROR) << "Unsupported public replica selection mode: "
+                   << ReplicaSelectionModeName(replica_selection.mode);
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    if (replica_selection.mode == ReplicaSelectionMode::SHADOW) {
+        ReplicaSignalProviderConfig provider_config;
+        provider_config.topology_source = {
+            true, false, std::chrono::seconds(30), 1.0};
+        provider_config.load_source = {
+            true, false, std::chrono::seconds(30), 1.0};
+        provider_config.health_source = {
+            true, false, std::chrono::seconds(30), 1.0};
+        replica_score_provider_ =
+            std::make_shared<CachedReplicaScoreProvider>(provider_config);
+        replica_selector_ = std::make_unique<ReplicaSelector>(
+            ReplicaSelectionMode::SHADOW, replica_score_provider_);
+    } else {
+        replica_score_provider_.reset();
+        replica_selector_ = std::make_unique<ReplicaSelector>(
+            ReplicaSelectionMode::LEGACY);
+    }
+
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
     const bool should_use_hugepage =
@@ -954,6 +996,66 @@ int RealClient::setup_real(
         tenant_id, enable_client_http_server, client_http_port));
 }
 
+int RealClient::setup_real_with_options(
+    const std::string &local_hostname, const std::string &metadata_server,
+    size_t global_segment_size, size_t local_buffer_size,
+    const std::string &protocol, const std::string &rdma_devices,
+    const std::string &master_server_addr,
+    const std::shared_ptr<TransferEngine> &transfer_engine,
+    const std::string &ipc_socket_path, bool enable_ssd_offload,
+    const std::string &ssd_offload_path, const std::string &tenant_id,
+    bool enable_client_http_server, int client_http_port,
+    ReplicaSelectionOptions replica_selection) {
+    return to_py_ret(setup_internal_with_options(
+        local_hostname, metadata_server, global_segment_size,
+        local_buffer_size, protocol, rdma_devices, master_server_addr,
+        transfer_engine, ipc_socket_path, 50052, enable_ssd_offload, true,
+        ssd_offload_path, tenant_id, enable_client_http_server,
+        client_http_port, replica_selection));
+}
+
+ReplicaSelectionMode RealClient::replica_selection_mode() const noexcept {
+    return replica_selector_ ? replica_selector_->mode()
+                             : ReplicaSelectionMode::LEGACY;
+}
+
+ReplicaSignalPublishStatus RealClient::publish_replica_signal_snapshot(
+    ReplicaSignalSnapshot snapshot) {
+    if (!replica_score_provider_) {
+        return ReplicaSignalPublishStatus::NOT_ENABLED;
+    }
+    return replica_score_provider_->PublishSnapshot(std::move(snapshot));
+}
+
+const Replica::Descriptor *RealClient::select_replica_for_read(
+    const std::vector<Replica::Descriptor> &replicas, const std::string &key,
+    uint64_t requested_bytes) const {
+    if (!client_ || !replica_selector_) return nullptr;
+
+    if (requested_bytes == 0) {
+        std::optional<uint64_t> inferred_size;
+        for (const auto &replica : replicas) {
+            if (replica.status != ReplicaStatus::COMPLETE) continue;
+            const uint64_t size = calculate_total_size(replica);
+            if (!inferred_size) {
+                inferred_size = size;
+            } else if (*inferred_size != size) {
+                inferred_size = 0;
+                break;
+            }
+        }
+        requested_bytes = inferred_size.value_or(0);
+    }
+
+    const auto local_endpoints = client_->GetLocalEndpoints();
+    const ReplicaSelectionContext context{
+        client_->tenant_id(), key, local_hostname, "", requested_bytes,
+        replica_selection_nonce_.fetch_add(1, std::memory_order_relaxed)};
+    const auto decision =
+        replica_selector_->Select(replicas, local_endpoints, context);
+    return ResolveReplica(replicas, decision.selected);
+}
+
 namespace {
 // Helper to get value from config dict with default
 inline std::string get_config(const ConfigDict &config, const std::string &key,
@@ -1102,6 +1204,16 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 
     std::string ssd_offload_path = get_config(config, "ssd_offload_path");
     std::string tenant_id = get_config(config, CONFIG_KEY_TENANT_ID, "default");
+    const std::string replica_selection_mode =
+        get_config(config, CONFIG_KEY_REPLICA_SELECTION_MODE, "legacy");
+    const auto replica_selection =
+        ParseReplicaSelectionOptions(replica_selection_mode);
+    if (!replica_selection) {
+        LOG(ERROR) << "Invalid " << CONFIG_KEY_REPLICA_SELECTION_MODE << ": "
+                   << replica_selection_mode
+                   << "; expected exactly 'legacy' or 'shadow'";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
     bool enable_ssd_offload =
         get_config_bool(config, "enable_ssd_offload", false);
     bool enable_client_http_server =
@@ -1113,11 +1225,12 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
     int client_http_port = client_http_port_opt.value();
 
-    return setup_internal(local_hostname, metadata_server, global_segment_size,
-                          local_buffer_size, protocol, rdma_devices,
-                          master_server_addr, nullptr, ipc_socket_path, 50052,
-                          enable_ssd_offload, true, ssd_offload_path, tenant_id,
-                          enable_client_http_server, client_http_port);
+    return setup_internal_with_options(
+        local_hostname, metadata_server, global_segment_size, local_buffer_size,
+        protocol, rdma_devices, master_server_addr, nullptr, ipc_socket_path,
+        50052, enable_ssd_offload, true, ssd_offload_path, tenant_id,
+        enable_client_http_server, client_http_port,
+        *replica_selection);
 }
 
 tl::expected<void, ErrorCode> RealClient::initAll_internal(
@@ -2638,8 +2751,7 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     // then LOCAL_DISK, then DISK.
     // LOCAL_DISK data is on a remote node's SSD — must use offload RPC.
     // MEMORY / DISK are handled via client_->Get below.
-    auto local_endpoints = client_->GetLocalEndpoints();
-    const auto *best_replica = SelectBestReplica(replica_list, local_endpoints);
+    const auto *best_replica = select_replica_for_read(replica_list, key);
     if (!best_replica) {
         LOG(ERROR) << "No usable replica for key: " << key;
         return nullptr;
@@ -2929,7 +3041,6 @@ RealClient::batch_get_buffer_internal(
     std::vector<DiskKeyOp> disk_ops;
     valid_ops.reserve(keys.size());
 
-    auto local_endpoints = client_->GetLocalEndpoints();
     for (size_t i = 0; i < keys.size(); ++i) {
         const auto &key = keys[i];
 
@@ -2951,7 +3062,7 @@ RealClient::batch_get_buffer_internal(
         // Select best replica: prefer local MEMORY, then any MEMORY,
         // then LOCAL_DISK, then DISK.
         const auto *best_replica =
-            SelectBestReplica(query_result_values.replicas, local_endpoints);
+            select_replica_for_read(query_result_values.replicas, key);
         if (!best_replica) {
             LOG(ERROR) << "No usable replica for key: " << key;
             continue;
@@ -3595,8 +3706,7 @@ RealClient::build_ranged_read_metadata_from_query_result(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    auto local_endpoints = client_->GetLocalEndpoints();
-    const auto *best_replica = SelectBestReplica(replica_list, local_endpoints);
+    const auto *best_replica = select_replica_for_read(replica_list, key);
     if (!best_replica) {
         LOG(ERROR) << "No usable replica for key: " << key;
         return tl::unexpected(ErrorCode::INVALID_REPLICA);
@@ -4479,7 +4589,6 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     std::vector<DiskKeyInfo> disk_operations;
     valid_operations.reserve(num_keys);
 
-    auto local_endpoints = client_->GetLocalEndpoints();
     for (size_t i = 0; i < num_keys; ++i) {
         const auto &key = keys[i];
 
@@ -4506,7 +4615,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         // Select best replica: prefer local MEMORY, then any MEMORY,
         // then LOCAL_DISK, then DISK.
         const auto *best_replica =
-            SelectBestReplica(query_result_values.replicas, local_endpoints);
+            select_replica_for_read(query_result_values.replicas, key);
         if (!best_replica) {
             LOG(ERROR) << "No usable replica for key: " << key;
             results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
@@ -4946,7 +5055,6 @@ RealClient::batch_get_into_multi_buffers_internal(
     std::vector<ValidKeyInfo> valid_operations;
     std::unordered_map<std::string, DiskKeyInfo> valid_local_disk_ops;
     valid_operations.reserve(num_keys);
-    auto local_endpoints = client_->GetLocalEndpoints();
     for (size_t i = 0; i < num_keys; ++i) {
         const auto &key = keys[i];
         // Handle query failures
@@ -4970,7 +5078,7 @@ RealClient::batch_get_into_multi_buffers_internal(
         // LOCAL_DISK, then DISK. Master may return multiple replicas in any
         // order, so always scan rather than blindly taking replicas[0].
         const auto *best_replica =
-            SelectBestReplica(query_result_values.replicas, local_endpoints);
+            select_replica_for_read(query_result_values.replicas, key);
         if (!best_replica) {
             LOG(ERROR) << "No usable replica for key: " << key;
             results.emplace_back(tl::unexpected(ErrorCode::INVALID_REPLICA));

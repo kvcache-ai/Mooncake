@@ -3,11 +3,15 @@
 
 // csignal must precede coro_http_client.hpp: the bundled ylt's coro_io.hpp
 // calls std::signal without including <csignal> itself.
+#include <algorithm>
 #include <csignal>
 #include <cstdlib>
 #include <optional>
+#include <set>
+#include <sstream>
 #include <string>
 #include <unordered_set>
+#include <vector>
 #include <ylt/coro_http/coro_http_client.hpp>
 
 #include "client_metric.h"
@@ -160,6 +164,80 @@ TEST_F(ClientMetricsTest, MasterClientMetricsSummaryTest) {
     EXPECT_TRUE(summary.find("max<") != std::string::npos);
 
     std::cout << "Master Client Metrics Summary:\n" << summary << std::endl;
+}
+
+TEST_F(ClientMetricsTest, HybridHistogramSerializesUniqueLabelSeries) {
+    ylt::metric::hybrid_histogram_1t histogram(
+        "test_multi_label_histogram", "Test multi-label histogram", {10, 20},
+        {{"cluster", "cluster-a"}}, {"operation"});
+    const std::array<std::string, 1> read_label = {"read"};
+    const std::array<std::string, 1> write_label = {"write"};
+
+    histogram.observe(read_label, 5);
+    histogram.observe(read_label, 15);
+    histogram.observe(write_label, 25);
+    histogram.observe(write_label, 25);
+
+    std::string serialized;
+    histogram.serialize(serialized);
+
+    std::vector<std::string> sample_lines;
+    std::istringstream stream(serialized);
+    for (std::string line; std::getline(stream, line);) {
+        if (line.rfind("test_multi_label_histogram", 0) == 0) {
+            sample_lines.push_back(line);
+        }
+    }
+
+    std::set<std::string> unique_series;
+    for (const auto& line : sample_lines) {
+        const auto value_separator = line.rfind(' ');
+        ASSERT_NE(value_separator, std::string::npos);
+        unique_series.insert(line.substr(0, value_separator));
+    }
+
+    EXPECT_EQ(sample_lines.size(), 10);
+    EXPECT_EQ(sample_lines.size(), unique_series.size());
+
+    const auto expect_once = [&sample_lines](const std::string& sample) {
+        EXPECT_EQ(std::count(sample_lines.begin(), sample_lines.end(), sample),
+                  1)
+            << sample;
+    };
+    expect_once(
+        "test_multi_label_histogram_bucket{cluster=\"cluster-a\","
+        "operation=\"read\",le=\"10.000000\"} 1");
+    expect_once(
+        "test_multi_label_histogram_bucket{cluster=\"cluster-a\","
+        "operation=\"read\",le=\"20.000000\"} 2");
+    expect_once(
+        "test_multi_label_histogram_bucket{cluster=\"cluster-a\","
+        "operation=\"read\",le=\"+Inf\"} 2");
+    expect_once(
+        "test_multi_label_histogram_sum{cluster=\"cluster-a\","
+        "operation=\"read\"} 20");
+    expect_once(
+        "test_multi_label_histogram_count{cluster=\"cluster-a\","
+        "operation=\"read\"} 2");
+    expect_once(
+        "test_multi_label_histogram_bucket{cluster=\"cluster-a\","
+        "operation=\"write\",le=\"10.000000\"} 0");
+    expect_once(
+        "test_multi_label_histogram_bucket{cluster=\"cluster-a\","
+        "operation=\"write\",le=\"20.000000\"} 0");
+    expect_once(
+        "test_multi_label_histogram_bucket{cluster=\"cluster-a\","
+        "operation=\"write\",le=\"+Inf\"} 2");
+    expect_once(
+        "test_multi_label_histogram_sum{cluster=\"cluster-a\","
+        "operation=\"write\"} 50");
+    expect_once(
+        "test_multi_label_histogram_count{cluster=\"cluster-a\","
+        "operation=\"write\"} 2");
+
+    std::string repeated;
+    histogram.serialize(repeated);
+    EXPECT_EQ(repeated, serialized);
 }
 
 TEST_F(ClientMetricsTest, ClientMetricsSummaryTest) {

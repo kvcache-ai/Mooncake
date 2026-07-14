@@ -24,6 +24,19 @@ extern "C" {
 
 typedef void *mooncake_store_t;
 
+typedef enum mooncake_replica_selection_mode {
+    MOONCAKE_REPLICA_SELECTION_LEGACY = 0,
+    MOONCAKE_REPLICA_SELECTION_SHADOW = 1,
+} mooncake_replica_selection_mode_t;
+
+#define MOONCAKE_STORE_SETUP_OPTIONS_VERSION 1u
+
+typedef struct mooncake_store_setup_options {
+    uint32_t struct_size;
+    uint32_t version;
+    mooncake_replica_selection_mode_t replica_selection_mode;
+} mooncake_store_setup_options_t;
+
 struct mooncake_replicate_config {
     size_t replica_num;
     int with_soft_pin;
@@ -55,6 +68,13 @@ int mooncake_store_setup(mooncake_store_t store, const char *local_hostname,
                          uint64_t local_buffer_size, const char *protocol,
                          const char *device_name,
                          const char *master_server_addr);
+
+int mooncake_store_setup_ex(
+    mooncake_store_t store, const char *local_hostname,
+    const char *metadata_server, uint64_t global_segment_size,
+    uint64_t local_buffer_size, const char *protocol, const char *device_name,
+    const char *master_server_addr,
+    const mooncake_store_setup_options_t *options);
 
 int mooncake_store_init_all(mooncake_store_t store, const char *protocol,
                             const char *device_name,
