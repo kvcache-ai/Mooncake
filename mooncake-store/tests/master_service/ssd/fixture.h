@@ -62,16 +62,20 @@ void PutAndOffload(MasterService& service, const UUID& client_id,
     ReplicateConfig config;
     config.replica_num = 1;
 
-    ASSERT_TRUE(service.PutStart(client_id, key, TenantId::Default(), object_size, config)
-                    .has_value());
-    ASSERT_TRUE(service.PutEnd(client_id, key, TenantId::Default(), ReplicaType::MEMORY)
-                    .has_value());
+    ASSERT_TRUE(
+        service
+            .PutStart(client_id, key, TenantId::Default(), object_size, config)
+            .has_value());
+    ASSERT_TRUE(
+        service.PutEnd(client_id, key, TenantId::Default(), ReplicaType::MEMORY)
+            .has_value());
 
     StorageObjectMetadata metadata;
     metadata.data_size = object_size;
     metadata.transport_endpoint = local_disk_endpoint;
-    OffloadTaskItem task{
-        .tenant_id = TenantId::Default().value(), .key = key, .size = object_size};
+    OffloadTaskItem task{.tenant_id = TenantId::Default().value(),
+                         .key = key,
+                         .size = object_size};
     ASSERT_TRUE(service.NotifyOffloadSuccess(client_id, {task}, {metadata})
                     .has_value());
 }
@@ -82,7 +86,8 @@ void ExpectNextAllocationOnSegment(MasterService& service,
                                    const std::string& expected_segment) {
     ReplicateConfig config;
     config.replica_num = 1;
-    auto result = service.PutStart(client_id, key, TenantId::Default(), 64, config);
+    auto result =
+        service.PutStart(client_id, key, TenantId::Default(), 64, config);
     ASSERT_TRUE(result.has_value());
     ASSERT_EQ(result->size(), 1u);
     ASSERT_TRUE((*result)[0].is_memory_replica());

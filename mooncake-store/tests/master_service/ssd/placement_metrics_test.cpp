@@ -22,19 +22,24 @@ TEST_F(MasterServiceSSDTest, RemoveDecrementsCacheTotalMetrics) {
     ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
 
     std::string key = "remove_cache_total_metric_key";
-    ASSERT_TRUE(
-        service_->PutStart(client_id, key, TenantId::Default(), 1024, {.replica_num = 1})
+    ASSERT_TRUE(service_
+                    ->PutStart(client_id, key, TenantId::Default(), 1024,
+                               {.replica_num = 1})
+                    .has_value());
+    EXPECT_TRUE(
+        service_
+            ->PutEnd(client_id, key, TenantId::Default(), ReplicaType::MEMORY)
             .has_value());
-    EXPECT_TRUE(service_->PutEnd(client_id, key, TenantId::Default(), ReplicaType::MEMORY)
-                    .has_value());
-    EXPECT_TRUE(service_->PutEnd(client_id, key, TenantId::Default(), ReplicaType::DISK)
-                    .has_value());
+    EXPECT_TRUE(
+        service_->PutEnd(client_id, key, TenantId::Default(), ReplicaType::DISK)
+            .has_value());
 
     auto stats = metrics.calculate_cache_stats();
     EXPECT_EQ(stats[CacheHitStat::MEMORY_TOTAL], base_memory_total + 1);
     EXPECT_EQ(stats[CacheHitStat::SSD_TOTAL], base_ssd_total + 1);
 
-    ASSERT_TRUE(service_->Remove(key, TenantId::Default(), /*force=*/true).has_value());
+    ASSERT_TRUE(
+        service_->Remove(key, TenantId::Default(), /*force=*/true).has_value());
 
     stats = metrics.calculate_cache_stats();
     EXPECT_EQ(stats[CacheHitStat::MEMORY_TOTAL], base_memory_total);
@@ -53,7 +58,8 @@ TEST_F(MasterServiceSSDTest, RemoveReleasesLocalDiskUsageTracking) {
     PutAndOffload(*service, client1, "ssd_remove_released", 800, segment1);
     PutAndOffload(*service, client2, "ssd_remove_baseline", 100, segment2);
 
-    ASSERT_TRUE(service->Remove("ssd_remove_released", TenantId::Default()).has_value());
+    ASSERT_TRUE(service->Remove("ssd_remove_released", TenantId::Default())
+                    .has_value());
 
     ExpectNextAllocationOnSegment(*service, client1, "ssd_remove_probe",
                                   segment1);
@@ -127,8 +133,9 @@ TEST_F(MasterServiceSSDTest, EvictDiskReplicaDecrementsLocalDiskUsageTracking) {
     // Evict the LOCAL_DISK replica of the heavy object from segment1.
     // NotifyOffloadSuccess creates a LOCAL_DISK replica (not DISK).
     // This decrements ssd_used[seg1] by 800 → ssd_used[seg1]=0 (100% free)
-    auto evict_result = service->EvictDiskReplica(
-        client1, "ssd_evict_dec_heavy", TenantId::Default(), ReplicaType::LOCAL_DISK);
+    auto evict_result =
+        service->EvictDiskReplica(client1, "ssd_evict_dec_heavy",
+                                  TenantId::Default(), ReplicaType::LOCAL_DISK);
     ASSERT_TRUE(evict_result.has_value());
 
     // After eviction: segment1 has 100% free, segment2 has 90% free
@@ -230,8 +237,10 @@ TEST_F(MasterServiceSSDTest,
         for (int i = 0; i < rounds; i++) {
             const std::string key = key_pfx + std::to_string(i);
             auto t0 = std::chrono::steady_clock::now();
-            (void)svc.PutStart(writer, key, TenantId::Default(), kSliceSize, cfg);
-            (void)svc.PutEnd(writer, key, TenantId::Default(), ReplicaType::MEMORY);
+            (void)svc.PutStart(writer, key, TenantId::Default(), kSliceSize,
+                               cfg);
+            (void)svc.PutEnd(writer, key, TenantId::Default(),
+                             ReplicaType::MEMORY);
             total += std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - t0);
             (void)svc.Remove(key, TenantId::Default(), /*force=*/true);

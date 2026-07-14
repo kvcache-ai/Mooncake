@@ -39,8 +39,8 @@ TEST_F(MasterServiceSSDSnapshotTest, PutStartExpires) {
                                       : ReplicaType::MEMORY;
 
         // Put key, should success.
-        auto put_start_result =
-            service_->PutStart(client_id, key, TenantId::Default(), slice_length, config);
+        auto put_start_result = service_->PutStart(
+            client_id, key, TenantId::Default(), slice_length, config);
         EXPECT_TRUE(put_start_result.has_value());
         auto replica_list = put_start_result.value();
         EXPECT_EQ(replica_list.size(), kReplicaCnt);
@@ -60,15 +60,16 @@ TEST_F(MasterServiceSSDSnapshotTest, PutStartExpires) {
             auto result = service_->Ping(client_id);
             EXPECT_TRUE(result.has_value());
             // Protect the key from eviction.
-            auto get_result = service_->GetReplicaList(key, TenantId::Default());
+            auto get_result =
+                service_->GetReplicaList(key, TenantId::Default());
             EXPECT_TRUE(get_result.has_value());
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
 
         // Put key again, should fail because the object has had an completed
         // replica.
-        put_start_result =
-            service_->PutStart(client_id, key, TenantId::Default(), slice_length, config);
+        put_start_result = service_->PutStart(
+            client_id, key, TenantId::Default(), slice_length, config);
         EXPECT_FALSE(put_start_result.has_value());
         EXPECT_EQ(put_start_result.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
 
@@ -79,7 +80,8 @@ TEST_F(MasterServiceSSDSnapshotTest, PutStartExpires) {
             auto result = service_->Ping(client_id);
             EXPECT_TRUE(result.has_value());
             // Protect the key from eviction.
-            auto get_result = service_->GetReplicaList(key, TenantId::Default());
+            auto get_result =
+                service_->GetReplicaList(key, TenantId::Default());
             EXPECT_TRUE(get_result.has_value());
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }

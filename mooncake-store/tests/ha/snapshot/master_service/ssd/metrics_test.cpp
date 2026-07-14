@@ -20,13 +20,17 @@ TEST_F(MasterServiceSSDSnapshotTest, RestorePreservesCacheTotalMetrics) {
     ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
 
     std::string key = "restore_cache_total_metric_key";
-    ASSERT_TRUE(
-        service_->PutStart(client_id, key, TenantId::Default(), 1024, {.replica_num = 1})
+    ASSERT_TRUE(service_
+                    ->PutStart(client_id, key, TenantId::Default(), 1024,
+                               {.replica_num = 1})
+                    .has_value());
+    EXPECT_TRUE(
+        service_
+            ->PutEnd(client_id, key, TenantId::Default(), ReplicaType::MEMORY)
             .has_value());
-    EXPECT_TRUE(service_->PutEnd(client_id, key, TenantId::Default(), ReplicaType::MEMORY)
-                    .has_value());
-    EXPECT_TRUE(service_->PutEnd(client_id, key, TenantId::Default(), ReplicaType::DISK)
-                    .has_value());
+    EXPECT_TRUE(
+        service_->PutEnd(client_id, key, TenantId::Default(), ReplicaType::DISK)
+            .has_value());
 
     auto& metrics = MasterMetricManager::instance();
     using CacheHitStat = MasterMetricManager::CacheHitStat;
@@ -55,7 +59,8 @@ TEST_F(MasterServiceSSDSnapshotTest, RestorePreservesCacheTotalMetrics) {
     EXPECT_EQ(stats[CacheHitStat::MEMORY_TOTAL], 1);
     EXPECT_EQ(stats[CacheHitStat::SSD_TOTAL], 1);
 
-    auto get_result = restored_service->GetReplicaList(key, TenantId::Default());
+    auto get_result =
+        restored_service->GetReplicaList(key, TenantId::Default());
     ASSERT_TRUE(get_result.has_value());
     EXPECT_EQ(2, get_result.value().replicas.size());
 }
