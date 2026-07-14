@@ -81,7 +81,6 @@ class BatchEvictBench {
     }
 
    private:
-    static constexpr const char* kTenantId = "default";
     static constexpr const char* kSegmentName = "batch_evict_bench_segment";
     static constexpr size_t kSegmentBase = 0x300000000;
     static constexpr uint64_t kObjectSize = 1024;
@@ -166,7 +165,7 @@ class BatchEvictBench {
              ++shard_idx) {
             MasterService::MetadataShardAccessorRW shard(&service, shard_idx);
             for (auto& [tenant_id, tenant_state] : shard->tenants) {
-                if (tenant_id != kTenantId) {
+                if (tenant_id != TenantId::Default()) {
                     continue;
                 }
                 for (auto& [key, metadata] : tenant_state.metadata) {
@@ -223,8 +222,8 @@ class BatchEvictBench {
 
         for (size_t i = 0; i < num_objects; ++i) {
             const std::string key = MakeKey(i);
-            auto put_start = service.PutStart(client_id, key, kTenantId,
-                                              kObjectSize, config);
+            auto put_start = service.PutStart(
+                client_id, key, TenantId::Default(), kObjectSize, config);
             if (!put_start.has_value()) {
                 LOG(ERROR) << "PutStart failed for i=" << i
                            << ", error=" << toString(put_start.error());
@@ -236,8 +235,8 @@ class BatchEvictBench {
                 return false;
             }
 
-            auto put_end =
-                service.PutEnd(client_id, key, kTenantId, ReplicaType::MEMORY);
+            auto put_end = service.PutEnd(client_id, key, TenantId::Default(),
+                                          ReplicaType::MEMORY);
             if (!put_end.has_value()) {
                 LOG(ERROR) << "PutEnd failed for i=" << i
                            << ", error=" << toString(put_end.error());

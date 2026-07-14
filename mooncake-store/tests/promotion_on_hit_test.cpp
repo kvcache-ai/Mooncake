@@ -107,20 +107,20 @@ class PromotionOnHitTest : public ::testing::Test {
         ReplicateConfig config;
         config.replica_num = 1;
         auto put_start =
-            service.PutStart(client_id, key, "default", size, config);
+            service.PutStart(client_id, key, TenantId::Default(), size, config);
         ASSERT_TRUE(put_start.has_value()) << "PutStart failed for key=" << key;
-        auto put_end =
-            service.PutEnd(client_id, key, "default", ReplicaType::MEMORY);
+        auto put_end = service.PutEnd(client_id, key, TenantId::Default(),
+                                      ReplicaType::MEMORY);
         ASSERT_TRUE(put_end.has_value()) << "PutEnd failed for key=" << key;
     }
 
     // Inject a synthetic LOCAL_DISK replica for `key` on `client_id`'s
     // segment via NotifyOffloadSuccess. Lets tests put a key into
     // LOCAL_DISK-only state without running the full offload pipeline.
-    bool InjectLocalDiskReplica(MasterService& service, const UUID& client_id,
-                                const std::string& key, int64_t size,
-                                const std::string& transport_endpoint,
-                                const std::string& tenant_id = "default") {
+    bool InjectLocalDiskReplica(
+        MasterService& service, const UUID& client_id, const std::string& key,
+        int64_t size, const std::string& transport_endpoint,
+        std::string tenant_id = std::string(TenantId::kDefaultValue)) {
         std::vector<OffloadTaskItem> tasks{
             OffloadTaskItem{.tenant_id = tenant_id, .key = key, .size = size}};
         StorageObjectMetadata sm;
@@ -164,7 +164,7 @@ TEST_F(PromotionOnHitTest, DefaultOffNoPromotion) {
     // GetReplicaList many times. With promotion_on_hit=false, nothing should
     // appear in promotion_objects regardless of access count.
     for (int i = 0; i < 5; ++i) {
-        auto resp = service->GetReplicaList("k1", "default");
+        auto resp = service->GetReplicaList("k1", TenantId::Default());
         ASSERT_TRUE(resp.has_value());
     }
 
@@ -191,7 +191,7 @@ TEST_F(PromotionOnHitTest, NoLocalDiskNoPromotion) {
 
     PutObject(*service, ctx.client_id, "k_mem_only");
     for (int i = 0; i < 5; ++i) {
-        auto resp = service->GetReplicaList("k_mem_only", "default");
+        auto resp = service->GetReplicaList("k_mem_only", TenantId::Default());
         ASSERT_TRUE(resp.has_value());
     }
 
@@ -223,7 +223,7 @@ TEST_F(PromotionOnHitTest, MemoryReplicaPresentNoPromotion) {
                                        ctx.segment_name));
 
     for (int i = 0; i < 5; ++i) {
-        auto resp = service->GetReplicaList("k_dual", "default");
+        auto resp = service->GetReplicaList("k_dual", TenantId::Default());
         ASSERT_TRUE(resp.has_value());
     }
 
@@ -259,13 +259,14 @@ TEST_F(PromotionOnHitTest, BatchGetReplicaListPromotesLocalDiskOnlyObject) {
     const int64_t admitted_pre = mm.get_promotion_admitted();
     const int64_t in_flight_pre = mm.get_promotion_in_flight();
 
-    auto single_result = service->GetReplicaList(single_key, "default");
+    auto single_result =
+        service->GetReplicaList(single_key, TenantId::Default());
     ASSERT_TRUE(single_result.has_value());
     ASSERT_EQ(single_result->replicas.size(), 1u);
     EXPECT_TRUE(single_result->replicas[0].is_local_disk_replica());
 
     auto batch_result = service->BatchGetReplicaList(
-        std::vector<std::string>{batch_key}, "default");
+        std::vector<std::string>{batch_key}, TenantId::Default());
     ASSERT_EQ(batch_result.size(), 1u);
     ASSERT_TRUE(batch_result[0].has_value());
     ASSERT_EQ(batch_result[0]->replicas.size(), 1u);
@@ -310,7 +311,7 @@ TEST_F(PromotionOnHitTest,
     const int64_t in_flight_pre = mm.get_promotion_in_flight();
 
     auto result = service->BatchGetReplicaListForAdmin(
-        std::vector<std::string>{key}, "default");
+        std::vector<std::string>{key}, TenantId::Default());
     ASSERT_EQ(result.size(), 1u);
     ASSERT_TRUE(result[0].has_value());
     ASSERT_EQ(result[0]->replicas.size(), 1u);
@@ -354,7 +355,7 @@ TEST_F(PromotionOnHitTest,
 
     // Read-only admin query must leave the memory-cache-hit counter untouched.
     auto admin_result = service->BatchGetReplicaListForAdmin(
-        std::vector<std::string>{key}, "default");
+        std::vector<std::string>{key}, TenantId::Default());
     ASSERT_EQ(admin_result.size(), 1u);
     ASSERT_TRUE(admin_result[0].has_value());
     EXPECT_EQ(mem_hits(), before_admin);
@@ -362,7 +363,7 @@ TEST_F(PromotionOnHitTest,
     // The client-facing path does bump it, proving the assertion above is
     // meaningful rather than a counter that never moves.
     (void)service->BatchGetReplicaList(std::vector<std::string>{key},
-                                       "default");
+                                       TenantId::Default());
     EXPECT_GT(mem_hits(), before_admin);
 
     service->RemoveAll();
@@ -390,7 +391,7 @@ TEST_F(PromotionOnHitTest, AllocStartUnknownKey) {
     auto service = std::make_unique<MasterService>(config);
 
     auto resp = service->PromotionAllocStart(generate_uuid(), "nonexistent",
-                                             "default", 1024, {});
+                                             TenantId::Default(), 1024, {});
     ASSERT_FALSE(resp.has_value());
     EXPECT_EQ(resp.error(), ErrorCode::OBJECT_NOT_FOUND);
 }
@@ -403,8 +404,8 @@ TEST_F(PromotionOnHitTest, NotifyUnknownKey) {
     auto service = std::make_unique<MasterService>(config);
 
     UUID client_id = generate_uuid();
-    auto resp =
-        service->NotifyPromotionSuccess(client_id, "nonexistent", "default");
+    auto resp = service->NotifyPromotionSuccess(client_id, "nonexistent",
+                                                TenantId::Default());
     ASSERT_FALSE(resp.has_value());
     EXPECT_EQ(resp.error(), ErrorCode::OBJECT_NOT_FOUND);
 }
@@ -439,7 +440,7 @@ TEST_F(PromotionOnHitTest, RacingReadersDedup) {
     for (int t = 0; t < kThreads; ++t) {
         threads.emplace_back([&service]() {
             for (int j = 0; j < kReadsPerThread; ++j) {
-                auto r = service->GetReplicaList("k_cold", "default");
+                auto r = service->GetReplicaList("k_cold", TenantId::Default());
                 EXPECT_TRUE(r.has_value());
             }
         });
@@ -489,7 +490,7 @@ TEST_F(PromotionOnHitTest, StalePromotionReaper) {
     // the per-shard PromotionTask intact (the heartbeat is best-effort GC,
     // not the authoritative state).
     {
-        auto r = service->GetReplicaList("k_cold", "default");
+        auto r = service->GetReplicaList("k_cold", TenantId::Default());
         ASSERT_TRUE(r.has_value());
         auto pending = service->PromotionObjectHeartbeat(ctx.client_id);
         ASSERT_TRUE(pending.has_value());
@@ -499,7 +500,7 @@ TEST_F(PromotionOnHitTest, StalePromotionReaper) {
     // Without reap, dedup blocks re-enqueue. Confirm: GetReplicaList again,
     // heartbeat must be empty because PromotionTask still pins the slot.
     {
-        auto r = service->GetReplicaList("k_cold", "default");
+        auto r = service->GetReplicaList("k_cold", TenantId::Default());
         ASSERT_TRUE(r.has_value());
         auto pending = service->PromotionObjectHeartbeat(ctx.client_id);
         ASSERT_TRUE(pending.has_value());
@@ -518,7 +519,7 @@ TEST_F(PromotionOnHitTest, StalePromotionReaper) {
     // Trigger #3: with the task reaped, dedup is unblocked and a fresh
     // GetReplicaList must enqueue again.
     {
-        auto r = service->GetReplicaList("k_cold", "default");
+        auto r = service->GetReplicaList("k_cold", TenantId::Default());
         ASSERT_TRUE(r.has_value());
         auto pending = service->PromotionObjectHeartbeat(ctx.client_id);
         ASSERT_TRUE(pending.has_value());
@@ -558,12 +559,12 @@ TEST_F(PromotionOnHitTest, RemoveDuringPromotion) {
 
     // Queue a promotion task.
     {
-        auto r = service->GetReplicaList("k_cold", "default");
+        auto r = service->GetReplicaList("k_cold", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
 
     // Lease must expire before we can call non-force Remove (or use force).
-    auto rm = service->Remove("k_cold", "default", /*force=*/true);
+    auto rm = service->Remove("k_cold", TenantId::Default(), /*force=*/true);
     // Remove returns REPLICA_IS_NOT_READY if any replica is non-COMPLETE.
     // The injected LOCAL_DISK replica is COMPLETE, so this should succeed.
     ASSERT_TRUE(rm.has_value())
@@ -575,8 +576,8 @@ TEST_F(PromotionOnHitTest, RemoveDuringPromotion) {
 
     // NotifyPromotionSuccess on the now-removed key must surface the missing
     // metadata cleanly, not crash.
-    auto notify =
-        service->NotifyPromotionSuccess(ctx.client_id, "k_cold", "default");
+    auto notify = service->NotifyPromotionSuccess(ctx.client_id, "k_cold",
+                                                  TenantId::Default());
     ASSERT_FALSE(notify.has_value());
     EXPECT_EQ(notify.error(), ErrorCode::OBJECT_NOT_FOUND);
 
@@ -590,7 +591,7 @@ TEST_F(PromotionOnHitTest, RemoveDuringPromotion) {
     ASSERT_TRUE(InjectLocalDiskReplica(*service, ctx.client_id, "k_cold", 1024,
                                        ctx.segment_name));
     {
-        auto r = service->GetReplicaList("k_cold", "default");
+        auto r = service->GetReplicaList("k_cold", TenantId::Default());
         ASSERT_TRUE(r.has_value());
         auto pending = service->PromotionObjectHeartbeat(ctx.client_id);
         ASSERT_TRUE(pending.has_value());
@@ -630,14 +631,14 @@ TEST_F(PromotionOnHitTest, MultiSegmentAllocPicksAvailableSegment) {
     // Seed the PromotionTask through the gate — PromotionAllocStart now
     // requires an in-flight task to exist (rejects orphaned-stage path).
     {
-        auto r = service->GetReplicaList("k_cold", "default");
+        auto r = service->GetReplicaList("k_cold", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
 
     // PromotionAllocStart — test the segment-selection logic on top of
     // the gate-seeded task.
     auto resp = service->PromotionAllocStart(holder_client_id, "k_cold",
-                                             "default", 1024, {});
+                                             TenantId::Default(), 1024, {});
     ASSERT_TRUE(resp.has_value())
         << "PromotionAllocStart should succeed when any DRAM segment has "
         << "capacity; error=" << resp.error();
@@ -680,12 +681,13 @@ TEST_F(PromotionOnHitTest, MultiSegmentAllocRespectsPreferred) {
     // Seed the PromotionTask through the gate so AllocStart's
     // task-existence check passes.
     {
-        auto r = service->GetReplicaList("k_cold", "default");
+        auto r = service->GetReplicaList("k_cold", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
 
-    auto resp = service->PromotionAllocStart(
-        seg_a.client_id, "k_cold", "default", 1024, {seg_b.segment_name});
+    auto resp = service->PromotionAllocStart(seg_a.client_id, "k_cold",
+                                             TenantId::Default(), 1024,
+                                             {seg_b.segment_name});
     ASSERT_TRUE(resp.has_value());
     const auto& mem_desc = resp.value().memory_descriptor;
     EXPECT_EQ(
@@ -744,13 +746,13 @@ TEST_F(PromotionOnHitTest, QueueLimitRejectsBeyondCap) {
     const int64_t cap_rej_pre = mm.get_promotion_rejected_cap();
 
     // First read on k1 enqueues a task in shard S.
-    auto r1 = service->GetReplicaList(k1, "default");
+    auto r1 = service->GetReplicaList(k1, TenantId::Default());
     ASSERT_TRUE(r1.has_value());
 
     // Second read on k2 (same shard S, different key, so no dedup) must
     // be dropped by the cap gate: the cluster-wide in-flight counter is
     // already 1, which meets promotion_queue_limit_ = 1.
-    auto r2 = service->GetReplicaList(k2, "default");
+    auto r2 = service->GetReplicaList(k2, TenantId::Default());
     ASSERT_TRUE(r2.has_value()) << "read itself must still succeed; "
                                 << "queue gate is silent";
 
@@ -795,7 +797,7 @@ TEST_F(PromotionOnHitTest, HeartbeatBoundedBatchPreservesLeftovers) {
     for (const auto& k : keys) {
         ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, k, 1024,
                                            seg.segment_name));
-        auto r = service->GetReplicaList(k, "default");
+        auto r = service->GetReplicaList(k, TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
 
@@ -834,7 +836,7 @@ TEST_F(PromotionOnHitTest, HeartbeatBoundedBatchPreservesLeftovers) {
     // (they're cleared by NotifyPromotionSuccess, not by Heartbeat), so the
     // source refcnts remain pinned until processed.
     for (const auto& k : keys) {
-        auto rl = service->GetReplicaList(k, "default");
+        auto rl = service->GetReplicaList(k, TenantId::Default());
         ASSERT_TRUE(rl.has_value()) << "key " << k << " should still exist";
     }
 
@@ -876,14 +878,14 @@ TEST_F(PromotionOnHitTest, ReaperPopsStagedMemoryReplicaOnExpiry) {
 
     // Trigger the gate to enqueue a PromotionTask.
     {
-        auto r = service->GetReplicaList("k_cold", "default");
+        auto r = service->GetReplicaList("k_cold", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
     // Drive the AllocStart side so alloc_id != 0 — this is the exact
     // setup that produces an orphaned PROCESSING MEMORY replica if the
     // reaper does not pop it.
     auto alloc = service->PromotionAllocStart(ctx.client_id, "k_cold",
-                                              "default", 1024, {});
+                                              TenantId::Default(), 1024, {});
     ASSERT_TRUE(alloc.has_value());
 
     // After AllocStart, the DRAM allocator must have committed bytes for
@@ -921,8 +923,8 @@ TEST_F(PromotionOnHitTest, ReaperPopsStagedMemoryReplicaOnExpiry) {
     // and must return REPLICA_IS_NOT_READY (the task entry is gone, so
     // the alloc_id lookup at the top of NotifyPromotionSuccess fails
     // fast).
-    auto notify =
-        service->NotifyPromotionSuccess(ctx.client_id, "k_cold", "default");
+    auto notify = service->NotifyPromotionSuccess(ctx.client_id, "k_cold",
+                                                  TenantId::Default());
     ASSERT_FALSE(notify.has_value());
     EXPECT_EQ(notify.error(), ErrorCode::REPLICA_IS_NOT_READY);
 
@@ -970,12 +972,12 @@ TEST_F(PromotionOnHitTest, QueueLimitRejectsCrossShard) {
     ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, k2, 1024,
                                        seg.segment_name));
 
-    auto r1 = service->GetReplicaList(k1, "default");
+    auto r1 = service->GetReplicaList(k1, TenantId::Default());
     ASSERT_TRUE(r1.has_value());
 
     // k2 lives in a different shard, but the global cap is already met
     // by k1's task — k2 must be rejected.
-    auto r2 = service->GetReplicaList(k2, "default");
+    auto r2 = service->GetReplicaList(k2, TenantId::Default());
     ASSERT_TRUE(r2.has_value()) << "read itself still succeeds";
 
     auto heartbeat = service->PromotionObjectHeartbeat(seg.client_id);
@@ -1049,7 +1051,7 @@ TEST_F(PromotionOnHitTest, AllocStartResetsTaskDeadline) {
 
     // T=0 : admit. start_time = T=0.
     {
-        auto r = service->GetReplicaList("k_late", "default");
+        auto r = service->GetReplicaList("k_late", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
 
@@ -1059,7 +1061,7 @@ TEST_F(PromotionOnHitTest, AllocStartResetsTaskDeadline) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1500));
 
     auto alloc = service->PromotionAllocStart(ctx.client_id, "k_late",
-                                              "default", 1024, {});
+                                              TenantId::Default(), 1024, {});
     ASSERT_TRUE(alloc.has_value())
         << "AllocStart must succeed before the queue-wait phase's TTL "
         << "expires (1.5s elapsed, TTL is 2s). If this fires the test "
@@ -1129,7 +1131,7 @@ TEST_F(PromotionOnHitTest, NotifySuccessDecrementsCounter) {
 
     // Admit task 1. promotion_in_flight_ goes from 0 -> 1.
     {
-        auto r = service->GetReplicaList("k_first", "default");
+        auto r = service->GetReplicaList("k_first", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
 
@@ -1138,11 +1140,11 @@ TEST_F(PromotionOnHitTest, NotifySuccessDecrementsCounter) {
     // COMPLETE, drops the source LOCAL_DISK refcnt, erases the task, and
     // decrements the counter.
     auto alloc = service->PromotionAllocStart(seg.client_id, "k_first",
-                                              "default", 1024, {});
+                                              TenantId::Default(), 1024, {});
     ASSERT_TRUE(alloc.has_value())
         << "AllocStart should succeed; error=" << alloc.error();
-    auto notify =
-        service->NotifyPromotionSuccess(seg.client_id, "k_first", "default");
+    auto notify = service->NotifyPromotionSuccess(seg.client_id, "k_first",
+                                                  TenantId::Default());
     ASSERT_TRUE(notify.has_value())
         << "NotifyPromotionSuccess happy path should succeed; if this "
         << "fires, AllocStart did not record alloc_id, or the staged "
@@ -1153,7 +1155,7 @@ TEST_F(PromotionOnHitTest, NotifySuccessDecrementsCounter) {
     // still saturated at 1 and TryPushPromotionQueue silently drops this
     // attempt.
     {
-        auto r = service->GetReplicaList("k_second", "default");
+        auto r = service->GetReplicaList("k_second", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
     auto pending = service->PromotionObjectHeartbeat(seg.client_id);
@@ -1198,7 +1200,7 @@ TEST_F(PromotionOnHitTest, AllocStartRejectsReapedTask) {
 
     // Admit the task.
     {
-        auto r = service->GetReplicaList("k_cold", "default");
+        auto r = service->GetReplicaList("k_cold", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
 
@@ -1216,7 +1218,7 @@ TEST_F(PromotionOnHitTest, AllocStartRejectsReapedTask) {
     // Allocating would leave an orphaned PROCESSING MEMORY replica
     // attached to the object.
     auto alloc = service->PromotionAllocStart(ctx.client_id, "k_cold",
-                                              "default", 1024, {});
+                                              TenantId::Default(), 1024, {});
     ASSERT_FALSE(alloc.has_value())
         << "AllocStart must reject when the task has been reaped — "
         << "otherwise the staged PROCESSING MEMORY replica is orphaned";
@@ -1255,19 +1257,19 @@ TEST_F(PromotionOnHitTest, NotifyRejectsNonHolder) {
 
     // Admit + stage.
     {
-        auto r = service->GetReplicaList("k_cold", "default");
+        auto r = service->GetReplicaList("k_cold", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
     auto alloc = service->PromotionAllocStart(holder.client_id, "k_cold",
-                                              "default", 1024, {});
+                                              TenantId::Default(), 1024, {});
     ASSERT_TRUE(alloc.has_value());
 
     // An unrelated client tries to Notify. Must be rejected as
     // INVALID_PARAMS so the staged replica stays PROCESSING.
     UUID intruder_id = generate_uuid();
     ASSERT_NE(intruder_id, holder.client_id);
-    auto bad_notify =
-        service->NotifyPromotionSuccess(intruder_id, "k_cold", "default");
+    auto bad_notify = service->NotifyPromotionSuccess(intruder_id, "k_cold",
+                                                      TenantId::Default());
     ASSERT_FALSE(bad_notify.has_value())
         << "Notify from a non-holder client must be rejected — otherwise "
         << "any client knowing the key can commit someone else's "
@@ -1279,7 +1281,7 @@ TEST_F(PromotionOnHitTest, NotifyRejectsNonHolder) {
     // GetReplicaList filters PROCESSING replicas, and pre-AllocStart
     // there are no COMPLETE replicas to read for a LOCAL_DISK-only key
     // (only the LOCAL_DISK descriptor itself).
-    auto r_check = service->GetReplicaList("k_cold", "default");
+    auto r_check = service->GetReplicaList("k_cold", TenantId::Default());
     ASSERT_TRUE(r_check.has_value());
     bool saw_complete_memory = false;
     for (const auto& d : r_check.value().replicas) {
@@ -1292,8 +1294,8 @@ TEST_F(PromotionOnHitTest, NotifyRejectsNonHolder) {
         << "Rejected Notify must not have committed the staged replica";
 
     // The legitimate holder must still be able to Notify successfully.
-    auto good_notify =
-        service->NotifyPromotionSuccess(holder.client_id, "k_cold", "default");
+    auto good_notify = service->NotifyPromotionSuccess(
+        holder.client_id, "k_cold", TenantId::Default());
     ASSERT_TRUE(good_notify.has_value())
         << "Holder Notify on the same task must succeed after a rejected "
         << "intruder Notify — the task entry should be untouched by the "
@@ -1339,11 +1341,11 @@ TEST_F(PromotionOnHitTest, NotifyFailureReleasesStateImmediately) {
 
     // Admit + stage k_a. promotion_in_flight_ goes 0 -> 1.
     {
-        auto r = service->GetReplicaList("k_a", "default");
+        auto r = service->GetReplicaList("k_a", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
-    auto alloc =
-        service->PromotionAllocStart(seg.client_id, "k_a", "default", 1024, {});
+    auto alloc = service->PromotionAllocStart(seg.client_id, "k_a",
+                                              TenantId::Default(), 1024, {});
     ASSERT_TRUE(alloc.has_value());
 
     // The staged PROCESSING MEMORY buffer is allocated.
@@ -1355,8 +1357,8 @@ TEST_F(PromotionOnHitTest, NotifyFailureReleasesStateImmediately) {
     // Holder reports failure (simulating SSD read error after AllocStart
     // succeeded). Master must immediately reap the staged replica and
     // decrement the slot counter.
-    auto failure =
-        service->NotifyPromotionFailure(seg.client_id, "k_a", "default");
+    auto failure = service->NotifyPromotionFailure(seg.client_id, "k_a",
+                                                   TenantId::Default());
     ASSERT_TRUE(failure.has_value())
         << "NotifyPromotionFailure on a valid in-flight task from the "
         << "legitimate holder must succeed; error=" << failure.error();
@@ -1378,7 +1380,7 @@ TEST_F(PromotionOnHitTest, NotifyFailureReleasesStateImmediately) {
     // succeed even though queue_limit=1. Without the failure-side
     // decrement the cap would stay saturated until reaper TTL.
     {
-        auto r = service->GetReplicaList("k_b", "default");
+        auto r = service->GetReplicaList("k_b", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
     auto heartbeat = service->PromotionObjectHeartbeat(seg.client_id);
@@ -1391,8 +1393,8 @@ TEST_F(PromotionOnHitTest, NotifyFailureReleasesStateImmediately) {
 
     // Idempotency: repeated failure notification on the same key must be
     // safe (return OK without underflowing the counter).
-    auto failure_again =
-        service->NotifyPromotionFailure(seg.client_id, "k_a", "default");
+    auto failure_again = service->NotifyPromotionFailure(seg.client_id, "k_a",
+                                                         TenantId::Default());
     EXPECT_TRUE(failure_again.has_value())
         << "Repeated NotifyPromotionFailure should be idempotent (return "
         << "OK on already-released task), not error.";
@@ -1421,18 +1423,18 @@ TEST_F(PromotionOnHitTest, NotifyFailureRejectsNonHolder) {
                                        1024, holder.segment_name));
 
     {
-        auto r = service->GetReplicaList("k_cold", "default");
+        auto r = service->GetReplicaList("k_cold", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
     auto alloc = service->PromotionAllocStart(holder.client_id, "k_cold",
-                                              "default", 1024, {});
+                                              TenantId::Default(), 1024, {});
     ASSERT_TRUE(alloc.has_value());
 
     // Intruder calls Failure with the wrong client_id.
     UUID intruder_id = generate_uuid();
     ASSERT_NE(intruder_id, holder.client_id);
-    auto bad_failure =
-        service->NotifyPromotionFailure(intruder_id, "k_cold", "default");
+    auto bad_failure = service->NotifyPromotionFailure(intruder_id, "k_cold",
+                                                       TenantId::Default());
     ASSERT_FALSE(bad_failure.has_value())
         << "Failure from a non-holder client must be rejected.";
     EXPECT_EQ(bad_failure.error(), ErrorCode::INVALID_PARAMS);
@@ -1440,8 +1442,8 @@ TEST_F(PromotionOnHitTest, NotifyFailureRejectsNonHolder) {
     // The legitimate holder must still be able to either commit via
     // Notify-Success or release via Notify-Failure on the same task. Use
     // Notify-Failure here to exercise the surviving-task path.
-    auto good_failure =
-        service->NotifyPromotionFailure(holder.client_id, "k_cold", "default");
+    auto good_failure = service->NotifyPromotionFailure(
+        holder.client_id, "k_cold", TenantId::Default());
     ASSERT_TRUE(good_failure.has_value())
         << "Holder Failure must succeed after a rejected intruder "
         << "Failure — the task entry should be untouched by the "
@@ -1475,14 +1477,14 @@ TEST_F(PromotionOnHitTest, AllocStartRejectsNonHolder) {
     const size_t used_baseline = seg_baseline->first;
 
     {
-        auto r = service->GetReplicaList("k_cold", "default");
+        auto r = service->GetReplicaList("k_cold", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
 
     UUID intruder_id = generate_uuid();
     ASSERT_NE(intruder_id, holder.client_id);
-    auto bad_alloc = service->PromotionAllocStart(intruder_id, "k_cold",
-                                                  "default", 1024, {});
+    auto bad_alloc = service->PromotionAllocStart(
+        intruder_id, "k_cold", TenantId::Default(), 1024, {});
     ASSERT_FALSE(bad_alloc.has_value())
         << "AllocStart from a non-holder client must be rejected — "
         << "otherwise an attacker that drained another's queue could "
@@ -1497,8 +1499,8 @@ TEST_F(PromotionOnHitTest, AllocStartRejectsNonHolder) {
 
     // The legitimate holder must still be able to AllocStart (task
     // untouched by the rejection).
-    auto good_alloc = service->PromotionAllocStart(holder.client_id, "k_cold",
-                                                   "default", 1024, {});
+    auto good_alloc = service->PromotionAllocStart(
+        holder.client_id, "k_cold", TenantId::Default(), 1024, {});
     ASSERT_TRUE(good_alloc.has_value())
         << "Holder AllocStart on the same task must succeed after a "
         << "rejected intruder AllocStart; error=" << good_alloc.error();
@@ -1532,7 +1534,7 @@ TEST_F(PromotionOnHitTest, AllocStartRejectsSizeMismatch) {
     const size_t used_baseline = seg_baseline->first;
 
     {
-        auto r = service->GetReplicaList("k_cold", "default");
+        auto r = service->GetReplicaList("k_cold", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
 
@@ -1540,7 +1542,7 @@ TEST_F(PromotionOnHitTest, AllocStartRejectsSizeMismatch) {
     for (uint64_t bad_size : {static_cast<uint64_t>(kRealSize) / 2,
                               static_cast<uint64_t>(kRealSize) * 4}) {
         auto bad_alloc = service->PromotionAllocStart(
-            holder.client_id, "k_cold", "default", bad_size, {});
+            holder.client_id, "k_cold", TenantId::Default(), bad_size, {});
         ASSERT_FALSE(bad_alloc.has_value())
             << "AllocStart with size=" << bad_size
             << " (task.object_size=" << kRealSize << ") must be rejected.";
@@ -1556,9 +1558,9 @@ TEST_F(PromotionOnHitTest, AllocStartRejectsSizeMismatch) {
 
     // Correct size must still work — the task was not consumed by the
     // rejections.
-    auto good_alloc =
-        service->PromotionAllocStart(holder.client_id, "k_cold", "default",
-                                     static_cast<uint64_t>(kRealSize), {});
+    auto good_alloc = service->PromotionAllocStart(
+        holder.client_id, "k_cold", TenantId::Default(),
+        static_cast<uint64_t>(kRealSize), {});
     ASSERT_TRUE(good_alloc.has_value())
         << "AllocStart with the correct size must succeed after rejected "
         << "size-mismatch attempts; error=" << good_alloc.error();
@@ -1603,7 +1605,7 @@ TEST_F(PromotionOnHitTest, ClientExpiryClearsPromotionTask) {
 
     // Admit the promotion. promotion_in_flight_ goes 0 -> 1.
     {
-        auto r = service->GetReplicaList("k_cold", "default");
+        auto r = service->GetReplicaList("k_cold", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
 
@@ -1631,7 +1633,7 @@ TEST_F(PromotionOnHitTest, ClientExpiryClearsPromotionTask) {
                                        "k_other", 1024,
                                        second_holder.segment_name));
     {
-        auto r = service->GetReplicaList("k_other", "default");
+        auto r = service->GetReplicaList("k_other", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
     auto pending_pre =
@@ -1664,7 +1666,7 @@ TEST_F(PromotionOnHitTest, ClientExpiryClearsPromotionTask) {
     // on the second holder; with queue_limit=1 this can only succeed if
     // the slot was freed.
     {
-        auto r = service->GetReplicaList("k_other", "default");
+        auto r = service->GetReplicaList("k_other", TenantId::Default());
         ASSERT_TRUE(r.has_value())
             << "GetReplicaList(k_other) failed with error=" << r.error();
     }
@@ -1746,7 +1748,7 @@ TEST_F(PromotionOnHitTest, RemoveErasesPromotionTask) {
 
     // Admit task 1.
     {
-        auto r = service->GetReplicaList("k_first", "default");
+        auto r = service->GetReplicaList("k_first", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
     {
@@ -1758,7 +1760,7 @@ TEST_F(PromotionOnHitTest, RemoveErasesPromotionTask) {
     // Remove k_first with force=true. With the fix, this also wipes
     // k_first's promotion_tasks entry and decrements
     // promotion_in_flight_ back to 0.
-    auto rm = service->Remove("k_first", "default", /*force=*/true);
+    auto rm = service->Remove("k_first", TenantId::Default(), /*force=*/true);
     ASSERT_TRUE(rm.has_value())
         << "Remove should succeed; error=" << rm.error();
 
@@ -1766,7 +1768,7 @@ TEST_F(PromotionOnHitTest, RemoveErasesPromotionTask) {
     // if the slot was freed by Remove. Without the in-flight cleanup,
     // it would stay pinned for the full 300s TTL.
     {
-        auto r = service->GetReplicaList("k_second", "default");
+        auto r = service->GetReplicaList("k_second", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
     auto pending_post = service->PromotionObjectHeartbeat(holder.client_id);
@@ -1803,12 +1805,13 @@ TEST_F(PromotionOnHitTest, RemoveByRegexErasesPromotionTask) {
 
     // Admit task on regex_k1.
     {
-        auto r = service->GetReplicaList("regex_k1", "default");
+        auto r = service->GetReplicaList("regex_k1", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
 
     // RemoveByRegex matches regex_k1 only.
-    auto removed = service->RemoveByRegex("^regex_", "default", /*force=*/true);
+    auto removed =
+        service->RemoveByRegex("^regex_", TenantId::Default(), /*force=*/true);
     ASSERT_TRUE(removed.has_value())
         << "RemoveByRegex should succeed; error=" << removed.error();
     EXPECT_EQ(removed.value(), 1) << "exactly one key (regex_k1) should match";
@@ -1816,7 +1819,7 @@ TEST_F(PromotionOnHitTest, RemoveByRegexErasesPromotionTask) {
     // Slot must be free — admit on other_k2 (different shard or same,
     // doesn't matter because counter is global).
     {
-        auto r = service->GetReplicaList("other_k2", "default");
+        auto r = service->GetReplicaList("other_k2", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
     auto pending_post = service->PromotionObjectHeartbeat(holder.client_id);
@@ -1854,7 +1857,7 @@ TEST_F(PromotionOnHitTest, RemoveAllErasesPromotionTask) {
     const int64_t cancelled_pre = mm.get_promotion_cancelled();
 
     {
-        auto r = service->GetReplicaList("k_first", "default");
+        auto r = service->GetReplicaList("k_first", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
     {
@@ -1873,7 +1876,7 @@ TEST_F(PromotionOnHitTest, RemoveAllErasesPromotionTask) {
     ASSERT_TRUE(InjectLocalDiskReplica(*service, holder.client_id, "k_second",
                                        1024, holder.segment_name));
     {
-        auto r = service->GetReplicaList("k_second", "default");
+        auto r = service->GetReplicaList("k_second", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
     auto pending_post = service->PromotionObjectHeartbeat(holder.client_id);
@@ -1918,7 +1921,7 @@ TEST_F(PromotionOnHitTest, BatchRemoveErasesPromotionTask) {
     const int64_t cancelled_pre = mm.get_promotion_cancelled();
 
     {
-        auto r = service->GetReplicaList("k_first", "default");
+        auto r = service->GetReplicaList("k_first", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
     {
@@ -1927,7 +1930,8 @@ TEST_F(PromotionOnHitTest, BatchRemoveErasesPromotionTask) {
         EXPECT_EQ(CountPromotionTask(*pending, "k_first"), 1u);
     }
 
-    auto results = service->BatchRemove({"k_first"}, "default", /*force=*/true);
+    auto results =
+        service->BatchRemove({"k_first"}, TenantId::Default(), /*force=*/true);
     ASSERT_EQ(results.size(), 1u);
     EXPECT_TRUE(results[0].has_value())
         << "BatchRemove should succeed; error=" << results[0].error();
@@ -1937,7 +1941,7 @@ TEST_F(PromotionOnHitTest, BatchRemoveErasesPromotionTask) {
         << "must bump promotion_cancelled_total.";
 
     {
-        auto r = service->GetReplicaList("k_second", "default");
+        auto r = service->GetReplicaList("k_second", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
     auto pending_post = service->PromotionObjectHeartbeat(holder.client_id);
@@ -1974,7 +1978,7 @@ TEST_F(PromotionOnHitTest, BatchRemoveStaleHandleErasesPromotionTask) {
     const int64_t cancelled_pre = mm.get_promotion_cancelled();
 
     {
-        auto r = service->GetReplicaList("k_first", "default");
+        auto r = service->GetReplicaList("k_first", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
     {
@@ -1983,7 +1987,8 @@ TEST_F(PromotionOnHitTest, BatchRemoveStaleHandleErasesPromotionTask) {
         EXPECT_EQ(CountPromotionTask(*pending, "k_first"), 1u);
     }
 
-    auto results = service->BatchRemove({"k_first"}, "default", /*force=*/true);
+    auto results =
+        service->BatchRemove({"k_first"}, TenantId::Default(), /*force=*/true);
     ASSERT_EQ(results.size(), 1u);
     EXPECT_FALSE(results[0].has_value())
         << "stale-handle path should report OBJECT_NOT_FOUND once the "
@@ -2007,7 +2012,7 @@ TEST_F(PromotionOnHitTest, BatchRemoveStaleHandleErasesPromotionTask) {
                                        "k_second", 1024,
                                        second_holder.segment_name));
     {
-        auto r = service->GetReplicaList("k_second", "default");
+        auto r = service->GetReplicaList("k_second", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
     auto pending_post =
@@ -2048,18 +2053,18 @@ TEST_F(PromotionOnHitTest, MetricsFunnelTracksSuccessfulPromotion) {
 
     // Admit.
     {
-        auto r = service->GetReplicaList("k_hot", "default");
+        auto r = service->GetReplicaList("k_hot", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
     EXPECT_EQ(mm.get_promotion_admitted() - admitted_pre, 1);
     EXPECT_EQ(mm.get_promotion_in_flight() - in_flight_pre, 1);
 
     // Drive AllocStart + NotifyPromotionSuccess.
-    auto alloc = service->PromotionAllocStart(seg.client_id, "k_hot", "default",
-                                              kObjBytes, {});
+    auto alloc = service->PromotionAllocStart(
+        seg.client_id, "k_hot", TenantId::Default(), kObjBytes, {});
     ASSERT_TRUE(alloc.has_value());
-    auto notify =
-        service->NotifyPromotionSuccess(seg.client_id, "k_hot", "default");
+    auto notify = service->NotifyPromotionSuccess(seg.client_id, "k_hot",
+                                                  TenantId::Default());
     ASSERT_TRUE(notify.has_value());
 
     EXPECT_EQ(mm.get_promotion_completed() - completed_pre, 1);
@@ -2094,25 +2099,25 @@ TEST_F(PromotionOnHitTest, MetricsRejectionCountersIncrementOnGateMiss) {
 
     // 1st Get on k_a: freq=1, threshold=2 → rejected on frequency.
     {
-        auto r = service->GetReplicaList("k_a", "default");
+        auto r = service->GetReplicaList("k_a", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
     EXPECT_EQ(mm.get_promotion_rejected_frequency() - freq_pre, 1);
 
     // 2nd Get on k_a: freq=2, admits. Now in-flight = 1 == limit.
     {
-        auto r = service->GetReplicaList("k_a", "default");
+        auto r = service->GetReplicaList("k_a", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
     // Get on k_b: freq=1, threshold=2 → rejected on frequency.
     {
-        auto r = service->GetReplicaList("k_b", "default");
+        auto r = service->GetReplicaList("k_b", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
     // Get on k_b again: freq=2, gets past frequency, but cap=1
     // saturated → rejected on cap.
     {
-        auto r = service->GetReplicaList("k_b", "default");
+        auto r = service->GetReplicaList("k_b", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
     EXPECT_EQ(mm.get_promotion_rejected_cap() - cap_pre, 1);
@@ -2139,7 +2144,7 @@ TEST_F(PromotionOnHitTest, MetricsRejectionCountersIncrementOnGateMiss) {
 
     const int64_t wm_pre = mm.get_promotion_rejected_watermark();
     {
-        auto r = wm_service->GetReplicaList("k_w", "default");
+        auto r = wm_service->GetReplicaList("k_w", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
     EXPECT_EQ(mm.get_promotion_rejected_watermark() - wm_pre, 1);
@@ -2156,19 +2161,20 @@ TEST_F(PromotionOnHitTest, AdmissionFrequencyIsTenantScoped) {
     config.promotion_admission_threshold = 2;
     config.default_kv_lease_ttl = 2000;
     const std::string key = "shared_hot_key";
-    const std::string tenant_a = "tenant_promotion_a";
-    const std::string tenant_b = "tenant_promotion_b";
-    config.tenant_quota_connector_uri = WriteTenantQuotaPolicyFile(
-        {{tenant_a, 64 * 1024 * 1024}, {tenant_b, 64 * 1024 * 1024}});
+    const TenantId tenant_a("tenant_promotion_a");
+    const TenantId tenant_b("tenant_promotion_b");
+    config.tenant_quota_connector_uri =
+        WriteTenantQuotaPolicyFile({{tenant_a.value(), 64 * 1024 * 1024},
+                                    {tenant_b.value(), 64 * 1024 * 1024}});
     auto service = std::make_unique<MasterService>(config);
 
     constexpr size_t seg_size = 1024 * 1024 * 16;
     auto seg =
         PrepareSegment(*service, "seg_tenant", kDefaultSegmentBase, seg_size);
     ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, key, 1024,
-                                       seg.segment_name, tenant_a));
+                                       seg.segment_name, tenant_a.value()));
     ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, key, 1024,
-                                       seg.segment_name, tenant_b));
+                                       seg.segment_name, tenant_b.value()));
 
     {
         auto r = service->GetReplicaList(key, tenant_a);
@@ -2192,7 +2198,7 @@ TEST_F(PromotionOnHitTest, AdmissionFrequencyIsTenantScoped) {
         service->PromotionObjectHeartbeat(seg.client_id);
     ASSERT_TRUE(pending_after_tenant_a_second.has_value());
     ASSERT_EQ(pending_after_tenant_a_second->size(), 1u);
-    EXPECT_EQ((*pending_after_tenant_a_second)[0].tenant_id, tenant_a);
+    EXPECT_EQ((*pending_after_tenant_a_second)[0].tenant_id, tenant_a.value());
     EXPECT_EQ((*pending_after_tenant_a_second)[0].key, key);
 
     service->RemoveAll();
@@ -2218,7 +2224,7 @@ TEST_F(PromotionOnHitTest, MaxPerHeartbeatKnobControlsBatchSize) {
         const auto key = "k_" + std::to_string(i);
         ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, key, 1024,
                                            seg.segment_name));
-        auto r = service->GetReplicaList(key, "default");
+        auto r = service->GetReplicaList(key, TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
 
@@ -2259,7 +2265,7 @@ TEST_F(PromotionOnHitTest, MaxPerHeartbeatZeroClampsToOne) {
     ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k1", 1024,
                                        seg.segment_name));
     {
-        auto r = service->GetReplicaList("k1", "default");
+        auto r = service->GetReplicaList("k1", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
 
@@ -2297,13 +2303,13 @@ TEST_F(PromotionOnHitTest, MetricsRemoveMidPromotionCountsAsCancelled) {
 
     // Admit a promotion. in_flight goes from 0 to 1.
     {
-        auto r = service->GetReplicaList("k_drop", "default");
+        auto r = service->GetReplicaList("k_drop", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
     ASSERT_EQ(mm.get_promotion_admitted() - admitted_pre, 1);
     ASSERT_EQ(mm.get_promotion_in_flight() - in_flight_pre, 1);
 
-    auto rm = service->Remove("k_drop", "default", /*force=*/true);
+    auto rm = service->Remove("k_drop", TenantId::Default(), /*force=*/true);
     ASSERT_TRUE(rm.has_value()) << "error=" << rm.error();
 
     EXPECT_EQ(mm.get_promotion_in_flight() - in_flight_pre, 0);

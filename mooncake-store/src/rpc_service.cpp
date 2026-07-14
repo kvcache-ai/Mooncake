@@ -1,5 +1,10 @@
 #include "rpc_service.h"
 
+#include <cassert>
+#include <functional>
+#include <string_view>
+#include <type_traits>
+
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/util/tl/expected.hpp>
 
@@ -11,6 +16,44 @@
 #include "version.h"
 
 namespace mooncake {
+namespace {
+
+TenantId ResolveRequestTenantId(std::string_view raw,
+                                bool enable_multi_tenants) {
+    if (!enable_multi_tenants) {
+        return TenantId::Default();
+    }
+    TenantId tenant_id{std::string(raw)};
+    assert(tenant_id.IsValid());
+    return tenant_id;
+}
+
+tl::expected<TenantId, ErrorCode> ResolveTenantIdForWrite(
+    std::string_view raw, bool enable_multi_tenants) {
+    if (!enable_multi_tenants) {
+        return TenantId::Default();
+    }
+    if (raw.empty()) {
+        return tl::make_unexpected(ErrorCode::TENANT_NOT_REGISTERED);
+    }
+    TenantId tenant_id{std::string(raw)};
+    if (!tenant_id.IsValid()) {
+        return tl::make_unexpected(ErrorCode::TENANT_NOT_REGISTERED);
+    }
+    return tenant_id;
+}
+
+template <typename Fn>
+auto WithWriteTenant(std::string_view raw, bool enable_multi_tenants, Fn&& fn) {
+    using Result = std::invoke_result_t<Fn, const TenantId&>;
+    auto tenant_id = ResolveTenantIdForWrite(raw, enable_multi_tenants);
+    if (!tenant_id) {
+        return Result(tl::make_unexpected(tenant_id.error()));
+    }
+    return std::invoke(std::forward<Fn>(fn), tenant_id.value());
+}
+
+}  // namespace
 
 WrappedMasterService::WrappedMasterService(
     const WrappedMasterServiceConfig& config,
@@ -37,7 +80,12 @@ WrappedMasterService::CalcCacheStats() {
 tl::expected<bool, ErrorCode> WrappedMasterService::ExistKey(
     const std::string& key, const std::string& tenant_id) {
     return execute_rpc(
-        "ExistKey", [&] { return master_service_.ExistKey(key, tenant_id); },
+        "ExistKey",
+        [&] {
+            return master_service_.ExistKey(
+                key, ResolveRequestTenantId(
+                         tenant_id, master_service_.IsTenantQuotaEnabled()));
+        },
         [&](auto& timer) { timer.LogRequest("key=", key); },
         [] { MasterMetricManager::instance().inc_exist_key_requests(); },
         [] { MasterMetricManager::instance().inc_exist_key_failures(); });
@@ -50,7 +98,9 @@ std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchExistKey(
     timer.LogRequest("keys_count=", total_keys);
     MasterMetricManager::instance().inc_batch_exist_key_requests(total_keys);
 
-    auto result = master_service_.BatchExistKey(keys, tenant_id);
+    auto result = master_service_.BatchExistKey(
+        keys, ResolveRequestTenantId(tenant_id,
+                                     master_service_.IsTenantQuotaEnabled()));
 
     size_t failure_count = 0;
     for (size_t i = 0; i < result.size(); ++i) {
@@ -161,7 +211,11 @@ WrappedMasterService::GetReplicaListByRegex(const std::string& str,
                                             const std::string& tenant_id) {
     return execute_rpc(
         "GetReplicaListByRegex",
-        [&] { return master_service_.GetReplicaListByRegex(str, tenant_id); },
+        [&] {
+            return master_service_.GetReplicaListByRegex(
+                str, ResolveRequestTenantId(
+                         tenant_id, master_service_.IsTenantQuotaEnabled()));
+        },
         [&](auto& timer) { timer.LogRequest("Regex=", str); },
         [] {
             MasterMetricManager::instance()
@@ -178,7 +232,11 @@ WrappedMasterService::GetReplicaList(const std::string& key,
                                      const std::string& tenant_id) {
     return execute_rpc(
         "GetReplicaList",
-        [&] { return master_service_.GetReplicaList(key, tenant_id); },
+        [&] {
+            return master_service_.GetReplicaList(
+                key, ResolveRequestTenantId(
+                         tenant_id, master_service_.IsTenantQuotaEnabled()));
+        },
         [&](auto& timer) { timer.LogRequest("key=", key); },
         [] { MasterMetricManager::instance().inc_get_replica_list_requests(); },
         [] {
@@ -198,7 +256,9 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> results;
     results.reserve(keys.size());
 
-    results = master_service_.BatchGetReplicaList(keys, tenant_id);
+    results = master_service_.BatchGetReplicaList(
+        keys, ResolveRequestTenantId(tenant_id,
+                                     master_service_.IsTenantQuotaEnabled()));
 
     size_t failure_count = 0;
     for (size_t i = 0; i < results.size(); ++i) {
@@ -233,7 +293,9 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
 WrappedMasterService::BatchGetReplicaListForAdmin(
     const std::vector<std::string>& keys, const std::string& tenant_id) {
-    return master_service_.BatchGetReplicaListForAdmin(keys, tenant_id);
+    return master_service_.BatchGetReplicaListForAdmin(
+        keys, ResolveRequestTenantId(tenant_id,
+                                     master_service_.IsTenantQuotaEnabled()));
 }
 
 tl::expected<GetReplicaListResponse, ErrorCode>
@@ -241,7 +303,11 @@ WrappedMasterService::GetReplicaListForAdmin(const std::string& key,
                                              const std::string& tenant_id) {
     return execute_rpc(
         "GetReplicaListForAdmin",
-        [&] { return master_service_.GetReplicaListForAdmin(key, tenant_id); },
+        [&] {
+            return master_service_.GetReplicaListForAdmin(
+                key, ResolveRequestTenantId(
+                         tenant_id, master_service_.IsTenantQuotaEnabled()));
+        },
         [&](auto& timer) { timer.LogRequest("key=", key); }, [] {}, [] {});
 }
 
@@ -253,8 +319,13 @@ WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
     return execute_rpc(
         "PutStart",
         [&] {
-            return master_service_.PutStart(client_id, key, tenant_id,
-                                            slice_length, config);
+            return WithWriteTenant(tenant_id,
+                                   master_service_.IsTenantQuotaEnabled(),
+                                   [&](const TenantId& resolved_tenant_id) {
+                                       return master_service_.PutStart(
+                                           client_id, key, resolved_tenant_id,
+                                           slice_length, config);
+                                   });
         },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key,
@@ -270,8 +341,11 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
     return execute_rpc(
         "PutEnd",
         [&] {
-            return master_service_.PutEnd(client_id, key, tenant_id,
-                                          replica_type);
+            return master_service_.PutEnd(
+                client_id, key,
+                ResolveRequestTenantId(tenant_id,
+                                       master_service_.IsTenantQuotaEnabled()),
+                replica_type);
         },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key,
@@ -287,8 +361,11 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutRevoke(
     return execute_rpc(
         "PutRevoke",
         [&] {
-            return master_service_.PutRevoke(client_id, key, tenant_id,
-                                             replica_type);
+            return master_service_.PutRevoke(
+                client_id, key,
+                ResolveRequestTenantId(tenant_id,
+                                       master_service_.IsTenantQuotaEnabled()),
+                replica_type);
         },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key,
@@ -312,6 +389,8 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
         results;
     results.reserve(keys.size());
+    auto resolved_tenant_id = ResolveTenantIdForWrite(
+        tenant_id, master_service_.IsTenantQuotaEnabled());
 
     if (keys.size() != slice_lengths.size()) {
         LOG(ERROR) << "BatchPutStart: keys.size()=" << keys.size()
@@ -325,12 +404,16 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
                    << " != keys.size()=" << keys.size();
         results.assign(keys.size(),
                        tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    } else if (!resolved_tenant_id) {
+        results.assign(keys.size(),
+                       tl::make_unexpected(resolved_tenant_id.error()));
     } else if (config.prefer_alloc_in_same_node) {
         ReplicateConfig new_config = config;
         for (size_t i = 0; i < keys.size(); ++i) {
             auto key_config = new_config.ForSingleKey(i);
             auto result = master_service_.PutStart(
-                client_id, keys[i], tenant_id, slice_lengths[i], key_config);
+                client_id, keys[i], resolved_tenant_id.value(),
+                slice_lengths[i], key_config);
             results.emplace_back(result);
             if ((i == 0) && result.has_value()) {
                 std::string preferred_segment;
@@ -352,7 +435,8 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
         for (size_t i = 0; i < keys.size(); ++i) {
             auto key_config = config.ForSingleKey(i);
             results.emplace_back(master_service_.PutStart(
-                client_id, keys[i], tenant_id, slice_lengths[i], key_config));
+                client_id, keys[i], resolved_tenant_id.value(),
+                slice_lengths[i], key_config));
         }
     }
 
@@ -403,10 +487,11 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
 
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(keys.size());
-
+    const auto resolved_tenant_id = ResolveRequestTenantId(
+        tenant_id, master_service_.IsTenantQuotaEnabled());
     for (const auto& key : keys) {
-        results.emplace_back(
-            master_service_.PutEnd(client_id, key, tenant_id, replica_type));
+        results.emplace_back(master_service_.PutEnd(
+            client_id, key, resolved_tenant_id, replica_type));
     }
 
     size_t failure_count = 0;
@@ -443,10 +528,11 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
 
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(keys.size());
-
+    const auto resolved_tenant_id = ResolveRequestTenantId(
+        tenant_id, master_service_.IsTenantQuotaEnabled());
     for (const auto& key : keys) {
-        results.emplace_back(
-            master_service_.PutRevoke(client_id, key, tenant_id, replica_type));
+        results.emplace_back(master_service_.PutRevoke(
+            client_id, key, resolved_tenant_id, replica_type));
     }
 
     size_t failure_count = 0;
@@ -481,8 +567,13 @@ WrappedMasterService::UpsertStart(const UUID& client_id, const std::string& key,
     return execute_rpc(
         "UpsertStart",
         [&] {
-            return master_service_.UpsertStart(client_id, key, tenant_id,
-                                               slice_length, config);
+            return WithWriteTenant(tenant_id,
+                                   master_service_.IsTenantQuotaEnabled(),
+                                   [&](const TenantId& resolved_tenant_id) {
+                                       return master_service_.UpsertStart(
+                                           client_id, key, resolved_tenant_id,
+                                           slice_length, config);
+                                   });
         },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key,
@@ -498,8 +589,11 @@ tl::expected<void, ErrorCode> WrappedMasterService::UpsertEnd(
     return execute_rpc(
         "UpsertEnd",
         [&] {
-            return master_service_.UpsertEnd(client_id, key, tenant_id,
-                                             replica_type);
+            return master_service_.UpsertEnd(
+                client_id, key,
+                ResolveRequestTenantId(tenant_id,
+                                       master_service_.IsTenantQuotaEnabled()),
+                replica_type);
         },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key,
@@ -515,8 +609,11 @@ tl::expected<void, ErrorCode> WrappedMasterService::UpsertRevoke(
     return execute_rpc(
         "UpsertRevoke",
         [&] {
-            return master_service_.UpsertRevoke(client_id, key, tenant_id,
-                                                replica_type);
+            return master_service_.UpsertRevoke(
+                client_id, key,
+                ResolveRequestTenantId(tenant_id,
+                                       master_service_.IsTenantQuotaEnabled()),
+                replica_type);
         },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key,
@@ -536,8 +633,29 @@ WrappedMasterService::BatchUpsertStart(
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
     MasterMetricManager::instance().inc_batch_put_start_requests(total_keys);
 
-    auto results = master_service_.BatchUpsertStart(client_id, keys, tenant_id,
-                                                    slice_lengths, config);
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+        results;
+    if (keys.size() != slice_lengths.size()) {
+        LOG(ERROR) << "BatchUpsertStart: keys.size()=" << keys.size()
+                   << " != slice_lengths.size()=" << slice_lengths.size();
+        results.assign(keys.size(),
+                       tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    } else if (config.group_ids.has_value() &&
+               config.group_ids->size() != keys.size()) {
+        LOG(ERROR) << "BatchUpsertStart: group_ids.size()="
+                   << config.group_ids->size()
+                   << " != keys.size()=" << keys.size();
+        results.assign(keys.size(),
+                       tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    } else if (auto resolved_tenant_id = ResolveTenantIdForWrite(
+                   tenant_id, master_service_.IsTenantQuotaEnabled());
+               !resolved_tenant_id) {
+        results.assign(keys.size(),
+                       tl::make_unexpected(resolved_tenant_id.error()));
+    } else {
+        results = master_service_.BatchUpsertStart(
+            client_id, keys, resolved_tenant_id.value(), slice_lengths, config);
+    }
 
     size_t failure_count = 0;
     for (size_t i = 0; i < results.size(); ++i) {
@@ -571,7 +689,10 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchUpsertEnd(
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
     MasterMetricManager::instance().inc_batch_put_end_requests(total_keys);
 
-    auto results = master_service_.BatchUpsertEnd(client_id, keys, tenant_id);
+    const auto resolved_tenant_id = ResolveRequestTenantId(
+        tenant_id, master_service_.IsTenantQuotaEnabled());
+    auto results =
+        master_service_.BatchUpsertEnd(client_id, keys, resolved_tenant_id);
 
     size_t failure_count = 0;
     for (size_t i = 0; i < results.size(); ++i) {
@@ -606,8 +727,10 @@ WrappedMasterService::BatchUpsertRevoke(const UUID& client_id,
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
     MasterMetricManager::instance().inc_batch_put_revoke_requests(total_keys);
 
+    const auto resolved_tenant_id = ResolveRequestTenantId(
+        tenant_id, master_service_.IsTenantQuotaEnabled());
     auto results =
-        master_service_.BatchUpsertRevoke(client_id, keys, tenant_id);
+        master_service_.BatchUpsertRevoke(client_id, keys, resolved_tenant_id);
 
     size_t failure_count = 0;
     for (size_t i = 0; i < results.size(); ++i) {
@@ -636,7 +759,14 @@ WrappedMasterService::BatchUpsertRevoke(const UUID& client_id,
 tl::expected<void, ErrorCode> WrappedMasterService::Remove(
     const std::string& key, bool force, const std::string& tenant_id) {
     return execute_rpc(
-        "Remove", [&] { return master_service_.Remove(key, tenant_id, force); },
+        "Remove",
+        [&] {
+            return master_service_.Remove(
+                key,
+                ResolveRequestTenantId(tenant_id,
+                                       master_service_.IsTenantQuotaEnabled()),
+                force);
+        },
         [&](auto& timer) { timer.LogRequest("key=", key, ", force=", force); },
         [] { MasterMetricManager::instance().inc_remove_requests(); },
         [] { MasterMetricManager::instance().inc_remove_failures(); });
@@ -646,7 +776,13 @@ tl::expected<long, ErrorCode> WrappedMasterService::RemoveByRegex(
     const std::string& str, bool force, const std::string& tenant_id) {
     return execute_rpc(
         "RemoveByRegex",
-        [&] { return master_service_.RemoveByRegex(str, tenant_id, force); },
+        [&] {
+            return master_service_.RemoveByRegex(
+                str,
+                ResolveRequestTenantId(tenant_id,
+                                       master_service_.IsTenantQuotaEnabled()),
+                force);
+        },
         [&](auto& timer) {
             timer.LogRequest("regex=", str, ", force=", force);
         },
@@ -658,7 +794,10 @@ long WrappedMasterService::RemoveAll(bool force, const std::string& tenant_id) {
     ScopedVLogTimer timer(1, "RemoveAll");
     timer.LogRequest("action=remove_all_objects, force=", force);
     MasterMetricManager::instance().inc_remove_all_requests();
-    long result = master_service_.RemoveAll(tenant_id, force);
+    long result = master_service_.RemoveAll(
+        ResolveRequestTenantId(tenant_id,
+                               master_service_.IsTenantQuotaEnabled()),
+        force);
     timer.LogResponse("items_removed=", result);
     return result;
 }
@@ -671,7 +810,11 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchRemove(
     timer.LogRequest("keys_count=", total_keys, ", force=", force);
     MasterMetricManager::instance().inc_remove_requests(total_keys);
 
-    auto results = master_service_.BatchRemove(keys, tenant_id, force);
+    auto results = master_service_.BatchRemove(
+        keys,
+        ResolveRequestTenantId(tenant_id,
+                               master_service_.IsTenantQuotaEnabled()),
+        force);
 
     size_t failure_count = 0;
     for (const auto& result : results) {
@@ -830,8 +973,13 @@ tl::expected<CopyStartResponse, ErrorCode> WrappedMasterService::CopyStart(
     return execute_rpc(
         "CopyStart",
         [&] {
-            return master_service_.CopyStart(client_id, key, tenant_id,
-                                             src_segment, tgt_segments);
+            return WithWriteTenant(tenant_id,
+                                   master_service_.IsTenantQuotaEnabled(),
+                                   [&](const TenantId& resolved_tenant_id) {
+                                       return master_service_.CopyStart(
+                                           client_id, key, resolved_tenant_id,
+                                           src_segment, tgt_segments);
+                                   });
         },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key,
@@ -848,7 +996,12 @@ tl::expected<void, ErrorCode> WrappedMasterService::CopyEnd(
     const std::string& tenant_id) {
     return execute_rpc(
         "CopyEnd",
-        [&] { return master_service_.CopyEnd(client_id, key, tenant_id); },
+        [&] {
+            return master_service_.CopyEnd(
+                client_id, key,
+                ResolveRequestTenantId(tenant_id,
+                                       master_service_.IsTenantQuotaEnabled()));
+        },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key,
                              ", tenant_id=", tenant_id);
@@ -862,7 +1015,12 @@ tl::expected<void, ErrorCode> WrappedMasterService::CopyRevoke(
     const std::string& tenant_id) {
     return execute_rpc(
         "CopyRevoke",
-        [&] { return master_service_.CopyRevoke(client_id, key, tenant_id); },
+        [&] {
+            return master_service_.CopyRevoke(
+                client_id, key,
+                ResolveRequestTenantId(tenant_id,
+                                       master_service_.IsTenantQuotaEnabled()));
+        },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key,
                              ", tenant_id=", tenant_id);
@@ -877,8 +1035,13 @@ tl::expected<MoveStartResponse, ErrorCode> WrappedMasterService::MoveStart(
     return execute_rpc(
         "MoveStart",
         [&] {
-            return master_service_.MoveStart(client_id, key, tenant_id,
-                                             src_segment, tgt_segment);
+            return WithWriteTenant(tenant_id,
+                                   master_service_.IsTenantQuotaEnabled(),
+                                   [&](const TenantId& resolved_tenant_id) {
+                                       return master_service_.MoveStart(
+                                           client_id, key, resolved_tenant_id,
+                                           src_segment, tgt_segment);
+                                   });
         },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key,
@@ -895,7 +1058,12 @@ tl::expected<void, ErrorCode> WrappedMasterService::MoveEnd(
     const std::string& tenant_id) {
     return execute_rpc(
         "MoveEnd",
-        [&] { return master_service_.MoveEnd(client_id, key, tenant_id); },
+        [&] {
+            return master_service_.MoveEnd(
+                client_id, key,
+                ResolveRequestTenantId(tenant_id,
+                                       master_service_.IsTenantQuotaEnabled()));
+        },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key,
                              ", tenant_id=", tenant_id);
@@ -909,7 +1077,12 @@ tl::expected<void, ErrorCode> WrappedMasterService::MoveRevoke(
     const std::string& tenant_id) {
     return execute_rpc(
         "MoveRevoke",
-        [&] { return master_service_.MoveRevoke(client_id, key, tenant_id); },
+        [&] {
+            return master_service_.MoveRevoke(
+                client_id, key,
+                ResolveRequestTenantId(tenant_id,
+                                       master_service_.IsTenantQuotaEnabled()));
+        },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key,
                              ", tenant_id=", tenant_id);
@@ -924,8 +1097,11 @@ tl::expected<void, ErrorCode> WrappedMasterService::EvictDiskReplica(
     return execute_rpc(
         "EvictDiskReplica",
         [&] {
-            return master_service_.EvictDiskReplica(client_id, key, tenant_id,
-                                                    replica_type);
+            return master_service_.EvictDiskReplica(
+                client_id, key,
+                ResolveRequestTenantId(tenant_id,
+                                       master_service_.IsTenantQuotaEnabled()),
+                replica_type);
         },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key,
@@ -952,7 +1128,10 @@ WrappedMasterService::BatchEvictDiskReplica(
     MasterMetricManager::instance().inc_evict_disk_replica_requests();
 
     auto results = master_service_.BatchEvictDiskReplica(
-        client_id, keys, tenant_id, replica_type);
+        client_id, keys,
+        ResolveRequestTenantId(tenant_id,
+                               master_service_.IsTenantQuotaEnabled()),
+        replica_type);
 
     size_t failure_count = 0;
     for (size_t i = 0; i < results.size(); ++i) {
@@ -978,7 +1157,14 @@ tl::expected<UUID, ErrorCode> WrappedMasterService::CreateCopyTask(
     const std::vector<std::string>& targets) {
     return execute_rpc(
         "CreateCopyTask",
-        [&] { return master_service_.CreateCopyTask(key, tenant_id, targets); },
+        [&] {
+            return WithWriteTenant(tenant_id,
+                                   master_service_.IsTenantQuotaEnabled(),
+                                   [&](const TenantId& resolved_tenant_id) {
+                                       return master_service_.CreateCopyTask(
+                                           key, resolved_tenant_id, targets);
+                                   });
+        },
         [&](auto& timer) {
             timer.LogRequest("key=", key, ", tenant_id=", tenant_id,
                              ", targets_size=", targets.size());
@@ -995,8 +1181,12 @@ tl::expected<UUID, ErrorCode> WrappedMasterService::CreateMoveTask(
     return execute_rpc(
         "CreateMoveTask",
         [&] {
-            return master_service_.CreateMoveTask(key, tenant_id, source,
-                                                  target);
+            return WithWriteTenant(
+                tenant_id, master_service_.IsTenantQuotaEnabled(),
+                [&](const TenantId& resolved_tenant_id) {
+                    return master_service_.CreateMoveTask(
+                        key, resolved_tenant_id, source, target);
+                });
         },
         [&](auto& timer) {
             timer.LogRequest("key=", key, ", tenant_id=", tenant_id,
@@ -1093,7 +1283,9 @@ WrappedMasterService::GetTenantQuotaSnapshot(const std::string& tenant_id) {
     if (!master_service_.IsTenantQuotaEnabled()) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
     }
-    auto snapshot = master_service_.GetTenantQuotaSnapshot(tenant_id);
+    auto snapshot =
+        master_service_.GetTenantQuotaSnapshot(ResolveRequestTenantId(
+            tenant_id, master_service_.IsTenantQuotaEnabled()));
     if (!snapshot.has_value()) {
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
@@ -1106,7 +1298,14 @@ WrappedMasterService::UpsertTenantQuotaPolicy(const std::string& tenant_id,
     if (!master_service_.IsTenantQuotaEnabled()) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
     }
-    return master_service_.UpsertTenantQuotaPolicy(tenant_id,
+    if (tenant_id.empty()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    TenantId resolved_tenant_id(tenant_id);
+    if (!resolved_tenant_id.IsValid()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return master_service_.UpsertTenantQuotaPolicy(resolved_tenant_id,
                                                    requested_quota_bytes);
 }
 
@@ -1115,7 +1314,14 @@ WrappedMasterService::DeleteTenantQuotaPolicy(const std::string& tenant_id) {
     if (!master_service_.IsTenantQuotaEnabled()) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
     }
-    return master_service_.DeleteTenantQuotaPolicy(tenant_id);
+    if (tenant_id.empty()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    TenantId resolved_tenant_id(tenant_id);
+    if (!resolved_tenant_id.IsValid()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return master_service_.DeleteTenantQuotaPolicy(resolved_tenant_id);
 }
 
 tl::expected<uint64_t, ErrorCode>
@@ -1130,7 +1336,7 @@ tl::expected<std::vector<std::string>, ErrorCode>
 WrappedMasterService::GetAllKeysForAdmin() {
     // Compatibility endpoint: /get_all_keys historically listed only the
     // default tenant's keys.
-    return master_service_.GetAllKeys("default");
+    return master_service_.GetAllKeys(TenantId::Default());
 }
 
 tl::expected<std::vector<std::string>, ErrorCode>
@@ -1186,6 +1392,11 @@ tl::expected<void, ErrorCode> WrappedMasterService::NotifyOffloadSuccess(
     ScopedVLogTimer timer(1, "NotifyOffloadSuccess");
     timer.LogRequest("action=notify_offload_success");
 
+    for (const auto& task : tasks) {
+        (void)ResolveRequestTenantId(task.tenant_id,
+                                     master_service_.IsTenantQuotaEnabled());
+    }
+
     auto result =
         master_service_.NotifyOffloadSuccess(client_id, tasks, metadatas);
     timer.LogResponseExpected(result);
@@ -1205,8 +1416,12 @@ WrappedMasterService::PromotionAllocStart(
     uint64_t size, const std::vector<std::string>& preferred_segments) {
     ScopedVLogTimer timer(1, "PromotionAllocStart");
     timer.LogRequest("action=promotion_alloc_start");
-    auto result = master_service_.PromotionAllocStart(client_id, key, tenant_id,
-                                                      size, preferred_segments);
+    auto result = WithWriteTenant(
+        tenant_id, master_service_.IsTenantQuotaEnabled(),
+        [&](const TenantId& resolved_tenant_id) {
+            return master_service_.PromotionAllocStart(
+                client_id, key, resolved_tenant_id, size, preferred_segments);
+        });
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1216,8 +1431,10 @@ tl::expected<void, ErrorCode> WrappedMasterService::NotifyPromotionSuccess(
     const std::string& tenant_id) {
     ScopedVLogTimer timer(1, "NotifyPromotionSuccess");
     timer.LogRequest("action=notify_promotion_success");
-    auto result =
-        master_service_.NotifyPromotionSuccess(client_id, key, tenant_id);
+    auto result = master_service_.NotifyPromotionSuccess(
+        client_id, key,
+        ResolveRequestTenantId(tenant_id,
+                               master_service_.IsTenantQuotaEnabled()));
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1227,8 +1444,10 @@ tl::expected<void, ErrorCode> WrappedMasterService::NotifyPromotionFailure(
     const std::string& tenant_id) {
     ScopedVLogTimer timer(1, "NotifyPromotionFailure");
     timer.LogRequest("action=notify_promotion_failure");
-    auto result =
-        master_service_.NotifyPromotionFailure(client_id, key, tenant_id);
+    auto result = master_service_.NotifyPromotionFailure(
+        client_id, key,
+        ResolveRequestTenantId(tenant_id,
+                               master_service_.IsTenantQuotaEnabled()));
     timer.LogResponseExpected(result);
     return result;
 }
