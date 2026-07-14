@@ -31,7 +31,17 @@ pub(super) fn try_cold_backing_state(state: i32) -> Result<mooncake_store_core::
     )
 }
 
-pub(super) fn pb_cold_backing_route(
+pub(crate) fn pb_cold_backing_replica(
+    replica: &mooncake_store_core::ColdBackingReplica,
+) -> pb::ColdBackingReplica {
+    pb::ColdBackingReplica {
+        owner: Some(pb_runtime_id(&replica.owner)),
+        cold_tier_id: replica.cold_tier_id.clone(),
+        object_locator: replica.object_locator.clone(),
+    }
+}
+
+pub(crate) fn pb_cold_backing_route(
     route: &mooncake_store_core::ColdBackingRoute,
 ) -> pb::ColdBackingRoute {
     pb::ColdBackingRoute {
@@ -41,7 +51,26 @@ pub(super) fn pb_cold_backing_route(
         length: route.length,
         checksum: route.checksum,
         state: pb_cold_backing_state(route.state),
+        replicas: route.replicas.iter().map(pb_cold_backing_replica).collect(),
     }
+}
+
+pub(super) fn try_cold_backing_replica(
+    replica: pb::ColdBackingReplica,
+) -> Result<mooncake_store_core::ColdBackingReplica> {
+    let owner = replica
+        .owner
+        .as_ref()
+        .map(try_runtime_id)
+        .transpose()?
+        .ok_or_else(|| {
+            StoreError::Transport("control plane cold backing replica is missing owner".to_string())
+        })?;
+    Ok(mooncake_store_core::ColdBackingReplica {
+        owner,
+        cold_tier_id: replica.cold_tier_id,
+        object_locator: replica.object_locator,
+    })
 }
 
 pub(super) fn try_cold_backing_route(
@@ -62,6 +91,10 @@ pub(super) fn try_cold_backing_route(
         length: route.length,
         checksum: route.checksum,
         state: try_cold_backing_state(route.state)?,
-        replicas: Vec::new(),
+        replicas: route
+            .replicas
+            .into_iter()
+            .map(try_cold_backing_replica)
+            .collect::<Result<Vec<_>>>()?,
     })
 }

@@ -3,8 +3,8 @@ use super::{
     batch_read_from_cold_staged, execute_owner_cold_restore_promote_phase, read_from_cold_one_shot,
 };
 use crate::control_plane::{
-    ColdReadResponse, ColdReadTarget, ColdTierControlService, ColdTierFreeResult,
-    ColdTierProbeResult,
+    ColdReadResponse, ColdReadTarget, ColdReclaimResult, ColdTierControlService,
+    ColdTierFreeResult, ColdTierProbeResult,
 };
 use mooncake_store_core::{SegmentName, StoreError};
 use std::sync::Arc;
@@ -161,6 +161,43 @@ impl ColdTierControlService for LocalAllocatorAdapter {
                 pending.remove(&(segment.clone(), *offset));
             }
         }
+    }
+
+    fn batch_reclaim_cold_backings(
+        &self,
+        namespace: &str,
+        authority: &str,
+        cold_backings: Vec<mooncake_store_core::ColdBackingRoute>,
+    ) -> Vec<mooncake_store_core::Result<ColdReclaimResult>> {
+        if authority != self.runtime.stable_id.0 {
+            return cold_backings
+                .into_iter()
+                .map(|_| {
+                    Err(StoreError::InvalidState(format!(
+                        "cold tier reclaim authority mismatch: request={authority} local={}",
+                        self.runtime.stable_id.0
+                    )))
+                })
+                .collect();
+        }
+        if namespace != self.storage_owner.metadata.route_namespace() {
+            return cold_backings
+                .into_iter()
+                .map(|_| {
+                    Err(StoreError::InvalidState(format!(
+                        "cold tier reclaim namespace mismatch: request={namespace} local={}",
+                        self.storage_owner.metadata.route_namespace()
+                    )))
+                })
+                .collect();
+        }
+        cold_backings
+            .into_iter()
+            .map(|cold_backing| {
+                self.storage_owner
+                    .reclaim_cold_backing_for_route_delete(&cold_backing)
+            })
+            .collect()
     }
 
     fn pin_for_read(&self, slots: &[(SegmentName, u64)]) -> u64 {

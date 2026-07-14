@@ -1,4 +1,5 @@
-use super::codec::decode_error;
+use super::codec::{decode_error, ensure_batch_len};
+use super::cold_tier_codec::pb_cold_backing_route;
 use super::*;
 use crate::observability::OperationTracker;
 
@@ -41,6 +42,13 @@ pub(crate) struct ColdReadResult {
 pub(crate) struct ColdReadResponse {
     pub result: Result<ColdReadResult>,
     pub deferred_promote: Option<Box<dyn FnOnce() + Send>>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ColdReclaimResult {
+    pub removed_cold_payload: bool,
+    pub removed_pending_source: bool,
+    pub skipped_still_referenced: bool,
 }
 
 pub(crate) struct ColdReadTarget {
@@ -92,6 +100,13 @@ pub(crate) trait ColdTierControlService: Send + Sync {
 
     fn ack_cold_read_complete(&self, slots: &[(SegmentName, u64)]);
 
+    fn batch_reclaim_cold_backings(
+        &self,
+        namespace: &str,
+        authority: &str,
+        cold_backings: Vec<mooncake_store_core::ColdBackingRoute>,
+    ) -> Vec<Result<ColdReclaimResult>>;
+
     fn pin_for_read(&self, _slots: &[(SegmentName, u64)]) -> u64 {
         0
     }
@@ -142,6 +157,22 @@ impl ColdTierControlService for UnsupportedColdTierControlService {
     }
 
     fn ack_cold_read_complete(&self, _slots: &[(SegmentName, u64)]) {}
+
+    fn batch_reclaim_cold_backings(
+        &self,
+        _namespace: &str,
+        _authority: &str,
+        cold_backings: Vec<mooncake_store_core::ColdBackingRoute>,
+    ) -> Vec<Result<ColdReclaimResult>> {
+        cold_backings
+            .into_iter()
+            .map(|_| {
+                Err(StoreError::Unsupported(
+                    "cold tier reclaim control is not wired yet".to_string(),
+                ))
+            })
+            .collect()
+    }
 }
 
 impl ControlPlaneClient {
@@ -295,6 +326,48 @@ impl ControlPlaneClient {
                 },
                 channel,
             )
+        })();
+        tracker.finish(&result, 0);
+        result
+    }
+
+    pub(crate) fn batch_reclaim_cold_backings(
+        &self,
+        lease: &ClientLease,
+        namespace: &str,
+        authority: &str,
+        cold_backings: &[mooncake_store_core::ColdBackingRoute],
+    ) -> Result<Vec<Result<ColdReclaimResult>>> {
+        let tracker = OperationTracker::new("control_batch_reclaim_cold_backings");
+        let expected = cold_backings.len();
+        let request = pb::BatchReclaimColdBackingsRequest {
+            namespace: namespace.to_string(),
+            authority: authority.to_string(),
+            cold_backings: cold_backings.iter().map(pb_cold_backing_route).collect(),
+        };
+        let result = (|| {
+            let channel = self.channel_for(lease)?;
+            let reply = self.rpc(
+                |mut client| async move {
+                    client
+                        .batch_reclaim_cold_backings(Request::new(request))
+                        .await
+                },
+                channel,
+            )?;
+            ensure_batch_len("batch_reclaim_cold_backings", expected, reply.results.len())?;
+            Ok(reply
+                .results
+                .into_iter()
+                .map(|reply| {
+                    decode_error(reply.error)?;
+                    Ok(ColdReclaimResult {
+                        removed_cold_payload: reply.removed_cold_payload,
+                        removed_pending_source: reply.removed_pending_source,
+                        skipped_still_referenced: reply.skipped_still_referenced,
+                    })
+                })
+                .collect())
         })();
         tracker.finish(&result, 0);
         result

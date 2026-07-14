@@ -479,6 +479,91 @@ impl StorageOwnerState {
         Ok(total_freed)
     }
 
+    pub(in super::super) fn reclaim_cold_backing_for_route_delete(
+        &self,
+        cold_backing: &mooncake_store_core::ColdBackingRoute,
+    ) -> Result<crate::control_plane::ColdReclaimResult> {
+        if cold_backing.owner != self.runtime {
+            return Err(StoreError::InvalidState(format!(
+                "cold backing {} belongs to runtime {}, not {}",
+                cold_tier_device_id(cold_backing),
+                cold_backing.owner,
+                self.runtime
+            )));
+        }
+        let Some(_) = self.ensure_cold_tier_device_loaded(cold_tier_device_id(cold_backing))?
+        else {
+            return Err(StoreError::NotFound(format!(
+                "cold tier device {} not found",
+                cold_tier_device_id(cold_backing)
+            )));
+        };
+        if self.cold_backing_still_referenced_by_active_route(cold_backing)? {
+            return Ok(crate::control_plane::ColdReclaimResult {
+                skipped_still_referenced: true,
+                ..crate::control_plane::ColdReclaimResult::default()
+            });
+        }
+        let backend = self.cold_tier_devices.backend_for(cold_backing)?;
+        let removed_cold_payload = backend_remove_cold_payload(backend.as_ref(), cold_backing)?;
+        let removed_pending_source =
+            match backend_remove_pending_source(backend.as_ref(), cold_backing) {
+                Ok(removed) => removed,
+                Err(error) => {
+                    self.record_cold_tier_cleanup_error(cold_tier_device_id(cold_backing), &error);
+                    tracing::warn!(
+                        error = %error,
+                        cold_tier_id = %cold_tier_device_id(cold_backing),
+                        object_locator = %cold_backing.object_locator,
+                        "failed to remove pending source during owner reclaim"
+                    );
+                    false
+                }
+            };
+        if removed_cold_payload
+            && cold_backing.state == mooncake_store_core::ColdBackingState::Materialized
+        {
+            self.apply_cold_tier_usage_delta(
+                cold_tier_device_id(cold_backing),
+                -(cold_backing.length as i64),
+                0,
+            )?;
+        }
+        info!(
+            runtime = %self.runtime,
+            cold_tier_id = %cold_tier_device_id(cold_backing),
+            object_locator = %cold_backing.object_locator,
+            length = cold_backing.length,
+            removed_cold_payload,
+            removed_pending_source,
+            "cold_reclaim_payload_deleted_by_owner"
+        );
+        Ok(crate::control_plane::ColdReclaimResult {
+            removed_cold_payload,
+            removed_pending_source,
+            skipped_still_referenced: false,
+        })
+    }
+
+    fn cold_backing_still_referenced_by_active_route(
+        &self,
+        cold_backing: &mooncake_store_core::ColdBackingRoute,
+    ) -> Result<bool> {
+        let routes = self.metadata.as_ref().list_object_routes_by_cold_backing(
+            &mooncake_store_core::ColdBackingRouteFilter {
+                device_id: Some(cold_tier_device_id(cold_backing).to_string()),
+                owner: Some(cold_backing.owner.clone()),
+                ..mooncake_store_core::ColdBackingRouteFilter::default()
+            },
+        )?;
+        Ok(routes.iter().any(|route| {
+            route.state == RouteState::Active
+                && route.cold_backing.as_ref().is_some_and(|current| {
+                    cold_backing_route_contains_target(current, cold_backing)
+                })
+        }))
+    }
+
     pub(crate) fn probe_cold_tier_device(&self, device_id: &str) -> Result<ColdTierDeviceRecord> {
         let Some(device) = self.ensure_cold_tier_device_loaded(device_id)? else {
             return Err(StoreError::NotFound(format!(
@@ -798,4 +883,20 @@ impl StorageOwnerState {
             }
         }
     }
+}
+
+fn cold_backing_route_contains_target(
+    current: &mooncake_store_core::ColdBackingRoute,
+    target: &mooncake_store_core::ColdBackingRoute,
+) -> bool {
+    (current.owner == target.owner
+        && current.cold_tier_id == target.cold_tier_id
+        && current.object_locator == target.object_locator
+        && current.length == target.length)
+        || current.replicas.iter().any(|replica| {
+            replica.owner == target.owner
+                && replica.cold_tier_id == target.cold_tier_id
+                && replica.object_locator == target.object_locator
+                && current.length == target.length
+        })
 }

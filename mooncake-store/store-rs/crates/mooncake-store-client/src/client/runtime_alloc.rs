@@ -810,75 +810,7 @@ impl StoreClient {
                     );
                     continue;
                 }
-                let backend = self.storage_owner.cold_tier_devices.backend_for(cold_backing)?;
-                let removed_cold_payload =
-                    match cold_tier::backend_remove_cold_payload(backend.as_ref(), cold_backing) {
-                        Ok(removed) => removed,
-                        Err(error) => {
-                            warn!(
-                                error = %error,
-                                cold_tier_id = %cold_backing.cold_tier_id,
-                                object_locator = %cold_backing.object_locator,
-                                "failed to remove cold payload during reclaim"
-                            );
-                            registry::record_cold_tier_operation(
-                                "reclaim",
-                                "error",
-                                registry::cold_tier_error_kind(&error),
-                            );
-                            return Err(error);
-                        }
-                    };
-                if let Err(error) = cold_tier::backend_remove_pending_source(backend.as_ref(), cold_backing) {
-                    warn!(
-                        error = %error,
-                        cold_tier_id = %cold_backing.cold_tier_id,
-                        object_locator = %cold_backing.object_locator,
-                        "failed to remove pending source during reclaim"
-                    );
-                    registry::record_cold_tier_operation(
-                        "cleanup",
-                        "error",
-                        registry::cold_tier_error_kind(&error),
-                    );
-                }
-                for replica in &cold_backing.replicas {
-                    let replica_backing = mooncake_store_core::ColdBackingRoute {
-                        owner: replica.owner.clone(),
-                        cold_tier_id: replica.cold_tier_id.clone(),
-                        object_locator: replica.object_locator.clone(),
-                        ..cold_backing.clone()
-                    };
-                    if let Ok(replica_backend) =
-                        self.storage_owner.cold_tier_devices.backend_for(&replica_backing)
-                    {
-                        let _ =
-                            cold_tier::backend_remove_cold_payload(replica_backend.as_ref(), &replica_backing);
-                        let _ = cold_tier::backend_remove_pending_source(
-                            replica_backend.as_ref(),
-                            &replica_backing,
-                        );
-                    }
-                }
-                if removed_cold_payload
-                    && cold_backing.state == mooncake_store_core::ColdBackingState::Materialized
-                {
-                    self.storage_owner.apply_cold_tier_usage_delta(
-                        &cold_backing.cold_tier_id,
-                        -(cold_backing.length as i64),
-                        0,
-                    )?;
-                }
-                info!(
-                    runtime = %self.lease.runtime,
-                    route_key = %reclaim.route_key.0,
-                    cold_tier_id = %cold_backing.cold_tier_id,
-                    object_locator = %cold_backing.object_locator,
-                    length = cold_backing.length,
-                    removed_cold_payload,
-                    "cold_reclaim_payload_deleted"
-                );
-                registry::record_cold_tier_operation("reclaim", "cold", "none");
+                self.reclaim_cold_backings_by_owner(&reclaim.route_key, cold_backing)?;
                 continue;
             }
             releases.push(AllocationReleaseRequest {
@@ -902,6 +834,100 @@ impl StoreClient {
             );
         }
         result
+    }
+
+
+    fn reclaim_cold_backings_by_owner(
+        &self,
+        route_key: &ObjectKey,
+        cold_backing: &mooncake_store_core::ColdBackingRoute,
+    ) -> Result<()> {
+        let mut groups = BTreeMap::<ClientRuntimeId, Vec<mooncake_store_core::ColdBackingRoute>>::new();
+        for target in Self::cold_reclaim_targets(cold_backing) {
+            groups.entry(target.owner.clone()).or_default().push(target);
+        }
+        let namespace = self.metadata.route_namespace();
+        for (owner, targets) in groups {
+            let results = if owner == self.lease.runtime {
+                targets
+                    .iter()
+                    .map(|target| self.storage_owner.reclaim_cold_backing_for_route_delete(target))
+                    .collect::<Vec<_>>()
+            } else {
+                let lease = self.lookup_runtime_lease(&owner)?;
+                self.control_client.batch_reclaim_cold_backings(
+                    &lease,
+                    &namespace,
+                    &owner.stable_id.0,
+                    &targets,
+                )?
+            };
+            for (target, result) in targets.iter().zip(results) {
+                match result {
+                    Ok(result) => {
+                        if result.skipped_still_referenced {
+                            registry::record_cold_tier_operation(
+                                "reclaim",
+                                "skipped",
+                                "still_referenced",
+                            );
+                            continue;
+                        }
+                        info!(
+                            runtime = %self.lease.runtime,
+                            owner = %owner,
+                            route_key = %route_key.0,
+                            cold_tier_id = %target.cold_tier_id,
+                            object_locator = %target.object_locator,
+                            length = target.length,
+                            removed_cold_payload = result.removed_cold_payload,
+                            removed_pending_source = result.removed_pending_source,
+                            "cold_reclaim_payload_deleted"
+                        );
+                        registry::record_cold_tier_operation("reclaim", "cold", "none");
+                    }
+                    Err(error) => {
+                        warn!(
+                            runtime = %self.lease.runtime,
+                            owner = %owner,
+                            route_key = %route_key.0,
+                            cold_tier_id = %target.cold_tier_id,
+                            object_locator = %target.object_locator,
+                            error = %error,
+                            "failed to reclaim cold payload on owner"
+                        );
+                        registry::record_cold_tier_operation(
+                            "reclaim",
+                            "error",
+                            registry::cold_tier_error_kind(&error),
+                        );
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn cold_reclaim_targets(
+        cold_backing: &mooncake_store_core::ColdBackingRoute,
+    ) -> Vec<mooncake_store_core::ColdBackingRoute> {
+        let mut targets = Vec::with_capacity(1 + cold_backing.replicas.len());
+        let mut primary = cold_backing.clone();
+        primary.replicas.clear();
+        targets.push(primary);
+        for replica in &cold_backing.replicas {
+            targets.push(mooncake_store_core::ColdBackingRoute {
+                owner: replica.owner.clone(),
+                cold_tier_id: replica.cold_tier_id.clone(),
+                object_locator: replica.object_locator.clone(),
+                length: cold_backing.length,
+                checksum: cold_backing.checksum,
+                state: cold_backing.state,
+                replicas: Vec::new(),
+            });
+        }
+        targets
     }
 
     fn cold_reclaim_still_targets_route(

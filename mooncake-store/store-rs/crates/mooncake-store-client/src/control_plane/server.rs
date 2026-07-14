@@ -1,8 +1,8 @@
 use super::codec::*;
 use super::cold_tier_server::{
-    handle_ack_cold_read_complete, handle_batch_read_from_cold, handle_manual_cold_tier_free,
-    handle_manual_cold_tier_gc, handle_pin_for_read, handle_probe_cold_tier_device,
-    handle_read_from_cold, handle_trigger_cold_tier_offload,
+    handle_ack_cold_read_complete, handle_batch_read_from_cold, handle_batch_reclaim_cold_backings,
+    handle_manual_cold_tier_free, handle_manual_cold_tier_gc, handle_pin_for_read,
+    handle_probe_cold_tier_device, handle_read_from_cold, handle_trigger_cold_tier_offload,
 };
 use super::pb::control_plane_service_server::ControlPlaneService as _;
 use super::*;
@@ -344,6 +344,13 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
         request: Request<pb::AckColdReadCompleteRequest>,
     ) -> std::result::Result<Response<pb::AckColdReadCompleteReply>, Status> {
         handle_ack_cold_read_complete(self.cold_tier.clone(), request).await
+    }
+
+    async fn batch_reclaim_cold_backings(
+        &self,
+        request: Request<pb::BatchReclaimColdBackingsRequest>,
+    ) -> std::result::Result<Response<pb::BatchReclaimColdBackingsReply>, Status> {
+        handle_batch_reclaim_cold_backings(self.cold_tier.clone(), request).await
     }
 
     async fn pin_for_read(

@@ -261,8 +261,8 @@ mod cold_tier_server;
 mod server;
 
 pub(crate) use cold_tier::{
-    ColdReadResponse, ColdReadResult, ColdReadTarget, ColdTierControlService, ColdTierFreeResult,
-    ColdTierProbeResult, UnsupportedColdTierControlService,
+    ColdReadResponse, ColdReadResult, ColdReadTarget, ColdReclaimResult, ColdTierControlService,
+    ColdTierFreeResult, ColdTierProbeResult, UnsupportedColdTierControlService,
 };
 pub(crate) use server::ControlPlaneHandle;
 
@@ -276,6 +276,8 @@ use self::codec::{
     try_cas_result, try_compatibility, try_object_route, try_replica_route, try_replica_tier,
     try_route_state, try_runtime_id, try_segment_reservation,
 };
+#[cfg(test)]
+use self::cold_tier_codec::{pb_cold_backing_route, try_cold_backing_route};
 #[cfg(test)]
 use self::server::{
     control_plane_server_threads_from_env, handle_control_stream_request, GrpcControlPlaneService,

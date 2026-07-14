@@ -28,6 +28,7 @@ service ControlPlaneService {
   rpc ReadFromCold(ReadFromColdRequest) returns (ReadFromColdReply);
   rpc BatchReadFromCold(BatchReadFromColdRequest) returns (BatchReadFromColdReply);
   rpc AckColdReadComplete(AckColdReadCompleteRequest) returns (AckColdReadCompleteReply);
+  rpc BatchReclaimColdBackings(BatchReclaimColdBackingsRequest) returns (BatchReclaimColdBackingsReply);
   rpc PinForRead(PinForReadRequest) returns (PinForReadReply);
   rpc ControlStream(stream ControlStreamRequest) returns (stream ControlStreamReply);
 }
@@ -124,6 +125,13 @@ message ColdBackingRoute {
   uint64 length = 4;
   optional uint64 checksum = 5;
   ColdBackingState state = 6;
+  repeated ColdBackingReplica replicas = 7;
+}
+
+message ColdBackingReplica {
+  ClientRuntimeId owner = 1;
+  string cold_tier_id = 2;
+  string object_locator = 3;
 }
 
 message ObjectRoute {
@@ -488,6 +496,23 @@ message AckColdReadCompleteRequest {
 }
 
 message AckColdReadCompleteReply {}
+
+message BatchReclaimColdBackingsRequest {
+  string namespace = 1;
+  string authority = 2;
+  repeated ColdBackingRoute cold_backings = 3;
+}
+
+message ReclaimColdBackingReply {
+  bool removed_cold_payload = 1;
+  bool removed_pending_source = 2;
+  bool skipped_still_referenced = 3;
+  ErrorDetail error = 4;
+}
+
+message BatchReclaimColdBackingsReply {
+  repeated ReclaimColdBackingReply results = 1;
+}
 
 message PinForReadRequest {
   repeated string segment_names = 1;
