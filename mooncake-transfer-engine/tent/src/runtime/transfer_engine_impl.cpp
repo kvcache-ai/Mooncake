@@ -1873,12 +1873,9 @@ Status TransferEngineImpl::finishQueuedOwner(
         queued.credit_reservation->state == CreditReservationState::Committed) {
         CHECK_STATUS(receiver_credit_dispatch_gate_->release(
             *queued.credit_reservation));
-        if (receiver_credit_pull_controller_ && queued.credit_charge) {
-            CHECK_STATUS(receiver_credit_pull_controller_->request(
-                queued.credit_reservation->snapshot.target_id,
-                queued.credit_server_addr, queued.credit_qos_class,
-                *queued.credit_charge));
-        }
+        // Completion is cumulative local state, not a push notification. The
+        // next on-demand pull reports it while asking for a refill; sending an
+        // RPC here makes control traffic proportional to transfer count.
     }
     if (queued.in_dispatch_window) {
         if (dispatch_inflight_owners_ == 0 ||
