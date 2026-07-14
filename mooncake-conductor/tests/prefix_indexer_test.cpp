@@ -1,625 +1,651 @@
-// Tests for the prefix index: block-hash computation, store/remove/query
-// flows, cache-hit accounting, and the /global_view aggregation.
-
 #include <gtest/gtest.h>
 
-#include <barrier>
-#include <limits>
-#include <memory>
+#include <cstdint>
+#include <map>
 #include <optional>
 #include <set>
+#include <span>
 #include <string>
-#include <thread>
+#include <utility>
 #include <vector>
 
-#include "conductor/common/types.h"
+#include "conductor/prefixindex/hash_strategy.h"
 #include "conductor/prefixindex/prefix_indexer.h"
 #include "prefix_indexer_test_peer.h"
 
 namespace {
 
-using conductor::common::RemovedEvent;
-using conductor::common::StoredEvent;
-using conductor::prefixindex::ModelContext;
+using conductor::prefixindex::BlockPresenceSnapshot;
+using conductor::prefixindex::CacheHitResult;
+using conductor::prefixindex::ContextKey;
+using conductor::prefixindex::EngineOwner;
+using conductor::prefixindex::EngineRegistration;
+using conductor::prefixindex::GpuClear;
+using conductor::prefixindex::GpuMutation;
+using conductor::prefixindex::HashBlock;
+using conductor::prefixindex::HashProfile;
 using conductor::prefixindex::PrefixCacheTable;
 using conductor::prefixindex::PrefixCacheTableSnapshot;
 using conductor::prefixindex::PrefixCacheTableTestPeer;
+using conductor::prefixindex::ProjectedPrefix;
+using conductor::prefixindex::SharedClear;
+using conductor::prefixindex::SharedMutation;
+using conductor::prefixindex::SharedObjectOwner;
+using conductor::prefixindex::StorageTier;
 
-std::vector<int32_t> Seq(int32_t from, int32_t to) {
-    std::vector<int32_t> out;
-    for (int32_t i = from; i <= to; ++i) out.push_back(i);
-    return out;
+constexpr char kRootDigest[] =
+    "4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e";
+
+ContextKey TestContext(int64_t block_size = 16) {
+    return {.tenant_id = "tenant-a",
+            .model_name = "model-a",
+            .lora_name = "",
+            .block_size = block_size};
 }
 
-ModelContext TestContext(const std::string& instance_id = "instance-1",
-                         int64_t block_size = 4) {
-    ModelContext ctx;
-    ctx.model_name = "test-model";
-    ctx.lora_name = "none";
-    ctx.block_size = block_size;
-    ctx.tenant_id = "default";
-    ctx.additional_salt = "";
-    ctx.instance_id = instance_id;
-    return ctx;
+HashProfile TestProfile() {
+    return {.strategy = "vllm_v1",
+            .algorithm = "sha256_cbor",
+            .root_digest = kRootDigest,
+            .index_projection = "low64_be"};
 }
 
-StoredEvent TestStoredEvent() {
-    StoredEvent event;
-    event.block_hashes = {100, 200};
-    event.block_size = 4;
-    event.model_name = "test-model";
-    event.lora_name = "none";
-    event.instance_id = "instance-1";
-    event.parent_block_hash = 0;
-    event.token_ids = Seq(1, 8);
-    event.medium = "cpu";
-    return event;
+EngineRegistration Registration(const std::string& instance_id = "instance-a",
+                                int64_t dp_rank = 0) {
+    const ContextKey context = TestContext();
+    return {.context = context,
+            .profile = TestProfile(),
+            .instance_id = instance_id,
+            .dp_rank = dp_rank,
+            .effective_block_size = context.block_size,
+            .cache_group = 0};
 }
 
-ModelContext ContextForEvent(const StoredEvent& event) {
-    ModelContext context;
-    context.model_name = event.model_name;
-    context.lora_name = event.lora_name;
-    context.block_size = event.block_size;
-    context.tenant_id = "default";
-    context.additional_salt = "";
-    context.instance_id = event.instance_id;
-    return context;
+EngineOwner GpuOwner(const std::string& instance_id = "instance-a",
+                     int64_t dp_rank = 0,
+                     const std::string& stream = "stream-a") {
+    return {.source_stream = stream,
+            .instance_id = instance_id,
+            .dp_rank = dp_rank};
 }
 
-struct InvalidStoreCase {
-    const char* name;
-    StoredEvent event;
-    std::optional<size_t> expected_token_count;
-    const char* error_fragment;
-};
-
-StoredEvent StoreEventWithLayout(size_t hash_count, size_t token_count,
-                                 int64_t block_size = 4) {
-    StoredEvent event = TestStoredEvent();
-    event.block_hashes.resize(hash_count);
-    for (size_t i = 0; i < hash_count; ++i) {
-        event.block_hashes[i] = 100 + i;
-    }
-    event.token_ids.resize(token_count);
-    for (size_t i = 0; i < token_count; ++i) {
-        event.token_ids[i] = static_cast<int32_t>(i + 1);
-    }
-    event.block_size = block_size;
-    return event;
-}
-
-StoredEvent MultiplicationOverflowEvent() {
-    constexpr size_t kHashCount = 3;
-    const size_t block_size =
-        std::numeric_limits<size_t>::max() / kHashCount + 1;
-    EXPECT_LE(block_size,
-              static_cast<size_t>(std::numeric_limits<int64_t>::max()));
-
-    StoredEvent event = StoreEventWithLayout(kHashCount, 1);
-    event.block_size = static_cast<int64_t>(block_size);
-    return event;
-}
-
-std::vector<InvalidStoreCase> InvalidStoreCases() {
+SharedObjectOwner SharedOwner(const std::string& object_id = "object-a",
+                              const std::string& stream = "pool-stream",
+                              const std::string& backend = "backend-a") {
     return {
-        {"single block short", StoreEventWithLayout(1, 3), 4,
-         "token count mismatch"},
-        {"single block long", StoreEventWithLayout(1, 5), 4,
-         "token count mismatch"},
-        {"multiple blocks short", StoreEventWithLayout(2, 7), 8,
-         "token count mismatch"},
-        {"multiple blocks long", StoreEventWithLayout(2, 9), 8,
-         "token count mismatch"},
-        {"hashes only", StoreEventWithLayout(1, 0), 4,
-         "must both be empty or both be non-empty"},
-        {"tokens only", StoreEventWithLayout(0, 4), 0,
-         "must both be empty or both be non-empty"},
-        {"zero block size", StoreEventWithLayout(1, 1, 0), std::nullopt,
-         "greater than zero"},
-        {"negative block size", StoreEventWithLayout(1, 1, -4), std::nullopt,
-         "greater than zero"},
-        {"token count multiplication overflow", MultiplicationOverflowEvent(),
-         std::nullopt, "overflow"},
-    };
+        .source_stream = stream, .backend_id = backend, .object_id = object_id};
 }
 
-void ExpectErrorContains(const std::string& error, const std::string& value) {
-    EXPECT_NE(error.find(value), std::string::npos) << "error=" << error;
+ProjectedPrefix Prefix(uint64_t value) { return {.value = value}; }
+
+GpuMutation Gpu(const std::vector<ProjectedPrefix>& prefixes,
+                EngineOwner owner = GpuOwner()) {
+    const ContextKey context = TestContext();
+    return {.context = context,
+            .prefixes = prefixes,
+            .owner = std::move(owner),
+            .effective_block_size = context.block_size,
+            .cache_group = 0};
 }
 
-void ExpectRejectedWithoutCreatingContext(const InvalidStoreCase& test_case) {
-    PrefixCacheTable table;
-    const std::string error = table.ProcessStoreEvent(test_case.event, 0);
+SharedMutation Shared(const std::vector<ProjectedPrefix>& prefixes,
+                      StorageTier tier,
+                      SharedObjectOwner owner = SharedOwner()) {
+    const ContextKey context = TestContext();
+    return {.context = context,
+            .prefixes = prefixes,
+            .tier = tier,
+            .owner = std::move(owner),
+            .effective_block_size = context.block_size,
+            .cache_group = 0};
+}
 
-    ASSERT_FALSE(error.empty()) << "case=" << test_case.name;
-    ExpectErrorContains(error, test_case.error_fragment);
-    ExpectErrorContains(
-        error,
-        "hash_count=" + std::to_string(test_case.event.block_hashes.size()));
-    ExpectErrorContains(
-        error, "block_size=" + std::to_string(test_case.event.block_size));
-    ExpectErrorContains(
-        error, "actual=" + std::to_string(test_case.event.token_ids.size()));
-    if (test_case.expected_token_count.has_value()) {
-        ExpectErrorContains(
-            error,
-            "expected=" + std::to_string(*test_case.expected_token_count));
-    } else {
-        EXPECT_EQ(error.find("expected="), std::string::npos)
-            << "error=" << error;
+GpuClear ClearFor(EngineOwner owner = GpuOwner()) {
+    const ContextKey context = TestContext();
+    return {.context = context,
+            .owner = std::move(owner),
+            .effective_block_size = context.block_size,
+            .cache_group = 0};
+}
+
+SharedClear ClearFor(SharedObjectOwner owner,
+                     std::optional<StorageTier> tier = std::nullopt) {
+    const ContextKey context = TestContext();
+    return {.context = context,
+            .owner = std::move(owner),
+            .tier = tier,
+            .effective_block_size = context.block_size,
+            .cache_group = 0};
+}
+
+std::vector<int32_t> Tokens(size_t count) {
+    std::vector<int32_t> tokens;
+    tokens.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        tokens.push_back(static_cast<int32_t>(i + 1));
+    }
+    return tokens;
+}
+
+std::vector<ProjectedPrefix> Hashes(
+    const std::vector<int32_t>& tokens,
+    std::optional<std::string> cache_salt = std::nullopt) {
+    std::string error;
+    auto strategy =
+        conductor::prefixindex::CreateHashStrategy(TestProfile(), &error);
+    EXPECT_TRUE(error.empty()) << error;
+    if (!strategy) {
+        return {};
     }
 
-    EXPECT_FALSE(PrefixCacheTableTestPeer::ContextExists(
-        table, ContextForEvent(test_case.event)));
-    const PrefixCacheTableSnapshot snapshot =
+    std::vector<HashBlock> blocks;
+    error = strategy->Compute(TestContext(), tokens, std::move(cache_salt),
+                              &blocks);
+    EXPECT_TRUE(error.empty()) << error;
+
+    std::vector<ProjectedPrefix> prefixes;
+    prefixes.reserve(blocks.size());
+    for (const HashBlock& block : blocks) {
+        prefixes.push_back(block.projected);
+    }
+    return prefixes;
+}
+
+void RegisterOrFail(PrefixCacheTable& table,
+                    const EngineRegistration& registration) {
+    const auto result = table.Register(registration);
+    ASSERT_TRUE(result.error.empty()) << result.error;
+}
+
+BlockPresenceSnapshot Presence(const PrefixCacheTable& table,
+                               ProjectedPrefix prefix) {
+    const PrefixCacheTableSnapshot table_snapshot =
         PrefixCacheTableTestPeer::Snapshot(table);
-    EXPECT_EQ(snapshot.global_view.context_count, 0);
-    EXPECT_TRUE(snapshot.global_view.model_contexts.empty());
-    EXPECT_TRUE(snapshot.global_view.proxy_hash_map.empty());
-    EXPECT_TRUE(snapshot.contexts.empty());
+    return table_snapshot.contexts.at(TestContext()).blocks.at(prefix);
 }
 
-void PopulateCompleteTableState(PrefixCacheTable& table) {
-    StoredEvent event = TestStoredEvent();
-    ASSERT_EQ(table.ProcessStoreEvent(event, 0), "");
+TEST(Registration, InvalidInputsDoNotCreateContextState) {
+    std::vector<EngineRegistration> invalid;
 
-    event.medium = "GPU";
-    ASSERT_EQ(table.ProcessStoreEvent(event, 2), "");
-    table.AddDpSize(TestContext(), 0);
-    table.AddDpSize(TestContext(), 2);
+    auto non_positive = Registration();
+    non_positive.context.block_size = 0;
+    non_positive.effective_block_size = 0;
+    invalid.push_back(non_positive);
 
-    StoredEvent other = TestStoredEvent();
-    other.model_name = "other-model";
-    other.instance_id = "instance-2";
-    other.block_hashes = {300};
-    other.token_ids = Seq(9, 12);
-    ASSERT_EQ(table.ProcessStoreEvent(other, 7), "");
-    table.AddDpSize(ContextForEvent(other), 7);
+    auto mismatch = Registration();
+    mismatch.effective_block_size = 8;
+    invalid.push_back(mismatch);
 
-    PrefixCacheTableTestPeer::SetLastAccess(table, TestContext(), 123456789);
-    PrefixCacheTableTestPeer::SetLastAccess(table, ContextForEvent(other),
-                                            987654321);
-}
+    auto unsupported_group = Registration();
+    unsupported_group.cache_group = 1;
+    invalid.push_back(unsupported_group);
 
-// --- ComputePrefixHash ---------------------------------------------------
+    auto empty_instance = Registration();
+    empty_instance.instance_id.clear();
+    invalid.push_back(empty_instance);
 
-TEST(ComputePrefixHash, BlockCounts) {
+    auto negative_rank = Registration();
+    negative_rank.dp_rank = -1;
+    invalid.push_back(negative_rank);
+
+    auto malformed_profile = Registration();
+    malformed_profile.profile.root_digest = "not-a-digest";
+    invalid.push_back(malformed_profile);
+
     PrefixCacheTable table;
-    struct Case {
-        const char* name;
-        int64_t block_size;
-        std::vector<int32_t> tokens;
-        uint64_t cache_salt;
-        size_t want_len;
-    };
-    const Case cases[] = {
-        {"single block", 4, Seq(1, 4), 0, 1},
-        {"multiple blocks", 4, Seq(1, 8), 0, 2},
-        {"partial block not counted", 4, Seq(1, 5), 0, 1},
-        {"empty token ids", 4, {}, 0, 0},
-        {"with non-zero cache salt", 4, Seq(1, 4), 12345, 1},
-        {"zero block size returns empty", 0, Seq(1, 4), 0, 0},
-    };
-    for (const auto& c : cases) {
-        ModelContext ctx = TestContext("", c.block_size);
-        ctx.additional_salt = "test-salt";
-        const auto got = table.ComputePrefixHash(ctx, c.tokens, c.cache_salt);
-        EXPECT_EQ(got.size(), c.want_len) << "case=" << c.name;
-        for (size_t i = 0; i < got.size(); ++i) {
-            EXPECT_NE(got[i], 0u) << "case=" << c.name << " index=" << i;
-        }
+    for (const auto& registration : invalid) {
+        SCOPED_TRACE(registration.instance_id);
+        const auto validation =
+            PrefixCacheTable::ValidateRegistration(registration);
+        EXPECT_FALSE(validation.error.empty());
+        const auto result = table.Register(registration);
+        EXPECT_FALSE(result.error.empty());
+        EXPECT_FALSE(result.inserted);
     }
+    EXPECT_EQ(table.GetGlobalView().context_count, 0);
+    EXPECT_TRUE(PrefixCacheTableTestPeer::Snapshot(table).contexts.empty());
 }
 
-// --- ProcessStoreEvent ---------------------------------------------------
-
-TEST(ProcessStoreEvent, CreatesContextData) {
+TEST(Registration, TracksEveryInstanceAndRankIdempotently) {
     PrefixCacheTable table;
-    EXPECT_EQ(table.ProcessStoreEvent(TestStoredEvent(), 0), "");
-    EXPECT_TRUE(PrefixCacheTableTestPeer::ContextExists(table, TestContext()));
+
+    auto first = table.Register(Registration("instance-a", 0));
+    ASSERT_TRUE(first.error.empty()) << first.error;
+    EXPECT_TRUE(first.inserted);
+
+    auto duplicate = table.Register(Registration("instance-a", 0));
+    ASSERT_TRUE(duplicate.error.empty()) << duplicate.error;
+    EXPECT_FALSE(duplicate.inserted);
+
+    auto omitted_group = Registration("instance-a", 0);
+    omitted_group.cache_group.reset();
+    auto omitted_duplicate = table.Register(omitted_group);
+    ASSERT_TRUE(omitted_duplicate.error.empty()) << omitted_duplicate.error;
+    EXPECT_FALSE(omitted_duplicate.inserted);
+
+    auto second_rank = table.Register(Registration("instance-a", 2));
+    ASSERT_TRUE(second_rank.error.empty()) << second_rank.error;
+    EXPECT_TRUE(second_rank.inserted);
+
+    auto second_instance = table.Register(Registration("instance-b", 1));
+    ASSERT_TRUE(second_instance.error.empty()) << second_instance.error;
+    EXPECT_TRUE(second_instance.inserted);
+
+    const auto snapshot = PrefixCacheTableTestPeer::Snapshot(table);
+    ASSERT_EQ(snapshot.contexts.size(), 1u);
+    const auto& state = snapshot.contexts.at(TestContext());
+    EXPECT_EQ(state.profile, TestProfile());
+    EXPECT_EQ(state.instance_ranks.at("instance-a"), (std::set<int64_t>{0, 2}));
+    EXPECT_EQ(state.instance_ranks.at("instance-b"), (std::set<int64_t>{1}));
+    EXPECT_TRUE(state.blocks.empty());
 }
 
-TEST(ProcessStoreEvent, ConcurrentFirstAccessUsesCanonicalContextData) {
+TEST(Registration, ConflictingProfilePreservesCompleteState) {
     PrefixCacheTable table;
-    ModelContext ctx = TestContext();
-    // Make candidate initialisation long enough for all barrier-released
-    // workers to observe the initially empty map before insertion.
-    ctx.additional_salt.assign(1 << 20, 's');
-
-    constexpr int kThreads = 16;
-    std::barrier start(kThreads);
-    std::vector<std::shared_ptr<conductor::prefixindex::ContextData>> returned(
-        kThreads);
-    std::vector<std::thread> workers;
-    workers.reserve(kThreads);
-    for (int i = 0; i < kThreads; ++i) {
-        workers.emplace_back([&table, &ctx, &start, &returned, i] {
-            start.arrive_and_wait();
-            auto data = PrefixCacheTableTestPeer::GetContextData(table, ctx);
-            {
-                std::unique_lock lock(data->hashmap_mu);
-                data->dp_size.insert(i);
-            }
-            returned[i] = std::move(data);
-        });
-    }
-    for (auto& worker : workers) worker.join();
-
-    const auto canonical = PrefixCacheTableTestPeer::GetContextData(table, ctx);
-    for (const auto& data : returned) {
-        EXPECT_EQ(data, canonical);
-    }
-
-    const auto dp_size = PrefixCacheTableTestPeer::DpSize(table, ctx);
-    ASSERT_EQ(dp_size.size(), static_cast<size_t>(kThreads));
-    for (int i = 0; i < kThreads; ++i) {
-        EXPECT_TRUE(dp_size.contains(i));
-    }
-    EXPECT_EQ(table.GetGlobalView().context_count, 1);
-}
-
-TEST(ProcessStoreEvent, FullyEmptyEventIsNoopBeforeBlockSizeValidation) {
-    PrefixCacheTable table;
-    PopulateCompleteTableState(table);
+    RegisterOrFail(table, Registration());
+    ASSERT_EQ(table.StoreGpu(Gpu({Prefix(1)})), "");
     const auto before = PrefixCacheTableTestPeer::Snapshot(table);
 
-    StoredEvent event = TestStoredEvent();
-    event.instance_id = "never-created";
-    event.block_hashes.clear();
-    event.token_ids.clear();
-    event.block_size = std::numeric_limits<int64_t>::min();
+    auto conflicting = Registration("instance-b", 1);
+    conflicting.profile.root_digest = std::string(64, '0');
+    const auto result = table.Register(conflicting);
 
-    EXPECT_EQ(table.ProcessStoreEvent(event, 0), "");
+    EXPECT_FALSE(result.error.empty());
+    EXPECT_FALSE(result.inserted);
+    EXPECT_EQ(PrefixCacheTableTestPeer::Snapshot(table), before);
+}
+
+TEST(Registration, ProfileBindingValidationIsExactAndLookupOnly) {
+    PrefixCacheTable table;
+    const auto empty_before = PrefixCacheTableTestPeer::Snapshot(table);
+
     EXPECT_FALSE(
-        PrefixCacheTableTestPeer::ContextExists(table, ContextForEvent(event)));
-    EXPECT_TRUE(PrefixCacheTableTestPeer::Snapshot(table) == before);
+        table.ValidateProfileBinding(TestContext(), TestProfile()).empty());
+    EXPECT_EQ(PrefixCacheTableTestPeer::Snapshot(table), empty_before);
+
+    RegisterOrFail(table, Registration());
+    const auto registered = PrefixCacheTableTestPeer::Snapshot(table);
+    EXPECT_EQ(table.ValidateProfileBinding(TestContext(), TestProfile()), "");
+
+    HashProfile conflict = TestProfile();
+    conflict.root_digest = std::string(64, '0');
+    EXPECT_FALSE(table.ValidateProfileBinding(TestContext(), conflict).empty());
+    EXPECT_EQ(PrefixCacheTableTestPeer::Snapshot(table), registered);
 }
 
-TEST(ProcessStoreEvent, SingleBlockShortTokensRejected) {
-    ExpectRejectedWithoutCreatingContext(InvalidStoreCases()[0]);
-}
-
-TEST(ProcessStoreEvent, SingleBlockLongTokensRejected) {
-    ExpectRejectedWithoutCreatingContext(InvalidStoreCases()[1]);
-}
-
-TEST(ProcessStoreEvent, MultipleBlocksShortTokensRejected) {
-    ExpectRejectedWithoutCreatingContext(InvalidStoreCases()[2]);
-}
-
-TEST(ProcessStoreEvent, MultipleBlocksLongTokensRejected) {
-    ExpectRejectedWithoutCreatingContext(InvalidStoreCases()[3]);
-}
-
-TEST(ProcessStoreEvent, HashesWithoutTokensRejected) {
-    ExpectRejectedWithoutCreatingContext(InvalidStoreCases()[4]);
-}
-
-TEST(ProcessStoreEvent, TokensWithoutHashesRejected) {
-    ExpectRejectedWithoutCreatingContext(InvalidStoreCases()[5]);
-}
-
-TEST(ProcessStoreEvent, ZeroBlockSizeRejected) {
-    ExpectRejectedWithoutCreatingContext(InvalidStoreCases()[6]);
-}
-
-TEST(ProcessStoreEvent, NegativeBlockSizeRejected) {
-    ExpectRejectedWithoutCreatingContext(InvalidStoreCases()[7]);
-}
-
-TEST(ProcessStoreEvent, TokenCountMultiplicationOverflowRejected) {
-    ExpectRejectedWithoutCreatingContext(InvalidStoreCases()[8]);
-}
-
-TEST(ProcessStoreEvent, InvalidLayoutsPreserveCompleteExistingState) {
+TEST(Mutations, StoreRequiresKnownContextAndRegisteredGpuRank) {
     PrefixCacheTable table;
-    PopulateCompleteTableState(table);
-    const PrefixCacheTableSnapshot before =
-        PrefixCacheTableTestPeer::Snapshot(table);
+    const auto gpu = Gpu({Prefix(1)});
+    const auto shared = Shared({Prefix(1)}, StorageTier::kCpu);
 
-    ASSERT_EQ(before.global_view.context_count, 2);
-    ASSERT_EQ(before.global_view.model_contexts.size(), 2u);
-    ASSERT_EQ(before.global_view.proxy_hash_map.size(), 2u);
-    ASSERT_EQ(before.contexts.size(), 2u);
+    EXPECT_FALSE(table.StoreGpu(gpu).empty());
+    EXPECT_FALSE(table.StoreShared(shared).empty());
+    EXPECT_EQ(table.GetGlobalView().context_count, 0);
 
-    const auto target = before.contexts.find(TestContext());
-    ASSERT_NE(target, before.contexts.end());
-    EXPECT_EQ(target->second.proxy_hash_mapping.size(), 2u);
-    EXPECT_EQ(target->second.prefix_entries.size(), 2u);
-    EXPECT_EQ(target->second.total_prefixes, 2);
-    EXPECT_EQ(target->second.dp_size, (std::set<int64_t>{0, 2}));
-    EXPECT_EQ(target->second.last_access, 123456789);
-    for (const auto& [hash, entry] : target->second.prefix_entries) {
-        SCOPED_TRACE(hash);
-        EXPECT_EQ(entry.total_replica_nums, 2);
-        EXPECT_EQ(entry.medium_set, (std::set<std::string>{"GPU", "cpu"}));
-        EXPECT_EQ(entry.dp_rank_set, (std::set<int64_t>{0, 2}));
-        EXPECT_EQ(entry.engine_last_access_time.size(), 1u);
-        EXPECT_TRUE(entry.engine_last_access_time.contains("instance-1"));
-    }
-
-    ModelContext other_context = TestContext("instance-2");
-    other_context.model_name = "other-model";
-    const auto other = before.contexts.find(other_context);
-    ASSERT_NE(other, before.contexts.end());
-    EXPECT_EQ(other->second.last_access, 987654321);
-
-    for (const auto& test_case : InvalidStoreCases()) {
-        SCOPED_TRACE(test_case.name);
-        const std::string error = table.ProcessStoreEvent(test_case.event, 0);
-        ASSERT_FALSE(error.empty());
-
-        const PrefixCacheTableSnapshot after =
-            PrefixCacheTableTestPeer::Snapshot(table);
-        EXPECT_TRUE(after == before);
-        EXPECT_EQ(PrefixCacheTableTestPeer::GetLastAccess(table, TestContext()),
-                  123456789);
-    }
+    RegisterOrFail(table, Registration("instance-a", 1));
+    EXPECT_FALSE(table.StoreGpu(gpu).empty());
+    EXPECT_TRUE(PrefixCacheTableTestPeer::Snapshot(table)
+                    .contexts.at(TestContext())
+                    .blocks.empty());
 }
 
-// --- ProcessRemoveEvent --------------------------------------------------
-
-TEST(ProcessRemoveEvent, ClearsProxyHashMapping) {
+TEST(Mutations, InvalidGroupTierAndOwnersPreserveState) {
     PrefixCacheTable table;
-    ASSERT_EQ(table.ProcessStoreEvent(TestStoredEvent(), 0), "");
+    RegisterOrFail(table, Registration());
+    ASSERT_EQ(table.StoreGpu(Gpu({Prefix(1)})), "");
+    const auto before = PrefixCacheTableTestPeer::Snapshot(table);
 
-    RemovedEvent remove;
-    remove.block_hashes = {100, 200};
-    remove.model_name = "test-model";
-    remove.lora_name = "none";
-    remove.instance_id = "instance-1";
-    remove.block_size = 4;
-    remove.medium = "cpu";
-    EXPECT_EQ(table.ProcessRemoveEvent(remove, 0, "instance-1"), "");
+    auto bad_group = Gpu({Prefix(2)});
+    bad_group.cache_group = 3;
+    EXPECT_FALSE(table.StoreGpu(bad_group).empty());
 
-    EXPECT_TRUE(PrefixCacheTableTestPeer::ContextExists(table, TestContext()));
-    EXPECT_EQ(
-        PrefixCacheTableTestPeer::ProxyHashMappingSize(table, TestContext()),
-        0u);
+    auto bad_owner = Gpu({Prefix(2)});
+    bad_owner.owner.source_stream.clear();
+    EXPECT_FALSE(table.StoreGpu(bad_owner).empty());
+
+    auto bad_tier = Shared({Prefix(2)}, StorageTier::kGpu);
+    EXPECT_FALSE(table.StoreShared(bad_tier).empty());
+
+    EXPECT_EQ(PrefixCacheTableTestPeer::Snapshot(table), before);
 }
 
-TEST(ProcessRemoveEvent, EmptyBlockHashesIsNoop) {
+TEST(Mutations, DuplicateGpuStoreAndRemoveAreIdempotent) {
     PrefixCacheTable table;
-    RemovedEvent remove;
-    remove.block_hashes = {};
-    remove.model_name = "test-model";
-    remove.lora_name = "none";
-    remove.instance_id = "instance-1";
-    remove.block_size = 4;
-    remove.medium = "cpu";
-    EXPECT_EQ(table.ProcessRemoveEvent(remove, 0, "instance-1"), "");
+    RegisterOrFail(table, Registration());
+    const ProjectedPrefix prefix = Prefix(7);
+    const auto mutation = Gpu({prefix});
+
+    ASSERT_EQ(table.StoreGpu(mutation), "");
+    ASSERT_EQ(table.StoreGpu(mutation), "");
+    EXPECT_EQ(Presence(table, prefix).gpu_owners,
+              (std::set<EngineOwner>{GpuOwner()}));
+
+    auto absent_owner = Gpu({prefix}, GpuOwner("instance-b", 0, "stream-b"));
+    ASSERT_EQ(table.RemoveGpu(absent_owner), "");
+    EXPECT_EQ(Presence(table, prefix).gpu_owners,
+              (std::set<EngineOwner>{GpuOwner()}));
+
+    ASSERT_EQ(table.RemoveGpu(mutation), "");
+    ASSERT_EQ(table.RemoveGpu(mutation), "");
+    EXPECT_TRUE(PrefixCacheTableTestPeer::Snapshot(table)
+                    .contexts.at(TestContext())
+                    .blocks.empty());
 }
 
-// Spec scenario: after all replicas removed, block no longer hits.
-TEST(ProcessRemoveEvent, AllReplicasRemovedNoLongerHits) {
+TEST(Mutations, CollidingSharedOwnersRemainIndependentlyRemovable) {
     PrefixCacheTable table;
-    ASSERT_EQ(table.ProcessStoreEvent(TestStoredEvent(), 0), "");
-    ASSERT_GT(
-        table.CacheHitCompute(TestContext(), Seq(1, 8)).longest_match_tokens,
-        0);
+    RegisterOrFail(table, Registration());
+    const ProjectedPrefix collision = Prefix(0x123456789abcdef0ULL);
+    const SharedObjectOwner first = SharedOwner("object-a");
+    const SharedObjectOwner second = SharedOwner("object-b");
 
-    RemovedEvent remove;
-    remove.block_hashes = {100, 200};
-    remove.model_name = "test-model";
-    remove.lora_name = "none";
-    remove.instance_id = "instance-1";
-    remove.block_size = 4;
-    ASSERT_EQ(table.ProcessRemoveEvent(remove, 0, "instance-1"), "");
+    ASSERT_EQ(table.StoreShared(Shared({collision}, StorageTier::kCpu, first)),
+              "");
+    ASSERT_EQ(table.StoreShared(Shared({collision}, StorageTier::kCpu, second)),
+              "");
+    ASSERT_EQ(table.StoreShared(Shared({collision}, StorageTier::kCpu, first)),
+              "");
+    EXPECT_EQ(Presence(table, collision).cpu_owners,
+              (std::set<SharedObjectOwner>{first, second}));
 
-    const auto result = table.CacheHitCompute(TestContext(), Seq(1, 8));
-    EXPECT_EQ(result.longest_match_tokens, 0);
+    ASSERT_EQ(table.RemoveShared(Shared({collision}, StorageTier::kCpu, first)),
+              "");
+    EXPECT_EQ(Presence(table, collision).cpu_owners,
+              (std::set<SharedObjectOwner>{second}));
+
+    ASSERT_EQ(
+        table.RemoveShared(Shared({collision}, StorageTier::kCpu, second)), "");
+    EXPECT_TRUE(PrefixCacheTableTestPeer::Snapshot(table)
+                    .contexts.at(TestContext())
+                    .blocks.empty());
+}
+
+TEST(Mutations, BlockLivesUntilEveryTierOwnerSetIsEmpty) {
+    PrefixCacheTable table;
+    RegisterOrFail(table, Registration());
+    const ProjectedPrefix prefix = Prefix(11);
+    const auto gpu = Gpu({prefix});
+    const auto cpu = Shared({prefix}, StorageTier::kCpu, SharedOwner("cpu"));
+    const auto disk = Shared({prefix}, StorageTier::kDisk, SharedOwner("disk"));
+
+    ASSERT_EQ(table.StoreGpu(gpu), "");
+    ASSERT_EQ(table.StoreShared(cpu), "");
+    ASSERT_EQ(table.StoreShared(disk), "");
+    ASSERT_EQ(table.RemoveGpu(gpu), "");
+    EXPECT_TRUE(Presence(table, prefix).gpu_owners.empty());
+    EXPECT_FALSE(Presence(table, prefix).cpu_owners.empty());
+    EXPECT_FALSE(Presence(table, prefix).disk_owners.empty());
+
+    ASSERT_EQ(table.RemoveShared(cpu), "");
+    EXPECT_TRUE(Presence(table, prefix).cpu_owners.empty());
+    EXPECT_FALSE(Presence(table, prefix).disk_owners.empty());
+
+    ASSERT_EQ(table.RemoveShared(disk), "");
+    EXPECT_TRUE(PrefixCacheTableTestPeer::Snapshot(table)
+                    .contexts.at(TestContext())
+                    .blocks.empty());
+}
+
+TEST(Mutations, GpuAndSharedClearAreExactlyOwnerScoped) {
+    PrefixCacheTable table;
+    RegisterOrFail(table, Registration("instance-a", 0));
+    RegisterOrFail(table, Registration("instance-b", 1));
+    const ProjectedPrefix prefix = Prefix(21);
+    const EngineOwner engine_a = GpuOwner("instance-a", 0, "stream-a");
+    const EngineOwner engine_a_other_stream =
+        GpuOwner("instance-a", 0, "stream-a-other");
+    const EngineOwner engine_b = GpuOwner("instance-b", 1, "stream-b");
+    const SharedObjectOwner shared_a = SharedOwner("object-a");
+    const SharedObjectOwner shared_b = SharedOwner("object-b");
+
+    ASSERT_EQ(table.StoreGpu(Gpu({prefix}, engine_a)), "");
+    ASSERT_EQ(table.StoreGpu(Gpu({prefix}, engine_a_other_stream)), "");
+    ASSERT_EQ(table.StoreGpu(Gpu({prefix}, engine_b)), "");
+    ASSERT_EQ(table.StoreShared(Shared({prefix}, StorageTier::kCpu, shared_a)),
+              "");
+    ASSERT_EQ(table.StoreShared(Shared({prefix}, StorageTier::kDisk, shared_a)),
+              "");
+    ASSERT_EQ(table.StoreShared(Shared({prefix}, StorageTier::kCpu, shared_b)),
+              "");
+
+    ASSERT_EQ(table.ClearGpu(ClearFor(engine_a)), "");
+    EXPECT_EQ(Presence(table, prefix).gpu_owners,
+              (std::set<EngineOwner>{engine_a_other_stream, engine_b}));
+    EXPECT_EQ(Presence(table, prefix).cpu_owners,
+              (std::set<SharedObjectOwner>{shared_a, shared_b}));
+
+    ASSERT_EQ(table.ClearShared(ClearFor(shared_a, StorageTier::kCpu)), "");
+    EXPECT_EQ(Presence(table, prefix).cpu_owners,
+              (std::set<SharedObjectOwner>{shared_b}));
+    EXPECT_EQ(Presence(table, prefix).disk_owners,
+              (std::set<SharedObjectOwner>{shared_a}));
+    EXPECT_EQ(Presence(table, prefix).gpu_owners,
+              (std::set<EngineOwner>{engine_a_other_stream, engine_b}));
+
+    ASSERT_EQ(table.ClearShared(ClearFor(shared_a)), "");
+    EXPECT_TRUE(Presence(table, prefix).disk_owners.empty());
+    EXPECT_EQ(Presence(table, prefix).gpu_owners,
+              (std::set<EngineOwner>{engine_a_other_stream, engine_b}));
+}
+
+TEST(Mutations, UnknownRemoveClearAndUnregisterNeverCreateState) {
+    PrefixCacheTable table;
+    const ContextKey context = TestContext();
+
+    EXPECT_EQ(table.RemoveGpu(Gpu({Prefix(1)})), "");
+    EXPECT_EQ(table.ClearGpu(ClearFor()), "");
+    EXPECT_EQ(table.RemoveShared(Shared({Prefix(1)}, StorageTier::kCpu)), "");
+    EXPECT_EQ(table.ClearShared(ClearFor(SharedOwner())), "");
+    EXPECT_EQ(table.Unregister(context, "instance-a", 0), "");
+
+    EXPECT_FALSE(PrefixCacheTableTestPeer::ContextExists(table, context));
+    EXPECT_TRUE(PrefixCacheTableTestPeer::Snapshot(table).contexts.empty());
+}
+
+TEST(Unregister, RemovesOnlySelectedRankGpuOwners) {
+    PrefixCacheTable table;
+    RegisterOrFail(table, Registration("instance-a", 0));
+    RegisterOrFail(table, Registration("instance-a", 1));
+    RegisterOrFail(table, Registration("instance-b", 0));
+    const ProjectedPrefix prefix = Prefix(31);
+    const EngineOwner a0 = GpuOwner("instance-a", 0, "stream-a0");
+    const EngineOwner a0_second_stream =
+        GpuOwner("instance-a", 0, "stream-a0-second");
+    const EngineOwner a1 = GpuOwner("instance-a", 1, "stream-a1");
+    const EngineOwner b0 = GpuOwner("instance-b", 0, "stream-b0");
+    const SharedObjectOwner shared = SharedOwner();
+
+    ASSERT_EQ(table.StoreGpu(Gpu({prefix}, a0)), "");
+    ASSERT_EQ(table.StoreGpu(Gpu({prefix}, a0_second_stream)), "");
+    ASSERT_EQ(table.StoreGpu(Gpu({prefix}, a1)), "");
+    ASSERT_EQ(table.StoreGpu(Gpu({prefix}, b0)), "");
+    ASSERT_EQ(table.StoreShared(Shared({prefix}, StorageTier::kCpu, shared)),
+              "");
+
+    ASSERT_EQ(table.Unregister(TestContext(), "instance-a", 0), "");
+    auto snapshot = PrefixCacheTableTestPeer::Snapshot(table);
+    const auto& state = snapshot.contexts.at(TestContext());
+    EXPECT_EQ(state.instance_ranks.at("instance-a"), (std::set<int64_t>{1}));
+    EXPECT_EQ(state.instance_ranks.at("instance-b"), (std::set<int64_t>{0}));
+    EXPECT_EQ(state.blocks.at(prefix).gpu_owners,
+              (std::set<EngineOwner>{a1, b0}));
+    EXPECT_EQ(state.blocks.at(prefix).cpu_owners,
+              (std::set<SharedObjectOwner>{shared}));
+
+    ASSERT_EQ(table.Unregister(TestContext(), "instance-a", 1), "");
+    snapshot = PrefixCacheTableTestPeer::Snapshot(table);
+    EXPECT_FALSE(snapshot.contexts.at(TestContext())
+                     .instance_ranks.contains("instance-a"));
+    EXPECT_EQ(snapshot.contexts.at(TestContext()).blocks.at(prefix).gpu_owners,
+              (std::set<EngineOwner>{b0}));
+    EXPECT_EQ(snapshot.contexts.at(TestContext()).blocks.at(prefix).cpu_owners,
+              (std::set<SharedObjectOwner>{shared}));
+}
+
+TEST(Query, ExactTwoInstanceSharedCacheExample) {
+    PrefixCacheTable table;
+    RegisterOrFail(table, Registration("instance-1", 0));
+    RegisterOrFail(table, Registration("instance-2", 1));
+    const auto tokens = Tokens(48);
+    const auto hashes = Hashes(tokens);
+    ASSERT_EQ(hashes.size(), 3u);
+
+    ASSERT_EQ(table.StoreGpu(Gpu({hashes[0], hashes[1]},
+                                 GpuOwner("instance-1", 0, "engine-1"))),
+              "");
+    ASSERT_EQ(table.StoreShared(
+                  Shared(hashes, StorageTier::kCpu, SharedOwner("cpu-object"))),
+              "");
+    ASSERT_EQ(table.StoreShared(Shared(hashes, StorageTier::kDisk,
+                                       SharedOwner("disk-object"))),
+              "");
+
+    const auto results = table.Query(TestContext(), tokens);
+    ASSERT_EQ(results.size(), 2u);
+
+    const CacheHitResult& first = results.at("instance-1");
+    EXPECT_EQ(first.longest_match_tokens, 48);
+    EXPECT_EQ(first.gpu, 32);
+    EXPECT_EQ(first.dp, (std::map<int64_t, int64_t>{{0, 32}}));
+    EXPECT_EQ(first.cpu, 48);
+    EXPECT_EQ(first.disk, 48);
+
+    const CacheHitResult& second = results.at("instance-2");
+    EXPECT_EQ(second.longest_match_tokens, 48);
+    EXPECT_EQ(second.gpu, 0);
+    EXPECT_EQ(second.dp, (std::map<int64_t, int64_t>{{1, 0}}));
+    EXPECT_EQ(second.cpu, 48);
+    EXPECT_EQ(second.disk, 48);
+}
+
+TEST(Query, GpuPrefixComposesWithSharedTail) {
+    PrefixCacheTable table;
+    RegisterOrFail(table, Registration());
+    const auto tokens = Tokens(48);
+    const auto hashes = Hashes(tokens);
+    ASSERT_EQ(hashes.size(), 3u);
+
+    ASSERT_EQ(table.StoreGpu(Gpu({hashes[0], hashes[1]})), "");
+    ASSERT_EQ(table.StoreShared(Shared({hashes[2]}, StorageTier::kCpu)), "");
+
+    const auto result = table.Query(TestContext(), tokens).at("instance-a");
+    EXPECT_EQ(result.longest_match_tokens, 48);
+    EXPECT_EQ(result.gpu, 32);
+    EXPECT_EQ(result.dp, (std::map<int64_t, int64_t>{{0, 32}}));
     EXPECT_EQ(result.cpu, 0);
+    EXPECT_EQ(result.disk, 0);
 }
 
-// Spec scenario (bug-for-bug): mediumSet keeps GPU after the GPU replica
-// is removed, as long as the replica count stays positive.
-TEST(ProcessRemoveEvent, MediumSetRetainedBugForBug) {
+TEST(Query, DuplicateTierPresenceCountsOnceInLongestMatch) {
     PrefixCacheTable table;
+    RegisterOrFail(table, Registration());
+    const auto tokens = Tokens(16);
+    const auto hashes = Hashes(tokens);
+    ASSERT_EQ(hashes.size(), 1u);
 
-    // Two replicas of the same engine block hash: GPU then cpu.
-    StoredEvent gpu_event = TestStoredEvent();
-    gpu_event.block_hashes = {100};
-    gpu_event.token_ids = Seq(1, 4);
-    gpu_event.medium = "GPU";
-    ASSERT_EQ(table.ProcessStoreEvent(gpu_event, 0), "");
+    ASSERT_EQ(table.StoreGpu(Gpu(hashes)), "");
+    ASSERT_EQ(table.StoreShared(Shared(hashes, StorageTier::kCpu)), "");
+    ASSERT_EQ(table.StoreShared(Shared(hashes, StorageTier::kDisk)), "");
 
-    StoredEvent cpu_event = gpu_event;
-    cpu_event.medium = "cpu";
-    ASSERT_EQ(table.ProcessStoreEvent(cpu_event, 1), "");
-
-    // Remove one replica; count stays > 0.
-    // NOTE: removing by the engine hash also deletes the proxy mapping
-    // (bug-for-bug), but the prefix entry survives with count 1.
-    RemovedEvent remove;
-    remove.block_hashes = {100};
-    remove.model_name = "test-model";
-    remove.lora_name = "none";
-    remove.instance_id = "instance-1";
-    remove.block_size = 4;
-    remove.medium = "GPU";
-    ASSERT_EQ(table.ProcessRemoveEvent(remove, 0, "instance-1"), "");
-
-    // Bug-for-bug: GPU still reported (dirty read) because mediumSet is
-    // never pruned; CPU also still counted.
-    const auto result = table.CacheHitCompute(TestContext(), Seq(1, 4));
-    EXPECT_EQ(result.longest_match_tokens, 4);
-    EXPECT_EQ(result.gpu, 4);
-    EXPECT_EQ(result.cpu, 4);
+    const auto result = table.Query(TestContext(), tokens).at("instance-a");
+    EXPECT_EQ(result.longest_match_tokens, 16);
+    EXPECT_EQ(result.gpu, 16);
+    EXPECT_EQ(result.cpu, 16);
+    EXPECT_EQ(result.disk, 16);
 }
 
-// Bug-for-bug: replica count may go negative; entry is erased at <= 0 and
-// a later remove of the same conductor hash is a silent no-op.
-TEST(ProcessRemoveEvent, ReplicaCountCanGoNegativePathIsSafe) {
+TEST(Query, DifferentRanksNeverFabricateOneGpuPrefix) {
     PrefixCacheTable table;
-    StoredEvent event = TestStoredEvent();
-    event.block_hashes = {100};
-    event.token_ids = Seq(1, 4);
-    ASSERT_EQ(table.ProcessStoreEvent(event, 0), "");
+    RegisterOrFail(table, Registration("instance-a", 0));
+    RegisterOrFail(table, Registration("instance-a", 1));
+    const auto tokens = Tokens(32);
+    const auto hashes = Hashes(tokens);
+    ASSERT_EQ(hashes.size(), 2u);
 
-    RemovedEvent remove;
-    remove.block_hashes = {100};
-    remove.model_name = "test-model";
-    remove.lora_name = "none";
-    remove.instance_id = "instance-1";
-    remove.block_size = 4;
-    ASSERT_EQ(table.ProcessRemoveEvent(remove, 0, "instance-1"), "");
-    // Second remove: mapping already gone, must be a safe no-op.
-    ASSERT_EQ(table.ProcessRemoveEvent(remove, 0, "instance-1"), "");
-    EXPECT_EQ(
-        table.CacheHitCompute(TestContext(), Seq(1, 4)).longest_match_tokens,
-        0);
-}
+    ASSERT_EQ(
+        table.StoreGpu(Gpu({hashes[0]}, GpuOwner("instance-a", 0, "rank-0"))),
+        "");
+    ASSERT_EQ(
+        table.StoreGpu(Gpu({hashes[1]}, GpuOwner("instance-a", 1, "rank-1"))),
+        "");
 
-// --- CacheHitCompute -----------------------------------------------------
-
-TEST(CacheHitCompute, HitAfterStore) {
-    PrefixCacheTable table;
-    StoredEvent event = TestStoredEvent();
-    event.block_hashes = {100};
-    event.token_ids = Seq(1, 4);
-    ASSERT_EQ(table.ProcessStoreEvent(event, 0), "");
-
-    const auto result = table.CacheHitCompute(TestContext(), Seq(1, 4));
-    EXPECT_GT(result.longest_match_tokens, 0);
-    EXPECT_GT(result.cpu, 0);
-}
-
-TEST(CacheHitCompute, NonExistentContextReturnsZeros) {
-    PrefixCacheTable table;
-    ModelContext ctx = TestContext();
-    ctx.model_name = "non-existent-model";
-    ctx.additional_salt = "test-salt";
-    ctx.instance_id = "";
-
-    const auto result = table.CacheHitCompute(ctx, Seq(1, 4));
-    EXPECT_EQ(result.longest_match_tokens, 0);
+    const auto result = table.Query(TestContext(), tokens).at("instance-a");
+    EXPECT_EQ(result.longest_match_tokens, 16);
+    EXPECT_EQ(result.gpu, 16);
+    EXPECT_EQ(result.dp, (std::map<int64_t, int64_t>{{0, 16}, {1, 0}}));
     EXPECT_EQ(result.cpu, 0);
+    EXPECT_EQ(result.disk, 0);
+}
+
+TEST(Query, RegisteredZeroHitRanksAndIncompleteTailAreRetained) {
+    PrefixCacheTable table;
+    RegisterOrFail(table, Registration("instance-a", 0));
+    RegisterOrFail(table, Registration("instance-a", 2));
+    const auto incomplete_tokens = Tokens(15);
+
+    const auto results = table.Query(TestContext(), incomplete_tokens);
+    ASSERT_EQ(results.size(), 1u);
+    const auto& result = results.at("instance-a");
+    EXPECT_EQ(result.longest_match_tokens, 0);
+    EXPECT_EQ(result.dp, (std::map<int64_t, int64_t>{{0, 0}, {2, 0}}));
     EXPECT_EQ(result.gpu, 0);
+    EXPECT_EQ(result.cpu, 0);
+    EXPECT_EQ(result.disk, 0);
 }
 
-TEST(CacheHitCompute, ZeroBlockSizeReturnsZerosWithoutCrash) {
+TEST(Query, InstanceFilterAndUnknownContextAreLookupOnly) {
     PrefixCacheTable table;
-    // Materialize the context with a store first so the zero-BlockSize
-    // path reaches ComputePrefixHash.
-    ModelContext ctx = TestContext("instance-1", 0);
-    ctx.additional_salt = "test-salt";
-    const auto result = table.CacheHitCompute(ctx, Seq(1, 4));
-    EXPECT_EQ(result.longest_match_tokens, 0);
+    RegisterOrFail(table, Registration("instance-a", 0));
+    RegisterOrFail(table, Registration("instance-b", 1));
+    const auto before = PrefixCacheTableTestPeer::Snapshot(table);
+
+    const auto filtered =
+        table.Query(TestContext(), Tokens(16), std::nullopt, "instance-b");
+    ASSERT_EQ(filtered.size(), 1u);
+    EXPECT_TRUE(filtered.contains("instance-b"));
+
+    EXPECT_TRUE(
+        table.Query(TestContext(), Tokens(16), std::nullopt, "unknown-instance")
+            .empty());
+    ContextKey unknown = TestContext();
+    unknown.model_name = "missing";
+    EXPECT_TRUE(table.Query(unknown, Tokens(16)).empty());
+    EXPECT_EQ(PrefixCacheTableTestPeer::Snapshot(table), before);
 }
 
-// Spec scenario: different InstanceID contexts are fully isolated.
-TEST(CacheHitCompute, DifferentInstanceIdIsolated) {
+TEST(Query, CacheSaltChangesHashesWithoutChangingContextIdentity) {
     PrefixCacheTable table;
-    ASSERT_EQ(table.ProcessStoreEvent(TestStoredEvent(), 0), "");
+    RegisterOrFail(table, Registration());
+    const auto tokens = Tokens(16);
+    const auto unsalted = Hashes(tokens);
+    ASSERT_EQ(table.StoreGpu(Gpu(unsalted)), "");
 
-    const auto result =
-        table.CacheHitCompute(TestContext("instance-B"), Seq(1, 8));
-    EXPECT_EQ(result.longest_match_tokens, 0);
-}
+    const auto hit = table.Query(TestContext(), tokens).at("instance-a");
+    EXPECT_EQ(hit.longest_match_tokens, 16);
 
-// Spec scenario: partial prefix hit — only stored leading blocks count.
-TEST(CacheHitCompute, PartialPrefixHit) {
-    PrefixCacheTable table;
-    // Store only the first 2 blocks (tokens 1..8).
-    ASSERT_EQ(table.ProcessStoreEvent(TestStoredEvent(), 0), "");
-
-    // Query 4 blocks (tokens 1..16): only the stored prefix matches.
-    const auto result = table.CacheHitCompute(TestContext(), Seq(1, 16));
-    EXPECT_EQ(result.longest_match_tokens, 2 * 4);
-    EXPECT_EQ(result.cpu, 2 * 4);
-    EXPECT_EQ(result.gpu, 0);
-}
-
-// Spec scenario: matching stops at the first gap even if later blocks
-// exist (prefix semantics).
-TEST(CacheHitCompute, StopsAtFirstMissingBlock) {
-    PrefixCacheTable table;
-    ASSERT_EQ(table.ProcessStoreEvent(TestStoredEvent(), 0), "");
-
-    // Query where the first block differs: nothing may match.
-    auto tokens = Seq(1, 8);
-    tokens[0] = 999;
-    const auto result = table.CacheHitCompute(TestContext(), tokens);
-    EXPECT_EQ(result.longest_match_tokens, 0);
-}
-
-// Spec scenario (bug-for-bug): unknown medium (empty string, "disk", ...)
-// logs a warning and does not count as a hit; DISK stays 0.
-TEST(CacheHitCompute, UnknownMediumNotCountedBugForBug) {
-    PrefixCacheTable table;
-    for (const std::string medium : {"", "disk", "DISK", "Cpu", "gpu"}) {
-        StoredEvent event = TestStoredEvent();
-        event.instance_id = "inst-" + medium;
-        event.block_hashes = {100};
-        event.token_ids = Seq(1, 4);
-        event.medium = medium;
-        ASSERT_EQ(table.ProcessStoreEvent(event, 0), "");
-
-        const auto result =
-            table.CacheHitCompute(TestContext("inst-" + medium), Seq(1, 4));
-        EXPECT_EQ(result.longest_match_tokens, 0) << "medium=" << medium;
-        EXPECT_EQ(result.gpu, 0) << "medium=" << medium;
-        EXPECT_EQ(result.cpu, 0) << "medium=" << medium;
-        EXPECT_EQ(result.disk, 0) << "medium=" << medium;
-    }
-}
-
-// DP counting: each hit block contributes block_size per dp_rank present.
-TEST(CacheHitCompute, DpRankCounting) {
-    PrefixCacheTable table;
-    StoredEvent event = TestStoredEvent();
-    event.block_hashes = {100};
-    event.token_ids = Seq(1, 4);
-    event.medium = "GPU";
-    ASSERT_EQ(table.ProcessStoreEvent(event, 0), "");
-    // Same engine hash stored again from dp_rank 2.
-    ASSERT_EQ(table.ProcessStoreEvent(event, 2), "");
-
-    const auto result = table.CacheHitCompute(TestContext(), Seq(1, 4));
-    EXPECT_EQ(result.longest_match_tokens, 4);
-    ASSERT_EQ(result.dp.size(), 2u);
-    EXPECT_EQ(result.dp.at(0), 4);
-    EXPECT_EQ(result.dp.at(2), 4);
-}
-
-// --- GetGlobalView (spec: 全局视图导出) ----------------------------------
-
-TEST(GetGlobalView, ContainsAllContexts) {
-    PrefixCacheTable table;
-    ASSERT_EQ(table.ProcessStoreEvent(TestStoredEvent(), 0), "");
-    StoredEvent other = TestStoredEvent();
-    other.instance_id = "instance-2";
-    ASSERT_EQ(table.ProcessStoreEvent(other, 0), "");
-
-    const auto view = table.GetGlobalView();
-    EXPECT_EQ(view.context_count, 2);
-    ASSERT_EQ(view.model_contexts.size(), 2u);
-    ASSERT_EQ(view.proxy_hash_map.size(), 2u);
-    for (const auto& mapping : view.proxy_hash_map) {
-        EXPECT_EQ(mapping.size(), 2u);  // engine hashes 100 and 200
-    }
-}
-
-TEST(GetGlobalView, EmptyTable) {
-    PrefixCacheTable table;
-    const auto view = table.GetGlobalView();
-    EXPECT_EQ(view.context_count, 0);
-    EXPECT_TRUE(view.model_contexts.empty());
-    EXPECT_TRUE(view.proxy_hash_map.empty());
-}
-
-// --- AddDpSize ------------------------------------------------------------
-
-TEST(AddDpSize, CreatesContextAndRecordsRank) {
-    PrefixCacheTable table;
-    ModelContext ctx = TestContext();
-    table.AddDpSize(ctx, 0);
-    table.AddDpSize(ctx, 3);
-    table.AddDpSize(ctx, 0);  // idempotent
-    EXPECT_TRUE(PrefixCacheTableTestPeer::ContextExists(table, ctx));
+    const auto salted =
+        table.Query(TestContext(), tokens, std::string("request-salt"))
+            .at("instance-a");
+    EXPECT_EQ(salted.longest_match_tokens, 0);
     EXPECT_EQ(table.GetGlobalView().context_count, 1);
-    EXPECT_EQ(table.GetGlobalView().model_contexts.size(), 1u);
+}
+
+TEST(GlobalView, ReportsProfileRegistrationAndOwnerMapSize) {
+    PrefixCacheTable table;
+    RegisterOrFail(table, Registration("instance-a", 0));
+    RegisterOrFail(table, Registration("instance-b", 1));
+    ASSERT_EQ(table.StoreGpu(Gpu({Prefix(1), Prefix(2)})), "");
+
+    const auto view = table.GetGlobalView();
+    ASSERT_EQ(view.context_count, 1);
+    ASSERT_EQ(view.contexts.size(), 1u);
+    EXPECT_EQ(view.contexts[0].context, TestContext());
+    EXPECT_EQ(view.contexts[0].profile, TestProfile());
+    EXPECT_EQ(view.contexts[0].instance_ranks.at("instance-a"),
+              (std::set<int64_t>{0}));
+    EXPECT_EQ(view.contexts[0].instance_ranks.at("instance-b"),
+              (std::set<int64_t>{1}));
+    EXPECT_EQ(view.contexts[0].prefix_count, 2u);
 }
 
 }  // namespace

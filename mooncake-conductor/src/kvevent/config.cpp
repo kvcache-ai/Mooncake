@@ -6,6 +6,7 @@
 
 #include <cstdlib>
 #include <fstream>
+#include <limits>
 
 #include "conductor/common/utils.h"
 
@@ -40,6 +41,57 @@ std::string JsonString(const Json::Value& obj, const char* key) {
         return obj[key].asString();
     }
     return "";
+}
+
+bool JsonInt64(const Json::Value& value, int64_t* out) {
+    if (value.type() == Json::intValue) {
+        *out = value.asInt64();
+        return true;
+    }
+    if (value.type() == Json::uintValue &&
+        value.asUInt64() <=
+            static_cast<Json::UInt64>(std::numeric_limits<int64_t>::max())) {
+        *out = static_cast<int64_t>(value.asUInt64());
+        return true;
+    }
+    return false;
+}
+
+common::HashProfileConfig ParseHashProfile(const Json::Value& raw) {
+    common::HashProfileConfig profile;
+    const Json::Value& value = raw["hash_profile"];
+    if (!value.isObject()) {
+        return profile;
+    }
+    profile.strategy = JsonString(value, "strategy");
+    profile.algorithm = JsonString(value, "algorithm");
+    profile.root_digest = JsonString(value, "root_digest");
+    profile.index_projection = JsonString(value, "index_projection");
+    return profile;
+}
+
+bool ParseCacheGroup(const Json::Value& raw,
+                     std::optional<int64_t>* cache_group) {
+    if (!raw.isMember("cache_group") || raw["cache_group"].isNull()) {
+        cache_group->reset();
+        return true;
+    }
+    const Json::Value& value = raw["cache_group"];
+    int64_t parsed = 0;
+    if (value.type() == Json::intValue) {
+        parsed = value.asInt64();
+    } else if (value.type() == Json::uintValue &&
+               value.asUInt64() <= static_cast<Json::UInt64>(
+                                       std::numeric_limits<int64_t>::max())) {
+        parsed = static_cast<int64_t>(value.asUInt64());
+    } else {
+        return false;
+    }
+    if (parsed != 0) {
+        return false;
+    }
+    *cache_group = parsed;
+    return true;
 }
 
 }  // namespace
@@ -94,17 +146,47 @@ std::vector<common::ServiceConfig> ParseConfig(int* http_server_port) {
             svc.replay_endpoint = JsonString(raw, "replay_endpoint");
             svc.type = service_type;
             svc.model_name = JsonString(raw, "modelname");
+            if (raw.isMember("lora_name") && !raw["lora_name"].isString()) {
+                LOG(ERROR) << "Invalid lora_name stream_key=" << name;
+                continue;
+            }
             svc.lora_name = JsonString(raw, "lora_name");
+            if (raw.isMember("tenant_id") && !raw["tenant_id"].isString()) {
+                LOG(ERROR) << "Invalid tenant_id stream_key=" << name;
+                continue;
+            }
             svc.tenant_id = JsonString(raw, "tenant_id");
-            svc.instance_id = name;  // map key is the instance id
-            svc.block_size =
-                raw.isMember("block_size") && raw["block_size"].isNumeric()
-                    ? raw["block_size"].asInt64()
-                    : 0;
-            svc.dp_rank = raw.isMember("dp_rank") && raw["dp_rank"].isNumeric()
-                              ? raw["dp_rank"].asInt()
-                              : 0;
-            svc.additional_salt = JsonString(raw, "additionalsalt");
+            if (svc.tenant_id.empty()) {
+                svc.tenant_id = "default";
+            }
+            if (raw.isMember("instance_id")) {
+                if (!raw["instance_id"].isString() ||
+                    raw["instance_id"].asString().empty()) {
+                    LOG(ERROR) << "Invalid instance_id stream_key=" << name;
+                    continue;
+                }
+                svc.instance_id = raw["instance_id"].asString();
+            } else {
+                svc.instance_id = name;
+            }
+            if (!raw.isMember("block_size") ||
+                !JsonInt64(raw["block_size"], &svc.block_size)) {
+                LOG(ERROR) << "Invalid block_size instance_id=" << name;
+                continue;
+            }
+            int64_t dp_rank = 0;
+            if (!raw.isMember("dp_rank") ||
+                !JsonInt64(raw["dp_rank"], &dp_rank) || dp_rank < 0 ||
+                dp_rank > std::numeric_limits<int>::max()) {
+                LOG(ERROR) << "Invalid dp_rank instance_id=" << name;
+                continue;
+            }
+            svc.dp_rank = static_cast<int>(dp_rank);
+            if (!ParseCacheGroup(raw, &svc.cache_group)) {
+                LOG(ERROR) << "Invalid cache_group instance_id=" << name;
+                continue;
+            }
+            svc.hash_profile = ParseHashProfile(raw);
             services.push_back(std::move(svc));
         }
     }

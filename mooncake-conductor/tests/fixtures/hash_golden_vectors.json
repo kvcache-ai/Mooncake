@@ -1,182 +1,166 @@
 {
-  "compute_hash_cases": [
+  "description": "Golden vectors for the supported vLLM v1 sha256_cbor block-hash profile.",
+  "generator": "vLLM 0.22.0 hash_block_tokens semantics with cbor2 6.1.1 canonical=True",
+  "profile": {
+    "strategy": "vllm_v1",
+    "algorithm": "sha256_cbor",
+    "root_digest": "4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e",
+    "index_projection": "low64_be"
+  },
+  "cases": [
     {
-      "name": "zero_parent_single_zero_token",
-      "parent_hash": "0",
-      "token_ids": [
-        0
+      "name": "spec_unsalted",
+      "block_size": 4,
+      "lora_name": "",
+      "cache_salt": null,
+      "token_ids": [1, 2, 3, 4, 5, 6, 7, 8],
+      "expected": [
+        {
+          "digest": "c9d58ba695280d69b243e1e0df813136ca9196b286fb1a021e0b2e028ef071cb",
+          "projected_hex": "1e0b2e028ef071cb",
+          "projected_decimal": "2164874634404590027"
+        },
+        {
+          "digest": "24125b23e68883b5c2141db2959d48433fe6bde2f26bd914efad121d154ab2d6",
+          "projected_hex": "efad121d154ab2d6",
+          "projected_decimal": "17270480062156288726"
+        }
       ],
-      "expected": "17252927351209727994"
+      "incorrect_low64_parent_digest": "067bc227e5aa13cb174be22cd7016b7b21b663eddba6241928d7a7d1ffc0aa1e"
     },
     {
-      "name": "zero_parent_int32_max",
-      "parent_hash": "0",
-      "token_ids": [
-        2147483647
-      ],
-      "expected": "6389369522363153732"
+      "name": "lora_every_block",
+      "block_size": 4,
+      "lora_name": "adapter-A",
+      "cache_salt": null,
+      "token_ids": [1, 2, 3, 4, 5, 6, 7, 8],
+      "expected": [
+        {
+          "digest": "1424c0ec536f82188b592f263601d4e48c0255081c5f1e9225163c6d611a5222",
+          "projected_hex": "25163c6d611a5222",
+          "projected_decimal": "2672389869369184802"
+        },
+        {
+          "digest": "4a2ec941640a8f2470869ec2b3cf6bdd90e2be83b21807b628ac9abe9341eea9",
+          "projected_hex": "28ac9abe9341eea9",
+          "projected_decimal": "2930887600816385705"
+        }
+      ]
     },
     {
-      "name": "zero_parent_int32_min",
-      "parent_hash": "0",
-      "token_ids": [
-        -2147483648
-      ],
-      "expected": "11922097559946081098"
+      "name": "salt_first_block",
+      "block_size": 4,
+      "lora_name": "",
+      "cache_salt": "tenant-salt",
+      "token_ids": [1, 2, 3, 4, 5, 6, 7, 8],
+      "expected": [
+        {
+          "digest": "3be45574566e2f3c51c9f254d9627cf113382b627aeaefe8b661d66cfa089359",
+          "projected_hex": "b661d66cfa089359",
+          "projected_decimal": "13142020951183496025"
+        },
+        {
+          "digest": "22dea68f80ff7f40243dfb906a33db02571905c78a3b42153a56de5ad08c661a",
+          "projected_hex": "3a56de5ad08c661a",
+          "projected_decimal": "4203791783824221722"
+        }
+      ]
     },
     {
-      "name": "zero_parent_negative_one",
-      "parent_hash": "0",
-      "token_ids": [
-        -1
-      ],
-      "expected": "16245199199750232163"
+      "name": "lora_then_salt",
+      "block_size": 4,
+      "lora_name": "adapter-A",
+      "cache_salt": "tenant-salt",
+      "token_ids": [1, 2, 3, 4, 5, 6, 7, 8],
+      "expected": [
+        {
+          "digest": "22977da6c71098507264dbf4161d451c2d98494c5c146717f36787e184b36040",
+          "projected_hex": "f36787e184b36040",
+          "projected_decimal": "17539136676481425472"
+        },
+        {
+          "digest": "6a3cd7de2626c2d2982eb5bc9d4878a49745c3784bde8a2334ffac47286bb866",
+          "projected_hex": "34ffac47286bb866",
+          "projected_decimal": "3818960430654273638"
+        }
+      ]
     },
     {
-      "name": "empty_salt_seed_parent_simple_block",
-      "parent_hash": "17241709254077376921",
+      "name": "signed_integer_boundaries",
+      "block_size": 12,
+      "lora_name": "",
+      "cache_salt": null,
       "token_ids": [
-        1,
-        2,
-        3,
-        4
-      ],
-      "expected": "17479108795143759033"
-    },
-    {
-      "name": "test_salt_seed_parent_simple_block",
-      "parent_hash": "3093326237178100292",
-      "token_ids": [
-        1,
-        2,
-        3,
-        4
-      ],
-      "expected": "9426078380181780810"
-    },
-    {
-      "name": "max_uint64_parent",
-      "parent_hash": "18446744073709551615",
-      "token_ids": [
-        42
-      ],
-      "expected": "10811737520595092618"
-    },
-    {
-      "name": "mixed_boundary_tokens",
-      "parent_hash": "1311768467463790320",
-      "token_ids": [
-        1,
+        -2147483648,
+        -257,
+        -256,
+        -25,
+        -24,
         -1,
         0,
-        2147483647,
-        -2147483648,
-        7,
-        8,
-        9
+        23,
+        24,
+        255,
+        256,
+        2147483647
       ],
-      "expected": "14297812555718036751"
+      "expected": [
+        {
+          "digest": "d4e5cc975a84b5ae7299d36910284bf256ea1eade2689dba6391b08d86e006d7",
+          "projected_hex": "6391b08d86e006d7",
+          "projected_decimal": "7174709803277616855"
+        }
+      ]
     },
     {
-      "name": "empty_token_block",
-      "parent_hash": "1",
-      "token_ids": [],
-      "expected": "11468921228449061269"
-    },
-    {
-      "name": "sixteen_token_block",
-      "parent_hash": "14633529491185867926",
-      "token_ids": [
-        100,
-        101,
-        102,
-        103,
-        104,
-        105,
-        106,
-        107,
-        108,
-        109,
-        110,
-        111,
-        112,
-        113,
-        114,
-        115
-      ],
-      "expected": "16676570778039606898"
-    }
-  ],
-  "description": "Golden vectors for conductor computeHash / ComputePrefixHash. computeHash = XXH64(seed=0) over parentHash (8B little-endian) followed by each token id (4B little-endian). Generated from the Go implementation.",
-  "generator": "GOLDEN_VECTOR_DIR=\u003cdir\u003e go test -run TestExportGoldenVectors ./prefixindex/",
-  "prefix_chain_cases": [
-    {
-      "name": "empty_salt_three_blocks",
+      "name": "utf8_length_23",
       "block_size": 4,
-      "additional_salt": "",
-      "cache_salt": "17241709254077376921",
-      "token_ids": [
-        1,
-        2,
-        3,
-        4,
-        5,
-        6,
-        7,
-        8,
-        9,
-        10,
-        11,
-        12
-      ],
-      "expected_chain": [
-        "17479108795143759033",
-        "7381301201260694503",
-        "18337328429285706432"
+      "lora_name": "aaaaaaaaaaaaaaaaaaaaaaa",
+      "cache_salt": null,
+      "token_ids": [1, 2, 3, 4],
+      "expected": [
+        {
+          "digest": "3cc96f507898959352d1d123c849d0ab4b11846c8de3c67123d72e78957adb07",
+          "projected_hex": "23d72e78957adb07",
+          "projected_decimal": "2582584006759078663"
+        }
       ]
     },
     {
-      "name": "test_salt_two_blocks",
+      "name": "utf8_length_24",
       "block_size": 4,
-      "additional_salt": "test-salt",
-      "cache_salt": "3093326237178100292",
-      "token_ids": [
-        1,
-        2,
-        3,
-        4,
-        5,
-        6,
-        7,
-        8
-      ],
-      "expected_chain": [
-        "9426078380181780810",
-        "17244436113247910852"
+      "lora_name": "aaaaaaaaaaaaaaaaaaaaaaaa",
+      "cache_salt": null,
+      "token_ids": [1, 2, 3, 4],
+      "expected": [
+        {
+          "digest": "553263ebbf33660ecba67f9fcabea06d20cca3a71c79abf6e1894d39c7fa8ff8",
+          "projected_hex": "e1894d39c7fa8ff8",
+          "projected_decimal": "16251605640906706936"
+        }
       ]
     },
     {
-      "name": "chinese_salt_negative_tokens",
-      "block_size": 2,
-      "additional_salt": "中文盐值测试",
-      "cache_salt": "6735174366932667753",
-      "token_ids": [
-        -1,
-        -2,
-        -3,
-        -4
-      ],
-      "expected_chain": [
-        "9165633725006739174",
-        "15046282266286516170"
+      "name": "utf8_multibyte",
+      "block_size": 4,
+      "lora_name": "\u6a21\u578b-\u9002\u914d\u5668",
+      "cache_salt": "\u76d0\u503c-\ud83d\ude80",
+      "token_ids": [1, 2, 3, 4],
+      "expected": [
+        {
+          "digest": "69af00b1b180a366c69003a00527c2baf6bbc71880abc3b1d3b60fa2f553cdca",
+          "projected_hex": "d3b60fa2f553cdca",
+          "projected_decimal": "15255397980339162570"
+        }
       ]
     },
     {
-      "name": "empty_salt_single_block_bs16",
-      "block_size": 16,
-      "additional_salt": "",
-      "cache_salt": "17241709254077376921",
+      "name": "definite_array_length_24",
+      "block_size": 24,
+      "lora_name": "",
+      "cache_salt": null,
       "token_ids": [
+        0,
         1,
         2,
         3,
@@ -192,42 +176,44 @@
         13,
         14,
         15,
-        16
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23
       ],
-      "expected_chain": [
-        "9404987693367201964"
+      "expected": [
+        {
+          "digest": "792917e681c347b21bebfdd57cabcca6b79c865f83ccd2cfbd9cb56ffed2b088",
+          "projected_hex": "bd9cb56ffed2b088",
+          "projected_decimal": "13662994862156460168"
+        }
       ]
     },
     {
-      "name": "partial_trailing_block_dropped",
+      "name": "incomplete_tail",
       "block_size": 4,
-      "additional_salt": "",
-      "cache_salt": "17241709254077376921",
-      "token_ids": [
-        1,
-        2,
-        3,
-        4,
-        5,
-        6
-      ],
-      "expected_chain": [
-        "17479108795143759033"
+      "lora_name": "",
+      "cache_salt": null,
+      "token_ids": [1, 2, 3, 4, 5, 6],
+      "expected": [
+        {
+          "digest": "c9d58ba695280d69b243e1e0df813136ca9196b286fb1a021e0b2e028ef071cb",
+          "projected_hex": "1e0b2e028ef071cb",
+          "projected_decimal": "2164874634404590027"
+        }
       ]
     },
     {
-      "name": "zero_block_size_returns_empty",
-      "block_size": 0,
-      "additional_salt": "",
-      "cache_salt": "17241709254077376921",
-      "token_ids": [
-        1,
-        2,
-        3,
-        4
-      ],
-      "expected_chain": []
+      "name": "no_complete_block",
+      "block_size": 4,
+      "lora_name": "",
+      "cache_salt": null,
+      "token_ids": [1, 2, 3],
+      "expected": []
     }
-  ],
-  "xxhash_module": "github.com/cespare/xxhash/v2 v2.3.0"
+  ]
 }

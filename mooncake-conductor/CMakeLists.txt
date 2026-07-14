@@ -17,6 +17,7 @@ if(NOT TARGET yalantinglibs::yalantinglibs)
   find_package(yalantinglibs CONFIG REQUIRED)
 endif()
 find_package(Threads REQUIRED)
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 
 # ThreadSanitizer build for the concurrency tests (task 6.7): cmake
 # -DCONDUCTOR_CPP_TSAN=ON .. Run with:
@@ -29,30 +30,10 @@ if(CONDUCTOR_CPP_TSAN)
   message(STATUS "conductor-cpp: ThreadSanitizer enabled")
 endif()
 
-# Find xxHash (required for prefix hashing)
-find_path(
-  XXHASH_INCLUDE_DIR
-  NAMES xxhash.h
-  PATHS /usr/include /usr/local/include)
-find_library(
-  XXHASH_LIBRARY
-  NAMES xxhash libxxhash
-  PATHS /usr/lib /usr/local/lib /usr/lib64)
-if(XXHASH_INCLUDE_DIR AND XXHASH_LIBRARY)
-  message(
-    STATUS
-      "conductor-cpp: found xxHash: include=${XXHASH_INCLUDE_DIR} lib=${XXHASH_LIBRARY}"
-  )
-else()
-  message(
-    FATAL_ERROR
-      "xxHash library/header not found. Please install libxxhash-dev or xxhash-devel and try again."
-  )
-endif()
-
 add_library(
   conductor_cpp_core STATIC
   src/common/utils.cpp
+  src/prefixindex/hash_strategy.cpp
   src/prefixindex/prefix_indexer.cpp
   src/zmq/msg_decoder.cpp
   src/zmq/zmq_client.cpp
@@ -60,13 +41,12 @@ add_library(
   src/kvevent/event_manager.cpp
   src/kvevent/config.cpp)
 
-target_include_directories(
-  conductor_cpp_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
-                            ${XXHASH_INCLUDE_DIR})
+target_include_directories(conductor_cpp_core
+                           PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 target_link_libraries(
   conductor_cpp_core
-  PUBLIC ${XXHASH_LIBRARY}
+  PUBLIC OpenSSL::Crypto
          cppzmq
          msgpack-cxx
          yalantinglibs::yalantinglibs

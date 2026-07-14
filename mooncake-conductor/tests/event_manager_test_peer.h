@@ -30,9 +30,10 @@ class EventManagerTestPeer {
         return result;
     }
 
-    static void Unsubscribe(EventManager& mgr, const std::string& instance_id,
-                            const std::string& tenant_id, int dp_rank) {
-        mgr.UnsubscribeFromService(instance_id, tenant_id, dp_rank);
+    static std::pair<bool, std::string> Unsubscribe(
+        EventManager& mgr, const std::string& instance_id,
+        const std::string& tenant_id, int dp_rank) {
+        return mgr.UnsubscribeFromService(instance_id, tenant_id, dp_rank);
     }
 
     static void FakeSubscriber(EventManager& mgr, const std::string& key) {
@@ -42,6 +43,15 @@ class EventManagerTestPeer {
             std::make_shared<zmq::ZMQClient>(zmq::ZMQClientConfig{}, nullptr);
         std::unique_lock lock(mgr.mu_);
         mgr.subscribers_[key] = std::move(dummy);
+    }
+
+    static void FakeActiveService(EventManager& mgr, const std::string& key,
+                                  const common::ServiceConfig& service) {
+        auto dummy =
+            std::make_shared<zmq::ZMQClient>(zmq::ZMQClientConfig{}, nullptr);
+        std::unique_lock lock(mgr.mu_);
+        mgr.subscribers_[key] = std::move(dummy);
+        mgr.active_configs_[key] = service;
     }
 
     static size_t ServicesLen(EventManager& mgr) {
@@ -63,14 +73,6 @@ class EventManagerTestPeer {
                               const common::ServiceConfig& svc) {
         std::unique_lock lock(mgr.mu_);
         mgr.services_.push_back(svc);
-    }
-
-    static bool TenantHasInstance(EventManager& mgr, const std::string& tenant,
-                                  const std::string& instance) {
-        std::shared_lock lock(mgr.tenant_mutex_);
-        auto it = mgr.tenant_instance_map_.find(tenant);
-        return it != mgr.tenant_instance_map_.end() &&
-               it->second.count(instance) != 0;
     }
 
     static uint16_t HttpPort(EventManager& mgr);

@@ -1,14 +1,23 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
-#include <vector>
 
 namespace conductor {
 namespace common {
 
 inline constexpr const char* kServiceTypeVLLM = "vLLM";
 inline constexpr const char* kServiceTypeMooncake = "Mooncake";
+
+struct HashProfileConfig {
+    std::string strategy;
+    std::string algorithm;
+    std::string root_digest;
+    std::string index_projection;
+
+    bool operator==(const HashProfileConfig&) const = default;
+};
 
 struct ServiceConfig {
     std::string endpoint;         // kv publisher endpoint
@@ -20,27 +29,10 @@ struct ServiceConfig {
     std::string instance_id;  // required
     int64_t block_size = 0;
     int dp_rank = 0;
-    std::string additional_salt;  // (optional), default use empty string
-};
+    std::optional<int64_t> cache_group;
+    HashProfileConfig hash_profile;
 
-struct StoredEvent {
-    std::vector<uint64_t> block_hashes;
-    int64_t block_size = 0;
-    std::string model_name;
-    std::string lora_name;
-    std::string instance_id;
-    uint64_t parent_block_hash = 0;
-    std::vector<int32_t> token_ids;
-    std::string medium;
-};
-
-struct RemovedEvent {
-    std::vector<uint64_t> block_hashes;
-    std::string model_name;
-    std::string lora_name;
-    std::string instance_id;
-    int64_t block_size = 0;
-    std::string medium;
+    bool operator==(const ServiceConfig&) const = default;
 };
 
 }  // namespace common

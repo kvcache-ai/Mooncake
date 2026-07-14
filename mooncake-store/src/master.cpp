@@ -237,8 +237,9 @@ DEFINE_string(kv_events_tenant_id, "default",
               "Config compatibility default; events use per-object tenant_id");
 DEFINE_string(kv_events_additional_salt, "",
               "Fixed hash namespace salt for published KV events");
-DEFINE_string(kv_events_lora_name, "",
-              "Fixed LoRA name for published KV events; empty means base model");
+DEFINE_string(
+    kv_events_lora_name, "",
+    "Fixed LoRA name for published KV events; empty means base model");
 DEFINE_uint32(kv_events_block_size, 0,
               "Fixed KV block size for published events; 0 means unknown");
 DEFINE_uint32(kv_events_dp_rank, 0,

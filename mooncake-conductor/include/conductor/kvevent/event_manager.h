@@ -43,12 +43,7 @@ class KVEventHandler : public zmq::EventHandler {
                                    int64_t dp_rank);
 
     EventManager* manager_;
-    std::string tenant_id_;
-    std::string model_name_;
-    std::string lora_name_;
-    std::string instance_id_;
-    int64_t block_size_ = 0;
-    std::string additional_salt_;
+    common::ServiceConfig service_;
 };
 
 std::string MakeServiceKey(const std::string& instance_id,
@@ -91,8 +86,9 @@ class EventManager {
 
     // Must be called WITHOUT mu_ held; stops the ZMQ client outside the
     // manager lock (see deadlock note in the implementation).
-    void UnsubscribeFromService(const std::string& instance_id,
-                                const std::string& tenant_id, int dp_rank);
+    std::pair<bool, std::string> UnsubscribeFromService(
+        const std::string& instance_id, const std::string& tenant_id,
+        int dp_rank);
 
     void RegisterHttpHandlers();
 
@@ -104,10 +100,7 @@ class EventManager {
     std::unordered_map<std::string, std::shared_ptr<zmq::ZMQClient>>
         subscribers_;
     std::map<std::string, common::ServiceConfig> active_configs_;
-
-    // Map tenant -> instance set, guarded by tenant_mutex_.
-    std::unordered_map<std::string, std::set<std::string>> tenant_instance_map_;
-    std::shared_mutex tenant_mutex_;
+    std::set<std::string> unregistering_;
 
     std::shared_mutex mu_;
     bool stopped_ = false;
