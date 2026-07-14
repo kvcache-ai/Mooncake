@@ -27,8 +27,14 @@ target_include_directories(admission_queue_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME admission_queue_test COMMAND admission_queue_test)
 
-# Reproducible hot-path microbenchmark; intentionally not registered with ctest.
-# Run manually when changing deadline promotion partitioning.
+add_executable(bw_arbitration_test bw_arbitration_test.cpp)
+target_link_libraries(bw_arbitration_test PRIVATE tent_common gtest gtest_main)
+target_include_directories(bw_arbitration_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME bw_arbitration_test COMMAND bw_arbitration_test)
+
+# Reproducible hot-path microbenchmark; intentionally not registered with
+# ctest. Run manually when changing deadline promotion partitioning.
 add_executable(deadline_promotion_bench deadline_promotion_bench.cpp
                                         ../src/runtime/admission_queue.cpp)
 target_link_libraries(deadline_promotion_bench PRIVATE tent_common)
@@ -110,6 +116,13 @@ target_link_libraries(tent_tcp_transport_test PRIVATE gtest gtest_main
 target_include_directories(tent_tcp_transport_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_tcp_transport_test COMMAND tent_tcp_transport_test)
+
+add_executable(tent_shm_transport_test shm_transport_test.cpp)
+target_link_libraries(tent_shm_transport_test PRIVATE gtest gtest_main
+                                                      tent_link_group)
+target_include_directories(tent_shm_transport_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_shm_transport_test COMMAND tent_shm_transport_test)
 
 add_executable(tent_failover_test failover_test.cpp)
 target_link_libraries(tent_failover_test PRIVATE gtest gtest_main
@@ -241,7 +254,8 @@ add_test(NAME tent_runtime_queue_dispatch_test
 # Causal chain stage decomposition: validates that dispatch_time and post_time
 # timestamps are populated on both queue and direct-commit paths.
 add_executable(causal_chain_test causal_chain_test.cpp)
-target_link_libraries(causal_chain_test PRIVATE gtest gtest_main tent_link_group)
+target_link_libraries(causal_chain_test PRIVATE gtest gtest_main
+                                                tent_link_group)
 if(TARGET asio_shared)
   target_link_libraries(causal_chain_test PRIVATE asio_shared)
 endif()

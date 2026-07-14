@@ -333,7 +333,14 @@ TEST_F(MasterServiceSSDSnapshotTest, RemoveKey) {
 }
 
 TEST_F(MasterServiceSSDSnapshotTest, EvictObject) {
-    CreateMasterServiceWithSSDFeat("/mnt/ssd");
+    // Keep the lease expiry wait below the client live TTL. This test verifies
+    // eviction and snapshot restore, not the process-wide default lease TTL.
+    constexpr uint64_t kv_lease_ttl = 2000;
+    auto service_config = MasterServiceConfig::builder()
+                              .set_root_fs_dir("/mnt/ssd")
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .build();
+    CreateMasterServiceWithSSDFeatAndConfig(service_config);
     // Mount a segment that can hold about 1024 * 16 objects.
     // As the eviction is processed separately for each shard,
     // we need to fill each shard with enough objects to thoroughly
@@ -387,8 +394,7 @@ TEST_F(MasterServiceSSDSnapshotTest, EvictObject) {
     }
     ASSERT_GT(success_gets, 1024 * 16);
 
-    std::this_thread::sleep_for(
-        std::chrono::milliseconds(DEFAULT_DEFAULT_KV_LEASE_TTL));
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
     // service_->RemoveAll();
 }
 

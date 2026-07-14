@@ -209,7 +209,7 @@ int WorkerPool::submitPostSend(
                     continue;
                 }
                 auto alt_path =
-                    MakeNicPath(peer_segment_desc->name,
+                    MakeNicPath(peer_segment_desc->nicPathServerName(),
                                 peer_segment_desc->devices[alt_dev_id].name);
                 if (isRailAvailable(alt_path)) {
                     device_id = alt_dev_id;
@@ -726,6 +726,7 @@ int WorkerPool::doProcessContextEvents() {
                event.event_type == IBV_EVENT_PORT_ERR ||
                event.event_type == IBV_EVENT_LID_CHANGE) {
         context_.set_active(false);
+        refreshPublishedLocalTopology();
 
         /**
          * Similar deadlock might happen if we call
@@ -744,9 +745,23 @@ int WorkerPool::doProcessContextEvents() {
 
         context_.disconnectAllEndpoints();
         LOG(INFO) << "Worker: Context " << context_.deviceName()
-                  << " is now inactive";
+                  << " is now inactive due to fatal event: "
+                  << event.event_type;
+    } else if (event.event_type == IBV_EVENT_GID_CHANGE) {
+        auto gid_refresh_result = refreshPublishedLocalGid();
+        ibv_ack_async_event(&event);
+        event_acked = true;
+
+        if (gid_refresh_result != GidRefreshResult::UNCHANGED) {
+            context_.disconnectAllEndpoints();
+            LOG(INFO) << "Worker: Context " << context_.deviceName()
+                      << " GID refresh result="
+                      << static_cast<int>(gid_refresh_result)
+                      << ", disconnected all endpoints";
+        }
     } else if (event.event_type == IBV_EVENT_PORT_ACTIVE) {
         context_.set_active(true);
+        refreshPublishedLocalTopology();
         markContextSuccess();  // Reset failure counter on port recovery
         LOG(INFO) << "Worker: Context " << context_.deviceName()
                   << " is now active";
@@ -757,6 +772,47 @@ int WorkerPool::doProcessContextEvents() {
     }
 
     return 0;
+}
+
+void WorkerPool::refreshPublishedLocalTopology() {
+    std::lock_guard<std::mutex> guard(context_.engine().local_desc_lock_);
+    auto desc =
+        context_.engine().metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    if (!desc || !context_.engine().local_topology_) return;
+
+    auto updated_desc = std::make_shared<RdmaTransport::SegmentDesc>(*desc);
+    updated_desc->topology = *context_.engine().local_topology_;
+    for (const auto &context : context_.engine().context_list_) {
+        if (context->active()) continue;
+        updated_desc->topology.disableDevice(context->deviceName());
+    }
+
+    context_.engine().metadata_->addLocalSegment(
+        LOCAL_SEGMENT_ID, updated_desc->name, std::move(updated_desc));
+    int ret = context_.engine().metadata_->updateLocalSegmentDesc();
+    if (ret) {
+        LOG(WARNING) << "Failed to publish RDMA topology update for "
+                     << context_.deviceName() << ", ret=" << ret;
+    }
+}
+
+GidRefreshResult WorkerPool::refreshPublishedLocalGid() {
+    std::string previous_gid;
+    std::string next_gid;
+    auto result = context_.refreshCurrentGid(&previous_gid, &next_gid);
+    if (result == GidRefreshResult::CHANGED) {
+        LOG(WARNING) << "Worker: refreshed published GID for "
+                     << context_.deviceName() << ": " << previous_gid << " -> "
+                     << next_gid;
+    } else if (result == GidRefreshResult::UNCHANGED) {
+        LOG(INFO) << "Worker: received GID change event for "
+                  << context_.deviceName() << ", current GID is unchanged";
+    } else {
+        LOG(ERROR) << "Worker: failed to refresh published GID for "
+                   << context_.deviceName()
+                   << ", disconnecting endpoints to avoid stale GID reuse";
+    }
+    return result;
 }
 
 void WorkerPool::monitorWorker() {
