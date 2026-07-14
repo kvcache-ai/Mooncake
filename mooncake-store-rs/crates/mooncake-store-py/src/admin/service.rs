@@ -2727,7 +2727,11 @@ mod tests {
             let url = format!("redis://127.0.0.1:{port}/0");
             let deadline = Instant::now() + Duration::from_secs(5);
             while Instant::now() < deadline {
-                if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                if redis::Client::open(url.as_str())
+                    .ok()
+                    .and_then(|client| client.get_connection().ok())
+                    .is_some()
+                {
                     return Some(Self {
                         child,
                         url,

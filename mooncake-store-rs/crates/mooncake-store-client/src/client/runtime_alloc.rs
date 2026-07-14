@@ -715,7 +715,7 @@ impl StoreClient {
                 .collect::<Vec<_>>();
             return self.execute_pending_reclaims(hot, "flush_due_reclaims");
         }
-        self.execute_pending_reclaims(due.into(), "flush_due_reclaims")
+        self.execute_pending_reclaims(due, "flush_due_reclaims")
     }
 
     fn flush_all_reclaims(&self) -> Result<()> {
