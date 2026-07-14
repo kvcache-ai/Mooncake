@@ -57,7 +57,7 @@ environment setup must be prepared separately.
 | --- | --- | --- | --- |
 | NVIDIA CUDA / GPUDirect | `-DUSE_CUDA=ON` | Install CUDA 12.1+ and enable `nvidia-fs` for cuFile builds. | Add CUDA libraries to `LIBRARY_PATH` and `LD_LIBRARY_PATH`, for example `/usr/local/cuda/lib64`. |
 | NVIDIA NCCL DeviceTransport | `-DUSE_NCCL_DEVICE=ON` | Install NCCL 2.30.4+ with `nccl_device.h`. Requires CUDA. | Set `NCCL_ROOT` when NCCL is outside the standard search paths. NCCL Device API device code must be rebuilt or re-JITed with headers that exactly match the runtime `libnccl`. |
-| NVIDIA NCCL host RMA (WRITE only) | `-DUSE_NCCL_HOST=ON` | Install NCCL 2.30.4+ with `nccl_device.h`. Requires CUDA. | Set `NCCL_ROOT` when NCCL is outside the standard search paths. This backend supports Transfer Engine WRITE requests only because NCCL 2.30 has no public host Get operation. |
+| NVIDIA NCCL host RMA (WRITE only) | `-DUSE_NCCL_HOST=ON` | Install NCCL 2.30.4+. Requires CUDA. | Set `NCCL_ROOT` when NCCL is outside the standard search paths. Install NCCL as the only transport in a `TransferEngine(false)` instance before registering buffers. Peers must register matching buffer sizes in the same order. It has no multi-transport fallback and supports WRITE requests only because NCCL 2.30 has no public host Get operation. |
 | NVIDIA Multi-Node NVLink | `-DUSE_MNNVL=ON` | Requires CUDA. | Also set `-DUSE_CUDA=ON`. Not used with MUSA, HIP, or MACA builds. |
 | Moore Threads MUSA | `-DUSE_MUSA=ON` | Install MUSA SDK and `mthreads-peermem` for GPUDirect RDMA. | Add `/usr/local/musa/lib` to `LIBRARY_PATH` and `LD_LIBRARY_PATH`. |
 | Cambricon MLU | `-DUSE_MLU=ON` | Install Cambricon Neuware SDK. | Set `NEUWARE_HOME`, or pass `-DNEUWARE_ROOT=/path/to/neuware`. Use `-DMLU_INCLUDE_DIR` and `-DMLU_LIB_DIR` for custom layouts. |
@@ -143,7 +143,7 @@ The following options can be passed to `cmake ..`.
 | --- | --- | --- |
 | `-DUSE_CUDA=ON/OFF` | `OFF` | Enable GPU memory support, including GPUDirect RDMA, NVMe-oF, and GPU-aware TCP transport. Required when transferring GPU memory, even when using TCP. |
 | `-DUSE_NCCL_DEVICE=ON/OFF` | `OFF` | Enable the experimental NCCL DeviceTransport backend. Requires CUDA and NCCL 2.30.4+; AOT- and JIT-compiled NCCL device code must use headers that exactly match the runtime `libnccl`. |
-| `-DUSE_NCCL_HOST=ON/OFF` | `OFF` | Enable the experimental, WRITE-only NCCL host RMA transport. Requires CUDA and NCCL 2.30.4+. |
+| `-DUSE_NCCL_HOST=ON/OFF` | `OFF` | Enable the experimental, WRITE-only NCCL host RMA transport. Requires CUDA and NCCL 2.30.4+, must be installed before its buffers are registered, and must be the engine's only installed transport. |
 | `-DUSE_MNNVL=ON/OFF` | `OFF` | Enable Multi-Node NVLink transport. Requires `-DUSE_CUDA=ON`; not used with MUSA, HIP, or MACA builds. |
 | `-DUSE_MUSA=ON/OFF` | `OFF` | Enable Moore Threads GPU support via MUSA. |
 | `-DUSE_MACA=ON/OFF` | `OFF` | Enable MetaX (Muxi) GPU support via MACA. |

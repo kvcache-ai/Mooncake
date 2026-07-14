@@ -24,12 +24,17 @@ namespace mooncake {
 // Host-submitted NCCL RMA backend for the classic Transfer Engine API.
 // Native NCCL communicators and windows are intentionally private.
 //
-// Each peer pair must register the same number of CUDA VMM buffers, with
-// matching lengths, before its first transfer. Corresponding buffers become
-// one NCCL symmetric window; ncclMemAlloc is the supported allocation path.
+// Install the NCCL transport before registering its buffers so registration
+// order is retained.
+//
+// Each peer pair must register the same number of CUDA VMM buffers in the same
+// order, with matching lengths, before its first transfer. Corresponding
+// buffers become one NCCL symmetric window; ncclMemAlloc is the supported
+// allocation path. Both endpoints must remain available while the first
+// transfer initializes the peer session and its collective symmetric windows.
 // Only WRITE is supported; it uses ncclPutSignal. NCCL 2.30 has no public host
-// Get operation, so READ is rejected with Status::NotSupportedTransport before
-// communicator or window setup.
+// Get operation, so READ is rejected with Status::NotSupportedTransport
+// without submitting an NCCL operation.
 class NcclHostTransport final : public Transport {
    public:
     NcclHostTransport();

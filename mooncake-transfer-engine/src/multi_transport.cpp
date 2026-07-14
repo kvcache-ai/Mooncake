@@ -316,6 +316,14 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
 
 Transport* MultiTransport::installTransport(const std::string& proto,
                                             std::shared_ptr<Topology> topo) {
+#ifdef USE_NCCL_HOST
+    if ((proto == "nccl" && !transport_map_.empty()) ||
+        (proto != "nccl" && transport_map_.count("nccl") != 0)) {
+        LOG(ERROR) << "NCCL host transport must be the only transport "
+                      "installed in a Transfer Engine instance";
+        return nullptr;
+    }
+#endif
     Transport* transport = nullptr;
     if (std::string(proto) == "rdma") {
         transport = new RdmaTransport();
@@ -475,7 +483,6 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
     // priority instead of relying on buffer registration order.
     if (proto.find(',') != std::string::npos) {
         auto protocol_priority = [](const std::string& p) {
-            if (p == "nccl") return 5;
             // hip is intra-node GPU-IPC only. On a cross-node request a
             // hip+rdma segment must fall through to rdma; allow deployments
             // that know they need the cross-node path to de-prioritize hip.
@@ -495,7 +502,6 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
             isHipReachableTarget(target_segment_desc->name, local_server_name_);
         std::string chosen;
         int chosen_priority = -1;
-        bool skipped_nccl_read = false;
         for (const auto& buffer : target_segment_desc->buffers) {
             // CXL buffers locate via offset + cxl_base_addr; all other
             // protocols use the absolute virtual address in buffer.addr.
@@ -505,11 +511,6 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
                     : buffer.addr;
             if (entry.target_offset >= start &&
                 entry.target_offset < start + buffer.length) {
-                if (buffer.protocol == "nccl" &&
-                    entry.opcode != TransferRequest::WRITE) {
-                    skipped_nccl_read = true;
-                    continue;
-                }
                 if (buffer.protocol == "hip" && !hip_reachable) continue;
                 int priority = protocol_priority(buffer.protocol);
                 if (priority > chosen_priority) {
@@ -519,11 +520,6 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
             }
         }
         if (chosen.empty()) {
-            if (skipped_nccl_read) {
-                return Status::NotSupportedTransport(
-                    "NCCL host transport supports WRITE only and no "
-                    "READ-capable transport covers the target address");
-            }
             return Status::InvalidArgument(
                 "No matching buffer for target offset in multi-protocol "
                 "segment " +
@@ -574,12 +570,6 @@ Status MultiTransport::mp_selectTransport(const TransferRequest& entry,
     std::string item;
     while (std::getline(ss, item, ',')) {
         if (!item.empty()) protos.push_back(item);
-    }
-
-    if (preferred_proto == "nccl" && entry.opcode != TransferRequest::WRITE) {
-        return Status::NotSupportedTransport(
-            "NCCL host transport supports WRITE only; select a "
-            "READ-capable transport");
     }
 
     // hip GPU IPC cannot reach a remote host; downgrade an explicit hip

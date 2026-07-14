@@ -27,7 +27,6 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -54,7 +53,7 @@ class TransferMetadata {
         std::string name;
         uint64_t addr;
         uint64_t length;
-        int32_t device_id = -1;  // CUDA device for GPU-backed transports
+        int32_t device_id = -1;  // CUDA device for NCCL buffers
 #ifdef ENABLE_MULTI_PROTOCOL
         std::string protocol;  // for multi-protocol mode (cxl/tcp/rdma)
 #endif
@@ -140,8 +139,7 @@ class TransferMetadata {
     };
 
     struct HandShakeDesc {
-        std::string protocol;
-        std::string payload;
+        std::string payload;  // opaque transport-specific handshake data
         std::string local_nic_path;
         uint16_t local_lid = 0;
         std::string local_gid;
@@ -196,11 +194,6 @@ class TransferMetadata {
                              bool update_metadata);
 
     int removeLocalMemoryBuffer(void *addr, bool update_metadata);
-    int removeLocalMemoryBuffer(void *addr, const std::string &protocol,
-                                bool update_metadata);
-    int removeLocalMemoryBuffers(const std::vector<void *> &addr_list,
-                                 const std::string &protocol,
-                                 bool update_metadata);
 
     int addLocalSegment(SegmentID segment_id, const std::string &segment_name,
                         std::shared_ptr<SegmentDesc> &&desc);
@@ -221,18 +214,8 @@ class TransferMetadata {
 
     using OnReceiveHandShake = std::function<int(const HandShakeDesc &peer_desc,
                                                  HandShakeDesc &local_desc)>;
-    int updateDefaultHandshakeHandler(OnReceiveHandShake on_receive_handshake);
-    int startHandshakeDaemon(uint16_t listen_port, int sockfd);
-
-    // Backward-compatible convenience wrapper. New callers that need to
-    // replace the default handler should do so explicitly before starting the
-    // daemon.
     int startHandshakeDaemon(OnReceiveHandShake on_receive_handshake,
                              uint16_t listen_port, int sockfd);
-
-    int registerHandshakeHandler(const std::string &protocol,
-                                 OnReceiveHandShake on_receive_handshake);
-    int unregisterHandshakeHandler(const std::string &protocol);
 
     int sendHandshake(const std::string &peer_server_name,
                       const HandShakeDesc &local_desc,
@@ -262,7 +245,6 @@ class TransferMetadata {
     std::string common_key_prefix_;
     std::string rpc_meta_prefix_;
     // local cache
-    std::mutex local_segment_txn_mutex_;
     RWSpinlock segment_lock_;
     std::unordered_map<uint64_t, std::shared_ptr<SegmentDesc>>
         segment_id_to_desc_map_;
@@ -278,10 +260,6 @@ class TransferMetadata {
 
     std::shared_ptr<HandShakePlugin> handshake_plugin_;
     std::shared_ptr<MetadataStoragePlugin> storage_plugin_;
-    std::mutex handshake_handler_mutex_;
-    std::once_flag handshake_callbacks_once_;
-    std::unordered_map<std::string, OnReceiveHandShake> handshake_handlers_;
-    OnReceiveHandShake default_handshake_handler_;
 };
 
 }  // namespace mooncake

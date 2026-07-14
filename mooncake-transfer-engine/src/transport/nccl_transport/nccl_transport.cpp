@@ -22,7 +22,6 @@
 #include <json/json.h>
 #endif
 #include <nccl.h>
-#include <nccl_device.h>
 
 #include <algorithm>
 #include <array>
@@ -164,13 +163,17 @@ bool decodeBuffers(const Json::Value& value, int expected_device,
         if (error) *error = "NCCL buffer catalog is empty";
         return false;
     }
-    std::sort(decoded.begin(), decoded.end(),
+    // Preserve the sender's registration order: NCCL window registration is
+    // collective, so both ranks must pair corresponding buffers by the same
+    // index. Use a separate address-ordered copy only to validate overlap.
+    auto by_address = decoded;
+    std::sort(by_address.begin(), by_address.end(),
               [](const BufferInfo& lhs, const BufferInfo& rhs) {
                   return lhs.addr < rhs.addr;
               });
-    for (size_t i = 1; i < decoded.size(); ++i) {
-        const auto& previous = decoded[i - 1];
-        if (previous.addr + previous.length > decoded[i].addr) {
+    for (size_t i = 1; i < by_address.size(); ++i) {
+        const auto& previous = by_address[i - 1];
+        if (previous.addr + previous.length > by_address[i].addr) {
             if (error) *error = "NCCL buffer catalog contains overlap";
             return false;
         }
@@ -378,19 +381,6 @@ class NcclSession {
             return;
         }
 
-        ncclCommProperties_t properties = NCCL_COMM_PROPERTIES_INITIALIZER;
-        result = ncclCommQueryProperties(comm_, &properties);
-        if (result != ncclSuccess) {
-            setFailure(ncclError(result, "ncclCommQueryProperties"));
-            if (saved_device >= 0) cudaSetDevice(saved_device);
-            return;
-        }
-        if (!properties.hostRmaSupport) {
-            setFailure("NCCL communicator does not support host RMA");
-            if (saved_device >= 0) cudaSetDevice(saved_device);
-            return;
-        }
-
         cuda_result =
             cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking);
         if (cuda_result != cudaSuccess) {
@@ -507,10 +497,6 @@ class NcclHostTransport::Impl {
     explicit Impl(NcclHostTransport* owner) : owner_(owner) {}
 
     ~Impl() {
-        if (metadata_ && handshake_handler_registered_) {
-            metadata_->unregisterHandshakeHandler(kHandshakeProtocol);
-        }
-
         std::unordered_map<std::string, std::shared_ptr<NcclSession>> sessions;
         {
             std::lock_guard<std::mutex> lock(sessions_mutex_);
@@ -525,37 +511,19 @@ class NcclHostTransport::Impl {
         local_server_name_ = local_server_name;
         metadata_ = std::move(metadata);
 
-        auto old_segment = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
         auto segment = std::make_shared<SegmentDesc>();
-        if (!segment) return ERR_MEMORY;
-        if (old_segment) *segment = *old_segment;
         segment->name = local_server_name_;
-#ifdef ENABLE_MULTI_PROTOCOL
-        if (segment->protocol.empty()) {
-            segment->protocol = kHandshakeProtocol;
-        } else if (segment->protocol.find(kHandshakeProtocol) ==
-                   std::string::npos) {
-            segment->protocol += ",";
-            segment->protocol += kHandshakeProtocol;
-        }
-#else
         segment->protocol = kHandshakeProtocol;
-#endif
         int result = metadata_->addLocalSegment(
             LOCAL_SEGMENT_ID, local_server_name_, std::move(segment));
         if (result != 0) return result;
 
-        result = metadata_->registerHandshakeHandler(
-            kHandshakeProtocol,
+        result = metadata_->startHandshakeDaemon(
             [this](const HandShakeDesc& peer, HandShakeDesc& local) {
                 return onHandshake(peer, local);
-            });
-        if (result != 0) return result;
-        handshake_handler_registered_ = true;
-
-        result =
-            metadata_->startHandshakeDaemon(metadata_->localRpcMeta().rpc_port,
-                                            metadata_->localRpcMeta().sockfd);
+            },
+            metadata_->localRpcMeta().rpc_port,
+            metadata_->localRpcMeta().sockfd);
         if (result != 0) return result;
         return metadata_->updateLocalSegmentDesc();
     }
@@ -610,17 +578,40 @@ class NcclHostTransport::Impl {
                           "session catalog has been frozen";
             return ERR_INVALID_ARGUMENT;
         }
-        for (void* addr : addr_list) {
+        std::vector<BufferDesc> metadata_buffers;
+        metadata_buffers.reserve(addr_list.size());
+        for (size_t index = 0; index < addr_list.size(); ++index) {
+            void* addr = addr_list[index];
+            if (std::find(addr_list.begin(), addr_list.begin() + index, addr) !=
+                addr_list.begin() + index) {
+                return ERR_INVALID_ARGUMENT;
+            }
             auto it = std::find_if(local_buffers_.begin(), local_buffers_.end(),
                                    [addr](const BufferInfo& buffer) {
                                        return buffer.addr ==
                                               reinterpret_cast<uint64_t>(addr);
                                    });
             if (it == local_buffers_.end()) return ERR_ADDRESS_NOT_REGISTERED;
+            BufferDesc metadata_buffer;
+            if (!findMetadataBuffer(addr, &metadata_buffer)) {
+                return ERR_ADDRESS_NOT_REGISTERED;
+            }
+            metadata_buffers.push_back(std::move(metadata_buffer));
         }
-        int result = metadata_->removeLocalMemoryBuffers(
-            addr_list, kHandshakeProtocol, true);
-        if (result != 0) return result;
+        size_t removed = 0;
+        for (; removed < addr_list.size(); ++removed) {
+            void* addr = addr_list[removed];
+            int result = metadata_->removeLocalMemoryBuffer(addr, false);
+            if (result != 0) {
+                restoreMetadataBuffers(metadata_buffers, removed);
+                return result;
+            }
+        }
+        int result = metadata_->updateLocalSegmentDesc();
+        if (result != 0) {
+            restoreMetadataBuffers(metadata_buffers, metadata_buffers.size());
+            return result;
+        }
         for (void* addr : addr_list) {
             local_buffers_.erase(
                 std::remove_if(local_buffers_.begin(), local_buffers_.end(),
@@ -782,6 +773,32 @@ class NcclHostTransport::Impl {
     }
 
    private:
+    bool findMetadataBuffer(void* addr, BufferDesc* result) const {
+        if (!result) return false;
+        auto segment = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+        if (!segment) return false;
+        auto it = std::find_if(
+            segment->buffers.begin(), segment->buffers.end(),
+            [addr](const BufferDesc& buffer) {
+                return buffer.addr == reinterpret_cast<uint64_t>(addr);
+            });
+        if (it == segment->buffers.end()) return false;
+        *result = *it;
+        return true;
+    }
+
+    void restoreMetadataBuffers(const std::vector<BufferDesc>& buffers,
+                                size_t count) {
+        for (size_t index = 0; index < count; ++index) {
+            int result = metadata_->addLocalMemoryBuffer(buffers[index], false);
+            if (result != 0) {
+                LOG(ERROR) << "[Host NCCL] failed to restore metadata buffer "
+                           << reinterpret_cast<void*>(buffers[index].addr)
+                           << ": " << result;
+            }
+        }
+    }
+
     // buffers_mutex_ must be held across each complete catalog mutation so the
     // first session cannot snapshot a partially committed registration.
     int registerMemoryLocked(void* addr, size_t length,
@@ -823,16 +840,10 @@ class NcclHostTransport::Impl {
         desc.addr = info.addr;
         desc.length = info.length;
         desc.device_id = info.device_id;
-#ifdef ENABLE_MULTI_PROTOCOL
-        desc.protocol = kHandshakeProtocol;
-#endif
         int result = metadata_->addLocalMemoryBuffer(desc, update_metadata);
         if (result != 0) {
-            // addLocalMemoryBuffer preserves the legacy local-first behavior
-            // used by other transports. Roll back NCCL's protocol-specific
-            // descriptor when publication fails so both local catalogs agree.
-            int rollback_result = metadata_->removeLocalMemoryBuffer(
-                addr, kHandshakeProtocol, false);
+            int rollback_result =
+                metadata_->removeLocalMemoryBuffer(addr, false);
             if (rollback_result != 0 &&
                 rollback_result != ERR_ADDRESS_NOT_REGISTERED) {
                 LOG(ERROR) << "[Host NCCL] failed to roll back metadata for "
@@ -863,9 +874,17 @@ class NcclHostTransport::Impl {
                                });
         if (it == local_buffers_.end()) return ERR_ADDRESS_NOT_REGISTERED;
 
-        int result = metadata_->removeLocalMemoryBuffer(
-            addr, kHandshakeProtocol, update_metadata);
-        if (result != 0) return result;
+        BufferDesc metadata_buffer;
+        if (!findMetadataBuffer(addr, &metadata_buffer)) {
+            return ERR_ADDRESS_NOT_REGISTERED;
+        }
+        int result = metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+        if (result != 0) {
+            if (update_metadata) {
+                restoreMetadataBuffers({metadata_buffer}, 1);
+            }
+            return result;
+        }
         local_buffers_.erase(it);
         return 0;
     }
@@ -883,10 +902,9 @@ class NcclHostTransport::Impl {
         // flag. The first session therefore snapshots a complete, immutable
         // catalog instead of racing a buffer mutation between two locks.
         buffers_frozen_ = true;
-        std::sort(snapshot.begin(), snapshot.end(),
-                  [](const BufferInfo& lhs, const BufferInfo& rhs) {
-                      return lhs.addr < rhs.addr;
-                  });
+        // Keep registration order so collective window index i represents the
+        // same logical buffer on both ranks even when their virtual addresses
+        // differ.
         *result = std::move(snapshot);
         return true;
     }
@@ -909,12 +927,6 @@ class NcclHostTransport::Impl {
     bool findRemoteBuffer(const SegmentDesc& segment, uint64_t addr,
                           size_t length, BufferInfo* result) const {
         for (const auto& buffer : segment.buffers) {
-#ifdef ENABLE_MULTI_PROTOCOL
-            if (!buffer.protocol.empty() &&
-                buffer.protocol != kHandshakeProtocol) {
-                continue;
-            }
-#endif
             BufferInfo info{buffer.addr, buffer.length, buffer.device_id};
             if (info.device_id >= 0 && containsRange(info, addr, length)) {
                 if (result) *result = info;
@@ -1005,7 +1017,6 @@ class NcclHostTransport::Impl {
         request["buffers"] = encodeBuffers(local_buffers);
 
         HandShakeDesc local_desc;
-        local_desc.protocol = kHandshakeProtocol;
         local_desc.payload = encodeJson(request);
         HandShakeDesc peer_desc;
         int result = metadata_->sendHandshake(peer_name, local_desc, peer_desc);
@@ -1064,7 +1075,6 @@ class NcclHostTransport::Impl {
     }
 
     int onHandshake(const HandShakeDesc& peer_desc, HandShakeDesc& local_desc) {
-        local_desc.protocol = kHandshakeProtocol;
         Json::Value request;
         std::string error;
         if (!decodeJson(peer_desc.payload, &request, &error)) {
@@ -1183,7 +1193,6 @@ class NcclHostTransport::Impl {
     std::mutex sessions_mutex_;
     std::unordered_map<std::string, std::shared_ptr<NcclSession>> sessions_;
     std::unordered_map<std::string, std::string> bootstrap_ids_;
-    bool handshake_handler_registered_ = false;
 };
 
 NcclHostTransport::NcclHostTransport() : impl_(std::make_unique<Impl>(this)) {}

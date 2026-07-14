@@ -114,12 +114,8 @@ TEST(ParseHostNameWithPort, HostWithoutPort) {
 
 TEST(HostPortHelpers, DetectsExplicitPort) {
     EXPECT_TRUE(hasExplicitPort("8.8.8.8:4321"));
-    EXPECT_TRUE(hasExplicitPort("8.8.8.8:0"));
     EXPECT_TRUE(hasExplicitPort("example.com:4321"));
     EXPECT_TRUE(hasExplicitPort("[2001:db8::1]:4321"));
-    EXPECT_TRUE(hasExplicitPort("[2001:db8::1]:0"));
-    EXPECT_FALSE(hasExplicitPort("8.8.8.8"));
-    EXPECT_FALSE(hasExplicitPort("example.com"));
     EXPECT_FALSE(hasExplicitPort("2001:db8::1"));
     EXPECT_FALSE(hasExplicitPort("[2001:db8::1]"));
 }

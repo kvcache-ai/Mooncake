@@ -138,19 +138,10 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 #endif
         if (metadata_conn_string == P2PHANDSHAKE) {
             rpc_binding_method = "P2P handshake";
-            // Preserve the legacy dynamic-port behavior for callers that pass
-            // only a host name.  The parser supplies the default handshake
-            // port for those callers, but that port was not explicitly
-            // requested and cannot be shared by multiple local processes.
-            // Explicit non-zero ports are honored so independently launched
-            // peers can advertise predictable endpoints.
-            if (!hasExplicitPort(local_server_name) || port == 0) {
-                desc.rpc_port = findAvailableTcpPort(desc.sockfd);
-                if (desc.rpc_port == 0) {
-                    LOG(ERROR)
-                        << "P2P: No valid port found for local TCP service.";
-                    return -1;
-                }
+            desc.rpc_port = findAvailableTcpPort(desc.sockfd);
+            if (desc.rpc_port == 0) {
+                LOG(ERROR) << "P2P: No valid port found for local TCP service.";
+                return -1;
             }
 #if defined(USE_ASCEND)
             // The current version of Ascend Transport does not support IPv6,
@@ -444,6 +435,13 @@ Transport* TransferEngineImpl::installTransport(const std::string& proto,
         LOG(WARNING) << "Transport " << proto << " already installed";
         return transport;
     }
+#ifdef USE_NCCL_HOST
+    if (proto == "nccl" && !local_memory_regions_.empty()) {
+        LOG(ERROR) << "Install NCCL before registering local memory so peer "
+                      "buffer order remains deterministic";
+        return nullptr;
+    }
+#endif
 
     if (args != nullptr && args[0] != nullptr) {
         const std::string nic_priority_matrix = static_cast<char*>(args[0]);
