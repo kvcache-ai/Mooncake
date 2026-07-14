@@ -1080,10 +1080,9 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
                             "deserialize local_disk_segments legacy "
                             "offloading size is not integer"));
                     }
-                    auto [tenant_id, user_key] =
-                        ParseTenantScopedStorageKey(key);
+                    auto [tenant_id, user_key] = TenantId::ParseScopedKey(key);
                     segment->offloading_objects[key] =
-                        OffloadTaskItem{.tenant_id = std::move(tenant_id),
+                        OffloadTaskItem{.tenant_id = tenant_id.value(),
                                         .key = std::move(user_key),
                                         .size = task_obj.as<int64_t>()};
                 }

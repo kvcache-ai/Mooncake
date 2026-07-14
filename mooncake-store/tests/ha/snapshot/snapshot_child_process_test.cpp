@@ -206,7 +206,7 @@ class SnapshotChildProcessTest : public ::testing::Test {
         size_t shard_idx = svc->getShardIndex(key);
         auto& shard = svc->metadata_shards_[shard_idx];
         SharedMutexLocker lock(&shard.mutex, shared_lock_t{});
-        auto tenant_it = shard.tenants.find("default");
+        auto tenant_it = shard.tenants.find(TenantId::Default());
         return tenant_it != shard.tenants.end() &&
                tenant_it->second.metadata.find(key) !=
                    tenant_it->second.metadata.end();

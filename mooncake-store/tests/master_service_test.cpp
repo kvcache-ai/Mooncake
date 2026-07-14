@@ -322,22 +322,22 @@ class MasterServiceTest : public ::testing::Test {
 
 TEST(TenantScopedStorageKeyTest, RoundTripsAndParsesLegacyKeys) {
     const auto scoped =
-        MakeTenantScopedStorageKey("tenant:with:colon", "path/key:with:colon");
+        TenantId("tenant:with:colon").MakeScopedKey("path/key:with:colon");
     EXPECT_NE(scoped.find('\0'), std::string::npos);
 
-    auto [tenant_id, key] = ParseTenantScopedStorageKey(scoped);
-    EXPECT_EQ(tenant_id, "tenant:with:colon");
+    auto [tenant_id, key] = TenantId::ParseScopedKey(scoped);
+    EXPECT_EQ(tenant_id.value(), "tenant:with:colon");
     EXPECT_EQ(key, "path/key:with:colon");
 
-    auto [default_tenant, default_key] = ParseTenantScopedStorageKey("raw_key");
-    EXPECT_EQ(default_tenant, "default");
+    auto [default_tenant, default_key] = TenantId::ParseScopedKey("raw_key");
+    EXPECT_EQ(default_tenant.value(), "default");
     EXPECT_EQ(default_key, "raw_key");
 
     std::string legacy = "legacy_tenant";
     legacy.push_back('\0');
     legacy.append("legacy_key");
-    auto [legacy_tenant, legacy_key] = ParseTenantScopedStorageKey(legacy);
-    EXPECT_EQ(legacy_tenant, "legacy_tenant");
+    auto [legacy_tenant, legacy_key] = TenantId::ParseScopedKey(legacy);
+    EXPECT_EQ(legacy_tenant.value(), "legacy_tenant");
     EXPECT_EQ(legacy_key, "legacy_key");
 }
 

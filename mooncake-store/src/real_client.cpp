@@ -5618,10 +5618,10 @@ RealClient::batch_get_into_offload_object_internal(
     std::vector<std::string> keys;
     std::vector<std::string> storage_keys;
     std::vector<int64_t> sizes;
+    const TenantId tenant_id(client_->tenant_id());
     for (const auto &object_it : objects) {
         keys.emplace_back(object_it.first);
-        storage_keys.emplace_back(
-            MakeTenantScopedStorageKey(client_->tenant_id(), object_it.first));
+        storage_keys.emplace_back(tenant_id.MakeScopedKey(object_it.first));
         int64_t total = 0;
         for (const auto &s : object_it.second) total += s.size;
         sizes.emplace_back(total);

@@ -23,10 +23,10 @@ std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
     std::vector<OffloadTaskItem> tasks;
     tasks.reserve(storage_keys.size());
     for (size_t i = 0; i < storage_keys.size(); ++i) {
-        auto [tenant_id, key] = ParseTenantScopedStorageKey(storage_keys[i]);
+        auto [tenant_id, key] = TenantId::ParseScopedKey(storage_keys[i]);
         const int64_t size =
             i < metadatas.size() ? metadatas[i].data_size : int64_t{0};
-        tasks.push_back(OffloadTaskItem{.tenant_id = std::move(tenant_id),
+        tasks.push_back(OffloadTaskItem{.tenant_id = tenant_id.value(),
                                         .key = std::move(key),
                                         .size = size});
     }
@@ -369,7 +369,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     task_by_storage_key.reserve(offloading_objects.size());
     for (const auto& task : offloading_objects) {
         const auto storage_key =
-            MakeTenantScopedStorageKey(task.tenant_id, task.key);
+            TenantId(task.tenant_id).MakeScopedKey(task.key);
         storage_object_sizes.emplace(storage_key, task.size);
         task_by_storage_key.emplace(storage_key, task);
     }
@@ -468,16 +468,15 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         auto eviction_handler = [this](const std::vector<std::string>&
                                            evicted_keys) {
             if (evicted_keys.empty()) return;
-            std::unordered_map<std::string, std::vector<std::string>>
+            std::unordered_map<TenantId, std::vector<std::string>, TenantIdHash>
                 keys_by_tenant;
             for (const auto& storage_key : evicted_keys) {
-                auto [tenant_id, key] =
-                    ParseTenantScopedStorageKey(storage_key);
+                auto [tenant_id, key] = TenantId::ParseScopedKey(storage_key);
                 keys_by_tenant[tenant_id].push_back(key);
             }
             for (const auto& [tenant_id, keys] : keys_by_tenant) {
                 auto results = client_->BatchEvictDiskReplica(
-                    keys, tenant_id, ReplicaType::LOCAL_DISK);
+                    keys, tenant_id.value(), ReplicaType::LOCAL_DISK);
                 for (size_t i = 0; i < results.size(); ++i) {
                     if (!results[i]) {
                         LOG(WARNING)
@@ -765,7 +764,7 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
         const auto& key = task.key;
         const auto& tenant_id = task.tenant_id;
         const int64_t size = task.size;
-        const auto storage_key = MakeTenantScopedStorageKey(tenant_id, key);
+        const auto storage_key = TenantId(tenant_id).MakeScopedKey(key);
         if (size <= 0) {
             LOG(WARNING) << "Skipping promotion for key=" << key
                          << " with non-positive size=" << size;

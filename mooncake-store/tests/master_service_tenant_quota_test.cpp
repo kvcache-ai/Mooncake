@@ -233,7 +233,7 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
 
     tl::expected<void, ErrorCode> ReserveTenantQuotaForTest(
         MasterService& service, const std::string& tenant_id, uint64_t bytes) {
-        return service.ReserveTenantQuota(tenant_id, bytes);
+        return service.ReserveTenantQuota(TenantId(tenant_id), bytes);
     }
 
     std::unique_lock<std::shared_mutex> LockSnapshotForTest(

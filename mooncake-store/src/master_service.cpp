@@ -146,10 +146,10 @@ void RefreshTenantQuotaOverQuota(TenantQuotaState& state) {
             state.effective_quota_bytes;
 }
 
-TenantQuotaSnapshot MakeTenantQuotaSnapshot(const std::string& tenant_id,
+TenantQuotaSnapshot MakeTenantQuotaSnapshot(const TenantId& tenant_id,
                                             const TenantQuotaState& state) {
     return TenantQuotaSnapshot{
-        .tenant_id = tenant_id,
+        .tenant_id = tenant_id.value(),
         .requested_quota_bytes = state.requested_quota_bytes,
         .effective_quota_bytes = state.effective_quota_bytes,
         .used_bytes = state.used_bytes,
@@ -626,7 +626,7 @@ std::optional<uint32_t> MasterService::GetNoFHeartbeatFailureCountForTesting(
 std::optional<TenantQuotaSnapshot>
 MasterService::GetTenantQuotaSnapshotForTesting(
     const std::string& tenant_id) const {
-    const auto& normalized_tenant = NormalizeTenantIdRef(tenant_id);
+    const TenantId normalized_tenant(tenant_id);
     const auto shard_idx = getTenantQuotaShardIndex(normalized_tenant);
     const auto& shard = tenant_quota_shards_[shard_idx];
     std::lock_guard<std::mutex> lock(shard.mutex);
@@ -679,14 +679,14 @@ MasterService::UpsertTenantQuotaPolicy(const std::string& tenant_id,
     if (tenant_id.empty()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    const auto& normalized_tenant = NormalizeTenantIdRef(tenant_id);
-    if (!IsValidTenantId(normalized_tenant)) {
+    const TenantId normalized_tenant(tenant_id);
+    if (!normalized_tenant.IsValid()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     std::lock_guard<std::mutex> policy_lock(tenant_quota_policy_mutex_);
     auto policy = BuildTenantQuotaPolicySnapshot();
-    policy.tenant_quotas[normalized_tenant] = requested_quota_bytes;
+    policy.tenant_quotas[normalized_tenant.value()] = requested_quota_bytes;
     auto save_result = tenant_quota_policy_store_->Save(policy);
     if (!save_result) {
         LOG(ERROR) << "failed to save tenant quota policy: "
@@ -694,7 +694,7 @@ MasterService::UpsertTenantQuotaPolicy(const std::string& tenant_id,
         return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
     }
     ApplyTenantQuotaPolicies(policy);
-    auto result_snapshot = GetTenantQuotaSnapshot(normalized_tenant);
+    auto result_snapshot = GetTenantQuotaSnapshot(normalized_tenant.value());
     if (!result_snapshot.has_value()) {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
@@ -710,14 +710,14 @@ MasterService::DeleteTenantQuotaPolicy(const std::string& tenant_id) {
     if (tenant_id.empty()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    const auto& normalized_tenant = NormalizeTenantIdRef(tenant_id);
-    if (!IsValidTenantId(normalized_tenant)) {
+    const TenantId normalized_tenant(tenant_id);
+    if (!normalized_tenant.IsValid()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     std::lock_guard<std::mutex> policy_lock(tenant_quota_policy_mutex_);
     auto policy = BuildTenantQuotaPolicySnapshot();
-    auto policy_it = policy.tenant_quotas.find(normalized_tenant);
+    auto policy_it = policy.tenant_quotas.find(normalized_tenant.value());
     if (policy_it == policy.tenant_quotas.end()) {
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
@@ -756,7 +756,7 @@ MasterService::DeleteTenantQuotaPolicy(const std::string& tenant_id) {
         RefreshTenantQuotaOverQuota(state);
     }
 
-    auto post_mark_snapshot = GetTenantQuotaSnapshot(normalized_tenant);
+    auto post_mark_snapshot = GetTenantQuotaSnapshot(normalized_tenant.value());
     if (TenantHasObjects(normalized_tenant) ||
         (post_mark_snapshot.has_value() &&
          (post_mark_snapshot->used_bytes != 0 ||
@@ -776,7 +776,7 @@ MasterService::DeleteTenantQuotaPolicy(const std::string& tenant_id) {
         return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
     }
     ApplyTenantQuotaPolicies(policy);
-    return GetTenantQuotaSnapshot(normalized_tenant);
+    return GetTenantQuotaSnapshot(normalized_tenant.value());
 }
 
 auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
@@ -963,69 +963,64 @@ std::string MasterService::GetClientHostId(const UUID& client_id) const {
     return it == client_host_id_.end() ? std::string() : it->second;
 }
 
-size_t MasterService::getMetadataShardIndex(const std::string& tenant_id,
+size_t MasterService::getMetadataShardIndex(const TenantId& tenant_id,
                                             const std::string& key) const {
-    const auto& normalized_tenant = NormalizeTenantIdRef(tenant_id);
     std::shared_lock<std::shared_mutex> lock(group_routing_mutex_);
-    auto it =
-        object_group_ids_.find(MakeTenantScopedKey(normalized_tenant, key));
+    auto it = object_group_ids_.find(tenant_id.MakeScopedKey(key));
     if (it == object_group_ids_.end()) {
-        return getShardIndex(normalized_tenant, key);
+        return getShardIndex(tenant_id, key);
     }
     return getShardIndex(it->second);
 }
 
 size_t MasterService::getTenantQuotaShardIndex(
-    const std::string& tenant_id) const {
-    return std::hash<std::string>{}(NormalizeTenantId(tenant_id)) %
-           kNumTenantQuotaShards;
+    const TenantId& tenant_id) const {
+    return TenantIdHash{}(tenant_id) % kNumTenantQuotaShards;
 }
 
-std::string MasterService::NormalizeRequestTenantId(
-    const std::string& tenant_id) const {
+TenantId MasterService::ResolveRequestTenantId(
+    std::string_view tenant_id) const {
     if (!enable_multi_tenants_) {
-        return "default";
+        return TenantId::Default();
     }
-    return NormalizeTenantId(tenant_id);
+    return TenantId(std::string(tenant_id));
 }
 
 MasterService::ObjectIdentity MasterService::MakeObjectIdentityForRequest(
     const std::string& user_key, const std::string& tenant_id) const {
-    return {NormalizeRequestTenantId(tenant_id), user_key};
+    return {ResolveRequestTenantId(tenant_id), user_key};
 }
 
-bool MasterService::IsTenantRegistered(const std::string& tenant_id) const {
+bool MasterService::IsTenantRegistered(const TenantId& tenant_id) const {
     if (!enable_multi_tenants_) {
         return true;
     }
-    const auto& normalized_tenant = NormalizeTenantIdRef(tenant_id);
     const auto& shard =
-        tenant_quota_shards_[getTenantQuotaShardIndex(normalized_tenant)];
+        tenant_quota_shards_[getTenantQuotaShardIndex(tenant_id)];
     std::lock_guard<std::mutex> lock(shard.mutex);
-    auto it = shard.tenants.find(normalized_tenant);
+    auto it = shard.tenants.find(tenant_id);
     return it != shard.tenants.end() && it->second.has_explicit_policy;
 }
 
-tl::expected<std::string, ErrorCode> MasterService::NormalizeTenantIdForWrite(
-    const std::string& tenant_id) const {
+tl::expected<TenantId, ErrorCode> MasterService::ResolveTenantIdForWrite(
+    std::string_view tenant_id) const {
     if (!enable_multi_tenants_) {
-        return std::string("default");
+        return TenantId::Default();
     }
     std::lock_guard<std::mutex> policy_lock(tenant_quota_policy_mutex_);
-    return NormalizeTenantIdForWriteLocked(tenant_id);
+    return ResolveTenantIdForWriteLocked(tenant_id);
 }
 
-tl::expected<std::string, ErrorCode>
-MasterService::NormalizeTenantIdForWriteLocked(
-    const std::string& tenant_id) const {
+tl::expected<TenantId, ErrorCode> MasterService::ResolveTenantIdForWriteLocked(
+    std::string_view tenant_id) const {
     if (!enable_multi_tenants_) {
-        return std::string("default");
+        return TenantId::Default();
     }
     if (tenant_id.empty()) {
         return tl::make_unexpected(ErrorCode::TENANT_NOT_REGISTERED);
     }
-    const auto& normalized_tenant = NormalizeTenantIdRef(tenant_id);
-    if (!IsValidTenantId(normalized_tenant)) {
+    const TenantId normalized_tenant{std::string(tenant_id)};
+    if (!normalized_tenant.IsValid()) {
         return tl::make_unexpected(ErrorCode::TENANT_NOT_REGISTERED);
     }
     if (!IsTenantRegistered(normalized_tenant)) {
@@ -1034,11 +1029,10 @@ MasterService::NormalizeTenantIdForWriteLocked(
     return normalized_tenant;
 }
 
-bool MasterService::TenantHasObjects(const std::string& tenant_id) const {
-    const auto& normalized_tenant = NormalizeTenantIdRef(tenant_id);
+bool MasterService::TenantHasObjects(const TenantId& tenant_id) const {
     for (size_t i = 0; i < kNumShards; ++i) {
         MetadataShardAccessorRO shard(this, i);
-        auto tenant_it = shard->tenants.find(normalized_tenant);
+        auto tenant_it = shard->tenants.find(tenant_id);
         if (tenant_it != shard->tenants.end() &&
             !tenant_it->second.metadata.empty()) {
             return true;
@@ -1055,7 +1049,8 @@ TenantQuotaPolicySnapshot MasterService::BuildTenantQuotaPolicySnapshot()
         std::lock_guard<std::mutex> lock(shard.mutex);
         for (const auto& [tenant_id, state] : shard.tenants) {
             if (state.has_explicit_policy) {
-                snapshot.tenant_quotas[tenant_id] = state.requested_quota_bytes;
+                snapshot.tenant_quotas[tenant_id.value()] =
+                    state.requested_quota_bytes;
             }
         }
     }
@@ -1064,20 +1059,22 @@ TenantQuotaPolicySnapshot MasterService::BuildTenantQuotaPolicySnapshot()
 
 void MasterService::ApplyTenantQuotaPolicies(
     const TenantQuotaPolicySnapshot& snapshot) {
-    std::array<std::vector<std::pair<std::string, uint64_t>>,
+    std::array<std::vector<std::pair<TenantId, uint64_t>>,
                kNumTenantQuotaShards>
         grouped_quotas;
     for (const auto& [tenant_id, requested_quota_bytes] :
          snapshot.tenant_quotas) {
-        grouped_quotas[getTenantQuotaShardIndex(tenant_id)].emplace_back(
-            tenant_id, requested_quota_bytes);
+        TenantId canonical_tenant(tenant_id);
+        grouped_quotas[getTenantQuotaShardIndex(canonical_tenant)].emplace_back(
+            std::move(canonical_tenant), requested_quota_bytes);
     }
 
     for (size_t i = 0; i < kNumTenantQuotaShards; ++i) {
         auto& shard = tenant_quota_shards_[i];
         std::lock_guard<std::mutex> lock(shard.mutex);
         for (auto it = shard.tenants.begin(); it != shard.tenants.end();) {
-            const auto policy_it = snapshot.tenant_quotas.find(it->first);
+            const auto policy_it =
+                snapshot.tenant_quotas.find(it->first.value());
             auto& state = it->second;
             if (policy_it != snapshot.tenant_quotas.end()) {
                 state.requested_quota_bytes = policy_it->second;
@@ -1153,13 +1150,12 @@ bool MasterService::ShouldProtectZeroChargeMetadataCreate(
 }
 
 uint64_t MasterService::ComputeTenantQuotaDeficit(
-    const std::string& tenant_id, uint64_t incoming_quota_charge) {
+    const TenantId& tenant_id, uint64_t incoming_quota_charge) {
     uint64_t deficit = incoming_quota_charge;
-    const auto& normalized_tenant = NormalizeTenantIdRef(tenant_id);
     auto& quota_shard =
-        tenant_quota_shards_[getTenantQuotaShardIndex(normalized_tenant)];
+        tenant_quota_shards_[getTenantQuotaShardIndex(tenant_id)];
     std::lock_guard<std::mutex> lock(quota_shard.mutex);
-    auto quota_it = quota_shard.tenants.find(normalized_tenant);
+    auto quota_it = quota_shard.tenants.find(tenant_id);
     if (quota_it == quota_shard.tenants.end()) {
         return deficit;
     }
@@ -1205,7 +1201,7 @@ void MasterService::RecomputeTenantEffectiveQuotas() {
     std::lock_guard<std::mutex> recompute_lock(tenant_quota_recompute_mutex_);
     const uint64_t capacity = GetTenantQuotaAllocatableCapacityBytes();
 
-    std::map<std::string, TenantQuotaState> active_tenants;
+    std::map<TenantId, TenantQuotaState> active_tenants;
     for (size_t i = 0; i < kNumTenantQuotaShards; ++i) {
         auto& shard = tenant_quota_shards_[i];
         std::lock_guard<std::mutex> lock(shard.mutex);
@@ -1242,22 +1238,20 @@ void MasterService::RecomputeTenantEffectiveQuotas() {
 }
 
 tl::expected<void, ErrorCode> MasterService::ReserveTenantQuota(
-    const std::string& tenant_id, uint64_t bytes) {
+    const TenantId& tenant_id, uint64_t bytes) {
     if (!enable_multi_tenants_) {
         return {};
     }
-    const auto& normalized_tenant = NormalizeTenantIdRef(tenant_id);
     auto exceeds_effective_quota = [](const TenantQuotaState& state,
                                       uint64_t additional_bytes) {
         return static_cast<unsigned __int128>(state.used_bytes) +
                    state.reserved_bytes + additional_bytes >
                state.effective_quota_bytes;
     };
-    auto& shard =
-        tenant_quota_shards_[getTenantQuotaShardIndex(normalized_tenant)];
+    auto& shard = tenant_quota_shards_[getTenantQuotaShardIndex(tenant_id)];
     {
         std::lock_guard<std::mutex> lock(shard.mutex);
-        auto it = shard.tenants.find(normalized_tenant);
+        auto it = shard.tenants.find(tenant_id);
         if (it == shard.tenants.end() || !it->second.has_explicit_policy) {
             return tl::make_unexpected(ErrorCode::TENANT_NOT_REGISTERED);
         }
@@ -1276,26 +1270,24 @@ tl::expected<void, ErrorCode> MasterService::ReserveTenantQuota(
     }
 }
 
-void MasterService::CommitTenantQuota(const std::string& tenant_id,
+void MasterService::CommitTenantQuota(const TenantId& tenant_id,
                                       uint64_t bytes) {
     if (!enable_multi_tenants_ || bytes == 0) {
         return;
     }
-    const auto& normalized_tenant = NormalizeTenantIdRef(tenant_id);
-    auto& shard =
-        tenant_quota_shards_[getTenantQuotaShardIndex(normalized_tenant)];
+    auto& shard = tenant_quota_shards_[getTenantQuotaShardIndex(tenant_id)];
     std::lock_guard<std::mutex> lock(shard.mutex);
-    auto it = shard.tenants.find(normalized_tenant);
+    auto it = shard.tenants.find(tenant_id);
     if (it == shard.tenants.end()) {
         LOG(ERROR) << "tenant quota commit mismatch tenant="
-                   << normalized_tenant << ", bytes=" << bytes
+                   << tenant_id.value() << ", bytes=" << bytes
                    << ", reserved=0";
         return;
     }
     auto& state = it->second;
     if (state.reserved_bytes < bytes) {
         LOG(ERROR) << "tenant quota commit mismatch tenant="
-                   << normalized_tenant << ", bytes=" << bytes
+                   << tenant_id.value() << ", bytes=" << bytes
                    << ", reserved=" << state.reserved_bytes;
         return;
     }
@@ -1309,28 +1301,26 @@ void MasterService::CommitTenantQuota(const std::string& tenant_id,
     RefreshTenantQuotaOverQuota(state);
 }
 
-void MasterService::AbortTenantQuota(const std::string& tenant_id,
+void MasterService::AbortTenantQuota(const TenantId& tenant_id,
                                      uint64_t bytes) {
     if (!enable_multi_tenants_ || bytes == 0) {
         return;
     }
-    const auto& normalized_tenant = NormalizeTenantIdRef(tenant_id);
-    auto& shard =
-        tenant_quota_shards_[getTenantQuotaShardIndex(normalized_tenant)];
+    auto& shard = tenant_quota_shards_[getTenantQuotaShardIndex(tenant_id)];
     bool recompute_needed = false;
     {
         std::lock_guard<std::mutex> lock(shard.mutex);
-        auto it = shard.tenants.find(normalized_tenant);
+        auto it = shard.tenants.find(tenant_id);
         if (it == shard.tenants.end()) {
             LOG(ERROR) << "tenant quota abort mismatch tenant="
-                       << normalized_tenant << ", bytes=" << bytes
+                       << tenant_id.value() << ", bytes=" << bytes
                        << ", reserved=0";
             return;
         }
         auto& state = it->second;
         if (state.reserved_bytes < bytes) {
             LOG(ERROR) << "tenant quota abort mismatch tenant="
-                       << normalized_tenant << ", bytes=" << bytes
+                       << tenant_id.value() << ", bytes=" << bytes
                        << ", reserved=" << state.reserved_bytes;
             return;
         }
@@ -1347,28 +1337,26 @@ void MasterService::AbortTenantQuota(const std::string& tenant_id,
     }
 }
 
-void MasterService::ReleaseTenantQuota(const std::string& tenant_id,
+void MasterService::ReleaseTenantQuota(const TenantId& tenant_id,
                                        uint64_t bytes) {
     if (!enable_multi_tenants_ || bytes == 0) {
         return;
     }
-    const auto& normalized_tenant = NormalizeTenantIdRef(tenant_id);
-    auto& shard =
-        tenant_quota_shards_[getTenantQuotaShardIndex(normalized_tenant)];
+    auto& shard = tenant_quota_shards_[getTenantQuotaShardIndex(tenant_id)];
     bool recompute_needed = false;
     {
         std::lock_guard<std::mutex> lock(shard.mutex);
-        auto it = shard.tenants.find(normalized_tenant);
+        auto it = shard.tenants.find(tenant_id);
         if (it == shard.tenants.end()) {
             LOG(ERROR) << "tenant quota release mismatch tenant="
-                       << normalized_tenant << ", bytes=" << bytes
+                       << tenant_id.value() << ", bytes=" << bytes
                        << ", used=0";
             return;
         }
         auto& state = it->second;
         if (state.used_bytes < bytes) {
             LOG(ERROR) << "tenant quota release mismatch tenant="
-                       << normalized_tenant << ", bytes=" << bytes
+                       << tenant_id.value() << ", bytes=" << bytes
                        << ", used=" << state.used_bytes;
             return;
         }
@@ -1388,25 +1376,23 @@ void MasterService::ReleaseTenantQuota(const std::string& tenant_id,
     }
 }
 
-void MasterService::ReleaseTenantQuotaPartial(const std::string& tenant_id,
+void MasterService::ReleaseTenantQuotaPartial(const TenantId& tenant_id,
                                               uint64_t bytes) {
     if (!enable_multi_tenants_ || bytes == 0) {
         return;
     }
-    const auto& normalized_tenant = NormalizeTenantIdRef(tenant_id);
-    auto& shard =
-        tenant_quota_shards_[getTenantQuotaShardIndex(normalized_tenant)];
+    auto& shard = tenant_quota_shards_[getTenantQuotaShardIndex(tenant_id)];
     std::lock_guard<std::mutex> lock(shard.mutex);
-    auto it = shard.tenants.find(normalized_tenant);
+    auto it = shard.tenants.find(tenant_id);
     if (it == shard.tenants.end()) {
         LOG(ERROR) << "tenant quota partial release mismatch tenant="
-                   << normalized_tenant << ", bytes=" << bytes << ", used=0";
+                   << tenant_id.value() << ", bytes=" << bytes << ", used=0";
         return;
     }
     auto& state = it->second;
     if (state.used_bytes < bytes) {
         LOG(ERROR) << "tenant quota partial release mismatch tenant="
-                   << normalized_tenant << ", bytes=" << bytes
+                   << tenant_id.value() << ", bytes=" << bytes
                    << ", used=" << state.used_bytes;
         return;
     }
@@ -1414,26 +1400,24 @@ void MasterService::ReleaseTenantQuotaPartial(const std::string& tenant_id,
     RefreshTenantQuotaOverQuota(state);
 }
 
-void MasterService::CommitAdditionalTenantQuota(const std::string& tenant_id,
+void MasterService::CommitAdditionalTenantQuota(const TenantId& tenant_id,
                                                 uint64_t bytes) {
     if (!enable_multi_tenants_ || bytes == 0) {
         return;
     }
-    const auto& normalized_tenant = NormalizeTenantIdRef(tenant_id);
-    auto& shard =
-        tenant_quota_shards_[getTenantQuotaShardIndex(normalized_tenant)];
+    auto& shard = tenant_quota_shards_[getTenantQuotaShardIndex(tenant_id)];
     std::lock_guard<std::mutex> lock(shard.mutex);
-    auto it = shard.tenants.find(normalized_tenant);
+    auto it = shard.tenants.find(tenant_id);
     if (it == shard.tenants.end()) {
         LOG(ERROR) << "tenant quota additional commit mismatch tenant="
-                   << normalized_tenant << ", bytes=" << bytes
+                   << tenant_id.value() << ", bytes=" << bytes
                    << ", reserved=0";
         return;
     }
     auto& state = it->second;
     if (state.reserved_bytes < bytes) {
         LOG(ERROR) << "tenant quota additional commit mismatch tenant="
-                   << normalized_tenant << ", bytes=" << bytes
+                   << tenant_id.value() << ", bytes=" << bytes
                    << ", reserved=" << state.reserved_bytes;
         return;
     }
@@ -1446,21 +1430,19 @@ void MasterService::CommitAdditionalTenantQuota(const std::string& tenant_id,
     RefreshTenantQuotaOverQuota(state);
 }
 
-void MasterService::AbortReplicationTaskQuota(const std::string& tenant_id,
+void MasterService::AbortReplicationTaskQuota(const TenantId& tenant_id,
                                               const ReplicationTask& task) {
     AbortTenantQuota(tenant_id, task.reserved_quota_charge_bytes);
 }
 
 void MasterService::IncrementTenantMetadataObjectCount(
-    const std::string& tenant_id) {
+    const TenantId& tenant_id) {
     if (!enable_multi_tenants_) {
         return;
     }
-    const auto& normalized_tenant = NormalizeTenantIdRef(tenant_id);
-    auto& shard =
-        tenant_quota_shards_[getTenantQuotaShardIndex(normalized_tenant)];
+    auto& shard = tenant_quota_shards_[getTenantQuotaShardIndex(tenant_id)];
     std::lock_guard<std::mutex> lock(shard.mutex);
-    auto& state = shard.tenants[normalized_tenant];
+    auto& state = shard.tenants[tenant_id];
     if (state.metadata_object_count < std::numeric_limits<uint64_t>::max()) {
         ++state.metadata_object_count;
     }
@@ -1468,20 +1450,18 @@ void MasterService::IncrementTenantMetadataObjectCount(
 }
 
 void MasterService::DecrementTenantMetadataObjectCount(
-    const std::string& tenant_id) {
+    const TenantId& tenant_id) {
     if (!enable_multi_tenants_) {
         return;
     }
-    const auto& normalized_tenant = NormalizeTenantIdRef(tenant_id);
-    auto& shard =
-        tenant_quota_shards_[getTenantQuotaShardIndex(normalized_tenant)];
+    auto& shard = tenant_quota_shards_[getTenantQuotaShardIndex(tenant_id)];
     bool recompute_needed = false;
     {
         std::lock_guard<std::mutex> lock(shard.mutex);
-        auto it = shard.tenants.find(normalized_tenant);
+        auto it = shard.tenants.find(tenant_id);
         if (it == shard.tenants.end()) {
             LOG(WARNING) << "tenant metadata object count decrement mismatch "
-                         << "tenant=" << normalized_tenant;
+                         << "tenant=" << tenant_id.value();
             return;
         }
         auto& state = it->second;
@@ -1489,7 +1469,7 @@ void MasterService::DecrementTenantMetadataObjectCount(
             --state.metadata_object_count;
         } else {
             LOG(WARNING) << "tenant metadata object count underflow tenant="
-                         << normalized_tenant;
+                         << tenant_id.value();
         }
         if (IsLazyEmptyTenantQuotaState(state)) {
             shard.tenants.erase(it);
@@ -1523,10 +1503,12 @@ void MasterService::RebuildTenantQuotaUsageFromMetadata() {
         return;
     }
 
-    std::unordered_set<std::string> metadata_tenants;
-    std::unordered_map<std::string, uint64_t> used_by_tenant;
-    std::unordered_map<std::string, uint64_t> committed_count_by_tenant;
-    std::unordered_map<std::string, uint64_t> metadata_count_by_tenant;
+    std::unordered_set<TenantId, TenantIdHash> metadata_tenants;
+    std::unordered_map<TenantId, uint64_t, TenantIdHash> used_by_tenant;
+    std::unordered_map<TenantId, uint64_t, TenantIdHash>
+        committed_count_by_tenant;
+    std::unordered_map<TenantId, uint64_t, TenantIdHash>
+        metadata_count_by_tenant;
     for (size_t i = 0; i < kNumShards; ++i) {
         MetadataShardAccessorRW shard(this, i);
         for (auto& [tenant_id, tenant_state] : shard->tenants) {
@@ -1566,7 +1548,7 @@ void MasterService::RebuildTenantQuotaUsageFromMetadata() {
             state.effective_quota_bytes = 0;
             state.has_explicit_policy = false;
             LOG(WARNING)
-                << "tenant " << tenant_id
+                << "tenant " << tenant_id.value()
                 << " exists in metadata but has no connector quota policy; "
                    "creating orphan quota state";
         }
@@ -1579,11 +1561,9 @@ void MasterService::RebuildTenantQuotaUsageFromMetadata() {
 }
 
 std::optional<std::string> MasterService::GetGroupRoute(
-    const std::string& tenant_id, const std::string& key) const {
-    const auto& normalized_tenant = NormalizeTenantIdRef(tenant_id);
+    const TenantId& tenant_id, const std::string& key) const {
     std::shared_lock<std::shared_mutex> lock(group_routing_mutex_);
-    auto it =
-        object_group_ids_.find(MakeTenantScopedKey(normalized_tenant, key));
+    auto it = object_group_ids_.find(tenant_id.MakeScopedKey(key));
     if (it == object_group_ids_.end()) {
         return std::nullopt;
     }
@@ -1591,36 +1571,33 @@ std::optional<std::string> MasterService::GetGroupRoute(
 }
 
 MasterService::ObjectOperationLock MasterService::AcquireObjectOperationLock(
-    const std::string& tenant_id, const std::string& key) {
-    const auto scoped_key = MakeTenantScopedKey(tenant_id, key);
+    const TenantId& tenant_id, const std::string& key) {
+    const auto scoped_key = tenant_id.MakeScopedKey(key);
     const auto stripe_idx =
         std::hash<std::string>{}(scoped_key) % kObjectOperationLockStripes;
     return {std::unique_lock<std::mutex>(object_operation_locks_[stripe_idx])};
 }
 
 void MasterService::RegisterGroupMember(TenantState& tenant_state,
-                                        const std::string& tenant_id,
+                                        const TenantId& tenant_id,
                                         const std::string& key,
                                         const std::string& group_id) {
     if (group_id.empty()) {
         return;
     }
-    const auto& normalized_tenant = NormalizeTenantIdRef(tenant_id);
     std::unique_lock<std::shared_mutex> lock(group_routing_mutex_);
-    object_group_ids_[MakeTenantScopedKey(normalized_tenant, key)] = group_id;
-    groups_needing_lease_refresh_.insert(
-        MakeTenantScopedKey(normalized_tenant, group_id));
+    object_group_ids_[tenant_id.MakeScopedKey(key)] = group_id;
+    groups_needing_lease_refresh_.insert(tenant_id.MakeScopedKey(group_id));
     tenant_state.group_members[group_id].insert(key);
 }
 
 void MasterService::UnregisterGroupMember(TenantState& tenant_state,
-                                          const std::string& tenant_id,
+                                          const TenantId& tenant_id,
                                           const std::string& key,
                                           const std::string& group_id) {
     if (group_id.empty()) {
         return;
     }
-    const auto& normalized_tenant = NormalizeTenantIdRef(tenant_id);
     bool group_empty = false;
     auto group_it = tenant_state.group_members.find(group_id);
     if (group_it != tenant_state.group_members.end()) {
@@ -1631,14 +1608,12 @@ void MasterService::UnregisterGroupMember(TenantState& tenant_state,
         }
     }
     std::unique_lock<std::shared_mutex> lock(group_routing_mutex_);
-    auto route_it =
-        object_group_ids_.find(MakeTenantScopedKey(normalized_tenant, key));
+    auto route_it = object_group_ids_.find(tenant_id.MakeScopedKey(key));
     if (route_it != object_group_ids_.end() && route_it->second == group_id) {
         object_group_ids_.erase(route_it);
     }
     if (group_empty) {
-        groups_needing_lease_refresh_.erase(
-            MakeTenantScopedKey(normalized_tenant, group_id));
+        groups_needing_lease_refresh_.erase(tenant_id.MakeScopedKey(group_id));
     }
 }
 
@@ -1732,7 +1707,7 @@ std::unordered_map<std::string, MasterService::ObjectMetadata>::iterator
 MasterService::EraseMetadata(
     TenantState& tenant_state,
     std::unordered_map<std::string, ObjectMetadata>::iterator it,
-    const std::string& tenant_id) {
+    const TenantId& tenant_id) {
     return EraseMetadata(tenant_state, it, tenant_id, QuotaEraseMode::kFull);
 }
 
@@ -1740,7 +1715,7 @@ std::unordered_map<std::string, MasterService::ObjectMetadata>::iterator
 MasterService::EraseMetadata(
     TenantState& tenant_state,
     std::unordered_map<std::string, ObjectMetadata>::iterator it,
-    const std::string& tenant_id, QuotaEraseMode quota_mode) {
+    const TenantId& tenant_id, QuotaEraseMode quota_mode) {
     return EraseMetadata(tenant_state, it, tenant_id, quota_mode, nullptr);
 }
 
@@ -1752,7 +1727,7 @@ std::unordered_map<std::string, MasterService::ObjectMetadata>::iterator
 MasterService::EraseMetadata(
     TenantState& tenant_state,
     std::unordered_map<std::string, ObjectMetadata>::iterator it,
-    const std::string& tenant_id, QuotaEraseMode quota_mode,
+    const TenantId& tenant_id, QuotaEraseMode quota_mode,
     MetadataShardAccessorRW* shard) {
     bool had_completed_disk = it->second.HasReplica([](const Replica& r) {
         return r.is_local_disk_replica() && r.is_completed();
@@ -1844,10 +1819,10 @@ void MasterService::RebuildGroupRoutingIndex() {
                     continue;
                 }
                 tenant_state.group_members[metadata.group_id].insert(key);
-                rebuilt_group_ids[MakeTenantScopedKey(tenant_id, key)] =
+                rebuilt_group_ids[tenant_id.MakeScopedKey(key)] =
                     metadata.group_id;
                 groups_needing_refresh.insert(
-                    MakeTenantScopedKey(tenant_id, metadata.group_id));
+                    tenant_id.MakeScopedKey(metadata.group_id));
             }
         }
     }
@@ -1870,9 +1845,9 @@ void MasterService::GrantLeaseForGroup(const TenantState& tenant_state,
                                                     default_kv_soft_pin_ttl_);
     if (!needs_refresh) {
         std::shared_lock<std::shared_mutex> lock(group_routing_mutex_);
-        needs_refresh = groups_needing_lease_refresh_.find(MakeTenantScopedKey(
-                            metadata.tenant_id, metadata.group_id)) !=
-                        groups_needing_lease_refresh_.end();
+        needs_refresh =
+            groups_needing_lease_refresh_.find(metadata.tenant_id.MakeScopedKey(
+                metadata.group_id)) != groups_needing_lease_refresh_.end();
     }
     if (!needs_refresh) {
         return;
@@ -1897,7 +1872,7 @@ void MasterService::GrantLeaseForGroup(const TenantState& tenant_state,
     {
         std::unique_lock<std::shared_mutex> lock(group_routing_mutex_);
         groups_needing_lease_refresh_.erase(
-            MakeTenantScopedKey(metadata.tenant_id, metadata.group_id));
+            metadata.tenant_id.MakeScopedKey(metadata.group_id));
     }
 }
 
@@ -2110,7 +2085,7 @@ auto MasterService::ExistKey(const std::string& key,
 
 std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
     const std::vector<std::string>& keys, const std::string& tenant_id) {
-    const std::string normalized_tenant = NormalizeRequestTenantId(tenant_id);
+    const TenantId normalized_tenant = ResolveRequestTenantId(tenant_id);
     std::vector<tl::expected<bool, ErrorCode>> results(keys.size());
     if (keys.empty()) {
         return results;
@@ -2122,7 +2097,7 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
             group_routing_mutex_);
         for (size_t i = 0; i < keys.size(); ++i) {
             auto route_it = object_group_ids_.find(
-                MakeTenantScopedKey(normalized_tenant, keys[i]));
+                normalized_tenant.MakeScopedKey(keys[i]));
             const size_t shard_idx =
                 route_it == object_group_ids_.end()
                     ? getShardIndex(normalized_tenant, keys[i])
@@ -2179,7 +2154,7 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
 auto MasterService::GetAllKeys(const std::string& tenant_id)
     -> tl::expected<std::vector<std::string>, ErrorCode> {
     std::vector<std::string> all_keys;
-    const auto normalized_tenant = NormalizeRequestTenantId(tenant_id);
+    const auto normalized_tenant = ResolveRequestTenantId(tenant_id);
     for (size_t i = 0; i < kNumShards; i++) {
         MetadataShardAccessorRO shard(this, i);
         auto tenant_it = shard->tenants.find(normalized_tenant);
@@ -2362,7 +2337,8 @@ auto MasterService::BatchReplicaClear(
             continue;
         }
         // BatchReplicaClear is a default-tenant compatibility/admin helper.
-        MetadataAccessorRW accessor(this, MakeObjectIdentity(key, "default"));
+        MetadataAccessorRW accessor(
+            this, MakeObjectIdentity(key, TenantId::Default()));
         if (!accessor.Exists()) {
             LOG(WARNING) << "BatchReplicaClear: key=" << key
                          << " not found, skipping";
@@ -2492,7 +2468,7 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
     }
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    const auto normalized_tenant = NormalizeRequestTenantId(tenant_id);
+    const auto normalized_tenant = ResolveRequestTenantId(tenant_id);
     for (size_t i = 0; i < kNumShards; ++i) {
         MetadataShardAccessorRO shard(this, i);
         auto tenant_it = shard->tenants.find(normalized_tenant);
@@ -2601,7 +2577,7 @@ auto MasterService::GetReplicaList(const std::string& key,
 auto MasterService::GetReplicaListForAdmin(const std::string& key,
                                            const std::string& tenant_id)
     -> tl::expected<GetReplicaListResponse, ErrorCode> {
-    const auto object_id = MakeObjectIdentity(key, tenant_id);
+    const auto object_id = MakeObjectIdentity(key, TenantId(tenant_id));
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRO accessor(this, object_id);
@@ -2638,7 +2614,7 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
         return results;
     }
 
-    const auto normalized_tenant = NormalizeRequestTenantId(tenant_id);
+    const auto normalized_tenant = ResolveRequestTenantId(tenant_id);
     constexpr size_t kInvalidKeyIndex = std::numeric_limits<size_t>::max();
     std::array<size_t, kNumShards> key_list_heads;
     key_list_heads.fill(kInvalidKeyIndex);
@@ -2648,7 +2624,7 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
         for (size_t i = keys.size(); i > 0; --i) {
             const size_t original_idx = i - 1;
             const auto scoped_key =
-                MakeTenantScopedKey(normalized_tenant, keys[original_idx]);
+                normalized_tenant.MakeScopedKey(keys[original_idx]);
             const auto route_it = object_group_ids_.find(scoped_key);
             const size_t shard_idx =
                 route_it == object_group_ids_.end()
@@ -2759,7 +2735,7 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
         return results;
     }
 
-    const auto normalized_tenant = NormalizeTenantId(tenant_id);
+    const TenantId normalized_tenant(tenant_id);
     constexpr size_t kInvalidKeyIndex = std::numeric_limits<size_t>::max();
     std::array<size_t, kNumShards> key_list_heads;
     key_list_heads.fill(kInvalidKeyIndex);
@@ -2769,7 +2745,7 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
         for (size_t i = keys.size(); i > 0; --i) {
             const size_t original_idx = i - 1;
             const auto scoped_key =
-                MakeTenantScopedKey(normalized_tenant, keys[original_idx]);
+                normalized_tenant.MakeScopedKey(keys[original_idx]);
             const auto route_it = object_group_ids_.find(scoped_key);
             const size_t shard_idx =
                 route_it == object_group_ids_.end()
@@ -2839,8 +2815,7 @@ auto MasterService::AllocateAndInsertMetadata(
     MetadataShardAccessorRW& shard, const UUID& client_id,
     const std::string& key, uint64_t value_length,
     const ReplicateConfig& config, const std::string& group_id,
-    const std::string& tenant_id,
-    const std::chrono::system_clock::time_point& now)
+    const TenantId& tenant_id, const std::chrono::system_clock::time_point& now)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
     auto& tenant_state = shard->tenants[tenant_id];
     if (tenant_state.metadata.contains(key)) {
@@ -3057,11 +3032,12 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                              const uint64_t slice_length,
                              const ReplicateConfig& config)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
-    auto normalized_tenant_result = NormalizeTenantIdForWrite(tenant_id);
+    auto normalized_tenant_result = ResolveTenantIdForWrite(tenant_id);
     if (!normalized_tenant_result) {
         return tl::make_unexpected(normalized_tenant_result.error());
     }
-    const ObjectIdentity object_id{normalized_tenant_result.value(), key};
+    const ObjectIdentity object_id{std::move(normalized_tenant_result.value()),
+                                   key};
     if ((config.replica_num == 0 && config.nof_replica_num == 0) ||
         key.empty() || slice_length == 0) {
         LOG(ERROR) << "key=" << key << ", replica_num=" << config.replica_num
@@ -3118,7 +3094,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         if (ShouldProtectZeroChargeMetadataCreate(requested_quota_charge)) {
             zero_charge_policy_lock.lock();
             auto latest_tenant_result =
-                NormalizeTenantIdForWriteLocked(tenant_id);
+                ResolveTenantIdForWriteLocked(tenant_id);
             if (!latest_tenant_result) {
                 return tl::make_unexpected(latest_tenant_result.error());
             }
@@ -3210,11 +3186,11 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         }
         if (attempt == kMaxTenantQuotaEvictionRetries) {
             MasterMetricManager::instance().inc_tenant_quota_reject(
-                object_id.tenant_id, "quota_exceeded");
+                object_id.tenant_id.value(), "quota_exceeded");
             return result;
         }
         EvictTenantMemoryForQuota(
-            object_id.tenant_id,
+            object_id.tenant_id.value(),
             ComputeTenantQuotaDeficit(object_id.tenant_id,
                                       requested_quota_charge));
     }
@@ -3318,27 +3294,27 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
     // at beginning. 2. If this object has soft pin enabled, set it to be soft
     // pinned.
     metadata.GrantLease(0, default_kv_soft_pin_ttl_);
-    PublishKvStored(key, replica_type, metadata, tenant_id);
+    PublishKvStored(key, replica_type, metadata, metadata.tenant_id);
     return {};
 }
 
 auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
                                const std::string& tenant_id, Replica& replica)
     -> tl::expected<bool, ErrorCode> {
-    std::string normalized_tenant = "default";
+    TenantId normalized_tenant;
     std::unique_lock<std::mutex> policy_lock(tenant_quota_policy_mutex_,
                                              std::defer_lock);
     if (enable_multi_tenants_) {
         policy_lock.lock();
         auto normalized_tenant_result =
-            NormalizeTenantIdForWriteLocked(tenant_id);
+            ResolveTenantIdForWriteLocked(tenant_id);
         if (!normalized_tenant_result) {
             return tl::make_unexpected(normalized_tenant_result.error());
         }
         normalized_tenant = std::move(normalized_tenant_result.value());
     }
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    const ObjectIdentity object_id{normalized_tenant, key};
+    const ObjectIdentity object_id{std::move(normalized_tenant), key};
     MetadataAccessorRW accessor(this, object_id);
     if (!accessor.Exists()) {
         accessor.Create(
@@ -3488,11 +3464,12 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                 const uint64_t slice_length,
                                 const ReplicateConfig& config)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
-    auto normalized_tenant_result = NormalizeTenantIdForWrite(tenant_id);
+    auto normalized_tenant_result = ResolveTenantIdForWrite(tenant_id);
     if (!normalized_tenant_result) {
         return tl::make_unexpected(normalized_tenant_result.error());
     }
-    const ObjectIdentity object_id{normalized_tenant_result.value(), key};
+    const ObjectIdentity object_id{std::move(normalized_tenant_result.value()),
+                                   key};
     // --- Parameter validation (same as PutStart) ---
     if ((config.replica_num == 0 && config.nof_replica_num == 0) ||
         key.empty() || slice_length == 0) {
@@ -3550,7 +3527,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
         if (ShouldProtectZeroChargeMetadataCreate(requested_quota_charge)) {
             zero_charge_policy_lock.lock();
             auto latest_tenant_result =
-                NormalizeTenantIdForWriteLocked(tenant_id);
+                ResolveTenantIdForWriteLocked(tenant_id);
             if (!latest_tenant_result) {
                 return tl::make_unexpected(latest_tenant_result.error());
             }
@@ -3797,11 +3774,11 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
         }
         if (attempt == kMaxTenantQuotaEvictionRetries) {
             MasterMetricManager::instance().inc_tenant_quota_reject(
-                object_id.tenant_id, "quota_exceeded");
+                object_id.tenant_id.value(), "quota_exceeded");
             return result;
         }
         EvictTenantMemoryForQuota(
-            object_id.tenant_id,
+            object_id.tenant_id.value(),
             ComputeTenantQuotaDeficit(object_id.tenant_id,
                                       requested_quota_charge));
     }
@@ -3875,7 +3852,8 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     MetadataAccessorRW accessor(this, object_id);
     if (!accessor.Exists()) {
-        LOG(INFO) << "key=" << key << ", tenant_id=" << object_id.tenant_id
+        LOG(INFO) << "key=" << key
+                  << ", tenant_id=" << object_id.tenant_id.value()
                   << ", info=object_not_found_for_eviction";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
@@ -3908,7 +3886,7 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
     }
 
     if (!metadata.IsValid()) {
-        PublishKvRemoved(key, metadata, tenant_id);
+        PublishKvRemoved(key, metadata, object_id.tenant_id);
         accessor.Erase();
     }
     return {};
@@ -3930,11 +3908,12 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     const UUID& client_id, const std::string& key, const std::string& tenant_id,
     const std::string& src_segment,
     const std::vector<std::string>& tgt_segments) {
-    auto normalized_tenant_result = NormalizeTenantIdForWrite(tenant_id);
+    auto normalized_tenant_result = ResolveTenantIdForWrite(tenant_id);
     if (!normalized_tenant_result) {
         return tl::make_unexpected(normalized_tenant_result.error());
     }
-    const ObjectIdentity object_id{normalized_tenant_result.value(), key};
+    const ObjectIdentity object_id{std::move(normalized_tenant_result.value()),
+                                   key};
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     {
         ScopedSegmentAccess segment_access =
@@ -3989,7 +3968,7 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     if (!quota_result) {
         if (quota_result.error() == ErrorCode::TENANT_QUOTA_EXCEEDED) {
             MasterMetricManager::instance().inc_tenant_quota_reject(
-                object_id.tenant_id, "quota_exceeded");
+                object_id.tenant_id.value(), "quota_exceeded");
         }
         return tl::make_unexpected(quota_result.error());
     }
@@ -4212,11 +4191,12 @@ tl::expected<void, ErrorCode> MasterService::CopyRevoke(
 tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
     const UUID& client_id, const std::string& key, const std::string& tenant_id,
     const std::string& src_segment, const std::string& tgt_segment) {
-    auto normalized_tenant_result = NormalizeTenantIdForWrite(tenant_id);
+    auto normalized_tenant_result = ResolveTenantIdForWrite(tenant_id);
     if (!normalized_tenant_result) {
         return tl::make_unexpected(normalized_tenant_result.error());
     }
-    const ObjectIdentity object_id{normalized_tenant_result.value(), key};
+    const ObjectIdentity object_id{std::move(normalized_tenant_result.value()),
+                                   key};
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     if (src_segment == tgt_segment) {
         LOG(ERROR) << "key=" << key << ", move_tgt=" << tgt_segment
@@ -4269,7 +4249,7 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
         if (!quota_result) {
             if (quota_result.error() == ErrorCode::TENANT_QUOTA_EXCEEDED) {
                 MasterMetricManager::instance().inc_tenant_quota_reject(
-                    object_id.tenant_id, "quota_exceeded");
+                    object_id.tenant_id.value(), "quota_exceeded");
             }
             return tl::make_unexpected(quota_result.error());
         }
@@ -4527,7 +4507,7 @@ auto MasterService::Remove(const std::string& key, const std::string& tenant_id,
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
     }
 
-    PublishKvRemoved(key, metadata, tenant_id);
+    PublishKvRemoved(key, metadata, object_id.tenant_id);
     auto& tenant_state [[maybe_unused]] = accessor.GetTenantState();
     accessor.Erase();
     return {};
@@ -4548,7 +4528,7 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
     }
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    const auto normalized_tenant = NormalizeRequestTenantId(tenant_id);
+    const auto normalized_tenant = ResolveRequestTenantId(tenant_id);
     for (size_t i = 0; i < kNumShards; ++i) {
         MetadataShardAccessorRW shard(this, i);
         auto tenant_it = shard->tenants.find(normalized_tenant);
@@ -4655,7 +4635,7 @@ long MasterService::RemoveAll(const std::string& tenant_id, bool force) {
     // calling std::chrono::steady_clock::now()
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     auto now = std::chrono::system_clock::now();
-    const auto normalized_tenant = NormalizeRequestTenantId(tenant_id);
+    const auto normalized_tenant = ResolveRequestTenantId(tenant_id);
 
     for (size_t i = 0; i < kNumShards; i++) {
         MetadataShardAccessorRW shard(this, i);
@@ -4685,7 +4665,7 @@ long MasterService::RemoveAll(const std::string& tenant_id, bool force) {
     }
 
     VLOG(1) << "action=remove_all_objects"
-            << ", tenant_id=" << normalized_tenant
+            << ", tenant_id=" << normalized_tenant.value()
             << ", removed_count=" << removed_count
             << ", total_freed_size=" << total_freed_size;
     return removed_count;
@@ -4695,7 +4675,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                                 const std::string& tenant_id, bool force)
     -> std::vector<tl::expected<void, ErrorCode>> {
     std::vector<tl::expected<void, ErrorCode>> results(keys.size());
-    const auto normalized_tenant = NormalizeRequestTenantId(tenant_id);
+    const auto normalized_tenant = ResolveRequestTenantId(tenant_id);
 
     // Group keys by shard to reduce lock contention
     std::unordered_map<size_t,
@@ -4960,7 +4940,8 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
     }
 
     for (auto& [_, task] : offloading_objects_copy) {
-        const auto object_id = MakeObjectIdentity(task.key, task.tenant_id);
+        const auto object_id =
+            MakeObjectIdentity(task.key, TenantId(task.tenant_id));
         MetadataAccessorRW accessor(this, object_id);
         if (accessor.Exists()) {
             auto& tenant_state = accessor.GetTenantState();
@@ -5128,22 +5109,23 @@ auto MasterService::NotifyOffloadSuccess(
 
         if (!handled_existing_object) {
             auto normalized_tenant_result =
-                NormalizeTenantIdForWrite(request_object_id.tenant_id);
+                ResolveTenantIdForWrite(request_object_id.tenant_id.value());
             if (!normalized_tenant_result) {
                 return tl::make_unexpected(normalized_tenant_result.error());
             }
-            const ObjectIdentity object_id{normalized_tenant_result.value(),
-                                           request_object_id.user_key};
+            const ObjectIdentity object_id{
+                std::move(normalized_tenant_result.value()),
+                request_object_id.user_key};
 
             auto res = AddReplica(client_id, object_id.user_key,
-                                  object_id.tenant_id, replica);
+                                  object_id.tenant_id.value(), replica);
             if (!res) {
                 if (res.error() == ErrorCode::OBJECT_NOT_FOUND) {
                     continue;
                 }
                 LOG(ERROR) << "Failed to add replica: error=" << res.error()
                            << ", client_id=" << client_id
-                           << ", tenant_id=" << object_id.tenant_id
+                           << ", tenant_id=" << object_id.tenant_id.value()
                            << ", key=" << object_id.user_key;
                 return tl::make_unexpected(res.error());
             }
@@ -5196,8 +5178,8 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
                                  .get_memory_descriptor()
                                  .buffer_descriptor.size_;
         auto res = local_disk_segment_it->second->offloading_objects.emplace(
-            MakeTenantScopedStorageKey(object_id.tenant_id, object_id.user_key),
-            OffloadTaskItem{.tenant_id = object_id.tenant_id,
+            object_id.tenant_id.MakeScopedKey(object_id.user_key),
+            OffloadTaskItem{.tenant_id = object_id.tenant_id.value(),
                             .key = object_id.user_key,
                             .size = size});
         if (!res.second) {
@@ -5232,9 +5214,9 @@ tl::expected<void, ErrorCode> MasterService::PushPromotionQueue(
     }
     MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
     auto res = local_disk_segment_it->second->promotion_objects.emplace(
-        MakeTenantScopedStorageKey(object_id.tenant_id, object_id.user_key),
+        object_id.tenant_id.MakeScopedKey(object_id.user_key),
         PromotionTaskItem{
-            .tenant_id = object_id.tenant_id,
+            .tenant_id = object_id.tenant_id.value(),
             .key = object_id.user_key,
             .size = static_cast<int64_t>(source_replica.get_descriptor()
                                              .get_local_disk_descriptor()
@@ -5250,8 +5232,7 @@ void MasterService::TryPushPromotionQueue(const ObjectIdentity& object_id) {
         return;
     }
     const auto& key = object_id.user_key;
-    const auto admission_key =
-        MakeTenantScopedStorageKey(object_id.tenant_id, key);
+    const auto admission_key = object_id.tenant_id.MakeScopedKey(key);
 
     // Frequency gate: bump and compare against the threshold. The sketch
     // returns uint8_t (saturating at 255); promotion_admission_threshold_
@@ -5381,11 +5362,12 @@ auto MasterService::PromotionAllocStart(
     const UUID& client_id, const std::string& key, const std::string& tenant_id,
     uint64_t size, const std::vector<std::string>& preferred_segments)
     -> tl::expected<PromotionAllocStartResponse, ErrorCode> {
-    auto normalized_tenant_result = NormalizeTenantIdForWrite(tenant_id);
+    auto normalized_tenant_result = ResolveTenantIdForWrite(tenant_id);
     if (!normalized_tenant_result) {
         return tl::make_unexpected(normalized_tenant_result.error());
     }
-    const ObjectIdentity object_id{normalized_tenant_result.value(), key};
+    const ObjectIdentity object_id{std::move(normalized_tenant_result.value()),
+                                   key};
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRW accessor(this, object_id);
     if (!accessor.Exists()) {
@@ -5579,8 +5561,8 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
         auto it = client_local_disk_segment.find(client_id);
         if (it != client_local_disk_segment.end()) {
             MutexLocker locker(&it->second->offloading_mutex_);
-            it->second->promotion_objects.erase(MakeTenantScopedStorageKey(
-                object_id.tenant_id, object_id.user_key));
+            it->second->promotion_objects.erase(
+                object_id.tenant_id.MakeScopedKey(object_id.user_key));
         }
     }
 
@@ -5649,8 +5631,8 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
         auto it = client_local_disk_segment.find(client_id);
         if (it != client_local_disk_segment.end()) {
             MutexLocker locker(&it->second->offloading_mutex_);
-            it->second->promotion_objects.erase(MakeTenantScopedStorageKey(
-                object_id.tenant_id, object_id.user_key));
+            it->second->promotion_objects.erase(
+                object_id.tenant_id.MakeScopedKey(object_id.user_key));
         }
     }
 
@@ -6302,7 +6284,7 @@ MasterService::EvictTenantMemoryForQuota(const std::string& tenant_id,
         return total;
     }
 
-    const auto& normalized_tenant = NormalizeTenantIdRef(tenant_id);
+    const TenantId normalized_tenant(tenant_id);
     auto now = std::chrono::system_clock::now();
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
 
@@ -6499,7 +6481,7 @@ MasterService::EvictTenantMemoryForQuota(const std::string& tenant_id,
 
     if (total.freed_bytes > 0) {
         MasterMetricManager::instance().inc_tenant_evict_bytes(
-            normalized_tenant,
+            normalized_tenant.value(),
             static_cast<int64_t>(std::min<uint64_t>(
                 total.freed_bytes,
                 static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))));
@@ -6582,7 +6564,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     // replicas were evicted (all MEMORY replicas of the key are now pinned).
     auto try_evict_or_offload =
         [&, this](
-            const std::string& tenant_id, const std::string& key,
+            const TenantId& tenant_id, const std::string& key,
             ObjectMetadata& metadata, TenantState& tenant_state,
             std::vector<std::vector<Replica>>& deferred_replicas) -> uint64_t {
         if (!offload_on_evict_) {
@@ -6649,7 +6631,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     };
 
     auto try_evict_group_or_object =
-        [&, this](const std::string& tenant_id, const std::string& key,
+        [&, this](const TenantId& tenant_id, const std::string& key,
                   ObjectMetadata& metadata, MetadataShardAccessorRW& shard,
                   TenantState& tenant_state,
                   std::vector<std::vector<Replica>>& deferred_replicas,
@@ -6712,7 +6694,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     // Iterators would be invalid if the shard is modified between phases.
     struct Candidate {
         size_t shard_idx;
-        std::string tenant_id;
+        TenantId tenant_id;
         std::string key;
         std::chrono::system_clock::time_point lease_timeout;
     };
@@ -7799,7 +7781,7 @@ MasterService::MetadataSerializer::SerializeShard(const MetadataShard& shard,
     sorted_entries.reserve(metadata_count);
     for (const auto& [tenant_id, tenant_state] : shard.tenants) {
         for (const auto& [key, metadata] : tenant_state.metadata) {
-            sorted_entries.push_back({tenant_id, key, &metadata});
+            sorted_entries.push_back({tenant_id.value(), key, &metadata});
         }
     }
     std::sort(sorted_entries.begin(), sorted_entries.end(),
@@ -7873,15 +7855,14 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
                 "[tenant_id, key, metadata]"));
         }
 
-        std::string tenant_id = "default";
+        TenantId tenant_id;
         std::string key;
         const msgpack::object* value_obj = nullptr;
         if (item.via.array.size == 2) {
             key = item.via.array.ptr[0].as<std::string>();
             value_obj = &item.via.array.ptr[1];
         } else {
-            tenant_id =
-                NormalizeTenantId(item.via.array.ptr[0].as<std::string>());
+            tenant_id = TenantId(item.via.array.ptr[0].as<std::string>());
             key = item.via.array.ptr[1].as<std::string>();
             value_obj = &item.via.array.ptr[2];
         }
@@ -8115,11 +8096,12 @@ MasterService::MetadataSerializer::DeserializeMetadata(
 tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
     const std::string& key, const std::string& tenant_id,
     const std::vector<std::string>& targets) {
-    auto normalized_tenant_result = NormalizeTenantIdForWrite(tenant_id);
+    auto normalized_tenant_result = ResolveTenantIdForWrite(tenant_id);
     if (!normalized_tenant_result) {
         return tl::make_unexpected(normalized_tenant_result.error());
     }
-    const ObjectIdentity object_id{normalized_tenant_result.value(), key};
+    const ObjectIdentity object_id{std::move(normalized_tenant_result.value()),
+                                   key};
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     if (targets.empty()) {
         LOG(ERROR) << "key=" << key << ", error=empty_targets";
@@ -8168,7 +8150,7 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
     }
     return task_manager_.get_write_access()
         .submit_task_typed<TaskType::REPLICA_COPY>(
-            select_client, {.tenant_id = object_id.tenant_id,
+            select_client, {.tenant_id = object_id.tenant_id.value(),
                             .key = object_id.user_key,
                             .source = selected_source_segment,
                             .targets = targets});
@@ -8177,11 +8159,12 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
 tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
     const std::string& key, const std::string& tenant_id,
     const std::string& source, const std::string& target) {
-    auto normalized_tenant_result = NormalizeTenantIdForWrite(tenant_id);
+    auto normalized_tenant_result = ResolveTenantIdForWrite(tenant_id);
     if (!normalized_tenant_result) {
         return tl::make_unexpected(normalized_tenant_result.error());
     }
-    const ObjectIdentity object_id{normalized_tenant_result.value(), key};
+    const ObjectIdentity object_id{std::move(normalized_tenant_result.value()),
+                                   key};
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRO accessor(this, object_id);
     if (!accessor.Exists()) {
@@ -8229,7 +8212,7 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
 
     return task_manager_.get_write_access()
         .submit_task_typed<TaskType::REPLICA_MOVE>(
-            select_client, {.tenant_id = object_id.tenant_id,
+            select_client, {.tenant_id = object_id.tenant_id.value(),
                             .key = object_id.user_key,
                             .source = source,
                             .target = target});
@@ -8439,10 +8422,9 @@ tl::expected<void, ErrorCode> MasterService::CancelDrainJob(
 }
 
 std::string MasterService::MakeDrainUnitKey(
-    const std::string& tenant_id, const std::string& key,
+    const TenantId& tenant_id, const std::string& key,
     const std::string& source_segment) const {
-    const auto& normalized_tenant = NormalizeTenantIdRef(tenant_id);
-    return std::to_string(normalized_tenant.size()) + ":" + normalized_tenant +
+    return std::to_string(tenant_id.value().size()) + ":" + tenant_id.value() +
            ":" + std::to_string(key.size()) + ":" + key + ":" + source_segment;
 }
 
@@ -8538,7 +8520,7 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
     }
 
     struct DrainPlan {
-        std::string tenant_id;
+        TenantId tenant_id;
         std::string key;
         std::string source_segment;
         std::string target_segment;
@@ -8607,7 +8589,7 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
     job.blocked_units = blocked_unit_keys.size();
 
     for (const auto& plan : plans) {
-        auto task_id = CreateMoveTask(plan.key, plan.tenant_id,
+        auto task_id = CreateMoveTask(plan.key, plan.tenant_id.value(),
                                       plan.source_segment, plan.target_segment);
         if (task_id.has_value()) {
             ActiveDrainTask active_task;
@@ -8910,7 +8892,7 @@ std::string MasterService::MediumForMetadata(const ObjectMetadata& metadata) {
 void MasterService::PublishKvStored(const std::string& key,
                                     ReplicaType replica_type,
                                     const ObjectMetadata& metadata,
-                                    const std::string& tenant_id) {
+                                    const TenantId& tenant_id) {
     if (!kv_event_publisher_ || !kv_event_publisher_->enabled()) {
         return;
     }
@@ -8924,7 +8906,7 @@ void MasterService::PublishKvStored(const std::string& key,
 
 void MasterService::PublishKvRemoved(const std::string& key,
                                      const std::string& medium,
-                                     const std::string& tenant_id,
+                                     const TenantId& tenant_id,
                                      const std::string& group_id) {
     if (!kv_event_publisher_ || !kv_event_publisher_->enabled()) {
         return;
@@ -8934,7 +8916,7 @@ void MasterService::PublishKvRemoved(const std::string& key,
 
 void MasterService::PublishKvRemoved(const std::string& key,
                                      const ObjectMetadata& metadata,
-                                     const std::string& tenant_id) {
+                                     const TenantId& tenant_id) {
     PublishKvRemoved(key, MediumForMetadata(metadata), tenant_id,
                      metadata.group_id);
 }
@@ -8943,7 +8925,7 @@ void MasterService::PublishKvRemovedAfterEvict(const std::string& key,
                                                uint64_t freed_bytes,
                                                const std::string& medium,
                                                const ObjectMetadata& metadata,
-                                               const std::string& tenant_id) {
+                                               const TenantId& tenant_id) {
     (void)freed_bytes;
     (void)medium;
     if (!kv_event_publisher_ || !kv_event_publisher_->enabled()) {

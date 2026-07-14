@@ -14,9 +14,11 @@
 #include <optional>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 #include <ylt/util/expected.hpp>
 #include <ylt/util/tl/expected.hpp>
@@ -849,7 +851,7 @@ class MasterService {
 
     // Internal data structures
     struct ObjectIdentity {
-        std::string tenant_id;
+        TenantId tenant_id;
         std::string user_key;
     };
 
@@ -870,7 +872,7 @@ class MasterService {
             size_t value_length, std::vector<Replica>&& reps,
             bool enable_soft_pin, bool enable_hard_pin = false,
             ObjectDataType data_type_ = ObjectDataType::UNKNOWN,
-            std::string group_id_ = "", std::string tenant_id_ = "default",
+            std::string group_id_ = "", TenantId tenant_id_ = TenantId(),
             std::string user_key_ = {})
             : client_id(client_id_),
               put_start_time(put_start_time_),
@@ -903,7 +905,7 @@ class MasterService {
         const size_t size;
         const ObjectDataType data_type{ObjectDataType::UNKNOWN};
         const std::string group_id;
-        const std::string tenant_id;
+        const TenantId tenant_id;
         const std::string user_key;
 
         mutable SpinLock lock;
@@ -1229,7 +1231,8 @@ class MasterService {
     // Sharded metadata maps and their mutexes
     struct MetadataShard {
         mutable SharedMutex mutex;
-        std::unordered_map<std::string, TenantState> tenants GUARDED_BY(mutex);
+        std::unordered_map<TenantId, TenantState, TenantIdHash> tenants
+            GUARDED_BY(mutex);
         // Count of objects that have at least one completed LOCAL_DISK replica.
         // Used to compute eviction_base = metadata.size() - disk_object_count,
         // excluding disk-only objects from the eviction denominator.
@@ -1254,7 +1257,7 @@ class MasterService {
     static constexpr size_t kNumTenantQuotaShards = 1024;
     struct TenantQuotaShard {
         mutable std::mutex mutex;
-        std::unordered_map<std::string, TenantQuotaState> tenants
+        std::unordered_map<TenantId, TenantQuotaState, TenantIdHash> tenants
             GUARDED_BY(mutex);
     };
     std::array<TenantQuotaShard, kNumTenantQuotaShards> tenant_quota_shards_;
@@ -1271,7 +1274,7 @@ class MasterService {
         std::unique_lock<std::mutex> lock;
     };
 
-    ObjectOperationLock AcquireObjectOperationLock(const std::string& tenant_id,
+    ObjectOperationLock AcquireObjectOperationLock(const TenantId& tenant_id,
                                                    const std::string& key);
 
     std::array<std::mutex, kObjectOperationLockStripes> object_operation_locks_;
@@ -1343,38 +1346,26 @@ class MasterService {
     };
 
     static ObjectIdentity MakeObjectIdentity(const std::string& user_key,
-                                             const std::string& tenant_id) {
-        return {NormalizeTenantId(tenant_id), user_key};
+                                             TenantId tenant_id) {
+        return {std::move(tenant_id), user_key};
     }
-    std::string NormalizeRequestTenantId(const std::string& tenant_id) const;
+    TenantId ResolveRequestTenantId(std::string_view tenant_id) const;
     ObjectIdentity MakeObjectIdentityForRequest(
         const std::string& user_key, const std::string& tenant_id) const;
-    tl::expected<std::string, ErrorCode> NormalizeTenantIdForWrite(
-        const std::string& tenant_id) const;
-    tl::expected<std::string, ErrorCode> NormalizeTenantIdForWriteLocked(
-        const std::string& tenant_id) const;
-    bool IsTenantRegistered(const std::string& tenant_id) const;
-    bool TenantHasObjects(const std::string& tenant_id) const;
-
-    static std::string MakeTenantScopedKey(const std::string& tenant_id,
-                                           const std::string& key) {
-        const auto normalized_tenant = NormalizeTenantId(tenant_id);
-        std::string scoped_key;
-        scoped_key.reserve(normalized_tenant.size() + key.size() + 1);
-        scoped_key.append(normalized_tenant);
-        scoped_key.push_back('\0');
-        scoped_key.append(key);
-        return scoped_key;
-    }
+    tl::expected<TenantId, ErrorCode> ResolveTenantIdForWrite(
+        std::string_view tenant_id) const;
+    tl::expected<TenantId, ErrorCode> ResolveTenantIdForWriteLocked(
+        std::string_view tenant_id) const;
+    bool IsTenantRegistered(const TenantId& tenant_id) const;
+    bool TenantHasObjects(const TenantId& tenant_id) const;
 
     // Helper to get shard index from tenant-scoped object identity.
-    size_t getShardIndex(const std::string& tenant_id,
+    size_t getShardIndex(const TenantId& tenant_id,
                          const std::string& user_key) const {
-        const auto normalized_tenant = NormalizeTenantId(tenant_id);
-        if (normalized_tenant == "default") {
+        if (tenant_id.IsDefault()) {
             return std::hash<std::string>{}(user_key) % kNumShards;
         }
-        size_t seed = std::hash<std::string>{}(normalized_tenant);
+        size_t seed = std::hash<std::string>{}(tenant_id.value());
         boost::hash_combine(seed, user_key);
         return seed % kNumShards;
     }
@@ -1384,23 +1375,22 @@ class MasterService {
         return std::hash<std::string>{}(key) % kNumShards;
     }
 
-    size_t getMetadataShardIndex(const std::string& tenant_id,
+    size_t getMetadataShardIndex(const TenantId& tenant_id,
                                  const std::string& key) const;
-    size_t getTenantQuotaShardIndex(const std::string& tenant_id) const;
-    std::optional<std::string> GetGroupRoute(const std::string& tenant_id,
+    size_t getTenantQuotaShardIndex(const TenantId& tenant_id) const;
+    std::optional<std::string> GetGroupRoute(const TenantId& tenant_id,
                                              const std::string& key) const;
     void RegisterGroupMember(TenantState& tenant_state,
-                             const std::string& tenant_id,
-                             const std::string& key,
+                             const TenantId& tenant_id, const std::string& key,
                              const std::string& group_id);
     void UnregisterGroupMember(TenantState& tenant_state,
-                               const std::string& tenant_id,
+                               const TenantId& tenant_id,
                                const std::string& key,
                                const std::string& group_id);
     std::unordered_map<std::string, ObjectMetadata>::iterator EraseMetadata(
         TenantState& tenant_state,
         std::unordered_map<std::string, ObjectMetadata>::iterator it,
-        const std::string& tenant_id);
+        const TenantId& tenant_id);
     void ReleaseLocalDiskUsage(const std::vector<Replica>& replicas);
     enum class QuotaEraseMode {
         kFull,
@@ -1410,27 +1400,25 @@ class MasterService {
     std::unordered_map<std::string, ObjectMetadata>::iterator EraseMetadata(
         TenantState& tenant_state,
         std::unordered_map<std::string, ObjectMetadata>::iterator it,
-        const std::string& tenant_id, QuotaEraseMode quota_mode);
+        const TenantId& tenant_id, QuotaEraseMode quota_mode);
     uint64_t CompletedMemoryQuotaCharge(const ObjectMetadata& metadata) const;
     uint64_t RequestedMemoryQuotaCharge(uint64_t value_length,
                                         const ReplicateConfig& config) const;
     bool ShouldProtectZeroChargeMetadataCreate(
         uint64_t requested_quota_charge) const;
-    uint64_t ComputeTenantQuotaDeficit(const std::string& tenant_id,
+    uint64_t ComputeTenantQuotaDeficit(const TenantId& tenant_id,
                                        uint64_t incoming_quota_charge);
-    tl::expected<void, ErrorCode> ReserveTenantQuota(
-        const std::string& tenant_id, uint64_t bytes);
-    void CommitTenantQuota(const std::string& tenant_id, uint64_t bytes);
-    void AbortTenantQuota(const std::string& tenant_id, uint64_t bytes);
-    void ReleaseTenantQuota(const std::string& tenant_id, uint64_t bytes);
-    void ReleaseTenantQuotaPartial(const std::string& tenant_id,
-                                   uint64_t bytes);
-    void CommitAdditionalTenantQuota(const std::string& tenant_id,
-                                     uint64_t bytes);
-    void AbortReplicationTaskQuota(const std::string& tenant_id,
+    tl::expected<void, ErrorCode> ReserveTenantQuota(const TenantId& tenant_id,
+                                                     uint64_t bytes);
+    void CommitTenantQuota(const TenantId& tenant_id, uint64_t bytes);
+    void AbortTenantQuota(const TenantId& tenant_id, uint64_t bytes);
+    void ReleaseTenantQuota(const TenantId& tenant_id, uint64_t bytes);
+    void ReleaseTenantQuotaPartial(const TenantId& tenant_id, uint64_t bytes);
+    void CommitAdditionalTenantQuota(const TenantId& tenant_id, uint64_t bytes);
+    void AbortReplicationTaskQuota(const TenantId& tenant_id,
                                    const ReplicationTask& task);
-    void IncrementTenantMetadataObjectCount(const std::string& tenant_id);
-    void DecrementTenantMetadataObjectCount(const std::string& tenant_id);
+    void IncrementTenantMetadataObjectCount(const TenantId& tenant_id);
+    void DecrementTenantMetadataObjectCount(const TenantId& tenant_id);
     void ReleaseCommittedQuotaCharge(ObjectMetadata& metadata, uint64_t bytes);
     void RecomputeTenantEffectiveQuotas();
     void RebuildTenantQuotaUsageFromMetadata();
@@ -1441,7 +1429,7 @@ class MasterService {
     std::unordered_map<std::string, ObjectMetadata>::iterator EraseMetadata(
         TenantState& tenant_state,
         std::unordered_map<std::string, ObjectMetadata>::iterator it,
-        const std::string& tenant_id, QuotaEraseMode quota_mode,
+        const TenantId& tenant_id, QuotaEraseMode quota_mode,
         MetadataShardAccessorRW* shard);
     void RebuildGroupRoutingIndex();
     void GrantLeaseForGroup(const TenantState& tenant_state,
@@ -1461,7 +1449,7 @@ class MasterService {
         MetadataShardAccessorRW& shard, const UUID& client_id,
         const std::string& key, uint64_t value_length,
         const ReplicateConfig& config, const std::string& group_id,
-        const std::string& tenant_id,
+        const TenantId& tenant_id,
         const std::chrono::system_clock::time_point& now)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
@@ -1523,7 +1511,7 @@ class MasterService {
     // no-op if no task exists.
     void ErasePromotionTaskIfPresent(
         TenantState& tenant_state, const std::string& key,
-        const std::string& tenant_id) NO_THREAD_SAFETY_ANALYSIS {
+        const TenantId& tenant_id) NO_THREAD_SAFETY_ANALYSIS {
         auto task_it = tenant_state.promotion_tasks.find(key);
         if (task_it != tenant_state.promotion_tasks.end()) {
             AbortTenantQuota(tenant_id,
@@ -1572,10 +1560,9 @@ class MasterService {
     // Helper class for accessing metadata with automatic locking and cleanup
     class MetadataAccessorRW {
        public:
-        MetadataAccessorRW(MasterService* service,
-                           const ObjectIdentity& object_id)
+        MetadataAccessorRW(MasterService* service, ObjectIdentity object_id)
             : service_(service),
-              object_id_(object_id),
+              object_id_(std::move(object_id)),
               shard_idx_(service_->getMetadataShardIndex(object_id_.tenant_id,
                                                          object_id_.user_key)),
               shard_guard_(service_, shard_idx_),
@@ -1744,7 +1731,8 @@ class MasterService {
         ObjectIdentity object_id_;
         size_t shard_idx_;
         MetadataShardAccessorRW shard_guard_;
-        std::unordered_map<std::string, TenantState>::iterator tenant_it_;
+        std::unordered_map<TenantId, TenantState, TenantIdHash>::iterator
+            tenant_it_;
         TenantState* tenant_state_;
         ObjectMetadataIterator it_;
         ProcessingIterator processing_it_;
@@ -1796,9 +1784,9 @@ class MasterService {
     class MetadataAccessorRO {
        public:
         MetadataAccessorRO(const MasterService* service,
-                           const ObjectIdentity& object_id)
+                           ObjectIdentity object_id)
             : service_(service),
-              object_id_(object_id),
+              object_id_(std::move(object_id)),
               shard_idx_(service_->getMetadataShardIndex(object_id_.tenant_id,
                                                          object_id_.user_key)),
               shard_guard_(service_, shard_idx_),
@@ -1849,7 +1837,8 @@ class MasterService {
         const ObjectIdentity object_id_;
         const size_t shard_idx_;
         MetadataShardAccessorRO shard_guard_;
-        std::unordered_map<std::string, TenantState>::const_iterator tenant_it_;
+        std::unordered_map<TenantId, TenantState, TenantIdHash>::const_iterator
+            tenant_it_;
         const TenantState* tenant_state_;
         ObjectMetadataConstIterator it_;
         ProcessingConstIterator processing_it_;
@@ -2054,7 +2043,7 @@ class MasterService {
 
     struct ActiveDrainTask {
         UUID task_id;
-        std::string tenant_id;
+        TenantId tenant_id;
         std::string key;
         std::string source_segment;
         std::string target_segment;
@@ -2096,7 +2085,7 @@ class MasterService {
     std::optional<std::string> SelectDrainTargetForKey(
         const ObjectMetadata& metadata, const std::string& source_segment,
         const std::vector<std::string>& requested_targets);
-    std::string MakeDrainUnitKey(const std::string& tenant_id,
+    std::string MakeDrainUnitKey(const TenantId& tenant_id,
                                  const std::string& key,
                                  const std::string& source_segment) const;
 
@@ -2114,18 +2103,18 @@ class MasterService {
     static std::string MediumForMetadata(const ObjectMetadata& metadata);
     void PublishKvStored(const std::string& key, ReplicaType replica_type,
                          const ObjectMetadata& metadata,
-                         const std::string& tenant_id);
+                         const TenantId& tenant_id);
     void PublishKvRemoved(const std::string& key,
                           const ObjectMetadata& metadata,
-                          const std::string& tenant_id);
+                          const TenantId& tenant_id);
     void PublishKvRemoved(const std::string& key, const std::string& medium,
-                          const std::string& tenant_id,
+                          const TenantId& tenant_id,
                           const std::string& group_id);
     void PublishKvRemovedAfterEvict(const std::string& key,
                                     uint64_t freed_bytes,
                                     const std::string& medium,
                                     const ObjectMetadata& metadata,
-                                    const std::string& tenant_id);
+                                    const TenantId& tenant_id);
 };
 
 }  // namespace mooncake
