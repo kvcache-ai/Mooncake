@@ -20,6 +20,11 @@ struct ReceiverCreditRuntimeConfig {
     static constexpr uint32_t kDefaultFreshnessTtlMs = 1000;
     static constexpr uint32_t kDefaultRetryAfterUs = 1000;
     static constexpr uint32_t kDefaultProgressIntervalUs = 1000;
+    static constexpr size_t kDefaultAdaptiveMinOwners = 1;
+    static constexpr size_t kDefaultAdaptiveInitialOwners = 2;
+    static constexpr size_t kDefaultAdaptiveMaxOwners = 2;
+    static constexpr uint32_t kDefaultAdaptiveSlowRttUs = 1000;
+    static constexpr uint32_t kDefaultAdaptiveHealthyPulls = 4096;
 
     CreditRolloutMode mode{CreditRolloutMode::Disabled};
     std::array<uint64_t, kCreditResourceCount> capacity{};
@@ -29,6 +34,12 @@ struct ReceiverCreditRuntimeConfig {
     uint32_t retry_after_us{kDefaultRetryAfterUs};
     uint32_t progress_interval_us{kDefaultProgressIntervalUs};
     uint32_t default_qos_class{0};
+    bool adaptive_dispatch_enabled{true};
+    size_t adaptive_dispatch_min_owners{kDefaultAdaptiveMinOwners};
+    size_t adaptive_dispatch_initial_owners{kDefaultAdaptiveInitialOwners};
+    size_t adaptive_dispatch_max_owners{kDefaultAdaptiveMaxOwners};
+    uint32_t adaptive_dispatch_slow_rtt_us{kDefaultAdaptiveSlowRttUs};
+    uint32_t adaptive_dispatch_healthy_pulls{kDefaultAdaptiveHealthyPulls};
 };
 
 // Loads and validates the receiver_credit section. The output is changed only

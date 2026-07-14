@@ -46,7 +46,15 @@ TEST(ReceiverCreditConfig, LoadsCompleteNestedRequiredConfiguration) {
           "control": {
             "freshness_ttl_ms": 500,
             "retry_after_us": 200,
-            "poll_interval_us": 50
+            "poll_interval_us": 50,
+            "adaptive_dispatch": {
+              "enabled": true,
+              "min_owners": 1,
+              "initial_owners": 2,
+              "max_owners": 8,
+              "slow_rtt_us": 1500,
+              "healthy_pulls_per_increase": 1024
+            }
           },
           "limits": {"max_peers": 4096}
         }
@@ -69,6 +77,12 @@ TEST(ReceiverCreditConfig, LoadsCompleteNestedRequiredConfiguration) {
     EXPECT_EQ(output.freshness_ttl_ms, 500);
     EXPECT_EQ(output.retry_after_us, 200);
     EXPECT_EQ(output.progress_interval_us, 50);
+    EXPECT_TRUE(output.adaptive_dispatch_enabled);
+    EXPECT_EQ(output.adaptive_dispatch_min_owners, 1);
+    EXPECT_EQ(output.adaptive_dispatch_initial_owners, 2);
+    EXPECT_EQ(output.adaptive_dispatch_max_owners, 8);
+    EXPECT_EQ(output.adaptive_dispatch_slow_rtt_us, 1500);
+    EXPECT_EQ(output.adaptive_dispatch_healthy_pulls, 1024);
 }
 
 TEST(ReceiverCreditConfig, SupportsOptionalModeAndLegacyAliases) {
@@ -249,6 +263,27 @@ TEST(ReceiverCreditConfig, EnforcesControlAndPeerBounds) {
       })",
                      false, output)
                     .IsInvalidArgument());
+    EXPECT_TRUE(load(R"({
+        "receiver_credit": {"control": {"adaptive_dispatch": {
+          "min_owners": 4, "initial_owners": 2, "max_owners": 8
+        }}}
+      })",
+                     false, output)
+                    .IsInvalidArgument());
+    EXPECT_TRUE(load(R"({
+        "receiver_credit": {"control": {"adaptive_dispatch": {
+          "min_owners": 1, "initial_owners": 4, "max_owners": 2
+        }}}
+      })",
+                     false, output)
+                    .IsInvalidArgument());
+    EXPECT_TRUE(load(R"({
+        "receiver_credit": {"control": {"adaptive_dispatch": {
+          "enabled": "true"
+        }}}
+      })",
+                     false, output)
+                    .IsInvalidArgument());
 }
 
 TEST(ReceiverCreditConfig, MvpOnlyAcceptsQosClassZero) {
@@ -268,6 +303,12 @@ TEST(ReceiverCreditConfig, FailureLeavesOutputUnchanged) {
     output.retry_after_us = 31;
     output.progress_interval_us = 37;
     output.default_qos_class = 41;
+    output.adaptive_dispatch_enabled = false;
+    output.adaptive_dispatch_min_owners = 43;
+    output.adaptive_dispatch_initial_owners = 47;
+    output.adaptive_dispatch_max_owners = 53;
+    output.adaptive_dispatch_slow_rtt_us = 59;
+    output.adaptive_dispatch_healthy_pulls = 61;
     const auto before = output;
 
     EXPECT_TRUE(load(R"({"receiver_credit": {"mode": "broken"}})", true, output)
@@ -280,6 +321,18 @@ TEST(ReceiverCreditConfig, FailureLeavesOutputUnchanged) {
     EXPECT_EQ(output.retry_after_us, before.retry_after_us);
     EXPECT_EQ(output.progress_interval_us, before.progress_interval_us);
     EXPECT_EQ(output.default_qos_class, before.default_qos_class);
+    EXPECT_EQ(output.adaptive_dispatch_enabled,
+              before.adaptive_dispatch_enabled);
+    EXPECT_EQ(output.adaptive_dispatch_min_owners,
+              before.adaptive_dispatch_min_owners);
+    EXPECT_EQ(output.adaptive_dispatch_initial_owners,
+              before.adaptive_dispatch_initial_owners);
+    EXPECT_EQ(output.adaptive_dispatch_max_owners,
+              before.adaptive_dispatch_max_owners);
+    EXPECT_EQ(output.adaptive_dispatch_slow_rtt_us,
+              before.adaptive_dispatch_slow_rtt_us);
+    EXPECT_EQ(output.adaptive_dispatch_healthy_pulls,
+              before.adaptive_dispatch_healthy_pulls);
 }
 
 }  // namespace

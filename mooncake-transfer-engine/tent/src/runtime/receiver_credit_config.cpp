@@ -14,6 +14,7 @@ namespace mooncake::tent {
 namespace {
 
 constexpr size_t kMaxPeers = 65536;
+constexpr size_t kMaxDispatchOwners = 65536;
 constexpr size_t kDataBytesIndex =
     static_cast<size_t>(CreditResource::DataBytes) - 1;
 constexpr size_t kRequestSlotsIndex =
@@ -70,6 +71,20 @@ Status readPositiveUint32(const json& object, const char* key,
     if (value == 0 || value > std::numeric_limits<uint32_t>::max())
         return invalidConfig(path + "." + key, "out of range");
     output = static_cast<uint32_t>(value);
+    return Status::OK();
+}
+
+Status readPositiveSize(const json& object, const char* key,
+                        const std::string& path, size_t maximum,
+                        size_t& output) {
+    auto it = object.find(key);
+    if (it == object.end()) return Status::OK();
+    if (!it->is_number_unsigned())
+        return invalidConfig(path + "." + key, "expected a positive integer");
+    uint64_t value = it->get<uint64_t>();
+    if (value == 0 || value > maximum)
+        return invalidConfig(path + "." + key, "out of range");
+    output = static_cast<size_t>(value);
     return Status::OK();
 }
 
@@ -234,9 +249,10 @@ Status loadReceiverCreditConfig(const Config& config,
         auto control_it = section->find("control");
         if (control_it != section->end()) {
             CHECK_STATUS(requireObject(*control_it, "receiver_credit.control"));
-            CHECK_STATUS(rejectUnknownKeys(
-                *control_it, "receiver_credit.control",
-                {"freshness_ttl_ms", "retry_after_us", "poll_interval_us"}));
+            CHECK_STATUS(
+                rejectUnknownKeys(*control_it, "receiver_credit.control",
+                                  {"freshness_ttl_ms", "retry_after_us",
+                                   "poll_interval_us", "adaptive_dispatch"}));
             CHECK_STATUS(readPositiveUint32(*control_it, "freshness_ttl_ms",
                                             "receiver_credit.control",
                                             parsed.freshness_ttl_ms));
@@ -246,6 +262,46 @@ Status loadReceiverCreditConfig(const Config& config,
             CHECK_STATUS(readPositiveUint32(*control_it, "poll_interval_us",
                                             "receiver_credit.control",
                                             parsed.progress_interval_us));
+
+            auto adaptive_it = control_it->find("adaptive_dispatch");
+            if (adaptive_it != control_it->end()) {
+                const std::string path =
+                    "receiver_credit.control.adaptive_dispatch";
+                CHECK_STATUS(requireObject(*adaptive_it, path));
+                CHECK_STATUS(rejectUnknownKeys(
+                    *adaptive_it, path,
+                    {"enabled", "min_owners", "initial_owners", "max_owners",
+                     "slow_rtt_us", "healthy_pulls_per_increase"}));
+                auto enabled_it = adaptive_it->find("enabled");
+                if (enabled_it != adaptive_it->end()) {
+                    if (!enabled_it->is_boolean())
+                        return invalidConfig(path + ".enabled",
+                                             "expected boolean");
+                    parsed.adaptive_dispatch_enabled = enabled_it->get<bool>();
+                }
+                CHECK_STATUS(readPositiveSize(
+                    *adaptive_it, "min_owners", path, kMaxDispatchOwners,
+                    parsed.adaptive_dispatch_min_owners));
+                CHECK_STATUS(readPositiveSize(
+                    *adaptive_it, "initial_owners", path, kMaxDispatchOwners,
+                    parsed.adaptive_dispatch_initial_owners));
+                CHECK_STATUS(readPositiveSize(
+                    *adaptive_it, "max_owners", path, kMaxDispatchOwners,
+                    parsed.adaptive_dispatch_max_owners));
+                CHECK_STATUS(
+                    readPositiveUint32(*adaptive_it, "slow_rtt_us", path,
+                                       parsed.adaptive_dispatch_slow_rtt_us));
+                CHECK_STATUS(readPositiveUint32(
+                    *adaptive_it, "healthy_pulls_per_increase", path,
+                    parsed.adaptive_dispatch_healthy_pulls));
+                if (parsed.adaptive_dispatch_min_owners >
+                        parsed.adaptive_dispatch_initial_owners ||
+                    parsed.adaptive_dispatch_initial_owners >
+                        parsed.adaptive_dispatch_max_owners)
+                    return invalidConfig(
+                        path,
+                        "expected min_owners <= initial_owners <= max_owners");
+            }
         }
 
         auto limits_it = section->find("limits");
