@@ -14,24 +14,553 @@
   },
   "editable": true,
   "gnetId": null,
-  "graphTooltip": 0,
+  "graphTooltip": 1,
   "links": [],
   "panels": [
     {
-      "title": "RPC Requests",
-      "type": "graph",
+      "title": "Memory Usage",
+      "type": "gauge",
       "datasource": "Prometheus",
-      "gridPos": {
-        "h": 9,
-        "w": 12,
-        "x": 0,
-        "y": 0
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+      "id": 1,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.7 },
+              { "color": "red", "value": 0.9 }
+            ]
+          }
+        }
       },
-      "id": 2,
       "targets": [
         {
-          "expr": "rate(mooncake_master_rpc_requests_total[5m])",
-          "legendFormat": "{{method}}",
+          "expr": "master_allocated_bytes / master_total_capacity_bytes",
+          "legendFormat": "DRAM Usage",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "title": "Key Count",
+      "type": "stat",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 6, "w": 3, "x": 6, "y": 0 },
+      "id": 2,
+      "fieldConfig": {
+        "defaults": { "unit": "short" }
+      },
+      "targets": [
+        {
+          "expr": "master_key_count",
+          "legendFormat": "Keys",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "title": "Active Clients",
+      "type": "stat",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 6, "w": 3, "x": 9, "y": 0 },
+      "id": 3,
+      "fieldConfig": {
+        "defaults": { "unit": "short" }
+      },
+      "targets": [
+        {
+          "expr": "master_active_clients",
+          "legendFormat": "Clients",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "title": "File Storage Usage",
+      "type": "gauge",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 0 },
+      "id": 4,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.7 },
+              { "color": "red", "value": 0.9 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "master_allocated_file_size_bytes / master_total_file_capacity_bytes",
+          "legendFormat": "SSD/DFS Usage",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "title": "Soft Pinned Keys",
+      "type": "stat",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 6, "w": 3, "x": 18, "y": 0 },
+      "id": 5,
+      "fieldConfig": {
+        "defaults": { "unit": "short" }
+      },
+      "targets": [
+        {
+          "expr": "master_soft_pin_key_count",
+          "legendFormat": "Soft Pinned",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "title": "NoF SSD Usage",
+      "type": "gauge",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 6, "w": 3, "x": 21, "y": 0 },
+      "id": 6,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.7 },
+              { "color": "red", "value": 0.9 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "master_nof_allocated_bytes / master_total_nof_capacity_bytes",
+          "legendFormat": "NoF Usage",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "title": "Storage Capacity (Bytes)",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "id": 10,
+      "fieldConfig": {
+        "defaults": { "unit": "bytes" }
+      },
+      "targets": [
+        {
+          "expr": "master_allocated_bytes",
+          "legendFormat": "DRAM Allocated",
+          "refId": "A"
+        },
+        {
+          "expr": "master_total_capacity_bytes",
+          "legendFormat": "DRAM Capacity",
+          "refId": "B"
+        },
+        {
+          "expr": "master_allocated_file_size_bytes",
+          "legendFormat": "File Allocated",
+          "refId": "C"
+        },
+        {
+          "expr": "master_total_file_capacity_bytes",
+          "legendFormat": "File Capacity",
+          "refId": "D"
+        },
+        {
+          "expr": "master_nof_allocated_bytes",
+          "legendFormat": "NoF Allocated",
+          "refId": "E"
+        },
+        {
+          "expr": "master_total_nof_capacity_bytes",
+          "legendFormat": "NoF Capacity",
+          "refId": "F"
+        }
+      ]
+    },
+    {
+      "title": "Per-Segment Memory Usage (Bytes)",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "id": 11,
+      "fieldConfig": {
+        "defaults": { "unit": "bytes" }
+      },
+      "targets": [
+        {
+          "expr": "segment_allocated_bytes",
+          "legendFormat": "{{segment}} allocated",
+          "refId": "A"
+        },
+        {
+          "expr": "segment_total_capacity_bytes",
+          "legendFormat": "{{segment}} capacity",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "title": "Put/Get Request Rate",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+      "id": 20,
+      "fieldConfig": {
+        "defaults": { "unit": "reqps" }
+      },
+      "targets": [
+        {
+          "expr": "rate(master_put_start_requests_total[5m])",
+          "legendFormat": "PutStart",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(master_put_end_requests_total[5m])",
+          "legendFormat": "PutEnd",
+          "refId": "B"
+        },
+        {
+          "expr": "rate(master_get_replica_list_requests_total[5m])",
+          "legendFormat": "GetReplicaList",
+          "refId": "C"
+        },
+        {
+          "expr": "rate(master_remove_requests_total[5m])",
+          "legendFormat": "Remove",
+          "refId": "D"
+        },
+        {
+          "expr": "rate(master_exist_key_requests_total[5m])",
+          "legendFormat": "ExistKey",
+          "refId": "E"
+        }
+      ]
+    },
+    {
+      "title": "Request Failure Rate",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
+      "id": 21,
+      "fieldConfig": {
+        "defaults": { "unit": "reqps" }
+      },
+      "targets": [
+        {
+          "expr": "rate(master_put_start_failures_total[5m])",
+          "legendFormat": "PutStart Fail",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(master_put_start_alloc_failures_total[5m])",
+          "legendFormat": "PutStart Alloc Fail",
+          "refId": "B"
+        },
+        {
+          "expr": "rate(master_put_end_failures_total[5m])",
+          "legendFormat": "PutEnd Fail",
+          "refId": "C"
+        },
+        {
+          "expr": "rate(master_get_replica_list_failures_total[5m])",
+          "legendFormat": "GetReplicaList Fail",
+          "refId": "D"
+        },
+        {
+          "expr": "rate(master_put_revoke_failures_total[5m])",
+          "legendFormat": "PutRevoke Fail",
+          "refId": "E"
+        }
+      ]
+    },
+    {
+      "title": "Cache Hit Rate",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 22 },
+      "id": 30,
+      "fieldConfig": {
+        "defaults": { "unit": "ops" }
+      },
+      "targets": [
+        {
+          "expr": "rate(mem_cache_hit_nums_[5m])",
+          "legendFormat": "Memory Hits/s",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(file_cache_hit_nums_[5m])",
+          "legendFormat": "SSD Hits/s",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "title": "Cached Objects",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 22 },
+      "id": 32,
+      "fieldConfig": {
+        "defaults": { "unit": "short" }
+      },
+      "targets": [
+        {
+          "expr": "mem_cache_nums_",
+          "legendFormat": "Memory Objects",
+          "refId": "A"
+        },
+        {
+          "expr": "file_cache_nums_",
+          "legendFormat": "SSD Objects",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "title": "Eviction Count Rate",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 22 },
+      "id": 31,
+      "fieldConfig": {
+        "defaults": { "unit": "ops" }
+      },
+      "targets": [
+        {
+          "expr": "rate(master_evicted_key_count[5m])",
+          "legendFormat": "Evicted Keys/s",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(master_successful_evictions_total[5m])",
+          "legendFormat": "Success/s",
+          "refId": "B"
+        },
+        {
+          "expr": "rate(master_attempted_evictions_total[5m])",
+          "legendFormat": "Attempts/s",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "title": "Eviction Throughput",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 22 },
+      "id": 33,
+      "fieldConfig": {
+        "defaults": { "unit": "Bps" }
+      },
+      "targets": [
+        {
+          "expr": "rate(master_evicted_size_bytes[5m])",
+          "legendFormat": "Evicted Bytes/s",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "title": "Promotion (L2 → L1)",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 30 },
+      "id": 40,
+      "fieldConfig": {
+        "defaults": { "unit": "short" }
+      },
+      "targets": [
+        {
+          "expr": "master_promotion_in_flight",
+          "legendFormat": "In Flight",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(master_promotion_admitted_total[5m])",
+          "legendFormat": "Admitted/s",
+          "refId": "B"
+        },
+        {
+          "expr": "rate(master_promotion_completed_total[5m])",
+          "legendFormat": "Completed/s",
+          "refId": "C"
+        },
+        {
+          "expr": "rate(master_promotion_failed_total[5m])",
+          "legendFormat": "Failed/s",
+          "refId": "D"
+        },
+        {
+          "expr": "rate(master_promotion_rejected_frequency_total[5m])",
+          "legendFormat": "Rejected (frequency)/s",
+          "refId": "E"
+        },
+        {
+          "expr": "rate(master_promotion_rejected_watermark_total[5m])",
+          "legendFormat": "Rejected (watermark)/s",
+          "refId": "F"
+        },
+        {
+          "expr": "rate(master_promotion_rejected_cap_total[5m])",
+          "legendFormat": "Rejected (cap)/s",
+          "refId": "G"
+        }
+      ]
+    },
+    {
+      "title": "Value Size Distribution",
+      "type": "heatmap",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 30 },
+      "id": 41,
+      "targets": [
+        {
+          "expr": "rate(master_value_size_bytes_bucket[5m])",
+          "legendFormat": "{{le}}",
+          "refId": "A",
+          "format": "heatmap"
+        }
+      ]
+    },
+    {
+      "title": "Snapshot Operations",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 38 },
+      "id": 50,
+      "fieldConfig": {
+        "defaults": { "unit": "short" }
+      },
+      "targets": [
+        {
+          "expr": "rate(master_snapshot_success[5m])",
+          "legendFormat": "Snapshot Success/s",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(master_snapshot_fail[5m])",
+          "legendFormat": "Snapshot Fail/s",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "title": "NoF Heartbeat",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 38 },
+      "id": 51,
+      "fieldConfig": {
+        "defaults": { "unit": "short" }
+      },
+      "targets": [
+        {
+          "expr": "rate(master_nof_heartbeat_success_total[5m])",
+          "legendFormat": "HB Success/s",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(master_nof_heartbeat_failure_total[5m])",
+          "legendFormat": "HB Failure/s",
+          "refId": "B"
+        },
+        {
+          "expr": "rate(master_nof_heartbeat_timeout_total[5m])",
+          "legendFormat": "HB Timeout/s",
+          "refId": "C"
+        },
+        {
+          "expr": "rate(master_nof_segments_unmounted_by_heartbeat_total[5m])",
+          "legendFormat": "Segments Unmounted/s",
+          "refId": "D"
+        }
+      ]
+    },
+    {
+      "title": "Segment Mount/Unmount Rate",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 46 },
+      "id": 60,
+      "fieldConfig": {
+        "defaults": { "unit": "reqps" }
+      },
+      "targets": [
+        {
+          "expr": "rate(master_mount_segment_requests_total[5m])",
+          "legendFormat": "Mount",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(master_unmount_segment_requests_total[5m])",
+          "legendFormat": "Unmount",
+          "refId": "B"
+        },
+        {
+          "expr": "rate(master_remount_segment_requests_total[5m])",
+          "legendFormat": "Remount",
+          "refId": "C"
+        },
+        {
+          "expr": "rate(master_mount_segment_failures_total[5m])",
+          "legendFormat": "Mount Fail",
+          "refId": "D"
+        }
+      ]
+    },
+    {
+      "title": "PutStart Discard / Release Rate",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 46 },
+      "id": 61,
+      "fieldConfig": {
+        "defaults": { "unit": "ops" }
+      },
+      "targets": [
+        {
+          "expr": "rate(master_put_start_discard_cnt[5m])",
+          "legendFormat": "Discard/s",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(master_put_start_release_cnt[5m])",
+          "legendFormat": "Release/s",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "title": "Discarded Staging Size",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 46 },
+      "id": 62,
+      "fieldConfig": {
+        "defaults": { "unit": "bytes" }
+      },
+      "targets": [
+        {
+          "expr": "master_put_start_discarded_staging_size",
+          "legendFormat": "Staging Size",
           "refId": "A"
         }
       ]
@@ -39,29 +568,18 @@
   ],
   "schemaVersion": 22,
   "style": "dark",
-  "tags": [],
+  "tags": ["mooncake"],
   "templating": {
     "list": []
   },
-  "title": "Mooncake Master",
+  "title": "Mooncake Store Master",
   "time": {
     "from": "now-6h",
     "to": "now"
   },
   "timepicker": {
-    "refresh_intervals": [
-      "5s",
-      "10s",
-      "30s",
-      "1m",
-      "5m",
-      "15m",
-      "30m",
-      "1h",
-      "2h",
-      "1d"
-    ]
+    "refresh_intervals": ["5s", "10s", "30s", "1m", "5m"]
   },
   "timezone": "browser",
-  "version": 1
+  "version": 2
 }
