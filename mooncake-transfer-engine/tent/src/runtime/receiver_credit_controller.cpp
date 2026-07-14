@@ -20,6 +20,9 @@ constexpr size_t resourceIndex(CreditResource resource) {
 constexpr std::array<CreditResource, 2> kProductionResources{
     CreditResource::DataBytes, CreditResource::RequestSlots};
 
+constexpr std::array<uint64_t, 6> kPullLatencyBucketUpperNs{
+    100'000, 250'000, 500'000, 1'000'000, 10'000'000, 100'000'000};
+
 bool sameGeneration(const CreditPeerContextSnapshot& context,
                     const CreditActivationV1& activation) {
     return context.key.receiver_session == activation.receiver_session_id &&
@@ -196,6 +199,14 @@ void ReceiverCreditPullController::launch(PeerKey key) {
         request.resources.push_back(usage);
     }
 
+    {
+        std::lock_guard lock(mutex_);
+        auto it = peers_.find(key);
+        if (stopped_ || it == peers_.end()) return;
+        it->second.pull_started_at = std::chrono::steady_clock::now();
+        ++pulls_started_;
+    }
+
     auto self = shared_from_this();
     ControlClient::pullReceiverCreditAsync(
         rpc_agent_, server_addr, request,
@@ -295,6 +306,28 @@ Status ReceiverCreditPullController::applyResponse(
 
 void ReceiverCreditPullController::finish(
     PeerKey key, Status rpc_status, ReceiverCreditPullResponseV1 response) {
+    {
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard lock(mutex_);
+        auto it = peers_.find(key);
+        if (it != peers_.end() &&
+            it->second.pull_started_at.time_since_epoch().count() != 0) {
+            const auto elapsed = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    now - it->second.pull_started_at)
+                    .count());
+            it->second.pull_started_at = {};
+            ++pulls_completed_;
+            pull_latency_ns_sum_ += elapsed;
+            pull_latency_ns_max_ = std::max(pull_latency_ns_max_, elapsed);
+            size_t bucket = 0;
+            while (bucket < kPullLatencyBucketUpperNs.size() &&
+                   elapsed > kPullLatencyBucketUpperNs[bucket])
+                ++bucket;
+            ++pull_latency_buckets_[bucket];
+        }
+    }
+
     bool request_again = false;
     Status result = std::move(rpc_status);
     if (result.ok()) result = applyResponse(key, response, request_again);
@@ -336,6 +369,25 @@ size_t ReceiverCreditPullController::peerCount() const {
 void ReceiverCreditPullController::stop() {
     std::lock_guard lock(mutex_);
     stopped_ = true;
+    if (!summary_logged_) {
+        const double average_us =
+            pulls_completed_ == 0
+                ? 0.0
+                : static_cast<double>(pull_latency_ns_sum_) /
+                      static_cast<double>(pulls_completed_) / 1000.0;
+        LOG(INFO) << "Receiver credit pull summary: started=" << pulls_started_
+                  << " completed=" << pulls_completed_
+                  << " avg_us=" << average_us << " max_us="
+                  << static_cast<double>(pull_latency_ns_max_) / 1000.0
+                  << " buckets_le_100us=" << pull_latency_buckets_[0]
+                  << " le_250us=" << pull_latency_buckets_[1]
+                  << " le_500us=" << pull_latency_buckets_[2]
+                  << " le_1ms=" << pull_latency_buckets_[3]
+                  << " le_10ms=" << pull_latency_buckets_[4]
+                  << " le_100ms=" << pull_latency_buckets_[5]
+                  << " gt_100ms=" << pull_latency_buckets_[6];
+        summary_logged_ = true;
+    }
     peers_.clear();
 }
 

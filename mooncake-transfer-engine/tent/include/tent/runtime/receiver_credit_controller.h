@@ -5,6 +5,7 @@
 #define TENT_RUNTIME_RECEIVER_CREDIT_CONTROLLER_H
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -71,6 +72,7 @@ class ReceiverCreditPullController
         bool in_flight{false};
         bool dirty{false};
         CreditPeerState state{CreditPeerState::Negotiating};
+        std::chrono::steady_clock::time_point pull_started_at{};
     };
 
     ReceiverCreditPullController(
@@ -99,6 +101,12 @@ class ReceiverCreditPullController
 
     mutable std::mutex mutex_;
     bool stopped_{false};
+    bool summary_logged_{false};
+    uint64_t pulls_started_{0};
+    uint64_t pulls_completed_{0};
+    uint64_t pull_latency_ns_sum_{0};
+    uint64_t pull_latency_ns_max_{0};
+    std::array<uint64_t, 7> pull_latency_buckets_{};
     std::unordered_map<PeerKey, Peer, PeerKeyHash> peers_;
 };
 
