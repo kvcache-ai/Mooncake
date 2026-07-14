@@ -58,11 +58,7 @@ class RWSpinlock {
 
     void writeLockAggressive() {
         uint32_t count = 0;
-        RWTicket increment;
-        increment.users = 1;
-        RWTicket old(
-            ticket.fetch_add(increment.whole, std::memory_order_acquire));
-        uint16_t val = old.users;
+        uint16_t val = fetch_add_users(1);
         RWTicket t;
         while (val !=
                (t.whole = ticket.load(std::memory_order_acquire), t.write)) {
@@ -120,6 +116,20 @@ class RWSpinlock {
     void unlockShared() { fetch_add_write(1); }
 
    private:
+    uint16_t fetch_add_users(uint16_t delta) {
+        uint64_t expected = ticket.load(std::memory_order_relaxed);
+        uint64_t new_val;
+        RWTicket t;
+        do {
+            t.whole = expected;
+            t.users += delta;
+            new_val = t.whole;
+        } while (!ticket.compare_exchange_weak(expected, new_val,
+                                               std::memory_order_acquire,
+                                               std::memory_order_relaxed));
+        return static_cast<uint16_t>(t.users - delta);
+    }
+
     uint16_t fetch_add_read(uint16_t delta) {
         uint64_t expected = ticket.load(std::memory_order_relaxed);
         uint64_t new_val;
@@ -129,7 +139,7 @@ class RWSpinlock {
             t.read += delta;
             new_val = t.whole;
         } while (!ticket.compare_exchange_weak(expected, new_val,
-                                               std::memory_order_acquire));
+                                               std::memory_order_release));
         return static_cast<uint16_t>(t.read - delta);
     }
 
