@@ -115,9 +115,9 @@ class ControlClient {
 
     using OnReceiverCreditPull =
         std::function<void(Status, ReceiverCreditPullResponseV1)>;
-    // Two reusable worker connections issue the same idempotent sequence; the
-    // first successful response wins, avoiding a TCP retransmission tail from
-    // stalling receiver-credit progress.
+    // A second reusable worker connection hedges the same idempotent sequence
+    // only when the primary has not completed promptly; the first successful
+    // response wins, avoiding a TCP retransmission tail from stalling credit.
     static void pullReceiverCreditAsync(
         const std::shared_ptr<CoroRpcAgent>& agent,
         const std::string& server_addr,
