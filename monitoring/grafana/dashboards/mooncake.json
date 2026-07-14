@@ -1,67 +1,909 @@
 {
-  "annotations": {
-    "list": [
-      {
-        "builtIn": 1,
-        "datasource": "-- Grafana --",
-        "enable": true,
-        "hide": true,
-        "iconColor": "rgba(0, 211, 255, 1)",
-        "name": "Annotations & Alerts",
-        "type": "dashboard"
-      }
-    ]
-  },
+  "annotations": { "list": [ { "builtIn": 1, "datasource": "-- Grafana --", "enable": true, "hide": true, "iconColor": "rgba(0, 211, 255, 1)", "name": "Annotations & Alerts", "type": "dashboard" } ] },
   "editable": true,
   "gnetId": null,
+  "refresh": "500ms",
   "graphTooltip": 0,
   "links": [],
   "panels": [
     {
-      "title": "RPC Requests",
-      "type": "graph",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "id": 100,
+      "panels": [],
+      "title": "Cluster Overview",
+      "type": "row"
+    },
+    {
       "datasource": "Prometheus",
-      "gridPos": {
-        "h": 9,
-        "w": 12,
-        "x": 0,
-        "y": 0
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "thresholds" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" },
+        "overrides": []
       },
-      "id": 2,
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+      "id": 101,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "expr": "master_active_clients", "legendFormat": "", "refId": "A" }],
+      "title": "Active Clients",
+      "type": "stat"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "thresholds" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 1000000 }, { "color": "red", "value": 10000000 } ] }, "unit": "short" },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
+      "id": 102,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "expr": "master_key_count", "legendFormat": "Keys", "refId": "A" }],
+      "title": "Total Keys",
+      "type": "stat"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "thresholds" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
+      "id": 103,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "expr": "master_soft_pin_key_count", "legendFormat": "Soft Pinned", "refId": "A" }],
+      "title": "Soft Pinned Keys",
+      "type": "stat"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "bytes" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
+      "id": 104,
+      "options": { "legend": { "calcs": ["mean", "lastNotNull", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
-        {
-          "expr": "rate(mooncake_master_rpc_requests_total[5m])",
-          "legendFormat": "{{method}}",
-          "refId": "A"
-        }
-      ]
+        { "expr": "master_allocated_bytes", "legendFormat": "Memory Allocated", "refId": "A" },
+        { "expr": "master_total_capacity_bytes", "legendFormat": "Memory Capacity", "refId": "B" }
+      ],
+      "title": "Memory Storage",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "thresholds" }, "mappings": [], "max": 100, "min": 0, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 70 }, { "color": "red", "value": 90 } ] }, "unit": "percent" },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 5 },
+      "id": 105,
+      "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "expr": "100 * master_allocated_bytes / master_total_capacity_bytes", "legendFormat": "", "refId": "A" }],
+      "title": "Memory Usage %",
+      "type": "stat"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "thresholds" }, "mappings": [], "max": 100, "min": 0, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 70 }, { "color": "red", "value": 90 } ] }, "unit": "percent" },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 5 },
+      "id": 106,
+      "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "expr": "100 * master_nof_allocated_bytes / master_total_nof_capacity_bytes", "legendFormat": "", "refId": "A" }],
+      "title": "NoF SSD Usage %",
+      "type": "stat"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "thresholds" }, "mappings": [], "max": 100, "min": 0, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 70 }, { "color": "red", "value": 90 } ] }, "unit": "percent" },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 5 },
+      "id": 107,
+      "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "expr": "100 * master_allocated_file_size_bytes / master_total_file_capacity_bytes", "legendFormat": "", "refId": "A" }],
+      "title": "File Storage Usage %",
+      "type": "stat"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "bytes" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 9 },
+      "id": 108,
+      "options": { "legend": { "calcs": ["mean", "lastNotNull", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "master_nof_allocated_bytes", "legendFormat": "NoF SSD Allocated", "refId": "A" },
+        { "expr": "master_total_nof_capacity_bytes", "legendFormat": "NoF SSD Capacity", "refId": "B" }
+      ],
+      "title": "NoF SSD Storage",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
+      "id": 200,
+      "panels": [],
+      "title": "RPC QPS — Core Operations",
+      "type": "row"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "reqps" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 10 },
+      "id": 201,
+      "options": { "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "rate(master_put_start_requests_total[5m])", "legendFormat": "PutStart", "refId": "A" },
+        { "expr": "rate(master_put_end_requests_total[5m])", "legendFormat": "PutEnd", "refId": "B" },
+        { "expr": "rate(master_put_revoke_requests_total[5m])", "legendFormat": "PutRevoke", "refId": "C" }
+      ],
+      "title": "Put Operations QPS",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "reqps" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 10 },
+      "id": 202,
+      "options": { "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "rate(master_get_replica_list_requests_total[5m])", "legendFormat": "GetReplicaList", "refId": "A" },
+        { "expr": "rate(master_get_replica_list_by_regex_requests_total[5m])", "legendFormat": "GetReplicaListByRegex", "refId": "B" },
+        { "expr": "rate(master_exist_key_requests_total[5m])", "legendFormat": "ExistKey", "refId": "C" }
+      ],
+      "title": "Get / Query Operations QPS",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "reqps" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 10 },
+      "id": 203,
+      "options": { "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "rate(master_remove_requests_total[5m])", "legendFormat": "Remove", "refId": "A" },
+        { "expr": "rate(master_remove_by_regex_requests_total[5m])", "legendFormat": "RemoveByRegex", "refId": "B" },
+        { "expr": "rate(master_remove_all_requests_total[5m])", "legendFormat": "RemoveAll", "refId": "C" },
+        { "expr": "rate(master_ping_requests_total[5m])", "legendFormat": "Ping", "refId": "D" }
+      ],
+      "title": "Remove / Ping Operations QPS",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "reqps" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 18 },
+      "id": 204,
+      "options": { "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "rate(master_put_start_failures_total[5m])", "legendFormat": "PutStart Fail", "refId": "A" },
+        { "expr": "rate(master_put_start_alloc_failures_total[5m])", "legendFormat": "PutStart Alloc Fail", "refId": "B" },
+        { "expr": "rate(master_put_end_failures_total[5m])", "legendFormat": "PutEnd Fail", "refId": "C" },
+        { "expr": "rate(master_put_revoke_failures_total[5m])", "legendFormat": "PutRevoke Fail", "refId": "D" }
+      ],
+      "title": "Put Failure Rates",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "reqps" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 18 },
+      "id": 205,
+      "options": { "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "rate(master_get_replica_list_failures_total[5m])", "legendFormat": "GetReplicaList Fail", "refId": "A" },
+        { "expr": "rate(master_get_replica_list_by_regex_failures_total[5m])", "legendFormat": "GetByRegex Fail", "refId": "B" },
+        { "expr": "rate(master_exist_key_failures_total[5m])", "legendFormat": "ExistKey Fail", "refId": "C" },
+        { "expr": "rate(master_remove_failures_total[5m])", "legendFormat": "Remove Fail", "refId": "D" },
+        { "expr": "rate(master_ping_failures_total[5m])", "legendFormat": "Ping Fail", "refId": "E" }
+      ],
+      "title": "Get / Remove / Ping Failure Rates",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "reqps" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 18 },
+      "id": 206,
+      "options": { "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "rate(master_remove_by_regex_failures_total[5m])", "legendFormat": "RemoveByRegex Fail", "refId": "A" },
+        { "expr": "rate(master_remove_all_failures_total[5m])", "legendFormat": "RemoveAll Fail", "refId": "B" }
+      ],
+      "title": "Other Failure Rates",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 26 },
+      "id": 300,
+      "panels": [],
+      "title": "Segment Lifecycle Ops",
+      "type": "row"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "reqps" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 27 },
+      "id": 301,
+      "options": { "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "rate(master_mount_segment_requests_total[5m])", "legendFormat": "Mount MEM", "refId": "A" },
+        { "expr": "rate(master_unmount_segment_requests_total[5m])", "legendFormat": "Unmount MEM", "refId": "B" },
+        { "expr": "rate(master_remount_segment_requests_total[5m])", "legendFormat": "Remount MEM", "refId": "C" }
+      ],
+      "title": "Memory Segment Mount / Unmount / Remount Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "reqps" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 27 },
+      "id": 302,
+      "options": { "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "rate(master_mount_nof_segment_requests_total[5m])", "legendFormat": "Mount NoF", "refId": "A" },
+        { "expr": "rate(master_unmount_nof_segment_requests_total[5m])", "legendFormat": "Unmount NoF", "refId": "B" },
+        { "expr": "rate(master_remount_nof_segment_requests_total[5m])", "legendFormat": "Remount NoF", "refId": "C" }
+      ],
+      "title": "NoF SSD Segment Mount / Unmount / Remount Rate",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 35 },
+      "id": 400,
+      "panels": [],
+      "title": "Copy / Move / Task Operations",
+      "type": "row"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "reqps" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 36 },
+      "id": 401,
+      "options": { "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "rate(master_copy_start_requests_total[5m])", "legendFormat": "CopyStart", "refId": "A" },
+        { "expr": "rate(master_copy_end_requests_total[5m])", "legendFormat": "CopyEnd", "refId": "B" },
+        { "expr": "rate(master_copy_revoke_requests_total[5m])", "legendFormat": "CopyRevoke", "refId": "C" }
+      ],
+      "title": "Copy Protocol Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "reqps" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 36 },
+      "id": 402,
+      "options": { "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "rate(master_move_start_requests_total[5m])", "legendFormat": "MoveStart", "refId": "A" },
+        { "expr": "rate(master_move_end_requests_total[5m])", "legendFormat": "MoveEnd", "refId": "B" },
+        { "expr": "rate(master_move_revoke_requests_total[5m])", "legendFormat": "MoveRevoke", "refId": "C" }
+      ],
+      "title": "Move Protocol Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "reqps" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 36 },
+      "id": 403,
+      "options": { "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "rate(master_create_copy_task_requests_total[5m])", "legendFormat": "CreateCopyTask", "refId": "A" },
+        { "expr": "rate(master_create_move_task_requests_total[5m])", "legendFormat": "CreateMoveTask", "refId": "B" },
+        { "expr": "rate(master_query_task_requests_total[5m])", "legendFormat": "QueryTask", "refId": "C" },
+        { "expr": "rate(master_fetch_tasks_requests_total[5m])", "legendFormat": "FetchTasks", "refId": "D" },
+        { "expr": "rate(master_update_task_requests_total[5m])", "legendFormat": "MarkTaskComplete", "refId": "E" },
+        { "expr": "rate(master_evict_disk_replica_requests_total[5m])", "legendFormat": "EvictDiskReplica", "refId": "F" }
+      ],
+      "title": "Task Management Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "reqps" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 44 },
+      "id": 404,
+      "options": { "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "rate(master_copy_start_failures_total[5m])", "legendFormat": "CopyStart Fail", "refId": "A" },
+        { "expr": "rate(master_copy_end_failures_total[5m])", "legendFormat": "CopyEnd Fail", "refId": "B" },
+        { "expr": "rate(master_move_start_failures_total[5m])", "legendFormat": "MoveStart Fail", "refId": "C" },
+        { "expr": "rate(master_move_end_failures_total[5m])", "legendFormat": "MoveEnd Fail", "refId": "D" },
+        { "expr": "rate(master_create_copy_task_failures_total[5m])", "legendFormat": "CreateCopyTask Fail", "refId": "E" },
+        { "expr": "rate(master_create_move_task_failures_total[5m])", "legendFormat": "CreateMoveTask Fail", "refId": "F" }
+      ],
+      "title": "Copy / Move / Task Failure Rates",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 52 },
+      "id": 500,
+      "panels": [],
+      "title": "Eviction Statistics",
+      "type": "row"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 53 },
+      "id": 501,
+      "options": { "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "rate(master_attempted_evictions_total[5m])", "legendFormat": "Total Attempts", "refId": "A" },
+        { "expr": "rate(master_successful_evictions_total[5m])", "legendFormat": "Total Success", "refId": "B" }
+      ],
+      "title": "Total Eviction Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 53 },
+      "id": 502,
+      "options": { "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "rate(master_attempted_evictions_mem[5m])", "legendFormat": "MEM Attempts", "refId": "A" },
+        { "expr": "rate(master_successful_evictions_mem[5m])", "legendFormat": "MEM Success", "refId": "B" },
+        { "expr": "rate(master_attempted_evictions_nof[5m])", "legendFormat": "NoF Attempts", "refId": "C" },
+        { "expr": "rate(master_successful_evictions_nof[5m])", "legendFormat": "NoF Success", "refId": "D" }
+      ],
+      "title": "MEM vs NoF Eviction Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 53 },
+      "id": 503,
+      "options": { "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "rate(master_evicted_key_count[5m])", "legendFormat": "Total Keys", "refId": "A" },
+        { "expr": "rate(master_evicted_key_count_mem[5m])", "legendFormat": "MEM Keys", "refId": "B" },
+        { "expr": "rate(master_evicted_key_count_nof[5m])", "legendFormat": "NoF Keys", "refId": "C" }
+      ],
+      "title": "Evicted Keys Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "Bps" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 61 },
+      "id": 504,
+      "options": { "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "rate(master_evicted_size_bytes[5m])", "legendFormat": "Total Bytes", "refId": "A" },
+        { "expr": "rate(master_evicted_size_bytes_mem[5m])", "legendFormat": "MEM Bytes", "refId": "B" },
+        { "expr": "rate(master_evicted_size_bytes_nof[5m])", "legendFormat": "NoF Bytes", "refId": "C" }
+      ],
+      "title": "Evicted Bytes Rate",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 69 },
+      "id": 600,
+      "panels": [],
+      "title": "Promotion-on-Hit",
+      "type": "row"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "thresholds" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 100 }, { "color": "red", "value": 1000 } ] }, "unit": "short" },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 3, "x": 0, "y": 70 },
+      "id": 601,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "expr": "master_promotion_in_flight", "legendFormat": "", "refId": "A" }],
+      "title": "In-Flight",
+      "type": "stat"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "thresholds" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 3, "x": 3, "y": 70 },
+      "id": 602,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "expr": "master_promotion_admitted_total", "legendFormat": "", "refId": "A" }],
+      "title": "Admitted",
+      "type": "stat"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "thresholds" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 3, "x": 6, "y": 70 },
+      "id": 603,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "expr": "master_promotion_completed_total", "legendFormat": "", "refId": "A" }],
+      "title": "Completed",
+      "type": "stat"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "thresholds" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 0 } ] }, "unit": "short" },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 3, "x": 9, "y": 70 },
+      "id": 604,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "expr": "master_promotion_failed_total", "legendFormat": "", "refId": "A" }],
+      "title": "Failed",
+      "type": "stat"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "thresholds" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "orange", "value": null } ] }, "unit": "short" },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 3, "x": 12, "y": 70 },
+      "id": 605,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "expr": "master_promotion_cancelled_total", "legendFormat": "", "refId": "A" }],
+      "title": "Cancelled",
+      "type": "stat"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "thresholds" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "orange", "value": null } ] }, "unit": "short" },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 3, "x": 15, "y": 70 },
+      "id": 606,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "expr": "master_promotion_expired_total", "legendFormat": "", "refId": "A" }],
+      "title": "Expired",
+      "type": "stat"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "thresholds" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "blue", "value": null } ] }, "unit": "decbytes" },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 3, "x": 18, "y": 70 },
+      "id": 607,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "expr": "master_promotion_completed_bytes_total", "legendFormat": "", "refId": "A" }],
+      "title": "Completed Bytes",
+      "type": "stat"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "thresholds" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "purple", "value": null } ] }, "unit": "short" },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 3, "x": 21, "y": 70 },
+      "id": 608,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [
+        { "expr": "master_promotion_rejected_frequency_total + master_promotion_rejected_watermark_total + master_promotion_rejected_cap_total", "legendFormat": "", "refId": "A" }
+      ],
+      "title": "Total Rejected",
+      "type": "stat"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "reqps" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 74 },
+      "id": 609,
+      "options": { "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "rate(master_promotion_admitted_total[5m])", "legendFormat": "Admitted", "refId": "A" },
+        { "expr": "rate(master_promotion_completed_total[5m])", "legendFormat": "Completed", "refId": "B" },
+        { "expr": "rate(master_promotion_failed_total[5m])", "legendFormat": "Failed", "refId": "C" },
+        { "expr": "rate(master_promotion_cancelled_total[5m])", "legendFormat": "Cancelled", "refId": "D" },
+        { "expr": "rate(master_promotion_expired_total[5m])", "legendFormat": "Expired", "refId": "E" }
+      ],
+      "title": "Promotion Lifecycle Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "reqps" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 74 },
+      "id": 610,
+      "options": { "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "rate(master_promotion_rejected_frequency_total[5m])", "legendFormat": "Rejected: Freq", "refId": "A" },
+        { "expr": "rate(master_promotion_rejected_watermark_total[5m])", "legendFormat": "Rejected: Watermark", "refId": "B" },
+        { "expr": "rate(master_promotion_rejected_cap_total[5m])", "legendFormat": "Rejected: Cap", "refId": "C" }
+      ],
+      "title": "Promotion Rejection Rate",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 82 },
+      "id": 700,
+      "panels": [],
+      "title": "Cache Hit Statistics",
+      "type": "row"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 83 },
+      "id": 701,
+      "options": { "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "rate(mem_cache_hit_nums_[5m])", "legendFormat": "MEM Hits", "refId": "A" },
+        { "expr": "rate(file_cache_hit_nums_[5m])", "legendFormat": "SSD Hits", "refId": "B" }
+      ],
+      "title": "Cache Hit Count Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "Bps" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 83 },
+      "id": 702,
+      "options": { "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "rate(mem_cache_hit_bytes_total[5m])", "legendFormat": "MEM Bytes", "refId": "A" },
+        { "expr": "rate(file_cache_hit_bytes_total[5m])", "legendFormat": "SSD Bytes", "refId": "B" }
+      ],
+      "title": "Cache Hit Bytes Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 83 },
+      "id": 703,
+      "options": { "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "mem_cache_nums_", "legendFormat": "MEM Objects", "refId": "A" },
+        { "expr": "file_cache_nums_", "legendFormat": "SSD Objects", "refId": "B" }
+      ],
+      "title": "Current Cached Objects",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "thresholds" }, "mappings": [], "max": 100, "min": 0, "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "orange", "value": 50 }, { "color": "green", "value": 80 } ] }, "unit": "percent" },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 91 },
+      "id": 704,
+      "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "expr": "100 * rate(mem_cache_hit_nums_[5m]) / (rate(mem_cache_hit_nums_[5m]) + rate(file_cache_hit_nums_[5m]) + 1)", "legendFormat": "", "refId": "A" }],
+      "title": "MEM Hit Ratio % (Store-observed)",
+      "type": "stat"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "thresholds" }, "mappings": [], "max": 100, "min": 0, "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "orange", "value": 80 }, { "color": "green", "value": 95 } ] }, "unit": "percent" },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 91 },
+      "id": 705,
+      "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "expr": "100 * rate(valid_get_nums_[5m]) / (rate(total_get_nums_[5m]) + 1)", "legendFormat": "", "refId": "A" }],
+      "title": "Valid Get Rate %",
+      "type": "stat"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "reqps" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 91 },
+      "id": 706,
+      "options": { "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "rate(valid_get_nums_[5m])", "legendFormat": "Valid Gets", "refId": "A" },
+        { "expr": "rate(total_get_nums_[5m])", "legendFormat": "Total Gets", "refId": "B" }
+      ],
+      "title": "Get Operations (Valid vs Total)",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 99 },
+      "id": 800,
+      "panels": [],
+      "title": "NoF Heartbeat & Health",
+      "type": "row"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 100 },
+      "id": 801,
+      "options": { "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "rate(master_nof_heartbeat_success_total[5m])", "legendFormat": "Success", "refId": "A" },
+        { "expr": "rate(master_nof_heartbeat_failure_total[5m])", "legendFormat": "Failure", "refId": "B" },
+        { "expr": "rate(master_nof_heartbeat_timeout_total[5m])", "legendFormat": "Timeout", "refId": "C" }
+      ],
+      "title": "NoF Heartbeat Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "thresholds" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] }, "unit": "short" },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 100 },
+      "id": 802,
+      "options": { "colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "expr": "master_nof_segments_unmounted_by_heartbeat_total", "legendFormat": "", "refId": "A" }],
+      "title": "Unmounted by Heartbeat",
+      "type": "stat"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "ms", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "ms" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 100 },
+      "id": 803,
+      "options": { "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "rate(master_nof_heartbeat_probe_latency_ms_bucket[5m])", "legendFormat": "le={{le}}ms", "refId": "A" }
+      ],
+      "title": "NoF Heartbeat Probe Latency (Histogram)",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 108 },
+      "id": 900,
+      "panels": [],
+      "title": "Snapshot Operations",
+      "type": "row"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "thresholds" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 109 },
+      "id": 901,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "expr": "master_snapshot_success", "legendFormat": "", "refId": "A" }],
+      "title": "Snapshot Success",
+      "type": "stat"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "thresholds" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] }, "unit": "short" },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 109 },
+      "id": 902,
+      "options": { "colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "expr": "master_snapshot_fail", "legendFormat": "", "refId": "A" }],
+      "title": "Snapshot Failures",
+      "type": "stat"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "ms", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "ms" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 16, "x": 8, "y": 109 },
+      "id": 903,
+      "options": { "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "rate(master_snapshot_duration_ms_bucket[5m])", "legendFormat": "le={{le}}ms", "refId": "A" }
+      ],
+      "title": "Snapshot Duration Distribution (Histogram)",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 117 },
+      "id": 1000,
+      "panels": [],
+      "title": "PutStart Discard / Staging",
+      "type": "row"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 118 },
+      "id": 1001,
+      "options": { "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "master_put_start_discard_cnt", "legendFormat": "Discarded", "refId": "A" },
+        { "expr": "master_put_start_release_cnt", "legendFormat": "Released", "refId": "B" }
+      ],
+      "title": "PutStart Discard / Release Cumulative",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "thresholds" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 1073741824 }, { "color": "red", "value": 10737418240 } ] }, "unit": "bytes" },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 118 },
+      "id": 1002,
+      "options": { "colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "expr": "master_put_start_discarded_staging_size", "legendFormat": "", "refId": "A" }],
+      "title": "Staging Size (Discarded not Released)",
+      "type": "stat"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 126 },
+      "id": 1100,
+      "panels": [],
+      "title": "Batch Operations (Overview)",
+      "type": "row"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "reqps" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 127 },
+      "id": 1101,
+      "options": { "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "rate(master_batch_put_start_requests_total[5m])", "legendFormat": "BatchPutStart", "refId": "A" },
+        { "expr": "rate(master_batch_put_end_requests_total[5m])", "legendFormat": "BatchPutEnd", "refId": "B" },
+        { "expr": "rate(master_batch_put_revoke_requests_total[5m])", "legendFormat": "BatchPutRevoke", "refId": "C" },
+        { "expr": "rate(master_batch_get_replica_list_requests_total[5m])", "legendFormat": "BatchGetReplicaList", "refId": "D" },
+        { "expr": "rate(master_batch_exist_key_requests_total[5m])", "legendFormat": "BatchExistKey", "refId": "E" },
+        { "expr": "rate(master_batch_query_ip_requests_total[5m])", "legendFormat": "BatchQueryIp", "refId": "F" },
+        { "expr": "rate(master_batch_replica_clear_requests_total[5m])", "legendFormat": "BatchReplicaClear", "refId": "G" }
+      ],
+      "title": "Batch Operation Request Rates",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 127 },
+      "id": 1102,
+      "options": { "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "rate(master_batch_put_start_items_total[5m])", "legendFormat": "BatchPutStart Items", "refId": "A" },
+        { "expr": "rate(master_batch_put_end_items_total[5m])", "legendFormat": "BatchPutEnd Items", "refId": "B" },
+        { "expr": "rate(master_batch_get_replica_list_items_total[5m])", "legendFormat": "BatchGetRL Items", "refId": "C" },
+        { "expr": "rate(master_batch_exist_key_items_total[5m])", "legendFormat": "BatchExistKey Items", "refId": "D" },
+        { "expr": "rate(master_batch_query_ip_items_total[5m])", "legendFormat": "BatchQueryIp Items", "refId": "E" },
+        { "expr": "rate(master_batch_replica_clear_items_total[5m])", "legendFormat": "BatchReplicaClear Items", "refId": "F" }
+      ],
+      "title": "Batch Operation Item Throughput",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 135 },
+      "id": 1200,
+      "panels": [],
+      "title": "Value Size Distribution (Histogram)",
+      "type": "row"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }, "unit": "short" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 136 },
+      "id": 1201,
+      "options": { "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "master_value_size_bytes_bucket", "legendFormat": "le={{le}}", "refId": "A" }
+      ],
+      "title": "Object Value Size Distribution",
+      "type": "timeseries"
     }
   ],
-  "schemaVersion": 22,
+  "schemaVersion": 36,
   "style": "dark",
-  "tags": [],
-  "templating": {
-    "list": []
-  },
+  "tags": ["mooncake", "master", "storage"],
+  "templating": { "list": [] },
   "title": "Mooncake Master",
-  "time": {
-    "from": "now-6h",
-    "to": "now"
-  },
-  "timepicker": {
-    "refresh_intervals": [
-      "5s",
-      "10s",
-      "30s",
-      "1m",
-      "5m",
-      "15m",
-      "30m",
-      "1h",
-      "2h",
-      "1d"
-    ]
-  },
+  "time": { "from": "now-6h", "to": "now" },
+  "timepicker": { "refresh_intervals": ["5s", "10s", "30s", "1m", "5m", "15m", "30m", "1h", "2h", "1d"] },
   "timezone": "browser",
   "version": 1
 }
