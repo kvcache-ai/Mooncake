@@ -8467,6 +8467,27 @@ std::string MasterService::MakeDrainLocalDiskUnitKey(
            MakeDrainUnitKey(tenant_id, key, "");
 }
 
+void MasterService::VisitDrainSourceLocalDiskReplicas(
+    const DrainJob& job, const ObjectMetadata& metadata,
+    const std::function<void(const UUID&, const std::vector<std::string>&)>&
+        visit_fn) const {
+    metadata.VisitReplicas(
+        &Replica::fn_is_local_disk_replica, [&](const Replica& replica) {
+            const auto holder_id = replica.get_local_disk_client_id();
+            if (!holder_id.has_value()) {
+                return;
+            }
+
+            const auto source_it =
+                job.source_segments_by_client.find(holder_id.value());
+            if (source_it == job.source_segments_by_client.end()) {
+                return;
+            }
+
+            visit_fn(holder_id.value(), source_it->second);
+        });
+}
+
 std::optional<std::string> MasterService::SelectDrainTargetForKey(
     const ObjectMetadata& metadata, const std::string& source_segment,
     const std::vector<std::string>& requested_targets) {
@@ -8585,19 +8606,12 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
                     // segment name. Associate them with every requested
                     // source segment owned by that client and fail closed:
                     // REPLICA_MOVE cannot migrate them yet.
-                    metadata.VisitReplicas(
-                        &Replica::fn_is_local_disk_replica,
-                        [&](const Replica& replica) {
-                            const auto holder_id =
-                                replica.get_local_disk_client_id();
-                            if (!holder_id.has_value() ||
-                                !job.source_segments_by_client.contains(
-                                    holder_id.value())) {
-                                return;
-                            }
-
+                    VisitDrainSourceLocalDiskReplicas(
+                        job, metadata,
+                        [&](const UUID& holder_id,
+                            const std::vector<std::string>&) {
                             const auto unit_key = MakeDrainLocalDiskUnitKey(
-                                tenant_id, key, holder_id.value());
+                                tenant_id, key, holder_id);
                             if (job.terminal_failed_unit_keys.insert(unit_key)
                                     .second) {
                                 job.failed_units++;
@@ -8699,27 +8713,16 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
             MetadataShardAccessorRO shard(this, i);
             for (const auto& [tenant_id, tenant_state] : shard->tenants) {
                 for (const auto& [key, metadata] : tenant_state.metadata) {
-                    metadata.VisitReplicas(
-                        &Replica::fn_is_local_disk_replica,
-                        [&](const Replica& replica) {
-                            const auto holder_id =
-                                replica.get_local_disk_client_id();
-                            if (!holder_id.has_value()) {
-                                return;
-                            }
-                            auto source_it = job.source_segments_by_client.find(
-                                holder_id.value());
-                            if (source_it ==
-                                job.source_segments_by_client.end()) {
-                                return;
-                            }
-
+                    VisitDrainSourceLocalDiskReplicas(
+                        job, metadata,
+                        [&](const UUID& holder_id,
+                            const std::vector<std::string>& source_segments) {
                             has_remaining_local_disk_replicas = true;
-                            remaining_segments.insert(source_it->second.begin(),
-                                                      source_it->second.end());
+                            remaining_segments.insert(source_segments.begin(),
+                                                      source_segments.end());
                             remaining_unit_keys.insert(
                                 MakeDrainLocalDiskUnitKey(tenant_id, key,
-                                                          holder_id.value()));
+                                                          holder_id));
                         });
 
                     const auto replica_segments =

@@ -2112,6 +2112,10 @@ class MasterService {
     std::string MakeDrainLocalDiskUnitKey(const std::string& tenant_id,
                                           const std::string& key,
                                           const UUID& client_id) const;
+    void VisitDrainSourceLocalDiskReplicas(
+        const DrainJob& job, const ObjectMetadata& metadata,
+        const std::function<void(const UUID&, const std::vector<std::string>&)>&
+            visit_fn) const;
 
     std::thread job_dispatch_thread_;
     std::atomic<bool> job_dispatch_running_{false};
