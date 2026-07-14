@@ -53,6 +53,8 @@ DEFINE_string(
     tent_transport_hint, "unspec",
     "tent only: per-request transport_hint. "
     "unspec|rdma|tcp|shm|nvlink|gds|io_uring|mnnvl|ascend|sunrise_link");
+DEFINE_string(tent_rdma_devices, "",
+              "tent only: comma-separated RDMA devices allowed by tebench");
 DEFINE_bool(enable_runtime_queue, false,
             "tent only: route submissions through the runtime queue");
 DEFINE_uint64(runtime_queue_max_dispatch_owners, 64,
@@ -103,6 +105,7 @@ std::string XferBenchConfig::xport_type;
 std::string XferBenchConfig::backend;
 bool XferBenchConfig::notifi = false;
 std::string XferBenchConfig::tent_transport_hint;
+std::string XferBenchConfig::tent_rdma_devices;
 bool XferBenchConfig::enable_runtime_queue = false;
 size_t XferBenchConfig::runtime_queue_max_dispatch_owners = 0;
 std::string XferBenchConfig::receiver_credit_mode;
@@ -143,6 +146,7 @@ void XferBenchConfig::loadFromFlags() {
     backend = FLAGS_backend;
     notifi = FLAGS_notifi;
     tent_transport_hint = FLAGS_tent_transport_hint;
+    tent_rdma_devices = FLAGS_tent_rdma_devices;
     enable_runtime_queue = FLAGS_enable_runtime_queue;
     runtime_queue_max_dispatch_owners = FLAGS_runtime_queue_max_dispatch_owners;
     receiver_credit_mode = FLAGS_receiver_credit_mode;

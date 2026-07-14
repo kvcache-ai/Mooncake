@@ -84,6 +84,20 @@ std::shared_ptr<Config> loadConfig() {
             XferBenchConfig::receiver_credit_adaptive_healthy_pulls);
         config->set("receiver_credit/limits/max_peers", size_t{4096});
     }
+    if (!XferBenchConfig::tent_rdma_devices.empty()) {
+        std::vector<std::string> devices;
+        std::stringstream input(XferBenchConfig::tent_rdma_devices);
+        for (std::string device; std::getline(input, device, ',');) {
+            if (!device.empty()) devices.push_back(std::move(device));
+        }
+        if (!devices.empty()) {
+            json rule = {{"name", "tebench_rdma_devices"},
+                         {"segment_type", "memory"},
+                         {"devices", std::move(devices)},
+                         {"transports", json::array({"rdma"})}};
+            config->set("policy", json::array({std::move(rule)}));
+        }
+    }
 
     // Configure transport types based on xport_type parameter
     if (!XferBenchConfig::xport_type.empty()) {
