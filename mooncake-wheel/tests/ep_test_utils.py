@@ -147,27 +147,37 @@ class suppress_stdout_stderr:
 
 
 def bench_kineto(fn, kernel_names, num_tests: int = 30, suppress_kineto_output: bool = False,
-                 trace_path: Optional[str] = None, barrier_comm_profiling: bool = False):
+                 trace_path: Optional[str] = None, barrier_comm_profiling: bool = False,
+                 profile_enabled: bool = True):
+    assert isinstance(kernel_names, str) or isinstance(kernel_names, tuple)
+    is_tupled = isinstance(kernel_names, tuple)
+    kernel_names = (kernel_names, ) if isinstance(kernel_names, str) else kernel_names
+    assert all([isinstance(name, str) for name in kernel_names])
+
+    def run_profile_body(prof=None):
+        for i in range(2):
+            # NOTES: use a large kernel and a barrier to eliminate the unbalanced CPU launch overhead
+            if barrier_comm_profiling:
+                lhs = torch.randn((8192, 8192), dtype=torch.float, device='cuda')
+                rhs = torch.randn((8192, 8192), dtype=torch.float, device='cuda')
+                lhs @ rhs
+                dist.all_reduce(torch.ones(1, dtype=torch.float, device='cuda'))
+            for _ in range(num_tests):
+                fn()
+            if prof is not None:
+                prof.step()
+
+    if not profile_enabled:
+        run_profile_body()
+        kernel_times = [0.0 for _ in kernel_names]
+        return tuple(kernel_times) if is_tupled else kernel_times[0]
+
     # Profile
     suppress = suppress_stdout_stderr if suppress_kineto_output else empty_suppress
     with suppress():
         schedule = torch.profiler.schedule(wait=0, warmup=1, active=1, repeat=1)
         with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA], schedule=schedule) as prof:
-            for i in range(2):
-                # NOTES: use a large kernel and a barrier to eliminate the unbalanced CPU launch overhead
-                if barrier_comm_profiling:
-                    lhs = torch.randn((8192, 8192), dtype=torch.float, device='cuda')
-                    rhs = torch.randn((8192, 8192), dtype=torch.float, device='cuda')
-                    lhs @ rhs
-                    dist.all_reduce(torch.ones(1, dtype=torch.float, device='cuda'))
-                for _ in range(num_tests):
-                    fn()
-                prof.step()
-
-    assert isinstance(kernel_names, str) or isinstance(kernel_names, tuple)
-    is_tupled = isinstance(kernel_names, tuple)
-    kernel_names = (kernel_names, ) if isinstance(kernel_names, str) else kernel_names
-    assert all([isinstance(name, str) for name in kernel_names])
+            run_profile_body(prof)
 
     # Save chrome traces
     if trace_path is not None:

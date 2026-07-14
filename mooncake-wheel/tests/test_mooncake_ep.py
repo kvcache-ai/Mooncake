@@ -217,24 +217,28 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
     # Skip profiling in fallback mode as kernels are Python functions, not CUDA kernels
     if not buffer._use_fallback:
         for return_recv_hook in (False, True):
-            cpu_group.barrier()
-            dispatch_t, combine_t = bench_kineto(partial(test_func, zero_copy=True, return_recv_hook=return_recv_hook),
-                                                 kernel_names=('dispatch', 'combine'), barrier_comm_profiling=True,
-                                                 suppress_kineto_output=True)
-            if not return_recv_hook:
-                # In fallback mode, kernels may not be found (they're Python functions)
-                # So we skip bandwidth calculation if time is 0
-                if dispatch_t > 0 and combine_t > 0:
-                    print(f'[rank {rank}] Dispatch bandwidth: {num_dispatch_comm_bytes / 1e9 / dispatch_t:.2f} GB/s, avg_t={dispatch_t * 1e6:.2f} us | '
-                          f'Combine bandwidth: {num_combine_comm_bytes / 1e9 / combine_t:.2f} GB/s, avg_t={combine_t * 1e6:.2f} us', flush=True)
+            for profile_rank in range(num_ranks):
+                cpu_group.barrier()
+                dispatch_t, combine_t = bench_kineto(
+                    partial(test_func, zero_copy=True, return_recv_hook=return_recv_hook),
+                    kernel_names=('dispatch', 'combine'), barrier_comm_profiling=True,
+                    suppress_kineto_output=True, profile_enabled=(rank == profile_rank))
+                if rank != profile_rank:
+                    continue
+                if not return_recv_hook:
+                    # In fallback mode, kernels may not be found (they're Python functions)
+                    # So we skip bandwidth calculation if time is 0
+                    if dispatch_t > 0 and combine_t > 0:
+                        print(f'[rank {rank}] Dispatch bandwidth: {num_dispatch_comm_bytes / 1e9 / dispatch_t:.2f} GB/s, avg_t={dispatch_t * 1e6:.2f} us | '
+                              f'Combine bandwidth: {num_combine_comm_bytes / 1e9 / combine_t:.2f} GB/s, avg_t={combine_t * 1e6:.2f} us', flush=True)
+                    else:
+                        print(f'[rank {rank}] Profiling skipped (kernels not found in CUDA profiler)', flush=True)
                 else:
-                    print(f'[rank {rank}] Profiling skipped (kernels not found in CUDA profiler)', flush=True)
-            else:
-                if dispatch_t > 0 and combine_t > 0:
-                    print(f'[rank {rank}] Dispatch send/recv time: {dispatch_t * 2 * 1e6:.2f} us | '
-                          f'Combine send/recv time: {combine_t * 2 * 1e6:.2f} us', flush=True)
-                else:
-                    print(f'[rank {rank}] Profiling skipped (kernels not found in CUDA profiler)', flush=True)
+                    if dispatch_t > 0 and combine_t > 0:
+                        print(f'[rank {rank}] Dispatch send/recv time: {dispatch_t * 2 * 1e6:.2f} us | '
+                              f'Combine send/recv time: {combine_t * 2 * 1e6:.2f} us', flush=True)
+                    else:
+                        print(f'[rank {rank}] Profiling skipped (kernels not found in CUDA profiler)', flush=True)
     else:
         if rank == 0:
             print(f'[rank {rank}] Profiling skipped (fallback mode - using Python implementation)', flush=True)
