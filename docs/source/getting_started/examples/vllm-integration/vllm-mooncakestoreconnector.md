@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 # Guide: vLLM MooncakeStoreConnector
 
 ```{admonition} Archived
@@ -133,3 +137,8 @@ python examples/disaggregated/disaggregated_serving/mooncake_connector/mooncake_
 > ```
 >
 > Without this, identical prompts may produce different block hashes on different DP ranks, preventing cross-instance prefix cache hits.
+
+
+### 4. Performance
+
+Please refer to this [webpage](../../../performance/vllm/vllm-v1-mooncake-store.md).

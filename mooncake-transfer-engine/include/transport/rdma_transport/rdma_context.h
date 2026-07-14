@@ -59,6 +59,12 @@ struct GidSelectionSnapshot {
     int gid_index = -1;
 };
 
+enum class GidRefreshResult {
+    UNCHANGED = 0,
+    CHANGED = 1,
+    FAILED = 2,
+};
+
 struct RdmaCq {
     RdmaCq() : native(nullptr), outstanding(0) {}
     ibv_cq *native;
@@ -170,6 +176,12 @@ class RdmaContext {
         const std::vector<AutoGidSelectionIdentity> &tried_selections = {},
         std::string *previous_gid = nullptr, std::string *next_gid = nullptr);
 
+    // Refresh the runtime GID after IBV_EVENT_GID_CHANGE. Auto-GID mode uses
+    // the same candidate filtering/ranking as initial device open; explicit
+    // MC_GID_INDEX keeps the configured index and refreshes only its value.
+    GidRefreshResult refreshCurrentGid(std::string *previous_gid = nullptr,
+                                       std::string *next_gid = nullptr);
+
     ibv_context *context() const { return context_; }
 
     RdmaTransport &engine() const { return engine_; }
@@ -181,6 +193,7 @@ class RdmaContext {
     uint8_t numLagPorts() const { return num_lag_ports_; }
 
     int activeSpeed() const { return active_speed_; }
+    int activeWidth() const { return active_width_; }
 
     ibv_mtu activeMTU() const { return active_mtu_; }
 
@@ -216,6 +229,11 @@ class RdmaContext {
    public:
     int submitPostSend(const std::vector<Transport::Slice *> &slice_list);
 
+    void trackPostedSlices(const std::vector<Transport::Slice *> &slice_list,
+                           size_t first, size_t count);
+    void untrackPostedSlices(const std::vector<Transport::Slice *> &slice_list,
+                             size_t first, size_t count);
+
    private:
     const std::string device_name_;
     RdmaTransport &engine_;
@@ -232,6 +250,7 @@ class RdmaContext {
     uint16_t lid_ = 0;
     int gid_index_ = -1;
     int active_speed_ = -1;
+    int active_width_ = 1;
     ibv_mtu active_mtu_;
     uint8_t num_lag_ports_ = 0;  // 0/1 = not in LAG; ≥2 = LAG active
     ibv_gid gid_;

@@ -91,6 +91,9 @@ option(USE_EFA "option for using AWS EFA transport" OFF)
 option(USE_UB "option for using UB protocol transport" OFF)
 option(USE_SUNRISE
        "option for enabling gpu features for Sunrise GPU with Tang runtime" OFF)
+option(USE_TPU
+       "option for enabling TPU (PJRT) staging support in TENT; the PJRT adapter is loaded at runtime via dlopen, no build-time SDK required"
+       OFF)
 
 if(USE_UB)
   add_compile_definitions(USE_UB)
@@ -201,6 +204,20 @@ if(USE_CUDA)
   message(STATUS "CUDA support is enabled")
   include_directories(/usr/local/cuda/include)
   link_directories(/usr/local/cuda/lib /usr/local/cuda/lib64)
+endif()
+
+if(USE_TPU)
+  # Every TPU source file lives under mooncake-transfer-engine/tent, which is
+  # only added when USE_TENT is ON. Without this guard -DUSE_TPU=ON configures
+  # and builds cleanly while compiling no TPU code at all.
+  if(NOT USE_TENT)
+    message(
+      FATAL_ERROR
+        "USE_TPU=ON requires USE_TENT=ON: all TPU support lives in TENT. Re-run cmake with -DUSE_TENT=ON."
+    )
+  endif()
+  add_compile_definitions(USE_TPU)
+  message(STATUS "TPU (PJRT) staging support is enabled")
 endif()
 
 if(NOT DEFINED NEUWARE_ROOT OR NEUWARE_ROOT STREQUAL "")

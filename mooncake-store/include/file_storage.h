@@ -1,7 +1,7 @@
 #pragma once
 
 #include "client_service.h"
-#include "client_buffer.hpp"
+#include "client_buffer.h"
 #include "storage_backend.h"
 #include "pinned_buffer_pool.h"
 

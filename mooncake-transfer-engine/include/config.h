@@ -60,6 +60,11 @@ struct GlobalConfig {
     // which is minutes. Override via MC_HANDSHAKE_CONNECT_TIMEOUT.
     int handshake_connect_timeout = 5;
     bool metacache = true;
+    // Periodically refresh Transfer Engine metadata-derived local caches. 0
+    // disables the background poller and preserves the manual
+    // syncSegmentCache() behavior. Currently refreshes cached remote segment
+    // descriptors. Override via MC_TE_METADATA_REFRESH_INTERVAL_SECONDS.
+    uint64_t te_metadata_refresh_interval_seconds = 0;
     int log_level = google::INFO;
     bool trace = false;
     int64_t slice_timeout = -1;
@@ -71,6 +76,7 @@ struct GlobalConfig {
     bool enable_hca_peer_affinity = false;
     std::unordered_map<std::string, std::vector<std::string>> nic_peer_affinity;
     bool log_rdma_slice_affinity = false;
+    bool track_rdma_posted_slices = false;
     int parallel_reg_mr = -1;
     size_t eic_max_block_size = 64UL * 1024 * 1024;
     EndpointStoreType endpoint_store_type = EndpointStoreType::SIEVE;
@@ -93,6 +99,7 @@ struct GlobalConfig {
     int ib_pci_relaxed_ordering_mode = 0;
     bool ascend_use_fabric_mem = false;
     bool ascend_agent_mode = false;
+    bool sunrise_use_device_mem = false;
     // Transient flag scoped to a single TE init: set true by the Store entry
     // (Client::InitTransferEngine) before installing the ascend transport, and
     // reset to false right after. Lets ascend_direct distinguish a Store-init

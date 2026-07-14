@@ -4,7 +4,7 @@
 #include <utility>
 #include <vector>
 
-#include "aligned_client_buffer.hpp"
+#include "aligned_client_buffer.h"
 #include "storage_backend.h"
 #include "client_metric.h"
 #include "utils.h"
@@ -446,8 +446,8 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             }
             std::unordered_map<std::string, std::vector<Slice>>
                 user_batch_object;
-            auto query_result = BatchQuerySegmentSlices(user_keys, tenant_id,
-                                                        user_batch_object);
+            [[maybe_unused]] auto query_result = BatchQuerySegmentSlices(
+                user_keys, tenant_id, user_batch_object);
             // BatchQuerySegmentSlices is now best-effort: it always returns
             // OK. Keys present in user_batch_object go to batch_object; the
             // rest are reported as failed.

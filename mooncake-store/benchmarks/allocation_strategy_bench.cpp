@@ -15,7 +15,7 @@
 #include <gflags/gflags.h>
 #include "types.h"
 
-#include "offset_allocator/offset_allocator.hpp"
+#include "offset_allocator/offset_allocator.h"
 #include "allocator.h"
 #include "allocation_strategy.h"
 
