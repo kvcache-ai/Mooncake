@@ -260,6 +260,10 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
     }
 
     RWSpinlock::WriteGuard guard(relocate_lock_);
+    if (!metadata_) {
+        return Status::InvalidArgument(
+            "SHM transport is not installed" LOC_MARK);
+    }
     auto &relocate_map = relocate_map_[target_id];
 
     // Another thread may have published this mapping while the writer lock was

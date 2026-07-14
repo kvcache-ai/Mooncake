@@ -141,6 +141,12 @@ TEST(ShmTransportTest, SharesAndReleasesRelocationAcrossThreads) {
     errno = 0;
     EXPECT_EQ(mincore(mapped, page_size, &residency), -1);
     EXPECT_EQ(errno, ENOMEM);
+
+    uint64_t address_after_uninstall = kRemoteAddress;
+    EXPECT_TRUE(ShmTransportTestPeer::relocate(transport,
+                                               address_after_uninstall,
+                                               page_size, LOCAL_SEGMENT_ID)
+                    .IsInvalidArgument());
 }
 
 }  // namespace
