@@ -32,6 +32,15 @@ static bool macaHostPhaseFenceCoversPeers() {
 #endif
 }
 
+static bool useCurrentStreamForKinetoProfile(bool async,
+                                             bool return_recv_hook) {
+    if (async || return_recv_hook) return false;
+    const char* value = std::getenv("MOONCAKE_EP_KINETO_CURRENT_STREAM");
+    return value != nullptr &&
+           (std::string(value) == "1" || std::string(value) == "ON" ||
+            std::string(value) == "TRUE");
+}
+
 MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
                                    int64_t num_ep_buffer_bytes,
                                    TransferEngine* engine)
@@ -174,9 +183,14 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
     // Wait previous tasks to be finished
     // NOTES: the hook mode will always use the default stream
     auto compute_stream = at::cuda::getCurrentCUDAStream();
-    auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
+    bool profile_on_current_stream =
+        useCurrentStreamForKinetoProfile(async, return_recv_hook);
+    auto launch_stream = (return_recv_hook || profile_on_current_stream)
+                             ? compute_stream
+                             : comm_stream;
     EP_HOST_ASSERT(not(async and return_recv_hook));
-    if (not return_recv_hook) stream_wait(launch_stream, compute_stream);
+    if (not return_recv_hook && not profile_on_current_stream)
+        stream_wait(launch_stream, compute_stream);
 
     // Allocate packed tensors
     auto packed_recv_x = torch::empty(
@@ -281,7 +295,7 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
         event = EventHandle(launch_stream);
     } else if (return_recv_hook && macaHostPhaseFenceCoversPeers()) {
         event = EventHandle(launch_stream);
-    } else if (not return_recv_hook) {
+    } else if (not return_recv_hook && not profile_on_current_stream) {
         stream_wait(compute_stream, launch_stream);
     }
 
@@ -360,9 +374,14 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
     // Wait previous tasks to be finished
     // NOTES: the hook mode will always use the default stream
     auto compute_stream = at::cuda::getCurrentCUDAStream();
-    auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
+    bool profile_on_current_stream =
+        useCurrentStreamForKinetoProfile(async, return_recv_hook);
+    auto launch_stream = (return_recv_hook || profile_on_current_stream)
+                             ? compute_stream
+                             : comm_stream;
     EP_HOST_ASSERT(not(async and return_recv_hook));
-    if (not return_recv_hook) stream_wait(launch_stream, compute_stream);
+    if (not return_recv_hook && not profile_on_current_stream)
+        stream_wait(launch_stream, compute_stream);
 
     // Allocate output tensor
     torch::Tensor combined_x;
@@ -449,7 +468,7 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
         event = EventHandle(launch_stream);
     } else if (return_recv_hook && macaHostPhaseFenceCoversPeers()) {
         event = EventHandle(launch_stream);
-    } else if (not return_recv_hook) {
+    } else if (not return_recv_hook && not profile_on_current_stream) {
         stream_wait(compute_stream, launch_stream);
     }
 

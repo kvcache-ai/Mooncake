@@ -221,11 +221,20 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
             # which is unavailable in this B300 build. This barrier is outside
             # the measured window, so use the existing CPU control group.
             cpu_group.barrier()
-            dispatch_t, combine_t = bench_kineto(
-                partial(test_func, zero_copy=True, return_recv_hook=return_recv_hook),
-                kernel_names=('dispatch', 'combine'), barrier_comm_profiling=True,
-                suppress_kineto_output=True,
-                num_kernels_per_period=2 if return_recv_hook else 1)
+            previous_profile_stream = os.environ.get("MOONCAKE_EP_KINETO_CURRENT_STREAM")
+            if not return_recv_hook:
+                os.environ["MOONCAKE_EP_KINETO_CURRENT_STREAM"] = "1"
+            try:
+                dispatch_t, combine_t = bench_kineto(
+                    partial(test_func, zero_copy=True, return_recv_hook=return_recv_hook),
+                    kernel_names=('dispatch', 'combine'), barrier_comm_profiling=True,
+                    suppress_kineto_output=True,
+                    num_kernels_per_period=2 if return_recv_hook else 1)
+            finally:
+                if previous_profile_stream is None:
+                    os.environ.pop("MOONCAKE_EP_KINETO_CURRENT_STREAM", None)
+                else:
+                    os.environ["MOONCAKE_EP_KINETO_CURRENT_STREAM"] = previous_profile_stream
             if not return_recv_hook:
                 if dispatch_t > 0 and combine_t > 0:
                     print(f'[rank {rank}] Dispatch bandwidth: {num_dispatch_comm_bytes / 1e9 / dispatch_t:.2f} GB/s, avg_t={dispatch_t * 1e6:.2f} us | '
