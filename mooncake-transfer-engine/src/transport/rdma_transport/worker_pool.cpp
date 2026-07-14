@@ -591,10 +591,9 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
         for (auto &slice : slice_list) {
             auto target_id = slice->target_id;
             if (!segment_desc_map.count(target_id)) {
-                segment_desc_map[target_id] = context_.engine()
-                                                  .meta()
-                                                  ->getSegmentDescByID(
-                                                      target_id, true);
+                segment_desc_map[target_id] =
+                    context_.engine().meta()->getSegmentDescByID(target_id,
+                                                                 true);
             }
         }
     }
@@ -735,8 +734,7 @@ bool WorkerPool::tryHandoffToAnotherLocalWorker(Transport::Slice *slice) {
                 buffer_id, device_id, probe)) {
             continue;
         }
-        if (device_id < 0 ||
-            device_id >= static_cast<int>(contexts.size()) ||
+        if (device_id < 0 || device_id >= static_cast<int>(contexts.size()) ||
             device_id == current_ctx_id) {
             continue;
         }
