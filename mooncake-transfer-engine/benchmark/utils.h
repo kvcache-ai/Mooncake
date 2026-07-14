@@ -77,6 +77,7 @@ struct XferBenchConfig {
     static bool notifi;
     static std::string tent_transport_hint;
     static std::string tent_rdma_devices;
+    static int tent_dram_numa_node;
     static bool enable_runtime_queue;
     static size_t runtime_queue_max_dispatch_owners;
     static std::string receiver_credit_mode;

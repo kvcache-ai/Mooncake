@@ -151,6 +151,15 @@ int TENTBenchRunner::allocateBuffers() {
     if (seg_type == "DRAM") {
         device_prefix = "cpu";
         num_buffers = numa_num_configured_nodes();
+        if (XferBenchConfig::tent_dram_numa_node >= 0) {
+            start_idx = XferBenchConfig::tent_dram_numa_node;
+            if (start_idx >= num_buffers) {
+                LOG(ERROR) << "tent_dram_numa_node " << start_idx
+                           << " out of range [0, " << num_buffers << ")";
+                return -1;
+            }
+            num_buffers = 1;
+        }
 #if defined(USE_CUDA) || defined(USE_SUNRISE)
     } else if (seg_type == "VRAM") {
         device_prefix = "cuda";
