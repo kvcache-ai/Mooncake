@@ -117,6 +117,13 @@ target_include_directories(tent_tcp_transport_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_tcp_transport_test COMMAND tent_tcp_transport_test)
 
+add_executable(tent_shm_transport_test shm_transport_test.cpp)
+target_link_libraries(tent_shm_transport_test PRIVATE gtest gtest_main
+                                                      tent_link_group)
+target_include_directories(tent_shm_transport_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_shm_transport_test COMMAND tent_shm_transport_test)
+
 add_executable(tent_failover_test failover_test.cpp)
 target_link_libraries(tent_failover_test PRIVATE gtest gtest_main
                                                  tent_link_group)
@@ -247,7 +254,8 @@ add_test(NAME tent_runtime_queue_dispatch_test
 # Causal chain stage decomposition: validates that dispatch_time and post_time
 # timestamps are populated on both queue and direct-commit paths.
 add_executable(causal_chain_test causal_chain_test.cpp)
-target_link_libraries(causal_chain_test PRIVATE gtest gtest_main tent_link_group)
+target_link_libraries(causal_chain_test PRIVATE gtest gtest_main
+                                                tent_link_group)
 if(TARGET asio_shared)
   target_link_libraries(causal_chain_test PRIVATE asio_shared)
 endif()
