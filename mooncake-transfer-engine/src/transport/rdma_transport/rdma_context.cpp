@@ -294,7 +294,28 @@ int RdmaContext::socketId() {
 int RdmaContext::deconstruct() {
     worker_pool_.reset();
 
-    endpoint_store_->destroyQPs();
+    // Graceful teardown order: QPs -> MRs.
+    if (endpoint_store_) {
+        endpoint_store_->disconnectQPs();
+
+        // In normal graceful shutdown, reclaim should finish quickly.
+        constexpr auto kReclaimTimeout = std::chrono::seconds(10);
+        auto start = std::chrono::steady_clock::now();
+        while (endpoint_store_->waitingListSize() > 0) {
+            endpoint_store_->reclaimEndpoint();
+            if (endpoint_store_->waitingListSize() == 0) break;
+            if (std::chrono::steady_clock::now() - start > kReclaimTimeout) {
+                LOG(WARNING) << "Endpoint reclaim timed out during graceful "
+                                "shutdown; forcing QP destruction";
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
+        if (endpoint_store_->destroyQPs()) {
+            LOG(ERROR) << "Failed to destroy all QPs before MR deregistration";
+        }
+    }
 
     for (auto &[_, entry] : memory_region_map_) {
         int ret = ibv_dereg_mr(entry.mr);
