@@ -41,6 +41,8 @@ int processBatchSizes(BenchRunner& runner, size_t block_size, size_t batch_size,
 
     XferBenchStats stats;
     std::vector<XferBenchStats> qos_stats(qos_classes.size());
+    XferBenchStats tight_stats;
+    XferBenchStats loose_stats;
     std::mutex mutex;
     int rc = runner.runInitiatorTasks([&](int thread_id) -> int {
         runner.pinThread(thread_id);
@@ -55,10 +57,21 @@ int processBatchSizes(BenchRunner& runner, size_t block_size, size_t batch_size,
         const bool qos_enabled = !qos_classes.empty();
         const size_t qos_class =
             qos_enabled ? qosClassForThread(qos_classes, thread_id) : 0;
+        const bool tight = XferBenchConfig::deadline_us > 0 &&
+                           thread_id < XferBenchConfig::deadline_tight_threads;
+        auto deadlineNs = [&]() -> uint64_t {
+            if (!tight) return 0;
+            const auto now =
+                std::chrono::steady_clock::now().time_since_epoch();
+            return std::chrono::duration_cast<std::chrono::nanoseconds>(now)
+                       .count() +
+                   XferBenchConfig::deadline_us * 1000ull;
+        };
+
         XferBenchTimer timer;
         while (timer.lap_us(false) < 1000000ull) {
             runner.runSingleTransfer(local_addr, target_addr, block_size,
-                                     batch_size, opcode);
+                                     batch_size, opcode, deadlineNs());
         }
         timer.reset();
         std::vector<double> transfer_duration;
@@ -69,12 +82,14 @@ int processBatchSizes(BenchRunner& runner, size_t block_size, size_t batch_size,
                 if (XferBenchConfig::check_consistency)
                     pattern =
                         fillData((void*)local_addr, block_size * batch_size);
-                auto val = runner.runSingleTransfer(
-                    local_addr, target_addr, block_size, batch_size, WRITE);
+                auto val = runner.runSingleTransfer(local_addr, target_addr,
+                                                    block_size, batch_size,
+                                                    WRITE, deadlineNs());
                 transfer_duration.push_back(val);
                 fillData((void*)local_addr, block_size * batch_size);
                 val = runner.runSingleTransfer(local_addr, target_addr,
-                                               block_size, batch_size, READ);
+                                               block_size, batch_size, READ,
+                                               deadlineNs());
                 if (XferBenchConfig::check_consistency)
                     verifyData((void*)local_addr, block_size * batch_size,
                                pattern);
@@ -83,8 +98,9 @@ int processBatchSizes(BenchRunner& runner, size_t block_size, size_t batch_size,
         } else {
             while (timer.lap_us(false) <
                    XferBenchConfig::duration * 1000000ull) {
-                auto val = runner.runSingleTransfer(
-                    local_addr, target_addr, block_size, batch_size, opcode);
+                auto val = runner.runSingleTransfer(local_addr, target_addr,
+                                                    block_size, batch_size,
+                                                    opcode, deadlineNs());
                 transfer_duration.push_back(val);
             }
         }
@@ -96,6 +112,9 @@ int processBatchSizes(BenchRunner& runner, size_t block_size, size_t batch_size,
             qos_stats[qos_class].total_duration.add(total_duration);
             qos_stats[qos_class].transfer_duration.add(transfer_duration);
         }
+        auto& group_stats = tight ? tight_stats : loose_stats;
+        group_stats.total_duration.add(total_duration);
+        group_stats.transfer_duration.add(transfer_duration);
         return 0;
     });
 
@@ -114,6 +133,14 @@ int processBatchSizes(BenchRunner& runner, size_t block_size, size_t batch_size,
                 return -1;
             }
         }
+    }
+    if (XferBenchConfig::deadline_us > 0) {
+        const int tight_threads =
+            std::min(num_threads, XferBenchConfig::deadline_tight_threads);
+        printDeadlineGroupStats("tight", block_size, batch_size, tight_stats,
+                                tight_threads, XferBenchConfig::deadline_us);
+        printDeadlineGroupStats("loose", block_size, batch_size, loose_stats,
+                                num_threads - tight_threads, 0);
     }
     return 0;
 }
@@ -162,6 +189,17 @@ int main(int argc, char* argv[]) {
     if (XferBenchConfig::qos_link_capacity_gbps < 0.0 ||
         !std::isfinite(XferBenchConfig::qos_link_capacity_gbps)) {
         LOG(ERROR) << "qos_link_capacity_gbps must be finite and non-negative";
+        return EXIT_FAILURE;
+    }
+    if (XferBenchConfig::deadline_tight_threads < 0 ||
+        XferBenchConfig::deadline_tight_threads >
+            XferBenchConfig::max_num_threads) {
+        LOG(ERROR) << "deadline_tight_threads must be in [0, max_num_threads]";
+        return EXIT_FAILURE;
+    }
+    if (XferBenchConfig::deadline_us > 0 &&
+        XferBenchConfig::backend != "tent") {
+        LOG(ERROR) << "deadline tagging is supported only by the tent backend";
         return EXIT_FAILURE;
     }
     std::unique_ptr<BenchRunner> runner;

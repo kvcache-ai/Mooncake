@@ -72,6 +72,9 @@ struct XferBenchConfig {
     static std::string qos_classes_json;
     static double qos_link_capacity_gbps;
     static std::string qos_output_jsonl;
+    static uint64_t deadline_us;
+    static int deadline_tight_threads;
+    static bool deadline_bw_arbitration;
 
     static std::string metadata_type;
     static std::string metadata_url_list;
@@ -80,6 +83,7 @@ struct XferBenchConfig {
     static std::string backend;
     static bool notifi;
     static std::string tent_transport_hint;
+    static std::string tent_intent_type;
 
     static int local_gpu_id;
     static int target_gpu_id;
@@ -168,6 +172,10 @@ void printStatsHeader();
 
 void printStats(size_t block_size, size_t batch_size, XferBenchStats& stats,
                 int num_threads);
+
+void printDeadlineGroupStats(const char* group, size_t block_size,
+                             size_t batch_size, XferBenchStats& stats,
+                             int num_threads, uint64_t deadline_us);
 
 #if defined(USE_CUDA) || defined(USE_SUNRISE)
 static inline bool isCudaMemory(void* ptr) {

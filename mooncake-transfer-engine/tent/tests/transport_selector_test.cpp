@@ -14,6 +14,8 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 
@@ -748,6 +750,224 @@ TEST(TransportSelectorTest, PolicyQpPoolEmptyOrNonStringIsUnset) {
     ctx.policy_name = "bad-pool";
     EXPECT_FALSE(
         selector.select(ctx, transports, /*index=*/0).qp_pool.has_value());
+}
+
+// Intent-specific policies bind Request::intent_type to transport and
+// link-layer QoS selection. Policies are first-match, so the specific entry is
+// deliberately placed before the catch-all fallback.
+TEST(TransportSelectorTest, IntentSpecificPolicyIsSelected) {
+    auto conf = std::make_shared<Config>();
+    json foreground;
+    foreground["name"] = "foreground";
+    foreground["segment_type"] = "memory";
+    foreground["intent_type"] = "foreground_get";
+    foreground["transports"] = {"rdma"};
+    foreground["service_level"] = 3;
+    foreground["traffic_class"] = 96;
+    foreground["qp_pool"] = "foreground";
+    json fallback;
+    fallback["name"] = "fallback";
+    fallback["segment_type"] = "memory";
+    fallback["transports"] = {"tcp"};
+    conf->set("policy", json::array({foreground, fallback}));
+
+    TransportSelector selector(conf);
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[RDMA] = std::make_shared<FakeTransport>(RDMA);
+    transports[TCP] = std::make_shared<FakeTransport>(TCP);
+    static_cast<FakeTransport*>(transports[RDMA].get())->setDramToDram(true);
+    static_cast<FakeTransport*>(transports[TCP].get())->setDramToDram(true);
+    std::vector<TransportType> buffer_transports = {RDMA, TCP};
+
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = false;
+    ctx.local_memory_type = MTYPE_CPU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.transfer_size = 4096;
+    ctx.priority_level = PRIO_HIGH;
+    ctx.buffer_transports = &buffer_transports;
+    ctx.intent_type = IntentType::FOREGROUND_GET;
+
+    auto result = selector.select(ctx, transports);
+    EXPECT_EQ(result.transport, RDMA);
+    EXPECT_EQ(result.service_level, 3);
+    EXPECT_EQ(result.traffic_class, 96);
+    EXPECT_EQ(result.qp_pool, "foreground");
+}
+
+TEST(TransportSelectorTest, IntentMismatchFallsThroughToCatchAll) {
+    auto conf = std::make_shared<Config>();
+    json foreground;
+    foreground["name"] = "foreground";
+    foreground["segment_type"] = "memory";
+    foreground["intent_type"] = "foreground_get";
+    foreground["transports"] = {"rdma"};
+    json fallback;
+    fallback["name"] = "fallback";
+    fallback["segment_type"] = "memory";
+    fallback["transports"] = {"tcp"};
+    conf->set("policy", json::array({foreground, fallback}));
+
+    TransportSelector selector(conf);
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[RDMA] = std::make_shared<FakeTransport>(RDMA);
+    transports[TCP] = std::make_shared<FakeTransport>(TCP);
+    static_cast<FakeTransport*>(transports[RDMA].get())->setDramToDram(true);
+    static_cast<FakeTransport*>(transports[TCP].get())->setDramToDram(true);
+    std::vector<TransportType> buffer_transports = {RDMA, TCP};
+
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = false;
+    ctx.local_memory_type = MTYPE_CPU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.transfer_size = 4096;
+    ctx.priority_level = PRIO_LOW;
+    ctx.buffer_transports = &buffer_transports;
+    ctx.intent_type = IntentType::CHECKPOINT;
+
+    EXPECT_EQ(selector.select(ctx, transports).transport, TCP);
+}
+
+TEST(TransportSelectorTest, PolicyWithoutIntentMatchesAnyIntent) {
+    auto conf = std::make_shared<Config>();
+    json policy;
+    policy["name"] = "legacy";
+    policy["segment_type"] = "memory";
+    policy["transports"] = {"rdma"};
+    conf->set("policy", json::array({policy}));
+
+    TransportSelector selector(conf);
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[RDMA] = std::make_shared<FakeTransport>(RDMA);
+    static_cast<FakeTransport*>(transports[RDMA].get())->setDramToDram(true);
+    std::vector<TransportType> buffer_transports = {RDMA};
+
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = false;
+    ctx.local_memory_type = MTYPE_CPU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.transfer_size = 4096;
+    ctx.priority_level = PRIO_LOW;
+    ctx.buffer_transports = &buffer_transports;
+    ctx.intent_type = IntentType::CHECKPOINT;
+
+    EXPECT_EQ(selector.select(ctx, transports).transport, RDMA);
+}
+
+TEST(TransportSelectorTest, NumericIntentValueIsAccepted) {
+    auto conf = std::make_shared<Config>();
+    json policy;
+    policy["name"] = "checkpoint";
+    policy["segment_type"] = "memory";
+    policy["intent_type"] = static_cast<int>(IntentType::CHECKPOINT);
+    policy["transports"] = {"tcp"};
+    conf->set("policy", json::array({policy}));
+
+    TransportSelector selector(conf);
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[TCP] = std::make_shared<FakeTransport>(TCP);
+    static_cast<FakeTransport*>(transports[TCP].get())->setDramToDram(true);
+    std::vector<TransportType> buffer_transports = {TCP};
+
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = false;
+    ctx.local_memory_type = MTYPE_CPU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.transfer_size = 4096;
+    ctx.priority_level = PRIO_LOW;
+    ctx.buffer_transports = &buffer_transports;
+    ctx.intent_type = IntentType::CHECKPOINT;
+
+    EXPECT_EQ(selector.select(ctx, transports).transport, TCP);
+}
+
+TEST(TransportSelectorTest, InvalidIntentPolicyIsSkipped) {
+    auto conf = std::make_shared<Config>();
+    json bad_name;
+    bad_name["name"] = "bad-name";
+    bad_name["segment_type"] = "memory";
+    bad_name["intent_type"] = "not_an_intent";
+    bad_name["transports"] = {"rdma"};
+    json bad_number;
+    bad_number["name"] = "bad-number";
+    bad_number["segment_type"] = "memory";
+    bad_number["intent_type"] = 999;
+    bad_number["transports"] = {"rdma"};
+    json bad_type;
+    bad_type["name"] = "bad-type";
+    bad_type["segment_type"] = "memory";
+    bad_type["intent_type"] = true;
+    bad_type["transports"] = {"rdma"};
+    json bad_unsigned;
+    bad_unsigned["name"] = "bad-unsigned";
+    bad_unsigned["segment_type"] = "memory";
+    bad_unsigned["intent_type"] = std::numeric_limits<uint64_t>::max();
+    bad_unsigned["transports"] = {"rdma"};
+    json fallback;
+    fallback["name"] = "fallback";
+    fallback["segment_type"] = "memory";
+    fallback["transports"] = {"tcp"};
+    conf->set("policy", json::array({bad_name, bad_number, bad_type,
+                                     bad_unsigned, fallback}));
+
+    TransportSelector selector(conf);
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[RDMA] = std::make_shared<FakeTransport>(RDMA);
+    transports[TCP] = std::make_shared<FakeTransport>(TCP);
+    static_cast<FakeTransport*>(transports[RDMA].get())->setDramToDram(true);
+    static_cast<FakeTransport*>(transports[TCP].get())->setDramToDram(true);
+    std::vector<TransportType> buffer_transports = {RDMA, TCP};
+
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = false;
+    ctx.local_memory_type = MTYPE_CPU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.transfer_size = 4096;
+    ctx.priority_level = PRIO_HIGH;
+    ctx.buffer_transports = &buffer_transports;
+    ctx.intent_type = IntentType::FOREGROUND_GET;
+
+    EXPECT_EQ(selector.select(ctx, transports).transport, TCP);
+}
+
+TEST(TransportSelectorTest, ExplicitPolicyNameOverridesIntentFilter) {
+    auto conf = std::make_shared<Config>();
+    json policy;
+    policy["name"] = "operator-override";
+    policy["segment_type"] = "memory";
+    policy["intent_type"] = "checkpoint";
+    policy["transports"] = {"tcp"};
+    conf->set("policy", json::array({policy}));
+
+    TransportSelector selector(conf);
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[TCP] = std::make_shared<FakeTransport>(TCP);
+    static_cast<FakeTransport*>(transports[TCP].get())->setDramToDram(true);
+    std::vector<TransportType> buffer_transports = {TCP};
+
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = false;
+    ctx.local_memory_type = MTYPE_CPU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.transfer_size = 4096;
+    ctx.priority_level = PRIO_HIGH;
+    ctx.buffer_transports = &buffer_transports;
+    ctx.intent_type = IntentType::FOREGROUND_GET;
+    ctx.policy_name = "operator-override";
+
+    EXPECT_EQ(selector.select(ctx, transports).transport, TCP);
 }
 
 }  // namespace
