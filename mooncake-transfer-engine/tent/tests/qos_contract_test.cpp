@@ -173,6 +173,50 @@ TEST(QosContractTest, ExplicitPolicyNameCanResolveNamedContract) {
     EXPECT_DOUBLE_EQ(*effective.max_bandwidth_gbps, 10.0);
 }
 
+TEST(QosContractTest, ExplicitPolicyNameSkipsTenantIntentResolution) {
+    Config config;
+    loadConfig(&config, R"json(
+{
+  "qos": {
+    "version": 1,
+    "defaults": {"priority": "low"},
+    "tenants": [
+      {
+        "name": "tenant-a",
+        "defaults": {"priority": "medium"},
+        "intents": {
+          "foreground_get": {
+            "name": "tenant-critical",
+            "priority": "high"
+          },
+          "checkpoint": {
+            "name": "bulk-checkpoint",
+            "priority": "low",
+            "max_bandwidth_gbps": 10
+          }
+        }
+      }
+    ]
+  }
+}
+)json");
+    QosContractResolver resolver;
+    ASSERT_TRUE(resolver.loadFromConfig(config).ok());
+
+    EffectiveQosPolicy effective;
+    auto status = resolver.resolve({.tenant = "tenant-a",
+                                    .intent = "foreground_get",
+                                    .policy_name = "bulk-checkpoint",
+                                    .requested_priority = PRIO_HIGH},
+                                   &effective);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+    EXPECT_TRUE(effective.matched);
+    EXPECT_EQ(effective.matched_contract, "bulk-checkpoint");
+    EXPECT_EQ(effective.effective_priority, PRIO_LOW);
+    ASSERT_TRUE(effective.max_bandwidth_gbps.has_value());
+    EXPECT_DOUBLE_EQ(*effective.max_bandwidth_gbps, 10.0);
+}
+
 TEST(QosContractTest, UnknownTenantFallsBackInCompatibilityMode) {
     Config config;
     loadConfig(&config, R"json(
