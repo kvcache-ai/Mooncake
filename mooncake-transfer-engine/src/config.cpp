@@ -335,26 +335,6 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
-    const char* handshake_worker_threads =
-        std::getenv("MC_HANDSHAKE_WORKER_THREADS");
-    if (handshake_worker_threads) {
-        try {
-            int val = std::stoi(handshake_worker_threads);
-            constexpr int kMaxHandshakeWorkerThreads = 128;
-            if (val > 0 && val <= kMaxHandshakeWorkerThreads) {
-                config.handshake_worker_threads = val;
-            } else {
-                LOG(WARNING) << "Ignore value from environment variable "
-                                "MC_HANDSHAKE_WORKER_THREADS, valid range is "
-                             << "1-" << kMaxHandshakeWorkerThreads;
-            }
-        } catch (const std::exception& e) {
-            LOG(WARNING) << "Invalid MC_HANDSHAKE_WORKER_THREADS environment "
-                            "value: "
-                         << handshake_worker_threads << ". Error: " << e.what();
-        }
-    }
-
     const char* handshake_connect_timeout =
         std::getenv("MC_HANDSHAKE_CONNECT_TIMEOUT");
     if (handshake_connect_timeout) {
@@ -651,12 +631,6 @@ void dumpGlobalConfig() {
     LOG(INFO) << "parallel_reg_mr = " << config.parallel_reg_mr;
     LOG(INFO) << "ib_traffic_class = " << config.ib_traffic_class;
     LOG(INFO) << "ib_service_level = " << config.ib_service_level;
-    LOG(INFO) << "handshake_listen_backlog = "
-              << config.handshake_listen_backlog;
-    LOG(INFO) << "handshake_worker_threads = "
-              << config.handshake_worker_threads;
-    LOG(INFO) << "handshake_connect_timeout = "
-              << config.handshake_connect_timeout;
     {
         std::ostringstream oss;
         for (size_t i = 0; i < config.mlx5_qp_udp_sports.size(); ++i) {
