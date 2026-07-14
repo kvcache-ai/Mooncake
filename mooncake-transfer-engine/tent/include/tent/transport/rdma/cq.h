@@ -31,32 +31,10 @@ class RdmaContext;
 class RdmaCQ {
    public:
     RdmaCQ() : cq_(nullptr), cqe_now_(0), cqe_limit_(-1), context_(nullptr) {}
-    RdmaCQ(const RdmaCQ &other)
-        : cq_(other.cq_),
-          cqe_now_(other.cqe_now_.load(std::memory_order_relaxed)),
-          cqe_limit_(other.cqe_limit_),
-          context_(other.context_) {}
-    RdmaCQ(RdmaCQ &&other) noexcept
-        : cq_(other.cq_),
-          cqe_now_(other.cqe_now_.load(std::memory_order_relaxed)),
-          cqe_limit_(other.cqe_limit_),
-          context_(other.context_) {}
-    RdmaCQ &operator=(const RdmaCQ &other) {
-        cq_ = other.cq_;
-        cqe_now_.store(other.cqe_now_.load(std::memory_order_relaxed),
-                       std::memory_order_relaxed);
-        cqe_limit_ = other.cqe_limit_;
-        context_ = other.context_;
-        return *this;
-    }
-    RdmaCQ &operator=(RdmaCQ &&other) noexcept {
-        cq_ = other.cq_;
-        cqe_now_.store(other.cqe_now_.load(std::memory_order_relaxed),
-                       std::memory_order_relaxed);
-        cqe_limit_ = other.cqe_limit_;
-        context_ = other.context_;
-        return *this;
-    }
+    RdmaCQ(const RdmaCQ &) = delete;
+    RdmaCQ &operator=(const RdmaCQ &) = delete;
+    RdmaCQ(RdmaCQ &&) = delete;
+    RdmaCQ &operator=(RdmaCQ &&) = delete;
 
     ~RdmaCQ();
 

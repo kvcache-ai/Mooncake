@@ -85,11 +85,17 @@ class RWSpinlock {
     }
 
     void unlock() {
+        uint64_t expected = ticket.load(std::memory_order_relaxed);
+        uint64_t new_val;
         RWTicket t;
-        t.whole = ticket.load(std::memory_order_relaxed);
-        ++t.read;
-        ++t.write;
-        ticket.store(t.whole, std::memory_order_release);
+        do {
+            t.whole = expected;
+            ++t.read;
+            ++t.write;
+            new_val = t.whole;
+        } while (!ticket.compare_exchange_weak(
+            expected, new_val, std::memory_order_release,
+            std::memory_order_relaxed));
     }
 
     void lockShared() {

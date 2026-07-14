@@ -61,24 +61,14 @@ struct GidSelectionSnapshot {
 
 struct RdmaCq {
     RdmaCq() : native(nullptr), outstanding(0) {}
-    RdmaCq(const RdmaCq &other)
-        : native(other.native),
-          outstanding(other.outstanding.load(std::memory_order_relaxed)) {}
+    RdmaCq(const RdmaCq &) = delete;
+    RdmaCq &operator=(const RdmaCq &) = delete;
     RdmaCq(RdmaCq &&other) noexcept
         : native(other.native),
-          outstanding(other.outstanding.load(std::memory_order_relaxed)) {}
-    RdmaCq &operator=(const RdmaCq &other) {
-        native = other.native;
-        outstanding.store(other.outstanding.load(std::memory_order_relaxed),
-                          std::memory_order_relaxed);
-        return *this;
+          outstanding(other.outstanding.load(std::memory_order_relaxed)) {
+        other.native = nullptr;
     }
-    RdmaCq &operator=(RdmaCq &&other) noexcept {
-        native = other.native;
-        outstanding.store(other.outstanding.load(std::memory_order_relaxed),
-                          std::memory_order_relaxed);
-        return *this;
-    }
+    RdmaCq &operator=(RdmaCq &&) = delete;
 
     ibv_cq *native;
     std::atomic<int> outstanding;
