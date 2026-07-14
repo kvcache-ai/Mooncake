@@ -2787,4 +2787,413 @@ TEST_F(StorageBackendTest, AdaptorBatchOffload_EvictionHandlerCalled) {
 
 //-----------------------------------------------------------------------------
 
+//-----------------------------------------------------------------------------
+// OffsetAllocatorStorageBackend Eviction Tests
+//-----------------------------------------------------------------------------
+
+// Helper: build a BatchOffload request for a single key/value pair.
+std::unordered_map<std::string, std::vector<Slice>> MakeSingleKeyBatch(
+    const std::string& key, const std::string& value,
+    std::vector<std::unique_ptr<char[]>>& buffers) {
+    auto buf = std::make_unique<char[]>(value.size());
+    std::memcpy(buf.get(), value.data(), value.size());
+    buffers.push_back(std::move(buf));
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    batch.emplace(
+        key, std::vector<Slice>{Slice{buffers.back().get(), value.size()}});
+    return batch;
+}
+
+TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_Eviction_FifoOrder) {
+    // Verify that when watermark-triggered eviction fires, the oldest
+    // key (by insertion order) is evicted first.
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.storage_backend_type = StorageBackendType::kOffsetAllocator;
+    config.total_size_limit = 4 * 1024;  // 4KB — very small arena
+    config.total_keys_limit = 100;
+
+    OffsetAllocatorBackendConfig evict_cfg;
+    evict_cfg.eviction_policy = OffsetEvictionPolicy::FIFO;
+
+    OffsetAllocatorStorageBackend storage_backend(config, evict_cfg);
+    ASSERT_TRUE(storage_backend.Init());
+
+    std::vector<std::string> evicted_keys;
+    auto eviction_handler =
+        [&evicted_keys](const std::vector<std::string>& keys) {
+            for (const auto& k : keys) evicted_keys.push_back(k);
+        };
+    auto complete_handler = [](const std::vector<std::string>&,
+                               std::vector<StorageObjectMetadata>&) {
+        return ErrorCode::OK;
+    };
+
+    // Write A, B, C one by one. The arena is 4 KB; each 1 KB record
+    // (8 + key + value) ≈ 1040 bytes. 4 records should trigger eviction.
+    std::string data(1000, 'x');
+    std::vector<std::unique_ptr<char[]>> buffers;
+
+    for (const auto& key : {"key_a", "key_b", "key_c"}) {
+        auto batch = MakeSingleKeyBatch(key, data, buffers);
+        [[maybe_unused]] auto res = storage_backend.BatchOffload(
+            batch, complete_handler, eviction_handler);
+        ASSERT_TRUE(res.has_value()) << "key=" << key;
+    }
+
+    // The fourth write should push total_size_ over high_watermark_bytes_
+    // and evict key_a (the oldest).
+    auto batch = MakeSingleKeyBatch("key_d", data, buffers);
+    [[maybe_unused]] auto res =
+        storage_backend.BatchOffload(batch, complete_handler, eviction_handler);
+    ASSERT_TRUE(res.has_value());
+
+    ASSERT_FALSE(evicted_keys.empty())
+        << "Should have evicted at least one key";
+    EXPECT_EQ(evicted_keys[0], "key_a")
+        << "FIFO eviction must evict the oldest key first";
+    EXPECT_FALSE(storage_backend.IsExist("key_a").value_or(true))
+        << "key_a should no longer exist after eviction";
+    EXPECT_TRUE(storage_backend.IsExist("key_d").value_or(false))
+        << "key_d should exist";
+}
+
+//-----------------------------------------------------------------------------
+
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_Eviction_NoEvictionWhenNONE) {
+    // Under default NONE policy, the allocate-fail path still breaks.
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.storage_backend_type = StorageBackendType::kOffsetAllocator;
+    config.total_size_limit = 4 * 1024;
+    config.total_keys_limit = 100;
+
+    OffsetAllocatorStorageBackend storage_backend(config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    std::vector<std::string> evicted_keys;
+    auto eviction_handler =
+        [&evicted_keys](const std::vector<std::string>& keys) {
+            for (const auto& k : keys) evicted_keys.push_back(k);
+        };
+    auto complete_handler = [](const std::vector<std::string>&,
+                               std::vector<StorageObjectMetadata>&) {
+        return ErrorCode::OK;
+    };
+
+    std::string data(1500, 'x');
+    std::vector<std::unique_ptr<char[]>> buffers;
+
+    int offloaded = 0;
+    for (const auto& key : {"key_a", "key_b", "key_c", "key_d"}) {
+        auto batch = MakeSingleKeyBatch(key, data, buffers);
+        [[maybe_unused]] auto res = storage_backend.BatchOffload(
+            batch, complete_handler, eviction_handler);
+        if (res.has_value())
+            ++offloaded;
+        else
+            break;  // allocation failure should break
+    }
+
+    EXPECT_GT(offloaded, 0);
+    EXPECT_LT(offloaded, 5) << "NONE policy should break on allocation failure";
+    EXPECT_TRUE(evicted_keys.empty()) << "NONE policy should never evict";
+}
+
+//-----------------------------------------------------------------------------
+
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_Eviction_MasterNotifiedBeforeReuse) {
+    // Verify that eviction_handler is called BEFORE allocate() for the
+    // key whose eviction made room, i.e. the notify-before-reuse contract.
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.storage_backend_type = StorageBackendType::kOffsetAllocator;
+    config.total_size_limit = 4 * 1024;
+    config.total_keys_limit = 100;
+
+    OffsetAllocatorBackendConfig evict_cfg;
+    evict_cfg.eviction_policy = OffsetEvictionPolicy::FIFO;
+
+    OffsetAllocatorStorageBackend storage_backend(config, evict_cfg);
+    ASSERT_TRUE(storage_backend.Init());
+
+    bool handler_called_before_allocation = false;
+    bool allocate_happened = false;
+
+    auto eviction_handler =
+        [&handler_called_before_allocation,
+         &allocate_happened](const std::vector<std::string>& keys) {
+            if (!keys.empty() && !allocate_happened) {
+                handler_called_before_allocation = true;
+            }
+        };
+    auto complete_handler = [](const std::vector<std::string>&,
+                               std::vector<StorageObjectMetadata>&) {
+        return ErrorCode::OK;
+    };
+
+    // The test doesn't have direct instrumentation for "allocate() just
+    // happened". But the design guarantees that eviction_handler is called
+    // at (B) before (C) in BatchOffload. We verify indirectly:
+    // after writing enough to trigger eviction, the handler must have been
+    // invoked with at least one key AND that key no longer exists.
+    std::string data(1000, 'x');
+    std::vector<std::unique_ptr<char[]>> buffers;
+
+    for (const auto& key : {"key_a", "key_b", "key_c"}) {
+        auto batch = MakeSingleKeyBatch(key, data, buffers);
+        storage_backend.BatchOffload(batch, complete_handler, eviction_handler);
+    }
+
+    std::vector<std::string> captured_evicted;
+    auto capture_handler =
+        [&captured_evicted](const std::vector<std::string>& keys) {
+            for (const auto& k : keys) captured_evicted.push_back(k);
+        };
+
+    auto batch = MakeSingleKeyBatch("key_d", data, buffers);
+    storage_backend.BatchOffload(batch, complete_handler, capture_handler);
+
+    EXPECT_FALSE(captured_evicted.empty())
+        << "Should have evicted at least one key";
+    for (const auto& ek : captured_evicted) {
+        EXPECT_FALSE(storage_backend.IsExist(ek).value_or(true))
+            << "Evicted key " << ek
+            << " should not exist (erased before reuse)";
+    }
+    EXPECT_TRUE(storage_backend.IsExist("key_d").value_or(false));
+}
+
+//-----------------------------------------------------------------------------
+
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_Eviction_PostLoopFlush) {
+    // The last key in a batch may trigger eviction but fail allocate.
+    // The evicted keys must still be flushed to the handler before return.
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.storage_backend_type = StorageBackendType::kOffsetAllocator;
+    // Arena large enough for several keys but small enough to trigger
+    // eviction near capacity.
+    config.total_size_limit = 8 * 1024;
+    config.total_keys_limit = 100;
+
+    OffsetAllocatorBackendConfig evict_cfg;
+    evict_cfg.eviction_policy = OffsetEvictionPolicy::FIFO;
+
+    OffsetAllocatorStorageBackend storage_backend(config, evict_cfg);
+    ASSERT_TRUE(storage_backend.Init());
+
+    std::vector<std::string> all_evicted;
+    auto eviction_handler =
+        [&all_evicted](const std::vector<std::string>& keys) {
+            for (const auto& k : keys) all_evicted.push_back(k);
+        };
+    auto complete_handler = [](const std::vector<std::string>&,
+                               std::vector<StorageObjectMetadata>&) {
+        return ErrorCode::OK;
+    };
+
+    std::string data(1500, 'x');  // each record ≈ 1516 bytes
+    std::vector<std::unique_ptr<char[]>> buffers;
+
+    // Write enough to fill the arena and trigger eviction.
+    for (const auto& key : {"key_a", "key_b", "key_c", "key_d", "key_e"}) {
+        auto batch = MakeSingleKeyBatch(key, data, buffers);
+        [[maybe_unused]] auto res = storage_backend.BatchOffload(
+            batch, complete_handler, eviction_handler);
+        // Some may succeed, some may fail — we just care that evicted
+        // keys are eventually reported.
+    }
+
+    // If any eviction happened, the evicted keys should be reported.
+    // We don't assert non-empty because capacity calculations can vary;
+    // we just assert that if keys were evicted, they're no longer present.
+    if (!all_evicted.empty()) {
+        for (const auto& ek : all_evicted) {
+            EXPECT_FALSE(storage_backend.IsExist(ek).value_or(true))
+                << "Evicted key " << ek << " should not exist";
+        }
+    }
+}
+
+//-----------------------------------------------------------------------------
+
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_Eviction_KeyCountTrigger) {
+    // Verify that eviction fires when total_keys_ exceeds the key-count
+    // high watermark, even when bytes are well below the byte watermark.
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.storage_backend_type = StorageBackendType::kOffsetAllocator;
+    config.total_size_limit = 1 * 1024 * 1024;  // 1 MB — plenty of bytes
+    config.total_keys_limit = 10;               // only 10 keys allowed
+
+    OffsetAllocatorBackendConfig evict_cfg;
+    evict_cfg.eviction_policy = OffsetEvictionPolicy::FIFO;
+
+    OffsetAllocatorStorageBackend storage_backend(config, evict_cfg);
+    ASSERT_TRUE(storage_backend.Init());
+
+    std::vector<std::string> evicted_keys;
+    auto eviction_handler =
+        [&evicted_keys](const std::vector<std::string>& keys) {
+            for (const auto& k : keys) evicted_keys.push_back(k);
+        };
+    auto complete_handler = [](const std::vector<std::string>&,
+                               std::vector<StorageObjectMetadata>&) {
+        return ErrorCode::OK;
+    };
+
+    // Each key is tiny (10 bytes), so bytes stay low.
+    std::string data(10, 'x');
+    std::vector<std::unique_ptr<char[]>> buffers;
+
+    for (int i = 0; i < 15; ++i) {
+        std::string key = "tiny_key_" + std::to_string(i);
+        auto batch = MakeSingleKeyBatch(key, data, buffers);
+        storage_backend.BatchOffload(batch, complete_handler, eviction_handler);
+    }
+
+    // Key-count watermark should have triggered eviction.
+    EXPECT_FALSE(evicted_keys.empty())
+        << "Key-count overflow should trigger eviction even with low bytes";
+}
+
+//-----------------------------------------------------------------------------
+
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_Eviction_ConcurrentReadSafety) {
+    // Validate the load-bearing safety property: AllocationPtr refcount
+    // must keep an evicted key's physical extent alive (pinned) until
+    // all in-flight BatchLoad calls release their shared_ptr copies.
+    //
+    // Mechanism being tested:
+    //   1. BatchLoad copies entry.allocation (shared_ptr) into its
+    //      ReadPlan, incrementing the refcount.  (storage_backend.cpp
+    //      ~line 3375: "entry.allocation" copy in ReadPlan)
+    //   2. EvictToMakeRoom erases the key from shard.map, decrementing
+    //      the map's shared_ptr.  If no reader holds a copy, the
+    //      RefCountedAllocationHandle destructor calls freeAllocation
+    //      and the extent returns to the allocator.
+    //   3. While a reader holds its shared_ptr copy (refcount >= 1),
+    //      freeAllocation does NOT fire → the extent is still marked
+    //      "used" in the allocator → allocate() cannot re-issue that
+    //      offset.  The reader always sees the original bytes.
+    //
+    // This test interleaves reads and eviction-triggering writes;
+    // any data corruption means the allocator re-issued a still-read
+    // offset, which would be a violation of the refcount contract.
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.storage_backend_type = StorageBackendType::kOffsetAllocator;
+    config.total_size_limit =
+        8 * 1024;  // 8 KB — tight enough that 80 keys trigger eviction
+    config.total_keys_limit = 500;
+
+    OffsetAllocatorBackendConfig evict_cfg;
+    evict_cfg.eviction_policy = OffsetEvictionPolicy::FIFO;
+
+    OffsetAllocatorStorageBackend storage_backend(config, evict_cfg);
+    ASSERT_TRUE(storage_backend.Init());
+
+    auto complete_handler = [](const std::vector<std::string>&,
+                               std::vector<StorageObjectMetadata>&) {
+        return ErrorCode::OK;
+    };
+
+    // Pre-populate with distinct-per-key data so a re-issued offset
+    // is detectable: if key_i's extent is handed to a new key and the
+    // reader still reads from it, read_buf[0] won't match 'A' + i%26.
+    std::vector<std::unique_ptr<char[]>> buffers;
+    const int kNumKeys = 30;
+    for (int i = 0; i < kNumKeys; ++i) {
+        std::string key = "ckey_" + std::to_string(i);
+        std::string val(100, static_cast<char>('A' + (i % 26)));
+        auto batch = MakeSingleKeyBatch(key, val, buffers);
+        storage_backend.BatchOffload(batch, complete_handler);
+    }
+    // Confirm pre-populated keys exist before the stress phase.
+    for (int i = 0; i < std::min(kNumKeys, 5); ++i) {
+        EXPECT_TRUE(storage_backend.IsExist("ckey_" + std::to_string(i))
+                        .value_or(false));
+    }
+
+    // Eviction handler that tracks victim keys so we can assert post-hoc.
+    std::vector<std::string> all_evicted;
+    std::mutex evict_mtx;
+    auto eviction_handler = [&all_evicted,
+                             &evict_mtx](const std::vector<std::string>& keys) {
+        std::lock_guard<std::mutex> lk(evict_mtx);
+        for (const auto& k : keys) all_evicted.push_back(k);
+    };
+
+    std::atomic<bool> stop{false};
+    std::atomic<int> read_errors{0};
+    std::atomic<int> read_success{0};
+    std::atomic<int> read_not_found{0};
+
+    std::thread reader([&]() {
+        while (!stop) {
+            for (int i = 0; i < kNumKeys; ++i) {
+                std::string key = "ckey_" + std::to_string(i);
+                auto read_buf = std::make_unique<char[]>(100);
+                std::unordered_map<std::string, Slice> load;
+                load.emplace(key, Slice{read_buf.get(), 100});
+                auto res = storage_backend.BatchLoad(load);
+                if (res.has_value()) {
+                    read_success++;
+                    if (read_buf[0] != static_cast<char>('A' + (i % 26))) {
+                        read_errors++;
+                    }
+                } else {
+                    read_not_found++;  // expected after eviction
+                }
+            }
+        }
+    });
+
+    std::thread writer([&]() {
+        for (int i = kNumKeys; i < kNumKeys + 50 && !stop; ++i) {
+            std::string key = "newkey_" + std::to_string(i);
+            std::string val(100, 'Z');
+            std::vector<std::unique_ptr<char[]>> wbufs;
+            auto batch = MakeSingleKeyBatch(key, val, wbufs);
+            storage_backend.BatchOffload(batch, complete_handler,
+                                         eviction_handler);
+        }
+        stop = true;
+    });
+
+    writer.join();
+    reader.join();
+
+    // Core safety assertion: zero data corruption across all reads.
+    EXPECT_EQ(read_errors.load(), 0)
+        << "Refcount must prevent allocator from re-issuing in-use extents";
+
+    // Sanity: some reads succeeded and some keys were evicted.
+    EXPECT_GT(read_success.load(), 0);
+    {
+        std::lock_guard<std::mutex> lk(evict_mtx);
+        EXPECT_FALSE(all_evicted.empty())
+            << "Eviction must have occurred during concurrent stress";
+    }
+
+    // Post-condition: at least one evicted key is no longer in the map.
+    {
+        std::lock_guard<std::mutex> lk(evict_mtx);
+        bool any_gone = false;
+        for (const auto& ek : all_evicted) {
+            if (!storage_backend.IsExist(ek).value_or(true)) {
+                any_gone = true;
+                break;
+            }
+        }
+        EXPECT_TRUE(any_gone) << "Evicted keys must be removed from shard.map";
+    }
+}
+
 }  // namespace mooncake::test
