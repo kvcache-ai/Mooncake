@@ -1227,12 +1227,20 @@ TEST_F(MasterServiceSnapshotTest, UnmountSegmentImmediateCleanup) {
     // Unmount segment1
     auto unmount_result1 = service_->UnmountSegment(segment1.id, client_id);
     ASSERT_TRUE(unmount_result1.has_value());
-    // Umount will remove all objects in the segment, include the key1
-    ASSERT_EQ(1, service_->GetKeyCount());
-    // Verify objects in segment1 is gone
+
+    // The object becomes invisible immediately even though physical metadata
+    // cleanup runs asynchronously.
     auto get_result1 = service_->GetReplicaList(key1, "default");
     ASSERT_FALSE(get_result1.has_value());
     ASSERT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result1.error());
+
+    const auto cleanup_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (service_->GetKeyCount() != 1 &&
+           std::chrono::steady_clock::now() < cleanup_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_EQ(1, service_->GetKeyCount());
 
     // Verify objects in segment2 is still there
     auto get_result2 = service_->GetReplicaList(key2, "default");
