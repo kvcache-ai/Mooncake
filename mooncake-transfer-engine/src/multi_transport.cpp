@@ -273,33 +273,38 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
 
     if (batch_desc.is_finished.load(std::memory_order_acquire) ||
         task_count == 0) {
-        status.s = Transport::TransferStatusEnum::COMPLETED;
+        status.s = batch_desc.has_failure.load(std::memory_order_acquire)
+                       ? Transport::TransferStatusEnum::FAILED
+                       : Transport::TransferStatusEnum::COMPLETED;
         status.transferred_bytes =
             batch_desc.finished_transfer_bytes.load(std::memory_order_relaxed);
         return Status::OK();
     }
 
-    size_t success_count = 0;
+    size_t terminal_count = 0;
+    bool has_failure = batch_desc.has_failure.load(std::memory_order_acquire);
     for (size_t task_id = 0; task_id < task_count; task_id++) {
         TransferStatus task_status;
         auto ret = getTransferStatus(batch_id, task_id, task_status);
 
         if (!ret.ok()) {
-            status.s = Transport::TransferStatusEnum::FAILED;
-            return Status::OK();
+            has_failure = true;
+            continue;
         }
 
         if (task_status.s == Transport::TransferStatusEnum::COMPLETED) {
             status.transferred_bytes += task_status.transferred_bytes;
-            success_count++;
+            terminal_count++;
         } else if (task_status.s == Transport::TransferStatusEnum::FAILED) {
-            status.s = Transport::TransferStatusEnum::FAILED;
-            return Status::OK();
+            has_failure = true;
+            terminal_count++;
         }
     }
 
-    status.s = (success_count == task_count)
-                   ? Transport::TransferStatusEnum::COMPLETED
+    batch_desc.has_failure.store(has_failure, std::memory_order_release);
+    status.s = terminal_count == task_count
+                   ? has_failure ? Transport::TransferStatusEnum::FAILED
+                                 : Transport::TransferStatusEnum::COMPLETED
                    : Transport::TransferStatusEnum::WAITING;
     if (status.s == Transport::TransferStatusEnum::COMPLETED) {
         batch_desc.is_finished.store(true, std::memory_order_release);

@@ -216,6 +216,26 @@ export MC_FORCE_MNNVL=true
 - NVIDIA NVLink hardware
 - Compiled with `USE_INTRA_NVLINK=ON`
 
+**Imported Mapping Reclamation:**
+
+Both MNNVL fabric mappings and intra-node CUDA IPC mappings are reclaimed
+after an idle timeout. The settings are read when the transport is created:
+
+```bash
+# Idle timeout in seconds. Default: 120. Set to 0 or a negative value to disable.
+export MC_NVLINK_IMPORT_TTL=120
+
+# Background scan interval in seconds. Default: 30. Must be positive.
+export MC_NVLINK_EVICT_INTERVAL=30
+```
+
+A mapping is not reclaimed while it has an in-flight asynchronous transfer.
+Completion is tracked per submission, so later work queued on the same CUDA
+stream does not delay an earlier mapping's idle timestamp. Each scan attempts
+all eligible mappings; there is no fixed per-scan release limit.
+If CUDA cannot establish that a failed stream is quiescent, the mapping remains
+pinned until process exit rather than risking an unmap during DMA.
+
 ### HIP Transport (hip)
 
 **Description:** AMD ROCm/HIP transport for GPU communication using IPC handles or Shareable handles.
