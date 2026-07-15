@@ -98,6 +98,8 @@ class TransferEngine {
 
     bool isUsingTent() const { return use_tent_; }
 
+    [[nodiscard]] bool isNvlinkFabricTransportReady() const;
+
     SegmentHandle openSegment(const std::string& segment_name);
 
     Status CheckSegmentStatus(SegmentID sid);
@@ -165,6 +167,8 @@ class TransferEngine {
     Status getBatchTransferStatus(BatchID batch_id, TransferStatus& status);
 
     Transport* getTransport(const std::string& proto);
+
+    void appendTransportMetrics(std::string& output);
 
 #if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
     !defined(USE_CXI)

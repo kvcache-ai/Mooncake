@@ -120,31 +120,52 @@ Status MultiTransport::submitTransfer(
             "Exceed the limitation of batch capacity");
     }
 
-    size_t task_id = batch_desc.task_list.size();
-    batch_desc.task_list.resize(task_id + entries.size());
+    const size_t first_task_id = batch_desc.task_list.size();
+    batch_desc.task_list.resize(first_task_id + entries.size());
+
+    for (size_t index = 0; index < entries.size(); ++index) {
+        auto& task = batch_desc.task_list[first_task_id + index];
+        task.batch_id = batch_id;
+#ifdef USE_ASCEND_HETEROGENEOUS
+        task.request = const_cast<Transport::TransferRequest*>(&entries[index]);
+#else
+        task.request = &entries[index];
+#endif
+        task.operation = entries[index].opcode;
+        task.operation_initialized = true;
+    }
 
     std::unordered_map<Transport*, std::vector<Transport::TransferTask*> >
         submit_tasks;
-    for (auto& request : entries) {
+    for (size_t index = 0; index < entries.size(); ++index) {
+        auto& request = entries[index];
         Transport* transport = nullptr;
         auto status = selectTransport(request, transport);
-        if (!status.ok()) return status;
+        if (!status.ok()) {
+            for (size_t failed = first_task_id;
+                 failed < batch_desc.task_list.size(); ++failed) {
+                Transport::markSubmissionFailed(batch_desc.task_list[failed]);
+            }
+            return status;
+        }
         assert(transport);
-        auto& task = batch_desc.task_list[task_id];
-        task.batch_id = batch_id;
+        auto& task = batch_desc.task_list[first_task_id + index];
         task.transport_ = transport;
 #ifdef USE_ASCEND_HETEROGENEOUS
         task.request = const_cast<Transport::TransferRequest*>(&request);
-#else
-        task.request = &request;
 #endif
-        ++task_id;
         submit_tasks[transport].push_back(&task);
     }
     Status overall_status = Status::OK();
     for (auto& entry : submit_tasks) {
         auto status = entry.first->submitTransferTask(entry.second);
         if (!status.ok()) {
+            for (auto* task : entry.second) {
+                if (task != nullptr && !task->is_finished &&
+                    task->slice_count == 0) {
+                    Transport::markSubmissionFailed(*task);
+                }
+            }
             // LOG(ERROR) << "Failed to submit transfer task to "
             //            << entry.first->getName();
             overall_status = status;
@@ -163,31 +184,52 @@ Status MultiTransport::mp_submitTransfer(
             "Exceed the limitation of batch capacity");
     }
 
-    size_t task_id = batch_desc.task_list.size();
-    batch_desc.task_list.resize(task_id + entries.size());
+    const size_t first_task_id = batch_desc.task_list.size();
+    batch_desc.task_list.resize(first_task_id + entries.size());
+
+    for (size_t index = 0; index < entries.size(); ++index) {
+        auto& task = batch_desc.task_list[first_task_id + index];
+        task.batch_id = batch_id;
+#ifdef USE_ASCEND_HETEROGENEOUS
+        task.request = const_cast<Transport::TransferRequest*>(&entries[index]);
+#else
+        task.request = &entries[index];
+#endif
+        task.operation = entries[index].opcode;
+        task.operation_initialized = true;
+    }
 
     std::unordered_map<Transport*, std::vector<Transport::TransferTask*> >
         submit_tasks;
-    for (auto& request : entries) {
+    for (size_t index = 0; index < entries.size(); ++index) {
+        auto& request = entries[index];
         Transport* transport = nullptr;
         auto status = mp_selectTransport(request, transport, proto);
-        if (!status.ok()) return status;
+        if (!status.ok()) {
+            for (size_t failed = first_task_id;
+                 failed < batch_desc.task_list.size(); ++failed) {
+                Transport::markSubmissionFailed(batch_desc.task_list[failed]);
+            }
+            return status;
+        }
         assert(transport);
-        auto& task = batch_desc.task_list[task_id];
-        task.batch_id = batch_id;
+        auto& task = batch_desc.task_list[first_task_id + index];
         task.transport_ = transport;
 #ifdef USE_ASCEND_HETEROGENEOUS
         task.request = const_cast<Transport::TransferRequest*>(&request);
-#else
-        task.request = &request;
 #endif
-        ++task_id;
         submit_tasks[transport].push_back(&task);
     }
     Status overall_status = Status::OK();
     for (auto& entry : submit_tasks) {
         auto status = entry.first->submitTransferTask(entry.second);
         if (!status.ok()) {
+            for (auto* task : entry.second) {
+                if (task != nullptr && !task->is_finished &&
+                    task->slice_count == 0) {
+                    Transport::markSubmissionFailed(*task);
+                }
+            }
             // LOG(ERROR) << "Failed to submit transfer task to "
             //            << entry.first->getName();
             overall_status = status;
@@ -205,6 +247,12 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
         return Status::InvalidArgument("Task ID out of range");
     }
     auto& task = batch_desc.task_list[task_id];
+
+    if (__atomic_load_n(&task.submission_failed, __ATOMIC_ACQUIRE)) {
+        status.s = Transport::TransferStatusEnum::FAILED;
+        status.transferred_bytes = task.transferred_bytes;
+        return Status::OK();
+    }
 
     // Helper: check if any slice has exceeded the configured timeout.
     // Returns true if a timeout was detected (and logs it).
@@ -271,9 +319,25 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
     const size_t task_count = batch_desc.task_list.size();
     status.transferred_bytes = 0;
 
-    if (batch_desc.is_finished.load(std::memory_order_acquire) ||
-        task_count == 0) {
-        status.s = Transport::TransferStatusEnum::COMPLETED;
+    const bool batch_finished =
+        batch_desc.is_finished.load(std::memory_order_acquire);
+    if (batch_finished || task_count == 0) {
+        // Event-driven completion may publish the batch before the caller ever
+        // polls an individual task. Give each selected transport a narrow,
+        // idempotent opportunity to finalize per-task result metrics.
+        if (batch_finished) {
+            for (auto& task : batch_desc.task_list) {
+                if (task.transport_ == nullptr) continue;
+                const bool success = !__atomic_load_n(&task.submission_failed,
+                                                      __ATOMIC_ACQUIRE) &&
+                                     __atomic_load_n(&task.failed_slice_count,
+                                                     __ATOMIC_ACQUIRE) == 0;
+                task.transport_->finalizeTransferResult(task, success);
+            }
+        }
+        status.s = batch_desc.has_failure.load(std::memory_order_acquire)
+                       ? Transport::TransferStatusEnum::FAILED
+                       : Transport::TransferStatusEnum::COMPLETED;
         status.transferred_bytes =
             batch_desc.finished_transfer_bytes.load(std::memory_order_relaxed);
         return Status::OK();
@@ -293,6 +357,7 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
             status.transferred_bytes += task_status.transferred_bytes;
             success_count++;
         } else if (task_status.s == Transport::TransferStatusEnum::FAILED) {
+            batch_desc.has_failure.store(true, std::memory_order_release);
             status.s = Transport::TransferStatusEnum::FAILED;
             return Status::OK();
         }
@@ -612,11 +677,31 @@ bool MultiTransport::isTcpOnly() const {
     return transport_map_.size() == 1 && transport_map_.count("tcp") == 1;
 }
 
+bool MultiTransport::isNvlinkFabricTransportReady() const {
+#ifdef USE_MNNVL
+    if (transport_map_.size() != 1) return false;
+    auto it = transport_map_.find("nvlink");
+    if (it == transport_map_.end()) return false;
+    auto* transport = dynamic_cast<NvlinkTransport*>(it->second.get());
+    return transport != nullptr && transport->isFabricMemoryEnabled();
+#else
+    return false;
+#endif
+}
+
 std::vector<Transport*> MultiTransport::listTransports() {
     std::vector<Transport*> transport_list;
     for (auto& entry : transport_map_)
         transport_list.push_back(entry.second.get());
     return transport_list;
+}
+
+void MultiTransport::appendTransportMetrics(std::string& output) {
+    for (auto* transport : listTransports()) {
+        if (transport != nullptr) {
+            transport->appendMetrics(output);
+        }
+    }
 }
 
 void* MultiTransport::getBaseAddr() {

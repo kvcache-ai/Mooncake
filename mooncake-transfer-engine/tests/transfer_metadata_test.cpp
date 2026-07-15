@@ -20,7 +20,10 @@
 #include <sys/time.h>
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
+#include <future>
+#include <mutex>
 #include <thread>
 
 #include "config.h"
@@ -30,6 +33,355 @@
 using namespace mooncake;
 
 namespace mooncake {
+
+class TransferMetadataTestPeer {
+   public:
+    static int EncodeSegmentDesc(TransferMetadata& metadata,
+                                 const TransferMetadata::SegmentDesc& desc,
+                                 Json::Value& encoded) {
+        return metadata.encodeSegmentDesc(desc, encoded);
+    }
+
+    static std::shared_ptr<TransferMetadata::SegmentDesc> DecodeSegmentDesc(
+        TransferMetadata& metadata, Json::Value& encoded,
+        const std::string& segment_name) {
+        return metadata.decodeSegmentDesc(encoded, segment_name);
+    }
+
+    static void SetStoragePlugin(
+        TransferMetadata& metadata,
+        std::shared_ptr<MetadataStoragePlugin> storage_plugin) {
+        metadata.p2p_handshake_mode_ = false;
+        metadata.storage_plugin_ = std::move(storage_plugin);
+    }
+};
+
+class FailOnceMetadataStoragePlugin : public MetadataStoragePlugin {
+   public:
+    bool get(const std::string&, Json::Value& value) override {
+        value = last_successful_value;
+        return has_successful_value;
+    }
+
+    bool set(const std::string&, const Json::Value& value) override {
+        ++set_calls;
+        last_attempted_value = value;
+        if (fail_next_set) {
+            fail_next_set = false;
+            return false;
+        }
+        last_successful_value = value;
+        has_successful_value = true;
+        return true;
+    }
+
+    bool remove(const std::string&) override { return true; }
+
+    int set_calls = 0;
+    bool fail_next_set = false;
+    bool has_successful_value = false;
+    Json::Value last_attempted_value;
+    Json::Value last_successful_value;
+};
+
+class BlockingFailOnceMetadataStoragePlugin : public MetadataStoragePlugin {
+   public:
+    bool get(const std::string&, Json::Value& value) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        value = last_successful_value;
+        return has_successful_value;
+    }
+
+    bool set(const std::string&, const Json::Value& value) override {
+        std::unique_lock<std::mutex> lock(mutex_);
+        ++set_calls;
+        last_attempted_value = value;
+        if (block_and_fail_next_set_) {
+            block_and_fail_next_set_ = false;
+            blocked_ = true;
+            condition_.notify_all();
+            condition_.wait(lock, [this] { return release_blocked_set_; });
+            release_blocked_set_ = false;
+            return false;
+        }
+        last_successful_value = value;
+        has_successful_value = true;
+        return true;
+    }
+
+    bool remove(const std::string&) override { return true; }
+
+    void BlockAndFailNextSet() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        block_and_fail_next_set_ = true;
+        blocked_ = false;
+    }
+
+    void WaitUntilSetIsBlocked() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        condition_.wait(lock, [this] { return blocked_; });
+    }
+
+    void ReleaseBlockedSet() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        release_blocked_set_ = true;
+        condition_.notify_all();
+    }
+
+    int SetCalls() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return set_calls;
+    }
+
+    Json::Value LastSuccessfulValue() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return last_successful_value;
+    }
+
+   private:
+    mutable std::mutex mutex_;
+    std::condition_variable condition_;
+    int set_calls = 0;
+    bool block_and_fail_next_set_ = false;
+    bool blocked_ = false;
+    bool release_blocked_set_ = false;
+    bool has_successful_value = false;
+    Json::Value last_attempted_value;
+    Json::Value last_successful_value;
+};
+
+template <typename T>
+concept HasMemoryKind = requires(T value) { value.memory_kind; };
+template <typename T>
+concept HasNumaNode = requires(T value) { value.numa_node; };
+template <typename T>
+concept HasFabricDomain = requires(T value) { value.fabric_domain_id; };
+template <typename T>
+concept HasGeneration = requires(T value) { value.generation; };
+
+static_assert(!HasMemoryKind<TransferMetadata::SegmentDesc>);
+static_assert(!HasNumaNode<TransferMetadata::SegmentDesc>);
+static_assert(!HasFabricDomain<TransferMetadata::SegmentDesc>);
+static_assert(!HasGeneration<TransferMetadata::SegmentDesc>);
+static_assert(!HasMemoryKind<TransferMetadata::BufferDesc>);
+static_assert(!HasNumaNode<TransferMetadata::BufferDesc>);
+static_assert(!HasFabricDomain<TransferMetadata::BufferDesc>);
+static_assert(!HasGeneration<TransferMetadata::BufferDesc>);
+
+TEST(TransferMetadataSchemaTest, NvlinkDescriptorMatchesV1GoldenJson) {
+    TransferMetadata metadata(P2PHANDSHAKE);
+    // Freeze the NVLink JSON contract inherited from the current origin/main.
+    // Compare parsed values so key order and whitespace do not become an
+    // accidental ABI.
+    TransferMetadata::SegmentDesc descriptor{};
+    descriptor.name = "provider:12345";
+    descriptor.protocol = "nvlink";
+    descriptor.tcp_data_port = 0;
+    descriptor.tcp_proto_version = 1;
+
+    TransferMetadata::BufferDesc buffer{};
+    buffer.name = descriptor.name;
+    buffer.addr = 0x100000000ULL;
+    buffer.length = 0x20000ULL;
+    buffer.shm_name = "fabric-handle-v1";
+    descriptor.buffers.push_back(buffer);
+
+    Json::Value encoded;
+    ASSERT_EQ(TransferMetadataTestPeer::EncodeSegmentDesc(metadata, descriptor,
+                                                          encoded),
+              0);
+    ASSERT_TRUE(encoded.isMember("timestamp"));
+    ASSERT_TRUE(encoded["timestamp"].isString());
+    ASSERT_FALSE(encoded["timestamp"].asString().empty());
+    encoded["timestamp"] = "<timestamp>";
+
+    Json::Value expected;
+    expected["name"] = descriptor.name;
+    expected["protocol"] = descriptor.protocol;
+    expected["tcp_data_port"] = descriptor.tcp_data_port;
+    expected["tcp_proto_version"] = descriptor.tcp_proto_version;
+    expected["timestamp"] = "<timestamp>";
+    Json::Value expected_buffers(Json::arrayValue);
+    Json::Value expected_buffer;
+    expected_buffer["name"] = buffer.name;
+    expected_buffer["addr"] = static_cast<Json::UInt64>(buffer.addr);
+    expected_buffer["length"] = static_cast<Json::UInt64>(buffer.length);
+    expected_buffer["shm_name"] = buffer.shm_name;
+    expected_buffers.append(expected_buffer);
+    expected["buffers"] = expected_buffers;
+
+    EXPECT_EQ(encoded, expected)
+        << "NVLink SegmentDesc wire fields changed from the V1 golden schema";
+    for (const char* forbidden :
+         {"memory_kind", "numa_node", "fabric_domain_id", "generation"}) {
+        EXPECT_FALSE(encoded.isMember(forbidden));
+        EXPECT_FALSE(encoded["buffers"][0].isMember(forbidden));
+    }
+
+    Json::Value baseline_golden = expected;
+    auto decoded = TransferMetadataTestPeer::DecodeSegmentDesc(
+        metadata, baseline_golden, descriptor.name);
+    ASSERT_NE(decoded, nullptr);
+    EXPECT_EQ(decoded->name, descriptor.name);
+    EXPECT_EQ(decoded->protocol, descriptor.protocol);
+    EXPECT_EQ(decoded->tcp_data_port, descriptor.tcp_data_port);
+    EXPECT_EQ(decoded->tcp_proto_version, descriptor.tcp_proto_version);
+    ASSERT_EQ(decoded->buffers.size(), 1U);
+    EXPECT_EQ(decoded->buffers[0].name, buffer.name);
+    EXPECT_EQ(decoded->buffers[0].addr, buffer.addr);
+    EXPECT_EQ(decoded->buffers[0].length, buffer.length);
+    EXPECT_EQ(decoded->buffers[0].shm_name, buffer.shm_name);
+
+    Json::Value reencoded;
+    ASSERT_EQ(TransferMetadataTestPeer::EncodeSegmentDesc(metadata, *decoded,
+                                                          reencoded),
+              0);
+    ASSERT_TRUE(reencoded.isMember("timestamp"));
+    ASSERT_TRUE(reencoded["timestamp"].isString());
+    ASSERT_FALSE(reencoded["timestamp"].asString().empty());
+    reencoded["timestamp"] = "<timestamp>";
+    EXPECT_EQ(reencoded, expected);
+}
+
+TEST(TransferMetadataRemovalTest,
+     FailedRemoteUpdateRestoresLocalDescriptorForRetry) {
+    TransferMetadata metadata(P2PHANDSHAKE);
+    auto storage = std::make_shared<FailOnceMetadataStoragePlugin>();
+    TransferMetadataTestPeer::SetStoragePlugin(metadata, storage);
+
+    auto segment = std::make_shared<TransferMetadata::SegmentDesc>();
+    segment->name = "provider:12345";
+    segment->protocol = "nvlink";
+    TransferMetadata::BufferDesc buffer{};
+    buffer.name = segment->name;
+    buffer.addr = 0x100000000ULL;
+    buffer.length = 0x20000ULL;
+    buffer.shm_name = "fabric-handle-v1";
+    segment->buffers.push_back(buffer);
+    auto original_segment = segment;
+    ASSERT_EQ(metadata.addLocalSegment(LOCAL_SEGMENT_ID, segment->name,
+                                       std::move(segment)),
+              0);
+
+    ASSERT_EQ(metadata.updateLocalSegmentDesc(), 0);
+    ASSERT_TRUE(storage->has_successful_value);
+    ASSERT_EQ(storage->last_successful_value["buffers"].size(), 1U);
+
+    storage->fail_next_set = true;
+    EXPECT_EQ(metadata.removeLocalMemoryBuffer(
+                  reinterpret_cast<void*>(buffer.addr), true),
+              ERR_METADATA);
+    EXPECT_EQ(storage->set_calls, 2);
+    EXPECT_EQ(storage->last_attempted_value["buffers"].size(), 0U);
+    EXPECT_EQ(storage->last_successful_value["buffers"].size(), 1U);
+
+    auto local = metadata.getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(local, nullptr);
+    EXPECT_EQ(local, original_segment)
+        << "failed deletion must restore the previous descriptor snapshot";
+    ASSERT_EQ(local->buffers.size(), 1U);
+    EXPECT_EQ(local->buffers[0].addr, buffer.addr)
+        << "failed deletion must remain retryable in the local descriptor";
+
+    EXPECT_EQ(metadata.removeLocalMemoryBuffer(
+                  reinterpret_cast<void*>(buffer.addr), true),
+              0);
+    EXPECT_EQ(storage->set_calls, 3);
+    EXPECT_EQ(storage->last_successful_value["buffers"].size(), 0U);
+    local = metadata.getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(local, nullptr);
+    EXPECT_TRUE(local->buffers.empty());
+}
+
+TEST(TransferMetadataRemovalTest,
+     FailedRemoteUpdateSerializesConcurrentCowMutationAndRetry) {
+    using namespace std::chrono_literals;
+
+    TransferMetadata metadata(P2PHANDSHAKE);
+    auto storage = std::make_shared<BlockingFailOnceMetadataStoragePlugin>();
+    TransferMetadataTestPeer::SetStoragePlugin(metadata, storage);
+
+    auto segment = std::make_shared<TransferMetadata::SegmentDesc>();
+    segment->name = "provider:concurrent";
+    segment->protocol = "nvlink";
+    TransferMetadata::BufferDesc first{};
+    first.name = segment->name;
+    first.addr = 0x100000000ULL;
+    first.length = 0x20000ULL;
+    first.shm_name = "fabric-handle-first";
+    segment->buffers.push_back(first);
+    ASSERT_EQ(metadata.addLocalSegment(LOCAL_SEGMENT_ID, segment->name,
+                                       std::move(segment)),
+              0);
+    ASSERT_EQ(metadata.updateLocalSegmentDesc(), 0);
+
+    TransferMetadata::BufferDesc second{};
+    second.name = first.name;
+    second.addr = 0x200000000ULL;
+    second.length = 0x40000ULL;
+    second.shm_name = "fabric-handle-second";
+
+    storage->BlockAndFailNextSet();
+    auto remove = std::async(std::launch::async, [&] {
+        return metadata.removeLocalMemoryBuffer(
+            reinterpret_cast<void*>(first.addr), true);
+    });
+    storage->WaitUntilSetIsBlocked();
+
+    std::promise<void> add_started_promise;
+    auto add_started = add_started_promise.get_future();
+    auto add = std::async(std::launch::async, [&] {
+        add_started_promise.set_value();
+        return metadata.addLocalMemoryBuffer(second, false);
+    });
+    add_started.wait();
+    EXPECT_EQ(add.wait_for(50ms), std::future_status::timeout)
+        << "concurrent COW mutation must wait for removal publication/rollback";
+
+    storage->ReleaseBlockedSet();
+    EXPECT_EQ(remove.get(), ERR_METADATA);
+    EXPECT_EQ(add.get(), 0);
+
+    auto local = metadata.getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(local, nullptr);
+    ASSERT_EQ(local->buffers.size(), 2U);
+    EXPECT_EQ(local->buffers[0].addr, first.addr);
+    EXPECT_EQ(local->buffers[1].addr, second.addr);
+
+    EXPECT_EQ(metadata.removeLocalMemoryBuffer(
+                  reinterpret_cast<void*>(first.addr), true),
+              0);
+    EXPECT_EQ(storage->SetCalls(), 3);
+    Json::Value published = storage->LastSuccessfulValue();
+    ASSERT_EQ(published["buffers"].size(), 1U);
+    EXPECT_EQ(published["buffers"][0]["addr"].asUInt64(), second.addr);
+
+    local = metadata.getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(local, nullptr);
+    ASSERT_EQ(local->buffers.size(), 1U);
+    EXPECT_EQ(local->buffers[0].addr, second.addr);
+}
+
+TEST(TransferTaskSubmissionFailureTest, ZeroSliceFailureIsExplicitlyTerminal) {
+    Transport::BatchDesc batch;
+    batch.batch_size = 1;
+    batch.id = reinterpret_cast<Transport::BatchID>(&batch);
+    batch.task_list.resize(1);
+    auto& task = batch.task_list.front();
+    task.batch_id = batch.id;
+
+    Transport::markSubmissionFailed(task);
+    Transport::markSubmissionFailed(task);
+
+    EXPECT_TRUE(task.submission_failed);
+    EXPECT_TRUE(task.is_finished);
+    EXPECT_EQ(task.slice_count, 0);
+    EXPECT_TRUE(batch.has_failure.load());
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+    EXPECT_TRUE(batch.is_finished.load());
+    EXPECT_EQ(batch.finished_task_count.load(), 1);
+#endif
+}
 
 class TransferMetadataTest : public ::testing::Test {
    protected:

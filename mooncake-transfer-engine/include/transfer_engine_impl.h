@@ -350,6 +350,17 @@ class TransferEngineImpl {
         return multi_transports_->getTransport(proto);
     }
 
+    void appendTransportMetrics(std::string& output) {
+        if (multi_transports_ != nullptr) {
+            multi_transports_->appendTransportMetrics(output);
+        }
+    }
+
+    [[nodiscard]] bool isNvlinkFabricTransportReady() const {
+        return multi_transports_ != nullptr &&
+               multi_transports_->isNvlinkFabricTransportReady();
+    }
+
 #if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
     !defined(USE_CXI)
     // Device transport accessors — lazily created, owned by this impl.

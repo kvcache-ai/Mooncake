@@ -379,7 +379,7 @@ jobs:
         sudo bash -x dependencies.sh -y
         mkdir build
         cd build
-        cmake -G Ninja .. -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=OFF -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
+        cmake -G Ninja .. -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DUSE_EVENT_DRIVEN_COMPLETION=ON -DWITH_EP=OFF -DWITH_STORE_RUST=OFF -DBUILD_UNIT_TESTS=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
       shell: bash
 
     - name: Build project
@@ -393,6 +393,39 @@ jobs:
         cd build
         cmake --build .
         sudo cmake --install .
+      shell: bash
+
+    - name: Gate NVLink VMM unit tests
+      run: |
+        cuda_driver_stub=""
+        for stub_dir in /usr/local/cuda/lib64/stubs /usr/local/cuda/targets/*/lib/stubs; do
+          if [ -f "$stub_dir/libcuda.so" ]; then
+            cuda_driver_stub="$stub_dir/libcuda.so"
+            break
+          fi
+        done
+        if [ -z "$cuda_driver_stub" ]; then
+          echo "::error::CUDA driver stub libcuda.so was not found"
+          exit 1
+        fi
+
+        cuda_driver_stub_runtime="$RUNNER_TEMP/cuda-driver-stubs"
+        mkdir -p "$cuda_driver_stub_runtime"
+        cp -L "$cuda_driver_stub" "$cuda_driver_stub_runtime/libcuda.so.1"
+        export LD_LIBRARY_PATH="$cuda_driver_stub_runtime:$(dirname "$cuda_driver_stub"):/usr/local/cuda/lib64:/usr/local/lib:${LD_LIBRARY_PATH:-}"
+
+        cd build
+        discovered_tests="$(ctest -N -L nvlink_vmm_unit)"
+        printf '%s\n' "$discovered_tests"
+        test_count="$(
+          awk '$1 == "Total" && $2 == "Tests:" {print $3}' \
+            <<<"$discovered_tests"
+        )"
+        if [[ ! "$test_count" =~ ^[1-9][0-9]*$ ]]; then
+          echo "::error::No nvlink_vmm_unit tests were discovered"
+          exit 1
+        fi
+        ctest -L nvlink_vmm_unit --output-on-failure
       shell: bash
 
     - name: Run sccache stat for check

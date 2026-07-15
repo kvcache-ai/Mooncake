@@ -300,6 +300,20 @@ class Transport {
         volatile uint64_t failed_slice_count = 0;
         volatile uint64_t transferred_bytes = 0;
         volatile bool is_finished = false;
+        // Explicit terminal state for failures that happen before a transport
+        // can create a Slice (for example address relocation or stream setup).
+        // A zero-slice task otherwise looks spuriously successful to legacy
+        // completion code.
+        volatile bool submission_failed = false;
+        // NvlinkTransport may be polled repeatedly after a task reaches a
+        // terminal state. Keep its bounded result metric idempotent per task.
+        volatile bool transport_result_observed = false;
+        // The request storage is owned by the submit caller and may be gone by
+        // the time an asynchronous transfer completes. Snapshot the operation
+        // while staging the task so terminal metrics never dereference the
+        // borrowed request pointer.
+        TransferRequest::OpCode operation = TransferRequest::READ;
+        bool operation_initialized = false;
         uint64_t total_bytes = 0;
         BatchID batch_id = 0;
 
@@ -315,6 +329,11 @@ class Transport {
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
         volatile uint64_t completed_slice_count = 0;
+        // NVLink POSTED slices require getTransferStatus() to drive
+        // cudaStreamQuery progress even when no completion notification fires.
+        // Other event-driven transports leave this false and remain purely
+        // condition-variable driven.
+        bool requires_periodic_status_polling = false;
 #endif
 
         // record the origin request
@@ -356,6 +375,33 @@ class Transport {
 #endif
     };
 
+    // Mark a task terminal when submission failed before Slice ownership was
+    // established. This is shared by transports and MultiTransport so every
+    // batch remains queryable/freeable even when submitTransfer() returns an
+    // error. The operation is idempotent.
+    static void markSubmissionFailed(TransferTask &task) {
+        if (__atomic_exchange_n(&task.submission_failed, true,
+                                __ATOMIC_ACQ_REL)) {
+            return;
+        }
+        __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
+
+        if (task.batch_id == 0) return;
+        auto &batch_desc = toBatchDesc(task.batch_id);
+        batch_desc.has_failure.store(true, std::memory_order_release);
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+        auto previous = batch_desc.finished_task_count.fetch_add(
+            1, std::memory_order_relaxed);
+        if (previous + 1 == batch_desc.batch_size) {
+            {
+                std::lock_guard<std::mutex> lock(batch_desc.completion_mutex);
+                batch_desc.is_finished.store(true, std::memory_order_release);
+            }
+            batch_desc.completion_cv.notify_all();
+        }
+#endif
+    }
+
    public:
     virtual ~Transport() {}
 
@@ -384,6 +430,14 @@ class Transport {
     virtual Status getTransferStatus(BatchID batch_id, size_t task_id,
                                      TransferStatus &status) = 0;
 
+    // Called when a terminal task is observed without necessarily polling the
+    // transport (for example MultiTransport's event-driven batch fast path).
+    // Implementations must tolerate repeated calls.
+    virtual void finalizeTransferResult(TransferTask &task, bool success) {
+        (void)task;
+        (void)success;
+    }
+
     std::shared_ptr<TransferMetadata> &meta() { return metadata_; }
 
     struct BufferEntry {
@@ -395,6 +449,8 @@ class Transport {
         return Status::OK();
     }
     virtual Status CheckStatus(SegmentID sid) { return Status::OK(); }
+
+    virtual void appendMetrics(std::string &output) { (void)output; }
 
    protected:
     virtual int install(std::string &local_server_name,

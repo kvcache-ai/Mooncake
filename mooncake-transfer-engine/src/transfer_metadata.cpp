@@ -1225,6 +1225,7 @@ TransferMetadata::SegmentID TransferMetadata::getSegmentID(
 }
 
 int TransferMetadata::updateLocalSegmentDesc(uint64_t segment_id) {
+    std::lock_guard<std::mutex> publish_guard(local_segment_publish_mutex_);
     std::shared_ptr<SegmentDesc> desc;
     {
         RWSpinlock::ReadGuard guard(segment_lock_);
@@ -1241,6 +1242,7 @@ int TransferMetadata::updateLocalSegmentDesc(uint64_t segment_id) {
 int TransferMetadata::addLocalSegment(SegmentID segment_id,
                                       const std::string &segment_name,
                                       std::shared_ptr<SegmentDesc> &&desc) {
+    std::lock_guard<std::mutex> publish_guard(local_segment_publish_mutex_);
     RWSpinlock::WriteGuard guard(segment_lock_);
     segment_id_to_desc_map_[segment_id] = desc;
     segment_name_to_id_map_[segment_name] = segment_id;
@@ -1248,6 +1250,7 @@ int TransferMetadata::addLocalSegment(SegmentID segment_id,
 }
 
 int TransferMetadata::removeLocalSegment(const std::string &segment_name) {
+    std::lock_guard<std::mutex> publish_guard(local_segment_publish_mutex_);
     RWSpinlock::WriteGuard guard(segment_lock_);
     if (segment_name_to_id_map_.count(segment_name)) {
         int segment_id = segment_name_to_id_map_[segment_name];
@@ -1259,25 +1262,32 @@ int TransferMetadata::removeLocalSegment(const std::string &segment_name) {
 
 int TransferMetadata::addLocalMemoryBuffer(const BufferDesc &buffer_desc,
                                            bool update_metadata) {
+    std::lock_guard<std::mutex> publish_guard(local_segment_publish_mutex_);
+    std::shared_ptr<SegmentDesc> new_segment_desc;
     {
         RWSpinlock::WriteGuard guard(segment_lock_);
-        auto new_segment_desc = std::make_shared<SegmentDesc>();
+        new_segment_desc = std::make_shared<SegmentDesc>();
         auto &segment_desc = segment_id_to_desc_map_[LOCAL_SEGMENT_ID];
         *new_segment_desc = *segment_desc;
         segment_desc = new_segment_desc;
         segment_desc->buffers.push_back(buffer_desc);
     }
-    if (update_metadata) return updateLocalSegmentDesc();
+    if (update_metadata)
+        return updateSegmentDesc(new_segment_desc->name, *new_segment_desc);
     return 0;
 }
 
 int TransferMetadata::removeLocalMemoryBuffer(void *addr,
                                               bool update_metadata) {
+    std::lock_guard<std::mutex> publish_guard(local_segment_publish_mutex_);
     bool addr_exist = false;
+    std::shared_ptr<SegmentDesc> old_segment_desc;
+    std::shared_ptr<SegmentDesc> new_segment_desc;
     {
         RWSpinlock::WriteGuard guard(segment_lock_);
-        auto new_segment_desc = std::make_shared<SegmentDesc>();
         auto &segment_desc = segment_id_to_desc_map_[LOCAL_SEGMENT_ID];
+        old_segment_desc = segment_desc;
+        new_segment_desc = std::make_shared<SegmentDesc>();
         *new_segment_desc = *segment_desc;
         segment_desc = new_segment_desc;
         for (auto iter = segment_desc->buffers.begin();
@@ -1295,7 +1305,18 @@ int TransferMetadata::removeLocalMemoryBuffer(void *addr,
         }
     }
     if (addr_exist) {
-        if (update_metadata) return updateLocalSegmentDesc();
+        if (update_metadata) {
+            int rc =
+                updateSegmentDesc(new_segment_desc->name, *new_segment_desc);
+            if (rc != 0) {
+                RWSpinlock::WriteGuard guard(segment_lock_);
+                // local_segment_publish_mutex_ prevents another COW mutation
+                // from interleaving with this remote update. Restore the exact
+                // pre-removal snapshot so the caller can retry safely.
+                segment_id_to_desc_map_[LOCAL_SEGMENT_ID] = old_segment_desc;
+            }
+            return rc;
+        }
         return 0;
     }
     return ERR_ADDRESS_NOT_REGISTERED;

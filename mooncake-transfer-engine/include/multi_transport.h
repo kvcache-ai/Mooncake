@@ -67,7 +67,18 @@ class MultiTransport {
      */
     bool isTcpOnly() const;
 
+    /**
+     * @brief Check the strict transport prerequisite for an EGM Store Pool.
+     *
+     * The V1 data path must publish only Fabric NVLink descriptors. A mixed
+     * auto-discovered transport set (for example RDMA plus NVLink) is rejected
+     * instead of silently selecting or publishing another protocol.
+     */
+    bool isNvlinkFabricTransportReady() const;
+
     std::vector<Transport *> listTransports();
+
+    void appendTransportMetrics(std::string &output);
 
     void *getBaseAddr();
 

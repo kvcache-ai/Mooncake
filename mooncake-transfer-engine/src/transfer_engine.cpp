@@ -125,6 +125,10 @@ int TransferEngine::uninstallTransport(const std::string& proto) {
     return impl_->uninstallTransport(proto);
 }
 
+bool TransferEngine::isNvlinkFabricTransportReady() const {
+    return impl_ != nullptr && impl_->isNvlinkFabricTransportReady();
+}
+
 std::string TransferEngine::getLocalIpAndPort() {
     return impl_->getLocalIpAndPort();
 }
@@ -249,6 +253,12 @@ Status TransferEngine::getBatchTransferStatus(BatchID batch_id,
 
 Transport* TransferEngine::getTransport(const std::string& proto) {
     return impl_->getTransport(proto);
+}
+
+void TransferEngine::appendTransportMetrics(std::string& output) {
+    if (impl_ != nullptr) {
+        impl_->appendTransportMetrics(output);
+    }
 }
 
 #if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
@@ -486,6 +496,11 @@ int TransferEngine::uninstallTransport(const std::string& proto) {
         return 0;
     else
         return impl_->uninstallTransport(proto);
+}
+
+bool TransferEngine::isNvlinkFabricTransportReady() const {
+    return !use_tent_ && impl_ != nullptr &&
+           impl_->isNvlinkFabricTransportReady();
 }
 
 std::string TransferEngine::getLocalIpAndPort() {
@@ -752,6 +767,12 @@ Transport* TransferEngine::getTransport(const std::string& proto) {
         return nullptr;
     else
         return impl_->getTransport(proto);
+}
+
+void TransferEngine::appendTransportMetrics(std::string& output) {
+    if (!use_tent_ && impl_ != nullptr) {
+        impl_->appendTransportMetrics(output);
+    }
 }
 
 #if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
