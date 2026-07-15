@@ -12,6 +12,8 @@
 
 namespace mooncake {
 
+struct ReplicaPlacementShadowResult;
+
 class MasterMetricManager {
    public:
     // --- Singleton Access ---
@@ -389,6 +391,12 @@ class MasterMetricManager {
     int64_t get_update_task_requests();
     int64_t get_update_task_failures();
 
+    // Replica placement SHADOW metrics have fixed-cardinality labels derived
+    // only from enums. Object keys, tenants and endpoints are deliberately not
+    // accepted by this API.
+    void observe_replica_placement_shadow(
+        const ReplicaPlacementShadowResult& result);
+
     // --- Serialization ---
     /**
      * @brief Serializes all managed metrics into Prometheus text format.
@@ -685,6 +693,11 @@ class MasterMetricManager {
 
     ylt::metric::dynamic_counter_2t tenant_quota_reject_total_;
     ylt::metric::dynamic_counter_1t tenant_evict_bytes_total_;
+
+    ylt::metric::dynamic_counter_2t replica_placement_shadow_observations_;
+    ylt::metric::dynamic_counter_2t replica_placement_shadow_add_intents_;
+    ylt::metric::dynamic_counter_2t replica_placement_shadow_remove_intents_;
+    ylt::metric::dynamic_counter_1t replica_placement_shadow_degraded_;
 
     // Snapshot Metrics
     ylt::metric::histogram_t snapshot_duration_ms_;

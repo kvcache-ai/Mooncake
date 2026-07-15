@@ -2,6 +2,8 @@
 
 #include "master_service.h"
 
+#include "master_metric_manager.h"
+
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -140,6 +142,46 @@ TEST_F(ReplicaPlacementMasterShadowTest,
 }
 
 TEST_F(ReplicaPlacementMasterShadowTest,
+       UnavailableAndStaleExternalSignalsRemainNonActuating) {
+    MasterServiceConfig config;
+    config.replica_placement_shadow_config = ExplicitSignalShadowConfig();
+    MasterService service(config);
+    ReplicaPlacementSignalSnapshot unavailable;
+    unavailable.generation = 1;
+    unavailable.observed_at = std::chrono::steady_clock::now();
+    ASSERT_EQ(
+        service.PublishReplicaPlacementSignalSnapshot(std::move(unavailable)),
+        ReplicaPlacementSignalPublishStatus::PUBLISHED);
+    const UUID client_id =
+        PrepareMemorySegment(service, "shadow_external_faults");
+    PutObject(service, client_id, "key");
+
+    ASSERT_TRUE(service.GetReplicaList("key", "default").has_value());
+    auto stale = AvailableSnapshot(2);
+    stale.observed_at =
+        std::chrono::steady_clock::now() - std::chrono::seconds(31);
+    ASSERT_EQ(service.PublishReplicaPlacementSignalSnapshot(std::move(stale)),
+              ReplicaPlacementSignalPublishStatus::PUBLISHED);
+    ASSERT_TRUE(service.GetReplicaList("key", "default").has_value());
+
+    const auto counters = service.GetReplicaPlacementShadowCounters();
+    ASSERT_TRUE(counters.has_value());
+    EXPECT_EQ(counters->observations[Observation(
+                  ReplicaTemperature::COLD,
+                  ReplicaPlacementShadowSignalStatus::SOURCE_UNAVAILABLE)],
+              1);
+    EXPECT_EQ(counters->observations[Observation(
+                  ReplicaTemperature::WARM,
+                  ReplicaPlacementShadowSignalStatus::STALE_SNAPSHOT)],
+              1);
+    uint64_t intents = 0;
+    for (uint64_t count : counters->add_intents) intents += count;
+    for (uint64_t count : counters->remove_intents) intents += count;
+    EXPECT_EQ(intents, 0);
+    service.RemoveAll();
+}
+
+TEST_F(ReplicaPlacementMasterShadowTest,
        SingleAndBatchGetDriveShadowButAdminGetDoesNot) {
     MasterServiceConfig config;
     config.replica_placement_shadow_config = ExplicitSignalShadowConfig();
@@ -206,6 +248,51 @@ TEST_F(ReplicaPlacementMasterShadowTest,
     ASSERT_TRUE(counters.has_value());
     EXPECT_EQ(failures.load(std::memory_order_relaxed), 0);
     EXPECT_EQ(TotalObservations(*counters), kThreadCount * kIterations);
+    service.RemoveAll();
+}
+
+TEST_F(ReplicaPlacementMasterShadowTest,
+       PrometheusMetricsUseOnlyFixedCardinalityLabels) {
+    MasterServiceConfig config;
+    config.replica_placement_shadow_config = ExplicitSignalShadowConfig();
+    MasterService service(config);
+    ASSERT_EQ(
+        service.PublishReplicaPlacementSignalSnapshot(AvailableSnapshot(1)),
+        ReplicaPlacementSignalPublishStatus::PUBLISHED);
+    const UUID client_id = PrepareMemorySegment(service, "shadow_metrics");
+    const std::string secret_key = "must_not_appear_object_key_7f3a";
+    PutObject(service, client_id, secret_key);
+
+    ASSERT_TRUE(service.GetReplicaList(secret_key, "default").has_value());
+
+    ReplicaPlacementShadowResult synthetic;
+    synthetic.temperature = ReplicaTemperature::HOT;
+    synthetic.signal_status = ReplicaPlacementShadowSignalStatus::READY;
+    synthetic.plan.adjustments[Tier(ReplicaPlacementTier::LOCAL_DISK)].add = 2;
+    synthetic.plan.adjustments[Tier(ReplicaPlacementTier::MEMORY)].remove = 1;
+    synthetic.plan.degraded_reasons[0] =
+        ReplicaPlacementDegradedReason::REQUIRED_TIER_UNHEALTHY;
+    synthetic.plan.degraded_reason_count = 1;
+    MasterMetricManager::instance().observe_replica_placement_shadow(synthetic);
+
+    const std::string metrics =
+        MasterMetricManager::instance().serialize_metrics();
+    EXPECT_NE(
+        metrics.find("master_replica_placement_shadow_observations_total"),
+        std::string::npos);
+    EXPECT_NE(metrics.find("temperature=\"hot\",status=\"ready\""),
+              std::string::npos);
+    EXPECT_NE(metrics.find("temperature=\"hot\",tier=\"local_disk\""),
+              std::string::npos);
+    EXPECT_NE(metrics.find("temperature=\"hot\",tier=\"memory\""),
+              std::string::npos);
+    EXPECT_NE(metrics.find("reason=\"required_tier_unhealthy\""),
+              std::string::npos);
+    EXPECT_EQ(metrics.find(secret_key), std::string::npos);
+    EXPECT_EQ(metrics.find("tenant"), std::string::npos)
+        << "replica placement SHADOW metric labels must not contain tenants";
+    EXPECT_EQ(metrics.find("endpoint"), std::string::npos)
+        << "replica placement SHADOW metric labels must not contain endpoints";
     service.RemoveAll();
 }
 
@@ -303,6 +390,42 @@ TEST_F(ReplicaPlacementMasterShadowTest,
 }
 
 TEST_F(ReplicaPlacementMasterShadowTest,
+       AutoCollectorRejectsKnownFullLocalDisk) {
+    MasterReplicaPlacementShadowConfig shadow;
+    shadow.evaluator = ShadowConfig();
+    shadow.evaluator.policy.targets[static_cast<size_t>(
+        ReplicaTemperature::COLD)][Tier(ReplicaPlacementTier::LOCAL_DISK)] =
+        ReplicaTierTarget{2, true};
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.replica_placement_shadow_config = shadow;
+    MasterService service(config);
+    const UUID client_id = PrepareMemorySegment(service, "shadow_local_full");
+    ASSERT_TRUE(service.MountLocalDiskSegment(client_id, true).has_value());
+    constexpr int64_t kCapacity = 1024;
+    ASSERT_TRUE(service.ReportSsdCapacity(client_id, kCapacity).has_value());
+    PutObject(service, client_id, "key");
+    StorageObjectMetadata metadata;
+    metadata.data_size = kCapacity;
+    metadata.transport_endpoint = "shadow_local_full";
+    OffloadTaskItem task{
+        .tenant_id = "default", .key = "key", .size = kCapacity};
+    ASSERT_TRUE(service.NotifyOffloadSuccess(client_id, {task}, {metadata})
+                    .has_value());
+
+    ASSERT_TRUE(service.GetReplicaList("key", "default").has_value());
+    const auto counters = service.GetReplicaPlacementShadowCounters();
+    ASSERT_TRUE(counters.has_value());
+    EXPECT_EQ(counters->add_intents[Intent(ReplicaTemperature::COLD,
+                                           ReplicaPlacementTier::LOCAL_DISK)],
+              0);
+    EXPECT_EQ(counters->degraded[static_cast<size_t>(
+                  ReplicaPlacementDegradedReason::REQUIRED_TIER_UNAVAILABLE)],
+              1);
+    service.RemoveAll();
+}
+
+TEST_F(ReplicaPlacementMasterShadowTest,
        AutoCollectorProbesConfiguredRemoteStoreDirectory) {
     const auto root = std::filesystem::temp_directory_path() /
                       ("mooncake_shadow_remote_" +
@@ -337,6 +460,40 @@ TEST_F(ReplicaPlacementMasterShadowTest,
     std::error_code error;
     std::filesystem::remove_all(root, error);
     EXPECT_FALSE(error);
+}
+
+TEST_F(ReplicaPlacementMasterShadowTest,
+       AutoCollectorRejectsMissingRemoteStoreDirectory) {
+    const auto root = std::filesystem::temp_directory_path() /
+                      ("mooncake_shadow_missing_remote_" +
+                       std::to_string(static_cast<uint64_t>(::getpid())));
+    std::error_code cleanup_error;
+    std::filesystem::remove_all(root, cleanup_error);
+    ASSERT_FALSE(std::filesystem::exists(root));
+
+    MasterReplicaPlacementShadowConfig shadow;
+    shadow.evaluator = ShadowConfig();
+    shadow.evaluator.policy.targets[static_cast<size_t>(
+        ReplicaTemperature::COLD)][Tier(ReplicaPlacementTier::REMOTE_STORE)] =
+        ReplicaTierTarget{2, true};
+    MasterServiceConfig config;
+    config.root_fs_dir = root.string();
+    config.cluster_id = "missing";
+    config.replica_placement_shadow_config = shadow;
+    MasterService service(config);
+    const UUID client_id = PrepareMemorySegment(service, "shadow_remote_down");
+    PutObject(service, client_id, "key");
+
+    ASSERT_TRUE(service.GetReplicaList("key", "default").has_value());
+    const auto counters = service.GetReplicaPlacementShadowCounters();
+    ASSERT_TRUE(counters.has_value());
+    EXPECT_EQ(counters->add_intents[Intent(ReplicaTemperature::COLD,
+                                           ReplicaPlacementTier::REMOTE_STORE)],
+              0);
+    EXPECT_EQ(counters->degraded[static_cast<size_t>(
+                  ReplicaPlacementDegradedReason::REQUIRED_TIER_UNHEALTHY)],
+              1);
+    service.RemoveAll();
 }
 
 TEST(ReplicaPlacementMasterShadowConfigTest,

@@ -7,6 +7,7 @@
 #include <vector>   // Required by histogram serialization
 #include <cmath>
 
+#include "replica_placement_shadow.h"
 #include "utils.h"
 
 namespace mooncake {
@@ -381,6 +382,23 @@ MasterMetricManager::MasterMetricManager()
       tenant_evict_bytes_total_(
           "mooncake_tenant_evict_bytes_total",
           "Total bytes evicted by tenant-scoped quota eviction", {"tenant_id"}),
+      replica_placement_shadow_observations_(
+          "master_replica_placement_shadow_observations_total",
+          "Replica placement SHADOW observations by temperature and signal "
+          "status",
+          {"temperature", "status"}),
+      replica_placement_shadow_add_intents_(
+          "master_replica_placement_shadow_add_intents_total",
+          "Replica add intents proposed by replica placement SHADOW",
+          {"temperature", "tier"}),
+      replica_placement_shadow_remove_intents_(
+          "master_replica_placement_shadow_remove_intents_total",
+          "Replica remove intents proposed by replica placement SHADOW",
+          {"temperature", "tier"}),
+      replica_placement_shadow_degraded_(
+          "master_replica_placement_shadow_degraded_total",
+          "Replica placement SHADOW degraded observations by reason",
+          {"reason"}),
 
       // Snapshot Metrics
       snapshot_duration_ms_(
@@ -1694,6 +1712,49 @@ int64_t MasterMetricManager::get_update_task_failures() {
     return mark_task_to_complete_failures_.value();
 }
 
+void MasterMetricManager::observe_replica_placement_shadow(
+    const ReplicaPlacementShadowResult& result) {
+    static constexpr std::array<const char*, kReplicaTemperatureCount>
+        kTemperatures = {"cold", "warm", "hot"};
+    static constexpr std::array<const char*,
+                                kReplicaPlacementShadowSignalStatusCount>
+        kStatuses = {"ready", "missing_snapshot", "source_unavailable",
+                     "stale_snapshot"};
+    static constexpr std::array<const char*, kReplicaPlacementTierCount>
+        kTiers = {"memory", "local_disk", "nof_ssd", "remote_store"};
+    static constexpr std::array<const char*,
+                                kReplicaPlacementDegradedReasonCount>
+        kDegradedReasons = {
+            "required_tier_unavailable", "required_tier_unhealthy",
+            "required_tier_signal_unknown", "min_complete_unsatisfied"};
+
+    const size_t temperature = static_cast<size_t>(result.temperature);
+    const size_t status = static_cast<size_t>(result.signal_status);
+    if (temperature >= kTemperatures.size() || status >= kStatuses.size()) {
+        return;
+    }
+    replica_placement_shadow_observations_.inc(
+        {kTemperatures[temperature], kStatuses[status]});
+    for (size_t tier = 0; tier < result.plan.adjustments.size(); ++tier) {
+        const auto& adjustment = result.plan.adjustments[tier];
+        if (adjustment.add != 0) {
+            replica_placement_shadow_add_intents_.inc(
+                {kTemperatures[temperature], kTiers[tier]}, adjustment.add);
+        }
+        if (adjustment.remove != 0) {
+            replica_placement_shadow_remove_intents_.inc(
+                {kTemperatures[temperature], kTiers[tier]}, adjustment.remove);
+        }
+    }
+    for (size_t i = 0; i < result.plan.degraded_reason_count; ++i) {
+        const size_t reason =
+            static_cast<size_t>(result.plan.degraded_reasons[i]);
+        if (reason < kDegradedReasons.size()) {
+            replica_placement_shadow_degraded_.inc({kDegradedReasons[reason]});
+        }
+    }
+}
+
 // --- Serialization ---
 std::string MasterMetricManager::serialize_metrics() {
     // Note: Following Prometheus style, metrics with value 0 that haven't
@@ -1836,6 +1897,12 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(promotion_rejected_cap_);
     serialize_metric(tenant_quota_reject_total_);
     serialize_metric(tenant_evict_bytes_total_);
+
+    // Serialize fixed-cardinality replica placement SHADOW metrics.
+    serialize_metric(replica_placement_shadow_observations_);
+    serialize_metric(replica_placement_shadow_add_intents_);
+    serialize_metric(replica_placement_shadow_remove_intents_);
+    serialize_metric(replica_placement_shadow_degraded_);
 
     // Serialize Snapshot Metrics
     serialize_metric(snapshot_duration_ms_);

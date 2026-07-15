@@ -643,8 +643,9 @@ void MasterService::ObserveReplicaPlacementShadow(
     std::span<const Replica::Descriptor> replicas) {
     if (!replica_placement_shadow_evaluator_) return;
     RefreshReplicaPlacementShadowSignals();
-    (void)replica_placement_shadow_evaluator_->Observe(
+    const auto result = replica_placement_shadow_evaluator_->Observe(
         MakeTenantScopedKey(object_id.tenant_id, object_id.user_key), replicas);
+    MasterMetricManager::instance().observe_replica_placement_shadow(result);
 }
 
 void MasterService::RefreshReplicaPlacementShadowSignals() {
