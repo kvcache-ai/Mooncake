@@ -105,19 +105,19 @@ ReplicaPlacementShadowEvaluator::PublishSignalSnapshot(
         }
     }
 
-    std::lock_guard lock(publish_mutex_);
-    const auto current = snapshot_.load(std::memory_order_acquire);
+    std::lock_guard lock(snapshot_mutex_);
+    const auto current = snapshot_;
     if (current && snapshot.generation <= current->generation) {
         return ReplicaPlacementSignalPublishStatus::GENERATION_NOT_INCREASING;
     }
-    snapshot_.store(std::make_shared<const ReplicaPlacementSignalSnapshot>(
-                        std::move(snapshot)),
-                    std::memory_order_release);
+    snapshot_ = std::make_shared<const ReplicaPlacementSignalSnapshot>(
+        std::move(snapshot));
     return ReplicaPlacementSignalPublishStatus::PUBLISHED;
 }
 
 uint64_t ReplicaPlacementShadowEvaluator::CurrentGeneration() const noexcept {
-    const auto snapshot = snapshot_.load(std::memory_order_acquire);
+    std::lock_guard lock(snapshot_mutex_);
+    const auto snapshot = snapshot_;
     return snapshot ? snapshot->generation : 0;
 }
 
@@ -140,7 +140,11 @@ ReplicaPlacementShadowResult ReplicaPlacementShadowEvaluator::Observe(
         observations[i].pending = result.inventory[i].pending;
     }
 
-    const auto snapshot = snapshot_.load(std::memory_order_acquire);
+    std::shared_ptr<const ReplicaPlacementSignalSnapshot> snapshot;
+    {
+        std::lock_guard lock(snapshot_mutex_);
+        snapshot = snapshot_;
+    }
     if (!snapshot) {
         result.signal_status =
             ReplicaPlacementShadowSignalStatus::MISSING_SNAPSHOT;

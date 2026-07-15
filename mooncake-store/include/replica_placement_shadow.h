@@ -126,9 +126,8 @@ class ReplicaPlacementShadowEvaluator final {
     ReplicaPlacementPolicy policy_;
     CountMinSketch sketch_;
     std::shared_ptr<const ReplicaPlacementSignalClock> clock_;
-    std::atomic<std::shared_ptr<const ReplicaPlacementSignalSnapshot>>
-        snapshot_;
-    mutable std::mutex publish_mutex_;
+    std::shared_ptr<const ReplicaPlacementSignalSnapshot> snapshot_;
+    mutable std::mutex snapshot_mutex_;
     std::array<std::atomic<uint64_t>,
                kReplicaTemperatureCount *
                    kReplicaPlacementShadowSignalStatusCount>
