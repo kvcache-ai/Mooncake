@@ -212,7 +212,11 @@ class CachedReplicaScoreProvider final : public ReplicaScoreProvider {
    private:
     std::shared_ptr<const ReplicaSignalClock> clock_;
     const ReplicaSignalProviderConfig config_;
-    std::atomic<std::shared_ptr<const ReplicaSignalSnapshot>> snapshot_;
+    // Use the shared_ptr atomic free functions instead of the C++20
+    // atomic<shared_ptr<T>> specialization. Mooncake's Ubuntu 22.04 CI uses
+    // libstdc++ 11, where that specialization is not available even though
+    // the project is compiled as C++20.
+    std::shared_ptr<const ReplicaSignalSnapshot> snapshot_;
 };
 
 }  // namespace mooncake

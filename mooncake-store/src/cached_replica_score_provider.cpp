@@ -382,21 +382,23 @@ ReplicaSignalPublishStatus CachedReplicaScoreProvider::PublishSnapshot(
 
     std::shared_ptr<const ReplicaSignalSnapshot> update =
         std::make_shared<ReplicaSignalSnapshot>(std::move(snapshot));
-    auto current = snapshot_.load(std::memory_order_acquire);
+    auto current =
+        std::atomic_load_explicit(&snapshot_, std::memory_order_acquire);
     while (true) {
         if (current && update->generation <= current->generation) {
             return ReplicaSignalPublishStatus::GENERATION_NOT_INCREASING;
         }
-        if (snapshot_.compare_exchange_weak(current, update,
-                                            std::memory_order_release,
-                                            std::memory_order_acquire)) {
+        if (std::atomic_compare_exchange_weak_explicit(
+                &snapshot_, &current, update, std::memory_order_release,
+                std::memory_order_acquire)) {
             return ReplicaSignalPublishStatus::PUBLISHED;
         }
     }
 }
 
 uint64_t CachedReplicaScoreProvider::CurrentGeneration() const noexcept {
-    const auto snapshot = snapshot_.load(std::memory_order_acquire);
+    const auto snapshot =
+        std::atomic_load_explicit(&snapshot_, std::memory_order_acquire);
     return snapshot ? snapshot->generation : 0;
 }
 
@@ -413,7 +415,8 @@ void CachedReplicaScoreProvider::ScoreAll(
     }
 
     // Exactly one acquire load and one clock read define the complete batch.
-    const auto snapshot = snapshot_.load(std::memory_order_acquire);
+    const auto snapshot =
+        std::atomic_load_explicit(&snapshot_, std::memory_order_acquire);
     const auto now = clock_->Now();
     if (!snapshot) {
         for (auto& verdict : verdicts) {
