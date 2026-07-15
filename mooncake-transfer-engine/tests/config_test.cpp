@@ -197,5 +197,77 @@ TEST_F(PkeyIndexEnvTest, TeMetadataRefreshIntervalRejectsNonNumericOverride) {
     EXPECT_EQ(config.te_metadata_refresh_interval_seconds, 456);
 }
 
+// MC_CONN_PAUSE_TTL_MS arms the active-connect circuit-breaker: after an
+// endpoint to a peer is torn down, active reconnection to that peer's address
+// is paused for this many ms so the CQ poller isn't blocked re-handshaking a
+// gone peer. 0 disables (and is the default); the range is capped at 600000ms.
+// As with the other knobs, a typo / out-of-range value must preserve the
+// default rather than silently change behavior.
+class ConnPauseTtlEnvTest : public ::testing::Test {
+   protected:
+    void TearDown() override { ::unsetenv("MC_CONN_PAUSE_TTL_MS"); }
+};
+
+TEST_F(ConnPauseTtlEnvTest, DefaultIsZeroWhenUnset) {
+    ::unsetenv("MC_CONN_PAUSE_TTL_MS");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.conn_pause_ttl_ms, 0);
+}
+
+TEST_F(ConnPauseTtlEnvTest, ValidOverrideIsApplied) {
+    ASSERT_EQ(::setenv("MC_CONN_PAUSE_TTL_MS", "5000", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.conn_pause_ttl_ms, 5000);
+}
+
+TEST_F(ConnPauseTtlEnvTest, ZeroIsAcceptedAndDisables) {
+    ASSERT_EQ(::setenv("MC_CONN_PAUSE_TTL_MS", "0", 1), 0);
+    GlobalConfig config;
+    config.conn_pause_ttl_ms = 99;  // sentinel must be overwritten by 0
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.conn_pause_ttl_ms, 0);
+}
+
+TEST_F(ConnPauseTtlEnvTest, MaxBoundaryIsApplied) {
+    ASSERT_EQ(::setenv("MC_CONN_PAUSE_TTL_MS", "600000", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.conn_pause_ttl_ms, 600000);
+}
+
+TEST_F(ConnPauseTtlEnvTest, OutOfRangeIsIgnored) {
+    ASSERT_EQ(::setenv("MC_CONN_PAUSE_TTL_MS", "600001", 1), 0);
+    GlobalConfig config;
+    config.conn_pause_ttl_ms = 7;  // sentinel preserved when rejected
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.conn_pause_ttl_ms, 7);
+}
+
+TEST_F(ConnPauseTtlEnvTest, NegativeIsIgnored) {
+    ASSERT_EQ(::setenv("MC_CONN_PAUSE_TTL_MS", "-1", 1), 0);
+    GlobalConfig config;
+    config.conn_pause_ttl_ms = 11;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.conn_pause_ttl_ms, 11);
+}
+
+TEST_F(ConnPauseTtlEnvTest, NonNumericKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_CONN_PAUSE_TTL_MS", "abc", 1), 0);
+    GlobalConfig config;
+    config.conn_pause_ttl_ms = 13;  // a typo must NOT silently change behavior
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.conn_pause_ttl_ms, 13);
+}
+
+TEST_F(ConnPauseTtlEnvTest, EmptyStringKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_CONN_PAUSE_TTL_MS", "", 1), 0);
+    GlobalConfig config;
+    config.conn_pause_ttl_ms = 17;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.conn_pause_ttl_ms, 17);
+}
+
 }  // namespace
 }  // namespace mooncake

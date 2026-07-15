@@ -101,6 +101,15 @@ add_executable(tcp_address_validation_test
 target_link_libraries(tcp_address_validation_test PUBLIC gtest gtest_main)
 add_test(NAME tcp_address_validation_test COMMAND tcp_address_validation_test)
 
+# Hardware-free unit test for the active-connect circuit-breaker state
+# (ConnectPauseTracker is header-only and clock-injectable), runs on every CI
+# runner.
+add_executable(connect_pause_tracker_test
+               ${WORKSPACE}/connect_pause_tracker_test.cpp)
+target_link_libraries(connect_pause_tracker_test PUBLIC gtest gtest_main
+                                                        pthread)
+add_test(NAME connect_pause_tracker_test COMMAND connect_pause_tracker_test)
+
 if(USE_MNNVL)
   add_executable(nvlink_transport_test ${WORKSPACE}/nvlink_transport_test.cpp)
   target_link_libraries(nvlink_transport_test PUBLIC transfer_engine gtest
