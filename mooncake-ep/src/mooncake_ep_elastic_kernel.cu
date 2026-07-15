@@ -593,6 +593,7 @@ void launch_mooncake_elastic_dispatch(
         TRY_HYBRID_DISPATCH(H, E, K, M, S, 2, 8)
 
         TRY_HYBRID_DISPATCH_SHAPE(4096, 256, 8, 128, 24);
+        TRY_HYBRID_DISPATCH_SHAPE(7168, 256, 8, 128, 24);
 
 #undef TRY_HYBRID_DISPATCH_SHAPE
 #undef TRY_HYBRID_DISPATCH
@@ -674,6 +675,8 @@ void launch_mooncake_elastic_dispatch(
 #else
     TRY_DISPATCH(4096, 256, 8, 128, 24, 8);
     TRY_DISPATCH(4096, 256, 8, 128, 24, 2);
+    TRY_DISPATCH(7168, 256, 8, 128, 24, 8);
+    TRY_DISPATCH(7168, 256, 8, 128, 24, 2);
 #endif
 
 #undef TRY_DISPATCH
@@ -749,6 +752,7 @@ void launch_mooncake_elastic_dispatch_copy_epilogue(
         TRY_HYBRID_DISPATCH_EPILOGUE(H, E, K, M, S, 2, 8)
 
         TRY_HYBRID_DISPATCH_EPILOGUE_SHAPE(4096, 256, 8, 128, 24);
+        TRY_HYBRID_DISPATCH_EPILOGUE_SHAPE(7168, 256, 8, 128, 24);
 
 #undef TRY_HYBRID_DISPATCH_EPILOGUE_SHAPE
 #undef TRY_HYBRID_DISPATCH_EPILOGUE
@@ -804,6 +808,8 @@ void launch_mooncake_elastic_dispatch_copy_epilogue(
 #else
     TRY_DISPATCH_EPILOGUE(4096, 256, 8, 128, 24, 8);
     TRY_DISPATCH_EPILOGUE(4096, 256, 8, 128, 24, 2);
+    TRY_DISPATCH_EPILOGUE(7168, 256, 8, 128, 24, 8);
+    TRY_DISPATCH_EPILOGUE(7168, 256, 8, 128, 24, 2);
 #endif
 
 #undef TRY_DISPATCH_EPILOGUE
@@ -871,6 +877,7 @@ void* launch_mooncake_elastic_combine(
         TRY_HYBRID_COMBINE(H, E, K, M, S, 2, 8)
 
         TRY_HYBRID_COMBINE_SHAPE(4096, 256, 8, 128, 24);
+        TRY_HYBRID_COMBINE_SHAPE(7168, 256, 8, 128, 24);
 
 #undef TRY_HYBRID_COMBINE_SHAPE
 #undef TRY_HYBRID_COMBINE
@@ -907,6 +914,8 @@ void* launch_mooncake_elastic_combine(
 #else
     TRY_COMBINE(4096, 256, 8, 128, 24, 8);
     TRY_COMBINE(4096, 256, 8, 128, 24, 2);
+    TRY_COMBINE(7168, 256, 8, 128, 24, 8);
+    TRY_COMBINE(7168, 256, 8, 128, 24, 2);
 #endif
 
 #undef TRY_COMBINE
@@ -959,6 +968,7 @@ void launch_mooncake_elastic_combine_reduce_epilogue(
     TRY_COMBINE_EPILOGUE(H, E, K, M, S, 2, 8)
 
     TRY_HYBRID_COMBINE_EPILOGUE_SHAPE(4096, 256, 8, 128, 24);
+    TRY_HYBRID_COMBINE_EPILOGUE_SHAPE(7168, 256, 8, 128, 24);
 #endif
 
 #undef TRY_HYBRID_COMBINE_EPILOGUE_SHAPE
