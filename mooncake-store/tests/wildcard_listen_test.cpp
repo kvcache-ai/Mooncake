@@ -50,15 +50,19 @@ extern "C" int getaddrinfo(const char *node, const char *service,
         return EAI_NONAME;
     }
     // If RTLD_NEXT resolution failed (e.g. static linking), fall back to an
-    // error instead of dereferencing a null function pointer.
+    // error instead of dereferencing a null function pointer. EAI_FAIL is used
+    // rather than EAI_SYSTEM because the latter tells callers to inspect errno,
+    // which is not set here.
     if (real_getaddrinfo == nullptr) {
-        return EAI_SYSTEM;
+        return EAI_FAIL;
     }
     return real_getaddrinfo(node, service, hints, res);
 }
 
 TEST(WildcardListenTest, RpcServerListensWhenResolverRejectsWildcard) {
-    const auto port = static_cast<unsigned short>(mooncake::getFreeTcpPort());
+    const int free_port = mooncake::getFreeTcpPort();
+    ASSERT_GT(free_port, 0) << "failed to obtain a free TCP port";
+    const auto port = static_cast<unsigned short>(free_port);
     coro_rpc::coro_rpc_server server(1, port, "0.0.0.0");
 
     auto stopped = server.async_start();
@@ -69,12 +73,16 @@ TEST(WildcardListenTest, RpcServerListensWhenResolverRejectsWildcard) {
     server.stop();
 }
 
+// 0.0.0.0 is covered by the RPC test above; bind the HTTP server to the IPv6
+// wildcard "::" so the numeric-literal path is exercised for both families.
 TEST(WildcardListenTest, HttpServerListensWhenResolverRejectsWildcard) {
-    const auto port = static_cast<unsigned short>(mooncake::getFreeTcpPort());
-    coro_http::coro_http_server server(1, port, "0.0.0.0");
+    const int free_port = mooncake::getFreeTcpPort();
+    ASSERT_GT(free_port, 0) << "failed to obtain a free TCP port";
+    const auto port = static_cast<unsigned short>(free_port);
+    coro_http::coro_http_server server(1, port, "::");
 
     auto stopped = server.async_start();
-    ASSERT_FALSE(stopped.hasResult()) << "failed to listen on 0.0.0.0";
+    ASSERT_FALSE(stopped.hasResult()) << "failed to listen on ::";
 
     server.stop();
 }
