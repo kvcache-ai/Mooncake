@@ -33,12 +33,16 @@ CUFileDescPool::CUFileDescPool(size_t max_batch_size)
 }
 
 CUFileDescPool::~CUFileDescPool() {
+    auto destroy_desc = [](CUFileBatchDesc* desc) {
+        cuFileBatchIODestroy(desc->batch_handle->handle);
+        delete desc->batch_handle;
+        delete desc;
+    };
+
     // First, collect and destroy batch_handles from allocated descriptors
     for (size_t i = 0; i < MAX_NR_DESC; ++i) {
         if (descs_[i] != nullptr) {
-            cuFileBatchIODestroy(descs_[i]->batch_handle->handle);
-            delete descs_[i]->batch_handle;
-            delete descs_[i];
+            destroy_desc(descs_[i]);
             descs_[i] = nullptr;
         }
     }
@@ -50,6 +54,10 @@ CUFileDescPool::~CUFileDescPool() {
         delete batch_handle;
     }
     handle_pool_.clear();
+    for (auto* desc : quarantined_descs_) {
+        destroy_desc(desc);
+    }
+    quarantined_descs_.clear();
 }
 
 int CUFileDescPool::allocCUfileDesc(size_t batch_size) {
@@ -113,6 +121,7 @@ int CUFileDescPool::allocCUfileDesc(size_t batch_size) {
         desc->io_events.clear();
         desc->io_events.reserve(max_batch_size_);
         desc->polled_events.resize(max_batch_size_);
+        desc->reusable = true;
 
         descs_[idx] = desc;
         return idx;
@@ -221,6 +230,31 @@ bool CUFileDescPool::cachePolledEvent(std::vector<CUfileIOEvents_t>& io_events,
     return true;
 }
 
+bool CUFileDescPool::cancelBatch(int idx) {
+    RWSpinlock::WriteGuard guard(mutex_);
+    if (idx < 0 || idx >= (int)MAX_NR_DESC || descs_[idx] == nullptr) {
+        LOG(ERROR) << "Invalid descriptor index: " << idx;
+        return false;
+    }
+
+    CUfileError_t rc = cuFileBatchIOCancel(descs_[idx]->batch_handle->handle);
+    if (rc.err != CU_FILE_SUCCESS) {
+        LOG(WARNING) << "cuFileBatchIOCancel failed for descriptor " << idx
+                     << ": " << cuFileGetErrorString(rc);
+        return false;
+    }
+    return true;
+}
+
+void CUFileDescPool::markUnreusable(int idx) {
+    RWSpinlock::WriteGuard guard(mutex_);
+    if (idx < 0 || idx >= (int)MAX_NR_DESC || descs_[idx] == nullptr) {
+        LOG(ERROR) << "Invalid descriptor index: " << idx;
+        return;
+    }
+    descs_[idx]->reusable = false;
+}
+
 int CUFileDescPool::getSliceNum(int idx) {
     RWSpinlock::ReadGuard guard(mutex_);
     if (idx < 0 || idx >= (int)MAX_NR_DESC || descs_[idx] == nullptr) {
@@ -250,11 +284,16 @@ int CUFileDescPool::freeCUfileDesc(int idx) {
     // cuFileBatchIODestroy)
     {
         std::lock_guard<std::mutex> lock(handle_pool_lock_);
-        handle_pool_.push_back(desc->batch_handle);
+        if (desc->reusable) {
+            handle_pool_.push_back(desc->batch_handle);
+        } else {
+            quarantined_descs_.push_back(desc);
+        }
     }
 
-    // Delete the descriptor (each allocation gets a fresh one)
-    delete desc;
+    if (desc->reusable) {
+        delete desc;
+    }
     descs_[idx] = nullptr;
 
     return 0;

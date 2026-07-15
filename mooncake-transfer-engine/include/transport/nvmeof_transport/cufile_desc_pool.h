@@ -47,6 +47,7 @@ struct CUFileBatchDesc {
     // so its output cannot be treated as a positional status snapshot.
     std::vector<CUfileIOEvents_t> io_events;
     std::vector<CUfileIOEvents_t> polled_events;
+    bool reusable = true;
 };
 
 class CUFileDescPool {
@@ -73,6 +74,12 @@ class CUFileDescPool {
     // Get transfer status for a specific slice
     CUfileIOEvents_t getTransferStatus(int idx, int slice_id);
 
+    // Best-effort cancellation for a submitted batch.
+    bool cancelBatch(int idx);
+
+    // Prevent an unsafe batch handle from being returned to the reusable pool.
+    void markUnreusable(int idx);
+
     // Get current number of slices in the descriptor
     int getSliceNum(int idx);
 
@@ -92,6 +99,8 @@ class CUFileDescPool {
     // Object pool for BatchHandle to avoid frequent cuFileBatchIOSetUp/Destroy
     std::vector<BatchHandle*> handle_pool_;
     std::mutex handle_pool_lock_;
+
+    std::vector<CUFileBatchDesc*> quarantined_descs_;
 
     // Array of descriptors (nullptr = free slot)
     CUFileBatchDesc* descs_[MAX_NR_DESC];

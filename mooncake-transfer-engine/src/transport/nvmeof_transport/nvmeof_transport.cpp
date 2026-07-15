@@ -97,21 +97,32 @@ Status NVMeoFTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             "NVMeoFTransport: Task has no submitted slices");
     }
 
+    if (task.is_finished && task_id < nvmeof_desc.transfer_status.size()) {
+        status = nvmeof_desc.transfer_status[task_id];
+        return Status::OK();
+    }
+
     auto [slice_id, slice_num] = nvmeof_desc.task_to_slices[task_id];
     thread_local std::vector<TransferStatus> slice_statuses;
-    slice_statuses.clear();
-    slice_statuses.reserve(slice_num);
-    for (size_t i = slice_id; i < slice_id + slice_num; ++i) {
-        auto event = desc_pool_->getTransferStatus(nvmeof_desc.desc_idx_, i);
-        auto slice_status = from_cufile_transfer_status(event.status);
-        slice_statuses.push_back(TransferStatus{
-            .s = slice_status,
-            .transferred_bytes = slice_status == COMPLETED ? event.ret : 0});
-    }
+    collectSliceStatuses(nvmeof_desc.desc_idx_, slice_id, slice_num,
+                         slice_statuses);
 
     bool is_finished = false;
     status = aggregateTransferStatus(slice_statuses, is_finished);
+    if (!is_finished && isTerminalFailure(status.s)) {
+        desc_pool_->cancelBatch(nvmeof_desc.desc_idx_);
+        collectSliceStatuses(nvmeof_desc.desc_idx_, slice_id, slice_num,
+                             slice_statuses);
+        status = aggregateTransferStatus(slice_statuses, is_finished);
+        if (!is_finished && isTerminalFailure(status.s)) {
+            desc_pool_->markUnreusable(nvmeof_desc.desc_idx_);
+            is_finished = true;
+        }
+    }
     if (is_finished) {
+        if (task_id < nvmeof_desc.transfer_status.size()) {
+            nvmeof_desc.transfer_status[task_id] = status;
+        }
         task.is_finished = true;
     }
     return Status::OK();
@@ -177,10 +188,29 @@ Transport::TransferStatus NVMeoFTransport::aggregateTransferStatus(
 
     if (slice_statuses.empty()) {
         result.s = INVALID;
-    } else if (!is_finished) {
+    } else if (!is_finished && failure_priority == 0) {
         result.s = has_pending ? PENDING : WAITING;
     }
     return result;
+}
+
+void NVMeoFTransport::collectSliceStatuses(
+    int desc_idx, size_t slice_id, size_t slice_num,
+    std::vector<TransferStatus> &slice_statuses) {
+    slice_statuses.clear();
+    slice_statuses.reserve(slice_num);
+    for (size_t i = slice_id; i < slice_id + slice_num; ++i) {
+        auto event = desc_pool_->getTransferStatus(desc_idx, i);
+        auto slice_status = from_cufile_transfer_status(event.status);
+        slice_statuses.push_back(TransferStatus{
+            .s = slice_status,
+            .transferred_bytes = slice_status == COMPLETED ? event.ret : 0});
+    }
+}
+
+bool NVMeoFTransport::isTerminalFailure(TransferStatusEnum status) {
+    return status == INVALID || status == CANCELED || status == TIMEOUT ||
+           status == FAILED;
 }
 
 Status NVMeoFTransport::submitTransfer(
