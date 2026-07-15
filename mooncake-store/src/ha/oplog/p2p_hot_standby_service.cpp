@@ -60,7 +60,11 @@ ErrorCode P2PHotStandbyService::StartOplogFollowingLocked(
 
     watcher_oplog_store_ = OpLogStoreFactory::Create(
         config_.oplog_store_type, config_.cluster_id, OpLogStoreRole::READER,
-        config_.oplog_store_root_dir, config_.oplog_poll_interval_ms);
+        config_.oplog_store_type == OpLogStoreType::REDIS
+            ? config_.redis_endpoint
+            : config_.oplog_store_root_dir,
+        config_.oplog_poll_interval_ms, config_.redis_password,
+        config_.redis_username);
     if (!watcher_oplog_store_) {
         LOG(ERROR) << "P2PHotStandbyService: failed to create reader store"
                    << ", cluster_id=" << config_.cluster_id;
@@ -182,7 +186,11 @@ ErrorCode P2PHotStandbyService::FinalCatchUpForPromotionLocked(
     uint64_t current_applied_seq_id) {
     auto catch_up_store = OpLogStoreFactory::Create(
         config_.oplog_store_type, config_.cluster_id, OpLogStoreRole::READER,
-        config_.oplog_store_root_dir, config_.oplog_poll_interval_ms);
+        config_.oplog_store_type == OpLogStoreType::REDIS
+            ? config_.redis_endpoint
+            : config_.oplog_store_root_dir,
+        config_.oplog_poll_interval_ms, config_.redis_password,
+        config_.redis_username);
     if (!catch_up_store) {
         LOG(ERROR) << "P2PHotStandbyService: failed to create catch-up store";
         return ErrorCode::INTERNAL_ERROR;

@@ -8,9 +8,10 @@ RedisMasterViewHelper::RedisMasterViewHelper(const std::string& cluster_id,
                                              const std::string& redis_endpoint,
                                              const std::string& password,
                                              int db_index, int ttl_sec,
-                                             int heartbeat_interval_sec)
+                                             int heartbeat_interval_sec,
+                                             const std::string& username)
     : redis_helper_(cluster_id, redis_endpoint, password, db_index, ttl_sec,
-                    heartbeat_interval_sec),
+                    heartbeat_interval_sec, username),
       ttl_sec_(ttl_sec) {}
 
 ErrorCode RedisMasterViewHelper::Connect() { return redis_helper_.Connect(); }

@@ -35,6 +35,7 @@ using WriteConfig = std::variant<ReplicateConfig, WriteRouteRequestConfig>;
 
 struct ClientMasterDiscoveryConfig {
     std::string redis_cluster_id = DEFAULT_CLUSTER_ID;
+    std::string redis_username;
     std::string redis_password;
     int redis_db_index = 0;
     int redis_master_view_ttl_sec = 5;

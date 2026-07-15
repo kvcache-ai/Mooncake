@@ -12,6 +12,7 @@
 #ifdef STORE_USE_REDIS
 #include "redis_helper.h"
 #include "redis_master_view_helper.h"
+#include "redis_test_utils.h"
 #include <hiredis/hiredis.h>
 
 namespace mooncake {
@@ -19,14 +20,20 @@ namespace testing {
 
 DEFINE_string(redis_endpoint, "127.0.0.1:6379",
               "Redis endpoint for Redis test");
+DEFINE_string(redis_username, "",
+              "Redis ACL username for Redis test. Empty uses password-only "
+              "AUTH.");
+DEFINE_string(redis_password, "", "Redis password for Redis test");
 DEFINE_int32(redis_ttl_sec, 2, "Short TTL for testing fast key expiration");
 DEFINE_string(cluster_id, "test_helper", "Cluster ID for Redis test");
+DEFINE_bool(redis_supports_client_kill, true,
+            "Whether the Redis-compatible backend supports CLIENT KILL.");
 
 // ============================================================
 // Helper: clean up Redis keys between tests
 // ============================================================
 
-static void CleanupRedisKeys() {
+static std::pair<std::string, int> ParseRedisEndpoint() {
     std::string host = "127.0.0.1";
     int port = 6379;
     auto colon_pos = FLAGS_redis_endpoint.rfind(':');
@@ -34,8 +41,14 @@ static void CleanupRedisKeys() {
         host = FLAGS_redis_endpoint.substr(0, colon_pos);
         port = std::stoi(FLAGS_redis_endpoint.substr(colon_pos + 1));
     }
+    return {host, port};
+}
+
+static void CleanupRedisKeys() {
+    auto [host, port] = ParseRedisEndpoint();
     redisContext* ctx = redisConnect(host.c_str(), port);
-    if (ctx && !ctx->err) {
+    if (AuthenticateRedisContext(ctx, FLAGS_redis_username,
+                                 FLAGS_redis_password)) {
         std::string master_view_key =
             "mooncake:{" + FLAGS_cluster_id + "/}master_view";
         std::string master_epoch_key =
@@ -69,21 +82,24 @@ class RedisHelperTest : public ::testing::Test {
 };
 
 TEST_F(RedisHelperTest, Connect) {
-    RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint, "", 0,
-                       FLAGS_redis_ttl_sec, 1);
+    RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                       FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
+                       FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, helper.Connect());
 
     // Second connection (empty password = no auth) should also work
-    RedisHelper helper2(FLAGS_cluster_id, FLAGS_redis_endpoint, "", 0,
-                        FLAGS_redis_ttl_sec, 1);
+    RedisHelper helper2(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                        FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
+                        FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, helper2.Connect());
 }
 
 // === Test 2: ElectLeader + GetMasterView ===
 
 TEST_F(RedisHelperTest, ElectLeaderAndGetMasterView) {
-    RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint, "", 0,
-                       FLAGS_redis_ttl_sec, 1);
+    RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                       FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
+                       FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, helper.Connect());
 
     std::string master_address = "10.0.0.1:50051";
@@ -95,8 +111,9 @@ TEST_F(RedisHelperTest, ElectLeaderAndGetMasterView) {
     ASSERT_GT(lease_id, 0);
 
     // Read back via a separate helper
-    RedisHelper reader(FLAGS_cluster_id, FLAGS_redis_endpoint, "", 0,
-                       FLAGS_redis_ttl_sec, 1);
+    RedisHelper reader(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                       FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
+                       FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, reader.Connect());
 
     std::string got_address;
@@ -109,8 +126,9 @@ TEST_F(RedisHelperTest, ElectLeaderAndGetMasterView) {
 // === Test 3: KeepLeader keeps key alive past TTL ===
 
 TEST_F(RedisHelperTest, KeepLeaderRenewsTTL) {
-    RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint, "", 0,
-                       FLAGS_redis_ttl_sec, 1);
+    RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                       FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
+                       FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, helper.Connect());
 
     std::string master_address = "10.0.0.2:50051";
@@ -138,8 +156,9 @@ TEST_F(RedisHelperTest, KeepLeaderRenewsTTL) {
 
 TEST_F(RedisHelperTest, KeyExpiresAfterKeepLeaderStops) {
     const int short_ttl = 1;
-    RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint, "", 0, short_ttl,
-                       1);
+    RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                       FLAGS_redis_password, 0, short_ttl, 1,
+                       FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, helper.Connect());
 
     std::string master_address = "10.0.0.3:50051";
@@ -162,8 +181,9 @@ TEST_F(RedisHelperTest, ElectLeaderWaitsForKeyExpiry) {
     const int short_ttl = 1;
 
     // First helper: elect and let key expire (no KeepLeader)
-    RedisHelper first(FLAGS_cluster_id, FLAGS_redis_endpoint, "", 0, short_ttl,
-                      1);
+    RedisHelper first(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                      FLAGS_redis_password, 0, short_ttl, 1,
+                      FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, first.Connect());
     std::string first_addr = "10.0.0.4:50051";
     ViewVersionId first_version = 0;
@@ -171,8 +191,9 @@ TEST_F(RedisHelperTest, ElectLeaderWaitsForKeyExpiry) {
     first.ElectLeader(first_addr, first_version, first_lease);
 
     // Second helper: try to elect — should block until key expires
-    RedisHelper second(FLAGS_cluster_id, FLAGS_redis_endpoint, "", 0, short_ttl,
-                       1);
+    RedisHelper second(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                       FLAGS_redis_password, 0, short_ttl, 1,
+                       FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, second.Connect());
     ViewVersionId second_version = 0;
     int second_lease = 0;
@@ -203,8 +224,9 @@ TEST_F(RedisHelperTest, ElectLeaderWaitsForKeyExpiry) {
 
 TEST_F(RedisHelperTest, EpochMonotonicallyIncreases) {
     const int short_ttl = 1;
-    RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint, "", 0, short_ttl,
-                       1);
+    RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                       FLAGS_redis_password, 0, short_ttl, 1,
+                       FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, helper.Connect());
 
     ViewVersionId prev_epoch = 0;
@@ -222,8 +244,9 @@ TEST_F(RedisHelperTest, EpochMonotonicallyIncreases) {
 // === Test 7: CancelKeepAlive stops KeepLeader promptly ===
 
 TEST_F(RedisHelperTest, CancelKeepAliveStopsPromptly) {
-    RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint, "", 0,
-                       FLAGS_redis_ttl_sec, 1);
+    RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                       FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
+                       FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, helper.Connect());
 
     std::string master_address = "10.0.0.7:50051";
@@ -275,8 +298,9 @@ TEST_F(RedisHelperTest, CreateConnectionUnreachable) {
 // Covers: redis_helper.cpp:130-131, 145-146
 
 TEST_F(RedisHelperTest, ConnectTwice) {
-    RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint, "", 0,
-                       FLAGS_redis_ttl_sec, 1);
+    RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                       FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
+                       FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, helper.Connect());
     // Second Connect should free old contexts and create new ones
     EXPECT_EQ(ErrorCode::OK, helper.Connect());
@@ -286,8 +310,9 @@ TEST_F(RedisHelperTest, ConnectTwice) {
 // Covers: redis_helper.cpp:510
 
 TEST_F(RedisHelperTest, GetMasterViewWithoutConnect) {
-    RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint, "", 0,
-                       FLAGS_redis_ttl_sec, 1);
+    RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                       FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
+                       FLAGS_redis_username);
     // Don't call Connect — election_ctx_ is null
     std::string addr;
     ViewVersionId ver = 0;
@@ -302,11 +327,10 @@ TEST_F(RedisHelperTest, ElectLeaderUnparsableExistingValue) {
     // Write garbage into the master_view key directly
     std::string master_view_key =
         "mooncake:{" + FLAGS_cluster_id + "/}master_view";
-    redisContext* ctx = redisConnect(
-        FLAGS_redis_endpoint.substr(0, FLAGS_redis_endpoint.rfind(':')).c_str(),
-        std::stoi(
-            FLAGS_redis_endpoint.substr(FLAGS_redis_endpoint.rfind(':') + 1)));
-    ASSERT_TRUE(ctx && !ctx->err);
+    auto [host, port] = ParseRedisEndpoint();
+    redisContext* ctx = redisConnect(host.c_str(), port);
+    ASSERT_TRUE(AuthenticateRedisContext(ctx, FLAGS_redis_username,
+                                         FLAGS_redis_password));
     RedisReplyPtr r((redisReply*)redisCommand(
         ctx, "SET %b %b EX %d", master_view_key.data(), master_view_key.size(),
         "garbage", 7, short_ttl));
@@ -314,8 +338,9 @@ TEST_F(RedisHelperTest, ElectLeaderUnparsableExistingValue) {
 
     // ElectLeader should still work — it sees an unparsable leader value
     // and waits for it to expire, then wins election
-    RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint, "", 0, short_ttl,
-                       1);
+    RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                       FLAGS_redis_password, 0, short_ttl, 1,
+                       FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, helper.Connect());
 
     ViewVersionId version = 0;
@@ -333,8 +358,9 @@ TEST_F(RedisHelperTest, ElectLeaderContendedThenWin) {
     const int short_ttl = 1;
 
     // First helper: elect as leader
-    RedisHelper first(FLAGS_cluster_id, FLAGS_redis_endpoint, "", 0, short_ttl,
-                      1);
+    RedisHelper first(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                      FLAGS_redis_password, 0, short_ttl, 1,
+                      FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, first.Connect());
     ViewVersionId first_version = 0;
     int first_lease = 0;
@@ -342,8 +368,9 @@ TEST_F(RedisHelperTest, ElectLeaderContendedThenWin) {
 
     // Second helper: try to elect while key exists — will watch until expiry
     // Then TryElectOnce may race and lose once before winning
-    RedisHelper second(FLAGS_cluster_id, FLAGS_redis_endpoint, "", 0, short_ttl,
-                       1);
+    RedisHelper second(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                       FLAGS_redis_password, 0, short_ttl, 1,
+                       FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, second.Connect());
 
     ViewVersionId second_version = 0;
@@ -357,8 +384,9 @@ TEST_F(RedisHelperTest, ElectLeaderContendedThenWin) {
 // Covers: redis_helper.cpp:532-536
 
 TEST_F(RedisHelperTest, GetMasterViewNoLeader) {
-    RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint, "", 0,
-                       FLAGS_redis_ttl_sec, 1);
+    RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                       FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
+                       FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, helper.Connect());
 
     // No election has happened, so master_view key should not exist
@@ -371,19 +399,18 @@ TEST_F(RedisHelperTest, GetMasterViewNoLeader) {
 // Covers: redis_helper.cpp:532-536 (ParseLeaderValue failure path)
 
 TEST_F(RedisHelperTest, GetMasterViewCorruptedValue) {
-    RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint, "", 0,
-                       FLAGS_redis_ttl_sec, 1);
+    RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                       FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
+                       FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, helper.Connect());
 
     // Write corrupt value directly
     std::string master_view_key =
         "mooncake:{" + FLAGS_cluster_id + "/}master_view";
-    std::string host =
-        FLAGS_redis_endpoint.substr(0, FLAGS_redis_endpoint.rfind(':'));
-    int port = std::stoi(
-        FLAGS_redis_endpoint.substr(FLAGS_redis_endpoint.rfind(':') + 1));
+    auto [host, port] = ParseRedisEndpoint();
     redisContext* ctx = redisConnect(host.c_str(), port);
-    ASSERT_TRUE(ctx && !ctx->err);
+    ASSERT_TRUE(AuthenticateRedisContext(ctx, FLAGS_redis_username,
+                                         FLAGS_redis_password));
     RedisReplyPtr r((redisReply*)redisCommand(
         ctx, "SET %b %b EX %d", master_view_key.data(), master_view_key.size(),
         "not-json", 8, FLAGS_redis_ttl_sec));
@@ -422,8 +449,9 @@ TEST_F(RedisHelperTest, ParseLeaderValueMissingFields) {
 
 TEST_F(RedisHelperTest, KeepLeaderLosesLeadership) {
     const int short_ttl = 2;
-    RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint, "", 0, short_ttl,
-                       1);
+    RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                       FLAGS_redis_password, 0, short_ttl, 1,
+                       FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, helper.Connect());
 
     std::string master_address = "10.0.0.11:50051";
@@ -435,12 +463,10 @@ TEST_F(RedisHelperTest, KeepLeaderLosesLeadership) {
     // taking over)
     std::string master_view_key =
         "mooncake:{" + FLAGS_cluster_id + "/}master_view";
-    std::string host =
-        FLAGS_redis_endpoint.substr(0, FLAGS_redis_endpoint.rfind(':'));
-    int port = std::stoi(
-        FLAGS_redis_endpoint.substr(FLAGS_redis_endpoint.rfind(':') + 1));
+    auto [host, port] = ParseRedisEndpoint();
     redisContext* ctx = redisConnect(host.c_str(), port);
-    ASSERT_TRUE(ctx && !ctx->err);
+    ASSERT_TRUE(AuthenticateRedisContext(ctx, FLAGS_redis_username,
+                                         FLAGS_redis_password));
     RedisReplyPtr r((redisReply*)redisCommand(
         ctx, "SET %b %b EX %d", master_view_key.data(), master_view_key.size(),
         R"({"address":"10.0.0.99:50051","epoch":999,"ts":0,"ttl":2})", 57,
@@ -464,28 +490,32 @@ TEST_F(RedisHelperTest, KeepLeaderLosesLeadership) {
 // forcing WatchLeader to fall through to the pure polling path.
 
 TEST_F(RedisHelperTest, WatchLeaderPollingFallback) {
+    if (!FLAGS_redis_supports_client_kill) {
+        GTEST_SKIP() << "Redis-compatible backend does not support CLIENT KILL";
+    }
+
     const int short_ttl = 3;
 
     // First helper: elect as leader (key lives for short_ttl seconds)
-    RedisHelper first(FLAGS_cluster_id, FLAGS_redis_endpoint, "", 0, short_ttl,
-                      1);
+    RedisHelper first(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                      FLAGS_redis_password, 0, short_ttl, 1,
+                      FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, first.Connect());
     ViewVersionId first_version = 0;
     int first_lease = 0;
     first.ElectLeader("10.0.0.12:50051", first_version, first_lease);
 
     // Second helper: Connect, then break its subscribe connection
-    RedisHelper second(FLAGS_cluster_id, FLAGS_redis_endpoint, "", 0, short_ttl,
-                       1);
+    RedisHelper second(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                       FLAGS_redis_password, 0, short_ttl, 1,
+                       FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, second.Connect());
 
     // Kill all normal client connections to break subscribe_ctx_
-    std::string host =
-        FLAGS_redis_endpoint.substr(0, FLAGS_redis_endpoint.rfind(':'));
-    int port = std::stoi(
-        FLAGS_redis_endpoint.substr(FLAGS_redis_endpoint.rfind(':') + 1));
+    auto [host, port] = ParseRedisEndpoint();
     redisContext* admin = redisConnect(host.c_str(), port);
-    ASSERT_TRUE(admin && !admin->err);
+    ASSERT_TRUE(AuthenticateRedisContext(admin, FLAGS_redis_username,
+                                         FLAGS_redis_password));
     RedisReplyPtr kr(
         (redisReply*)redisCommand(admin, "CLIENT KILL TYPE normal"));
     redisFree(admin);
@@ -506,9 +536,14 @@ TEST_F(RedisHelperTest, WatchLeaderPollingFallback) {
 // operation that retries.
 
 TEST_F(RedisHelperTest, ReconnectAfterConnectionLoss) {
+    if (!FLAGS_redis_supports_client_kill) {
+        GTEST_SKIP() << "Redis-compatible backend does not support CLIENT KILL";
+    }
+
     const int short_ttl = 2;
-    RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint, "", 0, short_ttl,
-                       1);
+    RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                       FLAGS_redis_password, 0, short_ttl, 1,
+                       FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, helper.Connect());
 
     std::string master_address = "10.0.0.14:50051";
@@ -524,12 +559,10 @@ TEST_F(RedisHelperTest, ReconnectAfterConnectionLoss) {
     std::this_thread::sleep_for(std::chrono::seconds(2));
 
     // Kill the redis client connections to force a reconnect
-    std::string host =
-        FLAGS_redis_endpoint.substr(0, FLAGS_redis_endpoint.rfind(':'));
-    int port = std::stoi(
-        FLAGS_redis_endpoint.substr(FLAGS_redis_endpoint.rfind(':') + 1));
+    auto [host, port] = ParseRedisEndpoint();
     redisContext* admin = redisConnect(host.c_str(), port);
-    ASSERT_TRUE(admin && !admin->err);
+    ASSERT_TRUE(AuthenticateRedisContext(admin, FLAGS_redis_username,
+                                         FLAGS_redis_password));
 
     // CLIENT KILL to drop all normal clients except our admin connection
     RedisReplyPtr r(
@@ -551,8 +584,9 @@ TEST_F(RedisHelperTest, ElectLeaderCancelledViaWatchLeader) {
     const int short_ttl = 2;
 
     // First helper: elect as leader and keep it alive
-    RedisHelper first(FLAGS_cluster_id, FLAGS_redis_endpoint, "", 0, short_ttl,
-                      1);
+    RedisHelper first(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                      FLAGS_redis_password, 0, short_ttl, 1,
+                      FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, first.Connect());
     ViewVersionId first_version = 0;
     int first_lease = 0;
@@ -561,8 +595,9 @@ TEST_F(RedisHelperTest, ElectLeaderCancelledViaWatchLeader) {
     std::thread first_keep([&]() { first.KeepLeader(first_lease); });
 
     // Second helper: will block in ElectLeader → WatchLeader
-    RedisHelper second(FLAGS_cluster_id, FLAGS_redis_endpoint, "", 0, short_ttl,
-                       1);
+    RedisHelper second(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                       FLAGS_redis_password, 0, short_ttl, 1,
+                       FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, second.Connect());
     ViewVersionId second_version = 0;
     int second_lease = 0;
@@ -590,8 +625,9 @@ TEST_F(RedisHelperTest, SubscribeReceivesVacantMessage) {
     const int short_ttl = 2;
 
     // First helper: elect as leader with a short TTL
-    RedisHelper first(FLAGS_cluster_id, FLAGS_redis_endpoint, "", 0, short_ttl,
-                      1);
+    RedisHelper first(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                      FLAGS_redis_password, 0, short_ttl, 1,
+                      FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, first.Connect());
     ViewVersionId first_version = 0;
     int first_lease = 0;
@@ -601,8 +637,9 @@ TEST_F(RedisHelperTest, SubscribeReceivesVacantMessage) {
     std::thread first_keep([&]() { first.KeepLeader(first_lease); });
 
     // Second helper: elect — will block in WatchLeader subscribing
-    RedisHelper second(FLAGS_cluster_id, FLAGS_redis_endpoint, "", 0, short_ttl,
-                       1);
+    RedisHelper second(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                       FLAGS_redis_password, 0, short_ttl, 1,
+                       FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, second.Connect());
     ViewVersionId second_version = 0;
     int second_lease = 0;
@@ -639,8 +676,9 @@ class RedisElectionTest : public ::testing::Test {
 // === Test 8: MasterViewHelper ElectLeader + GetMasterView ===
 
 TEST_F(RedisElectionTest, ElectAndGetMasterView) {
-    RedisMasterViewHelper mv_helper(FLAGS_cluster_id, FLAGS_redis_endpoint, "",
-                                    0, FLAGS_redis_ttl_sec, 1);
+    RedisMasterViewHelper mv_helper(
+        FLAGS_cluster_id, FLAGS_redis_endpoint, FLAGS_redis_password, 0,
+        FLAGS_redis_ttl_sec, 1, FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, mv_helper.Connect());
 
     std::string master_address = "10.0.0.10:50051";
@@ -661,8 +699,9 @@ TEST_F(RedisElectionTest, ElectAndGetMasterView) {
 // === Test 9: MasterViewHelper KeepLeader ===
 
 TEST_F(RedisElectionTest, KeepLeaderRenewsTTL) {
-    RedisMasterViewHelper mv_helper(FLAGS_cluster_id, FLAGS_redis_endpoint, "",
-                                    0, FLAGS_redis_ttl_sec, 1);
+    RedisMasterViewHelper mv_helper(
+        FLAGS_cluster_id, FLAGS_redis_endpoint, FLAGS_redis_password, 0,
+        FLAGS_redis_ttl_sec, 1, FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, mv_helper.Connect());
 
     std::string master_address = "10.0.0.11:50051";
@@ -687,8 +726,9 @@ TEST_F(RedisElectionTest, KeepLeaderRenewsTTL) {
 
 TEST_F(RedisElectionTest, KeyExpiresAfterKeepLeaderStops) {
     const int short_ttl = 1;
-    RedisMasterViewHelper mv_helper(FLAGS_cluster_id, FLAGS_redis_endpoint, "",
-                                    0, short_ttl, 1);
+    RedisMasterViewHelper mv_helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                                    FLAGS_redis_password, 0, short_ttl, 1,
+                                    FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, mv_helper.Connect());
 
     std::string master_address = "10.0.0.12:50051";
@@ -700,8 +740,9 @@ TEST_F(RedisElectionTest, KeyExpiresAfterKeepLeaderStops) {
     // Don't start KeepLeader — let the key expire naturally
     std::this_thread::sleep_for(std::chrono::seconds(short_ttl * 3));
 
-    RedisMasterViewHelper reader(FLAGS_cluster_id, FLAGS_redis_endpoint, "", 0,
-                                 short_ttl, 1);
+    RedisMasterViewHelper reader(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                                 FLAGS_redis_password, 0, short_ttl, 1,
+                                 FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, reader.Connect());
     std::string got_address;
     ViewVersionId got_version = 0;
@@ -713,15 +754,17 @@ TEST_F(RedisElectionTest, KeyExpiresAfterKeepLeaderStops) {
 TEST_F(RedisElectionTest, ElectLeaderWaitsForKeyExpiry) {
     const int short_ttl = 1;
 
-    RedisMasterViewHelper first(FLAGS_cluster_id, FLAGS_redis_endpoint, "", 0,
-                                short_ttl, 1);
+    RedisMasterViewHelper first(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                                FLAGS_redis_password, 0, short_ttl, 1,
+                                FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, first.Connect());
     ViewVersionId first_version = 0;
     EtcdLeaseId first_lease = 0;
     first.ElectLeader("10.0.0.13:50051", first_version, first_lease);
 
-    RedisMasterViewHelper second(FLAGS_cluster_id, FLAGS_redis_endpoint, "", 0,
-                                 short_ttl, 1);
+    RedisMasterViewHelper second(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                                 FLAGS_redis_password, 0, short_ttl, 1,
+                                 FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, second.Connect());
     ViewVersionId second_version = 0;
     EtcdLeaseId second_lease = 0;
@@ -751,8 +794,9 @@ TEST_F(RedisElectionTest, ElectLeaderWaitsForKeyExpiry) {
 
 TEST_F(RedisElectionTest, EpochMonotonicallyIncreases) {
     const int short_ttl = 1;
-    RedisMasterViewHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint, "", 0,
-                                 short_ttl, 1);
+    RedisMasterViewHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                                 FLAGS_redis_password, 0, short_ttl, 1,
+                                 FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, helper.Connect());
 
     ViewVersionId prev_epoch = 0;

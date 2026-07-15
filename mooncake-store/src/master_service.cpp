@@ -31,17 +31,22 @@ MasterService::MasterService(const MasterServiceConfig& config)
         return;
     }
 
+    auto store_type = ParseOpLogStoreType(config.oplog_store_type);
+    const std::string& store_location = store_type == OpLogStoreType::REDIS
+                                            ? config.redis_endpoint
+                                            : config.oplog_data_dir;
     auto store = OpLogStoreFactory::Create(
-        ParseOpLogStoreType(config.oplog_store_type), config.cluster_id,
-        OpLogStoreRole::WRITER, config.oplog_data_dir);
+        store_type, config.cluster_id, OpLogStoreRole::WRITER, store_location,
+        kDefaultOpLogPollIntervalMs, config.redis_password,
+        config.redis_username);
     if (!store) {
         LOG(ERROR) << "MasterService: failed to initialize OpLogStore"
                    << ", type=" << config.oplog_store_type
-                   << ", data_dir=" << config.oplog_data_dir
+                   << ", location=" << store_location
                    << ", cluster_id=" << config.cluster_id;
         throw std::runtime_error(
             "failed to initialize OpLogStore while oplog is enabled: type=" +
-            config.oplog_store_type + ", data_dir=" + config.oplog_data_dir +
+            config.oplog_store_type + ", location=" + store_location +
             ", cluster_id=" + config.cluster_id);
     }
 

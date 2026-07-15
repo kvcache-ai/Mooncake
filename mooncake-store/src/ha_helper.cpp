@@ -168,6 +168,9 @@ int MasterServiceSupervisor::Start() {
             standby_config.oplog_store_type =
                 ParseOpLogStoreType(config_.oplog_store_type);
             standby_config.oplog_store_root_dir = config_.oplog_data_dir;
+            standby_config.redis_endpoint = config_.redis_endpoint;
+            standby_config.redis_username = config_.redis_username;
+            standby_config.redis_password = config_.redis_password;
 
             p2p_standby =
                 std::make_unique<P2PHotStandbyService>(standby_config);
@@ -285,7 +288,7 @@ std::unique_ptr<MasterViewHelper> CreateMasterViewHelper(
         auto helper = std::make_unique<RedisMasterViewHelper>(
             config.cluster_id, config.redis_endpoint, config.redis_password,
             config.redis_db_index, config.redis_master_view_ttl_sec,
-            config.redis_heartbeat_interval_sec);
+            config.redis_heartbeat_interval_sec, config.redis_username);
         auto rc = helper->Connect();
         if (rc != ErrorCode::OK) {
             LOG(ERROR) << "Failed to connect to Redis at: "

@@ -13,6 +13,7 @@
 #include "e2e_utils.h"
 #include "process_handler.h"
 #include "redis_master_view_helper.h"
+#include "../redis_test_utils.h"
 #include "types.h"
 
 #include <hiredis/hiredis.h>
@@ -21,6 +22,10 @@ FLAG_master_path;
 FLAG_out_dir;
 DEFINE_string(redis_endpoint, "127.0.0.1:6379",
               "Redis endpoint for Redis master failover test");
+DEFINE_string(redis_username, "",
+              "Redis ACL username for Redis master failover test");
+DEFINE_string(redis_password, "",
+              "Redis password for Redis master failover test");
 DEFINE_string(redis_cluster_id, "redis_chaos_test",
               "Redis cluster ID for Redis master failover test");
 DEFINE_int32(redis_master_view_ttl_sec, 5,
@@ -67,7 +72,8 @@ std::string MasterEpochKey() {
 bool DeleteRedisKey(const std::string& key) {
     auto [host, port] = ParseRedisEndpoint();
     redisContext* ctx = redisConnect(host.c_str(), port);
-    if (!ctx || ctx->err) {
+    if (!AuthenticateRedisContext(ctx, FLAGS_redis_username,
+                                  FLAGS_redis_password)) {
         if (ctx) redisFree(ctx);
         return false;
     }
@@ -84,7 +90,8 @@ bool DeleteRedisKey(const std::string& key) {
 void CleanupRedisKeys() {
     auto [host, port] = ParseRedisEndpoint();
     redisContext* ctx = redisConnect(host.c_str(), port);
-    if (!ctx || ctx->err) {
+    if (!AuthenticateRedisContext(ctx, FLAGS_redis_username,
+                                  FLAGS_redis_password)) {
         if (ctx) redisFree(ctx);
         return;
     }
@@ -121,14 +128,16 @@ class RedisChaosTest : public ::testing::Test {
     void SetUp() override {
         CleanupRedisKeys();
         master_view_helper_ = std::make_unique<RedisMasterViewHelper>(
-            FLAGS_redis_cluster_id, FLAGS_redis_endpoint, "",
+            FLAGS_redis_cluster_id, FLAGS_redis_endpoint, FLAGS_redis_password,
             /*db_index=*/0, FLAGS_redis_master_view_ttl_sec,
-            FLAGS_redis_heartbeat_interval_sec);
+            FLAGS_redis_heartbeat_interval_sec, FLAGS_redis_username);
         ASSERT_EQ(master_view_helper_->Connect(), ErrorCode::OK);
 
         MasterRunnerConfig config;
         config.election_backend = "redis";
         config.redis_endpoint = FLAGS_redis_endpoint;
+        config.redis_username = FLAGS_redis_username;
+        config.redis_password = FLAGS_redis_password;
         config.redis_master_view_ttl_sec = FLAGS_redis_master_view_ttl_sec;
         config.redis_heartbeat_interval_sec =
             FLAGS_redis_heartbeat_interval_sec;

@@ -17,8 +17,10 @@ namespace mooncake {
 RedisHelper::RedisHelper(const std::string& cluster_id,
                          const std::string& redis_endpoint,
                          const std::string& password, int db_index, int ttl_sec,
-                         int heartbeat_interval_sec)
+                         int heartbeat_interval_sec,
+                         const std::string& username)
     : redis_endpoint_(redis_endpoint),
+      username_(username),
       password_(password),
       db_index_(db_index),
       ttl_sec_(ttl_sec),
@@ -90,8 +92,18 @@ redisContext* RedisHelper::CreateConnection() {
     }
     redisSetTimeout(ctx, tv);
 
-    // Authenticate if password provided
-    if (!password_.empty()) {
+    // Authenticate if credentials are provided. Redis ACL uses two arguments;
+    // older Redis/TBase deployments may still use one password argument.
+    if (!username_.empty()) {
+        RedisReplyPtr reply((redisReply*)redisCommand(
+            ctx, "AUTH %b %b", username_.data(), username_.size(),
+            password_.data(), password_.size()));
+        if (!reply || reply->type == REDIS_REPLY_ERROR) {
+            LOG(ERROR) << "Redis AUTH failed";
+            redisFree(ctx);
+            return nullptr;
+        }
+    } else if (!password_.empty()) {
         RedisReplyPtr reply((redisReply*)redisCommand(
             ctx, "AUTH %b", password_.data(), password_.size()));
         if (!reply || reply->type == REDIS_REPLY_ERROR) {

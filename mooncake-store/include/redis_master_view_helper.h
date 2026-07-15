@@ -24,7 +24,8 @@ class RedisMasterViewHelper : public MasterViewHelper {
     RedisMasterViewHelper(const std::string& cluster_id,
                           const std::string& redis_endpoint,
                           const std::string& password, int db_index,
-                          int ttl_sec, int heartbeat_interval_sec);
+                          int ttl_sec, int heartbeat_interval_sec,
+                          const std::string& username = "");
 
     ErrorCode Connect();
 

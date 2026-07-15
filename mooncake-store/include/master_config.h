@@ -67,6 +67,7 @@ struct MasterConfig {
     // "redis")
     std::string election_backend = "etcd";  // "etcd" (default) or "redis"
     std::string redis_endpoint;         // Redis endpoint, e.g. "10.0.0.1:6379"
+    std::string redis_username;         // Redis ACL username
     std::string redis_password;         // Redis AUTH password (empty = no auth)
     int redis_db_index = 0;             // Redis DB index
     int redis_master_view_ttl_sec = 5;  // Leader key TTL in seconds
@@ -126,6 +127,7 @@ class MasterServiceSupervisorConfig {
     // Redis election backend configuration
     ElectionBackend election_backend = ElectionBackend::ETCD;
     std::string redis_endpoint;            // Redis endpoint for election
+    std::string redis_username;            // Redis ACL username
     std::string redis_password;            // Redis AUTH password
     int redis_db_index = 0;                // Redis DB index
     int redis_master_view_ttl_sec = 5;     // Leader key TTL in seconds
@@ -203,6 +205,7 @@ class MasterServiceSupervisorConfig {
                 ". Must be 'etcd' or 'redis'");
         }
         redis_endpoint = config.redis_endpoint;
+        redis_username = config.redis_username;
         redis_password = config.redis_password;
         redis_db_index = config.redis_db_index;
         redis_master_view_ttl_sec = config.redis_master_view_ttl_sec;
@@ -298,6 +301,9 @@ class WrappedMasterServiceConfig {
     bool enable_oplog = false;
     std::string oplog_store_type = "localfs";
     std::string oplog_data_dir = "/tmp/mooncake_oplog";
+    std::string redis_endpoint;
+    std::string redis_username;
+    std::string redis_password;
     bool enable_offload = false;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
@@ -343,6 +349,9 @@ class WrappedMasterServiceConfig {
         enable_oplog = config.enable_oplog;
         oplog_store_type = config.oplog_store_type;
         oplog_data_dir = config.oplog_data_dir;
+        redis_endpoint = config.redis_endpoint;
+        redis_username = config.redis_username;
+        redis_password = config.redis_password;
         enable_offload = config.enable_offload;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
@@ -393,6 +402,9 @@ class WrappedMasterServiceConfig {
         enable_oplog = config.enable_oplog;
         oplog_store_type = config.oplog_store_type;
         oplog_data_dir = config.oplog_data_dir;
+        redis_endpoint = config.redis_endpoint;
+        redis_username = config.redis_username;
+        redis_password = config.redis_password;
         enable_offload = config.enable_offload;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
@@ -639,6 +651,9 @@ class MasterServiceConfig {
     bool enable_oplog = false;
     std::string oplog_store_type = "localfs";
     std::string oplog_data_dir = "/tmp/mooncake_oplog";
+    std::string redis_endpoint;
+    std::string redis_username;
+    std::string redis_password;
     bool enable_offload = false;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
@@ -680,6 +695,9 @@ class MasterServiceConfig {
         enable_oplog = config.enable_oplog;
         oplog_store_type = config.oplog_store_type;
         oplog_data_dir = config.oplog_data_dir;
+        redis_endpoint = config.redis_endpoint;
+        redis_username = config.redis_username;
+        redis_password = config.redis_password;
         enable_offload = config.enable_offload;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;

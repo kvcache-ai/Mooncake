@@ -30,6 +30,7 @@ struct MasterRunnerConfig {
     std::string election_backend = "etcd";
     std::string etcd_endpoints;
     std::string redis_endpoint;
+    std::string redis_username;
     std::string redis_password;
     int redis_db_index = 0;
     int redis_master_view_ttl_sec = 5;
