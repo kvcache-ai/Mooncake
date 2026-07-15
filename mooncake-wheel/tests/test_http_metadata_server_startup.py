@@ -84,17 +84,21 @@ class HttpMetadataServerStartupTest(unittest.TestCase):
         startup = Future()
         loop = asyncio.new_event_loop()
         run_forever = loop.run_forever
-        run_count = 0
+
+        # Stop the loop as soon as the server signals readiness (the callback
+        # runs in the loop thread when notify_started sets the result), so the
+        # wrapper below can raise once startup has completed. Keying off the
+        # startup future keeps this independent of how many times
+        # run_until_complete internally invokes run_forever.
+        startup.add_done_callback(lambda _: loop.call_soon(loop.stop))
 
         def interrupt_after_readiness():
-            nonlocal run_count
-            run_count += 1
-            if run_count != 3:
-                return run_forever()
-
-            loop.call_soon(loop.stop)
             run_forever()
-            raise KeyboardInterrupt
+            if startup.done():
+                # Restore the real run_forever so cleanup in _run_server's
+                # finally block is not interrupted a second time.
+                loop.run_forever = run_forever
+                raise KeyboardInterrupt
 
         loop.run_forever = interrupt_after_readiness
 

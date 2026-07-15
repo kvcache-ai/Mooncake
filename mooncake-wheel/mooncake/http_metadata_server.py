@@ -8,12 +8,11 @@ used by Mooncake. It can be used as an alternative to etcd for metadata storage.
 
 import argparse
 import asyncio
-from concurrent.futures import Future
 import logging
-import os
 import signal
 import sys
 import threading
+from concurrent.futures import Future
 from enum import Enum
 from time import sleep
 
@@ -133,6 +132,8 @@ class KVBootstrapServer:
             self._loop.run_until_complete(site.start())
             self._loop.call_soon(notify_started)
             self._loop.run_forever()
+        # BaseException (not Exception) so KeyboardInterrupt/SystemExit during
+        # startup reach run() with their exact type preserved (re-raised below).
         except BaseException as e:
             if not startup.done():
                 startup.set_exception(e)
