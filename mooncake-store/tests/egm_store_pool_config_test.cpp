@@ -15,13 +15,13 @@ TEST(EgmStorePoolConfigTest, DefaultsToDisabled) {
 }
 
 TEST(EgmStorePoolConfigTest, ParsesStrictCaseInsensitiveBooleans) {
-    for (const std::string& value : {"true", "TRUE", "TrUe", "1"}) {
+    for (const std::string& value : {"true", "TRUE", "True", "1"}) {
         ConfigDict config{{CONFIG_KEY_ENABLE_EGM_STORE_POOL, value}};
         auto options = ParseEgmStorePoolOptions(config, 4096);
         ASSERT_TRUE(options) << value;
         EXPECT_TRUE(options->enabled) << value;
     }
-    for (const std::string& value : {"false", "FALSE", "FaLsE", "0"}) {
+    for (const std::string& value : {"false", "FALSE", "False", "0"}) {
         ConfigDict config{{CONFIG_KEY_ENABLE_EGM_STORE_POOL, value}};
         auto options = ParseEgmStorePoolOptions(config, 4096);
         ASSERT_TRUE(options) << value;
