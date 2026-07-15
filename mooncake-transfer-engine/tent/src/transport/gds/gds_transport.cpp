@@ -279,7 +279,9 @@ Status GdsTransport::submitTransferTasks(
         GdsFileContext* context = findFileContext(request.target_id);
         if (!context || !context->ready())
             return Status::InvalidArgument("Invalid remote segment" LOC_MARK);
-        IOParamRange range{gds_batch->io_params.size(), 0};
+        size_t task_id = gds_batch->io_param_ranges.size();
+        IOParamRange range;
+        range.base = gds_batch->io_params.size();
         for (size_t offset = 0; offset < request.length;
              offset += kMaxSliceSize) {
             size_t length = std::min(kMaxSliceSize, request.length - offset);
@@ -287,7 +289,8 @@ Status GdsTransport::submitTransferTasks(
             params.mode = CUFILE_BATCH;
             params.opcode =
                 (request.opcode == Request::READ) ? CUFILE_READ : CUFILE_WRITE;
-            params.cookie = (void*)0;
+            params.cookie =
+                reinterpret_cast<void*>(static_cast<std::uintptr_t>(task_id));
             params.u.batch.devPtr_base = request.source;
             params.u.batch.devPtr_offset = offset;
             params.u.batch.file_offset = request.target_offset + offset;
@@ -315,26 +318,38 @@ Status GdsTransport::getTransferStatus(SubBatchRef batch, int task_id,
     unsigned num_tasks = gds_batch->io_param_ranges.size();
     if (task_id < 0 || task_id >= (int)num_tasks)
         return Status::InvalidArgument("Invalid task ID");
-    auto range = gds_batch->io_param_ranges[task_id];
+    unsigned num_events = static_cast<unsigned>(gds_batch->io_params.size());
     auto result =
-        cuFileBatchIOGetStatus(gds_batch->batch_handle->handle, 0, &num_tasks,
+        cuFileBatchIOGetStatus(gds_batch->batch_handle->handle, 0, &num_events,
                                gds_batch->io_events.data(), nullptr);
     if (result.err != CU_FILE_SUCCESS)
         return Status::InternalError(
             std::string("Failed to get GDS batch status: Code ") +
             std::to_string(result.err) + LOC_MARK);
-    status.s = PENDING;
-    size_t complete_count = 0;
-    for (size_t index = range.base; index < range.base + range.count; ++index) {
+
+    for (size_t index = 0; index < num_events; ++index) {
         auto& event = gds_batch->io_events[index];
+        auto event_task_id = reinterpret_cast<std::uintptr_t>(event.cookie);
+        if (event_task_id >= gds_batch->io_param_ranges.size()) {
+            LOG(ERROR) << "Invalid GDS batch IO cookie: " << event_task_id;
+            continue;
+        }
+
+        auto& range = gds_batch->io_param_ranges[event_task_id];
+        if (range.status != PENDING) continue;
+
         auto s = parseTransferStatus(event.status);
-        if (s == COMPLETED)
-            complete_count++;
-        else if (s != PENDING)
-            status.s = s;
-        status.transferred_bytes += event.ret;
+        if (s == COMPLETED) {
+            range.complete_count++;
+            range.transferred_bytes += event.ret;
+            if (range.complete_count == range.count) range.status = COMPLETED;
+        } else if (s != PENDING) {
+            range.status = s;
+        }
     }
-    if (complete_count == range.count) status.s = COMPLETED;
+
+    auto& range = gds_batch->io_param_ranges[task_id];
+    status = TransferStatus{range.status, range.transferred_bytes};
     return Status::OK();
 }
 
