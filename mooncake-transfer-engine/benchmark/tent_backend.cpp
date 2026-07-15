@@ -102,6 +102,8 @@ std::shared_ptr<Config> loadConfig() {
     config->set("metadata_type", XferBenchConfig::metadata_type);
     config->set("metadata_servers", XferBenchConfig::metadata_url_list);
     config->set("rpc_server_port", XferBenchConfig::rpc_server_port);
+    config->set("transports/rdma/deadline_bw_arbitration",
+                XferBenchConfig::deadline_bw_arbitration);
 
     // Configure transport types based on xport_type parameter
     if (!XferBenchConfig::xport_type.empty()) {
@@ -791,7 +793,8 @@ int TENTBenchRunner::runInitiatorTasks(
 double TENTBenchRunner::runSingleTransfer(uint64_t local_addr,
                                           uint64_t target_addr,
                                           uint64_t block_size,
-                                          uint64_t batch_size, OpCode opcode) {
+                                          uint64_t batch_size, OpCode opcode,
+                                          uint64_t deadline_ns) {
     XferBenchTimer timer;
     uint64_t receiver_credit_request_id = 0;
     const uint64_t receiver_credit_bytes = block_size * batch_size;
@@ -812,6 +815,7 @@ double TENTBenchRunner::runSingleTransfer(uint64_t local_addr,
         entry.target_id = handle_;
         entry.target_offset = target_addr + block_size * i;
         entry.transport_hint = transport_hint_;
+        entry.deadline_ns = deadline_ns;
         entry.intent_type = intent_type_;
         requests.emplace_back(entry);
     }

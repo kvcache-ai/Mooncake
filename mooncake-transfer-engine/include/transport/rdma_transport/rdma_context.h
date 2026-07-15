@@ -59,10 +59,25 @@ struct GidSelectionSnapshot {
     int gid_index = -1;
 };
 
+enum class GidRefreshResult {
+    UNCHANGED = 0,
+    CHANGED = 1,
+    FAILED = 2,
+};
+
 struct RdmaCq {
     RdmaCq() : native(nullptr), outstanding(0) {}
+    RdmaCq(const RdmaCq &) = delete;
+    RdmaCq &operator=(const RdmaCq &) = delete;
+    RdmaCq(RdmaCq &&other) noexcept
+        : native(other.native),
+          outstanding(other.outstanding.load(std::memory_order_relaxed)) {
+        other.native = nullptr;
+    }
+    RdmaCq &operator=(RdmaCq &&) = delete;
+
     ibv_cq *native;
-    volatile int outstanding;
+    std::atomic<int> outstanding;
 };
 
 struct MemoryRegionMeta {
@@ -113,9 +128,11 @@ class RdmaContext {
         uintptr_t addr) const;
 
    public:
-    bool active() const { return active_; }
+    bool active() const { return active_.load(std::memory_order_acquire); }
 
-    void set_active(bool flag) { active_ = flag; }
+    void set_active(bool flag) {
+        active_.store(flag, std::memory_order_release);
+    }
 
    public:
     // EndPoint Management
@@ -170,6 +187,12 @@ class RdmaContext {
         const std::vector<AutoGidSelectionIdentity> &tried_selections = {},
         std::string *previous_gid = nullptr, std::string *next_gid = nullptr);
 
+    // Refresh the runtime GID after IBV_EVENT_GID_CHANGE. Auto-GID mode uses
+    // the same candidate filtering/ranking as initial device open; explicit
+    // MC_GID_INDEX keeps the configured index and refreshes only its value.
+    GidRefreshResult refreshCurrentGid(std::string *previous_gid = nullptr,
+                                       std::string *next_gid = nullptr);
+
     ibv_context *context() const { return context_; }
 
     RdmaTransport &engine() const { return engine_; }
@@ -193,7 +216,7 @@ class RdmaContext {
 
     ibv_cq *cq();
 
-    volatile int *cqOutstandingCount(int cq_index) {
+    std::atomic<int> *cqOutstandingCount(int cq_index) {
         return &cq_list_[cq_index].outstanding;
     }
 
@@ -261,7 +284,7 @@ class RdmaContext {
 
     std::shared_ptr<WorkerPool> worker_pool_;
 
-    volatile bool active_;
+    std::atomic<bool> active_;
 };
 
 }  // namespace mooncake

@@ -16,6 +16,13 @@
 #include "glog/logging.h"
 #include "types.h"
 
+DEFINE_uint64(
+    num_objects, 0,
+    "Run a single custom scale with this object count (0 = default scales)");
+DEFINE_double(evict_ratio_target, 0.50, "BatchEvict target eviction ratio");
+DEFINE_double(evict_ratio_lowerbound, 0.25,
+              "BatchEvict lower-bound eviction ratio");
+
 namespace mooncake::benchmarks {
 
 class BatchEvictBench {
@@ -25,6 +32,9 @@ class BatchEvictBench {
         const char* large_mode = std::getenv("MOONCAKE_EVICT_BENCH_LARGE");
         if (large_mode != nullptr && std::string(large_mode) == "1") {
             scales.push_back(1000000);
+        }
+        if (FLAGS_num_objects > 0) {
+            scales = {static_cast<size_t>(FLAGS_num_objects)};
         }
 
         std::cout << "num_objects,total_us,objects_before,objects_after,"
@@ -85,8 +95,6 @@ class BatchEvictBench {
     static constexpr const char* kSegmentName = "batch_evict_bench_segment";
     static constexpr size_t kSegmentBase = 0x300000000;
     static constexpr uint64_t kObjectSize = 1024;
-    static constexpr double kEvictRatioTarget = 0.50;
-    static constexpr double kEvictRatioLowerbound = 0.25;
 
     struct MetadataStats {
         size_t object_count{0};
@@ -302,7 +310,7 @@ class BatchEvictBench {
                                        size_t evicted_count,
                                        uint64_t freed_bytes) {
         const size_t lowerbound = static_cast<size_t>(
-            std::ceil(objects_before * kEvictRatioLowerbound));
+            std::ceil(objects_before * FLAGS_evict_ratio_lowerbound));
         if (evicted_count < lowerbound) {
             LOG(ERROR) << "evicted_count below lowerbound: evicted="
                        << evicted_count << ", lowerbound=" << lowerbound;
@@ -338,7 +346,8 @@ class BatchEvictBench {
         }
 
         const auto evict_start = std::chrono::steady_clock::now();
-        service.BatchEvict(kEvictRatioTarget, kEvictRatioLowerbound);
+        service.BatchEvict(FLAGS_evict_ratio_target,
+                           FLAGS_evict_ratio_lowerbound);
         const auto total_us =
             std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - evict_start)
@@ -393,7 +402,8 @@ class BatchEvictBench {
         });
 
         const auto evict_start = std::chrono::steady_clock::now();
-        service.BatchEvict(kEvictRatioTarget, kEvictRatioLowerbound);
+        service.BatchEvict(FLAGS_evict_ratio_target,
+                           FLAGS_evict_ratio_lowerbound);
         const auto batch_evict_total_us =
             std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - evict_start)
@@ -427,6 +437,22 @@ int main(int argc, char** argv) {
     google::InitGoogleLogging("BatchEvictBench");
     FLAGS_logtostderr = true;
     gflags::ParseCommandLineFlags(&argc, &argv, true);
+
+    if (!(FLAGS_evict_ratio_lowerbound > 0.0 &&
+          FLAGS_evict_ratio_lowerbound <= FLAGS_evict_ratio_target &&
+          FLAGS_evict_ratio_target <= 1.0)) {
+        LOG(ERROR) << "Invalid eviction ratios: require 0 < lowerbound <= "
+                      "target <= 1, got target="
+                   << FLAGS_evict_ratio_target
+                   << ", lowerbound=" << FLAGS_evict_ratio_lowerbound;
+        google::ShutdownGoogleLogging();
+        return 1;
+    }
+
+    LOG(INFO) << "BatchEvict benchmark config: num_objects="
+              << FLAGS_num_objects
+              << ", target_ratio=" << FLAGS_evict_ratio_target
+              << ", lowerbound_ratio=" << FLAGS_evict_ratio_lowerbound;
 
     using mooncake::benchmarks::BatchEvictBench;
     const bool ok = BatchEvictBench::RunRealBatchEvictScales() &&
