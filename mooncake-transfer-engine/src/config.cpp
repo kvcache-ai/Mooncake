@@ -441,6 +441,57 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
+    const char* context_pause_ttl_env = std::getenv("MC_CONTEXT_PAUSE_TTL_MS");
+    if (context_pause_ttl_env) {
+        // Robust parse (not atoi): a non-numeric typo must keep the default
+        // rather than silently resolve to 0 and re-enable the legacy latch.
+        // 0 is a valid explicit "never auto-reactivate"; negative /
+        // out-of-range / garbage are rejected, preserving the default.
+        int val = 0;
+        const char* end = context_pause_ttl_env + strlen(context_pause_ttl_env);
+        auto [ptr, ec] = std::from_chars(context_pause_ttl_env, end, val);
+        if (ec == std::errc() && ptr == end) {
+            if (val >= 0 && val <= 600000) {
+                config.context_pause_ttl_ms = val;
+            } else {
+                LOG(WARNING) << "Ignore value from environment variable "
+                                "MC_CONTEXT_PAUSE_TTL_MS, value "
+                             << context_pause_ttl_env
+                             << " out of range (should be 0-600000)";
+            }
+        } else {
+            LOG(WARNING)
+                << "Invalid MC_CONTEXT_PAUSE_TTL_MS environment value: "
+                << context_pause_ttl_env
+                << ". Expected an integer in range 0-600000";
+        }
+    }
+
+    const char* context_min_peers_env =
+        std::getenv("MC_CONTEXT_FAILURE_MIN_PEERS");
+    if (context_min_peers_env) {
+        // 1 is the legacy single-peer tripping behavior; 0 would make the
+        // breaker trip on streaks with no recorded peer and is rejected.
+        int val = 0;
+        const char* end = context_min_peers_env + strlen(context_min_peers_env);
+        auto [ptr, ec] = std::from_chars(context_min_peers_env, end, val);
+        if (ec == std::errc() && ptr == end) {
+            if (val >= 1 && val <= 64) {
+                config.context_failure_min_peers = val;
+            } else {
+                LOG(WARNING) << "Ignore value from environment variable "
+                                "MC_CONTEXT_FAILURE_MIN_PEERS, value "
+                             << context_min_peers_env
+                             << " out of range (should be 1-64)";
+            }
+        } else {
+            LOG(WARNING)
+                << "Invalid MC_CONTEXT_FAILURE_MIN_PEERS environment value: "
+                << context_min_peers_env
+                << ". Expected an integer in range 1-64";
+        }
+    }
+
     const char* log_dir_path = std::getenv("MC_LOG_DIR");
     if (log_dir_path) {
         google::InitGoogleLogging("mooncake-transfer-engine");
