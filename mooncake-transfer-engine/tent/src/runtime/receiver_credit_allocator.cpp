@@ -104,6 +104,8 @@ Status ReceiverCreditAllocator::pull(const ReceiverCreditPullRequestV1& request,
         return Status::OK();
     }
 
+    const bool initial_session =
+        isZeroSession(request.expected_receiver_session_id);
     const EntryKey key{request.sender_peer, request.qos_class};
     auto existing = entries_.find(key);
     if (existing != entries_.end() && existing->second.has_request) {
@@ -118,7 +120,8 @@ Status ReceiverCreditAllocator::pull(const ReceiverCreditPullRequestV1& request,
             }
             return Status::OK();
         }
-        if (request.request_sequence < entry.last_request.request_sequence) {
+        if (!initial_session &&
+            request.request_sequence < entry.last_request.request_sequence) {
             response = makeResponse(ReceiverCreditPullStatus::Rejected, 0,
                                     request.qos_class, entry.granted,
                                     entry.update_sequence);
@@ -126,13 +129,26 @@ Status ReceiverCreditAllocator::pull(const ReceiverCreditPullRequestV1& request,
         }
     }
 
-    const bool initial_session =
-        isZeroSession(request.expected_receiver_session_id);
+    if (initial_session && existing != entries_.end()) {
+        for (size_t i = 0; i < kCreditResourceCount; ++i) {
+            const auto& entry = existing->second;
+            if (entry.completed[i] > entry.granted[i])
+                return Status::InternalError(
+                    "receiver credit restart entry is inconsistent" LOC_MARK);
+            const uint64_t outstanding = entry.granted[i] - entry.completed[i];
+            if (outstanding > committed_[i])
+                return Status::InternalError(
+                    "receiver credit restart reclaim underflow" LOC_MARK);
+            committed_[i] -= outstanding;
+        }
+        entries_.erase(existing);
+        existing = entries_.end();
+    }
+
     const bool matching_session =
         request.expected_receiver_session_id == config_.receiver_session_id &&
         request.expected_epoch == config_.epoch;
-    if ((!initial_session && !matching_session) ||
-        (initial_session && existing != entries_.end())) {
+    if (!initial_session && !matching_session) {
         const auto& grants =
             existing == entries_.end() ? zero_grants : existing->second.granted;
         const uint64_t update_sequence =

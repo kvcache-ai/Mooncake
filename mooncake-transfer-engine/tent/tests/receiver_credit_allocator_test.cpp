@@ -263,6 +263,32 @@ TEST(ReceiverCreditAllocator, RestartAndUnsupportedQosNeverAllocate) {
     EXPECT_EQ(snapshot.committed[index(CreditResource::DataBytes)], 0);
 }
 
+TEST(ReceiverCreditAllocator, InitialSessionRestartReclaimsOutstandingGrant) {
+    auto receiver = allocator();
+    ReceiverCreditPullResponseV1 response;
+
+    ASSERT_TRUE(
+        receiver->pull(pullRequest(101, 1, 100, 500, 1, 4), response).ok());
+    ASSERT_EQ(response.status, ReceiverCreditPullStatus::Granted);
+    EXPECT_EQ(grant(response, CreditResource::DataBytes), 500);
+
+    auto restart = pullRequest(101, 2, 100, 600, 1, 5);
+    restart.expected_receiver_session_id = {};
+    restart.expected_epoch = 0;
+    restart.last_update_sequence = 0;
+    ASSERT_TRUE(receiver->pull(restart, response).ok());
+    EXPECT_EQ(response.status, ReceiverCreditPullStatus::Granted);
+    EXPECT_EQ(grant(response, CreditResource::DataBytes), 600);
+    EXPECT_EQ(grant(response, CreditResource::RequestSlots), 5);
+
+    ReceiverCreditAllocatorSnapshot snapshot;
+    ASSERT_TRUE(receiver->snapshot(snapshot).ok());
+    EXPECT_EQ(snapshot.entries, 1);
+    EXPECT_EQ(snapshot.committed[index(CreditResource::DataBytes)], 600);
+    EXPECT_EQ(snapshot.committed[index(CreditResource::RequestSlots)], 5);
+    EXPECT_EQ(snapshot.free[index(CreditResource::DataBytes)], 400);
+}
+
 TEST(ReceiverCreditAllocator, EntryTableIsBounded) {
     auto bounded = config();
     bounded.max_entries = 1;
