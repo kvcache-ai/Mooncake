@@ -178,6 +178,7 @@ bool WarmupBatchCleanup::ShutdownFor(std::chrono::milliseconds timeout) {
 void WarmupBatchCleanup::WorkerMain() {
     constexpr auto kRetryInterval = std::chrono::milliseconds(10);
     while (true) {
+        bool made_progress = false;
         std::optional<PendingWarmupBatch> transfer;
         std::optional<PendingWarmupBatchIDRelease> batch_id_release;
         {
@@ -216,12 +217,27 @@ void WarmupBatchCleanup::WorkerMain() {
             const auto state = poll_batch_(transfer->batch_id);
             std::optional<PendingWarmupBatchIDRelease> retry_batch_id;
             if (state == WarmupBatchState::kTerminal) {
+                made_progress = true;
                 transfer->buffer.reset();
                 PendingWarmupBatchIDRelease release{
                     transfer->batch_id, std::move(transfer->segment_name)};
                 if (!TryFreeWarmupBatchID(release)) {
                     retry_batch_id.emplace(std::move(release));
                 }
+            } else if (state == WarmupBatchState::kStatusError) {
+                ++transfer->status_error_attempts;
+                if (transfer->status_error_attempts == 1 ||
+                    transfer->status_error_attempts % 100 == 0) {
+                    LOG(WARNING)
+                        << "warmup: failed to query transfer status for '"
+                        << transfer->segment_name << "', batch "
+                        << transfer->batch_id
+                        << ", attempts=" << transfer->status_error_attempts
+                        << "; retaining probe buffer because transfer "
+                           "termination cannot be confirmed";
+                }
+            } else {
+                transfer->status_error_attempts = 0;
             }
 
             {
@@ -239,6 +255,7 @@ void WarmupBatchCleanup::WorkerMain() {
 
         if (batch_id_release) {
             const bool released = TryFreeWarmupBatchID(*batch_id_release);
+            made_progress = made_progress || released;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 --processing_batch_id_releases_;
@@ -250,9 +267,11 @@ void WarmupBatchCleanup::WorkerMain() {
             }
         }
 
-        std::unique_lock<std::mutex> lock(mutex_);
-        cv_.wait_for(lock, kRetryInterval,
-                     [this]() { return stop_requested_; });
+        if (!made_progress) {
+            std::unique_lock<std::mutex> lock(mutex_);
+            cv_.wait_for(lock, kRetryInterval,
+                         [this]() { return stop_requested_; });
+        }
     }
 }
 

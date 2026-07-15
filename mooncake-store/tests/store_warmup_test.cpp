@@ -263,6 +263,54 @@ TEST_F(StoreWarmupTest, PendingTransferRetainsBufferUntilTerminal) {
     EXPECT_TRUE(cleanup.ShutdownFor(std::chrono::seconds(1)));
 }
 
+TEST_F(StoreWarmupTest, StatusErrorRetainsProbeBuffer) {
+    alignas(64) std::array<std::byte, 64> memory{};
+    auto allocator =
+        ClientBufferAllocator::create(memory.data(), memory.size(), "tcp");
+    auto buffer = allocator->allocate(memory.size());
+    ASSERT_TRUE(buffer.has_value());
+
+    std::atomic<bool> terminal{false};
+    std::atomic<size_t> status_error_calls{0};
+    std::atomic<size_t> release_calls{0};
+    std::mutex status_mutex;
+    std::condition_variable status_cv;
+    internal::WarmupBatchCleanup cleanup(
+        [&](Transport::BatchID) {
+            if (terminal.load()) {
+                return internal::WarmupBatchState::kTerminal;
+            }
+            status_error_calls.fetch_add(1);
+            status_cv.notify_all();
+            return internal::WarmupBatchState::kStatusError;
+        },
+        [&](Transport::BatchID) {
+            release_calls.fetch_add(1);
+            return Status::OK();
+        });
+
+    cleanup.TrackPendingTransfer(
+        {4, "status-error-segment", std::move(*buffer), false});
+    bool observed_status_error = false;
+    {
+        std::unique_lock<std::mutex> lock(status_mutex);
+        observed_status_error =
+            status_cv.wait_for(lock, std::chrono::seconds(1),
+                               [&]() { return status_error_calls.load() > 0; });
+    }
+
+    EXPECT_TRUE(observed_status_error);
+    EXPECT_EQ(cleanup.PendingTransferCount(), 1);
+    EXPECT_FALSE(allocator->allocate(memory.size()).has_value());
+    EXPECT_EQ(release_calls.load(), 0);
+
+    terminal.store(true);
+    EXPECT_TRUE(cleanup.DrainFor(std::chrono::seconds(1)));
+    EXPECT_EQ(release_calls.load(), 1);
+    EXPECT_TRUE(allocator->allocate(memory.size()).has_value());
+    EXPECT_TRUE(cleanup.ShutdownFor(std::chrono::seconds(1)));
+}
+
 TEST_F(StoreWarmupTest, PendingTransferDoesNotStarveBatchIdRelease) {
     alignas(64) std::array<std::byte, 64> memory{};
     auto allocator =

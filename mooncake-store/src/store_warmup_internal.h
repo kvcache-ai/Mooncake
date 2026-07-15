@@ -55,6 +55,8 @@ struct PendingWarmupBatch {
     std::string segment_name;
     std::optional<BufferHandle> buffer;
     bool transfer_terminal = false;
+    // Consecutive failures while querying the transfer status.
+    size_t status_error_attempts = 0;
 };
 
 struct PendingWarmupBatchIDRelease {
@@ -63,6 +65,8 @@ struct PendingWarmupBatchIDRelease {
     size_t release_attempts = 0;
 };
 
+// A status-query error is not terminal: it does not prove that the transfer
+// has stopped accessing its destination buffer.
 enum class WarmupBatchState { kPending, kTerminal, kStatusError };
 
 struct StoreWarmupProbeResult {
