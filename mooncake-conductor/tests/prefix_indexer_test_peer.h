@@ -2,6 +2,7 @@
 
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <shared_mutex>
 #include <unordered_map>
@@ -40,6 +41,13 @@ class PrefixCacheTableTestPeer {
     static bool ContextExists(const PrefixCacheTable& table,
                               const ContextKey& context) {
         return table.LoadContextState(context) != nullptr;
+    }
+
+    static std::unique_lock<std::shared_mutex> LockContextState(
+        const PrefixCacheTable& table, const ContextKey& context) {
+        auto state = table.LoadContextState(context);
+        if (state == nullptr) return {};
+        return std::unique_lock<std::shared_mutex>(state->mutex);
     }
 
     static PrefixCacheTableSnapshot Snapshot(const PrefixCacheTable& table) {

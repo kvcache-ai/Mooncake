@@ -49,9 +49,12 @@ class EventManagerTestPeer {
                                   const common::ServiceConfig& service) {
         auto dummy =
             std::make_shared<zmq::ZMQClient>(zmq::ZMQClientConfig{}, nullptr);
+        auto handler = std::make_shared<KVEventHandler>(&mgr, service);
         std::unique_lock lock(mgr.mu_);
         mgr.subscribers_[key] = std::move(dummy);
+        mgr.handlers_[key] = std::move(handler);
         mgr.active_configs_[key] = service;
+        mgr.active_endpoints_[service.endpoint] = key;
     }
 
     static size_t ServicesLen(EventManager& mgr) {
@@ -69,6 +72,18 @@ class EventManagerTestPeer {
         return mgr.active_configs_.size();
     }
 
+    static size_t CleanupQuarantinedCount(EventManager& mgr) {
+        std::shared_lock lock(mgr.mu_);
+        return mgr.cleanup_quarantined_.size();
+    }
+
+    static std::shared_ptr<KVEventHandler> HandlerFor(EventManager& mgr,
+                                                      const std::string& key) {
+        std::shared_lock lock(mgr.mu_);
+        auto handler = mgr.handlers_.find(key);
+        return handler == mgr.handlers_.end() ? nullptr : handler->second;
+    }
+
     static void AppendService(EventManager& mgr,
                               const common::ServiceConfig& svc) {
         std::unique_lock lock(mgr.mu_);
@@ -80,10 +95,36 @@ class EventManagerTestPeer {
 
 class KVEventHandlerTestPeer {
    public:
-    static std::string BlockStored(KVEventHandler& handler,
-                                   const zmq::BlockStoredEvent& event,
-                                   int64_t dp_rank) {
-        return handler.HandleBlockStored(event, dp_rank);
+    static size_t BindingCount(KVEventHandler& handler) {
+        std::lock_guard lock(handler.bindings_mu_);
+        return handler.pool_bindings_.size();
+    }
+
+    static bool IsAvailable(KVEventHandler& handler) {
+        std::lock_guard lock(handler.lifecycle_mu_);
+        return handler.available_;
+    }
+
+    static bool BeginDispatch(KVEventHandler& handler) {
+        return handler.BeginDispatch();
+    }
+
+    static void EndDispatch(KVEventHandler& handler) { handler.EndDispatch(); }
+
+    static std::string HandleVllmStored(KVEventHandler& handler,
+                                        const zmq::VllmStoredEvent& event,
+                                        const zmq::MessageMetadata& metadata) {
+        return handler.HandleVllmStored(event, metadata);
+    }
+
+    static bool SetFirstBindingOwnerSource(KVEventHandler& handler,
+                                           const std::string& source) {
+        std::lock_guard lock(handler.bindings_mu_);
+        if (handler.pool_bindings_.empty()) {
+            return false;
+        }
+        handler.pool_bindings_.begin()->second.owner.source_stream = source;
+        return true;
     }
 };
 

@@ -11,6 +11,7 @@ add_executable(
   json_uint64_test.cpp
   msg_decoder_test.cpp
   zmq_client_test.cpp
+  event_ingest_integration_test.cpp
   event_manager_test.cpp
   concurrency_test.cpp)
 

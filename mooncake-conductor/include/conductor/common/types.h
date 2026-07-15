@@ -3,12 +3,32 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace conductor {
 namespace common {
 
-inline constexpr const char* kServiceTypeVLLM = "vLLM";
-inline constexpr const char* kServiceTypeMooncake = "Mooncake";
+enum class PublisherKind { kVllm, kMooncake };
+
+inline constexpr std::string_view PublisherKindName(PublisherKind kind) {
+    switch (kind) {
+        case PublisherKind::kVllm:
+            return "vLLM";
+        case PublisherKind::kMooncake:
+            return "Mooncake";
+    }
+    return "unknown";
+}
+
+inline std::optional<PublisherKind> ParsePublisherKind(std::string_view value) {
+    if (value == "vLLM") {
+        return PublisherKind::kVllm;
+    }
+    if (value == "Mooncake") {
+        return PublisherKind::kMooncake;
+    }
+    return std::nullopt;
+}
 
 struct HashProfileConfig {
     std::string strategy;
@@ -22,8 +42,8 @@ struct HashProfileConfig {
 struct ServiceConfig {
     std::string endpoint;         // kv publisher endpoint
     std::string replay_endpoint;  // replay publisher endpoint
-    std::string type;             // kv publisher type, support: vLLM,Mooncake
-    std::string model_name;       // Model name hosted by the service
+    PublisherKind publisher_kind = PublisherKind::kVllm;
+    std::string model_name;  // Model name hosted by the service
     std::string lora_name;
     std::string tenant_id;    // (optional), default use 'default'
     std::string instance_id;  // required

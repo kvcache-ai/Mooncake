@@ -1,12 +1,8 @@
 #pragma once
 
-// Lenient msgpack decoding for the two publisher schemas:
-//  - vLLM topic:  3-element batch [timestamp, events, dp_rank]
-//  - mooncake:    2-element batch [timestamp, events]
-//
-// Field values are read through msgpack::object type checks (never rigid
-// MSGPACK_DEFINE structs) because the Python publisher picks integer
-// widths dynamically and emits nil-able fields.
+// Strict envelope and recognized-field decoding for the independent vLLM and
+// Mooncake map protocols. Event-local failures are materialized in the batch
+// so valid siblings can still be dispatched in source order.
 
 #include <cstddef>
 #include <string>
@@ -16,14 +12,18 @@
 namespace conductor {
 namespace zmq {
 
-struct EventBatchResult {
+template <typename Batch>
+struct BatchDecodeResult {
     bool ok = false;
-    EventBatch batch;
-    std::string error;  // set when !ok; human-readable error string
+    Batch batch;
+    std::string error;
 };
 
-EventBatchResult DecodeVllmEventBatch(const char* data, size_t len);
-EventBatchResult DecodeMooncakeEventBatch(const char* data, size_t len);
+using VllmEventBatchResult = BatchDecodeResult<VllmEventBatch>;
+using MooncakeEventBatchResult = BatchDecodeResult<MooncakeEventBatch>;
+
+VllmEventBatchResult DecodeVllmEventBatch(const char* data, size_t len);
+MooncakeEventBatchResult DecodeMooncakeEventBatch(const char* data, size_t len);
 
 }  // namespace zmq
 }  // namespace conductor

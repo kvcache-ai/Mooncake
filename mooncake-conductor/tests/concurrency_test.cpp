@@ -1,4 +1,4 @@
-// Focus tests for Stop/HandleEvent interaction and concurrent
+// Focus tests for Stop/HandleBatch interaction and concurrent
 // register/unregister, designed to run under TSAN (build-tsan) to verify
 // the lock rules:
 //  - handlers take the manager read lock; UnsubscribeFromService must
@@ -30,9 +30,12 @@
 
 namespace {
 
+using conductor::common::PublisherKind;
 using conductor::common::ServiceConfig;
 using conductor::kvevent::EventManager;
+using conductor::kvevent::EventManagerTestPeer;
 using conductor::kvevent::KVEventHandler;
+using conductor::kvevent::KVEventHandlerTestPeer;
 using conductor::prefixindex::ContextKey;
 using conductor::prefixindex::EngineOwner;
 using conductor::prefixindex::EngineRegistration;
@@ -47,9 +50,11 @@ using conductor::prefixindex::SharedClear;
 using conductor::prefixindex::SharedMutation;
 using conductor::prefixindex::SharedObjectOwner;
 using conductor::prefixindex::StorageTier;
-using conductor::zmq::BlockRemovedEvent;
-using conductor::zmq::BlockStoredEvent;
-using conductor::zmq::KVEvent;
+using conductor::zmq::MessageMetadata;
+using conductor::zmq::VllmEvent;
+using conductor::zmq::VllmEventBatch;
+using conductor::zmq::VllmRemovedEvent;
+using conductor::zmq::VllmStoredEvent;
 
 constexpr char kRaceRootDigest[] =
     "4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e";
@@ -61,15 +66,18 @@ HashProfile RaceProfile() {
             .index_projection = "low64_be"};
 }
 
-ServiceConfig RaceService(const std::string& instance_id) {
+ServiceConfig RaceService(const std::string& instance_id, int endpoint_slot,
+                          int dp_rank = 0) {
     ServiceConfig svc;
-    svc.endpoint = "tcp://127.0.0.1:59999";
-    svc.replay_endpoint = "tcp://127.0.0.1:59998";
-    svc.type = conductor::common::kServiceTypeVLLM;
+    const int live_port = 50000 + endpoint_slot * 4 + dp_rank * 2;
+    svc.endpoint = "tcp://127.0.0.1:" + std::to_string(live_port);
+    svc.replay_endpoint = "tcp://127.0.0.1:" + std::to_string(live_port + 1);
+    svc.publisher_kind = PublisherKind::kVllm;
     svc.model_name = "race-model";
     svc.instance_id = instance_id;
     svc.tenant_id = "default";
     svc.block_size = 16;
+    svc.dp_rank = dp_rank;
     svc.cache_group = 0;
     svc.hash_profile = {.strategy = "vllm_v1",
                         .algorithm = "sha256_cbor",
@@ -79,34 +87,52 @@ ServiceConfig RaceService(const std::string& instance_id) {
 }
 
 // Handlers keep dispatching events while the manager stops. This is the
-// exact interaction behind Go's documented deadlock: HandleEvent takes
+// exact interaction behind Go's documented deadlock: HandleBatch takes
 // the manager read lock, Stop takes it exclusively.
 TEST(Concurrency, StopWhileHandlingEvents) {
     EventManager mgr({}, 0);
-    ServiceConfig svc;
+    ServiceConfig svc = RaceService("race-instance", 0);
     svc.block_size = 4;
-    svc.model_name = "race-model";
-    svc.instance_id = "race-instance";
+    ASSERT_TRUE(mgr.GetIndexer()
+                    ->Register({.context = {.tenant_id = svc.tenant_id,
+                                            .model_name = svc.model_name,
+                                            .lora_name = svc.lora_name,
+                                            .block_size = svc.block_size},
+                                .profile = RaceProfile(),
+                                .instance_id = svc.instance_id,
+                                .dp_rank = svc.dp_rank,
+                                .effective_block_size = svc.block_size,
+                                .cache_group = svc.cache_group})
+                    .error.empty());
     KVEventHandler handler(&mgr, svc);
+    const MessageMetadata metadata{.publisher_kind = PublisherKind::kVllm,
+                                   .endpoint = svc.endpoint,
+                                   .topic = "race"};
 
     std::atomic<bool> done{false};
     std::vector<std::thread> workers;
     for (int w = 0; w < 4; ++w) {
-        workers.emplace_back([&handler, &done, w] {
-            BlockStoredEvent stored;
+        workers.emplace_back([&handler, &done, &metadata, w] {
+            VllmStoredEvent stored;
             stored.block_size = 4;
             stored.token_ids = {1, 2, 3, 4};
-            BlockRemovedEvent removed;
+            stored.medium = "GPU";
+            VllmRemovedEvent removed;
+            removed.medium = "GPU";
             uint64_t hash = 1000 * (w + 1);
             while (!done.load()) {
                 stored.block_hashes = {hash};
                 removed.block_hashes = {hash};
                 ++hash;
-                // After Stop, HandleEvent returns "manager stopped" —
+                VllmEventBatch stored_batch;
+                stored_batch.events.push_back({.event = VllmEvent{stored}});
+                VllmEventBatch removed_batch;
+                removed_batch.events.push_back({.event = VllmEvent{removed}});
+                // After Stop, HandleBatch returns "manager stopped" --
                 // either outcome is fine; the assertion is no deadlock
                 // and no TSAN report.
-                (void)handler.HandleEvent(KVEvent(stored), w);
-                (void)handler.HandleEvent(KVEvent(removed), w);
+                (void)handler.HandleBatch(stored_batch, metadata);
+                (void)handler.HandleBatch(removed_batch, metadata);
             }
         });
     }
@@ -125,7 +151,7 @@ TEST(Concurrency, StartConcurrentWithServiceRegistration) {
 
     std::vector<ServiceConfig> services;
     for (int i = 0; i < kStaticServices; ++i) {
-        services.push_back(RaceService("static-" + std::to_string(i)));
+        services.push_back(RaceService("static-" + std::to_string(i), i));
     }
     EventManager mgr(std::move(services), 0);
 
@@ -140,7 +166,8 @@ TEST(Concurrency, StartConcurrentWithServiceRegistration) {
         for (int i = 0; i < kDynamicServices; ++i) {
             const auto result =
                 conductor::kvevent::EventManagerTestPeer::Register(
-                    mgr, RaceService("dynamic-" + std::to_string(i)));
+                    mgr, RaceService("dynamic-" + std::to_string(i),
+                                     kStaticServices + i));
             if (!result.second.empty()) {
                 registration_errors.fetch_add(1);
             }
@@ -177,10 +204,11 @@ TEST(Concurrency, ConcurrentRegisterUnregister) {
             for (int round = 0; round < kRounds; ++round) {
                 // Half the threads fight over the same key; half use
                 // distinct keys.
+                const bool shared = w % 2 == 0;
                 ServiceConfig svc =
-                    RaceService((w % 2 == 0) ? "shared-instance"
-                                             : "instance-" + std::to_string(w));
-                svc.dp_rank = round % 2;
+                    RaceService(shared ? "shared-instance"
+                                       : "instance-" + std::to_string(w),
+                                shared ? 100 : 100 + w, round % 2);
 
                 const auto result =
                     conductor::kvevent::EventManagerTestPeer::Subscribe(mgr,
@@ -202,6 +230,119 @@ TEST(Concurrency, ConcurrentRegisterUnregister) {
     EXPECT_EQ(conductor::kvevent::EventManagerTestPeer::ActiveConfigCount(mgr),
               0u);
     mgr.Stop();
+}
+
+TEST(Concurrency, UnregisterWaitsForAdmittedCallbackBeforeEndpointCleanup) {
+    EventManager mgr({}, 0);
+    ServiceConfig svc = RaceService("in-flight-instance", 220);
+    svc.block_size = 4;
+    ASSERT_TRUE(EventManagerTestPeer::Register(mgr, svc).first);
+    const std::string service_key = conductor::kvevent::MakeServiceKey(
+        svc.instance_id, svc.tenant_id, svc.dp_rank);
+    auto handler = EventManagerTestPeer::HandlerFor(mgr, service_key);
+    ASSERT_NE(handler, nullptr);
+    ASSERT_TRUE(KVEventHandlerTestPeer::BeginDispatch(*handler));
+
+    std::pair<bool, std::string> unregister_result;
+    std::atomic<bool> unregister_done{false};
+    std::thread unregister_thread([&] {
+        unregister_result = EventManagerTestPeer::Unsubscribe(
+            mgr, svc.instance_id, svc.tenant_id, svc.dp_rank);
+        unregister_done.store(true);
+    });
+
+    const auto unavailable_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (KVEventHandlerTestPeer::IsAvailable(*handler) &&
+           std::chrono::steady_clock::now() < unavailable_deadline) {
+        std::this_thread::yield();
+    }
+    EXPECT_FALSE(KVEventHandlerTestPeer::IsAvailable(*handler));
+    EXPECT_FALSE(unregister_done.load());
+
+    VllmStoredEvent stored;
+    stored.block_hashes = {uint64_t{4242}};
+    stored.token_ids = {1, 2, 3, 4};
+    stored.block_size = svc.block_size;
+    stored.medium = "GPU";
+    const MessageMetadata metadata{.publisher_kind = PublisherKind::kVllm,
+                                   .endpoint = svc.endpoint,
+                                   .topic = "in-flight",
+                                   .sequence = 1};
+    EXPECT_TRUE(
+        KVEventHandlerTestPeer::HandleVllmStored(*handler, stored, metadata)
+            .empty());
+
+    const auto in_flight_snapshot =
+        PrefixCacheTableTestPeer::Snapshot(*mgr.GetIndexer());
+    const ContextKey context{.tenant_id = svc.tenant_id,
+                             .model_name = svc.model_name,
+                             .lora_name = svc.lora_name,
+                             .block_size = svc.block_size};
+    const auto in_flight_context = in_flight_snapshot.contexts.find(context);
+    EXPECT_NE(in_flight_context, in_flight_snapshot.contexts.end());
+    if (in_flight_context != in_flight_snapshot.contexts.end()) {
+        EXPECT_TRUE(in_flight_context->second.blocks.contains(
+            ProjectedPrefix{.value = 4242}));
+    }
+
+    const auto replacement_while_stopping =
+        EventManagerTestPeer::Register(mgr, svc);
+    EXPECT_FALSE(replacement_while_stopping.first);
+    EXPECT_NE(replacement_while_stopping.second.find("unregistered"),
+              std::string::npos);
+
+    KVEventHandlerTestPeer::EndDispatch(*handler);
+    unregister_thread.join();
+    EXPECT_TRUE(unregister_result.first) << unregister_result.second;
+    EXPECT_TRUE(unregister_result.second.empty());
+    EXPECT_TRUE(PrefixCacheTableTestPeer::Snapshot(*mgr.GetIndexer())
+                    .contexts.at(context)
+                    .blocks.empty());
+
+    VllmEventBatch late_batch;
+    late_batch.events.push_back({.event = VllmEvent{stored}});
+    EXPECT_FALSE(handler->HandleBatch(late_batch, metadata).empty());
+    EXPECT_TRUE(EventManagerTestPeer::Register(mgr, svc).first);
+}
+
+TEST(Concurrency, ConcurrentStopCallersWaitForHandlerQuiescence) {
+    EventManager mgr({}, 0);
+    const ServiceConfig svc = RaceService("stop-barrier-instance", 221);
+    ASSERT_TRUE(EventManagerTestPeer::Register(mgr, svc).first);
+    auto handler = EventManagerTestPeer::HandlerFor(
+        mgr, conductor::kvevent::MakeServiceKey(svc.instance_id, svc.tenant_id,
+                                                svc.dp_rank));
+    ASSERT_NE(handler, nullptr);
+    ASSERT_TRUE(KVEventHandlerTestPeer::BeginDispatch(*handler));
+
+    std::atomic<bool> first_done{false};
+    std::atomic<bool> second_done{false};
+    std::thread first([&] {
+        mgr.Stop();
+        first_done.store(true);
+    });
+    const auto unavailable_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (KVEventHandlerTestPeer::IsAvailable(*handler) &&
+           std::chrono::steady_clock::now() < unavailable_deadline) {
+        std::this_thread::yield();
+    }
+    EXPECT_FALSE(KVEventHandlerTestPeer::IsAvailable(*handler));
+
+    std::thread second([&] {
+        mgr.Stop();
+        second_done.store(true);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    EXPECT_FALSE(first_done.load());
+    EXPECT_FALSE(second_done.load());
+
+    KVEventHandlerTestPeer::EndDispatch(*handler);
+    first.join();
+    second.join();
+    EXPECT_TRUE(first_done.load());
+    EXPECT_TRUE(second_done.load());
 }
 
 TEST(Concurrency, PrefixTableOwnerMutationsQueryAndUnregister) {
@@ -357,6 +498,21 @@ TEST(Concurrency, PrefixTableOwnerMutationsQueryAndUnregister) {
             const auto results = table.Query(context, tokens);
             EXPECT_TRUE(results.contains("instance-a"));
             EXPECT_TRUE(results.contains("instance-b"));
+            for (const auto& [unused_instance, result] : results) {
+                (void)unused_instance;
+                const auto completed_call_state = [](int64_t value) {
+                    return value == 0 || value == 4 || value == 8 ||
+                           value == 12;
+                };
+                EXPECT_TRUE(completed_call_state(result.longest_match_tokens));
+                EXPECT_TRUE(completed_call_state(result.gpu));
+                EXPECT_TRUE(completed_call_state(result.cpu));
+                EXPECT_TRUE(completed_call_state(result.disk));
+                for (const auto& [unused_rank, matched] : result.dp) {
+                    (void)unused_rank;
+                    EXPECT_TRUE(completed_call_state(matched));
+                }
+            }
             if (round % 10 == 0) {
                 (void)table.GetGlobalView();
             }

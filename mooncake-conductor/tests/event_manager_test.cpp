@@ -2,6 +2,7 @@
 // and static configuration tests.
 
 #include <gtest/gtest.h>
+#include <glog/logging.h>
 #include <asio.hpp>
 #include <json/json.h>
 #include <ylt/coro_http/coro_http_client.hpp>
@@ -15,6 +16,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -39,6 +41,7 @@ uint16_t EventManagerTestPeer::HttpPort(EventManager& manager) {
 namespace {
 
 using conductor::common::HashProfileConfig;
+using conductor::common::PublisherKind;
 using conductor::common::ServiceConfig;
 using conductor::kvevent::EventManager;
 using conductor::kvevent::EventManagerTestPeer;
@@ -57,8 +60,17 @@ using conductor::prefixindex::ProjectedPrefix;
 using conductor::prefixindex::SharedMutation;
 using conductor::prefixindex::SharedObjectOwner;
 using conductor::prefixindex::StorageTier;
-using conductor::zmq::BlockRemovedEvent;
-using conductor::zmq::BlockStoredEvent;
+using conductor::zmq::DecodedBatch;
+using conductor::zmq::MessageMetadata;
+using conductor::zmq::MooncakeClearedEvent;
+using conductor::zmq::MooncakeEvent;
+using conductor::zmq::MooncakeEventBatch;
+using conductor::zmq::MooncakeRemovedEvent;
+using conductor::zmq::MooncakeStoredEvent;
+using conductor::zmq::VllmEvent;
+using conductor::zmq::VllmEventBatch;
+using conductor::zmq::VllmRemovedEvent;
+using conductor::zmq::VllmStoredEvent;
 
 constexpr std::string_view kRootDigest =
     "4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e";
@@ -104,9 +116,15 @@ ServiceConfig VllmService(const std::string& instance_id = "instance-1",
                           const std::string& tenant_id = "default",
                           int dp_rank = 0, int64_t block_size = 16) {
     ServiceConfig service;
-    service.endpoint = "tcp://127.0.0.1:59999";
-    service.replay_endpoint = "tcp://127.0.0.1:59998";
-    service.type = conductor::common::kServiceTypeVLLM;
+    uint32_t endpoint_hash = 2166136261u;
+    for (const unsigned char character :
+         instance_id + "|" + tenant_id + "|" + std::to_string(dp_rank)) {
+        endpoint_hash = (endpoint_hash ^ character) * 16777619u;
+    }
+    const uint16_t port = static_cast<uint16_t>(20000 + endpoint_hash % 15000);
+    service.endpoint = "tcp://127.0.0.1:" + std::to_string(port);
+    service.replay_endpoint = "tcp://127.0.0.1:" + std::to_string(port + 20000);
+    service.publisher_kind = PublisherKind::kVllm;
     service.model_name = "test-model";
     service.instance_id = instance_id;
     service.tenant_id = tenant_id;
@@ -120,7 +138,7 @@ ServiceConfig MooncakeService(const ServiceConfig& engine) {
     ServiceConfig service = engine;
     service.endpoint = "tcp://127.0.0.1:60999";
     service.replay_endpoint = "tcp://127.0.0.1:60998";
-    service.type = conductor::common::kServiceTypeMooncake;
+    service.publisher_kind = PublisherKind::kMooncake;
     service.instance_id = "shared-pool";
     service.dp_rank = 0;
     return service;
@@ -237,7 +255,8 @@ Json::Value ServiceJson(const ServiceConfig& service) {
     Json::Value value(Json::objectValue);
     value["endpoint"] = service.endpoint;
     value["replay_endpoint"] = service.replay_endpoint;
-    value["type"] = service.type;
+    value["type"] = std::string(
+        conductor::common::PublisherKindName(service.publisher_kind));
     value["modelname"] = service.model_name;
     value["lora_name"] = service.lora_name;
     value["tenant_id"] = service.tenant_id;
@@ -304,6 +323,20 @@ TEST(SubscribeToService, ConflictingDuplicateIsRejectedWithoutIndexChange) {
         manager.GetIndexer()->Query(ContextFor(conflicting), {}).empty());
 }
 
+TEST(SubscribeToService, ConflictingLiveEndpointIsRejectedAcrossPublishers) {
+    EventManager manager({}, 0);
+    const auto service = VllmService("engine-a");
+    ASSERT_TRUE(EventManagerTestPeer::Subscribe(manager, service).first);
+
+    auto conflicting = MooncakeService(service);
+    conflicting.endpoint = service.endpoint;
+    const auto result = EventManagerTestPeer::Subscribe(manager, conflicting);
+    EXPECT_FALSE(result.first);
+    EXPECT_NE(result.second.find("endpoint"), std::string::npos);
+    EXPECT_EQ(EventManagerTestPeer::SubscriberCount(manager), 1u);
+    EXPECT_EQ(manager.GetIndexer()->GetGlobalView().context_count, 1);
+}
+
 TEST(SubscribeToService, InvalidRegistrationCreatesNoState) {
     EventManager manager({}, 0);
     auto service = VllmService();
@@ -329,8 +362,7 @@ TEST(SubscribeToService, ManagerStoppedCreatesNoState) {
 
 TEST(RegistrationLifecycle, StaticServicesRegisterEveryRank) {
     auto rank_zero = VllmService("instance-1", "default", 0);
-    auto rank_one = rank_zero;
-    rank_one.dp_rank = 1;
+    auto rank_one = VllmService("instance-1", "default", 1);
     EventManager manager({rank_zero, rank_one}, 0);
     manager.Start();
 
@@ -343,8 +375,7 @@ TEST(RegistrationLifecycle, StaticServicesRegisterEveryRank) {
 TEST(RegistrationLifecycle, PartialUnregisterPreservesRemainingRank) {
     EventManager manager({}, 0);
     auto rank_zero = VllmService("instance-1", "default", 0);
-    auto rank_one = rank_zero;
-    rank_one.dp_rank = 1;
+    auto rank_one = VllmService("instance-1", "default", 1);
     ASSERT_TRUE(EventManagerTestPeer::Register(manager, rank_zero).first);
     ASSERT_TRUE(EventManagerTestPeer::Register(manager, rank_one).first);
 
@@ -703,8 +734,7 @@ class RegistrationHttpTest : public ::testing::Test {
 
 TEST_F(RegistrationHttpTest, PartialUnregisterKeepsInstanceUntilLastRank) {
     auto rank_zero = VllmService("instance-1", "default", 0);
-    auto rank_one = rank_zero;
-    rank_one.dp_rank = 1;
+    auto rank_one = VllmService("instance-1", "default", 1);
     ASSERT_EQ(Register(rank_zero).status, 200);
     ASSERT_EQ(Register(rank_one).status, 200);
 
@@ -777,26 +807,156 @@ TEST_F(RegistrationHttpTest, RejectsConflictingMooncakeProfileBeforeStart) {
     EXPECT_EQ(view.contexts[0].profile, TestProfile());
 }
 
-TEST(KVEventHandlerTest, RejectsBlockAndRankMismatchWithoutMutation) {
+MessageMetadata MetadataFor(const ServiceConfig& service,
+                            std::string topic = "", int64_t sequence = 7) {
+    return {.publisher_kind = service.publisher_kind,
+            .endpoint = service.endpoint,
+            .topic = std::move(topic),
+            .sequence = sequence};
+}
+
+std::string DispatchVllm(KVEventHandler& handler, const ServiceConfig& service,
+                         std::vector<VllmEvent> events,
+                         std::optional<int64_t> dp_rank = std::nullopt,
+                         std::string topic = "") {
+    VllmEventBatch batch{
+        .timestamp_seconds = 1.25, .events = {}, .data_parallel_rank = dp_rank};
+    for (auto& event : events) {
+        batch.events.push_back({.event = std::move(event), .error = ""});
+    }
+    return handler.HandleBatch(DecodedBatch(std::move(batch)),
+                               MetadataFor(service, std::move(topic)));
+}
+
+std::string DispatchMooncake(KVEventHandler& handler,
+                             const ServiceConfig& service,
+                             std::vector<MooncakeEvent> events,
+                             std::string topic = "") {
+    MooncakeEventBatch batch{.timestamp_milliseconds = 1700000000123,
+                             .events = {},
+                             .data_parallel_rank = 4};
+    for (auto& event : events) {
+        batch.events.push_back({.event = std::move(event), .error = ""});
+    }
+    return handler.HandleBatch(DecodedBatch(std::move(batch)),
+                               MetadataFor(service, std::move(topic)));
+}
+
+VllmStoredEvent VllmStored(uint64_t prefix, int64_t block_size,
+                           std::string medium = "GPU") {
+    return {.block_hashes = {prefix},
+            .parent_block_hash = std::nullopt,
+            .token_ids = std::vector<int32_t>{999, 998},
+            .block_size = block_size,
+            .lora_id = std::nullopt,
+            .medium = std::move(medium),
+            .lora_name = std::nullopt,
+            .extra_keys_present = false,
+            .group_idx = 0};
+}
+
+std::string ConnectorHashFor(uint64_t prefix, char leading = '0') {
+    char low64[17];
+    std::snprintf(low64, sizeof(low64), "%016llx",
+                  static_cast<unsigned long long>(prefix));
+    return std::string(48, leading) + low64;
+}
+
+MooncakeStoredEvent MooncakeStored(const ServiceConfig& engine, uint64_t prefix,
+                                   std::string object_key,
+                                   std::string medium = "CPU",
+                                   std::string backend = "backend-a") {
+    MooncakeStoredEvent event;
+    event.fields = {.event_id = 1,
+                    .timestamp_milliseconds = 1700000000123,
+                    .model_name = engine.model_name,
+                    .block_size = engine.block_size,
+                    .additional_salt = std::nullopt,
+                    .lora_name = engine.lora_name.empty()
+                                     ? std::optional<std::string>{}
+                                     : engine.lora_name,
+                    .tenant_id = engine.tenant_id,
+                    .backend_id = std::move(backend),
+                    .medium = std::move(medium),
+                    .data_parallel_rank = 9};
+    event.object.group_id = "0";
+    event.object.object_key = std::move(object_key);
+    event.object.connector_block_hash = ConnectorHashFor(prefix);
+    event.object.seq_hashes = {prefix};
+    event.object.base_block_idx = std::nullopt;
+    event.parent_hash = std::nullopt;
+    event.token_ids = std::nullopt;
+    return event;
+}
+
+MooncakeRemovedEvent MooncakeRemoved(const MooncakeStoredEvent& stored) {
+    return {.fields = stored.fields, .object = stored.object};
+}
+
+MooncakeClearedEvent MooncakeCleared(const ServiceConfig& context,
+                                     std::string backend = "backend-a") {
+    return {.fields = {.event_id = 3,
+                       .timestamp_milliseconds = 1700000000123,
+                       .model_name = context.model_name,
+                       .block_size = context.block_size,
+                       .additional_salt = std::nullopt,
+                       .lora_name = std::nullopt,
+                       .tenant_id = context.tenant_id,
+                       .backend_id = std::move(backend),
+                       .medium = std::nullopt,
+                       .data_parallel_rank = 9}};
+}
+
+class WarningSink : public google::LogSink {
+   public:
+    WarningSink() { google::AddLogSink(this); }
+    ~WarningSink() override { google::RemoveLogSink(this); }
+
+    void send(google::LogSeverity severity, const char*, const char*, int,
+              const google::LogMessageTime&, const char* message,
+              size_t message_len) override {
+        if (severity != google::GLOG_WARNING) {
+            return;
+        }
+        std::lock_guard lock(mu_);
+        messages_.emplace_back(message, message_len);
+    }
+
+    bool Contains(std::string_view needle) const {
+        std::lock_guard lock(mu_);
+        return std::any_of(messages_.begin(), messages_.end(),
+                           [&](const std::string& message) {
+                               return message.find(needle) != std::string::npos;
+                           });
+    }
+
+   private:
+    mutable std::mutex mu_;
+    std::vector<std::string> messages_;
+};
+
+TEST(KVEventHandlerTest, VllmBatchDpConflictRejectsEveryEvent) {
     EventManager manager({}, 0);
     const auto service = VllmService("engine", "default", 2, 4);
     ASSERT_TRUE(
         manager.GetIndexer()->Register(RegistrationFor(service)).error.empty());
     KVEventHandler handler(&manager, service);
+    const auto tokens = Sequence(1, 4);
+    const auto prefixes =
+        ProjectedFor(ContextFor(service), TestProfile(), tokens);
+    ASSERT_EQ(prefixes.size(), 1u);
 
-    BlockStoredEvent event;
-    event.block_size = 8;
-    event.block_hashes = {100};
-    event.medium = "GPU";
-    EXPECT_NE(KVEventHandlerTestPeer::BlockStored(handler, event, 2), "");
-    event.block_size = 4;
-    EXPECT_NE(KVEventHandlerTestPeer::BlockStored(handler, event, 1), "");
-    ASSERT_EQ(manager.GetIndexer()->GetGlobalView().contexts.size(), 1u);
-    EXPECT_EQ(manager.GetIndexer()->GetGlobalView().contexts[0].prefix_count,
-              0u);
+    EXPECT_FALSE(
+        DispatchVllm(handler, service, {VllmStored(prefixes[0].value, 4)}, 1)
+            .empty());
+    EXPECT_EQ(manager.GetIndexer()
+                  ->Query(ContextFor(service), tokens)
+                  .at("engine")
+                  .gpu,
+              0);
 }
 
-TEST(KVEventHandlerTest, VllmUsesProjectedGpuHashesAndExactOwnerRemoval) {
+TEST(KVEventHandlerTest, VllmAdmissionFailureDoesNotBlockValidSiblings) {
     EventManager manager({}, 0);
     const auto service = VllmService("engine", "default", 0, 4);
     ASSERT_TRUE(
@@ -807,37 +967,179 @@ TEST(KVEventHandlerTest, VllmUsesProjectedGpuHashesAndExactOwnerRemoval) {
         ProjectedFor(ContextFor(service), TestProfile(), tokens);
     ASSERT_EQ(prefixes.size(), 1u);
 
-    BlockStoredEvent stored;
-    stored.block_size = 4;
-    stored.block_hashes = {prefixes[0].value};
-    stored.medium = "gPu";
-    ASSERT_TRUE(
-        KVEventHandlerTestPeer::BlockStored(handler, stored, 0).empty());
+    auto invalid = VllmStored(prefixes[0].value, 8);
+    auto invalid_lora = VllmStored(prefixes[0].value, 4);
+    invalid_lora.lora_name = "other-lora";
+    auto invalid_cache_spec = VllmStored(prefixes[0].value, 4);
+    invalid_cache_spec.kv_cache_spec_kind = "sliding_window";
+    invalid_cache_spec.kv_cache_spec_sliding_window = 128;
+    auto valid = VllmStored(prefixes[0].value, 4, "gPu");
+    EXPECT_TRUE(DispatchVllm(handler, service,
+                             {std::move(invalid), std::move(invalid_lora),
+                              std::move(invalid_cache_spec), std::move(valid)},
+                             0, "mooncake")
+                    .empty());
     EXPECT_EQ(manager.GetIndexer()
                   ->Query(ContextFor(service), tokens)
                   .at("engine")
                   .gpu,
               4);
 
-    BlockRemovedEvent removed;
-    removed.block_hashes = stored.block_hashes;
-    removed.medium = "GPU";
-    ASSERT_TRUE(
-        handler.HandleEvent(conductor::zmq::KVEvent(removed), 0).empty());
+    VllmRemovedEvent removed{
+        .block_hashes = {prefixes[0].value}, .medium = "GPU", .group_idx = 0};
+    EXPECT_TRUE(DispatchVllm(handler, service, {removed, removed}, 0).empty());
     EXPECT_EQ(manager.GetIndexer()
                   ->Query(ContextFor(service), tokens)
                   .at("engine")
                   .gpu,
               0);
-
-    stored.medium = "cpu";
-    EXPECT_TRUE(
-        KVEventHandlerTestPeer::BlockStored(handler, stored, 0).empty());
-    EXPECT_EQ(manager.GetIndexer()->GetGlobalView().contexts[0].prefix_count,
-              0u);
 }
 
-TEST(KVEventHandlerTest, MooncakeSharedMutationRequiresExactProfile) {
+TEST(KVEventHandlerTest, VllmNonNullLoraIdIsRejectedWithoutBlockingSibling) {
+    EventManager manager({}, 0);
+    const auto service = VllmService("engine", "default", 0, 4);
+    ASSERT_TRUE(
+        manager.GetIndexer()->Register(RegistrationFor(service)).error.empty());
+    KVEventHandler handler(&manager, service);
+    const auto tokens = Sequence(1, 8);
+    const auto prefixes =
+        ProjectedFor(ContextFor(service), TestProfile(), tokens);
+    ASSERT_EQ(prefixes.size(), 2u);
+
+    auto untrusted_lora = VllmStored(prefixes[0].value, 4);
+    untrusted_lora.lora_id = 7;
+    auto valid = VllmStored(prefixes[1].value, 4);
+    WarningSink warnings;
+    EXPECT_TRUE(DispatchVllm(handler, service,
+                             {std::move(untrusted_lora), std::move(valid)}, 0)
+                    .empty());
+
+    const auto view = manager.GetIndexer()->GetGlobalView();
+    ASSERT_EQ(view.contexts.size(), 1u);
+    EXPECT_EQ(view.contexts[0].prefix_count, 1u);
+    EXPECT_TRUE(warnings.Contains(
+        "lora_id cannot be validated against trusted registration"));
+}
+
+TEST(KVEventHandlerTest, VllmBinaryHashUsesFinalEightBytesWithoutRehashing) {
+    EventManager manager({}, 0);
+    const auto service = VllmService("engine", "default", 0, 4);
+    ASSERT_TRUE(
+        manager.GetIndexer()->Register(RegistrationFor(service)).error.empty());
+    KVEventHandler handler(&manager, service);
+    const auto tokens = Sequence(1, 4);
+    const auto prefixes =
+        ProjectedFor(ContextFor(service), TestProfile(), tokens);
+    ASSERT_EQ(prefixes.size(), 1u);
+
+    std::vector<uint8_t> full_hash(32, 0x55);
+    for (int shift = 56, index = 24; shift >= 0; shift -= 8, ++index) {
+        full_hash[index] = static_cast<uint8_t>(prefixes[0].value >> shift);
+    }
+    auto stored = VllmStored(prefixes[0].value, 4);
+    stored.block_hashes = {full_hash};
+    stored.token_ids = std::vector<int32_t>{-1, -2, -3, -4};
+    auto short_hash = VllmStored(prefixes[0].value, 4);
+    short_hash.block_hashes = {std::vector<uint8_t>(7, 0xff)};
+    EXPECT_TRUE(DispatchVllm(handler, service,
+                             {std::move(short_hash), std::move(stored)}, 0)
+                    .empty());
+    EXPECT_EQ(manager.GetIndexer()->GetGlobalView().contexts[0].prefix_count,
+              1u);
+    EXPECT_EQ(manager.GetIndexer()
+                  ->Query(ContextFor(service), tokens)
+                  .at("engine")
+                  .gpu,
+              4);
+}
+
+TEST(KVEventHandlerTest, VllmCpuDiskAreNoOpsAndGpuSiblingContinues) {
+    EventManager manager({}, 0);
+    const auto service = VllmService("engine", "default", 0, 4);
+    ASSERT_TRUE(
+        manager.GetIndexer()->Register(RegistrationFor(service)).error.empty());
+    KVEventHandler handler(&manager, service);
+    const auto tokens = Sequence(1, 4);
+    const auto prefixes =
+        ProjectedFor(ContextFor(service), TestProfile(), tokens);
+
+    const std::array<std::string, 4> warning_media = {"CPU", "cpu", "DISK",
+                                                      "disk"};
+    std::vector<VllmEvent> events;
+    for (const auto& medium : warning_media) {
+        events.emplace_back(VllmStored(prefixes[0].value, 4, medium));
+    }
+    events.emplace_back(VllmStored(prefixes[0].value, 4, "GPU"));
+    for (const auto& medium : warning_media) {
+        events.emplace_back(
+            VllmRemovedEvent{.block_hashes = {prefixes[0].value},
+                             .medium = medium,
+                             .group_idx = 0});
+    }
+
+    WarningSink warnings;
+    EXPECT_TRUE(DispatchVllm(handler, service, std::move(events), 0).empty());
+    const auto result =
+        manager.GetIndexer()->Query(ContextFor(service), tokens).at("engine");
+    EXPECT_EQ(result.gpu, 4);
+    EXPECT_EQ(result.cpu, 0);
+    EXPECT_EQ(result.disk, 0);
+    EXPECT_TRUE(warnings.Contains("endpoint=" + service.endpoint));
+    EXPECT_TRUE(warnings.Contains("publisher_kind=vLLM"));
+    EXPECT_TRUE(warnings.Contains("instance=engine"));
+    EXPECT_TRUE(warnings.Contains("dp_rank=0"));
+    for (const auto& medium : warning_media) {
+        EXPECT_TRUE(
+            warnings.Contains("event_type=BlockStored medium=" + medium));
+        EXPECT_TRUE(
+            warnings.Contains("event_type=BlockRemoved medium=" + medium));
+    }
+    EXPECT_TRUE(warnings.Contains("hash_count=1"));
+}
+
+TEST(KVEventHandlerTest, VllmClearPreservesOtherEngineAndSharedOwners) {
+    EventManager manager({}, 0);
+    const auto engine_a = VllmService("engine-a", "default", 0, 4);
+    const auto engine_b = VllmService("engine-b", "default", 0, 4);
+    ASSERT_TRUE(manager.GetIndexer()
+                    ->Register(RegistrationFor(engine_a))
+                    .error.empty());
+    ASSERT_TRUE(manager.GetIndexer()
+                    ->Register(RegistrationFor(engine_b))
+                    .error.empty());
+    KVEventHandler handler_a(&manager, engine_a);
+    KVEventHandler handler_b(&manager, engine_b);
+    auto pool = MooncakeService(engine_a);
+    KVEventHandler pool_handler(&manager, pool);
+    const auto tokens = Sequence(1, 4);
+    const auto prefix =
+        ProjectedFor(ContextFor(engine_a), TestProfile(), tokens).front();
+
+    EXPECT_TRUE(
+        DispatchVllm(handler_a, engine_a, {VllmStored(prefix.value, 4)}, 0)
+            .empty());
+    EXPECT_TRUE(
+        DispatchVllm(handler_b, engine_b, {VllmStored(prefix.value, 4)}, 0)
+            .empty());
+    EXPECT_TRUE(DispatchMooncake(
+                    pool_handler, pool,
+                    {MooncakeStored(engine_a, prefix.value, "shared-object")})
+                    .empty());
+    EXPECT_TRUE(DispatchVllm(handler_a, engine_a,
+                             {conductor::zmq::VllmClearedEvent{}}, 0)
+                    .empty());
+
+    const auto results =
+        manager.GetIndexer()->Query(ContextFor(engine_a), tokens);
+    ASSERT_EQ(results.size(), 2u);
+    EXPECT_EQ(results.at("engine-a").gpu, 0);
+    EXPECT_EQ(results.at("engine-a").cpu, 4);
+    EXPECT_EQ(results.at("engine-b").gpu, 4);
+    EXPECT_EQ(results.at("engine-b").cpu, 4);
+    EXPECT_FALSE(results.contains(pool.instance_id));
+}
+
+TEST(KVEventHandlerTest, MooncakeExactBindingsSurviveLow64Collision) {
     EventManager manager({}, 0);
     const auto engine = VllmService("engine", "default", 0, 4);
     ASSERT_TRUE(
@@ -845,34 +1147,405 @@ TEST(KVEventHandlerTest, MooncakeSharedMutationRequiresExactProfile) {
     const auto tokens = Sequence(1, 4);
     const auto prefixes =
         ProjectedFor(ContextFor(engine), TestProfile(), tokens);
-    ASSERT_EQ(prefixes.size(), 1u);
-
     auto pool = MooncakeService(engine);
-    KVEventHandler pool_handler(&manager, pool);
-    BlockStoredEvent stored;
-    stored.block_size = 4;
-    stored.block_hashes = {prefixes[0].value};
-    stored.medium = "CPU";
-    ASSERT_TRUE(
-        KVEventHandlerTestPeer::BlockStored(pool_handler, stored, -1).empty());
+    KVEventHandler handler(&manager, pool);
+
+    auto first = MooncakeStored(engine, prefixes[0].value, "object-a");
+    first.fields.additional_salt = "diagnostic-only";
+    auto second = MooncakeStored(engine, prefixes[0].value, "object-b");
+    second.object.connector_block_hash =
+        ConnectorHashFor(prefixes[0].value, 'a');
+    EXPECT_TRUE(
+        DispatchMooncake(handler, pool, {first, first, second}).empty());
+    EXPECT_EQ(KVEventHandlerTestPeer::BindingCount(handler), 2u);
     EXPECT_EQ(manager.GetIndexer()
                   ->Query(ContextFor(engine), tokens)
                   .at("engine")
                   .cpu,
               4);
 
-    auto conflicting_pool = pool;
-    conflicting_pool.hash_profile.root_digest = std::string(kOtherRootDigest);
-    KVEventHandler conflicting_handler(&manager, conflicting_pool);
-    stored.medium = "DISK";
-    EXPECT_NE(
-        KVEventHandlerTestPeer::BlockStored(conflicting_handler, stored, -1),
-        "");
+    EXPECT_TRUE(
+        DispatchMooncake(handler, pool, {MooncakeRemoved(first)}).empty());
+    EXPECT_EQ(KVEventHandlerTestPeer::BindingCount(handler), 1u);
     EXPECT_EQ(manager.GetIndexer()
                   ->Query(ContextFor(engine), tokens)
                   .at("engine")
-                  .disk,
+                  .cpu,
+              4);
+    EXPECT_TRUE(
+        DispatchMooncake(handler, pool, {MooncakeRemoved(first)}).empty());
+
+    EXPECT_TRUE(
+        DispatchMooncake(handler, pool, {MooncakeRemoved(second)}).empty());
+    EXPECT_EQ(KVEventHandlerTestPeer::BindingCount(handler), 0u);
+    EXPECT_EQ(manager.GetIndexer()
+                  ->Query(ContextFor(engine), tokens)
+                  .at("engine")
+                  .cpu,
               0);
+}
+
+TEST(KVEventHandlerTest, MooncakeMediumMigrationAndTenantClearAreScoped) {
+    EventManager manager({}, 0);
+    const auto tenant_a = VllmService("engine-a", "tenant-a", 0, 4);
+    auto tenant_b = VllmService("engine-b", "tenant-b", 0, 4);
+    tenant_b.model_name = tenant_a.model_name;
+    ASSERT_TRUE(manager.GetIndexer()
+                    ->Register(RegistrationFor(tenant_a))
+                    .error.empty());
+    ASSERT_TRUE(manager.GetIndexer()
+                    ->Register(RegistrationFor(tenant_b))
+                    .error.empty());
+    const auto tokens = Sequence(1, 4);
+    const auto prefix_a =
+        ProjectedFor(ContextFor(tenant_a), TestProfile(), tokens).front();
+    const auto prefix_b =
+        ProjectedFor(ContextFor(tenant_b), TestProfile(), tokens).front();
+    auto pool = MooncakeService(tenant_a);
+    KVEventHandler handler(&manager, pool);
+    KVEventHandler engine_handler(&manager, tenant_a);
+
+    auto cpu_a = MooncakeStored(tenant_a, prefix_a.value, "tenant-a-object");
+    auto disk_a = cpu_a;
+    disk_a.fields.medium = "DISK";
+    auto other_backend = MooncakeStored(
+        tenant_a, prefix_a.value, "other-backend-object", "CPU", "backend-b");
+    auto cpu_b = MooncakeStored(tenant_b, prefix_b.value, "tenant-b-object");
+    EXPECT_TRUE(DispatchVllm(engine_handler, tenant_a,
+                             {VllmStored(prefix_a.value, 4)}, 0)
+                    .empty());
+    EXPECT_TRUE(DispatchMooncake(handler, pool,
+                                 {cpu_a, MooncakeRemoved(cpu_a), disk_a,
+                                  other_backend, cpu_b})
+                    .empty());
+    auto result_a = manager.GetIndexer()
+                        ->Query(ContextFor(tenant_a), tokens)
+                        .at("engine-a");
+    EXPECT_EQ(result_a.gpu, 4);
+    EXPECT_EQ(result_a.cpu, 4);
+    EXPECT_EQ(result_a.disk, 4);
+
+    EXPECT_TRUE(
+        DispatchMooncake(handler, pool, {MooncakeCleared(tenant_a)}).empty());
+    result_a = manager.GetIndexer()
+                   ->Query(ContextFor(tenant_a), tokens)
+                   .at("engine-a");
+    const auto result_b = manager.GetIndexer()
+                              ->Query(ContextFor(tenant_b), tokens)
+                              .at("engine-b");
+    EXPECT_EQ(result_a.gpu, 4);
+    EXPECT_EQ(result_a.cpu, 4);
+    EXPECT_EQ(result_a.disk, 0);
+    EXPECT_EQ(result_b.cpu, 4);
+    EXPECT_EQ(KVEventHandlerTestPeer::BindingCount(handler), 2u);
+}
+
+TEST(KVEventHandlerTest, MooncakeHashConflictDoesNotBlockValidSibling) {
+    EventManager manager({}, 0);
+    const auto engine = VllmService("engine", "default", 0, 4);
+    ASSERT_TRUE(
+        manager.GetIndexer()->Register(RegistrationFor(engine)).error.empty());
+    const auto tokens = Sequence(1, 4);
+    const auto prefix =
+        ProjectedFor(ContextFor(engine), TestProfile(), tokens).front();
+    auto pool = MooncakeService(engine);
+    KVEventHandler handler(&manager, pool);
+    auto invalid = MooncakeStored(engine, prefix.value, "invalid");
+    invalid.object.seq_hashes = {prefix.value + 1};
+    auto missing_object = MooncakeStored(engine, prefix.value, "missing");
+    missing_object.object.object_key.reset();
+    auto wrong_model = MooncakeStored(engine, prefix.value, "wrong-model");
+    wrong_model.fields.model_name = "other-model";
+    auto wrong_lora = MooncakeStored(engine, prefix.value, "wrong-lora");
+    wrong_lora.fields.lora_name = "other-lora";
+    auto wrong_block = MooncakeStored(engine, prefix.value, "wrong-block");
+    wrong_block.fields.block_size = 8;
+    auto valid = MooncakeStored(engine, prefix.value, "valid");
+
+    EXPECT_TRUE(DispatchMooncake(handler, pool,
+                                 {invalid, missing_object, wrong_model,
+                                  wrong_lora, wrong_block, valid})
+                    .empty());
+    EXPECT_EQ(KVEventHandlerTestPeer::BindingCount(handler), 1u);
+    EXPECT_EQ(manager.GetIndexer()
+                  ->Query(ContextFor(engine), tokens)
+                  .at("engine")
+                  .cpu,
+              4);
+}
+
+TEST(KVEventHandlerTest, MooncakeMissingBackendCreatesNoOwnerOrBinding) {
+    EventManager manager({}, 0);
+    const auto engine = VllmService("engine", "default", 0, 4);
+    ASSERT_TRUE(
+        manager.GetIndexer()->Register(RegistrationFor(engine)).error.empty());
+    const auto tokens = Sequence(1, 4);
+    const auto prefix =
+        ProjectedFor(ContextFor(engine), TestProfile(), tokens).front();
+    auto pool = MooncakeService(engine);
+    KVEventHandler handler(&manager, pool);
+    auto missing_backend =
+        MooncakeStored(engine, prefix.value, "missing-backend");
+    missing_backend.fields.backend_id.clear();
+
+    WarningSink warnings;
+    EXPECT_TRUE(
+        DispatchMooncake(handler, pool, {std::move(missing_backend)}).empty());
+    EXPECT_EQ(KVEventHandlerTestPeer::BindingCount(handler), 0u);
+    EXPECT_EQ(manager.GetIndexer()
+                  ->Query(ContextFor(engine), tokens)
+                  .at("engine")
+                  .cpu,
+              0);
+    EXPECT_TRUE(warnings.Contains("backend_id is required"));
+}
+
+TEST(KVEventHandlerTest, UnsupportedGroupsAreEventLocalForBothSources) {
+    EventManager manager({}, 0);
+    const auto engine = VllmService("engine", "default", 0, 4);
+    ASSERT_TRUE(
+        manager.GetIndexer()->Register(RegistrationFor(engine)).error.empty());
+    const auto tokens = Sequence(1, 4);
+    const auto prefix =
+        ProjectedFor(ContextFor(engine), TestProfile(), tokens).front();
+    KVEventHandler engine_handler(&manager, engine);
+    auto bad_vllm = VllmStored(prefix.value, 4);
+    bad_vllm.group_idx = 1;
+    EXPECT_TRUE(DispatchVllm(engine_handler, engine,
+                             {bad_vllm, VllmStored(prefix.value, 4)}, 0)
+                    .empty());
+    EXPECT_EQ(manager.GetIndexer()
+                  ->Query(ContextFor(engine), tokens)
+                  .at("engine")
+                  .gpu,
+              4);
+
+    auto pool = MooncakeService(engine);
+    KVEventHandler pool_handler(&manager, pool);
+    auto bad_mooncake =
+        MooncakeStored(engine, prefix.value, "bad-group-object");
+    bad_mooncake.object.group_id = "1";
+    auto valid_mooncake =
+        MooncakeStored(engine, prefix.value, "valid-group-object");
+    EXPECT_TRUE(
+        DispatchMooncake(pool_handler, pool, {bad_mooncake, valid_mooncake})
+            .empty());
+    EXPECT_EQ(KVEventHandlerTestPeer::BindingCount(pool_handler), 1u);
+}
+
+TEST(KVEventHandlerTest, MooncakeUnsupportedMediaAreWarningsAndNoOps) {
+    EventManager manager({}, 0);
+    const auto engine = VllmService("engine", "default", 0, 4);
+    ASSERT_TRUE(
+        manager.GetIndexer()->Register(RegistrationFor(engine)).error.empty());
+    const auto tokens = Sequence(1, 4);
+    const auto prefix =
+        ProjectedFor(ContextFor(engine), TestProfile(), tokens).front();
+    auto pool = MooncakeService(engine);
+    KVEventHandler handler(&manager, pool);
+    WarningSink warnings;
+
+    EXPECT_TRUE(DispatchMooncake(
+                    handler, pool,
+                    {MooncakeStored(engine, prefix.value, "gpu", "GPU"),
+                     MooncakeStored(engine, prefix.value, "empty", ""),
+                     MooncakeStored(engine, prefix.value, "unknown", "tape"),
+                     MooncakeStored(engine, prefix.value, "cpu", "cpu")})
+                    .empty());
+    EXPECT_EQ(KVEventHandlerTestPeer::BindingCount(handler), 1u);
+    const auto result =
+        manager.GetIndexer()->Query(ContextFor(engine), tokens).at("engine");
+    EXPECT_EQ(result.gpu, 0);
+    EXPECT_EQ(result.cpu, 4);
+    EXPECT_EQ(result.disk, 0);
+    EXPECT_TRUE(warnings.Contains("event_type=stored"));
+    EXPECT_TRUE(warnings.Contains("publisher_kind=Mooncake"));
+    EXPECT_TRUE(warnings.Contains("event_dp=9"));
+    EXPECT_TRUE(warnings.Contains("medium=GPU"));
+    EXPECT_TRUE(warnings.Contains("medium=tape"));
+}
+
+TEST(RegistrationLifecycle, MooncakeUnregisterCleansEndpointBindings) {
+    EventManager manager({}, 0);
+    const auto engine_a = VllmService("engine-a", "default", 0, 4);
+    auto engine_b = VllmService("engine-b", "tenant-b", 0, 4);
+    engine_b.model_name = engine_a.model_name;
+    auto pool = MooncakeService(engine_a);
+    auto other_pool = pool;
+    other_pool.instance_id = "shared-pool-2";
+    other_pool.endpoint = "tcp://127.0.0.1:61001";
+    other_pool.replay_endpoint.clear();
+    ASSERT_TRUE(EventManagerTestPeer::Register(manager, engine_a).first);
+    ASSERT_TRUE(EventManagerTestPeer::Register(manager, engine_b).first);
+    ASSERT_TRUE(EventManagerTestPeer::Register(manager, pool).first);
+    ASSERT_TRUE(EventManagerTestPeer::Register(manager, other_pool).first);
+    auto handler = EventManagerTestPeer::HandlerFor(
+        manager,
+        MakeServiceKey(pool.instance_id, pool.tenant_id, pool.dp_rank));
+    auto other_handler = EventManagerTestPeer::HandlerFor(
+        manager, MakeServiceKey(other_pool.instance_id, other_pool.tenant_id,
+                                other_pool.dp_rank));
+    ASSERT_NE(handler, nullptr);
+    ASSERT_NE(other_handler, nullptr);
+    const auto tokens = Sequence(1, 4);
+    const auto prefix_a =
+        ProjectedFor(ContextFor(engine_a), TestProfile(), tokens).front();
+    const auto prefix_b =
+        ProjectedFor(ContextFor(engine_b), TestProfile(), tokens).front();
+    EXPECT_TRUE(
+        DispatchMooncake(*handler, pool,
+                         {MooncakeStored(engine_a, prefix_a.value, "pool-a"),
+                          MooncakeStored(engine_b, prefix_b.value, "pool-b")})
+            .empty());
+    EXPECT_TRUE(DispatchMooncake(
+                    *other_handler, other_pool,
+                    {MooncakeStored(engine_a, prefix_a.value, "other-pool")})
+                    .empty());
+    EXPECT_EQ(manager.GetIndexer()
+                  ->Query(ContextFor(engine_a), tokens)
+                  .at("engine-a")
+                  .cpu,
+              4);
+    EXPECT_EQ(manager.GetIndexer()
+                  ->Query(ContextFor(engine_b), tokens)
+                  .at("engine-b")
+                  .cpu,
+              4);
+
+    const auto removed = EventManagerTestPeer::Unsubscribe(
+        manager, pool.instance_id, pool.tenant_id, pool.dp_rank);
+    ASSERT_TRUE(removed.first) << removed.second;
+    EXPECT_TRUE(removed.second.empty());
+    EXPECT_EQ(manager.GetIndexer()
+                  ->Query(ContextFor(engine_a), tokens)
+                  .at("engine-a")
+                  .cpu,
+              4);
+    EXPECT_EQ(manager.GetIndexer()
+                  ->Query(ContextFor(engine_b), tokens)
+                  .at("engine-b")
+                  .cpu,
+              0);
+    EXPECT_FALSE(DispatchMooncake(
+                     *handler, pool,
+                     {MooncakeStored(engine_a, prefix_a.value, "late-object")})
+                     .empty());
+    EXPECT_TRUE(EventManagerTestPeer::Register(manager, pool).first);
+}
+
+TEST(RegistrationLifecycle,
+     CleanupFailureQuarantinesBindingsAndEndpointUntilRetry) {
+    EventManager manager({}, 0);
+    const auto engine = VllmService("engine", "default", 0, 4);
+    const auto pool = MooncakeService(engine);
+    ASSERT_TRUE(EventManagerTestPeer::Register(manager, engine).first);
+    ASSERT_TRUE(EventManagerTestPeer::Register(manager, pool).first);
+
+    const std::string pool_key =
+        MakeServiceKey(pool.instance_id, pool.tenant_id, pool.dp_rank);
+    auto handler = EventManagerTestPeer::HandlerFor(manager, pool_key);
+    ASSERT_NE(handler, nullptr);
+    const auto tokens = Sequence(1, 4);
+    const auto prefix =
+        ProjectedFor(ContextFor(engine), TestProfile(), tokens).front();
+    ASSERT_TRUE(DispatchMooncake(*handler, pool,
+                                 {MooncakeStored(engine, prefix.value,
+                                                 "quarantined-object")})
+                    .empty());
+    ASSERT_EQ(KVEventHandlerTestPeer::BindingCount(*handler), 1u);
+
+    ASSERT_TRUE(
+        KVEventHandlerTestPeer::SetFirstBindingOwnerSource(*handler, ""));
+    const auto failed = EventManagerTestPeer::Unsubscribe(
+        manager, pool.instance_id, pool.tenant_id, pool.dp_rank);
+    EXPECT_TRUE(failed.first);
+    EXPECT_FALSE(failed.second.empty());
+    EXPECT_EQ(EventManagerTestPeer::CleanupQuarantinedCount(manager), 1u);
+    EXPECT_EQ(KVEventHandlerTestPeer::BindingCount(*handler), 1u);
+    EXPECT_EQ(manager.GetIndexer()
+                  ->Query(ContextFor(engine), tokens)
+                  .at(engine.instance_id)
+                  .cpu,
+              4);
+
+    const auto exact_retry = EventManagerTestPeer::Register(manager, pool);
+    EXPECT_FALSE(exact_retry.first);
+    EXPECT_NE(exact_retry.second.find("quarantined"), std::string::npos);
+    auto endpoint_conflict = pool;
+    endpoint_conflict.instance_id = "replacement-pool";
+    const auto conflicting_retry =
+        EventManagerTestPeer::Register(manager, endpoint_conflict);
+    EXPECT_FALSE(conflicting_retry.first);
+    EXPECT_NE(conflicting_retry.second.find("endpoint"), std::string::npos);
+
+    ASSERT_TRUE(KVEventHandlerTestPeer::SetFirstBindingOwnerSource(
+        *handler, pool.endpoint));
+    const auto retried = EventManagerTestPeer::Unsubscribe(
+        manager, pool.instance_id, pool.tenant_id, pool.dp_rank);
+    EXPECT_TRUE(retried.first) << retried.second;
+    EXPECT_TRUE(retried.second.empty());
+    EXPECT_EQ(EventManagerTestPeer::CleanupQuarantinedCount(manager), 0u);
+    EXPECT_EQ(KVEventHandlerTestPeer::BindingCount(*handler), 0u);
+    EXPECT_EQ(manager.GetIndexer()
+                  ->Query(ContextFor(engine), tokens)
+                  .at(engine.instance_id)
+                  .cpu,
+              0);
+    EXPECT_TRUE(EventManagerTestPeer::Register(manager, pool).first);
+}
+
+TEST(RegistrationLifecycle, VllmUnregisterPreservesOtherAndSharedOwners) {
+    EventManager manager({}, 0);
+    const auto engine_a = VllmService("engine-a", "default", 0, 4);
+    const auto engine_b = VllmService("engine-b", "default", 0, 4);
+    auto pool = MooncakeService(engine_a);
+    ASSERT_TRUE(EventManagerTestPeer::Register(manager, engine_a).first);
+    ASSERT_TRUE(EventManagerTestPeer::Register(manager, engine_b).first);
+    ASSERT_TRUE(EventManagerTestPeer::Register(manager, pool).first);
+    auto handler_a = EventManagerTestPeer::HandlerFor(
+        manager, MakeServiceKey(engine_a.instance_id, engine_a.tenant_id,
+                                engine_a.dp_rank));
+    auto handler_b = EventManagerTestPeer::HandlerFor(
+        manager, MakeServiceKey(engine_b.instance_id, engine_b.tenant_id,
+                                engine_b.dp_rank));
+    auto pool_handler = EventManagerTestPeer::HandlerFor(
+        manager,
+        MakeServiceKey(pool.instance_id, pool.tenant_id, pool.dp_rank));
+    ASSERT_NE(handler_a, nullptr);
+    ASSERT_NE(handler_b, nullptr);
+    ASSERT_NE(pool_handler, nullptr);
+    const auto tokens = Sequence(1, 4);
+    const auto prefix =
+        ProjectedFor(ContextFor(engine_a), TestProfile(), tokens).front();
+    EXPECT_TRUE(
+        DispatchVllm(*handler_a, engine_a, {VllmStored(prefix.value, 4)}, 0)
+            .empty());
+    EXPECT_TRUE(
+        DispatchVllm(*handler_b, engine_b, {VllmStored(prefix.value, 4)}, 0)
+            .empty());
+    EXPECT_TRUE(DispatchMooncake(
+                    *pool_handler, pool,
+                    {MooncakeStored(engine_a, prefix.value, "shared-object")})
+                    .empty());
+
+    const auto removed = EventManagerTestPeer::Unsubscribe(
+        manager, engine_a.instance_id, engine_a.tenant_id, engine_a.dp_rank);
+    ASSERT_TRUE(removed.first) << removed.second;
+    EXPECT_TRUE(removed.second.empty());
+    auto results = manager.GetIndexer()->Query(ContextFor(engine_a), tokens);
+    ASSERT_EQ(results.size(), 1u);
+    EXPECT_EQ(results.at("engine-b").gpu, 4);
+    EXPECT_EQ(results.at("engine-b").cpu, 4);
+    EXPECT_FALSE(
+        DispatchVllm(*handler_a, engine_a, {VllmStored(prefix.value, 4)}, 0)
+            .empty());
+
+    EXPECT_TRUE(EventManagerTestPeer::Register(manager, engine_a).first);
+    results = manager.GetIndexer()->Query(ContextFor(engine_a), tokens);
+    ASSERT_EQ(results.size(), 2u);
+    EXPECT_EQ(results.at("engine-a").gpu, 0);
+    EXPECT_EQ(results.at("engine-a").cpu, 4);
+    EXPECT_EQ(results.at("engine-b").gpu, 4);
 }
 
 class ConfigEnvGuard {

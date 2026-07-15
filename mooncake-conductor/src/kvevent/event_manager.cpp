@@ -237,7 +237,7 @@ std::string ValidateServiceConfig(const common::ServiceConfig& service) {
     if (service.cache_group.has_value() && *service.cache_group != 0) {
         return "only cache group zero is supported";
     }
-    if (service.type == common::kServiceTypeVLLM) {
+    if (service.publisher_kind == common::PublisherKind::kVllm) {
         if (service.instance_id.empty()) {
             return "instance_id is required for vLLM";
         }
@@ -245,10 +245,10 @@ std::string ValidateServiceConfig(const common::ServiceConfig& service) {
                    RegistrationFromService(service))
             .error;
     }
-    if (service.type == common::kServiceTypeMooncake) {
+    if (service.publisher_kind == common::PublisherKind::kMooncake) {
         return prefixindex::ValidateHashProfile(ProfileFromService(service));
     }
-    return "unsupported service type: " + service.type;
+    return "unsupported publisher kind";
 }
 
 bool ParseJsonObject(coro_http_request& req, Json::Value* out,
@@ -407,9 +407,10 @@ bool ParseServiceConfigRequest(const Json::Value& body,
         "block_size",      "cache_group", "dp_rank",   "endpoint",
         "hash_profile",    "instance_id", "lora_name", "modelname",
         "replay_endpoint", "tenant_id",   "type"};
+    std::string publisher_type;
     if (!RejectUnknownFields(body, kAllowedFields, resp) ||
         !RequiredString(body, "endpoint", resp, &service->endpoint) ||
-        !RequiredString(body, "type", resp, &service->type) ||
+        !RequiredString(body, "type", resp, &publisher_type) ||
         !RequiredString(body, "modelname", resp, &service->model_name) ||
         !RequiredString(body, "instance_id", resp, &service->instance_id) ||
         !RequiredPositiveInt64(body, "block_size", resp,
@@ -424,6 +425,13 @@ bool ParseServiceConfigRequest(const Json::Value& body,
         !ParseHashProfileConfig(body, resp, &service->hash_profile)) {
         return false;
     }
+    const auto publisher_kind = common::ParsePublisherKind(publisher_type);
+    if (!publisher_kind.has_value()) {
+        HttpJsonError(resp, "invalid_value", "type must be vLLM or Mooncake",
+                      "type");
+        return false;
+    }
+    service->publisher_kind = *publisher_kind;
     if (service->tenant_id.empty()) {
         service->tenant_id = "default";
     }
@@ -476,7 +484,7 @@ Json::Value ServiceConfigToJson(const common::ServiceConfig& svc) {
     Json::Value out(Json::objectValue);
     out["Endpoint"] = svc.endpoint;
     out["ReplayEndpoint"] = svc.replay_endpoint;
-    out["Type"] = svc.type;
+    out["Type"] = std::string(common::PublisherKindName(svc.publisher_kind));
     out["ModelName"] = svc.model_name;
     out["LoraName"] = svc.lora_name;
     out["TenantID"] = svc.tenant_id;
@@ -540,7 +548,8 @@ void EventManager::Start() {
             }
             if (!result.second.empty()) {
                 LOG(ERROR) << "Failed to initiate subscription service_type="
-                           << svc.type << " instance_id=" << svc.instance_id
+                           << common::PublisherKindName(svc.publisher_kind)
+                           << " instance_id=" << svc.instance_id
                            << " endpoint=" << svc.endpoint
                            << " error=" << result.second;
                 failure_count.fetch_add(1);
@@ -561,9 +570,14 @@ void EventManager::Stop() {
     {
         std::unique_lock lock(mu_);
         if (stopped_) {
+            stop_cv_.wait(lock, [this] { return stop_complete_; });
             return;
         }
         stopped_ = true;
+        for (const auto& [unused_key, handler] : handlers_) {
+            (void)unused_key;
+            handler->MarkUnavailable();
+        }
     }
 
     LOG(INFO) << "Stopping Conductor KV Event Manager.....";
@@ -579,14 +593,29 @@ void EventManager::Stop() {
     // outside it — same deadlock rule as UnsubscribeFromService.
     std::vector<std::pair<std::string, std::shared_ptr<zmq::ZMQClient>>>
         clients;
+    std::vector<std::shared_ptr<KVEventHandler>> handlers;
     {
         std::unique_lock lock(mu_);
         clients.assign(subscribers_.begin(), subscribers_.end());
+        handlers.reserve(handlers_.size());
+        for (const auto& [unused_key, handler] : handlers_) {
+            (void)unused_key;
+            handlers.push_back(handler);
+        }
     }
     for (auto& [key, client] : clients) {
         client->Stop();
         LOG(INFO) << "Stopped all subscription service_key=" << key;
     }
+    for (const auto& handler : handlers) {
+        handler->WaitForIdle();
+    }
+
+    {
+        std::unique_lock lock(mu_);
+        stop_complete_ = true;
+    }
+    stop_cv_.notify_all();
 }
 
 std::pair<bool, std::string> EventManager::SubscribeToService(
@@ -607,6 +636,9 @@ std::pair<bool, std::string> EventManager::SubscribeToService(
     if (unregistering_.contains(svc_key)) {
         return {false, "service is being unregistered: " + svc_key};
     }
+    if (cleanup_quarantined_.contains(svc_key)) {
+        return {false, "service cleanup is quarantined: " + svc_key};
+    }
     if (auto existing = active_configs_.find(svc_key);
         existing != active_configs_.end()) {
         if (existing->second == svc) {
@@ -617,6 +649,11 @@ std::pair<bool, std::string> EventManager::SubscribeToService(
     if (subscribers_.contains(svc_key)) {
         return {false,
                 "inconsistent subscriber state for service key: " + svc_key};
+    }
+    if (auto endpoint = active_endpoints_.find(svc.endpoint);
+        endpoint != active_endpoints_.end()) {
+        return {false, "conflicting active registration for endpoint: " +
+                           svc.endpoint};
     }
 
     // Use ReplayEndpoint directly, fallback to empty if not provided
@@ -630,6 +667,7 @@ std::pair<bool, std::string> EventManager::SubscribeToService(
     zmq_config.endpoint = svc.endpoint;
     zmq_config.replay_endpoint = replay_endpoint;
     zmq_config.model_name = svc.model_name;
+    zmq_config.publisher_kind = svc.publisher_kind;
     zmq_config.poll_timeout = std::chrono::milliseconds(100);
     zmq_config.replay_timeout = std::chrono::seconds(5);
     zmq_config.reconnect_delay = std::chrono::seconds(1);
@@ -639,7 +677,7 @@ std::pair<bool, std::string> EventManager::SubscribeToService(
     }
 
     bool inserted_registration = false;
-    if (svc.type == common::kServiceTypeVLLM) {
+    if (svc.publisher_kind == common::PublisherKind::kVllm) {
         const auto registration_result =
             indexer_.Register(RegistrationFromService(svc));
         if (!registration_result.error.empty()) {
@@ -671,9 +709,12 @@ std::pair<bool, std::string> EventManager::SubscribeToService(
     }
 
     subscribers_[svc_key] = client;
+    handlers_[svc_key] = handler;
     active_configs_[svc_key] = svc;
+    active_endpoints_[svc.endpoint] = svc_key;
 
-    LOG(INFO) << "Successfully subscribed to service service_type=" << svc.type
+    LOG(INFO) << "Successfully subscribed to service publisher_kind="
+              << common::PublisherKindName(svc.publisher_kind)
               << " service_key=" << svc_key
               << " instance_id=" << svc.instance_id
               << " tenant_id=" << svc.tenant_id << " endpoint=" << svc.endpoint
@@ -687,6 +728,7 @@ std::pair<bool, std::string> EventManager::UnsubscribeFromService(
     const std::string svc_key = MakeServiceKey(instance_id, tenant_id, dp_rank);
 
     std::shared_ptr<zmq::ZMQClient> client;
+    std::shared_ptr<KVEventHandler> handler;
     common::ServiceConfig service;
     {
         std::unique_lock lock(mu_);
@@ -694,48 +736,71 @@ std::pair<bool, std::string> EventManager::UnsubscribeFromService(
             return {false, "service is already being unregistered: " + svc_key};
         }
         auto client_it = subscribers_.find(svc_key);
+        auto handler_it = handlers_.find(svc_key);
         auto config_it = active_configs_.find(svc_key);
-        if (client_it == subscribers_.end() ||
+        if (client_it == subscribers_.end() || handler_it == handlers_.end() ||
             config_it == active_configs_.end()) {
             return {false, "service not found: " + svc_key};
         }
         client = client_it->second;
+        handler = handler_it->second;
         service = config_it->second;
         // Keep the maps populated while Stop joins the event loop. This
         // reserves the key and prevents a replacement registration from being
         // removed by this in-flight unregister operation.
         unregistering_.insert(svc_key);
+        handler->MarkUnavailable();
     }
 
     // Stop the ZMQ client OUTSIDE mu_ to avoid deadlock:
-    // HandleEvent acquires mu_ (read). If the ZMQ event-loop thread is
-    // currently inside HandleEvent (or about to enter it), holding mu_
+    // HandleBatch acquires mu_ (read). If the ZMQ event-loop thread is
+    // currently inside HandleBatch (or about to enter it), holding mu_
     // while waiting for that thread to exit via client->Stop() -> join
     // would deadlock.
     client->Stop();
+    handler->WaitForIdle();
 
-    std::string index_error;
+    std::string index_error = handler->InvalidateEndpoint();
+    if (service.publisher_kind == common::PublisherKind::kVllm) {
+        const std::string unregister_error = indexer_.Unregister(
+            ContextFromService(service), service.instance_id, service.dp_rank);
+        if (index_error.empty()) {
+            index_error = unregister_error;
+        }
+    }
+    if (!index_error.empty()) {
+        std::unique_lock lock(mu_);
+        unregistering_.erase(svc_key);
+        cleanup_quarantined_.insert(svc_key);
+        LOG(ERROR) << "Endpoint cleanup quarantined service_key=" << svc_key
+                   << " endpoint=" << service.endpoint
+                   << " error=" << index_error;
+        return {true, index_error};
+    }
+
     {
         std::unique_lock lock(mu_);
-        if (service.type == common::kServiceTypeVLLM) {
-            index_error =
-                indexer_.Unregister(ContextFromService(service),
-                                    service.instance_id, service.dp_rank);
-        }
         subscribers_.erase(svc_key);
+        handlers_.erase(svc_key);
         active_configs_.erase(svc_key);
+        if (auto endpoint = active_endpoints_.find(service.endpoint);
+            endpoint != active_endpoints_.end() &&
+            endpoint->second == svc_key) {
+            active_endpoints_.erase(endpoint);
+        }
         if (auto service_it =
                 std::find(services_.begin(), services_.end(), service);
             service_it != services_.end()) {
             services_.erase(service_it);
         }
         unregistering_.erase(svc_key);
+        cleanup_quarantined_.erase(svc_key);
     }
 
     LOG(INFO) << "Successfully unsubscribed from service service_key="
               << svc_key << " instance_id=" << instance_id
               << " tenant_id=" << tenant_id;
-    return {true, index_error};
+    return {true, ""};
 }
 
 void EventManager::RegisterHttpHandlers() {

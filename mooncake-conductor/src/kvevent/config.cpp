@@ -23,19 +23,6 @@ std::string DefaultConductorConfigPath() {
     return std::string(home) + "/.mooncake/conductor_config.json";
 }
 
-// Service type mapping: only "vLLM" and "Mooncake" are valid.
-bool MapServiceType(const std::string& s, std::string* out) {
-    if (s == "vLLM") {
-        *out = common::kServiceTypeVLLM;
-        return true;
-    }
-    if (s == "Mooncake") {
-        *out = common::kServiceTypeMooncake;
-        return true;
-    }
-    return false;
-}
-
 std::string JsonString(const Json::Value& obj, const char* key) {
     if (obj.isMember(key) && obj[key].isString()) {
         return obj[key].asString();
@@ -134,8 +121,9 @@ std::vector<common::ServiceConfig> ParseConfig(int* http_server_port) {
                 continue;
             }
 
-            std::string service_type;
-            if (!MapServiceType(JsonString(raw, "type"), &service_type)) {
+            const auto publisher_kind =
+                common::ParsePublisherKind(JsonString(raw, "type"));
+            if (!publisher_kind.has_value()) {
                 LOG(ERROR) << "Unknown service type type="
                            << JsonString(raw, "type");
                 continue;
@@ -144,7 +132,7 @@ std::vector<common::ServiceConfig> ParseConfig(int* http_server_port) {
             common::ServiceConfig svc;
             svc.endpoint = JsonString(raw, "endpoint");
             svc.replay_endpoint = JsonString(raw, "replay_endpoint");
-            svc.type = service_type;
+            svc.publisher_kind = *publisher_kind;
             svc.model_name = JsonString(raw, "modelname");
             if (raw.isMember("lora_name") && !raw["lora_name"].isString()) {
                 LOG(ERROR) << "Invalid lora_name stream_key=" << name;
