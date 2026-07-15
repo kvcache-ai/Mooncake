@@ -2333,6 +2333,17 @@ Status TransferEngineImpl::progressBatch(BatchID batch_id,
     return getBatchStatus(batch_id, overall_status, true);
 }
 
+Status TransferEngineImpl::getNicLoadStats(
+    std::vector<NicLoadStats>& stats) const {
+    stats.clear();
+    for (const auto& transport : transport_list_) {
+        if (transport) {
+            CHECK_STATUS(transport->getNicLoadStats(stats));
+        }
+    }
+    return Status::OK();
+}
+
 void TransferEngineImpl::notifyBatchMaybeReady(BatchID batch_id) {
     if (progress_worker_) progress_worker_->notifyBatchMaybeReady(batch_id);
 }
