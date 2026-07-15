@@ -2925,6 +2925,111 @@ PYBIND11_MODULE(store, m) {
             "multiple "
             "keys")
         .def(
+            "batch_get_session_start",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys) {
+                if (!self.is_client_initialized()) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return std::vector<int>{};
+                }
+                py::gil_scoped_release release;
+                return self.store_->batch_get_session_start(keys);
+            },
+            py::arg("keys"),
+            "Start a get session: query replicas once and cache them")
+        .def(
+            "batch_get_into_multi_buffer_ranges",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys,
+               const std::vector<std::vector<uintptr_t>> &all_buffer_ptrs,
+               const std::vector<std::vector<size_t>> &all_sizes,
+               const std::vector<std::vector<size_t>> &all_src_offsets) {
+                if (!self.is_client_initialized()) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return std::vector<int>{};
+                }
+                py::gil_scoped_release release;
+                return self.store_->batch_get_into_multi_buffer_ranges(
+                    keys, CastAddrs2Ptrs(all_buffer_ptrs), all_sizes,
+                    all_src_offsets);
+            },
+            py::arg("keys"), py::arg("all_buffer_ptrs"), py::arg("all_sizes"),
+            py::arg("all_src_offsets"),
+            "Ranged get into multiple buffers using a get session")
+        .def(
+            "batch_get_session_end",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys) {
+                if (!self.is_client_initialized()) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return -1;
+                }
+                py::gil_scoped_release release;
+                return self.store_->batch_get_session_end(keys);
+            },
+            py::arg("keys"),
+            "End a get session and drop cached replica metadata")
+        .def(
+            "batch_put_session_start",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys,
+               const std::vector<size_t> &sizes,
+               const ReplicateConfig &config = ReplicateConfig{}) {
+                if (!self.is_client_initialized()) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return std::vector<int>{};
+                }
+                py::gil_scoped_release release;
+                return self.store_->batch_put_session_start(keys, sizes,
+                                                            config);
+            },
+            py::arg("keys"), py::arg("sizes"),
+            py::arg("config") = ReplicateConfig{},
+            "Start a put session: reserve objects without transfer")
+        .def(
+            "batch_put_from_multi_buffer_ranges",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys,
+               const std::vector<std::vector<uintptr_t>> &all_buffer_ptrs,
+               const std::vector<std::vector<size_t>> &all_sizes,
+               const std::vector<std::vector<size_t>> &all_dst_offsets) {
+                if (!self.is_client_initialized()) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return std::vector<int>{};
+                }
+                py::gil_scoped_release release;
+                return self.store_->batch_put_from_multi_buffer_ranges(
+                    keys, CastAddrs2Ptrs(all_buffer_ptrs), all_sizes,
+                    all_dst_offsets);
+            },
+            py::arg("keys"), py::arg("all_buffer_ptrs"), py::arg("all_sizes"),
+            py::arg("all_dst_offsets"),
+            "Ranged put from multiple buffers using a put session")
+        .def(
+            "batch_put_session_end",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys) {
+                if (!self.is_client_initialized()) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return std::vector<int>{};
+                }
+                py::gil_scoped_release release;
+                return self.store_->batch_put_session_end(keys);
+            },
+            py::arg("keys"), "Complete a put session and make objects readable")
+        .def(
+            "batch_put_session_revoke",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys) {
+                if (!self.is_client_initialized()) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return std::vector<int>{};
+                }
+                py::gil_scoped_release release;
+                return self.store_->batch_put_session_revoke(keys);
+            },
+            py::arg("keys"), "Revoke an incomplete put session")
+        .def(
             "get_replica_desc",
             [](MooncakeStorePyWrapper &self, const std::string &key) {
                 py::gil_scoped_release release;

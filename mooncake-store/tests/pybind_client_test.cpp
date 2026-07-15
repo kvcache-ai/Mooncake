@@ -805,6 +805,326 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffers) {
         << "Dst data buffer unregistration should succeed";
 }
 
+TEST_F(RealClientTest, TestPutGetSessionRanges) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17814", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    constexpr size_t kNumLayers = 4;
+    constexpr size_t kPageSize = 64;
+    constexpr size_t kObjectSize = kPageSize * kNumLayers;
+    constexpr size_t kNumKeys = 3;
+
+    std::string src_data(kObjectSize * kNumKeys, 'A');
+    std::string dst_data(kObjectSize * kNumKeys, 'B');
+    for (size_t i = 0; i < src_data.size(); ++i) {
+        src_data[i] = static_cast<char>('a' + (i % 26));
+    }
+
+    ASSERT_EQ(py_client_->register_buffer(src_data.data(), src_data.size()), 0);
+    ASSERT_EQ(py_client_->register_buffer(dst_data.data(), dst_data.size()), 0);
+
+    std::vector<std::string> keys;
+    std::vector<size_t> object_sizes;
+    keys.reserve(kNumKeys);
+    object_sizes.reserve(kNumKeys);
+    for (size_t i = 0; i < kNumKeys; ++i) {
+        keys.push_back("session_key_" + std::to_string(i));
+        object_sizes.push_back(kObjectSize);
+    }
+
+    auto put_start_rcs =
+        py_client_->batch_put_session_start(keys, object_sizes);
+    ASSERT_EQ(put_start_rcs.size(), kNumKeys);
+    for (auto rc : put_start_rcs) {
+        EXPECT_EQ(rc, 0) << "batch_put_session_start should succeed";
+    }
+
+    for (size_t layer = 0; layer < kNumLayers; ++layer) {
+        std::vector<std::vector<void*>> all_buffers(kNumKeys);
+        std::vector<std::vector<size_t>> all_sizes(kNumKeys);
+        std::vector<std::vector<size_t>> all_dst_offsets(kNumKeys);
+        for (size_t i = 0; i < kNumKeys; ++i) {
+            char* layer_ptr =
+                src_data.data() + i * kObjectSize + layer * kPageSize;
+            all_buffers[i] = {layer_ptr};
+            all_sizes[i] = {kPageSize};
+            all_dst_offsets[i] = {layer * kPageSize};
+        }
+        auto put_rcs = py_client_->batch_put_from_multi_buffer_ranges(
+            keys, all_buffers, all_sizes, all_dst_offsets);
+        ASSERT_EQ(put_rcs.size(), kNumKeys);
+        for (auto rc : put_rcs) {
+            EXPECT_EQ(rc, static_cast<int>(kPageSize));
+        }
+    }
+
+    auto put_end_rcs = py_client_->batch_put_session_end(keys);
+    ASSERT_EQ(put_end_rcs.size(), kNumKeys);
+    for (auto rc : put_end_rcs) {
+        EXPECT_EQ(rc, 0) << "batch_put_session_end should succeed";
+    }
+
+    auto get_start_rcs = py_client_->batch_get_session_start(keys);
+    ASSERT_EQ(get_start_rcs.size(), kNumKeys);
+    for (auto rc : get_start_rcs) {
+        EXPECT_EQ(rc, 0) << "batch_get_session_start should succeed";
+    }
+
+    for (size_t layer = 0; layer < kNumLayers; ++layer) {
+        std::vector<std::vector<void*>> all_buffers(kNumKeys);
+        std::vector<std::vector<size_t>> all_sizes(kNumKeys);
+        std::vector<std::vector<size_t>> all_src_offsets(kNumKeys);
+        for (size_t i = 0; i < kNumKeys; ++i) {
+            char* layer_ptr =
+                dst_data.data() + i * kObjectSize + layer * kPageSize;
+            all_buffers[i] = {layer_ptr};
+            all_sizes[i] = {kPageSize};
+            all_src_offsets[i] = {layer * kPageSize};
+        }
+        auto get_rcs = py_client_->batch_get_into_multi_buffer_ranges(
+            keys, all_buffers, all_sizes, all_src_offsets);
+        ASSERT_EQ(get_rcs.size(), kNumKeys);
+        for (auto rc : get_rcs) {
+            EXPECT_EQ(rc, static_cast<int>(kPageSize));
+        }
+    }
+
+    EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
+    EXPECT_EQ(dst_data, src_data);
+
+    // Revoke path: start then revoke without end.
+    std::vector<std::string> revoke_keys = {"session_revoke_0"};
+    std::vector<size_t> revoke_sizes = {kObjectSize};
+    auto revoke_start =
+        py_client_->batch_put_session_start(revoke_keys, revoke_sizes);
+    ASSERT_EQ(revoke_start.size(), 1);
+    EXPECT_EQ(revoke_start[0], 0);
+    auto revoke_rcs = py_client_->batch_put_session_revoke(revoke_keys);
+    ASSERT_EQ(revoke_rcs.size(), 1);
+    EXPECT_EQ(revoke_rcs[0], 0);
+    auto missing = py_client_->batch_get_session_start(revoke_keys);
+    ASSERT_EQ(missing.size(), 1);
+    EXPECT_LT(missing[0], 0);
+
+    ASSERT_EQ(py_client_->unregister_buffer(src_data.data()), 0);
+    ASSERT_EQ(py_client_->unregister_buffer(dst_data.data()), 0);
+}
+
+// Abnormal put/get session cases. See check table in PR / review notes.
+TEST_F(RealClientTest, TestPutGetSessionAbnormal) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17815", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    constexpr size_t kPage = 64;
+    constexpr size_t kObjectSize = kPage * 2;
+    const int kInvalidParams =
+        static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+
+    std::string buf(kObjectSize, 'x');
+    ASSERT_EQ(py_client_->register_buffer(buf.data(), buf.size()), 0);
+
+    // --- Put: ranges/end/revoke without start ---
+    {
+        std::vector<std::string> keys = {"no_put_session"};
+        auto ranges = py_client_->batch_put_from_multi_buffer_ranges(
+            keys, {{buf.data()}}, {{kPage}}, {{0}});
+        ASSERT_EQ(ranges.size(), 1);
+        EXPECT_EQ(ranges[0], kInvalidParams);
+
+        auto end_rcs = py_client_->batch_put_session_end(keys);
+        ASSERT_EQ(end_rcs.size(), 1);
+        EXPECT_EQ(end_rcs[0], kInvalidParams);
+
+        auto revoke_rcs = py_client_->batch_put_session_revoke(keys);
+        ASSERT_EQ(revoke_rcs.size(), 1);
+        EXPECT_EQ(revoke_rcs[0], kInvalidParams);
+    }
+
+    // --- Put: keys/sizes mismatch ---
+    {
+        auto rcs =
+            py_client_->batch_put_session_start({"a", "b"}, {kObjectSize});
+        ASSERT_EQ(rcs.size(), 2);
+        EXPECT_EQ(rcs[0], kInvalidParams);
+        EXPECT_EQ(rcs[1], kInvalidParams);
+    }
+
+    // --- Put: duplicate start ---
+    {
+        std::vector<std::string> keys = {"dup_put"};
+        auto first = py_client_->batch_put_session_start(keys, {kObjectSize});
+        ASSERT_EQ(first.size(), 1);
+        EXPECT_EQ(first[0], 0);
+        auto second = py_client_->batch_put_session_start(keys, {kObjectSize});
+        ASSERT_EQ(second.size(), 1);
+        EXPECT_EQ(second[0], kInvalidParams);
+        EXPECT_EQ(py_client_->batch_put_session_revoke(keys)[0], 0);
+    }
+
+    // --- Put: range overflow past object_size ---
+    {
+        std::vector<std::string> keys = {"overflow_put"};
+        ASSERT_EQ(py_client_->batch_put_session_start(keys, {kObjectSize})[0],
+                  0);
+        auto overflow = py_client_->batch_put_from_multi_buffer_ranges(
+            keys, {{buf.data()}}, {{kPage}},
+            {{kObjectSize}});  // offset == size
+        ASSERT_EQ(overflow.size(), 1);
+        EXPECT_EQ(overflow[0], kInvalidParams);
+        EXPECT_EQ(py_client_->batch_put_session_revoke(keys)[0], 0);
+    }
+
+    // --- Put: buffer/size/offset arity mismatch ---
+    {
+        std::vector<std::string> keys = {"arity_put"};
+        ASSERT_EQ(py_client_->batch_put_session_start(keys, {kObjectSize})[0],
+                  0);
+        auto bad = py_client_->batch_put_from_multi_buffer_ranges(
+            keys, {{buf.data(), buf.data() + kPage}}, {{kPage}}, {{0}});
+        ASSERT_EQ(bad.size(), 1);
+        EXPECT_EQ(bad[0], kInvalidParams);
+        EXPECT_EQ(py_client_->batch_put_session_revoke(keys)[0], 0);
+    }
+
+    // --- Put: end clears session; second end fails ---
+    {
+        std::vector<std::string> keys = {"put_end_once"};
+        ASSERT_EQ(py_client_->batch_put_session_start(keys, {kObjectSize})[0],
+                  0);
+        ASSERT_EQ(py_client_->batch_put_from_multi_buffer_ranges(
+                      keys, {{buf.data()}}, {{kObjectSize}}, {{0}})[0],
+                  static_cast<int>(kObjectSize));
+        EXPECT_EQ(py_client_->batch_put_session_end(keys)[0], 0);
+        EXPECT_EQ(py_client_->batch_put_session_end(keys)[0], kInvalidParams);
+        // ranges after end also fail
+        EXPECT_EQ(py_client_->batch_put_from_multi_buffer_ranges(
+                      keys, {{buf.data()}}, {{kPage}}, {{0}})[0],
+                  kInvalidParams);
+    }
+
+    // --- Get: ranges without start ---
+    {
+        std::vector<std::string> keys = {"no_get_session"};
+        auto ranges = py_client_->batch_get_into_multi_buffer_ranges(
+            keys, {{buf.data()}}, {{kPage}}, {{0}});
+        ASSERT_EQ(ranges.size(), 1);
+        EXPECT_EQ(ranges[0], kInvalidParams);
+    }
+
+    // --- Get: start on missing object ---
+    {
+        auto rcs = py_client_->batch_get_session_start({"missing_obj"});
+        ASSERT_EQ(rcs.size(), 1);
+        EXPECT_LT(rcs[0], 0);
+    }
+
+    // --- Get: end clears session; ranges after end fail ---
+    {
+        std::vector<std::string> keys = {"put_end_once"};  // exists from above
+        auto start = py_client_->batch_get_session_start(keys);
+        ASSERT_EQ(start.size(), 1);
+        EXPECT_EQ(start[0], 0);
+        EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
+        auto after_end = py_client_->batch_get_into_multi_buffer_ranges(
+            keys, {{buf.data()}}, {{kPage}}, {{0}});
+        ASSERT_EQ(after_end.size(), 1);
+        EXPECT_EQ(after_end[0], kInvalidParams);
+    }
+
+    // --- Get: arity mismatch while session exists ---
+    {
+        std::vector<std::string> keys = {"put_end_once"};
+        ASSERT_EQ(py_client_->batch_get_session_start(keys)[0], 0);
+        auto bad = py_client_->batch_get_into_multi_buffer_ranges(
+            keys, {{buf.data()}}, {{kPage, kPage}}, {{0}});
+        ASSERT_EQ(bad.size(), 1);
+        EXPECT_EQ(bad[0], kInvalidParams);
+        EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
+    }
+
+    ASSERT_EQ(py_client_->unregister_buffer(buf.data()), 0);
+}
+
+// Lease expire on get ranges must drop the cached get session.
+TEST_F(RealClientTest, TestGetSessionLeaseExpiredDropsSession) {
+    constexpr uint64_t kLeaseTtlMs = 50;
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_default_kv_lease_ttl(kLeaseTtlMs)
+                                  .build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17816", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    constexpr size_t kSize = 128;
+    const int kLeaseExpired = static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
+    const int kInvalidParams =
+        static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+
+    std::string src(kSize, 'S');
+    std::string dst(kSize, 'D');
+    ASSERT_EQ(py_client_->register_buffer(src.data(), src.size()), 0);
+    ASSERT_EQ(py_client_->register_buffer(dst.data(), dst.size()), 0);
+
+    std::vector<std::string> keys = {"lease_session_key"};
+    ASSERT_EQ(py_client_->batch_put_session_start(keys, {kSize})[0], 0);
+    ASSERT_EQ(py_client_->batch_put_from_multi_buffer_ranges(
+                  keys, {{src.data()}}, {{kSize}}, {{0}})[0],
+              static_cast<int>(kSize));
+    ASSERT_EQ(py_client_->batch_put_session_end(keys)[0], 0);
+
+    ASSERT_EQ(py_client_->batch_get_session_start(keys)[0], 0);
+
+    // Wait past cached lease_deadline (client-local check; no Master query).
+    std::this_thread::sleep_for(std::chrono::milliseconds(kLeaseTtlMs + 50));
+
+    auto expired = py_client_->batch_get_into_multi_buffer_ranges(
+        keys, {{dst.data()}}, {{kSize}}, {{0}});
+    ASSERT_EQ(expired.size(), 1);
+    EXPECT_EQ(expired[0], kLeaseExpired)
+        << "get ranges after lease ttl should return LEASE_EXPIRED";
+
+    // Session must have been erased: next ranges sees no session.
+    auto again = py_client_->batch_get_into_multi_buffer_ranges(
+        keys, {{dst.data()}}, {{kSize}}, {{0}});
+    ASSERT_EQ(again.size(), 1);
+    EXPECT_EQ(again[0], kInvalidParams)
+        << "get session should be dropped after LEASE_EXPIRED";
+
+    // get_end is still safe (idempotent erase).
+    EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
+
+    ASSERT_EQ(py_client_->unregister_buffer(src.data()), 0);
+    ASSERT_EQ(py_client_->unregister_buffer(dst.data()), 0);
+}
+
 TEST_F(RealClientTest, TestBatchAndNormalGetReplicaDesc) {
     // Start in-proc master
     ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))

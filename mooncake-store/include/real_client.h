@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <boost/lockfree/queue.hpp>
+#include <chrono>
 #include <csignal>
 #include <map>
 #include <memory>
@@ -241,6 +242,33 @@ class RealClient : public PyClient {
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
         const ReplicateConfig &config = ReplicateConfig{});
+
+    std::vector<int> batch_get_session_start(
+        const std::vector<std::string> &keys) override;
+
+    std::vector<int> batch_get_into_multi_buffer_ranges(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const std::vector<std::vector<size_t>> &all_src_offsets) override;
+
+    int batch_get_session_end(const std::vector<std::string> &keys) override;
+
+    std::vector<int> batch_put_session_start(
+        const std::vector<std::string> &keys, const std::vector<size_t> &sizes,
+        const ReplicateConfig &config = ReplicateConfig{}) override;
+
+    std::vector<int> batch_put_from_multi_buffer_ranges(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const std::vector<std::vector<size_t>> &all_dst_offsets) override;
+
+    std::vector<int> batch_put_session_end(
+        const std::vector<std::string> &keys) override;
+
+    std::vector<int> batch_put_session_revoke(
+        const std::vector<std::string> &keys) override;
 
     int put_parts(const std::string &key,
                   std::vector<std::span<const char>> values,
@@ -854,6 +882,17 @@ class RealClient : public PyClient {
     mutable std::shared_mutex registered_buffer_mutex_;
     std::unordered_map<void *, size_t> registered_buffer_sizes_;
     std::optional<WritableBufferRegion> local_buffer_region_;
+
+    // KV transfer sessions (process-local; not shared with DummyClient).
+    // get_sessions_ stores a FilterQueryResult'd QueryResult (single complete
+    // memory replica + lease); ranges only compare lease locally (no Master).
+    struct PutSessionEntry {
+        std::vector<Replica::Descriptor> replicas;
+        uint64_t object_size{0};
+    };
+    mutable std::mutex session_mutex_;
+    std::unordered_map<std::string, QueryResult> get_sessions_;
+    std::unordered_map<std::string, PutSessionEntry> put_sessions_;
 
     // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.
     bool map_dummy_range_in_shm(const MappedShm &shm, uint64_t dummy_addr,

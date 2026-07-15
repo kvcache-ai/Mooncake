@@ -31,6 +31,7 @@
 namespace mooncake {
 
 class PutOperation;
+class RealClient;
 
 /**
  * @brief Result of a query operation containing replica information and lease
@@ -214,6 +215,36 @@ class Client {
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
         const ReplicateConfig& config);
+
+    /**
+     * @brief Write slices into a memory replica at an object-byte offset.
+     */
+    ErrorCode TransferWriteRange(const Replica::Descriptor& replica_descriptor,
+                                 std::vector<Slice>& slices,
+                                 uint64_t dst_offset);
+
+    /**
+     * @brief Batch ranged read against cached replicas. For each entry,
+     * submits every (slice, src_offset) fragment against its replica, then
+     * awaits all in parallel. Returns per-entry total bytes transferred or
+     * an ErrorCode. Used by RealClient get sessions; TransferFuture stays
+     * internal. No Master RPC.
+     */
+    std::vector<tl::expected<int64_t, ErrorCode>> BatchTransferReadRanges(
+        const std::vector<Replica::Descriptor>& replicas,
+        const std::vector<std::vector<Slice>>& slices,
+        const std::vector<std::vector<uint64_t>>& src_offsets);
+
+    /**
+     * @brief Batch ranged write into cached replicas (replication). For each
+     * entry, submits every fragment to every memory replica, then awaits all.
+     * Returns per-entry logical bytes transferred (counted once, not per
+     * replica) or an ErrorCode. Used by RealClient put sessions.
+     */
+    std::vector<tl::expected<int64_t, ErrorCode>> BatchTransferWriteRanges(
+        const std::vector<std::vector<Replica::Descriptor>>& replicas_per_entry,
+        const std::vector<std::vector<Slice>>& slices,
+        const std::vector<std::vector<uint64_t>>& dst_offsets);
 
     /**
      * @brief Upserts data: inserts if key doesn't exist, updates if it does
@@ -649,6 +680,23 @@ class Client {
 
     bool IsReplicaOnLocalMemory(const Replica::Descriptor& replica);
 
+    // First half of BatchPut only (size-only slices → StartBatchPut).
+    // Used by RealClient put sessions; not a Master API facade.
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    StartBatchPutForSizes(const std::vector<std::string>& keys,
+                          const std::vector<uint64_t>& object_sizes,
+                          const ReplicateConfig& config);
+
+    // Finalize/revoke a put session for a batch of keys. Thin wrappers over
+    // the master client, exposed so RealClient put sessions can end/revoke
+    // without touching Client internals. Same RPC path as FinalizeBatchPut.
+    std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
+        const std::vector<std::string>& keys,
+        ReplicaType replica_type = ReplicaType::ALL);
+    std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
+        const std::vector<std::string>& keys,
+        ReplicaType replica_type = ReplicaType::ALL);
+
    protected:
     /**
      * @brief Constructor exposed to subclasses for testing only; production
@@ -675,6 +723,15 @@ class Client {
     ErrorCode TransferReadInternal(
         const Replica::Descriptor& replica_descriptor,
         std::vector<Slice>& slices, uint64_t src_offset);
+    // Internal async range submission helpers (return the transfer future).
+    // Used by the synchronous TransferReadRange/WriteRange and the batch
+    // range transfer methods; not part of the public API.
+    std::optional<TransferFuture> SubmitRangeRead(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices, uint64_t src_offset);
+    std::optional<TransferFuture> SubmitRangeWrite(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices, uint64_t dst_offset);
     ErrorCode TransferWrite(const Replica::Descriptor& replica_descriptor,
                             std::vector<Slice>& slices);
     ErrorCode TransferRead(const Replica::Descriptor& replica_descriptor,
