@@ -5,6 +5,7 @@
 
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <ranges>
 #include <thread>
 #include <atomic>
@@ -3078,6 +3079,68 @@ TEST_F(StorageBackendTest, BucketWatermarkEvictionUsesHandlerAndKeepsNewest) {
     EXPECT_FALSE(oldest_exists.value());
 
     auto newest_exists = storage_backend.IsExist("bucket_key_2");
+    ASSERT_TRUE(newest_exists.has_value());
+    EXPECT_TRUE(newest_exists.value());
+}
+
+TEST_F(StorageBackendTest,
+       BucketWatermarkEvictionDoesNotOverEvictForSharedDisk) {
+    std::error_code ec;
+    auto space_info = fs::space(data_path, ec);
+    ASSERT_FALSE(ec);
+    constexpr uint64_t kMinFreeSpace = 256ULL * 1024 * 1024;
+    if (space_info.available <= kMinFreeSpace) {
+        GTEST_SKIP() << "Need more than 256MB free space to isolate the "
+                        "synthetic-size check";
+    }
+    if (space_info.available >
+        static_cast<uint64_t>(std::numeric_limits<int64_t>::max() / 2)) {
+        GTEST_SKIP() << "Filesystem is too large for this synthetic quota test";
+    }
+
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 10;
+    bucket_config.bucket_size_limit = 8 * 1024;
+    bucket_config.max_total_size =
+        static_cast<int64_t>(space_info.available * 2);
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    std::vector<std::unique_ptr<char[]>> buffers;
+    for (int i = 0; i < 3; ++i) {
+        const std::string key = "shared_disk_bucket_key_" + std::to_string(i);
+        auto buffer = std::make_unique<char[]>(6 * 1024);
+        std::memset(buffer.get(), static_cast<int>('A' + i), 6 * 1024);
+        std::unordered_map<std::string, std::vector<Slice>> batch;
+        batch.emplace(key, std::vector<Slice>{Slice{buffer.get(), 6 * 1024}});
+        buffers.push_back(std::move(buffer));
+
+        auto result = storage_backend.BatchOffload(
+            batch,
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+        ASSERT_TRUE(result.has_value());
+    }
+
+    constexpr int64_t kHighWatermarkBytes = 14 * 1024;
+    constexpr int64_t kLowWatermarkBytes = 12 * 1024;
+    auto evict_result = storage_backend.EvictAboveDiskWatermark(
+        static_cast<double>(kHighWatermarkBytes) / bucket_config.max_total_size,
+        static_cast<double>(kLowWatermarkBytes) / bucket_config.max_total_size,
+        [](const std::vector<std::string>&) {
+            return tl::expected<void, ErrorCode>{};
+        });
+
+    ASSERT_TRUE(evict_result.has_value());
+    EXPECT_FALSE(evict_result.value().empty());
+    EXPECT_LT(evict_result.value().size(), 3);
+
+    auto newest_exists = storage_backend.IsExist("shared_disk_bucket_key_2");
     ASSERT_TRUE(newest_exists.has_value());
     EXPECT_TRUE(newest_exists.value());
 }

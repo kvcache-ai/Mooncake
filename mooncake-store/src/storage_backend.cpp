@@ -2761,16 +2761,19 @@ BucketStorageBackend::PrepareEviction(
         if (!ec) {
             uint64_t actual_available = space_info.available;
             constexpr uint64_t kMinFreeSpace = 256 * kMB;
-            uint64_t req_sz =
-                required_size > 0 ? static_cast<uint64_t>(required_size) : 0;
+            // Watermark eviction passes a synthetic required_size to drive
+            // quota-based cleanup. It is not a real incoming write, so it
+            // should not be counted as physical disk free-space demand.
+            uint64_t req_sz = (!write_keys.empty() && required_size > 0)
+                                  ? static_cast<uint64_t>(required_size)
+                                  : 0;
             initial_disk_full = actual_available < req_sz + kMinFreeSpace;
             if (initial_disk_full) {
                 deficit = req_sz + kMinFreeSpace - actual_available;
-                LOG(WARNING)
-                    << "[Evict] Actual disk space too low: available="
-                    << actual_available << ", required=" << required_size
-                    << ", deficit=" << deficit
-                    << ". Will evict buckets to free space.";
+                LOG(WARNING) << "[Evict] Actual disk space too low: available="
+                             << actual_available << ", required=" << req_sz
+                             << ", deficit=" << deficit
+                             << ". Will evict buckets to free space.";
             }
         } else {
             LOG(WARNING) << "[Evict] Failed to get disk space info for "
