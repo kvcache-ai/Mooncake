@@ -695,6 +695,10 @@ std::string Topology::toString() const {
     return value.toStyledString();
 }
 
+bool Topology::operator==(const Topology &other) const {
+    return matrix_ == other.matrix_ && hca_list_ == other.hca_list_;
+}
+
 Json::Value Topology::toJson() const {
     Json::Value root;
     for (const auto &pair : matrix_) {

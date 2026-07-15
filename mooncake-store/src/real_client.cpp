@@ -12,6 +12,7 @@
 #include <cstdlib>  // for atexit
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <functional>
 #include <limits>
 #include <optional>
@@ -19,6 +20,7 @@
 
 #include "real_client.h"
 #include "client_buffer.h"
+#include "replica_selection.h"
 #include "common.h"
 #include "config.h"
 #include "mutex.h"
@@ -277,46 +279,21 @@ inline tl::expected<void, ErrorCode> scatter_host_to_maybe_device(
     return {};
 }
 
-// Select the best replica from a list: prefer local MEMORY, then any
-// MEMORY, then LOCAL_DISK, then DISK.  Master may return replicas in any
-// order, so we always scan.
-inline const Replica::Descriptor *SelectBestReplica(
-    const std::vector<Replica::Descriptor> &replicas,
-    const std::unordered_set<std::string> &local_endpoints) {
-    const Replica::Descriptor *first_memory = nullptr;
-    const Replica::Descriptor *first_nof = nullptr;
-    for (const auto &r : replicas) {
-        if (r.status != ReplicaStatus::COMPLETE) continue;
-        if (r.is_memory_replica()) {
-            if (local_endpoints.count(
-                    r.get_memory_descriptor()
-                        .buffer_descriptor.transport_endpoint_)) {
-                return &r;  // local MEMORY — best case
-            }
-            if (!first_memory) first_memory = &r;
-        } else if (r.is_nof_replica()) {
-            if (local_endpoints.count(
-                    r.get_nof_descriptor()
-                        .buffer_descriptor.transport_endpoint_)) {
-                return &r;  // local NOF_SSD — also good
-            }
-            if (!first_nof) first_nof = &r;
-        }
+// Gather memory that may be GPU or host into a host destination.
+inline tl::expected<void, ErrorCode> gather_maybe_device_to_host(
+    void *dst, const void *src, size_t size, const std::string &context) {
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
+    if (!runtime_accelerator.CopyToHost(dst, src, size)) {
+        LOG(ERROR) << "D2H copy failed: " << context;
+        return tl::unexpected(ErrorCode::TRANSFER_FAIL);
     }
-    if (first_memory) return first_memory;
-    if (first_nof) return first_nof;
-
-    const Replica::Descriptor *best = nullptr;
-    for (const auto &r : replicas) {
-        if (r.status != ReplicaStatus::COMPLETE) continue;
-        if (r.is_local_disk_replica()) {
-            best = &r;  // LOCAL_DISK always overrides DISK
-        } else if (r.is_disk_replica() && !best) {
-            best = &r;
-        }
-    }
-    return best;
+    return {};
 }
+
+// SelectBestReplica and the replica-scoring helpers live in
+// replica_selection.h (included above) so they can be unit-tested directly.
+using mooncake::SelectBestReplica;
 
 // Build a QueryResult containing only the chosen replica so that
 // Client::Get / Client::BatchGet (which internally call
@@ -626,7 +603,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::shared_ptr<TransferEngine> &transfer_engine,
     const std::string &ipc_socket_path, int local_rpc_port,
     bool enable_ssd_offload, bool start_offload_rpc_server,
-    const std::string &ssd_offload_path, const std::string &tenant_id) {
+    const std::string &ssd_offload_path, const std::string &tenant_id,
+    bool enable_client_http_server, int client_http_port) {
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
     const bool should_use_hugepage =
@@ -816,6 +794,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             }
         }
 
+        const bool parallel_hugetlb_population =
+            protocol == "rdma" && should_use_hugepage;
+
         while (global_segment_size > 0) {
             size_t segment_size = std::min(global_segment_size, max_mr_size);
             global_segment_size -= segment_size;
@@ -841,7 +822,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 mapped_size =
                     align_up(segment_size, get_hugepage_size_from_env());
                 ptr = allocate_buffer_mmap_memory(mapped_size,
-                                                  get_hugepage_size_from_env());
+                                                  get_hugepage_size_from_env(),
+                                                  parallel_hugetlb_population);
             } else {
                 ptr = allocate_buffer_allocator_memory(segment_size,
                                                        this->protocol);
@@ -874,6 +856,19 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             } else {
                 segment_ptrs_.emplace_back(ptr);
             }
+
+            // Populate HugeTLB pages in parallel immediately before transfer-
+            // engine registration. NUMA mappings use node-local workers for
+            // each mbind region; direct mappings use the generic worker pool.
+            if (parallel_hugetlb_population) {
+                if (!seg_numa_nodes.empty()) {
+                    populate_hugetlb_numa_mapping(ptr, mapped_size,
+                                                  seg_numa_nodes);
+                } else if (!is_mmap_arena_allocation(ptr)) {
+                    populate_hugetlb_mapping(ptr, mapped_size);
+                }
+            }
+
             auto mount_result =
                 client_->MountSegment(ptr, mapped_size, protocol, seg_location);
             if (!mount_result.has_value()) {
@@ -935,10 +930,20 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
     }
     client_requester_ = std::make_shared<ClientRequester>();
-    if (FLAGS_enable_http_server) {
-        if (start_http_server() != 0) {
-            LOG(ERROR) << "Failed to start HTTP server on port "
-                       << FLAGS_http_port;
+    const bool should_start_http_server =
+        enable_client_http_server || FLAGS_enable_http_server;
+    const int selected_http_port =
+        enable_client_http_server ? client_http_port : FLAGS_http_port;
+    if (should_start_http_server) {
+        if (selected_http_port <= 0 || selected_http_port > 65535) {
+            LOG(ERROR) << "Invalid client HTTP server port: "
+                       << selected_http_port;
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (start_http_server(selected_http_port) != 0) {
+            LOG(WARNING) << "Failed to start client HTTP server on port "
+                         << selected_http_port
+                         << "; continuing without HTTP endpoints";
         }
     }
 
@@ -952,12 +957,13 @@ int RealClient::setup_real(
     const std::string &master_server_addr,
     const std::shared_ptr<TransferEngine> &transfer_engine,
     const std::string &ipc_socket_path, bool enable_ssd_offload,
-    const std::string &ssd_offload_path, const std::string &tenant_id) {
+    const std::string &ssd_offload_path, const std::string &tenant_id,
+    bool enable_client_http_server, int client_http_port) {
     return to_py_ret(setup_internal(
         local_hostname, metadata_server, global_segment_size, local_buffer_size,
         protocol, rdma_devices, master_server_addr, transfer_engine,
         ipc_socket_path, 50052, enable_ssd_offload, true, ssd_offload_path,
-        tenant_id));
+        tenant_id, enable_client_http_server, client_http_port));
 }
 
 namespace {
@@ -983,6 +989,60 @@ inline std::optional<size_t> get_config_size(const ConfigDict &config,
         return std::nullopt;
     }
     return static_cast<size_t>(parsed_size_opt.value());
+}
+
+inline std::string trim(const std::string &value) {
+    auto start = value.find_first_not_of(" \t\r\n");
+    if (start == std::string::npos) {
+        return "";
+    }
+    auto end = value.find_last_not_of(" \t\r\n");
+    return value.substr(start, end - start + 1);
+}
+
+inline bool get_config_bool(const ConfigDict &config, const std::string &key,
+                            bool default_value) {
+    auto it = config.find(key);
+    if (it == config.end()) {
+        return default_value;
+    }
+
+    std::string value = trim(it->second);
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    if (value == "true" || value == "1" || value == "yes" || value == "on" ||
+        value == "enable") {
+        return true;
+    }
+    if (value == "false" || value == "0" || value == "no" || value == "off" ||
+        value == "disable") {
+        return false;
+    }
+
+    LOG(WARNING) << "Invalid boolean value for config key '" << key
+                 << "': " << it->second << ", using default: " << default_value;
+    return default_value;
+}
+
+inline std::optional<int> get_config_int(const ConfigDict &config,
+                                         const std::string &key,
+                                         int default_value) {
+    auto it = config.find(key);
+    if (it == config.end()) {
+        return default_value;
+    }
+
+    std::string value = trim(it->second);
+    int parsed_value = 0;
+    const char *begin = value.data();
+    const char *end = begin + value.size();
+    auto [ptr, ec] = std::from_chars(begin, end, parsed_value);
+    if (ec != std::errc{} || ptr != end) {
+        LOG(ERROR) << "Invalid integer value for config key '" << key
+                   << "': " << it->second;
+        return std::nullopt;
+    }
+    return parsed_value;
 }
 }  // namespace
 
@@ -1054,19 +1114,22 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 
     std::string ssd_offload_path = get_config(config, "ssd_offload_path");
     std::string tenant_id = get_config(config, CONFIG_KEY_TENANT_ID, "default");
-
-    std::string enable_ssd_offload_str =
-        get_config(config, "enable_ssd_offload", "false");
-    std::transform(enable_ssd_offload_str.begin(), enable_ssd_offload_str.end(),
-                   enable_ssd_offload_str.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
     bool enable_ssd_offload =
-        (enable_ssd_offload_str == "true" || enable_ssd_offload_str == "1");
+        get_config_bool(config, "enable_ssd_offload", false);
+    bool enable_client_http_server =
+        get_config_bool(config, CONFIG_KEY_ENABLE_CLIENT_HTTP_SERVER, false);
+    auto client_http_port_opt = get_config_int(
+        config, CONFIG_KEY_CLIENT_HTTP_PORT, DEFAULT_CLIENT_HTTP_PORT);
+    if (!client_http_port_opt.has_value()) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    int client_http_port = client_http_port_opt.value();
 
-    return setup_internal(
-        local_hostname, metadata_server, global_segment_size, local_buffer_size,
-        protocol, rdma_devices, master_server_addr, nullptr, ipc_socket_path,
-        50052, enable_ssd_offload, true, ssd_offload_path, tenant_id);
+    return setup_internal(local_hostname, metadata_server, global_segment_size,
+                          local_buffer_size, protocol, rdma_devices,
+                          master_server_addr, nullptr, ipc_socket_path, 50052,
+                          enable_ssd_offload, true, ssd_offload_path, tenant_id,
+                          enable_client_http_server, client_http_port);
 }
 
 tl::expected<void, ErrorCode> RealClient::initAll_internal(
@@ -1594,11 +1657,15 @@ int RealClient::health_check() {
     return HC_HEALTHY;
 }
 
-int RealClient::start_http_server() {
+int RealClient::start_http_server(int port) {
     using namespace coro_http;
 
-    http_server_ =
-        std::make_unique<coro_http_server>(/*thread_num=*/1, FLAGS_http_port);
+    if (http_server_) {
+        LOG(WARNING) << "Client HTTP server is already running";
+        return 0;
+    }
+
+    http_server_ = std::make_unique<coro_http_server>(/*thread_num=*/1, port);
 
     http_server_->set_http_handler<GET>(
         "/health", [this](coro_http_request &req, coro_http_response &resp) {
@@ -1664,11 +1731,11 @@ int RealClient::start_http_server() {
 
     auto ec = http_server_->async_start();
     if (ec.hasResult()) {
-        LOG(ERROR) << "Failed to start HTTP server on port " << FLAGS_http_port;
+        LOG(WARNING) << "Failed to start HTTP server on port " << port;
         http_server_.reset();
         return -1;
     }
-    LOG(INFO) << "Client HTTP server started on port " << FLAGS_http_port;
+    LOG(INFO) << "Client HTTP server started on port " << port;
     return 0;
 }
 
@@ -1703,7 +1770,7 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto &buffer_handle = *alloc_result;
-    auto scatter_result = scatter_host_to_maybe_device(
+    auto scatter_result = gather_maybe_device_to_host(
         buffer_handle.ptr(), value.data(), value.size_bytes(), "put:" + key);
     if (!scatter_result) {
         return tl::unexpected(scatter_result.error());
@@ -1785,9 +1852,9 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
         auto &buffer_handle = *alloc_result;
-        auto scatter_result = scatter_host_to_maybe_device(
-            buffer_handle.ptr(), value.data(), value.size_bytes(),
-            "put_batch:" + key);
+        auto scatter_result =
+            gather_maybe_device_to_host(buffer_handle.ptr(), value.data(),
+                                        value.size_bytes(), "put_batch:" + key);
         if (!scatter_result) {
             return tl::unexpected(scatter_result.error());
         }
@@ -1894,7 +1961,7 @@ tl::expected<void, ErrorCode> RealClient::put_parts_internal(
     // Copy all parts into the contiguous buffer
     size_t offset = 0;
     for (const auto &value : values) {
-        auto scatter_result = scatter_host_to_maybe_device(
+        auto scatter_result = gather_maybe_device_to_host(
             static_cast<char *>(buffer_handle.ptr()) + offset, value.data(),
             value.size_bytes(), "put_multi_value");
         if (!scatter_result) {
@@ -3212,9 +3279,42 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             return static_cast<int64_t>(total_size);
         }
 
+        auto runtime_accelerator =
+            device::GetAcceleratorRegistry().RuntimeAccelerators();
+        void *dst = static_cast<char *>(buffer) + dst_offset;
+        if (runtime_accelerator.FindDeviceForPointer(dst)) {
+            if (!client_buffer_allocator_) {
+                LOG(ERROR) << "Client buffer allocator is not provided";
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            auto alloc_result = client_buffer_allocator_->allocate(total_size);
+            if (!alloc_result) {
+                LOG(ERROR) << "Failed to allocate temp buffer for GPU memory "
+                           << "read, key: " << key << ", size: " << total_size;
+                return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+            }
+            BufferHandle tmp_handle(std::move(*alloc_result));
+            std::vector<mooncake::Slice> tmp_slices;
+            allocateSlices(tmp_slices, replica, tmp_handle.ptr());
+
+            auto filtered_qr = FilterQueryResult(query_result, replica);
+            auto get_result = client_->Get(key, filtered_qr, tmp_slices);
+            if (!get_result) {
+                LOG(ERROR) << "Get failed for key: " << key
+                           << " with error: " << toString(get_result.error());
+                return tl::unexpected(get_result.error());
+            }
+            if (auto r = scatter_host_to_maybe_device(
+                    dst, tmp_handle.ptr(), total_size,
+                    "MEMORY full read, key: " + key);
+                !r) {
+                return tl::unexpected(r.error());
+            }
+            return static_cast<int64_t>(total_size);
+        }
+
         std::vector<mooncake::Slice> slices;
-        allocateSlices(slices, replica,
-                       static_cast<char *>(buffer) + dst_offset);
+        allocateSlices(slices, replica, dst);
 
         auto filtered_qr = FilterQueryResult(query_result, replica);
         auto get_result = client_->Get(key, filtered_qr, slices);
@@ -3298,8 +3398,39 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         return tl::unexpected(ErrorCode::INVALID_REPLICA);
     }
 
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
+    void *dst = static_cast<char *>(buffer) + dst_offset;
+    if (runtime_accelerator.FindDeviceForPointer(dst)) {
+        if (!client_buffer_allocator_) {
+            LOG(ERROR) << "Client buffer allocator is not provided";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        auto alloc_result = client_buffer_allocator_->allocate(size);
+        if (!alloc_result) {
+            LOG(ERROR) << "Failed to allocate temp buffer for GPU ranged "
+                       << "read, key: " << key << ", size: " << size;
+            return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+        BufferHandle tmp_handle(std::move(*alloc_result));
+        std::vector<Slice> tmp_slices;
+        tmp_slices.emplace_back(Slice{tmp_handle.ptr(), size});
+
+        auto get_result =
+            client_->Get(key, query_result, tmp_slices, src_offset);
+        if (!get_result) {
+            return tl::unexpected(get_result.error());
+        }
+        if (auto r = scatter_host_to_maybe_device(
+                dst, tmp_handle.ptr(), size, "MEMORY ranged read, key: " + key);
+            !r) {
+            return tl::unexpected(r.error());
+        }
+        return static_cast<int64_t>(size);
+    }
+
     std::vector<Slice> slices;
-    slices.emplace_back(Slice{static_cast<char *>(buffer) + dst_offset, size});
+    slices.emplace_back(Slice{dst, size});
 
     auto get_result = client_->Get(key, query_result, slices, src_offset);
     if (!get_result) {
@@ -3734,7 +3865,7 @@ tl::expected<void, ErrorCode> RealClient::upsert_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto &buffer_handle = *alloc_result;
-    auto scatter_result = scatter_host_to_maybe_device(
+    auto scatter_result = gather_maybe_device_to_host(
         buffer_handle.ptr(), value.data(), value.size_bytes(), "upsert:" + key);
     if (!scatter_result) {
         return tl::unexpected(scatter_result.error());
@@ -3970,7 +4101,7 @@ tl::expected<void, ErrorCode> RealClient::upsert_parts_internal(
     auto &buffer_handle = *alloc_result;
     size_t offset = 0;
     for (const auto &value : values) {
-        auto scatter_result = scatter_host_to_maybe_device(
+        auto scatter_result = gather_maybe_device_to_host(
             static_cast<char *>(buffer_handle.ptr()) + offset, value.data(),
             value.size_bytes(), "upsert_parts:" + key);
         if (!scatter_result) {
@@ -4058,7 +4189,7 @@ tl::expected<void, ErrorCode> RealClient::upsert_batch_internal(
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
         auto &buffer_handle = *alloc_result;
-        auto scatter_result = scatter_host_to_maybe_device(
+        auto scatter_result = gather_maybe_device_to_host(
             buffer_handle.ptr(), value.data(), value.size_bytes(),
             "upsert_batch:" + key);
         if (!scatter_result) {
@@ -4377,7 +4508,7 @@ std::vector<tl::expected<int64_t, ErrorCode>>
 RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                                     const std::vector<void *> &buffers,
                                     const std::vector<size_t> &sizes) {
-    auto start_time = std::chrono::steady_clock::now();
+    [[maybe_unused]] auto start_time = std::chrono::steady_clock::now();
     // Validate preconditions
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -4646,8 +4777,9 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         store_segment_it->second.emplace(op_it.first, op_it.second.slices);
     }
 
-    size_t offload_object_count = 0;
-    auto start_read_store_time = std::chrono::steady_clock::now();
+    [[maybe_unused]] size_t offload_object_count = 0;
+    [[maybe_unused]] auto start_read_store_time =
+        std::chrono::steady_clock::now();
     for (auto &offload_objects_it : offload_objects) {
         offload_object_count += offload_objects_it.second.size();
         auto batch_get_offload_result = batch_get_into_offload_object_internal(
@@ -4664,10 +4796,11 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     }
 
     auto end_time = std::chrono::steady_clock::now();
-    auto elapsed_time = std::chrono::duration_cast<std::chrono::microseconds>(
-                            end_time - start_time)
-                            .count();
-    auto read_store_time =
+    [[maybe_unused]] auto elapsed_time =
+        std::chrono::duration_cast<std::chrono::microseconds>(end_time -
+                                                              start_time)
+            .count();
+    [[maybe_unused]] auto read_store_time =
         std::chrono::duration_cast<std::chrono::microseconds>(
             end_time - start_read_store_time)
             .count();

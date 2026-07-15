@@ -17,6 +17,7 @@
 #include <glog/logging.h>
 
 #include "tent/common/status.h"
+#include "tent/platform/tpu_pjrt_shim.h"
 #include "tent/runtime/platform.h"
 #include "tent/runtime/slab.h"
 
@@ -59,7 +60,8 @@ Status TpuTransport::uninstall() {
 Status TpuTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
     auto tpu_batch = Slab<TpuSubBatch>::Get().allocate();
     if (!tpu_batch)
-        return Status::InternalError("Unable to allocate TPU sub-batch");
+        return Status::InternalError(
+            "Unable to allocate TPU sub-batch" LOC_MARK);
     batch = tpu_batch;
     tpu_batch->task_list.reserve(max_size);
     tpu_batch->max_size = max_size;
@@ -108,6 +110,32 @@ void TpuTransport::startTransfer(TpuTask *task, TpuSubBatch *batch) {
     }
 
     void *staging = reinterpret_cast<void *>(task->request.target_offset);
+
+    // Exactly one side of a staging hop is TPU HBM: the local stage copies
+    // HBM<->host staging buffer, and a delegated remote stage copies the peer's
+    // host staging buffer<->its HBM (so `staging` is the device side there).
+    // Verify that here instead of relying on Platform::copy to classify: if the
+    // adapter fails to recognise a device pointer -- e.g. it only matches base
+    // addresses and ProxyManager handed us `base + chunk_offset` -- then
+    // Platform::copy sees two host pointers and silently memcpy()s from a token
+    // that is not the buffer's data, corrupting the transfer. Fail loudly.
+    auto &shim = TpuPjrtShim::instance();
+    const bool source_is_device = shim.isDevicePtr(task->request.source);
+    const bool staging_is_device = shim.isDevicePtr(staging);
+    if (source_is_device == staging_is_device) {
+        LOG(ERROR)
+            << "TpuTransport: a staging copy must have exactly one TPU "
+               "device side, but source="
+            << task->request.source << " (device=" << source_is_device
+            << ") and target=" << staging << " (device=" << staging_is_device
+            << "). Either the PJRT adapter is unavailable, or it does not "
+               "resolve interior pointers (see tpu_pjrt_abi.h).";
+        task->status_word = TransferStatusEnum::FAILED;
+        task->transferred_bytes = 0;
+        batch->notifyProgress();
+        return;
+    }
+
     Status status;
     if (task->request.opcode == Request::READ)
         // host staging buffer -> device (H2D)

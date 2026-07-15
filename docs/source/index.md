@@ -99,6 +99,7 @@ getting_started/quick-start
 :maxdepth: 1
 
 deployment/mooncake-store-deployment-guide
+deployment/kubernetes-deployment-guide/index
 getting_started/examples/sglang-integration/index
 getting_started/examples/vllm-integration/index
 Mooncake x LMCache Integration<getting_started/examples/lmcache-integration>
@@ -111,10 +112,9 @@ Mooncake x LMDeploy Integration<getting_started/examples/lmdeploy-integration-v0
 :::{toctree}
 :caption: Performance
 :maxdepth: 1
-
-performance/vllm/index
-performance/sglang/index
 performance/mooncake/index
+performance/sglang/index
+performance/vllm/index
 :::
 
 % Explanation of Mooncake internals

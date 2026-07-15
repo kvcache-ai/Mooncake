@@ -39,9 +39,15 @@
 #include "kv_event/kv_event_publisher.h"
 
 namespace mooncake {
+
+// Forward declaration for MasterSnapshotManager
+class MasterSnapshotManager;
+
 namespace ha {
 class SnapshotCatalogStore;
-}
+class MasterSnapshotCodec;
+class MasterSnapshotCodecTest;  // test fixture, needs private state access
+}  // namespace ha
 
 class EtcdOpLogStore;
 
@@ -88,6 +94,11 @@ class MasterService {
     friend class test::PromotionOnHitTest;
     friend class benchmarks::BatchEvictBench;
     friend class test::MasterServiceTenantQuotaTest;
+    friend class MasterSnapshotManager;    // Allow access to internal state for
+                                           // snapshot
+    friend class ha::MasterSnapshotCodec;  // Allow codec to access private
+                                           // members
+    friend class ha::MasterSnapshotCodecTest;  // codec round-trip unit test
 
    public:
     using NoFProbeFn =
@@ -795,30 +806,7 @@ class MasterService {
     void setHttpMetadataRemoteUrl(const std::string& metadata_connstring);
 
    private:
-    void SnapshotThreadFunc();
-
-    // Persist master state
-    tl::expected<void, SerializationError> PersistState(
-        const std::string& snapshot_id);
-    tl::expected<void, SerializationError> PersistState(
-        const ha::SnapshotDescriptor& descriptor);
-    tl::expected<ha::SnapshotDescriptor, SerializationError>
-    BuildSnapshotDescriptor(const std::string& snapshot_id,
-                            const std::string& manifest_path,
-                            const std::string& object_prefix) const;
-    tl::expected<ha::OpLogSequenceId, SerializationError>
-    ResolveSnapshotSequenceId() const;
-#ifdef STORE_USE_ETCD
-    tl::expected<EtcdOpLogStore*, SerializationError>
-    GetSnapshotBoundaryOpLogStore() const;
-#endif
-
-    tl::expected<void, SerializationError> UploadSnapshotPayloadFile(
-        const std::vector<uint8_t>& data, const std::string& path,
-        const std::string& local_filename, const std::string& snapshot_id);
-
     std::unique_ptr<ha::SnapshotCatalogStore> CreateSnapshotCatalogStore();
-    void CleanupOldSnapshot(int keep_count, const std::string& snapshot_id);
     ha::SnapshotCatalogStore* GetSnapshotCatalogStore();
 
     // Restore master state
@@ -827,12 +815,6 @@ class MasterService {
         const ha::SnapshotDescriptor& snapshot,
         const std::chrono::system_clock::time_point& now);
     void ResetStateAfterFailedRestoreAttempt();
-
-    void WaitForSnapshotChild(pid_t pid, const std::string& snapshot_id,
-                              int log_pipe_fd);
-
-    void HandleChildTimeout(pid_t pid, const std::string& snapshot_id);
-    void HandleChildExit(pid_t pid, int status, const std::string& snapshot_id);
 
     // BatchEvict evicts objects in a near-LRU way, i.e., prioritizes to evict
     // object with smaller lease timeout. It has two passes. The first pass only
@@ -1579,10 +1561,9 @@ class MasterService {
     static constexpr uint64_t kEvictionThreadSleepMs =
         10;  // 10 ms sleep between eviction checks
 
-    std::thread snapshot_thread_;
-    std::atomic<bool> snapshot_running_{false};
-    std::mutex snapshot_thread_mutex_;
-    std::condition_variable snapshot_thread_cv_;
+    // Snapshot manager handles snapshot lifecycle orchestration
+    std::unique_ptr<MasterSnapshotManager> snapshot_manager_;
+
     // Task cleanup thread related members
     std::thread task_cleanup_thread_;
     std::atomic<bool> task_cleanup_running_{false};
@@ -2026,10 +2007,6 @@ class MasterService {
     std::unique_ptr<SnapshotObjectStore> snapshot_object_store_;
     std::unique_ptr<ha::SnapshotCatalogStore> snapshot_catalog_store_;
     mutable std::shared_mutex snapshot_mutex_;
-#ifdef STORE_USE_ETCD
-    mutable std::mutex snapshot_boundary_oplog_store_mutex_;
-    mutable std::unique_ptr<EtcdOpLogStore> snapshot_boundary_oplog_store_;
-#endif
 
     // Discarded replicas management
     const std::chrono::seconds put_start_discard_timeout_sec_;
