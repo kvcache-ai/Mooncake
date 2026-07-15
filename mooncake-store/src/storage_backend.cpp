@@ -3459,10 +3459,23 @@ OffsetAllocatorStorageBackend::LoadMetadata() {
     }
 
     std::string buf(static_cast<size_t>(sz), '\0');
-    ssize_t n = pread(fd, buf.data(), buf.size(), 0);
-    if (n != sz) {
-        LOG(ERROR) << "Short read from " << meta_path;
-        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    size_t read_bytes = 0;
+    char* ptr = buf.data();
+    while (read_bytes < static_cast<size_t>(sz)) {
+        ssize_t n = pread(fd, ptr, static_cast<size_t>(sz) - read_bytes,
+                          static_cast<off_t>(read_bytes));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            LOG(ERROR) << "Read failed from " << meta_path << ": "
+                       << strerror(errno);
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+        if (n == 0) {
+            LOG(ERROR) << "Unexpected EOF from " << meta_path;
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+        read_bytes += static_cast<size_t>(n);
+        ptr += n;
     }
 
     OffsetAllocatorPersistedMetadata meta;
@@ -3796,14 +3809,14 @@ bool OffsetAllocatorStorageBackend::TryRecoverFromMetadata() {
         FdGuard fd_guard(raw_fd);
 
         // Verify data file size matches capacity_
-        off_t actual_size = lseek(fd_guard.get(), 0, SEEK_END);
-        if (actual_size < 0) {
-            LOG(ERROR) << "lseek failed on data file: " << strerror(errno);
+        struct stat st;
+        if (fstat(fd_guard.get(), &st) != 0) {
+            LOG(ERROR) << "fstat failed on data file: " << strerror(errno);
             return false;
         }
-        if (static_cast<uint64_t>(actual_size) != capacity_) {
+        if (static_cast<uint64_t>(st.st_size) != capacity_) {
             LOG(WARNING) << "data file size mismatch: expected " << capacity_
-                         << ", got " << actual_size
+                         << ", got " << st.st_size
                          << " -- falling back to fresh start";
             return false;
         }
