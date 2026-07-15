@@ -289,7 +289,7 @@ jobs:
        github.event.action == 'opened' ||
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-22.04
-    container: mthreads/musa:rc4.3.0-devel-ubuntu22.04-amd64
+    container: mthreads/pytorch:2.9.1.post1-py3.10-musa5.2.0-devel-ubuntu22.04-amd64
     steps:
     - uses: actions/checkout@v4
       with:
