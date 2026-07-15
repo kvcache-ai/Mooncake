@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "real_client.h"
+#include "registered_pinned_memory.h"
 #include "client_buffer.h"
 #include "replica_selection.h"
 #include "common.h"
@@ -50,6 +51,21 @@ DEFINE_int32(http_port, 9300,
 namespace mooncake {
 namespace {
 constexpr std::chrono::seconds kIpcRequestRecvTimeout{5};
+
+bool IsHostStoreSegmentProtocol(const std::string &protocol) {
+    return protocol.empty() || protocol == "tcp" || protocol == "rdma" ||
+           protocol == "efa" || protocol == "cxi" || protocol == "rpc_only";
+}
+
+std::shared_ptr<RegisteredPinnedRegion> TryPinStoreSegment(
+    void *ptr, size_t size, const std::string &protocol,
+    const char *segment_owner) {
+    if (!IsHostStoreSegmentProtocol(protocol)) return nullptr;
+    return RegisteredPinnedMemoryManager::instance().try_pin(
+        ptr, size,
+        std::string("Store segment ") + segment_owner +
+            " protocol=" + protocol);
+}
 
 #ifdef USE_ASCEND_DIRECT
 bool checkAcl(aclError result, const char *message) {
@@ -869,12 +885,19 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 }
             }
 
+            auto pinned_region =
+                TryPinStoreSegment(ptr, mapped_size, this->protocol, "setup");
             auto mount_result =
                 client_->MountSegment(ptr, mapped_size, protocol, seg_location);
             if (!mount_result.has_value()) {
+                pinned_region.reset();
                 LOG(ERROR) << "Failed to mount segment: "
                            << toString(mount_result.error());
                 return tl::unexpected(mount_result.error());
+            }
+            if (pinned_region) {
+                setup_segment_pinned_regions_.push_back(
+                    std::move(pinned_region));
             }
         }
         if (total_glbseg_size == 0) {
@@ -1187,6 +1210,7 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     ReleaseAllAllocatedSegmentRecords();
     client_buffer_allocator_.reset();
     port_binder_.reset();
+    setup_segment_pinned_regions_.clear();
     hugepage_segment_ptrs_.clear();
     ub_segment_ptrs_.clear();
 #if defined(USE_SUNRISE)
@@ -1380,6 +1404,7 @@ void RealClient::ReleaseAllocatedSegmentRecord(const std::string &segment_id) {
         }
     }
     if (found && record.base) {
+        record.pinned_region.reset();
         free_memory(record.protocol, record.base);
     }
 }
@@ -1392,6 +1417,7 @@ void RealClient::ReleaseAllAllocatedSegmentRecords() {
     }
     for (auto &entry : records) {
         if (entry.second.base) {
+            entry.second.pinned_region.reset();
             free_memory(entry.second.protocol, entry.second.base);
         }
     }
@@ -1533,17 +1559,21 @@ int RealClient::allocateAndMountSegment(
             break;
         }
 
+        auto pinned_region =
+            TryPinStoreSegment(ptr, chunk_size, protocol, "allocated");
         auto result =
             client_->MountSegmentAndGetId(ptr, chunk_size, protocol, location);
         if (!result.has_value()) {
             LOG(ERROR) << "MountSegmentAndGetId failed";
+            pinned_region.reset();
             free_memory(protocol, ptr);
             break;
         }
 
         std::string segment_id = UuidToString(result.value());
         mounted_ids.push_back(segment_id);
-        allocated_records.push_back({ptr, chunk_size, protocol});
+        allocated_records.push_back(
+            {ptr, chunk_size, protocol, std::move(pinned_region)});
 
         remaining -= chunk_size;
     }
@@ -1555,6 +1585,7 @@ int RealClient::allocateAndMountSegment(
                 client_->UnmountSegmentById(id);
             }
             if (allocated_records[i].base) {
+                allocated_records[i].pinned_region.reset();
                 free_memory(allocated_records[i].protocol,
                             allocated_records[i].base);
             }
@@ -1643,6 +1674,7 @@ int RealClient::unmountAndFreeSegment(
 
     for (auto &p : to_cleanup) {
         if (p.second.base) {
+            p.second.pinned_region.reset();
             free_memory(p.second.protocol, p.second.base);
         }
     }
