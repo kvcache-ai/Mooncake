@@ -3452,17 +3452,22 @@ OffsetAllocatorStorageBackend::LoadMetadata() {
     }
     FdGuard closer(fd);
 
-    off_t sz = lseek(fd, 0, SEEK_END);
-    if (sz <= 0) {
-        LOG(ERROR) << "Metadata file is empty or unreadable: " << meta_path;
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        LOG(ERROR) << "fstat failed on " << meta_path << ": "
+                   << strerror(errno);
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+    if (st.st_size == 0) {
+        LOG(ERROR) << "Metadata file is empty: " << meta_path;
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     }
 
-    std::string buf(static_cast<size_t>(sz), '\0');
+    std::string buf(static_cast<size_t>(st.st_size), '\0');
     size_t read_bytes = 0;
     char* ptr = buf.data();
-    while (read_bytes < static_cast<size_t>(sz)) {
-        ssize_t n = pread(fd, ptr, static_cast<size_t>(sz) - read_bytes,
+    while (read_bytes < static_cast<size_t>(st.st_size)) {
+        ssize_t n = pread(fd, ptr, static_cast<size_t>(st.st_size) - read_bytes,
                           static_cast<off_t>(read_bytes));
         if (n < 0) {
             if (errno == EINTR) continue;
@@ -4055,8 +4060,10 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
 
         // ---- (B) Notify master + accumulate tombstone ----
         if (eviction_on && !evicted_keys.empty()) {
-            all_evicted_this_batch_.insert(evicted_keys.begin(),
-                                           evicted_keys.end());
+            if (cfg_.persist_mode != OffsetPersistMode::kDisabled) {
+                all_evicted_this_batch_.insert(evicted_keys.begin(),
+                                               evicted_keys.end());
+            }
             eviction_handler(evicted_keys);
             evicted_keys.clear();
         }
@@ -4080,8 +4087,10 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
                 fallback_total_evicted += (evicted_keys.size() - before);
 
                 if (eviction_on && !evicted_keys.empty()) {
-                    all_evicted_this_batch_.insert(evicted_keys.begin(),
-                                                   evicted_keys.end());
+                    if (cfg_.persist_mode != OffsetPersistMode::kDisabled) {
+                        all_evicted_this_batch_.insert(evicted_keys.begin(),
+                                                       evicted_keys.end());
+                    }
                     eviction_handler(evicted_keys);
                     evicted_keys.clear();
                 }
