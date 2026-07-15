@@ -5928,10 +5928,10 @@ void MasterService::RestoreState() {
             auto payloads_result =
                 snapshot_repository_->DownloadSnapshotPayloads(snapshot);
             if (!payloads_result) {
-                LOG(WARNING) << "[Restore] Snapshot candidate "
-                             << snapshot.snapshot_id
-                             << " is unusable: failed to download payloads: "
-                             << payloads_result.error().message;
+                LOG(WARNING)
+                    << "[Restore] Snapshot candidate " << snapshot.snapshot_id
+                    << " is unusable: failed to download payloads: "
+                    << payloads_result.error().message;
                 continue;
             }
 
@@ -5939,19 +5939,19 @@ void MasterService::RestoreState() {
             auto decode_result =
                 snapshot_codec_->Decode(this, payloads_result.value());
             if (!decode_result) {
-                LOG(WARNING) << "[Restore] Snapshot candidate "
-                             << snapshot.snapshot_id
-                             << " is unusable: " << decode_result.error().message;
+                LOG(WARNING)
+                    << "[Restore] Snapshot candidate " << snapshot.snapshot_id
+                    << " is unusable: " << decode_result.error().message;
                 continue;
             }
 
             // Phase 3: Apply state (master service responsibility)
             auto apply_result = ApplySnapshotState(now);
             if (!apply_result) {
-                LOG(WARNING) << "[Restore] Snapshot candidate "
-                             << snapshot.snapshot_id
-                             << " is unusable: failed to apply state: "
-                             << apply_result.error().message;
+                LOG(WARNING)
+                    << "[Restore] Snapshot candidate " << snapshot.snapshot_id
+                    << " is unusable: failed to apply state: "
+                    << apply_result.error().message;
                 continue;
             }
 
