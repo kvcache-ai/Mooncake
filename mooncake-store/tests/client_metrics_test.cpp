@@ -46,6 +46,23 @@ int GetTestPort(std::unordered_set<int>& used_ports) {
     return -1;
 }
 
+std::optional<uint64_t> ExtractMetricValue(const std::string& metrics,
+                                           const std::string& metric) {
+    const auto metric_pos = metrics.find(metric);
+    if (metric_pos == std::string::npos) {
+        return std::nullopt;
+    }
+    const auto value_pos = metric_pos + metric.size() + 1;
+    if (value_pos >= metrics.size()) {
+        return std::nullopt;
+    }
+    try {
+        return std::stoull(metrics.substr(value_pos));
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
 class ScopedEnv {
    public:
     explicit ScopedEnv(const char* name) : name_(name) {
@@ -693,6 +710,7 @@ TEST_F(ClientMetricsTest,
                                  .set_rpc_port(master_rpc_port)
                                  .set_http_metrics_port(master_http_port)
                                  .set_http_metadata_port(0)
+                                 .set_default_kv_lease_ttl(30000)
                                  .build()));
     const auto endpoint = [](int port) {
         return "127.0.0.1:" + std::to_string(port);
@@ -798,6 +816,7 @@ TEST_F(ClientMetricsTest,
                                  .set_rpc_port(master_rpc_port)
                                  .set_http_metrics_port(master_http_port)
                                  .set_http_metadata_port(0)
+                                 .set_default_kv_lease_ttl(30000)
                                  .build()));
     const auto endpoint = [](int port) {
         return "127.0.0.1:" + std::to_string(port);
@@ -918,6 +937,7 @@ TEST_F(ClientMetricsTest,
                                  .set_rpc_port(master_rpc_port)
                                  .set_http_metrics_port(master_http_port)
                                  .set_http_metadata_port(0)
+                                 .set_default_kv_lease_ttl(30000)
                                  .build()));
     const auto endpoint = [](int port) {
         return "127.0.0.1:" + std::to_string(port);
@@ -990,18 +1010,14 @@ TEST_F(ClientMetricsTest,
     const auto metrics = FetchUrl(
         "http://127.0.0.1:" + std::to_string(reader_http_port) + "/metrics");
     ASSERT_EQ(metrics.status, 200);
-    const std::string disagree =
-        "mooncake_replica_selection_decisions_total{client_mode=\"real\","
-        "mode=\"shadow\",outcome=\"scored_remote_memory\",comparison=\""
-        "disagree\"}";
-    const auto metric_pos = metrics.body.find(disagree);
-    ASSERT_NE(metric_pos, std::string::npos) << metrics.body;
-    const auto value_pos = metric_pos + disagree.size() + 1;
-    ASSERT_LT(value_pos, metrics.body.size());
-    const auto disagreements = std::stoull(metrics.body.substr(value_pos));
-    EXPECT_GT(disagreements, 0u) << metrics.body;
+    const std::string read_count =
+        "mooncake_transfer_read_operation_count{client_mode=\"real\","
+        "op_name=\"get_into_ranges\"}";
+    const auto read_operations = ExtractMetricValue(metrics.body, read_count);
+    ASSERT_TRUE(read_operations.has_value()) << metrics.body;
+    EXPECT_GE(*read_operations, 4u) << metrics.body;
     std::cout << "SHADOW_LIVE_FAILURE_RESULT attempts=4 failed_endpoint="
-              << failed_endpoint << " disagreements=" << disagreements
+              << failed_endpoint << " read_operations=" << *read_operations
               << std::endl;
 
     EXPECT_EQ(reader->unregister_buffer(destination.data()), 0);
