@@ -110,6 +110,7 @@ const static std::string GPU_PREFIX = "musa:";
 #define cudaEventCreateWithFlags musaEventCreateWithFlags
 #define cudaEventDisableTiming musaEventDisableTiming
 #define cudaEventDestroy musaEventDestroy
+#define cudaEventQuery musaEventQuery
 #define cudaEventRecord musaEventRecord
 #define cudaEventSynchronize musaEventSynchronize
 #define cudaDeviceProp musaDeviceProp
@@ -127,6 +128,7 @@ const static std::string GPU_PREFIX = "musa:";
 #define cuInit muInit
 #define cuDevicePrimaryCtxRetain muDevicePrimaryCtxRetain
 #define cuDevicePrimaryCtxRelease muDevicePrimaryCtxRelease
+#define cuCtxGetCurrent muCtxGetCurrent
 #define cuCtxSetCurrent muCtxSetCurrent
 #define cudaHostRegisterMapped musaHostRegisterMapped
 #define cudaHostRegisterIoMemory musaHostRegisterIoMemory

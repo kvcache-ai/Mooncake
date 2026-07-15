@@ -149,8 +149,11 @@ class Transport {
             } ub;
             struct {
                 void *dest_addr;
-                void *cuda_stream;  // cudaStream_t, used by async NVLink
-                                    // transport
+                void *cuda_stream;      // cudaStream_t, used by async NVLink
+                                        // transport
+                void *cuda_completion;  // Shared per-submission completion
+                uint64_t mapping_base_addr;
+                int cuda_device_id;
             } local;
             struct {
                 uint64_t dest_addr;
@@ -180,17 +183,17 @@ class Transport {
 
        public:
         void markSuccess() {
-            status = Slice::SUCCESS;
             __atomic_fetch_add(&task->transferred_bytes, length,
                                __ATOMIC_RELAXED);
             __atomic_fetch_add(&task->success_slice_count, 1, __ATOMIC_RELAXED);
+            __atomic_store_n(&status, Slice::SUCCESS, __ATOMIC_RELEASE);
 
             check_batch_completion(false);
         }
 
         void markFailed() {
-            status = Slice::FAILED;
             __atomic_fetch_add(&task->failed_slice_count, 1, __ATOMIC_RELAXED);
+            __atomic_store_n(&status, Slice::FAILED, __ATOMIC_RELEASE);
 
             check_batch_completion(true);
         }
