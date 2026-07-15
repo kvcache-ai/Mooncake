@@ -4970,6 +4970,58 @@ TEST_F(MasterServiceTest, WrappedWriteBoundaryRejectsInvalidTenantIds) {
     EXPECT_EQ(invalid.error(), ErrorCode::TENANT_NOT_REGISTERED);
 }
 
+TEST_F(MasterServiceTest, WrappedRequestBoundaryRejectsInvalidTenantIds) {
+    WrappedMasterService service(
+        MakeStrictWrappedConfig({std::string(TenantId::kDefaultValue)}));
+
+    auto invalid = service.GetReplicaList("missing-key", "_invalid-tenant");
+    ASSERT_FALSE(invalid.has_value());
+    EXPECT_EQ(invalid.error(), ErrorCode::INVALID_PARAMS);
+
+    const std::string control_tenant("tenant\0bad", 10);
+    auto batch =
+        service.BatchGetReplicaList({"key-a", "key-b"}, control_tenant);
+    ASSERT_EQ(batch.size(), 2u);
+    for (const auto& result : batch) {
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    }
+
+    std::vector<OffloadTaskItem> tasks = {
+        {.tenant_id = "_invalid-tenant", .key = "key", .size = 1}};
+    std::vector<StorageObjectMetadata> metadatas = {
+        {.bucket_id = 0,
+         .offset = 0,
+         .key_size = 3,
+         .data_size = 1,
+         .transport_endpoint = "segment"}};
+    auto offload =
+        service.NotifyOffloadSuccess(generate_uuid(), tasks, metadatas);
+    ASSERT_FALSE(offload.has_value());
+    EXPECT_EQ(offload.error(), ErrorCode::INVALID_PARAMS);
+
+    // RemoveAll has a legacy scalar return type and cannot carry ErrorCode.
+    EXPECT_EQ(service.RemoveAll(false, "_invalid-tenant"), 0);
+}
+
+TEST_F(MasterServiceTest, WrappedRequestBoundaryPreservesTenantNormalization) {
+    WrappedMasterService multi_tenant_service(
+        MakeStrictWrappedConfig({std::string(TenantId::kDefaultValue)}));
+    auto empty = multi_tenant_service.ExistKey("missing-key", "");
+    ASSERT_TRUE(empty.has_value());
+    EXPECT_FALSE(empty.value());
+
+    WrappedMasterServiceConfig single_tenant_config;
+    single_tenant_config.default_kv_lease_ttl = 100;
+    single_tenant_config.enable_metric_reporting = false;
+    single_tenant_config.enable_multi_tenants = false;
+    WrappedMasterService single_tenant_service(single_tenant_config);
+    auto invalid =
+        single_tenant_service.ExistKey("missing-key", "_invalid-tenant");
+    ASSERT_TRUE(invalid.has_value());
+    EXPECT_FALSE(invalid.value());
+}
+
 TEST_F(MasterServiceTest, BatchQueryIpTest) {
     std::unique_ptr<MasterService> service_(new MasterService());
     const UUID client_id = generate_uuid();
