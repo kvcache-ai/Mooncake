@@ -1,3 +1,4 @@
+#include "serializer.h"
 #include "storage_backend.h"
 
 #include <fcntl.h>
@@ -7,6 +8,7 @@
 #include <errno.h>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 
 #include <optional>
 #include <regex>
@@ -23,6 +25,25 @@
 #include "utils.h"
 
 #include <ylt/util/tl/expected.hpp>
+
+namespace {
+struct FdGuard {
+    int fd = -1;
+    explicit FdGuard(int f) : fd(f) {}
+    ~FdGuard() {
+        if (fd >= 0) close(fd);
+    }
+    FdGuard(const FdGuard&) = delete;
+    FdGuard& operator=(const FdGuard&) = delete;
+    int get() const { return fd; }
+    int release() {
+        int r = fd;
+        fd = -1;
+        return r;
+    }
+};
+}  // namespace
+
 #include "storage/distributed/distributed_storage_backend.h"
 
 namespace mooncake {
@@ -88,6 +109,14 @@ BucketBackendConfig BucketBackendConfig::FromEnvironment() {
 }
 
 bool OffsetAllocatorBackendConfig::Validate() const {
+    if (persist_mode == OffsetPersistMode::kRelaxed) {
+        if (persist_interval_seconds < 5) {
+            LOG(ERROR) << "OffsetAllocatorBackendConfig: "
+                          "persist_interval_seconds must be >= 5 for "
+                          "kRelaxed mode";
+            return false;
+        }
+    }
     if (high_ratio <= 0.0 || high_ratio > 1.0) {
         LOG(ERROR)
             << "OffsetAllocatorBackendConfig: high_ratio must be in (0,1]";
@@ -170,6 +199,26 @@ OffsetAllocatorBackendConfig OffsetAllocatorBackendConfig::FromEnvironment() {
                      << max_evict_raw << " is non-positive; using default "
                      << cfg.max_evict_per_offload;
     }
+
+    // Persistence mode
+    const char* persist = std::getenv("MOONCAKE_OFFSET_PERSIST_MODE");
+    if (persist) {
+        std::string s(persist);
+        if (s == "disabled" || s == "DISABLED") {
+            cfg.persist_mode = OffsetPersistMode::kDisabled;
+        } else if (s == "relaxed" || s == "RELAXED") {
+            cfg.persist_mode = OffsetPersistMode::kRelaxed;
+        } else if (s == "strict" || s == "STRICT") {
+            cfg.persist_mode = OffsetPersistMode::kStrict;
+        } else {
+            LOG(WARNING) << "Unknown MOONCAKE_OFFSET_PERSIST_MODE=" << s
+                         << "; using default (disabled)";
+        }
+    }
+
+    cfg.persist_interval_seconds =
+        GetEnvOr<int64_t>("MOONCAKE_OFFSET_PERSIST_INTERVAL_SECONDS",
+                          cfg.persist_interval_seconds);
 
     return cfg;
 }
@@ -2934,6 +2983,10 @@ std::string OffsetAllocatorStorageBackend::GetDataFilePath() const {
     return (std::filesystem::path(storage_path_) / "kv_cache.data").string();
 }
 
+std::string OffsetAllocatorStorageBackend::GetMetaFilePath() const {
+    return (std::filesystem::path(storage_path_) / "kv_cache.meta").string();
+}
+
 //-----------------------------------------------------------------------------
 
 tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
@@ -2951,76 +3004,18 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
 
-        // Clear in-memory maps (V1: no persistence, start fresh)
-        // Lock all shards to ensure exclusive access during initialization
+        // Ensure storage path exists
         {
-            std::vector<std::unique_ptr<SharedMutexLocker>> shard_locks;
-            shard_locks.reserve(kNumShards);
-            for (size_t i = 0; i < kNumShards; ++i) {
-                shard_locks.emplace_back(
-                    std::make_unique<SharedMutexLocker>(&shards_[i].mutex));
-                shards_[i].map.clear();
-            }
-            total_size_.store(0, std::memory_order_relaxed);
-            total_keys_.store(0, std::memory_order_relaxed);
-        }
-
-        // Get data file path
-        data_file_path_ = GetDataFilePath();
-
-        // RAII wrapper to ensure fd is closed on all error paths
-        struct FdGuard {
-            int fd;
-            explicit FdGuard(int fd) : fd(fd) {}
-            ~FdGuard() {
-                if (fd >= 0) {
-                    close(fd);
-                }
-            }
-            // Release ownership (caller takes responsibility)
-            int release() {
-                int ret = fd;
-                fd = -1;
-                return ret;
-            }
-            // Get fd without releasing (for operations)
-            int get() const { return fd; }
-        };
-
-        // Open/truncate data file in read-write mode
-        // We need raw fd for fallocate, so open directly
-        int flags = O_CLOEXEC | O_RDWR | O_CREAT | O_TRUNC;
-        int raw_fd = open(data_file_path_.c_str(), flags, 0644);
-        if (raw_fd < 0) {
-            LOG(ERROR) << "Failed to open data file: " << data_file_path_;
-            return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
-        }
-        FdGuard fd_guard(raw_fd);
-
-        // Use fallocate if available, otherwise ftruncate
-        if (fallocate(fd_guard.get(), 0, 0, capacity_) != 0) {
-            // Fallback to ftruncate
-            if (ftruncate(fd_guard.get(), capacity_) != 0) {
-                LOG(ERROR) << "Failed to preallocate file: " << data_file_path_
-                           << ", capacity: " << capacity_
-                           << ", error: " << strerror(errno);
-                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+            std::error_code ec;
+            fs::create_directories(storage_path_, ec);
+            if (ec) {
+                LOG(ERROR) << "Failed to create storage directory: "
+                           << storage_path_;
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
             }
         }
 
-        // Release fd to StorageFile (takes ownership and will close it)
-#ifdef USE_URING
-        if (file_storage_config_.use_uring) {
-            data_file_ = std::make_unique<UringFile>(
-                data_file_path_, fd_guard.release(), 32, true);
-        } else
-#endif
-        {
-            data_file_ = std::make_unique<PosixFile>(data_file_path_,
-                                                     fd_guard.release());
-        }
-
-        // Resolve watermark thresholds from config
+        // ---- Resolve watermarks ----
         high_watermark_bytes_ =
             cfg_.high_watermark_bytes > 0
                 ? cfg_.high_watermark_bytes
@@ -3040,10 +3035,8 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
                 : static_cast<int64_t>(file_storage_config_.total_keys_limit *
                                        cfg_.keys_low_ratio);
 
-        // Auto-nudge ratio-derived low watermarks when integer truncation
-        // collapses them to the same value as high (e.g. limit=5, ratio
-        // 0.95->4, ratio 0.90->4 => low==high==4).  Only applies to
-        // auto-derived values; explicit config values are validated strictly.
+        // Auto-nudge ratio-derived low watermarks when integer
+        // truncation collapses them to the same value as high
         if (cfg_.low_watermark_bytes == 0 && high_watermark_bytes_ > 0 &&
             low_watermark_bytes_ >= high_watermark_bytes_) {
             low_watermark_bytes_ =
@@ -3096,6 +3089,83 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
                 std::max<int64_t>(1, high_watermark_keys_ / 2);
         }
 
+        // ---- Recovery path ----
+        if (cfg_.persist_mode != OffsetPersistMode::kDisabled &&
+            TryRecoverFromMetadata()) {
+            last_persist_time_us_.store(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count(),
+                std::memory_order_relaxed);
+            initialized_.store(true, std::memory_order_release);
+            LOG(INFO) << "OffsetAllocatorStorageBackend recovered: "
+                      << total_keys_.load() << " keys, " << total_size_.load()
+                      << " bytes";
+            return {};
+        }
+
+        // ---- Fresh start path ----
+        LOG(INFO) << "Fresh start path";
+
+        // Close any recovery fd and clean up stale metadata
+        data_file_.reset();
+        {
+            std::error_code ec;
+            fs::remove(GetMetaFilePath(), ec);
+            fs::remove(GetMetaFilePath() + ".tmp", ec);
+        }
+
+        // Clear in-memory maps (V1: no persistence, start fresh)
+        {
+            std::vector<std::unique_ptr<SharedMutexLocker>> shard_locks;
+            shard_locks.reserve(kNumShards);
+            for (size_t i = 0; i < kNumShards; ++i) {
+                shard_locks.emplace_back(
+                    std::make_unique<SharedMutexLocker>(&shards_[i].mutex));
+                shards_[i].map.clear();
+            }
+            total_size_.store(0, std::memory_order_relaxed);
+            total_keys_.store(0, std::memory_order_relaxed);
+        }
+
+        // Get data file path
+        data_file_path_ = GetDataFilePath();
+
+        // Open/truncate data file in read-write mode
+        int flags = O_CLOEXEC | O_RDWR | O_CREAT | O_TRUNC;
+        int raw_fd = open(data_file_path_.c_str(), flags, 0644);
+        if (raw_fd < 0) {
+            LOG(ERROR) << "Failed to open data file: " << data_file_path_;
+            return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+        }
+        FdGuard fd_guard(raw_fd);
+
+        // Use fallocate if available, otherwise ftruncate
+        if (fallocate(fd_guard.get(), 0, 0, capacity_) != 0) {
+            // Fallback to ftruncate
+            if (ftruncate(fd_guard.get(), capacity_) != 0) {
+                LOG(ERROR) << "Failed to preallocate file: " << data_file_path_
+                           << ", capacity: " << capacity_
+                           << ", error: " << strerror(errno);
+                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+            }
+        }
+
+        // Release fd to StorageFile (takes ownership and will close it)
+#ifdef USE_URING
+        if (file_storage_config_.use_uring) {
+            data_file_ = std::make_unique<UringFile>(
+                data_file_path_, fd_guard.release(), 32, true);
+        } else
+#endif
+        {
+            data_file_ = std::make_unique<PosixFile>(data_file_path_,
+                                                     fd_guard.release());
+        }
+        if (cfg_.persist_mode != OffsetPersistMode::kDisabled) {
+            data_file_->SetDeleteOnWriteFail(false);
+        }
+
         // Create allocator with tuned node capacity
         constexpr int64_t kMinObjectSize = 256;
         constexpr int64_t kMaxNodeRamBytes =
@@ -3136,6 +3206,14 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
             insert_seq_.store(0, std::memory_order_relaxed);
         }
 
+        // Initialize persist timestamp (avoid immediate checkpoint
+        // on first write)
+        last_persist_time_us_.store(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count(),
+            std::memory_order_relaxed);
+
         initialized_.store(true, std::memory_order_release);
         LOG(INFO) << "OffsetAllocatorStorageBackend initialized, capacity: "
                   << capacity_
@@ -3151,9 +3229,568 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
     return {};
 }
 
-//-----------------------------------------------------------------------------
 // EvictToMakeRoom
 //-----------------------------------------------------------------------------
+
+//-----------------------------------------------------------------------------
+// ShouldPersistNow
+//-----------------------------------------------------------------------------
+
+bool OffsetAllocatorStorageBackend::ShouldPersistNow() const {
+    if (cfg_.persist_mode == OffsetPersistMode::kDisabled) return false;
+    if (cfg_.persist_mode == OffsetPersistMode::kStrict) return true;
+    using TimePointUs = std::chrono::time_point<std::chrono::steady_clock,
+                                                std::chrono::microseconds>;
+    auto last_tp = TimePointUs(std::chrono::microseconds(
+        last_persist_time_us_.load(std::memory_order_relaxed)));
+    return (std::chrono::steady_clock::now() - last_tp) >=
+           std::chrono::seconds(cfg_.persist_interval_seconds);
+}
+
+//-----------------------------------------------------------------------------
+// SaveMetadata
+//-----------------------------------------------------------------------------
+
+tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::SaveMetadata(
+    const std::vector<std::string>& evicted_keys_this_batch) {
+    namespace fs = std::filesystem;
+
+    if (!metadata_dirty_.exchange(false, std::memory_order_relaxed) &&
+        evicted_keys_this_batch.empty()) {
+        return {};
+    }
+
+    int step = test_metadata_write_failure_step_.exchange(
+        0, std::memory_order_relaxed);
+    struct DirtyGuard {
+        std::atomic<bool>& dirty;
+        std::atomic<int64_t>& failures;
+        bool active = true;
+        DirtyGuard(std::atomic<bool>& d, std::atomic<int64_t>& f)
+            : dirty(d), failures(f) {}
+        ~DirtyGuard() {
+            if (active) {
+                dirty.store(true, std::memory_order_relaxed);
+                failures.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        void disarm() { active = false; }
+    } dirty_guard(metadata_dirty_, metadata_save_failures_);
+
+    auto t_start = std::chrono::steady_clock::now();
+
+    // 1. Serialize allocator
+    std::vector<SerializedByte> alloc_buf;
+    ErrorCode ec = serialize_to(*allocator_, alloc_buf);
+    if (ec != ErrorCode::OK || alloc_buf.empty()) {
+        return tl::make_unexpected(
+            ec != ErrorCode::OK ? ec : ErrorCode::INTERNAL_ERROR);
+    }
+    if (step == 1) return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+
+    // 2. Build metadata struct
+    OffsetAllocatorPersistedMetadata meta;
+    meta.version = 1;
+    meta.allocator_state.assign(reinterpret_cast<const char*>(alloc_buf.data()),
+                                alloc_buf.size());
+    meta.evicted_keys_this_batch = evicted_keys_this_batch;
+
+    {
+        MutexLocker ev(&eviction_mutex_);
+        meta.insert_seq = insert_seq_.load(std::memory_order_relaxed);
+        meta.fifo_entries.reserve(fifo_index_.size());
+        for (const auto& [seq, key] : fifo_index_) {
+            meta.fifo_entries.push_back({seq, key});
+        }
+    }
+
+    // 3. Serialize metadata
+    std::string buf;
+    try {
+        struct_pb::to_pb(meta, buf);
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "struct_pb::to_pb failed in SaveMetadata: " << e.what();
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    if (buf.empty()) {
+        LOG(ERROR) << "struct_pb produced empty metadata buffer";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    // 4. Atomic write via tmp + rename
+    std::string meta_path = GetMetaFilePath();
+    std::string tmp_path = meta_path + ".tmp";
+
+    int fd =
+        open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        LOG(ERROR) << "Failed to create " << tmp_path << ": "
+                   << strerror(errno);
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+
+    const char* ptr = buf.data();
+    size_t remaining = buf.size();
+    while (remaining > 0) {
+        ssize_t n = write(fd, ptr, remaining);
+        if (n <= 0) {
+            if (n < 0 && errno == EINTR) continue;
+            LOG(ERROR) << "write failed on " << tmp_path << ": "
+                       << (n < 0 ? strerror(errno) : "returned 0");
+            close(fd);
+            unlink(tmp_path.c_str());
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        ptr += n;
+        remaining -= n;
+    }
+    if (step == 2) {
+        close(fd);
+        unlink(tmp_path.c_str());
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+
+    if (fdatasync(fd) != 0) {
+        LOG(ERROR) << "fdatasync failed on " << tmp_path;
+        close(fd);
+        unlink(tmp_path.c_str());
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    close(fd);
+
+    if (rename(tmp_path.c_str(), meta_path.c_str()) != 0) {
+        LOG(ERROR) << "rename " << tmp_path << " -> " << meta_path
+                   << " failed: " << strerror(errno);
+        unlink(tmp_path.c_str());
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    if (step == 3) return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+
+    // fsync parent directory
+    fs::path parent = fs::path(meta_path).parent_path();
+    int dir_fd = open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dir_fd < 0) {
+        LOG(ERROR) << "open parent dir failed: " << strerror(errno);
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    if (fsync(dir_fd) != 0) {
+        LOG(ERROR) << "fsync parent dir failed: " << strerror(errno);
+        close(dir_fd);
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    close(dir_fd);
+
+    dirty_guard.disarm();
+
+    last_save_metadata_cost_us_.store(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t_start)
+            .count(),
+        std::memory_order_relaxed);
+
+    return {};
+}
+
+//-----------------------------------------------------------------------------
+// LoadMetadata
+//-----------------------------------------------------------------------------
+
+tl::expected<OffsetAllocatorPersistedMetadata, ErrorCode>
+OffsetAllocatorStorageBackend::LoadMetadata() {
+    std::string meta_path = GetMetaFilePath();
+
+    int fd = open(meta_path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        LOG(ERROR) << "Failed to open " << meta_path << ": " << strerror(errno);
+        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    }
+    FdGuard closer(fd);
+
+    off_t sz = lseek(fd, 0, SEEK_END);
+    if (sz <= 0) {
+        LOG(ERROR) << "Metadata file is empty or unreadable: " << meta_path;
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+
+    std::string buf(static_cast<size_t>(sz), '\0');
+    ssize_t n = pread(fd, buf.data(), buf.size(), 0);
+    if (n != sz) {
+        LOG(ERROR) << "Short read from " << meta_path;
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+
+    OffsetAllocatorPersistedMetadata meta;
+    try {
+        struct_pb::from_pb(meta, buf);
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "struct_pb::from_pb failed for " << meta_path << ": "
+                   << e.what();
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+
+    if (meta.version != 1) {
+        LOG(ERROR) << "Unsupported metadata version " << meta.version << " in "
+                   << meta_path;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (meta.allocator_state.empty()) {
+        LOG(ERROR) << "Empty allocator_state in " << meta_path;
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+
+    return meta;
+}
+
+//-----------------------------------------------------------------------------
+// RebuildShardMapsFromAllocator
+//-----------------------------------------------------------------------------
+
+void OffsetAllocatorStorageBackend::RebuildShardMapsFromAllocator() {
+    const int64_t kMaxKeyLen = 1 * 1024 * 1024;
+    int64_t rebuilt = 0;
+    int64_t skipped = 0;
+
+    // Lock all shards during rebuild (Init is single-threaded, but
+    // locking documents the invariant).
+    std::vector<std::unique_ptr<SharedMutexLocker>> shard_locks;
+    shard_locks.reserve(kNumShards);
+    for (size_t i = 0; i < kNumShards; ++i) {
+        shard_locks.emplace_back(
+            std::make_unique<SharedMutexLocker>(&shards_[i].mutex));
+    }
+    total_size_.store(0, std::memory_order_relaxed);
+    total_keys_.store(0, std::memory_order_relaxed);
+
+    allocator_->visit_used_nodes([&](uint64_t real_offset, uint64_t alloc_size,
+                                     uint32_t node_index) {
+        if (real_offset + RecordHeader::SIZE >
+            static_cast<uint64_t>(capacity_)) {
+            LOG(ERROR) << "[Recover] offset " << real_offset
+                       << " + header exceeds capacity " << capacity_;
+            ++skipped;
+            return;
+        }
+
+        char hdr_buf[RecordHeader::SIZE];
+        iovec hdr_iov = {hdr_buf, sizeof(hdr_buf)};
+        auto hdr_res = data_file_->vector_read(&hdr_iov, 1, real_offset);
+        if (!hdr_res || hdr_res.value() != RecordHeader::SIZE) {
+            LOG(ERROR) << "[Recover] Failed to read header at " << real_offset;
+            ++skipped;
+            return;
+        }
+        RecordHeader header{};
+        std::memcpy(&header.key_len, hdr_buf, sizeof(header.key_len));
+        std::memcpy(&header.value_len, hdr_buf + sizeof(header.key_len),
+                    sizeof(header.value_len));
+
+        if (header.key_len > kMaxKeyLen) {
+            LOG(ERROR) << "[Recover] Invalid key_len " << header.key_len
+                       << " at " << real_offset;
+            ++skipped;
+            return;
+        }
+
+        uint64_t record_size =
+            RecordHeader::SIZE + header.key_len + header.value_len;
+        if (record_size > alloc_size) {
+            LOG(ERROR) << "[Recover] record_size " << record_size
+                       << " > alloc_size " << alloc_size << " at "
+                       << real_offset;
+            ++skipped;
+            return;
+        }
+        if (record_size >
+            static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+            LOG(ERROR) << "[Recover] record_size " << record_size
+                       << " exceeds uint32_t at " << real_offset;
+            ++skipped;
+            return;
+        }
+        if (real_offset + record_size > static_cast<uint64_t>(capacity_)) {
+            LOG(ERROR) << "[Recover] record past capacity at " << real_offset;
+            ++skipped;
+            return;
+        }
+
+        std::string key(header.key_len, '\0');
+        iovec key_iov = {key.data(), static_cast<size_t>(header.key_len)};
+        auto key_res = data_file_->vector_read(
+            &key_iov, 1, real_offset + RecordHeader::SIZE);
+        if (!key_res ||
+            key_res.value() != static_cast<size_t>(header.key_len)) {
+            LOG(ERROR) << "[Recover] Failed to read key at " << real_offset;
+            ++skipped;
+            return;
+        }
+
+        auto handle = allocator_->createHandleAtNode(node_index, real_offset,
+                                                     record_size);
+        if (!handle.has_value()) {
+            LOG(ERROR) << "[Recover] createHandleAtNode failed for " << key
+                       << " at " << real_offset;
+            ++skipped;
+            return;
+        }
+
+        auto allocation_ptr = std::make_shared<RefCountedAllocationHandle>(
+            std::move(handle.value()));
+
+        size_t shard_idx = ShardForKey(key);
+        auto [it, inserted] = shards_[shard_idx].map.emplace(
+            key, ObjectEntry(real_offset, static_cast<uint32_t>(record_size),
+                             header.value_len, std::move(allocation_ptr),
+                             /*fifo_seq=*/0));
+
+        if (!inserted) {
+            LOG(ERROR) << "[Recover] Duplicate key " << key << " at "
+                       << real_offset << " (node_idx=" << node_index
+                       << " existing_offset=" << it->second.offset
+                       << ") -- kept existing, freed duplicate (RAII)";
+            ++skipped;
+            return;
+        }
+
+        total_size_.fetch_add(static_cast<int64_t>(record_size),
+                              std::memory_order_relaxed);
+        total_keys_.fetch_add(1, std::memory_order_relaxed);
+        ++rebuilt;
+    });
+
+    LOG(INFO) << "[Recover] RebuildShardMaps: " << rebuilt << " keys rebuilt, "
+              << skipped << " skipped (corrupt)";
+    if (rebuilt == 0) {
+        LOG(WARNING) << "[Recover] No records recovered -- data file "
+                        "may be empty or corrupt";
+    }
+}
+
+//-----------------------------------------------------------------------------
+// RestoreAndRepairFifoIndex
+//-----------------------------------------------------------------------------
+
+void OffsetAllocatorStorageBackend::RestoreAndRepairFifoIndex(
+    const OffsetAllocatorPersistedMetadata& meta) {
+    uint64_t max_seq = meta.insert_seq;
+    for (const auto& [seq, _] : meta.fifo_entries) {
+        max_seq = std::max(max_seq, seq);
+    }
+    insert_seq_.store(max_seq + 1, std::memory_order_relaxed);
+
+    {
+        MutexLocker ev(&eviction_mutex_);
+        fifo_index_.clear();
+        std::unordered_set<std::string> fifo_keys;
+
+        // Phase A: restore from persisted entries
+        for (const auto& [seq, key] : meta.fifo_entries) {
+            if (seq >= meta.insert_seq) {
+                LOG(WARNING) << "[Recover] seq " << seq << " >= insert_seq "
+                             << meta.insert_seq << " -- skipping";
+                continue;
+            }
+            size_t shard_idx = ShardForKey(key);
+            SharedMutexLocker lk(&shards_[shard_idx].mutex);
+            auto it = shards_[shard_idx].map.find(key);
+            if (it == shards_[shard_idx].map.end()) {
+                LOG(WARNING) << "[Recover] key " << key
+                             << " not in shard map -- skipping";
+                continue;
+            }
+            if (fifo_index_.count(seq)) {
+                LOG(WARNING) << "[Recover] Duplicate seq " << seq
+                             << " -- deferred to Phase B";
+                continue;
+            }
+            fifo_index_[seq] = key;
+            fifo_keys.insert(key);
+            it->second.fifo_seq = seq;
+        }
+
+        // Phase B: repair -- assign new seq to any shard-map entry
+        // not yet in the FIFO index
+        for (size_t s = 0; s < kNumShards; ++s) {
+            SharedMutexLocker lk(&shards_[s].mutex);
+            for (auto& [key, entry] : shards_[s].map) {
+                if (!fifo_keys.count(key)) {
+                    uint64_t new_seq =
+                        insert_seq_.fetch_add(1, std::memory_order_relaxed);
+                    entry.fifo_seq = new_seq;
+                    fifo_index_[new_seq] = key;
+                    fifo_keys.insert(key);
+                }
+            }
+        }
+
+        // Phase C: delete evicted keys that were resurrected
+        for (const auto& key : meta.evicted_keys_this_batch) {
+            size_t shard_idx = ShardForKey(key);
+            SharedMutexLocker lk(&shards_[shard_idx].mutex);
+            auto it = shards_[shard_idx].map.find(key);
+            if (it != shards_[shard_idx].map.end()) {
+                total_size_.fetch_sub(
+                    static_cast<int64_t>(it->second.total_size),
+                    std::memory_order_relaxed);
+                total_keys_.fetch_sub(1, std::memory_order_relaxed);
+                fifo_index_.erase(it->second.fifo_seq);
+                shards_[shard_idx].map.erase(it);
+            }
+        }
+    }
+
+    LOG(INFO) << "[Recover] FIFO index restored: " << fifo_index_.size()
+              << " entries";
+}
+
+//-----------------------------------------------------------------------------
+// TryRecoverFromMetadata
+//-----------------------------------------------------------------------------
+
+bool OffsetAllocatorStorageBackend::TryRecoverFromMetadata() {
+    try {
+        namespace fs = std::filesystem;
+
+        struct FallbackGuard {
+            std::atomic<int64_t>& ctr;
+            bool disarmed = false;
+            FallbackGuard(std::atomic<int64_t>& c) : ctr(c) {}
+            ~FallbackGuard() {
+                if (!disarmed) ctr.fetch_add(1, std::memory_order_relaxed);
+            }
+            void disarm() { disarmed = true; }
+        } fallback_guard(metadata_load_fallbacks_);
+
+        std::string meta_path = GetMetaFilePath();
+        std::string tmp_path = meta_path + ".tmp";
+        std::error_code ec_tmp, ec_meta;
+
+        // Clean up stale tmp
+        if (fs::exists(tmp_path, ec_tmp)) {
+            if (!fs::exists(meta_path, ec_meta)) {
+                fs::remove(tmp_path, ec_tmp);
+                LOG(INFO) << "Orphaned .meta.tmp cleaned up";
+                fallback_guard.disarm();
+                return false;
+            }
+            fs::remove(tmp_path, ec_tmp);
+        }
+
+        if (!fs::exists(meta_path, ec_meta)) {
+            fallback_guard.disarm();
+            return false;
+        }
+
+        LOG(INFO) << "Recovery path: " << meta_path << " found";
+
+        // Load metadata
+        auto meta_result = LoadMetadata();
+        if (!meta_result) {
+            LOG(ERROR) << "LoadMetadata failed, falling back to fresh start";
+            return false;
+        }
+        OffsetAllocatorPersistedMetadata meta = std::move(meta_result.value());
+
+        // Deserialize allocator into local shared_ptr; only move to
+        // member on full success
+        std::shared_ptr<offset_allocator::OffsetAllocator> alloc;
+        try {
+            const auto* data = reinterpret_cast<const SerializedByte*>(
+                meta.allocator_state.data());
+            std::vector<SerializedByte> alloc_buf(
+                data, data + meta.allocator_state.size());
+            alloc =
+                deserialize_from<offset_allocator::OffsetAllocator>(alloc_buf);
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "Allocator deserialization threw: " << e.what()
+                       << " -- fresh start";
+            return false;
+        }
+        if (!alloc) {
+            LOG(ERROR) << "Allocator deserialization returned null"
+                          " -- fresh start";
+            return false;
+        }
+
+        // Verify capacity match
+        {
+            auto metrics = alloc->get_metrics();
+            if (static_cast<uint64_t>(metrics.capacity) != capacity_) {
+                LOG(WARNING) << "Allocator capacity mismatch: serialized "
+                             << metrics.capacity << " vs current " << capacity_
+                             << ". total_size_limit may have changed; "
+                                "falling back to fresh start.";
+                return false;
+            }
+        }
+
+        // Open data file without truncation
+        data_file_path_ = GetDataFilePath();
+        int flags = O_CLOEXEC | O_RDWR;
+        int raw_fd = open(data_file_path_.c_str(), flags, 0644);
+        if (raw_fd < 0) {
+            LOG(ERROR) << "Failed to open data file: " << data_file_path_;
+            return false;
+        }
+        FdGuard fd_guard(raw_fd);
+
+        // Verify data file size matches capacity_
+        off_t actual_size = lseek(fd_guard.get(), 0, SEEK_END);
+        if (actual_size < 0) {
+            LOG(ERROR) << "lseek failed on data file: " << strerror(errno);
+            return false;
+        }
+        if (static_cast<uint64_t>(actual_size) != capacity_) {
+            LOG(WARNING) << "data file size mismatch: expected " << capacity_
+                         << ", got " << actual_size
+                         << " -- falling back to fresh start";
+            return false;
+        }
+
+#ifdef USE_URING
+        if (file_storage_config_.use_uring) {
+            data_file_ = std::make_unique<UringFile>(
+                data_file_path_, fd_guard.release(), 32, true);
+        } else
+#endif
+        {
+            data_file_ = std::make_unique<PosixFile>(data_file_path_,
+                                                     fd_guard.release());
+        }
+        data_file_->SetDeleteOnWriteFail(false);
+
+        // Move allocator to member only after all checks pass
+        allocator_ = std::move(alloc);
+
+        // Clear and rebuild shard maps
+        {
+            std::vector<std::unique_ptr<SharedMutexLocker>> locks;
+            locks.reserve(kNumShards);
+            for (size_t i = 0; i < kNumShards; ++i) {
+                locks.emplace_back(
+                    std::make_unique<SharedMutexLocker>(&shards_[i].mutex));
+                shards_[i].map.clear();
+            }
+        }
+        total_size_.store(0, std::memory_order_relaxed);
+        total_keys_.store(0, std::memory_order_relaxed);
+
+        RebuildShardMapsFromAllocator();
+        RestoreAndRepairFifoIndex(meta);
+
+        fallback_guard.disarm();
+
+        LOG(INFO) << "OffsetAllocatorStorageBackend recovered: "
+                  << total_keys_.load() << " keys, " << total_size_.load()
+                  << " bytes";
+        return true;
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Recovery failed with exception: " << e.what();
+        return false;
+    } catch (...) {
+        LOG(ERROR) << "Recovery failed with unknown exception";
+        return false;
+    }
+}
 
 void OffsetAllocatorStorageBackend::EvictToMakeRoom(
     int64_t required_bytes, size_t min_victims,
@@ -3205,6 +3842,7 @@ void OffsetAllocatorStorageBackend::EvictToMakeRoom(
                 // per-key delete path neglects to also erase from
                 // fifo_index_.  Keep the lazy-repair as a defense.
                 fifo_index_.erase(oldest);
+                metadata_dirty_.store(true, std::memory_order_relaxed);
                 ++n;  // counted toward scan budget
                 continue;
             }
@@ -3218,6 +3856,10 @@ void OffsetAllocatorStorageBackend::EvictToMakeRoom(
                                   std::memory_order_relaxed);
             total_keys_.fetch_sub(1, std::memory_order_relaxed);
             shard.map.erase(it);
+            if (cfg_.persist_mode != OffsetPersistMode::kDisabled) {
+                all_evicted_this_batch_.push_back(vkey);
+            }
+            metadata_dirty_.store(true, std::memory_order_relaxed);
         }
         fifo_index_.erase(oldest);
         out_evicted.push_back(std::move(vkey));
@@ -3241,10 +3883,9 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
     // total_size_ / total_keys_ assume only ONE thread calls
     // BatchOffload at a time (currently guaranteed by FileStorage's
     // single heartbeat_thread_).  The atomics make individual loads
-    // and stores atomic, but the read-modify-write sequences (check
-    // watermark → evict → update counters) are NOT atomic across
-    // threads.  If concurrent offload is added, the DCHECK_GE guards
-    // in EvictToMakeRoom must also be re-evaluated.
+    // and stores atomic, but the read-modify-write sequences are NOT
+    // atomic across threads.  If concurrent offload is added, the
+    // DCHECK_GE guards in EvictToMakeRoom must also be re-evaluated.
     // ================================================================
 
     if (!initialized_.load(std::memory_order_acquire)) {
@@ -3269,9 +3910,6 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
         (cfg_.eviction_policy != OffsetEvictionPolicy::NONE) &&
         (eviction_handler != nullptr);
 
-    // Warn if eviction policy is set but caller omitted the handler.
-    // IsEnableOffloading() will still return true in this mode, but
-    // eviction is effectively disabled (degraded to NONE behavior).
     if (cfg_.eviction_policy != OffsetEvictionPolicy::NONE &&
         eviction_handler == nullptr) {
         LOG_FIRST_N(WARNING, 1)
@@ -3281,7 +3919,7 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
     }
 
     // Build the set of keys being offloaded in this batch so that
-    // EvictToMakeRoom does not evict them (they aren't committed yet).
+    // EvictToMakeRoom does not evict them.
     std::unordered_set<std::string> batch_keys;
     if (eviction_on) {
         for (const auto& [k, _] : batch_object) batch_keys.insert(k);
@@ -3292,9 +3930,6 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
     keys.reserve(batch_object.size());
     metadatas.reserve(batch_object.size());
 
-    // Accumulated evicted keys across the per-key loop.
-    // Flushed to eviction_handler before each allocate() that may reuse
-    // freed space, and again after the loop for any leftover victims.
     std::vector<std::string> evicted_keys;
 
     for (const auto& [key, slices] : batch_object) {
@@ -3311,22 +3946,18 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
             total_value_size += slice.size;
         }
         if (total_value_size > UINT32_MAX) {
-            LOG(ERROR)
-                << "Object too large for SSD offload (value_len must fit "
-                   "in 4 GiB) for key: "
-                << key << ", size: " << total_value_size
-                << " - skipping this key";
+            LOG(ERROR) << "Object too large for SSD offload for key: " << key
+                       << ", size: " << total_value_size;
             continue;
         }
         uint32_t value_size = static_cast<uint32_t>(total_value_size);
 
         RecordHeader header{.key_len = static_cast<uint32_t>(key.size()),
                             .value_len = value_size};
+
         size_t record_size =
             RecordHeader::SIZE + header.key_len + header.value_len;
 
-        // Guard against record_size exceeding what the on-disk format
-        // can represent (ObjectEntry::total_size is uint32_t).
         if (record_size > UINT32_MAX) {
             LOG(ERROR) << "Record too large for key: " << key
                        << ", record_size=" << record_size;
@@ -3341,20 +3972,17 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
                                high_watermark_bytes_);
             bool over_keys = (cur_keys > high_watermark_keys_);
             if (over_bytes || over_keys) {
-                // When triggered by key-count overflow, force at least
-                // fallback_evict_batch victims even if bytes are low.
                 size_t min_v = over_keys ? cfg_.fallback_evict_batch : 0;
                 EvictToMakeRoom(static_cast<int64_t>(record_size), min_v,
                                 batch_keys, evicted_keys);
             }
         }
 
-        // ---- (B) Notify master of evicted keys BEFORE allocating ----
-        // Layer-1 (byte safety): BatchLoad pins extents via shared_ptr,
-        // so the allocator cannot re-issue a still-read offset.  Layer-2
-        // (master metadata): the master must be told the key's local-disk
-        // replica is gone before we reuse its space for a new key.
-        if (eviction_on && eviction_handler && !evicted_keys.empty()) {
+        // ---- (B) Notify master + accumulate tombstone ----
+        if (eviction_on && !evicted_keys.empty()) {
+            all_evicted_this_batch_.insert(all_evicted_this_batch_.end(),
+                                           evicted_keys.begin(),
+                                           evicted_keys.end());
             eviction_handler(evicted_keys);
             evicted_keys.clear();
         }
@@ -3375,57 +4003,54 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
                 EvictToMakeRoom(static_cast<int64_t>(record_size),
                                 cfg_.fallback_evict_batch, batch_keys,
                                 evicted_keys);
-                size_t evicted_this_turn = evicted_keys.size() - before;
-                fallback_total_evicted += evicted_this_turn;
+                fallback_total_evicted += (evicted_keys.size() - before);
 
-                // Notify master of fallback victims before retrying.
-                if (eviction_handler && !evicted_keys.empty()) {
+                if (eviction_on && !evicted_keys.empty()) {
+                    all_evicted_this_batch_.insert(
+                        all_evicted_this_batch_.end(), evicted_keys.begin(),
+                        evicted_keys.end());
                     eviction_handler(evicted_keys);
                     evicted_keys.clear();
                 }
 
                 uint64_t now_largest =
                     allocator_->get_metrics().largest_free_region_;
-                if (evicted_this_turn == 0) break;  // no victims at all
-                // Stop if the largest free region did not grow at all.
-                // Using `prev_largest` (rather than `prev_largest +
-                // record_size / 2`) allows gradual coalescence when
-                // many small victims must be evicted for one large
-                // allocation.  The `fallback_total_evicted` cap still
-                // bounds total eviction per key.
+                if (before == evicted_keys.size()) break;
                 if (now_largest <= prev_largest) break;
                 prev_largest = now_largest;
                 allocation = allocator_->allocate(record_size);
             }
         }
 
-        // ---- Handle allocation failure ----
         if (!allocation.has_value()) {
             if (eviction_on) {
                 eviction_skips_.fetch_add(1, std::memory_order_relaxed);
                 LOG(WARNING) << "Skipping key after eviction attempts: " << key;
-                continue;  // eviction enabled: try next key
+                continue;
             } else {
                 LOG(ERROR) << "Failed to allocate " << record_size
                            << " bytes for key: " << key
-                           << " - stopping processing for this batch";
-                break;  // eviction disabled: preserve old break semantics
+                           << " - stopping processing";
+                break;
             }
         }
 
         uint64_t offset = allocation->address();
 
-        // ---- (E) Disk write (unchanged from original) ----
+        // ---- (E) Disk write ----
         std::vector<iovec> iovs;
         iovs.reserve(2 + 1 + slices.size());
+
         iovs.push_back(
             {const_cast<char*>(reinterpret_cast<const char*>(&header.key_len)),
              sizeof(header.key_len)});
         iovs.push_back({const_cast<char*>(
                             reinterpret_cast<const char*>(&header.value_len)),
                         sizeof(header.value_len)});
+
         iovs.push_back({const_cast<char*>(key.data()),
                         static_cast<size_t>(header.key_len)});
+
         for (const auto& slice : slices) {
             iovs.push_back({slice.ptr, slice.size});
         }
@@ -3451,9 +4076,6 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
             size_t shard_idx = ShardForKey(key);
             auto& shard = shards_[shard_idx];
 
-            // Lock order: eviction_mutex_ -> shard.mutex.
-            // Both insert and evict paths obey this order, preventing
-            // the overwrite-vs-evict race on fifo_index_.
             std::optional<MutexLocker> ev_lock;
             if (eviction_on) ev_lock.emplace(&eviction_mutex_);
             SharedMutexLocker shard_lock(&shard.mutex);
@@ -3466,7 +4088,6 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
             if (eviction_on) {
                 seq = insert_seq_.fetch_add(1, std::memory_order_relaxed);
                 if (!is_new_key) {
-                    // Overwrite: drop old size and remove old FIFO slot.
                     size_delta -= static_cast<int64_t>(it->second.total_size);
                     fifo_index_.erase(it->second.fifo_seq);
                 }
@@ -3477,7 +4098,7 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
             shard.map.insert_or_assign(
                 key, ObjectEntry(offset, static_cast<uint32_t>(record_size),
                                  value_size, std::move(allocation_ptr), seq));
-
+            metadata_dirty_.store(true, std::memory_order_relaxed);
             if (eviction_on) fifo_index_.emplace(seq, key);
 
             total_size_.fetch_add(size_delta, std::memory_order_relaxed);
@@ -3493,30 +4114,90 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
                                   static_cast<int64_t>(value_size), ""});
     }
 
-    // ---- Post-loop flush: notify master of any evicted keys that
-    // were accumulated by the last (possibly allocate-failing) key.
+    // ---- Persistence barrier (kRelaxed / kStrict) ----
+    // Reconstruct set of keys successfully written in this batch
+    std::unordered_set<std::string> successfully_written_keys_set(keys.begin(),
+                                                                  keys.end());
+
+    const bool persist_enabled =
+        (cfg_.persist_mode == OffsetPersistMode::kRelaxed ||
+         cfg_.persist_mode == OffsetPersistMode::kStrict);
+
+    if (persist_enabled && metadata_dirty_.load(std::memory_order_relaxed) &&
+        ShouldPersistNow()) {
+        // Filter stale tombstones: remove keys that were successfully
+        // re-written in this batch from all_evicted_this_batch_.
+        if (!all_evicted_this_batch_.empty() &&
+            !successfully_written_keys_set.empty()) {
+            auto it = std::remove_if(
+                all_evicted_this_batch_.begin(), all_evicted_this_batch_.end(),
+                [&](const std::string& k) {
+                    return successfully_written_keys_set.count(k);
+                });
+            if (it != all_evicted_this_batch_.end()) {
+                LOG(INFO) << "Cleared " << all_evicted_this_batch_.end() - it
+                          << " stale eviction tombstones";
+                all_evicted_this_batch_.erase(it,
+                                              all_evicted_this_batch_.end());
+            }
+        }
+
+        // data fsync (REQUIRED: ensures metadata points to
+        // durable data)
+        auto sync_res = data_file_->datasync();
+        if (!sync_res) {
+            LOG(ERROR) << "datasync failed: "
+                       << static_cast<int>(sync_res.error());
+            if (cfg_.persist_mode == OffsetPersistMode::kStrict) {
+                return tl::make_unexpected(sync_res.error());
+            }
+            // kRelaxed: skip this checkpoint, retry next interval
+        } else {
+            auto save_res = SaveMetadata(all_evicted_this_batch_);
+            if (!save_res) {
+                LOG(WARNING)
+                    << "Checkpoint failed (mode="
+                    << static_cast<int>(cfg_.persist_mode)
+                    << "), will retry in " << cfg_.persist_interval_seconds
+                    << "s: " << static_cast<int>(save_res.error());
+                if (cfg_.persist_mode == OffsetPersistMode::kStrict) {
+                    return tl::make_unexpected(save_res.error());
+                }
+                // kRelaxed: keep metadata_dirty_=true (DirtyGuard
+                // restores it), retry next interval
+            } else {
+                all_evicted_this_batch_.clear();
+                last_persist_time_us_.store(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count(),
+                    std::memory_order_relaxed);
+            }
+        }
+    }
+
+    // ---- Post-loop eviction handler flush ----
     if (eviction_on && eviction_handler && !evicted_keys.empty()) {
         eviction_handler(evicted_keys);
         evicted_keys.clear();
     }
 
+    // ---- Complete handler ----
     if (complete_handler != nullptr && !keys.empty()) {
         auto error_code = complete_handler(keys, metadatas);
         if (error_code != ErrorCode::OK) {
             LOG(ERROR) << "Complete handler failed: " << error_code << " - "
                        << keys.size()
-                       << " keys were successfully written to disk but master "
-                          "was not notified. "
-                       << "Master will learn about them via ScanMeta on next "
-                          "restart.";
+                       << " keys were successfully written to disk but "
+                          "master was not notified. "
+                       << "Master will learn about them via ScanMeta on "
+                          "next restart.";
             return tl::make_unexpected(error_code);
         }
     }
 
     return static_cast<int64_t>(keys.size());
 }
-
-//-----------------------------------------------------------------------------
 
 tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
     std::unordered_map<std::string, Slice>& batched_slices) {

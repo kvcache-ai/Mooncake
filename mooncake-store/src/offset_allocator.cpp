@@ -683,4 +683,20 @@ std::ostream& operator<<(std::ostream& os,
     return os;
 }
 
+// ============================================================================
+// Recovery helpers
+// ============================================================================
+
+std::optional<OffsetAllocationHandle> OffsetAllocator::createHandleAtNode(
+    uint32_t node_index, uint64_t real_offset, uint64_t requested_size) {
+    MutexLocker guard(&m_mutex);
+    if (!m_allocator || node_index >= m_allocator->m_current_capacity)
+        return std::nullopt;
+    const auto& node = m_allocator->m_nodes[node_index];
+    if (!node.used) return std::nullopt;
+    OffsetAllocation allocation(node.dataOffset, node_index);
+    return OffsetAllocationHandle(shared_from_this(), allocation, real_offset,
+                                  requested_size);
+}
+
 }  // namespace mooncake::offset_allocator

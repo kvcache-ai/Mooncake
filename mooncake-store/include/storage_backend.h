@@ -206,6 +206,12 @@ enum class OffsetEvictionPolicy {
     LRU,   // Approximate LRU via cross-shard sampling (phase 2)
 };
 
+enum class OffsetPersistMode {
+    kDisabled,  // No persistence (default)
+    kRelaxed,   // Periodic checkpoint
+    kStrict,    // Every BatchOffload is durable
+};
+
 struct OffsetAllocatorBackendConfig {
     OffsetEvictionPolicy eviction_policy = OffsetEvictionPolicy::NONE;
 
@@ -236,7 +242,29 @@ struct OffsetAllocatorBackendConfig {
     bool Validate() const;
 
     static OffsetAllocatorBackendConfig FromEnvironment();
+
+    // ---- Persistence settings ----
+    OffsetPersistMode persist_mode = OffsetPersistMode::kDisabled;
+    int64_t persist_interval_seconds = 60;
 };
+
+// ===== Persistence metadata structures =====
+
+struct PersistedFifoEntry {
+    uint64_t seq;
+    std::string key;
+};
+YLT_REFL(PersistedFifoEntry, seq, key);
+
+struct OffsetAllocatorPersistedMetadata {
+    uint32_t version = 1;
+    std::string allocator_state;
+    uint64_t insert_seq = 0;
+    std::vector<PersistedFifoEntry> fifo_entries;
+    std::vector<std::string> evicted_keys_this_batch;
+};
+YLT_REFL(OffsetAllocatorPersistedMetadata, version, allocator_state, insert_seq,
+         fifo_entries, evicted_keys_this_batch);
 
 struct FileStorageConfig {
     // type of the storage backend
@@ -1304,9 +1332,52 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
                          const std::unordered_set<std::string>& batch_keys,
                          std::vector<std::string>& out_evicted);
 
+    // ===== Persistence methods =====
+
+    std::string GetMetaFilePath() const;
+
+    bool ShouldPersistNow() const;
+
+    tl::expected<void, ErrorCode> SaveMetadata(
+        const std::vector<std::string>& evicted_keys_this_batch);
+
+    tl::expected<OffsetAllocatorPersistedMetadata, ErrorCode> LoadMetadata();
+
+    void RebuildShardMapsFromAllocator();
+
+    void RestoreAndRepairFifoIndex(
+        const OffsetAllocatorPersistedMetadata& meta);
+
+    bool TryRecoverFromMetadata();
+
     // Test-only: Predicate to determine which keys should fail in BatchOffload.
     // Used for deterministic testing of partial success behavior.
     std::function<bool(const std::string& key)> test_failure_predicate_;
+
+   private:
+    // ---- Persistence state ----
+    std::atomic<int64_t> last_persist_time_us_{0};
+    std::vector<std::string> all_evicted_this_batch_;
+    std::atomic<bool> metadata_dirty_{false};
+
+    // ---- Persistence metrics ----
+    std::atomic<int64_t> last_save_metadata_cost_us_{0};
+    std::atomic<int64_t> metadata_save_failures_{0};
+    std::atomic<int64_t> metadata_load_fallbacks_{0};
+
+    // ---- Test-only hooks ----
+    std::atomic<int> test_metadata_write_failure_step_{0};
+
+   public:
+    // ---- Test accessors ----
+    void SetMetadataWriteFailure(int step) {
+        test_metadata_write_failure_step_ = step;
+    }
+    size_t GetAllEvictedThisBatchSizeForTest() const {
+        return all_evicted_this_batch_.size();
+    }
+
+   private:
 };
 
 tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>

@@ -5,6 +5,7 @@
 #include <memory>
 #include <optional>
 #include <vector>
+#include <algorithm>
 #include <glog/logging.h>
 
 #include "mutex.h"
@@ -43,6 +44,7 @@ struct OffsetAllocation {
 
     friend class __Allocator;
     friend class Serializer<OffsetAllocationHandle>;
+    friend class OffsetAllocator;  // for createHandleAtNode during recovery
 };
 
 struct OffsetAllocStorageReport {
@@ -156,6 +158,17 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     [[nodiscard]]
     std::optional<OffsetAllocationHandle> allocate(size_t size);
 
+    // ===== Recovery helpers =====
+
+    template <typename Func>
+    void visit_used_nodes(Func&& callback) const;
+
+    [[nodiscard]] std::optional<OffsetAllocationHandle> createHandleAtNode(
+        uint32_t node_index, uint64_t real_offset, uint64_t requested_size);
+
+    // ===== Recovery helpers =====
+
+    // Visit every used (allocated) node in the allocator.
     // Get storage report (thread-safe)
     [[nodiscard]]
     OffsetAllocStorageReport storageReport() const;
@@ -266,6 +279,8 @@ class __Allocator {
 
     friend class OffsetAllocatorTest;  // for unit tests
     friend class mooncake::Serializer<__Allocator>;
+    friend class OffsetAllocator;
+    friend class OffsetAllocator;  // for visit_used_nodes / createHandleAtNode
 };
 
 // Template method implementations
@@ -359,6 +374,38 @@ __Allocator::__Allocator(T& serializer) {
     } catch (const std::exception& e) {
         LOG(ERROR) << "Deserializing __Allocator failed, error=" << e.what();
         throw std::runtime_error("Deserializing __Allocator failed");
+    }
+}
+
+// Out-of-line template definition for visit_used_nodes (must be
+// after __Allocator is fully defined to access m_nodes etc.)
+template <typename Func>
+void OffsetAllocator::visit_used_nodes(Func&& callback) const {
+    struct NodeInfo {
+        uint64_t real_offset;
+        uint64_t alloc_size;
+        uint32_t node_index;
+    };
+    std::vector<NodeInfo> infos;
+    {
+        MutexLocker guard(&m_mutex);
+        if (!m_allocator) return;
+        infos.reserve(std::min<uint64_t>(
+            static_cast<uint64_t>(m_allocator->m_current_capacity) / 4,
+            m_allocated_num * 2ULL + 16));
+        for (uint32_t i = 0; i < m_allocator->m_current_capacity; ++i) {
+            const auto& node = m_allocator->m_nodes[i];
+            if (node.used) {
+                infos.push_back(
+                    {m_base + (static_cast<uint64_t>(node.dataOffset)
+                               << m_multiplier_bits),
+                     static_cast<uint64_t>(node.dataSize) << m_multiplier_bits,
+                     i});
+            }
+        }
+    }
+    for (const auto& info : infos) {
+        callback(info.real_offset, info.alloc_size, info.node_index);
     }
 }
 
