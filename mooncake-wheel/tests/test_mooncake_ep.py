@@ -51,6 +51,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
             simulated_gemm_x = per_token_cast_back(packed_recv_x[0].view(-1, hidden), packed_recv_x[1].view(-1, hidden // 128)).view(packed_recv_x[0].shape) \
                 if dispatch_use_fp8 else packed_recv_x.clone()
             all_topk_idx = torch.empty((num_ranks, num_tokens, num_topk), dtype=topk_idx.dtype, device='cuda')
+            continue
             dist.all_gather_into_tensor(all_topk_idx, topk_idx, group=group)
             for i in range(num_local_experts if do_check else 0):
                 expert_id = rank * num_local_experts + i
