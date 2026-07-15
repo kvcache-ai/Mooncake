@@ -120,6 +120,22 @@ void WaitForReplicaNotReady(MasterService& service, const std::string& key,
     EXPECT_EQ(result.error(), ErrorCode::REPLICA_IS_NOT_READY);
 }
 
+void WaitForObjectNotFound(MasterService& service, const std::string& key,
+                           std::chrono::seconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto result = service.GetReplicaList(key, "default");
+        if (!result.has_value() &&
+            result.error() == ErrorCode::OBJECT_NOT_FOUND) {
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    auto result = service.GetReplicaList(key, "default");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::OBJECT_NOT_FOUND);
+}
+
 void ExpectNextAllocationOnSegment(MasterService& service,
                                    const UUID& client_id,
                                    const std::string& key,
@@ -890,10 +906,7 @@ TEST_F(MasterServiceSSDTest,
     ASSERT_FALSE(mismatch_result.has_value());
     EXPECT_EQ(mismatch_result.error(), ErrorCode::REPLICA_IS_NOT_READY);
 
-    std::this_thread::sleep_for(std::chrono::seconds(2));
-    auto expired_result = service->GetReplicaList(key, "default");
-    ASSERT_FALSE(expired_result.has_value());
-    EXPECT_EQ(expired_result.error(), ErrorCode::OBJECT_NOT_FOUND);
+    WaitForObjectNotFound(*service, key, std::chrono::seconds(4));
 
     MountMemoryAndLocalDisk(*service, same_marker_late_client,
                             "ssd_expire_same_marker_late", 0x1300000000ULL,
