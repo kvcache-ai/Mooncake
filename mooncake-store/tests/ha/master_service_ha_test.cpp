@@ -4107,11 +4107,13 @@ TEST_F(MasterServiceHATest,
         service->AddReplica(client_id, key, kDefaultTenant, local_disk_replica);
     ASSERT_TRUE(add_res.has_value());
 
+    // Inject failure before expiry so the background reaper cannot discard
+    // the PROCESSING replica successfully during the wait.
+    mock_store->SetWriteError(ErrorCode::PERSISTENT_FAIL);
+
     // Wait for put_start_release_timeout to elapse so Part 1 considers
     // the PROCESSING replica expired.
     std::this_thread::sleep_for(std::chrono::milliseconds(2100));
-
-    mock_store->SetWriteError(ErrorCode::PERSISTENT_FAIL);
 
     // Drive an eviction cycle which calls DiscardExpiredProcessingReplicas
     // up-front. With persist failing, the PROCESSING memory replica must

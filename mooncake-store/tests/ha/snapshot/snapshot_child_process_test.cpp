@@ -105,6 +105,7 @@ class SnapshotChildProcessTest : public ::testing::Test {
                           .set_enable_ha(true)
                           .set_ha_backend_type("etcd")
                           .set_ha_backend_connstring(etcd_endpoints)
+                          .set_oplog_store_type("etcd")
                           .set_cluster_id(cluster_id)
                           .set_snapshot_backup_dir(tmp_dir() + "/backup")
                           .set_snapshot_interval_seconds(100)
