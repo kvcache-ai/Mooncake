@@ -104,6 +104,20 @@ class MasterServiceTest : public ::testing::Test {
         service.CleanupExpiredSoftPins(now);
     }
 
+    void SetSoftPinDeadlineForTest(
+        MasterService& service, const std::string& key,
+        const std::chrono::system_clock::time_point& deadline,
+        const std::string& tenant_id = "default") {
+        const auto normalized_tenant =
+            service.NormalizeRequestTenantId(tenant_id);
+        const size_t shard_idx =
+            service.getMetadataShardIndex(normalized_tenant, key);
+        MasterService::MetadataShardAccessorRW shard(&service, shard_idx);
+        auto& metadata = shard->tenants.at(normalized_tenant).metadata.at(key);
+        SpinLocker locker(&metadata.lock);
+        metadata.soft_pin_timeout = deadline;
+    }
+
     std::string WriteTenantPolicyFile(
         const std::map<std::string, uint64_t>& tenant_quotas) {
         TenantQuotaPolicySnapshot snapshot;
@@ -4642,6 +4656,55 @@ TEST_F(MasterServiceTest, SoftPinActionsCommitOnFirstReadableUpsert) {
               before_enable_again + std::chrono::seconds(5));
     EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
               baseline + 1);
+}
+
+TEST_F(MasterServiceTest,
+       ExpiredSoftPinIsNotCarriedAcrossUpsertMetadataReplacement) {
+    std::unique_ptr<MasterService> service(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service);
+    const UUID client_a = generate_uuid();
+    const UUID client_b = generate_uuid();
+    const int64_t baseline =
+        MasterMetricManager::instance().get_soft_pin_key_count();
+
+    ReplicateConfig enable;
+    enable.soft_pin_action = SoftPinAction::ENABLE;
+    enable.soft_pin_ttl_ms = 10000;
+    ReplicateConfig preserve;
+
+    ASSERT_TRUE(
+        service->PutStart(client_a, "preempted", "default", 1024, enable)
+            .has_value());
+    ASSERT_TRUE(
+        service->PutEnd(client_a, "preempted", "default", ReplicaType::MEMORY)
+            .has_value());
+    SetSoftPinDeadlineForTest(
+        *service, "preempted",
+        std::chrono::system_clock::now() - std::chrono::seconds(1));
+    ASSERT_TRUE(
+        service->UpsertStart(client_a, "preempted", "default", 1024, preserve)
+            .has_value());
+    ASSERT_TRUE(
+        service->UpsertStart(client_b, "preempted", "default", 1024, preserve)
+            .has_value());
+    EXPECT_FALSE(GetSoftPinDeadline(*service, "preempted").has_value());
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline);
+
+    ASSERT_TRUE(service->PutStart(client_a, "resized", "default", 1024, enable)
+                    .has_value());
+    ASSERT_TRUE(
+        service->PutEnd(client_a, "resized", "default", ReplicaType::MEMORY)
+            .has_value());
+    SetSoftPinDeadlineForTest(
+        *service, "resized",
+        std::chrono::system_clock::now() - std::chrono::seconds(1));
+    ASSERT_TRUE(
+        service->UpsertStart(client_a, "resized", "default", 2048, preserve)
+            .has_value());
+    EXPECT_FALSE(GetSoftPinDeadline(*service, "resized").has_value());
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              baseline);
 }
 
 TEST_F(MasterServiceTest, RepeatedPutEndDoesNotRefreshSoftPin) {

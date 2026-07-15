@@ -1506,7 +1506,7 @@ void MasterService::CleanupExpiredSoftPins(
     for (size_t shard_idx = 0; shard_idx < kNumShards; ++shard_idx) {
         int shard_expired_count = 0;
         {
-            MetadataShardAccessorRW shard(this, shard_idx);
+            MetadataShardAccessorRO shard(this, shard_idx);
             for (auto& [tenant_id, tenant_state] : shard->tenants) {
                 for (auto& [key, metadata] : tenant_state.metadata) {
                     shard_expired_count -=
@@ -3345,6 +3345,10 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     if (!metadata.HasReplica(&Replica::fn_is_completed)) {
                         case_a_committed_soft_pin_timeout =
                             metadata.GetCommittedSoftPinTimeout();
+                        if (case_a_committed_soft_pin_timeout &&
+                            *case_a_committed_soft_pin_timeout <= now) {
+                            case_a_committed_soft_pin_timeout.reset();
+                        }
                         EraseMetadata(tenant_state, it, object_id.tenant_id,
                                       QuotaEraseMode::kFull, &shard);
                         it = tenant_state.metadata.end();
@@ -3442,6 +3446,10 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     merged_config.with_hard_pin || metadata.IsHardPinned();
                 auto committed_soft_pin_timeout =
                     metadata.GetCommittedSoftPinTimeout();
+                if (committed_soft_pin_timeout &&
+                    *committed_soft_pin_timeout <= now) {
+                    committed_soft_pin_timeout.reset();
+                }
 
                 const std::string existing_group_id = metadata.group_id;
                 const uint64_t old_quota_charge =
