@@ -16,6 +16,18 @@ DEFINE_string(master_server_address, "127.0.0.1:50051",
               "Master server address");
 DEFINE_string(protocol, "tcp", "Protocol");
 DEFINE_int32(port, 50052, "Real Client service port");
+DEFINE_string(redis_cluster_id, mooncake::DEFAULT_CLUSTER_ID,
+              "Redis HA cluster ID for redis:// master discovery");
+DEFINE_string(redis_username, "",
+              "Redis ACL username for redis:// master discovery");
+DEFINE_string(redis_password, "",
+              "Redis AUTH password for redis:// master discovery");
+DEFINE_int32(redis_db_index, 0,
+             "Redis database index for redis:// master discovery");
+DEFINE_int32(redis_master_view_ttl_sec, 5,
+             "Redis master view TTL for redis:// master discovery");
+DEFINE_int32(redis_heartbeat_interval_sec, 2,
+             "Redis heartbeat interval for redis:// master discovery");
 DEFINE_string(global_segment_size, "4 GB", "Size of global segment");
 DEFINE_int32(threads, 1, "Number of rpc threads for dummy client");
 DEFINE_bool(enable_offload, false, "Enable offload availability");
@@ -144,7 +156,10 @@ int main(int argc, char* argv[]) {
                 FLAGS_p2p_key_lease_scan_interval_ms,
                 FLAGS_p2p_transfer_direction_mode, FLAGS_runtime_config,
                 FLAGS_enable_client_metric_collection,
-                FLAGS_metric_report_interval_seconds);
+                FLAGS_metric_report_interval_seconds, FLAGS_redis_cluster_id,
+                FLAGS_redis_password, FLAGS_redis_db_index,
+                FLAGS_redis_master_view_ttl_sec,
+                FLAGS_redis_heartbeat_interval_sec, FLAGS_redis_username);
         } else {
             if (FLAGS_deployment_mode != "Centralization") {
                 LOG(WARNING)
@@ -162,7 +177,10 @@ int main(int argc, char* argv[]) {
                 FLAGS_enable_offload, static_cast<uint16_t>(FLAGS_http_port),
                 FLAGS_enable_http_server, {}, static_cast<uint16_t>(FLAGS_port),
                 FLAGS_runtime_config, FLAGS_enable_client_metric_collection,
-                FLAGS_metric_report_interval_seconds);
+                FLAGS_metric_report_interval_seconds, FLAGS_redis_cluster_id,
+                FLAGS_redis_password, FLAGS_redis_db_index,
+                FLAGS_redis_master_view_ttl_sec,
+                FLAGS_redis_heartbeat_interval_sec, FLAGS_redis_username);
         }
     }();
 

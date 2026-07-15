@@ -122,8 +122,22 @@ bool MasterProcessHandler::start() {
         // Execute the master
         std::string rpc_address_arg = "--rpc-address=" + config_.rpc_address;
         std::string rpc_port_arg = "--rpc-port=" + std::to_string(port_);
-        std::vector<std::string> args = {master_path_, "--enable-ha=true",
-                                         rpc_address_arg, rpc_port_arg};
+        std::vector<std::string> args = {
+            master_path_,
+            "--enable-ha=true",
+            rpc_address_arg,
+            rpc_port_arg,
+            "--deployment-mode=" + config_.deployment_mode,
+            "--max-replicas-per-key=" +
+                std::to_string(config_.max_replicas_per_key)};
+
+        if (config_.enable_oplog) {
+            args.emplace_back("--enable-oplog=true");
+            args.emplace_back("--oplog-store-type=" + config_.oplog_store_type);
+            if (!config_.oplog_data_dir.empty()) {
+                args.emplace_back("--oplog-data-dir=" + config_.oplog_data_dir);
+            }
+        }
 
         if (config_.election_backend == "redis") {
             args.emplace_back("--election-backend=redis");
@@ -151,7 +165,9 @@ bool MasterProcessHandler::start() {
 
         LOG(INFO) << "[m" << index_ << "] Exec master " << rpc_address_arg
                   << " " << rpc_port_arg
-                  << " backend=" << config_.election_backend;
+                  << " backend=" << config_.election_backend
+                  << " deployment=" << config_.deployment_mode
+                  << " enable_oplog=" << config_.enable_oplog;
         std::vector<char*> argv;
         argv.reserve(args.size() + 1);
         for (auto& arg : args) {

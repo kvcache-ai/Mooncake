@@ -3,14 +3,16 @@
 #include <cstring>
 #include <stdexcept>
 
+#include "p2p_client_service.h"
 #include "utils.h"
 
 namespace mooncake {
 namespace testing {
 
 ClientTestWrapper::ClientTestWrapper(std::shared_ptr<ClientService> client,
-                                     std::shared_ptr<SimpleAllocator> allocator)
-    : client_(client), allocator_(allocator) {}
+                                     std::shared_ptr<SimpleAllocator> allocator,
+                                     bool is_p2p)
+    : client_(client), is_p2p_(is_p2p), allocator_(allocator) {}
 
 ClientTestWrapper::~ClientTestWrapper() {
     for (auto& [base, segment] : segments_) {
@@ -23,18 +25,52 @@ ClientTestWrapper::CreateClientWrapper(
     const std::string& hostname, const std::string& metadata_connstring,
     const std::string& protocol, const std::string& device_name,
     const std::string& master_server_entry, size_t local_buffer_size,
-    const std::string& redis_cluster_id, bool enable_http_server) {
-    auto config = ClientConfigBuilder::build_centralized_real_client(
-        hostname, metadata_connstring, protocol, device_name,
-        master_server_entry, 0, local_buffer_size, nullptr, "", false, 9003,
-        enable_http_server);
-    if (!redis_cluster_id.empty()) {
-        config.redis_cluster_id = redis_cluster_id;
-    }
-    auto client_opt = ClientService::Create(config);
-
-    if (!client_opt.has_value()) {
-        return std::nullopt;
+    const std::string& redis_cluster_id, bool enable_http_server,
+    const std::string& deployment_mode,
+    const std::string& p2p_local_transfer_mode, uint16_t p2p_client_rpc_port,
+    const std::string& redis_username, const std::string& redis_password) {
+    std::shared_ptr<ClientService> client;
+    if (deployment_mode == "P2P") {
+        static constexpr const char* kP2PTierConfig =
+            R"({"tiers": [{"type": "DRAM", "capacity": 67108864, "priority": 100}]})";
+        auto config = ClientConfigBuilder::build_p2p_real_client(
+            hostname, metadata_connstring, protocol, device_name,
+            master_server_entry, kP2PTierConfig, local_buffer_size, nullptr, "",
+            p2p_client_rpc_port, /*rpc_thread_num=*/2,
+            /*lock_shard_count=*/1024,
+            /*route_cache_max_memory_bytes=*/300 * 1024 * 1024,
+            /*route_cache_ttl_ms=*/60 * 1000, p2p_local_transfer_mode,
+            /*local_memcpy_async_worker_num=*/32, /*http_port=*/9003,
+            enable_http_server);
+        if (!redis_cluster_id.empty()) {
+            config.redis_cluster_id = redis_cluster_id;
+        }
+        config.redis_username = redis_username;
+        config.redis_password = redis_password;
+        client = std::make_shared<P2PClientService>(
+            config.metadata_connstring, config.http_port,
+            config.enable_http_server, config.labels);
+        auto err =
+            std::static_pointer_cast<P2PClientService>(client)->Init(config);
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "failed to init P2P client, error=" << err;
+            return std::nullopt;
+        }
+    } else {
+        auto config = ClientConfigBuilder::build_centralized_real_client(
+            hostname, metadata_connstring, protocol, device_name,
+            master_server_entry, 0, local_buffer_size, nullptr, "", false, 9003,
+            enable_http_server);
+        if (!redis_cluster_id.empty()) {
+            config.redis_cluster_id = redis_cluster_id;
+        }
+        config.redis_username = redis_username;
+        config.redis_password = redis_password;
+        auto client_opt = ClientService::Create(config);
+        if (!client_opt.has_value()) {
+            return std::nullopt;
+        }
+        client = client_opt.value();
     }
 
     std::shared_ptr<SimpleAllocator> allocator =
@@ -44,7 +80,7 @@ ClientTestWrapper::CreateClientWrapper(
         return std::nullopt;
     }
 
-    auto register_result = client_opt.value()->RegisterLocalMemory(
+    auto register_result = client->RegisterLocalMemory(
         allocator->getBase(), local_buffer_size, "cpu:0", false, false);
     ErrorCode error_code =
         register_result.has_value() ? ErrorCode::OK : register_result.error();
@@ -54,7 +90,8 @@ ClientTestWrapper::CreateClientWrapper(
                    << ", error=" << error_code;
         return std::nullopt;
     }
-    return std::make_shared<ClientTestWrapper>(client_opt.value(), allocator);
+    return std::make_shared<ClientTestWrapper>(client, allocator,
+                                               deployment_mode == "P2P");
 }
 
 ErrorCode ClientTestWrapper::Mount(const size_t size, void*& buffer) {
@@ -105,7 +142,6 @@ ErrorCode ClientTestWrapper::Get(const std::string& key, std::string& value) {
     if (query_result.value()->replicas.empty()) {
         return ErrorCode::INVALID_REPLICA;
     }
-
     uint64_t total_size =
         calculate_total_size(query_result.value()->replicas[0]);
     if (total_size == 0) {
@@ -140,11 +176,11 @@ ErrorCode ClientTestWrapper::Put(const std::string& key,
         offset += slice.size;
     }
 
-    // Configure replication
-    ReplicateConfig config;
-    config.replica_num = 1;
-
     // Perform put operation
+    ReplicateConfig replicate_config;
+    replicate_config.replica_num = 1;
+    WriteConfig config = is_p2p_ ? WriteConfig{WriteRouteRequestConfig{}}
+                                 : WriteConfig{replicate_config};
     auto put_result = client_->Put(key, slice_guard.slices_, config);
     return put_result.has_value() ? ErrorCode::OK : put_result.error();
 }

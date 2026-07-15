@@ -33,7 +33,8 @@ class ClientTestWrapper {
      * @param allocator Allocate slice memory for get and put operations.
      */
     ClientTestWrapper(std::shared_ptr<ClientService> client,
-                      std::shared_ptr<SimpleAllocator> allocator);
+                      std::shared_ptr<SimpleAllocator> allocator,
+                      bool is_p2p = false);
     ~ClientTestWrapper();
 
     // The client wrapper is not copyable.
@@ -64,7 +65,12 @@ class ClientTestWrapper {
                         const std::string& master_server_entry,
                         size_t local_buffer_size = 1024 * 1024 * 128,
                         const std::string& redis_cluster_id = "",
-                        bool enable_http_server = true);
+                        bool enable_http_server = true,
+                        const std::string& deployment_mode = "Centralization",
+                        const std::string& p2p_local_transfer_mode = "memcpy",
+                        uint16_t p2p_client_rpc_port = 0,
+                        const std::string& redis_username = "",
+                        const std::string& redis_password = "");
 
     // Mount a segment. The buffer will be used to unmount the segment.
     ErrorCode Mount(const size_t size, void*& buffer);
@@ -97,6 +103,7 @@ class ClientTestWrapper {
 
     // The client instance.
     std::shared_ptr<ClientService> client_;
+    bool is_p2p_{false};
     // The segments that are mounted by the client.
     std::unordered_map<uintptr_t, SegmentInfo> segments_;
     // Manage the memory allocation for get and put operations.
