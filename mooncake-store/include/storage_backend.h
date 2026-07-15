@@ -1076,6 +1076,15 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
         const FileStorageConfig& file_storage_config_,
         const OffsetAllocatorBackendConfig& offset_backend_config = {});
 
+    ~OffsetAllocatorStorageBackend();
+    OffsetAllocatorStorageBackend(OffsetAllocatorStorageBackend&&) = default;
+    OffsetAllocatorStorageBackend& operator=(OffsetAllocatorStorageBackend&&) =
+        default;
+    OffsetAllocatorStorageBackend(const OffsetAllocatorStorageBackend&) =
+        delete;
+    OffsetAllocatorStorageBackend& operator=(
+        const OffsetAllocatorStorageBackend&) = delete;
+
     /**
      * @brief Initializes the offset allocator storage backend.
      * Creates/truncates the data file and initializes the allocator.
@@ -1339,7 +1348,7 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     bool ShouldPersistNow() const;
 
     tl::expected<void, ErrorCode> SaveMetadata(
-        const std::vector<std::string>& evicted_keys_this_batch);
+        const std::unordered_set<std::string>& evicted_keys_this_batch);
 
     tl::expected<OffsetAllocatorPersistedMetadata, ErrorCode> LoadMetadata();
 
@@ -1357,13 +1366,14 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
    private:
     // ---- Persistence state ----
     std::atomic<int64_t> last_persist_time_us_{0};
-    std::vector<std::string> all_evicted_this_batch_;
+    std::unordered_set<std::string> all_evicted_this_batch_;
     std::atomic<bool> metadata_dirty_{false};
 
     // ---- Persistence metrics ----
     std::atomic<int64_t> last_save_metadata_cost_us_{0};
     std::atomic<int64_t> metadata_save_failures_{0};
     std::atomic<int64_t> metadata_load_fallbacks_{0};
+    std::atomic<int64_t> metadata_consecutive_failures_{0};
 
     // ---- Test-only hooks ----
     std::atomic<int> test_metadata_write_failure_step_{0};
@@ -1375,6 +1385,15 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     }
     size_t GetAllEvictedThisBatchSizeForTest() const {
         return all_evicted_this_batch_.size();
+    }
+    int64_t GetMetadataSaveFailures() const {
+        return metadata_save_failures_.load(std::memory_order_relaxed);
+    }
+    int64_t GetMetadataLoadFallbacks() const {
+        return metadata_load_fallbacks_.load(std::memory_order_relaxed);
+    }
+    int64_t GetMetadataConsecutiveFailures() const {
+        return metadata_consecutive_failures_.load(std::memory_order_relaxed);
     }
 
    private:

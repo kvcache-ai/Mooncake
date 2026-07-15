@@ -279,7 +279,6 @@ class __Allocator {
 
     friend class OffsetAllocatorTest;  // for unit tests
     friend class mooncake::Serializer<__Allocator>;
-    friend class OffsetAllocator;
     friend class OffsetAllocator;  // for visit_used_nodes / createHandleAtNode
 };
 

@@ -2979,6 +2979,41 @@ OffsetAllocatorStorageBackend::OffsetAllocatorStorageBackend(
     capacity_ = file_storage_config_.total_size_limit;
 }
 
+OffsetAllocatorStorageBackend::~OffsetAllocatorStorageBackend() {
+    try {
+        if (cfg_.persist_mode == OffsetPersistMode::kDisabled) return;
+        if (!initialized_.load(std::memory_order_acquire)) return;
+        if (!data_file_) return;
+
+        if (!metadata_dirty_.load(std::memory_order_relaxed)) {
+            // Nothing to persist.
+            return;
+        }
+
+        // Best-effort final checkpoint on graceful shutdown.
+        auto sync_res = data_file_->datasync();
+        if (!sync_res) {
+            LOG(ERROR) << "Final checkpoint datasync failed: "
+                       << static_cast<int>(sync_res.error());
+            return;
+        }
+
+        auto save_res = SaveMetadata(all_evicted_this_batch_);
+        if (!save_res) {
+            LOG(ERROR) << "Final checkpoint SaveMetadata failed: "
+                       << static_cast<int>(save_res.error());
+            return;
+        }
+
+        all_evicted_this_batch_.clear();
+        LOG(INFO) << "Final persistence checkpoint completed on shutdown";
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Final checkpoint threw: " << e.what();
+    } catch (...) {
+        LOG(ERROR) << "Final checkpoint threw unknown exception";
+    }
+}
+
 std::string OffsetAllocatorStorageBackend::GetDataFilePath() const {
     return (std::filesystem::path(storage_path_) / "kv_cache.data").string();
 }
@@ -3252,7 +3287,7 @@ bool OffsetAllocatorStorageBackend::ShouldPersistNow() const {
 //-----------------------------------------------------------------------------
 
 tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::SaveMetadata(
-    const std::vector<std::string>& evicted_keys_this_batch) {
+    const std::unordered_set<std::string>& evicted_keys_this_batch) {
     namespace fs = std::filesystem;
 
     if (!metadata_dirty_.exchange(false, std::memory_order_relaxed) &&
@@ -3262,132 +3297,144 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::SaveMetadata(
 
     int step = test_metadata_write_failure_step_.exchange(
         0, std::memory_order_relaxed);
-    struct DirtyGuard {
-        std::atomic<bool>& dirty;
-        std::atomic<int64_t>& failures;
-        bool active = true;
-        DirtyGuard(std::atomic<bool>& d, std::atomic<int64_t>& f)
-            : dirty(d), failures(f) {}
-        ~DirtyGuard() {
-            if (active) {
-                dirty.store(true, std::memory_order_relaxed);
-                failures.fetch_add(1, std::memory_order_relaxed);
+    try {
+        struct DirtyGuard {
+            std::atomic<bool>& dirty;
+            std::atomic<int64_t>& failures;
+            bool active = true;
+            DirtyGuard(std::atomic<bool>& d, std::atomic<int64_t>& f)
+                : dirty(d), failures(f) {}
+            ~DirtyGuard() {
+                if (active) {
+                    dirty.store(true, std::memory_order_relaxed);
+                    failures.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            void disarm() { active = false; }
+        } dirty_guard(metadata_dirty_, metadata_save_failures_);
+
+        auto t_start = std::chrono::steady_clock::now();
+
+        // 1. Serialize allocator
+        std::vector<SerializedByte> alloc_buf;
+        ErrorCode ec = serialize_to(*allocator_, alloc_buf);
+        if (ec != ErrorCode::OK || alloc_buf.empty()) {
+            return tl::make_unexpected(
+                ec != ErrorCode::OK ? ec : ErrorCode::INTERNAL_ERROR);
+        }
+        if (step == 1) return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+
+        // 2. Build metadata struct
+        OffsetAllocatorPersistedMetadata meta;
+        meta.version = 1;
+        meta.allocator_state.assign(
+            reinterpret_cast<const char*>(alloc_buf.data()), alloc_buf.size());
+        meta.evicted_keys_this_batch.assign(evicted_keys_this_batch.begin(),
+                                            evicted_keys_this_batch.end());
+
+        {
+            MutexLocker ev(&eviction_mutex_);
+            meta.insert_seq = insert_seq_.load(std::memory_order_relaxed);
+            meta.fifo_entries.reserve(fifo_index_.size());
+            for (const auto& [seq, key] : fifo_index_) {
+                meta.fifo_entries.push_back({seq, key});
             }
         }
-        void disarm() { active = false; }
-    } dirty_guard(metadata_dirty_, metadata_save_failures_);
 
-    auto t_start = std::chrono::steady_clock::now();
-
-    // 1. Serialize allocator
-    std::vector<SerializedByte> alloc_buf;
-    ErrorCode ec = serialize_to(*allocator_, alloc_buf);
-    if (ec != ErrorCode::OK || alloc_buf.empty()) {
-        return tl::make_unexpected(
-            ec != ErrorCode::OK ? ec : ErrorCode::INTERNAL_ERROR);
-    }
-    if (step == 1) return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-
-    // 2. Build metadata struct
-    OffsetAllocatorPersistedMetadata meta;
-    meta.version = 1;
-    meta.allocator_state.assign(reinterpret_cast<const char*>(alloc_buf.data()),
-                                alloc_buf.size());
-    meta.evicted_keys_this_batch = evicted_keys_this_batch;
-
-    {
-        MutexLocker ev(&eviction_mutex_);
-        meta.insert_seq = insert_seq_.load(std::memory_order_relaxed);
-        meta.fifo_entries.reserve(fifo_index_.size());
-        for (const auto& [seq, key] : fifo_index_) {
-            meta.fifo_entries.push_back({seq, key});
+        // 3. Serialize metadata
+        std::string buf;
+        try {
+            struct_pb::to_pb(meta, buf);
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "struct_pb::to_pb failed in SaveMetadata: "
+                       << e.what();
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
-    }
+        if (buf.empty()) {
+            LOG(ERROR) << "struct_pb produced empty metadata buffer";
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
 
-    // 3. Serialize metadata
-    std::string buf;
-    try {
-        struct_pb::to_pb(meta, buf);
-    } catch (const std::exception& e) {
-        LOG(ERROR) << "struct_pb::to_pb failed in SaveMetadata: " << e.what();
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-    }
-    if (buf.empty()) {
-        LOG(ERROR) << "struct_pb produced empty metadata buffer";
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
+        // 4. Atomic write via tmp + rename
+        std::string meta_path = GetMetaFilePath();
+        std::string tmp_path = meta_path + ".tmp";
 
-    // 4. Atomic write via tmp + rename
-    std::string meta_path = GetMetaFilePath();
-    std::string tmp_path = meta_path + ".tmp";
+        int fd = open(tmp_path.c_str(),
+                      O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (fd < 0) {
+            LOG(ERROR) << "Failed to create " << tmp_path << ": "
+                       << strerror(errno);
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
 
-    int fd =
-        open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    if (fd < 0) {
-        LOG(ERROR) << "Failed to create " << tmp_path << ": "
-                   << strerror(errno);
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-    }
-
-    const char* ptr = buf.data();
-    size_t remaining = buf.size();
-    while (remaining > 0) {
-        ssize_t n = write(fd, ptr, remaining);
-        if (n <= 0) {
-            if (n < 0 && errno == EINTR) continue;
-            LOG(ERROR) << "write failed on " << tmp_path << ": "
-                       << (n < 0 ? strerror(errno) : "returned 0");
+        const char* ptr = buf.data();
+        size_t remaining = buf.size();
+        while (remaining > 0) {
+            ssize_t n = write(fd, ptr, remaining);
+            if (n <= 0) {
+                if (n < 0 && errno == EINTR) continue;
+                LOG(ERROR) << "write failed on " << tmp_path << ": "
+                           << (n < 0 ? strerror(errno) : "returned 0");
+                close(fd);
+                unlink(tmp_path.c_str());
+                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+            }
+            ptr += n;
+            remaining -= n;
+        }
+        if (step == 2) {
             close(fd);
             unlink(tmp_path.c_str());
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
-        ptr += n;
-        remaining -= n;
-    }
-    if (step == 2) {
+
+        // Use fsync (not fdatasync) for the metadata file: metadata is
+        // small and we need inode metadata (file size) durable as well.
+        if (fsync(fd) != 0) {
+            LOG(ERROR) << "fsync failed on " << tmp_path;
+            close(fd);
+            unlink(tmp_path.c_str());
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
         close(fd);
-        unlink(tmp_path.c_str());
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+
+        if (rename(tmp_path.c_str(), meta_path.c_str()) != 0) {
+            LOG(ERROR) << "rename " << tmp_path << " -> " << meta_path
+                       << " failed: " << strerror(errno);
+            unlink(tmp_path.c_str());
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        if (step == 3) return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+
+        // fsync parent directory
+        fs::path parent = fs::path(meta_path).parent_path();
+        if (parent.empty()) parent = ".";
+        int dir_fd = open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (dir_fd < 0) {
+            LOG(ERROR) << "open parent dir failed: " << strerror(errno);
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        FdGuard dir_guard(dir_fd);
+        if (fsync(dir_fd) != 0) {
+            LOG(ERROR) << "fsync parent dir failed: " << strerror(errno);
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+
+        dirty_guard.disarm();
+
+        last_save_metadata_cost_us_.store(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t_start)
+                .count(),
+            std::memory_order_relaxed);
+
+        return {};
+    } catch (const std::exception& e) {
+        // std::bad_alloc or other exception during serialization.
+        // DirtyGuard restores metadata_dirty_ on scope exit.
+        LOG(ERROR) << "SaveMetadata failed with exception: " << e.what();
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-
-    if (fdatasync(fd) != 0) {
-        LOG(ERROR) << "fdatasync failed on " << tmp_path;
-        close(fd);
-        unlink(tmp_path.c_str());
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-    }
-    close(fd);
-
-    if (rename(tmp_path.c_str(), meta_path.c_str()) != 0) {
-        LOG(ERROR) << "rename " << tmp_path << " -> " << meta_path
-                   << " failed: " << strerror(errno);
-        unlink(tmp_path.c_str());
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-    }
-    if (step == 3) return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-
-    // fsync parent directory
-    fs::path parent = fs::path(meta_path).parent_path();
-    int dir_fd = open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (dir_fd < 0) {
-        LOG(ERROR) << "open parent dir failed: " << strerror(errno);
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-    }
-    FdGuard dir_guard(dir_fd);
-    if (fsync(dir_fd) != 0) {
-        LOG(ERROR) << "fsync parent dir failed: " << strerror(errno);
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-    }
-
-    dirty_guard.disarm();
-
-    last_save_metadata_cost_us_.store(
-        std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - t_start)
-            .count(),
-        std::memory_order_relaxed);
-
-    return {};
 }
 
 //-----------------------------------------------------------------------------
@@ -3462,10 +3509,19 @@ void OffsetAllocatorStorageBackend::RebuildShardMapsFromAllocator() {
 
     allocator_->visit_used_nodes([&](uint64_t real_offset, uint64_t alloc_size,
                                      uint32_t node_index) {
+        // Helper: free a corrupt/unrecoverable node via RAII.
+        // Creates a temporary handle with requested_size=0 to avoid
+        // m_allocated_size underflow, then lets it go out of scope.
+        auto free_leaked_node = [&]() {
+            auto h = allocator_->createHandleAtNode(node_index, real_offset,
+                                                    /*requested_size=*/0);
+        };
+
         if (real_offset + RecordHeader::SIZE >
             static_cast<uint64_t>(capacity_)) {
             LOG(ERROR) << "[Recover] offset " << real_offset
                        << " + header exceeds capacity " << capacity_;
+            free_leaked_node();
             ++skipped;
             return;
         }
@@ -3475,6 +3531,7 @@ void OffsetAllocatorStorageBackend::RebuildShardMapsFromAllocator() {
         auto hdr_res = data_file_->vector_read(&hdr_iov, 1, real_offset);
         if (!hdr_res || hdr_res.value() != RecordHeader::SIZE) {
             LOG(ERROR) << "[Recover] Failed to read header at " << real_offset;
+            free_leaked_node();
             ++skipped;
             return;
         }
@@ -3486,6 +3543,7 @@ void OffsetAllocatorStorageBackend::RebuildShardMapsFromAllocator() {
         if (header.key_len > kMaxKeyLen) {
             LOG(ERROR) << "[Recover] Invalid key_len " << header.key_len
                        << " at " << real_offset;
+            free_leaked_node();
             ++skipped;
             return;
         }
@@ -3496,6 +3554,7 @@ void OffsetAllocatorStorageBackend::RebuildShardMapsFromAllocator() {
             LOG(ERROR) << "[Recover] record_size " << record_size
                        << " > alloc_size " << alloc_size << " at "
                        << real_offset;
+            free_leaked_node();
             ++skipped;
             return;
         }
@@ -3503,11 +3562,13 @@ void OffsetAllocatorStorageBackend::RebuildShardMapsFromAllocator() {
             static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
             LOG(ERROR) << "[Recover] record_size " << record_size
                        << " exceeds uint32_t at " << real_offset;
+            free_leaked_node();
             ++skipped;
             return;
         }
         if (real_offset + record_size > static_cast<uint64_t>(capacity_)) {
             LOG(ERROR) << "[Recover] record past capacity at " << real_offset;
+            free_leaked_node();
             ++skipped;
             return;
         }
@@ -3519,6 +3580,7 @@ void OffsetAllocatorStorageBackend::RebuildShardMapsFromAllocator() {
         if (!key_res ||
             key_res.value() != static_cast<size_t>(header.key_len)) {
             LOG(ERROR) << "[Recover] Failed to read key at " << real_offset;
+            free_leaked_node();
             ++skipped;
             return;
         }
@@ -3528,6 +3590,7 @@ void OffsetAllocatorStorageBackend::RebuildShardMapsFromAllocator() {
         if (!handle.has_value()) {
             LOG(ERROR) << "[Recover] createHandleAtNode failed for " << key
                        << " at " << real_offset;
+            free_leaked_node();
             ++skipped;
             return;
         }
@@ -3856,7 +3919,7 @@ void OffsetAllocatorStorageBackend::EvictToMakeRoom(
             total_keys_.fetch_sub(1, std::memory_order_relaxed);
             shard.map.erase(it);
             if (cfg_.persist_mode != OffsetPersistMode::kDisabled) {
-                all_evicted_this_batch_.push_back(vkey);
+                all_evicted_this_batch_.insert(vkey);
             }
             metadata_dirty_.store(true, std::memory_order_relaxed);
         }
@@ -3979,8 +4042,7 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
 
         // ---- (B) Notify master + accumulate tombstone ----
         if (eviction_on && !evicted_keys.empty()) {
-            all_evicted_this_batch_.insert(all_evicted_this_batch_.end(),
-                                           evicted_keys.begin(),
+            all_evicted_this_batch_.insert(evicted_keys.begin(),
                                            evicted_keys.end());
             eviction_handler(evicted_keys);
             evicted_keys.clear();
@@ -4005,16 +4067,16 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
                 fallback_total_evicted += (evicted_keys.size() - before);
 
                 if (eviction_on && !evicted_keys.empty()) {
-                    all_evicted_this_batch_.insert(
-                        all_evicted_this_batch_.end(), evicted_keys.begin(),
-                        evicted_keys.end());
+                    all_evicted_this_batch_.insert(evicted_keys.begin(),
+                                                   evicted_keys.end());
                     eviction_handler(evicted_keys);
                     evicted_keys.clear();
                 }
 
                 uint64_t now_largest =
                     allocator_->get_metrics().largest_free_region_;
-                if (before == evicted_keys.size()) break;
+                if (before == 0)
+                    break;  // evicted_keys is cleared after each notify
                 if (now_largest <= prev_largest) break;
                 prev_largest = now_largest;
                 allocation = allocator_->allocate(record_size);
@@ -4131,15 +4193,12 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
     // to delete the valid re-written key on recovery.
     if (persist_enabled && !all_evicted_this_batch_.empty() &&
         !successfully_written_keys_set.empty()) {
-        auto it = std::remove_if(
-            all_evicted_this_batch_.begin(), all_evicted_this_batch_.end(),
-            [&](const std::string& k) {
-                return successfully_written_keys_set.count(k);
-            });
-        if (it != all_evicted_this_batch_.end()) {
-            LOG(INFO) << "Cleared " << all_evicted_this_batch_.end() - it
-                      << " stale eviction tombstones";
-            all_evicted_this_batch_.erase(it, all_evicted_this_batch_.end());
+        size_t removed = 0;
+        for (const auto& k : successfully_written_keys_set) {
+            removed += all_evicted_this_batch_.erase(k);
+        }
+        if (removed > 0) {
+            LOG(INFO) << "Cleared " << removed << " stale eviction tombstones";
         }
     }
 
@@ -4158,17 +4217,25 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
         } else {
             auto save_res = SaveMetadata(all_evicted_this_batch_);
             if (!save_res) {
-                LOG(WARNING)
-                    << "Checkpoint failed (mode="
-                    << static_cast<int>(cfg_.persist_mode)
-                    << "), will retry in " << cfg_.persist_interval_seconds
-                    << "s: " << static_cast<int>(save_res.error());
+                auto fails = metadata_consecutive_failures_.fetch_add(
+                                 1, std::memory_order_relaxed) +
+                             1;
+                // Log every 10th consecutive failure (LOG_FIRST_N
+                // counts by call-site, not by content — use LOG(WARNING)).
+                if (fails % 10 == 0) {
+                    LOG(WARNING) << "Checkpoint " << fails
+                                 << " consecutive failures (mode="
+                                 << static_cast<int>(cfg_.persist_mode)
+                                 << "): " << static_cast<int>(save_res.error());
+                }
                 if (cfg_.persist_mode == OffsetPersistMode::kStrict) {
                     return tl::make_unexpected(save_res.error());
                 }
                 // kRelaxed: keep metadata_dirty_=true (DirtyGuard
                 // restores it), retry next interval
             } else {
+                metadata_consecutive_failures_.store(0,
+                                                     std::memory_order_relaxed);
                 all_evicted_this_batch_.clear();
                 last_persist_time_us_.store(
                     std::chrono::duration_cast<std::chrono::microseconds>(
@@ -4177,12 +4244,6 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
                     std::memory_order_relaxed);
             }
         }
-    }
-
-    // ---- Post-loop eviction handler flush ----
-    if (eviction_on && eviction_handler && !evicted_keys.empty()) {
-        eviction_handler(evicted_keys);
-        evicted_keys.clear();
     }
 
     // ---- Complete handler ----

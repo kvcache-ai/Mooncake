@@ -694,6 +694,17 @@ std::optional<OffsetAllocationHandle> OffsetAllocator::createHandleAtNode(
         return std::nullopt;
     const auto& node = m_allocator->m_nodes[node_index];
     if (!node.used) return std::nullopt;
+
+    // Cross-validate: real_offset must match the node's stored offset.
+    uint64_t expected_offset =
+        m_base + (static_cast<uint64_t>(node.dataOffset) << m_multiplier_bits);
+    if (expected_offset != real_offset) {
+        LOG(ERROR) << "node/offset mismatch: node_index=" << node_index
+                   << " expected_offset=" << expected_offset
+                   << " real_offset=" << real_offset;
+        return std::nullopt;
+    }
+
     OffsetAllocation allocation(node.dataOffset, node_index);
     return OffsetAllocationHandle(shared_from_this(), allocation, real_offset,
                                   requested_size);
