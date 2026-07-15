@@ -6,11 +6,13 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include <unistd.h>
 #include <gtest/gtest.h>
 
 namespace mooncake::test {
@@ -55,6 +57,13 @@ ReplicaPlacementShadowConfig ShadowConfig() {
     config.signal_ttl = std::chrono::seconds(30);
     config.sketch_width = 4096;
     config.sketch_depth = 4;
+    return config;
+}
+
+MasterReplicaPlacementShadowConfig ExplicitSignalShadowConfig() {
+    MasterReplicaPlacementShadowConfig config;
+    config.evaluator = ShadowConfig();
+    config.auto_collect_master_signals = false;
     return config;
 }
 
@@ -113,7 +122,7 @@ TEST_F(ReplicaPlacementMasterShadowTest, DefaultOffHasNoObserverState) {
 TEST_F(ReplicaPlacementMasterShadowTest,
        MissingSnapshotRecordsDegradedObservationWithoutActuation) {
     MasterServiceConfig config;
-    config.replica_placement_shadow_config = ShadowConfig();
+    config.replica_placement_shadow_config = ExplicitSignalShadowConfig();
     MasterService service(config);
     const UUID client_id = PrepareMemorySegment(service, "shadow_missing");
     PutObject(service, client_id, "key");
@@ -133,7 +142,7 @@ TEST_F(ReplicaPlacementMasterShadowTest,
 TEST_F(ReplicaPlacementMasterShadowTest,
        SingleAndBatchGetDriveShadowButAdminGetDoesNot) {
     MasterServiceConfig config;
-    config.replica_placement_shadow_config = ShadowConfig();
+    config.replica_placement_shadow_config = ExplicitSignalShadowConfig();
     MasterService service(config);
     ASSERT_EQ(
         service.PublishReplicaPlacementSignalSnapshot(AvailableSnapshot(1)),
@@ -169,7 +178,7 @@ TEST_F(ReplicaPlacementMasterShadowTest,
 TEST_F(ReplicaPlacementMasterShadowTest,
        ConcurrentGetsPreserveExactObservationCount) {
     MasterServiceConfig config;
-    config.replica_placement_shadow_config = ShadowConfig();
+    config.replica_placement_shadow_config = ExplicitSignalShadowConfig();
     MasterService service(config);
     ASSERT_EQ(
         service.PublishReplicaPlacementSignalSnapshot(AvailableSnapshot(1)),
@@ -200,6 +209,148 @@ TEST_F(ReplicaPlacementMasterShadowTest,
     service.RemoveAll();
 }
 
+TEST_F(ReplicaPlacementMasterShadowTest,
+       AutoCollectorPublishesRealMountedMemorySignalsWithBoundedRefresh) {
+    MasterReplicaPlacementShadowConfig shadow;
+    shadow.evaluator = ShadowConfig();
+    shadow.evaluator.policy
+        .targets[static_cast<size_t>(ReplicaTemperature::COLD)]
+                [Tier(ReplicaPlacementTier::MEMORY)]
+        .desired = 2;
+    shadow.auto_collect_master_signals = true;
+    shadow.signal_refresh_interval = std::chrono::seconds(1);
+    MasterServiceConfig config;
+    config.replica_placement_shadow_config = shadow;
+    MasterService service(config);
+    const UUID client_id = PrepareMemorySegment(service, "shadow_collector");
+    PutObject(service, client_id, "key");
+
+    ASSERT_TRUE(service.GetReplicaList("key", "default").has_value());
+    EXPECT_EQ(service.ReplicaPlacementShadowSignalGeneration(), 1);
+    ASSERT_TRUE(service.GetReplicaList("key", "default").has_value());
+    EXPECT_EQ(service.ReplicaPlacementShadowSignalGeneration(), 1)
+        << "refresh interval must prevent a signal scan on every Get";
+
+    const auto counters = service.GetReplicaPlacementShadowCounters();
+    ASSERT_TRUE(counters.has_value());
+    EXPECT_EQ(TotalObservations(*counters), 2);
+    EXPECT_EQ(counters->observations[Observation(
+                  ReplicaTemperature::COLD,
+                  ReplicaPlacementShadowSignalStatus::READY)],
+              1);
+    EXPECT_EQ(counters->observations[Observation(
+                  ReplicaTemperature::WARM,
+                  ReplicaPlacementShadowSignalStatus::READY)],
+              1);
+    EXPECT_EQ(counters->add_intents[Intent(ReplicaTemperature::COLD,
+                                           ReplicaPlacementTier::MEMORY)],
+              1);
+    service.RemoveAll();
+}
+
+TEST_F(ReplicaPlacementMasterShadowTest,
+       AutoCollectorUsesReportedLocalDiskCapacity) {
+    MasterReplicaPlacementShadowConfig shadow;
+    shadow.evaluator = ShadowConfig();
+    shadow.evaluator.policy.targets[static_cast<size_t>(
+        ReplicaTemperature::COLD)][Tier(ReplicaPlacementTier::LOCAL_DISK)] =
+        ReplicaTierTarget{1, true};
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.replica_placement_shadow_config = shadow;
+    MasterService service(config);
+    const UUID client_id = PrepareMemorySegment(service, "shadow_local_disk");
+    ASSERT_TRUE(service.MountLocalDiskSegment(client_id, true).has_value());
+    ASSERT_TRUE(service.ReportSsdCapacity(client_id, 1024 * 1024).has_value());
+    PutObject(service, client_id, "key");
+
+    ASSERT_TRUE(service.GetReplicaList("key", "default").has_value());
+    const auto counters = service.GetReplicaPlacementShadowCounters();
+    ASSERT_TRUE(counters.has_value());
+    EXPECT_EQ(counters->add_intents[Intent(ReplicaTemperature::COLD,
+                                           ReplicaPlacementTier::LOCAL_DISK)],
+              1);
+    service.RemoveAll();
+}
+
+TEST_F(ReplicaPlacementMasterShadowTest,
+       AutoCollectorKeepsUnreportedLocalDiskCapacityUnknown) {
+    MasterReplicaPlacementShadowConfig shadow;
+    shadow.evaluator = ShadowConfig();
+    shadow.evaluator.policy.targets[static_cast<size_t>(
+        ReplicaTemperature::COLD)][Tier(ReplicaPlacementTier::LOCAL_DISK)] =
+        ReplicaTierTarget{1, true};
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.replica_placement_shadow_config = shadow;
+    MasterService service(config);
+    const UUID client_id =
+        PrepareMemorySegment(service, "shadow_local_unknown");
+    ASSERT_TRUE(service.MountLocalDiskSegment(client_id, true).has_value());
+    PutObject(service, client_id, "key");
+
+    ASSERT_TRUE(service.GetReplicaList("key", "default").has_value());
+    const auto counters = service.GetReplicaPlacementShadowCounters();
+    ASSERT_TRUE(counters.has_value());
+    EXPECT_EQ(counters->add_intents[Intent(ReplicaTemperature::COLD,
+                                           ReplicaPlacementTier::LOCAL_DISK)],
+              0);
+    EXPECT_EQ(
+        counters->degraded[static_cast<size_t>(
+            ReplicaPlacementDegradedReason::REQUIRED_TIER_SIGNAL_UNKNOWN)],
+        1);
+    service.RemoveAll();
+}
+
+TEST_F(ReplicaPlacementMasterShadowTest,
+       AutoCollectorProbesConfiguredRemoteStoreDirectory) {
+    const auto root = std::filesystem::temp_directory_path() /
+                      ("mooncake_shadow_remote_" +
+                       std::to_string(static_cast<uint64_t>(::getpid())));
+    const std::string cluster_id = "cluster";
+    ASSERT_TRUE(std::filesystem::create_directories(root / cluster_id));
+
+    MasterReplicaPlacementShadowConfig shadow;
+    shadow.evaluator = ShadowConfig();
+    shadow.evaluator.policy.targets[static_cast<size_t>(
+        ReplicaTemperature::COLD)][Tier(ReplicaPlacementTier::REMOTE_STORE)] =
+        ReplicaTierTarget{2, true};
+    MasterServiceConfig config;
+    config.root_fs_dir = root.string();
+    config.cluster_id = cluster_id;
+    config.replica_placement_shadow_config = shadow;
+    {
+        MasterService service(config);
+        const UUID client_id =
+            PrepareMemorySegment(service, "shadow_remote_store");
+        PutObject(service, client_id, "key");
+
+        ASSERT_TRUE(service.GetReplicaList("key", "default").has_value());
+        const auto counters = service.GetReplicaPlacementShadowCounters();
+        ASSERT_TRUE(counters.has_value());
+        EXPECT_EQ(
+            counters->add_intents[Intent(ReplicaTemperature::COLD,
+                                         ReplicaPlacementTier::REMOTE_STORE)],
+            1);
+        service.RemoveAll();
+    }
+    std::error_code error;
+    std::filesystem::remove_all(root, error);
+    EXPECT_FALSE(error);
+}
+
+TEST(ReplicaPlacementMasterShadowConfigTest,
+     AutoCollectorRefreshCannotOutliveSignalTtl) {
+    MasterReplicaPlacementShadowConfig shadow;
+    shadow.evaluator = ShadowConfig();
+    shadow.evaluator.signal_ttl = std::chrono::milliseconds(10);
+    shadow.signal_refresh_interval = std::chrono::milliseconds(11);
+    MasterServiceConfig config;
+    config.replica_placement_shadow_config = shadow;
+
+    EXPECT_THROW((void)MasterService(config), std::invalid_argument);
+}
+
 TEST(ReplicaPlacementMasterShadowConfigTest,
      WrappedConfigPropagatesExplicitOptInOnly) {
     WrappedMasterServiceConfig wrapped;
@@ -207,11 +358,13 @@ TEST(ReplicaPlacementMasterShadowConfigTest,
     MasterServiceConfig disabled(wrapped);
     EXPECT_FALSE(disabled.replica_placement_shadow_config.has_value());
 
-    wrapped.replica_placement_shadow_config = ShadowConfig();
+    wrapped.replica_placement_shadow_config = ExplicitSignalShadowConfig();
     MasterServiceConfig enabled(wrapped);
     ASSERT_TRUE(enabled.replica_placement_shadow_config.has_value());
-    EXPECT_EQ(enabled.replica_placement_shadow_config->warm_threshold, 2);
-    EXPECT_EQ(enabled.replica_placement_shadow_config->hot_threshold, 3);
+    EXPECT_EQ(enabled.replica_placement_shadow_config->evaluator.warm_threshold,
+              2);
+    EXPECT_EQ(enabled.replica_placement_shadow_config->evaluator.hot_threshold,
+              3);
 }
 
 }  // namespace

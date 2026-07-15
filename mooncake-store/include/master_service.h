@@ -1951,10 +1951,21 @@ class MasterService {
     // metadata; only explicit configuration constructs it.
     std::unique_ptr<ReplicaPlacementShadowEvaluator>
         replica_placement_shadow_evaluator_;
+    bool replica_placement_shadow_auto_collect_signals_{false};
+    std::chrono::nanoseconds replica_placement_shadow_refresh_interval_{
+        std::chrono::seconds(1)};
+    std::atomic<bool> replica_placement_shadow_external_signal_source_{false};
+    std::mutex replica_placement_shadow_refresh_mutex_;
+    std::optional<ReplicaPlacementSignalClock::TimePoint>
+        replica_placement_shadow_last_refresh_;
 
     void ObserveReplicaPlacementShadow(
         const ObjectIdentity& object_id,
         std::span<const Replica::Descriptor> replicas);
+    void RefreshReplicaPlacementShadowSignals();
+    [[nodiscard]] ReplicaPlacementSignalSnapshot
+    CollectReplicaPlacementShadowSignals(
+        ReplicaPlacementSignalClock::TimePoint observed_at);
 
     const std::string ha_backend_type_;
 

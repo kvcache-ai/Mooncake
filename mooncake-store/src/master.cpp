@@ -388,13 +388,14 @@ DEFINE_bool(enable_cxl, false, "Whether to enable CXL memory support");
 
 namespace {
 
-mooncake::ReplicaPlacementShadowConfig LoadReplicaPlacementShadowProfile(
+mooncake::MasterReplicaPlacementShadowConfig LoadReplicaPlacementShadowProfile(
     const std::string& path) {
     mooncake::DefaultConfig profile;
     profile.SetPath(path);
     profile.Load();
 
-    mooncake::ReplicaPlacementShadowConfig config;
+    mooncake::MasterReplicaPlacementShadowConfig master_config;
+    auto& config = master_config.evaluator;
     uint32_t warm_threshold = config.warm_threshold;
     uint32_t hot_threshold = config.hot_threshold;
     uint64_t signal_ttl_ms = static_cast<uint64_t>(
@@ -402,11 +403,21 @@ mooncake::ReplicaPlacementShadowConfig LoadReplicaPlacementShadowProfile(
             .count());
     uint64_t sketch_width = config.sketch_width;
     uint64_t sketch_depth = config.sketch_depth;
+    uint64_t signal_refresh_interval_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            master_config.signal_refresh_interval)
+            .count());
     profile.GetUInt32("warm_threshold", &warm_threshold, warm_threshold);
     profile.GetUInt32("hot_threshold", &hot_threshold, hot_threshold);
     profile.GetDurationMs("signal_ttl", &signal_ttl_ms, signal_ttl_ms);
     profile.GetUInt64("sketch_width", &sketch_width, sketch_width);
     profile.GetUInt64("sketch_depth", &sketch_depth, sketch_depth);
+    profile.GetBool("auto_collect_master_signals",
+                    &master_config.auto_collect_master_signals,
+                    master_config.auto_collect_master_signals);
+    profile.GetDurationMs("signal_refresh_interval",
+                          &signal_refresh_interval_ms,
+                          signal_refresh_interval_ms);
     profile.GetUInt32("min_complete_replicas",
                       &config.policy.min_complete_replicas,
                       config.policy.min_complete_replicas);
@@ -425,6 +436,8 @@ mooncake::ReplicaPlacementShadowConfig LoadReplicaPlacementShadowProfile(
     config.signal_ttl = std::chrono::milliseconds(signal_ttl_ms);
     config.sketch_width = static_cast<size_t>(sketch_width);
     config.sketch_depth = static_cast<size_t>(sketch_depth);
+    master_config.signal_refresh_interval =
+        std::chrono::milliseconds(signal_refresh_interval_ms);
 
     constexpr std::array<std::string_view, 3> kTemperatureNames = {
         "cold", "warm", "hot"};
@@ -450,10 +463,10 @@ mooncake::ReplicaPlacementShadowConfig LoadReplicaPlacementShadowProfile(
                 mooncake::ReplicaTierTarget{desired, required};
         }
     }
-    return config;
+    return master_config;
 }
 
-std::optional<mooncake::ReplicaPlacementShadowConfig>
+std::optional<mooncake::MasterReplicaPlacementShadowConfig>
 LoadOptionalReplicaPlacementShadowProfile(const std::string& path) {
     if (path.empty()) return std::nullopt;
     return LoadReplicaPlacementShadowProfile(path);
