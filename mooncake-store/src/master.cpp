@@ -2,12 +2,15 @@
 #include <glog/logging.h>
 
 #include <atomic>  // For std::atomic
+#include <array>
 #include <chrono>  // For std::chrono
 #include <csignal>
 #include <cstdlib>  // For std::getenv
 #include <fstream>  // For std::ifstream
 #include <memory>   // For std::unique_ptr
+#include <limits>
 #include <string>
+#include <string_view>
 #include <thread>  // For std::thread
 #include <json/json.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
@@ -225,6 +228,11 @@ DEFINE_uint32(promotion_max_per_heartbeat, 1,
               "SSD-read + RDMA-write on the client; serializing them avoids "
               "blocking past the client-liveness window. Default 1 is "
               "conservative.");
+DEFINE_string(
+    replica_placement_shadow_config, "",
+    "Path to a YAML/JSON replica placement SHADOW profile. Empty disables "
+    "the observer. The profile must explicitly provide all 12 tier targets; "
+    "SHADOW never submits Copy/Move tasks.");
 DEFINE_bool(enable_kv_events, false,
             "Enable RFC #1527 KV cache event publisher over ZMQ");
 DEFINE_string(kv_events_bind_endpoint, "",
@@ -380,6 +388,77 @@ DEFINE_bool(enable_cxl, false, "Whether to enable CXL memory support");
 
 namespace {
 
+mooncake::ReplicaPlacementShadowConfig LoadReplicaPlacementShadowProfile(
+    const std::string& path) {
+    mooncake::DefaultConfig profile;
+    profile.SetPath(path);
+    profile.Load();
+
+    mooncake::ReplicaPlacementShadowConfig config;
+    uint32_t warm_threshold = config.warm_threshold;
+    uint32_t hot_threshold = config.hot_threshold;
+    uint64_t signal_ttl_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(config.signal_ttl)
+            .count());
+    uint64_t sketch_width = config.sketch_width;
+    uint64_t sketch_depth = config.sketch_depth;
+    profile.GetUInt32("warm_threshold", &warm_threshold, warm_threshold);
+    profile.GetUInt32("hot_threshold", &hot_threshold, hot_threshold);
+    profile.GetDurationMs("signal_ttl", &signal_ttl_ms, signal_ttl_ms);
+    profile.GetUInt64("sketch_width", &sketch_width, sketch_width);
+    profile.GetUInt64("sketch_depth", &sketch_depth, sketch_depth);
+    profile.GetUInt32("min_complete_replicas",
+                      &config.policy.min_complete_replicas,
+                      config.policy.min_complete_replicas);
+    profile.GetUInt32("max_total_replicas", &config.policy.max_total_replicas,
+                      config.policy.max_total_replicas);
+
+    if (warm_threshold > std::numeric_limits<uint8_t>::max() ||
+        hot_threshold > std::numeric_limits<uint8_t>::max() ||
+        sketch_width > std::numeric_limits<size_t>::max() ||
+        sketch_depth > std::numeric_limits<size_t>::max()) {
+        throw std::runtime_error(
+            "replica placement SHADOW profile value exceeds type limit");
+    }
+    config.warm_threshold = static_cast<uint8_t>(warm_threshold);
+    config.hot_threshold = static_cast<uint8_t>(hot_threshold);
+    config.signal_ttl = std::chrono::milliseconds(signal_ttl_ms);
+    config.sketch_width = static_cast<size_t>(sketch_width);
+    config.sketch_depth = static_cast<size_t>(sketch_depth);
+
+    constexpr std::array<std::string_view, 3> kTemperatureNames = {
+        "cold", "warm", "hot"};
+    constexpr std::array<std::string_view, 4> kTierNames = {
+        "memory", "local_disk", "nof_ssd", "remote_store"};
+    constexpr uint32_t kMissingTarget = std::numeric_limits<uint32_t>::max();
+    for (size_t temperature = 0; temperature < kTemperatureNames.size();
+         ++temperature) {
+        for (size_t tier = 0; tier < kTierNames.size(); ++tier) {
+            const std::string prefix =
+                "targets." + std::string(kTemperatureNames[temperature]) + "." +
+                std::string(kTierNames[tier]);
+            uint32_t desired = kMissingTarget;
+            bool required = false;
+            profile.GetUInt32(prefix + ".desired", &desired, kMissingTarget);
+            profile.GetBool(prefix + ".required", &required, false);
+            if (desired == kMissingTarget) {
+                throw std::runtime_error(
+                    "replica placement SHADOW profile is missing " + prefix +
+                    ".desired");
+            }
+            config.policy.targets[temperature][tier] =
+                mooncake::ReplicaTierTarget{desired, required};
+        }
+    }
+    return config;
+}
+
+std::optional<mooncake::ReplicaPlacementShadowConfig>
+LoadOptionalReplicaPlacementShadowProfile(const std::string& path) {
+    if (path.empty()) return std::nullopt;
+    return LoadReplicaPlacementShadowProfile(path);
+}
+
 std::string ResolveHABackendConnstring(
     const mooncake::MasterConfig& master_config) {
     return mooncake::ResolveConfiguredHABackendConnstring(
@@ -506,6 +585,13 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt32("promotion_max_per_heartbeat",
                              &master_config.promotion_max_per_heartbeat,
                              FLAGS_promotion_max_per_heartbeat);
+    std::string replica_placement_shadow_profile;
+    default_config.GetString("replica_placement_shadow_config",
+                             &replica_placement_shadow_profile,
+                             FLAGS_replica_placement_shadow_config);
+    master_config.replica_placement_shadow_config =
+        LoadOptionalReplicaPlacementShadowProfile(
+            replica_placement_shadow_profile);
     default_config.GetBool("enable_kv_events", &master_config.enable_kv_events,
                            FLAGS_enable_kv_events);
     default_config.GetString("kv_events_bind_endpoint",
@@ -853,6 +939,14 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.promotion_max_per_heartbeat =
             FLAGS_promotion_max_per_heartbeat;
+    }
+    if ((google::GetCommandLineFlagInfo("replica_placement_shadow_config",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.replica_placement_shadow_config =
+            LoadOptionalReplicaPlacementShadowProfile(
+                FLAGS_replica_placement_shadow_config);
     }
     if ((google::GetCommandLineFlagInfo("enable_kv_events", &info) &&
          !info.is_default) ||
@@ -1267,18 +1361,18 @@ int main(int argc, char* argv[]) {
     // Initialize the master configuration
     mooncake::MasterConfig master_config;
     std::string conf_path = FLAGS_config_path;
-    if (!conf_path.empty()) {
-        mooncake::DefaultConfig default_config;
-        default_config.SetPath(conf_path);
-        try {
+    try {
+        if (!conf_path.empty()) {
+            mooncake::DefaultConfig default_config;
+            default_config.SetPath(conf_path);
             default_config.Load();
-        } catch (const std::exception& e) {
-            LOG(FATAL) << "Failed to initialize default config: " << e.what();
-            return 1;
+            InitMasterConf(default_config, master_config);
         }
-        InitMasterConf(default_config, master_config);
+        LoadConfigFromCmdline(master_config, !conf_path.empty());
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Failed to initialize master configuration: " << e.what();
+        return 1;
     }
-    LoadConfigFromCmdline(master_config, !conf_path.empty());
     ResolveRpcAddressFromInterfaceOrDie(master_config);
 
     // Fall back to environment variables for pod identity (K8s Downward API)

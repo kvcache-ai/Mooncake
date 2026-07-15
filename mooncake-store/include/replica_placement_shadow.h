@@ -53,6 +53,7 @@ enum class ReplicaPlacementSignalPublishStatus : uint8_t {
     PUBLISHED = 0,
     INVALID_SNAPSHOT,
     GENERATION_NOT_INCREASING,
+    NOT_ENABLED,
 };
 
 enum class ReplicaPlacementShadowSignalStatus : uint8_t {

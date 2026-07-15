@@ -46,6 +46,8 @@ set_tests_properties(
   PROPERTIES ENVIRONMENT "MC_STORE_REPLICA_SCORING=1")
 add_store_test(replica_placement_policy_test replica_placement_policy_test.cpp)
 add_store_test(replica_placement_shadow_test replica_placement_shadow_test.cpp)
+add_store_test(replica_placement_master_shadow_test
+               replica_placement_master_shadow_test.cpp)
 add_store_test(eviction_strategy_test eviction_strategy_test.cpp)
 add_store_test(deadline_scheduler_test deadline_scheduler_test.cpp)
 add_store_test(kv_event_publisher_test kv_event_publisher_test.cpp)

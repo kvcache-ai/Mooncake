@@ -13,6 +13,7 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <span>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -115,6 +116,14 @@ class MasterService {
         const UUID& segment_id);
     std::optional<TenantQuotaSnapshot> GetTenantQuotaSnapshotForTesting(
         const std::string& tenant_id) const;
+    [[nodiscard]] bool ReplicaPlacementShadowEnabled() const noexcept;
+    [[nodiscard]] ReplicaPlacementSignalPublishStatus
+    PublishReplicaPlacementSignalSnapshot(
+        ReplicaPlacementSignalSnapshot snapshot);
+    [[nodiscard]] uint64_t ReplicaPlacementShadowSignalGeneration()
+        const noexcept;
+    [[nodiscard]] std::optional<ReplicaPlacementShadowCountersSnapshot>
+    GetReplicaPlacementShadowCounters() const noexcept;
     bool IsTenantQuotaEnabled() const;
     std::vector<TenantQuotaSnapshot> ListTenantQuotaSnapshots() const;
     std::optional<TenantQuotaSnapshot> GetTenantQuotaSnapshot(
@@ -1937,6 +1946,15 @@ class MasterService {
     // true. CountMinSketch is mutex-protected internally so we can call into it
     // from any GetReplicaList caller without additional locking.
     std::unique_ptr<CountMinSketch> promotion_sketch_;
+
+    // Optional read-path observer. It owns no task queue and cannot mutate
+    // metadata; only explicit configuration constructs it.
+    std::unique_ptr<ReplicaPlacementShadowEvaluator>
+        replica_placement_shadow_evaluator_;
+
+    void ObserveReplicaPlacementShadow(
+        const ObjectIdentity& object_id,
+        std::span<const Replica::Descriptor> replicas);
 
     const std::string ha_backend_type_;
 

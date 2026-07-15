@@ -411,6 +411,15 @@ MasterService::MasterService(const MasterServiceConfig& config)
                   << ")";
     }
 
+    if (config.replica_placement_shadow_config.has_value()) {
+        replica_placement_shadow_evaluator_ =
+            std::make_unique<ReplicaPlacementShadowEvaluator>(
+                *config.replica_placement_shadow_config);
+        LOG(INFO) << "Replica placement SHADOW enabled: observations produce "
+                     "fixed-cardinality intent counters only; Copy/Move "
+                     "submission remains disabled";
+    }
+
     kv_event_publisher_ =
         std::make_unique<KvEventPublisher>(BuildKvEventConfig(config));
 
@@ -577,6 +586,41 @@ MasterService::~MasterService() {
     if (snapshot_manager_) {
         snapshot_manager_.reset();
     }
+}
+
+bool MasterService::ReplicaPlacementShadowEnabled() const noexcept {
+    return replica_placement_shadow_evaluator_ != nullptr;
+}
+
+ReplicaPlacementSignalPublishStatus
+MasterService::PublishReplicaPlacementSignalSnapshot(
+    ReplicaPlacementSignalSnapshot snapshot) {
+    if (!replica_placement_shadow_evaluator_) {
+        return ReplicaPlacementSignalPublishStatus::NOT_ENABLED;
+    }
+    return replica_placement_shadow_evaluator_->PublishSignalSnapshot(
+        std::move(snapshot));
+}
+
+uint64_t MasterService::ReplicaPlacementShadowSignalGeneration()
+    const noexcept {
+    return replica_placement_shadow_evaluator_
+               ? replica_placement_shadow_evaluator_->CurrentGeneration()
+               : 0;
+}
+
+std::optional<ReplicaPlacementShadowCountersSnapshot>
+MasterService::GetReplicaPlacementShadowCounters() const noexcept {
+    if (!replica_placement_shadow_evaluator_) return std::nullopt;
+    return replica_placement_shadow_evaluator_->Counters();
+}
+
+void MasterService::ObserveReplicaPlacementShadow(
+    const ObjectIdentity& object_id,
+    std::span<const Replica::Descriptor> replicas) {
+    if (!replica_placement_shadow_evaluator_) return;
+    (void)replica_placement_shadow_evaluator_->Observe(
+        MakeTenantScopedKey(object_id.tenant_id, object_id.user_key), replicas);
 }
 
 void MasterService::SetNoFProbeFnForTesting(NoFProbeFn fn) {
@@ -2532,6 +2576,7 @@ auto MasterService::GetReplicaList(const std::string& key,
 
     GetReplicaListResponse resp({}, default_kv_lease_ttl_);
     bool promotion_eligible = false;
+    std::vector<Replica::Descriptor> shadow_replica_list;
     {
         MetadataAccessorRO accessor(this, object_id);
 
@@ -2552,6 +2597,13 @@ auto MasterService::GetReplicaList(const std::string& key,
         if (replica_list.empty()) {
             LOG(WARNING) << "key=" << key << ", error=replica_not_ready";
             return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+        }
+
+        if (replica_placement_shadow_evaluator_) {
+            shadow_replica_list.reserve(metadata.CountReplicas());
+            for (const auto& replica : metadata.GetAllReplicas()) {
+                shadow_replica_list.emplace_back(replica.get_descriptor());
+            }
         }
 
         // TODO: NoF SSD support (ranhaojia)
@@ -2595,6 +2647,7 @@ auto MasterService::GetReplicaList(const std::string& key,
     if (promotion_eligible) {
         TryPushPromotionQueue(object_id);
     }
+    ObserveReplicaPlacementShadow(object_id, shadow_replica_list);
     return resp;
 }
 
@@ -2668,6 +2721,8 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
         }
 
         std::vector<ObjectIdentity> promotion_candidates;
+        std::vector<std::pair<ObjectIdentity, std::vector<Replica::Descriptor>>>
+            shadow_candidates;
         std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
         {
             MetadataShardAccessorRO shard(this, shard_idx);
@@ -2724,6 +2779,17 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                 MasterMetricManager::instance().inc_valid_get_nums();
                 GrantLeaseForGroup(tenant_state, key, metadata);
 
+                if (replica_placement_shadow_evaluator_) {
+                    std::vector<Replica::Descriptor> shadow_replicas;
+                    shadow_replicas.reserve(metadata.CountReplicas());
+                    for (const auto& replica : metadata.GetAllReplicas()) {
+                        shadow_replicas.emplace_back(replica.get_descriptor());
+                    }
+                    shadow_candidates.emplace_back(
+                        MakeObjectIdentity(key, normalized_tenant),
+                        std::move(shadow_replicas));
+                }
+
                 if (promotion_on_hit_) {
                     const bool any_memory =
                         metadata.HasReplica(&Replica::fn_is_memory_replica);
@@ -2742,6 +2808,9 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
 
         for (const auto& object_id : promotion_candidates) {
             TryPushPromotionQueue(object_id);
+        }
+        for (const auto& [object_id, replicas] : shadow_candidates) {
+            ObserveReplicaPlacementShadow(object_id, replicas);
         }
     }
 
