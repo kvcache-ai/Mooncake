@@ -45,6 +45,7 @@ struct MasterConfig {
     double nof_eviction_ratio;
     double nof_eviction_high_watermark_ratio;
     int64_t client_live_ttl_sec;
+    int64_t local_disk_rejoin_grace_sec;
     int64_t nof_heartbeat_interval_sec;
     uint32_t nof_heartbeat_probe_timeout_ms;
     uint32_t nof_heartbeat_failures_threshold;
@@ -164,6 +165,7 @@ class MasterServiceSupervisorConfig {
     RequiredParam<double> nof_eviction_high_watermark_ratio{
         "nof_eviction_high_watermark_ratio"};
     RequiredParam<int64_t> client_live_ttl_sec{"client_live_ttl_sec"};
+    int64_t local_disk_rejoin_grace_sec = 600;
     RequiredParam<int64_t> nof_heartbeat_interval_sec{
         "nof_heartbeat_interval_sec"};
     RequiredParam<uint32_t> nof_heartbeat_probe_timeout_ms{
@@ -266,6 +268,7 @@ class MasterServiceSupervisorConfig {
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
         client_live_ttl_sec = config.client_live_ttl_sec;
+        local_disk_rejoin_grace_sec = config.local_disk_rejoin_grace_sec;
         nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
         nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
         nof_heartbeat_failures_threshold =
@@ -426,6 +429,7 @@ class WrappedMasterServiceConfig {
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
     ViewVersionId view_version = 0;
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
+    int64_t local_disk_rejoin_grace_sec = 600;
     int64_t nof_heartbeat_interval_sec = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
     uint32_t nof_heartbeat_probe_timeout_ms =
         DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS;
@@ -512,6 +516,7 @@ class WrappedMasterServiceConfig {
             config.nof_eviction_high_watermark_ratio;
         view_version = view_version_param;
         client_live_ttl_sec = config.client_live_ttl_sec;
+        local_disk_rejoin_grace_sec = config.local_disk_rejoin_grace_sec;
         nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
         nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
         nof_heartbeat_failures_threshold =
@@ -624,6 +629,7 @@ class WrappedMasterServiceConfig {
             config.nof_eviction_high_watermark_ratio;
         view_version = view_version_param;
         client_live_ttl_sec = config.client_live_ttl_sec;
+        local_disk_rejoin_grace_sec = config.local_disk_rejoin_grace_sec;
         enable_ha =
             true;  // This is used in HA mode, so enable_ha should be true
         enable_offload = config.enable_offload;
@@ -704,6 +710,7 @@ class MasterServiceConfigBuilder {
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
     ViewVersionId view_version_ = 0;
     int64_t client_live_ttl_sec_ = DEFAULT_CLIENT_LIVE_TTL_SEC;
+    int64_t local_disk_rejoin_grace_sec_ = 600;
     int64_t nof_heartbeat_interval_sec_ = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
     uint32_t nof_heartbeat_probe_timeout_ms_ =
         DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS;
@@ -795,6 +802,11 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_client_live_ttl_sec(int64_t ttl) {
         client_live_ttl_sec_ = ttl;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_local_disk_rejoin_grace_sec(int64_t ttl) {
+        local_disk_rejoin_grace_sec_ = ttl;
         return *this;
     }
 
@@ -1042,6 +1054,7 @@ class MasterServiceConfig {
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
     ViewVersionId view_version = 0;
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
+    int64_t local_disk_rejoin_grace_sec = 600;
     int64_t nof_heartbeat_interval_sec = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
     uint32_t nof_heartbeat_probe_timeout_ms =
         DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS;
@@ -1124,6 +1137,7 @@ class MasterServiceConfig {
             config.nof_eviction_high_watermark_ratio;
         view_version = config.view_version;
         client_live_ttl_sec = config.client_live_ttl_sec;
+        local_disk_rejoin_grace_sec = config.local_disk_rejoin_grace_sec;
         nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
         nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
         nof_heartbeat_failures_threshold =
@@ -1210,6 +1224,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
         nof_eviction_high_watermark_ratio_;
     config.view_version = view_version_;
     config.client_live_ttl_sec = client_live_ttl_sec_;
+    config.local_disk_rejoin_grace_sec = local_disk_rejoin_grace_sec_;
     config.nof_heartbeat_interval_sec = nof_heartbeat_interval_sec_;
     config.nof_heartbeat_probe_timeout_ms = nof_heartbeat_probe_timeout_ms_;
     config.nof_heartbeat_failures_threshold = nof_heartbeat_failures_threshold_;

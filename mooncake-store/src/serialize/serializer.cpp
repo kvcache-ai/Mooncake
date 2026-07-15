@@ -658,11 +658,21 @@ tl::expected<void, SerializationError> Serializer<Replica>::serialize(
     // 1. Serialize id_ member variable
     packer.pack(static_cast<uint64_t>(replica.id_));
 
+    auto replica_type = replica.type();
+
+    // DISCONNECTED is a runtime-only LOCAL_DISK owner-liveness state. Restore
+    // it as COMPLETE and let the client monitor re-evaluate liveness after a
+    // leader restart, without changing the snapshot wire format.
+    auto serialized_status = replica.status_;
+    if (replica_type == ReplicaType::LOCAL_DISK &&
+        serialized_status == ReplicaStatus::DISCONNECTED) {
+        serialized_status = ReplicaStatus::COMPLETE;
+    }
+
     // 2. Serialize status_ member variable
-    packer.pack(static_cast<int16_t>(replica.status_));
+    packer.pack(static_cast<int16_t>(serialized_status));
 
     // 3. Serialize replica type
-    auto replica_type = replica.type();
     packer.pack(static_cast<int8_t>(replica_type));
 
     // 4. Serialize specific data by type

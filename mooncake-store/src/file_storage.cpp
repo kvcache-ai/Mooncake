@@ -1,6 +1,17 @@
 #include "file_storage.h"
 
+#include <fcntl.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <chrono>
+#include <cstring>
+#include <fstream>
 #include <memory>
+#include <mutex>
+#include <random>
+#include <sstream>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -16,6 +27,127 @@
 namespace mooncake {
 
 namespace {
+
+constexpr const char* kLocalDiskSegmentIdMarker =
+    ".mooncake_local_disk_segment_id";
+
+std::string TrimMarker(std::string marker) {
+    const auto first = marker.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) {
+        return {};
+    }
+    const auto last = marker.find_last_not_of(" \t\r\n");
+    return marker.substr(first, last - first + 1);
+}
+
+std::string ReadExistingLocalDiskSegmentId(
+    const std::filesystem::path& marker_path) {
+    std::ifstream input(marker_path);
+    if (!input) {
+        return {};
+    }
+
+    std::string existing;
+    if (!std::getline(input, existing)) {
+        throw std::runtime_error("Invalid empty LOCAL_DISK marker: " +
+                                 marker_path.string());
+    }
+    existing = TrimMarker(existing);
+    if (existing.empty()) {
+        throw std::runtime_error("Invalid empty LOCAL_DISK marker: " +
+                                 marker_path.string());
+    }
+    return existing;
+}
+
+bool HasUnmarkedLocalDiskData(const std::filesystem::path& storage_path) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(storage_path, ec)) {
+        if (entry.path().filename() == kLocalDiskSegmentIdMarker) {
+            continue;
+        }
+        return true;
+    }
+    if (ec) {
+        throw std::runtime_error("Failed to scan LOCAL_DISK storage path " +
+                                 storage_path.string() + ": " + ec.message());
+    }
+    return false;
+}
+
+bool RejectUnmarkedLocalDiskData() {
+    const char* value = std::getenv("MC_STORE_REJECT_UNMARKED_DATA");
+    return value != nullptr &&
+           (std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 ||
+            std::strcmp(value, "TRUE") == 0);
+}
+
+std::string GenerateLocalDiskSegmentId(const std::string& storage_path) {
+    std::random_device rd;
+    std::mt19937_64 gen(rd());
+    const auto now =
+        std::chrono::steady_clock::now().time_since_epoch().count();
+    std::ostringstream oss;
+    oss << "local-disk-" << std::hex << std::hash<std::string>{}(storage_path)
+        << "-" << now << "-" << gen();
+    return oss.str();
+}
+
+std::string LoadOrCreateLocalDiskSegmentId(const std::string& storage_path) {
+    static std::mutex local_disk_segment_id_mutex;
+    std::lock_guard<std::mutex> lock(local_disk_segment_id_mutex);
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (!fs::create_directories(storage_path, ec) && ec) {
+        throw std::runtime_error("Failed to create LOCAL_DISK storage path " +
+                                 storage_path + ": " + ec.message());
+    }
+    const auto marker_path = fs::path(storage_path) / kLocalDiskSegmentIdMarker;
+    if (fs::exists(marker_path, ec)) {
+        return ReadExistingLocalDiskSegmentId(marker_path);
+    }
+    if (ec) {
+        throw std::runtime_error("Failed to stat LOCAL_DISK marker " +
+                                 marker_path.string() + ": " + ec.message());
+    }
+
+    const bool has_unmarked_data = HasUnmarkedLocalDiskData(storage_path);
+    if (has_unmarked_data) {
+        const std::string message =
+            "LOCAL_DISK storage path contains data but no marker: " +
+            storage_path;
+        if (RejectUnmarkedLocalDiskData()) {
+            throw std::runtime_error(message);
+        }
+        LOG(WARNING) << message << "; auto-generating marker for migration";
+    }
+
+    const auto generated = GenerateLocalDiskSegmentId(storage_path);
+    const std::string contents = generated + "\n";
+    const int fd = ::open(marker_path.c_str(), O_WRONLY | O_CREAT | O_EXCL,
+                          S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+    if (fd < 0) {
+        if (errno == EEXIST) {
+            return ReadExistingLocalDiskSegmentId(marker_path);
+        }
+        throw std::runtime_error("Failed to create LOCAL_DISK marker " +
+                                 marker_path.string() + ": " +
+                                 std::strerror(errno));
+    }
+    const ssize_t written =
+        ::write(fd, contents.data(), static_cast<size_t>(contents.size()));
+    const int write_errno = errno;
+    const int close_result = ::close(fd);
+    if (written != static_cast<ssize_t>(contents.size()) || close_result != 0) {
+        std::error_code unlink_ec;
+        fs::remove(marker_path, unlink_ec);
+        throw std::runtime_error("Failed to write LOCAL_DISK marker " +
+                                 marker_path.string() + ": " +
+                                 std::strerror(write_errno));
+    }
+    return generated;
+}
 
 std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
     const std::vector<std::string>& storage_keys,
@@ -185,6 +317,12 @@ FileStorage::FileStorage(const FileStorageConfig& config,
     if (!config.Validate()) {
         throw std::invalid_argument("Invalid FileStorage configuration");
     }
+    if (config_.local_disk_segment_id.empty()) {
+        config_.local_disk_segment_id =
+            LoadOrCreateLocalDiskSegmentId(config_.storage_filepath);
+    }
+    LOG(INFO) << "FileStorage local_disk_segment_id="
+              << config_.local_disk_segment_id;
 
     auto create_storage_backend_result = CreateStorageBackend(config_);
     if (!create_storage_backend_result) {
@@ -257,8 +395,8 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
     {
         MutexLocker locker(&offloading_mutex_);
         enable_offloading_ = enable_offloading_result.value();
-        auto mount_file_storage_result =
-            client_->MountLocalDiskSegment(enable_offloading_);
+        auto mount_file_storage_result = client_->MountLocalDiskSegment(
+            enable_offloading_, config_.local_disk_segment_id, local_rpc_addr_);
         if (!mount_file_storage_result) {
             LOG(ERROR) << "Failed to mount file storage: "
                        << mount_file_storage_result.error();
@@ -661,8 +799,9 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                              << "SEGMENT_NOT_FOUND, attempting to "
                              << "re-register local disk segment and "
                              << "re-register object metadata";
-                auto remount_result =
-                    client_->MountLocalDiskSegment(enable_offloading_);
+                auto remount_result = client_->MountLocalDiskSegment(
+                    enable_offloading_, config_.local_disk_segment_id,
+                    local_rpc_addr_);
                 if (remount_result) {
                     heartbeat_result = client_->OffloadObjectHeartbeat(
                         enable_offloading_, offloading_objects);

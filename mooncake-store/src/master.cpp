@@ -262,6 +262,9 @@ DEFINE_int64(
     "Seconds a client stays considered alive after the last heartbeat. "
     "If this TTL elapses without a refresh, the master treats the "
     "client as disconnected and may unmount its segments");
+DEFINE_int64(local_disk_rejoin_grace_sec, 600,
+             "Seconds to retain DISCONNECTED LOCAL_DISK metadata for warm "
+             "client rejoin before cleanup");
 DEFINE_int64(nof_heartbeat_interval_sec,
              mooncake::DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC,
              "How often master probes each mounted NoF segment");
@@ -465,6 +468,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetInt64("client_live_ttl_sec",
                             &master_config.client_live_ttl_sec,
                             FLAGS_client_ttl);
+    default_config.GetInt64("local_disk_rejoin_grace_sec",
+                            &master_config.local_disk_rejoin_grace_sec,
+                            FLAGS_local_disk_rejoin_grace_sec);
     default_config.GetInt64("nof_heartbeat_interval_sec",
                             &master_config.nof_heartbeat_interval_sec,
                             FLAGS_nof_heartbeat_interval_sec);
@@ -951,6 +957,12 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.client_live_ttl_sec = FLAGS_client_ttl;
     }
+    if ((google::GetCommandLineFlagInfo("local_disk_rejoin_grace_sec", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.local_disk_rejoin_grace_sec =
+            FLAGS_local_disk_rejoin_grace_sec;
+    }
     if ((google::GetCommandLineFlagInfo("nof_heartbeat_interval_sec", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -1388,6 +1400,8 @@ int main(int argc, char* argv[]) {
         << ", ha_backend_connstring=" << ha_backend_connstring
         << ", etcd_endpoints=" << master_config.etcd_endpoints
         << ", client_ttl=" << master_config.client_live_ttl_sec
+        << ", local_disk_rejoin_grace_sec="
+        << master_config.local_disk_rejoin_grace_sec
         << ", rpc_thread_num=" << master_config.rpc_thread_num
         << ", rpc_port=" << master_config.rpc_port
         << ", rpc_address=" << master_config.rpc_address

@@ -411,7 +411,9 @@ class Client {
      * @brief Mounts a local disk segment into the master.
      * @param enable_offloading If true, enables offloading (write-to-file).
      */
-    tl::expected<void, ErrorCode> MountLocalDiskSegment(bool enable_offloading);
+    tl::expected<void, ErrorCode> MountLocalDiskSegment(
+        bool enable_offloading, const std::string& local_disk_segment_id = {},
+        const std::string& transport_endpoint = {});
 
     /**
      * @brief Heartbeat call to collect object-level statistics and retrieve the

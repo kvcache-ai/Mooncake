@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 
 #include <filesystem>
+#include <fstream>
 #include <thread>
 
 #include "allocator.h"
@@ -33,6 +34,7 @@ class FileStorageTest : public ::testing::Test {
         UnsetEnv("MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT");
         UnsetEnv("MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES");
         UnsetEnv("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS");
+        UnsetEnv("MC_STORE_REJECT_UNMARKED_DATA");
         data_path = std::filesystem::current_path().string() + "/data";
         fs::create_directories(data_path);
         for (const auto& entry : fs::directory_iterator(data_path)) {
@@ -92,6 +94,7 @@ class FileStorageTest : public ::testing::Test {
     }
 
     void TearDown() override {
+        UnsetEnv("MC_STORE_REJECT_UNMARKED_DATA");
         google::ShutdownGoogleLogging();
         LOG(INFO) << "Clear test data...";
         for (const auto& entry : fs::directory_iterator(data_path)) {
@@ -101,6 +104,101 @@ class FileStorageTest : public ::testing::Test {
         }
     }
 };
+
+TEST_F(FileStorageTest, LocalDiskSegmentMarkerCreatedAndReused) {
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+
+    {
+        FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+    }
+
+    const auto marker_path =
+        std::filesystem::path(data_path) / ".mooncake_local_disk_segment_id";
+    std::ifstream first_marker(marker_path);
+    std::string first_id;
+    ASSERT_TRUE(std::getline(first_marker, first_id));
+    ASSERT_FALSE(first_id.empty());
+
+    {
+        FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+    }
+
+    std::ifstream second_marker(marker_path);
+    std::string second_id;
+    ASSERT_TRUE(std::getline(second_marker, second_id));
+    EXPECT_EQ(second_id, first_id);
+}
+
+TEST_F(FileStorageTest, LocalDiskSegmentMarkerConcurrentCreateIsIdempotent) {
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+
+    std::vector<std::thread> threads;
+    std::vector<std::string> errors(8);
+    for (size_t i = 0; i < errors.size(); ++i) {
+        threads.emplace_back([&, i] {
+            try {
+                FileStorage fileStorage(file_storage_config, nullptr,
+                                        "localhost:9003");
+            } catch (const std::exception& e) {
+                errors[i] = e.what();
+            }
+        });
+    }
+    for (auto& thread : threads) {
+        thread.join();
+    }
+    for (const auto& error : errors) {
+        EXPECT_TRUE(error.empty()) << error;
+    }
+
+    const auto marker_path =
+        std::filesystem::path(data_path) / ".mooncake_local_disk_segment_id";
+    std::ifstream marker(marker_path);
+    std::string id;
+    ASSERT_TRUE(std::getline(marker, id));
+    EXPECT_FALSE(id.empty());
+}
+
+TEST_F(FileStorageTest,
+       LocalDiskSegmentMarkerMissingWithDataMigratesByDefault) {
+    std::filesystem::create_directory(std::filesystem::path(data_path) /
+                                      "existing_payload");
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+
+    const auto marker_path =
+        std::filesystem::path(data_path) / ".mooncake_local_disk_segment_id";
+    std::ifstream marker(marker_path);
+    std::string id;
+    ASSERT_TRUE(std::getline(marker, id));
+    EXPECT_FALSE(id.empty());
+}
+
+TEST_F(FileStorageTest, LocalDiskSegmentMarkerMissingWithDataStrictRejects) {
+    std::filesystem::create_directory(std::filesystem::path(data_path) /
+                                      "existing_payload");
+    SetEnv("MC_STORE_REJECT_UNMARKED_DATA", "1");
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+
+    EXPECT_THROW(FileStorage(file_storage_config, nullptr, "localhost:9003"),
+                 std::runtime_error);
+}
+
+TEST_F(FileStorageTest, LocalDiskSegmentMarkerEmptyRejects) {
+    const auto marker_path =
+        std::filesystem::path(data_path) / ".mooncake_local_disk_segment_id";
+    std::ofstream(marker_path) << "\n";
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+
+    EXPECT_THROW(FileStorage(file_storage_config, nullptr, "localhost:9003"),
+                 std::runtime_error);
+}
 
 TEST_F(FileStorageTest, IsEnableOffloading) {
     std::unordered_map<std::string, std::string> all_object;
