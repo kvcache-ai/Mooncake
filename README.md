@@ -32,6 +32,7 @@ Under real workloads, Mooncake’s innovative architecture enables Kimi to handl
 
 <h2 id="updates">🔄 Updates</h2>
 
+- **Jul 2, 2026**: vLLM adds [MooncakeStoreECConnector](https://github.com/vllm-project/vllm/pull/47302) for multimodal hidden-state transfer in disaggregated encoder/prefill deployments, using Mooncake Store to share encoder outputs across instances.
 - **May 7, 2026**: 🚀 [vLLM officially features Mooncake Store](https://vllm.ai/blog/mooncake-store) — a deep dive into how Mooncake's distributed KVCache engine supercharges vLLM inference with high-throughput, memory-efficient, cross-instance KV cache sharing!
 - **Apr 29, 2026**: SGLang introduces [RDMA-based P2P weight transfer for large-scale distributed RL](https://lmsys.org/blog/2026-04-29-p2p-update/) using Mooncake TransferEngine, achieving 7x faster weight updates for the 1T-parameter Kimi-K2 model (53s → 7.2s) with zero-copy RDMA transfer across thousands of GPUs.
 - **Mar 19, 2026**: [TorchSpec: Speculative Decoding Training at Scale](https://pytorch.org/blog/torchspec-speculative-decoding-training-at-scale) is [open sourced](https://github.com/torchspec-project/TorchSpec), using Mooncake to decouple inference and training via efficient hidden states management.
