@@ -131,7 +131,8 @@ def _run_sweep_unlocked(
         if samples_path.is_file():
             for line in samples_path.read_text().splitlines():
                 row = json.loads(line)
-                completed_keys.add((row["case"], row["repeat"]))
+                if row.get("exit_code") == 0:
+                    completed_keys.add((row["case"], row["repeat"]))
     else:
         manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
 

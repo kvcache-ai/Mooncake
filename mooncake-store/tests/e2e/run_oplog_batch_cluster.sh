@@ -279,6 +279,7 @@ start_master() {
       "MOONCAKE_TEST_FAILPOINT_TIMEOUT_SEC=$FAILPOINT_TIMEOUT_SEC")
   fi
   local -a ha_args=(--enable_ha=false)
+  local -a non_ha_args=()
   local -a config_args=()
   [[ -z "$MASTER_CONFIG" ]] || config_args=(--config_path="$MASTER_CONFIG")
   if [[ "$ENABLE_HA" == true ]]; then
@@ -288,9 +289,11 @@ start_master() {
       --oplog_store_type="$OPLOG_STORE_TYPE"
       --oplog_batch_max_entries="$BATCH_ENTRIES"
       --batch_oplog_retry_timeout_sec="$RETRY_TIMEOUT_SEC")
+  else
+    non_ha_args=(--default_kv_lease_ttl=5s)
   fi
   start_process "master-$index" "${environment[@]}" "$MASTER_BIN" \
-    "${config_args[@]}" "${ha_args[@]}" \
+    "${config_args[@]}" "${ha_args[@]}" "${non_ha_args[@]}" \
     --rpc_address=127.0.0.1 --rpc_port="${RPC_PORTS[$index]}" \
     --metrics_port="${ADMIN_PORTS[$index]}" \
     --enable_http_metadata_server=false --logtostderr=true

@@ -20,11 +20,14 @@ class SweepTest(unittest.TestCase):
             fake = root / "fake_bench.py"
             fake.write_text(
                 "#!/usr/bin/env python3\n"
-                "import json, sys\n"
+                "import json, pathlib, sys\n"
                 "args=dict(x[2:].split('=', 1) for x in sys.argv[1:])\n"
+                "attempts=pathlib.Path(__file__).with_name('attempts')\n"
+                "count=int(attempts.read_text()) if attempts.exists() else 0\n"
+                "attempts.write_text(str(count + 1))\n"
                 "result={'schema_version':1,'entries_per_sec':int(args['max_entries'])*100}\n"
                 "open(args['output_json'],'w').write(json.dumps(result))\n"
-                "raise SystemExit(7 if args['max_entries']=='8' else 0)\n"
+                "raise SystemExit(7 if args['max_entries']=='8' and count < 4 else 0)\n"
             )
             fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
             matrix = root / "matrix.json"
@@ -61,7 +64,7 @@ class SweepTest(unittest.TestCase):
             self.assertGreater(manifest["host"]["cpu_count"], 0)
             self.assertTrue(manifest["host"]["machine"])
 
-            sweep.run_sweep(
+            resume_exit_code = sweep.run_sweep(
                 benchmark=fake,
                 output_dir=root / "out",
                 repeat=2,
@@ -69,8 +72,24 @@ class SweepTest(unittest.TestCase):
                 endpoints="127.0.0.1:2379",
                 resume=True,
             )
+            self.assertEqual(resume_exit_code, 0)
+            resumed_rows = [
+                json.loads(line)
+                for line in (root / "out/samples.jsonl").read_text().splitlines()
+            ]
             self.assertEqual(
-                len((root / "out/samples.jsonl").read_text().splitlines()), 4
+                [
+                    (row["case"], row["repeat"], row["exit_code"])
+                    for row in resumed_rows
+                ],
+                [
+                    ("b1", 0, 0),
+                    ("b1", 1, 0),
+                    ("b8", 0, 7),
+                    ("b8", 1, 7),
+                    ("b8", 0, 0),
+                    ("b8", 1, 0),
+                ],
             )
 
             with (root / "out/.sweep.lock").open("w") as lock_stream:
