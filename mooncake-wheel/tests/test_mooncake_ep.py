@@ -124,10 +124,11 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                                                  zero_copy=zero_copy, return_recv_hook=return_recv_hook)
         large_gemm_with_hook(hook) if return_recv_hook else None
 
-    def dispatch_test_func(use_fp8: bool):
+    def dispatch_test_func(use_fp8: bool, raw_fp8_send: bool = False):
         _, _, _, event, _ = buffer.dispatch(
             x, topk_idx, active_ranks, num_tokens, num_experts, -1,
-            use_fp8=use_fp8, async_finish=True)
+            use_fp8=use_fp8, async_finish=True,
+            raw_fp8_send=raw_fp8_send)
         event.current_stream_wait()
 
     # Calculate bandwidth
@@ -140,12 +141,19 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
         num_dispatch_bf16_comm_bytes += (num_bf16_bytes + 16) * num_selections
         num_combine_comm_bytes += num_bf16_bytes * num_selections
 
-    # Isolate the FP8 packing path while retaining the normal non-hook stream wait.
-    for dispatch_use_fp8 in ([False] if _USE_MACA else [False, True]):
+    # Isolate normal FP8 packing from the same-size raw FP8 transport path.
+    dispatch_modes = [(False, False, 'BF16')]
+    if not _USE_MACA:
+        dispatch_modes.extend([
+            (True, False, 'FP8'),
+            (True, True, 'FP8 raw-send'),
+        ])
+    for dispatch_use_fp8, raw_fp8_send, dispatch_dtype in dispatch_modes:
         cpu_group.barrier()
-        dispatch_t, min_t, max_t = bench(partial(dispatch_test_func, use_fp8=dispatch_use_fp8))
+        dispatch_t, min_t, max_t = bench(partial(
+            dispatch_test_func, use_fp8=dispatch_use_fp8,
+            raw_fp8_send=raw_fp8_send))
         dispatch_bytes = num_dispatch_fp8_comm_bytes if dispatch_use_fp8 else num_dispatch_bf16_comm_bytes
-        dispatch_dtype = 'FP8' if dispatch_use_fp8 else 'BF16'
         print(f'[rank {rank}] Dispatch {dispatch_dtype} end-to-end bandwidth: {dispatch_bytes / 1e9 / dispatch_t:.2f} GB/s, '
               f'avg_t={dispatch_t * 1e6:.2f} us, min_t={min_t * 1e6:.2f} us, max_t={max_t * 1e6:.2f} us', flush=True)
 

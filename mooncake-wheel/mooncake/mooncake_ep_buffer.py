@@ -351,6 +351,7 @@ class Buffer:
         use_fp8: Optional[bool] = None,
         async_finish: bool = False,
         return_recv_hook: bool = False,
+        raw_fp8_send: bool = False,
     ) -> Tuple[
         Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor],
         torch.Tensor,
@@ -362,6 +363,14 @@ class Buffer:
             use_fp8 = not _USE_MACA
         elif _USE_MACA and use_fp8:
             raise NotImplementedError("FP8 dispatch is not supported on MACA")
+        if raw_fp8_send and not use_fp8:
+            raise ValueError("raw_fp8_send requires use_fp8=True")
+        if raw_fp8_send and self._use_fallback:
+            raise RuntimeError("raw_fp8_send requires the native EP fast path")
+        if raw_fp8_send and (not async_finish or return_recv_hook):
+            raise ValueError(
+                "raw_fp8_send is only valid for non-hook async dispatch timing"
+            )
 
         # MUSA/MACA do not support cooperative grid sync, so the C++ runtime
         # splits no-hook calls into SEND -> phase-ack -> RECV instead of using
@@ -422,6 +431,7 @@ class Buffer:
                 use_fp8,
                 async_finish,
                 runtime_return_recv_hook,
+                raw_fp8_send,
             )
             if _USE_MACA:
                 hook = self._wrap_maca_recv_hook(hook, event)

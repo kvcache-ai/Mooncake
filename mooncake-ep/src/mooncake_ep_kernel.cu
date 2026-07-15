@@ -126,7 +126,8 @@ void mark_and_wait_phase_ack(void* mxa_buffer,
                   epoch, timeout_ticks);
 }
 
-template <bool kUseFP8, int kNumWarpGroups, int kNumWarpsPerGroup, int kHidden>
+template <bool kUseFP8, bool kRawFp8Send, int kNumWarpGroups,
+          int kNumWarpsPerGroup, int kHidden>
 __global__ EP_LAUNCH_BOUNDS(kNumWarpGroups * kNumWarpsPerGroup * 32, 1) void
 dispatch(void* packed_recv_x, float* packed_recv_x_scales,
          int* packed_recv_src_info, int64_t* packed_recv_layout_range,
@@ -227,7 +228,13 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                     // Read
                     auto int4_value = __ldg(x_int4 + i);
 
-                    if (kUseFP8) {
+                    if constexpr (kUseFP8 && kRawFp8Send) {
+                        // Preserve the source-load and FP8 packet footprint while
+                        // bypassing amax reduction and FP8 conversion for timing.
+                        rdma_x_vec[i] = int2{int4_value.x, int4_value.y};
+                        if ((i & 15) == 0)
+                            rdma_x_scales[i >> 4] = 1.0f;
+                    } else if constexpr (kUseFP8) {
                         // Calculate local amax
                         auto bf16_values = reinterpret_cast<nv_bfloat16*>(&int4_value);
                         float fp32_values[kNumElemsPerRead];
@@ -465,7 +472,8 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
               int* next_clean_buffer,
               int num_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
               int num_topk, int num_experts, int rank, int num_ranks, bool use_fp8,
-              void* workspace, cudaStream_t stream, int64_t timeout_ticks, int phases) {
+              void* workspace, cudaStream_t stream, int64_t timeout_ticks,
+              int phases, bool raw_fp8_send) {
     constexpr int kNumMaxTopK = 11;
     constexpr int kNumWarpsPerGroup = 8;
 #ifdef MOONCAKE_EP_USE_MUSA
@@ -486,8 +494,11 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     EP_HOST_ASSERT(num_experts * sizeof(int) * 2 <= NUM_WORKSPACE_BYTES);
 
 #define DISPATCH_LAUNCH_CASE(hidden) { \
-auto dispatch_func = use_fp8 ? dispatch<true, kNumWarpGroups, kNumWarpsPerGroup, hidden> : \
-                               dispatch<false, kNumWarpGroups, kNumWarpsPerGroup, hidden>; \
+auto dispatch_func = use_fp8 \
+    ? (raw_fp8_send \
+        ? dispatch<true, true, kNumWarpGroups, kNumWarpsPerGroup, hidden> \
+        : dispatch<true, false, kNumWarpGroups, kNumWarpsPerGroup, hidden>) \
+    : dispatch<false, false, kNumWarpGroups, kNumWarpsPerGroup, hidden>; \
 LAUNCH_KERNEL(&cfg, dispatch_func, \
               packed_recv_x, packed_recv_x_scales, \
               packed_recv_src_info, packed_recv_layout_range, \
