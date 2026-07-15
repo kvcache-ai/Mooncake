@@ -234,7 +234,7 @@ class EfaContext {
     // the per-process aliasing that a host+nic "stable key" would impose
     // on sglang DP>1 workloads (each DP worker has its own RPC port and
     // must retain its own peer_map_ slot).
-    size_t peer_map_max_;  // set from MC_MAX_PEER_MAP, 0 = unlimited
+    size_t peer_map_max_;  // set from MC_MAX_EP_PER_CTX, 0 = unlimited
 
     // peer_map_ entry storing both the endpoint and an iterator into the
     // FIFO eviction list, so deletion from either side is O(1).
