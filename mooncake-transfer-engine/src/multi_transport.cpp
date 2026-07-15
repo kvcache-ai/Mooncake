@@ -151,9 +151,6 @@ Status MultiTransport::submitTransfer(
         assert(transport);
         auto& task = batch_desc.task_list[first_task_id + index];
         task.transport_ = transport;
-#ifdef USE_ASCEND_HETEROGENEOUS
-        task.request = const_cast<Transport::TransferRequest*>(&request);
-#endif
         submit_tasks[transport].push_back(&task);
     }
     Status overall_status = Status::OK();
@@ -215,9 +212,6 @@ Status MultiTransport::mp_submitTransfer(
         assert(transport);
         auto& task = batch_desc.task_list[first_task_id + index];
         task.transport_ = transport;
-#ifdef USE_ASCEND_HETEROGENEOUS
-        task.request = const_cast<Transport::TransferRequest*>(&request);
-#endif
         submit_tasks[transport].push_back(&task);
     }
     Status overall_status = Status::OK();

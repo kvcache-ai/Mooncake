@@ -1263,17 +1263,25 @@ int TransferMetadata::removeLocalSegment(const std::string &segment_name) {
 int TransferMetadata::addLocalMemoryBuffer(const BufferDesc &buffer_desc,
                                            bool update_metadata) {
     std::lock_guard<std::mutex> publish_guard(local_segment_publish_mutex_);
+    std::shared_ptr<SegmentDesc> old_segment_desc;
     std::shared_ptr<SegmentDesc> new_segment_desc;
     {
         RWSpinlock::WriteGuard guard(segment_lock_);
-        new_segment_desc = std::make_shared<SegmentDesc>();
         auto &segment_desc = segment_id_to_desc_map_[LOCAL_SEGMENT_ID];
+        old_segment_desc = segment_desc;
+        new_segment_desc = std::make_shared<SegmentDesc>();
         *new_segment_desc = *segment_desc;
         segment_desc = new_segment_desc;
         segment_desc->buffers.push_back(buffer_desc);
     }
-    if (update_metadata)
-        return updateSegmentDesc(new_segment_desc->name, *new_segment_desc);
+    if (update_metadata) {
+        int rc = updateSegmentDesc(new_segment_desc->name, *new_segment_desc);
+        if (rc != 0) {
+            RWSpinlock::WriteGuard guard(segment_lock_);
+            segment_id_to_desc_map_[LOCAL_SEGMENT_ID] = old_segment_desc;
+        }
+        return rc;
+    }
     return 0;
 }
 

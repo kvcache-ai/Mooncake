@@ -243,6 +243,128 @@ TEST(TransferMetadataSchemaTest, NvlinkDescriptorMatchesV1GoldenJson) {
     EXPECT_EQ(reencoded, expected);
 }
 
+TEST(TransferMetadataAdditionTest,
+     FailedRemoteUpdateRestoresLocalDescriptorForRetry) {
+    TransferMetadata metadata(P2PHANDSHAKE);
+    auto storage = std::make_shared<FailOnceMetadataStoragePlugin>();
+    TransferMetadataTestPeer::SetStoragePlugin(metadata, storage);
+
+    auto segment = std::make_shared<TransferMetadata::SegmentDesc>();
+    segment->name = "provider:add-retry";
+    segment->protocol = "nvlink";
+    auto original_segment = segment;
+    ASSERT_EQ(metadata.addLocalSegment(LOCAL_SEGMENT_ID, segment->name,
+                                       std::move(segment)),
+              0);
+    ASSERT_EQ(metadata.updateLocalSegmentDesc(), 0);
+    ASSERT_TRUE(storage->has_successful_value);
+    ASSERT_EQ(storage->last_successful_value["buffers"].size(), 0U);
+
+    TransferMetadata::BufferDesc buffer{};
+    buffer.name = original_segment->name;
+    buffer.addr = 0x100000000ULL;
+    buffer.length = 0x20000ULL;
+    buffer.shm_name = "fabric-handle-add-retry";
+
+    storage->fail_next_set = true;
+    EXPECT_EQ(metadata.addLocalMemoryBuffer(buffer, true), ERR_METADATA);
+    EXPECT_EQ(storage->set_calls, 2);
+    EXPECT_EQ(storage->last_attempted_value["buffers"].size(), 1U);
+    EXPECT_EQ(storage->last_successful_value["buffers"].size(), 0U);
+
+    auto local = metadata.getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(local, nullptr);
+    EXPECT_EQ(local, original_segment)
+        << "failed addition must restore the previous descriptor snapshot";
+    EXPECT_TRUE(local->buffers.empty());
+
+    EXPECT_EQ(metadata.addLocalMemoryBuffer(buffer, true), 0);
+    EXPECT_EQ(storage->set_calls, 3);
+    ASSERT_EQ(storage->last_successful_value["buffers"].size(), 1U);
+    EXPECT_EQ(storage->last_successful_value["buffers"][0]["addr"].asUInt64(),
+              buffer.addr);
+    local = metadata.getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(local, nullptr);
+    ASSERT_EQ(local->buffers.size(), 1U);
+    EXPECT_EQ(local->buffers[0].addr, buffer.addr);
+}
+
+TEST(TransferMetadataAdditionTest,
+     FailedRemoteUpdateSerializesConcurrentCowMutationAndRetry) {
+    using namespace std::chrono_literals;
+
+    TransferMetadata metadata(P2PHANDSHAKE);
+    auto storage = std::make_shared<BlockingFailOnceMetadataStoragePlugin>();
+    TransferMetadataTestPeer::SetStoragePlugin(metadata, storage);
+
+    auto segment = std::make_shared<TransferMetadata::SegmentDesc>();
+    segment->name = "provider:add-concurrent";
+    segment->protocol = "nvlink";
+    TransferMetadata::BufferDesc first{};
+    first.name = segment->name;
+    first.addr = 0x100000000ULL;
+    first.length = 0x20000ULL;
+    first.shm_name = "fabric-handle-first";
+    segment->buffers.push_back(first);
+    ASSERT_EQ(metadata.addLocalSegment(LOCAL_SEGMENT_ID, segment->name,
+                                       std::move(segment)),
+              0);
+    ASSERT_EQ(metadata.updateLocalSegmentDesc(), 0);
+
+    TransferMetadata::BufferDesc second{};
+    second.name = first.name;
+    second.addr = 0x200000000ULL;
+    second.length = 0x40000ULL;
+    second.shm_name = "fabric-handle-second";
+    TransferMetadata::BufferDesc third{};
+    third.name = first.name;
+    third.addr = 0x300000000ULL;
+    third.length = 0x60000ULL;
+    third.shm_name = "fabric-handle-third";
+
+    storage->BlockAndFailNextSet();
+    auto failed_add = std::async(std::launch::async, [&] {
+        return metadata.addLocalMemoryBuffer(second, true);
+    });
+    storage->WaitUntilSetIsBlocked();
+
+    std::promise<void> concurrent_add_started_promise;
+    auto concurrent_add_started = concurrent_add_started_promise.get_future();
+    auto concurrent_add = std::async(std::launch::async, [&] {
+        concurrent_add_started_promise.set_value();
+        return metadata.addLocalMemoryBuffer(third, false);
+    });
+    concurrent_add_started.wait();
+    EXPECT_EQ(concurrent_add.wait_for(50ms), std::future_status::timeout)
+        << "concurrent COW mutation must wait for addition "
+           "publication/rollback";
+
+    storage->ReleaseBlockedSet();
+    EXPECT_EQ(failed_add.get(), ERR_METADATA);
+    EXPECT_EQ(concurrent_add.get(), 0);
+
+    auto local = metadata.getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(local, nullptr);
+    ASSERT_EQ(local->buffers.size(), 2U);
+    EXPECT_EQ(local->buffers[0].addr, first.addr);
+    EXPECT_EQ(local->buffers[1].addr, third.addr);
+
+    EXPECT_EQ(metadata.addLocalMemoryBuffer(second, true), 0);
+    EXPECT_EQ(storage->SetCalls(), 3);
+    Json::Value published = storage->LastSuccessfulValue();
+    ASSERT_EQ(published["buffers"].size(), 3U);
+    EXPECT_EQ(published["buffers"][0]["addr"].asUInt64(), first.addr);
+    EXPECT_EQ(published["buffers"][1]["addr"].asUInt64(), third.addr);
+    EXPECT_EQ(published["buffers"][2]["addr"].asUInt64(), second.addr);
+
+    local = metadata.getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(local, nullptr);
+    ASSERT_EQ(local->buffers.size(), 3U);
+    EXPECT_EQ(local->buffers[0].addr, first.addr);
+    EXPECT_EQ(local->buffers[1].addr, third.addr);
+    EXPECT_EQ(local->buffers[2].addr, second.addr);
+}
+
 TEST(TransferMetadataRemovalTest,
      FailedRemoteUpdateRestoresLocalDescriptorForRetry) {
     TransferMetadata metadata(P2PHANDSHAKE);

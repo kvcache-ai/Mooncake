@@ -324,7 +324,7 @@ add_test(
   NAME nvlink_vmm_transfer_metadata_test
   COMMAND
     $<TARGET_FILE:transfer_metadata_test>
-    --gtest_filter=TransferMetadataSchemaTest.*:TransferMetadataRemovalTest.*:TransferTaskSubmissionFailureTest.*
+    --gtest_filter=TransferMetadataSchemaTest.*:TransferMetadataAdditionTest.*:TransferMetadataRemovalTest.*:TransferTaskSubmissionFailureTest.*
 )
 set_tests_properties(nvlink_vmm_transfer_metadata_test
                      PROPERTIES LABELS "nvlink_vmm_unit")
