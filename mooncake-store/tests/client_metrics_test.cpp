@@ -244,7 +244,8 @@ TEST_F(ClientMetricsTest, HybridHistogramSerializesUniqueLabelSeries) {
 
 TEST_F(ClientMetricsTest,
        ReplicaSelectionMetricsUseOnlyFixedLowCardinalityLabels) {
-    ReplicaSelectionMetric metrics({{"cluster", "cluster-a"}});
+    ReplicaSelectionMetric metrics(
+        std::map<std::string, std::string>{{"cluster", "cluster-a"}});
 
     ReplicaSelectionDecision agree;
     agree.mode = ReplicaSelectionMode::SHADOW;
