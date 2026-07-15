@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstring>
 
+#include <optional>
 #include <regex>
 #include <string>
 #include <thread>
@@ -84,6 +85,93 @@ BucketBackendConfig BucketBackendConfig::FromEnvironment() {
     }
 
     return config;
+}
+
+bool OffsetAllocatorBackendConfig::Validate() const {
+    if (high_ratio <= 0.0 || high_ratio > 1.0) {
+        LOG(ERROR)
+            << "OffsetAllocatorBackendConfig: high_ratio must be in (0,1]";
+        return false;
+    }
+    if (low_ratio <= 0.0 || low_ratio >= high_ratio) {
+        LOG(ERROR) << "OffsetAllocatorBackendConfig: low_ratio must be in (0, "
+                      "high_ratio)";
+        return false;
+    }
+    if (keys_high_ratio <= 0.0 || keys_high_ratio > 1.0) {
+        LOG(ERROR)
+            << "OffsetAllocatorBackendConfig: keys_high_ratio must be in (0,1]";
+        return false;
+    }
+    if (keys_low_ratio <= 0.0 || keys_low_ratio >= keys_high_ratio) {
+        LOG(ERROR) << "OffsetAllocatorBackendConfig: keys_low_ratio must be in "
+                      "(0, keys_high_ratio)";
+        return false;
+    }
+    if (max_evict_per_offload == 0) {
+        LOG(ERROR) << "OffsetAllocatorBackendConfig: max_evict_per_offload "
+                      "must be > 0";
+        return false;
+    }
+    if (fallback_evict_batch == 0) {
+        LOG(ERROR)
+            << "OffsetAllocatorBackendConfig: fallback_evict_batch must be > 0";
+        return false;
+    }
+    if (max_capacity_nodes < 0) {
+        LOG(ERROR)
+            << "OffsetAllocatorBackendConfig: max_capacity_nodes must be >= 0";
+        return false;
+    }
+    return true;
+}
+
+static std::optional<double> GetEnvDouble(const char* name) {
+    const char* env = std::getenv(name);
+    if (!env || env[0] == '\0') return std::nullopt;
+    try {
+        return std::stod(env);
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+OffsetAllocatorBackendConfig OffsetAllocatorBackendConfig::FromEnvironment() {
+    OffsetAllocatorBackendConfig cfg;
+
+    const char* pol = std::getenv("MOONCAKE_OFFSET_EVICTION_POLICY");
+    if (pol) {
+        std::string s(pol);
+        if (s == "fifo" || s == "FIFO" || s == "Fifo") {
+            cfg.eviction_policy = OffsetEvictionPolicy::FIFO;
+        }
+        // NONE is default; LRU reserved for phase 2
+    }
+
+    if (auto v = GetEnvDouble("MOONCAKE_OFFSET_HIGH_RATIO"))
+        cfg.high_ratio = *v;
+    if (auto v = GetEnvDouble("MOONCAKE_OFFSET_LOW_RATIO")) cfg.low_ratio = *v;
+    // Both byte and key watermarks derive from the same ratio pair.
+    cfg.keys_high_ratio = cfg.high_ratio;
+    cfg.keys_low_ratio = cfg.low_ratio;
+
+    cfg.max_capacity_nodes = GetEnvOr<int64_t>(
+        "MOONCAKE_OFFSET_MAX_CAPACITY_NODES", cfg.max_capacity_nodes);
+
+    // Read eviction cap as int64_t to guard against negative env values
+    // which would wrap to SIZE_MAX with GetEnvOr<size_t>.
+    auto max_evict_raw =
+        GetEnvOr<int64_t>("MOONCAKE_OFFSET_MAX_EVICT_PER_OFFLOAD",
+                          static_cast<int64_t>(cfg.max_evict_per_offload));
+    if (max_evict_raw > 0) {
+        cfg.max_evict_per_offload = static_cast<size_t>(max_evict_raw);
+    } else if (max_evict_raw <= 0) {
+        LOG(WARNING) << "MOONCAKE_OFFSET_MAX_EVICT_PER_OFFLOAD="
+                     << max_evict_raw << " is non-positive; using default "
+                     << cfg.max_evict_per_offload;
+    }
+
+    return cfg;
 }
 
 StorageBackendInterface::StorageBackendInterface(
@@ -1589,24 +1677,23 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
         ReleasePreparedWrite(pending);
         return tl::make_unexpected(write_bucket_result.error());
     }
-    if (complete_handler != nullptr) {
-        auto error_code = complete_handler(bucket->keys, metadatas);
-        if (error_code != ErrorCode::OK) {
-            LOG(ERROR) << "Complete handler failed: " << error_code
-                       << ", Key count: " << bucket->keys.size()
-                       << ", Bucket id: " << bucket_id;
-            ReleasePreparedWrite(pending);
-            return tl::make_unexpected(error_code);
-        }
-    }
+    // Save a copy of bucket->keys before std::move(bucket) into buckets_
+    // consumes the shared_ptr. Needed for complete_handler and rollback.
+    const auto bucket_keys = bucket->keys;
 
-    bool duplicate_found = false;
+    // Commit to metadata maps under exclusive lock FIRST.
+    // This ensures any concurrent BatchLoad arriving after Master redirects
+    // reads to this node can find the key in object_bucket_map_.
+    // Even if complete_handler fails later, the read path is correct —
+    // RollbackCommittedBucket will undo the commit safely.
     {
         SharedMutexLocker lock(&mutex_);
 
         ReleasePreparedWriteLocked(pending);
 
-        for (const auto& key : bucket->keys) {
+        // Pre-check for duplicates before modifying any state
+        bool duplicate_found = false;
+        for (const auto& key : bucket_keys) {
             if (object_bucket_map_.find(key) != object_bucket_map_.end()) {
                 duplicate_found = true;
                 break;
@@ -1616,23 +1703,46 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
         if (!duplicate_found) {
             total_size_ += bucket->data_size + bucket->meta_size;
             object_bucket_map_.reserve(object_bucket_map_.size() +
-                                       bucket->keys.size());
-            for (size_t i = 0; i < bucket->keys.size(); ++i) {
+                                       bucket_keys.size());
+            for (size_t i = 0; i < bucket_keys.size(); ++i) {
                 auto [it, inserted] = object_bucket_map_.insert(
-                    {bucket->keys[i], std::move(metadatas[i])});
+                    {bucket_keys[i], metadatas[i]});
                 CHECK(inserted)
-                    << "Reserved key became duplicated: " << bucket->keys[i];
+                    << "Reserved key became duplicated: " << bucket_keys[i];
             }
             buckets_.emplace(bucket_id, std::move(bucket));
             lru_index_.emplace(0LL, bucket_id);
         }
+        if (duplicate_found) {
+            LOG(ERROR) << "Reserved key became duplicated before commit, "
+                          "bucket_id="
+                       << bucket_id;
+            lock.unlock();
+            CleanupOrphanedBucket(bucket_id);
+            return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+        }
     }
+    // Lock released. From this point forward, concurrent BatchLoad
+    // can find the keys and read from the committed bucket files.
 
-    if (duplicate_found) {
-        LOG(ERROR) << "Reserved key became duplicated before commit, bucket_id="
-                   << bucket_id;
-        CleanupOrphanedBucket(bucket_id);
-        return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+    // Notify Master AFTER local index is committed.
+    // metadatas[i].transport_endpoint is empty here (it gets populated by
+    // complete_handler before the RPC); int64_t fields carry the metadata
+    // from BuildBucket unchanged.
+    if (complete_handler != nullptr) {
+        auto error_code = complete_handler(bucket_keys, metadatas);
+        if (error_code != ErrorCode::OK) {
+            LOG(ERROR) << "Complete handler failed: " << error_code
+                       << ", Key count: " << bucket_keys.size()
+                       << ", Bucket id: " << bucket_id;
+            // Master was NOT notified. The local index has entries that
+            // Master doesn't know about — a "client can read but Master
+            // doesn't know" ghost replica. Rollback the local commit
+            // (removes index entries + waits for inflight reads + deletes
+            // on-disk files).
+            RollbackCommittedBucket(bucket_id, bucket_keys);
+            return tl::make_unexpected(error_code);
+        }
     }
 
     return bucket_id;
@@ -2438,6 +2548,14 @@ void BucketStorageBackend::CleanupOrphanedBucket(int64_t bucket_id) {
 
     auto data_path_res = GetBucketDataPath(bucket_id);
     if (data_path_res) {
+        // Evict the cached file handle before deleting the file, matching
+        // the pattern in FinalizeEviction. Without this, a subsequent open
+        // on the same path (e.g. after bucket_id reuse) may return a stale
+        // handle pointing to the now-deleted file.
+        {
+            MutexLocker cache_locker(&file_cache_mutex_);
+            file_cache_.erase(data_path_res.value());
+        }
         if (fs::remove(data_path_res.value(), ec)) {
             LOG(INFO) << "Cleaned up orphaned bucket data file: "
                       << data_path_res.value();
@@ -2460,6 +2578,97 @@ void BucketStorageBackend::CleanupOrphanedBucket(int64_t bucket_id) {
                          << ", error: " << ec.message();
         }
     }
+}
+
+void BucketStorageBackend::RollbackCommittedBucket(
+    int64_t bucket_id, const std::vector<std::string>& keys) {
+    std::shared_ptr<BucketMetadata> bucket_meta;
+
+    // Phase 1: Remove from metadata maps under exclusive lock.
+    // This prevents new readers from finding the keys.
+    {
+        SharedMutexLocker lock(&mutex_);
+
+        auto bucket_it = buckets_.find(bucket_id);
+        if (bucket_it == buckets_.end()) {
+            LOG(WARNING) << "RollbackCommittedBucket: bucket " << bucket_id
+                         << " not found in buckets_ — already removed?";
+            // Still clean up disk files in case they are orphaned
+            CleanupOrphanedBucket(bucket_id);
+            return;
+        }
+
+        // Save a reference for inflight-read waiting
+        bucket_meta = bucket_it->second;
+
+        // Remove all keys from object_bucket_map_
+        for (const auto& key : keys) {
+            auto obj_it = object_bucket_map_.find(key);
+            if (obj_it != object_bucket_map_.end() &&
+                obj_it->second.bucket_id == bucket_id) {
+                total_size_ -=
+                    obj_it->second.data_size + obj_it->second.key_size;
+                object_bucket_map_.erase(obj_it);
+            }
+        }
+
+        // Remove bucket metadata
+        total_size_ -= bucket_meta->meta_size;
+        lru_index_.erase({0LL, bucket_id});
+        buckets_.erase(bucket_it);
+    }
+
+    // Phase 2: Wait for inflight reads to drain.
+    // Readers that found the key before we removed it from the map
+    // hold a BucketReadGuard that keeps inflight_reads_ > 0.
+    // In practice this should never block: the bucket was committed and
+    // rolled back within microseconds — no reader had time to acquire a
+    // guard. But guard against the edge case anyway.
+    //
+    // Uses the same spin-then-sleep pattern as DeleteBucket (not the
+    // spin-then-yield pattern of FinalizeEviction) because rollback is a
+    // rare error-recovery path where CPU friendliness matters more than
+    // latency.
+    {
+        constexpr int kMaxSpinIterations = 1000;
+        constexpr auto kSleepDuration = std::chrono::microseconds(100);
+        constexpr auto kMaxWaitTime = std::chrono::seconds(10);
+        int spin_count = 0;
+        auto wait_start = std::chrono::steady_clock::now();
+        while (bucket_meta->inflight_reads_.load(std::memory_order_acquire) >
+               0) {
+            if (++spin_count > kMaxSpinIterations) {
+                std::this_thread::sleep_for(kSleepDuration);
+                spin_count = 0;
+                if (std::chrono::steady_clock::now() - wait_start >
+                    kMaxWaitTime) {
+                    LOG(ERROR)
+                        << "RollbackCommittedBucket: timed out waiting "
+                        << "for inflight reads on bucket " << bucket_id
+                        << " (inflight="
+                        << bucket_meta->inflight_reads_.load(
+                               std::memory_order_relaxed)
+                        << "). Leaving orphaned files on disk; they will "
+                        << "be cleaned up by Init() on next restart.";
+                    // Return WITHOUT deleting files. A reader is still
+                    // holding a guard, so deleting the files could cause
+                    // I/O errors on the read path. This matches
+                    // DeleteBucket's behavior (returns INTERNAL_ERROR
+                    // instead of deleting). The orphan will be recovered
+                    // by Init()'s orphan scan.
+                    return;
+                }
+            } else {
+                PAUSE();
+            }
+        }
+    }
+
+    // Phase 3: Delete on-disk files now that no readers remain.
+    CleanupOrphanedBucket(bucket_id);
+
+    LOG(INFO) << "RollbackCommittedBucket: rolled back bucket " << bucket_id
+              << " with " << keys.size() << " keys";
 }
 
 std::map<int64_t, std::shared_ptr<BucketMetadata>>::iterator
@@ -3183,9 +3392,11 @@ BucketStorageBackend::GetFileInstance() const {
 // ============================================================================
 
 OffsetAllocatorStorageBackend::OffsetAllocatorStorageBackend(
-    const FileStorageConfig& file_storage_config_)
+    const FileStorageConfig& file_storage_config_,
+    const OffsetAllocatorBackendConfig& offset_backend_config)
     : StorageBackendInterface(file_storage_config_),
-      storage_path_(file_storage_config_.storage_filepath) {
+      storage_path_(file_storage_config_.storage_filepath),
+      cfg_(offset_backend_config) {
     capacity_ = file_storage_config_.total_size_limit;
 }
 
@@ -3279,16 +3490,128 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
                                                      fd_guard.release());
         }
 
-        // Create allocator with base=0, size=capacity
-        allocator_ = offset_allocator::OffsetAllocator::create(0, capacity_);
+        // Resolve watermark thresholds from config
+        high_watermark_bytes_ =
+            cfg_.high_watermark_bytes > 0
+                ? cfg_.high_watermark_bytes
+                : static_cast<int64_t>(capacity_ * cfg_.high_ratio);
+        low_watermark_bytes_ =
+            cfg_.low_watermark_bytes > 0
+                ? cfg_.low_watermark_bytes
+                : static_cast<int64_t>(capacity_ * cfg_.low_ratio);
+        high_watermark_keys_ =
+            cfg_.high_watermark_keys > 0
+                ? cfg_.high_watermark_keys
+                : static_cast<int64_t>(file_storage_config_.total_keys_limit *
+                                       cfg_.keys_high_ratio);
+        low_watermark_keys_ =
+            cfg_.low_watermark_keys > 0
+                ? cfg_.low_watermark_keys
+                : static_cast<int64_t>(file_storage_config_.total_keys_limit *
+                                       cfg_.keys_low_ratio);
+
+        // Auto-nudge ratio-derived low watermarks when integer truncation
+        // collapses them to the same value as high (e.g. limit=5, ratio
+        // 0.95->4, ratio 0.90->4 => low==high==4).  Only applies to
+        // auto-derived values; explicit config values are validated strictly.
+        if (cfg_.low_watermark_bytes == 0 && high_watermark_bytes_ > 0 &&
+            low_watermark_bytes_ >= high_watermark_bytes_) {
+            low_watermark_bytes_ =
+                std::max<int64_t>(1, high_watermark_bytes_ - 1);
+        }
+        if (cfg_.low_watermark_keys == 0 && high_watermark_keys_ > 0 &&
+            low_watermark_keys_ >= high_watermark_keys_) {
+            low_watermark_keys_ =
+                std::max<int64_t>(1, high_watermark_keys_ - 1);
+        }
+
+        // Validate watermarks
+        if (low_watermark_bytes_ >= high_watermark_bytes_) {
+            LOG(ERROR) << "Invalid watermark: low_bytes="
+                       << low_watermark_bytes_
+                       << " >= high_bytes=" << high_watermark_bytes_;
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (low_watermark_keys_ >= high_watermark_keys_) {
+            LOG(ERROR) << "Invalid watermark: low_keys=" << low_watermark_keys_
+                       << " >= high_keys=" << high_watermark_keys_;
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+
+        // Clamp watermarks to not exceed capacity / total_keys_limit
+        if (high_watermark_bytes_ > static_cast<int64_t>(capacity_)) {
+            LOG(WARNING) << "high_watermark_bytes clamped from "
+                         << high_watermark_bytes_
+                         << " to capacity=" << capacity_;
+            high_watermark_bytes_ = static_cast<int64_t>(capacity_);
+            low_watermark_bytes_ =
+                std::min(low_watermark_bytes_, high_watermark_bytes_ - 1);
+        }
+        if (high_watermark_keys_ > file_storage_config_.total_keys_limit) {
+            LOG(WARNING) << "high_watermark_keys clamped from "
+                         << high_watermark_keys_ << " to total_keys_limit="
+                         << file_storage_config_.total_keys_limit;
+            high_watermark_keys_ = file_storage_config_.total_keys_limit;
+            low_watermark_keys_ =
+                std::min(low_watermark_keys_, high_watermark_keys_ - 1);
+        }
+
+        // Guard against zero low-watermark on very small capacity
+        if (low_watermark_bytes_ <= 0 && high_watermark_bytes_ > 0) {
+            low_watermark_bytes_ =
+                std::max<int64_t>(1, high_watermark_bytes_ / 2);
+        }
+        if (low_watermark_keys_ <= 0 && high_watermark_keys_ > 0) {
+            low_watermark_keys_ =
+                std::max<int64_t>(1, high_watermark_keys_ / 2);
+        }
+
+        // Create allocator with tuned node capacity
+        constexpr int64_t kMinObjectSize = 256;
+        constexpr int64_t kMaxNodeRamBytes =
+            512LL * 1024 * 1024;  // 512MB node RAM budget
+        constexpr uint32_t kRamBasedMaxNodes =
+            static_cast<uint32_t>(kMaxNodeRamBytes / 56);
+        constexpr uint32_t kAbsoluteMaxNodes =
+            std::min<uint32_t>(kRamBasedMaxNodes, 32U << 20);
+
+        uint32_t max_nodes = (1U << 20);  // default 1M nodes
+        if (cfg_.max_capacity_nodes > 0) {
+            if (cfg_.max_capacity_nodes > kAbsoluteMaxNodes) {
+                LOG(WARNING)
+                    << "max_capacity_nodes " << cfg_.max_capacity_nodes
+                    << " exceeds RAM budget; clamped to " << kAbsoluteMaxNodes;
+                max_nodes = kAbsoluteMaxNodes;
+            } else {
+                max_nodes = static_cast<uint32_t>(cfg_.max_capacity_nodes);
+            }
+        } else {
+            int64_t auto_nodes = std::max<int64_t>(
+                1LL << 20, std::min<int64_t>(capacity_ / kMinObjectSize,
+                                             kAbsoluteMaxNodes));
+            max_nodes = static_cast<uint32_t>(auto_nodes);
+        }
+        uint32_t init_nodes = std::min<uint32_t>(128U * 1024, max_nodes);
+        allocator_ = offset_allocator::OffsetAllocator::create(
+            0, capacity_, init_nodes, max_nodes);
         if (!allocator_) {
             LOG(ERROR) << "Failed to create OffsetAllocator";
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
 
+        // Initialize eviction index
+        {
+            MutexLocker ev(&eviction_mutex_);
+            fifo_index_.clear();
+            insert_seq_.store(0, std::memory_order_relaxed);
+        }
+
         initialized_.store(true, std::memory_order_release);
         LOG(INFO) << "OffsetAllocatorStorageBackend initialized, capacity: "
-                  << capacity_ << " bytes, data file: " << data_file_path_;
+                  << capacity_
+                  << " bytes, high_watermark: " << high_watermark_bytes_
+                  << " bytes, " << high_watermark_keys_ << " keys"
+                  << ", data file: " << data_file_path_;
     } catch (const std::exception& e) {
         LOG(ERROR) << "OffsetAllocatorStorageBackend initialize error: "
                    << e.what();
@@ -3299,13 +3622,100 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
 }
 
 //-----------------------------------------------------------------------------
+// EvictToMakeRoom
+//-----------------------------------------------------------------------------
+
+void OffsetAllocatorStorageBackend::EvictToMakeRoom(
+    int64_t required_bytes, size_t min_victims,
+    const std::unordered_set<std::string>& batch_keys,
+    std::vector<std::string>& out_evicted) {
+    if (cfg_.eviction_policy == OffsetEvictionPolicy::NONE) return;
+
+    MutexLocker ev(&eviction_mutex_);
+    size_t n = 0;
+
+    while (n < cfg_.max_evict_per_offload) {
+        int64_t cur_size = total_size_.load(std::memory_order_relaxed);
+        int64_t cur_keys = total_keys_.load(std::memory_order_relaxed);
+        bool below_bytes = (cur_size + required_bytes <= low_watermark_bytes_);
+        bool below_keys = (cur_keys <= low_watermark_keys_);
+        // Stop when both byte and key-count watermarks are satisfied
+        // and we have met the minimum victim count.
+        if (below_bytes && below_keys && n >= min_victims) break;
+
+        if (fifo_index_.empty()) break;
+
+        auto oldest = fifo_index_.begin();
+        uint64_t vseq = oldest->first;
+        std::string vkey = oldest->second;
+
+        // Skip batch_keys prefix — keys being written in this batch.
+        // Do NOT erase their FIFO slots (they may fail allocate() and
+        // need the slot to remain in the index for future eviction).
+        // Worst-case comparison cost: O(|batch_keys_prefix|), bounded.
+        while (oldest != fifo_index_.end() &&
+               batch_keys.count(oldest->second)) {
+            ++oldest;
+        }
+        if (oldest == fifo_index_.end()) break;  // all are batch_keys
+        vkey = oldest->second;
+        vseq = oldest->first;
+
+        size_t shard_idx = ShardForKey(vkey);
+        auto& shard = shards_[shard_idx];
+        {
+            SharedMutexLocker lk(&shard.mutex);
+            auto it = shard.map.find(vkey);
+            if (it == shard.map.end() || it->second.fifo_seq != vseq) {
+                // Orphan slot in fifo_index_: the key is no longer in
+                // shard.map, or its fifo_seq was replaced by a newer
+                // overwrite.  Overwrites are cleaned up in BatchOffload
+                // Step-4 (fifo_index_.erase(old_seq) under the lock),
+                // so today this branch is only reachable if a future
+                // per-key delete path neglects to also erase from
+                // fifo_index_.  Keep the lazy-repair as a defense.
+                fifo_index_.erase(oldest);
+                ++n;  // counted toward scan budget
+                continue;
+            }
+            // Defensive assertions against double-evict underflow.
+            // Precondition: single heartbeat_thread_ serialises offload;
+            // if concurrent offload is added, these must be re-evaluated.
+            DCHECK_GE(total_size_.load(std::memory_order_relaxed),
+                      it->second.total_size);
+            DCHECK_GE(total_keys_.load(std::memory_order_relaxed), 1);
+            total_size_.fetch_sub(it->second.total_size,
+                                  std::memory_order_relaxed);
+            total_keys_.fetch_sub(1, std::memory_order_relaxed);
+            shard.map.erase(it);
+        }
+        fifo_index_.erase(oldest);
+        out_evicted.push_back(std::move(vkey));
+        ++n;
+    }
+}
+
+//-----------------------------------------------------------------------------
 
 tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
     const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
     std::function<ErrorCode(const std::vector<std::string>& keys,
                             std::vector<StorageObjectMetadata>& metadatas)>
         complete_handler,
-    EvictionHandler /*eviction_handler*/) {
+    EvictionHandler eviction_handler) {
+    // ================================================================
+    // SINGLE-WRITER PRECONDITION
+    //
+    // BatchOffload, EvictToMakeRoom, and the watermark accounting on
+    // total_size_ / total_keys_ assume only ONE thread calls
+    // BatchOffload at a time (currently guaranteed by FileStorage's
+    // single heartbeat_thread_).  The atomics make individual loads
+    // and stores atomic, but the read-modify-write sequences (check
+    // watermark → evict → update counters) are NOT atomic across
+    // threads.  If concurrent offload is added, the DCHECK_GE guards
+    // in EvictToMakeRoom must also be re-evaluated.
+    // ================================================================
+
     if (!initialized_.load(std::memory_order_acquire)) {
         LOG(ERROR)
             << "Storage backend is not initialized. Call Init() before use.";
@@ -3324,33 +3734,47 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
         return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
     }
 
+    const bool eviction_on =
+        (cfg_.eviction_policy != OffsetEvictionPolicy::NONE) &&
+        (eviction_handler != nullptr);
+
+    // Warn if eviction policy is set but caller omitted the handler.
+    // IsEnableOffloading() will still return true in this mode, but
+    // eviction is effectively disabled (degraded to NONE behavior).
+    if (cfg_.eviction_policy != OffsetEvictionPolicy::NONE &&
+        eviction_handler == nullptr) {
+        LOG_FIRST_N(WARNING, 1)
+            << "Eviction policy is " << static_cast<int>(cfg_.eviction_policy)
+            << " but eviction_handler is null; eviction is disabled. "
+               "IsEnableOffloading() will still return true.";
+    }
+
+    // Build the set of keys being offloaded in this batch so that
+    // EvictToMakeRoom does not evict them (they aren't committed yet).
+    std::unordered_set<std::string> batch_keys;
+    if (eviction_on) {
+        for (const auto& [k, _] : batch_object) batch_keys.insert(k);
+    }
+
     std::vector<std::string> keys;
     std::vector<StorageObjectMetadata> metadatas;
     keys.reserve(batch_object.size());
     metadatas.reserve(batch_object.size());
 
-    // Process each object in the batch; continue on individual failures to
-    // support partial success
-    for (const auto& [key, slices] : batch_object) {
-        if (slices.empty()) {
-            // Skip empty slices (empty values are allowed but not stored)
-            continue;
-        }
+    // Accumulated evicted keys across the per-key loop.
+    // Flushed to eviction_handler before each allocate() that may reuse
+    // freed space, and again after the loop for any leftover victims.
+    std::vector<std::string> evicted_keys;
 
-        // Test-only: Check if this key should fail (deterministic failure
-        // injection)
+    for (const auto& [key, slices] : batch_object) {
+        if (slices.empty()) continue;
+
         if (test_failure_predicate_ && test_failure_predicate_(key)) {
             LOG(INFO) << "[TEST] Injecting failure for key: " << key
                       << " (test failure predicate)";
-            continue;  // Simulate allocation/write failure
+            continue;
         }
 
-        // Calculate total value size. RecordHeader stores value_len as a
-        // uint32_t (RecordHeader::SIZE is 8 bytes), so accumulating directly
-        // into a uint32_t would silently overflow for an object larger than
-        // 4 GiB: the record would be under-allocated and then its full slices
-        // written past the allocation. Sum in 64 bits and reject oversized
-        // objects instead of corrupting the storage arena.
         uint64_t total_value_size = 0;
         for (const auto& slice : slices) {
             total_value_size += slice.size;
@@ -3361,48 +3785,122 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
                    "in 4 GiB) for key: "
                 << key << ", size: " << total_value_size
                 << " - skipping this key";
-            continue;  // partial-success model: keep processing other keys
+            continue;
         }
         uint32_t value_size = static_cast<uint32_t>(total_value_size);
 
-        // Prepare record header
         RecordHeader header{.key_len = static_cast<uint32_t>(key.size()),
                             .value_len = value_size};
-
-        // Use size_t for record_size to handle large objects (up to 4GB per
-        // RecordHeader)
         size_t record_size =
             RecordHeader::SIZE + header.key_len + header.value_len;
 
-        // Step 1: Allocate space (allocator is thread-safe, ensures unique
-        // offsets) No locks held during allocation
+        // Guard against record_size exceeding what the on-disk format
+        // can represent (ObjectEntry::total_size is uint32_t).
+        if (record_size > UINT32_MAX) {
+            LOG(ERROR) << "Record too large for key: " << key
+                       << ", record_size=" << record_size;
+            continue;
+        }
+
+        // ---- (A) Proactive eviction (watermark-driven) ----
+        if (eviction_on) {
+            int64_t cur_size = total_size_.load(std::memory_order_relaxed);
+            int64_t cur_keys = total_keys_.load(std::memory_order_relaxed);
+            bool over_bytes = (cur_size + static_cast<int64_t>(record_size) >
+                               high_watermark_bytes_);
+            bool over_keys = (cur_keys > high_watermark_keys_);
+            if (over_bytes || over_keys) {
+                // When triggered by key-count overflow, force at least
+                // fallback_evict_batch victims even if bytes are low.
+                size_t min_v = over_keys ? cfg_.fallback_evict_batch : 0;
+                EvictToMakeRoom(static_cast<int64_t>(record_size), min_v,
+                                batch_keys, evicted_keys);
+            }
+        }
+
+        // ---- (B) Notify master of evicted keys BEFORE allocating ----
+        // Layer-1 (byte safety): BatchLoad pins extents via shared_ptr,
+        // so the allocator cannot re-issue a still-read offset.  Layer-2
+        // (master metadata): the master must be told the key's local-disk
+        // replica is gone before we reuse its space for a new key.
+        if (eviction_on && eviction_handler && !evicted_keys.empty()) {
+            auto notify_result = eviction_handler(evicted_keys);
+            if (!notify_result) {
+                return tl::make_unexpected(notify_result.error());
+            }
+            evicted_keys.clear();
+        }
+
+        // ---- (C) Allocate ----
         auto allocation = allocator_->allocate(record_size);
+
+        // ---- (D) Fallback eviction (nullopt retry loop) ----
+        if (!allocation.has_value() && eviction_on) {
+            uint64_t prev_largest =
+                allocator_->get_metrics().largest_free_region_;
+            size_t fallback_total_evicted = 0;
+            const size_t kMaxFallbackEvicted = cfg_.max_evict_per_offload;
+
+            while (!allocation.has_value() &&
+                   fallback_total_evicted < kMaxFallbackEvicted) {
+                size_t before = evicted_keys.size();
+                EvictToMakeRoom(static_cast<int64_t>(record_size),
+                                cfg_.fallback_evict_batch, batch_keys,
+                                evicted_keys);
+                size_t evicted_this_turn = evicted_keys.size() - before;
+                fallback_total_evicted += evicted_this_turn;
+
+                // Notify master of fallback victims before retrying.
+                if (eviction_handler && !evicted_keys.empty()) {
+                    auto notify_result = eviction_handler(evicted_keys);
+                    if (!notify_result) {
+                        return tl::make_unexpected(notify_result.error());
+                    }
+                    evicted_keys.clear();
+                }
+
+                uint64_t now_largest =
+                    allocator_->get_metrics().largest_free_region_;
+                if (evicted_this_turn == 0) break;  // no victims at all
+                // Stop if the largest free region did not grow at all.
+                // Using `prev_largest` (rather than `prev_largest +
+                // record_size / 2`) allows gradual coalescence when
+                // many small victims must be evicted for one large
+                // allocation.  The `fallback_total_evicted` cap still
+                // bounds total eviction per key.
+                if (now_largest <= prev_largest) break;
+                prev_largest = now_largest;
+                allocation = allocator_->allocate(record_size);
+            }
+        }
+
+        // ---- Handle allocation failure ----
         if (!allocation.has_value()) {
-            LOG(ERROR) << "Failed to allocate " << record_size
-                       << " bytes for key: " << key
-                       << " - stopping processing for this batch";
-            break;  // Stop processing other keys as space is likely exhausted
+            if (eviction_on) {
+                eviction_skips_.fetch_add(1, std::memory_order_relaxed);
+                LOG(WARNING) << "Skipping key after eviction attempts: " << key;
+                continue;  // eviction enabled: try next key
+            } else {
+                LOG(ERROR) << "Failed to allocate " << record_size
+                           << " bytes for key: " << key
+                           << " - stopping processing for this batch";
+                break;  // eviction disabled: preserve old break semantics
+            }
         }
 
         uint64_t offset = allocation->address();
 
-        // Step 2: Write data to disk (no metadata locks held during I/O)
+        // ---- (E) Disk write (unchanged from original) ----
         std::vector<iovec> iovs;
-        iovs.reserve(2 + slices.size());
-
-        // Header
+        iovs.reserve(2 + 1 + slices.size());
         iovs.push_back(
             {const_cast<char*>(reinterpret_cast<const char*>(&header.key_len)),
              sizeof(header.key_len)});
         iovs.push_back({const_cast<char*>(
                             reinterpret_cast<const char*>(&header.value_len)),
                         sizeof(header.value_len)});
-
-        // Key
         iovs.push_back({const_cast<char*>(key.data()),
                         static_cast<size_t>(header.key_len)});
-
-        // Value slices
         for (const auto& slice : slices) {
             iovs.push_back({slice.ptr, slice.size});
         }
@@ -3411,78 +3909,84 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
             data_file_->vector_write(iovs.data(), iovs.size(), offset);
         if (!write_result) {
             LOG(ERROR) << "Failed to write record for key: " << key
-                       << ", error: " << write_result.error()
-                       << " - continuing with remaining keys";
-            // Allocation handle is still local (not yet stored in the metadata
-            // map) and will be freed automatically when going out of scope.
-            continue;  // Continue processing other keys
+                       << ", error: " << write_result.error();
+            continue;
         }
-
-        // Handle the case where the data was written partially.
-        size_t written = write_result.value();
-        if (written != record_size) {
+        if (write_result.value() != record_size) {
             LOG(ERROR) << "Write size mismatch for key: " << key
-                       << ", expected: " << record_size << ", got: " << written
-                       << " - continuing with remaining keys";
-            continue;  // Continue processing other keys
+                       << ", expected: " << record_size
+                       << ", got: " << write_result.value();
+            continue;
         }
 
-        // Step 3: Wrap allocation in refcounted handle
-        auto allocation_ptr = std::make_shared<RefCountedAllocationHandle>(
-            std::move(allocation.value()));
-
-        // Step 4: Update metadata map under exclusive shard lock
-        // Lock only the shard for this key (other shards can proceed in
-        // parallel)
+        // ---- (F) Metadata update with FIFO index maintenance ----
         {
+            auto allocation_ptr = std::make_shared<RefCountedAllocationHandle>(
+                std::move(allocation.value()));
             size_t shard_idx = ShardForKey(key);
             auto& shard = shards_[shard_idx];
-            SharedMutexLocker lock(&shard.mutex);
 
-            // Check if key exists to update size accounting
+            // Lock order: eviction_mutex_ -> shard.mutex.
+            // Both insert and evict paths obey this order, preventing
+            // the overwrite-vs-evict race on fifo_index_.
+            std::optional<MutexLocker> ev_lock;
+            if (eviction_on) ev_lock.emplace(&eviction_mutex_);
+            SharedMutexLocker shard_lock(&shard.mutex);
+
             auto it = shard.map.find(key);
             int64_t size_delta = static_cast<int64_t>(record_size);
             bool is_new_key = (it == shard.map.end());
+            uint64_t seq = 0;
 
-            if (!is_new_key) {
-                // Overwrite: subtract old size
+            if (eviction_on) {
+                seq = insert_seq_.fetch_add(1, std::memory_order_relaxed);
+                if (!is_new_key) {
+                    // Overwrite: drop old size and remove old FIFO slot.
+                    size_delta -= static_cast<int64_t>(it->second.total_size);
+                    fifo_index_.erase(it->second.fifo_seq);
+                }
+            } else if (!is_new_key) {
                 size_delta -= static_cast<int64_t>(it->second.total_size);
-                // Old AllocationPtr will be dropped, refcount decremented
-                // Physical extent freed when last reader releases it
             }
 
-            // Update map (insert_or_assign handles both insert and overwrite)
             shard.map.insert_or_assign(
-                key, ObjectEntry(offset, record_size, value_size,
-                                 std::move(allocation_ptr)));
+                key, ObjectEntry(offset, static_cast<uint32_t>(record_size),
+                                 value_size, std::move(allocation_ptr), seq));
 
-            // Update total size atomically (lock-free, separate from map
-            // updates)
+            if (eviction_on) fifo_index_.emplace(seq, key);
+
             total_size_.fetch_add(size_delta, std::memory_order_relaxed);
-
-            // Update total keys only if inserting a new key
             if (is_new_key) {
                 total_keys_.fetch_add(1, std::memory_order_relaxed);
             }
         }
 
         keys.push_back(key);
-        metadatas.push_back(StorageObjectMetadata{
-            0,  // bucket_id not used for this backend
-            static_cast<int64_t>(offset), static_cast<int64_t>(header.key_len),
-            static_cast<int64_t>(value_size), ""});
+        metadatas.push_back(
+            StorageObjectMetadata{0, static_cast<int64_t>(offset),
+                                  static_cast<int64_t>(header.key_len),
+                                  static_cast<int64_t>(value_size), ""});
     }
 
-    // Invoke complete handler only if we have successful keys to report
+    // ---- Post-loop flush: notify master of any evicted keys that
+    // were accumulated by the last (possibly allocate-failing) key.
+    if (eviction_on && eviction_handler && !evicted_keys.empty()) {
+        auto notify_result = eviction_handler(evicted_keys);
+        if (!notify_result) {
+            return tl::make_unexpected(notify_result.error());
+        }
+        evicted_keys.clear();
+    }
+
     if (complete_handler != nullptr && !keys.empty()) {
         auto error_code = complete_handler(keys, metadatas);
         if (error_code != ErrorCode::OK) {
-            LOG(ERROR)
-                << "Complete handler failed: " << error_code << " - "
-                << keys.size()
-                << " keys were successfully written to disk but master was not "
-                   "notified. "
-                << "Master will learn about them via ScanMeta on next restart.";
+            LOG(ERROR) << "Complete handler failed: " << error_code << " - "
+                       << keys.size()
+                       << " keys were successfully written to disk but master "
+                          "was not notified. "
+                       << "Master will learn about them via ScanMeta on next "
+                          "restart.";
             return tl::make_unexpected(error_code);
         }
     }
@@ -3645,15 +4149,17 @@ OffsetAllocatorStorageBackend::IsEnableOffloading() {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
-    // TODO: See if free space check is needed here.
-    // Check quota limits only (atomic counters, completely lock-free!)
+    // When eviction is enabled, BatchOffload's EvictToMakeRoom is
+    // responsible for making room — do not block offload here.
+    if (cfg_.eviction_policy != OffsetEvictionPolicy::NONE) {
+        return true;
+    }
+
+    // Eviction disabled: keep the original quota-check behavior.
     bool within_size_limit = total_size_.load(std::memory_order_relaxed) <
                              file_storage_config_.total_size_limit;
-
-    // Check keys limit (atomic counter maintained during BatchOffload)
     bool within_keys_limit = total_keys_.load(std::memory_order_relaxed) <
                              file_storage_config_.total_keys_limit;
-
     return within_size_limit && within_keys_limit;
 }
 
@@ -3767,7 +4273,14 @@ CreateStorageBackend(const FileStorageConfig& config) {
                 config, file_per_key_backend_config);
         }
         case StorageBackendType::kOffsetAllocator: {
-            return std::make_shared<OffsetAllocatorStorageBackend>(config);
+            auto offset_backend_config =
+                OffsetAllocatorBackendConfig::FromEnvironment();
+            if (!offset_backend_config.Validate()) {
+                throw std::invalid_argument(
+                    "Invalid OffsetAllocatorBackendConfig");
+            }
+            return std::make_shared<OffsetAllocatorStorageBackend>(
+                config, offset_backend_config);
         }
         case StorageBackendType::kDistributed: {
             auto distributed_config =

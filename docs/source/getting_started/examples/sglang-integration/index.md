@@ -17,7 +17,7 @@ SGLang uses Mooncake's Transfer Engine for direct zero-copy KV cache transfer be
 
 **Related:** [Full PD Disaggregation Guide](../sglang-integration-v1) — installation, cross-node/same-node setup, XpYd topology, EP backend for MoE models, and EPD backend for multimodal models.
 
-**Benchmark:** [PD Disaggregation Performance](../../../performance/sglang-benchmark-results-v1) — compares 1P1D disaggregation with regular SGLang instances.
+**Benchmark:** [PD Disaggregation Performance](../../../performance/sglang/sglang-benchmark-results-v1) — compares 1P1D disaggregation with regular SGLang instances.
 
 ---
 

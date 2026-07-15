@@ -44,6 +44,8 @@
 #include "utils/zstd_util.h"
 #include "utils/file_util.h"
 #include "utils.h"
+#include "kv_event/kv_event_config.h"
+#include "master_snapshot_manager.h"
 
 namespace mooncake {
 
@@ -234,12 +236,12 @@ MasterService::MasterService(const MasterServiceConfig& config)
           config.snapshot_catalog_store_connstring),
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
       put_start_release_timeout_sec_(config.put_start_release_timeout_sec),
-      task_manager_(config.task_manager_config),
       cxl_path_(config.cxl_path),
       cxl_size_(config.cxl_size),
       enable_cxl_(config.enable_cxl),
       offloading_queue_limit_(config.offloading_queue_limit),
-      offload_cap_ratio_(config.offload_cap_ratio) {
+      offload_cap_ratio_(config.offload_cap_ratio),
+      task_manager_(config.task_manager_config) {
     // Initialize HTTP metadata key prefix (read env var once at startup)
     const char* custom_prefix = std::getenv("MC_METADATA_CLUSTER_ID");
     if (custom_prefix && std::strlen(custom_prefix) > 0) {
@@ -409,6 +411,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
                   << ")";
     }
 
+    kv_event_publisher_ =
+        std::make_unique<KvEventPublisher>(BuildKvEventConfig(config));
+
     eviction_running_ = true;
     eviction_thread_ = std::thread(&MasterService::EvictionThreadFunc, this);
     VLOG(1) << "action=start_eviction_thread";
@@ -454,9 +459,30 @@ MasterService::MasterService(const MasterServiceConfig& config)
 
     if (enable_snapshot_) {
         if (memory_allocator_type_ == BufferAllocatorType::OFFSET) {
-            snapshot_running_ = true;
-            snapshot_thread_ =
-                std::thread(&MasterService::SnapshotThreadFunc, this);
+            // Initialize and start snapshot manager
+            MasterSnapshotManagerOptions snapshot_options;
+            snapshot_options.enable_snapshot = enable_snapshot_;
+            snapshot_options.snapshot_interval_seconds =
+                snapshot_interval_seconds_;
+            snapshot_options.snapshot_child_timeout_seconds =
+                snapshot_child_timeout_seconds_;
+            snapshot_options.snapshot_retention_count =
+                snapshot_retention_count_;
+            snapshot_options.snapshot_backup_dir = snapshot_backup_dir_;
+            snapshot_options.use_snapshot_backup_dir = use_snapshot_backup_dir_;
+            snapshot_options.snapshot_catalog_store_type =
+                snapshot_catalog_store_type_;
+            snapshot_options.snapshot_catalog_store_connstring =
+                snapshot_catalog_store_connstring_;
+            snapshot_options.ha_backend_type = ha_backend_type_;
+            snapshot_options.ha_backend_connstring = ha_backend_connstring_;
+            snapshot_options.cluster_id = cluster_id_;
+            snapshot_options.enable_ha = enable_ha_;
+
+            snapshot_manager_ = std::make_unique<MasterSnapshotManager>(
+                this, snapshot_options, snapshot_mutex_,
+                snapshot_object_store_.get(), snapshot_catalog_store_.get());
+            snapshot_manager_->Start();
         }
     }
 
@@ -507,10 +533,12 @@ MasterService::~MasterService() {
     // Stop and join the threads
     eviction_running_ = false;
     client_monitor_running_ = false;
-    {
-        std::lock_guard<std::mutex> lk(snapshot_thread_mutex_);
-        snapshot_running_ = false;
+
+    // Stop snapshot manager (non-blocking)
+    if (snapshot_manager_) {
+        snapshot_manager_->Stop();
     }
+
     task_cleanup_running_ = false;
     job_dispatch_running_ = false;
     http_metadata_cleanup_running_ = false;
@@ -520,7 +548,6 @@ MasterService::~MasterService() {
 #endif
 
     // Wake sleepers so join() doesn't block for long sleep intervals.
-    snapshot_thread_cv_.notify_all();
     task_cleanup_cv_.notify_all();
     http_metadata_cleanup_cv_.notify_all();
 
@@ -535,9 +562,6 @@ MasterService::~MasterService() {
         nof_heartbeat_thread_.join();
     }
 #endif
-    if (snapshot_thread_.joinable()) {
-        snapshot_thread_.join();
-    }
     if (task_cleanup_thread_.joinable()) {
         task_cleanup_thread_.join();
     }
@@ -546,6 +570,12 @@ MasterService::~MasterService() {
     }
     if (job_dispatch_thread_.joinable()) {
         job_dispatch_thread_.join();
+    }
+
+    // Reset snapshot manager after all other threads have joined
+    // This triggers the destructor which joins the snapshot thread
+    if (snapshot_manager_) {
+        snapshot_manager_.reset();
     }
 }
 
@@ -3288,6 +3318,7 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
     // at beginning. 2. If this object has soft pin enabled, set it to be soft
     // pinned.
     metadata.GrantLease(0, default_kv_soft_pin_ttl_);
+    PublishKvStored(key, replica_type, metadata, tenant_id);
     return {};
 }
 
@@ -3877,6 +3908,7 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
     }
 
     if (!metadata.IsValid()) {
+        PublishKvRemoved(key, metadata, tenant_id);
         accessor.Erase();
     }
     return {};
@@ -4495,7 +4527,8 @@ auto MasterService::Remove(const std::string& key, const std::string& tenant_id,
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
     }
 
-    auto& tenant_state = accessor.GetTenantState();
+    PublishKvRemoved(key, metadata, tenant_id);
+    auto& tenant_state [[maybe_unused]] = accessor.GetTenantState();
     accessor.Erase();
     return {};
 }
@@ -5868,686 +5901,6 @@ uint64_t MasterService::ReleaseExpiredDiscardedReplicas(
     return released_cnt;
 }
 
-void MasterService::SnapshotThreadFunc() {
-    LOG(INFO) << "[Snapshot] snapshot_thread started";
-    while (snapshot_running_) {
-        // Wait for the next snapshot cycle, but allow fast shutdown.
-        {
-            std::unique_lock<std::mutex> lk(snapshot_thread_mutex_);
-            snapshot_thread_cv_.wait_for(
-                lk, std::chrono::seconds(snapshot_interval_seconds_),
-                [&] { return !snapshot_running_.load(); });
-        }
-
-        if (!snapshot_running_) {
-            break;
-        }
-
-        if (!enable_snapshot_) {
-            // Snapshot is disabled
-            LOG(INFO)
-                << "[Snapshot] Snapshot is disabled, waiting for next cycle";
-            continue;
-        }
-        // Fork a child process to save current state
-
-        std::string snapshot_id =
-            FormatTimestamp(std::chrono::system_clock::now());
-        LOG(INFO) << "[Snapshot] Preparing to fork child process, snapshot_id="
-                  << snapshot_id;
-
-        // Create pipe for child process logging
-        int log_pipe[2];
-        if (pipe(log_pipe) == -1) {
-            LOG(ERROR) << "[Snapshot] Failed to create log pipe: "
-                       << strerror(errno) << ", snapshot_id=" << snapshot_id;
-            continue;
-        }
-
-        const std::string& snapshot_root =
-            snapshot_catalog_store_->GetSnapshotRoot();
-        const std::string path_prefix = snapshot_root + snapshot_id + "/";
-        const std::string manifest_path = path_prefix + SNAPSHOT_MANIFEST_FILE;
-        auto descriptor =
-            BuildSnapshotDescriptor(snapshot_id, manifest_path, path_prefix);
-        if (!descriptor) {
-            LOG(ERROR) << "[Snapshot] Failed to build descriptor before fork, "
-                          "snapshot_id="
-                       << snapshot_id
-                       << ", code=" << toString(descriptor.error().code)
-                       << ", msg=" << descriptor.error().message;
-            close(log_pipe[0]);
-            close(log_pipe[1]);
-            continue;
-        }
-
-        pid_t pid;
-        {
-            std::unique_lock<std::shared_mutex> lock(snapshot_mutex_);
-            LOG(INFO) << "[Snapshot] Locking snapshot mutex, snapshot_id="
-                      << snapshot_id;
-            pid = fork();
-        }
-        if (pid == -1) {
-            // Fork failed
-            LOG(ERROR) << "[Snapshot] Failed to fork child process for state "
-                          "persistence: "
-                       << strerror(errno) << ", snapshot_id=" << snapshot_id;
-            close(log_pipe[0]);
-            close(log_pipe[1]);
-        } else if (pid == 0) {
-            // Child process
-            // Close read end, set write end for logging
-            close(log_pipe[0]);
-            g_snapshot_log_pipe_fd = log_pipe[1];
-
-            // Save current state using the configured persistence mechanism
-            SNAP_LOG_INFO("[Snapshot] Child process started, snapshot_id={}",
-                          snapshot_id);
-            auto result = PersistState(descriptor.value());
-            if (!result) {
-                SNAP_LOG_ERROR(
-                    "[Snapshot] Child process failed to persist state, "
-                    "snapshot_id={},code={},msg={}",
-                    snapshot_id, toString(result.error().code),
-                    result.error().message);
-                close(log_pipe[1]);
-                _exit(1);  // Exit child process with error
-            }
-            SNAP_LOG_INFO(
-                "[Snapshot] Child process successfully persisted state, "
-                "snapshot_id={}",
-                snapshot_id);
-
-            close(log_pipe[1]);
-            _exit(0);  // Exit child process successfully
-        } else {
-            // Parent process
-            // Close write end, pass read end to wait function
-            close(log_pipe[1]);
-            WaitForSnapshotChild(pid, snapshot_id, log_pipe[0]);
-            close(log_pipe[0]);
-        }
-    }
-    LOG(INFO) << "[Snapshot] snapshot_thread stopped";
-}
-
-void MasterService::WaitForSnapshotChild(pid_t pid,
-                                         const std::string& snapshot_id,
-                                         int log_pipe_fd) {
-    // Default 5 minute timeout
-    const int64_t timeout_seconds = snapshot_child_timeout_seconds_;
-
-    LOG(INFO)
-        << "[Snapshot] waiting for child process to complete, snapshot_id="
-        << snapshot_id << ", child_pid=" << pid
-        << ", timeout=" << timeout_seconds << "s";
-
-    // Set pipe to non-blocking mode
-    int flags = fcntl(log_pipe_fd, F_GETFL, 0);
-    if (flags == -1 || fcntl(log_pipe_fd, F_SETFL, flags | O_NONBLOCK) == -1) {
-        LOG(WARNING) << "[Snapshot] Failed to set pipe non-blocking: "
-                     << strerror(errno);
-    }
-
-    // Buffer for reading child logs
-    char buf[4096];
-    std::string log_buffer;
-
-    // Helper lambda to read and output child logs
-    auto flush_child_logs = [&]() {
-        while (true) {
-            ssize_t n = read(log_pipe_fd, buf, sizeof(buf) - 1);
-            if (n > 0) {
-                buf[n] = '\0';
-                log_buffer += buf;
-                // Output complete lines
-                size_t pos;
-                while ((pos = log_buffer.find('\n')) != std::string::npos) {
-                    std::string line = log_buffer.substr(0, pos);
-                    log_buffer.erase(0, pos + 1);
-                    if (!line.empty()) {
-                        LOG(INFO) << "[Snapshot:Child] " << line;
-                    }
-                }
-            } else {
-                break;
-            }
-        }
-    };
-
-    // Record start time
-    auto start_time = std::chrono::steady_clock::now();
-
-    // Use non-blocking polling to wait
-    while (true) {
-        // Read child logs first
-        flush_child_logs();
-
-        int status;
-        pid_t result = waitpid(pid, &status, WNOHANG);
-
-        if (result == -1) {
-            LOG(ERROR) << "[Snapshot] Failed to wait for child process: "
-                       << strerror(errno) << ", snapshot_id=" << snapshot_id
-                       << ", child_pid=" << pid;
-            MasterMetricManager::instance().inc_snapshot_fail();
-            return;
-        } else if (result == 0) {
-            // Child process is still running
-            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                               std::chrono::steady_clock::now() - start_time)
-                               .count();
-
-            if (elapsed >= timeout_seconds) {
-                // Timeout handling - flush remaining logs before killing
-                flush_child_logs();
-                if (!log_buffer.empty()) {
-                    LOG(INFO) << "[Snapshot:Child] " << log_buffer;
-                }
-                HandleChildTimeout(pid, snapshot_id);
-                MasterMetricManager::instance().inc_snapshot_fail();
-                return;
-            }
-
-            // Brief sleep before checking again
-            std::this_thread::sleep_for(std::chrono::seconds(2));
-        } else {
-            // Child process has exited
-            // Flush remaining logs from child
-            flush_child_logs();
-            // Output any remaining incomplete line
-            if (!log_buffer.empty()) {
-                LOG(INFO) << "[Snapshot:Child] " << log_buffer;
-            }
-
-            HandleChildExit(pid, status, snapshot_id);
-            auto elapsed =
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - start_time)
-                    .count();
-            MasterMetricManager::instance().set_snapshot_duration_ms(elapsed);
-            return;
-        }
-    }
-}
-
-void MasterService::HandleChildTimeout(pid_t pid,
-                                       const std::string& snapshot_id) {
-    LOG(WARNING) << "[Snapshot] Child process timeout, snapshot_id="
-                 << snapshot_id << ", child_pid=" << pid
-                 << ", killing child process";
-
-    // Try to gracefully terminate the child process
-    if (kill(pid, SIGTERM) == 0) {
-        // Wait a few seconds to see if it exits gracefully
-        std::this_thread::sleep_for(std::chrono::seconds(5));
-
-        // Check if it has exited
-        int status;
-        if (waitpid(pid, &status, WNOHANG) == 0) {
-            // Child process still not exited, force kill
-            LOG(WARNING) << "[Snapshot] Child process still running, force "
-                            "killing, snapshot_id="
-                         << snapshot_id << ", child_pid=" << pid;
-            kill(pid, SIGKILL);
-
-            // Wait for force termination to complete
-            waitpid(pid, &status, 0);
-            LOG(WARNING)
-                << "[Snapshot] Child process force killed, snapshot_id="
-                << snapshot_id << ", child_pid=" << pid;
-        } else {
-            LOG(INFO) << "[Snapshot] Child process terminated gracefully after "
-                         "SIGTERM, snapshot_id="
-                      << snapshot_id << ", child_pid=" << pid;
-        }
-    } else {
-        LOG(ERROR) << "[Snapshot] Failed to send SIGTERM to child process, "
-                      "snapshot_id="
-                   << snapshot_id << ", child_pid=" << pid
-                   << ", error=" << strerror(errno);
-    }
-}
-
-void MasterService::HandleChildExit(pid_t pid, int status,
-                                    const std::string& snapshot_id) {
-    if (WIFEXITED(status)) {
-        int exit_code = WEXITSTATUS(status);
-        if (exit_code != 0) {
-            LOG(ERROR) << "[Snapshot] Child process exited with error code: "
-                       << exit_code << ", snapshot_id=" << snapshot_id
-                       << ", child_pid=" << pid;
-            MasterMetricManager::instance().inc_snapshot_fail();
-        } else {
-            LOG(INFO) << "[Snapshot] Child process successfully persisted "
-                         "state, snapshot_id="
-                      << snapshot_id << ", child_pid=" << pid;
-            MasterMetricManager::instance().inc_snapshot_success();
-        }
-    } else if (WIFSIGNALED(status)) {
-        int signal = WTERMSIG(status);
-        LOG(ERROR) << "[Snapshot] Child process terminated by signal: "
-                   << signal << ", snapshot_id=" << snapshot_id
-                   << ", child_pid=" << pid;
-        MasterMetricManager::instance().inc_snapshot_fail();
-    }
-}
-
-tl::expected<ha::OpLogSequenceId, SerializationError>
-MasterService::ResolveSnapshotSequenceId() const {
-    if (!enable_ha_ || ha_backend_type_ != "etcd") {
-        // OpLog sequence ids start at 1. Returning 0 here is a sentinel that
-        // means "no persisted OpLog boundary", so a standby that later calls
-        // Recover(0) will replay from the first entry when oplog following is
-        // enabled.
-        return ha::OpLogSequenceId{0};
-    }
-
-#ifndef STORE_USE_ETCD
-    return tl::make_unexpected(SerializationError(
-        ErrorCode::UNAVAILABLE_IN_CURRENT_MODE,
-        "etcd snapshot sequence resolution is unavailable in this build"));
-#else
-    auto oplog_store = GetSnapshotBoundaryOpLogStore();
-    if (!oplog_store) {
-        return tl::make_unexpected(oplog_store.error());
-    }
-
-    uint64_t sequence_id = 0;
-    auto err = oplog_store.value()->GetLatestSequenceId(sequence_id);
-    if (err == ErrorCode::OPLOG_ENTRY_NOT_FOUND) {
-        return ha::OpLogSequenceId{0};
-    }
-    if (err != ErrorCode::OK) {
-        return tl::make_unexpected(SerializationError(
-            err, fmt::format("failed to resolve snapshot sequence boundary: {}",
-                             toString(err))));
-    }
-
-    return static_cast<ha::OpLogSequenceId>(sequence_id);
-#endif
-}
-
-#ifdef STORE_USE_ETCD
-tl::expected<EtcdOpLogStore*, SerializationError>
-MasterService::GetSnapshotBoundaryOpLogStore() const {
-    if (ha_backend_connstring_.empty()) {
-        return tl::make_unexpected(SerializationError(
-            ErrorCode::INVALID_PARAMS,
-            "etcd snapshot sequence resolution requires a backend connstring"));
-    }
-
-    std::lock_guard<std::mutex> lock(snapshot_boundary_oplog_store_mutex_);
-    if (snapshot_boundary_oplog_store_ != nullptr) {
-        return snapshot_boundary_oplog_store_.get();
-    }
-
-    auto err =
-        EtcdHelper::ConnectToEtcdStoreClient(ha_backend_connstring_.c_str());
-    if (err != ErrorCode::OK) {
-        return tl::make_unexpected(SerializationError(
-            err, fmt::format("failed to connect to etcd for snapshot boundary: "
-                             "{}",
-                             toString(err))));
-    }
-
-    auto oplog_store = std::make_unique<EtcdOpLogStore>(cluster_id_);
-    err = oplog_store->Init();
-    if (err != ErrorCode::OK) {
-        return tl::make_unexpected(SerializationError(
-            err, fmt::format("failed to initialize etcd oplog store: {}",
-                             toString(err))));
-    }
-
-    snapshot_boundary_oplog_store_ = std::move(oplog_store);
-    return snapshot_boundary_oplog_store_.get();
-}
-#endif
-
-tl::expected<ha::SnapshotDescriptor, SerializationError>
-MasterService::BuildSnapshotDescriptor(const std::string& snapshot_id,
-                                       const std::string& manifest_path,
-                                       const std::string& object_prefix) const {
-    auto sequence_id = ResolveSnapshotSequenceId();
-    if (!sequence_id) {
-        return tl::make_unexpected(sequence_id.error());
-    }
-
-    const std::string& snapshot_root =
-        snapshot_catalog_store_->GetSnapshotRoot();
-    auto descriptor = ha::snapshot_catalog_store_detail::MakeSnapshotDescriptor(
-        snapshot_root, snapshot_id);
-    descriptor.last_included_seq = sequence_id.value();
-    descriptor.producer_view_version = view_version_;
-    descriptor.manifest_key = manifest_path;
-    descriptor.object_prefix = object_prefix;
-    descriptor.created_at_ms = CurrentTimeMs();
-    return descriptor;
-}
-
-tl::expected<void, SerializationError> MasterService::PersistState(
-    const std::string& snapshot_id) {
-    const std::string& snapshot_root =
-        snapshot_catalog_store_->GetSnapshotRoot();
-    const std::string path_prefix = snapshot_root + snapshot_id + "/";
-    const std::string manifest_path = path_prefix + SNAPSHOT_MANIFEST_FILE;
-    auto descriptor =
-        BuildSnapshotDescriptor(snapshot_id, manifest_path, path_prefix);
-    if (!descriptor) {
-        return tl::make_unexpected(descriptor.error());
-    }
-    return PersistState(descriptor.value());
-}
-
-tl::expected<void, SerializationError> MasterService::PersistState(
-    const ha::SnapshotDescriptor& descriptor) {
-    const std::string& snapshot_id = descriptor.snapshot_id;
-    const std::string& path_prefix = descriptor.object_prefix;
-    const std::string& manifest_path = descriptor.manifest_key;
-
-    try {
-        auto* snapshot_catalog_store = GetSnapshotCatalogStore();
-        if (!snapshot_catalog_store) {
-            return tl::make_unexpected(SerializationError(
-                ErrorCode::PERSISTENT_FAIL,
-                "snapshot catalog store is not initialized"));
-        }
-
-        SNAP_LOG_INFO(
-            "[Snapshot] action=persisting_state start, snapshot_id={}, "
-            "serializer_type={}, version={}",
-            snapshot_id, SNAPSHOT_SERIALIZER_TYPE, SNAPSHOT_SERIALIZER_VERSION);
-        MetadataSerializer metadata_serializer(this);
-        SegmentSerializer segment_serializer(&segment_manager_);
-        TaskManagerSerializer task_manager_serializer(&task_manager_);
-
-        auto metadata_result = metadata_serializer.Serialize();
-        if (!metadata_result) {
-            SNAP_LOG_ERROR(
-                "[Snapshot] metadata serialization failed, snapshot_id={}, "
-                "code={}, msg={}",
-                snapshot_id, toString(metadata_result.error().code),
-                metadata_result.error().message);
-
-            return tl::make_unexpected(metadata_result.error());
-        }
-        SNAP_LOG_INFO(
-            "[Snapshot] metadata serialization_successful, snapshot_id={}",
-            snapshot_id);
-
-        auto segment_result = segment_serializer.Serialize();
-        if (!segment_result) {
-            SNAP_LOG_ERROR(
-                "[Snapshot] segment serialization failed, snapshot_id={}, "
-                "code={}, msg={}",
-                snapshot_id, toString(segment_result.error().code),
-                segment_result.error().message);
-            return tl::make_unexpected(segment_result.error());
-        }
-        SNAP_LOG_INFO(
-            "[Snapshot] segment serialization_successful, snapshot_id={}",
-            snapshot_id);
-
-        auto task_manager_result = task_manager_serializer.Serialize();
-        if (!task_manager_result) {
-            SNAP_LOG_ERROR(
-                "[Snapshot] task manager serialization failed, snapshot_id={}, "
-                "code={}, msg={}",
-                snapshot_id, toString(task_manager_result.error().code),
-                task_manager_result.error().message);
-            return tl::make_unexpected(task_manager_result.error());
-        }
-        SNAP_LOG_INFO(
-            "[Snapshot] task manager serialization_successful, snapshot_id={}",
-            snapshot_id);
-
-        const auto& serialized_metadata = metadata_result.value();
-        const auto& serialized_segment = segment_result.value();
-        const auto& serialized_task_manager = task_manager_result.value();
-
-        // When backup_dir is enabled, try all uploads to ensure complete backup
-        // When backup_dir is disabled, use fail-fast mode
-        bool upload_success = true;
-        std::string error_msg;
-        SNAP_LOG_INFO("[Snapshot] Backend info: {}",
-                      snapshot_object_store_->GetConnectionInfo());
-
-        // Upload metadata
-        std::string metadata_path = path_prefix + SNAPSHOT_METADATA_FILE;
-        auto upload_result =
-            UploadSnapshotPayloadFile(serialized_metadata, metadata_path,
-                                      SNAPSHOT_METADATA_FILE, snapshot_id);
-        if (!upload_result) {
-            SNAP_LOG_ERROR(
-                "[Snapshot] metadata upload failed, snapshot_id={}, "
-                "path={}, code={}, msg={}",
-                snapshot_id, metadata_path,
-                toString(upload_result.error().code),
-                upload_result.error().message);
-            if (!use_snapshot_backup_dir_) {
-                return tl::make_unexpected(upload_result.error());
-            }
-            error_msg.append(upload_result.error().message + "\n");
-            upload_success = false;
-        }
-
-        // Upload segment
-        std::string segment_path = path_prefix + SNAPSHOT_SEGMENTS_FILE;
-        upload_result =
-            UploadSnapshotPayloadFile(serialized_segment, segment_path,
-                                      SNAPSHOT_SEGMENTS_FILE, snapshot_id);
-        if (!upload_result) {
-            SNAP_LOG_ERROR(
-                "[Snapshot] segment upload failed, snapshot_id={}, "
-                "path={}, code={}, msg={}",
-                snapshot_id, segment_path, toString(upload_result.error().code),
-                upload_result.error().message);
-            if (!use_snapshot_backup_dir_) {
-                return tl::make_unexpected(upload_result.error());
-            }
-            error_msg.append(upload_result.error().message + "\n");
-            upload_success = false;
-        }
-
-        // Upload task manager
-        std::string task_manager_path =
-            path_prefix + SNAPSHOT_TASK_MANAGER_FILE;
-        upload_result = UploadSnapshotPayloadFile(
-            serialized_task_manager, task_manager_path,
-            SNAPSHOT_TASK_MANAGER_FILE, snapshot_id);
-        if (!upload_result) {
-            SNAP_LOG_ERROR(
-                "[Snapshot] task_manager upload failed, snapshot_id={}, "
-                "path={}, code={}, msg={}",
-                snapshot_id, task_manager_path,
-                toString(upload_result.error().code),
-                upload_result.error().message);
-            if (!use_snapshot_backup_dir_) {
-                return tl::make_unexpected(upload_result.error());
-            }
-            error_msg.append(upload_result.error().message + "\n");
-            upload_success = false;
-        }
-
-        // Upload manifest
-        std::string manifest_content =
-            fmt::format("{}|{}|{}", SNAPSHOT_SERIALIZER_TYPE,
-                        SNAPSHOT_SERIALIZER_VERSION, snapshot_id);
-        std::vector<uint8_t> manifest_bytes(manifest_content.begin(),
-                                            manifest_content.end());
-        upload_result = UploadSnapshotPayloadFile(
-            manifest_bytes, manifest_path, SNAPSHOT_MANIFEST_FILE, snapshot_id);
-        if (!upload_result) {
-            SNAP_LOG_ERROR(
-                "[Snapshot] manifest upload failed, snapshot_id={}, "
-                "path={}, code={}, msg={}",
-                snapshot_id, manifest_path,
-                toString(upload_result.error().code),
-                upload_result.error().message);
-            if (!use_snapshot_backup_dir_) {
-                return tl::make_unexpected(upload_result.error());
-            }
-            error_msg.append(upload_result.error().message + "\n");
-            upload_success = false;
-        }
-
-        if (!upload_success) {
-            return tl::make_unexpected(
-                SerializationError(ErrorCode::PERSISTENT_FAIL, error_msg));
-        }
-
-        // Publish snapshot catalog entry and advance the latest marker.
-        std::string latest_path =
-            snapshot_catalog_store->GetSnapshotRoot() + SNAPSHOT_LATEST_FILE;
-        std::string latest_content = snapshot_id;
-
-        auto publish_result = snapshot_catalog_store->Publish(descriptor);
-        if (publish_result != ErrorCode::OK) {
-            SNAP_LOG_ERROR(
-                "[Snapshot] latest update failed, snapshot_id={}, file={}, "
-                "code={}",
-                snapshot_id, latest_path, toString(publish_result));
-            if (use_snapshot_backup_dir_) {
-                auto save_path = fs::path(snapshot_backup_dir_) /
-                                 SNAPSHOT_BACKUP_SAVE_DIR /
-                                 SNAPSHOT_LATEST_FILE;
-                auto save_result =
-                    FileUtil::SaveStringToFile(latest_content, save_path);
-                if (!save_result) {
-                    SNAP_LOG_ERROR(
-                        "[Snapshot] save latest to disk failed, "
-                        "snapshot_id={}, "
-                        "content={}, file={}",
-                        snapshot_id, latest_content, save_path.string());
-                }
-            }
-
-            return tl::make_unexpected(SerializationError(
-                ErrorCode::PERSISTENT_FAIL,
-                fmt::format("latest update {} failed", latest_path)));
-        }
-        SNAP_LOG_INFO(
-            "[Snapshot] Upload latest success: {}, snapshot_id={}, "
-            "content={}",
-            latest_path, snapshot_id, latest_content);
-
-        CleanupOldSnapshot(snapshot_retention_count_, snapshot_id);
-        SNAP_LOG_INFO("[Snapshot] action=persisting_state end, snapshot_id={}",
-                      snapshot_id);
-    } catch (const std::exception& e) {
-        SNAP_LOG_ERROR(
-            "[Snapshot] Exception during state persistent, snapshot_id={}, "
-            "error={}",
-            snapshot_id, e.what());
-        return tl::make_unexpected(SerializationError(
-            ErrorCode::PERSISTENT_FAIL,
-            fmt::format("Exception during state persistent: {}", e.what())));
-    } catch (...) {
-        SNAP_LOG_ERROR(
-            "[Snapshot] Unknown exception during state persistent, "
-            "snapshot_id={}",
-            snapshot_id);
-        return tl::make_unexpected(
-            SerializationError(ErrorCode::PERSISTENT_FAIL,
-                               "Unknown exception during state persistent"));
-    }
-    return {};
-}
-
-tl::expected<void, SerializationError> MasterService::UploadSnapshotPayloadFile(
-    const std::vector<uint8_t>& data, const std::string& path,
-    const std::string& local_filename, const std::string& snapshot_id) {
-    SNAP_LOG_INFO("[Snapshot] Uploading {} to: {}, snapshot_id={}",
-                  local_filename, path, snapshot_id);
-
-    std::string error_msg;
-    auto upload_result = snapshot_object_store_->UploadBuffer(path, data);
-    if (!upload_result) {
-        SNAP_LOG_ERROR(
-            "[Snapshot] {} upload failed, snapshot_id={}, file={}, error={}",
-            local_filename, snapshot_id, path, upload_result.error());
-
-        // Upload failed, save locally for manual recovery in exception
-        // scenarios
-        if (use_snapshot_backup_dir_) {
-            auto save_path = fs::path(snapshot_backup_dir_) /
-                             SNAPSHOT_BACKUP_SAVE_DIR / local_filename;
-            auto save_result = FileUtil::SaveBinaryToFile(data, save_path);
-            if (!save_result) {
-                SNAP_LOG_ERROR(
-                    "[Snapshot] save {} to disk failed, snapshot_id={}, "
-                    "file={}",
-                    local_filename, snapshot_id, save_path.string());
-            }
-        }
-
-        error_msg.append(local_filename)
-            .append(" upload ")
-            .append(path)
-            .append(" failed; ");
-        return tl::make_unexpected(
-            SerializationError(ErrorCode::PERSISTENT_FAIL, error_msg));
-    } else {
-        SNAP_LOG_INFO("[Snapshot] Upload {} success: {}, snapshot_id={}",
-                      local_filename, path, snapshot_id);
-    }
-
-    return {};
-}
-
-void MasterService::CleanupOldSnapshot(int keep_count,
-                                       const std::string& snapshot_id) {
-    auto* snapshot_catalog_store = GetSnapshotCatalogStore();
-    if (!snapshot_catalog_store) {
-        SNAP_LOG_ERROR(
-            "[Snapshot] snapshot catalog store is not initialized, "
-            "snapshot_id={}",
-            snapshot_id);
-        return;
-    }
-
-    // List() loads one descriptor per published snapshot. This remains cheap
-    // because CleanupOldSnapshot() itself enforces snapshot_retention_count_
-    // and keeps the catalog single-digit in normal deployments.
-    auto list_result = snapshot_catalog_store->List(kUnlimitedSnapshotList);
-    if (!list_result) {
-        SNAP_LOG_ERROR("[Snapshot] error=list failed, snapshot_id={}, code={}",
-                       snapshot_id, toString(list_result.error()));
-        return;
-    }
-
-    const auto& snapshots = list_result.value();
-
-    if (static_cast<int>(snapshots.size()) > keep_count) {
-        for (int i = keep_count; i < static_cast<int>(snapshots.size()); i++) {
-            const std::string& old_state_dir = snapshots[i].snapshot_id;
-
-            if (old_state_dir == snapshot_id) {
-                SNAP_LOG_WARN(
-                    "[Snapshot] Skipping deletion of current snapshot "
-                    "directory {}, "
-                    "snapshot_id={}",
-                    old_state_dir, snapshot_id);
-                continue;
-            }
-
-            auto delete_result = snapshot_catalog_store->Delete(old_state_dir);
-            if (delete_result != ErrorCode::OK) {
-                SNAP_LOG_ERROR(
-                    "[Snapshot] Failed to delete old snapshot {}, "
-                    "snapshot_id={}, code={}",
-                    old_state_dir, snapshot_id, toString(delete_result));
-            } else {
-                SNAP_LOG_INFO(
-                    "[Snapshot] Successfully deleted old snapshot {}, "
-                    "snapshot_id={}",
-                    old_state_dir, snapshot_id);
-            }
-        }
-    }
-}
-
 void MasterService::RestoreState() {
     auto* snapshot_catalog_store = GetSnapshotCatalogStore();
     if (!snapshot_catalog_store) {
@@ -7344,6 +6697,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
             result.freed_bytes += freed;
             if (freed > 0) {
                 result.evicted_objects++;
+                PublishKvRemovedAfterEvict(member_key, freed, "cpu",
+                                           member_metadata, tenant_id);
             }
             if (member_key != key && !member_metadata.IsValid()) {
                 EraseMetadata(tenant_state, member_it, tenant_id,
@@ -7501,6 +6856,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     deferred_replicas,
                     /*allow_soft_pinned=*/false);
                 total_freed_size += evict_result.freed_bytes;
+                if (!it->second.IsGrouped()) {
+                    PublishKvRemovedAfterEvict(c.key, evict_result.freed_bytes,
+                                               "cpu", it->second, c.tenant_id);
+                }
                 if (!it->second.IsValid()) {
                     EraseMetadata(tenant_state, it, c.tenant_id,
                                   QuotaEraseMode::kFull, &shard);
@@ -7561,6 +6920,11 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                     shard, tenant_state, deferred_replicas,
                                     /*allow_soft_pinned=*/false);
                                 total_freed_size += evict_result.freed_bytes;
+                                if (!it->second.IsGrouped()) {
+                                    PublishKvRemovedAfterEvict(
+                                        it->first, evict_result.freed_bytes,
+                                        "cpu", it->second, tenant_it->first);
+                                }
                                 if (!it->second.IsValid()) {
                                     it = EraseMetadata(
                                         tenant_state, it, tenant_it->first,
@@ -7621,6 +6985,11 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                     shard, tenant_state, deferred_replicas,
                                     /*allow_soft_pinned=*/true);
                                 total_freed_size += evict_result.freed_bytes;
+                                if (!it->second.IsGrouped()) {
+                                    PublishKvRemovedAfterEvict(
+                                        it->first, evict_result.freed_bytes,
+                                        "cpu", it->second, tenant_it->first);
+                                }
                                 if (!it->second.IsValid()) {
                                     it = EraseMetadata(
                                         tenant_state, it, tenant_it->first,
@@ -7780,6 +7149,8 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
 
                 total_freed_size += metadata.size * erased;
                 shard_evicted_count++;
+                PublishKvRemovedAfterEvict(it->first, metadata.size * erased,
+                                           "disk", metadata, tenant_it->first);
                 if (!metadata.IsValid()) {
                     it = EraseMetadata(tenant_state, it, tenant_it->first,
                                        QuotaEraseMode::kFull, &shard);
@@ -8741,23 +8112,6 @@ MasterService::MetadataSerializer::DeserializeMetadata(
     return metadata;
 }
 
-std::string MasterService::FormatTimestamp(
-    const std::chrono::system_clock::time_point& tp) {
-    auto time_t = std::chrono::system_clock::to_time_t(tp);
-
-    std::stringstream ss;
-    ss << std::put_time(std::localtime(&time_t), "%Y%m%d_%H%M%S");
-
-    // Add milliseconds to ensure uniqueness
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                  tp.time_since_epoch()) %
-              1000;
-
-    ss << "_" << std::setfill('0') << std::setw(3) << ms.count();
-
-    return ss.str();
-}
-
 tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
     const std::string& key, const std::string& tenant_id,
     const std::vector<std::string>& targets) {
@@ -9507,6 +8861,108 @@ MasterService::MetadataSerializer::DeserializeDiscardedReplicas(
     }
 
     return {};
+}
+
+KvEventConfig MasterService::BuildKvEventConfig(
+    const MasterServiceConfig& config) {
+    KvEventConfig kv_config;
+    kv_config.enabled = config.enable_kv_events;
+    kv_config.bind_endpoint = config.kv_events_bind_endpoint;
+    kv_config.model_name = config.kv_events_model_name;
+    kv_config.backend_id = config.kv_events_backend_id;
+    kv_config.tenant_id = config.kv_events_tenant_id;
+    kv_config.additional_salt = config.kv_events_additional_salt;
+    kv_config.lora_name = config.kv_events_lora_name;
+    kv_config.block_size = config.kv_events_block_size;
+    kv_config.dp_rank = config.kv_events_dp_rank;
+    kv_config.emit_legacy_compat_fields = config.kv_events_emit_legacy_compat;
+    kv_config.emit_object_key = config.kv_events_emit_object_key;
+    kv_config.queue_capacity = config.kv_events_queue_capacity;
+    return kv_config;
+}
+
+std::string MasterService::MediumForReplicaType(ReplicaType replica_type) {
+    switch (replica_type) {
+        case ReplicaType::MEMORY:
+            return "cpu";
+        case ReplicaType::DISK:
+        case ReplicaType::LOCAL_DISK:
+        case ReplicaType::NOF_SSD:
+            return "disk";
+        case ReplicaType::ALL:
+        default:
+            return "cpu";
+    }
+}
+
+std::string MasterService::MediumForMetadata(const ObjectMetadata& metadata) {
+    if (metadata.HasMemReplica()) {
+        return "cpu";
+    }
+    if (metadata.HasReplica(&Replica::fn_is_nof_replica) ||
+        metadata.HasReplica(&Replica::fn_is_disk_replica) ||
+        metadata.HasReplica(&Replica::fn_is_local_disk_replica)) {
+        return "disk";
+    }
+    return "cpu";
+}
+
+void MasterService::PublishKvStored(const std::string& key,
+                                    ReplicaType replica_type,
+                                    const ObjectMetadata& metadata,
+                                    const std::string& tenant_id) {
+    if (!kv_event_publisher_ || !kv_event_publisher_->enabled()) {
+        return;
+    }
+    std::string medium = MediumForReplicaType(replica_type);
+    if (replica_type == ReplicaType::ALL) {
+        medium = MediumForMetadata(metadata);
+    }
+    kv_event_publisher_->PublishStored(key, medium, tenant_id,
+                                       metadata.group_id);
+}
+
+void MasterService::PublishKvRemoved(const std::string& key,
+                                     const std::string& medium,
+                                     const std::string& tenant_id,
+                                     const std::string& group_id) {
+    if (!kv_event_publisher_ || !kv_event_publisher_->enabled()) {
+        return;
+    }
+    kv_event_publisher_->PublishRemoved(key, medium, tenant_id, group_id);
+}
+
+void MasterService::PublishKvRemoved(const std::string& key,
+                                     const ObjectMetadata& metadata,
+                                     const std::string& tenant_id) {
+    PublishKvRemoved(key, MediumForMetadata(metadata), tenant_id,
+                     metadata.group_id);
+}
+
+void MasterService::PublishKvRemovedAfterEvict(const std::string& key,
+                                               uint64_t freed_bytes,
+                                               const std::string& medium,
+                                               const ObjectMetadata& metadata,
+                                               const std::string& tenant_id) {
+    (void)freed_bytes;
+    (void)medium;
+    if (!kv_event_publisher_ || !kv_event_publisher_->enabled()) {
+        return;
+    }
+    if (!metadata.IsValid()) {
+        PublishKvRemoved(key, metadata, tenant_id);
+    }
+}
+
+bool MasterService::KvEventsEnabled() const {
+    return kv_event_publisher_ && kv_event_publisher_->enabled();
+}
+
+KvEventPublisher::Stats MasterService::GetKvEventStats() const {
+    if (!kv_event_publisher_) {
+        return {};
+    }
+    return kv_event_publisher_->GetStats();
 }
 
 void MasterService::setHttpMetadataServer(HttpMetadataServer* server) {

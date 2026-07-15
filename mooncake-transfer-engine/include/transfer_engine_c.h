@@ -165,6 +165,10 @@ int freeBatchID(transfer_engine_t engine, batch_id_t batch_id);
 
 int syncSegmentCache(transfer_engine_t engine);
 
+void enableGracefulShutdown(transfer_engine_t engine);
+int showLinks(transfer_engine_t engine, char *buf_out, size_t buf_len,
+              int json);
+
 #ifdef __cplusplus
 }
 #endif  // __cplusplus

@@ -6,7 +6,7 @@
 #include <aws/s3/model/DeleteObjectRequest.h>
 #include <aws/core/auth/AWSCredentials.h>
 #include <aws/core/utils/memory/stl/AWSVector.h>
-#include <aws/s3/model/ListObjectsRequest.h>
+#include <aws/s3/model/ListObjectsV2Request.h>
 #include <aws/s3/model/DeleteObjectsRequest.h>
 #include <aws/s3/model/ObjectIdentifier.h>
 #include <aws/s3/model/Delete.h>
@@ -781,7 +781,7 @@ tl::expected<void, std::string> S3Helper::ListObjectsWithPrefix(
     const std::string &prefix, std::vector<std::string> &object_keys) {
     object_keys.clear();
 
-    Aws::S3::Model::ListObjectsRequest request;
+    Aws::S3::Model::ListObjectsV2Request request;
     request.WithBucket(bucket_);
     request.WithPrefix(prefix);
 
@@ -791,10 +791,10 @@ tl::expected<void, std::string> S3Helper::ListObjectsWithPrefix(
 
     bool done = false;
     while (!done) {
-        auto outcome = s3_client_.ListObjects(request);
+        auto outcome = s3_client_.ListObjectsV2(request);
         if (!outcome.IsSuccess()) {
             return tl::make_unexpected(fmt::format(
-                "ListObjects error: {}", outcome.GetError().GetMessage()));
+                "ListObjectsV2 error: {}", outcome.GetError().GetMessage()));
         }
 
         const auto &result = outcome.GetResult();
@@ -806,8 +806,13 @@ tl::expected<void, std::string> S3Helper::ListObjectsWithPrefix(
 
         // Check if there are more objects to fetch
         if (result.GetIsTruncated()) {
-            // Set marker to get next page
-            request.WithMarker(result.GetNextMarker());
+            const auto &next_token = result.GetNextContinuationToken();
+            if (next_token.empty()) {
+                return tl::make_unexpected(
+                    "ListObjectsV2 error: truncated response missing next "
+                    "continuation token");
+            }
+            request.SetContinuationToken(next_token);
         } else {
             done = true;
         }

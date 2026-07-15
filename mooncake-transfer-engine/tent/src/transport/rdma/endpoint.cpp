@@ -82,7 +82,7 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
     context_ = context;
     params_ = params;
     endpoint_name_ = endpoint_name;
-    inflight_slices_ = 0;
+    inflight_slices_.store(0, std::memory_order_relaxed);
 
     // Resolve the per-pool QP layout (see computeQpPoolSegments). Empty
     // qp_pools (the default) keeps the historical single homogeneous run of
@@ -105,7 +105,7 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
     wr_depth_list_ = new WrDepthBlock[total_qp]();
 
     for (int i = 0; i < total_qp; ++i) {
-        wr_depth_list_[i].value = 0;
+        wr_depth_list_[i].value.store(0, std::memory_order_relaxed);
         ibv_qp_init_attr attr;
         memset(&attr, 0, sizeof(attr));
         auto cq = context_->cq(i % context_->cqCount())->cq();
@@ -271,9 +271,10 @@ int RdmaEndPoint::deconstructUnlocked() {
 
     bool all_qps_destroyed = true;
     for (size_t i = 0; i < qp_list_.size(); ++i) {
-        if (wr_depth_list_ && wr_depth_list_[i].value != 0) {
-            const int outstanding = wr_depth_list_[i].value;
-            cancelQuota(i, outstanding);
+        if (wr_depth_list_) {
+            const int outstanding =
+                wr_depth_list_[i].value.load(std::memory_order_relaxed);
+            if (outstanding != 0) cancelQuota(i, outstanding);
         }
         if (!qp_list_[i]) continue;
         if (context_->verbs_.ibv_destroy_qp(qp_list_[i])) {
@@ -367,7 +368,7 @@ bool RdmaEndPoint::finishDestroy() {
     // failed, enforce a timeout so cleanup can still make progress.
     bool has_outstanding = false;
     for (size_t i = 0; wr_depth_list_ && i < qp_list_.size(); ++i) {
-        if (wr_depth_list_[i].value != 0) {
+        if (wr_depth_list_[i].value.load(std::memory_order_relaxed) != 0) {
             has_outstanding = true;
             break;
         }
@@ -732,10 +733,11 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
     // Check endpoint status before submitting
     if (status_.load(std::memory_order_relaxed) != EP_READY) return 0;
     auto cq = context_->cq(qp_index % context_->cqCount());
-    int wr_count =
-        std::min(cq->maxCqe() - cq->getQuota(),
-                 std::min(params_->max_qp_wr - wr_depth_list_[qp_index].value,
-                          (int)slice_list.size()));
+    int wr_count = std::min(
+        cq->maxCqe() - cq->getQuota(),
+        std::min(params_->max_qp_wr - wr_depth_list_[qp_index].value.load(
+                                          std::memory_order_relaxed),
+                 (int)slice_list.size()));
     int sge_count = wr_count * kSgeEntries;
 
     if (wr_count <= 0 || !reserveQuota(qp_index, wr_count)) return 0;
@@ -851,15 +853,17 @@ std::vector<uint32_t> RdmaEndPoint::qpNum() {
     return ret;
 }
 
-int RdmaEndPoint::getInflightSlices() const { return inflight_slices_; }
+int RdmaEndPoint::getInflightSlices() const {
+    return inflight_slices_.load(std::memory_order_relaxed);
+}
 
 bool RdmaEndPoint::reserveQuota(int qp_index, int num_entries) {
     assert(qp_index >= 0 && qp_index < (int)qp_list_.size());
     auto cq = context_->cq(qp_index % context_->cqCount());
     if (!cq->reserveQuota(num_entries)) return false;
-    auto prev_depth_list =
-        __sync_fetch_and_add(&wr_depth_list_[qp_index].value, num_entries);
-    __sync_fetch_and_add(&inflight_slices_, num_entries);
+    auto prev_depth_list = wr_depth_list_[qp_index].value.fetch_add(
+        num_entries, std::memory_order_acq_rel);
+    inflight_slices_.fetch_add(num_entries, std::memory_order_acq_rel);
     if (prev_depth_list + num_entries > params_->max_qp_wr) {
         cancelQuota(qp_index, num_entries);
         return false;
@@ -869,8 +873,9 @@ bool RdmaEndPoint::reserveQuota(int qp_index, int num_entries) {
 
 void RdmaEndPoint::cancelQuota(int qp_index, int num_entries) {
     assert(qp_index >= 0 && qp_index < (int)qp_list_.size());
-    __sync_fetch_and_sub(&wr_depth_list_[qp_index].value, num_entries);
-    __sync_fetch_and_sub(&inflight_slices_, num_entries);
+    wr_depth_list_[qp_index].value.fetch_sub(num_entries,
+                                             std::memory_order_acq_rel);
+    inflight_slices_.fetch_sub(num_entries, std::memory_order_acq_rel);
     auto cq = context_->cq(qp_index % context_->cqCount());
     cq->cancelQuota(num_entries);
 }

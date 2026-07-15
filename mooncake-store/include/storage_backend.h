@@ -203,6 +203,44 @@ struct BucketBackendConfig {
     static BucketBackendConfig FromEnvironment();
 };
 
+enum class OffsetEvictionPolicy {
+    NONE,  // No eviction
+    FIFO,  // Evict oldest key first (by insertion order)
+    LRU,   // Approximate LRU via cross-shard sampling (phase 2)
+};
+
+struct OffsetAllocatorBackendConfig {
+    OffsetEvictionPolicy eviction_policy = OffsetEvictionPolicy::NONE;
+
+    // Watermark thresholds: eviction triggers when total_size_ exceeds high,
+    // drives down to low. 0 = auto-resolved in Init() from ratios.
+    int64_t high_watermark_bytes = 0;
+    int64_t low_watermark_bytes = 0;
+    double high_ratio = 0.90;
+    double low_ratio = 0.80;
+
+    // Key-count watermarks (symmetric with byte watermarks).
+    // high triggers eviction, drives down to low.
+    int64_t high_watermark_keys = 0;
+    int64_t low_watermark_keys = 0;
+    double keys_high_ratio = 0.95;
+    double keys_low_ratio = 0.90;
+
+    // Eviction caps
+    size_t max_evict_per_offload = 4096;
+    size_t fallback_evict_batch = 16;
+
+    // Allocator node capacity override.
+    // 0 = auto-derived from capacity_ / kMinObjectSize (capped at RAM budget).
+    // Must be <= UINT32_MAX (OffsetAllocator::create takes uint32
+    // max_capacity).
+    int64_t max_capacity_nodes = 0;
+
+    bool Validate() const;
+
+    static OffsetAllocatorBackendConfig FromEnvironment();
+};
+
 struct FileStorageConfig {
     // type of the storage backend
     StorageBackendType storage_backend_type = StorageBackendType::kBucket;
@@ -920,6 +958,21 @@ class BucketStorageBackend : public StorageBackendInterface {
      */
     void CleanupOrphanedBucket(int64_t bucket_id);
 
+    /**
+     * @brief Rollback a committed bucket from the local index when
+     * NotifyOffloadSuccess fails after local commit. Removes keys from
+     * object_bucket_map_, removes the bucket from buckets_ and lru_index_,
+     * waits for inflight reads to drain, then cleans up on-disk files.
+     *
+     * Called from BatchOffload when complete_handler fails after the local
+     * index has already been committed.
+     *
+     * @param bucket_id The bucket ID to roll back.
+     * @param keys The keys that were committed.
+     */
+    void RollbackCommittedBucket(int64_t bucket_id,
+                                 const std::vector<std::string>& keys);
+
     // Holds eviction state between PrepareEviction and FinalizeEviction.
     // PrepareEviction removes buckets from metadata maps and returns this.
     // FinalizeEviction removes persisted metadata, waits for in-flight reads,
@@ -1054,7 +1107,8 @@ class BucketStorageBackend : public StorageBackendInterface {
 class OffsetAllocatorStorageBackend : public StorageBackendInterface {
    public:
     OffsetAllocatorStorageBackend(
-        const FileStorageConfig& file_storage_config_);
+        const FileStorageConfig& file_storage_config_,
+        const OffsetAllocatorBackendConfig& offset_backend_config = {});
 
     /**
      * @brief Initializes the offset allocator storage backend.
@@ -1121,6 +1175,15 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     void SetTestFailurePredicate(
         std::function<bool(const std::string& key)> predicate) override {
         test_failure_predicate_ = std::move(predicate);
+    }
+
+    // Returns the number of keys skipped after fallback eviction
+    // could not make enough room (fragmentation, extents pinned by
+    // in-flight reads, or allocator node exhaustion).  Monotonically
+    // increasing; useful for distinguishing "watermark working" from
+    // "thrashing but unable to free space".
+    int64_t GetEvictionSkips() const {
+        return eviction_skips_.load(std::memory_order_relaxed);
     }
 
    private:
@@ -1193,12 +1256,19 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
 
         // Refcounted handle keeps physical extent alive during reads
         AllocationPtr allocation;
+
+        // Monotonic insertion sequence number. Points back to the slot in
+        // fifo_index_ (seq -> key). Used during eviction to detect stale
+        // index entries (lazy-repair) and to remove old slots on overwrite.
+        uint64_t fifo_seq = 0;
+
         ObjectEntry(uint64_t off, uint32_t total, uint32_t val,
-                    AllocationPtr alloc_ptr)
+                    AllocationPtr alloc_ptr, uint64_t seq = 0)
             : offset(off),
               total_size(total),
               value_size(val),
-              allocation(std::move(alloc_ptr)) {}
+              allocation(std::move(alloc_ptr)),
+              fifo_seq(seq) {}
     };
 
     // Returns full path to data file: {storage_path_}/kv_cache.data
@@ -1261,6 +1331,39 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     // Total number of keys, updated atomically (avoids locking all shards for
     // counting)
     std::atomic<int64_t> total_keys_{0};
+
+    // ===== Eviction-related members =====
+    OffsetAllocatorBackendConfig cfg_;
+
+    // Counter for keys skipped due to fallback eviction exhaustion.
+    // See GetEvictionSkips() for the public accessor.
+    std::atomic<int64_t> eviction_skips_{0};
+
+    // Mutex protecting fifo_index_ and insert_seq_. Must be acquired BEFORE
+    // any shard mutex (shards_[i].mutex) when both are held.
+    mutable Mutex eviction_mutex_;
+
+    // Global FIFO index: insertion sequence number -> key.
+    // begin() = oldest key, the default eviction victim.
+    // Entries allowed to be stale; lazy-repair at eviction time.
+    std::map<uint64_t, std::string> fifo_index_;
+
+    // Monotonic sequence number source for fifo_index_.
+    std::atomic<uint64_t> insert_seq_{0};
+
+    // Resolved watermark thresholds (bytes), computed in Init().
+    int64_t high_watermark_bytes_ = 0;
+    int64_t low_watermark_bytes_ = 0;
+
+    // Resolved watermark thresholds (key count), computed in Init().
+    int64_t high_watermark_keys_ = 0;
+    int64_t low_watermark_keys_ = 0;
+
+    // Evict keys from the FIFO index until both byte and key-count watermarks
+    // are satisfied (or until the eviction cap is reached).
+    void EvictToMakeRoom(int64_t required_bytes, size_t min_victims,
+                         const std::unordered_set<std::string>& batch_keys,
+                         std::vector<std::string>& out_evicted);
 
     // Test-only: Predicate to determine which keys should fail in BatchOffload.
     // Used for deterministic testing of partial success behavior.
