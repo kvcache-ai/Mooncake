@@ -105,19 +105,19 @@ int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
     }
 
     qp_list_.resize(num_qp_list);
-    cq_outstanding_ = (volatile int *)cq->cq_context;
+    cq_outstanding_ = static_cast<std::atomic<int> *>(cq->cq_context);
 
     max_wr_depth_ = (int)max_wr_depth;
     max_sge_per_wr_ = max_sge_per_wr;
     max_inline_bytes_ = max_inline_bytes;
 
-    wr_depth_list_ = new volatile int[num_qp_list]();
+    wr_depth_list_ = new std::atomic<int>[num_qp_list]();
     if (!wr_depth_list_) {
         LOG(ERROR) << "Failed to allocate memory for work request depth list";
         return ERR_MEMORY;
     }
     for (size_t i = 0; i < num_qp_list; ++i) {
-        wr_depth_list_[i] = 0;
+        wr_depth_list_[i].store(0, std::memory_order_relaxed);
         ibv_qp_init_attr attr;
         memset(&attr, 0, sizeof(attr));
         attr.send_cq = cq;
@@ -165,7 +165,7 @@ int RdmaEndPoint::reconstruct() {
     // Reconstruct with same parameters as original construction
     status_.store(INITIALIZING, std::memory_order_relaxed);
     ready_wait_start_ts_.store(0, std::memory_order_relaxed);
-    active_ = true;
+    active_.store(true, std::memory_order_release);
 
     return construct(cq, num_qp, max_sge_per_wr, max_wr_depth,
                      max_inline_bytes);
@@ -182,15 +182,16 @@ int RdmaEndPoint::deconstructLocked() {
     bool displayed = false;
     if (wr_depth_list_) {
         for (size_t i = 0; i < qp_list_.size(); ++i) {
-            if (wr_depth_list_[i] != 0) {
+            int wr_depth = wr_depth_list_[i].load(std::memory_order_relaxed);
+            if (wr_depth != 0) {
                 if (!displayed) {
                     LOG(WARNING)
                         << "Outstanding work requests found, CQ will not "
                            "be generated";
                     displayed = true;
                 }
-                __sync_fetch_and_sub(cq_outstanding_, wr_depth_list_[i]);
-                wr_depth_list_[i] = 0;
+                cq_outstanding_->fetch_sub(wr_depth, std::memory_order_acq_rel);
+                wr_depth_list_[i].store(0, std::memory_order_relaxed);
             }
         }
     }
@@ -226,8 +227,8 @@ void RdmaEndPoint::beginDestroyLocked() {
     auto current_status = status_.load(std::memory_order_relaxed);
     if (current_status == DESTROYING || current_status == DESTROYED) return;
 
-    active_ = false;
-    inactive_time_ = getCurrentTimeInNano();
+    inactive_time_.store(getCurrentTimeInNano(), std::memory_order_relaxed);
+    active_.store(false, std::memory_order_release);
     status_.store(DESTROYING, std::memory_order_release);
     ready_wait_start_ts_.store(0, std::memory_order_relaxed);
 
@@ -257,7 +258,7 @@ bool RdmaEndPoint::finishDestroy() {
     // pre-two-phase predicate (!hasOutstandingSlice == !active_): only
     // inactive endpoints are eligible for reclaim; active ones must stay.
     if (current_status != DESTROYING) {
-        if (active_) return false;
+        if (active_.load(std::memory_order_acquire)) return false;
         // Endpoints that never reached construct() own no RDMA resources
         // and have wr_depth_list_ uninitialized; deconstructLocked() would
         // delete[] a wild pointer. Drop them directly.
@@ -275,13 +276,15 @@ bool RdmaEndPoint::finishDestroy() {
         // never be flushed; enforce a timeout to avoid leaking forever.
         bool has_outstanding = false;
         for (size_t i = 0; i < qp_list_.size(); ++i) {
-            if (wr_depth_list_[i] != 0) {
+            if (wr_depth_list_[i].load(std::memory_order_relaxed) != 0) {
                 has_outstanding = true;
                 break;
             }
         }
         if (has_outstanding) {
-            double elapsed = (getCurrentTimeInNano() - inactive_time_) / 1e9;
+            double elapsed = (getCurrentTimeInNano() -
+                              inactive_time_.load(std::memory_order_relaxed)) /
+                             1e9;
             if (elapsed < kFinishDestroyTimeoutSec) return false;
             LOG(WARNING) << "finishDestroy timed out after " << elapsed
                          << "s with outstanding WRs, forcing destruction";
@@ -807,7 +810,7 @@ int RdmaEndPoint::disconnectUnlocked() {
         // a QP that reached RTS cannot be reliably reset back to RTS.
 #ifdef CONFIG_ERDMA
         for (size_t i = 0; i < qp_list_.size(); ++i) {
-            CHECK_EQ(wr_depth_list_[i], 0)
+            CHECK_EQ(wr_depth_list_[i].load(std::memory_order_relaxed), 0)
                 << "Pre-connected endpoint must not have outstanding WRs";
         }
         return reconstruct();
@@ -822,7 +825,7 @@ int RdmaEndPoint::disconnectUnlocked() {
                 PLOG(ERROR) << "Failed to modify pre-connected QP to RESET";
                 ret = ERR_ENDPOINT;
             }
-            CHECK_EQ(wr_depth_list_[i], 0)
+            CHECK_EQ(wr_depth_list_[i].load(std::memory_order_relaxed), 0)
                 << "Pre-connected endpoint must not have outstanding WRs";
         }
         peer_qp_num_list_.clear();
@@ -907,7 +910,8 @@ int RdmaEndPoint::submitPostSend(
     std::vector<Transport::Slice *> &slice_list,
     std::vector<Transport::Slice *> &failed_slice_list) {
     RWSpinlock::WriteGuard guard(lock_);
-    if (!active_ || status_.load(std::memory_order_relaxed) != CONNECTED) {
+    if (!active_.load(std::memory_order_acquire) ||
+        status_.load(std::memory_order_relaxed) != CONNECTED) {
         for (auto &slice : slice_list) failed_slice_list.push_back(slice);
         slice_list.clear();
         return 0;
@@ -916,7 +920,8 @@ int RdmaEndPoint::submitPostSend(
     const size_t num_qp = qp_list_.size();
     if (slice_list.empty()) return 0;
     const size_t requested = slice_list.size();
-    int cq_remaining = int(globalConfig().max_cqe) - *cq_outstanding_;
+    int cq_remaining = int(globalConfig().max_cqe) -
+                       cq_outstanding_->load(std::memory_order_relaxed);
     if (cq_remaining <= 0) return 0;
 
     // Only allocate for the max number of WRs we can actually post per QP,
@@ -932,7 +937,8 @@ int RdmaEndPoint::submitPostSend(
     for (size_t qp_index = 0;
          qp_index < num_qp && cq_remaining > 0 && cursor < requested;
          ++qp_index) {
-        int qp_avail = max_wr_depth_ - wr_depth_list_[qp_index];
+        int qp_avail = max_wr_depth_ -
+                       wr_depth_list_[qp_index].load(std::memory_order_relaxed);
         if (qp_avail <= 0) continue;
 
         size_t remaining_qps = num_qp - qp_index;
@@ -970,8 +976,8 @@ int RdmaEndPoint::submitPostSend(
         }
 
         ibv_send_wr *bad_wr = nullptr;
-        __sync_fetch_and_add(&wr_depth_list_[qp_index], wr_count);
-        __sync_fetch_and_add(cq_outstanding_, wr_count);
+        wr_depth_list_[qp_index].fetch_add(wr_count, std::memory_order_acq_rel);
+        cq_outstanding_->fetch_add(wr_count, std::memory_order_acq_rel);
         // Register before ringing the doorbell. A fast completion may otherwise
         // be polled before the diagnostic registry sees the slice.
         context_.trackPostedSlices(slice_list, start, wr_count);
@@ -985,8 +991,9 @@ int RdmaEndPoint::submitPostSend(
             while (bad_wr) {
                 int i = bad_wr - wr_list.data();
                 failed_slice_list.push_back(slice_list[start + i]);
-                __sync_fetch_and_sub(&wr_depth_list_[qp_index], 1);
-                __sync_fetch_and_sub(cq_outstanding_, 1);
+                wr_depth_list_[qp_index].fetch_sub(1,
+                                                   std::memory_order_acq_rel);
+                cq_outstanding_->fetch_sub(1, std::memory_order_acq_rel);
                 bad_wr = bad_wr->next;
             }
             total_posted += wr_count;

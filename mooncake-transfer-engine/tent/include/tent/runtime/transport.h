@@ -161,6 +161,8 @@ class Transport {
 
     virtual const char* getName() const { return "<generic>"; }
 
+    virtual double getEstimatedBandwidth() const { return -1.0; }
+
    protected:
     Capabilities caps;
 };
