@@ -68,6 +68,10 @@ struct XferBenchConfig {
     static int duration;
     static int max_num_threads;
     static int start_num_threads;
+    static std::string qos_classes;
+    static std::string qos_classes_json;
+    static double qos_link_capacity_gbps;
+    static std::string qos_output_jsonl;
     static uint64_t deadline_us;
     static int deadline_tight_threads;
     static bool deadline_bw_arbitration;
@@ -125,7 +129,19 @@ struct XferMetricStats {
 
     double p999() { return percentile(99.9); }
 
+    double fractionAtOrBelow(double threshold) const {
+        if (samples.empty()) return 0.0;
+        const auto count = std::count_if(
+            samples.begin(), samples.end(),
+            [threshold](double value) { return value <= threshold; });
+        return static_cast<double>(count) / samples.size();
+    }
+
     void add(double value) { samples.push_back(value); }
+
+    void add(const std::vector<double>& values) {
+        samples.insert(samples.end(), values.begin(), values.end());
+    }
 
     void clear() { samples.clear(); }
 
