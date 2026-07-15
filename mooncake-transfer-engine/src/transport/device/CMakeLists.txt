@@ -16,6 +16,30 @@ target_include_directories(device_transport PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
 if(USE_CUDA)
   target_include_directories(device_transport PRIVATE /usr/local/cuda/include)
+
+  include(CheckCXXSourceCompiles)
+  set(_saved_cmake_required_libraries "${CMAKE_REQUIRED_LIBRARIES}")
+  set(CMAKE_REQUIRED_LIBRARIES mlx5)
+  check_cxx_source_compiles(
+    "#include <infiniband/mlx5dv.h>
+     int main() {
+       struct mlx5dv_devx_umem_in input{};
+       input.comp_mask = MLX5DV_UMEM_MASK_DMABUF;
+       input.dmabuf_fd = -1;
+       auto *umem = mlx5dv_devx_umem_reg_ex(nullptr, &input);
+       return umem != nullptr;
+     }"
+    MOONCAKE_HAVE_MLX5_DMABUF_UMEM)
+  set(CMAKE_REQUIRED_LIBRARIES "${_saved_cmake_required_libraries}")
+  unset(_saved_cmake_required_libraries)
+
+  if(MOONCAKE_HAVE_MLX5_DMABUF_UMEM)
+    message(STATUS "IBGDA DMA-BUF control UMEM support enabled")
+    target_compile_definitions(device_transport
+                               PRIVATE MOONCAKE_HAVE_MLX5_DMABUF_UMEM=1)
+  else()
+    message(STATUS "IBGDA DMA-BUF control UMEM support unavailable")
+  endif()
 endif()
 if(USE_MUSA)
   target_include_directories(device_transport PRIVATE /usr/local/musa/include)

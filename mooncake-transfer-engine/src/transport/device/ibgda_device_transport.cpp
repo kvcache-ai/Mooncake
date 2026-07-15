@@ -27,9 +27,11 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <unistd.h>
 
 #include "cuda_alike.h"
 #include "transport/device/ibgda/memheap.h"
@@ -41,6 +43,24 @@ namespace mooncake {
 namespace device {
 
 static constexpr size_t kCtrlBufSize = 1024ULL * 1024 * 1024;  // 1 GiB
+
+enum class ControlMemoryMode {
+    kGpuDmabuf,
+    kGpuVa,
+    kHostMapped,
+};
+
+static const char* controlMemoryModeName(ControlMemoryMode mode) {
+    switch (mode) {
+        case ControlMemoryMode::kGpuDmabuf:
+            return "gpu-dmabuf";
+        case ControlMemoryMode::kGpuVa:
+            return "gpu-va";
+        case ControlMemoryMode::kHostMapped:
+            return "host-mapped";
+    }
+    return "unknown";
+}
 
 static bool parseBoolEnvWithDefault(const char* name, bool default_value) {
     const char* value = std::getenv(name);
@@ -232,7 +252,21 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     }
 
     int allocateControlBuffer() override {
-        return allocateControlBuffer(false);
+#if defined(USE_CUDA) && defined(MOONCAKE_HAVE_MLX5_DMABUF_UMEM)
+        if (parseBoolEnvWithDefault("MOONCAKE_EP_IBGDA_DISABLE_DMABUF_CTRL",
+                                    false)) {
+            LOG(INFO) << "[EP IBGDA] DMA-BUF control UMEM disabled by env";
+        } else if (cudaSupportsDmabuf()) {
+            if (allocateControlBuffer(ControlMemoryMode::kGpuDmabuf) == 0)
+                return 0;
+            LOG(WARNING) << "[EP IBGDA] GPU DMA-BUF control UMEM unavailable; "
+                            "retrying with GPU VA registration";
+        }
+#elif defined(USE_CUDA)
+        LOG(INFO) << "[EP IBGDA] DMA-BUF control UMEM was unavailable at "
+                     "build time";
+#endif
+        return allocateControlBuffer(ControlMemoryMode::kGpuVa);
     }
 
     int createQueuePairs(void* stream_ptr) override {
@@ -366,9 +400,108 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         return failure.valid && failure.status == MLX5_CMD_STAT_BAD_PARAM_ERR;
     }
 
-    int allocateControlBuffer(bool host_backed) {
-        ctrl_buf_host_ = host_backed;
-        if (ctrl_buf_host_) {
+    bool cudaSupportsDmabuf() const {
+#if defined(USE_CUDA) && defined(MOONCAKE_HAVE_MLX5_DMABUF_UMEM)
+        CUdevice device;
+        CUresult result = cuCtxGetDevice(&device);
+        if (result != CUDA_SUCCESS) {
+            LOG(WARNING) << "[EP IBGDA] cuCtxGetDevice failed while probing "
+                            "DMA-BUF control support: "
+                         << cudaDriverError(result);
+            return false;
+        }
+
+        int supported = 0;
+        result = cuDeviceGetAttribute(
+            &supported, CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED, device);
+        if (result != CUDA_SUCCESS) {
+            LOG(WARNING) << "[EP IBGDA] CUDA DMA-BUF capability query failed: "
+                         << cudaDriverError(result);
+            return false;
+        }
+        if (!supported) {
+            LOG(INFO) << "[EP IBGDA] Active CUDA device does not support "
+                         "DMA-BUF control memory";
+        }
+        return supported != 0;
+#else
+        return false;
+#endif
+    }
+
+    static std::string cudaDriverError(CUresult result) {
+#if defined(USE_CUDA)
+        const char* name = nullptr;
+        const char* message = nullptr;
+        cuGetErrorName(result, &name);
+        cuGetErrorString(result, &message);
+        return std::string(name ? name : "CUDA_ERROR_UNKNOWN") + ": " +
+               (message ? message : "unknown CUDA driver error");
+#else
+        return std::to_string(static_cast<int>(result));
+#endif
+    }
+
+    mlx5dv_devx_umem* registerGpuDmabufControlUmem() {
+#if defined(USE_CUDA) && defined(MOONCAKE_HAVE_MLX5_DMABUF_UMEM)
+        int sync_memops = 1;
+        CUresult result = cuPointerSetAttribute(
+            &sync_memops, CU_POINTER_ATTRIBUTE_SYNC_MEMOPS,
+            reinterpret_cast<CUdeviceptr>(ctrl_buf_));
+        if (result != CUDA_SUCCESS) {
+            LOG(ERROR) << "[EP IBGDA] Failed to enable synchronous memory "
+                          "operations for DMA-BUF control memory: "
+                       << cudaDriverError(result);
+            return nullptr;
+        }
+
+        int dmabuf_fd = -1;
+        result = cuMemGetHandleForAddressRange(
+            &dmabuf_fd, reinterpret_cast<CUdeviceptr>(ctrl_buf_), kCtrlBufSize,
+            CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
+        if (result != CUDA_SUCCESS) {
+            LOG(ERROR) << "[EP IBGDA] Failed to export DMA-BUF control memory "
+                          "at "
+                       << ctrl_buf_ << " size=" << kCtrlBufSize << ": "
+                       << cudaDriverError(result);
+            return nullptr;
+        }
+
+        const long page_size = sysconf(_SC_PAGESIZE);
+        if (page_size <= 0) {
+            LOG(ERROR) << "[EP IBGDA] Failed to query host page size";
+            close(dmabuf_fd);
+            return nullptr;
+        }
+
+        struct mlx5dv_devx_umem_in input{};
+        input.addr = 0;
+        input.size = kCtrlBufSize;
+        input.access = IBV_ACCESS_LOCAL_WRITE;
+        input.pgsz_bitmap =
+            UINT64_MAX & ~(static_cast<uint64_t>(page_size) - 1);
+        input.comp_mask = MLX5DV_UMEM_MASK_DMABUF;
+        input.dmabuf_fd = dmabuf_fd;
+
+        mlx5dv_devx_umem* umem = mlx5dv_devx_umem_reg_ex(ctx_, &input);
+        const int registration_errno = errno;
+        if (close(dmabuf_fd) != 0) {
+            PLOG(WARNING) << "[EP IBGDA] Failed to close control DMA-BUF fd";
+        }
+        if (!umem) {
+            errno = registration_errno;
+            PLOG(ERROR) << "[EP IBGDA] mlx5dv_devx_umem_reg_ex failed for "
+                           "GPU DMA-BUF control memory";
+        }
+        return umem;
+#else
+        return nullptr;
+#endif
+    }
+
+    int allocateControlBuffer(ControlMemoryMode mode) {
+        ctrl_buf_mode_ = mode;
+        if (mode == ControlMemoryMode::kHostMapped) {
             int ret = posix_memalign(&ctrl_buf_, 4096, kCtrlBufSize);
             if (ret != 0) {
                 LOG(ERROR) << "[EP IBGDA] posix_memalign ctrl_buf failed: "
@@ -396,10 +529,8 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                 cudaHostUnregister(ctrl_buf_);
                 free(ctrl_buf_);
                 ctrl_buf_ = nullptr;
-                ctrl_buf_host_ = false;
                 return -1;
             }
-            LOG(INFO) << "[EP IBGDA] Using host-backed mapped control buffer";
         } else {
             cudaError_t err = cudaMalloc(&ctrl_buf_, kCtrlBufSize);
             if (err != cudaSuccess) {
@@ -410,15 +541,23 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
             ctrl_buf_dev_ = ctrl_buf_;
         }
 
-        ctrl_buf_umem_ = mlx5dv_devx_umem_reg(ctx_, ctrl_buf_, kCtrlBufSize,
-                                              IBV_ACCESS_LOCAL_WRITE);
+        if (mode == ControlMemoryMode::kGpuDmabuf) {
+            ctrl_buf_umem_ = registerGpuDmabufControlUmem();
+        } else {
+            ctrl_buf_umem_ = mlx5dv_devx_umem_reg(ctx_, ctrl_buf_, kCtrlBufSize,
+                                                  IBV_ACCESS_LOCAL_WRITE);
+        }
         if (!ctrl_buf_umem_) {
-            LOG(ERROR) << "[EP IBGDA] mlx5dv_devx_umem_reg failed (errno="
-                       << errno << ")";
+            LOG(ERROR) << "[EP IBGDA] Control UMEM registration failed for "
+                       << controlMemoryModeName(mode) << " (errno=" << errno
+                       << ")";
             freeControlBuffer();
             return -1;
         }
-        LOG(INFO) << "[EP IBGDA] ctrl_buf UMEM registered via VA path";
+        LOG(INFO) << "[EP IBGDA] Control buffer mode: "
+                  << controlMemoryModeName(mode) << " addr=" << ctrl_buf_dev_
+                  << " size=" << kCtrlBufSize
+                  << " umem_id=" << ctrl_buf_umem_->umem_id;
 
         ctrl_buf_heap_ = memheap_create(kCtrlBufSize);
         if (!ctrl_buf_heap_) {
@@ -431,7 +570,9 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
 
     bool retryWithHostControlBuffer() {
         auto failure = mlx5gda_last_create_qp_failure();
-        if (ctrl_buf_host_ || !isCreateQpBadParam(failure)) return false;
+        if (ctrl_buf_mode_ == ControlMemoryMode::kHostMapped ||
+            !isCreateQpBadParam(failure))
+            return false;
 
         LOG(WARNING) << "[EP IBGDA] GPU-backed control buffer was rejected by "
                         "DevX CREATE_QP"
@@ -441,7 +582,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
 
         destroyQueuePairs();
         freeControlBuffer();
-        return allocateControlBuffer(true) == 0;
+        return allocateControlBuffer(ControlMemoryMode::kHostMapped) == 0;
     }
 
     void destroyQueuePairs() {
@@ -461,7 +602,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
             ctrl_buf_umem_ = nullptr;
         }
         if (ctrl_buf_) {
-            if (ctrl_buf_host_) {
+            if (ctrl_buf_mode_ == ControlMemoryMode::kHostMapped) {
                 cudaHostUnregister(ctrl_buf_);
                 free(ctrl_buf_);
             } else {
@@ -469,7 +610,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
             }
             ctrl_buf_ = nullptr;
             ctrl_buf_dev_ = nullptr;
-            ctrl_buf_host_ = false;
+            ctrl_buf_mode_ = ControlMemoryMode::kGpuVa;
         }
     }
 
@@ -517,9 +658,9 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     std::vector<std::string> device_filter_;
 
     // Control buffer
-    void* ctrl_buf_ = nullptr;  // GPU VA
+    void* ctrl_buf_ = nullptr;  // Allocation address used for UMEM registration
     void* ctrl_buf_dev_ = nullptr;
-    bool ctrl_buf_host_ = false;
+    ControlMemoryMode ctrl_buf_mode_ = ControlMemoryMode::kGpuVa;
     mlx5dv_devx_umem* ctrl_buf_umem_ = nullptr;
     memheap* ctrl_buf_heap_ = nullptr;
 
