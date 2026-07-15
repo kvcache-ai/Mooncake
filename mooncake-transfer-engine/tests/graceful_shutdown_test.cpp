@@ -37,20 +37,39 @@ void waitChildWithTimeout(pid_t pid, int* status) {
     FAIL() << "child did not exit before timeout";
 }
 
+void notifyParentReady(int fd) {
+    const char ready = '1';
+    if (write(fd, &ready, 1) != 1) _exit(111);
+    close(fd);
+}
+
+void waitForChildReady(int fd) {
+    char ready = 0;
+    ASSERT_EQ(read(fd, &ready, 1), 1) << "child did not report readiness";
+    EXPECT_EQ(ready, '1');
+    close(fd);
+}
+
 }  // namespace
 
 TEST(GracefulShutdownTest, SigtermTriggersCleanExit) {
+    int ready_pipe[2];
+    ASSERT_EQ(pipe(ready_pipe), 0) << "pipe() failed";
+
     pid_t pid = fork();
     ASSERT_NE(pid, -1) << "fork() failed";
 
     if (pid == 0) {
+        close(ready_pipe[0]);
         auto engine = std::make_unique<TransferEngine>(false);
         engine->enableGracefulShutdown();
+        notifyParentReady(ready_pipe[1]);
         pause();
         _exit(99);
     }
 
-    usleep(100000);
+    close(ready_pipe[1]);
+    waitForChildReady(ready_pipe[0]);
     kill(pid, SIGTERM);
 
     int status;
@@ -62,17 +81,23 @@ TEST(GracefulShutdownTest, SigtermTriggersCleanExit) {
 }
 
 TEST(GracefulShutdownTest, SigintTriggersCleanExit) {
+    int ready_pipe[2];
+    ASSERT_EQ(pipe(ready_pipe), 0) << "pipe() failed";
+
     pid_t pid = fork();
     ASSERT_NE(pid, -1) << "fork() failed";
 
     if (pid == 0) {
+        close(ready_pipe[0]);
         auto engine = std::make_unique<TransferEngine>(false);
         engine->enableGracefulShutdown();
+        notifyParentReady(ready_pipe[1]);
         pause();
         _exit(99);
     }
 
-    usleep(100000);
+    close(ready_pipe[1]);
+    waitForChildReady(ready_pipe[0]);
     kill(pid, SIGINT);
 
     int status;
@@ -89,19 +114,25 @@ TEST(GracefulShutdownTest, IdempotentEnable) {
 }
 
 TEST(GracefulShutdownTest, EngineDestroyedBeforeSignal) {
+    int ready_pipe[2];
+    ASSERT_EQ(pipe(ready_pipe), 0) << "pipe() failed";
+
     pid_t pid = fork();
     ASSERT_NE(pid, -1) << "fork() failed";
 
     if (pid == 0) {
+        close(ready_pipe[0]);
         {
             auto engine = std::make_unique<TransferEngine>(false);
             engine->enableGracefulShutdown();
         }
+        notifyParentReady(ready_pipe[1]);
         pause();
         _exit(99);
     }
 
-    usleep(100000);
+    close(ready_pipe[1]);
+    waitForChildReady(ready_pipe[0]);
     kill(pid, SIGTERM);
 
     int status;
@@ -114,15 +145,21 @@ TEST(GracefulShutdownTest, ForkAfterInstallDoesNotHangChildSignal) {
     auto engine = std::make_unique<TransferEngine>(false);
     engine->enableGracefulShutdown();
 
+    int ready_pipe[2];
+    ASSERT_EQ(pipe(ready_pipe), 0) << "pipe() failed";
+
     pid_t pid = fork();
     ASSERT_NE(pid, -1) << "fork() failed";
 
     if (pid == 0) {
+        close(ready_pipe[0]);
+        notifyParentReady(ready_pipe[1]);
         pause();
         _exit(99);
     }
 
-    usleep(100000);
+    close(ready_pipe[1]);
+    waitForChildReady(ready_pipe[0]);
     kill(pid, SIGTERM);
 
     int status;
@@ -134,19 +171,25 @@ TEST(GracefulShutdownTest, ForkAfterInstallDoesNotHangChildSignal) {
 }
 
 TEST(GracefulShutdownTest, MultipleEngines) {
+    int ready_pipe[2];
+    ASSERT_EQ(pipe(ready_pipe), 0) << "pipe() failed";
+
     pid_t pid = fork();
     ASSERT_NE(pid, -1) << "fork() failed";
 
     if (pid == 0) {
+        close(ready_pipe[0]);
         auto engine1 = std::make_unique<TransferEngine>(false);
         auto engine2 = std::make_unique<TransferEngine>(false);
         engine1->enableGracefulShutdown();
         engine2->enableGracefulShutdown();
+        notifyParentReady(ready_pipe[1]);
         pause();
         _exit(99);
     }
 
-    usleep(100000);
+    close(ready_pipe[1]);
+    waitForChildReady(ready_pipe[0]);
     kill(pid, SIGTERM);
 
     int status;
