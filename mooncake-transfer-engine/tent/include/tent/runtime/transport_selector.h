@@ -82,6 +82,8 @@ struct SelectionContext {
     int priority_level;     // Request priority level (lower = more urgent)
     std::optional<std::string>
         policy_name;  // Optional: bind to specific policy by name
+    IntentType intent_type{
+        IntentType::INTENT_UNSPEC};  // Business intent for policy matching
 };
 
 /**
@@ -125,6 +127,10 @@ struct SelectionPolicy {
     // Named QP pool this policy's traffic should land on; parsed and stored for
     // now, routing to be wired later. Unset = the current single "data QP".
     std::optional<std::string> qp_pool;
+
+    // Optional business-intent filter. nullopt preserves the historical
+    // catch-all behavior; otherwise the request intent must match exactly.
+    std::optional<IntentType> intent_type;
 };
 
 /**

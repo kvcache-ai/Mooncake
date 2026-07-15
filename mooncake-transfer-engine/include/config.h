@@ -60,6 +60,11 @@ struct GlobalConfig {
     // which is minutes. Override via MC_HANDSHAKE_CONNECT_TIMEOUT.
     int handshake_connect_timeout = 5;
     bool metacache = true;
+    // Periodically refresh Transfer Engine metadata-derived local caches. 0
+    // disables the background poller and preserves the manual
+    // syncSegmentCache() behavior. Currently refreshes cached remote segment
+    // descriptors. Override via MC_TE_METADATA_REFRESH_INTERVAL_SECONDS.
+    uint64_t te_metadata_refresh_interval_seconds = 0;
     int log_level = google::INFO;
     bool trace = false;
     int64_t slice_timeout = -1;

@@ -35,6 +35,14 @@ DEFINE_int32(start_num_threads, 1,
              "Start number of concurrent worker threads.");
 DEFINE_int32(max_num_threads, 1,
              "Maximum number of concurrent worker threads.");
+DEFINE_uint64(deadline_us, 0,
+              "tent only: relative per-transfer deadline in microseconds for "
+              "tight worker threads (0 disables deadline tagging).");
+DEFINE_int32(deadline_tight_threads, 0,
+             "tent only: workers [0, N) that carry --deadline_us; remaining "
+             "workers have no deadline.");
+DEFINE_bool(deadline_bw_arbitration, false,
+            "tent only: enable deadline-aware RDMA bandwidth arbitration.");
 DEFINE_int32(local_gpu_id, 0, "Local GPU ID to be used, -1 for all GPUs");
 DEFINE_int32(target_gpu_id, 0, "Target GPU ID to be used, -1 for all GPUs");
 DEFINE_string(metadata_type, "p2p",
@@ -53,6 +61,10 @@ DEFINE_string(
     tent_transport_hint, "unspec",
     "tent only: per-request transport_hint. "
     "unspec|rdma|tcp|shm|nvlink|gds|io_uring|mnnvl|ascend|sunrise_link");
+DEFINE_string(tent_intent_type, "unspec",
+              "tent only: intent_type attached to every benchmark request. "
+              "unspec|foreground_get|background_prefetch|migration|checkpoint|"
+              "weight_loading|staging_internal");
 
 namespace mooncake {
 namespace tent {
@@ -70,6 +82,9 @@ size_t XferBenchConfig::max_batch_size = 0;
 int XferBenchConfig::duration = 0;
 int XferBenchConfig::max_num_threads = 0;
 int XferBenchConfig::start_num_threads = 0;
+uint64_t XferBenchConfig::deadline_us = 0;
+int XferBenchConfig::deadline_tight_threads = 0;
+bool XferBenchConfig::deadline_bw_arbitration = false;
 
 std::string XferBenchConfig::metadata_type;
 std::string XferBenchConfig::metadata_url_list;
@@ -78,6 +93,7 @@ std::string XferBenchConfig::xport_type;
 std::string XferBenchConfig::backend;
 bool XferBenchConfig::notifi = false;
 std::string XferBenchConfig::tent_transport_hint;
+std::string XferBenchConfig::tent_intent_type;
 
 int XferBenchConfig::local_gpu_id = 0;
 int XferBenchConfig::target_gpu_id = 0;
@@ -96,6 +112,9 @@ void XferBenchConfig::loadFromFlags() {
     max_batch_size = FLAGS_max_batch_size;
     start_num_threads = FLAGS_start_num_threads;
     max_num_threads = FLAGS_max_num_threads;
+    deadline_us = FLAGS_deadline_us;
+    deadline_tight_threads = FLAGS_deadline_tight_threads;
+    deadline_bw_arbitration = FLAGS_deadline_bw_arbitration;
     duration = FLAGS_duration;
 
     metadata_type = FLAGS_metadata_type;
@@ -106,6 +125,7 @@ void XferBenchConfig::loadFromFlags() {
     backend = FLAGS_backend;
     notifi = FLAGS_notifi;
     tent_transport_hint = FLAGS_tent_transport_hint;
+    tent_intent_type = FLAGS_tent_intent_type;
 
     local_gpu_id = FLAGS_local_gpu_id;
     target_gpu_id = FLAGS_target_gpu_id;
@@ -166,6 +186,21 @@ void printStats(size_t block_size, size_t batch_size, XferBenchStats& stats,
               << std::setw(14) << stats.transfer_duration.p999()
               << std::endl;
     // clang-format on
+}
+
+void printDeadlineGroupStats(const char* group, size_t block_size,
+                             size_t batch_size, XferBenchStats& stats,
+                             int num_threads, uint64_t deadline_us) {
+    if (num_threads <= 0 || stats.transfer_duration.count() == 0) return;
+    const double duration_s = stats.total_duration.avg() / 1e6;
+    const double bytes = static_cast<double>(block_size) * batch_size *
+                         stats.transfer_duration.count();
+    const double throughput_gbs = bytes / 1e9 / duration_s;
+    std::cout << "  [deadline-" << group << "] threads=" << num_threads;
+    if (deadline_us != 0) std::cout << " deadline_us=" << deadline_us;
+    std::cout << " operations=" << stats.transfer_duration.count()
+              << " throughput=" << std::fixed << std::setprecision(6)
+              << throughput_gbs << " GB/s" << std::endl;
 }
 
 }  // namespace tent

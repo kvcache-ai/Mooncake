@@ -75,6 +75,24 @@ TEST(ReceiverCredit, SequenceGapIsVisibleAndSafe) {
     EXPECT_EQ(d, CreditUpdateDisposition::SequenceGap);
 }
 
+TEST(ReceiverCredit, PartialGrantUpdateRetainsOmittedResources) {
+    SenderCreditLedger l;
+    ASSERT_TRUE(l.activate(key(), 7).ok());
+    grant(l, 1, 100, 5);
+
+    CreditUpdateDisposition d;
+    ASSERT_TRUE(l.applyUpdate(
+                     key(), update(7, 2, {{CreditResource::DataBytes, 160}}), d)
+                    .ok());
+    EXPECT_EQ(d, CreditUpdateDisposition::Applied);
+
+    uint64_t v;
+    ASSERT_TRUE(l.available(key(), CreditResource::DataBytes, v).ok());
+    EXPECT_EQ(v, 160);
+    ASSERT_TRUE(l.available(key(), CreditResource::RequestSlots, v).ok());
+    EXPECT_EQ(v, 5);
+}
+
 TEST(ReceiverCredit, StaleEpochFailsAndActivationFencesOldState) {
     SenderCreditLedger l;
     ASSERT_TRUE(l.activate(key(), 7).ok());
