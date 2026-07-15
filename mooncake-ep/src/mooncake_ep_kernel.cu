@@ -467,12 +467,12 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
               int num_topk, int num_experts, int rank, int num_ranks, bool use_fp8,
               void* workspace, cudaStream_t stream, int64_t timeout_ticks, int phases) {
     constexpr int kNumMaxTopK = 11;
-    constexpr int kNumWarpsPerGroup = 8;
+    constexpr int kNumWarpsPerGroup = 4;
 #ifdef MOONCAKE_EP_USE_MUSA
     // MT S5000 benefits from slightly more CTAs while keeping enough warps for top-k<=11.
     constexpr int kNumWarpGroups = 5;
 #else
-    constexpr int kNumWarpGroups = 4;
+    constexpr int kNumWarpGroups = 8;
 #endif
     EP_STATIC_ASSERT(kNumMaxTopK + 1 <= kNumWarpGroups * kNumWarpsPerGroup, "Too many top-k selections");
 
@@ -723,8 +723,8 @@ void combine(void* combined_x, int32_t* active_ranks,
              int num_topk, int num_experts, int rank, int num_ranks,
              void* workspace, cudaStream_t stream,
              int64_t timeout_ticks, int phases, bool zero_copy) {
-    constexpr int kNumWarpsPerGroup = 8;
-    constexpr int kNumWarpGroups = 4;
+    constexpr int kNumWarpsPerGroup = 4;
+    constexpr int kNumWarpGroups = 8;
     constexpr int kNumMaxTopk = 11;
 
     const auto num_warps = kNumWarpGroups * kNumWarpsPerGroup;
