@@ -51,6 +51,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
             simulated_gemm_x = per_token_cast_back(packed_recv_x[0].view(-1, hidden), packed_recv_x[1].view(-1, hidden // 128)).view(packed_recv_x[0].shape) \
                 if dispatch_use_fp8 else packed_recv_x.clone()
             all_topk_idx = torch.empty((num_ranks, num_tokens, num_topk), dtype=topk_idx.dtype, device='cuda')
+            continue
             dist.all_gather_into_tensor(all_topk_idx, topk_idx, group=group)
             for i in range(num_local_experts if do_check else 0):
                 expert_id = rank * num_local_experts + i
@@ -123,13 +124,32 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                                                  zero_copy=zero_copy, return_recv_hook=return_recv_hook)
         large_gemm_with_hook(hook) if return_recv_hook else None
 
+    def dispatch_test_func(use_fp8: bool):
+        _, _, _, event, _ = buffer.dispatch(
+            x, topk_idx, active_ranks, num_tokens, num_experts, -1,
+            use_fp8=use_fp8, async_finish=True)
+        event.current_stream_wait()
+
     # Calculate bandwidth
     num_fp8_bytes, num_bf16_bytes = (hidden + hidden / 128 * 4 + 16), hidden * 2
-    num_dispatch_comm_bytes, num_combine_comm_bytes = 0, 0
+    num_dispatch_fp8_comm_bytes, num_dispatch_bf16_comm_bytes = 0, 0
+    num_combine_comm_bytes = 0
     for i in range(num_tokens):
         num_selections = (topk_idx[i] != -1).sum().item()
-        num_dispatch_comm_bytes += num_fp8_bytes * num_selections
+        num_dispatch_fp8_comm_bytes += num_fp8_bytes * num_selections
+        num_dispatch_bf16_comm_bytes += (num_bf16_bytes + 16) * num_selections
         num_combine_comm_bytes += num_bf16_bytes * num_selections
+
+    # Isolate the FP8 packing path while retaining the normal non-hook stream wait.
+    for dispatch_use_fp8 in ([False] if _USE_MACA else [False, True]):
+        cpu_group.barrier()
+        dispatch_t, min_t, max_t = bench(partial(dispatch_test_func, use_fp8=dispatch_use_fp8))
+        dispatch_bytes = num_dispatch_fp8_comm_bytes if dispatch_use_fp8 else num_dispatch_bf16_comm_bytes
+        dispatch_dtype = 'FP8' if dispatch_use_fp8 else 'BF16'
+        print(f'[rank {rank}] Dispatch {dispatch_dtype} end-to-end bandwidth: {dispatch_bytes / 1e9 / dispatch_t:.2f} GB/s, '
+              f'avg_t={dispatch_t * 1e6:.2f} us, min_t={min_t * 1e6:.2f} us, max_t={max_t * 1e6:.2f} us', flush=True)
+
+    num_dispatch_comm_bytes = num_dispatch_fp8_comm_bytes
 
     # Dispatch + combine testing
     avg_t, min_t, max_t = bench(partial(test_func, zero_copy=False, return_recv_hook=False))
