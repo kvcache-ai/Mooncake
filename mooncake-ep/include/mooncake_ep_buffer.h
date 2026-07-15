@@ -111,7 +111,7 @@ struct MooncakeEpBuffer {
     dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx,
              torch::Tensor& active_ranks, int num_max_dispatch_tokens_per_rank,
              int num_experts, int timeout_us, bool use_fp8, bool async,
-             bool return_recv_hook, bool raw_fp8_send);
+             bool return_recv_hook);
 
     std::tuple<torch::Tensor, std::optional<EventHandle>,
                std::optional<std::function<void()>>>

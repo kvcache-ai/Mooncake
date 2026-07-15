@@ -134,8 +134,7 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
                            torch::Tensor& active_ranks,
                            int num_max_dispatch_tokens_per_rank,
                            int num_experts, int timeout_us, bool use_fp8,
-                           bool async, bool return_recv_hook,
-                           bool raw_fp8_send) {
+                           bool async, bool return_recv_hook) {
     // Tensor checks
     // By default using `ptp128c` FP8 cast
     EP_HOST_ASSERT(x.dim() == 2 and x.is_contiguous() and
@@ -147,8 +146,6 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
     EP_HOST_ASSERT(topk_idx.scalar_type() == torch::kInt64);
     EP_HOST_ASSERT(num_experts % num_ranks == 0);
     EP_HOST_ASSERT(USE_QP_COUNT % num_ranks == 0);
-    EP_HOST_ASSERT(!raw_fp8_send || use_fp8);
-    EP_HOST_ASSERT(!raw_fp8_send || (async && !return_recv_hook));
 
     auto num_tokens = static_cast<int>(x.size(0)),
          hidden = static_cast<int>(x.size(1));
@@ -250,7 +247,7 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
             topk_idx.data_ptr<int64_t>(), next_buffer.rdma_recv_signal_buffer,
             num_tokens, hidden, num_max_dispatch_tokens_per_rank, num_topk,
             num_experts, rank, num_ranks, use_fp8, workspace, launch_stream,
-            timeout_ticks, phases, raw_fp8_send);
+            timeout_ticks, phases);
     };
     if (return_recv_hook) {
         launcher(LOW_LATENCY_SEND_PHASE);
