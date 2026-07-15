@@ -3373,12 +3373,11 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::SaveMetadata(
         LOG(ERROR) << "open parent dir failed: " << strerror(errno);
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
+    FdGuard dir_guard(dir_fd);
     if (fsync(dir_fd) != 0) {
         LOG(ERROR) << "fsync parent dir failed: " << strerror(errno);
-        close(dir_fd);
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
-    close(dir_fd);
 
     dirty_guard.disarm();
 
@@ -4123,25 +4122,29 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
         (cfg_.persist_mode == OffsetPersistMode::kRelaxed ||
          cfg_.persist_mode == OffsetPersistMode::kStrict);
 
+    // Filter stale tombstones on EVERY persist-enabled batch,
+    // regardless of whether a checkpoint is triggered.  If we only
+    // filter inside ShouldPersistNow(), a key evicted in batch N
+    // and re-written in batch M (when no checkpoint fires) keeps
+    // its tombstone in all_evicted_this_batch_.  The NEXT checkpoint
+    // would then write the stale tombstone to meta, causing Phase C
+    // to delete the valid re-written key on recovery.
+    if (persist_enabled && !all_evicted_this_batch_.empty() &&
+        !successfully_written_keys_set.empty()) {
+        auto it = std::remove_if(
+            all_evicted_this_batch_.begin(), all_evicted_this_batch_.end(),
+            [&](const std::string& k) {
+                return successfully_written_keys_set.count(k);
+            });
+        if (it != all_evicted_this_batch_.end()) {
+            LOG(INFO) << "Cleared " << all_evicted_this_batch_.end() - it
+                      << " stale eviction tombstones";
+            all_evicted_this_batch_.erase(it, all_evicted_this_batch_.end());
+        }
+    }
+
     if (persist_enabled && metadata_dirty_.load(std::memory_order_relaxed) &&
         ShouldPersistNow()) {
-        // Filter stale tombstones: remove keys that were successfully
-        // re-written in this batch from all_evicted_this_batch_.
-        if (!all_evicted_this_batch_.empty() &&
-            !successfully_written_keys_set.empty()) {
-            auto it = std::remove_if(
-                all_evicted_this_batch_.begin(), all_evicted_this_batch_.end(),
-                [&](const std::string& k) {
-                    return successfully_written_keys_set.count(k);
-                });
-            if (it != all_evicted_this_batch_.end()) {
-                LOG(INFO) << "Cleared " << all_evicted_this_batch_.end() - it
-                          << " stale eviction tombstones";
-                all_evicted_this_batch_.erase(it,
-                                              all_evicted_this_batch_.end());
-            }
-        }
-
         // data fsync (REQUIRED: ensures metadata points to
         // durable data)
         auto sync_res = data_file_->datasync();

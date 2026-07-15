@@ -14,7 +14,6 @@ PosixFile::PosixFile(const std::string &filename, int fd)
     }
 }
 
-
 tl::expected<void, ErrorCode> PosixFile::datasync() {
     if (fdatasync(fd_) != 0) {
         LOG(ERROR) << "fdatasync failed: " << strerror(errno);
@@ -30,7 +29,8 @@ PosixFile::~PosixFile() {
         }
         // If the file was opened with an error code indicating a write failure,
         // attempt to delete the file to prevent corruption.
-        if (delete_on_write_fail_ && error_code_ == ErrorCode::FILE_WRITE_FAIL) {
+        if (delete_on_write_fail_ &&
+            error_code_ == ErrorCode::FILE_WRITE_FAIL) {
             if (::unlink(filename_.c_str()) == -1) {
                 LOG(ERROR) << "Failed to delete corrupted file: " << filename_;
             } else {
