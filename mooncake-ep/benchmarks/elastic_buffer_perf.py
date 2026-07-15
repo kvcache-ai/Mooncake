@@ -281,6 +281,10 @@ def main() -> None:
         payload_bytes = table[:, 6].mean().item() * args.hidden * 2
         dispatch_avg_ms = table[:, 0].mean().item()
         combine_avg_ms = table[:, 1].mean().item()
+        # An EP step advances at its slowest rank, not at the rank-average time.
+        dispatch_critical_ms = table[:, 0].max().item()
+        combine_critical_ms = table[:, 1].max().item()
+        e2e_critical_ms = (table[:, 0] + table[:, 1]).max().item()
         print(
             "MOONCAKE_ELASTIC_PERF_OK",
             f"world={world_size}",
@@ -293,6 +297,9 @@ def main() -> None:
             f"scaleup={buffer.num_scaleup_ranks}",
             f"dispatch_avg_ms={dispatch_avg_ms:.3f}",
             f"combine_avg_ms={combine_avg_ms:.3f}",
+            f"dispatch_critical_ms={dispatch_critical_ms:.3f}",
+            f"combine_critical_ms={combine_critical_ms:.3f}",
+            f"dispatch_combine_critical_ms={e2e_critical_ms:.3f}",
             f"recv_tokens_avg={table[:, 6].mean().item():.1f}",
             f"effective_payload_MB_per_rank={payload_bytes / 1e6:.1f}",
             f"dispatch_effective_GBps={payload_bytes / dispatch_avg_ms / 1e6:.2f}",
