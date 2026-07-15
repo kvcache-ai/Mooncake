@@ -2,17 +2,20 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <functional>
 #include <memory>
-#include <string>
-#include <vector>
+#include <optional>
 #include <regex>
-#include <unordered_set>
-#include <unordered_map>
+#include <string>
 #include <thread>
-#include <chrono>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 #include "allocator.h"
 #include "client_service.h"
@@ -29,6 +32,35 @@ DEFINE_uint64(default_kv_lease_ttl, mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL,
 
 namespace mooncake {
 namespace testing {
+
+class ScopedEnvVar {
+   public:
+    ScopedEnvVar(const char* name, const char* value) : name_(name) {
+        if (const char* previous = std::getenv(name_.c_str())) {
+            previous_value_ = previous;
+        }
+        if (value != nullptr) {
+            setenv(name_.c_str(), value, 1);
+        } else {
+            unsetenv(name_.c_str());
+        }
+    }
+
+    ~ScopedEnvVar() {
+        if (previous_value_.has_value()) {
+            setenv(name_.c_str(), previous_value_->c_str(), 1);
+        } else {
+            unsetenv(name_.c_str());
+        }
+    }
+
+    ScopedEnvVar(const ScopedEnvVar&) = delete;
+    ScopedEnvVar& operator=(const ScopedEnvVar&) = delete;
+
+   private:
+    std::string name_;
+    std::optional<std::string> previous_value_;
+};
 
 // Helper functions for client_id parsing
 std::string FormatClientId(const UUID& client_id) {
@@ -1844,6 +1876,105 @@ TEST_F(ClientIntegrationTest, MountSegmentAndGetIdAndUnmountSegmentById) {
 
     free(test_buffer);
 }
+
+TEST_F(ClientIntegrationTest,
+       MountSegmentMasterFailureCompensatesTransferEngineRegistration) {
+    ScopedEnvVar rpc_timeout("MC_RPC_TIMEOUT_MS", "500");
+    ScopedEnvVar use_tent("MC_USE_TENT", nullptr);
+    ScopedEnvVar use_tev1("MC_USE_TEV1", nullptr);
+
+    InProcMaster isolated_master;
+    ASSERT_TRUE(isolated_master.Start(InProcMasterConfigBuilder().build()));
+
+    const std::string local_hostname =
+        "127.0.0.1:" + std::to_string(getFreeTcpPort());
+    auto [host, port] = parseHostNameWithPort(local_hostname);
+    auto transfer_engine = std::make_shared<TransferEngine>();
+    ASSERT_EQ(transfer_engine->init(P2PHANDSHAKE, local_hostname, host, port),
+              0);
+    ASSERT_NE(transfer_engine->installTransport("tcp", nullptr), nullptr);
+
+    auto client_opt =
+        Client::Create(local_hostname, P2PHANDSHAKE, "tcp", std::nullopt,
+                       isolated_master.master_address(), transfer_engine);
+    ASSERT_TRUE(client_opt.has_value());
+    auto client = client_opt.value();
+
+    constexpr size_t kTestSize = 16 * 1024 * 1024;
+    void* test_buffer = allocate_buffer_allocator_memory(kTestSize);
+    ASSERT_NE(test_buffer, nullptr);
+
+    isolated_master.Stop();
+    auto mount_result =
+        client->MountSegmentAndGetId(test_buffer, kTestSize, "tcp", "cpu:0");
+    ASSERT_FALSE(mount_result.has_value());
+    EXPECT_EQ(mount_result.error(), ErrorCode::RPC_FAIL);
+
+    auto local_desc =
+        transfer_engine->getMetadata()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(local_desc, nullptr);
+    auto published_buffer = std::find_if(
+        local_desc->buffers.begin(), local_desc->buffers.end(),
+        [test_buffer](const TransferMetadata::BufferDesc& buffer) {
+            return buffer.addr == reinterpret_cast<uintptr_t>(test_buffer);
+        });
+    EXPECT_EQ(published_buffer, local_desc->buffers.end());
+
+    EXPECT_TRUE(client->UnregisterLocalMemoryIfPresent(test_buffer).has_value())
+        << "The outer rollback handoff must accept an already compensated "
+           "registration";
+
+    auto register_result = client->RegisterLocalMemory(test_buffer, kTestSize,
+                                                       "cpu:0", true, true);
+    EXPECT_TRUE(register_result.has_value())
+        << "Compensated address must be registerable again";
+    if (register_result.has_value()) {
+        EXPECT_TRUE(client->unregisterLocalMemory(test_buffer).has_value());
+    } else {
+        transfer_engine->unregisterLocalMemory(test_buffer);
+    }
+
+    free(test_buffer);
+}
+
+TEST_F(ClientIntegrationTest, NvlinkInitializationWithAutoDiscoveryEnabled) {
+    ScopedEnvVar auto_discovery("MC_MS_AUTO_DISC", "1");
+    ScopedEnvVar use_tent("MC_USE_TENT", nullptr);
+    ScopedEnvVar use_tev1("MC_USE_TEV1", nullptr);
+
+    const std::string local_hostname =
+        "127.0.0.1:" + std::to_string(getFreeTcpPort());
+    auto client_opt = Client::Create(local_hostname, P2PHANDSHAKE, "nvlink",
+                                     std::nullopt, master_address_);
+    EXPECT_TRUE(client_opt.has_value());
+}
+
+#ifdef USE_MNNVL
+TEST_F(ClientIntegrationTest, NvlinkInitializationWithAutoDiscoveryDisabled) {
+    ScopedEnvVar auto_discovery("MC_MS_AUTO_DISC", "0");
+    ScopedEnvVar use_tent("MC_USE_TENT", nullptr);
+    ScopedEnvVar use_tev1("MC_USE_TEV1", nullptr);
+
+    const std::string local_hostname =
+        "127.0.0.1:" + std::to_string(getFreeTcpPort());
+    auto client_opt = Client::Create(local_hostname, P2PHANDSHAKE, "nvlink",
+                                     "ignored-device", master_address_);
+    EXPECT_TRUE(client_opt.has_value());
+}
+#else
+TEST_F(ClientIntegrationTest,
+       NvlinkInitializationWithAutoDiscoveryDisabledRejectsUnsupportedBuild) {
+    ScopedEnvVar auto_discovery("MC_MS_AUTO_DISC", "0");
+    ScopedEnvVar use_tent("MC_USE_TENT", nullptr);
+    ScopedEnvVar use_tev1("MC_USE_TEV1", nullptr);
+
+    const std::string local_hostname =
+        "127.0.0.1:" + std::to_string(getFreeTcpPort());
+    auto client_opt = Client::Create(local_hostname, P2PHANDSHAKE, "nvlink",
+                                     "ignored-device", master_address_);
+    EXPECT_FALSE(client_opt.has_value());
+}
+#endif
 
 }  // namespace testing
 

@@ -31,6 +31,8 @@
 namespace mooncake {
 
 class PutOperation;
+class RealClient;
+class EgmStorePoolStoreTestPeer;
 
 /**
  * @brief Result of a query operation containing replica information and lease
@@ -348,6 +350,14 @@ class Client {
         void* addr, bool update_metadata = true);
 
     /**
+     * @brief Idempotent unregister used by setup rollback handoffs.
+     *        A buffer already removed by an inner compensation step is
+     *        considered successfully cleaned; all other errors are preserved.
+     */
+    tl::expected<void, ErrorCode> UnregisterLocalMemoryIfPresent(
+        void* addr, bool update_metadata = true);
+
+    /**
      * @brief Checks if an object exists
      * @param key Key to check
      * @return ErrorCode::OK if exists, ErrorCode::OBJECT_NOT_FOUND if not
@@ -551,6 +561,58 @@ class Client {
         }
     }
 
+    void ObserveEgmStorePoolCapacity(uint64_t requested_bytes,
+                                     uint64_t effective_bytes) {
+        if (metrics_ != nullptr) {
+            metrics_->ObserveEgmStorePoolCapacity(requested_bytes,
+                                                  effective_bytes);
+        }
+    }
+
+    void ObserveEgmStorePoolNode(int numa_node, uint64_t effective_bytes,
+                                 uint64_t chunk_count) {
+        if (metrics_ != nullptr) {
+            metrics_->ObserveEgmStorePoolNode(numa_node, effective_bytes,
+                                              chunk_count);
+        }
+    }
+
+    void ObserveEgmStorePoolStage(EgmStorePoolStage stage, uint64_t duration_us,
+                                  bool success) {
+        if (metrics_ != nullptr) {
+            metrics_->ObserveEgmStorePoolStage(stage, duration_us, success);
+        }
+    }
+
+    void ObserveEgmStorePoolRollback(bool success) {
+        if (metrics_ != nullptr) {
+            metrics_->ObserveEgmStorePoolRollback(success);
+        }
+    }
+
+    void ObserveEgmStorePoolCleanup(bool success, uint64_t pending_allocations,
+                                    uint64_t pending_bytes) {
+        if (metrics_ != nullptr) {
+            metrics_->ObserveEgmStorePoolCleanup(success, pending_allocations,
+                                                 pending_bytes);
+        }
+    }
+
+    void SetEgmStorePoolProcessQuarantine(uint64_t clients,
+                                          uint64_t allocations,
+                                          uint64_t bytes) {
+        if (metrics_ != nullptr) {
+            metrics_->SetEgmStorePoolProcessQuarantine(clients, allocations,
+                                                       bytes);
+        }
+    }
+
+    void ObserveMountSegmentCompensationFailure() {
+        if (metrics_ != nullptr) {
+            metrics_->ObserveMountSegmentCompensationFailure();
+        }
+    }
+
     // For Prometheus-style metrics
     tl::expected<std::string, ErrorCode> SerializeMetrics() {
         if (metrics_ == nullptr) {
@@ -558,6 +620,9 @@ class Client {
         }
         std::string str;
         metrics_->serialize(str);
+        if (transfer_engine_ != nullptr) {
+            transfer_engine_->appendTransportMetrics(str);
+        }
         return str;
     }
 
@@ -570,6 +635,15 @@ class Client {
     }
 
     [[nodiscard]] const std::string& GetProtocol() const { return protocol_; }
+
+    [[nodiscard]] bool IsUsingTent() const {
+        return transfer_engine_ != nullptr && transfer_engine_->isUsingTent();
+    }
+
+    [[nodiscard]] bool IsNvlinkFabricTransportReady() const {
+        return transfer_engine_ != nullptr &&
+               transfer_engine_->isNvlinkFabricTransportReady();
+    }
 
     /**
      * @brief Get the endpoint address for segment operations.
@@ -660,6 +734,9 @@ class Client {
            const std::string& tenant_id = "default");
 
    private:
+    friend class RealClient;
+    friend class EgmStorePoolStoreTestPeer;
+
     /**
      * @brief Internal helper functions for initialization and data transfer
      */
@@ -792,6 +869,16 @@ class Client {
     // Mutex to protect mounted_segments_
     mutable std::mutex mounted_segments_mutex_;
     std::unordered_map<UUID, Segment, boost::hash<UUID>> mounted_segments_;
+    // Test-binary-only seam used to fail the Master step after the real TE
+    // registration has completed. An empty optional continues with the real
+    // Master RPC. This remains private so production callers cannot alter
+    // mount behavior.
+    std::function<std::optional<ErrorCode>(const Segment&)>
+        mount_segment_master_failure_for_test_;
+    // A normal unmount can complete at Master and then fail while removing the
+    // local TE registration. Remember that partial progress so a retry does
+    // not issue a second non-idempotent Master unmount.
+    std::unordered_set<UUID, boost::hash<UUID>> master_unmounted_segments_;
 
     // Segments in graceful unmount: readable by remote peers, not allocatable
     // locally. TE MR remains registered until master confirms removal.

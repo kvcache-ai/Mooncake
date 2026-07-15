@@ -4,12 +4,16 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstring>
+#include <future>
+#include <functional>
 #include <memory>
 #include <thread>
 #include <vector>
 
+#include "transport/transport.h"
 #include "types.h"
 
 namespace mooncake {
@@ -30,6 +34,218 @@ class TransferTaskTest : public ::testing::Test {
         google::ShutdownGoogleLogging();
     }
 };
+
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+class TransferEngineOperationStateTestPeer {
+   public:
+    static TransferFuture MakeFuture(
+        BatchID batch_id, size_t batch_size,
+        bool requires_periodic_status_polling,
+        std::function<Status(BatchID, size_t, TransferStatus&)> status_query,
+        std::function<Status(BatchID)> batch_releaser) {
+        auto state =
+            std::shared_ptr<OperationState>(new TransferEngineOperationState(
+                batch_id, batch_size, requires_periodic_status_polling,
+                std::move(status_query), std::move(batch_releaser)));
+        return TransferFuture(std::move(state));
+    }
+};
+
+namespace {
+
+class PollDrivenBatch {
+   public:
+    PollDrivenBatch(size_t slice_count, bool fail_first_slice,
+                    int polls_before_completion)
+        : polls_before_completion_(polls_before_completion),
+          batch_(new Transport::BatchDesc{}) {
+        batch_->id = reinterpret_cast<BatchID>(batch_);
+        batch_->batch_size = 1;
+        batch_->task_list.resize(1);
+
+        auto& task = batch_->task_list.front();
+        task.batch_id = batch_->id;
+        task.slice_count = slice_count;
+        for (size_t index = 0; index < slice_count; ++index) {
+            auto* slice = new Transport::Slice{};
+            slice->length = 64;
+            slice->status = Transport::Slice::POSTED;
+            slice->task = &task;
+            task.slice_list.push_back(slice);
+        }
+
+        if (fail_first_slice) {
+            batch_->task_list.front().slice_list.front()->markFailed();
+        }
+    }
+
+    ~PollDrivenBatch() {
+        if (batch_ != nullptr) {
+            delete batch_;
+        }
+    }
+
+    BatchID id() const { return reinterpret_cast<BatchID>(batch_); }
+
+    Status Query(BatchID batch_id, size_t task_id, TransferStatus& status) {
+        if (batch_ == nullptr || batch_id != id() || task_id != 0) {
+            return Status::InvalidArgument("unexpected fake batch query");
+        }
+
+        const int poll = polls_.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (poll >= polls_before_completion_) {
+            CompletePostedSlices();
+        }
+
+        auto& task = batch_->task_list.front();
+        const uint64_t success =
+            __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+        const uint64_t failed =
+            __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+        status.transferred_bytes =
+            __atomic_load_n(&task.transferred_bytes, __ATOMIC_ACQUIRE);
+        if (success + failed == task.slice_count) {
+            status.s = failed == 0 ? TransferStatusEnum::COMPLETED
+                                   : TransferStatusEnum::FAILED;
+        } else {
+            status.s = TransferStatusEnum::WAITING;
+        }
+        return Status::OK();
+    }
+
+    Status Release(BatchID batch_id) {
+        if (batch_ == nullptr || batch_id != id()) {
+            return Status::InvalidArgument("unexpected fake batch release");
+        }
+        if (!__atomic_load_n(&batch_->task_list.front().is_finished,
+                             __ATOMIC_ACQUIRE)) {
+            return Status::BatchBusy("fake batch still has outstanding work");
+        }
+        delete batch_;
+        batch_ = nullptr;
+        released_.store(true, std::memory_order_release);
+        return Status::OK();
+    }
+
+    void CompletePostedSlices() {
+        if (completion_started_.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
+        for (auto* slice : batch_->task_list.front().slice_list) {
+            if (slice->status == Transport::Slice::POSTED) {
+                slice->markSuccess();
+            }
+        }
+    }
+
+    int polls() const { return polls_.load(std::memory_order_relaxed); }
+    bool released() const { return released_.load(std::memory_order_acquire); }
+
+   private:
+    const int polls_before_completion_;
+    Transport::BatchDesc* batch_;
+    std::atomic<int> polls_{0};
+    std::atomic<bool> completion_started_{false};
+    std::atomic<bool> released_{false};
+};
+
+struct WaitOutcome {
+    bool completed_without_rescue;
+    ErrorCode result;
+};
+
+WaitOutcome WaitForFutureWithBoundedRescue(TransferFuture& future,
+                                           PollDrivenBatch& batch) {
+    std::promise<ErrorCode> result_promise;
+    auto result_future = result_promise.get_future();
+    std::thread waiter([&future, &result_promise] {
+        result_promise.set_value(future.wait());
+    });
+
+    const bool completed_without_rescue =
+        result_future.wait_for(std::chrono::milliseconds(500)) ==
+        std::future_status::ready;
+    if (!completed_without_rescue) {
+        // Keep a regression from making this test wait for the production
+        // 60-second deadline. Completing the final fake slice also exercises
+        // the real BatchDesc CV notification path and safely releases waiter.
+        batch.CompletePostedSlices();
+    }
+
+    const bool stopped = result_future.wait_for(std::chrono::seconds(1)) ==
+                         std::future_status::ready;
+    EXPECT_TRUE(stopped);
+    waiter.join();
+    return {completed_without_rescue, result_future.get()};
+}
+
+}  // namespace
+
+class TransferEngineEventDrivenCompletionTest : public TransferTaskTest {};
+
+TEST_F(TransferEngineEventDrivenCompletionTest,
+       FuturePollsPostedSliceWithoutExternalNotification) {
+    auto batch = std::make_shared<PollDrivenBatch>(1, false, 5);
+    {
+        auto future = TransferEngineOperationStateTestPeer::MakeFuture(
+            batch->id(), 1, true,
+            [batch](BatchID id, size_t task_id, TransferStatus& status) {
+                return batch->Query(id, task_id, status);
+            },
+            [batch](BatchID id) { return batch->Release(id); });
+
+        const auto outcome = WaitForFutureWithBoundedRescue(future, *batch);
+        EXPECT_TRUE(outcome.completed_without_rescue);
+        EXPECT_EQ(outcome.result, ErrorCode::OK);
+        EXPECT_GE(batch->polls(), 5);
+    }
+    EXPECT_TRUE(batch->released());
+}
+
+TEST_F(TransferEngineEventDrivenCompletionTest,
+       FutureDrainsPostedSliceAfterPartialSubmissionFailure) {
+    auto batch = std::make_shared<PollDrivenBatch>(2, true, 5);
+    {
+        auto future = TransferEngineOperationStateTestPeer::MakeFuture(
+            batch->id(), 1, true,
+            [batch](BatchID id, size_t task_id, TransferStatus& status) {
+                return batch->Query(id, task_id, status);
+            },
+            [batch](BatchID id) { return batch->Release(id); });
+
+        const auto outcome = WaitForFutureWithBoundedRescue(future, *batch);
+        EXPECT_TRUE(outcome.completed_without_rescue);
+        EXPECT_EQ(outcome.result, ErrorCode::TRANSFER_FAIL);
+        EXPECT_GE(batch->polls(), 5);
+    }
+    EXPECT_TRUE(batch->released());
+}
+
+TEST_F(TransferEngineEventDrivenCompletionTest,
+       NonNvlinkBatchWaitsForNotificationWithoutHighFrequencyPolling) {
+    auto batch = std::make_shared<PollDrivenBatch>(1, false, 1000000);
+    std::thread completer([batch] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        batch->CompletePostedSlices();
+    });
+    {
+        auto future = TransferEngineOperationStateTestPeer::MakeFuture(
+            batch->id(), 1, false,
+            [batch](BatchID id, size_t task_id, TransferStatus& status) {
+                return batch->Query(id, task_id, status);
+            },
+            [batch](BatchID id) { return batch->Release(id); });
+
+        const auto outcome = WaitForFutureWithBoundedRescue(future, *batch);
+        EXPECT_TRUE(outcome.completed_without_rescue);
+        EXPECT_EQ(outcome.result, ErrorCode::OK);
+        EXPECT_LT(batch->polls(), 10)
+            << "a CV-driven non-NVLink batch must not be scanned every 1 ms";
+        completer.join();
+    }
+    EXPECT_TRUE(batch->released());
+}
+#endif
 
 // Test basic MemcpyOperation functionality
 TEST_F(TransferTaskTest, MemcpyOperationBasic) {

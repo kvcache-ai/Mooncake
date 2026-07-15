@@ -196,6 +196,14 @@ The following protocols are available at the C++ Transfer Engine level for speci
 - NVIDIA MNNVL hardware
 - Compiled with `USE_MNNVL=ON`
 
+Mooncake Store can additionally expose an Extended GPU Memory (EGM) DRAM pool
+over this transport. The pool is implemented with CUDA VMM `HOST_NUMA`
+allocations; the NUMA ID selects Provider-side CPU DRAM placement and does not
+define a separate transport. This mode is default-off and is configured through
+the Python `setup(config_dict)` overload; see
+[EGM Store Pool](../deployment/egm-store-pool.md) for its hardware
+prerequisites, API boundary, lifecycle rules, and deployment constraints.
+
 **Configuration:**
 ```bash
 # Set MC_FORCE_MNNVL=true to use MNNVL even when RDMA NICs are present

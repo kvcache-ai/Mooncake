@@ -296,8 +296,9 @@ TEST_F(RealClientTest, GetIntoAcceptsSubrangeOfLocalRegisteredBuffer) {
     config.replica_num = 1;
     ASSERT_EQ(py_client_->put(key, data_span, config), 0);
 
-    auto local_alloc =
-        py_client_->client_buffer_allocator_->allocate(test_data.size() + 32);
+    auto allocator = py_client_->SnapshotClientBufferAllocator();
+    ASSERT_NE(allocator, nullptr);
+    auto local_alloc = allocator->allocate(test_data.size() + 32);
     ASSERT_TRUE(local_alloc.has_value());
     BufferHandle handle = std::move(*local_alloc);
     auto* dst = static_cast<char*>(handle.ptr()) + 16;

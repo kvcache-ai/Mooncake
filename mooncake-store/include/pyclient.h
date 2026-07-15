@@ -38,7 +38,9 @@ enum HealthCheckStatus : int {
     HC_HEALTHY = 0,          // Fully connected, all links up
     HC_NOT_INITIALIZED = 1,  // Not initialized or already closed
     HC_MASTER_UNREACHABLE =
-        2  // Master (or RealClient for DummyClient) unreachable
+        2,  // Master (or RealClient for DummyClient) unreachable
+    HC_CLEANUP_PENDING = 3,     // Teardown failed; close must be retried
+    HC_PROCESS_QUARANTINED = 4  // A destroyed client retained VMM ownership
 };
 
 template <typename ResultValue, typename ErrorFactory>
@@ -369,6 +371,16 @@ class PyClient {
 
     virtual tl::expected<QueryTaskResponse, ErrorCode> query_task(
         const UUID &task_id) = 0;
+
+    // Readers must take an atomic shared_ptr snapshot before inspecting or
+    // allocating from the client buffer allocator. The returned shared_ptr is
+    // also a lifetime lease: allocator teardown cannot complete while a
+    // reader still holds it.
+    [[nodiscard]] std::shared_ptr<ClientBufferAllocator>
+    SnapshotClientBufferAllocator() const {
+        return std::atomic_load_explicit(&client_buffer_allocator_,
+                                         std::memory_order_acquire);
+    }
 
     std::shared_ptr<mooncake::Client> client_ = nullptr;
     std::shared_ptr<mooncake::ClientRequester> client_requester_ = nullptr;

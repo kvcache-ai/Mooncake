@@ -36,6 +36,7 @@ std::vector<int> batch_write_tensor_impl(const std::vector<std::string> &keys,
         std::vector<size_t> buffer_sizes;
         std::vector<size_t> original_indices;
         std::vector<std::unique_ptr<BufferHandle>> temp_allocations;
+        auto allocator = store_->SnapshotClientBufferAllocator();
 
         for (size_t i = 0; i < infos.size(); ++i) {
             if (!infos[i].valid()) {
@@ -46,7 +47,7 @@ std::vector<int> batch_write_tensor_impl(const std::vector<std::string> &keys,
             size_t total_size =
                 infos[i].metadata.header.data_offset + infos[i].tensor_size;
             auto alloc_result =
-                store_->client_buffer_allocator_->allocate(total_size);
+                allocator ? allocator->allocate(total_size) : std::nullopt;
 
             if (!alloc_result) {
                 LOG(ERROR) << "Failed to allocate buffer for " << operation_name

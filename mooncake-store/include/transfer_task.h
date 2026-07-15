@@ -4,6 +4,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -213,12 +214,20 @@ class TransferEngineOperationState : public OperationState {
    public:
     TransferEngineOperationState(TransferEngine& engine, BatchID batch_id,
                                  size_t batch_size)
-        : engine_(engine),
+        : engine_(&engine),
           batch_id_(batch_id),
           batch_size_(batch_size),
           start_ts_(getCurrentTimeInMilli()) {}
 
-    ~TransferEngineOperationState() { engine_.freeBatchID(batch_id_); }
+    ~TransferEngineOperationState() {
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+        if (batch_releaser_for_test_) {
+            batch_releaser_for_test_(batch_id_);
+            return;
+        }
+#endif
+        engine_->freeBatchID(batch_id_);
+    }
 
     bool is_completed() override;
 
@@ -229,6 +238,27 @@ class TransferEngineOperationState : public OperationState {
     }
 
    private:
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+    friend class TransferEngineOperationStateTestPeer;
+
+    // Narrow dependency seam for the event-driven Future/CV unit tests. The
+    // production constructor above continues to call TransferEngine directly.
+    TransferEngineOperationState(
+        BatchID batch_id, size_t batch_size,
+        bool requires_periodic_status_polling_for_test,
+        std::function<Status(BatchID, size_t, TransferStatus&)>
+            status_query_for_test,
+        std::function<Status(BatchID)> batch_releaser_for_test)
+        : engine_(nullptr),
+          batch_id_(batch_id),
+          batch_size_(batch_size),
+          start_ts_(getCurrentTimeInMilli()),
+          requires_periodic_status_polling_for_test_(
+              requires_periodic_status_polling_for_test),
+          status_query_for_test_(std::move(status_query_for_test)),
+          batch_releaser_for_test_(std::move(batch_releaser_for_test)) {}
+#endif
+
     /**
      * @brief Check the current completion status of the task, make sure to lock
      * the mutex before calling this function.
@@ -238,10 +268,16 @@ class TransferEngineOperationState : public OperationState {
 
     void set_result_internal(ErrorCode error_code);
 
-    TransferEngine& engine_;
+    TransferEngine* engine_;
     BatchID batch_id_;
     size_t batch_size_;
     const int64_t start_ts_;
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+    bool requires_periodic_status_polling_for_test_ = false;
+    std::function<Status(BatchID, size_t, TransferStatus&)>
+        status_query_for_test_;
+    std::function<Status(BatchID)> batch_releaser_for_test_;
+#endif
 };
 
 /**

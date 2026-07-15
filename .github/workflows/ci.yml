@@ -188,12 +188,31 @@ jobs:
         kill $MASTER_PID 2>/dev/null || true
       shell: bash
 
+    - name: Gate EGM Store Pool unit tests
+      run: |
+        cd build
+        export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+        discovered_tests="$(ctest -N -L egm_store_pool_unit)"
+        printf '%s\n' "$discovered_tests"
+        test_count="$(
+          awk '$1 == "Total" && $2 == "Tests:" {print $3}' \
+            <<<"$discovered_tests"
+        )"
+        if [[ ! "$test_count" =~ ^[1-9][0-9]*$ ]]; then
+          echo "::error::No egm_store_pool_unit tests were discovered"
+          exit 1
+        fi
+        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata \
+          DEFAULT_KV_LEASE_TTL=500 \
+          ctest -L egm_store_pool_unit --output-on-failure
+      shell: bash
+
     - name: Test (in build env) with coverage
       run: |
         cd build
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
         ldconfig -v || echo "always continue"
-        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 ctest -j --output-on-failure
+        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 ctest -j -LE egm_store_pool_unit --output-on-failure
       shell: bash
 
     - name: Drain HTTP E2E test
@@ -395,7 +414,14 @@ jobs:
         sudo cmake --install .
       shell: bash
 
-    - name: Gate NVLink VMM unit tests
+    - name: Start Metadata Server
+      run: |
+        cd mooncake-transfer-engine/example/http-metadata-server-python
+        pip install aiohttp
+        python ./bootstrap_server.py &
+      shell: bash
+
+    - name: Gate NVLink VMM and EGM Store Pool unit tests
       run: |
         cuda_driver_stub=""
         for stub_dir in /usr/local/cuda/lib64/stubs /usr/local/cuda/targets/*/lib/stubs; do
@@ -415,17 +441,20 @@ jobs:
         export LD_LIBRARY_PATH="$cuda_driver_stub_runtime:$(dirname "$cuda_driver_stub"):/usr/local/cuda/lib64:/usr/local/lib:${LD_LIBRARY_PATH:-}"
 
         cd build
-        discovered_tests="$(ctest -N -L nvlink_vmm_unit)"
-        printf '%s\n' "$discovered_tests"
-        test_count="$(
-          awk '$1 == "Total" && $2 == "Tests:" {print $3}' \
-            <<<"$discovered_tests"
-        )"
-        if [[ ! "$test_count" =~ ^[1-9][0-9]*$ ]]; then
-          echo "::error::No nvlink_vmm_unit tests were discovered"
-          exit 1
-        fi
-        ctest -L nvlink_vmm_unit --output-on-failure
+        for label in nvlink_vmm_unit egm_store_pool_unit; do
+          discovered_tests="$(ctest -N -L "$label")"
+          printf '%s\n' "$discovered_tests"
+          test_count="$(
+            awk '$1 == "Total" && $2 == "Tests:" {print $3}' \
+              <<<"$discovered_tests"
+          )"
+          if [[ ! "$test_count" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::No $label tests were discovered"
+            exit 1
+          fi
+          MC_METADATA_SERVER=http://127.0.0.1:8080/metadata \
+            ctest -L "$label" --output-on-failure
+        done
       shell: bash
 
     - name: Run sccache stat for check

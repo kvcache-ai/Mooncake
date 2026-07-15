@@ -3,8 +3,11 @@
 #include <atomic>
 #include <boost/lockfree/queue.hpp>
 #include <csignal>
+#include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -16,6 +19,7 @@
 #include "client_service.h"
 #include "client_buffer.h"
 #include "mutex.h"
+#include "egm_store_pool_orchestrator.h"
 #include "utils.h"
 #include "rpc_types.h"
 #if defined(USE_SUNRISE)
@@ -31,6 +35,9 @@ namespace mooncake {
 class RealClient;
 class UdsAcceptor;
 class UdsConnection;
+class ProductionEgmStorePoolOperations;
+struct EgmStorePoolOptions;
+class EgmStorePoolStoreTestPeer;
 
 // Global resource tracker to handle cleanup on abnormal termination
 class ResourceTracker {
@@ -855,6 +862,18 @@ class RealClient : public PyClient {
     std::unordered_map<void *, size_t> registered_buffer_sizes_;
     std::optional<WritableBufferRegion> local_buffer_region_;
 
+    bool egm_store_pool_enabled_ = false;
+    std::atomic<bool> egm_store_pool_cleanup_pending_{false};
+    std::vector<EgmStorePoolGlobalRecord> egm_store_pool_globals_;
+    std::optional<EgmStorePoolLocalRecord> egm_store_pool_local_;
+    std::unique_ptr<EgmStorePoolProcessQuarantineNode>
+        egm_store_pool_quarantine_node_;
+
+    tl::expected<void, ErrorCode> SetupEgmStorePool(
+        const EgmStorePoolOptions &options, size_t global_segment_size,
+        size_t local_buffer_size);
+    bool CleanupEgmStorePool(bool rollback);
+
     // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.
     bool map_dummy_range_in_shm(const MappedShm &shm, uint64_t dummy_addr,
                                 size_t offset, size_t size,
@@ -924,6 +943,38 @@ class RealClient : public PyClient {
         size_t local_buffer_size);
 
    private:
+    friend class ProductionEgmStorePoolOperations;
+    friend class EgmStorePoolStoreTestPeer;
+
+    tl::expected<void, ErrorCode> setup_internal_with_egm_store_pool(
+        const std::string &local_hostname, const std::string &metadata_server,
+        size_t global_segment_size, size_t local_buffer_size,
+        const std::string &protocol, const std::string &rdma_devices,
+        const std::string &master_server_addr,
+        const std::shared_ptr<TransferEngine> &transfer_engine,
+        const std::string &ipc_socket_path, int local_rpc_port,
+        bool enable_ssd_offload, bool start_offload_rpc_server,
+        const std::string &ssd_offload_path, const std::string &tenant_id,
+        bool enable_client_http_server, int client_http_port,
+        const EgmStorePoolOptions *egm_store_pool_options);
+
+    void PublishClientBufferAllocator(
+        std::shared_ptr<ClientBufferAllocator> allocator);
+    std::optional<BufferHandle> AllocateClientBuffer(size_t size);
+    tl::expected<void, ErrorCode> ReleaseEgmStorePoolAllocatorView(
+        const std::function<void()> &after_exchange_for_test = {});
+
+    // Tracks allocator ownership independently of the exported allocation
+    // records so setup cannot overwrite a cleanup-pending allocator.
+    bool egm_store_pool_allocator_installed_ = false;
+
+    // Test-binary-only fault injection forwarded to Client immediately before
+    // EGM Store Pool mount publication. Client invokes it only after the real
+    // TE registration succeeds and before the Master RPC. It is deliberately
+    // private and has no ConfigDict/environment surface.
+    std::function<std::optional<ErrorCode>(const Segment &)>
+        egm_store_pool_master_mount_failure_for_test_;
+
     std::unordered_map<std::string, MountedSegmentRecord>
         mounted_segment_records_;
     std::mutex mounted_segment_records_mutex_;

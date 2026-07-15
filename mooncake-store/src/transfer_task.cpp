@@ -744,7 +744,13 @@ void TransferEngineOperationState::check_task_status() {
 
     for (size_t i = 0; i < batch_size_; ++i) {
         TransferStatus status;
-        Status s = engine_.getTransferStatus(batch_id_, i, status);
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+        Status s = status_query_for_test_
+                       ? status_query_for_test_(batch_id_, i, status)
+                       : engine_->getTransferStatus(batch_id_, i, status);
+#else
+        Status s = engine_->getTransferStatus(batch_id_, i, status);
+#endif
         if (!s.ok()) {
             LOG(ERROR) << "Failed to get transfer status for batch "
                        << batch_id_ << " task " << i << " with error "
@@ -822,57 +828,80 @@ void TransferEngineOperationState::wait_for_completion() {
 #ifdef USE_EVENT_DRIVEN_COMPLETION
     VLOG(1) << "Waiting for transfer engine completion for batch " << batch_id_;
 
-    // Wait directly on BatchDesc's condition variable.
+    // Event-driven transports notify this condition variable directly. NVLink
+    // async copies are different: their POSTED slices only become terminal
+    // when getTransferStatus() polls cudaStreamQuery(). Use a short, bounded
+    // fallback interval only for batches that contain that transport; keeping
+    // pure RDMA/EFA/etc. batches on their normal CV wait preserves the purpose
+    // of event-driven completion.
     auto& batch_desc = Transport::toBatchDesc(batch_id_);
-    bool completed;
-    bool failed = false;
+    constexpr std::chrono::milliseconds progress_interval(1);
 
-    // Fast path: if already finished, avoid taking the mutex and waiting.
-    // Use acquire here to pair with the writer's release-store, because this
-    // path may skip taking the mutex. It ensures all prior updates are visible.
-    completed = batch_desc.is_finished.load(std::memory_order_acquire);
-    if (!completed) {
-        // Use the same mutex as the notifier when updating the predicate to
-        // avoid missed notifications. The predicate is re-checked under the
-        // lock. Under the mutex, relaxed is sufficient; the mutex acquire
-        // orders prior writes.
-        std::unique_lock<std::mutex> lock(batch_desc.completion_mutex);
+    const bool requires_periodic_status_polling =
+        status_query_for_test_
+            ? requires_periodic_status_polling_for_test_
+            : std::any_of(batch_desc.task_list.begin(),
+                          batch_desc.task_list.end(),
+                          [](const Transport::TransferTask& task) {
+                              return task.requires_periodic_status_polling;
+                          });
+
+    auto drive_progress = [this]() -> std::optional<ErrorCode> {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!result_.has_value()) {
+            // This scans every task even after observing a failure, so a batch
+            // containing FAILED and POSTED slices remains alive until all
+            // outstanding CUDA work reaches a terminal state.
+            check_task_status();
+        }
+        return result_;
+    };
+
+    while (true) {
+        if (auto result = drive_progress(); result.has_value()) {
+            VLOG(1) << "Transfer engine operation completed for batch "
+                    << batch_id_
+                    << " with result: " << static_cast<int>(result.value());
+            return;
+        }
+
         const int64_t elapsed_milliseconds =
             getCurrentTimeInMilli() - start_ts_;
-        if (elapsed_milliseconds < timeout_milliseconds) {
-            completed = batch_desc.completion_cv.wait_for(
-                lock,
-                std::chrono::milliseconds(timeout_milliseconds -
-                                          elapsed_milliseconds),
-                [&batch_desc] {
-                    return batch_desc.is_finished.load(
-                        std::memory_order_relaxed);
-                });
+        if (elapsed_milliseconds >= timeout_milliseconds) {
+            break;
         }
-    }  // Explicitly release completion_mutex before acquiring mutex_
 
-    // Once completion is observed, read failure flag.
-    if (completed) {
-        failed = batch_desc.has_failure.load(std::memory_order_relaxed);
+        const auto remaining = std::chrono::milliseconds(timeout_milliseconds -
+                                                         elapsed_milliseconds);
+        const auto wait_duration = requires_periodic_status_polling
+                                       ? std::min(progress_interval, remaining)
+                                       : remaining;
+
+        // Do not hold mutex_ while waiting on completion_mutex. A status query
+        // may mark the final slice and take completion_mutex to publish the
+        // batch, so keeping the lock scopes disjoint avoids lock inversion.
+        std::unique_lock<std::mutex> lock(batch_desc.completion_mutex);
+        batch_desc.completion_cv.wait_for(lock, wait_duration, [&batch_desc] {
+            return batch_desc.is_finished.load(std::memory_order_relaxed);
+        });
     }
 
-    ErrorCode error_code =
-        completed ? (failed ? ErrorCode::TRANSFER_FAIL : ErrorCode::OK)
-                  : ErrorCode::TRANSFER_FAIL;
+    // One final progress pass closes the race where CUDA completed at the
+    // deadline but no notification was emitted before the timed wait expired.
+    if (auto result = drive_progress(); result.has_value()) {
+        VLOG(1) << "Transfer engine operation completed for batch " << batch_id_
+                << " with result: " << static_cast<int>(result.value());
+        return;
+    }
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        set_result_internal(error_code);
+        if (!result_.has_value()) {
+            set_result_internal(ErrorCode::TRANSFER_FAIL);
+        }
     }
-
-    if (completed) {
-        VLOG(1) << "Transfer engine operation completed for batch " << batch_id_
-                << " with result: " << static_cast<int>(error_code);
-    } else {
-        LOG(ERROR) << "Failed to complete transfers after "
-                   << timeout_milliseconds << " milliseconds for batch "
-                   << batch_id_;
-    }
+    LOG(ERROR) << "Failed to complete transfers after " << timeout_milliseconds
+               << " milliseconds for batch " << batch_id_;
 #else
     VLOG(1) << "Starting transfer engine polling for batch " << batch_id_;
 

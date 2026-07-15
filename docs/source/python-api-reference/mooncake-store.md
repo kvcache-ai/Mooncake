@@ -1102,6 +1102,18 @@ store.setup("localhost", "http://localhost:8080/metadata", 512*1024*1024, 128*10
 
 </details>
 
+The class also provides a configuration-dictionary overload:
+
+```python
+def setup(self, config: Dict[str, object]) -> int
+```
+
+This is currently the only public binding that exposes
+`enable_egm_store_pool` and `egm_numa_nodes`. The fixed-argument
+overload above, C ABI, Rust API, and Go API do not expose EGM Store Pool
+controls. See [EGM Store Pool](../deployment/egm-store-pool.md) for the
+complete contract and an example.
+
 ---
 #### setup_dummy()
 Initialize the store with a dummy client for testing purposes.
@@ -2002,19 +2014,53 @@ store.close()
 ---
 
 #### close()
-Clean up all resources and terminate connections.
+Clean up all resources and terminate connections. If cleanup fails, the Store
+object remains attached so the same method can be called again.
 
 ```python
 def close(self) -> int
 ```
 
 **Returns:**
-- `int`: Status code (0 = success, non-zero = error code)
+- `int`: Status code (0 = success, non-zero = error code). A nonzero result
+  must not be ignored: retain the object, check `health_check()`, and retry
+  `close()` after the blocking condition clears.
 
 **Example:**
 ```python
-store.close()
+import time
+
+for attempt in range(3):
+    if store.close() == 0:
+        break
+    if store.health_check() != 3:  # HC_CLEANUP_PENDING
+        raise RuntimeError("store close failed")
+    time.sleep(1)
+else:
+    raise RuntimeError("store cleanup is still pending")
 ```
+
+For EGM Store Pool, health code `3` means teardown is degraded and still owns
+VMM allocations. Destroying the Python object in this state moves those owners
+to a process-lifetime quarantine and prevents new EGM Store Pool setup until the
+process restarts; subsequent Store instances report health code `4`.
+
+---
+#### health_check()
+Report Store connectivity and lifecycle health.
+
+```python
+def health_check(self) -> int
+```
+
+**Returns:**
+- `0` (`HC_HEALTHY`): initialized and connected to the Master.
+- `1` (`HC_NOT_INITIALIZED`): not initialized or already closed.
+- `2` (`HC_MASTER_UNREACHABLE`): the Master is unreachable.
+- `3` (`HC_CLEANUP_PENDING`): teardown retains resources and `close()` must be
+  retried on the same object.
+- `4` (`HC_PROCESS_QUARANTINED`): a destroyed client retained VMM ownership;
+  the process must be restarted before EGM Store Pool can be enabled again.
 
 ---
 #### put_from_with_metadata()

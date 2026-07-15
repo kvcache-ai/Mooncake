@@ -26,6 +26,8 @@ set(MOONCAKE_STORE_SOURCES
     posix_file.cpp
     client_buffer.cpp
     aligned_client_buffer.cpp
+    egm_store_pool.cpp
+    egm_store_pool_orchestrator.cpp
     real_client.cpp
     dummy_client.cpp
     uds_transport.cpp
@@ -119,9 +121,14 @@ find_library(
   PATHS /usr/lib /usr/local/lib /usr/lib64)
 set(KV_EVENTS_ZMQ_FOUND FALSE)
 if(ENABLE_KV_EVENTS)
-  find_library(ZMQ_LIBRARY NAMES zmq libzmq PATHS /usr/lib /usr/local/lib
-                                              /usr/lib64)
-  find_path(ZMQ_INCLUDE_DIR NAMES zmq.h PATHS /usr/include /usr/local/include)
+  find_library(
+    ZMQ_LIBRARY
+    NAMES zmq libzmq
+    PATHS /usr/lib /usr/local/lib /usr/lib64)
+  find_path(
+    ZMQ_INCLUDE_DIR
+    NAMES zmq.h
+    PATHS /usr/include /usr/local/include)
   if(ZMQ_INCLUDE_DIR AND ZMQ_LIBRARY)
     message(STATUS "Found ZMQ: include=${ZMQ_INCLUDE_DIR} lib=${ZMQ_LIBRARY}")
     list(APPEND MASTER_EXTRA_INCS ${ZMQ_INCLUDE_DIR})
@@ -132,7 +139,8 @@ if(ENABLE_KV_EVENTS)
     message(
       FATAL_ERROR
         "ENABLE_KV_EVENTS is ON but libzmq was not found. "
-        "Install libzmq3-dev or pass -DENABLE_KV_EVENTS=OFF to configure without ZMQ.")
+        "Install libzmq3-dev or pass -DENABLE_KV_EVENTS=OFF to configure without ZMQ."
+    )
   endif()
 endif()
 
@@ -408,12 +416,12 @@ if(USE_ASCEND
 endif()
 
 if(USE_SUNRISE)
-    target_link_libraries(mooncake_store PRIVATE
-        ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
-        ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
-    target_link_libraries(mooncake_client PRIVATE
-        ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
-        ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
+  target_link_libraries(
+    mooncake_store PRIVATE ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
+                           ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
+  target_link_libraries(
+    mooncake_client PRIVATE ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
+                            ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
 endif()
 
 install(TARGETS mooncake_master mooncake_client DESTINATION bin)

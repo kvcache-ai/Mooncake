@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cctype>
 #include <charconv>
+#include <exception>
 #include <functional>
 #include <limits>
 #include <optional>
@@ -23,6 +24,7 @@
 #include "replica_selection.h"
 #include "common.h"
 #include "config.h"
+#include "egm_store_pool.h"
 #include "mutex.h"
 #include "types.h"
 #include "utils.h"
@@ -33,6 +35,7 @@
 #include "uds_transport.h"
 #include "shm_helper.h"
 #include "memory_location.h"
+#include "transport/nvlink_transport/nvlink_vmm_allocation.h"
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
@@ -50,6 +53,22 @@ DEFINE_int32(http_port, 9300,
 namespace mooncake {
 namespace {
 constexpr std::chrono::seconds kIpcRequestRecvTimeout{5};
+
+class ScopeExit {
+   public:
+    explicit ScopeExit(std::function<void()> cleanup)
+        : cleanup_(std::move(cleanup)) {}
+    ScopeExit(const ScopeExit &) = delete;
+    ScopeExit &operator=(const ScopeExit &) = delete;
+    ~ScopeExit() {
+        if (active_) cleanup_();
+    }
+    void Release() { active_ = false; }
+
+   private:
+    std::function<void()> cleanup_;
+    bool active_ = true;
+};
 
 #ifdef USE_ASCEND_DIRECT
 bool checkAcl(aclError result, const char *message) {
@@ -302,6 +321,181 @@ inline QueryResult FilterQueryResult(const QueryResult &qr,
                                      const Replica::Descriptor &replica) {
     return QueryResult({replica}, qr.lease_timeout);
 }
+}  // namespace
+
+namespace {
+
+class ProductionEgmStorePoolAllocation final : public EgmStorePoolAllocation {
+   public:
+    explicit ProductionEgmStorePoolAllocation(
+        std::unique_ptr<NvlinkVmmAllocation> owner)
+        : owner_(std::move(owner)) {}
+
+    void *base() const override { return owner_->base(); }
+    size_t length() const override { return owner_->length(); }
+    size_t granularity() const override { return owner_->granularity(); }
+    Status Release() { return owner_->Release(); }
+
+   private:
+    std::unique_ptr<NvlinkVmmAllocation> owner_;
+};
+
+}  // namespace
+
+class ProductionEgmStorePoolOperations final : public EgmStorePoolOperations {
+   public:
+    explicit ProductionEgmStorePoolOperations(RealClient &owner)
+        : owner_(owner) {}
+
+    tl::expected<std::unique_ptr<EgmStorePoolAllocation>, ErrorCode> Allocate(
+        const EgmStorePoolAllocationRequest &request) override {
+        NvlinkVmmAllocation::Options options;
+        options.location_type = NvlinkVmmAllocation::LocationType::HOST_NUMA;
+        options.location_id = request.numa_node;
+        options.requested_length = request.requested_length;
+        options.fabric_exportable = request.fabric_exportable;
+        options.required_va_alignment = request.required_va_alignment;
+        options.access_observer = [this](uint64_t duration_us, bool success) {
+            if (owner_.client_) {
+                owner_.client_->ObserveEgmStorePoolStage(
+                    EgmStorePoolStage::kAccess, duration_us, success);
+            }
+        };
+
+        std::unique_ptr<NvlinkVmmAllocation> allocation;
+        Status status = NvlinkVmmAllocation::Create(options, allocation);
+        if (!status.ok() || allocation == nullptr) {
+            LOG(ERROR) << "EGM Store Pool "
+                       << (request.role == EgmStorePoolAllocationRole::kLocal
+                               ? "local"
+                               : "global")
+                       << " allocation failed for node " << request.numa_node
+                       << ", chunk=" << request.plan_index << ": " << status;
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        return std::unique_ptr<EgmStorePoolAllocation>(
+            new ProductionEgmStorePoolAllocation(std::move(allocation)));
+    }
+
+    tl::expected<void, ErrorCode> InstallAllocatorView(
+        EgmStorePoolAllocation *local_allocation,
+        size_t configured_local_length) override {
+        try {
+            std::shared_ptr<ClientBufferAllocator> allocator;
+            if (local_allocation != nullptr) {
+                allocator = ClientBufferAllocator::create(
+                    local_allocation->base(), configured_local_length,
+                    "nvlink");
+            } else {
+                allocator = ClientBufferAllocator::create(size_t{0}, "nvlink");
+            }
+            owner_.PublishClientBufferAllocator(std::move(allocator));
+        } catch (const std::exception &error) {
+            LOG(ERROR) << "EGM Store Pool allocator view creation failed: "
+                       << error.what();
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        return {};
+    }
+
+    tl::expected<void, ErrorCode> ReleaseAllocatorView() override {
+        return owner_.ReleaseEgmStorePoolAllocatorView();
+    }
+
+    tl::expected<void, ErrorCode> RegisterLocal(
+        void *base, size_t length, bool remote_accessible) override {
+        if (!owner_.client_) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        auto registered = owner_.client_->RegisterLocalMemory(
+            base, length, kWildcardLocation, remote_accessible, false);
+        if (!registered) return registered;
+
+        std::unique_lock<std::shared_mutex> lock(
+            owner_.registered_buffer_mutex_);
+        owner_.local_buffer_region_ = RealClient::WritableBufferRegion{
+            .base = base,
+            .size = length,
+            .offset = 0,
+        };
+        return {};
+    }
+
+    tl::expected<UUID, ErrorCode> MountGlobal(void *base,
+                                              size_t length) override {
+        if (!owner_.client_) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        return owner_.client_->MountSegmentAndGetId(base, length, "nvlink",
+                                                    kWildcardLocation);
+    }
+
+    tl::expected<void, ErrorCode> UnmountGlobal(
+        const UUID &segment_id) override {
+        if (!owner_.client_) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        return owner_.client_->UnmountSegmentById(segment_id);
+    }
+
+    tl::expected<void, ErrorCode> UnregisterIfPresent(
+        void *base, bool update_metadata) override {
+        if (!owner_.client_) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        return owner_.client_->UnregisterLocalMemoryIfPresent(base,
+                                                              update_metadata);
+    }
+
+    tl::expected<void, ErrorCode> Destroy(
+        std::unique_ptr<EgmStorePoolAllocation> &allocation) override {
+        auto *production_allocation =
+            dynamic_cast<ProductionEgmStorePoolAllocation *>(allocation.get());
+        if (production_allocation == nullptr) {
+            LOG(ERROR) << "EGM Store Pool destroy received an unknown "
+                          "allocation implementation";
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        try {
+            Status status = production_allocation->Release();
+            if (!status.ok()) {
+                LOG(ERROR) << "EGM Store Pool VMM release failed; retaining "
+                              "ownership for cleanup retry: "
+                           << status;
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+        } catch (const std::exception &error) {
+            LOG(ERROR) << "EGM Store Pool VMM release threw; retaining "
+                          "ownership for cleanup retry: "
+                       << error.what();
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        } catch (...) {
+            LOG(ERROR) << "EGM Store Pool VMM release threw an unknown "
+                          "exception; retaining ownership for cleanup retry";
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        allocation.reset();
+        return {};
+    }
+
+   private:
+    RealClient &owner_;
+};
+
+namespace {
+
+EgmStorePoolStage ToMetricStage(EgmStorePoolOrchestrationStage stage) {
+    switch (stage) {
+        case EgmStorePoolOrchestrationStage::kAllocation:
+            return EgmStorePoolStage::kAllocation;
+        case EgmStorePoolOrchestrationStage::kRegistration:
+            return EgmStorePoolStage::kRegistration;
+        case EgmStorePoolOrchestrationStage::kMount:
+            return EgmStorePoolStage::kMount;
+    }
+    return EgmStorePoolStage::kAllocation;
+}
+
 }  // namespace
 
 PyClient::~PyClient() {}
@@ -563,6 +757,11 @@ RealClient::RealClient() {
     mooncake::init_ylt_log_level();
     const char *hp = std::getenv("MC_STORE_USE_HUGEPAGE");
     use_hugepage_ = (hp != nullptr);
+    // Reserve the destructor's fail-closed ownership handoff before any CUDA
+    // resource exists. EGM Store Pool setup refuses to start if this allocation
+    // was unavailable, so teardown never depends on allocating under failure.
+    egm_store_pool_quarantine_node_ =
+        PrepareEgmStorePoolProcessQuarantineNode();
 }
 
 RealClient::~RealClient() {
@@ -572,7 +771,41 @@ RealClient::~RealClient() {
     }
     // Ensure resources are cleaned even if not explicitly closed
     stop_http_server();
-    tearDownAll_internal();
+    auto teardown = tearDownAll_internal();
+    // Include partial setup state even if the feature flag was cleared.
+    const bool retained_egm_store_pool_state =
+        egm_store_pool_enabled_ || !egm_store_pool_globals_.empty() ||
+        egm_store_pool_local_.has_value() ||
+        egm_store_pool_allocator_installed_;
+    if (!teardown && retained_egm_store_pool_state) {
+        // Cleanup could not prove that every published descriptor was removed.
+        // Deliberately quarantine the VMM mappings until process exit instead
+        // of letting member destruction recycle their virtual addresses while
+        // a stale Master/TE descriptor may still exist.
+        const auto ownership = GetEgmStorePoolOwnershipStats(
+            egm_store_pool_globals_, egm_store_pool_local_);
+        if (QuarantineEgmStorePoolOwnership(
+                std::move(egm_store_pool_quarantine_node_),
+                egm_store_pool_globals_, egm_store_pool_local_)) {
+            const auto process_stats = GetEgmStorePoolProcessQuarantineStats();
+            if (client_) {
+                client_->SetEgmStorePoolProcessQuarantine(
+                    process_stats.clients, process_stats.allocations,
+                    process_stats.bytes);
+            }
+            LOG(ERROR)
+                << "EGM Store Pool cleanup remained incomplete during "
+                   "destruction; quarantined allocations="
+                << ownership.allocations << " bytes=" << ownership.bytes
+                << ". This process is unhealthy and refuses new EGM Store Pool "
+                   "setup; restart is required";
+        } else {
+            LOG(ERROR) << "EGM Store Pool process quarantine node is missing; "
+                          "terminating rather than recycling a potentially "
+                          "published VMM address";
+            std::terminate();
+        }
+    }
 }
 
 std::shared_ptr<RealClient> RealClient::create() {
@@ -595,7 +828,275 @@ tl::expected<void, ErrorCode> RealClient::setup_ascend_internal(
     return {};
 }
 
-tl::expected<void, ErrorCode> RealClient::setup_internal(
+tl::expected<void, ErrorCode> RealClient::SetupEgmStorePool(
+    const EgmStorePoolOptions &options, size_t global_segment_size,
+    size_t local_buffer_size) {
+    auto observe_stage = [this](EgmStorePoolStage stage,
+                                std::chrono::steady_clock::time_point start,
+                                bool success) {
+        const auto elapsed =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - start)
+                .count();
+        client_->ObserveEgmStorePoolStage(
+            stage, static_cast<uint64_t>(std::max<int64_t>(elapsed, 0)),
+            success);
+    };
+
+    const auto process_quarantine = GetEgmStorePoolProcessQuarantineStats();
+    if (client_) {
+        client_->SetEgmStorePoolProcessQuarantine(
+            process_quarantine.clients, process_quarantine.allocations,
+            process_quarantine.bytes);
+    }
+    if (process_quarantine.clients != 0) {
+        LOG(ERROR)
+            << "EGM Store Pool setup refused because a destroyed "
+               "client left process-quarantined VMM ownership: clients="
+            << process_quarantine.clients
+            << " allocations=" << process_quarantine.allocations
+            << " bytes=" << process_quarantine.bytes
+            << "; restart the process before enabling EGM Store Pool again";
+        observe_stage(EgmStorePoolStage::kPreflight,
+                      std::chrono::steady_clock::now(), false);
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    if (!egm_store_pool_quarantine_node_) {
+        LOG(ERROR) << "EGM Store Pool setup cannot reserve its fail-closed "
+                      "process quarantine node";
+        observe_stage(EgmStorePoolStage::kPreflight,
+                      std::chrono::steady_clock::now(), false);
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    auto stage_start = std::chrono::steady_clock::now();
+    if (client_->IsUsingTent()) {
+        LOG(ERROR) << "EGM Store Pool V1 requires legacy NvlinkTransport; "
+                      "TENT is not supported";
+        observe_stage(EgmStorePoolStage::kPreflight, stage_start, false);
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!client_->IsNvlinkFabricTransportReady()) {
+        LOG(ERROR) << "EGM Store Pool V1 requires NvlinkTransport as the only "
+                      "installed transport with Fabric memory enabled; check "
+                      "MC_MS_AUTO_DISC/MC_FORCE_MNNVL and MC_USE_NVLINK_IPC";
+        observe_stage(EgmStorePoolStage::kPreflight, stage_start, false);
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    Status capability = NvlinkVmmAllocation::CheckStrictFabricCapability();
+    if (!capability.ok()) {
+        LOG(ERROR) << "EGM Store Pool Fabric preflight failed: " << capability;
+        observe_stage(EgmStorePoolStage::kPreflight, stage_start, false);
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    observe_stage(EgmStorePoolStage::kPreflight, stage_start, true);
+
+    auto environment = CreateProductionEgmStorePoolEnvironment();
+    stage_start = std::chrono::steady_clock::now();
+    auto global_nodes =
+        DiscoverEgmStorePoolNodes(options, global_segment_size, *environment);
+    if (!global_nodes) {
+        LOG(ERROR) << "EGM Store Pool node discovery failed: "
+                   << global_nodes.error();
+        observe_stage(EgmStorePoolStage::kDiscovery, stage_start, false);
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    std::vector<std::pair<int, size_t>> node_granularities;
+    node_granularities.reserve(global_nodes->size());
+    for (int node : *global_nodes) {
+        size_t granularity = 0;
+        Status status = NvlinkVmmAllocation::GetAllocationGranularity(
+            NvlinkVmmAllocation::LocationType::HOST_NUMA, node, true,
+            granularity);
+        if (!status.ok()) {
+            LOG(ERROR) << "EGM Store Pool granularity query failed for node "
+                       << node << ": " << status;
+            observe_stage(EgmStorePoolStage::kDiscovery, stage_start, false);
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        node_granularities.emplace_back(node, granularity);
+    }
+    observe_stage(EgmStorePoolStage::kDiscovery, stage_start, true);
+
+    EgmStorePoolPlan plan;
+    stage_start = std::chrono::steady_clock::now();
+    if (global_segment_size > 0) {
+        auto planned =
+            PlanEgmStorePoolCapacity(global_segment_size, node_granularities,
+                                     globalConfig().max_mr_size);
+        if (!planned) {
+            LOG(ERROR) << "EGM Store Pool capacity planning failed: "
+                       << planned.error();
+            observe_stage(EgmStorePoolStage::kPlanning, stage_start, false);
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        plan = std::move(*planned);
+    }
+    observe_stage(EgmStorePoolStage::kPlanning, stage_start, true);
+
+    int local_numa_node = -1;
+    int setup_cpu = -1;
+    stage_start = std::chrono::steady_clock::now();
+    if (local_buffer_size > 0) {
+        auto cpu = environment->CurrentCpu();
+        if (!cpu) {
+            LOG(ERROR) << "EGM Store Pool setup CPU resolution failed: "
+                       << cpu.error();
+            observe_stage(EgmStorePoolStage::kDiscovery, stage_start, false);
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        setup_cpu = *cpu;
+        auto node = environment->NumaNodeForCpu(setup_cpu);
+        if (!node || *node < 0 || !environment->IsNumaNodeOnline(*node)) {
+            LOG(ERROR) << "EGM Store Pool local node resolution failed for "
+                          "setup CPU "
+                       << setup_cpu
+                       << (node ? ": invalid/offline node " +
+                                      std::to_string(*node)
+                                : ": " + node.error());
+            observe_stage(EgmStorePoolStage::kDiscovery, stage_start, false);
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        local_numa_node = *node;
+    }
+    observe_stage(EgmStorePoolStage::kDiscovery, stage_start, true);
+
+    int current_cuda_device = -1;
+#ifdef USE_CUDA
+    if (cudaGetDevice(&current_cuda_device) != cudaSuccess) {
+        current_cuda_device = -1;
+    }
+#endif
+    LOG(INFO) << "EGM Store Pool locality setup_cpu=" << setup_cpu
+              << " local_numa=" << local_numa_node
+              << " current_cuda_device=" << current_cuda_device;
+
+    client_->ObserveEgmStorePoolCapacity(global_segment_size,
+                                         plan.effective_total);
+    for (const auto &node : plan.nodes) {
+        const uint64_t chunk_count = static_cast<uint64_t>(std::count_if(
+            plan.chunks.begin(), plan.chunks.end(),
+            [&](const auto &chunk) { return chunk.node_id == node.node_id; }));
+        client_->ObserveEgmStorePoolNode(
+            node.node_id, static_cast<uint64_t>(node.effective_bytes),
+            chunk_count);
+    }
+
+    const bool has_master_mount_test_hook =
+        static_cast<bool>(egm_store_pool_master_mount_failure_for_test_);
+    if (has_master_mount_test_hook) {
+        client_->mount_segment_master_failure_for_test_ =
+            egm_store_pool_master_mount_failure_for_test_;
+    }
+    ScopeExit clear_master_mount_test_hook(
+        [this, has_master_mount_test_hook]() {
+            if (has_master_mount_test_hook && client_) {
+                client_->mount_segment_master_failure_for_test_ = {};
+            }
+        });
+    ProductionEgmStorePoolOperations operations(*this);
+    auto orchestrated = SetupEgmStorePoolOrchestration(
+        operations, plan, local_numa_node, local_buffer_size,
+        egm_store_pool_globals_, egm_store_pool_local_,
+        egm_store_pool_allocator_installed_,
+        [this](EgmStorePoolOrchestrationStage stage, uint64_t duration_us,
+               bool success) {
+            client_->ObserveEgmStorePoolStage(ToMetricStage(stage), duration_us,
+                                              success);
+        });
+    if (!orchestrated) {
+        return tl::make_unexpected(orchestrated.error().error);
+    }
+
+    LOG(INFO) << "EGM Store Pool publication complete: requested="
+              << global_segment_size << " effective=" << plan.effective_total
+              << " chunks=" << plan.chunks.size() << " setup_cpu=" << setup_cpu
+              << " local_numa=" << local_numa_node;
+    return {};
+}
+
+bool RealClient::CleanupEgmStorePool(bool rollback) {
+    const auto cleanup_start = std::chrono::steady_clock::now();
+    ProductionEgmStorePoolOperations operations(*this);
+    const bool success = CleanupEgmStorePoolOrchestration(
+        operations, egm_store_pool_globals_, egm_store_pool_local_,
+        egm_store_pool_allocator_installed_);
+    const auto pending = GetEgmStorePoolOwnershipStats(egm_store_pool_globals_,
+                                                       egm_store_pool_local_);
+    egm_store_pool_cleanup_pending_.store(!success, std::memory_order_release);
+    if (client_) {
+        const auto elapsed =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - cleanup_start)
+                .count();
+        client_->ObserveEgmStorePoolStage(
+            rollback ? EgmStorePoolStage::kRollback
+                     : EgmStorePoolStage::kTeardown,
+            static_cast<uint64_t>(std::max<int64_t>(elapsed, 0)), success);
+        if (rollback) {
+            client_->ObserveEgmStorePoolRollback(success);
+        }
+        client_->ObserveEgmStorePoolCleanup(success, pending.allocations,
+                                            pending.bytes);
+    }
+    LOG(INFO) << "EGM Store Pool " << (rollback ? "rollback" : "teardown")
+              << " completed, success=" << success;
+    egm_store_pool_enabled_ = !success;
+    return success;
+}
+
+void RealClient::PublishClientBufferAllocator(
+    std::shared_ptr<ClientBufferAllocator> allocator) {
+    std::atomic_store_explicit(&client_buffer_allocator_, std::move(allocator),
+                               std::memory_order_release);
+}
+
+std::optional<BufferHandle> RealClient::AllocateClientBuffer(size_t size) {
+    auto allocator = SnapshotClientBufferAllocator();
+    if (!allocator) return std::nullopt;
+    // The snapshot remains alive through allocate(), and a successful handle
+    // takes its own shared_ptr lease before the local snapshot is released.
+    return allocator->allocate(size);
+}
+
+tl::expected<void, ErrorCode> RealClient::ReleaseEgmStorePoolAllocatorView(
+    const std::function<void()> &after_exchange_for_test) {
+    auto owner = std::atomic_exchange_explicit(
+        &client_buffer_allocator_, std::shared_ptr<ClientBufferAllocator>{},
+        std::memory_order_acq_rel);
+
+    if (after_exchange_for_test) {
+        try {
+            after_exchange_for_test();
+        } catch (...) {
+            std::atomic_store_explicit(&client_buffer_allocator_, owner,
+                                       std::memory_order_release);
+            throw;
+        }
+    }
+
+    // exchange() is the release linearization point. A reader either acquired
+    // a lease before it (and is counted here), or observes null afterwards.
+    if (owner && owner.use_count() > 1) {
+        const long outstanding_holders = owner.use_count() - 1;
+        std::atomic_store_explicit(&client_buffer_allocator_, owner,
+                                   std::memory_order_release);
+        LOG(ERROR) << "EGM Store Pool allocator view has "
+                   << outstanding_holders
+                   << " outstanding holder(s); cleanup must be retried after "
+                      "in-flight allocator users and BufferHandles release it";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    {
+        std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+        local_buffer_region_.reset();
+    }
+    return {};
+}
+
+tl::expected<void, ErrorCode> RealClient::setup_internal_with_egm_store_pool(
     const std::string &local_hostname, const std::string &metadata_server,
     size_t global_segment_size, size_t local_buffer_size,
     const std::string &protocol, const std::string &rdma_devices,
@@ -604,7 +1105,36 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &ipc_socket_path, int local_rpc_port,
     bool enable_ssd_offload, bool start_offload_rpc_server,
     const std::string &ssd_offload_path, const std::string &tenant_id,
-    bool enable_client_http_server, int client_http_port) {
+    bool enable_client_http_server, int client_http_port,
+    const EgmStorePoolOptions *egm_store_pool_options) {
+    const bool retained_egm_store_pool_state =
+        egm_store_pool_enabled_ || !egm_store_pool_globals_.empty() ||
+        egm_store_pool_local_.has_value() ||
+        egm_store_pool_allocator_installed_;
+    if (retained_egm_store_pool_state) {
+        LOG(ERROR) << "Refusing setup while EGM Store Pool ownership is "
+                      "active or cleanup-pending: enabled="
+                   << egm_store_pool_enabled_
+                   << " global_records=" << egm_store_pool_globals_.size()
+                   << " local_record=" << egm_store_pool_local_.has_value()
+                   << " allocator_installed="
+                   << egm_store_pool_allocator_installed_
+                   << "; retry explicit close until cleanup succeeds";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    const bool enable_egm_store_pool =
+        egm_store_pool_options != nullptr && egm_store_pool_options->enabled;
+    egm_store_pool_enabled_ = enable_egm_store_pool;
+    ScopeExit egm_store_pool_rollback([this, enable_egm_store_pool]() {
+        if (enable_egm_store_pool && egm_store_pool_enabled_) {
+            CleanupEgmStorePool(true);
+        }
+    });
+    if (enable_egm_store_pool && protocol != "nvlink") {
+        LOG(ERROR) << "enable_egm_store_pool requires protocol=nvlink";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
     const bool should_use_hugepage =
@@ -710,175 +1240,189 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
     }
 
-    // Local_buffer_size is allowed to be 0, but we only register memory when
-    // local_buffer_size > 0. Invoke ibv_reg_mr() with size=0 is UB, and may
-    // fail in some rdma implementations.
-    // Dummy Client can create shm and share it with Real Client, so Real Client
-    // can create client buffer allocator on the shared memory later.
-    bool use_spdk_dma_for_client_buffer = false;
+    if (enable_egm_store_pool) {
+        auto setup_result = SetupEgmStorePool(
+            *egm_store_pool_options, global_segment_size, local_buffer_size);
+        if (!setup_result) return setup_result;
+    } else {
+        // Local_buffer_size is allowed to be 0, but we only register memory
+        // when local_buffer_size > 0. Invoke ibv_reg_mr() with size=0 is UB,
+        // and may fail in some rdma implementations. Dummy Client can create
+        // shm and share it with Real Client, so Real Client can create client
+        // buffer allocator on the shared memory later.
+        bool use_spdk_dma_for_client_buffer = false;
 #ifdef USE_NOF
-    use_spdk_dma_for_client_buffer = true;
+        use_spdk_dma_for_client_buffer = true;
 #endif
-    client_buffer_allocator_ = ClientBufferAllocator::create(
-        local_buffer_size, this->protocol, should_use_hugepage,
-        use_spdk_dma_for_client_buffer);
-    if (local_buffer_size > 0 && protocol != "cxl") {
-        LOG(INFO) << "Registering local memory: " << local_buffer_size
-                  << " bytes";
-        auto result = client_->RegisterLocalMemory(
-            client_buffer_allocator_->getBase(), local_buffer_size,
-            kWildcardLocation, false, true);
-        if (!result.has_value()) {
-            LOG(ERROR) << "Failed to register local memory: "
-                       << toString(result.error());
-            return tl::unexpected(result.error());
-        }
-        {
-            std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
-            local_buffer_region_ = WritableBufferRegion{
-                .base = client_buffer_allocator_->getBase(),
-                .size = local_buffer_size,
-                .offset = 0,
-            };
-        }
-    } else {
-        LOG(INFO) << "Local buffer size is 0, skip registering local memory";
-    }
-
-    // If global_segment_size is 0, skip mount segment;
-    // If global_segment_size is larger than max_mr_size, split to multiple
-    // mapped_shms.
-    if (protocol == "cxl") {
-        size_t cxl_dev_size = 0;
-        const char *env = std::getenv("MC_CXL_DEV_SIZE");
-        if (env) {
-            char *end = nullptr;
-            unsigned long long val = strtoull(env, &end, 10);
-            if (end != env && *end == '\0')
-                cxl_dev_size = static_cast<size_t>(val);
+        auto client_buffer_allocator = ClientBufferAllocator::create(
+            local_buffer_size, this->protocol, should_use_hugepage,
+            use_spdk_dma_for_client_buffer);
+        PublishClientBufferAllocator(client_buffer_allocator);
+        if (local_buffer_size > 0 && protocol != "cxl") {
+            LOG(INFO) << "Registering local memory: " << local_buffer_size
+                      << " bytes";
+            auto result = client_->RegisterLocalMemory(
+                client_buffer_allocator->getBase(), local_buffer_size,
+                kWildcardLocation, false, true);
+            if (!result.has_value()) {
+                LOG(ERROR) << "Failed to register local memory: "
+                           << toString(result.error());
+                return tl::unexpected(result.error());
+            }
+            {
+                std::unique_lock<std::shared_mutex> lock(
+                    registered_buffer_mutex_);
+                local_buffer_region_ = WritableBufferRegion{
+                    .base = client_buffer_allocator->getBase(),
+                    .size = local_buffer_size,
+                    .offset = 0,
+                };
+            }
         } else {
-            LOG(FATAL) << "MC_CXL_DEV_SIZE not set";
-            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            LOG(INFO)
+                << "Local buffer size is 0, skip registering local memory";
         }
 
-        void *ptr = client_->GetBaseAddr();
-        LOG(INFO) << "Mounting CXL segment: " << cxl_dev_size << " bytes, "
-                  << ptr;
-        auto mount_result = client_->MountSegment(ptr, cxl_dev_size, protocol);
-        if (!mount_result.has_value()) {
-            LOG(ERROR) << "Failed to mount segment: "
-                       << toString(mount_result.error());
-            return tl::unexpected(mount_result.error());
-        }
-
-    } else {
-        auto max_mr_size = globalConfig().max_mr_size;     // Max segment size
-        uint64_t total_glbseg_size = global_segment_size;  // For logging
-        uint64_t current_glbseg_size = 0;                  // For logging
-
-        // For RDMA, auto-discover NUMA nodes with NICs and distribute
-        // global_segment across them for full NIC utilization.
-        std::vector<int> seg_numa_nodes;
-        if (protocol == "rdma") {
-            seg_numa_nodes = client_->GetNicNumaNodes();
-            if (seg_numa_nodes.size() > 1) {
-                std::string nodes_str;
-                for (size_t i = 0; i < seg_numa_nodes.size(); ++i) {
-                    if (i) nodes_str += ",";
-                    nodes_str += std::to_string(seg_numa_nodes[i]);
-                }
-                LOG(INFO) << "NUMA-segmented mode: NIC NUMA nodes=["
-                          << nodes_str << "]";
+        // If global_segment_size is 0, skip mount segment;
+        // If global_segment_size is larger than max_mr_size, split to multiple
+        // mapped_shms.
+        if (protocol == "cxl") {
+            size_t cxl_dev_size = 0;
+            const char *env = std::getenv("MC_CXL_DEV_SIZE");
+            if (env) {
+                char *end = nullptr;
+                unsigned long long val = strtoull(env, &end, 10);
+                if (end != env && *end == '\0')
+                    cxl_dev_size = static_cast<size_t>(val);
             } else {
-                seg_numa_nodes.clear();
-            }
-        }
-
-        const bool parallel_hugetlb_population =
-            protocol == "rdma" && should_use_hugepage;
-
-        while (global_segment_size > 0) {
-            size_t segment_size = std::min(global_segment_size, max_mr_size);
-            global_segment_size -= segment_size;
-            current_glbseg_size += segment_size;
-            LOG(INFO) << "Mounting segment: " << segment_size << " bytes, "
-                      << current_glbseg_size << " of " << total_glbseg_size;
-
-            size_t mapped_size = segment_size;
-            void *ptr = nullptr;
-            std::string seg_location = kWildcardLocation;
-
-            if (!seg_numa_nodes.empty()) {
-                // NUMA-segmented allocation: contiguous VMA, per-region binding
-                size_t page_sz = should_use_hugepage
-                                     ? get_hugepage_size_from_env()
-                                     : static_cast<size_t>(getpagesize());
-                mapped_size =
-                    align_up(segment_size, page_sz * seg_numa_nodes.size());
-                ptr = allocate_buffer_numa_segments(mapped_size, seg_numa_nodes,
-                                                    page_sz);
-                seg_location = buildSegmentsLocation(page_sz, seg_numa_nodes);
-            } else if (should_use_hugepage) {
-                mapped_size =
-                    align_up(segment_size, get_hugepage_size_from_env());
-                ptr = allocate_buffer_mmap_memory(mapped_size,
-                                                  get_hugepage_size_from_env(),
-                                                  parallel_hugetlb_population);
-            } else {
-                ptr = allocate_buffer_allocator_memory(segment_size,
-                                                       this->protocol);
-            }
-
-            if (!ptr) {
-                LOG(ERROR) << "Failed to allocate segment memory";
+                LOG(FATAL) << "MC_CXL_DEV_SIZE not set";
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
             }
-            if (this->protocol == "ascend" || this->protocol == "ubshmem") {
-                ascend_segment_ptrs_.emplace_back(
-                    ptr, AscendSegmentDeleter{this->protocol});
-            } else if (this->protocol == "sunrise_link") {
-#if defined(USE_SUNRISE)
-                sunrise_segment_ptrs_.emplace_back(ptr,
-                                                   SunriseSegmentDeleter{});
-#else
-                LOG(ERROR)
-                    << "sunrise_link protocol requires USE_SUNRISE build";
-                return tl::unexpected(ErrorCode::INVALID_PARAMS);
-#endif
-            } else if (this->protocol == "ub") {
-                ub_segment_ptrs_.emplace_back(ptr,
-                                              UbSegmentDeleter{mapped_size});
-            } else if (!seg_numa_nodes.empty() || should_use_hugepage) {
-                // NUMA-segmented or hugepage: track as mmap allocation for
-                // munmap cleanup
-                hugepage_segment_ptrs_.emplace_back(
-                    ptr, HugepageSegmentDeleter{mapped_size});
-            } else {
-                segment_ptrs_.emplace_back(ptr);
-            }
 
-            // Populate HugeTLB pages in parallel immediately before transfer-
-            // engine registration. NUMA mappings use node-local workers for
-            // each mbind region; direct mappings use the generic worker pool.
-            if (parallel_hugetlb_population) {
-                if (!seg_numa_nodes.empty()) {
-                    populate_hugetlb_numa_mapping(ptr, mapped_size,
-                                                  seg_numa_nodes);
-                } else if (!is_mmap_arena_allocation(ptr)) {
-                    populate_hugetlb_mapping(ptr, mapped_size);
-                }
-            }
-
+            void *ptr = client_->GetBaseAddr();
+            LOG(INFO) << "Mounting CXL segment: " << cxl_dev_size << " bytes, "
+                      << ptr;
             auto mount_result =
-                client_->MountSegment(ptr, mapped_size, protocol, seg_location);
+                client_->MountSegment(ptr, cxl_dev_size, protocol);
             if (!mount_result.has_value()) {
                 LOG(ERROR) << "Failed to mount segment: "
                            << toString(mount_result.error());
                 return tl::unexpected(mount_result.error());
             }
-        }
-        if (total_glbseg_size == 0) {
-            LOG(INFO) << "Global segment size is 0, skip mounting segment";
+
+        } else {
+            auto max_mr_size = globalConfig().max_mr_size;  // Max segment size
+            uint64_t total_glbseg_size = global_segment_size;  // For logging
+            uint64_t current_glbseg_size = 0;                  // For logging
+
+            // For RDMA, auto-discover NUMA nodes with NICs and distribute
+            // global_segment across them for full NIC utilization.
+            std::vector<int> seg_numa_nodes;
+            if (protocol == "rdma") {
+                seg_numa_nodes = client_->GetNicNumaNodes();
+                if (seg_numa_nodes.size() > 1) {
+                    std::string nodes_str;
+                    for (size_t i = 0; i < seg_numa_nodes.size(); ++i) {
+                        if (i) nodes_str += ",";
+                        nodes_str += std::to_string(seg_numa_nodes[i]);
+                    }
+                    LOG(INFO) << "NUMA-segmented mode: NIC NUMA nodes=["
+                              << nodes_str << "]";
+                } else {
+                    seg_numa_nodes.clear();
+                }
+            }
+
+            const bool parallel_hugetlb_population =
+                protocol == "rdma" && should_use_hugepage;
+
+            while (global_segment_size > 0) {
+                size_t segment_size =
+                    std::min(global_segment_size, max_mr_size);
+                global_segment_size -= segment_size;
+                current_glbseg_size += segment_size;
+                LOG(INFO) << "Mounting segment: " << segment_size << " bytes, "
+                          << current_glbseg_size << " of " << total_glbseg_size;
+
+                size_t mapped_size = segment_size;
+                void *ptr = nullptr;
+                std::string seg_location = kWildcardLocation;
+
+                if (!seg_numa_nodes.empty()) {
+                    // NUMA-segmented allocation: contiguous VMA, per-region
+                    // binding
+                    size_t page_sz = should_use_hugepage
+                                         ? get_hugepage_size_from_env()
+                                         : static_cast<size_t>(getpagesize());
+                    mapped_size =
+                        align_up(segment_size, page_sz * seg_numa_nodes.size());
+                    ptr = allocate_buffer_numa_segments(
+                        mapped_size, seg_numa_nodes, page_sz);
+                    seg_location =
+                        buildSegmentsLocation(page_sz, seg_numa_nodes);
+                } else if (should_use_hugepage) {
+                    mapped_size =
+                        align_up(segment_size, get_hugepage_size_from_env());
+                    ptr = allocate_buffer_mmap_memory(
+                        mapped_size, get_hugepage_size_from_env(),
+                        parallel_hugetlb_population);
+                } else {
+                    ptr = allocate_buffer_allocator_memory(segment_size,
+                                                           this->protocol);
+                }
+
+                if (!ptr) {
+                    LOG(ERROR) << "Failed to allocate segment memory";
+                    return tl::unexpected(ErrorCode::INVALID_PARAMS);
+                }
+                if (this->protocol == "ascend" || this->protocol == "ubshmem") {
+                    ascend_segment_ptrs_.emplace_back(
+                        ptr, AscendSegmentDeleter{this->protocol});
+                } else if (this->protocol == "sunrise_link") {
+#if defined(USE_SUNRISE)
+                    sunrise_segment_ptrs_.emplace_back(ptr,
+                                                       SunriseSegmentDeleter{});
+#else
+                    LOG(ERROR)
+                        << "sunrise_link protocol requires USE_SUNRISE build";
+                    return tl::unexpected(ErrorCode::INVALID_PARAMS);
+#endif
+                } else if (this->protocol == "ub") {
+                    ub_segment_ptrs_.emplace_back(
+                        ptr, UbSegmentDeleter{mapped_size});
+                } else if (!seg_numa_nodes.empty() || should_use_hugepage) {
+                    // NUMA-segmented or hugepage: track as mmap allocation for
+                    // munmap cleanup
+                    hugepage_segment_ptrs_.emplace_back(
+                        ptr, HugepageSegmentDeleter{mapped_size});
+                } else {
+                    segment_ptrs_.emplace_back(ptr);
+                }
+
+                // Populate HugeTLB pages in parallel immediately before
+                // transfer-engine registration. NUMA mappings use node-local
+                // workers for each mbind region; direct mappings use the
+                // generic worker pool.
+                if (parallel_hugetlb_population) {
+                    if (!seg_numa_nodes.empty()) {
+                        populate_hugetlb_numa_mapping(ptr, mapped_size,
+                                                      seg_numa_nodes);
+                    } else if (!is_mmap_arena_allocation(ptr)) {
+                        populate_hugetlb_mapping(ptr, mapped_size);
+                    }
+                }
+
+                auto mount_result = client_->MountSegment(
+                    ptr, mapped_size, protocol, seg_location);
+                if (!mount_result.has_value()) {
+                    LOG(ERROR) << "Failed to mount segment: "
+                               << toString(mount_result.error());
+                    return tl::unexpected(mount_result.error());
+                }
+            }
+            if (total_glbseg_size == 0) {
+                LOG(INFO) << "Global segment size is 0, skip mounting segment";
+            }
         }
     }
 
@@ -947,7 +1491,29 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
     }
 
+    if (enable_egm_store_pool) {
+        LOG(INFO) << "EGM Store Pool setup ready";
+    }
+    egm_store_pool_rollback.Release();
     return {};
+}
+
+tl::expected<void, ErrorCode> RealClient::setup_internal(
+    const std::string &local_hostname, const std::string &metadata_server,
+    size_t global_segment_size, size_t local_buffer_size,
+    const std::string &protocol, const std::string &rdma_devices,
+    const std::string &master_server_addr,
+    const std::shared_ptr<TransferEngine> &transfer_engine,
+    const std::string &ipc_socket_path, int local_rpc_port,
+    bool enable_ssd_offload, bool start_offload_rpc_server,
+    const std::string &ssd_offload_path, const std::string &tenant_id,
+    bool enable_client_http_server, int client_http_port) {
+    return setup_internal_with_egm_store_pool(
+        local_hostname, metadata_server, global_segment_size, local_buffer_size,
+        protocol, rdma_devices, master_server_addr, transfer_engine,
+        ipc_socket_path, local_rpc_port, enable_ssd_offload,
+        start_offload_rpc_server, ssd_offload_path, tenant_id,
+        enable_client_http_server, client_http_port, nullptr);
 }
 
 int RealClient::setup_real(
@@ -1125,11 +1691,28 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
     int client_http_port = client_http_port_opt.value();
 
-    return setup_internal(local_hostname, metadata_server, global_segment_size,
-                          local_buffer_size, protocol, rdma_devices,
-                          master_server_addr, nullptr, ipc_socket_path, 50052,
-                          enable_ssd_offload, true, ssd_offload_path, tenant_id,
-                          enable_client_http_server, client_http_port);
+    auto egm_store_pool_options =
+        ParseEgmStorePoolOptions(config, global_segment_size);
+    if (!egm_store_pool_options) {
+        LOG(ERROR) << "Invalid EGM Store Pool configuration: "
+                   << egm_store_pool_options.error();
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (egm_store_pool_options->enabled && protocol != "nvlink") {
+        LOG(ERROR) << CONFIG_KEY_ENABLE_EGM_STORE_POOL
+                   << " requires protocol=nvlink";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    LOG(INFO) << "EGM Store Pool feature source=config_dict state="
+              << (egm_store_pool_options->enabled ? "enabled" : "disabled")
+              << " node_selection="
+              << (egm_store_pool_options->auto_nodes ? "auto" : "explicit");
+
+    return setup_internal_with_egm_store_pool(
+        local_hostname, metadata_server, global_segment_size, local_buffer_size,
+        protocol, rdma_devices, master_server_addr, nullptr, ipc_socket_path,
+        50052, enable_ssd_offload, true, ssd_offload_path, tenant_id,
+        enable_client_http_server, client_http_port, &*egm_store_pool_options);
 }
 
 tl::expected<void, ErrorCode> RealClient::initAll_internal(
@@ -1160,32 +1743,59 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         return {};
     }
 
+    const bool retained_egm_store_pool_state =
+        egm_store_pool_enabled_ || !egm_store_pool_globals_.empty() ||
+        egm_store_pool_local_.has_value() ||
+        egm_store_pool_allocator_installed_;
+    if (!client_) {
+        if (retained_egm_store_pool_state) {
+            LOG(ERROR) << "EGM Store Pool teardown cannot proceed without "
+                          "the owning client; retaining VMM ownership for "
+                          "process quarantine";
+            egm_store_pool_cleanup_pending_.store(true,
+                                                  std::memory_order_release);
+            closed_.store(false, std::memory_order_release);
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        // Not initialized or already cleaned; treat as success for idempotence
+        stop_ipc_server();
+        stop_dummy_client_monitor();
+        stop_http_server();
+        return {};
+    }
+    if (retained_egm_store_pool_state) {
+        if (!CleanupEgmStorePool(false)) {
+            LOG(ERROR) << "EGM Store Pool teardown is incomplete; client "
+                          "and VMM ownership are retained so close can retry";
+            closed_.store(false, std::memory_order_release);
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+    }
+
     stop_ipc_server();
     stop_dummy_client_monitor();
     stop_http_server();
-
-    if (!client_) {
-        // Not initialized or already cleaned; treat as success for idempotence
-        return {};
-    }
-    if (client_buffer_allocator_ && client_buffer_allocator_->size() > 0 &&
-        protocol != "cxl") {
-        auto unregister_result = client_->unregisterLocalMemory(
-            client_buffer_allocator_->getBase(), true);
-        if (!unregister_result) {
-            LOG(WARNING)
-                << "Failed to unregister client local buffer on tear down: "
-                << toString(unregister_result.error());
+    {
+        auto client_buffer_allocator = SnapshotClientBufferAllocator();
+        if (client_buffer_allocator && client_buffer_allocator->size() > 0 &&
+            protocol != "cxl") {
+            auto unregister_result = client_->unregisterLocalMemory(
+                client_buffer_allocator->getBase(), true);
+            if (!unregister_result) {
+                LOG(WARNING)
+                    << "Failed to unregister client local buffer on tear down: "
+                    << toString(unregister_result.error());
+            }
+            std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+            local_buffer_region_.reset();
         }
-        std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
-        local_buffer_region_.reset();
     }
 
     // Reset all resources
     client_.reset();
     ReleaseAllMountedSegmentRecords();
     ReleaseAllAllocatedSegmentRecords();
-    client_buffer_allocator_.reset();
+    PublishClientBufferAllocator(nullptr);
     port_binder_.reset();
     hugepage_segment_ptrs_.clear();
     ub_segment_ptrs_.clear();
@@ -1651,6 +2261,18 @@ int RealClient::unmountAndFreeSegment(
 }
 
 int RealClient::health_check() {
+    if (egm_store_pool_cleanup_pending_.load(std::memory_order_acquire)) {
+        return HC_CLEANUP_PENDING;
+    }
+    const auto process_quarantine = GetEgmStorePoolProcessQuarantineStats();
+    if (process_quarantine.clients != 0) {
+        if (client_) {
+            client_->SetEgmStorePoolProcessQuarantine(
+                process_quarantine.clients, process_quarantine.allocations,
+                process_quarantine.bytes);
+        }
+        return HC_PROCESS_QUARANTINED;
+    }
     if (closed_.load()) return HC_NOT_INITIALIZED;
     if (!client_) return HC_NOT_INITIALIZED;
     if (!client_->is_ping_healthy()) return HC_MASTER_UNREACHABLE;
@@ -1680,6 +2302,12 @@ int RealClient::start_http_server(int port) {
                     break;
                 case HC_MASTER_UNREACHABLE:
                     status_str = "master_unreachable";
+                    break;
+                case HC_CLEANUP_PENDING:
+                    status_str = "cleanup_pending";
+                    break;
+                case HC_PROCESS_QUARANTINED:
+                    status_str = "process_quarantined";
                     break;
                 default:
                     status_str = "unknown";
@@ -1804,7 +2432,8 @@ int RealClient::put(const std::string &key, std::span<const char> value,
                     const ReplicateConfig &config) {
     auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
         [&]() {
-            return put_internal(key, value, config, client_buffer_allocator_);
+            return put_internal(key, value, config,
+                                SnapshotClientBufferAllocator());
         },
         [](const auto &ret) { return ret.has_value(); },
         [&](uint64_t latency_us, const auto &) {
@@ -1909,7 +2538,7 @@ int RealClient::put_batch(const std::vector<std::string> &keys,
     auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
         [&]() {
             return put_batch_internal(keys, values, config,
-                                      client_buffer_allocator_);
+                                      SnapshotClientBufferAllocator());
         },
         [](const auto &ret) { return ret.has_value(); },
         [&](uint64_t latency_us, const auto &) {
@@ -2005,7 +2634,7 @@ int RealClient::put_parts(const std::string &key,
     auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
         [&]() {
             return put_parts_internal(key, values, config,
-                                      client_buffer_allocator_);
+                                      SnapshotClientBufferAllocator());
         },
         [](const auto &ret) { return ret.has_value(); },
         [&](uint64_t latency_us, const auto &) {
@@ -2720,7 +3349,9 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
 // Implementation of get_buffer method
 std::shared_ptr<BufferHandle> RealClient::get_buffer(const std::string &key) {
     return execute_timed_operation<std::shared_ptr<BufferHandle>>(
-        [&]() { return get_buffer_internal(key, client_buffer_allocator_); },
+        [&]() {
+            return get_buffer_internal(key, SnapshotClientBufferAllocator());
+        },
         [](const auto &buffer) { return buffer != nullptr; },
         [&](uint64_t latency_us, const auto &buffer) {
             client_->ObserveTransferOperation(TransferOperationKind::kRead,
@@ -2941,6 +3572,13 @@ RealClient::batch_get_buffer_internal(
     std::vector<DiskKeyOp> disk_ops;
     valid_ops.reserve(keys.size());
 
+    auto allocator = client_buffer_allocator;
+    if (!allocator) allocator = SnapshotClientBufferAllocator();
+    if (!allocator) {
+        LOG(ERROR) << "Client buffer allocator is not provided";
+        return final_results;
+    }
+
     auto local_endpoints = client_->GetLocalEndpoints();
     for (size_t i = 0; i < keys.size(); ++i) {
         const auto &key = keys[i];
@@ -2974,8 +3612,6 @@ RealClient::batch_get_buffer_internal(
             continue;
         }
 
-        auto &allocator = client_buffer_allocator ? client_buffer_allocator
-                                                  : client_buffer_allocator_;
         auto alloc_result = allocator->allocate(total_size);
         if (!alloc_result) {
             LOG(ERROR) << "Failed to allocate buffer for key: " << key;
@@ -3253,7 +3889,7 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         if (replica.is_disk_replica()) {
             // DISK full read: local file I/O (vector_read) cannot write to
             // GPU memory. Use temp CPU buffer, then scatter to dst.
-            auto alloc_result = client_buffer_allocator_->allocate(total_size);
+            auto alloc_result = AllocateClientBuffer(total_size);
             if (!alloc_result) {
                 LOG(ERROR) << "Failed to allocate temp buffer for DISK full "
                            << "read, key: " << key << ", size: " << total_size;
@@ -3336,7 +3972,7 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     auto partial_disk_read =
         [&](auto &&read_op,
             size_t buf_size) -> tl::expected<int64_t, ErrorCode> {
-        auto alloc_result = client_buffer_allocator_->allocate(buf_size);
+        auto alloc_result = AllocateClientBuffer(buf_size);
         if (!alloc_result) {
             LOG(ERROR) << "Failed to allocate temp buffer for ranged disk "
                        << "read, key: " << key << ", size: " << buf_size;
@@ -3885,7 +4521,7 @@ int RealClient::upsert(const std::string &key, std::span<const char> value,
     auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
         [&]() {
             return upsert_internal(key, value, config,
-                                   client_buffer_allocator_);
+                                   SnapshotClientBufferAllocator());
         },
         [](const auto &ret) { return ret.has_value(); },
         [&](uint64_t latency_us, const auto &) {
@@ -4127,7 +4763,7 @@ int RealClient::upsert_parts(const std::string &key,
     auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
         [&]() {
             return upsert_parts_internal(key, values, config,
-                                         client_buffer_allocator_);
+                                         SnapshotClientBufferAllocator());
         },
         [](const auto &ret) { return ret.has_value(); },
         [&](uint64_t latency_us, const auto &) {
@@ -4246,7 +4882,7 @@ int RealClient::upsert_batch(const std::vector<std::string> &keys,
     auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
         [&]() {
             return upsert_batch_internal(keys, values, config,
-                                         client_buffer_allocator_);
+                                         SnapshotClientBufferAllocator());
         },
         [](const auto &ret) { return ret.has_value(); },
         [&](uint64_t latency_us, const auto &) {
@@ -4703,8 +5339,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                     tl::unexpected(ErrorCode::INVALID_REPLICA);
                 continue;
             }
-            auto alloc_result =
-                client_buffer_allocator_->allocate(op.total_size);
+            auto alloc_result = AllocateClientBuffer(op.total_size);
             if (!alloc_result) {
                 LOG(ERROR) << "Failed to allocate temp buffer for DISK "
                            << "read, key: " << op.key
@@ -5247,8 +5882,7 @@ RealClient::batch_get_into_multi_buffers_internal(
 
             for (auto &[key, op] : valid_local_disk_ops) {
                 if (op.is_local_disk) continue;
-                auto alloc_result =
-                    client_buffer_allocator_->allocate(op.total_size);
+                auto alloc_result = AllocateClientBuffer(op.total_size);
                 if (!alloc_result) {
                     LOG(ERROR)
                         << "Failed to allocate temp buffer for DISK "

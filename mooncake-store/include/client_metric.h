@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <iomanip>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <sstream>
@@ -12,6 +13,7 @@
 #include <unordered_set>
 #include <vector>
 #include <ylt/metric/counter.hpp>
+#include <ylt/metric/gauge.hpp>
 #include <ylt/metric/histogram.hpp>
 #include <ylt/metric/summary.hpp>
 #include "utils.h"
@@ -101,6 +103,191 @@ Result execute_timed_operation(Operation&& operation, SuccessFn&& success_fn,
 }
 
 enum class TransferOperationKind { kRead, kWrite };
+
+enum class EgmStorePoolStage {
+    kPreflight,
+    kDiscovery,
+    kPlanning,
+    kAllocation,
+    kAccess,
+    kRegistration,
+    kMount,
+    kRollback,
+    kTeardown,
+};
+
+inline const char* EgmStorePoolStageName(EgmStorePoolStage stage) {
+    switch (stage) {
+        case EgmStorePoolStage::kPreflight:
+            return "preflight";
+        case EgmStorePoolStage::kDiscovery:
+            return "discovery";
+        case EgmStorePoolStage::kPlanning:
+            return "planning";
+        case EgmStorePoolStage::kAllocation:
+            return "allocation";
+        case EgmStorePoolStage::kAccess:
+            return "access";
+        case EgmStorePoolStage::kRegistration:
+            return "registration";
+        case EgmStorePoolStage::kMount:
+            return "mount";
+        case EgmStorePoolStage::kRollback:
+            return "rollback";
+        case EgmStorePoolStage::kTeardown:
+            return "teardown";
+    }
+    return "unknown";
+}
+
+struct EgmStorePoolMetric {
+    std::array<std::string, 1> numa_node_label = {"numa_node"};
+    std::array<std::string, 1> stage_label = {"stage"};
+
+    explicit EgmStorePoolMetric(std::map<std::string, std::string> = {})
+        : requested_capacity_bytes(
+              "mooncake_egm_store_pool_requested_capacity_bytes",
+              "Requested EGM Store Pool Provider capacity in bytes", {}),
+          effective_capacity_bytes(
+              "mooncake_egm_store_pool_effective_capacity_bytes",
+              "Effective EGM Store Pool Provider capacity in bytes", {}),
+          effective_bytes_by_node(
+              "mooncake_egm_store_pool_node_effective_bytes",
+              "Effective EGM Store Pool Provider bytes by NUMA node",
+              numa_node_label),
+          chunk_count_by_node(
+              "mooncake_egm_store_pool_node_chunks",
+              "EGM Store Pool Provider chunk count by NUMA node",
+              numa_node_label),
+          stage_duration_us(
+              "mooncake_egm_store_pool_stage_duration_us",
+              "EGM Store Pool setup stage duration in microseconds",
+              kLatencyBucket, {}, stage_label),
+          initialization_failures(
+              "mooncake_egm_store_pool_initialization_failures_total",
+              "EGM Store Pool initialization failures by stage", {},
+              stage_label),
+          rollback_attempts("mooncake_egm_store_pool_rollback_attempts_total",
+                            "EGM Store Pool rollback attempts", {}),
+          rollback_failures("mooncake_egm_store_pool_rollback_failures_total",
+                            "EGM Store Pool rollback failures", {}),
+          cleanup_pending("mooncake_egm_store_pool_cleanup_pending",
+                          "Whether EGM Store Pool cleanup must be retried", {}),
+          cleanup_pending_allocations(
+              "mooncake_egm_store_pool_cleanup_pending_allocations",
+              "VMM allocations retained by retryable EGM Store Pool cleanup",
+              {}),
+          cleanup_pending_bytes(
+              "mooncake_egm_store_pool_cleanup_pending_bytes",
+              "VMM bytes retained by retryable EGM Store Pool cleanup", {}),
+          cleanup_attempts(
+              "mooncake_egm_store_pool_cleanup_attempts_total",
+              "EGM Store Pool rollback and teardown cleanup attempts", {}),
+          cleanup_failures(
+              "mooncake_egm_store_pool_cleanup_failures_total",
+              "EGM Store Pool rollback and teardown cleanup failures", {}),
+          process_quarantine_clients(
+              "mooncake_egm_store_pool_process_quarantine_clients",
+              "Destroyed clients retained in the process EGM quarantine", {}),
+          process_quarantine_allocations(
+              "mooncake_egm_store_pool_process_quarantine_allocations",
+              "VMM allocations retained in the process EGM quarantine", {}),
+          process_quarantine_bytes(
+              "mooncake_egm_store_pool_process_quarantine_bytes",
+              "VMM bytes retained in the process EGM quarantine", {}) {}
+
+    ylt::metric::gauge_t requested_capacity_bytes;
+    ylt::metric::gauge_t effective_capacity_bytes;
+    ylt::metric::dynamic_gauge_1t effective_bytes_by_node;
+    ylt::metric::dynamic_gauge_1t chunk_count_by_node;
+    ylt::metric::hybrid_histogram_1t stage_duration_us;
+    ylt::metric::hybrid_counter_1t initialization_failures;
+    ylt::metric::counter_t rollback_attempts;
+    ylt::metric::counter_t rollback_failures;
+    ylt::metric::gauge_t cleanup_pending;
+    ylt::metric::gauge_t cleanup_pending_allocations;
+    ylt::metric::gauge_t cleanup_pending_bytes;
+    ylt::metric::counter_t cleanup_attempts;
+    ylt::metric::counter_t cleanup_failures;
+    ylt::metric::gauge_t process_quarantine_clients;
+    ylt::metric::gauge_t process_quarantine_allocations;
+    ylt::metric::gauge_t process_quarantine_bytes;
+
+    void SetCapacity(uint64_t requested_bytes, uint64_t effective_bytes) {
+        requested_capacity_bytes.update(static_cast<int64_t>(requested_bytes));
+        effective_capacity_bytes.update(static_cast<int64_t>(effective_bytes));
+    }
+
+    void SetNodeCapacity(int numa_node, uint64_t effective_bytes,
+                         uint64_t chunk_count) {
+        const std::array<std::string, 1> label = {std::to_string(numa_node)};
+        effective_bytes_by_node.update(label,
+                                       static_cast<int64_t>(effective_bytes));
+        chunk_count_by_node.update(label, static_cast<int64_t>(chunk_count));
+    }
+
+    void ObserveStage(EgmStorePoolStage stage, uint64_t duration_us,
+                      bool success) {
+        const std::array<std::string, 1> label = {EgmStorePoolStageName(stage)};
+        // basic_hybrid_histogram omits zero-valued observations during
+        // serialization and may clear the caller's output buffer when every
+        // observation is zero. Preserve sub-microsecond stages as 1 us so
+        // serializing this metric cannot erase metrics appended before it.
+        stage_duration_us.observe(label, std::max<uint64_t>(duration_us, 1));
+        if (!success) {
+            initialization_failures.inc(label);
+        }
+    }
+
+    void ObserveRollback(bool success) {
+        rollback_attempts.inc();
+        if (!success) {
+            rollback_failures.inc();
+        }
+    }
+
+    void ObserveCleanup(bool success, uint64_t pending_allocations,
+                        uint64_t pending_bytes) {
+        cleanup_attempts.inc();
+        if (!success) cleanup_failures.inc();
+        cleanup_pending.update(success ? 0 : 1);
+        cleanup_pending_allocations.update(
+            static_cast<int64_t>(std::min<uint64_t>(
+                pending_allocations, std::numeric_limits<int64_t>::max())));
+        cleanup_pending_bytes.update(static_cast<int64_t>(std::min<uint64_t>(
+            pending_bytes, std::numeric_limits<int64_t>::max())));
+    }
+
+    void SetProcessQuarantine(uint64_t clients, uint64_t allocations,
+                              uint64_t bytes) {
+        process_quarantine_clients.update(static_cast<int64_t>(
+            std::min<uint64_t>(clients, std::numeric_limits<int64_t>::max())));
+        process_quarantine_allocations.update(
+            static_cast<int64_t>(std::min<uint64_t>(
+                allocations, std::numeric_limits<int64_t>::max())));
+        process_quarantine_bytes.update(static_cast<int64_t>(
+            std::min<uint64_t>(bytes, std::numeric_limits<int64_t>::max())));
+    }
+
+    void serialize(std::string& str) {
+        requested_capacity_bytes.serialize(str);
+        effective_capacity_bytes.serialize(str);
+        effective_bytes_by_node.serialize(str);
+        chunk_count_by_node.serialize(str);
+        stage_duration_us.serialize(str);
+        initialization_failures.serialize(str);
+        rollback_attempts.serialize(str);
+        rollback_failures.serialize(str);
+        cleanup_pending.serialize(str);
+        cleanup_pending_allocations.serialize(str);
+        cleanup_pending_bytes.serialize(str);
+        cleanup_attempts.serialize(str);
+        cleanup_failures.serialize(str);
+        process_quarantine_clients.serialize(str);
+        process_quarantine_allocations.serialize(str);
+        process_quarantine_bytes.serialize(str);
+    }
+};
 
 struct TransferMetric {
     TransferMetric(std::map<std::string, std::string> labels = {})
@@ -663,6 +850,8 @@ struct ClientMetric {
     MasterClientMetric master_client_metric;
     TransferOperationMetric transfer_operation_metric;
     SsdMetric ssd_metric;
+    EgmStorePoolMetric egm_store_pool_metric;
+    ylt::metric::counter_t mount_segment_compensation_failures;
 
     /**
      * @brief Creates a ClientMetric instance based on environment variables
@@ -683,6 +872,42 @@ struct ClientMetric {
                                   const std::string& op_name, uint64_t bytes,
                                   uint64_t latency_us) {
         transfer_operation_metric.Observe(kind, op_name, bytes, latency_us);
+    }
+
+    void ObserveEgmStorePoolCapacity(uint64_t requested_bytes,
+                                     uint64_t effective_bytes) {
+        egm_store_pool_metric.SetCapacity(requested_bytes, effective_bytes);
+    }
+
+    void ObserveEgmStorePoolNode(int numa_node, uint64_t effective_bytes,
+                                 uint64_t chunk_count) {
+        egm_store_pool_metric.SetNodeCapacity(numa_node, effective_bytes,
+                                              chunk_count);
+    }
+
+    void ObserveEgmStorePoolStage(EgmStorePoolStage stage, uint64_t duration_us,
+                                  bool success) {
+        egm_store_pool_metric.ObserveStage(stage, duration_us, success);
+    }
+
+    void ObserveEgmStorePoolRollback(bool success) {
+        egm_store_pool_metric.ObserveRollback(success);
+    }
+
+    void ObserveEgmStorePoolCleanup(bool success, uint64_t pending_allocations,
+                                    uint64_t pending_bytes) {
+        egm_store_pool_metric.ObserveCleanup(success, pending_allocations,
+                                             pending_bytes);
+    }
+
+    void SetEgmStorePoolProcessQuarantine(uint64_t clients,
+                                          uint64_t allocations,
+                                          uint64_t bytes) {
+        egm_store_pool_metric.SetProcessQuarantine(clients, allocations, bytes);
+    }
+
+    void ObserveMountSegmentCompensationFailure() {
+        mount_segment_compensation_failures.inc();
     }
 
     void serialize(std::string& str);

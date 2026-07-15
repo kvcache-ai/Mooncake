@@ -277,6 +277,104 @@ TEST_F(ClientMetricsTest, SummaryCanOmitMasterRpcMetrics) {
                 std::string::npos);
 }
 
+TEST_F(ClientMetricsTest, EgmStorePoolMetricsUseBoundedLabels) {
+    ClientMetric metrics;
+    metrics.ObserveEgmStorePoolCapacity(1024 * 1024, 768 * 1024);
+    metrics.ObserveEgmStorePoolNode(0, 384 * 1024, 2);
+    metrics.ObserveEgmStorePoolNode(1, 384 * 1024, 2);
+    metrics.ObserveEgmStorePoolStage(EgmStorePoolStage::kAllocation, 250, true);
+    metrics.ObserveEgmStorePoolStage(EgmStorePoolStage::kAccess, 125, true);
+    metrics.ObserveEgmStorePoolStage(EgmStorePoolStage::kMount, 500, false);
+    metrics.ObserveEgmStorePoolRollback(true);
+    metrics.ObserveEgmStorePoolRollback(false);
+    metrics.ObserveEgmStorePoolCleanup(false, 3, 16384);
+    metrics.SetEgmStorePoolProcessQuarantine(1, 3, 16384);
+
+    std::string serialized;
+    metrics.serialize(serialized);
+
+    EXPECT_NE(
+        serialized.find("mooncake_egm_store_pool_requested_capacity_bytes"),
+        std::string::npos);
+    EXPECT_NE(
+        serialized.find("mooncake_egm_store_pool_effective_capacity_bytes"),
+        std::string::npos);
+    EXPECT_NE(serialized.find("numa_node=\"0\""), std::string::npos);
+    EXPECT_NE(serialized.find("numa_node=\"1\""), std::string::npos);
+    EXPECT_NE(serialized.find("stage=\"allocation\""), std::string::npos);
+    EXPECT_NE(serialized.find("stage=\"access\""), std::string::npos);
+    EXPECT_NE(serialized.find("stage=\"mount\""), std::string::npos);
+    EXPECT_NE(serialized.find("mooncake_egm_store_pool_cleanup_pending 1"),
+              std::string::npos);
+    EXPECT_NE(serialized.find(
+                  "mooncake_egm_store_pool_cleanup_pending_allocations 3"),
+              std::string::npos);
+    EXPECT_NE(
+        serialized.find("mooncake_egm_store_pool_cleanup_pending_bytes 16384"),
+        std::string::npos);
+    EXPECT_NE(
+        serialized.find("mooncake_egm_store_pool_process_quarantine_clients 1"),
+        std::string::npos);
+    EXPECT_NE(serialized.find(
+                  "mooncake_egm_store_pool_process_quarantine_allocations 3"),
+              std::string::npos);
+    EXPECT_NE(serialized.find(
+                  "mooncake_egm_store_pool_process_quarantine_bytes 16384"),
+              std::string::npos);
+    EXPECT_EQ(serialized.find("endpoint="), std::string::npos);
+    EXPECT_EQ(serialized.find("uuid="), std::string::npos);
+    EXPECT_EQ(serialized.find("address="), std::string::npos);
+    EXPECT_EQ(serialized.find("fabric_handle="), std::string::npos);
+}
+
+TEST_F(ClientMetricsTest, EgmStorePoolMetricsIgnoreAmbientClientLabels) {
+    EgmStorePoolMetric metrics({{"endpoint", "secret-endpoint"},
+                                {"uuid", "secret-uuid"},
+                                {"address", "secret-address"},
+                                {"fabric_handle", "secret-handle"}});
+    metrics.SetCapacity(1024, 1024);
+    metrics.SetNodeCapacity(0, 1024, 1);
+    metrics.ObserveStage(EgmStorePoolStage::kAccess, 10, true);
+
+    std::string serialized;
+    metrics.serialize(serialized);
+
+    EXPECT_NE(serialized.find("numa_node=\"0\""), std::string::npos);
+    EXPECT_NE(serialized.find("stage=\"access\""), std::string::npos);
+    EXPECT_EQ(serialized.find("secret-endpoint"), std::string::npos);
+    EXPECT_EQ(serialized.find("secret-uuid"), std::string::npos);
+    EXPECT_EQ(serialized.find("secret-address"), std::string::npos);
+    EXPECT_EQ(serialized.find("secret-handle"), std::string::npos);
+}
+
+TEST_F(ClientMetricsTest, ZeroDurationStagePreservesEarlierMetrics) {
+    ClientMetric metrics;
+    metrics.transfer_metric.total_read_bytes.inc(1024);
+    metrics.ObserveEgmStorePoolStage(EgmStorePoolStage::kPreflight, 0, true);
+
+    std::string serialized;
+    metrics.serialize(serialized);
+
+    EXPECT_NE(serialized.find("mooncake_transfer_read_bytes"),
+              std::string::npos);
+    EXPECT_NE(serialized.find("stage=\"preflight\""), std::string::npos);
+}
+
+TEST_F(ClientMetricsTest, MountCompensationFailureMetricIsUnlabelled) {
+    ClientMetric metrics;
+    metrics.ObserveMountSegmentCompensationFailure();
+
+    std::string serialized;
+    metrics.serialize(serialized);
+
+    const std::string metric_name =
+        "mooncake_client_mount_segment_compensation_failures_total";
+    const auto metric_pos = serialized.find(metric_name);
+    ASSERT_NE(metric_pos, std::string::npos);
+    EXPECT_EQ(serialized.find('{', metric_pos), std::string::npos);
+    EXPECT_NE(serialized.find(metric_name + " 1"), std::string::npos);
+}
+
 TEST_F(ClientMetricsTest, SerializeWithDynamicLabels) {
     auto verify = [](const std::string& str) {
         EXPECT_TRUE(str.find("instance_id=\"12345\"") != std::string::npos);

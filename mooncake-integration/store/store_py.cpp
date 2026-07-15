@@ -1457,6 +1457,7 @@ class MooncakeStorePyWrapper {
             std::vector<size_t> original_indices;
 
             std::vector<std::unique_ptr<BufferHandle>> temp_allocations;
+            auto allocator = store_->SnapshotClientBufferAllocator();
 
             for (size_t i = 0; i < infos.size(); ++i) {
                 if (!infos[i].valid()) continue;
@@ -1464,7 +1465,7 @@ class MooncakeStorePyWrapper {
                 size_t total_size =
                     sizeof(TensorMetadata) + infos[i].tensor_size;
                 auto alloc_result =
-                    store_->client_buffer_allocator_->allocate(total_size);
+                    allocator ? allocator->allocate(total_size) : std::nullopt;
 
                 if (!alloc_result) {
                     LOG(ERROR)
@@ -2120,6 +2121,11 @@ PYBIND11_MODULE(store, m) {
                const std::string &tenant_id = "default",
                bool enable_client_http_server = false,
                int client_http_port = DEFAULT_CLIENT_HTTP_PORT) {
+                if (self.store_) {
+                    LOG(ERROR) << "setup refused while an existing store is "
+                                  "active or cleanup-pending; close it first";
+                    return static_cast<int>(ErrorCode::INVALID_PARAMS);
+                }
                 auto real_client = self.init_real_client();
                 std::shared_ptr<mooncake::TransferEngine> transfer_engine =
                     nullptr;
@@ -2145,6 +2151,11 @@ PYBIND11_MODULE(store, m) {
         .def(
             "setup",
             [](MooncakeStorePyWrapper &self, const py::dict &config_dict) {
+                if (self.store_) {
+                    LOG(ERROR) << "setup refused while an existing store is "
+                                  "active or cleanup-pending; close it first";
+                    return static_cast<int>(ErrorCode::INVALID_PARAMS);
+                }
                 auto real_client = self.init_real_client();
 
                 // Convert py::dict to ConfigDict (all values as strings)
@@ -2168,6 +2179,10 @@ PYBIND11_MODULE(store, m) {
             "  local_buffer_size: Local buffer size (default 16MB).\n"
             "  protocol: Transfer protocol (default 'tcp').\n"
             "  rdma_devices: RDMA device list.\n"
+            "  enable_egm_store_pool: Enable the Store-owned EGM DRAM pool "
+            "memory (default false).\n"
+            "  egm_numa_nodes: Provider CPU DRAM NUMA nodes ('auto' or "
+            "a comma-separated list).\n"
             "  master_server_addr: Master server address.\n"
             "  ipc_socket_path: IPC socket path.\n"
             "  enable_ssd_offload: Enable SSD offload (default false).\n"
@@ -2181,6 +2196,12 @@ PYBIND11_MODULE(store, m) {
             "setup_dummy",
             [](MooncakeStorePyWrapper &self, size_t mem_pool_size,
                size_t local_buffer_size, const std::string &server_address) {
+                if (self.store_) {
+                    LOG(ERROR) << "setup_dummy refused while an existing "
+                                  "store is active or cleanup-pending; close "
+                                  "it first";
+                    return static_cast<int>(ErrorCode::INVALID_PARAMS);
+                }
                 auto &resource_tracker = ResourceTracker::getInstance();
                 self.use_dummy_client_ = true;
                 self.store_ = std::make_shared<DummyClient>();
@@ -2282,6 +2303,26 @@ PYBIND11_MODULE(store, m) {
             py::arg("keys"), py::arg("force") = false,
             "Batch remove objects by keys. Returns a list of status codes "
             "(0=success, negative=error code) for each key.")
+        .def(
+            "serialize_metrics",
+            [](MooncakeStorePyWrapper &self) {
+                if (!self.store_ || !self.store_->client_) {
+                    throw std::runtime_error("store metrics are not available");
+                }
+                auto client = self.store_->client_;
+                auto result = [&client]() {
+                    py::gil_scoped_release release;
+                    return client->SerializeMetrics();
+                }();
+                if (!result) {
+                    throw std::runtime_error(
+                        "failed to serialize store metrics: " +
+                        toString(result.error()));
+                }
+                return std::move(*result);
+            },
+            "Return a read-only Prometheus snapshot of Store and transport "
+            "metrics.")
         .def("is_exist",
              [](MooncakeStorePyWrapper &self, const std::string &key) {
                  py::gil_scoped_release release;
@@ -2297,17 +2338,26 @@ PYBIND11_MODULE(store, m) {
             py::arg("keys"),
             "Check if multiple objects exist. Returns list of results: 1 if "
             "exists, 0 if not exists, -1 if error")
-        .def("close",
-             [](MooncakeStorePyWrapper &self) {
-                 if (!self.store_) return 0;
-                 int rc = self.store_->tearDownAll();
-                 self.store_.reset();
-                 return rc;
-             })
+        .def(
+            "close",
+            [](MooncakeStorePyWrapper &self) {
+                if (!self.store_) return 0;
+                int rc = self.store_->tearDownAll();
+                if (rc == 0) {
+                    self.store_.reset();
+                    self.real_client_.reset();
+                    self.use_dummy_client_ = false;
+                }
+                return rc;
+            },
+            "Close the store. A non-zero result leaves the client attached so "
+            "cleanup can be retried by calling close() again.")
         .def("health_check", &MooncakeStorePyWrapper::health_check,
              "Health check for store connectivity. "
              "Returns 0 if healthy, 1 if not initialized/closed, "
-             "2 if master unreachable.")
+             "2 if master unreachable, or 3 if cleanup is pending and close() "
+             "must be retried. Returns 4 if a destroyed client left "
+             "process-quarantined VMM ownership and restart is required.")
         .def("get_size",
              [](MooncakeStorePyWrapper &self, const std::string &key) {
                  py::gil_scoped_release release;

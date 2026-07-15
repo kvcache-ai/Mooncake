@@ -41,22 +41,25 @@ add_test(
   NAME replica_selection_env_opt_in_test
   COMMAND replica_selection_test
           --gtest_filter=ReplicaSelectionTest.EnvironmentOptInUsesBuiltinScorer)
-set_tests_properties(
-  replica_selection_env_opt_in_test
-  PROPERTIES ENVIRONMENT "MC_STORE_REPLICA_SCORING=1")
+set_tests_properties(replica_selection_env_opt_in_test
+                     PROPERTIES ENVIRONMENT "MC_STORE_REPLICA_SCORING=1")
 add_store_test(eviction_strategy_test eviction_strategy_test.cpp)
 add_store_test(deadline_scheduler_test deadline_scheduler_test.cpp)
 add_store_test(kv_event_publisher_test kv_event_publisher_test.cpp)
 if(ENABLE_KV_EVENTS)
-  find_library(KV_EVENT_TEST_ZMQ_LIBRARY NAMES zmq libzmq PATHS /usr/lib
-               /usr/local/lib /usr/lib64)
-  find_path(KV_EVENT_TEST_ZMQ_INCLUDE_DIR NAMES zmq.h PATHS /usr/include
-            /usr/local/include)
-  target_compile_definitions(kv_event_publisher_test PRIVATE
-                             MOONCAKE_ENABLE_KV_EVENTS=1)
+  find_library(
+    KV_EVENT_TEST_ZMQ_LIBRARY
+    NAMES zmq libzmq
+    PATHS /usr/lib /usr/local/lib /usr/lib64)
+  find_path(
+    KV_EVENT_TEST_ZMQ_INCLUDE_DIR
+    NAMES zmq.h
+    PATHS /usr/include /usr/local/include)
+  target_compile_definitions(kv_event_publisher_test
+                             PRIVATE MOONCAKE_ENABLE_KV_EVENTS=1)
   if(KV_EVENT_TEST_ZMQ_LIBRARY AND KV_EVENT_TEST_ZMQ_INCLUDE_DIR)
     target_include_directories(kv_event_publisher_test
-                             PRIVATE ${KV_EVENT_TEST_ZMQ_INCLUDE_DIR})
+                               PRIVATE ${KV_EVENT_TEST_ZMQ_INCLUDE_DIR})
     target_link_libraries(kv_event_publisher_test
                           PRIVATE ${KV_EVENT_TEST_ZMQ_LIBRARY})
   endif()
@@ -86,11 +89,59 @@ add_store_test(master_admin_server_test master_admin_server_test.cpp)
 add_store_test(posix_file_test posix_file_test.cpp)
 add_store_test(thread_pool_test thread_pool_test.cpp)
 add_store_test(transfer_task_test transfer_task_test.cpp)
+if(USE_EVENT_DRIVEN_COMPLETION)
+  add_test(NAME nvlink_event_driven_completion_test
+           COMMAND $<TARGET_FILE:transfer_task_test>
+                   --gtest_filter=TransferEngineEventDrivenCompletionTest.*)
+  set_tests_properties(nvlink_event_driven_completion_test
+                       PROPERTIES LABELS "egm_store_pool_unit")
+endif()
 add_store_test(tenant_quota_test tenant_quota_test.cpp)
 add_store_test(segment_test segment_test.cpp)
 add_store_test(offset_allocator_test offset_allocator_test.cpp)
 add_store_test(utils_test utils_test.cpp)
 add_store_test(client_buffer_test client_buffer_test.cpp)
+add_store_test(egm_store_pool_config_test egm_store_pool_config_test.cpp)
+add_store_test(egm_store_pool_setup_test egm_store_pool_setup_test.cpp)
+add_store_test(egm_store_pool_orchestrator_test
+               egm_store_pool_orchestrator_test.cpp)
+add_executable(egm_store_pool_store_test egm_store_pool_store_test.cpp)
+target_include_directories(
+  egm_store_pool_store_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+                                    ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(
+  egm_store_pool_store_test
+  PUBLIC mooncake_store
+         transfer_engine
+         cachelib_memory_allocator
+         ${ETCD_WRAPPER_LIB}
+         glog
+         ibverbs
+         gtest
+         gtest_main
+         pthread)
+add_test(NAME egm_store_pool_store_test
+         COMMAND $<TARGET_FILE:egm_store_pool_store_test>
+                 --gtest_filter=EgmStorePoolStoreTest.*)
+target_include_directories(egm_store_pool_config_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_include_directories(egm_store_pool_setup_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_include_directories(egm_store_pool_orchestrator_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+set_tests_properties(
+  egm_store_pool_config_test egm_store_pool_setup_test
+  egm_store_pool_orchestrator_test egm_store_pool_store_test
+  client_integration_test PROPERTIES LABELS "egm_store_pool_unit")
+if(USE_MNNVL
+   AND USE_CUDA
+   AND NOT USE_HIP)
+  add_test(NAME egm_store_pool_store_hardware_test
+           COMMAND $<TARGET_FILE:egm_store_pool_store_test>
+                   --gtest_filter=EgmStorePoolStoreHardwareTest.*)
+  set_tests_properties(egm_store_pool_store_hardware_test
+                       PROPERTIES LABELS "egm_store_pool_hardware")
+endif()
 add_store_test(client_local_hot_cache_test client_local_hot_cache_test.cpp)
 add_store_test(client_tcp_local_memcpy_test client_tcp_local_memcpy_test.cpp)
 add_store_test(pybind_client_test pybind_client_test.cpp)
@@ -99,6 +150,8 @@ add_store_test(host_port_fix_test host_port_fix_test.cpp)
 add_store_test(client_metrics_test client_metrics_test.cpp)
 add_store_test(ssd_metrics_test ssd_metrics_test.cpp)
 add_store_test(serializer_test serializer_test.cpp)
+set_tests_properties(client_metrics_test serializer_test
+                     PROPERTIES LABELS "egm_store_pool_unit")
 add_store_test(
   embedded_snapshot_catalog_store_test
   ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store_test.cpp

@@ -219,6 +219,9 @@ constexpr const char* CONFIG_KEY_TENANT_ID = "tenant_id";
 constexpr const char* CONFIG_KEY_ENABLE_CLIENT_HTTP_SERVER =
     "enable_client_http_server";
 constexpr const char* CONFIG_KEY_CLIENT_HTTP_PORT = "client_http_port";
+constexpr const char* CONFIG_KEY_ENABLE_EGM_STORE_POOL =
+    "enable_egm_store_pool";
+constexpr const char* CONFIG_KEY_EGM_NUMA_NODES = "egm_numa_nodes";
 
 // Store client configuration defaults
 static constexpr size_t DEFAULT_GLOBAL_SEGMENT_SIZE = 1024 * 1024 * 16;  // 16MB

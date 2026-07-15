@@ -83,6 +83,12 @@ ClientMetric::ClientMetric(uint64_t interval_seconds,
       master_client_metric(labels),
       transfer_operation_metric(labels),
       ssd_metric(labels),
+      egm_store_pool_metric(labels),
+      mount_segment_compensation_failures(
+          "mooncake_client_mount_segment_compensation_failures_total",
+          "Master mount failures whose Transfer Engine unregister "
+          "compensation also failed",
+          {}),
       should_stop_metrics_thread_(false),
       metrics_interval_seconds_(interval_seconds),
       bandwidth_reporting_enabled_(bandwidth_reporting_enabled),
@@ -128,6 +134,8 @@ void ClientMetric::serialize(std::string& str) {
     }
     transfer_operation_metric.serialize(str);
     ssd_metric.serialize(str);
+    egm_store_pool_metric.serialize(str);
+    mount_segment_compensation_failures.serialize(str);
 }
 
 std::string ClientMetric::summary_metrics() {

@@ -286,12 +286,12 @@ BufferPoolNative::BufferPoolNative(const py::object &store, size_t max_bytes,
         throw std::runtime_error(
             "alignment must be a power of two and at least sizeof(void*)");
     }
-    if (!py_client_->client_buffer_allocator_ ||
-        py_client_->client_buffer_allocator_->size() == 0) {
+    auto allocator = py_client_->SnapshotClientBufferAllocator();
+    if (!allocator || allocator->size() == 0) {
         throw std::runtime_error(
             "BufferPool requires a store configured with a local buffer");
     }
-    local_buffer_capacity_ = py_client_->client_buffer_allocator_->size();
+    local_buffer_capacity_ = allocator->size();
     if (max_bytes == 0) {
         if (local_buffer_capacity_ >
             std::numeric_limits<size_t>::max() - local_buffer_capacity_) {
@@ -398,11 +398,12 @@ std::optional<BufferPoolNative::Region> BufferPoolNative::try_acquire_locked(
     std::shared_ptr<BufferHandle> handle;
     bool overflow_registered = false;
     try {
-        if (auto alloc_result =
-                py_client_->client_buffer_allocator_->allocate(allocation_size);
-            alloc_result.has_value()) {
+        auto allocator = py_client_->SnapshotClientBufferAllocator();
+        auto alloc_result =
+            allocator ? allocator->allocate(allocation_size) : std::nullopt;
+        if (alloc_result.has_value()) {
             handle = std::make_shared<BufferHandle>(std::move(*alloc_result));
-        } else {
+        } else if (allocator) {
             handle = allocate_overflow_unlocked(allocation_size);
             overflow_registered = handle != nullptr;
         }
