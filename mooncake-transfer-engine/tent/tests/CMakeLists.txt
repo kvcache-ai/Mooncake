@@ -60,6 +60,12 @@ target_include_directories(thread_local_storage_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME thread_local_storage_test COMMAND thread_local_storage_test)
 
+add_executable(tent_rw_spinlock_test rw_spinlock_test.cpp)
+target_link_libraries(tent_rw_spinlock_test PRIVATE gtest gtest_main)
+target_include_directories(tent_rw_spinlock_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_rw_spinlock_test COMMAND tent_rw_spinlock_test)
+
 add_executable(tent_ip_utils_test ip_utils_test.cpp)
 target_link_libraries(tent_ip_utils_test PRIVATE tent_common gtest gtest_main)
 target_include_directories(tent_ip_utils_test

@@ -447,7 +447,7 @@ void WorkerPool::performPollCq(int thread_id) {
 
     int processed_slice_count = 0;
     const static size_t kPollCount = 64;
-    std::unordered_map<volatile int *, int> qp_depth_set;
+    std::unordered_map<std::atomic<int> *, int> qp_depth_set;
     SliceList failed_slice_list;  // Unified: collect all slices for redispatch
     for (int cq_index = 0; cq_index < context_.cqCount(); cq_index++) {
         ibv_wc wc[kPollCount];
@@ -515,12 +515,12 @@ void WorkerPool::performPollCq(int thread_id) {
             }
         }
         if (nr_poll)
-            __sync_fetch_and_sub(context_.cqOutstandingCount(cq_index),
-                                 nr_poll);
+            context_.cqOutstandingCount(cq_index)->fetch_sub(
+                nr_poll, std::memory_order_acq_rel);
     }
 
     for (auto &entry : qp_depth_set)
-        __sync_fetch_and_sub(entry.first, entry.second);
+        entry.first->fetch_sub(entry.second, std::memory_order_acq_rel);
 
     if (processed_slice_count) {
         processed_slice_count_.fetch_add(processed_slice_count);
@@ -640,7 +640,9 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
 bool WorkerPool::hasOutstandingCq(int thread_id) {
     if (!workerCanPoll(thread_id)) return false;
     for (int cq_index = 0; cq_index < context_.cqCount(); ++cq_index) {
-        if (*context_.cqOutstandingCount(cq_index) > 0) return true;
+        if (context_.cqOutstandingCount(cq_index)->load(
+                std::memory_order_relaxed) > 0)
+            return true;
     }
     return false;
 }
@@ -836,7 +838,8 @@ void WorkerPool::monitorWorker() {
 
         int64_t cq_outstanding = 0;
         for (int cq_index = 0; cq_index < context_.cqCount(); ++cq_index) {
-            cq_outstanding += *context_.cqOutstandingCount(cq_index);
+            cq_outstanding += context_.cqOutstandingCount(cq_index)->load(
+                std::memory_order_relaxed);
         }
         const uint64_t processed_count =
             processed_slice_count_.load(std::memory_order_relaxed);

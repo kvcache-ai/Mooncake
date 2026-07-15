@@ -15,6 +15,7 @@
 #ifndef TENT_ENDPOINT_H
 #define TENT_ENDPOINT_H
 
+#include <atomic>
 #include <memory>
 #include <queue>
 #include <unordered_set>
@@ -26,7 +27,7 @@ namespace mooncake {
 namespace tent {
 class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     struct WrDepthBlock {
-        volatile int value;
+        std::atomic<int> value;
         uint64_t padding[7];
     };
 
@@ -160,7 +161,7 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
 
     size_t acknowledge(RdmaSlice* slice, TransferStatusEnum status);
 
-    volatile int* getQuotaCounter(int qp_index) const {
+    std::atomic<int>* getQuotaCounter(int qp_index) const {
         return &wr_depth_list_[qp_index].value;
     }
 
@@ -205,7 +206,7 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     // are synchronized by the endpoint lifecycle lock.
     std::vector<BoundedSliceQueue> slice_queue_;
     WrDepthBlock* wr_depth_list_;
-    volatile int inflight_slices_;
+    std::atomic<int> inflight_slices_;
     uint32_t padding_[7];
     RWSpinlock lock_;
 

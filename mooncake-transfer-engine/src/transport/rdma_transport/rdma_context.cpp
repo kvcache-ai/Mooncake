@@ -614,7 +614,7 @@ RdmaContext::findMemoryRegionContaining(uintptr_t addr) const {
 
 std::shared_ptr<RdmaEndPoint> RdmaContext::endpoint(
     const std::string &peer_nic_path) {
-    if (!active_) {
+    if (!active_.load(std::memory_order_acquire)) {
         LOG(ERROR) << "Context is not active: " << deviceName();
         return nullptr;
     }
