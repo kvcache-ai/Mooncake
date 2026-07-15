@@ -266,7 +266,8 @@ class Buffer:
                 dist.all_gather(handles, local_handle_tensor, self.group)
                 remote_handles = [h.tolist() for h in handles]
                 active_ranks_mask = self._active_ranks_list(torch.device("cuda"))
-                self.runtime.sync_nvlink_ipc_handles(remote_handles, active_ranks_mask)
+                # Debug: skip CUDA IPC exchange to force non-local traffic onto IBGDA.
+                # self.runtime.sync_nvlink_ipc_handles(remote_handles, active_ranks_mask)
             except Exception as e:
                 import warnings
 
