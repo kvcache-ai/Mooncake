@@ -68,7 +68,6 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 ARG PYTHON_VERSION
 ARG PYPI_INDEX_URL=https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
-ENV PIP_INDEX_URL=${PYPI_INDEX_URL}
 
 # Install runtime dependencies required by Mooncake
 RUN apt-get update && \
@@ -85,6 +84,6 @@ RUN apt-get update && \
 
 # Copy wheels produced in builder stage and install them via pip
 COPY --from=builder /workspace/mooncake-wheel/dist /tmp/mooncake-wheel
-RUN python${PYTHON_VERSION} -m pip install --no-cache-dir /tmp/mooncake-wheel/*.whl && rm -rf /tmp/mooncake-wheel /root/.cache/pip
+RUN PIP_INDEX_URL=${PYPI_INDEX_URL} python${PYTHON_VERSION} -m pip install --no-cache-dir /tmp/mooncake-wheel/*.whl && rm -rf /tmp/mooncake-wheel /root/.cache/pip
 
 CMD ["/bin/bash"]
