@@ -217,10 +217,20 @@ int CUFileDescPool::submitBatch(int idx) {
     }
 
     const auto submit_count = desc->io_params.size() - desc->submitted_count;
-    CUFILE_CHECK(
+    const auto result =
         batch_api_->submit(desc->batch_handle->handle, submit_count,
-                           desc->io_params.data() + desc->submitted_count, 0));
+                           desc->io_params.data() + desc->submitted_count, 0);
+
+    // cuFile does not guarantee that a failed batch submission accepted no
+    // requests. Keep the attempted range alive and quarantine the descriptor
+    // so status polling can conservatively cancel and drain it.
     desc->submitted_count = desc->io_params.size();
+    if (result.err != CU_FILE_SUCCESS) {
+        desc->failure_seen = true;
+        LOG(ERROR) << "Failed to submit descriptor " << idx << ": "
+                   << cuFileGetErrorString(result);
+        return -1;
+    }
     return 0;
 }
 
@@ -246,11 +256,12 @@ bool CUFileDescPool::isAcceptingSubmissions(int idx) {
     return !descs_[idx]->failure_seen;
 }
 
-int CUFileDescPool::pollBatch(int idx, CUFileBatchSnapshot& snapshot) {
+CUFileBatchPollResult CUFileDescPool::pollBatch(int idx,
+                                                CUFileBatchSnapshot& snapshot) {
     RWSpinlock::WriteGuard guard(mutex_);
     if (idx < 0 || idx >= (int)MAX_NR_DESC || descs_[idx] == nullptr) {
         LOG(ERROR) << "Invalid descriptor index: " << idx;
-        return -1;
+        return CUFileBatchPollResult::kError;
     }
 
     auto* desc = descs_[idx];
@@ -279,23 +290,28 @@ int CUFileDescPool::pollBatch(int idx, CUFileBatchSnapshot& snapshot) {
     unsigned nr = desc->submitted_count;
     if (desc->polled_events.size() < nr) {
         LOG(ERROR) << "Completion buffer is too small for descriptor " << idx;
-        return -1;
+        return CUFileBatchPollResult::kError;
     }
     if (nr > 0) {
         auto result =
             batch_api_->getStatus(desc->batch_handle->handle, 0, &nr,
                                   desc->polled_events.data(), nullptr);
         if (result.err != CU_FILE_SUCCESS) {
-            // The batch-specific internal error is documented as retryable.
+            if (result.err == CU_FILE_INTERNAL_BATCH_GETSTATUS_ERROR) {
+                cancel_active();
+                LOG(WARNING)
+                    << "Failed to poll descriptor " << idx << ": "
+                    << cuFileGetErrorString(result) << "; retrying later";
+                return CUFileBatchPollResult::kRetry;
+            }
+
             // Other errors leave the descriptor state unknown, so quarantine
             // it and attempt cancellation.
-            if (result.err != CU_FILE_INTERNAL_BATCH_GETSTATUS_ERROR) {
-                desc->failure_seen = true;
-            }
+            desc->failure_seen = true;
             cancel_active();
             LOG(ERROR) << "Failed to poll descriptor " << idx << ": "
                        << cuFileGetErrorString(result);
-            return -1;
+            return CUFileBatchPollResult::kError;
         }
     }
 
@@ -329,7 +345,7 @@ int CUFileDescPool::pollBatch(int idx, CUFileBatchSnapshot& snapshot) {
         desc->cancel_requested.begin() + desc->submitted_count);
     snapshot.failure_seen = desc->failure_seen;
     snapshot.all_terminal = !has_active;
-    return 0;
+    return CUFileBatchPollResult::kSuccess;
 }
 
 bool CUFileDescPool::cachePolledEvent(std::vector<CUfileIOEvents_t>& io_events,

@@ -114,7 +114,17 @@ Status NVMeoFTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     }
 
     thread_local CUFileBatchSnapshot snapshot;
-    if (desc_pool_->pollBatch(nvmeof_desc.desc_idx_, snapshot) != 0) {
+    const auto poll_result =
+        desc_pool_->pollBatch(nvmeof_desc.desc_idx_, snapshot);
+    if (poll_result == CUFileBatchPollResult::kRetry) {
+        if (task.is_finished && task_id < nvmeof_desc.transfer_status.size()) {
+            status = nvmeof_desc.transfer_status[task_id];
+        } else {
+            status = {.s = PENDING, .transferred_bytes = 0};
+        }
+        return Status::OK();
+    }
+    if (poll_result == CUFileBatchPollResult::kError) {
         return Status::Context("NVMeoFTransport: Failed to poll cuFile batch");
     }
 

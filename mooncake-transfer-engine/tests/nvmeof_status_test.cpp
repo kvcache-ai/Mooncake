@@ -81,7 +81,7 @@ class FakeCUFileBatchAPI : public CUFileBatchAPI {
         EXPECT_EQ(flags, 0);
         submitted_counts.push_back(nr);
         submitted_first_cookies.push_back(params[0].cookie);
-        return success();
+        return submit_result;
     }
 
     CUfileError_t getStatus(CUfileBatchHandle_t batch_handle, unsigned min_nr,
@@ -129,6 +129,7 @@ class FakeCUFileBatchAPI : public CUFileBatchAPI {
     int cancel_calls = 0;
     CUfileBatchHandle_t submitted_handle = nullptr;
     CUfileIOParams_t* submitted_params = nullptr;
+    CUfileError_t submit_result = success();
     CUfileError_t cancel_result = success();
     CUfileError_t get_status_result = success();
     std::vector<unsigned> submitted_counts;
@@ -241,7 +242,8 @@ TEST(NVMeoFStatusTest, RejectsInvalidDescriptorOperations) {
     EXPECT_EQ(desc_pool->submitBatch(-1), -1);
     EXPECT_EQ(desc_pool->discardUnsubmittedParams(-1), -1);
     EXPECT_FALSE(desc_pool->isAcceptingSubmissions(-1));
-    EXPECT_EQ(desc_pool->pollBatch(-1, snapshot), -1);
+    EXPECT_EQ(desc_pool->pollBatch(-1, snapshot),
+              CUFileBatchPollResult::kError);
     EXPECT_EQ(desc_pool->getSliceNum(-1), -1);
     EXPECT_EQ(desc_pool->freeCUfileDesc(-1), -1);
     EXPECT_EQ(desc_pool->getDesc(-1), nullptr);
@@ -353,6 +355,14 @@ TEST(NVMeoFStatusTest, FinishedTaskPollStillDrivesDescriptorFailureCleanup) {
     ASSERT_TRUE(batch_desc.task_list[0].is_finished);
     ASSERT_FALSE(batch_desc.task_list[1].is_finished);
 
+    batch_api->get_status_result = {
+        .err = CU_FILE_INTERNAL_BATCH_GETSTATUS_ERROR, .cu_err = CUDA_SUCCESS};
+    ASSERT_TRUE(transport->getTransferStatus(batch_id, 0, status).ok());
+    EXPECT_EQ(status.s, Transport::COMPLETED);
+    EXPECT_EQ(status.transferred_bytes, 1024);
+    EXPECT_EQ(batch_api->cancel_calls, 0);
+
+    batch_api->get_status_result = FakeCUFileBatchAPI::success();
     batch_api->status_results.push_back({completion(1, CUFILE_FAILED)});
     ASSERT_TRUE(transport->getTransferStatus(batch_id, 0, status).ok());
 
@@ -509,7 +519,8 @@ TEST(NVMeoFStatusTest, ReusesSuccessfulHandleAndSubmitsOnlyNewParams) {
     batch_api->status_results.push_back({completion(1, CUFILE_COMPLETE, 2048),
                                          completion(0, CUFILE_COMPLETE, 1024)});
     CUFileBatchSnapshot snapshot;
-    ASSERT_EQ(desc_pool->pollBatch(desc_idx, snapshot), 0);
+    ASSERT_EQ(desc_pool->pollBatch(desc_idx, snapshot),
+              CUFileBatchPollResult::kSuccess);
     EXPECT_TRUE(snapshot.all_terminal);
     EXPECT_FALSE(snapshot.failure_seen);
     ASSERT_EQ(desc_pool->freeCUfileDesc(desc_idx), 0);
@@ -539,7 +550,8 @@ TEST(NVMeoFStatusTest, DiscardsOnlyUnsubmittedParams) {
 
     batch_api->status_results.push_back({completion(0, CUFILE_COMPLETE, 1024)});
     CUFileBatchSnapshot snapshot;
-    ASSERT_EQ(desc_pool->pollBatch(desc_idx, snapshot), 0);
+    ASSERT_EQ(desc_pool->pollBatch(desc_idx, snapshot),
+              CUFileBatchPollResult::kSuccess);
     ASSERT_TRUE(snapshot.all_terminal);
     EXPECT_EQ(desc_pool->freeCUfileDesc(desc_idx), 0);
 }
@@ -573,7 +585,7 @@ TEST(NVMeoFStatusTest, BuildsCUFileBatchParameters) {
     EXPECT_TRUE(transport->freeBatchID(batch_id).ok());
 }
 
-TEST(NVMeoFStatusTest, PropagatesStatusPollingErrors) {
+TEST(NVMeoFStatusTest, RetriesTransientStatusPollingErrors) {
     auto batch_api = std::make_shared<FakeCUFileBatchAPI>();
     auto desc_pool = CUFileDescPoolTestPeer::create(batch_api);
     auto transport = NVMeoFTransportTestPeer::createWithoutDriver(desc_pool);
@@ -591,7 +603,8 @@ TEST(NVMeoFStatusTest, PropagatesStatusPollingErrors) {
     batch_api->get_status_result = {
         .err = CU_FILE_INTERNAL_BATCH_GETSTATUS_ERROR, .cu_err = CUDA_SUCCESS};
     Transport::TransferStatus status{};
-    EXPECT_TRUE(transport->getTransferStatus(batch_id, 0, status).IsContext());
+    EXPECT_TRUE(transport->getTransferStatus(batch_id, 0, status).ok());
+    EXPECT_EQ(status.s, Transport::PENDING);
 
     batch_api->get_status_result = FakeCUFileBatchAPI::success();
     batch_api->status_results.push_back({completion(0, CUFILE_COMPLETE, 1024)});
@@ -626,7 +639,8 @@ TEST(NVMeoFStatusTest, ValidatesFreePreconditionsAndPoolQuiescence) {
 
     batch_api->status_results.push_back({completion(0, CUFILE_COMPLETE, 1024)});
     CUFileBatchSnapshot snapshot;
-    ASSERT_EQ(desc_pool->pollBatch(nvmeof_desc.desc_idx_, snapshot), 0);
+    ASSERT_EQ(desc_pool->pollBatch(nvmeof_desc.desc_idx_, snapshot),
+              CUFileBatchPollResult::kSuccess);
     ASSERT_TRUE(snapshot.all_terminal);
     EXPECT_TRUE(transport->freeBatchID(batch_id).ok());
 }
@@ -644,17 +658,54 @@ TEST(NVMeoFStatusTest, RetriesStatusPollingWithoutCancelingHealthyBatch) {
     batch_api->get_status_result = {
         .err = CU_FILE_INTERNAL_BATCH_GETSTATUS_ERROR, .cu_err = CUDA_SUCCESS};
     CUFileBatchSnapshot snapshot;
-    EXPECT_EQ(desc_pool->pollBatch(desc_idx, snapshot), -1);
+    EXPECT_EQ(desc_pool->pollBatch(desc_idx, snapshot),
+              CUFileBatchPollResult::kRetry);
     EXPECT_EQ(batch_api->cancel_calls, 0);
     EXPECT_TRUE(desc_pool->isAcceptingSubmissions(desc_idx));
 
     batch_api->get_status_result = FakeCUFileBatchAPI::success();
     batch_api->status_results.push_back({completion(0, CUFILE_COMPLETE, 1024)});
-    ASSERT_EQ(desc_pool->pollBatch(desc_idx, snapshot), 0);
+    ASSERT_EQ(desc_pool->pollBatch(desc_idx, snapshot),
+              CUFileBatchPollResult::kSuccess);
     EXPECT_TRUE(snapshot.all_terminal);
     EXPECT_FALSE(snapshot.failure_seen);
     EXPECT_EQ(desc_pool->freeCUfileDesc(desc_idx), 0);
     EXPECT_TRUE(batch_api->destroyed_handles.empty());
+}
+
+TEST(NVMeoFStatusTest, QuarantinesAttemptedRangeAfterSubmitError) {
+    auto batch_api = std::make_shared<FakeCUFileBatchAPI>();
+    auto desc_pool = CUFileDescPoolTestPeer::create(batch_api);
+
+    const int desc_idx = desc_pool->allocCUfileDesc(2);
+    ASSERT_GE(desc_idx, 0);
+    const auto failed_handle =
+        desc_pool->getDesc(desc_idx)->batch_handle->handle;
+    CUfileIOParams_t params{};
+    ASSERT_EQ(desc_pool->pushParams(desc_idx, params), 0);
+    ASSERT_EQ(desc_pool->pushParams(desc_idx, params), 0);
+
+    batch_api->submit_result = {.err = CU_FILE_INTERNAL_BATCH_SUBMIT_ERROR,
+                                .cu_err = CUDA_SUCCESS};
+    EXPECT_EQ(desc_pool->submitBatch(desc_idx), -1);
+    EXPECT_EQ(desc_pool->getDesc(desc_idx)->submitted_count, 2);
+    EXPECT_FALSE(desc_pool->isAcceptingSubmissions(desc_idx));
+
+    CUFileBatchSnapshot snapshot;
+    ASSERT_EQ(desc_pool->pollBatch(desc_idx, snapshot),
+              CUFileBatchPollResult::kSuccess);
+    EXPECT_TRUE(snapshot.failure_seen);
+    EXPECT_FALSE(snapshot.all_terminal);
+    EXPECT_EQ(batch_api->cancel_calls, 1);
+
+    batch_api->status_results.push_back(
+        {completion(0, CUFILE_CANCELED), completion(1, CUFILE_CANCELED)});
+    ASSERT_EQ(desc_pool->pollBatch(desc_idx, snapshot),
+              CUFileBatchPollResult::kSuccess);
+    EXPECT_TRUE(snapshot.all_terminal);
+    EXPECT_EQ(desc_pool->freeCUfileDesc(desc_idx), 0);
+    EXPECT_EQ(batch_api->destroyed_handles,
+              (std::vector<CUfileBatchHandle_t>{failed_handle}));
 }
 
 TEST(NVMeoFStatusTest, QuarantinesBatchAfterNonRetryableStatusError) {
@@ -672,14 +723,16 @@ TEST(NVMeoFStatusTest, QuarantinesBatchAfterNonRetryableStatusError) {
     batch_api->get_status_result = {.err = CU_FILE_INVALID_VALUE,
                                     .cu_err = CUDA_SUCCESS};
     CUFileBatchSnapshot snapshot;
-    EXPECT_EQ(desc_pool->pollBatch(desc_idx, snapshot), -1);
+    EXPECT_EQ(desc_pool->pollBatch(desc_idx, snapshot),
+              CUFileBatchPollResult::kError);
     EXPECT_EQ(batch_api->cancel_calls, 1);
     EXPECT_FALSE(desc_pool->isAcceptingSubmissions(desc_idx));
     EXPECT_TRUE(batch_api->destroyed_handles.empty());
 
     batch_api->get_status_result = FakeCUFileBatchAPI::success();
     batch_api->status_results.push_back({completion(0, CUFILE_CANCELED)});
-    ASSERT_EQ(desc_pool->pollBatch(desc_idx, snapshot), 0);
+    ASSERT_EQ(desc_pool->pollBatch(desc_idx, snapshot),
+              CUFileBatchPollResult::kSuccess);
     EXPECT_TRUE(snapshot.all_terminal);
     EXPECT_TRUE(snapshot.failure_seen);
     EXPECT_EQ(desc_pool->freeCUfileDesc(desc_idx), 0);

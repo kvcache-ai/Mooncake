@@ -77,6 +77,12 @@ struct CUFileBatchSnapshot {
     bool all_terminal = true;
 };
 
+enum class CUFileBatchPollResult {
+    kError = -1,
+    kSuccess = 0,
+    kRetry = 1,
+};
+
 class CUFileDescPool {
     friend class CUFileDescPoolTestPeer;
 
@@ -104,7 +110,7 @@ class CUFileDescPool {
     bool isAcceptingSubmissions(int idx);
 
     // Poll once and return a descriptor-wide completion snapshot.
-    int pollBatch(int idx, CUFileBatchSnapshot& snapshot);
+    CUFileBatchPollResult pollBatch(int idx, CUFileBatchSnapshot& snapshot);
 
     // Get current number of slices in the descriptor
     int getSliceNum(int idx);
