@@ -1852,9 +1852,9 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
         auto &buffer_handle = *alloc_result;
-        auto scatter_result = gather_maybe_device_to_host(
-            buffer_handle.ptr(), value.data(), value.size_bytes(),
-            "put_batch:" + key);
+        auto scatter_result =
+            gather_maybe_device_to_host(buffer_handle.ptr(), value.data(),
+                                        value.size_bytes(), "put_batch:" + key);
         if (!scatter_result) {
             return tl::unexpected(scatter_result.error());
         }
