@@ -591,12 +591,11 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &ssd_offload_path, const std::string &tenant_id,
     bool enable_client_http_server, int client_http_port) {
     return setup_internal_with_options(
-        local_hostname, metadata_server, global_segment_size,
-        local_buffer_size, protocol, rdma_devices, master_server_addr,
-        transfer_engine, ipc_socket_path, local_rpc_port, enable_ssd_offload,
+        local_hostname, metadata_server, global_segment_size, local_buffer_size,
+        protocol, rdma_devices, master_server_addr, transfer_engine,
+        ipc_socket_path, local_rpc_port, enable_ssd_offload,
         start_offload_rpc_server, ssd_offload_path, tenant_id,
-        enable_client_http_server, client_http_port,
-        ReplicaSelectionOptions{});
+        enable_client_http_server, client_http_port, ReplicaSelectionOptions{});
 }
 
 tl::expected<void, ErrorCode> RealClient::setup_internal_with_options(
@@ -624,12 +623,12 @@ tl::expected<void, ErrorCode> RealClient::setup_internal_with_options(
 
     if (replica_selection.mode == ReplicaSelectionMode::SHADOW) {
         ReplicaSignalProviderConfig provider_config;
-        provider_config.topology_source = {
-            true, false, std::chrono::seconds(30), 1.0};
-        provider_config.load_source = {
-            true, false, std::chrono::seconds(30), 1.0};
-        provider_config.health_source = {
-            true, false, std::chrono::seconds(30), 1.0};
+        provider_config.topology_source = {true, false,
+                                           std::chrono::seconds(30), 1.0};
+        provider_config.load_source = {true, false, std::chrono::seconds(30),
+                                       1.0};
+        provider_config.health_source = {true, false, std::chrono::seconds(30),
+                                         1.0};
         replica_score_provider_ =
             std::make_shared<CachedReplicaScoreProvider>(provider_config);
         replica_transfer_signal_collector_ =
@@ -642,8 +641,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal_with_options(
     } else {
         replica_transfer_signal_collector_.reset();
         replica_score_provider_.reset();
-        replica_selector_ = std::make_unique<ReplicaSelector>(
-            ReplicaSelectionMode::LEGACY);
+        replica_selector_ =
+            std::make_unique<ReplicaSelector>(ReplicaSelectionMode::LEGACY);
     }
 
     this->protocol = protocol;
@@ -1018,11 +1017,11 @@ int RealClient::setup_real_with_options(
     bool enable_client_http_server, int client_http_port,
     ReplicaSelectionOptions replica_selection) {
     return to_py_ret(setup_internal_with_options(
-        local_hostname, metadata_server, global_segment_size,
-        local_buffer_size, protocol, rdma_devices, master_server_addr,
-        transfer_engine, ipc_socket_path, 50052, enable_ssd_offload, true,
-        ssd_offload_path, tenant_id, enable_client_http_server,
-        client_http_port, replica_selection));
+        local_hostname, metadata_server, global_segment_size, local_buffer_size,
+        protocol, rdma_devices, master_server_addr, transfer_engine,
+        ipc_socket_path, 50052, enable_ssd_offload, true, ssd_offload_path,
+        tenant_id, enable_client_http_server, client_http_port,
+        replica_selection));
 }
 
 ReplicaSelectionMode RealClient::replica_selection_mode() const noexcept {
@@ -1060,12 +1059,12 @@ const Replica::Descriptor *RealClient::select_replica_for_read(
 
     const auto local_endpoints = client_->GetLocalEndpoints();
     if (replica_transfer_signal_collector_) {
-        for (const auto& replica : replicas) {
+        for (const auto &replica : replicas) {
             if (replica.status != ReplicaStatus::COMPLETE ||
                 !replica.is_memory_replica()) {
                 continue;
             }
-            const auto& handle =
+            const auto &handle =
                 replica.get_memory_descriptor().buffer_descriptor;
             if (!local_endpoints.contains(handle.transport_endpoint_)) {
                 replica_transfer_signal_collector_->ObserveEndpoint(
@@ -1081,7 +1080,11 @@ const Replica::Descriptor *RealClient::select_replica_for_read(
         }
     }
     const ReplicaSelectionContext context{
-        client_->tenant_id(), key, local_hostname, "", requested_bytes,
+        client_->tenant_id(),
+        key,
+        local_hostname,
+        "",
+        requested_bytes,
         replica_selection_nonce_.fetch_add(1, std::memory_order_relaxed)};
     const auto selection_start = std::chrono::steady_clock::now();
     const auto decision =
@@ -1271,8 +1274,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         local_hostname, metadata_server, global_segment_size, local_buffer_size,
         protocol, rdma_devices, master_server_addr, nullptr, ipc_socket_path,
         50052, enable_ssd_offload, true, ssd_offload_path, tenant_id,
-        enable_client_http_server, client_http_port,
-        *replica_selection);
+        enable_client_http_server, client_http_port, *replica_selection);
 }
 
 tl::expected<void, ErrorCode> RealClient::initAll_internal(

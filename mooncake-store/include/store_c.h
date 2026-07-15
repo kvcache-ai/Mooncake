@@ -70,12 +70,13 @@ int mooncake_store_setup(mooncake_store_t store, const char *local_hostname,
                          const char *device_name,
                          const char *master_server_addr);
 
-int mooncake_store_setup_ex(
-    mooncake_store_t store, const char *local_hostname,
-    const char *metadata_server, uint64_t global_segment_size,
-    uint64_t local_buffer_size, const char *protocol, const char *device_name,
-    const char *master_server_addr,
-    const mooncake_store_setup_options_t *options);
+int mooncake_store_setup_ex(mooncake_store_t store, const char *local_hostname,
+                            const char *metadata_server,
+                            uint64_t global_segment_size,
+                            uint64_t local_buffer_size, const char *protocol,
+                            const char *device_name,
+                            const char *master_server_addr,
+                            const mooncake_store_setup_options_t *options);
 
 int mooncake_store_init_all(mooncake_store_t store, const char *protocol,
                             const char *device_name,

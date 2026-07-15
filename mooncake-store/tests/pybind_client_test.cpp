@@ -979,9 +979,9 @@ TEST_F(RealClientTest, SetupWithShadowReplicaSelection) {
         << "Failed to start in-proc master";
     master_address_ = master_.master_address();
 
-    ConfigDict config = MakeConfigDict(
-        "localhost:17817", std::to_string(16 * 1024 * 1024),
-        std::to_string(16 * 1024 * 1024));
+    ConfigDict config =
+        MakeConfigDict("localhost:17817", std::to_string(16 * 1024 * 1024),
+                       std::to_string(16 * 1024 * 1024));
     config[CONFIG_KEY_REPLICA_SELECTION_MODE] = "shadow";
 
     const auto result = py_client_->setup_internal(config);
@@ -996,9 +996,9 @@ TEST_F(RealClientTest, SetupWithShadowReplicaSelection) {
 }
 
 TEST_F(RealClientTest, SetupRejectsNonPublicReplicaSelectionModes) {
-    ConfigDict config = MakeConfigDict(
-        "localhost:17818", std::to_string(16 * 1024 * 1024),
-        std::to_string(16 * 1024 * 1024));
+    ConfigDict config =
+        MakeConfigDict("localhost:17818", std::to_string(16 * 1024 * 1024),
+                       std::to_string(16 * 1024 * 1024));
 
     for (const std::string_view invalid : {"", "active", "SHADOW", "v2"}) {
         config[CONFIG_KEY_REPLICA_SELECTION_MODE] = std::string(invalid);
