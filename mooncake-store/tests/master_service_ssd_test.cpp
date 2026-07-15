@@ -502,7 +502,7 @@ TEST_F(MasterServiceSSDTest, PutStartExpires) {
     ASSERT_TRUE(mount_result.has_value());
 
     std::string key = "test_key";
-    uint64_t value_length = 16 * 1024 * 1024;  // 16MB
+    uint64_t value_length = 8 * 1024 * 1024;  // 8MB
     uint64_t slice_length = value_length;
     ReplicateConfig config;
 
