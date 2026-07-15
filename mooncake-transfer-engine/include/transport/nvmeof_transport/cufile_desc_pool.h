@@ -74,6 +74,12 @@ class CUFileDescPool {
     // Get transfer status for a specific slice
     CUfileIOEvents_t getTransferStatus(int idx, int slice_id);
 
+    // Poll cuFile once for the batch and update cached completion events.
+    bool updateBatchStatus(int idx);
+
+    // Get cached transfer status for a specific slice.
+    CUfileIOEvents_t getCachedTransferStatus(int idx, int slice_id);
+
     // Best-effort cancellation for a submitted batch.
     bool cancelBatch(int idx);
 
@@ -92,8 +98,14 @@ class CUFileDescPool {
    private:
     static bool cachePolledEvent(std::vector<CUfileIOEvents_t>& io_events,
                                  const CUfileIOEvents_t& event);
+    static bool isTerminalStatus(CUfileStatus_t status);
+    static CUfileIOEvents_t failedEvent();
+    static void destroyDesc(CUFileBatchDesc* desc);
+    static bool updateBatchStatus(CUFileBatchDesc* desc, int idx);
 
     static const size_t MAX_NR_DESC = 256;  // Max number of descriptors
+    void cleanupQuarantinedDescs();
+
     size_t max_batch_size_;
 
     // Object pool for BatchHandle to avoid frequent cuFileBatchIOSetUp/Destroy

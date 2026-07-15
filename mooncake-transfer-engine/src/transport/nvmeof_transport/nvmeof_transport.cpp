@@ -199,8 +199,9 @@ void NVMeoFTransport::collectSliceStatuses(
     std::vector<TransferStatus> &slice_statuses) {
     slice_statuses.clear();
     slice_statuses.reserve(slice_num);
+    desc_pool_->updateBatchStatus(desc_idx);
     for (size_t i = slice_id; i < slice_id + slice_num; ++i) {
-        auto event = desc_pool_->getTransferStatus(desc_idx, i);
+        auto event = desc_pool_->getCachedTransferStatus(desc_idx, i);
         auto slice_status = from_cufile_transfer_status(event.status);
         slice_statuses.push_back(TransferStatus{
             .s = slice_status,
