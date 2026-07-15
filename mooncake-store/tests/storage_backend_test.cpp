@@ -297,6 +297,17 @@ TEST_F(StorageBackendTest, ShardedBackendBalancesRendezvousPlacement) {
     }
 }
 
+TEST_F(StorageBackendTest, ShardedBackendRejectsEmptyBackendList) {
+    FileStorageConfig config;
+    config.storage_backend_type = StorageBackendType::kFilePerKey;
+    config.storage_filepath = data_path;
+
+    std::vector<std::shared_ptr<StorageBackendInterface>> children;
+    EXPECT_THROW(
+        { ShardedStorageBackend backend(config, children); },
+        std::invalid_argument);
+}
+
 TEST_F(StorageBackendTest, StorageBackendAll) {
     std::shared_ptr<SimpleAllocator> client_buffer_allocator =
         std::make_shared<SimpleAllocator>(128 * 1024 * 1024);

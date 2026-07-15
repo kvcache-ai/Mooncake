@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <future>
 #include <mutex>
+#include <stdexcept>
 #include <utility>
 
 namespace mooncake {
@@ -39,6 +40,10 @@ ShardedStorageBackend::ShardedStorageBackend(
     std::vector<std::shared_ptr<StorageBackendInterface>> backends)
     : StorageBackendInterface(file_storage_config),
       backends_(std::move(backends)) {
+    if (backends_.empty()) {
+        throw std::invalid_argument(
+            "ShardedStorageBackend: backends list cannot be empty");
+    }
     backend_ids_.reserve(backends_.size());
     for (const auto& backend : backends_) {
         backend_ids_.push_back(
@@ -102,7 +107,12 @@ tl::expected<size_t, ErrorCode> ShardedStorageBackend::ResolveBackend(
     {
         std::shared_lock lock(route_overrides_mutex_);
         auto it = route_overrides_.find(key);
-        if (it != route_overrides_.end()) return it->second;
+        if (it != route_overrides_.end()) {
+            if (it->second >= backends_.size()) {
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            return it->second;
+        }
     }
 
     const size_t preferred = SelectBackend(key);
@@ -144,6 +154,9 @@ tl::expected<int64_t, ErrorCode> ShardedStorageBackend::BatchOffload(
             std::shared_lock lock(route_overrides_mutex_);
             auto route = route_overrides_.find(key);
             if (route != route_overrides_.end()) index = route->second;
+        }
+        if (index >= backends_.size()) {
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
         batches[index].emplace(key, slices);
     }
@@ -311,6 +324,9 @@ tl::expected<void, ErrorCode> ShardedStorageBackend::AllocateOffloadingBuckets(
             std::shared_lock lock(route_overrides_mutex_);
             auto route = route_overrides_.find(key);
             if (route != route_overrides_.end()) index = route->second;
+        }
+        if (index >= backends_.size()) {
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
         per_backend[index].emplace(key, size);
     }
