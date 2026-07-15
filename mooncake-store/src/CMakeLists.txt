@@ -77,6 +77,7 @@ set(MOONCAKE_STORE_SOURCES
     ha/oplog/p2p_oplog_types.cpp
     ha/oplog/p2p_oplog_applier.cpp
     ha/oplog/p2p_standby_metadata_store.cpp
+    ha/oplog/p2p_hot_standby_service.cpp
     standby_state_machine.cpp
     ha_metric_manager.cpp
 )

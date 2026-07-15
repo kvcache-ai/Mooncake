@@ -94,8 +94,9 @@ TEST(P2PStandbyMetadataStoreTest, AddReplicaAfterClientRegistered) {
     store.RegisterClient(client_id, "10.0.0.1", 50051, {});
     store.AddReplica("key1", client_id, seg_id, 1024, 1);
 
-    auto it = store.GetObjects().find("key1");
-    ASSERT_NE(it, store.GetObjects().end());
+    auto objects = store.GetObjects();
+    auto it = objects.find("key1");
+    ASSERT_NE(it, objects.end());
     ASSERT_EQ(it->second.replicas.size(), 1u);
     auto& p2p =
         std::get<P2PProxyDescriptor>(it->second.replicas[0].descriptor_variant);
@@ -118,7 +119,7 @@ TEST(P2PStandbyMetadataStoreTest, AddReplicaPreservesSegmentExtra) {
 
     store.AddReplica("key1", client_id, seg_id, 1024, 1);
 
-    auto* info = store.GetClient(client_id);
+    auto info = store.GetClient(client_id);
     ASSERT_NE(info, nullptr);
     ASSERT_EQ(info->segments.size(), 1u);
     ASSERT_TRUE(info->segments[0].IsP2PSegment());
@@ -136,7 +137,7 @@ TEST(P2PStandbyMetadataStoreTest, AddReplicaCreatesObject) {
 
     store.AddReplica("model-weights", client_id, seg_id, 4096, 123);
 
-    const auto& objects = store.GetObjects();
+    auto objects = store.GetObjects();
     ASSERT_EQ(objects.size(), 1u);
     auto it = objects.find("model-weights");
     ASSERT_NE(it, objects.end());
@@ -154,8 +155,9 @@ TEST(P2PStandbyMetadataStoreTest, AddReplicaMultiple) {
     store.AddReplica("key1", client1, seg1, 1024, 1);
     store.AddReplica("key1", client2, seg2, 2048, 2);
 
-    auto it = store.GetObjects().find("key1");
-    ASSERT_NE(it, store.GetObjects().end());
+    auto objects = store.GetObjects();
+    auto it = objects.find("key1");
+    ASSERT_NE(it, objects.end());
     EXPECT_EQ(it->second.last_sequence_id, 2u);
     EXPECT_EQ(it->second.replicas.size(), 2u);
 }
@@ -168,8 +170,9 @@ TEST(P2PStandbyMetadataStoreTest, AddReplicaDuplicateIgnored) {
     store.AddReplica("key1", client, seg, 1024, 1);
     store.AddReplica("key1", client, seg, 1024, 2);
 
-    auto it = store.GetObjects().find("key1");
-    ASSERT_NE(it, store.GetObjects().end());
+    auto objects = store.GetObjects();
+    auto it = objects.find("key1");
+    ASSERT_NE(it, objects.end());
     EXPECT_EQ(it->second.last_sequence_id, 2u);
     EXPECT_EQ(it->second.replicas.size(), 1u);
 }
@@ -187,8 +190,9 @@ TEST(P2PStandbyMetadataStoreTest, RemoveReplica) {
     // Remove one replica
     store.RemoveReplica("key1", client1, seg1);
 
-    auto it = store.GetObjects().find("key1");
-    ASSERT_NE(it, store.GetObjects().end());
+    auto objects = store.GetObjects();
+    auto it = objects.find("key1");
+    ASSERT_NE(it, objects.end());
     EXPECT_EQ(it->second.replicas.size(), 1u);
 }
 
@@ -227,7 +231,7 @@ TEST(P2PStandbyMetadataStoreTest, RegisterClientBasic) {
 
     store.RegisterClient(client_id, "192.168.1.1", 50051, segments);
 
-    auto* info = store.GetClient(client_id);
+    auto info = store.GetClient(client_id);
     ASSERT_NE(info, nullptr);
     EXPECT_EQ(info->ip_address, "192.168.1.1");
     EXPECT_EQ(info->rpc_port, 50051u);
@@ -242,7 +246,7 @@ TEST(P2PStandbyMetadataStoreTest, RegisterClientUpdatesExisting) {
     store.RegisterClient(client_id, "10.0.0.1", 50052,
                          {MakeSegment(MakeUUID(100, 0))});
 
-    auto* info = store.GetClient(client_id);
+    auto info = store.GetClient(client_id);
     ASSERT_NE(info, nullptr);
     EXPECT_EQ(info->ip_address, "10.0.0.1");
     EXPECT_EQ(info->rpc_port, 50052u);
@@ -265,7 +269,7 @@ TEST(P2PStandbyMetadataStoreTest, RegisterClientPreservesEarlyMountSegment) {
     store.RegisterClient(client_id, "192.168.1.1", 50051, {reg_seg});
 
     // Both segments should be preserved (merge, not overwrite)
-    auto* info = store.GetClient(client_id);
+    auto info = store.GetClient(client_id);
     ASSERT_NE(info, nullptr);
     EXPECT_EQ(info->segments.size(), 2u);
 }
@@ -282,7 +286,7 @@ TEST(P2PStandbyMetadataStoreTest, RegisterClientDuplicateSegmentIgnored) {
     // REGISTER_CLIENT with same segment — should not duplicate
     store.RegisterClient(client_id, "10.0.0.1", 50051, {seg});
 
-    auto* info = store.GetClient(client_id);
+    auto info = store.GetClient(client_id);
     ASSERT_NE(info, nullptr);
     EXPECT_EQ(info->segments.size(), 1u);
 }
@@ -296,8 +300,9 @@ TEST(P2PStandbyMetadataStoreTest, RegisterClientUpdatesReplicaIPs) {
     store.AddReplica("key1", client_id, seg_id, 1024, 1);
 
     // Verify replica has empty ip/port (backfilling deferred to ExportMetadata)
-    auto it = store.GetObjects().find("key1");
-    ASSERT_NE(it, store.GetObjects().end());
+    auto objects = store.GetObjects();
+    auto it = objects.find("key1");
+    ASSERT_NE(it, objects.end());
     ASSERT_EQ(it->second.replicas.size(), 1u);
     auto& desc = it->second.replicas[0];
     auto& p2p = std::get<P2PProxyDescriptor>(desc.descriptor_variant);
@@ -308,8 +313,9 @@ TEST(P2PStandbyMetadataStoreTest, RegisterClientUpdatesReplicaIPs) {
     store.RegisterClient(client_id, "192.168.1.1", 50051, {});
 
     // In-place replicas still have empty ip/port
-    it = store.GetObjects().find("key1");
-    ASSERT_NE(it, store.GetObjects().end());
+    objects = store.GetObjects();
+    it = objects.find("key1");
+    ASSERT_NE(it, objects.end());
     auto& in_place_p2p =
         std::get<P2PProxyDescriptor>(it->second.replicas[0].descriptor_variant);
     EXPECT_TRUE(in_place_p2p.ip_address.empty());
@@ -393,14 +399,14 @@ TEST(P2PStandbyMetadataStoreTest, UnRegisterClientPreservesOtherClients) {
     ASSERT_NE(store.GetClient(client2), nullptr);
     EXPECT_EQ(store.GetKeyCount(), 1u);
 
-    auto shared_it = store.GetObjects().find("shared-key");
-    ASSERT_NE(shared_it, store.GetObjects().end());
+    auto objects = store.GetObjects();
+    auto shared_it = objects.find("shared-key");
+    ASSERT_NE(shared_it, objects.end());
     ASSERT_EQ(shared_it->second.replicas.size(), 1u);
     const auto& p2p = std::get<P2PProxyDescriptor>(
         shared_it->second.replicas[0].descriptor_variant);
     EXPECT_EQ(p2p.client_id, client2);
-    EXPECT_EQ(store.GetObjects().find("client1-only"),
-              store.GetObjects().end());
+    EXPECT_EQ(objects.find("client1-only"), objects.end());
 }
 
 // ============================================================================
@@ -416,7 +422,7 @@ TEST(P2PStandbyMetadataStoreTest, AddSegmentDuplicateIgnored) {
     store.AddSegment(client_id, seg);
     store.AddSegment(client_id, seg);  // duplicate — should be ignored
 
-    auto* info = store.GetClient(client_id);
+    auto info = store.GetClient(client_id);
     ASSERT_NE(info, nullptr);
     EXPECT_EQ(info->segments.size(), 1u);
 }
@@ -439,7 +445,7 @@ TEST(P2PStandbyMetadataStoreTest, AddAndRemoveSegment) {
 
     store.AddSegment(client_id, seg);
 
-    auto* info = store.GetClient(client_id);
+    auto info = store.GetClient(client_id);
     ASSERT_NE(info, nullptr);
     EXPECT_EQ(info->segments.size(), 1u);
     EXPECT_EQ(info->segments[0].id, seg_id);
@@ -458,13 +464,15 @@ TEST(P2PStandbyMetadataStoreTest, RemoveSegmentCascadeDeletesReplicas) {
 
     // Add replica on this segment
     store.AddReplica("key1", client_id, seg_id, 1024, 1);
-    ASSERT_EQ(store.GetObjects().size(), 1u);
+    auto objects = store.GetObjects();
+    ASSERT_EQ(objects.size(), 1u);
 
     // Unmount the segment — should cascade delete replicas
     store.RemoveSegment(seg_id, client_id);
 
     // Object should be gone (no replicas left)
-    EXPECT_EQ(store.GetObjects().size(), 0u);
+    objects = store.GetObjects();
+    EXPECT_EQ(objects.size(), 0u);
 }
 
 TEST(P2PStandbyMetadataStoreTest, RemoveSegmentDoesNotAffectOtherSegments) {
@@ -477,13 +485,15 @@ TEST(P2PStandbyMetadataStoreTest, RemoveSegmentDoesNotAffectOtherSegments) {
     store.AddReplica("key1", client_id, seg1, 1024, 1);
     store.AddReplica("key1", client_id, seg2, 2048, 1);
 
-    ASSERT_EQ(store.GetObjects().find("key1")->second.replicas.size(), 2u);
+    auto objects = store.GetObjects();
+    ASSERT_EQ(objects.find("key1")->second.replicas.size(), 2u);
 
     // Remove seg1 — should only remove replica on seg1
     store.RemoveSegment(seg1, client_id);
 
-    auto it = store.GetObjects().find("key1");
-    ASSERT_NE(it, store.GetObjects().end());
+    objects = store.GetObjects();
+    auto it = objects.find("key1");
+    ASSERT_NE(it, objects.end());
     EXPECT_EQ(it->second.replicas.size(), 1u);
 }
 

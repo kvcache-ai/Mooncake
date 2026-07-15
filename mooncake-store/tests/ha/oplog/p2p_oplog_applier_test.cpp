@@ -109,7 +109,7 @@ TEST(P2POpLogApplierTest, ApplyAddReplica) {
     auto entry = MakeAddReplicaEntry(1, "model-weights", payload);
     EXPECT_TRUE(applier.ApplyOpLogEntry(entry));
 
-    auto& objects = store.GetObjects();
+    auto objects = store.GetObjects();
     ASSERT_EQ(objects.size(), 1u);
     EXPECT_NE(objects.find("model-weights"), objects.end());
     EXPECT_EQ(objects.at("model-weights").replicas.size(), 1u);
@@ -207,7 +207,7 @@ TEST(P2POpLogApplierTest, ApplyMountSegment) {
     auto entry = MakeMountSegmentEntry(1, payload);
     EXPECT_TRUE(applier.ApplyOpLogEntry(entry));
 
-    auto* info = store.GetClient(client);
+    auto info = store.GetClient(client);
     ASSERT_NE(info, nullptr);
     ASSERT_EQ(info->segments.size(), 1u);
     EXPECT_EQ(info->segments[0].id, seg_id);
@@ -249,7 +249,7 @@ TEST(P2POpLogApplierTest, ApplyUnmountSegment) {
     applier.ApplyOpLogEntry(MakeUnmountSegmentEntry(3, umount_payload));
 
     EXPECT_EQ(store.GetKeyCount(), 0u);  // Object removed (no replicas)
-    auto* info = store.GetClient(client);
+    auto info = store.GetClient(client);
     ASSERT_NE(info, nullptr);
     EXPECT_EQ(info->segments.size(), 0u);  // Segment removed
 }
@@ -274,7 +274,7 @@ TEST(P2POpLogApplierTest, ApplyRegisterClient) {
     auto entry = MakeRegisterClientEntry(1, payload);
     EXPECT_TRUE(applier.ApplyOpLogEntry(entry));
 
-    auto* info = store.GetClient(client);
+    auto info = store.GetClient(client);
     ASSERT_NE(info, nullptr);
     EXPECT_EQ(info->ip_address, "192.168.1.100");
     EXPECT_EQ(info->rpc_port, 50051u);
@@ -330,8 +330,9 @@ TEST(P2POpLogApplierTest, ApplyUnregisterClient) {
 
     EXPECT_EQ(store.GetClient(client), nullptr);
     ASSERT_NE(store.GetClient(other_client), nullptr);
-    auto object_it = store.GetObjects().find("shared-key");
-    ASSERT_NE(object_it, store.GetObjects().end());
+    auto objects = store.GetObjects();
+    auto object_it = objects.find("shared-key");
+    ASSERT_NE(object_it, objects.end());
     ASSERT_EQ(object_it->second.replicas.size(), 1u);
     const auto& p2p = std::get<P2PProxyDescriptor>(
         object_it->second.replicas[0].descriptor_variant);

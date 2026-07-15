@@ -22,8 +22,6 @@ namespace mooncake {
 /// maintains both object metadata (via MetadataStore) and P2P-specific state
 /// (client registrations, segment mappings).
 ///
-/// Note: primary-side recording for UNREGISTER_CLIENT is intentionally deferred
-/// to the follow-up change that wires lifecycle events into RecordOplog().
 class P2POpLogApplier : public OpLogApplier {
    public:
     /// Constructor.
