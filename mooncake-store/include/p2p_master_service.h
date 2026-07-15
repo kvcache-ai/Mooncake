@@ -6,6 +6,7 @@
 #include "p2p_client_manager.h"
 #include "p2p_rpc_types.h"
 #include "ha/oplog/oplog_manager.h"
+#include "ha/oplog/p2p_standby_metadata_store.h"
 
 namespace mooncake {
 
@@ -69,6 +70,18 @@ class P2PMasterService : public MasterService {
      * @brief Client notifies Master that metadata sync is complete
      */
     auto SetSyncCompleted(UUID client_id) -> tl::expected<void, ErrorCode>;
+
+    /**
+     * @brief Restore P2P metadata exported by P2PHotStandbyService promotion.
+     *
+     * The target service must be empty. Restore registers clients/segments and
+     * rebuilds object metadata plus segment reverse indexes without recording
+     * new OpLog entries. If last_applied_sequence_id is provided, the target
+     * OpLogManager starts future writes after that sequence.
+     */
+    ErrorCode RestoreFromStandbyMetadata(
+        const P2PStandbyMetadataStore::ExportedMetadata& metadata,
+        uint64_t last_applied_sequence_id = 0);
 
     ErrorCode RecordOplog(OpType type, const std::string& key,
                           const std::string& payload = std::string());

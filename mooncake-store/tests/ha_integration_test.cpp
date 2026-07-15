@@ -304,6 +304,7 @@ TEST_F(HAIntegrationTest, DegradedModeLocalOps) {
     EXPECT_FALSE(exist_none.value());
 
     ForceRecover(client1_);
+    client1_->StopHeartbeat();
 }
 
 // A3: Degraded mode — remote Get returns OBJECT_NOT_FOUND;
@@ -469,6 +470,43 @@ TEST_F(HAIntegrationTest, MasterSideState) {
         ASSERT_NE(p2p_meta, nullptr);
         EXPECT_FALSE(p2p_meta->IsSyncing());
     }
+}
+
+// A8: Re-registration reports current local tier segments to the master.
+TEST_F(HAIntegrationTest, ReRegisterReportsCurrentTierSegments) {
+    auto expected_segments = client1_->CollectTierSegments();
+    ASSERT_FALSE(expected_segments.empty());
+
+    auto& svc = master_.GetWrapped().GetMasterService();
+    UnregisterClientRequest unreg;
+    unreg.client_id = client1_->GetClientID();
+    unreg.deployment_mode = DeploymentMode::P2P;
+    auto unreg_result = svc.UnregisterClient(unreg);
+    ASSERT_TRUE(unreg_result.has_value())
+        << "UnregisterClient failed: " << unreg_result.error();
+
+    auto reg_result = client1_->RegisterClient();
+    ASSERT_TRUE(reg_result.has_value())
+        << "Re-register failed: " << reg_result.error();
+
+    auto registered_segments =
+        svc.GetClientManager().GetClientSegments(client1_->GetClientID());
+    ASSERT_TRUE(registered_segments.has_value())
+        << "GetClientSegments failed: " << registered_segments.error();
+    EXPECT_EQ(registered_segments.value().size(), expected_segments.size());
+
+    for (const auto& segment : expected_segments) {
+        auto registered = svc.GetClientManager().QuerySegment(
+            client1_->GetClientID(), segment.id);
+        ASSERT_TRUE(registered.has_value())
+            << "Missing registered segment: " << segment.name;
+        EXPECT_EQ(registered.value()->name, segment.name);
+        EXPECT_EQ(registered.value()->size, segment.size);
+        EXPECT_EQ(registered.value()->GetP2PExtra().memory_type,
+                  segment.GetP2PExtra().memory_type);
+    }
+
+    ForceRecover(client1_);
 }
 
 // ============================================================================

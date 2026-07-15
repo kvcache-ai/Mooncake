@@ -190,8 +190,9 @@ ErrorCode P2PHotStandbyService::FinalCatchUpForPromotionLocked(
 
     static constexpr size_t kBatchSize = 1000;
     static constexpr size_t kMaxCatchUpBatches = 100;
-    // TODO: Add election/readiness gating before allowing promotion: require
-    // initial sync completion, enforce max standby lag, and monitor apply rate.
+    // TODO: Add promotion readiness gating and a clear fail/continue policy for
+    // incomplete catch-up: require initial sync completion, enforce max standby
+    // lag, handle final catch-up read failures, and monitor apply rate.
     uint64_t read_from_seq = current_applied_seq_id;
     size_t total_applied = 0;
     size_t batch_count = 0;

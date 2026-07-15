@@ -1,10 +1,13 @@
 #include "ha_helper.h"
 #include "etcd_helper.h"
 #include "centralized_rpc_service.h"
+#include "ha/oplog/p2p_hot_standby_service.h"
 #include "p2p_rpc_service.h"
 #ifdef STORE_USE_REDIS
 #include "redis_master_view_helper.h"
 #endif
+
+#include <optional>
 
 namespace mooncake {
 
@@ -157,6 +160,25 @@ int MasterServiceSupervisor::Start() {
             return -1;
         }
 
+        std::unique_ptr<P2PHotStandbyService> p2p_standby;
+        if (config_.deployment_mode == DeploymentMode::P2P &&
+            config_.enable_oplog) {
+            P2PHotStandbyConfig standby_config;
+            standby_config.cluster_id = config_.cluster_id;
+            standby_config.oplog_store_type =
+                ParseOpLogStoreType(config_.oplog_store_type);
+            standby_config.oplog_store_root_dir = config_.oplog_data_dir;
+
+            p2p_standby =
+                std::make_unique<P2PHotStandbyService>(standby_config);
+            auto standby_start = p2p_standby->Start();
+            if (standby_start != ErrorCode::OK) {
+                LOG(ERROR) << "Failed to start P2P hot standby service"
+                           << ", error=" << toString(standby_start);
+                return -1;
+            }
+        }
+
         LOG(INFO) << "Trying to elect self as leader...";
         EtcdLeaseId lease_id = 0;
         // view_version will be updated by ElectLeader and then used in
@@ -177,6 +199,24 @@ int MasterServiceSupervisor::Start() {
         std::this_thread::sleep_for(
             std::chrono::seconds(mv_helper->GetLeaderLeaseTTLSeconds()));
 
+        std::optional<P2PStandbyMetadataStore::ExportedMetadata>
+            p2p_promoted_metadata;
+        uint64_t p2p_promoted_sequence_id = 0;
+        if (p2p_standby) {
+            auto promote_err = p2p_standby->Promote();
+            if (promote_err != ErrorCode::OK) {
+                LOG(ERROR) << "Failed to promote P2P hot standby service"
+                           << ", error=" << toString(promote_err);
+                mv_helper->CancelKeepAlive(lease_id);
+                keep_leader_thread.join();
+                return -1;
+            }
+            p2p_promoted_sequence_id =
+                p2p_standby->GetLatestAppliedSequenceId();
+            p2p_promoted_metadata = p2p_standby->ExportMetadata();
+            p2p_standby.reset();
+        }
+
         LOG(INFO) << "Starting master service...";
         std::unique_ptr<WrappedMasterService> wrapped_master_service;
         if (config_.deployment_mode == DeploymentMode::CENTRALIZATION) {
@@ -187,10 +227,26 @@ int MasterServiceSupervisor::Start() {
                 server, static_cast<WrappedCentralizedMasterService&>(
                             *wrapped_master_service));
         } else {
-            wrapped_master_service = std::make_unique<WrappedP2PMasterService>(
-                WrappedMasterServiceConfig(config_, view_version));
-            RegisterP2PRpcService(server, static_cast<WrappedP2PMasterService&>(
-                                              *wrapped_master_service));
+            auto p2p_wrapped_service =
+                std::make_unique<WrappedP2PMasterService>(
+                    WrappedMasterServiceConfig(config_, view_version));
+            if (p2p_promoted_metadata.has_value()) {
+                auto& p2p_master_service = static_cast<P2PMasterService&>(
+                    p2p_wrapped_service->GetMasterService());
+                auto restore_err =
+                    p2p_master_service.RestoreFromStandbyMetadata(
+                        p2p_promoted_metadata.value(),
+                        p2p_promoted_sequence_id);
+                if (restore_err != ErrorCode::OK) {
+                    LOG(ERROR) << "Failed to restore P2P promoted metadata"
+                               << ", error=" << toString(restore_err);
+                    mv_helper->CancelKeepAlive(lease_id);
+                    keep_leader_thread.join();
+                    return -1;
+                }
+            }
+            RegisterP2PRpcService(server, *p2p_wrapped_service);
+            wrapped_master_service = std::move(p2p_wrapped_service);
         }
         // Metric reporting is now handled by WrappedMasterService.
 
