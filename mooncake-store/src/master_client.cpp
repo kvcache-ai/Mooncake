@@ -223,6 +223,21 @@ struct RpcNameTraits<&WrappedMasterService::OffloadObjectHeartbeat> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::ReportNicLoadStats> {
+    static constexpr const char* value = "ReportNicLoadStats";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchGetNicLoadStats> {
+    static constexpr const char* value = "BatchGetNicLoadStats";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchGetNicLoadStatsByEndpoints> {
+    static constexpr const char* value = "BatchGetNicLoadStatsByEndpoints";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::ReportSsdCapacity> {
     static constexpr const char* value = "ReportSsdCapacity";
 };
@@ -995,6 +1010,31 @@ tl::expected<void, ErrorCode> MasterClient::ReportSsdCapacity(
                      ", ssd_total_capacity_bytes=", ssd_total_capacity_bytes);
     return invoke_rpc<&WrappedMasterService::ReportSsdCapacity, void>(
         client_id, ssd_total_capacity_bytes);
+}
+
+tl::expected<void, ErrorCode> MasterClient::ReportNicLoadStats(
+    const UUID& client_id, const std::vector<NicLoadStat>& stats) {
+    ScopedVLogTimer timer(1, "MasterClient::ReportNicLoadStats");
+    timer.LogRequest("client_id=", client_id, ", device_count=", stats.size());
+    return invoke_rpc<&WrappedMasterService::ReportNicLoadStats, void>(
+        client_id, stats);
+}
+
+tl::expected<std::vector<ClientNicLoadStats>, ErrorCode>
+MasterClient::BatchGetNicLoadStats(const std::vector<UUID>& client_ids) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchGetNicLoadStats");
+    timer.LogRequest("client_id_count=", client_ids.size());
+    return invoke_rpc<&WrappedMasterService::BatchGetNicLoadStats,
+                      std::vector<ClientNicLoadStats>>(client_ids);
+}
+
+tl::expected<std::vector<ClientNicLoadStats>, ErrorCode>
+MasterClient::BatchGetNicLoadStatsByEndpoints(
+    const std::vector<std::string>& endpoints) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchGetNicLoadStatsByEndpoints");
+    timer.LogRequest("endpoint_count=", endpoints.size());
+    return invoke_rpc<&WrappedMasterService::BatchGetNicLoadStatsByEndpoints,
+                      std::vector<ClientNicLoadStats>>(endpoints);
 }
 
 tl::expected<void, ErrorCode> MasterClient::NotifyOffloadSuccess(

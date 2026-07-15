@@ -27,6 +27,36 @@ struct PingResponse {
 YLT_REFL(PingResponse, view_version_id, client_status);
 
 /**
+ * @brief Per-NIC device load statistics reported by each client.
+ */
+struct NicLoadStat {
+    std::string device_name;
+    uint64_t inflight_bytes;
+    double ewma_bandwidth_bps;
+
+    NicLoadStat() : inflight_bytes(0), ewma_bandwidth_bps(0.0) {}
+    NicLoadStat(std::string device_name_param, uint64_t inflight_bytes_param,
+                double ewma_bandwidth_bps_param)
+        : device_name(std::move(device_name_param)),
+          inflight_bytes(inflight_bytes_param),
+          ewma_bandwidth_bps(ewma_bandwidth_bps_param) {}
+};
+YLT_REFL(NicLoadStat, device_name, inflight_bytes, ewma_bandwidth_bps);
+
+/**
+ * @brief Aggregated NIC load statistics for a single client.
+ */
+struct ClientNicLoadStats {
+    UUID client_id;
+    std::string endpoint;
+    std::vector<NicLoadStat> devices;
+    uint64_t updated_at_ms;
+
+    ClientNicLoadStats() : updated_at_ms(0) {}
+};
+YLT_REFL(ClientNicLoadStats, client_id, endpoint, devices, updated_at_ms);
+
+/**
  * @brief Response structure for GetReplicaList operation
  */
 struct GetReplicaListResponse {

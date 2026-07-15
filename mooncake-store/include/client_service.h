@@ -429,6 +429,24 @@ class Client {
         int64_t ssd_total_capacity_bytes);
 
     /**
+     * @brief Report per-device NIC load statistics to the master.
+     */
+    tl::expected<void, ErrorCode> ReportNicLoadStats(
+        const std::vector<NicLoadStat>& stats);
+
+    /**
+     * @brief Batch-query NIC load snapshots for the given client IDs.
+     */
+    tl::expected<std::vector<ClientNicLoadStats>, ErrorCode>
+    BatchGetNicLoadStats(const std::vector<UUID>& client_ids);
+
+    /**
+     * @brief Batch-query NIC load snapshots by segment/TE endpoint strings.
+     */
+    tl::expected<std::vector<ClientNicLoadStats>, ErrorCode>
+    BatchGetNicLoadStatsByEndpoints(const std::vector<std::string>& endpoints);
+
+    /**
      * @brief Heartbeat-driven pull of pending L2->L1 promotion work for this
      * client. Mirror of OffloadObjectHeartbeat. Returns tenant-scoped tasks the
      * caller (FileStorage) must read from local SSD and stage as MEMORY
@@ -669,6 +687,7 @@ class Client {
         const std::string& metadata_connstring, const std::string& protocol,
         const std::optional<std::string>& device_names);
     void InitTransferSubmitter();
+    void ReportLocalNicLoadStats();
     ErrorCode TransferData(const Replica::Descriptor& replica_descriptor,
                            std::vector<Slice>& slices,
                            TransferRequest::OpCode op_code);

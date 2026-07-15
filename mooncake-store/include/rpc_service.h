@@ -213,6 +213,15 @@ class WrappedMasterService {
     tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
     OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
 
+    tl::expected<void, ErrorCode> ReportNicLoadStats(
+        const UUID& client_id, const std::vector<NicLoadStat>& stats);
+
+    tl::expected<std::vector<ClientNicLoadStats>, ErrorCode>
+    BatchGetNicLoadStats(const std::vector<UUID>& client_ids);
+
+    tl::expected<std::vector<ClientNicLoadStats>, ErrorCode>
+    BatchGetNicLoadStatsByEndpoints(const std::vector<std::string>& endpoints);
+
     tl::expected<void, ErrorCode> ReportSsdCapacity(
         const UUID& client_id, int64_t ssd_total_capacity_bytes);
 
