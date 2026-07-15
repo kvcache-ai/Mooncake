@@ -1705,8 +1705,8 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
             object_bucket_map_.reserve(object_bucket_map_.size() +
                                        bucket_keys.size());
             for (size_t i = 0; i < bucket_keys.size(); ++i) {
-                auto [it, inserted] = object_bucket_map_.insert(
-                    {bucket_keys[i], metadatas[i]});
+                auto [it, inserted] =
+                    object_bucket_map_.insert({bucket_keys[i], metadatas[i]});
                 CHECK(inserted)
                     << "Reserved key became duplicated: " << bucket_keys[i];
             }

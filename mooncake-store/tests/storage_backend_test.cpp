@@ -554,7 +554,7 @@ TEST_F(StorageBackendTest, MissingBucketDataFileCleanup) {
             recovered_keys.insert(recovered_keys.end(), keys.begin(),
                                   keys.end());
             return ErrorCode::OK;
-    });
+        });
     ASSERT_TRUE(scan_result.has_value());
     EXPECT_TRUE(recovered_keys.empty());
 }
