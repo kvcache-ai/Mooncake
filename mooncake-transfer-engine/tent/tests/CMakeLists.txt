@@ -27,6 +27,13 @@ target_include_directories(admission_queue_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME admission_queue_test COMMAND admission_queue_test)
 
+add_executable(receiver_credit_test receiver_credit_test.cpp
+                                    ../src/runtime/receiver_credit.cpp)
+target_link_libraries(receiver_credit_test PRIVATE tent_common gtest gtest_main)
+target_include_directories(receiver_credit_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME receiver_credit_test COMMAND receiver_credit_test)
+
 add_executable(bw_arbitration_test bw_arbitration_test.cpp)
 target_link_libraries(bw_arbitration_test PRIVATE tent_common gtest gtest_main)
 target_include_directories(bw_arbitration_test
