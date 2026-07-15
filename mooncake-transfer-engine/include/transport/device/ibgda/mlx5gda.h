@@ -33,6 +33,19 @@ struct mlx5gda_wqebb {
     uint64_t qwords[8];  // 64 bytes
 };
 
+struct mlx5gda_control_region {
+    void *addr;
+    size_t size;
+    struct mlx5dv_devx_umem *umem;
+};
+
+struct mlx5gda_control_region_allocator {
+    void *context;
+    int (*allocate)(void *context, size_t size,
+                    struct mlx5gda_control_region *region);
+    void (*release)(void *context, struct mlx5gda_control_region *region);
+};
+
 struct mlx5gda_rdma_write_wqe {
     struct mlx5_wqe_ctrl_seg ctrl;
     struct mlx5_wqe_raddr_seg raddr;
@@ -53,13 +66,18 @@ struct mlx5gda_cq {
     uint32_t cqe;
     size_t cq_offset;
     size_t dbr_offset;
+    void *cq_buf;
+    void *dbr;
+    struct mlx5gda_control_region cq_region;
+    struct mlx5gda_control_region dbr_region;
+    struct mlx5gda_control_region_allocator region_allocator;
 };
 
-struct mlx5gda_cq *mlx5gda_create_cq(void *ctrl_buf,
-                                     struct mlx5dv_devx_umem *ctrl_buf_umem,
-                                     struct memheap *ctrl_buf_heap,
-                                     struct ibv_pd *pd, int num_cqe,
-                                     cudaStream_t stream);
+struct mlx5gda_cq *mlx5gda_create_cq(
+    void *ctrl_buf, struct mlx5dv_devx_umem *ctrl_buf_umem,
+    struct memheap *ctrl_buf_heap, struct ibv_pd *pd, int num_cqe,
+    cudaStream_t stream,
+    const struct mlx5gda_control_region_allocator *region_allocator);
 void mlx5gda_destroy_cq(struct memheap *ctrl_buf_heap, struct mlx5gda_cq *cq);
 
 static const size_t MLX5GDA_BF_SIZE = 256;
@@ -79,6 +97,13 @@ struct mlx5gda_qp {
     size_t wq_offset;
     size_t dbr_offset;
     size_t ready_offset;
+    void *wq;
+    void *dbr;
+    void *ready;
+    struct mlx5gda_control_region wq_region;
+    struct mlx5gda_control_region dbr_region;
+    struct mlx5gda_control_region ready_region;
+    struct mlx5gda_control_region_allocator region_allocator;
 };
 
 struct mlx5gda_qp_devctx {
@@ -108,11 +133,11 @@ struct mlx5gda_create_qp_failure {
 void mlx5gda_reset_create_qp_failure();
 mlx5gda_create_qp_failure mlx5gda_last_create_qp_failure();
 
-struct mlx5gda_qp *mlx5gda_create_rc_qp(struct mlx5dv_pd mpd, void *ctrl_buf,
-                                        struct mlx5dv_devx_umem *ctrl_buf_umem,
-                                        struct memheap *ctrl_buf_heap,
-                                        struct ibv_pd *pd, int wqe,
-                                        uint8_t port_num, cudaStream_t stream);
+struct mlx5gda_qp *mlx5gda_create_rc_qp(
+    struct mlx5dv_pd mpd, void *ctrl_buf,
+    struct mlx5dv_devx_umem *ctrl_buf_umem, struct memheap *ctrl_buf_heap,
+    struct ibv_pd *pd, int wqe, uint8_t port_num, cudaStream_t stream,
+    const struct mlx5gda_control_region_allocator *region_allocator);
 void mlx5gda_destroy_qp(struct memheap *ctrl_buf_heap, struct mlx5gda_qp *qp);
 
 int mlx5gda_modify_rc_qp_rst2init(struct mlx5gda_qp *qp, uint16_t pkey_index);
