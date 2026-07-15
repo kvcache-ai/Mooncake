@@ -340,15 +340,15 @@ Status GdsTransport::getTransferStatus(SubBatchRef batch, int task_id,
         if (s == COMPLETED) {
             range.complete_count++;
             range.transferred_bytes += event.ret;
-            if (range.status == PENDING && range.complete_count == range.count) {
-                range.status = COMPLETED;
-            }
         } else if (s != PENDING) {
             range.status = s;
         }
     }
 
     auto& range = gds_batch->io_param_ranges[task_id];
+    if (range.complete_count == range.count) {
+        range.status = COMPLETED;
+    }
     status = TransferStatus{range.status, range.transferred_bytes};
     return Status::OK();
 }
