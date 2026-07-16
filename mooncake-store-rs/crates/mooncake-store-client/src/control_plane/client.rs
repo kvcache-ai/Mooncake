@@ -198,11 +198,9 @@ impl ControlPlaneClient {
                 );
             }
         }
-        let channel = self.channel_for(lease)?;
-        let reply = self.rpc(
-            |mut client| async move { client.batch_contains_routes(Request::new(request)).await },
-            channel,
-        )?;
+        let reply = self.rpc_for_lease(lease, |mut client| async move {
+            client.batch_contains_routes(Request::new(request)).await
+        })?;
         decode_route_batch_contains_reply(reply)
     }
 
@@ -246,11 +244,9 @@ impl ControlPlaneClient {
                 );
             }
         }
-        let channel = self.channel_for(lease)?;
-        let reply = self.rpc(
-            |mut client| async move { client.batch_get_routes(Request::new(request)).await },
-            channel,
-        )?;
+        let reply = self.rpc_for_lease(lease, |mut client| async move {
+            client.batch_get_routes(Request::new(request)).await
+        })?;
         decode_route_batch_get_reply(reply)
     }
 
@@ -303,15 +299,11 @@ impl ControlPlaneClient {
                 );
             }
         }
-        let channel = self.channel_for(lease)?;
-        let reply = self.rpc(
-            |mut client| async move {
-                client
-                    .batch_compare_and_swap_routes(Request::new(request))
-                    .await
-            },
-            channel,
-        )?;
+        let reply = self.rpc_for_lease(lease, |mut client| async move {
+            client
+                .batch_compare_and_swap_routes(Request::new(request))
+                .await
+        })?;
         decode_route_batch_cas_reply(reply, "control plane batch cas")
     }
 
@@ -359,15 +351,11 @@ impl ControlPlaneClient {
                 );
             }
         }
-        let channel = self.channel_for(lease)?;
-        let reply = self.rpc(
-            |mut client| async move {
-                client
-                    .list_routes_by_replica_owner(Request::new(request))
-                    .await
-            },
-            channel,
-        )?;
+        let reply = self.rpc_for_lease(lease, |mut client| async move {
+            client
+                .list_routes_by_replica_owner(Request::new(request))
+                .await
+        })?;
         decode_route_list_by_replica_owner_reply(reply)
     }
 
@@ -419,11 +407,9 @@ impl ControlPlaneClient {
                 );
             }
         }
-        let channel = self.channel_for(lease)?;
-        let reply = self.rpc(
-            |mut client| async move { client.batch_replace_routes(Request::new(request)).await },
-            channel,
-        )?;
+        let reply = self.rpc_for_lease(lease, |mut client| async move {
+            client.batch_replace_routes(Request::new(request)).await
+        })?;
         decode_route_batch_replace_reply(reply)
     }
 
@@ -568,14 +554,9 @@ impl ControlPlaneClient {
                     );
                 }
             }
-            let channel = self.channel_for(lease)?;
-            let reply =
-                self.rpc(
-                    |mut client| async move {
-                        client.batch_report_route_hits(Request::new(request)).await
-                    },
-                    channel,
-                )?;
+            let reply = self.rpc_for_lease(lease, |mut client| async move {
+                client.batch_report_route_hits(Request::new(request)).await
+            })?;
             decode_error(reply.error)?;
             Ok(reply.accepted as usize)
         })();
@@ -628,15 +609,11 @@ impl ControlPlaneClient {
                     );
                 }
             }
-            let channel = self.channel_for(lease)?;
-            let reply = self.rpc(
-                |mut client| async move {
-                    client
-                        .batch_track_replica_routes(Request::new(request))
-                        .await
-                },
-                channel,
-            )?;
+            let reply = self.rpc_for_lease(lease, |mut client| async move {
+                client
+                    .batch_track_replica_routes(Request::new(request))
+                    .await
+            })?;
             decode_error(reply.error)?;
             Ok(reply.accepted as usize)
         })();
@@ -651,14 +628,9 @@ impl ControlPlaneClient {
     ) -> Result<String> {
         let tracker = OperationTracker::new("control_migration_submit");
         let result = (|| {
-            let channel = self.channel_for(lease)?;
-            let reply =
-                self.rpc(
-                    |mut client| async move {
-                        client.submit_migration_task(Request::new(request)).await
-                    },
-                    channel,
-                )?;
+            let reply = self.rpc_for_lease(lease, |mut client| async move {
+                client.submit_migration_task(Request::new(request)).await
+            })?;
             decode_error(reply.error)?;
             if reply.execution_id.trim().is_empty() {
                 return Err(StoreError::Transport(
@@ -678,15 +650,11 @@ impl ControlPlaneClient {
     ) -> Result<pb::GetMigrationExecutionStatusReply> {
         let tracker = OperationTracker::new("control_migration_status_detail");
         let result = (|| {
-            let channel = self.channel_for(lease)?;
-            let reply = self.rpc(
-                |mut client| async move {
-                    client
-                        .get_migration_execution_status(Request::new(request))
-                        .await
-                },
-                channel,
-            )?;
+            let reply = self.rpc_for_lease(lease, |mut client| async move {
+                client
+                    .get_migration_execution_status(Request::new(request))
+                    .await
+            })?;
             decode_error(reply.error.clone())?;
             Ok(reply)
         })();
@@ -821,11 +789,9 @@ impl ControlPlaneClient {
                     );
                 }
             }
-            let channel = self.channel_for(lease)?;
-            let reply = self.rpc(
-                |mut client| async move { client.batch_reserve_any(Request::new(request)).await },
-                channel,
-            )?;
+            let reply = self.rpc_for_lease(lease, |mut client| async move {
+                client.batch_reserve_any(Request::new(request)).await
+            })?;
             ensure_batch_len("batch_reserve_any", length_bytes.len(), reply.replies.len())?;
             Ok(reply
                 .replies
@@ -938,14 +904,9 @@ impl ControlPlaneClient {
                     );
                 }
             }
-            let channel = self.channel_for(lease)?;
-            let reply =
-                self.rpc(
-                    |mut client| async move {
-                        client.batch_reserve_specific(Request::new(request)).await
-                    },
-                    channel,
-                )?;
+            let reply = self.rpc_for_lease(lease, |mut client| async move {
+                client.batch_reserve_specific(Request::new(request)).await
+            })?;
             ensure_batch_len(
                 "batch_reserve_specific",
                 requests.len(),
@@ -1027,11 +988,9 @@ impl ControlPlaneClient {
                     );
                 }
             }
-            let channel = self.channel_for(lease)?;
-            let reply = self.rpc(
-                |mut client| async move { client.batch_release(Request::new(request)).await },
-                channel,
-            )?;
+            let reply = self.rpc_for_lease(lease, |mut client| async move {
+                client.batch_release(Request::new(request)).await
+            })?;
             ensure_batch_len("batch_release", requests.len(), reply.replies.len())?;
             Ok(reply
                 .replies
@@ -1094,6 +1053,21 @@ impl ControlPlaneClient {
 
     fn invalidate_stream_session(&self, address: &str) {
         self.streams.lock().remove(address);
+    }
+
+    fn invalidate_channel(&self, address: &str) {
+        if self.channels.lock().remove(address).is_some() {
+            debug!(address, "invalidated stale control plane channel");
+        }
+    }
+
+    fn invalidate_on_transport_error<T>(&self, lease: &ClientLease, result: &Result<T>) {
+        if matches!(result, Err(StoreError::Transport(_))) {
+            if let Ok(address) = control_address(lease) {
+                self.invalidate_channel(&address);
+                self.invalidate_stream_session(&address);
+            }
+        }
     }
 
     fn stream_request(
@@ -1185,7 +1159,9 @@ impl ControlPlaneClient {
                 StoreError::Transport(format!("invalid control plane uri {uri}: {error}"))
             })?
             .connect_timeout(CONNECT_TIMEOUT)
-            .tcp_nodelay(true);
+            .tcp_nodelay(true)
+            .http2_keep_alive_interval(KEEPALIVE_INTERVAL)
+            .keep_alive_timeout(KEEPALIVE_TIMEOUT);
         let channel = self
             .with_runtime(|runtime| runtime.block_on(endpoint.connect()))
             .map_err(|error| {
@@ -1196,6 +1172,17 @@ impl ControlPlaneClient {
         trace!(address, "opened new control plane channel");
         self.channels.lock().insert(address, channel.clone());
         Ok(channel)
+    }
+
+    pub(super) fn rpc_for_lease<F, Fut, T>(&self, lease: &ClientLease, f: F) -> Result<T>
+    where
+        F: FnOnce(pb::control_plane_service_client::ControlPlaneServiceClient<Channel>) -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<Response<T>, Status>>,
+    {
+        let channel = self.channel_for(lease)?;
+        let result = self.rpc(f, channel);
+        self.invalidate_on_transport_error(lease, &result);
+        result
     }
 
     pub(super) fn rpc<F, Fut, T>(&self, f: F, channel: Channel) -> Result<T>
@@ -1237,7 +1224,11 @@ impl ControlPlaneClient {
 
         let uri = normalize_control_uri(&address);
         let endpoint = match Endpoint::from_shared(uri.clone()) {
-            Ok(endpoint) => endpoint.connect_timeout(timeout).tcp_nodelay(true),
+            Ok(endpoint) => endpoint
+                .connect_timeout(timeout)
+                .tcp_nodelay(true)
+                .http2_keep_alive_interval(KEEPALIVE_INTERVAL)
+                .keep_alive_timeout(KEEPALIVE_TIMEOUT),
             Err(error) => {
                 return ControlPlaneReachability::Unknown(StoreError::Transport(format!(
                     "invalid control plane uri {uri}: {error}"
