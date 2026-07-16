@@ -22,6 +22,9 @@ class RedisOpLogStore : public OpLogStore {
                     const std::string& username = "");
     ~RedisOpLogStore() override;
 
+    RedisOpLogStore(const RedisOpLogStore&) = delete;
+    RedisOpLogStore& operator=(const RedisOpLogStore&) = delete;
+
     ErrorCode Init() override;
     ErrorCode WriteOpLog(const OpLogEntry& entry, bool sync = true) override;
     ErrorCode ReadOpLog(uint64_t sequence_id, OpLogEntry& entry) override;

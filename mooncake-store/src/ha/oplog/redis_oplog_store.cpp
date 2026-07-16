@@ -34,8 +34,38 @@ bool ParseRedisEndpoint(const std::string& redis_endpoint, std::string& host,
                         int& port) {
     host = "127.0.0.1";
     port = 6379;
-    auto colon_pos = redis_endpoint.rfind(':');
-    if (colon_pos != std::string::npos) {
+    if (redis_endpoint.empty()) {
+        return true;
+    }
+
+    if (redis_endpoint.front() == '[') {
+        auto bracket_pos = redis_endpoint.find(']');
+        if (bracket_pos == std::string::npos) {
+            return false;
+        }
+        host = redis_endpoint.substr(1, bracket_pos - 1);
+        if (bracket_pos + 1 == redis_endpoint.size()) {
+            return !host.empty();
+        }
+        if (redis_endpoint[bracket_pos + 1] != ':') {
+            return false;
+        }
+        uint64_t parsed_port = 0;
+        const std::string port_str = redis_endpoint.substr(bracket_pos + 2);
+        if (port_str.empty() || !ParseUint64(port_str, parsed_port) ||
+            parsed_port == 0 || parsed_port > 65535) {
+            return false;
+        }
+        port = static_cast<int>(parsed_port);
+        return !host.empty();
+    }
+
+    const auto colon_count =
+        std::count(redis_endpoint.begin(), redis_endpoint.end(), ':');
+    if (colon_count > 1) {
+        host = redis_endpoint;
+    } else if (colon_count == 1) {
+        auto colon_pos = redis_endpoint.find(':');
         host = redis_endpoint.substr(0, colon_pos);
         uint64_t parsed_port = 0;
         const std::string port_str = redis_endpoint.substr(colon_pos + 1);
@@ -45,7 +75,7 @@ bool ParseRedisEndpoint(const std::string& redis_endpoint, std::string& host,
             return false;
         }
         port = static_cast<int>(parsed_port);
-    } else if (!redis_endpoint.empty()) {
+    } else {
         host = redis_endpoint;
     }
     return !host.empty();
@@ -308,7 +338,8 @@ ErrorCode RedisOpLogStore::ReadOpLogSince(uint64_t start_sequence_id,
         return ErrorCode::INTERNAL_ERROR;
     }
 
-    entries.reserve(reply->elements);
+    std::vector<uint64_t> sequence_ids;
+    sequence_ids.reserve(reply->elements);
     for (size_t i = 0; i < reply->elements; ++i) {
         redisReply* item = reply->element[i];
         if (!item || item->type != REDIS_REPLY_STRING) {
@@ -320,14 +351,62 @@ ErrorCode RedisOpLogStore::ReadOpLogSince(uint64_t start_sequence_id,
             LOG(ERROR) << "RedisOpLogStore::ReadOpLogSince: invalid seq value";
             return ErrorCode::INTERNAL_ERROR;
         }
-        OpLogEntry entry;
-        err = ReadOpLogUnlocked(sequence_id, entry);
-        if (err != ErrorCode::OK) {
+        sequence_ids.push_back(sequence_id);
+    }
+
+    for (uint64_t sequence_id : sequence_ids) {
+        const std::string entry_key = EntryKey(sequence_id);
+        if (redisAppendCommand(ctx_, "GET %b", entry_key.data(),
+                               entry_key.size()) != REDIS_OK) {
+            LOG(ERROR) << "RedisOpLogStore::ReadOpLogSince: append GET failed"
+                       << ", sequence_id=" << sequence_id;
+            redisFree(ctx_);
+            ctx_ = nullptr;
+            return ErrorCode::INTERNAL_ERROR;
+        }
+    }
+
+    entries.reserve(sequence_ids.size());
+    for (size_t i = 0; i < sequence_ids.size(); ++i) {
+        redisReply* raw_reply = nullptr;
+        if (redisGetReply(ctx_, reinterpret_cast<void**>(&raw_reply)) !=
+                REDIS_OK ||
+            !raw_reply) {
+            LOG(ERROR) << "RedisOpLogStore::ReadOpLogSince: pipeline GET failed"
+                       << ", sequence_id=" << sequence_ids[i];
+            redisFree(ctx_);
+            ctx_ = nullptr;
+            return ErrorCode::INTERNAL_ERROR;
+        }
+        RedisReplyPtr entry_reply(raw_reply);
+        if (entry_reply->type == REDIS_REPLY_NIL) {
             LOG(ERROR) << "RedisOpLogStore::ReadOpLogSince: missing indexed "
                           "entry"
-                       << ", sequence_id=" << sequence_id
-                       << ", error=" << toString(err);
-            return err;
+                       << ", sequence_id=" << sequence_ids[i];
+            return ErrorCode::OPLOG_ENTRY_NOT_FOUND;
+        }
+        if (entry_reply->type == REDIS_REPLY_ERROR) {
+            LOG(ERROR) << "RedisOpLogStore::ReadOpLogSince: GET failed"
+                       << ", sequence_id=" << sequence_ids[i] << ", error="
+                       << (entry_reply->str ? entry_reply->str : "null");
+            redisFree(ctx_);
+            ctx_ = nullptr;
+            return ErrorCode::INTERNAL_ERROR;
+        }
+        if (entry_reply->type != REDIS_REPLY_STRING) {
+            LOG(ERROR)
+                << "RedisOpLogStore::ReadOpLogSince: unexpected GET reply type"
+                << ", type=" << entry_reply->type
+                << ", sequence_id=" << sequence_ids[i];
+            return ErrorCode::INTERNAL_ERROR;
+        }
+
+        OpLogEntry entry;
+        std::string serialized(entry_reply->str, entry_reply->len);
+        if (!DeserializeOpLogEntry(serialized, entry)) {
+            LOG(ERROR) << "RedisOpLogStore::ReadOpLogSince: deserialize failed"
+                       << ", sequence_id=" << sequence_ids[i];
+            return ErrorCode::INTERNAL_ERROR;
         }
         entries.push_back(std::move(entry));
     }
