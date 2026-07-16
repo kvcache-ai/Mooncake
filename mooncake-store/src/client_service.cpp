@@ -552,10 +552,16 @@ tl::expected<void, ErrorCode> ClientService::RegisterLocalMemory(
     bool remote_accessible, bool update_metadata) {
     auto check_result = CheckRegisterMemoryParams(addr, length);
     if (!check_result) {
+        LOG(ERROR) << "RegisterLocalMemory param check failed, addr=" << addr
+                   << ", length=" << length << ", location=" << location
+                   << ", error=" << toString(check_result.error());
         return tl::unexpected(check_result.error());
     }
     if (this->transfer_engine_->registerLocalMemory(
             addr, length, location, remote_accessible, update_metadata) != 0) {
+        LOG(ERROR) << "transfer_engine registerLocalMemory failed, addr=" << addr
+                   << ", length=" << length << ", location=" << location
+                   << ", remote_accessible=" << remote_accessible;
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     return {};
@@ -565,6 +571,8 @@ tl::expected<void, ErrorCode> ClientService::unregisterLocalMemory(
     void* addr, bool update_metadata) {
     if (this->transfer_engine_->unregisterLocalMemory(addr, update_metadata) !=
         0) {
+        LOG(ERROR) << "transfer_engine unregisterLocalMemory failed, addr="
+                   << addr;
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     return {};
