@@ -397,20 +397,6 @@ jobs:
 
     - name: Build and gate NVLink VMM unit tests
       run: |
-        cmake -G Ninja -S . -B build-nvlink-vmm-tests \
-          -DUSE_HTTP=ON \
-          -DUSE_CUDA=ON \
-          -DUSE_MNNVL=ON \
-          -DWITH_EP=OFF \
-          -DWITH_STORE_RUST=OFF \
-          -DBUILD_UNIT_TESTS=ON \
-          -DENABLE_SCCACHE=ON \
-          -DCMAKE_BUILD_TYPE=Release
-        cmake --build build-nvlink-vmm-tests --target \
-          nvlink_transport_test \
-          nvlink_vmm_allocation_test \
-          transfer_metadata_test
-
         cuda_driver_stub=""
         for stub_dir in /usr/local/cuda/lib64/stubs /usr/local/cuda/targets/*/lib/stubs; do
           if [ -f "$stub_dir/libcuda.so" ]; then
@@ -422,11 +408,26 @@ jobs:
           echo "::error::CUDA driver stub libcuda.so was not found"
           exit 1
         fi
+        cuda_driver_stub_dir="$(dirname "$cuda_driver_stub")"
+        export LIBRARY_PATH="$cuda_driver_stub_dir:${LIBRARY_PATH:-}"
+
+        cmake -G Ninja -S . -B build-nvlink-vmm-tests \
+          -DUSE_HTTP=ON \
+          -DUSE_CUDA=ON \
+          -DUSE_MNNVL=ON \
+          -DWITH_EP=OFF \
+          -DWITH_STORE_RUST=OFF \
+          -DBUILD_UNIT_TESTS=ON \
+          -DENABLE_SCCACHE=ON \
+          -DCMAKE_BUILD_TYPE=Release
+        cmake --build build-nvlink-vmm-tests --target \
+          nvlink_transport_test \
+          nvlink_vmm_allocation_test
 
         cuda_driver_stub_runtime="$RUNNER_TEMP/cuda-driver-stubs"
         mkdir -p "$cuda_driver_stub_runtime"
         cp -L "$cuda_driver_stub" "$cuda_driver_stub_runtime/libcuda.so.1"
-        export LD_LIBRARY_PATH="$cuda_driver_stub_runtime:$(dirname "$cuda_driver_stub"):/usr/local/cuda/lib64:/usr/local/lib:${LD_LIBRARY_PATH:-}"
+        export LD_LIBRARY_PATH="$cuda_driver_stub_runtime:$cuda_driver_stub_dir:/usr/local/cuda/lib64:/usr/local/lib:${LD_LIBRARY_PATH:-}"
 
         cd build-nvlink-vmm-tests
         discovered_tests="$(ctest -N -L nvlink_vmm_unit)"
