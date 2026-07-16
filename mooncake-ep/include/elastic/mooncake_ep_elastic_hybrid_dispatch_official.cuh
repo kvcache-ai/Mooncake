@@ -444,15 +444,8 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                 const auto ptr =
                     workspace_layout.get_scaleout_channel_signaled_tail_ptr(
                         channel_idx, scaleout_rank_idx);
-                const auto old_signaled_tail =
-                    math::pack2<int, int64_t>(0, stored_old_scaleout_tail);
-
-                // NOTES: the "release" scope will be `sys` for the local rank
-                // (we may involve NVLink so not `gpu`) For RDMA requests,
-                // "release" is ensured by "atomic"
-                gin.red_add_rel<transport::ScaleoutTeam>(
-                    ptr, signaled_tail - old_signaled_tail, lane_idx,
-                    transport::kRedAddReleaseLowWordLast);
+                gin.put_value<transport::ScaleoutTeam>(ptr, signaled_tail,
+                                                       lane_idx);
                 stored_old_scaleout_tail = stored_scaleout_tail;
             }
             __syncwarp();

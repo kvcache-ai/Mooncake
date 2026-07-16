@@ -157,38 +157,11 @@ struct MooncakeGin {
                                   reinterpret_cast<int*>(dst_ptr),
                                   static_cast<int32_t>(value));
             } else {
-                // Device RDMA WRITE sources must be registered GDR addresses;
-                // a by-value scalar lives in thread-local storage and is not a
-                // valid IBGDA source.  Current elastic uses remote int64
-                // put_value only for single-writer, zeroed notify slots, so a
-                // split 32-bit RED add is equivalent to writing the packed
-                // word.
-                auto* words = reinterpret_cast<int32_t*>(dst_ptr);
-                const auto signed_value = static_cast<int64_t>(value);
-                const auto low = static_cast<int32_t>(
-                    static_cast<uint64_t>(signed_value) & 0xffffffffull);
-                const auto high = static_cast<int32_t>(signed_value >> 32);
-                if ((flags & kRedAddReleaseLowWordLast) == 0) {
-                    if (low != 0) {
-                        device::mc_red_add(ctx, dst_rank, qp_idx,
-                                           physical_qps_per_rank, words, low);
-                    }
-                    if (high != 0) {
-                        device::mc_red_add(ctx, dst_rank, qp_idx,
-                                           physical_qps_per_rank, words + 1,
-                                           high);
-                    }
-                } else {
-                    if (high != 0) {
-                        device::mc_red_add(ctx, dst_rank, qp_idx,
-                                           physical_qps_per_rank, words + 1,
-                                           high);
-                    }
-                    if (low != 0) {
-                        device::mc_red_add(ctx, dst_rank, qp_idx,
-                                           physical_qps_per_rank, words, low);
-                    }
-                }
+                device::mc_put_value64(
+                    ctx, dst_rank, qp_idx, physical_qps_per_rank,
+                    reinterpret_cast<const uint64_t*>(dst_ptr),
+                    static_cast<uint64_t>(value));
+                (void)flags;
             }
         }
     }
