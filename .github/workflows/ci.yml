@@ -366,18 +366,18 @@ jobs:
           fi
         done
 
-        apt_options=(
-          -o Acquire::ForceIPv4=true
-          -o Acquire::Retries=3
-          -o Acquire::http::Timeout=30
-          -o Acquire::https::Timeout=30
-        )
+        sudo tee /etc/apt/apt.conf.d/99mooncake-ci-network >/dev/null <<'EOF'
+        Acquire::ForceIPv4 "true";
+        Acquire::Retries "3";
+        Acquire::http::Timeout "30";
+        Acquire::https::Timeout "30";
+        EOF
 
         wget --inet4-only --tries=3 --timeout=30 \
           https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/sbsa/cuda-keyring_1.1-1_all.deb
         sudo dpkg -i cuda-keyring_1.1-1_all.deb
-        sudo apt-get "${apt_options[@]}" update
-        sudo apt-get "${apt_options[@]}" install -y cuda-toolkit-13-0
+        sudo apt-get update
+        sudo apt-get install -y cuda-toolkit-13-0
         echo "/usr/local/cuda/bin" >> $GITHUB_PATH
         /usr/local/cuda/bin/nvcc --version
       shell: bash
@@ -808,6 +808,7 @@ jobs:
         sudo rm -rf /usr/share/dotnet
         sudo rm -rf /opt/ghc
         sudo rm -rf /opt/hostedtoolcache/CodeQL
+        sudo rm -rf /usr/local/lib/android
         docker system prune --all --force --volumes
 
         echo "Disk usage after cleanup:"
@@ -821,7 +822,6 @@ jobs:
       run: |
         docker build --progress=plain -f docker/mooncake.Dockerfile \
           --build-arg PYTHON_VERSION=3.10 \
-          --build-arg CMAKE_BUILD_TYPE=Release \
           --build-arg EP_TORCH_VERSIONS="2.12.1" \
           -t mooncake:from-source .
 
