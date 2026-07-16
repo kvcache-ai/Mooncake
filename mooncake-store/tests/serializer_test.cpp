@@ -1,6 +1,8 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
+
 #include "serializer.h"
 #include "serialize/serializer.h"
 #include "segment.h"
@@ -283,6 +285,115 @@ TEST_F(SerializerTest, RestoredReplicaTracksRestoredSegmentLifetime) {
     }
 
     EXPECT_FALSE((*restored_replica)->get_available_descriptor().has_value());
+}
+
+TEST_F(SerializerTest, SameNameSegmentsRestoreIndependentRegistrations) {
+    SegmentManager source_manager(BufferAllocatorType::OFFSET);
+    Segment segment1;
+    segment1.id = generate_uuid();
+    segment1.name = "shared_snapshot_name";
+    segment1.base = 0x300000000;
+    segment1.size = 16 * 1024 * 1024;
+    segment1.te_endpoint = segment1.name;
+
+    Segment segment2 = segment1;
+    segment2.id = generate_uuid();
+    segment2.base = 0x400000000;
+    const UUID client_id = generate_uuid();
+
+    {
+        auto segment_access = source_manager.getSegmentAccess();
+        ASSERT_EQ(ErrorCode::OK,
+                  segment_access.MountSegment(segment1, client_id));
+        ASSERT_EQ(ErrorCode::OK,
+                  segment_access.MountSegment(segment2, client_id));
+    }
+
+    SegmentView source_view(&source_manager);
+    MountedSegment source_segment1;
+    MountedSegment source_segment2;
+    ASSERT_EQ(ErrorCode::OK,
+              source_view.GetMountedSegment(segment1.id, source_segment1));
+    ASSERT_EQ(ErrorCode::OK,
+              source_view.GetMountedSegment(segment2.id, source_segment2));
+    ASSERT_TRUE(source_segment1.allocator_registration);
+    ASSERT_TRUE(source_segment2.allocator_registration);
+
+    auto buffer1 = source_segment1.allocator_registration->allocate(1024);
+    auto buffer2 = source_segment2.allocator_registration->allocate(1024);
+    ASSERT_TRUE(buffer1);
+    ASSERT_TRUE(buffer2);
+    Replica replica1(std::move(buffer1), ReplicaStatus::COMPLETE);
+    Replica replica2(std::move(buffer2), ReplicaStatus::COMPLETE);
+
+    msgpack::sbuffer replica_buffer1;
+    MsgpackPacker replica_packer1(&replica_buffer1);
+    ASSERT_TRUE(
+        Serializer<Replica>::serialize(replica1, source_view, replica_packer1)
+            .has_value());
+    msgpack::sbuffer replica_buffer2;
+    MsgpackPacker replica_packer2(&replica_buffer2);
+    ASSERT_TRUE(
+        Serializer<Replica>::serialize(replica2, source_view, replica_packer2)
+            .has_value());
+
+    SegmentSerializer source_serializer(&source_manager);
+    auto segment_snapshot = source_serializer.Serialize();
+    ASSERT_TRUE(segment_snapshot.has_value());
+
+    SegmentManager restored_manager(BufferAllocatorType::OFFSET);
+    SegmentSerializer restored_serializer(&restored_manager);
+    ASSERT_TRUE(restored_serializer.Deserialize(*segment_snapshot).has_value());
+
+    SegmentView restored_view(&restored_manager);
+    MountedSegment restored_segment1;
+    MountedSegment restored_segment2;
+    ASSERT_EQ(ErrorCode::OK,
+              restored_view.GetMountedSegment(segment1.id, restored_segment1));
+    ASSERT_EQ(ErrorCode::OK,
+              restored_view.GetMountedSegment(segment2.id, restored_segment2));
+    ASSERT_TRUE(restored_segment1.allocator_registration);
+    ASSERT_TRUE(restored_segment2.allocator_registration);
+    EXPECT_NE(restored_segment1.allocator_registration,
+              restored_segment2.allocator_registration);
+
+    {
+        auto allocator_access = restored_manager.getAllocatorAccess();
+        const auto* registrations =
+            allocator_access.getAllocatorManager().getRegistrations(
+                segment1.name);
+        ASSERT_NE(nullptr, registrations);
+        ASSERT_EQ(2u, registrations->size());
+        EXPECT_NE(registrations->end(),
+                  std::find(registrations->begin(), registrations->end(),
+                            restored_segment1.allocator_registration));
+        EXPECT_NE(registrations->end(),
+                  std::find(registrations->begin(), registrations->end(),
+                            restored_segment2.allocator_registration));
+    }
+
+    auto replica_object1 =
+        msgpack::unpack(replica_buffer1.data(), replica_buffer1.size());
+    auto restored_replica1 =
+        Serializer<Replica>::deserialize(replica_object1.get(), restored_view);
+    ASSERT_TRUE(restored_replica1.has_value());
+    auto replica_object2 =
+        msgpack::unpack(replica_buffer2.data(), replica_buffer2.size());
+    auto restored_replica2 =
+        Serializer<Replica>::deserialize(replica_object2.get(), restored_view);
+    ASSERT_TRUE(restored_replica2.has_value());
+    ASSERT_TRUE((*restored_replica1)->get_available_descriptor().has_value());
+    ASSERT_TRUE((*restored_replica2)->get_available_descriptor().has_value());
+
+    size_t metrics_dec_capacity = 0;
+    {
+        auto segment_access = restored_manager.getSegmentAccess();
+        ASSERT_EQ(ErrorCode::OK, segment_access.PrepareUnmountSegment(
+                                     segment1.id, metrics_dec_capacity));
+    }
+
+    EXPECT_FALSE((*restored_replica1)->get_available_descriptor().has_value());
+    EXPECT_TRUE((*restored_replica2)->get_available_descriptor().has_value());
 }
 
 }  // namespace mooncake::test
