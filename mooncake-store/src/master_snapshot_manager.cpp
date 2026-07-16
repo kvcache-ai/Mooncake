@@ -160,11 +160,21 @@ void MasterSnapshotManager::SnapshotThreadFunc() {
             continue;
         }
 
+        // Capture client liveness before taking snapshot_mutex_. This keeps
+        // the documented client_mutex_ -> snapshot_mutex_ lock order while
+        // still allowing stale handles to be removed from the frozen state.
+        auto alive_clients = master_service_->getAliveClientsSnapshot();
+
         pid_t pid;
         {
             std::unique_lock<std::shared_mutex> lock(snapshot_mutex_);
             LOG(INFO) << "[Snapshot] Locking snapshot mutex, snapshot_id="
                       << snapshot_id;
+            // Unmount removes the segment before its asynchronous metadata
+            // cleanup necessarily runs. Clean the frozen state before fork so
+            // the child never serializes replicas backed by expired
+            // allocators.
+            master_service_->ClearInvalidHandles(alive_clients);
             pid = fork();
         }
         if (pid == -1) {

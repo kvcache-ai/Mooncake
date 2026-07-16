@@ -937,18 +937,26 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
     // order
     segment_manager_->allocator_manager_ = AllocatorManager();
 
-    // Add allocators in saved original order
+    // Add allocator names in their saved order. Registrations sharing a name
+    // are rebuilt in stable segment-id order because names_ stores each name
+    // only once.
     for (const auto& name : saved_allocator_names) {
-        for (auto& pair : segment_manager_->mounted_segments_) {
-            MountedSegment& mounted_segment = pair.second;
+        std::vector<UUID> matching_segment_ids;
+        for (const auto& [segment_id, mounted_segment] :
+             segment_manager_->mounted_segments_) {
             if (mounted_segment.segment.name == name &&
                 mounted_segment.status == SegmentStatus::OK &&
                 mounted_segment.buf_allocator) {
-                mounted_segment.allocator_registration =
-                    segment_manager_->allocator_manager_.addAllocator(
-                        name, mounted_segment.buf_allocator);
-                break;
+                matching_segment_ids.push_back(segment_id);
             }
+        }
+        std::sort(matching_segment_ids.begin(), matching_segment_ids.end());
+        for (const auto& segment_id : matching_segment_ids) {
+            auto& mounted_segment =
+                segment_manager_->mounted_segments_.at(segment_id);
+            mounted_segment.allocator_registration =
+                segment_manager_->allocator_manager_.addAllocator(
+                    name, mounted_segment.buf_allocator);
         }
     }
 

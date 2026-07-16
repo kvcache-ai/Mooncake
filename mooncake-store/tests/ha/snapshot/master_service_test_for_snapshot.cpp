@@ -1263,6 +1263,52 @@ TEST_F(MasterServiceSnapshotTest, UnmountSegmentImmediateCleanup) {
               segment2.name);
 }
 
+TEST_F(MasterServiceSnapshotTest, SnapshotCleansInvalidHandlesBeforePersist) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_memory_allocator(BufferAllocatorType::OFFSET)
+                              .build();
+    service_.reset(new MasterService(service_config));
+
+    constexpr size_t buffer1 = 0x300000000;
+    constexpr size_t buffer2 = 0x400000000;
+    constexpr size_t size = 1024 * 1024 * 16;
+    auto segment1 = MakeSegment("snapshot_cleanup_segment1", buffer1, size);
+    auto segment2 = MakeSegment("snapshot_cleanup_segment2", buffer2, size);
+    UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_->MountSegment(segment1, client_id).has_value());
+    ASSERT_TRUE(service_->MountSegment(segment2, client_id).has_value());
+
+    const std::string removed_key =
+        GenerateKeyForSegment(client_id, service_, segment1.name);
+    const std::string surviving_key =
+        GenerateKeyForSegment(client_id, service_, segment2.name);
+    ASSERT_EQ(2u, service_->GetKeyCount());
+
+    // Keep the stale metadata pending so persistence deterministically covers
+    // the window between unmount and asynchronous cleanup.
+    StopInvalidHandleCleanup(service_.get());
+    ASSERT_TRUE(service_->UnmountSegment(segment1.id, client_id).has_value());
+    ASSERT_EQ(2u, service_->GetKeyCount());
+
+    auto removed_result = service_->GetReplicaList(removed_key, "default");
+    ASSERT_FALSE(removed_result.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, removed_result.error());
+    ASSERT_TRUE(service_->GetReplicaList(surviving_key, "default").has_value());
+
+    auto persist_result =
+        CallPersistState(service_.get(), GenerateSnapshotId());
+    ASSERT_TRUE(persist_result.has_value())
+        << "Failed to persist state: " << persist_result.error().message;
+
+    EXPECT_EQ(1u, service_->GetKeyCount());
+    auto removed_exists = service_->ExistKey(removed_key, "default");
+    ASSERT_TRUE(removed_exists.has_value());
+    EXPECT_FALSE(*removed_exists);
+    auto surviving_exists = service_->ExistKey(surviving_key, "default");
+    ASSERT_TRUE(surviving_exists.has_value());
+    EXPECT_TRUE(*surviving_exists);
+}
+
 TEST_F(MasterServiceSnapshotTest, ReadableAfterPartialUnmountWithReplication) {
     service_.reset(new MasterService());
 
