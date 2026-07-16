@@ -106,3 +106,7 @@ if(USE_CUDA AND BUILD_DEVICE_TRANSPORT_EXAMPLE)
       CUDA_ARCHITECTURES "80;90")
   endif()
 endif()
+
+add_executable(show_link ${WORKSPACE}/show_link.cpp)
+target_link_libraries(show_link PUBLIC transfer_engine gflags::gflags
+                                       glog::glog)

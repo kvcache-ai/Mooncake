@@ -43,6 +43,8 @@
 #endif
 
 namespace mooncake {
+class TransferEngineImplTestPeer;
+
 using TransferRequest = Transport::TransferRequest;
 using TransferStatus = Transport::TransferStatus;
 using TransferStatusEnum = Transport::TransferStatusEnum;
@@ -56,6 +58,8 @@ using RegisteredBuffer = TransferEngine::RegisteredBuffer;
 #endif
 
 class TransferEngineImpl {
+    friend class TransferEngineImplTestPeer;
+
    public:
     TransferEngineImpl(bool auto_discover = false)
         : metadata_(nullptr),
@@ -342,6 +346,7 @@ class TransferEngineImpl {
     }
 
     Transport* getTransport(const std::string& proto) {
+        if (!multi_transports_) return nullptr;
         return multi_transports_->getTransport(proto);
     }
 
@@ -400,12 +405,16 @@ class TransferEngineImpl {
 
     using MemoryRegionMap = std::map<uintptr_t, MemoryRegion>;
 
-    MemoryRegionMap::iterator findMemoryRegionContaining(uintptr_t addr);
-
-    MemoryRegionMap::const_iterator findMemoryRegionContaining(
-        uintptr_t addr) const;
-
     bool hasOverlapLocked(uintptr_t addr, uint64_t length) const;
+
+    bool hasOverlapInMapLocked(const MemoryRegionMap& regions, uintptr_t addr,
+                               uint64_t length) const;
+
+    bool tryReserveMemoryRegions(const std::vector<MemoryRegion>& regions);
+
+    void commitMemoryRegions(const std::vector<MemoryRegion>& regions);
+
+    void releaseMemoryRegions(const std::vector<MemoryRegion>& regions);
 
     void insertMemoryRegionLocked(const MemoryRegion& region);
 
@@ -416,6 +425,7 @@ class TransferEngineImpl {
     std::shared_ptr<MultiTransport> multi_transports_;
     std::shared_mutex mutex_;
     MemoryRegionMap local_memory_regions_;
+    MemoryRegionMap registering_memory_regions_;
     std::shared_ptr<Topology> local_topology_;
 
     RWSpinlock send_notifies_lock_;
