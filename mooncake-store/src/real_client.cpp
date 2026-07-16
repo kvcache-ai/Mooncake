@@ -30,6 +30,10 @@
 #include "device/accelerator_registry.h"
 #include "default_config.h"
 #include "uds_transport.h"
+
+#ifdef USE_CUDA
+#include <cuda_runtime.h>
+#endif
 #include "shm_helper.h"
 #include "memory_location.h"
 #ifdef USE_NOF
@@ -3789,6 +3793,15 @@ RealClient::batch_put_with_store_reservation(
     std::thread([fs, keys, batched_slices, resp = std::move(resp), failed_set,
                  p = gds_promise]() {
         try {
+            // CUDA context is thread-local. std::thread starts with
+            // no context, so cudaPointerGetAttributes() (called by
+            // FindDeviceForPointer inside WriteRecord) fails to
+            // recognise GPU pointers and falls back to CPU pwrite.
+            // cudaFree(nullptr) is a guaranteed no-op that triggers
+            // lazy primary-context initialisation on this thread.
+#ifdef USE_CUDA
+            cudaFree(nullptr);
+#endif
             size_t reservation_idx = 0;
             std::unordered_set<size_t> dma_succeeded;
             for (size_t i = 0; i < keys.size(); ++i) {
@@ -3935,6 +3948,9 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
             std::thread([fs, keys, ordered_batched_slices, tenant, p,
                          barrier]() {
                 try {
+#ifdef USE_CUDA
+                    cudaFree(nullptr);
+#endif
                     auto res = fs->DirectGdsOffload(
                         keys, ordered_batched_slices, tenant, barrier);
                     p->set_value(res);
@@ -5242,6 +5258,9 @@ RealClient::batch_put_from_multi_buffers_internal(
             auto fs = file_storage_;  // shared_ptr, keeps FileStorage alive
             std::thread([fs, keys, batched_slices, tenant, p, barrier]() {
                 try {
+#ifdef USE_CUDA
+                    cudaFree(nullptr);
+#endif
                     auto res = fs->DirectGdsOffload(keys, batched_slices,
                                                     tenant, barrier);
                     p->set_value(res);
