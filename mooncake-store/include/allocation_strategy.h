@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <memory>
-#include <random>
 #include <string>
 #include <set>
 #include <unordered_map>
@@ -13,6 +12,7 @@
 #include "allocator.h"  // Contains BufferAllocator declaration
 #include "replica.h"
 #include "types.h"
+#include "random.h"
 
 namespace mooncake {
 
@@ -242,9 +242,6 @@ class RandomAllocationStrategy : public AllocationStrategy {
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
 
-        // Random number generator.
-        static thread_local std::mt19937 generator(std::random_device{}());
-
         std::vector<Replica> replicas;
         replicas.reserve(replica_num);
 
@@ -254,8 +251,8 @@ class RandomAllocationStrategy : public AllocationStrategy {
                 return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
             }
 
-            auto buffer = allocateSingle(allocator_manager, names[0],
-                                         slice_length, generator);
+            auto buffer =
+                allocateSingle(allocator_manager, names[0], slice_length);
             if (buffer) {
                 replicas.emplace_back(std::move(buffer),
                                       ReplicaStatus::PROCESSING, replica_type);
@@ -275,7 +272,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
             }
 
             auto buffer = allocateSingle(allocator_manager, preferred_segment,
-                                         slice_length, generator);
+                                         slice_length);
             if (buffer) {
                 replicas.emplace_back(std::move(buffer),
                                       ReplicaStatus::PROCESSING, replica_type);
@@ -290,8 +287,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
 
         // If replica_num is not satisfied, allocate the remaining replicas
         // randomly.
-        std::uniform_int_distribution<size_t> distribution(0, names.size() - 1);
-        size_t start_idx = distribution(generator);
+        size_t start_idx = randomIndex(names.size());
 
         const size_t max_retry = std::min(kMaxRetryLimit, names.size());
         size_t try_count = 0;
@@ -307,8 +303,8 @@ class RandomAllocationStrategy : public AllocationStrategy {
                 continue;
             }
 
-            auto buffer = allocateSingle(allocator_manager, names[index],
-                                         slice_length, generator);
+            auto buffer =
+                allocateSingle(allocator_manager, names[index], slice_length);
             if (buffer) {
                 replicas.emplace_back(std::move(buffer),
                                       ReplicaStatus::PROCESSING, replica_type);
@@ -328,9 +324,6 @@ class RandomAllocationStrategy : public AllocationStrategy {
     tl::expected<Replica, ErrorCode> AllocateFrom(
         const AllocatorManager& allocator_manager, const size_t slice_length,
         const std::string& segment_name) {
-        // Random number generator.
-        static thread_local std::mt19937 generator(std::random_device{}());
-
         // Validate input parameters
         if (slice_length == 0) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -341,8 +334,8 @@ class RandomAllocationStrategy : public AllocationStrategy {
             return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
         }
 
-        auto buffer = allocateSingle(allocator_manager, segment_name,
-                                     slice_length, generator);
+        auto buffer =
+            allocateSingle(allocator_manager, segment_name, slice_length);
         if (buffer == nullptr) {
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
@@ -352,7 +345,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
 
     std::unique_ptr<AllocatedBuffer> allocateSingle(
         const AllocatorManager& allocator_manager, const std::string& name,
-        const size_t slice_length, std::mt19937& generator) {
+        const size_t slice_length) {
         const auto allocators = allocator_manager.getAllocators(name);
         if (allocators == nullptr || allocators->size() == 0) {
             return nullptr;
@@ -366,9 +359,8 @@ class RandomAllocationStrategy : public AllocationStrategy {
 
         // Randomly select a start point to distribute
         // allocations across all segments
-        std::uniform_int_distribution<size_t> dist(0, num_segs - 1);
-        size_t seg_offset =
-            dist(generator);  // select a start segment to place replica
+        // Select a start segment to place the replica.
+        size_t seg_offset = randomIndex(num_segs);
         for (size_t i = 0; i < num_segs; i++) {  // only allocate one replica
             auto& allocator = (*allocators)[(i + seg_offset) % num_segs];
             if (auto buffer = allocator->allocate(slice_length)) {
@@ -420,8 +412,6 @@ class FreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
 
-        static thread_local std::mt19937 generator(std::random_device{}());
-
         std::vector<Replica> replicas;
         replicas.reserve(replica_num);
         std::set<std::string> used_segments;
@@ -434,7 +424,7 @@ class FreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
             }
 
             auto buffer = allocateSingle(allocator_manager, preferred_segment,
-                                         slice_length, generator);
+                                         slice_length);
             if (buffer) {
                 replicas.emplace_back(std::move(buffer),
                                       ReplicaStatus::PROCESSING, replica_type);
@@ -452,8 +442,7 @@ class FreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
         size_t sample_count =
             std::min(kCandidateMultiplier * remaining, names.size());
 
-        std::uniform_int_distribution<size_t> start_dist(0, names.size() - 1);
-        size_t start_idx = start_dist(generator);
+        size_t start_idx = randomIndex(names.size());
 
         struct Candidate {
             size_t name_idx;
@@ -489,8 +478,7 @@ class FreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
                 continue;
             }
 
-            auto buffer = allocateSingle(allocator_manager, name, slice_length,
-                                         generator);
+            auto buffer = allocateSingle(allocator_manager, name, slice_length);
             if (buffer) {
                 replicas.emplace_back(std::move(buffer),
                                       ReplicaStatus::PROCESSING, replica_type);
@@ -503,8 +491,7 @@ class FreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
         }
 
         // --- Fallback: Random allocation for any remaining replicas ---
-        std::uniform_int_distribution<size_t> distribution(0, names.size() - 1);
-        size_t fallback_idx = distribution(generator);
+        size_t fallback_idx = randomIndex(names.size());
         const size_t max_retry = std::min(kMaxRetryLimit, names.size());
         size_t try_count = 0;
 
@@ -519,8 +506,8 @@ class FreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
                 continue;
             }
 
-            auto buffer = allocateSingle(allocator_manager, names[index],
-                                         slice_length, generator);
+            auto buffer =
+                allocateSingle(allocator_manager, names[index], slice_length);
             if (buffer) {
                 replicas.emplace_back(std::move(buffer),
                                       ReplicaStatus::PROCESSING, replica_type);
@@ -578,8 +565,6 @@ class SsdFreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
 
-        static thread_local std::mt19937 generator(std::random_device{}());
-
         std::vector<Replica> replicas;
         replicas.reserve(replica_num);
         std::set<std::string> used_segments;
@@ -592,7 +577,7 @@ class SsdFreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
             }
 
             auto buffer = allocateSingle(allocator_manager, preferred_segment,
-                                         slice_length, generator);
+                                         slice_length);
             if (buffer) {
                 replicas.emplace_back(std::move(buffer),
                                       ReplicaStatus::PROCESSING, replica_type);
@@ -609,8 +594,7 @@ class SsdFreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
         size_t sample_count =
             std::min(kCandidateMultiplier * remaining, names.size());
 
-        std::uniform_int_distribution<size_t> start_dist(0, names.size() - 1);
-        size_t start_idx = start_dist(generator);
+        size_t start_idx = randomIndex(names.size());
 
         struct Candidate {
             size_t name_idx;
@@ -643,8 +627,7 @@ class SsdFreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
             }
 
             const auto& name = names[candidate.name_idx];
-            auto buffer = allocateSingle(allocator_manager, name, slice_length,
-                                         generator);
+            auto buffer = allocateSingle(allocator_manager, name, slice_length);
             if (buffer) {
                 replicas.emplace_back(std::move(buffer),
                                       ReplicaStatus::PROCESSING, replica_type);
@@ -657,8 +640,7 @@ class SsdFreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
         }
 
         // Fallback: Random allocation for remaining replicas
-        std::uniform_int_distribution<size_t> distribution(0, names.size() - 1);
-        size_t fallback_idx = distribution(generator);
+        size_t fallback_idx = randomIndex(names.size());
         const size_t max_retry = std::min(kMaxRetryLimit, names.size());
         size_t try_count = 0;
 
@@ -674,8 +656,7 @@ class SsdFreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
                 continue;
             }
 
-            auto buffer = allocateSingle(allocator_manager, name, slice_length,
-                                         generator);
+            auto buffer = allocateSingle(allocator_manager, name, slice_length);
             if (buffer) {
                 replicas.emplace_back(std::move(buffer),
                                       ReplicaStatus::PROCESSING, replica_type);
