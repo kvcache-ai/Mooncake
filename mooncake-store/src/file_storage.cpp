@@ -440,6 +440,11 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
     return batch_result;
 }
 
+bool FileStorage::IsPerBucketSoftOffloadError(ErrorCode error) {
+    return error == ErrorCode::INVALID_READ ||
+           error == ErrorCode::OBJECT_ALREADY_EXISTS;
+}
+
 tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     const std::vector<OffloadTaskItem>& offloading_objects) {
     if (offloading_objects.empty()) {
@@ -628,7 +633,11 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                 enable_offloading_ = false;
                 return tl::make_unexpected(offload_res.error());
             }
-            if (offload_res.error() == ErrorCode::INVALID_READ) {
+            if (IsPerBucketSoftOffloadError(offload_res.error())) {
+                // Only this bucket failed to persist; report its keys back to
+                // the master as failed (releasing their offloading tasks and
+                // source-replica refcounts) and keep processing the remaining
+                // buckets instead of aborting the whole offload cycle.
                 for (const auto& [key, _] : host_batch_object) {
                     failed_tasks.push_back(task_by_storage_key.at(key));
                 }

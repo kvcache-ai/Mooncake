@@ -108,6 +108,12 @@ class FileStorageTest : public ::testing::Test {
         return bucket_backend->UngroupedOffloadingObjectsSize();
     }
 
+    // Static funnel to the private FileStorage::IsPerBucketSoftOffloadError.
+    // FileStorageTest is friended; TEST_F-generated subclasses are not.
+    static bool CallIsPerBucketSoftOffloadError(ErrorCode error) {
+        return FileStorage::IsPerBucketSoftOffloadError(error);
+    }
+
     void AssertHeartbeatEvictsAllKeys(
         FileStorage& fileStorage, const std::vector<std::string>& expected_keys,
         const std::unordered_map<std::string, std::vector<Slice>>&
@@ -519,6 +525,25 @@ TEST_F(FileStorageTest, NotifyEvictedDiskReplicasUsesTenantScopedKeys) {
         ASSERT_FALSE(after[0].has_value());
         EXPECT_EQ(after[0].error(), ErrorCode::OBJECT_NOT_FOUND);
     }
+}
+
+// Regression test for issue #2827: under concurrent/repeat offload of the same
+// keys, the bucket backend rejects a whole bucket atomically with
+// OBJECT_ALREADY_EXISTS (see BucketStorageBackend duplicate-key tests). That
+// error must be treated as a per-bucket soft failure so OffloadObjects reports
+// the keys back to the master and continues, rather than aborting the whole
+// offload cycle and leaving master/SSD metadata inconsistent (which surfaced as
+// spurious INVALID_KEY on the read path). It stays alongside INVALID_READ,
+// while genuinely fatal errors (e.g. KEYS_ULTRA_LIMIT, INTERNAL_ERROR) do not.
+TEST_F(FileStorageTest, DuplicateOffloadErrorIsPerBucketSoftError) {
+    EXPECT_TRUE(
+        CallIsPerBucketSoftOffloadError(ErrorCode::OBJECT_ALREADY_EXISTS));
+    EXPECT_TRUE(CallIsPerBucketSoftOffloadError(ErrorCode::INVALID_READ));
+
+    EXPECT_FALSE(CallIsPerBucketSoftOffloadError(ErrorCode::KEYS_ULTRA_LIMIT));
+    EXPECT_FALSE(CallIsPerBucketSoftOffloadError(ErrorCode::INTERNAL_ERROR));
+    EXPECT_FALSE(CallIsPerBucketSoftOffloadError(ErrorCode::INVALID_KEY));
+    EXPECT_FALSE(CallIsPerBucketSoftOffloadError(ErrorCode::OK));
 }
 
 TEST_F(FileStorageTest, InvalidIntValueUsesDefault) {

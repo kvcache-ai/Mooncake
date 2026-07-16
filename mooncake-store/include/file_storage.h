@@ -78,6 +78,26 @@ class FileStorage {
         const std::vector<OffloadTaskItem>& offloading_objects);
 
     /**
+     * @brief Classifies a BatchOffload error as affecting only the current
+     * bucket rather than the whole offload cycle.
+     *
+     * Such an error means the bucket's keys simply cannot be persisted this
+     * round; OffloadObjects reports them back to the master as failed (so their
+     * offloading tasks and source-replica refcounts are released) and continues
+     * with the remaining buckets, instead of aborting the entire cycle.
+     *
+     *   - INVALID_READ: source data for these keys could not be read/staged.
+     *   - OBJECT_ALREADY_EXISTS: the key(s) were already offloaded, or are
+     *     being offloaded concurrently. The bucket backend rejects the whole
+     *     bucket atomically by design (see BucketStorageBackend::BatchOffload
+     *     and its PrepareEviction duplicate guard). Treating this as fatal
+     *     aborted the cycle, leaked offloading tasks, and left master/SSD
+     *     metadata inconsistent, which surfaced as spurious INVALID_KEY on the
+     *     read path (issue #2827).
+     */
+    static bool IsPerBucketSoftOffloadError(ErrorCode error);
+
+    /**
      * @brief Performs a heartbeat operation for the FileStorage component.
      * 1. Sends object status (e.g., access frequency, size) to the master via
      * client.
