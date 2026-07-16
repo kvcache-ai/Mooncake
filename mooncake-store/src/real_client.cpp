@@ -3943,7 +3943,14 @@ RealClient::batch_put_with_store_reservation(
             // cudaFree(nullptr) is a guaranteed no-op that triggers
             // lazy primary-context initialisation on this thread.
 #ifdef USE_CUDA
-            cudaFree(nullptr);
+            {
+                cudaError_t err = cudaFree(nullptr);
+                if (err != cudaSuccess)
+                    LOG(WARNING) << "GDS worker: cudaFree(nullptr) failed: "
+                                 << cudaGetErrorString(err)
+                                 << " — GPU pointer detection will fall back "
+                                 << "to pwrite";
+            }
 #endif
             size_t reservation_idx = 0;
             std::unordered_set<size_t> dma_succeeded;
@@ -4082,7 +4089,15 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
                          barrier]() {
                 try {
 #ifdef USE_CUDA
-                    cudaFree(nullptr);
+                    {
+                        cudaError_t err = cudaFree(nullptr);
+                        if (err != cudaSuccess)
+                            LOG(WARNING)
+                                << "GDS worker: cudaFree(nullptr) failed: "
+                                << cudaGetErrorString(err)
+                                << " — GPU pointer detection will fall back "
+                                << "to pwrite";
+                    }
 #endif
                     auto res = fs->DirectGdsOffload(
                         keys, ordered_batched_slices, tenant, barrier);
@@ -5357,7 +5372,15 @@ RealClient::batch_put_from_multi_buffers_internal(
             std::thread([fs, keys, batched_slices, tenant, p, barrier]() {
                 try {
 #ifdef USE_CUDA
-                    cudaFree(nullptr);
+                    {
+                        cudaError_t err = cudaFree(nullptr);
+                        if (err != cudaSuccess)
+                            LOG(WARNING)
+                                << "GDS worker: cudaFree(nullptr) failed: "
+                                << cudaGetErrorString(err)
+                                << " — GPU pointer detection will fall back "
+                                << "to pwrite";
+                    }
 #endif
                     auto res = fs->DirectGdsOffload(keys, batched_slices,
                                                     tenant, barrier);

@@ -12,11 +12,6 @@
 #include "gds/gds_context.h"  // GdsContext complete type for unique_ptr
 #include "storage_backend.h"
 #include "test_server_helpers.h"
-#include "utils/common.h" 
-#include "client_metric.h"
-#include "file_storage.h"
-#include "storage_backend.h"
-#include "test_server_helpers.h"
 #include "utils/common.h"
 
 namespace mooncake {

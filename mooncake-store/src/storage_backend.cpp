@@ -3681,18 +3681,21 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
             high_watermark_keys_ =
                 cfg_.high_watermark_keys > 0
                     ? cfg_.high_watermark_keys
-                    : static_cast<int64_t>(file_storage_config_.total_keys_limit *
-                                           cfg_.keys_high_ratio);
+                    : static_cast<int64_t>(
+                          file_storage_config_.total_keys_limit *
+                          cfg_.keys_high_ratio);
             low_watermark_keys_ =
                 cfg_.low_watermark_keys > 0
                     ? cfg_.low_watermark_keys
-                    : static_cast<int64_t>(file_storage_config_.total_keys_limit *
-                                           cfg_.keys_low_ratio);
+                    : static_cast<int64_t>(
+                          file_storage_config_.total_keys_limit *
+                          cfg_.keys_low_ratio);
 
             // Auto-nudge ratio-derived low watermarks when integer truncation
             // collapses them to the same value as high (e.g. limit=5, ratio
             // 0.95->4, ratio 0.90->4 => low==high==4).  Only applies to
-            // auto-derived values; explicit config values are validated strictly.
+            // auto-derived values; explicit config values are validated
+            // strictly.
             if (cfg_.low_watermark_bytes == 0 && high_watermark_bytes_ > 0 &&
                 low_watermark_bytes_ >= high_watermark_bytes_) {
                 low_watermark_bytes_ =
@@ -3712,16 +3715,17 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
             if (low_watermark_keys_ >= high_watermark_keys_) {
-                LOG(ERROR) << "Invalid watermark: low_keys=" << low_watermark_keys_
+                LOG(ERROR) << "Invalid watermark: low_keys="
+                           << low_watermark_keys_
                            << " >= high_keys=" << high_watermark_keys_;
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
 
             // Clamp watermarks to not exceed capacity / total_keys_limit
             if (high_watermark_bytes_ > static_cast<int64_t>(capacity_)) {
-                LOG(WARNING) << "high_watermark_bytes clamped from "
-                             << high_watermark_bytes_
-                             << " to capacity=" << capacity_;
+                LOG(WARNING)
+                    << "high_watermark_bytes clamped from "
+                    << high_watermark_bytes_ << " to capacity=" << capacity_;
                 high_watermark_bytes_ = static_cast<int64_t>(capacity_);
                 low_watermark_bytes_ =
                     std::min(low_watermark_bytes_, high_watermark_bytes_ - 1);
@@ -3759,7 +3763,8 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
                 if (cfg_.max_capacity_nodes > kAbsoluteMaxNodes) {
                     LOG(WARNING)
                         << "max_capacity_nodes " << cfg_.max_capacity_nodes
-                        << " exceeds RAM budget; clamped to " << kAbsoluteMaxNodes;
+                        << " exceeds RAM budget; clamped to "
+                        << kAbsoluteMaxNodes;
                     max_nodes = kAbsoluteMaxNodes;
                 } else {
                     max_nodes = static_cast<uint32_t>(cfg_.max_capacity_nodes);
