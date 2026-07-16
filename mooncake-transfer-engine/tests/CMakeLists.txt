@@ -72,6 +72,11 @@ if(USE_CXL)
 endif()
 
 if(USE_NVMEOF)
+  add_executable(nvmeof_status_test ${WORKSPACE}/nvmeof_status_test.cpp)
+  target_link_libraries(nvmeof_status_test PUBLIC transfer_engine gtest
+                                                  gtest_main)
+  add_test(NAME nvmeof_status_test COMMAND nvmeof_status_test)
+
   add_executable(nvmeof_transport_test ${WORKSPACE}/nvmeof_transport_test.cpp)
   target_link_libraries(nvmeof_transport_test PUBLIC transfer_engine gtest
                                                      gtest_main)
@@ -96,11 +101,17 @@ add_executable(tcp_address_validation_test
 target_link_libraries(tcp_address_validation_test PUBLIC gtest gtest_main)
 add_test(NAME tcp_address_validation_test COMMAND tcp_address_validation_test)
 
-if(USE_MNNVL)
-  add_executable(nvlink_transport_test ${WORKSPACE}/nvlink_transport_test.cpp)
-  target_link_libraries(nvlink_transport_test PUBLIC transfer_engine gtest
-                                                     gtest_main)
-  add_test(NAME nvlink_transport_test COMMAND nvlink_transport_test)
+# Hardware-free unit tests for DmabufExport struct and
+# RdmaContext::{exportDmabuf, closeDmabufExport}. Runs on every CI runner —
+# no RDMA device or GPU required (host-memory paths only).
+add_executable(dmabuf_export_test ${WORKSPACE}/dmabuf_export_test.cpp)
+target_link_libraries(dmabuf_export_test PUBLIC transfer_engine gtest gtest_main)
+add_test(NAME dmabuf_export_test COMMAND dmabuf_export_test)
+
+if (USE_MNNVL)
+    add_executable(nvlink_transport_test ${WORKSPACE}/nvlink_transport_test.cpp)
+    target_link_libraries(nvlink_transport_test PUBLIC transfer_engine gtest gtest_main )
+    add_test(NAME nvlink_transport_test COMMAND nvlink_transport_test)
 endif()
 
 if(USE_HIP)
@@ -193,20 +204,22 @@ if(USE_SUNRISE)
                  ${WORKSPACE}/sunrise_link_transport_test.cpp)
   target_include_directories(sunrise_link_transport_test
                              PRIVATE ${MC_TANGRT_ROOT}/include)
-  target_link_libraries(sunrise_link_transport_test PUBLIC transfer_engine
-                                                           gtest gtest_main
-                                                           ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
-                                                           ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
+  target_link_libraries(
+    sunrise_link_transport_test
+    PUBLIC transfer_engine gtest gtest_main
+           ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
+           ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
   add_test(NAME sunrise_link_transport_test COMMAND sunrise_link_transport_test)
 
   add_executable(sunrise_link_transport_runtime_test
                  ${WORKSPACE}/sunrise_link_transport_runtime_test.cpp)
   target_include_directories(sunrise_link_transport_runtime_test
                              PRIVATE ${MC_TANGRT_ROOT}/include)
-  target_link_libraries(sunrise_link_transport_runtime_test
-                        PUBLIC transfer_engine gtest gtest_main
-                               ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
-                               ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
+  target_link_libraries(
+    sunrise_link_transport_runtime_test
+    PUBLIC transfer_engine gtest gtest_main
+           ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
+           ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
   add_test(NAME sunrise_link_transport_runtime_test
            COMMAND sunrise_link_transport_runtime_test)
 
@@ -214,31 +227,32 @@ if(USE_SUNRISE)
                  ${WORKSPACE}/sunrise_link_transport_unit_test.cpp)
   target_include_directories(sunrise_link_transport_unit_test
                              PRIVATE ${MC_TANGRT_ROOT}/include)
-  target_link_libraries(sunrise_link_transport_unit_test
-                        PUBLIC transfer_engine gtest gtest_main
-                               ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
-                               ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
+  target_link_libraries(
+    sunrise_link_transport_unit_test
+    PUBLIC transfer_engine gtest gtest_main
+           ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
+           ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
   add_test(NAME sunrise_link_transport_unit_test
            COMMAND sunrise_link_transport_unit_test)
 
-  add_executable(sunrise_allocator_test
-                 ${WORKSPACE}/sunrise_allocator_test.cpp)
+  add_executable(sunrise_allocator_test ${WORKSPACE}/sunrise_allocator_test.cpp)
   target_include_directories(sunrise_allocator_test
                              PRIVATE ${MC_TANGRT_ROOT}/include)
-  target_link_libraries(sunrise_allocator_test
-                        PUBLIC transfer_engine gtest gtest_main
-                               ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
-                               ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
+  target_link_libraries(
+    sunrise_allocator_test
+    PUBLIC transfer_engine gtest gtest_main
+           ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
+           ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
   add_test(NAME sunrise_allocator_test COMMAND sunrise_allocator_test)
 
-  add_executable(sunrise_link_copy_test
-                 ${WORKSPACE}/sunrise_link_copy_test.cpp)
+  add_executable(sunrise_link_copy_test ${WORKSPACE}/sunrise_link_copy_test.cpp)
   target_include_directories(sunrise_link_copy_test
                              PRIVATE ${MC_TANGRT_ROOT}/include)
-  target_link_libraries(sunrise_link_copy_test
-                        PUBLIC transfer_engine gtest gtest_main
-                               ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
-                               ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
+  target_link_libraries(
+    sunrise_link_copy_test
+    PUBLIC transfer_engine gtest gtest_main
+           ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
+           ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
   add_test(NAME sunrise_link_copy_test COMMAND sunrise_link_copy_test)
 endif()
 
@@ -258,8 +272,8 @@ add_test(NAME rdma_gid_probe_test COMMAND rdma_gid_probe_test)
 
 add_executable(multi_transport_locality_test
                ${WORKSPACE}/multi_transport_locality_test.cpp)
-target_link_libraries(multi_transport_locality_test PUBLIC transfer_engine gtest
-                                                           gtest_main)
+target_link_libraries(multi_transport_locality_test PUBLIC transfer_engine
+                                                           gtest gtest_main)
 add_test(NAME multi_transport_locality_test
          COMMAND multi_transport_locality_test)
 
@@ -307,7 +321,7 @@ endif()
 
 add_executable(graceful_shutdown_test ${WORKSPACE}/graceful_shutdown_test.cpp)
 target_link_libraries(graceful_shutdown_test PUBLIC transfer_engine gtest
-                                                   gtest_main)
+                                                    gtest_main)
 add_test(NAME graceful_shutdown_test COMMAND graceful_shutdown_test)
 
 add_executable(show_links_test ${WORKSPACE}/show_links_test.cpp)

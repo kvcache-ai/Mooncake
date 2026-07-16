@@ -2,13 +2,16 @@
 
 #include <glog/logging.h>
 
+#include <array>
 #include <atomic>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "file_interface.h"
@@ -267,6 +270,12 @@ struct FileStorageConfig {
     // Use io_uring for file I/O instead of POSIX pread/pwrite
     bool use_uring = false;
 
+    // Proactively evict local disk objects from the heartbeat thread once
+    // backend usage crosses the high watermark.
+    bool enable_disk_watermark_eviction = true;
+    double disk_eviction_high_watermark_ratio = 0.90;
+    double disk_eviction_low_watermark_ratio = 0.80;
+
     // Validates the configuration for correctness and consistency
     bool Validate() const;
 
@@ -288,6 +297,9 @@ class StorageBackendInterface {
    public:
     StorageBackendInterface(const FileStorageConfig& file_storage_config);
 
+    using EvictionHandler = std::function<tl::expected<void, ErrorCode>(
+        const std::vector<std::string>& evicted_keys)>;
+
     virtual tl::expected<void, ErrorCode> Init() = 0;
 
     virtual tl::expected<int64_t, ErrorCode> BatchOffload(
@@ -295,8 +307,7 @@ class StorageBackendInterface {
         std::function<ErrorCode(const std::vector<std::string>& keys,
                                 std::vector<StorageObjectMetadata>& metadatas)>
             complete_handler,
-        std::function<void(const std::vector<std::string>& evicted_keys)>
-            eviction_handler = nullptr) = 0;
+        EvictionHandler eviction_handler = nullptr) = 0;
 
     virtual tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batched_slices) = 0;
@@ -327,6 +338,13 @@ class StorageBackendInterface {
     // Remove all persisted objects from disk. Called during RemoveAll to
     // clean up physical SSD files alongside master metadata deletion.
     virtual void RemoveAll() {}
+
+    virtual tl::expected<std::vector<std::string>, ErrorCode>
+    EvictAboveDiskWatermark(double /* high_watermark_ratio */,
+                            double /* low_watermark_ratio */,
+                            EvictionHandler /* eviction_handler */ = nullptr) {
+        return std::vector<std::string>{};
+    }
 
     FileStorageConfig file_storage_config_;
 };
@@ -426,7 +444,8 @@ class StorageBackend {
      */
     tl::expected<std::vector<std::string>, ErrorCode> StoreObject(
         const std::string& path, const std::vector<Slice>& slices,
-        const std::string& key = "");
+        const std::string& key = "",
+        StorageBackendInterface::EvictionHandler eviction_handler = nullptr);
 
     /**
      * @brief Stores an object from a string
@@ -437,7 +456,8 @@ class StorageBackend {
      */
     tl::expected<std::vector<std::string>, ErrorCode> StoreObject(
         const std::string& path, const std::string& str,
-        const std::string& key = "");
+        const std::string& key = "",
+        StorageBackendInterface::EvictionHandler eviction_handler = nullptr);
 
     /**
      * @brief Stores an object from a span of data
@@ -448,7 +468,14 @@ class StorageBackend {
      */
     tl::expected<std::vector<std::string>, ErrorCode> StoreObject(
         const std::string& path, std::span<const char> data,
-        const std::string& key = "");
+        const std::string& key = "",
+        StorageBackendInterface::EvictionHandler eviction_handler = nullptr);
+
+    tl::expected<std::vector<std::string>, ErrorCode> EvictAboveDiskWatermark(
+        double high_watermark_ratio, double low_watermark_ratio,
+        StorageBackendInterface::EvictionHandler eviction_handler = nullptr);
+
+    void UpdateFileRecordKey(const std::string& path, const std::string& key);
 
     /**
      * @brief Loads an object into slices
@@ -506,8 +533,11 @@ class StorageBackend {
     std::list<FileRecord> file_write_queue_;
     std::unordered_map<std::string, std::list<FileRecord>::iterator>
         file_queue_map_;
+    std::unordered_set<std::string> pending_eviction_paths_;
     mutable std::shared_mutex
         file_queue_mutex_;  // Mutex to protect file queue operations
+    static constexpr size_t kFilePathLockCount = 64;
+    std::array<Mutex, kFilePathLockCount> file_path_mutexes_;
 
     // Storage space tracking variables
     mutable std::shared_mutex
@@ -539,6 +569,12 @@ class StorageBackend {
      */
     FileRecord EvictFile();
 
+    FileRecord PopFileToEvictByFIFO();
+
+    void RestoreFileToWriteQueueFront(const FileRecord& record);
+
+    tl::expected<void, ErrorCode> DeleteEvictedFile(const FileRecord& record);
+
     /**
      * @brief Add file to write queue for FIFO tracking
      * @param path Path of the file to add to queue
@@ -561,13 +597,6 @@ class StorageBackend {
     bool CheckDiskSpace(size_t required_size);
 
     /**
-     * @brief Select a file to evict based on FIFO order (earliest written
-     * first)
-     * @return The file to evict, or empty structure if no file found
-     */
-    FileRecord SelectFileToEvictByFIFO();
-
-    /**
      * @brief Ensures that a specified amount of disk space is available,
      * performing evictions if necessary.
      *
@@ -578,7 +607,8 @@ class StorageBackend {
      *         attempting evictions up to the maximum attempt limit.
      */
     tl::expected<std::vector<std::string>, ErrorCode> EnsureDiskSpace(
-        size_t required_size);
+        size_t required_size,
+        StorageBackendInterface::EvictionHandler eviction_handler = nullptr);
 
     /**
      * @brief Releases a specified amount of disk space and updates internal
@@ -605,6 +635,10 @@ class StorageBackend {
      * @return true if eviction is enabled, false otherwise.
      */
     bool IsEvictionEnabled() const;
+
+    Mutex& GetFilePathMutex(const std::string& path);
+
+    bool IsFilePendingEviction(const std::string& path) const;
 
     /**
      * @brief Helper: Creates a file for writing and handles errors
@@ -670,8 +704,7 @@ class StorageBackendAdaptor : public StorageBackendInterface {
         std::function<ErrorCode(const std::vector<std::string>& keys,
                                 std::vector<StorageObjectMetadata>& metadatas)>
             complete_handler,
-        std::function<void(const std::vector<std::string>& evicted_keys)>
-            eviction_handler = nullptr) override;
+        EvictionHandler eviction_handler = nullptr) override;
 
     tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batched_slices) override;
@@ -694,6 +727,10 @@ class StorageBackendAdaptor : public StorageBackendInterface {
     }
 
     void RemoveAll() override;
+
+    tl::expected<std::vector<std::string>, ErrorCode> EvictAboveDiskWatermark(
+        double high_watermark_ratio, double low_watermark_ratio,
+        EvictionHandler eviction_handler = nullptr) override;
 
    private:
     const FilePerKeyConfig file_per_key_config_;
@@ -747,8 +784,7 @@ class BucketStorageBackend : public StorageBackendInterface {
         std::function<ErrorCode(const std::vector<std::string>& keys,
                                 std::vector<StorageObjectMetadata>& metadatas)>
             complete_handler,
-        std::function<void(const std::vector<std::string>& evicted_keys)>
-            eviction_handler = nullptr) override;
+        EvictionHandler eviction_handler = nullptr) override;
 
     /**
      * @brief Retrieves metadata for multiple objects in a single batch
@@ -881,6 +917,10 @@ class BucketStorageBackend : public StorageBackendInterface {
      */
     tl::expected<void, ErrorCode> DeleteBucket(int64_t bucket_id);
 
+    tl::expected<std::vector<std::string>, ErrorCode> EvictAboveDiskWatermark(
+        double high_watermark_ratio, double low_watermark_ratio,
+        EvictionHandler eviction_handler = nullptr) override;
+
    private:
     tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode> BuildBucket(
         int64_t bucket_id,
@@ -920,9 +960,8 @@ class BucketStorageBackend : public StorageBackendInterface {
     tl::expected<bool, ErrorCode> HasNext();
 
     /**
-     * @brief Cleanup orphaned bucket files (data + metadata) for a given bucket
-     * ID. Called when BatchOffload fails due to duplicate keys after files were
-     * written.
+     * @brief Remove any remaining data and metadata files for a bucket.
+     * Used by write rollback and startup recovery of incomplete buckets.
      * @param bucket_id The bucket ID whose files should be deleted.
      */
     void CleanupOrphanedBucket(int64_t bucket_id);
@@ -944,11 +983,15 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     // Holds eviction state between PrepareEviction and FinalizeEviction.
     // PrepareEviction removes buckets from metadata maps and returns this.
-    // FinalizeEviction waits for in-flight reads and deletes the files.
+    // FinalizeEviction removes persisted metadata, waits for in-flight reads,
+    // and then deletes the data files.
     struct PendingEviction {
         std::vector<std::string> keys;  // All keys in evicted buckets
         std::vector<std::pair<int64_t, std::shared_ptr<BucketMetadata>>>
             buckets;  // (bucket_id, metadata) for file deletion
+        std::vector<std::string> write_keys;
+        int64_t evicted_size = 0;
+        int64_t write_size = 0;
     };
 
     /**
@@ -959,7 +1002,18 @@ class BucketStorageBackend : public StorageBackendInterface {
      * @param required_size Size of the incoming bucket to be written.
      * @return PendingEviction with all keys and bucket metadata removed.
      */
-    PendingEviction PrepareEviction(int64_t required_size);
+    tl::expected<PendingEviction, ErrorCode> PrepareEviction(
+        int64_t required_size, const std::vector<std::string>& write_keys = {});
+
+    void RestorePreparedEviction(PendingEviction&& pending);
+
+    void RestorePreparedEvictionLocked(PendingEviction&& pending);
+
+    void CommitPreparedEviction(const PendingEviction& pending);
+
+    void ReleasePreparedWrite(const PendingEviction& pending);
+
+    void ReleasePreparedWriteLocked(const PendingEviction& pending);
 
     /**
      * @brief Select the next bucket to evict according to the configured
@@ -971,12 +1025,16 @@ class BucketStorageBackend : public StorageBackendInterface {
     SelectEvictionCandidate();
 
     /**
-     * @brief Phase 2 of eviction: wait for in-flight reads on each evicted
-     * bucket to drain, then delete the data and metadata files.
+     * @brief Phase 2 of eviction: delete persisted metadata for each evicted
+     * bucket, wait for in-flight reads to drain, then delete the data file.
+     * When metadata removal succeeds, doing it first prevents a later read
+     * timeout or data-file deletion failure from leaving a bucket that Init()
+     * could recover.
      * Must be called AFTER master has been notified via eviction_handler.
      * @param pending The result of a prior PrepareEviction call.
      */
-    void FinalizeEviction(const PendingEviction& pending);
+    tl::expected<void, ErrorCode> FinalizeEviction(
+        const PendingEviction& pending);
 
    public:
     /**
@@ -1024,6 +1082,10 @@ class BucketStorageBackend : public StorageBackendInterface {
     int64_t total_size_ GUARDED_BY(mutex_) = 0;
     std::unordered_map<std::string, StorageObjectMetadata> GUARDED_BY(mutex_)
         object_bucket_map_;
+    std::unordered_set<std::string> GUARDED_BY(mutex_) pending_eviction_keys_;
+    std::unordered_set<std::string> GUARDED_BY(mutex_) pending_write_keys_;
+    int64_t pending_eviction_size_ GUARDED_BY(mutex_) = 0;
+    int64_t pending_write_size_ GUARDED_BY(mutex_) = 0;
     std::map<int64_t, std::shared_ptr<BucketMetadata>> GUARDED_BY(
         mutex_) buckets_;
     // LRU eviction index: ordered set of {last_access_ns_, bucket_id}.
@@ -1077,8 +1139,7 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
         std::function<ErrorCode(const std::vector<std::string>& keys,
                                 std::vector<StorageObjectMetadata>& metadatas)>
             complete_handler,
-        std::function<void(const std::vector<std::string>& evicted_keys)>
-            eviction_handler = nullptr) override;
+        EvictionHandler eviction_handler = nullptr) override;
 
     /**
      * @brief Loads data for multiple objects in a batch operation.
