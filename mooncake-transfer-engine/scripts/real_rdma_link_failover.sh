@@ -342,11 +342,11 @@ echo "initiator exit code: $INITIATOR_RC"
 echo "target log         : $TARGET_LOG"
 echo "initiator log      : $INITIATOR_LOG"
 
-if grep -E "FAILED|failed|Transport retry counter exceeded|Cannot make connection|KVTransferError|AddressNotRegistered|Detect data integrity problem" "$INITIATOR_LOG" "$TARGET_LOG" >/tmp/mooncake-real-link-failover-grep.$$ 2>/dev/null; then
+grep_output="$(grep -E "FAILED|failed|Transport retry counter exceeded|Cannot make connection|KVTransferError|AddressNotRegistered|Detect data integrity problem" "$INITIATOR_LOG" "$TARGET_LOG" 2>/dev/null | tail -n 80 || true)"
+if [[ -n "$grep_output" ]]; then
     echo
     echo "Important failure-like log lines:"
-    tail -n 80 /tmp/mooncake-real-link-failover-grep.$$
-    rm -f /tmp/mooncake-real-link-failover-grep.$$
+    echo "$grep_output"
 fi
 
 if [[ "$FAULT_SIDE" == "sender" ]]; then

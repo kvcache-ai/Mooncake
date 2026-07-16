@@ -871,6 +871,15 @@ int Topology::disableDevice(const std::string &device_name) {
             avail_hca.end());
         record.second.avail_hca_name_to_index_map_.erase(device_name);
     }
+    for (auto &local_entry : resolved_hca_peer_affinity_by_local_) {
+        for (auto &storage_entry : local_entry.second) {
+            auto &candidates = storage_entry.second;
+            candidates.erase(
+                std::remove(candidates.begin(), candidates.end(),
+                            disabled_hca_index),
+                candidates.end());
+        }
+    }
     return 0;
 }
 }  // namespace mooncake

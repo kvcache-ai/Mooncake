@@ -1091,7 +1091,7 @@ void WorkerPool::maybeActivateRecoveredContext() {
 bool WorkerPool::hasAvailablePeerRailAlternative(
     Transport::Slice *slice, const std::string &failed_peer_path) {
     auto peer_segment_desc =
-        context_.engine().meta()->getSegmentDescByID(slice->target_id, true);
+        context_.engine().meta()->getSegmentDescByID(slice->target_id, false);
     if (!peer_segment_desc) return false;
 
     int buffer_id = -1;
