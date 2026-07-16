@@ -5,6 +5,7 @@
 #include <charconv>
 #include <cstdlib>
 #include <optional>
+#include <string>
 #include <system_error>
 
 #include <glog/logging.h>
@@ -16,11 +17,30 @@
 namespace mooncake {
 namespace {
 
+std::pair<const char*, const char*> TrimAsciiWhitespace(const char* value) {
+    const char* begin = value;
+    while (std::isspace(static_cast<unsigned char>(*begin))) {
+        ++begin;
+    }
+
+    const char* end = begin;
+    while (*end != '\0') {
+        ++end;
+    }
+    while (end > begin &&
+           std::isspace(static_cast<unsigned char>(*(end - 1)))) {
+        --end;
+    }
+
+    return {begin, end};
+}
+
 bool ParsePinnedMemoryEnabled() {
     const char* value = std::getenv("MC_STORE_PIN_MEMORY");
     if (!value) return true;
 
-    std::string normalized(value);
+    auto [begin, end] = TrimAsciiWhitespace(value);
+    std::string normalized(begin, end);
     std::transform(
         normalized.begin(), normalized.end(), normalized.begin(),
         [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
@@ -32,23 +52,11 @@ std::optional<uint64_t> ParsePinnedMemoryLimit() {
     const char* value = std::getenv("MC_STORE_PIN_MEMORY_MAX_BYTES");
     if (!value || value[0] == '\0') return 0;
 
-    const char* number = value;
-    while (std::isspace(static_cast<unsigned char>(*number))) {
-        ++number;
-    }
+    auto [number, end] = TrimAsciiWhitespace(value);
     if (*number == '-') {
         LOG(WARNING) << "Invalid MC_STORE_PIN_MEMORY_MAX_BYTES='" << value
                      << "', disabling Store segment pinning";
         return std::nullopt;
-    }
-
-    const char* end = number;
-    while (*end != '\0') {
-        ++end;
-    }
-    while (end > number &&
-           std::isspace(static_cast<unsigned char>(*(end - 1)))) {
-        --end;
     }
 
     uint64_t parsed = 0;
@@ -232,9 +240,15 @@ void RegisteredPinnedMemoryManager::release(RegisteredPinnedRegion* region) {
 #if defined(USE_CUDA)
     cudaError_t err = cudaHostUnregister(region->addr_);
     if (err != cudaSuccess) {
-        LOG(FATAL) << "cudaHostUnregister failed for " << region->owner_
-                   << ", size=" << region->size_
-                   << ", error=" << cudaGetErrorString(err);
+        if (err == cudaErrorCudartUnloading) {
+            LOG(WARNING) << "Skip cudaHostUnregister for " << region->owner_
+                         << " because CUDA runtime is unloading, size="
+                         << region->size_;
+        } else {
+            LOG(FATAL) << "cudaHostUnregister failed for " << region->owner_
+                       << ", size=" << region->size_
+                       << ", error=" << cudaGetErrorString(err);
+        }
     }
 #endif
 
