@@ -46,11 +46,14 @@ bool supportFabricMem() {
     if (err != cudaSuccess || num_devices == 0) return false;
 
     for (int device_id = 0; device_id < num_devices; ++device_id) {
+        CUdevice cu_device;
+        if (cuDeviceGet(&cu_device, device_id) != CUDA_SUCCESS) return false;
         int supported = 0;
-        cuDeviceGetAttribute(&supported,
-                             CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED,
-                             device_id);
-        if (!supported) return false;
+        if (cuDeviceGetAttribute(
+                &supported, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED,
+                cu_device) != CUDA_SUCCESS ||
+            !supported)
+            return false;
     }
     return true;
 }
@@ -381,6 +384,7 @@ class P2pDeviceTransportImpl : public P2pTransport {
     void freeBuffer(void* ptr) override {
 #if defined(USE_CUDA)
         cleanupFabricPeerMappings();
+        if (ptr == nullptr) return;
         if (use_fabric_mem_) {
             CUdeviceptr dptr = reinterpret_cast<CUdeviceptr>(ptr);
             cuMemUnmap(dptr, fabric_alloc_size_);
@@ -487,6 +491,12 @@ class P2pDeviceTransportImpl : public P2pTransport {
         if (use_fabric_mem_) {
             cleanupFabricPeerMappings();
             all_peers_accessible_ = true;
+            std::vector<CUmemAccessDesc> access(device_count);
+            for (int i = 0; i < device_count; ++i) {
+                access[i].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+                access[i].location.id = i;
+                access[i].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+            }
             for (int dst = 0; dst < num_ranks_; ++dst) {
                 if (active_ranks_mask[dst] == 0) continue;
                 if (dst == rank) continue;
@@ -525,13 +535,9 @@ class P2pDeviceTransportImpl : public P2pTransport {
                     all_peers_accessible_ = false;
                     break;
                 }
-                void* peer_ptr = reinterpret_cast<void*>(peer_reserved);
-
-                res = cuMemMap(reinterpret_cast<CUdeviceptr>(peer_ptr),
-                               mapped_size, 0, handle, 0);
+                res = cuMemMap(peer_reserved, mapped_size, 0, handle, 0);
                 if (res != CUDA_SUCCESS) {
-                    cuMemAddressFree(reinterpret_cast<CUdeviceptr>(peer_ptr),
-                                     mapped_size);
+                    cuMemAddressFree(peer_reserved, mapped_size);
                     cuMemRelease(handle);
                     LOG(ERROR) << "[EP P2P] cuMemMap peer fabric mapping "
                                   "failed for rank "
@@ -540,22 +546,11 @@ class P2pDeviceTransportImpl : public P2pTransport {
                     break;
                 }
 
-                int peer_device_count = 0;
-                cudaGetDeviceCount(&peer_device_count);
-                std::vector<CUmemAccessDesc> access(peer_device_count);
-                for (int i = 0; i < peer_device_count; ++i) {
-                    access[i].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-                    access[i].location.id = i;
-                    access[i].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-                }
-                res = cuMemSetAccess(reinterpret_cast<CUdeviceptr>(peer_ptr),
-                                     mapped_size, access.data(),
-                                     peer_device_count);
+                res = cuMemSetAccess(peer_reserved, mapped_size, access.data(),
+                                     device_count);
                 if (res != CUDA_SUCCESS) {
-                    cuMemUnmap(reinterpret_cast<CUdeviceptr>(peer_ptr),
-                               mapped_size);
-                    cuMemAddressFree(reinterpret_cast<CUdeviceptr>(peer_ptr),
-                                     mapped_size);
+                    cuMemUnmap(peer_reserved, mapped_size);
+                    cuMemAddressFree(peer_reserved, mapped_size);
                     cuMemRelease(handle);
                     LOG(ERROR) << "[EP P2P] cuMemSetAccess peer fabric mapping "
                                   "failed for rank "
@@ -564,6 +559,7 @@ class P2pDeviceTransportImpl : public P2pTransport {
                     break;
                 }
 
+                void* peer_ptr = reinterpret_cast<void*>(peer_reserved);
                 fabric_peer_mappings_[dst] = {peer_ptr, mapped_size, handle};
                 available[dst] = 1;
                 peer_ptrs_host_[dst] = peer_ptr;
