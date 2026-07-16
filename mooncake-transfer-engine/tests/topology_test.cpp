@@ -145,8 +145,7 @@ TEST(ToplogyTest, TestDisableDeviceRemovesLocalHcaAffinityCandidate) {
     ASSERT_EQ(topology.parse(json_str), 0);
 
     const auto &hca_list = topology.getHcaList();
-    auto disabled_iter =
-        std::find(hca_list.begin(), hca_list.end(), "mlx5_2");
+    auto disabled_iter = std::find(hca_list.begin(), hca_list.end(), "mlx5_2");
     ASSERT_NE(disabled_iter, hca_list.end());
     const int disabled_index =
         static_cast<int>(std::distance(hca_list.begin(), disabled_iter));
