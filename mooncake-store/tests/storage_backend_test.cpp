@@ -2821,9 +2821,11 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_Eviction_FifoOrder) {
 
     std::vector<std::string> evicted_keys;
     auto eviction_handler =
-        [&evicted_keys](const std::vector<std::string>& keys) {
-            for (const auto& k : keys) evicted_keys.push_back(k);
-        };
+        [&evicted_keys](const std::vector<std::string>& keys)
+        -> tl::expected<void, ErrorCode> {
+        for (const auto& k : keys) evicted_keys.push_back(k);
+        return {};
+    };
     auto complete_handler = [](const std::vector<std::string>&,
                                std::vector<StorageObjectMetadata>&) {
         return ErrorCode::OK;
@@ -2874,9 +2876,11 @@ TEST_F(StorageBackendTest,
 
     std::vector<std::string> evicted_keys;
     auto eviction_handler =
-        [&evicted_keys](const std::vector<std::string>& keys) {
-            for (const auto& k : keys) evicted_keys.push_back(k);
-        };
+        [&evicted_keys](const std::vector<std::string>& keys)
+        -> tl::expected<void, ErrorCode> {
+        for (const auto& k : keys) evicted_keys.push_back(k);
+        return {};
+    };
     auto complete_handler = [](const std::vector<std::string>&,
                                std::vector<StorageObjectMetadata>&) {
         return ErrorCode::OK;
@@ -2924,11 +2928,13 @@ TEST_F(StorageBackendTest,
 
     auto eviction_handler =
         [&handler_called_before_allocation,
-         &allocate_happened](const std::vector<std::string>& keys) {
-            if (!keys.empty() && !allocate_happened) {
-                handler_called_before_allocation = true;
-            }
-        };
+         &allocate_happened](const std::vector<std::string>& keys)
+        -> tl::expected<void, ErrorCode> {
+        if (!keys.empty() && !allocate_happened) {
+            handler_called_before_allocation = true;
+        }
+        return {};
+    };
     auto complete_handler = [](const std::vector<std::string>&,
                                std::vector<StorageObjectMetadata>&) {
         return ErrorCode::OK;
@@ -2949,9 +2955,11 @@ TEST_F(StorageBackendTest,
 
     std::vector<std::string> captured_evicted;
     auto capture_handler =
-        [&captured_evicted](const std::vector<std::string>& keys) {
-            for (const auto& k : keys) captured_evicted.push_back(k);
-        };
+        [&captured_evicted](const std::vector<std::string>& keys)
+        -> tl::expected<void, ErrorCode> {
+        for (const auto& k : keys) captured_evicted.push_back(k);
+        return {};
+    };
 
     auto batch = MakeSingleKeyBatch("key_d", data, buffers);
     storage_backend.BatchOffload(batch, complete_handler, capture_handler);
@@ -2987,10 +2995,11 @@ TEST_F(StorageBackendTest,
     ASSERT_TRUE(storage_backend.Init());
 
     std::vector<std::string> all_evicted;
-    auto eviction_handler =
-        [&all_evicted](const std::vector<std::string>& keys) {
-            for (const auto& k : keys) all_evicted.push_back(k);
-        };
+    auto eviction_handler = [&all_evicted](const std::vector<std::string>& keys)
+        -> tl::expected<void, ErrorCode> {
+        for (const auto& k : keys) all_evicted.push_back(k);
+        return {};
+    };
     auto complete_handler = [](const std::vector<std::string>&,
                                std::vector<StorageObjectMetadata>&) {
         return ErrorCode::OK;
@@ -3039,9 +3048,11 @@ TEST_F(StorageBackendTest,
 
     std::vector<std::string> evicted_keys;
     auto eviction_handler =
-        [&evicted_keys](const std::vector<std::string>& keys) {
-            for (const auto& k : keys) evicted_keys.push_back(k);
-        };
+        [&evicted_keys](const std::vector<std::string>& keys)
+        -> tl::expected<void, ErrorCode> {
+        for (const auto& k : keys) evicted_keys.push_back(k);
+        return {};
+    };
     auto complete_handler = [](const std::vector<std::string>&,
                                std::vector<StorageObjectMetadata>&) {
         return ErrorCode::OK;
@@ -3125,9 +3136,11 @@ TEST_F(StorageBackendTest,
     std::vector<std::string> all_evicted;
     std::mutex evict_mtx;
     auto eviction_handler = [&all_evicted,
-                             &evict_mtx](const std::vector<std::string>& keys) {
+                             &evict_mtx](const std::vector<std::string>& keys)
+        -> tl::expected<void, ErrorCode> {
         std::lock_guard<std::mutex> lk(evict_mtx);
         for (const auto& k : keys) all_evicted.push_back(k);
+        return {};
     };
 
     std::atomic<bool> stop{false};

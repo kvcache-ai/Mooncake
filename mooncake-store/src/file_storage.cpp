@@ -465,9 +465,10 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             continue;
         }
 
-        auto eviction_handler = [this](const std::vector<std::string>&
-                                           evicted_keys) {
-            if (evicted_keys.empty()) return;
+        auto eviction_handler =
+            [this](const std::vector<std::string>& evicted_keys)
+            -> tl::expected<void, ErrorCode> {
+            if (evicted_keys.empty()) return {};
             std::unordered_map<std::string, std::vector<std::string>>
                 keys_by_tenant;
             for (const auto& storage_key : evicted_keys) {
@@ -488,6 +489,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                     }
                 }
             }
+            return {};
         };
 
         // D2H staging: replace device slices with host memory slices

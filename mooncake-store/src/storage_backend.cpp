@@ -1145,8 +1145,7 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
     std::function<ErrorCode(const std::vector<std::string>& keys,
                             std::vector<StorageObjectMetadata>& metadatas)>
         complete_handler,
-    std::function<void(const std::vector<std::string>& evicted_keys)>
-        eviction_handler) {
+    EvictionHandler eviction_handler) {
     if (batch_object.empty()) {
         LOG(ERROR) << "batch object is empty";
         return tl::make_unexpected(ErrorCode::INVALID_KEY);
@@ -1418,8 +1417,7 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     std::function<ErrorCode(const std::vector<std::string>& keys,
                             std::vector<StorageObjectMetadata>& metadatas)>
         complete_handler,
-    std::function<void(const std::vector<std::string>& evicted_keys)>
-        eviction_handler) {
+    EvictionHandler eviction_handler) {
     if (!initialized_.load(std::memory_order_acquire)) {
         LOG(ERROR)
             << "Storage backend is not initialized. Call Init() before use.";
@@ -3954,8 +3952,7 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
     std::function<ErrorCode(const std::vector<std::string>& keys,
                             std::vector<StorageObjectMetadata>& metadatas)>
         complete_handler,
-    std::function<void(const std::vector<std::string>& evicted_keys)>
-        eviction_handler) {
+    EvictionHandler eviction_handler) {
     // ================================================================
     // SINGLE-WRITER PRECONDITION
     //
@@ -4059,12 +4056,15 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
         }
 
         // ---- (B) Notify master + accumulate tombstone ----
-        if (eviction_on && !evicted_keys.empty()) {
+        if (eviction_on && eviction_handler && !evicted_keys.empty()) {
             if (cfg_.persist_mode != OffsetPersistMode::kDisabled) {
                 all_evicted_this_batch_.insert(evicted_keys.begin(),
                                                evicted_keys.end());
             }
-            eviction_handler(evicted_keys);
+            auto notify_result = eviction_handler(evicted_keys);
+            if (!notify_result) {
+                return tl::make_unexpected(notify_result.error());
+            }
             evicted_keys.clear();
         }
 
@@ -4086,12 +4086,15 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
                                 evicted_keys);
                 fallback_total_evicted += (evicted_keys.size() - before);
 
-                if (eviction_on && !evicted_keys.empty()) {
+                if (eviction_handler && !evicted_keys.empty()) {
                     if (cfg_.persist_mode != OffsetPersistMode::kDisabled) {
                         all_evicted_this_batch_.insert(evicted_keys.begin(),
                                                        evicted_keys.end());
                     }
-                    eviction_handler(evicted_keys);
+                    auto notify_result = eviction_handler(evicted_keys);
+                    if (!notify_result) {
+                        return tl::make_unexpected(notify_result.error());
+                    }
                     evicted_keys.clear();
                 }
 
@@ -4266,6 +4269,16 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
                     std::memory_order_relaxed);
             }
         }
+    }
+
+    // ---- Post-loop flush: notify master of any evicted keys that
+    // were accumulated by the last (possibly allocate-failing) key.
+    if (eviction_on && eviction_handler && !evicted_keys.empty()) {
+        auto notify_result = eviction_handler(evicted_keys);
+        if (!notify_result) {
+            return tl::make_unexpected(notify_result.error());
+        }
+        evicted_keys.clear();
     }
 
     // ---- Complete handler ----

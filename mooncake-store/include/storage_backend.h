@@ -295,6 +295,12 @@ struct FileStorageConfig {
     // Use io_uring for file I/O instead of POSIX pread/pwrite
     bool use_uring = false;
 
+    // Proactively evict local disk objects from the heartbeat thread once
+    // backend usage crosses the high watermark.
+    bool enable_disk_watermark_eviction = true;
+    double disk_eviction_high_watermark_ratio = 0.90;
+    double disk_eviction_low_watermark_ratio = 0.80;
+
     // Validates the configuration for correctness and consistency
     bool Validate() const;
 
@@ -316,6 +322,9 @@ class StorageBackendInterface {
    public:
     StorageBackendInterface(const FileStorageConfig& file_storage_config);
 
+    using EvictionHandler = std::function<tl::expected<void, ErrorCode>(
+        const std::vector<std::string>& evicted_keys)>;
+
     virtual tl::expected<void, ErrorCode> Init() = 0;
 
     virtual tl::expected<int64_t, ErrorCode> BatchOffload(
@@ -323,8 +332,7 @@ class StorageBackendInterface {
         std::function<ErrorCode(const std::vector<std::string>& keys,
                                 std::vector<StorageObjectMetadata>& metadatas)>
             complete_handler,
-        std::function<void(const std::vector<std::string>& evicted_keys)>
-            eviction_handler = nullptr) = 0;
+        EvictionHandler eviction_handler = nullptr) = 0;
 
     virtual tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batched_slices) = 0;
@@ -350,6 +358,13 @@ class StorageBackendInterface {
     virtual void SetTestFailurePredicate(
         std::function<bool(const std::string& key)> /* predicate */) {
         // Default: no-op (no test failures injected)
+    }
+
+    virtual tl::expected<std::vector<std::string>, ErrorCode>
+    EvictAboveDiskWatermark(double /* high_watermark_ratio */,
+                            double /* low_watermark_ratio */,
+                            EvictionHandler /* eviction_handler */ = nullptr) {
+        return std::vector<std::string>{};
     }
 
     FileStorageConfig file_storage_config_;
@@ -694,8 +709,7 @@ class StorageBackendAdaptor : public StorageBackendInterface {
         std::function<ErrorCode(const std::vector<std::string>& keys,
                                 std::vector<StorageObjectMetadata>& metadatas)>
             complete_handler,
-        std::function<void(const std::vector<std::string>& evicted_keys)>
-            eviction_handler = nullptr) override;
+        EvictionHandler eviction_handler = nullptr) override;
 
     tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batched_slices) override;
@@ -769,8 +783,7 @@ class BucketStorageBackend : public StorageBackendInterface {
         std::function<ErrorCode(const std::vector<std::string>& keys,
                                 std::vector<StorageObjectMetadata>& metadatas)>
             complete_handler,
-        std::function<void(const std::vector<std::string>& evicted_keys)>
-            eviction_handler = nullptr) override;
+        EvictionHandler eviction_handler = nullptr) override;
 
     /**
      * @brief Retrieves metadata for multiple objects in a single batch
@@ -1106,8 +1119,7 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
         std::function<ErrorCode(const std::vector<std::string>& keys,
                                 std::vector<StorageObjectMetadata>& metadatas)>
             complete_handler,
-        std::function<void(const std::vector<std::string>& evicted_keys)>
-            eviction_handler = nullptr) override;
+        EvictionHandler eviction_handler = nullptr) override;
 
     /**
      * @brief Loads data for multiple objects in a batch operation.
