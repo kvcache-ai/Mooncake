@@ -2,11 +2,13 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_set>
 
 #include "types.h"
@@ -57,6 +59,26 @@ TEST(HttpMetadataCleanupWorkerTest, CreateRejectsNonHttpRemoteBackend) {
         HttpMetadataCleanupWorker::Create(nullptr, "redis://metadata:6379");
     ASSERT_FALSE(worker.has_value());
     EXPECT_NE(worker.error().find("not an HTTP endpoint"), std::string::npos);
+}
+
+TEST(HttpMetadataCleanupWorkerTest, SerializesConcurrentStartAndStop) {
+    HttpMetadataCleanupWorker worker([](const std::string&) { return true; },
+                                     "mooncake/");
+    std::atomic<bool> start_failed{false};
+
+    for (int i = 0; i < 8; ++i) {
+        std::thread starter([&] {
+            if (!worker.Start()) {
+                start_failed = true;
+            }
+        });
+        std::thread stopper([&] { worker.Stop(); });
+        starter.join();
+        stopper.join();
+    }
+
+    worker.Stop();
+    EXPECT_FALSE(start_failed.load());
 }
 
 }  // namespace mooncake::testing

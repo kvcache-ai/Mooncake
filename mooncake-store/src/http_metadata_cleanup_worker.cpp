@@ -81,25 +81,30 @@ bool HttpMetadataCleanupWorker::Start() {
         return false;
     }
 
-    bool expected = false;
-    if (!running_.compare_exchange_strong(expected, true)) {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    if (running_) {
         return true;
     }
+    running_ = true;
     try {
         thread_ = std::thread(&HttpMetadataCleanupWorker::ThreadFunc, this);
     } catch (...) {
+        std::lock_guard<std::mutex> queue_lock(mutex_);
         running_ = false;
+        queue_.clear();
         throw;
     }
     return true;
 }
 
 void HttpMetadataCleanupWorker::Stop() {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!running_.exchange(false)) {
+        std::lock_guard<std::mutex> queue_lock(mutex_);
+        if (!running_) {
             return;
         }
+        running_ = false;
         queue_.clear();
     }
     cv_.notify_all();

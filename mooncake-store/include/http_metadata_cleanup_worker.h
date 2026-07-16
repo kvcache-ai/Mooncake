@@ -60,6 +60,8 @@ class HttpMetadataCleanupWorker {
     RemoveKeyFn remove_key_;
     std::string http_metadata_prefix_;
 
+    // Serializes Start/Stop and protects thread_ from concurrent access.
+    std::mutex lifecycle_mutex_;
     std::thread thread_;
     std::atomic<bool> running_{false};
     std::mutex mutex_;
