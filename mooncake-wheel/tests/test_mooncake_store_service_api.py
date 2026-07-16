@@ -808,31 +808,46 @@ class StoreServiceShutdownTest(unittest.IsolatedAsyncioTestCase):
         loop = asyncio.get_running_loop()
 
         class SchedulingStore(FakeStore):
+            def __init__(self):
+                super().__init__()
+                self.close_calls = 0
+
             def setup(self, *args):
                 ret = super().setup(*args)
                 loop.call_soon(shutdown_event.set)
                 return ret
 
+            def close(self):
+                self.close_calls += 1
+                return 0
+
+        store = SchedulingStore()
         with mock.patch(
             "mooncake.mooncake_store_service.MooncakeDistributedStore",
-            SchedulingStore,
+            return_value=store,
         ):
             result = await self.service.start_store_service(
                 max_wait_time=1, shutdown_event=shutdown_event
             )
 
         self.assertFalse(result)
+        self.assertEqual(store.close_calls, 1)
+        self.assertIsNone(self.service.store)
 
     async def test_stop_logs_nonzero_close_return(self):
-        self.service.store = mock.Mock()
-        self.service.store.close.return_value = 7
+        store = mock.Mock()
+        store.close.return_value = 7
+        self.service.store = store
 
         with self.assertLogs(level=logging.WARNING) as logs:
             await self.service.stop()
 
+        self.assertIsNone(self.service.store)
         self.assertTrue(
             any("close returned 7" in message for message in logs.output)
         )
+        await self.service.stop()
+        store.close.assert_called_once_with()
 
     async def test_signal_handler_requests_shutdown(self):
         loop = mock.Mock()
@@ -860,8 +875,14 @@ class StoreServiceShutdownTest(unittest.IsolatedAsyncioTestCase):
         service.start_http_service = mock.AsyncMock(return_value=True)
         service.stop = mock.AsyncMock()
 
+        startup_calls = []
+
         def request_shutdown(_loop, shutdown_event):
+            startup_calls.append("install")
             shutdown_event.set()
+
+        def unblock_shutdown_signals():
+            startup_calls.append("unblock")
 
         with (
             mock.patch(
@@ -873,7 +894,8 @@ class StoreServiceShutdownTest(unittest.IsolatedAsyncioTestCase):
                 return_value=service,
             ),
             mock.patch(
-                "mooncake.mooncake_store_service._unblock_shutdown_signals"
+                "mooncake.mooncake_store_service._unblock_shutdown_signals",
+                side_effect=unblock_shutdown_signals,
             ),
             mock.patch(
                 "mooncake.mooncake_store_service._install_shutdown_signal_handlers",
@@ -885,6 +907,7 @@ class StoreServiceShutdownTest(unittest.IsolatedAsyncioTestCase):
         service.start_store_service.assert_awaited_once()
         service.start_http_service.assert_not_awaited()
         service.stop.assert_awaited_once()
+        self.assertEqual(startup_calls, ["install", "unblock"])
 
 
 class ShmNameToPathTest(unittest.TestCase):

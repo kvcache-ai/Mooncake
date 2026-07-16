@@ -181,6 +181,7 @@ class MooncakeStoreService:
                         logging.info(
                             "Store startup cancelled by shutdown request"
                         )
+                        await self.stop()
                         return False
 
                 if ret != 0:
@@ -684,6 +685,7 @@ class MooncakeStoreService:
     async def stop(self):
         if self.store:
             ret = self.store.close()
+            self.store = None
             if ret != 0:
                 logging.warning("Mooncake service close returned %s", ret)
             else:
@@ -723,8 +725,8 @@ async def main():
     shutdown_event = asyncio.Event()
     loop = asyncio.get_running_loop()
 
-    _unblock_shutdown_signals()
     _install_shutdown_signal_handlers(loop, shutdown_event)
+    _unblock_shutdown_signals()
 
     try:
         if not await service.start_store_service(
