@@ -98,6 +98,8 @@ class TransferEngine {
 
     bool isUsingTent() const { return use_tent_; }
 
+    [[nodiscard]] bool supportsNvlinkFabricMemory() const;
+
     SegmentHandle openSegment(const std::string& segment_name);
 
     Status CheckSegmentStatus(SegmentID sid);

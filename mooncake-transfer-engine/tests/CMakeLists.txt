@@ -108,10 +108,52 @@ add_executable(dmabuf_export_test ${WORKSPACE}/dmabuf_export_test.cpp)
 target_link_libraries(dmabuf_export_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME dmabuf_export_test COMMAND dmabuf_export_test)
 
-if (USE_MNNVL)
-    add_executable(nvlink_transport_test ${WORKSPACE}/nvlink_transport_test.cpp)
+if(USE_MNNVL)
+  add_executable(nvlink_transport_test ${WORKSPACE}/nvlink_transport_test.cpp)
     target_link_libraries(nvlink_transport_test PUBLIC transfer_engine gtest gtest_main )
-    add_test(NAME nvlink_transport_test COMMAND nvlink_transport_test)
+  add_test(NAME nvlink_transport_test COMMAND nvlink_transport_test)
+
+  if(USE_CUDA AND NOT USE_HIP)
+    add_test(
+      NAME nvlink_transport_fake_driver_test
+      COMMAND
+        ${CMAKE_COMMAND} -E env --unset=MC_USE_NVLINK_IPC
+        GTEST_FILTER=NvlinkTransportUnitTest.*
+        $<TARGET_FILE:nvlink_transport_test>)
+    set_tests_properties(nvlink_transport_fake_driver_test
+                         PROPERTIES LABELS "nvlink_vmm_unit")
+    add_test(
+      NAME nvlink_transport_fabric_hbm_test
+      COMMAND
+        ${CMAKE_COMMAND} -E env --unset=MC_USE_NVLINK_IPC
+        GTEST_FILTER=NvlinkTransportTest.WriteAndRead
+        $<TARGET_FILE:nvlink_transport_test>)
+    add_test(
+      NAME nvlink_transport_ipc_cuda_malloc_test
+      COMMAND
+        ${CMAKE_COMMAND} -E env MC_USE_NVLINK_IPC=1
+        GTEST_FILTER=NvlinkTransportTest.WriteAndRead
+        $<TARGET_FILE:nvlink_transport_test>)
+    set_tests_properties(
+      nvlink_transport_fabric_hbm_test nvlink_transport_ipc_cuda_malloc_test
+      PROPERTIES LABELS "nvlink_hbm_regression;nvlink_vmm_hardware")
+
+    add_executable(nvlink_vmm_allocation_test
+                   ${WORKSPACE}/nvlink_vmm_allocation_test.cpp)
+    target_link_libraries(nvlink_vmm_allocation_test PUBLIC transfer_engine
+                                                            gtest gtest_main)
+    add_test(NAME nvlink_vmm_allocation_test COMMAND nvlink_vmm_allocation_test)
+    set_tests_properties(nvlink_vmm_allocation_test PROPERTIES LABELS
+                                                               "nvlink_vmm_unit")
+
+    add_executable(nvlink_vmm_fabric_test
+                   ${WORKSPACE}/nvlink_vmm_fabric_test.cpp)
+    target_link_libraries(nvlink_vmm_fabric_test PUBLIC transfer_engine gtest
+                                                        gtest_main)
+    add_test(NAME nvlink_vmm_fabric_test COMMAND nvlink_vmm_fabric_test)
+    set_tests_properties(nvlink_vmm_fabric_test
+                         PROPERTIES LABELS "nvlink_vmm_hardware")
+  endif()
 endif()
 
 if(USE_HIP)

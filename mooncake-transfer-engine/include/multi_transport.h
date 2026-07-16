@@ -32,7 +32,7 @@ class MultiTransport {
     using BatchDesc = Transport::BatchDesc;
 
     MultiTransport(std::shared_ptr<TransferMetadata> metadata,
-                   std::string &local_server_name);
+                   std::string& local_server_name);
 
     ~MultiTransport();
 
@@ -41,23 +41,23 @@ class MultiTransport {
     Status freeBatchID(BatchID batch_id);
 
     Status submitTransfer(BatchID batch_id,
-                          const std::vector<TransferRequest> &entries);
+                          const std::vector<TransferRequest>& entries);
 
 #ifdef ENABLE_MULTI_PROTOCOL
     Status mp_submitTransfer(BatchID batch_id,
-                             const std::vector<TransferRequest> &entries,
-                             std::string &proto);
+                             const std::vector<TransferRequest>& entries,
+                             std::string& proto);
 #endif
 
     Status getTransferStatus(BatchID batch_id, size_t task_id,
-                             TransferStatus &status);
+                             TransferStatus& status);
 
-    Status getBatchTransferStatus(BatchID batch_id, TransferStatus &status);
+    Status getBatchTransferStatus(BatchID batch_id, TransferStatus& status);
 
-    Transport *installTransport(const std::string &proto,
+    Transport* installTransport(const std::string& proto,
                                 std::shared_ptr<Topology> topo);
 
-    Transport *getTransport(const std::string &proto);
+    Transport* getTransport(const std::string& proto);
 
     /**
      * @brief Check if TCP is the only installed transport.
@@ -67,17 +67,20 @@ class MultiTransport {
      */
     bool isTcpOnly() const;
 
-    std::vector<Transport *> listTransports();
+    /** Return whether an installed NVLink transport supports Fabric memory. */
+    bool supportsNvlinkFabricMemory() const;
 
-    void *getBaseAddr();
+    std::vector<Transport*> listTransports();
+
+    void* getBaseAddr();
 
    private:
-    Status selectTransport(const TransferRequest &entry, Transport *&transport);
+    Status selectTransport(const TransferRequest& entry, Transport*& transport);
 
 #ifdef ENABLE_MULTI_PROTOCOL
-    Status mp_selectTransport(const TransferRequest &entry,
-                              Transport *&transport,
-                              std::string &preferred_proto);
+    Status mp_selectTransport(const TransferRequest& entry,
+                              Transport*& transport,
+                              std::string& preferred_proto);
 #endif
 
    private:
