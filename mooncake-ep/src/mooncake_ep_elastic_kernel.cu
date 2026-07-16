@@ -749,8 +749,10 @@ void launch_mooncake_elastic_dispatch_copy_epilogue(
 
 #define TRY_HYBRID_DISPATCH_EPILOGUE_SHAPE(H, E, K, M, S)                      \
         TRY_HYBRID_DISPATCH_EPILOGUE(H, E, K, M, S, 2, 4, 4);                  \
+        TRY_HYBRID_DISPATCH_EPILOGUE(H, E, K, M, S, 2, 4, 7);                  \
         TRY_HYBRID_DISPATCH_EPILOGUE(H, E, K, M, S, 2, 4, 8);                  \
         TRY_HYBRID_DISPATCH_EPILOGUE(H, E, K, M, S, 2, 8, 4);                  \
+        TRY_HYBRID_DISPATCH_EPILOGUE(H, E, K, M, S, 2, 8, 7);                  \
         TRY_HYBRID_DISPATCH_EPILOGUE(H, E, K, M, S, 2, 8, 8)
 
         TRY_HYBRID_DISPATCH_EPILOGUE_SHAPE(4096, 256, 8, 128, 24);
