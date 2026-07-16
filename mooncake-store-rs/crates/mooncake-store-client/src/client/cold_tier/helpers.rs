@@ -295,9 +295,9 @@ pub(in super::super) fn read_local_hot_replica_payload(
             )));
         }
     }
-    let payload = borrow_replica_payload_from_local_memory(state, replica).or_else(|_| {
+    let payload = copy_replica_payload_from_local_memory(state, replica).or_else(|_| {
         load_offload_source(backend, route)?
-            .map(PendingOffloadPayload::Owned)
+            .map(PendingOffloadPayload::new)
             .ok_or_else(|| {
                 StoreError::NotFound(format!(
                     "route {} has no source payload available for offload",
@@ -331,7 +331,7 @@ pub(in super::super) fn local_hot_replica_checksum(
             )));
         }
     }
-    let payload = borrow_replica_payload_from_local_memory(state, replica)?;
+    let payload = copy_replica_payload_from_local_memory(state, replica)?;
     if payload.len() != replica.length as usize {
         return Err(StoreError::InvalidState(format!(
             "route {} local payload length mismatch while checksumming: expected {} actual {}",
@@ -343,20 +343,20 @@ pub(in super::super) fn local_hot_replica_checksum(
     Ok(payload_checksum(payload.as_slice()))
 }
 
-fn borrow_replica_payload_from_local_memory(
+fn copy_replica_payload_from_local_memory(
     state: &Arc<Mutex<StoreState>>,
     replica: &ReplicaRoute,
 ) -> Result<PendingOffloadPayload> {
-    let addr = {
+    let payload = {
         let state = state.lock();
-        state
+        let addr = state
             .memory_ref()?
-            .storage_address(&replica.segment_name, replica.segment_offset as usize)?
+            .storage_address(&replica.segment_name, replica.segment_offset as usize)?;
+        // Keep pending offload materialization independent from hot-slot reuse.
+        // The route/allocator state may move on before the backend write runs.
+        unsafe { std::slice::from_raw_parts(addr.cast::<u8>(), replica.length as usize).to_vec() }
     };
-    Ok(PendingOffloadPayload::LocalHot {
-        addr: addr.cast::<u8>(),
-        len: replica.length as usize,
-    })
+    Ok(PendingOffloadPayload::new(payload))
 }
 
 fn load_offload_source(

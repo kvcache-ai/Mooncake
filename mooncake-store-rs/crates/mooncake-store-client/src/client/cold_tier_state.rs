@@ -525,41 +525,19 @@ struct PendingOffloadMaterialization {
     permit: ColdTierAdmissionPermit,
 }
 
-enum PendingOffloadPayload {
-    Owned(Vec<u8>),
-    /// Raw pointer into registered shared-memory segment.
-    ///
-    /// # Safety
-    ///
-    /// The pointer is valid for the lifetime of the `PendingOffloadMaterialization` because:
-    /// 1. The source segment is pinned in the memory registry while any route references it.
-    /// 2. The offload CAS atomically transitions the route away from the segment before the
-    ///    segment can be freed — if the CAS fails, the pointer is never dereferenced again.
-    /// 3. The `PendingOffloadMaterialization` is consumed (and the pointer discarded) within a
-    ///    single offload batch iteration; it never escapes to another thread or outlives the
-    ///    segment pin.
-    LocalHot { addr: *const u8, len: usize },
-}
-
-// SAFETY: The raw pointer in LocalHot points into a pinned shared-memory segment that
-// remains valid for the lifetime of the containing PendingOffloadMaterialization (see
-// safety invariants on the LocalHot variant). The offload worker is the sole consumer.
-unsafe impl Send for PendingOffloadPayload {}
+struct PendingOffloadPayload(Vec<u8>);
 
 impl PendingOffloadPayload {
+    fn new(payload: Vec<u8>) -> Self {
+        Self(payload)
+    }
+
     fn as_slice(&self) -> &[u8] {
-        match self {
-            Self::Owned(payload) => payload,
-            // SAFETY: See invariants documented on `LocalHot` variant.
-            Self::LocalHot { addr, len } => unsafe { slice::from_raw_parts(*addr, *len) },
-        }
+        &self.0
     }
 
     fn len(&self) -> usize {
-        match self {
-            Self::Owned(payload) => payload.len(),
-            Self::LocalHot { len, .. } => *len,
-        }
+        self.0.len()
     }
 }
 
