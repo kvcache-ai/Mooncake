@@ -177,7 +177,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
       nof_eviction_high_watermark_ratio_(
           config.nof_eviction_high_watermark_ratio),
       view_version_(config.view_version),
-      client_live_ttl_sec_(config.client_live_ttl_sec),
+      client_active_ttl_sec_(config.client_active_ttl_sec),
+      client_suspicion_ttl_sec_(config.client_suspicion_ttl_sec),
       nof_heartbeat_interval_sec_(
           std::chrono::seconds(config.nof_heartbeat_interval_sec)),
       nof_heartbeat_probe_timeout_ms_(
@@ -7038,7 +7039,7 @@ void MasterService::ClientMonitorFunc() {
         while (client_ping_queue_.pop(pod_client_id)) {
             UUID client_id = {pod_client_id.first, pod_client_id.second};
             client_ttl[client_id] =
-                now + std::chrono::seconds(client_live_ttl_sec_);
+                now + std::chrono::seconds(client_active_ttl_sec_);
         }
 
         // Find out expired clients

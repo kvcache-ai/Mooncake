@@ -1880,7 +1880,8 @@ class MasterService {
     static constexpr size_t kClientPingQueueSize =
         128 * 1024;  // Size of the client ping queue
     boost::lockfree::queue<PodUUID> client_ping_queue_{kClientPingQueueSize};
-    const int64_t client_live_ttl_sec_;
+    const int64_t client_active_ttl_sec_;
+    const int64_t client_suspicion_ttl_sec_;
     std::mutex client_lease_expired_callbacks_mutex_;
     std::vector<ClientLeaseExpiredCallback> client_lease_expired_callbacks_;
     const std::chrono::seconds nof_heartbeat_interval_sec_;

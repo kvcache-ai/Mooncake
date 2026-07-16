@@ -1589,7 +1589,8 @@ TEST_F(PromotionOnHitTest, ClientExpiryClearsPromotionTask) {
     // ClearInvalidHandles, not from the promotion-task reaper.
     config.put_start_release_timeout_sec = 300;
     // Short client TTL so expiration is fast.
-    config.client_live_ttl_sec = 1;
+    config.client_active_ttl_sec = 1;
+    config.client_suspicion_ttl_sec = 1;
     auto service = std::make_unique<MasterService>(config);
 
     constexpr size_t seg_size = 1024 * 1024 * 16;
