@@ -279,10 +279,30 @@ Transport::TransferStatus NVMeoFTransport::aggregateTransferStatus(
 
     if (slice_statuses.empty()) {
         result.s = INVALID;
-    } else if (!is_finished) {
+    } else if (!is_finished && failure_priority == 0) {
         result.s = has_pending ? PENDING : WAITING;
     }
     return result;
+}
+
+void NVMeoFTransport::collectSliceStatuses(
+    int desc_idx, size_t slice_id, size_t slice_num,
+    std::vector<TransferStatus> &slice_statuses) {
+    slice_statuses.clear();
+    slice_statuses.reserve(slice_num);
+    desc_pool_->updateBatchStatus(desc_idx);
+    for (size_t i = slice_id; i < slice_id + slice_num; ++i) {
+        auto event = desc_pool_->getCachedTransferStatus(desc_idx, i);
+        auto slice_status = from_cufile_transfer_status(event.status);
+        slice_statuses.push_back(TransferStatus{
+            .s = slice_status,
+            .transferred_bytes = slice_status == COMPLETED ? event.ret : 0});
+    }
+}
+
+bool NVMeoFTransport::isTerminalFailure(TransferStatusEnum status) {
+    return status == INVALID || status == CANCELED || status == TIMEOUT ||
+           status == FAILED;
 }
 
 Status NVMeoFTransport::submitTransfer(

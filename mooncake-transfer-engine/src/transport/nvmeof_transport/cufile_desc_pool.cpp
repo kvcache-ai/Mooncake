@@ -74,9 +74,7 @@ CUFileDescPool::~CUFileDescPool() {
     // First, collect and destroy batch_handles from allocated descriptors
     for (size_t i = 0; i < MAX_NR_DESC; ++i) {
         if (descs_[i] != nullptr) {
-            batch_api_->destroy(descs_[i]->batch_handle->handle);
-            delete descs_[i]->batch_handle;
-            delete descs_[i];
+            destroyDesc(descs_[i]);
             descs_[i] = nullptr;
         }
     }
@@ -88,6 +86,10 @@ CUFileDescPool::~CUFileDescPool() {
         delete batch_handle;
     }
     handle_pool_.clear();
+    for (auto* desc : quarantined_descs_) {
+        destroyDesc(desc);
+    }
+    quarantined_descs_.clear();
 }
 
 int CUFileDescPool::allocCUfileDesc(size_t batch_size) {
@@ -154,6 +156,7 @@ int CUFileDescPool::allocCUfileDesc(size_t batch_size) {
         desc->polled_events.resize(max_batch_size_);
         desc->cancel_requested.clear();
         desc->cancel_requested.reserve(max_batch_size_);
+        desc->reusable = true;
 
         descs_[idx] = desc;
         return idx;
@@ -348,6 +351,60 @@ CUFileBatchPollResult CUFileDescPool::pollBatch(int idx,
     return CUFileBatchPollResult::kSuccess;
 }
 
+bool CUFileDescPool::updateBatchStatus(int idx) {
+    RWSpinlock::WriteGuard guard(mutex_);
+    if (idx < 0 || idx >= (int)MAX_NR_DESC || descs_[idx] == nullptr) {
+        LOG(ERROR) << "Invalid descriptor index: " << idx;
+        return false;
+    }
+
+    return updateBatchStatus(descs_[idx], idx);
+}
+
+CUfileIOEvents_t CUFileDescPool::getCachedTransferStatus(int idx,
+                                                         int slice_id) {
+    RWSpinlock::ReadGuard guard(mutex_);
+    if (idx < 0 || idx >= (int)MAX_NR_DESC || descs_[idx] == nullptr) {
+        LOG(ERROR) << "Invalid descriptor index: " << idx;
+        return failedEvent();
+    }
+
+    auto* desc = descs_[idx];
+    if (slice_id < 0 || slice_id >= (int)desc->io_params.size()) {
+        LOG(ERROR) << "Invalid slice_id " << slice_id << " for descriptor "
+                   << idx << " (size: " << desc->io_params.size() << ")";
+        return failedEvent();
+    }
+
+    return desc->io_events[slice_id];
+}
+
+bool CUFileDescPool::updateBatchStatus(CUFileBatchDesc* desc, int idx) {
+    unsigned nr = desc->submitted_count;
+    if (desc->polled_events.size() < nr) {
+        LOG(ERROR) << "Completion buffer is too small for descriptor " << idx;
+        return false;
+    }
+
+    auto result = batch_api_->getStatus(desc->batch_handle->handle, 0, &nr,
+                                        desc->polled_events.data(), nullptr);
+    if (result.err != CU_FILE_SUCCESS) {
+        LOG(WARNING) << "cuFileBatchIOGetStatus failed for descriptor " << idx
+                     << ": " << cuFileGetErrorString(result);
+        return false;
+    }
+
+    for (unsigned i = 0; i < nr; ++i) {
+        if (!cachePolledEvent(desc->io_events, desc->polled_events[i])) {
+            LOG(ERROR) << "Invalid completion cookie "
+                       << reinterpret_cast<uintptr_t>(
+                              desc->polled_events[i].cookie)
+                       << " for descriptor " << idx;
+        }
+    }
+    return true;
+}
+
 bool CUFileDescPool::cachePolledEvent(std::vector<CUfileIOEvents_t>& io_events,
                                       const CUfileIOEvents_t& event) {
     const uintptr_t cookie = reinterpret_cast<uintptr_t>(event.cookie);
@@ -368,6 +425,67 @@ bool CUFileDescPool::allTerminal(const CUFileBatchDesc& desc) {
     return true;
 }
 
+CUfileIOEvents_t CUFileDescPool::failedEvent() {
+    CUfileIOEvents_t event = {};
+    event.status = CUFILE_FAILED;
+    event.ret = -1;
+    return event;
+}
+
+void CUFileDescPool::destroyDesc(CUFileBatchDesc* desc) {
+    batch_api_->destroy(desc->batch_handle->handle);
+    delete desc->batch_handle;
+    delete desc;
+}
+
+void CUFileDescPool::cleanupQuarantinedDescs() {
+    auto it = quarantined_descs_.begin();
+    while (it != quarantined_descs_.end()) {
+        auto* desc = *it;
+        updateBatchStatus(desc, -1);
+
+        bool all_terminal = true;
+        for (size_t i = 0; i < desc->submitted_count; ++i) {
+            if (!isTerminal(desc->io_events[i].status)) {
+                all_terminal = false;
+                break;
+            }
+        }
+
+        if (all_terminal) {
+            destroyDesc(desc);
+            it = quarantined_descs_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+bool CUFileDescPool::cancelBatch(int idx) {
+    RWSpinlock::WriteGuard guard(mutex_);
+    if (idx < 0 || idx >= (int)MAX_NR_DESC || descs_[idx] == nullptr) {
+        LOG(ERROR) << "Invalid descriptor index: " << idx;
+        return false;
+    }
+
+    CUfileError_t rc = batch_api_->cancel(descs_[idx]->batch_handle->handle);
+    if (rc.err != CU_FILE_SUCCESS) {
+        LOG(WARNING) << "cuFileBatchIOCancel failed for descriptor " << idx
+                     << ": " << cuFileGetErrorString(rc);
+        return false;
+    }
+    return true;
+}
+
+void CUFileDescPool::markUnreusable(int idx) {
+    RWSpinlock::WriteGuard guard(mutex_);
+    if (idx < 0 || idx >= (int)MAX_NR_DESC || descs_[idx] == nullptr) {
+        LOG(ERROR) << "Invalid descriptor index: " << idx;
+        return;
+    }
+    descs_[idx]->reusable = false;
+}
+
 int CUFileDescPool::getSliceNum(int idx) {
     RWSpinlock::ReadGuard guard(mutex_);
     if (idx < 0 || idx >= (int)MAX_NR_DESC || descs_[idx] == nullptr) {
@@ -379,37 +497,46 @@ int CUFileDescPool::getSliceNum(int idx) {
 }
 
 int CUFileDescPool::freeCUfileDesc(int idx) {
-    BatchHandle* retired_handle = nullptr;
-    {
-        RWSpinlock::WriteGuard guard(mutex_);
-        if (idx < 0 || idx >= (int)MAX_NR_DESC || descs_[idx] == nullptr) {
-            LOG(ERROR) << "Invalid descriptor index: " << idx;
-            return -1;
-        }
+    RWSpinlock::WriteGuard guard(mutex_);
+    if (idx < 0 || idx >= (int)MAX_NR_DESC || descs_[idx] == nullptr) {
+        LOG(ERROR) << "Invalid descriptor index: " << idx;
+        return -1;
+    }
 
-        auto* desc = descs_[idx];
-        if (!allTerminal(*desc)) {
-            LOG(ERROR) << "Descriptor " << idx
-                       << " cannot be freed while I/O is active";
-            return -1;
-        }
+    auto* desc = descs_[idx];
+    const bool all_terminal = allTerminal(*desc);
+    if (!all_terminal && desc->reusable) {
+        LOG(ERROR) << "Descriptor " << idx
+                   << " cannot be freed while I/O is active";
+        return -1;
+    }
 
-        if (desc->failure_seen) {
-            retired_handle = desc->batch_handle;
-        } else {
-            std::lock_guard<std::mutex> lock(handle_pool_lock_);
-            handle_pool_.push_back(desc->batch_handle);
-        }
-
-        // Delete the descriptor (each allocation gets a fresh one)
-        delete desc;
+    // Reusable descriptors are safe to recycle only after the caller observed
+    // all IOs complete. Non-reusable descriptors may still be referenced by
+    // cuFile after a bounded failure cleanup, so keep their handle and params
+    // quarantined until a later poll observes terminal status for every IO.
+    // Return healthy handles to the pool for reuse (avoid expensive
+    // cuFileBatchIODestroy). Failed handles are always retired.
+    if (!all_terminal && !desc->reusable) {
+        std::lock_guard<std::mutex> lock(handle_pool_lock_);
+        quarantined_descs_.push_back(desc);
         descs_[idx] = nullptr;
+        cleanupQuarantinedDescs();
+        return 0;
     }
 
-    if (retired_handle) {
-        batch_api_->destroy(retired_handle->handle);
-        delete retired_handle;
+    if (!desc->reusable || desc->failure_seen) {
+        batch_api_->destroy(desc->batch_handle->handle);
+    } else {
+        std::lock_guard<std::mutex> lock(handle_pool_lock_);
+        handle_pool_.push_back(desc->batch_handle);
     }
+    if (!desc->reusable || desc->failure_seen) {
+        delete desc->batch_handle;
+    }
+    delete desc;
+    descs_[idx] = nullptr;
+    cleanupQuarantinedDescs();
 
     return 0;
 }

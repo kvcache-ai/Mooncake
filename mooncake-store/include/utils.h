@@ -461,7 +461,8 @@ void* allocate_buffer_numa_segments(size_t total_size,
                                     const std::vector<int>& numa_nodes,
                                     size_t page_size = 0);
 
-void free_memory(const std::string& protocol, void* ptr);
+void free_memory(const std::string& protocol, void* ptr,
+                 bool use_spdk_dma = false);
 
 // Network utility functions
 

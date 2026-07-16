@@ -68,6 +68,7 @@ struct CUFileBatchDesc {
     size_t submitted_count = 0;
     bool failure_seen = false;
     bool cancel_attempted = false;
+    bool reusable = true;
 };
 
 struct CUFileBatchSnapshot {
@@ -112,6 +113,18 @@ class CUFileDescPool {
     // Poll once and return a descriptor-wide completion snapshot.
     CUFileBatchPollResult pollBatch(int idx, CUFileBatchSnapshot& snapshot);
 
+    // Poll cuFile once for the batch and update cached completion events.
+    bool updateBatchStatus(int idx);
+
+    // Get cached transfer status for a specific slice.
+    CUfileIOEvents_t getCachedTransferStatus(int idx, int slice_id);
+
+    // Best-effort cancellation for a submitted batch.
+    bool cancelBatch(int idx);
+
+    // Prevent an unsafe batch handle from being returned to the reusable pool.
+    void markUnreusable(int idx);
+
     // Get current number of slices in the descriptor
     int getSliceNum(int idx);
 
@@ -129,14 +142,21 @@ class CUFileDescPool {
                                  const CUfileIOEvents_t& event);
     static bool isTerminal(CUfileStatus_t status);
     static bool allTerminal(const CUFileBatchDesc& desc);
+    static CUfileIOEvents_t failedEvent();
+    bool updateBatchStatus(CUFileBatchDesc* desc, int idx);
+    void destroyDesc(CUFileBatchDesc* desc);
 
     static const size_t MAX_NR_DESC = 256;  // Max number of descriptors
+    void cleanupQuarantinedDescs();
+
     size_t max_batch_size_;
     std::shared_ptr<CUFileBatchAPI> batch_api_;
 
     // Object pool for BatchHandle to avoid frequent cuFileBatchIOSetUp/Destroy
     std::vector<BatchHandle*> handle_pool_;
     std::mutex handle_pool_lock_;
+
+    std::vector<CUFileBatchDesc*> quarantined_descs_;
 
     // Array of descriptors (nullptr = free slot)
     CUFileBatchDesc* descs_[MAX_NR_DESC];

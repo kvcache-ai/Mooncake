@@ -69,6 +69,11 @@ class NVMeoFTransport : public Transport {
     static TransferStatus aggregateTransferStatus(
         const std::vector<TransferStatus> &slice_statuses, bool &is_finished);
 
+    void collectSliceStatuses(int desc_idx, size_t slice_id, size_t slice_num,
+                              std::vector<TransferStatus> &slice_statuses);
+
+    static bool isTerminalFailure(TransferStatusEnum status);
+
     void startTransfer(Slice *slice);
 
    private:
