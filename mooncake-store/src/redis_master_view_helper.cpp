@@ -10,36 +10,40 @@ RedisMasterViewHelper::RedisMasterViewHelper(const std::string& cluster_id,
                                              int db_index, int ttl_sec,
                                              int heartbeat_interval_sec,
                                              const std::string& username)
-    : redis_helper_(cluster_id, redis_endpoint, password, db_index, ttl_sec,
-                    heartbeat_interval_sec, username),
+    : redis_election_helper_(cluster_id, redis_endpoint, password, db_index,
+                             ttl_sec, heartbeat_interval_sec, username),
       ttl_sec_(ttl_sec) {}
 
-ErrorCode RedisMasterViewHelper::Connect() { return redis_helper_.Connect(); }
+ErrorCode RedisMasterViewHelper::Connect() {
+    return redis_election_helper_.Connect();
+}
 
 void RedisMasterViewHelper::ElectLeader(const std::string& master_address,
                                         ViewVersionId& version,
                                         EtcdLeaseId& lease_id) {
     int redis_lease_id = 0;
-    redis_helper_.ElectLeader(master_address, version, redis_lease_id);
+    redis_election_helper_.ElectLeader(master_address, version, redis_lease_id);
     lease_id = static_cast<EtcdLeaseId>(redis_lease_id);
 }
 
 void RedisMasterViewHelper::KeepLeader(EtcdLeaseId lease_id) {
-    redis_helper_.KeepLeader(static_cast<int>(lease_id));
+    redis_election_helper_.KeepLeader(static_cast<int>(lease_id));
 }
 
 void RedisMasterViewHelper::CancelKeepAlive(EtcdLeaseId lease_id) {
     (void)lease_id;
-    redis_helper_.CancelKeepAlive();
+    redis_election_helper_.CancelKeepAlive();
 }
 
 int RedisMasterViewHelper::GetLeaderLeaseTTLSeconds() const { return ttl_sec_; }
 
-void RedisMasterViewHelper::CancelElection() { redis_helper_.CancelElection(); }
+void RedisMasterViewHelper::CancelElection() {
+    redis_election_helper_.CancelElection();
+}
 
 ErrorCode RedisMasterViewHelper::GetMasterView(std::string& master_address,
                                                ViewVersionId& version) {
-    return redis_helper_.GetMasterView(master_address, version);
+    return redis_election_helper_.GetMasterView(master_address, version);
 }
 
 }  // namespace mooncake

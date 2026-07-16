@@ -10,7 +10,7 @@
 #include "types.h"
 
 #ifdef STORE_USE_REDIS
-#include "redis_helper.h"
+#include "redis_election_helper.h"
 #include "redis_master_view_helper.h"
 #include "redis_test_utils.h"
 #include <hiredis/hiredis.h>
@@ -64,13 +64,13 @@ static void CleanupRedisKeys() {
 }
 
 // ============================================================
-// RedisHelperTest — direct RedisHelper API tests
+// RedisElectionHelperTest — direct RedisElectionHelper API tests
 // ============================================================
 
-class RedisHelperTest : public ::testing::Test {
+class RedisElectionHelperTest : public ::testing::Test {
    protected:
     static void SetUpTestSuite() {
-        google::InitGoogleLogging("RedisHelperTest");
+        google::InitGoogleLogging("RedisElectionHelperTest");
         google::SetVLOGLevel("*", 1);
         FLAGS_logtostderr = 1;
     }
@@ -81,25 +81,25 @@ class RedisHelperTest : public ::testing::Test {
     void TearDown() override { CleanupRedisKeys(); }
 };
 
-TEST_F(RedisHelperTest, Connect) {
-    RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
-                       FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
-                       FLAGS_redis_username);
+TEST_F(RedisElectionHelperTest, Connect) {
+    RedisElectionHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                               FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
+                               FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, helper.Connect());
 
     // Second connection (empty password = no auth) should also work
-    RedisHelper helper2(FLAGS_cluster_id, FLAGS_redis_endpoint,
-                        FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
-                        FLAGS_redis_username);
+    RedisElectionHelper helper2(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                                FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
+                                FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, helper2.Connect());
 }
 
 // === Test 2: ElectLeader + GetMasterView ===
 
-TEST_F(RedisHelperTest, ElectLeaderAndGetMasterView) {
-    RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
-                       FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
-                       FLAGS_redis_username);
+TEST_F(RedisElectionHelperTest, ElectLeaderAndGetMasterView) {
+    RedisElectionHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                               FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
+                               FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, helper.Connect());
 
     std::string master_address = "10.0.0.1:50051";
@@ -111,9 +111,9 @@ TEST_F(RedisHelperTest, ElectLeaderAndGetMasterView) {
     ASSERT_GT(lease_id, 0);
 
     // Read back via a separate helper
-    RedisHelper reader(FLAGS_cluster_id, FLAGS_redis_endpoint,
-                       FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
-                       FLAGS_redis_username);
+    RedisElectionHelper reader(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                               FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
+                               FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, reader.Connect());
 
     std::string got_address;
@@ -125,10 +125,10 @@ TEST_F(RedisHelperTest, ElectLeaderAndGetMasterView) {
 
 // === Test 3: KeepLeader keeps key alive past TTL ===
 
-TEST_F(RedisHelperTest, KeepLeaderRenewsTTL) {
-    RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
-                       FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
-                       FLAGS_redis_username);
+TEST_F(RedisElectionHelperTest, KeepLeaderRenewsTTL) {
+    RedisElectionHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                               FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
+                               FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, helper.Connect());
 
     std::string master_address = "10.0.0.2:50051";
@@ -154,11 +154,11 @@ TEST_F(RedisHelperTest, KeepLeaderRenewsTTL) {
 
 // === Test 4: Key expires after KeepLeader stops ===
 
-TEST_F(RedisHelperTest, KeyExpiresAfterKeepLeaderStops) {
+TEST_F(RedisElectionHelperTest, KeyExpiresAfterKeepLeaderStops) {
     const int short_ttl = 1;
-    RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
-                       FLAGS_redis_password, 0, short_ttl, 1,
-                       FLAGS_redis_username);
+    RedisElectionHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                               FLAGS_redis_password, 0, short_ttl, 1,
+                               FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, helper.Connect());
 
     std::string master_address = "10.0.0.3:50051";
@@ -177,13 +177,13 @@ TEST_F(RedisHelperTest, KeyExpiresAfterKeepLeaderStops) {
 
 // === Test 5: ElectLeader waits for key expiry, then wins ===
 
-TEST_F(RedisHelperTest, ElectLeaderWaitsForKeyExpiry) {
+TEST_F(RedisElectionHelperTest, ElectLeaderWaitsForKeyExpiry) {
     const int short_ttl = 1;
 
     // First helper: elect and let key expire (no KeepLeader)
-    RedisHelper first(FLAGS_cluster_id, FLAGS_redis_endpoint,
-                      FLAGS_redis_password, 0, short_ttl, 1,
-                      FLAGS_redis_username);
+    RedisElectionHelper first(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                              FLAGS_redis_password, 0, short_ttl, 1,
+                              FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, first.Connect());
     std::string first_addr = "10.0.0.4:50051";
     ViewVersionId first_version = 0;
@@ -191,9 +191,9 @@ TEST_F(RedisHelperTest, ElectLeaderWaitsForKeyExpiry) {
     first.ElectLeader(first_addr, first_version, first_lease);
 
     // Second helper: try to elect — should block until key expires
-    RedisHelper second(FLAGS_cluster_id, FLAGS_redis_endpoint,
-                       FLAGS_redis_password, 0, short_ttl, 1,
-                       FLAGS_redis_username);
+    RedisElectionHelper second(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                               FLAGS_redis_password, 0, short_ttl, 1,
+                               FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, second.Connect());
     ViewVersionId second_version = 0;
     int second_lease = 0;
@@ -222,11 +222,11 @@ TEST_F(RedisHelperTest, ElectLeaderWaitsForKeyExpiry) {
 
 // === Test 6: Epoch monotonicity ===
 
-TEST_F(RedisHelperTest, EpochMonotonicallyIncreases) {
+TEST_F(RedisElectionHelperTest, EpochMonotonicallyIncreases) {
     const int short_ttl = 1;
-    RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
-                       FLAGS_redis_password, 0, short_ttl, 1,
-                       FLAGS_redis_username);
+    RedisElectionHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                               FLAGS_redis_password, 0, short_ttl, 1,
+                               FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, helper.Connect());
 
     ViewVersionId prev_epoch = 0;
@@ -243,10 +243,10 @@ TEST_F(RedisHelperTest, EpochMonotonicallyIncreases) {
 
 // === Test 7: CancelKeepAlive stops KeepLeader promptly ===
 
-TEST_F(RedisHelperTest, CancelKeepAliveStopsPromptly) {
-    RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
-                       FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
-                       FLAGS_redis_username);
+TEST_F(RedisElectionHelperTest, CancelKeepAliveStopsPromptly) {
+    RedisElectionHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                               FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
+                               FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, helper.Connect());
 
     std::string master_address = "10.0.0.7:50051";
@@ -271,48 +271,49 @@ TEST_F(RedisHelperTest, CancelKeepAliveStopsPromptly) {
 }
 
 // === Test 8: CreateConnection with invalid port ===
-// Covers: redis_helper.cpp:69-74 (port parse exception, host-only endpoint)
+// Covers: redis_election_helper.cpp:69-74 (port parse exception, host-only
+// endpoint)
 
-TEST_F(RedisHelperTest, CreateConnectionInvalidPort) {
-    RedisHelper helper(FLAGS_cluster_id, "127.0.0.1:notaport", "", 0,
-                       FLAGS_redis_ttl_sec, 1);
+TEST_F(RedisElectionHelperTest, CreateConnectionInvalidPort) {
+    RedisElectionHelper helper(FLAGS_cluster_id, "127.0.0.1:notaport", "", 0,
+                               FLAGS_redis_ttl_sec, 1);
     // Connect should fail because port is not a number (stoi throws)
     EXPECT_NE(ErrorCode::OK, helper.Connect());
 }
 
-TEST_F(RedisHelperTest, CreateConnectionHostOnlyEndpoint) {
+TEST_F(RedisElectionHelperTest, CreateConnectionHostOnlyEndpoint) {
     // Endpoint without colon → host-only, port defaults to 6379
-    RedisHelper helper(FLAGS_cluster_id, "127.0.0.1", "", 0,
-                       FLAGS_redis_ttl_sec, 1);
+    RedisElectionHelper helper(FLAGS_cluster_id, "127.0.0.1", "", 0,
+                               FLAGS_redis_ttl_sec, 1);
     EXPECT_EQ(ErrorCode::OK, helper.Connect());
 }
 
-TEST_F(RedisHelperTest, CreateConnectionUnreachable) {
+TEST_F(RedisElectionHelperTest, CreateConnectionUnreachable) {
     // Use a port that nobody listens on — connect should fail
-    RedisHelper helper(FLAGS_cluster_id, "127.0.0.1:16379", "", 0,
-                       FLAGS_redis_ttl_sec, 1);
+    RedisElectionHelper helper(FLAGS_cluster_id, "127.0.0.1:16379", "", 0,
+                               FLAGS_redis_ttl_sec, 1);
     EXPECT_NE(ErrorCode::OK, helper.Connect());
 }
 
 // === Test 9: Connect called twice (replaces existing connections) ===
-// Covers: redis_helper.cpp:130-131, 145-146
+// Covers: redis_election_helper.cpp:130-131, 145-146
 
-TEST_F(RedisHelperTest, ConnectTwice) {
-    RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
-                       FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
-                       FLAGS_redis_username);
+TEST_F(RedisElectionHelperTest, ConnectTwice) {
+    RedisElectionHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                               FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
+                               FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, helper.Connect());
     // Second Connect should free old contexts and create new ones
     EXPECT_EQ(ErrorCode::OK, helper.Connect());
 }
 
 // === Test 10: GetMasterView without Connect ===
-// Covers: redis_helper.cpp:510
+// Covers: redis_election_helper.cpp:510
 
-TEST_F(RedisHelperTest, GetMasterViewWithoutConnect) {
-    RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
-                       FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
-                       FLAGS_redis_username);
+TEST_F(RedisElectionHelperTest, GetMasterViewWithoutConnect) {
+    RedisElectionHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                               FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
+                               FLAGS_redis_username);
     // Don't call Connect — election_ctx_ is null
     std::string addr;
     ViewVersionId ver = 0;
@@ -320,9 +321,9 @@ TEST_F(RedisHelperTest, GetMasterViewWithoutConnect) {
 }
 
 // === Test 11: ElectLeader with existing invalid (unparsable) value ===
-// Covers: redis_helper.cpp:232-233
+// Covers: redis_election_helper.cpp:232-233
 
-TEST_F(RedisHelperTest, ElectLeaderUnparsableExistingValue) {
+TEST_F(RedisElectionHelperTest, ElectLeaderUnparsableExistingValue) {
     const int short_ttl = 2;
     // Write garbage into the master_view key directly
     std::string master_view_key =
@@ -338,9 +339,9 @@ TEST_F(RedisHelperTest, ElectLeaderUnparsableExistingValue) {
 
     // ElectLeader should still work — it sees an unparsable leader value
     // and waits for it to expire, then wins election
-    RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
-                       FLAGS_redis_password, 0, short_ttl, 1,
-                       FLAGS_redis_username);
+    RedisElectionHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                               FLAGS_redis_password, 0, short_ttl, 1,
+                               FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, helper.Connect());
 
     ViewVersionId version = 0;
@@ -352,15 +353,15 @@ TEST_F(RedisHelperTest, ElectLeaderUnparsableExistingValue) {
 }
 
 // === Test 12: ElectLeader sees existing leader, waits, then wins ===
-// Covers: redis_helper.cpp:218 (TryElectOnce failed → loop back)
+// Covers: redis_election_helper.cpp:218 (TryElectOnce failed → loop back)
 
-TEST_F(RedisHelperTest, ElectLeaderContendedThenWin) {
+TEST_F(RedisElectionHelperTest, ElectLeaderContendedThenWin) {
     const int short_ttl = 1;
 
     // First helper: elect as leader
-    RedisHelper first(FLAGS_cluster_id, FLAGS_redis_endpoint,
-                      FLAGS_redis_password, 0, short_ttl, 1,
-                      FLAGS_redis_username);
+    RedisElectionHelper first(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                              FLAGS_redis_password, 0, short_ttl, 1,
+                              FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, first.Connect());
     ViewVersionId first_version = 0;
     int first_lease = 0;
@@ -368,9 +369,9 @@ TEST_F(RedisHelperTest, ElectLeaderContendedThenWin) {
 
     // Second helper: try to elect while key exists — will watch until expiry
     // Then TryElectOnce may race and lose once before winning
-    RedisHelper second(FLAGS_cluster_id, FLAGS_redis_endpoint,
-                       FLAGS_redis_password, 0, short_ttl, 1,
-                       FLAGS_redis_username);
+    RedisElectionHelper second(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                               FLAGS_redis_password, 0, short_ttl, 1,
+                               FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, second.Connect());
 
     ViewVersionId second_version = 0;
@@ -381,12 +382,12 @@ TEST_F(RedisHelperTest, ElectLeaderContendedThenWin) {
 }
 
 // === Test 13: GetMasterView with no leader key ===
-// Covers: redis_helper.cpp:532-536
+// Covers: redis_election_helper.cpp:532-536
 
-TEST_F(RedisHelperTest, GetMasterViewNoLeader) {
-    RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
-                       FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
-                       FLAGS_redis_username);
+TEST_F(RedisElectionHelperTest, GetMasterViewNoLeader) {
+    RedisElectionHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                               FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
+                               FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, helper.Connect());
 
     // No election has happened, so master_view key should not exist
@@ -396,12 +397,12 @@ TEST_F(RedisHelperTest, GetMasterViewNoLeader) {
 }
 
 // === Test 14: GetMasterView with corrupted value in Redis ===
-// Covers: redis_helper.cpp:532-536 (ParseLeaderValue failure path)
+// Covers: redis_election_helper.cpp:532-536 (ParseLeaderValue failure path)
 
-TEST_F(RedisHelperTest, GetMasterViewCorruptedValue) {
-    RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
-                       FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
-                       FLAGS_redis_username);
+TEST_F(RedisElectionHelperTest, GetMasterViewCorruptedValue) {
+    RedisElectionHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                               FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
+                               FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, helper.Connect());
 
     // Write corrupt value directly
@@ -423,35 +424,37 @@ TEST_F(RedisHelperTest, GetMasterViewCorruptedValue) {
 }
 
 // === Test 15: ParseLeaderValue unit tests (no Redis needed) ===
-// Covers: redis_helper.cpp:600-601, 606
+// Covers: redis_election_helper.cpp:600-601, 606
 
-TEST_F(RedisHelperTest, ParseLeaderValueInvalidJson) {
+TEST_F(RedisElectionHelperTest, ParseLeaderValueInvalidJson) {
     std::string addr;
     ViewVersionId epoch = 0;
-    EXPECT_FALSE(RedisHelper::ParseLeaderValue("not-json", addr, epoch));
+    EXPECT_FALSE(
+        RedisElectionHelper::ParseLeaderValue("not-json", addr, epoch));
 }
 
-TEST_F(RedisHelperTest, ParseLeaderValueMissingFields) {
+TEST_F(RedisElectionHelperTest, ParseLeaderValueMissingFields) {
     std::string addr;
     ViewVersionId epoch = 0;
     // Valid JSON but missing "address" field
-    EXPECT_FALSE(RedisHelper::ParseLeaderValue(R"({"epoch":1})", addr, epoch));
+    EXPECT_FALSE(
+        RedisElectionHelper::ParseLeaderValue(R"({"epoch":1})", addr, epoch));
     // Has address but missing "epoch"
-    EXPECT_FALSE(RedisHelper::ParseLeaderValue(
+    EXPECT_FALSE(RedisElectionHelper::ParseLeaderValue(
         R"({"address":"10.0.0.1:50051"})", addr, epoch));
     // Has both but epoch is not integer
-    EXPECT_FALSE(RedisHelper::ParseLeaderValue(
+    EXPECT_FALSE(RedisElectionHelper::ParseLeaderValue(
         R"({"address":"10.0.0.1:50051","epoch":"not_int"})", addr, epoch));
 }
 
 // === Test 16: KeepLeader loses leadership when key is overwritten ===
-// Covers: redis_helper.cpp:477-479, 484
+// Covers: redis_election_helper.cpp:477-479, 484
 
-TEST_F(RedisHelperTest, KeepLeaderLosesLeadership) {
+TEST_F(RedisElectionHelperTest, KeepLeaderLosesLeadership) {
     const int short_ttl = 2;
-    RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
-                       FLAGS_redis_password, 0, short_ttl, 1,
-                       FLAGS_redis_username);
+    RedisElectionHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                               FLAGS_redis_password, 0, short_ttl, 1,
+                               FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, helper.Connect());
 
     std::string master_address = "10.0.0.11:50051";
@@ -485,11 +488,11 @@ TEST_F(RedisHelperTest, KeepLeaderLosesLeadership) {
 }
 
 // === Test 17: WatchLeader polling fallback ===
-// Covers: redis_helper.cpp:379-413 (polling path when SUBSCRIBE fails)
+// Covers: redis_election_helper.cpp:379-413 (polling path when SUBSCRIBE fails)
 // We use CLIENT KILL to break subscribe_ctx_ so SUBSCRIBE command fails,
 // forcing WatchLeader to fall through to the pure polling path.
 
-TEST_F(RedisHelperTest, WatchLeaderPollingFallback) {
+TEST_F(RedisElectionHelperTest, WatchLeaderPollingFallback) {
     if (!FLAGS_redis_supports_client_kill) {
         GTEST_SKIP() << "Redis-compatible backend does not support CLIENT KILL";
     }
@@ -497,18 +500,18 @@ TEST_F(RedisHelperTest, WatchLeaderPollingFallback) {
     const int short_ttl = 3;
 
     // First helper: elect as leader (key lives for short_ttl seconds)
-    RedisHelper first(FLAGS_cluster_id, FLAGS_redis_endpoint,
-                      FLAGS_redis_password, 0, short_ttl, 1,
-                      FLAGS_redis_username);
+    RedisElectionHelper first(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                              FLAGS_redis_password, 0, short_ttl, 1,
+                              FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, first.Connect());
     ViewVersionId first_version = 0;
     int first_lease = 0;
     first.ElectLeader("10.0.0.12:50051", first_version, first_lease);
 
     // Second helper: Connect, then break its subscribe connection
-    RedisHelper second(FLAGS_cluster_id, FLAGS_redis_endpoint,
-                       FLAGS_redis_password, 0, short_ttl, 1,
-                       FLAGS_redis_username);
+    RedisElectionHelper second(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                               FLAGS_redis_password, 0, short_ttl, 1,
+                               FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, second.Connect());
 
     // Kill all normal client connections to break subscribe_ctx_
@@ -531,19 +534,19 @@ TEST_F(RedisHelperTest, WatchLeaderPollingFallback) {
 }
 
 // === Test 18: Reconnect after connection loss ===
-// Covers: redis_helper.cpp:552-566, 192-199, 171-179
+// Covers: redis_election_helper.cpp:552-566, 192-199, 171-179
 // We use CLIENT KILL to sever the election connection, then trigger an
 // operation that retries.
 
-TEST_F(RedisHelperTest, ReconnectAfterConnectionLoss) {
+TEST_F(RedisElectionHelperTest, ReconnectAfterConnectionLoss) {
     if (!FLAGS_redis_supports_client_kill) {
         GTEST_SKIP() << "Redis-compatible backend does not support CLIENT KILL";
     }
 
     const int short_ttl = 2;
-    RedisHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
-                       FLAGS_redis_password, 0, short_ttl, 1,
-                       FLAGS_redis_username);
+    RedisElectionHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                               FLAGS_redis_password, 0, short_ttl, 1,
+                               FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, helper.Connect());
 
     std::string master_address = "10.0.0.14:50051";
@@ -577,16 +580,16 @@ TEST_F(RedisHelperTest, ReconnectAfterConnectionLoss) {
 }
 
 // === Test 19: ElectLeader detects cancel via WatchLeader ===
-// Covers: redis_helper.cpp:171-179 (election_ctx_ null → retry)
+// Covers: redis_election_helper.cpp:171-179 (election_ctx_ null → retry)
 // ElectLeader can be cancelled while waiting in WatchLeader.
 
-TEST_F(RedisHelperTest, ElectLeaderCancelledViaWatchLeader) {
+TEST_F(RedisElectionHelperTest, ElectLeaderCancelledViaWatchLeader) {
     const int short_ttl = 2;
 
     // First helper: elect as leader and keep it alive
-    RedisHelper first(FLAGS_cluster_id, FLAGS_redis_endpoint,
-                      FLAGS_redis_password, 0, short_ttl, 1,
-                      FLAGS_redis_username);
+    RedisElectionHelper first(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                              FLAGS_redis_password, 0, short_ttl, 1,
+                              FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, first.Connect());
     ViewVersionId first_version = 0;
     int first_lease = 0;
@@ -595,9 +598,9 @@ TEST_F(RedisHelperTest, ElectLeaderCancelledViaWatchLeader) {
     std::thread first_keep([&]() { first.KeepLeader(first_lease); });
 
     // Second helper: will block in ElectLeader → WatchLeader
-    RedisHelper second(FLAGS_cluster_id, FLAGS_redis_endpoint,
-                       FLAGS_redis_password, 0, short_ttl, 1,
-                       FLAGS_redis_username);
+    RedisElectionHelper second(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                               FLAGS_redis_password, 0, short_ttl, 1,
+                               FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, second.Connect());
     ViewVersionId second_version = 0;
     int second_lease = 0;
@@ -619,15 +622,15 @@ TEST_F(RedisHelperTest, ElectLeaderCancelledViaWatchLeader) {
 }
 
 // === Test 20: Subscribe loop processes message ===
-// Covers: redis_helper.cpp:352-359 (message parsing in subscribe loop)
+// Covers: redis_election_helper.cpp:352-359 (message parsing in subscribe loop)
 
-TEST_F(RedisHelperTest, SubscribeReceivesVacantMessage) {
+TEST_F(RedisElectionHelperTest, SubscribeReceivesVacantMessage) {
     const int short_ttl = 2;
 
     // First helper: elect as leader with a short TTL
-    RedisHelper first(FLAGS_cluster_id, FLAGS_redis_endpoint,
-                      FLAGS_redis_password, 0, short_ttl, 1,
-                      FLAGS_redis_username);
+    RedisElectionHelper first(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                              FLAGS_redis_password, 0, short_ttl, 1,
+                              FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, first.Connect());
     ViewVersionId first_version = 0;
     int first_lease = 0;
@@ -637,9 +640,9 @@ TEST_F(RedisHelperTest, SubscribeReceivesVacantMessage) {
     std::thread first_keep([&]() { first.KeepLeader(first_lease); });
 
     // Second helper: elect — will block in WatchLeader subscribing
-    RedisHelper second(FLAGS_cluster_id, FLAGS_redis_endpoint,
-                       FLAGS_redis_password, 0, short_ttl, 1,
-                       FLAGS_redis_username);
+    RedisElectionHelper second(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                               FLAGS_redis_password, 0, short_ttl, 1,
+                               FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, second.Connect());
     ViewVersionId second_version = 0;
     int second_lease = 0;

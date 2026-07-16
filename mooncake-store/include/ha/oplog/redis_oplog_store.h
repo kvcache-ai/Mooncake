@@ -9,7 +9,7 @@
 #include <mutex>
 
 #include "ha/oplog/oplog_store.h"
-#include "redis_helper.h"
+#include "redis_util.h"
 
 namespace mooncake {
 
