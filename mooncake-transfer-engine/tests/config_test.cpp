@@ -261,6 +261,14 @@ TEST_F(ConnPauseTtlEnvTest, NonNumericKeepsDefault) {
     EXPECT_EQ(config.conn_pause_ttl_ms, 13);
 }
 
+TEST_F(ConnPauseTtlEnvTest, NumericSuffixKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_CONN_PAUSE_TTL_MS", "5000s", 1), 0);
+    GlobalConfig config;
+    config.conn_pause_ttl_ms = 15;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.conn_pause_ttl_ms, 15);
+}
+
 TEST_F(ConnPauseTtlEnvTest, EmptyStringKeepsDefault) {
     ASSERT_EQ(::setenv("MC_CONN_PAUSE_TTL_MS", "", 1), 0);
     GlobalConfig config;

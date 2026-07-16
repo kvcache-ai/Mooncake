@@ -14,6 +14,7 @@
 
 #include "config.h"
 
+#include <charconv>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -399,8 +400,10 @@ void loadGlobalConfig(GlobalConfig& config) {
         // rather than silently resolve to 0. 0 is a valid explicit "disable";
         // negative / out-of-range / garbage are rejected, preserving the
         // default.
-        try {
-            int val = std::stoi(conn_pause_ttl_env);
+        int val = 0;
+        const char* end = conn_pause_ttl_env + strlen(conn_pause_ttl_env);
+        auto [ptr, ec] = std::from_chars(conn_pause_ttl_env, end, val);
+        if (ec == std::errc() && ptr == end) {
             if (val >= 0 && val <= 600000) {
                 config.conn_pause_ttl_ms = val;
             } else {
@@ -409,9 +412,10 @@ void loadGlobalConfig(GlobalConfig& config) {
                              << conn_pause_ttl_env
                              << " out of range (should be 0-600000)";
             }
-        } catch (const std::exception& e) {
+        } else {
             LOG(WARNING) << "Invalid MC_CONN_PAUSE_TTL_MS environment value: "
-                         << conn_pause_ttl_env << ". Error: " << e.what();
+                         << conn_pause_ttl_env
+                         << ". Expected an integer in range 0-600000";
         }
     }
 
