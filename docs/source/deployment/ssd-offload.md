@@ -25,10 +25,7 @@ mkdir -p /nvme/mooncake_offload
 
 ```bash
 mooncake_master \
-    --rpc_port=50051 \
-    --enable_offload=true \
-    --offload_on_evict=true \
-    --promotion_on_hit=true
+    --rpc_port=50051
 ```
 
 ### Step 3A (Mode A): Start the application with embedded Real Client
