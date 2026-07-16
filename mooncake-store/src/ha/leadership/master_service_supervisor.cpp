@@ -1,4 +1,5 @@
 #include "ha/leadership/master_service_supervisor.h"
+#include "environ.h"
 
 #include <atomic>
 #include <chrono>
@@ -374,8 +375,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         coro_rpc::coro_rpc_server server(
             config.rpc_thread_num, config.rpc_port, config.rpc_address,
             config.rpc_conn_timeout, config.rpc_enable_tcp_no_delay);
-        const char* protocol = std::getenv("MC_RPC_PROTOCOL");
-        if (protocol && std::string_view(protocol) == "rdma") {
+        if (Environ::Get().GetRpcProtocol() == "rdma") {
             server.init_ibv();
         }
 

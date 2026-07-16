@@ -1,4 +1,5 @@
 #include "ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.h"
+#include "environ.h"
 
 #include <cstdlib>
 #include <exception>
@@ -330,10 +331,8 @@ ClusterNamespace RedisSnapshotCatalogStore::ResolveClusterNamespace(
         return cluster_namespace;
     }
 
-    const char* env_cluster_id = std::getenv("MC_STORE_CLUSTER_ID");
-    if (env_cluster_id != nullptr && *env_cluster_id != '\0') {
-        return env_cluster_id;
-    }
+    std::string cluster_id = Environ::Get().GetStoreClusterId();
+    if (!cluster_id.empty()) return cluster_id;
     return DEFAULT_CLUSTER_ID;
 }
 

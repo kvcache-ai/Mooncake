@@ -20,6 +20,8 @@
 #include <cctype>
 #include <sstream>
 
+#include "environ.h"
+
 namespace mooncake {
 namespace tent {
 Status Config::load(const std::string& content) {
@@ -51,8 +53,8 @@ std::string Config::dump(int indent) const {
 
 static inline void setConfig(Config& config, const std::string& env_key,
                              const std::string& config_key) {
-    const char* val = std::getenv(env_key.c_str());
-    if (val) config.setFromString(config_key, std::string(val));
+    std::string val = Environ::GetString(env_key.c_str(), "");
+    if (!val.empty()) config.setFromString(config_key, val);
 }
 
 // Like setConfig, but parses the env value as a comma-separated list and
@@ -60,8 +62,8 @@ static inline void setConfig(Config& config, const std::string& env_key,
 // trailing comma or spaces around names are tolerated (e.g. "mlx5_0, mlx5_1").
 static inline void setArrayConfig(Config& config, const std::string& env_key,
                                   const std::string& config_key) {
-    const char* val = std::getenv(env_key.c_str());
-    if (!val) return;
+    std::string val = Environ::GetString(env_key.c_str(), "");
+    if (val.empty()) return;
     std::vector<std::string> items;
     std::stringstream ss(val);
     std::string item;
@@ -74,10 +76,9 @@ static inline void setArrayConfig(Config& config, const std::string& env_key,
 }
 
 Status ConfigHelper::loadFromEnv(Config& config) {
-    const char* conf_str = std::getenv("MC_TENT_CONF");
+    std::string conf = Environ::Get().GetTentConf();
     Status status = Status::OK();
-    if (conf_str && *conf_str != '\0') {
-        std::string conf(conf_str);
+    if (!conf.empty()) {
         bool is_file = false;
         try {
             is_file = std::filesystem::exists(conf);

@@ -30,27 +30,6 @@ bool parseMetricsEnabled() {
             value == "on" || value == "enable");
 }
 
-bool parseBoolEnv(const char* env_name, bool default_value) {
-    const char* env_value = std::getenv(env_name);
-    if (!env_value) {
-        return default_value;
-    }
-
-    std::string value = toLower(env_value);
-    if (value == "1" || value == "true" || value == "yes" || value == "on" ||
-        value == "enable") {
-        return true;
-    }
-    if (value == "0" || value == "false" || value == "no" || value == "off" ||
-        value == "disable") {
-        return false;
-    }
-
-    LOG(WARNING) << "Failed to parse " << env_name << ": " << env_value
-                 << ", fallback to default=" << default_value;
-    return default_value;
-}
-
 uint64_t parseMetricsInterval() {
     int interval = Environ::Get().GetStoreClientMetricInterval();
     if (interval == 0) {
@@ -99,7 +78,7 @@ std::unique_ptr<ClientMetric> ClientMetric::Create(
 
     uint64_t interval = parseMetricsInterval();
     bool bandwidth_reporting_enabled =
-        parseBoolEnv("MC_STORE_CLIENT_METRIC_BANDWIDTH", true);
+        Environ::Get().GetStoreClientMetricBandwidth();
 
     LOG(INFO) << "Client metrics enabled (default enabled)";
     LOG(INFO) << "Client bandwidth summary "

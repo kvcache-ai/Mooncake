@@ -7,20 +7,21 @@
 #include <cstdlib>
 #include <thread>
 #include "spdk/spdk_wrapper.h"
+#include "environ.h"
 
 namespace mooncake {
 namespace {
 
 bool ParseEnvU64(const char *name, uint64_t *out) {
-    const char *val = std::getenv(name);
-    if (!val || *val == '\0') {
+    std::string val = Environ::GetString(name, "");
+    if (val.empty()) {
         return false;
     }
 
     errno = 0;
     char *end = nullptr;
-    unsigned long long parsed = std::strtoull(val, &end, 10);
-    if (errno != 0 || end == val || (end && *end != '\0')) {
+    unsigned long long parsed = std::strtoull(val.c_str(), &end, 10);
+    if (errno != 0 || end == val.c_str() || (end && *end != '\0')) {
         LOG(WARNING) << "Invalid value for " << name << ": " << val;
         return false;
     }

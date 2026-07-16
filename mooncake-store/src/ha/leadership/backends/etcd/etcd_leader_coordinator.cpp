@@ -1,4 +1,5 @@
 #include "ha/leadership/backends/etcd/etcd_leader_coordinator.h"
+#include "environ.h"
 
 #include <algorithm>
 #include <atomic>
@@ -529,13 +530,8 @@ ClusterNamespace EtcdLeaderCoordinator::ResolveClusterNamespace(
         return cluster_namespace;
     }
 
-    std::string resolved_namespace;
-    const char* env_cluster_id = std::getenv("MC_STORE_CLUSTER_ID");
-    if (env_cluster_id != nullptr && std::strlen(env_cluster_id) > 0) {
-        resolved_namespace = env_cluster_id;
-    } else {
-        resolved_namespace = DEFAULT_CLUSTER_ID;
-    }
+    std::string resolved_namespace = Environ::Get().GetStoreClusterId();
+    if (resolved_namespace.empty()) resolved_namespace = DEFAULT_CLUSTER_ID;
     return resolved_namespace;
 }
 

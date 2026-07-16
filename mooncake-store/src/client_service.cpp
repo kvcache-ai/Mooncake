@@ -33,6 +33,7 @@
 #include "transfer_task.h"
 #include "transport/transport.h"
 #include "config.h"
+#include "environ.h"
 #include "ha/leadership/leader_coordinator_factory.h"
 #include "types.h"
 #include "client_buffer.h"
@@ -47,15 +48,15 @@ namespace {
 
 #ifdef USE_NOF
 std::optional<int> GetConfiguredNumaSocketId() {
-    const char* raw_value = std::getenv("MC_STORE_NUMA_SOCKET_ID");
-    if (!raw_value || raw_value[0] == '\0') {
+    std::string raw_value = Environ::Get().GetStoreNumaSocketId();
+    if (raw_value.empty()) {
         return std::nullopt;
     }
 
     char* end_ptr = nullptr;
     errno = 0;
-    long parsed = std::strtol(raw_value, &end_ptr, 10);
-    if (errno != 0 || end_ptr == raw_value ||
+    long parsed = std::strtol(raw_value.c_str(), &end_ptr, 10);
+    if (errno != 0 || end_ptr == raw_value.c_str() ||
         (end_ptr != nullptr && *end_ptr != '\0') || parsed < 0 ||
         parsed > std::numeric_limits<int>::max()) {
         LOG(WARNING) << "Invalid MC_STORE_NUMA_SOCKET_ID=" << raw_value
@@ -401,8 +402,8 @@ ReplicateConfig Client::AttachHostId(const ReplicateConfig& config) const {
 }
 
 static std::optional<bool> get_auto_discover() {
-    const char* ev_ad = std::getenv("MC_MS_AUTO_DISC");
-    if (ev_ad) {
+    std::string ev_ad = Environ::Get().GetMsAutoDisc();
+    if (!ev_ad.empty()) {
         try {
             int iv = std::stoi(ev_ad);
             if (iv == 1) {
@@ -439,12 +440,13 @@ static inline void rtrim(std::string& s) {
 
 static std::vector<std::string> get_auto_discover_filters() {
     std::vector<std::string> whitelst_filters;
-    char* ev_ad = std::getenv("MC_MS_FILTERS");
-    if (ev_ad) {
+    std::string ev_ad = Environ::Get().GetMsFilters();
+    if (!ev_ad.empty()) {
         LOG(INFO) << "whitelist filters: " << ev_ad;
         char delimiter = ',';
-        char* end = ev_ad + std::strlen(ev_ad);
-        char *start = ev_ad, *pos = ev_ad;
+        const char* start = ev_ad.c_str();
+        const char* end = start + ev_ad.size();
+        const char* pos = start;
         while ((pos = std::find(start, end, delimiter)) != end) {
             std::string str(start, pos);
             ltrim(str);
@@ -452,7 +454,7 @@ static std::vector<std::string> get_auto_discover_filters() {
             whitelst_filters.emplace_back(std::move(str));
             start = pos + 1;
         }
-        if (start != (end + 1)) {
+        if (start != end) {
             std::string str(start, end);
             ltrim(str);
             rtrim(str);
@@ -696,8 +698,8 @@ ErrorCode Client::InitTransferEngine(
             auto filters = get_auto_discover_filters();
             transfer_engine_->setWhitelistFilters(std::move(filters));
         } else {
-            const char* env_filters = std::getenv("MC_MS_FILTERS");
-            if (env_filters && *env_filters != '\0') {
+            std::string env_filters = Environ::Get().GetMsFilters();
+            if (!env_filters.empty()) {
                 LOG(WARNING)
                     << "MC_MS_FILTERS is set but auto discovery is disabled; "
                     << "ignoring whitelist: " << env_filters;
@@ -3957,8 +3959,8 @@ tl::expected<Replica::Descriptor, ErrorCode> Client::GetPreferredReplica(
 }
 
 size_t Client::GetLocalHotCacheSizeFromEnv() {
-    if (const char* ev_size = std::getenv("MC_STORE_LOCAL_HOT_CACHE_SIZE")) {
-        std::string ev_size_str(ev_size);
+    std::string ev_size_str = Environ::Get().GetStoreLocalHotCacheSize();
+    if (!ev_size_str.empty()) {
         std::string error_msg = "Invalid MC_STORE_LOCAL_HOT_CACHE_SIZE='" +
                                 ev_size_str + "', disable local hot cache";
         // Check for negative values
@@ -3983,9 +3985,8 @@ size_t Client::GetLocalHotCacheSizeFromEnv() {
 }
 
 size_t Client::GetLocalHotBlockSizeFromEnv(size_t default_value) {
-    if (const char* ev_block_size =
-            std::getenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE")) {
-        std::string ev_block_size_str(ev_block_size);
+    std::string ev_block_size_str = Environ::Get().GetStoreLocalHotBlockSize();
+    if (!ev_block_size_str.empty()) {
         std::string error_msg = "Invalid MC_STORE_LOCAL_HOT_BLOCK_SIZE='" +
                                 ev_block_size_str +
                                 "', using default block size";
@@ -4035,9 +4036,7 @@ ErrorCode Client::InitLocalHotCache() {
     // MC_STORE_LOCAL_HOT_CACHE_USE_SHM: "1" enables memfd-backed shm (default
     // off). When enabled, hot cache is shareable with dummy clients via IPC.
     bool use_shm = false;
-    if (const char* ev = std::getenv("MC_STORE_LOCAL_HOT_CACHE_USE_SHM")) {
-        use_shm = (std::string(ev) == "1");
-    }
+    use_shm = Environ::Get().GetStoreLocalHotCacheUseShm() == "1";
 
     // Enable hot cache
     {
@@ -4083,9 +4082,9 @@ ErrorCode Client::InitLocalHotCache() {
 
         // MC_STORE_LOCAL_HOT_ADMISSION_THRESHOLD: minimum CMS count before a
         // key is admitted to hot cache (default 2).
-        if (const char* ev =
-                std::getenv("MC_STORE_LOCAL_HOT_ADMISSION_THRESHOLD")) {
-            std::string ev_str(ev);
+        std::string ev_str =
+            Environ::Get().GetStoreLocalHotAdmissionThreshold();
+        if (!ev_str.empty()) {
             std::string error_msg =
                 "Invalid MC_STORE_LOCAL_HOT_ADMISSION_THRESHOLD='" + ev_str +
                 "', using default";

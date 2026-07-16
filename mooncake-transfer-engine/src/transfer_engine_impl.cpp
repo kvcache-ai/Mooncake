@@ -27,6 +27,7 @@
 #include <sstream>
 #endif
 
+#include "environ.h"
 #include "transfer_metadata_plugin.h"
 #include "transport/transport.h"
 #ifdef USE_BAREX
@@ -80,6 +81,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
                              uint64_t rpc_port) {
     TransferMetadata::RpcMetaDesc desc;
     std::string rpc_binding_method;
+    const auto& env = Environ::Get();
 
     if (!setFilesLimit()) {
         LOG(WARNING) << "Failed to set file descriptor limit. Continuing "
@@ -88,13 +90,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     }
     // Set resources to the maximum value
 #ifdef USE_BAREX
-    const char* use_barex_env = std::getenv("USE_BAREX");
-    if (use_barex_env) {
-        int val = atoi(use_barex_env);
-        if (val != 0) {
-            use_barex_ = true;
-        }
-    }
+    use_barex_ = env.GetUseBarex();
 #endif
 
 #ifdef USE_ASCEND
@@ -117,8 +113,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     local_server_name_ = local_server_name;
 #endif
 
-    if (getenv("MC_LEGACY_RPC_PORT_BINDING") ||
-        metadata_conn_string == P2PHANDSHAKE) {
+    if (env.GetLegacyRpcPortBinding() || metadata_conn_string == P2PHANDSHAKE) {
         rpc_binding_method = "legacy/P2P";
         desc.ip_or_host_name = host_name;
         desc.rpc_port = port;
@@ -156,9 +151,9 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     } else {
         rpc_binding_method = "new RPC mapping";
         (void)(ip_or_host_name);
-        auto* ip_address = getenv("MC_TCP_BIND_ADDRESS");
-        if (ip_address)
-            desc.ip_or_host_name = ip_address;
+        std::string tcp_bind_address = env.GetTcpBindAddress();
+        if (!tcp_bind_address.empty())
+            desc.ip_or_host_name = tcp_bind_address;
         else {
             auto ip_list = findLocalIpAddresses();
             if (ip_list.empty()) {
@@ -206,7 +201,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     // transport installation logic and use TCP transport only. This allows
     // running metadata-only instances without requiring specialized hardware
     // (e.g., NPU for Ascend Direct, RDMA HCAs, etc.).
-    if (getenv("MC_FORCE_TCP")) {
+    if (env.GetForceTcp()) {
 #ifdef USE_TCP
         Transport* tcp_transport =
             multi_transports_->installTransport("tcp", nullptr);
@@ -244,7 +239,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 
 #if defined(USE_CXL) && !defined(USE_ASCEND) && \
     !defined(USE_ASCEND_HETEROGENEOUS)
-    if (std::getenv("MC_CXL_DEV_PATH") != nullptr) {
+    if (!env.GetCxlDevPath().empty()) {
         Transport* cxl_transport =
             multi_transports_->installTransport("cxl", local_topology_);
         if (!cxl_transport) {
@@ -256,8 +251,8 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 
     if (auto_discover_) {
         LOG(INFO) << "Auto-discovering topology...";
-        if (getenv("MC_CUSTOM_TOPO_JSON")) {
-            auto path = getenv("MC_CUSTOM_TOPO_JSON");
+        std::string path = env.GetCustomTopoJson();
+        if (!path.empty()) {
             LOG(INFO) << "Using custom topology from: " << path;
             auto topo_json = loadTopologyJsonFile(path);
             if (!topo_json.empty()) {
@@ -291,10 +286,10 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
         }
 #elif defined(USE_MACA)
 
-        if (getenv("MC_MACA_HOST_TRANSPORT")) {
+        if (env.GetMacaHostTransport()) {
             if ((local_topology_->getHcaList().size() > 0 &&
-                 !getenv("MC_FORCE_TCP")) ||
-                getenv("MC_FORCE_HCA")) {
+                 !env.GetForceTcp()) ||
+                env.GetForceHca()) {
                 Transport* t = multi_transports_->installTransport(
                     "rdma", local_topology_);
                 if (!t) {
@@ -328,8 +323,8 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 
 #elif defined(USE_MNNVL) || defined(USE_INTRA_NVLINK)
 
-        const char* force_mnnvl = getenv("MC_FORCE_MNNVL");
-        const char* intra_env = getenv("MC_INTRANODE_NVLINK");
+        bool force_mnnvl = env.GetForceMnnvl();
+        bool intra_env = env.GetIntranodeNvlink();
         // Explicit env var overrides take priority over HCA auto-detection
         if (intra_env) {
             Transport* t =
@@ -363,9 +358,8 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
         // Sunrise classic installs its transport explicitly from tebench after
         // benchmark-specific setup, so it skips the default auto transport
         // path.
-        if ((local_topology_->getHcaList().size() > 0 &&
-             !getenv("MC_FORCE_TCP")) ||
-            getenv("MC_FORCE_HCA")) {
+        if ((local_topology_->getHcaList().size() > 0 && !env.GetForceTcp()) ||
+            env.GetForceHca()) {
             // only install RDMA transport when there is at least one HCA
             Transport* rdma_transport = nullptr;
             if (use_barex_) {
@@ -901,34 +895,21 @@ static std::string toLower(const std::string& s) {
 }
 
 void TransferEngineImpl::InitializeMetricsConfig() {
+    const auto& env = Environ::Get();
     // Check if metrics reporting is enabled via environment variable
-    const char* metric_env = getenv("MC_TE_METRIC");
-    if (metric_env) {
+    std::string metric_env = env.GetTeMetric();
+    if (!metric_env.empty()) {
         std::string value = toLower(metric_env);
         metrics_enabled_ = (value == "1" || value == "true" || value == "yes" ||
                             value == "on");
     }
 
     // Check for custom reporting interval
-    const char* interval_env = getenv("MC_TE_METRIC_INTERVAL_SECONDS");
-    if (interval_env) {
-        try {
-            int interval = std::stoi(interval_env);
-            if (interval > 0) {
-                metrics_interval_seconds_ = static_cast<uint64_t>(interval);
-                LOG(INFO) << "Metrics reporting interval set to "
-                          << metrics_interval_seconds_ << " seconds";
-            } else {
-                LOG(WARNING)
-                    << "Invalid MC_TE_METRIC_INTERVAL_SECONDS value: "
-                    << interval_env << ", must be positive. Using default: "
-                    << metrics_interval_seconds_;
-            }
-        } catch (const std::exception& e) {
-            LOG(WARNING) << "Failed to parse MC_TE_METRIC_INTERVAL_SECONDS: "
-                         << interval_env
-                         << ", using default: " << metrics_interval_seconds_;
-        }
+    int interval = env.GetTeMetricIntervalSeconds();
+    if (interval > 0) {
+        metrics_interval_seconds_ = static_cast<uint64_t>(interval);
+        LOG(INFO) << "Metrics reporting interval set to "
+                  << metrics_interval_seconds_ << " seconds";
     }
 }
 

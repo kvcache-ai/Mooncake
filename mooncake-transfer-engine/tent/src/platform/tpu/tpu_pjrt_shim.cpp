@@ -19,6 +19,8 @@
 
 #include <cstdlib>
 
+#include "environ.h"
+
 namespace mooncake {
 namespace tent {
 
@@ -26,9 +28,8 @@ namespace {
 constexpr const char kDefaultAdapterLib[] = "libmooncake_tpu_pjrt.so";
 
 const char *adapterLibraryPath() {
-    const char *env = std::getenv("MC_TPU_PJRT_LIB");
-    if (env && env[0] != '\0') return env;
-    return kDefaultAdapterLib;
+    static const std::string lib = Environ::Get().GetTpuPjrtLib();
+    return lib.empty() ? kDefaultAdapterLib : lib.c_str();
 }
 }  // namespace
 

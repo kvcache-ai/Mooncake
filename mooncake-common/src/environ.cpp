@@ -72,7 +72,16 @@ bool Environ::GetBool(const char* name, bool default_value) {
         std::string s(val);
         std::transform(s.begin(), s.end(), s.begin(),
                        [](unsigned char c) { return std::tolower(c); });
-        return s == "1" || s == "true" || s == "on" || s == "yes";
+        if (s == "1" || s == "true" || s == "on" || s == "yes" ||
+            s == "enable" || s == "enabled")
+            return true;
+        if (s.empty() || s == "0" || s == "false" || s == "off" || s == "no" ||
+            s == "disable" || s == "disabled")
+            return false;
+        std::cerr << "[Mooncake] Warning: invalid value '" << val
+                  << "' for env " << name << ", using default " << default_value
+                  << std::endl;
+        return default_value;
     }
     return default_value;
 }
@@ -85,6 +94,8 @@ std::string Environ::GetString(const char* name,
     }
     return default_value;
 }
+
+bool Environ::IsSet(const char* name) { return std::getenv(name) != nullptr; }
 
 Environ::Environ() {
     num_cq_per_ctx_ = GetInt("MC_NUM_CQ_PER_CTX", 1);
@@ -144,14 +155,15 @@ Environ::Environ() {
     ms_filters_ = GetString("MC_MS_FILTERS", "");
     rpc_protocol_ = GetString("MC_RPC_PROTOCOL", "");
     slice_timeout_ = GetInt("MC_SLICE_TIMEOUT", 0);
-    store_client_metric_ = GetString("MC_STORE_CLIENT_METRIC", "");
-    store_client_metric_interval_ =
-        GetInt("MC_STORE_CLIENT_METRIC_INTERVAL", 0);
     store_cluster_id_ = GetString("MC_STORE_CLUSTER_ID", "");
     store_hugepage_size_ = GetString("MC_STORE_HUGEPAGE_SIZE", "");
     store_memcpy_ = GetString("MC_STORE_MEMCPY", "");
     store_use_hugepage_ = GetString("MC_STORE_USE_HUGEPAGE", "");
     tcp_bind_address_ = GetString("MC_TCP_BIND_ADDRESS", "");
+    tcp_proto_ = GetString("MC_TCP_PROTO", "");
+    tcp_status_timeout_sec_ = GetString("MC_TCP_STATUS_TIMEOUT_SEC", "");
+    tcp_enable_connection_pool_ =
+        GetString("MC_TCP_ENABLE_CONNECTION_POOL", "");
     te_metric_ = GetString("MC_TE_METRIC", "");
     te_metric_interval_seconds_ = GetInt("MC_TE_METRIC_INTERVAL_SECONDS", 0);
     tent_conf_ = GetString("MC_TENT_CONF", "");

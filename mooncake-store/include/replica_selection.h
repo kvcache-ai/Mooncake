@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "replica.h"
+#include "environ.h"
 
 namespace mooncake {
 
@@ -83,8 +84,7 @@ inline double BuiltinRemoteReplicaScore(const Replica::Descriptor &r) {
 // live so tests / late injection take effect.
 inline bool RemoteReplicaScoringEnabled() {
     static const bool env_enabled = [] {
-        const char *env = std::getenv("MC_STORE_REPLICA_SCORING");
-        return env && std::string(env) == "1";
+        return Environ::Get().GetStoreReplicaScoring() == "1";
     }();
     if (env_enabled) return true;
     std::shared_lock lk(detail::ScorerMutex());

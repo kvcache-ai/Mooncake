@@ -16,6 +16,7 @@
 
 #include <bits/stdint-uintn.h>
 #include "cuda_alike.h"
+#include "environ.h"
 #include <glog/logging.h>
 
 #include <algorithm>
@@ -147,10 +148,8 @@ struct CallerSync {
 
 static MacaCallerSyncMode callerSyncMode() {
     static const MacaCallerSyncMode mode = [] {
-        const char *env = std::getenv("MC_MACA_CALLER_SYNC");
-        if (!env) return MacaCallerSyncMode::Host;
-
-        std::string value(env);
+        std::string value = Environ::Get().GetMacaCallerSync();
+        if (value.empty()) return MacaCallerSyncMode::Host;
         if (value == "host") return MacaCallerSyncMode::Host;
         if (value == "wait") return MacaCallerSyncMode::Wait;
         LOG(WARNING) << "MacaTransport: unknown MC_MACA_CALLER_SYNC=" << value
@@ -172,10 +171,8 @@ static const char *callerSyncModeName(MacaCallerSyncMode mode) {
 
 static MacaCopyApi copyApi() {
     static const MacaCopyApi api = [] {
-        const char *env = std::getenv("MC_MACA_COPY_API");
-        if (!env) return MacaCopyApi::Auto;
-
-        std::string value(env);
+        std::string value = Environ::Get().GetMacaCopyApi();
+        if (value.empty()) return MacaCopyApi::Auto;
         if (value == "auto") return MacaCopyApi::Auto;
         if (value == "default") return MacaCopyApi::Default;
         if (value == "batchflag") return MacaCopyApi::BatchFlag;
@@ -201,12 +198,12 @@ static const char *copyApiName(MacaCopyApi api) {
 static size_t batchFlagMinBytes() {
     static const size_t min_bytes = [] {
         constexpr size_t kDefaultMinBytes = 1024ULL * 1024ULL;
-        const char *env = std::getenv("MC_MACA_BATCHFLAG_MIN_BYTES");
-        if (!env) return kDefaultMinBytes;
+        std::string env = Environ::Get().GetMacaBatchflagMinBytes();
+        if (env.empty()) return kDefaultMinBytes;
 
         char *end = nullptr;
-        unsigned long long value = std::strtoull(env, &end, 0);
-        if (end == env || *end != '\0') {
+        unsigned long long value = std::strtoull(env.c_str(), &end, 0);
+        if (end == env.c_str() || *end != '\0') {
             LOG(WARNING) << "MacaTransport: unknown "
                             "MC_MACA_BATCHFLAG_MIN_BYTES="
                          << env << ", falling back to " << kDefaultMinBytes;

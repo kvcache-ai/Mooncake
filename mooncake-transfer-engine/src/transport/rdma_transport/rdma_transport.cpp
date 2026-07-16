@@ -31,6 +31,7 @@
 #include "common.h"
 #include "config.h"
 #include "environ.h"
+#include "environ.h"
 #include "memory_location.h"
 #include "topology.h"
 #include "transport/rdma_transport/rdma_context.h"
@@ -117,11 +118,10 @@ int RdmaTransport::install(std::string &local_server_name,
     // In dual-NIC environments (e.g. separate TCP and RDMA interfaces),
     // MC_RDMA_BIND_ADDRESS allows NIC paths to use an RDMA-reachable IP
     // while local_server_name_ keeps the TCP-reachable address for P2P.
-    const char *rdma_bind_addr = std::getenv("MC_RDMA_BIND_ADDRESS");
-    if (rdma_bind_addr && rdma_bind_addr[0] != '\0') {
+    std::string rdma_bind_addr = Environ::Get().GetRdmaBindAddress();
+    if (!rdma_bind_addr.empty()) {
         auto [host_name, port] = parseHostNameWithPort(local_server_name);
-        rdma_server_name_ =
-            std::string(rdma_bind_addr) + ":" + std::to_string(port);
+        rdma_server_name_ = rdma_bind_addr + ":" + std::to_string(port);
         LOG(INFO) << "RdmaTransport: using RDMA bind address "
                   << rdma_server_name_
                   << " (TCP address: " << local_server_name_ << ")";

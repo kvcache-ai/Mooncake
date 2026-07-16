@@ -37,13 +37,14 @@
 #include "transport/transport.h"
 
 #include "cuda_alike.h"
+#include "environ.h"
 
 namespace mooncake {
 using tcpsocket = asio::ip::tcp::socket;
 static size_t getChunkSize() {
     static const size_t val = [] {
-        const char* env = std::getenv("MC_TCP_SLICE_SIZE");
-        if (env) {
+        std::string env = Environ::Get().GetTcpSliceSize();
+        if (!env.empty()) {
             try {
                 size_t v = std::stoull(env);
                 if (v > 0) return v;
@@ -147,8 +148,7 @@ static inline bool statusFrameValid(uint64_t frame) {
 static bool forceLegacyTcpProto() {
     // Read per call (startTransfer already does metadata lookups; getenv is
     // noise) so tests can cover both protocol modes in one process.
-    const char* env = std::getenv("MC_TCP_PROTO");
-    return env && env[0] == '1' && env[1] == '\0';
+    return Environ::Get().GetTcpProto() == "1";
 }
 
 // Server-side session: handles transfer requests on a persistent connection.
@@ -419,9 +419,9 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     // default is generous so no healthy slow path can trip it, since it only
     // covers the frame itself, never payload streaming.
     static int statusFrameTimeoutSec() {
-        const char* env = std::getenv("MC_TCP_STATUS_TIMEOUT_SEC");
-        if (env) {
-            int v = std::atoi(env);
+        std::string env = Environ::Get().GetTcpStatusTimeoutSec();
+        if (!env.empty()) {
+            int v = std::atoi(env.c_str());
             if (v > 0) return v;
         }
         return 30;
@@ -841,8 +841,8 @@ struct TcpContext {
 };
 
 TcpTransport::TcpTransport() : context_(nullptr), running_(false) {
-    if (getenv("MC_TCP_ENABLE_CONNECTION_POOL") != nullptr) {
-        std::string val(getenv("MC_TCP_ENABLE_CONNECTION_POOL"));
+    std::string val = Environ::Get().GetTcpEnableConnectionPool();
+    if (!val.empty()) {
         std::transform(val.begin(), val.end(), val.begin(),
                        [](unsigned char c) -> char { return std::tolower(c); });
         if (val == "0" || val == "false" || val == "no") {

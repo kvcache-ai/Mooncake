@@ -1,4 +1,5 @@
 #include "storage_backend.h"
+#include "environ.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -127,8 +128,8 @@ bool OffsetAllocatorBackendConfig::Validate() const {
 }
 
 static std::optional<double> GetEnvDouble(const char* name) {
-    const char* env = std::getenv(name);
-    if (!env || env[0] == '\0') return std::nullopt;
+    std::string env = Environ::GetString(name, "");
+    if (env.empty()) return std::nullopt;
     try {
         return std::stod(env);
     } catch (...) {
@@ -139,9 +140,8 @@ static std::optional<double> GetEnvDouble(const char* name) {
 OffsetAllocatorBackendConfig OffsetAllocatorBackendConfig::FromEnvironment() {
     OffsetAllocatorBackendConfig cfg;
 
-    const char* pol = std::getenv("MOONCAKE_OFFSET_EVICTION_POLICY");
-    if (pol) {
-        std::string s(pol);
+    std::string s = Environ::GetString("MOONCAKE_OFFSET_EVICTION_POLICY", "");
+    if (!s.empty()) {
         if (s == "fifo" || s == "FIFO" || s == "Fifo") {
             cfg.eviction_policy = OffsetEvictionPolicy::FIFO;
         }

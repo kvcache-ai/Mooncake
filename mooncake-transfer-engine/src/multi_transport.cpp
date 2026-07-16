@@ -19,6 +19,7 @@
 #include <string>
 
 #include "config.h"
+#include "environ.h"
 #include "multi_transport_locality.h"
 #include "transport/rdma_transport/rdma_transport.h"
 #ifdef USE_BAREX
@@ -470,8 +471,8 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
             // hip is intra-node GPU-IPC only. On a cross-node request a
             // hip+rdma segment must fall through to rdma; allow deployments
             // that know they need the cross-node path to de-prioritize hip.
-            if (p == "hip") return std::getenv("MC_DISABLE_HIP") ? 0 : 4;
-            if (p == "maca") return std::getenv("MC_DISABLE_MACA") ? 0 : 4;
+            if (p == "hip") return Environ::Get().GetDisableHip() ? 0 : 4;
+            if (p == "maca") return Environ::Get().GetDisableMaca() ? 0 : 4;
             if (p == "cxl") return 3;
             if (p == "rdma") return 2;
             if (p == "tcp") return 1;

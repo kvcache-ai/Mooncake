@@ -32,6 +32,20 @@ class EnvironTest : public ::testing::Test {
         unsetenv("MC_TEST_SIZET");
         unsetenv("MC_TEST_BOOL");
         unsetenv("MC_TEST_STRING");
+        unsetenv("MC_CXL_DEV_PATH");
+        unsetenv("MC_PKEY_INDEX");
+        unsetenv("MC_IB_SL");
+        unsetenv("MC_MS_FILTERS");
+        unsetenv("MC_RPC_TIMEOUT_MS");
+        unsetenv("MC_STORE_CLIENT_METRIC");
+        unsetenv("MC_STORE_CLIENT_METRIC_INTERVAL");
+        unsetenv("MC_STORE_CLIENT_METRIC_BANDWIDTH");
+        unsetenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
+        unsetenv("MC_TE_FILTERS");
+        unsetenv("MC_TCP_PROTO");
+        unsetenv("MC_TPU_PJRT_LIB");
+        unsetenv("MC_USE_UBSHMEM_IPC");
+        unsetenv("MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP");
         // Make sure AWS vars don't leak in from the test runner's env.
         unsetenv("MOONCAKE_AWS_REGION");
         unsetenv("MOONCAKE_AWS_S3_ENDPOINT");
@@ -254,6 +268,70 @@ TEST_F(EnvironTest, GetStringEmpty) {
 TEST_F(EnvironTest, GetStringWithSpaces) {
     setenv("MC_TEST_STRING", "hello world", 1);
     EXPECT_EQ(Environ::GetString("MC_TEST_STRING", ""), "hello world");
+}
+
+TEST_F(EnvironTest, DynamicGettersObserveRuntimeUpdates) {
+    const auto& env = Environ::Get();
+
+    setenv("MC_CXL_DEV_PATH", "/dev/dax0.0", 1);
+    setenv("MC_PKEY_INDEX", "7", 1);
+    setenv("MC_IB_SL", "3", 1);
+    setenv("MC_MS_FILTERS", "mlx5_0,mlx5_1", 1);
+    setenv("MC_RPC_TIMEOUT_MS", "250", 1);
+    setenv("MC_STORE_CLIENT_METRIC", "0", 1);
+    setenv("MC_STORE_CLIENT_METRIC_INTERVAL", "15", 1);
+    setenv("MC_STORE_CLIENT_METRIC_BANDWIDTH", "0", 1);
+    setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", "1048576", 1);
+    setenv("MC_TE_FILTERS", "mlx5_2", 1);
+    setenv("MC_TCP_PROTO", "1", 1);
+    setenv("MC_TPU_PJRT_LIB", "/tmp/libtpu_mock.so", 1);
+    setenv("MC_USE_UBSHMEM_IPC", "1", 1);
+    setenv("MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP", "", 1);
+
+    EXPECT_EQ(env.GetCxlDevPath(), "/dev/dax0.0");
+    EXPECT_EQ(env.GetPkeyIndex(), 7);
+    EXPECT_EQ(env.GetIbServiceLevel(), 3);
+    EXPECT_EQ(env.GetMsFilters(), "mlx5_0,mlx5_1");
+    EXPECT_EQ(env.GetRpcTimeoutMs(), "250");
+    EXPECT_EQ(env.GetStoreClientMetric(), "0");
+    EXPECT_EQ(env.GetStoreClientMetricInterval(), 15);
+    EXPECT_FALSE(env.GetStoreClientMetricBandwidth());
+    EXPECT_EQ(env.GetStoreLocalHotCacheSize(), "1048576");
+    EXPECT_EQ(env.GetTeFilters(), "mlx5_2");
+    EXPECT_EQ(env.GetTcpProto(), "1");
+    EXPECT_EQ(env.GetTpuPjrtLib(), "/tmp/libtpu_mock.so");
+    EXPECT_TRUE(env.GetUseUbshmemIpc());
+    EXPECT_TRUE(env.GetMasterServiceSnapshotTestSkipCleanup());
+
+    unsetenv("MC_CXL_DEV_PATH");
+    unsetenv("MC_PKEY_INDEX");
+    unsetenv("MC_IB_SL");
+    unsetenv("MC_MS_FILTERS");
+    unsetenv("MC_RPC_TIMEOUT_MS");
+    unsetenv("MC_STORE_CLIENT_METRIC");
+    unsetenv("MC_STORE_CLIENT_METRIC_INTERVAL");
+    unsetenv("MC_STORE_CLIENT_METRIC_BANDWIDTH");
+    unsetenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
+    unsetenv("MC_TE_FILTERS");
+    unsetenv("MC_TCP_PROTO");
+    unsetenv("MC_TPU_PJRT_LIB");
+    unsetenv("MC_USE_UBSHMEM_IPC");
+    unsetenv("MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP");
+
+    EXPECT_TRUE(env.GetCxlDevPath().empty());
+    EXPECT_EQ(env.GetPkeyIndex(), -1);
+    EXPECT_EQ(env.GetIbServiceLevel(), -1);
+    EXPECT_TRUE(env.GetMsFilters().empty());
+    EXPECT_TRUE(env.GetRpcTimeoutMs().empty());
+    EXPECT_TRUE(env.GetStoreClientMetric().empty());
+    EXPECT_EQ(env.GetStoreClientMetricInterval(), 0);
+    EXPECT_TRUE(env.GetStoreClientMetricBandwidth());
+    EXPECT_TRUE(env.GetStoreLocalHotCacheSize().empty());
+    EXPECT_TRUE(env.GetTeFilters().empty());
+    EXPECT_TRUE(env.GetTcpProto().empty());
+    EXPECT_EQ(env.GetTpuPjrtLib(), "libmooncake_tpu_pjrt.so");
+    EXPECT_FALSE(env.GetUseUbshmemIpc());
+    EXPECT_FALSE(env.GetMasterServiceSnapshotTestSkipCleanup());
 }
 
 int main(int argc, char** argv) {

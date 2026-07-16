@@ -22,6 +22,7 @@
 #include <boost/algorithm/string.hpp>
 
 #include "http_metadata_server.h"
+#include "environ.h"
 #include "master_metric_manager.h"
 #include "common.h"
 #include "segment.h"
@@ -225,9 +226,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
       offload_cap_ratio_(config.offload_cap_ratio),
       task_manager_(config.task_manager_config) {
     // Initialize HTTP metadata key prefix (read env var once at startup)
-    const char* custom_prefix = std::getenv("MC_METADATA_CLUSTER_ID");
-    if (custom_prefix && std::strlen(custom_prefix) > 0) {
-        http_metadata_prefix_ = "mooncake/" + std::string(custom_prefix);
+    std::string custom_prefix = Environ::Get().GetMetadataClusterId();
+    if (!custom_prefix.empty()) {
+        http_metadata_prefix_ = "mooncake/" + custom_prefix;
         if (http_metadata_prefix_.back() != '/') {
             http_metadata_prefix_ += '/';
         }
@@ -6016,7 +6017,7 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
     // Cleanup expired metadata (unless test environment disables it)
     {
         const bool skip_cleanup =
-            std::getenv("MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP");
+            Environ::Get().GetMasterServiceSnapshotTestSkipCleanup();
         if (!skip_cleanup) {
             auto cleanup_now = now;
             for (auto& shard : metadata_shards_) {

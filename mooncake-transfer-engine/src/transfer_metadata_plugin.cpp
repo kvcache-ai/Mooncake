@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "transfer_metadata_plugin.h"
+#include "environ.h"
 
 #include <arpa/inet.h>
 #include <bits/stdint-uintn.h>
@@ -552,32 +553,20 @@ std::shared_ptr<MetadataStoragePlugin> MetadataStoragePlugin::Create(
 
 #ifdef USE_REDIS
     if (parsed_conn_string.first == "redis") {
-        const char *username = std::getenv("MC_REDIS_USERNAME");
-        std::string username_str = username ? username : "";
-
-        const char *password = std::getenv("MC_REDIS_PASSWORD");
-        std::string password_str = password ? password : "";
+        const auto &env = Environ::Get();
+        std::string username = env.GetRedisUsername();
+        std::string password = env.GetRedisPassword();
 
         uint8_t db_index = 0;
-        const char *db_index_str = std::getenv("MC_REDIS_DB_INDEX");
-        if (db_index_str) {
-            try {
-                int index = std::stoi(db_index_str);
-                if (index >= 0 && index <= 255) {
-                    db_index = static_cast<uint8_t>(index);
-                } else {
-                    LOG(WARNING) << "Invalid Redis DB index: " << index
-                                 << ", using default 0";
-                }
-            } catch (const std::exception &e) {
-                LOG(WARNING)
-                    << "Failed to parse MC_REDIS_DB_INDEX: " << e.what()
-                    << ", using default 0";
-            }
-        }
+        int index = env.GetRedisDbIndex();
+        if (index >= 0 && index <= 255)
+            db_index = static_cast<uint8_t>(index);
+        else
+            LOG(WARNING) << "Invalid Redis DB index: " << index
+                         << ", using default 0";
 
         return std::make_shared<RedisStoragePlugin>(
-            parsed_conn_string.second, username_str, password_str, db_index);
+            parsed_conn_string.second, username, password, db_index);
     }
 #endif  // USE_REDIS
 

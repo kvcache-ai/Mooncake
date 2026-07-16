@@ -308,40 +308,22 @@ static void setupP2PAccess(int num_devices) {
 }
 
 static int getNumStreams() {
-    const char* env = getenv("MC_HIP_NUM_STREAMS");
-    if (env) {
-        try {
-            int value = std::stoi(env);
-            if (value > 0) {
-                return value;
-            }
-            LOG(WARNING) << "MC_HIP_NUM_STREAMS value " << value
-                         << " must be positive, using default "
-                         << kDefaultNumStreams;
-        } catch (...) {
-            LOG(WARNING) << "Invalid MC_HIP_NUM_STREAMS value, using default "
-                         << kDefaultNumStreams;
-        }
-    }
+    int value = Environ::Get().GetHipNumStreams();
+    if (value > 0) return value;
+    if (value < 0)
+        LOG(WARNING) << "MC_HIP_NUM_STREAMS value " << value
+                     << " must be positive, using default "
+                     << kDefaultNumStreams;
     return kDefaultNumStreams;
 }
 
 static int getNumEvents() {
-    const char* env = getenv("MC_HIP_NUM_EVENTS");
-    if (env) {
-        try {
-            int value = std::stoi(env);
-            if (value > 0) {
-                return value;
-            }
-            LOG(WARNING) << "MC_HIP_NUM_EVENTS value " << value
-                         << " must be positive, using default "
-                         << kDefaultNumEvents;
-        } catch (...) {
-            LOG(WARNING) << "Invalid MC_HIP_NUM_EVENTS value, using default "
-                         << kDefaultNumEvents;
-        }
-    }
+    int value = Environ::Get().GetHipNumEvents();
+    if (value > 0) return value;
+    if (value < 0)
+        LOG(WARNING) << "MC_HIP_NUM_EVENTS value " << value
+                     << " must be positive, using default "
+                     << kDefaultNumEvents;
     return kDefaultNumEvents;
 }
 

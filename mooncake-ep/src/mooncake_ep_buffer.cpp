@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <sstream>
 #include <transfer_engine.h>
+#include "environ.h"
 
 namespace mooncake {
 
@@ -54,15 +55,16 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
     // Optional runtime override for the RoCE active-QP cap (default 8).
     // Set MOONCAKE_EP_ACTIVE_QPS_PER_RANK to a value >= the per-rank QP count
     // (e.g. 256) to effectively disable the cap.
-    if (const char* env = std::getenv("MOONCAKE_EP_ACTIVE_QPS_PER_RANK")) {
+    std::string active_qps_env = Environ::Get().GetEpActiveQpsPerRank();
+    if (!active_qps_env.empty()) {
         char* end = nullptr;
-        long v = std::strtol(env, &end, 10);
-        if (end != env && *end == '\0' && v > 0) {
+        long v = std::strtol(active_qps_env.c_str(), &end, 10);
+        if (end != active_qps_env.c_str() && *end == '\0' && v > 0) {
             active_qps_cap_ = static_cast<int>(v);
         } else {
             LOG(WARNING) << "[EP] ignoring invalid "
                             "MOONCAKE_EP_ACTIVE_QPS_PER_RANK='"
-                         << env << "'";
+                         << active_qps_env << "'";
         }
     }
     LOG(INFO) << "[EP] RoCE active QPs/rank cap = " << active_qps_cap_;
@@ -104,9 +106,9 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
         // Read optional NIC whitelist from env var (same convention as PG
         // tests).
         std::vector<std::string> device_filter;
-        if (const char* env = std::getenv("MOONCAKE_EP_DEVICE_FILTER")) {
-            std::string s(env);
-            std::istringstream ss(s);
+        std::string device_filter_env = Environ::Get().GetEpDeviceFilter();
+        if (!device_filter_env.empty()) {
+            std::istringstream ss(device_filter_env);
             std::string tok;
             while (std::getline(ss, tok, ',')) {
                 if (!tok.empty()) device_filter.push_back(tok);

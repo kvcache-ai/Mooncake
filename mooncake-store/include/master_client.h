@@ -13,6 +13,7 @@
 #include <ylt/coro_io/ibverbs/ib_socket.hpp>
 
 #include "client_metric.h"
+#include "environ.h"
 #include "replica.h"
 #include "segment.h"
 #include "types.h"
@@ -65,8 +66,8 @@ class MasterClient {
         // would otherwise continue probing failed addresses indefinitely. See
         // PR #1642.
         pool_conf.host_alive_detect_duration = std::chrono::seconds(0);
-        const char* value = std::getenv("MC_RPC_PROTOCOL");
-        if (value && std::string_view(value) == "rdma") {
+        const auto& env = Environ::Get();
+        if (env.GetRpcProtocol() == "rdma") {
             detail::MaybeEnableRdmaSocketConfig(
                 pool_conf.client_config.socket_config);
         }
@@ -76,14 +77,16 @@ class MasterClient {
         // timeout is given, so setting it here covers every RPC method
         // uniformly. Default stays at coro_rpc's built-in 30s if unset;
         // a negative value disables the timeout (no timer is armed).
-        if (const char* timeout_ms = std::getenv("MC_RPC_TIMEOUT_MS")) {
+        std::string timeout_ms = env.GetRpcTimeoutMs();
+        if (!timeout_ms.empty()) {
             pool_conf.client_config.request_timeout_duration =
-                std::chrono::milliseconds(std::atoll(timeout_ms));
+                std::chrono::milliseconds(std::atoll(timeout_ms.c_str()));
         }
         // Optional override for the TCP/RDMA connect timeout (default 30s).
-        if (const char* connect_ms = std::getenv("MC_RPC_CONNECT_TIMEOUT_MS")) {
+        std::string connect_ms = env.GetRpcConnectTimeoutMs();
+        if (!connect_ms.empty()) {
             pool_conf.client_config.connect_timeout_duration =
-                std::chrono::milliseconds(std::atoll(connect_ms));
+                std::chrono::milliseconds(std::atoll(connect_ms.c_str()));
         }
         client_pools_ =
             std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(

@@ -1,4 +1,5 @@
 #include "ssd_register_client.h"
+#include "environ.h"
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
@@ -25,8 +26,7 @@ int NoFRegisterClient::set_register(const std::string &nqn, size_t nsid,
         return OPERATION_FAILED;
     }
 
-    const char *trtype_env = std::getenv("MC_NOF_TRTYPE");
-    std::string trtype = trtype_env ? trtype_env : "RDMA";
+    std::string trtype = Environ::Get().GetNofTrtype();
     std::transform(
         trtype.begin(), trtype.end(), trtype.begin(),
         [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
@@ -70,8 +70,7 @@ int NoFRegisterClient::set_unregister_by_endpoint(
         return OPERATION_FAILED;
     }
 
-    const char *trtype_env = std::getenv("MC_NOF_TRTYPE");
-    std::string trtype = trtype_env ? trtype_env : "RDMA";
+    std::string trtype = Environ::Get().GetNofTrtype();
     std::transform(
         trtype.begin(), trtype.end(), trtype.begin(),
         [](unsigned char c) { return static_cast<char>(std::toupper(c)); });

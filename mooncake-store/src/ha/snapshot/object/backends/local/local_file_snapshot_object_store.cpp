@@ -8,6 +8,8 @@
 #include <fmt/format.h>
 #include <glog/logging.h>
 
+#include "environ.h"
+
 namespace mooncake {
 
 namespace {
@@ -17,8 +19,8 @@ constexpr const char* kEnvLocalPath = "MOONCAKE_SNAPSHOT_LOCAL_PATH";
 }  // namespace
 
 LocalFileSnapshotObjectStore::LocalFileSnapshotObjectStore() {
-    const char* env_path = std::getenv(kEnvLocalPath);
-    if (!env_path || !*env_path) {
+    std::string env_path = Environ::GetString(kEnvLocalPath, "");
+    if (env_path.empty()) {
         throw std::runtime_error(
             "MOONCAKE_SNAPSHOT_LOCAL_PATH environment variable is not set. "
             "Please set it to a persistent directory path for snapshot "

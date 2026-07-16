@@ -28,6 +28,7 @@
 #include "common.h"
 #include "common/serialization.h"
 #include "config.h"
+#include "environ.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
 
@@ -159,8 +160,7 @@ static int setDeviceContext(void *source_ptr) {
 }
 
 static bool supportFabricMem() {
-    const char *use_ipc = getenv("MC_USE_UBSHMEM_IPC");
-    if (use_ipc != nullptr && strcmp(use_ipc, "1") == 0) {
+    if (Environ::Get().GetUseUbshmemIpc()) {
         return false;
     }
     uint32_t num_devices = 0;
@@ -181,9 +181,10 @@ UBShmemTransport::UBShmemTransport()
       num_streams_per_transfer_(kDefaultNumStreams),
       thread_pool_size_(kDefaultThreadPool),
       stream_pool_timeout_ms_(kGetStreamTimeoutMillis) {
-    const char *num_streams_per_transfer_env =
-        getenv("MC_UBSHMEM_STREAMS_PER_TRANSFER");
-    if (num_streams_per_transfer_env != nullptr) {
+    const auto &env = Environ::Get();
+    std::string num_streams_per_transfer_env =
+        env.GetUbshmemStreamsPerTransfer();
+    if (!num_streams_per_transfer_env.empty()) {
         std::optional<int32_t> env_value =
             parseFromString<int32_t>(num_streams_per_transfer_env);
         if (env_value.has_value() && env_value.value() > 0) {
@@ -191,9 +192,9 @@ UBShmemTransport::UBShmemTransport()
         }
     }
 
-    const char *max_streams_env = getenv("MC_UBSHMEM_MAX_STREAMS");
+    std::string max_streams_env = env.GetUbshmemMaxStreams();
     int max_streams = kDefaultNumStreams * kDefaultThreadPool;
-    if (max_streams_env != nullptr) {
+    if (!max_streams_env.empty()) {
         std::optional<int32_t> env_value =
             parseFromString<int32_t>(max_streams_env);
         if (env_value.has_value() && env_value.value() > 0) {
@@ -201,8 +202,8 @@ UBShmemTransport::UBShmemTransport()
         }
     }
 
-    const char *thread_pool_size_env = getenv("MC_UBSHMEM_THREAD_POOL_SIZE");
-    if (thread_pool_size_env != nullptr) {
+    std::string thread_pool_size_env = env.GetUbshmemThreadPoolSize();
+    if (!thread_pool_size_env.empty()) {
         std::optional<int32_t> env_value =
             parseFromString<int32_t>(thread_pool_size_env);
         if (env_value.has_value() && env_value.value() > 0 &&
@@ -220,8 +221,8 @@ UBShmemTransport::UBShmemTransport()
         }
     }
 
-    const char *stream_timeout_env = getenv("MC_UBSHMEM_GET_STREAM_TIMEOUT");
-    if (stream_timeout_env != nullptr) {
+    std::string stream_timeout_env = env.GetUbshmemGetStreamTimeout();
+    if (!stream_timeout_env.empty()) {
         std::optional<int32_t> env_value =
             parseFromString<int32_t>(stream_timeout_env);
         if (env_value.has_value() && env_value.value() > 0) {
