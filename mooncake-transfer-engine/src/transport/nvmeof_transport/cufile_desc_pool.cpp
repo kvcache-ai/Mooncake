@@ -215,8 +215,9 @@ bool CUFileDescPool::updateBatchStatus(CUFileBatchDesc* desc, int idx) {
         return false;
     }
 
-    CUfileError_t rc = cuFileBatchIOGetStatus(
-        desc->batch_handle->handle, 0, &nr, desc->polled_events.data(), nullptr);
+    CUfileError_t rc =
+        cuFileBatchIOGetStatus(desc->batch_handle->handle, 0, &nr,
+                               desc->polled_events.data(), nullptr);
     if (rc.err != CU_FILE_SUCCESS) {
         LOG(WARNING) << "cuFileBatchIOGetStatus failed for descriptor " << idx
                      << ": " << cuFileGetErrorString(rc);
