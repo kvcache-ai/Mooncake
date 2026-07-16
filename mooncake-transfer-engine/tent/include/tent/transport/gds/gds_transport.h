@@ -36,8 +36,11 @@ namespace tent {
 class GdsFileContext;
 
 struct IOParamRange {
-    size_t base;
-    size_t count;
+    size_t base = 0;
+    size_t count = 0;
+    size_t complete_count = 0;
+    size_t transferred_bytes = 0;
+    TransferStatusEnum status = TransferStatusEnum::PENDING;
 };
 
 // Wrapper for reusable CUfileBatchHandle_t

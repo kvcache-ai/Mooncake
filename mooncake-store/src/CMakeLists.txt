@@ -258,6 +258,7 @@ if(USE_NOF)
       crypto
       aio
       z
+      isal
       elf
       ibverbs
       rdmacm
