@@ -509,7 +509,8 @@ class RealClient : public PyClient {
         128 * 1024;  // Size of the client ping queue
     boost::lockfree::queue<PodUUID> dummy_client_ping_queue_{
         kDummyClientPingQueueSize};
-    const int64_t dummy_client_live_ttl_sec_ = DEFAULT_DUMMY_CLIENT_LIVE_TTL_SEC;
+    const int64_t dummy_client_live_ttl_sec_ =
+        DEFAULT_DUMMY_CLIENT_LIVE_TTL_SEC;
 
     // IPC Server members for receiving FD from Dummy Clients
     std::string ipc_socket_path_;

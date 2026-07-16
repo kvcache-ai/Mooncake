@@ -723,7 +723,8 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal(
         }
     }
 
-    // Build the (potentially expensive) allocator BEFORE taking the global lock.
+    // Build the (potentially expensive) allocator BEFORE taking the global
+    // lock.
     std::shared_ptr<ClientBufferAllocator> new_allocator;
     if (is_local_buffer) {
         new_allocator =

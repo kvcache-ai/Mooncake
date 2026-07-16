@@ -99,8 +99,8 @@ TEST(RealClientRemountTest, PingStatusIsPerClient) {
 
 // ping() must take dummy_client_mutex_ in SHARED mode, so a concurrent reader
 // (another ping, or a put/get doing find_shm_context) never blocks a heartbeat.
-// If ping mistakenly took the lock exclusively, this call would block behind the
-// reader below and the test would time out.
+// If ping mistakenly took the lock exclusively, this call would block behind
+// the reader below and the test would time out.
 TEST(RealClientRemountTest, PingNotBlockedByConcurrentReader) {
     RealClient rc;
     UUID id{7, 8};

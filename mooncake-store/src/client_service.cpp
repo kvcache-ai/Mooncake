@@ -559,8 +559,8 @@ tl::expected<void, ErrorCode> ClientService::RegisterLocalMemory(
     }
     if (this->transfer_engine_->registerLocalMemory(
             addr, length, location, remote_accessible, update_metadata) != 0) {
-        LOG(ERROR) << "transfer_engine registerLocalMemory failed, addr=" << addr
-                   << ", length=" << length << ", location=" << location
+        LOG(ERROR) << "transfer_engine registerLocalMemory failed, addr="
+                   << addr << ", length=" << length << ", location=" << location
                    << ", remote_accessible=" << remote_accessible;
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }

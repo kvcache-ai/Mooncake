@@ -478,8 +478,8 @@ int DummyClient::unregister_buffer(void* buffer) {
         return -1;
     }
     // Clear the registered flag BEFORE the RPC so a concurrent ping never sees
-    // registered > real-side count and re-registers the segment we are dropping;
-    // restore it if the RPC fails.
+    // registered > real-side count and re-registers the segment we are
+    // dropping; restore it if the RPC fails.
     shm_helper_->set_registered(shm, false);
     auto ret = invoke_rpc<&RealClient::unregister_shm_buffer_internal, void>(
         reinterpret_cast<uint64_t>(buffer), client_id_);
@@ -738,7 +738,8 @@ tl::expected<QueryTaskResponse, ErrorCode> DummyClient::query_task(
 //   (mapped_shm_count < expected).
 // - Re-sends ALL segments (not just the missing ones): the dummy can't tell
 //   which the RealClient still holds.
-// - Idempotent: map_shm_internal skips segments whose dummy_base_addr is already
+// - Idempotent: map_shm_internal skips segments whose dummy_base_addr is
+// already
 //   mapped (closes fd, returns ok), so kept segments are no-ops.
 // - Returns true only if every segment succeeded; stops at the first failure.
 bool DummyClient::reregister_all_shms() {
@@ -773,7 +774,7 @@ void DummyClient::ping_thread_main() {
                 resp.status == DummyClientStatus::DISCONNECTION ||
                 resp.mapped_shm_count < registered;
 
-            if (!needs_reregister) { // Client is healthy
+            if (!needs_reregister) {  // Client is healthy
                 ping_fail_count = 0;
                 std::this_thread::sleep_for(
                     std::chrono::milliseconds(success_ping_interval_ms));
@@ -793,7 +794,7 @@ void DummyClient::ping_thread_main() {
                 continue;
             }
             LOG(WARNING) << "client_id=" << client_id_
-            << ", reregister_all_shms failed, escalating";
+                         << ", reregister_all_shms failed, escalating";
         }
 
         // Ping failed or Re-registration failed
@@ -811,9 +812,9 @@ void DummyClient::ping_thread_main() {
                     LOG(INFO)
                         << "Re-registered all shared memorys successfully";
 
-                    // Even if register_shm_via_ipc succeeded, confirm the RPC is
-                    // responsive AND the real_client side now holds all our segments
-                    // before declaring the connection restored.
+                    // Even if register_shm_via_ipc succeeded, confirm the RPC
+                    // is responsive AND the real_client side now holds all our
+                    // segments before declaring the connection restored.
                     auto check_rpc =
                         invoke_rpc<&RealClient::ping, DummyHeartbeatResponse>(
                             client_id_);
