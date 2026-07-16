@@ -138,16 +138,5 @@ __device__ __forceinline__ void mc_red_add(const CommCtx& ctx, int dst_rank,
     mc_signal(ctx, dst_rank, channel, qps_per_rank, sig_ptr, val);
 }
 
-__device__ __forceinline__ void mc_put_value64(const CommCtx& ctx, int dst_rank,
-                                               int channel, int qps_per_rank,
-                                               const uint64_t* dst_ptr,
-                                               uint64_t value) {
-    uint64_t recv_raddr = ctx.ibgda.raddrs[dst_rank] +
-                          (reinterpret_cast<const char*>(dst_ptr) -
-                           reinterpret_cast<const char*>(ctx.p2p.local_base));
-    mc_ibgda_put_value64(ctx.ibgda, channel, dst_rank, ctx.rank, qps_per_rank,
-                         recv_raddr, value);
-}
-
 }  // namespace device
 }  // namespace mooncake

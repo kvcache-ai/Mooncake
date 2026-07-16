@@ -748,7 +748,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
         if (lane_idx < kNumScaleoutRanks) {
             // Update remote tails
             const auto expected_signal = math::pack2<int, int64_t>(1, 0);
-            gin.put_value<transport::ScaleoutTeam>(
+            gin.red_add_rel<transport::ScaleoutTeam>(
                 workspace_layout.get_scaleout_channel_signaled_tail_ptr(
                     channel_idx, scaleout_rank_idx),
                 expected_signal, lane_idx);

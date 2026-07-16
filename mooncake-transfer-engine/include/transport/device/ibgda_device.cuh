@@ -37,10 +37,6 @@ __device__ __forceinline__ void mc_ibgda_red_add(const IbgdaContext&, int, int,
                                                  int, int, uint64_t, uint64_t,
                                                  int32_t) {}
 
-__device__ __forceinline__ void mc_ibgda_put_value64(const IbgdaContext&, int,
-                                                     int, int, int, uint64_t,
-                                                     uint64_t) {}
-
 }  // namespace device
 }  // namespace mooncake
 
@@ -211,34 +207,6 @@ __device__ __forceinline__ void mc_ibgda_write_rdma_write_wqe(
     wqe->data.addr = mc_bswap64(laddr);
 }
 
-// Inline RDMA WRITE keeps the publication value in the WQE itself. This
-// avoids a registered staging buffer whose contents could be overwritten
-// before the NIC fetches them.
-__device__ __forceinline__ void mc_ibgda_write_rdma_write_inline64_wqe(
-    mlx5gda_qp_devctx* qp, uint32_t slot, uint64_t value, uint64_t raddr,
-    __be32 rkey) {
-    constexpr uint32_t kInlineSegment = 1u << 31;
-    auto* wqe = reinterpret_cast<mlx5gda_rdma_write_wqe*>(
-        qp->wq + (slot & qp->wqeid_mask));
-    const uint32_t wqe_counter = slot & 0xffffu;
-
-    wqe->ctrl = {};
-    wqe->ctrl.qpn_ds = mc_bswap32((qp->qpn << 8) | 3);
-    wqe->ctrl.fm_ce_se = MLX5_WQE_CTRL_CQ_UPDATE;
-    wqe->ctrl.opmod_idx_opcode =
-        mc_bswap32((wqe_counter << 8) | MLX5_OPCODE_RDMA_WRITE);
-
-    wqe->raddr.raddr = mc_bswap64(raddr);
-    wqe->raddr.rkey = rkey;
-    wqe->raddr.reserved = 0;
-
-    auto* inline_words = reinterpret_cast<uint32_t*>(&wqe->data);
-    inline_words[0] = mc_bswap32(kInlineSegment | sizeof(value));
-    inline_words[1] = static_cast<uint32_t>(value);
-    inline_words[2] = static_cast<uint32_t>(value >> 32);
-    inline_words[3] = 0;
-}
-
 // Issue an RDMA ATOMIC MASKED FETCH-AND-ADD WQE (32-bit add_data).
 // This matches the original CUDA IBGDA EP kernel. A regular 64-bit
 // MLX5_OPCODE_ATOMIC_FA does not implement the 32-bit signal-buffer add used
@@ -335,28 +303,6 @@ __device__ __forceinline__ void mc_ibgda_put_defer_db(
     qp->wq_head_atomic = slot + 1;
     mc_ibgda_mark_wqe_ready(qp, slot);
     mc_ibgda_unlock(qp);
-}
-
-__device__ __forceinline__ void mc_ibgda_put_value64(
-    const IbgdaContext& ctx, int channel, int dst_rank, int src_rank,
-    int qps_per_rank, uint64_t recv_raddr, uint64_t value) {
-    auto* qp = mc_ibgda_channel(ctx, channel, dst_rank, qps_per_rank);
-    if (mc_ibgda_debug_enabled(qp, MLX5GDA_DEBUG_ATOMIC_RESERVE)) {
-        const uint32_t slot = mc_ibgda_reserve_wqe(qp);
-        mc_ibgda_write_rdma_write_inline64_wqe(qp, slot, value, recv_raddr,
-                                               mc_bswap32(ctx.rkeys[dst_rank]));
-        mc_ibgda_mark_wqe_ready(qp, slot);
-        mc_ibgda_flush_ready_wqes(qp);
-        return;
-    }
-
-    mc_ibgda_lock(qp);
-    const uint32_t slot = qp->db_head;
-    mc_ibgda_write_rdma_write_inline64_wqe(qp, slot, value, recv_raddr,
-                                           mc_bswap32(ctx.rkeys[dst_rank]));
-    mc_ibgda_post_send_db_locked(qp, slot);
-    mc_ibgda_unlock(qp);
-    (void)src_rank;
 }
 
 // RDMA ATOMIC ADD: add `value` to the 32-bit word at `recv_raddr` on
