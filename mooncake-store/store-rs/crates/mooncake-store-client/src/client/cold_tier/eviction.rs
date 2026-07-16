@@ -1,6 +1,6 @@
 use super::super::{
     refresh_cold_tier_device_cache, ObjectRoute, OperationTracker, PendingOffloadPrepareOutcome,
-    RestorePromotionQueue, Result, StorageOwnerState, StoreError,
+    RestorePromotionQueue, Result, RouteState, StorageOwnerState,
 };
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -43,9 +43,27 @@ impl StorageOwnerState {
                     self.rebuild_clock()?;
                 }
                 Ok(false) => {
-                    return Err(StoreError::InvalidState(format!(
-                        "debug evict_all made no progress after {MAX_NO_PROGRESS_RETRIES} retries with hot replicas remaining"
-                    )));
+                    let repaired = self.repair_stuck_pending_offloads_for_debug_evict_all()?;
+                    if repaired > 0 {
+                        warn!(
+                            runtime = %self.runtime,
+                            evicted,
+                            repaired,
+                            "debug evict_all repaired stuck pending offloads after no-progress scans"
+                        );
+                        no_progress_retries = 0;
+                        self.rebuild_clock()?;
+                        continue;
+                    }
+                    let remaining = self.hot_replica_count_for_debug_evict_all()?;
+                    warn!(
+                        runtime = %self.runtime,
+                        evicted,
+                        remaining,
+                        max_attempts = MAX_NO_PROGRESS_RETRIES,
+                        "debug evict_all stopped after best-effort no-progress scans"
+                    );
+                    break;
                 }
                 Err(error) if error_retries < MAX_ERROR_RETRIES => {
                     error_retries += 1;
@@ -59,7 +77,30 @@ impl StorageOwnerState {
                     );
                     self.rebuild_clock()?;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    let repaired = self.repair_stuck_pending_offloads_for_debug_evict_all()?;
+                    if repaired > 0 {
+                        warn!(
+                            runtime = %self.runtime,
+                            evicted,
+                            repaired,
+                            error = %error,
+                            "debug evict_all repaired stuck pending offloads after eviction error"
+                        );
+                        error_retries = 0;
+                        self.rebuild_clock()?;
+                        continue;
+                    }
+                    let remaining = self.hot_replica_count_for_debug_evict_all()?;
+                    warn!(
+                        runtime = %self.runtime,
+                        evicted,
+                        remaining,
+                        error = %error,
+                        "debug evict_all stopped after best-effort eviction error handling"
+                    );
+                    break;
+                }
             }
         }
         info!(
@@ -71,9 +112,77 @@ impl StorageOwnerState {
     }
 
     fn has_hot_replicas_for_debug_evict_all(&self) -> Result<bool> {
-        Ok(!self
-            .collect_routes_by_replica_owner(&self.runtime)?
-            .is_empty())
+        Ok(self.hot_replica_count_for_debug_evict_all()? > 0)
+    }
+
+    fn hot_replica_count_for_debug_evict_all(&self) -> Result<usize> {
+        Ok(self.collect_routes_by_replica_owner(&self.runtime)?.len())
+    }
+
+    fn repair_stuck_pending_offloads_for_debug_evict_all(&self) -> Result<usize> {
+        let routes = self.collect_routes_by_replica_owner(&self.runtime)?;
+        let mut repaired = 0usize;
+        let offload_worker_idle = !self.pending_offloads.is_materializing();
+        for route in routes {
+            if route.state != RouteState::Active {
+                self.sync_route(&route);
+                continue;
+            }
+            if !route
+                .replicas
+                .iter()
+                .any(|replica| replica.owner == self.runtime)
+            {
+                self.sync_route(&route);
+                continue;
+            }
+            let Some(cold_backing) = route.cold_backing.clone() else {
+                continue;
+            };
+            if cold_backing.owner != self.runtime
+                || cold_backing.state != mooncake_store_core::ColdBackingState::PendingOffload
+            {
+                continue;
+            }
+            if super::cold_tier_disabled() {
+                super::offload::clear_unavailable_pending_cold_backing(
+                    self,
+                    &route,
+                    &cold_backing,
+                    "debug_evict_all_cold_tier_disabled",
+                    None,
+                )?;
+                repaired = repaired.saturating_add(1);
+                continue;
+            }
+            if let Err(error) = self.cold_tier_devices.backend_for(&cold_backing) {
+                super::offload::clear_unavailable_pending_cold_backing(
+                    self,
+                    &route,
+                    &cold_backing,
+                    "debug_evict_all_backend_unavailable",
+                    Some(&error),
+                )?;
+                repaired = repaired.saturating_add(1);
+                continue;
+            }
+            if offload_worker_idle
+                && self.pending_offloads.requeue_for_debug_evict_all(
+                    route.key.clone(),
+                    route.version,
+                    Some(cold_backing.length),
+                )
+            {
+                repaired = repaired.saturating_add(1);
+                warn!(
+                    runtime = %self.runtime,
+                    key = %route.key.0,
+                    route_version = route.version.0,
+                    "debug evict_all requeued stuck pending offload"
+                );
+            }
+        }
+        Ok(repaired)
     }
 }
 
