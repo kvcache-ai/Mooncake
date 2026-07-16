@@ -21,6 +21,8 @@ use tracing::{debug, trace, warn};
 use crate::observability::OperationTracker;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_REQUEST_TIMEOUT_ENV: &str = "MC_STORE_RS_CONTROL_REQUEST_TIMEOUT_MS";
 const CONTROL_PLANE_THREADS_ENV: &str = "MC_STORE_RS_CONTROL_PLANE_THREADS";

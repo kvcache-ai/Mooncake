@@ -355,9 +355,10 @@ impl StoreClient {
     ) -> Result<Option<ObjectRoute>> {
         self.finalize_tenant_quota_put(reservation, route, value_len)?;
         log_route_publish_sample(&self.lease.runtime, route, value_len, operation);
-        Ok(self
+        let _ = self
             .cold_tier
-            .on_route_published(self.storage_owner.as_ref(), route))
+            .on_route_published(self.storage_owner.as_ref(), route);
+        Ok(None)
     }
 
     fn finalize_tenant_quota_delete(

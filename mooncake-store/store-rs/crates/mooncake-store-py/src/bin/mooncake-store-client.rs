@@ -1025,10 +1025,6 @@ fn drained_message(stable_id: &str, evacuated_routes: usize) -> String {
     )
 }
 
-fn stopped_message(stable_id: &str) -> String {
-    format!("mooncake-store-client stopped stable_id={stable_id}")
-}
-
 fn install_signal_handler() -> Result<ShutdownSignal, Box<dyn Error>> {
     let shutdown = Arc::new(AtomicU8::new(0));
     let handle = shutdown.clone();
