@@ -65,6 +65,8 @@ class P2pTransport {
     // remote_handles[i] is the blob exported by rank i.
     // active_ranks_mask[i] == 1 means rank i is participating.
     // After this call, availableTablePtr() and peerPtrsTablePtr() are valid.
+    // The tables are transport-scoped: a later call replaces the previously
+    // imported peer mapping context.
     virtual void importPeerHandles(
         void* local_ptr, int rank, int num_ranks,
         const std::vector<std::vector<int32_t>>& remote_handles,

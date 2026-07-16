@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "cuda_alike.h"
@@ -88,6 +89,12 @@ bool deserializeFabricHandle(const std::vector<int32_t>& encoded,
     *bytes = static_cast<size_t>(encoded_size);
     return *bytes != 0;
 }
+
+struct FabricAllocation {
+    CUdeviceptr ptr = 0;
+    size_t size = 0;
+    CUmemGenericAllocationHandle handle{};
+};
 #else
 bool supportFabricMem() { return false; }
 #endif
@@ -247,6 +254,7 @@ class P2pDeviceTransportImpl : public P2pTransport {
     ~P2pDeviceTransportImpl() override {
 #if defined(USE_CUDA)
         cleanupFabricPeerMappings();
+        cleanupFabricAllocations();
 #endif
         if (available_table_) cudaFree(available_table_);
         if (peer_ptrs_dev_) cudaFree(peer_ptrs_dev_);
@@ -300,34 +308,29 @@ class P2pDeviceTransportImpl : public P2pTransport {
                 return nullptr;
             }
 
-            fabric_alloc_size_ = std::max(
+            size_t fabric_alloc_size = std::max(
                 granularity, (bytes + granularity - 1) & ~(granularity - 1));
-            res =
-                cuMemCreate(&fabric_mem_handle_, fabric_alloc_size_, &prop, 0);
+            CUmemGenericAllocationHandle fabric_mem_handle{};
+            res = cuMemCreate(&fabric_mem_handle, fabric_alloc_size, &prop, 0);
             if (res != CUDA_SUCCESS) {
-                fabric_alloc_size_ = 0;
                 LOG(ERROR) << "[EP P2P] cuMemCreate(FABRIC) failed: " << res;
                 return nullptr;
             }
 
             CUdeviceptr reserved = 0;
-            res = cuMemAddressReserve(&reserved, fabric_alloc_size_,
-                                      granularity, 0, 0);
+            res = cuMemAddressReserve(&reserved, fabric_alloc_size, granularity,
+                                      0, 0);
             if (res != CUDA_SUCCESS) {
-                cuMemRelease(fabric_mem_handle_);
-                fabric_mem_handle_ = {};
-                fabric_alloc_size_ = 0;
+                cuMemRelease(fabric_mem_handle);
                 LOG(ERROR) << "[EP P2P] cuMemAddressReserve failed: " << res;
                 return nullptr;
             }
 
-            res = cuMemMap(reserved, fabric_alloc_size_, 0, fabric_mem_handle_,
-                           0);
+            res =
+                cuMemMap(reserved, fabric_alloc_size, 0, fabric_mem_handle, 0);
             if (res != CUDA_SUCCESS) {
-                cuMemAddressFree(reserved, fabric_alloc_size_);
-                cuMemRelease(fabric_mem_handle_);
-                fabric_mem_handle_ = {};
-                fabric_alloc_size_ = 0;
+                cuMemAddressFree(reserved, fabric_alloc_size);
+                cuMemRelease(fabric_mem_handle);
                 LOG(ERROR) << "[EP P2P] cuMemMap failed: " << res;
                 return nullptr;
             }
@@ -340,21 +343,22 @@ class P2pDeviceTransportImpl : public P2pTransport {
                 access[i].location.id = i;
                 access[i].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
             }
-            res = cuMemSetAccess(reserved, fabric_alloc_size_, access.data(),
+            res = cuMemSetAccess(reserved, fabric_alloc_size, access.data(),
                                  device_count);
             if (res != CUDA_SUCCESS) {
-                cuMemUnmap(reserved, fabric_alloc_size_);
-                cuMemAddressFree(reserved, fabric_alloc_size_);
-                cuMemRelease(fabric_mem_handle_);
-                fabric_mem_handle_ = {};
-                fabric_alloc_size_ = 0;
+                cuMemUnmap(reserved, fabric_alloc_size);
+                cuMemAddressFree(reserved, fabric_alloc_size);
+                cuMemRelease(fabric_mem_handle);
                 LOG(ERROR) << "[EP P2P] cuMemSetAccess failed: " << res;
                 return nullptr;
             }
 
             ptr = reinterpret_cast<void*>(reserved);
+            fabric_allocations_.emplace(
+                ptr, FabricAllocation{reserved, fabric_alloc_size,
+                                      fabric_mem_handle});
             LOG(INFO) << "[EP P2P] allocated fabric buffer bytes=" << bytes
-                      << " mapped_bytes=" << fabric_alloc_size_;
+                      << " mapped_bytes=" << fabric_alloc_size;
             return ptr;
         }
 #endif
@@ -383,15 +387,22 @@ class P2pDeviceTransportImpl : public P2pTransport {
 
     void freeBuffer(void* ptr) override {
 #if defined(USE_CUDA)
-        cleanupFabricPeerMappings();
         if (ptr == nullptr) return;
         if (use_fabric_mem_) {
-            CUdeviceptr dptr = reinterpret_cast<CUdeviceptr>(ptr);
-            cuMemUnmap(dptr, fabric_alloc_size_);
-            cuMemAddressFree(dptr, fabric_alloc_size_);
-            cuMemRelease(fabric_mem_handle_);
-            fabric_mem_handle_ = {};
-            fabric_alloc_size_ = 0;
+            auto it = fabric_allocations_.find(ptr);
+            if (it == fabric_allocations_.end()) {
+                LOG(ERROR) << "[EP P2P] unknown fabric buffer=" << ptr;
+                return;
+            }
+            if (ptr == local_ptr_) {
+                cleanupFabricPeerMappings();
+                local_ptr_ = nullptr;
+            }
+            FabricAllocation allocation = it->second;
+            fabric_allocations_.erase(it);
+            cuMemUnmap(allocation.ptr, allocation.size);
+            cuMemAddressFree(allocation.ptr, allocation.size);
+            cuMemRelease(allocation.handle);
             return;
         }
 #endif
@@ -401,9 +412,14 @@ class P2pDeviceTransportImpl : public P2pTransport {
     std::vector<int32_t> exportIpcHandle(void* ptr) override {
 #if defined(USE_CUDA)
         if (use_fabric_mem_) {
+            auto it = fabric_allocations_.find(ptr);
+            if (it == fabric_allocations_.end()) {
+                LOG(ERROR) << "[EP P2P] unknown fabric buffer=" << ptr;
+                return {};
+            }
             CUmemFabricHandle export_handle;
             CUresult res =
-                cuMemExportToShareableHandle(&export_handle, fabric_mem_handle_,
+                cuMemExportToShareableHandle(&export_handle, it->second.handle,
                                              CU_MEM_HANDLE_TYPE_FABRIC, 0);
             if (res != CUDA_SUCCESS) {
                 LOG(ERROR)
@@ -411,7 +427,7 @@ class P2pDeviceTransportImpl : public P2pTransport {
                     << res;
                 return {};
             }
-            return serializeFabricHandle(export_handle, fabric_alloc_size_);
+            return serializeFabricHandle(export_handle, it->second.size);
         }
 #endif
 #ifdef USE_MACA
@@ -802,6 +818,16 @@ class P2pDeviceTransportImpl : public P2pTransport {
             }
         }
     }
+
+    void cleanupFabricAllocations() {
+        for (const auto& entry : fabric_allocations_) {
+            const auto& allocation = entry.second;
+            cuMemUnmap(allocation.ptr, allocation.size);
+            cuMemAddressFree(allocation.ptr, allocation.size);
+            cuMemRelease(allocation.handle);
+        }
+        fabric_allocations_.clear();
+    }
 #endif
 
     int num_ranks_;
@@ -811,10 +837,9 @@ class P2pDeviceTransportImpl : public P2pTransport {
     void** peer_ptrs_host_ = nullptr;
     void** peer_ptrs_dev_ = nullptr;
     bool all_peers_accessible_ = false;
-    CUmemGenericAllocationHandle fabric_mem_handle_{};
-    size_t fabric_alloc_size_ = 0;
 #if defined(USE_CUDA)
     std::vector<FabricPeerMapping> fabric_peer_mappings_;
+    std::unordered_map<void*, FabricAllocation> fabric_allocations_;
 #endif
 };
 
