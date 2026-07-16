@@ -9,6 +9,7 @@
 #include <limits>
 #include <thread>
 #include "memory_location.h"
+#include "environ.h"
 #include "pg_utils.h"
 
 namespace mooncake {
@@ -16,8 +17,7 @@ namespace mooncake {
 namespace {
 
 size_t getEnv_size_t(const char* name, size_t default_val) {
-    const char* val = std::getenv(name);
-    return val ? std::strtoull(val, nullptr, 10) : default_val;
+    return Environ::GetSizeT(name, default_val);
 }
 
 void setCudaDeviceIfNeeded(bool is_cpu, int cuda_device_index,

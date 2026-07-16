@@ -60,18 +60,19 @@ class CXLTransportTest : public ::testing::Test {
     std::shared_ptr<mooncake::TransferMetadata> metadata_client;
     int tmp_fd = -1;
     uint8_t *addr = nullptr;
-    uint8_t *base_addr;
+    uint8_t *base_addr = nullptr;
     std::pair<std::string, uint16_t> hostname_port;
     std::unique_ptr<mooncake::TransferEngine> engine;
     const size_t offset_1 = 2 * 1024 * 1024;
     const size_t offset_2 = 6 * 1024 * 1024;
     const size_t len = 2 * 1024 * 1024;
-    CxlTransport *cxl_xport;
-    Transport *xport;
-    void **args;
+    CxlTransport *cxl_xport = nullptr;
+    Transport *xport = nullptr;
+    void **args = nullptr;
     mooncake::Transport::SegmentID segment_id;
     std::shared_ptr<TransferMetadata::SegmentDesc> segment_desc;
     const size_t kDataLength = 4 * 1024;
+    bool cxl_available = true;
 
    protected:
     void SetUp() override {
@@ -86,7 +87,8 @@ class CXLTransportTest : public ::testing::Test {
         // Set device name from gflags parameter
         setenv("MC_CXL_DEV_PATH", FLAGS_device_name.c_str(), 1);
 
-        setenv("MC_CXL_DEV_SIZE", std::to_string(FLAGS_device_size).c_str(), 1);
+        std::string device_size_str = std::to_string(FLAGS_device_size);
+        setenv("MC_CXL_DEV_SIZE", device_size_str.c_str(), 1);
 
         // cxl setup
         engine = std::make_unique<TransferEngine>(false);
@@ -99,7 +101,11 @@ class CXLTransportTest : public ::testing::Test {
         args = (void **)malloc(2 * sizeof(void *));
         args[0] = nullptr;
         xport = engine->installTransport("cxl", args);
-        ASSERT_NE(xport, nullptr);
+        if (xport == nullptr) {
+            cxl_available = false;
+            LOG(WARNING) << "CXL device not available, tests will be skipped";
+            return;
+        }
 
         cxl_xport = dynamic_cast<CxlTransport *>(xport);
         base_addr = (uint8_t *)cxl_xport->getCxlBaseAddr();
@@ -117,13 +123,20 @@ class CXLTransportTest : public ::testing::Test {
             close(tmp_fd);
             unlink(FLAGS_device_name.c_str());
         }
-        free(args);
+        if (args) {
+            free(args);
+        }
         google::ShutdownGoogleLogging();
-        freeMemoryPool(addr, kDataLength);
+        if (addr) {
+            freeMemoryPool(addr, kDataLength);
+        }
     }
 };
 
 TEST_F(CXLTransportTest, MultiWrite) {
+    if (!cxl_available) {
+        GTEST_SKIP() << "CXL device not available";
+    }
     int times = 10;
     while (times--) {
         for (size_t offset = 0; offset < kDataLength; ++offset)
@@ -159,6 +172,9 @@ TEST_F(CXLTransportTest, MultiWrite) {
 }
 
 TEST_F(CXLTransportTest, MultipleRead) {
+    if (!cxl_available) {
+        GTEST_SKIP() << "CXL device not available";
+    }
     int times = 10;
     while (times--) {
         for (size_t offset = 0; offset < kDataLength; ++offset)

@@ -8,6 +8,8 @@
 
 #include <cuda_runtime.h>
 
+#include "environ.h"
+
 namespace mooncake {
 namespace {
 
@@ -20,9 +22,7 @@ int64_t align_i64(int64_t x, int64_t alignment) {
 }
 
 int getenv_int(const char* name, int default_value) {
-    const char* value = std::getenv(name);
-    if (value == nullptr || value[0] == '\0') return default_value;
-    return std::max(1, std::atoi(value));
+    return std::max(1, Environ::GetInt(name, default_value));
 }
 
 int hybrid_num_channels(int num_sms) {

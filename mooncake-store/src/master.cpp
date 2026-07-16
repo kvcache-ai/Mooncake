@@ -14,6 +14,7 @@
 #include <ylt/easylog/record.hpp>
 
 #include "default_config.h"
+#include "environ.h"
 #include "duration_utils.h"
 #include "ha/leadership/master_service_supervisor.h"
 
@@ -69,39 +70,40 @@ uint64_t ParseDurationFlagOrDie(const char* flag_name,
 // "metadata_server" field of MOONCAKE_CONFIG_PATH. Returns "" if none found;
 // the caller validates the scheme (only http(s) is supported).
 std::string ResolveMetadataServerForCleanup() {
-    if (const char* env = std::getenv("MOONCAKE_TE_META_DATA_SERVER")) {
-        std::string value(env);
+    const auto& env = mooncake::Environ::Get();
+    std::string value = env.GetMooncakeTeMetadataServer();
+    if (!value.empty()) {
         // P2PHANDSHAKE has no central metadata server, nothing to clean up.
         if (!value.empty() && value != "P2PHANDSHAKE") {
             return value;
         }
     }
 
-    if (const char* cfg = std::getenv("MOONCAKE_CONFIG_PATH")) {
-        if (cfg[0] != '\0') {
-            try {
-                std::ifstream fin(cfg);
-                if (fin) {
-                    Json::CharReaderBuilder builder;
-                    Json::Value root;
-                    std::string errs;
-                    if (Json::parseFromStream(builder, fin, &root, &errs) &&
-                        root.isMember("metadata_server") &&
-                        root["metadata_server"].isString()) {
-                        return root["metadata_server"].asString();
-                    }
-                    if (!errs.empty()) {
-                        LOG(WARNING) << "Failed to parse MOONCAKE_CONFIG_PATH ("
-                                     << cfg << "): " << errs;
-                    }
-                } else {
-                    LOG(WARNING) << "Cannot open MOONCAKE_CONFIG_PATH (" << cfg
-                                 << "): file does not exist or is not readable";
+    std::string config_path = env.GetMooncakeConfigPath();
+    if (!config_path.empty()) {
+        try {
+            std::ifstream fin(config_path);
+            if (fin) {
+                Json::CharReaderBuilder builder;
+                Json::Value root;
+                std::string errs;
+                if (Json::parseFromStream(builder, fin, &root, &errs) &&
+                    root.isMember("metadata_server") &&
+                    root["metadata_server"].isString()) {
+                    return root["metadata_server"].asString();
                 }
-            } catch (const std::exception& e) {
-                LOG(WARNING) << "Error reading MOONCAKE_CONFIG_PATH (" << cfg
-                             << "): " << e.what();
+                if (!errs.empty()) {
+                    LOG(WARNING) << "Failed to parse MOONCAKE_CONFIG_PATH ("
+                                 << config_path << "): " << errs;
+                }
+            } else {
+                LOG(WARNING)
+                    << "Cannot open MOONCAKE_CONFIG_PATH (" << config_path
+                    << "): file does not exist or is not readable";
             }
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Error reading MOONCAKE_CONFIG_PATH ("
+                         << config_path << "): " << e.what();
         }
     }
 
@@ -1283,12 +1285,11 @@ int main(int argc, char* argv[]) {
 
     // Fall back to environment variables for pod identity (K8s Downward API)
     if (master_config.pod_name.empty()) {
-        const char* env = std::getenv("POD_NAME");
-        if (env) master_config.pod_name = env;
+        master_config.pod_name = mooncake::Environ::Get().GetPodName();
     }
     if (master_config.pod_namespace.empty()) {
-        const char* env = std::getenv("POD_NAMESPACE");
-        if (env) master_config.pod_namespace = env;
+        master_config.pod_namespace =
+            mooncake::Environ::Get().GetPodNamespace();
     }
 
     const std::string ha_backend_connstring =
@@ -1323,9 +1324,9 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    const char* value = std::getenv("MC_RPC_PROTOCOL");
+    std::string rpc_protocol = mooncake::Environ::Get().GetRpcProtocol();
     std::string protocol = "tcp";
-    if (value && std::string_view(value) == "rdma") {
+    if (rpc_protocol == "rdma") {
         protocol = "rdma";
     }
 
@@ -1477,8 +1478,7 @@ int main(int argc, char* argv[]) {
             master_config.rpc_address,
             std::chrono::seconds(master_config.rpc_conn_timeout_seconds),
             master_config.rpc_enable_tcp_no_delay);
-        const char* value = std::getenv("MC_RPC_PROTOCOL");
-        if (value && std::string_view(value) == "rdma") {
+        if (rpc_protocol == "rdma") {
             server.init_ibv();
         }
         auto wrapped_master_service =

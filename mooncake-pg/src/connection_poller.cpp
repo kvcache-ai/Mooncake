@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include "environ.h"
 #include "memory_location.h"
 #include "mooncake_worker.cuh"
 #include "pg_utils.h"
@@ -22,10 +23,7 @@ namespace mooncake {
 // cross-node -- CPU heap buffers are invisible to remote peers.
 #if !defined(MOONCAKE_EP_USE_MUSA) && !defined(USE_MACA)
 static bool supportFabricMem() {
-    const char* nvlink_ipc = getenv("MC_USE_NVLINK_IPC");
-
-    bool fabric_enabled = nvlink_ipc && strcmp(nvlink_ipc, "0") == 0;
-    if (!fabric_enabled) return false;
+    if (!Environ::Get().GetNvlinkFabricMemEnabled()) return false;
 
     int num_devices = 0;
     cudaError_t err = cudaGetDeviceCount(&num_devices);

@@ -30,6 +30,7 @@
 #include <thread>
 
 #include "config.h"
+#include "environ.h"
 #include "cuda_alike.h"
 #include "environ.h"
 #include "hip_device_guard.h"
@@ -70,8 +71,9 @@ bool containsAddress(const MemoryRegionMeta &region, uintptr_t addr) {
 // Result is cached after the first call.
 bool isKernelDmabufSupported() {
     static const bool supported = []() {
-        if (const char *env = std::getenv("MOONCAKE_DISABLE_HIP_DMABUF")) {
-            if (std::string(env) != "0") {
+        std::string disable_dmabuf = Environ::Get().GetDisableHipDmabuf();
+        if (!disable_dmabuf.empty()) {
+            if (disable_dmabuf != "0") {
                 LOG(INFO)
                     << "HIP dmabuf disabled via MOONCAKE_DISABLE_HIP_DMABUF";
                 return false;

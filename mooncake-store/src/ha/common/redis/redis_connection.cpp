@@ -1,4 +1,7 @@
 #include "ha/common/redis/redis_connection.h"
+#include "environ.h"
+
+#include <glog/logging.h>
 
 #include <algorithm>
 #include <chrono>
@@ -74,11 +77,14 @@ tl::expected<int, ErrorCode> ParsePositiveInt(std::string_view text,
 }
 
 tl::expected<int, ErrorCode> ResolveRedisDbIndex() {
-    const char* raw_db_index = std::getenv("MC_REDIS_DB_INDEX");
-    if (raw_db_index == nullptr || std::strlen(raw_db_index) == 0) {
-        return 0;
+    const auto& env = Environ::Get();
+    int db_index = env.GetRedisDbIndex();
+    if (db_index < 0 || db_index > 255) {
+        LOG(ERROR) << "Invalid MC_REDIS_DB_INDEX='" << env.GetRedisDbIndexRaw()
+                   << "': expected an integer in [0, 255]";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return ParsePositiveInt(raw_db_index, 0, 255);
+    return db_index;
 }
 
 tl::expected<RedisEndpoint, ErrorCode> ParseRedisEndpoint(
@@ -195,17 +201,17 @@ tl::expected<RedisContextPtr, ErrorCode> ConnectRedis(
         return tl::make_unexpected(connection_error);
     }
 
-    const char* username = std::getenv("MC_REDIS_USERNAME");
-    const char* password = std::getenv("MC_REDIS_PASSWORD");
-    if (password != nullptr && std::strlen(password) > 0) {
+    std::string username = Environ::Get().GetRedisUsername();
+    std::string password = Environ::Get().GetRedisPassword();
+    if (!password.empty()) {
         RedisReplyPtr reply;
-        if (username != nullptr && std::strlen(username) > 0) {
+        if (!username.empty()) {
             reply.reset(static_cast<redisReply*>(redisCommand(
-                context.get(), "AUTH %b %b", username, std::strlen(username),
-                password, std::strlen(password))));
+                context.get(), "AUTH %b %b", username.data(), username.size(),
+                password.data(), password.size())));
         } else {
             reply.reset(static_cast<redisReply*>(redisCommand(
-                context.get(), "AUTH %b", password, std::strlen(password))));
+                context.get(), "AUTH %b", password.data(), password.size())));
         }
         if (reply == nullptr || reply->type == REDIS_REPLY_ERROR) {
             return tl::make_unexpected(connection_error);

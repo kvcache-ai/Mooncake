@@ -33,6 +33,7 @@
 
 #include "cuda_alike.h"
 #include "config.h"
+#include "environ.h"
 #include "memory_location.h"
 #include "topology.h"
 #include "char_util.h"
@@ -160,17 +161,16 @@ static inline void rtrim(std::string &s) {
 
 static std::set<std::string> getIbvDeviceWhitelist() {
     std::set<std::string> whitelist;
-    const char *env = std::getenv("MC_TE_FILTERS");
-    if (!env || !*env) {
+    std::string env = Environ::Get().GetTeFilters();
+    if (env.empty()) {
         return whitelist;
     }
 
     LOG(INFO) << "IB device whitelist: " << env;
-    std::string env_str(env);
     size_t start = 0;
     size_t pos = 0;
-    while ((pos = env_str.find(',', start)) != std::string::npos) {
-        std::string token = env_str.substr(start, pos - start);
+    while ((pos = env.find(',', start)) != std::string::npos) {
+        std::string token = env.substr(start, pos - start);
         ltrim(token);
         rtrim(token);
         if (!token.empty()) {
@@ -178,8 +178,8 @@ static std::set<std::string> getIbvDeviceWhitelist() {
         }
         start = pos + 1;
     }
-    if (start < env_str.length()) {
-        std::string token = env_str.substr(start);
+    if (start < env.length()) {
+        std::string token = env.substr(start);
         ltrim(token);
         rtrim(token);
         if (!token.empty()) {
@@ -592,14 +592,7 @@ static std::vector<TopologyEntry> discoverCudaTopology(
 }
 #endif
 
-Topology::Topology() {
-    auto str = getenv("MC_PATH_ROUNDROBIN");
-    if (str && (strcmp(str, "1") == 0 || strcasecmp(str, "true") == 0)) {
-        use_round_robin_ = true;
-    } else {
-        use_round_robin_ = false;
-    }
-}
+Topology::Topology() { use_round_robin_ = Environ::Get().GetPathRoundrobin(); }
 
 Topology::~Topology() {}
 

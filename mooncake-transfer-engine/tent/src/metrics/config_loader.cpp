@@ -18,30 +18,37 @@
 
 #include <cstdlib>
 
+#include "environ.h"
+
 namespace mooncake {
 namespace tent {
 
 void MetricsConfigLoader::applyEnvironmentOverrides(MetricsConfig& config) {
-    if (const char* env_val = std::getenv(config_keys::ENV_METRICS_ENABLED)) {
+    std::string env_val =
+        Environ::GetString(config_keys::ENV_METRICS_ENABLED, "");
+    if (!env_val.empty()) {
         config.enabled = ConfigHelper::parseBool(env_val, config.enabled);
     }
 
-    if (const char* env_val = std::getenv(config_keys::ENV_METRICS_HTTP_PORT)) {
+    env_val = Environ::GetString(config_keys::ENV_METRICS_HTTP_PORT, "");
+    if (!env_val.empty()) {
         config.http_port = ConfigHelper::parsePort(env_val, config.http_port);
     }
 
-    if (const char* env_val = std::getenv(config_keys::ENV_METRICS_HTTP_HOST)) {
+    env_val = Environ::GetString(config_keys::ENV_METRICS_HTTP_HOST, "");
+    if (!env_val.empty()) {
         config.http_host = env_val;
     }
 
-    if (const char* env_val =
-            std::getenv(config_keys::ENV_METRICS_REPORT_INTERVAL)) {
+    env_val = Environ::GetString(config_keys::ENV_METRICS_REPORT_INTERVAL, "");
+    if (!env_val.empty()) {
         config.report_interval_seconds =
             ConfigHelper::parseInt(env_val, config.report_interval_seconds);
     }
 
-    if (const char* env_val =
-            std::getenv(config_keys::ENV_METRICS_HTTP_SERVER_THREADS)) {
+    env_val =
+        Environ::GetString(config_keys::ENV_METRICS_HTTP_SERVER_THREADS, "");
+    if (!env_val.empty()) {
         int threads =
             ConfigHelper::parseInt(env_val, config.http_server_threads);
         if (threads > 0 && threads <= 65535) {
@@ -49,28 +56,29 @@ void MetricsConfigLoader::applyEnvironmentOverrides(MetricsConfig& config) {
         }
     }
 
-    if (const char* env_val =
-            std::getenv(config_keys::ENV_METRICS_ENABLE_PROMETHEUS)) {
+    env_val =
+        Environ::GetString(config_keys::ENV_METRICS_ENABLE_PROMETHEUS, "");
+    if (!env_val.empty()) {
         config.enable_prometheus =
             ConfigHelper::parseBool(env_val, config.enable_prometheus);
     }
 
-    if (const char* env_val =
-            std::getenv(config_keys::ENV_METRICS_ENABLE_JSON)) {
+    env_val = Environ::GetString(config_keys::ENV_METRICS_ENABLE_JSON, "");
+    if (!env_val.empty()) {
         config.enable_json =
             ConfigHelper::parseBool(env_val, config.enable_json);
     }
 
-    if (const char* env_val =
-            std::getenv(config_keys::ENV_METRICS_LATENCY_BUCKETS)) {
+    env_val = Environ::GetString(config_keys::ENV_METRICS_LATENCY_BUCKETS, "");
+    if (!env_val.empty()) {
         auto buckets = ConfigHelper::parseDoubleArray(env_val);
         if (!buckets.empty()) {
             config.latency_buckets = buckets;
         }
     }
 
-    if (const char* env_val =
-            std::getenv(config_keys::ENV_METRICS_SIZE_BUCKETS)) {
+    env_val = Environ::GetString(config_keys::ENV_METRICS_SIZE_BUCKETS, "");
+    if (!env_val.empty()) {
         auto buckets = ConfigHelper::parseDoubleArray(env_val);
         if (!buckets.empty()) {
             config.size_buckets = buckets;

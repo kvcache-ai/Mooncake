@@ -27,6 +27,7 @@
 #include <string>
 
 #include "cuda_alike.h"
+#include "environ.h"
 
 namespace mooncake {
 namespace device {
@@ -34,20 +35,10 @@ namespace device {
 #ifdef USE_MACA
 namespace {
 
-bool parseBoolEnv(const char* name) {
-    const char* value = std::getenv(name);
-    if (value == nullptr) return false;
-    std::string s(value);
-    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    return s == "1" || s == "on" || s == "true" || s == "yes";
-}
+bool parseBoolEnv(const char* name) { return Environ::GetBool(name, false); }
 
 std::string getLowerEnv(const char* name) {
-    const char* value = std::getenv(name);
-    if (value == nullptr) return "";
-    std::string s(value);
+    std::string s = Environ::GetString(name, "");
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
         return static_cast<char>(std::tolower(c));
     });
@@ -152,8 +143,8 @@ bool pairListed(const std::string& pairs, int src, int dst) {
 bool macaP2pPairAllowed(int src_physical, int dst_physical) {
     if (parseBoolEnv("MOONCAKE_EP_MACA_ALLOW_NODE_P2P")) return true;
 
-    const char* explicit_pairs = std::getenv("MOONCAKE_EP_MACA_P2P_PAIRS");
-    if (explicit_pairs != nullptr && explicit_pairs[0] != '\0')
+    std::string explicit_pairs = Environ::Get().GetEpMacaP2pPairs();
+    if (!explicit_pairs.empty())
         return pairListed(explicit_pairs, src_physical, dst_physical);
 
     // C500 exposes two direct MetaXLink islands by default: 0<->1 and 2<->3.

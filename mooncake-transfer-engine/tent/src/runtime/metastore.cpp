@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "tent/runtime/metastore.h"
+#include "environ.h"
 #ifdef USE_ETCD
 #include "tent/metastore/etcd.h"
 #endif
@@ -39,31 +40,12 @@ std::shared_ptr<MetaStore> MetaStore::Create(const std::string& type,
 #ifdef USE_REDIS
     if (type == "redis") {
         // Get Redis password from environment variable for security
-        std::string password;
-        const char* env_password = std::getenv("MC_REDIS_PASSWORD");
-        if (env_password && *env_password) {
-            password = env_password;
-        }
-
-        std::string username;
-        const char* env_username = std::getenv("MC_REDIS_USERNAME");
-        if (env_username && *env_username) {
-            username = env_username;
-        }
+        const auto& env = Environ::Get();
+        std::string password = env.GetRedisPassword();
+        std::string username = env.GetRedisUsername();
 
         // Get Redis DB index from environment variable
-        int redis_db_index = REDIS_DEFAULT_DB_INDEX;
-        const char* env_db_index = std::getenv("MC_REDIS_DB_INDEX");
-        if (env_db_index && *env_db_index) {
-            try {
-                redis_db_index = std::stoi(env_db_index);
-            } catch (const std::exception& e) {
-                LOG(WARNING)
-                    << "Invalid MC_REDIS_DB_INDEX environment variable: "
-                    << env_db_index << ", using default "
-                    << static_cast<int>(REDIS_DEFAULT_DB_INDEX);
-            }
-        }
+        int redis_db_index = env.GetRedisDbIndex();
 
         // Validate redis_db_index range (0-255)
         uint8_t db_index = REDIS_DEFAULT_DB_INDEX;

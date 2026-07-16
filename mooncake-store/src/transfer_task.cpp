@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 #include "device/accelerator_registry.h"
+#include "environ.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
 #ifdef USE_NOF
@@ -19,77 +20,24 @@
 #endif
 
 #ifdef USE_NOF
-static bool IsTruthyEnv(const char* value) {
-    if (!value) {
-        return false;
-    }
-    std::string normalized(value);
-    std::transform(
-        normalized.begin(), normalized.end(), normalized.begin(),
-        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    return normalized == "1" || normalized == "true" || normalized == "yes" ||
-           normalized == "on";
-}
-
 static bool IsSpdkNofDebugEnabled() {
-    static const bool enabled = IsTruthyEnv(std::getenv("MC_NOF_DEBUG"));
-    return enabled;
+    return mooncake::Environ::Get().GetNofDebug();
 }
 
 static int GetSpdkNofDebugIntervalMs() {
-    static const int interval_ms = []() {
-        const char* raw_value = std::getenv("MC_NOF_DEBUG_INTERVAL_MS");
-        if (!raw_value) {
-            return 1000;
-        }
-        char* end_ptr = nullptr;
-        long parsed = std::strtol(raw_value, &end_ptr, 10);
-        if (end_ptr == raw_value || (end_ptr != nullptr && *end_ptr != '\0') ||
-            parsed <= 0) {
-            return 1000;
-        }
-        return static_cast<int>(parsed);
-    }();
-    return interval_ms;
-}
-
-static int GetPositiveEnvOrDefault(const char* name, int default_value) {
-    const char* raw_value = std::getenv(name);
-    if (!raw_value || raw_value[0] == '\0') {
-        return default_value;
-    }
-
-    errno = 0;
-    char* end_ptr = nullptr;
-    long parsed = std::strtol(raw_value, &end_ptr, 10);
-    if (errno != 0 || end_ptr == raw_value ||
-        (end_ptr != nullptr && *end_ptr != '\0') || parsed <= 0 ||
-        parsed > std::numeric_limits<int>::max()) {
-        LOG(WARNING) << "Invalid value for " << name << ": " << raw_value
-                     << ", using default " << default_value;
-        return default_value;
-    }
-
-    return static_cast<int>(parsed);
+    return mooncake::Environ::Get().GetNofDebugIntervalMs();
 }
 
 static int GetSpdkNofSubmitChunkBytes() {
-    static const int value = GetPositiveEnvOrDefault(
-        "MC_NOF_SUBMIT_CHUNK_BYTES", mooncake::kDefaultSpdkNofSubmitChunkBytes);
-    return value;
+    return mooncake::Environ::Get().GetNofSubmitChunkBytes();
 }
 
 static int GetSpdkNofInflightBytesLimit() {
-    static const int value =
-        GetPositiveEnvOrDefault("MC_NOF_INFLIGHT_BYTES_LIMIT",
-                                mooncake::kDefaultSpdkNofInflightBytesLimit);
-    return value;
+    return mooncake::Environ::Get().GetNofInflightBytesLimit();
 }
 
 static int GetSpdkNofWorkerCount() {
-    static const int value = GetPositiveEnvOrDefault(
-        "MC_NOF_WORKERS", mooncake::kDefaultSpdkNofWorkers);
-    return value;
+    return mooncake::Environ::Get().GetNofWorkers();
 }
 
 static int CountSpdkNofQueuedTasks(const mooncake::SpdkNofTask* head) {
@@ -949,8 +897,9 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
     // When not set, auto-detect based on transport type:
     //   - TCP-only environment: enable memcpy (avoids TCP loopback overhead)
     //   - RDMA/other transports: disable memcpy (RDMA is more efficient)
-    const char* env_value = std::getenv("MC_STORE_MEMCPY");
-    if (env_value == nullptr) {
+    const auto& env = Environ::Get();
+    std::string env_value = env.GetStoreMemcpy();
+    if (!env.IsStoreMemcpySet()) {
         memcpy_enabled_ = engine_.isTcpOnly();
         LOG(INFO) << "MC_STORE_MEMCPY not set, auto-detected: "
                   << (memcpy_enabled_ ? "TCP-only environment, memcpy enabled"

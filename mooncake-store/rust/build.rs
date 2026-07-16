@@ -266,6 +266,8 @@ fn main() {
             build_dir.join("mooncake-transfer-engine/src"),
             build_dir.join("mooncake-transfer-engine/src/common/base"),
             build_dir.join("mooncake-asio"),
+            build_dir.join("mooncake-common"),
+            build_dir.join("mooncake-common/src"),
             build_dir.join("mooncake-common/etcd"),
         ] {
             push_existing_dir(&mut search_dirs, dir);
@@ -281,6 +283,7 @@ fn main() {
         default_build_dir.join("mooncake-transfer-engine/src/common/base"),
         default_build_dir.join("mooncake-asio"),
         default_build_dir.join("mooncake-common"),
+        default_build_dir.join("mooncake-common/src"),
         default_build_dir.join("mooncake-common/etcd"),
         PathBuf::from("/usr/local/lib"),
         PathBuf::from("/usr/lib/x86_64-linux-gnu"),
@@ -338,6 +341,7 @@ fn main() {
         "mooncake_store",
         "cachelib_memory_allocator",
         "transfer_engine",
+        "mooncake_common",
         "base",
         "asio",
         "stdc++",

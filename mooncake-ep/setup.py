@@ -5,10 +5,12 @@ from setuptools import setup
 import torch
 
 use_musa = os.getenv("MOONCAKE_EP_USE_MUSA", "").upper() in {"1", "ON", "TRUE", "YES"}
-use_maca = (
-    os.getenv("MOONCAKE_EP_USE_MACA", "").upper() in {"1", "ON", "TRUE", "YES"}
-    or (hasattr(torch.version, "maca") and torch.version.maca is not None)
-)
+use_maca = os.getenv("MOONCAKE_EP_USE_MACA", "").upper() in {
+    "1",
+    "ON",
+    "TRUE",
+    "YES",
+} or (hasattr(torch.version, "maca") and torch.version.maca is not None)
 if use_musa:
     try:
         import torchada  # noqa: F401
@@ -58,6 +60,7 @@ cuda_library_dirs = []
 include_dirs = [
     os.path.join(current_dir, "include"),
     os.path.join(current_dir, "../mooncake-transfer-engine/include"),
+    os.path.join(current_dir, "../mooncake-common/include"),
 ]
 
 if use_musa:

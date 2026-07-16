@@ -1,4 +1,5 @@
 #include "shm_helper.h"
+#include "environ.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -37,8 +38,7 @@ ShmHelper* ShmHelper::getInstance() {
 }
 
 ShmHelper::ShmHelper() {
-    const char* hp = std::getenv("MC_STORE_USE_HUGEPAGE");
-    use_hugepage_ = (hp != nullptr);
+    use_hugepage_ = Environ::Get().GetStoreUseHugepageEnabled();
 }
 
 ShmHelper::~ShmHelper() { cleanup(); }

@@ -12,6 +12,8 @@
 #include <unordered_map>
 #include <ylt/easylog.hpp>
 
+#include "environ.h"
+
 namespace mooncake {
 class DefaultConfig {
    public:
@@ -150,13 +152,12 @@ class DefaultConfig {
 
 // usage: export MC_YLT_LOG_LEVEL=info or export MC_YLT_LOG_LEVEL=debug etc.
 inline void init_ylt_log_level() {
-    const char* env_level = std::getenv("MC_YLT_LOG_LEVEL");
-    if (!env_level || !*env_level) {
+    std::string level_str = Environ::Get().GetYltLogLevel();
+    if (level_str.empty()) {
         // default is WARN
         easylog::set_min_severity(easylog::Severity::WARN);
         return;
     }
-    std::string level_str(env_level);
     std::transform(level_str.begin(), level_str.end(), level_str.begin(),
                    [](unsigned char c) { return std::tolower(c); });
     easylog::Severity severity;

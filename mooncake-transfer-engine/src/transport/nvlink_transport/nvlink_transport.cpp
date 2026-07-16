@@ -29,6 +29,7 @@
 #include "common.h"
 #include "common/serialization.h"
 #include "config.h"
+#include "environ.h"
 #include "transfer_engine.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
@@ -315,7 +316,7 @@ static int getNumDevices() {
 }
 
 static bool supportFabricMem() {
-    if (getenv("MC_USE_NVLINK_IPC")) return false;
+    if (!Environ::Get().GetNvlinkFabricMemEnabled()) return false;
 
     int num_devices = 0;
     cudaError_t err = cudaGetDeviceCount(&num_devices);

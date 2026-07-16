@@ -23,6 +23,7 @@
 #include "replica_selection.h"
 #include "common.h"
 #include "config.h"
+#include "environ.h"
 #include "mutex.h"
 #include "types.h"
 #include "utils.h"
@@ -561,8 +562,7 @@ void ResourceTracker::startSignalThread() {
 RealClient::RealClient() {
     // Initialize logging severity (leave as before)
     mooncake::init_ylt_log_level();
-    const char *hp = std::getenv("MC_STORE_USE_HUGEPAGE");
-    use_hugepage_ = (hp != nullptr);
+    use_hugepage_ = Environ::Get().GetStoreUseHugepageEnabled();
 }
 
 RealClient::~RealClient() {
@@ -750,11 +750,11 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     // mapped_shms.
     if (protocol == "cxl") {
         size_t cxl_dev_size = 0;
-        const char *env = std::getenv("MC_CXL_DEV_SIZE");
-        if (env) {
+        std::string env = Environ::Get().GetCxlDevSize();
+        if (!env.empty()) {
             char *end = nullptr;
-            unsigned long long val = strtoull(env, &end, 10);
-            if (end != env && *end == '\0')
+            unsigned long long val = strtoull(env.c_str(), &end, 10);
+            if (end != env.c_str() && *end == '\0')
                 cxl_dev_size = static_cast<size_t>(val);
         } else {
             LOG(FATAL) << "MC_CXL_DEV_SIZE not set";
@@ -5711,8 +5711,7 @@ RealClient::batch_get_into_offload_object_internal(
 
 ClientRequester::ClientRequester() {
     coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config pool_conf{};
-    const char *value = std::getenv("MC_RPC_PROTOCOL");
-    if (value && std::string_view(value) == "rdma") {
+    if (Environ::Get().GetRpcProtocol() == "rdma") {
         pool_conf.client_config.socket_config =
             coro_io::ib_socket_t::config_t{};
     }

@@ -7,6 +7,8 @@
 #include <cstdlib>
 #include <thread>
 
+#include "environ.h"
+
 namespace mooncake {
 
 namespace {
@@ -19,8 +21,8 @@ std::string toLower(const std::string& str) {
 }
 
 bool parseMetricsEnabled() {
-    const char* metric_env = std::getenv("MC_STORE_CLIENT_METRIC");
-    if (!metric_env) {
+    std::string metric_env = Environ::Get().GetStoreClientMetric();
+    if (metric_env.empty()) {
         return true;
     }
     std::string value = toLower(metric_env);
@@ -28,49 +30,16 @@ bool parseMetricsEnabled() {
             value == "on" || value == "enable");
 }
 
-bool parseBoolEnv(const char* env_name, bool default_value) {
-    const char* env_value = std::getenv(env_name);
-    if (!env_value) {
-        return default_value;
-    }
-
-    std::string value = toLower(env_value);
-    if (value == "1" || value == "true" || value == "yes" || value == "on" ||
-        value == "enable") {
-        return true;
-    }
-    if (value == "0" || value == "false" || value == "no" || value == "off" ||
-        value == "disable") {
-        return false;
-    }
-
-    LOG(WARNING) << "Failed to parse " << env_name << ": " << env_value
-                 << ", fallback to default=" << default_value;
-    return default_value;
-}
-
 uint64_t parseMetricsInterval() {
-    const char* interval_env = std::getenv("MC_STORE_CLIENT_METRIC_INTERVAL");
-    if (!interval_env) {
-        // Default to disabled
-        return 0;
+    int interval = Environ::Get().GetStoreClientMetricInterval();
+    if (interval == 0) {
+        LOG(INFO) << "Client metrics reporting disabled (interval=0) via "
+                     "MC_STORE_CLIENT_METRIC_INTERVAL";
+    } else if (interval > 0) {
+        LOG(INFO) << "Client metrics interval set to " << interval
+                  << "s via MC_STORE_CLIENT_METRIC_INTERVAL";
     }
-
-    try {
-        uint64_t interval = std::stoull(interval_env);
-        if (interval == 0) {
-            LOG(INFO) << "Client metrics reporting disabled (interval=0) via "
-                         "MC_STORE_CLIENT_METRIC_INTERVAL";
-        } else {
-            LOG(INFO) << "Client metrics interval set to " << interval
-                      << "s via MC_STORE_CLIENT_METRIC_INTERVAL";
-        }
-        return interval;
-    } catch (const std::exception& e) {
-        LOG(WARNING) << "Failed to parse MC_STORE_CLIENT_METRIC_INTERVAL: "
-                     << interval_env << ", disabling metrics reporting";
-        return 0;
-    }
+    return interval >= 0 ? static_cast<uint64_t>(interval) : 0;
 }
 
 }  // anonymous namespace
@@ -109,7 +78,7 @@ std::unique_ptr<ClientMetric> ClientMetric::Create(
 
     uint64_t interval = parseMetricsInterval();
     bool bandwidth_reporting_enabled =
-        parseBoolEnv("MC_STORE_CLIENT_METRIC_BANDWIDTH", true);
+        Environ::Get().GetStoreClientMetricBandwidth();
 
     LOG(INFO) << "Client metrics enabled (default enabled)";
     LOG(INFO) << "Client bandwidth summary "

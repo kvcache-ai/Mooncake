@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "tent/runtime/transfer_engine_impl.h"
+#include "environ.h"
 #include "tent/transport/shm/shm_transport.h"
 #include "tent/transport/tcp/tcp_transport.h"
 
@@ -69,7 +70,7 @@ Status TransferEngineImpl::loadTransports() {
 #endif
 
 #ifdef USE_CUDA
-    bool enable_mnnvl = getenv("MC_ENABLE_MNNVL") != nullptr;
+    bool enable_mnnvl = Environ::Get().GetEnableMnnvl();
     if (enable_mnnvl) {
         if (conf_->get("transports/mnnvl/enable", true))
             transport_list_[MNNVL] = std::make_shared<MnnvlTransport>();

@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <memory>
 #include "connection_poller.h"
+#include "environ.h"
 #include "memory_location.h"
 #include "mooncake_worker.cuh"
 #include "pg_utils.h"
@@ -19,7 +20,7 @@ namespace {
 
 #ifdef USE_MACA
 static void requireMacaHostTransport() {
-    TORCH_CHECK(std::getenv("MC_MACA_HOST_TRANSPORT") != nullptr,
+    TORCH_CHECK(Environ::Get().GetMacaHostTransport(),
                 "MACA PG requires MC_MACA_HOST_TRANSPORT=1 so the transfer "
                 "engine uses a host transport.");
 }

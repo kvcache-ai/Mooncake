@@ -17,23 +17,20 @@
 
 #include "common.h"
 #include "common/serialization.h"
+#include "environ.h"
 
 namespace {
 
 static std::string TangRtSharedObjectPath(const char* soname) {
-    const char* lib_dir = std::getenv("MC_TANGRT_LIB_DIR");
-    if (lib_dir && lib_dir[0]) {
-        std::string d(lib_dir);
+    const auto& env = mooncake::Environ::Get();
+    std::string d = env.GetTangrtLibDir();
+    if (!d.empty()) {
         while (!d.empty() && d.back() == '/') d.pop_back();
         return d + "/" + soname;
     }
-    const char* root = std::getenv("MC_TANGRT_ROOT");
-    std::string r = (root && root[0]) ? std::string(root)
-                                      : std::string("/usr/local/tangrt");
+    std::string r = env.GetTangrtRoot();
     while (!r.empty() && r.back() == '/') r.pop_back();
-    const char* arch = std::getenv("MC_TANGRT_LIB_ARCH");
-    std::string arch_dir =
-        (arch && arch[0]) ? std::string(arch) : std::string("linux-x86_64");
+    std::string arch_dir = env.GetTangrtLibArch();
     std::string arch_path = r + "/lib/" + arch_dir + "/" + soname;
     if (access(arch_path.c_str(), R_OK) == 0) return arch_path;
     return r + "/lib/" + soname;

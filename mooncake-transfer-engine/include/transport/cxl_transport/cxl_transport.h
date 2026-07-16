@@ -85,9 +85,9 @@ class CxlTransport : public Transport {
     bool validateMemoryBounds(void *dest, void *src, size_t size);
 
    private:
-    void *cxl_base_addr;
-    size_t cxl_dev_size;
-    char *cxl_dev_path;
+    void *cxl_base_addr = nullptr;
+    size_t cxl_dev_size = 0;
+    std::string cxl_dev_path;
 };
 }  // namespace mooncake
 

@@ -11,6 +11,8 @@
 #include <limits>
 #include <ylt/util/tl/expected.hpp>
 
+#include "environ.h"
+
 #include "rpc_types.h"
 #include "types.h"
 
@@ -329,15 +331,15 @@ inline size_t align_up(size_t size, size_t alignment) {
  */
 [[nodiscard]] inline size_t get_hugepage_size_from_env(
     unsigned int* out_flags = nullptr, bool use_memfd = false) {
-    const char* use_hp_env = std::getenv("MC_STORE_USE_HUGEPAGE");
-    if (use_hp_env == nullptr) {
+    const auto& env = Environ::Get();
+    if (!env.GetStoreUseHugepageEnabled()) {
         return 0;
     }
 
     size_t size = SZ_2MB;  // Default to 2MB
 
-    const char* size_env = std::getenv("MC_STORE_HUGEPAGE_SIZE");
-    if (size_env != nullptr) {
+    std::string size_env = env.GetStoreHugepageSize();
+    if (!size_env.empty()) {
         size_t parsed_size = string_to_byte_size(size_env);
 
         if (parsed_size == SZ_2MB || parsed_size == SZ_1GB) {
@@ -517,8 +519,8 @@ int64_t time_gen();
 // Helper: Get integer from environment variable, fallback to default
 template <typename T>
 T GetEnvOr(const char* name, T default_value) {
-    const char* env_val = std::getenv(name);
-    if (!env_val || std::string(env_val).empty()) {
+    std::string env_val = Environ::GetString(name, "");
+    if (env_val.empty()) {
         return default_value;
     }
     try {

@@ -38,6 +38,7 @@
 #include <thread>
 
 #include "error.h"
+#include "environ.h"
 
 #if defined(__x86_64__)
 #include <immintrin.h>
@@ -414,24 +415,16 @@ constexpr size_t kMaxHandshakeMaxLength = 128ULL << 20;    // 128MB
 
 // Load handshake max length from environment variable.
 static inline size_t loadHandshakeMaxLength() {
-    const char *env = std::getenv("MC_HANDSHAKE_MAX_LENGTH");
-    if (env != nullptr) {
-        std::string_view env_sv(env);
-        size_t val = 0;
-        auto [ptr, ec] =
-            std::from_chars(env_sv.data(), env_sv.data() + env_sv.size(), val);
-        if (ec == std::errc() && ptr == env_sv.data() + env_sv.size() &&
-            val >= kDefaultHandshakeMaxLength &&
-            val <= kMaxHandshakeMaxLength) {
-            LOG(INFO) << "MC_HANDSHAKE_MAX_LENGTH set to " << val << " bytes ("
-                      << (val >> 20) << " MB)";
-            return val;
-        }
-        LOG(WARNING) << "Invalid MC_HANDSHAKE_MAX_LENGTH value: " << env
-                     << ", valid range: " << kDefaultHandshakeMaxLength
-                     << " to " << kMaxHandshakeMaxLength << ", using default "
-                     << (kDefaultHandshakeMaxLength >> 20) << "MB";
+    size_t val = static_cast<size_t>(Environ::Get().GetHandshakeMaxLength());
+    if (val >= kDefaultHandshakeMaxLength && val <= kMaxHandshakeMaxLength) {
+        LOG(INFO) << "MC_HANDSHAKE_MAX_LENGTH set to " << val << " bytes ("
+                  << (val >> 20) << " MB)";
+        return val;
     }
+    LOG(WARNING) << "Invalid MC_HANDSHAKE_MAX_LENGTH value: " << val
+                 << ", valid range: " << kDefaultHandshakeMaxLength << " to "
+                 << kMaxHandshakeMaxLength << ", using default "
+                 << (kDefaultHandshakeMaxLength >> 20) << "MB";
     return kDefaultHandshakeMaxLength;
 }
 
