@@ -12,6 +12,7 @@
 #include "types.h"
 #include "rpc_types.h"
 #include "master_config.h"
+#include "kv_event/kv_event_publisher.h"
 #include "segment.h"
 
 namespace mooncake {
@@ -64,6 +65,15 @@ class WrappedMasterService {
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& keys,
                         const std::string& tenant_id = "default");
+
+    // Read-only admin variants: no lease grants, no promotion, no metric
+    // updates.
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
+                                const std::string& tenant_id = "default");
+
+    tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaListForAdmin(
+        const std::string& key, const std::string& tenant_id = "default");
 
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStart(
         const UUID& client_id, const std::string& key,
@@ -289,6 +299,9 @@ class WrappedMasterService {
     std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplica(
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::string& tenant_id, ReplicaType replica_type);
+
+    bool KvEventsEnabled() const;
+    KvEventPublisher::Stats GetKvEventStats() const;
 
    private:
     MasterService master_service_;

@@ -14,6 +14,7 @@
 #include "types.h"
 #include "memory_alloc.h"
 #include "ssd_register_client.h"
+#include "device/accelerator_registry.h"
 
 #include <cstdlib>  // for atexit
 #include <memory>
@@ -181,7 +182,14 @@ pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *usr_buffer,
         exported_data = new char[total_length];
         if (!exported_data) return pybind11::none();
 
-        memcpy(exported_data, buffer_handle->ptr(), total_length);
+        if (!mooncake::device::GetAcceleratorRegistry()
+                 .RuntimeAccelerators()
+                 .CopyToHost(exported_data, buffer_handle->ptr(),
+                             total_length)) {
+            LOG(ERROR) << "Failed to copy buffer to host memory";
+            delete[] exported_data;
+            return pybind11::none();
+        }
     } else {
         exported_data = usr_buffer;
         if (data_length < 0) {
@@ -478,6 +486,20 @@ class MooncakeStorePyWrapper {
             }
 
             py::gil_scoped_acquire acquire_gil;
+            auto runtime_accelerator =
+                mooncake::device::GetAcceleratorRegistry()
+                    .RuntimeAccelerators();
+            if (runtime_accelerator.FindDeviceForPointer(
+                    buffer_handle->ptr())) {
+                std::string host_buf(buffer_handle->size(), '\0');
+                if (!runtime_accelerator.CopyToHost(host_buf.data(),
+                                                    buffer_handle->ptr(),
+                                                    buffer_handle->size())) {
+                    LOG(ERROR) << "Failed to copy buffer to host memory";
+                    return pybind11::none();
+                }
+                return pybind11::bytes(host_buf);
+            }
             return pybind11::bytes((char *)buffer_handle->ptr(),
                                    buffer_handle->size());
         }
@@ -504,10 +526,28 @@ class MooncakeStorePyWrapper {
             std::vector<pybind11::bytes> results;
             results.reserve(batch_data.size());
 
+            auto runtime_accelerator =
+                mooncake::device::GetAcceleratorRegistry()
+                    .RuntimeAccelerators();
+
             for (const auto &data : batch_data) {
-                results.emplace_back(
-                    data ? pybind11::bytes((char *)data->ptr(), data->size())
-                         : kNullString);
+                if (!data) {
+                    results.emplace_back(kNullString);
+                    continue;
+                }
+                if (runtime_accelerator.FindDeviceForPointer(data->ptr())) {
+                    std::string host_buf(data->size(), '\0');
+                    if (!runtime_accelerator.CopyToHost(
+                            host_buf.data(), data->ptr(), data->size())) {
+                        LOG(ERROR) << "Failed to copy buffer to host memory";
+                        results.emplace_back(kNullString);
+                        continue;
+                    }
+                    results.emplace_back(pybind11::bytes(host_buf));
+                } else {
+                    results.emplace_back(
+                        pybind11::bytes((char *)data->ptr(), data->size()));
+                }
             }
             return results;
         }
@@ -2077,7 +2117,9 @@ PYBIND11_MODULE(store, m) {
                const py::object &engine = py::none(),
                bool enable_ssd_offload = false,
                const std::string &ssd_offload_path = "",
-               const std::string &tenant_id = "default") {
+               const std::string &tenant_id = "default",
+               bool enable_client_http_server = false,
+               int client_http_port = DEFAULT_CLIENT_HTTP_PORT) {
                 auto real_client = self.init_real_client();
                 std::shared_ptr<mooncake::TransferEngine> transfer_engine =
                     nullptr;
@@ -2089,14 +2131,17 @@ PYBIND11_MODULE(store, m) {
                     local_hostname, metadata_server, global_segment_size,
                     local_buffer_size, protocol, rdma_devices,
                     master_server_addr, transfer_engine, "", enable_ssd_offload,
-                    ssd_offload_path, tenant_id);
+                    ssd_offload_path, tenant_id, enable_client_http_server,
+                    client_http_port);
             },
             py::arg("local_hostname"), py::arg("metadata_server"),
             py::arg("global_segment_size"), py::arg("local_buffer_size"),
             py::arg("protocol"), py::arg("rdma_devices"),
             py::arg("master_server_addr"), py::arg("engine") = py::none(),
             py::arg("enable_ssd_offload") = false,
-            py::arg("ssd_offload_path") = "", py::arg("tenant_id") = "default")
+            py::arg("ssd_offload_path") = "", py::arg("tenant_id") = "default",
+            py::arg("enable_client_http_server") = false,
+            py::arg("client_http_port") = DEFAULT_CLIENT_HTTP_PORT)
         .def(
             "setup",
             [](MooncakeStorePyWrapper &self, const py::dict &config_dict) {
@@ -2127,7 +2172,11 @@ PYBIND11_MODULE(store, m) {
             "  ipc_socket_path: IPC socket path.\n"
             "  enable_ssd_offload: Enable SSD offload (default false).\n"
             "  ssd_offload_path: SSD storage directory path (overrides env "
-            "var).")
+            "var).\n"
+            "  tenant_id: Tenant identifier (default 'default').\n"
+            "  enable_client_http_server: Enable client HTTP endpoints "
+            "(default false).\n"
+            "  client_http_port: Client HTTP metrics port (default 9300).")
         .def(
             "setup_dummy",
             [](MooncakeStorePyWrapper &self, size_t mem_pool_size,

@@ -14,6 +14,7 @@
 
 #include "transfer_engine_c.h"
 
+#include <cstdio>
 #include <cstdint>
 #include <memory>
 
@@ -249,4 +250,19 @@ int freeBatchID(transfer_engine_t engine, batch_id_t batch_id) {
 int syncSegmentCache(transfer_engine_t engine) {
     TransferEngine *native = (TransferEngine *)engine;
     return native->syncSegmentCache();
+}
+
+void enableGracefulShutdown(transfer_engine_t engine) {
+    TransferEngine *native = (TransferEngine *)engine;
+    native->enableGracefulShutdown();
+}
+
+int showLinks(transfer_engine_t engine, char *buf_out, size_t buf_len,
+              int json) {
+    if (!engine || !buf_out || buf_len == 0) return -1;
+
+    TransferEngine *native = (TransferEngine *)engine;
+    auto result = native->showLinks(json != 0);
+    snprintf(buf_out, buf_len, "%s", result.c_str());
+    return 0;
 }

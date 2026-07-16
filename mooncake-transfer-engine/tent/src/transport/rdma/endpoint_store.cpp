@@ -89,7 +89,7 @@ int FIFOEndpointStore::remove(RdmaEndPoint* ep) {
          ++iter) {
         if (iter->second.get() == ep) {
             waiting_list_.insert(iter->second);
-            iter->second->beginDestroyNoLock();
+            iter->second->beginDestroy();
             auto fifo_iter = fifo_map_[iter->first];
             fifo_list_.erase(fifo_iter);
             fifo_map_.erase(iter->first);
@@ -130,16 +130,43 @@ void FIFOEndpointStore::reclaim() {
 
 size_t FIFOEndpointStore::size() { return endpoint_map_.size(); }
 
-void FIFOEndpointStore::clear() {
-    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
-    std::vector<std::string> to_delete;
-    for (auto& entry : endpoint_map_) to_delete.push_back(entry.first);
-    for (auto& key : to_delete) {
-        endpoint_map_.erase(key);
-        auto fifo_iter = fifo_map_[key];
-        fifo_list_.erase(fifo_iter);
-        fifo_map_.erase(key);
+int FIFOEndpointStore::clear() {
+    // clear() is used by RdmaContext::disable() immediately before CQs, PD and
+    // the verbs context are destroyed. Merely erasing endpoint_map_ is unsafe:
+    // an endpoint retained by an external shared_ptr could otherwise run its
+    // destructor later and access an already-destroyed RdmaContext.
+    std::vector<std::shared_ptr<RdmaEndPoint>> endpoints;
+    {
+        RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+        // Detach both published and already-retiring endpoints atomically.
+        // After this point no lookup can acquire one of these endpoints.
+        endpoints.reserve(endpoint_map_.size() + waiting_list_.size());
+        for (auto& entry : endpoint_map_) endpoints.push_back(entry.second);
+        for (auto& endpoint : waiting_list_) endpoints.push_back(endpoint);
+        endpoint_map_.clear();
+        waiting_list_.clear();
+        fifo_list_.clear();
+        fifo_map_.clear();
     }
+    // Do not call endpoint methods while holding endpoint_map_lock_: endpoint
+    // destruction also unregisters its notification QP and takes endpoint
+    // locks. Keeping verbs teardown outside the Store lock both shortens the
+    // critical section and avoids introducing a Store/Endpoint lock cycle.
+    //
+    // Context shutdown has already stopped workers, so the normal two-phase
+    // waiting-list path cannot drain CQ flush completions. Force synchronous
+    // deconstruction here, before RdmaContext destroys its CQs and PD.
+    // deconstruct() is idempotent, so external shared_ptr owners may release
+    // the already-deconstructed endpoint later without touching verbs again.
+    std::vector<std::shared_ptr<RdmaEndPoint>> failed;
+    for (auto& endpoint : endpoints) {
+        if (endpoint->deconstruct()) failed.push_back(endpoint);
+    }
+    if (failed.empty()) return 0;
+
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    waiting_list_.insert(failed.begin(), failed.end());
+    return -1;
 }
 
 std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::get(const std::string& key) {
@@ -191,13 +218,11 @@ std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::getOrInsert(
         }
     }
     endpoint = std::make_shared<RdmaEndPoint>();
-    int ret = endpoint->construct(&context_, &context_.params().endpoint, key,
-                                  &endpoints_count_);
+    int ret = endpoint->construct(&context_, &context_.params().endpoint, key);
     if (ret) {
         LOG(ERROR) << "Failed to construct endpoint for key " << key;
         return nullptr;
     }
-    endpoints_count_.fetch_add(1, std::memory_order_relaxed);
     while (this->size() >= max_size_) evictOne();
     endpoint_map_[key] = std::make_pair(endpoint, false);
     fifo_list_.push_front(key);
@@ -213,7 +238,7 @@ int SIEVEEndpointStore::remove(RdmaEndPoint* ep) {
         if (iter->second.first.get() == ep) {
             waiting_list_len_++;
             waiting_list_.insert(iter->second.first);
-            iter->second.first->beginDestroyNoLock();
+            iter->second.first->beginDestroy();
             auto fifo_iter = fifo_map_[iter->first];
             if (hand_.has_value() && hand_.value() == fifo_iter) {
                 fifo_iter == fifo_list_.begin() ? hand_ = std::nullopt
@@ -276,30 +301,43 @@ void SIEVEEndpointStore::reclaim() {
 
 size_t SIEVEEndpointStore::size() { return endpoint_map_.size(); }
 
-void SIEVEEndpointStore::clear() {
-    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
-    std::vector<std::string> to_delete;
-    for (auto& entry : endpoint_map_) to_delete.push_back(entry.first);
-    for (auto& key : to_delete) {
-        endpoint_map_.erase(key);
-        auto fifo_iter = fifo_map_[key];
-        if (hand_.has_value() && hand_.value() == fifo_iter) {
-            fifo_iter == fifo_list_.begin() ? hand_ = std::nullopt
-                                            : hand_ = std::prev(fifo_iter);
-        }
-        fifo_list_.erase(fifo_iter);
-        fifo_map_.erase(key);
+int SIEVEEndpointStore::clear() {
+    // Terminal shutdown semantics are intentionally different from normal
+    // SIEVE eviction: remove()/evictOne() retire endpoints asynchronously,
+    // while clear() must release all verbs objects before their parent
+    // RdmaContext tears down CQs, PD and the device context.
+    std::vector<std::shared_ptr<RdmaEndPoint>> endpoints;
+    {
+        RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+        // Take a strong-reference snapshot and make the Store empty in one
+        // critical section. This prevents concurrent lookup from observing a
+        // partially-cleared cache or returning an endpoint being destroyed.
+        endpoints.reserve(endpoint_map_.size() + waiting_list_.size());
+        for (auto& entry : endpoint_map_)
+            endpoints.push_back(entry.second.first);
+        for (auto& endpoint : waiting_list_) endpoints.push_back(endpoint);
+        endpoint_map_.clear();
+        waiting_list_.clear();
+        waiting_list_len_.store(0, std::memory_order_relaxed);
+        fifo_list_.clear();
+        fifo_map_.clear();
+        hand_ = std::nullopt;
     }
+    // Run verbs operations outside endpoint_map_lock_. Workers are already
+    // stopped, so waiting for asynchronous CQ-driven reclaim is impossible;
+    // synchronously deconstruct each endpoint instead. The operation is
+    // idempotent, allowing outstanding external shared_ptr references to die
+    // safely after the Store and Context have gone away.
+    std::vector<std::shared_ptr<RdmaEndPoint>> failed;
+    for (auto& endpoint : endpoints) {
+        if (endpoint->deconstruct()) failed.push_back(endpoint);
+    }
+    if (failed.empty()) return 0;
 
-    const int max_retries = 5000;
-    int retries = 0;
-    while (endpoints_count_.load(std::memory_order_relaxed) > 0) {
-        if (++retries > max_retries) {
-            LOG(ERROR) << "Some endpoints not cleared after 5 seconds";
-            break;
-        }
-        usleep(1000);
-    }
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    waiting_list_.insert(failed.begin(), failed.end());
+    waiting_list_len_.store(waiting_list_.size(), std::memory_order_relaxed);
+    return -1;
 }
 }  // namespace tent
 }  // namespace mooncake

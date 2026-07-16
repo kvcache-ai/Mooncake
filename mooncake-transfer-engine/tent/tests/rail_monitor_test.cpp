@@ -58,6 +58,115 @@ static std::shared_ptr<Topology> makeSingleNicTopology(const std::string& nic,
     return topo;
 }
 
+static std::shared_ptr<Topology> makeTwoNicTopology(const std::string& first,
+                                                    const std::string& second) {
+    auto json_str = R"({
+        "nics": [
+            {"name": ")" +
+                    first + R"(", "type": 0, "numa_node": 0},
+            {"name": ")" +
+                    second + R"(", "type": 0, "numa_node": 0}
+        ],
+        "mems": [{
+            "name": "host0",
+            "type": 0,
+            "numa_node": 0,
+            "device_list": {"rank0": [0, 1]}
+        }]
+    })";
+    auto topo = std::make_shared<Topology>();
+    auto status = topo->parse(json_str);
+    if (!status.ok()) {
+        ADD_FAILURE() << "Topology::parse failed: " << status.ToString();
+    }
+    return topo;
+}
+
+TEST(RailMonitorConfigTest, CustomJsonOverridesAutomaticPeerMapping) {
+    auto local = makeTwoNicTopology("local0", "local1");
+    auto remote = makeTwoNicTopology("remote0", "remote1");
+    const std::string rail_json = R"({
+        "all": [
+            {"local": "local0", "remote": "remote1"},
+            {"local": "local1", "remote": "remote0"}
+        ],
+        "direct": [
+            {"local": "local0", "remote": "remote1"},
+            {"local": "local1", "remote": "remote0"}
+        ]
+    })";
+
+    RailMonitor rail;
+    ASSERT_TRUE(rail.load(local.get(), remote.get(), rail_json, nullptr).ok());
+    EXPECT_EQ(rail.findBestRemoteDevice(/*local_nic=*/0, /*remote_numa=*/0), 1);
+    EXPECT_EQ(rail.findBestRemoteDevice(/*local_nic=*/1, /*remote_numa=*/0), 0);
+    EXPECT_TRUE(rail.available(/*local_nic=*/0, /*remote_nic=*/1));
+    EXPECT_FALSE(rail.available(/*local_nic=*/0, /*remote_nic=*/0));
+}
+
+// Build a 2-NIC topology (mlx5_a, mlx5_b) with per-NIC NUMA nodes, so the two
+// sides can disagree on which NUMA a same-named NIC sits in — the asymmetric
+// (overlay) situation from #2467.
+static std::shared_ptr<Topology> makeNamedNumaTopology(const std::string& n0,
+                                                       int numa0,
+                                                       const std::string& n1,
+                                                       int numa1) {
+    auto json_str =
+        R"({
+        "nics": [
+            {"name": ")" +
+        n0 + R"(", "type": 0, "numa_node": )" + std::to_string(numa0) + R"(},
+            {"name": ")" +
+        n1 + R"(", "type": 0, "numa_node": )" + std::to_string(numa1) + R"(}
+        ],
+        "mems": [{
+            "name": "host0",
+            "type": 0,
+            "numa_node": 0,
+            "device_list": {"rank0": [0, 1]}
+        }]
+    })";
+    auto topo = std::make_shared<Topology>();
+    auto status = topo->parse(json_str);
+    if (!status.ok()) {
+        ADD_FAILURE() << "Topology::parse failed: " << status.ToString();
+    }
+    return topo;
+}
+
+// ---------------------------------------------------------------------------
+// Cross-NUMA mapping must prefer a same-name remote device over a positional
+// (i % remote_cnt) pick, so a local NIC is not routed to an unrelated remote
+// NIC on a different physical/overlay network (issues #2758/#2467).
+//
+// Setup (asymmetric NUMA, as in #2467's overlay case):
+//   local : mlx5_x @ NUMA 0 (idx0), mlx5_y @ NUMA 1 (idx1)
+//   remote: mlx5_y @ NUMA 0 (idx0), mlx5_x @ NUMA 1 (idx1)
+// Local mlx5_y sits in NUMA 1; its same-name remote mlx5_y sits in NUMA 0.
+// Querying local mlx5_y (idx1) for the remote NUMA-0 domain is cross-NUMA and
+// must pick the same-name remote mlx5_y (remote idx0). The positional bug would
+// instead pick remote_devices[NUMA0][i]. With only one device in that domain
+// they coincide, so we make the discriminating assertion below.
+// ---------------------------------------------------------------------------
+
+TEST(RailMonitorCrossNumaTest, CrossNumaPrefersSameNameDevice) {
+    // local NUMA-1 domain has one NIC: mlx5_y (idx1).
+    auto local = makeNamedNumaTopology("mlx5_x", 0, "mlx5_y", 1);
+    // remote NUMA-0 domain: mlx5_y (idx0); remote NUMA-1 domain: mlx5_x (idx1).
+    auto remote = makeNamedNumaTopology("mlx5_y", 0, "mlx5_x", 1);
+    RailMonitor rail;
+    ASSERT_TRUE(rail.load(local.get(), remote.get()).ok());
+    ASSERT_TRUE(rail.ready());
+
+    // local mlx5_y (idx1, NUMA 1) reaching the remote NUMA-0 domain: the only
+    // same-name device is remote mlx5_y at idx0. Must map there.
+    EXPECT_EQ(rail.findBestRemoteDevice(/*local_nic=*/1, /*remote_numa=*/0), 0);
+
+    // local mlx5_x (idx0, NUMA 0) reaching remote NUMA-1 domain: same-name
+    // remote mlx5_x is at idx1. Must map there, not positionally to idx0.
+    EXPECT_EQ(rail.findBestRemoteDevice(/*local_nic=*/0, /*remote_numa=*/1), 1);
+}
+
 // ---------------------------------------------------------------------------
 // markRecovered resets error_count so failures start accumulating fresh
 // ---------------------------------------------------------------------------

@@ -33,7 +33,8 @@
 #include "transfer_metadata.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
-#if defined(USE_CUDA) || defined(USE_MUSA)
+#if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
+    !defined(USE_CXI)
 #include "transport/device/device_transport.h"
 #endif
 #ifdef WITH_METRICS
@@ -42,6 +43,8 @@
 #endif
 
 namespace mooncake {
+class TransferEngineImplTestPeer;
+
 using TransferRequest = Transport::TransferRequest;
 using TransferStatus = Transport::TransferStatus;
 using TransferStatusEnum = Transport::TransferStatusEnum;
@@ -55,6 +58,8 @@ using RegisteredBuffer = TransferEngine::RegisteredBuffer;
 #endif
 
 class TransferEngineImpl {
+    friend class TransferEngineImplTestPeer;
+
    public:
     TransferEngineImpl(bool auto_discover = false)
         : metadata_(nullptr),
@@ -341,10 +346,12 @@ class TransferEngineImpl {
     }
 
     Transport* getTransport(const std::string& proto) {
+        if (!multi_transports_) return nullptr;
         return multi_transports_->getTransport(proto);
     }
 
-#if defined(USE_CUDA) || defined(USE_MUSA)
+#if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
+    !defined(USE_CXI)
     // Device transport accessors — lazily created, owned by this impl.
     device::P2pTransport* getOrCreateP2pTransport(int num_ranks);
     device::RdmaTransport* getOrCreateRdmaTransport(
@@ -398,12 +405,16 @@ class TransferEngineImpl {
 
     using MemoryRegionMap = std::map<uintptr_t, MemoryRegion>;
 
-    MemoryRegionMap::iterator findMemoryRegionContaining(uintptr_t addr);
-
-    MemoryRegionMap::const_iterator findMemoryRegionContaining(
-        uintptr_t addr) const;
-
     bool hasOverlapLocked(uintptr_t addr, uint64_t length) const;
+
+    bool hasOverlapInMapLocked(const MemoryRegionMap& regions, uintptr_t addr,
+                               uint64_t length) const;
+
+    bool tryReserveMemoryRegions(const std::vector<MemoryRegion>& regions);
+
+    void commitMemoryRegions(const std::vector<MemoryRegion>& regions);
+
+    void releaseMemoryRegions(const std::vector<MemoryRegion>& regions);
 
     void insertMemoryRegionLocked(const MemoryRegion& region);
 
@@ -414,6 +425,7 @@ class TransferEngineImpl {
     std::shared_ptr<MultiTransport> multi_transports_;
     std::shared_mutex mutex_;
     MemoryRegionMap local_memory_regions_;
+    MemoryRegionMap registering_memory_regions_;
     std::shared_ptr<Topology> local_topology_;
 
     RWSpinlock send_notifies_lock_;
@@ -427,7 +439,8 @@ class TransferEngineImpl {
     std::vector<std::string> filter_;
     bool use_barex_ = false;
 
-#if defined(USE_CUDA) || defined(USE_MUSA)
+#if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
+    !defined(USE_CXI)
     // Device transports (P2P + IBGDA) — lazily created, owned by this impl.
     // Referenced by EP and future CPU-proxy paths.
     std::unique_ptr<device::P2pTransport> p2p_transport_;

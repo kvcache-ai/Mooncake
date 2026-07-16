@@ -2,9 +2,9 @@
 
 ## Overview
 
-Mooncake Store supports offloading KV cache objects from distributed memory to local SSD. When memory pressure is high, the master instructs clients to persist selected objects to disk. On a cache miss, the client automatically falls back to reading from SSD.
+Mooncake Store supports offloading KV cache objects from distributed memory to a local filesystem path, typically backed by local SSDs. When memory pressure is high, the master instructs clients to persist selected objects to disk. On a cache miss, the client automatically falls back to reading from the local filesystem-backed offload path.
 
-For measured TTFT and throughput impact in multi-turn workloads, see [Mooncake SSD Offload Benchmark](../performance/ssd-offload-benchmark-results.md).
+For measured TTFT and throughput impact in multi-turn workloads, see [Mooncake SSD Offload Benchmark](../performance/mooncake/ssd-offload-benchmark-results.md).
 
 SSD offload requires the **Real Client** and supports two deployment modes:
 
@@ -12,6 +12,8 @@ SSD offload requires the **Real Client** and supports two deployment modes:
 - **Mode B: Standalone Real Client + DummyClient** — a standalone `mooncake_client` process runs SSD offload, and the Python process connects via a DummyClient.
 
 In both modes, all SSD reads and writes happen within the Real Client (embedded or standalone).
+
+SSD offload does not use the master's `--root_fs_dir` option. Configure the local disk path on each Real Client with `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`; the master tracks offloaded objects as `LOCAL_DISK` replicas. `--root_fs_dir` is a legacy parameter from an older persistence path and may cause issues when used with `--enable_offload=true`.
 
 ## Startup Steps
 
@@ -91,7 +93,7 @@ store.setup_dummy(
 |------|---------|-------------|
 | `--metadata_server` | `http://127.0.0.1:8080/metadata` | Metadata server connection string |
 | `--master_server_address` | `127.0.0.1:50051` | Master address |
-| `--host` | `0.0.0.0` | This machine's externally reachable IP |
+| `--host` | `0.0.0.0` | This machine's externally reachable IP. Accepts `ip:port` to specify the data plane port for TransferEngine |
 | `--port` | `50052` | Real client RPC listening port |
 | `--device_names` | ` ` | NIC name(s), e.g. `eth0` or `mlx5_0` |
 | `--protocol` | `tcp` | Transport protocol: `tcp` or `rdma` |
@@ -138,6 +140,11 @@ Start with `--enable_offload=true` for eager SSD persistence. Add `--offload_on_
 | `MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS` | `1` | Interval for reclaiming expired offload buffers; defaults to the heartbeat interval in the current implementation |
 | `MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS` | `5000` | Lease time for buffers returned by `batch_get_offload_object` before GC reclaims them |
 | `MOONCAKE_OFFLOAD_USE_URING` | `false` | Enable io_uring for async file I/O |
+| `MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION` | `true` | Enable proactive local-disk eviction from the FileStorage heartbeat |
+| `MOONCAKE_OFFLOAD_DISK_EVICTION_HIGH_WATERMARK_RATIO` | `0.90` | Trigger proactive disk eviction when backend usage exceeds this ratio of its quota |
+| `MOONCAKE_OFFLOAD_DISK_EVICTION_LOW_WATERMARK_RATIO` | `0.80` | Target backend usage ratio for proactive disk eviction |
+
+The `MOONCAKE_OFFLOAD_*` watermark names are preferred. Short aliases `MOONCAKE_DISK_EVICTION_HIGH_WATERMARK_RATIO` and `MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO` are also accepted. The high watermark must be greater than the low watermark.
 
 ### Bucket backend settings
 
@@ -157,7 +164,7 @@ Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=file_per_key_storage_b
 | Environment Variable | Default | Description |
 |---|---|---|
 | `MOONCAKE_OFFLOAD_FSDIR` | `file_per_key_dir` | Subdirectory name created under `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` |
-| `MOONCAKE_OFFLOAD_ENABLE_EVICTION` | `true` | Enables local-storage eviction logic for this backend. Legacy `ENABLE_EVICTION` is also accepted |
+| `MOONCAKE_OFFLOAD_ENABLE_EVICTION` | `true` | Enables local-storage eviction logic for this backend. Short alias: `ENABLE_EVICTION` |
 
 ---
 
@@ -185,7 +192,7 @@ Stores each object in an individual file. Simple and easy to inspect, but genera
 | Environment Variable | Default | Description |
 |---|---|---|
 | `MOONCAKE_OFFLOAD_FSDIR` | `file_per_key_dir` | Subdirectory name under `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` where objects are stored |
-| `MOONCAKE_OFFLOAD_ENABLE_EVICTION` | `true` | Enable disk eviction when the total size exceeds the quota |
+| `MOONCAKE_OFFLOAD_ENABLE_EVICTION` | `true` | Enable disk eviction for this backend. Short alias: `ENABLE_EVICTION` |
 
 Best for: debugging or small-scale deployments.
 
@@ -201,7 +208,9 @@ Best for: high-concurrency scenarios with many small objects where restart durab
 
 ---
 
-## Eviction (Bucket Backend Only)
+## Eviction
+
+### Write-time eviction
 
 When `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` is set, the backend automatically evicts buckets before writing new ones if total disk usage would exceed the limit.
 
@@ -212,6 +221,20 @@ When `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` is set, the backend automatically 
 | `lru` | Evict the least recently read bucket first |
 
 Eviction is two-phase: the bucket is removed from metadata and master is notified first, then in-flight reads are drained before files are deleted.
+
+### Proactive watermark eviction
+
+When `MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION=true`, the FileStorage heartbeat asks the backend to check local-disk usage every `MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS` seconds. If usage exceeds `MOONCAKE_OFFLOAD_DISK_EVICTION_HIGH_WATERMARK_RATIO`, the backend evicts toward `MOONCAKE_OFFLOAD_DISK_EVICTION_LOW_WATERMARK_RATIO`.
+
+| Backend | Behavior |
+|---------|----------|
+| `bucket_storage_backend` | Reuses `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY`; set it to `fifo` or `lru` because the default policy `none` makes watermark eviction a no-op |
+| `file_per_key_storage_backend` | Requires `MOONCAKE_OFFLOAD_ENABLE_EVICTION=true`; reuses the FIFO file eviction queue and recovered keys from startup metadata scan |
+| `offset_allocator_storage_backend` | No-op in this version |
+
+The watermark ratios apply to each backend's quota. For `bucket_storage_backend`, the quota is `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE`; when that value is `0`, the backend defaults it to 90% of the physical disk capacity. For `file_per_key_storage_backend`, the underlying file backend uses its storage quota, which defaults to 90% of the physical disk capacity in SSD offload mode.
+
+For watermark eviction, the real client notifies the master before deleting local files. If the notification fails, the selected files remain tracked locally and are retried by a later heartbeat.
 
 ---
 

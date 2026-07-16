@@ -1,4 +1,4 @@
-#include "client_buffer.hpp"
+#include "client_buffer.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -9,6 +9,10 @@
 #include <unistd.h>    // For ftruncate, close, shm_unlink
 
 #include "utils.h"
+
+#if defined(USE_SUNRISE)
+#include "sunrise_allocator.h"
+#endif
 
 namespace mooncake {
 
@@ -43,8 +47,15 @@ ClientBufferAllocator::ClientBufferAllocator(size_t size,
     if (use_hugepage_) {
         buffer_ = allocate_buffer_mmap_memory(size, alignment);
     } else {
-        buffer_ = allocate_buffer_allocator_memory(size, protocol, alignment,
-                                                   use_spdk_dma_);
+#if defined(USE_SUNRISE)
+        if (protocol == "sunrise_link") {
+            buffer_ = sunrise_allocate_memory(size, alignment, false);
+        } else
+#endif
+        {
+            buffer_ = allocate_buffer_allocator_memory(
+                size, protocol, alignment, use_spdk_dma_);
+        }
     }
     if (!buffer_) {
         throw std::bad_alloc();
@@ -69,7 +80,7 @@ ClientBufferAllocator::~ClientBufferAllocator() {
         if (use_hugepage_) {
             free_buffer_mmap_memory(buffer_, buffer_size_);
         } else {
-            free_memory(protocol, buffer_);
+            free_memory(protocol, buffer_, use_spdk_dma_);
         }
     }
 }

@@ -315,6 +315,91 @@ TEST_F(PromotionOnHitTest, BatchGetReplicaListPromotesLocalDiskOnlyObject) {
     service->RemoveAll();
 }
 
+// The read-only admin batch query must NOT trigger promotion-on-hit, even for a
+// LOCAL_DISK-only key. Contrast with BatchGetReplicaListPromotesLocalDiskOnly
+// Object above, where the client-facing BatchGetReplicaList admits the key for
+// promotion.
+TEST_F(PromotionOnHitTest,
+       BatchGetReplicaListForAdminDoesNotPromoteLocalDiskOnlyObject) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.promotion_max_per_heartbeat = 2;
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx = PrepareSegment(*service, "test_segment_admin",
+                              kDefaultSegmentBase, seg_size);
+
+    const std::string key = "k_batch_admin_no_promote";
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, ctx.client_id, key, 1024,
+                                       ctx.segment_name));
+
+    auto& mm = MasterMetricManager::instance();
+    const int64_t admitted_pre = mm.get_promotion_admitted();
+    const int64_t in_flight_pre = mm.get_promotion_in_flight();
+
+    auto result = service->BatchGetReplicaListForAdmin(
+        std::vector<std::string>{key}, "default");
+    ASSERT_EQ(result.size(), 1u);
+    ASSERT_TRUE(result[0].has_value());
+    ASSERT_EQ(result[0]->replicas.size(), 1u);
+    EXPECT_TRUE(result[0]->replicas[0].is_local_disk_replica());
+
+    // No promotion admitted or enqueued by the read-only admin path.
+    EXPECT_EQ(mm.get_promotion_admitted() - admitted_pre, 0);
+    EXPECT_EQ(mm.get_promotion_in_flight() - in_flight_pre, 0);
+    auto pending = service->PromotionObjectHeartbeat(ctx.client_id);
+    ASSERT_TRUE(pending.has_value());
+    EXPECT_EQ(pending->size(), 0u);
+    EXPECT_EQ(CountPromotionTask(*pending, key), 0u);
+
+    service->RemoveAll();
+}
+
+// The read-only admin batch query must NOT update the store-observed cache-hit
+// counters. Contrast with the client-facing BatchGetReplicaList, which bumps
+// the memory-cache-hit counter for a MEMORY replica.
+TEST_F(PromotionOnHitTest,
+       BatchGetReplicaListForAdminDoesNotUpdateCacheHitMetrics) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx = PrepareSegment(*service, "metrics_segment", kDefaultSegmentBase,
+                              seg_size);
+
+    const std::string key = "k_admin_no_metric";
+    PutObject(*service, ctx.client_id, key, 1024);
+
+    using CacheHitStat = MasterMetricManager::CacheHitStat;
+    auto mem_hits = []() {
+        auto stats = MasterMetricManager::instance().calculate_cache_stats();
+        return stats[CacheHitStat::MEMORY_HITS];
+    };
+
+    const double before_admin = mem_hits();
+
+    // Read-only admin query must leave the memory-cache-hit counter untouched.
+    auto admin_result = service->BatchGetReplicaListForAdmin(
+        std::vector<std::string>{key}, "default");
+    ASSERT_EQ(admin_result.size(), 1u);
+    ASSERT_TRUE(admin_result[0].has_value());
+    EXPECT_EQ(mem_hits(), before_admin);
+
+    // The client-facing path does bump it, proving the assertion above is
+    // meaningful rather than a counter that never moves.
+    (void)service->BatchGetReplicaList(std::vector<std::string>{key},
+                                       "default");
+    EXPECT_GT(mem_hits(), before_admin);
+
+    service->RemoveAll();
+}
+
 // PromotionObjectHeartbeat returns an empty task list when called against a
 // client that has no LocalDiskSegment registered.
 TEST_F(PromotionOnHitTest, HeartbeatReturnsErrorForUnknownClient) {

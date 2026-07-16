@@ -782,6 +782,8 @@ inline std::shared_ptr<AllocationStrategy> CreateAllocationStrategy(
             return std::make_shared<CxlAllocationStrategy>();
         case AllocationStrategyType::SSD_FREE_RATIO_FIRST:
             return std::make_shared<SsdFreeRatioFirstAllocationStrategy>();
+        case AllocationStrategyType::LOCAL_FIRST:
+            return std::make_shared<RandomAllocationStrategy>();
         default:
             return std::make_shared<RandomAllocationStrategy>();
     }

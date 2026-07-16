@@ -83,14 +83,14 @@ inline bool IsValidClusterIdComponent(const std::string& cluster_id) {
     return true;
 }
 static constexpr uint64_t DEFAULT_DEFAULT_KV_LEASE_TTL =
-    5000;  // in milliseconds
+    10000;  // in milliseconds
 static constexpr uint64_t DEFAULT_KV_SOFT_PIN_TTL_MS =
     30 * 60 * 1000;  // 30 minutes
 static constexpr bool DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS = true;
 static constexpr double DEFAULT_EVICTION_RATIO = 0.05;
-static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.95;
+static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
 static constexpr double DEFAULT_NOF_EVICTION_RATIO = 0.05;
-static constexpr double DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO = 0.95;
+static constexpr double DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
 static constexpr int64_t DEFAULT_MASTER_VIEW_LEASE_TTL_SEC = 5;  // in seconds
 static constexpr int64_t DEFAULT_CLIENT_LIVE_TTL_SEC = 10;       // in seconds
 static constexpr int64_t DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC = 10;
@@ -216,13 +216,19 @@ constexpr const char* CONFIG_KEY_RDMA_DEVICES = "rdma_devices";
 constexpr const char* CONFIG_KEY_MASTER_SERVER_ADDR = "master_server_addr";
 constexpr const char* CONFIG_KEY_IPC_SOCKET_PATH = "ipc_socket_path";
 constexpr const char* CONFIG_KEY_TENANT_ID = "tenant_id";
+constexpr const char* CONFIG_KEY_ENABLE_CLIENT_HTTP_SERVER =
+    "enable_client_http_server";
+constexpr const char* CONFIG_KEY_CLIENT_HTTP_PORT = "client_http_port";
 
 // Store client configuration defaults
 static constexpr size_t DEFAULT_GLOBAL_SEGMENT_SIZE = 1024 * 1024 * 16;  // 16MB
 static constexpr size_t DEFAULT_LOCAL_BUFFER_SIZE = 1024 * 1024 * 16;    // 16MB
 constexpr const char* DEFAULT_PROTOCOL = "tcp";
 constexpr const char* DEFAULT_MASTER_SERVER_ADDR = "127.0.0.1:50051";
+static constexpr int DEFAULT_CLIENT_HTTP_PORT = 9300;
 
+// Original: returns a new string (copies when tenant_id is non-empty).
+// Kept for backward compatibility with callers that need an owned string.
 inline std::string NormalizeTenantId(const std::string& tenant_id) {
     return tenant_id.empty() ? "default" : tenant_id;
 }
@@ -239,9 +245,25 @@ inline bool IsValidTenantId(const std::string& tenant_id) {
     return true;
 }
 
+// Zero-copy variant: returns a const reference that is valid as long as
+// the input `tenant_id` is alive. When the input is empty, returns a
+// reference to a static "default" string. Use this in hot-path callers
+// (getMetadataShardIndex, getTenantQuotaShardIndex, MakeObjectIdentity, …)
+// to eliminate the string copy that NormalizeTenantId() would otherwise
+// perform on every invocation.
+//
+// WARNING: The returned reference must not outlive the input tenant_id.
+// Passing a temporary string (e.g., NormalizeTenantIdRef(get_temp_str()))
+// creates a dangling reference when the temporary is destroyed at the
+// semicolon. Callers that need an owned string should use NormalizeTenantId().
+inline const std::string& NormalizeTenantIdRef(const std::string& tenant_id) {
+    static const std::string kDefaultTenant = "default";
+    return tenant_id.empty() ? kDefaultTenant : tenant_id;
+}
+
 inline std::string MakeTenantScopedStorageKey(const std::string& tenant_id,
                                               const std::string& key) {
-    const auto normalized_tenant = NormalizeTenantId(tenant_id);
+    const auto& normalized_tenant = NormalizeTenantIdRef(tenant_id);
     std::string scoped_key;
     scoped_key.reserve(normalized_tenant.size() + key.size() + 1);
     scoped_key.append(normalized_tenant);
@@ -468,9 +490,10 @@ struct Segment {
     // TE p2p endpoint (ip:port) for transport-only addressing
     std::string te_endpoint{};
     std::string protocol;
+    std::string host_id{};
     Segment() = default;
 };
-YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol);
+YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol, host_id);
 
 /**
  * @brief Allocation strategy type for segment allocation
@@ -480,6 +503,7 @@ enum class AllocationStrategyType {
     FREE_RATIO_FIRST,      // Free-ratio-first allocation
     CXL,                   // CXL-specific allocation
     SSD_FREE_RATIO_FIRST,  // SSD free-ratio-first allocation
+    LOCAL_FIRST            // Prefer local host before ordered remote fallback
 };
 
 /**
