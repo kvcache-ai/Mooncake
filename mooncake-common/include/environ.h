@@ -46,7 +46,10 @@ class Environ {
     std::string GetLogDir() const { return log_dir_; }
     std::string GetRedisUsername() const { return redis_username_; }
     std::string GetRedisPassword() const { return redis_password_; }
-    int GetRedisDbIndex() const { return redis_db_index_; }
+    int GetRedisDbIndex() const;
+    std::string GetRedisDbIndexRaw() const {
+        return GetString("MC_REDIS_DB_INDEX", "");
+    }
     int GetFragmentRatio() const { return fragment_ratio_; }
     bool GetEnableDestDeviceAffinity() const {
         return enable_dest_device_affinity_;
@@ -221,12 +224,17 @@ class Environ {
     }
     std::string GetTentConf() const { return tent_conf_; }
     int GetTransferTimeout() const { return transfer_timeout_; }
-    bool GetUseHipIpc() const { return use_hip_ipc_; }
-    bool GetUseNvlinkIpc() const { return use_nvlink_ipc_; }
+    bool GetUseHipIpc() const { return GetBool("MC_USE_HIP_IPC", true); }
+    bool GetUseNvlinkIpc() const { return GetBool("MC_USE_NVLINK_IPC", false); }
     // Returns true only when MC_USE_NVLINK_IPC is explicitly set to "0",
     // which opts in to fabric-memory mode on MNNVL clusters.
     bool GetNvlinkFabricMemEnabled() const {
-        return use_nvlink_ipc_raw_ == "0";
+        return GetString("MC_USE_NVLINK_IPC", "") == "0";
+    }
+    // HIP fabric memory follows the legacy transport matrix: either explicitly
+    // disable HIP IPC, or explicitly opt into NVLink fabric memory with "0".
+    bool GetHipFabricMemEnabled() const {
+        return !GetUseHipIpc() || GetNvlinkFabricMemEnabled();
     }
     bool GetUseTent() const { return use_tent_; }
     bool GetUseTev1() const { return use_tev1_; }
@@ -338,7 +346,6 @@ class Environ {
     std::string log_dir_;
     std::string redis_username_;
     std::string redis_password_;
-    int redis_db_index_;
     int fragment_ratio_;
     bool enable_dest_device_affinity_;
     bool use_ipv6_;
@@ -379,9 +386,6 @@ class Environ {
     int te_metric_interval_seconds_;
     std::string tent_conf_;
     int transfer_timeout_;
-    bool use_hip_ipc_;
-    bool use_nvlink_ipc_;
-    std::string use_nvlink_ipc_raw_;
     bool use_tent_;
     bool use_tev1_;
     std::string ylt_log_level_;

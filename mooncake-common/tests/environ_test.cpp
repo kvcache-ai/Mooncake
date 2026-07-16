@@ -36,6 +36,7 @@ class EnvironTest : public ::testing::Test {
         unsetenv("MC_PKEY_INDEX");
         unsetenv("MC_IB_SL");
         unsetenv("MC_MS_FILTERS");
+        unsetenv("MC_REDIS_DB_INDEX");
         unsetenv("MC_RPC_TIMEOUT_MS");
         unsetenv("MC_STORE_CLIENT_METRIC");
         unsetenv("MC_STORE_CLIENT_METRIC_INTERVAL");
@@ -44,6 +45,8 @@ class EnvironTest : public ::testing::Test {
         unsetenv("MC_TE_FILTERS");
         unsetenv("MC_TCP_PROTO");
         unsetenv("MC_TPU_PJRT_LIB");
+        unsetenv("MC_USE_HIP_IPC");
+        unsetenv("MC_USE_NVLINK_IPC");
         unsetenv("MC_USE_UBSHMEM_IPC");
         unsetenv("MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP");
         // Make sure AWS vars don't leak in from the test runner's env.
@@ -268,6 +271,60 @@ TEST_F(EnvironTest, GetStringEmpty) {
 TEST_F(EnvironTest, GetStringWithSpaces) {
     setenv("MC_TEST_STRING", "hello world", 1);
     EXPECT_EQ(Environ::GetString("MC_TEST_STRING", ""), "hello world");
+}
+
+TEST_F(EnvironTest, RedisDbIndexIsDynamicAndStrictlyValidated) {
+    const auto& env = Environ::Get();
+
+    EXPECT_EQ(env.GetRedisDbIndex(), 0);
+
+    setenv("MC_REDIS_DB_INDEX", "42", 1);
+    EXPECT_EQ(env.GetRedisDbIndexRaw(), "42");
+    EXPECT_EQ(env.GetRedisDbIndex(), 42);
+
+    for (const char* invalid : {"-1", "256", "abc", "12junk", " 12"}) {
+        SCOPED_TRACE(invalid);
+        setenv("MC_REDIS_DB_INDEX", invalid, 1);
+        EXPECT_EQ(env.GetRedisDbIndexRaw(), invalid);
+        EXPECT_EQ(env.GetRedisDbIndex(), -1);
+    }
+
+    unsetenv("MC_REDIS_DB_INDEX");
+    EXPECT_EQ(env.GetRedisDbIndex(), 0);
+}
+
+TEST_F(EnvironTest, FabricMemoryEnvironmentMatrix) {
+    struct TestCase {
+        const char* hip_ipc;
+        const char* nvlink_ipc;
+        bool hip_fabric;
+        bool nvlink_fabric;
+    };
+    constexpr TestCase cases[] = {
+        {nullptr, nullptr, false, false}, {"0", nullptr, true, false},
+        {nullptr, "0", true, true},       {"0", "0", true, true},
+        {"1", "1", false, false},         {"false", nullptr, true, false},
+        {nullptr, "false", false, false},
+    };
+
+    const auto& env = Environ::Get();
+    for (const auto& test_case : cases) {
+        if (test_case.hip_ipc)
+            setenv("MC_USE_HIP_IPC", test_case.hip_ipc, 1);
+        else
+            unsetenv("MC_USE_HIP_IPC");
+        if (test_case.nvlink_ipc)
+            setenv("MC_USE_NVLINK_IPC", test_case.nvlink_ipc, 1);
+        else
+            unsetenv("MC_USE_NVLINK_IPC");
+
+        SCOPED_TRACE(std::string("hip=") +
+                     (test_case.hip_ipc ? test_case.hip_ipc : "<unset>") +
+                     ", nvlink=" +
+                     (test_case.nvlink_ipc ? test_case.nvlink_ipc : "<unset>"));
+        EXPECT_EQ(env.GetHipFabricMemEnabled(), test_case.hip_fabric);
+        EXPECT_EQ(env.GetNvlinkFabricMemEnabled(), test_case.nvlink_fabric);
+    }
 }
 
 TEST_F(EnvironTest, DynamicGettersObserveRuntimeUpdates) {

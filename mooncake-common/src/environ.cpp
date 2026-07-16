@@ -4,6 +4,7 @@
 #include <cstring>
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <iostream>
 
 namespace mooncake {
@@ -97,6 +98,24 @@ std::string Environ::GetString(const char* name,
 
 bool Environ::IsSet(const char* name) { return std::getenv(name) != nullptr; }
 
+int Environ::GetRedisDbIndex() const {
+    const std::string raw = GetRedisDbIndexRaw();
+    if (raw.empty()) return 0;
+
+    int result = 0;
+    const char* begin = raw.data();
+    const char* end = begin + raw.size();
+    const auto [ptr, error] = std::from_chars(begin, end, result);
+    if (error != std::errc{} || ptr != end || result < 0 || result > 255) {
+        std::cerr << "[Mooncake] Warning: invalid value '" << raw
+                  << "' for env MC_REDIS_DB_INDEX, expected an integer in "
+                     "[0, 255]"
+                  << std::endl;
+        return -1;
+    }
+    return result;
+}
+
 Environ::Environ() {
     num_cq_per_ctx_ = GetInt("MC_NUM_CQ_PER_CTX", 1);
     num_comp_channels_per_ctx_ = GetInt("MC_NUM_COMP_CHANNELS_PER_CTX", 1);
@@ -125,7 +144,6 @@ Environ::Environ() {
     log_dir_ = GetString("MC_LOG_DIR", "");
     redis_username_ = GetString("MC_REDIS_USERNAME", "");
     redis_password_ = GetString("MC_REDIS_PASSWORD", "");
-    redis_db_index_ = GetInt("MC_REDIS_DB_INDEX", 0);
     fragment_ratio_ = GetInt("MC_FRAGMENT_RATIO", 4);
     enable_dest_device_affinity_ =
         GetBool("MC_ENABLE_DEST_DEVICE_AFFINITY", false);
@@ -168,9 +186,6 @@ Environ::Environ() {
     te_metric_interval_seconds_ = GetInt("MC_TE_METRIC_INTERVAL_SECONDS", 0);
     tent_conf_ = GetString("MC_TENT_CONF", "");
     transfer_timeout_ = GetInt("MC_TRANSFER_TIMEOUT", 0);
-    use_hip_ipc_ = GetBool("MC_USE_HIP_IPC", true);
-    use_nvlink_ipc_ = GetBool("MC_USE_NVLINK_IPC", false);
-    use_nvlink_ipc_raw_ = GetString("MC_USE_NVLINK_IPC", "");
     use_tent_ = GetBool("MC_USE_TENT", false);
     use_tev1_ = GetBool("MC_USE_TEV1", false);
     ylt_log_level_ = GetString("MC_YLT_LOG_LEVEL", "");

@@ -1,6 +1,8 @@
 #include "ha/common/redis/redis_connection.h"
 #include "environ.h"
 
+#include <glog/logging.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -75,9 +77,13 @@ tl::expected<int, ErrorCode> ParsePositiveInt(std::string_view text,
 }
 
 tl::expected<int, ErrorCode> ResolveRedisDbIndex() {
-    int db_index = Environ::Get().GetRedisDbIndex();
-    if (db_index < 0 || db_index > 255)
+    const auto& env = Environ::Get();
+    int db_index = env.GetRedisDbIndex();
+    if (db_index < 0 || db_index > 255) {
+        LOG(ERROR) << "Invalid MC_REDIS_DB_INDEX='" << env.GetRedisDbIndexRaw()
+                   << "': expected an integer in [0, 255]";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     return db_index;
 }
 
