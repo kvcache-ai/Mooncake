@@ -52,11 +52,12 @@ TEST(ConnectPauseTracker, PausedUntilExpiry) {
     auto clk = std::make_shared<FakeClock>();
     auto t = makeTracker(clk);
     const std::string peer = "10.0.0.1:1234";
-    t.pause(peer, 1000);            // paused until ts == 1000
-    EXPECT_TRUE(t.isPaused(peer));  // now == 0
-    clk->now = 999;
+    clk->now = 500;
+    t.pauseFor(peer, 1000);         // paused until ts == 1500
+    EXPECT_TRUE(t.isPaused(peer));  // now == 500
+    clk->now = 1499;
     EXPECT_TRUE(t.isPaused(peer));   // just before expiry
-    clk->now = 1000;                 // at expiry (>= until)
+    clk->now = 1500;                 // at expiry (>= until)
     EXPECT_FALSE(t.isPaused(peer));  // expired
     EXPECT_EQ(t.size(), 0u);         // and lazily deleted on the failing check
 }
@@ -65,7 +66,7 @@ TEST(ConnectPauseTracker, RepeatedChecksDoNotExtendHardDeadline) {
     auto clk = std::make_shared<FakeClock>();
     auto t = makeTracker(clk);
     const std::string peer = "10.0.0.1:1234";
-    t.pause(peer, 1000);
+    t.pauseFor(peer, 1000);
 
     // Simulate continuous traffic checking the pause. Lookups are not actual
     // connection failures, so they must not refresh the deadline.
@@ -82,9 +83,9 @@ TEST(ConnectPauseTracker, RefreshExtendsWindow) {
     auto clk = std::make_shared<FakeClock>();
     auto t = makeTracker(clk);
     const std::string peer = "p";
-    t.pause(peer, 100);
+    t.pauseFor(peer, 100);
     clk->now = 50;
-    t.pause(peer, 200);  // re-arm while still paused -> extend
+    t.pauseFor(peer, 150);  // re-arm while still paused -> extend to ts == 200
     clk->now = 150;
     EXPECT_TRUE(t.isPaused(peer));  // within the extended window
     clk->now = 200;
@@ -94,8 +95,8 @@ TEST(ConnectPauseTracker, RefreshExtendsWindow) {
 TEST(ConnectPauseTracker, PruneDropsOnlyExpired) {
     auto clk = std::make_shared<FakeClock>();
     auto t = makeTracker(clk);
-    t.pause("a", 100);
-    t.pause("b", 300);
+    t.pauseFor("a", 100);
+    t.pauseFor("b", 300);
     EXPECT_EQ(t.size(), 2u);
     clk->now = 200;  // "a" expired, "b" still paused
     t.prune();
@@ -107,8 +108,8 @@ TEST(ConnectPauseTracker, PruneDropsOnlyExpired) {
 TEST(ConnectPauseTracker, PerPeerIndependent) {
     auto clk = std::make_shared<FakeClock>();
     auto t = makeTracker(clk);
-    t.pause("a", 100);
-    t.pause("b", 1000);
+    t.pauseFor("a", 100);
+    t.pauseFor("b", 1000);
     clk->now = 150;
     EXPECT_FALSE(t.isPaused("a"));  // a's window lapsed
     EXPECT_TRUE(t.isPaused("b"));   // b's has not
@@ -126,7 +127,7 @@ TEST(ConnectPauseTracker, ConcurrentAccessIsRaceFree) {
     for (int i = 0; i < 4; ++i)
         threads.emplace_back([&t, i] {
             std::string s = "peer" + std::to_string(i % 3);
-            for (int k = 0; k < kIters; ++k) t.pause(s, kFarFuture);
+            for (int k = 0; k < kIters; ++k) t.pauseFor(s, kFarFuture);
         });
     for (int i = 0; i < 4; ++i)
         threads.emplace_back([&t] {

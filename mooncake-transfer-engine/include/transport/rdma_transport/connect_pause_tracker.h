@@ -1,4 +1,4 @@
-// Copyright 2024 KVCache.AI
+// Copyright 2026 KVCache.AI
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -35,11 +35,12 @@ class ConnectPauseTracker {
 
     explicit ConnectPauseTracker(Clock clock) : clock_(std::move(clock)) {}
 
-    // Arm/refresh the pause for `server` until the absolute timestamp
-    // `until_ns`.
-    void pause(const std::string &server, uint64_t until_ns) {
+    // Arm/refresh the pause for `server` for `duration_ns`. The deadline is
+    // derived from the injected clock so production and tests use one time
+    // source.
+    void pauseFor(const std::string &server, uint64_t duration_ns) {
         std::lock_guard<std::mutex> lock(mu_);
-        until_ns_[server] = until_ns;
+        until_ns_[server] = clock_() + duration_ns;
     }
 
     // Whether `server` is currently paused. Expired entries are deleted on

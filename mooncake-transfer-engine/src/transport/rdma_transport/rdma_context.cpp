@@ -671,9 +671,8 @@ void RdmaContext::pauseConnect(const std::string &peer_nic_path) {
     if (ttl_ms <= 0) return;  // disabled
     auto server_name = getServerNameFromNicPath(peer_nic_path);
     if (server_name.empty()) return;
-    uint64_t until =
-        getCurrentTimeInNano() + static_cast<uint64_t>(ttl_ms) * 1000000ull;
-    connect_pause_.pause(server_name, until);
+    connect_pause_.pauseFor(server_name,
+                            static_cast<uint64_t>(ttl_ms) * 1000000ull);
 }
 
 bool RdmaContext::isConnectPaused(const std::string &peer_nic_path) {
