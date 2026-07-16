@@ -105,9 +105,11 @@ int hybrid_num_channels_per_sm(int hidden, int elem_size, int num_sf_packs,
             "Elastic hybrid kernel requires shared memory for at least four "
             "channels per SM");
     }
-    // JIT is not available yet; select the largest compiled variant that does
-    // not exceed DeepEP's shared-memory-derived channel count.
-    return num_channels_per_sm >= 8 ? 8 : 4;
+    // JIT is not available yet; select the exact compiled variant for the
+    // channel counts exercised by the supported static shapes.
+    if (num_channels_per_sm >= 8) return 8;
+    if (num_channels_per_sm >= 7) return 7;
+    return 4;
 }
 
 }  // namespace
