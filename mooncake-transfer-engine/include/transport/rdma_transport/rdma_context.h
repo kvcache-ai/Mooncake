@@ -67,8 +67,17 @@ enum class GidRefreshResult {
 
 struct RdmaCq {
     RdmaCq() : native(nullptr), outstanding(0) {}
+    RdmaCq(const RdmaCq &) = delete;
+    RdmaCq &operator=(const RdmaCq &) = delete;
+    RdmaCq(RdmaCq &&other) noexcept
+        : native(other.native),
+          outstanding(other.outstanding.load(std::memory_order_relaxed)) {
+        other.native = nullptr;
+    }
+    RdmaCq &operator=(RdmaCq &&) = delete;
+
     ibv_cq *native;
-    volatile int outstanding;
+    std::atomic<int> outstanding;
 };
 
 struct MemoryRegionMeta {
@@ -76,6 +85,19 @@ struct MemoryRegionMeta {
     // track it ourselves.
     void *addr;
     struct ibv_mr *mr;
+};
+
+// A dma_buf handle exported once for a buffer and shared across every NIC's
+// registration of that buffer. Exporting a single fd (instead of one per NIC)
+// collapses the per-NIC dma_buf objects into one kernel object, so the GPU
+// driver reserves a single BAR1 window for the buffer rather than one window
+// per NIC. Host memory (and the nvidia-peermem path) yields kHostReg with no
+// fd, taking the plain ibv_reg_mr path.
+struct DmabufExport {
+    enum class Method { kHostReg, kDmabufReg };
+    Method method = Method::kHostReg;
+    int fd = -1;          // live dma_buf fd; -1 when not applicable
+    uint64_t offset = 0;  // offset of addr within the exported allocation
 };
 
 // RdmaContext represents the set of resources controlled by each local NIC,
@@ -99,6 +121,26 @@ class RdmaContext {
     // Memory Region Management
     int registerMemoryRegion(void *addr, size_t length, int access);
 
+    // Shared-fd variant: the caller exports a single dma_buf fd for the buffer
+    // via exportDmabuf(), passes the same handle to every NIC's registration,
+    // then closes the fd once via closeDmabufExport() AFTER all registrations
+    // have completed. This keeps one dma_buf object alive across all NICs so
+    // the GPU driver reserves a single BAR1 window for the buffer.
+    int registerMemoryRegion(void *addr, size_t length, int access,
+                             const DmabufExport &exp);
+
+    // Exports a single dma_buf fd for the allocation backing addr. GPU device
+    // memory yields kDmabufReg with a live fd; host memory and the
+    // nvidia-peermem path yield kHostReg with no fd. Any fd placed in out.fd
+    // MUST be closed by the caller (via closeDmabufExport) AFTER every
+    // registerMemoryRegion() call consuming it has returned — each successful
+    // registration takes its own reference, so closing earlier would invalidate
+    // the fd for the remaining NICs.
+    static int exportDmabuf(void *addr, DmabufExport &out);
+
+    // Closes the fd held by a DmabufExport, if any. Idempotent.
+    static void closeDmabufExport(DmabufExport &exp);
+
     int unregisterMemoryRegion(void *addr);
 
     int preTouchMemory(void *addr, size_t length);
@@ -109,6 +151,7 @@ class RdmaContext {
 
    private:
     int registerMemoryRegionInternal(void *addr, size_t length, int access,
+                                     const DmabufExport &exp,
                                      MemoryRegionMeta &mrMeta);
 
     using MemoryRegionMap = std::map<uintptr_t, MemoryRegionMeta>;
@@ -119,9 +162,11 @@ class RdmaContext {
         uintptr_t addr) const;
 
    public:
-    bool active() const { return active_; }
+    bool active() const { return active_.load(std::memory_order_acquire); }
 
-    void set_active(bool flag) { active_ = flag; }
+    void set_active(bool flag) {
+        active_.store(flag, std::memory_order_release);
+    }
 
    public:
     // EndPoint Management
@@ -205,7 +250,7 @@ class RdmaContext {
 
     ibv_cq *cq();
 
-    volatile int *cqOutstandingCount(int cq_index) {
+    std::atomic<int> *cqOutstandingCount(int cq_index) {
         return &cq_list_[cq_index].outstanding;
     }
 
@@ -273,7 +318,7 @@ class RdmaContext {
 
     std::shared_ptr<WorkerPool> worker_pool_;
 
-    volatile bool active_;
+    std::atomic<bool> active_;
 };
 
 }  // namespace mooncake

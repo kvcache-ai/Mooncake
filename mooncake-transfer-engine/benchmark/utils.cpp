@@ -35,6 +35,17 @@ DEFINE_int32(start_num_threads, 1,
              "Start number of concurrent worker threads.");
 DEFINE_int32(max_num_threads, 1,
              "Maximum number of concurrent worker threads.");
+DEFINE_string(
+    qos_classes, "",
+    "QoS classes as name:threads:slo_us:weight[:isolated_gbps],...; "
+    "enables per-class QoS metrics and requires a fixed thread count.");
+DEFINE_string(qos_classes_json, "",
+              "QoS classes as a JSON array of objects with name, threads, "
+              "slo_us, weight, and optional isolated_gbps fields.");
+DEFINE_double(qos_link_capacity_gbps, 0.0,
+              "Link capacity in GB/s for total utilization (0 reports N/A).");
+DEFINE_string(qos_output_jsonl, "",
+              "Append versioned QoS metric records to this JSONL file.");
 DEFINE_uint64(deadline_us, 0,
               "tent only: relative per-transfer deadline in microseconds for "
               "tight worker threads (0 disables deadline tagging).");
@@ -82,6 +93,10 @@ size_t XferBenchConfig::max_batch_size = 0;
 int XferBenchConfig::duration = 0;
 int XferBenchConfig::max_num_threads = 0;
 int XferBenchConfig::start_num_threads = 0;
+std::string XferBenchConfig::qos_classes;
+std::string XferBenchConfig::qos_classes_json;
+double XferBenchConfig::qos_link_capacity_gbps = 0.0;
+std::string XferBenchConfig::qos_output_jsonl;
 uint64_t XferBenchConfig::deadline_us = 0;
 int XferBenchConfig::deadline_tight_threads = 0;
 bool XferBenchConfig::deadline_bw_arbitration = false;
@@ -112,6 +127,10 @@ void XferBenchConfig::loadFromFlags() {
     max_batch_size = FLAGS_max_batch_size;
     start_num_threads = FLAGS_start_num_threads;
     max_num_threads = FLAGS_max_num_threads;
+    qos_classes = FLAGS_qos_classes;
+    qos_classes_json = FLAGS_qos_classes_json;
+    qos_link_capacity_gbps = FLAGS_qos_link_capacity_gbps;
+    qos_output_jsonl = FLAGS_qos_output_jsonl;
     deadline_us = FLAGS_deadline_us;
     deadline_tight_threads = FLAGS_deadline_tight_threads;
     deadline_bw_arbitration = FLAGS_deadline_bw_arbitration;
