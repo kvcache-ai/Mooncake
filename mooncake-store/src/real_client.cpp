@@ -4668,6 +4668,14 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
 
     size_t offload_object_count = 0;
     auto start_read_store_time = std::chrono::steady_clock::now();
+    {
+        std::ostringstream oss;
+        oss << "action=batch_get_into_endpoint_split";
+        for (const auto &oe : offload_objects) {
+            oss << " ep=" << oe.first << " keys=" << oe.second.size();
+        }
+        VLOG(1) << oss.str();
+    }
     for (auto &offload_objects_it : offload_objects) {
         offload_object_count += offload_objects_it.second.size();
         auto batch_get_offload_result = batch_get_into_offload_object_internal(
@@ -4691,10 +4699,14 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         std::chrono::duration_cast<std::chrono::microseconds>(
             end_time - start_read_store_time)
             .count();
-    // LOG(INFO) << "Time taken for batch_get_into: " << elapsed_time
-    //           << "us, read store: " << read_store_time
-    //           << "us, with memory key count: " << valid_operations.size()
-    //           << ", offload key count: " << offload_object_count;
+    VLOG(1) << "action=batch_get_into_summary"
+              << " total_keys=" << num_keys
+              << " memory_keys=" << valid_operations.size()
+              << " local_disk_keys=" << offload_object_count
+              << " disk_keys=" << disk_operations.size()
+              << " endpoints_with_offload=" << offload_objects.size()
+              << " total_us=" << elapsed_time
+              << " store_read_us=" << read_store_time;
 
     return results;
 }

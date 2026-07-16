@@ -1,2 +1,5 @@
 **/.dockerignore
 **/*.Dockerfile
+extern/yalantinglibs
+build/
+dist/

@@ -9,6 +9,7 @@
 #include <cstring>
 
 #include <regex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1405,6 +1406,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchQuery(
 
 tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
     std::unordered_map<std::string, Slice>& batch_object) {
+    auto batch_start = std::chrono::steady_clock::now();
+    int64_t batch_total_bytes = 0;
     // Step 1: Build read plan by copying metadata under lock
     // BucketReadGuard increments inflight_reads_ to prevent deletion during IO.
     // When the guard goes out of scope, it decrements the counter.
@@ -1476,8 +1479,25 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
     // which remain alive until this function returns (~line bucket_guards
     // destructor), keeping inflight_reads_ > 0 throughout the I/O phase.
 
+    VLOG(1) << "action=batchload_start"
+              << " keys=" << batch_object.size()
+              << " buckets=" << bucket_read_plans.size();
+    {
+        std::ostringstream oss;
+        oss << "action=batchload_plan";
+        for (auto& [bid, plans] : bucket_read_plans) {
+            int64_t b_bytes = 0;
+            for (auto& p : plans) b_bytes += p.data_size;
+            batch_total_bytes += b_bytes;
+            oss << " b" << bid << "=" << plans.size() << "/" << b_bytes;
+        }
+        VLOG(1) << oss.str();
+    }
+
     // Step 2: Perform IO without holding any locks
     for (auto& [bucket_id, read_plans] : bucket_read_plans) {
+        auto bucket_io_start = std::chrono::steady_clock::now();
+        int64_t bucket_bytes = 0;
         // Open file for this bucket (cheap syscall, no lock needed)
         auto filepath_res = GetBucketDataPath(bucket_id);
         if (!filepath_res) {
@@ -1494,62 +1514,156 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
         }
         auto& file = file_res.value();
 
-        // Read each key's data
-        for (const auto& plan : read_plans) {
-            int64_t actual_offset = plan.offset + plan.key_size;
-            tl::expected<size_t, ErrorCode> read_res;
+        // ---- Merge optimization: sort by offset, merge adjacent reads ----
+        // Group read_plans whose actual_offset values are within
+        // kMergeGapBytes of each other. Each group is read by a single
+        // pread into a temporary buffer, then scattered to dest slices
+        // via memcpy. This collapses N pread syscalls into 1 for groups
+        // of keys whose data sit close together in the bucket file.
+        constexpr int64_t kMergeGapBytes = 256 * 1024;  // 256 KiB threshold
+
+        // Working copy sorted by actual_offset (offset + key_size)
+        std::vector<ReadPlan*> sorted_plans;
+        sorted_plans.reserve(read_plans.size());
+        for (auto& p : read_plans) sorted_plans.push_back(&p);
+        std::sort(sorted_plans.begin(), sorted_plans.end(),
+                  [](const ReadPlan* a, const ReadPlan* b) {
+                      return (a->offset + a->key_size) <
+                             (b->offset + b->key_size);
+                  });
+
+        size_t merge_group_count = 0;
+        size_t pread_count_after_merge = 0;
+
+        size_t idx = 0;
+        while (idx < sorted_plans.size()) {
+            size_t group_start = idx;
+            int64_t seg_offset =
+                sorted_plans[idx]->offset + sorted_plans[idx]->key_size;
+            int64_t seg_end = seg_offset +
+                              static_cast<int64_t>(sorted_plans[idx]->dest_slice.size);
+            // Greedily extend the group while the next key is within
+            // kMergeGapBytes of the current segment end.
+            while (idx + 1 < sorted_plans.size()) {
+                int64_t next_offset =
+                    sorted_plans[idx + 1]->offset +
+                    sorted_plans[idx + 1]->key_size;
+                if (next_offset - seg_end > kMergeGapBytes) break;
+                seg_end = next_offset +
+                          static_cast<int64_t>(sorted_plans[idx + 1]->dest_slice.size);
+                ++idx;
+            }
+            size_t group_end = idx;
+            size_t group_size = group_end - group_start + 1;
+            ++pread_count_after_merge;
+            if (group_size > 1) ++merge_group_count;
+
+            if (group_size == 1) {
+                // Single key: original single-pread path
+                const auto& plan = *sorted_plans[group_start];
+                int64_t actual_offset = plan.offset + plan.key_size;
+                tl::expected<size_t, ErrorCode> read_res;
 
 #ifdef USE_URING
-            // Try to use read_aligned for O_DIRECT I/O if file is UringFile
-            UringFile* uring_file = dynamic_cast<UringFile*>(file.get());
-            if (uring_file != nullptr) {
-                // Calculate aligned read range
-                int64_t aligned_offset =
-                    align_down(actual_offset, kDirectIOAlignment);
-                int64_t data_end =
-                    actual_offset + static_cast<int64_t>(plan.dest_slice.size);
-                int64_t aligned_end = static_cast<int64_t>(align_up(
-                    static_cast<size_t>(data_end), kDirectIOAlignment));
-                size_t aligned_size =
-                    static_cast<size_t>(aligned_end - aligned_offset);
-                int64_t offset_in_buffer = actual_offset - aligned_offset;
-
-                // Zero-copy path: read directly into the slice buffer.
-                // dest_slice.ptr is 4096-aligned and oversized (from
-                // AllocateBatch) to accommodate the full aligned read range.
-                read_res = uring_file->read_aligned(
-                    plan.dest_slice.ptr, aligned_size, aligned_offset);
-
-                if (read_res) {
-                    // Adjust ptr to point to actual data start (no memcpy)
-                    batch_object.at(plan.key).ptr =
-                        static_cast<char*>(plan.dest_slice.ptr) +
-                        offset_in_buffer;
-                    read_res = plan.dest_slice.size;
-                }
-            } else
+                UringFile* uring_file = dynamic_cast<UringFile*>(file.get());
+                if (uring_file != nullptr) {
+                    int64_t aligned_offset =
+                        align_down(actual_offset, kDirectIOAlignment);
+                    int64_t data_end = actual_offset +
+                        static_cast<int64_t>(plan.dest_slice.size);
+                    int64_t aligned_end = static_cast<int64_t>(align_up(
+                        static_cast<size_t>(data_end), kDirectIOAlignment));
+                    size_t aligned_size =
+                        static_cast<size_t>(aligned_end - aligned_offset);
+                    int64_t offset_in_buffer = actual_offset - aligned_offset;
+                    read_res = uring_file->read_aligned(
+                        plan.dest_slice.ptr, aligned_size, aligned_offset);
+                    if (read_res) {
+                        batch_object.at(plan.key).ptr =
+                            static_cast<char*>(plan.dest_slice.ptr) +
+                            offset_in_buffer;
+                        read_res = plan.dest_slice.size;
+                    }
+                } else
 #endif
-            {
-                // Fallback to vector_read for non-UringFile
-                iovec iov{plan.dest_slice.ptr, plan.dest_slice.size};
-                read_res = file->vector_read(&iov, 1, actual_offset);
-            }
+                {
+                    iovec iov{plan.dest_slice.ptr, plan.dest_slice.size};
+                    read_res = file->vector_read(&iov, 1, actual_offset);
+                }
 
-            if (!read_res) {
-                LOG(ERROR) << "vector_read failed for key: " << plan.key
-                           << ", bucket_id=" << plan.bucket_id
-                           << ", error: " << read_res.error();
-                return tl::make_unexpected(read_res.error());
+                if (!read_res) {
+                    LOG(ERROR) << "vector_read failed for key: " << plan.key
+                               << ", bucket_id=" << plan.bucket_id
+                               << ", error: " << read_res.error();
+                    return tl::make_unexpected(read_res.error());
+                }
+                if (read_res.value() != plan.dest_slice.size) {
+                    LOG(ERROR) << "Read size mismatch for key: " << plan.key
+                               << ", expected: " << plan.dest_slice.size
+                               << ", got: " << read_res.value();
+                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                }
+                bucket_bytes += plan.data_size;
+            } else {
+                // Merged group: one big pread into temp buffer, then scatter
+                int64_t seg_size = seg_end - seg_offset;
+                std::vector<char> merge_buf(static_cast<size_t>(seg_size));
+                iovec iov{merge_buf.data(), static_cast<size_t>(seg_size)};
+                auto read_res = file->vector_read(&iov, 1, seg_offset);
+                if (!read_res) {
+                    LOG(ERROR) << "merged vector_read failed for bucket_id="
+                               << bucket_id << ", seg_offset=" << seg_offset
+                               << ", seg_size=" << seg_size
+                               << ", error: " << read_res.error();
+                    return tl::make_unexpected(read_res.error());
+                }
+                if (read_res.value() != static_cast<size_t>(seg_size)) {
+                    LOG(ERROR) << "merged read size mismatch, bucket_id="
+                               << bucket_id << ", expected=" << seg_size
+                               << ", got=" << read_res.value();
+                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                }
+                // Scatter: for each key, memcpy from merge_buf to dest_slice
+                for (size_t k = group_start; k <= group_end; ++k) {
+                    const auto& plan = *sorted_plans[k];
+                    int64_t key_offset = plan.offset + plan.key_size;
+                    int64_t buf_offset = key_offset - seg_offset;
+                    std::memcpy(plan.dest_slice.ptr,
+                                merge_buf.data() + buf_offset,
+                                plan.dest_slice.size);
+                    bucket_bytes += plan.data_size;
+                }
             }
-
-            if (read_res.value() != plan.dest_slice.size) {
-                LOG(ERROR) << "Read size mismatch for key: " << plan.key
-                           << ", expected: " << plan.dest_slice.size
-                           << ", got: " << read_res.value();
-                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-            }
+            ++idx;
         }
+
+        VLOG(1) << "bucket_id=" << bucket_id
+                << " preads_before_merge=" << read_plans.size()
+                << " preads_after_merge=" << pread_count_after_merge
+                << " merge_groups=" << merge_group_count;
+        auto bucket_elapsed_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - bucket_io_start)
+                .count();
+        VLOG(1) << "action=batchload_bucket_done"
+                  << " bucket_id=" << bucket_id
+                  << " keys=" << read_plans.size()
+                  << " bytes=" << bucket_bytes
+                  << " elapsed_us=" << bucket_elapsed_us
+                  << " preads=" << read_plans.size()
+                  << " per_key_us=" << (read_plans.empty() ? 0 : bucket_elapsed_us / static_cast<int64_t>(read_plans.size()));
     }
+
+    auto batch_elapsed_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - batch_start)
+            .count();
+    VLOG(1) << "action=batchload_done"
+              << " keys=" << batch_object.size()
+              << " buckets=" << bucket_read_plans.size()
+              << " total_bytes=" << batch_total_bytes
+              << " elapsed_us=" << batch_elapsed_us
+              << " throughput_mbs=" << (batch_elapsed_us > 0 ? (double)batch_total_bytes / 1024.0 / 1024.0 / ((double)batch_elapsed_us / 1000000.0) : 0.0);
 
     // bucket_guards go out of scope here, decrementing inflight_reads_
     return {};
