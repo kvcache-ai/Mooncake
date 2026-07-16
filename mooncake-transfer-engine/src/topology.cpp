@@ -760,6 +760,10 @@ int Topology::selectDevice(const std::string storage_type, int retry_count) {
     if (resolved_matrix_.count(storage_type) == 0) return ERR_DEVICE_NOT_FOUND;
 
     auto &entry = resolved_matrix_[storage_type];
+    if (entry.preferred_hca.empty() && entry.avail_hca.empty()) {
+        return ERR_DEVICE_NOT_FOUND;
+    }
+
     if (retry_count == 0) {
         int rand_value;
         if (use_round_robin_) {
@@ -782,7 +786,7 @@ int Topology::selectDevice(const std::string storage_type, int retry_count) {
             return entry.avail_hca[index];
         }
     }
-    return 0;
+    return ERR_DEVICE_NOT_FOUND;
 }
 
 int Topology::resolve() {
@@ -828,6 +832,13 @@ int Topology::resolve() {
 }
 
 int Topology::disableDevice(const std::string &device_name) {
+    int disabled_hca_index = -1;
+    auto hca_iter = std::find(hca_list_.begin(), hca_list_.end(), device_name);
+    if (hca_iter != hca_list_.end()) {
+        disabled_hca_index = static_cast<int>(
+            std::distance(hca_list_.begin(), hca_iter));
+    }
+
     for (auto &record : matrix_) {
         auto &preferred_hca = record.second.preferred_hca;
         auto preferred_hca_iter =
@@ -839,6 +850,27 @@ int Topology::disableDevice(const std::string &device_name) {
             std::find(avail_hca.begin(), avail_hca.end(), device_name);
         if (avail_hca_iter != avail_hca.end()) avail_hca.erase(avail_hca_iter);
     }
-    return resolve();
+
+    if (disabled_hca_index < 0) return 0;
+
+    // Keep existing HCA indexes stable. RDMA transport stores lkey/rkey and
+    // context arrays by the resolved HCA index, so re-running resolve() here
+    // could compact indexes after a disabled device and make those arrays point
+    // at the wrong RNIC.
+    for (auto &record : resolved_matrix_) {
+        auto &preferred_hca = record.second.preferred_hca;
+        preferred_hca.erase(std::remove(preferred_hca.begin(),
+                                        preferred_hca.end(),
+                                        disabled_hca_index),
+                            preferred_hca.end());
+        record.second.preferred_hca_name_to_index_map_.erase(device_name);
+
+        auto &avail_hca = record.second.avail_hca;
+        avail_hca.erase(std::remove(avail_hca.begin(), avail_hca.end(),
+                                    disabled_hca_index),
+                        avail_hca.end());
+        record.second.avail_hca_name_to_index_map_.erase(device_name);
+    }
+    return 0;
 }
 }  // namespace mooncake

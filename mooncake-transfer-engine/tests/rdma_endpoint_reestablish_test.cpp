@@ -29,6 +29,8 @@
  */
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cerrno>
 #include <cstdlib>
 #include <fstream>
@@ -37,6 +39,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -50,9 +53,80 @@
 
 #include "common.h"
 #include "transfer_engine.h"
+#include "transport/rdma_transport/rdma_context.h"
+#include "transport/rdma_transport/rdma_transport.h"
+#include "transport/rdma_transport/worker_pool.h"
 #include "transport/transport.h"
 
 using namespace mooncake;
+
+namespace mooncake {
+
+class RdmaTransportTestPeer {
+   public:
+    static bool setContextActive(RdmaTransport* transport,
+                                 const std::string& device_name, bool active) {
+        if (!transport) return false;
+        for (auto& context : transport->context_list_) {
+            if (context && context->deviceName() == device_name) {
+                context->set_active(active);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static bool contextActive(RdmaTransport* transport,
+                              const std::string& device_name) {
+        if (!transport) return false;
+        for (auto& context : transport->context_list_) {
+            if (context && context->deviceName() == device_name) {
+                return context->active();
+            }
+        }
+        return false;
+    }
+
+    static bool injectContextEvent(RdmaTransport* transport,
+                                   const std::string& device_name,
+                                   ibv_event_type event_type);
+};
+
+class WorkerPoolTestPeer {
+   public:
+    static void processContextEvent(WorkerPool& worker_pool,
+                                    ibv_event_type event_type) {
+        worker_pool.processContextEventForTest(event_type);
+    }
+};
+
+class RdmaContextTestPeer {
+   public:
+    static bool injectContextEvent(RdmaContext* context,
+                                   ibv_event_type event_type) {
+        if (context && context->worker_pool_) {
+            WorkerPoolTestPeer::processContextEvent(*context->worker_pool_,
+                                                    event_type);
+            return true;
+        }
+        return false;
+    }
+};
+
+bool RdmaTransportTestPeer::injectContextEvent(RdmaTransport* transport,
+                                               const std::string& device_name,
+                                               ibv_event_type event_type) {
+    if (!transport) return false;
+    for (auto& context : transport->context_list_) {
+        if (context && context->deviceName() == device_name) {
+            return RdmaContextTestPeer::injectContextEvent(context.get(),
+                                                          event_type);
+        }
+    }
+    return false;
+}
+
+}  // namespace mooncake
 
 namespace {
 
@@ -82,8 +156,11 @@ struct RtrFaultInjectionState {
     std::mutex mu;
     bool synthetic_gid_swap_enabled = false;
     std::string synthetic_gid_device;
+    int synthetic_gid_a = 0;
+    int synthetic_gid_b = 1;
     bool fail_first_rtr_einval = false;
     std::string fail_rtr_device;
+    bool first_rtr_attempted = false;
     int injected_failures = 0;
     std::unordered_map<std::string, std::vector<int>> rtr_sgid_history;
     std::unordered_map<std::string, std::vector<std::string>> rtr_gid_history;
@@ -105,8 +182,11 @@ void resetRtrFaultInjectionState() {
     std::lock_guard<std::mutex> guard(g_rtr_fault_injection_state.mu);
     g_rtr_fault_injection_state.synthetic_gid_swap_enabled = false;
     g_rtr_fault_injection_state.synthetic_gid_device.clear();
+    g_rtr_fault_injection_state.synthetic_gid_a = 0;
+    g_rtr_fault_injection_state.synthetic_gid_b = 1;
     g_rtr_fault_injection_state.fail_first_rtr_einval = false;
     g_rtr_fault_injection_state.fail_rtr_device.clear();
+    g_rtr_fault_injection_state.first_rtr_attempted = false;
     g_rtr_fault_injection_state.injected_failures = 0;
     g_rtr_fault_injection_state.rtr_sgid_history.clear();
     g_rtr_fault_injection_state.rtr_gid_history.clear();
@@ -116,8 +196,11 @@ void configureRtrFaultInjection(const std::string& device_name) {
     std::lock_guard<std::mutex> guard(g_rtr_fault_injection_state.mu);
     g_rtr_fault_injection_state.synthetic_gid_swap_enabled = true;
     g_rtr_fault_injection_state.synthetic_gid_device = device_name;
+    g_rtr_fault_injection_state.synthetic_gid_a = 0;
+    g_rtr_fault_injection_state.synthetic_gid_b = 1;
     g_rtr_fault_injection_state.fail_first_rtr_einval = true;
     g_rtr_fault_injection_state.fail_rtr_device = device_name;
+    g_rtr_fault_injection_state.first_rtr_attempted = false;
     g_rtr_fault_injection_state.injected_failures = 0;
     g_rtr_fault_injection_state.rtr_sgid_history.clear();
     g_rtr_fault_injection_state.rtr_gid_history.clear();
@@ -160,22 +243,40 @@ int maybeSwapSyntheticGidIndex(const std::string& device_name, int gid_index) {
         g_rtr_fault_injection_state.synthetic_gid_device != device_name) {
         return gid_index;
     }
-    if (gid_index == 0) return 1;
-    if (gid_index == 1) return 0;
+    if (gid_index == g_rtr_fault_injection_state.synthetic_gid_a)
+        return g_rtr_fault_injection_state.synthetic_gid_b;
+    if (gid_index == g_rtr_fault_injection_state.synthetic_gid_b)
+        return g_rtr_fault_injection_state.synthetic_gid_a;
     return gid_index;
 }
 
-bool shouldInjectRtrEinval(const std::string& device_name, int sgid_index) {
+int injectedRtrErrnoOrZero(const std::string& device_name, int sgid_index) {
     std::lock_guard<std::mutex> guard(g_rtr_fault_injection_state.mu);
     if (!g_rtr_fault_injection_state.fail_first_rtr_einval ||
         g_rtr_fault_injection_state.fail_rtr_device != device_name ||
-        sgid_index != 0) {
-        return false;
+        sgid_index != g_rtr_fault_injection_state.synthetic_gid_a ||
+        g_rtr_fault_injection_state.first_rtr_attempted) {
+        return 0;
     }
     g_rtr_fault_injection_state.fail_first_rtr_einval = false;
     g_rtr_fault_injection_state.synthetic_gid_swap_enabled = false;
+    g_rtr_fault_injection_state.first_rtr_attempted = true;
     ++g_rtr_fault_injection_state.injected_failures;
-    return true;
+    return EINVAL;
+}
+
+void expectRtrEinvalRecoveredWithRetry(const std::string& device_name) {
+    EXPECT_EQ(getInjectedFailureCount(), 1);
+    auto sgid_history = getRtrSgidHistory(device_name);
+    auto gid_history = getRtrGidHistory(device_name);
+    ASSERT_EQ(sgid_history.size(), gid_history.size());
+    ASSERT_GE(sgid_history.size(), 2u)
+        << "RTR/EINVAL was injected, but the endpoint did not retry RTR";
+    EXPECT_FALSE(gid_history.front().empty());
+
+    EXPECT_TRUE(std::any_of(
+        gid_history.begin() + 1, gid_history.end(),
+        [&](const std::string& gid) { return gid != gid_history.front(); }));
 }
 
 std::string formatDeviceNames(const std::string& device_names) {
@@ -204,6 +305,16 @@ std::string makeNicPriorityMatrix(const std::string& device_name) {
            formatted_devices + "],[]]}";
 }
 
+std::string makeNicPriorityMatrix(const std::string& preferred_devices,
+                                  const std::string& fallback_devices) {
+    auto formatted_preferred = formatDeviceNames(preferred_devices);
+    auto formatted_fallback = formatDeviceNames(fallback_devices);
+    return "{\"cpu:0\": [[" + formatted_preferred + "],[" +
+           formatted_fallback + "]], "
+           " \"cpu:1\": [[" +
+           formatted_preferred + "],[" + formatted_fallback + "]]}";
+}
+
 void waitForTransfer(TransferEngine* engine, BatchID batch_id,
                      const std::string& op_name) {
     bool completed = false;
@@ -221,8 +332,46 @@ void waitForTransfer(TransferEngine* engine, BatchID batch_id,
     EXPECT_EQ(s, Status::OK());
 }
 
+bool waitForTransferWithTimeout(TransferEngine* engine, BatchID batch_id,
+                                const std::string& op_name,
+                                std::chrono::seconds timeout) {
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+    TransferStatus status;
+    while (std::chrono::steady_clock::now() < deadline) {
+        Status s = engine->getTransferStatus(batch_id, 0, status);
+        if (s != Status::OK()) {
+            ADD_FAILURE() << op_name << " getTransferStatus failed: "
+                          << s.ToString();
+            return false;
+        }
+        if (status.s == TransferStatusEnum::COMPLETED) {
+            s = engine->freeBatchID(batch_id);
+            if (s != Status::OK()) {
+                ADD_FAILURE() << op_name << " freeBatchID failed: "
+                              << s.ToString();
+                return false;
+            }
+            return true;
+        }
+        if (status.s == TransferStatusEnum::FAILED) {
+            ADD_FAILURE() << op_name << " FAILED";
+            engine->freeBatchID(batch_id);
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    ADD_FAILURE() << op_name << " timed out after " << timeout.count()
+                  << " seconds";
+    engine->freeBatchID(batch_id);
+    return false;
+}
+
+struct RawNicPriorityMatrix {};
+
 struct TEContext {
     std::unique_ptr<TransferEngine> engine_{};
+    RdmaTransport* rdma_transport_{};
     uint8_t* local_addr_{};
     bool segment_opened_{false};
     SegmentHandle segment_handle_{};
@@ -230,17 +379,25 @@ struct TEContext {
 
     TEContext(const std::string& local_server_name,
               const std::string& metadata_server, const std::string& segment_id,
-              const std::string& device_name) {
+              const std::string& device_name)
+        : TEContext(local_server_name, metadata_server, segment_id,
+                    makeNicPriorityMatrix(device_name), RawNicPriorityMatrix{}) {
+    }
+
+    TEContext(const std::string& local_server_name,
+              const std::string& metadata_server, const std::string& segment_id,
+              const std::string& nic_priority_matrix, RawNicPriorityMatrix) {
         engine_ = std::make_unique<TransferEngine>(false);
         auto hostname_port = parseHostNameWithPort(local_server_name);
         engine_->init(metadata_server, local_server_name, hostname_port.first,
                       hostname_port.second);
 
-        auto nic_priority_matrix = makeNicPriorityMatrix(device_name);
         void* args[2] = {const_cast<char*>(nic_priority_matrix.c_str()),
                          nullptr};
         Transport* xport = engine_->installTransport("rdma", args);
         LOG_ASSERT(xport);
+        rdma_transport_ = dynamic_cast<RdmaTransport*>(xport);
+        LOG_ASSERT(rdma_transport_);
 
         local_addr_ = static_cast<uint8_t*>(numa_alloc_onnode(kRAMBufSize, 0));
         memset(local_addr_, 0, kDataLength);
@@ -401,34 +558,261 @@ TEST_F(RDMAEndpointReestablishTest, EndpointReestablishReverseDevices) {
 TEST_F(RDMAEndpointReestablishTest, ActiveHandshakeRetriesAfterAutoGidReprobe) {
     configureRtrFaultInjection(initiator_device_name);
     runEndpointReestablishScenario(target_device_name, initiator_device_name);
-
-    EXPECT_EQ(getInjectedFailureCount(), 1);
-    auto sgid_history = getRtrSgidHistory(initiator_device_name);
-    auto gid_history = getRtrGidHistory(initiator_device_name);
-    ASSERT_EQ(sgid_history.size(), gid_history.size());
-    ASSERT_GE(sgid_history.size(), 2u);
-    EXPECT_EQ(sgid_history.front(), 0);
-    EXPECT_FALSE(gid_history.front().empty());
-    EXPECT_TRUE(std::any_of(
-        gid_history.begin() + 1, gid_history.end(),
-        [&](const std::string& gid) { return gid != gid_history.front(); }));
+    expectRtrEinvalRecoveredWithRetry(initiator_device_name);
 }
 
 TEST_F(RDMAEndpointReestablishTest,
        PassiveHandshakeRetriesAfterAutoGidReprobe) {
     configureRtrFaultInjection(target_device_name);
     runEndpointReestablishScenario(target_device_name, initiator_device_name);
+    expectRtrEinvalRecoveredWithRetry(target_device_name);
+}
 
-    EXPECT_EQ(getInjectedFailureCount(), 1);
-    auto sgid_history = getRtrSgidHistory(target_device_name);
-    auto gid_history = getRtrGidHistory(target_device_name);
-    ASSERT_EQ(sgid_history.size(), gid_history.size());
-    ASSERT_GE(sgid_history.size(), 2u);
-    EXPECT_EQ(sgid_history.front(), 0);
-    EXPECT_FALSE(gid_history.front().empty());
-    EXPECT_TRUE(std::any_of(
-        gid_history.begin() + 1, gid_history.end(),
-        [&](const std::string& gid) { return gid != gid_history.front(); }));
+TEST_F(RDMAEndpointReestablishTest,
+       SenderSingleRnicDownUsesFallbackLocalRnic) {
+    if (target_device_name == initiator_device_name) {
+        GTEST_SKIP() << "Need two distinct RDMA devices for sender failover";
+    }
+
+    const std::string both_devices =
+        target_device_name + "," + initiator_device_name;
+    const std::string target_matrix = makeNicPriorityMatrix(both_devices);
+    LOG(INFO) << "========== Setting up dual-RNIC Target ==========";
+    TEContext target_ctx(target_server_name, metadata_server, "",
+                         target_matrix, RawNicPriorityMatrix{});
+    const std::string target_segment_name =
+        usesP2PHandshake(metadata_server) ? target_ctx.localSegmentName()
+                                          : target_server_name;
+
+    // Put the soon-to-be-down sender RNIC in the preferred tier and the
+    // surviving sender RNIC in the fallback tier. This proves TE can skip the
+    // inactive preferred local context and still complete the transfer through
+    // another local RNIC.
+    const std::string sender_matrix =
+        makeNicPriorityMatrix(initiator_device_name, target_device_name);
+    TEContext init_ctx(initiator_server_name, metadata_server,
+                       target_segment_name, sender_matrix,
+                       RawNicPriorityMatrix{});
+
+    ASSERT_TRUE(RdmaTransportTestPeer::setContextActive(
+        init_ctx.rdma_transport_, initiator_device_name, false));
+    ASSERT_FALSE(RdmaTransportTestPeer::contextActive(
+        init_ctx.rdma_transport_, initiator_device_name));
+    ASSERT_TRUE(RdmaTransportTestPeer::contextActive(init_ctx.rdma_transport_,
+                                                    target_device_name));
+
+    for (size_t i = 0; i < kDataLength; ++i) {
+        init_ctx.local_addr_[i] = static_cast<uint8_t>((i * 17) % 251);
+    }
+
+    auto batch_id = init_ctx.engine_->allocateBatchID(1);
+    TransferRequest entry;
+    entry.opcode = TransferRequest::WRITE;
+    entry.length = kDataLength;
+    entry.source = init_ctx.local_addr_;
+    entry.target_id = init_ctx.segment_handle_;
+    entry.target_offset = init_ctx.remote_base_;
+
+    Status s = init_ctx.engine_->submitTransfer(batch_id, {entry});
+    ASSERT_EQ(s, Status::OK());
+    waitForTransfer(init_ctx.engine_.get(), batch_id,
+                    "WRITE with one sender RNIC down");
+
+    for (size_t i = 0; i < kDataLength; ++i) {
+        ASSERT_EQ(target_ctx.local_addr_[i],
+                  static_cast<uint8_t>((i * 17) % 251))
+            << "Data mismatch at offset " << i;
+    }
+}
+
+TEST_F(RDMAEndpointReestablishTest,
+       InjectedSenderRnicDownKeepsFallbackTransfersSmoothForTwentySeconds) {
+    auto devices = getAvailableRdmaDevices();
+    for (const auto* device : {"mlx5_1", "mlx5_2", "mlx5_3", "mlx5_4"}) {
+        if (std::find(devices.begin(), devices.end(), device) ==
+            devices.end()) {
+            GTEST_SKIP() << "Need " << device << " for this 4-RNIC test";
+        }
+    }
+
+    const std::string target_matrix = makeNicPriorityMatrix("mlx5_3,mlx5_4");
+    TEContext target_ctx(target_server_name, metadata_server, "",
+                         target_matrix, RawNicPriorityMatrix{});
+    const std::string target_segment_name =
+        usesP2PHandshake(metadata_server) ? target_ctx.localSegmentName()
+                                          : target_server_name;
+
+    const std::string sender_matrix = makeNicPriorityMatrix("mlx5_2", "mlx5_1");
+    TEContext init_ctx(initiator_server_name, metadata_server,
+                       target_segment_name, sender_matrix,
+                       RawNicPriorityMatrix{});
+
+    std::atomic<bool> injected_down{false};
+    std::atomic<bool> injected_up{false};
+    std::atomic<bool> inject_down_ok{false};
+    std::atomic<bool> inject_up_ok{false};
+    std::thread injector([&] {
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        inject_down_ok.store(RdmaTransportTestPeer::injectContextEvent(
+                                 init_ctx.rdma_transport_, "mlx5_2",
+                                 IBV_EVENT_PORT_ERR),
+                             std::memory_order_release);
+        injected_down.store(true, std::memory_order_release);
+
+        std::this_thread::sleep_for(std::chrono::seconds(7));
+        inject_up_ok.store(RdmaTransportTestPeer::injectContextEvent(
+                               init_ctx.rdma_transport_, "mlx5_2",
+                               IBV_EVENT_PORT_ACTIVE),
+                           std::memory_order_release);
+        injected_up.store(true, std::memory_order_release);
+    });
+
+    constexpr size_t kFaultLoopLength = 4ull << 20;
+    auto start = std::chrono::steady_clock::now();
+    auto deadline = start + std::chrono::seconds(20);
+    size_t completed_transfers = 0;
+    uint8_t last_pattern = 0;
+    bool transfer_ok = true;
+
+    while (std::chrono::steady_clock::now() < deadline) {
+        last_pattern = static_cast<uint8_t>((completed_transfers * 37) % 251);
+        memset(init_ctx.local_addr_, last_pattern, kFaultLoopLength);
+
+        auto batch_id = init_ctx.engine_->allocateBatchID(1);
+        TransferRequest entry;
+        entry.opcode = TransferRequest::WRITE;
+        entry.length = kFaultLoopLength;
+        entry.source = init_ctx.local_addr_;
+        entry.target_id = init_ctx.segment_handle_;
+        entry.target_offset = init_ctx.remote_base_;
+
+        Status s = init_ctx.engine_->submitTransfer(batch_id, {entry});
+        if (s != Status::OK()) {
+            ADD_FAILURE() << "submitTransfer failed during injected sender "
+                             "RNIC down/fallback: "
+                          << s.ToString();
+            transfer_ok = false;
+            break;
+        }
+        if (!waitForTransferWithTimeout(
+                init_ctx.engine_.get(), batch_id,
+                "20s WRITE during injected sender RNIC down/fallback",
+                std::chrono::seconds(5))) {
+            transfer_ok = false;
+            break;
+        }
+        ++completed_transfers;
+    }
+
+    injector.join();
+    ASSERT_TRUE(injected_down.load(std::memory_order_acquire));
+    ASSERT_TRUE(injected_up.load(std::memory_order_acquire));
+    ASSERT_TRUE(inject_down_ok.load(std::memory_order_acquire));
+    ASSERT_TRUE(inject_up_ok.load(std::memory_order_acquire));
+    ASSERT_TRUE(transfer_ok);
+    ASSERT_GT(completed_transfers, 0u);
+
+    for (size_t i = 0; i < kFaultLoopLength; ++i) {
+        ASSERT_EQ(target_ctx.local_addr_[i], last_pattern)
+            << "Data mismatch at offset " << i;
+    }
+    LOG(INFO) << "Completed " << completed_transfers
+              << " transfers during injected mlx5_2 down/fallback";
+}
+
+TEST_F(RDMAEndpointReestablishTest,
+       InjectedReceiverRnicDownKeepsFallbackTransfersSmoothForTwentySeconds) {
+    auto devices = getAvailableRdmaDevices();
+    for (const auto* device : {"mlx5_1", "mlx5_2", "mlx5_3", "mlx5_4"}) {
+        if (std::find(devices.begin(), devices.end(), device) ==
+            devices.end()) {
+            GTEST_SKIP() << "Need " << device << " for this 4-RNIC test";
+        }
+    }
+
+    const std::string target_matrix = makeNicPriorityMatrix("mlx5_3", "mlx5_4");
+    TEContext target_ctx(target_server_name, metadata_server, "",
+                         target_matrix, RawNicPriorityMatrix{});
+    const std::string target_segment_name =
+        usesP2PHandshake(metadata_server) ? target_ctx.localSegmentName()
+                                          : target_server_name;
+
+    const std::string sender_matrix = makeNicPriorityMatrix("mlx5_1,mlx5_2");
+    TEContext init_ctx(initiator_server_name, metadata_server,
+                       target_segment_name, sender_matrix,
+                       RawNicPriorityMatrix{});
+
+    std::atomic<bool> injected_down{false};
+    std::atomic<bool> injected_up{false};
+    std::atomic<bool> inject_down_ok{false};
+    std::atomic<bool> inject_up_ok{false};
+    std::thread injector([&] {
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        inject_down_ok.store(RdmaTransportTestPeer::injectContextEvent(
+                                 target_ctx.rdma_transport_, "mlx5_3",
+                                 IBV_EVENT_PORT_ERR),
+                             std::memory_order_release);
+        injected_down.store(true, std::memory_order_release);
+
+        std::this_thread::sleep_for(std::chrono::seconds(7));
+        inject_up_ok.store(RdmaTransportTestPeer::injectContextEvent(
+                               target_ctx.rdma_transport_, "mlx5_3",
+                               IBV_EVENT_PORT_ACTIVE),
+                           std::memory_order_release);
+        injected_up.store(true, std::memory_order_release);
+    });
+
+    constexpr size_t kFaultLoopLength = 4ull << 20;
+    auto start = std::chrono::steady_clock::now();
+    auto deadline = start + std::chrono::seconds(20);
+    size_t completed_transfers = 0;
+    uint8_t last_pattern = 0;
+    bool transfer_ok = true;
+
+    while (std::chrono::steady_clock::now() < deadline) {
+        last_pattern = static_cast<uint8_t>((completed_transfers * 41) % 251);
+        memset(init_ctx.local_addr_, last_pattern, kFaultLoopLength);
+
+        auto batch_id = init_ctx.engine_->allocateBatchID(1);
+        TransferRequest entry;
+        entry.opcode = TransferRequest::WRITE;
+        entry.length = kFaultLoopLength;
+        entry.source = init_ctx.local_addr_;
+        entry.target_id = init_ctx.segment_handle_;
+        entry.target_offset = init_ctx.remote_base_;
+
+        Status s = init_ctx.engine_->submitTransfer(batch_id, {entry});
+        if (s != Status::OK()) {
+            ADD_FAILURE() << "submitTransfer failed during injected receiver "
+                             "RNIC down/fallback: "
+                          << s.ToString();
+            transfer_ok = false;
+            break;
+        }
+        if (!waitForTransferWithTimeout(
+                init_ctx.engine_.get(), batch_id,
+                "20s WRITE during injected receiver RNIC down/fallback",
+                std::chrono::seconds(5))) {
+            transfer_ok = false;
+            break;
+        }
+        ++completed_transfers;
+    }
+
+    injector.join();
+    ASSERT_TRUE(injected_down.load(std::memory_order_acquire));
+    ASSERT_TRUE(injected_up.load(std::memory_order_acquire));
+    ASSERT_TRUE(inject_down_ok.load(std::memory_order_acquire));
+    ASSERT_TRUE(inject_up_ok.load(std::memory_order_acquire));
+    ASSERT_TRUE(transfer_ok);
+    ASSERT_GT(completed_transfers, 0u);
+
+    for (size_t i = 0; i < kFaultLoopLength; ++i) {
+        ASSERT_EQ(target_ctx.local_addr_[i], last_pattern)
+            << "Data mismatch at offset " << i;
+    }
+    LOG(INFO) << "Completed " << completed_transfers
+              << " transfers during injected receiver mlx5_3 down/fallback";
 }
 
 }  // namespace
@@ -475,8 +859,9 @@ extern "C" int __wrap_ibv_modify_qp(ibv_qp* qp, ibv_qp_attr* attr,
             gid_string = formatGidBytes(actual_gid.raw);
         }
         recordRtrAttempt(device_name, sgid_index, gid_string);
-        if (shouldInjectRtrEinval(device_name, sgid_index)) {
-            errno = EINVAL;
+        int injected_errno = injectedRtrErrnoOrZero(device_name, sgid_index);
+        if (injected_errno != 0) {
+            errno = injected_errno;
             return -1;
         }
     }

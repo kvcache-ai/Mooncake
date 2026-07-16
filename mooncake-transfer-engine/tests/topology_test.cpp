@@ -114,6 +114,28 @@ TEST(ToplogyTest, TestSelectDeviceAny) {
     ASSERT_TRUE(items.empty());
 }
 
+TEST(ToplogyTest, TestSelectDeviceEmptyEntry) {
+    mooncake::Topology topology;
+    std::string json_str = "{\"gpu:0\" : [[],[]]}";
+    topology.clear();
+    ASSERT_EQ(topology.parse(json_str), 0);
+
+    ASSERT_EQ(topology.selectDevice("gpu:0", 0), ERR_DEVICE_NOT_FOUND);
+    ASSERT_EQ(topology.selectDevice("gpu:0", 1), ERR_DEVICE_NOT_FOUND);
+}
+
+TEST(ToplogyTest, TestDisableOnlyPreferredDeviceLeavesNoSelection) {
+    mooncake::Topology topology;
+    std::string json_str = "{\"gpu:0\" : [[\"mlx5_2\"],[]]}";
+    topology.clear();
+    ASSERT_EQ(topology.parse(json_str), 0);
+    ASSERT_EQ(topology.selectDevice("gpu:0", 0), 0);
+
+    ASSERT_EQ(topology.disableDevice("mlx5_2"), 0);
+    ASSERT_EQ(topology.selectDevice("gpu:0", 0), ERR_DEVICE_NOT_FOUND);
+    ASSERT_EQ(topology.selectDevice("gpu:0", 1), ERR_DEVICE_NOT_FOUND);
+}
+
 int main(int argc, char **argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

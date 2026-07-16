@@ -1411,7 +1411,19 @@ int TransferMetadata::startHandshakeDaemon(
             TransferHandshakeUtil::decode(peer, peer_desc);
             if (on_receive_handshake) {
                 int ret = on_receive_handshake(peer_desc, local_desc);
-                if (ret) return ret;
+                if (ret) {
+                    if (local_desc.reply_msg.empty()) {
+                        local_desc.reply_msg =
+                            "Handshake callback failed: " +
+                            std::to_string(ret);
+                    }
+                    // The callback failure is a handshake-level rejection, not
+                    // an RPC handler failure. Return a structured reply so the
+                    // peer can report the rejection reason instead of seeing an
+                    // empty/undecodable handshake response.
+                    local = TransferHandshakeUtil::encode(local_desc);
+                    return 0;
+                }
             }
             local = TransferHandshakeUtil::encode(local_desc);
             return 0;

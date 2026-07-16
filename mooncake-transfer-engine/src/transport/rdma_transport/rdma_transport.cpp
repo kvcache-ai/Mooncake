@@ -615,9 +615,12 @@ Status RdmaTransport::submitTransferTask(
                 retry_cnt = request.advise_retry_cnt;
             bool found_device = false;
             if (request_buffer_id >= 0 && request_device_id >= 0) {
-                found_device = true;
-                buffer_id = request_buffer_id;
-                device_id = request_device_id;
+                auto &request_context = context_list_[request_device_id];
+                if (request_context && request_context->active()) {
+                    found_device = true;
+                    buffer_id = request_buffer_id;
+                    device_id = request_device_id;
+                }
             }
             while (retry_cnt < kMaxRetryCount && !found_device) {
                 if (selectDevice(local_segment_desc.get(),
@@ -741,7 +744,11 @@ RdmaTransport::SegmentID RdmaTransport::getSegmentID(
 int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
                                           HandShakeDesc &local_desc) {
     auto local_nic_name = getNicNameFromNicPath(peer_desc.peer_nic_path);
-    if (local_nic_name.empty()) return ERR_INVALID_ARGUMENT;
+    if (local_nic_name.empty()) {
+        local_desc.reply_msg =
+            "Invalid peer_nic_path in handshake: " + peer_desc.peer_nic_path;
+        return ERR_INVALID_ARGUMENT;
+    }
 
     std::shared_ptr<RdmaContext> context;
     int index = 0;
@@ -752,13 +759,42 @@ int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
         }
         index++;
     }
-    if (!context) return ERR_INVALID_ARGUMENT;
+    if (!context) {
+        local_desc.reply_msg =
+            "Local RDMA context not found for handshake NIC: " +
+            local_nic_name;
+        return ERR_INVALID_ARGUMENT;
+    }
 
     // Use existing endpoint or create new one.
     auto endpoint = context->endpoint(peer_desc.local_nic_path);
-    if (!endpoint) return ERR_ENDPOINT;
+    if (!endpoint) {
+        local_desc.reply_msg =
+            "Local RDMA endpoint unavailable for " + local_nic_name +
+            " <- " + peer_desc.local_nic_path;
+        return ERR_ENDPOINT;
+    }
     int ret = endpoint->setupConnectionsByPassive(peer_desc, local_desc);
-    if (endpoint->retired()) context->deleteEndpointByPtr(endpoint.get());
+    if (endpoint->retired()) {
+        context->deleteEndpointByPtr(endpoint.get());
+        if (ret == ERR_ENDPOINT) {
+            // setupConnectionsByPassive() can retire a stale endpoint before
+            // creating a usable passive connection for this incoming handshake.
+            // That is a local endpoint-store race, not necessarily a peer
+            // handshake failure, so absorb it once with a fresh endpoint.
+            local_desc = HandShakeDesc();
+            endpoint = context->endpoint(peer_desc.local_nic_path);
+            if (!endpoint) {
+                local_desc.reply_msg =
+                    "Fresh local RDMA endpoint unavailable after retiring "
+                    "stale endpoint for " +
+                    local_nic_name + " <- " + peer_desc.local_nic_path;
+                return ERR_ENDPOINT;
+            }
+            ret = endpoint->setupConnectionsByPassive(peer_desc, local_desc);
+            if (endpoint->retired()) context->deleteEndpointByPtr(endpoint.get());
+        }
+    }
     return ret;
 }
 
