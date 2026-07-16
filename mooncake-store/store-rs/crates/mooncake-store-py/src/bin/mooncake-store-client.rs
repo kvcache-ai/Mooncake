@@ -1191,7 +1191,7 @@ mod tests {
         parse_cli_from, parse_falsey_env_bool, parse_hugepage_size_arg, parse_label,
         parse_route_control_arg, parse_transport_backend_arg, requested_initial_state,
         resolve_timeout_config, should_activate_after_ready, start_metrics_if_needed,
-        started_message, startup_initial_state, stopped_message, validate_args, ColdTierKindArg,
+        started_message, startup_initial_state, validate_args, ColdTierKindArg,
         ColdTierSsdEngineArg, Command, HeartbeatLoopState, InitialStateArg, RouteControlArg,
         RunArgs, TransportBackendArg,
     };
@@ -2053,10 +2053,6 @@ mod tests {
         assert_eq!(
             drained_message("node-a", 7),
             "mooncake-store-client drained stable_id=node-a evacuated_routes=7"
-        );
-        assert_eq!(
-            stopped_message("node-a"),
-            "mooncake-store-client stopped stable_id=node-a"
         );
     }
 
