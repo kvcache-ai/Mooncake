@@ -65,16 +65,6 @@ Status validateKnownKeys(const json& node,
     return Status::OK();
 }
 
-Status validateBandwidthRange(const QosPolicyFields& fields,
-                              const std::string& path) {
-    if (fields.min_bandwidth_gbps && fields.max_bandwidth_gbps &&
-        *fields.min_bandwidth_gbps > *fields.max_bandwidth_gbps) {
-        return Status::InvalidArgument(
-            path + " min_bandwidth_gbps exceeds max_bandwidth_gbps");
-    }
-    return Status::OK();
-}
-
 }  // namespace
 
 std::string QosContractResolver::normalizeKey(const std::string& value) {
@@ -213,16 +203,8 @@ Status QosContractResolver::parsePolicyFields(const json& node,
         return Status::InvalidArgument(path + " must be an object");
     }
     static const std::vector<std::string> kAllowedPolicyKeys = {
-        "priority",
-        "min_bandwidth_gbps",
-        "max_bandwidth_gbps",
-        "weight",
-        "burst_bytes",
-        "max_inflight_bytes",
-        "max_inflight_requests",
-        "deadline_profile",
-        "allowed_degraded_actions",
-        "name"};
+        "priority", "max_inflight_bytes", "max_inflight_requests",
+        "allowed_degraded_actions"};
     CHECK_STATUS(validateKnownKeys(node, kAllowedPolicyKeys, path));
 
     if (node.contains("priority")) {
@@ -230,37 +212,6 @@ Status QosContractResolver::parsePolicyFields(const json& node,
         CHECK_STATUS(
             parsePriority(node["priority"], &priority, path + ".priority"));
         out->priority = priority;
-    }
-
-    auto parse_double = [&](const char* key,
-                            std::optional<double>* dst) -> Status {
-        if (!node.contains(key)) return Status::OK();
-        if (!node[key].is_number()) {
-            return Status::InvalidArgument(path + "." + key +
-                                           " must be numeric");
-        }
-        double value = node[key].get<double>();
-        if (value < 0.0) {
-            return Status::InvalidArgument(path + "." + key + " must be >= 0");
-        }
-        *dst = value;
-        return Status::OK();
-    };
-    CHECK_STATUS(parse_double("min_bandwidth_gbps", &out->min_bandwidth_gbps));
-    CHECK_STATUS(parse_double("max_bandwidth_gbps", &out->max_bandwidth_gbps));
-    CHECK_STATUS(validateBandwidthRange(*out, path));
-
-    if (node.contains("weight")) {
-        if (!node["weight"].is_number_unsigned() &&
-            !node["weight"].is_number_integer()) {
-            return Status::InvalidArgument(path + ".weight must be integer");
-        }
-        auto weight = node["weight"].get<int64_t>();
-        if (weight <= 0 || weight > std::numeric_limits<uint32_t>::max()) {
-            return Status::InvalidArgument(path +
-                                           ".weight must be positive uint32");
-        }
-        out->weight = static_cast<uint32_t>(weight);
     }
 
     auto parse_bytes_field = [&](const char* key,
@@ -279,24 +230,10 @@ Status QosContractResolver::parsePolicyFields(const json& node,
         *dst = value;
         return Status::OK();
     };
-    CHECK_STATUS(parse_bytes_field("burst_bytes", &out->burst_bytes));
     CHECK_STATUS(
         parse_bytes_field("max_inflight_bytes", &out->max_inflight_bytes));
     CHECK_STATUS(parse_uint64_field("max_inflight_requests",
                                     &out->max_inflight_requests));
-
-    if (node.contains("deadline_profile")) {
-        if (!node["deadline_profile"].is_string()) {
-            return Status::InvalidArgument(path +
-                                           ".deadline_profile must be string");
-        }
-        auto profile =
-            normalizeKey(node["deadline_profile"].get<std::string>());
-        if (profile.empty()) {
-            return Status::InvalidArgument(path + ".deadline_profile is empty");
-        }
-        out->deadline_profile = profile;
-    }
 
     if (node.contains("allowed_degraded_actions")) {
         if (!node["allowed_degraded_actions"].is_array()) {
@@ -325,17 +262,10 @@ Status QosContractResolver::parsePolicyFields(const json& node,
 void QosContractResolver::mergeFields(QosPolicyFields* dst,
                                       const QosPolicyFields& src) {
     if (src.priority) dst->priority = src.priority;
-    if (src.min_bandwidth_gbps)
-        dst->min_bandwidth_gbps = src.min_bandwidth_gbps;
-    if (src.max_bandwidth_gbps)
-        dst->max_bandwidth_gbps = src.max_bandwidth_gbps;
-    if (src.weight) dst->weight = src.weight;
-    if (src.burst_bytes) dst->burst_bytes = src.burst_bytes;
     if (src.max_inflight_bytes)
         dst->max_inflight_bytes = src.max_inflight_bytes;
     if (src.max_inflight_requests)
         dst->max_inflight_requests = src.max_inflight_requests;
-    if (src.deadline_profile) dst->deadline_profile = src.deadline_profile;
     if (src.allowed_degraded_actions) {
         dst->allowed_degraded_actions = src.allowed_degraded_actions;
     }
@@ -343,11 +273,8 @@ void QosContractResolver::mergeFields(QosPolicyFields* dst,
 
 Status QosContractResolver::loadFromConfig(const Config& config) {
     enabled_ = false;
-    strict_mode_ = false;
     global_defaults_ = QosPolicyFields{};
-    intent_defaults_.clear();
     tenants_.clear();
-    named_contracts_.clear();
 
     try {
         json qos = config.get<json>("qos", json{});
@@ -356,7 +283,7 @@ Status QosContractResolver::loadFromConfig(const Config& config) {
             return Status::InvalidArgument("qos must be an object");
         }
         static const std::vector<std::string> kAllowedQosKeys = {
-            "version", "strict_mode", "defaults", "intent_defaults", "tenants"};
+            "version", "defaults", "tenants"};
         CHECK_STATUS(validateKnownKeys(qos, kAllowedQosKeys, "qos"));
 
         if (qos.contains("version") && !qos["version"].is_number_integer()) {
@@ -367,28 +294,9 @@ Status QosContractResolver::loadFromConfig(const Config& config) {
             return Status::InvalidArgument("unsupported qos.version: " +
                                            std::to_string(version));
         }
-        if (qos.contains("strict_mode") && !qos["strict_mode"].is_boolean()) {
-            return Status::InvalidArgument("qos.strict_mode must be boolean");
-        }
-        strict_mode_ = qos.value("strict_mode", false);
-
         if (qos.contains("defaults")) {
             CHECK_STATUS(parsePolicyFields(qos["defaults"], &global_defaults_,
                                            "qos.defaults"));
-        }
-
-        if (qos.contains("intent_defaults")) {
-            if (!qos["intent_defaults"].is_object()) {
-                return Status::InvalidArgument(
-                    "qos.intent_defaults must be an object");
-            }
-            for (auto it = qos["intent_defaults"].begin();
-                 it != qos["intent_defaults"].end(); ++it) {
-                QosPolicyFields fields;
-                CHECK_STATUS(parsePolicyFields(
-                    it.value(), &fields, "qos.intent_defaults." + it.key()));
-                intent_defaults_[normalizeKey(it.key())] = std::move(fields);
-            }
         }
 
         if (qos.contains("tenants")) {
@@ -438,35 +346,6 @@ Status QosContractResolver::loadFromConfig(const Config& config) {
                         CHECK_STATUS(
                             parsePolicyFields(it.value(), &fields,
                                               path + ".intents." + it.key()));
-                        if (it.value().contains("name")) {
-                            if (!it.value()["name"].is_string()) {
-                                return Status::InvalidArgument(
-                                    path + ".intents." + it.key() +
-                                    ".name must be string");
-                            }
-                            auto contract_name = normalizeKey(
-                                it.value()["name"].get<std::string>());
-                            if (contract_name.empty()) {
-                                return Status::InvalidArgument(
-                                    path + ".intents." + it.key() +
-                                    ".name is empty");
-                            }
-                            if (named_contracts_.contains(contract_name)) {
-                                return Status::InvalidArgument(
-                                    "duplicate qos contract name: " +
-                                    contract_name);
-                            }
-                            QosPolicyFields named = global_defaults_;
-                            auto intent_default = intent_defaults_.find(intent);
-                            if (intent_default != intent_defaults_.end()) {
-                                mergeFields(&named, intent_default->second);
-                            }
-                            mergeFields(&named, tenant.defaults);
-                            mergeFields(&named, fields);
-                            CHECK_STATUS(validateBandwidthRange(
-                                named, "qos contract " + contract_name));
-                            named_contracts_[contract_name] = named;
-                        }
                         tenant.intents[intent] = std::move(fields);
                     }
                 }
@@ -474,16 +353,12 @@ Status QosContractResolver::loadFromConfig(const Config& config) {
             }
         }
 
-        enabled_ = qos.contains("defaults") ||
-                   qos.contains("intent_defaults") || qos.contains("tenants");
+        enabled_ = qos.contains("defaults") || qos.contains("tenants");
         return Status::OK();
     } catch (const std::exception& e) {
         enabled_ = false;
-        strict_mode_ = false;
         global_defaults_ = QosPolicyFields{};
-        intent_defaults_.clear();
         tenants_.clear();
-        named_contracts_.clear();
         return Status::InvalidArgument(
             std::string("failed to parse qos config: ") + e.what());
     }
@@ -493,8 +368,8 @@ Status QosContractResolver::resolve(const QosRequestContext& context,
                                     EffectiveQosPolicy* out) const {
     if (!out) return Status::InvalidArgument("effective qos output is null");
     *out = EffectiveQosPolicy{};
-    out->tenant =
-        normalizeKey(context.tenant.empty() ? "default" : context.tenant);
+    out->tenant_id =
+        normalizeKey(context.tenant_id.empty() ? "default" : context.tenant_id);
     out->intent =
         normalizeKey(context.intent.empty() ? "unspec" : context.intent);
     out->requested_priority = context.requested_priority;
@@ -508,44 +383,19 @@ Status QosContractResolver::resolve(const QosRequestContext& context,
     QosPolicyFields fields = global_defaults_;
     out->matched_contract = "global_default";
 
-    if (context.policy_name) {
-        auto policy_name = normalizeKey(*context.policy_name);
-        auto named_it = named_contracts_.find(policy_name);
-        if (named_it != named_contracts_.end()) {
-            mergeFields(&fields, named_it->second);
+    auto tenant_it = tenants_.find(out->tenant_id);
+    if (tenant_it != tenants_.end()) {
+        mergeFields(&fields, tenant_it->second.defaults);
+        out->matched_contract = out->tenant_id + ".default";
+        auto intent_it = tenant_it->second.intents.find(out->intent);
+        if (intent_it != tenant_it->second.intents.end()) {
+            mergeFields(&fields, intent_it->second);
             out->matched = true;
-            out->matched_contract = policy_name;
-        } else if (strict_mode_) {
-            return Status::InvalidArgument("unknown qos policy_name: " +
-                                           policy_name);
-        }
-    }
-
-    if (!out->matched) {
-        auto intent_default = intent_defaults_.find(out->intent);
-        if (intent_default != intent_defaults_.end()) {
-            mergeFields(&fields, intent_default->second);
-            out->matched_contract = "intent_default." + out->intent;
-        }
-
-        auto tenant_it = tenants_.find(out->tenant);
-        if (tenant_it != tenants_.end()) {
-            mergeFields(&fields, tenant_it->second.defaults);
-            out->matched_contract = out->tenant + ".default";
-            auto intent_it = tenant_it->second.intents.find(out->intent);
-            if (intent_it != tenant_it->second.intents.end()) {
-                mergeFields(&fields, intent_it->second);
-                out->matched = true;
-                out->matched_contract = out->tenant + "." + out->intent;
-            }
-        } else if (strict_mode_) {
-            return Status::InvalidArgument("unknown qos tenant: " +
-                                           out->tenant);
+            out->matched_contract = out->tenant_id + "." + out->intent;
         }
     }
 
     static_cast<QosPolicyFields&>(*out) = fields;
-    CHECK_STATUS(validateBandwidthRange(*out, "resolved qos policy"));
     if (out->priority) out->effective_priority = *out->priority;
     return Status::OK();
 }
@@ -553,22 +403,11 @@ Status QosContractResolver::resolve(const QosRequestContext& context,
 void QosContractResolver::fieldsToJson(json* out,
                                        const QosPolicyFields& fields) {
     if (fields.priority) (*out)["priority"] = *fields.priority;
-    if (fields.min_bandwidth_gbps) {
-        (*out)["min_bandwidth_gbps"] = *fields.min_bandwidth_gbps;
-    }
-    if (fields.max_bandwidth_gbps) {
-        (*out)["max_bandwidth_gbps"] = *fields.max_bandwidth_gbps;
-    }
-    if (fields.weight) (*out)["weight"] = *fields.weight;
-    if (fields.burst_bytes) (*out)["burst_bytes"] = *fields.burst_bytes;
     if (fields.max_inflight_bytes) {
         (*out)["max_inflight_bytes"] = *fields.max_inflight_bytes;
     }
     if (fields.max_inflight_requests) {
         (*out)["max_inflight_requests"] = *fields.max_inflight_requests;
-    }
-    if (fields.deadline_profile) {
-        (*out)["deadline_profile"] = *fields.deadline_profile;
     }
     if (fields.allowed_degraded_actions) {
         (*out)["allowed_degraded_actions"] = *fields.allowed_degraded_actions;
@@ -580,19 +419,13 @@ std::string QosContractResolver::explainJson(const EffectiveQosPolicy& policy,
     json out;
     out["enabled"] = policy.enabled;
     out["matched"] = policy.matched;
-    out["tenant"] = policy.tenant;
+    out["tenant_id"] = policy.tenant_id;
     out["intent"] = policy.intent;
     out["matched_contract"] = policy.matched_contract;
     out["requested_priority"] = policy.requested_priority;
     out["effective_priority"] = policy.effective_priority;
+    out["diagnostic_scope"] = "resolution_only";
     fieldsToJson(&out, policy);
-    out["enforcement"] = {
-        {"priority_authorization", "planned"},
-        {"max_inflight_bytes", "planned"},
-        {"max_inflight_requests", "planned"},
-        {"bandwidth_cap", "planned"},
-        {"receiver_credits", "planned"},
-    };
     return out.dump(indent);
 }
 

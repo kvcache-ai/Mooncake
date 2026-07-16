@@ -31,34 +31,22 @@ namespace tent {
 
 struct QosPolicyFields {
     std::optional<int> priority;
-    std::optional<double> min_bandwidth_gbps;
-    std::optional<double> max_bandwidth_gbps;
-    std::optional<uint32_t> weight;
-    std::optional<uint64_t> burst_bytes;
     std::optional<uint64_t> max_inflight_bytes;
     std::optional<uint64_t> max_inflight_requests;
-    std::optional<std::string> deadline_profile;
     std::optional<std::vector<std::string>> allowed_degraded_actions;
 };
 
 struct QosRequestContext {
-    // Tenant is the administrative isolation domain for QoS resolution
-    // (for example a user, workload group, or serving deployment). When no
-    // explicit policy_name is matched, the resolver applies this tenant's
-    // defaults and then this tenant's intent-specific override. Empty values
+    // Opaque administrative isolation identifier supplied by the caller. A
+    // Store integration should pass its canonical Store tenant ID here rather
+    // than create a second TENT-specific tenant namespace. Empty values
     // normalize to "default".
-    std::string tenant = "default";
+    std::string tenant_id = "default";
     // Intent is the normalized business meaning of the transfer
     // (foreground_get, background_prefetch, checkpoint, ...). When no explicit
-    // policy_name is matched, it first selects global intent defaults and then
     // selects the tenant-local intent override. Empty values normalize to
     // "unspec".
     std::string intent = "unspec";
-    // Optional explicit contract name requested by the caller. If it matches a
-    // named contract, that contract is selected after global defaults and the
-    // tenant/intent lookup is skipped. If it is unknown, compatibility mode
-    // falls back to tenant/intent resolution; strict mode rejects the request.
-    std::optional<std::string> policy_name;
     // Legacy caller priority. It is preserved when no resolved contract sets a
     // priority, and is overridden by the effective QoS contract priority when
     // present.
@@ -69,11 +57,11 @@ struct EffectiveQosPolicy : public QosPolicyFields {
     bool enabled = false;
     bool matched = false;
     // Normalized request identity used for resolution and explain output.
-    std::string tenant = "default";
+    std::string tenant_id = "default";
     std::string intent = "unspec";
     // Name of the contract layer that supplied the most specific match:
-    // compatibility_default, global_default, intent_default.<intent>,
-    // <tenant>.default, <tenant>.<intent>, or an explicit policy_name.
+    // compatibility_default, global_default, <tenant>.default, or
+    // <tenant>.<intent>.
     std::string matched_contract = "compatibility_default";
     int requested_priority = PRIO_HIGH;
     int effective_priority = PRIO_HIGH;
@@ -84,7 +72,6 @@ class QosContractResolver {
     Status loadFromConfig(const Config& config);
 
     bool enabled() const { return enabled_; }
-    bool strictMode() const { return strict_mode_; }
 
     Status resolve(const QosRequestContext& context,
                    EffectiveQosPolicy* out) const;
@@ -113,11 +100,8 @@ class QosContractResolver {
     static void fieldsToJson(json* out, const QosPolicyFields& fields);
 
     bool enabled_{false};
-    bool strict_mode_{false};
     QosPolicyFields global_defaults_;
-    std::unordered_map<std::string, QosPolicyFields> intent_defaults_;
     std::unordered_map<std::string, TenantContract> tenants_;
-    std::unordered_map<std::string, QosPolicyFields> named_contracts_;
 };
 
 }  // namespace tent
