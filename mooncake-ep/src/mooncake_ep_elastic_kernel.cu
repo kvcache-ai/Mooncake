@@ -966,6 +966,8 @@ void launch_mooncake_elastic_combine_reduce_epilogue(
 #else
     TRY_COMBINE_EPILOGUE(4096, 256, 8, 128, 24, 1, 8);
     TRY_COMBINE_EPILOGUE(4096, 256, 8, 128, 24, 1, 2);
+    TRY_COMBINE_EPILOGUE(7168, 256, 8, 128, 24, 1, 8);
+    TRY_COMBINE_EPILOGUE(7168, 256, 8, 128, 24, 1, 2);
 
 #define TRY_HYBRID_COMBINE_EPILOGUE_SHAPE(H, E, K, M, S)                       \
     TRY_COMBINE_EPILOGUE(H, E, K, M, S, 2, 4);                                 \
