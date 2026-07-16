@@ -47,6 +47,7 @@ class HAIntegrationTest : public ::testing::Test {
         const std::string& host_name, const std::string& master_addr,
         uint32_t rpc_port = 0, size_t async_sender_thread_count = 1) {
         if (rpc_port == 0) rpc_port = getFreeTcpPort();
+        const uint16_t http_port = static_cast<uint16_t>(getFreeTcpPort());
 
         auto config = ClientConfigBuilder::build_p2p_real_client(
             host_name, "P2PHANDSHAKE", "tcp", std::nullopt, master_addr,
@@ -56,8 +57,7 @@ class HAIntegrationTest : public ::testing::Test {
             /*route_cache_max_memory_bytes=*/300 * 1024 * 1024,
             /*route_cache_ttl_ms=*/60 * 1000,
             /*local_transfer_mode=*/"memcpy",
-            /*local_memcpy_async_worker_num=*/32,
-            /*http_port=*/9003,
+            /*local_memcpy_async_worker_num=*/32, http_port,
             /*enable_http_server=*/true,
             /*labels=*/{}, async_sender_thread_count);
 
@@ -128,6 +128,17 @@ class HAIntegrationTest : public ::testing::Test {
         client->ha_manager_->HandleEvent(HAEvent::MASTER_UNREACHABLE);
         ASSERT_TRUE(client->ha_manager_->IsDegraded())
             << "Expected DEGRADED state after MASTER_UNREACHABLE";
+    }
+
+    static bool RegisterOrAlreadyRestored(
+        std::shared_ptr<P2PClientService>& client, ErrorCode& error) {
+        auto reg = client->RegisterClient();
+        if (reg.has_value()) {
+            error = ErrorCode::OK;
+            return true;
+        }
+        error = reg.error();
+        return error == ErrorCode::CLIENT_ALREADY_EXISTS;
     }
 
     static void ForceRecover(std::shared_ptr<P2PClientService>& client) {
@@ -304,6 +315,7 @@ TEST_F(HAIntegrationTest, DegradedModeLocalOps) {
     EXPECT_FALSE(exist_none.value());
 
     ForceRecover(client1_);
+    client1_->StopHeartbeat();
 }
 
 // A3: Degraded mode — remote Get returns OBJECT_NOT_FOUND;
@@ -471,6 +483,43 @@ TEST_F(HAIntegrationTest, MasterSideState) {
     }
 }
 
+// A8: Re-registration reports current local tier segments to the master.
+TEST_F(HAIntegrationTest, ReRegisterReportsCurrentTierSegments) {
+    auto expected_segments = client1_->CollectTierSegments();
+    ASSERT_FALSE(expected_segments.empty());
+
+    auto& svc = master_.GetWrapped().GetMasterService();
+    UnregisterClientRequest unreg;
+    unreg.client_id = client1_->GetClientID();
+    unreg.deployment_mode = DeploymentMode::P2P;
+    auto unreg_result = svc.UnregisterClient(unreg);
+    ASSERT_TRUE(unreg_result.has_value())
+        << "UnregisterClient failed: " << unreg_result.error();
+
+    auto reg_result = client1_->RegisterClient();
+    ASSERT_TRUE(reg_result.has_value())
+        << "Re-register failed: " << reg_result.error();
+
+    auto registered_segments =
+        svc.GetClientManager().GetClientSegments(client1_->GetClientID());
+    ASSERT_TRUE(registered_segments.has_value())
+        << "GetClientSegments failed: " << registered_segments.error();
+    EXPECT_EQ(registered_segments.value().size(), expected_segments.size());
+
+    for (const auto& segment : expected_segments) {
+        auto registered = svc.GetClientManager().QuerySegment(
+            client1_->GetClientID(), segment.id);
+        ASSERT_TRUE(registered.has_value())
+            << "Missing registered segment: " << segment.name;
+        EXPECT_EQ(registered.value()->name, segment.name);
+        EXPECT_EQ(registered.value()->size, segment.size);
+        EXPECT_EQ(registered.value()->GetP2PExtra().memory_type,
+                  segment.GetP2PExtra().memory_type);
+    }
+
+    ForceRecover(client1_);
+}
+
 // ============================================================================
 // Group B: End-to-end failure scenario tests
 // ============================================================================
@@ -515,13 +564,21 @@ TEST_F(HAIntegrationTest, MasterRestartRecovery) {
         if (attempt == 9) FAIL() << "Reconnect client2 failed after retries";
     }
 
-    // Re-register clients with the restarted master.
-    auto reg1 = client1_->RegisterClient();
-    ASSERT_TRUE(reg1.has_value())
-        << "Re-register client1 failed: " << static_cast<int>(reg1.error());
-    auto reg2 = client2_->RegisterClient();
-    ASSERT_TRUE(reg2.has_value())
-        << "Re-register client2 failed: " << static_cast<int>(reg2.error());
+    // Re-register clients with the restarted master. After P2P master metadata
+    // restore is enabled, background HA recovery can race with this manual
+    // re-register and restore the same client first. In that case
+    // CLIENT_ALREADY_EXISTS means the restarted master already has the client,
+    // which is acceptable for this recovery test.
+    //
+    // TODO: Split client registration into strict user-initiated register and
+    // HA recovery register, so this idempotent "already restored" case is
+    // modeled by a dedicated recovery API instead of test-side interpretation.
+    ErrorCode reg1_error = ErrorCode::OK;
+    ASSERT_TRUE(RegisterOrAlreadyRestored(client1_, reg1_error))
+        << "Re-register client1 failed: " << static_cast<int>(reg1_error);
+    ErrorCode reg2_error = ErrorCode::OK;
+    ASSERT_TRUE(RegisterOrAlreadyRestored(client2_, reg2_error))
+        << "Re-register client2 failed: " << static_cast<int>(reg2_error);
 
     // Recovery: DEGRADED → SYNCING → FULL
     ForceRecover(client1_);

@@ -2,6 +2,7 @@
 
 #include <glog/logging.h>
 #include <algorithm>
+#include <variant>
 
 #include "ha/oplog/p2p_oplog_types.h"
 #include "p2p_client_meta.h"
@@ -654,6 +655,147 @@ auto P2PMasterService::SetSyncCompleted(UUID client_id)
     p2p_client->SetSyncing(false);
     LOG(INFO) << "SetSyncCompleted: client_id=" << client_id;
     return {};
+}
+
+ErrorCode P2PMasterService::RestoreFromStandbyMetadata(
+    const P2PStandbyMetadataStore::ExportedMetadata& metadata,
+    uint64_t last_applied_sequence_id) {
+    if (GetKeyCount() != 0 || !client_manager_->GetAllClients().empty()) {
+        LOG(ERROR) << "RestoreFromStandbyMetadata: target service is not empty"
+                   << ", existing_keys=" << GetKeyCount()
+                   << ", existing_clients="
+                   << client_manager_->GetAllClients().size();
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    if (last_applied_sequence_id > 0) {
+        auto* manager = GetOpLogManager();
+        if (manager) {
+            manager->SetInitialSequenceId(last_applied_sequence_id);
+        } else {
+            LOG(WARNING)
+                << "RestoreFromStandbyMetadata: cannot set initial OpLog "
+                   "sequence without OpLogManager"
+                << ", last_applied_sequence_id=" << last_applied_sequence_id;
+        }
+    }
+
+    size_t restored_clients = 0;
+    size_t restored_objects = 0;
+    size_t restored_replicas = 0;
+    size_t skipped_replicas = 0;
+
+    for (const auto& [client_id, client_info] : metadata.clients) {
+        RegisterClientRequest req;
+        req.client_id = client_id;
+        req.ip_address = client_info.ip_address;
+        req.rpc_port = client_info.rpc_port;
+        req.segments = client_info.segments;
+        req.deployment_mode = DeploymentMode::P2P;
+
+        auto result = MasterService::RegisterClient(req);
+        if (!result.has_value()) {
+            LOG(ERROR) << "RestoreFromStandbyMetadata: failed to restore client"
+                       << ", client_id=" << client_id
+                       << ", error=" << toString(result.error());
+            return result.error();
+        }
+
+        auto p2p_client = std::dynamic_pointer_cast<P2PClientMeta>(
+            client_manager_->GetClient(client_id));
+        if (p2p_client) {
+            p2p_client->SetSyncing(false);
+        }
+        ++restored_clients;
+    }
+
+    for (const auto& [key, standby_metadata] : metadata.objects) {
+        std::vector<Replica> replicas;
+        replicas.reserve(standby_metadata.replicas.size());
+
+        // TODO: Make promotion restore strict once gap/out-of-order handling is
+        // hardened. Missing clients/segments should follow an explicit policy
+        // instead of silently producing a partially restored object.
+        for (const auto& desc : standby_metadata.replicas) {
+            if (!std::holds_alternative<P2PProxyDescriptor>(
+                    desc.descriptor_variant)) {
+                LOG(WARNING)
+                    << "RestoreFromStandbyMetadata: skip non-P2P replica"
+                    << ", key=" << key << ", replica=" << desc;
+                ++skipped_replicas;
+                continue;
+            }
+
+            const auto& p2p_desc =
+                std::get<P2PProxyDescriptor>(desc.descriptor_variant);
+            auto client = std::dynamic_pointer_cast<P2PClientMeta>(
+                client_manager_->GetClient(p2p_desc.client_id));
+            if (!client) {
+                LOG(WARNING)
+                    << "RestoreFromStandbyMetadata: skip replica with missing "
+                       "client"
+                    << ", key=" << key << ", client_id=" << p2p_desc.client_id
+                    << ", segment_id=" << p2p_desc.segment_id;
+                ++skipped_replicas;
+                continue;
+            }
+
+            auto segment = client->QuerySegment(p2p_desc.segment_id);
+            if (!segment.has_value()) {
+                LOG(WARNING)
+                    << "RestoreFromStandbyMetadata: skip replica with missing "
+                       "segment"
+                    << ", key=" << key << ", client_id=" << p2p_desc.client_id
+                    << ", segment_id=" << p2p_desc.segment_id
+                    << ", error=" << toString(segment.error());
+                ++skipped_replicas;
+                continue;
+            }
+
+            const uint64_t object_size = p2p_desc.object_size != 0
+                                             ? p2p_desc.object_size
+                                             : standby_metadata.size;
+            replicas.emplace_back(
+                P2PProxyReplicaData(client, segment.value(), object_size),
+                ReplicaStatus::COMPLETE);
+        }
+
+        if (replicas.empty()) {
+            LOG(WARNING)
+                << "RestoreFromStandbyMetadata: skip object with no restorable "
+                   "replicas"
+                << ", key=" << key;
+            continue;
+        }
+
+        MetadataAccessorRW accessor(this, key);
+        auto& shard = accessor.GetShard().GetRef();
+        auto new_meta = std::make_unique<ObjectMetadata>(standby_metadata.size,
+                                                         std::move(replicas));
+        auto [it, inserted] = shard.metadata.emplace(key, std::move(new_meta));
+        if (!inserted) {
+            LOG(ERROR)
+                << "RestoreFromStandbyMetadata: object already exists despite "
+                   "empty-target check"
+                << ", key=" << key;
+            return ErrorCode::INTERNAL_ERROR;
+        }
+
+        for (const auto& replica : it->second->replicas_) {
+            AddReplicaToSegmentIndex(shard, it->first, replica);
+            OnReplicaAdded(replica);
+            ++restored_replicas;
+        }
+        ++restored_objects;
+    }
+
+    LOG(INFO) << "RestoreFromStandbyMetadata: restored"
+              << ", clients=" << restored_clients
+              << ", objects=" << restored_objects
+              << ", replicas=" << restored_replicas
+              << ", skipped_replicas=" << skipped_replicas
+              << ", last_applied_sequence_id=" << last_applied_sequence_id;
+    return ErrorCode::OK;
 }
 
 void P2PMasterService::OnObjectAccessed(const ObjectMetadata& metadata) {
