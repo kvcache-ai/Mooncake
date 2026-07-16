@@ -500,10 +500,48 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_TCP_ENABLE_CONNECTION_POOL` Enable TCP Connection Pool to avoid excessive sockets.
 - `MC_TCP_SLICE_SIZE` The segmentation granularity (in bytes) of TCP transport for splitting large transfers into socket read/write operations. Corresponds to `MC_SLICE_SIZE` for RDMA. Default value 65536 (64KB).
 - `MC_TCP_PROTO` When set to `1`, TCP initiators use the legacy unacknowledged framing even against servers that support acknowledged framing (protocol v2). Under v2 (the default against v2-capable servers), a WRITE completes only after the receiver confirms the payload has been applied to destination memory, and server-side rejections surface as failed transfers instead of silent data loss. Use this variable only as a rollback escape hatch during mixed-version upgrades.
+- `MC_TE_METRIC` Enable Transfer Engine metrics collection (accepted values: `1`, `true`, `yes`, `on`). Disabled by default. Turns on both the periodic latency/throughput log line and the standard Prometheus-style metrics described in [Standard Metrics](#standard-metrics).
+- `MC_TE_METRIC_INTERVAL_SECONDS` Interval in seconds for the periodic metrics log line. Default value 5. Must be positive.
+- `MC_TE_METRIC_HTTP_PORT` TCP port for the metrics HTTP server. Default value 0, which leaves the HTTP server disabled (metrics are still collected and can be scraped in-process). Set a positive port to expose `/metrics`, `/metrics/summary`, `/metrics/json`, and `/health`.
+- `MC_TE_METRIC_HTTP_HOST` Bind address for the metrics HTTP server. Default value `0.0.0.0`.
+- `MC_TE_METRIC_HTTP_THREADS` Number of HTTP server worker threads. Default value 1.
 
 ## C++ API Reference
 
 For the complete C++ API reference, see [Transfer Engine C++ API](../../api-reference/cpp/index).
+
+(standard-metrics)=
+## Standard Metrics
+
+The Classic Transfer Engine exports standard Prometheus-style metrics in
+addition to its periodic log line. Metrics collection is off by default; enable
+it with `MC_TE_METRIC=1`. To scrape the metrics over HTTP, also set
+`MC_TE_METRIC_HTTP_PORT` to a positive port. The endpoint layout matches the
+[TENT metrics system](../tent/metrics.md): `/metrics` (Prometheus text),
+`/metrics/summary` (human readable), `/metrics/json` (JSON), and `/health`.
+
+Metrics are compiled in only when the project is built with `-DWITH_METRICS=ON`
+(the default). Every transfer is recorded exactly once: a request is counted at
+submission time, and exactly one completion or failure is recorded when the
+task first reaches a terminal state, so repeated polling of
+`getTransferStatus` never double counts.
+
+| Metric Name | Type | Description |
+|-------------|------|-------------|
+| `transfer_requests_total` | Counter | Total transfer tasks submitted |
+| `transfer_bytes_total` | Counter | Total bytes transferred (successful tasks) |
+| `transfer_failures_total` | Counter | Total transfer tasks that failed, canceled, or timed out |
+| `transfer_latency_seconds` | Histogram | Completion latency distribution in seconds (successful tasks) |
+| `transfer_size_bytes` | Histogram | Transfer request size distribution in bytes |
+| `inflight_transfers` | Gauge | Transfers currently in flight (submitted but not yet terminal) |
+
+The existing periodic log line (throughput and latency distribution, controlled
+by `MC_TE_METRIC_INTERVAL_SECONDS`) is preserved unchanged; the metrics above
+are additional functionality.
+
+Runtime collection can be toggled without a rebuild via
+`TransferEngineMetrics::setEnabled(false)`, which makes the record functions
+return after a single atomic load.
 
 ## Supported Protocols
 

@@ -40,6 +40,7 @@
 #ifdef WITH_METRICS
 #include "ylt/metric/counter.hpp"
 #include "ylt/metric/histogram.hpp"
+#include "transfer_engine_metrics.h"
 #endif
 
 namespace mooncake {
@@ -131,6 +132,7 @@ class TransferEngineImpl {
             for (auto& task : batch.task_list) {
                 if (task.start_time.time_since_epoch().count() == 0) {
                     task.start_time = now;
+                    TransferEngineMetrics::instance().recordSubmitted();
                 }
             }
         }
@@ -157,6 +159,7 @@ class TransferEngineImpl {
             for (auto& task : batch.task_list) {
                 if (task.start_time.time_since_epoch().count() == 0) {
                     task.start_time = now;
+                    TransferEngineMetrics::instance().recordSubmitted();
                 }
             }
         }
@@ -192,6 +195,7 @@ class TransferEngineImpl {
             for (auto& task : batch.task_list) {
                 if (task.start_time.time_since_epoch().count() == 0) {
                     task.start_time = now;
+                    TransferEngineMetrics::instance().recordSubmitted();
                 }
             }
         }
@@ -219,6 +223,7 @@ class TransferEngineImpl {
             for (auto& task : batch.task_list) {
                 if (task.start_time.time_since_epoch().count() == 0) {
                     task.start_time = now;
+                    TransferEngineMetrics::instance().recordSubmitted();
                 }
             }
         }
@@ -284,7 +289,7 @@ class TransferEngineImpl {
                 goto metrics_done;
             }
 
-            // Only record metrics for successful completions
+            // Only record latency metrics for successful completions
             if (status.s == TransferStatusEnum::COMPLETED) {
                 if (status.transferred_bytes > 0) {
                     transferred_bytes_counter_.inc(status.transferred_bytes);
@@ -294,6 +299,15 @@ class TransferEngineImpl {
                     std::chrono::duration_cast<std::chrono::microseconds>(
                         now - start);
                 task_completion_latency_us_.observe(duration.count());
+
+                // Standard Prometheus-style metrics (exported via HTTP).
+                double latency_seconds = duration.count() / 1000000.0;
+                TransferEngineMetrics::instance().recordCompleted(
+                    status.transferred_bytes, latency_seconds);
+            } else {
+                // FAILED / CANCELED / TIMEOUT all count as a failure and clear
+                // this task's slot in the inflight gauge.
+                TransferEngineMetrics::instance().recordFailed();
             }
 
             // Reset start_time to prevent duplicate processing

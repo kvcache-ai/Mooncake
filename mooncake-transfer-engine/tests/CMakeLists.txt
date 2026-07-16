@@ -19,6 +19,12 @@ target_link_libraries(transport_uint_test PUBLIC transfer_engine gtest
                                                  gtest_main)
 add_test(NAME transport_uint_test COMMAND transport_uint_test)
 
+add_executable(transfer_engine_metrics_test
+               ${WORKSPACE}/transfer_engine_metrics_test.cpp)
+target_link_libraries(transfer_engine_metrics_test PUBLIC transfer_engine gtest
+                                                          gtest_main)
+add_test(NAME transfer_engine_metrics_test COMMAND transfer_engine_metrics_test)
+
 add_executable(endpoint_store_test ${WORKSPACE}/endpoint_store_test.cpp)
 target_link_libraries(endpoint_store_test PUBLIC transfer_engine gtest
                                                  gtest_main)
