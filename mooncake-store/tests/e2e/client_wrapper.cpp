@@ -47,15 +47,15 @@ ClientTestWrapper::CreateClientWrapper(
         }
         config.redis_username = redis_username;
         config.redis_password = redis_password;
-        client = std::make_shared<P2PClientService>(
+        auto p2p_client = std::make_shared<P2PClientService>(
             config.metadata_connstring, config.http_port,
             config.enable_http_server, config.labels);
-        auto err =
-            std::static_pointer_cast<P2PClientService>(client)->Init(config);
+        auto err = p2p_client->Init(config);
         if (err != ErrorCode::OK) {
             LOG(ERROR) << "failed to init P2P client, error=" << err;
             return std::nullopt;
         }
+        client = std::move(p2p_client);
     } else {
         auto config = ClientConfigBuilder::build_centralized_real_client(
             hostname, metadata_connstring, protocol, device_name,

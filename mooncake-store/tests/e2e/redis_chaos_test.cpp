@@ -179,6 +179,13 @@ class ClientCtlProcess {
         }
 
         if (pid == 0) {
+            struct sigaction default_action = {};
+            default_action.sa_handler = SIG_DFL;
+            sigemptyset(&default_action.sa_mask);
+            if (sigaction(SIGPIPE, &default_action, nullptr) != 0) {
+                _exit(1);
+            }
+
             dup2(stdin_pipe[0], STDIN_FILENO);
             dup2(stdout_pipe[1], STDOUT_FILENO);
 
@@ -296,6 +303,17 @@ class ClientCtlProcess {
                     pid_ = 0;
                     return;
                 }
+                if (ret < 0) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    if (errno != ECHILD) {
+                        LOG(ERROR) << "failed to wait for clientctl: "
+                                   << strerror(errno);
+                    }
+                    pid_ = 0;
+                    return;
+                }
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
             kill(pid_, SIGKILL);
@@ -320,9 +338,19 @@ class RedisChaosTest : public ::testing::Test {
     static void SetUpTestSuite() {
         google::InitGoogleLogging("RedisChaosTest");
         FLAGS_logtostderr = 1;
+
+        struct sigaction ignore_action = {};
+        ignore_action.sa_handler = SIG_IGN;
+        sigemptyset(&ignore_action.sa_mask);
+        ASSERT_EQ(sigaction(SIGPIPE, &ignore_action, &old_sigpipe_action_), 0)
+            << strerror(errno);
     }
 
-    static void TearDownTestSuite() { google::ShutdownGoogleLogging(); }
+    static void TearDownTestSuite() {
+        EXPECT_EQ(sigaction(SIGPIPE, &old_sigpipe_action_, nullptr), 0)
+            << strerror(errno);
+        google::ShutdownGoogleLogging();
+    }
 
     void SetUp() override {
         CleanupRedisKeys();
@@ -519,6 +547,7 @@ class RedisChaosTest : public ::testing::Test {
 
     std::vector<std::unique_ptr<MasterProcessHandler>> masters_;
     std::unique_ptr<RedisMasterViewHelper> master_view_helper_;
+    inline static struct sigaction old_sigpipe_action_ = {};
 };
 
 TEST_F(RedisChaosTest, LeaderKilledFailover) {
