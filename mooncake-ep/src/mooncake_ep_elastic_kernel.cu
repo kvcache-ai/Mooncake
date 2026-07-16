@@ -584,8 +584,10 @@ void launch_mooncake_elastic_dispatch(
 
 #define TRY_HYBRID_DISPATCH_SHAPE(H, E, K, M, S)                               \
         TRY_HYBRID_DISPATCH(H, E, K, M, S, 2, 4, 4);                           \
+        TRY_HYBRID_DISPATCH(H, E, K, M, S, 2, 4, 7);                           \
         TRY_HYBRID_DISPATCH(H, E, K, M, S, 2, 4, 8);                           \
         TRY_HYBRID_DISPATCH(H, E, K, M, S, 2, 8, 4);                           \
+        TRY_HYBRID_DISPATCH(H, E, K, M, S, 2, 8, 7);                           \
         TRY_HYBRID_DISPATCH(H, E, K, M, S, 2, 8, 8)
 
         TRY_HYBRID_DISPATCH_SHAPE(4096, 256, 8, 128, 24);
@@ -874,8 +876,10 @@ void* launch_mooncake_elastic_combine(
 
 #define TRY_HYBRID_COMBINE_SHAPE(H, E, K, M, S)                                \
         TRY_HYBRID_COMBINE(H, E, K, M, S, 2, 4, 4);                            \
+        TRY_HYBRID_COMBINE(H, E, K, M, S, 2, 4, 7);                            \
         TRY_HYBRID_COMBINE(H, E, K, M, S, 2, 4, 8);                            \
         TRY_HYBRID_COMBINE(H, E, K, M, S, 2, 8, 4);                            \
+        TRY_HYBRID_COMBINE(H, E, K, M, S, 2, 8, 7);                            \
         TRY_HYBRID_COMBINE(H, E, K, M, S, 2, 8, 8)
 
         TRY_HYBRID_COMBINE_SHAPE(4096, 256, 8, 128, 24);

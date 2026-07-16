@@ -293,6 +293,7 @@ def main() -> None:
             f"tokens={args.num_tokens}",
             f"hidden={args.hidden}",
             f"topk={args.num_topk}",
+            f"channels_per_sm={cached_handle.num_channels_per_sm}",
             f"scaleout={buffer.num_scaleout_ranks}",
             f"scaleup={buffer.num_scaleup_ranks}",
             f"dispatch_avg_ms={dispatch_avg_ms:.3f}",
