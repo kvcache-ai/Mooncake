@@ -221,6 +221,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
       offloading_queue_limit_(config.offloading_queue_limit),
       offload_cap_ratio_(config.offload_cap_ratio),
       task_manager_(config.task_manager_config) {
+    if (client_active_ttl_sec_ <= 0 || client_suspicion_ttl_sec_ <= 0) {
+        throw std::invalid_argument("Client liveness TTLs must be positive");
+    }
     if (allocation_strategy_type_ == AllocationStrategyType::LOCAL_FIRST) {
         LOG(INFO) << "Local-first allocation strategy enabled";
     }
@@ -746,43 +749,39 @@ MasterService::DeleteTenantQuotaPolicy(const std::string& tenant_id) {
 
 auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
-    ErrorCode mount_result = ErrorCode::OK;
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    ErrorCode mount_result = ErrorCode::INTERNAL_ERROR;
     {
-        ScopedSegmentAccess segment_access =
-            segment_manager_.getSegmentAccess();
-
-        // Tell the client monitor thread to start timing for this client. To
-        // avoid the following undesired situations, this message must be sent
-        // after locking the segment mutex and before the mounting operation
-        // completes:
-        // 1. Sending the message before the lock: the client expires and
-        // unmouting invokes before this mounting are completed, which prevents
-        // this segment being able to be unmounted forever;
-        // 2. Sending the message after mounting the segment: After mounting
-        // this segment, when trying to push id to the queue, the queue is
-        // already full. However, at this point, the message must be sent,
-        // otherwise this client cannot be monitored and expired.
-        {
-            PodUUID pod_client_id;
-            pod_client_id.first = client_id.first;
-            pod_client_id.second = client_id.second;
-            if (!client_ping_queue_.push(pod_client_id)) {
-                LOG(ERROR) << "segment_name=" << segment.name
-                           << ", error=client_ping_queue_full";
-                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-            }
+        std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
+        auto record_it =
+            client_liveness_records_
+                .try_emplace(client_id,
+                             std::make_shared<ClientLivenessRecord>(
+                                 ClientLivenessRecord::Clock::now()))
+                .first;
+        const auto& record = record_it->second;
+        std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+        const auto observation = record->ObserveAndRun(
+            ClientLivenessRecord::Clock::now(), [&] {
+                ScopedSegmentAccess segment_access =
+                    segment_manager_.getSegmentAccess();
+                LOG(INFO)
+                    << "client_id=" << client_id
+                    << ", action=mount_segment, segment_name=" << segment.name;
+                mount_result =
+                    segment_access.MountSegment(segment, client_id);
+            });
+        if (observation == ClientLivenessObservation::REJECTED_OFFLINE) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
         }
-
-        LOG(INFO) << "client_id=" << client_id
-                  << ", action=mount_segment, segment_name=" << segment.name;
-
-        auto err = segment_access.MountSegment(segment, client_id);
-        if (err == ErrorCode::SEGMENT_ALREADY_EXISTS) {
-            // Return OK because this is an idempotent operation
-            mount_result = err;
-        } else if (err != ErrorCode::OK) {
-            return tl::make_unexpected(err);
+        if (observation == ClientLivenessObservation::RECOVERED_ACTIVE) {
+            LOG(INFO) << "client_id=" << client_id
+                      << ", action=client_liveness_recovered, "
+                         "signal=memory_mount";
+        }
+        if (mount_result != ErrorCode::OK &&
+            mount_result != ErrorCode::SEGMENT_ALREADY_EXISTS) {
+            return tl::make_unexpected(mount_result);
         }
     }
     UpdateClientHostId(client_id, segment.host_id);
@@ -821,57 +820,45 @@ auto MasterService::MountNoFSegment(const NoFSegment& segment,
 auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                    const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    {
-        std::unique_lock<std::shared_mutex> lock(client_mutex_);
-        for (const auto& segment : segments) {
-            if (!segment.host_id.empty()) {
-                client_host_id_[client_id] = segment.host_id;
-                break;
-            }
-        }
-        if (ok_client_.contains(client_id)) {
-            LOG(WARNING) << "client_id=" << client_id
-                         << ", warn=client_already_remounted";
-            // Return OK because this is an idempotent operation
-            return {};
-        }
+    std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
+    if (ok_client_.contains(client_id)) {
+        LOG(WARNING) << "client_id=" << client_id
+                     << ", warn=client_already_remounted";
+        return {};
+    }
 
-        {
+    auto record_it =
+        client_liveness_records_
+            .try_emplace(client_id,
+                         std::make_shared<ClientLivenessRecord>(
+                             ClientLivenessRecord::Clock::now()))
+            .first;
+    const auto& record = record_it->second;
+    ErrorCode err = ErrorCode::INTERNAL_ERROR;
+    {
+        std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+        const bool accepted = record->RunUnlessOffline([&] {
             ScopedSegmentAccess segment_access =
                 segment_manager_.getSegmentAccess();
-
-            // Tell the client monitor thread to start timing for this client.
-            // To avoid the following undesired situations, this message must be
-            // sent after locking the segment mutex or client mutex and before
-            // the remounting operation completes:
-            // 1. Sending the message before the lock: the client expires and
-            // unmouting invokes before this remounting are completed, which
-            // prevents this segment being able to be unmounted forever;
-            // 2. Sending the message after remounting the segments: After
-            // remounting these segments, when trying to push id to the queue,
-            // the queue is already full. However, at this point, the message
-            // must be sent, otherwise this client cannot be monitored and
-            // expired.
-            PodUUID pod_client_id;
-            pod_client_id.first = client_id.first;
-            pod_client_id.second = client_id.second;
-            if (!client_ping_queue_.push(pod_client_id)) {
-                LOG(ERROR) << "client_id=" << client_id
-                           << ", error=client_ping_queue_full";
-                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-            }
-
-            ErrorCode err = segment_access.ReMountSegment(segments, client_id);
-            if (err != ErrorCode::OK) {
-                return tl::make_unexpected(err);
-            }
+            err = segment_access.ReMountSegment(segments, client_id);
+        });
+        if (!accepted) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
         }
-
-        // Change the client status to OK
-        ok_client_.insert(client_id);
-        MasterMetricManager::instance().inc_active_clients();
+        if (err != ErrorCode::OK) {
+            return tl::make_unexpected(err);
+        }
     }
+    for (const auto& segment : segments) {
+        if (!segment.host_id.empty()) {
+            client_host_id_[client_id] = segment.host_id;
+            break;
+        }
+    }
+    ok_client_.insert(client_id);
+    MasterMetricManager::instance().inc_active_clients();
+    client_lock.unlock();
     RecomputeTenantEffectiveQuotas();
 
     return {};
@@ -896,10 +883,24 @@ auto MasterService::ReMountNoFSegment(const std::vector<NoFSegment>& segments,
 #endif
 }
 
-std::unordered_set<UUID, boost::hash<UUID>>
-MasterService::getAliveClientsSnapshot() const {
+std::shared_ptr<ClientLivenessRecord> MasterService::FindClientRecord(
+    const UUID& client_id) const {
     std::shared_lock<std::shared_mutex> lock(client_mutex_);
-    return ok_client_;
+    const auto it = client_liveness_records_.find(client_id);
+    return it == client_liveness_records_.end() ? nullptr : it->second;
+}
+
+std::unordered_set<UUID, boost::hash<UUID>>
+MasterService::GetRetainedClientIdsSnapshot() const {
+    std::shared_lock<std::shared_mutex> lock(client_mutex_);
+    std::unordered_set<UUID, boost::hash<UUID>> retained_clients;
+    retained_clients.reserve(client_liveness_records_.size());
+    for (const auto& [client_id, record] : client_liveness_records_) {
+        if (record->ShouldRetainResources()) {
+            retained_clients.insert(client_id);
+        }
+    }
+    return retained_clients;
 }
 
 void MasterService::UpdateClientHostId(const UUID& client_id,
@@ -1867,7 +1868,7 @@ void MasterService::GrantLeaseForGroup(const TenantState& tenant_state,
 }
 
 void MasterService::ClearInvalidHandles() {
-    ClearInvalidHandles(getAliveClientsSnapshot());
+    ClearInvalidHandles(GetRetainedClientIdsSnapshot());
 }
 
 void MasterService::ClearInvalidHandles(
@@ -1927,6 +1928,7 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
                                    const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
     size_t metrics_dec_capacity = 0;  // to update the metrics
+    const auto retained_clients = GetRetainedClientIdsSnapshot();
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     // 1. Prepare to unmount the segment by deleting its allocator
@@ -1946,7 +1948,7 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
        // deadlocks
 
     // 2. Remove the metadata of the related objects
-    ClearInvalidHandles();
+    ClearInvalidHandles(retained_clients);
 
     // 3. Commit the unmount operation
     {
@@ -3092,7 +3094,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         auto now = std::chrono::system_clock::now();
         std::optional<size_t> retry_shard_idx;
         {
-            auto alive_clients = getAliveClientsSnapshot();
+            auto alive_clients = GetRetainedClientIdsSnapshot();
             std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
             const size_t lookup_shard_idx =
                 getMetadataShardIndex(object_id.tenant_id, object_id.user_key);
@@ -3525,7 +3527,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
         std::optional<size_t> case_a_retry_shard_idx;
         {
             // --- Lock acquisition ---
-            auto alive_clients = getAliveClientsSnapshot();
+            auto alive_clients = GetRetainedClientIdsSnapshot();
             std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
             // Use getMetadataShardIndex to find the object at its current shard
             // (handles both grouped and ungrouped routing).
@@ -4674,9 +4676,8 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
         keys_by_shard[shard_idx].emplace_back(i, &keys[i]);
     }
 
+    auto alive_clients = GetRetainedClientIdsSnapshot();
     std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
-
-    auto alive_clients = getAliveClientsSnapshot();
 
     // Process each shard once, acquiring lock per shard
     for (auto& [shard_idx, key_group] : keys_by_shard) {
@@ -4804,23 +4805,23 @@ size_t MasterService::GetKeyCount() const {
 
 auto MasterService::Ping(const UUID& client_id)
     -> tl::expected<PingResponse, ErrorCode> {
-    ClientStatus client_status;
-    {
-        std::shared_lock<std::shared_mutex> lock(client_mutex_);
-        auto it = ok_client_.find(client_id);
-        if (it != ok_client_.end()) {
-            client_status = ClientStatus::OK;
-        } else {
-            client_status = ClientStatus::NEED_REMOUNT;
+    std::shared_lock<std::shared_mutex> lock(client_mutex_);
+    bool observation_accepted = false;
+    const auto record_it = client_liveness_records_.find(client_id);
+    if (record_it != client_liveness_records_.end()) {
+        const auto observation = record_it->second->Observe(
+            ClientLivenessRecord::Clock::now());
+        observation_accepted =
+            observation != ClientLivenessObservation::REJECTED_OFFLINE;
+        if (observation == ClientLivenessObservation::RECOVERED_ACTIVE) {
+            LOG(INFO) << "client_id=" << client_id
+                      << ", action=client_liveness_recovered, signal=ping";
         }
     }
-    PodUUID pod_client_id = {client_id.first, client_id.second};
-    if (!client_ping_queue_.push(pod_client_id)) {
-        // Queue is full
-        LOG(ERROR) << "client_id=" << client_id
-                   << ", error=client_ping_queue_full";
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
+    const ClientStatus client_status =
+        observation_accepted && ok_client_.contains(client_id)
+            ? ClientStatus::OK
+            : ClientStatus::NEED_REMOUNT;
     return PingResponse(view_version_, client_status);
 }
 
@@ -4854,29 +4855,33 @@ auto MasterService::MountLocalDiskSegment(const UUID& client_id,
         LOG(ERROR) << "	The offload functionality is not enabled";
         return tl::make_unexpected(ErrorCode::UNABLE_OFFLOAD);
     }
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-
-    auto err =
-        segment_access.MountLocalDiskSegment(client_id, enable_offloading);
-    if (err == ErrorCode::SEGMENT_ALREADY_EXISTS) {
-        // Return OK because this is an idempotent operation
-        return {};
-    } else if (err != ErrorCode::OK) {
-        return tl::make_unexpected(err);
+    std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
+    auto record_it =
+        client_liveness_records_
+            .try_emplace(client_id,
+                         std::make_shared<ClientLivenessRecord>(
+                             ClientLivenessRecord::Clock::now()))
+            .first;
+    const auto& record = record_it->second;
+    ErrorCode err = ErrorCode::INTERNAL_ERROR;
+    std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+    const auto observation = record->ObserveAndRun(
+        ClientLivenessRecord::Clock::now(), [&] {
+            ScopedSegmentAccess segment_access =
+                segment_manager_.getSegmentAccess();
+            err = segment_access.MountLocalDiskSegment(client_id,
+                                                       enable_offloading);
+        });
+    if (observation == ClientLivenessObservation::REJECTED_OFFLINE) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
-
-    // Notify the client monitor thread to start tracking this client's TTL.
-    // Without this, a client that only mounts a LOCAL_DISK segment (and
-    // doesn't ping) would be considered expired by ClientMonitorFunc, which
-    // would then clear all its LOCAL_DISK replicas.
-    PodUUID pod_client_id;
-    pod_client_id.first = client_id.first;
-    pod_client_id.second = client_id.second;
-    if (!client_ping_queue_.push(pod_client_id)) {
-        LOG(ERROR) << "client_id=" << client_id
-                   << ", error=client_ping_queue_full";
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    if (observation == ClientLivenessObservation::RECOVERED_ACTIVE) {
+        LOG(INFO) << "client_id=" << client_id
+                  << ", action=client_liveness_recovered, "
+                     "signal=local_disk_mount";
+    }
+    if (err != ErrorCode::OK && err != ErrorCode::SEGMENT_ALREADY_EXISTS) {
+        return tl::make_unexpected(err);
     }
 
     return {};
@@ -5967,9 +5972,9 @@ void MasterService::ResetStateAfterFailedRestoreAttempt() {
     {
         std::unique_lock<std::shared_mutex> lock(client_mutex_);
         ok_client_.clear();
-    }
-    PodUUID pod_uuid;
-    while (client_ping_queue_.pop(pod_uuid)) {
+        client_liveness_records_.clear();
+        pending_offboarding_jobs_.clear();
+        pending_client_offboarding_jobs_.store(0, std::memory_order_release);
     }
 
     MasterMetricManager::instance().reset_allocated_mem_size();
@@ -7027,149 +7032,260 @@ void MasterService::NotifyClientLeaseExpired(
     }
 }
 
+void MasterService::RetryPrepareClientOffboarding(
+    ClientOffboardingJob& job) {
+    ++job.attempts;
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    std::vector<Segment> segments;
+    if (segment_access.GetClientSegments(job.client_id, segments) !=
+        ErrorCode::OK) {
+        job.stage = ClientOffboardingStage::READY_FOR_METADATA_CLEANUP;
+        return;
+    }
+
+    bool preparation_pending = false;
+    for (const auto& segment : segments) {
+        const auto already_prepared = std::find_if(
+            job.segments.begin(), job.segments.end(), [&](const auto& item) {
+                return item.segment_id == segment.id;
+            });
+        if (already_prepared != job.segments.end()) {
+            continue;
+        }
+
+        size_t metrics_dec_capacity = 0;
+        const auto result = segment_access.PrepareUnmountSegment(
+            segment.id, metrics_dec_capacity);
+        if (result == ErrorCode::OK) {
+            job.segments.push_back({
+                .segment_id = segment.id,
+                .segment_name = segment.name,
+                .metrics_dec_capacity = metrics_dec_capacity,
+            });
+            continue;
+        }
+
+        preparation_pending = true;
+        LOG(ERROR) << "client_id=" << job.client_id
+                   << ", segment_name=" << segment.name
+                   << ", action=client_offboarding_retry"
+                   << ", stage=prepare, attempt=" << job.attempts
+                   << ", error=" << toString(result);
+    }
+
+    if (!preparation_pending) {
+        job.stage = ClientOffboardingStage::READY_FOR_METADATA_CLEANUP;
+    }
+}
+
+void MasterService::CompleteClientOffboardingBatch(
+    const std::unordered_set<UUID, boost::hash<UUID>>& retained_clients) {
+    bool needs_metadata_cleanup = false;
+    for (const auto& job : pending_offboarding_jobs_) {
+        if (job.stage ==
+                ClientOffboardingStage::READY_FOR_METADATA_CLEANUP &&
+            !job.metadata_cleaned) {
+            needs_metadata_cleanup = true;
+            break;
+        }
+    }
+
+    if (needs_metadata_cleanup) {
+        ClearInvalidHandles(retained_clients);
+        for (auto& job : pending_offboarding_jobs_) {
+            if (job.stage ==
+                    ClientOffboardingStage::READY_FOR_METADATA_CLEANUP &&
+                !job.metadata_cleaned) {
+                job.metadata_cleaned = true;
+                job.stage = ClientOffboardingStage::COMMITTING;
+            }
+        }
+    }
+
+    bool quota_recompute_needed = false;
+    for (auto& job : pending_offboarding_jobs_) {
+        if (job.stage != ClientOffboardingStage::COMMITTING) {
+            continue;
+        }
+
+        bool commit_pending = false;
+        {
+            ScopedSegmentAccess segment_access =
+                segment_manager_.getSegmentAccess();
+            for (auto& segment : job.segments) {
+                if (segment.committed) {
+                    continue;
+                }
+                const auto result = segment_access.CommitUnmountSegment(
+                    segment.segment_id, job.client_id,
+                    segment.metrics_dec_capacity);
+                if (result != ErrorCode::OK) {
+                    commit_pending = true;
+                    LOG(ERROR)
+                        << "client_id=" << job.client_id
+                        << ", segment_name=" << segment.segment_name
+                        << ", action=client_offboarding_retry"
+                        << ", stage=commit, attempt=" << job.attempts
+                        << ", error=" << toString(result);
+                    continue;
+                }
+                segment.committed = true;
+                LOG(INFO) << "client_id=" << job.client_id
+                          << ", segment_name=" << segment.segment_name
+                          << ", action=unmount_offline_mem_segment";
+                if (!segment.http_cleanup_submitted) {
+                    cleanupHttpMetadata(segment.segment_name);
+                    segment.http_cleanup_submitted = true;
+                }
+            }
+            if (!commit_pending && !job.local_disk_unmounted) {
+                segment_access.UnmountLocalDiskSegment(job.client_id);
+                job.local_disk_unmounted = true;
+            }
+        }
+
+        if (!commit_pending && job.local_disk_unmounted) {
+            job.stage = ClientOffboardingStage::COMPLETE;
+            quota_recompute_needed = true;
+            const auto duration_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - job.started_at)
+                    .count();
+            LOG(INFO) << "client_id=" << job.client_id
+                      << ", action=client_offboarding_complete"
+                      << ", duration_ms=" << duration_ms
+                      << ", attempts=" << job.attempts;
+        }
+    }
+
+    if (quota_recompute_needed) {
+        RecomputeTenantEffectiveQuotas();
+    }
+}
+
 void MasterService::ClientMonitorFunc() {
-    std::unordered_map<UUID, std::chrono::steady_clock::time_point,
-                       boost::hash<UUID>>
-        client_ttl;
     while (client_monitor_running_) {
-        auto now = std::chrono::steady_clock::now();
-
-        // Update the client ttl
-        PodUUID pod_client_id;
-        while (client_ping_queue_.pop(pod_client_id)) {
-            UUID client_id = {pod_client_id.first, pod_client_id.second};
-            client_ttl[client_id] =
-                now + std::chrono::seconds(client_active_ttl_sec_);
-        }
-
-        // Find out expired clients
-        std::vector<UUID> expired_clients;
-        for (auto it = client_ttl.begin(); it != client_ttl.end();) {
-            if (it->second < now) {
-                LOG(INFO) << "client_id=" << it->first
-                          << ", action=client_expired";
-                expired_clients.push_back(it->first);
-                it = client_ttl.erase(it);
-            } else {
-                ++it;
+        const auto now = ClientLivenessRecord::Clock::now();
+        std::vector<std::pair<UUID, std::shared_ptr<ClientLivenessRecord>>>
+            records;
+        {
+            std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
+            records.reserve(client_liveness_records_.size());
+            for (const auto& entry : client_liveness_records_) {
+                records.push_back(entry);
             }
         }
 
-        // Update the client status to NEED_REMOUNT
-        if (!expired_clients.empty()) {
-            std::vector<ClientLeaseExpiredEvent> expiration_events;
-            expiration_events.reserve(expired_clients.size());
-            std::unordered_map<UUID, size_t, boost::hash<UUID>> event_indices;
-            for (const auto& client_id : expired_clients) {
-                event_indices.emplace(client_id, expiration_events.size());
-                expiration_events.push_back({client_id, {}});
+        std::vector<std::pair<UUID, std::shared_ptr<ClientLivenessRecord>>>
+            due_offline;
+        for (const auto& [client_id, record] : records) {
+            if (record->state() == ClientLivenessState::ACTIVE) {
+                const auto transition = record->Evaluate(
+                    now, std::chrono::seconds(client_active_ttl_sec_),
+                    std::chrono::seconds(client_suspicion_ttl_sec_));
+                if (transition ==
+                    ClientLivenessTransition::BECAME_SUSPECTED) {
+                    LOG(INFO) << "client_id=" << client_id
+                              << ", action=client_liveness_suspected";
+                }
+                continue;
             }
-
-            // Notify graceful unmount scheduler to drop pending records
-            // for expired clients. The actual unmount is handled below.
-            for (auto& cid : expired_clients) {
-                graceful_unmount_scheduler_.RemoveIf(
-                    [&cid](const GracefulUnmountDeadlineRecord& record) {
-                        return record.client_id == cid;
-                    });
+            if (record->state() == ClientLivenessState::SUSPECTED) {
+                due_offline.emplace_back(client_id, record);
             }
+        }
 
-            // Record which segments are unmounted, will be used in the commit
-            // phase.
-            std::vector<UUID> unmount_segments;
-            std::vector<size_t> dec_capacities;
-            std::vector<UUID> client_ids;
-            std::vector<std::string> segment_names;
-            {
-                std::shared_lock<std::shared_mutex> shared_lock(
-                    snapshot_mutex_);
-                {
-                    // Lock client_mutex and segment_mutex
-                    std::unique_lock<std::shared_mutex> lock(client_mutex_);
-                    for (auto& client_id : expired_clients) {
-                        auto it = ok_client_.find(client_id);
-                        if (it != ok_client_.end()) {
-                            ok_client_.erase(it);
+        if (!due_offline.empty() || !pending_offboarding_jobs_.empty()) {
+            std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
+            std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+
+            for (const auto& [client_id, record] : due_offline) {
+                const auto current = client_liveness_records_.find(client_id);
+                if (current == client_liveness_records_.end() ||
+                    current->second != record) {
+                    continue;
+                }
+
+                ClientOffboardingJob job{
+                    .client_id = client_id,
+                    .record = record,
+                    .segments = {},
+                    .stage = ClientOffboardingStage::PREPARING,
+                    .metadata_cleaned = false,
+                    .local_disk_unmounted = false,
+                    .attempts = 0,
+                    .started_at = std::chrono::steady_clock::now(),
+                };
+                const auto transition = record->EvaluateAndRetire(
+                    now, std::chrono::seconds(client_active_ttl_sec_),
+                    std::chrono::seconds(client_suspicion_ttl_sec_), [&] {
+                        if (ok_client_.erase(client_id) > 0) {
                             MasterMetricManager::instance()
                                 .dec_active_clients();
                         }
                         client_host_id_.erase(client_id);
-                    }
-
-                    ScopedSegmentAccess segment_access =
-                        segment_manager_.getSegmentAccess();
-                    for (auto& client_id : expired_clients) {
-                        // mounted memory segments of this expired client
-                        std::vector<Segment> segments;
-                        segment_access.GetClientSegments(client_id, segments);
-                        for (auto& seg : segments) {
-                            size_t metrics_dec_capacity = 0;
-                            if (segment_access.PrepareUnmountSegment(
-                                    seg.id, metrics_dec_capacity) ==
-                                ErrorCode::OK) {
-                                unmount_segments.push_back(seg.id);
-                                dec_capacities.push_back(metrics_dec_capacity);
-                                client_ids.push_back(client_id);
-                                segment_names.push_back(seg.name);
-                            } else {
-                                LOG(ERROR)
-                                    << "client_id=" << client_id
-                                    << ", segment_name=" << seg.name << ", "
-                                    << "error=prepare_unmount_expired_"
-                                       "mem_segment_failed";
-                            }
-                        }
-                    }
-                }  // Release client and segment mutexes before the long-running
-                   // ClearInvalidHandles call to avoid deadlocks.
-
-                // Always clean up invalid handles when there are expired
-                // clients, even if no memory segments were unmounted. This is
-                // necessary to clean up local_disk replicas whose owner client
-                // has expired.
-                ClearInvalidHandles();
-
-                // Commit unmount of memory segments and clean up local_disk
-                // segments for expired clients. Both require the exclusive
-                // segment lock.
-                {
-                    ScopedSegmentAccess segment_access =
-                        segment_manager_.getSegmentAccess();
-                    for (size_t i = 0; i < unmount_segments.size(); i++) {
-                        ErrorCode err = segment_access.CommitUnmountSegment(
-                            unmount_segments[i], client_ids[i],
-                            dec_capacities[i]);
-                        if (err != ErrorCode::OK) {
-                            LOG(ERROR) << "client_id=" << client_ids[i]
-                                       << ", segment_name=" << segment_names[i]
-                                       << ", error=commit_unmount_expired_mem_"
-                                          "segment_failed ("
-                                       << err << ")";
-                            continue;
-                        }
-                        expiration_events[event_indices.at(client_ids[i])]
-                            .unmounted_memory_segment_names.push_back(
-                                segment_names[i]);
-                        LOG(INFO) << "client_id=" << client_ids[i]
-                                  << ", segment_name=" << segment_names[i]
-                                  << ", action=unmount_expired_mem_segment";
-                    }
-                    for (auto& client_id : expired_clients) {
-                        segment_access.UnmountLocalDiskSegment(client_id);
-                    }
+                        graceful_unmount_scheduler_.RemoveIf(
+                            [&client_id](
+                                const GracefulUnmountDeadlineRecord& item) {
+                                return item.client_id == client_id;
+                            });
+                        RetryPrepareClientOffboarding(job);
+                    });
+                if (transition !=
+                    ClientLivenessTransition::BECAME_OFFLINE) {
+                    continue;
                 }
-                RecomputeTenantEffectiveQuotas();
-            }  // Release snapshot mutex before invoking external callbacks.
-
-            for (const auto& event : expiration_events) {
-                NotifyClientLeaseExpired(event);
+                LOG(INFO) << "client_id=" << client_id
+                          << ", action=client_liveness_offline";
+                pending_offboarding_jobs_.push_back(std::move(job));
+                pending_client_offboarding_jobs_.store(
+                    pending_offboarding_jobs_.size(),
+                    std::memory_order_release);
             }
+
+            for (auto& job : pending_offboarding_jobs_) {
+                if (job.stage == ClientOffboardingStage::PREPARING) {
+                    RetryPrepareClientOffboarding(job);
+                }
+            }
+
+            std::unordered_set<UUID, boost::hash<UUID>> retained_clients;
+            retained_clients.reserve(client_liveness_records_.size());
+            for (const auto& [client_id, record] :
+                 client_liveness_records_) {
+                if (record->ShouldRetainResources()) {
+                    retained_clients.insert(client_id);
+                }
+            }
+            client_lock.unlock();
+
+            CompleteClientOffboardingBatch(retained_clients);
+            snapshot_lock.unlock();
+
+            client_lock.lock();
+            for (const auto& job : pending_offboarding_jobs_) {
+                if (job.stage != ClientOffboardingStage::COMPLETE) {
+                    continue;
+                }
+                const auto current =
+                    client_liveness_records_.find(job.client_id);
+                if (current != client_liveness_records_.end() &&
+                    current->second == job.record) {
+                    client_liveness_records_.erase(current);
+                }
+            }
+            std::erase_if(pending_offboarding_jobs_, [](const auto& job) {
+                return job.stage == ClientOffboardingStage::COMPLETE;
+            });
+            pending_client_offboarding_jobs_.store(
+                pending_offboarding_jobs_.size(), std::memory_order_release);
         }
 
         std::this_thread::sleep_for(
             std::chrono::milliseconds(kClientMonitorSleepMs));
     }
 }
+
 
 bool MasterService::ProbeNoFSegment(const std::string& te_endpoint,
                                     std::string* error_reason) {

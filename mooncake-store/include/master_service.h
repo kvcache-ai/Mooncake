@@ -3,7 +3,6 @@
 #include <array>
 #include <atomic>
 #include <boost/functional/hash.hpp>
-#include <boost/lockfree/queue.hpp>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -23,6 +22,8 @@
 
 #include "allocation_strategy.h"
 #include "client_lifecycle_event.h"
+#include "client_liveness.h"
+#include "client_offboarding.h"
 #include "count_min_sketch.h"
 #include "deadline_scheduler.h"
 #include "master_metric_manager.h"
@@ -83,6 +84,10 @@ class BatchEvictBench;
  * 4. metadata_shards_[shard_idx_].mutex
  * 5. tenant_quota_shards_[shard_idx_].mutex
  * 6. segment_mutex_
+ *
+ * A ClientLivenessRecord transition mutex may be acquired after
+ * client_mutex_ and snapshot_mutex_. It must not be held across metadata-shard
+ * scans, and callbacks executed under it must not reacquire client_mutex_.
  *
  * Strict tenant admission and policy mutation paths that need both
  * tenant_quota_policy_mutex_ and snapshot_mutex_ must acquire the tenant
@@ -830,9 +835,10 @@ class MasterService {
     TenantQuotaEvictionResult EvictTenantMemoryForQuota(
         const std::string& tenant_id, uint64_t target_bytes);
 
-    // Helper to get a snapshot of alive clients (under client_mutex_ shared
-    // lock)
-    std::unordered_set<UUID, boost::hash<UUID>> getAliveClientsSnapshot() const;
+    std::shared_ptr<ClientLivenessRecord> FindClientRecord(
+        const UUID& client_id) const;
+    std::unordered_set<UUID, boost::hash<UUID>>
+    GetRetainedClientIdsSnapshot() const;
     void UpdateClientHostId(const UUID& client_id, const std::string& host_id);
     std::string GetClientHostId(const UUID& client_id) const;
 
@@ -1863,6 +1869,9 @@ class MasterService {
 
     // Client related members
     mutable std::shared_mutex client_mutex_;
+    std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
+                       boost::hash<UUID>>
+        client_liveness_records_;
     std::unordered_set<UUID, boost::hash<UUID>>
         ok_client_;  // client with ok status
     std::unordered_map<UUID, std::string, boost::hash<UUID>> client_host_id_;
@@ -1872,14 +1881,15 @@ class MasterService {
     std::atomic<bool> client_monitor_running_{false};
     static constexpr uint64_t kClientMonitorSleepMs =
         1000;  // 1000 ms sleep between client monitor checks
-    // boost lockfree queue requires trivial assignment operator
-    struct PodUUID {
-        uint64_t first;
-        uint64_t second;
-    };
-    static constexpr size_t kClientPingQueueSize =
-        128 * 1024;  // Size of the client ping queue
-    boost::lockfree::queue<PodUUID> client_ping_queue_{kClientPingQueueSize};
+    void RetryPrepareClientOffboarding(ClientOffboardingJob& job);
+    void CompleteClientOffboardingBatch(
+        const std::unordered_set<UUID, boost::hash<UUID>>& retained_clients);
+    [[nodiscard]] bool HasPendingClientOffboarding() const {
+        return pending_client_offboarding_jobs_.load(
+                   std::memory_order_acquire) != 0;
+    }
+    std::vector<ClientOffboardingJob> pending_offboarding_jobs_;
+    std::atomic<size_t> pending_client_offboarding_jobs_{0};
     const int64_t client_active_ttl_sec_;
     const int64_t client_suspicion_ttl_sec_;
     std::mutex client_lease_expired_callbacks_mutex_;

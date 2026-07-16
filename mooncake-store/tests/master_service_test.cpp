@@ -323,6 +323,26 @@ class MasterServiceTest : public ::testing::Test {
     }
 };
 
+TEST_F(MasterServiceTest, PingUnknownClientRequestsRemount) {
+    MasterService service;
+
+    auto response = service.Ping(generate_uuid());
+
+    ASSERT_TRUE(response.has_value());
+    EXPECT_EQ(response->client_status, ClientStatus::NEED_REMOUNT);
+}
+
+TEST_F(MasterServiceTest, RemountEstablishesReadinessWithoutHeartbeatQueue) {
+    MasterService service;
+    const UUID client_id = generate_uuid();
+
+    ASSERT_TRUE(service.ReMountSegment({}, client_id).has_value());
+    auto response = service.Ping(client_id);
+
+    ASSERT_TRUE(response.has_value());
+    EXPECT_EQ(response->client_status, ClientStatus::OK);
+}
+
 TEST(TenantScopedStorageKeyTest, RoundTripsAndParsesLegacyKeys) {
     const auto scoped =
         MakeTenantScopedStorageKey("tenant:with:colon", "path/key:with:colon");

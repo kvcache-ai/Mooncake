@@ -156,6 +156,15 @@ void MasterSnapshotManager::SnapshotThreadFunc() {
             std::unique_lock<std::shared_mutex> lock(snapshot_mutex_);
             LOG(INFO) << "[Snapshot] Locking snapshot mutex, snapshot_id="
                       << snapshot_id;
+            if (master_service_->HasPendingClientOffboarding()) {
+                LOG(WARNING)
+                    << "[Snapshot] Skipping snapshot while Client offboarding "
+                       "is pending, snapshot_id="
+                    << snapshot_id;
+                close(log_pipe[0]);
+                close(log_pipe[1]);
+                continue;
+            }
             pid = fork();
         }
         if (pid == -1) {
