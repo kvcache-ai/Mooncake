@@ -3,6 +3,7 @@
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/util/tl/expected.hpp>
 
+#include "http_metadata_cleanup_worker.h"
 #include "master_metric_manager.h"
 #include "master_service.h"
 #include "rpc_helper.h"
@@ -17,13 +18,19 @@ WrappedMasterService::WrappedMasterService(
     HttpMetadataServer* http_metadata_server,
     const std::string& http_metadata_remote_url)
     : master_service_(MasterServiceConfig(config)) {
-    // Configure metadata cleanup on client timeout. Prefer the co-located
-    // in-process server; otherwise fall back to a separately-deployed HTTP
-    // metadata server derived from the cluster configuration.
-    if (http_metadata_server) {
-        master_service_.setHttpMetadataServer(http_metadata_server);
-    } else if (!http_metadata_remote_url.empty()) {
-        master_service_.setHttpMetadataRemoteUrl(http_metadata_remote_url);
+    if (http_metadata_server || !http_metadata_remote_url.empty()) {
+        http_metadata_cleanup_worker_ =
+            std::make_unique<HttpMetadataCleanupWorker>(
+                http_metadata_server, http_metadata_remote_url);
+        if (http_metadata_cleanup_worker_->Start()) {
+            master_service_.RegisterClientLeaseExpiredCallback(
+                [worker = http_metadata_cleanup_worker_.get()](
+                    const ClientLeaseExpiredEvent& event) {
+                    worker->Enqueue(event);
+                });
+        } else {
+            http_metadata_cleanup_worker_.reset();
+        }
     }
 }
 

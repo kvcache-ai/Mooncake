@@ -2,6 +2,7 @@
 
 #include <csignal>
 
+#include <memory>
 #include <string>
 #include <boost/functional/hash.hpp>
 #include <cstdint>
@@ -19,6 +20,7 @@ namespace mooncake {
 
 // Forward declaration
 class HttpMetadataServer;
+class HttpMetadataCleanupWorker;
 class WrappedMasterService {
    public:
     // Constructor with optional metadata-cleanup-on-timeout configuration.
@@ -304,6 +306,10 @@ class WrappedMasterService {
     KvEventPublisher::Stats GetKvEventStats() const;
 
    private:
+    // Declared before master_service_ so it is destroyed afterwards. This
+    // keeps the callback target alive until MasterService has stopped and
+    // joined its client monitor thread.
+    std::unique_ptr<HttpMetadataCleanupWorker> http_metadata_cleanup_worker_;
     MasterService master_service_;
 };
 
