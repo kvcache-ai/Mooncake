@@ -104,6 +104,10 @@ if(STORE_USE_REDIS)
     add_test(NAME redis_helper_test COMMAND redis_helper_test)
 endif()
 
+if(STORE_USE_REDIS)
+    add_store_test(redis_oplog_store_test ha/oplog/redis_oplog_store_test.cpp)
+endif()
+
 add_executable(stress_workload_test stress_workload_test.cpp)
 target_link_libraries(stress_workload_test PUBLIC
     mooncake_store

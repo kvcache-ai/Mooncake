@@ -91,6 +91,7 @@ if(STORE_USE_REDIS)
     message(STATUS "Found hiredis: include=${HIREDIS_INCLUDE_DIR} lib=${HIREDIS_LIB}")
     list(APPEND MOONCAKE_STORE_SOURCES redis_helper.cpp)
     list(APPEND MOONCAKE_STORE_SOURCES redis_master_view_helper.cpp)
+    list(APPEND MOONCAKE_STORE_SOURCES ha/oplog/redis_oplog_store.cpp)
     list(APPEND EXTRA_LIBS ${HIREDIS_LIB})
 endif()
 

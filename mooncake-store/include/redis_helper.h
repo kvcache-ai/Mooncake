@@ -44,7 +44,8 @@ class RedisHelper {
     RedisHelper(const std::string& cluster_id,
                 const std::string& redis_endpoint,
                 const std::string& password = "", int db_index = 0,
-                int ttl_sec = 5, int heartbeat_interval_sec = 2);
+                int ttl_sec = 5, int heartbeat_interval_sec = 2,
+                const std::string& username = "");
     ~RedisHelper();
 
     RedisHelper(const RedisHelper&) = delete;
@@ -173,6 +174,7 @@ class RedisHelper {
     // === Connection state ===
 
     std::string redis_endpoint_;
+    std::string username_;
     std::string password_;
     int db_index_;
     redisContext* election_ctx_ =

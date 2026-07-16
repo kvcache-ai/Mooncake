@@ -77,7 +77,7 @@ CreateClientMasterViewHelper(const std::string& master_server_entry,
         auto helper = std::make_unique<RedisMasterViewHelper>(
             config.redis_cluster_id, redis_entry, config.redis_password,
             config.redis_db_index, config.redis_master_view_ttl_sec,
-            config.redis_heartbeat_interval_sec);
+            config.redis_heartbeat_interval_sec, config.redis_username);
         auto err = helper->Connect();
         if (err != ErrorCode::OK) {
             LOG(ERROR) << "Failed to connect to Redis at: " << redis_entry;
@@ -226,6 +226,7 @@ void ClientService::SetMasterDiscoveryConfig(
     master_discovery_config_.redis_cluster_id = config.redis_cluster_id.empty()
                                                     ? DEFAULT_CLUSTER_ID
                                                     : config.redis_cluster_id;
+    master_discovery_config_.redis_username = config.redis_username;
     master_discovery_config_.redis_password = config.redis_password;
     master_discovery_config_.redis_db_index = config.redis_db_index;
     master_discovery_config_.redis_master_view_ttl_sec =

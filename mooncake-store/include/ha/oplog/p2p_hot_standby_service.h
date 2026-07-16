@@ -20,6 +20,10 @@ struct P2PHotStandbyConfig {
     std::string cluster_id;
     OpLogStoreType oplog_store_type{kDefaultOpLogStoreType};
     std::string oplog_store_root_dir{kDefaultOpLogRootDir};
+    std::string redis_endpoint;
+    std::string redis_username;
+    std::string redis_password;
+    int redis_db_index{0};
     int oplog_poll_interval_ms{kDefaultOpLogPollIntervalMs};
 };
 

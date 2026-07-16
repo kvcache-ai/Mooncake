@@ -140,6 +140,7 @@ DEFINE_string(election_backend, "etcd",
 DEFINE_string(redis_endpoint, "",
               "Redis endpoint for election (required when "
               "election_backend=redis), e.g. '10.0.0.1:6379'");
+DEFINE_string(redis_username, "", "Redis ACL username (empty = one-arg AUTH)");
 DEFINE_string(redis_password, "", "Redis AUTH password (empty = no auth)");
 DEFINE_int32(redis_db_index, 0, "Redis database index (default: 0)");
 DEFINE_int32(
@@ -264,6 +265,8 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                              FLAGS_election_backend);
     default_config.GetString("redis_endpoint", &master_config.redis_endpoint,
                              FLAGS_redis_endpoint);
+    default_config.GetString("redis_username", &master_config.redis_username,
+                             FLAGS_redis_username);
     default_config.GetString("redis_password", &master_config.redis_password,
                              FLAGS_redis_password);
     default_config.GetInt32("redis_db_index", &master_config.redis_db_index,
@@ -546,6 +549,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.redis_password = FLAGS_redis_password;
+    }
+    if ((google::GetCommandLineFlagInfo("redis_username", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.redis_username = FLAGS_redis_username;
     }
     if ((google::GetCommandLineFlagInfo("redis_db_index", &info) &&
          !info.is_default) ||

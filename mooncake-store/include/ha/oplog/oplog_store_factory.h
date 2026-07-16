@@ -17,6 +17,7 @@ enum class OpLogStoreRole {
 enum class OpLogStoreType {
     ETCD,
     LOCAL_FS,
+    REDIS,
 };
 
 #ifdef STORE_USE_ETCD
@@ -38,6 +39,9 @@ inline OpLogStoreType ParseOpLogStoreType(const std::string& type_str) {
     if (lower == "etcd") {
         return OpLogStoreType::ETCD;
     }
+    if (lower == "redis") {
+        return OpLogStoreType::REDIS;
+    }
     return kDefaultOpLogStoreType;
 }
 
@@ -45,6 +49,8 @@ inline std::string OpLogStoreTypeToString(OpLogStoreType type) {
     switch (type) {
         case OpLogStoreType::LOCAL_FS:
             return "localfs";
+        case OpLogStoreType::REDIS:
+            return "redis";
         case OpLogStoreType::ETCD:
         default:
             return "etcd";
@@ -68,7 +74,9 @@ class OpLogStoreFactory {
     static std::unique_ptr<OpLogStore> Create(
         OpLogStoreType type, const std::string& cluster_id, OpLogStoreRole role,
         const std::string& oplog_root_dir = kDefaultOpLogRootDir,
-        int poll_interval_ms = kDefaultOpLogPollIntervalMs);
+        int poll_interval_ms = kDefaultOpLogPollIntervalMs,
+        const std::string& password = "", const std::string& username = "",
+        int db_index = 0);
 };
 
 }  // namespace mooncake

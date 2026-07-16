@@ -136,6 +136,9 @@ bool MasterProcessHandler::start() {
             args.emplace_back(
                 "--redis-heartbeat-interval-sec=" +
                 std::to_string(config_.redis_heartbeat_interval_sec));
+            if (!config_.redis_username.empty()) {
+                args.emplace_back("--redis-username=" + config_.redis_username);
+            }
             if (!config_.redis_password.empty()) {
                 args.emplace_back("--redis-password=" + config_.redis_password);
             }

@@ -127,6 +127,7 @@ struct RealClientConfigBase {
     // Redis election backend configuration.
     // Only used when master_server_entry starts with "redis://".
     std::string redis_cluster_id = DEFAULT_CLUSTER_ID;
+    std::string redis_username;
     std::string redis_password;
     int redis_db_index = 0;
     int redis_master_view_ttl_sec = 5;
@@ -251,8 +252,8 @@ class ClientConfigBuilder {
         uint64_t metric_report_interval_seconds = 60,
         const std::string& redis_cluster_id = DEFAULT_CLUSTER_ID,
         const std::string& redis_password = "", int redis_db_index = 0,
-        int redis_master_view_ttl_sec = 5,
-        int redis_heartbeat_interval_sec = 2) {
+        int redis_master_view_ttl_sec = 5, int redis_heartbeat_interval_sec = 2,
+        const std::string& redis_username = "") {
         CentralizedClientConfig config;
         fill_real_client_config_base(
             config, local_hostname, metadata_connstring, protocol, rdma_devices,
@@ -262,7 +263,8 @@ class ClientConfigBuilder {
             metric_report_interval_seconds);
         fill_redis_discovery_config(config, redis_cluster_id, redis_password,
                                     redis_db_index, redis_master_view_ttl_sec,
-                                    redis_heartbeat_interval_sec);
+                                    redis_heartbeat_interval_sec,
+                                    redis_username);
         config.global_segment_size = global_segment_size;
         config.enable_offload = enable_offload;
         config.local_rpc_port = local_rpc_port;
@@ -311,7 +313,7 @@ class ClientConfigBuilder {
             enable_metric_collection, metric_report_interval_seconds,
             redis_config.cluster_id, redis_config.password,
             redis_config.db_index, redis_config.master_view_ttl_sec,
-            redis_config.heartbeat_interval_sec);
+            redis_config.heartbeat_interval_sec, redis_config.username);
     }
 
     static P2PClientConfig build_p2p_real_client(
@@ -343,8 +345,8 @@ class ClientConfigBuilder {
         uint64_t metric_report_interval_seconds = 60,
         const std::string& redis_cluster_id = DEFAULT_CLUSTER_ID,
         const std::string& redis_password = "", int redis_db_index = 0,
-        int redis_master_view_ttl_sec = 5,
-        int redis_heartbeat_interval_sec = 2) {
+        int redis_master_view_ttl_sec = 5, int redis_heartbeat_interval_sec = 2,
+        const std::string& redis_username = "") {
         P2PClientConfig config;
         fill_real_client_config_base(
             config, local_hostname, metadata_connstring, protocol, rdma_devices,
@@ -354,7 +356,8 @@ class ClientConfigBuilder {
             metric_report_interval_seconds);
         fill_redis_discovery_config(config, redis_cluster_id, redis_password,
                                     redis_db_index, redis_master_view_ttl_sec,
-                                    redis_heartbeat_interval_sec);
+                                    redis_heartbeat_interval_sec,
+                                    redis_username);
         config.client_rpc_port = client_rpc_port;
         config.rpc_thread_num = rpc_thread_num;
         config.lock_shard_count = lock_shard_count;
@@ -465,12 +468,13 @@ class ClientConfigBuilder {
             metric_report_interval_seconds, redis_config.cluster_id,
             redis_config.password, redis_config.db_index,
             redis_config.master_view_ttl_sec,
-            redis_config.heartbeat_interval_sec);
+            redis_config.heartbeat_interval_sec, redis_config.username);
     }
 
    private:
     struct RedisDiscoveryConfig {
         std::string cluster_id = DEFAULT_CLUSTER_ID;
+        std::string username;
         std::string password;
         int db_index = 0;
         int master_view_ttl_sec = 5;
@@ -489,6 +493,7 @@ class ClientConfigBuilder {
         static constexpr const char* kIpcSocketPath = "ipc_socket_path";
         static constexpr const char* kRuntimeConfig = "runtime_config";
         static constexpr const char* kRedisClusterId = "redis_cluster_id";
+        static constexpr const char* kRedisUsername = "redis_username";
         static constexpr const char* kRedisPassword = "redis_password";
         static constexpr const char* kRedisDbIndex = "redis_db_index";
         static constexpr const char* kRedisMasterViewTtlSec =
@@ -641,6 +646,8 @@ class ClientConfigBuilder {
         RedisDiscoveryConfig redis_config;
         redis_config.cluster_id = get_config_str(
             config, DictCommon::kRedisClusterId, DEFAULT_CLUSTER_ID);
+        redis_config.username =
+            get_config_str(config, DictCommon::kRedisUsername);
         redis_config.password =
             get_config_str(config, DictCommon::kRedisPassword);
         redis_config.db_index =
@@ -657,8 +664,10 @@ class ClientConfigBuilder {
                                             const std::string& redis_password,
                                             int redis_db_index,
                                             int redis_master_view_ttl_sec,
-                                            int redis_heartbeat_interval_sec) {
+                                            int redis_heartbeat_interval_sec,
+                                            const std::string& redis_username) {
         config.redis_cluster_id = redis_cluster_id;
+        config.redis_username = redis_username;
         config.redis_password = redis_password;
         config.redis_db_index = redis_db_index;
         config.redis_master_view_ttl_sec = redis_master_view_ttl_sec;
