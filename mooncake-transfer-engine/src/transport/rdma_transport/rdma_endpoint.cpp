@@ -1191,8 +1191,7 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
             "Failed to modify QP to RTR, check mtu, gid, peer lid, peer qp num";
         PLOG(ERROR) << "[Handshake] " << message
                     << ": local=" << context_.nicPath()
-                    << ", peer=" << peer_nic_path_
-                    << ", qp_index=" << qp_index
+                    << ", peer=" << peer_nic_path_ << ", qp_index=" << qp_index
                     << ", local_qp=" << qp->qp_num
                     << ", peer_qp=" << peer_qp_num
                     << ", local_gid=" << context_.gid()

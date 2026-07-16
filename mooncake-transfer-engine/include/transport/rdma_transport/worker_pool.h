@@ -49,9 +49,8 @@ class WorkerPool {
     // worker queue.
     int submitPreparedPostSend(
         const std::vector<Transport::Slice *> &slice_list);
-    void enqueuePreparedSlices(
-        SliceList (&slice_list_map)[kShardCount],
-        uint64_t submitted_slice_count);
+    void enqueuePreparedSlices(SliceList (&slice_list_map)[kShardCount],
+                               uint64_t submitted_slice_count);
 
     void performPostSend(int thread_id);
 
@@ -84,8 +83,7 @@ class WorkerPool {
 
     void refreshPublishedLocalTopology();
     GidRefreshResult refreshPublishedLocalGid();
-    void scheduleContextRecovery(
-        uint64_t delay_ns = kContextRecoveryDelayNs);
+    void scheduleContextRecovery(uint64_t delay_ns = kContextRecoveryDelayNs);
     void maybeActivateRecoveredContext();
     bool hasAvailablePeerRailAlternative(Transport::Slice *slice,
                                          const std::string &failed_peer_path);
@@ -115,10 +113,10 @@ class WorkerPool {
             context_failure_count_.fetch_add(1, std::memory_order_relaxed) + 1;
         if (failure_count >= kContextFailureThreshold) {
             if (context_.active()) {
-                LOG(WARNING) << "All rails failed for context "
-                             << context_.deviceName() << " for "
-                             << failure_count
-                             << " consecutive attempts, marking inactive";
+                LOG(WARNING)
+                    << "All rails failed for context " << context_.deviceName()
+                    << " for " << failure_count
+                    << " consecutive attempts, marking inactive";
                 context_.set_active(false);
                 return true;
             }
@@ -165,7 +163,7 @@ class WorkerPool {
     std::mutex rail_state_lock_;
 
     // Rail monitor configuration
-    const static int kRailErrorThreshold = 5;            // Errors before pause
+    const static int kRailErrorThreshold = 5;             // Errors before pause
     const static uint64_t kRailPauseNs = 30000000000ull;  // 30 second pause
     const static uint64_t kContextRecoveryDelayNs =
         30000000000ull;  // 30 seconds before a recovered local RNIC is reused

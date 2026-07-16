@@ -1414,8 +1414,7 @@ int TransferMetadata::startHandshakeDaemon(
                 if (ret) {
                     if (local_desc.reply_msg.empty()) {
                         local_desc.reply_msg =
-                            "Handshake callback failed: " +
-                            std::to_string(ret);
+                            "Handshake callback failed: " + std::to_string(ret);
                     }
                     // The callback failure is a handshake-level rejection, not
                     // an RPC handler failure. Return a structured reply so the

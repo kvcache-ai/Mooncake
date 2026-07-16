@@ -261,8 +261,8 @@ int WorkerPool::submitPostSend(
     return 0;
 }
 
-void WorkerPool::enqueuePreparedSlices(
-    SliceList (&slice_list_map)[kShardCount], uint64_t submitted_slice_count) {
+void WorkerPool::enqueuePreparedSlices(SliceList (&slice_list_map)[kShardCount],
+                                       uint64_t submitted_slice_count) {
     for (int shard_id = 0; shard_id < kShardCount; ++shard_id) {
         if (slice_list_map[shard_id].empty()) continue;
         slice_queue_lock_[shard_id].lock();
@@ -508,7 +508,8 @@ void WorkerPool::performPostSend(int thread_id) {
         if (!retry_list.empty()) {
             redispatch(retry_list, thread_id);
         }
-        if (!local_retry_list.empty()) redispatch(local_retry_list, thread_id, true);
+        if (!local_retry_list.empty())
+            redispatch(local_retry_list, thread_id, true);
     }
 }
 
@@ -566,12 +567,11 @@ void WorkerPool::performPollCq(int thread_id) {
                 if (wc[i].status == IBV_WC_WR_FLUSH_ERR) {
                     if (!context_.active()) {
                         if (globalConfig().trace)
-                            LOG(INFO) << "Worker: WR flush error on inactive "
-                                      << "local context "
-                                      << context_.deviceName()
-                                      << " (peer_nic: "
-                                      << slice->peer_nic_path
-                                      << "), handing off if retry allows";
+                            LOG(INFO)
+                                << "Worker: WR flush error on inactive "
+                                << "local context " << context_.deviceName()
+                                << " (peer_nic: " << slice->peer_nic_path
+                                << "), handing off if retry allows";
                         if (shouldRetrySlice(slice))
                             local_failed_slice_list.push_back(slice);
                         else {
@@ -678,7 +678,8 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
             auto target_id = slice->target_id;
             if (!segment_desc_map.count(target_id)) {
                 segment_desc_map[target_id] =
-                    context_.engine().meta()->getSegmentDescByID(target_id, true);
+                    context_.engine().meta()->getSegmentDescByID(target_id,
+                                                                 true);
             }
         }
     }
@@ -751,9 +752,9 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
                     LOG(ERROR)
                         << "Worker: Cannot redispatch slice because all peer "
                            "rails are paused for target "
-                        << slice->target_id << ", selected peer="
-                        << peer_nic_path << ", retry_cnt="
-                        << slice->rdma.retry_cnt;
+                        << slice->target_id
+                        << ", selected peer=" << peer_nic_path
+                        << ", retry_cnt=" << slice->rdma.retry_cnt;
                     slice->markFailed();
                     processed_slice_count_++;
                     continue;
@@ -838,7 +839,8 @@ bool WorkerPool::tryHandoffToAnotherLocalWorker(Transport::Slice *slice) {
             auto source = reinterpret_cast<uint64_t>(slice->source_addr);
             auto buffer_start = reinterpret_cast<uint64_t>(buffer.addr);
             auto buffer_end = buffer_start + buffer.length;
-            if (buffer_start <= source && source + slice->length <= buffer_end) {
+            if (buffer_start <= source &&
+                source + slice->length <= buffer_end) {
                 buffer_id = static_cast<int>(idx);
                 break;
             }
@@ -846,8 +848,9 @@ bool WorkerPool::tryHandoffToAnotherLocalWorker(Transport::Slice *slice) {
         if (buffer_id < 0) {
             continue;
         }
-        if (device_id >= static_cast<int>(
-                             local_segment_desc->buffers[buffer_id].lkey.size())) {
+        if (device_id >=
+            static_cast<int>(
+                local_segment_desc->buffers[buffer_id].lkey.size())) {
             continue;
         }
 
@@ -1042,10 +1045,11 @@ void WorkerPool::processContextEventForTest(ibv_event_type event_type) {
 
 void WorkerPool::scheduleContextRecovery(uint64_t delay_ns) {
     uint64_t activate_after = getCurrentTimeInNano() + delay_ns;
-    recovery_activate_after_ns_.store(activate_after, std::memory_order_relaxed);
+    recovery_activate_after_ns_.store(activate_after,
+                                      std::memory_order_relaxed);
     LOG(INFO) << "Worker: Context " << context_.deviceName()
-              << " scheduled recovery probe after "
-              << delay_ns / 1000000000ull << " seconds";
+              << " scheduled recovery probe after " << delay_ns / 1000000000ull
+              << " seconds";
 }
 
 void WorkerPool::maybeActivateRecoveredContext() {

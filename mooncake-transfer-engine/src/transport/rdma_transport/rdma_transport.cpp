@@ -761,17 +761,16 @@ int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
     }
     if (!context) {
         local_desc.reply_msg =
-            "Local RDMA context not found for handshake NIC: " +
-            local_nic_name;
+            "Local RDMA context not found for handshake NIC: " + local_nic_name;
         return ERR_INVALID_ARGUMENT;
     }
 
     // Use existing endpoint or create new one.
     auto endpoint = context->endpoint(peer_desc.local_nic_path);
     if (!endpoint) {
-        local_desc.reply_msg =
-            "Local RDMA endpoint unavailable for " + local_nic_name +
-            " <- " + peer_desc.local_nic_path;
+        local_desc.reply_msg = "Local RDMA endpoint unavailable for " +
+                               local_nic_name + " <- " +
+                               peer_desc.local_nic_path;
         return ERR_ENDPOINT;
     }
     int ret = endpoint->setupConnectionsByPassive(peer_desc, local_desc);
@@ -792,7 +791,8 @@ int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
                 return ERR_ENDPOINT;
             }
             ret = endpoint->setupConnectionsByPassive(peer_desc, local_desc);
-            if (endpoint->retired()) context->deleteEndpointByPtr(endpoint.get());
+            if (endpoint->retired())
+                context->deleteEndpointByPtr(endpoint.get());
         }
     }
     return ret;

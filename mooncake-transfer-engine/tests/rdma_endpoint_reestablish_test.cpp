@@ -120,7 +120,7 @@ bool RdmaTransportTestPeer::injectContextEvent(RdmaTransport* transport,
     for (auto& context : transport->context_list_) {
         if (context && context->deviceName() == device_name) {
             return RdmaContextTestPeer::injectContextEvent(context.get(),
-                                                          event_type);
+                                                           event_type);
         }
     }
     return false;
@@ -309,8 +309,8 @@ std::string makeNicPriorityMatrix(const std::string& preferred_devices,
                                   const std::string& fallback_devices) {
     auto formatted_preferred = formatDeviceNames(preferred_devices);
     auto formatted_fallback = formatDeviceNames(fallback_devices);
-    return "{\"cpu:0\": [[" + formatted_preferred + "],[" +
-           formatted_fallback + "]], "
+    return "{\"cpu:0\": [[" + formatted_preferred + "],[" + formatted_fallback +
+           "]], "
            " \"cpu:1\": [[" +
            formatted_preferred + "],[" + formatted_fallback + "]]}";
 }
@@ -340,15 +340,15 @@ bool waitForTransferWithTimeout(TransferEngine* engine, BatchID batch_id,
     while (std::chrono::steady_clock::now() < deadline) {
         Status s = engine->getTransferStatus(batch_id, 0, status);
         if (s != Status::OK()) {
-            ADD_FAILURE() << op_name << " getTransferStatus failed: "
-                          << s.ToString();
+            ADD_FAILURE() << op_name
+                          << " getTransferStatus failed: " << s.ToString();
             return false;
         }
         if (status.s == TransferStatusEnum::COMPLETED) {
             s = engine->freeBatchID(batch_id);
             if (s != Status::OK()) {
-                ADD_FAILURE() << op_name << " freeBatchID failed: "
-                              << s.ToString();
+                ADD_FAILURE()
+                    << op_name << " freeBatchID failed: " << s.ToString();
                 return false;
             }
             return true;
@@ -381,8 +381,8 @@ struct TEContext {
               const std::string& metadata_server, const std::string& segment_id,
               const std::string& device_name)
         : TEContext(local_server_name, metadata_server, segment_id,
-                    makeNicPriorityMatrix(device_name), RawNicPriorityMatrix{}) {
-    }
+                    makeNicPriorityMatrix(device_name),
+                    RawNicPriorityMatrix{}) {}
 
     TEContext(const std::string& local_server_name,
               const std::string& metadata_server, const std::string& segment_id,
@@ -568,8 +568,7 @@ TEST_F(RDMAEndpointReestablishTest,
     expectRtrEinvalRecoveredWithRetry(target_device_name);
 }
 
-TEST_F(RDMAEndpointReestablishTest,
-       SenderSingleRnicDownUsesFallbackLocalRnic) {
+TEST_F(RDMAEndpointReestablishTest, SenderSingleRnicDownUsesFallbackLocalRnic) {
     if (target_device_name == initiator_device_name) {
         GTEST_SKIP() << "Need two distinct RDMA devices for sender failover";
     }
@@ -578,11 +577,11 @@ TEST_F(RDMAEndpointReestablishTest,
         target_device_name + "," + initiator_device_name;
     const std::string target_matrix = makeNicPriorityMatrix(both_devices);
     LOG(INFO) << "========== Setting up dual-RNIC Target ==========";
-    TEContext target_ctx(target_server_name, metadata_server, "",
-                         target_matrix, RawNicPriorityMatrix{});
-    const std::string target_segment_name =
-        usesP2PHandshake(metadata_server) ? target_ctx.localSegmentName()
-                                          : target_server_name;
+    TEContext target_ctx(target_server_name, metadata_server, "", target_matrix,
+                         RawNicPriorityMatrix{});
+    const std::string target_segment_name = usesP2PHandshake(metadata_server)
+                                                ? target_ctx.localSegmentName()
+                                                : target_server_name;
 
     // Put the soon-to-be-down sender RNIC in the preferred tier and the
     // surviving sender RNIC in the fallback tier. This proves TE can skip the
@@ -596,10 +595,10 @@ TEST_F(RDMAEndpointReestablishTest,
 
     ASSERT_TRUE(RdmaTransportTestPeer::setContextActive(
         init_ctx.rdma_transport_, initiator_device_name, false));
-    ASSERT_FALSE(RdmaTransportTestPeer::contextActive(
-        init_ctx.rdma_transport_, initiator_device_name));
+    ASSERT_FALSE(RdmaTransportTestPeer::contextActive(init_ctx.rdma_transport_,
+                                                      initiator_device_name));
     ASSERT_TRUE(RdmaTransportTestPeer::contextActive(init_ctx.rdma_transport_,
-                                                    target_device_name));
+                                                     target_device_name));
 
     for (size_t i = 0; i < kDataLength; ++i) {
         init_ctx.local_addr_[i] = static_cast<uint8_t>((i * 17) % 251);
@@ -636,11 +635,11 @@ TEST_F(RDMAEndpointReestablishTest,
     }
 
     const std::string target_matrix = makeNicPriorityMatrix("mlx5_3,mlx5_4");
-    TEContext target_ctx(target_server_name, metadata_server, "",
-                         target_matrix, RawNicPriorityMatrix{});
-    const std::string target_segment_name =
-        usesP2PHandshake(metadata_server) ? target_ctx.localSegmentName()
-                                          : target_server_name;
+    TEContext target_ctx(target_server_name, metadata_server, "", target_matrix,
+                         RawNicPriorityMatrix{});
+    const std::string target_segment_name = usesP2PHandshake(metadata_server)
+                                                ? target_ctx.localSegmentName()
+                                                : target_server_name;
 
     const std::string sender_matrix = makeNicPriorityMatrix("mlx5_2", "mlx5_1");
     TEContext init_ctx(initiator_server_name, metadata_server,
@@ -653,17 +652,17 @@ TEST_F(RDMAEndpointReestablishTest,
     std::atomic<bool> inject_up_ok{false};
     std::thread injector([&] {
         std::this_thread::sleep_for(std::chrono::seconds(5));
-        inject_down_ok.store(RdmaTransportTestPeer::injectContextEvent(
-                                 init_ctx.rdma_transport_, "mlx5_2",
-                                 IBV_EVENT_PORT_ERR),
-                             std::memory_order_release);
+        inject_down_ok.store(
+            RdmaTransportTestPeer::injectContextEvent(
+                init_ctx.rdma_transport_, "mlx5_2", IBV_EVENT_PORT_ERR),
+            std::memory_order_release);
         injected_down.store(true, std::memory_order_release);
 
         std::this_thread::sleep_for(std::chrono::seconds(7));
-        inject_up_ok.store(RdmaTransportTestPeer::injectContextEvent(
-                               init_ctx.rdma_transport_, "mlx5_2",
-                               IBV_EVENT_PORT_ACTIVE),
-                           std::memory_order_release);
+        inject_up_ok.store(
+            RdmaTransportTestPeer::injectContextEvent(
+                init_ctx.rdma_transport_, "mlx5_2", IBV_EVENT_PORT_ACTIVE),
+            std::memory_order_release);
         injected_up.store(true, std::memory_order_release);
     });
 
@@ -731,11 +730,11 @@ TEST_F(RDMAEndpointReestablishTest,
     }
 
     const std::string target_matrix = makeNicPriorityMatrix("mlx5_3", "mlx5_4");
-    TEContext target_ctx(target_server_name, metadata_server, "",
-                         target_matrix, RawNicPriorityMatrix{});
-    const std::string target_segment_name =
-        usesP2PHandshake(metadata_server) ? target_ctx.localSegmentName()
-                                          : target_server_name;
+    TEContext target_ctx(target_server_name, metadata_server, "", target_matrix,
+                         RawNicPriorityMatrix{});
+    const std::string target_segment_name = usesP2PHandshake(metadata_server)
+                                                ? target_ctx.localSegmentName()
+                                                : target_server_name;
 
     const std::string sender_matrix = makeNicPriorityMatrix("mlx5_1,mlx5_2");
     TEContext init_ctx(initiator_server_name, metadata_server,
@@ -748,17 +747,17 @@ TEST_F(RDMAEndpointReestablishTest,
     std::atomic<bool> inject_up_ok{false};
     std::thread injector([&] {
         std::this_thread::sleep_for(std::chrono::seconds(5));
-        inject_down_ok.store(RdmaTransportTestPeer::injectContextEvent(
-                                 target_ctx.rdma_transport_, "mlx5_3",
-                                 IBV_EVENT_PORT_ERR),
-                             std::memory_order_release);
+        inject_down_ok.store(
+            RdmaTransportTestPeer::injectContextEvent(
+                target_ctx.rdma_transport_, "mlx5_3", IBV_EVENT_PORT_ERR),
+            std::memory_order_release);
         injected_down.store(true, std::memory_order_release);
 
         std::this_thread::sleep_for(std::chrono::seconds(7));
-        inject_up_ok.store(RdmaTransportTestPeer::injectContextEvent(
-                               target_ctx.rdma_transport_, "mlx5_3",
-                               IBV_EVENT_PORT_ACTIVE),
-                           std::memory_order_release);
+        inject_up_ok.store(
+            RdmaTransportTestPeer::injectContextEvent(
+                target_ctx.rdma_transport_, "mlx5_3", IBV_EVENT_PORT_ACTIVE),
+            std::memory_order_release);
         injected_up.store(true, std::memory_order_release);
     });
 

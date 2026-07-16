@@ -835,8 +835,8 @@ int Topology::disableDevice(const std::string &device_name) {
     int disabled_hca_index = -1;
     auto hca_iter = std::find(hca_list_.begin(), hca_list_.end(), device_name);
     if (hca_iter != hca_list_.end()) {
-        disabled_hca_index = static_cast<int>(
-            std::distance(hca_list_.begin(), hca_iter));
+        disabled_hca_index =
+            static_cast<int>(std::distance(hca_list_.begin(), hca_iter));
     }
 
     for (auto &record : matrix_) {
@@ -859,16 +859,16 @@ int Topology::disableDevice(const std::string &device_name) {
     // at the wrong RNIC.
     for (auto &record : resolved_matrix_) {
         auto &preferred_hca = record.second.preferred_hca;
-        preferred_hca.erase(std::remove(preferred_hca.begin(),
-                                        preferred_hca.end(),
-                                        disabled_hca_index),
-                            preferred_hca.end());
+        preferred_hca.erase(
+            std::remove(preferred_hca.begin(), preferred_hca.end(),
+                        disabled_hca_index),
+            preferred_hca.end());
         record.second.preferred_hca_name_to_index_map_.erase(device_name);
 
         auto &avail_hca = record.second.avail_hca;
-        avail_hca.erase(std::remove(avail_hca.begin(), avail_hca.end(),
-                                    disabled_hca_index),
-                        avail_hca.end());
+        avail_hca.erase(
+            std::remove(avail_hca.begin(), avail_hca.end(), disabled_hca_index),
+            avail_hca.end());
         record.second.avail_hca_name_to_index_map_.erase(device_name);
     }
     return 0;
