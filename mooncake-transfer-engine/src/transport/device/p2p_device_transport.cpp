@@ -37,7 +37,9 @@ namespace {
 
 #if defined(USE_CUDA)
 bool supportFabricMem() {
-    if (std::getenv("MC_USE_NVLINK_IPC") != nullptr) return false;
+    const char* nvlink_ipc = std::getenv("MC_USE_NVLINK_IPC");
+    if (nvlink_ipc == nullptr || std::strcmp(nvlink_ipc, "0") != 0)
+        return false;
 
     int num_devices = 0;
     cudaError_t err = cudaGetDeviceCount(&num_devices);
@@ -261,7 +263,8 @@ class P2pDeviceTransportImpl : public P2pTransport {
         if (use_fabric_mem_) {
             int device_id = 0;
             if (cudaGetDevice(&device_id) != cudaSuccess) {
-                LOG(ERROR) << "[EP P2P] cudaGetDevice failed before fabric alloc";
+                LOG(ERROR)
+                    << "[EP P2P] cudaGetDevice failed before fabric alloc";
                 return nullptr;
             }
 
@@ -294,10 +297,10 @@ class P2pDeviceTransportImpl : public P2pTransport {
                 return nullptr;
             }
 
-            fabric_alloc_size_ =
-                std::max(granularity, (bytes + granularity - 1) &
-                                          ~(granularity - 1));
-            res = cuMemCreate(&fabric_mem_handle_, fabric_alloc_size_, &prop, 0);
+            fabric_alloc_size_ = std::max(
+                granularity, (bytes + granularity - 1) & ~(granularity - 1));
+            res =
+                cuMemCreate(&fabric_mem_handle_, fabric_alloc_size_, &prop, 0);
             if (res != CUDA_SUCCESS) {
                 fabric_alloc_size_ = 0;
                 LOG(ERROR) << "[EP P2P] cuMemCreate(FABRIC) failed: " << res;
@@ -305,8 +308,8 @@ class P2pDeviceTransportImpl : public P2pTransport {
             }
 
             CUdeviceptr reserved = 0;
-            res = cuMemAddressReserve(&reserved, fabric_alloc_size_, granularity,
-                                      0, 0);
+            res = cuMemAddressReserve(&reserved, fabric_alloc_size_,
+                                      granularity, 0, 0);
             if (res != CUDA_SUCCESS) {
                 cuMemRelease(fabric_mem_handle_);
                 fabric_mem_handle_ = {};
@@ -395,9 +398,9 @@ class P2pDeviceTransportImpl : public P2pTransport {
 #if defined(USE_CUDA)
         if (use_fabric_mem_) {
             CUmemFabricHandle export_handle;
-            CUresult res = cuMemExportToShareableHandle(
-                &export_handle, fabric_mem_handle_, CU_MEM_HANDLE_TYPE_FABRIC,
-                0);
+            CUresult res =
+                cuMemExportToShareableHandle(&export_handle, fabric_mem_handle_,
+                                             CU_MEM_HANDLE_TYPE_FABRIC, 0);
             if (res != CUDA_SUCCESS) {
                 LOG(ERROR)
                     << "[EP P2P] cuMemExportToShareableHandle(FABRIC) failed: "
@@ -493,8 +496,8 @@ class P2pDeviceTransportImpl : public P2pTransport {
                 }
                 CUmemFabricHandle export_handle;
                 size_t mapped_size = 0;
-                if (!deserializeFabricHandle(remote_handles[dst], &export_handle,
-                                             &mapped_size)) {
+                if (!deserializeFabricHandle(remote_handles[dst],
+                                             &export_handle, &mapped_size)) {
                     all_peers_accessible_ = false;
                     break;
                 }
@@ -788,10 +791,12 @@ class P2pDeviceTransportImpl : public P2pTransport {
 
     void cleanupFabricPeerMappings() {
         if (!use_fabric_mem_) return;
-        for (int i = 0; i < static_cast<int>(fabric_peer_mappings_.size()); ++i) {
+        for (int i = 0; i < static_cast<int>(fabric_peer_mappings_.size());
+             ++i) {
             auto& mapping = fabric_peer_mappings_[i];
             if (mapping.ptr == nullptr) continue;
-            cuMemUnmap(reinterpret_cast<CUdeviceptr>(mapping.ptr), mapping.size);
+            cuMemUnmap(reinterpret_cast<CUdeviceptr>(mapping.ptr),
+                       mapping.size);
             cuMemAddressFree(reinterpret_cast<CUdeviceptr>(mapping.ptr),
                              mapping.size);
             cuMemRelease(mapping.handle);
