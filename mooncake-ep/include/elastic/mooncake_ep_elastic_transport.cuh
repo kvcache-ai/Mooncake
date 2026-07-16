@@ -35,7 +35,7 @@ struct MooncakeGin {
     device::CommCtx ctx;
     int qp_idx = 0;
     int sharing_mode = 0;
-    int qps_per_rank = 1;
+    int physical_qps_per_rank = 1;
     int scaleout_rank_idx = 0;
     int scaleup_rank_idx = 0;
     int num_scaleup_ranks = 0;
@@ -47,10 +47,14 @@ struct MooncakeGin {
         : ctx(ctx),
           qp_idx(qp_idx),
           sharing_mode(sharing_mode),
-          qps_per_rank(max(1, num_qps / max(1, num_ranks))),
+          physical_qps_per_rank(max(1, ctx.qps_per_rank)),
           scaleout_rank_idx(scaleout_rank_idx),
           scaleup_rank_idx(scaleup_rank_idx),
-          num_scaleup_ranks(num_scaleup_ranks) {}
+          num_scaleup_ranks(num_scaleup_ranks) {
+        (void)num_qps;
+        (void)num_ranks;
+        this->qp_idx %= physical_qps_per_rank;
+    }
 
     template <typename team_t>
     __device__ __forceinline__ int world_rank(int dst_rank) const {
@@ -126,8 +130,9 @@ struct MooncakeGin {
             // so a system fence is sufficient to publish the writes.
             __threadfence_system();
         } else {
-            device::mc_rdma_put(ctx, qp_idx, dst_rank, qps_per_rank, src_ptr,
-                                dst_ptr, static_cast<uint32_t>(num_bytes), 0);
+            device::mc_rdma_put(ctx, qp_idx, dst_rank, physical_qps_per_rank,
+                                src_ptr, dst_ptr,
+                                static_cast<uint32_t>(num_bytes), 0);
         }
     }
 
@@ -148,7 +153,7 @@ struct MooncakeGin {
             }
         } else {
             if constexpr (sizeof(value_t) == sizeof(int32_t)) {
-                device::mc_signal(ctx, dst_rank, qp_idx, qps_per_rank,
+                device::mc_signal(ctx, dst_rank, qp_idx, physical_qps_per_rank,
                                   reinterpret_cast<int*>(dst_ptr),
                                   static_cast<int32_t>(value));
             } else {
@@ -165,21 +170,23 @@ struct MooncakeGin {
                 const auto high = static_cast<int32_t>(signed_value >> 32);
                 if ((flags & kRedAddReleaseLowWordLast) == 0) {
                     if (low != 0) {
-                        device::mc_red_add(ctx, dst_rank, qp_idx, qps_per_rank,
-                                           words, low);
+                        device::mc_red_add(ctx, dst_rank, qp_idx,
+                                           physical_qps_per_rank, words, low);
                     }
                     if (high != 0) {
-                        device::mc_red_add(ctx, dst_rank, qp_idx, qps_per_rank,
-                                           words + 1, high);
+                        device::mc_red_add(ctx, dst_rank, qp_idx,
+                                           physical_qps_per_rank, words + 1,
+                                           high);
                     }
                 } else {
                     if (high != 0) {
-                        device::mc_red_add(ctx, dst_rank, qp_idx, qps_per_rank,
-                                           words + 1, high);
+                        device::mc_red_add(ctx, dst_rank, qp_idx,
+                                           physical_qps_per_rank, words + 1,
+                                           high);
                     }
                     if (low != 0) {
-                        device::mc_red_add(ctx, dst_rank, qp_idx, qps_per_rank,
-                                           words, low);
+                        device::mc_red_add(ctx, dst_rank, qp_idx,
+                                           physical_qps_per_rank, words, low);
                     }
                 }
             }
@@ -197,7 +204,7 @@ struct MooncakeGin {
             if (routed != nullptr) {
                 device::mc_atomic_add_release(routed, static_cast<int>(value));
             } else {
-                device::mc_red_add(ctx, dst_rank, qp_idx, qps_per_rank,
+                device::mc_red_add(ctx, dst_rank, qp_idx, physical_qps_per_rank,
                                    reinterpret_cast<int*>(dst_ptr),
                                    static_cast<int32_t>(value));
             }
@@ -232,21 +239,23 @@ struct MooncakeGin {
                 const auto high = static_cast<int32_t>(signed_value >> 32);
                 if ((flags & kRedAddReleaseLowWordLast) == 0) {
                     if (low != 0) {
-                        device::mc_red_add(ctx, dst_rank, qp_idx, qps_per_rank,
-                                           words, low);
+                        device::mc_red_add(ctx, dst_rank, qp_idx,
+                                           physical_qps_per_rank, words, low);
                     }
                     if (high != 0) {
-                        device::mc_red_add(ctx, dst_rank, qp_idx, qps_per_rank,
-                                           words + 1, high);
+                        device::mc_red_add(ctx, dst_rank, qp_idx,
+                                           physical_qps_per_rank, words + 1,
+                                           high);
                     }
                 } else {
                     if (high != 0) {
-                        device::mc_red_add(ctx, dst_rank, qp_idx, qps_per_rank,
-                                           words + 1, high);
+                        device::mc_red_add(ctx, dst_rank, qp_idx,
+                                           physical_qps_per_rank, words + 1,
+                                           high);
                     }
                     if (low != 0) {
-                        device::mc_red_add(ctx, dst_rank, qp_idx, qps_per_rank,
-                                           words, low);
+                        device::mc_red_add(ctx, dst_rank, qp_idx,
+                                           physical_qps_per_rank, words, low);
                     }
                 }
             }

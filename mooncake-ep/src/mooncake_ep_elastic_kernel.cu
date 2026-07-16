@@ -21,16 +21,14 @@ constexpr int kElasticNumEpilogueWarps = 4;
 constexpr int kElasticNumDispatchWarps = 8;
 constexpr int kElasticNumEpilogueWarps = 8;
 #endif
-constexpr int kElasticNumHybridScaleoutWarps = 4;
-constexpr int kElasticNumHybridForwardWarps = 4;
-constexpr int kElasticNumHybridScaleupWarps = 4;
-constexpr int kElasticNumQPs = MAX_QP_COUNT;
+constexpr int kElasticNumDirectLogicalQPs = 9;
+constexpr int kElasticNumHybridLogicalQPs = 65;
 constexpr int64_t kElasticTimeoutCycles = NUM_TIMEOUT_CYCLES;
 
 inline int ceil_div(int x, int y) { return (x + y - 1) / y; }
 
-inline int hybrid_num_channels(int num_sms) {
-    return num_sms * kElasticNumHybridForwardWarps;
+inline int hybrid_num_channels(int num_sms, int num_channels_per_sm) {
+    return num_sms * num_channels_per_sm;
 }
 
 inline void* hybrid_combine_reduce_buffer_ptr(void* buffer, int hidden,
@@ -92,6 +90,7 @@ inline int combine_epilogue_smem_bytes(int hidden, int num_warps) {
 inline device::CommCtx make_comm_ctx(const ElasticLaunchContext& ctx) {
     device::CommCtx comm_ctx{};
     comm_ctx.rank = ctx.rank;
+    comm_ctx.qps_per_rank = ctx.physical_qps_per_rank;
     comm_ctx.p2p.available = ctx.nvlink_available;
     comm_ctx.p2p.peer_ptrs = ctx.ipc_peer_ptrs;
     comm_ctx.p2p.local_base = ctx.gdr_buffer;
@@ -478,8 +477,6 @@ void launch_mooncake_elastic_dispatch(
                             num_notify_warps, num_dispatch_warps));
     const bool reuse_slot_indices = effective_cached_mode || deterministic;
     const auto comm_ctx = make_comm_ctx(ctx);
-    (void)num_channels_per_sm;
-
 #ifdef MOONCAKE_EP_USE_MUSA
     if (musa_use_prepared_slots) {
         launch_musa_elastic_prepare_dispatch(
@@ -493,8 +490,7 @@ void launch_mooncake_elastic_dispatch(
 #ifndef MOONCAKE_EP_USE_MUSA
     if (ctx.num_scaleout_ranks != 1) {
         const bool hybrid_reuse_slot_indices = cached_mode;
-        const int hybrid_dispatch_warps =
-            kElasticNumHybridScaleoutWarps + kElasticNumHybridForwardWarps;
+        const int hybrid_dispatch_warps = 2 * num_channels_per_sm;
         const int hybrid_threads =
             (num_notify_warps + hybrid_dispatch_warps) * 32;
         const int hybrid_smem_bytes = std::max(
@@ -504,15 +500,14 @@ void launch_mooncake_elastic_dispatch(
                                 num_experts, num_notify_warps,
                                 hybrid_dispatch_warps));
 
-#define LAUNCH_HYBRID_DISPATCH(HB, SFP, E, K, M, S, SO, SU)                    \
+#define LAUNCH_HYBRID_DISPATCH(HB, SFP, E, K, M, S, SO, SU, C)                 \
         do {                                                                   \
             constexpr int kHiddenBytes = (HB);                                 \
             constexpr int kNumSFPacks = (SFP);                                 \
             if (cached_mode) {                                                 \
                 auto kernel = elastic::hybrid_dispatch_impl<                   \
-                    false, true, S, 0, kElasticNumHybridScaleoutWarps,         \
-                    kElasticNumHybridForwardWarps, SO, SU, kHiddenBytes,       \
-                    kNumSFPacks, M, E, K, 1, kElasticNumQPs,                   \
+                    false, true, S, 0, C, C, SO, SU, kHiddenBytes,             \
+                    kNumSFPacks, M, E, K, 1, kElasticNumHybridLogicalQPs,      \
                     kElasticTimeoutCycles>;                                    \
                 launch_cooperative(kernel, S, hybrid_threads,                  \
                                    hybrid_smem_bytes, stream, x,               \
@@ -531,9 +526,8 @@ void launch_mooncake_elastic_dispatch(
             } else if (hybrid_reuse_slot_indices) {                            \
                 auto kernel = elastic::hybrid_dispatch_impl<                   \
                     false, true, S, kElasticNumNotifyWarps,                    \
-                    kElasticNumHybridScaleoutWarps,                            \
-                    kElasticNumHybridForwardWarps, SO, SU, kHiddenBytes,       \
-                    kNumSFPacks, M, E, K, 1, kElasticNumQPs,                   \
+                    C, C, SO, SU, kHiddenBytes, kNumSFPacks, M, E, K, 1,       \
+                    kElasticNumHybridLogicalQPs,                               \
                     kElasticTimeoutCycles>;                                    \
                 launch_cooperative(kernel, S, hybrid_threads,                  \
                                    hybrid_smem_bytes, stream, x,               \
@@ -552,9 +546,8 @@ void launch_mooncake_elastic_dispatch(
             } else {                                                           \
                 auto kernel = elastic::hybrid_dispatch_impl<                   \
                     false, false, S, kElasticNumNotifyWarps,                   \
-                    kElasticNumHybridScaleoutWarps,                            \
-                    kElasticNumHybridForwardWarps, SO, SU, kHiddenBytes,       \
-                    kNumSFPacks, M, E, K, 1, kElasticNumQPs,                   \
+                    C, C, SO, SU, kHiddenBytes, kNumSFPacks, M, E, K, 1,       \
+                    kElasticNumHybridLogicalQPs,                               \
                     kElasticTimeoutCycles>;                                    \
                 launch_cooperative(kernel, S, hybrid_threads,                  \
                                    hybrid_smem_bytes, stream, x,               \
@@ -573,27 +566,31 @@ void launch_mooncake_elastic_dispatch(
             }                                                                  \
         } while (false)
 
-#define TRY_HYBRID_DISPATCH_TYPED(H, E, K, M, S, SO, SU, EL, SFP)              \
+#define TRY_HYBRID_DISPATCH_TYPED(H, E, K, M, S, SO, SU, C, EL, SFP)           \
         if (hidden == H && num_experts == E && num_topk == K &&                \
             num_max_tokens_per_rank == M && num_sms == S &&                   \
             ctx.num_scaleout_ranks == SO && ctx.num_scaleup_ranks == SU &&     \
-            elem_size == EL && num_sf_packs == SFP && expert_alignment == 1 && \
+            num_channels_per_sm == C && elem_size == EL &&                     \
+            num_sf_packs == SFP && expert_alignment == 1 &&                    \
             !do_cpu_sync) {                                                    \
-            LAUNCH_HYBRID_DISPATCH((H) * (EL), SFP, E, K, M, S, SO, SU);       \
+            LAUNCH_HYBRID_DISPATCH((H) * (EL), SFP, E, K, M, S, SO, SU, C);    \
             return;                                                            \
         }
 
-#define TRY_HYBRID_DISPATCH(H, E, K, M, S, SO, SU)                             \
-        TRY_HYBRID_DISPATCH_TYPED(H, E, K, M, S, SO, SU,                       \
+#define TRY_HYBRID_DISPATCH(H, E, K, M, S, SO, SU, C)                          \
+        TRY_HYBRID_DISPATCH_TYPED(H, E, K, M, S, SO, SU, C,                    \
                                   static_cast<int>(sizeof(nv_bfloat16)), 0);   \
-        TRY_HYBRID_DISPATCH_TYPED(H, E, K, M, S, SO, SU, 1, (H) / 128)
+        TRY_HYBRID_DISPATCH_TYPED(H, E, K, M, S, SO, SU, C, 1, (H) / 128)
 
 #define TRY_HYBRID_DISPATCH_SHAPE(H, E, K, M, S)                               \
-        TRY_HYBRID_DISPATCH(H, E, K, M, S, 2, 4);                              \
-        TRY_HYBRID_DISPATCH(H, E, K, M, S, 2, 8)
+        TRY_HYBRID_DISPATCH(H, E, K, M, S, 2, 4, 4);                           \
+        TRY_HYBRID_DISPATCH(H, E, K, M, S, 2, 4, 8);                           \
+        TRY_HYBRID_DISPATCH(H, E, K, M, S, 2, 8, 4);                           \
+        TRY_HYBRID_DISPATCH(H, E, K, M, S, 2, 8, 8)
 
         TRY_HYBRID_DISPATCH_SHAPE(4096, 256, 8, 128, 24);
         TRY_HYBRID_DISPATCH_SHAPE(7168, 256, 8, 128, 24);
+        TRY_HYBRID_DISPATCH_SHAPE(7168, 256, 8, 128, 40);
 
 #undef TRY_HYBRID_DISPATCH_SHAPE
 #undef TRY_HYBRID_DISPATCH
@@ -609,7 +606,8 @@ void launch_mooncake_elastic_dispatch(
         if (effective_cached_mode) {                                           \
             auto kernel = elastic::dispatch_impl<                              \
                 true, false, true, S, 0, kElasticNumDispatchWarps, R,          \
-                kHiddenBytes, kNumSFPacks, M, E, K, 1, kElasticNumQPs,         \
+                kHiddenBytes, kNumSFPacks, M, E, K, 1,                        \
+                kElasticNumDirectLogicalQPs,                                  \
                 kElasticTimeoutCycles>;                                        \
             launch_cooperative(kernel, S, num_threads, smem_bytes, stream, x,  \
                                static_cast<sf_pack_t*>(sf), topk_idx,          \
@@ -625,7 +623,7 @@ void launch_mooncake_elastic_dispatch(
             auto kernel = elastic::dispatch_impl<                              \
                 true, false, true, S, kElasticNumNotifyWarps,                  \
                 kElasticNumDispatchWarps, R, kHiddenBytes, kNumSFPacks, M, E, K, 1, \
-                kElasticNumQPs, kElasticTimeoutCycles>;                       \
+                kElasticNumDirectLogicalQPs, kElasticTimeoutCycles>;          \
             launch_cooperative(kernel, S, num_threads, smem_bytes, stream, x,  \
                                static_cast<sf_pack_t*>(sf), topk_idx,          \
                                topk_weights, copied_topk_idx,                  \
@@ -640,7 +638,7 @@ void launch_mooncake_elastic_dispatch(
             auto kernel = elastic::dispatch_impl<                              \
                 true, false, false, S, kElasticNumNotifyWarps,                 \
                 kElasticNumDispatchWarps, R, kHiddenBytes, kNumSFPacks, M, E, K, 1, \
-                kElasticNumQPs, kElasticTimeoutCycles>;                       \
+                kElasticNumDirectLogicalQPs, kElasticTimeoutCycles>;          \
             launch_cooperative(kernel, S, num_threads, smem_bytes, stream, x,  \
                                static_cast<sf_pack_t*>(sf), topk_idx,          \
                                topk_weights, copied_topk_idx,                  \
@@ -731,28 +729,31 @@ void launch_mooncake_elastic_dispatch_copy_epilogue(
                                ctx.scaleup_rank_idx);                          \
         } while (false)
 
-#define TRY_HYBRID_DISPATCH_EPILOGUE_TYPED(H, E, K, M, S, SO, SU, EL, SFP)     \
+#define TRY_HYBRID_DISPATCH_EPILOGUE_TYPED(H, E, K, M, S, SO, SU, C, EL, SFP)  \
         if (hidden == H && num_experts == E && num_topk == K &&                \
             num_max_tokens_per_rank == M && num_sms == S &&                   \
             ctx.num_scaleout_ranks == SO && ctx.num_scaleup_ranks == SU &&     \
             elem_size == EL && num_sf_packs == SFP &&                          \
-            num_channels == hybrid_num_channels(S)) {                          \
+            num_channels == hybrid_num_channels(S, C)) {                       \
             LAUNCH_HYBRID_DISPATCH_EPILOGUE((H) * (EL), SFP, E, K, M, S, SO, SU, \
-                                            (S) * kElasticNumHybridForwardWarps); \
+                                            (S) * (C));                         \
             return;                                                            \
         }
 
-#define TRY_HYBRID_DISPATCH_EPILOGUE(H, E, K, M, S, SO, SU)                    \
-        TRY_HYBRID_DISPATCH_EPILOGUE_TYPED(H, E, K, M, S, SO, SU,              \
+#define TRY_HYBRID_DISPATCH_EPILOGUE(H, E, K, M, S, SO, SU, C)                 \
+        TRY_HYBRID_DISPATCH_EPILOGUE_TYPED(H, E, K, M, S, SO, SU, C,           \
                                            static_cast<int>(sizeof(nv_bfloat16)), 0); \
-        TRY_HYBRID_DISPATCH_EPILOGUE_TYPED(H, E, K, M, S, SO, SU, 1, (H) / 128)
+        TRY_HYBRID_DISPATCH_EPILOGUE_TYPED(H, E, K, M, S, SO, SU, C, 1, (H) / 128)
 
 #define TRY_HYBRID_DISPATCH_EPILOGUE_SHAPE(H, E, K, M, S)                      \
-        TRY_HYBRID_DISPATCH_EPILOGUE(H, E, K, M, S, 2, 4);                     \
-        TRY_HYBRID_DISPATCH_EPILOGUE(H, E, K, M, S, 2, 8)
+        TRY_HYBRID_DISPATCH_EPILOGUE(H, E, K, M, S, 2, 4, 4);                  \
+        TRY_HYBRID_DISPATCH_EPILOGUE(H, E, K, M, S, 2, 4, 8);                  \
+        TRY_HYBRID_DISPATCH_EPILOGUE(H, E, K, M, S, 2, 8, 4);                  \
+        TRY_HYBRID_DISPATCH_EPILOGUE(H, E, K, M, S, 2, 8, 8)
 
         TRY_HYBRID_DISPATCH_EPILOGUE_SHAPE(4096, 256, 8, 128, 24);
         TRY_HYBRID_DISPATCH_EPILOGUE_SHAPE(7168, 256, 8, 128, 24);
+        TRY_HYBRID_DISPATCH_EPILOGUE_SHAPE(7168, 256, 8, 128, 40);
 
 #undef TRY_HYBRID_DISPATCH_EPILOGUE_SHAPE
 #undef TRY_HYBRID_DISPATCH_EPILOGUE
@@ -837,19 +838,18 @@ void* launch_mooncake_elastic_combine(
 
 #ifndef MOONCAKE_EP_USE_MUSA
     if (ctx.num_scaleout_ranks != 1) {
-        const int hybrid_combine_warps =
-            kElasticNumHybridScaleupWarps + kElasticNumHybridForwardWarps;
+        const int num_channels_per_sm = num_channels / num_sms;
+        const int hybrid_combine_warps = 2 * num_channels_per_sm;
         const int hybrid_threads = hybrid_combine_warps * 32;
         const int hybrid_smem_bytes = std::max(
             num_smem_bytes,
             combine_smem_bytes(hidden, num_topk, hybrid_combine_warps));
 
-#define LAUNCH_HYBRID_COMBINE(H, E, K, M, S, SO, SU)                           \
+#define LAUNCH_HYBRID_COMBINE(H, E, K, M, S, SO, SU, C)                        \
         do {                                                                   \
             auto kernel = elastic::hybrid_combine_impl<                        \
-                false, true, S, kElasticNumHybridScaleupWarps,                 \
-                kElasticNumHybridForwardWarps, SO, SU, H, M, E, K,             \
-                kElasticNumQPs, kElasticTimeoutCycles>;                        \
+                false, true, S, C, C, SO, SU, H, M, E, K,                     \
+                kElasticNumHybridLogicalQPs, kElasticTimeoutCycles>;           \
             launch_cooperative(kernel, S, hybrid_threads, hybrid_smem_bytes,   \
                                stream, static_cast<nv_bfloat16*>(x),           \
                                topk_weights, src_metadata,                     \
@@ -860,24 +860,27 @@ void* launch_mooncake_elastic_combine(
                                num_reduced_tokens);                            \
         } while (false)
 
-#define TRY_HYBRID_COMBINE(H, E, K, M, S, SO, SU)                              \
+#define TRY_HYBRID_COMBINE(H, E, K, M, S, SO, SU, C)                           \
         if (hidden == H && num_experts == E && num_topk == K &&                \
             num_max_tokens_per_rank == M && num_sms == S &&                   \
             ctx.num_scaleout_ranks == SO && ctx.num_scaleup_ranks == SU &&     \
             allow_multiple_reduction && !use_expanded_layout &&                \
-            num_channels == hybrid_num_channels(S) &&                          \
+            num_channels == hybrid_num_channels(S, C) &&                       \
             token_metadata_at_forward != nullptr && channel_linked_list != nullptr) { \
-            LAUNCH_HYBRID_COMBINE(H, E, K, M, S, SO, SU);                      \
+            LAUNCH_HYBRID_COMBINE(H, E, K, M, S, SO, SU, C);                   \
             return hybrid_combine_reduce_buffer_ptr(                            \
                 ctx.buffer, H, K, M, SO, SU, allow_multiple_reduction);         \
         }
 
 #define TRY_HYBRID_COMBINE_SHAPE(H, E, K, M, S)                                \
-        TRY_HYBRID_COMBINE(H, E, K, M, S, 2, 4);                               \
-        TRY_HYBRID_COMBINE(H, E, K, M, S, 2, 8)
+        TRY_HYBRID_COMBINE(H, E, K, M, S, 2, 4, 4);                            \
+        TRY_HYBRID_COMBINE(H, E, K, M, S, 2, 4, 8);                            \
+        TRY_HYBRID_COMBINE(H, E, K, M, S, 2, 8, 4);                            \
+        TRY_HYBRID_COMBINE(H, E, K, M, S, 2, 8, 8)
 
         TRY_HYBRID_COMBINE_SHAPE(4096, 256, 8, 128, 24);
         TRY_HYBRID_COMBINE_SHAPE(7168, 256, 8, 128, 24);
+        TRY_HYBRID_COMBINE_SHAPE(7168, 256, 8, 128, 40);
 
 #undef TRY_HYBRID_COMBINE_SHAPE
 #undef TRY_HYBRID_COMBINE
@@ -890,7 +893,8 @@ void* launch_mooncake_elastic_combine(
 #define LAUNCH_COMBINE(H, E, K, M, S, R)                                       \
     do {                                                                       \
         auto kernel = elastic::combine_impl<true, false, true, S,              \
-            kElasticNumEpilogueWarps, R, H, M, E, K, kElasticNumQPs,           \
+            kElasticNumEpilogueWarps, R, H, M, E, K,                           \
+            kElasticNumDirectLogicalQPs,                                       \
             kElasticTimeoutCycles>;                                           \
         launch_cooperative(kernel, S, num_threads, smem_bytes, stream,         \
                            static_cast<nv_bfloat16*>(x), topk_weights,         \
@@ -969,6 +973,7 @@ void launch_mooncake_elastic_combine_reduce_epilogue(
 
     TRY_HYBRID_COMBINE_EPILOGUE_SHAPE(4096, 256, 8, 128, 24);
     TRY_HYBRID_COMBINE_EPILOGUE_SHAPE(7168, 256, 8, 128, 24);
+    TRY_HYBRID_COMBINE_EPILOGUE_SHAPE(7168, 256, 8, 128, 40);
 #endif
 
 #undef TRY_HYBRID_COMBINE_EPILOGUE_SHAPE

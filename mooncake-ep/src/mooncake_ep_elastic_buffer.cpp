@@ -1,5 +1,6 @@
 #include <elastic/mooncake_ep_elastic_buffer.h>
 #include <elastic/mooncake_ep_elastic_launch.cuh>
+#include <elastic/mooncake_ep_elastic_layout.cuh>
 
 #include <algorithm>
 #include <cstdlib>
@@ -13,7 +14,9 @@ namespace {
 
 int64_t ceil_div_i64(int64_t x, int64_t y) { return (x + y - 1) / y; }
 
-constexpr int kElasticHybridChannelsPerSm = 4;
+constexpr int kElasticDefaultPhysicalQpsPerRank = 32;
+constexpr int kElasticDirectLogicalQps = 9;
+constexpr int kElasticHybridLogicalQps = 65;
 
 int64_t align_i64(int64_t x, int64_t alignment) {
     return ceil_div_i64(x, alignment) * alignment;
@@ -25,14 +28,15 @@ int getenv_int(const char* name, int default_value) {
     return std::max(1, std::atoi(value));
 }
 
-int hybrid_num_channels(int num_sms) {
-    return std::max(1, num_sms) * kElasticHybridChannelsPerSm;
+int hybrid_num_channels(int num_sms, int num_channels_per_sm) {
+    return std::max(1, num_sms) * std::max(1, num_channels_per_sm);
 }
 
-int hybrid_num_max_tokens_per_channel(int num_max_tokens_per_rank,
-                                      int num_sms) {
+int hybrid_num_max_tokens_per_channel(int num_max_tokens_per_rank, int num_sms,
+                                      int num_channels_per_sm) {
     return static_cast<int>(
-        ceil_div_i64(num_max_tokens_per_rank, hybrid_num_channels(num_sms)));
+        ceil_div_i64(num_max_tokens_per_rank,
+                     hybrid_num_channels(num_sms, num_channels_per_sm)));
 }
 
 int64_t elastic_workspace_num_bytes() {
@@ -75,6 +79,37 @@ int device_smem_bytes() {
 #endif
 }
 
+int hybrid_num_channels_per_sm(int hidden, int elem_size, int num_sf_packs,
+                               int num_topk, int num_ranks, int num_experts,
+                               int num_smem_bytes,
+                               bool prefer_overlap_with_compute) {
+    constexpr int kNumNotifyThreads = 4 * 32;
+    constexpr int kNumMaxChannelsPerSm = 8;
+    const int notify_smem_bytes =
+        align_i64(num_ranks + num_experts, kNumNotifyThreads) * sizeof(int);
+    const auto dispatch_layout = elastic::layout::TokenLayout(
+        hidden * elem_size, num_sf_packs * sizeof(sf_pack_t), num_topk, true);
+    const auto combine_layout = elastic::layout::TokenLayout(
+        hidden * static_cast<int>(sizeof(nv_bfloat16)), 0, num_topk, false);
+    int num_channels_per_sm =
+        std::min((num_smem_bytes - notify_smem_bytes) /
+                     dispatch_layout.get_num_bytes<true>(),
+                 num_smem_bytes / combine_layout.get_num_bytes<true>());
+    num_channels_per_sm =
+        std::min(num_channels_per_sm / 2, kNumMaxChannelsPerSm);
+    if (!prefer_overlap_with_compute) {
+        num_channels_per_sm = std::min(num_channels_per_sm, 4);
+    }
+    if (num_channels_per_sm < 4) {
+        throw std::runtime_error(
+            "Elastic hybrid kernel requires shared memory for at least four "
+            "channels per SM");
+    }
+    // JIT is not available yet; select the largest compiled variant that does
+    // not exceed DeepEP's shared-memory-derived channel count.
+    return num_channels_per_sm >= 8 ? 8 : 4;
+}
+
 }  // namespace
 
 ElasticLaunchContext MooncakeElasticBuffer::make_launch_context(
@@ -113,7 +148,7 @@ ElasticLaunchContext MooncakeElasticBuffer::make_launch_context(
     ctx.num_scaleout_ranks = topology.num_scaleout_ranks;
     ctx.num_scaleup_ranks = topology.num_scaleup_ranks;
     ctx.is_scaleup_nvlink = true;
-    ctx.num_qps = buffer.USE_QP_COUNT;
+    ctx.physical_qps_per_rank = buffer.qps_per_rank();
     ctx.timeout_cycles = timeout_cycles;
     return ctx;
 }
@@ -133,7 +168,15 @@ MooncakeElasticBuffer::MooncakeElasticBuffer(
     config_.allow_multiple_reduction = allow_multiple_reduction;
     config_.prefer_overlap_with_compute = prefer_overlap_with_compute;
     config_.sl_idx = sl_idx;
-    config_.num_allocated_qps = num_allocated_qps;
+    const int required_logical_qps =
+        allow_hybrid_mode ? kElasticHybridLogicalQps : kElasticDirectLogicalQps;
+    config_.num_allocated_qps =
+        num_allocated_qps == 0 ? required_logical_qps : num_allocated_qps;
+    if (config_.num_allocated_qps < required_logical_qps) {
+        throw std::runtime_error(
+            "Mooncake static Elastic kernels require at least " +
+            std::to_string(required_logical_qps) + " logical QPs");
+    }
     config_.num_cpu_timeout_secs = num_cpu_timeout_secs;
     config_.num_gpu_timeout_secs = num_gpu_timeout_secs;
 
@@ -148,8 +191,12 @@ MooncakeElasticBuffer::MooncakeElasticBuffer(
             num_ranks, num_max_tokens_per_rank, hidden, num_topk,
             use_fp8_dispatch, allow_hybrid_mode, allow_multiple_reduction);
     }
-    native_buffer_ =
-        std::make_unique<MooncakeEpBuffer>(rank, num_ranks, num_buffer_bytes);
+    const int physical_qps_per_rank =
+        getenv_int("MOONCAKE_EP_ELASTIC_PHYSICAL_QPS_PER_RANK",
+                   kElasticDefaultPhysicalQpsPerRank);
+    native_buffer_ = std::make_unique<MooncakeEpBuffer>(
+        rank, num_ranks, num_buffer_bytes, nullptr,
+        physical_qps_per_rank * num_ranks);
     host_workspace_bytes_ = elastic_workspace_num_bytes();
     CUDA_CHECK(cudaHostAlloc(&host_workspace_, host_workspace_bytes_,
                              cudaHostAllocMapped));
@@ -250,14 +297,21 @@ ElasticDispatchOutput MooncakeElasticBuffer::dispatch(
     // intra-node scale-up domain.
     const int num_recv_tokens = num_max_tokens_per_rank * topology_.num_ranks;
     const int num_smem_bytes = device_smem_bytes();
-    const int num_channels_per_sm = 1;
-    const int num_channels = num_sms * num_channels_per_sm;
+    int num_channels_per_sm = 1;
     const bool cached_mode = cached_handle.has_value();
     const bool use_hybrid = topology_.num_scaleout_ranks != 1;
-    const int hybrid_channels = use_hybrid ? hybrid_num_channels(num_sms) : 0;
+    if (use_hybrid) {
+        num_channels_per_sm = hybrid_num_channels_per_sm(
+            hidden, static_cast<int>(x.element_size()), num_sf_packs, num_topk,
+            topology_.num_ranks, num_experts, num_smem_bytes,
+            config_.prefer_overlap_with_compute);
+    }
+    const int num_channels = num_sms * num_channels_per_sm;
+    const int hybrid_channels =
+        use_hybrid ? hybrid_num_channels(num_sms, num_channels_per_sm) : 0;
     const int hybrid_max_tokens_per_channel =
-        use_hybrid ? hybrid_num_max_tokens_per_channel(num_max_tokens_per_rank,
-                                                       num_sms)
+        use_hybrid ? hybrid_num_max_tokens_per_channel(
+                         num_max_tokens_per_rank, num_sms, num_channels_per_sm)
                    : 0;
     if (cached_mode) {
         const auto& handle = cached_handle.value();
@@ -267,6 +321,7 @@ ElasticDispatchOutput MooncakeElasticBuffer::dispatch(
         EP_HOST_ASSERT(handle.num_max_tokens_per_rank ==
                        num_max_tokens_per_rank);
         EP_HOST_ASSERT(handle.num_sms == num_sms);
+        EP_HOST_ASSERT(handle.num_channels_per_sm == num_channels_per_sm);
         if (use_hybrid) {
             EP_HOST_ASSERT(handle.dst_buffer_slot_idx.dim() == 4);
             EP_HOST_ASSERT(handle.dst_buffer_slot_idx.size(0) ==
@@ -383,9 +438,8 @@ ElasticDispatchOutput MooncakeElasticBuffer::dispatch(
         num_tokens, num_max_tokens_per_rank, hidden,
         static_cast<int>(x.element_size()), num_sf_packs, sf_token_stride,
         sf_hidden_stride, num_experts, num_topk, expert_alignment, num_sms,
-        use_hybrid ? kElasticHybridChannelsPerSm : num_channels_per_sm,
-        num_smem_bytes, cached_mode, config_.deterministic, false, launch_ctx,
-        launch_stream.stream());
+        num_channels_per_sm, num_smem_bytes, cached_mode, config_.deterministic,
+        false, launch_ctx, launch_stream.stream());
 
     const int num_recv_output_capacity =
         do_expand ? num_recv_tokens * num_topk : num_recv_tokens;
@@ -504,6 +558,7 @@ ElasticDispatchOutput MooncakeElasticBuffer::dispatch(
     handle.expert_alignment = expert_alignment;
     handle.num_max_tokens_per_rank = num_max_tokens_per_rank;
     handle.num_sms = num_sms;
+    handle.num_channels_per_sm = num_channels_per_sm;
     handle.topk_idx = cached_mode ? cached_handle->topk_idx : topk_idx.clone();
     handle.psum_num_recv_tokens_per_expert =
         handle_psum_num_recv_tokens_per_expert;
@@ -544,9 +599,11 @@ ElasticCombineOutput MooncakeElasticBuffer::combine(
     const int num_topk = static_cast<int>(handle.topk_idx.size(1));
     const int num_combined_tokens = static_cast<int>(handle.topk_idx.size(0));
     const int num_smem_bytes = device_smem_bytes();
-    const int num_channels = std::max(1, num_sms);
     const bool use_hybrid = topology_.num_scaleout_ranks != 1;
-    const int hybrid_channels = use_hybrid ? hybrid_num_channels(num_sms) : 0;
+    const int num_channels_per_sm = use_hybrid ? handle.num_channels_per_sm : 1;
+    const int num_channels = std::max(1, num_sms) * num_channels_per_sm;
+    const int hybrid_channels =
+        use_hybrid ? hybrid_num_channels(num_sms, num_channels_per_sm) : 0;
     auto compute_stream = at::cuda::getCurrentCUDAStream();
     auto launch_stream = native_buffer_->comm_stream;
     stream_wait(launch_stream, compute_stream);

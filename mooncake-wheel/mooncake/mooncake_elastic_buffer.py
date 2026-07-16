@@ -50,6 +50,7 @@ class EPHandle:
         expert_alignment: int,
         num_max_tokens_per_rank: int,
         num_sms: int,
+        num_channels_per_sm: int,
         topk_idx: torch.Tensor,
         num_recv_tokens_per_expert_list: List[int],
         psum_num_recv_tokens_per_scaleup_rank: torch.Tensor,
@@ -66,6 +67,7 @@ class EPHandle:
         self.expert_alignment = expert_alignment
         self.num_max_tokens_per_rank = num_max_tokens_per_rank
         self.num_sms = num_sms
+        self.num_channels_per_sm = num_channels_per_sm
         self.topk_idx = topk_idx
         self.psum_num_recv_tokens_per_scaleup_rank = psum_num_recv_tokens_per_scaleup_rank
         self.psum_num_recv_tokens_per_expert = psum_num_recv_tokens_per_expert
@@ -130,6 +132,8 @@ class ElasticBuffer:
         self.prefer_overlap_with_compute = prefer_overlap_with_compute
         self.deterministic = deterministic
         self.sl_idx = int(os.getenv("EP_OVERRIDE_RDMA_SL", sl_idx))
+        if num_allocated_qps == 0:
+            num_allocated_qps = 65 if allow_hybrid_mode else 17
         self.num_allocated_qps = num_allocated_qps
         self.num_cpu_timeout_secs = num_cpu_timeout_secs
         self.num_gpu_timeout_secs = num_gpu_timeout_secs
@@ -216,7 +220,7 @@ class ElasticBuffer:
             dist.all_gather(rkeys, rkey_tensor, self.group)
             rkeys_list = torch.cat(rkeys).tolist()
 
-            all_to_all_size = ep.MAX_QP_COUNT // self.num_ranks
+            all_to_all_size = self.runtime.qps_per_rank()
             if is_update:
                 self.runtime.update_local_qpns()
 
@@ -497,6 +501,7 @@ class ElasticBuffer:
             expert_alignment=native_handle.expert_alignment,
             num_max_tokens_per_rank=native_handle.num_max_tokens_per_rank,
             num_sms=native_handle.num_sms,
+            num_channels_per_sm=native_handle.num_channels_per_sm,
             topk_idx=native_handle.topk_idx,
             num_recv_tokens_per_expert_list=list(native_handle.num_recv_tokens_per_expert_list),
             psum_num_recv_tokens_per_scaleup_rank=native_handle.psum_num_recv_tokens_per_scaleup_rank,
