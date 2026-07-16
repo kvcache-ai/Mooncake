@@ -214,6 +214,13 @@ FileStorage::FileStorage(const FileStorageConfig& config,
         }
     }
 #endif
+
+    // Register this FileStorage with the Client so that
+    // ExecuteReplicaTransfer can access local-disk loading for
+    // LOCAL_DISK drain migration.
+    if (client_) {
+        client_->set_file_storage(this);
+    }
 }
 
 FileStorage::~FileStorage() {
@@ -1017,6 +1024,39 @@ FileStorage::AllocateBatch(const std::vector<std::string>& keys,
     }
     result->total_size = total_size;
     return result;
+}
+
+tl::expected<std::shared_ptr<FileStorage::AllocatedBatch>, ErrorCode>
+FileStorage::LoadBatchFromLocalDisk(const std::string& key,
+                                    const std::string& tenant_id,
+                                    uint64_t size) {
+    if (size == 0) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    const auto storage_key = MakeTenantScopedStorageKey(tenant_id, key);
+
+    // (a) Allocate an O_DIRECT-aligned staging buffer.
+    std::vector<std::string> single_key{storage_key};
+    std::vector<int64_t> single_size{static_cast<int64_t>(size)};
+    auto allocate_res = AllocateBatch(single_key, single_size);
+    if (!allocate_res) {
+        LOG(WARNING) << "LoadBatchFromLocalDisk: AllocateBatch failed for key="
+                     << key << ", error=" << allocate_res.error();
+        return tl::make_unexpected(allocate_res.error());
+    }
+
+    auto staging = allocate_res.value();
+
+    // (b) Read the data from local SSD into the staging buffer.
+    auto load_res = BatchLoad(staging->slices);
+    if (!load_res) {
+        LOG(WARNING) << "LoadBatchFromLocalDisk: BatchLoad failed for key="
+                     << key << ", error=" << load_res.error();
+        return tl::make_unexpected(load_res.error());
+    }
+
+    return staging;
 }
 
 void FileStorage::ClientBufferGCThreadFunc() {

@@ -1025,6 +1025,13 @@ class MasterService {
             return it != replicas_.end() ? &(*it) : nullptr;
         }
 
+        const Replica* GetFirstReplica(
+            const std::function<bool(const Replica&)>& pred_fn) const {
+            const auto it =
+                std::find_if(replicas_.begin(), replicas_.end(), pred_fn);
+            return it != replicas_.end() ? &(*it) : nullptr;
+        }
+
         Replica* GetReplicaByID(const ReplicaID& id) {
             return GetFirstReplica(
                 [&id](const Replica& replica) { return replica.id() == id; });
@@ -1063,6 +1070,19 @@ class MasterService {
         }
 
         Replica* GetReplicaBySegmentName(const std::string& segment_name) {
+            return GetFirstReplica([&segment_name](const Replica& replica) {
+                auto names = replica.get_segment_names();
+                for (auto& name_opt : names) {
+                    if (name_opt == segment_name) {
+                        return true;
+                    }
+                }
+                return false;
+            });
+        }
+
+        const Replica* GetReplicaBySegmentName(
+            const std::string& segment_name) const {
             return GetFirstReplica([&segment_name](const Replica& replica) {
                 auto names = replica.get_segment_names();
                 for (auto& name_opt : names) {

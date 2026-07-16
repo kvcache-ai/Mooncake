@@ -49,9 +49,11 @@ class FileStorage {
      */
     bool ReleaseBuffer(uint64_t batch_id);
 
-   private:
-    friend class FileStorageTest;
-    friend class FileStoragePromotionTest;
+    /**
+     * @brief RAII wrapper for a batch of O_DIRECT-aligned staging buffers
+     * allocated from client_buffer_allocator_. The BufferHandles in
+     * `handles` release the staging space when this object is destroyed.
+     */
     struct AllocatedBatch {
         uint64_t batch_id;
         std::vector<BufferHandle> handles;
@@ -69,6 +71,26 @@ class FileStorage {
 
         ~AllocatedBatch() = default;
     };
+
+    /**
+     * @brief Load a single key from local SSD into a staging buffer.
+     * Used by Client::ExecuteReplicaTransfer for LOCAL_DISK drain
+     * migration. Allocates an O_DIRECT-aligned buffer via
+     * client_buffer_allocator_, reads the data from the local SSD
+     * backend, and returns the batch. The caller is responsible for
+     * keeping the shared_ptr alive while using the slices (RAII
+     * releases the staging space when it goes out of scope).
+     *
+     * @param key        Object key (without tenant prefix)
+     * @param tenant_id  Tenant ID (used to build the storage key)
+     * @param size       Expected data size in bytes
+     * @return shared_ptr<AllocatedBatch> on success, error on failure
+     */
+    tl::expected<std::shared_ptr<AllocatedBatch>, ErrorCode>
+    LoadBatchFromLocalDisk(const std::string& key,
+                           const std::string& tenant_id, uint64_t size);
+
+   private:
 
     /**
      * @brief Offload object data and metadata.
