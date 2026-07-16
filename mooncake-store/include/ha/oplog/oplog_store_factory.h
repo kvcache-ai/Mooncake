@@ -75,7 +75,8 @@ class OpLogStoreFactory {
         OpLogStoreType type, const std::string& cluster_id, OpLogStoreRole role,
         const std::string& oplog_root_dir = kDefaultOpLogRootDir,
         int poll_interval_ms = kDefaultOpLogPollIntervalMs,
-        const std::string& password = "", const std::string& username = "");
+        const std::string& password = "", const std::string& username = "",
+        int db_index = 0);
 };
 
 }  // namespace mooncake

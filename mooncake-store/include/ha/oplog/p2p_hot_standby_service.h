@@ -23,6 +23,7 @@ struct P2PHotStandbyConfig {
     std::string redis_endpoint;
     std::string redis_username;
     std::string redis_password;
+    int redis_db_index{0};
     int oplog_poll_interval_ms{kDefaultOpLogPollIntervalMs};
 };
 

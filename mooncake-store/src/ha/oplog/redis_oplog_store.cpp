@@ -32,10 +32,8 @@ bool ParseUint64(const std::string& value, uint64_t& result) {
 
 bool ParseRedisEndpoint(const std::string& redis_endpoint, std::string& host,
                         int& port) {
-    host = "127.0.0.1";
-    port = 6379;
     if (redis_endpoint.empty()) {
-        return true;
+        return false;
     }
 
     if (redis_endpoint.front() == '[') {
@@ -44,10 +42,8 @@ bool ParseRedisEndpoint(const std::string& redis_endpoint, std::string& host,
             return false;
         }
         host = redis_endpoint.substr(1, bracket_pos - 1);
-        if (bracket_pos + 1 == redis_endpoint.size()) {
-            return !host.empty();
-        }
-        if (redis_endpoint[bracket_pos + 1] != ':') {
+        if (bracket_pos + 1 == redis_endpoint.size() ||
+            redis_endpoint[bracket_pos + 1] != ':') {
             return false;
         }
         uint64_t parsed_port = 0;
@@ -62,9 +58,7 @@ bool ParseRedisEndpoint(const std::string& redis_endpoint, std::string& host,
 
     const auto colon_count =
         std::count(redis_endpoint.begin(), redis_endpoint.end(), ':');
-    if (colon_count > 1) {
-        host = redis_endpoint;
-    } else if (colon_count == 1) {
+    if (colon_count == 1) {
         auto colon_pos = redis_endpoint.find(':');
         host = redis_endpoint.substr(0, colon_pos);
         uint64_t parsed_port = 0;
@@ -76,7 +70,7 @@ bool ParseRedisEndpoint(const std::string& redis_endpoint, std::string& host,
         }
         port = static_cast<int>(parsed_port);
     } else {
-        host = redis_endpoint;
+        return false;
     }
     return !host.empty();
 }
@@ -95,11 +89,12 @@ RedisOpLogStore::RedisOpLogStore(const std::string& cluster_id,
                                  const std::string& redis_endpoint,
                                  bool enable_write, int poll_interval_ms,
                                  const std::string& password,
-                                 const std::string& username)
+                                 const std::string& username, int db_index)
     : cluster_id_(cluster_id),
       redis_endpoint_(redis_endpoint),
       username_(username),
       password_(password),
+      db_index_(db_index),
       enable_write_(enable_write),
       poll_interval_ms_(poll_interval_ms) {
     if (!NormalizeAndValidateClusterId(cluster_id_)) {
@@ -175,6 +170,20 @@ redisContext* RedisOpLogStore::CreateConnection() const {
         }
     }
 
+    if (db_index_ != 0) {
+        RedisReplyPtr select_reply(
+            (redisReply*)redisCommand(ctx, "SELECT %d", db_index_));
+        if (!select_reply || select_reply->type == REDIS_REPLY_ERROR) {
+            LOG(ERROR) << "RedisOpLogStore: SELECT failed"
+                       << ", endpoint=" << redis_endpoint_
+                       << ", db_index=" << db_index_ << ", error="
+                       << (select_reply && select_reply->str ? select_reply->str
+                                                             : "null");
+            redisFree(ctx);
+            return nullptr;
+        }
+    }
+
     return ctx;
 }
 
@@ -187,7 +196,13 @@ ErrorCode RedisOpLogStore::EnsureConnectedUnlocked() {
         ctx_ = nullptr;
     }
     ctx_ = CreateConnection();
-    return ctx_ ? ErrorCode::OK : ErrorCode::INTERNAL_ERROR;
+    if (!ctx_) {
+        LOG(ERROR) << "RedisOpLogStore: failed to create Redis connection"
+                   << ", endpoint=" << redis_endpoint_
+                   << ", db_index=" << db_index_;
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    return ErrorCode::OK;
 }
 
 ErrorCode RedisOpLogStore::Init() {
@@ -362,6 +377,7 @@ ErrorCode RedisOpLogStore::ReadOpLogSince(uint64_t start_sequence_id,
                        << ", sequence_id=" << sequence_id;
             redisFree(ctx_);
             ctx_ = nullptr;
+            entries.clear();
             return ErrorCode::INTERNAL_ERROR;
         }
     }
@@ -376,6 +392,7 @@ ErrorCode RedisOpLogStore::ReadOpLogSince(uint64_t start_sequence_id,
                        << ", sequence_id=" << sequence_ids[i];
             redisFree(ctx_);
             ctx_ = nullptr;
+            entries.clear();
             return ErrorCode::INTERNAL_ERROR;
         }
         RedisReplyPtr entry_reply(raw_reply);
@@ -383,6 +400,9 @@ ErrorCode RedisOpLogStore::ReadOpLogSince(uint64_t start_sequence_id,
             LOG(ERROR) << "RedisOpLogStore::ReadOpLogSince: missing indexed "
                           "entry"
                        << ", sequence_id=" << sequence_ids[i];
+            redisFree(ctx_);
+            ctx_ = nullptr;
+            entries.clear();
             return ErrorCode::OPLOG_ENTRY_NOT_FOUND;
         }
         if (entry_reply->type == REDIS_REPLY_ERROR) {
@@ -391,6 +411,7 @@ ErrorCode RedisOpLogStore::ReadOpLogSince(uint64_t start_sequence_id,
                        << (entry_reply->str ? entry_reply->str : "null");
             redisFree(ctx_);
             ctx_ = nullptr;
+            entries.clear();
             return ErrorCode::INTERNAL_ERROR;
         }
         if (entry_reply->type != REDIS_REPLY_STRING) {
@@ -398,6 +419,9 @@ ErrorCode RedisOpLogStore::ReadOpLogSince(uint64_t start_sequence_id,
                 << "RedisOpLogStore::ReadOpLogSince: unexpected GET reply type"
                 << ", type=" << entry_reply->type
                 << ", sequence_id=" << sequence_ids[i];
+            redisFree(ctx_);
+            ctx_ = nullptr;
+            entries.clear();
             return ErrorCode::INTERNAL_ERROR;
         }
 
@@ -406,6 +430,9 @@ ErrorCode RedisOpLogStore::ReadOpLogSince(uint64_t start_sequence_id,
         if (!DeserializeOpLogEntry(serialized, entry)) {
             LOG(ERROR) << "RedisOpLogStore::ReadOpLogSince: deserialize failed"
                        << ", sequence_id=" << sequence_ids[i];
+            redisFree(ctx_);
+            ctx_ = nullptr;
+            entries.clear();
             return ErrorCode::INTERNAL_ERROR;
         }
         entries.push_back(std::move(entry));
@@ -496,6 +523,9 @@ ErrorCode RedisOpLogStore::RecordSnapshotSequenceId(
     const std::string& snapshot_id, uint64_t sequence_id) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!IsValidSnapshotId(snapshot_id)) {
+        LOG(ERROR) << "RedisOpLogStore::RecordSnapshotSequenceId: invalid "
+                      "snapshot_id"
+                   << ", snapshot_id=" << snapshot_id;
         return ErrorCode::INVALID_PARAMS;
     }
     auto err = EnsureConnectedUnlocked();
@@ -517,6 +547,9 @@ ErrorCode RedisOpLogStore::GetSnapshotSequenceId(const std::string& snapshot_id,
                                                  uint64_t& sequence_id) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!IsValidSnapshotId(snapshot_id)) {
+        LOG(ERROR) << "RedisOpLogStore::GetSnapshotSequenceId: invalid "
+                      "snapshot_id"
+                   << ", snapshot_id=" << snapshot_id;
         return ErrorCode::INVALID_PARAMS;
     }
     auto err = EnsureConnectedUnlocked();

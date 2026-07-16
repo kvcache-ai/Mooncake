@@ -19,7 +19,7 @@ class RedisOpLogStore : public OpLogStore {
                     const std::string& redis_endpoint, bool enable_write,
                     int poll_interval_ms = 1000,
                     const std::string& password = "",
-                    const std::string& username = "");
+                    const std::string& username = "", int db_index = 0);
     ~RedisOpLogStore() override;
 
     RedisOpLogStore(const RedisOpLogStore&) = delete;
@@ -54,6 +54,7 @@ class RedisOpLogStore : public OpLogStore {
     std::string redis_endpoint_;
     std::string username_;
     std::string password_;
+    int db_index_;
     bool enable_write_;
     int poll_interval_ms_;
     std::string key_tag_;

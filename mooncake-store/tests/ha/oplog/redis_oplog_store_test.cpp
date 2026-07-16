@@ -29,6 +29,16 @@ TEST(RedisOpLogStoreStandaloneTest, InvalidEndpointReturnsError) {
     EXPECT_EQ(nullptr, factory_store);
 }
 
+TEST(RedisOpLogStoreStandaloneTest, EndpointRequiresExplicitPort) {
+    for (const std::string& endpoint : {"", "127.0.0.1", "[::1]", "::1"}) {
+        RedisOpLogStore store("invalid_endpoint_test", endpoint,
+                              /*enable_write=*/true,
+                              /*poll_interval_ms=*/10);
+        EXPECT_EQ(ErrorCode::INTERNAL_ERROR, store.Init())
+            << "endpoint=" << endpoint;
+    }
+}
+
 class RedisOpLogStoreTest : public ::testing::Test {
    protected:
     void SetUp() override {
@@ -243,6 +253,14 @@ TEST_F(RedisOpLogStoreTest, FactoryCreatesRedisStore) {
         redis_username_);
     ASSERT_NE(store, nullptr);
     ASSERT_EQ(ErrorCode::OK, store->WriteOpLog(MakeEntry(1), true));
+}
+
+TEST_F(RedisOpLogStoreTest, RejectsInvalidDatabaseIndex) {
+    RedisOpLogStore store(cluster_id_, redis_endpoint_,
+                          /*enable_write=*/true,
+                          /*poll_interval_ms=*/10, redis_password_,
+                          redis_username_, /*db_index=*/-1);
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, store.Init());
 }
 
 TEST_F(RedisOpLogStoreTest, MasterServiceUsesRedisEndpointForRedisOpLog) {

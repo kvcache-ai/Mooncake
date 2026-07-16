@@ -171,6 +171,7 @@ int MasterServiceSupervisor::Start() {
             standby_config.redis_endpoint = config_.redis_endpoint;
             standby_config.redis_username = config_.redis_username;
             standby_config.redis_password = config_.redis_password;
+            standby_config.redis_db_index = config_.redis_db_index;
 
             p2p_standby =
                 std::make_unique<P2PHotStandbyService>(standby_config);

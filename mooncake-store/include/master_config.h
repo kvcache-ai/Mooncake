@@ -304,6 +304,7 @@ class WrappedMasterServiceConfig {
     std::string redis_endpoint;
     std::string redis_username;
     std::string redis_password;
+    int redis_db_index = 0;
     bool enable_offload = false;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
@@ -352,6 +353,7 @@ class WrappedMasterServiceConfig {
         redis_endpoint = config.redis_endpoint;
         redis_username = config.redis_username;
         redis_password = config.redis_password;
+        redis_db_index = config.redis_db_index;
         enable_offload = config.enable_offload;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
@@ -405,6 +407,7 @@ class WrappedMasterServiceConfig {
         redis_endpoint = config.redis_endpoint;
         redis_username = config.redis_username;
         redis_password = config.redis_password;
+        redis_db_index = config.redis_db_index;
         enable_offload = config.enable_offload;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
@@ -654,6 +657,7 @@ class MasterServiceConfig {
     std::string redis_endpoint;
     std::string redis_username;
     std::string redis_password;
+    int redis_db_index = 0;
     bool enable_offload = false;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
@@ -698,6 +702,7 @@ class MasterServiceConfig {
         redis_endpoint = config.redis_endpoint;
         redis_username = config.redis_username;
         redis_password = config.redis_password;
+        redis_db_index = config.redis_db_index;
         enable_offload = config.enable_offload;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
