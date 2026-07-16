@@ -237,10 +237,17 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
 
     int createQueuePairs(void* stream_ptr) override {
         auto stream = static_cast<cudaStream_t>(stream_ptr);
+        uint32_t wqebb_count = 16384;
+        if (const char* env = std::getenv("MOONCAKE_EP_IBGDA_WQEBBS")) {
+            const long value = std::strtol(env, nullptr, 10);
+            if (value >= 64 && (value & (value - 1)) == 0)
+                wqebb_count = static_cast<uint32_t>(value);
+        }
+        LOG(INFO) << "[EP IBGDA] WQEBBs/QP = " << wqebb_count;
         for (int i = 0; i < num_qps_; ++i) {
-            mlx5gda_qp* qp =
-                mlx5gda_create_rc_qp(mpd_, ctrl_buf_, ctrl_buf_umem_,
-                                     ctrl_buf_heap_, pd_, 16384, 1, stream);
+            mlx5gda_qp* qp = mlx5gda_create_rc_qp(
+                mpd_, ctrl_buf_, ctrl_buf_umem_, ctrl_buf_heap_, pd_,
+                wqebb_count, 1, stream);
             if (!qp) {
                 LOG(ERROR) << "[EP IBGDA] mlx5gda_create_rc_qp failed at " << i;
                 if (retryWithHostControlBuffer())
