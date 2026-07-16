@@ -1269,6 +1269,17 @@ impl ColdTierOffloadManager {
         self.queue.lock().retry_after(entry, delay);
     }
 
+    pub(in super::super) fn requeue_for_debug_evict_all(
+        &self,
+        route_key: ObjectKey,
+        route_version: RouteVersion,
+        length_bytes: Option<u64>,
+    ) -> bool {
+        self.queue
+            .lock()
+            .requeue_for_debug_evict_all(route_key, route_version, length_bytes)
+    }
+
     pub(in super::super) fn is_empty(&self) -> bool {
         self.queue.lock().is_empty()
     }
@@ -1538,6 +1549,30 @@ impl PendingOffloadQueue {
         } else if self.keys.insert(entry.key.clone()) {
             self.entries.push_back(entry);
         }
+    }
+
+    pub(in super::super) fn requeue_for_debug_evict_all(
+        &mut self,
+        route_key: ObjectKey,
+        route_version: RouteVersion,
+        length_bytes: Option<u64>,
+    ) -> bool {
+        let key = PendingOffloadKey { route_key };
+        let removed_in_flight = self.in_flight.remove(&key);
+        if self.keys.contains(&key) {
+            return removed_in_flight;
+        }
+        let now = Instant::now();
+        self.keys.insert(key.clone());
+        self.entries.push_front(PendingOffloadEntry {
+            key,
+            route_version,
+            attempts: 0,
+            not_before: now,
+            enqueued_at: now,
+            length_bytes,
+        });
+        true
     }
 
     pub(in super::super) fn is_empty(&self) -> bool {
