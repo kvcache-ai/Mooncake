@@ -31,7 +31,7 @@ struct WorkspaceLayout {
     // vector for each logical barrier tag, as hybrid kernels mix world and
     // scale-up-only barriers in the same workspace and therefore must not share
     // phase/sign state across tags.
-    static constexpr int kNumBarrierTags = 16;
+    static constexpr int kNumBarrierTags = 32;
     static constexpr int64_t kNumBarrierBytesPerTag =
         sizeof(unsigned long long) + 2 * kNumMaxRanks * sizeof(int);
     static constexpr int64_t kNumBarrierSignalBytes =

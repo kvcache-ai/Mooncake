@@ -21,6 +21,7 @@ static constexpr int kHybridDispatchTag0 = 6;
 static constexpr int kHybridDispatchTag1 = 7;
 static constexpr int kHybridCombineTag0 = 8;
 static constexpr int kHybridCombineTag1 = 9;
+static constexpr int kParallelBarrierTagOffset = 16;
 
 static constexpr int kFlushAllAllocatedQPs = -1;
 
@@ -162,23 +163,33 @@ __forceinline__ __device__ void gpu_barrier(
 
     do_scaleout &= kNumScaleoutRanks > 1;
     do_scaleup &= kNumScaleupRanks > 1;
-    if (do_scaleup && !do_scaleout) {
+    if (do_scaleup && do_scaleout) {
+        static_assert(kNumSMs >= 2, "Hybrid barrier requires at least two SMs");
+        static_assert(kTag + kParallelBarrierTagOffset <
+                          layout::WorkspaceLayout::kNumBarrierTags,
+                      "Insufficient barrier tags");
+        if (sm_idx == 0) {
+            mooncake_barrier_wo_local_sync<
+                transport::ScaleupTeam, kNumScaleupRanks, kNumSMs, kNumThreads,
+                kNumTimeoutCycles, kTag>(gin, workspace, scaleup_rank_idx,
+                                         sm_idx, thread_idx);
+        } else {
+            mooncake_barrier_wo_local_sync<transport::ScaleoutTeam,
+                                           kNumScaleoutRanks, kNumSMs - 1,
+                                           kNumThreads, kNumTimeoutCycles,
+                                           kTag + kParallelBarrierTagOffset>(
+                gin, workspace, scaleout_rank_idx, sm_idx - 1, thread_idx);
+        }
+    } else if (do_scaleup) {
         mooncake_barrier_wo_local_sync<transport::ScaleupTeam, kNumScaleupRanks,
                                        kNumSMs, kNumThreads, kNumTimeoutCycles,
                                        kTag>(gin, workspace, scaleup_rank_idx,
                                              sm_idx, thread_idx);
-    } else if (do_scaleout && !do_scaleup) {
+    } else if (do_scaleout) {
         mooncake_barrier_wo_local_sync<transport::ScaleoutTeam,
                                        kNumScaleoutRanks, kNumSMs, kNumThreads,
                                        kNumTimeoutCycles, kTag>(
             gin, workspace, scaleout_rank_idx, sm_idx, thread_idx);
-    } else {
-        const int global_rank =
-            scaleout_rank_idx * kNumScaleupRanks + scaleup_rank_idx;
-        mooncake_barrier_wo_local_sync<
-            transport::WorldTeam, kNumScaleoutRanks * kNumScaleupRanks, kNumSMs,
-            kNumThreads, kNumTimeoutCycles, kTag>(gin, workspace, global_rank,
-                                                  sm_idx, thread_idx);
     }
 
     if constexpr (kSyncAtEnd) {

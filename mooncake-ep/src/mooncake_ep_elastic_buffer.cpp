@@ -44,7 +44,7 @@ int64_t elastic_workspace_num_bytes() {
     constexpr int64_t kNumMaxExperts = 2048;
     constexpr int64_t kNumMaxChannels = 8 * 160;
     constexpr int64_t kNumMaxInflightAGRS = 32;
-    constexpr int64_t kNumBarrierTags = 16;
+    constexpr int64_t kNumBarrierTags = 32;
 
     int64_t num_bytes = 0;
     num_bytes += kNumBarrierTags *
@@ -104,6 +104,16 @@ int hybrid_num_channels_per_sm(int hidden, int elem_size, int num_sf_packs,
         throw std::runtime_error(
             "Elastic hybrid kernel requires shared memory for at least four "
             "channels per SM");
+    }
+    if (const char* env = std::getenv("MOONCAKE_EP_ELASTIC_CHANNELS_PER_SM")) {
+        const int requested = std::atoi(env);
+        if ((requested == 4 || requested == 7 || requested == 8) &&
+            requested <= num_channels_per_sm) {
+            return requested;
+        }
+        throw std::runtime_error(
+            "MOONCAKE_EP_ELASTIC_CHANNELS_PER_SM must select a compiled "
+            "channel count that fits available shared memory");
     }
     // JIT is not available yet; select the exact compiled variant for the
     // channel counts exercised by the supported static shapes.
