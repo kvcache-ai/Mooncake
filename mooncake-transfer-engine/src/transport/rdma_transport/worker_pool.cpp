@@ -368,7 +368,14 @@ void WorkerPool::performPostSend(int thread_id) {
         processed_slice_count_.fetch_add(entry.second.size());
         entry.second.clear();
 #else
-        if (!isRailAvailable(entry.first)) {
+        // Check the connection pause before looking up or creating an endpoint.
+        // A paused peer is a policy decision, not a new path failure: routing
+        // it through setupConnectionsByActive() would return ERR_ENDPOINT,
+        // delete the endpoint, and refresh the pause without attempting a
+        // connection. Keeping the check here gives the pause a hard retry
+        // deadline; only a genuine connection/QP failure can arm or extend it.
+        if (!isRailAvailable(entry.first) ||
+            context_.isConnectPaused(entry.first)) {
             for (auto &slice : entry.second) failed_slice_list.push_back(slice);
             entry.second.clear();
             continue;

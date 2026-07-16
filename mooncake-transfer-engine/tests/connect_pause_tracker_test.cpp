@@ -61,6 +61,23 @@ TEST(ConnectPauseTracker, PausedUntilExpiry) {
     EXPECT_EQ(t.size(), 0u);         // and lazily deleted on the failing check
 }
 
+TEST(ConnectPauseTracker, RepeatedChecksDoNotExtendHardDeadline) {
+    auto clk = std::make_shared<FakeClock>();
+    auto t = makeTracker(clk);
+    const std::string peer = "10.0.0.1:1234";
+    t.pause(peer, 1000);
+
+    // Simulate continuous traffic checking the pause. Lookups are not actual
+    // connection failures, so they must not refresh the deadline.
+    for (uint64_t now = 100; now < 1000; now += 100) {
+        clk->now = now;
+        EXPECT_TRUE(t.isPaused(peer));
+    }
+
+    clk->now = 1000;
+    EXPECT_FALSE(t.isPaused(peer));
+}
+
 TEST(ConnectPauseTracker, RefreshExtendsWindow) {
     auto clk = std::make_shared<FakeClock>();
     auto t = makeTracker(clk);

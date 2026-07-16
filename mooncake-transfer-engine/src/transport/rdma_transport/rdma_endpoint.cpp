@@ -344,16 +344,6 @@ int RdmaEndPoint::setupConnectionsByActive() {
             return ret;
         }
 
-        // Active-connect circuit-breaker: if we recently tore down an endpoint
-        // to this peer (path failure / QP fatal), skip the handshake for the
-        // configured pause window instead of blocking the posting worker on
-        // an RPC to a likely-gone peer. Fail fast; performPostSend then
-        // redispatches or fails the (not-yet-posted) slices. No-op when
-        // conn_pause_ttl_ms is 0.
-        if (context_.isConnectPaused(peer_nic_path_)) {
-            return ERR_ENDPOINT;
-        }
-
         // Only the first UNCONNECTED caller transitions to CONNECTING.
         auto current_status = status_.load(std::memory_order_relaxed);
         if (current_status == UNCONNECTED) {
