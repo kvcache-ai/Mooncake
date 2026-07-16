@@ -2,11 +2,18 @@
 #include "tenant_quota_policy_store.h"
 #include "types.h"
 
+#ifdef STORE_USE_ETCD
+#include "etcd_helper.h"
+#endif
+
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <limits>
 #include <map>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -14,6 +21,19 @@
 
 namespace mooncake {
 namespace {
+
+#ifdef STORE_USE_ETCD
+constexpr const char* kTenantQuotaEtcdEndpoints = "127.0.0.1:2379";
+constexpr std::string_view kTenantQuotaEtcdProbeKey = "tenant_quota_probe";
+
+std::string GetTenantQuotaEtcdEndpoints() {
+    const char* endpoints = std::getenv("MOONCAKE_TENANT_QUOTA_ETCD_ENDPOINTS");
+    if (endpoints != nullptr && endpoints[0] != '\0') {
+        return endpoints;
+    }
+    return kTenantQuotaEtcdEndpoints;
+}
+#endif
 
 TenantQuotaSnapshot Snapshot(const TenantQuotaTable& table,
                              const std::string& tenant_id) {
@@ -35,6 +55,46 @@ std::filesystem::path MakeTempPolicyPath(const std::string& suffix) {
            ("mooncake_tenant_quota_policy_store_test_" +
             std::to_string(::getpid()) + "_" + suffix + ".yaml");
 }
+
+#ifdef STORE_USE_ETCD
+std::string PrefixEnd(std::string prefix) {
+    for (int i = static_cast<int>(prefix.size()) - 1; i >= 0; --i) {
+        unsigned char c = static_cast<unsigned char>(prefix[i]);
+        if (c < 0xFF) {
+            prefix[i] = static_cast<char>(c + 1);
+            prefix.resize(i + 1);
+            return prefix;
+        }
+    }
+    return std::string(1, '\0');
+}
+
+std::optional<std::string> GetTenantQuotaEtcdSkipReason() {
+    const std::string endpoints = GetTenantQuotaEtcdEndpoints();
+    ErrorCode error = EtcdHelper::ConnectToEtcdStoreClient(endpoints);
+    if (error != ErrorCode::OK) {
+        return "Etcd server not reachable at " + endpoints + ": " +
+               toString(error);
+    }
+    std::string value;
+    EtcdRevisionId revision_id = 0;
+    error =
+        EtcdHelper::Get(kTenantQuotaEtcdProbeKey.data(),
+                        kTenantQuotaEtcdProbeKey.size(), value, revision_id);
+    if (error == ErrorCode::ETCD_OPERATION_ERROR) {
+        return "Etcd server not reachable at " + endpoints + ": " +
+               toString(error);
+    }
+    return std::nullopt;
+}
+
+void CleanupTenantQuotaEtcdCluster(const std::string& cluster_id) {
+    std::string prefix = "mooncake-store/" + cluster_id + "/";
+    std::string end = PrefixEnd(prefix);
+    (void)EtcdHelper::DeleteRange(prefix.c_str(), prefix.size(), end.c_str(),
+                                  end.size());
+}
+#endif
 
 void MakeOrphanTenant(TenantQuotaTable* table, const std::string& tenant_id,
                       uint64_t bytes) {
@@ -227,6 +287,77 @@ TEST(TenantQuotaPolicyStoreTest, RoundTripsYamlFile) {
 
     std::filesystem::remove(path);
 }
+
+TEST(TenantQuotaPolicyStoreTest, FileFactoryCreatesYamlStore) {
+    const auto path = MakeTempPolicyPath("factory-file");
+    auto store =
+        CreateTenantQuotaPolicyStore("file", path.string(), "test_cluster");
+    ASSERT_TRUE(store.has_value()) << store.error();
+}
+
+TEST(TenantQuotaPolicyStoreTest, FileFactoryRequiresUri) {
+    auto store = CreateTenantQuotaPolicyStore("file", "", "test_cluster");
+    ASSERT_FALSE(store.has_value());
+    EXPECT_NE(store.error().find("non-empty uri"), std::string::npos);
+}
+
+#ifndef STORE_USE_ETCD
+TEST(TenantQuotaPolicyStoreTest, EtcdFactoryRequiresStoreUseEtcd) {
+    auto store =
+        CreateTenantQuotaPolicyStore("etcd", "127.0.0.1:2379", "test_cluster");
+    ASSERT_FALSE(store.has_value());
+    EXPECT_NE(store.error().find("STORE_USE_ETCD"), std::string::npos);
+}
+#endif
+
+#ifdef STORE_USE_ETCD
+TEST(TenantQuotaPolicyStoreTest, EtcdMissingKeyLoadsEmptySnapshot) {
+    if (auto skip_reason = GetTenantQuotaEtcdSkipReason();
+        skip_reason.has_value()) {
+        GTEST_SKIP() << skip_reason.value();
+    }
+
+    const std::string cluster_id =
+        "tenant_quota_missing_" + std::to_string(::getpid());
+    CleanupTenantQuotaEtcdCluster(cluster_id);
+
+    auto store = CreateTenantQuotaPolicyStore(
+        "etcd", GetTenantQuotaEtcdEndpoints(), cluster_id);
+    ASSERT_TRUE(store.has_value()) << store.error();
+
+    auto loaded = store.value()->Load();
+    ASSERT_TRUE(loaded.has_value()) << loaded.error();
+    EXPECT_TRUE(loaded->tenant_quotas.empty());
+
+    CleanupTenantQuotaEtcdCluster(cluster_id);
+}
+
+TEST(TenantQuotaPolicyStoreTest, EtcdRoundTripsSnapshot) {
+    if (auto skip_reason = GetTenantQuotaEtcdSkipReason();
+        skip_reason.has_value()) {
+        GTEST_SKIP() << skip_reason.value();
+    }
+
+    const std::string cluster_id =
+        "tenant_quota_roundtrip_" + std::to_string(::getpid());
+    CleanupTenantQuotaEtcdCluster(cluster_id);
+
+    auto store = CreateTenantQuotaPolicyStore(
+        "etcd", GetTenantQuotaEtcdEndpoints(), cluster_id);
+    ASSERT_TRUE(store.has_value()) << store.error();
+
+    TenantQuotaPolicySnapshot snapshot;
+    snapshot.tenant_quotas = {{"tenant-a", 1024}, {"tenant-b", 2048}};
+    auto save = store.value()->Save(snapshot);
+    ASSERT_TRUE(save.has_value()) << save.error();
+
+    auto loaded = store.value()->Load();
+    ASSERT_TRUE(loaded.has_value()) << loaded.error();
+    EXPECT_EQ(loaded->tenant_quotas, snapshot.tenant_quotas);
+
+    CleanupTenantQuotaEtcdCluster(cluster_id);
+}
+#endif
 
 TEST(TenantQuotaPolicyStoreTest, RoundTripsYamlSpecialScalarNames) {
     TenantQuotaPolicySnapshot snapshot;

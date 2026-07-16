@@ -14,7 +14,7 @@
 
 #include "pyclient.h"
 #include "client_service.h"
-#include "client_buffer.hpp"
+#include "client_buffer.h"
 #include "mutex.h"
 #include "utils.h"
 #include "rpc_types.h"
@@ -89,7 +89,9 @@ class RealClient : public PyClient {
         const std::string &ipc_socket_path = "",
         bool enable_ssd_offload = false,
         const std::string &ssd_offload_path = "",
-        const std::string &tenant_id = "default");
+        const std::string &tenant_id = "default",
+        bool enable_client_http_server = false,
+        int client_http_port = DEFAULT_CLIENT_HTTP_PORT);
 
     int setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                     const std::string &server_address,
@@ -511,7 +513,9 @@ class RealClient : public PyClient {
         const std::string &ipc_socket_path = "", int local_rpc_port = 50052,
         bool enable_ssd_offload = false, bool start_offload_rpc_server = false,
         const std::string &ssd_offload_path = "",
-        const std::string &tenant_id = "default");
+        const std::string &tenant_id = "default",
+        bool enable_client_http_server = false,
+        int client_http_port = DEFAULT_CLIENT_HTTP_PORT);
 
     // Overload that accepts a configuration dictionary
     tl::expected<void, ErrorCode> setup_internal(const ConfigDict &config);
@@ -927,7 +931,7 @@ class RealClient : public PyClient {
     int stop_ipc_server();
     // Embedded HTTP server for health-check / metrics
     std::unique_ptr<coro_http::coro_http_server> http_server_;
-    int start_http_server();
+    int start_http_server(int port);
     void stop_http_server();
 
     void handle_ipc_shm_register(UdsConnection &connection);

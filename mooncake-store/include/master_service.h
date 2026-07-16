@@ -36,11 +36,20 @@
 #include "ha/ha_types.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "task_manager.h"
+#include "kv_event/kv_event_publisher.h"
 
 namespace mooncake {
+
+// Forward declaration for MasterSnapshotManager
+class MasterSnapshotManager;
+class MasterSnapshotRepository;
+
 namespace ha {
 class SnapshotCatalogStore;
-}
+class MasterSnapshotCodec;
+struct MasterSnapshotPayloads;
+class MasterSnapshotCodecTest;  // test fixture, needs private state access
+}  // namespace ha
 
 class EtcdOpLogStore;
 
@@ -62,6 +71,9 @@ class SnapshotChildProcessTest;
 class PromotionOnHitTest;
 class MasterServiceTenantQuotaTest;
 }  // namespace test
+namespace benchmarks {
+class BatchEvictBench;
+}  // namespace benchmarks
 
 /*
  * @brief MasterService is the main class for the master server.
@@ -82,7 +94,13 @@ class MasterService {
     friend class test::MasterServiceSnapshotTestBase;
     friend class test::SnapshotChildProcessTest;
     friend class test::PromotionOnHitTest;
+    friend class benchmarks::BatchEvictBench;
     friend class test::MasterServiceTenantQuotaTest;
+    friend class MasterSnapshotManager;    // Allow access to internal state for
+                                           // snapshot
+    friend class ha::MasterSnapshotCodec;  // Allow codec to access private
+                                           // members
+    friend class ha::MasterSnapshotCodecTest;  // codec round-trip unit test
 
    public:
     using NoFProbeFn =
@@ -284,6 +302,9 @@ class MasterService {
         std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
         ErrorCode>;
 
+    bool KvEventsEnabled() const;
+    KvEventPublisher::Stats GetKvEventStats() const;
+
     /**
      * @brief Batch clear KV cache replicas for specified object keys.
      * @param object_keys Vector of object key strings to clear.
@@ -323,11 +344,29 @@ class MasterService {
         -> tl::expected<GetReplicaListResponse, ErrorCode>;
 
     /**
+     * @brief Read-only single-key replica list query for admin use.
+     * Unlike GetReplicaList, this does not grant leases, trigger
+     * promotion, or update cache-hit metrics.
+     */
+    auto GetReplicaListForAdmin(const std::string& key,
+                                const std::string& tenant_id)
+        -> tl::expected<GetReplicaListResponse, ErrorCode>;
+
+    /**
      * @brief Get replica lists for a batch of objects.
      */
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& keys,
                         const std::string& tenant_id);
+
+    /**
+     * @brief Read-only batch replica list query for admin use.
+     * Unlike BatchGetReplicaList, this does not grant leases, trigger
+     * promotion, or update cache-hit metrics.
+     */
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
+                                const std::string& tenant_id);
 
     /**
      * @brief Start a put operation for an object
@@ -769,44 +808,21 @@ class MasterService {
     void setHttpMetadataRemoteUrl(const std::string& metadata_connstring);
 
    private:
-    void SnapshotThreadFunc();
-
-    // Persist master state
-    tl::expected<void, SerializationError> PersistState(
-        const std::string& snapshot_id);
-    tl::expected<void, SerializationError> PersistState(
-        const ha::SnapshotDescriptor& descriptor);
-    tl::expected<ha::SnapshotDescriptor, SerializationError>
-    BuildSnapshotDescriptor(const std::string& snapshot_id,
-                            const std::string& manifest_path,
-                            const std::string& object_prefix) const;
-    tl::expected<ha::OpLogSequenceId, SerializationError>
-    ResolveSnapshotSequenceId() const;
-#ifdef STORE_USE_ETCD
-    tl::expected<EtcdOpLogStore*, SerializationError>
-    GetSnapshotBoundaryOpLogStore() const;
-#endif
-
-    tl::expected<void, SerializationError> UploadSnapshotPayloadFile(
-        const std::vector<uint8_t>& data, const std::string& path,
-        const std::string& local_filename, const std::string& snapshot_id);
-
     std::unique_ptr<ha::SnapshotCatalogStore> CreateSnapshotCatalogStore();
-    void CleanupOldSnapshot(int keep_count, const std::string& snapshot_id);
     ha::SnapshotCatalogStore* GetSnapshotCatalogStore();
 
     // Restore master state
     void RestoreState();
-    bool TryRestoreStateFromSnapshot(
-        const ha::SnapshotDescriptor& snapshot,
-        const std::chrono::system_clock::time_point& now);
     void ResetStateAfterFailedRestoreAttempt();
 
-    void WaitForSnapshotChild(pid_t pid, const std::string& snapshot_id,
-                              int log_pipe_fd);
-
-    void HandleChildTimeout(pid_t pid, const std::string& snapshot_id);
-    void HandleChildExit(pid_t pid, int status, const std::string& snapshot_id);
+    /**
+     * @brief Apply decoded snapshot state to running master service
+     * @param payloads Decoded snapshot payloads
+     * @param now Current time for cleanup logic
+     * @return void on success, SerializationError on failure
+     */
+    tl::expected<void, SerializationError> ApplySnapshotState(
+        const std::chrono::system_clock::time_point& now);
 
     // BatchEvict evicts objects in a near-LRU way, i.e., prioritizes to evict
     // object with smaller lease timeout. It has two passes. The first pass only
@@ -1553,10 +1569,9 @@ class MasterService {
     static constexpr uint64_t kEvictionThreadSleepMs =
         10;  // 10 ms sleep between eviction checks
 
-    std::thread snapshot_thread_;
-    std::atomic<bool> snapshot_running_{false};
-    std::mutex snapshot_thread_mutex_;
-    std::condition_variable snapshot_thread_cv_;
+    // Snapshot manager handles snapshot lifecycle orchestration
+    std::unique_ptr<MasterSnapshotManager> snapshot_manager_;
+
     // Task cleanup thread related members
     std::thread task_cleanup_thread_;
     std::atomic<bool> task_cleanup_running_{false};
@@ -1999,11 +2014,9 @@ class MasterService {
     std::string snapshot_catalog_store_connstring_;
     std::unique_ptr<SnapshotObjectStore> snapshot_object_store_;
     std::unique_ptr<ha::SnapshotCatalogStore> snapshot_catalog_store_;
+    std::unique_ptr<MasterSnapshotRepository> snapshot_repository_;
+    std::unique_ptr<ha::MasterSnapshotCodec> snapshot_codec_;
     mutable std::shared_mutex snapshot_mutex_;
-#ifdef STORE_USE_ETCD
-    mutable std::mutex snapshot_boundary_oplog_store_mutex_;
-    mutable std::unique_ptr<EtcdOpLogStore> snapshot_boundary_oplog_store_;
-#endif
 
     // Discarded replicas management
     const std::chrono::seconds put_start_discard_timeout_sec_;
@@ -2108,6 +2121,26 @@ class MasterService {
     std::mutex job_mutex_;
     std::unordered_map<UUID, std::shared_ptr<DrainJob>, boost::hash<UUID>>
         drain_jobs_ GUARDED_BY(job_mutex_);
+
+    std::unique_ptr<KvEventPublisher> kv_event_publisher_;
+
+    static KvEventConfig BuildKvEventConfig(const MasterServiceConfig& config);
+    static std::string MediumForReplicaType(ReplicaType replica_type);
+    static std::string MediumForMetadata(const ObjectMetadata& metadata);
+    void PublishKvStored(const std::string& key, ReplicaType replica_type,
+                         const ObjectMetadata& metadata,
+                         const std::string& tenant_id);
+    void PublishKvRemoved(const std::string& key,
+                          const ObjectMetadata& metadata,
+                          const std::string& tenant_id);
+    void PublishKvRemoved(const std::string& key, const std::string& medium,
+                          const std::string& tenant_id,
+                          const std::string& group_id);
+    void PublishKvRemovedAfterEvict(const std::string& key,
+                                    uint64_t freed_bytes,
+                                    const std::string& medium,
+                                    const ObjectMetadata& metadata,
+                                    const std::string& tenant_id);
 };
 
 }  // namespace mooncake

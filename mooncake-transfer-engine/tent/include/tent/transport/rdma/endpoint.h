@@ -15,6 +15,7 @@
 #ifndef TENT_ENDPOINT_H
 #define TENT_ENDPOINT_H
 
+#include <atomic>
 #include <memory>
 #include <queue>
 #include <unordered_set>
@@ -26,7 +27,7 @@ namespace mooncake {
 namespace tent {
 class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     struct WrDepthBlock {
-        volatile int value;
+        std::atomic<int> value;
         uint64_t padding[7];
     };
 
@@ -160,7 +161,7 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
 
     size_t acknowledge(RdmaSlice* slice, TransferStatusEnum status);
 
-    volatile int* getQuotaCounter(int qp_index) const {
+    std::atomic<int>* getQuotaCounter(int qp_index) const {
         return &wr_depth_list_[qp_index].value;
     }
 
@@ -171,6 +172,10 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
 
     int setupOneQP(int qp_index, const std::string& peer_gid, uint16_t peer_lid,
                    uint32_t peer_qp_num, std::string* reply_msg = nullptr);
+
+    // Returns the pool segment owning qp_index, or nullptr when no pools are
+    // configured (the default single-pool case). Read-only after construct().
+    const QpPoolSegment* poolForQp(int qp_index) const;
 
     bool reserveQuota(int qp_index, int num_entries);
 
@@ -193,11 +198,15 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     std::string endpoint_name_;
 
     std::vector<ibv_qp*> qp_list_;
+    // Per-pool QP layout, resolved once in construct() from params_->qp_pools.
+    // Empty = default single pool spanning all of qp_list_. Each segment's
+    // [begin, begin+num_qp) indexes into qp_list_. Read-only after construct().
+    std::vector<QpPoolSegment> qp_pool_segments_;
     // Each data QP queue is owned by exactly one worker lane; reset/deconstruct
     // are synchronized by the endpoint lifecycle lock.
     std::vector<BoundedSliceQueue> slice_queue_;
     WrDepthBlock* wr_depth_list_;
-    volatile int inflight_slices_;
+    std::atomic<int> inflight_slices_;
     uint32_t padding_[7];
     RWSpinlock lock_;
 

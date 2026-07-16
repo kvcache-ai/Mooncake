@@ -82,14 +82,30 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
     context_ = context;
     params_ = params;
     endpoint_name_ = endpoint_name;
-    inflight_slices_ = 0;
-    qp_list_.resize(params_->qp_mul_factor);
+    inflight_slices_.store(0, std::memory_order_relaxed);
+
+    // Resolve the per-pool QP layout (see computeQpPoolSegments). Empty
+    // qp_pools (the default) keeps the historical single homogeneous run of
+    // qp_mul_factor data QPs; a non-empty config lays out one contiguous
+    // segment per pool. qp_pool_segments_ is read-only after construct().
+    QpPoolLayout layout =
+        computeQpPoolSegments(params_->qp_pools, params_->qp_mul_factor);
+    if (!layout.valid) {
+        LOG(ERROR) << "Invalid QP count " << layout.total_qp
+                   << " (qp_mul_factor=" << params_->qp_mul_factor
+                   << ", pools=" << params_->qp_pools.size() << ")";
+        return -1;
+    }
+    qp_pool_segments_ = std::move(layout.segments);
+    const int total_qp = layout.total_qp;
+
+    qp_list_.resize(total_qp);
     // Value-initialize the full array because cleanup may run after only a
     // prefix of QPs has been created.
-    wr_depth_list_ = new WrDepthBlock[params_->qp_mul_factor]();
+    wr_depth_list_ = new WrDepthBlock[total_qp]();
 
-    for (int i = 0; i < params_->qp_mul_factor; ++i) {
-        wr_depth_list_[i].value = 0;
+    for (int i = 0; i < total_qp; ++i) {
+        wr_depth_list_[i].value.store(0, std::memory_order_relaxed);
         ibv_qp_init_attr attr;
         memset(&attr, 0, sizeof(attr));
         auto cq = context_->cq(i % context_->cqCount())->cq();
@@ -255,9 +271,10 @@ int RdmaEndPoint::deconstructUnlocked() {
 
     bool all_qps_destroyed = true;
     for (size_t i = 0; i < qp_list_.size(); ++i) {
-        if (wr_depth_list_ && wr_depth_list_[i].value != 0) {
-            const int outstanding = wr_depth_list_[i].value;
-            cancelQuota(i, outstanding);
+        if (wr_depth_list_) {
+            const int outstanding =
+                wr_depth_list_[i].value.load(std::memory_order_relaxed);
+            if (outstanding != 0) cancelQuota(i, outstanding);
         }
         if (!qp_list_[i]) continue;
         if (context_->verbs_.ibv_destroy_qp(qp_list_[i])) {
@@ -351,7 +368,7 @@ bool RdmaEndPoint::finishDestroy() {
     // failed, enforce a timeout so cleanup can still make progress.
     bool has_outstanding = false;
     for (size_t i = 0; wr_depth_list_ && i < qp_list_.size(); ++i) {
-        if (wr_depth_list_[i].value != 0) {
+        if (wr_depth_list_[i].value.load(std::memory_order_relaxed) != 0) {
             has_outstanding = true;
             break;
         }
@@ -648,6 +665,14 @@ int RdmaEndPoint::resetConnection(const std::string& reason) {
     return 0;
 }
 
+const QpPoolSegment* RdmaEndPoint::poolForQp(int qp_index) const {
+    for (const auto& seg : qp_pool_segments_) {
+        if (qp_index >= seg.begin && qp_index < seg.begin + seg.num_qp)
+            return &seg;
+    }
+    return nullptr;
+}
+
 int RdmaEndPoint::setupAllQPs(const std::string& peer_gid, uint16_t peer_lid,
                               std::vector<uint32_t> peer_qp_num_list,
                               std::string* reply_msg) {
@@ -694,14 +719,25 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
     RWSpinlock::ReadGuard guard(lock_);
     if (qp_list_.empty()) return 0;
     if (qp_index < 0) qp_index = 0;
-    qp_index %= qp_list_.size();
+    // Route to the QP pool this transfer asked for (RFC #2568 step 3). All
+    // slices in a list belong to one task, hence one pool; fold the worker-lane
+    // candidate into that pool's QP segment. Empty/unknown pool or no pools
+    // configured => unchanged global spray.
+    static const std::string kNoPool;
+    const std::string& pool_name =
+        (!slice_list.empty() && slice_list.front()->task)
+            ? slice_list.front()->task->qp_pool
+            : kNoPool;
+    qp_index = selectQpInPool(qp_pool_segments_, pool_name, qp_index,
+                              (int)qp_list_.size());
     // Check endpoint status before submitting
     if (status_.load(std::memory_order_relaxed) != EP_READY) return 0;
     auto cq = context_->cq(qp_index % context_->cqCount());
-    int wr_count =
-        std::min(cq->maxCqe() - cq->getQuota(),
-                 std::min(params_->max_qp_wr - wr_depth_list_[qp_index].value,
-                          (int)slice_list.size()));
+    int wr_count = std::min(
+        cq->maxCqe() - cq->getQuota(),
+        std::min(params_->max_qp_wr - wr_depth_list_[qp_index].value.load(
+                                          std::memory_order_relaxed),
+                 (int)slice_list.size()));
     int sge_count = wr_count * kSgeEntries;
 
     if (wr_count <= 0 || !reserveQuota(qp_index, wr_count)) return 0;
@@ -817,15 +853,17 @@ std::vector<uint32_t> RdmaEndPoint::qpNum() {
     return ret;
 }
 
-int RdmaEndPoint::getInflightSlices() const { return inflight_slices_; }
+int RdmaEndPoint::getInflightSlices() const {
+    return inflight_slices_.load(std::memory_order_relaxed);
+}
 
 bool RdmaEndPoint::reserveQuota(int qp_index, int num_entries) {
     assert(qp_index >= 0 && qp_index < (int)qp_list_.size());
     auto cq = context_->cq(qp_index % context_->cqCount());
     if (!cq->reserveQuota(num_entries)) return false;
-    auto prev_depth_list =
-        __sync_fetch_and_add(&wr_depth_list_[qp_index].value, num_entries);
-    __sync_fetch_and_add(&inflight_slices_, num_entries);
+    auto prev_depth_list = wr_depth_list_[qp_index].value.fetch_add(
+        num_entries, std::memory_order_acq_rel);
+    inflight_slices_.fetch_add(num_entries, std::memory_order_acq_rel);
     if (prev_depth_list + num_entries > params_->max_qp_wr) {
         cancelQuota(qp_index, num_entries);
         return false;
@@ -835,8 +873,9 @@ bool RdmaEndPoint::reserveQuota(int qp_index, int num_entries) {
 
 void RdmaEndPoint::cancelQuota(int qp_index, int num_entries) {
     assert(qp_index >= 0 && qp_index < (int)qp_list_.size());
-    __sync_fetch_and_sub(&wr_depth_list_[qp_index].value, num_entries);
-    __sync_fetch_and_sub(&inflight_slices_, num_entries);
+    wr_depth_list_[qp_index].value.fetch_sub(num_entries,
+                                             std::memory_order_acq_rel);
+    inflight_slices_.fetch_sub(num_entries, std::memory_order_acq_rel);
     auto cq = context_->cq(qp_index % context_->cqCount());
     cq->cancelQuota(num_entries);
 }
@@ -846,6 +885,19 @@ int RdmaEndPoint::setupOneQP(int qp_index, const std::string& peer_gid,
                              std::string* reply_msg) {
     assert(qp_index >= 0 && qp_index < (int)qp_list_.size());
     auto& qp = qp_list_[qp_index];
+
+    // Resolve link-layer QoS for this QP. When it belongs to a pool that
+    // overrides SL/TC, use the pool's values; otherwise fall back to the global
+    // endpoint SL/TC (unchanged default behavior).
+    const QpPoolSegment* pool = poolForQp(qp_index);
+    const uint8_t qp_service_level =
+        (pool && pool->service_level >= 0)
+            ? static_cast<uint8_t>(pool->service_level)
+            : params_->service_level;
+    const uint8_t qp_traffic_class =
+        (pool && pool->traffic_class >= 0)
+            ? static_cast<uint8_t>(pool->traffic_class)
+            : params_->traffic_class;
 
     // RESET -> INIT
     ibv_qp_attr attr;
@@ -886,9 +938,9 @@ int RdmaEndPoint::setupOneQP(int qp_index, const std::string& peer_gid,
     attr.ah_attr.grh.sgid_index = context().gidIndex();
     attr.ah_attr.grh.hop_limit = params_->hop_limit;
     attr.ah_attr.grh.flow_label = params_->flow_label;
-    attr.ah_attr.grh.traffic_class = params_->traffic_class;
+    attr.ah_attr.grh.traffic_class = qp_traffic_class;
     attr.ah_attr.dlid = peer_lid;
-    attr.ah_attr.sl = params_->service_level;
+    attr.ah_attr.sl = qp_service_level;
     attr.ah_attr.src_path_bits = params_->src_path_bits;
     attr.ah_attr.static_rate = params_->static_rate;
     attr.ah_attr.is_global = 1;

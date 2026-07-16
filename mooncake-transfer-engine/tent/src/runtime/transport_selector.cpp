@@ -18,10 +18,9 @@
 #include "tent/thirdparty/nlohmann/json.h"
 
 #include <algorithm>
-#include <glog/logging.h>
-
-#include <algorithm>
 #include <cctype>
+#include <cstdint>
+#include <glog/logging.h>
 
 namespace mooncake {
 namespace tent {
@@ -29,20 +28,32 @@ namespace tent {
 // Transport type name mapping
 static const std::unordered_map<std::string, TransportType> kTransportNameMap =
     {
-        {"unspec", UNSPEC},       {"rdma", RDMA},
-        {"mnnvl", MNNVL},         {"shm", SHM},
-        {"nvlink", NVLINK},       {"gds", GDS},
-        {"io_uring", IOURING},    {"tcp", TCP},
-        {"ascend", AscendDirect}, {"sunrise_link", SUNRISE_LINK},
+        {"unspec", UNSPEC},
+        {"rdma", RDMA},
+        {"mnnvl", MNNVL},
+        {"shm", SHM},
+        {"nvlink", NVLINK},
+        {"gds", GDS},
+        {"io_uring", IOURING},
+        {"tcp", TCP},
+        {"ascend", AscendDirect},
+        {"sunrise_link", SUNRISE_LINK},
+        {"tpu", TPU},
 };
 
 static const std::unordered_map<TransportType, std::string>
     kTransportTypeNames = {
-        {UNSPEC, "unspec"},       {RDMA, "rdma"},
-        {MNNVL, "mnnvl"},         {SHM, "shm"},
-        {NVLINK, "nvlink"},       {GDS, "gds"},
-        {IOURING, "io_uring"},    {TCP, "tcp"},
-        {AscendDirect, "ascend"}, {SUNRISE_LINK, "sunrise_link"},
+        {UNSPEC, "unspec"},
+        {RDMA, "rdma"},
+        {MNNVL, "mnnvl"},
+        {SHM, "shm"},
+        {NVLINK, "nvlink"},
+        {GDS, "gds"},
+        {IOURING, "io_uring"},
+        {TCP, "tcp"},
+        {AscendDirect, "ascend"},
+        {SUNRISE_LINK, "sunrise_link"},
+        {TPU, "tpu"},
 };
 
 // Memory type name mapping for pattern matching
@@ -50,6 +61,46 @@ static const std::string kMemoryTypeCpu = "cpu";
 static const std::string kMemoryTypeCuda = "cuda";
 static const std::string kMemoryTypeNpu = "npu";
 static const std::string kMemoryTypeWildcard = "*";
+
+static const std::unordered_map<std::string, IntentType> kIntentTypeNameMap = {
+    {"intent_unspec", IntentType::INTENT_UNSPEC},
+    {"unspec", IntentType::INTENT_UNSPEC},
+    {"foreground_get", IntentType::FOREGROUND_GET},
+    {"background_prefetch", IntentType::BACKGROUND_PREFETCH},
+    {"migration", IntentType::MIGRATION},
+    {"checkpoint", IntentType::CHECKPOINT},
+    {"weight_loading", IntentType::WEIGHT_LOADING},
+    {"staging_internal", IntentType::STAGING_INTERNAL},
+};
+
+static std::optional<IntentType> parseIntentType(const json& value) {
+    if (value.is_string()) {
+        auto name = value.get<std::string>();
+        std::transform(name.begin(), name.end(), name.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        auto it = kIntentTypeNameMap.find(name);
+        if (it != kIntentTypeNameMap.end()) return it->second;
+        return std::nullopt;
+    }
+
+    if (value.is_number_unsigned()) {
+        const auto raw = value.get<uint64_t>();
+        if (raw <= static_cast<uint64_t>(IntentType::STAGING_INTERNAL)) {
+            return static_cast<IntentType>(raw);
+        }
+        return std::nullopt;
+    }
+
+    if (value.is_number_integer()) {
+        const auto raw = value.get<int64_t>();
+        if (raw >= static_cast<int64_t>(IntentType::INTENT_UNSPEC) &&
+            raw <= static_cast<int64_t>(IntentType::STAGING_INTERNAL)) {
+            return static_cast<IntentType>(raw);
+        }
+    }
+
+    return std::nullopt;
+}
 
 std::string TransportSelector::transportTypeName(TransportType type) {
     auto it = kTransportTypeNames.find(type);
@@ -74,14 +125,18 @@ std::vector<SelectionPolicy> TransportSelector::getDefaultPolicies() {
         {
             "file_storage",
             SegmentType::File,
-            std::nullopt,   // same_machine doesn't matter for file
-            std::nullopt,   // local_memory_pattern
-            std::nullopt,   // remote_memory_pattern
-            std::nullopt,   // min_size
-            std::nullopt,   // max_size
-            std::nullopt,   // priority
-            {},             // devices (empty = all devices)
-            {GDS, IOURING}  // File segment priority (original: GDS -> IOURING)
+            std::nullopt,    // same_machine doesn't matter for file
+            std::nullopt,    // local_memory_pattern
+            std::nullopt,    // remote_memory_pattern
+            std::nullopt,    // min_size
+            std::nullopt,    // max_size
+            std::nullopt,    // priority
+            {},              // devices (empty = all devices)
+            {GDS, IOURING},  // File priority (original: GDS -> IOURING)
+            std::nullopt,    // service_level
+            std::nullopt,    // traffic_class
+            std::nullopt,    // qp_pool
+            std::nullopt     // intent_type
         },
         {
             "memory_default",
@@ -89,11 +144,15 @@ std::vector<SelectionPolicy> TransportSelector::getDefaultPolicies() {
             std::nullopt,  // any machine
             std::nullopt,  // any local memory
             std::nullopt,  // any remote memory
-            std::nullopt,  // any size
-            std::nullopt,  // min_priority
+            std::nullopt,  // min_size
+            std::nullopt,  // max_size
+            std::nullopt,  // priority
             {},            // devices (empty = all devices)
-            {}  // Empty priority = use buffer_transports order (original
-                // behavior)
+            {},            // Empty = use buffer_transports order
+            std::nullopt,  // service_level
+            std::nullopt,  // traffic_class
+            std::nullopt,  // qp_pool
+            std::nullopt   // intent_type
         },
     };
 }
@@ -184,6 +243,19 @@ void TransportSelector::loadPolicies() {
             policy.priority = std::nullopt;
         }
 
+        // Parse the optional business-intent filter. An invalid value skips the
+        // entire policy instead of turning it into a catch-all rule, which
+        // would silently broaden its authorization scope.
+        if (policy_json.contains("intent_type")) {
+            auto intent = parseIntentType(policy_json["intent_type"]);
+            if (!intent.has_value()) {
+                LOG(WARNING)
+                    << "Skip policy " << policy.name << ": invalid intent_type";
+                continue;
+            }
+            policy.intent_type = *intent;
+        }
+
         // Parse devices (optional)
         if (policy_json.contains("devices")) {
             for (const auto& device_name : policy_json["devices"]) {
@@ -203,6 +275,42 @@ void TransportSelector::loadPolicies() {
                 if (type != UNSPEC) {
                     policy.transports.push_back(type);
                 }
+            }
+        }
+
+        // Parse link-layer QoS attributes (RFC #2519 / #2568, step 1: stored
+        // only, not yet applied to QPs). Out-of-range values are ignored so a
+        // bad config never breaks selection.
+        if (policy_json.contains("service_level")) {
+            int sl = policy_json.value("service_level", -1);
+            if (sl >= 0 && sl <= 15) {
+                policy.service_level = sl;
+            } else {
+                LOG(WARNING) << "Ignore service_level in policy " << policy.name
+                             << ", value " << sl << " out of range (0-15)";
+            }
+        }
+        if (policy_json.contains("traffic_class")) {
+            int tc = policy_json.value("traffic_class", -1);
+            if (tc >= 0 && tc <= 255) {
+                policy.traffic_class = tc;
+            } else {
+                LOG(WARNING) << "Ignore traffic_class in policy " << policy.name
+                             << ", value " << tc << " out of range (0-255)";
+            }
+        }
+        // Reserved for step 2 (per-class QP pools); parsed for forward schema
+        // compatibility, no effect yet.
+        if (policy_json.contains("qp_pool")) {
+            auto& qp = policy_json["qp_pool"];
+            if (!qp.is_string()) {
+                LOG(WARNING) << "Ignore qp_pool in policy " << policy.name
+                             << ", expected a string";
+            } else {
+                auto value = qp.get<std::string>();
+                // Treat an empty string the same as unset (use default pool)
+                // so a blank config value doesn't look like an explicit pool.
+                if (!value.empty()) policy.qp_pool = std::move(value);
             }
         }
 
@@ -235,6 +343,9 @@ bool TransportSelector::matchesMemoryPattern(const std::string& pattern,
             break;
         case MTYPE_ROCM:
             type_str = "rocm";
+            break;
+        case MTYPE_TPU:
+            type_str = "tpu";
             break;
         default:
             type_str = "unknown";
@@ -300,6 +411,13 @@ bool TransportSelector::matchesPolicy(const SelectionPolicy& policy,
         }
     }
 
+    // Policies without an intent filter retain the historical catch-all
+    // behavior. Intent-specific policies require an exact match.
+    if (policy.intent_type.has_value() &&
+        context.intent_type != policy.intent_type.value()) {
+        return false;
+    }
+
     return true;
 }
 
@@ -319,15 +437,21 @@ bool TransportSelector::isTransportAvailable(
     }
 
     // Special constraints
-    if ((type == NVLINK || type == SHM) && !context.same_machine) {
-        return false;  // NVLINK and SHM only work on same machine
+    if ((type == NVLINK || type == SHM || type == TPU) &&
+        !context.same_machine) {
+        // NVLINK/SHM only work on same machine; TPU is a local-stage-only
+        // executor (HBM<->host), so it must never be picked for a remote hop.
+        return false;
     }
 
     const auto& caps = transport->capabilities();
 
-    // Helper to check if memory type is GPU/NPU
+    // Helper to check if memory type is a device (GPU/NPU/TPU). TPU is included
+    // so its device<->host staging hop routes to TpuTransport (gpu_to_dram /
+    // dram_to_gpu); it never satisfies gpu_to_gpu, so cross-node TPU traffic is
+    // always staged through host DRAM.
     auto is_gpu = [](MemoryType t) {
-        return t == MTYPE_CUDA || t == MTYPE_ROCM;
+        return t == MTYPE_CUDA || t == MTYPE_ROCM || t == MTYPE_TPU;
     };
 
     // For file segments, check file-specific capabilities (original logic)
@@ -383,6 +507,13 @@ SelectionResult TransportSelector::select(
                      << ", priority_level=" << context.priority_level;
         return result;  // UNSPEC, all devices
     }
+
+    // Carry the matched policy's link-layer QoS out to the caller (RFC #2519 /
+    // #2568, step 1). These are plumbed but not yet applied at QP setup; that
+    // is the per-class QP pool follow-up (step 2).
+    result.service_level = matching_policy->service_level;
+    result.traffic_class = matching_policy->traffic_class;
+    result.qp_pool = matching_policy->qp_pool;
 
     // Convert device names to mask
     result.device_mask = ~0ULL;  // Default: all devices

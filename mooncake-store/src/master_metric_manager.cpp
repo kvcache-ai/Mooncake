@@ -1937,7 +1937,7 @@ std::string MasterMetricManager::get_summary_string(
     int64_t nof_allocated = nof_allocated_size_.value();
     int64_t nof_capacity = nof_total_capacity_.value();
     int64_t file_allocated = file_allocated_size_.value();
-    int64_t file_capacity = file_total_capacity_.value();
+    [[maybe_unused]] int64_t file_capacity = file_total_capacity_.value();
     int64_t keys = key_count_.value();
     int64_t soft_pin_keys = soft_pin_key_count_.value();
     int64_t active_clients = active_clients_.value();

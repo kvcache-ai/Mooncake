@@ -4,6 +4,8 @@ add_subdirectory(cachelib_memory_allocator)
 set(MOONCAKE_STORE_SOURCES
     allocator.cpp
     master_service.cpp
+    master_snapshot_manager.cpp
+    master_snapshot_repository.cpp
     client_service.cpp
     client_metric.cpp
     types.cpp
@@ -46,6 +48,7 @@ set(MOONCAKE_STORE_SOURCES
     ha/leadership/master_service_supervisor.cpp
     ha/standby_controller.cpp
     ha/snapshot/catalog_backed_snapshot_provider.cpp
+    ha/snapshot/master_snapshot_codec.cpp
     ha/snapshot/object/snapshot_object_store.cpp
     ha/snapshot/object/backends/local/local_file_snapshot_object_store.cpp
     ha/snapshot/object/backends/s3/s3_snapshot_object_store.cpp
@@ -115,6 +118,25 @@ find_library(
   XXHASH_LIBRARY
   NAMES xxhash libxxhash
   PATHS /usr/lib /usr/local/lib /usr/lib64)
+set(KV_EVENTS_ZMQ_FOUND FALSE)
+if(ENABLE_KV_EVENTS)
+  find_library(ZMQ_LIBRARY NAMES zmq libzmq PATHS /usr/lib /usr/local/lib
+                                              /usr/lib64)
+  find_path(ZMQ_INCLUDE_DIR NAMES zmq.h PATHS /usr/include /usr/local/include)
+  if(ZMQ_INCLUDE_DIR AND ZMQ_LIBRARY)
+    message(STATUS "Found ZMQ: include=${ZMQ_INCLUDE_DIR} lib=${ZMQ_LIBRARY}")
+    list(APPEND MASTER_EXTRA_INCS ${ZMQ_INCLUDE_DIR})
+    list(APPEND EXTRA_LIBS ${ZMQ_LIBRARY})
+    list(APPEND MOONCAKE_STORE_SOURCES kv_event/kv_event_publisher.cpp)
+    set(KV_EVENTS_ZMQ_FOUND TRUE)
+  else()
+    message(
+      FATAL_ERROR
+        "ENABLE_KV_EVENTS is ON but libzmq was not found. "
+        "Install libzmq3-dev or pass -DENABLE_KV_EVENTS=OFF to configure without ZMQ.")
+  endif()
+endif()
+
 if(XXHASH_INCLUDE_DIR AND XXHASH_LIBRARY)
   message(
     STATUS "Found xxHash: include=${XXHASH_INCLUDE_DIR} lib=${XXHASH_LIBRARY}")
@@ -237,6 +259,7 @@ if(USE_NOF)
       crypto
       aio
       z
+      isal
       elf
       ibverbs
       rdmacm
@@ -253,6 +276,9 @@ set(GDS_CORE_SOURCES
 )
 list(APPEND MOONCAKE_STORE_SOURCES ${GDS_CORE_SOURCES})
 add_library(mooncake_store ${MOONCAKE_STORE_SOURCES})
+if(KV_EVENTS_ZMQ_FOUND)
+  target_compile_definitions(mooncake_store PRIVATE MOONCAKE_ENABLE_KV_EVENTS=1)
+endif()
 target_include_directories(mooncake_store PUBLIC ${XXHASH_INCLUDE_DIR})
 if(USE_NOF)
   target_include_directories(mooncake_store PRIVATE ${SPDK_INCLUDE_DIR}

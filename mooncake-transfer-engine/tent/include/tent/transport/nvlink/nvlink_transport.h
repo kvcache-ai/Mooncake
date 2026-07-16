@@ -40,7 +40,6 @@ struct NVLinkTask {
     volatile size_t transferred_bytes;
     uint64_t target_addr = 0;
     bool is_cuda_ipc;
-    int cuda_id = 0;
     cudaEvent_t completion_event = nullptr;
 };
 
@@ -49,6 +48,7 @@ struct NVLinkSubBatch : public Transport::SubBatch {
     size_t max_size;
     CUDAStreamHandle sync_stream;
     CUDAStreamHandle async_stream;
+    int stream_device_id = -1;
     // Completion events created in startTransfer (one per submit). Destroyed by
     // the destructor (RAII); Slab<T>::deallocate() invokes ~NVLinkSubBatch()
     // before reusing the storage, so this runs on every free.
@@ -124,7 +124,7 @@ class NVLinkTransport : public Transport {
     uint64_t async_memcpy_threshold_;
     bool host_register_;
 
-    std::mutex register_mutex_;
+    mutable std::mutex register_mutex_;
     std::unordered_set<uint64_t> registered_base_addrs_;
 };
 }  // namespace tent
