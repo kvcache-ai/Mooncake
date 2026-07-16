@@ -19,17 +19,26 @@ WrappedMasterService::WrappedMasterService(
     const std::string& http_metadata_remote_url)
     : master_service_(MasterServiceConfig(config)) {
     if (http_metadata_server || !http_metadata_remote_url.empty()) {
-        http_metadata_cleanup_worker_ =
-            std::make_unique<HttpMetadataCleanupWorker>(
-                http_metadata_server, http_metadata_remote_url);
-        if (http_metadata_cleanup_worker_->Start()) {
-            master_service_.RegisterClientLeaseExpiredCallback(
-                [worker = http_metadata_cleanup_worker_.get()](
-                    const ClientLeaseExpiredEvent& event) {
-                    worker->Enqueue(event);
-                });
+        auto worker = HttpMetadataCleanupWorker::Create(
+            http_metadata_server, http_metadata_remote_url);
+        if (!worker) {
+            LOG(WARNING) << "HTTP metadata cleanup on client lease expiry is "
+                            "disabled: "
+                         << worker.error();
         } else {
-            http_metadata_cleanup_worker_.reset();
+            http_metadata_cleanup_worker_ = std::move(worker.value());
+            if (http_metadata_cleanup_worker_->Start()) {
+                master_service_.RegisterClientLeaseExpiredCallback(
+                    [worker = http_metadata_cleanup_worker_.get()](
+                        const ClientLeaseExpiredEvent& event) {
+                        worker->Enqueue(event);
+                    });
+            } else {
+                LOG(WARNING)
+                    << "HTTP metadata cleanup on client lease expiry is "
+                       "disabled: worker failed to start";
+                http_metadata_cleanup_worker_.reset();
+            }
         }
     }
 }

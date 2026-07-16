@@ -12,63 +12,60 @@
 
 namespace mooncake {
 
-HttpMetadataCleanupWorker::HttpMetadataCleanupWorker(
+HttpMetadataCleanupWorker::CreateResult HttpMetadataCleanupWorker::Create(
     HttpMetadataServer* http_metadata_server,
-    const std::string& http_metadata_remote_url)
-    : http_metadata_prefix_(BuildMetadataPrefix()) {
+    const std::string& http_metadata_remote_url) {
+    RemoveKeyFn remove_key;
     if (http_metadata_server) {
-        remove_key_ = [http_metadata_server](const std::string& key) {
+        remove_key = [http_metadata_server](const std::string& key) {
             return http_metadata_server->removeKey(key);
         };
         LOG(INFO) << "HTTP metadata cleanup on client lease expiry: enabled "
                      "(co-located metadata server)";
-        return;
+        return std::make_unique<HttpMetadataCleanupWorker>(
+            std::move(remove_key), BuildMetadataPrefix());
     }
 
     if (http_metadata_remote_url.empty()) {
-        return;
+        return tl::make_unexpected(std::string(
+            "no local or remote HTTP metadata backend was configured"));
     }
 
-#ifdef USE_HTTP
     // MetadataStoragePlugin::Create() terminates for unsupported backends, so
     // reject non-HTTP connection strings before calling it.
     if (http_metadata_remote_url.rfind("http://", 0) != 0 &&
         http_metadata_remote_url.rfind("https://", 0) != 0) {
-        LOG(WARNING) << "Configured metadata server '"
-                     << http_metadata_remote_url
-                     << "' is not an HTTP endpoint; metadata cleanup on "
-                        "client lease expiry is disabled.";
-        return;
+        return tl::make_unexpected("configured metadata server '" +
+                                   http_metadata_remote_url +
+                                   "' is not an HTTP endpoint");
     }
 
+#ifdef USE_HTTP
     try {
         auto http_metadata_remote =
             MetadataStoragePlugin::Create(http_metadata_remote_url);
         if (!http_metadata_remote) {
-            LOG(WARNING)
-                << "Failed to initialize remote HTTP metadata client for "
-                << http_metadata_remote_url
-                << ": plugin factory returned null. Metadata cleanup on "
-                   "client lease expiry is disabled.";
-            return;
+            return tl::make_unexpected(
+                "metadata plugin factory returned null for '" +
+                http_metadata_remote_url + "'");
         }
-        remove_key_ =
+        remove_key =
             [remote = std::move(http_metadata_remote)](const std::string& key) {
                 return remote->remove(key);
             };
         LOG(INFO) << "HTTP metadata cleanup on client lease expiry: enabled "
                      "(remote metadata server "
                   << http_metadata_remote_url << ")";
+        return std::make_unique<HttpMetadataCleanupWorker>(
+            std::move(remove_key), BuildMetadataPrefix());
     } catch (const std::exception& e) {
-        LOG(WARNING) << "Failed to initialize remote HTTP metadata client for "
-                     << http_metadata_remote_url << ": " << e.what()
-                     << ". Metadata cleanup on client lease expiry is "
-                        "disabled.";
+        return tl::make_unexpected(
+            "failed to initialize remote HTTP metadata client for '" +
+            http_metadata_remote_url + "': " + e.what());
     }
 #else
-    LOG(WARNING) << "Remote HTTP metadata cleanup was configured, but this "
-                    "build has no HTTP metadata support (USE_HTTP=OFF); "
-                    "cleanup on client lease expiry is disabled.";
+    return tl::make_unexpected(
+        std::string("remote HTTP metadata cleanup requires USE_HTTP=ON"));
 #endif
 }
 

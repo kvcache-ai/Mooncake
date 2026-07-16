@@ -46,9 +46,17 @@ TEST(HttpMetadataCleanupWorkerTest,
     worker.Stop();
 }
 
-TEST(HttpMetadataCleanupWorkerTest, DoesNotStartWithoutBackend) {
-    HttpMetadataCleanupWorker worker(static_cast<HttpMetadataServer*>(nullptr));
-    EXPECT_FALSE(worker.Start());
+TEST(HttpMetadataCleanupWorkerTest, CreateReportsMissingBackend) {
+    auto worker = HttpMetadataCleanupWorker::Create(nullptr);
+    ASSERT_FALSE(worker.has_value());
+    EXPECT_NE(worker.error().find("no local or remote"), std::string::npos);
+}
+
+TEST(HttpMetadataCleanupWorkerTest, CreateRejectsNonHttpRemoteBackend) {
+    auto worker =
+        HttpMetadataCleanupWorker::Create(nullptr, "redis://metadata:6379");
+    ASSERT_FALSE(worker.has_value());
+    EXPECT_NE(worker.error().find("not an HTTP endpoint"), std::string::npos);
 }
 
 }  // namespace mooncake::testing

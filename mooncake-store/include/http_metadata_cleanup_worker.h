@@ -3,10 +3,13 @@
 #include <atomic>
 #include <condition_variable>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <ylt/util/tl/expected.hpp>
 
 #include "client_lifecycle_event.h"
 
@@ -20,9 +23,15 @@ class HttpMetadataServer;
 class HttpMetadataCleanupWorker {
    public:
     using RemoveKeyFn = std::function<bool(const std::string&)>;
+    using CreateResult =
+        tl::expected<std::unique_ptr<HttpMetadataCleanupWorker>, std::string>;
 
-    HttpMetadataCleanupWorker(HttpMetadataServer* http_metadata_server,
-                              const std::string& http_metadata_remote_url = "");
+    // Validates the configured backend and returns either a ready-to-start
+    // worker or an actionable initialization error.
+    static CreateResult Create(
+        HttpMetadataServer* http_metadata_server,
+        const std::string& http_metadata_remote_url = "");
+
     HttpMetadataCleanupWorker(RemoveKeyFn remove_key,
                               std::string metadata_prefix);
     ~HttpMetadataCleanupWorker();
