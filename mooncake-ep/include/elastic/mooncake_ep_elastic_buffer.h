@@ -47,6 +47,7 @@ struct ElasticNativeHandle {
     int expert_alignment = 1;
     int num_max_tokens_per_rank = 0;
     int num_sms = 0;
+    int num_channels_per_sm = 1;
     torch::Tensor topk_idx;
     torch::Tensor psum_num_recv_tokens_per_scaleup_rank;
     torch::Tensor psum_num_recv_tokens_per_expert;
@@ -117,6 +118,7 @@ class MooncakeElasticBuffer {
 
     bool ibgda_disabled() const { return native_buffer_->ibgda_disabled(); }
     bool use_fast_path() { return native_buffer_->use_fast_path(); }
+    int qps_per_rank() const { return native_buffer_->qps_per_rank(); }
     void update_local_qpns() { native_buffer_->update_local_qpns(); }
     bool is_roce() const { return native_buffer_->is_roce(); }
     void sync_ibgda_peers(const std::vector<int64_t>& remote_addrs,

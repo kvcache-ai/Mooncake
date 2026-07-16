@@ -31,6 +31,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_readwrite("num_max_tokens_per_rank",
                        &ElasticNativeHandle::num_max_tokens_per_rank)
         .def_readwrite("num_sms", &ElasticNativeHandle::num_sms)
+        .def_readwrite("num_channels_per_sm",
+                       &ElasticNativeHandle::num_channels_per_sm)
         .def_readwrite("topk_idx", &ElasticNativeHandle::topk_idx)
         .def_readwrite(
             "psum_num_recv_tokens_per_scaleup_rank",
@@ -107,6 +109,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              &MooncakeElasticBuffer::get_theoretical_num_sms)
         .def("ibgda_disabled", &MooncakeElasticBuffer::ibgda_disabled)
         .def("use_fast_path", &MooncakeElasticBuffer::use_fast_path)
+        .def("qps_per_rank", &MooncakeElasticBuffer::qps_per_rank)
         .def("update_local_qpns", &MooncakeElasticBuffer::update_local_qpns)
         .def("is_roce", &MooncakeElasticBuffer::is_roce)
         .def("sync_ibgda_peers", &MooncakeElasticBuffer::sync_ibgda_peers)

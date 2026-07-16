@@ -20,6 +20,7 @@ struct CommCtx {
     P2PContext p2p;
     IbgdaContext ibgda;
     int rank;
+    int qps_per_rank;
 };
 
 // Construct CommCtx from the raw kernel arguments.
@@ -31,6 +32,7 @@ __device__ __forceinline__ CommCtx make_comm_ctx(
     int rank, int num_ranks, int num_qps) {
     CommCtx ctx;
     ctx.rank = rank;
+    ctx.qps_per_rank = max(1, num_qps / max(1, num_ranks));
 
     ctx.p2p.available = nvlink_available;
     ctx.p2p.peer_ptrs = ipc_peer_ptrs;

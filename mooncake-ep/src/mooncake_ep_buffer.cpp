@@ -44,12 +44,12 @@ static bool macaHostPhaseFenceCoversPeers() {
 
 MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
                                    int64_t num_ep_buffer_bytes,
-                                   TransferEngine* engine)
+                                   TransferEngine* engine, int qp_count)
     : rank(rank),
       num_ranks(num_ranks),
       num_ep_buffer_bytes(num_ep_buffer_bytes),
       comm_stream(at::cuda::getStreamFromPool(true)) {
-    USE_QP_COUNT = MAX_QP_COUNT / num_ranks * num_ranks;
+    USE_QP_COUNT = std::max(num_ranks, qp_count / num_ranks * num_ranks);
 
     // Optional runtime override for the RoCE active-QP cap (default 8).
     // Set MOONCAKE_EP_ACTIVE_QPS_PER_RANK to a value >= the per-rank QP count

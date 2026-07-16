@@ -109,7 +109,8 @@ struct MooncakeEpBuffer {
     // (engine owns the transports).  Otherwise EP creates its own via the
     // factory functions (EP owns them via owned_p2p_transport_ etc.).
     MooncakeEpBuffer(int rank, int num_ranks, int64_t num_ep_buffer_bytes,
-                     TransferEngine* engine = nullptr);
+                     TransferEngine* engine = nullptr,
+                     int qp_count = MAX_QP_COUNT);
 
     ~MooncakeEpBuffer() noexcept(false);
 
@@ -138,6 +139,8 @@ struct MooncakeEpBuffer {
     bool is_roce() const {
         return rdma_transport_ && rdma_transport_->isRoce();
     }
+
+    int qps_per_rank() const { return USE_QP_COUNT / num_ranks; }
 
     // Fast-path: IBGDA available, or all peers accessible via P2P.
     bool use_fast_path() {
