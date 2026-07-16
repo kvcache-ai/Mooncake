@@ -3064,7 +3064,20 @@ impl StoreClient {
             let mut inputs: Vec<ColdReadInput> = Vec::with_capacity(remote_cold_indices.len());
             for &index in &remote_cold_indices {
                 let owner = resolved[index].replica.owner.clone();
-                let owner_lease = match self.metadata.get_client_lease(&owner) {
+                let owner_lease = match self.lookup_cold_backing_owner_lease(&owner) {
+                    Ok(lease) => {
+                        if lease.runtime != owner {
+                            info!(
+                                runtime = %self.lease.runtime,
+                                tenant = %resolved[index].tenant,
+                                key = %resolved[index].key,
+                                stale_owner = %owner,
+                                live_owner = %lease.runtime,
+                                "remote cold read resolved stale owner to live incarnation"
+                            );
+                        }
+                        lease
+                    }
                     Err(e) => {
                         warn!(
                             runtime = %self.lease.runtime,
@@ -3072,52 +3085,9 @@ impl StoreClient {
                             key = %resolved[index].key,
                             owner = %owner,
                             error = %e,
-                            "get_client_lease failed for remote cold read"
+                            "resolve cold backing owner lease failed for remote cold read"
                         );
                         return Err(e);
-                    }
-                    Ok(Some(lease)) => lease,
-                    Ok(None) => {
-                        match self
-                            .metadata
-                            .get_live_runtime_by_stable_id(&owner.stable_id)
-                        {
-                            Ok(Some(live_lease)) => {
-                                info!(
-                                    runtime = %self.lease.runtime,
-                                    tenant = %resolved[index].tenant,
-                                    key = %resolved[index].key,
-                                    stale_owner = %owner,
-                                    live_owner = %live_lease.runtime,
-                                    "remote cold read resolved stale owner to live incarnation"
-                                );
-                                live_lease
-                            }
-                            Ok(None) => {
-                                warn!(
-                                    runtime = %self.lease.runtime,
-                                    tenant = %resolved[index].tenant,
-                                    key = %resolved[index].key,
-                                    owner = %owner,
-                                    "no live incarnation for stale cold read owner"
-                                );
-                                return Err(StoreError::NotFound(format!(
-                                    "runtime {} (stable_id={}) has no live incarnation for cold read of tenant={} key={}",
-                                    owner, owner.stable_id, resolved[index].tenant, resolved[index].key
-                                )));
-                            }
-                            Err(e) => {
-                                warn!(
-                                    runtime = %self.lease.runtime,
-                                    tenant = %resolved[index].tenant,
-                                    key = %resolved[index].key,
-                                    owner = %owner,
-                                    error = %e,
-                                    "get_live_runtime_by_stable_id failed"
-                                );
-                                return Err(e);
-                            }
-                        }
                     }
                 };
                 let scope = resolved[index].route.namespace.clone().unwrap_or_else(|| {
@@ -3134,10 +3104,10 @@ impl StoreClient {
                     .unwrap_or_else(|| resolved[index].key.clone());
                 inputs.push(ColdReadInput {
                     index,
-                    owner_lease,
+                    owner_lease: owner_lease.clone(),
                     request: crate::control_plane::pb::ReadFromColdRequest {
                         namespace: route_namespace.clone(),
-                        authority: String::new(),
+                        authority: owner_lease.runtime.stable_id.0.clone(),
                         tenant: scope.tenant,
                         key: logical_key,
                         domain: scope.domain,
@@ -3442,25 +3412,7 @@ impl StoreClient {
                 let mut retry_groups: BTreeMap<ClientRuntimeId, RetryBatchGroup> = BTreeMap::new();
                 for &index in &fire_indices {
                     let owner = resolved[index].replica.owner.clone();
-                    let owner_lease = match self.metadata.get_client_lease(&owner) {
-                        Err(e) => return Err(e),
-                        Ok(Some(lease)) => lease,
-                        Ok(None) => {
-                            match self
-                                .metadata
-                                .get_live_runtime_by_stable_id(&owner.stable_id)
-                            {
-                                Ok(Some(live_lease)) => live_lease,
-                                Ok(None) => {
-                                    return Err(StoreError::NotFound(format!(
-                                        "runtime {} has no live incarnation for cold retry",
-                                        owner
-                                    )));
-                                }
-                                Err(e) => return Err(e),
-                            }
-                        }
-                    };
+                    let owner_lease = self.lookup_cold_backing_owner_lease(&owner)?;
                     let scope = resolved[index].route.namespace.clone().unwrap_or_else(|| {
                         mooncake_store_core::NamespaceScope::with_defaults(
                             Some(&resolved[index].tenant),

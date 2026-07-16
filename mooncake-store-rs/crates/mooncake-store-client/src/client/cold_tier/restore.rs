@@ -160,30 +160,21 @@ pub(in super::super) fn trigger_remote_owner_cold_restore(
         return Err(StoreError::Unsupported("cold tier is disabled".to_string()));
     }
     let owner = entry.replica.owner.clone();
-    let resolved_lease = match client.metadata.get_client_lease(&owner)? {
-        Some(lease) => Some(lease),
-        None => {
-            // Owner incarnation gone — try finding the live incarnation of
-            // the same physical store (same stable_id, new epoch).
-            let live = client
-                .metadata
-                .get_live_runtime_by_stable_id(&owner.stable_id)?;
-            if let Some(ref live_lease) = live {
+    let owner_lease = match client.lookup_cold_backing_owner_lease(&owner) {
+        Ok(lease) => {
+            if lease.runtime != owner {
                 info!(
                     runtime = %client.lease.runtime,
                     tenant = %entry.tenant,
                     key = %entry.key,
                     stale_owner = %owner,
-                    live_owner = %live_lease.runtime,
+                    live_owner = %lease.runtime,
                     "cold restore resolved stale owner to live incarnation"
                 );
             }
-            live
+            lease
         }
-    };
-    let owner_lease = resolved_lease
-        .filter(|lease| compatibility_matches(&client.lease, lease))
-        .ok_or_else(|| {
+        Err(StoreError::NotFound(_)) => {
             debug!(
                 runtime = %client.lease.runtime,
                 tenant = %entry.tenant,
@@ -192,11 +183,13 @@ pub(in super::super) fn trigger_remote_owner_cold_restore(
                 reason = "owner_lease_unavailable",
                 "mooncake store owner cold restore aborted before submit"
             );
-            StoreError::NotFound(format!(
+            return Err(StoreError::NotFound(format!(
                 "runtime {} is not available for cold restore of tenant={} key={}",
                 owner, entry.tenant, entry.key
-            ))
-        })?;
+            )));
+        }
+        Err(error) => return Err(error),
+    };
     if !owner_lease.state.serves_reads() {
         debug!(
             runtime = %client.lease.runtime,

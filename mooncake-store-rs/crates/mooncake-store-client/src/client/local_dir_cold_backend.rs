@@ -485,7 +485,7 @@ pub(super) fn try_register_recovered_cold_object(
         replicas: Vec::new(),
     };
 
-    if let Some(current) = metadata.get_object_route(&recovered.manifest.key)? {
+    let repair_current = |current: ObjectRoute| -> Result<RecoveredObjectOutcome> {
         let already_consistent = current.cold_backing.as_ref().is_some_and(|backing| {
             backing.cold_tier_id == recovered.manifest.cold_tier_id
                 && backing.object_locator == recovered.manifest.object_locator
@@ -495,22 +495,11 @@ pub(super) fn try_register_recovered_cold_object(
         if already_consistent {
             return Ok(RecoveredObjectOutcome::AlreadyConsistent);
         }
-        if current.version > recovered.manifest.route_version {
-            tracing::warn!(
-                route_key = %recovered.manifest.key.0,
-                current_version = current.version.0,
-                recovered_version = recovered.manifest.route_version.0,
-                cold_tier_id = %recovered.manifest.cold_tier_id,
-                object_locator = %recovered.manifest.object_locator,
-                "startup cold-tier manifest recovery: skipping stale disk manifest for newer route"
-            );
-            return Ok(RecoveredObjectOutcome::Superseded);
-        }
 
         let mut next = current.clone();
         next.version = current.version.next();
-        next.cold_backing = Some(manifest_backing);
-        let cas = route_directory.compare_and_swap_local_route(
+        next.cold_backing = Some(manifest_backing.clone());
+        let cas = route_directory.compare_and_swap_object_route(
             observer,
             &recovered.manifest.key,
             Some(current.version),
@@ -520,6 +509,7 @@ pub(super) fn try_register_recovered_cold_object(
             tracing::info!(
                 route_key = %recovered.manifest.key.0,
                 current_version = current.version.0,
+                recovered_version = recovered.manifest.route_version.0,
                 cold_tier_id = %recovered.manifest.cold_tier_id,
                 object_locator = %recovered.manifest.object_locator,
                 had_cold_backing = current.cold_backing.is_some(),
@@ -530,35 +520,50 @@ pub(super) fn try_register_recovered_cold_object(
             tracing::warn!(
                 route_key = %recovered.manifest.key.0,
                 current_version = current.version.0,
+                recovered_version = recovered.manifest.route_version.0,
+                conflict_version = ?cas.current.as_ref().map(|route| route.version.0),
                 "startup cold-tier manifest recovery: route repair CAS conflict"
             );
             Ok(RecoveredObjectOutcome::Superseded)
         }
+    };
+
+    if let Some(current) = metadata.get_object_route(&recovered.manifest.key)? {
+        return repair_current(current);
+    }
+
+    let route = route_from_recovered_cold_object(recovered, observer.runtime.clone());
+    let cas = route_directory.compare_and_swap_object_route(
+        observer,
+        &recovered.manifest.key,
+        None,
+        Some(&route),
+    )?;
+    if cas.applied {
+        tracing::info!(
+            route_key = %recovered.manifest.key.0,
+            route_version = recovered.manifest.route_version.0,
+            cold_tier_id = %recovered.manifest.cold_tier_id,
+            object_locator = %recovered.manifest.object_locator,
+            "startup cold-tier manifest recovery: registered disk-backed route"
+        );
+        Ok(RecoveredObjectOutcome::Registered)
+    } else if let Some(current) = cas.current {
+        tracing::info!(
+            route_key = %recovered.manifest.key.0,
+            route_version = recovered.manifest.route_version.0,
+            current_version = current.version.0,
+            had_cold_backing = current.cold_backing.is_some(),
+            "startup cold-tier manifest recovery: create CAS conflict, repairing current route from disk manifest"
+        );
+        repair_current(current)
     } else {
-        let route = route_from_recovered_cold_object(recovered, observer.runtime.clone());
-        let cas = route_directory.compare_and_swap_local_route(
-            observer,
-            &recovered.manifest.key,
-            None,
-            Some(&route),
-        )?;
-        if cas.applied {
-            tracing::info!(
-                route_key = %recovered.manifest.key.0,
-                route_version = recovered.manifest.route_version.0,
-                cold_tier_id = %recovered.manifest.cold_tier_id,
-                object_locator = %recovered.manifest.object_locator,
-                "startup cold-tier manifest recovery: registered disk-backed route"
-            );
-            Ok(RecoveredObjectOutcome::Registered)
-        } else {
-            tracing::info!(
-                route_key = %recovered.manifest.key.0,
-                route_version = recovered.manifest.route_version.0,
-                "startup cold-tier manifest recovery: superseded by newer version on disk"
-            );
-            Ok(RecoveredObjectOutcome::Superseded)
-        }
+        tracing::info!(
+            route_key = %recovered.manifest.key.0,
+            route_version = recovered.manifest.route_version.0,
+            "startup cold-tier manifest recovery: superseded by newer version on disk"
+        );
+        Ok(RecoveredObjectOutcome::Superseded)
     }
 }
 
@@ -652,7 +657,7 @@ pub(super) fn reconcile_cold_tier_startup(
                                 if let Some(next_backing) = next.cold_backing.as_mut() {
                                     next_backing.owner = observer.runtime.clone();
                                 }
-                                let cas = route_directory.compare_and_swap_local_route(
+                                let cas = route_directory.compare_and_swap_object_route(
                                     observer,
                                     &route.key,
                                     Some(route.version),
@@ -683,7 +688,7 @@ pub(super) fn reconcile_cold_tier_startup(
                                     next_backing.owner = observer.runtime.clone();
                                 }
                             }
-                            let cas = route_directory.compare_and_swap_local_route(
+                            let cas = route_directory.compare_and_swap_object_route(
                                 observer,
                                 &route.key,
                                 Some(route.version),
