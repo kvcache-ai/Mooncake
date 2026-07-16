@@ -67,7 +67,7 @@ struct AddReplicaPayload {
     YLT_REFL(AddReplicaPayload, object_key, client_id, segment_id, size);
 };
 
-/// Payload for REMOVE_REPLICA (OpType=11, async).
+/// Payload for REMOVE_REPLICA (OpType=11, sync).
 /// Records that a replica was removed from an object.
 struct RemoveReplicaPayload {
     std::string object_key;

@@ -8,8 +8,10 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <thread>
 #include <variant>
 
+#include "ha/oplog/localfs_oplog_store.h"
 #include "p2p_master_service.h"
 #include "p2p_rpc_service.h"
 #include "p2p_rpc_types.h"
@@ -78,6 +80,23 @@ class P2PHotStandbyServiceTest : public ::testing::Test {
             .memory_type = MemoryType::DRAM,
         };
         return segment;
+    }
+
+    bool WaitForPersistedEntry(uint64_t sequence_id,
+                               std::chrono::milliseconds timeout) const {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            LocalFsOpLogStore reader(kClusterId, test_dir_.string(),
+                                     /*enable_batch_write=*/false);
+            if (reader.Init() == ErrorCode::OK) {
+                OpLogEntry entry;
+                if (reader.ReadOpLog(sequence_id, entry) == ErrorCode::OK) {
+                    return true;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return false;
     }
 
     void RegisterClient(P2PMasterService& service, const UUID& client_id,
@@ -190,6 +209,7 @@ TEST_F(P2PHotStandbyServiceTest, PromoteFinalCatchUpExportsLateEntry) {
         standby.WaitForAppliedSequence(1, std::chrono::milliseconds(2000)));
 
     AddReplica(master, "key-late", client_id, segment_id, 8192);
+    ASSERT_TRUE(WaitForPersistedEntry(2, std::chrono::milliseconds(2000)));
     ASSERT_EQ(standby.Promote(), ErrorCode::OK);
     EXPECT_EQ(standby.GetState(), StandbyState::PROMOTED);
     EXPECT_GE(standby.GetLatestAppliedSequenceId(), 2);

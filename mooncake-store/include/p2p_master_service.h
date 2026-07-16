@@ -84,7 +84,8 @@ class P2PMasterService : public MasterService {
         uint64_t last_applied_sequence_id = 0);
 
     ErrorCode RecordOplog(OpType type, const std::string& key,
-                          const std::string& payload = std::string());
+                          const std::string& payload = std::string(),
+                          bool sync = true);
 
     std::vector<Replica::Descriptor> FilterReplicas(
         const GetReplicaListRequestConfig& config,
@@ -130,12 +131,19 @@ class P2PMasterService : public MasterService {
         MetadataShard& shard, std::string_view key, const UUID& client_id,
         const UUID& segment_id) NO_THREAD_SAFETY_ANALYSIS;
 
+    ErrorCode RecordOplogOrError(OpType type, const std::string& key,
+                                 const std::string& payload,
+                                 const char* operation,
+                                 const std::string& details = std::string(),
+                                 bool sync = true);
+
     std::shared_ptr<P2PClientManager> client_manager_;
     std::array<P2PMetadataShard, kNumShards> metadata_shards_;
     // for the number of clients owning a key:
     // 1. max_replicas_per_key_ == 0 means no limitation
     // 2. max_replicas_per_key_ > 0 means the max client owner count
     uint64_t max_replicas_per_key_;
+    bool async_add_replica_oplog_{false};
 };
 
 }  // namespace mooncake

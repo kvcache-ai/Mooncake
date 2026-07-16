@@ -82,23 +82,22 @@ OpLogEntry OpLogManager::AllocateEntry(OpType type, const std::string& key,
     return entry;
 }
 
-ErrorCode OpLogManager::PersistEntry(const OpLogEntry& entry) const {
+ErrorCode OpLogManager::PersistEntry(const OpLogEntry& entry, bool sync) const {
     std::shared_lock<std::shared_mutex> lock(mutex_);
     auto store = oplog_store_;
     lock.unlock();
     if (!store) {
         return ErrorCode::INTERNAL_ERROR;
     }
-    // Strategy 2+: PUT_END is Async, REMOVE (and others) are Sync
-    bool sync = (entry.op_type != OpType::PUT_END);
     return store->WriteOpLog(entry, sync);
 }
 
 tl::expected<uint64_t, ErrorCode> OpLogManager::AppendAndPersist(
-    OpType type, const std::string& key, const std::string& payload) {
+    OpType type, const std::string& key, const std::string& payload,
+    bool sync) {
     // Seq pre-allocation semantics: allocate first, then persist.
     OpLogEntry entry = AllocateEntry(type, key, payload);
-    ErrorCode err = PersistEntry(entry);
+    ErrorCode err = PersistEntry(entry, sync);
     if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);
     }

@@ -5,13 +5,17 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "ha/oplog/localfs_oplog_store.h"
+#include "ha/oplog/oplog_store.h"
 #include "ha/oplog/p2p_oplog_types.h"
 #include "master_config.h"
 #include "p2p_rpc_types.h"
@@ -19,6 +23,56 @@
 
 namespace mooncake::test {
 namespace {
+
+class FailingOpLogStore : public OpLogStore {
+   public:
+    ErrorCode Init() override { return ErrorCode::OK; }
+    ErrorCode WriteOpLog(const OpLogEntry& entry, bool sync) override {
+        (void)entry;
+        (void)sync;
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    ErrorCode ReadOpLog(uint64_t sequence_id, OpLogEntry& entry) override {
+        (void)sequence_id;
+        (void)entry;
+        return ErrorCode::OPLOG_ENTRY_NOT_FOUND;
+    }
+    ErrorCode ReadOpLogSince(uint64_t start_sequence_id, size_t limit,
+                             std::vector<OpLogEntry>& entries) override {
+        (void)start_sequence_id;
+        (void)limit;
+        entries.clear();
+        return ErrorCode::OK;
+    }
+    ErrorCode GetLatestSequenceId(uint64_t& sequence_id) override {
+        sequence_id = 0;
+        return ErrorCode::OK;
+    }
+    ErrorCode GetMaxSequenceId(uint64_t& sequence_id) override {
+        sequence_id = 0;
+        return ErrorCode::OK;
+    }
+    ErrorCode UpdateLatestSequenceId(uint64_t sequence_id) override {
+        (void)sequence_id;
+        return ErrorCode::OK;
+    }
+    ErrorCode RecordSnapshotSequenceId(const std::string& snapshot_id,
+                                       uint64_t sequence_id) override {
+        (void)snapshot_id;
+        (void)sequence_id;
+        return ErrorCode::OK;
+    }
+    ErrorCode GetSnapshotSequenceId(const std::string& snapshot_id,
+                                    uint64_t& sequence_id) override {
+        (void)snapshot_id;
+        sequence_id = 0;
+        return ErrorCode::OPLOG_ENTRY_NOT_FOUND;
+    }
+    ErrorCode CleanupOpLogBefore(uint64_t before_sequence_id) override {
+        (void)before_sequence_id;
+        return ErrorCode::OK;
+    }
+};
 
 class P2PRecordOplogTest : public ::testing::Test {
    protected:
@@ -113,13 +167,28 @@ class P2PRecordOplogTest : public ::testing::Test {
     }
 
     OpLogEntry ReadEntry(uint64_t sequence_id) const {
+        OpLogEntry entry;
+        for (int i = 0; i < 100; ++i) {
+            LocalFsOpLogStore reader(kClusterId, test_dir_.string(),
+                                     /*enable_batch_write=*/false);
+            EXPECT_EQ(reader.Init(), ErrorCode::OK);
+            if (reader.ReadOpLog(sequence_id, entry) == ErrorCode::OK) {
+                return entry;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+
         LocalFsOpLogStore reader(kClusterId, test_dir_.string(),
                                  /*enable_batch_write=*/false);
         EXPECT_EQ(reader.Init(), ErrorCode::OK);
-
-        OpLogEntry entry;
         EXPECT_EQ(reader.ReadOpLog(sequence_id, entry), ErrorCode::OK);
         return entry;
+    }
+
+    void InjectFailingOpLogStore(P2PMasterService& service) const {
+        auto* manager = service.GetOpLogManager();
+        ASSERT_NE(manager, nullptr);
+        manager->SetOpLogStore(std::make_shared<FailingOpLogStore>());
     }
 
     static constexpr const char* kClusterId = "p2p-record-oplog-test";
@@ -317,6 +386,74 @@ TEST_F(P2PRecordOplogTest, BatchSyncReplicaRecordsSuccessfulOps) {
 
     EXPECT_TRUE(has_entry(OpType_REMOVE_REPLICA, "old-key"));
     EXPECT_TRUE(has_entry(OpType_ADD_REPLICA, "new-key"));
+}
+
+TEST_F(P2PRecordOplogTest,
+       RegisterClientReturnsErrorWhenOplogPersistenceFails) {
+    P2PMasterService service(MakeConfig());
+    InjectFailingOpLogStore(service);
+
+    RegisterClientRequest req;
+    req.client_id = {30, 30};
+    req.ip_address = "127.0.0.1";
+    req.rpc_port = 50051;
+    req.segments = {MakeSegment({31, 31})};
+    req.deployment_mode = DeploymentMode::P2P;
+
+    auto result = service.RegisterClient(req);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INTERNAL_ERROR);
+
+    // Current primary-side policy is apply-memory-then-record for lifecycle
+    // operations. Do not silently roll this back in the error path; a follow-up
+    // durable retry/outbox or prepare-log-apply flow should make this stronger.
+    EXPECT_NE(service.GetClientManager().GetClient(req.client_id), nullptr);
+}
+
+TEST_F(P2PRecordOplogTest, AddReplicaDoesNotApplyWhenOplogPersistenceFails) {
+    P2PMasterService service(MakeConfig());
+    const UUID client_id{32, 32};
+    const UUID segment_id{33, 33};
+    RegisterClient(service, client_id, MakeSegment(segment_id));
+    InjectFailingOpLogStore(service);
+
+    AddReplicaRequest req;
+    req.key = "failed-add";
+    req.client_id = client_id;
+    req.segment_id = segment_id;
+    req.size = 4096;
+
+    auto result = service.AddReplica(req);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INTERNAL_ERROR);
+
+    auto replicas = service.GetReplicaList(req.key);
+    ASSERT_FALSE(replicas.has_value());
+    EXPECT_EQ(replicas.error(), ErrorCode::OBJECT_NOT_FOUND);
+}
+
+TEST_F(P2PRecordOplogTest, RemoveReplicaDoesNotApplyWhenOplogPersistenceFails) {
+    P2PMasterService service(MakeConfig());
+    const UUID client_id{34, 34};
+    const UUID segment_id{35, 35};
+    RegisterClient(service, client_id, MakeSegment(segment_id));
+    AddReplica(service, "failed-remove", client_id, segment_id);
+    InjectFailingOpLogStore(service);
+
+    RemoveReplicaRequest req;
+    req.key = "failed-remove";
+    req.client_id = client_id;
+    req.segment_id = segment_id;
+
+    auto result = service.RemoveReplica(req);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INTERNAL_ERROR);
+
+    auto replicas = service.GetReplicaList(req.key);
+    ASSERT_TRUE(replicas.has_value()) << toString(replicas.error());
+    ASSERT_EQ(replicas->replicas.size(), 1);
+    EXPECT_EQ(replicas->replicas[0].get_p2p_proxy_descriptor().client_id,
+              client_id);
 }
 
 TEST_F(P2PRecordOplogTest, EnabledOplogFailsFastWhenStoreInitFails) {
