@@ -728,6 +728,10 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal(
     if (is_local_buffer) {
         new_allocator =
             ClientBufferAllocator::create(shm_buffer, shm_size, this->protocol);
+        if (!new_allocator) {
+            LOG(ERROR) << "Failed to create allocator";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
     }
 
     {
