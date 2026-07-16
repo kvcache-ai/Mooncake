@@ -3631,7 +3631,7 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
 void OffsetAllocatorStorageBackend::EvictToMakeRoom(
     int64_t required_bytes, size_t min_victims,
     const std::unordered_set<std::string>& batch_keys,
-    std::vector<std::string>& out_evicted) {
+    PendingEviction& out_pending) {
     if (cfg_.eviction_policy == OffsetEvictionPolicy::NONE) return;
 
     MutexLocker ev(&eviction_mutex_);
@@ -3687,15 +3687,64 @@ void OffsetAllocatorStorageBackend::EvictToMakeRoom(
             DCHECK_GE(total_size_.load(std::memory_order_relaxed),
                       it->second.total_size);
             DCHECK_GE(total_keys_.load(std::memory_order_relaxed), 1);
+            out_pending.objects.emplace_back(vkey, it->second);
             total_size_.fetch_sub(it->second.total_size,
                                   std::memory_order_relaxed);
             total_keys_.fetch_sub(1, std::memory_order_relaxed);
             shard.map.erase(it);
         }
         fifo_index_.erase(oldest);
-        out_evicted.push_back(std::move(vkey));
         ++n;
     }
+}
+
+//-----------------------------------------------------------------------------
+
+void OffsetAllocatorStorageBackend::RestorePreparedEviction(
+    PendingEviction&& pending) {
+    MutexLocker ev(&eviction_mutex_);
+
+    for (auto& [key, entry] : pending.objects) {
+        const uint32_t restored_size = entry.total_size;
+        const uint64_t restored_seq = entry.fifo_seq;
+        auto& shard = shards_[ShardForKey(key)];
+        SharedMutexLocker lk(&shard.mutex);
+
+        const bool map_inserted =
+            shard.map.emplace(key, std::move(entry)).second;
+        CHECK(map_inserted) << "Failed to restore evicted key: " << key;
+        const bool fifo_inserted =
+            fifo_index_.emplace(restored_seq, key).second;
+        CHECK(fifo_inserted)
+            << "Failed to restore FIFO entry for evicted key: " << key;
+        total_size_.fetch_add(restored_size, std::memory_order_relaxed);
+        total_keys_.fetch_add(1, std::memory_order_relaxed);
+    }
+    pending.objects.clear();
+}
+
+tl::expected<void, ErrorCode>
+OffsetAllocatorStorageBackend::NotifyAndCommitPreparedEviction(
+    const EvictionHandler& eviction_handler, PendingEviction& pending) {
+    if (pending.objects.empty()) return {};
+
+    std::vector<std::string> evicted_keys;
+    evicted_keys.reserve(pending.objects.size());
+    for (const auto& [key, _] : pending.objects) {
+        evicted_keys.push_back(key);
+    }
+
+    auto notify_result = eviction_handler(evicted_keys);
+    if (!notify_result) {
+        const ErrorCode error = notify_result.error();
+        RestorePreparedEviction(std::move(pending));
+        return tl::make_unexpected(error);
+    }
+
+    // Dropping the final metadata references commits the eviction and makes
+    // unpinned extents available to the allocator.
+    pending.objects.clear();
+    return {};
 }
 
 //-----------------------------------------------------------------------------
@@ -3764,10 +3813,9 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
     keys.reserve(batch_object.size());
     metadatas.reserve(batch_object.size());
 
-    // Accumulated evicted keys across the per-key loop.
-    // Flushed to eviction_handler before each allocate() that may reuse
-    // freed space, and again after the loop for any leftover victims.
-    std::vector<std::string> evicted_keys;
+    // Prepared victims are held here until the master accepts their removal.
+    // Their allocation handles prevent reuse before notification succeeds.
+    PendingEviction pending_eviction;
 
     for (const auto& [key, slices] : batch_object) {
         if (slices.empty()) continue;
@@ -3817,7 +3865,7 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
                 // fallback_evict_batch victims even if bytes are low.
                 size_t min_v = over_keys ? cfg_.fallback_evict_batch : 0;
                 EvictToMakeRoom(static_cast<int64_t>(record_size), min_v,
-                                batch_keys, evicted_keys);
+                                batch_keys, pending_eviction);
             }
         }
 
@@ -3826,12 +3874,12 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
         // so the allocator cannot re-issue a still-read offset.  Layer-2
         // (master metadata): the master must be told the key's local-disk
         // replica is gone before we reuse its space for a new key.
-        if (eviction_on && eviction_handler && !evicted_keys.empty()) {
-            auto notify_result = eviction_handler(evicted_keys);
+        if (eviction_on && !pending_eviction.objects.empty()) {
+            auto notify_result = NotifyAndCommitPreparedEviction(
+                eviction_handler, pending_eviction);
             if (!notify_result) {
                 return tl::make_unexpected(notify_result.error());
             }
-            evicted_keys.clear();
         }
 
         // ---- (C) Allocate ----
@@ -3846,20 +3894,19 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
 
             while (!allocation.has_value() &&
                    fallback_total_evicted < kMaxFallbackEvicted) {
-                size_t before = evicted_keys.size();
                 EvictToMakeRoom(static_cast<int64_t>(record_size),
                                 cfg_.fallback_evict_batch, batch_keys,
-                                evicted_keys);
-                size_t evicted_this_turn = evicted_keys.size() - before;
+                                pending_eviction);
+                size_t evicted_this_turn = pending_eviction.objects.size();
                 fallback_total_evicted += evicted_this_turn;
 
                 // Notify master of fallback victims before retrying.
-                if (eviction_handler && !evicted_keys.empty()) {
-                    auto notify_result = eviction_handler(evicted_keys);
+                if (!pending_eviction.objects.empty()) {
+                    auto notify_result = NotifyAndCommitPreparedEviction(
+                        eviction_handler, pending_eviction);
                     if (!notify_result) {
                         return tl::make_unexpected(notify_result.error());
                     }
-                    evicted_keys.clear();
                 }
 
                 uint64_t now_largest =
@@ -3973,12 +4020,12 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
 
     // ---- Post-loop flush: notify master of any evicted keys that
     // were accumulated by the last (possibly allocate-failing) key.
-    if (eviction_on && eviction_handler && !evicted_keys.empty()) {
-        auto notify_result = eviction_handler(evicted_keys);
+    if (eviction_on && !pending_eviction.objects.empty()) {
+        auto notify_result =
+            NotifyAndCommitPreparedEviction(eviction_handler, pending_eviction);
         if (!notify_result) {
             return tl::make_unexpected(notify_result.error());
         }
-        evicted_keys.clear();
     }
 
     if (complete_handler != nullptr && !keys.empty()) {
