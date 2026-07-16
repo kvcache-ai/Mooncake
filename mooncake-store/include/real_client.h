@@ -456,7 +456,7 @@ class RealClient : public PyClient {
     batch_get_replica_desc(const std::vector<std::string>& keys);
     std::vector<Replica::Descriptor> get_replica_desc(const std::string& key);
 
-    tl::expected<HeartbeatResponse, ErrorCode> ping(const UUID& client_id);
+    tl::expected<DummyHeartbeatResponse, ErrorCode> ping(const UUID& client_id);
 
     tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
     batch_get_offload_object(const std::vector<std::string>& keys,
@@ -475,13 +475,17 @@ class RealClient : public PyClient {
     };
 
     struct ShmContext {
-        // List of all mapped shared memory for this client
-        std::vector<MappedShm> mapped_shms;
-        std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
-            nullptr;
+        mutable SharedMutex mutex;
+        std::vector<MappedShm> mapped_shms GUARDED_BY(mutex);
+        std::shared_ptr<ClientBufferAllocator> client_buffer_allocator
+            GUARDED_BY(mutex) = nullptr;
     };
-    mutable std::shared_mutex dummy_client_mutex_;
-    std::unordered_map<UUID, ShmContext, boost::hash<UUID>> shm_contexts_;
+
+    mutable SharedMutex dummy_client_mutex_;
+    std::unordered_map<UUID, std::shared_ptr<ShmContext>, boost::hash<UUID>>
+        shm_contexts_ GUARDED_BY(dummy_client_mutex_);
+
+    std::shared_ptr<ShmContext> find_shm_context(const UUID& client_id);
 
     // Ensure cleanup executes at most once across multiple entry points
     std::atomic<bool> closed_{false};
@@ -505,8 +509,8 @@ class RealClient : public PyClient {
         128 * 1024;  // Size of the client ping queue
     boost::lockfree::queue<PodUUID> dummy_client_ping_queue_{
         kDummyClientPingQueueSize};
-    const int64_t dummy_client_live_ttl_sec_ = DEFAULT_CLIENT_LIVE_TTL_SEC;
-    int64_t view_version_ = 0;
+    const int64_t dummy_client_live_ttl_sec_ =
+        DEFAULT_DUMMY_CLIENT_LIVE_TTL_SEC;
 
     // IPC Server members for receiving FD from Dummy Clients
     std::string ipc_socket_path_;

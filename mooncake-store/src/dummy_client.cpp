@@ -391,8 +391,8 @@ int DummyClient::setup(DummyClientConfig& config) {
         shm_helper_->free(local_buffer_shm->base_addr);
         return -1;
     }
-    local_buffer_shm->registered = true;
     local_buffer_shm->is_local = true;
+    shm_helper_->set_registered(local_buffer_shm, true);
 
     ping_running_ = true;
     ping_thread_ = std::thread([this]() mutable { this->ping_thread_main(); });
@@ -401,14 +401,16 @@ int DummyClient::setup(DummyClientConfig& config) {
 }
 
 int DummyClient::tearDownAll() {
-    unregister_shm();
-
+    // Stop the ping thread before unregistering: otherwise a ping racing the
+    // unmap below would see the client missing and re-register it.
     if (ping_running_) {
         ping_running_ = false;
         if (ping_thread_.joinable()) {
             ping_thread_.join();
         }
     }
+
+    unregister_shm();
     return 0;
 }
 
@@ -444,12 +446,12 @@ int DummyClient::register_buffer(void* buffer, size_t size) {
     }
 
     // If this shm is not registered with RealClient yet, do it now
-    if (!shm->registered) {
+    if (!shm_helper_->is_registered(shm)) {
         if (register_shm_via_ipc(shm.get(), shm->is_local) != 0) {
             LOG(ERROR) << "Failed to implicitly register new SHM via IPC";
             return -1;
         }
-        shm->registered = true;
+        shm_helper_->set_registered(shm, true);
     }
 
     return 0;
@@ -466,7 +468,7 @@ int DummyClient::unregister_buffer(void* buffer) {
         LOG(ERROR) << "Buffer is not in any registered shared memory";
         return -1;
     }
-    if (!shm->registered) {
+    if (!shm_helper_->is_registered(shm)) {
         LOG(ERROR) << "Buffer is not registered with RealClient";
         return -1;
     }
@@ -475,10 +477,14 @@ int DummyClient::unregister_buffer(void* buffer) {
         LOG(ERROR) << "Invalid buffer address for unregistration";
         return -1;
     }
+    // Clear the registered flag BEFORE the RPC so a concurrent ping never sees
+    // registered > real-side count and re-registers the segment we are
+    // dropping; restore it if the RPC fails.
+    shm_helper_->set_registered(shm, false);
     auto ret = invoke_rpc<&RealClient::unregister_shm_buffer_internal, void>(
         reinterpret_cast<uint64_t>(buffer), client_id_);
-    if (ret.has_value()) {
-        shm->registered = false;
+    if (!ret.has_value()) {
+        shm_helper_->set_registered(shm, true);
     }
     return to_py_ret(ret);
 }
@@ -727,8 +733,30 @@ tl::expected<QueryTaskResponse, ErrorCode> DummyClient::query_task(
     return invoke_rpc<&RealClient::query_task, QueryTaskResponse>(task_id);
 }
 
+// Re-register all of this dummy's segments with the RealClient.
+// - When: RealClient dropped us (DISCONNECTION) or lost some segments
+//   (mapped_shm_count < expected).
+// - Re-sends ALL segments (not just the missing ones): the dummy can't tell
+//   which the RealClient still holds.
+// - Idempotent: map_shm_internal skips segments whose dummy_base_addr is
+// already
+//   mapped (closes fd, returns ok), so kept segments are no-ops.
+// - Returns true only if every segment succeeded; stops at the first failure.
+bool DummyClient::reregister_all_shms() {
+    bool all_registered = true;
+    for (const auto& shm_ptr : shm_helper_->get_registered_snapshot()) {
+        if (register_shm_via_ipc(shm_ptr.get(), shm_ptr->is_local) != 0) {
+            LOG(WARNING) << "Failed to re-register shared memory: "
+                         << shm_ptr->name;
+            all_registered = false;
+            break;
+        }
+    }
+    return all_registered;
+}
+
 void DummyClient::ping_thread_main() {
-    const int max_ping_fail_count = 1;
+    const int max_ping_fail_count = 3;
     const int success_ping_interval_ms = 1000;
     const int fail_ping_interval_ms = 1000;
     const int retry_connect_interval_ms = 2000;
@@ -737,17 +765,39 @@ void DummyClient::ping_thread_main() {
 
     while (ping_running_) {
         auto ping_result =
-            invoke_rpc<&RealClient::ping, HeartbeatResponse>(client_id_);
+            invoke_rpc<&RealClient::ping, DummyHeartbeatResponse>(client_id_);
 
-        if (ping_result.has_value() &&
-            ping_result.value().status == ClientStatus::HEALTH) {
-            ping_fail_count = 0;
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(success_ping_interval_ms));
-            continue;
+        if (ping_result.has_value()) {
+            const auto& resp = ping_result.value();
+            const size_t registered = shm_helper_->count_registered();
+            const bool needs_reregister =
+                resp.status == DummyClientStatus::DISCONNECTION ||
+                resp.mapped_shm_count < registered;
+
+            if (!needs_reregister) {  // Client is healthy
+                ping_fail_count = 0;
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(success_ping_interval_ms));
+                continue;
+            }
+
+            LOG(WARNING) << "client_id=" << client_id_
+                         << ", RealClient reachable but segments missing "
+                            "(reported="
+                         << resp.mapped_shm_count << ", expected=" << registered
+                         << ", client_status=" << resp.status
+                         << "), re-registering all shms";
+            if (reregister_all_shms()) {
+                ping_fail_count = 0;
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(success_ping_interval_ms));
+                continue;
+            }
+            LOG(WARNING) << "client_id=" << client_id_
+                         << ", reregister_all_shms failed, escalating";
         }
 
-        // Ping failed
+        // Ping failed or Re-registration failed
         ping_fail_count++;
         LOG(WARNING) << "Ping failed " << ping_fail_count << "/"
                      << max_ping_fail_count;
@@ -758,33 +808,20 @@ void DummyClient::ping_thread_main() {
 
             // Reconnection Loop
             while (ping_running_) {
-                // Re-register ALL shms
-                bool all_registered = true;
-                const auto& shms = shm_helper_->get_shms();
-                for (const auto& shm_ptr : shms) {
-                    if (shm_ptr->registered) {
-                        if (register_shm_via_ipc(shm_ptr.get(),
-                                                 shm_ptr->is_local) != 0) {
-                            LOG(WARNING)
-                                << "Failed to re-register shared memory "
-                                   "during reconnection";
-                            all_registered = false;
-                            break;
-                        }
-                    }
-                }
-
-                if (all_registered) {
+                if (reregister_all_shms()) {
                     LOG(INFO)
                         << "Re-registered all shared memorys successfully";
 
-                    // Try to validate RPC connection
-                    // Even if register_shm_via_ipc succeeded, we should check
-                    // if RPC is responsive
+                    // Even if register_shm_via_ipc succeeded, confirm the RPC
+                    // is responsive AND the real_client side now holds all our
+                    // segments before declaring the connection restored.
                     auto check_rpc =
-                        invoke_rpc<&RealClient::ping, HeartbeatResponse>(
+                        invoke_rpc<&RealClient::ping, DummyHeartbeatResponse>(
                             client_id_);
-                    if (check_rpc.has_value()) {
+                    if (check_rpc.has_value() &&
+                        check_rpc.value().status == DummyClientStatus::HEALTH &&
+                        check_rpc.value().mapped_shm_count >=
+                            shm_helper_->count_registered()) {
                         LOG(INFO) << "RPC connection restored";
                         ping_fail_count = 0;
                         connected_ = true;

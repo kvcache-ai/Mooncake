@@ -5,6 +5,7 @@
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 
 #include "pyclient.h"
+#include <atomic>
 #include <memory>
 
 namespace mooncake {
@@ -33,6 +34,39 @@ class ShmHelper {
 
     const std::vector<std::shared_ptr<ShmSegment>>& get_shms() const {
         return shms_;
+    }
+
+    std::vector<std::shared_ptr<ShmSegment>> get_shms_snapshot() const {
+        std::lock_guard<std::mutex> lock(shm_mutex_);
+        return shms_;
+    }
+
+    void set_registered(const std::shared_ptr<ShmSegment>& shm, bool value) {
+        std::lock_guard<std::mutex> lock(shm_mutex_);
+        if (shm) shm->registered = value;
+    }
+
+    bool is_registered(const std::shared_ptr<ShmSegment>& shm) const {
+        std::lock_guard<std::mutex> lock(shm_mutex_);
+        return shm && shm->registered;
+    }
+
+    size_t count_registered() const {
+        std::lock_guard<std::mutex> lock(shm_mutex_);
+        size_t count = 0;
+        for (const auto& shm : shms_) {
+            if (shm->registered) ++count;
+        }
+        return count;
+    }
+
+    std::vector<std::shared_ptr<ShmSegment>> get_registered_snapshot() const {
+        std::lock_guard<std::mutex> lock(shm_mutex_);
+        std::vector<std::shared_ptr<ShmSegment>> registered;
+        for (const auto& shm : shms_) {
+            if (shm->registered) registered.push_back(shm);
+        }
+        return registered;
     }
 
     bool is_hugepage() const { return use_hugepage_; }
@@ -170,6 +204,8 @@ class DummyClient : public PyClient {
 
     int register_shm_via_ipc(const ShmHelper::ShmSegment* shm,
                              bool is_local = false);
+
+    bool reregister_all_shms();
 
     /**
      * @brief Generic RPC invocation helper for single-result operations
