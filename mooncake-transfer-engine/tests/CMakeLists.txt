@@ -110,6 +110,13 @@ target_link_libraries(connect_pause_tracker_test PUBLIC gtest gtest_main
                                                         pthread)
 add_test(NAME connect_pause_tracker_test COMMAND connect_pause_tracker_test)
 
+# Hardware-free unit tests for DmabufExport struct and
+# RdmaContext::{exportDmabuf, closeDmabufExport}. Runs on every CI runner —
+# no RDMA device or GPU required (host-memory paths only).
+add_executable(dmabuf_export_test ${WORKSPACE}/dmabuf_export_test.cpp)
+target_link_libraries(dmabuf_export_test PUBLIC transfer_engine gtest gtest_main)
+add_test(NAME dmabuf_export_test COMMAND dmabuf_export_test)
+
 if(USE_MNNVL)
   add_executable(nvlink_transport_test ${WORKSPACE}/nvlink_transport_test.cpp)
   target_link_libraries(nvlink_transport_test PUBLIC transfer_engine gtest

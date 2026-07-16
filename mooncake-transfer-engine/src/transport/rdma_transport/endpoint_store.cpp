@@ -144,10 +144,24 @@ void FIFOEndpointStore::reclaimEndpoint() {
 size_t FIFOEndpointStore::getSize() { return endpoint_map_.size(); }
 
 int FIFOEndpointStore::destroyQPs() {
-    for (auto &kv : endpoint_map_) {
-        kv.second->destroyQP();
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    int ret = 0;
+
+    // Always transition QPs to ERR before destroy to flush inflight WRs.
+    for (auto &endpoint : waiting_list_) {
+        endpoint->beginDestroy();
     }
-    return 0;
+    for (auto &kv : endpoint_map_) {
+        kv.second->beginDestroy();
+    }
+
+    for (auto &endpoint : waiting_list_) {
+        if (endpoint->destroyQP()) ret = -1;
+    }
+    for (auto &kv : endpoint_map_) {
+        if (kv.second->destroyQP()) ret = -1;
+    }
+    return ret;
 }
 
 int FIFOEndpointStore::disconnectQPs() {
@@ -322,9 +336,22 @@ void SIEVEEndpointStore::reclaimEndpoint() {
 }
 
 int SIEVEEndpointStore::destroyQPs() {
-    for (auto &endpoint : waiting_list_) endpoint->destroyQP();
-    for (auto &kv : endpoint_map_) kv.second.first->destroyQP();
-    return 0;
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    int ret = 0;
+
+    // Always transition QPs to ERR before destroy to flush inflight WRs.
+    for (auto &endpoint : waiting_list_) {
+        endpoint->beginDestroy();
+    }
+    for (auto &kv : endpoint_map_) {
+        kv.second.first->beginDestroy();
+    }
+
+    for (auto &endpoint : waiting_list_)
+        if (endpoint->destroyQP()) ret = -1;
+    for (auto &kv : endpoint_map_)
+        if (kv.second.first->destroyQP()) ret = -1;
+    return ret;
 }
 
 int SIEVEEndpointStore::disconnectQPs() {

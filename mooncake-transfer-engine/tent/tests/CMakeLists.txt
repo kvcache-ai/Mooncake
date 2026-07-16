@@ -201,7 +201,15 @@ target_include_directories(tent_rail_monitor_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_rail_monitor_test COMMAND tent_rail_monitor_test)
 
-# Transport Selector Unit Test
+# QoS Contract Schema Unit Test
+add_executable(tent_qos_contract_test qos_contract_test.cpp
+                                      ../src/runtime/qos_contract.cpp)
+target_link_libraries(tent_qos_contract_test PRIVATE gtest gtest_main
+                                                     tent_common)
+target_include_directories(tent_qos_contract_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_qos_contract_test COMMAND tent_qos_contract_test)
+
 add_executable(tent_transport_selector_test transport_selector_test.cpp)
 target_link_libraries(tent_transport_selector_test PRIVATE gtest gtest_main
                                                            tent_link_group)
