@@ -1,11 +1,11 @@
 #include "registered_pinned_memory.h"
 
 #include <algorithm>
-#include <cerrno>
 #include <cctype>
+#include <charconv>
 #include <cstdlib>
-#include <limits>
 #include <optional>
+#include <system_error>
 
 #include <glog/logging.h>
 
@@ -42,19 +42,23 @@ std::optional<uint64_t> ParsePinnedMemoryLimit() {
         return std::nullopt;
     }
 
-    char* end = nullptr;
-    errno = 0;
-    unsigned long long parsed = std::strtoull(number, &end, 10);
-    while (end && std::isspace(static_cast<unsigned char>(*end))) {
+    const char* end = number;
+    while (*end != '\0') {
         ++end;
     }
-    if (end == number || (end && *end != '\0') || errno == ERANGE ||
-        parsed > std::numeric_limits<uint64_t>::max()) {
+    while (end > number &&
+           std::isspace(static_cast<unsigned char>(*(end - 1)))) {
+        --end;
+    }
+
+    uint64_t parsed = 0;
+    auto [ptr, ec] = std::from_chars(number, end, parsed);
+    if (ec != std::errc{} || ptr != end) {
         LOG(WARNING) << "Invalid MC_STORE_PIN_MEMORY_MAX_BYTES='" << value
                      << "', disabling Store segment pinning";
         return std::nullopt;
     }
-    return static_cast<uint64_t>(parsed);
+    return parsed;
 }
 
 std::pair<bool, uint64_t> ParsePinnedMemoryConfig() {
@@ -74,8 +78,9 @@ RegisteredPinnedRegion::~RegisteredPinnedRegion() {
 }
 
 RegisteredPinnedMemoryManager& RegisteredPinnedMemoryManager::instance() {
-    static RegisteredPinnedMemoryManager manager;
-    return manager;
+    static RegisteredPinnedMemoryManager* manager =
+        new RegisteredPinnedMemoryManager();
+    return *manager;
 }
 
 RegisteredPinnedMemoryManager::RegisteredPinnedMemoryManager()
