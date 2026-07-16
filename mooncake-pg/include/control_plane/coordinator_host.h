@@ -31,7 +31,7 @@ class RpcClient;
 //   | heartbeat       |--- RPC ----->| postHeartbeat()           |
 //   | proposeViewUpd  |--- RPC ----->| postProposeViewUpdate()   |
 //   | publishEndpoint |--- RPC ----->| postPublishEndpoint()     |
-//   | reportTransfer  |--- RPC ----->| postTransferObservation() |
+//   | reportLinkEvent |--- RPC ----->| postLinkEventReport()     |
 //   +-----------------+              +---------------------------+
 //                                            |
 //                                    SerializedExecutor
@@ -45,9 +45,9 @@ class RpcClient;
 //                                            |
 //                              +-----------------------------------+
 //                              | runEffects()                      |
-//                              |  RankStateUpdatePush -> broadcast |
-//                              |  ViewUpdatePush -> callAsync      |
-//                              |  ReplyProposalEffect -> reply     |
+//                              |  BroadcastRankState -> broadcast  |
+//                              |  PushViewUpdate -> callAsync      |
+//                              |  ReplyProposal -> reply           |
 //                              +-----------------------------------+
 //
 
@@ -76,9 +76,7 @@ class CoordinatorRpcServiceImpl : public CoordinatorRpcService {
     void proposeViewUpdate(coro_rpc::context<ProposeViewUpdateResponse> ctx,
                            ProposeViewUpdateRequest req) override;
 
-    void reportLinkStateChange(LinkStateChangeReport req) override;
-
-    void reportTransferObservation(TransferObservationReport req) override;
+    void reportLinkEvent(LinkEventReport req) override;
 
     void syncAfterFailure(coro_rpc::context<SyncAfterFailureResponse> ctx,
                           SyncAfterFailureRequest req) override;
@@ -116,9 +114,7 @@ class CoordinatorHost {
     void postPublishEndpoint(coro_rpc::context<PublishEndpointResponse> ctx,
                              PublishEndpointRequest req);
 
-    void postTransferObservation(TransferObservationReport req);
-
-    void postLinkStateChange(LinkStateChangeReport req);
+    void postLinkEventReport(LinkEventReport req);
 
     void postSyncAfterFailure(coro_rpc::context<SyncAfterFailureResponse> ctx,
                               SyncAfterFailureRequest req);
@@ -142,7 +138,7 @@ class CoordinatorHost {
     // Host maintains the propose_id -> RPC context mapping.
     // 2PC state is inside CentralizedCoordinatorStateMachine;
     // Host just stores the RPC context for replying when the
-    // state machine emits ReplyProposalEffect.
+    // state machine emits ReplyProposal.
     uint64_t next_propose_id_{1};
     std::unordered_map<uint64_t, coro_rpc::context<ProposeViewUpdateResponse>>
         pending_rpcs_;
@@ -152,7 +148,7 @@ class CoordinatorHost {
         pending_sync_ctxs_;
 
     void runEffects(const std::vector<CoordinatorEffect>& effects);
-    void pushViewUpdate(const ViewUpdateEffect& effect);
+    void pushViewUpdate(const PushViewUpdate& effect);
 
     template <auto Method, typename Push>
     void pushToAgent(GlobalRank rank, const Push& msg) {

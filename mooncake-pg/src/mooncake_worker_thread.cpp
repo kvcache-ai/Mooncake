@@ -335,7 +335,7 @@ void MooncakeWorker::startWorker() {
                             signal_ptr[j] = 0;
                         }
 
-                        // Push transfer observation via backend's Agent.
+                        // Push link event via backend's Agent.
                         if (group->backend) {
                             auto& att_tensor = task_attempted_tensor_[i];
                             auto& fail_tensor = task_failed_tensor_[i];
@@ -347,19 +347,18 @@ void MooncakeWorker::startWorker() {
                                 }
                             }
                             if (has_any_attempted) {
-                                std::vector<uint8_t> attempted(kMaxNumRanks, 0);
-                                std::vector<uint8_t> failed(kMaxNumRanks, 0);
+                                LinkEvent event;
+                                event.events.assign(kMaxNumRanks,
+                                                    LinkEvent::EventType::None);
                                 for (int j = 0; j < group->maxGroupSize; ++j) {
                                     int32_t peer_global = group->rank_order[j];
-                                    attempted[peer_global] =
-                                        att_tensor[j].item<int>() ? 1 : 0;
-                                    failed[peer_global] =
-                                        fail_tensor[j].item<int>() ? 1 : 0;
+                                    if (!att_tensor[j].item<int>()) continue;
+                                    event.events[peer_global] =
+                                        fail_tensor[j].item<int>()
+                                            ? LinkEvent::EventType::Failure
+                                            : LinkEvent::EventType::Success;
                                 }
-                                group->backend->getAgent()
-                                    .pushTransferObservation(
-                                        std::move(attempted),
-                                        std::move(failed));
+                                group->backend->getAgent().pushLinkEvent(event);
                             }
                         }
 

@@ -128,10 +128,11 @@ void LinkManager::shutdown() {
             engine_->closeSegment(link.target_id.value());
             link.target_id = std::nullopt;
         }
-        if (link.warmup_batch_id.has_value()) {
-            engine_->freeBatchID(link.warmup_batch_id.value());
-            link.warmup_batch_id = std::nullopt;
+        if (link.probe_batch_id.has_value()) {
+            engine_->freeBatchID(link.probe_batch_id.value());
+            link.probe_batch_id = std::nullopt;
         }
+        link.health_check_requested = false;
         link.state = PeerLinkState::Idle;
         link.is_candidate = false;
     }
@@ -182,12 +183,37 @@ void LinkManager::disconnect(GlobalRank peer) {
     tearDownPeerLink(peer);
 }
 
+void LinkManager::requestHealthCheck(GlobalRank peer) {
+    if (peer == rank_) return;
+    if (!rankInRange(peer)) return;
+
+    std::lock_guard<std::mutex> lock(peers_mutex_);
+    auto& link = peers_[peer];
+    if (!link.is_candidate || link.state != PeerLinkState::Connected ||
+        !link.target_id.has_value() || link.skip_warmup ||
+        !warmup_send_region_ || link.warmup_recv_addr == 0) {
+        return;
+    }
+    if (link.health_check_requested) return;
+
+    link.health_check_requested = true;
+    link.probe_backoff = PeerLink::kProbeBackoffMin;
+    link.next_probe_time = std::chrono::steady_clock::now();
+    wakeup();
+}
+
 void LinkManager::stopReconnect(GlobalRank peer) {
     if (peer == rank_) return;
     if (!rankInRange(peer)) return;
 
     std::lock_guard<std::mutex> lock(peers_mutex_);
-    peers_[peer].is_candidate = false;
+    auto& link = peers_[peer];
+    link.is_candidate = false;
+    link.health_check_requested = false;
+    if (link.probe_batch_id.has_value()) {
+        engine_->freeBatchID(link.probe_batch_id.value());
+        link.probe_batch_id = std::nullopt;
+    }
 }
 
 bool LinkManager::isConnected(GlobalRank peer) const {
@@ -264,19 +290,18 @@ void LinkManager::tearDownPeerLink(GlobalRank peer) {
         engine_->removeLocalSegment(link.server_name);
     }
 
-    if (link.warmup_batch_id.has_value()) {
-        engine_->freeBatchID(link.warmup_batch_id.value());
-        link.warmup_batch_id = std::nullopt;
+    if (link.probe_batch_id.has_value()) {
+        engine_->freeBatchID(link.probe_batch_id.value());
+        link.probe_batch_id = std::nullopt;
     }
+    link.health_check_requested = false;
 
     link.state = PeerLinkState::Idle;
 
     publishLinkDown(peer);
-
-    emit(TELinkEvent{.kind = TELinkEvent::Kind::LinkDown, .peer = peer});
 }
 
-void LinkManager::emit(TELinkEvent event) {
+void LinkManager::emit(TELinkUpEvent event) {
     std::lock_guard<std::mutex> lock(event_callback_mutex_);
     if (event_callback_) {
         event_callback_(std::move(event));
@@ -290,7 +315,8 @@ void LinkManager::pollerLoop() {
         bool did_work = false;
 
         // Find the next eligible peer to probe under a single lock.
-        GlobalRank to_probe = kInvalidGlobalRank;
+        GlobalRank connection_peer = kInvalidGlobalRank;
+        GlobalRank health_check_peer = kInvalidGlobalRank;
         {
             std::lock_guard<std::mutex> lock(peers_mutex_);
             auto now = std::chrono::steady_clock::now();
@@ -300,18 +326,27 @@ void LinkManager::pollerLoop() {
 
                 auto& link = peers_[peer];
                 if (!link.is_candidate) continue;
-                if (link.state == PeerLinkState::Connected) continue;
+                if (link.state == PeerLinkState::Connected) {
+                    if (link.health_check_requested &&
+                        now >= link.next_probe_time) {
+                        health_check_peer = peer;
+                        break;
+                    }
+                    continue;
+                }
                 if (now < link.next_probe_time) continue;
 
                 // Schedule next probe attempt with exponential backoff.
                 link.next_probe_time = now + link.probe_backoff;
-                to_probe = peer;
+                connection_peer = peer;
                 break;  // probe one per iteration
             }
         }
 
-        if (to_probe != kInvalidGlobalRank) {
-            did_work = probePeer(to_probe);
+        if (health_check_peer != kInvalidGlobalRank) {
+            did_work = advanceHealthCheck(health_check_peer);
+        } else if (connection_peer != kInvalidGlobalRank) {
+            did_work = advanceConnection(connection_peer);
         }
 
         // Sleep a bit if idle, or a tiny bit if active (to avoid busy-loop).
@@ -324,7 +359,61 @@ void LinkManager::pollerLoop() {
     }
 }
 
-bool LinkManager::probePeer(GlobalRank peer) {
+bool LinkManager::advanceHealthCheck(GlobalRank peer) {
+    std::lock_guard<std::mutex> lock(peers_mutex_);
+    auto& link = peers_[peer];
+    if (!link.is_candidate || link.state != PeerLinkState::Connected ||
+        !link.health_check_requested || !link.target_id.has_value()) {
+        return false;
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    if (!link.probe_batch_id.has_value()) {
+        auto batch_id = engine_->allocateBatchID(1);
+        uint64_t target_offset =
+            link.warmup_recv_addr + rank_ * sizeof(int32_t);
+        engine_->submitTransfer(batch_id,
+                                {TransferRequest{
+                                    .opcode = TransferRequest::WRITE,
+                                    .source = warmup_send_region_.get(),
+                                    .target_id = *link.target_id,
+                                    .target_offset = target_offset,
+                                    .length = sizeof(int32_t),
+                                }});
+        link.probe_batch_id = batch_id;
+        link.next_probe_time =
+            now + std::chrono::milliseconds(kPollerActiveSleepMs);
+        return true;
+    }
+
+    TransferStatus status;
+    engine_->getTransferStatus(*link.probe_batch_id, 0, status);
+    if (status.s == TransferStatusEnum::COMPLETED) {
+        engine_->freeBatchID(*link.probe_batch_id);
+        link.probe_batch_id = std::nullopt;
+        link.health_check_requested = false;
+        link.probe_backoff = PeerLink::kProbeBackoffMin;
+        emit(TELinkUpEvent{.peer = peer});
+        return true;
+    }
+
+    if (status.s == TransferStatusEnum::FAILED) {
+        LOG(WARNING) << "LinkManager: health check rank " << rank_ << " -> "
+                     << peer << " FAILED";
+        engine_->freeBatchID(*link.probe_batch_id);
+        link.probe_batch_id = std::nullopt;
+        link.next_probe_time = now + link.probe_backoff;
+        link.probe_backoff =
+            std::min(link.probe_backoff * 2, PeerLink::kProbeBackoffMax);
+        return false;
+    }
+
+    link.next_probe_time =
+        now + std::chrono::milliseconds(kPollerActiveSleepMs);
+    return true;
+}
+
+bool LinkManager::advanceConnection(GlobalRank peer) {
     std::lock_guard<std::mutex> lock(peers_mutex_);
     auto& link = peers_[peer];
 
@@ -348,8 +437,7 @@ bool LinkManager::probePeer(GlobalRank peer) {
                 link.state = PeerLinkState::Connected;
                 link.probe_backoff = PeerLink::kProbeBackoffMin;
                 publishLinkUp(peer, segment_id);
-                emit(TELinkEvent{
-                    .kind = TELinkEvent::Kind::LinkUp,
+                emit(TELinkUpEvent{
                     .peer = peer,
                 });
                 return true;
@@ -371,7 +459,7 @@ bool LinkManager::probePeer(GlobalRank peer) {
                                             .target_offset = target_offset,
                                             .length = sizeof(int32_t),
                                         }});
-                link.warmup_batch_id = batch_id;
+                link.probe_batch_id = batch_id;
                 link.state = PeerLinkState::WaitingWarmupTransfer;
             } else {
                 // Wait for the peer to warmup us.
@@ -381,22 +469,21 @@ bool LinkManager::probePeer(GlobalRank peer) {
         }
 
         case PeerLinkState::WaitingWarmupTransfer: {
-            if (!link.warmup_batch_id.has_value()) {
+            if (!link.probe_batch_id.has_value()) {
                 link.state = PeerLinkState::Idle;
                 return false;
             }
 
             TransferStatus status;
-            engine_->getTransferStatus(link.warmup_batch_id.value(), 0, status);
+            engine_->getTransferStatus(link.probe_batch_id.value(), 0, status);
 
             if (status.s == TransferStatusEnum::COMPLETED) {
-                engine_->freeBatchID(link.warmup_batch_id.value());
-                link.warmup_batch_id = std::nullopt;
+                engine_->freeBatchID(link.probe_batch_id.value());
+                link.probe_batch_id = std::nullopt;
                 link.state = PeerLinkState::Connected;
                 link.probe_backoff = PeerLink::kProbeBackoffMin;
                 publishLinkUp(peer, link.target_id.value());
-                emit(TELinkEvent{
-                    .kind = TELinkEvent::Kind::LinkUp,
+                emit(TELinkUpEvent{
                     .peer = peer,
                 });
                 return true;
@@ -409,8 +496,8 @@ bool LinkManager::probePeer(GlobalRank peer) {
                     << " warmup_recv_addr=" << (void*)link.warmup_recv_addr
                     << " target_offset="
                     << (void*)(link.warmup_recv_addr + rank_ * sizeof(int32_t));
-                engine_->freeBatchID(link.warmup_batch_id.value());
-                link.warmup_batch_id = std::nullopt;
+                engine_->freeBatchID(link.probe_batch_id.value());
+                link.probe_batch_id = std::nullopt;
                 engine_->closeSegment(link.target_id.value());
                 link.target_id = std::nullopt;
                 link.state = PeerLinkState::Idle;
@@ -432,8 +519,7 @@ bool LinkManager::probePeer(GlobalRank peer) {
                 link.state = PeerLinkState::Connected;
                 link.probe_backoff = PeerLink::kProbeBackoffMin;
                 publishLinkUp(peer, link.target_id.value());
-                emit(TELinkEvent{
-                    .kind = TELinkEvent::Kind::LinkUp,
+                emit(TELinkUpEvent{
                     .peer = peer,
                 });
                 return true;

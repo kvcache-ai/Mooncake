@@ -332,7 +332,7 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
         return meta_ ? meta_->epoch.load(std::memory_order_acquire) : 0;
     }
 
-    // Called by AgentHost when a TE link to peer goes down.
+    // Called by AgentHost when a TE link to peer goes up
     void onPeerLinkReset(InGroupRank peer);
 
     // Called by NotifyLinkRefreshed effect: refresh the cached TE segment

@@ -20,23 +20,22 @@ class AgentStateMachine {
     void unregisterGroup(GroupId group_id);
 
     AgentApplyResult handlePeerJoined(const PeerJoinedPush& push);
-    AgentApplyResult handleRankStateUpdate(const RankStateUpdatePush& push);
+    AgentApplyResult handleRankStateUpdate(const RankStatePush& push);
+    std::pair<AgentApplyResult, bool> applyGroupView(GroupId group_id,
+                                                     const GroupView& view);
     std::pair<AgentApplyResult, bool> handleViewUpdate(
         const ViewUpdatePush& push);
-    AgentApplyResult handleLinkStateChange(GlobalRank peer, bool connected);
+    AgentApplyResult handleLinkUp(GlobalRank peer);
 
     HeartbeatRequest buildHeartbeat() const;
 
     AgentApplyResult applyRegisterAgentResponse(
         const RegisterAgentResponse& resp);
-    AgentApplyResult prepareCleanSlateRegister();
+    AgentApplyResult reset(uint64_t new_epoch);
 
-    void setAgentSessionEpoch(uint64_t epoch) {
-        agent_session_epoch_.store(epoch, std::memory_order_release);
-    }
-
-    std::optional<TransferObservationReport> processTransferObservation(
-        const TransferObservationEvent& event);
+    AgentApplyResult pushLinkEvent(const LinkEvent& event);
+    std::optional<LinkEventReport> getLinkEventReport() const;
+    void handleLinkEventReportAck(const LinkEventReportAck& ack);
 
     GroupView getGroupView(GroupId group_id) const;
 
@@ -66,9 +65,11 @@ class AgentStateMachine {
     std::unordered_map<GroupId, GroupView> groups_;
 
     std::vector<RankState> global_rank_states_;
-    std::vector<bool> link_connected_;
-    std::vector<bool> last_reported_peer_status_;
     std::vector<std::optional<RankConnectionMetadata>> rank_connections_;
+
+    std::vector<LinkEvent::EventType> observed_link_state_;
+    uint64_t link_state_version_ = 0;
+    uint64_t acked_link_state_version_ = 0;
 
     CoordinatorConnection coordinator_connection_ =
         CoordinatorConnection::Disconnected;
@@ -76,6 +77,8 @@ class AgentStateMachine {
     bool rankInRange(GlobalRank rank) const {
         return 0 <= rank && rank < max_world_size_;
     }
+
+    bool recordLinkEvent(GlobalRank peer, LinkEvent::EventType type);
 };
 
 }  // namespace mooncake

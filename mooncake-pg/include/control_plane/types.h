@@ -47,6 +47,8 @@ struct GroupEndpointInfo {
     // p2p
     uint64_t p2p_credit_region = 0;
     uint64_t p2p_ack_region = 0;
+
+    bool operator==(const GroupEndpointInfo&) const = default;
 };
 
 // Membership state of one rank inside a single GroupView.
@@ -71,6 +73,8 @@ struct GroupMember {
     }
     bool hasLeft() const { return status == GroupMemberState::Left; }
     bool hasEndpoint() const { return endpoint.has_value(); }
+
+    bool operator==(const GroupMember&) const = default;
 };
 
 // Group lifecycle status.
@@ -97,23 +101,18 @@ struct GroupView {
     bool auto_deactivate = true;
     std::vector<GlobalRank> rank_order;  // InGroupRank -> GlobalRank
     std::vector<GroupMember> members;    // indexed by GlobalRank
+
+    bool operator==(const GroupView&) const = default;
 };
 
-struct TransferObservationEvent {
-    std::vector<uint8_t> attempted_ranks;
-    std::vector<uint8_t> failed_ranks_hint;
+struct LinkEvent {
+    enum class EventType : uint8_t {
+        None = 0,
+        Success = 1,
+        Failure = 2,
+    };
 
-    // Merge `next` into `acc` for peers where next.attempted_ranks is set.
-    // Later observations override earlier ones for the same peer.
-    static void merge(TransferObservationEvent& acc,
-                      const TransferObservationEvent& next,
-                      int max_world_size) {
-        for (int peer = 0; peer < max_world_size; ++peer) {
-            if (!next.attempted_ranks[peer]) continue;
-            acc.attempted_ranks[peer] = 1;
-            acc.failed_ranks_hint[peer] = next.failed_ranks_hint[peer];
-        }
-    }
+    std::vector<EventType> events;
 };
 
 }  // namespace mooncake

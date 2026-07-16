@@ -707,20 +707,44 @@ def _replacement_recovery_worker(
         ctx.record_result({"role": "replacement"})
 
 
-def _manual_deactivate_worker(
+def _manual_deactivate_recovery_worker(
     ctx: MooncakePGWorkerContext,
     broken_exited: mp.Event,
-    survivors_synced: mp.Barrier,
+    start_recovery: mp.Event,
 ) -> None:
-    """Multi-round test with auto_deactivate_on_failure=False:
+    """Manual deactivation and recovery with auto_deactivate disabled:
     Round 1 (all healthy): failedRanks = all 0s, activeRanks = all 1s.
     Round 2 (rank died, not yet deactivated): activeRanks unchanged.
-    --- Survivors deactivate the dead rank. ---
-    Round 3 (after deactivate): failedRanks = all 0s for reduced group,
-      activeRanks reflects the deactivation.
+    Round 3: survivors sync, manually deactivate, and run as a reduced group.
+    Round 4: a replacement joins, survivors recover it, and the full group
+      runs again.
     """
-    device = ctx.init_group(auto_deactivate_on_failure=False,
-                            auto_sync_on_failure=False)
+    logical_rank = ctx.rank if ctx.proc_rank < ctx.world_size else BROKEN_RANK
+
+    if ctx.proc_rank >= ctx.world_size:
+        if not start_recovery.wait(timeout=30.0):
+            raise TimeoutError("timed out waiting to start manual recovery")
+
+        device = ctx.init_group(
+            rank=logical_rank,
+            auto_deactivate_on_failure=False,
+            auto_sync_on_failure=False,
+        )
+        backend = ctx.get_backend()
+        pg.join_group(backend)
+
+        tensor = torch.tensor(
+            [logical_rank + 1], dtype=torch.int32, device=device
+        )
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        ctx.record_result({"role": "replacement"})
+        return
+
+    device = ctx.init_group(
+        rank=logical_rank,
+        auto_deactivate_on_failure=False,
+        auto_sync_on_failure=False,
+    )
     backend = ctx.get_backend()
 
     # Round 1: all healthy
@@ -738,7 +762,7 @@ def _manual_deactivate_worker(
     active_ranks = pg.get_active_ranks(backend)
     assert active_ranks.cpu().tolist() == [1] * ctx.world_size
 
-    if ctx.rank == BROKEN_RANK:
+    if logical_rank == BROKEN_RANK:
         ctx.record_result({"role": "broken"})
         broken_exited.set()
         os._exit(0)
@@ -763,17 +787,17 @@ def _manual_deactivate_worker(
     active_ranks = pg.get_active_ranks(backend)
     assert active_ranks.cpu().tolist() == [1] * ctx.world_size
 
-    # For groups with auto_deactivate=False, users are responsible for synchronizing
-    # the surviving ranks after a failure. Otherwise, a ViewUpdate may race with
-    # in-flight operations on other ranks.
-    #
-    # This behavior is intentional:
-    #   - For auto_deactivate=True groups, PG automatically performs synchronization and
-    #     failure reconciliation. Synchronization is handled by `sync_after_failure`, which
-    #     is also performed automatically when `auto_sync_on_failure` is enabled (the default).
-    #   - For auto_deactivate=False groups, synchronization and failure
-    #     reconciliation are entirely the user's responsibility.
-    survivors_synced.wait()
+    # sync_after_failure waits for the shared reconciliation decision even
+    # when membership is managed manually.  Its response applies the
+    # authoritative group view before returning, and the local failed-link
+    # observation must already be visible through get_peer_state().
+    sync_resp = pg.sync_after_failure(backend)
+    assert sync_resp.status in (
+        pg.SyncAfterFailureStatus.Reconciled,
+        pg.SyncAfterFailureStatus.NoPending,
+    ), f"rank {logical_rank}: sync_after_failure failed: {sync_resp.reject_reason}"
+    assert not pg.get_peer_state(backend, [BROKEN_RANK])[0], \
+        f"rank {logical_rank}: failed rank remained locally activatable after sync"
 
     # Survivors deactivate the dead rank before issuing new collectives.
     resp = pg.deactivate_ranks(backend, [BROKEN_RANK])
@@ -796,6 +820,26 @@ def _manual_deactivate_worker(
     assert int(tensor.cpu().item()) == expected_reduced
     assert pg.get_local_success(work), \
         f"rank {ctx.rank}: round 3 should succeed after manual deactivate"
+
+    if logical_rank == 0:
+        start_recovery.set()
+
+    wait_until(
+        lambda: pg.get_peer_state(backend, [BROKEN_RANK])[0],
+        timeout_s=30.0,
+        poll_interval_s=0.05,
+        description=f"rank {logical_rank} waiting for replacement",
+    )
+
+    resp = pg.recover_ranks(backend, [BROKEN_RANK])
+    assert resp.status == pg.ViewUpdateStatus.Applied, \
+        f"rank {logical_rank}: recover_ranks should apply, got {resp.status}"
+
+    tensor = torch.tensor(
+        [logical_rank + 1], dtype=torch.int32, device=device
+    )
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    assert int(tensor.cpu().item()) == expected_all
 
     ctx.record_result({"role": "survivor"})
 
@@ -978,21 +1022,23 @@ class _ElasticMixin:
         self.assertEqual(len(replacement_rows), 1)
         self.assertGreaterEqual(len(broken_rows), 1)
 
-    def test_manual_evict(self) -> None:
-        """Test multi-round manual evict with auto_deactivate_on_failure=False.
+    def test_manual_evict_recovery(self) -> None:
+        """Test manual evict and recovery with auto_deactivate disabled.
 
         Round 1: all healthy, failedRanks = all 0s.
-        Round 2: rank died, activeRanks unchanged, manually deactivate.
-        Round 3: after deactivate, collective succeeds with reduced group.
+        Round 2: rank dies; sync reconciles but leaves membership unchanged.
+        Round 3: manually deactivate and run with the reduced group.
+        Round 4: activate a replacement and run with the full group.
         """
         spawn_ctx = mp.get_context("spawn")
         broken_exited = spawn_ctx.Event()
-        survivors_synced = spawn_ctx.Barrier(self.world_size - 1)
+        start_recovery = spawn_ctx.Event()
 
         rows = self.spawn_backend_and_collect(
-            _manual_deactivate_worker,
+            _manual_deactivate_recovery_worker,
             broken_exited,
-            survivors_synced,
+            start_recovery,
+            nprocs=self.world_size + 1,
             timeout_s=30.0,
         )
 
@@ -1001,6 +1047,9 @@ class _ElasticMixin:
         # All survivors should complete
         survivor_rows = [r for r in rows if r.get("role") == "survivor"]
         self.assertEqual(len(survivor_rows), self.world_size - 1)
+
+        replacement_rows = [r for r in rows if r.get("role") == "replacement"]
+        self.assertEqual(len(replacement_rows), 1)
 
         # Broken rank should have exited (may not have result)
         broken_rows = [r for r in rows if r.get("role") == "broken"]

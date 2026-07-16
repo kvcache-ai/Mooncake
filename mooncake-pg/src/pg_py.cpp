@@ -296,8 +296,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("backend"));
 
     py::enum_<SyncAfterFailureStatus>(m, "SyncAfterFailureStatus")
-        .value("DecisionApplied", SyncAfterFailureStatus::DecisionApplied)
-        .value("NoChange", SyncAfterFailureStatus::NoChange)
+        .value("Reconciled", SyncAfterFailureStatus::Reconciled)
+        .value("NoPending", SyncAfterFailureStatus::NoPending)
         .value("Rejected", SyncAfterFailureStatus::Rejected);
 
     py::enum_<ViewUpdateStatus>(m, "ViewUpdateStatus")

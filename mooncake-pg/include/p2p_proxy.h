@@ -524,7 +524,7 @@ class P2PProxy {
     // Clean up the active op on a lane
     void cleanupFailedSendOp(SendOpContext& op_ctx);
     void cleanupFailedRecvOp(RecvOpContext& op_ctx);
-    // Reset P2P session and push transfer observation to Agent.
+    // Reset P2P session and push link event to Agent.
     void reportPeerFailure(int peer_rank);
     // Clean up, mark kFailed, and report the failure.
     void handleFailedSendOp(SendOpContext& op_ctx);

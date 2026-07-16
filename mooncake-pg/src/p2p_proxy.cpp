@@ -338,15 +338,13 @@ void P2PProxy::handleFailedSendOp(SendOpContext& op_ctx) {
     op_ctx.failed_ranks_hint_[op_ctx.peer_rank_] = 1;
     // Reset P2P session state (epoch, lanes).
     resetPeerState(op_ctx.peer_rank_);
-    // observation bit-vectors are indexed by GlobalRank.
+    // link event vector is indexed by GlobalRank.
     int32_t peer_global = meta_->rank_order[op_ctx.peer_rank_];
     if (meta_->backend) {
-        std::vector<uint8_t> attempted(kMaxNumRanks, 0);
-        std::vector<uint8_t> failed(kMaxNumRanks, 0);
-        attempted[peer_global] = 1;
-        failed[peer_global] = 1;
-        meta_->backend->getAgent().pushTransferObservation(std::move(attempted),
-                                                           std::move(failed));
+        LinkEvent event;
+        event.events.assign(kMaxNumRanks, LinkEvent::EventType::None);
+        event.events[peer_global] = LinkEvent::EventType::Failure;
+        meta_->backend->getAgent().pushLinkEvent(event);
     }
     op_ctx.status_->store(OpStatus::kFailed, std::memory_order_release);
     LOG(ERROR) << "Rank " << meta_->rank << ": P2P SendOp to peer "
@@ -359,15 +357,13 @@ void P2PProxy::handleFailedRecvOp(RecvOpContext& op_ctx) {
     op_ctx.failed_ranks_hint_[op_ctx.peer_rank_] = 1;
     // Reset P2P session state (epoch, lanes).
     resetPeerState(op_ctx.peer_rank_);
-    // observation bit-vectors are indexed by GlobalRank.
+    // link event vector is indexed by GlobalRank.
     int32_t peer_global = meta_->rank_order[op_ctx.peer_rank_];
     if (meta_->backend) {
-        std::vector<uint8_t> attempted(kMaxNumRanks, 0);
-        std::vector<uint8_t> failed(kMaxNumRanks, 0);
-        attempted[peer_global] = 1;
-        failed[peer_global] = 1;
-        meta_->backend->getAgent().pushTransferObservation(std::move(attempted),
-                                                           std::move(failed));
+        LinkEvent event;
+        event.events.assign(kMaxNumRanks, LinkEvent::EventType::None);
+        event.events[peer_global] = LinkEvent::EventType::Failure;
+        meta_->backend->getAgent().pushLinkEvent(event);
     }
     op_ctx.status_->store(OpStatus::kFailed, std::memory_order_release);
     LOG(ERROR) << "Rank " << meta_->rank << ": P2P RecvOp from peer "

@@ -19,9 +19,7 @@
 
 namespace mooncake {
 
-struct TELinkEvent {
-    enum class Kind { LinkUp, LinkDown };
-    Kind kind = Kind::LinkDown;
+struct TELinkUpEvent {
     GlobalRank peer = kInvalidGlobalRank;
 };
 
@@ -47,11 +45,13 @@ class LinkManager {
 
     void disconnect(GlobalRank peer);
 
+    void requestHealthCheck(GlobalRank peer);
+
     void stopReconnect(GlobalRank peer);
 
     bool isConnected(GlobalRank peer) const;
 
-    using EventCallback = std::function<void(TELinkEvent)>;
+    using EventCallback = std::function<void(TELinkUpEvent)>;
     void setEventCallback(EventCallback callback);
 
     std::optional<TransferMetadata::SegmentID> resolvePeer(
@@ -86,15 +86,19 @@ class LinkManager {
         bool skip_warmup = false;
 
         std::optional<TransferMetadata::SegmentID> target_id;
-        std::optional<BatchID> warmup_batch_id;
         uint64_t warmup_recv_addr = 0;
 
+        // Only meaningful while state == Connected; it does not prevent the
+        // application from resolving or using the existing target_id.
+        bool health_check_requested = false;
+
+        std::optional<BatchID> probe_batch_id;
         std::chrono::steady_clock::time_point next_probe_time;
-        std::chrono::milliseconds probe_backoff{1000};
         static constexpr auto kProbeBackoffMin =
             std::chrono::milliseconds(1000);
         static constexpr auto kProbeBackoffMax =
             std::chrono::milliseconds(10000);
+        std::chrono::milliseconds probe_backoff{kProbeBackoffMin};
     };
 
     std::vector<PeerLink> peers_;
@@ -131,9 +135,10 @@ class LinkManager {
     std::atomic<bool> shutdown_{false};
 
     void pollerLoop();
-    bool probePeer(GlobalRank peer);
+    bool advanceConnection(GlobalRank peer);
+    bool advanceHealthCheck(GlobalRank peer);
     void tearDownPeerLink(GlobalRank peer);
-    void emit(TELinkEvent event);
+    void emit(TELinkUpEvent event);
     void wakeup();
 
     static bool supportFabricMem();

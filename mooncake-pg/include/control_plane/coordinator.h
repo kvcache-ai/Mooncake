@@ -38,11 +38,8 @@ class CoordinatorStateMachine {
     virtual CoordinatorApplyResult<void> handleProposeViewUpdate(
         uint64_t propose_id, const ProposeViewUpdateRequest& req) = 0;
 
-    virtual CoordinatorApplyResult<void> handleTransferObservation(
-        const TransferObservationReport& req) = 0;
-
-    virtual CoordinatorApplyResult<void> handleLinkStateChange(
-        const LinkStateChangeReport& req) = 0;
+    virtual CoordinatorApplyResult<void> handleLinkEventReport(
+        const LinkEventReport& req) = 0;
 
     virtual CoordinatorApplyResult<void> handleSyncAfterFailure(
         uint64_t sync_id, const SyncAfterFailureRequest& req) = 0;
@@ -82,11 +79,8 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     CoordinatorApplyResult<void> handleProposeViewUpdate(
         uint64_t propose_id, const ProposeViewUpdateRequest& req) override;
 
-    CoordinatorApplyResult<void> handleTransferObservation(
-        const TransferObservationReport& req) override;
-
-    CoordinatorApplyResult<void> handleLinkStateChange(
-        const LinkStateChangeReport& req) override;
+    CoordinatorApplyResult<void> handleLinkEventReport(
+        const LinkEventReport& req) override;
 
     CoordinatorApplyResult<void> handleSyncAfterFailure(
         uint64_t sync_id, const SyncAfterFailureRequest& req) override;
@@ -117,6 +111,7 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
         uint64_t agent_session_epoch = 0;
         std::chrono::steady_clock::time_point last_heartbeat;
         std::vector<uint8_t> link_status;
+        uint64_t last_link_event_report_id = 0;
         uint64_t warmup_recv_addr = 0;
     };
 
@@ -149,24 +144,21 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
                        std::unordered_map<uint64_t, PendingViewUpdateBarrier>>
         pending_barriers_;
 
-    // Fault reconciliation window.  Transfer observations update link_status
-    // immediately, but the coordinator defers the membership decision until
-    // the window closes.
+    struct PendingSync {
+        uint64_t sync_id = 0;
+        uint64_t agent_session_epoch = 0;
+    };
+
+    using PendingSyncs = std::unordered_map<
+        GroupId, std::unordered_map<GlobalRank, std::vector<PendingSync>>>;
+
     struct FaultReconciliationContext {
         bool active = false;
         std::chrono::steady_clock::time_point deadline;
+        PendingSyncs pending_syncs;
     };
     FaultReconciliationContext reconciliation_ctx_;
     std::chrono::microseconds fault_reconciliation_window_;
-
-    // Pending sync-after-failure requests.  Keyed by group_id, each entry maps
-    // caller_rank -> list of sync_ids waiting for a decision for that group.
-    // Resolved ONLY when the caller ACKs the ViewUpdate that carries the
-    // decision (handleViewUpdateAck), or when the caller/group is removed and
-    // the sync is rejected.
-    std::unordered_map<GroupId,
-                       std::unordered_map<GlobalRank, std::vector<uint64_t>>>
-        pending_syncs_;
 
     static constexpr auto kProposeTimeout = std::chrono::seconds(2);
     static constexpr auto kHeartbeatTimeout = std::chrono::seconds(5);
@@ -187,11 +179,16 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     // An existing window is not extended.
     void tryOpenReconciliationWindow();
 
-    // Apply transfer observation to a reporter's link_status.
-    // Returns true when at least one peer was reported as failed.
-    bool applyLinkStatusUpdate(RankInfo& reporter,
-                               const std::vector<uint8_t>& attempted,
-                               const std::vector<uint8_t>& failed);
+    struct LinkEventReportApplyResult {
+        bool changed = false;
+        bool has_negative = false;
+    };
+    std::optional<LinkEventReportApplyResult> applyLinkEventReport(
+        RankInfo& reporter, const LinkEventReport& report);
+
+    SyncAfterFailureResponse makeSyncResponse(SyncAfterFailureStatus status,
+                                              GroupId group_id) const;
+    void resolvePendingSyncs(std::vector<CoordinatorEffect>& effects);
 
     bool isMutuallyConnected(GlobalRank a, GlobalRank b) const;
 
@@ -230,11 +227,10 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
 
     // Compute the ACK set for a ViewUpdate barrier (proposal, bootstrap, ...).
     std::unordered_set<GlobalRank> computeBarrierAckSet(
-        const GroupView& old_view, const GroupView& new_view,
-        GroupId group_id) const;
+        const GroupView& old_view, const GroupView& new_view) const;
 
     // Reject pending syncs for `group_id` / `group_id, rank`.
-    // Emits ReplySyncEffect for each pending sync_id.
+    // Emits ReplySync for each pending sync_id.
     void rejectPendingSyncs(GroupId group_id, GlobalRank rank,
                             const std::string& reason,
                             std::vector<CoordinatorEffect>& effects);

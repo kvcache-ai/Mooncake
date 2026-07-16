@@ -38,7 +38,7 @@ class MooncakeBackend;
 //   +-----------------+              +---------------------------+
 //   | proposeActivate |-> (sync) --->| call Coordinator RPC      |
 //   | registerGroup   |-> post() --->| agent_.registerGroup()    |
-//   | pushObservation |-> enqueue -->| observation_queue_        |
+//   | pushLinkEvent   |-> post() --->| agent_.pushLinkEvent()      |
 //   +-----------------+              +---------------------------+
 //                                            |
 //                                    SerializedExecutor (tick)
@@ -53,9 +53,8 @@ class MooncakeBackend;
 //                              +--------------------------------+
 //                              | runEffects()                   |
 //                              |  EnablePeerProbe -> LinkManager|
-//                              |  SendObservation -> RPC        |
+//                              |  SendLinkEventReport -> RPC    |
 //                              |  ApplyViewToBackend -> backend |
-//                              |  NotifyTEUnreachable -> fanout |
 //                              |              ...               |
 //                              +--------------------------------+
 
@@ -85,9 +84,7 @@ class AgentInterface {
     virtual ProposeViewUpdateResponse proposeDeactivate(
         GroupId group_id, const std::vector<GlobalRank>& ranks) = 0;
 
-    virtual void pushTransferObservation(
-        std::vector<uint8_t> attempted_ranks,
-        std::vector<uint8_t> failed_ranks_hint) = 0;
+    virtual void pushLinkEvent(const LinkEvent& event) = 0;
 
     virtual SyncAfterFailureResponse syncAfterFailure(GroupId group_id) = 0;
 
@@ -102,7 +99,8 @@ class AgentRpcServiceImpl : public AgentRpcService {
     explicit AgentRpcServiceImpl(AgentHost& host) : host_(host) {}
 
     void onPeerJoined(PeerJoinedPush push) override;
-    void onRankStateUpdate(RankStateUpdatePush push) override;
+    void onRankStateUpdate(RankStatePush push) override;
+    void onLinkEventReportAck(LinkEventReportAck ack) override;
     void onViewUpdate(coro_rpc::context<ViewUpdateAck> ctx,
                       ViewUpdatePush push) override;
 
@@ -146,9 +144,7 @@ class AgentHost : public AgentInterface {
     ProposeViewUpdateResponse proposeDeactivate(
         GroupId group_id, const std::vector<GlobalRank>& ranks) override;
 
-    void pushTransferObservation(
-        std::vector<uint8_t> attempted_ranks,
-        std::vector<uint8_t> failed_ranks_hint) override;
+    void pushLinkEvent(const LinkEvent& event) override;
 
     SyncAfterFailureResponse syncAfterFailure(GroupId group_id) override;
 
@@ -156,11 +152,12 @@ class AgentHost : public AgentInterface {
         return agent_.getAgentSessionEpoch();
     }
     void postPeerJoined(PeerJoinedPush push);
-    void postRankStateUpdate(RankStateUpdatePush push);
+    void postRankStateUpdate(RankStatePush push);
+    void postLinkEventReportAck(LinkEventReportAck ack);
     void postViewUpdate(coro_rpc::context<ViewUpdateAck> ctx,
                         ViewUpdatePush push);
 
-    void postTELinkEvent(TELinkEvent event);
+    void postLinkUpEvent(TELinkUpEvent event);
 
    private:
     AgentStateMachine agent_;
@@ -210,12 +207,10 @@ class AgentHost : public AgentInterface {
     // Accessed only from the executor thread.
     std::unordered_map<GroupId, MooncakeBackend*> backends_;
 
-    // Pending observation, merged on push by worker thread.
-    std::optional<TransferObservationEvent> pending_observation_;
-    std::mutex pending_observation_mutex_;
-
     void startAgentRegistration();
     void tick();
+
+    void sendLinkEventReport();
 
     void sendPublishEndpointRpc(GroupEndpointPublication endpoint);
 

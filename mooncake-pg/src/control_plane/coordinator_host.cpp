@@ -39,14 +39,8 @@ void CoordinatorRpcServiceImpl::publishEndpoint(
     host_.postPublishEndpoint(std::move(ctx), std::move(req));
 }
 
-void CoordinatorRpcServiceImpl::reportLinkStateChange(
-    LinkStateChangeReport req) {
-    host_.postLinkStateChange(std::move(req));
-}
-
-void CoordinatorRpcServiceImpl::reportTransferObservation(
-    TransferObservationReport req) {
-    host_.postTransferObservation(std::move(req));
+void CoordinatorRpcServiceImpl::reportLinkEvent(LinkEventReport req) {
+    host_.postLinkEventReport(std::move(req));
 }
 
 void CoordinatorRpcServiceImpl::syncAfterFailure(
@@ -71,17 +65,15 @@ CoordinatorHost::~CoordinatorHost() { shutdown(); }
 void CoordinatorHost::start() {
     rpc_server_ = std::make_unique<RpcServer>(/*port=*/0, /*thread_num=*/2);
     rpc_impl_ = std::make_unique<CoordinatorRpcServiceImpl>(*this);
-    rpc_server_
-        ->registerHandler<&CoordinatorRpcService::registerAgent,
-                          &CoordinatorRpcService::heartbeat,
-                          &CoordinatorRpcService::registerGroup,
-                          &CoordinatorRpcService::unregisterGroup,
-                          &CoordinatorRpcService::proposeViewUpdate,
-                          &CoordinatorRpcService::publishEndpoint,
-                          &CoordinatorRpcService::reportLinkStateChange,
-                          &CoordinatorRpcService::reportTransferObservation,
-                          &CoordinatorRpcService::syncAfterFailure>(
-            rpc_impl_.get());
+    rpc_server_->registerHandler<&CoordinatorRpcService::registerAgent,
+                                 &CoordinatorRpcService::heartbeat,
+                                 &CoordinatorRpcService::registerGroup,
+                                 &CoordinatorRpcService::unregisterGroup,
+                                 &CoordinatorRpcService::proposeViewUpdate,
+                                 &CoordinatorRpcService::publishEndpoint,
+                                 &CoordinatorRpcService::reportLinkEvent,
+                                 &CoordinatorRpcService::syncAfterFailure>(
+        rpc_impl_.get());
 
     bool server_started = rpc_server_->start();
     if (!server_started) {
@@ -110,8 +102,10 @@ void CoordinatorHost::shutdown() {
     pending_rpcs_.clear();
 
     for (auto& [sync_id, ctx] : pending_sync_ctxs_) {
-        ctx.response_msg(SyncAfterFailureResponse{
-            SyncAfterFailureStatus::Rejected, 0, "coordinator shutting down"});
+        SyncAfterFailureResponse response;
+        response.status = SyncAfterFailureStatus::Rejected;
+        response.reject_reason = "coordinator shutting down";
+        ctx.response_msg(std::move(response));
     }
     pending_sync_ctxs_.clear();
 
@@ -178,16 +172,9 @@ void CoordinatorHost::postPublishEndpoint(
         });
 }
 
-void CoordinatorHost::postTransferObservation(TransferObservationReport req) {
+void CoordinatorHost::postLinkEventReport(LinkEventReport req) {
     executor_.post([this, req = std::move(req)]() {
-        auto result = state_machine_.handleTransferObservation(req);
-        runEffects(result.effects);
-    });
-}
-
-void CoordinatorHost::postLinkStateChange(LinkStateChangeReport req) {
-    executor_.post([this, req = std::move(req)]() {
-        auto result = state_machine_.handleLinkStateChange(req);
+        auto result = state_machine_.handleLinkEventReport(req);
         runEffects(result.effects);
     });
 }
@@ -218,36 +205,44 @@ void CoordinatorHost::runEffects(
     for (const auto& effect : effects) {
         std::visit(
             overloaded{
-                [this](const RankStateUpdatePush& e) {
+                [this](const BroadcastRankState& e) {
                     for (int i = 0; i < max_world_size_; ++i) {
                         if (state_machine_.getRankState(i) !=
                             RankState::Offline) {
-                            pushToAgent<&AgentRpcService::onRankStateUpdate>(i,
-                                                                             e);
+                            pushToAgent<&AgentRpcService::onRankStateUpdate>(
+                                i, e.push);
                         }
                     }
                 },
-                [this](const ViewUpdateEffect& e) { pushViewUpdate(e); },
-                [this](const ReplyProposalEffect& e) {
+                [this](const PushViewUpdate& e) { pushViewUpdate(e); },
+                [this](const ReplyProposal& e) {
                     auto it = pending_rpcs_.find(e.propose_id);
                     if (it != pending_rpcs_.end()) {
                         it->second.response_msg(e.response);
                         pending_rpcs_.erase(it);
                     }
                 },
-                [this](const ReplySyncEffect& e) {
+                [this](const ReplySync& e) {
                     auto it = pending_sync_ctxs_.find(e.sync_id);
                     if (it != pending_sync_ctxs_.end()) {
                         it->second.response_msg(e.response);
                         pending_sync_ctxs_.erase(it);
                     }
                 },
-                [this](const PeerJoinedPush& e) {
+                [this](const BroadcastPeerJoined& e) {
                     for (int i = 0; i < max_world_size_; ++i) {
-                        if (i != e.rank && state_machine_.getRankState(i) !=
-                                               RankState::Offline) {
-                            pushToAgent<&AgentRpcService::onPeerJoined>(i, e);
+                        if (i != e.push.rank && state_machine_.getRankState(
+                                                    i) != RankState::Offline) {
+                            pushToAgent<&AgentRpcService::onPeerJoined>(i,
+                                                                        e.push);
                         }
+                    }
+                },
+                [this](const AckLinkEventReport& e) {
+                    if (state_machine_.getRankState(e.ack.rank) !=
+                        RankState::Offline) {
+                        pushToAgent<&AgentRpcService::onLinkEventReportAck>(
+                            e.ack.rank, e.ack);
                     }
                 },
             },
@@ -255,7 +250,7 @@ void CoordinatorHost::runEffects(
     }
 }
 
-void CoordinatorHost::pushViewUpdate(const ViewUpdateEffect& effect) {
+void CoordinatorHost::pushViewUpdate(const PushViewUpdate& effect) {
     ViewUpdatePush push{effect.view.group_id, effect.view};
     auto group_id = effect.view.group_id;
 
