@@ -6257,6 +6257,27 @@ bool MasterService::TryRestoreStateFromSnapshot(
             }
         }
 
+        {
+            // Rebuild file (SSD) total capacity from restored
+            // LocalDiskSegment instances, so that the SSD Storage
+            // denominator is correct after restore (matching the mem
+            // capacity rebuild above).
+            ScopedLocalDiskSegmentAccess local_disk_access =
+                segment_manager_.getLocalDiskSegmentAccess();
+            auto& client_local_disk =
+                local_disk_access.getClientLocalDiskSegment();
+            int64_t total_file_cap = 0;
+            for (const auto& [client_id, segment] : client_local_disk) {
+                if (segment && segment->ssd_total_capacity_bytes > 0) {
+                    MasterMetricManager::instance().inc_total_file_capacity(
+                        segment->ssd_total_capacity_bytes);
+                    total_file_cap += segment->ssd_total_capacity_bytes;
+                }
+            }
+            LOG(INFO) << "[Restore] Total file capacity after restore: "
+                      << total_file_cap;
+        }
+
         LOG(INFO) << "[Restore] Successfully restored state from snapshot: "
                   << state_id;
         return true;
@@ -6287,6 +6308,7 @@ void MasterService::ResetStateAfterFailedRestoreAttempt() {
 
     MasterMetricManager::instance().reset_allocated_mem_size();
     MasterMetricManager::instance().reset_total_mem_capacity();
+    MasterMetricManager::instance().reset_total_file_capacity();
     MasterMetricManager::instance().reset_cache_total_nums();
 }
 
