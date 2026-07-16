@@ -68,6 +68,19 @@ environment setup must be prepared separately.
 | Hygon DCU | `-DUSE_HYGON=ON` | Install DTK SDK. | Set `DTK_HOME`, or pass `-DDTK_ROOT=/path/to/dtk`. Use `-DDTK_INCLUDE_DIR` and `-DDTK_LIB_DIR` for custom layouts. |
 | Iluvatar CoreX | `-DUSE_COREX=ON` | Install CoreX SDK. | Set `COREX_HOME`, or pass `-DCOREX_ROOT=/path/to/corex`. Use `-DCOREX_INCLUDE_DIR` and `-DCOREX_LIB_DIR` for custom layouts. |
 
+```{admonition} NCCL host RMA constraints
+:class: important
+The first valid NCCL host WRITE freezes the ordered CUDA-buffer catalog before
+bootstrap. Registration and unregistration are not allowed afterward, even if
+bootstrap fails. Session initialization is attempted once for each
+endpoint/device pair. If the session reaches a terminal failure, it retains the
+error and subsequent transfers fail without retrying bootstrap. Recovery
+requires destroying and recreating the NCCL-only `TransferEngine` on both
+peers, then registering the buffers again. A one-sided restart is unsupported.
+Same-engine targets remain unsupported and should use
+the intra-node NVLink/P2P transport.
+```
+
 ```{admonition} NCCL DeviceTransport version contract
 :class: important
 Mooncake currently requires NCCL Device API device code, whether AOT-compiled

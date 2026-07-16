@@ -33,6 +33,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -225,10 +226,33 @@ int getPointerDevice(const void* ptr) {
     return attributes.device;
 }
 
+bool endpointLess(const std::string& local_name, int local_device,
+                  const std::string& peer_name, int peer_device) {
+    return std::tie(local_name, local_device) <
+           std::tie(peer_name, peer_device);
+}
+
+void destroyNcclSliceEvent(Transport::Slice* slice) {
+    if (!slice || !slice->nccl.event) return;
+
+    cudaEvent_t event = reinterpret_cast<cudaEvent_t>(slice->nccl.event);
+    const int device_id = slice->nccl.device_id;
+    // Relinquish slice ownership before calling CUDA so all later cleanup
+    // paths are idempotent even when CUDA reports an error.
+    slice->nccl.event = nullptr;
+    slice->nccl.device_id = -1;
+
+    int saved_device = -1;
+    cudaGetDevice(&saved_device);
+    if (device_id >= 0) cudaSetDevice(device_id);
+    cudaEventDestroy(event);
+    if (saved_device >= 0) cudaSetDevice(saved_device);
+}
+
 std::string makeSessionKey(const std::string& local_name, int local_device,
                            const std::string& peer_name, int peer_device) {
     std::ostringstream out;
-    if (local_name < peer_name) {
+    if (endpointLess(local_name, local_device, peer_name, peer_device)) {
         out << local_name << '#' << local_device << '|' << peer_name << '#'
             << peer_device;
     } else {
@@ -645,6 +669,7 @@ class NcclHostTransport::Impl {
             slice->ts = getCurrentTimeInNano();
             slice->nccl.event = nullptr;
             slice->nccl.device_id = -1;
+            slice->cleanup_callback = destroyNcclSliceEvent;
             task->slice_list.push_back(slice);
             __sync_fetch_and_add(&task->slice_count, 1);
 
@@ -716,15 +741,7 @@ class NcclHostTransport::Impl {
             }
 
             if (!error.empty()) {
-                if (slice->nccl.event) {
-                    int saved_device = -1;
-                    cudaGetDevice(&saved_device);
-                    cudaSetDevice(slice->nccl.device_id);
-                    cudaEventDestroy(
-                        reinterpret_cast<cudaEvent_t>(slice->nccl.event));
-                    if (saved_device >= 0) cudaSetDevice(saved_device);
-                    slice->nccl.event = nullptr;
-                }
+                destroyNcclSliceEvent(slice);
                 LOG(ERROR) << "[Host NCCL] submit failed: " << error;
                 slice->markFailed();
                 if (overall.ok()) overall = Status::Context(error);
@@ -748,13 +765,11 @@ class NcclHostTransport::Impl {
                 reinterpret_cast<cudaEvent_t>(slice->nccl.event);
             cudaError_t result = cudaEventQuery(event);
             if (result == cudaSuccess) {
-                cudaEventDestroy(event);
-                slice->nccl.event = nullptr;
+                destroyNcclSliceEvent(slice);
                 slice->markSuccess();
             } else if (result != cudaErrorNotReady) {
                 cudaGetLastError();
-                cudaEventDestroy(event);
-                slice->nccl.event = nullptr;
+                destroyNcclSliceEvent(slice);
                 slice->markFailed();
             }
             if (saved_device >= 0) cudaSetDevice(saved_device);
@@ -777,11 +792,11 @@ class NcclHostTransport::Impl {
         if (!result) return false;
         auto segment = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
         if (!segment) return false;
-        auto it = std::find_if(
-            segment->buffers.begin(), segment->buffers.end(),
-            [addr](const BufferDesc& buffer) {
-                return buffer.addr == reinterpret_cast<uint64_t>(addr);
-            });
+        auto it = std::find_if(segment->buffers.begin(), segment->buffers.end(),
+                               [addr](const BufferDesc& buffer) {
+                                   return buffer.addr ==
+                                          reinterpret_cast<uint64_t>(addr);
+                               });
         if (it == segment->buffers.end()) return false;
         *result = *it;
         return true;
@@ -991,6 +1006,9 @@ class NcclHostTransport::Impl {
             }
         }
         if (existing) {
+            // NCCL communicator/window initialization is collective. Retain a
+            // terminally failed session rather than letting one endpoint retry
+            // a new collective generation without coordinating its peer.
             if (!existing->waitReady(error)) return nullptr;
             return existing;
         }
@@ -1000,7 +1018,10 @@ class NcclHostTransport::Impl {
             if (error) *error = "No NCCL buffers registered on local device";
             return nullptr;
         }
-        const int local_rank = local_server_name_ < peer_name ? 0 : 1;
+        const int local_rank = endpointLess(local_server_name_, local_device,
+                                            peer_name, peer_device)
+                                   ? 0
+                                   : 1;
         ncclUniqueId unique_id{};
         std::string unique_id_string;
         if (local_rank == 0 && !selectBootstrapId(key, "", true, &unique_id,
@@ -1128,7 +1149,10 @@ class NcclHostTransport::Impl {
                            error)) {
             return -1;
         }
-        const int local_rank = local_server_name_ < peer_name ? 0 : 1;
+        const int local_rank = endpointLess(local_server_name_, local_device,
+                                            peer_name, peer_device)
+                                   ? 0
+                                   : 1;
 
         const std::string key = makeSessionKey(local_server_name_, local_device,
                                                peer_name, peer_device);

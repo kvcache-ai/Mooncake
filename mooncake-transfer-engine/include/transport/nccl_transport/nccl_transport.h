@@ -32,6 +32,14 @@ namespace mooncake {
 // buffers become one NCCL symmetric window; ncclMemAlloc is the supported
 // allocation path. Both endpoints must remain available while the first
 // transfer initializes the peer session and its collective symmetric windows.
+// The first valid WRITE freezes the registered-buffer catalog before bootstrap,
+// so registration cannot change afterward even if bootstrap fails. Session
+// initialization is attempted once per endpoint/device pair. A terminal
+// session failure remains cached, and later transfers return that error
+// without retrying bootstrap. Recovery requires recreating the NCCL transport
+// (normally its TransferEngine instance) on both peers and registering the
+// buffers again; one-sided restart is unsupported.
+//
 // Only WRITE is supported; it uses ncclPutSignal. NCCL 2.30 has no public host
 // Get operation, so READ is rejected with Status::NotSupportedTransport
 // without submitting an NCCL operation.
