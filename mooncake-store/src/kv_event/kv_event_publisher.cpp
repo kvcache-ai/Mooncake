@@ -171,10 +171,9 @@ void KvEventPublisher::PublishStored(const std::string& object_key,
     state.context = BuildEventContext(object_key);
     state.media.insert(medium);
     std::vector<PendingEvent> events;
-    events.push_back(PendingEvent{EventKind::kStored, object_key, medium,
-                                  normalized_tenant,
-                                  ResolveGroupId(group_id, state.context),
-                                  state.context});
+    events.push_back(
+        PendingEvent{EventKind::kStored, object_key, medium, normalized_tenant,
+                     ResolveGroupId(group_id, state.context), state.context});
     EnqueueBatch(std::move(events));
 }
 
@@ -203,12 +202,9 @@ void KvEventPublisher::PublishRemoved(const std::string& object_key,
         object_states_.erase(normalized_tenant);
     }
     std::vector<PendingEvent> events;
-    events.push_back(PendingEvent{EventKind::kRemoved,
-                                  object_key,
-                                  medium,
-                                  normalized_tenant,
-                                  ResolveGroupId(group_id, context),
-                                  std::move(context)});
+    events.push_back(
+        PendingEvent{EventKind::kRemoved, object_key, medium, normalized_tenant,
+                     ResolveGroupId(group_id, context), std::move(context)});
     EnqueueBatch(std::move(events));
 }
 
@@ -250,12 +246,9 @@ void KvEventPublisher::PublishCommitted(
     std::vector<PendingEvent> events;
     for (const auto& medium : SortedMedia(previous_media)) {
         if (!new_media.contains(medium)) {
-            events.push_back(PendingEvent{EventKind::kRemoved,
-                                          object_key,
-                                          medium,
-                                          normalized_tenant,
-                                          event_group_id,
-                                          context});
+            events.push_back(PendingEvent{EventKind::kRemoved, object_key,
+                                          medium, normalized_tenant,
+                                          event_group_id, context});
         }
     }
     for (const auto& medium : SortedMedia(new_media)) {
@@ -307,11 +300,8 @@ void KvEventPublisher::PublishObjectRemoved(
     std::vector<PendingEvent> events;
     const std::string event_group_id = ResolveGroupId(group_id, context);
     for (const auto& medium : SortedMedia(previous_media)) {
-        events.push_back(PendingEvent{EventKind::kRemoved,
-                                      object_key,
-                                      medium,
-                                      normalized_tenant,
-                                      event_group_id,
+        events.push_back(PendingEvent{EventKind::kRemoved, object_key, medium,
+                                      normalized_tenant, event_group_id,
                                       context});
     }
 
@@ -349,22 +339,16 @@ void KvEventPublisher::SyncObjectState(
     std::vector<PendingEvent> events;
     for (const auto& medium : SortedMedia(previous_media)) {
         if (!new_media.contains(medium)) {
-            events.push_back(PendingEvent{EventKind::kRemoved,
-                                          object_key,
-                                          medium,
-                                          normalized_tenant,
-                                          event_group_id,
-                                          context});
+            events.push_back(PendingEvent{EventKind::kRemoved, object_key,
+                                          medium, normalized_tenant,
+                                          event_group_id, context});
         }
     }
     for (const auto& medium : SortedMedia(new_media)) {
         if (!previous_media.contains(medium)) {
-            events.push_back(PendingEvent{EventKind::kStored,
-                                          object_key,
-                                          medium,
-                                          normalized_tenant,
-                                          event_group_id,
-                                          context});
+            events.push_back(PendingEvent{EventKind::kStored, object_key,
+                                          medium, normalized_tenant,
+                                          event_group_id, context});
         }
     }
 
@@ -542,10 +526,9 @@ void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
                       : (is_cleared ? "AllBlocksCleared" : "BlockRemoved");
         const std::string& tenant_id =
             item.pending.tenant_id.empty() ? "default" : item.pending.tenant_id;
-        const std::string& model_name =
-            item.pending.context.model_name.empty()
-                ? config_.model_name
-                : item.pending.context.model_name;
+        const std::string& model_name = item.pending.context.model_name.empty()
+                                            ? config_.model_name
+                                            : item.pending.context.model_name;
 
         const size_t connector_metadata_fields =
             static_cast<size_t>(

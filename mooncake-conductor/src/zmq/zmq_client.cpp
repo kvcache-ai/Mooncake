@@ -1,8 +1,11 @@
 #include "conductor/zmq/zmq_client.h"
 
 #include <glog/logging.h>
+#include <zmq_addon.hpp>
 
+#include <iterator>
 #include <utility>
+#include <vector>
 
 #include "conductor/zmq/msg_decoder.h"
 
@@ -52,7 +55,9 @@ std::string ZMQClient::Start() {
 
     loop_thread_ = std::thread([this] { Loop(); });
 
-    LOG(INFO) << "ZMQ client started service=" << config_.cache_pool_key;
+    LOG(INFO) << "ZMQ client started service=" << config_.cache_pool_key
+              << " endpoint=" << config_.endpoint << " publisher_kind="
+              << common::PublisherKindName(config_.publisher_kind);
     return "";
 }
 
@@ -118,7 +123,7 @@ void ZMQClient::HandleReconnect() {
     }
 
     const int64_t last_seq = GetLastSequence();
-    if (last_seq >= 0) {
+    if (last_seq >= 0 && !config_.replay_endpoint.empty()) {
         LOG(INFO) << "Reconnected service=" << config_.cache_pool_key
                   << " resuming_from=" << (last_seq + 1);
         if (auto err = RequestReplay(last_seq + 1); !err.empty()) {
@@ -148,13 +153,14 @@ std::string ZMQClient::Connect() {
         // Important: Subscribe to all topics
         sock->set(::zmq::sockopt::subscribe, "");
 
-        auto replay_socket = std::make_unique<::zmq::socket_t>(
-            zmq_context_, ::zmq::socket_type::dealer);
-        replay_socket->set(::zmq::sockopt::ipv6, 1);
-        replay_socket->connect(config_.replay_endpoint);
-
         sub_socket_ = std::move(sock);
-        replay_socket_ = std::move(replay_socket);
+        if (!config_.replay_endpoint.empty()) {
+            auto replay_socket = std::make_unique<::zmq::socket_t>(
+                zmq_context_, ::zmq::socket_type::dealer);
+            replay_socket->set(::zmq::sockopt::ipv6, 1);
+            replay_socket->connect(config_.replay_endpoint);
+            replay_socket_ = std::move(replay_socket);
+        }
         connected_ = true;
 
         reconnect_delay_ = config_.reconnect_delay;
@@ -164,8 +170,11 @@ std::string ZMQClient::Connect() {
                e.what();
     }
 
-    LOG(INFO) << "Successfully connected to vLLM publisher service="
-              << config_.cache_pool_key << " endpoint=" << config_.endpoint;
+    LOG(INFO) << "Successfully connected to publisher service="
+              << config_.cache_pool_key << " endpoint=" << config_.endpoint
+              << " publisher_kind="
+              << common::PublisherKindName(config_.publisher_kind)
+              << " live_only=" << config_.replay_endpoint.empty();
 
     return "";
 }
@@ -213,21 +222,28 @@ std::string ZMQClient::ProcessMessage() {
         return "socket is nil";
     }
 
-    // Read Frames: [Topic, Seq, Payload]
-    ::zmq::message_t topic_msg, seq_msg, payload_msg;
+    // Once the first frame is readable, the complete multipart message is
+    // available. Consume it through the final frame so malformed frame counts
+    // cannot block shutdown or leak a tail into the next message.
+    std::vector<::zmq::message_t> frames;
     try {
-        if (!socket->recv(topic_msg, ::zmq::recv_flags::none)) {
-            return "failed to receive topic frame";
-        }
-        if (!socket->recv(seq_msg, ::zmq::recv_flags::none)) {
-            return "failed to receive seq frame";
-        }
-        if (!socket->recv(payload_msg, ::zmq::recv_flags::none)) {
-            return "failed to receive payload frame";
+        const auto frame_count = ::zmq::recv_multipart(
+            *socket, std::back_inserter(frames), ::zmq::recv_flags::none);
+        if (!frame_count) {
+            return "failed to receive multipart message";
         }
     } catch (const ::zmq::error_t& e) {
         return std::string("recv error: ") + e.what();
     }
+
+    if (frames.size() != 3) {
+        return "invalid multipart frame count: expected 3, got " +
+               std::to_string(frames.size());
+    }
+
+    auto& topic_msg = frames[0];
+    auto& seq_msg = frames[1];
+    auto& payload_msg = frames[2];
 
     if (seq_msg.size() != 8) {
         return "invalid sequence length";
@@ -256,31 +272,48 @@ std::string ZMQClient::ProcessMessage() {
 
     const std::string topic(static_cast<const char*>(topic_msg.data()),
                             topic_msg.size());
-    VLOG(1) << "enter deal topic topic=" << topic;
+    const MessageMetadata metadata{
+        .publisher_kind = config_.publisher_kind,
+        .endpoint = config_.endpoint,
+        .topic = topic,
+        .sequence = seq,
+    };
 
-    EventBatchResult decoded;
-    if (topic == "mooncake") {
-        decoded = DecodeMooncakeEventBatch(
+    DecodedBatch batch;
+    std::string decode_error;
+    if (config_.publisher_kind == common::PublisherKind::kMooncake) {
+        auto decoded = DecodeMooncakeEventBatch(
             static_cast<const char*>(payload_msg.data()), payload_msg.size());
-    } else {
-        decoded = DecodeVllmEventBatch(
-            static_cast<const char*>(payload_msg.data()), payload_msg.size());
-    }
-    if (!decoded.ok) {
-        return "decode failed: " + decoded.error;
-    }
-
-    for (auto& event : decoded.batch.events) {
-        // Inject Source Name
-        std::visit([this](auto& e) { e.pod_name = config_.cache_pool_key; },
-                   event);
-
-        if (auto err = event_handler_->HandleEvent(
-                event, decoded.batch.data_parallel_rank);
-            !err.empty()) {
-            LOG(ERROR) << "Handler error service=" << config_.cache_pool_key
-                       << " error=" << err;
+        if (decoded.ok) {
+            batch = std::move(decoded.batch);
+        } else {
+            decode_error = std::move(decoded.error);
         }
+    } else {
+        auto decoded = DecodeVllmEventBatch(
+            static_cast<const char*>(payload_msg.data()), payload_msg.size());
+        if (decoded.ok) {
+            batch = std::move(decoded.batch);
+        } else {
+            decode_error = std::move(decoded.error);
+        }
+    }
+    if (!decode_error.empty()) {
+        LOG(WARNING) << "Rejected KV event envelope endpoint="
+                     << metadata.endpoint << " topic=" << metadata.topic
+                     << " seq=" << metadata.sequence << " publisher_kind="
+                     << common::PublisherKindName(metadata.publisher_kind)
+                     << " error=" << decode_error;
+        return "";
+    }
+    if (event_handler_ == nullptr) {
+        return "event handler is nil";
+    }
+    if (auto err = event_handler_->HandleBatch(batch, metadata); !err.empty()) {
+        LOG(ERROR) << "Handler error service=" << config_.cache_pool_key
+                   << " endpoint=" << metadata.endpoint
+                   << " topic=" << metadata.topic
+                   << " seq=" << metadata.sequence << " error=" << err;
     }
 
     VLOG(1) << "Processed batch service=" << config_.cache_pool_key

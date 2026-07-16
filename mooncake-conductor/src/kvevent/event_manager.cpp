@@ -5,9 +5,15 @@
 #include <csignal>
 #include <ylt/coro_http/coro_http_server.hpp>
 
+#include <algorithm>
 #include <chrono>
+#include <limits>
+#include <optional>
+#include <set>
 #include <thread>
 #include <utility>
+
+#include "conductor/prefixindex/hash_strategy.h"
 
 namespace conductor {
 namespace kvevent {
@@ -21,6 +27,46 @@ using coro_http::status_type;
 constexpr const char* kTextPlain = "text/plain; charset=utf-8";
 constexpr const char* kApplicationJson = "application/json";
 
+prefixindex::ContextKey ContextFromService(
+    const common::ServiceConfig& service) {
+    return {.tenant_id = service.tenant_id,
+            .model_name = service.model_name,
+            .lora_name = service.lora_name,
+            .block_size = service.block_size};
+}
+
+prefixindex::HashProfile ProfileFromService(
+    const common::ServiceConfig& service) {
+    return {.strategy = service.hash_profile.strategy,
+            .algorithm = service.hash_profile.algorithm,
+            .root_digest = service.hash_profile.root_digest,
+            .index_projection = service.hash_profile.index_projection};
+}
+
+prefixindex::EngineRegistration RegistrationFromService(
+    const common::ServiceConfig& service) {
+    return {.context = ContextFromService(service),
+            .profile = ProfileFromService(service),
+            .instance_id = service.instance_id,
+            .dp_rank = service.dp_rank,
+            .effective_block_size = service.block_size,
+            .cache_group = service.cache_group};
+}
+
+bool JsonInt64(const Json::Value& value, int64_t* out) {
+    if (value.type() == Json::intValue) {
+        *out = value.asInt64();
+        return true;
+    }
+    if (value.type() == Json::uintValue &&
+        value.asUInt64() <=
+            static_cast<Json::UInt64>(std::numeric_limits<int64_t>::max())) {
+        *out = static_cast<int64_t>(value.asUInt64());
+        return true;
+    }
+    return false;
+}
+
 // Writes an error response: text/plain body with trailing \n.
 void HttpError(coro_http_response& resp, status_type status,
                const std::string& message) {
@@ -28,25 +74,209 @@ void HttpError(coro_http_response& resp, status_type status,
     resp.set_status_and_content(status, message + "\n");
 }
 
-void HttpJson(coro_http_response& resp, const Json::Value& value) {
+void HttpJson(coro_http_response& resp, status_type status,
+              const Json::Value& value) {
     Json::StreamWriterBuilder wb;
     wb["indentation"] = "";
     // JSON-encoded output terminates with a trailing '\n' (wire contract).
     resp.add_header("Content-Type", kApplicationJson);
-    resp.set_status_and_content(status_type::ok,
-                                Json::writeString(wb, value) + "\n");
+    resp.set_status_and_content(status, Json::writeString(wb, value) + "\n");
+}
+
+void HttpJson(coro_http_response& resp, const Json::Value& value) {
+    HttpJson(resp, status_type::ok, value);
+}
+
+void HttpJsonError(coro_http_response& resp, const char* reason,
+                   const std::string& message, const char* field = nullptr,
+                   std::optional<size_t> index = std::nullopt) {
+    Json::Value error(Json::objectValue);
+    error["error"] = message;
+    error["reason"] = reason;
+    if (field != nullptr) {
+        error["field"] = field;
+    }
+    if (index.has_value()) {
+        error["index"] = Json::Value::UInt64(*index);
+    }
+    HttpJson(resp, status_type::bad_request, error);
+}
+
+bool RejectUnknownFields(const Json::Value& body,
+                         const std::set<std::string>& allowed,
+                         coro_http_response& resp) {
+    for (const std::string& name : body.getMemberNames()) {
+        if (!allowed.contains(name)) {
+            HttpJsonError(resp, "unknown_field",
+                          "unsupported request field: " + name, name.c_str());
+            return false;
+        }
+    }
+    return true;
+}
+
+bool RequiredString(const Json::Value& body, const char* field,
+                    coro_http_response& resp, std::string* out) {
+    if (!body.isMember(field)) {
+        HttpJsonError(resp, "missing", std::string(field) + " is required",
+                      field);
+        return false;
+    }
+    if (!body[field].isString()) {
+        HttpJsonError(resp, "invalid_type",
+                      std::string(field) + " must be a string", field);
+        return false;
+    }
+    *out = body[field].asString();
+    if (out->empty()) {
+        HttpJsonError(resp, "invalid_value",
+                      std::string(field) + " must not be empty", field);
+        return false;
+    }
+    return true;
+}
+
+bool OptionalStringStrict(const Json::Value& body, const char* field,
+                          const std::string& fallback, coro_http_response& resp,
+                          std::string* out) {
+    if (!body.isMember(field)) {
+        *out = fallback;
+        return true;
+    }
+    if (!body[field].isString()) {
+        HttpJsonError(resp, "invalid_type",
+                      std::string(field) + " must be a string", field);
+        return false;
+    }
+    *out = body[field].asString();
+    return true;
+}
+
+bool RequiredPositiveInt64(const Json::Value& body, const char* field,
+                           coro_http_response& resp, int64_t* out) {
+    if (!body.isMember(field)) {
+        HttpJsonError(resp, "missing", std::string(field) + " is required",
+                      field);
+        return false;
+    }
+    if (!JsonInt64(body[field], out)) {
+        HttpJsonError(resp, "invalid_type",
+                      std::string(field) + " must be an integer", field);
+        return false;
+    }
+    if (*out <= 0) {
+        HttpJsonError(resp, "out_of_range",
+                      std::string(field) + " must be greater than zero", field);
+        return false;
+    }
+    return true;
+}
+
+bool ParseOptionalCacheGroup(const Json::Value& body, coro_http_response& resp,
+                             std::optional<int64_t>* cache_group) {
+    if (!body.isMember("cache_group") || body["cache_group"].isNull()) {
+        cache_group->reset();
+        return true;
+    }
+    int64_t value = 0;
+    if (!JsonInt64(body["cache_group"], &value)) {
+        HttpJsonError(resp, "invalid_type",
+                      "cache_group must be an integer or null", "cache_group");
+        return false;
+    }
+    if (value != 0) {
+        HttpJsonError(resp, "unsupported", "only cache group zero is supported",
+                      "cache_group");
+        return false;
+    }
+    *cache_group = value;
+    return true;
+}
+
+bool ParseHashProfileConfig(const Json::Value& body, coro_http_response& resp,
+                            common::HashProfileConfig* profile) {
+    if (!body.isMember("hash_profile")) {
+        HttpJsonError(resp, "missing", "hash_profile is required",
+                      "hash_profile");
+        return false;
+    }
+    const Json::Value& value = body["hash_profile"];
+    if (!value.isObject()) {
+        HttpJsonError(resp, "invalid_type", "hash_profile must be an object",
+                      "hash_profile");
+        return false;
+    }
+    static const std::set<std::string> kAllowedProfileFields = {
+        "algorithm", "index_projection", "root_digest", "strategy"};
+    if (!RejectUnknownFields(value, kAllowedProfileFields, resp)) {
+        return false;
+    }
+    return RequiredString(value, "strategy", resp, &profile->strategy) &&
+           RequiredString(value, "algorithm", resp, &profile->algorithm) &&
+           RequiredString(value, "root_digest", resp, &profile->root_digest) &&
+           RequiredString(value, "index_projection", resp,
+                          &profile->index_projection);
+}
+
+std::string ValidateServiceConfig(const common::ServiceConfig& service) {
+    if (service.endpoint.empty()) {
+        return "endpoint is required";
+    }
+    if (service.model_name.empty()) {
+        return "modelname is required";
+    }
+    if (service.tenant_id.empty()) {
+        return "tenant_id must not be empty after normalization";
+    }
+    if (service.block_size <= 0) {
+        return "block_size must be greater than zero";
+    }
+    if (service.dp_rank < 0) {
+        return "dp_rank must be non-negative";
+    }
+    if (service.cache_group.has_value() && *service.cache_group != 0) {
+        return "only cache group zero is supported";
+    }
+    if (service.publisher_kind == common::PublisherKind::kVllm) {
+        if (service.instance_id.empty()) {
+            return "instance_id is required for vLLM";
+        }
+        return prefixindex::PrefixCacheTable::ValidateRegistration(
+                   RegistrationFromService(service))
+            .error;
+    }
+    if (service.publisher_kind == common::PublisherKind::kMooncake) {
+        return prefixindex::ValidateHashProfile(ProfileFromService(service));
+    }
+    return "unsupported publisher kind";
+}
+
+bool ParseJsonObject(coro_http_request& req, Json::Value* out,
+                     std::string* errors, bool strict = false) {
+    Json::CharReaderBuilder rb;
+    if (strict) {
+        rb["allowComments"] = false;
+        rb["allowTrailingCommas"] = false;
+        rb["failIfExtra"] = true;
+    }
+    const auto body = req.get_body();
+    std::unique_ptr<Json::CharReader> reader(rb.newCharReader());
+    if (!reader->parse(body.data(), body.data() + body.size(), out, errors)) {
+        return false;
+    }
+    if (!out->isObject()) {
+        *errors = "request body must be a JSON object";
+        return false;
+    }
+    return true;
 }
 
 // Parses a request body as a JSON object. Returns false (and writes the
 // 400 response) on malformed JSON.
 bool ParseJsonBody(coro_http_request& req, coro_http_response& resp,
                    const char* what, Json::Value* out) {
-    Json::CharReaderBuilder rb;
     std::string errs;
-    const auto body = req.get_body();
-    std::unique_ptr<Json::CharReader> reader(rb.newCharReader());
-    if (!reader->parse(body.data(), body.data() + body.size(), out, &errs) ||
-        !out->isObject()) {
+    if (!ParseJsonObject(req, out, &errs)) {
         LOG(ERROR) << "Failed to decode " << what << " JSON err=" << errs;
         HttpError(resp, status_type::bad_request, "Invalid JSON");
         return false;
@@ -54,19 +284,182 @@ bool ParseJsonBody(coro_http_request& req, coro_http_response& resp,
     return true;
 }
 
-// Optional-string semantics: an absent or non-string field falls back.
-std::string OptionalString(const Json::Value& obj, const char* key,
-                           const std::string& fallback) {
-    if (obj.isMember(key) && obj[key].isString()) {
-        return obj[key].asString();
+bool ParseQueryJsonBody(coro_http_request& req, coro_http_response& resp,
+                        Json::Value* out) {
+    std::string errs;
+    if (!ParseJsonObject(req, out, &errs, true)) {
+        LOG(ERROR) << "Failed to decode query JSON err=" << errs;
+        HttpJsonError(resp, "invalid_json", "Invalid JSON object");
+        return false;
     }
-    return fallback;
+    return true;
 }
 
-// tenant_id: absent-or-empty falls back to the default ("" also falls back).
-std::string TenantOrDefault(const Json::Value& obj) {
-    const std::string t = OptionalString(obj, "tenant_id", "");
-    return t.empty() ? "default" : t;
+bool ParseQueryTokenIds(const Json::Value& body, coro_http_response& resp,
+                        std::vector<int32_t>* token_ids) {
+    if (!body.isMember("token_ids")) {
+        HttpJsonError(resp, "missing", "token_ids is required", "token_ids");
+        return false;
+    }
+
+    const Json::Value& values = body["token_ids"];
+    if (!values.isArray()) {
+        HttpJsonError(resp, "not_array", "token_ids must be an array",
+                      "token_ids");
+        return false;
+    }
+
+    token_ids->clear();
+    token_ids->reserve(values.size());
+    for (Json::ArrayIndex index = 0; index < values.size(); ++index) {
+        const Json::Value& value = values[index];
+        int32_t token_id = 0;
+        if (value.type() == Json::intValue) {
+            const Json::Int64 signed_value = value.asInt64();
+            if (signed_value < std::numeric_limits<int32_t>::min() ||
+                signed_value > std::numeric_limits<int32_t>::max()) {
+                HttpJsonError(resp, "out_of_range",
+                              "token_ids element is outside the int32 range",
+                              "token_ids", index);
+                return false;
+            }
+            token_id = static_cast<int32_t>(signed_value);
+        } else if (value.type() == Json::uintValue) {
+            const Json::UInt64 unsigned_value = value.asUInt64();
+            if (unsigned_value > static_cast<Json::UInt64>(
+                                     std::numeric_limits<int32_t>::max())) {
+                HttpJsonError(resp, "out_of_range",
+                              "token_ids element is outside the int32 range",
+                              "token_ids", index);
+                return false;
+            }
+            token_id = static_cast<int32_t>(unsigned_value);
+        } else {
+            HttpJsonError(resp, "invalid_type",
+                          "token_ids element must be a JSON integer",
+                          "token_ids", index);
+            return false;
+        }
+        token_ids->push_back(token_id);
+    }
+    return true;
+}
+
+struct QueryRequest {
+    prefixindex::ContextKey context;
+    std::vector<int32_t> token_ids;
+    std::optional<std::string> cache_salt;
+    std::optional<std::string> instance_filter;
+};
+
+bool ParseQueryRequest(const Json::Value& body, coro_http_response& resp,
+                       QueryRequest* request) {
+    static const std::set<std::string> kAllowedFields = {
+        "block_size", "cache_salt", "instance_id", "lora_name",
+        "model",      "tenant_id",  "token_ids"};
+    if (!RejectUnknownFields(body, kAllowedFields, resp)) {
+        return false;
+    }
+
+    if (!RequiredString(body, "model", resp, &request->context.model_name) ||
+        !RequiredPositiveInt64(body, "block_size", resp,
+                               &request->context.block_size) ||
+        !ParseQueryTokenIds(body, resp, &request->token_ids) ||
+        !OptionalStringStrict(body, "tenant_id", "default", resp,
+                              &request->context.tenant_id) ||
+        !OptionalStringStrict(body, "lora_name", "", resp,
+                              &request->context.lora_name)) {
+        return false;
+    }
+    if (request->context.tenant_id.empty()) {
+        request->context.tenant_id = "default";
+    }
+
+    request->cache_salt.reset();
+    if (body.isMember("cache_salt") && !body["cache_salt"].isNull()) {
+        if (!body["cache_salt"].isString()) {
+            HttpJsonError(resp, "invalid_type",
+                          "cache_salt must be a string or null", "cache_salt");
+            return false;
+        }
+        const std::string value = body["cache_salt"].asString();
+        if (!value.empty()) {
+            request->cache_salt = value;
+        }
+    }
+
+    request->instance_filter.reset();
+    if (body.isMember("instance_id")) {
+        if (!body["instance_id"].isString()) {
+            HttpJsonError(resp, "invalid_type", "instance_id must be a string",
+                          "instance_id");
+            return false;
+        }
+        request->instance_filter = body["instance_id"].asString();
+    }
+    return true;
+}
+
+bool ParseServiceConfigRequest(const Json::Value& body,
+                               coro_http_response& resp,
+                               common::ServiceConfig* service) {
+    static const std::set<std::string> kAllowedFields = {
+        "block_size",      "cache_group", "dp_rank",   "endpoint",
+        "hash_profile",    "instance_id", "lora_name", "modelname",
+        "replay_endpoint", "tenant_id",   "type"};
+    std::string publisher_type;
+    if (!RejectUnknownFields(body, kAllowedFields, resp) ||
+        !RequiredString(body, "endpoint", resp, &service->endpoint) ||
+        !RequiredString(body, "type", resp, &publisher_type) ||
+        !RequiredString(body, "modelname", resp, &service->model_name) ||
+        !RequiredString(body, "instance_id", resp, &service->instance_id) ||
+        !RequiredPositiveInt64(body, "block_size", resp,
+                               &service->block_size) ||
+        !OptionalStringStrict(body, "replay_endpoint", "", resp,
+                              &service->replay_endpoint) ||
+        !OptionalStringStrict(body, "lora_name", "", resp,
+                              &service->lora_name) ||
+        !OptionalStringStrict(body, "tenant_id", "default", resp,
+                              &service->tenant_id) ||
+        !ParseOptionalCacheGroup(body, resp, &service->cache_group) ||
+        !ParseHashProfileConfig(body, resp, &service->hash_profile)) {
+        return false;
+    }
+    const auto publisher_kind = common::ParsePublisherKind(publisher_type);
+    if (!publisher_kind.has_value()) {
+        HttpJsonError(resp, "invalid_value", "type must be vLLM or Mooncake",
+                      "type");
+        return false;
+    }
+    service->publisher_kind = *publisher_kind;
+    if (service->tenant_id.empty()) {
+        service->tenant_id = "default";
+    }
+
+    if (!body.isMember("dp_rank")) {
+        HttpJsonError(resp, "missing", "dp_rank is required", "dp_rank");
+        return false;
+    }
+    int64_t dp_rank = 0;
+    if (!JsonInt64(body["dp_rank"], &dp_rank)) {
+        HttpJsonError(resp, "invalid_type", "dp_rank must be an integer",
+                      "dp_rank");
+        return false;
+    }
+    if (dp_rank < 0 ||
+        dp_rank > static_cast<int64_t>(std::numeric_limits<int>::max())) {
+        HttpJsonError(resp, "out_of_range",
+                      "dp_rank must be a non-negative int", "dp_rank");
+        return false;
+    }
+    service->dp_rank = static_cast<int>(dp_rank);
+
+    if (const std::string error = ValidateServiceConfig(*service);
+        !error.empty()) {
+        HttpJsonError(resp, "invalid_registration", error);
+        return false;
+    }
+    return true;
 }
 
 Json::Value CacheHitResultToJson(const prefixindex::CacheHitResult& result) {
@@ -78,10 +471,10 @@ Json::Value CacheHitResultToJson(const prefixindex::CacheHitResult& result) {
         // contract).
         dp[std::to_string(rank)] = Json::Value::Int64(tokens);
     }
-    out["DP"] = dp;
-    out["GPU"] = Json::Value::Int64(result.gpu);
-    out["CPU"] = Json::Value::Int64(result.cpu);
-    out["DISK"] = Json::Value::Int64(result.disk);
+    out["dp"] = dp;
+    out["gpu"] = Json::Value::Int64(result.gpu);
+    out["cpu"] = Json::Value::Int64(result.cpu);
+    out["disk"] = Json::Value::Int64(result.disk);
     return out;
 }
 
@@ -91,14 +484,24 @@ Json::Value ServiceConfigToJson(const common::ServiceConfig& svc) {
     Json::Value out(Json::objectValue);
     out["Endpoint"] = svc.endpoint;
     out["ReplayEndpoint"] = svc.replay_endpoint;
-    out["Type"] = svc.type;
+    out["Type"] = std::string(common::PublisherKindName(svc.publisher_kind));
     out["ModelName"] = svc.model_name;
     out["LoraName"] = svc.lora_name;
     out["TenantID"] = svc.tenant_id;
     out["InstanceID"] = svc.instance_id;
     out["BlockSize"] = Json::Value::Int64(svc.block_size);
     out["DPRank"] = svc.dp_rank;
-    out["AdditionalSalt"] = svc.additional_salt;
+    if (svc.cache_group.has_value()) {
+        out["CacheGroup"] = Json::Value::Int64(*svc.cache_group);
+    } else {
+        out["CacheGroup"] = Json::Value(Json::nullValue);
+    }
+    Json::Value profile(Json::objectValue);
+    profile["strategy"] = svc.hash_profile.strategy;
+    profile["algorithm"] = svc.hash_profile.algorithm;
+    profile["root_digest"] = svc.hash_profile.root_digest;
+    profile["index_projection"] = svc.hash_profile.index_projection;
+    out["HashProfile"] = profile;
     return out;
 }
 
@@ -111,9 +514,7 @@ std::string MakeServiceKey(const std::string& instance_id,
 
 EventManager::EventManager(std::vector<common::ServiceConfig> services,
                            int http_server_port)
-    : services_(std::move(services)), http_server_port_(http_server_port) {
-    // TODO: create an independent indexer for each ModelContext
-}
+    : services_(std::move(services)), http_server_port_(http_server_port) {}
 
 EventManager::~EventManager() { Stop(); }
 
@@ -147,7 +548,8 @@ void EventManager::Start() {
             }
             if (!result.second.empty()) {
                 LOG(ERROR) << "Failed to initiate subscription service_type="
-                           << svc.type << " instance_id=" << svc.instance_id
+                           << common::PublisherKindName(svc.publisher_kind)
+                           << " instance_id=" << svc.instance_id
                            << " endpoint=" << svc.endpoint
                            << " error=" << result.second;
                 failure_count.fetch_add(1);
@@ -168,9 +570,14 @@ void EventManager::Stop() {
     {
         std::unique_lock lock(mu_);
         if (stopped_) {
+            stop_cv_.wait(lock, [this] { return stop_complete_; });
             return;
         }
         stopped_ = true;
+        for (const auto& [unused_key, handler] : handlers_) {
+            (void)unused_key;
+            handler->MarkUnavailable();
+        }
     }
 
     LOG(INFO) << "Stopping Conductor KV Event Manager.....";
@@ -186,14 +593,29 @@ void EventManager::Stop() {
     // outside it — same deadlock rule as UnsubscribeFromService.
     std::vector<std::pair<std::string, std::shared_ptr<zmq::ZMQClient>>>
         clients;
+    std::vector<std::shared_ptr<KVEventHandler>> handlers;
     {
         std::unique_lock lock(mu_);
         clients.assign(subscribers_.begin(), subscribers_.end());
+        handlers.reserve(handlers_.size());
+        for (const auto& [unused_key, handler] : handlers_) {
+            (void)unused_key;
+            handlers.push_back(handler);
+        }
     }
     for (auto& [key, client] : clients) {
         client->Stop();
         LOG(INFO) << "Stopped all subscription service_key=" << key;
     }
+    for (const auto& handler : handlers) {
+        handler->WaitForIdle();
+    }
+
+    {
+        std::unique_lock lock(mu_);
+        stop_complete_ = true;
+    }
+    stop_cv_.notify_all();
 }
 
 std::pair<bool, std::string> EventManager::SubscribeToService(
@@ -205,21 +627,33 @@ std::pair<bool, std::string> EventManager::SubscribeToService(
         return {false, "manager stopped"};
     }
 
-    // Use (instance_id, tenant_id) as composite key to support
-    // multi-tenant replicas
-    std::string svc_key =
+    if (const std::string error = ValidateServiceConfig(svc); !error.empty()) {
+        return {false, "invalid service registration: " + error};
+    }
+
+    const std::string svc_key =
         MakeServiceKey(svc.instance_id, svc.tenant_id, svc.dp_rank);
-    if (svc.instance_id.empty()) {
-        svc_key = MakeServiceKey(svc.endpoint, svc.tenant_id, svc.dp_rank);
+    if (unregistering_.contains(svc_key)) {
+        return {false, "service is being unregistered: " + svc_key};
     }
-
-    if (subscribers_.count(svc_key) != 0) {
-        return {false, ""};
+    if (cleanup_quarantined_.contains(svc_key)) {
+        return {false, "service cleanup is quarantined: " + svc_key};
     }
-
-    // Validate endpoint
-    if (svc.endpoint.empty()) {
-        return {false, "endpoint is required"};
+    if (auto existing = active_configs_.find(svc_key);
+        existing != active_configs_.end()) {
+        if (existing->second == svc) {
+            return {false, ""};
+        }
+        return {false, "conflicting registration for service key: " + svc_key};
+    }
+    if (subscribers_.contains(svc_key)) {
+        return {false,
+                "inconsistent subscriber state for service key: " + svc_key};
+    }
+    if (auto endpoint = active_endpoints_.find(svc.endpoint);
+        endpoint != active_endpoints_.end()) {
+        return {false, "conflicting active registration for endpoint: " +
+                           svc.endpoint};
     }
 
     // Use ReplayEndpoint directly, fallback to empty if not provided
@@ -233,6 +667,7 @@ std::pair<bool, std::string> EventManager::SubscribeToService(
     zmq_config.endpoint = svc.endpoint;
     zmq_config.replay_endpoint = replay_endpoint;
     zmq_config.model_name = svc.model_name;
+    zmq_config.publisher_kind = svc.publisher_kind;
     zmq_config.poll_timeout = std::chrono::milliseconds(100);
     zmq_config.replay_timeout = std::chrono::seconds(5);
     zmq_config.reconnect_delay = std::chrono::seconds(1);
@@ -241,21 +676,45 @@ std::pair<bool, std::string> EventManager::SubscribeToService(
         return {false, "invalid ZMQ config: " + err};
     }
 
+    bool inserted_registration = false;
+    if (svc.publisher_kind == common::PublisherKind::kVllm) {
+        const auto registration_result =
+            indexer_.Register(RegistrationFromService(svc));
+        if (!registration_result.error.empty()) {
+            return {false, "failed to register prefix context: " +
+                               registration_result.error};
+        }
+        inserted_registration = registration_result.inserted;
+    } else {
+        const std::string binding_error = indexer_.ValidateProfileBinding(
+            ContextFromService(svc), ProfileFromService(svc));
+        if (!binding_error.empty() &&
+            binding_error != "ContextKey is not registered") {
+            return {false,
+                    "failed to bind shared-cache profile: " + binding_error};
+        }
+    }
+
     auto client = std::make_shared<zmq::ZMQClient>(zmq_config, handler);
     if (auto err = client->Start(); !err.empty()) {
+        if (inserted_registration) {
+            const std::string rollback_error = indexer_.Unregister(
+                ContextFromService(svc), svc.instance_id, svc.dp_rank);
+            if (!rollback_error.empty()) {
+                LOG(ERROR) << "Registration rollback failed service_key="
+                           << svc_key << " error=" << rollback_error;
+            }
+        }
         return {false, "failed to start ZMQ client: " + err};
     }
 
     subscribers_[svc_key] = client;
+    handlers_[svc_key] = handler;
     active_configs_[svc_key] = svc;
+    active_endpoints_[svc.endpoint] = svc_key;
 
-    // Add instance to tenant's instance map
-    {
-        std::unique_lock tenant_lock(tenant_mutex_);
-        tenant_instance_map_[svc.tenant_id].insert(svc.instance_id);
-    }
-
-    LOG(INFO) << "Successfully subscribed to service service_type=" << svc.type
+    LOG(INFO) << "Successfully subscribed to service publisher_kind="
+              << common::PublisherKindName(svc.publisher_kind)
               << " service_key=" << svc_key
               << " instance_id=" << svc.instance_id
               << " tenant_id=" << svc.tenant_id << " endpoint=" << svc.endpoint
@@ -264,47 +723,84 @@ std::pair<bool, std::string> EventManager::SubscribeToService(
     return {true, ""};
 }
 
-void EventManager::UnsubscribeFromService(const std::string& instance_id,
-                                          const std::string& tenant_id,
-                                          int dp_rank) {
+std::pair<bool, std::string> EventManager::UnsubscribeFromService(
+    const std::string& instance_id, const std::string& tenant_id, int dp_rank) {
     const std::string svc_key = MakeServiceKey(instance_id, tenant_id, dp_rank);
 
-    // Atomically remove from tracking maps under mu_ so that a
-    // concurrent /register sees a consistent (empty) state.
     std::shared_ptr<zmq::ZMQClient> client;
+    std::shared_ptr<KVEventHandler> handler;
+    common::ServiceConfig service;
     {
         std::unique_lock lock(mu_);
-        auto it = subscribers_.find(svc_key);
-        if (it != subscribers_.end()) {
-            client = it->second;
-            subscribers_.erase(it);
-            active_configs_.erase(svc_key);
+        if (unregistering_.contains(svc_key)) {
+            return {false, "service is already being unregistered: " + svc_key};
         }
-    }
-
-    if (client == nullptr) {
-        return;
+        auto client_it = subscribers_.find(svc_key);
+        auto handler_it = handlers_.find(svc_key);
+        auto config_it = active_configs_.find(svc_key);
+        if (client_it == subscribers_.end() || handler_it == handlers_.end() ||
+            config_it == active_configs_.end()) {
+            return {false, "service not found: " + svc_key};
+        }
+        client = client_it->second;
+        handler = handler_it->second;
+        service = config_it->second;
+        // Keep the maps populated while Stop joins the event loop. This
+        // reserves the key and prevents a replacement registration from being
+        // removed by this in-flight unregister operation.
+        unregistering_.insert(svc_key);
+        handler->MarkUnavailable();
     }
 
     // Stop the ZMQ client OUTSIDE mu_ to avoid deadlock:
-    // HandleEvent acquires mu_ (read). If the ZMQ event-loop thread is
-    // currently inside HandleEvent (or about to enter it), holding mu_
+    // HandleBatch acquires mu_ (read). If the ZMQ event-loop thread is
+    // currently inside HandleBatch (or about to enter it), holding mu_
     // while waiting for that thread to exit via client->Stop() -> join
     // would deadlock.
     client->Stop();
+    handler->WaitForIdle();
 
-    // Remove engine_instance from tenant's instance set
-    {
-        std::unique_lock tenant_lock(tenant_mutex_);
-        auto it = tenant_instance_map_.find(tenant_id);
-        if (it != tenant_instance_map_.end()) {
-            it->second.erase(instance_id);
+    std::string index_error = handler->InvalidateEndpoint();
+    if (service.publisher_kind == common::PublisherKind::kVllm) {
+        const std::string unregister_error = indexer_.Unregister(
+            ContextFromService(service), service.instance_id, service.dp_rank);
+        if (index_error.empty()) {
+            index_error = unregister_error;
         }
+    }
+    if (!index_error.empty()) {
+        std::unique_lock lock(mu_);
+        unregistering_.erase(svc_key);
+        cleanup_quarantined_.insert(svc_key);
+        LOG(ERROR) << "Endpoint cleanup quarantined service_key=" << svc_key
+                   << " endpoint=" << service.endpoint
+                   << " error=" << index_error;
+        return {true, index_error};
+    }
+
+    {
+        std::unique_lock lock(mu_);
+        subscribers_.erase(svc_key);
+        handlers_.erase(svc_key);
+        active_configs_.erase(svc_key);
+        if (auto endpoint = active_endpoints_.find(service.endpoint);
+            endpoint != active_endpoints_.end() &&
+            endpoint->second == svc_key) {
+            active_endpoints_.erase(endpoint);
+        }
+        if (auto service_it =
+                std::find(services_.begin(), services_.end(), service);
+            service_it != services_.end()) {
+            services_.erase(service_it);
+        }
+        unregistering_.erase(svc_key);
+        cleanup_quarantined_.erase(svc_key);
     }
 
     LOG(INFO) << "Successfully unsubscribed from service service_key="
               << svc_key << " instance_id=" << instance_id
               << " tenant_id=" << tenant_id;
+    return {true, ""};
 }
 
 void EventManager::RegisterHttpHandlers() {
@@ -313,74 +809,32 @@ void EventManager::RegisterHttpHandlers() {
     auto* server = http_server_.get();
 
     // ---- /query ---------------------------------------------------------
-    server->set_http_handler<POST>("/query", [this](coro_http_request& req,
-                                                    coro_http_response& resp) {
-        VLOG(1) << "receive req method=POST path=/query";
+    server->set_http_handler<POST>(
+        "/query", [this](coro_http_request& req, coro_http_response& resp) {
+            VLOG(1) << "receive req method=POST path=/query";
 
-        Json::Value body;
-        if (!ParseJsonBody(req, resp, "query", &body)) {
-            return;
-        }
-
-        const std::string tenant_id = TenantOrDefault(body);
-        const std::string lora_name = OptionalString(body, "lora_name", "");
-        const std::string cache_salt = OptionalString(body, "cache_salt", "");
-        const std::string model = OptionalString(body, "model", "");
-        const int64_t block_size =
-            body.isMember("block_size") && body["block_size"].isNumeric()
-                ? body["block_size"].asInt64()
-                : 0;
-
-        std::vector<int32_t> token_ids;
-        if (body.isMember("token_ids") && body["token_ids"].isArray()) {
-            for (const auto& t : body["token_ids"]) {
-                token_ids.push_back(t.asInt());
+            Json::Value body;
+            if (!ParseQueryJsonBody(req, resp, &body)) {
+                return;
             }
-        }
 
-        auto make_context = [&](const std::string& instance_id) {
-            prefixindex::ModelContext ctx;
-            ctx.tenant_id = tenant_id;
-            ctx.model_name = model;
-            ctx.lora_name = lora_name;
-            ctx.block_size = block_size;
-            ctx.additional_salt = cache_salt;
-            ctx.instance_id = instance_id;
-            return ctx;
-        };
-
-        // {tenant: {instance: CacheHitResult}}
-        Json::Value response_result(Json::objectValue);
-        auto add_result = [&](const std::string& instance_id) {
-            const auto ctx = make_context(instance_id);
-            const auto result = indexer_.CacheHitCompute(ctx, token_ids);
-            if (!response_result.isMember(tenant_id)) {
-                response_result[tenant_id] = Json::Value(Json::objectValue);
+            QueryRequest query;
+            if (!ParseQueryRequest(body, resp, &query)) {
+                return;
             }
-            response_result[tenant_id][instance_id] =
-                CacheHitResultToJson(result);
-        };
 
-        if (body.isMember("instance_id") && body["instance_id"].isString()) {
-            const std::string instance_id = body["instance_id"].asString();
-            LOG(INFO) << "search all engine instance for tenant. "
-                      << "instance_id=" << instance_id;
-            add_result(instance_id);
-        } else {
-            std::shared_lock tenant_lock(tenant_mutex_);
-            auto it = tenant_instance_map_.find(tenant_id);
-            if (it != tenant_instance_map_.end()) {
-                for (const auto& instance_id : it->second) {
-                    add_result(instance_id);
-                }
-            } else {
-                LOG(WARNING) << "current tenant has no engine_instance. "
-                             << "tenant_id=" << tenant_id;
+            const auto results =
+                indexer_.Query(query.context, query.token_ids, query.cache_salt,
+                               query.instance_filter);
+            Json::Value instances(Json::objectValue);
+            for (const auto& [instance_id, result] : results) {
+                instances[instance_id] = CacheHitResultToJson(result);
             }
-        }
 
-        HttpJson(resp, response_result);
-    });
+            Json::Value response_result(Json::objectValue);
+            response_result["instances"] = instances;
+            HttpJson(resp, response_result);
+        });
     server->set_http_handler<GET>("/query", [](coro_http_request&,
                                                coro_http_response& resp) {
         HttpError(resp, status_type::method_not_allowed, "Method not allowed");
@@ -394,29 +848,10 @@ void EventManager::RegisterHttpHandlers() {
                 return;
             }
 
-            // Handle Optional fields' default values
-            const std::string tenant_id = TenantOrDefault(body);
-            const std::string lora_name = OptionalString(body, "lora_name", "");
-            const std::string additional_salt =
-                OptionalString(body, "additionalsalt", "");
-
             common::ServiceConfig svc;
-            svc.endpoint = OptionalString(body, "endpoint", "");
-            svc.replay_endpoint = OptionalString(body, "replay_endpoint", "");
-            svc.type = OptionalString(body, "type", "");
-            svc.model_name = OptionalString(body, "modelname", "");
-            svc.lora_name = lora_name;
-            svc.tenant_id = tenant_id;
-            svc.instance_id = OptionalString(body, "instance_id", "");
-            svc.block_size =
-                body.isMember("block_size") && body["block_size"].isNumeric()
-                    ? body["block_size"].asInt64()
-                    : 0;
-            svc.dp_rank =
-                body.isMember("dp_rank") && body["dp_rank"].isNumeric()
-                    ? body["dp_rank"].asInt()
-                    : 0;
-            svc.additional_salt = additional_salt;
+            if (!ParseServiceConfigRequest(body, resp, &svc)) {
+                return;
+            }
 
             {
                 std::unique_lock lock(mu_);
@@ -425,21 +860,16 @@ void EventManager::RegisterHttpHandlers() {
                     lock.unlock();
                     LOG(ERROR) << "Dynamic register failed instance_id="
                                << svc.instance_id << " err=" << err;
-                    HttpError(resp, status_type::internal_server_error,
-                              "Failed to subscribe: " + err);
+                    if (err.starts_with("failed to start ZMQ client")) {
+                        HttpError(resp, status_type::internal_server_error,
+                                  "Failed to subscribe: " + err);
+                    } else {
+                        HttpJsonError(resp, "invalid_registration", err);
+                    }
                     return;
                 }
                 if (is_new) {
                     services_.push_back(svc);
-                    prefixindex::ModelContext model_context;
-                    model_context.tenant_id = tenant_id;
-                    model_context.model_name = svc.model_name;
-                    model_context.lora_name = lora_name;
-                    model_context.block_size = svc.block_size;
-                    model_context.additional_salt = additional_salt;
-                    model_context.instance_id = svc.instance_id;
-                    indexer_.AddDpSize(model_context,
-                                       static_cast<int64_t>(svc.dp_rank));
                 }
             }
 
@@ -462,34 +892,51 @@ void EventManager::RegisterHttpHandlers() {
                 return;
             }
 
-            // Build target service key from instance_id and tenant_id
-            const std::string target_tenant = TenantOrDefault(body);
-            const std::string instance_id =
-                OptionalString(body, "instance_id", "");
-            const int dp_rank =
-                body.isMember("dp_rank") && body["dp_rank"].isNumeric()
-                    ? body["dp_rank"].asInt()
-                    : 0;
+            static const std::set<std::string> kAllowedFields = {
+                "dp_rank", "instance_id", "tenant_id"};
+            if (!RejectUnknownFields(body, kAllowedFields, resp)) {
+                return;
+            }
+            std::string target_tenant;
+            std::string instance_id;
+            if (!RequiredString(body, "instance_id", resp, &instance_id) ||
+                !OptionalStringStrict(body, "tenant_id", "default", resp,
+                                      &target_tenant)) {
+                return;
+            }
+            if (target_tenant.empty()) {
+                target_tenant = "default";
+            }
+            if (!body.isMember("dp_rank")) {
+                HttpJsonError(resp, "missing", "dp_rank is required",
+                              "dp_rank");
+                return;
+            }
+            int64_t parsed_rank = 0;
+            if (!JsonInt64(body["dp_rank"], &parsed_rank) || parsed_rank < 0 ||
+                parsed_rank >
+                    static_cast<int64_t>(std::numeric_limits<int>::max())) {
+                HttpJsonError(resp, "invalid_value",
+                              "dp_rank must be a non-negative int", "dp_rank");
+                return;
+            }
+            const int dp_rank = static_cast<int>(parsed_rank);
             const std::string target_key =
                 MakeServiceKey(instance_id, target_tenant, dp_rank);
 
-            // Direct lookup and removal. Hold mu_ only for the existence
-            // check; UnsubscribeFromService handles map removal under its
-            // own mu_ and calls client->Stop() outside the lock to avoid
-            // deadlock with HandleEvent's read lock.
-            bool exists;
-            {
-                std::unique_lock lock(mu_);
-                exists = active_configs_.count(target_key) != 0;
-            }
-
-            if (!exists) {
-                HttpError(resp, status_type::not_found,
-                          "service not found: " + target_key);
+            const auto [removed_service, error] =
+                UnsubscribeFromService(instance_id, target_tenant, dp_rank);
+            if (!removed_service) {
+                HttpError(
+                    resp, status_type::not_found,
+                    error.empty() ? "service not found: " + target_key : error);
                 return;
             }
-
-            UnsubscribeFromService(instance_id, target_tenant, dp_rank);
+            if (!error.empty()) {
+                HttpError(resp, status_type::internal_server_error,
+                          "Failed to unregister prefix context: " + error);
+                return;
+            }
 
             Json::Value out(Json::objectValue);
             out["status"] = "unregistered successfully";
@@ -511,30 +958,33 @@ void EventManager::RegisterHttpHandlers() {
             Json::Value out(Json::objectValue);
             out["context_count"] = global_view.context_count;
             Json::Value contexts(Json::arrayValue);
-            for (const auto& ctx : global_view.model_contexts) {
+            for (const auto& view : global_view.contexts) {
                 Json::Value c(Json::objectValue);
-                c["model_name"] = ctx.model_name;
-                c["lora_name"] = ctx.lora_name;
-                c["block_size"] = Json::Value::Int64(ctx.block_size);
-                c["additional_salt"] = ctx.additional_salt;
-                c["tenant_id"] = ctx.tenant_id;
-                c["instance_id"] = ctx.instance_id;
+                c["model_name"] = view.context.model_name;
+                c["lora_name"] = view.context.lora_name;
+                c["block_size"] = Json::Value::Int64(view.context.block_size);
+                c["tenant_id"] = view.context.tenant_id;
+                c["prefix_count"] = Json::Value::UInt64(view.prefix_count);
+
+                Json::Value profile(Json::objectValue);
+                profile["strategy"] = view.profile.strategy;
+                profile["algorithm"] = view.profile.algorithm;
+                profile["root_digest"] = view.profile.root_digest;
+                profile["index_projection"] = view.profile.index_projection;
+                c["hash_profile"] = profile;
+
+                Json::Value instances(Json::objectValue);
+                for (const auto& [instance_id, ranks] : view.instance_ranks) {
+                    Json::Value rank_values(Json::arrayValue);
+                    for (const int64_t rank : ranks) {
+                        rank_values.append(Json::Value::Int64(rank));
+                    }
+                    instances[instance_id] = rank_values;
+                }
+                c["instances"] = instances;
                 contexts.append(c);
             }
-            out["model_contexts"] = contexts;
-            Json::Value hashmaps(Json::arrayValue);
-            for (const auto& mapping : global_view.proxy_hash_map) {
-                Json::Value m(Json::objectValue);
-                for (const auto& [engine_hash, conductor_hash] : mapping) {
-                    // map<uint64,uint64> is serialised with decimal-string
-                    // keys and plain-number values (JSON wire contract;
-                    // uint64 precision is covered by json_uint64_test.cpp).
-                    m[std::to_string(engine_hash)] =
-                        Json::Value::UInt64(conductor_hash);
-                }
-                hashmaps.append(m);
-            }
-            out["hashmap"] = hashmaps;
+            out["contexts"] = contexts;
             HttpJson(resp, out);
         });
     server->set_http_handler<POST>(

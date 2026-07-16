@@ -45,8 +45,8 @@ inline bool ParseNonNegativeInt(std::string_view value, int64_t* result) {
         return false;
     }
     int64_t parsed = 0;
-    const auto [end, error] = std::from_chars(
-        value.data(), value.data() + value.size(), parsed, 10);
+    const auto [end, error] =
+        std::from_chars(value.data(), value.data() + value.size(), parsed, 10);
     if (error != std::errc{} || end != value.data() + value.size() ||
         parsed < 0) {
         return false;
@@ -70,8 +70,7 @@ inline std::optional<uint64_t> ParseLow64Hex(std::string_view value) {
     }
     for (const char c : value) {
         const bool hex_digit = (c >= '0' && c <= '9') ||
-                               (c >= 'a' && c <= 'f') ||
-                               (c >= 'A' && c <= 'F');
+                               (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
         if (!hex_digit) {
             return std::nullopt;
         }
@@ -83,8 +82,8 @@ inline std::optional<uint64_t> ParseLow64Hex(std::string_view value) {
         value.remove_prefix(value.size() - 16);
     }
     uint64_t parsed = 0;
-    const auto [end, error] = std::from_chars(
-        value.data(), value.data() + value.size(), parsed, 16);
+    const auto [end, error] =
+        std::from_chars(value.data(), value.data() + value.size(), parsed, 16);
     if (error != std::errc{} || end != value.data() + value.size()) {
         return std::nullopt;
     }
@@ -133,8 +132,8 @@ inline std::optional<KvEventKeyInfo> ParseKvEventKey(
         if (!detail::ParseLabeledInt(parts[i + 1], "pcp", &pcp_rank) ||
             !detail::ParseLabeledInt(parts[i + 2], "dcp", &dcp_rank) ||
             !detail::ParseLabeledInt(parts[i + 3], "pp_rank:", &pp_rank) ||
-            (has_group && !detail::ParseLabeledInt(parts[i + 4], "group:",
-                                                   &group_id))) {
+            (has_group &&
+             !detail::ParseLabeledInt(parts[i + 4], "group:", &group_id))) {
             continue;
         }
         const size_t hash_index = i + (has_group ? 5 : 4);
@@ -174,8 +173,8 @@ inline std::optional<KvEventKeyInfo> ParseKvEventKey(
         int64_t head_or_tp_rank = 0;
         if (i + 4 >= parts.size() ||
             !detail::ParseLabeledInt(parts[i + 1], "dcp", &dcp_rank) ||
-            !detail::ParseLabeledInt(parts[i + 2], "head_or_tp_rank:",
-                                     &head_or_tp_rank)) {
+            !detail::ParseLabeledInt(parts[i + 2],
+                                     "head_or_tp_rank:", &head_or_tp_rank)) {
             continue;
         }
 

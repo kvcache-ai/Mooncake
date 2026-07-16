@@ -1,15 +1,16 @@
 #include "conductor/zmq/msg_decoder.h"
 
-#include <glog/logging.h>
 #include <msgpack.hpp>
 
-#include <charconv>
 #include <cmath>
 #include <cstdint>
-#include <ctime>
-#include <functional>
-#include <sstream>
+#include <limits>
+#include <map>
+#include <optional>
+#include <set>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 namespace conductor {
@@ -20,34 +21,30 @@ namespace {
 using msgpack::object;
 using msgpack::type::object_type;
 
-// ---------------------------------------------------------------------
-// Small result helpers carrying either a value or an error string.
-
 template <typename T>
-struct Result {
-    bool ok = false;
-    T value{};
+struct ValueResult {
+    std::optional<T> value;
     std::string error;
 
-    static Result Ok(T v) { return {true, std::move(v), ""}; }
-    static Result Err(std::string e) { return {false, T{}, std::move(e)}; }
+    static ValueResult Ok(T value) {
+        return {.value = std::move(value), .error = ""};
+    }
+    static ValueResult Err(std::string error) {
+        return {.value = std::nullopt, .error = std::move(error)};
+    }
 };
 
-// A neutral type name for a msgpack-decoded value (msgpack-cxx erases
-// integer width, so all integers report as "integer"). Only used in
-// error/log text — tests match on stable keywords, not type names.
-std::string MsgpackTypeName(const object& v) {
-    switch (v.type) {
+std::string TypeName(const object& value) {
+    switch (value.type) {
         case object_type::NIL:
             return "nil";
         case object_type::BOOLEAN:
-            return "bool";
+            return "boolean";
         case object_type::POSITIVE_INTEGER:
-            return "integer";
+            return "positive integer";
         case object_type::NEGATIVE_INTEGER:
-            return "integer";
+            return "negative integer";
         case object_type::FLOAT32:
-            return "float";
         case object_type::FLOAT64:
             return "float";
         case object_type::STR:
@@ -59,752 +56,727 @@ std::string MsgpackTypeName(const object& v) {
         case object_type::MAP:
             return "map";
         case object_type::EXT:
-            return "ext";
+            return "extension";
     }
     return "unknown";
 }
 
-// Shortest round-trip float formatting ('g' with minimal digits),
-// suitable for the numeric-string fallback paths below.
-std::string FormatFloatShortest(double f) {
-    char buf[64];
-    auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), f);
-    if (ec != std::errc()) return "?";
-    return std::string(buf, ptr);
+class MapReader {
+   public:
+    MapReader(const object& value,
+              const std::set<std::string_view>& recognized_fields) {
+        if (value.type != object_type::MAP) {
+            error_ = "expected event map, got " + TypeName(value);
+            return;
+        }
+        for (uint32_t index = 0; index < value.via.map.size; ++index) {
+            const auto& item = value.via.map.ptr[index];
+            if (item.key.type != object_type::STR) {
+                error_ = "event map key at index " + std::to_string(index) +
+                         " must be a string";
+                return;
+            }
+            const std::string key(item.key.via.str.ptr, item.key.via.str.size);
+            if (!recognized_fields.contains(key)) {
+                continue;
+            }
+            if (!fields_.emplace(key, &item.val).second) {
+                error_ = "duplicate recognized key: " + key;
+                return;
+            }
+        }
+    }
+
+    const std::string& error() const { return error_; }
+
+    const object* Get(std::string_view name) const {
+        auto it = fields_.find(std::string(name));
+        return it == fields_.end() ? nullptr : it->second;
+    }
+
+   private:
+    std::map<std::string, const object*> fields_;
+    std::string error_;
+};
+
+ValueResult<std::string> ParseString(const object& value) {
+    if (value.type != object_type::STR) {
+        return ValueResult<std::string>::Err("expected string, got " +
+                                             TypeName(value));
+    }
+    return ValueResult<std::string>::Ok(
+        std::string(value.via.str.ptr, value.via.str.size));
 }
 
-// Strict base-10 uint64 parse: digits only (no sign, no spaces).
-Result<uint64_t> ParseUintStrict(const std::string& s) {
-    if (s.empty()) {
-        return Result<uint64_t>::Err("invalid syntax");
+ValueResult<std::optional<std::string>> ParseNullableString(
+    const object& value) {
+    if (value.type == object_type::NIL) {
+        return ValueResult<std::optional<std::string>>::Ok(std::nullopt);
     }
-    uint64_t out = 0;
-    auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), out, 10);
-    if (ec != std::errc() || ptr != s.data() + s.size()) {
-        return Result<uint64_t>::Err("invalid syntax");
+    auto parsed = ParseString(value);
+    if (!parsed.value.has_value()) {
+        return ValueResult<std::optional<std::string>>::Err(parsed.error);
     }
-    return Result<uint64_t>::Ok(out);
+    return ValueResult<std::optional<std::string>>::Ok(
+        std::move(*parsed.value));
 }
 
-// ---------------------------------------------------------------------
-// Lenient numeric conversion helpers.
-
-Result<int64_t> ParseInt64(const object& v) {
-    switch (v.type) {
-        case object_type::POSITIVE_INTEGER:
-            return Result<int64_t>::Ok(static_cast<int64_t>(v.via.u64));
-        case object_type::NEGATIVE_INTEGER:
-            return Result<int64_t>::Ok(v.via.i64);
-        case object_type::FLOAT32:
-        case object_type::FLOAT64:
-            return Result<int64_t>::Ok(static_cast<int64_t>(v.via.f64));
-        default:
-            return Result<int64_t>::Err("unsupported integer type: " +
-                                        MsgpackTypeName(v));
+ValueResult<uint64_t> ParseUint64(const object& value) {
+    if (value.type != object_type::POSITIVE_INTEGER) {
+        return ValueResult<uint64_t>::Err("expected unsigned integer, got " +
+                                          TypeName(value));
     }
+    return ValueResult<uint64_t>::Ok(value.via.u64);
 }
 
-Result<uint64_t> ParseUint64(const object& v) {
-    switch (v.type) {
-        case object_type::POSITIVE_INTEGER:
-            return Result<uint64_t>::Ok(v.via.u64);
-        case object_type::NEGATIVE_INTEGER:
-            // Cast: int64 to uint64 wraps two's-complement.
-            return Result<uint64_t>::Ok(static_cast<uint64_t>(v.via.i64));
-        case object_type::FLOAT32:
-        case object_type::FLOAT64: {
-            const double f = v.via.f64;
-            if (f < 0) {
-                // Negative floats wrap through the signed conversion
-                // (fixed conversion contract).
-                return Result<uint64_t>::Ok(
-                    static_cast<uint64_t>(static_cast<int64_t>(f)));
-            }
-            return Result<uint64_t>::Ok(static_cast<uint64_t>(f));
-        }
-        default:
-            return Result<uint64_t>::Err("unsupported integer type: " +
-                                         MsgpackTypeName(v));
+ValueResult<int64_t> ParseInt64(const object& value) {
+    if (value.type == object_type::NEGATIVE_INTEGER) {
+        return ValueResult<int64_t>::Ok(value.via.i64);
     }
+    if (value.type == object_type::POSITIVE_INTEGER &&
+        value.via.u64 <=
+            static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        return ValueResult<int64_t>::Ok(static_cast<int64_t>(value.via.u64));
+    }
+    return ValueResult<int64_t>::Err("expected signed 64-bit integer, got " +
+                                     TypeName(value));
 }
 
-Result<std::vector<uint64_t>> ParseUint64Array(const object& v) {
-    if (v.type != object_type::ARRAY) {
-        return Result<std::vector<uint64_t>>::Err("expected array, got " +
-                                                  MsgpackTypeName(v));
+ValueResult<std::optional<int64_t>> ParseNullableInt64(const object& value) {
+    if (value.type == object_type::NIL) {
+        return ValueResult<std::optional<int64_t>>::Ok(std::nullopt);
     }
-    std::vector<uint64_t> result;
-    result.reserve(v.via.array.size);
-    for (uint32_t i = 0; i < v.via.array.size; ++i) {
-        auto item = ParseUint64(v.via.array.ptr[i]);
-        if (!item.ok) {
-            return Result<std::vector<uint64_t>>::Err(
-                "failed to parse element at index " + std::to_string(i) + ": " +
-                item.error);
-        }
-        result.push_back(item.value);
+    auto parsed = ParseInt64(value);
+    if (!parsed.value.has_value()) {
+        return ValueResult<std::optional<int64_t>>::Err(parsed.error);
     }
-    return Result<std::vector<uint64_t>>::Ok(std::move(result));
+    return ValueResult<std::optional<int64_t>>::Ok(*parsed.value);
 }
 
-Result<std::vector<int32_t>> ParseInt32Array(const object& v) {
-    if (v.type != object_type::ARRAY) {
-        return Result<std::vector<int32_t>>::Err("expected array, got " +
-                                                 MsgpackTypeName(v));
+ValueResult<std::optional<uint64_t>> ParseNullableUint64(const object& value) {
+    if (value.type == object_type::NIL) {
+        return ValueResult<std::optional<uint64_t>>::Ok(std::nullopt);
     }
-    std::vector<int32_t> result;
-    result.reserve(v.via.array.size);
-    for (uint32_t i = 0; i < v.via.array.size; ++i) {
-        const object& item = v.via.array.ptr[i];
-        switch (item.type) {
-            case object_type::POSITIVE_INTEGER:
-                // int32(uint64) truncates to the low 32 bits.
-                result.push_back(
-                    static_cast<int32_t>(static_cast<uint32_t>(item.via.u64)));
-                break;
-            case object_type::NEGATIVE_INTEGER:
-                result.push_back(
-                    static_cast<int32_t>(static_cast<uint32_t>(item.via.i64)));
-                break;
-            case object_type::FLOAT32:
-            case object_type::FLOAT64:
-                result.push_back(
-                    static_cast<int32_t>(static_cast<int64_t>(item.via.f64)));
-                break;
-            default:
-                return Result<std::vector<int32_t>>::Err(
-                    "unsupported integer type at index " + std::to_string(i) +
-                    ": " + MsgpackTypeName(item));
-        }
+    auto parsed = ParseUint64(value);
+    if (!parsed.value.has_value()) {
+        return ValueResult<std::optional<uint64_t>>::Err(parsed.error);
     }
-    return Result<std::vector<int32_t>>::Ok(std::move(result));
+    return ValueResult<std::optional<uint64_t>>::Ok(*parsed.value);
 }
 
-// SafeGetString never returns an error — every branch produces some
-// string (with a warning for unexpected types).
-std::string SafeGetString(const object& v) {
-    switch (v.type) {
-        case object_type::STR:
-            return std::string(v.via.str.ptr, v.via.str.size);
-        case object_type::BIN:
-            return std::string(v.via.bin.ptr, v.via.bin.size);
-        case object_type::POSITIVE_INTEGER:
-            return std::to_string(v.via.u64);
-        case object_type::NEGATIVE_INTEGER:
-            return std::to_string(v.via.i64);
-        case object_type::FLOAT32:
-        case object_type::FLOAT64:
-            return FormatFloatShortest(v.via.f64);
-        case object_type::NIL:
-            return "";
-        default:
-            LOG(WARNING) << "Unexpected type in string field type="
-                         << MsgpackTypeName(v);
-            if (v.type == object_type::BOOLEAN) {
-                return v.via.boolean ? "true" : "false";
-            }
-            // Fall back to a generic stream stringification;
-            // arrays/maps never occur in string fields with real
-            // publishers.
-            std::ostringstream oss;
-            oss << v;
-            return oss.str();
+ValueResult<ExternalHash> ParseExternalHash(const object& value) {
+    if (value.type == object_type::POSITIVE_INTEGER) {
+        return ValueResult<ExternalHash>::Ok(value.via.u64);
     }
+    if (value.type == object_type::BIN) {
+        const auto* begin = reinterpret_cast<const uint8_t*>(value.via.bin.ptr);
+        return ValueResult<ExternalHash>::Ok(
+            std::vector<uint8_t>(begin, begin + value.via.bin.size));
+    }
+    return ValueResult<ExternalHash>::Err(
+        "expected unsigned integer or binary hash, got " + TypeName(value));
 }
 
-// Timestamp in unix microseconds (float timestamps are truncated to
-// microsecond precision).
-Result<int64_t> ParseTimestampMicro(const object& v) {
-    switch (v.type) {
-        case object_type::EXT: {
-            // msgpack timestamp extension (type -1) — decoded as a
-            // point in time.
-            if (v.via.ext.type() != -1) {
-                return Result<int64_t>::Err("unsupported timestamp type: ext");
-            }
-            const char* p = v.via.ext.data();
-            const uint32_t size = v.via.ext.size;
-            auto be32 = [](const char* b) {
-                return (uint32_t(uint8_t(b[0])) << 24) |
-                       (uint32_t(uint8_t(b[1])) << 16) |
-                       (uint32_t(uint8_t(b[2])) << 8) | uint32_t(uint8_t(b[3]));
-            };
-            int64_t sec = 0;
-            int64_t nsec = 0;
-            if (size == 4) {
-                sec = be32(p);
-            } else if (size == 8) {
-                const uint64_t data64 =
-                    (uint64_t(be32(p)) << 32) | uint64_t(be32(p + 4));
-                nsec = static_cast<int64_t>(data64 >> 34);
-                sec = static_cast<int64_t>(data64 & 0x3FFFFFFFFULL);
-            } else if (size == 12) {
-                nsec = be32(p);
-                sec = static_cast<int64_t>((uint64_t(be32(p + 4)) << 32) |
-                                           uint64_t(be32(p + 8)));
-            } else {
-                return Result<int64_t>::Err("unsupported timestamp type: ext");
-            }
-            return Result<int64_t>::Ok(sec * 1000000 + nsec / 1000);
-        }
-        case object_type::POSITIVE_INTEGER:
-            return Result<int64_t>::Ok(static_cast<int64_t>(v.via.u64) *
-                                       1000000);
-        case object_type::NEGATIVE_INTEGER:
-            return Result<int64_t>::Ok(v.via.i64 * 1000000);
-        case object_type::FLOAT32:
-        case object_type::FLOAT64: {
-            const double t = v.via.f64;
-            const int64_t sec = static_cast<int64_t>(t);
-            const int64_t nsec =
-                static_cast<int64_t>((t - static_cast<double>(sec)) * 1e9);
-            // Unix timestamp (sec, nsec) truncated to microseconds.
-            return Result<int64_t>::Ok(sec * 1000000 + nsec / 1000);
-        }
-        case object_type::STR: {
-            // Minimal RFC3339 timestamp parsing:
-            // "2006-01-02T15:04:05Z" / "±hh:mm" offsets, optional
-            // fractional seconds.
-            const std::string s(v.via.str.ptr, v.via.str.size);
-            std::tm tm{};
-            const char* rest = strptime(s.c_str(), "%Y-%m-%dT%H:%M:%S", &tm);
-            if (rest == nullptr) {
-                return Result<int64_t>::Err("cannot parse timestamp \"" + s +
-                                            "\"");
-            }
-            int64_t micro = 0;
-            if (*rest == '.') {
-                ++rest;
-                int64_t frac = 0;
-                int digits = 0;
-                while (*rest >= '0' && *rest <= '9') {
-                    if (digits < 6) {
-                        frac = frac * 10 + (*rest - '0');
-                        ++digits;
-                    }
-                    ++rest;
-                }
-                while (digits < 6) {
-                    frac *= 10;
-                    ++digits;
-                }
-                micro = frac;
-            }
-            int64_t offset_sec = 0;
-            if (*rest == 'Z' || *rest == 'z') {
-                // UTC
-            } else if (*rest == '+' || *rest == '-') {
-                const int sign = (*rest == '-') ? -1 : 1;
-                int hh = 0, mm = 0;
-                if (sscanf(rest + 1, "%2d:%2d", &hh, &mm) != 2) {
-                    return Result<int64_t>::Err("cannot parse timestamp \"" +
-                                                s + "\"");
-                }
-                offset_sec = sign * (hh * 3600 + mm * 60);
-            } else {
-                return Result<int64_t>::Err("cannot parse timestamp \"" + s +
-                                            "\"");
-            }
-            const int64_t sec = timegm(&tm) - offset_sec;
-            return Result<int64_t>::Ok(sec * 1000000 + micro);
-        }
-        default:
-            return Result<int64_t>::Err("unsupported timestamp type: " +
-                                        MsgpackTypeName(v));
+ValueResult<std::optional<ExternalHash>> ParseNullableExternalHash(
+    const object& value) {
+    if (value.type == object_type::NIL) {
+        return ValueResult<std::optional<ExternalHash>>::Ok(std::nullopt);
     }
+    auto parsed = ParseExternalHash(value);
+    if (!parsed.value.has_value()) {
+        return ValueResult<std::optional<ExternalHash>>::Err(parsed.error);
+    }
+    return ValueResult<std::optional<ExternalHash>>::Ok(
+        std::move(*parsed.value));
 }
 
-// Strict scalar conversion used for Mooncake block hash array elements.
-// Negatives and non-integral floats error.
-Result<uint64_t> ParseSingleUint64(const object& v) {
-    switch (v.type) {
-        case object_type::POSITIVE_INTEGER:
-            return Result<uint64_t>::Ok(v.via.u64);
-        case object_type::NEGATIVE_INTEGER:
-            return Result<uint64_t>::Err("negative value " +
-                                         std::to_string(v.via.i64) +
-                                         " cannot convert to unsigned integer");
-        case object_type::FLOAT32:
-        case object_type::FLOAT64: {
-            const double f = v.via.f64;
-            if (f < 0 || f != static_cast<double>(static_cast<uint64_t>(f))) {
-                return Result<uint64_t>::Err("float " + FormatFloatShortest(f) +
-                                             " invalid for unsigned integer");
-            }
-            return Result<uint64_t>::Ok(static_cast<uint64_t>(f));
-        }
-        case object_type::STR: {
-            const std::string s(v.via.str.ptr, v.via.str.size);
-            if (s.empty()) {
-                return Result<uint64_t>::Err(
-                    "empty string cannot be parsed as integer");
-            }
-            auto parsed = ParseUintStrict(s);
-            if (!parsed.ok) {
-                return Result<uint64_t>::Err("invalid integer string \"" + s +
-                                             "\"");
-            }
-            return parsed;
-        }
-        case object_type::NIL:
-            return Result<uint64_t>::Err("nil cannot be parsed as integer");
-        default:
-            return Result<uint64_t>::Err("unsupported type " +
-                                         MsgpackTypeName(v) +
-                                         " for integer conversion");
+template <typename T, typename Parser>
+ValueResult<std::vector<T>> ParseArray(const object& value, Parser parser) {
+    if (value.type != object_type::ARRAY) {
+        return ValueResult<std::vector<T>>::Err("expected array, got " +
+                                                TypeName(value));
     }
+    std::vector<T> result;
+    result.reserve(value.via.array.size);
+    for (uint32_t index = 0; index < value.via.array.size; ++index) {
+        auto parsed = parser(value.via.array.ptr[index]);
+        if (!parsed.value.has_value()) {
+            return ValueResult<std::vector<T>>::Err(
+                "element " + std::to_string(index) + ": " + parsed.error);
+        }
+        result.push_back(std::move(*parsed.value));
+    }
+    return ValueResult<std::vector<T>>::Ok(std::move(result));
 }
 
-// Parent-hash field of BlockStoreEvent. Accepts unsigned ints,
-// non-negative signed ints, nil (-> 0), decimal strings, and (via a
-// generic stringify fallback) integral floats.
-Result<uint64_t> ParseMooncakeUint64(const object& v) {
-    std::string s;
-    switch (v.type) {
-        case object_type::STR:
-            s = std::string(v.via.str.ptr, v.via.str.size);
-            break;
-        case object_type::NIL:
-            s = "";
-            break;
-        case object_type::POSITIVE_INTEGER:
-            return Result<uint64_t>::Ok(v.via.u64);
-        case object_type::NEGATIVE_INTEGER:
-            return Result<uint64_t>::Err("negative value " +
-                                         std::to_string(v.via.i64));
-        default:
-            // Default branch: stringify the value then parse as uint.
-            // Integral floats whose shortest formatting is plain digits
-            // parse fine; "1e+06", "1.5", "true", "[...]" all fail.
-            if (v.type == object_type::FLOAT32 ||
-                v.type == object_type::FLOAT64) {
-                s = FormatFloatShortest(v.via.f64);
-            } else if (v.type == object_type::BOOLEAN) {
-                s = v.via.boolean ? "true" : "false";
-            } else {
-                std::ostringstream oss;
-                oss << v;
-                s = oss.str();
-            }
-            break;
-    }
-    if (s.empty()) {
-        return Result<uint64_t>::Ok(0);
-    }
-    auto parsed = ParseUintStrict(s);
-    if (!parsed.ok) {
-        return Result<uint64_t>::Err("invalid integer string \"" + s + "\"");
-    }
-    return parsed;
+ValueResult<std::vector<ExternalHash>> ParseExternalHashes(
+    const object& value) {
+    return ParseArray<ExternalHash>(value, ParseExternalHash);
 }
 
-// Block-hashes field of BlockStoreEvent. Accepts nil,
-// comma/space-separated decimal strings, arrays of scalars, or a bare
-// scalar.
-Result<std::vector<uint64_t>> ParseMooncakeUint64List(const object& v) {
-    using R = Result<std::vector<uint64_t>>;
-    switch (v.type) {
-        case object_type::NIL:
-            return R::Ok({});
-        case object_type::STR: {
-            const std::string s(v.via.str.ptr, v.via.str.size);
-            if (s.empty()) {
-                return R::Ok({});
-            }
-            std::vector<uint64_t> result;
-            std::string part;
-            auto flush = [&]() -> std::string {
-                if (part.empty()) return "";
-                auto parsed = ParseUintStrict(part);
-                if (!parsed.ok) {
-                    return "failed to parse integer from string \"" + part +
-                           "\": invalid integer string \"" + part + "\"";
-                }
-                result.push_back(parsed.value);
-                part.clear();
-                return "";
-            };
-            for (const char c : s) {
-                if (c == ',' || c == ' ' || c == '\t' || c == '\n') {
-                    if (auto err = flush(); !err.empty()) return R::Err(err);
-                } else {
-                    part.push_back(c);
-                }
-            }
-            if (auto err = flush(); !err.empty()) return R::Err(err);
-            return R::Ok(std::move(result));
-        }
-        case object_type::ARRAY: {
-            std::vector<uint64_t> result;
-            result.reserve(v.via.array.size);
-            for (uint32_t i = 0; i < v.via.array.size; ++i) {
-                auto item = ParseSingleUint64(v.via.array.ptr[i]);
-                if (!item.ok) {
-                    return R::Err("failed to parse element: " + item.error);
-                }
-                result.push_back(item.value);
-            }
-            return R::Ok(std::move(result));
-        }
-        default: {
-            // try parse as single uint64
-            auto single = ParseSingleUint64(v);
-            if (!single.ok) {
-                return R::Err(single.error);
-            }
-            return R::Ok({single.value});
-        }
-    }
+ValueResult<std::vector<uint64_t>> ParseUint64Array(const object& value) {
+    return ParseArray<uint64_t>(value, ParseUint64);
 }
 
-Result<std::vector<std::vector<std::string>>> ConvertToReplicaList(
-    const object& v) {
-    using R = Result<std::vector<std::vector<std::string>>>;
-    if (v.type != object_type::ARRAY) {
-        return R::Err("expected array, got " + MsgpackTypeName(v));
-    }
-    std::vector<std::vector<std::string>> result;
-    result.reserve(v.via.array.size);
-    for (uint32_t i = 0; i < v.via.array.size; ++i) {
-        const object& item = v.via.array.ptr[i];
-        if (item.type != object_type::ARRAY) {
-            return R::Err("item " + std::to_string(i) +
-                          " is not an array, got " + MsgpackTypeName(item));
+ValueResult<std::vector<int32_t>> ParseInt32Array(const object& value) {
+    return ParseArray<int32_t>(value, [](const object& item) {
+        auto parsed = ParseInt64(item);
+        if (!parsed.value.has_value()) {
+            return ValueResult<int32_t>::Err(parsed.error);
         }
-        std::vector<std::string> sub;
-        sub.reserve(item.via.array.size);
-        for (uint32_t j = 0; j < item.via.array.size; ++j) {
-            const object& elem = item.via.array.ptr[j];
-            if (elem.type != object_type::STR) {
-                return R::Err("element [" + std::to_string(i) + "][" +
-                              std::to_string(j) + "] is not string, got " +
-                              MsgpackTypeName(elem));
-            }
-            sub.emplace_back(elem.via.str.ptr, elem.via.str.size);
+        if (*parsed.value < std::numeric_limits<int32_t>::min() ||
+            *parsed.value > std::numeric_limits<int32_t>::max()) {
+            return ValueResult<int32_t>::Err("integer is outside int32 range");
         }
-        result.push_back(std::move(sub));
-    }
-    return R::Ok(std::move(result));
+        return ValueResult<int32_t>::Ok(static_cast<int32_t>(*parsed.value));
+    });
 }
 
-// ---------------------------------------------------------------------
-// Event parsers.
+ValueResult<std::optional<std::vector<int32_t>>> ParseNullableInt32Array(
+    const object& value) {
+    if (value.type == object_type::NIL) {
+        return ValueResult<std::optional<std::vector<int32_t>>>::Ok(
+            std::nullopt);
+    }
+    auto parsed = ParseInt32Array(value);
+    if (!parsed.value.has_value()) {
+        return ValueResult<std::optional<std::vector<int32_t>>>::Err(
+            parsed.error);
+    }
+    return ValueResult<std::optional<std::vector<int32_t>>>::Ok(
+        std::move(*parsed.value));
+}
 
-// Bounds guard for fixed-index array access: when an event array is
-// shorter than the schema requires, we return a decode error instead of
-// reading out of range.
-bool CheckLen(const object& arr, uint32_t need, const char* what,
-              std::string* err) {
-    if (arr.via.array.size < need) {
-        *err = std::string("event array too short for ") + what + ": need " +
-               std::to_string(need) + " elements, got " +
-               std::to_string(arr.via.array.size) +
-               " (returns error; caller handles)";
+template <typename T, typename Parser>
+bool ParseRequired(const MapReader& reader, std::string_view field,
+                   Parser parser, T* output, std::string* error) {
+    const object* value = reader.Get(field);
+    if (value == nullptr) {
+        *error = "missing required key: " + std::string(field);
+        return false;
+    }
+    auto parsed = parser(*value);
+    if (!parsed.value.has_value()) {
+        *error = "invalid " + std::string(field) + ": " + parsed.error;
+        return false;
+    }
+    *output = std::move(*parsed.value);
+    return true;
+}
+
+template <typename T, typename Parser>
+bool ParseOptional(const MapReader& reader, std::string_view field,
+                   Parser parser, std::optional<T>* output,
+                   std::string* error) {
+    const object* value = reader.Get(field);
+    if (value == nullptr) {
+        output->reset();
+        return true;
+    }
+    auto parsed = parser(*value);
+    if (!parsed.value.has_value()) {
+        *error = "invalid " + std::string(field) + ": " + parsed.error;
+        return false;
+    }
+    *output = std::move(*parsed.value);
+    return true;
+}
+
+template <typename T, typename Parser>
+bool ParseOptionalNullable(const MapReader& reader, std::string_view field,
+                           Parser parser, std::optional<T>* output,
+                           std::string* error) {
+    const object* value = reader.Get(field);
+    if (value == nullptr) {
+        output->reset();
+        return true;
+    }
+    auto parsed = parser(*value);
+    if (!parsed.value.has_value()) {
+        *error = "invalid " + std::string(field) + ": " + parsed.error;
+        return false;
+    }
+    *output = std::move(*parsed.value);
+    return true;
+}
+
+const std::set<std::string_view> kVllmFields = {
+    "type",      "block_hashes",       "parent_block_hash",
+    "token_ids", "block_size",         "lora_id",
+    "medium",    "lora_name",          "extra_keys",
+    "group_idx", "kv_cache_spec_kind", "kv_cache_spec_sliding_window",
+};
+
+const std::set<std::string_view> kVllmRemovedFields = {"type", "block_hashes",
+                                                       "medium", "group_idx"};
+
+std::string ValidateVllmExtraKeys(const object& value, size_t block_count,
+                                  bool* present) {
+    if (value.type == object_type::NIL) {
+        *present = false;
+        return "";
+    }
+    if (value.type != object_type::ARRAY) {
+        return "expected array or nil, got " + TypeName(value);
+    }
+    if (value.via.array.size != block_count) {
+        return "expected one entry per block hash, got " +
+               std::to_string(value.via.array.size) + " entries for " +
+               std::to_string(block_count) + " block hashes";
+    }
+    for (uint32_t index = 0; index < value.via.array.size; ++index) {
+        const object& item = value.via.array.ptr[index];
+        if (item.type != object_type::NIL && item.type != object_type::ARRAY) {
+            return "element " + std::to_string(index) +
+                   ": expected array or nil, got " + TypeName(item);
+        }
+    }
+    *present = true;
+    return "";
+}
+
+ValueResult<VllmEvent> ParseVllmEvent(const object& raw) {
+    MapReader reader(raw, kVllmFields);
+    if (!reader.error().empty()) {
+        return ValueResult<VllmEvent>::Err(reader.error());
+    }
+
+    std::string error;
+    std::string type;
+    if (!ParseRequired(reader, "type", ParseString, &type, &error)) {
+        return ValueResult<VllmEvent>::Err(error);
+    }
+
+    if (type == "BlockStored") {
+        VllmStoredEvent event;
+        if (!ParseRequired(reader, "block_hashes", ParseExternalHashes,
+                           &event.block_hashes, &error) ||
+            !ParseRequired(reader, "parent_block_hash",
+                           ParseNullableExternalHash, &event.parent_block_hash,
+                           &error) ||
+            !ParseRequired(reader, "token_ids", ParseNullableInt32Array,
+                           &event.token_ids, &error) ||
+            !ParseRequired(reader, "block_size", ParseInt64, &event.block_size,
+                           &error) ||
+            !ParseRequired(reader, "lora_id", ParseNullableInt64,
+                           &event.lora_id, &error) ||
+            !ParseRequired(reader, "medium", ParseNullableString, &event.medium,
+                           &error) ||
+            !ParseRequired(reader, "lora_name", ParseNullableString,
+                           &event.lora_name, &error) ||
+            !ParseOptionalNullable(reader, "group_idx", ParseNullableInt64,
+                                   &event.group_idx, &error) ||
+            !ParseOptionalNullable(reader, "kv_cache_spec_kind",
+                                   ParseNullableString,
+                                   &event.kv_cache_spec_kind, &error) ||
+            !ParseOptionalNullable(
+                reader, "kv_cache_spec_sliding_window", ParseNullableInt64,
+                &event.kv_cache_spec_sliding_window, &error)) {
+            return ValueResult<VllmEvent>::Err(error);
+        }
+        if (const object* extra_keys = reader.Get("extra_keys");
+            extra_keys != nullptr) {
+            if (std::string extra_keys_error = ValidateVllmExtraKeys(
+                    *extra_keys, event.block_hashes.size(),
+                    &event.extra_keys_present);
+                !extra_keys_error.empty()) {
+                return ValueResult<VllmEvent>::Err("invalid extra_keys: " +
+                                                   extra_keys_error);
+            }
+        }
+        return ValueResult<VllmEvent>::Ok(std::move(event));
+    }
+
+    if (type == "BlockRemoved") {
+        for (std::string_view field : kVllmFields) {
+            if (!kVllmRemovedFields.contains(field) &&
+                reader.Get(field) != nullptr) {
+                return ValueResult<VllmEvent>::Err(
+                    "BlockRemoved contains recognized key: " +
+                    std::string(field));
+            }
+        }
+        VllmRemovedEvent event;
+        if (!ParseRequired(reader, "block_hashes", ParseExternalHashes,
+                           &event.block_hashes, &error) ||
+            !ParseRequired(reader, "medium", ParseNullableString, &event.medium,
+                           &error) ||
+            !ParseOptionalNullable(reader, "group_idx", ParseNullableInt64,
+                                   &event.group_idx, &error)) {
+            return ValueResult<VllmEvent>::Err(error);
+        }
+        return ValueResult<VllmEvent>::Ok(std::move(event));
+    }
+
+    if (type == "AllBlocksCleared") {
+        for (std::string_view field : kVllmFields) {
+            if (field != "type" && reader.Get(field) != nullptr) {
+                return ValueResult<VllmEvent>::Err(
+                    "AllBlocksCleared contains recognized key: " +
+                    std::string(field));
+            }
+        }
+        return ValueResult<VllmEvent>::Ok(VllmClearedEvent{});
+    }
+
+    return ValueResult<VllmEvent>::Err("unknown vLLM event tag: " + type);
+}
+
+const std::set<std::string_view> kMooncakeFields = {
+    "event_id",
+    "timestamp",
+    "event_type",
+    "type",
+    "model_name",
+    "block_size",
+    "additional_salt",
+    "lora_name",
+    "tenant_id",
+    "backend_id",
+    "medium",
+    "dp_rank",
+    "group_id",
+    "object_key",
+    "connector_block_hash",
+    "cache_prefix",
+    "tp_rank",
+    "head_or_tp_rank",
+    "pcp_rank",
+    "dcp_rank",
+    "pp_rank",
+    "layer_id",
+    "seq_hashes",
+    "block_hashes",
+    "base_block_idx",
+    "parent_hash",
+    "token_ids",
+    "parent_block_hash",
+};
+
+bool ParseMooncakeCommon(const MapReader& reader, int64_t batch_timestamp,
+                         std::string_view event_type,
+                         MooncakeEventFields* fields, std::string* error) {
+    if (!ParseRequired(reader, "event_id", ParseUint64, &fields->event_id,
+                       error) ||
+        !ParseRequired(reader, "timestamp", ParseInt64,
+                       &fields->timestamp_milliseconds, error) ||
+        !ParseRequired(reader, "model_name", ParseNullableString,
+                       &fields->model_name, error) ||
+        !ParseRequired(reader, "block_size", ParseNullableInt64,
+                       &fields->block_size, error) ||
+        !ParseRequired(reader, "additional_salt", ParseNullableString,
+                       &fields->additional_salt, error) ||
+        !ParseRequired(reader, "lora_name", ParseNullableString,
+                       &fields->lora_name, error) ||
+        !ParseRequired(reader, "tenant_id", ParseString, &fields->tenant_id,
+                       error) ||
+        !ParseRequired(reader, "backend_id", ParseString, &fields->backend_id,
+                       error) ||
+        !ParseRequired(reader, "medium", ParseNullableString, &fields->medium,
+                       error) ||
+        !ParseRequired(reader, "dp_rank", ParseInt64,
+                       &fields->data_parallel_rank, error)) {
+        return false;
+    }
+    if (fields->timestamp_milliseconds != batch_timestamp) {
+        *error = "event timestamp conflicts with batch timestamp";
+        return false;
+    }
+    if (fields->data_parallel_rank < 0) {
+        *error = "event dp_rank must be non-negative";
+        return false;
+    }
+
+    if (const object* legacy_type = reader.Get("type");
+        legacy_type != nullptr) {
+        auto parsed = ParseString(*legacy_type);
+        if (!parsed.value.has_value()) {
+            *error = "invalid type: " + parsed.error;
+            return false;
+        }
+        const std::string_view expected =
+            event_type == "stored"
+                ? "BlockStored"
+                : (event_type == "removed" ? "BlockRemoved"
+                                           : "AllBlocksCleared");
+        if (*parsed.value != expected) {
+            *error = "legacy type conflicts with event_type";
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ParseMooncakeObject(const MapReader& reader, MooncakeObjectFields* object,
+                         std::string* error) {
+    if (!ParseRequired(reader, "group_id", ParseNullableString,
+                       &object->group_id, error) ||
+        !ParseRequired(reader, "seq_hashes", ParseUint64Array,
+                       &object->seq_hashes, error) ||
+        !ParseRequired(reader, "base_block_idx", ParseNullableInt64,
+                       &object->base_block_idx, error) ||
+        !ParseOptional(reader, "object_key", ParseString, &object->object_key,
+                       error) ||
+        !ParseOptional(reader, "connector_block_hash", ParseString,
+                       &object->connector_block_hash, error) ||
+        !ParseOptional(reader, "cache_prefix", ParseString,
+                       &object->cache_prefix, error) ||
+        !ParseOptionalNullable(reader, "tp_rank", ParseNullableInt64,
+                               &object->tp_rank, error) ||
+        !ParseOptionalNullable(reader, "head_or_tp_rank", ParseNullableInt64,
+                               &object->head_or_tp_rank, error) ||
+        !ParseOptionalNullable(reader, "pcp_rank", ParseNullableInt64,
+                               &object->pcp_rank, error) ||
+        !ParseOptionalNullable(reader, "dcp_rank", ParseNullableInt64,
+                               &object->dcp_rank, error) ||
+        !ParseOptionalNullable(reader, "pp_rank", ParseNullableInt64,
+                               &object->pp_rank, error) ||
+        !ParseOptionalNullable(reader, "layer_id", ParseNullableInt64,
+                               &object->layer_id, error) ||
+        !ParseOptional(reader, "block_hashes", ParseUint64Array,
+                       &object->legacy_block_hashes, error)) {
+        return false;
+    }
+    if (object->legacy_block_hashes.has_value() &&
+        *object->legacy_block_hashes != object->seq_hashes) {
+        *error = "legacy block_hashes conflicts with seq_hashes";
         return false;
     }
     return true;
 }
 
-Result<KVEvent> ParseVllmBlockStored(const object& data,
-                                     const object& timestamp) {
-    using R = Result<KVEvent>;
-    BlockStoredEvent event;
-    event.type = kEventTypeBlockStored;
-
-    std::string len_err;
-    if (!CheckLen(data, 7, "vLLM BlockStored", &len_err)) {
-        return R::Err(len_err);
+ValueResult<MooncakeEvent> ParseMooncakeEvent(const object& raw,
+                                              int64_t batch_timestamp) {
+    MapReader reader(raw, kMooncakeFields);
+    if (!reader.error().empty()) {
+        return ValueResult<MooncakeEvent>::Err(reader.error());
     }
-    const object* f = data.via.array.ptr;
-
-    // Field order below is fixed so the *first* error surfaced for a
-    // multi-error payload is deterministic.
-    auto ts = ParseTimestampMicro(timestamp);
-    if (!ts.ok) {
-        return R::Err("failed to parse timestamp: " + ts.error);
+    std::string error;
+    std::string event_type;
+    if (!ParseRequired(reader, "event_type", ParseString, &event_type,
+                       &error)) {
+        return ValueResult<MooncakeEvent>::Err(error);
     }
-    event.timestamp_unix_micro = ts.value;
-
-    auto hashes = ParseUint64Array(f[1]);
-    if (!hashes.ok) {
-        return R::Err("failed to parse block_hashes: " + hashes.error);
+    if (event_type != "stored" && event_type != "removed" &&
+        event_type != "cleared") {
+        return ValueResult<MooncakeEvent>::Err("unknown Mooncake event tag: " +
+                                               event_type);
     }
-    event.block_hashes = std::move(hashes.value);
 
-    if (f[3].type == object_type::ARRAY) {
-        auto tokens = ParseInt32Array(f[3]);
-        if (!tokens.ok) {
-            return R::Err("failed to parse token_ids at index " + tokens.error);
+    MooncakeEventFields fields;
+    if (!ParseMooncakeCommon(reader, batch_timestamp, event_type, &fields,
+                             &error)) {
+        return ValueResult<MooncakeEvent>::Err(error);
+    }
+
+    if (event_type == "cleared") {
+        static const std::set<std::string_view> kObjectOnlyFields = {
+            "group_id",          "object_key",  "connector_block_hash",
+            "cache_prefix",      "tp_rank",     "head_or_tp_rank",
+            "pcp_rank",          "dcp_rank",    "pp_rank",
+            "layer_id",          "seq_hashes",  "block_hashes",
+            "base_block_idx",    "parent_hash", "token_ids",
+            "parent_block_hash",
+        };
+        for (std::string_view field : kObjectOnlyFields) {
+            if (reader.Get(field) != nullptr) {
+                return ValueResult<MooncakeEvent>::Err(
+                    "cleared event contains recognized object key: " +
+                    std::string(field));
+            }
         }
-        event.token_ids = std::move(tokens.value);
-    } else {
-        return R::Err("missing or invalid token_ids");
+        return ValueResult<MooncakeEvent>::Ok(
+            MooncakeClearedEvent{.fields = std::move(fields)});
     }
 
-    if (f[2].type == object_type::NIL) {
-        event.parent_block_hash = 0;
-    } else if (f[2].type == object_type::POSITIVE_INTEGER) {
-        event.parent_block_hash = f[2].via.u64;
-    } else {
-        return R::Err("expected integer, got " + MsgpackTypeName(f[2]));
+    MooncakeObjectFields object_fields;
+    if (!ParseMooncakeObject(reader, &object_fields, &error)) {
+        return ValueResult<MooncakeEvent>::Err(error);
     }
 
-    auto block_size = ParseInt64(f[4]);
-    if (!block_size.ok) {
-        return R::Err("failed to parse field at index 4 as 'block_size': " +
-                      block_size.error);
-    }
-    event.block_size = block_size.value;
-
-    // f[5] is lora_id in the vLLM schema; it is intentionally skipped.
-    event.medium = SafeGetString(f[6]);
-
-    return R::Ok(std::move(event));
-}
-
-Result<KVEvent> ParseVllmBlockRemoved(const object& data) {
-    using R = Result<KVEvent>;
-    BlockRemovedEvent event;
-    event.type = kEventTypeBlockRemoved;
-
-    std::string len_err;
-    if (!CheckLen(data, 3, "vLLM BlockRemoved", &len_err)) {
-        return R::Err(len_err);
-    }
-    const object* f = data.via.array.ptr;
-
-    auto hashes = ParseUint64Array(f[1]);
-    if (!hashes.ok) {
-        return R::Err("failed to parse block_hashes: " + hashes.error);
-    }
-    event.block_hashes = std::move(hashes.value);
-
-    event.medium = SafeGetString(f[2]);
-    // NOTE: no timestamp assigned for removal events.
-    return R::Ok(std::move(event));
-}
-
-Result<KVEvent> ParseMooncakeBlockStored(const object& data,
-                                         const object& /*timestamp*/) {
-    // NOTE: batch timestamp ignored for removal event items.
-    using R = Result<KVEvent>;
-    BlockStoredEvent event;
-    event.type = kEventTypeBlockStored;
-
-    std::string len_err;
-    if (!CheckLen(data, 8, "Mooncake BlockStoreEvent", &len_err)) {
-        return R::Err(len_err);
-    }
-    const object* f = data.via.array.ptr;
-
-    event.mooncake_key = SafeGetString(f[1]);
-
-    auto replicas = ConvertToReplicaList(f[2]);
-    if (!replicas.ok) {
-        return R::Err("failed to parse ReplicaList from field at index 2: " +
-                      replicas.error);
-    }
-    event.replica_list = std::move(replicas.value);
-
-    auto block_size = ParseInt64(f[4]);
-    if (!block_size.ok) {
-        return R::Err("failed to parse BlockSize from field at index 4: " +
-                      block_size.error);
-    }
-    event.block_size = block_size.value;
-
-    auto hashes = ParseMooncakeUint64List(f[5]);
-    if (!hashes.ok) {
-        return R::Err("failed to parse BlockHashes from field at index 5: " +
-                      hashes.error);
-    }
-    event.block_hashes = std::move(hashes.value);
-
-    auto parent = ParseMooncakeUint64(f[6]);
-    if (!parent.ok) {
-        return R::Err(
-            "failed to parse ParentBlockHash from field at index 6: " +
-            parent.error);
-    }
-    event.parent_block_hash = parent.value;
-
-    if (f[7].type == object_type::ARRAY) {
-        auto tokens = ParseInt32Array(f[7]);
-        if (!tokens.ok) {
-            return R::Err("failed to parse TokenIDs from field at index 7: " +
-                          tokens.error);
+    if (event_type == "removed") {
+        if (reader.Get("parent_hash") != nullptr ||
+            reader.Get("token_ids") != nullptr ||
+            reader.Get("parent_block_hash") != nullptr) {
+            return ValueResult<MooncakeEvent>::Err(
+                "removed event contains recognized stored-only key");
         }
-        event.token_ids = std::move(tokens.value);
-    } else {
-        return R::Err("missing or invalid token_ids");
+        return ValueResult<MooncakeEvent>::Ok(MooncakeRemovedEvent{
+            .fields = std::move(fields), .object = std::move(object_fields)});
     }
 
-    // BUG: Medium never assigned for Mooncake-sourced blocks; queries always
-    // miss.
-    return R::Ok(std::move(event));
-}
-
-// ---------------------------------------------------------------------
-// Parser dispatch — one implementation per publisher schema.
-
-struct ParserSpec {
-    const char* source;
-    // Maps event-name string to the EventType string; nullptr = unknown.
-    const char* (*map_event)(const std::string&);
-    Result<KVEvent> (*parse)(const std::string& event_type, const object& raw,
-                             const object& timestamp);
-    const char* unknown_fmt;  // "unknown vllm event type: " etc.
-};
-
-const char* MooncakeEventMapping(const std::string& name) {
-    if (name == "BlockStoreEvent") return kEventTypeBlockStored;
-    if (name == "BlockUpdateEvent") return kEventTypeBlockUpdate;
-    if (name == "RemoveAllEvent") return kEventTypeAllCleared;
-    return nullptr;
-}
-
-Result<KVEvent> MooncakeParse(const std::string& event_type, const object& raw,
-                              const object& timestamp) {
-    if (event_type == kEventTypeBlockStored) {
-        return ParseMooncakeBlockStored(raw, timestamp);
+    MooncakeStoredEvent event{.fields = std::move(fields),
+                              .object = std::move(object_fields)};
+    if (!ParseRequired(reader, "parent_hash", ParseNullableUint64,
+                       &event.parent_hash, &error) ||
+        !ParseRequired(reader, "token_ids", ParseNullableInt32Array,
+                       &event.token_ids, &error)) {
+        return ValueResult<MooncakeEvent>::Err(error);
     }
-    // BUG: BlockUpdateEvent / RemoveAllEvent not handled (dead code on main
-    // branch — schema pending upstream alignment, see docs/KNOWN_ISSUES.md
-    // issue 9).
-    return Result<KVEvent>::Err("unhandled event: " + event_type);
+    if (const object* legacy_parent = reader.Get("parent_block_hash");
+        legacy_parent != nullptr) {
+        auto parsed = ParseNullableUint64(*legacy_parent);
+        if (!parsed.value.has_value()) {
+            return ValueResult<MooncakeEvent>::Err(
+                "invalid parent_block_hash: " + parsed.error);
+        }
+        if (*parsed.value != event.parent_hash) {
+            return ValueResult<MooncakeEvent>::Err(
+                "parent_block_hash conflicts with parent_hash");
+        }
+    }
+    return ValueResult<MooncakeEvent>::Ok(std::move(event));
 }
 
-const char* VllmEventMapping(const std::string& name) {
-    if (name == "BlockStored") return kEventTypeBlockStored;
-    if (name == "BlockRemoved") return kEventTypeBlockRemoved;
-    if (name == "AllBlocksCleared") return kEventTypeAllCleared;
-    return nullptr;
+template <typename Batch>
+BatchDecodeResult<Batch> EnvelopeError(std::string error) {
+    return {.ok = false, .batch = {}, .error = std::move(error)};
 }
 
-Result<KVEvent> VllmParse(const std::string& event_type, const object& raw,
-                          const object& timestamp) {
-    if (event_type == kEventTypeBlockStored) {
-        return ParseVllmBlockStored(raw, timestamp);
+ValueResult<msgpack::object_handle> UnpackOne(const char* data, size_t len) {
+    if (data == nullptr || len == 0) {
+        return ValueResult<msgpack::object_handle>::Err("empty payload");
     }
-    if (event_type == kEventTypeBlockRemoved) {
-        return ParseVllmBlockRemoved(raw);
-    }
-    return Result<KVEvent>::Err("unhandled event: " + event_type);
-}
-
-EventBatchResult DecodeCommonEventBatch(const char* data, size_t len,
-                                        uint32_t expected_length,
-                                        const ParserSpec& parser) {
-    EventBatchResult result;
-
-    if (len > 0) {
-        VLOG(1) << "First byte of payload hex="
-                << static_cast<int>(static_cast<unsigned char>(data[0]));
-    }
-
-    msgpack::object_handle oh;
     try {
-        oh = msgpack::unpack(data, len);
-    } catch (const std::exception& e) {
-        result.error = std::string("failed to decode event batch: ") + e.what();
-        return result;
+        size_t offset = 0;
+        auto handle = msgpack::unpack(data, len, offset);
+        if (offset != len) {
+            return ValueResult<msgpack::object_handle>::Err(
+                "trailing bytes after MessagePack value");
+        }
+        return ValueResult<msgpack::object_handle>::Ok(std::move(handle));
+    } catch (const std::exception& error) {
+        return ValueResult<msgpack::object_handle>::Err(error.what());
     }
-    const object& root = oh.get();
+}
+
+bool ValidateEnvelopeShape(const object& root, const object** timestamp,
+                           const object** events, const object** dp_rank,
+                           std::string* error) {
     if (root.type != object_type::ARRAY) {
-        // The event batch must be an array; non-arrays are rejected.
-        result.error =
-            "failed to decode event batch: msgpack data is not "
-            "an array (got " +
-            MsgpackTypeName(root) + ")";
-        return result;
+        *error = "expected three-element array envelope, got " + TypeName(root);
+        return false;
     }
-
-    if (root.via.array.size != expected_length) {
-        result.error = "expected " + std::to_string(expected_length) +
-                       "-element array, got " +
-                       std::to_string(root.via.array.size);
-        return result;
+    if (root.via.array.size != 3) {
+        *error = "expected three-element array envelope, got " +
+                 std::to_string(root.via.array.size) + " elements";
+        return false;
     }
-
-    const object& timestamp = root.via.array.ptr[0];
-    const object& events_obj = root.via.array.ptr[1];
-    if (events_obj.type != object_type::ARRAY) {
-        result.error = "invalid events type: " + MsgpackTypeName(events_obj);
-        return result;
+    *timestamp = &root.via.array.ptr[0];
+    *events = &root.via.array.ptr[1];
+    *dp_rank = &root.via.array.ptr[2];
+    if ((*events)->type != object_type::ARRAY) {
+        *error = "events must be an array, got " + TypeName(**events);
+        return false;
     }
+    return true;
+}
 
-    if (events_obj.via.array.size == 0) {
-        LOG(WARNING) << "Received empty event list";
+ValueResult<std::optional<int64_t>> ParseBatchDpRank(const object& value) {
+    auto parsed = ParseNullableInt64(value);
+    if (!parsed.value.has_value()) {
+        return parsed;
     }
-
-    int64_t dp_rank = -1;
-    if (expected_length == 3) {
-        auto parsed = ParseInt64(root.via.array.ptr[2]);
-        if (!parsed.ok) {
-            result.error = "failed to parse dpRank: " + parsed.error;
-            return result;
-        }
-        dp_rank = parsed.value;
+    if (parsed.value->has_value() && **parsed.value < 0) {
+        return ValueResult<std::optional<int64_t>>::Err(
+            "data_parallel_rank must be non-negative or nil");
     }
-
-    result.batch.source = parser.source;
-    result.batch.data_parallel_rank = dp_rank;
-    result.batch.events.reserve(events_obj.via.array.size);
-    LOG(INFO) << "Receive batched kv-event source=" << parser.source
-              << " dpRank=" << dp_rank;
-
-    for (uint32_t i = 0; i < events_obj.via.array.size; ++i) {
-        const object& raw_event = events_obj.via.array.ptr[i];
-        if (raw_event.type != object_type::ARRAY) {
-            result.error = "event at index " + std::to_string(i) +
-                           " is not an array: " + MsgpackTypeName(raw_event);
-            return result;
-        }
-        if (raw_event.via.array.size == 0 ||
-            raw_event.via.array.ptr[0].type != object_type::STR) {
-            result.error = "failed to parse event at index " +
-                           std::to_string(i) + ": invalid event type format: " +
-                           (raw_event.via.array.size == 0
-                                ? "<empty>"
-                                : MsgpackTypeName(raw_event.via.array.ptr[0]));
-            return result;
-        }
-        const object& name_obj = raw_event.via.array.ptr[0];
-        const std::string name(name_obj.via.str.ptr, name_obj.via.str.size);
-
-        const char* event_type = parser.map_event(name);
-        if (event_type == nullptr) {
-            result.error = "failed to parse event at index " +
-                           std::to_string(i) + ": " + parser.unknown_fmt + name;
-            return result;
-        }
-
-        auto parsed = parser.parse(event_type, raw_event, timestamp);
-        if (!parsed.ok) {
-            result.error = "failed to parse event at index " +
-                           std::to_string(i) + ": " + parsed.error;
-            return result;
-        }
-        result.batch.events.push_back(std::move(parsed.value));
-    }
-
-    result.ok = true;
-    return result;
+    return parsed;
 }
 
 }  // namespace
 
-EventBatchResult DecodeMooncakeEventBatch(const char* data, size_t len) {
-    static const ParserSpec kMooncakeParser = {
-        kSourceMooncake, MooncakeEventMapping, MooncakeParse,
-        "unknown mooncake event type: "};
-    return DecodeCommonEventBatch(data, len, 2, kMooncakeParser);
+VllmEventBatchResult DecodeVllmEventBatch(const char* data, size_t len) {
+    auto unpacked = UnpackOne(data, len);
+    if (!unpacked.value.has_value()) {
+        return EnvelopeError<VllmEventBatch>(
+            "failed to decode vLLM envelope: " + unpacked.error);
+    }
+    const object* timestamp = nullptr;
+    const object* events = nullptr;
+    const object* dp_rank = nullptr;
+    std::string error;
+    if (!ValidateEnvelopeShape(unpacked.value->get(), &timestamp, &events,
+                               &dp_rank, &error)) {
+        return EnvelopeError<VllmEventBatch>(error);
+    }
+    if (timestamp->type != object_type::FLOAT32 &&
+        timestamp->type != object_type::FLOAT64) {
+        return EnvelopeError<VllmEventBatch>(
+            "vLLM timestamp must be a float, got " + TypeName(*timestamp));
+    }
+    if (!std::isfinite(timestamp->via.f64)) {
+        return EnvelopeError<VllmEventBatch>("vLLM timestamp must be finite");
+    }
+    auto parsed_rank = ParseBatchDpRank(*dp_rank);
+    if (!parsed_rank.value.has_value()) {
+        return EnvelopeError<VllmEventBatch>(
+            "invalid vLLM data_parallel_rank: " + parsed_rank.error);
+    }
+
+    VllmEventBatch batch{.timestamp_seconds = timestamp->via.f64,
+                         .events = {},
+                         .data_parallel_rank = *parsed_rank.value};
+    batch.events.reserve(events->via.array.size);
+    for (uint32_t index = 0; index < events->via.array.size; ++index) {
+        auto parsed = ParseVllmEvent(events->via.array.ptr[index]);
+        if (parsed.value.has_value()) {
+            batch.events.push_back(
+                {.event = std::move(*parsed.value), .error = ""});
+        } else {
+            batch.events.push_back({.event = std::nullopt,
+                                    .error = "event " + std::to_string(index) +
+                                             ": " + parsed.error});
+        }
+    }
+    return {.ok = true, .batch = std::move(batch), .error = ""};
 }
 
-EventBatchResult DecodeVllmEventBatch(const char* data, size_t len) {
-    static const ParserSpec kVllmParser = {
-        kSourceVLLM, VllmEventMapping, VllmParse, "unknown vllm event type: "};
-    return DecodeCommonEventBatch(data, len, 3, kVllmParser);
+MooncakeEventBatchResult DecodeMooncakeEventBatch(const char* data,
+                                                  size_t len) {
+    auto unpacked = UnpackOne(data, len);
+    if (!unpacked.value.has_value()) {
+        return EnvelopeError<MooncakeEventBatch>(
+            "failed to decode Mooncake envelope: " + unpacked.error);
+    }
+    const object* timestamp = nullptr;
+    const object* events = nullptr;
+    const object* dp_rank = nullptr;
+    std::string error;
+    if (!ValidateEnvelopeShape(unpacked.value->get(), &timestamp, &events,
+                               &dp_rank, &error)) {
+        return EnvelopeError<MooncakeEventBatch>(error);
+    }
+    auto parsed_timestamp = ParseInt64(*timestamp);
+    if (!parsed_timestamp.value.has_value() || *parsed_timestamp.value < 0) {
+        return EnvelopeError<MooncakeEventBatch>(
+            "Mooncake timestamp must be a non-negative integer");
+    }
+    auto parsed_rank = ParseBatchDpRank(*dp_rank);
+    if (!parsed_rank.value.has_value()) {
+        return EnvelopeError<MooncakeEventBatch>(
+            "invalid Mooncake data_parallel_rank: " + parsed_rank.error);
+    }
+
+    MooncakeEventBatch batch{
+        .timestamp_milliseconds = *parsed_timestamp.value,
+        .events = {},
+        .data_parallel_rank = *parsed_rank.value,
+    };
+    batch.events.reserve(events->via.array.size);
+    for (uint32_t index = 0; index < events->via.array.size; ++index) {
+        auto parsed = ParseMooncakeEvent(events->via.array.ptr[index],
+                                         batch.timestamp_milliseconds);
+        if (parsed.value.has_value()) {
+            batch.events.push_back(
+                {.event = std::move(*parsed.value), .error = ""});
+        } else {
+            batch.events.push_back({.event = std::nullopt,
+                                    .error = "event " + std::to_string(index) +
+                                             ": " + parsed.error});
+        }
+    }
+    return {.ok = true, .batch = std::move(batch), .error = ""};
 }
 
 }  // namespace zmq

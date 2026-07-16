@@ -1,82 +1,94 @@
-// ModelContext equality / hashing tests: all six fields must
-// participate — a missed field would cause silent cross-context cache
-// misses. Per-field perturbation must break equality.
-
 #include <gtest/gtest.h>
 
+#include <concepts>
 #include <functional>
+#include <optional>
+#include <string>
 #include <unordered_map>
 
-#include "conductor/prefixindex/prefix_indexer.h"
+#include "conductor/prefixindex/types.h"
 
 namespace {
 
-using conductor::prefixindex::ModelContext;
+using conductor::prefixindex::ContextKey;
+using conductor::prefixindex::EngineRegistration;
+using conductor::prefixindex::GpuMutation;
 
-ModelContext BaseContext() {
-    ModelContext ctx;
-    ctx.model_name = "model-a";
-    ctx.lora_name = "lora-a";
-    ctx.block_size = 16;
-    ctx.additional_salt = "salt-a";
-    ctx.tenant_id = "tenant-a";
-    ctx.instance_id = "instance-a";
-    return ctx;
+template <typename T>
+concept HasInstanceId = requires(T value) { value.instance_id; };
+
+template <typename T>
+concept HasCacheSalt = requires(T value) { value.cache_salt; };
+
+template <typename T>
+concept HasAdditionalSalt = requires(T value) { value.additional_salt; };
+
+template <typename T>
+concept HasCacheGroups = requires(T value) { value.cache_groups; };
+
+static_assert(!HasInstanceId<ContextKey>);
+static_assert(!HasCacheSalt<ContextKey>);
+static_assert(!HasAdditionalSalt<ContextKey>);
+static_assert(!HasCacheGroups<EngineRegistration>);
+static_assert(!HasCacheGroups<GpuMutation>);
+static_assert(std::same_as<decltype(EngineRegistration::cache_group),
+                           std::optional<int64_t>>);
+static_assert(
+    std::same_as<decltype(GpuMutation::cache_group), std::optional<int64_t>>);
+
+ContextKey BaseContext() {
+    return {.tenant_id = "tenant-a",
+            .model_name = "model-a",
+            .lora_name = "lora-a",
+            .block_size = 16};
 }
 
-TEST(ModelContext, EqualToIdenticalCopy) {
-    EXPECT_EQ(BaseContext(), BaseContext());
-    EXPECT_EQ(std::hash<ModelContext>{}(BaseContext()),
-              std::hash<ModelContext>{}(BaseContext()));
+TEST(ContextKey, IdenticalCopiesCompareAndHashEqual) {
+    const ContextKey first = BaseContext();
+    const ContextKey second = first;
+
+    EXPECT_EQ(first, second);
+    EXPECT_EQ(std::hash<ContextKey>{}(first), std::hash<ContextKey>{}(second));
 }
 
-// One test per field: perturbing it must break operator== AND change the
-// behavior of the context as an unordered_map key.
 struct FieldCase {
     const char* name;
-    void (*perturb)(ModelContext*);
+    void (*change)(ContextKey*);
 };
 
-const FieldCase kFieldCases[] = {
-    {"model_name", [](ModelContext* c) { c->model_name = "model-B"; }},
-    {"lora_name", [](ModelContext* c) { c->lora_name = "lora-B"; }},
-    {"block_size", [](ModelContext* c) { c->block_size = 32; }},
-    {"additional_salt", [](ModelContext* c) { c->additional_salt = "salt-B"; }},
-    {"tenant_id", [](ModelContext* c) { c->tenant_id = "tenant-B"; }},
-    {"instance_id", [](ModelContext* c) { c->instance_id = "instance-B"; }},
+const FieldCase kFields[] = {
+    {"tenant_id", [](ContextKey* context) { context->tenant_id = "tenant-b"; }},
+    {"model_name",
+     [](ContextKey* context) { context->model_name = "model-b"; }},
+    {"lora_name", [](ContextKey* context) { context->lora_name = "lora-b"; }},
+    {"block_size", [](ContextKey* context) { context->block_size = 32; }},
 };
 
-TEST(ModelContext, EveryFieldParticipatesInEquality) {
-    for (const auto& fc : kFieldCases) {
-        ModelContext perturbed = BaseContext();
-        fc.perturb(&perturbed);
-        EXPECT_NE(BaseContext(), perturbed) << "field=" << fc.name;
+TEST(ContextKey, ExactlyFourFieldsParticipateInEqualityAndLookup) {
+    std::unordered_map<ContextKey, int> contexts;
+    contexts.emplace(BaseContext(), 1);
+
+    for (const FieldCase& field : kFields) {
+        SCOPED_TRACE(field.name);
+        ContextKey changed = BaseContext();
+        field.change(&changed);
+        EXPECT_NE(changed, BaseContext());
+        EXPECT_FALSE(contexts.contains(changed));
     }
 }
 
-TEST(ModelContext, EveryFieldParticipatesAsMapKey) {
-    std::unordered_map<ModelContext, int> map;
-    map[BaseContext()] = 1;
-    for (const auto& fc : kFieldCases) {
-        ModelContext perturbed = BaseContext();
-        fc.perturb(&perturbed);
-        // The perturbed key must land in its own slot, not alias the base
-        // key (this exercises hash + equality together).
-        EXPECT_EQ(map.find(perturbed), map.end()) << "field=" << fc.name;
-        map[perturbed] = 2;
-        EXPECT_EQ(map.at(BaseContext()), 1) << "field=" << fc.name;
-    }
-    EXPECT_EQ(map.size(), 1 + std::size(kFieldCases));
-}
+TEST(ContextKey, OwnerAndRequestSaltLiveOutsideTheKey) {
+    ContextKey shared = BaseContext();
+    const std::string first_instance = "instance-a";
+    const std::string second_instance = "instance-b";
+    const std::string first_salt = "salt-a";
+    const std::string second_salt = "salt-b";
 
-// Field-swap check: two contexts with the same multiset of string values
-// in different fields must not collide via operator==.
-TEST(ModelContext, SwappedFieldValuesNotEqual) {
-    ModelContext a = BaseContext();
-    ModelContext b = BaseContext();
-    b.tenant_id = a.instance_id;
-    b.instance_id = a.tenant_id;
-    EXPECT_NE(a, b);
+    EXPECT_NE(first_instance, second_instance);
+    EXPECT_NE(first_salt, second_salt);
+    EXPECT_EQ(shared, BaseContext());
+    EXPECT_EQ(std::hash<ContextKey>{}(shared),
+              std::hash<ContextKey>{}(BaseContext()));
 }
 
 }  // namespace

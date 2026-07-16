@@ -1,59 +1,118 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
 
+#include "conductor/common/types.h"
+
 namespace conductor {
 namespace zmq {
 
-// Event type string constants — these values appear verbatim in error
-// messages such as "unhandled event: BlockUpdate".
-inline constexpr const char* kEventTypeBlockStored = "BlockStored";
-inline constexpr const char* kEventTypeBlockRemoved = "BlockRemoved";
-inline constexpr const char* kEventTypeBlockUpdate = "BlockUpdate";
-inline constexpr const char* kEventTypeAllCleared = "AllBlocksCleared";
+using ExternalHash = std::variant<uint64_t, std::vector<uint8_t>>;
 
-inline constexpr const char* kSourceMooncake = "mooncake";
-inline constexpr const char* kSourceVLLM = "vllm";
-
-struct BlockStoredEvent {
-    std::string type = kEventTypeBlockStored;
-    // Unix microseconds; 0 == no timestamp. Only the vLLM BlockStored
-    // parser assigns it (Mooncake parser and BlockRemoved never do).
-    int64_t timestamp_unix_micro = 0;
-    std::vector<uint64_t> block_hashes;
-    std::vector<int32_t> token_ids;
-    uint64_t parent_block_hash = 0;
+struct VllmStoredEvent {
+    std::vector<ExternalHash> block_hashes;
+    std::optional<ExternalHash> parent_block_hash;
+    std::optional<std::vector<int32_t>> token_ids;
     int64_t block_size = 0;
-    std::string mooncake_key;
-    std::vector<std::vector<std::string>> replica_list;
-    std::string model_name;
-    int64_t lora_id = 0;
-    std::string lora_name;
-    std::string pod_name;
-    std::string medium;
+    std::optional<int64_t> lora_id;
+    std::optional<std::string> medium;
+    std::optional<std::string> lora_name;
+    bool extra_keys_present = false;
+    std::optional<int64_t> group_idx;
+    std::optional<std::string> kv_cache_spec_kind;
+    std::optional<int64_t> kv_cache_spec_sliding_window;
 };
 
-struct BlockRemovedEvent {
-    std::string type = kEventTypeBlockRemoved;
-    int64_t timestamp_unix_micro = 0;
-    std::vector<uint64_t> block_hashes;
-    std::string model_name;
-    std::string pod_name;
-    std::string medium;
+struct VllmRemovedEvent {
+    std::vector<ExternalHash> block_hashes;
+    std::optional<std::string> medium;
+    std::optional<int64_t> group_idx;
 };
 
-// KVEvent is the sum type for all KV cache events dispatched through the
-// ZMQ event pipeline; handlers switch over BlockStoredEvent and
-// BlockRemovedEvent (the only concrete types).
-using KVEvent = std::variant<BlockStoredEvent, BlockRemovedEvent>;
+struct VllmClearedEvent {};
 
-struct EventBatch {
-    std::string source;  // origin of the event batch: "vllm" | "mooncake"
-    std::vector<KVEvent> events;
-    int64_t data_parallel_rank = -1;
+using VllmEvent =
+    std::variant<VllmStoredEvent, VllmRemovedEvent, VllmClearedEvent>;
+
+struct MooncakeEventFields {
+    uint64_t event_id = 0;
+    int64_t timestamp_milliseconds = 0;
+    std::optional<std::string> model_name;
+    std::optional<int64_t> block_size;
+    std::optional<std::string> additional_salt;
+    std::optional<std::string> lora_name;
+    std::string tenant_id;
+    std::string backend_id;
+    std::optional<std::string> medium;
+    int64_t data_parallel_rank = 0;
+};
+
+struct MooncakeObjectFields {
+    std::optional<std::string> group_id;
+    std::optional<std::string> object_key;
+    std::optional<std::string> connector_block_hash;
+    std::optional<std::string> cache_prefix;
+    std::optional<int64_t> tp_rank;
+    std::optional<int64_t> head_or_tp_rank;
+    std::optional<int64_t> pcp_rank;
+    std::optional<int64_t> dcp_rank;
+    std::optional<int64_t> pp_rank;
+    std::optional<int64_t> layer_id;
+    std::vector<uint64_t> seq_hashes;
+    std::optional<std::vector<uint64_t>> legacy_block_hashes;
+    std::optional<int64_t> base_block_idx;
+};
+
+struct MooncakeStoredEvent {
+    MooncakeEventFields fields;
+    MooncakeObjectFields object;
+    std::optional<uint64_t> parent_hash;
+    std::optional<std::vector<int32_t>> token_ids;
+};
+
+struct MooncakeRemovedEvent {
+    MooncakeEventFields fields;
+    MooncakeObjectFields object;
+};
+
+struct MooncakeClearedEvent {
+    MooncakeEventFields fields;
+};
+
+using MooncakeEvent = std::variant<MooncakeStoredEvent, MooncakeRemovedEvent,
+                                   MooncakeClearedEvent>;
+
+template <typename Event>
+struct DecodedEvent {
+    std::optional<Event> event;
+    std::string error;
+
+    bool ok() const { return event.has_value(); }
+};
+
+struct VllmEventBatch {
+    double timestamp_seconds = 0;
+    std::vector<DecodedEvent<VllmEvent>> events;
+    std::optional<int64_t> data_parallel_rank;
+};
+
+struct MooncakeEventBatch {
+    int64_t timestamp_milliseconds = 0;
+    std::vector<DecodedEvent<MooncakeEvent>> events;
+    std::optional<int64_t> data_parallel_rank;
+};
+
+using DecodedBatch = std::variant<VllmEventBatch, MooncakeEventBatch>;
+
+struct MessageMetadata {
+    common::PublisherKind publisher_kind = common::PublisherKind::kVllm;
+    std::string endpoint;
+    std::string topic;
+    int64_t sequence = -1;
 };
 
 }  // namespace zmq

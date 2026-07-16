@@ -23,7 +23,8 @@ class EventHandler {
    public:
     virtual ~EventHandler() = default;
     // Returns empty string on success, error message otherwise.
-    virtual std::string HandleEvent(const KVEvent& event, int64_t dp_rank) = 0;
+    virtual std::string HandleBatch(const DecodedBatch& batch,
+                                    const MessageMetadata& metadata) = 0;
 };
 
 struct ZMQClientConfig {
@@ -31,6 +32,7 @@ struct ZMQClientConfig {
     std::string endpoint;
     std::string replay_endpoint;
     std::string model_name;
+    common::PublisherKind publisher_kind = common::PublisherKind::kVllm;
     std::chrono::milliseconds poll_timeout{100};
     std::chrono::milliseconds replay_timeout{5000};
     std::chrono::milliseconds reconnect_delay{1000};

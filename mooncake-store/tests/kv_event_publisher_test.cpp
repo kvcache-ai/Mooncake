@@ -39,8 +39,7 @@ TEST(KvEventKeyUtilTest, ParsesVllmAndVllmAscendConnectorKeys) {
     ASSERT_TRUE(vllm.has_value());
     EXPECT_EQ(vllm->cache_prefix, "deployment-a");
     EXPECT_EQ(vllm->model_name, "model-a");
-    EXPECT_EQ(vllm->block_hash,
-              "0123456789abcdef000000000000002a");
+    EXPECT_EQ(vllm->block_hash, "0123456789abcdef000000000000002a");
     EXPECT_EQ(vllm->seq_hash, 42u);
     EXPECT_EQ(vllm->group_id, 4);
     EXPECT_EQ(vllm->tp_rank, 2);
@@ -63,8 +62,7 @@ TEST(KvEventKeyUtilTest, ParsesVllmAndVllmAscendConnectorKeys) {
         "0123456789abcdef000000000000002c");
     ASSERT_TRUE(ascend.has_value());
     EXPECT_EQ(ascend->model_name, "model-c");
-    EXPECT_EQ(ascend->block_hash,
-              "0123456789abcdef000000000000002c");
+    EXPECT_EQ(ascend->block_hash, "0123456789abcdef000000000000002c");
     EXPECT_EQ(ascend->seq_hash, 44u);
     EXPECT_EQ(ascend->head_or_tp_rank, 2);
     EXPECT_EQ(ascend->pcp_rank, 0);
@@ -78,8 +76,7 @@ TEST(KvEventKeyUtilTest, ParsesVllmAndVllmAscendConnectorKeys) {
         "0123456789abcdef000000000000002d@7");
     ASSERT_TRUE(layerwise.has_value());
     EXPECT_EQ(layerwise->model_name, "model-d");
-    EXPECT_EQ(layerwise->block_hash,
-              "0123456789abcdef000000000000002d");
+    EXPECT_EQ(layerwise->block_hash, "0123456789abcdef000000000000002d");
     EXPECT_EQ(layerwise->seq_hash, 45u);
     EXPECT_EQ(layerwise->head_or_tp_rank, 1);
     EXPECT_EQ(layerwise->layer_id, 7);
@@ -90,8 +87,7 @@ TEST(KvEventKeyUtilTest, ParsesVllmAndVllmAscendConnectorKeys) {
     ASSERT_TRUE(opaque_hash.has_value());
     EXPECT_FALSE(opaque_hash->seq_hash.has_value());
     EXPECT_FALSE(ParseKvEventKey("unstructured-key").has_value());
-    EXPECT_FALSE(ParseKvEventKey(
-                     "@pcp0@dcp0@head_or_tp_rank:0@pp_rank:0@1")
+    EXPECT_FALSE(ParseKvEventKey("@pcp0@dcp0@head_or_tp_rank:0@pp_rank:0@1")
                      .has_value());
 
     const auto same_low64 = ParseKvEventKey(
@@ -483,13 +479,10 @@ TEST(KvEventPublisherTest, PublishesStoreMetadataAndMediumDelta) {
     EXPECT_EQ(MsgpackString(*added_model_name), "model-a");
     EXPECT_EQ(added_parent_hash->type, msgpack::type::NIL);
     EXPECT_EQ(added_token_ids->type, msgpack::type::NIL);
-    EXPECT_EQ(MsgpackString(*removed_hash),
-              "0123456789abcdef000000000000002a");
-    EXPECT_EQ(MsgpackString(*added_hash),
-              "0123456789abcdef000000000000002a");
+    EXPECT_EQ(MsgpackString(*removed_hash), "0123456789abcdef000000000000002a");
+    EXPECT_EQ(MsgpackString(*added_hash), "0123456789abcdef000000000000002a");
 
-    publisher.PublishObjectRemoved(object_key, "tenant-a", "group-a",
-                                   {"disk"});
+    publisher.PublishObjectRemoved(object_key, "tenant-a", "group-a", {"disk"});
     ASSERT_TRUE(ReceiveZmqMultipart(sub, frames));
     auto deleted_handle = msgpack::unpack(frames[2].data(), frames[2].size());
     const auto& deleted =
@@ -502,16 +495,14 @@ TEST(KvEventPublisherTest, PublishesStoreMetadataAndMediumDelta) {
     ASSERT_NE(deleted_hash, nullptr);
     EXPECT_EQ(MsgpackString(*deleted_type), "removed");
     EXPECT_EQ(MsgpackString(*deleted_medium), "disk");
-    EXPECT_EQ(MsgpackString(*deleted_hash),
-              "0123456789abcdef000000000000002a");
+    EXPECT_EQ(MsgpackString(*deleted_hash), "0123456789abcdef000000000000002a");
 
     const std::string layerwise_key =
         "model-b@pcp0@dcp1@head_or_tp_rank:2@"
         "0123456789abcdef000000000000002b@7";
     publisher.PublishStored(layerwise_key, "cpu", "tenant-a");
     ASSERT_TRUE(ReceiveZmqMultipart(sub, frames));
-    auto layerwise_handle =
-        msgpack::unpack(frames[2].data(), frames[2].size());
+    auto layerwise_handle = msgpack::unpack(frames[2].data(), frames[2].size());
     const auto& layerwise_event =
         layerwise_handle.get().via.array.ptr[1].via.array.ptr[0];
     const auto* head_or_tp_rank =
@@ -524,8 +515,7 @@ TEST(KvEventPublisherTest, PublishesStoreMetadataAndMediumDelta) {
     ASSERT_NE(layer_hash, nullptr);
     EXPECT_EQ(head_or_tp_rank->as<int64_t>(), 2);
     EXPECT_EQ(layer_id->as<int64_t>(), 7);
-    EXPECT_EQ(MsgpackString(*layer_hash),
-              "0123456789abcdef000000000000002b");
+    EXPECT_EQ(MsgpackString(*layer_hash), "0123456789abcdef000000000000002b");
     EXPECT_EQ(FindMapValue(layerwise_event, "pp_rank"), nullptr);
 
     const std::string high_bit_hash_key =
@@ -533,8 +523,7 @@ TEST(KvEventPublisherTest, PublishesStoreMetadataAndMediumDelta) {
         "0123456789abcdefffffffffffffffff";
     publisher.PublishStored(high_bit_hash_key, "cpu", "tenant-a");
     ASSERT_TRUE(ReceiveZmqMultipart(sub, frames));
-    auto high_bit_handle =
-        msgpack::unpack(frames[2].data(), frames[2].size());
+    auto high_bit_handle = msgpack::unpack(frames[2].data(), frames[2].size());
     const auto& high_bit_event =
         high_bit_handle.get().via.array.ptr[1].via.array.ptr[0];
     const auto* high_seq_hashes = FindMapValue(high_bit_event, "seq_hashes");
@@ -584,8 +573,8 @@ TEST(KvEventPublisherTest, InvalidHashesDegradeAndClearedIsTenantScoped) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     publisher.PublishStored(
-        "model-a@pcp0@dcp0@head_or_tp_rank:0@pp_rank:0@not-a-hash",
-        "cpu", "tenant-a");
+        "model-a@pcp0@dcp0@head_or_tp_rank:0@pp_rank:0@not-a-hash", "cpu",
+        "tenant-a");
 
     std::vector<std::string> frames;
     ASSERT_TRUE(ReceiveZmqMultipart(sub, frames));
