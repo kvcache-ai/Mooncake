@@ -91,7 +91,7 @@ void TransferEngineMetrics::initHttpServer(const Config& config) {
     using namespace coro_http;
     try {
         http_server_ = std::make_unique<coro_http_server>(
-            config.http_server_threads, config.http_port);
+            config.http_server_threads, config.http_port, config.http_host);
 
         http_server_->set_http_handler<GET>(
             "/metrics", [this](coro_http_request&, coro_http_response& resp) {
@@ -138,14 +138,14 @@ void TransferEngineMetrics::shutdown() {
 }
 
 void TransferEngineMetrics::recordSubmitted() {
-    if (!isEnabled()) return;
+    if (!isInitialized() || !isEnabled()) return;
     requests_total_.inc();
     inflight_transfers_.inc();
 }
 
 void TransferEngineMetrics::recordCompleted(size_t bytes,
                                             double latency_seconds) {
-    if (!isEnabled()) return;
+    if (!isInitialized() || !isEnabled()) return;
     if (bytes > 0) {
         bytes_total_.inc(static_cast<double>(bytes));
     }
@@ -159,7 +159,7 @@ void TransferEngineMetrics::recordCompleted(size_t bytes,
 }
 
 void TransferEngineMetrics::recordFailed() {
-    if (!isEnabled()) return;
+    if (!isInitialized() || !isEnabled()) return;
     failures_total_.inc();
     inflight_transfers_.dec();
 }

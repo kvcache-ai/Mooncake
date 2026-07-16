@@ -41,17 +41,16 @@ class TransferEngineImplTestPeer {
         return engine.multi_transports_->allocateBatchID(size);
     }
 
-    // Append one task backed by `transport`, marked as submitted (start_time
-    // set), mirroring what submitTransfer() does on the metrics path.
+    // Append one task backed by `transport` and run it through the real
+    // MultiTransport submission-metrics path (stamps start_time and calls
+    // recordSubmitted), exactly as submitTransfer() does before posting.
     static void addSubmittedTask(BatchID batch_id, Transport* transport) {
         auto& batch = Transport::toBatchDesc(batch_id);
         batch.task_list.emplace_back();
         auto& task = batch.task_list.back();
         task.batch_id = batch_id;
         task.transport_ = transport;
-#ifdef WITH_METRICS
-        task.start_time = std::chrono::steady_clock::now();
-#endif
+        markTaskSubmitted(task);
     }
 
     static void markAllFinished(BatchID batch_id) {
@@ -63,6 +62,14 @@ class TransferEngineImplTestPeer {
 
     static void freeBatch(TransferEngineImpl& engine, BatchID batch_id) {
         engine.multi_transports_->freeBatchID(batch_id);
+    }
+
+    // Expose MultiTransport's private submission-metrics helpers for testing.
+    static void markTaskSubmitted(Transport::TransferTask& task) {
+        MultiTransport::markTaskSubmitted(task);
+    }
+    static void rollbackTaskSubmission(Transport::TransferTask& task) {
+        MultiTransport::rollbackTaskSubmission(task);
     }
 };
 
@@ -215,11 +222,11 @@ TEST_F(TransferEngineImplMetricsTest,
     TransferEngineImplTestPeer::installTransport(engine, transport);
 
     BatchID batch = TransferEngineImplTestPeer::allocateBatch(engine, 1);
+    // addSubmittedTask runs the real submission-metrics path (recordSubmitted).
     TransferEngineImplTestPeer::addSubmittedTask(batch, transport.get());
 
     auto& m = TransferEngineMetrics::instance();
-    // Pretend the task was submitted (submit path increments this).
-    m.recordSubmitted();
+    EXPECT_EQ(m.requestsTotal(), 1);
     EXPECT_EQ(m.inflightTransfers(), 1);
 
     // Poll several times: metrics must be recorded exactly once.
@@ -249,7 +256,7 @@ TEST_F(TransferEngineImplMetricsTest, FailedTaskPollRecordsSingleFailure) {
     TransferEngineImplTestPeer::addSubmittedTask(batch, transport.get());
 
     auto& m = TransferEngineMetrics::instance();
-    m.recordSubmitted();
+    EXPECT_EQ(m.inflightTransfers(), 1);
 
     TransferStatus status;
     for (int i = 0; i < 3; ++i) {
@@ -262,6 +269,55 @@ TEST_F(TransferEngineImplMetricsTest, FailedTaskPollRecordsSingleFailure) {
 
     TransferEngineImplTestPeer::markAllFinished(batch);
     TransferEngineImplTestPeer::freeBatch(engine, batch);
+}
+
+// Reproduces the async-completion scenario: the task is already terminal by the
+// time the caller polls it exactly once. Because start_time is stamped at
+// submit (before posting), the single poll still records completion and clears
+// the inflight gauge — there is no permanent inflight leak.
+TEST_F(TransferEngineImplMetricsTest,
+       SinglePollOnAlreadyTerminalTaskIsRecorded) {
+    TransferEngineImpl engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12397"), 0);
+
+    auto transport = std::make_shared<FakeTransport>(
+        Transport::TransferStatusEnum::COMPLETED, 4096);
+    TransferEngineImplTestPeer::installTransport(engine, transport);
+
+    BatchID batch = TransferEngineImplTestPeer::allocateBatch(engine, 1);
+    TransferEngineImplTestPeer::addSubmittedTask(batch, transport.get());
+
+    auto& m = TransferEngineMetrics::instance();
+    ASSERT_EQ(m.inflightTransfers(), 1);
+
+    TransferStatus status;
+    ASSERT_TRUE(engine.getTransferStatus(batch, 0, status).ok());
+    EXPECT_EQ(status.s, Transport::TransferStatusEnum::COMPLETED);
+
+    EXPECT_EQ(m.requestsTotal(), 1);
+    EXPECT_EQ(m.bytesTotal(), 4096);
+    EXPECT_EQ(m.inflightTransfers(), 0);  // no leak
+
+    TransferEngineImplTestPeer::markAllFinished(batch);
+    TransferEngineImplTestPeer::freeBatch(engine, batch);
+}
+
+// A task that is submission-recorded but then rolled back (transport failed to
+// post it) must not leak the inflight gauge, and is counted as a failure.
+TEST_F(TransferEngineMetricsTest, SubmissionRollbackBalancesInflight) {
+    auto& m = metrics();
+
+    Transport::BatchDesc batch;
+    batch.task_list.emplace_back();
+    auto& task = batch.task_list.back();
+
+    TransferEngineImplTestPeer::markTaskSubmitted(task);
+    EXPECT_EQ(m.requestsTotal(), 1);
+    EXPECT_EQ(m.inflightTransfers(), 1);
+
+    TransferEngineImplTestPeer::rollbackTaskSubmission(task);
+    EXPECT_EQ(m.failuresTotal(), 1);
+    EXPECT_EQ(m.inflightTransfers(), 0);  // balanced
 }
 
 #endif  // WITH_METRICS

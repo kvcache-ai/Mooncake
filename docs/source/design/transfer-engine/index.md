@@ -522,9 +522,11 @@ it with `MC_TE_METRIC=1`. To scrape the metrics over HTTP, also set
 
 Metrics are compiled in only when the project is built with `-DWITH_METRICS=ON`
 (the default). Every transfer is recorded exactly once: a request is counted at
-submission time, and exactly one completion or failure is recorded when the
-task first reaches a terminal state, so repeated polling of
-`getTransferStatus` never double counts.
+submission time (before the task is handed to its transport, so the count is not
+lost to a fast asynchronous completion), and exactly one completion or failure
+is recorded when the task first reaches a terminal state. Repeated polling of
+`getTransferStatus` never double counts, and the `inflight_transfers` gauge
+always returns to its baseline.
 
 | Metric Name | Type | Description |
 |-------------|------|-------------|

@@ -20,6 +20,9 @@
 
 #include "config.h"
 #include "multi_transport_locality.h"
+#ifdef WITH_METRICS
+#include "transfer_engine_metrics.h"
+#endif
 #include "transport/rdma_transport/rdma_transport.h"
 #ifdef USE_BAREX
 #include "transport/barex_transport/barex_transport.h"
@@ -112,6 +115,35 @@ Status MultiTransport::freeBatchID(BatchID batch_id) {
     return Status::OK();
 }
 
+void MultiTransport::markTaskSubmitted(Transport::TransferTask& task) {
+#ifdef WITH_METRICS
+    // Only stamp/record once per task, and only while metrics collection is
+    // active (initialized == the process-wide MC_TE_METRIC switch). The runtime
+    // enable/disable state is handled inside recordSubmitted() itself.
+    if (!TransferEngineMetrics::instance().isInitialized()) return;
+    if (task.start_time.time_since_epoch().count() != 0) return;
+    task.start_time = std::chrono::steady_clock::now();
+    TransferEngineMetrics::instance().recordSubmitted();
+#else
+    (void)task;
+#endif
+}
+
+void MultiTransport::rollbackTaskSubmission(Transport::TransferTask& task) {
+#ifdef WITH_METRICS
+    if (!TransferEngineMetrics::instance().isInitialized()) return;
+    if (task.start_time.time_since_epoch().count() == 0) return;
+    // Clear the stamp first so a later getTransferStatus() poll on this task
+    // cannot record the terminal metrics a second time.
+    task.start_time = std::chrono::steady_clock::time_point();
+    // A task that could not be posted to its transport is a failed transfer:
+    // count the failure and release its slot in the inflight gauge.
+    TransferEngineMetrics::instance().recordFailed();
+#else
+    (void)task;
+#endif
+}
+
 Status MultiTransport::submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest>& entries) {
     auto& batch_desc = *((BatchDesc*)(batch_id));
@@ -138,6 +170,13 @@ Status MultiTransport::submitTransfer(
 #else
         task.request = &request;
 #endif
+        // Stamp the submission time and count the request BEFORE posting the
+        // task to the transport. The transport may complete (or fail) the task
+        // asynchronously as soon as it is posted, and getTransferStatus() only
+        // records completion/failure metrics for tasks whose start_time is set.
+        // Setting it here closes that race and keeps the inflight gauge
+        // balanced regardless of how fast the transport finishes.
+        markTaskSubmitted(task);
         ++task_id;
         submit_tasks[transport].push_back(&task);
     }
@@ -147,6 +186,11 @@ Status MultiTransport::submitTransfer(
         if (!status.ok()) {
             // LOG(ERROR) << "Failed to submit transfer task to "
             //            << entry.first->getName();
+            // Roll back the metrics for tasks that never made it onto the wire
+            // so the request/inflight counters stay consistent.
+            for (auto* task : entry.second) {
+                rollbackTaskSubmission(*task);
+            }
             overall_status = status;
         }
     }
@@ -181,6 +225,9 @@ Status MultiTransport::mp_submitTransfer(
 #else
         task.request = &request;
 #endif
+        // See submitTransfer(): stamp submission time / count the request
+        // before posting to avoid a race with asynchronous completion.
+        markTaskSubmitted(task);
         ++task_id;
         submit_tasks[transport].push_back(&task);
     }
@@ -190,6 +237,9 @@ Status MultiTransport::mp_submitTransfer(
         if (!status.ok()) {
             // LOG(ERROR) << "Failed to submit transfer task to "
             //            << entry.first->getName();
+            for (auto* task : entry.second) {
+                rollbackTaskSubmission(*task);
+            }
             overall_status = status;
         }
     }

@@ -72,6 +72,16 @@ class MultiTransport {
     void *getBaseAddr();
 
    private:
+    // Stamp a task's submission time (used for latency) and record it in the
+    // metrics system. Called before the task is posted to its transport so the
+    // metrics are consistent even if the transport completes it asynchronously.
+    // No-op unless WITH_METRICS and metrics are initialized.
+    static void markTaskSubmitted(Transport::TransferTask &task);
+
+    // Undo markTaskSubmitted() for a task that failed to be posted, keeping the
+    // request / inflight metrics balanced.
+    static void rollbackTaskSubmission(Transport::TransferTask &task);
+
     Status selectTransport(const TransferRequest &entry, Transport *&transport);
 
 #ifdef ENABLE_MULTI_PROTOCOL
