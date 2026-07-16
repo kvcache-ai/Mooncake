@@ -133,8 +133,7 @@ tl::expected<int64_t, ErrorCode> ShardedStorageBackend::BatchOffload(
     std::function<ErrorCode(const std::vector<std::string>& keys,
                             std::vector<StorageObjectMetadata>& metadatas)>
         complete_handler,
-    std::function<void(const std::vector<std::string>& evicted_keys)>
-        eviction_handler) {
+    EvictionHandler eviction_handler) {
     if (batch_object.empty()) {
         return tl::make_unexpected(ErrorCode::INVALID_KEY);
     }
@@ -167,6 +166,12 @@ tl::expected<int64_t, ErrorCode> ShardedStorageBackend::BatchOffload(
         if (!batches[i].empty()) active_backends.push_back(i);
     }
 
+    // Child backends may invoke their eviction callbacks concurrently. The
+    // caller's handler is not required to be thread-safe, so serialize those
+    // notifications while still returning each result to the originating
+    // child. This preserves the child's rollback-on-notification-failure
+    // contract introduced by StorageBackendInterface::EvictionHandler.
+    std::mutex eviction_handler_mutex;
     auto run_offload = [&](size_t i) {
         results[i].status = backends_[i]->BatchOffload(
             batches[i],
@@ -176,9 +181,18 @@ tl::expected<int64_t, ErrorCode> ShardedStorageBackend::BatchOffload(
                 results[i].metadatas = metadatas;
                 return ErrorCode::OK;
             },
-            [&, i](const std::vector<std::string>& keys) {
+            [&, i](const std::vector<std::string>& keys)
+                -> tl::expected<void, ErrorCode> {
+                if (eviction_handler) {
+                    std::lock_guard lock(eviction_handler_mutex);
+                    auto notify_result = eviction_handler(keys);
+                    if (!notify_result) {
+                        return tl::make_unexpected(notify_result.error());
+                    }
+                }
                 results[i].evicted_keys.insert(results[i].evicted_keys.end(),
                                                keys.begin(), keys.end());
+                return {};
             });
     };
 
@@ -212,9 +226,6 @@ tl::expected<int64_t, ErrorCode> ShardedStorageBackend::BatchOffload(
     }
 
     EraseRoutes(evicted_keys);
-    if (eviction_handler && !evicted_keys.empty()) {
-        eviction_handler(evicted_keys);
-    }
     if (!completed_keys.empty() && complete_handler) {
         ErrorCode error = complete_handler(completed_keys, completed_metadatas);
         if (error != ErrorCode::OK) return tl::make_unexpected(error);

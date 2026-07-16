@@ -308,6 +308,62 @@ TEST_F(StorageBackendTest, ShardedBackendRejectsEmptyBackendList) {
         std::invalid_argument);
 }
 
+TEST_F(StorageBackendTest, ShardedBackendPropagatesEvictionHandlerFailure) {
+    const auto child_path = (fs::path(data_path) / "eviction-child").string();
+    fs::create_directories(child_path);
+
+    FileStorageConfig config;
+    config.storage_backend_type = StorageBackendType::kBucket;
+    config.storage_filepath = child_path;
+    config.total_size_limit = 1024 * 1024 * 1024;
+    config.total_keys_limit = 1024;
+
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 10;
+    bucket_config.bucket_size_limit = 8 * 1024;
+    bucket_config.max_total_size = 10 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+
+    auto child = std::make_shared<BucketStorageBackend>(config, bucket_config);
+    ShardedStorageBackend backend(config, {child});
+    ASSERT_TRUE(backend.Init());
+
+    auto complete_handler = [](const std::vector<std::string>&,
+                               std::vector<StorageObjectMetadata>&) {
+        return ErrorCode::OK;
+    };
+    std::string old_value(6 * 1024, 'A');
+    std::unordered_map<std::string, std::vector<Slice>> old_batch;
+    old_batch.emplace("old-key", std::vector<Slice>{Slice{old_value.data(),
+                                                          old_value.size()}});
+    ASSERT_TRUE(backend.BatchOffload(old_batch, complete_handler));
+
+    std::string incoming_value(6 * 1024, 'B');
+    std::unordered_map<std::string, std::vector<Slice>> incoming_batch;
+    incoming_batch.emplace("incoming-key",
+                           std::vector<Slice>{Slice{incoming_value.data(),
+                                                    incoming_value.size()}});
+    std::vector<std::string> notified_keys;
+    auto result = backend.BatchOffload(
+        incoming_batch, complete_handler,
+        [&](const std::vector<std::string>& keys)
+            -> tl::expected<void, ErrorCode> {
+            notified_keys = keys;
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        });
+
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(notified_keys, std::vector<std::string>{"old-key"});
+
+    auto old_exists = backend.IsExist("old-key");
+    ASSERT_TRUE(old_exists);
+    EXPECT_TRUE(old_exists.value());
+    auto incoming_exists = backend.IsExist("incoming-key");
+    ASSERT_TRUE(incoming_exists);
+    EXPECT_FALSE(incoming_exists.value());
+}
+
 TEST_F(StorageBackendTest, StorageBackendAll) {
     std::shared_ptr<SimpleAllocator> client_buffer_allocator =
         std::make_shared<SimpleAllocator>(128 * 1024 * 1024);
