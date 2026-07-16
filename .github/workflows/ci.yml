@@ -110,7 +110,7 @@ jobs:
     - name: Build project
       run: |
         cd build
-        cmake --build .
+        cmake --build . --parallel 1
         sudo cmake --install .
       shell: bash
 
