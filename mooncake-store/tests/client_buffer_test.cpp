@@ -1,5 +1,5 @@
 // client_buffer_test.cpp
-#include "client_buffer.hpp"
+#include "client_buffer.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstring>
+#include <new>
 #include <thread>
 #include <vector>
 
@@ -58,6 +59,35 @@ TEST_F(ClientBufferTest, ZeroSizeAllocator) {
     auto handle_opt = allocator->allocate(1024);
     EXPECT_FALSE(handle_opt.has_value());
 }
+
+#if defined(USE_NOF)
+TEST_F(ClientBufferTest, SpdkDmaAllocatorDestroysWithSpdkFree) {
+    constexpr size_t buffer_size = 4096;
+    constexpr size_t alloc_size = 64;
+
+    std::shared_ptr<ClientBufferAllocator> allocator;
+    try {
+        allocator = ClientBufferAllocator::create(
+            buffer_size, "tcp", /*use_hugepage=*/false,
+            /*use_spdk_dma=*/true);
+    } catch (const std::bad_alloc&) {
+        GTEST_SKIP()
+            << "SPDK DMA allocation is unavailable in this environment";
+    }
+
+    ASSERT_NE(allocator, nullptr);
+    VerifyAlignment(allocator->getBase());
+
+    {
+        auto handle_opt = allocator->allocate(alloc_size);
+        ASSERT_TRUE(handle_opt.has_value());
+        BufferHandle handle = std::move(handle_opt.value());
+        VerifyBufferHandle(handle, alloc_size);
+    }
+
+    allocator.reset();
+}
+#endif
 
 // Test multiple allocations
 TEST_F(ClientBufferTest, MultipleAllocations) {

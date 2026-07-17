@@ -49,24 +49,49 @@ Retrieve replica information for a specific key, including memory locations and 
 
 **Method**: `GET`
 **Parameters**: `key` (query parameter) - The object key to query
-**Content-Type**: `text/plain; version=0.0.4`
-**Response**: JSON-formatted replica descriptors for memory replicas
+**Content-Type**: `application/json; charset=utf-8`
+**Response**: JSON object with success status and replica data array
 
 **Example**:
 ```bash
 curl "http://localhost:8080/query_key?key=my_object"
 ```
 
-**Response Format**:
-```text
+**Success Response** (HTTP 200):
+```json
 {
-  "transport_endpoint_": "hostname:port",
-  "buffer_descriptors": [...]
+  "success": true,
+  "data": [
+    {
+      "size_": 1073741824,
+      "buffer_address_": 140732000000000,
+      "protocol_": "rdma",
+      "transport_endpoint_": "192.168.1.100:12345"
+    }
+  ]
+}
+```
+
+**Error Response** (key not found, HTTP 404):
+```json
+{
+  "success": false,
+  "error_code": -704,
+  "error_message": "OBJECT_NOT_FOUND"
+}
+```
+
+**Error Response** (service unavailable, HTTP 503):
+```json
+{
+  "success": false,
+  "error_code": -1011,
+  "error_message": "service plane is not active"
 }
 ```
 
 #### `/batch_query_keys`
-Retrieve replica information for multiple keys in a single request, including memory locations and transport endpoints for each key.
+Retrieve replica information for multiple keys in a single request, including memory locations and transport endpoints for each key. The endpoint performs a read-only metadata lookup and does not grant leases, trigger promotion, or update cache-hit metrics.
 
 **Method**: `GET`
 **Parameters**: `keys` (query parameter) - Comma-separated list of object keys to query (format: key1,key2,key3)
@@ -90,6 +115,25 @@ curl "http://localhost:8080/batch_query_keys?keys=key1,key2,key3"
           "transport_endpoint_": "hostname:port",
           "buffer_descriptor": {...}
         }
+      ],
+      "disk_values": [
+        {
+          "file_path": "/path/to/object",
+          "object_size": 4096
+        }
+      ],
+      "local_disk_values": [
+        {
+          "client_id": "12345-67890",
+          "object_size": 4096,
+          "transport_endpoint": "hostname:port"
+        }
+      ],
+      "nof_values": [
+        {
+          "transport_endpoint_": "hostname:port",
+          "buffer_descriptor": {...}
+        }
       ]
     },
     "key2": {
@@ -99,6 +143,8 @@ curl "http://localhost:8080/batch_query_keys?keys=key1,key2,key3"
   }
 }
 ```
+
+The `values` field is always present (empty array when no memory replica exists). The `disk_values`, `local_disk_values`, and `nof_values` fields are optional and only appear when the corresponding replica type is present for the key.
 
 #### `/get_all_keys`
 List all keys currently stored in the distributed system.
@@ -205,7 +251,7 @@ Basic health check endpoint for service availability verification.
 **Method**: `GET`
 **Content-Type**: `text/plain; version=0.0.4`
 **Response**: `OK` when service is healthy
-**Status Codes**: 
+**Status Codes**:
 - `200 OK`: Service is healthy
 - Other: Service may be experiencing issues
 

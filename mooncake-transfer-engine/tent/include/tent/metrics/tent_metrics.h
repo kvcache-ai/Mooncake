@@ -81,6 +81,21 @@ class TentMetrics {
     void recordWriteFailed(size_t bytes);
     void recordTransportFailover();
 
+    // Record the deadline feasibility ratio (MLU) for a completed transfer
+    // that carried a deadline. mlu = actual_transfer_seconds / window_seconds,
+    // where window_seconds is (deadline - submit_time). mlu < 1 means the
+    // transfer met its deadline; mlu >= 1 means it missed. Observability only.
+    void recordDeadlineMLU(double mlu);
+
+    enum class Stage {
+        QueueWait,
+        Dispatch,
+        Transport,
+    };
+
+    // Causal chain: record per-stage latency breakdown (microseconds).
+    void recordStageLatency(Stage stage, double latency_us);
+
     // Get metrics for HTTP server
     std::string getPrometheusMetrics();
     std::string getJsonMetrics();
@@ -160,6 +175,32 @@ class TentMetrics {
     ylt::metric::histogram_t write_size_{
         "tent_write_size_bytes", "Write request size distribution in bytes",
         kSizeBuckets};
+
+    // Deadline feasibility ratio (MLU) distribution for transfers that carried
+    // a deadline. Stored in per-mille (MLU x 1000) so the histogram can use
+    // integer observe() like the others; the 1000 boundary is MLU == 1.0, the
+    // feasible/infeasible line (< 1000 met the deadline, >= 1000 missed it).
+    static inline const std::vector<double> kMluPerMilleBuckets{
+        100, 250, 500, 750, 900, 1000, 1250, 1500, 2000, 5000};
+    ylt::metric::histogram_t deadline_mlu_{
+        "tent_deadline_mlu_permille",
+        "Deadline feasibility ratio (MLU x 1000) distribution",
+        kMluPerMilleBuckets};
+
+    // Causal chain stage latency histograms (microseconds)
+    // Buckets span 10us to 500ms to capture both fast RDMA and slower TCP.
+    static inline const std::vector<double> kStageBuckets{
+        10, 50, 100, 500, 1000, 5000, 10000, 50000, 100000, 500000};
+    ylt::metric::histogram_t stage_queue_wait_{
+        "tent_stage_queue_wait_us",
+        "Causal chain: queue wait latency in microseconds", kStageBuckets};
+    ylt::metric::histogram_t stage_dispatch_{
+        "tent_stage_dispatch_us",
+        "Causal chain: dispatch latency in microseconds", kStageBuckets};
+    ylt::metric::histogram_t stage_transport_{
+        "tent_stage_transport_us",
+        "Causal chain: transport execution latency in microseconds",
+        kStageBuckets};
 
     // Helper to register all metrics to the vectors
     void registerMetrics();
@@ -266,6 +307,14 @@ class ScopedLatencyRecorder {
     ::mooncake::tent::ScopedLatencyRecorder _tent_latency_recorder_( \
         ::mooncake::tent::ScopedLatencyRecorder::OperationType::Write, bytes)
 
+#define TENT_RECORD_STAGE_LATENCY(stage, latency_us)                      \
+    do {                                                                  \
+        if (::mooncake::tent::TentMetrics::isEnabled()) {                 \
+            ::mooncake::tent::TentMetrics::instance().recordStageLatency( \
+                stage, latency_us);                                       \
+        }                                                                 \
+    } while (0)
+
 #else  // !TENT_METRICS_ENABLED
 
 // No-op stub class for ScopedLatencyRecorder when metrics are disabled
@@ -284,6 +333,7 @@ class ScopedLatencyRecorder {
 #define TENT_RECORD_TRANSPORT_FAILOVER() ((void)0)
 #define TENT_SCOPED_READ_LATENCY(bytes) ((void)0)
 #define TENT_SCOPED_WRITE_LATENCY(bytes) ((void)0)
+#define TENT_RECORD_STAGE_LATENCY(stage, latency_us) ((void)0)
 
 #endif  // TENT_METRICS_ENABLED
 

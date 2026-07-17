@@ -1,5 +1,5 @@
 [default]
-extend-ignore-words = ["CANN", "ASO", "fre", "wqs", "hsa"]
+extend-ignore-words = ["CANN", "ASO", "fre", "wqs", "hsa", "ue"]
 
 [default.extend-words]
 CANN = "CANN"
@@ -9,8 +9,13 @@ wqs = "wqs"
 # AMD HSA runtime symbol prefix (hsa_*, hsaRes, hsaErr, etc.) — used by the
 # ROCm dmabuf MR registration path.
 hsa = "hsa"
+Optin = "Optin"
+HPE = "HPE"
 
 [files]
 extend-exclude = [
   "mooncake-transfer-engine/tent/include/tent/thirdparty/nlohmann/json.h",
+  # DeepEP-derived elastic kernel headers keep upstream identifiers such as
+  # `ue8m0x4`; exclude the imported header block from spelling checks.
+  "mooncake-ep/include/elastic/*",
 ]

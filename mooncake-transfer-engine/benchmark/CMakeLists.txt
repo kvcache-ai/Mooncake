@@ -30,6 +30,8 @@ file(GLOB TEBENCH_SOURCES "*.cpp")
 # translation unit (which pulls in tent/ headers) from non-TENT builds.
 if(NOT USE_TENT)
   list(REMOVE_ITEM TEBENCH_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/tent_backend.cpp")
+  list(APPEND TEBENCH_SOURCES
+       "${CMAKE_CURRENT_SOURCE_DIR}/../tent/src/common/qos_metrics.cpp")
 endif()
 add_executable(tebench ${TEBENCH_SOURCES})
 target_link_libraries(tebench PUBLIC transfer_engine)
@@ -55,6 +57,30 @@ if(USE_SUNRISE)
 endif()
 
 # Set RPATH for finding libasio.so at runtime
+if(USE_SUNRISE AND MC_TANGRT_ROOT)
+  set(TANGRT_RPATH ":${MC_TANGRT_ROOT}/lib")
+else()
+  set(TANGRT_RPATH "")
+endif()
 set_target_properties(
   tebench PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE
-                     INSTALL_RPATH "$ORIGIN/../lib:$ORIGIN/../../mooncake-common")
+                     INSTALL_RPATH "$ORIGIN/../lib:$ORIGIN/../../mooncake-common${TANGRT_RPATH}")
+
+if(BUILD_UNIT_TESTS)
+  add_executable(tebench_qos_metrics_test tests/qos_metrics_test.cpp
+                                          qos_metrics_adapter.cpp utils.cpp)
+  if(NOT USE_TENT)
+    target_sources(tebench_qos_metrics_test PRIVATE
+                   ../tent/src/common/qos_metrics.cpp)
+  endif()
+  target_link_libraries(tebench_qos_metrics_test
+                        PRIVATE transfer_engine gtest gtest_main)
+  if(USE_TENT)
+    target_link_libraries(tebench_qos_metrics_test PRIVATE tent_common)
+  endif()
+  target_include_directories(
+    tebench_qos_metrics_test
+    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../tent/include")
+  add_test(NAME tebench_qos_metrics_test COMMAND tebench_qos_metrics_test)
+endif()

@@ -73,7 +73,20 @@ int EfaContext::construct(size_t num_cq_list, size_t max_cqe,
     }
 
     hints_->caps =
-        FI_MSG | FI_RMA | FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE;
+        FI_MSG | FI_RMA | FI_READ | FI_WRITE | FI_REMOTE_READ |
+        FI_REMOTE_WRITE
+#if defined(USE_CUDA) || defined(USE_HIP)
+        // Declare FI_HMEM so the provider wires up HMEM-aware copy routines
+        // (cudaMemcpy) on every data path, including the intra-node SHM SAR
+        // segmentation/reassembly path. Registering device memory via
+        // FI_MR_HMEM alone is NOT enough: without FI_HMEM in caps the SHM
+        // sub-provider initializes its copy callbacks in plain-host mode and
+        // does a host memcpy() straight into a CUDA device VA during SAR,
+        // which SIGSEGVs in __memcpy_avx512_unaligned_erms.
+        // See https://github.com/ofiwg/libfabric/issues/12328.
+        | FI_HMEM
+#endif
+        ;
     hints_->mode = FI_CONTEXT;
     hints_->ep_attr->type = FI_EP_RDM;  // EFA uses RDM endpoints
     hints_->fabric_attr->prov_name = strdup("efa");

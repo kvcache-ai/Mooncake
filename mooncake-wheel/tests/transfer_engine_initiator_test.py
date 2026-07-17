@@ -268,6 +268,31 @@ class TestVLLMAdaptorTransfer(unittest.TestCase):
             f"[✓] {circles} rounds of batch_write_async_read passed, batch size {batch_size}."
         )
 
+    def test_async_submit_to_unknown_peer_returns_zero(self):
+        """Async submit APIs return the documented failure sentinel 0.
+
+        openSegment failure used to surface as -1 cast through the unsigned
+        batch_id_t, i.e. 2**64 - 1, which passes the documented
+        `batch_id != 0` failure check and crashes get_batch_transfer_status.
+        """
+        # "unreachable_peer:9" is not registered with the metadata server, so
+        # openSegment fails before any buffer address is dereferenced.
+        batch_id = self.adaptor.batch_transfer_async_write(
+            "unreachable_peer:9", [0], [0], [16]
+        )
+        self.assertEqual(
+            batch_id,
+            0,
+            f"batch_transfer_async_write to unknown peer returned {batch_id}",
+        )
+
+        batch_id = self.adaptor.transfer_submit_write("unreachable_peer:9", 0, 0, 16)
+        self.assertEqual(
+            batch_id,
+            0,
+            f"transfer_submit_write to unknown peer returned {batch_id}",
+        )
+
     def test_send_probe_reachable_peer(self):
         """send_probe against a registered, reachable peer returns 0."""
         rc = self.adaptor.send_probe(self.target_server_name)

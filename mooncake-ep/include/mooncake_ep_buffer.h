@@ -16,6 +16,7 @@
 namespace mooncake {
 
 class TransferEngine;
+class MooncakeElasticBuffer;
 
 // MAX_QP_COUNT is defined in mooncake_ep_configs.cuh (shared with kernel code).
 
@@ -42,7 +43,7 @@ struct BufferPair {
         size_t signaling_buffer_bytes = num_experts * sizeof(int);
         size_t send_recv_buffer_bytes =
             num_experts * num_max_dispatch_tokens_per_rank *
-            (2 * sizeof(int4) + hidden * sizeof(nv_bfloat16));
+            (2 * sizeof(int4) + hidden * EP_BF16_SIZE);
         for (int i = 0; i < 2; ++i) {
             size_t rdma_base_offset = total_bytes +
                                       2 * i * signaling_buffer_bytes +
@@ -64,6 +65,8 @@ struct BufferPair {
 
 struct MooncakeEpBuffer {
    private:
+    friend class MooncakeElasticBuffer;
+
     // Device info and communication
     int device_id;
     int rank, num_ranks;
@@ -71,6 +74,7 @@ struct MooncakeEpBuffer {
 
     // GDR buffer — owned by p2p_transport_
     int buffer_idx{};
+    int phase_epochs[2]{};
     int64_t num_ep_buffer_bytes;
     void* gdr_buffer = nullptr;
 
@@ -88,6 +92,11 @@ struct MooncakeEpBuffer {
     bool ibgda_disabled_ = false;
 
     int USE_QP_COUNT = MAX_QP_COUNT;
+    // Cap on active RoCE QPs per peer: spreading small EP messages across too
+    // many QP/doorbell/progress streams hurts when GPUs share an HCA. Default
+    // 8; override at runtime with MOONCAKE_EP_ACTIVE_QPS_PER_RANK (>= per-rank
+    // QP count disables).
+    int active_qps_cap_ = 8;
 
     // Stream for communication
     at::cuda::CUDAStream comm_stream;

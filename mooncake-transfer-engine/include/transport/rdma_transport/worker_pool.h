@@ -31,6 +31,11 @@ class WorkerPool {
     // Add slices to queue, called by Transport
     int submitPostSend(const std::vector<Transport::Slice *> &slice_list);
 
+    void trackPostedSlices(const std::vector<Transport::Slice *> &slice_list,
+                           size_t first, size_t count);
+    void untrackPostedSlices(const std::vector<Transport::Slice *> &slice_list,
+                             size_t first, size_t count);
+
    private:
     void performPostSend(int thread_id);
 
@@ -39,6 +44,8 @@ class WorkerPool {
     void redispatch(std::vector<Transport::Slice *> &slice_list, int thread_id);
 
     void transferWorker(int thread_id);
+
+    bool hasOutstandingCq(int thread_id);
 
     void monitorWorker();
 
@@ -60,6 +67,8 @@ class WorkerPool {
     // and optionally deletes the endpoint
     void handlePathFailure(const std::string &peer_nic_path,
                            RdmaEndPoint *endpoint = nullptr);
+    void refreshPublishedLocalTopology();
+    GidRefreshResult refreshPublishedLocalGid();
 
     // Context-level health tracking for catastrophic hardware failure.
     // When all rails through a local RNIC are unavailable, increment the
@@ -86,7 +95,18 @@ class WorkerPool {
 
     std::vector<std::thread> worker_thread_;
     std::atomic<bool> workers_running_;
-    std::atomic<int> suspended_flag_;
+
+    std::atomic<int> parked_worker_count_;
+
+    // The poll worker updates these on every poll pass. The monitor worker
+    // reads them when CQ entries stay outstanding, so a transfer timeout can
+    // be distinguished from a stalled poller.
+    std::atomic<uint64_t> last_poll_ts_ns_{0};
+    std::atomic<uint64_t> last_poll_interval_ns_{0};
+    std::atomic<uint64_t> max_poll_interval_ns_{0};
+
+    std::mutex posted_slices_mutex_;
+    std::unordered_set<Transport::Slice *> posted_slices_;
 
     std::atomic<int> redispatch_counter_;
 

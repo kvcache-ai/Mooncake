@@ -68,6 +68,13 @@ struct XferBenchConfig {
     static int duration;
     static int max_num_threads;
     static int start_num_threads;
+    static std::string qos_classes;
+    static std::string qos_classes_json;
+    static double qos_link_capacity_gbps;
+    static std::string qos_output_jsonl;
+    static uint64_t deadline_us;
+    static int deadline_tight_threads;
+    static bool deadline_bw_arbitration;
 
     static std::string metadata_type;
     static std::string metadata_url_list;
@@ -76,6 +83,7 @@ struct XferBenchConfig {
     static std::string backend;
     static bool notifi;
     static std::string tent_transport_hint;
+    static std::string tent_intent_type;
 
     static int local_gpu_id;
     static int target_gpu_id;
@@ -107,7 +115,19 @@ struct XferMetricStats {
 
     double p999() { return percentile(99.9); }
 
+    double fractionAtOrBelow(double threshold) const {
+        if (samples.empty()) return 0.0;
+        const auto count = std::count_if(
+            samples.begin(), samples.end(),
+            [threshold](double value) { return value <= threshold; });
+        return static_cast<double>(count) / samples.size();
+    }
+
     void add(double value) { samples.push_back(value); }
+
+    void add(const std::vector<double>& values) {
+        samples.insert(samples.end(), values.begin(), values.end());
+    }
 
     void clear() { samples.clear(); }
 
@@ -153,6 +173,10 @@ void printStatsHeader();
 void printStats(size_t block_size, size_t batch_size, XferBenchStats& stats,
                 int num_threads);
 
+void printDeadlineGroupStats(const char* group, size_t block_size,
+                             size_t batch_size, XferBenchStats& stats,
+                             int num_threads, uint64_t deadline_us);
+
 #if defined(USE_CUDA) || defined(USE_SUNRISE)
 static inline bool isCudaMemory(void* ptr) {
     cudaPointerAttributes attr;
@@ -190,7 +214,10 @@ static inline uint8_t fillData(void* addr, size_t length) {
 #elif defined(USE_SUNRISE)
     if (isCudaMemory(addr)) {
         std::vector<uint8_t> ref_data(length, seed);
-        tangMemcpy(addr, ref_data.data(), length, tangMemcpyHostToDevice);
+        auto err =
+            cudaMemcpy(addr, ref_data.data(), length, cudaMemcpyHostToDevice);
+        LOG_ASSERT(err == cudaSuccess)
+            << "cudaMemcpy failed: " << cudaGetErrorString(err);
         return seed;
     }
 #endif
@@ -219,7 +246,10 @@ static inline void verifyData(void* addr, size_t length, uint8_t seed) {
 #elif defined(USE_SUNRISE)
     if (isCudaMemory(addr)) {
         std::vector<uint8_t> act_data(length);
-        tangMemcpy(act_data.data(), addr, length, tangMemcpyDeviceToHost);
+        auto err =
+            cudaMemcpy(act_data.data(), addr, length, cudaMemcpyDeviceToHost);
+        LOG_ASSERT(err == cudaSuccess)
+            << "cudaMemcpy failed: " << cudaGetErrorString(err);
         if (memcmp(act_data.data(), ref_data.data(), length)) {
             LOG(FATAL) << "Inconsistent data detected";
         }

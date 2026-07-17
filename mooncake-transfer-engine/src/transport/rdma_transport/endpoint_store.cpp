@@ -94,13 +94,15 @@ int FIFOEndpointStore::deleteEndpoint(const std::string &peer_nic_path) {
     return 0;
 }
 
-int FIFOEndpointStore::deleteEndpointByPtr(const RdmaEndPoint *endpoint_ptr) {
+int FIFOEndpointStore::deleteEndpointByPtr(const RdmaEndPoint *endpoint_ptr,
+                                           std::string *deleted_peer_nic_path) {
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     // Find endpoint by pointer
     for (auto iter = endpoint_map_.begin(); iter != endpoint_map_.end();
          ++iter) {
         if (iter->second.get() == endpoint_ptr) {
             std::string peer_nic_path = iter->first;
+            if (deleted_peer_nic_path) *deleted_peer_nic_path = peer_nic_path;
             waiting_list_len_++;
             iter->second->beginDestroy();
             waiting_list_.insert(iter->second);
@@ -142,16 +144,36 @@ void FIFOEndpointStore::reclaimEndpoint() {
 size_t FIFOEndpointStore::getSize() { return endpoint_map_.size(); }
 
 int FIFOEndpointStore::destroyQPs() {
-    for (auto &kv : endpoint_map_) {
-        kv.second->destroyQP();
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    int ret = 0;
+
+    // Always transition QPs to ERR before destroy to flush inflight WRs.
+    for (auto &endpoint : waiting_list_) {
+        endpoint->beginDestroy();
     }
-    return 0;
+    for (auto &kv : endpoint_map_) {
+        kv.second->beginDestroy();
+    }
+
+    for (auto &endpoint : waiting_list_) {
+        if (endpoint->destroyQP()) ret = -1;
+    }
+    for (auto &kv : endpoint_map_) {
+        if (kv.second->destroyQP()) ret = -1;
+    }
+    return ret;
 }
 
 int FIFOEndpointStore::disconnectQPs() {
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     for (auto &kv : endpoint_map_) {
-        kv.second->disconnect();
+        kv.second->beginDestroy();
+        waiting_list_.insert(kv.second);
     }
+    waiting_list_len_ += endpoint_map_.size();
+    endpoint_map_.clear();
+    fifo_list_.clear();
+    fifo_map_.clear();
     return 0;
 }
 
@@ -248,13 +270,15 @@ int SIEVEEndpointStore::deleteEndpoint(const std::string &peer_nic_path) {
     return 0;
 }
 
-int SIEVEEndpointStore::deleteEndpointByPtr(const RdmaEndPoint *endpoint_ptr) {
+int SIEVEEndpointStore::deleteEndpointByPtr(
+    const RdmaEndPoint *endpoint_ptr, std::string *deleted_peer_nic_path) {
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     // Find endpoint by pointer
     for (auto iter = endpoint_map_.begin(); iter != endpoint_map_.end();
          ++iter) {
         if (iter->second.first.get() == endpoint_ptr) {
             std::string peer_nic_path = iter->first;
+            if (deleted_peer_nic_path) *deleted_peer_nic_path = peer_nic_path;
             iter->second.first->beginDestroy();
             waiting_list_len_++;
             waiting_list_.insert(iter->second.first);
@@ -312,14 +336,35 @@ void SIEVEEndpointStore::reclaimEndpoint() {
 }
 
 int SIEVEEndpointStore::destroyQPs() {
-    for (auto &endpoint : waiting_list_) endpoint->destroyQP();
-    for (auto &kv : endpoint_map_) kv.second.first->destroyQP();
-    return 0;
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    int ret = 0;
+
+    // Always transition QPs to ERR before destroy to flush inflight WRs.
+    for (auto &endpoint : waiting_list_) {
+        endpoint->beginDestroy();
+    }
+    for (auto &kv : endpoint_map_) {
+        kv.second.first->beginDestroy();
+    }
+
+    for (auto &endpoint : waiting_list_)
+        if (endpoint->destroyQP()) ret = -1;
+    for (auto &kv : endpoint_map_)
+        if (kv.second.first->destroyQP()) ret = -1;
+    return ret;
 }
 
 int SIEVEEndpointStore::disconnectQPs() {
-    for (auto &endpoint : waiting_list_) endpoint->disconnect();
-    for (auto &kv : endpoint_map_) kv.second.first->disconnect();
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    for (auto &kv : endpoint_map_) {
+        kv.second.first->beginDestroy();
+        waiting_list_.insert(kv.second.first);
+    }
+    waiting_list_len_ += endpoint_map_.size();
+    endpoint_map_.clear();
+    fifo_list_.clear();
+    fifo_map_.clear();
+    hand_ = std::nullopt;
     return 0;
 }
 

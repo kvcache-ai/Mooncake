@@ -79,6 +79,10 @@ class RdmaTransport : public Transport {
     virtual Status getTransferStatus(SubBatchRef batch, int task_id,
                                      TransferStatus& status);
 
+    bool supportsCancellation() const override { return true; }
+
+    Status cancelTransferTask(SubBatchRef batch, int task_id) override;
+
     virtual Status addMemoryBuffer(BufferDesc& desc,
                                    const MemoryOptions& options);
 
@@ -90,6 +94,8 @@ class RdmaTransport : public Transport {
     bool warmupMemory(void* addr, size_t length) override;
 
     virtual const char* getName() const { return "rdma"; }
+
+    double getEstimatedBandwidth() const override;
 
     virtual bool supportNotification() const override { return true; }
 
@@ -140,10 +146,12 @@ class RdmaTransport : public Transport {
 
     // Map QP number to Endpoint for notification processing
     RWSpinlock notify_endpoint_map_lock_;
-    std::unordered_map<uint32_t, RdmaEndPoint*> notify_qp_to_endpoint_;
+    std::unordered_map<uint32_t, std::weak_ptr<RdmaEndPoint>>
+        notify_qp_to_endpoint_;
 
     // Register/unregister notification QP (called by Endpoint)
-    void registerNotifyQp(uint32_t qp_num, RdmaEndPoint* endpoint);
+    void registerNotifyQp(uint32_t qp_num,
+                          const std::shared_ptr<RdmaEndPoint>& endpoint);
     void unregisterNotifyQp(uint32_t qp_num);
     std::shared_ptr<RdmaEndPoint> getEndpoint(SegmentID target_id,
                                               int device_id);
