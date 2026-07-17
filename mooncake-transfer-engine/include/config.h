@@ -68,6 +68,14 @@ struct GlobalConfig {
     int log_level = google::INFO;
     bool trace = false;
     int64_t slice_timeout = -1;
+    // Active-connect circuit-breaker. After an endpoint to a peer is torn down
+    // (path failure / QP fatal), pause active reconnection to that peer's
+    // address for this many milliseconds, so the posting worker is not
+    // blocked re-handshaking a likely-gone peer (a k8s rolling restart brings
+    // the pod back at a different podIP:port, so the old address is dead). The
+    // not-yet-posted slices fail/redispatch instead of hanging. 0 disables.
+    // Override via MC_CONN_PAUSE_TTL_MS.
+    int conn_pause_ttl_ms = 0;
     uint16_t rpc_min_port = 15000;
     uint16_t rpc_max_port = 17000;
     bool use_ipv6 = false;
