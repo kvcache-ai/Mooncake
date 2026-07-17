@@ -512,6 +512,10 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     // orphaned offloading_tasks and release source replica refcounts.
     std::vector<OffloadTaskItem> failed_tasks;
     std::unordered_set<std::string> all_bucket_keys;
+    // Set when a whole-cycle error aborts the bucket loop early. We still fall
+    // through to the NACK flush below before returning it, so no drained key is
+    // left waiting on the TTL reaper.
+    std::optional<ErrorCode> abort_error;
 
     for (const auto& keys : buckets_keys) {
         for (const auto& k : keys) all_bucket_keys.insert(k);
@@ -589,6 +593,14 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             }
         }
 
+        // If every object in this bucket failed D2H staging, host_batch_object
+        // is empty (those keys are already in failed_tasks). Skip BatchOffload,
+        // which rejects an empty map as INVALID_KEY and would otherwise trip the
+        // whole-cycle abort below for a bucket that has nothing left to persist.
+        if (host_batch_object.empty()) {
+            continue;
+        }
+
         auto offload_start = std::chrono::steady_clock::now();
         auto bucket_complete_handler =
             [this, offload_start, complete_handler](
@@ -628,22 +640,29 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         if (!offload_res) {
             LOG(ERROR) << "Failed to store objects with error: "
                        << offload_res.error();
+            // This bucket did not persist, so report its keys back to the
+            // master as failed regardless of whether we continue or abort.
+            // Doing it here (rather than only on the soft path) keeps their
+            // offloading tasks and source-replica refcounts from leaking until
+            // the put_start_release_timeout_sec_ TTL reaper fires.
+            for (const auto& [key, _] : host_batch_object) {
+                failed_tasks.push_back(task_by_storage_key.at(key));
+            }
             if (offload_res.error() == ErrorCode::KEYS_ULTRA_LIMIT) {
+                // Disk is over the key-count limit: stop offloading entirely.
                 MutexLocker locker(&offloading_mutex_);
                 enable_offloading_ = false;
-                return tl::make_unexpected(offload_res.error());
             }
-            if (IsPerBucketSoftOffloadError(offload_res.error())) {
-                // Only this bucket failed to persist; report its keys back to
-                // the master as failed (releasing their offloading tasks and
-                // source-replica refcounts) and keep processing the remaining
-                // buckets instead of aborting the whole offload cycle.
-                for (const auto& [key, _] : host_batch_object) {
-                    failed_tasks.push_back(task_by_storage_key.at(key));
-                }
-            } else {
-                return tl::make_unexpected(offload_res.error());
+            if (!IsPerBucketSoftOffloadError(offload_res.error())) {
+                // Whole-cycle error (KEYS_ULTRA_LIMIT or any hard failure):
+                // stop processing further buckets, but fall through to the NACK
+                // flush below so every drained key is released. Unvisited
+                // buckets are not yet in all_bucket_keys, so the sweep NACKs
+                // them too; this bucket's keys were just pushed above.
+                abort_error = offload_res.error();
+                break;
             }
+            // Soft per-bucket error: keep processing the remaining buckets.
         }
     }
 
@@ -670,6 +689,9 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         }
     }
 
+    if (abort_error) {
+        return tl::make_unexpected(*abort_error);
+    }
     return {};
 }
 
