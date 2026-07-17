@@ -11768,10 +11768,10 @@ fn eviction_reclaims_stale_local_allocation_even_with_tiny_scan_limit() {
 }
 
 #[test]
-fn eviction_stale_prepass_does_not_release_route_missing_ghost() {
+fn eviction_reclaims_route_deleted_orphan_when_prepass_is_rate_limited() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
-    let transport = Arc::new(TestTransport::new("evict-missing-ghost-segment"));
-    let client = StoreClientBuilder::new(metadata, "evict-missing-ghost")
+    let transport = Arc::new(TestTransport::new("evict-deleted-orphan-segment"));
+    let client = StoreClientBuilder::new(metadata, "evict-deleted-orphan")
         .state(ClientLifecycleState::Active)
         .label("storage", "true")
         .route_control(RouteControlMode::MetadataOnly)
@@ -11784,7 +11784,7 @@ fn eviction_stale_prepass_does_not_release_route_missing_ghost() {
         .expect("local memory should register");
 
     let route = client
-        .put("missing-ghost-key", b"0123456789abcdef")
+        .put("deleted-orphan-key", b"0123456789abcdef")
         .expect("initial put should succeed");
     wait_for_storage_clock_route(&client, &route, false);
     assert_eq!(
@@ -11800,37 +11800,32 @@ fn eviction_stale_prepass_does_not_release_route_missing_ghost() {
     assert!(cas.applied, "route delete CAS should apply");
     assert!(
         client
-            .query_route("missing-ghost-key")
+            .query_route("deleted-orphan-key")
             .expect("route query should succeed")
             .is_none(),
-        "test setup should simulate a route-missing local ghost"
+        "test setup should simulate a deleted route with local orphan bytes"
     );
 
     client
         .storage_owner
         .stale_reclaim_scan_completed_at_ms
-        .store(0, Ordering::Relaxed);
-    let reclaimed = client
-        .storage_owner
-        .reclaim_stale_local_allocations_before_clock_eviction(None)
-        .expect("route-missing stale pre-pass should not error");
-    assert_eq!(
-        reclaimed, 0,
-        "route-missing/current-None is not authoritative proof for allocator release"
-    );
-    assert_eq!(
-        client.allocator.lock().usage_bytes().0,
-        16,
-        "route-missing ghost bytes must remain allocated until a confirmed cleanup path owns them"
-    );
+        .store(now_ms(), Ordering::Relaxed);
+    client
+        .put("deleted-orphan-fresh", b"fedcba9876543210")
+        .expect("fresh key should reclaim and reuse space from the deleted route");
+
     let tracked_allocations = {
         let clock = client.storage_owner.hot_replicas.clock.lock();
         clock.allocation_spans_for_key(&route.key)
     };
+    assert!(
+        tracked_allocations.is_empty(),
+        "released route-deleted orphan should be removed from CLOCK tracking"
+    );
     assert_eq!(
-        tracked_allocations.len(),
-        1,
-        "pre-pass should not drop tracking when route absence is inconclusive"
+        client.allocator.lock().usage_bytes().0,
+        16,
+        "fresh write should reuse the reclaimed capacity"
     );
 }
 
