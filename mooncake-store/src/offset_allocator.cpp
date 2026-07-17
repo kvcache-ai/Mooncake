@@ -657,9 +657,19 @@ void OffsetAllocator::freeAllocation(const OffsetAllocation& allocation,
     MutexLocker lock(&m_mutex);
     if (m_allocator) {
         m_allocator->free(allocation);
-        // Update lightweight metrics
-        m_allocated_size -= size;
-        m_allocated_num--;
+        // Update lightweight metrics.  Saturate instead of wrapping:
+        // recovery may free nodes whose exact requested size is unknown
+        // (corrupt record), and an unsigned underflow would poison the
+        // metric permanently.
+        if (size > m_allocated_size) {
+            LOG(WARNING) << "freeAllocation: size " << size
+                         << " exceeds allocated_size " << m_allocated_size
+                         << " -- clamping to 0";
+            m_allocated_size = 0;
+        } else {
+            m_allocated_size -= size;
+        }
+        if (m_allocated_num > 0) m_allocated_num--;
     }
 }
 

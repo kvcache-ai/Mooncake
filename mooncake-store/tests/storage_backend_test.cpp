@@ -4099,4 +4099,301 @@ TEST_F(StorageBackendTest,
     }
 }
 
+//-----------------------------------------------------------------------------
+// OffsetAllocatorStorageBackend Persistence / Recovery Tests
+//-----------------------------------------------------------------------------
+
+namespace {
+
+// Loads a single key into a heap buffer; nullopt when the key is missing
+// or the read fails.
+std::optional<std::string> LoadOne(OffsetAllocatorStorageBackend& backend,
+                                   const std::string& key, size_t value_size) {
+    auto buf = std::make_unique<char[]>(value_size);
+    std::unordered_map<std::string, Slice> load;
+    load.emplace(key, Slice{buf.get(), value_size});
+    auto res = backend.BatchLoad(load);
+    if (!res) return std::nullopt;
+    return std::string(buf.get(), value_size);
+}
+
+auto NoopCompleteHandler() {
+    return [](const std::vector<std::string>&,
+              std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; };
+}
+
+auto AcceptAllEvictionHandler() {
+    return
+        [](const std::vector<std::string>&) -> tl::expected<void, ErrorCode> {
+            return {};
+        };
+}
+
+FileStorageConfig MakeOffsetPersistConfig(const std::string& data_path,
+                                          int64_t size_limit) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.storage_backend_type = StorageBackendType::kOffsetAllocator;
+    config.total_size_limit = size_limit;
+    config.total_keys_limit = 100;
+    return config;
+}
+
+}  // namespace
+
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_Persist_RecoveryRoundtrip) {
+    // kStrict: every batch checkpoints.  After a graceful restart the
+    // recovered backend must serve all keys with their exact values.
+    auto config = MakeOffsetPersistConfig(data_path, 64 * 1024);
+    OffsetAllocatorBackendConfig backend_cfg;
+    backend_cfg.persist_mode = OffsetPersistMode::kStrict;
+
+    const std::string value_a(1000, 'a');
+    const std::string value_b(1500, 'b');
+    const std::string value_c(777, 'c');
+    {
+        OffsetAllocatorStorageBackend backend(config, backend_cfg);
+        ASSERT_TRUE(backend.Init());
+        std::vector<std::unique_ptr<char[]>> buffers;
+        for (const auto& kv :
+             {std::pair{"key_a", &value_a}, std::pair{"key_b", &value_b},
+              std::pair{"key_c", &value_c}}) {
+            auto batch = MakeSingleKeyBatch(kv.first, *kv.second, buffers);
+            auto res =
+                backend.BatchOffload(batch, NoopCompleteHandler(), nullptr);
+            ASSERT_TRUE(res.has_value()) << "key=" << kv.first;
+            ASSERT_EQ(res.value(), 1);
+        }
+    }  // graceful destruction (final checkpoint is a no-op for kStrict)
+
+    OffsetAllocatorStorageBackend recovered(config, backend_cfg);
+    ASSERT_TRUE(recovered.Init());
+    EXPECT_EQ(LoadOne(recovered, "key_a", value_a.size()),
+              std::make_optional(value_a));
+    EXPECT_EQ(LoadOne(recovered, "key_b", value_b.size()),
+              std::make_optional(value_b));
+    EXPECT_EQ(LoadOne(recovered, "key_c", value_c.size()),
+              std::make_optional(value_c));
+    EXPECT_FALSE(recovered.IsExist("key_missing").value_or(true));
+}
+
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_Persist_RelaxedDestructorCheckpoint) {
+    // kRelaxed with a long interval only checkpoints the first batch;
+    // the destructor's final checkpoint must cover the rest.
+    auto config = MakeOffsetPersistConfig(data_path, 64 * 1024);
+    OffsetAllocatorBackendConfig backend_cfg;
+    backend_cfg.persist_mode = OffsetPersistMode::kRelaxed;
+    backend_cfg.persist_interval_seconds = 3600;
+
+    const std::string value_a(1000, 'a');
+    const std::string value_b(1000, 'b');
+    {
+        OffsetAllocatorStorageBackend backend(config, backend_cfg);
+        ASSERT_TRUE(backend.Init());
+        std::vector<std::unique_ptr<char[]>> buffers;
+        // First batch: checkpoint fires (last_persist_time_us_ == 0).
+        auto batch_a = MakeSingleKeyBatch("key_a", value_a, buffers);
+        ASSERT_TRUE(
+            backend.BatchOffload(batch_a, NoopCompleteHandler(), nullptr)
+                .has_value());
+        // Second batch: inside the interval, no checkpoint until shutdown.
+        auto batch_b = MakeSingleKeyBatch("key_b", value_b, buffers);
+        ASSERT_TRUE(
+            backend.BatchOffload(batch_b, NoopCompleteHandler(), nullptr)
+                .has_value());
+    }  // destructor must checkpoint key_b
+
+    OffsetAllocatorStorageBackend recovered(config, backend_cfg);
+    ASSERT_TRUE(recovered.Init());
+    EXPECT_EQ(LoadOne(recovered, "key_a", value_a.size()),
+              std::make_optional(value_a));
+    EXPECT_EQ(LoadOne(recovered, "key_b", value_b.size()),
+              std::make_optional(value_b));
+}
+
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_Persist_EvictionTombstone) {
+    // An evicted key must NOT be resurrected by recovery: the checkpoint
+    // records a tombstone for it.
+    auto config = MakeOffsetPersistConfig(data_path, 4 * 1024);
+    OffsetAllocatorBackendConfig backend_cfg;
+    backend_cfg.eviction_policy = OffsetEvictionPolicy::FIFO;
+    backend_cfg.persist_mode = OffsetPersistMode::kStrict;
+
+    std::vector<std::string> evicted;
+    auto eviction_handler = [&evicted](const std::vector<std::string>& keys) {
+        for (const auto& k : keys) evicted.push_back(k);
+        return tl::expected<void, ErrorCode>{};
+    };
+
+    const std::string data(1000, 'x');
+    {
+        OffsetAllocatorStorageBackend backend(config, backend_cfg);
+        ASSERT_TRUE(backend.Init());
+        std::vector<std::unique_ptr<char[]>> buffers;
+        for (const auto& key : {"key_a", "key_b", "key_c", "key_d"}) {
+            auto batch = MakeSingleKeyBatch(key, data, buffers);
+            auto res = backend.BatchOffload(batch, NoopCompleteHandler(),
+                                            eviction_handler);
+            ASSERT_TRUE(res.has_value()) << "key=" << key;
+        }
+        ASSERT_FALSE(evicted.empty());
+        EXPECT_EQ(evicted[0], "key_a");
+        EXPECT_FALSE(backend.IsExist("key_a").value_or(true));
+    }
+
+    OffsetAllocatorStorageBackend recovered(config, backend_cfg);
+    ASSERT_TRUE(recovered.Init());
+    EXPECT_FALSE(recovered.IsExist("key_a").value_or(true))
+        << "evicted key_a must not be resurrected by recovery";
+    for (const auto& key : {"key_b", "key_c", "key_d"}) {
+        EXPECT_EQ(LoadOne(recovered, key, data.size()),
+                  std::make_optional(data))
+            << "key=" << key;
+    }
+}
+
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_Persist_DetectsCorruptRecord) {
+    // A torn/partial write after the last checkpoint must be detected via
+    // CRC and skipped, while intact records survive recovery.
+    auto config = MakeOffsetPersistConfig(data_path, 64 * 1024);
+    OffsetAllocatorBackendConfig backend_cfg;
+    backend_cfg.persist_mode = OffsetPersistMode::kStrict;
+
+    constexpr size_t kRecordHeaderSize = 20;  // RecordHeader::SIZE (v2)
+
+    std::unordered_map<std::string, StorageObjectMetadata> metas;
+    auto capturing_handler =
+        [&metas](const std::vector<std::string>& keys,
+                 std::vector<StorageObjectMetadata>& metadatas) {
+            for (size_t i = 0; i < keys.size(); ++i) {
+                metas.emplace(keys[i], metadatas[i]);
+            }
+            return ErrorCode::OK;
+        };
+
+    const std::string value_a(1000, 'a');
+    const std::string value_b(1000, 'b');
+    {
+        OffsetAllocatorStorageBackend backend(config, backend_cfg);
+        ASSERT_TRUE(backend.Init());
+        std::vector<std::unique_ptr<char[]>> buffers;
+        auto batch_a = MakeSingleKeyBatch("key_a", value_a, buffers);
+        ASSERT_TRUE(backend.BatchOffload(batch_a, capturing_handler, nullptr)
+                        .has_value());
+        auto batch_b = MakeSingleKeyBatch("key_b", value_b, buffers);
+        ASSERT_TRUE(backend.BatchOffload(batch_b, capturing_handler, nullptr)
+                        .has_value());
+    }
+    ASSERT_EQ(metas.count("key_a"), 1u);
+
+    // Flip one byte inside key_a's value region (header stays intact, so
+    // only the CRC can catch this).
+    {
+        const auto& meta = metas.at("key_a");
+        const off_t corrupt_pos = static_cast<off_t>(meta.offset) +
+                                  kRecordHeaderSize + meta.key_size + 10;
+        const std::string data_file = data_path + "/kv_cache.data";
+        int fd = open(data_file.c_str(), O_RDWR);
+        ASSERT_GE(fd, 0);
+        char byte;
+        ASSERT_EQ(pread(fd, &byte, 1, corrupt_pos), 1);
+        byte ^= 0xFF;
+        ASSERT_EQ(pwrite(fd, &byte, 1, corrupt_pos), 1);
+        fsync(fd);
+        close(fd);
+    }
+
+    OffsetAllocatorStorageBackend recovered(config, backend_cfg);
+    ASSERT_TRUE(recovered.Init());
+    EXPECT_FALSE(recovered.IsExist("key_a").value_or(true))
+        << "CRC-corrupted record must be skipped on recovery";
+    EXPECT_EQ(LoadOne(recovered, "key_b", value_b.size()),
+              std::make_optional(value_b));
+}
+
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_Persist_RejectsPostCheckpointWrite) {
+    // Crash window: a write (and the eviction that made room for it)
+    // happens AFTER the last checkpoint.  On recovery from that
+    // checkpoint the new record carries a seq >= the checkpoint's
+    // insert_seq and must be dropped rather than resurrected as a
+    // phantom key.
+    auto config = MakeOffsetPersistConfig(data_path, 2 * 1024);
+    OffsetAllocatorBackendConfig backend_cfg;
+    backend_cfg.eviction_policy = OffsetEvictionPolicy::FIFO;
+    backend_cfg.persist_mode = OffsetPersistMode::kRelaxed;
+    backend_cfg.persist_interval_seconds = 3600;  // no periodic checkpoint
+
+    const std::string data(1000, 'x');
+    {
+        OffsetAllocatorStorageBackend backend(config, backend_cfg);
+        ASSERT_TRUE(backend.Init());
+        std::vector<std::unique_ptr<char[]>> buffers;
+
+        // Batch 1: key_k is written and checkpointed (M1).  The eviction
+        // handler must be non-null for the key to enter the FIFO index
+        // (eviction is inert when the handler is null).
+        auto batch_k = MakeSingleKeyBatch("key_k", data, buffers);
+        auto res_k = backend.BatchOffload(batch_k, NoopCompleteHandler(),
+                                          AcceptAllEvictionHandler());
+        ASSERT_TRUE(res_k.has_value());
+        ASSERT_EQ(res_k.value(), 1);
+
+        // Simulate a crash from here on: no more checkpoints.
+        backend.SetSkipFinalCheckpointForTest();
+
+        // Batch 2: the arena (2KB) only fits one ~1KB record, so key_j
+        // evicts key_k and reuses its extent -- but M1 never learns
+        // about it.
+        auto batch_j = MakeSingleKeyBatch("key_j", data, buffers);
+        auto res = backend.BatchOffload(batch_j, NoopCompleteHandler(),
+                                        AcceptAllEvictionHandler());
+        ASSERT_TRUE(res.has_value());
+        ASSERT_EQ(res.value(), 1) << "key_j must reuse key_k's extent";
+        ASSERT_TRUE(backend.IsExist("key_j").value_or(false));
+        ASSERT_FALSE(backend.IsExist("key_k").value_or(true));
+    }
+
+    OffsetAllocatorStorageBackend recovered(config, backend_cfg);
+    ASSERT_TRUE(recovered.Init());
+    EXPECT_FALSE(recovered.IsExist("key_j").value_or(true))
+        << "post-checkpoint write must be dropped (seq >= insert_seq)";
+    EXPECT_FALSE(recovered.IsExist("key_k").value_or(true))
+        << "key_k's extent was reused; nothing valid remains at M1";
+}
+
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_Persist_OversizedKeyRejected) {
+    // Keys above kMaxKeyLen (1MB) are rejected at write time so they
+    // cannot silently vanish on recovery (which enforces the same cap).
+    auto config = MakeOffsetPersistConfig(data_path, 4 * 1024 * 1024);
+    OffsetAllocatorBackendConfig backend_cfg;
+    backend_cfg.persist_mode = OffsetPersistMode::kStrict;
+
+    OffsetAllocatorStorageBackend backend(config, backend_cfg);
+    ASSERT_TRUE(backend.Init());
+    std::vector<std::unique_ptr<char[]>> buffers;
+
+    const std::string huge_key(1024 * 1024 + 1, 'k');
+    const std::string small_value(32, 'v');
+    auto batch = MakeSingleKeyBatch(huge_key, small_value, buffers);
+    auto res = backend.BatchOffload(batch, NoopCompleteHandler(), nullptr);
+    ASSERT_TRUE(res.has_value());
+    EXPECT_EQ(res.value(), 0) << "oversized key must be skipped";
+    EXPECT_FALSE(backend.IsExist(huge_key).value_or(true));
+
+    // Boundary: exactly 1MB is accepted.
+    const std::string max_key(1024 * 1024, 'm');
+    auto batch_max = MakeSingleKeyBatch(max_key, small_value, buffers);
+    auto res_max =
+        backend.BatchOffload(batch_max, NoopCompleteHandler(), nullptr);
+    ASSERT_TRUE(res_max.has_value());
+    EXPECT_EQ(res_max.value(), 1);
+    EXPECT_TRUE(backend.IsExist(max_key).value_or(false));
+}
+
 }  // namespace mooncake::test

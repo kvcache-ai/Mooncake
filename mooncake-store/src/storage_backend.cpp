@@ -23,6 +23,7 @@
 
 #include "mutex.h"
 #include "utils.h"
+#include "crc32c.h"
 
 #include <ylt/util/tl/expected.hpp>
 
@@ -3457,6 +3458,10 @@ OffsetAllocatorStorageBackend::~OffsetAllocatorStorageBackend() {
         if (cfg_.persist_mode == OffsetPersistMode::kDisabled) return;
         if (!initialized_.load(std::memory_order_acquire)) return;
         if (!data_file_) return;
+        if (test_skip_final_checkpoint_.load(std::memory_order_relaxed)) {
+            // Test hook: simulate an abrupt crash (no final checkpoint).
+            return;
+        }
 
         if (!metadata_dirty_.load(std::memory_order_relaxed)) {
             // Nothing to persist.
@@ -3598,18 +3603,30 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
         }
 
         // ---- Recovery path ----
-        if (cfg_.persist_mode != OffsetPersistMode::kDisabled &&
-            TryRecoverFromMetadata()) {
-            last_persist_time_us_.store(
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now().time_since_epoch())
-                    .count(),
-                std::memory_order_relaxed);
-            initialized_.store(true, std::memory_order_release);
-            LOG(INFO) << "OffsetAllocatorStorageBackend recovered: "
-                      << total_keys_.load() << " keys, " << total_size_.load()
-                      << " bytes";
-            return {};
+        if (cfg_.persist_mode != OffsetPersistMode::kDisabled) {
+            const RecoveryResult recovery = TryRecoverFromMetadata();
+            if (recovery == RecoveryResult::kTransientError) {
+                // A momentary resource error (fd exhaustion, OOM, I/O
+                // error) must not wipe a recoverable cache: fail Init
+                // and let the operator retry instead of falling through
+                // to the fresh-start path below.
+                LOG(ERROR) << "Transient error during recovery; failing "
+                              "Init to protect persisted data";
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            if (recovery == RecoveryResult::kRecovered) {
+                last_persist_time_us_.store(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count(),
+                    std::memory_order_relaxed);
+                initialized_.store(true, std::memory_order_release);
+                LOG(INFO) << "OffsetAllocatorStorageBackend recovered: "
+                          << total_keys_.load() << " keys, "
+                          << total_size_.load() << " bytes";
+                return {};
+            }
+            // kNoMeta / kCorrupt: fall through to a fresh start.
         }
 
         // ---- Fresh start path ----
@@ -3799,7 +3816,7 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::SaveMetadata(
 
         // 2. Build metadata struct
         OffsetAllocatorPersistedMetadata meta;
-        meta.version = 1;
+        meta.version = kOffsetAllocatorPersistVersion;
         meta.allocator_state.assign(
             reinterpret_cast<const char*>(alloc_buf.data()), alloc_buf.size());
         meta.evicted_keys_this_batch.assign(evicted_keys_this_batch.begin(),
@@ -3965,9 +3982,10 @@ OffsetAllocatorStorageBackend::LoadMetadata() {
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     }
 
-    if (meta.version != 1) {
+    if (meta.version != kOffsetAllocatorPersistVersion) {
         LOG(ERROR) << "Unsupported metadata version " << meta.version << " in "
-                   << meta_path;
+                   << meta_path << " (expected "
+                   << kOffsetAllocatorPersistVersion << ")";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (meta.allocator_state.empty()) {
@@ -3982,8 +4000,8 @@ OffsetAllocatorStorageBackend::LoadMetadata() {
 // RebuildShardMapsFromAllocator
 //-----------------------------------------------------------------------------
 
-void OffsetAllocatorStorageBackend::RebuildShardMapsFromAllocator() {
-    const int64_t kMaxKeyLen = 1 * 1024 * 1024;
+void OffsetAllocatorStorageBackend::RebuildShardMapsFromAllocator(
+    uint64_t checkpoint_insert_seq) {
     int64_t rebuilt = 0;
     int64_t skipped = 0;
 
@@ -3998,21 +4016,29 @@ void OffsetAllocatorStorageBackend::RebuildShardMapsFromAllocator() {
     total_size_.store(0, std::memory_order_relaxed);
     total_keys_.store(0, std::memory_order_relaxed);
 
+    // Reused across records for CRC streaming (avoids a fresh 1MB
+    // allocation per record).
+    std::vector<char> chunk_buf;
+
     allocator_->visit_used_nodes([&](uint64_t real_offset, uint64_t alloc_size,
                                      uint32_t node_index) {
-        // Helper: free a corrupt/unrecoverable node via RAII.
-        // Creates a temporary handle with requested_size=0 to avoid
-        // m_allocated_size underflow, then lets it go out of scope.
-        auto free_leaked_node = [&]() {
+        // Helper: free a corrupt/unrecoverable node via RAII.  The
+        // temporary handle goes out of scope immediately, returning the
+        // extent to the allocator.  requested_size keeps the
+        // m_allocated_size metric consistent with the serialized state:
+        // when the header parsed, the exact record_size is known (it
+        // equals the requested size passed to allocate()); otherwise the
+        // node's bin size is the best available estimate.
+        auto free_leaked_node = [&](uint64_t requested_size) {
             auto h = allocator_->createHandleAtNode(node_index, real_offset,
-                                                    /*requested_size=*/0);
+                                                    requested_size);
         };
 
         if (real_offset + RecordHeader::SIZE >
             static_cast<uint64_t>(capacity_)) {
             LOG(ERROR) << "[Recover] offset " << real_offset
                        << " + header exceeds capacity " << capacity_;
-            free_leaked_node();
+            free_leaked_node(alloc_size);
             ++skipped;
             return;
         }
@@ -4022,19 +4048,16 @@ void OffsetAllocatorStorageBackend::RebuildShardMapsFromAllocator() {
         auto hdr_res = data_file_->vector_read(&hdr_iov, 1, real_offset);
         if (!hdr_res || hdr_res.value() != RecordHeader::SIZE) {
             LOG(ERROR) << "[Recover] Failed to read header at " << real_offset;
-            free_leaked_node();
+            free_leaked_node(alloc_size);
             ++skipped;
             return;
         }
-        RecordHeader header{};
-        std::memcpy(&header.key_len, hdr_buf, sizeof(header.key_len));
-        std::memcpy(&header.value_len, hdr_buf + sizeof(header.key_len),
-                    sizeof(header.value_len));
+        RecordHeader header = RecordHeader::ReadFrom(hdr_buf);
 
         if (header.key_len > kMaxKeyLen) {
             LOG(ERROR) << "[Recover] Invalid key_len " << header.key_len
                        << " at " << real_offset;
-            free_leaked_node();
+            free_leaked_node(alloc_size);
             ++skipped;
             return;
         }
@@ -4045,7 +4068,7 @@ void OffsetAllocatorStorageBackend::RebuildShardMapsFromAllocator() {
             LOG(ERROR) << "[Recover] record_size " << record_size
                        << " > alloc_size " << alloc_size << " at "
                        << real_offset;
-            free_leaked_node();
+            free_leaked_node(alloc_size);
             ++skipped;
             return;
         }
@@ -4053,13 +4076,29 @@ void OffsetAllocatorStorageBackend::RebuildShardMapsFromAllocator() {
             static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
             LOG(ERROR) << "[Recover] record_size " << record_size
                        << " exceeds uint32_t at " << real_offset;
-            free_leaked_node();
+            free_leaked_node(alloc_size);
             ++skipped;
             return;
         }
         if (real_offset + record_size > static_cast<uint64_t>(capacity_)) {
             LOG(ERROR) << "[Recover] record past capacity at " << real_offset;
-            free_leaked_node();
+            free_leaked_node(alloc_size);
+            ++skipped;
+            return;
+        }
+
+        // Post-checkpoint write guard: a record stamped at or after the
+        // checkpoint's insert_seq was written after the checkpoint fired.
+        // Its extent may hold a torn write (the crash hit mid-pwritev), or
+        // it may belong to a different key whose space was freed and reused
+        // after the checkpoint.  Either way the checkpoint cannot vouch for
+        // it, so the node is dropped and freed.
+        if (header.seq >= checkpoint_insert_seq) {
+            LOG(INFO) << "[Recover] record seq " << header.seq
+                      << " >= checkpoint insert_seq " << checkpoint_insert_seq
+                      << " at " << real_offset
+                      << " -- post-checkpoint write, dropping";
+            free_leaked_node(record_size);
             ++skipped;
             return;
         }
@@ -4071,7 +4110,79 @@ void OffsetAllocatorStorageBackend::RebuildShardMapsFromAllocator() {
         if (!key_res ||
             key_res.value() != static_cast<size_t>(header.key_len)) {
             LOG(ERROR) << "[Recover] Failed to read key at " << real_offset;
-            free_leaked_node();
+            free_leaked_node(record_size);
+            ++skipped;
+            return;
+        }
+
+        // Integrity check: stream the value in chunks and verify the
+        // CRC-32C over header-prefix + key + value.  This rejects torn
+        // writes whose header survived the crash but whose tail is stale
+        // or zero-filled.
+        Crc32c crc;
+        crc.Extend(hdr_buf, RecordHeader::PREFIX_SIZE);
+        crc.Extend(key.data(), key.size());
+        {
+            constexpr size_t kCrcChunkSize = 1 << 20;  // 1MB
+            chunk_buf.resize(
+                std::min<uint64_t>(header.value_len, kCrcChunkSize));
+            uint64_t remaining = header.value_len;
+            uint64_t value_offset =
+                real_offset + RecordHeader::SIZE + header.key_len;
+            bool read_failed = false;
+            while (remaining > 0) {
+                const size_t chunk =
+                    std::min<uint64_t>(remaining, chunk_buf.size());
+                iovec value_iov = {chunk_buf.data(), chunk};
+                auto value_res =
+                    data_file_->vector_read(&value_iov, 1, value_offset);
+                if (!value_res || value_res.value() != chunk) {
+                    LOG(ERROR)
+                        << "[Recover] Failed to read value at " << real_offset;
+                    read_failed = true;
+                    break;
+                }
+                crc.Extend(chunk_buf.data(), chunk);
+                value_offset += chunk;
+                remaining -= chunk;
+            }
+            if (read_failed) {
+                free_leaked_node(record_size);
+                ++skipped;
+                return;
+            }
+        }
+        if (crc.Final() != header.crc32) {
+            LOG(ERROR) << "[Recover] CRC mismatch at " << real_offset
+                       << " (stored " << header.crc32 << ", computed "
+                       << crc.Final() << ") -- torn or stale record";
+            free_leaked_node(record_size);
+            ++skipped;
+            return;
+        }
+
+        // Duplicate resolution BEFORE constructing any handle: a failed
+        // emplace would have moved allocation_ptr into a discarded
+        // temporary, freeing the very extent we might need to keep.
+        // Note: ObjectEntry.fifo_seq temporarily carries the record's seq
+        // for this comparison; RestoreAndRepairFifoIndex overwrites it
+        // with the persisted (or repaired) FIFO seq later.
+        size_t shard_idx = ShardForKey(key);
+        auto& shard_map = shards_[shard_idx].map;
+        auto existing = shard_map.find(key);
+        if (existing != shard_map.end() &&
+            header.seq <= existing->second.fifo_seq) {
+            // Duplicate key (two extents were both marked used at the
+            // checkpoint, e.g. an overwrite whose old extent was pinned
+            // by a reader) and the already-inserted record is the newer
+            // version.  Free this older extent via RAII.
+            LOG(INFO) << "[Recover] Duplicate key " << key << " at "
+                      << real_offset << " (seq " << header.seq
+                      << ") is older than existing record at "
+                      << existing->second.offset << " (seq "
+                      << existing->second.fifo_seq
+                      << ") -- kept existing, freed duplicate (RAII)";
+            free_leaked_node(record_size);
             ++skipped;
             return;
         }
@@ -4081,7 +4192,7 @@ void OffsetAllocatorStorageBackend::RebuildShardMapsFromAllocator() {
         if (!handle.has_value()) {
             LOG(ERROR) << "[Recover] createHandleAtNode failed for " << key
                        << " at " << real_offset;
-            free_leaked_node();
+            free_leaked_node(record_size);
             ++skipped;
             return;
         }
@@ -4089,20 +4200,31 @@ void OffsetAllocatorStorageBackend::RebuildShardMapsFromAllocator() {
         auto allocation_ptr = std::make_shared<RefCountedAllocationHandle>(
             std::move(handle.value()));
 
-        size_t shard_idx = ShardForKey(key);
-        auto [it, inserted] = shards_[shard_idx].map.emplace(
-            key, ObjectEntry(real_offset, static_cast<uint32_t>(record_size),
-                             header.value_len, std::move(allocation_ptr),
-                             /*fifo_seq=*/0));
-
-        if (!inserted) {
-            LOG(ERROR) << "[Recover] Duplicate key " << key << " at "
-                       << real_offset << " (node_idx=" << node_index
-                       << " existing_offset=" << it->second.offset
-                       << ") -- kept existing, freed duplicate (RAII)";
-            ++skipped;
+        if (existing != shard_map.end()) {
+            // The new record is the newer version: replace the entry.
+            // The replaced handle frees the older extent via RAII with
+            // its own exact requested size.
+            LOG(INFO) << "[Recover] Duplicate key " << key << " at "
+                      << real_offset << " (seq " << header.seq
+                      << ") replaces older record at "
+                      << existing->second.offset << " (seq "
+                      << existing->second.fifo_seq << ")";
+            const int64_t size_delta =
+                static_cast<int64_t>(record_size) -
+                static_cast<int64_t>(existing->second.total_size);
+            existing->second =
+                ObjectEntry(real_offset, static_cast<uint32_t>(record_size),
+                            header.value_len, std::move(allocation_ptr),
+                            /*fifo_seq=*/header.seq);
+            total_size_.fetch_add(size_delta, std::memory_order_relaxed);
+            ++rebuilt;
             return;
         }
+
+        shard_map.emplace(
+            key, ObjectEntry(real_offset, static_cast<uint32_t>(record_size),
+                             header.value_len, std::move(allocation_ptr),
+                             /*fifo_seq=*/header.seq));
 
         total_size_.fetch_add(static_cast<int64_t>(record_size),
                               std::memory_order_relaxed);
@@ -4199,7 +4321,8 @@ void OffsetAllocatorStorageBackend::RestoreAndRepairFifoIndex(
 // TryRecoverFromMetadata
 //-----------------------------------------------------------------------------
 
-bool OffsetAllocatorStorageBackend::TryRecoverFromMetadata() {
+OffsetAllocatorStorageBackend::RecoveryResult
+OffsetAllocatorStorageBackend::TryRecoverFromMetadata() {
     try {
         namespace fs = std::filesystem;
 
@@ -4223,23 +4346,32 @@ bool OffsetAllocatorStorageBackend::TryRecoverFromMetadata() {
                 fs::remove(tmp_path, ec_tmp);
                 LOG(INFO) << "Orphaned .meta.tmp cleaned up";
                 fallback_guard.disarm();
-                return false;
+                return RecoveryResult::kNoMeta;
             }
             fs::remove(tmp_path, ec_tmp);
         }
 
         if (!fs::exists(meta_path, ec_meta)) {
             fallback_guard.disarm();
-            return false;
+            return RecoveryResult::kNoMeta;
         }
 
         LOG(INFO) << "Recovery path: " << meta_path << " found";
 
-        // Load metadata
+        // Load metadata.  An open failure here (e.g. fd exhaustion,
+        // permission change) is transient: the meta file exists and may
+        // be perfectly fine, so it must not trigger a cache-wiping fresh
+        // start.  Parse/validation failures mean the meta is unusable.
         auto meta_result = LoadMetadata();
         if (!meta_result) {
+            if (meta_result.error() == ErrorCode::FILE_OPEN_FAIL) {
+                LOG(ERROR) << "LoadMetadata could not open " << meta_path
+                           << " -- transient error, keeping persisted data";
+                fallback_guard.disarm();
+                return RecoveryResult::kTransientError;
+            }
             LOG(ERROR) << "LoadMetadata failed, falling back to fresh start";
-            return false;
+            return RecoveryResult::kCorrupt;
         }
         OffsetAllocatorPersistedMetadata meta = std::move(meta_result.value());
 
@@ -4253,15 +4385,20 @@ bool OffsetAllocatorStorageBackend::TryRecoverFromMetadata() {
                 data, data + meta.allocator_state.size());
             alloc =
                 deserialize_from<offset_allocator::OffsetAllocator>(alloc_buf);
+        } catch (const std::bad_alloc& e) {
+            LOG(ERROR) << "Allocator deserialization OOM: " << e.what()
+                       << " -- transient error, keeping persisted data";
+            fallback_guard.disarm();
+            return RecoveryResult::kTransientError;
         } catch (const std::exception& e) {
             LOG(ERROR) << "Allocator deserialization threw: " << e.what()
                        << " -- fresh start";
-            return false;
+            return RecoveryResult::kCorrupt;
         }
         if (!alloc) {
             LOG(ERROR) << "Allocator deserialization returned null"
                           " -- fresh start";
-            return false;
+            return RecoveryResult::kCorrupt;
         }
 
         // Verify capacity match
@@ -4272,7 +4409,7 @@ bool OffsetAllocatorStorageBackend::TryRecoverFromMetadata() {
                              << metrics.capacity << " vs current " << capacity_
                              << ". total_size_limit may have changed; "
                                 "falling back to fresh start.";
-                return false;
+                return RecoveryResult::kCorrupt;
             }
         }
 
@@ -4281,8 +4418,18 @@ bool OffsetAllocatorStorageBackend::TryRecoverFromMetadata() {
         int flags = O_CLOEXEC | O_RDWR;
         int raw_fd = open(data_file_path_.c_str(), flags, 0644);
         if (raw_fd < 0) {
-            LOG(ERROR) << "Failed to open data file: " << data_file_path_;
-            return false;
+            const int open_errno = errno;
+            LOG(ERROR) << "Failed to open data file: " << data_file_path_
+                       << ": " << strerror(open_errno);
+            // The meta references data that is genuinely gone: nothing
+            // recoverable remains, so a fresh start is appropriate.
+            if (open_errno == ENOENT) {
+                return RecoveryResult::kCorrupt;
+            }
+            // Anything else (fd exhaustion, permissions, I/O error) may
+            // be transient -- do not wipe the persisted cache for it.
+            fallback_guard.disarm();
+            return RecoveryResult::kTransientError;
         }
         FdGuard fd_guard(raw_fd);
 
@@ -4290,13 +4437,14 @@ bool OffsetAllocatorStorageBackend::TryRecoverFromMetadata() {
         struct stat st;
         if (fstat(fd_guard.get(), &st) != 0) {
             LOG(ERROR) << "fstat failed on data file: " << strerror(errno);
-            return false;
+            fallback_guard.disarm();
+            return RecoveryResult::kTransientError;
         }
         if (static_cast<uint64_t>(st.st_size) != capacity_) {
             LOG(WARNING) << "data file size mismatch: expected " << capacity_
                          << ", got " << st.st_size
                          << " -- falling back to fresh start";
-            return false;
+            return RecoveryResult::kCorrupt;
         }
 
 #ifdef USE_URING
@@ -4327,7 +4475,7 @@ bool OffsetAllocatorStorageBackend::TryRecoverFromMetadata() {
         total_size_.store(0, std::memory_order_relaxed);
         total_keys_.store(0, std::memory_order_relaxed);
 
-        RebuildShardMapsFromAllocator();
+        RebuildShardMapsFromAllocator(meta.insert_seq);
         RestoreAndRepairFifoIndex(meta);
 
         fallback_guard.disarm();
@@ -4335,13 +4483,17 @@ bool OffsetAllocatorStorageBackend::TryRecoverFromMetadata() {
         LOG(INFO) << "OffsetAllocatorStorageBackend recovered: "
                   << total_keys_.load() << " keys, " << total_size_.load()
                   << " bytes";
-        return true;
+        return RecoveryResult::kRecovered;
+    } catch (const std::bad_alloc& e) {
+        LOG(ERROR) << "Recovery OOM: " << e.what()
+                   << " -- transient error, keeping persisted data";
+        return RecoveryResult::kTransientError;
     } catch (const std::exception& e) {
         LOG(ERROR) << "Recovery failed with exception: " << e.what();
-        return false;
+        return RecoveryResult::kCorrupt;
     } catch (...) {
         LOG(ERROR) << "Recovery failed with unknown exception";
-        return false;
+        return RecoveryResult::kCorrupt;
     }
 }
 
@@ -4576,6 +4728,14 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
             continue;
         }
 
+        if (key.size() > kMaxKeyLen) {
+            // Recovery rejects key_len above kMaxKeyLen; refuse such keys
+            // at write time so they cannot silently vanish on restart.
+            LOG(ERROR) << "Key too large for SSD offload: " << key.size()
+                       << " bytes (max " << kMaxKeyLen << ")";
+            continue;
+        }
+
         uint64_t total_value_size = 0;
         for (const auto& slice : slices) {
             total_value_size += slice.size;
@@ -4587,8 +4747,18 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
         }
         uint32_t value_size = static_cast<uint32_t>(total_value_size);
 
+        // Stamp every write with a fresh insert_seq_ value: recovery
+        // rejects any record stamped at/after the checkpoint's insert_seq
+        // (its extent may hold a torn write), so every record must carry
+        // one regardless of the eviction mode.  A failed write simply
+        // burns a seq; gaps in the sequence are harmless.
+        const uint64_t record_seq =
+            insert_seq_.fetch_add(1, std::memory_order_relaxed);
+
         RecordHeader header{.key_len = static_cast<uint32_t>(key.size()),
-                            .value_len = value_size};
+                            .value_len = value_size,
+                            .seq = record_seq,
+                            .crc32 = 0};
 
         size_t record_size =
             RecordHeader::SIZE + header.key_len + header.value_len;
@@ -4598,6 +4768,19 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
                        << ", record_size=" << record_size;
             continue;
         }
+
+        // Serialize the header; the CRC covers the header prefix, the key
+        // and the value, and lets recovery detect torn/stale records.
+        char hdr_buf[RecordHeader::SIZE];
+        header.WritePrefixTo(hdr_buf);
+        Crc32c crc;
+        crc.Extend(hdr_buf, RecordHeader::PREFIX_SIZE);
+        crc.Extend(key.data(), key.size());
+        for (const auto& slice : slices) {
+            crc.Extend(slice.ptr, slice.size);
+        }
+        header.crc32 = crc.Final();
+        header.WriteTo(hdr_buf);
 
         // ---- (A) Proactive eviction (watermark-driven) ----
         if (eviction_on) {
@@ -4687,14 +4870,9 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
 
         // ---- (E) Disk write ----
         std::vector<iovec> iovs;
-        iovs.reserve(2 + 1 + slices.size());
+        iovs.reserve(1 + 1 + slices.size());
 
-        iovs.push_back(
-            {const_cast<char*>(reinterpret_cast<const char*>(&header.key_len)),
-             sizeof(header.key_len)});
-        iovs.push_back({const_cast<char*>(
-                            reinterpret_cast<const char*>(&header.value_len)),
-                        sizeof(header.value_len)});
+        iovs.push_back({hdr_buf, static_cast<size_t>(RecordHeader::SIZE)});
 
         iovs.push_back({const_cast<char*>(key.data()),
                         static_cast<size_t>(header.key_len)});
@@ -4731,16 +4909,14 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
             auto it = shard.map.find(key);
             int64_t size_delta = static_cast<int64_t>(record_size);
             bool is_new_key = (it == shard.map.end());
-            uint64_t seq = 0;
+            // Stamped before the disk write; the record on disk carries
+            // the same seq so recovery can order writes against the
+            // checkpoint's insert_seq.
+            const uint64_t seq = record_seq;
 
-            if (eviction_on) {
-                seq = insert_seq_.fetch_add(1, std::memory_order_relaxed);
-                if (!is_new_key) {
-                    size_delta -= static_cast<int64_t>(it->second.total_size);
-                    fifo_index_.erase(it->second.fifo_seq);
-                }
-            } else if (!is_new_key) {
+            if (!is_new_key) {
                 size_delta -= static_cast<int64_t>(it->second.total_size);
+                if (eviction_on) fifo_index_.erase(it->second.fifo_seq);
             }
 
             shard.map.insert_or_assign(
@@ -4760,6 +4936,25 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
             StorageObjectMetadata{0, static_cast<int64_t>(offset),
                                   static_cast<int64_t>(header.key_len),
                                   static_cast<int64_t>(value_size), ""});
+    }
+
+    // ---- Post-loop flush: notify master of any evicted keys that
+    // were accumulated by the last (possibly allocate-failing) key.
+    // This runs BEFORE the persistence barrier so that the trailing
+    // victims' tombstones and freed extents are included in this
+    // batch's checkpoint; in kStrict mode that keeps the whole batch
+    // (writes AND evictions) durable, and avoids serializing victim
+    // extents as used only for them to be freed right after.
+    if (eviction_on && !pending_eviction.objects.empty()) {
+        auto notify_result =
+            NotifyAndCommitPreparedEviction(eviction_handler, pending_eviction);
+        if (!notify_result) {
+            // The eviction was rolled back.  The batch is not
+            // checkpointed here (metadata_dirty_ stays set and a later
+            // batch will persist it), which is consistent with
+            // reporting failure to the caller.
+            return tl::make_unexpected(notify_result.error());
+        }
     }
 
     // ---- Persistence barrier (kRelaxed / kStrict) ----
@@ -4795,8 +4990,16 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
         // durable data)
         auto sync_res = data_file_->datasync();
         if (!sync_res) {
+            auto fails = metadata_consecutive_failures_.fetch_add(
+                             1, std::memory_order_relaxed) +
+                         1;
             LOG(ERROR) << "datasync failed: "
                        << static_cast<int>(sync_res.error());
+            if (fails % 10 == 0) {
+                LOG(WARNING) << "Checkpoint datasync " << fails
+                             << " consecutive failures (mode="
+                             << static_cast<int>(cfg_.persist_mode) << ")";
+            }
             if (cfg_.persist_mode == OffsetPersistMode::kStrict) {
                 return tl::make_unexpected(sync_res.error());
             }
@@ -4830,16 +5033,6 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
                         .count(),
                     std::memory_order_relaxed);
             }
-        }
-    }
-
-    // ---- Post-loop flush: notify master of any evicted keys that
-    // were accumulated by the last (possibly allocate-failing) key.
-    if (eviction_on && !pending_eviction.objects.empty()) {
-        auto notify_result =
-            NotifyAndCommitPreparedEviction(eviction_handler, pending_eviction);
-        if (!notify_result) {
-            return tl::make_unexpected(notify_result.error());
         }
     }
 
@@ -4916,12 +5109,14 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
     // Step 2: Perform disk I/O without holding any locks
     // Allocations are kept alive by shared_ptr references in read_plans
     for (const auto& plan : read_plans) {
-        // Read header first
-        RecordHeader header;
-        iovec header_iovs[2] = {{&header.key_len, sizeof(header.key_len)},
-                                {&header.value_len, sizeof(header.value_len)}};
+        // Read header first.  The CRC is NOT verified here: records are
+        // CRC-validated once during recovery, and during normal operation
+        // a key only becomes visible after its write completed, so the
+        // hot read path stays checksum-free.
+        char hdr_buf[RecordHeader::SIZE];
+        iovec header_iov = {hdr_buf, sizeof(hdr_buf)};
         auto read_header_result =
-            data_file_->vector_read(header_iovs, 2, plan.offset);
+            data_file_->vector_read(&header_iov, 1, plan.offset);
         if (!read_header_result) {
             LOG(ERROR) << "Failed to read header for key: " << plan.key
                        << ", error: " << read_header_result.error();
@@ -4932,6 +5127,7 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
             LOG(ERROR) << "Header read size mismatch for key: " << plan.key;
             return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         }
+        RecordHeader header = RecordHeader::ReadFrom(hdr_buf);
 
         // Validate header matches metadata
         if (!header.ValidateAgainstMetadata(plan.value_size)) {

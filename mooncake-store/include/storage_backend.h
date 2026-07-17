@@ -4,6 +4,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstring>
 #include <filesystem>
 #include <functional>
 #include <map>
@@ -268,6 +269,12 @@ struct OffsetAllocatorPersistedMetadata {
 };
 YLT_REFL(OffsetAllocatorPersistedMetadata, version, allocator_state, insert_seq,
          fifo_entries, evicted_keys_this_batch);
+
+// Current on-disk format version of OffsetAllocatorPersistedMetadata.
+// v2: RecordHeader grew from 8 to 20 bytes (added per-record seq + CRC-32C).
+// v1 metadata is rejected on load (fresh start) because its data-file
+// records cannot be parsed with the v2 header layout.
+inline constexpr uint32_t kOffsetAllocatorPersistVersion = 2;
 
 struct FileStorageConfig {
     // type of the storage backend
@@ -1224,18 +1231,62 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     }
 
    private:
-    // On-disk record header: [u32 key_len][u32 value_len] (8 bytes total)
+    // On-disk record header v2 (20 bytes):
+    //   [u32 key_len][u32 value_len][u64 seq][u32 crc32]
+    // `seq` is the write's insert_seq_ stamp; on recovery any record with
+    // seq >= the checkpoint's insert_seq was written after that checkpoint
+    // and is dropped (its extent may hold a torn write). `crc32` is CRC-32C
+    // over the first 16 header bytes, the key and the value; it is verified
+    // on recovery so that torn or stale records are detected and skipped
+    // instead of being served as valid data.
     struct RecordHeader {
         // Length of key in bytes
         uint32_t key_len;
 
-        // Length of value in bytes
+        // Length of value in bytes. Currently assumes max object size is
+        // 4GB. If we need to support larger objects, change this to 8 bytes.
         uint32_t value_len;
 
-        // Header size: 8 bytes (2 * uint32_t). Currently assumes max object
-        // size is 4GB. If we need to support larger objects, change this to 16
-        // bytes.
-        static constexpr size_t SIZE = sizeof(uint32_t) * 2;
+        // insert_seq_ stamp of this write (monotonic per BatchOffload entry)
+        uint64_t seq;
+
+        // CRC-32C over [key_len|value_len|seq] + key + value
+        uint32_t crc32;
+
+        // Header size: 20 bytes on disk (fields are (de)serialized
+        // field-by-field; do NOT use sizeof(RecordHeader), which includes
+        // padding).
+        static constexpr size_t SIZE =
+            sizeof(uint32_t) * 2 + sizeof(uint64_t) + sizeof(uint32_t);
+
+        // Size of the crc-covered header prefix (everything before crc32).
+        static constexpr size_t PREFIX_SIZE =
+            sizeof(uint32_t) * 2 + sizeof(uint64_t);
+
+        void WritePrefixTo(char* out) const {
+            std::memcpy(out, &key_len, sizeof(key_len));
+            std::memcpy(out + sizeof(key_len), &value_len, sizeof(value_len));
+            std::memcpy(out + sizeof(key_len) + sizeof(value_len), &seq,
+                        sizeof(seq));
+        }
+
+        void WriteTo(char* out) const {
+            WritePrefixTo(out);
+            std::memcpy(out + PREFIX_SIZE, &crc32, sizeof(crc32));
+        }
+
+        static RecordHeader ReadFrom(const char* buf) {
+            RecordHeader h{};
+            size_t off = 0;
+            std::memcpy(&h.key_len, buf + off, sizeof(h.key_len));
+            off += sizeof(h.key_len);
+            std::memcpy(&h.value_len, buf + off, sizeof(h.value_len));
+            off += sizeof(h.value_len);
+            std::memcpy(&h.seq, buf + off, sizeof(h.seq));
+            off += sizeof(h.seq);
+            std::memcpy(&h.crc32, buf + off, sizeof(h.crc32));
+            return h;
+        }
 
         // Validate header against expected metadata
         bool ValidateAgainstMetadata(uint32_t expected_value_len) const {
@@ -1259,6 +1310,11 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
             return {};
         }
     };
+
+    // Maximum key length accepted by BatchOffload and trusted on recovery.
+    // Write-side enforcement (BatchOffload) and recovery-side validation
+    // (RebuildShardMapsFromAllocator) must agree on this bound.
+    static constexpr uint32_t kMaxKeyLen = 1024 * 1024;
 
     // Refcounted wrapper for move-only OffsetAllocationHandle. Physical extent
     // freed when last shared_ptr reference drops.
@@ -1285,7 +1341,7 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
         // Byte offset in data file where record is stored
         uint64_t offset;
 
-        // Total record size: header (8) + key + value
+        // Total record size: header (20) + key + value
         uint32_t total_size;
 
         // Value size only (excluding header and key)
@@ -1417,6 +1473,10 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     tl::expected<void, ErrorCode> NotifyAndCommitPreparedEviction(
         const EvictionHandler& eviction_handler, PendingEviction& pending);
 
+    // Record restart-persistence tombstones for prepared victims whose
+    // eviction has become final.  No-op when persistence is disabled.
+    void RecordEvictionTombstones(const PendingEviction& pending);
+
     // ===== Persistence methods =====
 
     std::string GetMetaFilePath() const;
@@ -1428,12 +1488,27 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
 
     tl::expected<OffsetAllocatorPersistedMetadata, ErrorCode> LoadMetadata();
 
-    void RebuildShardMapsFromAllocator();
+    // Outcome of a recovery attempt.  Distinguishes "safe to start fresh"
+    // (kNoMeta / kCorrupt) from "must not touch the persisted data"
+    // (kTransientError, e.g. fd exhaustion or OOM — retrying Init later may
+    // succeed, while a fresh start would destroy a recoverable cache).
+    enum class RecoveryResult {
+        kRecovered,       // persisted state fully restored
+        kNoMeta,          // no metadata file: genuine first boot
+        kCorrupt,         // meta/data missing, incompatible or corrupt
+        kTransientError,  // temporary resource error: do NOT wipe data
+    };
+
+    RecoveryResult TryRecoverFromMetadata();
+
+    // Rebuilds shard maps by scanning extents marked used in the
+    // deserialized allocator.  Records stamped with
+    // seq >= checkpoint_insert_seq were written after the checkpoint and
+    // are dropped (their extents may hold torn writes).
+    void RebuildShardMapsFromAllocator(uint64_t checkpoint_insert_seq);
 
     void RestoreAndRepairFifoIndex(
         const OffsetAllocatorPersistedMetadata& meta);
-
-    bool TryRecoverFromMetadata();
 
     // Test-only: Predicate to determine which keys should fail in BatchOffload.
     // Used for deterministic testing of partial success behavior.
@@ -1453,11 +1528,16 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
 
     // ---- Test-only hooks ----
     std::atomic<int> test_metadata_write_failure_step_{0};
+    // Skip the destructor's final checkpoint (simulates an abrupt crash).
+    std::atomic<bool> test_skip_final_checkpoint_{false};
 
    public:
     // ---- Test accessors ----
     void SetMetadataWriteFailure(int step) {
         test_metadata_write_failure_step_ = step;
+    }
+    void SetSkipFinalCheckpointForTest() {
+        test_skip_final_checkpoint_.store(true, std::memory_order_relaxed);
     }
     size_t GetAllEvictedThisBatchSizeForTest() const {
         return all_evicted_this_batch_.size();
