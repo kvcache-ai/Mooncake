@@ -195,6 +195,8 @@ metadata = result.metadata
 
 By default, structured object writes use `BundleTransferPolicy(copy_mode="auto")`. This keeps the existing behavior: Mooncake uses the zero-copy `batch_put_from` fast path when buffer registration is available, and falls back to ordinary `store.put` when the fast path is unavailable.
 
+Structured object write methods also accept `config`, which is forwarded to the underlying Mooncake Store write calls. Use `policy` for structured-object copy behavior and `config` for store-level placement or replication options.
+
 For very large tensors, buffer registration capacity can be exhausted. If the upper layer does not handle this failure mode yet, force the non-zero-copy path with `copy_mode="copy"`:
 
 ```python

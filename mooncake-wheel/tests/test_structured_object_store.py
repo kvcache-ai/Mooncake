@@ -19,7 +19,7 @@ from mooncake.structured_object_store import (
     RemoteBundleRef,
     StructuredObjectPayload,
     StructuredObjectReadSpec,
-    _legacy_dict_to_envelope,
+    _flat_dict_to_envelope,
     export_dataproto_ref,
     import_dataproto_ref,
     is_dataproto_ref_handle,
@@ -64,6 +64,8 @@ class InMemoryStore:
         self.batch_remove_calls = 0
         self.put_tensor_calls = 0
         self.get_tensor_calls = 0
+        self.put_configs: list[object] = []
+        self.batch_put_from_configs: list[object] = []
 
     def _enter_put(self) -> None:
         with self.lock:
@@ -83,7 +85,8 @@ class InMemoryStore:
         with self.lock:
             self.active_gets -= count
 
-    def put(self, key: str, value) -> int:
+    def put(self, key: str, value, config=None) -> int:
+        self.put_configs.append(config)
         self._enter_put()
         try:
             time.sleep(0.01)
@@ -126,14 +129,18 @@ class InMemoryStore:
         return [0 for _key in keys]
 
     def batch_put_from(
-        self, keys: list[str], buffer_ptrs: list[int], sizes: list[int]
+        self, keys: list[str], buffer_ptrs: list[int], sizes: list[int], config=None
     ) -> list[int]:
         self.batch_put_from_calls += 1
+        self.batch_put_from_configs.append(config)
         results: list[int] = []
         for key, ptr, size in zip(keys, buffer_ptrs, sizes):
             data = ctypes.string_at(ptr, size)
-            results.append(self.put(key, data))
+            results.append(self.put(key, data, config=config))
         return results
+
+    def put_from(self, key: str, buffer_ptr: int, size: int, config=None) -> int:
+        return self.put(key, ctypes.string_at(buffer_ptr, size), config)
 
     def put_tensor_from(self, key: str, buffer_ptr: int, size: int) -> int:
         self.put_tensor_from_calls += 1
@@ -225,6 +232,25 @@ class InMemoryStore:
             return results
         finally:
             self._exit_get(len(keys))
+
+
+class FakeLease:
+    def __init__(self, size: int) -> None:
+        self.size = size
+        self._buffer = ctypes.create_string_buffer(size)
+        self.ptr = ctypes.addressof(self._buffer)
+
+    @property
+    def buffer(self):
+        return memoryview(self._buffer)
+
+    def release(self) -> None:
+        pass
+
+
+class FakeBufferPool:
+    def acquire(self, size: int) -> FakeLease:
+        return FakeLease(size)
 
 
 class GetOnlyStore(InMemoryStore):
@@ -1331,6 +1357,32 @@ def test_dataproto_helper_roundtrip_uses_structured_object() -> None:
     assert stage_metadata["dataproto"]["stage"] == "rollout"
 
 
+def test_unified_dict_put_passes_store_config_to_put_writes() -> None:
+    store, transfer = make_transfer()
+    config = object()
+    data = {"input_ids": np.arange(12, dtype=np.int64).reshape(4, 3)}
+
+    ref = transfer.put(data, type="dict", config=config)
+    result = transfer.get(ref, type="dict")
+
+    assert np.array_equal(result["input_ids"], data["input_ids"])
+    assert store.put_configs
+    assert all(item is config for item in store.put_configs)
+
+
+def test_unified_dict_put_passes_store_config_to_batch_put_writes() -> None:
+    store, transfer = make_transfer(buffer_pool=FakeBufferPool())
+    config = object()
+    data = {"input_ids": np.arange(12, dtype=np.int64).reshape(4, 3)}
+
+    ref = transfer.put(data, type="dict", config=config)
+    result = transfer.get(ref, type="dict")
+
+    assert np.array_equal(result["input_ids"], data["input_ids"])
+    assert store.batch_put_from_configs
+    assert all(item is config for item in store.batch_put_from_configs)
+
+
 def test_dataproto_manifest_view_reuses_structured_manifest_specs() -> None:
     _store, transfer = make_transfer()
     data = SimpleDataProto(
@@ -1533,8 +1585,8 @@ def test_dataproto_helper_supports_dict_cls_and_reports_bad_cls() -> None:
         transfer.get_dataproto(ref, data_cls=BadDataProto)
 
 
-def test_legacy_dict_uses_schema_sections_without_field_name_rules() -> None:
-    envelope = _legacy_dict_to_envelope(
+def test_flat_dict_uses_schema_sections_without_field_name_rules() -> None:
+    envelope = _flat_dict_to_envelope(
         {
             "row_ids": range(0, 3),
             "tokens": [[1, 2], [3], [4, 5, 6]],
@@ -1575,8 +1627,8 @@ def test_legacy_dict_uses_schema_sections_without_field_name_rules() -> None:
     assert envelope["meta_info"]["global_lengths"] == [8, 9, 10, 11]
 
 
-def test_legacy_dict_schema_allows_unmapped_fields_to_fall_back() -> None:
-    envelope = _legacy_dict_to_envelope(
+def test_flat_dict_schema_allows_unmapped_fields_to_fall_back() -> None:
+    envelope = _flat_dict_to_envelope(
         {
             "row_ids": range(0, 3),
             "scores": np.asarray([2, 1, 3], dtype=np.int64),
@@ -1595,8 +1647,8 @@ def test_legacy_dict_schema_allows_unmapped_fields_to_fall_back() -> None:
     assert envelope["meta_info"] == {"global_step": 7}
 
 
-def test_legacy_dict_schema_keeps_unmapped_same_length_lists_as_meta() -> None:
-    envelope = _legacy_dict_to_envelope(
+def test_flat_dict_schema_keeps_unmapped_same_length_lists_as_meta() -> None:
+    envelope = _flat_dict_to_envelope(
         {
             "row_ids": range(0, 3),
             "metadata_list": ["a", "b", "c"],
@@ -1613,8 +1665,8 @@ def test_legacy_dict_schema_keeps_unmapped_same_length_lists_as_meta() -> None:
     assert envelope["meta_info"]["metadata_list"] == ["a", "b", "c"]
 
 
-def test_legacy_dict_schema_meta_lists_do_not_define_batch_size() -> None:
-    envelope = _legacy_dict_to_envelope(
+def test_flat_dict_schema_meta_lists_do_not_define_batch_size() -> None:
+    envelope = _flat_dict_to_envelope(
         {
             "global_lengths": [8, 9, 10, 11],
             "scores": np.asarray([2, 1, 3], dtype=np.int64),
@@ -1631,8 +1683,8 @@ def test_legacy_dict_schema_meta_lists_do_not_define_batch_size() -> None:
     assert envelope["meta_info"]["global_lengths"] == [8, 9, 10, 11]
 
 
-def test_legacy_dict_auto_mode_infers_unambiguous_row_fields() -> None:
-    envelope = _legacy_dict_to_envelope(
+def test_flat_dict_auto_mode_infers_unambiguous_row_fields() -> None:
+    envelope = _flat_dict_to_envelope(
         {
             "row_ids": range(0, 3),
             "tokens": [[1, 2], [3], [4, 5, 6]],
@@ -1651,7 +1703,7 @@ def test_legacy_dict_auto_mode_infers_unambiguous_row_fields() -> None:
     assert envelope["meta_info"] == {"global_step": 7}
 
 
-def test_dataproto_helper_accepts_legacy_dict_inputs() -> None:
+def test_dataproto_helper_accepts_flat_dict_inputs() -> None:
     _store, transfer = make_transfer()
     plain_ref = transfer.put_dataproto({"input_ids": np.arange(4)})
     envelope_ref = transfer.put_dataproto(
@@ -1937,24 +1989,24 @@ def test_dataproto_helper_rejects_invalid_schema_section() -> None:
         )
 
 
-def test_legacy_dict_schema_without_section_falls_back_to_auto_routing() -> None:
+def test_flat_dict_schema_without_section_falls_back_to_auto_routing() -> None:
     _store, transfer = make_transfer()
-    ref = transfer.put_legacy_dict(
+    ref = transfer.put_dict(
         {"values": range(1, 4), "step": 7},
         field_schemas={"values": FieldSchema(codec="ndarray", metadata={"dtype": "int64"})},
     )
 
-    result = transfer.get_legacy_dict(ref)
+    result = transfer.get_dict(ref)
 
     assert result["values"] == [1, 2, 3]
     assert result["step"] == 7
     assert ref.encoded_non_tensor["values"]["codec"] == "ndarray"
 
 
-def test_legacy_dict_schema_keeps_numeric_ndarray_direct() -> None:
+def test_flat_dict_schema_keeps_numeric_ndarray_direct() -> None:
     _store, transfer = make_transfer()
     values = np.asarray([1, 2, 3], dtype=np.int64)
-    ref = transfer.put_legacy_dict(
+    ref = transfer.put_dict(
         {"values": values},
         field_schemas={
             "values": FieldSchema(
@@ -1965,15 +2017,15 @@ def test_legacy_dict_schema_keeps_numeric_ndarray_direct() -> None:
         },
     )
 
-    result = transfer.get_legacy_dict(ref)
+    result = transfer.get_dict(ref)
 
     assert np.array_equal(result["values"], values)
     assert "values" not in ref.encoded_non_tensor
 
 
-def test_legacy_dict_schema_encodes_scalar_sequences_with_ndarray_codec() -> None:
+def test_flat_dict_schema_encodes_scalar_sequences_with_ndarray_codec() -> None:
     _store, transfer = make_transfer()
-    ref = transfer.put_legacy_dict(
+    ref = transfer.put_dict(
         {"values": range(1, 4)},
         field_schemas={
             "values": FieldSchema(
@@ -1984,15 +2036,15 @@ def test_legacy_dict_schema_encodes_scalar_sequences_with_ndarray_codec() -> Non
         },
     )
 
-    result = transfer.get_legacy_dict(ref)
+    result = transfer.get_dict(ref)
 
     assert result["values"] == [1, 2, 3]
     assert ref.encoded_non_tensor["values"]["codec"] == "ndarray"
 
 
-def test_legacy_dict_schema_keeps_nulls_in_structured_codec() -> None:
+def test_flat_dict_schema_keeps_nulls_in_structured_codec() -> None:
     _store, transfer = make_transfer()
-    ref = transfer.put_legacy_dict(
+    ref = transfer.put_dict(
         {"values": [1, None, 3]},
         field_schemas={
             "values": FieldSchema(
@@ -2003,15 +2055,15 @@ def test_legacy_dict_schema_keeps_nulls_in_structured_codec() -> None:
         },
     )
 
-    result = transfer.get_legacy_dict(ref)
+    result = transfer.get_dict(ref)
 
     assert result["values"] == [1, None, 3]
     assert ref.encoded_non_tensor["values"]["codec"] == "ndarray"
 
 
-def test_legacy_dict_schema_invalid_ndarray_dtype_falls_back() -> None:
+def test_flat_dict_schema_invalid_ndarray_dtype_falls_back() -> None:
     _store, transfer = make_transfer()
-    ref = transfer.put_legacy_dict(
+    ref = transfer.put_dict(
         {"values": [1, 2, 3]},
         field_schemas={
             "values": FieldSchema(
@@ -2022,15 +2074,15 @@ def test_legacy_dict_schema_invalid_ndarray_dtype_falls_back() -> None:
         },
     )
 
-    result = transfer.get_legacy_dict(ref)
+    result = transfer.get_dict(ref)
 
     assert result["values"] == [1, 2, 3]
     assert ref.encoded_non_tensor["values"]["codec"] == "ndarray"
 
 
-def test_legacy_dict_schema_missing_ndarray_dtype_falls_back_without_defaulting() -> None:
+def test_flat_dict_schema_missing_ndarray_dtype_falls_back_without_defaulting() -> None:
     _store, transfer = make_transfer()
-    ref = transfer.put_legacy_dict(
+    ref = transfer.put_dict(
         {"values": [1, 2, 3]},
         field_schemas={
             "values": FieldSchema(
@@ -2041,15 +2093,15 @@ def test_legacy_dict_schema_missing_ndarray_dtype_falls_back_without_defaulting(
         },
     )
 
-    result = transfer.get_legacy_dict(ref)
+    result = transfer.get_dict(ref)
 
     assert result["values"] == [1, 2, 3]
     assert ref.encoded_non_tensor["values"]["codec"] == "ndarray"
 
 
-def test_legacy_dict_schema_malformed_ndarray_dtype_falls_back() -> None:
+def test_flat_dict_schema_malformed_ndarray_dtype_falls_back() -> None:
     _store, transfer = make_transfer()
-    ref = transfer.put_legacy_dict(
+    ref = transfer.put_dict(
         {"values": [1, 2, 3]},
         field_schemas={
             "values": FieldSchema(
@@ -2060,14 +2112,14 @@ def test_legacy_dict_schema_malformed_ndarray_dtype_falls_back() -> None:
         },
     )
 
-    result = transfer.get_legacy_dict(ref)
+    result = transfer.get_dict(ref)
 
     assert result["values"] == [1, 2, 3]
     assert ref.encoded_non_tensor["values"]["codec"] == "ndarray"
 
 
-def test_legacy_dict_auto_mode_treats_zero_dim_ndarray_as_meta() -> None:
-    envelope = _legacy_dict_to_envelope(
+def test_flat_dict_auto_mode_treats_zero_dim_ndarray_as_meta() -> None:
+    envelope = _flat_dict_to_envelope(
         {"row_ids": range(0, 3), "scalar_meta": np.asarray(7)}
     )
 
@@ -2075,14 +2127,14 @@ def test_legacy_dict_auto_mode_treats_zero_dim_ndarray_as_meta() -> None:
     assert envelope["meta_info"]["scalar_meta"] == np.asarray(7)
 
 
-def test_legacy_dict_auto_mode_reports_ambiguous_list_metadata() -> None:
+def test_flat_dict_auto_mode_reports_ambiguous_list_metadata() -> None:
     with pytest.raises(ValueError, match="pass FieldSchema"):
-        _legacy_dict_to_envelope({"row_ids": range(0, 3), "metadata_list": [1, 2]})
+        _flat_dict_to_envelope({"row_ids": range(0, 3), "metadata_list": [1, 2]})
 
 
-def test_legacy_dict_schema_honors_explicit_non_ndarray_codec_for_numeric_ndarray() -> None:
+def test_flat_dict_schema_honors_explicit_non_ndarray_codec_for_numeric_ndarray() -> None:
     _store, transfer = make_transfer()
-    ref = transfer.put_legacy_dict(
+    ref = transfer.put_dict(
         {"values": np.asarray([[1, 2], [3, 4]], dtype=np.int64)},
         field_schemas={
             "values": FieldSchema(
@@ -2106,7 +2158,7 @@ def test_typed_ragged_packs_ndarray_rows_contiguously() -> None:
         np.arange(6, dtype=np.int32).reshape(2, 3),
     ]
 
-    ref = transfer.put_legacy_dict(
+    ref = transfer.put_dict(
         {"values": rows},
         field_schemas={
             "values": FieldSchema(
@@ -2116,7 +2168,7 @@ def test_typed_ragged_packs_ndarray_rows_contiguously() -> None:
             )
         },
     )
-    result = transfer.get_legacy_dict(ref)
+    result = transfer.get_dict(ref)
     view = transfer.dataproto_manifest_view(ref)
 
     encoded = ref.encoded_non_tensor["values"]
@@ -2150,7 +2202,7 @@ def test_typed_ragged_packs_ndarray_rows_contiguously() -> None:
     ]
     assert gathered["non_tensor_batch"]["values"][2].shape == ()
     imported = import_dataproto_ref(export_dataproto_ref(ref))
-    imported_result = transfer.get_legacy_dict(imported)
+    imported_result = transfer.get_dict(imported)
     assert [
         None if row is None else row.tolist() for row in imported_result["values"]
     ] == [None if row is None else row.tolist() for row in rows]
@@ -2214,9 +2266,9 @@ def test_release_result_recurses_into_ragged_row_views() -> None:
     assert other_owner.release_count == 1
 
 
-def test_legacy_dict_schema_codec_mismatch_falls_back() -> None:
+def test_flat_dict_schema_codec_mismatch_falls_back() -> None:
     _store, transfer = make_transfer()
-    ref = transfer.put_legacy_dict(
+    ref = transfer.put_dict(
         {"values": [1, 2, 3]},
         field_schemas={
             "values": FieldSchema(
@@ -2226,15 +2278,15 @@ def test_legacy_dict_schema_codec_mismatch_falls_back() -> None:
         },
     )
 
-    result = transfer.get_legacy_dict(ref)
+    result = transfer.get_dict(ref)
 
     assert result["values"] == [1, 2, 3]
     assert ref.encoded_non_tensor["values"]["codec"] == "ndarray"
 
 
-def test_legacy_dict_schema_auto_codec_reuses_recursive_encoding() -> None:
+def test_flat_dict_schema_auto_codec_reuses_recursive_encoding() -> None:
     _store, transfer = make_transfer()
-    ref = transfer.put_legacy_dict(
+    ref = transfer.put_dict(
         {
             "metadata": [
                 {"ids": [1, 2], "score": 0.5},
@@ -2256,7 +2308,7 @@ def test_legacy_dict_schema_auto_codec_reuses_recursive_encoding() -> None:
         },
     )
 
-    result = transfer.get_legacy_dict(ref)
+    result = transfer.get_dict(ref)
 
     assert result["metadata"] == [
         {"ids": [1, 2], "score": 0.5},
@@ -2266,9 +2318,9 @@ def test_legacy_dict_schema_auto_codec_reuses_recursive_encoding() -> None:
     assert "metadata" in ref.encoded_non_tensor
 
 
-def test_legacy_dict_schema_auto_codec_handles_object_ndarray_leaves() -> None:
+def test_flat_dict_schema_auto_codec_handles_object_ndarray_leaves() -> None:
     _store, transfer = make_transfer()
-    ref = transfer.put_legacy_dict(
+    ref = transfer.put_dict(
         {
             "metadata": [
                 {"values": np.asarray([{"x": 1}], dtype=object)},
@@ -2283,7 +2335,7 @@ def test_legacy_dict_schema_auto_codec_handles_object_ndarray_leaves() -> None:
         },
     )
 
-    result = transfer.get_legacy_dict(ref)
+    result = transfer.get_dict(ref)
 
     assert result["metadata"] == [
         {"values": [{"x": 1}]},
@@ -2292,14 +2344,14 @@ def test_legacy_dict_schema_auto_codec_handles_object_ndarray_leaves() -> None:
     assert ref.encoded_non_tensor["metadata"]["codec"] == "msgpack_ragged"
 
 
-def test_legacy_dict_schema_auto_codec_falls_back_after_recursive_error(monkeypatch) -> None:
+def test_flat_dict_schema_auto_codec_falls_back_after_recursive_error(monkeypatch) -> None:
     _store, transfer = make_transfer()
 
     def fail_inference(*_args, **_kwargs):
         raise ValueError("synthetic recursive failure")
 
     monkeypatch.setattr(sos, "infer_structure", fail_inference)
-    ref = transfer.put_legacy_dict(
+    ref = transfer.put_dict(
         {"metadata": [{"x": 1}, {"x": 2}]},
         field_schemas={
             "metadata": FieldSchema(
@@ -2309,7 +2361,7 @@ def test_legacy_dict_schema_auto_codec_falls_back_after_recursive_error(monkeypa
         },
     )
 
-    result = transfer.get_legacy_dict(ref)
+    result = transfer.get_dict(ref)
 
     assert result["metadata"] == [{"x": 1}, {"x": 2}]
     assert ref.encoded_non_tensor["metadata"]["codec"] == "msgpack_ragged"
