@@ -774,8 +774,8 @@ TEST_F(StorageBackendTest, AdaptorScanMetaAndIsEnableOffloading) {
     ASSERT_TRUE(adaptor.Init());
 
     auto enable_before = adaptor.IsEnableOffloading();
-    EXPECT_FALSE(enable_before);
-    EXPECT_EQ(enable_before.error(), ErrorCode::INTERNAL_ERROR);
+    ASSERT_TRUE(enable_before);
+    EXPECT_FALSE(enable_before.value());
 
     // New behavior: must call ScanMeta once before BatchOffload when eviction
     // is disabled, otherwise meta_scanned_ is false and BatchOffload is

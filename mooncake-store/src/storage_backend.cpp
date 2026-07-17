@@ -1342,6 +1342,9 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
     if (!enable_offloading_res) {
         return tl::make_unexpected(enable_offloading_res.error());
     }
+    if (!enable_offloading_res.value()) {
+        return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
+    }
     std::vector<StorageObjectMetadata> metadatas;
     std::vector<std::string> keys;
     metadatas.reserve(batch_object.size());
@@ -1462,8 +1465,9 @@ tl::expected<bool, ErrorCode> StorageBackendAdaptor::IsEnableOffloading() {
     }
 
     if (!meta_scanned_.load(std::memory_order_acquire)) {
-        LOG(ERROR) << "Metadata has not been loaded yet";
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        VLOG(1) << "Metadata has not been loaded yet; offloading remains "
+                   "disabled until the initial scan completes";
+        return false;
     }
 
     MutexLocker lock(&mutex_);

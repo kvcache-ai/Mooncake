@@ -36,6 +36,7 @@ class FileStorageTest : public ::testing::Test {
         UnsetEnv("MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT");
         UnsetEnv("MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES");
         UnsetEnv("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS");
+        UnsetEnv("MOONCAKE_OFFLOAD_ENABLE_EVICTION");
         UnsetEnv("MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION");
         UnsetEnv("MOONCAKE_OFFLOAD_DISK_EVICTION_HIGH_WATERMARK_RATIO");
         UnsetEnv("MOONCAKE_OFFLOAD_DISK_EVICTION_LOW_WATERMARK_RATIO");
@@ -404,6 +405,39 @@ TEST_F(FileStorageTest, ReadDiskWatermarkConfigFromEnv) {
     auto invalid_config = FileStorageConfig::FromEnvironment();
     EXPECT_DOUBLE_EQ(invalid_config.disk_eviction_high_watermark_ratio, 0.90);
     EXPECT_DOUBLE_EQ(invalid_config.disk_eviction_low_watermark_ratio, 0.80);
+}
+
+TEST_F(FileStorageTest, InitFilePerKeyWithEvictionDisabled) {
+    SetEnv("MOONCAKE_OFFLOAD_ENABLE_EVICTION", "false");
+
+    std::filesystem::path master_root =
+        std::filesystem::path(data_path) / "no_eviction_master";
+    std::filesystem::create_directories(master_root);
+    testing::InProcMaster master;
+    auto master_config = InProcMasterConfigBuilder()
+                             .set_enable_offload(true)
+                             .set_root_fs_dir(master_root.string())
+                             .build();
+    ASSERT_TRUE(master.Start(master_config));
+
+    std::string local_rpc_addr =
+        "127.0.0.1:" + std::to_string(getFreeTcpPort());
+    auto client = Client::Create(local_rpc_addr, master.metadata_url(), "tcp",
+                                 std::nullopt, master.master_address());
+    ASSERT_TRUE(client);
+
+    FileStorageConfig config = FileStorageConfig::FromEnvironment();
+    config.storage_backend_type = StorageBackendType::kFilePerKey;
+    config.storage_filepath = data_path + "/no_eviction_storage";
+    config.local_buffer_size = 4 * 1024 * 1024;
+    config.heartbeat_interval_seconds = 1;
+    fs::create_directories(config.storage_filepath);
+
+    FileStorage file_storage(config, client.value(), local_rpc_addr);
+    ASSERT_TRUE(file_storage.Init());
+    auto enable_result = FileStorageIsEnableOffloading(file_storage);
+    ASSERT_TRUE(enable_result);
+    EXPECT_TRUE(enable_result.value());
 }
 
 TEST_F(FileStorageTest, HeartbeatRunsDiskWatermarkEvictionWithoutOffloadWork) {

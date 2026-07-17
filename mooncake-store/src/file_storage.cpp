@@ -382,6 +382,20 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
         return scan_meta_result;
     }
 
+    // Some backends need the initial scan to reconstruct quota accounting.
+    // Refresh the local state before the first heartbeat publishes it to the
+    // master. Until this point such backends mount conservatively as disabled.
+    auto refreshed_offloading_result = IsEnableOffloading();
+    if (!refreshed_offloading_result) {
+        LOG(ERROR) << "Failed to refresh offloading state after metadata scan: "
+                   << refreshed_offloading_result.error();
+        return tl::make_unexpected(refreshed_offloading_result.error());
+    }
+    {
+        MutexLocker locker(&offloading_mutex_);
+        enable_offloading_ = refreshed_offloading_result.value();
+    }
+
     heartbeat_running_.store(true);
     heartbeat_thread_ = std::thread([this]() {
         LOG(INFO) << "Starting periodic task with interval: "
