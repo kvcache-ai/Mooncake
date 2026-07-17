@@ -59,6 +59,9 @@ struct GlobalConfig {
     // torn-down pod IP) it stalls for the kernel's full SYN-retry cycle,
     // which is minutes. Override via MC_HANDSHAKE_CONNECT_TIMEOUT.
     int handshake_connect_timeout = 5;
+    // Cooldown before retrying a failed RDMA peer rail. Override via
+    // MC_RDMA_RAIL_PAUSE_SECONDS.
+    uint64_t rdma_rail_pause_seconds = 30;
     bool metacache = true;
     // Periodically refresh Transfer Engine metadata-derived local caches. 0
     // disables the background poller and preserves the manual
