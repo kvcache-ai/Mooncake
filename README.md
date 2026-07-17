@@ -82,7 +82,7 @@ Under real workloads, Mooncake’s innovative architecture enables Kimi to handl
 
 Mooncake is an infrastructure project for large-scale LLM inference and training. It features a KV cache-centric disaggregated architecture that separates prefill and decode clusters, while leveraging otherwise underutilized CPU, DRAM, and SSD resources in GPU clusters to build a disaggregated KV cache pool.
 
-Mooncake includes a high-performance Transfer Engine for low-latency data movement across heterogeneous networks and accelerators; Mooncake Store for distributed KV cache and model-weight management; and Mooncake EP & PG for elastic MoE serving. Deeply integrated with ecosystems such as SGLang and vLLM, Mooncake helps LLM systems improve cache reuse, reduce serving latency, and scale efficiently across multi-node clusters.
+Mooncake includes a high-performance Transfer Engine for low-latency data movement across heterogeneous networks and accelerators; Mooncake Store for distributed KV cache and model-weight management; and Mooncake EP & PG for elastic MoE serving. Deeply integrated with ecosystems such as SGLang and vLLM, Mooncake helps LLM systems improve cache reuse, reduce serving latency, and scale efficiently across multi-node clusters. See the [disaggregated serving architecture](docs/source/design/architecture.md#disaggregated-serving-architecture) diagram in the documentation for a detailed view of EPD, PD, AM, and RL separation.
 
 <h2 id="show-cases">🔥 Show Cases</h2>
 
@@ -189,6 +189,14 @@ Mooncake integrates with [vLLM](https://github.com/vllm-project/vllm) to acceler
 - **vLLM-Omni stage communication**: Mooncake also integrates with [vLLM-Omni](https://github.com/vllm-project/vllm-omni) through `MooncakeTransferEngineConnector` and `MooncakeStoreConnector`, enabling efficient cross-node data exchange between vLLM-Omni stages.
 
 </details>
+
+<h2 id="supported-software">📊 Supported Software</h2>
+
+Mooncake integrates with inference engines, middleware frameworks, and RL post-training systems across the LLM ecosystem. See the [ecosystem support matrix](docs/source/design/ecosystem-support.md) for component-level adoption details (Transfer, Store, EP/Torch Backend, Ckpt Engine).
+
+| **Inference** | **Middleware** | **RL Post-Training** |
+| :---: | :---: | :---: |
+| <a href="https://github.com/vllm-project/vllm"><img src="image/software/vllm.png" width="52" alt="vLLM"/><br><sub>vLLM</sub></a><br><a href="https://github.com/sgl-project/sglang"><img src="image/software/sglang.png" width="52" alt="SGLang"/><br><sub>SGLang</sub></a><br><a href="https://github.com/InternLM/lmdeploy"><img src="image/software/lmdeploy.png" width="52" alt="LMDeploy"/><br><sub>LMDeploy</sub></a><br><a href="https://github.com/NVIDIA/TensorRT-LLM"><img src="image/software/tensorrt-llm.png" width="52" alt="TensorRT-LLM"/><br><sub>TensorRT-LLM</sub></a><br><a href="https://github.com/thu-pacman/chitu"><img src="image/software/chitu.png" width="52" alt="Chitu"/><br><sub>Chitu</sub></a><br><a href="https://github.com/jd-opensource/xllm"><img src="image/software/xllm.png" width="52" alt="xLLM"/><br><sub>xLLM</sub></a><br><a href="https://github.com/alibaba/rtp-llm"><img src="image/software/alibaba.png" width="52" alt="RTP"/><br><sub>RTP</sub></a> | <a href="https://github.com/alibaba"><img src="image/software/alibaba.png" width="52" alt="KVCM"/><br><sub>KVCM</sub></a><br><a href="https://github.com/antgroup"><img src="image/software/antgroup.png" width="52" alt="TBase"/><br><sub>TBase</sub></a><br><a href="https://github.com/ai-dynamo/dynamo"><img src="image/software/dynamo.png" width="52" alt="Dynamo"/><br><sub>Dynamo</sub></a><br><a href="https://github.com/LMCache/LMCache"><img src="image/software/lmcache.png" width="52" alt="LMCache"/><br><sub>LMCache</sub></a><br><a href="https://github.com/Ascend/TransferQueue"><img src="image/software/ascend.png" width="52" alt="TransferQueue"/><br><sub>TransferQueue</sub></a> | <a href="https://github.com/THUDM/slime"><img src="image/software/thudm.png" width="52" alt="Slime"/><br><sub>Slime/Miles</sub></a><br><a href="https://github.com/alibaba/ROLL"><img src="image/software/alibaba.png" width="52" alt="ROLL"/><br><sub>ROLL</sub></a><br><a href="https://github.com/volcengine/verl"><img src="image/software/volcengine.png" width="52" alt="Verl"/><br><sub>Verl</sub></a> |
 
 <h2 id="supported-hardware">🖥️ Supported Hardware</h2>
 
