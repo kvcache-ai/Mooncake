@@ -33,8 +33,12 @@ def init_dist(local_rank: int, num_local_ranks: int):
 
     ranks = list(range(num_local_ranks * num_nodes))
     group = dist.group.WORLD if use_nccl_device else dist.new_group(ranks)
-    cpu_backend = 'gloo' if use_nccl_device else 'mooncake-cpu'
-    cpu_group = dist.new_group(ranks, backend=cpu_backend)
+    # The device transport test uses this group only for barriers. Reuse the
+    # established NCCL world group instead of creating an extra cross-node
+    # Gloo group in NCCL mode.
+    cpu_group = group if use_nccl_device else dist.new_group(
+        ranks, backend='mooncake-cpu'
+    )
     return dist.get_rank(), dist.get_world_size(), group, cpu_group
 
 
