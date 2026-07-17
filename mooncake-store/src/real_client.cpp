@@ -1030,14 +1030,19 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 
                     // Start offload RPC server so cross-instance DISK reads
                     // (batch_get_offload_object) can reach this instance.
-                    // GDS-only mode: reserve/complete are co-located RPCs
-                    // (GDS hardware requires GPU and NVMe on the same
-                    // machine), so bind to loopback only — never expose
-                    // offset-reservation to the network.
+                    // Must bind 0.0.0.0: local_rpc_addr is advertised to
+                    // peers as hostname:port, so loopback binding would
+                    // break remote DISK reads. reserve/complete callers are
+                    // co-located (GDS requires GPU + NVMe on one machine)
+                    // but share this single server — per-handler binding
+                    // would require a second server. The handlers are
+                    // unauthenticated, same as the regular offload server
+                    // above; RPC-layer caller authentication is separate
+                    // hardening work, out of scope here.
                     if (start_offload_rpc_server && !offload_rpc_server_) {
                         offload_rpc_server_ =
                             std::make_unique<coro_rpc::coro_rpc_server>(
-                                1, 0, "127.0.0.1");
+                                1, 0, "0.0.0.0");
                         offload_rpc_server_->register_handler<
                             &RealClient::batch_get_offload_object>(this);
                         offload_rpc_server_->register_handler<
