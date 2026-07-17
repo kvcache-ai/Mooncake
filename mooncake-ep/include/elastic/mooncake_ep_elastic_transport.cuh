@@ -119,8 +119,9 @@ struct MooncakeGin {
     __device__ __forceinline__ void put(void* dst_ptr, const void* src_ptr,
                                         int num_bytes, int dst_rank,
                                         int /*flags*/ = 0) const {
-        dst_rank = world_rank<team_t>(dst_rank);
-        auto routed = get_sym_ptr<WorldTeam>(dst_ptr, dst_rank);
+        const int logical_dst_rank = dst_rank;
+        const int world_dst_rank = world_rank<team_t>(logical_dst_rank);
+        auto routed = get_sym_ptr<WorldTeam>(dst_ptr, world_dst_rank);
         if (routed != nullptr) {
             const auto src_addr = reinterpret_cast<uintptr_t>(src_ptr);
             const auto dst_addr = reinterpret_cast<uintptr_t>(routed);
@@ -158,14 +159,16 @@ struct MooncakeGin {
         } else {
 #ifdef USE_NCCL_DEVICE
             if (ctx.use_nccl) {
-                device::mc_nccl_put(ctx.nccl, qp_idx, dst_rank,
+                constexpr bool kRail = std::is_same_v<team_t, ScaleoutTeam>;
+                device::mc_nccl_put(ctx.nccl, qp_idx,
+                                    kRail ? logical_dst_rank : world_dst_rank,
                                     physical_qps_per_rank, src_ptr, dst_ptr,
                                     static_cast<uint32_t>(num_bytes),
-                                    ptx::get_lane_idx());
+                                    ptx::get_lane_idx(), kRail);
                 return;
             }
 #endif
-            device::mc_rdma_put(ctx, qp_idx, dst_rank, physical_qps_per_rank,
+            device::mc_rdma_put(ctx, qp_idx, world_dst_rank, physical_qps_per_rank,
                                 src_ptr, dst_ptr,
                                 static_cast<uint32_t>(num_bytes), 0);
         }
@@ -175,7 +178,8 @@ struct MooncakeGin {
     __device__ __forceinline__ void put_value(value_t* dst_ptr, value_t value,
                                               int dst_rank,
                                               int flags = 0) const {
-        dst_rank = world_rank<team_t>(dst_rank);
+        const int logical_dst_rank = dst_rank;
+        dst_rank = world_rank<team_t>(logical_dst_rank);
         auto* routed =
             static_cast<value_t*>(get_sym_ptr<WorldTeam>(dst_ptr, dst_rank));
         if (routed != nullptr) {
@@ -192,9 +196,12 @@ struct MooncakeGin {
                 if constexpr (sizeof(value_t) == sizeof(uint64_t) ||
                               sizeof(value_t) == sizeof(int64_t)) {
                     device::mc_nccl_signal_add(
-                        ctx.nccl, dst_rank, qp_idx, physical_qps_per_rank,
+                        ctx.nccl,
+                        std::is_same_v<team_t, ScaleoutTeam> ? logical_dst_rank : dst_rank,
+                        qp_idx, physical_qps_per_rank,
                         reinterpret_cast<uint64_t*>(dst_ptr),
-                        static_cast<uint64_t>(value), 0);
+                        static_cast<uint64_t>(value), 0,
+                        std::is_same_v<team_t, ScaleoutTeam>);
                 } else {
                     EP_DEVICE_ASSERT(
                         false &&
@@ -249,19 +256,28 @@ struct MooncakeGin {
                                                 int dst_rank,
                                                 int flags = 0) const {
         if constexpr (sizeof(value_t) == sizeof(int32_t)) {
-            dst_rank = world_rank<team_t>(dst_rank);
+            const int logical_dst_rank = dst_rank;
+            dst_rank = world_rank<team_t>(logical_dst_rank);
             auto* routed =
                 static_cast<int*>(get_sym_ptr<WorldTeam>(dst_ptr, dst_rank));
             if (routed != nullptr) {
                 device::mc_atomic_add_release(routed, static_cast<int>(value));
             } else {
+#ifdef USE_NCCL_DEVICE
+                if (ctx.use_nccl) {
+                    EP_DEVICE_ASSERT(false &&
+                                     "NCCL Elastic red_add_rel requires 64-bit values");
+                    return;
+                }
+#endif
                 device::mc_red_add(ctx, dst_rank, qp_idx, physical_qps_per_rank,
                                    reinterpret_cast<int*>(dst_ptr),
                                    static_cast<int32_t>(value));
             }
         } else if constexpr (sizeof(value_t) == sizeof(uint64_t) ||
                              sizeof(value_t) == sizeof(int64_t)) {
-            dst_rank = world_rank<team_t>(dst_rank);
+            const int logical_dst_rank = dst_rank;
+            dst_rank = world_rank<team_t>(logical_dst_rank);
             auto* routed = static_cast<int64_t*>(
                 get_sym_ptr<WorldTeam>(dst_ptr, dst_rank));
             if (routed != nullptr) {
@@ -277,9 +293,12 @@ struct MooncakeGin {
 #ifdef USE_NCCL_DEVICE
                 if (ctx.use_nccl) {
                     device::mc_nccl_signal_add(
-                        ctx.nccl, dst_rank, qp_idx, physical_qps_per_rank,
+                        ctx.nccl,
+                        std::is_same_v<team_t, ScaleoutTeam> ? logical_dst_rank : dst_rank,
+                        qp_idx, physical_qps_per_rank,
                         reinterpret_cast<uint64_t*>(dst_ptr),
-                        static_cast<uint64_t>(value), 0);
+                        static_cast<uint64_t>(value), 0,
+                        std::is_same_v<team_t, ScaleoutTeam>);
                     return;
                 }
 #endif

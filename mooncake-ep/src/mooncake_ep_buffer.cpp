@@ -226,6 +226,7 @@ void MooncakeEpBuffer::initialize_nccl_transport(
     config.num_ranks = num_ranks;
     config.enable_gin = true;
     config.gin_context_count = gin_context_count;
+    config.gin_rail_connectivity = num_ranks > 1;
     config.lsa_barrier_count = 0;
     if (owned_nccl_transport_->initialize(config, unique_id) != 0) {
         throw std::runtime_error(

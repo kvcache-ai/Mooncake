@@ -116,10 +116,12 @@ __forceinline__ __device__ void mooncake_barrier_wo_local_sync(
         auto* arrivals = reinterpret_cast<uint64_t*>(
             workspace.get_nvl_barrier_signal_ptr(kTag, 0));
         if (thread_idx < kNumRanks) {
-            const int dst_rank = gin.template world_rank<team_t>(thread_idx);
+            constexpr bool kRail = std::is_same_v<team_t, transport::ScaleoutTeam>;
+            const int dst_rank = kRail ? thread_idx
+                                       : gin.template world_rank<team_t>(thread_idx);
             device::mc_nccl_signal_add(gin.ctx.nccl, dst_rank, gin.qp_idx,
                                        gin.physical_qps_per_rank, arrivals, 1,
-                                       0);
+                                       0, kRail);
         }
         __syncthreads();
         __shared__ unsigned long long target;

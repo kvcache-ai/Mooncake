@@ -171,7 +171,8 @@ __device__ __forceinline__ void mc_nccl_lsa_barrier(
 
 __device__ __forceinline__ void mc_nccl_put(
     const NcclDeviceContext& ctx, int channel, int dst_rank, int qps_per_rank,
-    const void* send_ptr, void* recv_ptr, uint32_t nbytes, int lane_id) {
+    const void* send_ptr, void* recv_ptr, uint32_t nbytes, int lane_id,
+    bool rail = false) {
     (void)qps_per_rank;
     if (lane_id != 0) return;
 
@@ -181,7 +182,8 @@ __device__ __forceinline__ void mc_nccl_put(
     const auto window = detail::NcclDeviceContextAccess::window(ctx);
     ncclGin gin{comm, detail::mc_nccl_gin_context(
                           ctx, static_cast<unsigned int>(channel))};
-    gin.put(ncclTeamWorld(comm), dst_rank, window, dst_offset, window,
+    const auto team = rail ? ncclTeamRail(comm) : ncclTeamWorld(comm);
+    gin.put(team, dst_rank, window, dst_offset, window,
             src_offset, nbytes, ncclGin_None{}, ncclGin_None{},
             ncclCoopThread{});
 }
@@ -215,7 +217,7 @@ __device__ __forceinline__ void mc_nccl_put_with_signal(
 // system-scope atomic; GIN uses a VA signal on the selected context.
 __device__ __forceinline__ void mc_nccl_signal_add(
     const NcclDeviceContext& ctx, int dst_rank, int channel, int qps_per_rank,
-    uint64_t* signal_ptr, uint64_t value, int lane_id) {
+    uint64_t* signal_ptr, uint64_t value, int lane_id, bool rail = false) {
     (void)qps_per_rank;
     if (lane_id != 0) return;
 
@@ -226,7 +228,7 @@ __device__ __forceinline__ void mc_nccl_signal_add(
         return;
     }
     const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
-    if (ncclTeamRankIsMember(ncclTeamLsa(comm), ncclTeamWorld(comm),
+    if (!rail && ncclTeamRankIsMember(ncclTeamLsa(comm), ncclTeamWorld(comm),
                              dst_rank)) {
         const size_t signal_offset =
             detail::mc_nccl_pointer_offset(ctx, signal_ptr);
@@ -243,7 +245,8 @@ __device__ __forceinline__ void mc_nccl_signal_add(
     const auto window = detail::NcclDeviceContextAccess::window(ctx);
     ncclGin gin{comm, detail::mc_nccl_gin_context(
                           ctx, static_cast<unsigned int>(channel))};
-    gin.signal(ncclTeamWorld(comm), dst_rank,
+    const auto team = rail ? ncclTeamRail(comm) : ncclTeamWorld(comm);
+    gin.signal(team, dst_rank,
                ncclGin_VASignalAdd{window, signal_offset, value},
                ncclCoopThread{});
 }

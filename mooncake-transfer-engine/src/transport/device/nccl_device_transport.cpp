@@ -185,9 +185,11 @@ class NcclDeviceTransportImpl final : public NcclTransport {
         requirements.lsaBarrierCount = config.lsa_barrier_count;
         requirements.ginContextCount =
             config.enable_gin ? config.gin_context_count : 0;
-        requirements.ginConnectionType = config.enable_gin
-                                             ? NCCL_GIN_CONNECTION_FULL
-                                             : NCCL_GIN_CONNECTION_NONE;
+        requirements.ginConnectionType = !config.enable_gin
+                                             ? NCCL_GIN_CONNECTION_NONE
+                                             : (config.gin_rail_connectivity
+                                                    ? NCCL_GIN_CONNECTION_RAIL
+                                                    : NCCL_GIN_CONNECTION_FULL);
         requirements.ginExclusiveContexts =
             config.enable_gin && config.gin_exclusive_contexts;
 

@@ -40,12 +40,13 @@ struct NcclTransportConfig {
     int rank = -1;
     int num_ranks = 0;
 
-    // Mooncake currently supports either full world-team GIN connectivity or
-    // no GIN. Rail connectivity is deferred until Mooncake has a rail-team
-    // rank contract.
+    // GIN can connect the full world or corresponding ranks in each LSA rail.
     bool enable_gin = true;
     int gin_context_count = 4;
     bool gin_exclusive_contexts = false;
+    // Rail GIN connects corresponding ranks in each LSA team. Elastic hybrid
+    // uses it for scale-out traffic while local peers remain on LSA.
+    bool gin_rail_connectivity = false;
 
     // LSA barriers synchronize only the local LSA team. Cross-LSA/world
     // synchronization remains the caller's responsibility.
