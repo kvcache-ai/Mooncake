@@ -1346,6 +1346,53 @@ fn control_plane_client_round_trips_routes_and_allocator_calls() {
 }
 
 #[test]
+fn control_plane_client_can_be_called_from_tokio_runtime_thread() {
+    let authority = Arc::new(TestAuthority::default());
+    let allocator = Arc::new(TestAllocator::default());
+    let eviction = Arc::new(TestEviction::default());
+    let owner = sample_owner();
+    authority.insert(sample_route("alpha", 1, &owner));
+
+    let mut handle = ControlPlaneHandle::spawn("127.0.0.1", authority, allocator, eviction)
+        .expect("control plane server should start");
+    let lease = sample_lease(handle.address());
+    let client = ControlPlaneClient::new().expect("control plane client should start");
+    let authority_id = ClientStableId::new("authority");
+
+    let runtime = RuntimeBuilder::new_multi_thread()
+        .worker_threads(1)
+        .thread_name("control-plane-nested-runtime-regression")
+        .enable_all()
+        .build()
+        .expect("test runtime should start");
+    let get_results = runtime.block_on(async move {
+        client.batch_get_routes(
+            &lease,
+            "ns-a",
+            &authority_id,
+            &[ObjectKey::new("alpha"), ObjectKey::new("missing")],
+        )
+    });
+
+    let get_results =
+        get_results.expect("control client call inside Tokio runtime should not panic");
+    assert_eq!(get_results.len(), 2);
+    assert_eq!(
+        get_results[0]
+            .as_ref()
+            .expect("first route should decode")
+            .as_ref()
+            .map(|route| route.key.0.as_str()),
+        Some("alpha")
+    );
+    assert!(get_results[1]
+        .as_ref()
+        .expect("second route should decode")
+        .is_none());
+    handle.shutdown();
+}
+
+#[test]
 fn control_plane_client_reopens_closed_cached_stream_session() {
     let authority = Arc::new(TestAuthority::default());
     let allocator = Arc::new(TestAllocator::default());
