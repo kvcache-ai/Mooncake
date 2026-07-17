@@ -60,7 +60,7 @@ class MooncakeP2PShim final : public ::c10d::Backend {
 class MooncakeBackend final : public ::c10d::ProcessGroup {
    public:
     static constexpr size_t kDefaultCollectiveTimeoutUs = 10000000;  // 10 s
-    static constexpr int64_t kDefaultP2PTimeoutUs = 10000000;       // 10 s
+    static constexpr int64_t kDefaultP2PTimeoutUs = 10000000;        // 10 s
 
     struct MooncakeBackendOptions final : torch::CustomClassHolder {
         explicit MooncakeBackendOptions(at::Tensor activeRanks)
