@@ -1,6 +1,5 @@
 #include "real_client.h"
 #include "test_server_helpers.h"
-#include "gpu_staging_utils.h"
 
 #include <gtest/gtest.h>
 #include <cuda_runtime.h>
@@ -19,6 +18,8 @@ class GdsBatchPutSmoke : public ::testing::Test {
         setenv("MOONCAKE_ENABLE_GDS", "1", 1);
     }
     void TearDown() override {
+        unsetenv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR");
+        unsetenv("MOONCAKE_ENABLE_GDS");
         std::filesystem::remove_all("/tmp/gds_smoke_test");
     }
 };

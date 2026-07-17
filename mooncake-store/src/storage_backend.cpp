@@ -3430,18 +3430,29 @@ std::string OffsetAllocatorStorageBackend::GetDataFilePath() const {
 }
 tl::expected<OffloadSpaceReservation, ErrorCode>
 OffsetAllocatorStorageBackend::ReserveOffloadSpace(const std::string& key,
-                                                   uint32_t record_size,
                                                    uint32_t value_size) {
-    if (record_size > UINT32_MAX || value_size > record_size)
+    // The record layout (with alignment padding) is derived here so that
+    // reserver and reader can never disagree on the on-disk format.
+    const uint64_t record_size_64 =
+        RecordHeader::RecordSize(static_cast<uint32_t>(key.size()), value_size);
+    if (record_size_64 > UINT32_MAX) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    const uint32_t record_size = static_cast<uint32_t>(record_size_64);
 
     auto allocation = allocator_->allocate(record_size);
     if (!allocation) return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
 
     uint64_t offset = allocation->address();
 
+    const bool eviction_on =
+        (cfg_.eviction_policy != OffsetEvictionPolicy::NONE);
+
     auto& shard = shards_[ShardForKey(key)];
     {
+        // Lock order: eviction_mutex_ -> shard.mutex (same as BatchOffload).
+        std::optional<MutexLocker> ev_lock;
+        if (eviction_on) ev_lock.emplace(&eviction_mutex_);
         SharedMutexLocker locker(&shard.mutex);
         // Refuse to overwrite an existing record: the old AllocationPtr
         // would be destroyed, its offset recycled, and any in-flight DMA
@@ -3456,10 +3467,13 @@ OffsetAllocatorStorageBackend::ReserveOffloadSpace(const std::string& key,
             // allocator_->allocate() is RAII: going out of scope frees it.
             return tl::make_unexpected(ErrorCode::INVALID_KEY);
         }
+        uint64_t seq = 0;
+        if (eviction_on)
+            seq = insert_seq_.fetch_add(1, std::memory_order_relaxed);
         auto alloc_ptr = std::make_shared<RefCountedAllocationHandle>(
             std::move(*allocation));
-        ObjectEntry entry(offset, record_size, value_size,
-                          std::move(alloc_ptr));
+        ObjectEntry entry(offset, record_size, value_size, std::move(alloc_ptr),
+                          seq);
         entry.dirty_.store(true, std::memory_order_release);
         entry.quarantined_.store(false, std::memory_order_release);
         entry.reserved_at =
@@ -3467,20 +3481,34 @@ OffsetAllocatorStorageBackend::ReserveOffloadSpace(const std::string& key,
                 std::chrono::steady_clock::now().time_since_epoch())
                 .count();
         shard.map[key] = std::move(entry);
+        // Reserved space is real usage: account for it and make the record
+        // visible to FIFO eviction (once completed it behaves exactly like
+        // an offloaded record; while dirty, EvictToMakeRoom skips it).
+        total_size_.fetch_add(record_size, std::memory_order_relaxed);
+        total_keys_.fetch_add(1, std::memory_order_relaxed);
+        if (eviction_on) fifo_index_.emplace(seq, key);
     }
 
-    return OffloadSpaceReservation{offset, record_size, value_size};
+    return OffloadSpaceReservation{key, offset, record_size, value_size};
 }
 
-void OffsetAllocatorStorageBackend::CompleteOffloadSpace(
-    const std::string& key) {
+std::optional<OffloadSpaceCompletion>
+OffsetAllocatorStorageBackend::CompleteOffloadSpace(const std::string& key) {
     auto& shard = shards_[ShardForKey(key)];
     SharedMutexLocker locker(&shard.mutex, shared_lock);
     auto it = shard.map.find(key);
-    if (it != shard.map.end()) {
-        it->second.dirty_.store(false, std::memory_order_release);
-        it->second.quarantined_.store(false, std::memory_order_release);
+    if (it == shard.map.end()) {
+        LOG(WARNING) << "CompleteOffloadSpace: unknown key '" << key << "'";
+        return std::nullopt;
     }
+    OffloadSpaceCompletion info;
+    info.offset = it->second.offset;
+    info.total_size = it->second.total_size;
+    info.value_size = it->second.value_size;
+    info.was_dirty =
+        it->second.dirty_.exchange(false, std::memory_order_acq_rel);
+    it->second.quarantined_.store(false, std::memory_order_release);
+    return info;
 }
 
 tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::WriteAtOffset(
@@ -3494,8 +3522,15 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::WriteAtOffset(
 }
 void OffsetAllocatorStorageBackend::CleanupStaleDirtyRecords(
     int64_t now_seconds) {
-    static constexpr int64_t kOverdirtyTimeoutSec = 120;
-    static constexpr int64_t kQuarantineTimeoutSec = 120;
+    // The quarantine window must be far larger than the client-side DMA
+    // wait (120s in RealClient): a client whose DMA is merely slow — not
+    // dead — may still be writing to the reserved offset.  Reclaiming too
+    // early lets a new record reuse the offset while the stale DMA keeps
+    // writing into it.  10 minutes of grace makes that vanishingly
+    // unlikely; the space cost of a leaked record is bounded and
+    // recoverable, a torn record is not.
+    static constexpr int64_t kOverdirtyTimeoutSec = 600;
+    static constexpr int64_t kQuarantineTimeoutSec = 600;
 
     for (size_t i = 0; i < kNumShards; ++i) {
         auto& shard = shards_[i];
@@ -3530,6 +3565,9 @@ void OffsetAllocatorStorageBackend::CleanupStaleDirtyRecords(
         // Phase B — "zombie release": free quarantined records that
         // have been in quarantine long enough (DMA is definitely dead).
         {
+            // Lock order: eviction_mutex_ -> shard.mutex (fifo_index_ and
+            // the usage counters are maintained together with the erase).
+            MutexLocker ev_lock(&eviction_mutex_);
             SharedMutexLocker locker(&shard.mutex);
             auto it = shard.map.begin();
             while (it != shard.map.end()) {
@@ -3538,7 +3576,16 @@ void OffsetAllocatorStorageBackend::CleanupStaleDirtyRecords(
                     entry.quarantined_.load(std::memory_order_acquire) &&
                     (now_seconds - entry.quarantined_at) >
                         kQuarantineTimeoutSec) {
-                    // Erasing the entry destroys AllocationPtr; RAII frees
+                    // Mirror the accounting done in ReserveOffloadSpace:
+                    // release usage counters and the FIFO slot, then erase
+                    // (destroying the AllocationPtr frees the offset).
+                    DCHECK_GE(total_size_.load(std::memory_order_relaxed),
+                              entry.total_size);
+                    DCHECK_GE(total_keys_.load(std::memory_order_relaxed), 1);
+                    total_size_.fetch_sub(entry.total_size,
+                                          std::memory_order_relaxed);
+                    total_keys_.fetch_sub(1, std::memory_order_relaxed);
+                    fifo_index_.erase(entry.fifo_seq);
                     LOG(WARNING)
                         << "GDS zombie offset released: key=" << it->first
                         << " offset=" << entry.offset
@@ -3833,15 +3880,36 @@ void OffsetAllocatorStorageBackend::EvictToMakeRoom(
         uint64_t vseq = oldest->first;
         std::string vkey = oldest->second;
 
-        // Skip batch_keys prefix — keys being written in this batch.
-        // Do NOT erase their FIFO slots (they may fail allocate() and
-        // need the slot to remain in the index for future eviction).
-        // Worst-case comparison cost: O(|batch_keys_prefix|), bounded.
-        while (oldest != fifo_index_.end() &&
-               batch_keys.count(oldest->second)) {
+        // Skip slots that must not be evicted right now:
+        //  - batch_keys: keys being written in this batch.  Do NOT erase
+        //    their FIFO slots (they may fail allocate() and need the slot
+        //    to remain in the index for future eviction).
+        //  - dirty GDS reservations: a client DMA write may still be in
+        //    flight to the reserved offset; evicting would recycle the
+        //    offset under the writer.  The slot stays — the record either
+        //    completes (becomes evictable) or is reclaimed by
+        //    CleanupStaleDirtyRecords.
+        //  Worst-case comparison cost is bounded by the index size.
+        while (oldest != fifo_index_.end()) {
+            if (batch_keys.count(oldest->second)) {
+                ++oldest;
+                continue;
+            }
+            bool candidate_dirty = false;
+            {
+                auto& cand_shard = shards_[ShardForKey(oldest->second)];
+                SharedMutexLocker cand_lk(&cand_shard.mutex, shared_lock);
+                auto cand_it = cand_shard.map.find(oldest->second);
+                if (cand_it != cand_shard.map.end() &&
+                    cand_it->second.fifo_seq == oldest->first) {
+                    candidate_dirty =
+                        cand_it->second.dirty_.load(std::memory_order_acquire);
+                }
+            }
+            if (!candidate_dirty) break;  // evictable (or orphan) candidate
             ++oldest;
         }
-        if (oldest == fifo_index_.end()) break;  // all are batch_keys
+        if (oldest == fifo_index_.end()) break;  // nothing evictable
         vkey = oldest->second;
         vseq = oldest->first;
 
@@ -3976,7 +4044,7 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
         RecordHeader header{.key_len = static_cast<uint32_t>(key.size()),
                             .value_len = value_size};
         size_t record_size =
-            RecordHeader::SIZE + header.key_len + header.value_len;
+            RecordHeader::RecordSize(header.key_len, header.value_len);
 
         // Guard against record_size exceeding what the on-disk format
         // can represent (ObjectEntry::total_size is uint32_t).
@@ -4074,9 +4142,13 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
 
         uint64_t offset = allocation->address();
 
-        // ---- (E) Disk write (unchanged from original) ----
+        // ---- (E) Disk write ----
+        // Layout: header | key | zero padding | value — the value region
+        // starts at a 4 KiB aligned offset so the GDS path can DMA it
+        // (see RecordHeader in gds/gds_context.h).  Both the GDS and the
+        // vector_write paths must produce the identical layout.
         std::vector<iovec> iovs;
-        iovs.reserve(2 + 1 + slices.size());
+        iovs.reserve(2 + 2 + slices.size());
         iovs.push_back(
             {const_cast<char*>(reinterpret_cast<const char*>(&header.key_len)),
              sizeof(header.key_len)});
@@ -4085,6 +4157,9 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
                         sizeof(header.value_len)});
         iovs.push_back({const_cast<char*>(key.data()),
                         static_cast<size_t>(header.key_len)});
+        static const char kZeroPad[RecordHeader::kValueAlignment] = {};
+        iovs.push_back({const_cast<char*>(kZeroPad),
+                        RecordHeader::ValuePadding(header.key_len)});
         for (const auto& slice : slices) {
             iovs.push_back({slice.ptr, slice.size});
         }
@@ -4127,6 +4202,20 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
             auto it = shard.map.find(key);
             int64_t size_delta = static_cast<int64_t>(record_size);
             bool is_new_key = (it == shard.map.end());
+
+            // GDS dirty guard: never overwrite a record whose reserved
+            // DMA write may still be in flight.  Replacing the entry
+            // would destroy the old AllocationPtr, recycle the offset,
+            // and let a future record be torn by the stale DMA writer.
+            // The fresh allocation above is RAII-freed by skipping.
+            if (!is_new_key &&
+                it->second.dirty_.load(std::memory_order_acquire)) {
+                LOG(WARNING) << "BatchOffload: key " << key
+                             << " has an in-flight GDS reservation (dirty), "
+                                "skipping offload for this key";
+                continue;
+            }
+
             uint64_t seq = 0;
 
             if (eviction_on) {
@@ -4189,6 +4278,17 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
 
 tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
     std::unordered_map<std::string, Slice>& batched_slices) {
+    // Single-slice adapter over the multi-destination implementation.
+    std::unordered_map<std::string, std::vector<Slice>> multi;
+    multi.reserve(batched_slices.size());
+    for (const auto& [key, dest] : batched_slices) {
+        multi.emplace(key, std::vector<Slice>{dest});
+    }
+    return BatchLoadMultiDest(multi);
+}
+
+tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoadMultiDest(
+    std::unordered_map<std::string, std::vector<Slice>>& batched_slices) {
     if (!initialized_.load(std::memory_order_acquire)) {
         LOG(ERROR)
             << "Storage backend is not initialized. Call Init() before use.";
@@ -4202,13 +4302,13 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
         uint64_t offset;
         uint32_t value_size;
         AllocationPtr allocation;  // Refcounted handle keeps allocation alive
-        Slice dest_slice;
+        std::vector<Slice> dest_slices;
     };
 
     std::vector<ReadPlan> read_plans;
     read_plans.reserve(batched_slices.size());
 
-    for (const auto& [key, dest_slice] : batched_slices) {
+    for (const auto& [key, dest_slices] : batched_slices) {
         size_t shard_idx = ShardForKey(key);
         auto& shard = shards_[shard_idx];
         SharedMutexLocker lock(&shard.mutex, /*shared_mode=*/shared_lock);
@@ -4223,10 +4323,12 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
         const auto& entry = it->second;
 
         // Validate destination size matches stored value size
-        if (dest_slice.size != entry.value_size) {
+        size_t dest_total = 0;
+        for (const auto& s : dest_slices) dest_total += s.size;
+        if (dest_total != entry.value_size) {
             LOG(ERROR) << "Size mismatch for key: " << key
                        << ", expected: " << entry.value_size
-                       << ", got: " << dest_slice.size;
+                       << ", got: " << dest_total;
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
 
@@ -4249,7 +4351,7 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
         read_plans.push_back(
             ReadPlan{key, entry.offset, entry.value_size,
                      entry.allocation,  // shared_ptr copy, increments refcount
-                     dest_slice});
+                     dest_slices});
 
         // Lock released here; allocation stays alive via shared_ptr
     }
@@ -4262,8 +4364,7 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
         iovec header_iovs[2] = {{&header.key_len, sizeof(header.key_len)},
                                 {&header.value_len, sizeof(header.value_len)}};
         if (gds_ctx_ && gds_ctx_->enabled_) {
-            Slice mutable_slice = plan.dest_slice;
-            auto rec = gds_ctx_->ReadRecord(plan.key, mutable_slice,
+            auto rec = gds_ctx_->ReadRecord(plan.key, plan.dest_slices,
                                             plan.offset, plan.value_size);
             if (!rec) return tl::make_unexpected(rec.error());
             continue;
@@ -4312,21 +4413,28 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
             return tl::make_unexpected(validate_result.error());
         }
 
-        // Read value into destination slice
-        iovec value_iov = {plan.dest_slice.ptr, plan.dest_slice.size};
-        auto read_value_result = data_file_->vector_read(
-            &value_iov, 1, plan.offset + RecordHeader::SIZE + header.key_len);
-        if (!read_value_result) {
-            LOG(ERROR) << "Failed to read value for key: " << plan.key
-                       << ", error: " << read_value_result.error();
-            return tl::make_unexpected(read_value_result.error());
-        }
+        // Read value into the destination slices, starting at the aligned
+        // value offset (see RecordHeader in gds/gds_context.h).
+        uint64_t value_offset =
+            plan.offset + RecordHeader::ValueOffsetInRecord(header.key_len);
+        for (const auto& dest : plan.dest_slices) {
+            if (dest.size == 0) continue;
+            iovec value_iov = {dest.ptr, dest.size};
+            auto read_value_result =
+                data_file_->vector_read(&value_iov, 1, value_offset);
+            if (!read_value_result) {
+                LOG(ERROR) << "Failed to read value for key: " << plan.key
+                           << ", error: " << read_value_result.error();
+                return tl::make_unexpected(read_value_result.error());
+            }
 
-        if (read_value_result.value() != header.value_len) {
-            LOG(ERROR) << "Value read size mismatch for key: " << plan.key
-                       << ", expected: " << header.value_len
-                       << ", got: " << read_value_result.value();
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            if (read_value_result.value() != dest.size) {
+                LOG(ERROR) << "Value read size mismatch for key: " << plan.key
+                           << ", expected: " << dest.size
+                           << ", got: " << read_value_result.value();
+                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            }
+            value_offset += dest.size;
         }
     }
 
@@ -4432,12 +4540,18 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::ScanMeta(
         // Scan all shards, calling handler when limit is reached
         for (size_t i = 0; i < kNumShards; ++i) {
             for (const auto& [key, entry] : shards_[i].map) {
+                // Skip dirty GDS reservations: their DMA has not completed
+                // (or never will), so they must not be advertised to the
+                // master as readable replicas.
+                if (entry.dirty_.load(std::memory_order_acquire)) continue;
                 keys.push_back(key);
                 metadatas.push_back(StorageObjectMetadata{
                     0,  // bucket_id not used
                     static_cast<int64_t>(entry.offset),
-                    static_cast<int64_t>(entry.total_size - RecordHeader::SIZE -
-                                         entry.value_size),  // key_size
+                    // key_size is the record key length — the map key
+                    // itself (total_size also covers padding, so it
+                    // cannot be derived from it).
+                    static_cast<int64_t>(key.size()),
                     static_cast<int64_t>(entry.value_size), ""});
 
                 // Call handler when batch limit is reached

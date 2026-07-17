@@ -91,6 +91,12 @@ class FileStorage {
     tl::expected<void, ErrorCode> DirectGdsBatchLoad(
         std::unordered_map<std::string, Slice>& batch_object);
 
+    // Multi-fragment variant: each key's value is read into the given
+    // slices consecutively (per-layer GPU buffers).  Requires the
+    // OffsetAllocator backend.
+    tl::expected<void, ErrorCode> DirectGdsBatchLoadMulti(
+        std::unordered_map<std::string, std::vector<Slice>>& batch_object);
+
    private:
     friend class FileStorageTest;
     friend class FileStoragePromotionTest;

@@ -1,7 +1,8 @@
 // Copyright 2025 KVCache.AI
 //
-#include <mutex>
 // Licensed under the Apache License, Version 2.0 (the "License");
+
+#include <mutex>
 
 #include "gds/gds_device_ops.h"
 

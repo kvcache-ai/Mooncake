@@ -33,15 +33,18 @@ TEST_F(GdsContextTest, Init_FallbackOnNoGds) {
 }
 
 // ── Test 2: ProbeGdsAvailable 在兼容环境返回 false ──
+// 只在无 GDS 硬件的机器上断言 false;有硬件时本测试无意义,直接跳过。
 TEST_F(GdsContextTest, ProbeGdsAvailable_NoGds) {
-    EXPECT_FALSE(GdsContext::IsGdsAvailable());
+    if (GdsContext::IsGdsAvailable()) {
+        GTEST_SKIP() << "GDS hardware present; no-GDS assertion not applicable";
+    }
     GdsContext ctx;
     EXPECT_FALSE(ctx.ProbeGdsAvailable(test_dir_));
 }
 
-// ── Test 3: WriteRecord + ReadRecord (Compat 模式, CPU buffer) ──
-// 注意: 此测试在无 GDS 硬件时也能跑，因为 Init 失败后会走 StorageFile 路径
-// 这里的测试仅验证 RecordHeader 格式和 pwrite/pread 的正确性
+// ── Test 3: RecordHeader 布局 (4K 对齐 padding + pwrite/pread) ──
+// 注意: 无 GDS 硬件时 GdsContext 无法 Init,此测试直接按 RecordHeader
+// 定义的布局手工 pwrite/pread,验证对齐计算的读写一致性
 TEST_F(GdsContextTest, WriteRead_CpuBuffer) {
     // 直接打开文件写入（绕过 Init 的 probe）
     std::string path = test_dir_ + "/manual_test.data";
@@ -51,17 +54,22 @@ TEST_F(GdsContextTest, WriteRead_CpuBuffer) {
     // 写入测试数据
     std::string key = "test_key_001";
     std::string value = "hello_gds_test_data_12345678";
-    std::vector<Slice> slices = {Slice{(void*)value.data(), value.size()}};
+    const uint32_t klen = static_cast<uint32_t>(key.size());
+    const uint32_t vlen = static_cast<uint32_t>(value.size());
+    // 布局: header + key + zero padding + value — value 起始按 4K 对齐
+    const uint64_t value_off = RecordHeader::ValueOffsetInRecord(klen);
+    ASSERT_EQ(value_off % RecordHeader::kValueAlignment, 0u);
 
-    // header + key + value 直接 pwrite
-    RecordHeader hdr{.key_len = static_cast<uint32_t>(key.size()),
-                     .value_len = static_cast<uint32_t>(value.size())};
+    RecordHeader hdr{.key_len = klen, .value_len = vlen};
     ASSERT_EQ(::pwrite(fd, &hdr, RecordHeader::SIZE, 0), RecordHeader::SIZE);
-    ASSERT_EQ(::pwrite(fd, key.data(), key.size(), RecordHeader::SIZE),
-              static_cast<ssize_t>(key.size()));
-    ASSERT_EQ(::pwrite(fd, value.data(), value.size(),
-                       RecordHeader::SIZE + key.size()),
-              static_cast<ssize_t>(value.size()));
+    ASSERT_EQ(::pwrite(fd, key.data(), klen, RecordHeader::SIZE),
+              static_cast<ssize_t>(klen));
+    static const char kZeros[RecordHeader::kValueAlignment] = {};
+    ASSERT_EQ(::pwrite(fd, kZeros, RecordHeader::ValuePadding(klen),
+                       RecordHeader::SIZE + klen),
+              static_cast<ssize_t>(RecordHeader::ValuePadding(klen)));
+    ASSERT_EQ(::pwrite(fd, value.data(), vlen, value_off),
+              static_cast<ssize_t>(vlen));
 
     // 读回
     RecordHeader read_hdr;
@@ -76,8 +84,7 @@ TEST_F(GdsContextTest, WriteRead_CpuBuffer) {
     EXPECT_EQ(read_key, key);
 
     std::string read_val(value.size(), '\0');
-    ASSERT_EQ(::pread(fd, read_val.data(), value.size(),
-                      RecordHeader::SIZE + key.size()),
+    ASSERT_EQ(::pread(fd, read_val.data(), value.size(), value_off),
               static_cast<ssize_t>(value.size()));
     EXPECT_EQ(read_val, value);
 
@@ -96,5 +103,64 @@ TEST_F(GdsContextTest, IsGdsAvailable_Static) {
     bool avail = GdsContext::IsGdsAvailable();
     LOG(INFO) << "GDS available on this machine: " << std::boolalpha << avail;
     SUCCEED();
+}
+
+// ── Test 6: WriteRecord/ReadRecord 端到端 (需要 GDS 硬件) ──
+// 用 CPU buffer 走 GdsContext 的完整记录读写路径,验证 4K 对齐布局
+// 在真实 cuFile 句柄下的读写一致性(含多 slice 读)。
+TEST_F(GdsContextTest, WriteReadRecord_EndToEnd) {
+    if (!GdsContext::IsGdsAvailable()) {
+        GTEST_SKIP() << "no GDS hardware on this machine";
+    }
+    GdsContext ctx;
+    std::string data_file = test_dir_ + "/kv_cache.data";
+    auto init_res = ctx.Init(data_file, 16 * 1024 * 1024);  // 16MB
+    if (!init_res) {
+        GTEST_SKIP() << "GDS Init failed in this environment: "
+                     << static_cast<int>(init_res.error());
+    }
+    ASSERT_TRUE(ctx.enabled_.load());
+
+    // 写一个两 slice 的记录;key 长度刻意非对齐,验证 value 仍落在
+    // 4K 对齐的偏移上并能正确读回。
+    std::string key = "e2e_key_007";
+    std::string val_a = "first-fragment:";
+    std::string val_b(5000, 'z');
+    std::vector<Slice> slices = {Slice{val_a.data(), val_a.size()},
+                                 Slice{val_b.data(), val_b.size()}};
+    const uint64_t offset = 0;
+    auto wr = ctx.WriteRecord(key, slices, offset);
+    ASSERT_TRUE(wr.has_value());
+
+    // value 必须写在 4K 对齐偏移处 — 直接用 pread 校验布局。
+    const uint64_t value_off =
+        RecordHeader::ValueOffsetInRecord(static_cast<uint32_t>(key.size()));
+    ASSERT_EQ(value_off % RecordHeader::kValueAlignment, 0u);
+    std::string raw(value_off + val_a.size() + val_b.size(), '\0');
+    ASSERT_EQ(::pread(ctx.gds_fd_, raw.data(), raw.size(), 0),
+              static_cast<ssize_t>(raw.size()));
+    EXPECT_EQ(raw.substr(value_off, val_a.size()), val_a);
+
+    // 多 slice 读回并校验。
+    std::string dst_a(val_a.size(), '\0');
+    std::string dst_b(val_b.size(), '\0');
+    std::vector<Slice> dest = {Slice{dst_a.data(), dst_a.size()},
+                               Slice{dst_b.data(), dst_b.size()}};
+    auto rr = ctx.ReadRecord(
+        key, dest, offset, static_cast<uint32_t>(val_a.size() + val_b.size()));
+    ASSERT_TRUE(rr.has_value());
+    EXPECT_EQ(dst_a, val_a);
+    EXPECT_EQ(dst_b, val_b);
+
+    // 目标总大小与记录不符时必须拒绝(不允许截断/溢出读)。
+    std::string short_buf(8, '\0');
+    std::vector<Slice> bad = {Slice{short_buf.data(), short_buf.size()}};
+    EXPECT_FALSE(
+        ctx.ReadRecord(key, bad, offset,
+                       static_cast<uint32_t>(val_a.size() + val_b.size()))
+            .has_value());
+
+    ctx.Shutdown();
+    EXPECT_FALSE(ctx.enabled_.load());
 }
 }  // namespace mooncake

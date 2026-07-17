@@ -9,6 +9,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <unordered_set>
@@ -21,7 +22,17 @@
 
 namespace mooncake {
 struct OffloadSpaceReservation;
-}
+
+// Result of completing a previously reserved offload record.
+// Returned by StorageBackendInterface::CompleteOffloadSpace so the
+// caller (FileStorage) can register the DISK replica with the master.
+struct OffloadSpaceCompletion {
+    uint64_t offset = 0;
+    uint32_t total_size = 0;  // record size on disk (header+key+pad+value)
+    uint32_t value_size = 0;  // value bytes only
+    bool was_dirty = false;   // true if this call transitioned dirty->clean
+};
+}  // namespace mooncake
 
 #include "gds/gds_context.h"  // GdsContext complete type (needed by any class with unique_ptr<GdsContext>)
 
@@ -373,8 +384,13 @@ class StorageBackendInterface {
     // (true after Init() if probe passed).
     virtual bool IsGdsEnabled() const { return false; }
 
-    // Complete DMA write (default no-op; OffsetAllocator overrides).
-    virtual void CompleteOffloadSpace(const std::string& /*key*/) {}
+    // Complete DMA write; on success returns the record's completion info
+    // (std::nullopt when the key is unknown or already completed).
+    // Default: no-op (no test failures injected).
+    virtual std::optional<OffloadSpaceCompletion> CompleteOffloadSpace(
+        const std::string& /*key*/) {
+        return std::nullopt;
+    }
     // Return data file path (default empty; OffsetAllocator overrides).
     virtual std::string GetDataFilePath() const { return {}; }
 
@@ -1243,41 +1259,11 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     }
 
    private:
-    // On-disk record header: [u32 key_len][u32 value_len] (8 bytes total)
-    struct RecordHeader {
-        // Length of key in bytes
-        uint32_t key_len;
-
-        // Length of value in bytes
-        uint32_t value_len;
-
-        // Header size: 8 bytes (2 * uint32_t). Currently assumes max object
-        // size is 4GB. If we need to support larger objects, change this to 16
-        // bytes.
-        static constexpr size_t SIZE = sizeof(uint32_t) * 2;
-
-        // Validate header against expected metadata
-        bool ValidateAgainstMetadata(uint32_t expected_value_len) const {
-            return value_len == expected_value_len;
-        }
-
-        // Validate key matches expected key
-        tl::expected<void, ErrorCode> ValidateKey(
-            const std::string& expected_key,
-            const std::string& stored_key) const {
-            if (stored_key.size() != key_len) {
-                LOG(ERROR) << "Key length mismatch: expected " << key_len
-                           << ", got " << stored_key.size();
-                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-            }
-            if (stored_key != expected_key) {
-                LOG(ERROR) << "Key mismatch: expected " << expected_key
-                           << ", got " << stored_key;
-                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-            }
-            return {};
-        }
-    };
+    // On-disk record header: [u32 key_len][u32 value_len] (8 bytes total),
+    // defined once in gds/gds_context.h (mooncake::RecordHeader) so the GDS
+    // and non-GDS record layouts can never drift apart.  The value region
+    // starts at a 4 KiB aligned offset within the record (see
+    // RecordHeader::ValueOffsetInRecord).
 
     // Refcounted wrapper for move-only OffsetAllocationHandle. Physical extent
     // freed when last shared_ptr reference drops.
@@ -1320,7 +1306,8 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
 
         // quarantined_=true: DMA presumed lost; offset pending reclamation.
         // Set by heartbeat Phase A (overdirty), cleared by Phase B (zombie
-        // release via erase). See fix_patch.md §3.2 for the full protocol.
+        // release via erase). See CleanupStaleDirtyRecords in
+        // storage_backend.cpp for the full protocol.
         std::atomic<bool> quarantined_{false};
 
         // Timestamps for heartbeat stale-dirty cleanup (monotonic seconds).
@@ -1341,13 +1328,18 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
               allocation(std::move(alloc_ptr)),
               fifo_seq(seq) {}
         // Explicit move — std::atomic<bool> deletes implicit move.
+        // NOTE: every member must be carried over here — including
+        // fifo_seq, which the FIFO eviction index cross-checks against
+        // fifo_index_ (dropping it after insert_or_assign() makes the
+        // fresh slot look like an orphan and leaks the key from eviction).
         ObjectEntry(ObjectEntry&& other) noexcept
             : offset(other.offset),
               total_size(other.total_size),
               value_size(other.value_size),
               allocation(std::move(other.allocation)),
               reserved_at(other.reserved_at),
-              quarantined_at(other.quarantined_at) {
+              quarantined_at(other.quarantined_at),
+              fifo_seq(other.fifo_seq) {
             dirty_.store(other.dirty_.load(std::memory_order_acquire));
             quarantined_.store(
                 other.quarantined_.load(std::memory_order_acquire));
@@ -1362,6 +1354,7 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
                 other.quarantined_.load(std::memory_order_acquire));
             reserved_at = other.reserved_at;
             quarantined_at = other.quarantined_at;
+            fifo_seq = other.fifo_seq;
             return *this;
         }
     };
@@ -1369,12 +1362,16 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     // ── GDS two-phase commit (Part B) ──
    public:
     // Phase 1: allocate file space and insert metadata with dirty_=true.
-    // Returns the file offset for the caller to DMA-write into.
+    // The record size (including alignment padding) is derived from the
+    // key/value sizes.  Returns the file offset for the caller to
+    // DMA-write into.
     tl::expected<OffloadSpaceReservation, ErrorCode> ReserveOffloadSpace(
-        const std::string& key, uint32_t record_size, uint32_t value_size);
+        const std::string& key, uint32_t value_size);
 
-    // Phase 2: caller completed DMA → clear dirty_ flag.
-    void CompleteOffloadSpace(const std::string& key) override;
+    // Phase 2: caller completed DMA → clear dirty_ flag and return the
+    // record's completion info (for master DISK-replica registration).
+    std::optional<OffloadSpaceCompletion> CompleteOffloadSpace(
+        const std::string& key) override;
 
     // Write raw record data at a pre-allocated offset.
     // Used by vLLM in normal-mode + GDS: offset was obtained from
@@ -1382,6 +1379,12 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     tl::expected<void, ErrorCode> WriteAtOffset(
         const std::string& key, const std::vector<Slice>& slices,
         uint64_t offset);
+
+    // Multi-destination BatchLoad: each key's value is read into the
+    // given slices consecutively (multi-fragment values, e.g. per-layer
+    // GPU buffers).  The GDS path issues one cuFileRead per slice.
+    tl::expected<void, ErrorCode> BatchLoadMultiDest(
+        std::unordered_map<std::string, std::vector<Slice>>& batched_slices);
 
     void CleanupStaleDirtyRecords(int64_t now_seconds) override;
 

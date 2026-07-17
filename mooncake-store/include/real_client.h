@@ -2,9 +2,13 @@
 
 #include <atomic>
 #include <boost/lockfree/queue.hpp>
+#include <condition_variable>
 #include <csignal>
+#include <deque>
+#include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -903,6 +907,28 @@ class RealClient : public PyClient {
     // store_service coro_rpc address for normal-mode GDS
     // Reserve/Complete RPCs. Set via MOONCAKE_GDS_STORE_SERVICE_ADDR.
     std::string store_service_addr_;
+
+    // ── GDS worker ──
+    // Persistent worker thread for GDS DMA tasks.  Replaces per-batch
+    // detached threads: the CUDA primary context is initialised once on
+    // this thread (instead of a cudaFree(nullptr) trick per batch), and
+    // the thread is joined on destruction so no DMA outlives the client.
+    // Tasks are executed FIFO on this single thread, which also matches
+    // the single-writer expectation of the offload path.
+    std::mutex gds_worker_mutex_;
+    std::condition_variable gds_worker_cv_;
+    std::deque<std::function<void()>> gds_worker_queue_;
+    std::thread gds_worker_thread_;
+    bool gds_worker_stop_ = false;
+    bool gds_worker_started_ = false;
+
+    // Enqueue a task on the persistent GDS worker (started lazily on
+    // first use).  Results are reported through promises captured by the
+    // task itself.
+    void SubmitGdsTask(std::function<void()> task);
+    // Signal the worker to drain and exit, then join it.  Called from
+    // the destructor before any member teardown.
+    void StopGdsWorker();
 
     // Dummy Client manage related members
     void dummy_client_monitor_func();

@@ -943,8 +943,16 @@ std::optional<std::shared_ptr<Client>> Client::Create(
                 // skip the extra StorageBackend — it would compete with
                 // OffsetAllocator for disk space on the same drive and
                 // its eviction queue is always empty (no writes go through it).
+                // Only skip when the GDS device is actually present: the
+                // runtime probe may still fail later, and without hardware
+                // there is certainly no GDS to replace this backend.
                 bool enable_gds = GetEnvOr<bool>("MOONCAKE_ENABLE_GDS", false);
-                if (!enable_gds) {
+                if (!enable_gds || !GdsContext::IsGdsAvailable()) {
+                    if (enable_gds) {
+                        LOG(WARNING) << "MOONCAKE_ENABLE_GDS=1 but no GDS "
+                                        "device found; keeping the default "
+                                        "StorageBackend";
+                    }
                     client->PrepareStorageBackend(storage_root_dir, fs_subdir,
                                                   config.enable_disk_eviction,
                                                   config.quota_bytes);
@@ -2578,8 +2586,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
 std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
-    const ReplicateConfig& config,
-    std::function<void()> after_submit_callback) {
+    const ReplicateConfig& config) {
     ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
@@ -2605,13 +2612,6 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
 
     auto t0 = std::chrono::steady_clock::now();
     SubmitTransfers(ops);
-
-    // GDS hook: launch cuFile DMA in parallel with WaitForTransfers
-    if (after_submit_callback) {
-        after_submit_callback();  // non-blocking (callback launches detached
-                                  // thread)
-    }
-
     WaitForTransfers(ops);
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - t0)

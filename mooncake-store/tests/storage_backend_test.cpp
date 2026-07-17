@@ -3624,7 +3624,10 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_Eviction_FifoOrder) {
     FileStorageConfig config;
     config.storage_filepath = data_path;
     config.storage_backend_type = StorageBackendType::kOffsetAllocator;
-    config.total_size_limit = 4 * 1024;  // 4KB — very small arena
+    // Arena sized so exactly 3 records fit below the high watermark and
+    // the 4th write triggers eviction.  Each record is 4K-aligned:
+    // 4096 (aligned header+key) + 1000 (value) = 5096 bytes.
+    config.total_size_limit = 20 * 1024;
     config.total_keys_limit = 100;
 
     OffsetAllocatorBackendConfig evict_cfg;
@@ -3644,8 +3647,9 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_Eviction_FifoOrder) {
         return ErrorCode::OK;
     };
 
-    // Write A, B, C one by one. The arena is 4 KB; each 1 KB record
-    // (8 + key + value) ≈ 1040 bytes. 4 records should trigger eviction.
+    // Write A, B, C one by one. 3 records = 15288 bytes, below the
+    // 18432-byte high watermark (0.9 * 20KB). The fourth write pushes
+    // total_size_ over it and evicts key_a (the oldest).
     std::string data(1000, 'x');
     std::vector<std::unique_ptr<char[]>> buffers;
 
@@ -3726,7 +3730,9 @@ TEST_F(StorageBackendTest,
     FileStorageConfig config;
     config.storage_filepath = data_path;
     config.storage_backend_type = StorageBackendType::kOffsetAllocator;
-    config.total_size_limit = 4 * 1024;
+    // 20KB arena: 3 aligned records (5096 bytes each) fit below the
+    // 0.9 high watermark; the 4th write triggers eviction.
+    config.total_size_limit = 20 * 1024;
     config.total_keys_limit = 100;
 
     OffsetAllocatorBackendConfig evict_cfg;
@@ -3909,8 +3915,10 @@ TEST_F(StorageBackendTest,
     FileStorageConfig config;
     config.storage_filepath = data_path;
     config.storage_backend_type = StorageBackendType::kOffsetAllocator;
-    config.total_size_limit =
-        8 * 1024;  // 8 KB — tight enough that 80 keys trigger eviction
+    // 160KB arena: 30 aligned records (4196 bytes each: 4K-aligned
+    // header+key + 100-byte value) fit below the 0.9 high watermark;
+    // 50 more writes force eviction.
+    config.total_size_limit = 160 * 1024;
     config.total_keys_limit = 500;
 
     OffsetAllocatorBackendConfig evict_cfg;

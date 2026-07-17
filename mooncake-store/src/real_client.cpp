@@ -28,7 +28,6 @@
 #include "utils.h"
 #include "rpc_types.h"
 #include "file_storage.h"
-#include "gds/gds_device_ops.h"
 #include "device/accelerator_registry.h"
 #include "default_config.h"
 #include "uds_transport.h"
@@ -571,6 +570,9 @@ RealClient::RealClient() {
 }
 
 RealClient::~RealClient() {
+    // Drain and join the GDS worker first: in-flight DMA tasks reference
+    // file_storage_ and must finish (or be abandoned) before teardown.
+    StopGdsWorker();
     if (offload_rpc_server_) {
         offload_rpc_server_->stop();
         offload_rpc_server_.reset();
@@ -578,6 +580,55 @@ RealClient::~RealClient() {
     // Ensure resources are cleaned even if not explicitly closed
     stop_http_server();
     tearDownAll_internal();
+}
+
+void RealClient::SubmitGdsTask(std::function<void()> task) {
+    {
+        std::lock_guard<std::mutex> lock(gds_worker_mutex_);
+        if (!gds_worker_started_) {
+            gds_worker_stop_ = false;
+            gds_worker_thread_ = std::thread([this]() {
+#ifdef USE_CUDA
+                // CUDA context is thread-local.  A fresh std::thread has no
+                // context, so cudaPointerGetAttributes() (called by
+                // FindDeviceForPointer inside WriteRecord/ReadRecord) would
+                // fail to recognise GPU pointers and silently fall back to
+                // CPU pwrite.  cudaFree(nullptr) is a guaranteed no-op that
+                // triggers lazy primary-context initialisation — done once
+                // here for the whole lifetime of the worker thread.
+                cudaFree(nullptr);
+#endif
+                std::unique_lock<std::mutex> lk(gds_worker_mutex_);
+                while (true) {
+                    gds_worker_cv_.wait(lk, [this]() {
+                        return gds_worker_stop_ || !gds_worker_queue_.empty();
+                    });
+                    if (gds_worker_queue_.empty()) {
+                        if (gds_worker_stop_) return;
+                        continue;
+                    }
+                    auto work = std::move(gds_worker_queue_.front());
+                    gds_worker_queue_.pop_front();
+                    lk.unlock();
+                    work();
+                    lk.lock();
+                }
+            });
+            gds_worker_started_ = true;
+        }
+        gds_worker_queue_.push_back(std::move(task));
+    }
+    gds_worker_cv_.notify_one();
+}
+
+void RealClient::StopGdsWorker() {
+    {
+        std::lock_guard<std::mutex> lock(gds_worker_mutex_);
+        if (!gds_worker_started_) return;
+        gds_worker_stop_ = true;
+    }
+    gds_worker_cv_.notify_one();
+    if (gds_worker_thread_.joinable()) gds_worker_thread_.join();
 }
 
 std::shared_ptr<RealClient> RealClient::create() {
@@ -979,10 +1030,14 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 
                     // Start offload RPC server so cross-instance DISK reads
                     // (batch_get_offload_object) can reach this instance.
+                    // GDS-only mode: reserve/complete are co-located RPCs
+                    // (GDS hardware requires GPU and NVMe on the same
+                    // machine), so bind to loopback only — never expose
+                    // offset-reservation to the network.
                     if (start_offload_rpc_server && !offload_rpc_server_) {
                         offload_rpc_server_ =
                             std::make_unique<coro_rpc::coro_rpc_server>(
-                                1, 0, "0.0.0.0");
+                                1, 0, "127.0.0.1");
                         offload_rpc_server_->register_handler<
                             &RealClient::batch_get_offload_object>(this);
                         offload_rpc_server_->register_handler<
@@ -3883,8 +3938,9 @@ RealClient::batch_put_from_dummy_helper(
 //
 // vLLM has GPU pointers and a GDS-only file_storage_ with cuFile
 // handle on the shared kv_cache.data. Store_service owns the
-// OffsetAllocator.  Flow: Reserve(RPC) -> DMA(WriteAtOffset) ->
-// Complete(RPC)  \-> BatchPut(RDMA, parallel)
+// OffsetAllocator and the master DISK-replica registration.
+// Flow: Reserve(RPC) -> DMA(WriteAtOffset) ∥ BatchPut(RDMA) ->
+// Complete(RPC; store then notifies the master).
 // ===================================================================
 std::vector<tl::expected<void, ErrorCode>>
 RealClient::batch_put_with_store_reservation(
@@ -3899,15 +3955,23 @@ RealClient::batch_put_with_store_reservation(
         return client_->BatchPut(keys, mutable_slices, config);
     }
 
+    // Tenant-scope the keys exactly like the read path
+    // (batch_get_into_offload_object_internal) does, so the store's
+    // backend, the on-disk record keys and the master's object identity
+    // all agree on the same key form.
+    const std::string tenant_id = client_->tenant_id();
+    std::vector<std::string> scoped_keys;
+    scoped_keys.reserve(keys.size());
     std::vector<uint64_t> value_sizes;
     value_sizes.reserve(keys.size());
-    for (const auto &slices : mutable_slices) {
+    for (size_t i = 0; i < keys.size(); ++i) {
+        scoped_keys.push_back(MakeTenantScopedStorageKey(tenant_id, keys[i]));
         uint64_t total = 0;
-        for (const auto &s : slices) total += s.size;
+        for (const auto &s : mutable_slices[i]) total += s.size;
         value_sizes.push_back(total);
     }
 
-    BatchReserveOffloadSpaceRequest req(keys, value_sizes);
+    BatchReserveOffloadSpaceRequest req(scoped_keys, value_sizes);
     auto reserve_result = client_requester_->batch_reserve_offload_space(
         store_service_addr_, req);
     if (!reserve_result) {
@@ -3916,61 +3980,51 @@ RealClient::batch_put_with_store_reservation(
                    << " -- falling back to non-GDS BatchPut";
         return client_->BatchPut(keys, mutable_slices, config);
     }
-    auto &resp = reserve_result.value();
-    // Use shared_ptr so both the DMA thread and main thread can read
-    // failed_set without use-after-move. The set is const — neither
-    // side mutates it.
-    auto failed_set = std::make_shared<const std::unordered_set<size_t>>(
-        resp.failed_indices.begin(), resp.failed_indices.end());
+    const auto &resp = reserve_result.value();
+    // Match reservations to keys by NAME: each reservation carries its
+    // scoped key, so a key missing from the map is a failed reservation.
+    // (Positional alignment against the request would silently corrupt
+    // data if either side's bookkeeping ever diverged.)
+    auto offset_by_key =
+        std::make_shared<const std::unordered_map<std::string, uint64_t>>(
+            [&resp] {
+                std::unordered_map<std::string, uint64_t> m;
+                m.reserve(resp.reservations.size());
+                for (const auto &r : resp.reservations)
+                    m.emplace(r.key, r.offset);
+                return m;
+            }());
 
     // Promise carries the set of DMA-succeeded indices.
     // An empty set means all DMA writes failed (not an error — the
     // caller treats it as "no keys to complete").
-    // An exception means the DMA thread crashed.
     auto gds_promise =
         std::make_shared<std::promise<std::unordered_set<size_t>>>();
     auto gds_future = gds_promise->get_future();
-    // Capture file_storage_ shared_ptr instead of raw this, so the
-    // detached thread keeps the FileStorage alive for its lifetime.
+    // Capture file_storage_ shared_ptr so the worker task keeps the
+    // FileStorage (and its cuFile handle) alive for its lifetime.
     auto fs = file_storage_;
-    std::thread([fs, keys, batched_slices, resp = std::move(resp), failed_set,
-                 p = gds_promise]() {
-        try {
-            // CUDA context is thread-local. std::thread starts with
-            // no context, so cudaPointerGetAttributes() (called by
-            // FindDeviceForPointer inside WriteRecord) fails to
-            // recognise GPU pointers and falls back to CPU pwrite.
-            // cudaFree(nullptr) is a guaranteed no-op that triggers
-            // lazy primary-context initialisation on this thread.
-#ifdef USE_CUDA
-            {
-                cudaError_t err = cudaFree(nullptr);
-                if (err != cudaSuccess)
-                    LOG(WARNING) << "GDS worker: cudaFree(nullptr) failed: "
-                                 << cudaGetErrorString(err)
-                                 << " — GPU pointer detection will fall back "
-                                 << "to pwrite";
+    SubmitGdsTask(
+        [fs, scoped_keys, batched_slices, offset_by_key, p = gds_promise]() {
+            try {
+                std::unordered_set<size_t> dma_succeeded;
+                for (size_t i = 0; i < scoped_keys.size(); ++i) {
+                    auto it = offset_by_key->find(scoped_keys[i]);
+                    if (it == offset_by_key->end()) continue;  // reserve failed
+                    auto wr = fs->WriteAtOffset(scoped_keys[i],
+                                                batched_slices[i], it->second);
+                    if (wr) dma_succeeded.insert(i);
+                }
+                p->set_value(std::move(dma_succeeded));
+            } catch (...) {
+                p->set_exception(std::current_exception());
             }
-#endif
-            size_t reservation_idx = 0;
-            std::unordered_set<size_t> dma_succeeded;
-            for (size_t i = 0; i < keys.size(); ++i) {
-                if (failed_set->count(i)) continue;
-                auto &r = resp.reservations[reservation_idx++];
-                auto wr =
-                    fs->WriteAtOffset(keys[i], batched_slices[i], r.offset);
-                if (wr) dma_succeeded.insert(i);
-            }
-            p->set_value(std::move(dma_succeeded));
-        } catch (...) {
-            p->set_exception(std::current_exception());
-        }
-    }).detach();
+        });
 
     auto results = client_->BatchPut(keys, mutable_slices, config);
 
-    // Collect DMA-succeeded indices from the GDS thread.
-    // Default-empty set: if the thread times out or crashes, no keys
+    // Collect DMA-succeeded indices from the GDS worker.
+    // Default-empty set: if the task times out or crashes, no keys
     // are considered DMA-complete → none will be completed.
     std::unordered_set<size_t> dma_succeeded;
     if (gds_future.valid()) {
@@ -3981,30 +4035,31 @@ RealClient::batch_put_with_store_reservation(
             try {
                 dma_succeeded = gds_future.get();
                 LOG(INFO) << "GDS DMA completed: " << dma_succeeded.size()
-                          << "/" << (keys.size() - failed_set->size())
+                          << "/" << offset_by_key->size()
                           << " writes succeeded";
-                if (dma_succeeded.size() < keys.size() - failed_set->size()) {
+                if (dma_succeeded.size() < offset_by_key->size()) {
                     LOG(WARNING)
                         << "GDS: some DMA writes failed — "
-                        << "skipping CompleteOffloadSpace for those keys "
-                        << "to keep dirty_=true (heartbeat will retry)";
+                        << "skipping CompleteOffloadSpace for those keys; "
+                        << "their reserved offsets stay dirty and will be "
+                        << "reclaimed by the store-side cleanup";
                 }
             } catch (const std::exception &e) {
-                LOG(ERROR) << "GDS DMA thread crashed: " << e.what();
+                LOG(ERROR) << "GDS DMA task crashed: " << e.what();
             }
         }
     }
 
     // Intersect: reservation succeeded AND DMA succeeded AND RDMA succeeded.
-    std::vector<std::string> succeeded_keys;
+    std::vector<std::string> succeeded_scoped_keys;
     for (size_t i = 0; i < keys.size(); ++i) {
-        if (!failed_set->count(i) && dma_succeeded.count(i) &&
+        if (offset_by_key->count(scoped_keys[i]) && dma_succeeded.count(i) &&
             results[i].has_value())
-            succeeded_keys.push_back(keys[i]);
+            succeeded_scoped_keys.push_back(scoped_keys[i]);
     }
-    if (!succeeded_keys.empty()) {
+    if (!succeeded_scoped_keys.empty()) {
         BatchCompleteOffloadSpaceRequest complete_req(
-            std::move(succeeded_keys));
+            std::move(succeeded_scoped_keys));
         auto cr = client_requester_->batch_complete_offload_space(
             store_service_addr_, complete_req);
         if (!cr)
@@ -4077,45 +4132,25 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
     auto gds_future = gds_promise->get_future();
     auto notify_barrier = std::make_shared<std::promise<bool>>();
 
-    // Capture ordered_batched_slices by value into the GDS thread.
-    // Slice is {ptr, size} — cheap struct copy; actual GPU buffers are not
-    // copied. ordered_batched_slices has been chunked by kMaxSliceSize,
-    // same granularity as the CPU path (client_->BatchPut).
-    auto gds_cb = [this, &keys, &ordered_batched_slices, tenant = tenant_id_str,
-                   p = gds_promise, barrier = notify_barrier]() {
+    // Launch the GDS DMA on the persistent worker BEFORE BatchPut: the
+    // cuFile writes then overlap with the RDMA Submit+Wait inside
+    // BatchPut, which is the whole point of the parallel offload.
+    // ordered_batched_slices is captured by value — Slice is {ptr, size},
+    // a cheap struct copy; the GPU buffers themselves are not copied.
+    auto fs = file_storage_;  // shared_ptr, keeps FileStorage alive
+    SubmitGdsTask([fs, keys, slices = ordered_batched_slices,
+                   tenant = tenant_id_str, p = gds_promise,
+                   barrier = notify_barrier]() {
         try {
-            auto fs = file_storage_;  // shared_ptr, keeps FileStorage alive
-            std::thread([fs, keys, ordered_batched_slices, tenant, p,
-                         barrier]() {
-                try {
-#ifdef USE_CUDA
-                    {
-                        cudaError_t err = cudaFree(nullptr);
-                        if (err != cudaSuccess)
-                            LOG(WARNING)
-                                << "GDS worker: cudaFree(nullptr) failed: "
-                                << cudaGetErrorString(err)
-                                << " — GPU pointer detection will fall back "
-                                << "to pwrite";
-                    }
-#endif
-                    auto res = fs->DirectGdsOffload(
-                        keys, ordered_batched_slices, tenant, barrier);
-                    p->set_value(res);
-                } catch (...) {
-                    p->set_exception(std::current_exception());
-                }
-            }).detach();
-        } catch (const std::exception &e) {
-            LOG(ERROR) << "Failed to start GDS thread: " << e.what();
-            p->set_value(tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
+            p->set_value(fs->DirectGdsOffload(keys, slices, tenant, barrier));
+        } catch (...) {
+            p->set_exception(std::current_exception());
         }
-    };
+    });
 
     std::vector<tl::expected<void, ErrorCode>> results;
     try {
-        results = client_->BatchPut(keys, ordered_batched_slices, config,
-                                    std::move(gds_cb));
+        results = client_->BatchPut(keys, ordered_batched_slices, config);
     } catch (...) {
         notify_barrier->set_value(false);
         throw;
@@ -4124,7 +4159,7 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
     bool batch_put_ok =
         std::all_of(results.begin(), results.end(),
                     [](const auto &r) { return r.has_value(); });
-    // If any BatchPut key failed, the GDS thread skips
+    // If any BatchPut key failed, the GDS task skips
     // NotifyOffloadSuccess via the barrier (checks batch_put_ok).
     // This prevents orphan DISK replicas for failed keys.
     notify_barrier->set_value(batch_put_ok);
@@ -4134,16 +4169,17 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
         if (status == std::future_status::timeout) {
             LOG(ERROR) << "GDS offload timed out after 120s -- "
                        << "cuFileWrite may be blocked on NVMe. "
-                       << "DISK replica lost; heartbeat will retry.";
+                       << "DISK replica not registered for this batch.";
         } else {
             try {
                 auto r = gds_future.get();
                 if (!r)
                     LOG(WARNING) << "GDS offload failed: " << r.error()
-                                 << " (DISK replica lost; heartbeat will "
-                                    "retry if offload is enabled)";
+                                 << " (DISK replica not registered; the "
+                                    "store-side offload may retry later "
+                                    "if it is enabled)";
             } catch (const std::exception &e) {
-                LOG(ERROR) << "GDS offload thread crashed: " << e.what();
+                LOG(ERROR) << "GDS offload task crashed: " << e.what();
             }
         }
     }
@@ -5131,13 +5167,14 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                 local_rpc_addr)
                 continue;
 
-            // GDS local read: SSD -> user GPU buffer via cuFileRead
+            // GDS local read: SSD -> user buffers via one cuFileRead per
+            // slice (multi-fragment values are read consecutively into
+            // each destination slice — no staging copies).
             std::string storage_key =
                 MakeTenantScopedStorageKey(client_->tenant_id(), op_it.first);
-            std::unordered_map<std::string, Slice> load_batch;
-            // op_it.second.slices[0].ptr IS the user's GPU buffer
-            load_batch[storage_key] = op_it.second.slices[0];
-            auto load_res = file_storage_->DirectGdsBatchLoad(load_batch);
+            std::unordered_map<std::string, std::vector<Slice>> load_batch;
+            load_batch[storage_key] = op_it.second.slices;
+            auto load_res = file_storage_->DirectGdsBatchLoadMulti(load_batch);
             if (!load_res) {
                 LOG(WARNING)
                     << "GDS local BatchLoad failed for key: " << op_it.first
@@ -5362,43 +5399,23 @@ RealClient::batch_put_from_multi_buffers_internal(
     auto gds_future = gds_promise->get_future();
     auto notify_barrier = std::make_shared<std::promise<bool>>();
 
-    // Pass batched_slices directly — non-contiguous GPU buffers OK.
-    // GdsContext::WriteRecord handles each slice independently via
-    // cuFileWrite. Slice is {ptr, size}, cheap struct copy.
-    auto gds_cb = [this, &keys, &batched_slices, tenant = tenant_id_str,
+    // Same orchestration as batch_put_from_internal: launch the GDS DMA
+    // on the persistent worker before BatchPut so the cuFile writes
+    // overlap with the RDMA Submit+Wait.  batched_slices is captured by
+    // value — Slice is {ptr, size}, a cheap struct copy.
+    auto fs = file_storage_;  // shared_ptr, keeps FileStorage alive
+    SubmitGdsTask([fs, keys, slices = batched_slices, tenant = tenant_id_str,
                    p = gds_promise, barrier = notify_barrier]() {
         try {
-            auto fs = file_storage_;  // shared_ptr, keeps FileStorage alive
-            std::thread([fs, keys, batched_slices, tenant, p, barrier]() {
-                try {
-#ifdef USE_CUDA
-                    {
-                        cudaError_t err = cudaFree(nullptr);
-                        if (err != cudaSuccess)
-                            LOG(WARNING)
-                                << "GDS worker: cudaFree(nullptr) failed: "
-                                << cudaGetErrorString(err)
-                                << " — GPU pointer detection will fall back "
-                                << "to pwrite";
-                    }
-#endif
-                    auto res = fs->DirectGdsOffload(keys, batched_slices,
-                                                    tenant, barrier);
-                    p->set_value(res);
-                } catch (...) {
-                    p->set_exception(std::current_exception());
-                }
-            }).detach();
-        } catch (const std::exception &e) {
-            LOG(ERROR) << "Failed to start GDS thread: " << e.what();
-            p->set_value(tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
+            p->set_value(fs->DirectGdsOffload(keys, slices, tenant, barrier));
+        } catch (...) {
+            p->set_exception(std::current_exception());
         }
-    };
+    });
 
     std::vector<tl::expected<void, ErrorCode>> results;
     try {
-        results =
-            client_->BatchPut(keys, batched_slices, config, std::move(gds_cb));
+        results = client_->BatchPut(keys, batched_slices, config);
     } catch (...) {
         notify_barrier->set_value(false);
         throw;
@@ -5407,7 +5424,7 @@ RealClient::batch_put_from_multi_buffers_internal(
     bool batch_put_ok =
         std::all_of(results.begin(), results.end(),
                     [](const auto &r) { return r.has_value(); });
-    // If any BatchPut key failed, the GDS thread skips
+    // If any BatchPut key failed, the GDS task skips
     // NotifyOffloadSuccess via the barrier (checks batch_put_ok).
     // This prevents orphan DISK replicas for failed keys.
     notify_barrier->set_value(batch_put_ok);
@@ -5417,13 +5434,13 @@ RealClient::batch_put_from_multi_buffers_internal(
         if (status == std::future_status::timeout) {
             LOG(ERROR) << "GDS offload timed out after 120s -- "
                        << "cuFileWrite may be blocked on NVMe. "
-                       << "DISK replica lost; heartbeat will retry.";
+                       << "DISK replica not registered for this batch.";
         } else {
             try {
                 auto r = gds_future.get();
                 if (!r) LOG(WARNING) << "GDS offload failed: " << r.error();
             } catch (const std::exception &e) {
-                LOG(ERROR) << "GDS offload thread crashed: " << e.what();
+                LOG(ERROR) << "GDS offload task crashed: " << e.what();
             }
         }
     }
@@ -5663,13 +5680,17 @@ RealClient::batch_get_into_multi_buffers_internal(
                 std::string sk =
                     MakeTenantScopedStorageKey(client_->tenant_id(), key);
 
-                // Multi-fragment: read into first fragment via GDS, then
-                // CPU-copy to rest (V1: common case is single fragment per key
-                // from kMaxSliceSize)
+                // Multi-fragment read: issue one GDS read per destination
+                // fragment — the value is read consecutively into each
+                // (per-layer) GPU buffer directly, no staging copies.
                 if (op.buffers.empty()) continue;
-                std::unordered_map<std::string, Slice> lb;
-                lb[sk] = Slice{op.buffers[0], op.sizes[0]};
-                auto lr = file_storage_->DirectGdsBatchLoad(lb);
+                std::unordered_map<std::string, std::vector<Slice>> lb;
+                auto &dest_slices = lb[sk];
+                dest_slices.reserve(op.buffers.size());
+                for (size_t j = 0; j < op.buffers.size(); ++j) {
+                    dest_slices.push_back(Slice{op.buffers[j], op.sizes[j]});
+                }
+                auto lr = file_storage_->DirectGdsBatchLoadMulti(lb);
                 if (!lr) {
                     LOG(WARNING) << "GDS local read failed for key=" << key
                                  << " (" << lr.error() << ")";
@@ -5686,17 +5707,6 @@ RealClient::batch_get_into_multi_buffers_internal(
                         continue;
                     }
                     continue;
-                }
-                // Scatter to remaining fragments (CPU memcpy)
-                size_t copied = op.sizes[0];
-                char *src = static_cast<char *>(op.buffers[0]);
-                for (size_t j = 1;
-                     j < op.buffers.size() && copied < op.total_size; ++j) {
-                    size_t chunk =
-                        std::min(op.sizes[j], op.total_size - copied);
-                    GetGdsDeviceOpsSingleton()->CopyDeviceToDevice(
-                        op.buffers[j], src + copied, chunk);
-                    copied += chunk;
                 }
                 gds_read_keys.insert(key);
             }

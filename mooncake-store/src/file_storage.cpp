@@ -525,7 +525,9 @@ tl::expected<size_t, ErrorCode> FileStorage::DirectGdsOffload(
                     LOG(WARNING) << "GDS: BatchPut returned failure for "
                                  << "some keys. Skipping NotifyOffloadSuccess "
                                  << "to avoid orphan DISK replicas. "
-                                 << "Heartbeat will retry.";
+                                 << "No DISK replica is registered for this "
+                                 << "batch (the on-disk data stays "
+                                 << "unreferenced).";
                     return ErrorCode::INTERNAL_ERROR;
                 }
             } catch (const std::future_error& e) {
@@ -573,6 +575,16 @@ tl::expected<void, ErrorCode> FileStorage::DirectGdsBatchLoad(
     return BatchLoad(batch_object);
 }
 
+// DirectGdsBatchLoadMulti — multi-fragment GDS local read path:
+// one cuFileRead per destination slice, no D2D/H2D staging copies.
+tl::expected<void, ErrorCode> FileStorage::DirectGdsBatchLoadMulti(
+    std::unordered_map<std::string, std::vector<Slice>>& batch_object) {
+    auto* oa =
+        dynamic_cast<OffsetAllocatorStorageBackend*>(storage_backend_.get());
+    if (!oa) return tl::make_unexpected(ErrorCode::GDS_NOT_AVAILABLE);
+    return oa->BatchLoadMultiDest(batch_object);
+}
+
 // =====================================================================
 // GDS two-phase commit: store_service side
 // =====================================================================
@@ -581,49 +593,84 @@ tl::expected<BatchReserveOffloadSpaceResponse, ErrorCode>
 FileStorage::BatchReserveOffloadSpace(
     const std::vector<std::string>& keys,
     const std::vector<uint64_t>& value_sizes) {
+    if (keys.size() != value_sizes.size()) {
+        LOG(ERROR) << "BatchReserveOffloadSpace: keys/value_sizes size "
+                   << "mismatch (" << keys.size() << " vs "
+                   << value_sizes.size() << ")";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto* oa =
+        dynamic_cast<OffsetAllocatorStorageBackend*>(storage_backend_.get());
+    if (!oa) {
+        LOG(ERROR) << "BatchReserveOffloadSpace: storage backend does not "
+                      "support offset reservation";
+        return tl::make_unexpected(ErrorCode::GDS_NOT_AVAILABLE);
+    }
+
     BatchReserveOffloadSpaceResponse resp;
     resp.data_file_path = storage_backend_->GetDataFilePath();
+    resp.reservations.reserve(keys.size());
 
     for (size_t i = 0; i < keys.size(); ++i) {
+        // keys are tenant-scoped storage keys (MakeTenantScopedStorageKey);
+        // they are stored as-is so the read path (which also looks up
+        // scoped keys) can find the records.
         const auto& key = keys[i];
         uint64_t vsize = value_sizes[i];
-        if (vsize > UINT32_MAX) {
-            resp.failed_indices.push_back(static_cast<int32_t>(i));
-            continue;
+        if (key.empty() || key.size() > UINT32_MAX || vsize == 0 ||
+            vsize > UINT32_MAX) {
+            LOG(ERROR) << "BatchReserveOffloadSpace: invalid key/value size "
+                       << "for key " << key << " (key_len=" << key.size()
+                       << ", value_size=" << vsize << ")";
+            continue;  // key absent from reservations => treated as failed
         }
-        // Compute record_size in uint64_t to avoid overflow:
-        // RecordHeader::SIZE(8) + key.size() + vsize can exceed 2^32-1
-        // when both key and value are near UINT32_MAX.
-        uint64_t record_size_64 = RecordHeader::SIZE + key.size() + vsize;
-        if (record_size_64 > UINT32_MAX) {
-            LOG(ERROR) << "BatchReserveOffloadSpace: record too large for key "
-                       << key << " (size=" << record_size_64 << ")";
-            resp.failed_indices.push_back(static_cast<int32_t>(i));
-            continue;
-        }
-        uint32_t record_size = static_cast<uint32_t>(record_size_64);
-
-        auto* oa = dynamic_cast<OffsetAllocatorStorageBackend*>(
-            storage_backend_.get());
-        if (!oa) {
-            resp.failed_indices.push_back(static_cast<int32_t>(i));
-            continue;
-        }
-        auto res = oa->ReserveOffloadSpace(key, record_size,
-                                           static_cast<uint32_t>(vsize));
+        auto res = oa->ReserveOffloadSpace(key, static_cast<uint32_t>(vsize));
         if (!res) {
-            resp.failed_indices.push_back(static_cast<int32_t>(i));
+            LOG(WARNING) << "BatchReserveOffloadSpace: reserve failed for "
+                         << "key " << key << ": " << res.error();
             continue;
         }
-        resp.reservations.push_back(OffloadSpaceReservation{
-            res->offset, record_size, static_cast<uint32_t>(vsize)});
+        resp.reservations.push_back(*res);
     }
     return resp;
 }
 
 tl::expected<void, ErrorCode> FileStorage::BatchCompleteOffloadSpace(
     const std::vector<std::string>& keys) {
-    for (const auto& key : keys) storage_backend_->CompleteOffloadSpace(key);
+    // Phase 2 of the GDS two-phase commit: clear dirty_ for DMA-completed
+    // records, then register their DISK replicas with the master.  Without
+    // this notification the master never learns about the on-disk copies
+    // and the GDS-written data stays invisible to readers.
+    std::vector<OffloadTaskItem> tasks;
+    std::vector<StorageObjectMetadata> metadatas;
+    tasks.reserve(keys.size());
+    metadatas.reserve(keys.size());
+
+    for (const auto& key : keys) {  // tenant-scoped storage keys
+        auto info = storage_backend_->CompleteOffloadSpace(key);
+        if (!info.has_value()) continue;  // unknown key (evicted?)
+        if (!info->was_dirty) continue;   // duplicate Complete (retry)
+        auto [tenant_id, user_key] = ParseTenantScopedStorageKey(key);
+        tasks.push_back(OffloadTaskItem{
+            .tenant_id = tenant_id, .key = user_key, .size = info->value_size});
+        metadatas.push_back(StorageObjectMetadata{
+            0, static_cast<int64_t>(info->offset),
+            static_cast<int64_t>(key.size()),
+            static_cast<int64_t>(info->value_size), local_rpc_addr_});
+    }
+
+    if (tasks.empty()) return {};
+
+    auto result = client_->NotifyOffloadSuccess(tasks, metadatas);
+    if (!result) {
+        // The data is on disk and readable; only the master metadata is
+        // missing.  It is reconciled by ReRegisterOffloadedObjects (ScanMeta)
+        // on store restart or LOCAL_DISK segment re-mount.
+        LOG(ERROR) << "BatchCompleteOffloadSpace: NotifyOffloadSuccess failed "
+                   << "for " << tasks.size() << " key(s): " << result.error()
+                   << " — DISK replicas will be re-registered on next "
+                      "metadata rescan";
+    }
     return {};
 }
 

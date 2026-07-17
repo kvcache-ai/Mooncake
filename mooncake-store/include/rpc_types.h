@@ -276,17 +276,28 @@ YLT_REFL(BatchGetOffloadObjectResponse, batch_id, pointers,
 // ── GDS offload space reservation types ──
 
 struct OffloadSpaceReservation {
+    // The key this reservation belongs to (tenant-scoped storage key).
+    // Carried explicitly so the client matches reservations to keys by
+    // name instead of by fragile positional alignment against the request.
+    std::string key;
     uint64_t offset;       // file offset for cuFile DMA write
-    uint32_t record_size;  // total record size (header + key + value)
+    uint32_t record_size;  // total record size (header + key + pad + value)
     uint32_t value_size;   // value portion size
 
     OffloadSpaceReservation() : offset(0), record_size(0), value_size(0) {}
-    OffloadSpaceReservation(uint64_t off, uint32_t rsize, uint32_t vsize)
-        : offset(off), record_size(rsize), value_size(vsize) {}
+    OffloadSpaceReservation(std::string k, uint64_t off, uint32_t rsize,
+                            uint32_t vsize)
+        : key(std::move(k)),
+          offset(off),
+          record_size(rsize),
+          value_size(vsize) {}
 };
-YLT_REFL(OffloadSpaceReservation, offset, record_size, value_size);
+YLT_REFL(OffloadSpaceReservation, key, offset, record_size, value_size);
 
 struct BatchReserveOffloadSpaceRequest {
+    // Tenant-scoped storage keys (MakeTenantScopedStorageKey).  The store
+    // keeps them as-is in its backend so the read path (which also looks
+    // up scoped keys) finds the records.
     std::vector<std::string> keys;
     std::vector<uint64_t> value_sizes;
 
@@ -298,20 +309,19 @@ struct BatchReserveOffloadSpaceRequest {
 YLT_REFL(BatchReserveOffloadSpaceRequest, keys, value_sizes);
 
 struct BatchReserveOffloadSpaceResponse {
-    // Per-key reservations (parallel arrays with keys in request).
+    // One entry per successfully reserved key; keys that failed
+    // allocation are simply absent (the client treats a missing key
+    // as a failed reservation).
     std::vector<OffloadSpaceReservation> reservations;
-    // Indices of keys that failed allocation.
-    std::vector<int32_t> failed_indices;
     // Absolute path to the shared data file for cuFile DMA open.
     std::string data_file_path;
 
     BatchReserveOffloadSpaceResponse() = default;
 };
-YLT_REFL(BatchReserveOffloadSpaceResponse, reservations, failed_indices,
-         data_file_path);
+YLT_REFL(BatchReserveOffloadSpaceResponse, reservations, data_file_path);
 
 struct BatchCompleteOffloadSpaceRequest {
-    std::vector<std::string> keys;  // keys whose DMA has completed
+    std::vector<std::string> keys;  // tenant-scoped keys, DMA completed
 
     BatchCompleteOffloadSpaceRequest() = default;
     explicit BatchCompleteOffloadSpaceRequest(std::vector<std::string> k)

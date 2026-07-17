@@ -175,20 +175,20 @@ tl::expected<void, ErrorCode> GdsContext::InitClientDma(
     // left gds_fd_ open, close it now to prevent fd leak.
     if (gds_fd_ >= 0) {
         LOG(WARNING) << "GDS InitClientDma: closing previous fd " << gds_fd_;
+        // cuFile requires buffers deregistered before the file handle.
+        {
+            MutexLocker lock(&buf_mutex_);
+            for (auto& [ptr, _] : registered_buffers_) {
+                ops_->BufDeregister(ptr);
+            }
+            registered_buffers_.clear();
+        }
         if (cu_file_handle_) {
             ops_->FileHandleDeregister(cu_file_handle_);
             cu_file_handle_ = nullptr;
         }
         ::close(gds_fd_);
         gds_fd_ = -1;
-        // Clear stale buffer registrations — they were registered
-        // against the old cuFile handle and are invalid now.
-        // Without this, EnsureBufferRegistered() returns true for
-        // buffers that are NOT registered with the new handle.
-        {
-            MutexLocker lock(&buf_mutex_);
-            registered_buffers_.clear();
-        }
     }
 
     // Open the existing file — no O_CREAT, no O_TRUNC.
@@ -381,7 +381,9 @@ tl::expected<void, ErrorCode> GdsContext::WriteRecord(
     }
     uint32_t vsz = static_cast<uint32_t>(t);
 
-    MutexLocker io_lock(&io_mutex_);  // serialize record I/O
+    // Shared mode: concurrent records use explicit offsets and never
+    // interleave; Shutdown() takes the exclusive mode to drain us.
+    SharedMutexLocker io_lock(&io_mutex_, shared_lock);
 
     RecordHeader hdr{.key_len = klen, .value_len = vsz};
 
@@ -394,9 +396,20 @@ tl::expected<void, ErrorCode> GdsContext::WriteRecord(
         static_cast<ssize_t>(klen))
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
 
-    // value slices
+    // Zero the alignment padding so the record is fully initialized
+    // (the padding bytes are part of the allocated extent).
+    const uint32_t pad = RecordHeader::ValuePadding(klen);
+    if (pad > 0) {
+        static const char kZeroPad[RecordHeader::kValueAlignment] = {};
+        if (::pwrite(gds_fd_, kZeroPad, pad,
+                     static_cast<off_t>(offset + RecordHeader::SIZE + klen)) !=
+            static_cast<ssize_t>(pad))
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+
+    // value slices — value region starts at an aligned file offset.
     GdsDeviceFileHandle cfh = cu_file_handle_;
-    uint64_t vo = offset + RecordHeader::SIZE + klen;
+    uint64_t vo = offset + RecordHeader::ValueOffsetInRecord(klen);
 
     for (const auto& s : slices) {
         if (s.size == 0) continue;
@@ -457,10 +470,12 @@ tl::expected<void, ErrorCode> GdsContext::WriteRecord(
 // GdsContext::ReadRecord()
 // ===================================================================
 tl::expected<void, ErrorCode> GdsContext::ReadRecord(
-    const std::string& key, Slice& dest_slice, uint64_t offset,
-    uint32_t expected_value_size) {
+    const std::string& key, const std::vector<Slice>& dest_slices,
+    uint64_t offset, uint32_t expected_value_size) {
 #ifdef USE_GDS_BACKEND
-    MutexLocker io_lock(&io_mutex_);  // serialize record I/O
+    // Shared mode: concurrent reads/writes use explicit offsets;
+    // Shutdown() takes the exclusive mode to drain us.
+    SharedMutexLocker io_lock(&io_mutex_, shared_lock);
 
     RecordHeader hdr;
     if (::pread(gds_fd_, &hdr, RecordHeader::SIZE,
@@ -481,52 +496,71 @@ tl::expected<void, ErrorCode> GdsContext::ReadRecord(
         sk != key)
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
 
+    // The destination slices must exactly cover the stored value.
+    size_t total = 0;
+    for (const auto& s : dest_slices) total += s.size;
+    if (total != expected_value_size) {
+        LOG(ERROR) << "ReadRecord: destination size " << total
+                   << " != stored value size " << expected_value_size
+                   << " for key " << key;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
     GdsDeviceFileHandle cfh = cu_file_handle_;
-    uint64_t vo = offset + RecordHeader::SIZE + hdr.key_len;
+    uint64_t vo = offset + RecordHeader::ValueOffsetInRecord(hdr.key_len);
     auto rd_runtime =
         device::GetAcceleratorRegistry().RuntimeAccelerators(true);
-    device::PointerInfo rd_info;
-    const auto* rd_dev =
-        rd_runtime.FindDeviceForPointer(dest_slice.ptr, &rd_info);
 
-    if (rd_dev) {
-        rd_dev->SetContext(rd_info.device_id);
+    for (const auto& dest_slice : dest_slices) {
+        if (dest_slice.size == 0) continue;
+        if (!dest_slice.ptr)
+            return tl::make_unexpected(ErrorCode::FILE_INVALID_BUFFER);
 
-        // Use registration cache to avoid repeated Register/Deregister.
-        bool buf_ok = EnsureBufferRegistered(dest_slice.ptr, dest_slice.size);
-        if (!buf_ok) {
-            VLOG(1) << "GDS READ: buffer not registered, relying on "
-                    << "cuFile bounce buffer for ptr=" << dest_slice.ptr
-                    << " size=" << dest_slice.size;
+        device::PointerInfo rd_info;
+        const auto* rd_dev =
+            rd_runtime.FindDeviceForPointer(dest_slice.ptr, &rd_info);
+
+        if (rd_dev) {
+            rd_dev->SetContext(rd_info.device_id);
+
+            // Use registration cache to avoid repeated Register/Deregister.
+            bool buf_ok =
+                EnsureBufferRegistered(dest_slice.ptr, dest_slice.size);
+            if (!buf_ok) {
+                VLOG(1) << "GDS READ: buffer not registered, relying on "
+                        << "cuFile bounce buffer for ptr=" << dest_slice.ptr
+                        << " size=" << dest_slice.size;
+            }
+
+            ssize_t r = ops_->Read(cfh, dest_slice.ptr, dest_slice.size,
+                                   static_cast<off_t>(vo));
+            VLOG(1) << "[GDS READ] cuFileRead DMA: size=" << dest_slice.size
+                    << " offset=" << vo << " ret=" << r;
+            if (r != static_cast<ssize_t>(dest_slice.size))
+                return tl::make_unexpected(ErrorCode::GDS_IO_FAIL);
+        } else {
+            // Safety: verify this is truly CPU memory before pread.
+            auto safety_rt =
+                device::GetAcceleratorRegistry().RuntimeAccelerators(true);
+            if (safety_rt.FindDeviceForPointer(dest_slice.ptr) != nullptr) {
+                LOG(ERROR) << "GDS READ: device pointer " << dest_slice.ptr
+                           << " not matched by main lookup but found"
+                           << " by safety check; refusing pread";
+                return tl::make_unexpected(ErrorCode::GDS_IO_FAIL);
+            }
+            VLOG(1) << "[GDS READ] pread fallback: size=" << dest_slice.size
+                    << " offset=" << vo;
+            if (::pread(gds_fd_, dest_slice.ptr, dest_slice.size,
+                        static_cast<off_t>(vo)) !=
+                static_cast<ssize_t>(dest_slice.size))
+                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         }
-
-        ssize_t r = ops_->Read(cfh, dest_slice.ptr, dest_slice.size,
-                               static_cast<off_t>(vo));
-        VLOG(1) << "[GDS READ] cuFileRead DMA: size=" << dest_slice.size
-                << " offset=" << vo << " ret=" << r;
-        if (r != static_cast<ssize_t>(dest_slice.size))
-            return tl::make_unexpected(ErrorCode::GDS_IO_FAIL);
-    } else {
-        // Safety: verify this is truly CPU memory before pread.
-        auto safety_rt =
-            device::GetAcceleratorRegistry().RuntimeAccelerators(true);
-        if (safety_rt.FindDeviceForPointer(dest_slice.ptr) != nullptr) {
-            LOG(ERROR) << "GDS READ: device pointer " << dest_slice.ptr
-                       << " not matched by main lookup but found"
-                       << " by safety check; refusing pread";
-            return tl::make_unexpected(ErrorCode::GDS_IO_FAIL);
-        }
-        VLOG(1) << "[GDS READ] pread fallback: size=" << dest_slice.size
-                << " offset=" << vo;
-        if (::pread(gds_fd_, dest_slice.ptr, dest_slice.size,
-                    static_cast<off_t>(vo)) !=
-            static_cast<ssize_t>(dest_slice.size))
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        vo += dest_slice.size;
     }
     return {};
 #else
     (void)key;
-    (void)dest_slice;
+    (void)dest_slices;
     (void)offset;
     (void)expected_value_size;
     return tl::make_unexpected(ErrorCode::GDS_NOT_AVAILABLE);
@@ -554,11 +588,11 @@ void GdsContext::Shutdown() {
         registered_buffers_.clear();
     }
 
-    // Serialize with any in-flight WriteRecord/ReadRecord that holds
-    // io_mutex_. Without this, the I/O thread could be mid-DMA when
-    // we deregister the file handle or close the fd, which is UB in cuFile.
+    // Drain any in-flight WriteRecord/ReadRecord (they hold io_mutex_ in
+    // shared mode) before deregistering the file handle and closing the
+    // fd — tearing those down mid-DMA is UB in cuFile.
     {
-        MutexLocker io_lock(&io_mutex_);
+        SharedMutexLocker io_lock(&io_mutex_);
         if (cu_file_handle_) {
             ops_->FileHandleDeregister(cu_file_handle_);
             cu_file_handle_ = nullptr;
