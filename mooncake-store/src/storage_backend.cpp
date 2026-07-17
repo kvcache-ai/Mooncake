@@ -1501,6 +1501,10 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
     int64_t scanned_keys = 0;
     int64_t scanned_size = 0;
 
+    // Counters are committed only after a complete walk. A handler may have
+    // consumed earlier batches before a later traversal error; FileStorage
+    // retries the full scan, and master replica registration is idempotent.
+
     auto flush = [&]() -> tl::expected<void, ErrorCode> {
         if (keys.empty()) return {};
         auto ec = handler(keys, metas);
@@ -1514,7 +1518,9 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
     for (auto it1 = fs::directory_iterator(root, ec_root);
          !ec_root && it1 != fs::directory_iterator(); it1.increment(ec_root)) {
         if (ec_root) break;
-        if (!it1->is_directory(ec_root) || ec_root) continue;
+        std::error_code ec_entry;
+        const bool is_directory = it1->is_directory(ec_entry);
+        if (ec_entry || !is_directory) continue;
 
         const auto& d1 = it1->path();
 
@@ -1522,7 +1528,9 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
         for (auto it2 = fs::directory_iterator(d1, ec_d1);
              !ec_d1 && it2 != fs::directory_iterator(); it2.increment(ec_d1)) {
             if (ec_d1) break;
-            if (!it2->is_directory(ec_d1) || ec_d1) continue;
+            std::error_code ec_entry;
+            const bool is_directory = it2->is_directory(ec_entry);
+            if (ec_entry || !is_directory) continue;
 
             const auto& leaf = it2->path();
 
@@ -1532,10 +1540,12 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
                  it.increment(ec_leaf)) {
                 if (ec_leaf) break;
                 const auto& p = it->path();
-                if (!it->is_regular_file(ec_leaf) || ec_leaf) continue;
+                std::error_code ec_file;
+                const bool is_regular_file = it->is_regular_file(ec_file);
+                if (ec_file || !is_regular_file) continue;
 
-                uintmax_t sz = fs::file_size(p, ec_leaf);
-                if (ec_leaf) continue;
+                uintmax_t sz = fs::file_size(p, ec_file);
+                if (ec_file) continue;
 
                 std::string buf;
                 auto r =
@@ -1544,6 +1554,7 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
 
                 KVEntry kv;
                 try {
+                    // struct_pb::from_pb reports malformed input by throwing.
                     struct_pb::from_pb(kv, buf);
                 } catch (const std::exception& e) {
                     LOG(WARNING) << "Skipping malformed file during metadata "
