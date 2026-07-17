@@ -601,10 +601,26 @@ int TransferEngineImpl::registerLocalMemory(void* addr, size_t length,
         return ERR_ADDRESS_OVERLAPPED;
     }
 
+    std::vector<Transport*> attempted_transports;
     for (auto transport : multi_transports_->listTransports()) {
+        attempted_transports.push_back(transport);
         int ret = transport->registerLocalMemory(
             addr, length, location, remote_accessible, update_metadata);
         if (ret < 0) {
+            // Roll back the transports that already registered so a partial
+            // failure doesn't leave the region registered on some of them.
+            // Mirrors registerLocalMemoryBatch (#2869).
+            for (auto it = attempted_transports.rbegin();
+                 it != attempted_transports.rend(); ++it) {
+                int rollback_ret =
+                    (*it)->unregisterLocalMemory(addr, update_metadata);
+                if (rollback_ret != 0 &&
+                    rollback_ret != ERR_ADDRESS_NOT_REGISTERED) {
+                    LOG(WARNING)
+                        << "Failed to roll back registration for "
+                        << (*it)->getName() << ", ret=" << rollback_ret;
+                }
+            }
             releaseMemoryRegions(regions);
             return ret;
         }
