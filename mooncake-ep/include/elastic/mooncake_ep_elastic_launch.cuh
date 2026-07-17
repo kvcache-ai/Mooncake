@@ -27,6 +27,7 @@ struct ElasticLaunchContext {
     int num_scaleup_ranks = 1;
     bool is_scaleup_nvlink = true;
     bool use_64bit_rdma_atomics = false;
+    bool uniform_token_count = false;
     int physical_qps_per_rank = 1;
     int64_t timeout_cycles = -1;
 };

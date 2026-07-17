@@ -170,6 +170,8 @@ ElasticLaunchContext MooncakeElasticBuffer::make_launch_context(
     ctx.is_scaleup_nvlink = true;
     ctx.use_64bit_rdma_atomics =
         getenv_flag("MOONCAKE_EP_ELASTIC_RDMA_ATOMIC64");
+    ctx.uniform_token_count =
+        getenv_flag("MOONCAKE_EP_ELASTIC_UNIFORM_TOKENS");
     ctx.physical_qps_per_rank = buffer.qps_per_rank();
     ctx.timeout_cycles = timeout_cycles;
     return ctx;

@@ -599,8 +599,11 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             update_scaleout_tail();
         }
 
-        // Flush unflushed tails
-        update_scaleout_tail(true);
+        // With uniform input lengths, channels at or beyond num_tokens are
+        // known empty on every scale-out rank.  Their forwarders initialize as
+        // finished below, so they need no remote finish-tail publication.
+        if (!(comm_ctx.uniform_token_count && channel_idx >= num_tokens))
+            update_scaleout_tail(true);
     } else {
         const int forward_warp_idx =
             warp_idx - (kNumNotifyWarps + kNumScaleoutWarps);
@@ -637,7 +640,9 @@ __global__ void __launch_bounds__(kNumThreads, 1)
         int num_tokens_processed = 0;
         int stored_scaleout_old_tail_idx = 0;
         int stored_scaleup_send_counters[kNumScaleupRanksPerLane] = {};
-        int stored_finish_flag = lane_idx >= kNumScaleoutRanks;
+        int stored_finish_flag =
+            lane_idx >= kNumScaleoutRanks ||
+            (comm_ctx.uniform_token_count && channel_idx >= num_tokens);
         int stored_scaleout_tail_idx = 0;
         int recv_scaleout_rank_idx = channel_idx % kNumScaleoutRanks;
         uint32_t wip_mask;

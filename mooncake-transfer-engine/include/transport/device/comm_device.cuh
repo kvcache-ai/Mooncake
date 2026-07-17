@@ -22,6 +22,7 @@ struct CommCtx {
     int rank;
     int qps_per_rank;
     bool use_64bit_rdma_atomics;
+    bool uniform_token_count;
 };
 
 // Construct CommCtx from the raw kernel arguments.
@@ -35,6 +36,7 @@ __device__ __forceinline__ CommCtx make_comm_ctx(
     ctx.rank = rank;
     ctx.qps_per_rank = max(1, num_qps / max(1, num_ranks));
     ctx.use_64bit_rdma_atomics = false;
+    ctx.uniform_token_count = false;
 
     ctx.p2p.available = nvlink_available;
     ctx.p2p.peer_ptrs = ipc_peer_ptrs;

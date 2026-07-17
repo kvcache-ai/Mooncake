@@ -93,6 +93,7 @@ inline device::CommCtx make_comm_ctx(const ElasticLaunchContext& ctx) {
     comm_ctx.rank = ctx.rank;
     comm_ctx.qps_per_rank = ctx.physical_qps_per_rank;
     comm_ctx.use_64bit_rdma_atomics = ctx.use_64bit_rdma_atomics;
+    comm_ctx.uniform_token_count = ctx.uniform_token_count;
     comm_ctx.p2p.available = ctx.nvlink_available;
     comm_ctx.p2p.peer_ptrs = ctx.ipc_peer_ptrs;
     comm_ctx.p2p.local_base = ctx.gdr_buffer;
