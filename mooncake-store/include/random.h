@@ -2,22 +2,12 @@
 
 #include <concepts>
 #include <cstddef>
-#include <limits>
 #include <random>
 #include <stdexcept>
 
 namespace mooncake {
 
 using RandomEngine = std::mt19937_64;
-
-template <typename Integer>
-concept RandomInteger = std::integral<Integer> &&
-                        ((std::signed_integral<Integer> &&
-                          std::numeric_limits<Integer>::digits <=
-                              std::numeric_limits<long long>::digits) ||
-                         (std::unsigned_integral<Integer> &&
-                          std::numeric_limits<Integer>::digits <=
-                              std::numeric_limits<unsigned long long>::digits));
 
 namespace detail {
 
@@ -69,7 +59,7 @@ inline size_t randomIndex(size_t upper_bound) {
     return randomIndex(upper_bound, threadLocalRandomEngine());
 }
 
-template <RandomInteger Integer, std::uniform_random_bit_generator Generator>
+template <std::integral Integer, std::uniform_random_bit_generator Generator>
 Integer randomUniform(Integer lower_bound, Integer upper_bound,
                       Generator& generator) {
     if (lower_bound > upper_bound) {
@@ -89,7 +79,7 @@ Integer randomUniform(Integer lower_bound, Integer upper_bound,
 }
 
 // Returns an unbiased random integer in [lower_bound, upper_bound].
-template <RandomInteger Integer>
+template <std::integral Integer>
 Integer randomUniform(Integer lower_bound, Integer upper_bound) {
     return randomUniform(lower_bound, upper_bound, threadLocalRandomEngine());
 }
