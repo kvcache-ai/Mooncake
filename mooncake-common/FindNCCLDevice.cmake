@@ -32,7 +32,9 @@ if(NOT _NCCL_DEVICE_USING_CONFIG)
       /usr)
 
   find_library(NCCL_DEVICE_LIBRARY
-    NAMES nccl
+    # PyPI's nvidia-nccl wheels install the versioned ELF soname without an
+    # unversioned libnccl.so linker symlink.
+    NAMES nccl nccl.so.2
     HINTS
       ${NCCL_ROOT}
       $ENV{NCCL_ROOT}
