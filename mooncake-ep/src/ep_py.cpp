@@ -86,7 +86,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("dispatch", &MooncakeEpBuffer::dispatch)
         .def("combine", &MooncakeEpBuffer::combine)
         .def("get_next_combine_buffer",
-             &MooncakeEpBuffer::get_next_combine_buffer);
+             &MooncakeEpBuffer::get_next_combine_buffer)
+#ifdef USE_NCCL_DEVICE
+        .def("create_nccl_unique_id",
+             &MooncakeEpBuffer::create_nccl_unique_id)
+        .def("initialize_nccl_transport",
+             &MooncakeEpBuffer::initialize_nccl_transport)
+        .def("nccl_transport_enabled",
+             &MooncakeEpBuffer::nccl_transport_enabled)
+#endif
+        ;
 
     py::class_<MooncakeElasticBuffer>(m, "ElasticBuffer")
         .def(py::init<int, int, int64_t, int64_t, int64_t, int64_t, bool, bool,

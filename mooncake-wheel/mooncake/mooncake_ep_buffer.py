@@ -93,6 +93,16 @@ class Buffer:
         self.runtime = ep.Buffer(
             self.rank, self.group_size, num_ep_buffer_bytes
         )
+        self._use_nccl_device = os.getenv(
+            "MOONCAKE_EP_USE_NCCL_DEVICE", ""
+        ).lower() in {"1", "on", "true", "yes"}
+        if self._use_nccl_device and not hasattr(
+            self.runtime, "initialize_nccl_transport"
+        ):
+            raise RuntimeError(
+                "MOONCAKE_EP_USE_NCCL_DEVICE requires an EP extension built "
+                "with USE_NCCL_DEVICE=ON"
+            )
         # Fallback flag and buffers.
         # Note: `sync_nvlink_ipc_handles()` can mutate C++ `ibgda_disabled_` (True->False when
         # P2P+IPC succeeds for all ranks). We re-evaluate after IPC sync below.
@@ -170,7 +180,36 @@ class Buffer:
     def connect(self, is_update: bool = False):
         from mooncake import ep
 
-        if not self._use_fallback:
+        if self._use_nccl_device:
+            if is_update:
+                raise RuntimeError(
+                    "NCCL device transport does not support dynamic EP membership"
+                )
+            if not self.runtime.nccl_transport_enabled():
+                # All ranks call create_nccl_unique_id() to obtain the fixed
+                # encoded size; only rank 0 publishes its ID.
+                local_id = self.runtime.create_nccl_unique_id()
+                unique_id = torch.tensor(
+                    local_id
+                    if self.rank == 0
+                    else [0] * len(local_id),
+                    dtype=torch.int32,
+                    device="cuda",
+                )
+                dist.broadcast(unique_id, src=0, group=self.group)
+                gin_contexts = int(
+                    os.getenv("MOONCAKE_EP_NCCL_GIN_CONTEXTS", "4")
+                )
+                if gin_contexts <= 0:
+                    raise RuntimeError(
+                        "MOONCAKE_EP_NCCL_GIN_CONTEXTS must be positive"
+                    )
+                self.runtime.initialize_nccl_transport(
+                    unique_id.tolist(), gin_contexts
+                )
+            self._use_fallback = False
+
+        if not self._use_fallback and not self._use_nccl_device:
             (raddr, rkey) = self.runtime.get_mr_info()
 
             raddr = torch.tensor([raddr], dtype=torch.int64, device="cuda")
@@ -266,7 +305,15 @@ class Buffer:
                 dist.all_gather(handles, local_handle_tensor, self.group)
                 remote_handles = [h.tolist() for h in handles]
                 active_ranks_mask = self._active_ranks_list(torch.device("cuda"))
-                self.runtime.sync_nvlink_ipc_handles(remote_handles, active_ranks_mask)
+                if os.getenv("MOONCAKE_EP_SKIP_IPC_EXCHANGE", "").lower() not in {
+                    "1",
+                    "on",
+                    "true",
+                    "yes",
+                }:
+                    self.runtime.sync_nvlink_ipc_handles(
+                        remote_handles, active_ranks_mask
+                    )
             except Exception as e:
                 import warnings
 
@@ -350,6 +397,7 @@ class Buffer:
         use_fp8: Optional[bool] = None,
         async_finish: bool = False,
         return_recv_hook: bool = False,
+        diagnostic: Optional[torch.Tensor] = None,
     ) -> Tuple[
         Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor],
         torch.Tensor,
@@ -421,6 +469,7 @@ class Buffer:
                 use_fp8,
                 async_finish,
                 runtime_return_recv_hook,
+                diagnostic,
             )
             if _USE_MACA:
                 hook = self._wrap_maca_recv_hook(hook, event)
@@ -464,6 +513,7 @@ class Buffer:
         async_finish: bool = False,
         return_recv_hook: bool = False,
         out: Optional[torch.Tensor] = None,
+        diagnostic: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, EventOverlap, Callable]:
         # Same split-kernel behavior as dispatch().
         if _USE_SPLIT_SEND_RECV and async_finish:
@@ -520,6 +570,7 @@ class Buffer:
                 async_finish,
                 runtime_return_recv_hook,
                 out,
+                diagnostic,
             )
             if _USE_MACA:
                 hook = self._wrap_maca_recv_hook(hook, event)
