@@ -32,7 +32,10 @@ if(NOT _NCCL_DEVICE_USING_CONFIG)
       /usr)
 
   find_library(NCCL_DEVICE_LIBRARY
-    NAMES nccl
+    # PyPI's NCCL wheel ships the versioned SONAME without an unversioned
+    # development symlink. Keep it eligible so headers and runtime come from
+    # the same installation instead of falling back to a system NCCL.
+    NAMES nccl nccl.so.2
     HINTS
       ${NCCL_ROOT}
       $ENV{NCCL_ROOT}
