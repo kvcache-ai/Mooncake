@@ -1280,6 +1280,10 @@ impl ColdTierOffloadManager {
             .requeue_for_debug_evict_all(route_key, route_version, length_bytes)
     }
 
+    pub(in super::super) fn discard_for_debug_evict_all(&self, route_key: &ObjectKey) {
+        self.queue.lock().discard_for_debug_evict_all(route_key);
+    }
+
     pub(in super::super) fn is_empty(&self) -> bool {
         self.queue.lock().is_empty()
     }
@@ -1573,6 +1577,15 @@ impl PendingOffloadQueue {
             length_bytes,
         });
         true
+    }
+
+    pub(in super::super) fn discard_for_debug_evict_all(&mut self, route_key: &ObjectKey) {
+        let key = PendingOffloadKey {
+            route_key: route_key.clone(),
+        };
+        self.in_flight.remove(&key);
+        self.keys.remove(&key);
+        self.entries.retain(|entry| entry.key != key);
     }
 
     pub(in super::super) fn is_empty(&self) -> bool {

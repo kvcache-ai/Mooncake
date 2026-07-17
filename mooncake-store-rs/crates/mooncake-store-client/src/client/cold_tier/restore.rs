@@ -2,9 +2,9 @@ use super::super::{
     cold_tier_device_id, compatibility_matches, registry, AsyncEvictionHandle,
     AsyncReplicaTrackHandle, AsyncRouteHitReportHandle, ColdObjectRead, ColdRestoreFlightLeader,
     ColdRestoreFlightRegistration, ColdTierAdmissionPermit, ColdTierHandle,
-    ColdTierRateLimitConfig, ControlPlaneHandle, LocalAllocatorState, MembershipSyncHandle,
-    ObjectKey, ObjectRef, ObjectRoute, OperationTracker, ReplicaRoute, ReplicaTier,
-    ReplicationPolicy, RequestDeadline, ResolvedObject, RestorePromotionKey,
+    ColdTierRateLimitConfig, ControlPlaneHandle, DebugEvictAllResult, LocalAllocatorState,
+    MembershipSyncHandle, ObjectKey, ObjectRef, ObjectRoute, OperationTracker, ReplicaRoute,
+    ReplicaTier, ReplicationPolicy, RequestDeadline, ResolvedObject, RestorePromotionKey,
     RestorePromotionPayload, RestorePromotionPushOutcome, RestorePromotionQueue,
     RestorePromotionTask, Result, RouteState, StorageOwnerState, StoreClient, StoreError,
     DEFAULT_REMOTE_COLD_RESTORE_RECHECK_DELAY,
@@ -26,8 +26,8 @@ use tracing::{debug, info, warn};
 impl StoreClient {
     /// Evict all DRAM KV cache entries from this storage owner.
     ///
-    /// Returns the number of entries evicted.
-    pub fn debug_evict_all(&self) -> Result<usize> {
+    /// Evict all DRAM KV cache entries from this storage owner.
+    pub fn debug_evict_all(&self) -> Result<DebugEvictAllResult> {
         self.wait_for_restore_promotions();
         self.storage_owner.evict_all(&self.restore_promotions)
     }
