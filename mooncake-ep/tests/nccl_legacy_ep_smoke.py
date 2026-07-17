@@ -28,13 +28,12 @@ def main():
 
     packed, count, handle, event, hook = buffer.dispatch(
         x, topk_idx, active_ranks, tokens, experts, -1, async_finish=False)
-    event.current_stream_wait()
+    torch.cuda.synchronize()
     assert int(count[0].item()) == tokens, count
 
     output, event, hook = buffer.combine(
         packed.clone(), topk_idx, topk_weights, active_ranks, -1, handle,
         async_finish=False)
-    event.current_stream_wait()
     torch.cuda.synchronize()
     expected = torch.full_like(output, float(rank + 1))
     torch.testing.assert_close(output, expected)
