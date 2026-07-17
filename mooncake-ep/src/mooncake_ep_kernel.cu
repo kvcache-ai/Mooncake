@@ -1001,7 +1001,9 @@ combine(void* combined_x, int32_t* active_ranks,
             if (nccl_ctx != nullptr && src_rank != rank &&
                 !mc_comm_p2p_available(comm_ctx, src_rank)) {
                 const auto* signal = nccl_recv_signal_buffer + responsible_expert_idx;
-                mc_nccl_wait_signal(*nccl_ctx, local_expert_idx, signal, 1, 0);
+                mc_nccl_wait_signal(*nccl_ctx,
+                                    responsible_expert_idx % num_local_experts,
+                                    signal, 1, 0);
             } else
  #endif
             while (mc_ld_acquire(rdma_recv_signal_buffer + responsible_expert_idx) == 0) {
