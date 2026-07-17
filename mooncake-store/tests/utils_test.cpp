@@ -1,6 +1,7 @@
 #include "utils.h"
 #include "random.h"
 
+#include <cstdint>
 #include <future>
 #include <gtest/gtest.h>
 #include <netinet/in.h>
@@ -55,6 +56,21 @@ TEST(RandomTest, RandomUniformIncludesRequestedBounds) {
         EXPECT_LE(value, 9);
     }
     EXPECT_EQ(randomUniform(7, 7, engine), 7);
+}
+
+TEST(RandomTest, RandomUniformSupportsNarrowIntegers) {
+    std::mt19937_64 engine(42);
+    for (size_t i = 0; i < 1000; ++i) {
+        auto signed_value = randomUniform<int8_t>(-5, 9, engine);
+        EXPECT_GE(signed_value, -5);
+        EXPECT_LE(signed_value, 9);
+
+        auto unsigned_value = randomUniform<uint8_t>(2, 7, engine);
+        EXPECT_GE(unsigned_value, 2);
+        EXPECT_LE(unsigned_value, 7);
+    }
+    EXPECT_FALSE(randomUniform<bool>(false, false, engine));
+    EXPECT_TRUE(randomUniform<bool>(true, true, engine));
 }
 
 TEST(RandomTest, RejectsInvalidBounds) {

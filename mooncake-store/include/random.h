@@ -45,9 +45,25 @@ Integer randomUniform(Integer lower_bound, Integer upper_bound,
         throw std::invalid_argument(
             "randomUniform lower bound must not exceed upper bound");
     }
-    std::uniform_int_distribution<Integer> distribution(lower_bound,
-                                                        upper_bound);
-    return distribution(generator);
+    // uniform_int_distribution only accepts the standard signed and unsigned
+    // integer types. Map other integral types, such as char and char16_t, to a
+    // permitted type with the same signedness and sufficient width.
+    static_assert(
+        sizeof(Integer) <= sizeof(long long),
+        "randomUniform does not support integers wider than long long");
+    using DistributionInteger = std::conditional_t<
+        std::is_signed_v<Integer>,
+        std::conditional_t<sizeof(Integer) <= sizeof(int), int,
+                           std::conditional_t<sizeof(Integer) <= sizeof(long),
+                                              long, long long>>,
+        std::conditional_t<
+            sizeof(Integer) <= sizeof(unsigned int), unsigned int,
+            std::conditional_t<sizeof(Integer) <= sizeof(unsigned long),
+                               unsigned long, unsigned long long>>>;
+    std::uniform_int_distribution<DistributionInteger> distribution(
+        static_cast<DistributionInteger>(lower_bound),
+        static_cast<DistributionInteger>(upper_bound));
+    return static_cast<Integer>(distribution(generator));
 }
 
 // Returns an unbiased random integer in [lower_bound, upper_bound].
