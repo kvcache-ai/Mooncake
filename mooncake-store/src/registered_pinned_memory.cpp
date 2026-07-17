@@ -154,7 +154,6 @@ std::shared_ptr<RegisteredPinnedRegion> RegisteredPinnedMemoryManager::try_pin(
         return nullptr;
     }
 
-    RegionKey key{addr, size};
     const auto start = reinterpret_cast<uintptr_t>(addr);
     const auto end = start + size;
     if (end < start) {
@@ -175,13 +174,12 @@ std::shared_ptr<RegisteredPinnedRegion> RegisteredPinnedMemoryManager::try_pin(
     {
         std::lock_guard<std::mutex> lock(mutex_);
         for (const auto& entry : regions_) {
-            const auto region_start =
-                reinterpret_cast<uintptr_t>(entry.first.addr);
-            const auto region_end = region_start + entry.first.size;
+            const auto region_start = reinterpret_cast<uintptr_t>(entry.addr);
+            const auto region_end = region_start + entry.size;
             if (region_end < region_start) {
-                LOG(WARNING) << "Skip cudaHostRegister for " << owner
-                             << ": existing active range overflow, size="
-                             << entry.first.size;
+                LOG(WARNING)
+                    << "Skip cudaHostRegister for " << owner
+                    << ": existing active range overflow, size=" << entry.size;
                 return nullptr;
             }
 
@@ -203,12 +201,7 @@ std::shared_ptr<RegisteredPinnedRegion> RegisteredPinnedMemoryManager::try_pin(
         }
 
         try {
-            auto [_, inserted] = regions_.emplace(key, nullptr);
-            if (!inserted) {
-                LOG(WARNING) << "Skip cudaHostRegister for " << owner
-                             << ": active region already exists, size=" << size;
-                return nullptr;
-            }
+            regions_.push_back({addr, size, nullptr});
         } catch (...) {
             LOG(WARNING) << "Skip cudaHostRegister for " << owner
                          << ": failed to allocate pin tracking, size=" << size;
@@ -223,7 +216,7 @@ std::shared_ptr<RegisteredPinnedRegion> RegisteredPinnedMemoryManager::try_pin(
     if (!registered) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            drop_reservation_locked(key, size);
+            remove_inactive_region_locked(addr, size);
         }
         LOG(WARNING) << "cudaHostRegister failed for " << owner
                      << ", size=" << size << ", error=" << error_message
@@ -235,11 +228,14 @@ std::shared_ptr<RegisteredPinnedRegion> RegisteredPinnedMemoryManager::try_pin(
     uint64_t pinned_bytes = 0;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        auto it = regions_.find(key);
-        if (it != regions_.end() && it->second == nullptr) {
-            it->second = region.get();
+        for (auto& entry : regions_) {
+            if (entry.addr != addr || entry.size != size || entry.region) {
+                continue;
+            }
+            entry.region = region.get();
             pinned_bytes = pinned_bytes_;
             tracking_ready = true;
+            break;
         }
     }
     if (!tracking_ready) {
@@ -254,7 +250,7 @@ std::shared_ptr<RegisteredPinnedRegion> RegisteredPinnedMemoryManager::try_pin(
                        << ". Continue with best-effort cleanup.";
         }
         std::lock_guard<std::mutex> lock(mutex_);
-        drop_reservation_locked(key, size);
+        remove_inactive_region_locked(addr, size);
         return nullptr;
     }
 
@@ -266,15 +262,20 @@ std::shared_ptr<RegisteredPinnedRegion> RegisteredPinnedMemoryManager::try_pin(
 void RegisteredPinnedMemoryManager::release(RegisteredPinnedRegion* region) {
     if (!region || !region->addr_ || region->size_ == 0) return;
 
-    RegionKey key{region->addr_, region->size_};
+    bool should_unregister = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        auto region_it = regions_.find(key);
-        if (region_it == regions_.end() || region_it->second != region) {
-            return;
+        for (auto& entry : regions_) {
+            if (entry.addr != region->addr_ || entry.size != region->size_ ||
+                entry.region != region) {
+                continue;
+            }
+            entry.region = nullptr;
+            should_unregister = true;
+            break;
         }
-        region_it->second = nullptr;
     }
+    if (!should_unregister) return;
 
     std::string error_message;
     if (!pin_ops_.unregister_region) return;
@@ -296,22 +297,16 @@ void RegisteredPinnedMemoryManager::release(RegisteredPinnedRegion* region) {
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
-    auto it = regions_.find(key);
-    if (it == regions_.end() || it->second != nullptr) return;
-    regions_.erase(it);
-    if (pinned_bytes_ >= region->size_) {
-        pinned_bytes_ -= region->size_;
-    } else {
-        pinned_bytes_ = 0;
-    }
+    remove_inactive_region_locked(region->addr_, region->size_);
 }
 
-void RegisteredPinnedMemoryManager::drop_reservation_locked(
-    const RegionKey& key, size_t size) {
-    auto it = regions_.find(key);
-    if (it != regions_.end() && it->second == nullptr) {
+void RegisteredPinnedMemoryManager::remove_inactive_region_locked(void* addr,
+                                                                  size_t size) {
+    for (auto it = regions_.begin(); it != regions_.end(); ++it) {
+        if (it->addr != addr || it->size != size || it->region) continue;
         regions_.erase(it);
         pinned_bytes_ = pinned_bytes_ >= size ? pinned_bytes_ - size : 0;
+        return;
     }
 }
 
