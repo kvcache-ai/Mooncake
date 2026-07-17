@@ -22,6 +22,7 @@ def main():
     active_ranks = torch.ones(world_size, dtype=torch.int32, device="cuda")
     size = Buffer.get_ep_buffer_size_hint(tokens, hidden, world_size, experts)
     buffer = Buffer(dist.group.WORLD, num_ep_buffer_bytes=size)
+    assert buffer.runtime.nccl_transport_enabled()
 
     packed, count, handle, event, hook = buffer.dispatch(
         x, topk_idx, active_ranks, tokens, experts, -1, async_finish=False)

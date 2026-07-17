@@ -111,6 +111,7 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
     // its collective setup after Python has exchanged a unique ID.
 #ifdef USE_NCCL_DEVICE
     nccl_requested_ = env_flag_enabled("MOONCAKE_EP_USE_NCCL_DEVICE");
+    LOG(INFO) << "[EP] NCCL device transport requested=" << nccl_requested_;
     if (nccl_requested_) {
         ibgda_disabled_ = true;
         owned_nccl_transport_ = device::createNcclDeviceTransport();
