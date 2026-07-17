@@ -31,19 +31,31 @@ if(NOT _NCCL_DEVICE_USING_CONFIG)
       /usr/local
       /usr)
 
-  find_library(NCCL_DEVICE_LIBRARY
-    # PyPI's nvidia-nccl wheels install the versioned ELF soname without an
-    # unversioned libnccl.so linker symlink.
-    NAMES nccl nccl.so.2
+  # PyPI's nvidia-nccl wheels install the versioned ELF soname without an
+  # unversioned libnccl.so linker symlink. Resolve that exact file before
+  # allowing find_library() to fall back to a system installation.
+  find_file(NCCL_DEVICE_LIBRARY
+    NAMES libnccl.so.2
     HINTS
       ${NCCL_ROOT}
       $ENV{NCCL_ROOT}
       $ENV{NCCL_HOME}
     PATH_SUFFIXES lib lib64 build/lib build/lib64
-    PATHS
-      /usr/local/cuda
-      /usr/local
-      /usr)
+    NO_DEFAULT_PATH)
+
+  if(NOT NCCL_DEVICE_LIBRARY)
+    find_library(NCCL_DEVICE_LIBRARY
+      NAMES nccl
+      HINTS
+        ${NCCL_ROOT}
+        $ENV{NCCL_ROOT}
+        $ENV{NCCL_HOME}
+      PATH_SUFFIXES lib lib64 build/lib build/lib64
+      PATHS
+        /usr/local/cuda
+        /usr/local
+        /usr)
+  endif()
 
   if(NCCL_DEVICE_INCLUDE_DIR AND
      EXISTS "${NCCL_DEVICE_INCLUDE_DIR}/nccl.h")
