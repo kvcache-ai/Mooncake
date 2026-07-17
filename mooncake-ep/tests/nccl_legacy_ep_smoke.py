@@ -29,7 +29,8 @@ def main():
     assert buffer.runtime.nccl_transport_enabled()
 
     packed, count, handle, event, hook = buffer.dispatch(
-        x, topk_idx, active_ranks, tokens, experts, -1, async_finish=False)
+        x, topk_idx, active_ranks, tokens, experts, -1, use_fp8=False,
+        async_finish=False)
     torch.cuda.synchronize()
     assert int(count[0].item()) == tokens, count
 
