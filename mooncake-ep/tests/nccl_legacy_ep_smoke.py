@@ -12,7 +12,9 @@ def main():
     world_size = dist.get_world_size()
     torch.cuda.set_device(0)
 
-    tokens, hidden, topk, experts = 4, 7168, 1, world_size
+    # The legacy cooperative kernel requires more than one SM.  Keep the
+    # two-rank topology while provisioning enough experts for that launch.
+    tokens, hidden, topk, experts = 4, 7168, 1, 16
     x = torch.full((tokens, hidden), float(rank + 1), dtype=torch.bfloat16,
                    device="cuda")
     topk_idx = torch.full((tokens, topk), (rank + 1) % world_size,
