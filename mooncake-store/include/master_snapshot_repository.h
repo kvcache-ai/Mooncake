@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -7,6 +8,7 @@
 
 #include "types.h"
 #include "ha/ha_types.h"
+#include "ha/snapshot/master_snapshot_codec.h"
 
 namespace mooncake {
 
@@ -81,6 +83,30 @@ class MasterSnapshotRepository {
      * @return Connection info string
      */
     std::string GetObjectStoreConnectionInfo() const;
+
+    /**
+     * @brief Load the latest snapshot descriptor from catalog
+     * @return Snapshot descriptor on success, error code on failure
+     */
+    tl::expected<ha::SnapshotDescriptor, ErrorCode> LoadLatestSnapshot();
+
+    /**
+     * @brief Load all restorable snapshot descriptors
+     * @param latest_snapshot Optional latest snapshot descriptor to filter
+     * candidates
+     * @return Vector of candidate snapshots in chronological order, or error
+     */
+    tl::expected<std::vector<ha::SnapshotDescriptor>, ErrorCode>
+    LoadRestoreCandidates(
+        const std::optional<ha::SnapshotDescriptor>& latest_snapshot);
+
+    /**
+     * @brief Download snapshot payloads from object storage
+     * @param descriptor Snapshot descriptor with object paths
+     * @return Structured payloads ready for decoding, or error
+     */
+    tl::expected<ha::MasterSnapshotPayloads, SerializationError>
+    DownloadSnapshotPayloads(const ha::SnapshotDescriptor& descriptor);
 
    private:
     SnapshotObjectStore* object_store_;

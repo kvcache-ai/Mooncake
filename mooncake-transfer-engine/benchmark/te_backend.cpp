@@ -349,7 +349,9 @@ int TEBenchRunner::runInitiatorTasks(
 double TEBenchRunner::runSingleTransfer(uint64_t local_addr,
                                         uint64_t target_addr,
                                         uint64_t block_size,
-                                        uint64_t batch_size, OpCode opcode) {
+                                        uint64_t batch_size, OpCode opcode,
+                                        uint64_t deadline_ns) {
+    (void)deadline_ns;
     auto batch_id = engine_->allocateBatchID(batch_size);
     std::vector<TransferRequest> requests;
     for (uint64_t i = 0; i < batch_size; ++i) {

@@ -91,6 +91,68 @@ Each output row corresponds to one benchmark configuration.
 
 A short (~1 second) warmup phase is executed before measurements begin.
 
+### 4.1 QoS Metrics Baseline
+
+Use `--qos_classes` to partition a fixed number of worker threads into QoS
+classes:
+
+```text
+name:threads:slo_us:weight[:isolated_gbps],...
+```
+
+For readability, the same contract can be supplied as JSON with
+`--qos_classes_json`:
+
+```json
+[
+  {"name": "foreground", "threads": 4, "slo_us": 1000, "weight": 4, "isolated_gbps": 12.5},
+  {"name": "checkpoint", "threads": 12, "slo_us": 0, "weight": 1, "isolated_gbps": 10.0}
+]
+```
+
+Use only one of `--qos_classes` and `--qos_classes_json`.
+
+For example, the following closed-loop mixed workload assigns four workers to
+an SLO-constrained foreground class and twelve workers to a best-effort
+checkpoint class:
+
+```bash
+./tebench \
+  --target_seg_name=<SEG> \
+  --backend=tent \
+  --start_num_threads=16 \
+  --max_num_threads=16 \
+  --qos_classes=foreground:4:1000:4:12.5,checkpoint:12:0:1:10.0 \
+  --qos_link_capacity_gbps=25 \
+  --qos_output_jsonl=qos-results.jsonl
+```
+
+The class thread counts must add up to the fixed `start_num_threads` value.
+An `slo_us` of zero marks a best-effort class. The SLO is a reporting threshold:
+QoS baseline mode measures whether each completed transfer meets it, without
+changing request scheduling policy on either backend.
+
+The human-readable summary and the optional versioned JSONL record report:
+
+| Metric | Definition |
+| ------ | ---------- |
+| `slo_attainment` | Fraction of completed batches whose measured end-to-end transfer time is at most `slo_us` |
+| `p99_us` | P99 end-to-end batch transfer latency for the class |
+| `goodput_gbps` | Class throughput multiplied by SLO attainment; best-effort classes use attainment 1 |
+| `weighted_goodput_gbps` | Sum of `weight × goodput_gbps` |
+| `jain_fairness` | Jain index over per-class `throughput_gbps / weight` |
+| `isolation_leakage` | `max(0, 1 - mixed_throughput / isolated_throughput)` |
+| `total_utilization` | Aggregate measured throughput divided by `qos_link_capacity_gbps` |
+
+Isolation leakage requires a matching class-only baseline, supplied as the
+optional fifth class field. Total utilization requires
+`--qos_link_capacity_gbps`. Missing baselines are emitted as `N/A` in text and
+`null` in JSON rather than being inferred from the mixed run. Run isolated and
+mixed cases with the same block size, batch size, transport, memory type, and
+host pair. JSONL records retain `isolated_throughput_gbps` and
+`link_capacity_gbps` alongside the derived values so every metric can be
+recomputed from one record.
+
 ## 5. Runtime Configuration
 
 This section summarizes the key runtime options that control workload behavior,
@@ -187,8 +249,22 @@ gpu_id + thread_id
 **Transport (TENT only)**
 
 * `--xport_type` : `rdma | shm | mnnvl | gds | iouring`
+* `--tent_intent_type` : attach a standard transfer intent to every request,
+  such as `foreground_get`, `background_prefetch`, or `checkpoint`. This is
+  useful for validating intent-specific transport and QoS policy selection.
 
 **Metadata service**
 
 * `--metadata_type` : `p2p | etcd | redis | http` (default: `p2p`)
 * `--metadata_url_list` : comma-separated URLs (ignored in `p2p` mode)
+
+### 5.7 QoS Reporting
+
+* `--qos_classes` : class/thread/SLO/weight contract described in Section 4.1
+* `--qos_link_capacity_gbps` : measured usable link capacity in decimal GB/s
+* `--qos_output_jsonl` : append one schema-versioned JSON object per benchmark
+  configuration
+
+QoS mode intentionally requires a fixed thread count. Sweep offered load by
+running explicit cases with different class thread allocations so every output
+record has an unambiguous workload contract.

@@ -2118,7 +2118,9 @@ PYBIND11_MODULE(store, m) {
                const py::object &engine = py::none(),
                bool enable_ssd_offload = false,
                const std::string &ssd_offload_path = "",
-               const std::string &tenant_id = "default") {
+               const std::string &tenant_id = "default",
+               bool enable_client_http_server = false,
+               int client_http_port = DEFAULT_CLIENT_HTTP_PORT) {
                 auto real_client = self.init_real_client();
                 std::shared_ptr<mooncake::TransferEngine> transfer_engine =
                     nullptr;
@@ -2130,14 +2132,17 @@ PYBIND11_MODULE(store, m) {
                     local_hostname, metadata_server, global_segment_size,
                     local_buffer_size, protocol, rdma_devices,
                     master_server_addr, transfer_engine, "", enable_ssd_offload,
-                    ssd_offload_path, tenant_id);
+                    ssd_offload_path, tenant_id, enable_client_http_server,
+                    client_http_port);
             },
             py::arg("local_hostname"), py::arg("metadata_server"),
             py::arg("global_segment_size"), py::arg("local_buffer_size"),
             py::arg("protocol"), py::arg("rdma_devices"),
             py::arg("master_server_addr"), py::arg("engine") = py::none(),
             py::arg("enable_ssd_offload") = false,
-            py::arg("ssd_offload_path") = "", py::arg("tenant_id") = "default")
+            py::arg("ssd_offload_path") = "", py::arg("tenant_id") = "default",
+            py::arg("enable_client_http_server") = false,
+            py::arg("client_http_port") = DEFAULT_CLIENT_HTTP_PORT)
         .def(
             "setup",
             [](MooncakeStorePyWrapper &self, const py::dict &config_dict) {
@@ -2169,7 +2174,10 @@ PYBIND11_MODULE(store, m) {
             "  enable_ssd_offload: Enable SSD offload (default false).\n"
             "  ssd_offload_path: SSD storage directory path (overrides env "
             "var).\n"
-            "  tenant_id: Tenant identifier (default 'default').")
+            "  tenant_id: Tenant identifier (default 'default').\n"
+            "  enable_client_http_server: Enable client HTTP endpoints "
+            "(default false).\n"
+            "  client_http_port: Client HTTP metrics port (default 9300).")
         .def(
             "setup_dummy",
             [](MooncakeStorePyWrapper &self, size_t mem_pool_size,

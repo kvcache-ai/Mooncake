@@ -42,10 +42,14 @@ namespace mooncake {
 
 // Forward declaration for MasterSnapshotManager
 class MasterSnapshotManager;
+class MasterSnapshotRepository;
 
 namespace ha {
 class SnapshotCatalogStore;
-}
+class MasterSnapshotCodec;
+struct MasterSnapshotPayloads;
+class MasterSnapshotCodecTest;  // test fixture, needs private state access
+}  // namespace ha
 
 class EtcdOpLogStore;
 class DfsGlobalAllocator;
@@ -93,8 +97,11 @@ class MasterService {
     friend class test::PromotionOnHitTest;
     friend class benchmarks::BatchEvictBench;
     friend class test::MasterServiceTenantQuotaTest;
-    friend class MasterSnapshotManager;  // Allow access to internal state for
-                                         // snapshot
+    friend class MasterSnapshotManager;    // Allow access to internal state for
+                                           // snapshot
+    friend class ha::MasterSnapshotCodec;  // Allow codec to access private
+                                           // members
+    friend class ha::MasterSnapshotCodecTest;  // codec round-trip unit test
 
    public:
     using NoFProbeFn =
@@ -806,14 +813,19 @@ class MasterService {
 
    private:
     std::unique_ptr<ha::SnapshotCatalogStore> CreateSnapshotCatalogStore();
-    ha::SnapshotCatalogStore* GetSnapshotCatalogStore();
 
     // Restore master state
     void RestoreState();
-    bool TryRestoreStateFromSnapshot(
-        const ha::SnapshotDescriptor& snapshot,
-        const std::chrono::system_clock::time_point& now);
     void ResetStateAfterFailedRestoreAttempt();
+
+    /**
+     * @brief Apply decoded snapshot state to running master service
+     * @param payloads Decoded snapshot payloads
+     * @param now Current time for cleanup logic
+     * @return void on success, SerializationError on failure
+     */
+    tl::expected<void, SerializationError> ApplySnapshotState(
+        const std::chrono::system_clock::time_point& now);
 
     // BatchEvict evicts objects in a near-LRU way, i.e., prioritizes to evict
     // object with smaller lease timeout. It has two passes. The first pass only
@@ -2014,6 +2026,8 @@ class MasterService {
     std::string snapshot_catalog_store_connstring_;
     std::unique_ptr<SnapshotObjectStore> snapshot_object_store_;
     std::unique_ptr<ha::SnapshotCatalogStore> snapshot_catalog_store_;
+    std::unique_ptr<MasterSnapshotRepository> snapshot_repository_;
+    std::unique_ptr<ha::MasterSnapshotCodec> snapshot_codec_;
     mutable std::shared_mutex snapshot_mutex_;
 
     // Discarded replicas management
