@@ -269,7 +269,8 @@ __device__ __forceinline__ void mc_nccl_flush(const NcclDeviceContext& ctx,
 }
 
 __device__ __forceinline__ uint64_t mc_nccl_read_signal(
-    const NcclDeviceContext& ctx, int channel, const uint64_t* signal_ptr) {
+    const NcclDeviceContext& ctx, int channel, const uint64_t* signal_ptr,
+    int sharing_mode = NCCL_GIN_RESOURCE_SHARING_GPU) {
     if (!mc_nccl_gin_available(ctx)) {
         auto& value = *const_cast<uint64_t*>(signal_ptr);
         cuda::atomic_ref<uint64_t, cuda::thread_scope_system> signal(value);
@@ -280,7 +281,8 @@ __device__ __forceinline__ uint64_t mc_nccl_read_signal(
         detail::mc_nccl_pointer_offset(ctx, signal_ptr);
     const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
     ncclGin gin{comm, detail::mc_nccl_gin_context(
-                          ctx, static_cast<unsigned int>(channel))};
+                          ctx, static_cast<unsigned int>(channel)),
+                static_cast<ncclGinResourceSharingMode>(sharing_mode)};
     return gin.readSignal(detail::NcclDeviceContextAccess::window(ctx),
                           signal_offset);
 }
@@ -289,7 +291,8 @@ __device__ __forceinline__ uint64_t mc_nccl_read_signal(
 // after this function returns.
 __device__ __forceinline__ void mc_nccl_wait_signal(
     const NcclDeviceContext& ctx, int channel, const uint64_t* signal_ptr,
-    uint64_t least, int lane_id) {
+    uint64_t least, int lane_id,
+    int sharing_mode = NCCL_GIN_RESOURCE_SHARING_GPU) {
     if (lane_id != 0) return;
     if (!mc_nccl_gin_available(ctx)) {
         auto& value = *const_cast<uint64_t*>(signal_ptr);
@@ -303,7 +306,8 @@ __device__ __forceinline__ void mc_nccl_wait_signal(
         detail::mc_nccl_pointer_offset(ctx, signal_ptr);
     const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
     ncclGin gin{comm, detail::mc_nccl_gin_context(
-                          ctx, static_cast<unsigned int>(channel))};
+                          ctx, static_cast<unsigned int>(channel)),
+                static_cast<ncclGinResourceSharingMode>(sharing_mode)};
     gin.waitSignal(ncclCoopThread{},
                    detail::NcclDeviceContextAccess::window(ctx), signal_offset,
                    least);

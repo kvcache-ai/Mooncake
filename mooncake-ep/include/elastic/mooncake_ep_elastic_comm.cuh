@@ -121,7 +121,7 @@ __forceinline__ __device__ void mooncake_barrier_wo_local_sync(
                                        : gin.template world_rank<team_t>(thread_idx);
             device::mc_nccl_signal_add(gin.ctx.nccl, dst_rank, gin.qp_idx,
                                        gin.physical_qps_per_rank, arrivals, 1,
-                                       0, kRail);
+                                       0, kRail, gin.sharing_mode);
         }
         __syncthreads();
         __shared__ unsigned long long target;
