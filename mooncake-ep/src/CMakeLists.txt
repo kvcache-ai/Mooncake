@@ -12,6 +12,12 @@ set_target_properties(_ep PROPERTIES INSTALL_RPATH "$ORIGIN")
 if(USE_CUDA)
   set_target_properties(_ep PROPERTIES CUDA_ARCHITECTURES "90")
 endif()
+if(USE_MUSA)
+  target_compile_definitions(_ep PRIVATE MOONCAKE_EP_USE_MUSA=1)
+endif()
+if(USE_MACA)
+  target_compile_definitions(_ep PRIVATE MOONCAKE_EP_USE_MACA=1)
+endif()
 
 target_include_directories(_ep PRIVATE ${Python3_INCLUDE_DIRS})
 target_link_libraries(_ep PRIVATE transfer_engine ibverbs mlx5 glog::glog

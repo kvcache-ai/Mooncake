@@ -39,12 +39,14 @@
 #undef __CUDA_NO_BFLOAT162_OPERATORS__
 #endif
 
+#include <cuda_alike.h>
+#if !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
 #include <cuda_bf16.h>
-#ifndef MOONCAKE_EP_USE_MACA
 #include <cuda_fp8.h>
+#endif
+#ifndef MOONCAKE_EP_USE_MACA
 #include <infiniband/mlx5dv.h>
 #endif
-#include <cuda_runtime.h>
 
 #if defined(MOONCAKE_EP_USE_MUSA) || defined(MOONCAKE_EP_USE_MACA)
 #define MOONCAKE_EP_SPLIT_SEND_RECV 1

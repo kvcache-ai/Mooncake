@@ -3,7 +3,7 @@
 // transport references are replaced with Mooncake Device API adapters.
 #pragma once
 
-#include <cuda_bf16.h>
+#include <cuda_alike.h>
 #include <cstdint>
 
 #include <elastic/mooncake_ep_elastic_compiled.cuh>
