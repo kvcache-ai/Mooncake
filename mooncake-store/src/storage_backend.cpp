@@ -10,6 +10,8 @@
 #include <cstring>
 #include <limits>
 
+#include <array>
+#include <cctype>
 #include <optional>
 #include <regex>
 #include <string>
@@ -220,6 +222,16 @@ OffsetAllocatorBackendConfig OffsetAllocatorBackendConfig::FromEnvironment() {
     cfg.persist_interval_seconds =
         GetEnvOr<int64_t>("MOONCAKE_OFFSET_PERSIST_INTERVAL_SECONDS",
                           cfg.persist_interval_seconds);
+
+    // Record CRC-32C: "0"/"false"/"off" disables per-record checksums.
+    const char* crc_env = std::getenv("MOONCAKE_OFFSET_RECORD_CRC");
+    if (crc_env) {
+        std::string s(crc_env);
+        for (auto& c : s) c = static_cast<char>(std::tolower(c));
+        if (s == "0" || s == "false" || s == "off") {
+            cfg.enable_record_crc = false;
+        }
+    }
 
     return cfg;
 }
@@ -4062,8 +4074,18 @@ void OffsetAllocatorStorageBackend::RebuildShardMapsFromAllocator(
             return;
         }
 
+        // Records carrying flag bits this build does not understand were
+        // written by a newer format; refuse them rather than guess.
+        if ((header.flags & ~RecordHeader::kKnownFlags) != 0) {
+            LOG(ERROR) << "[Recover] Unknown flags " << header.flags << " at "
+                       << real_offset;
+            free_leaked_node(alloc_size);
+            ++skipped;
+            return;
+        }
+
         uint64_t record_size =
-            RecordHeader::SIZE + header.key_len + header.value_len;
+            RecordHeader::RecordSize(header.key_len, header.value_len);
         if (record_size > alloc_size) {
             LOG(ERROR) << "[Recover] record_size " << record_size
                        << " > alloc_size " << alloc_size << " at "
@@ -4115,50 +4137,57 @@ void OffsetAllocatorStorageBackend::RebuildShardMapsFromAllocator(
             return;
         }
 
-        // Integrity check: stream the value in chunks and verify the
-        // CRC-32C over header-prefix + key + value.  This rejects torn
-        // writes whose header survived the crash but whose tail is stale
-        // or zero-filled.
-        Crc32c crc;
-        crc.Extend(hdr_buf, RecordHeader::PREFIX_SIZE);
-        crc.Extend(key.data(), key.size());
-        {
-            constexpr size_t kCrcChunkSize = 1 << 20;  // 1MB
-            chunk_buf.resize(
-                std::min<uint64_t>(header.value_len, kCrcChunkSize));
-            uint64_t remaining = header.value_len;
-            uint64_t value_offset =
-                real_offset + RecordHeader::SIZE + header.key_len;
-            bool read_failed = false;
-            while (remaining > 0) {
-                const size_t chunk =
-                    std::min<uint64_t>(remaining, chunk_buf.size());
-                iovec value_iov = {chunk_buf.data(), chunk};
-                auto value_res =
-                    data_file_->vector_read(&value_iov, 1, value_offset);
-                if (!value_res || value_res.value() != chunk) {
-                    LOG(ERROR)
-                        << "[Recover] Failed to read value at " << real_offset;
-                    read_failed = true;
-                    break;
+        // Integrity check, only for checksummed records: stream the value
+        // in chunks and verify the CRC-32C over header-prefix + key +
+        // value.  This rejects torn writes whose header survived the
+        // crash but whose tail is stale or zero-filled.  Unchecksummed
+        // records (kFlagHasCrc clear, e.g. written with CRC disabled or
+        // by a DMA writer) skip the value scan entirely: they are trusted
+        // via the checkpoint's seq guard alone, and recovery stays
+        // O(header + key) for them.
+        if (header.HasCrc()) {
+            Crc32c crc;
+            crc.Extend(hdr_buf, RecordHeader::PREFIX_SIZE);
+            crc.Extend(key.data(), key.size());
+            {
+                constexpr size_t kCrcChunkSize = 1 << 20;  // 1MB
+                chunk_buf.resize(
+                    std::min<uint64_t>(header.value_len, kCrcChunkSize));
+                uint64_t remaining = header.value_len;
+                uint64_t value_offset =
+                    real_offset +
+                    RecordHeader::ValueOffsetInRecord(header.key_len);
+                bool read_failed = false;
+                while (remaining > 0) {
+                    const size_t chunk =
+                        std::min<uint64_t>(remaining, chunk_buf.size());
+                    iovec value_iov = {chunk_buf.data(), chunk};
+                    auto value_res =
+                        data_file_->vector_read(&value_iov, 1, value_offset);
+                    if (!value_res || value_res.value() != chunk) {
+                        LOG(ERROR) << "[Recover] Failed to read value at "
+                                   << real_offset;
+                        read_failed = true;
+                        break;
+                    }
+                    crc.Extend(chunk_buf.data(), chunk);
+                    value_offset += chunk;
+                    remaining -= chunk;
                 }
-                crc.Extend(chunk_buf.data(), chunk);
-                value_offset += chunk;
-                remaining -= chunk;
+                if (read_failed) {
+                    free_leaked_node(record_size);
+                    ++skipped;
+                    return;
+                }
             }
-            if (read_failed) {
+            if (crc.Final() != header.crc32) {
+                LOG(ERROR) << "[Recover] CRC mismatch at " << real_offset
+                           << " (stored " << header.crc32 << ", computed "
+                           << crc.Final() << ") -- torn or stale record";
                 free_leaked_node(record_size);
                 ++skipped;
                 return;
             }
-        }
-        if (crc.Final() != header.crc32) {
-            LOG(ERROR) << "[Recover] CRC mismatch at " << real_offset
-                       << " (stored " << header.crc32 << ", computed "
-                       << crc.Final() << ") -- torn or stale record";
-            free_leaked_node(record_size);
-            ++skipped;
-            return;
         }
 
         // Duplicate resolution BEFORE constructing any handle: a failed
@@ -4755,13 +4784,18 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
         const uint64_t record_seq =
             insert_seq_.fetch_add(1, std::memory_order_relaxed);
 
-        RecordHeader header{.key_len = static_cast<uint32_t>(key.size()),
-                            .value_len = value_size,
-                            .seq = record_seq,
-                            .crc32 = 0};
+        RecordHeader header{
+            .key_len = static_cast<uint32_t>(key.size()),
+            .value_len = value_size,
+            .seq = record_seq,
+            .flags = cfg_.enable_record_crc ? RecordHeader::kFlagHasCrc : 0u,
+            .crc32 = 0};
 
-        size_t record_size =
-            RecordHeader::SIZE + header.key_len + header.value_len;
+        // Aligned layout: header + key + zero padding + value.
+        const uint32_t value_padding =
+            RecordHeader::ValuePadding(header.key_len);
+        uint64_t record_size =
+            RecordHeader::RecordSize(header.key_len, header.value_len);
 
         if (record_size > UINT32_MAX) {
             LOG(ERROR) << "Record too large for key: " << key
@@ -4769,17 +4803,20 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
             continue;
         }
 
-        // Serialize the header; the CRC covers the header prefix, the key
-        // and the value, and lets recovery detect torn/stale records.
+        // Serialize the header; when enabled, the CRC covers the header
+        // prefix, the key and the value, and lets recovery detect
+        // torn/stale records.
         char hdr_buf[RecordHeader::SIZE];
         header.WritePrefixTo(hdr_buf);
-        Crc32c crc;
-        crc.Extend(hdr_buf, RecordHeader::PREFIX_SIZE);
-        crc.Extend(key.data(), key.size());
-        for (const auto& slice : slices) {
-            crc.Extend(slice.ptr, slice.size);
+        if (header.HasCrc()) {
+            Crc32c crc;
+            crc.Extend(hdr_buf, RecordHeader::PREFIX_SIZE);
+            crc.Extend(key.data(), key.size());
+            for (const auto& slice : slices) {
+                crc.Extend(slice.ptr, slice.size);
+            }
+            header.crc32 = crc.Final();
         }
-        header.crc32 = crc.Final();
         header.WriteTo(hdr_buf);
 
         // ---- (A) Proactive eviction (watermark-driven) ----
@@ -4869,13 +4906,24 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
         uint64_t offset = allocation->address();
 
         // ---- (E) Disk write ----
+        // Shared zero page backing the padding iov: the value region must
+        // start at a kValueAlignment boundary within the record, and the
+        // gap between key and value is zero-filled.
+        static constexpr std::array<char, RecordHeader::kValueAlignment>
+            kZeroPadding{};
+
         std::vector<iovec> iovs;
-        iovs.reserve(1 + 1 + slices.size());
+        iovs.reserve(3 + slices.size());
 
         iovs.push_back({hdr_buf, static_cast<size_t>(RecordHeader::SIZE)});
 
         iovs.push_back({const_cast<char*>(key.data()),
                         static_cast<size_t>(header.key_len)});
+
+        if (value_padding > 0) {
+            iovs.push_back({const_cast<char*>(kZeroPadding.data()),
+                            static_cast<size_t>(value_padding)});
+        }
 
         for (const auto& slice : slices) {
             iovs.push_back({slice.ptr, slice.size});
@@ -5159,10 +5207,11 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
             return tl::make_unexpected(validate_result.error());
         }
 
-        // Read value into destination slice
+        // Read value into destination slice (at its aligned offset)
         iovec value_iov = {plan.dest_slice.ptr, plan.dest_slice.size};
         auto read_value_result = data_file_->vector_read(
-            &value_iov, 1, plan.offset + RecordHeader::SIZE + header.key_len);
+            &value_iov, 1,
+            plan.offset + RecordHeader::ValueOffsetInRecord(header.key_len));
         if (!read_value_result) {
             LOG(ERROR) << "Failed to read value for key: " << plan.key
                        << ", error: " << read_value_result.error();
@@ -5283,8 +5332,10 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::ScanMeta(
                 metadatas.push_back(StorageObjectMetadata{
                     0,  // bucket_id not used
                     static_cast<int64_t>(entry.offset),
-                    static_cast<int64_t>(entry.total_size - RecordHeader::SIZE -
-                                         entry.value_size),  // key_size
+                    // key_size comes from the key itself: total_size also
+                    // contains header and alignment padding, so it cannot
+                    // be derived arithmetically.
+                    static_cast<int64_t>(key.size()),
                     static_cast<int64_t>(entry.value_size), ""});
 
                 // Call handler when batch limit is reached

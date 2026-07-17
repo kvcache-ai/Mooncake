@@ -3623,7 +3623,7 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_Eviction_FifoOrder) {
     FileStorageConfig config;
     config.storage_filepath = data_path;
     config.storage_backend_type = StorageBackendType::kOffsetAllocator;
-    config.total_size_limit = 4 * 1024;  // 4KB — very small arena
+    config.total_size_limit = 20 * 1024;  // 20KB — very small arena
     config.total_keys_limit = 100;
 
     OffsetAllocatorBackendConfig evict_cfg;
@@ -3643,8 +3643,9 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_Eviction_FifoOrder) {
         return ErrorCode::OK;
     };
 
-    // Write A, B, C one by one. The arena is 4 KB; each 1 KB record
-    // (8 + key + value) ≈ 1040 bytes. 4 records should trigger eviction.
+    // Write A, B, C one by one. The arena is 20 KB; each 1 KB record is
+    // 4K-aligned (header + key + padding + value = 4096 + 1000 = 5096
+    // bytes), so three fit and the fourth write should trigger eviction.
     std::string data(1000, 'x');
     std::vector<std::unique_ptr<char[]>> buffers;
 
@@ -3680,7 +3681,7 @@ TEST_F(StorageBackendTest,
     FileStorageConfig config;
     config.storage_filepath = data_path;
     config.storage_backend_type = StorageBackendType::kOffsetAllocator;
-    config.total_size_limit = 4 * 1024;
+    config.total_size_limit = 16 * 1024;  // fits two 4K-aligned records
     config.total_keys_limit = 100;
 
     OffsetAllocatorStorageBackend storage_backend(config);
@@ -3725,7 +3726,7 @@ TEST_F(StorageBackendTest,
     FileStorageConfig config;
     config.storage_filepath = data_path;
     config.storage_backend_type = StorageBackendType::kOffsetAllocator;
-    config.total_size_limit = 4 * 1024;
+    config.total_size_limit = 20 * 1024;
     config.total_keys_limit = 100;
 
     OffsetAllocatorBackendConfig evict_cfg;
@@ -3790,13 +3791,15 @@ TEST_F(StorageBackendTest,
     FileStorageConfig config;
     config.storage_filepath = data_path;
     config.storage_backend_type = StorageBackendType::kOffsetAllocator;
-    config.total_size_limit = 8 * 1024;
+    config.total_size_limit = 20 * 1024;
     config.total_keys_limit = 100;
 
     OffsetAllocatorBackendConfig evict_cfg;
     evict_cfg.eviction_policy = OffsetEvictionPolicy::FIFO;
-    evict_cfg.high_watermark_bytes = 3500;
-    evict_cfg.low_watermark_bytes = 2100;
+    // Three 4K-aligned records (5096 B each) fit below high; the fourth
+    // crosses it and eviction drives back to low (one victim).
+    evict_cfg.high_watermark_bytes = 16384;
+    evict_cfg.low_watermark_bytes = 15288;
 
     OffsetAllocatorStorageBackend storage_backend(config, evict_cfg);
     ASSERT_TRUE(storage_backend.Init());
@@ -3878,7 +3881,7 @@ TEST_F(StorageBackendTest,
     config.storage_backend_type = StorageBackendType::kOffsetAllocator;
     // Arena large enough for several keys but small enough to trigger
     // eviction near capacity.
-    config.total_size_limit = 8 * 1024;
+    config.total_size_limit = 24 * 1024;
     config.total_keys_limit = 100;
 
     OffsetAllocatorBackendConfig evict_cfg;
@@ -3898,7 +3901,7 @@ TEST_F(StorageBackendTest,
         return ErrorCode::OK;
     };
 
-    std::string data(1500, 'x');  // each record ≈ 1516 bytes
+    std::string data(1500, 'x');  // each 4K-aligned record = 5596 bytes
     std::vector<std::unique_ptr<char[]>> buffers;
 
     // Write enough to fill the arena and trigger eviction.
@@ -3992,7 +3995,8 @@ TEST_F(StorageBackendTest,
     config.storage_filepath = data_path;
     config.storage_backend_type = StorageBackendType::kOffsetAllocator;
     config.total_size_limit =
-        8 * 1024;  // 8 KB — tight enough that 80 keys trigger eviction
+        160 * 1024;  // tight enough that 80 4K-aligned records (~4.2KB
+                     // each) trigger eviction
     config.total_keys_limit = 500;
 
     OffsetAllocatorBackendConfig evict_cfg;
@@ -4217,7 +4221,7 @@ TEST_F(StorageBackendTest,
        OffsetAllocatorStorageBackend_Persist_EvictionTombstone) {
     // An evicted key must NOT be resurrected by recovery: the checkpoint
     // records a tombstone for it.
-    auto config = MakeOffsetPersistConfig(data_path, 4 * 1024);
+    auto config = MakeOffsetPersistConfig(data_path, 20 * 1024);
     OffsetAllocatorBackendConfig backend_cfg;
     backend_cfg.eviction_policy = OffsetEvictionPolicy::FIFO;
     backend_cfg.persist_mode = OffsetPersistMode::kStrict;
@@ -4263,7 +4267,7 @@ TEST_F(StorageBackendTest,
     OffsetAllocatorBackendConfig backend_cfg;
     backend_cfg.persist_mode = OffsetPersistMode::kStrict;
 
-    constexpr size_t kRecordHeaderSize = 20;  // RecordHeader::SIZE (v2)
+    using RecordHeader = OffsetAllocatorStorageBackend::RecordHeader;
 
     std::unordered_map<std::string, StorageObjectMetadata> metas;
     auto capturing_handler =
@@ -4291,11 +4295,15 @@ TEST_F(StorageBackendTest,
     ASSERT_EQ(metas.count("key_a"), 1u);
 
     // Flip one byte inside key_a's value region (header stays intact, so
-    // only the CRC can catch this).
+    // only the CRC can catch this).  The value starts at its 4K-aligned
+    // offset within the record.
     {
         const auto& meta = metas.at("key_a");
-        const off_t corrupt_pos = static_cast<off_t>(meta.offset) +
-                                  kRecordHeaderSize + meta.key_size + 10;
+        const off_t corrupt_pos =
+            static_cast<off_t>(meta.offset) +
+            static_cast<off_t>(RecordHeader::ValueOffsetInRecord(
+                static_cast<uint32_t>(meta.key_size))) +
+            10;
         const std::string data_file = data_path + "/kv_cache.data";
         int fd = open(data_file.c_str(), O_RDWR);
         ASSERT_GE(fd, 0);
@@ -4322,7 +4330,7 @@ TEST_F(StorageBackendTest,
     // checkpoint the new record carries a seq >= the checkpoint's
     // insert_seq and must be dropped rather than resurrected as a
     // phantom key.
-    auto config = MakeOffsetPersistConfig(data_path, 2 * 1024);
+    auto config = MakeOffsetPersistConfig(data_path, 6 * 1024);
     OffsetAllocatorBackendConfig backend_cfg;
     backend_cfg.eviction_policy = OffsetEvictionPolicy::FIFO;
     backend_cfg.persist_mode = OffsetPersistMode::kRelaxed;
@@ -4346,9 +4354,9 @@ TEST_F(StorageBackendTest,
         // Simulate a crash from here on: no more checkpoints.
         backend.SetSkipFinalCheckpointForTest();
 
-        // Batch 2: the arena (2KB) only fits one ~1KB record, so key_j
-        // evicts key_k and reuses its extent -- but M1 never learns
-        // about it.
+        // Batch 2: the arena (6KB) only fits one 4K-aligned record
+        // (5096 B), so key_j evicts key_k and reuses its extent -- but
+        // M1 never learns about it.
         auto batch_j = MakeSingleKeyBatch("key_j", data, buffers);
         auto res = backend.BatchOffload(batch_j, NoopCompleteHandler(),
                                         AcceptAllEvictionHandler());
@@ -4394,6 +4402,247 @@ TEST_F(StorageBackendTest,
     ASSERT_TRUE(res_max.has_value());
     EXPECT_EQ(res_max.value(), 1);
     EXPECT_TRUE(backend.IsExist(max_key).value_or(false));
+}
+
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_Persist_RecordCrcDisabledRoundtrip) {
+    // With per-record CRC disabled, recovery must still restore every
+    // record: validation then rests on the checkpoint's seq guard alone.
+    auto config = MakeOffsetPersistConfig(data_path, 64 * 1024);
+    OffsetAllocatorBackendConfig backend_cfg;
+    backend_cfg.persist_mode = OffsetPersistMode::kStrict;
+    backend_cfg.enable_record_crc = false;
+
+    const std::string value_a(1000, 'a');
+    const std::string value_b(1500, 'b');
+    {
+        OffsetAllocatorStorageBackend backend(config, backend_cfg);
+        ASSERT_TRUE(backend.Init());
+        std::vector<std::unique_ptr<char[]>> buffers;
+        for (const auto& kv :
+             {std::pair{"key_a", &value_a}, std::pair{"key_b", &value_b}}) {
+            auto batch = MakeSingleKeyBatch(kv.first, *kv.second, buffers);
+            auto res =
+                backend.BatchOffload(batch, NoopCompleteHandler(), nullptr);
+            ASSERT_TRUE(res.has_value()) << "key=" << kv.first;
+            ASSERT_EQ(res.value(), 1);
+        }
+    }
+
+    OffsetAllocatorStorageBackend recovered(config, backend_cfg);
+    ASSERT_TRUE(recovered.Init());
+    EXPECT_EQ(LoadOne(recovered, "key_a", value_a.size()),
+              std::make_optional(value_a));
+    EXPECT_EQ(LoadOne(recovered, "key_b", value_b.size()),
+              std::make_optional(value_b));
+}
+
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_Persist_RecordCrcDisabledTornValue) {
+    // Documents the weaker guarantee of CRC-disabled mode: in-place value
+    // corruption below the checkpoint's seq watermark is NOT detected on
+    // recovery and the record is served as-is.  Only disable CRC when torn
+    // writes are otherwise impossible (strict ordering, PLP storage) or
+    // the value never touches the CPU (DMA writers).
+    auto config = MakeOffsetPersistConfig(data_path, 64 * 1024);
+    OffsetAllocatorBackendConfig backend_cfg;
+    backend_cfg.persist_mode = OffsetPersistMode::kStrict;
+    backend_cfg.enable_record_crc = false;
+
+    using RecordHeader = OffsetAllocatorStorageBackend::RecordHeader;
+
+    std::unordered_map<std::string, StorageObjectMetadata> metas;
+    auto capturing_handler =
+        [&metas](const std::vector<std::string>& keys,
+                 std::vector<StorageObjectMetadata>& metadatas) {
+            for (size_t i = 0; i < keys.size(); ++i) {
+                metas.emplace(keys[i], metadatas[i]);
+            }
+            return ErrorCode::OK;
+        };
+
+    const std::string value_a(1000, 'a');
+    {
+        OffsetAllocatorStorageBackend backend(config, backend_cfg);
+        ASSERT_TRUE(backend.Init());
+        std::vector<std::unique_ptr<char[]>> buffers;
+        auto batch_a = MakeSingleKeyBatch("key_a", value_a, buffers);
+        ASSERT_TRUE(backend.BatchOffload(batch_a, capturing_handler, nullptr)
+                        .has_value());
+    }
+    ASSERT_EQ(metas.count("key_a"), 1u);
+
+    // Flip one byte inside key_a's value region.
+    {
+        const auto& meta = metas.at("key_a");
+        const off_t corrupt_pos =
+            static_cast<off_t>(meta.offset) +
+            static_cast<off_t>(RecordHeader::ValueOffsetInRecord(
+                static_cast<uint32_t>(meta.key_size))) +
+            10;
+        const std::string data_file = data_path + "/kv_cache.data";
+        int fd = open(data_file.c_str(), O_RDWR);
+        ASSERT_GE(fd, 0);
+        char byte;
+        ASSERT_EQ(pread(fd, &byte, 1, corrupt_pos), 1);
+        byte ^= 0xFF;
+        ASSERT_EQ(pwrite(fd, &byte, 1, corrupt_pos), 1);
+        fsync(fd);
+        close(fd);
+    }
+
+    OffsetAllocatorStorageBackend recovered(config, backend_cfg);
+    ASSERT_TRUE(recovered.Init());
+    // No CRC to fail: the record survives recovery ...
+    EXPECT_TRUE(recovered.IsExist("key_a").value_or(false));
+    // ... and the corrupted byte is served verbatim.
+    std::string expected = value_a;
+    expected[10] ^= 0xFF;
+    EXPECT_EQ(LoadOne(recovered, "key_a", value_a.size()),
+              std::make_optional(expected));
+}
+
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_RecordLayout_ValueAlignedTo4K) {
+    // The value region must start at a kValueAlignment boundary within
+    // every record (cuFile/DMA requirement), with zero-filled padding
+    // that is a pure function of key_len.
+    using RecordHeader = OffsetAllocatorStorageBackend::RecordHeader;
+
+    // Static layout properties, including the padding boundary cases.
+    static_assert(RecordHeader::SIZE == 24, "v3 header is 24 bytes");
+    static_assert(RecordHeader::ValuePadding(4072) == 0,
+                  "24 + 4072 == 4096 needs no padding");
+    static_assert(RecordHeader::ValuePadding(4073) == 4095, "");
+    static_assert(RecordHeader::ValueOffsetInRecord(0) == 4096, "");
+    static_assert(RecordHeader::RecordSize(5, 1000) == 5096, "");
+    EXPECT_EQ(
+        RecordHeader::ValueOffsetInRecord(5) % RecordHeader::kValueAlignment,
+        0u);
+    EXPECT_EQ(
+        RecordHeader::ValueOffsetInRecord(4073) % RecordHeader::kValueAlignment,
+        0u);
+
+    auto config = MakeOffsetPersistConfig(data_path, 256 * 1024);
+    OffsetAllocatorBackendConfig backend_cfg;
+    backend_cfg.persist_mode = OffsetPersistMode::kStrict;
+
+    std::unordered_map<std::string, StorageObjectMetadata> metas;
+    auto capturing_handler =
+        [&metas](const std::vector<std::string>& keys,
+                 std::vector<StorageObjectMetadata>& metadatas) {
+            for (size_t i = 0; i < keys.size(); ++i) {
+                metas.emplace(keys[i], metadatas[i]);
+            }
+            return ErrorCode::OK;
+        };
+
+    const std::string value(1000, 'v');
+    const std::string short_key = "key_a";
+    const std::string long_key(4073, 'k');  // padding boundary: 4095 B pad
+    {
+        OffsetAllocatorStorageBackend backend(config, backend_cfg);
+        ASSERT_TRUE(backend.Init());
+        std::vector<std::unique_ptr<char[]>> buffers;
+        for (const auto* key : {&short_key, &long_key}) {
+            auto batch = MakeSingleKeyBatch(*key, value, buffers);
+            ASSERT_TRUE(backend.BatchOffload(batch, capturing_handler, nullptr)
+                            .has_value());
+        }
+    }
+    ASSERT_EQ(metas.size(), 2u);
+
+    // On-disk contract: padding is zero-filled and value bytes start
+    // exactly at the aligned offset.
+    const std::string data_file = data_path + "/kv_cache.data";
+    int fd = open(data_file.c_str(), O_RDONLY);
+    ASSERT_GE(fd, 0);
+    for (const auto& [key, meta] : metas) {
+        const uint32_t key_len = static_cast<uint32_t>(meta.key_size);
+        const uint32_t pad = RecordHeader::ValuePadding(key_len);
+        std::vector<char> pad_buf(pad);
+        ASSERT_EQ(pread(fd, pad_buf.data(), pad,
+                        static_cast<off_t>(meta.offset) +
+                            static_cast<off_t>(RecordHeader::SIZE) + key_len),
+                  static_cast<ssize_t>(pad))
+            << "key=" << key;
+        for (char c : pad_buf) {
+            ASSERT_EQ(c, '\0') << "padding must be zero-filled, key=" << key;
+        }
+        char first_value_byte;
+        ASSERT_EQ(pread(fd, &first_value_byte, 1,
+                        static_cast<off_t>(meta.offset) +
+                            static_cast<off_t>(
+                                RecordHeader::ValueOffsetInRecord(key_len))),
+                  1)
+            << "key=" << key;
+        EXPECT_EQ(first_value_byte, 'v') << "key=" << key;
+    }
+    close(fd);
+
+    // Recovery roundtrip still works with aligned records.
+    OffsetAllocatorStorageBackend recovered(config, backend_cfg);
+    ASSERT_TRUE(recovered.Init());
+    EXPECT_EQ(LoadOne(recovered, "key_a", value.size()),
+              std::make_optional(value));
+    EXPECT_EQ(LoadOne(recovered, long_key, value.size()),
+              std::make_optional(value));
+}
+
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_Persist_RejectsUnknownFlags) {
+    // A record whose flags carry bits this build does not know must be
+    // dropped on recovery (it belongs to a newer on-disk format).
+    auto config = MakeOffsetPersistConfig(data_path, 64 * 1024);
+    OffsetAllocatorBackendConfig backend_cfg;
+    backend_cfg.persist_mode = OffsetPersistMode::kStrict;
+
+    std::unordered_map<std::string, StorageObjectMetadata> metas;
+    auto capturing_handler =
+        [&metas](const std::vector<std::string>& keys,
+                 std::vector<StorageObjectMetadata>& metadatas) {
+            for (size_t i = 0; i < keys.size(); ++i) {
+                metas.emplace(keys[i], metadatas[i]);
+            }
+            return ErrorCode::OK;
+        };
+
+    const std::string value_a(1000, 'a');
+    const std::string value_b(1000, 'b');
+    {
+        OffsetAllocatorStorageBackend backend(config, backend_cfg);
+        ASSERT_TRUE(backend.Init());
+        std::vector<std::unique_ptr<char[]>> buffers;
+        auto batch_a = MakeSingleKeyBatch("key_a", value_a, buffers);
+        ASSERT_TRUE(backend.BatchOffload(batch_a, capturing_handler, nullptr)
+                        .has_value());
+        auto batch_b = MakeSingleKeyBatch("key_b", value_b, buffers);
+        ASSERT_TRUE(backend.BatchOffload(batch_b, capturing_handler, nullptr)
+                        .has_value());
+    }
+    ASSERT_EQ(metas.count("key_a"), 1u);
+
+    // Set flags = 0x02 (unknown bit, kFlagHasCrc clear) in key_a's header:
+    // the flags field sits at byte offset 16 (u32 key_len, u32 value_len,
+    // u64 seq), little-endian.
+    {
+        const auto& meta = metas.at("key_a");
+        const std::string data_file = data_path + "/kv_cache.data";
+        int fd = open(data_file.c_str(), O_RDWR);
+        ASSERT_GE(fd, 0);
+        const char flag_byte = 0x02;
+        ASSERT_EQ(
+            pwrite(fd, &flag_byte, 1, static_cast<off_t>(meta.offset) + 16), 1);
+        fsync(fd);
+        close(fd);
+    }
+
+    OffsetAllocatorStorageBackend recovered(config, backend_cfg);
+    ASSERT_TRUE(recovered.Init());
+    EXPECT_FALSE(recovered.IsExist("key_a").value_or(true))
+        << "record with unknown flags must be dropped on recovery";
+    EXPECT_EQ(LoadOne(recovered, "key_b", value_b.size()),
+              std::make_optional(value_b));
 }
 
 }  // namespace mooncake::test
