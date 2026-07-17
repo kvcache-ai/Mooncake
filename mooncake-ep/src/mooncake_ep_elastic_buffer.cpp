@@ -6,7 +6,7 @@
 #include <cstring>
 #include <stdexcept>
 
-#include <cuda_runtime.h>
+#include <cuda_alike.h>
 
 namespace mooncake {
 namespace {

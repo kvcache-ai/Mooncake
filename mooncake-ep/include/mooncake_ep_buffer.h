@@ -1,9 +1,7 @@
 #ifndef MOONCAKE_EP_BUFFER_H
 #define MOONCAKE_EP_BUFFER_H
 
-#include <cuda_bf16.h>
-#include <cuda.h>
-#include <cuda_runtime.h>
+#include <cuda_alike.h>
 #include <functional>
 #include <memory>
 #include <optional>
