@@ -222,7 +222,7 @@ class Environ {
     int GetTeMetricIntervalSeconds() const {
         return te_metric_interval_seconds_;
     }
-    std::string GetTentConf() const { return tent_conf_; }
+    std::string GetTentConf() const { return GetString("MC_TENT_CONF", ""); }
     int GetTransferTimeout() const { return transfer_timeout_; }
     bool GetUseHipIpc() const { return GetBool("MC_USE_HIP_IPC", true); }
     bool GetUseNvlinkIpc() const { return GetBool("MC_USE_NVLINK_IPC", false); }
@@ -384,7 +384,6 @@ class Environ {
     std::string tcp_enable_connection_pool_;
     std::string te_metric_;
     int te_metric_interval_seconds_;
-    std::string tent_conf_;
     int transfer_timeout_;
     bool use_tent_;
     bool use_tev1_;

@@ -43,6 +43,7 @@ class EnvironTest : public ::testing::Test {
         unsetenv("MC_STORE_CLIENT_METRIC_BANDWIDTH");
         unsetenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
         unsetenv("MC_TE_FILTERS");
+        unsetenv("MC_TENT_CONF");
         unsetenv("MC_TCP_PROTO");
         unsetenv("MC_TPU_PJRT_LIB");
         unsetenv("MC_USE_HIP_IPC");
@@ -340,6 +341,7 @@ TEST_F(EnvironTest, DynamicGettersObserveRuntimeUpdates) {
     setenv("MC_STORE_CLIENT_METRIC_BANDWIDTH", "0", 1);
     setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", "1048576", 1);
     setenv("MC_TE_FILTERS", "mlx5_2", 1);
+    setenv("MC_TENT_CONF", "/tmp/tent-config.json", 1);
     setenv("MC_TCP_PROTO", "1", 1);
     setenv("MC_TPU_PJRT_LIB", "/tmp/libtpu_mock.so", 1);
     setenv("MC_USE_UBSHMEM_IPC", "1", 1);
@@ -355,6 +357,7 @@ TEST_F(EnvironTest, DynamicGettersObserveRuntimeUpdates) {
     EXPECT_FALSE(env.GetStoreClientMetricBandwidth());
     EXPECT_EQ(env.GetStoreLocalHotCacheSize(), "1048576");
     EXPECT_EQ(env.GetTeFilters(), "mlx5_2");
+    EXPECT_EQ(env.GetTentConf(), "/tmp/tent-config.json");
     EXPECT_EQ(env.GetTcpProto(), "1");
     EXPECT_EQ(env.GetTpuPjrtLib(), "/tmp/libtpu_mock.so");
     EXPECT_TRUE(env.GetUseUbshmemIpc());
@@ -370,6 +373,7 @@ TEST_F(EnvironTest, DynamicGettersObserveRuntimeUpdates) {
     unsetenv("MC_STORE_CLIENT_METRIC_BANDWIDTH");
     unsetenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
     unsetenv("MC_TE_FILTERS");
+    unsetenv("MC_TENT_CONF");
     unsetenv("MC_TCP_PROTO");
     unsetenv("MC_TPU_PJRT_LIB");
     unsetenv("MC_USE_UBSHMEM_IPC");
@@ -385,6 +389,7 @@ TEST_F(EnvironTest, DynamicGettersObserveRuntimeUpdates) {
     EXPECT_TRUE(env.GetStoreClientMetricBandwidth());
     EXPECT_TRUE(env.GetStoreLocalHotCacheSize().empty());
     EXPECT_TRUE(env.GetTeFilters().empty());
+    EXPECT_TRUE(env.GetTentConf().empty());
     EXPECT_TRUE(env.GetTcpProto().empty());
     EXPECT_EQ(env.GetTpuPjrtLib(), "libmooncake_tpu_pjrt.so");
     EXPECT_FALSE(env.GetUseUbshmemIpc());

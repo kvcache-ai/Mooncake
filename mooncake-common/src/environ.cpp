@@ -184,7 +184,6 @@ Environ::Environ() {
         GetString("MC_TCP_ENABLE_CONNECTION_POOL", "");
     te_metric_ = GetString("MC_TE_METRIC", "");
     te_metric_interval_seconds_ = GetInt("MC_TE_METRIC_INTERVAL_SECONDS", 0);
-    tent_conf_ = GetString("MC_TENT_CONF", "");
     transfer_timeout_ = GetInt("MC_TRANSFER_TIMEOUT", 0);
     use_tent_ = GetBool("MC_USE_TENT", false);
     use_tev1_ = GetBool("MC_USE_TEV1", false);
