@@ -1,6 +1,6 @@
 # SGLang PD Disaggregation Performance
 
-Mooncake provides a KV transfer backend for SGLang, enabling Prefill-Decode (PD) disaggregation through the Mooncake Transfer Engine. We evaluated this integration, focusing on the efficiency of cross-node KV cache transfer over RoCE v2.
+Mooncake provides a KV transfer backend for SGLang, enabling Prefill-Decode (PD) disaggregation through the Mooncake Transfer Engine. We evaluated this integration, focusing on the efficiency of cross-node KV cache transfer over RoCE.
 
 ## Benchmark Result
 
@@ -10,7 +10,7 @@ We measured the transfer bandwidth during the execution of requests with varying
 
 ![Mooncake KV Cache Transfer Bandwidth](../../image/sglang_pd_qwen3_235b_bandwidth.png)
 
-In a 1P1D (1 Prefiller, 1 Decoder) configuration using the Qwen3-235B-A22B-Instruct-2507 model, Mooncake achieved a peak transfer bandwidth of **164.3 GB/s**. Compared with the 200 GB/s aggregate line rate of four 400GbE links per node, this represents **82.2% bandwidth utilization**. This result demonstrates that the Mooncake Transfer Engine and GPUDirect RDMA can sustain high aggregate throughput over the cross-node RoCE v2 fabric.
+In a 1P1D (1 Prefiller, 1 Decoder) configuration using the Qwen3-235B-A22B-Instruct-2507 model, Mooncake achieved a peak transfer bandwidth of **164.3 GB/s**. Compared with the 200 GB/s aggregate line rate of four 400GbE links per node, this represents **82.2% bandwidth utilization**. This result demonstrates that the Mooncake Transfer Engine and GPUDirect RDMA can sustain high aggregate throughput over the cross-node RoCE fabric.
 
 ### Time to First Token (TTFT)
 
@@ -134,7 +134,7 @@ for prompt_len in 128 256 512 1024 2048 4096 8192 16384 32768; do
 done
 ```
 
-## Previous Benchmark: PD Disaggregation vs. Regular SGLang
+## PD Disaggregation vs. Regular SGLang
 
 We evaluated the earlier implementation on two A10 servers. By comparing the performance of a 1P1D configuration with that of two regular (non-disaggregated) instances, we observed that P/D disaggregation achieves approximately 30% lower ITL while maintaining comparable total throughput. This aligns with findings from the Mooncake paper, which highlighted that P/D disaggregation is effective in reducing TBT/ITL under similar throughput conditions—or conversely, in enabling higher throughput under stricter ITL/TBT SLOs.
 
