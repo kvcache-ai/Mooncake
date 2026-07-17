@@ -997,6 +997,9 @@ impl StorageOwnerState {
         preferred_segment: Option<&SegmentName>,
     ) -> Result<Option<mooncake_store_core::SegmentReservation>> {
         let Some(route) = self.load_victim_route_bounded(&victim.route_key)? else {
+            if self.reclaim_stale_local_allocations_for_key(&victim.route_key, None)? > 0 {
+                return self.reserve_local_after_stale_reclaim(length_bytes, preferred_segment);
+            }
             self.hot_replicas.remove_id(victim);
             return Ok(None);
         };
@@ -1187,14 +1190,14 @@ impl StorageOwnerState {
         key: &ObjectKey,
         current: Option<&ObjectRoute>,
     ) -> Result<usize> {
-        let Some(current) = current else {
-            return Ok(0);
+        let active_current = match current {
+            Some(route) if route.state == RouteState::Active => Some(route),
+            Some(_) => return Ok(0),
+            None => None,
         };
-        if current.state != RouteState::Active {
-            return Ok(0);
-        }
-
-        let live_allocations = self.local_allocation_spans_for_route(current);
+        let live_allocations = active_current
+            .map(|route| self.local_allocation_spans_for_route(route))
+            .unwrap_or_default();
         let candidate_allocations = {
             let clock = self.hot_replicas.clock.lock();
             clock.allocation_spans_for_key(key)
@@ -1204,8 +1207,11 @@ impl StorageOwnerState {
         }
         let releasable = {
             let mut allocator = self.allocator.lock();
-            let releasable =
-                allocator.releasable_stale_candidates(&candidate_allocations, &live_allocations, now_ms());
+            let releasable = allocator.releasable_stale_candidates(
+                &candidate_allocations,
+                &live_allocations,
+                now_ms(),
+            );
             for allocation in &releasable {
                 allocator.release(
                     &self.runtime,
@@ -1219,24 +1225,28 @@ impl StorageOwnerState {
         if releasable.is_empty() {
             return Ok(0);
         }
-        self.reconcile_after_stale_release(key, current, &releasable);
+        self.reconcile_after_stale_release(key, active_current, &releasable);
         Ok(releasable.len())
     }
 
     fn reconcile_after_stale_release(
         &self,
         key: &ObjectKey,
-        current: &ObjectRoute,
+        current: Option<&ObjectRoute>,
         released: &[AllocationSpan],
     ) {
-        self.allocator
-            .lock()
-            .clear_pending_route(current, &self.runtime);
+        if let Some(current) = current {
+            self.allocator
+                .lock()
+                .clear_pending_route(current, &self.runtime);
+        }
         let mut clock = self.hot_replicas.clock.lock();
         for allocation in released {
             clock.remove_allocation_for_key(key, allocation);
         }
-        clock.track_route(current, &self.runtime);
+        if let Some(current) = current {
+            clock.track_route(current, &self.runtime);
+        }
     }
 
     fn local_allocation_spans_for_route(&self, route: &ObjectRoute) -> BTreeSet<AllocationSpan> {
@@ -1254,6 +1264,9 @@ impl StorageOwnerState {
 
     fn evict_candidate(&self, victim: &ClockEntryId) -> Result<bool> {
         let Some(route) = self.load_victim_route_bounded(&victim.route_key)? else {
+            if self.reclaim_stale_local_allocations_for_key(&victim.route_key, None)? > 0 {
+                return Ok(true);
+            }
             self.hot_replicas.clock.lock().remove_id(victim);
             return Ok(false);
         };
