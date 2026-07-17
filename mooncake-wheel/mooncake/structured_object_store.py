@@ -1297,18 +1297,23 @@ class MooncakeBundleTransfer:
         for name, value in non_tensor_batch.items():
             schema = field_schemas.get(name) if field_schemas else None
             encoded: _EncodedStructuredLeaf | None = None
-            if schema is not None and schema.codec != "auto":
+            if schema is not None:
                 try:
                     encode_value = _coerce_schema_non_tensor_value(name, value)
-                    encoded = _encode_with_schema(
-                        f"non_tensor_batch.{name}", encode_value, schema
-                    )
+                    if schema.codec == "auto":
+                        _validate_schema_nullable(
+                            f"non_tensor_batch.{name}", encode_value, schema
+                        )
+                    else:
+                        encoded = _encode_with_schema(
+                            f"non_tensor_batch.{name}", encode_value, schema
+                        )
                 except (TypeError, ValueError, RuntimeError, AttributeError) as exc:
                     raise type(exc)(
                         f"failed to encode non_tensor_batch field {name!r} "
                         f"with FieldSchema codec {schema.codec!r}: {exc}"
                     ) from exc
-            elif _should_encode_non_tensor_field(value):
+            if encoded is None and _should_encode_non_tensor_field(value):
                 encoded = _encode_structured_non_tensor_field(
                     f"non_tensor_batch.{name}", value
                 )
@@ -1741,19 +1746,19 @@ def _validate_dataproto_schema_sections(
 ) -> None:
     if not field_schemas:
         return
-    for section, fields in (
-        ("batch", batch),
-        ("non_tensor_batch", non_tensor_batch),
-        ("meta_info", meta_info),
-    ):
-        for name in fields:
-            schema = field_schemas.get(name)
-            if schema is None:
-                continue
-            declared = _schema_section(name, schema)
-            if declared is None:
-                continue
-            if declared != section:
+    sections = {
+        "batch": batch,
+        "non_tensor_batch": non_tensor_batch,
+        "meta_info": meta_info,
+    }
+    for name, schema in field_schemas.items():
+        declared = _schema_section(name, schema)
+        if declared is None:
+            continue
+        if name in sections[declared]:
+            continue
+        for section, fields in sections.items():
+            if section != declared and name in fields:
                 raise ValueError(
                     f"FieldSchema for {name!r} declares section {declared!r}, "
                     f"but data contains it in {section!r}"
@@ -1770,6 +1775,11 @@ def _coerce_schema_non_tensor_value(name: str, value: Any) -> np.ndarray:
     raise TypeError(
         f"non_tensor_batch field {name!r} with FieldSchema must be an ndarray or non-string sequence"
     )
+
+
+def _validate_schema_nullable(path: str, value: np.ndarray, schema: FieldSchema) -> None:
+    if not schema.nullable and any(item is None for item in value):
+        raise ValueError(f"FieldSchema for {path!r} is not nullable")
 
 
 def _should_encode_non_tensor_field(value: Any) -> bool:
@@ -1794,8 +1804,7 @@ def _encode_with_schema(
 ) -> _EncodedStructuredLeaf:
     """Encode a non_tensor_batch field using an explicit schema."""
     values = list(value)
-    if not schema.nullable and any(item is None for item in values):
-        raise ValueError(f"FieldSchema for {path!r} is not nullable")
+    _validate_schema_nullable(path, value, schema)
     codec = schema.codec
     if codec not in _FIELD_SCHEMA_CODECS:
         raise ValueError(f"unsupported schema codec: {codec!r}")
@@ -2317,10 +2326,18 @@ def _encode_ragged_tensor_dict_values(
     rows = len(values)
     null_mask = np.asarray([item is None for item in values], dtype=np.bool_)
     for row, item in enumerate(values):
-        if item is not None and not isinstance(item, Mapping):
+        if item is None:
+            continue
+        if not isinstance(item, Mapping):
             raise TypeError(
                 "ragged_tensor_dict rows must be mappings or None; "
                 f"row {row} is {type(item).__name__}"
+            )
+        explicit_null_keys = sorted(key for key, value in item.items() if value is None)
+        if explicit_null_keys:
+            raise TypeError(
+                "ragged_tensor_dict rows cannot contain explicit None tensor values; "
+                f"row {row} has {explicit_null_keys}"
             )
     schema_keys = schema.metadata.get("keys")
     keys = (
@@ -2345,6 +2362,17 @@ def _encode_ragged_tensor_dict_values(
         for item in non_null:
             all_keys.update(item.keys())
         keys = _normalize_ragged_tensor_dict_keys(sorted(all_keys))
+    else:
+        declared_keys = set(keys)
+        for row, item in enumerate(values):
+            if item is None:
+                continue
+            extra_keys = sorted(set(item) - declared_keys)
+            if extra_keys:
+                raise ValueError(
+                    "ragged_tensor_dict rows contain keys not declared in "
+                    f"FieldSchema metadata['keys']; row {row} has {extra_keys}"
+                )
     if _torch is None:
         raise RuntimeError("torch is required to encode ragged_tensor_dict fields")
     payload: dict[str, Any] = {"null_mask": null_mask}
