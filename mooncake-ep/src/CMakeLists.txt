@@ -1,5 +1,6 @@
 set(MOONCAKE_EP_SOURCES
     ep_py.cpp
+    ../benchmarks/legacy_buffer_perf.cpp
     mooncake_ep_buffer.cpp
     mooncake_ep_elastic_buffer.cpp
     mooncake_ep_kernel.cu

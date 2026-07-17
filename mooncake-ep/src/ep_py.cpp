@@ -9,6 +9,8 @@ namespace py = pybind11;
 
 namespace mooncake {
 
+void bind_legacy_buffer_perf(py::module_& module);
+
 PYBIND11_MODULE(_ep, m) {
     m.def("get_ep_buffer_size_hint", &get_ep_buffer_size_hint);
     m.def("calculate_elastic_buffer_size",
@@ -21,6 +23,7 @@ PYBIND11_MODULE(_ep, m) {
         .def("synchronize", &EventHandle::synchronize);
 
     m.attr("MAX_QP_COUNT") = pybind11::int_(MAX_QP_COUNT);
+    bind_legacy_buffer_perf(m);
 
     py::class_<MooncakeEpBuffer>(m, "Buffer")
         .def(py::init<int, int, int64_t>())
