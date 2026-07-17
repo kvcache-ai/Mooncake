@@ -114,9 +114,10 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 
     // Adjust register count at certain cases
     // TODO: support more cases, or try to make channel count more aligned
-    constexpr bool kAdjustRegisters =
-        (kNumChannelsPerSM == 4 || kNumChannelsPerSM == 8) &&
-        !kUseExpandedLayout;
+    // DeepEP's register redistribution uses setmaxnreg, which is not accepted
+    // by ptxas for the SM90 target used by current Mooncake NV validation.
+    // Keep the official role split but disable this SM100-only optimization.
+    constexpr bool kAdjustRegisters = false;
     constexpr int kNumRegistersForScaleupWarps = 40;
     constexpr int kNumRegistersForForwardWarps =
         256 - kNumRegistersForScaleupWarps;
