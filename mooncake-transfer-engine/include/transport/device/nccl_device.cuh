@@ -225,7 +225,11 @@ __device__ __forceinline__ void mc_nccl_signal_add(
     (void)qps_per_rank;
     if (lane_id != 0) return;
 
-    if (dst_rank == detail::NcclDeviceContextAccess::rank(ctx)) {
+    // A rail rank is indexed inside ncclTeamRail, whereas ctx.rank_ is a
+    // world rank.  Comparing them would misclassify, for example, world rank
+    // 1 sending to rail rank 1 as a local update and drop the cross-node
+    // signal entirely.
+    if (!rail && dst_rank == detail::NcclDeviceContextAccess::rank(ctx)) {
         cuda::atomic_ref<uint64_t, cuda::thread_scope_system> signal(
             *signal_ptr);
         signal.fetch_add(value, cuda::memory_order_release);
