@@ -17,6 +17,10 @@ def _using_musa_backend() -> bool:
     }
 
 
+def _env_enabled(name: str) -> bool:
+    return os.getenv(name, "").upper() in {"1", "ON", "TRUE", "YES"}
+
+
 def _dist_barrier(group: dist.ProcessGroup) -> None:
     if _using_musa_backend():
         dist.barrier(group=group, device_ids=[torch.cuda.current_device()])
