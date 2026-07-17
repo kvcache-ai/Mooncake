@@ -1430,13 +1430,12 @@ tl::expected<bool, ErrorCode> StorageBackendAdaptor::IsExist(
 
     const auto legacy_path = ResolveLegacyPathFromKey(
         key, file_storage_config_.storage_filepath, file_per_key_config_.fsdir);
-    if (!fs::exists(legacy_path)) {
-        return false;
-    }
-
     std::error_code ec;
     const auto size = fs::file_size(legacy_path, ec);
     if (ec) {
+        if (ec == std::errc::no_such_file_or_directory) {
+            return false;
+        }
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     }
     std::string kv_buf;

@@ -835,6 +835,11 @@ TEST_F(StorageBackendTest, AdaptorValidatesLegacyFallbackKey) {
     auto wrong_result = adaptor.BatchLoad(wrong_load);
     ASSERT_FALSE(wrong_result);
     EXPECT_EQ(wrong_result.error(), ErrorCode::INVALID_KEY);
+
+    ASSERT_TRUE(fs::remove(legacy_path));
+    auto removed_exists = adaptor.IsExist(stored_key);
+    ASSERT_TRUE(removed_exists);
+    EXPECT_FALSE(removed_exists.value());
 }
 
 TEST_F(StorageBackendTest, AdaptorBatchOffload_PartialSuccess) {
