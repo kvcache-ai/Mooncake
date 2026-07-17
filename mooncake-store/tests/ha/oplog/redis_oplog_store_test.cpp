@@ -256,11 +256,11 @@ TEST_F(RedisOpLogStoreTest, AsyncWriteDoesNotAdvanceLatestPastGap) {
     EXPECT_EQ(2u, latest);
 }
 
-TEST_F(RedisOpLogStoreTest, RewriteExistingSequenceFails) {
+TEST_F(RedisOpLogStoreTest, RewriteExistingSequenceIsIdempotent) {
     auto writer = CreateWriter();
     auto entry = MakeEntry(1);
     ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(entry, true));
-    EXPECT_NE(ErrorCode::OK, writer->WriteOpLog(entry, true));
+    EXPECT_EQ(ErrorCode::OK, writer->WriteOpLog(entry, true));
 
     auto conflicting = entry;
     conflicting.payload = "different_payload";

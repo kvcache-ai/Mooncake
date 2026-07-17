@@ -8,6 +8,7 @@
 #include <cstring>
 #include <iomanip>
 #include <sstream>
+#include <string_view>
 
 #include "ha/oplog/oplog_serializer.h"
 #include "ha/oplog/polling_oplog_change_notifier.h"
@@ -341,10 +342,26 @@ ErrorCode RedisOpLogStore::PersistEntryNoLatest(redisContext* ctx,
         return ErrorCode::OK;
     }
     if (reply->type == REDIS_REPLY_NIL) {
-        // TODO(P2P HA): Read and compare an existing entry. Treat identical
-        // content as idempotent retry success and only reject conflicts.
-        LOG(ERROR) << "RedisOpLogStore::PersistEntryNoLatest: sequence already "
-                      "exists"
+        RedisReplyPtr existing((redisReply*)redisCommand(
+            ctx, "GET %b", entry_key.data(), entry_key.size()));
+        if (!existing || existing->type == REDIS_REPLY_ERROR) {
+            LOG(ERROR) << "RedisOpLogStore::PersistEntryNoLatest: GET existing "
+                          "entry failed"
+                       << ", sequence_id=" << entry.sequence_id;
+            return ErrorCode::INTERNAL_ERROR;
+        }
+        if (existing->type == REDIS_REPLY_STRING &&
+            std::string_view(existing->str, existing->len) == serialized) {
+            return ErrorCode::OK;
+        }
+        if (existing->type == REDIS_REPLY_NIL) {
+            LOG(WARNING) << "RedisOpLogStore::PersistEntryNoLatest: existing "
+                            "entry disappeared before comparison, retrying"
+                         << ", sequence_id=" << entry.sequence_id;
+            return ErrorCode::INTERNAL_ERROR;
+        }
+        LOG(ERROR) << "RedisOpLogStore::PersistEntryNoLatest: conflicting "
+                      "entry already exists"
                    << ", sequence_id=" << entry.sequence_id;
         return ErrorCode::INVALID_PARAMS;
     }
@@ -500,6 +517,9 @@ ErrorCode RedisOpLogStore::ReadOpLogSince(uint64_t start_sequence_id,
         return ErrorCode::INTERNAL_ERROR;
     }
 
+    // TODO(P2P HA): Do not silently advance a lagging standby past the trim
+    // horizon. Detect start_sequence_id < trimmed_sequence_id and handle it
+    // together with standby snapshot/bootstrap recovery.
     const uint64_t effective_start =
         std::max(start_sequence_id, trimmed_sequence_id);
     if (effective_start >= latest_sequence_id) {
@@ -624,6 +644,8 @@ ErrorCode RedisOpLogStore::GetMaxSequenceId(uint64_t& sequence_id) {
     return ErrorCode::OK;
 }
 
+// Recovery/admin operation inherited from OpLogStore. It must not run
+// concurrently with normal writes.
 ErrorCode RedisOpLogStore::UpdateLatestSequenceId(uint64_t sequence_id) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto err = EnsureConnectedUnlocked();
