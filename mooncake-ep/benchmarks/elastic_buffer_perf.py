@@ -73,6 +73,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Report selected CUDA kernel durations across all ranks.",
     )
+    parser.add_argument(
+        "--profile-rank",
+        type=int,
+        default=0,
+        help="Global rank on which to enable the CUDA profiler.",
+    )
     parser.add_argument("--seed", type=int, default=2026)
     return parser.parse_args()
 
@@ -163,6 +169,8 @@ def check_output(
 def main() -> None:
     args = parse_args()
     rank, world_size = init_distributed(args.seed)
+    if args.profile_kernels and not 0 <= args.profile_rank < world_size:
+        raise ValueError("profile-rank must identify a rank in the process group")
     max_tokens = args.max_tokens or max(128, args.num_tokens)
     num_experts = args.num_experts
     if num_experts % world_size != 0:
@@ -256,6 +264,7 @@ def main() -> None:
     combine_ms = []
     recv_tokens = []
     wall_start = time.time()
+    profile_this_rank = args.profile_kernels and rank == args.profile_rank
     profiler_context = (
         torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CUDA],
@@ -263,7 +272,7 @@ def main() -> None:
             with_stack=False,
             acc_events=True,
         )
-        if args.profile_kernels
+        if profile_this_rank
         else contextlib.nullcontext()
     )
     with profiler_context as profiler:
@@ -287,7 +296,7 @@ def main() -> None:
     kernel_profile = torch.zeros(
         (len(profiled_kernel_names), 2), device="cuda", dtype=torch.float64
     )
-    if args.profile_kernels:
+    if profile_this_rank:
         for event in profiler.key_averages():
             for index, kernel_name in enumerate(profiled_kernel_names):
                 if kernel_name not in event.key:
@@ -357,15 +366,17 @@ def main() -> None:
             for index, kernel_name in enumerate(profiled_kernel_names):
                 totals = kernel_table[:, index, 0]
                 counts = kernel_table[:, index, 1]
-                per_rank_us = totals / counts.clamp_min(1)
+                valid = counts > 0
+                per_rank_us = totals[valid] / counts[valid]
                 print(
                     "MOONCAKE_ELASTIC_KERNEL_PROFILE",
                     f"kernel={kernel_name}",
+                    f"profile_rank={args.profile_rank}",
                     f"avg_us={per_rank_us.mean().item():.2f}",
                     f"critical_us={per_rank_us.max().item():.2f}",
                     f"min_us={per_rank_us.min().item():.2f}",
-                    f"count_min={int(counts.min().item())}",
-                    f"count_max={int(counts.max().item())}",
+                    f"count_min={int(counts[valid].min().item())}",
+                    f"count_max={int(counts[valid].max().item())}",
                     flush=True,
                 )
 
