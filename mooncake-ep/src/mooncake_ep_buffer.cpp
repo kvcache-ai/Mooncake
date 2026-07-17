@@ -101,12 +101,6 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
         p2p_transport_ = owned_p2p_transport_.get();
     }
 
-    gdr_buffer = p2p_transport_->allocateBuffer(num_ep_buffer_bytes);
-    if (!gdr_buffer) {
-        throw std::runtime_error("[EP] Failed to allocate GDR buffer");
-    }
-    CUDA_CHECK(cudaMemset(gdr_buffer, 0, num_ep_buffer_bytes));
-
     // RDMA transport — optional; disabled if init fails. NCCL mode performs
     // its collective setup after Python has exchanged a unique ID.
 #ifdef USE_NCCL_DEVICE
@@ -117,8 +111,17 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
         if (!owned_nccl_transport_) {
             throw std::runtime_error("[EP] Failed to create NCCL transport");
         }
+        gdr_buffer = owned_nccl_transport_->allocateBuffer(num_ep_buffer_bytes);
+        gdr_buffer_owned_by_nccl_ = true;
     }
 #endif
+    if (!gdr_buffer) {
+        gdr_buffer = p2p_transport_->allocateBuffer(num_ep_buffer_bytes);
+    }
+    if (!gdr_buffer) {
+        throw std::runtime_error("[EP] Failed to allocate GDR buffer");
+    }
+    CUDA_CHECK(cudaMemset(gdr_buffer, 0, num_ep_buffer_bytes));
     bool initialize_ibgda = true;
 #ifdef USE_NCCL_DEVICE
     initialize_ibgda = !nccl_requested_;
@@ -171,6 +174,10 @@ MooncakeEpBuffer::~MooncakeEpBuffer() noexcept(false) {
     if (owned_nccl_transport_) {
         if (nccl_gdr_registration_.valid()) {
             owned_nccl_transport_->deregisterBuffer(&nccl_gdr_registration_);
+        }
+        if (gdr_buffer_owned_by_nccl_ && gdr_buffer) {
+            owned_nccl_transport_->freeBuffer(gdr_buffer);
+            gdr_buffer = nullptr;
         }
         owned_nccl_transport_->shutdown();
         owned_nccl_transport_.reset();

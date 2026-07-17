@@ -151,6 +151,18 @@ class MooncakeElasticBuffer {
         native_buffer_->sync_nvlink_ipc_handles(remote_handles,
                                                 active_ranks_mask);
     }
+#ifdef USE_NCCL_DEVICE
+    std::vector<int32_t> create_nccl_unique_id() {
+        return native_buffer_->create_nccl_unique_id();
+    }
+    void initialize_nccl_transport(const std::vector<int32_t>& unique_id,
+                                   int gin_context_count) {
+        native_buffer_->initialize_nccl_transport(unique_id, gin_context_count);
+    }
+    bool nccl_transport_enabled() const {
+        return native_buffer_->nccl_transport_enabled();
+    }
+#endif
 
    private:
     ElasticConfig config_;

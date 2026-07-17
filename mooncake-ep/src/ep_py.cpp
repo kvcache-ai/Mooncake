@@ -129,6 +129,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_ipc_handle", &MooncakeElasticBuffer::get_ipc_handle)
         .def("sync_nvlink_ipc_handles",
              &MooncakeElasticBuffer::sync_nvlink_ipc_handles)
+#ifdef USE_NCCL_DEVICE
+        .def("create_nccl_unique_id",
+             &MooncakeElasticBuffer::create_nccl_unique_id)
+        .def("initialize_nccl_transport",
+             &MooncakeElasticBuffer::initialize_nccl_transport)
+        .def("nccl_transport_enabled",
+             &MooncakeElasticBuffer::nccl_transport_enabled)
+#endif
         .def("dispatch", &MooncakeElasticBuffer::dispatch, py::arg("x"),
              py::arg("sf"), py::arg("topk_idx"), py::arg("topk_weights"),
              py::arg("active_ranks"), py::arg("num_experts"),

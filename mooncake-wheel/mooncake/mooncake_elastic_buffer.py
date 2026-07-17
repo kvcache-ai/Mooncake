@@ -187,6 +187,14 @@ class ElasticBuffer:
             num_cpu_timeout_secs,
             num_gpu_timeout_secs,
         )
+        self._use_nccl_device = _env_enabled("MOONCAKE_EP_USE_NCCL_DEVICE")
+        if self._use_nccl_device and not hasattr(
+            self.runtime, "initialize_nccl_transport"
+        ):
+            raise RuntimeError(
+                "MOONCAKE_EP_USE_NCCL_DEVICE requires an EP extension built "
+                "with USE_NCCL_DEVICE=ON"
+            )
         self._connect_native()
 
         torch.cuda.synchronize()
@@ -207,6 +215,23 @@ class ElasticBuffer:
 
     def _connect_native(self, is_update: bool = False) -> None:
         from mooncake import ep
+
+        if self._use_nccl_device:
+            if is_update:
+                raise RuntimeError("NCCL ElasticBuffer does not support member updates")
+            if not self.runtime.nccl_transport_enabled():
+                local_id = self.runtime.create_nccl_unique_id()
+                unique_id = torch.tensor(
+                    local_id if self.rank_idx == 0 else [0] * len(local_id),
+                    dtype=torch.int32,
+                    device="cuda",
+                )
+                dist.broadcast(unique_id, src=0, group=self.group)
+                contexts = int(os.getenv("MOONCAKE_EP_NCCL_GIN_CONTEXTS", "65"))
+                if contexts <= 0:
+                    raise RuntimeError("MOONCAKE_EP_NCCL_GIN_CONTEXTS must be positive")
+                self.runtime.initialize_nccl_transport(unique_id.tolist(), contexts)
+            return
 
         if not bool(self.runtime.ibgda_disabled()):
             raddr, rkey = self.runtime.get_mr_info()
