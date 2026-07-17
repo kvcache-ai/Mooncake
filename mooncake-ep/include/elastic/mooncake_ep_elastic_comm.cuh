@@ -108,6 +108,45 @@ __forceinline__ __device__ void mooncake_barrier_wo_local_sync(
 
 #ifdef USE_NCCL_DEVICE
     if (gin.ctx.use_nccl) {
+        if constexpr (std::is_same_v<team_t, transport::ScaleupTeam>) {
+            const int status = static_cast<int>(
+                (*workspace.get_nvl_barrier_counter_ptr(kTag)) & 3);
+            const int phase = status & 1;
+            const int sign = status >> 1;
+            const int* base_signal =
+                workspace.get_nvl_barrier_signal_ptr(kTag, phase);
+
+            if (thread_idx < kNumRanks) {
+                auto* dst_ptr = const_cast<int*>(base_signal) + rank_idx;
+                gin.red_add_rel<transport::ScaleupTeam>(
+                    dst_ptr, sign ? -1 : 1, thread_idx);
+            }
+            __syncthreads();
+
+            if (thread_idx == 0)
+                atomicAdd(workspace.get_nvl_barrier_counter_ptr(kTag), 1ULL);
+
+            timeout_while<kNumTimeoutCycles>(
+                thread_idx == 0, [=](const bool& is_last_check) {
+                    int sum = 0;
+#pragma unroll
+                    for (int i = 0; i < kNumRanks; ++i) {
+                        sum += ptx::ld_acquire_sys<int>(
+                            const_cast<int*>(base_signal) + i);
+                    }
+                    const auto target = sign ? 0 : kNumRanks;
+                    if (sum == target) return true;
+                    if (is_last_check) {
+                        printf(
+                            "NCCL LSA scaleup barrier timeout, tag: %d, "
+                            "rank: %d, signal-sum: %d, target: %d\n",
+                            kTag, rank_idx, sum, target);
+                    }
+                    return false;
+                });
+            return;
+        }
+
         // Each tag owns a monotonic receive counter in the symmetric workspace.
         // LSA peers update it with a system atomic and remote peers use a GIN
         // VA signal-add, so no CUDA IPC pointer or IBGDA atomic is involved.
