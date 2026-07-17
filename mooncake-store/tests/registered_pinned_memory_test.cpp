@@ -95,6 +95,30 @@ TEST(RegisteredPinnedMemoryManagerTest, OverlapAndDuplicateAreRejected) {
     EXPECT_EQ(State().unregister_calls, 2);
 }
 
+TEST(RegisteredPinnedMemoryManagerTest,
+     UnregisterFailureDropsTrackingAndRefunds) {
+    ResetState();
+    RegisteredPinnedMemoryManager manager({true, 32}, FakeOps());
+    std::array<char, 32> buffer{};
+
+    auto first = manager.try_pin(buffer.data(), 32, "first");
+    ASSERT_NE(first, nullptr);
+
+    State().unregister_result =
+        RegisteredPinnedMemoryManager::UnregisterResult::kError;
+    first.reset();
+    EXPECT_EQ(State().unregister_calls, 1);
+
+    State().unregister_result =
+        RegisteredPinnedMemoryManager::UnregisterResult::kSuccess;
+    auto second = manager.try_pin(buffer.data(), 32, "second");
+    ASSERT_NE(second, nullptr);
+    EXPECT_EQ(State().register_calls, 2);
+
+    second.reset();
+    EXPECT_EQ(State().unregister_calls, 2);
+}
+
 TEST(RegisteredPinnedMemoryManagerTest, RegisterFailureRefundsReservation) {
     ResetState();
     RegisteredPinnedMemoryManager manager({true, 32}, FakeOps());

@@ -247,10 +247,11 @@ std::shared_ptr<RegisteredPinnedRegion> RegisteredPinnedMemoryManager::try_pin(
         auto unregister_result =
             pin_ops_.unregister_region(addr, &error_message);
         if (unregister_result != UnregisterResult::kSuccess) {
-            LOG(FATAL) << "cudaHostUnregister failed after active range "
+            LOG(ERROR) << "cudaHostUnregister failed after active range "
                           "tracking mismatch for "
                        << owner << ", size=" << size
-                       << ", error=" << error_message;
+                       << ", error=" << error_message
+                       << ". Continue with best-effort cleanup.";
         }
         std::lock_guard<std::mutex> lock(mutex_);
         drop_reservation_locked(key, size);
@@ -279,15 +280,18 @@ void RegisteredPinnedMemoryManager::release(RegisteredPinnedRegion* region) {
     if (!pin_ops_.unregister_region) return;
     auto unregister_result =
         pin_ops_.unregister_region(region->addr_, &error_message);
+    // Treat CUDA unregistration as best-effort cleanup: drop manager state so
+    // stale raw tracking pointers do not outlive the Store segment owner.
     if (unregister_result != UnregisterResult::kSuccess) {
         if (unregister_result == UnregisterResult::kRuntimeUnloading) {
             LOG(WARNING) << "Skip cudaHostUnregister for " << region->owner_
                          << " because CUDA runtime is unloading, size="
                          << region->size_;
         } else {
-            LOG(FATAL) << "cudaHostUnregister failed for " << region->owner_
+            LOG(ERROR) << "cudaHostUnregister failed for " << region->owner_
                        << ", size=" << region->size_
-                       << ", error=" << error_message;
+                       << ", error=" << error_message
+                       << ". Continue with best-effort cleanup.";
         }
     }
 
