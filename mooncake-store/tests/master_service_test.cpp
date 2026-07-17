@@ -189,6 +189,14 @@ class MasterServiceTest : public ::testing::Test {
         return key;
     }
 
+    std::shared_ptr<ClientLivenessRecord> GetClientLivenessRecord(
+        MasterService& service, const UUID& client_id) const {
+        std::shared_lock<std::shared_mutex> lock(service.client_mutex_);
+        const auto it = service.client_liveness_records_.find(client_id);
+        return it == service.client_liveness_records_.end() ? nullptr
+                                                             : it->second;
+    }
+
     std::string FindGroupIdOnDifferentShard(const std::string& key) const {
         static constexpr size_t kMetadataShardCountForTest = 1024;
         const size_t key_shard =
@@ -341,6 +349,29 @@ TEST_F(MasterServiceTest, RemountEstablishesReadinessWithoutHeartbeatQueue) {
 
     ASSERT_TRUE(response.has_value());
     EXPECT_EQ(response->client_status, ClientStatus::OK);
+}
+
+TEST_F(MasterServiceTest, MemoryDescriptorFollowsClientLiveness) {
+    MasterService service;
+    constexpr std::string_view kSegmentName = "liveness_visibility_segment";
+    const auto context = PrepareSimpleSegment(service, std::string(kSegmentName));
+    const auto key = PutObjectOnSegment(service, generate_uuid(),
+                                        std::string(kSegmentName));
+
+    ASSERT_TRUE(service.GetReplicaList(key, "default").has_value());
+    auto record = GetClientLivenessRecord(service, context.client_id);
+    ASSERT_NE(record, nullptr);
+    ASSERT_EQ(record->Evaluate(ClientLivenessRecord::Clock::now(),
+                               ClientLivenessRecord::Clock::duration::zero(),
+                               std::chrono::seconds(60)),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+
+    auto hidden = service.GetReplicaList(key, "default");
+    ASSERT_FALSE(hidden.has_value());
+    EXPECT_EQ(hidden.error(), ErrorCode::REPLICA_IS_NOT_READY);
+
+    ASSERT_TRUE(service.Ping(context.client_id).has_value());
+    EXPECT_TRUE(service.GetReplicaList(key, "default").has_value());
 }
 
 TEST(TenantScopedStorageKeyTest, RoundTripsAndParsesLegacyKeys) {
@@ -5116,7 +5147,8 @@ TEST_F(MasterServiceTest, BatchQueryIpMixedIpv4AndIpv6Test) {
 TEST_F(MasterServiceTest,
        ClientLeaseExpiredCallbacksRunAfterResourceReclamation) {
     MasterServiceConfig config;
-    config.client_live_ttl_sec = 1;
+    config.client_active_ttl_sec = 1;
+    config.client_suspicion_ttl_sec = 1;
     auto service = std::make_unique<MasterService>(config);
 
     const UUID mounted_client_id = generate_uuid();

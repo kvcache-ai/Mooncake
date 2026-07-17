@@ -131,6 +131,19 @@ class MasterMetricManager {
     void dec_active_clients(int64_t val = 1);
     int64_t get_active_clients();
 
+    // Store Client liveness metrics. These are intentionally separate from
+    // active_clients_, whose existing meaning is ReMount readiness.
+    void client_liveness_record_created();
+    void client_liveness_became_suspected();
+    void client_liveness_recovered();
+    void client_liveness_became_offline();
+    void client_liveness_offline_record_removed();
+    void reset_client_liveness_metrics(int64_t active_records = 0);
+    void set_pending_client_offboarding_jobs(int64_t pending_jobs);
+    void inc_client_offboarding_failure();
+    void inc_client_offboarding_retry();
+    void observe_client_offboarding_duration_ms(int64_t duration_ms);
+
     // Snapshot Metrics
     void set_snapshot_duration_ms(int64_t size);
     void inc_snapshot_success();
@@ -549,6 +562,16 @@ class MasterMetricManager {
 
     // Cluster Metrics
     ylt::metric::gauge_t active_clients_;
+    ylt::metric::gauge_t client_liveness_active_clients_;
+    ylt::metric::gauge_t client_liveness_suspected_clients_;
+    ylt::metric::gauge_t client_liveness_offline_clients_;
+    ylt::metric::counter_t client_liveness_suspected_transitions_;
+    ylt::metric::counter_t client_liveness_recoveries_;
+    ylt::metric::counter_t client_liveness_offline_transitions_;
+    ylt::metric::gauge_t pending_client_offboarding_jobs_metric_;
+    ylt::metric::histogram_t client_offboarding_duration_ms_;
+    ylt::metric::counter_t client_offboarding_failures_;
+    ylt::metric::counter_t client_offboarding_retries_;
 
     // Operation Statistics
     ylt::metric::counter_t put_start_requests_;

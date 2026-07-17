@@ -306,6 +306,30 @@ class Replica {
 
     [[nodiscard]] Descriptor get_descriptor() const;
 
+    [[nodiscard]] bool getDescriptorIfAvailable(Descriptor& descriptor) const {
+        if (is_memory_replica()) {
+            const auto& data = std::get<MemoryReplicaData>(data_);
+            if (!data.buffer || !data.buffer->isAvailable()) {
+                return false;
+            }
+        } else if (is_nof_replica()) {
+            const auto& data = std::get<NoFReplicaData>(data_);
+            if (!data.buffer || !data.buffer->isAvailable()) {
+                return false;
+            }
+        }
+        descriptor = get_descriptor();
+        if (is_memory_replica()) {
+            return std::get<MemoryReplicaData>(data_)
+                .buffer->isAvailable();
+        }
+        if (is_nof_replica()) {
+            return std::get<NoFReplicaData>(data_)
+                .buffer->isAvailable();
+        }
+        return true;
+    }
+
     [[nodiscard]] ReplicaID id() const { return id_; }
 
     [[nodiscard]] ReplicaStatus status() const { return status_; }

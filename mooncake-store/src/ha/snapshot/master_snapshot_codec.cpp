@@ -74,6 +74,7 @@ tl::expected<void, SerializationError> MasterSnapshotCodec::Decode(
         if (!segments_result) {
             return tl::make_unexpected(segments_result.error());
         }
+        master_service->RebuildClientLivenessAfterRestore();
 
         // 2. Decode metadata (shards, discarded replicas, replica_next_id)
         auto metadata_result =

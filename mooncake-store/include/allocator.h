@@ -7,6 +7,7 @@
 #include <string>
 
 #include "cachelib_memory_allocator/MemoryAllocator.h"
+#include "client_liveness.h"
 #include "offset_allocator/offset_allocator.h"
 #include "types.h"
 
@@ -32,6 +33,23 @@ static constexpr size_t kAllocatorUnknownFreeSpace =
 
 // Forward declarations
 class BufferAllocatorBase;
+
+class SegmentLifetime {
+   public:
+    SegmentLifetime()
+        : available_(std::make_shared<std::atomic<bool>>(true)) {}
+
+    [[nodiscard]] bool isAvailable() const {
+        return available_->load(std::memory_order_acquire);
+    }
+
+    void setAvailable(bool available) const {
+        available_->store(available, std::memory_order_release);
+    }
+
+   private:
+    std::shared_ptr<std::atomic<bool>> available_;
+};
 
 class AllocatedBuffer {
    public:
@@ -61,8 +79,27 @@ class AllocatedBuffer {
     [[nodiscard]] std::size_t size() const noexcept { return this->size_; }
 
     [[nodiscard]] bool isAllocatorValid() const {
-        return !allocator_.expired();
+        return !allocator_.expired() && segment_lifetime_.isAvailable();
     }
+
+    [[nodiscard]] bool isClientServing() const {
+        return client_liveness_ && client_liveness_->IsServing();
+    }
+
+    [[nodiscard]] bool isAvailable() const {
+        return isAllocatorValid() && isClientServing();
+    }
+
+    void bindSegmentLifetime(SegmentLifetime lifetime) {
+        segment_lifetime_ = std::move(lifetime);
+    }
+
+    void bindClientLiveness(
+        std::shared_ptr<ClientLivenessRecord> client_liveness) {
+        client_liveness_ = std::move(client_liveness);
+    }
+
+    [[nodiscard]] bool getDescriptorIfAvailable(Descriptor& descriptor) const;
 
     // Serialize the buffer into a descriptor for transfer
     [[nodiscard]] Descriptor get_descriptor() const;
@@ -88,6 +125,8 @@ class AllocatedBuffer {
 
    private:
     std::weak_ptr<BufferAllocatorBase> allocator_;
+    SegmentLifetime segment_lifetime_;
+    std::shared_ptr<ClientLivenessRecord> client_liveness_;
     std::string segment_name_;
     void* buffer_ptr_{nullptr};
     std::size_t size_{0};

@@ -2831,6 +2831,25 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
             ErrorCode err = mount_result.error();
             LOG(ERROR) << "mount_segment_to_master_failed base=" << buffer
                        << " size=" << size << ", error=" << err;
+            // A Master application error proves the Segment was rejected.
+            // Roll back the TE registration made above. Transport failures
+            // are deliberately excluded because the request may have reached
+            // Master and committed despite the missing response.
+            const bool definitive_master_rejection =
+                err == ErrorCode::INVALID_PARAMS ||
+                err == ErrorCode::INTERNAL_ERROR ||
+                err == ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+            if (definitive_master_rejection) {
+                const int rollback_rc = transfer_engine_->unregisterLocalMemory(
+                    const_cast<void*>(buffer));
+                if (rollback_rc != 0 &&
+                    rollback_rc != ERR_ADDRESS_NOT_REGISTERED) {
+                    LOG(ERROR) << "mount_segment_registration_rollback_failed"
+                               << " base=" << buffer << " size=" << size
+                               << " error=" << rollback_rc
+                               << " original_master_error=" << err;
+                }
+            }
             return tl::unexpected(err);
         }
 

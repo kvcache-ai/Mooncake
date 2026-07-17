@@ -9,6 +9,7 @@
 #include <boost/functional/hash.hpp>
 
 #include "client_lifecycle_event.h"
+#include "master_metric_manager.h"
 #include "master_service.h"
 #include "segment.h"
 
@@ -55,7 +56,10 @@ bool ClientOffboardingWorker::Schedule(ClientOffboardingJob job) {
             return false;
         }
         jobs_.push_back(std::move(job));
-        pending_jobs_.fetch_add(1, std::memory_order_release);
+        const auto pending =
+            pending_jobs_.fetch_add(1, std::memory_order_release) + 1;
+        MasterMetricManager::instance().set_pending_client_offboarding_jobs(
+            static_cast<int64_t>(pending));
     }
     cv_.notify_one();
     return true;
@@ -115,6 +119,8 @@ void ClientOffboardingWorker::ThreadFunc() {
                         segment.metrics_dec_capacity);
                     if (err != ErrorCode::OK) {
                         completed = false;
+                        MasterMetricManager::instance()
+                            .inc_client_offboarding_failure();
                         LOG(ERROR)
                             << "client_id=" << job.client_id
                             << ", segment_name=" << segment.segment_name
@@ -165,14 +171,22 @@ void ClientOffboardingWorker::ThreadFunc() {
                 if (current != service_->client_liveness_records_.end() &&
                     current->second == job.liveness) {
                     service_->client_liveness_records_.erase(current);
+                    MasterMetricManager::instance()
+                        .client_liveness_offline_record_removed();
                 }
             }
 
-            pending_jobs_.fetch_sub(1, std::memory_order_release);
+            const auto pending =
+                pending_jobs_.fetch_sub(1, std::memory_order_release) - 1;
+            MasterMetricManager::instance()
+                .set_pending_client_offboarding_jobs(
+                    static_cast<int64_t>(pending));
             const auto duration_ms =
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - job.enqueued_at)
                     .count();
+            MasterMetricManager::instance()
+                .observe_client_offboarding_duration_ms(duration_ms);
             LOG(INFO) << "client_id=" << job.client_id
                       << ", action=client_offboarding_complete"
                       << ", duration_ms=" << duration_ms;

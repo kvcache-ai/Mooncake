@@ -70,6 +70,7 @@ class SnapshotChildProcessTest;
 // exposing test-only accessors on MasterService itself.
 class PromotionOnHitTest;
 class MasterServiceTenantQuotaTest;
+class MasterServiceTest;
 }  // namespace test
 namespace benchmarks {
 class BatchEvictBench;
@@ -100,6 +101,7 @@ class MasterService {
     friend class test::PromotionOnHitTest;
     friend class benchmarks::BatchEvictBench;
     friend class test::MasterServiceTenantQuotaTest;
+    friend class test::MasterServiceTest;
     friend class MasterSnapshotManager;    // Allow access to internal state for
                                            // snapshot
     friend class ClientOffboardingWorker;
@@ -807,6 +809,7 @@ class MasterService {
 
     // Restore master state
     void RestoreState();
+    void RebuildClientLivenessAfterRestore();
     void ResetStateAfterFailedRestoreAttempt();
 
     /**
@@ -1033,6 +1036,13 @@ class MasterService {
             return it != replicas_.end() ? &(*it) : nullptr;
         }
 
+        const Replica* GetFirstReplica(
+            const std::function<bool(const Replica&)>& pred_fn) const {
+            const auto it =
+                std::find_if(replicas_.begin(), replicas_.end(), pred_fn);
+            return it != replicas_.end() ? &(*it) : nullptr;
+        }
+
         Replica* GetReplicaByID(const ReplicaID& id) {
             return GetFirstReplica(
                 [&id](const Replica& replica) { return replica.id() == id; });
@@ -1079,6 +1089,17 @@ class MasterService {
                     }
                 }
                 return false;
+            });
+        }
+
+        const Replica* GetReplicaBySegmentName(
+            const std::string& segment_name) const {
+            return GetFirstReplica([&segment_name](const Replica& replica) {
+                const auto names = replica.get_segment_names();
+                return std::any_of(
+                    names.begin(), names.end(), [&](const auto& name_opt) {
+                        return name_opt == segment_name;
+                    });
             });
         }
 
@@ -1165,6 +1186,43 @@ class MasterService {
         // Use the accessors to visit and modify the replicas.
         std::vector<Replica> replicas_;
     };
+
+    class ClientServingReadView {
+       public:
+        explicit ClientServingReadView(const MasterService* service)
+            : service_(service), lock_(service->client_mutex_) {}
+
+        [[nodiscard]] bool IsServing(const UUID& client_id) const {
+            const auto it =
+                service_->client_liveness_records_.find(client_id);
+            return it != service_->client_liveness_records_.end() &&
+                   it->second->IsServing();
+        }
+
+        [[nodiscard]] std::shared_ptr<ClientLivenessRecord> FindRecord(
+            const UUID& client_id) const {
+            const auto it =
+                service_->client_liveness_records_.find(client_id);
+            return it == service_->client_liveness_records_.end()
+                       ? nullptr
+                       : it->second;
+        }
+
+       private:
+        const MasterService* service_;
+        std::shared_lock<std::shared_mutex> lock_;
+    };
+
+    [[nodiscard]] bool IsReplicaServing(
+        const Replica& replica,
+        const ClientServingReadView& clients) const;
+    [[nodiscard]] bool HasVisibleCompletedReplica(
+        const ObjectMetadata& metadata,
+        const ClientServingReadView& clients) const;
+    [[nodiscard]] std::vector<Replica::Descriptor>
+    GetVisibleReplicaDescriptors(
+        const ObjectMetadata& metadata,
+        const ClientServingReadView& clients) const;
 
     struct ReplicationTask {
         UUID client_id;

@@ -340,7 +340,7 @@ static AllocatorManager createCluster(int num_segments, size_t base_capacity,
         uint64_t base_addr = kPrimaryBaseAddr + (global_i * base_capacity);
         auto allocator = std::make_shared<OffsetBufferAllocator>(
             name, base_addr, capacity, name);
-        manager.addAllocator(name, allocator);
+        manager.addIndependentAllocator(name, allocator);
     }
     return manager;
 }
@@ -364,7 +364,7 @@ static std::vector<std::shared_ptr<BufferAllocatorBase>> injectNewSegments(
                              (static_cast<uint64_t>(id_offset + i) * capacity);
         auto allocator = std::make_shared<OffsetBufferAllocator>(
             name, base_addr, capacity, name);
-        manager.addAllocator(name, allocator);
+        manager.addIndependentAllocator(name, allocator);
         new_allocs.push_back(allocator);
     }
     return new_allocs;

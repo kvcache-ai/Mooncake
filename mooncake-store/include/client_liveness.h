@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <optional>
 #include <utility>
 
 namespace mooncake {
@@ -33,6 +34,21 @@ class ClientLivenessRecord {
     explicit ClientLivenessRecord(TimePoint initial_observation)
         : last_liveness_at_(initial_observation) {}
 
+    class ServingGuard {
+       public:
+        ServingGuard(const ServingGuard&) = delete;
+        ServingGuard& operator=(const ServingGuard&) = delete;
+        ServingGuard(ServingGuard&&) noexcept = default;
+        ServingGuard& operator=(ServingGuard&&) noexcept = default;
+
+       private:
+        friend class ClientLivenessRecord;
+        explicit ServingGuard(std::unique_lock<std::mutex>&& lock)
+            : lock_(std::move(lock)) {}
+
+        std::unique_lock<std::mutex> lock_;
+    };
+
     [[nodiscard]] ClientLivenessState state() const {
         return state_.load(std::memory_order_acquire);
     }
@@ -43,6 +59,15 @@ class ClientLivenessRecord {
 
     [[nodiscard]] bool ShouldRetainResources() const {
         return state() != ClientLivenessState::OFFLINE;
+    }
+
+    [[nodiscard]] std::optional<ServingGuard> TryAcquireServingGuard() {
+        std::unique_lock<std::mutex> lock(transition_mutex_);
+        if (state_.load(std::memory_order_relaxed) !=
+            ClientLivenessState::ACTIVE) {
+            return std::nullopt;
+        }
+        return ServingGuard(std::move(lock));
     }
 
     [[nodiscard]] ClientLivenessObservation Observe(TimePoint now) {
