@@ -23,7 +23,7 @@ constexpr int kElasticNumDispatchWarps = 8;
 constexpr int kElasticNumEpilogueWarps = 8;
 #endif
 constexpr int kElasticNumDirectLogicalQPs = 9;
-constexpr int kElasticNumHybridLogicalQPs = 65;
+constexpr int kElasticNumHybridLogicalQPs = 97;
 constexpr int64_t kElasticTimeoutCycles = NUM_TIMEOUT_CYCLES;
 
 inline int ceil_div(int x, int y) { return (x + y - 1) / y; }
@@ -637,6 +637,8 @@ void launch_mooncake_elastic_dispatch(
 #ifdef MOONCAKE_EP_ELASTIC_B300_PERF_SHAPES_ONLY
         TRY_HYBRID_DISPATCH_TYPED(7168, 256, 8, 128, 40, 2, 8, 4, 1,
                                   7168 / 128);
+        TRY_HYBRID_DISPATCH_TYPED(7168, 256, 8, 128, 128, 2, 8, 4, 1,
+                                  7168 / 128);
 #else
         TRY_HYBRID_DISPATCH_SHAPE(4096, 256, 8, 128, 24);
         TRY_HYBRID_DISPATCH_SHAPE(7168, 256, 8, 128, 24);
@@ -810,6 +812,8 @@ void launch_mooncake_elastic_dispatch_copy_epilogue(
 #ifdef MOONCAKE_EP_ELASTIC_B300_PERF_SHAPES_ONLY
         TRY_HYBRID_DISPATCH_EPILOGUE_TYPED(7168, 256, 8, 128, 40, 2, 8,
                                            4, 1, 7168 / 128);
+        TRY_HYBRID_DISPATCH_EPILOGUE_TYPED(7168, 256, 8, 128, 128, 2, 8,
+                                           4, 1, 7168 / 128);
 #else
         TRY_HYBRID_DISPATCH_EPILOGUE_SHAPE(4096, 256, 8, 128, 24);
         TRY_HYBRID_DISPATCH_EPILOGUE_SHAPE(7168, 256, 8, 128, 24);
@@ -947,6 +951,7 @@ void* launch_mooncake_elastic_combine(
 
 #ifdef MOONCAKE_EP_ELASTIC_B300_PERF_SHAPES_ONLY
         TRY_HYBRID_COMBINE(7168, 256, 8, 128, 40, 2, 8, 4);
+        TRY_HYBRID_COMBINE(7168, 256, 8, 128, 128, 2, 8, 4);
 #else
         TRY_HYBRID_COMBINE_SHAPE(4096, 256, 8, 128, 24);
         TRY_HYBRID_COMBINE_SHAPE(7168, 256, 8, 128, 24);
@@ -1041,6 +1046,7 @@ void launch_mooncake_elastic_combine_reduce_epilogue(
 #elif defined(MOONCAKE_EP_ELASTIC_B300_PERF_SHAPES_ONLY)
     TRY_COMBINE_EPILOGUE(7168, 256, 8, 128, 40, 1, 16);
     TRY_COMBINE_EPILOGUE(7168, 256, 8, 128, 40, 2, 8);
+    TRY_COMBINE_EPILOGUE(7168, 256, 8, 128, 128, 2, 8);
 #else
     TRY_COMBINE_EPILOGUE(4096, 256, 8, 128, 24, 1, 8);
     TRY_COMBINE_EPILOGUE(4096, 256, 8, 128, 24, 1, 2);

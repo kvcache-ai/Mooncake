@@ -16,7 +16,7 @@ int64_t ceil_div_i64(int64_t x, int64_t y) { return (x + y - 1) / y; }
 
 constexpr int kElasticDefaultPhysicalQpsPerRank = 32;
 constexpr int kElasticDirectLogicalQps = 9;
-constexpr int kElasticHybridLogicalQps = 65;
+constexpr int kElasticHybridLogicalQps = 97;
 
 int64_t align_i64(int64_t x, int64_t alignment) {
     return ceil_div_i64(x, alignment) * alignment;
