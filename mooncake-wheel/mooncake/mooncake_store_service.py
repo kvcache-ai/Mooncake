@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import json
 import logging
+import signal
 import time
 
 from aiohttp import web
@@ -31,6 +32,32 @@ def _shm_name_to_path(name):
     if not normalized or "/" in normalized or normalized in {".", ".."}:
         return None
     return f"/dev/shm/{normalized}"
+
+
+def _unblock_shutdown_signals():
+    try:
+        signal.pthread_sigmask(
+            signal.SIG_UNBLOCK, {signal.SIGINT, signal.SIGTERM}
+        )
+    except AttributeError:
+        pass
+
+
+def _install_shutdown_signal_handlers(loop, shutdown_event):
+    def request_shutdown(signum):
+        logging.info("Received signal %s, shutting down", signum)
+        shutdown_event.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, request_shutdown, sig)
+        except (NotImplementedError, RuntimeError):
+            signal.signal(
+                sig,
+                lambda signum, _frame: loop.call_soon_threadsafe(
+                    request_shutdown, signum
+                ),
+            )
 
 
 class MooncakeStoreService:
@@ -94,12 +121,15 @@ class MooncakeStoreService:
             format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         )
 
-    async def start_store_service(self, max_wait_time: float = 60):
+    async def start_store_service(
+        self, max_wait_time: float = 60, shutdown_event=None
+    ):
         """
         Start the store service with retry mechanism.
 
         Args:
             max_wait_time: Maximum total wait time in seconds (default: 60)
+            shutdown_event: Optional asyncio event used to cancel startup
 
         Returns:
             True if successful, False otherwise
@@ -108,7 +138,15 @@ class MooncakeStoreService:
         retry_interval = 1.0  # Fixed retry interval: 1 second
         start_time = time.perf_counter()
 
+        if shutdown_event is not None:
+            # Process any signal callback queued immediately before startup.
+            await asyncio.sleep(0)
+
         while True:
+            if shutdown_event is not None and shutdown_event.is_set():
+                logging.info("Store startup cancelled by shutdown request")
+                return False
+
             elapsed = time.perf_counter() - start_time
             if elapsed >= max_wait_time:
                 logging.error(
@@ -143,6 +181,17 @@ class MooncakeStoreService:
                     }
                 )
 
+                if shutdown_event is not None:
+                    # setup() is synchronous. Give asyncio signal callbacks a
+                    # chance to publish a shutdown requested while it ran.
+                    await asyncio.sleep(0)
+                    if shutdown_event.is_set():
+                        logging.info(
+                            "Store startup cancelled by shutdown request"
+                        )
+                        await self.stop()
+                        return False
+
                 if ret != 0:
                     raise RuntimeError("Store initialization failed")
 
@@ -168,7 +217,20 @@ class MooncakeStoreService:
 
                 # Wait before retry, but don't exceed max_wait_time
                 if actual_sleep_time > 0:
-                    await asyncio.sleep(actual_sleep_time)
+                    if shutdown_event is not None:
+                        try:
+                            await asyncio.wait_for(
+                                shutdown_event.wait(),
+                                timeout=actual_sleep_time,
+                            )
+                            logging.info(
+                                "Store startup cancelled by shutdown request"
+                            )
+                            return False
+                        except asyncio.TimeoutError:
+                            pass
+                    else:
+                        await asyncio.sleep(actual_sleep_time)
 
     async def start_http_service(self, port: int = 8080):
         app = web.Application(client_max_size=1024 * 1024 * 100)  # 100MB limit
@@ -667,8 +729,12 @@ class MooncakeStoreService:
 
     async def stop(self):
         if self.store:
-            self.store.close()
-            logging.info("Mooncake service stopped")
+            ret = self.store.close()
+            self.store = None
+            if ret != 0:
+                logging.warning("Mooncake service close returned %s", ret)
+            else:
+                logging.info("Mooncake service stopped")
 
 
 def parse_arguments():
@@ -713,25 +779,39 @@ async def main():
             logging.warning(f"Ignoring invalid CLI config: {item}")
 
     service = MooncakeStoreService(args.config, cli_config)
+    shutdown_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    _install_shutdown_signal_handlers(loop, shutdown_event)
+    _unblock_shutdown_signals()
 
     try:
-        if not await service.start_store_service(max_wait_time=args.max_wait_time):
+        if not await service.start_store_service(
+            max_wait_time=args.max_wait_time,
+            shutdown_event=shutdown_event,
+        ):
+            if shutdown_event.is_set():
+                return
             raise RuntimeError("Failed to start store service")
+
+        _unblock_shutdown_signals()
+        await asyncio.sleep(0)
+        if shutdown_event.is_set():
+            return
 
         if not await service.start_http_service(args.port):
             raise RuntimeError("Failed to start HTTP service")
 
-        logging.info("Mooncake Store Service is running. Press Ctrl+C to stop.")
-        while True:
-            await asyncio.sleep(1)
+        logging.info("Mooncake Store Service is running")
+        await shutdown_event.wait()
 
     except KeyboardInterrupt:
-        logging.info("Received shutdown signal")
-        await service.stop()
+        logging.info("Received keyboard interrupt, shutting down")
     except Exception as e:
         logging.error("Service error: %s", e)
-        await service.stop()
         raise
+    finally:
+        await service.stop()
 
 
 def sync_main():

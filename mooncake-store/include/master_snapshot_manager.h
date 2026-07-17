@@ -101,12 +101,6 @@ class MasterSnapshotManager {
     GetSnapshotBoundaryOpLogStore() const;
 #endif
 
-    tl::expected<void, SerializationError> UploadSnapshotPayloadFile(
-        const std::vector<uint8_t>& data, const std::string& path,
-        const std::string& local_filename, const std::string& snapshot_id);
-
-    void CleanupOldSnapshot(size_t keep_count, const std::string& snapshot_id);
-
     std::string FormatTimestamp(
         const std::chrono::system_clock::time_point& tp);
 

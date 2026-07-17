@@ -14,6 +14,7 @@
 
 #include "config.h"
 
+#include <charconv>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -391,6 +392,31 @@ void loadGlobalConfig(GlobalConfig& config) {
         else
             LOG(WARNING)
                 << "Ignore value from environment variable MC_SLICE_TIMEOUT";
+    }
+
+    const char* conn_pause_ttl_env = std::getenv("MC_CONN_PAUSE_TTL_MS");
+    if (conn_pause_ttl_env) {
+        // Robust parse (not atoi): a non-numeric typo must keep the default
+        // rather than silently resolve to 0. 0 is a valid explicit "disable";
+        // negative / out-of-range / garbage are rejected, preserving the
+        // default.
+        int val = 0;
+        const char* end = conn_pause_ttl_env + strlen(conn_pause_ttl_env);
+        auto [ptr, ec] = std::from_chars(conn_pause_ttl_env, end, val);
+        if (ec == std::errc() && ptr == end) {
+            if (val >= 0 && val <= 600000) {
+                config.conn_pause_ttl_ms = val;
+            } else {
+                LOG(WARNING) << "Ignore value from environment variable "
+                                "MC_CONN_PAUSE_TTL_MS, value "
+                             << conn_pause_ttl_env
+                             << " out of range (should be 0-600000)";
+            }
+        } else {
+            LOG(WARNING) << "Invalid MC_CONN_PAUSE_TTL_MS environment value: "
+                         << conn_pause_ttl_env
+                         << ". Expected an integer in range 0-600000";
+        }
     }
 
     const char* log_dir_path = std::getenv("MC_LOG_DIR");
