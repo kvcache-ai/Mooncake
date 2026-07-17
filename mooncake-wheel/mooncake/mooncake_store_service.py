@@ -236,9 +236,17 @@ class MooncakeStoreService:
                     # dropping all capacity.
                     previous_segment_ids = list(self.mounted_segment_ids)
                     previous_path = self.last_mount_info.get("path")
-                    # Remounting the *same* path before unmounting would collide
-                    # (SEGMENT_ALREADY_EXISTS), so the same-path case must stay
-                    # destroy-first; a distinct path can mount-then-destroy.
+                    # Same-path remount stays destroy-first. The standard
+                    # allocator wouldn't actually collide here: mountSegment
+                    # mints a fresh UUID per mount and the duplicate check is
+                    # UUID-keyed (segment.cpp:161), so the old "same path ->
+                    # SEGMENT_ALREADY_EXISTS" rationale was wrong for it. The
+                    # real restriction is the NoF path: segment.cpp:1249-1259
+                    # treats the same transport endpoint (te_endpoint) as the
+                    # same namespace even with a new UUID, so a same-endpoint
+                    # make-before-break WOULD collide. Destroy-first is kept to
+                    # stay correct across both allocators; a distinct path can
+                    # mount-then-destroy.
                     same_segment = (
                         bool(previous_segment_ids)
                         and previous_path is not None
