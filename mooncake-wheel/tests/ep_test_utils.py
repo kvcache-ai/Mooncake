@@ -17,9 +17,13 @@ def init_dist(local_rank: int, num_local_ranks: int):
     assert (num_local_ranks < 8 and num_nodes == 1) or num_local_ranks == 8
 
     torch.cuda.set_device(local_rank)
-    pg.set_host_ip("10.12.11.242")
+    use_nccl_device = os.getenv('MOONCAKE_EP_USE_NCCL_DEVICE', '').upper() in {
+        '1', 'ON', 'TRUE', 'YES'
+    }
+    if not use_nccl_device:
+        pg.set_host_ip(os.getenv('MOONCAKE_EP_HOST_IP', '10.12.11.242'))
     dist.init_process_group(
-        backend='mooncake',
+        backend='nccl' if use_nccl_device else 'mooncake',
         init_method=f'tcp://{ip}:{port}',
         world_size=num_nodes * num_local_ranks,
         rank=node_rank * num_local_ranks + local_rank
@@ -27,7 +31,11 @@ def init_dist(local_rank: int, num_local_ranks: int):
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device('cuda')
 
-    return dist.get_rank(), dist.get_world_size(), dist.new_group(list(range(num_local_ranks * num_nodes))), dist.new_group(list(range(num_local_ranks * num_nodes)), backend="mooncake-cpu")
+    ranks = list(range(num_local_ranks * num_nodes))
+    group = dist.group.WORLD if use_nccl_device else dist.new_group(ranks)
+    cpu_backend = 'gloo' if use_nccl_device else 'mooncake-cpu'
+    cpu_group = dist.new_group(ranks, backend=cpu_backend)
+    return dist.get_rank(), dist.get_world_size(), group, cpu_group
 
 
 def calc_diff(x: torch.Tensor, y: torch.Tensor):
