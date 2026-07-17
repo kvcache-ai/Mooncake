@@ -301,11 +301,13 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         # subsequent same-path detection keeps working.
         self.assertEqual(self.service.last_mount_info["path"], "/dev/shm/old")
 
-    async def test_reconfigure_decode_same_path_remount_falls_back_to_prefill(self):
-        # Remounting the SAME path stays destroy-first (to avoid a
-        # SEGMENT_ALREADY_EXISTS collision): the old segment is unmounted first,
-        # so a subsequent mount failure has nothing to fall back to and the node
-        # rolls back to prefill exactly as before.
+    async def test_reconfigure_decode_same_path_remount_failure_keeps_previous_segments(self):
+        # A remount to the SAME path that fails to mount must not destroy the
+        # still-healthy previous segments: the node keeps serving from them and
+        # stays in decode mode (make-before-break). Same-path MBB is safe here
+        # because /api/reconfigure binds through MasterClient::MountSegment,
+        # which mints a fresh UUID per mount and does not enter the NoF
+        # te_endpoint-dedup path, so old and new cannot collide on the same path.
         old_id = "00000000-0000-0000-0000-000000000001"
         self.service.current_mode = "decode"
         self.service.mounted_segment_ids = [old_id]
@@ -324,11 +326,15 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(resp.status, 500)
         body = json.loads(resp.text)
-        self.assertEqual(body["mode"], "prefill")
-        self.assertIn("rolled back to prefill", body["error"])
-        self.assertEqual(self.fake_store.unmount_calls, [([old_id], 0)])
-        self.assertEqual(self.service.mounted_segment_ids, [])
-        self.assertEqual(self.service.current_mode, "prefill")
+        self.assertEqual(body["mode"], "decode")
+        self.assertIn("keeping previous decode segments", body["error"])
+        # Nothing was unmounted, capacity preserved, mode unchanged.
+        self.assertEqual(self.fake_store.unmount_calls, [])
+        self.assertEqual(self.service.mounted_segment_ids, [old_id])
+        self.assertEqual(self.service.current_mode, "decode")
+        # last_mount_info still points at the previous (working) same path so a
+        # subsequent remount keeps working.
+        self.assertEqual(self.service.last_mount_info["path"], "/dev/shm/same")
 
     async def test_reconfigure_decode_remount_success_is_make_before_break(self):
         # A successful remount to a DIFFERENT path must mount the new segment

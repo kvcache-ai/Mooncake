@@ -235,43 +235,19 @@ class MooncakeStoreService:
                     # segments so a failed remount can keep them alive instead of
                     # dropping all capacity.
                     previous_segment_ids = list(self.mounted_segment_ids)
-                    previous_path = self.last_mount_info.get("path")
-                    # Same-path remount stays destroy-first. The standard
-                    # allocator wouldn't actually collide here: mountSegment
-                    # mints a fresh UUID per mount and the duplicate check is
-                    # UUID-keyed (segment.cpp:161), so the old "same path ->
-                    # SEGMENT_ALREADY_EXISTS" rationale was wrong for it. The
-                    # real restriction is the NoF path: segment.cpp:1249-1259
-                    # treats the same transport endpoint (te_endpoint) as the
-                    # same namespace even with a new UUID, so a same-endpoint
-                    # make-before-break WOULD collide. Destroy-first is kept to
-                    # stay correct across both allocators; a distinct path can
-                    # mount-then-destroy.
-                    same_segment = (
-                        bool(previous_segment_ids)
-                        and previous_path is not None
-                        and path == previous_path
-                    )
-
-                    if same_segment:
-                        logging.info(
-                            "Reconfigure decode: unmounting previous segments "
-                            "before same-path remount"
-                        )
-                        ret = self.store.unmount_segment(previous_segment_ids)
-                        if ret != 0:
-                            return web.Response(
-                                status=500,
-                                text=json.dumps(
-                                    {
-                                        "error": f"Unmount of previous segments failed, ret={ret}"
-                                    }
-                                ),
-                                content_type="application/json",
-                            )
-                        self.mounted_segment_ids.clear()
-                        previous_segment_ids = []
-
+                    # /api/reconfigure binds through store.mount_segment ->
+                    # MooncakeDistributedStore.mount_segment -> RealClient::mountSegment
+                    # -> Client::MountSegmentAndGetId -> MasterClient::MountSegment,
+                    # the standard allocator path: each mount mints a fresh UUID
+                    # and the duplicate check is UUID-keyed. That path never calls
+                    # MountNoFSegment or enters ScopedNoFSegmentAccess, so the NoF
+                    # te_endpoint dedup restriction does not apply here even in a
+                    # USE_NOF build. A same-path make-before-break therefore cannot
+                    # collide, and the old and new segments can coexist; keeping
+                    # the old segments live across a failed replacement mount
+                    # preserves decode capacity (the bug this PR fixes). Mount the
+                    # new segment first, and only retire the previous segments
+                    # per-id once the new mount succeeds.
                     result = self.store.mount_segment(
                         path, size, offset, protocol, location
                     )
