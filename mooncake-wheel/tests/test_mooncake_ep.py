@@ -169,7 +169,8 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
 # noinspection PyUnboundLocalVariable
 def test_loop(local_rank: int, num_local_ranks: int):
     rank, num_ranks, group, cpu_group = init_dist(local_rank, num_local_ranks)
-    num_tokens, hidden, num_topk, num_experts = 1280, 7168, 8, 288
+    num_tokens = int(os.getenv("MOONCAKE_EP_NUM_TOKENS", "80"))
+    hidden, num_topk, num_experts = 7168, 8, 288
 
     num_ep_buffer_bytes = Buffer.get_ep_buffer_size_hint(num_tokens, hidden, num_ranks, num_experts)
     if local_rank == 0:
