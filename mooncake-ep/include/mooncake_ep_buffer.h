@@ -89,6 +89,9 @@ struct MooncakeEpBuffer {
     int phase_epochs[2]{};
     int64_t num_ep_buffer_bytes;
     void* gdr_buffer = nullptr;
+#ifdef USE_NCCL_DEVICE
+    bool gdr_buffer_owned_by_nccl_ = false;
+#endif
 
     // Device transports — own all platform-specific state.
     // p2p_transport_: NVLink intra-node P2P.
