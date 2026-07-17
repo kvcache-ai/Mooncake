@@ -1,6 +1,7 @@
 // clang-format off
 
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -362,8 +363,9 @@ void launch_musa_elastic_prepare_dispatch(
 #endif
 
 template <typename Kernel, typename... Args>
-void launch_cooperative(Kernel kernel, int num_sms, int num_threads,
-                        int smem_bytes, cudaStream_t stream, Args... args) {
+void launch_cooperative_impl(Kernel kernel, int num_sms, int num_threads,
+                             int smem_bytes, cudaStream_t stream,
+                             bool cluster_dim_two, Args... args) {
 #ifndef MOONCAKE_EP_USE_MUSA
     CUDA_CHECK(cudaFuncSetAttribute(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
@@ -375,13 +377,37 @@ void launch_cooperative(Kernel kernel, int num_sms, int num_threads,
     cudaLaunchConfig_t cfg = {{num_sms, 1, 1}, {num_threads, 1, 1},
                               static_cast<unsigned int>(smem_bytes), stream,
                               nullptr, 0};
-    cudaLaunchAttribute attr[1];
+    cudaLaunchAttribute attr[2];
     attr[0].id = cudaLaunchAttributeCooperative;
     attr[0].val.cooperative = 1;
     cfg.attrs = attr;
     cfg.numAttrs = 1;
+    if (cluster_dim_two && num_sms % 2 == 0) {
+        attr[1].id = cudaLaunchAttributeClusterDimension;
+        attr[1].val.clusterDim = {2, 1, 1};
+        cfg.numAttrs = 2;
+    }
     CUDA_RUNTIME_CHECK(cudaLaunchKernelEx(&cfg, kernel, args...));
 #endif
+}
+
+template <typename Kernel, typename... Args>
+void launch_cooperative(Kernel kernel, int num_sms, int num_threads,
+                        int smem_bytes, cudaStream_t stream, Args... args) {
+    launch_cooperative_impl(kernel, num_sms, num_threads, smem_bytes, stream,
+                            false, args...);
+}
+
+template <typename Kernel, typename... Args>
+void launch_cooperative_main(Kernel kernel, int num_sms, int num_threads,
+                             int smem_bytes, cudaStream_t stream, Args... args) {
+    static const bool cluster_dim_two = [] {
+        const char* value =
+            std::getenv("MOONCAKE_EP_ELASTIC_CLUSTER_DIM2");
+        return value != nullptr && std::atoi(value) != 0;
+    }();
+    launch_cooperative_impl(kernel, num_sms, num_threads, smem_bytes, stream,
+                            cluster_dim_two, args...);
 }
 
 [[noreturn]] void unsupported_elastic_config(const char* op, int hidden,
@@ -509,7 +535,7 @@ void launch_mooncake_elastic_dispatch(
                     false, true, S, 0, C, C, SO, SU, kHiddenBytes,             \
                     kNumSFPacks, M, E, K, 1, kElasticNumHybridLogicalQPs,      \
                     kElasticTimeoutCycles>;                                    \
-                launch_cooperative(kernel, S, hybrid_threads,                  \
+                launch_cooperative_main(kernel, S, hybrid_threads,             \
                                    hybrid_smem_bytes, stream, x,               \
                                    static_cast<sf_pack_t*>(sf), topk_idx,      \
                                    topk_weights, copied_topk_idx,              \
@@ -529,7 +555,7 @@ void launch_mooncake_elastic_dispatch(
                     C, C, SO, SU, kHiddenBytes, kNumSFPacks, M, E, K, 1,       \
                     kElasticNumHybridLogicalQPs,                               \
                     kElasticTimeoutCycles>;                                    \
-                launch_cooperative(kernel, S, hybrid_threads,                  \
+                launch_cooperative_main(kernel, S, hybrid_threads,             \
                                    hybrid_smem_bytes, stream, x,               \
                                    static_cast<sf_pack_t*>(sf), topk_idx,      \
                                    topk_weights, copied_topk_idx,              \
@@ -549,7 +575,7 @@ void launch_mooncake_elastic_dispatch(
                     C, C, SO, SU, kHiddenBytes, kNumSFPacks, M, E, K, 1,       \
                     kElasticNumHybridLogicalQPs,                               \
                     kElasticTimeoutCycles>;                                    \
-                launch_cooperative(kernel, S, hybrid_threads,                  \
+                launch_cooperative_main(kernel, S, hybrid_threads,             \
                                    hybrid_smem_bytes, stream, x,               \
                                    static_cast<sf_pack_t*>(sf), topk_idx,      \
                                    topk_weights, copied_topk_idx,              \
@@ -611,7 +637,7 @@ void launch_mooncake_elastic_dispatch(
                 kHiddenBytes, kNumSFPacks, M, E, K, 1,                        \
                 kElasticNumDirectLogicalQPs,                                  \
                 kElasticTimeoutCycles>;                                        \
-            launch_cooperative(kernel, S, num_threads, smem_bytes, stream, x,  \
+            launch_cooperative_main(kernel, S, num_threads, smem_bytes, stream, x, \
                                static_cast<sf_pack_t*>(sf), topk_idx,          \
                                topk_weights, copied_topk_idx,                  \
                                cumulative_local_expert_recv_stats,             \
@@ -626,7 +652,7 @@ void launch_mooncake_elastic_dispatch(
                 true, false, true, S, kElasticNumNotifyWarps,                  \
                 kElasticNumDispatchWarps, R, kHiddenBytes, kNumSFPacks, M, E, K, 1, \
                 kElasticNumDirectLogicalQPs, kElasticTimeoutCycles>;          \
-            launch_cooperative(kernel, S, num_threads, smem_bytes, stream, x,  \
+            launch_cooperative_main(kernel, S, num_threads, smem_bytes, stream, x, \
                                static_cast<sf_pack_t*>(sf), topk_idx,          \
                                topk_weights, copied_topk_idx,                  \
                                cumulative_local_expert_recv_stats,             \
@@ -641,7 +667,7 @@ void launch_mooncake_elastic_dispatch(
                 true, false, false, S, kElasticNumNotifyWarps,                 \
                 kElasticNumDispatchWarps, R, kHiddenBytes, kNumSFPacks, M, E, K, 1, \
                 kElasticNumDirectLogicalQPs, kElasticTimeoutCycles>;          \
-            launch_cooperative(kernel, S, num_threads, smem_bytes, stream, x,  \
+            launch_cooperative_main(kernel, S, num_threads, smem_bytes, stream, x, \
                                static_cast<sf_pack_t*>(sf), topk_idx,          \
                                topk_weights, copied_topk_idx,                  \
                                cumulative_local_expert_recv_stats,             \
@@ -854,7 +880,7 @@ void* launch_mooncake_elastic_combine(
             auto kernel = elastic::hybrid_combine_impl<                        \
                 false, true, S, C, C, SO, SU, H, M, E, K,                     \
                 kElasticNumHybridLogicalQPs, kElasticTimeoutCycles>;           \
-            launch_cooperative(kernel, S, hybrid_threads, hybrid_smem_bytes,   \
+            launch_cooperative_main(kernel, S, hybrid_threads, hybrid_smem_bytes, \
                                stream, static_cast<nv_bfloat16*>(x),           \
                                topk_weights, src_metadata,                     \
                                psum_num_recv_tokens_per_scaleup_rank,          \
@@ -902,7 +928,7 @@ void* launch_mooncake_elastic_combine(
             kElasticNumEpilogueWarps, R, H, M, E, K,                           \
             kElasticNumDirectLogicalQPs,                                       \
             kElasticTimeoutCycles>;                                           \
-        launch_cooperative(kernel, S, num_threads, smem_bytes, stream,         \
+        launch_cooperative_main(kernel, S, num_threads, smem_bytes, stream,    \
                            static_cast<nv_bfloat16*>(x), topk_weights,         \
                            src_metadata, psum_num_recv_tokens_per_scaleup_rank,\
                            comm_ctx, ctx.buffer, ctx.workspace,                \
