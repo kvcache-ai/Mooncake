@@ -83,6 +83,8 @@ class WorkerPool {
 
     void refreshPublishedLocalTopology();
     GidRefreshResult refreshPublishedLocalGid();
+    bool handleContextEvent(ibv_event_type event_type, bool injected_for_test,
+                            struct ibv_async_event *event = nullptr);
     void scheduleContextRecovery(uint64_t delay_ns = kContextRecoveryDelayNs);
     void maybeActivateRecoveredContext();
     bool hasAvailablePeerRailAlternative(Transport::Slice *slice,
@@ -163,8 +165,7 @@ class WorkerPool {
     std::mutex rail_state_lock_;
 
     // Rail monitor configuration
-    const static int kRailErrorThreshold = 5;             // Errors before pause
-    const static uint64_t kRailPauseNs = 30000000000ull;  // 30 second pause
+    const static int kRailErrorThreshold = 5;  // Errors before pause
     const static uint64_t kContextRecoveryDelayNs =
         30000000000ull;  // 30 seconds before a recovered local RNIC is reused
 

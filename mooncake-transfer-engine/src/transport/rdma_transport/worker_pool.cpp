@@ -957,11 +957,32 @@ int WorkerPool::doProcessContextEvents() {
          * endpoint.
          */
         context_.deleteEndpointByPtr(endpoint_ptr);
-    } else if (event.event_type == IBV_EVENT_DEVICE_FATAL ||
-               event.event_type == IBV_EVENT_CQ_ERR ||
-               event.event_type == IBV_EVENT_WQ_FATAL ||
-               event.event_type == IBV_EVENT_PORT_ERR ||
-               event.event_type == IBV_EVENT_LID_CHANGE) {
+    } else if (handleContextEvent(event.event_type, false, &event)) {
+        event_acked = true;
+    }
+
+    if (!event_acked) {
+        ibv_ack_async_event(&event);
+    }
+
+    return 0;
+}
+
+void WorkerPool::processContextEventForTest(ibv_event_type event_type) {
+    LOG(WARNING) << "Worker: Injected context async event "
+                 << ibv_event_type_str(event_type) << " for context "
+                 << context_.deviceName();
+
+    handleContextEvent(event_type, true);
+}
+
+bool WorkerPool::handleContextEvent(ibv_event_type event_type,
+                                    bool injected_for_test,
+                                    struct ibv_async_event *event) {
+    if (event_type == IBV_EVENT_DEVICE_FATAL ||
+        event_type == IBV_EVENT_CQ_ERR || event_type == IBV_EVENT_WQ_FATAL ||
+        event_type == IBV_EVENT_PORT_ERR ||
+        event_type == IBV_EVENT_LID_CHANGE) {
         recovery_activate_after_ns_.store(0, std::memory_order_relaxed);
         context_.set_active(false);
         refreshPublishedLocalTopology();
@@ -978,69 +999,38 @@ int WorkerPool::doProcessContextEvents() {
          *     Calling endpoint->disconnect(), which blocks as endpoint->lock_
          * is held by Thread A.
          */
-        ibv_ack_async_event(&event);
-        event_acked = true;
+        if (event != nullptr) ibv_ack_async_event(event);
 
         context_.disconnectAllEndpoints();
         LOG(INFO) << "Worker: Context " << context_.deviceName()
-                  << " is now inactive due to fatal event: "
-                  << event.event_type;
-    } else if (event.event_type == IBV_EVENT_GID_CHANGE) {
-        auto gid_refresh_result = refreshPublishedLocalGid();
-        ibv_ack_async_event(&event);
-        event_acked = true;
-
-        if (gid_refresh_result != GidRefreshResult::UNCHANGED) {
-            context_.disconnectAllEndpoints();
-            LOG(INFO) << "Worker: Context " << context_.deviceName()
-                      << " GID refresh result="
-                      << static_cast<int>(gid_refresh_result)
-                      << ", disconnected all endpoints";
-        }
-    } else if (event.event_type == IBV_EVENT_PORT_ACTIVE) {
-        // PORT_ACTIVE only means the link started coming back. Real mlx5/RoCE
-        // data path can still reject RTR for a while after link-up, so delay
-        // publishing this local RNIC back to metadata.
-        scheduleContextRecovery();
-    }
-
-    if (!event_acked) {
-        ibv_ack_async_event(&event);
-    }
-
-    return 0;
-}
-
-void WorkerPool::processContextEventForTest(ibv_event_type event_type) {
-    LOG(WARNING) << "Worker: Injected context async event "
-                 << ibv_event_type_str(event_type) << " for context "
-                 << context_.deviceName();
-
-    if (event_type == IBV_EVENT_DEVICE_FATAL ||
-        event_type == IBV_EVENT_CQ_ERR || event_type == IBV_EVENT_WQ_FATAL ||
-        event_type == IBV_EVENT_PORT_ERR ||
-        event_type == IBV_EVENT_LID_CHANGE) {
-        recovery_activate_after_ns_.store(0, std::memory_order_relaxed);
-        context_.set_active(false);
-        refreshPublishedLocalTopology();
-        context_.disconnectAllEndpoints();
-        LOG(INFO) << "Worker: Context " << context_.deviceName()
-                  << " is now inactive due to injected fatal event: "
+                  << " is now inactive due to "
+                  << (injected_for_test ? "injected fatal event: "
+                                        : "fatal event: ")
                   << event_type;
     } else if (event_type == IBV_EVENT_GID_CHANGE) {
         auto gid_refresh_result = refreshPublishedLocalGid();
+        if (event != nullptr) ibv_ack_async_event(event);
+
         if (gid_refresh_result != GidRefreshResult::UNCHANGED) {
             context_.disconnectAllEndpoints();
             LOG(INFO) << "Worker: Context " << context_.deviceName()
-                      << " injected GID refresh result="
+                      << (injected_for_test ? " injected GID refresh result="
+                                            : " GID refresh result=")
                       << static_cast<int>(gid_refresh_result)
                       << ", disconnected all endpoints";
         }
     } else if (event_type == IBV_EVENT_PORT_ACTIVE) {
-        // Match the real async-event path: injected recovery also waits before
-        // re-enabling the local RNIC.
+        // PORT_ACTIVE only means the link started coming back. Real mlx5/RoCE
+        // data path can still reject RTR for a while after link-up, so delay
+        // publishing this local RNIC back to metadata. Injected tests follow
+        // the same path.
         scheduleContextRecovery();
+        if (event != nullptr) ibv_ack_async_event(event);
+    } else {
+        return false;
     }
+
+    return true;
 }
 
 void WorkerPool::scheduleContextRecovery(uint64_t delay_ns) {
@@ -1308,10 +1298,12 @@ void WorkerPool::markRailFailed(const std::string &peer_nic_path,
         state.error_count = kRailErrorThreshold;
     }
     if (state.error_count >= kRailErrorThreshold) {
-        state.pause_until_ns = now + kRailPauseNs;
+        const uint64_t rail_pause_ns =
+            globalConfig().rdma_rail_pause_seconds * 1000000000ull;
+        state.pause_until_ns = now + rail_pause_ns;
         LOG(WARNING) << "Rail paused: peer=" << peer_nic_path
                      << " error_count=" << state.error_count
-                     << " pause_ms=" << kRailPauseNs / 1000000ull;
+                     << " pause_ms=" << rail_pause_ns / 1000000ull;
     }
 }
 
