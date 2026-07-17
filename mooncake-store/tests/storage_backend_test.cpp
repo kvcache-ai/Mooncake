@@ -3786,6 +3786,90 @@ TEST_F(StorageBackendTest,
 //-----------------------------------------------------------------------------
 
 TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_Eviction_NotificationFailureRollback) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.storage_backend_type = StorageBackendType::kOffsetAllocator;
+    config.total_size_limit = 8 * 1024;
+    config.total_keys_limit = 100;
+
+    OffsetAllocatorBackendConfig evict_cfg;
+    evict_cfg.eviction_policy = OffsetEvictionPolicy::FIFO;
+    evict_cfg.high_watermark_bytes = 3500;
+    evict_cfg.low_watermark_bytes = 2100;
+
+    OffsetAllocatorStorageBackend storage_backend(config, evict_cfg);
+    ASSERT_TRUE(storage_backend.Init());
+
+    auto complete_handler = [](const std::vector<std::string>&,
+                               std::vector<StorageObjectMetadata>&) {
+        return ErrorCode::OK;
+    };
+    auto successful_eviction_handler =
+        [](const std::vector<std::string>&) -> tl::expected<void, ErrorCode> {
+        return {};
+    };
+
+    std::string data(1000, 'x');
+    std::vector<std::unique_ptr<char[]>> buffers;
+    for (const auto& key : {"key_a", "key_b", "key_c"}) {
+        auto batch = MakeSingleKeyBatch(key, data, buffers);
+        auto result = storage_backend.BatchOffload(batch, complete_handler,
+                                                   successful_eviction_handler);
+        ASSERT_TRUE(result.has_value()) << "key=" << key;
+    }
+
+    std::vector<std::string> failed_evictions;
+    auto failing_eviction_handler =
+        [&failed_evictions](const std::vector<std::string>& keys)
+        -> tl::expected<void, ErrorCode> {
+        failed_evictions = keys;
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    };
+
+    auto batch = MakeSingleKeyBatch("key_d", data, buffers);
+    auto failed_result = storage_backend.BatchOffload(batch, complete_handler,
+                                                      failing_eviction_handler);
+    ASSERT_FALSE(failed_result.has_value());
+    EXPECT_EQ(failed_result.error(), ErrorCode::INTERNAL_ERROR);
+    ASSERT_FALSE(failed_evictions.empty());
+    EXPECT_EQ(failed_evictions.front(), "key_a");
+
+    for (const auto& key : failed_evictions) {
+        auto exists = storage_backend.IsExist(key);
+        ASSERT_TRUE(exists.has_value());
+        EXPECT_TRUE(exists.value()) << "key=" << key;
+
+        std::vector<char> output(data.size());
+        std::unordered_map<std::string, Slice> load_batch;
+        load_batch.emplace(key, Slice{output.data(), output.size()});
+        auto load_result = storage_backend.BatchLoad(load_batch);
+        ASSERT_TRUE(load_result.has_value()) << "key=" << key;
+        EXPECT_EQ(std::string(output.begin(), output.end()), data);
+    }
+    EXPECT_FALSE(storage_backend.IsExist("key_d").value_or(true));
+
+    std::vector<std::string> retry_evictions;
+    auto retry_eviction_handler =
+        [&retry_evictions](const std::vector<std::string>& keys)
+        -> tl::expected<void, ErrorCode> {
+        retry_evictions = keys;
+        return {};
+    };
+    auto retry_result = storage_backend.BatchOffload(batch, complete_handler,
+                                                     retry_eviction_handler);
+    ASSERT_TRUE(retry_result.has_value());
+    EXPECT_EQ(retry_evictions, failed_evictions);
+    for (const auto& key : retry_evictions) {
+        EXPECT_FALSE(storage_backend.IsExist(key).value_or(true))
+            << "key=" << key;
+    }
+    EXPECT_TRUE(storage_backend.IsExist("key_d").value_or(false));
+}
+
+//-----------------------------------------------------------------------------
+
+TEST_F(StorageBackendTest,
        OffsetAllocatorStorageBackend_Eviction_PostLoopFlush) {
     // The last key in a batch may trigger eviction but fail allocate.
     // The evicted keys must still be flushed to the handler before return.
@@ -3893,14 +3977,13 @@ TEST_F(StorageBackendTest,
     //   1. BatchLoad copies entry.allocation (shared_ptr) into its
     //      ReadPlan, incrementing the refcount.  (storage_backend.cpp
     //      ~line 3375: "entry.allocation" copy in ReadPlan)
-    //   2. EvictToMakeRoom erases the key from shard.map, decrementing
-    //      the map's shared_ptr.  If no reader holds a copy, the
-    //      RefCountedAllocationHandle destructor calls freeAllocation
-    //      and the extent returns to the allocator.
-    //   3. While a reader holds its shared_ptr copy (refcount >= 1),
-    //      freeAllocation does NOT fire → the extent is still marked
-    //      "used" in the allocator → allocate() cannot re-issue that
-    //      offset.  The reader always sees the original bytes.
+    //   2. EvictToMakeRoom retains the allocation shared_ptr in pending
+    //      eviction state before erasing the key from shard.map. The pending
+    //      reference is released only after the master accepts the removal.
+    //   3. While either pending eviction or a reader holds a shared_ptr,
+    //      freeAllocation does NOT fire → the extent is still marked "used"
+    //      in the allocator → allocate() cannot re-issue that offset. The
+    //      reader always sees the original bytes.
     //
     // This test interleaves reads and eviction-triggering writes;
     // any data corruption means the allocator re-issued a still-read
