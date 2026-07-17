@@ -102,6 +102,7 @@ class MasterService {
     friend class test::MasterServiceTenantQuotaTest;
     friend class MasterSnapshotManager;    // Allow access to internal state for
                                            // snapshot
+    friend class ClientOffboardingWorker;
     friend class ha::MasterSnapshotCodec;  // Allow codec to access private
                                            // members
     friend class ha::MasterSnapshotCodecTest;  // codec round-trip unit test
@@ -1881,15 +1882,10 @@ class MasterService {
     std::atomic<bool> client_monitor_running_{false};
     static constexpr uint64_t kClientMonitorSleepMs =
         1000;  // 1000 ms sleep between client monitor checks
-    void RetryPrepareClientOffboarding(ClientOffboardingJob& job);
-    void CompleteClientOffboardingBatch(
-        const std::unordered_set<UUID, boost::hash<UUID>>& retained_clients);
     [[nodiscard]] bool HasPendingClientOffboarding() const {
-        return pending_client_offboarding_jobs_.load(
-                   std::memory_order_acquire) != 0;
+        return client_offboarding_worker_.HasPending();
     }
-    std::vector<ClientOffboardingJob> pending_offboarding_jobs_;
-    std::atomic<size_t> pending_client_offboarding_jobs_{0};
+    ClientOffboardingWorker client_offboarding_worker_{this};
     const int64_t client_active_ttl_sec_;
     const int64_t client_suspicion_ttl_sec_;
     std::mutex client_lease_expired_callbacks_mutex_;
