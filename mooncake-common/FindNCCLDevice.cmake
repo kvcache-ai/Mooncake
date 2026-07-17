@@ -31,20 +31,29 @@ if(NOT _NCCL_DEVICE_USING_CONFIG)
       /usr/local
       /usr)
 
-  find_library(NCCL_DEVICE_LIBRARY
-    # PyPI's NCCL wheel ships the versioned SONAME without an unversioned
-    # development symlink. Keep it eligible so headers and runtime come from
-    # the same installation instead of falling back to a system NCCL.
-    NAMES nccl nccl.so.2
-    HINTS
-      ${NCCL_ROOT}
-      $ENV{NCCL_ROOT}
-      $ENV{NCCL_HOME}
-    PATH_SUFFIXES lib lib64 build/lib build/lib64
-    PATHS
-      /usr/local/cuda
-      /usr/local
-      /usr)
+  # PyPI's NCCL wheel ships the versioned SONAME without an unversioned
+  # development symlink. Prefer that exact artifact before generic discovery
+  # can select an incompatible system NCCL.
+  foreach(_nccl_root ${NCCL_ROOT} $ENV{NCCL_ROOT} $ENV{NCCL_HOME})
+    if(EXISTS "${_nccl_root}/lib/libnccl.so.2")
+      set(NCCL_DEVICE_LIBRARY "${_nccl_root}/lib/libnccl.so.2")
+      break()
+    endif()
+  endforeach()
+
+  if(NOT NCCL_DEVICE_LIBRARY)
+    find_library(NCCL_DEVICE_LIBRARY
+      NAMES nccl
+      HINTS
+        ${NCCL_ROOT}
+        $ENV{NCCL_ROOT}
+        $ENV{NCCL_HOME}
+      PATH_SUFFIXES lib lib64 build/lib build/lib64
+      PATHS
+        /usr/local/cuda
+        /usr/local
+        /usr)
+  endif()
 
   if(NCCL_DEVICE_INCLUDE_DIR AND
      EXISTS "${NCCL_DEVICE_INCLUDE_DIR}/nccl.h")
