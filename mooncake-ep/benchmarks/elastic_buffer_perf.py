@@ -79,11 +79,6 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Global rank on which to enable the CUDA profiler.",
     )
-    parser.add_argument(
-        "--profile-internal",
-        action="store_true",
-        help="Collect low-overhead hybrid dispatch phase timestamps.",
-    )
     parser.add_argument("--seed", type=int, default=2026)
     return parser.parse_args()
 
@@ -174,9 +169,7 @@ def check_output(
 def main() -> None:
     args = parse_args()
     rank, world_size = init_distributed(args.seed)
-    if (args.profile_kernels or args.profile_internal) and not (
-        0 <= args.profile_rank < world_size
-    ):
+    if args.profile_kernels and not 0 <= args.profile_rank < world_size:
         raise ValueError("profile-rank must identify a rank in the process group")
     max_tokens = args.max_tokens or max(128, args.num_tokens)
     num_experts = args.num_experts
@@ -204,26 +197,6 @@ def main() -> None:
         route=args.route,
     )
     weights = torch.ones((args.num_tokens, args.num_topk), device="cuda", dtype=torch.float32)
-    internal_profile_names = (
-        "entry_scaleup_barrier",
-        "entry_scaleout_barrier",
-        "scaleout_total",
-        "scaleout_prepare",
-        "scaleout_put",
-        "scaleout_local_tail",
-        "scaleout_remote_tail",
-        "forward_total",
-        "forward_wait",
-        "forward_process",
-        "final_scaleup_barrier",
-    )
-    internal_profile = (
-        torch.zeros(
-            (len(internal_profile_names), 3), device="cuda", dtype=torch.int64
-        )
-        if args.profile_internal and rank == args.profile_rank
-        else None
-    )
 
     def run_one(iteration: int, cached_handle):
         x = make_input(rank, iteration, args.num_tokens, args.hidden)
@@ -244,7 +217,6 @@ def main() -> None:
             do_cpu_sync=True if not use_cached else None,
             num_sms=args.num_sms,
             async_with_compute_stream=False,
-            diagnostic=internal_profile,
         )
         dispatch_end.record()
 
@@ -285,9 +257,6 @@ def main() -> None:
     cached_handle = None
     for i in range(args.warmup):
         cached_handle, _dispatch_ms, _combine_ms, _actual = run_one(i, cached_handle)
-    if internal_profile is not None:
-        internal_profile.zero_()
-        torch.cuda.synchronize()
 
     dist.barrier()
     torch.cuda.synchronize()
@@ -360,17 +329,6 @@ def main() -> None:
         torch.empty_like(kernel_profile) for _ in range(world_size)
     ]
     dist.all_gather(gathered_kernel_profile, kernel_profile)
-    internal_profile_tensor = (
-        internal_profile
-        if internal_profile is not None
-        else torch.zeros(
-            (len(internal_profile_names), 3), device="cuda", dtype=torch.int64
-        )
-    )
-    gathered_internal_profile = [
-        torch.empty_like(internal_profile_tensor) for _ in range(world_size)
-    ]
-    dist.all_gather(gathered_internal_profile, internal_profile_tensor)
 
     if rank == 0:
         table = torch.stack(gathered).cpu()
@@ -419,19 +377,6 @@ def main() -> None:
                     f"min_us={per_rank_us.min().item():.2f}",
                     f"count_min={int(counts[valid].min().item())}",
                     f"count_max={int(counts[valid].max().item())}",
-                    flush=True,
-                )
-        if args.profile_internal:
-            internal_table = gathered_internal_profile[args.profile_rank].cpu()
-            for index, phase_name in enumerate(internal_profile_names):
-                count, total_ns, max_ns = internal_table[index].tolist()
-                print(
-                    "MOONCAKE_ELASTIC_INTERNAL_PROFILE",
-                    f"phase={phase_name}",
-                    f"profile_rank={args.profile_rank}",
-                    f"count={count}",
-                    f"avg_us={total_ns / max(1, count) / 1000:.2f}",
-                    f"max_us={max_ns / 1000:.2f}",
                     flush=True,
                 )
 

@@ -14,43 +14,6 @@
 
 namespace mooncake::elastic {
 
-enum HybridDispatchProfileKind {
-    kProfileEntryScaleupBarrier = 0,
-    kProfileEntryScaleoutBarrier = 1,
-    kProfileScaleoutTotal = 2,
-    kProfileScaleoutPrepare = 3,
-    kProfileScaleoutPut = 4,
-    kProfileScaleoutLocalTail = 5,
-    kProfileScaleoutRemoteTail = 6,
-    kProfileForwardTotal = 7,
-    kProfileForwardWait = 8,
-    kProfileForwardProcess = 9,
-    kProfileFinalScaleupBarrier = 10,
-    kNumHybridDispatchProfileKinds = 11,
-};
-
-constexpr int kHybridDispatchProfileColumns = 3;
-
-__device__ __forceinline__ unsigned long long hybrid_dispatch_profile_now() {
-#ifdef MOONCAKE_EP_USE_MUSA
-    return clock64();
-#else
-    unsigned long long nanoseconds;
-    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(nanoseconds));
-    return nanoseconds;
-#endif
-}
-
-__device__ __forceinline__ void hybrid_dispatch_profile_record(
-    int64_t* diagnostic, int kind, unsigned long long elapsed) {
-    if (diagnostic == nullptr) return;
-    auto* row = reinterpret_cast<unsigned long long*>(
-        diagnostic + kind * kHybridDispatchProfileColumns);
-    atomicAdd(row, 1ull);
-    atomicAdd(row + 1, elapsed);
-    atomicMax(row + 2, elapsed);
-}
-
 template <
     bool kDoCPUSync, bool kReuseSlotIndices, int kNumSMs, int kNumNotifyWarps,
     int kNumScaleoutWarps, int kNumForwardWarps, int kNumScaleoutRanks,
@@ -84,7 +47,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                          const device::CommCtx comm_ctx, void* buffer,
                          void* workspace, void* mapped_host_workspace,
                          const int scaleout_rank_idx,
-                         const int scaleup_rank_idx, int64_t* diagnostic) {
+                         const int scaleup_rank_idx) {
     constexpr int kNumExpertsPerRank = kNumExperts / kNumRanks;
     constexpr int kNumExpertsPerScaleout = kNumExperts / kNumScaleoutRanks;
     EP_STATIC_ASSERT(kNumExperts % kNumScaleupRanks == 0,
@@ -134,20 +97,11 @@ __global__ void __launch_bounds__(kNumThreads, 1)
         scaleup_rank_idx, kNumScaleupRanks, kNumRanks);
 
     // Global parallel barriers for scale-out subteam and scale-up subteam
-    const auto entry_barrier_start = hybrid_dispatch_profile_now();
     comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks, kNumSMs,
                       kNumThreads, kNumQPs, kNumTimeoutCycles,
                       comm::kHybridDispatchTag0, false, false, true>(
         gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx,
         thread_idx);
-    if (thread_idx == 0 && sm_idx < 2) {
-        hybrid_dispatch_profile_record(
-            diagnostic,
-            sm_idx == 0 ? kProfileEntryScaleupBarrier
-                        : kProfileEntryScaleoutBarrier,
-            hybrid_dispatch_profile_now() - entry_barrier_start);
-    }
-    const auto role_start = hybrid_dispatch_profile_now();
 
     // The golden layout during the whole process for both scale-out and forward
     // warps
@@ -496,15 +450,9 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                 // NOTES: the "release" scope will be `sys` for the local rank
                 // (we may involve NVLink so not `gpu`) For RDMA requests,
                 // "release" is ensured by "atomic"
-                const auto tail_start = hybrid_dispatch_profile_now();
                 gin.red_add_rel<transport::ScaleoutTeam>(
                     ptr, signaled_tail - old_signaled_tail, lane_idx,
                     transport::kRedAddReleaseLowWordLast);
-                hybrid_dispatch_profile_record(
-                    diagnostic,
-                    lane_idx == scaleout_rank_idx ? kProfileScaleoutLocalTail
-                                                  : kProfileScaleoutRemoteTail,
-                    hybrid_dispatch_profile_now() - tail_start);
                 stored_old_scaleout_tail = stored_scaleout_tail;
             }
             __syncwarp();
@@ -554,7 +502,6 @@ __global__ void __launch_bounds__(kNumThreads, 1)
         preload_next_token(channel_idx);
         for (int token_idx = channel_idx; token_idx < num_tokens;
              token_idx += kNumChannels) {
-            const auto token_start = hybrid_dispatch_profile_now();
             // Load top-k indices and weights
             EP_STATIC_ASSERT(kNumTopk <= 32,
                              "Insufficient lanes for loading top-k indices");
@@ -634,15 +581,10 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 
             // Preload the next token (overlapping with the IBGDA issues)
             preload_next_token(token_idx + kNumChannels);
-            if (lane_idx == 0)
-                hybrid_dispatch_profile_record(
-                    diagnostic, kProfileScaleoutPrepare,
-                    hybrid_dispatch_profile_now() - token_start);
 
             // Issue IBGDA requests
             if (stored_dst_slot_idx >= 0 and
                 stored_dst_scaleout_rank_idx != scaleout_rank_idx) {
-                const auto put_start = hybrid_dispatch_profile_now();
                 gin.put<transport::ScaleoutTeam>(
                     scaleout_recv_buffer.get_token_buffer(stored_dst_slot_idx)
                         .get_base_ptr(),
@@ -650,9 +592,6 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                         .get_base_ptr(),
                     tma_buffer.get_num_bytes<false>(),
                     stored_dst_scaleout_rank_idx, 0);
-                hybrid_dispatch_profile_record(
-                    diagnostic, kProfileScaleoutPut,
-                    hybrid_dispatch_profile_now() - put_start);
             }
             __syncwarp();
 
@@ -662,10 +601,6 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 
         // Flush unflushed tails
         update_scaleout_tail(true);
-        if (lane_idx == 0)
-            hybrid_dispatch_profile_record(
-                diagnostic, kProfileScaleoutTotal,
-                hybrid_dispatch_profile_now() - role_start);
     } else {
         const int forward_warp_idx =
             warp_idx - (kNumNotifyWarps + kNumScaleoutWarps);
@@ -717,7 +652,6 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                 hi_mask ? ptx::ffs(hi_mask) : ptx::ffs(wip_mask);
 
             // Wait for this rank to have data (or finish)
-            const auto wait_start = hybrid_dispatch_profile_now();
             comm::timeout_while<kNumTimeoutCycles>([&](const bool&
                                                            is_last_check) {
                 const uint32_t arrived_or_finished =
@@ -753,10 +687,6 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                 __syncwarp();
                 return false;
             });
-            if (lane_idx == 0)
-                hybrid_dispatch_profile_record(
-                    diagnostic, kProfileForwardWait,
-                    hybrid_dispatch_profile_now() - wait_start);
 
             // Process one chunk from the current rank
             const auto start_slot_idx = ptx::exchange(
@@ -771,7 +701,6 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                 scaleout_recv_buffer.get_rank_buffer(recv_scaleout_rank_idx);
             for (int slot_idx = start_slot_idx; slot_idx < end_slot_idx;
                  ++slot_idx) {
-                const auto process_start = hybrid_dispatch_profile_now();
                 const auto token_buffer =
                     recv_buffer.get_token_buffer(slot_idx);
 
@@ -900,10 +829,6 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                 }
                 num_tokens_processed += 1;
                 __syncwarp();
-                if (lane_idx == 0)
-                    hybrid_dispatch_profile_record(
-                        diagnostic, kProfileForwardProcess,
-                        hybrid_dispatch_profile_now() - process_start);
             }
         }
 
@@ -936,25 +861,16 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             *workspace_layout.get_scaleout_channel_signaled_tail_ptr(
                 channel_idx, lane_idx) = 0;
         __syncwarp();
-        if (lane_idx == 0)
-            hybrid_dispatch_profile_record(
-                diagnostic, kProfileForwardTotal,
-                hybrid_dispatch_profile_now() - role_start);
     }
 
     // Scale-up barrier to ensure data arrival
     // As scale-out tokens have already been consumed by forwarders, no need to
     // do scale-out barrier again
-    const auto final_barrier_start = hybrid_dispatch_profile_now();
     comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks, kNumSMs,
                       kNumThreads, kNumQPs, kNumTimeoutCycles,
                       comm::kHybridDispatchTag1, true, true, false>(
         gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx,
         thread_idx, /* do not scale-out */ false, true);
-    if (sm_idx == 0 && thread_idx == 0)
-        hybrid_dispatch_profile_record(
-            diagnostic, kProfileFinalScaleupBarrier,
-            hybrid_dispatch_profile_now() - final_barrier_start);
 
     // Trigger the copy epilogue kernel
 #if !defined(MOONCAKE_EP_USE_MUSA) && defined(__CUDA_ARCH__) && \

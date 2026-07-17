@@ -276,8 +276,7 @@ ElasticDispatchOutput MooncakeElasticBuffer::dispatch(
     torch::Tensor& active_ranks, int num_experts, int num_max_tokens_per_rank,
     int expert_alignment, int num_sms, bool do_expand, bool do_cpu_sync,
     bool async_with_compute_stream,
-    const std::optional<ElasticNativeHandle>& cached_handle,
-    const std::optional<torch::Tensor>& diagnostic) {
+    const std::optional<ElasticNativeHandle>& cached_handle) {
     EP_HOST_ASSERT(x.dim() == 2 && x.is_contiguous());
     const bool use_sf = sf.has_value();
     if (use_sf) {
@@ -294,15 +293,6 @@ ElasticDispatchOutput MooncakeElasticBuffer::dispatch(
     EP_HOST_ASSERT(topk_idx.scalar_type() == torch::kInt64);
     EP_HOST_ASSERT(x.size(0) == topk_idx.size(0));
     EP_HOST_ASSERT(num_experts % topology_.num_ranks == 0);
-    int64_t* diagnostic_ptr = nullptr;
-    if (diagnostic.has_value()) {
-        EP_HOST_ASSERT(diagnostic->is_cuda() && diagnostic->is_contiguous());
-        EP_HOST_ASSERT(diagnostic->scalar_type() == torch::kInt64);
-        EP_HOST_ASSERT(diagnostic->dim() == 2 && diagnostic->size(0) >= 11 &&
-                       diagnostic->size(1) >= 3);
-        EP_HOST_ASSERT(diagnostic->device() == x.device());
-        diagnostic_ptr = diagnostic->data_ptr<int64_t>();
-    }
 
     const int num_tokens = static_cast<int>(x.size(0));
     const int hidden = static_cast<int>(x.size(1));
@@ -461,7 +451,7 @@ ElasticDispatchOutput MooncakeElasticBuffer::dispatch(
         static_cast<int>(x.element_size()), num_sf_packs, sf_token_stride,
         sf_hidden_stride, num_experts, num_topk, expert_alignment, num_sms,
         num_channels_per_sm, num_smem_bytes, cached_mode, config_.deterministic,
-        false, launch_ctx, launch_stream.stream(), diagnostic_ptr);
+        false, launch_ctx, launch_stream.stream());
 
     const int num_recv_output_capacity =
         do_expand ? num_recv_tokens * num_topk : num_recv_tokens;
