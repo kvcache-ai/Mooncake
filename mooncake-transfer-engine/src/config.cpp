@@ -680,8 +680,7 @@ void dumpGlobalConfig() {
     LOG(INFO) << "ib_service_level = " << config.ib_service_level;
     LOG(INFO) << "te_metadata_refresh_interval_seconds = "
               << config.te_metadata_refresh_interval_seconds;
-    LOG(INFO) << "rdma_rail_pause_seconds = "
-              << config.rdma_rail_pause_seconds;
+    LOG(INFO) << "rdma_rail_pause_seconds = " << config.rdma_rail_pause_seconds;
     {
         std::ostringstream oss;
         for (size_t i = 0; i < config.mlx5_qp_udp_sports.size(); ++i) {
