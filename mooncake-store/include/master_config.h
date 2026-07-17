@@ -10,6 +10,8 @@ namespace mooncake {
 
 // The configuration for the master server
 struct MasterConfig {
+    static constexpr int kDefaultRedisPort = 6379;
+
     bool enable_metric_reporting;
     uint32_t metrics_port;
     uint32_t rpc_port;
@@ -72,6 +74,21 @@ struct MasterConfig {
     int redis_db_index = 0;             // Redis DB index
     int redis_master_view_ttl_sec = 5;  // Leader key TTL in seconds
     int redis_heartbeat_interval_sec = 2;  // KeepLeader renewal interval
+
+    void ApplyRedisEndpointDefaults() {
+        if (redis_endpoint.empty()) {
+            return;
+        }
+        if (redis_endpoint.front() == '[') {
+            if (redis_endpoint.back() == ']') {
+                redis_endpoint += ":" + std::to_string(kDefaultRedisPort);
+            }
+            return;
+        }
+        if (redis_endpoint.find(':') == std::string::npos) {
+            redis_endpoint += ":" + std::to_string(kDefaultRedisPort);
+        }
+    }
 };
 
 class MasterServiceSupervisorConfig {

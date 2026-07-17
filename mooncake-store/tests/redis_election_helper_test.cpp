@@ -7,6 +7,7 @@
 #include <string>
 #include <thread>
 
+#include "master_config.h"
 #include "types.h"
 
 #ifdef STORE_USE_REDIS
@@ -282,10 +283,49 @@ TEST_F(RedisElectionHelperTest, CreateConnectionInvalidPort) {
 }
 
 TEST_F(RedisElectionHelperTest, CreateConnectionHostOnlyEndpoint) {
-    // Endpoint without colon → host-only, port defaults to 6379
+    // Endpoint defaults belong to the configuration layer. RedisUtil requires
+    // an explicit port.
     RedisElectionHelper helper(FLAGS_cluster_id, "127.0.0.1", "", 0,
                                FLAGS_redis_ttl_sec, 1);
-    EXPECT_EQ(ErrorCode::OK, helper.Connect());
+    EXPECT_NE(ErrorCode::OK, helper.Connect());
+}
+
+TEST(RedisUtilTest, ParseEndpoint) {
+    std::string host;
+    int port = 0;
+
+    EXPECT_TRUE(RedisUtil::ParseEndpoint("redis.example.com:6379", host, port));
+    EXPECT_EQ("redis.example.com", host);
+    EXPECT_EQ(6379, port);
+
+    EXPECT_TRUE(RedisUtil::ParseEndpoint("[::1]:6380", host, port));
+    EXPECT_EQ("::1", host);
+    EXPECT_EQ(6380, port);
+}
+
+TEST(RedisUtilTest, RejectsEndpointWithoutExplicitPort) {
+    for (const char* endpoint : {"", "127.0.0.1", "[::1]", "::1"}) {
+        std::string host;
+        int port = 0;
+        EXPECT_FALSE(RedisUtil::ParseEndpoint(endpoint, host, port))
+            << endpoint;
+    }
+}
+
+TEST(RedisConfigTest, AppliesDefaultEndpointPort) {
+    MasterConfig config;
+
+    config.redis_endpoint = "redis.example.com";
+    config.ApplyRedisEndpointDefaults();
+    EXPECT_EQ("redis.example.com:6379", config.redis_endpoint);
+
+    config.redis_endpoint = "[::1]";
+    config.ApplyRedisEndpointDefaults();
+    EXPECT_EQ("[::1]:6379", config.redis_endpoint);
+
+    config.redis_endpoint = "redis.example.com:6380";
+    config.ApplyRedisEndpointDefaults();
+    EXPECT_EQ("redis.example.com:6380", config.redis_endpoint);
 }
 
 TEST_F(RedisElectionHelperTest, CreateConnectionUnreachable) {

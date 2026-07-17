@@ -75,8 +75,7 @@ RedisOpLogStore::~RedisOpLogStore() {
 redisContext* RedisOpLogStore::CreateConnection() const {
     return RedisUtil::CreateConnection(redis_endpoint_, username_, password_,
                                        db_index_, kConnectTimeoutMs,
-                                       kCommandTimeoutMs,
-                                       /*require_explicit_port=*/true);
+                                       kCommandTimeoutMs);
 }
 
 ErrorCode RedisOpLogStore::EnsureConnectedUnlocked() {

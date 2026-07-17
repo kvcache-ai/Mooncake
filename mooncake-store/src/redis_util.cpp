@@ -5,6 +5,7 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <utility>
 
 namespace mooncake {
 namespace {
@@ -24,70 +25,58 @@ bool ParseUint64(const std::string& value, uint64_t& result) {
 namespace RedisUtil {
 
 bool ParseEndpoint(const std::string& redis_endpoint, std::string& host,
-                   int& port, bool require_explicit_port) {
-    host = "127.0.0.1";
-    port = 6379;
+                   int& port) {
     if (redis_endpoint.empty()) {
-        return !require_explicit_port;
+        return false;
     }
 
+    std::string parsed_host;
+    uint64_t parsed_port = 0;
     if (redis_endpoint.front() == '[') {
         auto bracket_pos = redis_endpoint.find(']');
         if (bracket_pos == std::string::npos) {
             return false;
         }
-        host = redis_endpoint.substr(1, bracket_pos - 1);
-        if (bracket_pos + 1 == redis_endpoint.size()) {
-            return !require_explicit_port && !host.empty();
-        }
-        if (redis_endpoint[bracket_pos + 1] != ':') {
+        parsed_host = redis_endpoint.substr(1, bracket_pos - 1);
+        if (bracket_pos + 1 >= redis_endpoint.size() ||
+            redis_endpoint[bracket_pos + 1] != ':') {
             return false;
         }
-        uint64_t parsed_port = 0;
         const std::string port_str = redis_endpoint.substr(bracket_pos + 2);
         if (port_str.empty() || !ParseUint64(port_str, parsed_port) ||
             parsed_port == 0 || parsed_port > 65535) {
             return false;
         }
-        port = static_cast<int>(parsed_port);
-        return !host.empty();
-    }
-
-    const auto colon_count =
-        std::count(redis_endpoint.begin(), redis_endpoint.end(), ':');
-    if (colon_count > 1) {
-        if (require_explicit_port) {
+    } else {
+        const auto colon_count =
+            std::count(redis_endpoint.begin(), redis_endpoint.end(), ':');
+        if (colon_count != 1) {
             return false;
         }
-        host = redis_endpoint;
-    } else if (colon_count == 1) {
         auto colon_pos = redis_endpoint.find(':');
-        host = redis_endpoint.substr(0, colon_pos);
-        uint64_t parsed_port = 0;
+        parsed_host = redis_endpoint.substr(0, colon_pos);
         const std::string port_str = redis_endpoint.substr(colon_pos + 1);
-        if (host.empty() || port_str.empty() ||
+        if (parsed_host.empty() || port_str.empty() ||
             !ParseUint64(port_str, parsed_port) || parsed_port == 0 ||
             parsed_port > 65535) {
             return false;
         }
-        port = static_cast<int>(parsed_port);
-    } else {
-        if (require_explicit_port) {
-            return false;
-        }
-        host = redis_endpoint;
     }
-    return !host.empty();
+    if (parsed_host.empty()) {
+        return false;
+    }
+    host = std::move(parsed_host);
+    port = static_cast<int>(parsed_port);
+    return true;
 }
 
 redisContext* CreateConnection(const std::string& redis_endpoint,
                                const std::string& username,
                                const std::string& password, int db_index,
-                               int connect_timeout_ms, int command_timeout_ms,
-                               bool require_explicit_port) {
+                               int connect_timeout_ms, int command_timeout_ms) {
     std::string host;
     int port = 0;
-    if (!ParseEndpoint(redis_endpoint, host, port, require_explicit_port)) {
+    if (!ParseEndpoint(redis_endpoint, host, port)) {
         LOG(ERROR) << "RedisUtil: invalid Redis endpoint"
                    << ", endpoint=" << redis_endpoint;
         return nullptr;

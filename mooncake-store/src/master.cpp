@@ -623,6 +623,7 @@ int main(int argc, char* argv[]) {
         InitMasterConf(default_config, master_config);
     }
     LoadConfigFromCmdline(master_config, !conf_path.empty());
+    master_config.ApplyRedisEndpointDefaults();
 
     if (master_config.enable_ha) {
         if (master_config.election_backend != "etcd" &&

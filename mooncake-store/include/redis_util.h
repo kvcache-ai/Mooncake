@@ -23,14 +23,13 @@ using RedisReplyPtr = std::unique_ptr<redisReply, RedisReplyDeleter>;
 namespace RedisUtil {
 
 bool ParseEndpoint(const std::string& redis_endpoint, std::string& host,
-                   int& port, bool require_explicit_port = false);
+                   int& port);
 
 redisContext* CreateConnection(const std::string& redis_endpoint,
                                const std::string& username,
                                const std::string& password, int db_index = 0,
                                int connect_timeout_ms = 5000,
-                               int command_timeout_ms = 3000,
-                               bool require_explicit_port = false);
+                               int command_timeout_ms = 3000);
 
 }  // namespace RedisUtil
 
