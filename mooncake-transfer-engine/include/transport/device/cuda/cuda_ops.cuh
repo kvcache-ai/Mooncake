@@ -17,6 +17,12 @@ __device__ __forceinline__ int mc_ld_acquire(const int* ptr) {
     return ret;
 }
 
+__device__ __forceinline__ int mc_ld_acquire_gpu(const int* ptr) {
+    int ret;
+    asm volatile("ld.acquire.gpu.global.s32 %0, [%1];" : "=r"(ret) : "l"(ptr));
+    return ret;
+}
+
 __device__ __forceinline__ uint64_t mc_ld_acquire_u64(const uint64_t* ptr) {
     uint64_t ret;
     asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(ret) : "l"(ptr));
@@ -35,6 +41,13 @@ __device__ __forceinline__ void mc_st_release(const int* ptr, int val) {
 __device__ __forceinline__ void mc_st_release_u32(const uint32_t* ptr,
                                                   uint32_t val) {
     asm volatile("st.release.sys.global.L1::no_allocate.b32 [%0], %1;"
+                 :
+                 : "l"(ptr), "r"(val));
+}
+
+__device__ __forceinline__ void mc_st_release_gpu_u32(const uint32_t* ptr,
+                                                      uint32_t val) {
+    asm volatile("st.release.gpu.global.L1::no_allocate.b32 [%0], %1;"
                  :
                  : "l"(ptr), "r"(val));
 }

@@ -292,6 +292,13 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
     auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
     EP_HOST_ASSERT(not(async and return_recv_hook));
     if (not return_recv_hook) stream_wait(launch_stream, compute_stream);
+#ifdef USE_NCCL_DEVICE
+    if (nccl_gdr_context_device_) {
+        CUDA_CHECK(cudaMemsetAsync(next_buffer.nccl_recv_signal_buffer, 0,
+                                   num_experts * sizeof(uint64_t),
+                                   launch_stream));
+    }
+#endif
 
     // Allocate packed tensors
     auto packed_recv_x = torch::empty(
@@ -375,7 +382,11 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
             num_tokens, hidden, num_max_dispatch_tokens_per_rank, num_topk,
             num_experts, rank, num_ranks, use_fp8, workspace, launch_stream,
             timeout_ticks, phases, active_qps_per_rank, single_qp_flush_,
-            progressive_qp_flush_, diagnostic_ptr);
+            progressive_qp_flush_, diagnostic_ptr
+#ifdef USE_NCCL_DEVICE
+            , nccl_gdr_context_device_, buffer.nccl_recv_signal_buffer
+#endif
+            );
     };
     if (return_recv_hook) {
         launcher(LOW_LATENCY_SEND_PHASE);
@@ -481,6 +492,13 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
     auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
     EP_HOST_ASSERT(not(async and return_recv_hook));
     if (not return_recv_hook) stream_wait(launch_stream, compute_stream);
+#ifdef USE_NCCL_DEVICE
+    if (nccl_gdr_context_device_) {
+        CUDA_CHECK(cudaMemsetAsync(next_buffer.nccl_recv_signal_buffer, 0,
+                                   num_experts * sizeof(uint64_t),
+                                   launch_stream));
+    }
+#endif
 
     // Allocate output tensor
     torch::Tensor combined_x;
@@ -546,7 +564,11 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
             num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank,
             num_ranks, workspace, launch_stream, timeout_ticks, phases,
             zero_copy, active_qps_per_rank, single_qp_flush_,
-            progressive_qp_flush_, diagnostic_ptr);
+            progressive_qp_flush_, diagnostic_ptr
+#ifdef USE_NCCL_DEVICE
+            , nccl_gdr_context_device_, buffer.nccl_recv_signal_buffer
+#endif
+            );
     };
     if (return_recv_hook) {
         launcher(LOW_LATENCY_SEND_PHASE);

@@ -87,14 +87,16 @@ __device__ __forceinline__ void mc_rdma_put(
     const CommCtx& ctx, int channel, int dst_rank, int qps_per_rank,
     const void* send_ptr,
     void* recv_ptr,  // local VA of the recv slot (for raddr computation)
-    uint32_t nbytes, int lane_id) {
+    uint32_t nbytes, int lane_id,
+    IbgdaSignalProfile* profile = nullptr) {
     if (lane_id == 0) {
         uint64_t recv_raddr =
             ctx.ibgda.raddrs[dst_rank] +
             (reinterpret_cast<const char*>(recv_ptr) -
              reinterpret_cast<const char*>(ctx.p2p.local_base));
         mc_ibgda_put_defer_db(ctx.ibgda, channel, dst_rank, ctx.rank,
-                              qps_per_rank, send_ptr, recv_raddr, nbytes);
+                              qps_per_rank, send_ptr, recv_raddr, nbytes,
+                              profile);
     }
 }
 
@@ -105,15 +107,18 @@ __device__ __forceinline__ void mc_rdma_put(
 // sig_ptr is a local VA within the GDR buffer.
 // ---------------------------------------------------------------------------
 
-__device__ __forceinline__ void mc_signal(const CommCtx& ctx, int dst_rank,
+__device__ __forceinline__ bool mc_signal(const CommCtx& ctx, int dst_rank,
                                           int channel, int qps_per_rank,
-                                          int* sig_ptr, int32_t val) {
+                                          int* sig_ptr, int32_t val,
+                                          IbgdaSignalProfile* profile = nullptr,
+                                          bool defer_ibgda_flush = false) {
     if (dst_rank == ctx.rank) {
         mc_st_release(sig_ptr, val);
-        return;
+        return false;
     }
     if (mc_comm_p2p_available(ctx, dst_rank)) {
         mc_p2p_signal(ctx.p2p, dst_rank, sig_ptr, val);
+        return false;
     } else {
         uint64_t recv_raddr =
             ctx.ibgda.raddrs[dst_rank] +
@@ -125,15 +130,24 @@ __device__ __forceinline__ void mc_signal(const CommCtx& ctx, int dst_rank,
              reinterpret_cast<const char*>(ctx.ibgda.remote_atomic_base)) +
             (reinterpret_cast<const char*>(ctx.ibgda.local_atomic_base) -
              reinterpret_cast<const char*>(ctx.p2p.local_base));
-        mc_ibgda_red_add(ctx.ibgda, channel, dst_rank, ctx.rank, qps_per_rank,
-                         laddr, recv_raddr, val);
+        return mc_ibgda_red_add(ctx.ibgda, channel, dst_rank, ctx.rank,
+                                qps_per_rank, laddr, recv_raddr, val, profile,
+                                defer_ibgda_flush);
     }
 }
 
-__device__ __forceinline__ void mc_red_add(const CommCtx& ctx, int dst_rank,
-                                           int channel, int qps_per_rank,
-                                           int* sig_ptr, int32_t val) {
-    mc_signal(ctx, dst_rank, channel, qps_per_rank, sig_ptr, val);
+__device__ __forceinline__ bool mc_red_add(
+    const CommCtx& ctx, int dst_rank, int channel, int qps_per_rank,
+    int* sig_ptr, int32_t val, IbgdaSignalProfile* profile = nullptr,
+    bool defer_ibgda_flush = false) {
+    return mc_signal(ctx, dst_rank, channel, qps_per_rank, sig_ptr, val,
+                     profile, defer_ibgda_flush);
+}
+
+__device__ __forceinline__ void mc_flush_signal(
+    const CommCtx& ctx, int dst_rank, int channel, int qps_per_rank,
+    IbgdaSignalProfile* profile = nullptr) {
+    mc_ibgda_flush(ctx.ibgda, channel, dst_rank, qps_per_rank, profile);
 }
 
 }  // namespace device

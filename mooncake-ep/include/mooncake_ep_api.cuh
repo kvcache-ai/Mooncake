@@ -1,6 +1,9 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#ifdef USE_NCCL_DEVICE
+#include <transport/device/nccl_device_transport.h>
+#endif
 
 namespace mooncake {
 
@@ -16,7 +19,13 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
               int hidden, int num_max_dispatch_tokens_per_rank, int num_topk,
               int num_experts, int rank, int num_ranks, bool use_fp8,
               void* workspace, cudaStream_t stream, int64_t timeout_ticks,
-              int phases, int active_qps_per_rank);
+              int phases, int active_qps_per_rank, bool single_qp_flush,
+              bool progressive_qp_flush, int64_t* diagnostic
+#ifdef USE_NCCL_DEVICE
+              , const device::NcclDeviceContext* nccl_ctx,
+              uint64_t* nccl_recv_signal_buffer
+#endif
+              );
 
 void mark_phase_ack(void* mxa_buffer, const int32_t* nvlink_available,
                     void* const* ipc_peer_ptrs, int* ack_buffer, int rank,
@@ -42,6 +51,12 @@ void combine(void* combined_x, int32_t* active_ranks, void* mxa_buffer,
              int num_max_dispatch_tokens_per_rank, int num_topk,
              int num_experts, int rank, int num_ranks, void* workspace,
              cudaStream_t stream, int64_t timeout_ticks, int phases,
-             bool zero_copy, int active_qps_per_rank);
+             bool zero_copy, int active_qps_per_rank, bool single_qp_flush,
+             bool progressive_qp_flush, int64_t* diagnostic
+#ifdef USE_NCCL_DEVICE
+             , const device::NcclDeviceContext* nccl_ctx,
+             uint64_t* nccl_recv_signal_buffer
+#endif
+             );
 
 }  // namespace mooncake

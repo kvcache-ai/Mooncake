@@ -27,6 +27,10 @@ __device__ __forceinline__ int mc_ld_acquire(const int* ptr) {
     return ret;
 }
 
+__device__ __forceinline__ int mc_ld_acquire_gpu(const int* ptr) {
+    return mc_ld_acquire(ptr);
+}
+
 __device__ __forceinline__ uint64_t mc_ld_acquire_u64(const uint64_t* ptr) {
     uint64_t ret = *const_cast<volatile const uint64_t*>(ptr);
     __threadfence_system();
@@ -47,6 +51,11 @@ __device__ __forceinline__ void mc_st_release_u32(const uint32_t* ptr,
     __threadfence_system();
     *const_cast<volatile uint32_t*>(ptr) = val;
     __threadfence_system();
+}
+
+__device__ __forceinline__ void mc_st_release_gpu_u32(const uint32_t* ptr,
+                                                      uint32_t val) {
+    mc_st_release_u32(ptr, val);
 }
 
 __device__ __forceinline__ void mc_st_release_u64(const uint64_t* ptr,

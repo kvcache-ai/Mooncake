@@ -18,6 +18,7 @@ enum mlx5gda_debug_flags : uint32_t {
     MLX5GDA_DEBUG_SPARSE_CQE = 1u << 0,
     MLX5GDA_DEBUG_ATOMIC_RESERVE = 1u << 1,
     MLX5GDA_DEBUG_DEFER_DB = 1u << 2,
+    MLX5GDA_DEBUG_GPU_READY_SCOPE = 1u << 3,
 };
 
 struct mlx5gda_cq_dbr {
@@ -100,6 +101,7 @@ struct mlx5gda_qp {
     void *wq;
     void *dbr;
     void *ready;
+    bool ready_is_gpu_memory;
     struct mlx5gda_control_region wq_region;
     struct mlx5gda_control_region dbr_region;
     struct mlx5gda_control_region ready_region;
@@ -137,7 +139,8 @@ struct mlx5gda_qp *mlx5gda_create_rc_qp(
     struct mlx5dv_pd mpd, void *ctrl_buf,
     struct mlx5dv_devx_umem *ctrl_buf_umem, struct memheap *ctrl_buf_heap,
     struct ibv_pd *pd, int wqe, uint8_t port_num, cudaStream_t stream,
-    const struct mlx5gda_control_region_allocator *region_allocator);
+    const struct mlx5gda_control_region_allocator *region_allocator,
+    bool gpu_ready_ring);
 void mlx5gda_destroy_qp(struct memheap *ctrl_buf_heap, struct mlx5gda_qp *qp);
 
 int mlx5gda_modify_rc_qp_rst2init(struct mlx5gda_qp *qp, uint16_t pkey_index);

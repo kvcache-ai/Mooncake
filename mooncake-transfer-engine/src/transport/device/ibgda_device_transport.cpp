@@ -81,6 +81,8 @@ static uint32_t ibgdaDebugFlagsFromEnv() {
         flags |= MLX5GDA_DEBUG_ATOMIC_RESERVE;
     if (parseBoolEnvWithDefault("MOONCAKE_EP_IBGDA_DEFER_DB", true))
         flags |= MLX5GDA_DEBUG_DEFER_DB;
+    if (parseBoolEnvWithDefault("MOONCAKE_EP_IBGDA_GPU_READY_SCOPE", false))
+        flags |= MLX5GDA_DEBUG_GPU_READY_SCOPE;
     return flags;
 }
 
@@ -271,6 +273,21 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
 
     int createQueuePairs(void* stream_ptr) override {
         auto stream = static_cast<cudaStream_t>(stream_ptr);
+        const bool gpu_ready_ring = parseBoolEnvWithDefault(
+            "MOONCAKE_EP_IBGDA_GPU_READY_RING", false);
+        uint32_t qp_debug_flags = debug_flags_;
+        if ((qp_debug_flags & MLX5GDA_DEBUG_GPU_READY_SCOPE) != 0 &&
+            !gpu_ready_ring) {
+            LOG(WARNING) << "[EP IBGDA] Ignoring GPU ready scope without a "
+                            "GPU-resident ready ring";
+            qp_debug_flags &= ~MLX5GDA_DEBUG_GPU_READY_SCOPE;
+        }
+        if (gpu_ready_ring) {
+            LOG(INFO) << "[EP IBGDA] Using GPU-resident software ready rings";
+        }
+        if ((qp_debug_flags & MLX5GDA_DEBUG_GPU_READY_SCOPE) != 0) {
+            LOG(INFO) << "[EP IBGDA] Using GPU-scope ready publish/scan";
+        }
         mlx5gda_control_region_allocator region_allocator{
             .context = this,
             .allocate = allocateDmabufControlRegionThunk,
@@ -279,10 +296,18 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         const mlx5gda_control_region_allocator* allocator =
             ctrl_buf_mode_ == ControlMemoryMode::kGpuDmabuf ? &region_allocator
                                                             : nullptr;
+        uint32_t wqebb_count = 16384;
+        if (const char* env = std::getenv("MOONCAKE_EP_IBGDA_WQEBBS")) {
+            const long value = std::strtol(env, nullptr, 10);
+            if (value >= 64 && (value & (value - 1)) == 0) {
+                wqebb_count = static_cast<uint32_t>(value);
+            }
+        }
+        LOG(INFO) << "[EP IBGDA] WQEBBs/QP = " << wqebb_count;
         for (int i = 0; i < num_qps_; ++i) {
             mlx5gda_qp* qp = mlx5gda_create_rc_qp(
-                mpd_, ctrl_buf_, ctrl_buf_umem_, ctrl_buf_heap_, pd_, 16384, 1,
-                stream, allocator);
+                mpd_, ctrl_buf_, ctrl_buf_umem_, ctrl_buf_heap_, pd_, wqebb_count, 1,
+                stream, allocator, gpu_ready_ring);
             if (!qp) {
                 LOG(ERROR) << "[EP IBGDA] mlx5gda_create_rc_qp failed at " << i;
                 if (retryWithLegacyGpuControlBuffer())
@@ -300,7 +325,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
             mlx5gda_qp_devctx devctx{
                 .qpn = qp->qpn,
                 .wqeid_mask = qp->num_wqebb - 1,
-                .debug_flags = debug_flags_,
+                .debug_flags = qp_debug_flags,
                 .wq = reinterpret_cast<mlx5gda_wqebb*>(qp->wq),
                 .wq_ready = reinterpret_cast<uint32_t*>(qp->ready),
                 .cq = reinterpret_cast<mlx5_cqe64*>(qp->send_cq->cq_buf),

@@ -315,7 +315,8 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(
     struct mlx5dv_pd mpd, void* ctrl_buf,
     struct mlx5dv_devx_umem* ctrl_buf_umem, struct memheap* ctrl_buf_heap,
     struct ibv_pd* pd, int wqe, uint8_t port_num, cudaStream_t stream,
-    const struct mlx5gda_control_region_allocator* region_allocator) {
+    const struct mlx5gda_control_region_allocator* region_allocator,
+    bool gpu_ready_ring) {
     mlx5gda_reset_create_qp_failure();
 
     struct mlx5gda_qp* qp = NULL;
@@ -409,20 +410,22 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(
             perror("Failed to allocate QP DBR control region");
             goto fail;
         }
-        if (region_allocator->allocate(region_allocator->context,
-                                       num_wqebb * sizeof(uint32_t),
-                                       &qp->ready_region) != 0) {
-            perror("Failed to allocate WQ ready control region");
-            goto fail;
-        }
         wq = qp->wq_region.addr;
         dbr = qp->dbr_region.addr;
-        ready = qp->ready_region.addr;
         wq_umem = qp->wq_region.umem;
         dbr_umem = qp->dbr_region.umem;
         wq_offset = 0;
         dbr_offset = 0;
-        ready_offset = 0;
+        if (!gpu_ready_ring) {
+            if (region_allocator->allocate(region_allocator->context,
+                                           num_wqebb * sizeof(uint32_t),
+                                           &qp->ready_region) != 0) {
+                perror("Failed to allocate WQ ready control region");
+                goto fail;
+            }
+            ready = qp->ready_region.addr;
+            ready_offset = 0;
+        }
     } else {
         wq_offset = memheap_aligned_alloc(
             ctrl_buf_heap, num_wqebb * sizeof(struct mlx5gda_wqebb),
@@ -452,7 +455,7 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(
         }
     }
 
-    if (!split_regions) {
+    if (!split_regions && !gpu_ready_ring) {
         ready_offset =
             memheap_aligned_alloc(ctrl_buf_heap, num_wqebb * sizeof(uint32_t),
                                   (size_t)1 << MLX5_ADAPTER_PAGE_SHIFT);
@@ -461,7 +464,17 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(
             goto fail;
         }
     }
-    if (ctrl_host) {
+    if (gpu_ready_ring) {
+        if (cudaMalloc(&ready, num_wqebb * sizeof(uint32_t)) != cudaSuccess) {
+            print_cuda_error("Failed to allocate GPU WQ ready memory");
+            goto fail;
+        }
+        if (cudaMemsetAsync(ready, 0, num_wqebb * sizeof(uint32_t), stream) !=
+            cudaSuccess) {
+            print_cuda_error("Failed to zero GPU WQ ready memory");
+            goto fail;
+        }
+    } else if (ctrl_host) {
         memset(static_cast<char*>(ready) + ready_offset, 0,
                num_wqebb * sizeof(uint32_t));
     } else {
@@ -529,7 +542,8 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(
     qp->ready_offset = ready_offset;
     qp->wq = static_cast<char*>(wq) + wq_offset;
     qp->dbr = static_cast<char*>(dbr) + dbr_offset;
-    qp->ready = static_cast<char*>(ready) + ready_offset;
+    qp->ready = gpu_ready_ring ? ready : static_cast<char*>(ready) + ready_offset;
+    qp->ready_is_gpu_memory = gpu_ready_ring;
     return qp;
 
 fail:
@@ -560,6 +574,9 @@ fail:
     if (!split_regions && ready_offset != -1) {
         memheap_free(ctrl_buf_heap, ready_offset);
     }
+    if (gpu_ready_ring && ready != nullptr) {
+        cudaFree(ready);
+    }
     errno = saved_errno;
     return NULL;
 }
@@ -589,6 +606,9 @@ void mlx5gda_destroy_qp(struct memheap* ctrl_buf_heap, struct mlx5gda_qp* qp) {
     if (!uses_control_regions(&qp->region_allocator) &&
         qp->ready_offset != -1) {
         memheap_free(ctrl_buf_heap, qp->ready_offset);
+    }
+    if (qp->ready_is_gpu_memory && qp->ready) {
+        cudaFree(qp->ready);
     }
     if (qp) {
         free(qp);

@@ -11,6 +11,28 @@
 #include <cstdint>
 #include "transport/device/device_ops.cuh"
 
+namespace mooncake {
+namespace device {
+
+struct IbgdaSignalProfile {
+    uint64_t reserve_ticks = 0;
+    uint64_t wqe_build_ticks = 0;
+    uint64_t ready_publish_ticks = 0;
+    uint64_t flush_lock_ticks = 0;
+    uint64_t flush_lock_max_ticks = 0;
+    uint64_t flush_scan_ticks = 0;
+    uint64_t flush_scan_max_ticks = 0;
+    uint64_t doorbell_ticks = 0;
+    uint64_t doorbell_max_ticks = 0;
+    uint32_t flushed_wqes_max = 0;
+    uint32_t flush_calls = 0;
+    uint32_t doorbell_posts = 0;
+    uint32_t flushed_wqes = 0;
+};
+
+}  // namespace device
+}  // namespace mooncake
+
 #ifdef MOONCAKE_EP_USE_MACA
 
 namespace mooncake {
@@ -26,16 +48,26 @@ struct IbgdaContext {
 
 __device__ __forceinline__ void mc_ibgda_put(const IbgdaContext&, int, int, int,
                                              int, const void*, uint64_t,
-                                             uint32_t) {}
+                                             uint32_t,
+                                             IbgdaSignalProfile* = nullptr) {}
 
 __device__ __forceinline__ void mc_ibgda_put_defer_db(const IbgdaContext&, int,
                                                       int, int, int,
                                                       const void*, uint64_t,
-                                                      uint32_t) {}
+                                                      uint32_t,
+                                                      IbgdaSignalProfile* = nullptr) {}
 
-__device__ __forceinline__ void mc_ibgda_red_add(const IbgdaContext&, int, int,
+__device__ __forceinline__ bool mc_ibgda_red_add(const IbgdaContext&, int, int,
                                                  int, int, uint64_t, uint64_t,
-                                                 int32_t) {}
+                                                 int32_t,
+                                                 IbgdaSignalProfile* = nullptr,
+                                                 bool = false) {
+    return false;
+}
+
+__device__ __forceinline__ void mc_ibgda_flush(const IbgdaContext&, int, int,
+                                               int,
+                                               IbgdaSignalProfile* = nullptr) {}
 
 }  // namespace device
 }  // namespace mooncake
@@ -132,14 +164,22 @@ mc_ibgda_reserve_wqe(mlx5gda_qp_devctx* qp) {
 
 __device__ __forceinline__ void mc_ibgda_mark_wqe_ready(mlx5gda_qp_devctx* qp,
                                                         uint32_t slot) {
-    mc_st_release_u32(qp->wq_ready + (slot & qp->wqeid_mask), slot + 1);
+    auto* ready_ptr = qp->wq_ready + (slot & qp->wqeid_mask);
+    if (mc_ibgda_debug_enabled(qp, MLX5GDA_DEBUG_GPU_READY_SCOPE)) {
+        mc_st_release_gpu_u32(ready_ptr, slot + 1);
+    } else {
+        mc_st_release_u32(ready_ptr, slot + 1);
+    }
 }
 
 __device__ __forceinline__ bool mc_ibgda_wqe_ready(mlx5gda_qp_devctx* qp,
                                                    uint32_t slot) {
     auto* ready_ptr =
         reinterpret_cast<const int*>(qp->wq_ready + (slot & qp->wqeid_mask));
-    return static_cast<uint32_t>(mc_ld_acquire(ready_ptr)) == slot + 1;
+    const int ready = mc_ibgda_debug_enabled(qp, MLX5GDA_DEBUG_GPU_READY_SCOPE)
+                          ? mc_ld_acquire_gpu(ready_ptr)
+                          : mc_ld_acquire(ready_ptr);
+    return static_cast<uint32_t>(ready) == slot + 1;
 }
 
 __device__ __forceinline__ void mc_ibgda_post_send_db(mlx5gda_qp_devctx* qp,
@@ -165,15 +205,52 @@ __device__ __forceinline__ void mc_ibgda_post_send_db_locked(
 }
 
 __device__ __forceinline__ void mc_ibgda_flush_ready_wqes(
-    mlx5gda_qp_devctx* qp) {
+    mlx5gda_qp_devctx* qp, IbgdaSignalProfile* profile = nullptr,
+    bool atomic_reserved_load = false) {
+    const auto lock_start = profile != nullptr ? clock64() : 0;
     mc_ibgda_lock(qp);
+    if (profile != nullptr) {
+        const auto elapsed = clock64() - lock_start;
+        profile->flush_lock_ticks += elapsed;
+        profile->flush_lock_max_ticks = elapsed > profile->flush_lock_max_ticks
+                                            ? elapsed
+                                            : profile->flush_lock_max_ticks;
+        ++profile->flush_calls;
+    }
+
+    const auto scan_start = profile != nullptr ? clock64() : 0;
     uint32_t head = qp->db_head;
-    const uint32_t reserved = qp->wq_head_atomic;
+    const uint32_t old_head = head;
+    const uint32_t reserved = atomic_reserved_load
+                                  ? atomicAdd(&qp->wq_head_atomic, 0u)
+                                  : qp->wq_head_atomic;
     while (head < reserved && mc_ibgda_wqe_ready(qp, head)) ++head;
+    if (profile != nullptr) {
+        const auto elapsed = clock64() - scan_start;
+        profile->flush_scan_ticks += elapsed;
+        profile->flush_scan_max_ticks = elapsed > profile->flush_scan_max_ticks
+                                            ? elapsed
+                                            : profile->flush_scan_max_ticks;
+    }
+
     if (head != qp->db_head) {
+        const auto doorbell_start = profile != nullptr ? clock64() : 0;
         qp->db_head = head;
         qp->wq_head = static_cast<uint16_t>(head);
         mc_ibgda_post_send_db(qp, head);
+        if (profile != nullptr) {
+            const auto elapsed = clock64() - doorbell_start;
+            profile->doorbell_ticks += elapsed;
+            profile->doorbell_max_ticks = elapsed > profile->doorbell_max_ticks
+                                              ? elapsed
+                                              : profile->doorbell_max_ticks;
+            ++profile->doorbell_posts;
+            profile->flushed_wqes += head - old_head;
+            profile->flushed_wqes_max =
+                (head - old_head) > profile->flushed_wqes_max
+                    ? (head - old_head)
+                    : profile->flushed_wqes_max;
+        }
     }
     mc_ibgda_unlock(qp);
 }
@@ -250,16 +327,26 @@ __device__ __forceinline__ void mc_ibgda_put(const IbgdaContext& ctx,
                                              int src_rank, int qps_per_rank,
                                              const void* send_ptr,
                                              uint64_t recv_raddr,
-                                             uint32_t nbytes) {
+                                             uint32_t nbytes,
+                                             IbgdaSignalProfile* profile = nullptr) {
     auto* qp = mc_ibgda_channel(ctx, channel, dst_rank, qps_per_rank);
     if (mc_ibgda_debug_enabled(qp, MLX5GDA_DEBUG_ATOMIC_RESERVE)) {
+        const auto reserve_start = profile != nullptr ? clock64() : 0;
         uint32_t slot = mc_ibgda_reserve_wqe(qp);
+        if (profile != nullptr)
+            profile->reserve_ticks = clock64() - reserve_start;
+        const auto build_start = profile != nullptr ? clock64() : 0;
         mc_ibgda_write_rdma_write_wqe(
             qp, slot, reinterpret_cast<uint64_t>(send_ptr),
             mc_bswap32(ctx.rkeys[src_rank]), recv_raddr,
             mc_bswap32(ctx.rkeys[dst_rank]), nbytes);
+        if (profile != nullptr)
+            profile->wqe_build_ticks = clock64() - build_start;
+        const auto ready_start = profile != nullptr ? clock64() : 0;
         mc_ibgda_mark_wqe_ready(qp, slot);
-        mc_ibgda_flush_ready_wqes(qp);
+        if (profile != nullptr)
+            profile->ready_publish_ticks = clock64() - ready_start;
+        mc_ibgda_flush_ready_wqes(qp, profile);
         return;
     }
 
@@ -276,21 +363,30 @@ __device__ __forceinline__ void mc_ibgda_put(const IbgdaContext& ctx,
 __device__ __forceinline__ void mc_ibgda_put_defer_db(
     const IbgdaContext& ctx, int channel, int dst_rank, int src_rank,
     int qps_per_rank, const void* send_ptr, uint64_t recv_raddr,
-    uint32_t nbytes) {
+    uint32_t nbytes, IbgdaSignalProfile* profile = nullptr) {
     auto* qp = mc_ibgda_channel(ctx, channel, dst_rank, qps_per_rank);
     if (!mc_ibgda_debug_enabled(qp, MLX5GDA_DEBUG_DEFER_DB)) {
         mc_ibgda_put(ctx, channel, dst_rank, src_rank, qps_per_rank, send_ptr,
-                     recv_raddr, nbytes);
+                     recv_raddr, nbytes, profile);
         return;
     }
 
     if (mc_ibgda_debug_enabled(qp, MLX5GDA_DEBUG_ATOMIC_RESERVE)) {
+        const auto reserve_start = profile != nullptr ? clock64() : 0;
         uint32_t slot = mc_ibgda_reserve_wqe(qp);
+        if (profile != nullptr)
+            profile->reserve_ticks = clock64() - reserve_start;
+        const auto build_start = profile != nullptr ? clock64() : 0;
         mc_ibgda_write_rdma_write_wqe(
             qp, slot, reinterpret_cast<uint64_t>(send_ptr),
             mc_bswap32(ctx.rkeys[src_rank]), recv_raddr,
             mc_bswap32(ctx.rkeys[dst_rank]), nbytes);
+        if (profile != nullptr)
+            profile->wqe_build_ticks = clock64() - build_start;
+        const auto ready_start = profile != nullptr ? clock64() : 0;
         mc_ibgda_mark_wqe_ready(qp, slot);
+        if (profile != nullptr)
+            profile->ready_publish_ticks = clock64() - ready_start;
         return;
     }
 
@@ -307,21 +403,33 @@ __device__ __forceinline__ void mc_ibgda_put_defer_db(
 
 // RDMA ATOMIC ADD: add `value` to the 32-bit word at `recv_raddr` on
 // `dst_rank`. Must be called by lane 0 only.
-__device__ __forceinline__ void mc_ibgda_red_add(
+__device__ __forceinline__ bool mc_ibgda_red_add(
     const IbgdaContext& ctx, int channel, int dst_rank, int src_rank,
     int qps_per_rank,
     uint64_t laddr,       // local scratch VA for the atomic result
     uint64_t recv_raddr,  // remote VA of the signal word
-    int32_t value) {
+    int32_t value, IbgdaSignalProfile* profile = nullptr,
+    bool defer_flush = false) {
     auto* qp = mc_ibgda_channel(ctx, channel, dst_rank, qps_per_rank);
     if (mc_ibgda_debug_enabled(qp, MLX5GDA_DEBUG_ATOMIC_RESERVE)) {
+        const auto reserve_start = profile != nullptr ? clock64() : 0;
         uint32_t slot = mc_ibgda_reserve_wqe(qp);
+        if (profile != nullptr)
+            profile->reserve_ticks = clock64() - reserve_start;
+
+        const auto build_start = profile != nullptr ? clock64() : 0;
         mc_ibgda_write_rdma_atomic_add_wqe(
             qp, slot, value, laddr, mc_bswap32(ctx.rkeys[src_rank]), recv_raddr,
             mc_bswap32(ctx.rkeys[dst_rank]));
+        if (profile != nullptr)
+            profile->wqe_build_ticks = clock64() - build_start;
+
+        const auto ready_start = profile != nullptr ? clock64() : 0;
         mc_ibgda_mark_wqe_ready(qp, slot);
-        mc_ibgda_flush_ready_wqes(qp);
-        return;
+        if (profile != nullptr)
+            profile->ready_publish_ticks = clock64() - ready_start;
+        if (!defer_flush) mc_ibgda_flush_ready_wqes(qp, profile);
+        return defer_flush;
     }
 
     mc_ibgda_lock(qp);
@@ -331,6 +439,14 @@ __device__ __forceinline__ void mc_ibgda_red_add(
         mc_bswap32(ctx.rkeys[dst_rank]));
     mc_ibgda_post_send_db_locked(qp, slot);
     mc_ibgda_unlock(qp);
+    return false;
+}
+
+__device__ __forceinline__ void mc_ibgda_flush(
+    const IbgdaContext& ctx, int channel, int dst_rank, int qps_per_rank,
+    IbgdaSignalProfile* profile = nullptr) {
+    mc_ibgda_flush_ready_wqes(
+        mc_ibgda_channel(ctx, channel, dst_rank, qps_per_rank), profile, true);
 }
 
 }  // namespace device

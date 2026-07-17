@@ -6,16 +6,22 @@
 #include <mooncake_ep_exception.cuh>
 #include <mooncake_ep_launch.cuh>
 #include <transport/device/comm_device.cuh>
+#ifdef USE_NCCL_DEVICE
+#include <transport/device/nccl_device.cuh>
+#endif
 #include <mooncake_ep_utils.cuh>
 
 namespace mooncake {
 
 using mooncake::device::CommCtx;
+using mooncake::device::IbgdaSignalProfile;
 using mooncake::device::make_comm_ctx;
 using mooncake::device::mc_route_put;
+using mooncake::device::mc_comm_p2p_available;
 using mooncake::device::mc_rdma_put;
 using mooncake::device::mc_signal;
 using mooncake::device::mc_red_add;
+using mooncake::device::mc_flush_signal;
 using mooncake::device::mc_bar_sync;
 using mooncake::device::mc_grid_sync;
 using mooncake::device::mc_ld_nc;
@@ -27,14 +33,164 @@ using mooncake::device::mc_st_release;
 using mooncake::device::mc_atomic_add_release;
 using mooncake::device::mc_fence;
 using mooncake::device::mc_fence_barrier_fence;
+#ifdef USE_NCCL_DEVICE
+using mooncake::device::NcclDeviceContext;
+using mooncake::device::mc_nccl_put;
+using mooncake::device::mc_nccl_signal_add;
+using mooncake::device::mc_nccl_wait_signal;
+using mooncake::device::mc_nccl_read_signal;
+using mooncake::device::mc_nccl_flush;
+#define NCCL_KERNEL_ARGS , nccl_ctx, nccl_recv_signal_buffer
+#else
+#define NCCL_KERNEL_ARGS
+#endif
 
-__device__ __forceinline__ int ep_qp_channel(int expert_local_idx,
-                                             int qps_per_rank,
+enum EpProfileKind {
+    EP_PROFILE_DISPATCH_PACK = 0,
+    EP_PROFILE_DISPATCH_RDMA_POST = 1,
+    EP_PROFILE_DISPATCH_LOCAL_SEND_WAIT = 2,
+    EP_PROFILE_DISPATCH_SIGNAL_POST = 3,
+    EP_PROFILE_DISPATCH_REMOTE_WAIT = 4,
+    EP_PROFILE_DISPATCH_RECV_PACK = 5,
+    EP_PROFILE_COMBINE_STAGE = 6,
+    EP_PROFILE_COMBINE_RDMA_POST = 7,
+    EP_PROFILE_COMBINE_CLEAN_WAIT = 8,
+    EP_PROFILE_COMBINE_SIGNAL_POST = 9,
+    EP_PROFILE_COMBINE_REMOTE_WAIT = 10,
+    EP_PROFILE_COMBINE_REDUCE = 11,
+    EP_PROFILE_SIGNAL_RESERVE = 12,
+    EP_PROFILE_SIGNAL_WQE_BUILD = 13,
+    EP_PROFILE_SIGNAL_READY_PUBLISH = 14,
+    EP_PROFILE_SIGNAL_FLUSH_LOCK = 15,
+    EP_PROFILE_SIGNAL_FLUSH_SCAN = 16,
+    EP_PROFILE_SIGNAL_DOORBELL = 17,
+    EP_PROFILE_DATA_RESERVE = 18,
+    EP_PROFILE_DATA_WQE_BUILD = 19,
+    EP_PROFILE_DATA_READY_PUBLISH = 20,
+    EP_PROFILE_DATA_FLUSH_BATCH_WQES = 21,
+};
+
+constexpr int kEpProfileCols = 3;
+
+__device__ __forceinline__ void ep_profile_record(
+        int64_t* diagnostic, int kind, unsigned long long ticks) {
+    if (diagnostic == nullptr)
+        return;
+    auto* row = reinterpret_cast<unsigned long long*>(
+        diagnostic + kind * kEpProfileCols);
+    atomicAdd(row, 1ull);
+    atomicAdd(row + 1, ticks);
+    atomicMax(row + 2, ticks);
+}
+
+__device__ __forceinline__ void ep_profile_record_accum(
+        int64_t* diagnostic, int kind, unsigned long long count,
+        unsigned long long total_ticks, unsigned long long max_ticks) {
+    if (diagnostic == nullptr || count == 0)
+        return;
+    auto* row = reinterpret_cast<unsigned long long*>(
+        diagnostic + kind * kEpProfileCols);
+    atomicAdd(row, count);
+    atomicAdd(row + 1, total_ticks);
+    atomicMax(row + 2, max_ticks);
+}
+
+__device__ __forceinline__ void ep_profile_record_signal(
+        int64_t* diagnostic, const IbgdaSignalProfile& profile) {
+    if (profile.reserve_ticks != 0)
+        ep_profile_record(diagnostic, EP_PROFILE_SIGNAL_RESERVE,
+                          profile.reserve_ticks);
+    if (profile.wqe_build_ticks != 0)
+        ep_profile_record(diagnostic, EP_PROFILE_SIGNAL_WQE_BUILD,
+                          profile.wqe_build_ticks);
+    if (profile.ready_publish_ticks != 0)
+        ep_profile_record(diagnostic, EP_PROFILE_SIGNAL_READY_PUBLISH,
+                          profile.ready_publish_ticks);
+    ep_profile_record_accum(diagnostic, EP_PROFILE_SIGNAL_FLUSH_LOCK,
+                            profile.flush_calls, profile.flush_lock_ticks,
+                            profile.flush_lock_max_ticks);
+    ep_profile_record_accum(diagnostic, EP_PROFILE_SIGNAL_FLUSH_SCAN,
+                            profile.flush_calls, profile.flush_scan_ticks,
+                            profile.flush_scan_max_ticks);
+    ep_profile_record_accum(diagnostic, EP_PROFILE_SIGNAL_DOORBELL,
+                            profile.doorbell_posts, profile.doorbell_ticks,
+                            profile.doorbell_max_ticks);
+    ep_profile_record_accum(diagnostic, EP_PROFILE_DATA_FLUSH_BATCH_WQES,
+                            profile.doorbell_posts, profile.flushed_wqes,
+                            profile.flushed_wqes_max);
+}
+
+__device__ __forceinline__ void ep_profile_record_data(
+        int64_t* diagnostic, const IbgdaSignalProfile& profile) {
+    if (profile.reserve_ticks != 0)
+        ep_profile_record(diagnostic, EP_PROFILE_DATA_RESERVE,
+                          profile.reserve_ticks);
+    if (profile.wqe_build_ticks != 0)
+        ep_profile_record(diagnostic, EP_PROFILE_DATA_WQE_BUILD,
+                          profile.wqe_build_ticks);
+    if (profile.ready_publish_ticks != 0)
+        ep_profile_record(diagnostic, EP_PROFILE_DATA_READY_PUBLISH,
+                          profile.ready_publish_ticks);
+}
+
+__device__ __forceinline__ int ep_active_qps(int qps_per_rank,
                                              int active_qps_per_rank) {
     int active_qps = active_qps_per_rank;
     if (active_qps <= 0 || active_qps > qps_per_rank)
         active_qps = qps_per_rank;
-    return expert_local_idx % active_qps;
+    return active_qps;
+}
+
+__device__ __forceinline__ int ep_qp_channel(int expert_local_idx,
+                                             int qps_per_rank,
+                                             int active_qps_per_rank) {
+    return expert_local_idx %
+           ep_active_qps(qps_per_rank, active_qps_per_rank);
+}
+
+__device__ __forceinline__ void ep_remote_signal(
+        const CommCtx& comm_ctx, int dst_rank, int expert_local_idx,
+        int num_local_experts, int qps_per_rank, int active_qps_per_rank,
+        int* signal_ptr, int32_t value, bool single_qp_flush,
+        bool progressive_qp_flush, int* atomic_qp_signal_counter,
+        int64_t* diagnostic, int signal_profile_kind) {
+    const int active_qps =
+        ep_active_qps(qps_per_rank, active_qps_per_rank);
+    const int channel = expert_local_idx % active_qps;
+    const auto signal_start = diagnostic != nullptr ? clock64() : 0;
+    IbgdaSignalProfile signal_profile;
+    const bool aggregate_flush = single_qp_flush || progressive_qp_flush;
+    const bool deferred = mc_signal(
+        comm_ctx, dst_rank, channel, qps_per_rank, signal_ptr, value,
+        diagnostic != nullptr ? &signal_profile : nullptr, aggregate_flush);
+    if (deferred) {
+        int* counter = atomic_qp_signal_counter + dst_rank * active_qps + channel;
+        const int expected =
+            (num_local_experts + active_qps - channel - 1) / active_qps;
+        const int arrived = mc_atomic_add_release(counter, 1) + 1;
+        if (progressive_qp_flush && arrived == 1) {
+            int observed = 0;
+            while (observed < expected) {
+                int current;
+                while ((current = mc_ld_acquire(counter)) == observed);
+                observed = current;
+                mc_flush_signal(
+                    comm_ctx, dst_rank, channel, qps_per_rank,
+                    diagnostic != nullptr ? &signal_profile : nullptr);
+            }
+            mc_st_release(counter, 0);
+        } else if (!progressive_qp_flush && arrived == expected) {
+            mc_flush_signal(
+                comm_ctx, dst_rank, channel, qps_per_rank,
+                diagnostic != nullptr ? &signal_profile : nullptr);
+            mc_st_release(counter, 0);
+        }
+    }
+    if (diagnostic != nullptr) {
+        ep_profile_record(diagnostic, signal_profile_kind,
+                          clock64() - signal_start);
+        ep_profile_record_signal(diagnostic, signal_profile);
+    }
 }
 
 __global__ void mark_phase_ack_kernel(void* mxa_buffer,
@@ -148,11 +304,17 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
          const int32_t* nvlink_available, void* const* ipc_peer_ptrs,
          const void* x, const int64_t* topk_idx,
          int* atomic_counter_per_expert, int* atomic_finish_counter_per_expert,
+         int* atomic_qp_signal_counter,
          int* next_clean_buffer,
          int num_tokens, int num_max_dispatch_tokens_per_rank,
          int num_topk, int num_experts, int rank, int num_ranks,
          int64_t timeout_ticks,
-         int phases, int active_qps_per_rank) {
+         int phases, int active_qps_per_rank, bool single_qp_flush,
+         bool progressive_qp_flush, int64_t* diagnostic
+#ifdef USE_NCCL_DEVICE
+         , const NcclDeviceContext* nccl_ctx, uint64_t* nccl_recv_signal_buffer
+#endif
+         ) {
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto thread_id = static_cast<int>(threadIdx.x);
     const auto warp_id = thread_id / 32, lane_id = get_lane_id();
@@ -219,6 +381,8 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         EP_STATIC_ASSERT(kNumElemsPerRead * 32 % kNumPerChannels == 0, "Invalid vectorization");
         const auto num_threads = num_send_threads;
         const size_t hidden_bf16_int4 = kHidden / kNumElemsPerRead;
+        unsigned long long pack_count = 0, pack_total = 0, pack_max = 0;
+        unsigned long long post_count = 0, post_total = 0, post_max = 0;
 
         for (int token_idx = sm_id; token_idx < num_tokens; token_idx += num_sms) {
             const auto x_int4 = reinterpret_cast<const int4*>(x) + token_idx * hidden_bf16_int4;
@@ -231,6 +395,8 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             thread_id == 0 ? (*rdma_x_src_idx = token_idx) : 0;
 
             // FP8 cast
+            const auto pack_start =
+                diagnostic != nullptr && thread_id == 0 ? clock64() : 0;
             #pragma unroll
             for (int i = thread_id; i < hidden_bf16_int4; i += num_threads) {
                     // Read
@@ -268,6 +434,12 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                     }
                 }
             mc_bar_sync(1, num_threads);
+            if (diagnostic != nullptr && thread_id == 0) {
+                const auto elapsed = clock64() - pack_start;
+                ++pack_count;
+                pack_total += elapsed;
+                pack_max = max(pack_max, elapsed);
+            }
 
             // Issue sends
             if (dst_expert_idx >= 0) {
@@ -292,12 +464,32 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                     mc_fence();
                 } else {
                     // IBGDA path — send directly from source buffer
+                    IbgdaSignalProfile data_profile;
+                    const auto post_start =
+                        diagnostic != nullptr && lane_id == 0 ? clock64() : 0;
+                    const int channel = ep_qp_channel(dst_expert_local_idx,
+                                                       num_qp_per_rank,
+                                                       active_qps_per_rank);
+#ifdef USE_NCCL_DEVICE
+                    if (nccl_ctx != nullptr &&
+                        !mc_comm_p2p_available(comm_ctx, dst_rank)) {
+                        mc_nccl_put(*nccl_ctx, channel, dst_rank,
+                                    num_qp_per_rank, src_ptr, dst_ptr,
+                                    num_bytes_per_msg, lane_id);
+                    } else
+#endif
                     mc_rdma_put(comm_ctx,
-                                ep_qp_channel(dst_expert_local_idx,
-                                              num_qp_per_rank,
-                                              active_qps_per_rank),
+                                channel,
                                 dst_rank, num_qp_per_rank, src_ptr, dst_ptr,
-                                num_bytes_per_msg, lane_id);
+                                num_bytes_per_msg, lane_id,
+                                diagnostic != nullptr ? &data_profile : nullptr);
+                    if (diagnostic != nullptr && lane_id == 0) {
+                        const auto elapsed = clock64() - post_start;
+                        ++post_count;
+                        post_total += elapsed;
+                        post_max = max(post_max, elapsed);
+                        ep_profile_record_data(diagnostic, data_profile);
+                    }
                 }
 
                 // Increase counter after finishing
@@ -305,6 +497,12 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                 lane_id == 0 ? mc_atomic_add_release(atomic_finish_counter_per_expert + dst_expert_idx, 1) : 0;
             }
         }
+        if (thread_id == 0)
+            ep_profile_record_accum(diagnostic, EP_PROFILE_DISPATCH_PACK,
+                                    pack_count, pack_total, pack_max);
+        if (lane_id == 0)
+            ep_profile_record_accum(diagnostic, EP_PROFILE_DISPATCH_RDMA_POST,
+                                    post_count, post_total, post_max);
     } else if (is_count_warp) {
 #ifdef MOONCAKE_EP_SPLIT_SEND_RECV
         // Participate in __syncthreads() barriers from data warps.
@@ -362,14 +560,37 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         const auto num_tokens_sent = shared_num_tokens_sent_per_expert[responsible_expert_idx - sm_id * kNumWarpGroups];
 
         // Wait local sends issued and send expert counts
+        const auto local_wait_start = diagnostic != nullptr ? clock64() : 0;
         while (mc_ld_acquire(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG * 2);
+        if (diagnostic != nullptr)
+            ep_profile_record(diagnostic, EP_PROFILE_DISPATCH_LOCAL_SEND_WAIT,
+                              clock64() - local_wait_start);
         if (dst_rank != rank) {
+#ifdef USE_NCCL_DEVICE
+            if (nccl_ctx != nullptr &&
+                !mc_comm_p2p_available(comm_ctx, dst_rank)) {
+                const int channel = ep_qp_channel(dst_expert_local_idx,
+                                                   num_qp_per_rank,
+                                                   active_qps_per_rank);
+                auto* signal = nccl_recv_signal_buffer +
+                               dst_expert_local_idx * num_ranks + rank;
+                mc_nccl_signal_add(*nccl_ctx, dst_rank, channel,
+                                   num_qp_per_rank, signal,
+                                   static_cast<uint64_t>(num_tokens_sent + 1),
+                                   0);
+                mc_nccl_flush(*nccl_ctx, channel, 0);
+            } else {
+#endif
             int* signal_ptr = rdma_recv_signal_buffer + dst_expert_local_idx * num_ranks + rank;
-            mc_red_add(comm_ctx, dst_rank,
-                       ep_qp_channel(dst_expert_local_idx, num_qp_per_rank,
-                                     active_qps_per_rank),
-                       num_qp_per_rank, signal_ptr,
-                       static_cast<int32_t>(-num_tokens_sent - 1));
+            ep_remote_signal(
+                comm_ctx, dst_rank, dst_expert_local_idx, num_local_experts,
+                num_qp_per_rank, active_qps_per_rank, signal_ptr,
+                static_cast<int32_t>(-num_tokens_sent - 1), single_qp_flush,
+                progressive_qp_flush, atomic_qp_signal_counter, diagnostic,
+                EP_PROFILE_DISPATCH_SIGNAL_POST);
+#ifdef USE_NCCL_DEVICE
+            }
+#endif
         } else {
             mc_st_release(rdma_recv_signal_buffer + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1);
         }
@@ -415,6 +636,18 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Requires more than one warp per group");
         if (sub_warp_id == 1 and lane_id == 0) {
             unsigned long long start_time = clock64();
+#ifdef USE_NCCL_DEVICE
+            if (nccl_ctx != nullptr && src_rank != rank &&
+                !mc_comm_p2p_available(comm_ctx, src_rank)) {
+                const auto* signal = nccl_recv_signal_buffer +
+                                     local_expert_idx * num_ranks + src_rank;
+                mc_nccl_wait_signal(*nccl_ctx,
+                                    responsible_expert_idx % num_local_experts,
+                                    signal, 1, 0);
+                num_recv_tokens = static_cast<int>(
+                    mc_nccl_read_signal(*nccl_ctx, local_expert_idx, signal) - 1);
+            } else
+#endif
             while ((num_recv_tokens = mc_ld_acquire(rdma_recv_signal_buffer + local_expert_idx * num_ranks + src_rank)) == 0) {
                 unsigned long long end_time = clock64();
                 if (timeout_ticks != -1 && end_time - start_time > timeout_ticks) {
@@ -425,7 +658,11 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                     break;
                 }
             }
-            num_recv_tokens = -num_recv_tokens - 1;
+            if (diagnostic != nullptr && src_rank != rank)
+                ep_profile_record(diagnostic, EP_PROFILE_DISPATCH_REMOTE_WAIT,
+                                  clock64() - start_time);
+            if (num_recv_tokens < 0)
+                num_recv_tokens = -num_recv_tokens - 1;
             recv_token_begin_idx = atomicAdd(packed_recv_count + local_expert_idx, num_recv_tokens);
             shared_num_recv_tokens[warp_group_id] = num_recv_tokens;
             shared_recv_token_begin_idx[warp_group_id] = recv_token_begin_idx;
@@ -434,6 +671,10 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         mc_bar_sync(warp_group_id + 2, kNumWarpsPerGroup * 32);
         num_recv_tokens = shared_num_recv_tokens[warp_group_id];
         recv_token_begin_idx = shared_recv_token_begin_idx[warp_group_id];
+        const auto recv_pack_start =
+            diagnostic != nullptr && sub_warp_id == 1 && lane_id == 0
+                ? clock64()
+                : 0;
 
         // Copy tokens
         EP_DEVICE_ASSERT(num_scales <= 64);
@@ -463,8 +704,16 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                 (lane_id + 32) < num_scales ? dst_scales[(lane_id + 32) * scale_stride] = scale_1 : 0.0f;
             }
         }
+        if (diagnostic != nullptr) {
+            mc_bar_sync(warp_group_id + 2, kNumWarpsPerGroup * 32);
+            if (sub_warp_id == 1 && lane_id == 0)
+                ep_profile_record(diagnostic, EP_PROFILE_DISPATCH_RECV_PACK,
+                                  clock64() - recv_pack_start);
+        }
     } else {
         mc_bar_sync(warp_group_id + 2, kNumWarpsPerGroup * 32);
+        if (diagnostic != nullptr)
+            mc_bar_sync(warp_group_id + 2, kNumWarpsPerGroup * 32);
     }
 }
 
@@ -482,7 +731,12 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
               int num_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
               int num_topk, int num_experts, int rank, int num_ranks, bool use_fp8,
               void* workspace, cudaStream_t stream, int64_t timeout_ticks,
-              int phases, int active_qps_per_rank) {
+              int phases, int active_qps_per_rank, bool single_qp_flush,
+         bool progressive_qp_flush, int64_t* diagnostic
+#ifdef USE_NCCL_DEVICE
+         , const NcclDeviceContext* nccl_ctx, uint64_t* nccl_recv_signal_buffer
+#endif
+         ) {
     constexpr int kNumMaxTopK = 11;
     constexpr int kNumWarpsPerGroup = 4;
 #ifdef MOONCAKE_EP_USE_MUSA
@@ -500,7 +754,15 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     // Workspace checks
     auto atomic_counter_per_expert = reinterpret_cast<int*>(workspace);
     auto atomic_finish_counter_per_expert = atomic_counter_per_expert + num_experts;
-    EP_HOST_ASSERT(num_experts * sizeof(int) * 2 <= NUM_WORKSPACE_BYTES);
+    auto atomic_qp_signal_counter =
+        atomic_finish_counter_per_expert + num_experts;
+    const int qps_per_rank = MAX_QP_COUNT / num_ranks;
+    const int active_qps =
+        active_qps_per_rank > 0 && active_qps_per_rank <= qps_per_rank
+            ? active_qps_per_rank
+            : qps_per_rank;
+    EP_HOST_ASSERT((num_experts * 2 + num_ranks * active_qps) * sizeof(int) <=
+                   NUM_WORKSPACE_BYTES);
 
 #define DISPATCH_LAUNCH_CASE(hidden) { \
 auto dispatch_func = use_fp8 ? dispatch<true, kNumWarpGroups, kNumWarpsPerGroup, hidden> : \
@@ -517,10 +779,12 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
               nvlink_available, ipc_peer_ptrs, \
               x, topk_idx, \
               atomic_counter_per_expert, atomic_finish_counter_per_expert, \
+              atomic_qp_signal_counter, \
               next_clean_buffer, \
               num_tokens, num_max_dispatch_tokens_per_rank, \
               num_topk, num_experts, rank, num_ranks, timeout_ticks, phases, \
-              active_qps_per_rank); } break
+              active_qps_per_rank, single_qp_flush, progressive_qp_flush, \
+              diagnostic NCCL_KERNEL_ARGS); } break
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
     SWITCH_HIDDEN(DISPATCH_LAUNCH_CASE);
@@ -540,11 +804,18 @@ combine(void* combined_x, int32_t* active_ranks,
         const int* src_info, const int64_t* layout_range,
         int* next_clean_buffer,
         int* atomic_clean_flag,
+        int* atomic_qp_signal_counter,
         int num_combined_tokens, int hidden, int num_topk,
         int num_max_dispatch_tokens_per_rank,
         int num_experts, int rank, int num_ranks,
         int64_t timeout_ticks,
-        int phases, bool zero_copy, int active_qps_per_rank) {
+        int phases, bool zero_copy, int active_qps_per_rank,
+        bool single_qp_flush, bool progressive_qp_flush,
+        int64_t* diagnostic
+#ifdef USE_NCCL_DEVICE
+        , const NcclDeviceContext* nccl_ctx, uint64_t* nccl_recv_signal_buffer
+#endif
+        ) {
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto num_sms = static_cast<int>(gridDim.x);
     const auto thread_id = static_cast<int>(threadIdx.x);
@@ -602,6 +873,8 @@ combine(void* combined_x, int32_t* active_ranks,
         // Unpack layout
         int offset, num_tokens_to_send;
         unpack2(layout, num_tokens_to_send, offset);
+        unsigned long long stage_count = 0, stage_total = 0, stage_max = 0;
+        unsigned long long post_count = 0, post_total = 0, post_max = 0;
 
         // Issue IBGDA send
         for (int token_idx = offset + sub_warp_id; token_idx < offset + num_tokens_to_send; token_idx += kNumWarpsPerGroup) {
@@ -625,27 +898,84 @@ combine(void* combined_x, int32_t* active_ranks,
             } else {
                 // IBGDA path — stage to send buffer then RDMA write
                 const auto buf_int4_ptr = reinterpret_cast<int4*>(buf_ptr);
+                const auto stage_start = diagnostic != nullptr &&
+                                                 not zero_copy && lane_id == 0
+                                             ? clock64()
+                                             : 0;
                 if (not zero_copy)
                     UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, buf_int4_ptr, x_int4, mc_ld_nc, mc_st_na);
                 __syncwarp();
-                mc_rdma_put(comm_ctx,
-                            ep_qp_channel(local_expert_idx, num_qp_per_rank,
-                                          active_qps_per_rank),
+                if (diagnostic != nullptr && not zero_copy && lane_id == 0) {
+                    const auto elapsed = clock64() - stage_start;
+                    ++stage_count;
+                    stage_total += elapsed;
+                    stage_max = max(stage_max, elapsed);
+                }
+                const auto post_start =
+                    diagnostic != nullptr && lane_id == 0 ? clock64() : 0;
+                IbgdaSignalProfile data_profile;
+                const int channel = ep_qp_channel(local_expert_idx,
+                                                   num_qp_per_rank,
+                                                   active_qps_per_rank);
+#ifdef USE_NCCL_DEVICE
+                if (nccl_ctx != nullptr &&
+                    !mc_comm_p2p_available(comm_ctx, dst_rank)) {
+                    mc_nccl_put(*nccl_ctx, channel, dst_rank,
+                                num_qp_per_rank, buf_ptr, dst_ptr,
+                                num_bytes_per_slot, lane_id);
+                } else
+#endif
+                mc_rdma_put(comm_ctx, channel,
                             dst_rank, num_qp_per_rank, buf_ptr, dst_ptr,
-                            num_bytes_per_slot, lane_id);
+                            num_bytes_per_slot, lane_id,
+                            diagnostic != nullptr ? &data_profile : nullptr);
+                if (diagnostic != nullptr && lane_id == 0) {
+                    const auto elapsed = clock64() - post_start;
+                    ++post_count;
+                    post_total += elapsed;
+                    post_max = max(post_max, elapsed);
+                    ep_profile_record_data(diagnostic, data_profile);
+                }
             }
+        }
+        if (lane_id == 0) {
+            ep_profile_record_accum(diagnostic, EP_PROFILE_COMBINE_STAGE,
+                                    stage_count, stage_total, stage_max);
+            ep_profile_record_accum(diagnostic, EP_PROFILE_COMBINE_RDMA_POST,
+                                    post_count, post_total, post_max);
         }
         // Put finishing flag
         EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Requires more than one warp per group");
         mc_bar_sync(warp_group_id + 1, kNumWarpsPerGroup * 32);
         if (sub_warp_id == 1 and lane_id == 0) {
+            const auto clean_wait_start = diagnostic != nullptr ? clock64() : 0;
             while (mc_ld_acquire(atomic_clean_flag) == 0);
+            if (diagnostic != nullptr)
+                ep_profile_record(diagnostic, EP_PROFILE_COMBINE_CLEAN_WAIT,
+                                  clock64() - clean_wait_start);
             if (dst_rank != rank) {
+#ifdef USE_NCCL_DEVICE
+                if (nccl_ctx != nullptr &&
+                    !mc_comm_p2p_available(comm_ctx, dst_rank)) {
+                    const int channel = ep_qp_channel(local_expert_idx,
+                                                       num_qp_per_rank,
+                                                       active_qps_per_rank);
+                    auto* signal = nccl_recv_signal_buffer + global_expert_idx;
+                    mc_nccl_signal_add(*nccl_ctx, dst_rank, channel,
+                                       num_qp_per_rank, signal, 1, 0);
+                    mc_nccl_flush(*nccl_ctx, channel, 0);
+                } else {
+#endif
                 int* signal_ptr = rdma_recv_signal_buffer + global_expert_idx;
-                mc_signal(comm_ctx, dst_rank,
-                          ep_qp_channel(local_expert_idx, num_qp_per_rank,
-                                        active_qps_per_rank),
-                          num_qp_per_rank, signal_ptr, 1);
+                ep_remote_signal(
+                    comm_ctx, dst_rank, local_expert_idx, num_local_experts,
+                    num_qp_per_rank, active_qps_per_rank, signal_ptr, 1,
+                    single_qp_flush, progressive_qp_flush,
+                    atomic_qp_signal_counter, diagnostic,
+                    EP_PROFILE_COMBINE_SIGNAL_POST);
+#ifdef USE_NCCL_DEVICE
+                }
+#endif
             } else {
                 mc_st_release(rdma_recv_signal_buffer + global_expert_idx, 1);
             }
@@ -667,6 +997,13 @@ combine(void* combined_x, int32_t* active_ranks,
         EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Invalid number of warps per group");
         if (sub_warp_id == 0 and lane_id == 0) {
             unsigned long long start_time = clock64();
+ #ifdef USE_NCCL_DEVICE
+            if (nccl_ctx != nullptr && src_rank != rank &&
+                !mc_comm_p2p_available(comm_ctx, src_rank)) {
+                const auto* signal = nccl_recv_signal_buffer + responsible_expert_idx;
+                mc_nccl_wait_signal(*nccl_ctx, local_expert_idx, signal, 1, 0);
+            } else
+ #endif
             while (mc_ld_acquire(rdma_recv_signal_buffer + responsible_expert_idx) == 0) {
                 unsigned long long end_time = clock64();
                 if (timeout_ticks != -1 && end_time - start_time > timeout_ticks) {
@@ -676,6 +1013,9 @@ combine(void* combined_x, int32_t* active_ranks,
                     break;
                 }
             }
+            if (diagnostic != nullptr && src_rank != rank)
+                ep_profile_record(diagnostic, EP_PROFILE_COMBINE_REMOTE_WAIT,
+                                  clock64() - start_time);
         }
     }
 #ifdef MOONCAKE_EP_SPLIT_SEND_RECV
@@ -691,6 +1031,8 @@ combine(void* combined_x, int32_t* active_ranks,
     // Reduce tokens with FP8 cast
     EP_DEVICE_ASSERT(num_topk <= 32 and hidden_bf16_int4 <= num_threads);
     EP_STATIC_ASSERT(kHidden % (32 * kNumElemsPerInt4) == 0, "Invalid vectorization");
+    const auto reduce_start =
+        diagnostic != nullptr && thread_id == 0 ? clock64() : 0;
     if (thread_id < hidden_bf16_int4) {
         for (int token_idx = sm_id; token_idx < num_combined_tokens; token_idx += num_sms) {
             mc_fence();
@@ -731,6 +1073,12 @@ combine(void* combined_x, int32_t* active_ranks,
             (reinterpret_cast<int4*>(combined_x) + token_idx * hidden_bf16_int4)[thread_id] = combined_int4;
         }
     }
+    if (diagnostic != nullptr) {
+        __syncthreads();
+        if (thread_id == 0)
+            ep_profile_record(diagnostic, EP_PROFILE_COMBINE_REDUCE,
+                              clock64() - reduce_start);
+    }
 }
 
 void combine(void* combined_x, int32_t* active_ranks,
@@ -747,7 +1095,12 @@ void combine(void* combined_x, int32_t* active_ranks,
              int num_topk, int num_experts, int rank, int num_ranks,
              void* workspace, cudaStream_t stream,
              int64_t timeout_ticks, int phases, bool zero_copy,
-             int active_qps_per_rank) {
+             int active_qps_per_rank, bool single_qp_flush,
+             bool progressive_qp_flush, int64_t* diagnostic
+#ifdef USE_NCCL_DEVICE
+             , const NcclDeviceContext* nccl_ctx, uint64_t* nccl_recv_signal_buffer
+#endif
+             ) {
     constexpr int kNumWarpsPerGroup = 4;
     constexpr int kNumWarpGroups = 8;
     constexpr int kNumMaxTopk = 11;
@@ -757,7 +1110,14 @@ void combine(void* combined_x, int32_t* active_ranks,
 
     // Check workspace
     auto atomic_clean_flag = reinterpret_cast<int*>(workspace);
-    EP_HOST_ASSERT(sizeof(int) <= NUM_WORKSPACE_BYTES);
+    auto atomic_qp_signal_counter = atomic_clean_flag + num_experts * 2;
+    const int qps_per_rank = MAX_QP_COUNT / num_ranks;
+    const int active_qps =
+        active_qps_per_rank > 0 && active_qps_per_rank <= qps_per_rank
+            ? active_qps_per_rank
+            : qps_per_rank;
+    EP_HOST_ASSERT((num_experts * 2 + num_ranks * active_qps) * sizeof(int) <=
+                   NUM_WORKSPACE_BYTES);
     EP_HOST_ASSERT(num_topk <= kNumMaxTopk);
 
 #define COMBINE_LAUNCH_CASE(hidden) { \
@@ -773,10 +1133,13 @@ LAUNCH_KERNEL(&cfg, combine_func, \
               x, topk_idx, topk_weights, src_info, layout_range, \
               next_clean_buffer, \
               atomic_clean_flag, \
+              atomic_qp_signal_counter, \
               num_combined_tokens, hidden, num_topk, \
               num_max_dispatch_tokens_per_rank, \
               num_experts, rank, num_ranks, \
-              timeout_ticks, phases, zero_copy, active_qps_per_rank); } break
+              timeout_ticks, phases, zero_copy, active_qps_per_rank, \
+              single_qp_flush, progressive_qp_flush, \
+              diagnostic NCCL_KERNEL_ARGS); } break
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
     SWITCH_HIDDEN(COMBINE_LAUNCH_CASE);

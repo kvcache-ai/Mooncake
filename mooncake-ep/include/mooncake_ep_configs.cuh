@@ -3,6 +3,11 @@
 #define NUM_MAX_NVL_PEERS 8
 #define NUM_MAX_RDMA_PEERS 20
 #define MAX_QP_COUNT 256
+// The legacy EP kernels are compiled against MAX_QP_COUNT and allocate 256
+// QPs per rank.  Elastic uses a separate capacity so its DeepEP-style channel
+// mapping can dedicate 32 QPs to each of 16 destination ranks while leaving
+// enough RNIC QP capacity for the NCCL bootstrap communicator.
+#define ELASTIC_MAX_QP_COUNT 512
 #define NUM_MAX_FIFO_SLOTS 32768
 #define NUM_WORKSPACE_BYTES (32 * 1024 * 1024)
 #define NUM_MAX_LOCAL_EXPERTS 1024
