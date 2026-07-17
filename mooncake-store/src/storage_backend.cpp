@@ -27,6 +27,16 @@
 
 namespace mooncake {
 
+namespace {
+
+int64_t SteadyClockNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+}  // namespace
+
 bool FilePerKeyConfig::Validate() const {
     if (fsdir.empty()) {
         LOG(ERROR) << "FilePerKeyConfig: fsdir is invalid";
@@ -1704,10 +1714,7 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
             int64_t admission_time = 0;
             if (bucket_backend_config_.eviction_policy ==
                 BucketEvictionPolicy::LRU) {
-                admission_time =
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::steady_clock::now().time_since_epoch())
-                        .count();
+                admission_time = SteadyClockNowNs();
                 bucket->last_access_ns_.store(admission_time,
                                               std::memory_order_relaxed);
             }
@@ -1830,10 +1837,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                 // Update LRU timestamp for this bucket.
                 if (bucket_backend_config_.eviction_policy ==
                     BucketEvictionPolicy::LRU) {
-                    auto now =
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now().time_since_epoch())
-                            .count();
+                    const int64_t now = SteadyClockNowNs();
                     bucket_it->second->last_access_ns_.store(
                         now, std::memory_order_relaxed);
                 }
@@ -1954,6 +1958,12 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
         lru_index_.clear();
         total_size_ = 0;
         int64_t max_bucket_id = BucketIdGenerator::INIT_NEW_START_ID;
+        // Access history is not persisted, so recovered buckets share one
+        // admission timestamp and start with equal LRU priority.
+        const int64_t recovery_time =
+            bucket_backend_config_.eviction_policy == BucketEvictionPolicy::LRU
+                ? SteadyClockNowNs()
+                : 0;
 
         for (const auto& entry :
              fs::recursive_directory_iterator(storage_path_)) {
@@ -1972,7 +1982,6 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                 }
                 auto [metadata_it, success] = buckets_.try_emplace(
                     bucket_id, std::make_shared<BucketMetadata>());
-                if (success) lru_index_.emplace(0LL, bucket_id);
                 if (!success) {
                     LOG(ERROR) << "Failed to load bucket " << bucket_id_str;
                     return tl::make_unexpected(
@@ -1997,7 +2006,6 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                         fs::remove(bucket_meta_path_res.value());
                     }
 
-                    lru_index_.erase({0LL, bucket_id});
                     buckets_.erase(bucket_id);
                     continue;
                 }
@@ -2024,7 +2032,6 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                                << entry.path().string()
                                << ", will delete the bucket's remaining files";
                     CleanupOrphanedBucket(bucket_id);
-                    lru_index_.erase({0LL, bucket_id});
                     buckets_.erase(bucket_id);
                     continue;
                 }
@@ -2059,10 +2066,12 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                         fs::remove(bucket_meta_path_res.value());
                     }
 
-                    lru_index_.erase({0LL, bucket_id});
                     buckets_.erase(bucket_id);
                     continue;
                 }
+                metadata_it->second->last_access_ns_.store(
+                    recovery_time, std::memory_order_relaxed);
+                lru_index_.emplace(recovery_time, bucket_id);
                 if (bucket_id > max_bucket_id) {
                     max_bucket_id = bucket_id;
                 }
@@ -2625,7 +2634,7 @@ void BucketStorageBackend::RollbackCommittedBucket(
 
         // Remove bucket metadata
         total_size_ -= bucket_meta->meta_size;
-        lru_index_.erase({0LL, bucket_id});
+        EraseLruIndexEntryLocked(bucket_id);
         buckets_.erase(bucket_it);
     }
 
@@ -2942,6 +2951,15 @@ void BucketStorageBackend::ReleasePreparedWriteLocked(
     }
 }
 
+void BucketStorageBackend::EraseLruIndexEntryLocked(int64_t bucket_id) {
+    auto index_it = std::find_if(
+        lru_index_.begin(), lru_index_.end(),
+        [bucket_id](const auto& entry) { return entry.second == bucket_id; });
+    if (index_it != lru_index_.end()) {
+        lru_index_.erase(index_it);
+    }
+}
+
 tl::expected<void, ErrorCode> BucketStorageBackend::FinalizeEviction(
     const PendingEviction& pending) {
     namespace fs = std::filesystem;
@@ -3105,9 +3123,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
 
         // Move the shared_ptr out - we now own it
         bucket_metadata = std::move(bucket_it->second);
-        lru_index_.erase(
-            {bucket_metadata->last_access_ns_.load(std::memory_order_relaxed),
-             bucket_id});
+        EraseLruIndexEntryLocked(bucket_id);
         buckets_.erase(bucket_it);
 
         // Collect keys to remove (they reference this bucket)

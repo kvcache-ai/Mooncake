@@ -1007,6 +1007,9 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     void ReleasePreparedWriteLocked(const PendingEviction& pending);
 
+    // Remove the index entry by bucket ID because its timestamp may be stale.
+    void EraseLruIndexEntryLocked(int64_t bucket_id);
+
     /**
      * @brief Select the next bucket to evict according to the configured
      * eviction policy. Must be called with mutex_ held (exclusive).
