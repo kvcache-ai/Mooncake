@@ -91,6 +91,7 @@ class NcclBufferRegistration {
 // communicators and windows remain behind opaque pointers.
 class NcclDeviceContext {
    public:
+    NcclDeviceContext() = default;
     bool valid() const { return native_comm_ != nullptr; }
 
    private:

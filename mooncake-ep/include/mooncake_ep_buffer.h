@@ -28,6 +28,10 @@ struct BufferLayout {
     int* rdma_recv_signal_buffer;
     void* rdma_send_data_buffer;
     void* rdma_recv_data_buffer;
+    // NCCL GIN completion counters. They are deliberately separate from the
+    // legacy signed 32-bit IBGDA control words: GIN signals are aligned,
+    // unsigned 64-bit additive values.
+    uint64_t* nccl_recv_signal_buffer;
 };
 
 struct BufferPair {
@@ -44,13 +48,15 @@ struct BufferPair {
     BufferPair(void* rdma_buffer, int num_max_dispatch_tokens_per_rank,
                int hidden, int num_ranks, int num_experts) {
         size_t signaling_buffer_bytes = num_experts * sizeof(int);
+        size_t nccl_signaling_buffer_bytes = num_experts * sizeof(uint64_t);
         size_t send_recv_buffer_bytes =
             num_experts * num_max_dispatch_tokens_per_rank *
             (2 * sizeof(int4) + hidden * EP_BF16_SIZE);
+        const size_t per_buffer_bytes = 2 * signaling_buffer_bytes +
+                                        2 * send_recv_buffer_bytes +
+                                        nccl_signaling_buffer_bytes;
         for (int i = 0; i < 2; ++i) {
-            size_t rdma_base_offset = total_bytes +
-                                      2 * i * signaling_buffer_bytes +
-                                      2 * i * send_recv_buffer_bytes;
+            size_t rdma_base_offset = total_bytes + i * per_buffer_bytes;
             buffers[i] = {
                 advance<int*>(rdma_buffer, rdma_base_offset),
                 advance<int*>(rdma_buffer,
@@ -60,9 +66,12 @@ struct BufferPair {
                 advance<int*>(rdma_buffer, rdma_base_offset +
                                                2 * signaling_buffer_bytes +
                                                send_recv_buffer_bytes),
+                advance<uint64_t*>(rdma_buffer, rdma_base_offset +
+                                    2 * signaling_buffer_bytes +
+                                    2 * send_recv_buffer_bytes),
             };
         }
-        total_bytes += 4 * signaling_buffer_bytes + 4 * send_recv_buffer_bytes;
+        total_bytes += 2 * per_buffer_bytes;
     }
 };
 
@@ -95,6 +104,7 @@ struct MooncakeEpBuffer {
     std::unique_ptr<device::NcclTransport> owned_nccl_transport_;
     device::NcclBufferRegistration nccl_gdr_registration_;
     device::NcclDeviceContext nccl_gdr_context_;
+    device::NcclDeviceContext* nccl_gdr_context_device_ = nullptr;
     bool nccl_requested_ = false;
 #endif
 

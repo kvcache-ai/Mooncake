@@ -169,6 +169,7 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
 MooncakeEpBuffer::~MooncakeEpBuffer() noexcept(false) {
 #ifdef USE_NCCL_DEVICE
     if (owned_nccl_transport_) {
+        if (nccl_gdr_context_device_) cudaFree(nccl_gdr_context_device_);
         if (nccl_gdr_registration_.valid()) {
             owned_nccl_transport_->deregisterBuffer(&nccl_gdr_registration_);
         }
@@ -234,6 +235,9 @@ void MooncakeEpBuffer::initialize_nccl_transport(
         owned_nccl_transport_->shutdown();
         throw std::runtime_error("[EP] NCCL GDR device context is invalid");
     }
+    CUDA_CHECK(cudaMalloc(&nccl_gdr_context_device_, sizeof(nccl_gdr_context_)));
+    CUDA_CHECK(cudaMemcpy(nccl_gdr_context_device_, &nccl_gdr_context_,
+                          sizeof(nccl_gdr_context_), cudaMemcpyHostToDevice));
 }
 #endif
 
