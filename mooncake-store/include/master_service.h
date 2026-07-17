@@ -817,7 +817,6 @@ class MasterService {
 
    private:
     std::unique_ptr<ha::SnapshotCatalogStore> CreateSnapshotCatalogStore();
-    ha::SnapshotCatalogStore* GetSnapshotCatalogStore();
 
     // Restore master state
     void RestoreState();

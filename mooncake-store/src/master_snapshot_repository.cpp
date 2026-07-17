@@ -158,6 +158,10 @@ MasterSnapshotRepository::LoadLatestSnapshot() {
 tl::expected<std::vector<ha::SnapshotDescriptor>, ErrorCode>
 MasterSnapshotRepository::LoadRestoreCandidates(
     const std::optional<ha::SnapshotDescriptor>& latest_snapshot) {
+    if (!catalog_store_) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
     std::vector<ha::SnapshotDescriptor> candidates;
     std::unordered_set<std::string> candidate_ids;
 
@@ -194,6 +198,11 @@ MasterSnapshotRepository::LoadRestoreCandidates(
 tl::expected<ha::MasterSnapshotPayloads, SerializationError>
 MasterSnapshotRepository::DownloadSnapshotPayloads(
     const ha::SnapshotDescriptor& descriptor) {
+    if (!object_store_) {
+        return tl::make_unexpected(SerializationError(ErrorCode::INVALID_PARAMS,
+                                                      "object_store is null"));
+    }
+
     const std::string& snapshot_id = descriptor.snapshot_id;
     std::string path_prefix = descriptor.object_prefix;
     if (path_prefix.empty()) {

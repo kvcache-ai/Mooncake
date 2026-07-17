@@ -5956,8 +5956,18 @@ uint64_t MasterService::ReleaseExpiredDiscardedReplicas(
     return released_cnt;
 }
 
+/**
+ * @brief Restore master state from snapshot using three-phase architecture.
+ *
+ * Phase 1 (Repository): Load candidate snapshots from catalog
+ * Phase 2 (Repository + Codec): Download payloads and decode to memory
+ * Phase 3 (Service): Apply decoded state and rebuild metrics
+ *
+ * Attempts restore from candidates in chronological order until one succeeds.
+ * If all candidates fail, starts with a fresh state.
+ */
 void MasterService::RestoreState() {
-    auto* snapshot_catalog_store = GetSnapshotCatalogStore();
+    auto* snapshot_catalog_store = snapshot_catalog_store_.get();
     if (!snapshot_catalog_store) {
         LOG(ERROR) << "[Restore] Snapshot catalog store is not initialized, "
                       "starting fresh";
@@ -6189,10 +6199,6 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
     }
 
     return {};
-}
-
-ha::SnapshotCatalogStore* MasterService::GetSnapshotCatalogStore() {
-    return snapshot_catalog_store_.get();
 }
 
 MasterService::TenantQuotaEvictionResult
