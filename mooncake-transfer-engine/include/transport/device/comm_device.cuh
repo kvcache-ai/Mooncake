@@ -21,6 +21,7 @@ struct CommCtx {
     IbgdaContext ibgda;
     int rank;
     int qps_per_rank;
+    bool use_64bit_rdma_atomics;
 };
 
 // Construct CommCtx from the raw kernel arguments.
@@ -33,6 +34,7 @@ __device__ __forceinline__ CommCtx make_comm_ctx(
     CommCtx ctx;
     ctx.rank = rank;
     ctx.qps_per_rank = max(1, num_qps / max(1, num_ranks));
+    ctx.use_64bit_rdma_atomics = false;
 
     ctx.p2p.available = nvlink_available;
     ctx.p2p.peer_ptrs = ipc_peer_ptrs;
@@ -136,6 +138,24 @@ __device__ __forceinline__ void mc_red_add(const CommCtx& ctx, int dst_rank,
                                            int channel, int qps_per_rank,
                                            int* sig_ptr, int32_t val) {
     mc_signal(ctx, dst_rank, channel, qps_per_rank, sig_ptr, val);
+}
+
+__device__ __forceinline__ void mc_red_add64(const CommCtx& ctx, int dst_rank,
+                                             int channel, int qps_per_rank,
+                                             int64_t* sig_ptr, int64_t val) {
+    // Callers reach this helper only after mc_route_put() selected IBGDA.
+    const uint64_t recv_raddr =
+        ctx.ibgda.raddrs[dst_rank] +
+        (reinterpret_cast<const char*>(sig_ptr) -
+         reinterpret_cast<const char*>(ctx.p2p.local_base));
+    const uint64_t laddr =
+        ctx.ibgda.raddrs[ctx.rank] +
+        (reinterpret_cast<const char*>(sig_ptr) -
+         reinterpret_cast<const char*>(ctx.ibgda.remote_atomic_base)) +
+        (reinterpret_cast<const char*>(ctx.ibgda.local_atomic_base) -
+         reinterpret_cast<const char*>(ctx.p2p.local_base));
+    mc_ibgda_red_add64(ctx.ibgda, channel, dst_rank, ctx.rank, qps_per_rank,
+                       laddr, recv_raddr, val);
 }
 
 }  // namespace device

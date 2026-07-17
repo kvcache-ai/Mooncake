@@ -28,6 +28,14 @@ int getenv_int(const char* name, int default_value) {
     return std::max(1, std::atoi(value));
 }
 
+bool getenv_flag(const char* name) {
+    const char* value = std::getenv(name);
+    return value != nullptr &&
+           (std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 ||
+            std::strcmp(value, "TRUE") == 0 || std::strcmp(value, "on") == 0 ||
+            std::strcmp(value, "ON") == 0);
+}
+
 int hybrid_num_channels(int num_sms, int num_channels_per_sm) {
     return std::max(1, num_sms) * std::max(1, num_channels_per_sm);
 }
@@ -160,6 +168,8 @@ ElasticLaunchContext MooncakeElasticBuffer::make_launch_context(
     ctx.num_scaleout_ranks = topology.num_scaleout_ranks;
     ctx.num_scaleup_ranks = topology.num_scaleup_ranks;
     ctx.is_scaleup_nvlink = true;
+    ctx.use_64bit_rdma_atomics =
+        getenv_flag("MOONCAKE_EP_ELASTIC_RDMA_ATOMIC64");
     ctx.physical_qps_per_rank = buffer.qps_per_rank();
     ctx.timeout_cycles = timeout_cycles;
     return ctx;

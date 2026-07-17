@@ -32,6 +32,10 @@ __device__ __forceinline__ void mc_ibgda_red_add(const IbgdaContext&, int, int,
                                                  int, int, uint64_t, uint64_t,
                                                  int32_t) {}
 
+__device__ __forceinline__ void mc_ibgda_red_add64(const IbgdaContext&, int,
+                                                   int, int, int, uint64_t,
+                                                   uint64_t, int64_t) {}
+
 }  // namespace device
 }  // namespace mooncake
 
@@ -190,6 +194,33 @@ __device__ __forceinline__ void mc_ibgda_write_rdma_atomic_add_wqe(
     ++qp->wq_head;
 }
 
+// Issue a regular 64-bit RDMA FETCH-AND-ADD WQE.  Elastic uses this for
+// packed status/tail counters; legacy 32-bit signal buffers keep using the
+// masked operation above.
+__device__ __forceinline__ void mc_ibgda_write_rdma_atomic_add64_wqe(
+    mlx5gda_qp_devctx* qp, uint32_t slot, int64_t value, uint64_t laddr,
+    __be32 lkey, uint64_t raddr, __be32 rkey) {
+    auto* wqe = reinterpret_cast<mlx5gda_rdma_atomic_wqe*>(
+        qp->wq + (slot & qp->wqeid_mask));
+    const uint32_t wqe_counter = slot & 0xffffu;
+
+    wqe->ctrl = {};
+    wqe->ctrl.qpn_ds = mc_bswap32((qp->qpn << 8) | 4);
+    wqe->ctrl.fm_ce_se = MLX5_WQE_CTRL_CQ_UPDATE;
+    wqe->ctrl.opmod_idx_opcode =
+        mc_bswap32((wqe_counter << 8) | MLX5_OPCODE_ATOMIC_FA);
+
+    wqe->raddr.raddr = mc_bswap64(raddr);
+    wqe->raddr.rkey = rkey;
+    wqe->raddr.reserved = 0;
+    wqe->atomic.swap_add = mc_bswap64(static_cast<uint64_t>(value));
+    wqe->atomic.compare = 0;
+
+    wqe->data.byte_count = mc_bswap32(static_cast<uint32_t>(8));
+    wqe->data.lkey = lkey;
+    wqe->data.addr = mc_bswap64(laddr);
+}
+
 // ---------------------------------------------------------------------------
 // High-level IBGDA operations
 // ---------------------------------------------------------------------------
@@ -225,6 +256,31 @@ __device__ __forceinline__ void mc_ibgda_red_add(
         qp, value, laddr, mc_bswap32(ctx.rkeys[src_rank]), recv_raddr,
         mc_bswap32(ctx.rkeys[dst_rank]));
     mc_ibgda_post_send_db(qp);
+    mc_ibgda_unlock(qp);
+}
+
+// RDMA ATOMIC ADD for one aligned 64-bit packed counter.  The atomic response
+// goes to the same registered local scratch mapping used by 32-bit signals.
+__device__ __forceinline__ void mc_ibgda_red_add64(
+    const IbgdaContext& ctx, int channel, int dst_rank, int src_rank,
+    int qps_per_rank, uint64_t laddr, uint64_t recv_raddr, int64_t value) {
+    auto* qp = mc_ibgda_channel(ctx, channel, dst_rank, qps_per_rank);
+    if (mc_ibgda_debug_enabled(qp, MLX5GDA_DEBUG_ATOMIC_RESERVE)) {
+        uint32_t slot = mc_ibgda_reserve_wqe(qp);
+        mc_ibgda_write_rdma_atomic_add64_wqe(
+            qp, slot, value, laddr, mc_bswap32(ctx.rkeys[src_rank]),
+            recv_raddr, mc_bswap32(ctx.rkeys[dst_rank]));
+        mc_ibgda_mark_wqe_ready(qp, slot);
+        mc_ibgda_flush_ready_wqes(qp);
+        return;
+    }
+
+    mc_ibgda_lock(qp);
+    uint32_t slot = qp->db_head;
+    mc_ibgda_write_rdma_atomic_add64_wqe(
+        qp, slot, value, laddr, mc_bswap32(ctx.rkeys[src_rank]), recv_raddr,
+        mc_bswap32(ctx.rkeys[dst_rank]));
+    mc_ibgda_post_send_db_locked(qp, slot);
     mc_ibgda_unlock(qp);
 }
 
