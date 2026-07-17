@@ -74,8 +74,17 @@ Status TentMetrics::initialize(const MetricsConfig& config) {
     // Register all metrics to vectors for unified serialization
     registerMetrics();
 
-    // Initialize and start HTTP server
-    initHttpServer();
+    // Initialize and start HTTP server on the configured port. If the port is
+    // busy (e.g. another rank was given the same port), degrade to log-only
+    // metrics rather than falsely reporting a listening endpoint.
+    Status http_status = initHttpServer();
+    const bool http_ok = http_status.ok();
+    if (!http_ok) {
+        LOG(WARNING) << "TENT metrics HTTP endpoint unavailable on "
+                     << config_.http_host << ":" << config_.http_port << " ("
+                     << http_status.ToString()
+                     << "); continuing with log-only metrics";
+    }
 
     // Start periodic metric reporting thread if interval > 0
     if (config_.report_interval_seconds > 0) {
@@ -94,19 +103,53 @@ Status TentMetrics::initialize(const MetricsConfig& config) {
         });
     }
 
-    LOG(INFO)
-        << "TENT metrics initialized successfully, HTTP server listening on "
-        << config_.http_host << ":" << config_.http_port
-        << ", runtime_enabled=" << (runtime_enabled_.load() ? "true" : "false");
+    if (http_ok) {
+        LOG(INFO) << "TENT metrics initialized successfully, HTTP server "
+                     "listening on "
+                  << config_.http_host << ":"
+                  << bound_http_port_.load(std::memory_order_relaxed)
+                  << ", runtime_enabled="
+                  << (runtime_enabled_.load() ? "true" : "false");
+    } else {
+        LOG(INFO) << "TENT metrics initialized in log-only mode (HTTP endpoint "
+                     "disabled), runtime_enabled="
+                  << (runtime_enabled_.load() ? "true" : "false");
+    }
     return Status::OK();
 }
 
-void TentMetrics::initHttpServer() {
+Status TentMetrics::initHttpServer() {
     using namespace coro_http;
 
-    // Create HTTP server with configurable threads
+    // Create HTTP server with configurable threads on the configured port.
+    // Port assignment is intentionally deterministic: co-located ranks should
+    // be given distinct ports explicitly (e.g. base_port + local_rank), not
+    // auto-scanned, so a rank's metrics port stays predictable.
     http_server_ = std::make_unique<coro_http_server>(
         config_.http_server_threads, config_.http_port);
+
+    registerHttpHandlers();
+
+    // Start the HTTP server asynchronously. async_start() returns a future that
+    // already holds a result ONLY when startup failed (e.g. the port is already
+    // in use); on success the future stays pending while the server keeps
+    // running. Same idiom as mooncake-store's rpc_service.cpp /
+    // real_client.cpp.
+    auto ec = http_server_->async_start();
+    if (ec.hasResult()) {
+        http_server_.reset();
+        return Status::RpcServiceError(
+            "Failed to start TENT metrics HTTP server" LOC_MARK);
+    }
+
+    // Record the bound port (read by httpPort() from other threads, so it must
+    // be the atomic, not config_).
+    bound_http_port_.store(config_.http_port, std::memory_order_relaxed);
+    return Status::OK();
+}
+
+void TentMetrics::registerHttpHandlers() {
+    using namespace coro_http;
 
     // Register /metrics endpoint for Prometheus
     http_server_->set_http_handler<GET>(
@@ -140,9 +183,6 @@ void TentMetrics::initHttpServer() {
             resp.add_header("Content-Type", "text/plain");
             resp.set_status_and_content(status_type::ok, "OK");
         });
-
-    // Start the HTTP server asynchronously
-    http_server_->async_start();
 }
 
 void TentMetrics::shutdown() {
