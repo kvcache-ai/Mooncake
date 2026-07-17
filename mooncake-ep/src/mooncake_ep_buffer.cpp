@@ -1,6 +1,7 @@
 #include <mooncake_ep_buffer.h>
 #include <glog/logging.h>
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <sstream>
 #include <transfer_engine.h>
@@ -12,6 +13,16 @@ namespace {
 int active_qps_per_rank_for_ep(int qps_per_rank, bool is_roce, int cap) {
     if (!is_roce) return qps_per_rank;
     return std::min(qps_per_rank, cap);
+}
+
+bool env_flag_enabled(const char* name) {
+    const char* value = std::getenv(name);
+    if (value == nullptr) return false;
+    std::string normalized(value);
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return normalized == "1" || normalized == "on" || normalized == "true" ||
+           normalized == "yes";
 }
 
 }  // namespace
@@ -44,12 +55,12 @@ static bool macaHostPhaseFenceCoversPeers() {
 
 MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
                                    int64_t num_ep_buffer_bytes,
-                                   TransferEngine* engine)
+                                   TransferEngine* engine, int qp_count)
     : rank(rank),
       num_ranks(num_ranks),
       num_ep_buffer_bytes(num_ep_buffer_bytes),
       comm_stream(at::cuda::getStreamFromPool(true)) {
-    USE_QP_COUNT = MAX_QP_COUNT / num_ranks * num_ranks;
+    USE_QP_COUNT = std::max(num_ranks, qp_count / num_ranks * num_ranks);
 
     // Optional runtime override for the RoCE active-QP cap (default 8).
     // Set MOONCAKE_EP_ACTIVE_QPS_PER_RANK to a value >= the per-rank QP count
@@ -66,6 +77,16 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
         }
     }
     LOG(INFO) << "[EP] RoCE active QPs/rank cap = " << active_qps_cap_;
+    single_qp_flush_ = env_flag_enabled("MOONCAKE_EP_IBGDA_SINGLE_QP_FLUSH");
+    progressive_qp_flush_ =
+        env_flag_enabled("MOONCAKE_EP_IBGDA_PROGRESSIVE_QP_FLUSH");
+    LOG(INFO) << "[EP] IBGDA single flush per destination QP = "
+              << single_qp_flush_;
+    LOG(INFO) << "[EP] IBGDA progressive single flusher per destination QP = "
+              << progressive_qp_flush_;
+    if (single_qp_flush_ && progressive_qp_flush_)
+        LOG(WARNING) << "[EP] progressive QP flush takes precedence over "
+                        "last-arriver single QP flush";
 
     // Get ranks
     CUDA_CHECK(cudaGetDevice(&device_id));
@@ -86,7 +107,23 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
     }
     CUDA_CHECK(cudaMemset(gdr_buffer, 0, num_ep_buffer_bytes));
 
-    // RDMA transport — optional; disabled if init fails.
+    // RDMA transport — optional; disabled if init fails. NCCL mode performs
+    // its collective setup after Python has exchanged a unique ID.
+#ifdef USE_NCCL_DEVICE
+    nccl_requested_ = env_flag_enabled("MOONCAKE_EP_USE_NCCL_DEVICE");
+    if (nccl_requested_) {
+        ibgda_disabled_ = true;
+        owned_nccl_transport_ = device::createNcclDeviceTransport();
+        if (!owned_nccl_transport_) {
+            throw std::runtime_error("[EP] Failed to create NCCL transport");
+        }
+    }
+#endif
+    bool initialize_ibgda = true;
+#ifdef USE_NCCL_DEVICE
+    initialize_ibgda = !nccl_requested_;
+#endif
+    if (initialize_ibgda) {
     if (engine) {
         rdma_transport_ = engine->getOrCreateRdmaTransport();
         if (rdma_transport_) {
@@ -122,6 +159,7 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
             LOG(INFO) << "[EP] IBGDA unavailable, using P2P-only path";
         }
     }
+    }
 
     // Create 32 MiB workspace
     CUDA_CHECK(cudaMalloc(&workspace, NUM_WORKSPACE_BYTES));
@@ -129,6 +167,15 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
 }
 
 MooncakeEpBuffer::~MooncakeEpBuffer() noexcept(false) {
+#ifdef USE_NCCL_DEVICE
+    if (owned_nccl_transport_) {
+        if (nccl_gdr_registration_.valid()) {
+            owned_nccl_transport_->deregisterBuffer(&nccl_gdr_registration_);
+        }
+        owned_nccl_transport_->shutdown();
+        owned_nccl_transport_.reset();
+    }
+#endif
     // When EP owns the rdma transport, destructor handles QP/MR/ctrl_buf
     // teardown. When engine owns it, just clear the pointer.
     owned_rdma_transport_.reset();
@@ -153,6 +200,43 @@ MooncakeEpBuffer::~MooncakeEpBuffer() noexcept(false) {
     if (workspace) cudaFree(workspace);
 }
 
+#ifdef USE_NCCL_DEVICE
+std::vector<int32_t> MooncakeEpBuffer::create_nccl_unique_id() {
+    if (!owned_nccl_transport_) {
+        throw std::runtime_error("[EP] NCCL device transport is not enabled");
+    }
+    return owned_nccl_transport_->createUniqueId();
+}
+
+void MooncakeEpBuffer::initialize_nccl_transport(
+    const std::vector<int32_t>& unique_id, int gin_context_count) {
+    if (!owned_nccl_transport_) {
+        throw std::runtime_error("[EP] NCCL device transport is not enabled");
+    }
+    device::NcclTransportConfig config;
+    config.rank = rank;
+    config.num_ranks = num_ranks;
+    config.enable_gin = true;
+    config.gin_context_count = gin_context_count;
+    config.lsa_barrier_count = 0;
+    if (owned_nccl_transport_->initialize(config, unique_id) != 0) {
+        throw std::runtime_error("[EP] NCCL device transport initialization failed");
+    }
+    if (owned_nccl_transport_->registerBuffer(gdr_buffer, num_ep_buffer_bytes,
+                                               &nccl_gdr_registration_) != 0) {
+        owned_nccl_transport_->shutdown();
+        throw std::runtime_error("[EP] NCCL GDR buffer registration failed");
+    }
+    nccl_gdr_context_ =
+        owned_nccl_transport_->deviceContext(nccl_gdr_registration_);
+    if (!nccl_gdr_context_.valid()) {
+        owned_nccl_transport_->deregisterBuffer(&nccl_gdr_registration_);
+        owned_nccl_transport_->shutdown();
+        throw std::runtime_error("[EP] NCCL GDR device context is invalid");
+    }
+}
+#endif
+
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor,
            torch::Tensor, torch::Tensor, std::optional<EventHandle>,
            std::optional<std::function<void()>>>
@@ -161,7 +245,8 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
                            torch::Tensor& active_ranks,
                            int num_max_dispatch_tokens_per_rank,
                            int num_experts, int timeout_us, bool use_fp8,
-                           bool async, bool return_recv_hook) {
+                           bool async, bool return_recv_hook,
+                           const std::optional<torch::Tensor>& diagnostic) {
     // Tensor checks
     // By default using `ptp128c` FP8 cast
     EP_HOST_ASSERT(x.dim() == 2 and x.is_contiguous() and
@@ -173,6 +258,14 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
     EP_HOST_ASSERT(topk_idx.scalar_type() == torch::kInt64);
     EP_HOST_ASSERT(num_experts % num_ranks == 0);
     EP_HOST_ASSERT(USE_QP_COUNT % num_ranks == 0);
+    int64_t* diagnostic_ptr = nullptr;
+    if (diagnostic.has_value()) {
+        EP_HOST_ASSERT(diagnostic->dim() == 2 && diagnostic->is_contiguous());
+        EP_HOST_ASSERT(diagnostic->size(0) >= 22 && diagnostic->size(1) >= 3);
+        EP_HOST_ASSERT(diagnostic->scalar_type() == torch::kInt64);
+        EP_HOST_ASSERT(diagnostic->device() == x.device());
+        diagnostic_ptr = diagnostic->data_ptr<int64_t>();
+    }
 
     auto num_tokens = static_cast<int>(x.size(0)),
          hidden = static_cast<int>(x.size(1));
@@ -277,7 +370,8 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
             topk_idx.data_ptr<int64_t>(), next_buffer.rdma_recv_signal_buffer,
             num_tokens, hidden, num_max_dispatch_tokens_per_rank, num_topk,
             num_experts, rank, num_ranks, use_fp8, workspace, launch_stream,
-            timeout_ticks, phases, active_qps_per_rank);
+            timeout_ticks, phases, active_qps_per_rank, single_qp_flush_,
+            progressive_qp_flush_, diagnostic_ptr);
     };
     if (return_recv_hook) {
         launcher(LOW_LATENCY_SEND_PHASE);
@@ -333,7 +427,8 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
                           int num_max_dispatch_tokens_per_rank, int num_experts,
                           int timeout_us, bool zero_copy, bool async,
                           bool return_recv_hook,
-                          const std::optional<torch::Tensor>& out) {
+                          const std::optional<torch::Tensor>& out,
+                          const std::optional<torch::Tensor>& diagnostic) {
     // Tensor checks
     EP_HOST_ASSERT(x.dim() == 3 and x.is_contiguous() and
                    x.scalar_type() == torch::kBFloat16);
@@ -354,6 +449,14 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
     EP_HOST_ASSERT(layout_range.scalar_type() == torch::kInt64);
     EP_HOST_ASSERT(layout_range.size(0) == num_experts / num_ranks and
                    layout_range.size(1) == num_ranks);
+    int64_t* diagnostic_ptr = nullptr;
+    if (diagnostic.has_value()) {
+        EP_HOST_ASSERT(diagnostic->dim() == 2 && diagnostic->is_contiguous());
+        EP_HOST_ASSERT(diagnostic->size(0) >= 22 && diagnostic->size(1) >= 3);
+        EP_HOST_ASSERT(diagnostic->scalar_type() == torch::kInt64);
+        EP_HOST_ASSERT(diagnostic->device() == x.device());
+        diagnostic_ptr = diagnostic->data_ptr<int64_t>();
+    }
     auto hidden = static_cast<int>(x.size(2));
     auto num_local_experts = num_experts / num_ranks,
          num_topk = static_cast<int>(topk_weights.size(1));
@@ -438,7 +541,8 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
             next_buffer.rdma_recv_signal_buffer, num_combined_tokens, hidden,
             num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank,
             num_ranks, workspace, launch_stream, timeout_ticks, phases,
-            zero_copy, active_qps_per_rank);
+            zero_copy, active_qps_per_rank, single_qp_flush_,
+            progressive_qp_flush_, diagnostic_ptr);
     };
     if (return_recv_hook) {
         launcher(LOW_LATENCY_SEND_PHASE);

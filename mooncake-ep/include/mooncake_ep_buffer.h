@@ -12,6 +12,9 @@
 #include <mooncake_ep_exception.cuh>
 #include <torch/torch.h>
 #include <transport/device/device_transport.h>
+#ifdef USE_NCCL_DEVICE
+#include <transport/device/nccl_device_transport.h>
+#endif
 
 namespace mooncake {
 
@@ -88,6 +91,12 @@ struct MooncakeEpBuffer {
     // and these remain null.
     std::unique_ptr<device::P2pTransport> owned_p2p_transport_;
     std::unique_ptr<device::RdmaTransport> owned_rdma_transport_;
+#ifdef USE_NCCL_DEVICE
+    std::unique_ptr<device::NcclTransport> owned_nccl_transport_;
+    device::NcclBufferRegistration nccl_gdr_registration_;
+    device::NcclDeviceContext nccl_gdr_context_;
+    bool nccl_requested_ = false;
+#endif
 
     bool ibgda_disabled_ = false;
 
@@ -97,6 +106,8 @@ struct MooncakeEpBuffer {
     // 8; override at runtime with MOONCAKE_EP_ACTIVE_QPS_PER_RANK (>= per-rank
     // QP count disables).
     int active_qps_cap_ = 8;
+    bool single_qp_flush_ = false;
+    bool progressive_qp_flush_ = false;
 
     // Stream for communication
     at::cuda::CUDAStream comm_stream;
@@ -109,7 +120,7 @@ struct MooncakeEpBuffer {
     // (engine owns the transports).  Otherwise EP creates its own via the
     // factory functions (EP owns them via owned_p2p_transport_ etc.).
     MooncakeEpBuffer(int rank, int num_ranks, int64_t num_ep_buffer_bytes,
-                     TransferEngine* engine = nullptr);
+                     TransferEngine* engine = nullptr, int qp_count = 256);
 
     ~MooncakeEpBuffer() noexcept(false);
 
@@ -119,7 +130,8 @@ struct MooncakeEpBuffer {
     dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx,
              torch::Tensor& active_ranks, int num_max_dispatch_tokens_per_rank,
              int num_experts, int timeout_us, bool use_fp8, bool async,
-             bool return_recv_hook);
+             bool return_recv_hook,
+             const std::optional<torch::Tensor>& diagnostic);
 
     std::tuple<torch::Tensor, std::optional<EventHandle>,
                std::optional<std::function<void()>>>
@@ -128,12 +140,27 @@ struct MooncakeEpBuffer {
             const torch::Tensor& layout_range, torch::Tensor& active_ranks,
             int num_max_dispatch_tokens_per_rank, int num_experts,
             int timeout_us, bool zero_copy, bool async, bool return_recv_hook,
-            const std::optional<torch::Tensor>& out);
+            const std::optional<torch::Tensor>& out,
+            const std::optional<torch::Tensor>& diagnostic);
 
     torch::Tensor get_next_combine_buffer(int num_max_dispatch_tokens_per_rank,
                                           int hidden, int num_experts);
 
     bool ibgda_disabled() const { return ibgda_disabled_; }
+
+#ifdef USE_NCCL_DEVICE
+    // NCCL Device API bootstrap is driven through the existing Python process
+    // group before any EP kernel uses the opt-in GIN route.
+    std::vector<int32_t> create_nccl_unique_id();
+    void initialize_nccl_transport(const std::vector<int32_t>& unique_id,
+                                   int gin_context_count);
+    bool nccl_transport_enabled() const {
+        return nccl_gdr_context_.valid();
+    }
+    const device::NcclDeviceContext& nccl_gdr_context() const {
+        return nccl_gdr_context_;
+    }
+#endif
 
     bool is_roce() const {
         return rdma_transport_ && rdma_transport_->isRoce();
@@ -141,6 +168,9 @@ struct MooncakeEpBuffer {
 
     // Fast-path: IBGDA available, or all peers accessible via P2P.
     bool use_fast_path() {
+#ifdef USE_NCCL_DEVICE
+        if (nccl_gdr_context_.valid()) return true;
+#endif
         if (!ibgda_disabled_) return true;
         bool p2p_all = p2p_transport_ && p2p_transport_->allPeersAccessible();
         if (!p2p_all) {
