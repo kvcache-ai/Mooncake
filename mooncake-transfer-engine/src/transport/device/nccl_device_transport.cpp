@@ -146,12 +146,17 @@ class NcclDeviceTransportImpl final : public NcclTransport {
             return -1;
         }
 
+        LOG(INFO) << "[Device NCCL] initializing rank=" << config.rank << "/"
+                  << config.num_ranks << " cuda_device=" << cuda_device
+                  << " gin_contexts=" << config.gin_context_count;
         if (reportNcclError(
                 ncclCommInitRank(&comm_, config.num_ranks, id, config.rank),
                 "ncclCommInitRank") != 0) {
             comm_ = nullptr;
             return -1;
         }
+        LOG(INFO) << "[Device NCCL] ncclCommInitRank complete rank="
+                  << config.rank;
 
         ncclCommProperties_t comm_properties = NCCL_COMM_PROPERTIES_INITIALIZER;
         if (reportNcclError(ncclCommQueryProperties(comm_, &comm_properties),
@@ -191,6 +196,8 @@ class NcclDeviceTransportImpl final : public NcclTransport {
         requirements.ginExclusiveContexts =
             config.enable_gin && config.gin_exclusive_contexts;
 
+        LOG(INFO) << "[Device NCCL] creating device communicator rank="
+                  << config.rank;
         ncclResult_t start_result = ncclGroupStart();
         ncclResult_t create_result = ncclSuccess;
         ncclResult_t end_result = ncclSuccess;
@@ -205,6 +212,8 @@ class NcclDeviceTransportImpl final : public NcclTransport {
             return -1;
         }
         dev_comm_created_ = true;
+        LOG(INFO) << "[Device NCCL] device communicator complete rank="
+                  << config.rank;
 
         if (config.enable_gin && (dev_comm_.ginConnectionCount == 0 ||
                                   dev_comm_.ginContextCount == 0)) {
