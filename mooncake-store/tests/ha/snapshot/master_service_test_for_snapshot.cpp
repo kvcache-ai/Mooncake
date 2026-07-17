@@ -909,7 +909,7 @@ TEST_F(MasterServiceSnapshotTest, SingleSliceMultiReplicaFlow) {
     }
 }
 
-TEST_F(MasterServiceSnapshotTest, CleanupStaleHandlesTest) {
+TEST_F(MasterServiceSnapshotTest, ClientLivenessCleanupTest) {
     service_.reset(new MasterService());
 
     // Mount a segment for testing
@@ -1200,7 +1200,9 @@ TEST_F(MasterServiceSnapshotTest, ConcurrentRemoveAllOperations) {
 }
 
 TEST_F(MasterServiceSnapshotTest, UnmountSegmentImmediateCleanup) {
-    service_.reset(new MasterService());
+    auto service_config =
+        MasterServiceConfig::builder().set_enable_offload(true).build();
+    service_.reset(new MasterService(service_config));
 
     // Mount two segments for testing
     constexpr size_t buffer1 = 0x300000000;
@@ -1220,6 +1222,15 @@ TEST_F(MasterServiceSnapshotTest, UnmountSegmentImmediateCleanup) {
         GenerateKeyForSegment(client_id, service_, segment1.name);
     std::string key2 =
         GenerateKeyForSegment(client_id, service_, segment2.name);
+    UUID local_disk_client_id = generate_uuid();
+    ASSERT_TRUE(service_->MountLocalDiskSegment(local_disk_client_id, false)
+                    .has_value());
+    const std::string local_disk_key = "async_cleanup_local_disk_only";
+    ASSERT_TRUE(AddLocalDiskReplica(service_.get(), local_disk_client_id,
+                                    local_disk_key, 1024,
+                                    "async_cleanup_local_disk")
+                    .has_value());
+    ASSERT_EQ(3u, service_->GetKeyCount());
     uint64_t slice_length = 1024;
     ReplicateConfig config;
     config.replica_num = 1;
@@ -1236,15 +1247,20 @@ TEST_F(MasterServiceSnapshotTest, UnmountSegmentImmediateCleanup) {
 
     const auto cleanup_deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    while (service_->GetKeyCount() != 1 &&
+    while (service_->GetKeyCount() != 2 &&
            std::chrono::steady_clock::now() < cleanup_deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    ASSERT_EQ(1, service_->GetKeyCount());
+    ASSERT_EQ(2, service_->GetKeyCount());
 
     // Verify objects in segment2 is still there
     auto get_result2 = service_->GetReplicaList(key2, "default");
     ASSERT_TRUE(get_result2.has_value());
+    auto local_disk_result =
+        service_->GetReplicaList(local_disk_key, "default");
+    ASSERT_TRUE(local_disk_result.has_value());
+    ASSERT_EQ(1u, local_disk_result->replicas.size());
+    EXPECT_TRUE(local_disk_result->replicas.front().is_local_disk_replica());
 
     // Verify put key1 will put into segment2 rather than segment1
     auto put_start_result =
@@ -1266,6 +1282,7 @@ TEST_F(MasterServiceSnapshotTest, UnmountSegmentImmediateCleanup) {
 TEST_F(MasterServiceSnapshotTest, SnapshotCleansInvalidHandlesBeforePersist) {
     auto service_config = MasterServiceConfig::builder()
                               .set_memory_allocator(BufferAllocatorType::OFFSET)
+                              .set_enable_offload(true)
                               .build();
     service_.reset(new MasterService(service_config));
 
@@ -1275,38 +1292,173 @@ TEST_F(MasterServiceSnapshotTest, SnapshotCleansInvalidHandlesBeforePersist) {
     auto segment1 = MakeSegment("snapshot_cleanup_segment1", buffer1, size);
     auto segment2 = MakeSegment("snapshot_cleanup_segment2", buffer2, size);
     UUID client_id = generate_uuid();
-    ASSERT_TRUE(service_->MountSegment(segment1, client_id).has_value());
-    ASSERT_TRUE(service_->MountSegment(segment2, client_id).has_value());
+    ASSERT_TRUE(
+        service_->ReMountSegment({segment1, segment2}, client_id).has_value());
+    ASSERT_TRUE(service_->MountLocalDiskSegment(client_id, true).has_value());
 
     const std::string removed_key =
         GenerateKeyForSegment(client_id, service_, segment1.name);
+    const std::string mixed_key =
+        GenerateKeyForSegment(client_id, service_, segment1.name);
     const std::string surviving_key =
         GenerateKeyForSegment(client_id, service_, segment2.name);
-    ASSERT_EQ(2u, service_->GetKeyCount());
+    ASSERT_TRUE(AddLocalDiskReplica(service_.get(), client_id, mixed_key, 1024,
+                                    "remounted_local_disk")
+                    .has_value());
+
+    // A valid LOCAL_DISK generation must survive the availability sweep.
+    UUID pending_client_id = generate_uuid();
+    ASSERT_TRUE(
+        service_->MountLocalDiskSegment(pending_client_id, false).has_value());
+    const std::string local_disk_only_key = "snapshot_cleanup_local_disk_only";
+    ASSERT_TRUE(AddLocalDiskReplica(service_.get(), pending_client_id,
+                                    local_disk_only_key, 1024,
+                                    "pending_local_disk")
+                    .has_value());
+    ASSERT_EQ(4u, service_->GetKeyCount());
 
     // Keep the stale metadata pending so persistence deterministically covers
     // the window between unmount and asynchronous cleanup.
     StopInvalidHandleCleanup(service_.get());
     ASSERT_TRUE(service_->UnmountSegment(segment1.id, client_id).has_value());
-    ASSERT_EQ(2u, service_->GetKeyCount());
+    ASSERT_EQ(4u, service_->GetKeyCount());
 
     auto removed_result = service_->GetReplicaList(removed_key, "default");
     ASSERT_FALSE(removed_result.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, removed_result.error());
     ASSERT_TRUE(service_->GetReplicaList(surviving_key, "default").has_value());
 
+    CallSweepUnavailableReplicas(service_.get());
+
+    EXPECT_EQ(3u, service_->GetKeyCount());
+    auto mixed_result = service_->GetReplicaList(mixed_key, "default");
+    ASSERT_TRUE(mixed_result.has_value());
+    ASSERT_EQ(1u, mixed_result->replicas.size());
+    EXPECT_TRUE(mixed_result->replicas.front().is_local_disk_replica());
+    auto local_disk_only_result =
+        service_->GetReplicaList(local_disk_only_key, "default");
+    ASSERT_TRUE(local_disk_only_result.has_value());
+    ASSERT_EQ(1u, local_disk_only_result->replicas.size());
+    EXPECT_TRUE(
+        local_disk_only_result->replicas.front().is_local_disk_replica());
+
     auto persist_result =
         CallPersistState(service_.get(), GenerateSnapshotId());
     ASSERT_TRUE(persist_result.has_value())
         << "Failed to persist state: " << persist_result.error().message;
 
-    EXPECT_EQ(1u, service_->GetKeyCount());
+    EXPECT_EQ(3u, service_->GetKeyCount());
     auto removed_exists = service_->ExistKey(removed_key, "default");
     ASSERT_TRUE(removed_exists.has_value());
     EXPECT_FALSE(*removed_exists);
+    auto mixed_exists = service_->ExistKey(mixed_key, "default");
+    ASSERT_TRUE(mixed_exists.has_value());
+    EXPECT_TRUE(*mixed_exists);
+    auto local_disk_only_exists =
+        service_->ExistKey(local_disk_only_key, "default");
+    ASSERT_TRUE(local_disk_only_exists.has_value());
+    EXPECT_TRUE(*local_disk_only_exists);
     auto surviving_exists = service_->ExistKey(surviving_key, "default");
     ASSERT_TRUE(surviving_exists.has_value());
     EXPECT_TRUE(*surviving_exists);
+}
+
+TEST_F(MasterServiceSnapshotTest,
+       RestoredLocalDiskOnlyClientEntersLifetimeMonitor) {
+    auto source_config = MasterServiceConfig::builder()
+                             .set_memory_allocator(BufferAllocatorType::OFFSET)
+                             .set_enable_offload(true)
+                             .build();
+    service_ = std::make_unique<MasterService>(source_config);
+    EnsureSnapshotStores(service_.get());
+
+    const UUID client_id = generate_uuid();
+    const std::string key = "restored_local_disk_only_client";
+    ASSERT_TRUE(service_->MountLocalDiskSegment(client_id, false).has_value());
+    ASSERT_TRUE(AddLocalDiskReplica(service_.get(), client_id, key, 1024,
+                                    "restored_local_disk_endpoint")
+                    .has_value());
+    ASSERT_TRUE(
+        CallPersistState(service_.get(), GenerateSnapshotId()).has_value());
+
+    ::setenv("MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP", "1", 1);
+    auto restore_config = MasterServiceConfig::builder()
+                              .set_memory_allocator(BufferAllocatorType::OFFSET)
+                              .set_enable_snapshot_restore(true)
+                              .set_snapshot_object_store_type("local")
+                              .set_enable_offload(true)
+                              .set_client_live_ttl_sec(1)
+                              .build();
+    auto restored_service = std::make_unique<MasterService>(restore_config);
+    ::unsetenv("MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP");
+
+    ASSERT_TRUE(restored_service->GetReplicaList(key, "default").has_value());
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(4);
+    tl::expected<GetReplicaListResponse, ErrorCode> result =
+        restored_service->GetReplicaList(key, "default");
+    while (result.has_value() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        result = restored_service->GetReplicaList(key, "default");
+    }
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, result.error());
+}
+
+TEST_F(MasterServiceSnapshotTest,
+       PendingReplicaRemainsNotReadyDuringDeferredCleanup) {
+    service_ = std::make_unique<MasterService>();
+
+    constexpr size_t source_base = 0x300000000;
+    constexpr size_t target_base = 0x400000000;
+    constexpr size_t segment_size = 16 * 1024 * 1024;
+    auto source_segment =
+        MakeSegment("deferred_cleanup_source", source_base, segment_size);
+    auto target_segment =
+        MakeSegment("deferred_cleanup_target", target_base, segment_size);
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_->MountSegment(source_segment, client_id).has_value());
+    ASSERT_TRUE(service_->MountSegment(target_segment, client_id).has_value());
+
+    const std::string key = "deferred_cleanup_pending_replica";
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = source_segment.name;
+    ASSERT_TRUE(service_->PutStart(client_id, key, "default", 1024, config)
+                    .has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY)
+                    .has_value());
+    ASSERT_TRUE(service_
+                    ->CopyStart(client_id, key, "default", source_segment.name,
+                                {target_segment.name})
+                    .has_value());
+
+    // Keep the invalid COMPLETE source alongside the valid PROCESSING target.
+    StopInvalidHandleCleanup(service_.get());
+    ASSERT_TRUE(
+        service_->UnmountSegment(source_segment.id, client_id).has_value());
+    ASSERT_EQ(1u, service_->GetKeyCount());
+
+    auto get_result = service_->GetReplicaList(key, "default");
+    ASSERT_FALSE(get_result.has_value());
+    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, get_result.error());
+
+    auto admin_result = service_->GetReplicaListForAdmin(key, "default");
+    ASSERT_FALSE(admin_result.has_value());
+    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, admin_result.error());
+
+    auto batch_result = service_->BatchGetReplicaList({key}, "default");
+    ASSERT_EQ(1u, batch_result.size());
+    ASSERT_FALSE(batch_result.front().has_value());
+    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, batch_result.front().error());
+
+    auto admin_batch_result =
+        service_->BatchGetReplicaListForAdmin({key}, "default");
+    ASSERT_EQ(1u, admin_batch_result.size());
+    ASSERT_FALSE(admin_batch_result.front().has_value());
+    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY,
+              admin_batch_result.front().error());
 }
 
 TEST_F(MasterServiceSnapshotTest, ReadableAfterPartialUnmountWithReplication) {

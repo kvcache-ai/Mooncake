@@ -32,17 +32,25 @@ static constexpr size_t kAllocatorUnknownFreeSpace =
 
 class SegmentLifetime {
    public:
-    SegmentLifetime() : available_(std::make_shared<std::atomic<bool>>(true)) {}
+    static SegmentLifetime Available() { return SegmentLifetime(true); }
+    static SegmentLifetime Unavailable() { return SegmentLifetime(false); }
 
     [[nodiscard]] bool isAvailable() const {
         return available_->load(std::memory_order_acquire);
     }
 
-    void setAvailable(bool available) const {
-        available_->store(available, std::memory_order_release);
+    void invalidate() const {
+        available_->store(false, std::memory_order_release);
+    }
+
+    [[nodiscard]] bool isSameGeneration(const SegmentLifetime& other) const {
+        return available_ == other.available_;
     }
 
    private:
+    explicit SegmentLifetime(bool available)
+        : available_(std::make_shared<std::atomic<bool>>(available)) {}
+
     std::shared_ptr<std::atomic<bool>> available_;
 };
 
@@ -77,7 +85,7 @@ class AllocatedBuffer {
 
     [[nodiscard]] std::size_t size() const noexcept { return this->size_; }
 
-    [[nodiscard]] bool isAllocatorValid() const {
+    [[nodiscard]] bool isAvailable() const {
         return !allocator_.expired() && segment_lifetime_.isAvailable();
     }
 
@@ -111,7 +119,7 @@ class AllocatedBuffer {
     }
 
     std::weak_ptr<BufferAllocatorBase> allocator_;
-    SegmentLifetime segment_lifetime_;
+    SegmentLifetime segment_lifetime_ = SegmentLifetime::Unavailable();
     std::string segment_name_;
     void* buffer_ptr_{nullptr};
     std::size_t size_{0};

@@ -226,9 +226,22 @@ ErrorCode ScopedSegmentAccess::MountLocalDiskSegment(const UUID& client_id,
         segment_manager_->client_local_disk_segment_.find(client_id);
     if (exist_segment_it !=
         segment_manager_->client_local_disk_segment_.end()) {
-        LOG(WARNING) << "client_id=" << client_id
-                     << ", warn=local_disk_segment_already_exists";
-        return ErrorCode::SEGMENT_ALREADY_EXISTS;
+        if (exist_segment_it->second->lifetime.isAvailable()) {
+            LOG(WARNING) << "client_id=" << client_id
+                         << ", warn=local_disk_segment_already_exists";
+            return ErrorCode::SEGMENT_ALREADY_EXISTS;
+        }
+        int64_t reported_capacity = 0;
+        {
+            MutexLocker locker(&exist_segment_it->second->offloading_mutex_);
+            reported_capacity =
+                exist_segment_it->second->ssd_total_capacity_bytes;
+        }
+        if (reported_capacity > 0) {
+            MasterMetricManager::instance().dec_total_file_capacity(
+                reported_capacity);
+        }
+        segment_manager_->client_local_disk_segment_.erase(exist_segment_it);
     }
     segment_manager_->client_local_disk_segment_.emplace(
         client_id, std::make_shared<LocalDiskSegment>(enable_offloading));
@@ -407,9 +420,22 @@ ErrorCode ScopedSegmentAccess::GetClientSegments(
     return ErrorCode::OK;
 }
 
-void ScopedSegmentAccess::UnmountLocalDiskSegment(const UUID& client_id) {
+std::shared_ptr<LocalDiskSegment>
+ScopedSegmentAccess::PrepareUnmountLocalDiskSegment(const UUID& client_id) {
     auto it = segment_manager_->client_local_disk_segment_.find(client_id);
-    if (it != segment_manager_->client_local_disk_segment_.end()) {
+    if (it == segment_manager_->client_local_disk_segment_.end()) {
+        return nullptr;
+    }
+    it->second->lifetime.invalidate();
+    return it->second;
+}
+
+void ScopedSegmentAccess::CommitUnmountLocalDiskSegment(
+    const UUID& client_id,
+    const std::shared_ptr<LocalDiskSegment>& expected_segment) {
+    auto it = segment_manager_->client_local_disk_segment_.find(client_id);
+    if (it != segment_manager_->client_local_disk_segment_.end() &&
+        it->second == expected_segment) {
         // Hold offloading_mutex_ while reading ssd_total_capacity_bytes to
         // avoid a data race with OffloadObjectHeartbeat, which writes the
         // field under the same lock.  Release the lock before erase() so we
@@ -557,6 +583,15 @@ ErrorCode SegmentView::GetMountedSegment(const UUID& segment_id,
     // Return the found segment
     mountedSegment = it->second;
     return ErrorCode::OK;
+}
+
+SegmentLifetime SegmentView::GetLocalDiskSegmentLifetime(
+    const UUID& client_id) const {
+    auto it = segment_manager_->client_local_disk_segment_.find(client_id);
+    if (it == segment_manager_->client_local_disk_segment_.end()) {
+        return SegmentLifetime::Unavailable();
+    }
+    return it->second->lifetime;
 }
 
 tl::expected<std::vector<uint8_t>, SerializationError>

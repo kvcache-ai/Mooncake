@@ -22,6 +22,7 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "allocation_strategy.h"
+#include "background_worker.h"
 #include "count_min_sketch.h"
 #include "deadline_scheduler.h"
 #include "master_metric_manager.h"
@@ -74,9 +75,9 @@ class BatchEvictBench;
 /*
  * @brief MasterService is the main class for the master server.
  * Lock order: To avoid deadlocks, the following lock order should be followed:
- * 1. client_mutex_
- * 2. tenant_quota_policy_mutex_
- * 3. snapshot_mutex_
+ * 1. tenant_quota_policy_mutex_
+ * 2. snapshot_mutex_
+ * 3. client_mutex_
  * 4. metadata_shards_[shard_idx_].mutex
  * 5. tenant_quota_shards_[shard_idx_].mutex
  * 6. segment_mutex_
@@ -835,15 +836,6 @@ class MasterService {
     void UpdateClientHostId(const UUID& client_id, const std::string& host_id);
     std::string GetClientHostId(const UUID& client_id) const;
 
-    // Clear invalid handles in all shards
-    void ClearInvalidHandles();
-    void ClearInvalidHandles(
-        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients);
-    struct ObjectMetadata;
-    bool HasVisibleCompletedReplica(const ObjectMetadata& metadata) const;
-    std::vector<Replica::Descriptor> GetVisibleReplicaDescriptors(
-        const ObjectMetadata& metadata) const;
-
     std::string FormatTimestamp(
         const std::chrono::system_clock::time_point& tp);
     // We need to clean up finished tasks periodically to avoid memory leak
@@ -1134,15 +1126,30 @@ class MasterService {
 
         bool IsGrouped() const { return !group_id.empty(); }
 
-        // Check if the metadata is valid
-        // Valid means it has at least one valid replica and size is greater
-        // than 0
-        bool IsValid() const {
-            return size > 0 && HasReplica([](const Replica& replica) {
-                       return !replica.is_memory_replica() ||
-                              !replica.has_invalid_mem_handle();
-                   });
+        bool HasAvailableReplica() const {
+            return HasReplica(
+                [](const Replica& replica) { return replica.is_available(); });
         }
+
+        bool HasCompletedAvailableReplica() const {
+            return HasReplica(&Replica::fn_is_completed_and_available);
+        }
+
+        std::vector<Replica::Descriptor>
+        GetCompletedAvailableReplicaDescriptors() const {
+            std::vector<Replica::Descriptor> descriptors;
+            VisitReplicas(
+                &Replica::fn_is_completed,
+                [&descriptors](const Replica& replica) {
+                    auto descriptor = replica.get_available_descriptor();
+                    if (descriptor) {
+                        descriptors.emplace_back(std::move(*descriptor));
+                    }
+                });
+            return descriptors;
+        }
+
+        bool IsValid() const { return size > 0 && HasAvailableReplica(); }
 
         std::vector<std::string> GetReplicaSegmentNames() const {
             std::vector<std::string> segment_names;
@@ -1452,12 +1459,9 @@ class MasterService {
                             const std::string& key,
                             const ObjectMetadata& metadata) const;
 
-    // Helper to clean up stale handles pointing to unmounted segments
-    // or local_disk replicas whose owner client is no longer alive.
-    bool CleanupStaleHandles(
-        ObjectMetadata& metadata,
-        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients,
-        MetadataShardAccessorRW* shard = nullptr);
+    void SweepUnavailableReplicas();
+    void PruneCompletedUnavailableReplicas(ObjectMetadata& metadata,
+                                           MetadataShardAccessorRW* shard);
 
     // Helper: allocate replicas, create ObjectMetadata, insert into shard,
     // and return descriptor list.  Shared by PutStart and UpsertStart.
@@ -1573,27 +1577,7 @@ class MasterService {
     std::mutex task_cleanup_mutex_;
     std::condition_variable task_cleanup_cv_;
 
-    class InvalidHandleCleanup {
-       public:
-        explicit InvalidHandleCleanup(MasterService* service)
-            : service_(service) {}
-        ~InvalidHandleCleanup();
-
-        void Start();
-        void Stop();
-        void Schedule();
-
-       private:
-        void ThreadFunc();
-
-        MasterService* service_;
-        std::thread thread_;
-        bool running_{false};
-        bool requested_{false};
-        std::mutex mutex_;
-        std::condition_variable cv_;
-    };
-    InvalidHandleCleanup invalid_handle_cleanup_{this};
+    BackgroundWorker replica_cleanup_worker_;
 
     // Helper class for accessing metadata with automatic locking and cleanup
     class MetadataAccessorRW {
@@ -1620,28 +1604,12 @@ class MasterService {
                                        ? ReplicationTaskIterator{}
                                        : tenant_state_->replication_tasks.find(
                                              object_id_.user_key)) {
-            // Automatically clean up invalid handles (memory replicas only).
-            // Note: We only check memory replicas here to avoid lock order
-            // violation (client_mutex_ must be acquired before metadata shard).
-            // local_disk replicas are cleaned up by ClearInvalidHandles() in
-            // ClientMonitorFunc.
+            // Replica availability is backed by lock-free lifetime tokens, so
+            // cleanup does not need to acquire allocator or client locks.
             if (tenant_state_ != nullptr &&
                 it_ != tenant_state_->metadata.end()) {
-                // Erase invalid memory replicas (those with unmounted
-                // segments). No client_mutex_ needed since we only check memory
-                // replicas.
-                const uint64_t before_charge =
-                    service_->CompletedMemoryQuotaCharge(it_->second);
-                service_->EraseReplicasWithCacheTotalAccounting(
-                    it_->second, [](const Replica& replica) {
-                        return replica.has_invalid_mem_handle();
-                    });
-                const uint64_t after_charge =
-                    service_->CompletedMemoryQuotaCharge(it_->second);
-                if (before_charge > after_charge) {
-                    service_->ReleaseCommittedQuotaCharge(
-                        it_->second, before_charge - after_charge);
-                }
+                service_->PruneCompletedUnavailableReplicas(it_->second,
+                                                            &shard_guard_);
                 // If no valid replicas remain, delete the whole object.
                 if (!it_->second.IsValid()) {
                     const bool had_processing =

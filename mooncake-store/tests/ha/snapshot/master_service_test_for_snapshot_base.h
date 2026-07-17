@@ -165,16 +165,12 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
     // private members
     static tl::expected<void, SerializationError> CallPersistState(
         MasterService* service, const std::string& snapshot_id) {
-        // Production captures client liveness before taking snapshot_mutex_
-        // so stale-handle cleanup does not invert the documented lock order.
-        auto alive_clients = service->getAliveClientsSnapshot();
-
         // Production snapshots exclude mutating operations while forking.
         // Direct persistence in tests needs the same isolation because it
         // serializes live metadata in the current process.
         std::unique_lock<std::shared_mutex> snapshot_lock(
             service->snapshot_mutex_);
-        service->ClearInvalidHandles(alive_clients);
+        service->SweepUnavailableReplicas();
 
         // If snapshot_manager_ exists, use it; otherwise create a temporary one
         if (service->snapshot_manager_) {
@@ -211,7 +207,21 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
     }
 
     static void StopInvalidHandleCleanup(MasterService* service) {
-        service->invalid_handle_cleanup_.Stop();
+        service->replica_cleanup_worker_.Stop();
+    }
+
+    static void CallSweepUnavailableReplicas(MasterService* service) {
+        std::shared_lock<std::shared_mutex> snapshot_lock(
+            service->snapshot_mutex_);
+        service->SweepUnavailableReplicas();
+    }
+
+    static tl::expected<bool, ErrorCode> AddLocalDiskReplica(
+        MasterService* service, const UUID& client_id, const std::string& key,
+        uint64_t size, const std::string& transport_endpoint) {
+        Replica replica(client_id, size, transport_endpoint,
+                        ReplicaStatus::COMPLETE);
+        return service->AddReplica(client_id, key, "default", replica);
     }
 
     static void EnsureSnapshotStores(MasterService* service) {

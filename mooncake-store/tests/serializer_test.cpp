@@ -287,6 +287,63 @@ TEST_F(SerializerTest, RestoredReplicaTracksRestoredSegmentLifetime) {
     EXPECT_FALSE((*restored_replica)->get_available_descriptor().has_value());
 }
 
+TEST_F(SerializerTest, LocalDiskReplicaTracksSegmentGenerationLifetime) {
+    SegmentManager source_manager(BufferAllocatorType::OFFSET);
+    const UUID client_id = generate_uuid();
+    {
+        auto segment_access = source_manager.getSegmentAccess();
+        ASSERT_EQ(ErrorCode::OK,
+                  segment_access.MountLocalDiskSegment(client_id, true));
+    }
+
+    Replica replica(client_id, 1024, "local_disk_endpoint",
+                    ReplicaStatus::COMPLETE);
+    msgpack::sbuffer replica_buffer;
+    MsgpackPacker replica_packer(&replica_buffer);
+    SegmentView source_view(&source_manager);
+    ASSERT_TRUE(
+        Serializer<Replica>::serialize(replica, source_view, replica_packer)
+            .has_value());
+
+    SegmentSerializer source_serializer(&source_manager);
+    auto segment_snapshot = source_serializer.Serialize();
+    ASSERT_TRUE(segment_snapshot.has_value());
+
+    SegmentManager restored_manager(BufferAllocatorType::OFFSET);
+    SegmentSerializer restored_serializer(&restored_manager);
+    ASSERT_TRUE(restored_serializer.Deserialize(*segment_snapshot).has_value());
+    SegmentView restored_view(&restored_manager);
+    auto replica_object =
+        msgpack::unpack(replica_buffer.data(), replica_buffer.size());
+    auto restored_replica =
+        Serializer<Replica>::deserialize(replica_object.get(), restored_view);
+    ASSERT_TRUE(restored_replica.has_value());
+    ASSERT_TRUE((*restored_replica)->get_available_descriptor().has_value());
+
+    std::shared_ptr<LocalDiskSegment> old_generation;
+    {
+        auto segment_access = restored_manager.getSegmentAccess();
+        old_generation =
+            segment_access.PrepareUnmountLocalDiskSegment(client_id);
+    }
+    ASSERT_TRUE(old_generation);
+    EXPECT_FALSE((*restored_replica)->get_available_descriptor().has_value());
+
+    // A remount creates a new generation. Committing cleanup for the old
+    // generation must not invalidate or erase the replacement.
+    {
+        auto segment_access = restored_manager.getSegmentAccess();
+        ASSERT_EQ(ErrorCode::OK,
+                  segment_access.MountLocalDiskSegment(client_id, true));
+        segment_access.CommitUnmountLocalDiskSegment(client_id, old_generation);
+    }
+    auto new_replica =
+        Serializer<Replica>::deserialize(replica_object.get(), restored_view);
+    ASSERT_TRUE(new_replica.has_value());
+    EXPECT_TRUE((*new_replica)->get_available_descriptor().has_value());
+    EXPECT_FALSE((*restored_replica)->get_available_descriptor().has_value());
+}
+
 TEST_F(SerializerTest, SameNameSegmentsRestoreIndependentRegistrations) {
     SegmentManager source_manager(BufferAllocatorType::OFFSET);
     Segment segment1;

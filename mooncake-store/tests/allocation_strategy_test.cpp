@@ -162,9 +162,9 @@ TEST_P(AllocationStrategyParameterizedTest,
     ASSERT_EQ(1u, result->size());
     EXPECT_TRUE(result.value()[0].get_available_descriptor().has_value());
 
-    registration->setAvailable(false);
+    registration->invalidate();
     EXPECT_FALSE(result.value()[0].get_available_descriptor().has_value());
-    EXPECT_TRUE(result.value()[0].has_invalid_mem_handle());
+    EXPECT_FALSE(result.value()[0].is_available());
 }
 
 TEST_P(AllocationStrategyParameterizedTest,
@@ -184,7 +184,7 @@ TEST_P(AllocationStrategyParameterizedTest,
     EXPECT_EQ("client_cxl_segment", descriptor->get_memory_descriptor()
                                         .buffer_descriptor.transport_endpoint_);
 
-    registration->setAvailable(false);
+    registration->invalidate();
     EXPECT_FALSE(result.value()[0].get_available_descriptor().has_value());
 }
 

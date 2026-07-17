@@ -3,6 +3,7 @@
 #include <boost/functional/hash.hpp>
 #include <chrono>
 #include <map>
+#include <optional>
 #include <ostream>
 #include <set>
 #include <shared_mutex>
@@ -91,6 +92,7 @@ inline std::ostream& operator<<(
 
 struct LocalDiskSegment {
     mutable Mutex offloading_mutex_;
+    SegmentLifetime lifetime = SegmentLifetime::Available();
     bool enable_offloading;
     int64_t ssd_total_capacity_bytes = 0;  // last reported by client heartbeat
     std::atomic<int64_t> ssd_used_bytes{0};
@@ -235,11 +237,11 @@ class ScopedSegmentAccess {
     ErrorCode SetSegmentStatusByName(const std::string& segment_name,
                                      SegmentStatus status);
 
-    /**
-     * @brief Remove the local disk segment entry for a client.
-     * Called when a client expires to clean up its local disk segment.
-     */
-    void UnmountLocalDiskSegment(const UUID& client_id);
+    std::shared_ptr<LocalDiskSegment> PrepareUnmountLocalDiskSegment(
+        const UUID& client_id);
+    void CommitUnmountLocalDiskSegment(
+        const UUID& client_id,
+        const std::shared_ptr<LocalDiskSegment>& expected_segment);
 
    private:
     SegmentManager* segment_manager_;
@@ -400,6 +402,8 @@ class SegmentView {
 
     ErrorCode GetMountedSegment(const UUID& segment_id,
                                 MountedSegment& mountedSegment) const;
+
+    SegmentLifetime GetLocalDiskSegmentLifetime(const UUID& client_id) const;
 
    private:
     const SegmentManager* segment_manager_;

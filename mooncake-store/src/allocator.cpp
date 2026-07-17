@@ -50,12 +50,12 @@ AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor() const {
 }
 
 bool AllocatedBuffer::getDescriptorIfAvailable(Descriptor& descriptor) const {
-    if (!isAllocatorValid()) {
+    if (!isAvailable()) {
         return false;
     }
 
     descriptor = get_descriptor();
-    return isAllocatorValid();
+    return isAvailable();
 }
 
 void AllocatedBuffer::change_to_cxl(std::string client_segment_name) {

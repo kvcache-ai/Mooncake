@@ -360,7 +360,7 @@ MasterMetricManager::MasterMetricManager()
           "master_promotion_cancelled_total",
           "Total promotion tasks removed because the prerequisite went "
           "away: object removal mid-flight (Remove / UpsertStart / etc.), "
-          "holder-client expiry (ClearInvalidHandles), or staged replica "
+          "holder-client expiry (client-liveness cleanup), or staged replica "
           "lost (NotifyPromotionSuccess committed=false)"),
       promotion_rejected_frequency_(
           "master_promotion_rejected_frequency_total",
