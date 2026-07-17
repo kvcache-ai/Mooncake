@@ -187,7 +187,7 @@ impl ControlPlaneClient {
             let channel = self.channel_for(lease)?;
             let request = pb::TriggerColdTierOffloadRequest { max_tasks };
             let reply = self.rpc(
-                |mut client| async move {
+                move |mut client| async move {
                     client
                         .trigger_cold_tier_offload(Request::new(request))
                         .await
@@ -215,10 +215,13 @@ impl ControlPlaneClient {
                 device_id: device_id.to_string(),
                 max_backings,
             };
-            let reply = self.rpc(
-                |mut client| async move { client.manual_cold_tier_gc(Request::new(request)).await },
-                channel,
-            )?;
+            let reply =
+                self.rpc(
+                    move |mut client| async move {
+                        client.manual_cold_tier_gc(Request::new(request)).await
+                    },
+                    channel,
+                )?;
             decode_error(reply.error)?;
             Ok(reply.collected)
         })();
@@ -240,13 +243,12 @@ impl ControlPlaneClient {
                 device_id: device_id.to_string(),
                 max_victims,
             };
-            let reply =
-                self.rpc(
-                    |mut client| async move {
-                        client.manual_cold_tier_free(Request::new(request)).await
-                    },
-                    channel,
-                )?;
+            let reply = self.rpc(
+                move |mut client| async move {
+                    client.manual_cold_tier_free(Request::new(request)).await
+                },
+                channel,
+            )?;
             decode_error(reply.error.clone())?;
             Ok(reply)
         })();
@@ -272,13 +274,12 @@ impl ControlPlaneClient {
             let request = pb::ProbeColdTierDeviceRequest {
                 device_id: device_id.to_string(),
             };
-            let reply =
-                self.rpc(
-                    |mut client| async move {
-                        client.probe_cold_tier_device(Request::new(request)).await
-                    },
-                    channel,
-                )?;
+            let reply = self.rpc(
+                move |mut client| async move {
+                    client.probe_cold_tier_device(Request::new(request)).await
+                },
+                channel,
+            )?;
             decode_error(reply.error.clone())?;
             Ok(reply)
         })();
@@ -296,7 +297,7 @@ impl ControlPlaneClient {
         let result = (|| {
             let channel = self.channel_for(lease)?;
             let reply = self.rpc(
-                |mut client| async move { client.read_from_cold(Request::new(request)).await },
+                move |mut client| async move { client.read_from_cold(Request::new(request)).await },
                 channel,
             )?;
             if reply.backpressure {
@@ -321,7 +322,7 @@ impl ControlPlaneClient {
         let result = (|| {
             let channel = self.channel_for(lease)?;
             self.rpc(
-                |mut client| async move {
+                move |mut client| async move {
                     client.batch_read_from_cold(Request::new(request)).await
                 },
                 channel,
@@ -348,7 +349,7 @@ impl ControlPlaneClient {
         let result = (|| {
             let channel = self.channel_for(lease)?;
             let reply = self.rpc(
-                |mut client| async move {
+                move |mut client| async move {
                     client
                         .batch_reclaim_cold_backings(Request::new(request))
                         .await
@@ -413,7 +414,7 @@ impl ControlPlaneClient {
             segment_offsets,
         };
         let reply = self.rpc(
-            |mut client| async move { client.pin_for_read(Request::new(request)).await },
+            move |mut client| async move { client.pin_for_read(Request::new(request)).await },
             channel,
         )?;
         Ok(reply.pinned)
