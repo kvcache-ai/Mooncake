@@ -223,6 +223,13 @@ struct MooncakeGin {
                 // packed value is updated atomically with release ordering.
                 ptx::red_add_rel_sys(routed, static_cast<int64_t>(value));
             } else {
+                if (ctx.use_64bit_rdma_atomics) {
+                    device::mc_red_add64(ctx, dst_rank, qp_idx,
+                                         physical_qps_per_rank,
+                                         reinterpret_cast<int64_t*>(dst_ptr),
+                                         static_cast<int64_t>(value));
+                    return;
+                }
                 // Mooncake's current Device API only exposes 32-bit remote
                 // reduction.  Do not emulate the 64-bit add with an RDMA WRITE
                 // from a thread-local scalar: IBGDA WQEs use the registered GDR
