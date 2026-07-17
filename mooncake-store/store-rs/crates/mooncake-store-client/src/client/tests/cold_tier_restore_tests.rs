@@ -543,7 +543,9 @@ fn debug_evict_all_waits_for_pending_offload_claim_race() {
     sleep(Duration::from_millis(50));
     client.storage_owner.pending_offloads.retry(claimed);
 
-    assert_eq!(evict.join().expect("evict thread should join").unwrap(), 1);
+    let result = evict.join().expect("evict thread should join").unwrap();
+    assert!(result.completed, "evict-all should complete: {result:?}");
+    assert_eq!(result.evicted, 1);
     let route = client
         .query_route("debug-evict-race")
         .expect("route query should succeed")
@@ -590,7 +592,9 @@ fn debug_evict_all_removes_all_dram_replicas() {
     wait_for_materialized_cold_backing(&client, "debug-evict-a");
     wait_for_materialized_cold_backing(&client, "debug-evict-b");
 
-    assert_eq!(client.debug_evict_all().expect("debug evict-all"), 2);
+    let result = client.debug_evict_all().expect("debug evict-all");
+    assert!(result.completed, "evict-all should complete: {result:?}");
+    assert_eq!(result.evicted, 2);
     for key in ["debug-evict-a", "debug-evict-b"] {
         let route = client
             .query_route(key)
@@ -712,10 +716,13 @@ fn debug_evict_all_succeeds_with_pending_offload_and_disabled_device() {
     .expect("cache refresh should succeed");
 
     // Before the fix this would return Err(InvalidState("...no progress...")).
-    let evicted = client
+    let result = client
         .debug_evict_all()
         .expect("evict-all should succeed with PendingOffload + disabled device");
-    assert_eq!(evicted, 1, "should evict the single DRAM replica");
+    assert!(result.completed, "evict-all should complete: {result:?}");
+    assert_eq!(result.evicted, 1, "should evict the single DRAM replica");
+    assert_eq!(result.remaining_hot_replicas, 0);
+    assert_eq!(result.dropped_without_cold, 1);
 
     // Route should be fully deleted (no cold copy was on disk).
     assert!(

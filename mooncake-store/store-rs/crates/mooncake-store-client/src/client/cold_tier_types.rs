@@ -214,6 +214,20 @@ pub enum ColdTierEvictionPriorityPolicy {
     ColdestLargestFirst,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DebugEvictAllResult {
+    pub evicted: usize,
+    pub completed: bool,
+    pub remaining_hot_replicas: usize,
+    pub repaired: usize,
+    pub dropped_without_cold: usize,
+    pub timed_out: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stopped_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ColdTierOffloadPriorityConfig {
     pub pending_policy: ColdTierPendingOffloadPolicy,

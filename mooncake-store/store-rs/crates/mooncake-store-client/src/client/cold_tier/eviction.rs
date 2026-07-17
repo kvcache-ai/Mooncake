@@ -1,40 +1,53 @@
 use super::super::{
-    refresh_cold_tier_device_cache, ObjectRoute, OperationTracker, PendingOffloadPrepareOutcome,
-    RestorePromotionQueue, Result, RouteState, StorageOwnerState,
+    refresh_cold_tier_device_cache, DebugEvictAllResult, ObjectRoute, OperationTracker,
+    PendingOffloadPrepareOutcome, RestorePromotionQueue, Result, RouteState, StorageOwnerState,
 };
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar as StdCondvar, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 impl StorageOwnerState {
     pub(in super::super) fn evict_all(
         &self,
         restore_promotions: &RestorePromotionQueue,
-    ) -> Result<usize> {
+    ) -> Result<DebugEvictAllResult> {
         const MAX_ERROR_RETRIES: usize = 3;
         const MAX_NO_PROGRESS_RETRIES: usize = 100;
         const NO_PROGRESS_RETRY_DELAY: Duration = Duration::from_millis(10);
+        const DEBUG_EVICT_ALL_DEADLINE: Duration = Duration::from_secs(25);
 
-        let mut evicted = 0usize;
+        let started = Instant::now();
+        let mut result = DebugEvictAllResult::default();
         let mut error_retries = 0usize;
         let mut no_progress_retries = 0usize;
         self.rebuild_clock()?;
         loop {
-            match self.evict_one_blocking(None) {
-                Ok(true) => {
-                    evicted += 1;
+            if started.elapsed() >= DEBUG_EVICT_ALL_DEADLINE {
+                result.timed_out = true;
+                result.stopped_reason = Some("timeout".to_string());
+                break;
+            }
+            match self.evict_one_blocking_for_debug_evict_all(None, false) {
+                Ok(outcome) if outcome.evicted => {
+                    result.evicted = result.evicted.saturating_add(1);
+                    if outcome.dropped_without_cold {
+                        result.dropped_without_cold = result.dropped_without_cold.saturating_add(1);
+                    }
                     error_retries = 0;
                     no_progress_retries = 0;
                 }
-                Ok(false) if !self.has_hot_replicas_for_debug_evict_all()? => break,
-                Ok(false) if no_progress_retries < MAX_NO_PROGRESS_RETRIES => {
+                Ok(_) if !self.has_hot_replicas_for_debug_evict_all()? => break,
+                Ok(_) if no_progress_retries < MAX_NO_PROGRESS_RETRIES => {
                     no_progress_retries += 1;
                     restore_promotions.wait_for_worker_idle();
+                    let repaired = self.repair_stuck_pending_offloads_for_debug_evict_all()?;
+                    result.repaired = result.repaired.saturating_add(repaired);
                     warn!(
                         runtime = %self.runtime,
-                        evicted,
+                        evicted = result.evicted,
+                        repaired,
                         attempt = no_progress_retries,
                         max_attempts = MAX_NO_PROGRESS_RETRIES,
                         "debug evict_all retrying after no-progress scan with hot replicas remaining"
@@ -42,34 +55,28 @@ impl StorageOwnerState {
                     std::thread::sleep(NO_PROGRESS_RETRY_DELAY);
                     self.rebuild_clock()?;
                 }
-                Ok(false) => {
-                    let repaired = self.repair_stuck_pending_offloads_for_debug_evict_all()?;
-                    if repaired > 0 {
-                        warn!(
-                            runtime = %self.runtime,
-                            evicted,
-                            repaired,
-                            "debug evict_all repaired stuck pending offloads after no-progress scans"
-                        );
+                Ok(_) => {
+                    let forced = self.evict_one_blocking_for_debug_evict_all(None, true)?;
+                    if forced.evicted {
+                        result.evicted = result.evicted.saturating_add(1);
+                        if forced.dropped_without_cold {
+                            result.dropped_without_cold =
+                                result.dropped_without_cold.saturating_add(1);
+                        }
+                        error_retries = 0;
                         no_progress_retries = 0;
                         self.rebuild_clock()?;
                         continue;
                     }
-                    let remaining = self.hot_replica_count_for_debug_evict_all()?;
-                    warn!(
-                        runtime = %self.runtime,
-                        evicted,
-                        remaining,
-                        max_attempts = MAX_NO_PROGRESS_RETRIES,
-                        "debug evict_all stopped after best-effort no-progress scans"
-                    );
+                    result.stopped_reason = Some("no_progress".to_string());
                     break;
                 }
                 Err(error) if error_retries < MAX_ERROR_RETRIES => {
                     error_retries += 1;
+                    result.last_error = Some(error.to_string());
                     warn!(
                         runtime = %self.runtime,
-                        evicted,
+                        evicted = result.evicted,
                         attempt = error_retries,
                         max_attempts = MAX_ERROR_RETRIES,
                         error = %error,
@@ -78,37 +85,39 @@ impl StorageOwnerState {
                     self.rebuild_clock()?;
                 }
                 Err(error) => {
-                    let repaired = self.repair_stuck_pending_offloads_for_debug_evict_all()?;
-                    if repaired > 0 {
-                        warn!(
-                            runtime = %self.runtime,
-                            evicted,
-                            repaired,
-                            error = %error,
-                            "debug evict_all repaired stuck pending offloads after eviction error"
-                        );
+                    result.last_error = Some(error.to_string());
+                    let forced = self.evict_one_blocking_for_debug_evict_all(None, true)?;
+                    if forced.evicted {
+                        result.evicted = result.evicted.saturating_add(1);
+                        if forced.dropped_without_cold {
+                            result.dropped_without_cold =
+                                result.dropped_without_cold.saturating_add(1);
+                        }
                         error_retries = 0;
+                        no_progress_retries = 0;
                         self.rebuild_clock()?;
                         continue;
                     }
-                    let remaining = self.hot_replica_count_for_debug_evict_all()?;
-                    warn!(
-                        runtime = %self.runtime,
-                        evicted,
-                        remaining,
-                        error = %error,
-                        "debug evict_all stopped after best-effort eviction error handling"
-                    );
+                    result.stopped_reason = Some("eviction_error".to_string());
                     break;
                 }
             }
         }
+        result.remaining_hot_replicas = self.hot_replica_count_for_debug_evict_all()?;
+        result.completed = result.remaining_hot_replicas == 0;
+        if result.completed {
+            result.stopped_reason = None;
+        }
         info!(
             runtime = %self.runtime,
-            evicted,
+            evicted = result.evicted,
+            completed = result.completed,
+            remaining_hot_replicas = result.remaining_hot_replicas,
+            dropped_without_cold = result.dropped_without_cold,
+            timed_out = result.timed_out,
             "debug evict_all completed"
         );
-        Ok(evicted)
+        Ok(result)
     }
 
     fn has_hot_replicas_for_debug_evict_all(&self) -> Result<bool> {

@@ -18,6 +18,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use mooncake_store_core::{Result, StoreError};
+
+use crate::client::DebugEvictAllResult;
 #[cfg(test)]
 use parking_lot::ReentrantMutex;
 use tracing_subscriber::fmt::format::FmtSpan;
@@ -35,7 +37,7 @@ static DEBUG_EVICT_ALL_FN: OnceLock<Mutex<Option<DebugEvictAllFn>>> = OnceLock::
 static TEST_PROCESS_LOCK: OnceLock<ReentrantMutex<()>> = OnceLock::new();
 
 /// Callback type for the debug evict-all endpoint.
-type DebugEvictAllFn = Arc<dyn Fn() -> Result<usize> + Send + Sync>;
+type DebugEvictAllFn = Arc<dyn Fn() -> Result<DebugEvictAllResult> + Send + Sync>;
 
 const HTTP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const HTTP_READ_TIMEOUT: Duration = Duration::from_millis(250);
@@ -595,11 +597,24 @@ fn handle_debug_evict_all() -> (&'static str, &'static str, String) {
         callback
     };
     match callback() {
-        Ok(evicted) => (
-            "200 OK",
-            "application/json; charset=utf-8",
-            format!(r#"{{"evicted":{evicted}}}"#),
-        ),
+        Ok(result) => {
+            let status = if result.completed {
+                "200 OK"
+            } else {
+                "409 Conflict"
+            };
+            match serde_json::to_string(&result) {
+                Ok(body) => (status, "application/json; charset=utf-8", body),
+                Err(error) => (
+                    "500 Internal Server Error",
+                    "application/json; charset=utf-8",
+                    format!(
+                        r#"{{"error":"failed to serialize evict-all result: {}"}}"#,
+                        error.to_string().replace('"', "\\\"")
+                    ),
+                ),
+            }
+        }
         Err(error) => (
             "500 Internal Server Error",
             "application/json; charset=utf-8",
@@ -1838,12 +1853,49 @@ mod tests {
         register_debug_evict_all(Arc::new(|| {
             Err(StoreError::InvalidState("stale callback".to_string()))
         }));
-        register_debug_evict_all(Arc::new(|| Ok(7)));
+        register_debug_evict_all(Arc::new(|| {
+            Ok(DebugEvictAllResult {
+                evicted: 7,
+                completed: true,
+                ..DebugEvictAllResult::default()
+            })
+        }));
 
         let (status, content_type, body) = handle_debug_evict_all();
         assert_eq!(status, "200 OK");
         assert_eq!(content_type, "application/json; charset=utf-8");
-        assert_eq!(body, r#"{"evicted":7}"#);
+        assert!(body.contains(r#""evicted":7"#));
+        assert!(body.contains(r#""completed":true"#));
+
+        *debug_evict_all_callback()
+            .lock()
+            .expect("debug evict-all callback lock should not be poisoned") = None;
+    }
+
+    #[test]
+    fn debug_evict_all_partial_result_returns_conflict() {
+        let _guard = metrics_test_lock().lock();
+        *debug_evict_all_callback()
+            .lock()
+            .expect("debug evict-all callback lock should not be poisoned") = None;
+
+        register_debug_evict_all(Arc::new(|| {
+            Ok(DebugEvictAllResult {
+                evicted: 3,
+                completed: false,
+                remaining_hot_replicas: 2,
+                stopped_reason: Some("timeout".to_string()),
+                ..DebugEvictAllResult::default()
+            })
+        }));
+
+        let (status, content_type, body) = handle_debug_evict_all();
+        assert_eq!(status, "409 Conflict");
+        assert_eq!(content_type, "application/json; charset=utf-8");
+        assert!(body.contains(r#""evicted":3"#));
+        assert!(body.contains(r#""completed":false"#));
+        assert!(body.contains(r#""remaining_hot_replicas":2"#));
+        assert!(body.contains(r#""stopped_reason":"timeout""#));
 
         *debug_evict_all_callback()
             .lock()
@@ -1873,10 +1925,17 @@ mod tests {
         assert!(response.contains("HTTP/1.1 503"), "no callback → 503");
         assert!(response.contains("evict-all callback not registered"));
 
-        register_debug_evict_all(Arc::new(|| Ok(42)));
+        register_debug_evict_all(Arc::new(|| {
+            Ok(DebugEvictAllResult {
+                evicted: 42,
+                completed: true,
+                ..DebugEvictAllResult::default()
+            })
+        }));
         let response = post_evict(&address);
         assert!(response.contains("HTTP/1.1 200 OK"), "registered → 200");
-        assert!(response.contains(r#"{"evicted":42}"#));
+        assert!(response.contains(r#""evicted":42"#));
+        assert!(response.contains(r#""completed":true"#));
 
         *debug_evict_all_callback()
             .lock()
