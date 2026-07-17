@@ -5,7 +5,7 @@
 #undef protected
 
 #ifdef STORE_USE_REDIS
-#include "redis_helper.h"
+#include "redis_election_helper.h"
 #endif
 
 namespace mooncake {
@@ -48,7 +48,7 @@ void WriteRedisMasterViewOrSkip(const std::string& cluster_id,
 
     std::string key = RedisMasterViewKey(cluster_id);
     std::string value =
-        RedisHelper::SerializeLeaderValue(master_address, version, 30);
+        RedisElectionHelper::SerializeLeaderValue(master_address, version, 30);
     RedisReplyPtr reply(static_cast<redisReply*>(
         redisCommand(ctx, "SET %b %b EX 30", key.data(), key.size(),
                      value.data(), value.size())));

@@ -98,10 +98,10 @@ if (STORE_USE_ETCD)
     add_test(NAME high_availability_test COMMAND high_availability_test)
 endif()
 
-add_executable(redis_helper_test redis_helper_test.cpp)
-target_link_libraries(redis_helper_test PUBLIC mooncake_store transfer_engine cachelib_memory_allocator ${ETCD_WRAPPER_LIB} glog gtest gtest_main pthread)
+add_executable(redis_election_helper_test redis_election_helper_test.cpp)
+target_link_libraries(redis_election_helper_test PUBLIC mooncake_store transfer_engine cachelib_memory_allocator ${ETCD_WRAPPER_LIB} glog gtest gtest_main pthread)
 if(STORE_USE_REDIS)
-    add_test(NAME redis_helper_test COMMAND redis_helper_test)
+    add_test(NAME redis_election_helper_test COMMAND redis_election_helper_test)
 endif()
 
 if(STORE_USE_REDIS)

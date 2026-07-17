@@ -4,29 +4,19 @@
 
 #include <atomic>
 #include <cstdint>
-#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 
 #include <hiredis/hiredis.h>
+#include "redis_util.h"
 #include "types.h"
 
 namespace mooncake {
 
-/// Custom deleter for redisReply* — used by RedisReplyPtr.
-struct RedisReplyDeleter {
-    void operator()(redisReply* reply) const {
-        if (reply) freeReplyObject(reply);
-    }
-};
-
-/// RAII wrapper for redisReply* — automatically calls freeReplyObject on
-/// destruction. Usage: RedisReplyPtr reply((redisReply*)redisCommand(...));
-using RedisReplyPtr = std::unique_ptr<redisReply, RedisReplyDeleter>;
-
 /**
- * @brief Redis helper for leader election, mirroring EtcdHelper's role.
+ * @brief Redis helper for leader election, mirroring EtcdHelper's election
+ * role.
  *
  * Uses SET NX EX for atomic election, Lua scripts for lease renewal,
  * and Pub/Sub + fallback polling for watching leader key expiration.
@@ -39,17 +29,17 @@ using RedisReplyPtr = std::unique_ptr<redisReply, RedisReplyDeleter>;
  * polling connections are used only from single threads and do not need
  * mutual exclusion.
  */
-class RedisHelper {
+class RedisElectionHelper {
    public:
-    RedisHelper(const std::string& cluster_id,
-                const std::string& redis_endpoint,
-                const std::string& password = "", int db_index = 0,
-                int ttl_sec = 5, int heartbeat_interval_sec = 2,
-                const std::string& username = "");
-    ~RedisHelper();
+    RedisElectionHelper(const std::string& cluster_id,
+                        const std::string& redis_endpoint,
+                        const std::string& password = "", int db_index = 0,
+                        int ttl_sec = 5, int heartbeat_interval_sec = 2,
+                        const std::string& username = "");
+    ~RedisElectionHelper();
 
-    RedisHelper(const RedisHelper&) = delete;
-    RedisHelper& operator=(const RedisHelper&) = delete;
+    RedisElectionHelper(const RedisElectionHelper&) = delete;
+    RedisElectionHelper& operator=(const RedisElectionHelper&) = delete;
 
     /**
      * @brief Connect to Redis. Must be called before ElectLeader.

@@ -1,6 +1,6 @@
 #ifdef STORE_USE_REDIS
 
-#include "redis_helper.h"
+#include "redis_election_helper.h"
 
 #include <glog/logging.h>
 
@@ -14,11 +14,12 @@ namespace mooncake {
 // Construction / Destruction
 // ============================================================
 
-RedisHelper::RedisHelper(const std::string& cluster_id,
-                         const std::string& redis_endpoint,
-                         const std::string& password, int db_index, int ttl_sec,
-                         int heartbeat_interval_sec,
-                         const std::string& username)
+RedisElectionHelper::RedisElectionHelper(const std::string& cluster_id,
+                                         const std::string& redis_endpoint,
+                                         const std::string& password,
+                                         int db_index, int ttl_sec,
+                                         int heartbeat_interval_sec,
+                                         const std::string& username)
     : redis_endpoint_(redis_endpoint),
       username_(username),
       password_(password),
@@ -34,14 +35,14 @@ RedisHelper::RedisHelper(const std::string& cluster_id,
     master_view_key_ = "mooncake:{" + cid + "}master_view";
     master_epoch_key_ = "mooncake:{" + cid + "}master_epoch";
     leader_event_channel_ = "mooncake:" + cid + "leader_event";
-    LOG(INFO) << "RedisHelper created, master_view_key=" << master_view_key_
-              << " epoch_key=" << master_epoch_key_
+    LOG(INFO) << "RedisElectionHelper created, master_view_key="
+              << master_view_key_ << " epoch_key=" << master_epoch_key_
               << " channel=" << leader_event_channel_ << " ttl=" << ttl_sec_
               << "s"
               << " heartbeat=" << heartbeat_interval_sec_ << "s";
 }
 
-RedisHelper::~RedisHelper() {
+RedisElectionHelper::~RedisElectionHelper() {
     CancelElection();
     CancelKeepAlive();
     if (subscribe_ctx_) {
@@ -61,77 +62,17 @@ RedisHelper::~RedisHelper() {
 // CreateConnection — common logic for Connect / polling
 // ============================================================
 
-redisContext* RedisHelper::CreateConnection() {
-    std::string host = "127.0.0.1";
-    int port = 6379;
-    auto colon_pos = redis_endpoint_.rfind(':');
-    if (colon_pos != std::string::npos) {
-        host = redis_endpoint_.substr(0, colon_pos);
-        try {
-            port = std::stoi(redis_endpoint_.substr(colon_pos + 1));
-        } catch (const std::exception& e) {
-            LOG(ERROR) << "Invalid Redis endpoint port: " << redis_endpoint_;
-            return nullptr;
-        }
-    } else if (!redis_endpoint_.empty()) {
-        host = redis_endpoint_;
-    }
-
-    struct timeval tv;
-    tv.tv_sec = connect_timeout_ms_ / 1000;
-    tv.tv_usec = (connect_timeout_ms_ % 1000) * 1000;
-
-    redisContext* ctx = redisConnectWithTimeout(host.c_str(), port, tv);
-    if (!ctx || ctx->err) {
-        LOG(ERROR) << "Failed to connect to Redis at " << host << ":" << port
-                   << " err=" << (ctx ? ctx->errstr : "null");
-        if (ctx) {
-            redisFree(ctx);
-        }
-        return nullptr;
-    }
-    redisSetTimeout(ctx, tv);
-
-    // Authenticate if credentials are provided. Redis ACL uses two arguments;
-    // older Redis/TBase deployments may still use one password argument.
-    if (!username_.empty()) {
-        RedisReplyPtr reply((redisReply*)redisCommand(
-            ctx, "AUTH %b %b", username_.data(), username_.size(),
-            password_.data(), password_.size()));
-        if (!reply || reply->type == REDIS_REPLY_ERROR) {
-            LOG(ERROR) << "Redis AUTH failed";
-            redisFree(ctx);
-            return nullptr;
-        }
-    } else if (!password_.empty()) {
-        RedisReplyPtr reply((redisReply*)redisCommand(
-            ctx, "AUTH %b", password_.data(), password_.size()));
-        if (!reply || reply->type == REDIS_REPLY_ERROR) {
-            LOG(ERROR) << "Redis AUTH failed";
-            redisFree(ctx);
-            return nullptr;
-        }
-    }
-
-    // Select DB if not default
-    if (db_index_ != 0) {
-        RedisReplyPtr reply(
-            (redisReply*)redisCommand(ctx, "SELECT %d", db_index_));
-        if (!reply || reply->type == REDIS_REPLY_ERROR) {
-            LOG(ERROR) << "Redis SELECT " << db_index_ << " failed";
-            redisFree(ctx);
-            return nullptr;
-        }
-    }
-
-    return ctx;
+redisContext* RedisElectionHelper::CreateConnection() {
+    return RedisUtil::CreateConnection(redis_endpoint_, username_, password_,
+                                       db_index_, connect_timeout_ms_,
+                                       command_timeout_ms_);
 }
 
 // ============================================================
 // Connect
 // ============================================================
 
-ErrorCode RedisHelper::Connect() {
+ErrorCode RedisElectionHelper::Connect() {
     // Election connection
     {
         std::lock_guard<std::mutex> lock(election_mutex_);
@@ -180,8 +121,8 @@ ErrorCode RedisHelper::Connect() {
 // ElectLeader — blocks until this node wins election
 // ============================================================
 
-void RedisHelper::ElectLeader(const std::string& master_address,
-                              ViewVersionId& version, int& lease_id) {
+void RedisElectionHelper::ElectLeader(const std::string& master_address,
+                                      ViewVersionId& version, int& lease_id) {
     while (!cancel_election_) {
         bool connected = false;
         {
@@ -266,8 +207,8 @@ void RedisHelper::ElectLeader(const std::string& master_address,
     }
 }
 
-bool RedisHelper::TryElectOnce(const std::string& master_address,
-                               ViewVersionId& out_epoch) {
+bool RedisElectionHelper::TryElectOnce(const std::string& master_address,
+                                       ViewVersionId& out_epoch) {
     // Caller must hold election_mutex_
     // Step 2: INCR epoch counter
     RedisReplyPtr reply((redisReply*)redisCommand(election_ctx_, "INCR %b",
@@ -320,7 +261,7 @@ bool RedisHelper::TryElectOnce(const std::string& master_address,
 // WatchLeader — wait until leader key expires
 // ============================================================
 
-void RedisHelper::WatchLeader() {
+void RedisElectionHelper::WatchLeader() {
     // Fast path: SUBSCRIBE for leader event notification
     if (subscribe_ctx_ && WatchLeaderSubscribe()) {
         return;
@@ -330,7 +271,7 @@ void RedisHelper::WatchLeader() {
     WatchLeaderPolling();
 }
 
-bool RedisHelper::WatchLeaderSubscribe() {
+bool RedisElectionHelper::WatchLeaderSubscribe() {
     // Attempt SUBSCRIBE; return true if successful, false to fall back to
     // polling.
     if (!subscribe_ctx_) return false;
@@ -464,7 +405,7 @@ bool RedisHelper::WatchLeaderSubscribe() {
     return true;
 }
 
-void RedisHelper::WatchLeaderPolling() {
+void RedisElectionHelper::WatchLeaderPolling() {
     LOG(INFO) << "WatchLeader: using polling fallback (interval=" << ttl_sec_
               << "s)";
     redisContext* polling_ctx = CreateConnection();
@@ -499,7 +440,7 @@ void RedisHelper::WatchLeaderPolling() {
 // KeepLeader — renew TTL via Lua script, block until lost
 // ============================================================
 
-void RedisHelper::KeepLeader(int lease_id) {
+void RedisElectionHelper::KeepLeader(int lease_id) {
     (void)lease_id;  // Reserved for future lease validation
     keep_alive_running_ = true;
     cancel_keep_alive_ = false;
@@ -582,19 +523,19 @@ void RedisHelper::KeepLeader(int lease_id) {
     LOG(INFO) << "KeepLeader: exited renewal loop";
 }
 
-void RedisHelper::CancelKeepAlive() {
+void RedisElectionHelper::CancelKeepAlive() {
     cancel_keep_alive_ = true;
     keep_alive_running_ = false;
 }
 
-void RedisHelper::CancelElection() { cancel_election_ = true; }
+void RedisElectionHelper::CancelElection() { cancel_election_ = true; }
 
 // ============================================================
 // GetMasterView
 // ============================================================
 
-ErrorCode RedisHelper::GetMasterView(std::string& master_address,
-                                     ViewVersionId& version) {
+ErrorCode RedisElectionHelper::GetMasterView(std::string& master_address,
+                                             ViewVersionId& version) {
     std::lock_guard<std::mutex> lock(election_mutex_);
     if (!election_ctx_) {
         LOG(ERROR) << "GetMasterView: not connected to Redis at "
@@ -635,7 +576,7 @@ ErrorCode RedisHelper::GetMasterView(std::string& master_address,
 // Internal helpers
 // ============================================================
 
-void RedisHelper::PublishLeaderEvent(const std::string& event) {
+void RedisElectionHelper::PublishLeaderEvent(const std::string& event) {
     // Caller must hold election_mutex_
     if (!election_ctx_) return;
     RedisReplyPtr reply((redisReply*)redisCommand(
@@ -644,7 +585,7 @@ void RedisHelper::PublishLeaderEvent(const std::string& event) {
     // Reply is auto-freed — we don't need to inspect it.
 }
 
-bool RedisHelper::Reconnect(redisContext*& ctx) {
+bool RedisElectionHelper::Reconnect(redisContext*& ctx) {
     // Caller must hold election_mutex_ if reconnecting election_ctx_
     if (ctx) {
         redisFree(ctx);
@@ -661,7 +602,7 @@ bool RedisHelper::Reconnect(redisContext*& ctx) {
     return true;
 }
 
-void RedisHelper::DrainSubscribeContext() {
+void RedisElectionHelper::DrainSubscribeContext() {
     if (!subscribe_ctx_) return;
     // After UNSUBSCRIBE, buffered message frames may still be in the
     // read buffer. Drain them so the next SUBSCRIBE gets a clean reply.
@@ -688,9 +629,8 @@ void RedisHelper::DrainSubscribeContext() {
 // Serialization
 // ============================================================
 
-std::string RedisHelper::SerializeLeaderValue(const std::string& address,
-                                              ViewVersionId epoch,
-                                              int ttl_sec) {
+std::string RedisElectionHelper::SerializeLeaderValue(
+    const std::string& address, ViewVersionId epoch, int ttl_sec) {
     Json::Value root;
     root["address"] = address;
     root["epoch"] = static_cast<Json::Int64>(epoch);
@@ -707,9 +647,9 @@ std::string RedisHelper::SerializeLeaderValue(const std::string& address,
     return Json::writeString(builder, root);
 }
 
-bool RedisHelper::ParseLeaderValue(const std::string& json,
-                                   std::string& out_address,
-                                   ViewVersionId& out_epoch) {
+bool RedisElectionHelper::ParseLeaderValue(const std::string& json,
+                                           std::string& out_address,
+                                           ViewVersionId& out_epoch) {
     Json::Value root;
     Json::CharReaderBuilder builder;
     std::istringstream stream(json);

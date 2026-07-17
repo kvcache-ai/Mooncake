@@ -4,7 +4,7 @@
 #include "ha_helper.h"
 
 #ifdef STORE_USE_REDIS
-#include "redis_helper.h"
+#include "redis_election_helper.h"
 #endif
 
 namespace mooncake {
@@ -44,7 +44,7 @@ class RedisMasterViewHelper : public MasterViewHelper {
                             ViewVersionId& version) override;
 
    private:
-    RedisHelper redis_helper_;
+    RedisElectionHelper redis_election_helper_;
     int ttl_sec_;
 };
 #endif  // STORE_USE_REDIS
