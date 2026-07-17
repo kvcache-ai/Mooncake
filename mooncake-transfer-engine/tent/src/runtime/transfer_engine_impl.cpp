@@ -76,6 +76,8 @@ struct PreservedTentConfigOverrides {
     std::optional<std::string> local_segment_name;
     std::optional<std::string> rpc_server_hostname;
     std::optional<json> rpc_server_port;
+    std::optional<json> rdma_whitelist;
+    std::optional<json> rdma_blacklist;
 };
 
 template <typename T>
@@ -158,6 +160,10 @@ PreservedTentConfigOverrides captureExplicitTransferEngineConfig(
         config, "rpc_server_hostname", std::string());
     preserved.rpc_server_port =
         captureExplicitConfigValue(config, "rpc_server_port", json());
+    preserved.rdma_whitelist = captureExplicitConfigValue(
+        config, "topology/rdma_whitelist", json());
+    preserved.rdma_blacklist = captureExplicitConfigValue(
+        config, "topology/rdma_blacklist", json());
     return preserved;
 }
 
@@ -181,6 +187,10 @@ void restoreExplicitTransferEngineConfig(
                                preserved.rpc_server_hostname);
     restoreExplicitConfigValue(config, "rpc_server_port",
                                preserved.rpc_server_port);
+    restoreExplicitConfigValue(config, "topology/rdma_whitelist",
+                               preserved.rdma_whitelist);
+    restoreExplicitConfigValue(config, "topology/rdma_blacklist",
+                               preserved.rdma_blacklist);
 }
 
 TransferEngineImpl::TransferEngineImpl()
@@ -735,9 +745,32 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
 
     auto status = local_segment_tracker_->addInBatch(
         desc_list, [&](std::vector<BufferDesc>& descs) -> Status {
+            std::vector<TransportType> registered_transports;
             for (auto type : transports) {
                 auto s = transport_list_[type]->addMemoryBuffer(descs, options);
-                if (!s.ok()) LOG(WARNING) << s.ToString();
+                if (!s.ok()) {
+                    LOG(WARNING) << s.ToString();
+                    for (auto it = registered_transports.rbegin();
+                         it != registered_transports.rend(); ++it) {
+                        for (auto& desc : descs) {
+                            auto rollback_status =
+                                transport_list_[*it]->removeMemoryBuffer(desc);
+                            if (!rollback_status.ok()) {
+                                LOG(WARNING)
+                                    << "Failed to roll back memory buffer for "
+                                    << "transport " << *it << ": "
+                                    << rollback_status.ToString();
+                            }
+                            auto& desc_transports = desc.transports;
+                            desc_transports.erase(
+                                std::remove(desc_transports.begin(),
+                                            desc_transports.end(), *it),
+                                desc_transports.end());
+                        }
+                    }
+                    return s;
+                }
+                registered_transports.push_back(type);
             }
             return Status::OK();
         });
