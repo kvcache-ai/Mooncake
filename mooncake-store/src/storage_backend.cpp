@@ -1701,6 +1701,14 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
         }
 
         if (!duplicate_found) {
+            int64_t admission_time = 0;
+            if (bucket_backend_config_.eviction_policy ==
+                BucketEvictionPolicy::LRU) {
+                admission_time =
+                    std::chrono::steady_clock::now().time_since_epoch().count();
+                bucket->last_access_ns_.store(admission_time,
+                                              std::memory_order_relaxed);
+            }
             total_size_ += bucket->data_size + bucket->meta_size;
             object_bucket_map_.reserve(object_bucket_map_.size() +
                                        bucket_keys.size());
@@ -1711,7 +1719,7 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
                     << "Reserved key became duplicated: " << bucket_keys[i];
             }
             buckets_.emplace(bucket_id, std::move(bucket));
-            lru_index_.emplace(0LL, bucket_id);
+            lru_index_.emplace(admission_time, bucket_id);
         }
         if (duplicate_found) {
             LOG(ERROR) << "Reserved key became duplicated before commit, "

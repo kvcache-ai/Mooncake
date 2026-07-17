@@ -3083,6 +3083,56 @@ TEST_F(StorageBackendTest, BucketWatermarkEvictionUsesHandlerAndKeepsNewest) {
     EXPECT_TRUE(newest_exists.value());
 }
 
+TEST_F(StorageBackendTest, BucketLruTreatsNewBucketAsRecentlyAdmitted) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 10;
+    bucket_config.bucket_size_limit = 8 * 1024;
+    bucket_config.max_total_size = 30 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::LRU;
+
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    std::string old_value(6 * 1024, 'A');
+    std::unordered_map<std::string, std::vector<Slice>> old_batch = {
+        {"lru_old", {{old_value.data(), old_value.size()}}},
+    };
+    ASSERT_TRUE(storage_backend.BatchOffload(
+        old_batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+
+    std::vector<char> load_buffer(old_value.size());
+    std::unordered_map<std::string, Slice> load_batch = {
+        {"lru_old", {load_buffer.data(), load_buffer.size()}},
+    };
+    ASSERT_TRUE(storage_backend.BatchLoad(load_batch));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+    std::string new_value(6 * 1024, 'B');
+    std::unordered_map<std::string, std::vector<Slice>> new_batch = {
+        {"lru_new", {{new_value.data(), new_value.size()}}},
+    };
+    ASSERT_TRUE(storage_backend.BatchOffload(
+        new_batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+
+    auto evict_result = storage_backend.EvictAboveDiskWatermark(
+        /*high_watermark_ratio=*/0.30, /*low_watermark_ratio=*/0.25,
+        [](const std::vector<std::string>&) {
+            return tl::expected<void, ErrorCode>{};
+        });
+    ASSERT_TRUE(evict_result);
+    EXPECT_EQ(evict_result.value(), std::vector<std::string>{"lru_old"});
+
+    EXPECT_FALSE(storage_backend.IsExist("lru_old").value_or(true));
+    EXPECT_TRUE(storage_backend.IsExist("lru_new").value_or(false));
+}
+
 TEST_F(StorageBackendTest,
        BucketWatermarkEvictionDoesNotOverEvictForSharedDisk) {
     std::error_code ec;
