@@ -57,9 +57,7 @@ class SegmentAllocator {
 
     [[nodiscard]] bool isAvailable() const { return lifetime_.isAvailable(); }
 
-    void setAvailable(bool available) const {
-        lifetime_.setAvailable(available);
-    }
+    void invalidate() const { lifetime_.invalidate(); }
 
     [[nodiscard]] bool wrapsAllocator(
         const std::shared_ptr<BufferAllocatorBase>& allocator) const {
@@ -78,7 +76,7 @@ class SegmentAllocator {
 
    private:
     std::shared_ptr<BufferAllocatorBase> allocator_;
-    SegmentLifetime lifetime_;
+    SegmentLifetime lifetime_ = SegmentLifetime::Available();
 };
 
 using SegmentAllocatorRegistration = std::shared_ptr<SegmentAllocator>;
@@ -178,7 +176,7 @@ class AllocatorManager {
             return false;
         }
         if (invalidate) {
-            registration->setAvailable(false);
+            registration->invalidate();
         }
 
         auto registrations_it = registrations_.find(name);

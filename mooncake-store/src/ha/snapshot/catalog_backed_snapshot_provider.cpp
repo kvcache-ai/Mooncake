@@ -199,8 +199,7 @@ DeserializeStandbyObjectMetadata(
 
             const Replica& replica = *replica_result.value();
             if (replica.status() != ReplicaStatus::COMPLETE ||
-                (replica.is_memory_replica() &&
-                 replica.has_invalid_mem_handle())) {
+                (replica.is_memory_replica() && !replica.is_available())) {
                 return std::optional<StandbyObjectMetadata>();
             }
 

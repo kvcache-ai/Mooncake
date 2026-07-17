@@ -815,8 +815,11 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
                                 client_id_str)));
             }
 
+            // Fail closed: an orphan LOCAL_DISK replica must stay unavailable
+            // unless the corresponding restored segment generation exists.
             replica = std::make_shared<Replica>(
-                client_id, object_size, std::move(transport_endpoint), status);
+                client_id, object_size, std::move(transport_endpoint),
+                segment_view.GetLocalDiskSegmentLifetime(client_id), status);
             break;
         }
         default:
