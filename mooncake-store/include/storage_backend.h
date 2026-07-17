@@ -1359,6 +1359,12 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
         }
     };
 
+    // Keeps evicted metadata and allocation handles alive until the master
+    // accepts the replica-removal notification.
+    struct PendingEviction {
+        std::vector<std::pair<std::string, ObjectEntry>> objects;
+    };
+
     // ── GDS two-phase commit (Part B) ──
    public:
     // Phase 1: allocate file space and insert metadata with dirty_=true.
@@ -1477,10 +1483,19 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     int64_t low_watermark_keys_ = 0;
 
     // Evict keys from the FIFO index until both byte and key-count watermarks
-    // are satisfied (or until the eviction cap is reached).
+    // are satisfied (or until the eviction cap is reached). Allocations remain
+    // pinned in out_pending until notification succeeds.
     void EvictToMakeRoom(int64_t required_bytes, size_t min_victims,
                          const std::unordered_set<std::string>& batch_keys,
-                         std::vector<std::string>& out_evicted);
+                         PendingEviction& out_pending);
+
+    // Restore prepared victims when the master rejects their removal.
+    void RestorePreparedEviction(PendingEviction&& pending);
+
+    // Notify the master, then release prepared allocations on success or
+    // restore their metadata on failure.
+    tl::expected<void, ErrorCode> NotifyAndCommitPreparedEviction(
+        const EvictionHandler& eviction_handler, PendingEviction& pending);
 
     // Test-only: Predicate to determine which keys should fail in BatchOffload.
     // Used for deterministic testing of partial success behavior.

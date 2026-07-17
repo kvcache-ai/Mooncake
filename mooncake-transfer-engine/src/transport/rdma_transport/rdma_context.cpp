@@ -161,6 +161,8 @@ std::string gidBytesToString(const uint8_t *raw) {
 RdmaContext::RdmaContext(RdmaTransport &engine, const std::string &device_name)
     : device_name_(device_name),
       engine_(engine),
+      connect_pause_(
+          [] { return static_cast<uint64_t>(getCurrentTimeInNano()); }),
       next_comp_channel_index_(0),
       next_comp_vector_index_(0),
       next_cq_list_index_(0),
@@ -307,7 +309,28 @@ int RdmaContext::socketId() {
 int RdmaContext::deconstruct() {
     worker_pool_.reset();
 
-    endpoint_store_->destroyQPs();
+    // Graceful teardown order: QPs -> MRs.
+    if (endpoint_store_) {
+        endpoint_store_->disconnectQPs();
+
+        // In normal graceful shutdown, reclaim should finish quickly.
+        constexpr auto kReclaimTimeout = std::chrono::seconds(10);
+        auto start = std::chrono::steady_clock::now();
+        while (endpoint_store_->waitingListSize() > 0) {
+            endpoint_store_->reclaimEndpoint();
+            if (endpoint_store_->waitingListSize() == 0) break;
+            if (std::chrono::steady_clock::now() - start > kReclaimTimeout) {
+                LOG(WARNING) << "Endpoint reclaim timed out during graceful "
+                                "shutdown; forcing QP destruction";
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
+        if (endpoint_store_->destroyQPs()) {
+            LOG(ERROR) << "Failed to destroy all QPs before MR deregistration";
+        }
+    }
 
     for (auto &[_, entry] : memory_region_map_) {
         int ret = ibv_dereg_mr(entry.mr);
@@ -698,8 +721,39 @@ int RdmaContext::deleteEndpoint(const std::string &peer_nic_path) {
 }
 
 int RdmaContext::deleteEndpointByPtr(const RdmaEndPoint *endpoint_ptr) {
-    return endpoint_store_->deleteEndpointByPtr(endpoint_ptr);
+    // Tearing an endpoint down (path failure / QP fatal) means this peer is
+    // failing; pause active reconnection to its address so the CQ poller isn't
+    // blocked re-handshaking a likely-gone peer.
+    //
+    // Resolve the peer path *inside* the store, under its lock: the raw pointer
+    // may already be freed (e.g. an IBV_EVENT_QP_FATAL racing endpoint
+    // destruction), so we must not dereference it here. The store only compares
+    // pointer identity and returns the path from the live map key, and we arm
+    // the pause only if the endpoint was actually found. No-op when TTL is 0.
+    std::string deleted_peer_nic_path;
+    int ret = endpoint_store_->deleteEndpointByPtr(endpoint_ptr,
+                                                   &deleted_peer_nic_path);
+    if (!deleted_peer_nic_path.empty()) pauseConnect(deleted_peer_nic_path);
+    return ret;
 }
+
+void RdmaContext::pauseConnect(const std::string &peer_nic_path) {
+    int ttl_ms = globalConfig().conn_pause_ttl_ms;
+    if (ttl_ms <= 0) return;  // disabled
+    auto server_name = getServerNameFromNicPath(peer_nic_path);
+    if (server_name.empty()) return;
+    connect_pause_.pauseFor(server_name,
+                            static_cast<uint64_t>(ttl_ms) * 1000000ull);
+}
+
+bool RdmaContext::isConnectPaused(const std::string &peer_nic_path) {
+    if (globalConfig().conn_pause_ttl_ms <= 0) return false;  // disabled
+    auto server_name = getServerNameFromNicPath(peer_nic_path);
+    if (server_name.empty()) return false;
+    return connect_pause_.isPaused(server_name);
+}
+
+void RdmaContext::pruneConnectPause() { connect_pause_.prune(); }
 
 void RdmaContext::reclaimEndpoints() { endpoint_store_->reclaimEndpoint(); }
 
