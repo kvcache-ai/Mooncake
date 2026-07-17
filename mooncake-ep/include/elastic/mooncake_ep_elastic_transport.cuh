@@ -118,7 +118,7 @@ struct MooncakeGin {
     template <typename team_t>
     __device__ __forceinline__ void put(void* dst_ptr, const void* src_ptr,
                                         int num_bytes, int dst_rank,
-                                        int /*flags*/ = 0) const {
+                                        int flags = 0) const {
         const int logical_dst_rank = dst_rank;
         const int world_dst_rank = world_rank<team_t>(logical_dst_rank);
         auto routed = get_sym_ptr<WorldTeam>(dst_ptr, world_dst_rank);
@@ -164,7 +164,8 @@ struct MooncakeGin {
                                     kRail ? logical_dst_rank : world_dst_rank,
                                     physical_qps_per_rank, src_ptr, dst_ptr,
                                     static_cast<uint32_t>(num_bytes),
-                                    ptx::get_lane_idx(), kRail);
+                                    ptx::get_lane_idx(), kRail, sharing_mode,
+                                    flags);
                 return;
             }
 #endif
@@ -201,7 +202,7 @@ struct MooncakeGin {
                         qp_idx, physical_qps_per_rank,
                         reinterpret_cast<uint64_t*>(dst_ptr),
                         static_cast<uint64_t>(value), 0,
-                        std::is_same_v<team_t, ScaleoutTeam>);
+                        std::is_same_v<team_t, ScaleoutTeam>, sharing_mode);
                 } else {
                     EP_DEVICE_ASSERT(
                         false &&
@@ -298,7 +299,7 @@ struct MooncakeGin {
                         qp_idx, physical_qps_per_rank,
                         reinterpret_cast<uint64_t*>(dst_ptr),
                         static_cast<uint64_t>(value), 0,
-                        std::is_same_v<team_t, ScaleoutTeam>);
+                        std::is_same_v<team_t, ScaleoutTeam>, sharing_mode);
                     return;
                 }
 #endif
@@ -353,7 +354,7 @@ struct MooncakeGin {
     __device__ __forceinline__ void flush() const {
 #ifdef USE_NCCL_DEVICE
         if (ctx.use_nccl) {
-            device::mc_nccl_flush(ctx.nccl, qp_idx, 0);
+            device::mc_nccl_flush(ctx.nccl, qp_idx, 0, sharing_mode);
             return;
         }
 #endif
