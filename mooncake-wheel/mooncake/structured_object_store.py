@@ -2329,13 +2329,13 @@ def _encode_ragged_tensor_dict_values(
         else _normalize_ragged_tensor_dict_keys(schema_keys)
     )
     non_null = [item for item in values if item is not None]
-    if not non_null:
+    if not non_null and keys is None:
         return _EncodedStructuredLeaf(
             codec="ragged_tensor_dict",
             rows=rows,
             payload={"null_mask": null_mask},
             metadata={
-                "keys": keys or [],
+                "keys": [],
                 "key_codecs": {},
                 "schema_source": "field_schema",
             },

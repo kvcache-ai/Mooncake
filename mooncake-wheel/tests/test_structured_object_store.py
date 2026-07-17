@@ -1664,6 +1664,44 @@ def test_dataproto_field_schema_encodes_ragged_tensor_dict() -> None:
     assert torch.equal(indexed[1]["image"], rows[0]["image"])
 
 
+def test_dataproto_field_schema_encodes_all_null_ragged_tensor_dict() -> None:
+    pytest.importorskip("torch", exc_type=ImportError)
+    _store, transfer = make_transfer()
+    rows = np.empty(3, dtype=object)
+    rows[:] = [None, None, None]
+
+    ref = transfer.put_dataproto(
+        {
+            "batch": {"input_ids": np.arange(3)},
+            "non_tensor_batch": {"multi_modal_inputs": rows},
+        },
+        field_schemas={
+            "multi_modal_inputs": FieldSchema(
+                codec="ragged_tensor_dict",
+                metadata={"section": "non_tensor_batch", "keys": ["image"]},
+            )
+        },
+    )
+
+    encoded = ref.encoded_non_tensor["multi_modal_inputs"]
+    assert encoded["codec"] == "ragged_tensor_dict"
+    assert encoded["metadata"]["keys"] == ["image"]
+    assert "image.data" in encoded["payload"]
+
+    full = transfer.get_dataproto(ref)["non_tensor_batch"]["multi_modal_inputs"]
+    assert full.tolist() == [None, None, None]
+
+    sliced = transfer.get_dataproto(ref, rows=slice(1, 3))["non_tensor_batch"][
+        "multi_modal_inputs"
+    ]
+    assert sliced.tolist() == [None, None]
+
+    indexed = transfer.get_dataproto(ref, rows=[2, 0])["non_tensor_batch"][
+        "multi_modal_inputs"
+    ]
+    assert indexed.tolist() == [None, None]
+
+
 def test_dataproto_helper_treats_reserved_plain_dict_keys_as_batch_fields() -> None:
     _store, transfer = make_transfer()
     ref = transfer.put_dataproto({"batch": np.arange(4), "meta_info": np.arange(4)})
