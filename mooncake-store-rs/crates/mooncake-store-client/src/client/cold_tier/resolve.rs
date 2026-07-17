@@ -1,5 +1,6 @@
 use super::super::{
-    ClientRuntimeId, ObjectRoute, ReplicaRoute, ResolvedObject, Result, StoreClient, StoreError,
+    ClientLease, ClientLifecycleState, ClientRuntimeId, ObjectRoute, ReplicaRoute, ResolvedObject,
+    Result, StoreClient, StoreError,
 };
 use super::{cold_backing_placeholder, materialized_cold_backing, select_cold_backing_target};
 use mooncake_store_core::ColdTierDeviceState;
@@ -11,6 +12,63 @@ pub(in super::super) fn resolved_uses_cold_backing(entry: &ResolvedObject) -> bo
 }
 
 impl StoreClient {
+    pub(in super::super) fn select_cold_backing_owner_lease(
+        owner: &ClientRuntimeId,
+        leases: impl IntoIterator<Item = ClientLease>,
+    ) -> Option<ClientLease> {
+        let mut exact_readable = None;
+        let mut newest_active_incarnation = None;
+        for lease in leases {
+            if lease.runtime == *owner
+                && matches!(
+                    lease.state,
+                    ClientLifecycleState::Active | ClientLifecycleState::Draining
+                )
+            {
+                exact_readable = Some(lease.clone());
+            }
+            if lease.runtime.stable_id == owner.stable_id
+                && matches!(lease.state, ClientLifecycleState::Active)
+            {
+                let replace =
+                    newest_active_incarnation
+                        .as_ref()
+                        .is_none_or(|current: &ClientLease| {
+                            lease.runtime.epoch > current.runtime.epoch
+                        });
+                if replace {
+                    newest_active_incarnation = Some(lease);
+                }
+            }
+        }
+        newest_active_incarnation.or(exact_readable)
+    }
+
+    pub(in super::super) fn lookup_cold_backing_owner_lease_once(
+        &self,
+        owner: &ClientRuntimeId,
+        force_refresh: bool,
+    ) -> Result<ClientLease> {
+        Self::select_cold_backing_owner_lease(
+            owner,
+            self.available_compatible_live_clients(force_refresh)?,
+        )
+        .ok_or_else(|| {
+            StoreError::NotFound(format!("cold backing owner {} is not available", owner))
+        })
+    }
+
+    pub(in super::super) fn lookup_cold_backing_owner_lease(
+        &self,
+        owner: &ClientRuntimeId,
+    ) -> Result<ClientLease> {
+        match self.lookup_cold_backing_owner_lease_once(owner, false) {
+            Ok(lease) => Ok(lease),
+            Err(StoreError::NotFound(_)) => self.lookup_cold_backing_owner_lease_once(owner, true),
+            Err(error) => Err(error),
+        }
+    }
+
     pub(in super::super) fn resolve_cold_backing_read(
         &self,
         route: ObjectRoute,
