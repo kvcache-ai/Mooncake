@@ -2552,7 +2552,7 @@ TEST_F(MasterServiceTest, CopyStart) {
     [[maybe_unused]] const auto context4 =
         PrepareSimpleSegment(*service_, "segment_4");
 
-    UUID client_id = generate_uuid();
+    const UUID client_id = context1.client_id;
 
     // Test Case 1: CopyStart a non-existent key, should fail.
     auto copy_result = service_->CopyStart(
@@ -2691,8 +2691,8 @@ TEST_F(MasterServiceTest, CopyEnd) {
     [[maybe_unused]] const auto context3 =
         PrepareSimpleSegment(*service_, "segment_3");
 
-    UUID client_id = generate_uuid();
-    UUID invalid_client_id = generate_uuid();
+    const UUID client_id = context1.client_id;
+    const UUID invalid_client_id = context2.client_id;
 
     // Test Case 1: CopyEnd a non-existent key, should fail.
     auto copy_end_result =
@@ -2802,8 +2802,8 @@ TEST_F(MasterServiceTest, CopyRevoke) {
     [[maybe_unused]] const auto context2 =
         PrepareSimpleSegment(*service_, "segment_2");
 
-    UUID client_id = generate_uuid();
-    UUID invalid_client_id = generate_uuid();
+    const UUID client_id = context1.client_id;
+    const UUID invalid_client_id = context2.client_id;
 
     // Test Case 1: CopyRevoke a non-existent key, should fail.
     auto copy_revoke_result =
@@ -2895,7 +2895,7 @@ TEST_F(MasterServiceTest, MoveStart) {
     [[maybe_unused]] const auto context3 =
         PrepareSimpleSegment(*service_, "segment_3");
 
-    UUID client_id = generate_uuid();
+    const UUID client_id = context1.client_id;
 
     // Test Case 1: MoveStart a non-existent key, should fail.
     auto move_start_result = service_->MoveStart(
@@ -3031,8 +3031,8 @@ TEST_F(MasterServiceTest, MoveEnd) {
     [[maybe_unused]] const auto context2 =
         PrepareSimpleSegment(*service_, "segment_2");
 
-    UUID client_id = generate_uuid();
-    UUID invalid_client_id = generate_uuid();
+    const UUID client_id = context1.client_id;
+    const UUID invalid_client_id = context2.client_id;
 
     // Test Case 1: MoveEnd a non-existent key, should fail.
     auto move_end_result =
@@ -3111,8 +3111,8 @@ TEST_F(MasterServiceTest, MoveRevoke) {
     [[maybe_unused]] const auto context2 =
         PrepareSimpleSegment(*service_, "segment_2");
 
-    UUID client_id = generate_uuid();
-    UUID invalid_client_id = generate_uuid();
+    const UUID client_id = context1.client_id;
+    const UUID invalid_client_id = context2.client_id;
 
     // Test Case 1: MoveRevoke a non-existent key, should fail.
     auto move_revoke_result =
@@ -3209,7 +3209,7 @@ TEST_F(MasterServiceTest, ProtectCopyMoveSourceFromEviction) {
     [[maybe_unused]] const auto context2 =
         PrepareSimpleSegment(*service_, "segment_2", kBaseAddr, kSegmentSize);
 
-    UUID client_id = generate_uuid();
+    const UUID client_id = context1.client_id;
 
     const std::string copy_key = "copy_key";
     const std::string move_key = "move_key";
@@ -3294,7 +3294,7 @@ TEST_F(MasterServiceTest, DiscardTimeoutCopyMove) {
     [[maybe_unused]] const auto context2 =
         PrepareSimpleSegment(*service_, "segment_2", kBaseAddr, kSegmentSize);
 
-    UUID client_id = generate_uuid();
+    const UUID client_id = context1.client_id;
 
     const std::string copy_key = "copy_key";
     const std::string move_key = "move_key";
@@ -5147,6 +5147,7 @@ TEST_F(MasterServiceTest, BatchQueryIpMixedIpv4AndIpv6Test) {
 TEST_F(MasterServiceTest,
        ClientLeaseExpiredCallbacksRunAfterResourceReclamation) {
     MasterServiceConfig config;
+    config.enable_offload = true;
     config.client_active_ttl_sec = 1;
     config.client_suspicion_ttl_sec = 1;
     auto service = std::make_unique<MasterService>(config);
@@ -5188,7 +5189,9 @@ TEST_F(MasterServiceTest,
         });
 
     ASSERT_TRUE(service->Ping(mounted_client_id).has_value());
-    ASSERT_TRUE(service->Ping(empty_client_id).has_value());
+    ASSERT_TRUE(service->MountLocalDiskSegment(empty_client_id,
+                                               /*enable_offloading=*/true)
+                    .has_value());
 
     {
         std::unique_lock<std::mutex> lock(events_mutex);
@@ -6853,11 +6856,11 @@ TEST_F(MasterServiceTest, UpsertConflictReplicationTask) {
                               .build();
     std::unique_ptr<MasterService> service_(new MasterService(service_config));
 
-    [[maybe_unused]] const auto ctx1 =
+    const auto ctx1 =
         PrepareSimpleSegment(*service_, "segment_1");
     [[maybe_unused]] const auto ctx2 =
         PrepareSimpleSegment(*service_, "segment_2");
-    UUID client_id = generate_uuid();
+    const UUID client_id = ctx1.client_id;
 
     std::string key = "upsert_conflict_copy";
     uint64_t slice_length = 1024;

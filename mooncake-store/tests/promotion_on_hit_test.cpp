@@ -101,6 +101,22 @@ class PromotionOnHitTest : public ::testing::Test {
                 .segment_name = segment.name};
     }
 
+    void RetireClientForTest(MasterService& service,
+                             const UUID& client_id) const {
+        auto record = service.FindClientRecord(client_id);
+        ASSERT_NE(record, nullptr);
+        const auto retire_at = ClientLivenessRecord::Clock::now() +
+                               std::chrono::hours(1);
+        ASSERT_EQ(record->Evaluate(retire_at, std::chrono::seconds(0),
+                                   std::chrono::seconds(0)),
+                  ClientLivenessTransition::BECAME_SUSPECTED);
+        MasterMetricManager::instance().client_liveness_became_suspected();
+        ASSERT_EQ(record->Evaluate(retire_at, std::chrono::seconds(0),
+                                   std::chrono::seconds(0)),
+                  ClientLivenessTransition::BECAME_OFFLINE);
+        MasterMetricManager::instance().client_liveness_became_offline();
+    }
+
     // Put an object and complete it (creates a MEMORY replica).
     void PutObject(MasterService& service, const UUID& client_id,
                    const std::string& key, size_t size = 1024) {
@@ -368,16 +384,19 @@ TEST_F(PromotionOnHitTest,
     service->RemoveAll();
 }
 
-// PromotionObjectHeartbeat returns an empty task list when called against a
-// client that has no LocalDiskSegment registered.
+// A serving client without a LocalDiskSegment still reaches the legacy
+// SEGMENT_NOT_FOUND result after passing the liveness gate.
 TEST_F(PromotionOnHitTest, HeartbeatReturnsErrorForUnknownClient) {
     MasterServiceConfig config;
     config.enable_offload = true;
     config.promotion_on_hit = true;
     auto service = std::make_unique<MasterService>(config);
 
-    UUID unknown_client = generate_uuid();
-    auto pending = service->PromotionObjectHeartbeat(unknown_client);
+    Segment segment = MakeSegment("heartbeat_only_segment",
+                                  kDefaultSegmentBase, 1024 * 1024 * 16);
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
+    auto pending = service->PromotionObjectHeartbeat(client_id);
     ASSERT_FALSE(pending.has_value());
     EXPECT_EQ(pending.error(), ErrorCode::SEGMENT_NOT_FOUND);
 }
@@ -389,8 +408,10 @@ TEST_F(PromotionOnHitTest, AllocStartUnknownKey) {
     config.promotion_on_hit = true;
     auto service = std::make_unique<MasterService>(config);
 
-    auto resp = service->PromotionAllocStart(generate_uuid(), "nonexistent",
-                                             "default", 1024, {});
+    auto client = PrepareSegment(*service, "unknown_key_segment",
+                                 kDefaultSegmentBase, 1024 * 1024 * 16);
+    auto resp = service->PromotionAllocStart(
+        client.client_id, "nonexistent", "default", 1024, {});
     ASSERT_FALSE(resp.has_value());
     EXPECT_EQ(resp.error(), ErrorCode::OBJECT_NOT_FOUND);
 }
@@ -402,9 +423,10 @@ TEST_F(PromotionOnHitTest, NotifyUnknownKey) {
     config.promotion_on_hit = true;
     auto service = std::make_unique<MasterService>(config);
 
-    UUID client_id = generate_uuid();
-    auto resp =
-        service->NotifyPromotionSuccess(client_id, "nonexistent", "default");
+    auto client = PrepareSegment(*service, "notify_unknown_key_segment",
+                                 kDefaultSegmentBase, 1024 * 1024 * 16);
+    auto resp = service->NotifyPromotionSuccess(
+        client.client_id, "nonexistent", "default");
     ASSERT_FALSE(resp.has_value());
     EXPECT_EQ(resp.error(), ErrorCode::OBJECT_NOT_FOUND);
 }
@@ -1264,7 +1286,9 @@ TEST_F(PromotionOnHitTest, NotifyRejectsNonHolder) {
 
     // An unrelated client tries to Notify. Must be rejected as
     // INVALID_PARAMS so the staged replica stays PROCESSING.
-    UUID intruder_id = generate_uuid();
+    auto intruder = PrepareSegment(*service, "seg_b",
+                                   kDefaultSegmentBase + seg_size, seg_size);
+    const UUID intruder_id = intruder.client_id;
     ASSERT_NE(intruder_id, holder.client_id);
     auto bad_notify =
         service->NotifyPromotionSuccess(intruder_id, "k_cold", "default");
@@ -1429,7 +1453,9 @@ TEST_F(PromotionOnHitTest, NotifyFailureRejectsNonHolder) {
     ASSERT_TRUE(alloc.has_value());
 
     // Intruder calls Failure with the wrong client_id.
-    UUID intruder_id = generate_uuid();
+    auto intruder = PrepareSegment(*service, "seg_b",
+                                   kDefaultSegmentBase + seg_size, seg_size);
+    const UUID intruder_id = intruder.client_id;
     ASSERT_NE(intruder_id, holder.client_id);
     auto bad_failure =
         service->NotifyPromotionFailure(intruder_id, "k_cold", "default");
@@ -1479,7 +1505,9 @@ TEST_F(PromotionOnHitTest, AllocStartRejectsNonHolder) {
         ASSERT_TRUE(r.has_value());
     }
 
-    UUID intruder_id = generate_uuid();
+    auto intruder = PrepareSegment(*service, "seg_b",
+                                   kDefaultSegmentBase + seg_size, seg_size);
+    const UUID intruder_id = intruder.client_id;
     ASSERT_NE(intruder_id, holder.client_id);
     auto bad_alloc = service->PromotionAllocStart(intruder_id, "k_cold",
                                                   "default", 1024, {});
@@ -1950,11 +1978,9 @@ TEST_F(PromotionOnHitTest, BatchRemoveErasesPromotionTask) {
     service->RemoveAll(/*force=*/true);
 }
 
-// BatchRemove stale-handle path on a key with an in-flight
-// PromotionTask must drop the task entry. The holder is mounted via
-// PrepareSegment only (no ReMount), so its client is absent from
-// ok_client_; BatchRemove's CleanupStaleHandles then erases the
-// LOCAL_DISK replica and the stale-handle branch fires.
+// BatchRemove stale-handle path on a key with an in-flight PromotionTask must
+// drop the task entry. Explicitly retire the holder so the test drives the
+// liveness-based stale-handle rule instead of the removed ok_client_ rule.
 TEST_F(PromotionOnHitTest, BatchRemoveStaleHandleErasesPromotionTask) {
     MasterServiceConfig config;
     config.enable_offload = true;
@@ -1983,6 +2009,8 @@ TEST_F(PromotionOnHitTest, BatchRemoveStaleHandleErasesPromotionTask) {
         ASSERT_TRUE(pending.has_value());
         EXPECT_EQ(CountPromotionTask(*pending, "k_first"), 1u);
     }
+
+    RetireClientForTest(*service, holder.client_id);
 
     auto results = service->BatchRemove({"k_first"}, "default", /*force=*/true);
     ASSERT_EQ(results.size(), 1u);

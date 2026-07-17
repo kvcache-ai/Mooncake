@@ -3738,6 +3738,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     metadata.VisitReplicas(
                         &Replica::fn_is_completed,
                         [](Replica& replica) { replica.mark_processing(); });
+                    for (auto& descriptor : replica_list) {
+                        descriptor.status = ReplicaStatus::PROCESSING;
+                    }
                     SyncCacheTotalAccounting(metadata);
 
                     tenant_state.processing_keys.insert(key);
@@ -8324,8 +8327,12 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
 
     const auto& metadata = accessor.Get();
     const auto* source_replica = metadata.GetReplicaBySegmentName(source);
-    if (source_replica == nullptr ||
-        !IsReplicaServing(*source_replica, clients)) {
+    if (source_replica == nullptr) {
+        LOG(ERROR) << "key=" << key << ", source_segment=" << source
+                   << ", error=source_segment_not_found";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!IsReplicaServing(*source_replica, clients)) {
         LOG(ERROR) << "key=" << key << ", source_segment=" << source
                    << ", error=source_segment_not_serving";
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
