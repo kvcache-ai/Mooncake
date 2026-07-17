@@ -3710,6 +3710,10 @@ void OffsetAllocatorStorageBackend::RestorePreparedEviction(
         auto& shard = shards_[ShardForKey(key)];
         SharedMutexLocker lk(&shard.mutex);
 
+        // BatchOffload's single-writer precondition guarantees that no writer
+        // can recreate this key or consume its FIFO sequence while the
+        // eviction notification is in flight. Readers do not mutate either
+        // index, so both entries must still be absent here.
         const bool map_inserted =
             shard.map.emplace(key, std::move(entry)).second;
         CHECK(map_inserted) << "Failed to restore evicted key: " << key;
@@ -3727,6 +3731,10 @@ tl::expected<void, ErrorCode>
 OffsetAllocatorStorageBackend::NotifyAndCommitPreparedEviction(
     const EvictionHandler& eviction_handler, PendingEviction& pending) {
     if (pending.objects.empty()) return {};
+    if (!eviction_handler) {
+        pending.objects.clear();
+        return {};
+    }
 
     std::vector<std::string> evicted_keys;
     evicted_keys.reserve(pending.objects.size());
