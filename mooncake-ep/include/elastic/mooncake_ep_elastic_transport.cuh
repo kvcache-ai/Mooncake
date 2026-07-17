@@ -36,7 +36,11 @@ constexpr int kRedAddReleaseLowWordLast = 1 << 0;
 // to the source while the actual routing is decided by Mooncake CommCtx.
 struct MooncakeGin {
     device::CommCtx ctx;
+    // `qp_idx` is the logical DeepEP channel/context ID. NCCL GIN contexts
+    // are rank-local resources, whereas IBGDA QPs are partitioned per remote
+    // destination. Keep their mappings independent.
     int qp_idx = 0;
+    int physical_qp_idx = 0;
     int sharing_mode = 0;
     int physical_qps_per_rank = 1;
     int scaleout_rank_idx = 0;
@@ -54,9 +58,9 @@ struct MooncakeGin {
           scaleout_rank_idx(scaleout_rank_idx),
           scaleup_rank_idx(scaleup_rank_idx),
           num_scaleup_ranks(num_scaleup_ranks) {
-        (void)num_qps;
         (void)num_ranks;
-        this->qp_idx %= physical_qps_per_rank;
+        this->qp_idx %= max(1, num_qps);
+        this->physical_qp_idx = this->qp_idx % physical_qps_per_rank;
     }
 
     template <typename team_t>
@@ -175,7 +179,7 @@ struct MooncakeGin {
                 return;
             }
 #endif
-            device::mc_rdma_put(ctx, qp_idx, world_dst_rank, physical_qps_per_rank,
+            device::mc_rdma_put(ctx, physical_qp_idx, world_dst_rank, physical_qps_per_rank,
                                 src_ptr, dst_ptr,
                                 static_cast<uint32_t>(num_bytes), 0);
         }
@@ -218,7 +222,7 @@ struct MooncakeGin {
             }
 #endif
             if constexpr (sizeof(value_t) == sizeof(int32_t)) {
-                device::mc_signal(ctx, dst_rank, qp_idx, physical_qps_per_rank,
+                device::mc_signal(ctx, dst_rank, physical_qp_idx, physical_qps_per_rank,
                                   reinterpret_cast<int*>(dst_ptr),
                                   static_cast<int32_t>(value));
             } else {
@@ -235,22 +239,22 @@ struct MooncakeGin {
                 const auto high = static_cast<int32_t>(signed_value >> 32);
                 if ((flags & kRedAddReleaseLowWordLast) == 0) {
                     if (low != 0) {
-                        device::mc_red_add(ctx, dst_rank, qp_idx,
+                        device::mc_red_add(ctx, dst_rank, physical_qp_idx,
                                            physical_qps_per_rank, words, low);
                     }
                     if (high != 0) {
-                        device::mc_red_add(ctx, dst_rank, qp_idx,
+                        device::mc_red_add(ctx, dst_rank, physical_qp_idx,
                                            physical_qps_per_rank, words + 1,
                                            high);
                     }
                 } else {
                     if (high != 0) {
-                        device::mc_red_add(ctx, dst_rank, qp_idx,
+                        device::mc_red_add(ctx, dst_rank, physical_qp_idx,
                                            physical_qps_per_rank, words + 1,
                                            high);
                     }
                     if (low != 0) {
-                        device::mc_red_add(ctx, dst_rank, qp_idx,
+                        device::mc_red_add(ctx, dst_rank, physical_qp_idx,
                                            physical_qps_per_rank, words, low);
                     }
                 }
@@ -277,7 +281,7 @@ struct MooncakeGin {
                     return;
                 }
 #endif
-                device::mc_red_add(ctx, dst_rank, qp_idx, physical_qps_per_rank,
+                device::mc_red_add(ctx, dst_rank, physical_qp_idx, physical_qps_per_rank,
                                    reinterpret_cast<int*>(dst_ptr),
                                    static_cast<int32_t>(value));
             }
@@ -310,7 +314,7 @@ struct MooncakeGin {
                 }
 #endif
                 if (ctx.use_64bit_rdma_atomics) {
-                    device::mc_red_add64(ctx, dst_rank, qp_idx,
+                    device::mc_red_add64(ctx, dst_rank, physical_qp_idx,
                                          physical_qps_per_rank,
                                          reinterpret_cast<int64_t*>(dst_ptr),
                                          static_cast<int64_t>(value));
@@ -332,22 +336,22 @@ struct MooncakeGin {
                 const auto high = static_cast<int32_t>(signed_value >> 32);
                 if ((flags & kRedAddReleaseLowWordLast) == 0) {
                     if (low != 0) {
-                        device::mc_red_add(ctx, dst_rank, qp_idx,
+                        device::mc_red_add(ctx, dst_rank, physical_qp_idx,
                                            physical_qps_per_rank, words, low);
                     }
                     if (high != 0) {
-                        device::mc_red_add(ctx, dst_rank, qp_idx,
+                        device::mc_red_add(ctx, dst_rank, physical_qp_idx,
                                            physical_qps_per_rank, words + 1,
                                            high);
                     }
                 } else {
                     if (high != 0) {
-                        device::mc_red_add(ctx, dst_rank, qp_idx,
+                        device::mc_red_add(ctx, dst_rank, physical_qp_idx,
                                            physical_qps_per_rank, words + 1,
                                            high);
                     }
                     if (low != 0) {
-                        device::mc_red_add(ctx, dst_rank, qp_idx,
+                        device::mc_red_add(ctx, dst_rank, physical_qp_idx,
                                            physical_qps_per_rank, words, low);
                     }
                 }
