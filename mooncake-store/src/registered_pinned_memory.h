@@ -21,9 +21,14 @@ class RegisteredPinnedRegion {
    private:
     friend class RegisteredPinnedMemoryManager;
 
-    RegisteredPinnedRegion(void* addr, size_t size, std::string owner)
-        : addr_(addr), size_(size), owner_(std::move(owner)) {}
+    RegisteredPinnedRegion(RegisteredPinnedMemoryManager* manager, void* addr,
+                           size_t size, std::string owner)
+        : manager_(manager),
+          addr_(addr),
+          size_(size),
+          owner_(std::move(owner)) {}
 
+    RegisteredPinnedMemoryManager* manager_ = nullptr;
     void* addr_ = nullptr;
     size_t size_ = 0;
     std::string owner_;
@@ -31,6 +36,15 @@ class RegisteredPinnedRegion {
 
 class RegisteredPinnedMemoryManager {
    public:
+    enum class UnregisterResult { kSuccess, kRuntimeUnloading, kError };
+
+    struct PinOps {
+        bool (*register_region)(void* addr, size_t size,
+                                std::string* error_message) = nullptr;
+        UnregisterResult (*unregister_region)(
+            void* addr, std::string* error_message) = nullptr;
+    };
+
     static RegisteredPinnedMemoryManager& instance();
 
     std::shared_ptr<RegisteredPinnedRegion> try_pin(void* addr, size_t size,
@@ -59,12 +73,21 @@ class RegisteredPinnedMemoryManager {
 
     RegisteredPinnedMemoryManager();
     explicit RegisteredPinnedMemoryManager(std::pair<bool, uint64_t> config);
+#if defined(MOONCAKE_STORE_TEST)
+   public:
+#endif
+    RegisteredPinnedMemoryManager(std::pair<bool, uint64_t> config,
+                                  PinOps pin_ops);
+#if defined(MOONCAKE_STORE_TEST)
+   private:
+#endif
 
     void release(RegisteredPinnedRegion* region);
     void drop_reservation_locked(const RegionKey& key, size_t size);
 
     const bool enabled_;
     const uint64_t limit_bytes_;
+    const PinOps pin_ops_;
 
     mutable std::mutex mutex_;
     uint64_t pinned_bytes_ = 0;

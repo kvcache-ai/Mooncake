@@ -79,10 +79,44 @@ std::pair<bool, uint64_t> ParsePinnedMemoryConfig() {
     return {true, *limit};
 }
 
+#if defined(USE_CUDA)
+bool RegisterPinnedRegionWithCuda(void* addr, size_t size,
+                                  std::string* error_message) {
+    cudaError_t err = cudaHostRegister(addr, size, cudaHostRegisterPortable);
+    if (err == cudaSuccess) return true;
+    if (error_message) *error_message = cudaGetErrorString(err);
+    cudaGetLastError();
+    return false;
+}
+
+RegisteredPinnedMemoryManager::UnregisterResult UnregisterPinnedRegionWithCuda(
+    void* addr, std::string* error_message) {
+    cudaError_t err = cudaHostUnregister(addr);
+    if (err == cudaSuccess) {
+        return RegisteredPinnedMemoryManager::UnregisterResult::kSuccess;
+    }
+    if (error_message) *error_message = cudaGetErrorString(err);
+    if (err == cudaErrorCudartUnloading) {
+        return RegisteredPinnedMemoryManager::UnregisterResult::
+            kRuntimeUnloading;
+    }
+    return RegisteredPinnedMemoryManager::UnregisterResult::kError;
+}
+
+#endif
+
+RegisteredPinnedMemoryManager::PinOps DefaultPinOps() {
+#if defined(USE_CUDA)
+    return {RegisterPinnedRegionWithCuda, UnregisterPinnedRegionWithCuda};
+#else
+    return {};
+#endif
+}
+
 }  // namespace
 
 RegisteredPinnedRegion::~RegisteredPinnedRegion() {
-    RegisteredPinnedMemoryManager::instance().release(this);
+    if (manager_) manager_->release(this);
 }
 
 RegisteredPinnedMemoryManager& RegisteredPinnedMemoryManager::instance() {
@@ -96,7 +130,11 @@ RegisteredPinnedMemoryManager::RegisteredPinnedMemoryManager()
 
 RegisteredPinnedMemoryManager::RegisteredPinnedMemoryManager(
     std::pair<bool, uint64_t> config)
-    : enabled_(config.first), limit_bytes_(config.second) {
+    : RegisteredPinnedMemoryManager(config, DefaultPinOps()) {}
+
+RegisteredPinnedMemoryManager::RegisteredPinnedMemoryManager(
+    std::pair<bool, uint64_t> config, PinOps pin_ops)
+    : enabled_(config.first), limit_bytes_(config.second), pin_ops_(pin_ops) {
 #if defined(USE_CUDA)
     LOG(INFO) << "Store segment pinned memory is "
               << (enabled_ ? "enabled" : "disabled")
@@ -112,11 +150,10 @@ RegisteredPinnedMemoryManager::RegisteredPinnedMemoryManager(
 std::shared_ptr<RegisteredPinnedRegion> RegisteredPinnedMemoryManager::try_pin(
     void* addr, size_t size, const std::string& owner) {
     if (!addr || size == 0 || !enabled_) return nullptr;
+    if (!pin_ops_.register_region || !pin_ops_.unregister_region) {
+        return nullptr;
+    }
 
-#if !defined(USE_CUDA)
-    (void)owner;
-    return nullptr;
-#else
     RegionKey key{addr, size};
     const auto start = reinterpret_cast<uintptr_t>(addr);
     const auto end = start + size;
@@ -128,7 +165,7 @@ std::shared_ptr<RegisteredPinnedRegion> RegisteredPinnedMemoryManager::try_pin(
 
     std::shared_ptr<RegisteredPinnedRegion> region;
     try {
-        region.reset(new RegisteredPinnedRegion(addr, size, owner));
+        region.reset(new RegisteredPinnedRegion(this, addr, size, owner));
     } catch (...) {
         LOG(WARNING) << "Skip cudaHostRegister for " << owner
                      << ": failed to allocate pin tracking, size=" << size;
@@ -180,17 +217,17 @@ std::shared_ptr<RegisteredPinnedRegion> RegisteredPinnedMemoryManager::try_pin(
         pinned_bytes_ += size;
     }
 
-    cudaError_t err = cudaHostRegister(addr, size, cudaHostRegisterPortable);
-    if (err != cudaSuccess) {
+    std::string error_message;
+    const bool registered =
+        pin_ops_.register_region(addr, size, &error_message);
+    if (!registered) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             drop_reservation_locked(key, size);
         }
         LOG(WARNING) << "cudaHostRegister failed for " << owner
-                     << ", size=" << size
-                     << ", error=" << cudaGetErrorString(err)
+                     << ", size=" << size << ", error=" << error_message
                      << ". Continue with pageable host memory.";
-        cudaGetLastError();
         return nullptr;
     }
 
@@ -206,12 +243,14 @@ std::shared_ptr<RegisteredPinnedRegion> RegisteredPinnedMemoryManager::try_pin(
         }
     }
     if (!tracking_ready) {
-        err = cudaHostUnregister(addr);
-        if (err != cudaSuccess) {
+        error_message.clear();
+        auto unregister_result =
+            pin_ops_.unregister_region(addr, &error_message);
+        if (unregister_result != UnregisterResult::kSuccess) {
             LOG(FATAL) << "cudaHostUnregister failed after active range "
                           "tracking mismatch for "
                        << owner << ", size=" << size
-                       << ", error=" << cudaGetErrorString(err);
+                       << ", error=" << error_message;
         }
         std::lock_guard<std::mutex> lock(mutex_);
         drop_reservation_locked(key, size);
@@ -221,7 +260,6 @@ std::shared_ptr<RegisteredPinnedRegion> RegisteredPinnedMemoryManager::try_pin(
     LOG(INFO) << "cudaHostRegister succeeded for " << owner << ", size=" << size
               << ", pinned=" << pinned_bytes << ", limit=" << limit_bytes_;
     return region;
-#endif
 }
 
 void RegisteredPinnedMemoryManager::release(RegisteredPinnedRegion* region) {
@@ -237,20 +275,21 @@ void RegisteredPinnedMemoryManager::release(RegisteredPinnedRegion* region) {
         region_it->second = nullptr;
     }
 
-#if defined(USE_CUDA)
-    cudaError_t err = cudaHostUnregister(region->addr_);
-    if (err != cudaSuccess) {
-        if (err == cudaErrorCudartUnloading) {
+    std::string error_message;
+    if (!pin_ops_.unregister_region) return;
+    auto unregister_result =
+        pin_ops_.unregister_region(region->addr_, &error_message);
+    if (unregister_result != UnregisterResult::kSuccess) {
+        if (unregister_result == UnregisterResult::kRuntimeUnloading) {
             LOG(WARNING) << "Skip cudaHostUnregister for " << region->owner_
                          << " because CUDA runtime is unloading, size="
                          << region->size_;
         } else {
             LOG(FATAL) << "cudaHostUnregister failed for " << region->owner_
                        << ", size=" << region->size_
-                       << ", error=" << cudaGetErrorString(err);
+                       << ", error=" << error_message;
         }
     }
-#endif
 
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = regions_.find(key);
