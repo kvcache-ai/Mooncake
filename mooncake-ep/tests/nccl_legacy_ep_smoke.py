@@ -17,7 +17,9 @@ def main():
     tokens, hidden, topk, experts = 4, 7168, 1, 16
     x = torch.full((tokens, hidden), float(rank + 1), dtype=torch.bfloat16,
                    device="cuda")
-    topk_idx = torch.full((tokens, topk), (rank + 1) % world_size,
+    experts_per_rank = experts // world_size
+    peer_expert = ((rank + 1) % world_size) * experts_per_rank
+    topk_idx = torch.full((tokens, topk), peer_expert,
                           dtype=torch.int64, device="cuda")
     topk_weights = torch.ones((tokens, topk), dtype=torch.float32,
                               device="cuda")
