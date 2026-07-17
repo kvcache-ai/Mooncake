@@ -118,6 +118,7 @@ class AgentHost : public AgentInterface {
     // Throttle repeated registerAgent error logs.
     static constexpr auto kAgentRegisterErrorLogInterval =
         std::chrono::seconds(5);
+    static constexpr auto kHeartbeatInterval = std::chrono::seconds(1);
 
     AgentHost(c10::intrusive_ptr<c10d::Store> store, const std::string& host_ip,
               GlobalRank rank, int max_world_size, LinkManager& link_manager);
@@ -157,8 +158,6 @@ class AgentHost : public AgentInterface {
     void postViewUpdate(coro_rpc::context<ViewUpdateAck> ctx,
                         ViewUpdatePush push);
 
-    void postLinkUpEvent(TELinkUpEvent event);
-
    private:
     AgentStateMachine agent_;
     SerializedExecutor executor_;
@@ -172,6 +171,7 @@ class AgentHost : public AgentInterface {
 
     std::string coordinator_addr_;
     uint64_t agent_session_epoch_ = 0;
+    std::chrono::steady_clock::time_point next_heartbeat_at_;
 
     // RPC infrastructure.
     std::unique_ptr<RpcServer> rpc_server_;
@@ -209,8 +209,6 @@ class AgentHost : public AgentInterface {
 
     void startAgentRegistration();
     void tick();
-
-    void sendLinkEventReport();
 
     void sendPublishEndpointRpc(GroupEndpointPublication endpoint);
 

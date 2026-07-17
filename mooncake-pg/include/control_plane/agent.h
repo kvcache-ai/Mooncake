@@ -25,7 +25,6 @@ class AgentStateMachine {
                                                      const GroupView& view);
     std::pair<AgentApplyResult, bool> handleViewUpdate(
         const ViewUpdatePush& push);
-    AgentApplyResult handleLinkUp(GlobalRank peer);
 
     HeartbeatRequest buildHeartbeat() const;
 

@@ -212,6 +212,10 @@ struct RequestLinkHealthCheck {
     GlobalRank peer = kInvalidGlobalRank;
 };
 
+struct SendLinkEventReport {
+    LinkEventReport report;
+};
+
 struct StopReconnect {
     GlobalRank peer = kInvalidGlobalRank;
 };
@@ -250,9 +254,10 @@ struct NotifyRanksActivated {
 
 using AgentEffect =
     std::variant<EnablePeerProbe, DisconnectLink, RequestLinkHealthCheck,
-                 StopReconnect, DisconnectAllLinks, ClearAllPeerMetadata,
-                 ApplyViewToBackend, ResetPeerState, RefreshPeerLink,
-                 NotifyLinkRefreshed, NotifyGroupReady, NotifyRanksActivated>;
+                 SendLinkEventReport, StopReconnect, DisconnectAllLinks,
+                 ClearAllPeerMetadata, ApplyViewToBackend, ResetPeerState,
+                 RefreshPeerLink, NotifyLinkRefreshed, NotifyGroupReady,
+                 NotifyRanksActivated>;
 
 // Results produced by the Coordinator/Agent state machine
 

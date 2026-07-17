@@ -59,8 +59,13 @@ AgentHost::AgentHost(c10::intrusive_ptr<c10d::Store> store,
 AgentHost::~AgentHost() { shutdown(); }
 
 void AgentHost::start() {
-    link_manager_.setEventCallback(
-        [this](TELinkUpEvent event) { postLinkUpEvent(std::move(event)); });
+    link_manager_.setEventCallback([this](TELinkUpEvent event) {
+        if (event.peer < 0 || event.peer >= max_world_size_) return;
+        LinkEvent link_event;
+        link_event.events.assign(max_world_size_, LinkEvent::EventType::None);
+        link_event.events[event.peer] = LinkEvent::EventType::Success;
+        pushLinkEvent(link_event);
+    });
 
     rpc_server_ = std::make_unique<RpcServer>(/*port=*/0, /*thread_num=*/2);
     rpc_impl_ = std::make_unique<AgentRpcServiceImpl>(*this);
@@ -369,12 +374,6 @@ void AgentHost::postViewUpdate(coro_rpc::context<ViewUpdateAck> ctx,
     });
 }
 
-void AgentHost::postLinkUpEvent(TELinkUpEvent event) {
-    executor_.post([this, event = std::move(event)]() {
-        runEffects(agent_.handleLinkUp(event.peer));
-    });
-}
-
 void AgentHost::startAgentRegistration() {
     // Avoid duplicate registration RPCs.  This also covers the case where a
     // heartbeat response callback asks for re-registration while another
@@ -401,6 +400,7 @@ void AgentHost::startAgentRegistration() {
                 runEffects(effects);
 
                 if (resp.success) {
+                    next_heartbeat_at_ = std::chrono::steady_clock::now();
                     if (!agent_registration_done_) {
                         agent_registration_done_ = true;
                         for (auto& p : agent_registration_promises_) {
@@ -470,7 +470,9 @@ void AgentHost::tick() {
         return;
     }
 
-    sendLinkEventReport();
+    auto now = std::chrono::steady_clock::now();
+    if (now < next_heartbeat_at_) return;
+    next_heartbeat_at_ = now + kHeartbeatInterval;
 
     auto req = agent_.buildHeartbeat();
     req.agent_session_epoch = agent_.getAgentSessionEpoch();
@@ -488,15 +490,6 @@ void AgentHost::tick() {
         });
 }
 
-void AgentHost::sendLinkEventReport() {
-    auto report = agent_.getLinkEventReport();
-    if (!report.has_value() || !rpc_client_ || coordinator_addr_.empty()) {
-        return;
-    }
-    rpc_client_->send<&CoordinatorRpcService::reportLinkEvent>(
-        coordinator_addr_, std::move(*report));
-}
-
 void AgentHost::runEffects(const AgentApplyResult& effects) {
     for (const auto& effect : effects) {
         std::visit(
@@ -510,6 +503,11 @@ void AgentHost::runEffects(const AgentApplyResult& effects) {
                 },
                 [this](const RequestLinkHealthCheck& e) {
                     link_manager_.requestHealthCheck(e.peer);
+                },
+                [this](const SendLinkEventReport& e) {
+                    if (!rpc_client_ || coordinator_addr_.empty()) return;
+                    rpc_client_->send<&CoordinatorRpcService::reportLinkEvent>(
+                        coordinator_addr_, e.report);
                 },
                 [this](const StopReconnect& e) {
                     link_manager_.stopReconnect(e.peer);

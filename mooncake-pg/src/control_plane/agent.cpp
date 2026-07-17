@@ -194,19 +194,6 @@ std::pair<AgentApplyResult, bool> AgentStateMachine::handleViewUpdate(
     return applyGroupView(push.group_id, push.view);
 }
 
-AgentApplyResult AgentStateMachine::handleLinkUp(GlobalRank peer) {
-    AgentApplyResult effects;
-    if (!rankInRange(peer) || peer == rank_) {
-        LOG(WARNING) << "AgentStateMachine: handleLinkUp invalid peer " << peer;
-        return effects;
-    }
-    recordLinkEvent(peer, LinkEvent::EventType::Success);
-
-    effects.push_back(ResetPeerState{peer});
-    effects.push_back(NotifyLinkRefreshed{peer});
-    return effects;
-}
-
 HeartbeatRequest AgentStateMachine::buildHeartbeat() const {
     HeartbeatRequest req;
     req.rank = rank_;
@@ -244,6 +231,9 @@ AgentApplyResult AgentStateMachine::applyRegisterAgentResponse(
     }
 
     coordinator_connection_ = CoordinatorConnection::Connected;
+    if (auto report = getLinkEventReport()) {
+        effects.push_back(SendLinkEventReport{std::move(*report)});
+    }
     return effects;
 }
 
@@ -268,7 +258,6 @@ AgentApplyResult AgentStateMachine::reset(uint64_t new_epoch) {
 
 AgentApplyResult AgentStateMachine::pushLinkEvent(const LinkEvent& event) {
     AgentApplyResult effects;
-    if (rank_state_ == RankState::Offline) return effects;
 
     if (event.events.size() != static_cast<size_t>(max_world_size_)) {
         LOG(WARNING) << "AgentStateMachine: invalid LinkEvent size. "
@@ -277,12 +266,26 @@ AgentApplyResult AgentStateMachine::pushLinkEvent(const LinkEvent& event) {
         return effects;
     }
 
+    bool changed = false;
     for (int peer = 0; peer < max_world_size_; ++peer) {
         auto type = event.events[peer];
         if (type == LinkEvent::EventType::None) continue;
-        if (recordLinkEvent(peer, type) &&
-            type == LinkEvent::EventType::Failure) {
+        if (!recordLinkEvent(peer, type)) continue;
+
+        changed = true;
+        if (type == LinkEvent::EventType::Failure) {
             effects.push_back(RequestLinkHealthCheck{peer});
+        } else if (peer != rank_) {
+            effects.push_back(ResetPeerState{peer});
+            effects.push_back(NotifyLinkRefreshed{peer});
+        }
+    }
+
+    if (changed &&
+        coordinator_connection_ == CoordinatorConnection::Connected) {
+        auto report = getLinkEventReport();
+        if (report.has_value()) {
+            effects.push_back(SendLinkEventReport{std::move(*report)});
         }
     }
 
