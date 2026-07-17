@@ -1713,6 +1713,10 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(mem_total_capacity_);
     serialize_metric(mem_allocated_size_per_segment_);
     serialize_metric(mem_total_capacity_per_segment_);
+    serialize_metric(nof_allocated_size_);
+    serialize_metric(nof_total_capacity_);
+    serialize_metric(nof_allocated_size_per_segment_);
+    serialize_metric(nof_total_capacity_per_segment_);
     serialize_metric(file_allocated_size_);
     serialize_metric(file_total_capacity_);
     serialize_metric(key_count_);
@@ -1748,6 +1752,12 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(unmount_segment_failures_);
     serialize_metric(remount_segment_requests_);
     serialize_metric(remount_segment_failures_);
+    serialize_metric(mount_nof_segment_requests_);
+    serialize_metric(mount_nof_segment_failures_);
+    serialize_metric(unmount_nof_segment_requests_);
+    serialize_metric(unmount_nof_segment_failures_);
+    serialize_metric(remount_nof_segment_requests_);
+    serialize_metric(remount_nof_segment_failures_);
     serialize_metric(ping_requests_);
     serialize_metric(ping_failures_);
     serialize_metric(nof_heartbeat_success_total_);
@@ -1789,18 +1799,39 @@ std::string MasterMetricManager::serialize_metrics() {
     // Serialize Batch Request Counters
     serialize_metric(batch_exist_key_requests_);
     serialize_metric(batch_exist_key_failures_);
+    serialize_metric(batch_exist_key_partial_successes_);
+    serialize_metric(batch_exist_key_items_);
+    serialize_metric(batch_exist_key_failed_items_);
     serialize_metric(batch_query_ip_requests_);
     serialize_metric(batch_query_ip_failures_);
+    serialize_metric(batch_query_ip_partial_successes_);
+    serialize_metric(batch_query_ip_items_);
+    serialize_metric(batch_query_ip_failed_items_);
     serialize_metric(batch_replica_clear_requests_);
     serialize_metric(batch_replica_clear_failures_);
+    serialize_metric(batch_replica_clear_partial_successes_);
+    serialize_metric(batch_replica_clear_items_);
+    serialize_metric(batch_replica_clear_failed_items_);
     serialize_metric(batch_get_replica_list_requests_);
     serialize_metric(batch_get_replica_list_failures_);
+    serialize_metric(batch_get_replica_list_partial_successes_);
+    serialize_metric(batch_get_replica_list_items_);
+    serialize_metric(batch_get_replica_list_failed_items_);
     serialize_metric(batch_put_start_requests_);
     serialize_metric(batch_put_start_failures_);
+    serialize_metric(batch_put_start_partial_successes_);
+    serialize_metric(batch_put_start_items_);
+    serialize_metric(batch_put_start_failed_items_);
     serialize_metric(batch_put_end_requests_);
     serialize_metric(batch_put_end_failures_);
+    serialize_metric(batch_put_end_partial_successes_);
+    serialize_metric(batch_put_end_items_);
+    serialize_metric(batch_put_end_failed_items_);
     serialize_metric(batch_put_revoke_requests_);
     serialize_metric(batch_put_revoke_failures_);
+    serialize_metric(batch_put_revoke_partial_successes_);
+    serialize_metric(batch_put_revoke_items_);
+    serialize_metric(batch_put_revoke_failed_items_);
 
     // Serialize Store-observed cache reuse metrics
     serialize_metric(mem_cache_hit_nums_);
@@ -1817,6 +1848,14 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(eviction_attempts_);
     serialize_metric(evicted_key_count_);
     serialize_metric(evicted_size_);
+    serialize_metric(mem_eviction_success_);
+    serialize_metric(mem_eviction_attempts_);
+    serialize_metric(mem_evicted_key_count_);
+    serialize_metric(mem_evicted_size_);
+    serialize_metric(nof_eviction_success_);
+    serialize_metric(nof_eviction_attempts_);
+    serialize_metric(nof_evicted_key_count_);
+    serialize_metric(nof_evicted_size_);
 
     // Serialize PutStart Discard Metrics
     serialize_metric(put_start_discard_cnt_);

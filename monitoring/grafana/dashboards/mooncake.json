@@ -652,7 +652,7 @@
       "gridPos": { "h": 4, "w": 6, "x": 0, "y": 91 },
       "id": 704,
       "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
-      "targets": [{ "expr": "100 * rate(mem_cache_hit_nums_[5m]) / (rate(mem_cache_hit_nums_[5m]) + rate(file_cache_hit_nums_[5m]) + 1)", "legendFormat": "", "refId": "A" }],
+      "targets": [{ "expr": "100 * rate(mem_cache_hit_nums_[5m]) / clamp_min(rate(mem_cache_hit_nums_[5m]) + rate(file_cache_hit_nums_[5m]), 1e-9)", "legendFormat": "", "refId": "A" }],
       "title": "MEM Hit Ratio % (Store-observed)",
       "type": "stat"
     },
@@ -665,7 +665,7 @@
       "gridPos": { "h": 4, "w": 6, "x": 6, "y": 91 },
       "id": 705,
       "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
-      "targets": [{ "expr": "100 * rate(valid_get_nums_[5m]) / (rate(total_get_nums_[5m]) + 1)", "legendFormat": "", "refId": "A" }],
+      "targets": [{ "expr": "100 * rate(valid_get_nums_[5m]) / clamp_min(rate(total_get_nums_[5m]), 1e-9)", "legendFormat": "", "refId": "A" }],
       "title": "Valid Get Rate %",
       "type": "stat"
     },
@@ -733,7 +733,7 @@
       "id": 803,
       "options": { "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
-        { "expr": "rate(master_nof_heartbeat_probe_latency_ms_bucket[5m])", "legendFormat": "le={{le}}ms", "refId": "A" }
+        { "expr": "histogram_quantile(0.95, sum by (le) (rate(master_nof_heartbeat_probe_latency_ms_bucket[5m])))", "legendFormat": "p95", "refId": "A" }
       ],
       "title": "NoF Heartbeat Probe Latency (Histogram)",
       "type": "timeseries"
@@ -782,7 +782,7 @@
       "id": 903,
       "options": { "legend": { "calcs": ["mean", "lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
-        { "expr": "rate(master_snapshot_duration_ms_bucket[5m])", "legendFormat": "le={{le}}ms", "refId": "A" }
+        { "expr": "histogram_quantile(0.95, sum by (le) (rate(master_snapshot_duration_ms_bucket[5m])))", "legendFormat": "p95", "refId": "A" }
       ],
       "title": "Snapshot Duration Distribution (Histogram)",
       "type": "timeseries"
