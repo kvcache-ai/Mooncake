@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <ranges>
@@ -763,7 +764,7 @@ TEST_F(StorageBackendTest, AdaptorBatchOffloadEmptyShouldFail) {
 TEST_F(StorageBackendTest, AdaptorScanMetaAndIsEnableOffloading) {
     FileStorageConfig cfg;
     cfg.storage_filepath = data_path + "/";
-    cfg.total_keys_limit = 10;
+    cfg.total_keys_limit = 2;
     cfg.total_size_limit = 1024 * 1024;
 
     FilePerKeyConfig file_per_key_config;
@@ -819,17 +820,12 @@ TEST_F(StorageBackendTest, AdaptorScanMetaAndIsEnableOffloading) {
     ASSERT_TRUE(enable_after_write);
     EXPECT_TRUE(enable_after_write.value());
 
-    // Verify scan results via a fresh adaptor instance to avoid double-counting
-    // totals if ScanMeta is called again on the same adaptor.
-    StorageBackendAdaptor restart_adaptor(cfg, file_per_key_config);
-    ASSERT_TRUE(restart_adaptor.Init());
-
     std::vector<std::string> scan_keys;
     std::vector<StorageObjectMetadata> scan_metas;
 
-    auto scan_result = restart_adaptor.ScanMeta(
-        [&](const std::vector<std::string>& keys,
-            std::vector<StorageObjectMetadata>& metas) {
+    auto scan_result =
+        adaptor.ScanMeta([&](const std::vector<std::string>& keys,
+                             std::vector<StorageObjectMetadata>& metas) {
             scan_keys.insert(scan_keys.end(), keys.begin(), keys.end());
             scan_metas.insert(scan_metas.end(), metas.begin(), metas.end());
             return ErrorCode::OK;
@@ -839,7 +835,7 @@ TEST_F(StorageBackendTest, AdaptorScanMetaAndIsEnableOffloading) {
     EXPECT_EQ(scan_keys.size(), test_data.size());
     EXPECT_EQ(scan_metas.size(), test_data.size());
 
-    auto enable_after = restart_adaptor.IsEnableOffloading();
+    auto enable_after = adaptor.IsEnableOffloading();
     ASSERT_TRUE(enable_after);
     EXPECT_TRUE(enable_after.value());
 
@@ -858,6 +854,54 @@ TEST_F(StorageBackendTest, AdaptorScanMetaAndIsEnableOffloading) {
     auto enable_strict = strict_adaptor.IsEnableOffloading();
     ASSERT_TRUE(enable_strict);
     EXPECT_FALSE(enable_strict.value());
+}
+
+TEST_F(StorageBackendTest, AdaptorScanMetaSkipsMalformedFiles) {
+    FileStorageConfig cfg;
+    cfg.storage_filepath = data_path;
+    cfg.total_keys_limit = 1;
+    cfg.total_size_limit = 1024 * 1024;
+
+    FilePerKeyConfig backend_config;
+    backend_config.fsdir = "file_per_key_malformed_scan";
+    backend_config.enable_eviction = false;
+
+    StorageBackendAdaptor adaptor(cfg, backend_config);
+    ASSERT_TRUE(adaptor.Init());
+    ASSERT_TRUE(adaptor.ScanMeta(
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+
+    std::string value(128, 'v');
+    std::unordered_map<std::string, std::vector<Slice>> batch = {
+        {"valid_key", {{value.data(), value.size()}}},
+    };
+    ASSERT_TRUE(adaptor.BatchOffload(
+        batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+
+    const auto corrupt_dir =
+        fs::path(cfg.storage_filepath) / backend_config.fsdir / "a" / "b";
+    fs::create_directories(corrupt_dir);
+    std::ofstream corrupt_file(corrupt_dir / "corrupt", std::ios::binary);
+    ASSERT_TRUE(corrupt_file.is_open());
+    corrupt_file << std::string(8, static_cast<char>(0xff));
+    corrupt_file.close();
+
+    std::vector<std::string> scanned_keys;
+    auto scan_result =
+        adaptor.ScanMeta([&](const std::vector<std::string>& keys,
+                             std::vector<StorageObjectMetadata>&) {
+            scanned_keys.insert(scanned_keys.end(), keys.begin(), keys.end());
+            return ErrorCode::OK;
+        });
+    ASSERT_TRUE(scan_result);
+    EXPECT_EQ(scanned_keys, std::vector<std::string>{"valid_key"});
+
+    auto enable_result = adaptor.IsEnableOffloading();
+    ASSERT_TRUE(enable_result);
+    EXPECT_TRUE(enable_result.value());
 }
 
 TEST_F(StorageBackendTest, AdaptorScanMetaAndBatchLoadAcrossRestart) {
