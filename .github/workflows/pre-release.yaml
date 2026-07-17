@@ -28,7 +28,7 @@ jobs:
       cmake-args: >-
         -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON
         -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
-      artifact-prefix: pre-release-cuda
+      artifact-prefix: mooncake-wheel-pre-release
 
   build-non-cuda:
     uses: ./.github/workflows/_build-wheel.yaml
@@ -41,7 +41,7 @@ jobs:
       cmake-args: >-
         -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=OFF -DWITH_EP=OFF
         -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
-      artifact-prefix: pre-release-non-cuda
+      artifact-prefix: mooncake-wheel-non-cuda-pre-release
 
   build-cuda13:
     uses: ./.github/workflows/_build-wheel.yaml
@@ -57,7 +57,7 @@ jobs:
       cmake-args: >-
         -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON
         -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
-      artifact-prefix: pre-release-cuda13
+      artifact-prefix: mooncake-wheel-cuda13-pre-release
 
   build-cuda-arm64:
     uses: ./.github/workflows/_build-wheel.yaml
@@ -70,7 +70,7 @@ jobs:
       cmake-args: >-
         -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=OFF
         -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
-      artifact-prefix: pre-release-cuda-arm64
+      artifact-prefix: mooncake-wheel-arm64-pre-release
 
   build-cuda13-arm64:
     uses: ./.github/workflows/_build-wheel.yaml
@@ -84,7 +84,7 @@ jobs:
       cmake-args: >-
         -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=OFF
         -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
-      artifact-prefix: pre-release-cuda13-arm64
+      artifact-prefix: mooncake-wheel-cuda13-arm64-pre-release
 
   validate-release:
     name: Validate release artifacts
@@ -100,7 +100,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: mooncake-wheel/dist-all
-          pattern: pre-release-*
+          pattern: mooncake-wheel*pre-release*
 
       - name: Prepare wheels for validation
         run: |
@@ -129,7 +129,7 @@ jobs:
       - name: Upload validated wheels as workflow artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: pre-release-wheels-${{ github.ref_name }}
+          name: mooncake-wheels-pre-release-${{ github.ref_name }}
           path: mooncake-wheel/dist-release/*.whl
           retention-days: 14
 
