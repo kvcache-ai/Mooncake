@@ -164,7 +164,13 @@ struct MooncakeGin {
                                     kRail ? logical_dst_rank : world_dst_rank,
                                     physical_qps_per_rank, src_ptr, dst_ptr,
                                     static_cast<uint32_t>(num_bytes),
-                                    ptx::get_lane_idx(), kRail, sharing_mode,
+                                    // Elastic callers elect the issuing lane;
+                                    // its physical lane may be nonzero when
+                                    // metadata is sent to a distinct peer.
+                                    // The generic Device API's lane argument
+                                    // is a request-enable gate, not a CUDA
+                                    // lane identity.
+                                    0, kRail, sharing_mode,
                                     flags);
                 return;
             }
