@@ -1278,6 +1278,116 @@ fn cold_restore_large_checkpoint_batch_uses_caller_buffers_without_cross_object_
 }
 
 #[test]
+fn pending_offload_materialization_owns_payload_snapshot_after_prepare() {
+    let _cold_guard = enable_cold_tier_for_test();
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let root = cold_tier_test_root("pending-offload-snapshot-after-prepare");
+    let transport = Arc::new(TestTransport::new("pending-offload-snapshot-segment"));
+    let client = StoreClientBuilder::new(metadata, "pending-offload-snapshot")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(512))
+        .cold_tier_target(ColdTierTargetConfig::directory(
+            "pending-offload-snapshot-after-prepare",
+            ColdTierKind::Ssd,
+            root.clone(),
+        ))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let original = vec![0x11u8; 128];
+    client
+        .put("pending-offload-snapshot", &original)
+        .expect("put should publish pending cold backing");
+    let route = client
+        .query_route("pending-offload-snapshot")
+        .expect("route query should succeed")
+        .expect("route should exist");
+    let cold_backing = route
+        .cold_backing
+        .as_ref()
+        .expect("route should have pending cold backing")
+        .clone();
+    assert_eq!(
+        cold_backing.state,
+        mooncake_store_core::ColdBackingState::PendingOffload
+    );
+    let replica = route
+        .replicas
+        .iter()
+        .find(|replica| replica.owner == *client.runtime_id())
+        .expect("route should have local hot replica")
+        .clone();
+
+    let entry = client
+        .storage_owner
+        .pending_offloads
+        .claim(&route.key, route.version)
+        .expect("pending offload entry should be claimable");
+    let prepared = client
+        .storage_owner
+        .prepare_pending_offload_entries(vec![entry])
+        .expect("pending offload should prepare");
+    assert_eq!(prepared.len(), 1);
+
+    let replacement = vec![0xA5u8; original.len()];
+    let addr = {
+        let state = client.state.lock();
+        state
+            .memory_ref()
+            .expect("memory should be registered")
+            .storage_address(&replica.segment_name, replica.segment_offset as usize)
+            .expect("replica address should resolve")
+    };
+    unsafe {
+        std::ptr::copy_nonoverlapping(replacement.as_ptr(), addr.cast::<u8>(), replacement.len());
+    }
+    assert_eq!(
+        prepared[0].payload.as_slice(),
+        original.as_slice(),
+        "prepared offload payload must not observe later hot-slot mutation"
+    );
+
+    let mut first_error = None;
+    let materialized = client
+        .storage_owner
+        .materialize_prepared_pending_offload_batch(&prepared, &mut first_error)
+        .expect("prepared offload should materialize from owned snapshot");
+    assert_eq!(materialized, 1, "unexpected offload error: {first_error:?}");
+
+    let route = client
+        .query_route("pending-offload-snapshot")
+        .expect("route query after offload should succeed")
+        .expect("route should still exist");
+    let materialized = route
+        .cold_backing
+        .as_ref()
+        .expect("route should have materialized cold backing");
+    assert_eq!(
+        materialized.state,
+        mooncake_store_core::ColdBackingState::Materialized
+    );
+    let backend = client
+        .storage_owner
+        .cold_tier_devices
+        .backend_for(materialized)
+        .expect("backend should resolve");
+    let mut restored = vec![0u8; original.len()];
+    let bytes = backend
+        .get_object_into(materialized, &mut restored)
+        .expect("cold payload read should succeed")
+        .expect("cold payload should exist");
+    assert_eq!(bytes, original.len());
+    assert_eq!(restored, original);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 #[ignore = "too slow for default CI gate"]
 fn cold_restore_large_checkpoint_batch_rejects_corrupt_shard_without_partial_success() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
