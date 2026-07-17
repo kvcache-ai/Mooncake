@@ -6,7 +6,22 @@
 #include <unistd.h>
 #include <errno.h>
 
+#include <filesystem>
+
 using namespace mooncake;
+
+TEST(UtilsTest, ResolvePathFromKeyUsesBoundedStableDigest) {
+    const std::string root = "/tmp/mooncake";
+    const std::string fsdir = "file_per_key";
+    const std::string key(4096, '/');
+
+    const auto first = ResolvePathFromKey(key, root, fsdir);
+    const auto second = ResolvePathFromKey(key, root, fsdir);
+    EXPECT_EQ(first, second);
+    EXPECT_EQ(std::filesystem::path(first).filename().string().size(), 32);
+    EXPECT_NE(first, ResolvePathFromKey(key + "x", root, fsdir));
+    EXPECT_GT(ResolveLegacyPathFromKey(key, root, fsdir).size(), first.size());
+}
 
 TEST(UtilsTest, ByteSizeToString) {
     EXPECT_EQ(byte_size_to_string(999), "999 B");

@@ -1421,10 +1421,40 @@ StorageBackendAdaptor::EvictAboveDiskWatermark(
 
 tl::expected<bool, ErrorCode> StorageBackendAdaptor::IsExist(
     const std::string& key) {
-    auto path = ResolvePathFromKey(key, file_storage_config_.storage_filepath,
-                                   file_per_key_config_.fsdir);
     namespace fs = std::filesystem;
-    return fs::exists(path);
+    const auto path = ResolvePathFromKey(
+        key, file_storage_config_.storage_filepath, file_per_key_config_.fsdir);
+    if (fs::exists(path)) {
+        return true;
+    }
+
+    const auto legacy_path = ResolveLegacyPathFromKey(
+        key, file_storage_config_.storage_filepath, file_per_key_config_.fsdir);
+    if (!fs::exists(legacy_path)) {
+        return false;
+    }
+
+    std::error_code ec;
+    const auto size = fs::file_size(legacy_path, ec);
+    if (ec) {
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+    std::string kv_buf;
+    auto load_result = storage_backend_->LoadObject(legacy_path, kv_buf,
+                                                    static_cast<int64_t>(size));
+    if (!load_result) {
+        return tl::make_unexpected(load_result.error());
+    }
+
+    try {
+        KVEntry kv;
+        struct_pb::from_pb(kv, kv_buf);
+        return kv.key == key;
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Failed to decode legacy file for key: " << key
+                   << ", error: " << e.what();
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
 }
 
 tl::expected<void, ErrorCode> StorageBackendAdaptor::BatchLoad(
@@ -1435,6 +1465,14 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::BatchLoad(
         auto path =
             ResolvePathFromKey(kv.key, file_storage_config_.storage_filepath,
                                file_per_key_config_.fsdir);
+        if (!std::filesystem::exists(path)) {
+            const auto legacy_path = ResolveLegacyPathFromKey(
+                kv.key, file_storage_config_.storage_filepath,
+                file_per_key_config_.fsdir);
+            if (std::filesystem::exists(legacy_path)) {
+                path = legacy_path;
+            }
+        }
 
         kv.value.resize(slice.size);
 
@@ -1447,7 +1485,25 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::BatchLoad(
             return tl::make_unexpected(r.error());
         }
 
-        struct_pb::from_pb(kv, kv_buf);
+        try {
+            struct_pb::from_pb(kv, kv_buf);
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "Failed to decode file for key: " << key
+                       << ", error: " << e.what();
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+
+        if (kv.key != key) {
+            LOG(ERROR) << "Stored key does not match requested key";
+            return tl::make_unexpected(ErrorCode::INVALID_KEY);
+        }
+        if (kv.value.size() != slice.size) {
+            LOG(ERROR)
+                << "Stored value size does not match destination for key: "
+                << key << ", expected: " << slice.size
+                << ", got: " << kv.value.size();
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
 
         if (!kv.value.empty()) {
             std::memcpy(slice.ptr, kv.value.data(), kv.value.size());
@@ -1536,6 +1592,15 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
 
                 KVEntry kv;
                 struct_pb::from_pb(kv, buf);
+
+                const auto canonical_path = ResolvePathFromKey(
+                    kv.key, file_storage_config_.storage_filepath,
+                    file_per_key_config_.fsdir);
+                if (p.lexically_normal() !=
+                        fs::path(canonical_path).lexically_normal() &&
+                    fs::exists(canonical_path)) {
+                    continue;
+                }
                 storage_backend_->UpdateFileRecordKey(p.string(), kv.key);
 
                 total_keys++;

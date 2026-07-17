@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include <filesystem>
+#include <array>
 #include <iostream>
 #include <limits>
 #include <ranges>
@@ -22,6 +23,28 @@
 
 namespace fs = std::filesystem;
 namespace mooncake::test {
+
+static std::pair<std::string, std::string> FindLegacyPathCollision(
+    const std::string& root_dir, const std::string& fsdir) {
+    constexpr std::array<char, 10> kChars = {'_', '/', '\\', ':', '*',
+                                             '?', '"', '<',  '>', '|'};
+    std::unordered_map<std::string, std::string> key_by_path;
+    const std::string tenant_prefix("default\0", 8);
+    for (size_t value = 0; value < 10000; ++value) {
+        size_t remaining = value;
+        std::string key = tenant_prefix;
+        for (size_t i = 0; i < 4; ++i) {
+            key.push_back(kChars[remaining % kChars.size()]);
+            remaining /= kChars.size();
+        }
+        const auto path = ResolveLegacyPathFromKey(key, root_dir, fsdir);
+        auto [it, inserted] = key_by_path.emplace(path, key);
+        if (!inserted && it->second != key) {
+            return {it->second, key};
+        }
+    }
+    return {};
+}
 
 class StorageBackendTest : public ::testing::Test {
    protected:
@@ -706,6 +729,112 @@ TEST_F(StorageBackendTest, AdaptorBatchOffloadAndBatchLoad) {
         std::string loaded(static_cast<char*>(it->second.ptr), it->second.size);
         EXPECT_EQ(loaded, value);
     }
+}
+
+TEST_F(StorageBackendTest, AdaptorSeparatesLegacyPathCollisions) {
+    FileStorageConfig cfg;
+    cfg.storage_filepath = data_path;
+    FilePerKeyConfig backend_config;
+    backend_config.fsdir = "file_per_key_collision";
+    backend_config.enable_eviction = false;
+
+    auto [first_key, second_key] =
+        FindLegacyPathCollision(cfg.storage_filepath, backend_config.fsdir);
+    ASSERT_FALSE(first_key.empty());
+    ASSERT_EQ(ResolveLegacyPathFromKey(first_key, cfg.storage_filepath,
+                                       backend_config.fsdir),
+              ResolveLegacyPathFromKey(second_key, cfg.storage_filepath,
+                                       backend_config.fsdir));
+    ASSERT_NE(ResolvePathFromKey(first_key, cfg.storage_filepath,
+                                 backend_config.fsdir),
+              ResolvePathFromKey(second_key, cfg.storage_filepath,
+                                 backend_config.fsdir));
+
+    StorageBackendAdaptor adaptor(cfg, backend_config);
+    ASSERT_TRUE(adaptor.Init());
+    ASSERT_TRUE(adaptor.ScanMeta(
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+
+    std::string first_value(64, 'a');
+    std::string second_value(64, 'b');
+    std::unordered_map<std::string, std::vector<Slice>> batch = {
+        {first_key, {{first_value.data(), first_value.size()}}},
+        {second_key, {{second_value.data(), second_value.size()}}},
+    };
+    auto offload_result = adaptor.BatchOffload(
+        batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_TRUE(offload_result);
+    EXPECT_EQ(offload_result.value(), 2);
+
+    std::array<char, 64> first_output{};
+    std::array<char, 64> second_output{};
+    std::unordered_map<std::string, Slice> loads = {
+        {first_key, {first_output.data(), first_output.size()}},
+        {second_key, {second_output.data(), second_output.size()}},
+    };
+    ASSERT_TRUE(adaptor.BatchLoad(loads));
+    EXPECT_EQ(std::string(first_output.data(), first_output.size()),
+              first_value);
+    EXPECT_EQ(std::string(second_output.data(), second_output.size()),
+              second_value);
+}
+
+TEST_F(StorageBackendTest, AdaptorValidatesLegacyFallbackKey) {
+    FileStorageConfig cfg;
+    cfg.storage_filepath = data_path;
+    FilePerKeyConfig backend_config;
+    backend_config.fsdir = "file_per_key_legacy_fallback";
+    backend_config.enable_eviction = false;
+
+    auto [stored_key, colliding_key] =
+        FindLegacyPathCollision(cfg.storage_filepath, backend_config.fsdir);
+    ASSERT_FALSE(stored_key.empty());
+
+    StorageBackendAdaptor adaptor(cfg, backend_config);
+    ASSERT_TRUE(adaptor.Init());
+    ASSERT_TRUE(adaptor.ScanMeta(
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+
+    std::string value(64, 'v');
+    std::unordered_map<std::string, std::vector<Slice>> batch = {
+        {stored_key, {{value.data(), value.size()}}},
+    };
+    ASSERT_TRUE(adaptor.BatchOffload(
+        batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+
+    const auto canonical_path = ResolvePathFromKey(
+        stored_key, cfg.storage_filepath, backend_config.fsdir);
+    const auto legacy_path = ResolveLegacyPathFromKey(
+        stored_key, cfg.storage_filepath, backend_config.fsdir);
+    fs::create_directories(fs::path(legacy_path).parent_path());
+    fs::rename(canonical_path, legacy_path);
+
+    auto stored_exists = adaptor.IsExist(stored_key);
+    ASSERT_TRUE(stored_exists);
+    EXPECT_TRUE(stored_exists.value());
+    auto colliding_exists = adaptor.IsExist(colliding_key);
+    ASSERT_TRUE(colliding_exists);
+    EXPECT_FALSE(colliding_exists.value());
+
+    std::array<char, 64> output{};
+    std::unordered_map<std::string, Slice> valid_load = {
+        {stored_key, {output.data(), output.size()}},
+    };
+    ASSERT_TRUE(adaptor.BatchLoad(valid_load));
+    EXPECT_EQ(std::string(output.data(), output.size()), value);
+
+    std::unordered_map<std::string, Slice> wrong_load = {
+        {colliding_key, {output.data(), output.size()}},
+    };
+    auto wrong_result = adaptor.BatchLoad(wrong_load);
+    ASSERT_FALSE(wrong_result);
+    EXPECT_EQ(wrong_result.error(), ErrorCode::INVALID_KEY);
 }
 
 TEST_F(StorageBackendTest, AdaptorBatchOffload_PartialSuccess) {

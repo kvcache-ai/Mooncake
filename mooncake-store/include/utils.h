@@ -540,4 +540,10 @@ std::string ResolveMooncakeHostId(const std::string& local_hostname);
 std::string ResolvePathFromKey(const std::string& key,
                                const std::string& root_dir,
                                const std::string& fsdir);
+
+// Resolves the pre-digest file-per-key layout. Kept for reading cache files
+// written before ResolvePathFromKey switched to stable digest filenames.
+std::string ResolveLegacyPathFromKey(const std::string& key,
+                                     const std::string& root_dir,
+                                     const std::string& fsdir);
 }  // namespace mooncake
