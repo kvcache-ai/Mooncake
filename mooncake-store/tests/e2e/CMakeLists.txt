@@ -81,6 +81,7 @@ if(STORE_USE_REDIS)
         NAME redis_chaos_test
         COMMAND redis_chaos_test
             --master_path=${CMAKE_BINARY_DIR}/mooncake-store/src/mooncake_master
+            --clientctl_path=${CMAKE_BINARY_DIR}/mooncake-store/tests/e2e/clientctl
             --out_dir=${CMAKE_BINARY_DIR}/redis_chaos_output
     )
     set_tests_properties(redis_chaos_test PROPERTIES

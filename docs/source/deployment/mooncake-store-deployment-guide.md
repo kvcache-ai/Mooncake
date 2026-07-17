@@ -32,12 +32,16 @@ This page summarizes useful flags, environment variables, and HTTP endpoints to 
   - `--election_backend` (str, default `etcd`): Election backend, either `etcd` or `redis`.
   - `--etcd_endpoints` (str, default empty unless HA config): etcd endpoints, semicolon separated.
   - `--redis_endpoint` (str, default empty): Redis endpoint for Redis-based HA, such as `10.0.0.10:6379`.
+  - `--redis_username` (str, default empty): Redis ACL username for Redis-based HA.
   - `--redis_password` (str, default empty): Redis AUTH password for Redis-based HA.
   - `--redis_db_index` (int, default `0`): Redis DB index for Redis-based HA.
   - `--redis_master_view_ttl_sec` (int, default `5`): TTL for the Redis master view key.
   - `--redis_heartbeat_interval_sec` (int, default `2`): Redis leader renewal interval. It must be smaller than `--redis_master_view_ttl_sec`.
   - `--client_ttl` (int64, default `10` s): Client alive TTL after last ping (HA mode).
   - `--cluster_id` (str, default `mooncake_cluster`): Cluster ID for persistence and HA metadata isolation.
+  - `--enable_oplog` (bool, default `false`): Enable master metadata OpLog recording.
+  - `--oplog_store_type` (str, default `localfs`): OpLog backend, for example `localfs` or `redis`.
+  - `--oplog_data_dir` (str, default `/tmp/mooncake_oplog`): OpLog data path for `localfs`; Redis endpoint for `redis`.
 
 ### P2P HA OpLog Coverage
 
@@ -77,19 +81,33 @@ mooncake_master \
   --enable_ha=true \
   --election_backend=redis \
   --redis_endpoint=10.0.0.10:6379 \
+  --redis_username=<redis_user> \
+  --redis_password=<redis_password> \
   --cluster_id=mooncake_cluster \
   --rpc_address=10.0.0.1
 ```
 
 Repeat the command on the other master nodes with their own reachable `--rpc_address` values, for example `10.0.0.2` and `10.0.0.3`, while keeping `--redis_endpoint` and `--cluster_id` identical.
 
-Clients should use the matching Redis endpoint for HA master discovery:
+Client configs should use the matching Redis endpoint for HA master discovery:
 
 ```text
 master_server_entry = "redis://10.0.0.10:6379"
+redis_username = "<redis_user>"
+redis_password = "<redis_password>"
 ```
 
-The client Redis cluster ID must match the masters' `--cluster_id`. If the client does not set a cluster ID explicitly, it uses the default `mooncake_cluster`.
+When starting `mooncake_client`, pass the same settings through the client flags:
+
+```bash
+mooncake_client \
+  --master_server_address=redis://10.0.0.10:6379 \
+  --redis_cluster_id=mooncake_cluster \
+  --redis_username=<redis_user> \
+  --redis_password=<redis_password>
+```
+
+The client Redis cluster ID must match the masters' `--cluster_id`. If the client does not set a cluster ID explicitly, it uses the default `mooncake_cluster`. If Redis does not require ACL authentication, leave `redis_username` and `redis_password` empty.
 
 Operational notes:
 
@@ -98,6 +116,45 @@ Operational notes:
 - The active leader renews the Redis master view key periodically. If the leader process exits or loses renewal, the key expires and another master can be elected.
 - Clients using `redis://` resolve the current leader from Redis and reconnect after heartbeat failures. Existing requests may fail during the failover window and should be retried by the caller.
 - Redis HA metadata is isolated by `--cluster_id`, so different Mooncake Store clusters can share one Redis instance when they use different cluster IDs.
+
+For P2P master HA, run the masters in P2P deployment mode and enable Redis-backed OpLog storage. The election Redis endpoint and the OpLog Redis endpoint may be the same Redis instance, but every master in the cluster must use the same values. Redis-backed OpLog uses the same `--redis_username` and `--redis_password` authentication settings.
+
+```bash
+mooncake_master \
+  --deployment_mode=P2P \
+  --enable_ha=true \
+  --election_backend=redis \
+  --redis_endpoint=10.0.0.10:6379 \
+  --redis_username=<redis_user> \
+  --redis_password=<redis_password> \
+  --cluster_id=p2p_mooncake_cluster \
+  --enable_oplog=true \
+  --oplog_store_type=redis \
+  --oplog_data_dir=10.0.0.10:6379 \
+  --rpc_address=10.0.0.1
+```
+
+P2P clients should also use Redis master discovery and the same cluster ID:
+
+```text
+master_server_entry = "redis://10.0.0.10:6379"
+redis_cluster_id = "p2p_mooncake_cluster"
+redis_username = "<redis_user>"
+redis_password = "<redis_password>"
+deployment_mode = "P2P"
+```
+
+For `mooncake_client` in P2P mode:
+
+```bash
+mooncake_client \
+  --deployment_mode=P2P \
+  --metadata_server=P2PHANDSHAKE \
+  --master_server_address=redis://10.0.0.10:6379 \
+  --redis_cluster_id=p2p_mooncake_cluster \
+  --redis_username=<redis_user> \
+  --redis_password=<redis_password>
+```
 
 **Tips:**
 

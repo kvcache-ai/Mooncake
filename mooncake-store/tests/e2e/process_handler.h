@@ -37,6 +37,11 @@ struct MasterRunnerConfig {
     int redis_heartbeat_interval_sec = 2;
     std::string cluster_id;
     std::string rpc_address = "0.0.0.0";
+    std::string deployment_mode = "Centralization";
+    bool enable_oplog = false;
+    std::string oplog_store_type = "localfs";
+    std::string oplog_data_dir;
+    int max_replicas_per_key = 0;
 };
 
 class MasterProcessHandler {
