@@ -126,7 +126,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("num_max_tokens_per_rank"), py::arg("expert_alignment"),
              py::arg("num_sms"), py::arg("do_expand"), py::arg("do_cpu_sync"),
              py::arg("async_with_compute_stream"),
-             py::arg("cached_handle") = std::nullopt)
+             py::arg("cached_handle") = std::nullopt,
+             py::arg("diagnostic") = std::nullopt)
         .def("combine", &MooncakeElasticBuffer::combine, py::arg("x"),
              py::arg("handle"), py::arg("topk_weights"),
              py::arg("active_ranks"), py::arg("num_sms"),

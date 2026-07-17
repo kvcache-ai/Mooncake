@@ -46,7 +46,7 @@ void launch_mooncake_elastic_dispatch(
     int sf_hidden_stride, int num_experts, int num_topk, int expert_alignment,
     int num_sms, int num_channels_per_sm, int num_smem_bytes, bool cached_mode,
     bool deterministic, bool do_cpu_sync, const ElasticLaunchContext& ctx,
-    cudaStream_t stream);
+    cudaStream_t stream, int64_t* diagnostic);
 
 void launch_mooncake_elastic_dispatch_copy_epilogue(
     void* recv_x, void* recv_sf, int64_t* recv_topk_idx,

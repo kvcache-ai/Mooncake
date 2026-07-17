@@ -105,7 +105,8 @@ class MooncakeElasticBuffer {
         torch::Tensor& active_ranks, int num_experts,
         int num_max_tokens_per_rank, int expert_alignment, int num_sms,
         bool do_expand, bool do_cpu_sync, bool async_with_compute_stream,
-        const std::optional<ElasticNativeHandle>& cached_handle = std::nullopt);
+        const std::optional<ElasticNativeHandle>& cached_handle = std::nullopt,
+        const std::optional<torch::Tensor>& diagnostic = std::nullopt);
 
     ElasticCombineOutput combine(
         const torch::Tensor& x, const ElasticNativeHandle& handle,

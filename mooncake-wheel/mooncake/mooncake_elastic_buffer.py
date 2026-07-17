@@ -439,6 +439,7 @@ class ElasticBuffer:
         do_cpu_sync: Optional[bool] = None,
         num_sms: Optional[int] = None,
         async_with_compute_stream: bool = False,
+        diagnostic: Optional[torch.Tensor] = None,
     ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], Optional[torch.Tensor], Optional[torch.Tensor], EPHandle, EventOverlap]:
         if self.runtime is None:
             raise RuntimeError("ElasticBuffer has been destroyed")
@@ -492,6 +493,7 @@ class ElasticBuffer:
             do_cpu_sync,
             async_with_compute_stream,
             handle.native_handle if handle is not None else None,
+            diagnostic,
         )
         native_handle = output.handle
 
@@ -530,6 +532,7 @@ class ElasticBuffer:
             *(() if output.recv_topk_weights is None else (output.recv_topk_weights,)),
             *(() if native_handle.token_metadata_at_forward is None else (native_handle.token_metadata_at_forward,)),
             *(() if native_handle.channel_linked_list is None else (native_handle.channel_linked_list,)),
+            *(() if diagnostic is None else (diagnostic,)),
         )
         return (
             recv_x,

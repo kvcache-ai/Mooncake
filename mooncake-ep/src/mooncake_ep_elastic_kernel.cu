@@ -486,7 +486,8 @@ void launch_mooncake_elastic_dispatch(
     int sf_token_stride, int sf_hidden_stride, int num_experts, int num_topk,
     int expert_alignment, int num_sms, int num_channels_per_sm,
     int num_smem_bytes, bool cached_mode, bool deterministic,
-    bool do_cpu_sync, const ElasticLaunchContext& ctx, cudaStream_t stream) {
+    bool do_cpu_sync, const ElasticLaunchContext& ctx, cudaStream_t stream,
+    int64_t* diagnostic) {
 #ifdef MOONCAKE_EP_USE_MUSA
     const bool musa_use_prepared_slots = !cached_mode && ctx.num_scaleout_ranks == 1;
 #else
@@ -548,7 +549,7 @@ void launch_mooncake_elastic_dispatch(
                                    comm_ctx, ctx.buffer, ctx.workspace,        \
                                    ctx.mapped_host_workspace,                  \
                                    ctx.scaleout_rank_idx,                      \
-                                   ctx.scaleup_rank_idx);                      \
+                                   ctx.scaleup_rank_idx, diagnostic);          \
             } else if (hybrid_reuse_slot_indices) {                            \
                 auto kernel = elastic::hybrid_dispatch_impl<                   \
                     false, true, S, kElasticNumNotifyWarps,                    \
@@ -568,7 +569,7 @@ void launch_mooncake_elastic_dispatch(
                                    comm_ctx, ctx.buffer, ctx.workspace,        \
                                    ctx.mapped_host_workspace,                  \
                                    ctx.scaleout_rank_idx,                      \
-                                   ctx.scaleup_rank_idx);                      \
+                                   ctx.scaleup_rank_idx, diagnostic);          \
             } else {                                                           \
                 auto kernel = elastic::hybrid_dispatch_impl<                   \
                     false, false, S, kElasticNumNotifyWarps,                   \
@@ -588,7 +589,7 @@ void launch_mooncake_elastic_dispatch(
                                    comm_ctx, ctx.buffer, ctx.workspace,        \
                                    ctx.mapped_host_workspace,                  \
                                    ctx.scaleout_rank_idx,                      \
-                                   ctx.scaleup_rank_idx);                      \
+                                   ctx.scaleup_rank_idx, diagnostic);          \
             }                                                                  \
         } while (false)
 
