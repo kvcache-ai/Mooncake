@@ -1,12 +1,25 @@
 {
-  "description": "Golden vectors for the supported vLLM v1 sha256_cbor block-hash profile.",
+  "description": "Golden vectors for the supported vLLM v1 sha256_cbor seed-derived root and block-hash profile.",
   "generator": "vLLM 0.22.0 hash_block_tokens semantics with cbor2 6.1.1 canonical=True",
   "profile": {
     "strategy": "vllm_v1",
     "algorithm": "sha256_cbor",
+    "python_hash_seed": "0",
     "root_digest": "4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e",
     "index_projection": "low64_be"
   },
+  "seed_root_vectors": [
+    {
+      "python_hash_seed": "0",
+      "canonical_cbor_hex": "6130",
+      "root_digest": "4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e"
+    },
+    {
+      "python_hash_seed": "00",
+      "canonical_cbor_hex": "623030",
+      "root_digest": "8d912e4e62b3cc377b1d1c7a14ef61dffbdaa0990237035c05401c29414c4172"
+    }
+  ],
   "cases": [
     {
       "name": "spec_unsalted",

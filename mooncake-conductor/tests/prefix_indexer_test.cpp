@@ -35,6 +35,8 @@ using conductor::prefixindex::StorageTier;
 
 constexpr char kRootDigest[] =
     "4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e";
+constexpr char kPaddedSeedRootDigest[] =
+    "8d912e4e62b3cc377b1d1c7a14ef61dffbdaa0990237035c05401c29414c4172";
 
 ContextKey TestContext(int64_t block_size = 16) {
     return {.tenant_id = "tenant-a",
@@ -46,7 +48,16 @@ ContextKey TestContext(int64_t block_size = 16) {
 HashProfile TestProfile() {
     return {.strategy = "vllm_v1",
             .algorithm = "sha256_cbor",
+            .python_hash_seed = "0",
             .root_digest = kRootDigest,
+            .index_projection = "low64_be"};
+}
+
+HashProfile PaddedSeedProfile() {
+    return {.strategy = "vllm_v1",
+            .algorithm = "sha256_cbor",
+            .python_hash_seed = "00",
+            .root_digest = kPaddedSeedRootDigest,
             .index_projection = "low64_be"};
 }
 
@@ -206,6 +217,32 @@ TEST(Registration, InvalidInputsDoNotCreateContextState) {
     EXPECT_TRUE(PrefixCacheTableTestPeer::Snapshot(table).contexts.empty());
 }
 
+TEST(Registration, ForgedSeedRootPairIsRejectedWithoutMutation) {
+    PrefixCacheTable table;
+    auto forged = Registration();
+    forged.profile.root_digest = kPaddedSeedRootDigest;
+
+    const auto validation = PrefixCacheTable::ValidateRegistration(forged);
+    EXPECT_NE(validation.error.find("does not match"), std::string::npos);
+    const auto rejected = table.Register(forged);
+    EXPECT_NE(rejected.error.find("does not match"), std::string::npos);
+    EXPECT_FALSE(rejected.inserted);
+    EXPECT_TRUE(PrefixCacheTableTestPeer::Snapshot(table).contexts.empty());
+
+    RegisterOrFail(table, Registration());
+    const auto registered = PrefixCacheTableTestPeer::Snapshot(table);
+    EXPECT_NE(table.ValidateProfileBinding(TestContext(), forged.profile)
+                  .find("does not match"),
+              std::string::npos);
+    EXPECT_EQ(PrefixCacheTableTestPeer::Snapshot(table), registered);
+
+    forged.instance_id = "instance-b";
+    const auto conflicting = table.Register(forged);
+    EXPECT_NE(conflicting.error.find("does not match"), std::string::npos);
+    EXPECT_FALSE(conflicting.inserted);
+    EXPECT_EQ(PrefixCacheTableTestPeer::Snapshot(table), registered);
+}
+
 TEST(Registration, TracksEveryInstanceAndRankIdempotently) {
     PrefixCacheTable table;
 
@@ -247,7 +284,7 @@ TEST(Registration, ConflictingProfilePreservesCompleteState) {
     const auto before = PrefixCacheTableTestPeer::Snapshot(table);
 
     auto conflicting = Registration("instance-b", 1);
-    conflicting.profile.root_digest = std::string(64, '0');
+    conflicting.profile = PaddedSeedProfile();
     const auto result = table.Register(conflicting);
 
     EXPECT_FALSE(result.error.empty());
@@ -267,8 +304,7 @@ TEST(Registration, ProfileBindingValidationIsExactAndLookupOnly) {
     const auto registered = PrefixCacheTableTestPeer::Snapshot(table);
     EXPECT_EQ(table.ValidateProfileBinding(TestContext(), TestProfile()), "");
 
-    HashProfile conflict = TestProfile();
-    conflict.root_digest = std::string(64, '0');
+    const HashProfile conflict = PaddedSeedProfile();
     EXPECT_FALSE(table.ValidateProfileBinding(TestContext(), conflict).empty());
     EXPECT_EQ(PrefixCacheTableTestPeer::Snapshot(table), registered);
 }

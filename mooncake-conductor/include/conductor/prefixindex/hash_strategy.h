@@ -32,10 +32,17 @@ class HashStrategy {
                                 std::vector<HashBlock>* out) const = 0;
 };
 
-// Returns an empty string when the profile is supported and well formed.
+// Resolves a supported source profile and derives its root digest. Returns an
+// empty string on success.
+std::string ResolveHashProfile(const common::HashProfileConfig& config,
+                               HashProfile* out);
+
+// Returns an empty string when the resolved profile is supported, well formed,
+// and its root digest matches a fresh derivation from python_hash_seed.
 std::string ValidateHashProfile(const HashProfile& profile);
 
-// Returns nullptr and sets error when the profile is invalid or unsupported.
+// Returns nullptr and sets error when the resolved profile shape is invalid or
+// unsupported. This consumes the derived root without hashing the seed again.
 std::unique_ptr<HashStrategy> CreateHashStrategy(const HashProfile& profile,
                                                  std::string* error);
 

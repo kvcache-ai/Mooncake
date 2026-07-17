@@ -10,6 +10,8 @@
 
 namespace {
 
+using conductor::common::HashProfileConfig;
+using conductor::common::ResolvedHashProfile;
 using conductor::prefixindex::ContextKey;
 using conductor::prefixindex::EngineRegistration;
 using conductor::prefixindex::GpuMutation;
@@ -26,11 +28,22 @@ concept HasAdditionalSalt = requires(T value) { value.additional_salt; };
 template <typename T>
 concept HasCacheGroups = requires(T value) { value.cache_groups; };
 
+template <typename T>
+concept HasPythonHashSeed = requires(T value) { value.python_hash_seed; };
+
+template <typename T>
+concept HasRootDigest = requires(T value) { value.root_digest; };
+
 static_assert(!HasInstanceId<ContextKey>);
 static_assert(!HasCacheSalt<ContextKey>);
 static_assert(!HasAdditionalSalt<ContextKey>);
+static_assert(!HasPythonHashSeed<ContextKey>);
 static_assert(!HasCacheGroups<EngineRegistration>);
 static_assert(!HasCacheGroups<GpuMutation>);
+static_assert(HasPythonHashSeed<HashProfileConfig>);
+static_assert(!HasRootDigest<HashProfileConfig>);
+static_assert(HasPythonHashSeed<ResolvedHashProfile>);
+static_assert(HasRootDigest<ResolvedHashProfile>);
 static_assert(std::same_as<decltype(EngineRegistration::cache_group),
                            std::optional<int64_t>>);
 static_assert(

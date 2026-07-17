@@ -24,7 +24,6 @@
 
 namespace {
 
-using conductor::common::HashProfileConfig;
 using conductor::common::PublisherKind;
 using conductor::common::ServiceConfig;
 using conductor::kvevent::EventManager;
@@ -37,6 +36,7 @@ using conductor::prefixindex::HashBlock;
 using conductor::prefixindex::HashProfile;
 using conductor::prefixindex::PrefixCacheTableTestPeer;
 using conductor::prefixindex::ProjectedPrefix;
+using conductor::prefixindex::ResolveHashProfile;
 using conductor::zmq::DecodedBatch;
 using conductor::zmq::DecodeMooncakeEventBatch;
 using conductor::zmq::DecodeVllmEventBatch;
@@ -49,17 +49,16 @@ constexpr std::string_view kRootDigest =
     "4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e";
 
 HashProfile TestProfile() {
-    return {.strategy = "vllm_v1",
-            .algorithm = "sha256_cbor",
-            .root_digest = std::string(kRootDigest),
-            .index_projection = "low64_be"};
-}
-
-HashProfileConfig TestProfileConfig() {
-    return {.strategy = "vllm_v1",
-            .algorithm = "sha256_cbor",
-            .root_digest = std::string(kRootDigest),
-            .index_projection = "low64_be"};
+    const conductor::common::HashProfileConfig source{
+        .strategy = "vllm_v1",
+        .algorithm = "sha256_cbor",
+        .python_hash_seed = "0",
+        .index_projection = "low64_be",
+    };
+    HashProfile profile;
+    EXPECT_EQ(ResolveHashProfile(source, &profile), "");
+    EXPECT_EQ(profile.root_digest, kRootDigest);
+    return profile;
 }
 
 ContextKey ContextFor(const ServiceConfig& service) {
@@ -89,7 +88,7 @@ ServiceConfig VllmService(std::string instance_id, std::string endpoint,
     service.dp_rank = dp_rank;
     service.block_size = 4;
     service.cache_group = 0;
-    service.hash_profile = TestProfileConfig();
+    service.hash_profile = TestProfile();
     return service;
 }
 

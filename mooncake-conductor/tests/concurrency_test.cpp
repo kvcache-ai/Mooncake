@@ -46,6 +46,7 @@ using conductor::prefixindex::HashProfile;
 using conductor::prefixindex::PrefixCacheTable;
 using conductor::prefixindex::PrefixCacheTableTestPeer;
 using conductor::prefixindex::ProjectedPrefix;
+using conductor::prefixindex::ResolveHashProfile;
 using conductor::prefixindex::SharedClear;
 using conductor::prefixindex::SharedMutation;
 using conductor::prefixindex::SharedObjectOwner;
@@ -60,10 +61,16 @@ constexpr char kRaceRootDigest[] =
     "4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e";
 
 HashProfile RaceProfile() {
-    return {.strategy = "vllm_v1",
-            .algorithm = "sha256_cbor",
-            .root_digest = kRaceRootDigest,
-            .index_projection = "low64_be"};
+    const conductor::common::HashProfileConfig source{
+        .strategy = "vllm_v1",
+        .algorithm = "sha256_cbor",
+        .python_hash_seed = "0",
+        .index_projection = "low64_be",
+    };
+    HashProfile profile;
+    EXPECT_EQ(ResolveHashProfile(source, &profile), "");
+    EXPECT_EQ(profile.root_digest, kRaceRootDigest);
+    return profile;
 }
 
 ServiceConfig RaceService(const std::string& instance_id, int endpoint_slot,
@@ -79,10 +86,7 @@ ServiceConfig RaceService(const std::string& instance_id, int endpoint_slot,
     svc.block_size = 16;
     svc.dp_rank = dp_rank;
     svc.cache_group = 0;
-    svc.hash_profile = {.strategy = "vllm_v1",
-                        .algorithm = "sha256_cbor",
-                        .root_digest = kRaceRootDigest,
-                        .index_projection = "low64_be"};
+    svc.hash_profile = RaceProfile();
     return svc;
 }
 

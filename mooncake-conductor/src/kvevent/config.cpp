@@ -7,8 +7,10 @@
 #include <cstdlib>
 #include <fstream>
 #include <limits>
+#include <set>
 
 #include "conductor/common/utils.h"
+#include "conductor/prefixindex/hash_strategy.h"
 
 namespace conductor {
 namespace kvevent {
@@ -44,17 +46,50 @@ bool JsonInt64(const Json::Value& value, int64_t* out) {
     return false;
 }
 
-common::HashProfileConfig ParseHashProfile(const Json::Value& raw) {
-    common::HashProfileConfig profile;
+bool ParseHashProfile(const Json::Value& raw,
+                      common::ResolvedHashProfile* profile,
+                      std::string* error) {
+    if (!raw.isMember("hash_profile")) {
+        *error = "hash_profile is required";
+        return false;
+    }
     const Json::Value& value = raw["hash_profile"];
     if (!value.isObject()) {
-        return profile;
+        *error = "hash_profile must be an object";
+        return false;
     }
-    profile.strategy = JsonString(value, "strategy");
-    profile.algorithm = JsonString(value, "algorithm");
-    profile.root_digest = JsonString(value, "root_digest");
-    profile.index_projection = JsonString(value, "index_projection");
-    return profile;
+
+    static const std::set<std::string> kAllowedProfileFields = {
+        "algorithm", "index_projection", "python_hash_seed", "strategy"};
+    for (const std::string& name : value.getMemberNames()) {
+        if (!kAllowedProfileFields.contains(name)) {
+            *error = "unsupported hash_profile field: " + name;
+            return false;
+        }
+    }
+
+    common::HashProfileConfig source;
+    const auto require_string = [&](const char* field, std::string* out) {
+        if (!value.isMember(field)) {
+            *error = std::string(field) + " is required";
+            return false;
+        }
+        if (!value[field].isString()) {
+            *error = std::string(field) + " must be a string";
+            return false;
+        }
+        *out = value[field].asString();
+        return true;
+    };
+    if (!require_string("strategy", &source.strategy) ||
+        !require_string("algorithm", &source.algorithm) ||
+        !require_string("python_hash_seed", &source.python_hash_seed) ||
+        !require_string("index_projection", &source.index_projection)) {
+        return false;
+    }
+
+    *error = prefixindex::ResolveHashProfile(source, profile);
+    return error->empty();
 }
 
 bool ParseCacheGroup(const Json::Value& raw,
@@ -174,7 +209,12 @@ std::vector<common::ServiceConfig> ParseConfig(int* http_server_port) {
                 LOG(ERROR) << "Invalid cache_group instance_id=" << name;
                 continue;
             }
-            svc.hash_profile = ParseHashProfile(raw);
+            std::string profile_error;
+            if (!ParseHashProfile(raw, &svc.hash_profile, &profile_error)) {
+                LOG(ERROR) << "Invalid hash_profile stream_key=" << name
+                           << " error=" << profile_error;
+                continue;
+            }
             services.push_back(std::move(svc));
         }
     }
