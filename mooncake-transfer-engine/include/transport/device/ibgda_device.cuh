@@ -265,22 +265,13 @@ __device__ __forceinline__ void mc_ibgda_red_add64(
     const IbgdaContext& ctx, int channel, int dst_rank, int src_rank,
     int qps_per_rank, uint64_t laddr, uint64_t recv_raddr, int64_t value) {
     auto* qp = mc_ibgda_channel(ctx, channel, dst_rank, qps_per_rank);
-    if (mc_ibgda_debug_enabled(qp, MLX5GDA_DEBUG_ATOMIC_RESERVE)) {
-        uint32_t slot = mc_ibgda_reserve_wqe(qp);
-        mc_ibgda_write_rdma_atomic_add64_wqe(
-            qp, slot, value, laddr, mc_bswap32(ctx.rkeys[src_rank]),
-            recv_raddr, mc_bswap32(ctx.rkeys[dst_rank]));
-        mc_ibgda_mark_wqe_ready(qp, slot);
-        mc_ibgda_flush_ready_wqes(qp);
-        return;
-    }
-
     mc_ibgda_lock(qp);
-    uint32_t slot = qp->db_head;
+    const uint32_t slot = static_cast<uint32_t>(qp->wq_head);
     mc_ibgda_write_rdma_atomic_add64_wqe(
         qp, slot, value, laddr, mc_bswap32(ctx.rkeys[src_rank]), recv_raddr,
         mc_bswap32(ctx.rkeys[dst_rank]));
-    mc_ibgda_post_send_db_locked(qp, slot);
+    ++qp->wq_head;
+    mc_ibgda_post_send_db(qp);
     mc_ibgda_unlock(qp);
 }
 
