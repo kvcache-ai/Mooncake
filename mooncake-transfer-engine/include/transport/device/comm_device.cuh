@@ -8,6 +8,9 @@
 #include "transport/device/device_ops.cuh"
 #include "transport/device/p2p_device.cuh"
 #include "transport/device/ibgda_device.cuh"
+#ifdef USE_NCCL_DEVICE
+#include "transport/device/nccl_device_transport.h"
+#endif
 
 namespace mooncake {
 namespace device {
@@ -22,6 +25,10 @@ struct CommCtx {
     int rank;
     int qps_per_rank;
     bool use_64bit_rdma_atomics;
+#ifdef USE_NCCL_DEVICE
+    NcclDeviceContext nccl;
+    bool use_nccl = false;
+#endif
 };
 
 // Construct CommCtx from the raw kernel arguments.

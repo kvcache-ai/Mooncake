@@ -4,6 +4,9 @@
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#ifdef USE_NCCL_DEVICE
+#include <transport/device/nccl_device_transport.h>
+#endif
 
 namespace mooncake {
 
@@ -27,6 +30,10 @@ struct ElasticLaunchContext {
     int num_scaleup_ranks = 1;
     bool is_scaleup_nvlink = true;
     bool use_64bit_rdma_atomics = false;
+#ifdef USE_NCCL_DEVICE
+    device::NcclDeviceContext nccl_context{};
+    bool use_nccl = false;
+#endif
     int physical_qps_per_rank = 1;
     int64_t timeout_cycles = -1;
 };

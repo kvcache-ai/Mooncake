@@ -102,6 +102,10 @@ inline device::CommCtx make_comm_ctx(const ElasticLaunchContext& ctx) {
     comm_ctx.ibgda.rkeys = reinterpret_cast<const uint32_t*>(ctx.rkeys);
     comm_ctx.ibgda.local_atomic_base = ctx.rdma_send_signal_buffer;
     comm_ctx.ibgda.remote_atomic_base = ctx.rdma_recv_signal_buffer;
+#ifdef USE_NCCL_DEVICE
+    comm_ctx.nccl = ctx.nccl_context;
+    comm_ctx.use_nccl = ctx.use_nccl;
+#endif
     return comm_ctx;
 }
 
