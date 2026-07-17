@@ -45,7 +45,8 @@ void AgentRpcServiceImpl::onViewUpdate(coro_rpc::context<ViewUpdateAck> ctx,
 
 AgentHost::AgentHost(c10::intrusive_ptr<c10d::Store> store,
                      const std::string& host_ip, GlobalRank rank,
-                     int max_world_size, LinkManager& link_manager)
+                     int max_world_size, LinkManager& link_manager,
+                     int64_t fault_reconciliation_window_us)
     : agent_(rank, max_world_size),
       executor_("AgentHost"),
       link_manager_(link_manager),
@@ -54,7 +55,10 @@ AgentHost::AgentHost(c10::intrusive_ptr<c10d::Store> store,
       rank_(rank),
       max_world_size_(max_world_size),
       agent_session_epoch_(generateInitialAgentSessionEpoch()),
-      rpc_client_(std::make_unique<RpcClient>()) {}
+      rpc_client_(std::make_unique<RpcClient>(
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::microseconds(fault_reconciliation_window_us) * 2))) {
+}
 
 AgentHost::~AgentHost() { shutdown(); }
 

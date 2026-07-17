@@ -2,14 +2,15 @@
 #define MOONCAKE_PG_RPC_RUNTIME_H
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
-#include <chrono>
 
 #include <glog/logging.h>
 
@@ -45,7 +46,11 @@ class RpcServer {
 
 class RpcClient {
    public:
-    RpcClient() = default;
+    static constexpr auto kConnectTimeout = std::chrono::seconds(3);
+
+    explicit RpcClient(
+        std::chrono::milliseconds request_timeout,
+        std::chrono::milliseconds connect_timeout = kConnectTimeout);
     ~RpcClient() = default;
 
    private:
@@ -68,10 +73,11 @@ class RpcClient {
     // Synchronous call.
     template <auto Func, typename Req>
     auto call(const std::string& addr, Req req,
-              std::chrono::milliseconds timeout = std::chrono::seconds(5)) {
+              std::optional<std::chrono::milliseconds> timeout = std::nullopt) {
         using ResponseType = decltype(coro_rpc::get_return_type<Func>());
 
         auto client = createSyncClient();
+        auto request_timeout = timeout.value_or(state_->request_timeout);
 
         auto ec = async_simple::coro::syncAwait(client->connect(addr));
         if (ec) {
@@ -82,8 +88,8 @@ class RpcClient {
                         "RPC connect failed: " + std::string(ec.message()));
             return resp;
         }
-        auto result =
-            async_simple::coro::syncAwait(client->call_for<Func>(timeout, req));
+        auto result = async_simple::coro::syncAwait(
+            client->call_for<Func>(request_timeout, req));
         if (!result) {
             LOG(ERROR) << "RpcClient: call RPC failed: " << result.error().msg;
             ResponseType resp{};
@@ -117,11 +123,18 @@ class RpcClient {
 
    private:
     struct SharedState {
+        SharedState(std::chrono::milliseconds request_timeout,
+                    std::chrono::milliseconds connect_timeout)
+            : request_timeout(request_timeout),
+              connect_timeout(connect_timeout) {}
+
         std::mutex mutex;
         std::unordered_map<std::string,
                            std::shared_ptr<coro_rpc::coro_rpc_client>>
             clients;
         std::atomic<bool> shutdown{false};
+        std::chrono::milliseconds request_timeout;
+        std::chrono::milliseconds connect_timeout;
     };
 
     // Coroutine-based connect + cache lookup.
@@ -133,7 +146,7 @@ class RpcClient {
     static void spawn(async_simple::coro::Lazy<void> task);
 
     // Create a coro_rpc_client with local io_context (for sync call()).
-    static std::unique_ptr<coro_rpc::coro_rpc_client> createSyncClient();
+    std::unique_ptr<coro_rpc::coro_rpc_client> createSyncClient();
 
     // Fire-and-forget coroutine: connect, send_request, discard result.
     template <auto Func, typename Req>
@@ -189,7 +202,7 @@ class RpcClient {
         }
     }
 
-    std::shared_ptr<SharedState> state_ = std::make_shared<SharedState>();
+    std::shared_ptr<SharedState> state_;
 };
 
 }  // namespace mooncake

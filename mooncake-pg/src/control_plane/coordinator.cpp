@@ -323,24 +323,7 @@ CoordinatorApplyResult<void>
 CentralizedCoordinatorStateMachine::handleLinkEventReport(
     const LinkEventReport& req) {
     CoordinatorApplyResult<void> result;
-    if (!hasValidSession(req.reporter_rank, req.agent_session_epoch)) {
-        return result;
-    }
-    auto& reporter = ranks_[req.reporter_rank];
-
-    auto applied = applyLinkEventReport(reporter, req);
-    if (!applied.has_value()) return result;
-
-    result.effects.push_back(AckLinkEventReport{LinkEventReportAck{
-        req.reporter_rank, req.agent_session_epoch, req.report_id}});
-    if (applied->has_negative) {
-        LOG(INFO) << "[COORD] LinkEventReport has negative -> opening "
-                     "reconciliation window";
-        tryOpenReconciliationWindow();
-    } else if (applied->changed && !reconciliation_ctx_.active) {
-        updateRankStates(result.effects);
-        checkGroupTransitions(result.effects);
-    }
+    processLinkEventReport(req, result.effects);
     return result;
 }
 
@@ -353,19 +336,42 @@ void CentralizedCoordinatorStateMachine::tryOpenReconciliationWindow() {
     }
 }
 
-std::optional<CentralizedCoordinatorStateMachine::LinkEventReportApplyResult>
-CentralizedCoordinatorStateMachine::applyLinkEventReport(
-    RankInfo& reporter, const LinkEventReport& report) {
+void CentralizedCoordinatorStateMachine::tryCloseReconciliationWindow(
+    std::vector<CoordinatorEffect>& effects) {
+    if (!reconciliation_ctx_.active) return;
+    if (std::chrono::steady_clock::now() < reconciliation_ctx_.deadline) {
+        return;
+    }
+
+    LOG(INFO) << "[COORD] Reconciliation window expired.";
+    updateRankStates(effects);
+    applyAutoDeactivate(effects);
+    checkGroupTransitions(effects);
+    resolvePendingSyncs(effects);
+
+    reconciliation_ctx_.active = false;
+}
+
+void CentralizedCoordinatorStateMachine::processLinkEventReport(
+    const LinkEventReport& report, std::vector<CoordinatorEffect>& effects) {
+    if (!hasValidSession(report.reporter_rank, report.agent_session_epoch)) {
+        return;
+    }
     if (report.events.size() != static_cast<size_t>(max_world_size_) ||
         report.report_id == 0) {
         LOG(WARNING) << "[COORD] invalid LinkEventReport vectors";
-        return std::nullopt;
+        return;
     }
 
-    LinkEventReportApplyResult result;
-    if (report.report_id <= reporter.last_link_event_report_id) return result;
+    effects.push_back(AckLinkEventReport{LinkEventReportAck{
+        report.reporter_rank, report.agent_session_epoch, report.report_id}});
+
+    auto& reporter = ranks_[report.reporter_rank];
+    if (report.report_id <= reporter.last_link_event_report_id) return;
     reporter.last_link_event_report_id = report.report_id;
 
+    bool has_positive = false;
+    bool has_negative = false;
     for (int32_t peer = 0; peer < max_world_size_; ++peer) {
         auto type = report.events[peer];
         if (type == LinkEvent::EventType::None) continue;
@@ -375,10 +381,24 @@ CentralizedCoordinatorStateMachine::applyLinkEventReport(
         if (was_up == is_up) continue;
 
         reporter.link_status[peer] = is_up ? 1 : 0;
-        result.changed = true;
-        if (!is_up) result.has_negative = true;
+        if (is_up) {
+            has_positive = true;
+        } else {
+            has_negative = true;
+        }
     }
-    return result;
+
+    // Negative evidence opens a reconciliation window. Any positive changes
+    // in the same report are applied when the window closes.
+    if (has_negative) {
+        LOG(INFO) << "[COORD] LinkEventReport has negative -> try opening "
+                     "reconciliation window";
+        tryOpenReconciliationWindow();
+    } else if (has_positive && !reconciliation_ctx_.active) {
+        // Positive-only changes do not need reconciliation.
+        updateRankStates(effects);
+        checkGroupTransitions(effects);
+    }
 }
 
 // handleSyncAfterFailure - sync-after-failure RPC handler.
@@ -394,8 +414,6 @@ CentralizedCoordinatorStateMachine::handleSyncAfterFailure(
         result.effects.push_back(ReplySync{sync_id, response});
         return result;
     }
-    auto& reporter = ranks_[req.reporter_rank];
-
     auto view_it = group_views_.find(req.group_id);
     if (view_it == group_views_.end()) {
         SyncAfterFailureResponse response;
@@ -409,18 +427,7 @@ CentralizedCoordinatorStateMachine::handleSyncAfterFailure(
     if (req.link_event_report.has_value() &&
         req.link_event_report->reporter_rank == req.reporter_rank &&
         req.link_event_report->agent_session_epoch == req.agent_session_epoch) {
-        auto applied = applyLinkEventReport(reporter, *req.link_event_report);
-        if (applied.has_value()) {
-            result.effects.push_back(AckLinkEventReport{
-                LinkEventReportAck{req.reporter_rank, req.agent_session_epoch,
-                                   req.link_event_report->report_id}});
-            if (applied->has_negative) {
-                tryOpenReconciliationWindow();
-            } else if (applied->changed && !reconciliation_ctx_.active) {
-                updateRankStates(result.effects);
-                checkGroupTransitions(result.effects);
-            }
-        }
+        processLinkEventReport(*req.link_event_report, result.effects);
     }
 
     if (reconciliation_ctx_.active) {
@@ -478,7 +485,7 @@ CoordinatorApplyResult<void> CentralizedCoordinatorStateMachine::tick() {
         auto& info = ranks_[rank];
         if (info.state == RankState::Offline) continue;
         if (now - info.last_heartbeat > kHeartbeatTimeout) {
-            transitionToOffline(rank, result.effects);
+            transitionToOffline(rank, "heartbeat timeout", result.effects);
         }
     }
 
@@ -498,24 +505,17 @@ CoordinatorApplyResult<void> CentralizedCoordinatorStateMachine::tick() {
         }
     }
 
-    // Fault reconciliation window.
-    if (reconciliation_ctx_.active && now >= reconciliation_ctx_.deadline) {
-        LOG(INFO) << "[COORD] Reconciliation window expired, triggering "
-                     "auto_deactivate";
-        reconciliation_ctx_.active = false;
-        updateRankStates(result.effects);
-        applyAutoDeactivate(result.effects);
-        checkGroupTransitions(result.effects);
-        resolvePendingSyncs(result.effects);
-    }
+    tryCloseReconciliationWindow(result.effects);
 
     return result;
 }
 
 void CentralizedCoordinatorStateMachine::transitionToOffline(
-    GlobalRank rank, std::vector<CoordinatorEffect>& effects) {
+    GlobalRank rank, const char* reason,
+    std::vector<CoordinatorEffect>& effects) {
     LOG(INFO) << "[COORD] transitionToOffline rank=" << rank
-              << " state=" << static_cast<int>(ranks_[rank].state);
+              << " state=" << static_cast<int>(ranks_[rank].state)
+              << " reason=" << reason;
     ranks_[rank].state = RankState::Offline;
     ranks_[rank].link_status.assign(max_world_size_, 0);
 
@@ -964,7 +964,8 @@ void CentralizedCoordinatorStateMachine::commitBarrier(
                     response.status = ViewUpdateStatus::AppliedWithDroppedRanks;
                     response.dropped_ranks = dropped;
                     for (GlobalRank rank : dropped) {
-                        transitionToOffline(rank, effects);
+                        transitionToOffline(rank, "ViewUpdate barrier timeout",
+                                            effects);
                     }
                 }
                 effects.push_back(ReplyProposal{commit.propose_id, response});

@@ -121,7 +121,8 @@ class AgentHost : public AgentInterface {
     static constexpr auto kHeartbeatInterval = std::chrono::seconds(1);
 
     AgentHost(c10::intrusive_ptr<c10d::Store> store, const std::string& host_ip,
-              GlobalRank rank, int max_world_size, LinkManager& link_manager);
+              GlobalRank rank, int max_world_size, LinkManager& link_manager,
+              int64_t fault_reconciliation_window_us);
 
     ~AgentHost() override;
 

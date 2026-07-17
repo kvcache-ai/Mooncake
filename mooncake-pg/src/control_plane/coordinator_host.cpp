@@ -58,7 +58,10 @@ CoordinatorHost::CoordinatorHost(c10::intrusive_ptr<c10d::Store> store,
       store_(std::move(store)),
       host_ip_(host_ip),
       max_world_size_(max_world_size),
-      rpc_client_(std::make_unique<RpcClient>()) {}
+      rpc_client_(std::make_unique<RpcClient>(
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::microseconds(fault_reconciliation_window_us) * 2))) {
+}
 
 CoordinatorHost::~CoordinatorHost() { shutdown(); }
 

@@ -160,10 +160,10 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     FaultReconciliationContext reconciliation_ctx_;
     std::chrono::microseconds fault_reconciliation_window_;
 
-    static constexpr auto kProposeTimeout = std::chrono::seconds(2);
-    static constexpr auto kHeartbeatTimeout = std::chrono::seconds(5);
+    static constexpr auto kProposeTimeout = std::chrono::seconds(20);
+    static constexpr auto kHeartbeatTimeout = std::chrono::seconds(30);
 
-    void transitionToOffline(GlobalRank rank,
+    void transitionToOffline(GlobalRank rank, const char* reason,
                              std::vector<CoordinatorEffect>& effects);
 
     // Recompute the authoritative healthy set (max clique) and update
@@ -178,13 +178,9 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     // Opens a fault reconciliation window if it is not open.
     // An existing window is not extended.
     void tryOpenReconciliationWindow();
-
-    struct LinkEventReportApplyResult {
-        bool changed = false;
-        bool has_negative = false;
-    };
-    std::optional<LinkEventReportApplyResult> applyLinkEventReport(
-        RankInfo& reporter, const LinkEventReport& report);
+    void tryCloseReconciliationWindow(std::vector<CoordinatorEffect>& effects);
+    void processLinkEventReport(const LinkEventReport& report,
+                                std::vector<CoordinatorEffect>& effects);
 
     SyncAfterFailureResponse makeSyncResponse(SyncAfterFailureStatus status,
                                               GroupId group_id) const;

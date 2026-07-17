@@ -4,6 +4,10 @@
 
 namespace mooncake {
 
+RpcClient::RpcClient(std::chrono::milliseconds request_timeout,
+                     std::chrono::milliseconds connect_timeout)
+    : state_(std::make_shared<SharedState>(request_timeout, connect_timeout)) {}
+
 RpcServer::RpcServer(uint16_t port, unsigned thread_num)
     : port_(port), thread_num_(thread_num) {
     server_ = std::make_unique<coro_rpc::coro_rpc_server>(thread_num_, port_);
@@ -50,8 +54,8 @@ RpcClient::getOrCreateClient(std::shared_ptr<SharedState> state,
     // Slow path: create + connect outside the lock so that a slow TCP
     // handshake suspends only this coroutine, not other peers'.
     coro_rpc::coro_rpc_client::config config;
-    config.connect_timeout_duration = std::chrono::seconds(3);
-    config.request_timeout_duration = std::chrono::seconds(5);
+    config.connect_timeout_duration = state->connect_timeout;
+    config.request_timeout_duration = state->request_timeout;
 
     auto client = std::make_shared<coro_rpc::coro_rpc_client>(
         coro_io::get_global_executor(), config);
@@ -81,7 +85,8 @@ void RpcClient::spawn(async_simple::coro::Lazy<void> task) {
 
 std::unique_ptr<coro_rpc::coro_rpc_client> RpcClient::createSyncClient() {
     coro_rpc::coro_rpc_client::config config;
-    config.connect_timeout_duration = std::chrono::seconds(3);
+    config.connect_timeout_duration = state_->connect_timeout;
+    config.request_timeout_duration = state_->request_timeout;
     return std::make_unique<coro_rpc::coro_rpc_client>(
         coro_io::get_global_executor(), config);
 }
@@ -101,7 +106,8 @@ bool RpcClient::tryReconnect(const std::string& addr) {
     }
 
     coro_rpc::coro_rpc_client::config config;
-    config.connect_timeout_duration = std::chrono::seconds(3);
+    config.connect_timeout_duration = state_->connect_timeout;
+    config.request_timeout_duration = state_->request_timeout;
 
     auto client = std::make_shared<coro_rpc::coro_rpc_client>(
         coro_io::get_global_executor(), config);

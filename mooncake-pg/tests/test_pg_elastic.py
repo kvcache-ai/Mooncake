@@ -721,10 +721,114 @@ def _manual_deactivate_recovery_worker(
     """
     logical_rank = ctx.rank if ctx.proc_rank < ctx.world_size else BROKEN_RANK
 
-    if ctx.proc_rank >= ctx.world_size:
-        if not start_recovery.wait(timeout=30.0):
-            raise TimeoutError("timed out waiting to start manual recovery")
+    if ctx.proc_rank < ctx.world_size:
+        device = ctx.init_group(
+            rank=logical_rank,
+            auto_deactivate_on_failure=False,
+            auto_sync_on_failure=False,
+        )
+        backend = ctx.get_backend()
 
+        # Round 1: all healthy
+        expected_all = ctx.world_size * (ctx.world_size + 1) // 2
+        tensor = torch.tensor([ctx.rank + 1], dtype=torch.int32, device=device)
+        work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=True)
+        work.wait()
+        assert int(tensor.cpu().item()) == expected_all
+        assert pg.get_local_success(work), \
+            f"rank {ctx.rank}: round 1 should succeed locally"
+
+        failed_ranks_hint = pg.get_failed_ranks_hint(work)
+        assert failed_ranks_hint.tolist() == [0] * ctx.world_size
+
+        active_ranks = pg.get_active_ranks(backend)
+        assert active_ranks.cpu().tolist() == [1] * ctx.world_size
+
+        if logical_rank == BROKEN_RANK:
+            ctx.record_result({"role": "broken"})
+            broken_exited.set()
+            os._exit(0)
+
+        broken_exited.wait()
+
+        # Round 2: rank died, auto_deactivate=False ==> activeRanks unchanged.
+        # local_success=False because the dead rank is still in the group.
+        expected_reduced = expected_all - (BROKEN_RANK + 1)
+        tensor = torch.tensor([ctx.rank + 1], dtype=torch.int32, device=device)
+        work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=True)
+        work.wait()
+        assert int(tensor.cpu().item()) == expected_reduced
+        assert not pg.get_local_success(work), \
+            f"rank {ctx.rank}: round 2 should detect broken rank"
+
+        failed_ranks_hint = pg.get_failed_ranks_hint(work)
+        expected_failed_ranks_hint = [0] * ctx.world_size
+        expected_failed_ranks_hint[BROKEN_RANK] = 1
+        assert failed_ranks_hint.tolist() == expected_failed_ranks_hint
+
+        active_ranks = pg.get_active_ranks(backend)
+        assert active_ranks.cpu().tolist() == [1] * ctx.world_size
+
+        # sync_after_failure waits for the shared reconciliation decision even
+        # when membership is managed manually.  Its response applies the
+        # authoritative group view before returning, and the local failed-link
+        # observation must already be visible through get_peer_state().
+        sync_resp = pg.sync_after_failure(backend)
+        assert sync_resp.status in (
+            pg.SyncAfterFailureStatus.Reconciled,
+            pg.SyncAfterFailureStatus.NoPending,
+        ), f"rank {logical_rank}: sync_after_failure failed: {sync_resp.reject_reason}"
+        assert not pg.get_peer_state(backend, [BROKEN_RANK])[0], \
+            f"rank {logical_rank}: failed rank remained locally activatable after sync"
+
+        # Survivors deactivate the dead rank before issuing new collectives.
+        resp = pg.deactivate_ranks(backend, [BROKEN_RANK])
+        assert resp.status in (
+            pg.ViewUpdateStatus.Applied,
+            pg.ViewUpdateStatus.AppliedWithDroppedRanks,
+        ), f"rank {ctx.rank}: deactivate_ranks should apply, got {resp.status}"
+        # If ranks were dropped, they should only be the BROKEN_RANK
+        assert resp.status != pg.ViewUpdateStatus.AppliedWithDroppedRanks or set(
+            resp.dropped_ranks
+        ) == {
+            BROKEN_RANK
+        }, f"rank {ctx.rank}: unexpected dropped ranks {resp.dropped_ranks}"
+
+        # Round 3: after deactivate, collective with reduced group succeeds.
+        expected_reduced = expected_all - (BROKEN_RANK + 1)
+        tensor = torch.tensor([ctx.rank + 1], dtype=torch.int32, device=device)
+        work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=True)
+        work.wait()
+        assert int(tensor.cpu().item()) == expected_reduced
+        assert pg.get_local_success(work), \
+            f"rank {ctx.rank}: round 3 should succeed after manual deactivate"
+
+        if logical_rank == 0:
+            start_recovery.set()
+
+        wait_until(
+            lambda: pg.get_peer_state(backend, [BROKEN_RANK])[0],
+            timeout_s=30.0,
+            poll_interval_s=0.05,
+            description=f"rank {logical_rank} waiting for replacement",
+        )
+
+        resp = pg.recover_ranks(backend, [BROKEN_RANK])
+        assert resp.status == pg.ViewUpdateStatus.Applied, \
+            f"rank {logical_rank}: recover_ranks should apply, got {resp.status}"
+
+        tensor = torch.tensor(
+            [logical_rank + 1], dtype=torch.int32, device=device
+        )
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+
+        assert int(tensor.cpu().item()) == expected_all
+
+        ctx.record_result({"role": "survivor"})
+
+    else:
+        if not start_recovery.wait(timeout=120.0):
+            raise TimeoutError("timed out waiting to start manual recovery")
         device = ctx.init_group(
             rank=logical_rank,
             auto_deactivate_on_failure=False,
@@ -738,110 +842,6 @@ def _manual_deactivate_recovery_worker(
         )
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
         ctx.record_result({"role": "replacement"})
-        return
-
-    device = ctx.init_group(
-        rank=logical_rank,
-        auto_deactivate_on_failure=False,
-        auto_sync_on_failure=False,
-    )
-    backend = ctx.get_backend()
-
-    # Round 1: all healthy
-    expected_all = ctx.world_size * (ctx.world_size + 1) // 2
-    tensor = torch.tensor([ctx.rank + 1], dtype=torch.int32, device=device)
-    work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=True)
-    work.wait()
-    assert int(tensor.cpu().item()) == expected_all
-    assert pg.get_local_success(work), \
-        f"rank {ctx.rank}: round 1 should succeed locally"
-
-    failed_ranks_hint = pg.get_failed_ranks_hint(work)
-    assert failed_ranks_hint.tolist() == [0] * ctx.world_size
-
-    active_ranks = pg.get_active_ranks(backend)
-    assert active_ranks.cpu().tolist() == [1] * ctx.world_size
-
-    if logical_rank == BROKEN_RANK:
-        ctx.record_result({"role": "broken"})
-        broken_exited.set()
-        os._exit(0)
-
-    broken_exited.wait()
-
-    # Round 2: rank died, auto_deactivate=False ==> activeRanks unchanged.
-    # local_success=False because the dead rank is still in the group.
-    expected_reduced = expected_all - (BROKEN_RANK + 1)
-    tensor = torch.tensor([ctx.rank + 1], dtype=torch.int32, device=device)
-    work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=True)
-    work.wait()
-    assert int(tensor.cpu().item()) == expected_reduced
-    assert not pg.get_local_success(work), \
-        f"rank {ctx.rank}: round 2 should detect broken rank"
-
-    failed_ranks_hint = pg.get_failed_ranks_hint(work)
-    expected_failed_ranks_hint = [0] * ctx.world_size
-    expected_failed_ranks_hint[BROKEN_RANK] = 1
-    assert failed_ranks_hint.tolist() == expected_failed_ranks_hint
-
-    active_ranks = pg.get_active_ranks(backend)
-    assert active_ranks.cpu().tolist() == [1] * ctx.world_size
-
-    # sync_after_failure waits for the shared reconciliation decision even
-    # when membership is managed manually.  Its response applies the
-    # authoritative group view before returning, and the local failed-link
-    # observation must already be visible through get_peer_state().
-    sync_resp = pg.sync_after_failure(backend)
-    assert sync_resp.status in (
-        pg.SyncAfterFailureStatus.Reconciled,
-        pg.SyncAfterFailureStatus.NoPending,
-    ), f"rank {logical_rank}: sync_after_failure failed: {sync_resp.reject_reason}"
-    assert not pg.get_peer_state(backend, [BROKEN_RANK])[0], \
-        f"rank {logical_rank}: failed rank remained locally activatable after sync"
-
-    # Survivors deactivate the dead rank before issuing new collectives.
-    resp = pg.deactivate_ranks(backend, [BROKEN_RANK])
-    assert resp.status in (
-        pg.ViewUpdateStatus.Applied,
-        pg.ViewUpdateStatus.AppliedWithDroppedRanks,
-    ), f"rank {ctx.rank}: deactivate_ranks should apply, got {resp.status}"
-    # If ranks were dropped, they should only be the BROKEN_RANK
-    assert resp.status != pg.ViewUpdateStatus.AppliedWithDroppedRanks or set(
-        resp.dropped_ranks
-    ) == {
-        BROKEN_RANK
-    }, f"rank {ctx.rank}: unexpected dropped ranks {resp.dropped_ranks}"
-
-    # Round 3: after deactivate, collective with reduced group succeeds.
-    expected_reduced = expected_all - (BROKEN_RANK + 1)
-    tensor = torch.tensor([ctx.rank + 1], dtype=torch.int32, device=device)
-    work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=True)
-    work.wait()
-    assert int(tensor.cpu().item()) == expected_reduced
-    assert pg.get_local_success(work), \
-        f"rank {ctx.rank}: round 3 should succeed after manual deactivate"
-
-    if logical_rank == 0:
-        start_recovery.set()
-
-    wait_until(
-        lambda: pg.get_peer_state(backend, [BROKEN_RANK])[0],
-        timeout_s=30.0,
-        poll_interval_s=0.05,
-        description=f"rank {logical_rank} waiting for replacement",
-    )
-
-    resp = pg.recover_ranks(backend, [BROKEN_RANK])
-    assert resp.status == pg.ViewUpdateStatus.Applied, \
-        f"rank {logical_rank}: recover_ranks should apply, got {resp.status}"
-
-    tensor = torch.tensor(
-        [logical_rank + 1], dtype=torch.int32, device=device
-    )
-    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-    assert int(tensor.cpu().item()) == expected_all
-
-    ctx.record_result({"role": "survivor"})
 
 
 class _ElasticMixin:
@@ -856,7 +856,7 @@ class _ElasticMixin:
         rows = self.spawn_backend_and_collect(
             _fault_detection_worker,
             broken_exited,
-            timeout_s=30.0,
+            timeout_s=60.0,
         )
 
         self.assert_all_ok(rows)
@@ -880,7 +880,7 @@ class _ElasticMixin:
             broken_exited,
             start_recovery,
             nprocs=self.world_size + 1,
-            timeout_s=30.0,
+            timeout_s=60.0,
         )
 
         self.assert_all_ok(rows)
@@ -904,7 +904,7 @@ class _ElasticMixin:
             _extension_worker,
             extend_event,
             nprocs=self.world_size,
-            timeout_s=30.0,
+            timeout_s=60.0,
         )
 
         self.assert_all_ok(rows)
@@ -964,7 +964,7 @@ class _ElasticMixin:
             _extension_worker_with_subgroups,
             extend_event,
             nprocs=self.world_size,
-            timeout_s=30.0,
+            timeout_s=60.0,
         )
 
         self.assert_all_ok(rows)
@@ -985,7 +985,7 @@ class _ElasticMixin:
             _allgather_reduce_scatter_extension_worker,
             extend_event,
             nprocs=self.world_size,
-            timeout_s=30.0,
+            timeout_s=60.0,
         )
 
         self.assert_all_ok(rows)
@@ -1010,7 +1010,7 @@ class _ElasticMixin:
             broken_exited,
             start_recovery,
             nprocs=self.world_size + 1,
-            timeout_s=30.0,
+            timeout_s=60.0,
         )
 
         self.assert_all_ok(rows)
@@ -1039,7 +1039,7 @@ class _ElasticMixin:
             broken_exited,
             start_recovery,
             nprocs=self.world_size + 1,
-            timeout_s=30.0,
+            timeout_s=60.0,
         )
 
         self.assert_all_ok(rows)

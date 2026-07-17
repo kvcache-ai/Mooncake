@@ -90,7 +90,7 @@ class CoordinatorHost {
    public:
     CoordinatorHost(c10::intrusive_ptr<c10d::Store> store,
                     const std::string& host_ip, int max_world_size,
-                    int64_t fault_reconciliation_window_us = 50000);
+                    int64_t fault_reconciliation_window_us);
 
     ~CoordinatorHost();
 

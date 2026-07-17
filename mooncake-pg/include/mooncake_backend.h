@@ -24,15 +24,15 @@
 
 namespace mooncake {
 
-static constexpr size_t kDefaultCollectiveTimeoutUs = 100000;  // 100 ms
-static constexpr int64_t kDefaultP2PTimeoutUs = 3000000;       // 3 s
+static constexpr size_t kDefaultCollectiveTimeoutUs = 10000000;  // 10 s
+static constexpr int64_t kDefaultP2PTimeoutUs = 10000000;        // 10 s
 
 // Must be greater than collective_timeout_us so that timeout-based
 // failure reporters can contribute before the reconciliation window
 // expires. (Some ranks report failures based on timeout, while others
 // report based on failure status.)
 static constexpr int64_t kDefaultFaultReconciliationWindowUs =
-    4 * kDefaultCollectiveTimeoutUs;
+    3 * kDefaultCollectiveTimeoutUs;
 
 class AgentInterface;
 class AgentHost;
