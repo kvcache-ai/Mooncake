@@ -23,9 +23,10 @@
 #include <cstdlib>
 #include <thread>
 
+#include "common.h"
 #include "config.h"
-#include "transport/transport.h"
 #include "transfer_metadata_plugin.h"
+#include "transport/transport.h"
 
 using namespace mooncake;
 
@@ -109,6 +110,76 @@ TEST_F(TransferMetadataTest, LocalMemoryBufferTest) {
     }
     re = metadata_client->removeLocalSegment("test_local_segment");
     ASSERT_EQ(re, 0);
+}
+
+TEST_F(TransferMetadataTest, NcclMetadataAndHandshakePayloadRoundTrip) {
+    TransferMetadata server(P2PHANDSHAKE);
+    int sockfd = -1;
+    const uint16_t port = findAvailableTcpPort(sockfd);
+    ASSERT_NE(port, 0);
+    const std::string host = globalConfig().use_ipv6 ? "::1" : "127.0.0.1";
+
+    auto server_segment = std::make_shared<TransferMetadata::SegmentDesc>();
+    server_segment->name =
+        maybeWrapIpV6(host) + ":" + std::to_string(port);
+    server_segment->protocol = "nccl";
+    TransferMetadata::BufferDesc server_buffer;
+    server_buffer.name = "cuda:2";
+    server_buffer.addr = 0x10000;
+    server_buffer.length = 4096;
+    server_buffer.device_id = 2;
+    server_segment->buffers.push_back(server_buffer);
+    const std::string server_name = server_segment->name;
+    TransferMetadata::BufferDesc server_buffer_2;
+    server_buffer_2.name = "cuda:2-aux";
+    server_buffer_2.addr = 0x08000;
+    server_buffer_2.length = 8192;
+    server_buffer_2.device_id = 2;
+    server_segment->buffers.push_back(server_buffer_2);
+    ASSERT_EQ(server.addLocalSegment(LOCAL_SEGMENT_ID, server_name,
+                                     std::move(server_segment)),
+              0);
+
+    TransferMetadata::RpcMetaDesc rpc{};
+    rpc.ip_or_host_name = host;
+    rpc.rpc_port = port;
+    rpc.sockfd = sockfd;
+    ASSERT_EQ(server.addRpcMetaEntry("nccl-metadata-test", rpc), 0);
+    ASSERT_EQ(server.startHandshakeDaemon(
+                  [](const TransferMetadata::HandShakeDesc& peer,
+                     TransferMetadata::HandShakeDesc& local) {
+                      local.payload = "reply:" + peer.payload;
+                      return 0;
+                  },
+                  port, sockfd),
+              0);
+
+    TransferMetadata client(P2PHANDSHAKE);
+    auto client_segment = std::make_shared<TransferMetadata::SegmentDesc>();
+    client_segment->name = "client";
+    client_segment->protocol = "nccl";
+    ASSERT_EQ(client.addLocalSegment(LOCAL_SEGMENT_ID, "client",
+                                     std::move(client_segment)),
+              0);
+
+    auto peer_segment = client.getSegmentDesc(server_name);
+    ASSERT_NE(peer_segment, nullptr);
+    ASSERT_EQ(peer_segment->protocol, "nccl");
+    ASSERT_EQ(peer_segment->buffers.size(), 2U);
+    EXPECT_EQ(peer_segment->buffers[0].name, "cuda:2");
+    EXPECT_EQ(peer_segment->buffers[0].addr, 0x10000U);
+    EXPECT_EQ(peer_segment->buffers[0].length, 4096U);
+    EXPECT_EQ(peer_segment->buffers[0].device_id, 2);
+    EXPECT_EQ(peer_segment->buffers[1].name, "cuda:2-aux");
+    EXPECT_EQ(peer_segment->buffers[1].addr, 0x08000U);
+    EXPECT_EQ(peer_segment->buffers[1].length, 8192U);
+    EXPECT_EQ(peer_segment->buffers[1].device_id, 2);
+
+    TransferMetadata::HandShakeDesc request;
+    request.payload = "bootstrap";
+    TransferMetadata::HandShakeDesc response;
+    ASSERT_EQ(client.sendHandshake(server_name, request, response), 0);
+    EXPECT_EQ(response.payload, "reply:bootstrap");
 }
 
 // add, get and remove RPCMetaEntryMeta

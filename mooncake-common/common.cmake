@@ -71,6 +71,8 @@ option(BUILD_EXAMPLES "Build examples" ON)
 option(BUILD_UNIT_TESTS "Build unit tests" ON)
 option(BUILD_BENCHMARK "Build benchmarks" ON)
 option(USE_CUDA "option for enabling gpu features for NVIDIA GPU" OFF)
+option(USE_NCCL_DEVICE "option for enabling the NCCL DeviceTransport backend" OFF)
+option(USE_NCCL_HOST "option for enabling the NCCL host RMA transport" OFF)
 option(USE_MLU "option for enabling Cambricon MLU features" OFF)
 option(USE_MUSA "option for enabling gpu features for MTHREADS GPU" OFF)
 option(USE_MACA "option for enabling gpu features for MUXI GPU with MACA" OFF)
@@ -204,6 +206,27 @@ if(USE_CUDA)
   message(STATUS "CUDA support is enabled")
   include_directories(/usr/local/cuda/include)
   link_directories(/usr/local/cuda/lib /usr/local/cuda/lib64)
+endif()
+
+if(USE_NCCL_DEVICE OR USE_NCCL_HOST)
+  if(NOT USE_CUDA)
+    message(FATAL_ERROR
+      "USE_NCCL_DEVICE and USE_NCCL_HOST require USE_CUDA=ON")
+  endif()
+  list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_LIST_DIR})
+  find_package(NCCLDevice 2.30.4 REQUIRED MODULE)
+endif()
+
+if(USE_NCCL_DEVICE)
+  add_compile_definitions(USE_NCCL_DEVICE)
+  message(STATUS
+    "NCCL DeviceTransport support is enabled (NCCL ${NCCLDevice_VERSION})")
+endif()
+
+if(USE_NCCL_HOST)
+  add_compile_definitions(USE_NCCL_HOST)
+  message(STATUS
+    "NCCL host RMA transport is enabled (NCCL ${NCCLDevice_VERSION})")
 endif()
 
 if(USE_TPU)

@@ -31,6 +31,9 @@
 #ifdef USE_NVMEOF
 #include "transport/nvmeof_transport/nvmeof_transport.h"
 #endif
+#ifdef USE_NCCL_HOST
+#include "transport/nccl_transport/nccl_transport.h"
+#endif
 #ifdef USE_ASCEND_DIRECT
 #include "transport/ascend_transport/ascend_direct_transport/ascend_direct_transport.h"
 #endif
@@ -313,6 +316,14 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
 
 Transport* MultiTransport::installTransport(const std::string& proto,
                                             std::shared_ptr<Topology> topo) {
+#ifdef USE_NCCL_HOST
+    if ((proto == "nccl" && !transport_map_.empty()) ||
+        (proto != "nccl" && transport_map_.count("nccl") != 0)) {
+        LOG(ERROR) << "NCCL host transport must be the only transport "
+                      "installed in a Transfer Engine instance";
+        return nullptr;
+    }
+#endif
     Transport* transport = nullptr;
     if (std::string(proto) == "rdma") {
         transport = new RdmaTransport();
@@ -335,6 +346,11 @@ Transport* MultiTransport::installTransport(const std::string& proto,
 #ifdef USE_NVMEOF
     else if (std::string(proto) == "nvmeof") {
         transport = new NVMeoFTransport();
+    }
+#endif
+#ifdef USE_NCCL_HOST
+    else if (std::string(proto) == "nccl") {
+        transport = new NcclHostTransport();
     }
 #endif
 #ifdef USE_ASCEND_DIRECT

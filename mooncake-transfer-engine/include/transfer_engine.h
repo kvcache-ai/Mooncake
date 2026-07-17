@@ -35,6 +35,11 @@ class P2pTransport;
 class RdmaTransport;
 }  // namespace device
 #endif
+#ifdef USE_NCCL_DEVICE
+namespace device {
+class NcclTransport;
+}  // namespace device
+#endif
 using TransferRequest = Transport::TransferRequest;
 using TransferStatus = Transport::TransferStatus;
 using TransferStatusEnum = Transport::TransferStatusEnum;
@@ -175,6 +180,10 @@ class TransferEngine {
     device::P2pTransport* getOrCreateP2pTransport(int num_ranks);
     device::RdmaTransport* getOrCreateRdmaTransport(
         const std::vector<std::string>& device_filter = {});
+#endif
+#ifdef USE_NCCL_DEVICE
+    // NCCL is CUDA-only and independent of the host network transport.
+    device::NcclTransport* getOrCreateNcclTransport();
 #endif
 
     /**

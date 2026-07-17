@@ -163,6 +163,46 @@ TEST_F(TransportTest, parseHostNameWithPortTest) {
     ASSERT_EQ(res.second, 12001);
 }
 
+TEST_F(TransportTest, TransferTaskDestructorRunsSliceCleanup) {
+    int cleanup_count = 0;
+    {
+        Transport::TransferTask task;
+        auto* slice = new Transport::Slice();
+        slice->source_addr = &cleanup_count;
+        slice->cleanup_callback = [](Transport::Slice* released) {
+            auto* count = static_cast<int*>(released->source_addr);
+            ++*count;
+        };
+        task.slice_list.push_back(slice);
+    }
+
+    EXPECT_EQ(cleanup_count, 1);
+}
+
+TEST_F(TransportTest, SliceCleanupRunsOnceBeforeCacheReuse) {
+    Transport::ThreadLocalSliceCache cache;
+    int cleanup_count = 0;
+
+    Transport::Slice* slice = cache.allocate();
+    slice->source_addr = &cleanup_count;
+    slice->cleanup_callback = [](Transport::Slice* released) {
+        auto* count = static_cast<int*>(released->source_addr);
+        ++*count;
+    };
+
+    cache.deallocate(slice);
+    EXPECT_EQ(cleanup_count, 1);
+
+    Transport::Slice* reused = cache.allocate();
+    EXPECT_EQ(reused, slice);
+    EXPECT_EQ(reused->cleanup_callback, nullptr);
+
+    // A backend that does not install a callback must not inherit the callback
+    // from the previous owner of this cached slice.
+    cache.deallocate(reused);
+    EXPECT_EQ(cleanup_count, 1);
+}
+
 TEST_F(TransportTest, WriteSuccess) {
     int fd = CreateTempFile();
     ASSERT_NE(fd, -1) << "Failed to create temporary file";

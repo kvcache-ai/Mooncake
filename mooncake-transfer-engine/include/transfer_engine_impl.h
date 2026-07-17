@@ -37,6 +37,9 @@
     !defined(USE_CXI)
 #include "transport/device/device_transport.h"
 #endif
+#ifdef USE_NCCL_DEVICE
+#include "transport/device/nccl_device_transport.h"
+#endif
 #ifdef WITH_METRICS
 #include "ylt/metric/counter.hpp"
 #include "ylt/metric/histogram.hpp"
@@ -357,6 +360,9 @@ class TransferEngineImpl {
     device::RdmaTransport* getOrCreateRdmaTransport(
         const std::vector<std::string>& device_filter = {});
 #endif
+#ifdef USE_NCCL_DEVICE
+    device::NcclTransport* getOrCreateNcclTransport();
+#endif
 
     bool isTcpOnly() const { return multi_transports_->isTcpOnly(); }
 
@@ -445,6 +451,9 @@ class TransferEngineImpl {
     // Referenced by EP and future CPU-proxy paths.
     std::unique_ptr<device::P2pTransport> p2p_transport_;
     std::unique_ptr<device::RdmaTransport> rdma_transport_;
+#endif
+#ifdef USE_NCCL_DEVICE
+    std::unique_ptr<device::NcclTransport> nccl_transport_;
 #endif
 
 #ifdef WITH_METRICS
