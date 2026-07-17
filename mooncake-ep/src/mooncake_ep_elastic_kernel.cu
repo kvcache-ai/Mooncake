@@ -88,6 +88,14 @@ inline int combine_epilogue_smem_bytes(int hidden, int num_warps) {
     return num_warps * static_cast<int>(token_layout.get_num_bytes<false>());
 }
 
+inline int required_smem_bytes(int available_bytes, int required_bytes) {
+    if (required_bytes > available_bytes) {
+        throw std::runtime_error(
+            "Elastic kernel shared-memory requirement exceeds device capacity");
+    }
+    return required_bytes;
+}
+
 inline device::CommCtx make_comm_ctx(const ElasticLaunchContext& ctx) {
     device::CommCtx comm_ctx{};
     comm_ctx.rank = ctx.rank;
@@ -501,7 +509,7 @@ void launch_mooncake_elastic_dispatch(
     const int num_notify_warps = effective_cached_mode ? 0 : kElasticNumNotifyWarps;
     const int num_dispatch_warps = kElasticNumDispatchWarps;
     const int num_threads = (num_notify_warps + num_dispatch_warps) * 32;
-    const int smem_bytes = std::max(
+    const int smem_bytes = required_smem_bytes(
         num_smem_bytes,
         dispatch_smem_bytes(hidden, elem_size, num_sf_packs, num_topk,
                             ctx.num_scaleup_ranks, num_experts,
@@ -524,7 +532,7 @@ void launch_mooncake_elastic_dispatch(
         const int hybrid_dispatch_warps = 2 * num_channels_per_sm;
         const int hybrid_threads =
             (num_notify_warps + hybrid_dispatch_warps) * 32;
-        const int hybrid_smem_bytes = std::max(
+        const int hybrid_smem_bytes = required_smem_bytes(
             num_smem_bytes,
             dispatch_smem_bytes(hidden, elem_size, num_sf_packs, num_topk,
                                 ctx.num_scaleout_ranks * ctx.num_scaleup_ranks,
@@ -728,7 +736,7 @@ void launch_mooncake_elastic_dispatch_copy_epilogue(
     const ElasticLaunchContext& ctx, int* psum_num_recv_tokens_per_scaleup_rank,
     int* psum_num_recv_tokens_per_expert, cudaStream_t stream) {
     const int num_threads = kElasticNumEpilogueWarps * 32;
-    const int smem_bytes = std::max(
+    const int smem_bytes = required_smem_bytes(
         num_smem_bytes,
         dispatch_epilogue_smem_bytes(hidden, elem_size, num_sf_packs, num_topk,
                                      kElasticNumEpilogueWarps));
@@ -865,8 +873,9 @@ void* launch_mooncake_elastic_combine(
     int num_channels, bool use_expanded_layout, bool allow_multiple_reduction,
     const ElasticLaunchContext& ctx, cudaStream_t stream) {
     const int num_threads = kElasticNumEpilogueWarps * 32;
-    const int smem_bytes = std::max(
-        num_smem_bytes, combine_smem_bytes(hidden, num_topk, kElasticNumEpilogueWarps));
+    const int smem_bytes = required_smem_bytes(
+        num_smem_bytes,
+        combine_smem_bytes(hidden, num_topk, kElasticNumEpilogueWarps));
     const auto comm_ctx = make_comm_ctx(ctx);
     (void)token_metadata_at_forward;
     (void)channel_linked_list;
@@ -876,7 +885,7 @@ void* launch_mooncake_elastic_combine(
         const int num_channels_per_sm = num_channels / num_sms;
         const int hybrid_combine_warps = 2 * num_channels_per_sm;
         const int hybrid_threads = hybrid_combine_warps * 32;
-        const int hybrid_smem_bytes = std::max(
+        const int hybrid_smem_bytes = required_smem_bytes(
             num_smem_bytes,
             combine_smem_bytes(hidden, num_topk, hybrid_combine_warps));
 
@@ -974,8 +983,9 @@ void launch_mooncake_elastic_combine_reduce_epilogue(
     bool allow_multiple_reduction, const ElasticLaunchContext& ctx,
     cudaStream_t stream) {
     const int num_threads = kElasticNumEpilogueWarps * 32;
-    const int smem_bytes = std::max(
-        num_smem_bytes, combine_epilogue_smem_bytes(hidden, kElasticNumEpilogueWarps));
+    const int smem_bytes = required_smem_bytes(
+        num_smem_bytes,
+        combine_epilogue_smem_bytes(hidden, kElasticNumEpilogueWarps));
 
 #define LAUNCH_COMBINE_EPILOGUE(H, E, K, M, S, SO, SU)                         \
     do {                                                                       \
