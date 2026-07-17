@@ -22,11 +22,22 @@ def init_dist(local_rank: int, num_local_ranks: int):
     }
     if not use_nccl_device:
         pg.set_host_ip(os.getenv('MOONCAKE_EP_HOST_IP', '10.12.11.242'))
+    print(
+        f'[EP test] local_rank={local_rank} node_rank={node_rank} '
+        f'world_size={num_nodes * num_local_ranks} backend='
+        f'{"nccl" if use_nccl_device else "mooncake"}',
+        flush=True,
+    )
     dist.init_process_group(
         backend='nccl' if use_nccl_device else 'mooncake',
         init_method=f'tcp://{ip}:{port}',
         world_size=num_nodes * num_local_ranks,
         rank=node_rank * num_local_ranks + local_rank
+    )
+    print(
+        f'[EP test] process group ready rank={dist.get_rank()} '
+        f'world_size={dist.get_world_size()}',
+        flush=True,
     )
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device('cuda')
