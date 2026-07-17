@@ -6,6 +6,9 @@
 #include <mooncake_ep_utils.cuh>
 #include <elastic/mooncake_ep_elastic_ptx.cuh>
 #include <transport/device/comm_device.cuh>
+#ifdef USE_NCCL_DEVICE
+#include <transport/device/nccl_device.cuh>
+#endif
 
 namespace mooncake::elastic::transport {
 
@@ -71,6 +74,13 @@ struct MooncakeGin {
     template <typename team_t>
     __device__ __forceinline__ bool is_nvlink_accessible(int dst_rank) const {
         dst_rank = world_rank<team_t>(dst_rank);
+#ifdef USE_NCCL_DEVICE
+        if (ctx.use_nccl) {
+            const auto route = device::mc_nccl_route(ctx.nccl, dst_rank);
+            return route == device::NcclDeviceRoute::kLocal ||
+                   route == device::NcclDeviceRoute::kLsa;
+        }
+#endif
         return dst_rank == ctx.rank ||
                device::mc_comm_p2p_available(ctx, dst_rank);
     }
@@ -79,6 +89,14 @@ struct MooncakeGin {
     __device__ __forceinline__ void* get_sym_ptr(void* ptr,
                                                  int dst_rank) const {
         dst_rank = world_rank<team_t>(dst_rank);
+#ifdef USE_NCCL_DEVICE
+        if (ctx.use_nccl) {
+            const auto route = device::mc_nccl_route(ctx.nccl, dst_rank);
+            return route == device::NcclDeviceRoute::kGin
+                       ? nullptr
+                       : device::mc_nccl_peer_ptr(ctx.nccl, dst_rank, ptr);
+        }
+#endif
         return device::mc_route_put(ctx, dst_rank, ptr);
     }
 
@@ -86,6 +104,14 @@ struct MooncakeGin {
     __device__ __forceinline__ const void* get_sym_ptr(const void* ptr,
                                                        int dst_rank) const {
         dst_rank = world_rank<team_t>(dst_rank);
+#ifdef USE_NCCL_DEVICE
+        if (ctx.use_nccl) {
+            const auto route = device::mc_nccl_route(ctx.nccl, dst_rank);
+            return route == device::NcclDeviceRoute::kGin
+                       ? nullptr
+                       : device::mc_nccl_peer_ptr(ctx.nccl, dst_rank, ptr);
+        }
+#endif
         return device::mc_route_put(ctx, dst_rank, const_cast<void*>(ptr));
     }
 
@@ -94,7 +120,7 @@ struct MooncakeGin {
                                         int num_bytes, int dst_rank,
                                         int /*flags*/ = 0) const {
         dst_rank = world_rank<team_t>(dst_rank);
-        auto routed = device::mc_route_put(ctx, dst_rank, dst_ptr);
+        auto routed = get_sym_ptr<WorldTeam>(dst_ptr, dst_rank);
         if (routed != nullptr) {
             const auto src_addr = reinterpret_cast<uintptr_t>(src_ptr);
             const auto dst_addr = reinterpret_cast<uintptr_t>(routed);
@@ -130,6 +156,15 @@ struct MooncakeGin {
             // so a system fence is sufficient to publish the writes.
             __threadfence_system();
         } else {
+#ifdef USE_NCCL_DEVICE
+            if (ctx.use_nccl) {
+                device::mc_nccl_put(ctx.nccl, qp_idx, dst_rank,
+                                    physical_qps_per_rank, src_ptr, dst_ptr,
+                                    static_cast<uint32_t>(num_bytes),
+                                    ptx::get_lane_idx());
+                return;
+            }
+#endif
             device::mc_rdma_put(ctx, qp_idx, dst_rank, physical_qps_per_rank,
                                 src_ptr, dst_ptr,
                                 static_cast<uint32_t>(num_bytes), 0);
@@ -142,7 +177,7 @@ struct MooncakeGin {
                                               int flags = 0) const {
         dst_rank = world_rank<team_t>(dst_rank);
         auto* routed =
-            static_cast<value_t*>(device::mc_route_put(ctx, dst_rank, dst_ptr));
+            static_cast<value_t*>(get_sym_ptr<WorldTeam>(dst_ptr, dst_rank));
         if (routed != nullptr) {
             if constexpr (sizeof(value_t) == sizeof(int32_t)) {
                 device::mc_st_release(reinterpret_cast<int*>(routed),
@@ -152,6 +187,22 @@ struct MooncakeGin {
                 __threadfence_system();
             }
         } else {
+#ifdef USE_NCCL_DEVICE
+            if (ctx.use_nccl) {
+                if constexpr (sizeof(value_t) == sizeof(uint64_t) ||
+                              sizeof(value_t) == sizeof(int64_t)) {
+                    device::mc_nccl_signal_add(
+                        ctx.nccl, dst_rank, qp_idx, physical_qps_per_rank,
+                        reinterpret_cast<uint64_t*>(dst_ptr),
+                        static_cast<uint64_t>(value), 0);
+                } else {
+                    EP_DEVICE_ASSERT(
+                        false &&
+                        "NCCL Elastic put_value requires 64-bit values");
+                }
+                return;
+            }
+#endif
             if constexpr (sizeof(value_t) == sizeof(int32_t)) {
                 device::mc_signal(ctx, dst_rank, qp_idx, physical_qps_per_rank,
                                   reinterpret_cast<int*>(dst_ptr),
@@ -200,7 +251,7 @@ struct MooncakeGin {
         if constexpr (sizeof(value_t) == sizeof(int32_t)) {
             dst_rank = world_rank<team_t>(dst_rank);
             auto* routed =
-                static_cast<int*>(device::mc_route_put(ctx, dst_rank, dst_ptr));
+                static_cast<int*>(get_sym_ptr<WorldTeam>(dst_ptr, dst_rank));
             if (routed != nullptr) {
                 device::mc_atomic_add_release(routed, static_cast<int>(value));
             } else {
@@ -212,7 +263,7 @@ struct MooncakeGin {
                              sizeof(value_t) == sizeof(int64_t)) {
             dst_rank = world_rank<team_t>(dst_rank);
             auto* routed = static_cast<int64_t*>(
-                device::mc_route_put(ctx, dst_rank, dst_ptr));
+                get_sym_ptr<WorldTeam>(dst_ptr, dst_rank));
             if (routed != nullptr) {
                 // Some official elastic paths use the high 32 bits as the
                 // readiness word (notify counters), while others use the low 32
@@ -223,6 +274,15 @@ struct MooncakeGin {
                 // packed value is updated atomically with release ordering.
                 ptx::red_add_rel_sys(routed, static_cast<int64_t>(value));
             } else {
+#ifdef USE_NCCL_DEVICE
+                if (ctx.use_nccl) {
+                    device::mc_nccl_signal_add(
+                        ctx.nccl, dst_rank, qp_idx, physical_qps_per_rank,
+                        reinterpret_cast<uint64_t*>(dst_ptr),
+                        static_cast<uint64_t>(value), 0);
+                    return;
+                }
+#endif
                 if (ctx.use_64bit_rdma_atomics) {
                     device::mc_red_add64(ctx, dst_rank, qp_idx,
                                          physical_qps_per_rank,
@@ -271,7 +331,15 @@ struct MooncakeGin {
         }
     }
 
-    __device__ __forceinline__ void flush() const { __threadfence_system(); }
+    __device__ __forceinline__ void flush() const {
+#ifdef USE_NCCL_DEVICE
+        if (ctx.use_nccl) {
+            device::mc_nccl_flush(ctx.nccl, qp_idx, 0);
+            return;
+        }
+#endif
+        __threadfence_system();
+    }
 };
 
 }  // namespace mooncake::elastic::transport

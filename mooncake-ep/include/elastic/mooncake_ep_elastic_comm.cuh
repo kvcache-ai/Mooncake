@@ -106,6 +106,44 @@ __forceinline__ __device__ void mooncake_barrier_wo_local_sync(
     const int& rank_idx, const int& sm_idx, const int& thread_idx) {
     if (kNumSMs > 1 && sm_idx > 0) return;
 
+#ifdef USE_NCCL_DEVICE
+    if (gin.ctx.use_nccl) {
+        // Each tag owns a monotonic receive counter in the symmetric workspace.
+        // LSA peers update it with a system atomic and remote peers use a GIN
+        // VA signal-add, so no CUDA IPC pointer or IBGDA atomic is involved.
+        auto* epoch = reinterpret_cast<unsigned long long*>(
+            workspace.get_nvl_barrier_counter_ptr(kTag));
+        auto* arrivals = reinterpret_cast<unsigned long long*>(
+            workspace.get_nvl_barrier_signal_ptr(kTag, 0));
+        if (thread_idx < kNumRanks) {
+            const int dst_rank = gin.template world_rank<team_t>(thread_idx);
+            device::mc_nccl_signal_add(gin.ctx.nccl, dst_rank, gin.qp_idx,
+                                       gin.physical_qps_per_rank, arrivals, 1,
+                                       0);
+        }
+        __syncthreads();
+        __shared__ unsigned long long target;
+        if (thread_idx == 0)
+            target = (atomicAdd(epoch, 1ULL) + 1ULL) *
+                     static_cast<unsigned long long>(kNumRanks);
+        __syncthreads();
+        timeout_while<kNumTimeoutCycles>(
+            thread_idx == 0, [=](const bool& is_last_check) {
+                const auto observed =
+                    ptx::ld_acquire_sys<unsigned long long>(arrivals);
+                if (observed >= target) return true;
+                if (is_last_check) {
+                    printf(
+                        "NCCL Elastic barrier timeout, tag: %d, rank: %d, "
+                        "observed: %llu, target: %llu\n",
+                        kTag, rank_idx, observed, target);
+                }
+                return false;
+            });
+        return;
+    }
+#endif
+
     const int status =
         static_cast<int>((*workspace.get_nvl_barrier_counter_ptr(kTag)) & 3);
     const int phase = status & 1;
