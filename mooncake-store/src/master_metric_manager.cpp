@@ -895,8 +895,19 @@ void MasterMetricManager::client_liveness_became_offline() {
     client_liveness_offline_transitions_.inc(1);
 }
 
-void MasterMetricManager::client_liveness_offline_record_removed() {
-    client_liveness_offline_clients_.dec(1);
+void MasterMetricManager::on_client_liveness_record_removed(
+    ClientLivenessState state) {
+    switch (state) {
+        case ClientLivenessState::ACTIVE:
+            client_liveness_active_clients_.dec(1);
+            break;
+        case ClientLivenessState::SUSPECTED:
+            client_liveness_suspected_clients_.dec(1);
+            break;
+        case ClientLivenessState::OFFLINE:
+            client_liveness_offline_clients_.dec(1);
+            break;
+    }
 }
 
 void MasterMetricManager::reset_client_liveness_metrics(
@@ -914,14 +925,12 @@ void MasterMetricManager::reset_client_liveness_metrics(
     }
 }
 
-void MasterMetricManager::set_pending_client_offboarding_jobs(
-    int64_t pending_jobs) {
-    const int64_t current = pending_client_offboarding_jobs_metric_.value();
-    if (pending_jobs > current) {
-        pending_client_offboarding_jobs_metric_.inc(pending_jobs - current);
-    } else if (pending_jobs < current) {
-        pending_client_offboarding_jobs_metric_.dec(current - pending_jobs);
-    }
+void MasterMetricManager::inc_client_offboarding_queue_depth(int64_t jobs) {
+    pending_client_offboarding_jobs_metric_.inc(jobs);
+}
+
+void MasterMetricManager::dec_client_offboarding_queue_depth(int64_t jobs) {
+    pending_client_offboarding_jobs_metric_.dec(jobs);
 }
 
 void MasterMetricManager::inc_client_offboarding_failure() {

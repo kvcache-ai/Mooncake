@@ -549,6 +549,13 @@ MasterService::~MasterService() {
     if (snapshot_manager_) {
         snapshot_manager_.reset();
     }
+
+    std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
+    auto& metrics = MasterMetricManager::instance();
+    for (const auto& [_, record] : client_liveness_records_) {
+        metrics.on_client_liveness_record_removed(record->state());
+    }
+    client_liveness_records_.clear();
 }
 
 void MasterService::SetNoFProbeFnForTesting(NoFProbeFn fn) {

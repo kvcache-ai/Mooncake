@@ -6,6 +6,7 @@
 #include <string>
 #include <unordered_map>
 
+#include "client_liveness.h"
 #include "ylt/metric/counter.hpp"
 #include "ylt/metric/gauge.hpp"
 #include "ylt/metric/histogram.hpp"
@@ -137,9 +138,10 @@ class MasterMetricManager {
     void client_liveness_became_suspected();
     void client_liveness_recovered();
     void client_liveness_became_offline();
-    void client_liveness_offline_record_removed();
+    void on_client_liveness_record_removed(ClientLivenessState state);
     void reset_client_liveness_metrics(int64_t active_records = 0);
-    void set_pending_client_offboarding_jobs(int64_t pending_jobs);
+    void inc_client_offboarding_queue_depth(int64_t jobs = 1);
+    void dec_client_offboarding_queue_depth(int64_t jobs = 1);
     void inc_client_offboarding_failure();
     void inc_client_offboarding_retry();
     void observe_client_offboarding_duration_ms(int64_t duration_ms);

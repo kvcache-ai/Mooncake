@@ -47,6 +47,12 @@ void ClientOffboardingWorker::Stop() {
     if (thread_.joinable()) {
         thread_.join();
     }
+    const auto incomplete =
+        pending_jobs_.exchange(0, std::memory_order_acq_rel);
+    if (incomplete > 0) {
+        MasterMetricManager::instance().dec_client_offboarding_queue_depth(
+            static_cast<int64_t>(incomplete));
+    }
 }
 
 bool ClientOffboardingWorker::Schedule(ClientOffboardingJob job) {
@@ -56,10 +62,8 @@ bool ClientOffboardingWorker::Schedule(ClientOffboardingJob job) {
             return false;
         }
         jobs_.push_back(std::move(job));
-        const auto pending =
-            pending_jobs_.fetch_add(1, std::memory_order_release) + 1;
-        MasterMetricManager::instance().set_pending_client_offboarding_jobs(
-            static_cast<int64_t>(pending));
+        pending_jobs_.fetch_add(1, std::memory_order_release);
+        MasterMetricManager::instance().inc_client_offboarding_queue_depth();
     }
     cv_.notify_one();
     return true;
@@ -172,15 +176,13 @@ void ClientOffboardingWorker::ThreadFunc() {
                     current->second == job.liveness) {
                     service_->client_liveness_records_.erase(current);
                     MasterMetricManager::instance()
-                        .client_liveness_offline_record_removed();
+                        .on_client_liveness_record_removed(
+                            ClientLivenessState::OFFLINE);
                 }
             }
 
-            const auto pending =
-                pending_jobs_.fetch_sub(1, std::memory_order_release) - 1;
-            MasterMetricManager::instance()
-                .set_pending_client_offboarding_jobs(
-                    static_cast<int64_t>(pending));
+            pending_jobs_.fetch_sub(1, std::memory_order_release);
+            MasterMetricManager::instance().dec_client_offboarding_queue_depth();
             const auto duration_ms =
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - job.enqueued_at)
