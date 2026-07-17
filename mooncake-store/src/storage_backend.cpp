@@ -1705,7 +1705,9 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
             if (bucket_backend_config_.eviction_policy ==
                 BucketEvictionPolicy::LRU) {
                 admission_time =
-                    std::chrono::steady_clock::now().time_since_epoch().count();
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
                 bucket->last_access_ns_.store(admission_time,
                                               std::memory_order_relaxed);
             }
@@ -1828,9 +1830,10 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                 // Update LRU timestamp for this bucket.
                 if (bucket_backend_config_.eviction_policy ==
                     BucketEvictionPolicy::LRU) {
-                    auto now = std::chrono::steady_clock::now()
-                                   .time_since_epoch()
-                                   .count();
+                    auto now =
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
                     bucket_it->second->last_access_ns_.store(
                         now, std::memory_order_relaxed);
                 }
