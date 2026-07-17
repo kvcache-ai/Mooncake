@@ -2,7 +2,6 @@
 #include "../src/registered_pinned_memory.h"
 
 #include <array>
-#include <string>
 
 #include <gtest/gtest.h>
 
@@ -49,22 +48,27 @@ RegisteredPinnedMemoryManager::PinOps FakeOps() {
     return {FakeRegister, FakeUnregister};
 }
 
-TEST(RegisteredPinnedMemoryManagerTest, QuotaRejectsAndReleaseRefunds) {
-    ResetState();
-    RegisteredPinnedMemoryManager manager({true, 64}, FakeOps());
-    std::array<char, 128> buffer{};
+class RegisteredPinnedMemoryManagerTest : public ::testing::Test {
+   protected:
+    void SetUp() override { ResetState(); }
 
-    auto first = manager.try_pin(buffer.data(), 64, "first");
+    std::array<char, 128> buffer_{};
+};
+
+TEST_F(RegisteredPinnedMemoryManagerTest, QuotaRejectsAndReleaseRefunds) {
+    RegisteredPinnedMemoryManager manager({true, 64}, FakeOps());
+
+    auto first = manager.try_pin(buffer_.data(), 64, "first");
     ASSERT_NE(first, nullptr);
 
-    auto over_quota = manager.try_pin(buffer.data() + 64, 1, "over quota");
+    auto over_quota = manager.try_pin(buffer_.data() + 64, 1, "over quota");
     EXPECT_EQ(over_quota, nullptr);
     EXPECT_EQ(State().register_calls, 1);
 
     first.reset();
     EXPECT_EQ(State().unregister_calls, 1);
 
-    auto second = manager.try_pin(buffer.data() + 64, 64, "second");
+    auto second = manager.try_pin(buffer_.data() + 64, 64, "second");
     ASSERT_NE(second, nullptr);
     EXPECT_EQ(State().register_calls, 2);
 
@@ -72,21 +76,19 @@ TEST(RegisteredPinnedMemoryManagerTest, QuotaRejectsAndReleaseRefunds) {
     EXPECT_EQ(State().unregister_calls, 2);
 }
 
-TEST(RegisteredPinnedMemoryManagerTest, OverlapAndDuplicateAreRejected) {
-    ResetState();
+TEST_F(RegisteredPinnedMemoryManagerTest, OverlapAndDuplicateAreRejected) {
     RegisteredPinnedMemoryManager manager({true, 128}, FakeOps());
-    std::array<char, 128> buffer{};
 
-    auto first = manager.try_pin(buffer.data() + 16, 32, "first");
+    auto first = manager.try_pin(buffer_.data() + 16, 32, "first");
     ASSERT_NE(first, nullptr);
 
-    auto duplicate = manager.try_pin(buffer.data() + 16, 32, "duplicate");
+    auto duplicate = manager.try_pin(buffer_.data() + 16, 32, "duplicate");
     EXPECT_EQ(duplicate, nullptr);
 
-    auto overlap = manager.try_pin(buffer.data() + 32, 16, "overlap");
+    auto overlap = manager.try_pin(buffer_.data() + 32, 16, "overlap");
     EXPECT_EQ(overlap, nullptr);
 
-    auto adjacent = manager.try_pin(buffer.data() + 48, 16, "adjacent");
+    auto adjacent = manager.try_pin(buffer_.data() + 48, 16, "adjacent");
     ASSERT_NE(adjacent, nullptr);
 
     EXPECT_EQ(State().register_calls, 2);
@@ -95,13 +97,11 @@ TEST(RegisteredPinnedMemoryManagerTest, OverlapAndDuplicateAreRejected) {
     EXPECT_EQ(State().unregister_calls, 2);
 }
 
-TEST(RegisteredPinnedMemoryManagerTest,
-     UnregisterFailureDropsTrackingAndRefunds) {
-    ResetState();
+TEST_F(RegisteredPinnedMemoryManagerTest,
+       UnregisterFailureDropsTrackingAndRefunds) {
     RegisteredPinnedMemoryManager manager({true, 32}, FakeOps());
-    std::array<char, 32> buffer{};
 
-    auto first = manager.try_pin(buffer.data(), 32, "first");
+    auto first = manager.try_pin(buffer_.data(), 32, "first");
     ASSERT_NE(first, nullptr);
 
     State().unregister_result =
@@ -111,7 +111,7 @@ TEST(RegisteredPinnedMemoryManagerTest,
 
     State().unregister_result =
         RegisteredPinnedMemoryManager::UnregisterResult::kSuccess;
-    auto second = manager.try_pin(buffer.data(), 32, "second");
+    auto second = manager.try_pin(buffer_.data(), 32, "second");
     ASSERT_NE(second, nullptr);
     EXPECT_EQ(State().register_calls, 2);
 
@@ -119,19 +119,17 @@ TEST(RegisteredPinnedMemoryManagerTest,
     EXPECT_EQ(State().unregister_calls, 2);
 }
 
-TEST(RegisteredPinnedMemoryManagerTest, RegisterFailureRefundsReservation) {
-    ResetState();
+TEST_F(RegisteredPinnedMemoryManagerTest, RegisterFailureRefundsReservation) {
     RegisteredPinnedMemoryManager manager({true, 32}, FakeOps());
-    std::array<char, 32> buffer{};
 
     State().register_succeeds = false;
-    auto failed = manager.try_pin(buffer.data(), 32, "failed");
+    auto failed = manager.try_pin(buffer_.data(), 32, "failed");
     EXPECT_EQ(failed, nullptr);
     EXPECT_EQ(State().register_calls, 1);
     EXPECT_EQ(State().unregister_calls, 0);
 
     State().register_succeeds = true;
-    auto retried = manager.try_pin(buffer.data(), 32, "retried");
+    auto retried = manager.try_pin(buffer_.data(), 32, "retried");
     ASSERT_NE(retried, nullptr);
     EXPECT_EQ(State().register_calls, 2);
 

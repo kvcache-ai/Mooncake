@@ -54,9 +54,9 @@ class RegisteredPinnedMemoryManager {
     friend class RegisteredPinnedRegion;
 
     struct ActiveRegion {
-        void* addr = nullptr;
-        size_t size = 0;
-        RegisteredPinnedRegion* region = nullptr;
+        void* addr;
+        size_t size;
+        RegisteredPinnedRegion* region;
     };
 
     RegisteredPinnedMemoryManager();

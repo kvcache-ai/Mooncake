@@ -1081,23 +1081,15 @@ def setup(
 - `ssd_offload_path` (str): SSD offload directory. When provided, overrides the storage path environment configuration.
 - `tenant_id` (str): Tenant namespace for object keys. Defaults to `"default"`.
 
-**Store segment pinned memory:**
-
-CUDA-enabled builds can register Store-managed host segments as pinned memory
-when the process is given an explicit pinned-memory quota. This applies only to
-Store segment memory for host transfer protocols allocated by `setup()`
-(`global_segment_size`) and `allocateAndMountSegment()`. It does not pin
-file-backed `mountSegment()` mappings, CXL/device segments, the
-`local_buffer_size` client buffer, user buffers, dummy-client shared memory, or
-temporary staging buffers.
-
-- `MC_STORE_PIN_MEMORY_MAX_BYTES`: positive process-wide quota, in bytes. Store
-  segment pinning is disabled when this is unset, empty, `0`, or invalid.
-- `MC_STORE_PIN_MEMORY`: optional override. Set to `0`, `false`, `off`, or `no`
-  to disable Store segment pinning even when a quota is configured.
-
-If the quota is exhausted or CUDA registration fails, Mooncake continues with
-pageable Store segment memory.
+**Store segment pinned memory:** CUDA-enabled builds can register Store-managed
+host segments as pinned memory when `MC_STORE_PIN_MEMORY_MAX_BYTES` is set to a
+positive process-wide quota; unset, empty, `0`, or invalid values disable it.
+The scope is limited to host Store segments allocated by `setup()`
+(`global_segment_size`) and `allocateAndMountSegment()`; it excludes file-backed
+`mountSegment()` mappings, CXL/device segments, `local_buffer_size`, user
+buffers, dummy-client shared memory, and temporary staging buffers. If the quota
+is exhausted or CUDA registration fails, Mooncake continues with pageable Store
+segment memory.
 
 **Returns:**
 - `int`: Status code (0 = success, non-zero = error code)

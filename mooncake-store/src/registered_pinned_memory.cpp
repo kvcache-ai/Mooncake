@@ -1,6 +1,5 @@
 #include "registered_pinned_memory.h"
 
-#include <algorithm>
 #include <cctype>
 #include <charconv>
 #include <cstdlib>
@@ -35,19 +34,6 @@ std::pair<const char*, const char*> TrimAsciiWhitespace(const char* value) {
     return {begin, end};
 }
 
-bool ParsePinnedMemoryEnabled() {
-    const char* value = std::getenv("MC_STORE_PIN_MEMORY");
-    if (!value) return true;
-
-    auto [begin, end] = TrimAsciiWhitespace(value);
-    std::string normalized(begin, end);
-    std::transform(
-        normalized.begin(), normalized.end(), normalized.begin(),
-        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-    return !(normalized == "0" || normalized == "false" ||
-             normalized == "off" || normalized == "no");
-}
-
 std::optional<uint64_t> ParsePinnedMemoryLimit() {
     const char* value = std::getenv("MC_STORE_PIN_MEMORY_MAX_BYTES");
     if (!value || value[0] == '\0') return 0;
@@ -70,8 +56,6 @@ std::optional<uint64_t> ParsePinnedMemoryLimit() {
 }
 
 std::pair<bool, uint64_t> ParsePinnedMemoryConfig() {
-    if (!ParsePinnedMemoryEnabled()) return {false, 0};
-
     auto limit = ParsePinnedMemoryLimit();
     if (!limit.has_value() || *limit == 0) {
         return {false, 0};
@@ -229,13 +213,12 @@ std::shared_ptr<RegisteredPinnedRegion> RegisteredPinnedMemoryManager::try_pin(
     {
         std::lock_guard<std::mutex> lock(mutex_);
         for (auto& entry : regions_) {
-            if (entry.addr != addr || entry.size != size || entry.region) {
-                continue;
+            if (entry.addr == addr && entry.size == size && !entry.region) {
+                entry.region = region.get();
+                pinned_bytes = pinned_bytes_;
+                tracking_ready = true;
+                break;
             }
-            entry.region = region.get();
-            pinned_bytes = pinned_bytes_;
-            tracking_ready = true;
-            break;
         }
     }
     if (!tracking_ready) {
@@ -266,19 +249,17 @@ void RegisteredPinnedMemoryManager::release(RegisteredPinnedRegion* region) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         for (auto& entry : regions_) {
-            if (entry.addr != region->addr_ || entry.size != region->size_ ||
-                entry.region != region) {
-                continue;
+            if (entry.addr == region->addr_ && entry.size == region->size_ &&
+                entry.region == region) {
+                entry.region = nullptr;
+                should_unregister = true;
+                break;
             }
-            entry.region = nullptr;
-            should_unregister = true;
-            break;
         }
     }
     if (!should_unregister) return;
 
     std::string error_message;
-    if (!pin_ops_.unregister_region) return;
     auto unregister_result =
         pin_ops_.unregister_region(region->addr_, &error_message);
     // Treat CUDA unregistration as best-effort cleanup: drop manager state so
@@ -303,10 +284,11 @@ void RegisteredPinnedMemoryManager::release(RegisteredPinnedRegion* region) {
 void RegisteredPinnedMemoryManager::remove_inactive_region_locked(void* addr,
                                                                   size_t size) {
     for (auto it = regions_.begin(); it != regions_.end(); ++it) {
-        if (it->addr != addr || it->size != size || it->region) continue;
-        regions_.erase(it);
-        pinned_bytes_ = pinned_bytes_ >= size ? pinned_bytes_ - size : 0;
-        return;
+        if (it->addr == addr && it->size == size && !it->region) {
+            regions_.erase(it);
+            pinned_bytes_ = pinned_bytes_ >= size ? pinned_bytes_ - size : 0;
+            return;
+        }
     }
 }
 
