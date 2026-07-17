@@ -111,9 +111,9 @@ __forceinline__ __device__ void mooncake_barrier_wo_local_sync(
         // Each tag owns a monotonic receive counter in the symmetric workspace.
         // LSA peers update it with a system atomic and remote peers use a GIN
         // VA signal-add, so no CUDA IPC pointer or IBGDA atomic is involved.
-        auto* epoch = reinterpret_cast<unsigned long long*>(
+        auto* epoch = reinterpret_cast<uint64_t*>(
             workspace.get_nvl_barrier_counter_ptr(kTag));
-        auto* arrivals = reinterpret_cast<unsigned long long*>(
+        auto* arrivals = reinterpret_cast<uint64_t*>(
             workspace.get_nvl_barrier_signal_ptr(kTag, 0));
         if (thread_idx < kNumRanks) {
             const int dst_rank = gin.template world_rank<team_t>(thread_idx);
@@ -122,15 +122,14 @@ __forceinline__ __device__ void mooncake_barrier_wo_local_sync(
                                        0);
         }
         __syncthreads();
-        __shared__ unsigned long long target;
+        __shared__ uint64_t target;
         if (thread_idx == 0)
             target = (atomicAdd(epoch, 1ULL) + 1ULL) *
-                     static_cast<unsigned long long>(kNumRanks);
+                     static_cast<uint64_t>(kNumRanks);
         __syncthreads();
         timeout_while<kNumTimeoutCycles>(
             thread_idx == 0, [=](const bool& is_last_check) {
-                const auto observed =
-                    ptx::ld_acquire_sys<unsigned long long>(arrivals);
+                const auto observed = ptx::ld_acquire_sys<uint64_t>(arrivals);
                 if (observed >= target) return true;
                 if (is_last_check) {
                     printf(

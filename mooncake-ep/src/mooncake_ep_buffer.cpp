@@ -127,41 +127,42 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
     initialize_ibgda = !nccl_requested_;
 #endif
     if (initialize_ibgda) {
-    if (engine) {
-        rdma_transport_ = engine->getOrCreateRdmaTransport();
-        if (rdma_transport_) {
-            if (!initRdmaTransport(rdma_transport_, gdr_buffer,
-                                   num_ep_buffer_bytes, num_ranks, USE_QP_COUNT,
-                                   comm_stream.stream())) {
-                rdma_transport_ = nullptr;
+        if (engine) {
+            rdma_transport_ = engine->getOrCreateRdmaTransport();
+            if (rdma_transport_) {
+                if (!initRdmaTransport(rdma_transport_, gdr_buffer,
+                                       num_ep_buffer_bytes, num_ranks,
+                                       USE_QP_COUNT, comm_stream.stream())) {
+                    rdma_transport_ = nullptr;
+                    ibgda_disabled_ = true;
+                    LOG(INFO) << "[EP] IBGDA unavailable, using P2P-only path";
+                }
+            } else {
+                ibgda_disabled_ = true;
+            }
+        } else {
+            // Read optional NIC whitelist from env var (same convention as PG
+            // tests).
+            std::vector<std::string> device_filter;
+            if (const char* env = std::getenv("MOONCAKE_EP_DEVICE_FILTER")) {
+                std::string s(env);
+                std::istringstream ss(s);
+                std::string tok;
+                while (std::getline(ss, tok, ',')) {
+                    if (!tok.empty()) device_filter.push_back(tok);
+                }
+            }
+            auto t = device::createIbgdaDeviceTransport(device_filter);
+            if (initRdmaTransport(t.get(), gdr_buffer, num_ep_buffer_bytes,
+                                  num_ranks, USE_QP_COUNT,
+                                  comm_stream.stream())) {
+                owned_rdma_transport_ = std::move(t);
+                rdma_transport_ = owned_rdma_transport_.get();
+            } else {
                 ibgda_disabled_ = true;
                 LOG(INFO) << "[EP] IBGDA unavailable, using P2P-only path";
             }
-        } else {
-            ibgda_disabled_ = true;
         }
-    } else {
-        // Read optional NIC whitelist from env var (same convention as PG
-        // tests).
-        std::vector<std::string> device_filter;
-        if (const char* env = std::getenv("MOONCAKE_EP_DEVICE_FILTER")) {
-            std::string s(env);
-            std::istringstream ss(s);
-            std::string tok;
-            while (std::getline(ss, tok, ',')) {
-                if (!tok.empty()) device_filter.push_back(tok);
-            }
-        }
-        auto t = device::createIbgdaDeviceTransport(device_filter);
-        if (initRdmaTransport(t.get(), gdr_buffer, num_ep_buffer_bytes,
-                              num_ranks, USE_QP_COUNT, comm_stream.stream())) {
-            owned_rdma_transport_ = std::move(t);
-            rdma_transport_ = owned_rdma_transport_.get();
-        } else {
-            ibgda_disabled_ = true;
-            LOG(INFO) << "[EP] IBGDA unavailable, using P2P-only path";
-        }
-    }
     }
 
     // Create 32 MiB workspace
@@ -227,10 +228,11 @@ void MooncakeEpBuffer::initialize_nccl_transport(
     config.gin_context_count = gin_context_count;
     config.lsa_barrier_count = 0;
     if (owned_nccl_transport_->initialize(config, unique_id) != 0) {
-        throw std::runtime_error("[EP] NCCL device transport initialization failed");
+        throw std::runtime_error(
+            "[EP] NCCL device transport initialization failed");
     }
     if (owned_nccl_transport_->registerBuffer(gdr_buffer, num_ep_buffer_bytes,
-                                               &nccl_gdr_registration_) != 0) {
+                                              &nccl_gdr_registration_) != 0) {
         owned_nccl_transport_->shutdown();
         throw std::runtime_error("[EP] NCCL GDR buffer registration failed");
     }
@@ -377,8 +379,7 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
             topk_idx.data_ptr<int64_t>(), next_buffer.rdma_recv_signal_buffer,
             num_tokens, hidden, num_max_dispatch_tokens_per_rank, num_topk,
             num_experts, rank, num_ranks, use_fp8, workspace, launch_stream,
-            timeout_ticks, phases, active_qps_per_rank, single_qp_flush_,
-            progressive_qp_flush_, diagnostic_ptr);
+            timeout_ticks, phases, active_qps_per_rank);
     };
     if (return_recv_hook) {
         launcher(LOW_LATENCY_SEND_PHASE);
@@ -548,8 +549,7 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
             next_buffer.rdma_recv_signal_buffer, num_combined_tokens, hidden,
             num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank,
             num_ranks, workspace, launch_stream, timeout_ticks, phases,
-            zero_copy, active_qps_per_rank, single_qp_flush_,
-            progressive_qp_flush_, diagnostic_ptr);
+            zero_copy, active_qps_per_rank);
     };
     if (return_recv_hook) {
         launcher(LOW_LATENCY_SEND_PHASE);
