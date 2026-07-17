@@ -16,6 +16,7 @@ Typical single-node usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import time
 from dataclasses import dataclass
@@ -66,6 +67,11 @@ def parse_args() -> argparse.Namespace:
         "--sync-actual-count",
         action="store_true",
         help="Synchronize and verify GPU-side received-token count each iteration.",
+    )
+    parser.add_argument(
+        "--profile-kernels",
+        action="store_true",
+        help="Report selected CUDA kernel durations across all ranks.",
     )
     parser.add_argument("--seed", type=int, default=2026)
     return parser.parse_args()
@@ -250,14 +256,49 @@ def main() -> None:
     combine_ms = []
     recv_tokens = []
     wall_start = time.time()
-    for i in range(args.iters):
-        cached_handle, d_ms, c_ms, actual = run_one(args.warmup + i, cached_handle)
-        dispatch_ms.append(d_ms)
-        combine_ms.append(c_ms)
-        recv_tokens.append(actual)
+    profiler_context = (
+        torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CUDA],
+            record_shapes=False,
+            with_stack=False,
+            acc_events=True,
+        )
+        if args.profile_kernels
+        else contextlib.nullcontext()
+    )
+    with profiler_context as profiler:
+        for i in range(args.iters):
+            cached_handle, d_ms, c_ms, actual = run_one(
+                args.warmup + i, cached_handle
+            )
+            dispatch_ms.append(d_ms)
+            combine_ms.append(c_ms)
+            recv_tokens.append(actual)
     torch.cuda.synchronize()
     dist.barrier()
     wall_seconds = time.time() - wall_start
+
+    profiled_kernel_names = (
+        "hybrid_dispatch_impl",
+        "dispatch_copy_epilogue_impl",
+        "hybrid_combine_impl",
+        "combine_reduce_epilogue_impl",
+    )
+    kernel_profile = torch.zeros(
+        (len(profiled_kernel_names), 2), device="cuda", dtype=torch.float64
+    )
+    if args.profile_kernels:
+        for event in profiler.key_averages():
+            for index, kernel_name in enumerate(profiled_kernel_names):
+                if kernel_name not in event.key:
+                    continue
+                device_time_total = getattr(
+                    event,
+                    "self_device_time_total",
+                    getattr(event, "self_cuda_time_total", 0.0),
+                )
+                kernel_profile[index, 0] += device_time_total
+                kernel_profile[index, 1] += event.count
 
     stats = torch.tensor(
         [
@@ -275,6 +316,10 @@ def main() -> None:
     )
     gathered = [torch.empty_like(stats) for _ in range(world_size)]
     dist.all_gather(gathered, stats)
+    gathered_kernel_profile = [
+        torch.empty_like(kernel_profile) for _ in range(world_size)
+    ]
+    dist.all_gather(gathered_kernel_profile, kernel_profile)
 
     if rank == 0:
         table = torch.stack(gathered).cpu()
@@ -307,6 +352,22 @@ def main() -> None:
             f"combine_effective_GBps={payload_bytes / combine_avg_ms / 1e6:.2f}",
             flush=True,
         )
+        if args.profile_kernels:
+            kernel_table = torch.stack(gathered_kernel_profile).cpu()
+            for index, kernel_name in enumerate(profiled_kernel_names):
+                totals = kernel_table[:, index, 0]
+                counts = kernel_table[:, index, 1]
+                per_rank_us = totals / counts.clamp_min(1)
+                print(
+                    "MOONCAKE_ELASTIC_KERNEL_PROFILE",
+                    f"kernel={kernel_name}",
+                    f"avg_us={per_rank_us.mean().item():.2f}",
+                    f"critical_us={per_rank_us.max().item():.2f}",
+                    f"min_us={per_rank_us.min().item():.2f}",
+                    f"count_min={int(counts.min().item())}",
+                    f"count_max={int(counts.max().item())}",
+                    flush=True,
+                )
 
     dist.destroy_process_group()
 
