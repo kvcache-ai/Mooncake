@@ -476,6 +476,10 @@ void launch_elastic_dispatch_deterministic_prologue(
     // a separate kernel and does not call this CUDA cooperative prologue.
     TRY_PROLOGUE(0, 256, 8, 128, 24, 2);
     TRY_PROLOGUE(0, 256, 8, 128, 24, 8);
+#elif defined(MOONCAKE_EP_ELASTIC_B300_PERF_SHAPES_ONLY)
+    // B300 2x8 elastic perf sweep: hidden=7168, max_tokens=128, 40 SM,
+    // 4 channels/SM. Hidden is irrelevant for this prologue.
+    TRY_PROLOGUE(0, 256, 8, 128, 40, 8);
 #else
     // Common production MoE shapes; hidden is irrelevant for this prologue.
     TRY_PROLOGUE(0, 256, 8, 128, 24, 8);
@@ -629,9 +633,13 @@ void launch_mooncake_elastic_dispatch(
         TRY_HYBRID_DISPATCH(H, E, K, M, S, 2, 8, 7);                           \
         TRY_HYBRID_DISPATCH(H, E, K, M, S, 2, 8, 8)
 
+#ifdef MOONCAKE_EP_ELASTIC_B300_PERF_SHAPES_ONLY
+        TRY_HYBRID_DISPATCH(7168, 256, 8, 128, 40, 2, 8, 4);
+#else
         TRY_HYBRID_DISPATCH_SHAPE(4096, 256, 8, 128, 24);
         TRY_HYBRID_DISPATCH_SHAPE(7168, 256, 8, 128, 24);
         TRY_HYBRID_DISPATCH_SHAPE(7168, 256, 8, 128, 40);
+#endif
 
 #undef TRY_HYBRID_DISPATCH_SHAPE
 #undef TRY_HYBRID_DISPATCH
@@ -711,6 +719,8 @@ void launch_mooncake_elastic_dispatch(
                        static_cast<int>(sizeof(nv_bfloat16)), 0);
     TRY_DISPATCH_TYPED(4096, 256, 8, 128, 24, 8,
                        static_cast<int>(sizeof(nv_bfloat16)), 0);
+#elif defined(MOONCAKE_EP_ELASTIC_B300_PERF_SHAPES_ONLY)
+    TRY_DISPATCH(7168, 256, 8, 128, 40, 8);
 #else
     TRY_DISPATCH(4096, 256, 8, 128, 24, 8);
     TRY_DISPATCH(4096, 256, 8, 128, 24, 2);
@@ -794,9 +804,13 @@ void launch_mooncake_elastic_dispatch_copy_epilogue(
         TRY_HYBRID_DISPATCH_EPILOGUE(H, E, K, M, S, 2, 8, 7);                  \
         TRY_HYBRID_DISPATCH_EPILOGUE(H, E, K, M, S, 2, 8, 8)
 
+#ifdef MOONCAKE_EP_ELASTIC_B300_PERF_SHAPES_ONLY
+        TRY_HYBRID_DISPATCH_EPILOGUE(7168, 256, 8, 128, 40, 2, 8, 4);
+#else
         TRY_HYBRID_DISPATCH_EPILOGUE_SHAPE(4096, 256, 8, 128, 24);
         TRY_HYBRID_DISPATCH_EPILOGUE_SHAPE(7168, 256, 8, 128, 24);
         TRY_HYBRID_DISPATCH_EPILOGUE_SHAPE(7168, 256, 8, 128, 40);
+#endif
 
 #undef TRY_HYBRID_DISPATCH_EPILOGUE_SHAPE
 #undef TRY_HYBRID_DISPATCH_EPILOGUE
@@ -849,6 +863,8 @@ void launch_mooncake_elastic_dispatch_copy_epilogue(
                                 static_cast<int>(sizeof(nv_bfloat16)), 0);
     TRY_DISPATCH_EPILOGUE_TYPED(4096, 256, 8, 128, 24, 8,
                                 static_cast<int>(sizeof(nv_bfloat16)), 0);
+#elif defined(MOONCAKE_EP_ELASTIC_B300_PERF_SHAPES_ONLY)
+    TRY_DISPATCH_EPILOGUE(7168, 256, 8, 128, 40, 8);
 #else
     TRY_DISPATCH_EPILOGUE(4096, 256, 8, 128, 24, 8);
     TRY_DISPATCH_EPILOGUE(4096, 256, 8, 128, 24, 2);
@@ -924,9 +940,13 @@ void* launch_mooncake_elastic_combine(
         TRY_HYBRID_COMBINE(H, E, K, M, S, 2, 8, 7);                            \
         TRY_HYBRID_COMBINE(H, E, K, M, S, 2, 8, 8)
 
+#ifdef MOONCAKE_EP_ELASTIC_B300_PERF_SHAPES_ONLY
+        TRY_HYBRID_COMBINE(7168, 256, 8, 128, 40, 2, 8, 4);
+#else
         TRY_HYBRID_COMBINE_SHAPE(4096, 256, 8, 128, 24);
         TRY_HYBRID_COMBINE_SHAPE(7168, 256, 8, 128, 24);
         TRY_HYBRID_COMBINE_SHAPE(7168, 256, 8, 128, 40);
+#endif
 
 #undef TRY_HYBRID_COMBINE_SHAPE
 #undef TRY_HYBRID_COMBINE
@@ -1010,6 +1030,8 @@ void launch_mooncake_elastic_combine_reduce_epilogue(
 #ifdef MOONCAKE_EP_USE_MUSA
     TRY_COMBINE_EPILOGUE(4096, 256, 8, 128, 24, 1, 2);
     TRY_COMBINE_EPILOGUE(4096, 256, 8, 128, 24, 1, 8);
+#elif defined(MOONCAKE_EP_ELASTIC_B300_PERF_SHAPES_ONLY)
+    TRY_COMBINE_EPILOGUE(7168, 256, 8, 128, 40, 2, 8);
 #else
     TRY_COMBINE_EPILOGUE(4096, 256, 8, 128, 24, 1, 8);
     TRY_COMBINE_EPILOGUE(4096, 256, 8, 128, 24, 1, 2);

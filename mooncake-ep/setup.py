@@ -15,6 +15,14 @@ use_nccl_device = os.getenv("MOONCAKE_EP_USE_NCCL_DEVICE", "").upper() in {
     "TRUE",
     "YES",
 }
+use_b300_perf_shapes_only = os.getenv(
+    "MOONCAKE_EP_ELASTIC_B300_PERF_SHAPES_ONLY", ""
+).upper() in {
+    "1",
+    "ON",
+    "TRUE",
+    "YES",
+}
 if use_musa:
     try:
         import torchada  # noqa: F401
@@ -135,6 +143,11 @@ if use_nccl_device:
     ]
     cxx_args += nccl_defines
     device_args += nccl_defines
+
+if use_b300_perf_shapes_only:
+    shape_defines = ["-DMOONCAKE_EP_ELASTIC_B300_PERF_SHAPES_ONLY=1"]
+    cxx_args += shape_defines
+    device_args += shape_defines
 
 setup(
     name=module_name,
