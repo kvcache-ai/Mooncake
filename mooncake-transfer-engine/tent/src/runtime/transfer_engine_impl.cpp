@@ -2388,6 +2388,7 @@ Status TransferEngineImpl::unlockStageBuffer(uint64_t addr) {
 void TransferEngineImpl::recordTaskCompletionMetrics(
     TaskInfo& task, TransferStatusEnum prev_status,
     TransferStatusEnum new_status) {
+#if TENT_METRICS_ENABLED
     if (prev_status == PENDING && new_status != PENDING && !task.derived) {
         auto start_time = task.start_time;
         if (start_time.time_since_epoch().count() > 0) {
@@ -2402,7 +2403,6 @@ void TransferEngineImpl::recordTaskCompletionMetrics(
                     TentMetrics::instance().recordWriteCompleted(
                         task.request.length, latency_seconds);
                 }
-#if TENT_METRICS_ENABLED
                 // Causal chain stage decomposition
                 if (task.dispatch_time.time_since_epoch().count() > 0) {
                     double queue_wait_us =
@@ -2426,7 +2426,6 @@ void TransferEngineImpl::recordTaskCompletionMetrics(
                                                   transport_us);
                     }
                 }
-#endif
                 // Observability only (RFC #2519): if this transfer carried a
                 // deadline, emit the post-hoc feasibility ratio MLU =
                 // actual_transfer_time / available_window, where the window is
@@ -2449,17 +2448,16 @@ void TransferEngineImpl::recordTaskCompletionMetrics(
                 }
             } else if (new_status == FAILED) {
                 if (task.request.opcode == Request::READ) {
-                    TentMetrics::instance().recordReadFailed(
-                        task.request.length);
+                    TentMetrics::instance().recordReadFailed();
                 } else {
-                    TentMetrics::instance().recordWriteFailed(
-                        task.request.length);
+                    TentMetrics::instance().recordWriteFailed();
                 }
             }
             // Reset start_time to prevent duplicate recording
             task.start_time = std::chrono::steady_clock::time_point{};
         }
     }
+#endif  // TENT_METRICS_ENABLED
 }
 
 }  // namespace tent

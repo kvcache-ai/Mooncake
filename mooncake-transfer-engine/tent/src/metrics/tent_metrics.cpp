@@ -292,7 +292,7 @@ void TentMetrics::recordStageLatency(Stage stage, double latency_us) {
     }
 }
 
-void TentMetrics::recordReadFailed(size_t bytes) {
+void TentMetrics::recordReadFailed() {
     // Fast path: check runtime switch first
     if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
         return;
@@ -301,7 +301,7 @@ void TentMetrics::recordReadFailed(size_t bytes) {
     read_requests_total_.inc();  // Count failed requests too
 }
 
-void TentMetrics::recordWriteFailed(size_t bytes) {
+void TentMetrics::recordWriteFailed() {
     // Fast path: check runtime switch first
     if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
         return;
@@ -444,8 +444,8 @@ void TentMetrics::shutdown() { initialized_ = false; }
 
 void TentMetrics::recordReadCompleted(size_t, double) {}
 void TentMetrics::recordWriteCompleted(size_t, double) {}
-void TentMetrics::recordReadFailed(size_t) {}
-void TentMetrics::recordWriteFailed(size_t) {}
+void TentMetrics::recordReadFailed() {}
+void TentMetrics::recordWriteFailed() {}
 void TentMetrics::recordTransportFailover() {}
 void TentMetrics::recordDeadlineMLU(double) {}
 void TentMetrics::recordStageLatency(Stage, double) {}

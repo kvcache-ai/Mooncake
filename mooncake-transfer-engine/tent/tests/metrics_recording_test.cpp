@@ -361,8 +361,8 @@ TEST_F(MetricsRecordingTest, CompletedTransferRecordsBytesAndLatency) {
 TEST_F(MetricsRecordingTest, FailedTransferCountsFailureNotBytes) {
     auto before = MetricsSnapshot(TentMetrics::instance());
 
-    TentMetrics::instance().recordReadFailed(4096);
-    TentMetrics::instance().recordWriteFailed(8192);
+    TentMetrics::instance().recordReadFailed();
+    TentMetrics::instance().recordWriteFailed();
 
     auto after = MetricsSnapshot(TentMetrics::instance());
 

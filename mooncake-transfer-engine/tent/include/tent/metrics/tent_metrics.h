@@ -77,8 +77,8 @@ class TentMetrics {
     // Record transfer operations
     void recordReadCompleted(size_t bytes, double latency_seconds = 0.0);
     void recordWriteCompleted(size_t bytes, double latency_seconds = 0.0);
-    void recordReadFailed(size_t bytes);
-    void recordWriteFailed(size_t bytes);
+    void recordReadFailed();
+    void recordWriteFailed();
     void recordTransportFailover();
 
     // Record the deadline feasibility ratio (MLU) for a completed transfer
@@ -264,9 +264,9 @@ class ScopedLatencyRecorder {
         if (!enabled_) return;  // Skip if disabled
         failed_ = true;
         if (type_ == OperationType::Read) {
-            TentMetrics::instance().recordReadFailed(bytes_);
+            TentMetrics::instance().recordReadFailed();
         } else {
-            TentMetrics::instance().recordWriteFailed(bytes_);
+            TentMetrics::instance().recordWriteFailed();
         }
     }
 
@@ -295,19 +295,18 @@ class ScopedLatencyRecorder {
         }                                                                   \
     } while (0)
 
-#define TENT_RECORD_READ_FAILED(bytes)                                         \
-    do {                                                                       \
-        if (::mooncake::tent::TentMetrics::isEnabled()) {                      \
-            ::mooncake::tent::TentMetrics::instance().recordReadFailed(bytes); \
-        }                                                                      \
+#define TENT_RECORD_READ_FAILED()                                         \
+    do {                                                                  \
+        if (::mooncake::tent::TentMetrics::isEnabled()) {                 \
+            ::mooncake::tent::TentMetrics::instance().recordReadFailed(); \
+        }                                                                 \
     } while (0)
 
-#define TENT_RECORD_WRITE_FAILED(bytes)                                  \
-    do {                                                                 \
-        if (::mooncake::tent::TentMetrics::isEnabled()) {                \
-            ::mooncake::tent::TentMetrics::instance().recordWriteFailed( \
-                bytes);                                                  \
-        }                                                                \
+#define TENT_RECORD_WRITE_FAILED()                                         \
+    do {                                                                   \
+        if (::mooncake::tent::TentMetrics::isEnabled()) {                  \
+            ::mooncake::tent::TentMetrics::instance().recordWriteFailed(); \
+        }                                                                  \
     } while (0)
 
 #define TENT_RECORD_TRANSPORT_FAILOVER()                  \
@@ -348,8 +347,8 @@ class ScopedLatencyRecorder {
 // Zero-overhead macros when metrics are disabled at compile time
 #define TENT_RECORD_READ_COMPLETED(bytes, latency) ((void)0)
 #define TENT_RECORD_WRITE_COMPLETED(bytes, latency) ((void)0)
-#define TENT_RECORD_READ_FAILED(bytes) ((void)0)
-#define TENT_RECORD_WRITE_FAILED(bytes) ((void)0)
+#define TENT_RECORD_READ_FAILED() ((void)0)
+#define TENT_RECORD_WRITE_FAILED() ((void)0)
 #define TENT_RECORD_TRANSPORT_FAILOVER() ((void)0)
 #define TENT_SCOPED_READ_LATENCY(bytes) ((void)0)
 #define TENT_SCOPED_WRITE_LATENCY(bytes) ((void)0)
