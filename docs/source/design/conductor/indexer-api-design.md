@@ -1,521 +1,392 @@
-# Mooncake Conductor Indexer API
+# Mooncake Conductor HTTP API
 
-## Overview
+[中文](../../zh/design/conductor/indexer-api-design.md)
 
-Mooncake Conductor is a KV cache indexer used by routers and gateways to make
-cache-aware scheduling decisions. It consumes KV cache events from inference
-engines or storage backends, maintains prefix-hit metadata across cache tiers,
-and exposes HTTP APIs for service registration and cache-hit queries.
+This reference describes the five HTTP endpoints implemented by the current
+C++ Conductor service. Use it to register live event sources, remove them,
+inspect Conductor's in-memory state, and query reusable cache prefixes. Field
+names, allowed values, response casing, and error formats below follow the
+current parser and serializer.
 
-This document incorporates the latest API direction from:
+## Choose an endpoint
 
-- [RFC #1403: Mooncake KV-Store Indexer API Standardization](https://github.com/kvcache-ai/Mooncake/issues/1403)
-- [RFC #1527: KV Events API Standardization](https://github.com/kvcache-ai/Mooncake/issues/1527)
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/register` | Start one vLLM or Mooncake event subscription. |
+| `POST` | `/unregister` | Stop one subscription and clean up that endpoint's cache information. |
+| `POST` | `/query` | Query cache availability from prompt token IDs. |
+| `GET` | `/global_view` | Inspect cache-sharing groups and registered vLLM ranks. |
+| `GET` | `/services` | List active event subscriptions and their exact configuration. |
 
-The Conductor can serve multiple model groups in one process. Each query is
-scoped by model identity, block size, LoRA identity, tenant isolation, and the
-registered instance that can receive traffic.
+## Common request and response rules
 
-## Concepts
+All `POST` bodies are JSON objects. Unknown fields are rejected. Successful
+responses use `application/json`; JSON object key order is not part of the
+contract.
 
-### Storage tiers
-
-The indexer tracks KV cache availability across three logical tiers:
-
-- **G1, Device Pool**: Device-resident KV blocks, such as GPU, NPU, HBM, or
-  other accelerator memory owned by inference engines.
-- **G2, Host Pool**: CPU or host DRAM KV blocks, including Mooncake registered
-  memory pools.
-- **G3, Disk Pool**: SSD, 3FS, DFS, NFS, or other disk-backed KV storage.
-
-The `medium` field identifies the concrete tier or device type. Common values
-are `gpu`, `cpu`, and `disk`. Engines may add other values as new media are
-supported.
-
-### Identity dimensions
-
-KV cache hits are interpreted under the following dimensions:
-
-| Dimension | Description |
-|---|---|
-| `model_name` or `model` | Model identifier. KV blocks from different models are incompatible. |
-| `block_size` | Number of tokens per KV block. Different block sizes produce different token-to-block mappings. |
-| `additional_salt` | Opaque salt used to separate hash namespaces for quantization, model revision, tenant isolation, or other deployment-specific dimensions. |
-|`cache_salt`| Ensure cached data blocks are kept separate for different customers|
-| `lora_name` | LoRA adapter name. Empty or `null` means the base model. |
-| `tenant_id` | Upstream tenant or customer identity. Used for isolation and to keep query output bounded. |
-| `instance_id` | Routable API server or engine instance returned by the Indexer API. Routers use this value as the scheduling target. |
-| `backend_id` | KV Events identity for the entity that owns the KV blocks. It may be an inference worker, a Mooncake storage daemon, or another cache backend. |
-| `medium` | Cache medium where the blocks are present. |
-| `dp_rank` | Data-parallel rank that owns or can serve the blocks. |
-
-`instance_id` and `backend_id` intentionally have different meanings.
-`instance_id` is the router-facing target in the Indexer API. `backend_id` is
-the event-facing cache owner in the KV Events API. In deployments where cache
-storage is decoupled from inference workers, `backend_id` can identify a cache
-daemon while `instance_id` still identifies the engine endpoint that receives
-requests.
-
-## Hashing standard
-
-The standardized event contract recommends **XXH3-64 with seed `S`**.
-
-- **Local block hash**:
-  `XXH3(token_bytes_le, S)`, where tokens are little-endian `u32` values
-  concatenated for one block.
-- **Rolling sequence hash**:
-  The first block uses `seq_hash[0] = local_block_hash[0]`. Each subsequent
-  block uses:
-
-  ```text
-  seq_hash[i] = XXH3(seq_hash[i-1]_le || local_block_hash[i]_le, S)
-  ```
-
-  Here `||` means byte concatenation, not a logical OR.
-
-All hashes used by the standardized KV Events API are rolling sequence hashes.
-A `seq_hash` identifies the whole prefix up to that block depth, so equal
-prefixes produce equal hashes until the first differing block.
-
-If an engine does not follow the standardized hashing scheme, it must provide
-`token_ids` in `stored` events so the consumer can recompute the indexer's hash
-representation.
-
-## HTTP APIs
-
-### `POST /register`
-
-Registers a KV event publisher and starts consuming events from it.
+Most validation failures return status `400` with an
+`application/json` object:
 
 ```json
 {
-  "endpoint": "tcp://1.1.1.1:5557",
-  "replay_endpoint": "tcp://1.1.1.1:5558",
-  "type": "vLLM",
-  "modelname": "deepseek",
-  "lora_name": "sql-adapter",
-  "tenant_id": "default",
-  "instance_id": "vllm-prefill-node1",
-  "block_size": 128,
-  "dp_rank": 0,
-  "additionalsalt": "w8a8"
+  "error": "unsupported request field: root_digest",
+  "reason": "unknown_field",
+  "field": "root_digest"
 }
 ```
 
-| Field | Required | Description |
-|---|---|---|
-| `endpoint` | Yes | ZMQ KV event publisher endpoint. |
-| `replay_endpoint` | No | ZMQ replay endpoint used to recover missed events. |
-| `type` | Yes | Publisher type, such as `vLLM`, `SGLang`, or `Mooncake`. |
-| `modelname` | Yes | Model name for this publisher. This is the HTTP API wire name for `model_name`. |
-| `lora_name` | No | LoRA adapter name. Empty or omitted means base model. |
-| `tenant_id` | No | Tenant identity. Defaults to `default`. |
-| `instance_id` | Yes | Router-facing engine or API server instance identity. |
-| `block_size` | Yes | KV block size in tokens. |
-| `dp_rank` | Yes | Data-parallel rank for this publisher. |
-| `additionalsalt` | No | HTTP API wire name for `additional_salt`. Defaults to an empty string. |
+`field` is present when one field caused the error. `index` is also present
+when one array element caused it. The [error formats](#understand-errors)
+section lists the cases that return plain text instead.
 
-Successful response:
+## `POST /register`
+
+This endpoint starts one event subscription. Register each vLLM data-parallel
+(DP) rank with a separate endpoint. A Mooncake subscription supplies shared CPU or Disk
+information but does not create an inference-instance row in `/query`.
+
+### Request fields
+
+| Field | Required | Accepted value and when it matters |
+|---|---|---|
+| `endpoint` | Yes | Non-empty ZeroMQ live-publisher endpoint. It must not already belong to another active registration. |
+| `type` | Yes | Exactly `vLLM` or `Mooncake`. It decides which event message format Conductor reads. |
+| `modelname` | Yes | Non-empty registered model name. It defines vLLM context; Mooncake events carry the model that selects their actual shared context. |
+| `instance_id` | Yes | Non-empty inference engine name for vLLM, or subscription name for Mooncake. It is part of the service key; a Mooncake value does not become a query instance. |
+| `block_size` | Yes | Positive registered token count per block. It defines vLLM context; Mooncake events carry their actual block size. |
+| `dp_rank` | Yes | Integer from `0` through the platform's maximum `int`. It selects the vLLM DP rank and is part of every service key; for Mooncake it is subscription identity only. |
+| `hash_profile` | Yes | Object containing all four supported hash fields described below. |
+| `replay_endpoint` | No | String endpoint used after a reconnect to ask for missed events. Defaults to `""`, which disables the replay socket. |
+| `lora_name` | No | Registered Low-Rank Adaptation (LoRA) adapter name, default `""`. It defines vLLM context; Mooncake events carry their actual LoRA name. |
+| `tenant_id` | No | Registered tenant name. Omitted or `""` becomes `"default"`. It defines vLLM context and the service key; Mooncake events carry their actual tenant. |
+| `cache_group` | No | Integer `0` or `null`. Omission also means no explicit group. Other values and arrays are rejected. |
+
+The only supported `hash_profile` shape is:
+
+| Hash field | Supported value |
+|---|---|
+| `strategy` | `vllm_v1` |
+| `algorithm` | `sha256_cbor` |
+| `python_hash_seed` | String containing exactly `random` or ASCII decimal text whose numeric value is in `0..4294967295`. The original accepted text, including leading zeroes, is preserved. |
+| `index_projection` | `low64_be` |
+
+The input object must contain exactly those four fields. Empty, signed,
+whitespace-padded, non-string, invalid UTF-8, and out-of-range seeds are
+rejected. `"0"` and `"00"` are distinct; numeric JSON `0` is invalid.
+Registration-time `root_digest` is a legacy unknown field and is rejected.
+
+Each four-field cache-sharing group must use one identical resolved hash
+profile. For vLLM those fields come from registration; for Mooncake they come
+from each event, while the profile comes from the Mooncake registration.
+Conductor canonical-CBOR encodes the exact seed text and calculates SHA-256 to
+derive the root. The exact text must match `PYTHONHASHSEED` on every compatible
+vLLM process. The explicit string `random` is supported, but leaving the
+environment variable unset makes vLLM choose random root bytes that Conductor
+cannot reproduce and is unsupported. vLLM `--seed` controls model and sampling
+randomness, not prefix-cache hash identity.
+
+See [how token blocks become lookup values](./conductor-architecture-design.md#how-token-blocks-become-lookup-values)
+for the canonical Concise Binary Object Representation (CBOR) input order,
+LoRA-before-`cache_salt` ordering, complete parent-digest chaining,
+final-eight-byte big-endian lookup rule, and labelled golden vector.
+`cache_salt` is a query field, not a registration field.
+Mooncake event `additional_salt` is diagnostic and is not accepted by this
+HTTP endpoint.
+
+### Minimal request
+
+```bash
+curl -sS -X POST http://127.0.0.1:13333/register \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "endpoint": "tcp://127.0.0.1:5557",
+    "type": "vLLM",
+    "modelname": "test-model",
+    "instance_id": "engine-a",
+    "block_size": 16,
+    "dp_rank": 0,
+    "hash_profile": {
+      "strategy": "vllm_v1",
+      "algorithm": "sha256_cbor",
+      "python_hash_seed": "0",
+      "index_projection": "low64_be"
+    }
+  }'
+```
+
+Status `200` returns:
 
 ```json
 {
   "status": "registered successfully",
-  "instance_id": "vllm-prefill-node1"
+  "instance_id": "engine-a"
 }
 ```
 
-### `POST /unregister`
+Submitting the exact same active registration again returns the same success
+without starting another subscriber. A conflicting service key, endpoint, or
+hash profile returns a JSON `400` with `reason` `invalid_registration`.
+Failure to start the local subscription client returns plain-text `500`.
 
-Stops consuming events for a registered publisher.
+## `POST /unregister`
 
-```json
-{
-  "type": "vLLM",
-  "modelname": "deepseek",
-  "lora_name": "sql-adapter",
-  "tenant_id": "default",
-  "instance_id": "vllm-prefill-node1",
-  "block_size": 128,
-  "dp_rank": 0
-}
+This endpoint stops one exact subscription. It waits for that subscriber to
+stop before removing cache information contributed by its endpoint.
+
+### Request fields
+
+| Field | Required | Accepted value and when it matters |
+|---|---|---|
+| `instance_id` | Yes | Non-empty string used when the source was registered. |
+| `dp_rank` | Yes | Non-negative integer rank used when the source was registered. |
+| `tenant_id` | No | String used when the source was registered. Omitted or `""` becomes `"default"`. |
+
+No other fields are accepted.
+
+### Minimal request
+
+```bash
+curl -sS -X POST http://127.0.0.1:13333/unregister \
+  -H 'Content-Type: application/json' \
+  -d '{"instance_id":"engine-a","dp_rank":0}'
 ```
 
-`tenant_id` defaults to `default`. The current implementation removes the
-subscription identified by `(instance_id, tenant_id, dp_rank)`.
-
-Successful response:
+Status `200` returns the exact service key that was removed:
 
 ```json
 {
   "status": "unregistered successfully",
-  "removed_instances": ["vllm-prefill-node1|default|0"]
+  "removed_instances": [
+    "engine-a|default|0"
+  ]
 }
 ```
 
-### `POST /query`
+An unknown service key returns plain-text status `404`. A cleanup failure after
+the subscriber stops returns plain-text status `500`. Conductor keeps that
+service key and endpoint reserved, so neither can be registered again. Retry
+the same `/unregister` request until cleanup succeeds.
 
-Query cache hits by token IDs.
+## `POST /query`
 
-```json
-{
-  "model": "deepseek",
-  "lora_name": "sql-adapter",
-  "token_ids": [101, 15, 100, 55, 89],
-  "tenant_id": "default",
-  "instance_id": "vllm-prefill-node1",
-  "block_size": 64,
-  "cache_salt": "w8a8"
-}
-```
+This endpoint hashes complete token blocks with the profile already registered
+for the requested tenant, model, LoRA name, and block size. The request cannot
+override the strategy, algorithm, `python_hash_seed`, derived root digest, or
+final-eight-byte lookup rule.
 
-| Field | Required | Description |
+### Request fields
+
+| Field | Required | Accepted value and when it matters |
 |---|---|---|
-| `model` | Yes | Model name. |
-| `lora_name` | No | LoRA adapter name. Empty or omitted means base model. |
-| `lora_id` | No | Deprecated compatibility field. Do not use together with `lora_name`. |
-| `token_ids` | Yes | Prompt token IDs. Only complete blocks are considered. |
-| `tenant_id` | No | Tenant identity. Defaults to `default`. |
-| `instance_id` | No | If set, query one instance. If omitted, query all instances registered under the tenant. |
-| `block_size` | Yes | KV block size in tokens. |
-| `cache_salt` | No | Query-side hash namespace salt. Corresponds to the event `additional_salt` concept. |
+| `model` | Yes | Non-empty model name. It must match registration `modelname`. |
+| `block_size` | Yes | Positive integer. Only complete groups of this many tokens are hashed. |
+| `token_ids` | Yes | JSON array of signed 32-bit integers. An empty array is valid and reports zero hits for compatible registered ranks. |
+| `tenant_id` | No | String. Omitted or `""` becomes `"default"`. |
+| `lora_name` | No | String. Defaults to `""` for the base model. |
+| `cache_salt` | No | String, `null`, or omitted. `null`, `""`, and omission all select the no-salt hash path; a non-empty value must match the producer. |
+| `instance_id` | No | String filter. A matching registered instance is returned alone; an unknown value returns an empty `instances` object. |
 
-Response:
+No hash-profile override fields are accepted. A missing cache-sharing group
+also returns status `200` with an empty `instances` object and does not create
+state.
+
+### Minimal request
+
+```bash
+curl -sS -X POST http://127.0.0.1:13333/query \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "test-model",
+    "block_size": 16,
+    "token_ids": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+  }'
+```
+
+If `engine-a` rank `0` is registered and no matching cache event has arrived,
+the response is:
 
 ```json
 {
-  "default": {
-    "vllm-prefill-node1": {
-      "longest_matched": 256,
-      "GPU": 128,
-      "DP": {
-        "0": 128,
-        "1": 256
+  "instances": {
+    "engine-a": {
+      "longest_matched": 0,
+      "dp": {
+        "0": 0
       },
-      "CPU": 256,
-      "DISK": 0
+      "gpu": 0,
+      "cpu": 0,
+      "disk": 0
     }
   }
 }
 ```
 
-| Field | Description |
+### Result fields
+
+| Field | Meaning |
 |---|---|
-| `longest_matched` | Longest continuous prefix hit in tokens across all tracked media and DP ranks for this instance. |
-| `GPU`, `CPU`, `DISK` | Matched prefix tokens available on each medium. Names are examples; future media can be added. |
-| `DP` | Matched prefix tokens grouped by data-parallel rank. |
+| `instances` | Map keyed by selected registered vLLM `instance_id`. Mooncake subscriptions are not result rows. |
+| `longest_matched` | Largest consecutive token count one rank can serve using its GPU plus compatible shared CPU or Disk blocks. |
+| `dp` | Per-rank consecutive GPU token count. Rank keys are decimal JSON strings. |
+| `gpu` | Maximum consecutive GPU token count among this engine's ranks. |
+| `cpu` | Independent consecutive shared CPU token count starting at the first block. |
+| `disk` | Independent consecutive shared Disk token count starting at the first block. |
 
-### `POST /query_by_hash`
-
-Queries cache hits by precomputed rolling sequence hashes. This API avoids
-sending long token lists over the network.
-
-```json
-{
-  "model": "deepseek",
-  "lora_name": "sql-adapter",
-  "seq_hashes": [1234567890, 9876543210],
-  "tenant_id": "default",
-  "instance_id": "vllm-prefill-node1",
-  "block_size": 64,
-  "cache_salt": "w8a8"
-}
-```
-
-For compatibility with earlier drafts, clients may call the hash list
-`block_hash`, but new clients should use `seq_hashes` to make it explicit that
-the values are rolling sequence hashes rather than local block hashes.
-
-The response shape is the same as `/query`. For this API,
-`longest_matched = block_size * matched_hash_count`.
-
-
-## KV Events API
-
-The KV Events API is the wire contract between cache owners and indexers.
-Conductor normalizes engine-specific events into this model.
-
-### Event envelope
-
-Every standardized event carries the same envelope:
+For the current HTTP test state, instance `1` rank `0` has a 32-token GPU
+prefix, instance `2` rank `1` has none, and both see 48-token shared CPU and
+Disk prefixes. The exact response is:
 
 ```json
 {
-  "event_id": 42,
-  "timestamp": 1739145600000,
-  "event_type": "stored",
-  "model_name": "llama-3.1-8b",
-  "block_size": 64,
-  "additional_salt": null,
-  "lora_name": null,
-  "tenant_id": "default",
-  "backend_id": "worker-0",
-  "medium": "gpu",
-  "dp_rank": 0
+  "instances": {
+    "1": {
+      "longest_matched": 48,
+      "gpu": 32,
+      "dp": {
+        "0": 32
+      },
+      "cpu": 48,
+      "disk": 48
+    },
+    "2": {
+      "longest_matched": 48,
+      "gpu": 0,
+      "dp": {
+        "1": 0
+      },
+      "cpu": 48,
+      "disk": 48
+    }
+  }
 }
 ```
 
-| Field | Type | Description |
+See [what query fields mean](./conductor-architecture-design.md#what-query-fields-mean)
+for the continuity and per-rank rules.
+
+## `GET /global_view`
+
+This endpoint shows the cache-sharing groups known to this Conductor process.
+It takes no request body.
+
+### Minimal request
+
+```bash
+curl -sS http://127.0.0.1:13333/global_view
+```
+
+After registering `engine-a` ranks `0` and `1`, before cache events arrive, a
+one-context response has this shape:
+
+```json
+{
+  "context_count": 1,
+  "contexts": [
+    {
+      "model_name": "test-model",
+      "lora_name": "",
+      "block_size": 16,
+      "tenant_id": "default",
+      "prefix_count": 0,
+      "hash_profile": {
+        "strategy": "vllm_v1",
+        "algorithm": "sha256_cbor",
+        "python_hash_seed": "0",
+        "root_digest": "4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e",
+        "index_projection": "low64_be"
+      },
+      "instances": {
+        "engine-a": [
+          0,
+          1
+        ]
+      }
+    }
+  ]
+}
+```
+
+`context_count` is the number of entries in `contexts`. `prefix_count` counts
+distinct final-eight-byte lookup values that still have at least one GPU, CPU,
+or Disk record. `instances` maps registered vLLM engines to numeric rank
+arrays; Mooncake subscriptions are not added to this map. Context array order
+is not guaranteed. The resolved `hash_profile` reports the exact configured
+seed and its derived lowercase root together.
+
+## `GET /services`
+
+This endpoint lists active subscription configurations. It takes no request
+body. Field names intentionally use the casing shown below, which differs from
+the register request.
+
+### Minimal request
+
+```bash
+curl -sS http://127.0.0.1:13333/services
+```
+
+After the minimal register example, status `200` returns:
+
+```json
+{
+  "count": 1,
+  "services": [
+    {
+      "Endpoint": "tcp://127.0.0.1:5557",
+      "ReplayEndpoint": "",
+      "Type": "vLLM",
+      "ModelName": "test-model",
+      "LoraName": "",
+      "TenantID": "default",
+      "InstanceID": "engine-a",
+      "BlockSize": 16,
+      "DPRank": 0,
+      "CacheGroup": null,
+      "HashProfile": {
+        "strategy": "vllm_v1",
+        "algorithm": "sha256_cbor",
+        "python_hash_seed": "0",
+        "root_digest": "4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e",
+        "index_projection": "low64_be"
+      }
+    }
+  ]
+}
+```
+
+`count` is the number of active service keys. `CacheGroup` is `null` when the
+register request omitted it. Service array order is not guaranteed.
+Registration appearing here confirms local subscription setup, not remote
+event delivery or recovery of earlier events. Compare both
+`python_hash_seed` and derived `root_digest` with `/global_view` before sending
+cache-producing traffic.
+
+## Understand errors
+
+Conductor deliberately uses both JSON validation errors and plain-text
+operational errors:
+
+| Situation | Status | Content type and body |
 |---|---|---|
-| `event_id` | `u64` | Monotonically increasing sequence number scoped by the event stream dimensions. Authoritative for ordering. |
-| `timestamp` | `u64 or null` | Unix epoch milliseconds. Informational only, not used for ordering. |
-| `event_type` | `string` | One of `stored`, `removed`, or `cleared`. |
-| `model_name` | `string or null` | Model identifier. |
-| `block_size` | `u32 or null` | Tokens per block. |
-| `additional_salt` | `string or null` | Opaque deployment salt or namespace. |
-| `lora_name` | `string or null` | LoRA adapter name, or `null` for the base model. |
-| `tenant_id` | `string` | Tenant or customer identity. |
-| `backend_id` | `string` | Entity that owns the KV blocks. This can be an engine worker or a decoupled cache daemon. |
-| `medium` | `string or null` | Cache medium such as `gpu`, `cpu`, or `disk`. |
-| `dp_rank` | `u32 or null` | Data-parallel rank. |
+| Field validation for any `POST` endpoint | `400` | `application/json` with `error`, `reason`, and applicable `field` or `index`. |
+| Malformed `/query` JSON or a non-object body | `400` | `application/json` with `{"error":"Invalid JSON object","reason":"invalid_json"}`. |
+| Malformed `/register` or `/unregister` JSON, or a non-object body | `400` | `text/plain; charset=utf-8` with `Invalid JSON\n`. |
+| `/unregister` service key not found | `404` | `text/plain; charset=utf-8`, for example `service not found: engine-a\|default\|0\n`. |
+| `GET` on `/register`, `/unregister`, or `/query`; `POST` on `/global_view` or `/services` | `405` | `text/plain; charset=utf-8` with `Method not allowed\n`. |
+| `/register` cannot start the local subscription client | `500` | `text/plain; charset=utf-8` beginning `Failed to subscribe: failed to start ZMQ client:`. |
+| `/unregister` stops the subscriber but cache cleanup fails | `500` | `text/plain; charset=utf-8` beginning `Failed to unregister prefix context:`. |
 
-Events must be processed in consecutive `event_id` order within each stream
-identified by `(model_name, block_size, additional_salt, lora_name, tenant_id,
-backend_id, medium, dp_rank)`.
-
-### `stored`
-
-Published when one or more consecutive blocks are committed to a KV cache.
+For example, a string in `token_ids` produces an element-specific JSON error:
 
 ```json
 {
-  "event_id": 42,
-  "timestamp": 1739145600000,
-  "event_type": "stored",
-  "model_name": "llama-3.1-8b",
-  "block_size": 64,
-  "additional_salt": null,
-  "lora_name": null,
-  "tenant_id": "default",
-  "backend_id": "worker-0",
-  "medium": "gpu",
-  "dp_rank": 0,
-  "seq_hashes": [1234567890, 9876543210, 1122334455],
-  "base_block_idx": 5,
-  "parent_hash": 9999999999,
-  "token_ids": null
+  "error": "token_ids element must be a JSON integer",
+  "reason": "invalid_type",
+  "field": "token_ids",
+  "index": 0
 }
 ```
 
-| Field | Type | Description |
-|---|---|---|
-| `seq_hashes` | `u64[]` | Rolling sequence hashes of consecutive stored blocks. |
-| `base_block_idx` | `u32 or null` | Zero-based depth of the first block in this event. |
-| `parent_hash` | `u64 or null` | Rolling sequence hash at depth `base_block_idx - 1`; `null` at the root. |
-| `token_ids` | `u32[] or null` | Tokens across all blocks in this event. Required when the publisher does not use the standardized hash. |
-
-At least one of `base_block_idx` or `parent_hash` must be present so the
-consumer can locate the blocks in the sequence.
-
-### `removed`
-
-Published when one or more blocks are evicted.
-
-```json
-{
-  "event_id": 43,
-  "timestamp": 1739145601000,
-  "event_type": "removed",
-  "model_name": "llama-3.1-8b",
-  "block_size": 64,
-  "additional_salt": null,
-  "lora_name": null,
-  "tenant_id": "default",
-  "backend_id": "worker-0",
-  "medium": "gpu",
-  "dp_rank": 0,
-  "seq_hashes": [1122334455],
-  "base_block_idx": 7
-}
-```
-
-`seq_hashes` is required. `base_block_idx` is optional but recommended for
-collision detection and observability.
-
-### `cleared`
-
-Published when all blocks for the event stream dimensions are purged.
-
-```json
-{
-  "event_id": 44,
-  "timestamp": 1739145602000,
-  "event_type": "cleared",
-  "model_name": "llama-3.1-8b",
-  "block_size": 64,
-  "additional_salt": null,
-  "lora_name": null,
-  "tenant_id": "default",
-  "backend_id": "worker-0",
-  "medium": "gpu",
-  "dp_rank": 0
-}
-```
-
-No additional payload fields are required.
-
-## Compatibility notes
-
-The current Conductor implementation consumes vLLM ZMQ msgpack batches and
-normalizes `BlockStored` and `BlockRemoved` into the internal prefix index.
-Registration metadata supplies fields such as `modelname`, `tenant_id`,
-`instance_id`, `block_size`, and `additionalsalt` when the engine event does
-not carry the full standardized envelope.
-
-### Mooncake Store master publisher
-
-`mooncake_master` can optionally publish RFC #1527 events when
-`enable_kv_events=true`. The publisher binds a ZMQ PUB socket
-(`kv_events_bind_endpoint`) and emits the same three-frame batch format used by
-vLLM/SGLang: empty topic, big-endian sequence number, and a msgpack payload
-`[timestamp, [events], dp_rank]`.
-
-**Per-block events with fixed publisher context.** Per the
-[Dynamo KV Events for Custom Engines](https://docs.nvidia.com/dynamo/kv-managers/kv-events-for-custom-engines)
-model, each event describes one or more **KV cache blocks** (`seq_hashes`,
-`token_ids`, `parent_hash`, eviction hashes). The master emits one event per
-Mooncake object key and available medium; each key is treated as one pooled
-block. Block identity and available model context come from the object key.
-Keys generated by the vLLM connectors encode model, parallel-rank
-namespaces, KV group, and a hexadecimal prefix hash. The master extracts the
-model and low 64 bits of the hash while retaining the complete digest in
-`connector_block_hash` and the complete key in `object_key`.
-The master always supplies per-object `tenant_id` and `medium`. A deployment
-uses one Publisher for one fixed model, block-size, LoRA, salt, and DP context,
-so the master fills those envelope fields from `kv_events_*` configuration.
-The key-derived model takes precedence over the configured fallback. Parent
-hash, token IDs, and block depth remain unset because neither the connector key
-nor publisher config contains them.
-
-An Upsert of an existing object is represented as `removed` when the old value
-becomes unreadable, followed by `stored` for every completed medium after the
-new value commits. There is no separate update event type.
-
-Publisher-level config includes transport and stream identity plus the fixed
-model context: `kv_events_bind_endpoint`, `kv_events_backend_id`,
-`kv_events_model_name`, `kv_events_block_size`,
-`kv_events_additional_salt`, `kv_events_lora_name`, and `kv_events_dp_rank`.
-Optional compat flags are `kv_events_emit_object_key` and
-`kv_events_emit_legacy_compat`. Per-object tenant identity is not replaced by
-the global `kv_events_tenant_id` compatibility setting.
-
-Each event map uses RFC #1527 field names (`event_type`, `seq_hashes`,
-`backend_id`, `medium`, and so on). When `kv_events_emit_object_key` is enabled
-(default), the map also includes `object_key` with the Mooncake store key so
-Dynamo and other consumers can match on `sha256` + Mooncake key format without
-requiring decimal/`0x` `seq_hash` encoding. When `kv_events_emit_legacy_compat`
-is enabled (default), the map also includes aliases such as `type` and
-`block_hashes`. These aliases ease field mapping but do not make the master map
-payload wire-compatible with vLLM's positional event arrays; a decoder adapter
-is still required.
-
-Recognized connector keys end in a hexadecimal rolling prefix hash. Simple
-object keys may instead encode a decimal or `0x`-prefixed u64. When no hash can
-be parsed, events are still published if `kv_events_emit_object_key=true` (with
-an empty `seq_hashes` array). Configure
-`backend_id` to identify the cache owner (for example a per-node storage
-daemon) and register the bind endpoint with the indexer using publisher type
-`Mooncake`.
-
-`connector_block_hash` is a Mooncake extension containing the complete
-hexadecimal connector digest; `seq_hashes` and legacy `block_hashes` remain
-u64 arrays. Recognized keys may also expose `cache_prefix`, `tp_rank` or
-`head_or_tp_rank`, `pcp_rank`, `dcp_rank`, `pp_rank`, and `layer_id`.
-`cache_prefix` is a deployment namespace rather than request
-`additional_salt`, and none of the connector rank fields is `dp_rank`.
-Connector keys carry neither parent linkage nor block depth, so the master
-emits both `parent_hash` and `base_block_idx` as nil.
-
-See the [KV Event publisher design](../kv-event/index) for connector key
-formats, publication points, and medium transition rules.
-
-### Field provenance matrix (SGLang vs master vs indexer registration)
-
-In decoupled deployments (inference workers + Mooncake host/disk pool), the
-global KV indexer merges **three sources of truth**. Use this table when
-splitting publishers or writing PR/integration notes.
-
-**Legend**
-
-| Symbol | Meaning |
-|---|---|
-| **SGLang** | Inference engine ZMQ KV events (`BlockStored` / `BlockRemoved` / `AllBlocksCleared`) |
-| **Master** | `mooncake_master` optional RFC #1527 publisher (`enable_kv_events`) |
-| **Register** | Indexer HTTP `POST /register` (or CLI `--workers`) — not carried on the event wire |
-| **S+M** | Either source may supply; must agree on value for the stream |
-| **—** | Not applicable for that event type |
-
-#### Envelope and stream identity
-
-| Field | SGLang | Master | Register | Notes |
-|---|---|---|---|---|
-| `event_id` | Yes | Yes | — | Each publisher maintains its own monotonic counter per stream. |
-| `timestamp` | Yes | Yes | — | Informational only; not used for ordering. |
-| `event_type` | Yes | Yes | — | `stored` / `removed` / `cleared`. |
-| `model_name` | S+M | Conditional | S+M | Master uses a recognized connector key first, then configured fixed model fallback. |
-| `block_size` | Yes | Conditional | Yes | Master emits configured non-zero `kv_events_block_size`; registration must agree. |
-| `additional_salt` | Yes | Conditional | S+M | Master emits non-empty fixed publisher salt; register uses `additionalsalt`. |
-| `lora_name` | Yes | Conditional | S+M | Master emits configured fixed LoRA; nil means the base model. |
-| `tenant_id` | S+M | Yes | Yes | Per-object on master events. Register default `default`. |
-| `backend_id` | S+M | Yes | — | **Master**: storage daemon / pool owner. **SGLang**: often worker id; in decoupled mode prefer master=`daemon`, engine via **Register** `instance_id`. |
-| `medium` | Yes | Partial | — | **SGLang**: `GPU`, `CPU_PINNED`, `DISK`, `EXTERNAL`, etc. **Master**: only `cpu` / `disk` (host/disk pool), never GPU. |
-| `dp_rank` | Yes | Yes | Yes | Master emits configured rank in every event and the ZMQ batch trailer; registration must agree. |
-
-#### `stored` payload
-
-| Field | SGLang | Master | Register | Notes |
-|---|---|---|---|---|
-| `seq_hashes` | Yes | Conditional | — | **Required from SGLang** for correct prefix index. Master uses the low 64 bits of a recognized connector hash or a directly encoded decimal/`0x` u64 key. |
-| `object_key` | — | Yes | — | Mooncake store key (`kv_events_emit_object_key`, default on). Used by Dynamo for sha256+key matching. |
-| `connector_block_hash` | — | Conditional | — | Complete hexadecimal hash parsed from a recognized connector key; use this for full-digest matching instead of `seq_hashes`. |
-| `cache_prefix` | — | Conditional | — | vLLM Mooncake deployment namespace. It is distinct from request `additional_salt`. |
-| Connector rank fields | — | Conditional | — | Optional `tp_rank`/`head_or_tp_rank`, `pcp_rank`, `dcp_rank`, `pp_rank`, and `layer_id`; none are `dp_rank`. |
-| `block_hashes` (legacy) | Yes | Conditional | — | Alias of `seq_hashes` when `kv_events_emit_legacy_compat` is enabled on master. |
-| `parent_hash` | Yes | — | — | Connector object keys do not carry the parent link. |
-| `parent_block_hash` (legacy) | Yes | — | — | Same as `parent_hash`. |
-| `base_block_idx` | Yes | — | — | Connector keys do not carry block depth, so master emits nil. |
-| `token_ids` | Yes | — | — | Connector object keys do not carry token IDs. |
-| `block_size` (in-event) | Yes | Conditional | — | Master uses configured non-zero fixed publisher block size. |
-
-#### `removed` payload
-
-| Field | SGLang | Master | Register | Notes |
-|---|---|---|---|---|
-| `seq_hashes` | Yes | Conditional | — | **Required** on wire for strict RFC consumers. Master emits one hash when parseable, else empty with `object_key`. |
-| `base_block_idx` | Yes | — | — | Optional but recommended for observability. |
-
-#### `cleared` payload
-
-| Field | SGLang | Master | Register | Notes |
-|---|---|---|---|---|
-| (no extra fields) | — | — | — | Event is envelope-only. |
-| `cleared` / `AllBlocksCleared` | Yes | Yes | — | Master emits a tenant-scoped event after `RemoveAll` leaves that tenant empty. |
-
-#### Indexer / router plane (not in KV event JSON)
-
-| Field | SGLang | Master | Register | Notes |
-|---|---|---|---|---|
-| `instance_id` | — | — | Yes | Router-facing schedule target. Distinct from `backend_id`. |
-| `endpoint` | — | — | Yes | ZMQ PUB to subscribe (SGLang or master bind address). |
-| `replay_endpoint` | — | — | Yes | Optional gap replay (engine ROUTER). |
-| `type` | — | — | Yes | Publisher kind: `vLLM`, `SGLang`, `Mooncake`, etc. |
-
-#### Recommended split for Dynamo global KV indexer
-
-```mermaid
-flowchart LR
-  SGLang["SGLang ZMQ"]
-  Master["Mooncake master ZMQ"]
-  Reg["POST /register"]
-  Idx["Global KV indexer"]
-
-  SGLang -->|"GPU + HiCache tiers<br/>tokens, parent_hash, seq_hashes, lora"| Idx
-  Master -->|"Host/Disk pool<br/>fixed model context, backend_id, medium=cpu|disk"| Idx
-  Reg -->|"instance_id, model, block_size"| Idx
-```
-
-| Capability | Primary source |
-|---|---|
-| GPU prefix hits, LoRA-aware hashes, parent chain, multi-block batches | **SGLang** |
-| Pooled host/disk replica visibility | **Master** (if keys encode `seq_hash`) |
-| Request routing target | **Register** (`instance_id`) |
-| Tiered `/query` response (`gpu` / `cpu` / `disk`) | Merge **SGLang** + **Master** events (see RFC #1403) |
+Conductor-generated JSON responses end with a newline except `/services`,
+whose compact JSON body has no trailing newline. Plain-text errors shown with
+`\n` above include that trailing newline.
