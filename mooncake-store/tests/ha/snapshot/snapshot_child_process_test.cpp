@@ -671,8 +671,9 @@ TEST_F(SnapshotChildProcessTest, DeserializeMetadataSkipsInvalidClientId) {
     const std::string key = "invalid_client_id_snapshot_key";
 
     auto deserialize_result = DeserializeMetadataForTest(
-        BuildMetadataPayloadWithClientIdString(
-            "not-a-uuid", std::string_view(key.data(), key.size())));
+        BuildMetadataPayloadWithClientIdString("not-a-uuid",
+                                               std::string_view(key.data(),
+                                                                key.size())));
     ASSERT_TRUE(deserialize_result.has_value())
         << deserialize_result.error().message;
 
