@@ -1,6 +1,4 @@
-# Option to enable/disable TENT metrics at compile time
-option(TENT_METRICS_ENABLED "Enable TENT metrics collection" OFF)
-
+# TENT_METRICS_ENABLED option is declared in tent/CMakeLists.txt.
 file(GLOB TENT_METRICS_SOURCES "*.cpp")
 add_library(tent_metrics STATIC ${TENT_METRICS_SOURCES})
 # Link yalantinglibs::yalantinglibs for metrics and HTTP server (ylt headers + transitive deps).
