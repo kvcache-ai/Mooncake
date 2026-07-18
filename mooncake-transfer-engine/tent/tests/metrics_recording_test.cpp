@@ -52,6 +52,9 @@ namespace {
 
 #if TENT_METRICS_ENABLED
 
+#include <csignal>  // required before ylt headers (coro_io uses std::signal)
+#include <ylt/coro_http/coro_http_client.hpp>
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -78,6 +81,20 @@ uint16_t getFreeTcpPort() {
     int port = ntohs(addr.sin_port);
     ::close(sock);
     return static_cast<uint16_t>(port);
+}
+
+// HTTP GET helper. Adapted from
+// mooncake-store/tests/master_metrics_test.cpp FetchUrl().
+struct HttpResponse {
+    int http_status;
+    std::string body;
+};
+
+HttpResponse FetchUrl(uint16_t port, const std::string& path) {
+    coro_http::coro_http_client client;
+    auto result =
+        client.get("http://127.0.0.1:" + std::to_string(port) + path);
+    return {result.status, std::string(result.resp_body)};
 }
 
 // Snapshot of TentMetrics JSON output. Provides delta-based accessors so
@@ -548,6 +565,85 @@ TEST_F(MetricsRecordingTest, BucketsAreCompileTimeDefaults) {
                                      50000, 100000, 500000, 1000000};
     EXPECT_EQ(keys, expected)
         << "latency buckets must be the compile-time defaults";
+}
+
+// ---------------------------------------------------------------------------
+// L2 HTTP integration: scrape the real /metrics, /metrics/json, /health
+// endpoints via coro_http_client and assert on status + body. Validates the
+// HTTP wiring (handlers, content, status codes) on top of the L1 recording
+// assertions.
+// ---------------------------------------------------------------------------
+class MetricsHttpTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        TentMetrics::instance().shutdown();
+        MetricsConfig config;
+        config.enabled = true;
+        config.http_host = "127.0.0.1";
+        config.http_port = getFreeTcpPort();
+        config.report_interval_seconds = 0;
+        ASSERT_TRUE(TentMetrics::instance().initialize(config).ok());
+        TentMetrics::setEnabled(true);
+        port_ = TentMetrics::instance().httpPort();
+        // If the port bind raced (another process grabbed it), degrade
+        // gracefully rather than failing the build.
+        if (port_ == 0) {
+            GTEST_SKIP() << "metrics HTTP server did not bind; skipping HTTP "
+                            "integration test";
+        }
+    }
+
+    void TearDown() override {
+        TentMetrics::instance().shutdown();
+    }
+
+    // Retry a GET a few times to absorb the brief window between
+    // async_start() returning and the server accepting connections.
+    HttpResponse retryGet(const std::string& path, int attempts = 20) {
+        HttpResponse resp{0, ""};
+        for (int i = 0; i < attempts; ++i) {
+            resp = FetchUrl(port_, path);
+            if (resp.http_status == 200) return resp;
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+        return resp;
+    }
+
+    uint16_t port_ = 0;
+};
+
+TEST_F(MetricsHttpTest, PrometheusEndpointExposesAllCounters) {
+    // Record a mix of operations so the counters are non-zero.
+    TentMetrics::instance().recordReadCompleted(1024, 0.001);
+    TentMetrics::instance().recordWriteCompleted(2048, 0.002);
+    TentMetrics::instance().recordDeadlineInfeasible();
+
+    auto resp = retryGet("/metrics");
+    EXPECT_EQ(resp.http_status, 200);
+    EXPECT_NE(resp.body.find("tent_read_bytes_total"), std::string::npos);
+    EXPECT_NE(resp.body.find("tent_write_bytes_total"), std::string::npos);
+    EXPECT_NE(resp.body.find("tent_deadline_infeasible_total"),
+              std::string::npos);
+    EXPECT_NE(resp.body.find("tent_write_latency_us_bucket"), std::string::npos);
+}
+
+TEST_F(MetricsHttpTest, JsonEndpointValid) {
+    TentMetrics::instance().recordReadCompleted(512, 0.0005);
+
+    auto resp = retryGet("/metrics/json");
+    EXPECT_EQ(resp.http_status, 200);
+    // Must be parseable JSON and contain expected keys.
+    auto json = nlohmann::json::parse(resp.body, nullptr, /*allow_exceptions=*/false);
+    ASSERT_FALSE(json.is_discarded()) << "body was not valid JSON: " << resp.body;
+    EXPECT_TRUE(json.contains("tent_read_bytes_total"));
+    EXPECT_TRUE(json.contains("tent_deadline_infeasible_total"));
+    EXPECT_TRUE(json.contains("tent_read_latency_us"));
+}
+
+TEST_F(MetricsHttpTest, HealthEndpointOk) {
+    auto resp = retryGet("/health");
+    EXPECT_EQ(resp.http_status, 200);
+    EXPECT_EQ(resp.body, "OK");
 }
 
 #else  // !TENT_METRICS_ENABLED
