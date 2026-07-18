@@ -774,12 +774,22 @@ TEST_F(StorageBackendTest, AdaptorScanMetaAndIsEnableOffloading) {
     ASSERT_TRUE(adaptor.Init());
 
     auto enable_before = adaptor.IsEnableOffloading();
-    ASSERT_TRUE(enable_before);
-    EXPECT_FALSE(enable_before.value());
+    ASSERT_FALSE(enable_before);
+    EXPECT_EQ(enable_before.error(), ErrorCode::UNABLE_OFFLOADING);
 
-    // New behavior: must call ScanMeta once before BatchOffload when eviction
-    // is disabled, otherwise meta_scanned_ is false and BatchOffload is
-    // rejected.
+    std::string pre_scan_value = "not written";
+    std::unordered_map<std::string, std::vector<Slice>> pre_scan_batch = {
+        {"pre_scan_key", {{pre_scan_value.data(), pre_scan_value.size()}}},
+    };
+    auto pre_scan_offload = adaptor.BatchOffload(
+        pre_scan_batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_FALSE(pre_scan_offload);
+    EXPECT_EQ(pre_scan_offload.error(), ErrorCode::UNABLE_OFFLOADING);
+
+    // ScanMeta reconstructs quota accounting before writes are accepted when
+    // eviction is disabled.
     auto scan_init_res = adaptor.ScanMeta(
         [](const std::vector<std::string>&,
            std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
@@ -858,6 +868,17 @@ TEST_F(StorageBackendTest, AdaptorScanMetaAndIsEnableOffloading) {
     auto enable_strict = strict_adaptor.IsEnableOffloading();
     ASSERT_TRUE(enable_strict);
     EXPECT_FALSE(enable_strict.value());
+
+    std::string strict_value = "capacity limited";
+    std::unordered_map<std::string, std::vector<Slice>> strict_batch = {
+        {"strict_key", {{strict_value.data(), strict_value.size()}}},
+    };
+    auto strict_offload = strict_adaptor.BatchOffload(
+        strict_batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_FALSE(strict_offload);
+    EXPECT_EQ(strict_offload.error(), ErrorCode::KEYS_ULTRA_LIMIT);
 }
 
 TEST_F(StorageBackendTest, AdaptorScanMetaAndBatchLoadAcrossRestart) {
