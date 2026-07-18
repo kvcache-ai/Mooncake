@@ -13,6 +13,8 @@
 #include "gpu_vendor/ubshmem.h"
 #elif defined(USE_MACA)
 #include "gpu_vendor/maca.h"
+#elif defined(USE_SUPA)
+#include "gpu_vendor/supa.h"
 #elif defined(USE_SUNRISE)
 #include "gpu_vendor/sunrise.h"
 #elif defined(USE_HYGON)
@@ -24,7 +26,8 @@
 #endif
 
 #if !defined(USE_HIP) && !defined(USE_MUSA) && !defined(USE_MLU) && \
-    !defined(USE_UBSHMEM) && !defined(USE_MACA) && !defined(USE_SUNRISE)
+    !defined(USE_UBSHMEM) && !defined(USE_MACA) && !defined(USE_SUNRISE) && \
+    !defined(USE_SUPA)
 #include <string>
 const static std::string GPU_PREFIX = "cuda:";
 #endif

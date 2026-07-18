@@ -392,7 +392,7 @@ int RdmaContext::deconstruct() {
 int RdmaContext::exportDmabuf(void *addr, DmabufExport &out) {
     out = DmabufExport{};
     (void)addr;  // unused on the host-only (#else) build
-#if defined(USE_MLU) || defined(USE_MACA) || defined(USE_CUDA)
+#if defined(USE_MLU) || defined(USE_MACA) || defined(USE_CUDA) || defined(USE_SUPA)
     // Decide host vs GPU without assuming the presence of nvidia-peermem. Host
     // memory uses the plain ibv_reg_mr() path. GPU memory is exported once as a
     // dma_buf fd that every NIC then imports, so the driver keeps a single
@@ -403,7 +403,7 @@ int RdmaContext::exportDmabuf(void *addr, DmabufExport &out) {
 
     if (result != CUDA_SUCCESS || memType == CU_MEMORYTYPE_HOST) {
         out.method = DmabufExport::Method::kHostReg;
-#if defined(USE_CUDA)
+#if defined(USE_CUDA) || defined(USE_SUPA)
     } else if (memType == CU_MEMORYTYPE_DEVICE &&
                Environ::Get().GetWithNvidiaPeermem()) {
         // WITH_NVIDIA_PEERMEM env var is set: use ibv_reg_mr() directly for
@@ -411,7 +411,7 @@ int RdmaContext::exportDmabuf(void *addr, DmabufExport &out) {
         out.method = DmabufExport::Method::kHostReg;
 #endif
     } else if (memType == CU_MEMORYTYPE_DEVICE) {
-#if defined(USE_CUDA)
+#if defined(USE_CUDA) || defined(USE_SUPA)
         // Ensure a CUDA context is current — worker threads or callers
         // from non-CUDA threads may lack one.
         unsigned int devOrd = 0;
@@ -438,7 +438,7 @@ int RdmaContext::exportDmabuf(void *addr, DmabufExport &out) {
             cuGetErrorString(result, &errStr);
             LOG(ERROR) << "Failed to call cuMemGetAddressRange for "
                        << (uintptr_t)addr << " cuda error=" << errStr;
-#if defined(USE_CUDA)
+#if defined(USE_CUDA) || defined(USE_SUPA)
             cuDevicePrimaryCtxRelease(cuDev);
 #endif
             return ERR_CONTEXT;
@@ -456,7 +456,7 @@ int RdmaContext::exportDmabuf(void *addr, DmabufExport &out) {
             LOG(ERROR) << "Failed to retrieve dmabuf for " << (uintptr_t)addr
                        << " base=" << (uintptr_t)allocBase
                        << " size=" << allocSize << " cuda error=" << errStr;
-#if defined(USE_CUDA)
+#if defined(USE_CUDA) || defined(USE_SUPA)
             cuDevicePrimaryCtxRelease(cuDev);
 #endif
             return ERR_CONTEXT;
@@ -464,7 +464,7 @@ int RdmaContext::exportDmabuf(void *addr, DmabufExport &out) {
         out.method = DmabufExport::Method::kDmabufReg;
         out.fd = dmabuf_fd;
         out.offset = (uintptr_t)addr - (uintptr_t)allocBase;
-#if defined(USE_CUDA)
+#if defined(USE_CUDA) || defined(USE_SUPA)
         cuDevicePrimaryCtxRelease(cuDev);
 #endif
     }
@@ -582,7 +582,7 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
     }
     mrMeta.addr = addr;
 #if defined(USE_MLU) || defined(USE_MACA) || defined(USE_CUDA) || \
-    defined(USE_HIP_DMABUF)
+    defined(USE_HIP_DMABUF) || defined(USE_SUPA)
     if (exp.method == DmabufExport::Method::kDmabufReg) {
         // Import the shared dma_buf fd into this NIC's PD. The fd is kept open
         // by the caller until every NIC has registered; this MR takes its own
@@ -1241,7 +1241,7 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
             return ERR_CONTEXT;
         }
 
-#if defined(USE_MACA) || defined(USE_CUDA)
+#if defined(USE_MACA) || defined(USE_CUDA) || defined(USE_SUPA)
         // Verify DMA-BUF support against the GPU device(s) that the local
         // topology explicitly maps to this RNIC, rather than assuming the
         // verbs enumeration order matches GPU enumeration.
@@ -1289,7 +1289,7 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
             } else {
                 // cuInit is process-global and idempotent; call it once before
                 // the per-device loop, not per cuDeviceGet.
-#if defined(USE_CUDA)
+#if defined(USE_CUDA) || defined(USE_SUPA)
                 CUresult result = cuInit(0);
                 if (result != CUDA_SUCCESS) {
                     LOG(ERROR) << "Failed to initialize CUDA driver for RNIC "
