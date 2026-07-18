@@ -187,9 +187,10 @@ void TentMetrics::registerMetrics() {
 
     // Register all counters - add new counters here
     counters_ = {
-        &read_bytes_total_,     &write_bytes_total_,   &read_requests_total_,
-        &write_requests_total_, &read_failures_total_, &write_failures_total_,
-        &failover_total_,       &deadline_infeasible_total_,
+        &read_bytes_total_,    &write_bytes_total_,
+        &read_requests_total_, &write_requests_total_,
+        &read_failures_total_, &write_failures_total_,
+        &failover_total_,      &deadline_infeasible_total_,
     };
 
     // Register all histograms - add new histograms here. Each entry pairs the

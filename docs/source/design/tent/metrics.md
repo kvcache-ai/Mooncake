@@ -388,4 +388,3 @@ rate(tent_read_failures_total[5m]) / rate(tent_read_requests_total[5m])
 histogram_quantile(0.99, rate(tent_read_latency_us_bucket[5m])) / 1000000
 histogram_quantile(0.99, rate(tent_write_latency_us_bucket[5m])) / 1000000
 ```
-

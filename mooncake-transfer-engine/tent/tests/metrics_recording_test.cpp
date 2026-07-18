@@ -92,8 +92,7 @@ struct HttpResponse {
 
 HttpResponse FetchUrl(uint16_t port, const std::string& path) {
     coro_http::coro_http_client client;
-    auto result =
-        client.get("http://127.0.0.1:" + std::to_string(port) + path);
+    auto result = client.get("http://127.0.0.1:" + std::to_string(port) + path);
     return {result.status, std::string(result.resp_body)};
 }
 
@@ -135,7 +134,8 @@ class MetricsSnapshot {
     // All bucket keys for a histogram (sorted ascending as integers).
     std::vector<int64_t> bucketKeys(const std::string& name) const {
         std::vector<int64_t> keys;
-        if (!json_.contains(name) || !json_[name].contains("buckets")) return keys;
+        if (!json_.contains(name) || !json_[name].contains("buckets"))
+            return keys;
         for (auto it = json_[name]["buckets"].begin();
              it != json_[name]["buckets"].end(); ++it) {
             try {
@@ -276,8 +276,7 @@ void installFakeRdma(TransferEngineImpl& engine,
     engine.swapTransportForTest(RDMA, fake);
 }
 
-Request makeLocalWrite(uint8_t* ptr, size_t length,
-                       uint64_t deadline_ns = 0) {
+Request makeLocalWrite(uint8_t* ptr, size_t length, uint64_t deadline_ns = 0) {
     Request request;
     request.opcode = Request::WRITE;
     request.source = ptr;
@@ -323,9 +322,7 @@ class MetricsRecordingTest : public ::testing::Test {
         TentMetrics::setEnabled(true);
     }
 
-    void TearDown() override {
-        TentMetrics::instance().shutdown();
-    }
+    void TearDown() override { TentMetrics::instance().shutdown(); }
 };
 
 // ---------------------------------------------------------------------------
@@ -350,7 +347,8 @@ TEST_F(MetricsRecordingTest, CompletedTransferRecordsBytesAndLatency) {
     auto before = MetricsSnapshot(TentMetrics::instance());
     ASSERT_TRUE(
         engine.submitTransfer(batch, {makeLocalWrite(buf.data(), kLen)}).ok());
-    ASSERT_EQ(pollUntilTerminal(engine, batch, 0), TransferStatusEnum::COMPLETED);
+    ASSERT_EQ(pollUntilTerminal(engine, batch, 0),
+              TransferStatusEnum::COMPLETED);
     auto after = MetricsSnapshot(TentMetrics::instance());
 
     EXPECT_EQ(after.counter("tent_write_bytes_total") -
@@ -435,10 +433,11 @@ TEST_F(MetricsRecordingTest, InfeasibleDeadlineRecordsSeparateCounter) {
     auto before = MetricsSnapshot(TentMetrics::instance());
     // deadline_ns = 1 is always in the past relative to steady_clock now.
     ASSERT_TRUE(engine
-                    .submitTransfer(batch,
-                                    {makeLocalWrite(buf.data(), kLen, /*deadline_ns=*/1)})
+                    .submitTransfer(batch, {makeLocalWrite(buf.data(), kLen,
+                                                           /*deadline_ns=*/1)})
                     .ok());
-    ASSERT_EQ(pollUntilTerminal(engine, batch, 0), TransferStatusEnum::COMPLETED);
+    ASSERT_EQ(pollUntilTerminal(engine, batch, 0),
+              TransferStatusEnum::COMPLETED);
     auto after = MetricsSnapshot(TentMetrics::instance());
 
     // The infeasible counter must exist and increment by exactly 1.
@@ -480,13 +479,15 @@ TEST_F(MetricsRecordingTest, FeasibleDeadlineRecordsMLU) {
     // Deadline far in the future -> window is huge -> MLU is tiny but > 0.
     uint64_t future_ns = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch() + std::chrono::hours(1))
+            std::chrono::steady_clock::now().time_since_epoch() +
+            std::chrono::hours(1))
             .count());
     ASSERT_TRUE(engine
-                    .submitTransfer(batch,
-                                    {makeLocalWrite(buf.data(), kLen, future_ns)})
+                    .submitTransfer(
+                        batch, {makeLocalWrite(buf.data(), kLen, future_ns)})
                     .ok());
-    ASSERT_EQ(pollUntilTerminal(engine, batch, 0), TransferStatusEnum::COMPLETED);
+    ASSERT_EQ(pollUntilTerminal(engine, batch, 0),
+              TransferStatusEnum::COMPLETED);
     auto after = MetricsSnapshot(TentMetrics::instance());
 
     EXPECT_EQ(after.histogramCount("tent_deadline_mlu_permille") -
@@ -561,7 +562,7 @@ TEST_F(MetricsRecordingTest, BucketsAreCompileTimeDefaults) {
 
     // Compile-time kLatencyBuckets: 100, 500, 1000, 5000, 10000, 50000,
     // 100000, 500000, 1000000.
-    std::vector<int64_t> expected = {100,  500,   1000,   5000,   10000,
+    std::vector<int64_t> expected = {100,   500,    1000,   5000,   10000,
                                      50000, 100000, 500000, 1000000};
     EXPECT_EQ(keys, expected)
         << "latency buckets must be the compile-time defaults";
@@ -593,9 +594,7 @@ class MetricsHttpTest : public ::testing::Test {
         }
     }
 
-    void TearDown() override {
-        TentMetrics::instance().shutdown();
-    }
+    void TearDown() override { TentMetrics::instance().shutdown(); }
 
     // Retry a GET a few times to absorb the brief window between
     // async_start() returning and the server accepting connections.
@@ -624,7 +623,8 @@ TEST_F(MetricsHttpTest, PrometheusEndpointExposesAllCounters) {
     EXPECT_NE(resp.body.find("tent_write_bytes_total"), std::string::npos);
     EXPECT_NE(resp.body.find("tent_deadline_infeasible_total"),
               std::string::npos);
-    EXPECT_NE(resp.body.find("tent_write_latency_us_bucket"), std::string::npos);
+    EXPECT_NE(resp.body.find("tent_write_latency_us_bucket"),
+              std::string::npos);
 }
 
 TEST_F(MetricsHttpTest, JsonEndpointValid) {
@@ -633,8 +633,10 @@ TEST_F(MetricsHttpTest, JsonEndpointValid) {
     auto resp = retryGet("/metrics/json");
     EXPECT_EQ(resp.http_status, 200);
     // Must be parseable JSON and contain expected keys.
-    auto json = nlohmann::json::parse(resp.body, nullptr, /*allow_exceptions=*/false);
-    ASSERT_FALSE(json.is_discarded()) << "body was not valid JSON: " << resp.body;
+    auto json =
+        nlohmann::json::parse(resp.body, nullptr, /*allow_exceptions=*/false);
+    ASSERT_FALSE(json.is_discarded())
+        << "body was not valid JSON: " << resp.body;
     EXPECT_TRUE(json.contains("tent_read_bytes_total"));
     EXPECT_TRUE(json.contains("tent_deadline_infeasible_total"));
     EXPECT_TRUE(json.contains("tent_read_latency_us"));
