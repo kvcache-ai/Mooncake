@@ -100,6 +100,9 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
     config.offload_write_threads =
         GetEnvOr<uint32_t>("MOONCAKE_OFFLOAD_WRITE_THREADS",
                            config.offload_write_threads);
+    config.offload_read_threads =
+        GetEnvOr<uint32_t>("MOONCAKE_OFFLOAD_READ_THREADS",
+                           config.offload_read_threads);
 
     auto use_uring_str =
         GetEnvStringOr("MOONCAKE_OFFLOAD_USE_URING",

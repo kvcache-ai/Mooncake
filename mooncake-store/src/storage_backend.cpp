@@ -14,7 +14,10 @@
 #include <thread>
 #include <vector>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <mutex>
+#include <optional>
 #include <unordered_set>
 
 #include <ylt/struct_pb.hpp>
@@ -1494,8 +1497,27 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
         VLOG(1) << oss.str();
     }
 
-    // Step 2: Perform IO without holding any locks
-    for (auto& [bucket_id, read_plans] : bucket_read_plans) {
+    // Step 2: Perform IO without holding any locks.
+    //
+    // Buckets are independent (separate files, separate fds, disjoint key
+    // sets), so reads can safely overlap on a single NVMe device. Raising
+    // the in-flight pread count from 1 (serial) to N (parallel) lifts
+    // single-disk throughput from ~1.4 GB/s to ~4-5 GB/s — see commit
+    // e738cfd9 which applied the same pattern to the write path.
+    //
+    // Thread safety:
+    //   - bucket_read_plans snapshot is taken once below; workers only read
+    //     the snapshot (no concurrent unordered_map access).
+    //   - Each bucket opens its own fd via OpenFile; StorageFile instances
+    //     are not shared across worker threads.
+    //   - batch_object.at(plan.key).ptr writes target disjoint keys (a key
+    //     belongs to exactly one bucket), so different workers mutate
+    //     distinct map values. This is safe on all mainstream libstdc++
+    //     implementations; the C++ standard does not strictly guarantee it.
+    //   - VLOG is thread-safe via glog.
+    auto process_bucket = [&](int64_t bucket_id,
+                              std::vector<ReadPlan>& read_plans)
+        -> std::optional<ErrorCode> {
         auto bucket_io_start = std::chrono::steady_clock::now();
         int64_t bucket_bytes = 0;
         // Open file for this bucket (cheap syscall, no lock needed)
@@ -1503,14 +1525,14 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
         if (!filepath_res) {
             LOG(ERROR) << "Failed to get bucket data path, bucket_id="
                        << bucket_id;
-            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            return ErrorCode::INTERNAL_ERROR;
         }
 
         auto file_res = OpenFile(filepath_res.value(), FileMode::Read);
         if (!file_res) {
             LOG(ERROR) << "Failed to open bucket file: "
                        << filepath_res.value();
-            return tl::make_unexpected(file_res.error());
+            return file_res.error();
         }
         auto& file = file_res.value();
 
@@ -1586,8 +1608,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                                        << ", expected>="
                                        << plan.dest_slice.size
                                        << ", got=" << read_res.value();
-                            return tl::make_unexpected(
-                                ErrorCode::FILE_READ_FAIL);
+                            return ErrorCode::FILE_READ_FAIL;
                         }
                         batch_object.at(plan.key).ptr =
                             static_cast<char*>(plan.dest_slice.ptr) +
@@ -1605,13 +1626,13 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                     LOG(ERROR) << "vector_read failed for key: " << plan.key
                                << ", bucket_id=" << plan.bucket_id
                                << ", error: " << read_res.error();
-                    return tl::make_unexpected(read_res.error());
+                    return read_res.error();
                 }
                 if (read_res.value() != plan.dest_slice.size) {
                     LOG(ERROR) << "Read size mismatch for key: " << plan.key
                                << ", expected: " << plan.dest_slice.size
                                << ", got: " << read_res.value();
-                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                    return ErrorCode::FILE_READ_FAIL;
                 }
                 bucket_bytes += plan.data_size;
             } else {
@@ -1640,7 +1661,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                     LOG(ERROR) << "merged posix_memalign failed for bucket_id="
                                << bucket_id << ", aligned_size=" << aligned_size
                                << ": " << strerror(ret);
-                    return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+                    return ErrorCode::FILE_WRITE_FAIL;
                 }
                 std::unique_ptr<void, void (*)(void*)> merge_buf(
                     raw_buf, [](void* p) { free(p); });
@@ -1653,7 +1674,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                                << aligned_offset
                                << ", aligned_size=" << aligned_size
                                << ", error: " << read_res.error();
-                    return tl::make_unexpected(read_res.error());
+                    return read_res.error();
                 }
                 // The pread may short-read at EOF if the aligned read range
                 // overshoots the file end by up to (kDirectIOAlignment - 1)
@@ -1669,7 +1690,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                     LOG(ERROR) << "merged read short of data, bucket_id="
                                << bucket_id << ", expected>=" << min_needed
                                << ", got=" << read_res.value();
-                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                    return ErrorCode::FILE_READ_FAIL;
                 }
                 // Scatter: for each key, memcpy from merge_buf to dest_slice.
                 // buf_offset accounts for the alignment padding before
@@ -1704,6 +1725,75 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                   << " elapsed_us=" << bucket_elapsed_us
                   << " preads=" << read_plans.size()
                   << " per_key_us=" << (read_plans.empty() ? 0 : bucket_elapsed_us / static_cast<int64_t>(read_plans.size()));
+        return std::nullopt;
+    };
+
+    // Snapshot bucket plans into a vector so workers can index concurrently
+    // without touching the unordered_map (its iterators are not standard-
+    // guaranteed safe under concurrent read). Pointers remain valid because
+    // bucket_read_plans is a local variable that outlives the workers.
+    std::vector<std::pair<int64_t, std::vector<ReadPlan>*>> bucket_snapshot;
+    bucket_snapshot.reserve(bucket_read_plans.size());
+    for (auto& [bid, plans] : bucket_read_plans) {
+        bucket_snapshot.emplace_back(bid, &plans);
+    }
+    const size_t n = bucket_snapshot.size();
+
+    const uint32_t read_threads =
+        std::max<uint32_t>(1, file_storage_config_.offload_read_threads);
+    const bool use_parallel = (read_threads > 1 && n > 1);
+
+    VLOG(1) << "action=batchload_dispatch buckets=" << n
+            << " threads=" << read_threads
+            << " parallel=" << (use_parallel ? "true" : "false");
+
+    if (!use_parallel) {
+        // Serial path — preserves prior behavior, no thread overhead.
+        for (auto& [bid, plans_ptr] : bucket_snapshot) {
+            auto err = process_bucket(bid, *plans_ptr);
+            if (err.has_value()) {
+                return tl::make_unexpected(err.value());
+            }
+        }
+    } else {
+        // Parallel path — dispatch independent buckets concurrently.
+        // Structure mirrors WriteBucket parallelization (commit e738cfd9):
+        // workers pull bucket indices from a shared atomic counter, stop
+        // early once one bucket returns a fatal error, and the caller
+        // joins all workers before returning.
+        std::atomic<size_t> next_index{0};
+        std::atomic<bool> first_error_set{false};
+        std::optional<ErrorCode> first_error;
+        std::mutex result_mutex;
+
+        auto worker = [&]() {
+            for (;;) {
+                if (first_error_set.load(std::memory_order_acquire)) return;
+                size_t i = next_index.fetch_add(1, std::memory_order_acq_rel);
+                if (i >= n) return;
+                auto& [bid, plans_ptr] = bucket_snapshot[i];
+                auto err = process_bucket(bid, *plans_ptr);
+                if (err.has_value()) {
+                    std::lock_guard<std::mutex> lk(result_mutex);
+                    if (!first_error_set.exchange(true)) {
+                        first_error = err.value();
+                    }
+                    return;
+                }
+            }
+        };
+
+        std::vector<std::thread> workers;
+        workers.reserve(read_threads);
+        for (uint32_t i = 0; i < read_threads; ++i) {
+            workers.emplace_back(worker);
+        }
+        for (auto& w : workers) {
+            if (w.joinable()) w.join();
+        }
+        if (first_error.has_value()) {
+            return tl::make_unexpected(first_error.value());
+        }
     }
 
     auto batch_elapsed_us =

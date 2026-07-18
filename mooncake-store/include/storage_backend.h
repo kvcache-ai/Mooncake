@@ -240,6 +240,11 @@ struct FileStorageConfig {
     // (4 threads) so the SSD pipeline does not gate cache fill rate. 0 keeps
     // the legacy serial loop.
     uint32_t offload_write_threads = 4;
+    // Parallel bucket-read thread pool size for BatchLoad. Each BatchGet may
+    // fan out to N independent bucket files; reading them in parallel raises
+    // single-NVME read throughput from ~1.4 GB/s (serial, QD=1) to ~4-5 GB/s
+    // (QD=N). 0 or 1 keeps the legacy serial loop. Mirrors offload_write_threads.
+    uint32_t offload_read_threads = 4;
     // Soft local backlog cap. 0 = unbounded.
     uint32_t promotion_queue_capacity = 1024;
     // Per-worker drain batch size.
