@@ -181,10 +181,6 @@ void TentMetrics::shutdown() {
 }
 
 void TentMetrics::registerMetrics() {
-    // Pre-allocate vectors to avoid reallocation
-    counters_.reserve(8);
-    histograms_.reserve(8);
-
     // Register all counters - add new counters here
     counters_ = {
         &read_bytes_total_,    &write_bytes_total_,
