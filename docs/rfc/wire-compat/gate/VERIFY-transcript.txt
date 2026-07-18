@@ -1,0 +1,17 @@
+### Build
+build: OK
+
+### Self-check (codec faithfulness)
+[selfcheck] ExistKey bare<string>                              got=0x9dcffa76 want=0x9dcffa76 OK
+[selfcheck] PutStart #2288-era 4-arg (3-field RC)              got=0xfad0c534 want=0xfad0c534 OK
+[selfcheck] PutStart + bare trailing string (#2288 break)      got=0x22f8edba want=0x22f8edba OK
+[selfcheck] PutStart + compatible<string> (the fix)            got=0xfad0c534 want=0xfad0c534 OK
+selfcheck rc=0
+
+### Gate on clean tree
+[selfcheck] PutStart + bare trailing string (#2288 break)      got=0x22f8edba want=0x22f8edba OK
+[selfcheck] PutStart + compatible<string> (the fix)            got=0xfad0c534 want=0xfad0c534 OK
+[gate] PASS: master wire contract unchanged (59 handlers)
+
+### Golden handler count
+handlers=59
