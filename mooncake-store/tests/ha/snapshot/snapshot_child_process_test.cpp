@@ -666,6 +666,19 @@ TEST_F(SnapshotChildProcessTest,
     EXPECT_FALSE(ObjectIsGroupedInMetadata(key, shard_idx));
 }
 
+TEST_F(SnapshotChildProcessTest, DeserializeMetadataSkipsInvalidClientId) {
+    CreateDefaultService();
+    const std::string key = "invalid_client_id_snapshot_key";
+
+    auto deserialize_result = DeserializeMetadataForTest(
+        BuildMetadataPayloadWithClientIdString(
+            "not-a-uuid", std::string_view(key.data(), key.size())));
+    ASSERT_TRUE(deserialize_result.has_value())
+        << deserialize_result.error().message;
+
+    EXPECT_FALSE(KeyExistsInMetadata(service_.get(), key));
+}
+
 TEST_F(SnapshotChildProcessTest, LegacyEtcdConnstringFallbackIsPreserved) {
     MasterConfig legacy_config;
     legacy_config.enable_ha = true;
