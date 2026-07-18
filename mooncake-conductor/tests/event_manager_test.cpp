@@ -40,7 +40,6 @@ uint16_t EventManagerTestPeer::HttpPort(EventManager& manager) {
 
 namespace {
 
-using conductor::common::HashProfileConfig;
 using conductor::common::PublisherKind;
 using conductor::common::ServiceConfig;
 using conductor::kvevent::EventManager;
@@ -57,6 +56,7 @@ using conductor::prefixindex::HashBlock;
 using conductor::prefixindex::HashProfile;
 using conductor::prefixindex::PrefixCacheTable;
 using conductor::prefixindex::ProjectedPrefix;
+using conductor::prefixindex::ResolveHashProfile;
 using conductor::prefixindex::SharedMutation;
 using conductor::prefixindex::SharedObjectOwner;
 using conductor::prefixindex::StorageTier;
@@ -77,19 +77,16 @@ constexpr std::string_view kRootDigest =
 constexpr std::string_view kOtherRootDigest =
     "0000000000000000000000000000000000000000000000000000000000000000";
 
-HashProfile TestProfile(std::string root_digest = std::string(kRootDigest)) {
-    return {.strategy = "vllm_v1",
-            .algorithm = "sha256_cbor",
-            .root_digest = std::move(root_digest),
-            .index_projection = "low64_be"};
-}
-
-HashProfileConfig TestProfileConfig(
-    std::string root_digest = std::string(kRootDigest)) {
-    return {.strategy = "vllm_v1",
-            .algorithm = "sha256_cbor",
-            .root_digest = std::move(root_digest),
-            .index_projection = "low64_be"};
+HashProfile TestProfile(std::string python_hash_seed = "0") {
+    const conductor::common::HashProfileConfig source{
+        .strategy = "vllm_v1",
+        .algorithm = "sha256_cbor",
+        .python_hash_seed = std::move(python_hash_seed),
+        .index_projection = "low64_be",
+    };
+    HashProfile profile;
+    EXPECT_EQ(ResolveHashProfile(source, &profile), "");
+    return profile;
 }
 
 ContextKey ContextFor(const ServiceConfig& service) {
@@ -100,16 +97,12 @@ ContextKey ContextFor(const ServiceConfig& service) {
 }
 
 EngineRegistration RegistrationFor(const ServiceConfig& service) {
-    return {
-        .context = ContextFor(service),
-        .profile = {.strategy = service.hash_profile.strategy,
-                    .algorithm = service.hash_profile.algorithm,
-                    .root_digest = service.hash_profile.root_digest,
-                    .index_projection = service.hash_profile.index_projection},
-        .instance_id = service.instance_id,
-        .dp_rank = service.dp_rank,
-        .effective_block_size = service.block_size,
-        .cache_group = service.cache_group};
+    return {.context = ContextFor(service),
+            .profile = service.hash_profile,
+            .instance_id = service.instance_id,
+            .dp_rank = service.dp_rank,
+            .effective_block_size = service.block_size,
+            .cache_group = service.cache_group};
 }
 
 ServiceConfig VllmService(const std::string& instance_id = "instance-1",
@@ -130,7 +123,7 @@ ServiceConfig VllmService(const std::string& instance_id = "instance-1",
     service.tenant_id = tenant_id;
     service.dp_rank = dp_rank;
     service.block_size = block_size;
-    service.hash_profile = TestProfileConfig();
+    service.hash_profile = TestProfile();
     return service;
 }
 
@@ -269,7 +262,7 @@ Json::Value ServiceJson(const ServiceConfig& service) {
     Json::Value profile(Json::objectValue);
     profile["strategy"] = service.hash_profile.strategy;
     profile["algorithm"] = service.hash_profile.algorithm;
-    profile["root_digest"] = service.hash_profile.root_digest;
+    profile["python_hash_seed"] = service.hash_profile.python_hash_seed;
     profile["index_projection"] = service.hash_profile.index_projection;
     value["hash_profile"] = profile;
     return value;
@@ -346,6 +339,18 @@ TEST(SubscribeToService, InvalidRegistrationCreatesNoState) {
     const auto result = EventManagerTestPeer::Subscribe(manager, service);
     EXPECT_FALSE(result.first);
     EXPECT_FALSE(result.second.empty());
+    EXPECT_EQ(EventManagerTestPeer::SubscriberCount(manager), 0u);
+    EXPECT_EQ(manager.GetIndexer()->GetGlobalView().context_count, 0);
+}
+
+TEST(SubscribeToService, ForgedResolvedProfileCreatesNoState) {
+    EventManager manager({}, 0);
+    auto service = VllmService();
+    service.hash_profile.root_digest = std::string(kOtherRootDigest);
+
+    const auto result = EventManagerTestPeer::Subscribe(manager, service);
+    EXPECT_FALSE(result.first);
+    EXPECT_NE(result.second.find("root_digest"), std::string::npos);
     EXPECT_EQ(EventManagerTestPeer::SubscriberCount(manager), 0u);
     EXPECT_EQ(manager.GetIndexer()->GetGlobalView().context_count, 0);
 }
@@ -635,8 +640,10 @@ TEST_F(QueryHttpTest, RejectsMalformedInputsBeforeLookup) {
     bad_lora["lora_name"] = false;
     Json::Value bad_instance = ValidQuery();
     bad_instance["instance_id"] = 3;
-    Json::Value override_profile = ValidQuery();
-    override_profile["root_digest"] = std::string(kRootDigest);
+    Json::Value override_seed = ValidQuery();
+    override_seed["python_hash_seed"] = "0";
+    Json::Value override_root = ValidQuery();
+    override_root["root_digest"] = std::string(kRootDigest);
 
     const std::vector<Case> cases = {
         {"malformed JSON", "{not-json", "invalid_json"},
@@ -654,7 +661,8 @@ TEST_F(QueryHttpTest, RejectsMalformedInputsBeforeLookup) {
         {"bad tenant", JsonDocument(bad_tenant), "invalid_type"},
         {"bad lora", JsonDocument(bad_lora), "invalid_type"},
         {"bad instance", JsonDocument(bad_instance), "invalid_type"},
-        {"profile override", JsonDocument(override_profile), "unknown_field"},
+        {"seed override", JsonDocument(override_seed), "unknown_field"},
+        {"root override", JsonDocument(override_root), "unknown_field"},
     };
 
     const auto before = manager_->GetIndexer()->GetGlobalView();
@@ -732,6 +740,121 @@ class RegistrationHttpTest : public ::testing::Test {
     uint16_t port_ = 0;
 };
 
+TEST_F(RegistrationHttpTest, ResolvesReportsAndRetriesSeedProfile) {
+    const auto service = VllmService();
+    ASSERT_EQ(Register(service).status, 200);
+    ASSERT_EQ(Register(service).status, 200);
+    EXPECT_EQ(EventManagerTestPeer::SubscriberCount(*manager_), 1u);
+
+    const HttpResponse services_response = HttpGet(port_, "/services");
+    ASSERT_EQ(services_response.status, 200);
+    const Json::Value services = ParseJsonResponse(services_response);
+    ASSERT_EQ(services["count"].asInt(), 1);
+    ASSERT_EQ(services["services"].size(), 1u);
+    const Json::Value& service_profile = services["services"][0]["HashProfile"];
+    EXPECT_EQ(service_profile["strategy"].asString(), "vllm_v1");
+    EXPECT_EQ(service_profile["algorithm"].asString(), "sha256_cbor");
+    EXPECT_EQ(service_profile["python_hash_seed"].asString(), "0");
+    EXPECT_EQ(service_profile["root_digest"].asString(), kRootDigest);
+    EXPECT_EQ(service_profile["index_projection"].asString(), "low64_be");
+
+    const HttpResponse view_response = HttpGet(port_, "/global_view");
+    ASSERT_EQ(view_response.status, 200);
+    const Json::Value view = ParseJsonResponse(view_response);
+    ASSERT_EQ(view["context_count"].asInt(), 1);
+    ASSERT_EQ(view["contexts"].size(), 1u);
+    const Json::Value& context_profile = view["contexts"][0]["hash_profile"];
+    EXPECT_EQ(context_profile["python_hash_seed"].asString(), "0");
+    EXPECT_EQ(context_profile["root_digest"].asString(), kRootDigest);
+}
+
+TEST_F(RegistrationHttpTest, RejectsInvalidSeedProfilesWithoutMutation) {
+    struct Case {
+        const char* name;
+        Json::Value body;
+        const char* reason;
+        const char* field;
+    };
+
+    const Json::Value valid = ServiceJson(VllmService());
+    std::vector<Case> cases;
+    auto add = [&](const char* name, Json::Value body, const char* reason,
+                   const char* field) {
+        cases.push_back({name, std::move(body), reason, field});
+    };
+
+    Json::Value legacy = valid;
+    legacy["hash_profile"]["root_digest"] = std::string(kRootDigest);
+    add("legacy root", std::move(legacy), "unknown_field", "root_digest");
+    Json::Value missing = valid;
+    missing["hash_profile"].removeMember("python_hash_seed");
+    add("missing seed", std::move(missing), "missing", "python_hash_seed");
+    Json::Value misspelled = valid;
+    misspelled["hash_profile"].removeMember("python_hash_seed");
+    misspelled["hash_profile"]["python_hash_sead"] = "0";
+    add("misspelled seed", std::move(misspelled), "unknown_field",
+        "python_hash_sead");
+    Json::Value numeric = valid;
+    numeric["hash_profile"]["python_hash_seed"] = 0;
+    add("numeric seed", std::move(numeric), "invalid_type", "python_hash_seed");
+    Json::Value null_seed = valid;
+    null_seed["hash_profile"]["python_hash_seed"] =
+        Json::Value(Json::nullValue);
+    add("null seed", std::move(null_seed), "invalid_type", "python_hash_seed");
+    Json::Value boolean_seed = valid;
+    boolean_seed["hash_profile"]["python_hash_seed"] = true;
+    add("boolean seed", std::move(boolean_seed), "invalid_type",
+        "python_hash_seed");
+    Json::Value array_seed = valid;
+    array_seed["hash_profile"]["python_hash_seed"] =
+        Json::Value(Json::arrayValue);
+    add("array seed", std::move(array_seed), "invalid_type",
+        "python_hash_seed");
+    Json::Value object_seed = valid;
+    object_seed["hash_profile"]["python_hash_seed"] =
+        Json::Value(Json::objectValue);
+    add("object seed", std::move(object_seed), "invalid_type",
+        "python_hash_seed");
+    for (const char* seed : {"", "-1", "+1", " 0", "0 ", "4294967296"}) {
+        Json::Value malformed = valid;
+        malformed["hash_profile"]["python_hash_seed"] = seed;
+        add(seed[0] == '\0' ? "empty seed" : seed, std::move(malformed),
+            "invalid_value", "python_hash_seed");
+    }
+
+    for (const auto& test_case : cases) {
+        SCOPED_TRACE(test_case.name);
+        const HttpResponse response =
+            HttpPostJson(port_, "/register", JsonDocument(test_case.body));
+        EXPECT_EQ(response.status, 400);
+        const Json::Value error = ParseJsonResponse(response);
+        EXPECT_EQ(error["reason"].asString(), test_case.reason);
+        EXPECT_EQ(error["field"].asString(), test_case.field);
+        EXPECT_EQ(EventManagerTestPeer::SubscriberCount(*manager_), 0u);
+        EXPECT_EQ(manager_->GetIndexer()->GetGlobalView().context_count, 0);
+    }
+}
+
+TEST_F(RegistrationHttpTest, ContextProfileConflictIsAtomic) {
+    const auto original = VllmService("instance-1");
+    ASSERT_EQ(Register(original).status, 200);
+
+    auto conflicting = VllmService("instance-2");
+    conflicting.hash_profile = TestProfile("1");
+    const HttpResponse response = Register(conflicting);
+    ASSERT_EQ(response.status, 400);
+    EXPECT_EQ(ParseJsonResponse(response)["reason"].asString(),
+              "invalid_registration");
+
+    EXPECT_EQ(EventManagerTestPeer::SubscriberCount(*manager_), 1u);
+    const auto view = manager_->GetIndexer()->GetGlobalView();
+    ASSERT_EQ(view.contexts.size(), 1u);
+    EXPECT_EQ(view.contexts[0].profile, TestProfile());
+    EXPECT_EQ(view.contexts[0].instance_ranks.size(), 1u);
+    EXPECT_TRUE(view.contexts[0].instance_ranks.contains("instance-1"));
+    EXPECT_FALSE(view.contexts[0].instance_ranks.contains("instance-2"));
+}
+
 TEST_F(RegistrationHttpTest, PartialUnregisterKeepsInstanceUntilLastRank) {
     auto rank_zero = VllmService("instance-1", "default", 0);
     auto rank_one = VllmService("instance-1", "default", 1);
@@ -756,7 +879,7 @@ TEST_F(RegistrationHttpTest, RejectsProfileConflictAndMalformedGroup) {
     ASSERT_EQ(Register(service).status, 200);
 
     auto conflict = service;
-    conflict.hash_profile.root_digest = std::string(kOtherRootDigest);
+    conflict.hash_profile = TestProfile("1");
     EXPECT_EQ(Register(conflict).status, 400);
     const auto view = manager_->GetIndexer()->GetGlobalView();
     ASSERT_EQ(view.contexts.size(), 1u);
@@ -777,7 +900,7 @@ TEST_F(RegistrationHttpTest, RejectsProfileConflictAndMalformedGroup) {
     EXPECT_EQ(manager_->GetIndexer()->GetGlobalView().context_count, 1);
 
     invalid = ServiceJson(VllmService("bad-profile"));
-    invalid["hash_profile"]["root_digest"] = "NOT-A-DIGEST";
+    invalid["hash_profile"]["python_hash_seed"] = "not-a-seed";
     EXPECT_EQ(HttpPostJson(port_, "/register", JsonDocument(invalid)).status,
               400);
     EXPECT_EQ(manager_->GetIndexer()->GetGlobalView().context_count, 1);
@@ -798,7 +921,7 @@ TEST_F(RegistrationHttpTest, RejectsConflictingMooncakeProfileBeforeStart) {
     ASSERT_EQ(Register(engine).status, 200);
 
     auto pool = MooncakeService(engine);
-    pool.hash_profile.root_digest = std::string(kOtherRootDigest);
+    pool.hash_profile = TestProfile("1");
     EXPECT_EQ(Register(pool).status, 400);
     EXPECT_EQ(EventManagerTestPeer::SubscriberCount(*manager_), 1u);
 
@@ -934,6 +1057,43 @@ class WarningSink : public google::LogSink {
     mutable std::mutex mu_;
     std::vector<std::string> messages_;
 };
+
+TEST(RegistrationLifecycle,
+     PoolFirstSubscriptionDoesNotReserveProfileAndRejectsLaterMismatch) {
+    EventManager manager({}, 0);
+    const auto engine = VllmService("engine", "default", 0, 4);
+    auto pool = MooncakeService(engine);
+    pool.hash_profile = TestProfile("1");
+
+    ASSERT_TRUE(EventManagerTestPeer::Register(manager, pool).first);
+    EXPECT_EQ(manager.GetIndexer()->GetGlobalView().context_count, 0);
+    auto handler = EventManagerTestPeer::HandlerFor(
+        manager,
+        MakeServiceKey(pool.instance_id, pool.tenant_id, pool.dp_rank));
+    ASSERT_NE(handler, nullptr);
+
+    ASSERT_TRUE(EventManagerTestPeer::Register(manager, engine).first);
+    const auto tokens = Sequence(1, 4);
+    const auto prefix =
+        ProjectedFor(ContextFor(engine), TestProfile(), tokens).front();
+    WarningSink warnings;
+    EXPECT_TRUE(DispatchMooncake(
+                    *handler, pool,
+                    {MooncakeStored(engine, prefix.value, "mismatched-object")})
+                    .empty());
+
+    EXPECT_TRUE(warnings.Contains("Mooncake profile binding rejected"));
+    EXPECT_EQ(KVEventHandlerTestPeer::BindingCount(*handler), 0u);
+    const auto result =
+        manager.GetIndexer()->Query(ContextFor(engine), tokens).at("engine");
+    EXPECT_EQ(result.cpu, 0);
+    EXPECT_EQ(result.disk, 0);
+    const auto view = manager.GetIndexer()->GetGlobalView();
+    ASSERT_EQ(view.contexts.size(), 1u);
+    EXPECT_EQ(view.contexts[0].profile, TestProfile());
+    EXPECT_EQ(view.contexts[0].prefix_count, 0u);
+    EXPECT_EQ(EventManagerTestPeer::SubscriberCount(manager), 2u);
+}
 
 TEST(KVEventHandlerTest, VllmBatchDpConflictRejectsEveryEvent) {
     EventManager manager({}, 0);
@@ -1582,7 +1742,7 @@ TEST(ParseConfig, LoadsProfilesAndSkipsInvalidEntries) {
                            "hash_profile": {
                              "strategy": "vllm_v1",
                              "algorithm": "sha256_cbor",
-                             "root_digest": "4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e",
+                             "python_hash_seed": "0",
                              "index_projection": "low64_be"}},
             "inst-moon": {"endpoint": "tcp://127.0.0.1:6557",
                            "type": "Mooncake", "modelname": "m1",
@@ -1590,7 +1750,7 @@ TEST(ParseConfig, LoadsProfilesAndSkipsInvalidEntries) {
                            "hash_profile": {
                              "strategy": "vllm_v1",
                              "algorithm": "sha256_cbor",
-                             "root_digest": "4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e",
+                             "python_hash_seed": "0",
                              "index_projection": "low64_be"}},
             "bad-group": {"endpoint": "tcp://127.0.0.1:7557",
                            "type": "vLLM", "modelname": "m1",
@@ -1624,7 +1784,66 @@ TEST(ParseConfig, LoadsProfilesAndSkipsInvalidEntries) {
     EXPECT_EQ(services[1].tenant_id, "default");
     EXPECT_EQ(services[1].dp_rank, 2);
     EXPECT_EQ(services[1].cache_group, std::optional<int64_t>(0));
-    EXPECT_EQ(services[1].hash_profile, TestProfileConfig());
+    EXPECT_EQ(services[1].hash_profile, TestProfile());
+    std::remove(path.c_str());
+}
+
+TEST(ParseConfig, RejectsLegacyMissingMalformedAndUnknownProfiles) {
+    ConfigEnvGuard guard;
+    const std::string path =
+        ::testing::TempDir() + "conductor_cfg_strict_profile.json";
+    {
+        std::ofstream out(path);
+        out << R"({
+          "kvevent_instance": {
+            "valid": {
+              "endpoint": "tcp://127.0.0.1:5551", "type": "vLLM",
+              "modelname": "m1", "block_size": 16, "dp_rank": 0,
+              "hash_profile": {
+                "strategy": "vllm_v1", "algorithm": "sha256_cbor",
+                "python_hash_seed": "00", "index_projection": "low64_be"}},
+            "legacy-root": {
+              "endpoint": "tcp://127.0.0.1:5552", "type": "vLLM",
+              "modelname": "m1", "block_size": 16, "dp_rank": 0,
+              "hash_profile": {
+                "strategy": "vllm_v1", "algorithm": "sha256_cbor",
+                "python_hash_seed": "0", "index_projection": "low64_be",
+                "root_digest": "4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e"}},
+            "missing-seed": {
+              "endpoint": "tcp://127.0.0.1:5553", "type": "vLLM",
+              "modelname": "m1", "block_size": 16, "dp_rank": 0,
+              "hash_profile": {
+                "strategy": "vllm_v1", "algorithm": "sha256_cbor",
+                "index_projection": "low64_be"}},
+            "malformed-seed": {
+              "endpoint": "tcp://127.0.0.1:5554", "type": "vLLM",
+              "modelname": "m1", "block_size": 16, "dp_rank": 0,
+              "hash_profile": {
+                "strategy": "vllm_v1", "algorithm": "sha256_cbor",
+                "python_hash_seed": " 0", "index_projection": "low64_be"}},
+            "numeric-seed": {
+              "endpoint": "tcp://127.0.0.1:5555", "type": "vLLM",
+              "modelname": "m1", "block_size": 16, "dp_rank": 0,
+              "hash_profile": {
+                "strategy": "vllm_v1", "algorithm": "sha256_cbor",
+                "python_hash_seed": 0, "index_projection": "low64_be"}},
+            "misspelled": {
+              "endpoint": "tcp://127.0.0.1:5556", "type": "vLLM",
+              "modelname": "m1", "block_size": 16, "dp_rank": 0,
+              "hash_profile": {
+                "strategy": "vllm_v1", "algorithm": "sha256_cbor",
+                "python_hash_sead": "0", "index_projection": "low64_be"}}
+          }
+        })";
+    }
+    guard.SetPath(path);
+
+    int port = 13333;
+    const auto services = conductor::kvevent::ParseConfig(&port);
+    ASSERT_EQ(services.size(), 1u);
+    EXPECT_EQ(services[0].instance_id, "valid");
+    EXPECT_EQ(services[0].hash_profile, TestProfile("00"));
+    EXPECT_NE(services[0].hash_profile.root_digest, kRootDigest);
     std::remove(path.c_str());
 }
 
@@ -1642,7 +1861,7 @@ TEST(ParseConfig, ExplicitInstanceIdSupportsMultipleStaticRanks) {
               "block_size": 16, "dp_rank": 0,
               "hash_profile": {
                 "strategy": "vllm_v1", "algorithm": "sha256_cbor",
-                "root_digest": "4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e",
+                "python_hash_seed": "0",
                 "index_projection": "low64_be"}},
             "stream-rank-1": {
               "endpoint": "tcp://127.0.0.1:5558", "type": "vLLM",
@@ -1650,7 +1869,7 @@ TEST(ParseConfig, ExplicitInstanceIdSupportsMultipleStaticRanks) {
               "block_size": 16, "dp_rank": 1,
               "hash_profile": {
                 "strategy": "vllm_v1", "algorithm": "sha256_cbor",
-                "root_digest": "4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e",
+                "python_hash_seed": "0",
                 "index_projection": "low64_be"}}
           }
         })";

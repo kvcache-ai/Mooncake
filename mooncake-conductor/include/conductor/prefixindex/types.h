@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 
+#include "conductor/common/types.h"
+
 namespace conductor {
 namespace prefixindex {
 
@@ -19,14 +21,7 @@ struct ContextKey {
     bool operator==(const ContextKey&) const = default;
 };
 
-struct HashProfile {
-    std::string strategy;
-    std::string algorithm;
-    std::string root_digest;
-    std::string index_projection;
-
-    bool operator==(const HashProfile&) const = default;
-};
+using HashProfile = common::ResolvedHashProfile;
 
 struct ProjectedPrefix {
     uint64_t value = 0;

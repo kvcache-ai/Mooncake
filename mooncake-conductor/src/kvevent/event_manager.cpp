@@ -37,10 +37,7 @@ prefixindex::ContextKey ContextFromService(
 
 prefixindex::HashProfile ProfileFromService(
     const common::ServiceConfig& service) {
-    return {.strategy = service.hash_profile.strategy,
-            .algorithm = service.hash_profile.algorithm,
-            .root_digest = service.hash_profile.root_digest,
-            .index_projection = service.hash_profile.index_projection};
+    return service.hash_profile;
 }
 
 prefixindex::EngineRegistration RegistrationFromService(
@@ -194,7 +191,7 @@ bool ParseOptionalCacheGroup(const Json::Value& body, coro_http_response& resp,
 }
 
 bool ParseHashProfileConfig(const Json::Value& body, coro_http_response& resp,
-                            common::HashProfileConfig* profile) {
+                            common::ResolvedHashProfile* profile) {
     if (!body.isMember("hash_profile")) {
         HttpJsonError(resp, "missing", "hash_profile is required",
                       "hash_profile");
@@ -207,15 +204,35 @@ bool ParseHashProfileConfig(const Json::Value& body, coro_http_response& resp,
         return false;
     }
     static const std::set<std::string> kAllowedProfileFields = {
-        "algorithm", "index_projection", "root_digest", "strategy"};
+        "algorithm", "index_projection", "python_hash_seed", "strategy"};
     if (!RejectUnknownFields(value, kAllowedProfileFields, resp)) {
         return false;
     }
-    return RequiredString(value, "strategy", resp, &profile->strategy) &&
-           RequiredString(value, "algorithm", resp, &profile->algorithm) &&
-           RequiredString(value, "root_digest", resp, &profile->root_digest) &&
-           RequiredString(value, "index_projection", resp,
-                          &profile->index_projection);
+
+    common::HashProfileConfig source;
+    if (!RequiredString(value, "strategy", resp, &source.strategy) ||
+        !RequiredString(value, "algorithm", resp, &source.algorithm) ||
+        !RequiredString(value, "python_hash_seed", resp,
+                        &source.python_hash_seed) ||
+        !RequiredString(value, "index_projection", resp,
+                        &source.index_projection)) {
+        return false;
+    }
+
+    if (std::string error = prefixindex::ResolveHashProfile(source, profile);
+        !error.empty()) {
+        const char* field = "python_hash_seed";
+        if (source.strategy != "vllm_v1") {
+            field = "strategy";
+        } else if (source.algorithm != "sha256_cbor") {
+            field = "algorithm";
+        } else if (source.index_projection != "low64_be") {
+            field = "index_projection";
+        }
+        HttpJsonError(resp, "invalid_value", error, field);
+        return false;
+    }
+    return true;
 }
 
 std::string ValidateServiceConfig(const common::ServiceConfig& service) {
@@ -499,6 +516,7 @@ Json::Value ServiceConfigToJson(const common::ServiceConfig& svc) {
     Json::Value profile(Json::objectValue);
     profile["strategy"] = svc.hash_profile.strategy;
     profile["algorithm"] = svc.hash_profile.algorithm;
+    profile["python_hash_seed"] = svc.hash_profile.python_hash_seed;
     profile["root_digest"] = svc.hash_profile.root_digest;
     profile["index_projection"] = svc.hash_profile.index_projection;
     out["HashProfile"] = profile;
@@ -969,6 +987,7 @@ void EventManager::RegisterHttpHandlers() {
                 Json::Value profile(Json::objectValue);
                 profile["strategy"] = view.profile.strategy;
                 profile["algorithm"] = view.profile.algorithm;
+                profile["python_hash_seed"] = view.profile.python_hash_seed;
                 profile["root_digest"] = view.profile.root_digest;
                 profile["index_projection"] = view.profile.index_projection;
                 c["hash_profile"] = profile;

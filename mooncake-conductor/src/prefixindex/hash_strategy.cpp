@@ -14,6 +14,7 @@ namespace prefixindex {
 namespace {
 
 constexpr size_t kSha256DigestSize = 32;
+constexpr uint64_t kMaxPythonHashSeed = std::numeric_limits<uint32_t>::max();
 
 void AppendTypeAndLength(uint8_t major_type, uint64_t value,
                          std::vector<uint8_t>* out) {
@@ -154,6 +155,74 @@ int LowerHexValue(char value) {
     return -1;
 }
 
+std::string ValidateProfileSelectors(std::string_view strategy,
+                                     std::string_view algorithm,
+                                     std::string_view index_projection) {
+    if (strategy != "vllm_v1") {
+        return "unsupported hash strategy: " + std::string(strategy);
+    }
+    if (algorithm != "sha256_cbor") {
+        return "unsupported hash algorithm: " + std::string(algorithm);
+    }
+    if (index_projection != "low64_be") {
+        return "unsupported index projection: " + std::string(index_projection);
+    }
+    return "";
+}
+
+std::string ValidatePythonHashSeed(std::string_view seed) {
+    if (!IsValidUtf8(seed)) {
+        return "python_hash_seed must contain valid UTF-8";
+    }
+    if (seed == "random") {
+        return "";
+    }
+    if (seed.empty()) {
+        return "python_hash_seed must be \"random\" or ASCII decimal text in "
+               "0..4294967295";
+    }
+
+    uint64_t value = 0;
+    for (const char character : seed) {
+        if (character < '0' || character > '9') {
+            return "python_hash_seed must be \"random\" or ASCII decimal text "
+                   "in 0..4294967295";
+        }
+        const uint64_t digit = static_cast<uint64_t>(character - '0');
+        if (value > (kMaxPythonHashSeed - digit) / 10) {
+            return "python_hash_seed must be in range 0..4294967295";
+        }
+        value = value * 10 + digit;
+    }
+    return "";
+}
+
+std::string ValidateRootDigest(std::string_view root_digest) {
+    if (root_digest.size() != kSha256DigestSize * 2) {
+        return "root_digest must contain exactly 64 lowercase hex characters";
+    }
+    for (const char value : root_digest) {
+        if (LowerHexValue(value) < 0) {
+            return "root_digest must contain exactly 64 lowercase hex "
+                   "characters";
+        }
+    }
+    return "";
+}
+
+std::string ValidateResolvedHashProfileShape(const HashProfile& profile) {
+    if (auto error = ValidateProfileSelectors(
+            profile.strategy, profile.algorithm, profile.index_projection);
+        !error.empty()) {
+        return error;
+    }
+    if (auto error = ValidatePythonHashSeed(profile.python_hash_seed);
+        !error.empty()) {
+        return error;
+    }
+    return ValidateRootDigest(profile.root_digest);
+}
+
 std::array<uint8_t, kSha256DigestSize> DecodeRootDigest(
     std::string_view root_digest) {
     std::array<uint8_t, kSha256DigestSize> result{};
@@ -258,31 +327,64 @@ class VllmV1HashStrategy final : public HashStrategy {
 
 }  // namespace
 
+std::string ResolveHashProfile(const common::HashProfileConfig& config,
+                               HashProfile* out) {
+    if (out == nullptr) {
+        return "resolved hash profile output must not be null";
+    }
+    *out = {};
+
+    if (auto error = ValidateProfileSelectors(config.strategy, config.algorithm,
+                                              config.index_projection);
+        !error.empty()) {
+        return error;
+    }
+    if (auto error = ValidatePythonHashSeed(config.python_hash_seed);
+        !error.empty()) {
+        return error;
+    }
+
+    std::vector<uint8_t> encoded_seed;
+    AppendText(config.python_hash_seed, &encoded_seed);
+    std::array<uint8_t, kSha256DigestSize> root_digest{};
+    if (auto error = Sha256(encoded_seed, &root_digest); !error.empty()) {
+        return error;
+    }
+
+    *out = {.strategy = config.strategy,
+            .algorithm = config.algorithm,
+            .python_hash_seed = config.python_hash_seed,
+            .root_digest = DigestToHex(root_digest),
+            .index_projection = config.index_projection};
+    return "";
+}
+
 std::string ValidateHashProfile(const HashProfile& profile) {
-    if (profile.strategy != "vllm_v1") {
-        return "unsupported hash strategy: " + profile.strategy;
+    if (auto error = ValidateResolvedHashProfileShape(profile);
+        !error.empty()) {
+        return error;
     }
-    if (profile.algorithm != "sha256_cbor") {
-        return "unsupported hash algorithm: " + profile.algorithm;
+
+    HashProfile expected;
+    const common::HashProfileConfig source{
+        .strategy = profile.strategy,
+        .algorithm = profile.algorithm,
+        .python_hash_seed = profile.python_hash_seed,
+        .index_projection = profile.index_projection,
+    };
+    if (auto error = ResolveHashProfile(source, &expected); !error.empty()) {
+        return error;
     }
-    if (profile.index_projection != "low64_be") {
-        return "unsupported index projection: " + profile.index_projection;
-    }
-    if (profile.root_digest.size() != kSha256DigestSize * 2) {
-        return "root_digest must contain exactly 64 lowercase hex characters";
-    }
-    for (const char value : profile.root_digest) {
-        if (LowerHexValue(value) < 0) {
-            return "root_digest must contain exactly 64 lowercase hex "
-                   "characters";
-        }
+    if (profile.root_digest != expected.root_digest) {
+        return "root_digest does not match python_hash_seed and hash selectors";
     }
     return "";
 }
 
 std::unique_ptr<HashStrategy> CreateHashStrategy(const HashProfile& profile,
                                                  std::string* error) {
-    const std::string validation_error = ValidateHashProfile(profile);
+    const std::string validation_error =
+        ValidateResolvedHashProfileShape(profile);
     if (error != nullptr) {
         *error = validation_error;
     }

@@ -33,10 +33,20 @@ inline std::optional<PublisherKind> ParsePublisherKind(std::string_view value) {
 struct HashProfileConfig {
     std::string strategy;
     std::string algorithm;
-    std::string root_digest;
+    std::string python_hash_seed;
     std::string index_projection;
 
     bool operator==(const HashProfileConfig&) const = default;
+};
+
+struct ResolvedHashProfile {
+    std::string strategy;
+    std::string algorithm;
+    std::string python_hash_seed;
+    std::string root_digest;
+    std::string index_projection;
+
+    bool operator==(const ResolvedHashProfile&) const = default;
 };
 
 struct ServiceConfig {
@@ -50,7 +60,7 @@ struct ServiceConfig {
     int64_t block_size = 0;
     int dp_rank = 0;
     std::optional<int64_t> cache_group;
-    HashProfileConfig hash_profile;
+    ResolvedHashProfile hash_profile;
 
     bool operator==(const ServiceConfig&) const = default;
 };

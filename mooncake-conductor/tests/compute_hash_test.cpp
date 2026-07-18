@@ -12,32 +12,55 @@
 
 namespace {
 
+using conductor::common::HashProfileConfig;
 using conductor::prefixindex::ContextKey;
 using conductor::prefixindex::CreateHashStrategy;
 using conductor::prefixindex::DigestToHex;
 using conductor::prefixindex::HashBlock;
 using conductor::prefixindex::HashProfile;
+using conductor::prefixindex::ResolveHashProfile;
 using conductor::prefixindex::ValidateHashProfile;
 using conductor_test::LoadJsonFixture;
 using conductor_test::ParseU64;
+
+constexpr char kSeedZeroRoot[] =
+    "4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e";
+constexpr char kPaddedSeedZeroRoot[] =
+    "8d912e4e62b3cc377b1d1c7a14ef61dffbdaa0990237035c05401c29414c4172";
 
 HashProfile ProfileFrom(const Json::Value& value) {
     HashProfile profile;
     profile.strategy = value["strategy"].asString();
     profile.algorithm = value["algorithm"].asString();
+    profile.python_hash_seed = value["python_hash_seed"].asString();
     profile.root_digest = value["root_digest"].asString();
     profile.index_projection = value["index_projection"].asString();
     return profile;
+}
+
+HashProfileConfig SourceProfile(std::string python_hash_seed = "0") {
+    return {.strategy = "vllm_v1",
+            .algorithm = "sha256_cbor",
+            .python_hash_seed = std::move(python_hash_seed),
+            .index_projection = "low64_be"};
 }
 
 HashProfile ValidProfile() {
     return HashProfile{
         .strategy = "vllm_v1",
         .algorithm = "sha256_cbor",
-        .root_digest =
-            "4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e",
+        .python_hash_seed = "0",
+        .root_digest = kSeedZeroRoot,
         .index_projection = "low64_be",
     };
+}
+
+HashProfile ResolvedProfile(std::string python_hash_seed) {
+    HashProfile profile;
+    const std::string error = ResolveHashProfile(
+        SourceProfile(std::move(python_hash_seed)), &profile);
+    EXPECT_TRUE(error.empty()) << error;
+    return profile;
 }
 
 std::vector<int32_t> TokensFrom(const Json::Value& values) {
@@ -56,7 +79,97 @@ std::optional<std::string> SaltFrom(const Json::Value& value) {
     return value.asString();
 }
 
-TEST(HashProfile, AcceptsOnlyTheSupportedProfile) {
+TEST(HashProfileResolver, MatchesSeedRootGoldenVectors) {
+    const Json::Value fixture = LoadJsonFixture("hash_golden_vectors.json");
+    const Json::Value& vectors = fixture["seed_root_vectors"];
+    ASSERT_TRUE(vectors.isArray());
+    ASSERT_GE(vectors.size(), 2u);
+
+    for (const auto& vector : vectors) {
+        const std::string seed = vector["python_hash_seed"].asString();
+        SCOPED_TRACE(seed);
+        HashProfile resolved;
+        const std::string error =
+            ResolveHashProfile(SourceProfile(seed), &resolved);
+        ASSERT_TRUE(error.empty()) << error;
+        EXPECT_EQ(resolved.python_hash_seed, seed);
+        EXPECT_EQ(resolved.root_digest, vector["root_digest"].asString());
+    }
+}
+
+TEST(HashProfileResolver, AcceptsSupportedSeedsAndPreservesExactText) {
+    struct SeedCase {
+        const char* seed;
+        const char* root_digest;
+    };
+    const SeedCase cases[] = {
+        {"0", kSeedZeroRoot},
+        {"00", kPaddedSeedZeroRoot},
+        {"random",
+         "78d6ac7e28de859e492449dcea03e3807377d69998c5af819fed33a6df490cad"},
+        {"4294967295",
+         "177f280a5695322a18f16c96a26dc99d9c03f905940103dfe24a9c646fe446a8"},
+    };
+
+    for (const SeedCase& test_case : cases) {
+        SCOPED_TRACE(test_case.seed);
+        const HashProfile resolved = ResolvedProfile(test_case.seed);
+        EXPECT_EQ(resolved.strategy, "vllm_v1");
+        EXPECT_EQ(resolved.algorithm, "sha256_cbor");
+        EXPECT_EQ(resolved.python_hash_seed, test_case.seed);
+        EXPECT_EQ(resolved.root_digest, test_case.root_digest);
+        EXPECT_EQ(resolved.index_projection, "low64_be");
+        EXPECT_TRUE(ValidateHashProfile(resolved).empty());
+    }
+
+    EXPECT_NE(ResolvedProfile("0"), ResolvedProfile("00"));
+}
+
+TEST(HashProfileResolver, RejectsMalformedSeedTextAndClearsOutput) {
+    const std::vector<std::string> invalid = {
+        "",    "+1",     "-1",      " 0",         "0 ",         "0\n",
+        "1.0", "Random", "random ", "4294967296", "not-a-seed", "\xe9\x9b\xb6",
+    };
+
+    for (const std::string& seed : invalid) {
+        SCOPED_TRACE(seed);
+        HashProfile resolved = ValidProfile();
+        EXPECT_FALSE(
+            ResolveHashProfile(SourceProfile(seed), &resolved).empty());
+        EXPECT_EQ(resolved, HashProfile{});
+    }
+
+    EXPECT_FALSE(ResolveHashProfile(SourceProfile(), nullptr).empty());
+}
+
+TEST(HashProfileResolver, RejectsInvalidUtf8AndUnsupportedSelectors) {
+    for (const std::string seed :
+         {std::string("\xc0\xaf", 2), std::string("\xed\xa0\x80", 3)}) {
+        HashProfile resolved;
+        const std::string error =
+            ResolveHashProfile(SourceProfile(seed), &resolved);
+        EXPECT_NE(error.find("valid UTF-8"), std::string::npos);
+    }
+
+    std::vector<HashProfileConfig> unsupported;
+    auto source = SourceProfile();
+    source.strategy = "vllm_v2";
+    unsupported.push_back(source);
+    source = SourceProfile();
+    source.algorithm = "sha256";
+    unsupported.push_back(source);
+    source = SourceProfile();
+    source.index_projection = "high64_be";
+    unsupported.push_back(source);
+
+    for (const HashProfileConfig& candidate : unsupported) {
+        HashProfile resolved;
+        EXPECT_FALSE(ResolveHashProfile(candidate, &resolved).empty());
+        EXPECT_EQ(resolved, HashProfile{});
+    }
+}
+
+TEST(HashProfile, AcceptsOnlyTheSupportedResolvedProfile) {
     HashProfile profile = ValidProfile();
     EXPECT_TRUE(ValidateHashProfile(profile).empty());
 
@@ -67,7 +180,7 @@ TEST(HashProfile, AcceptsOnlyTheSupportedProfile) {
     EXPECT_NE(CreateHashStrategy(profile, nullptr), nullptr);
 }
 
-TEST(HashProfile, RejectsUnsupportedAndMalformedProfiles) {
+TEST(HashProfile, RejectsUnsupportedAndMalformedResolvedShapes) {
     std::vector<std::pair<std::string, HashProfile>> cases;
 
     HashProfile profile = ValidProfile();
@@ -81,6 +194,10 @@ TEST(HashProfile, RejectsUnsupportedAndMalformedProfiles) {
     profile = ValidProfile();
     profile.index_projection = "high64_be";
     cases.emplace_back("projection", profile);
+
+    profile = ValidProfile();
+    profile.python_hash_seed.clear();
+    cases.emplace_back("empty seed", profile);
 
     profile = ValidProfile();
     profile.root_digest.pop_back();
@@ -109,9 +226,22 @@ TEST(HashProfile, RejectsUnsupportedAndMalformedProfiles) {
     }
 }
 
+TEST(HashProfile, SemanticValidationRejectsForgedSeedRootPair) {
+    HashProfile forged = ValidProfile();
+    forged.root_digest = kPaddedSeedZeroRoot;
+
+    const std::string validation_error = ValidateHashProfile(forged);
+    EXPECT_NE(validation_error.find("does not match"), std::string::npos);
+
+    std::string factory_error = "stale error";
+    EXPECT_NE(CreateHashStrategy(forged, &factory_error), nullptr);
+    EXPECT_TRUE(factory_error.empty());
+}
+
 TEST(HashStrategyGolden, MatchesVllmAndCbor2Vectors) {
     const Json::Value fixture = LoadJsonFixture("hash_golden_vectors.json");
     const HashProfile profile = ProfileFrom(fixture["profile"]);
+    ASSERT_TRUE(ValidateHashProfile(profile).empty());
 
     std::string factory_error;
     auto strategy = CreateHashStrategy(profile, &factory_error);
@@ -240,9 +370,8 @@ TEST(HashStrategy, RejectsInvalidComputeInputsWithoutPartialOutput) {
         strategy->Compute(context, tokens, std::nullopt, nullptr).empty());
 }
 
-TEST(HashStrategy, RegisteredRootDigestChangesTheChain) {
-    HashProfile alternate_profile = ValidProfile();
-    alternate_profile.root_digest = std::string(64, '0');
+TEST(HashStrategy, ResolvedSeedChangesTheChain) {
+    const HashProfile alternate_profile = ResolvedProfile("00");
 
     std::string factory_error;
     auto default_strategy = CreateHashStrategy(ValidProfile(), &factory_error);

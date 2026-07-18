@@ -37,10 +37,7 @@ prefixindex::ContextKey ContextFromService(
 
 prefixindex::HashProfile ProfileFromService(
     const common::ServiceConfig& service) {
-    return {.strategy = service.hash_profile.strategy,
-            .algorithm = service.hash_profile.algorithm,
-            .root_digest = service.hash_profile.root_digest,
-            .index_projection = service.hash_profile.index_projection};
+    return service.hash_profile;
 }
 
 prefixindex::EngineOwner EngineOwnerFromService(
