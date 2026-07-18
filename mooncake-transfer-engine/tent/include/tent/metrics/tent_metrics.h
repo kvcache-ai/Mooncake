@@ -87,6 +87,15 @@ class TentMetrics {
     // transfer met its deadline; mlu >= 1 means it missed. Observability only.
     void recordDeadlineMLU(double mlu);
 
+    enum class Stage {
+        QueueWait,
+        Dispatch,
+        Transport,
+    };
+
+    // Causal chain: record per-stage latency breakdown (microseconds).
+    void recordStageLatency(Stage stage, double latency_us);
+
     // Get metrics for HTTP server
     std::string getPrometheusMetrics();
     std::string getJsonMetrics();
@@ -94,6 +103,14 @@ class TentMetrics {
 
     // Check if initialized
     bool isInitialized() const { return initialized_; }
+
+    // Port the HTTP metrics server is bound to, or 0 when the endpoint is not
+    // running (log-only mode, or metrics disabled at compile time). Backed by
+    // an atomic so it is safe to read from other threads while initialize() is
+    // still running.
+    uint16_t httpPort() const {
+        return bound_http_port_.load(std::memory_order_relaxed);
+    }
 
    private:
     TentMetrics() = default;
@@ -106,10 +123,22 @@ class TentMetrics {
 
     std::atomic<bool> initialized_{false};
     MetricsConfig config_;
+    // Port the HTTP server actually bound to, 0 until a successful bind. Kept
+    // separate from config_.http_port and atomic because httpPort() may be read
+    // by other threads while the initializing thread is still binding a port.
+    std::atomic<uint16_t> bound_http_port_{0};
 
 #if TENT_METRICS_ENABLED
-    // Initialize HTTP server with endpoints
-    void initHttpServer();
+    // Initialize and start the HTTP server on the configured port. Port
+    // assignment is deterministic: co-located ranks are expected to be given
+    // distinct ports explicitly (e.g. base_port + local_rank) rather than
+    // auto-scanned. Returns an error if the port cannot be bound (the caller
+    // then degrades to log-only metrics); on success bound_http_port_ is set.
+    Status initHttpServer();
+
+    // Register the /metrics, /metrics/summary, /metrics/json and /health
+    // endpoints on the current http_server_ instance.
+    void registerHttpHandlers();
 
     // HTTP server for metrics endpoint
     std::unique_ptr<coro_http::coro_http_server> http_server_;
@@ -177,6 +206,21 @@ class TentMetrics {
         "tent_deadline_mlu_permille",
         "Deadline feasibility ratio (MLU x 1000) distribution",
         kMluPerMilleBuckets};
+
+    // Causal chain stage latency histograms (microseconds)
+    // Buckets span 10us to 500ms to capture both fast RDMA and slower TCP.
+    static inline const std::vector<double> kStageBuckets{
+        10, 50, 100, 500, 1000, 5000, 10000, 50000, 100000, 500000};
+    ylt::metric::histogram_t stage_queue_wait_{
+        "tent_stage_queue_wait_us",
+        "Causal chain: queue wait latency in microseconds", kStageBuckets};
+    ylt::metric::histogram_t stage_dispatch_{
+        "tent_stage_dispatch_us",
+        "Causal chain: dispatch latency in microseconds", kStageBuckets};
+    ylt::metric::histogram_t stage_transport_{
+        "tent_stage_transport_us",
+        "Causal chain: transport execution latency in microseconds",
+        kStageBuckets};
 
     // Helper to register all metrics to the vectors
     void registerMetrics();
@@ -283,6 +327,14 @@ class ScopedLatencyRecorder {
     ::mooncake::tent::ScopedLatencyRecorder _tent_latency_recorder_( \
         ::mooncake::tent::ScopedLatencyRecorder::OperationType::Write, bytes)
 
+#define TENT_RECORD_STAGE_LATENCY(stage, latency_us)                      \
+    do {                                                                  \
+        if (::mooncake::tent::TentMetrics::isEnabled()) {                 \
+            ::mooncake::tent::TentMetrics::instance().recordStageLatency( \
+                stage, latency_us);                                       \
+        }                                                                 \
+    } while (0)
+
 #else  // !TENT_METRICS_ENABLED
 
 // No-op stub class for ScopedLatencyRecorder when metrics are disabled
@@ -301,6 +353,7 @@ class ScopedLatencyRecorder {
 #define TENT_RECORD_TRANSPORT_FAILOVER() ((void)0)
 #define TENT_SCOPED_READ_LATENCY(bytes) ((void)0)
 #define TENT_SCOPED_WRITE_LATENCY(bytes) ((void)0)
+#define TENT_RECORD_STAGE_LATENCY(stage, latency_us) ((void)0)
 
 #endif  // TENT_METRICS_ENABLED
 

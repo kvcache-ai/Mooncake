@@ -1,14 +1,17 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <cstring>
 #include <filesystem>
+#include <optional>
 #include <thread>
 
 #include "allocator.h"
-#include "storage_backend.h"
-#include "file_storage.h"
-#include "utils/common.h"
 #include "client_metric.h"
+#include "file_storage.h"
+#include "storage_backend.h"
+#include "test_server_helpers.h"
+#include "utils/common.h"
 
 namespace mooncake {
 
@@ -33,11 +36,19 @@ class FileStorageTest : public ::testing::Test {
         UnsetEnv("MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT");
         UnsetEnv("MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES");
         UnsetEnv("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS");
+        UnsetEnv("MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION");
+        UnsetEnv("MOONCAKE_OFFLOAD_DISK_EVICTION_HIGH_WATERMARK_RATIO");
+        UnsetEnv("MOONCAKE_OFFLOAD_DISK_EVICTION_LOW_WATERMARK_RATIO");
+        UnsetEnv("MOONCAKE_DISK_EVICTION_HIGH_WATERMARK_RATIO");
+        UnsetEnv("MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO");
         data_path = std::filesystem::current_path().string() + "/data";
         fs::create_directories(data_path);
         for (const auto& entry : fs::directory_iterator(data_path)) {
+            std::error_code ec;
             if (entry.is_regular_file()) {
-                fs::remove(entry.path());
+                fs::remove(entry.path(), ec);
+            } else if (entry.is_directory()) {
+                fs::remove_all(entry.path(), ec);
             }
         }
     }
@@ -69,6 +80,12 @@ class FileStorageTest : public ::testing::Test {
         return fileStorage.IsEnableOffloading();
     }
 
+    tl::expected<void, ErrorCode> FileStorageNotifyEvictedDiskReplicas(
+        FileStorage& fileStorage,
+        const std::vector<std::string>& evicted_keys) {
+        return fileStorage.NotifyEvictedDiskReplicas(evicted_keys);
+    }
+
     tl::expected<void, ErrorCode> FileStorageGroupOffloadingKeysByBucket(
         FileStorage& fileStorage,
         const std::unordered_map<std::string, int64_t>& offloading_objects,
@@ -89,6 +106,58 @@ class FileStorageTest : public ::testing::Test {
             return 0;
         }
         return bucket_backend->UngroupedOffloadingObjectsSize();
+    }
+
+    void AssertHeartbeatEvictsAllKeys(
+        FileStorage& fileStorage, const std::vector<std::string>& expected_keys,
+        const std::unordered_map<std::string, std::vector<Slice>>&
+            batch_object) {
+        ASSERT_TRUE(fileStorage.storage_backend_->Init());
+        {
+            MutexLocker locker(&fileStorage.offloading_mutex_);
+            fileStorage.enable_offloading_ = true;
+        }
+
+        auto offload_result = fileStorage.storage_backend_->BatchOffload(
+            batch_object,
+            [&fileStorage](const std::vector<std::string>& keys,
+                           std::vector<StorageObjectMetadata>& metadatas) {
+                for (auto& metadata : metadatas) {
+                    metadata.transport_endpoint = fileStorage.local_rpc_addr_;
+                }
+                auto result =
+                    fileStorage.client_->NotifyOffloadSuccess(keys, metadatas);
+                if (!result) {
+                    return result.error();
+                }
+                return ErrorCode::OK;
+            });
+        ASSERT_TRUE(offload_result.has_value());
+        ASSERT_EQ(offload_result.value(),
+                  static_cast<int64_t>(expected_keys.size()));
+
+        for (const auto& key : expected_keys) {
+            auto query_result = fileStorage.client_->Query(key);
+            ASSERT_TRUE(query_result.has_value());
+            bool has_local_disk_replica = false;
+            for (const auto& replica : query_result->replicas) {
+                has_local_disk_replica |= replica.is_local_disk_replica();
+            }
+            EXPECT_TRUE(has_local_disk_replica);
+        }
+
+        auto heartbeat_result = fileStorage.Heartbeat();
+        ASSERT_TRUE(heartbeat_result.has_value());
+
+        for (const auto& key : expected_keys) {
+            auto exists = fileStorage.storage_backend_->IsExist(key);
+            ASSERT_TRUE(exists.has_value());
+            EXPECT_FALSE(exists.value());
+
+            auto query_result = fileStorage.client_->Query(key);
+            ASSERT_FALSE(query_result.has_value());
+            EXPECT_EQ(query_result.error(), ErrorCode::OBJECT_NOT_FOUND);
+        }
     }
 
     void TearDown() override {
@@ -280,6 +349,9 @@ TEST_F(FileStorageTest, DefaultValuesWhenNoEnvSet) {
     EXPECT_EQ(config.total_keys_limit, 10'000'000);
     EXPECT_EQ(config.total_size_limit, 2ULL * 1024 * 1024 * 1024 * 1024);
     EXPECT_EQ(config.heartbeat_interval_seconds, 10u);
+    EXPECT_TRUE(config.enable_disk_watermark_eviction);
+    EXPECT_DOUBLE_EQ(config.disk_eviction_high_watermark_ratio, 0.90);
+    EXPECT_DOUBLE_EQ(config.disk_eviction_low_watermark_ratio, 0.80);
 }
 
 TEST_F(FileStorageTest, ReadStringFromEnv) {
@@ -309,6 +381,146 @@ TEST_F(FileStorageTest, ReadUint32FromEnv) {
     EXPECT_EQ(config.heartbeat_interval_seconds, 5u);
 }
 
+TEST_F(FileStorageTest, ReadDiskWatermarkConfigFromEnv) {
+    SetEnv("MOONCAKE_DISK_EVICTION_HIGH_WATERMARK_RATIO", "0.77");
+    SetEnv("MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO", "0.55");
+
+    auto alias_config = FileStorageConfig::FromEnvironment();
+    EXPECT_DOUBLE_EQ(alias_config.disk_eviction_high_watermark_ratio, 0.77);
+    EXPECT_DOUBLE_EQ(alias_config.disk_eviction_low_watermark_ratio, 0.55);
+
+    SetEnv("MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION", "0");
+    SetEnv("MOONCAKE_OFFLOAD_DISK_EVICTION_HIGH_WATERMARK_RATIO", "0.75");
+    SetEnv("MOONCAKE_OFFLOAD_DISK_EVICTION_LOW_WATERMARK_RATIO", "0.50");
+
+    auto config = FileStorageConfig::FromEnvironment();
+    EXPECT_FALSE(config.enable_disk_watermark_eviction);
+    EXPECT_DOUBLE_EQ(config.disk_eviction_high_watermark_ratio, 0.75);
+    EXPECT_DOUBLE_EQ(config.disk_eviction_low_watermark_ratio, 0.50);
+
+    SetEnv("MOONCAKE_OFFLOAD_DISK_EVICTION_HIGH_WATERMARK_RATIO", "0,75");
+    SetEnv("MOONCAKE_OFFLOAD_DISK_EVICTION_LOW_WATERMARK_RATIO", "nan");
+
+    auto invalid_config = FileStorageConfig::FromEnvironment();
+    EXPECT_DOUBLE_EQ(invalid_config.disk_eviction_high_watermark_ratio, 0.90);
+    EXPECT_DOUBLE_EQ(invalid_config.disk_eviction_low_watermark_ratio, 0.80);
+}
+
+TEST_F(FileStorageTest, HeartbeatRunsDiskWatermarkEvictionWithoutOffloadWork) {
+    std::filesystem::path master_root =
+        std::filesystem::path(data_path) / "heartbeat_master";
+    std::filesystem::create_directories(master_root);
+
+    testing::InProcMaster master;
+    auto master_config = InProcMasterConfigBuilder()
+                             .set_enable_offload(true)
+                             .set_root_fs_dir(master_root.string())
+                             .build();
+    ASSERT_TRUE(master.Start(master_config));
+
+    std::string local_rpc_addr =
+        "127.0.0.1:" + std::to_string(getFreeTcpPort());
+    auto client = Client::Create(local_rpc_addr, master.metadata_url(), "tcp",
+                                 std::nullopt, master.master_address());
+    ASSERT_TRUE(client.has_value());
+    auto mount_result = client.value()->MountLocalDiskSegment(true);
+    ASSERT_TRUE(mount_result.has_value())
+        << "MountLocalDiskSegment failed: " << toString(mount_result.error());
+
+    FileStorageConfig config = FileStorageConfig::FromEnvironment();
+    config.storage_backend_type = StorageBackendType::kFilePerKey;
+    config.storage_filepath = data_path + "/heartbeat_watermark";
+    config.local_buffer_size = 4 * 1024 * 1024;
+    config.disk_eviction_high_watermark_ratio = 1e-12;
+    config.disk_eviction_low_watermark_ratio = 0.5e-12;
+    fs::create_directories(config.storage_filepath);
+
+    FileStorage file_storage(config, client.value(), local_rpc_addr);
+
+    std::unordered_map<std::string, std::vector<Slice>> batch_object;
+    std::vector<std::unique_ptr<char[]>> buffers;
+    std::vector<std::string> expected_keys = {
+        "heartbeat_key_1", "heartbeat_key_2", "heartbeat_key_3"};
+    for (size_t i = 0; i < expected_keys.size(); ++i) {
+        auto buffer = std::make_unique<char[]>(512);
+        std::memset(buffer.get(), static_cast<int>('a' + i), 512);
+        batch_object.emplace(expected_keys[i],
+                             std::vector<Slice>{Slice{buffer.get(), 512}});
+        buffers.push_back(std::move(buffer));
+    }
+
+    AssertHeartbeatEvictsAllKeys(file_storage, expected_keys, batch_object);
+}
+
+TEST_F(FileStorageTest, NotifyEvictedDiskReplicasUsesTenantScopedKeys) {
+    std::filesystem::path master_root =
+        std::filesystem::path(data_path) / "tenant_notify_master";
+    std::filesystem::create_directories(master_root);
+
+    testing::InProcMaster master;
+    auto master_config = InProcMasterConfigBuilder()
+                             .set_enable_offload(true)
+                             .set_root_fs_dir(master_root.string())
+                             .build();
+    ASSERT_TRUE(master.Start(master_config));
+
+    std::string local_rpc_addr =
+        "127.0.0.1:" + std::to_string(getFreeTcpPort());
+    auto client = Client::Create(local_rpc_addr, master.metadata_url(), "tcp",
+                                 std::nullopt, master.master_address());
+    ASSERT_TRUE(client.has_value());
+    auto mount_result = client.value()->MountLocalDiskSegment(true);
+    ASSERT_TRUE(mount_result.has_value())
+        << "MountLocalDiskSegment failed: " << toString(mount_result.error());
+
+    FileStorageConfig config = FileStorageConfig::FromEnvironment();
+    config.storage_backend_type = StorageBackendType::kFilePerKey;
+    config.storage_filepath = data_path + "/tenant_notify";
+    fs::create_directories(config.storage_filepath);
+    FileStorage file_storage(config, client.value(), local_rpc_addr);
+
+    const std::string key = "shared_key";
+    std::vector<OffloadTaskItem> tasks = {
+        {.tenant_id = "tenant_a", .key = key, .size = 128},
+        {.tenant_id = "tenant_b", .key = key, .size = 128},
+    };
+    std::vector<StorageObjectMetadata> metadatas;
+    metadatas.reserve(tasks.size());
+    for (const auto& task : tasks) {
+        metadatas.push_back(StorageObjectMetadata{
+            .bucket_id = 0,
+            .offset = 0,
+            .key_size = static_cast<int64_t>(task.key.size()),
+            .data_size = task.size,
+            .transport_endpoint = local_rpc_addr,
+        });
+    }
+    ASSERT_TRUE(client.value()->NotifyOffloadSuccess(tasks, metadatas));
+
+    for (const auto& task : tasks) {
+        auto before = client.value()->BatchQuery({key}, task.tenant_id);
+        ASSERT_EQ(before.size(), 1);
+        ASSERT_TRUE(before[0].has_value());
+        bool has_local_disk_replica = false;
+        for (const auto& replica : before[0]->replicas) {
+            has_local_disk_replica |= replica.is_local_disk_replica();
+        }
+        ASSERT_TRUE(has_local_disk_replica);
+    }
+
+    auto notify_result = FileStorageNotifyEvictedDiskReplicas(
+        file_storage, {MakeTenantScopedStorageKey("tenant_a", key),
+                       MakeTenantScopedStorageKey("tenant_b", key)});
+    ASSERT_TRUE(notify_result.has_value());
+
+    for (const auto& task : tasks) {
+        auto after = client.value()->BatchQuery({key}, task.tenant_id);
+        ASSERT_EQ(after.size(), 1);
+        ASSERT_FALSE(after[0].has_value());
+        EXPECT_EQ(after[0].error(), ErrorCode::OBJECT_NOT_FOUND);
+    }
+}
+
 TEST_F(FileStorageTest, InvalidIntValueUsesDefault) {
     SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "abc");
     SetEnv("MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES", "sdfsdf");
@@ -320,6 +532,8 @@ TEST_F(FileStorageTest, InvalidIntValueUsesDefault) {
     EXPECT_EQ(bucket_backend_config.bucket_keys_limit, 500);
     EXPECT_EQ(config.total_size_limit, 2ULL * 1024 * 1024 * 1024 * 1024);
     EXPECT_EQ(config.heartbeat_interval_seconds, 10u);
+    EXPECT_DOUBLE_EQ(config.disk_eviction_high_watermark_ratio, 0.90);
+    EXPECT_DOUBLE_EQ(config.disk_eviction_low_watermark_ratio, 0.80);
 }
 
 TEST_F(FileStorageTest, OutOfRangeValueUsesDefault) {
@@ -384,6 +598,19 @@ TEST_F(FileStorageTest, ValidateFailsOnInvalidLimits) {
 
     config.total_size_limit = 1;
     config.heartbeat_interval_seconds = 0;
+    EXPECT_FALSE(config.Validate());
+
+    config.heartbeat_interval_seconds = 1;
+    config.disk_eviction_low_watermark_ratio = 0.9;
+    config.disk_eviction_high_watermark_ratio = 0.8;
+    EXPECT_FALSE(config.Validate());
+
+    config.disk_eviction_low_watermark_ratio = 0.0;
+    config.disk_eviction_high_watermark_ratio = 0.8;
+    EXPECT_FALSE(config.Validate());
+
+    config.disk_eviction_low_watermark_ratio = 0.8;
+    config.disk_eviction_high_watermark_ratio = 1.1;
     EXPECT_FALSE(config.Validate());
 }
 
