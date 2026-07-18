@@ -529,29 +529,12 @@ TEST_F(MetricsRecordingTest, HistogramJsonBucketsMatchBoundaries) {
 }
 
 // ---------------------------------------------------------------------------
-// Fix C (Red): when latency_buckets is set in config, the histograms must
-// STILL use the compile-time kLatencyBuckets (the config knob is being
-// removed). Today the code reassigns the histograms to the configured
-// buckets, so the bucket keys would be {"1000","2000"} -> assertion fails.
-// After Fix C removes the knob, the latency_buckets field is gone; this test
-// is updated then to drop the config assignment.
-//
-// NOTE: intentionally last — the reassignment below destructively overwrites
-// the singleton's histogram members and cannot be undone without Fix C.
+// Fix C (Green): histogram buckets are fixed at compile time. The runtime
+// config knob (latency_buckets/size_buckets) has been removed; buckets are
+// version-controlled in code for reproducible observability. This test
+// asserts the latency histogram exposes exactly the kLatencyBuckets keys.
 // ---------------------------------------------------------------------------
-TEST_F(MetricsRecordingTest, BucketsAreCompileTimeDefaultsIgnoringConfig) {
-    // Re-initialize with a config that tries to override buckets.
-    TentMetrics::instance().shutdown();
-    MetricsConfig config;
-    config.enabled = true;
-    config.http_host = "127.0.0.1";
-    config.http_port = getFreeTcpPort();
-    config.report_interval_seconds = 0;
-    config.latency_buckets = {0.001, 0.002};  // would become {1000, 2000} us
-    config.size_buckets = {1, 2};
-    ASSERT_TRUE(TentMetrics::instance().initialize(config).ok());
-    TentMetrics::setEnabled(true);
-
+TEST_F(MetricsRecordingTest, BucketsAreCompileTimeDefaults) {
     // Record one sample so the histogram is non-empty.
     TentMetrics::instance().recordReadCompleted(4096, 0.001);
 
@@ -564,7 +547,7 @@ TEST_F(MetricsRecordingTest, BucketsAreCompileTimeDefaultsIgnoringConfig) {
     std::vector<int64_t> expected = {100,  500,   1000,   5000,   10000,
                                      50000, 100000, 500000, 1000000};
     EXPECT_EQ(keys, expected)
-        << "latency buckets must be the compile-time defaults, not config-driven";
+        << "latency buckets must be the compile-time defaults";
 }
 
 #else  // !TENT_METRICS_ENABLED

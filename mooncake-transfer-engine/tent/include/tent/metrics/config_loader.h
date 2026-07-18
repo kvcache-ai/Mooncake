@@ -31,8 +31,6 @@ struct MetricsConfig {
     uint32_t report_interval_seconds = 30;  // 0 means disabled
     bool enable_prometheus = true;
     bool enable_json = true;
-    std::vector<double> latency_buckets;
-    std::vector<double> size_buckets;
 };
 
 // Helper class to load metrics configuration from various sources
@@ -74,10 +72,6 @@ constexpr const char* METRICS_REPORT_INTERVAL =
 constexpr const char* METRICS_ENABLE_PROMETHEUS = "metrics/enable_prometheus";
 constexpr const char* METRICS_ENABLE_JSON = "metrics/enable_json";
 
-// Bucket configurations
-constexpr const char* METRICS_LATENCY_BUCKETS = "metrics/latency_buckets";
-constexpr const char* METRICS_SIZE_BUCKETS = "metrics/size_buckets";
-
 // Environment variable names (with TENT_ prefix)
 constexpr const char* ENV_METRICS_ENABLED = "TENT_METRICS_ENABLED";
 constexpr const char* ENV_METRICS_HTTP_PORT = "TENT_METRICS_HTTP_PORT";
@@ -89,9 +83,6 @@ constexpr const char* ENV_METRICS_REPORT_INTERVAL =
 constexpr const char* ENV_METRICS_ENABLE_PROMETHEUS =
     "TENT_METRICS_ENABLE_PROMETHEUS";
 constexpr const char* ENV_METRICS_ENABLE_JSON = "TENT_METRICS_ENABLE_JSON";
-constexpr const char* ENV_METRICS_LATENCY_BUCKETS =
-    "TENT_METRICS_LATENCY_BUCKETS";
-constexpr const char* ENV_METRICS_SIZE_BUCKETS = "TENT_METRICS_SIZE_BUCKETS";
 }  // namespace config_keys
 
 }  // namespace tent

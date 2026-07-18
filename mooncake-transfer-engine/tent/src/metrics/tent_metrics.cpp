@@ -42,35 +42,6 @@ Status TentMetrics::initialize(const MetricsConfig& config) {
     // Set runtime enabled state from config
     runtime_enabled_.store(config_.enabled, std::memory_order_relaxed);
 
-    // Configure histogram buckets if provided (recreate histograms)
-    // Note: config latency_buckets are in seconds, convert to microseconds for
-    // histogram
-    if (!config_.latency_buckets.empty()) {
-        // Convert seconds to microseconds for histogram buckets
-        std::vector<double> latency_buckets_us;
-        latency_buckets_us.reserve(config_.latency_buckets.size());
-        for (double bucket_sec : config_.latency_buckets) {
-            latency_buckets_us.push_back(bucket_sec *
-                                         1000000.0);  // seconds -> microseconds
-        }
-        read_latency_ = ylt::metric::histogram_t(
-            "tent_read_latency_us", "Read latency distribution in microseconds",
-            latency_buckets_us);
-        write_latency_ = ylt::metric::histogram_t(
-            "tent_write_latency_us",
-            "Write latency distribution in microseconds", latency_buckets_us);
-    }
-
-    // Configure size histogram buckets if provided
-    if (!config_.size_buckets.empty()) {
-        read_size_ = ylt::metric::histogram_t(
-            "tent_read_size_bytes", "Read request size distribution in bytes",
-            config_.size_buckets);
-        write_size_ = ylt::metric::histogram_t(
-            "tent_write_size_bytes", "Write request size distribution in bytes",
-            config_.size_buckets);
-    }
-
     // Register all metrics to vectors for unified serialization
     registerMetrics();
 
