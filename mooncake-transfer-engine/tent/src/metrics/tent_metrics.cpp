@@ -175,7 +175,6 @@ void TentMetrics::shutdown() {
     // Clear metric vectors
     counters_.clear();
     histograms_.clear();
-    histogram_boundaries_.clear();
 
     initialized_ = false;
     LOG(INFO) << "TENT metrics shutdown complete";
@@ -183,9 +182,8 @@ void TentMetrics::shutdown() {
 
 void TentMetrics::registerMetrics() {
     // Pre-allocate vectors to avoid reallocation
-    counters_.reserve(7);
+    counters_.reserve(8);
     histograms_.reserve(8);
-    histogram_boundaries_.reserve(8);
 
     // Register all counters - add new counters here
     counters_ = {
@@ -194,15 +192,18 @@ void TentMetrics::registerMetrics() {
         &failover_total_,       &deadline_infeasible_total_,
     };
 
-    // Register all histograms - add new histograms here
-    // Note: histogram_boundaries_ must match the order of histograms_
+    // Register all histograms - add new histograms here. Each entry pairs the
+    // histogram with its compile-time bucket boundaries; the struct keeps the
+    // two in sync so getJsonMetrics() cannot mislabel buckets.
     histograms_ = {
-        &read_latency_, &write_latency_,    &read_size_,      &write_size_,
-        &deadline_mlu_, &stage_queue_wait_, &stage_dispatch_, &stage_transport_,
-    };
-    histogram_boundaries_ = {
-        kLatencyBuckets,     kLatencyBuckets, kSizeBuckets,  kSizeBuckets,
-        kMluPerMilleBuckets, kStageBuckets,   kStageBuckets, kStageBuckets,
+        {&read_latency_, &kLatencyBuckets},
+        {&write_latency_, &kLatencyBuckets},
+        {&read_size_, &kSizeBuckets},
+        {&write_size_, &kSizeBuckets},
+        {&deadline_mlu_, &kMluPerMilleBuckets},
+        {&stage_queue_wait_, &kStageBuckets},
+        {&stage_dispatch_, &kStageBuckets},
+        {&stage_transport_, &kStageBuckets},
     };
 }
 
@@ -308,8 +309,8 @@ std::string TentMetrics::getPrometheusMetrics() {
         }
 
         // Serialize all histograms
-        for (auto* histogram : histograms_) {
-            histogram->serialize(result);
+        for (const auto& entry : histograms_) {
+            entry.h->serialize(result);
         }
 
         return result;
@@ -331,9 +332,9 @@ std::string TentMetrics::getJsonMetrics() {
         }
 
         // Serialize all histograms
-        for (size_t h = 0; h < histograms_.size(); ++h) {
-            auto* histogram = histograms_[h];
-            const auto& boundaries = histogram_boundaries_[h];
+        for (const auto& entry : histograms_) {
+            auto* histogram = entry.h;
+            const auto& boundaries = *entry.boundaries;
 
             auto bucket_counts = histogram->get_bucket_counts();
 

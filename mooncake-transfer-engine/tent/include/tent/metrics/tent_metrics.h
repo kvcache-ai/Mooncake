@@ -175,11 +175,14 @@ class TentMetrics {
         "tent_deadline_infeasible_total",
         "Transfers whose deadline was already in the past at submit"};
 
-    // Histograms - stored as pointers for unified management
-    std::vector<ylt::metric::histogram_t*> histograms_;
-    // Store bucket boundaries separately since ylt histogram doesn't expose
-    // them publicly
-    std::vector<std::vector<double>> histogram_boundaries_;
+    // Histograms - paired with their bucket boundaries in a single vector so
+    // the two cannot drift out of sync (ylt histogram doesn't expose its
+    // boundaries publicly, so we hold them alongside the pointer).
+    struct HistogramEntry {
+        ylt::metric::histogram_t* h;
+        const std::vector<double>* boundaries;
+    };
+    std::vector<HistogramEntry> histograms_;
 
     // Latency histograms use microseconds (us) as unit
     // Default buckets: 100us, 500us, 1ms, 5ms, 10ms, 50ms, 100ms, 500ms, 1s
