@@ -87,6 +87,11 @@ class TentMetrics {
     // transfer met its deadline; mlu >= 1 means it missed. Observability only.
     void recordDeadlineMLU(double mlu);
 
+    // Record a transfer whose deadline was already in the past at submit time
+    // (infeasible window). Recorded into a dedicated counter so it is
+    // distinguishable from genuine MLU samples in the histogram above.
+    void recordDeadlineInfeasible();
+
     enum class Stage {
         QueueWait,
         Dispatch,
@@ -166,6 +171,9 @@ class TentMetrics {
     ylt::metric::counter_t failover_total_{
         "tent_transport_failover_total",
         "Total cross-transport failover events"};
+    ylt::metric::counter_t deadline_infeasible_total_{
+        "tent_deadline_infeasible_total",
+        "Transfers whose deadline was already in the past at submit"};
 
     // Histograms - stored as pointers for unified management
     std::vector<ylt::metric::histogram_t*> histograms_;

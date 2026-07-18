@@ -220,7 +220,7 @@ void TentMetrics::registerMetrics() {
     counters_ = {
         &read_bytes_total_,     &write_bytes_total_,   &read_requests_total_,
         &write_requests_total_, &read_failures_total_, &write_failures_total_,
-        &failover_total_,
+        &failover_total_,       &deadline_infeasible_total_,
     };
 
     // Register all histograms - add new histograms here
@@ -272,6 +272,12 @@ void TentMetrics::recordDeadlineMLU(double mlu) {
     if (mlu < 0.0) return;  // defensive: ignore invalid (e.g. window <= 0)
     // Store in per-mille so the integer histogram can bucket fractional ratios.
     deadline_mlu_.observe(static_cast<int64_t>(mlu * 1000.0));
+}
+
+void TentMetrics::recordDeadlineInfeasible() {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    deadline_infeasible_total_.inc();
 }
 
 void TentMetrics::recordStageLatency(Stage stage, double latency_us) {
@@ -448,6 +454,7 @@ void TentMetrics::recordReadFailed() {}
 void TentMetrics::recordWriteFailed() {}
 void TentMetrics::recordTransportFailover() {}
 void TentMetrics::recordDeadlineMLU(double) {}
+void TentMetrics::recordDeadlineInfeasible() {}
 void TentMetrics::recordStageLatency(Stage, double) {}
 
 std::string TentMetrics::getPrometheusMetrics() {

@@ -2443,7 +2443,9 @@ void TransferEngineImpl::recordTaskCompletionMetrics(
                             latency_seconds / window_seconds);
                     } else {
                         // Deadline already in the past at submit: infeasible.
-                        TentMetrics::instance().recordDeadlineMLU(5.0);
+                        // Recorded into a dedicated counter so it does not
+                        // pollute the MLU histogram with a sentinel value.
+                        TentMetrics::instance().recordDeadlineInfeasible();
                     }
                 }
             } else if (new_status == FAILED) {
