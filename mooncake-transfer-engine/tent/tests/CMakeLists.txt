@@ -20,6 +20,20 @@ target_include_directories(metrics_config_loader_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME metrics_config_loader_test COMMAND metrics_config_loader_test)
 
+# TENT Metrics HTTP server test: validates that initialize() detects a busy
+# metrics port and degrades to log-only metrics instead of falsely reporting a
+# listening endpoint.
+add_executable(tent_metrics_http_server_test metrics_http_server_test.cpp)
+target_link_libraries(tent_metrics_http_server_test
+                      PRIVATE tent_metrics tent_common gtest gtest_main glog)
+if(TARGET asio_shared)
+  target_link_libraries(tent_metrics_http_server_test PRIVATE asio_shared)
+endif()
+target_include_directories(tent_metrics_http_server_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_metrics_http_server_test
+         COMMAND tent_metrics_http_server_test)
+
 add_executable(admission_queue_test admission_queue_test.cpp
                                     ../src/runtime/admission_queue.cpp)
 target_link_libraries(admission_queue_test PRIVATE tent_common gtest gtest_main)

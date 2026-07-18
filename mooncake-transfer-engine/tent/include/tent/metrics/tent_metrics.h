@@ -104,6 +104,14 @@ class TentMetrics {
     // Check if initialized
     bool isInitialized() const { return initialized_; }
 
+    // Port the HTTP metrics server is bound to, or 0 when the endpoint is not
+    // running (log-only mode, or metrics disabled at compile time). Backed by
+    // an atomic so it is safe to read from other threads while initialize() is
+    // still running.
+    uint16_t httpPort() const {
+        return bound_http_port_.load(std::memory_order_relaxed);
+    }
+
    private:
     TentMetrics() = default;
     ~TentMetrics();
@@ -115,10 +123,22 @@ class TentMetrics {
 
     std::atomic<bool> initialized_{false};
     MetricsConfig config_;
+    // Port the HTTP server actually bound to, 0 until a successful bind. Kept
+    // separate from config_.http_port and atomic because httpPort() may be read
+    // by other threads while the initializing thread is still binding a port.
+    std::atomic<uint16_t> bound_http_port_{0};
 
 #if TENT_METRICS_ENABLED
-    // Initialize HTTP server with endpoints
-    void initHttpServer();
+    // Initialize and start the HTTP server on the configured port. Port
+    // assignment is deterministic: co-located ranks are expected to be given
+    // distinct ports explicitly (e.g. base_port + local_rank) rather than
+    // auto-scanned. Returns an error if the port cannot be bound (the caller
+    // then degrades to log-only metrics); on success bound_http_port_ is set.
+    Status initHttpServer();
+
+    // Register the /metrics, /metrics/summary, /metrics/json and /health
+    // endpoints on the current http_server_ instance.
+    void registerHttpHandlers();
 
     // HTTP server for metrics endpoint
     std::unique_ptr<coro_http::coro_http_server> http_server_;
