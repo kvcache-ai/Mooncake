@@ -34,6 +34,21 @@ target_include_directories(tent_metrics_http_server_test
 add_test(NAME tent_metrics_http_server_test
          COMMAND tent_metrics_http_server_test)
 
+# TENT Metrics recording test: drives a real TransferEngineImpl with a
+# FakeTransport and asserts that counters/histograms move correctly via the
+# JSON output. Covers completed/failed/infeasible-deadline recording and
+# histogram bucket invariants. Compiles to a stub test when metrics are
+# disabled at compile time.
+add_executable(tent_metrics_recording_test metrics_recording_test.cpp)
+target_link_libraries(tent_metrics_recording_test
+                      PRIVATE gtest gtest_main tent_link_group glog)
+if(TARGET asio_shared)
+  target_link_libraries(tent_metrics_recording_test PRIVATE asio_shared)
+endif()
+target_include_directories(tent_metrics_recording_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_metrics_recording_test COMMAND tent_metrics_recording_test)
+
 add_executable(admission_queue_test admission_queue_test.cpp
                                     ../src/runtime/admission_queue.cpp)
 target_link_libraries(admission_queue_test PRIVATE tent_common gtest gtest_main)
