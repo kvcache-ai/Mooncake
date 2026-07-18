@@ -28,7 +28,8 @@ jobs:
     uses: ./.github/workflows/_build-wheel.yaml
     with:
       runner: ubuntu-22.04-arm
-      cuda: sbsa-12.8
+      container: pytorch/manylinuxaarch64-builder:cuda12.8
+      cuda: container
       cmake-generator: Ninja
       torch-cuda-arch-list: '9.0'
       cmake-args: >-

@@ -368,6 +368,24 @@ void loadGlobalConfig(GlobalConfig& config) {
                             "MC_HANDSHAKE_CONNECT_TIMEOUT";
     }
 
+    const char* rdma_rail_pause_seconds =
+        std::getenv("MC_RDMA_RAIL_PAUSE_SECONDS");
+    if (rdma_rail_pause_seconds) {
+        try {
+            int val = std::stoi(rdma_rail_pause_seconds);
+            if (val > 0 && val < 3600) {
+                config.rdma_rail_pause_seconds = static_cast<uint64_t>(val);
+            } else {
+                LOG(WARNING) << "Ignore value from environment variable "
+                                "MC_RDMA_RAIL_PAUSE_SECONDS";
+            }
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Invalid MC_RDMA_RAIL_PAUSE_SECONDS environment "
+                            "value: "
+                         << rdma_rail_pause_seconds << ". Error: " << e.what();
+        }
+    }
+
     const char* log_level = std::getenv("MC_LOG_LEVEL");
     config.trace = false;
     if (log_level) {
@@ -688,6 +706,7 @@ void dumpGlobalConfig() {
     LOG(INFO) << "ib_service_level = " << config.ib_service_level;
     LOG(INFO) << "te_metadata_refresh_interval_seconds = "
               << config.te_metadata_refresh_interval_seconds;
+    LOG(INFO) << "rdma_rail_pause_seconds = " << config.rdma_rail_pause_seconds;
     {
         std::ostringstream oss;
         for (size_t i = 0; i < config.mlx5_qp_udp_sports.size(); ++i) {
