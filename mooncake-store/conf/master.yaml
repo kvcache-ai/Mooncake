@@ -27,6 +27,7 @@ memory_allocator: "offset"
 client_live_ttl_sec: 60
 
 # OpLog store configuration for HA hot-standby replication
+enable_oplog: false
 # OpLog store type: "etcd_batch_record", "etcd", "localfs", or empty
 # (default: etcd_batch_record if compiled with etcd support, else localfs)
 oplog_store_type: ""

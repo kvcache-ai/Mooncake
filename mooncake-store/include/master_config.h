@@ -56,6 +56,7 @@ struct MasterConfig {
     std::string etcd_endpoints;
 
     // OpLog store configuration
+    bool enable_oplog = false;
     std::string oplog_store_type;
     std::string oplog_store_root_dir = "/tmp/mooncake_oplog";
     int oplog_poll_interval_ms = 1000;
@@ -190,6 +191,7 @@ class MasterServiceSupervisorConfig {
     std::string ha_backend_connstring;
     std::string etcd_endpoints = "0.0.0.0:2379";
     // OpLog store configuration
+    bool enable_oplog = false;
     std::string oplog_store_type;
     std::string oplog_store_root_dir = "/tmp/mooncake_oplog";
     int oplog_poll_interval_ms = 1000;
@@ -316,6 +318,7 @@ class MasterServiceSupervisorConfig {
         etcd_endpoints = config.etcd_endpoints;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring, etcd_endpoints);
+        enable_oplog = config.enable_oplog;
         oplog_store_type = config.oplog_store_type;
         oplog_store_root_dir = config.oplog_store_root_dir;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
@@ -474,6 +477,7 @@ class WrappedMasterServiceConfig {
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     // OpLog store configuration
+    bool enable_oplog = false;
     std::string oplog_store_type;
     std::string oplog_store_root_dir = "/tmp/mooncake_oplog";
     int oplog_poll_interval_ms = 1000;
@@ -565,6 +569,7 @@ class WrappedMasterServiceConfig {
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring,
             config.etcd_endpoints);
+        enable_oplog = config.enable_oplog;
         oplog_store_type = config.oplog_store_type;
         oplog_store_root_dir = config.oplog_store_root_dir;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
@@ -678,6 +683,7 @@ class WrappedMasterServiceConfig {
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring,
             config.etcd_endpoints);
+        enable_oplog = config.enable_oplog;
         oplog_store_type = config.oplog_store_type;
         oplog_store_root_dir = config.oplog_store_root_dir;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
@@ -745,6 +751,7 @@ class MasterServiceConfigBuilder {
     std::string ha_backend_type_ = "etcd";
     std::string ha_backend_connstring_;
     // OpLog store configuration
+    bool enable_oplog_ = false;
     std::string oplog_store_type_;
     std::string oplog_store_root_dir_ = "/tmp/mooncake_oplog";
     int oplog_poll_interval_ms_ = 1000;
@@ -870,6 +877,11 @@ class MasterServiceConfigBuilder {
     MasterServiceConfigBuilder& set_ha_backend_connstring(
         const std::string& connstring) {
         ha_backend_connstring_ = connstring;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_enable_oplog(bool enable) {
+        enable_oplog_ = enable;
         return *this;
     }
 
@@ -1130,6 +1142,7 @@ class MasterServiceConfig {
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     // OpLog store configuration
+    bool enable_oplog = false;
     std::string oplog_store_type;
     std::string oplog_store_root_dir = "/tmp/mooncake_oplog";
     int oplog_poll_interval_ms = 1000;
@@ -1215,6 +1228,7 @@ class MasterServiceConfig {
         kv_events_queue_capacity = config.kv_events_queue_capacity;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = config.ha_backend_connstring;
+        enable_oplog = config.enable_oplog;
         oplog_store_type = config.oplog_store_type;
         oplog_store_root_dir = config.oplog_store_root_dir;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
@@ -1284,6 +1298,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.enable_offload = enable_offload_;
     config.ha_backend_type = ha_backend_type_;
     config.ha_backend_connstring = ha_backend_connstring_;
+    config.enable_oplog = enable_oplog_;
     config.oplog_store_type = oplog_store_type_;
     config.oplog_store_root_dir = oplog_store_root_dir_;
     config.oplog_poll_interval_ms = oplog_poll_interval_ms_;

@@ -164,6 +164,30 @@ TEST(StandbyControllerTest, PromoteStandbyReturnsStartFailure) {
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, controller->PromoteStandby());
 }
 
+TEST(StandbyControllerTest, OplogEnablementControlsReaderController) {
+    ha::HABackendSpec spec{
+        .type = ha::HABackendType::ETCD,
+        .connstring = "http://localhost:2379",
+        .cluster_namespace = "oplog-reader-gate-test",
+    };
+    MasterServiceSupervisorConfig config;
+
+    auto disabled = ha::CreateStandbyController(spec, config);
+    ASSERT_NE(disabled, nullptr);
+    EXPECT_EQ(ErrorCode::OK, disabled->PromoteStandby());
+
+    config.enable_oplog = true;
+    auto enabled = ha::CreateStandbyController(spec, config);
+    ASSERT_NE(enabled, nullptr);
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS,
+              enabled->PromoteStandby());
+
+    spec.type = ha::HABackendType::REDIS;
+    auto unsupported = ha::CreateStandbyController(spec, config);
+    ASSERT_NE(unsupported, nullptr);
+    EXPECT_EQ(ErrorCode::OK, unsupported->PromoteStandby());
+}
+
 TEST(StandbyControllerTest,
      PromoteStandbyAndExport_ReturnsErrorWhenNotStarted) {
     ha::HABackendSpec spec{

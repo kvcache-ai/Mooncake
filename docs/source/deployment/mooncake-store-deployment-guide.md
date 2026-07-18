@@ -143,6 +143,7 @@ mooncake_master \
   --enable_ha=true \
   --ha_backend_type=etcd \
   --ha_backend_connstring="10.0.0.1:2379;10.0.0.2:2379;10.0.0.3:2379" \
+  --enable_oplog=true \
   --oplog_store_type=etcd \
   --rpc_address=10.0.0.1
 ```
@@ -162,12 +163,10 @@ mooncake_master \
   --enable_ha=true \
   --ha_backend_type=redis \
   --ha_backend_connstring="redis://127.0.0.1:6379" \
-  --oplog_store_type=localfs \
-  --oplog_store_root_dir=/shared/mooncake_oplog \
   --rpc_address=10.0.0.1
 ```
 
-**Client addressing:** clients reach a Redis-backed HA cluster with the `redis://connstring` master-address form (e.g. `redis://127.0.0.1:6379`) for `master_server_addr` / `MOONCAKE_MASTER` / `--master_server_address`, instead of a single `IP:Port`. Redis is used only for leader election here; choose an OpLog backend separately.
+**Client addressing:** clients reach a Redis-backed HA cluster with the `redis://connstring` master-address form (e.g. `redis://127.0.0.1:6379`) for `master_server_addr` / `MOONCAKE_MASTER` / `--master_server_address`, instead of a single `IP:Port`. Redis is used only for leader election here. OpLog replication currently requires `ha_backend_type=etcd`.
 
 
 ---
@@ -264,13 +263,14 @@ Mooncake Store supports a Primary-Standby HA model with OpLog-based replication.
 
 ### HA Configuration
 
-HA uses two related but separate backends:
+HA leadership and metadata replication are configured separately:
 
 - The HA coordinator elects the active master. Configure it with `--enable_ha`, `--ha_backend_type`, `--ha_backend_connstring`, and `--cluster_id`. For `ha_backend_type=etcd`, legacy `--etcd_endpoints` is used only when `--ha_backend_connstring` is empty.
-- The OpLog store persists metadata mutations so standby masters can catch up and later be promoted. Configure it with the OpLog parameters below.
+- The optional OpLog store persists metadata mutations so standby masters can catch up and later be promoted. Enable it explicitly with `--enable_oplog=true`; it is disabled by default and currently requires `ha_backend_type=etcd`.
 
 
-- `--oplog_store_type`: Backend for OpLog storage.
+- `--enable_oplog`: Enable the primary OpLog writer and standby reader. Defaults to `false`.
+- `--oplog_store_type`: Backend for OpLog storage. Setting this option does not enable OpLog by itself.
   - `etcd_batch_record`: Use etcd ordered batch records (requires `STORE_USE_ETCD` at compile time).
   - `etcd`: Use legacy per-entry etcd OpLog storage (requires `STORE_USE_ETCD` at compile time).
   - `localfs`: Use a filesystem path shared by the primary and standby masters.
@@ -326,6 +326,7 @@ enable_ha: true
 ha_backend_type: "etcd"
 ha_backend_connstring: "etcd-1:2379;etcd-2:2379;etcd-3:2379"
 cluster_id: "mooncake_cluster"
+enable_oplog: true
 oplog_store_type: "etcd"
 enable_snapshot: true
 snapshot_object_store_type: "local"
@@ -340,6 +341,7 @@ enable_ha: true
 ha_backend_type: "etcd"
 ha_backend_connstring: "etcd-1:2379;etcd-2:2379;etcd-3:2379"
 cluster_id: "mooncake_cluster"
+enable_oplog: true
 oplog_store_type: "etcd"
 enable_snapshot_restore: true
 snapshot_object_store_type: "local"
@@ -372,6 +374,7 @@ enable_ha: true
 ha_backend_type: "etcd"
 ha_backend_connstring: "http://localhost:2379"
 cluster_id: "test_cluster"
+enable_oplog: true
 oplog_store_type: "localfs"
 oplog_store_root_dir: "/tmp/mooncake_oplog"
 oplog_poll_interval_ms: 1000
@@ -639,6 +642,7 @@ mooncake_master \
 | `--ha_backend_connstring` | empty | HA backend connection string |
 | `--etcd_endpoints` | empty | Backward-compatible etcd HA endpoints, used only for `ha_backend_type=etcd` when `--ha_backend_connstring` is empty |
 | `--cluster_id` | `mooncake_cluster` | Cluster ID for HA persistence |
+| `--enable_oplog` | `false` | Enable the primary OpLog writer and standby reader; currently requires `enable_ha=true` and `ha_backend_type=etcd` |
 | `--oplog_store_type` | empty | OpLog store type: `etcd_batch_record`, `etcd`, `localfs`, or empty for compile-time default (`etcd_batch_record` with etcd support, otherwise `localfs`) |
 | `--oplog_store_root_dir` | `/tmp/mooncake_oplog` | Root directory for localfs OpLog store; must be shared between primary and standby when using `localfs` |
 | `--oplog_poll_interval_ms` | `1000` | Poll interval in milliseconds for localfs and base polling/retry delay for batch standby |

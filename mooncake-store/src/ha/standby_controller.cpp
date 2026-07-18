@@ -44,7 +44,8 @@ StandbyRuntimeCapabilities BuildStandbyRuntimeCapabilities(
     const HABackendSpec& spec, const MasterServiceSupervisorConfig& config) {
     StandbyRuntimeCapabilities capabilities;
     capabilities.has_snapshot_bootstrap = config.enable_snapshot_restore;
-    capabilities.has_oplog_following = spec.type == HABackendType::ETCD;
+    capabilities.has_oplog_following =
+        config.enable_oplog && spec.type == HABackendType::ETCD;
     return capabilities;
 }
 

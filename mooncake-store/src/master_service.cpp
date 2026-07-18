@@ -200,8 +200,10 @@ MasterService::MasterService(const MasterServiceConfig& config)
       enable_offload_(config.enable_offload),
       ha_backend_type_(config.ha_backend_type),
       ha_backend_connstring_(config.ha_backend_connstring),
+      enable_oplog_(config.enable_oplog && config.ha_backend_type == "etcd"),
       oplog_batch_max_entries_(config.oplog_batch_max_entries),
-      use_batch_oplog_(config.enable_ha &&
+      use_batch_oplog_(config.enable_ha && config.enable_oplog &&
+                       config.ha_backend_type == "etcd" &&
                        ParseOpLogStoreType(config.oplog_store_type) ==
                            OpLogStoreType::ETCD_BATCH_RECORD),
       cluster_id_(config.cluster_id),
@@ -419,7 +421,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
             ? kDefaultOpLogStoreType
             : ParseOpLogStoreType(config.oplog_store_type);
 
-    if (enable_ha_ && !cluster_id_.empty()) {
+    if (enable_ha_ && enable_oplog_ && !cluster_id_.empty()) {
         if (use_batch_oplog_) {
 #ifdef STORE_USE_ETCD
             if (ha_backend_connstring_.empty()) {

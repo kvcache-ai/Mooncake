@@ -284,6 +284,8 @@ DEFINE_string(cluster_id, mooncake::DEFAULT_CLUSTER_ID,
               "in HA mode");
 
 // OpLog store configuration
+DEFINE_bool(enable_oplog, false,
+            "Enable HA metadata replication through the configured OpLog");
 DEFINE_string(oplog_store_type, "",
               "OpLog store type: etcd, localfs. Empty means default.");
 DEFINE_string(oplog_store_root_dir, "/tmp/mooncake_oplog",
@@ -563,6 +565,8 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                              FLAGS_etcd_endpoints);
     default_config.GetString("cluster_id", &master_config.cluster_id,
                              FLAGS_cluster_id);
+    default_config.GetBool("enable_oplog", &master_config.enable_oplog,
+                           FLAGS_enable_oplog);
     default_config.GetString("oplog_store_type",
                              &master_config.oplog_store_type,
                              FLAGS_oplog_store_type);
@@ -1004,6 +1008,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.cluster_id = FLAGS_cluster_id;
     }
+    if ((google::GetCommandLineFlagInfo("enable_oplog", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_oplog = FLAGS_enable_oplog;
+    }
     if ((google::GetCommandLineFlagInfo("oplog_batch_max_entries", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -1341,6 +1350,14 @@ int main(int argc, char* argv[]) {
                    << "etcd_endpoints";
         return 1;
     }
+    if (master_config.enable_oplog && !master_config.enable_ha) {
+        LOG(FATAL) << "enable_oplog requires enable_ha=true";
+        return 1;
+    }
+    if (master_config.enable_oplog && master_config.ha_backend_type != "etcd") {
+        LOG(FATAL) << "enable_oplog currently requires ha_backend_type=etcd";
+        return 1;
+    }
     if (!master_config.enable_ha && (!ha_backend_connstring.empty() ||
                                      !master_config.etcd_endpoints.empty())) {
         LOG(WARNING)
@@ -1416,6 +1433,7 @@ int main(int argc, char* argv[]) {
         << ", eviction_high_watermark_ratio="
         << master_config.eviction_high_watermark_ratio
         << ", enable_ha=" << master_config.enable_ha
+        << ", enable_oplog=" << master_config.enable_oplog
         << ", enable_offload=" << master_config.enable_offload
         << ", enable_kv_events=" << master_config.enable_kv_events
         << ", kv_events_bind_endpoint=" << master_config.kv_events_bind_endpoint
