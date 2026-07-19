@@ -64,6 +64,8 @@ class StagePayload:
             )
         if self.num_chunks < 1:
             raise ValueError(f"num_chunks must be >= 1, got {self.num_chunks}")
+        if self.lease is not None and self.lease <= 0:
+            raise ValueError(f"lease must be > 0, got {self.lease}")
 
 
 @dataclass(frozen=True)
