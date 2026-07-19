@@ -3,8 +3,6 @@
 #include <iomanip>
 #include <sstream>
 
-#include "ha/oplog/oplog_store.h"
-
 namespace mooncake {
 
 namespace {
@@ -93,7 +91,7 @@ bool ValidateOpLogBatchEntry(const OpLogEntry& entry, std::string* reason) {
         SetReason(reason, "tenant_id is empty or invalid");
         return false;
     }
-    return OpLogManager::ValidateEntrySize(entry, reason);
+    return ValidateOpLogEntrySize(entry, reason);
 }
 
 bool ValidateOpLogBatchClusterId(const std::string& cluster_id,

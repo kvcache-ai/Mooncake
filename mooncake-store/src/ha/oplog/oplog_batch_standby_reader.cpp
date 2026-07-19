@@ -37,9 +37,7 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
     if (err == ErrorCode::ETCD_KEY_NOT_EXIST) {
         if (batch_format_seen_) {
             SetPollError(result, ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, false);
-            return result;
         }
-        result.used_legacy_path = true;
         return result;
     }
     if (err != ErrorCode::OK) {
@@ -47,6 +45,7 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
         return result;
     }
     batch_format_seen_ = true;
+    result.durable_prefix_present = true;
     result.durable_prefix = prefix;
 
     if (last_observed_prefix_ &&
@@ -60,12 +59,10 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
         return result;
     }
 
-    const uint64_t expected = applier_.GetExpectedSequenceId();
     if (prefix.batch_id == 0) {
         last_observed_prefix_ = prefix;
-        if (IsSequenceOlderOrEqual(expected, prefix.last_seq)) {
-            result.waiting_for_legacy_catch_up = true;
-            result.legacy_catch_up_target = prefix.last_seq;
+        if (prefix.last_seq != 0) {
+            SetPollError(result, ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, false);
         }
         return result;
     }
@@ -115,12 +112,6 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
                 continue;
             }
             if (IsSequenceNewer(entry.sequence_id, expected)) {
-                if (last_applied_batch_id_ == 0 &&
-                    result.applied_entries == 0) {
-                    result.waiting_for_legacy_catch_up = true;
-                    result.legacy_catch_up_target = entry.sequence_id - 1;
-                    return result;
-                }
                 SetPollError(result, ErrorCode::INCOMPLETE_OPLOG_CATCH_UP,
                              false);
                 return result;

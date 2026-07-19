@@ -39,9 +39,7 @@
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "task_manager.h"
 #include "kv_event/kv_event_publisher.h"
-#include "ha/oplog/oplog_manager.h"
-#include "ha/oplog/oplog_store.h"
-#include "ha/oplog/oplog_store_factory.h"
+#include "ha/oplog/oplog_types.h"
 #include "ha/oplog/ordered_oplog_writer.h"
 #include "allocator.h"
 #include "metadata_store.h"
@@ -58,8 +56,6 @@ class MasterSnapshotCodec;
 struct MasterSnapshotPayloads;
 class MasterSnapshotCodecTest;  // test fixture, needs private state access
 }  // namespace ha
-
-class EtcdOpLogStore;
 
 // Forward declarations
 class AllocationStrategy;
@@ -142,19 +138,8 @@ class MasterService {
     DeleteTenantQuotaPolicy(const TenantId& tenant_id);
     uint64_t GetTenantQuotaAllocatableCapacityBytes();
 
-    /**
-     * @brief Inject a mock OpLogStore for testing. Must be called before
-     *        any HA OpLog operations.
-     */
-    void SetOpLogStoreForTesting(std::shared_ptr<OpLogStore> store);
     ErrorCode SetBatchOpLogBackendForTesting(
         std::shared_ptr<HaKvBackend> backend);
-
-    /**
-     * @brief Override retry behavior for OpLog persist in tests.
-     */
-    void SetOpLogRetryConfigForTesting(uint32_t max_attempts,
-                                       uint32_t max_backoff_ms);
 
     /**
      * @brief Test-only wrapper around BatchEvict / NoFBatchEvict so that
@@ -1725,7 +1710,7 @@ class MasterService {
             // violation (client_mutex_ must be acquired before metadata shard).
             // local_disk replicas are cleaned up by ClearInvalidHandles() in
             // ClientMonitorFunc.
-            if (!(service_->enable_ha_ && service_->use_batch_oplog_) &&
+            if (!(service_->enable_ha_ && service_->enable_oplog_) &&
                 tenant_state_ != nullptr &&
                 it_ != tenant_state_->metadata.end()) {
                 // Erase invalid memory replicas (those with unmounted
@@ -2080,7 +2065,6 @@ class MasterService {
     const std::string ha_backend_connstring_;
     const bool enable_oplog_;
     const uint32_t oplog_batch_max_entries_;
-    const bool use_batch_oplog_;
 
     // cluster id for persistent sub directory
     const std::string cluster_id_;
@@ -2275,23 +2259,11 @@ class MasterService {
                                     const TenantId& tenant_id);
 
     // OpLog publishing
-    std::shared_ptr<OpLogStore> oplog_store_;
-    OpLogManager oplog_manager_;
     std::shared_ptr<HaKvBackend> batch_oplog_kv_backend_;
     std::unique_ptr<OpLogBatchStorage> batch_oplog_storage_;
     std::unique_ptr<OrderedOpLogWriter> ordered_oplog_writer_;
 
     // OpLog publishing helpers
-    void AppendOpLogAndNotify(OpType type, const std::string& key,
-                              const std::string& payload = {});
-    void AppendOpLogAndNotify(OpType type, const TenantId& tenant_id,
-                              const std::string& key,
-                              const std::string& payload);
-    tl::expected<uint64_t, ErrorCode> AppendOpLogAndNotifyDurable(
-        OpType type, const std::string& key, const std::string& payload = {});
-    tl::expected<uint64_t, ErrorCode> AppendOpLogAndNotifyDurable(
-        OpType type, const TenantId& tenant_id, const std::string& key,
-        const std::string& payload);
     std::string SerializeMetadataForOpLog(const ObjectMetadata& metadata) const;
     std::string SerializeMetadataForOpLogWithoutMemReplicas(
         const ObjectMetadata& metadata) const;
@@ -2313,7 +2285,6 @@ class MasterService {
         OrderedOpLogWriter::Reservation&& reservation, OpType type,
         const std::string& tenant_id, const std::string& key,
         const std::string& payload, DurableFinalizeCallback callback);
-    ErrorCode PersistOpLogEntryWithSyncRetries(const OpLogEntry& entry) const;
 
     // Invalid endpoints from standby that don't exist locally
     std::unordered_set<std::string> invalid_replica_endpoints_;
@@ -2322,63 +2293,6 @@ class MasterService {
     // Key: transport_endpoint, Value: allocator.
     std::unordered_map<std::string, std::shared_ptr<BufferAllocatorBase>>
         standby_allocator_keepalive_;
-
-    // Pending mutation retry queue
-    enum class PendingMutationKind : uint8_t {
-        EVICT_MEM_REPLICAS = 1,
-        CLEAR_ALL_REPLICAS = 2,
-        CLEAR_REPLICAS_ON_SEGMENT = 3,
-        SEGMENT_LIFECYCLE = 4,
-        RELEASE_REMOVED_REPLICAS = 5,
-    };
-
-    struct PendingMutation {
-        PendingMutationKind kind;
-        std::string key;
-        std::string segment_name;
-        OpLogEntry oplog_entry;
-        std::vector<ReplicaID> removed_replica_ids;
-        QuotaEraseMode quota_mode{QuotaEraseMode::kFull};
-        uint32_t attempt{0};
-        std::chrono::steady_clock::time_point next_retry_at{};
-    };
-
-    void EnqueuePendingMutation(PendingMutation m);
-    void PendingMutationWorker();
-    bool ProcessPendingMutationOnce(PendingMutation& m);
-    void EnqueueRetryOnPersistFailure(const char* why, PendingMutationKind kind,
-                                      OpLogEntry entry);
-    void EnqueueRemovedReplicaFinalize(const char* why, OpLogEntry entry,
-                                       std::vector<ReplicaID> replica_ids,
-                                       QuotaEraseMode quota_mode);
-    void AppendOrPersistOrEnqueue(const char* why, OpType type,
-                                  const std::string& key,
-                                  const std::string& payload,
-                                  PendingMutationKind kind);
-    void AppendOrPersistOrEnqueue(const char* why, OpType type,
-                                  const TenantId& tenant_id,
-                                  const std::string& key,
-                                  const std::string& payload,
-                                  PendingMutationKind kind);
-    void AppendOrPersistOrEnqueueLazy(const char* why, OpType type,
-                                      const std::string& key,
-                                      const std::string& payload,
-                                      PendingMutationKind kind);
-    void AppendOrPersistOrEnqueueLazy(const char* why, OpType type,
-                                      const TenantId& tenant_id,
-                                      const std::string& key,
-                                      const std::string& payload,
-                                      PendingMutationKind kind);
-
-    /**
-     * Strong-consistency variant: if OpLog persist fails, returns error.
-     * Caller must NOT proceed with local mutation if this returns error.
-     */
-    tl::expected<OpLogEntry, ErrorCode> AppendOpLogAndNotifyDurableOrAbort(
-        OpType type, const std::string& key, const std::string& payload);
-    tl::expected<OpLogEntry, ErrorCode> AppendOpLogAndNotifyDurableOrAbort(
-        OpType type, const TenantId& tenant_id, const std::string& key,
-        const std::string& payload);
 
     /**
      * Segment lifecycle persist helper. Tries to durably persist the
@@ -2412,17 +2326,6 @@ class MasterService {
     std::vector<Replica::Descriptor> BuildRemainingReplicaDescriptors(
         const ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& should_remove) const;
-
-    std::mutex pending_mutations_mutex_;
-    std::condition_variable pending_mutations_cv_;
-    std::deque<PendingMutation> pending_mutations_;
-    std::atomic<bool> pending_mutations_running_{false};
-    std::thread pending_mutations_thread_;
-    static constexpr size_t kMaxPendingMutations = 10000;
-
-    // Test-only overrides for PersistOpLogEntryWithSyncRetries
-    std::atomic<uint32_t> oplog_retry_max_attempts_for_testing_{10};
-    std::atomic<uint32_t> oplog_retry_max_backoff_ms_for_testing_{30000};
 };
 
 }  // namespace mooncake

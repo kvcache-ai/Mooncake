@@ -42,22 +42,25 @@ add_test(
   NAME replica_selection_env_opt_in_test
   COMMAND replica_selection_test
           --gtest_filter=ReplicaSelectionTest.EnvironmentOptInUsesBuiltinScorer)
-set_tests_properties(
-  replica_selection_env_opt_in_test
-  PROPERTIES ENVIRONMENT "MC_STORE_REPLICA_SCORING=1")
+set_tests_properties(replica_selection_env_opt_in_test
+                     PROPERTIES ENVIRONMENT "MC_STORE_REPLICA_SCORING=1")
 add_store_test(eviction_strategy_test eviction_strategy_test.cpp)
 add_store_test(deadline_scheduler_test deadline_scheduler_test.cpp)
 add_store_test(kv_event_publisher_test kv_event_publisher_test.cpp)
 if(ENABLE_KV_EVENTS)
-  find_library(KV_EVENT_TEST_ZMQ_LIBRARY NAMES zmq libzmq PATHS /usr/lib
-               /usr/local/lib /usr/lib64)
-  find_path(KV_EVENT_TEST_ZMQ_INCLUDE_DIR NAMES zmq.h PATHS /usr/include
-            /usr/local/include)
-  target_compile_definitions(kv_event_publisher_test PRIVATE
-                             MOONCAKE_ENABLE_KV_EVENTS=1)
+  find_library(
+    KV_EVENT_TEST_ZMQ_LIBRARY
+    NAMES zmq libzmq
+    PATHS /usr/lib /usr/local/lib /usr/lib64)
+  find_path(
+    KV_EVENT_TEST_ZMQ_INCLUDE_DIR
+    NAMES zmq.h
+    PATHS /usr/include /usr/local/include)
+  target_compile_definitions(kv_event_publisher_test
+                             PRIVATE MOONCAKE_ENABLE_KV_EVENTS=1)
   if(KV_EVENT_TEST_ZMQ_LIBRARY AND KV_EVENT_TEST_ZMQ_INCLUDE_DIR)
     target_include_directories(kv_event_publisher_test
-                             PRIVATE ${KV_EVENT_TEST_ZMQ_INCLUDE_DIR})
+                               PRIVATE ${KV_EVENT_TEST_ZMQ_INCLUDE_DIR})
     target_link_libraries(kv_event_publisher_test
                           PRIVATE ${KV_EVENT_TEST_ZMQ_LIBRARY})
   endif()
@@ -220,34 +223,26 @@ add_ha_test(hot_standby_service_test ha/standby/hot_standby_service_test.cpp)
 add_ha_test(hot_standby_snapshot_bootstrap_test
             ha/standby/hot_standby_snapshot_bootstrap_test.cpp)
 add_ha_test(oplog_applier_test ha/oplog/oplog_applier_test.cpp)
-add_ha_test(oplog_manager_test ha/oplog/oplog_manager_test.cpp)
-add_ha_test(etcd_oplog_store_test ha/oplog/etcd_oplog_store_test.cpp)
-add_ha_test(oplog_replicator_test ha/oplog/oplog_replicator_test.cpp)
-add_ha_test(oplog_serializer_test ha/oplog/oplog_serializer_test.cpp)
+add_ha_test(oplog_types_test ha/oplog/oplog_types_test.cpp)
 add_ha_test(oplog_batch_codec_test ha/oplog/oplog_batch_codec_test.cpp)
 add_ha_test(oplog_batch_standby_reader_test
             ha/oplog/oplog_batch_standby_reader_test.cpp)
 add_ha_test(ordered_oplog_writer_test ha/oplog/ordered_oplog_writer_test.cpp)
 if(MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
-  target_compile_definitions(
-    ha_metric_manager_test PRIVATE MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
-  target_compile_definitions(
-    ordered_oplog_writer_test PRIVATE MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
+  target_compile_definitions(ha_metric_manager_test
+                             PRIVATE MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
+  target_compile_definitions(ordered_oplog_writer_test
+                             PRIVATE MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
 endif()
 add_executable(
-  oplog_test_failpoint_test
-  ha/oplog/oplog_test_failpoint_test.cpp
-  ../src/ha/oplog/oplog_test_failpoint.cpp)
+  oplog_test_failpoint_test ha/oplog/oplog_test_failpoint_test.cpp
+                            ../src/ha/oplog/oplog_test_failpoint.cpp)
 target_compile_definitions(oplog_test_failpoint_test
                            PRIVATE MOONCAKE_ENABLE_TEST_FAILPOINTS)
 target_link_libraries(oplog_test_failpoint_test PRIVATE glog gtest gtest_main
                                                         pthread)
 add_test(NAME oplog_test_failpoint_test COMMAND oplog_test_failpoint_test)
-add_ha_test(localfs_oplog_store_test ha/oplog/localfs_oplog_store_test.cpp)
-add_ha_test(ha_recovery_test ha/oplog/ha_recovery_test.cpp)
 add_ha_test(master_service_ha_test ha/master_service_ha_test.cpp)
-add_ha_test(localfs_hot_standby_integration_test
-            ha/oplog/localfs_hot_standby_integration_test.cpp)
 add_ha_test(catalog_backed_snapshot_provider_test
             ha/snapshot/catalog_backed_snapshot_provider_test.cpp)
 if(STORE_USE_REDIS)

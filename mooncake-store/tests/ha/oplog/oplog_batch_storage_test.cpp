@@ -138,18 +138,15 @@ OpLogBatchRecord MakeBatch(uint64_t batch_id, uint64_t first_seq,
 
 }  // namespace
 
-TEST(OpLogBatchStorageTest, InitializesDurablePrefixFromMaximumLegacyEntry) {
+TEST(OpLogBatchStorageTest, InitializesEmptyNamespaceAtZero) {
     FakeHaKvBackend backend;
-    ASSERT_EQ(ErrorCode::OK, backend.Put("/oplog/clusterA/latest", "42"));
-    ASSERT_EQ(ErrorCode::OK,
-              backend.Put("/oplog/clusterA/00000000000000000045", "entry"));
     OpLogBatchStorage storage("clusterA", backend);
 
     DurablePrefix prefix;
     EXPECT_EQ(ErrorCode::OK, storage.InitDurablePrefix(prefix));
 
     EXPECT_EQ(0u, prefix.batch_id);
-    EXPECT_EQ(45u, prefix.last_seq);
+    EXPECT_EQ(0u, prefix.last_seq);
     std::string encoded;
     ASSERT_EQ(ErrorCode::OK,
               backend.Get("/oplog/clusterA/durable_prefix", encoded));
@@ -159,30 +156,33 @@ TEST(OpLogBatchStorageTest, InitializesDurablePrefixFromMaximumLegacyEntry) {
     EXPECT_EQ(prefix.last_seq, stored.last_seq);
 }
 
-TEST(OpLogBatchStorageTest, IgnoresLegacyLatestAboveMaximumEntry) {
+TEST(OpLogBatchStorageTest, RejectsLegacyLatest) {
     FakeHaKvBackend backend;
-    ASSERT_EQ(ErrorCode::OK, backend.Put("/oplog/clusterA/latest", "45"));
-    ASSERT_EQ(ErrorCode::OK,
-              backend.Put("/oplog/clusterA/00000000000000000042", "entry"));
-    OpLogBatchStorage storage("clusterA/", backend);
-
-    DurablePrefix prefix;
-    EXPECT_EQ(ErrorCode::OK, storage.InitDurablePrefix(prefix));
-
-    EXPECT_EQ(0u, prefix.batch_id);
-    EXPECT_EQ(42u, prefix.last_seq);
-}
-
-TEST(OpLogBatchStorageTest, IgnoresLegacyLatestWhenNoEntriesExist) {
-    FakeHaKvBackend backend;
-    ASSERT_EQ(ErrorCode::OK, backend.Put("/oplog/clusterA/latest", "45"));
+    ASSERT_EQ(ErrorCode::OK, backend.Put("/oplog/clusterA/latest", "42"));
     OpLogBatchStorage storage("clusterA", backend);
 
     DurablePrefix prefix;
-    EXPECT_EQ(ErrorCode::OK, storage.InitDurablePrefix(prefix));
+    EXPECT_NE(ErrorCode::OK, storage.InitDurablePrefix(prefix));
+}
 
-    EXPECT_EQ(0u, prefix.batch_id);
-    EXPECT_EQ(0u, prefix.last_seq);
+TEST(OpLogBatchStorageTest, RejectsLegacyEntry) {
+    FakeHaKvBackend backend;
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put("/oplog/clusterA/00000000000000000042", "entry"));
+    OpLogBatchStorage storage("clusterA", backend);
+
+    DurablePrefix prefix;
+    EXPECT_NE(ErrorCode::OK, storage.InitDurablePrefix(prefix));
+}
+
+TEST(OpLogBatchStorageTest, RejectsLegacySnapshotSidecar) {
+    FakeHaKvBackend backend;
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put("/oplog/clusterA/snapshot/old/sequence_id", "42"));
+    OpLogBatchStorage storage("clusterA", backend);
+
+    DurablePrefix prefix;
+    EXPECT_NE(ErrorCode::OK, storage.InitDurablePrefix(prefix));
 }
 
 TEST(OpLogBatchStorageTest, InitDurablePrefixFailsClosedWhenBatchesExist) {

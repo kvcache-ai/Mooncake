@@ -144,7 +144,6 @@ mooncake_master \
   --ha_backend_type=etcd \
   --ha_backend_connstring="10.0.0.1:2379;10.0.0.2:2379;10.0.0.3:2379" \
   --enable_oplog=true \
-  --oplog_store_type=etcd \
   --rpc_address=10.0.0.1
 ```
 
@@ -243,19 +242,16 @@ The master resolves the current IPv4 address of `eth0` at startup and uses it as
 
 ## High Availability (HA)
 
-Mooncake Store supports a Primary-Standby HA model with OpLog-based replication. The active Primary serves all read/write traffic and publishes metadata mutations to an OpLog store. One or more Standby nodes replicate the OpLog to maintain an in-memory copy of the metadata and segment registry. When the Primary fails, a Standby can be promoted to become the new Primary.
+Mooncake Store supports a Primary-Standby HA model with batch-record OpLog replication. The active Primary serves traffic and writes ordered batches to etcd. Standby nodes poll the durable batch prefix and apply each entry in strict sequence order.
 
 ### HA Architecture
 
 ```
-+---------------+          OpLog Store          +---------------+
-|   Primary     |  (etcd / localfs)             |   Standby     |
-|               |  <----------------------------|               |
-|  OpLogManager |                               | OpLogApplier  |
-|  (Append)     |                               | (Apply)       |
-|               |                               |               |
-|  MasterService|                               | MetadataStore |
-+---------------+                               +---------------+
++------------------+     etcd batch records     +---------------+
+| Primary          | --------------------------> | Standby       |
+| OrderedOpLogWriter|     durable_prefix         | OpLogApplier  |
+| MasterService    |                              | MetadataStore |
++------------------+                              +---------------+
        ^                                                 |
        |         Leadership Election                      |
        +---------------- etcd/redis/k8s ------------------+
@@ -266,17 +262,12 @@ Mooncake Store supports a Primary-Standby HA model with OpLog-based replication.
 HA leadership and metadata replication are configured separately:
 
 - The HA coordinator elects the active master. Configure it with `--enable_ha`, `--ha_backend_type`, `--ha_backend_connstring`, and `--cluster_id`. For `ha_backend_type=etcd`, legacy `--etcd_endpoints` is used only when `--ha_backend_connstring` is empty.
-- The optional OpLog store persists metadata mutations so standby masters can catch up and later be promoted. Enable it explicitly with `--enable_oplog=true`; it is disabled by default and currently requires `ha_backend_type=etcd`.
+- The optional batch-record OpLog persists metadata mutations so standby masters can catch up and later be promoted. Enable it explicitly with `--enable_oplog=true`; it is disabled by default and requires `ha_backend_type=etcd` and a build with `STORE_USE_ETCD`.
 
 
 - `--enable_oplog`: Enable the primary OpLog writer and standby reader. Defaults to `false`.
-- `--oplog_store_type`: Backend for OpLog storage. Setting this option does not enable OpLog by itself.
-  - `etcd_batch_record`: Use etcd ordered batch records (requires `STORE_USE_ETCD` at compile time).
-  - `etcd`: Use legacy per-entry etcd OpLog storage (requires `STORE_USE_ETCD` at compile time).
-  - `localfs`: Use a filesystem path shared by the primary and standby masters.
-  - Empty string: Use the compile-time default (`etcd_batch_record` when built with etcd support, otherwise `localfs`).
-- `--oplog_store_root_dir`: Root directory for the localfs OpLog store. Only used when `oplog_store_type=localfs`.
-- `--oplog_poll_interval_ms`: Polling interval in milliseconds for localfs and the base polling/retry delay for batch standby.
+- `--oplog_poll_interval_ms`: Base polling and retry delay for the batch standby, in milliseconds.
+- `--oplog_batch_max_entries`: Maximum number of entries admitted to an ordered batch. Defaults to `1024`.
 - `--batch_oplog_retry_timeout_sec`: Maximum consecutive retryable batch-standby failure window in seconds (default `180`).
 
 For snapshot-based standby bootstrap, also configure:
@@ -294,26 +285,26 @@ When a Standby starts, it follows this sequence:
    - Rebuild object metadata and segment state from the snapshot baseline.
 2. **OpLog Catch-up**:
    - Start from the snapshot's `last_included_seq` (or from 1 if no snapshot).
-   - Continuously poll/watch the OpLog store and apply new entries.
+   - Poll `durable_prefix`, read batch records up to that boundary, and apply entries in strict sequence order.
 
 Supported OpLog entry types:
 - `PUT_END`: Object write completion
 - `REMOVE`: Object removal
 - `PUT_REVOKE`: Object revocation
-- `BATCH_REMOVE`: Batch removal
 - `SEGMENT_MOUNT`: Segment mount event
 - `SEGMENT_UNMOUNT`: Segment unmount event
+- `SEGMENT_UPDATE`: Segment update event
 
 ### Promotion and Failover
 
 When the Primary fails, the Standby is promoted through the following steps:
 
-1. **Final Catch-up**: The Standby stops the OpLog replicator and performs a final catch-up of any remaining entries.
-2. **Export Context**: The Standby exports its current state as a `PromotionContext`, including:
+1. **Leadership Lease**: The supervisor must acquire and retain the leadership lease before promotion begins.
+2. **Final Prefix Read and Catch-up**: The Standby stops its polling loop, reads `durable_prefix` again, and applies all durable batches. A missing prefix is accepted only when the local applied sequence is zero; otherwise promotion fails closed.
+3. **Export Context**: The Standby exports its current state as a `PromotionContext`, including:
    - `applied_seq_id`: The latest applied OpLog sequence ID.
    - `objects`: All object metadata from the in-memory store.
    - `segments`: All segment registry entries.
-3. **Leadership Transition**: The Standby acquires leadership through the configured HA backend.
 4. **State Restoration**: The new Primary restores its state from the `PromotionContext`, populating metadata shards and the segment manager.
 5. **Invalid Endpoint Filtering**: During restoration, any replica endpoints that correspond to segments no longer in the registry are automatically filtered out from `GetReplicaList` results.
 
@@ -327,7 +318,8 @@ ha_backend_type: "etcd"
 ha_backend_connstring: "etcd-1:2379;etcd-2:2379;etcd-3:2379"
 cluster_id: "mooncake_cluster"
 enable_oplog: true
-oplog_store_type: "etcd"
+oplog_poll_interval_ms: 1000
+oplog_batch_max_entries: 1024
 enable_snapshot: true
 snapshot_object_store_type: "local"
 snapshot_catalog_store_type: "embedded"
@@ -342,7 +334,8 @@ ha_backend_type: "etcd"
 ha_backend_connstring: "etcd-1:2379;etcd-2:2379;etcd-3:2379"
 cluster_id: "mooncake_cluster"
 enable_oplog: true
-oplog_store_type: "etcd"
+oplog_poll_interval_ms: 1000
+oplog_batch_max_entries: 1024
 enable_snapshot_restore: true
 snapshot_object_store_type: "local"
 snapshot_catalog_store_type: "embedded"
@@ -365,22 +358,18 @@ mooncake_master --config_path=primary.yaml
 mooncake_master --config_path=standby.yaml
 ```
 
-### Example: HA Deployment with localfs OpLog (testing)
+### Resetting a Legacy OpLog Namespace
 
-For local testing, or for a build without etcd OpLog support, use the localfs OpLog store. The `oplog_store_root_dir` must be visible to both primary and standby processes:
+The batch-only implementation does not migrate or read older per-entry OpLog data. Reusing a namespace that contains legacy `latest`, numeric entry, or snapshot sidecar keys is rejected.
 
-```yaml
-enable_ha: true
-ha_backend_type: "etcd"
-ha_backend_connstring: "http://localhost:2379"
-cluster_id: "test_cluster"
-enable_oplog: true
-oplog_store_type: "localfs"
-oplog_store_root_dir: "/tmp/mooncake_oplog"
-oplog_poll_interval_ms: 1000
-```
+Reset is destructive:
 
-> **Note:** The `localfs` OpLog store is suitable for testing and development. Production HA deployments should use `etcd`.
+1. Stop every Primary and Standby process that uses the cluster ID.
+2. Confirm that loss of the old metadata and snapshots is acceptable.
+3. Delete the complete `/oplog/{cluster_id}` namespace directly with the operator's etcd tooling.
+4. Start the cluster with empty state and batch-record OpLog enabled.
+
+Do not delete individual compatibility keys while any process is running, and do not retain an old snapshot baseline with a nonzero sequence after deleting `durable_prefix`.
 
 ## Metrics Endpoints
 
@@ -643,9 +632,8 @@ mooncake_master \
 | `--etcd_endpoints` | empty | Backward-compatible etcd HA endpoints, used only for `ha_backend_type=etcd` when `--ha_backend_connstring` is empty |
 | `--cluster_id` | `mooncake_cluster` | Cluster ID for HA persistence |
 | `--enable_oplog` | `false` | Enable the primary OpLog writer and standby reader; currently requires `enable_ha=true` and `ha_backend_type=etcd` |
-| `--oplog_store_type` | empty | OpLog store type: `etcd_batch_record`, `etcd`, `localfs`, or empty for compile-time default (`etcd_batch_record` with etcd support, otherwise `localfs`) |
-| `--oplog_store_root_dir` | `/tmp/mooncake_oplog` | Root directory for localfs OpLog store; must be shared between primary and standby when using `localfs` |
-| `--oplog_poll_interval_ms` | `1000` | Poll interval in milliseconds for localfs and base polling/retry delay for batch standby |
+| `--oplog_poll_interval_ms` | `1000` | Base polling and retry delay for the batch standby, in milliseconds |
+| `--oplog_batch_max_entries` | `1024` | Maximum number of entries admitted to an ordered batch |
 | `--batch_oplog_retry_timeout_sec` | `180` | Maximum consecutive retryable batch-standby failure window in seconds |
 
 ```{caution}

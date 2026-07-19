@@ -255,7 +255,7 @@ TEST(OpLogBatchRecordCodecTest, RebuildsNonPersistedEntryFields) {
     ASSERT_EQ(1u, out.entries.size());
     EXPECT_EQ(0u, out.entries[0].timestamp_ms);
     EXPECT_EQ(0u, out.entries[0].prefix_hash);
-    EXPECT_TRUE(OpLogManager::VerifyChecksum(out.entries[0]));
+    EXPECT_TRUE(VerifyOpLogChecksum(out.entries[0]));
 }
 
 TEST(OpLogBatchRecordCodecTest, RoundTripsMultiEntryBatch) {

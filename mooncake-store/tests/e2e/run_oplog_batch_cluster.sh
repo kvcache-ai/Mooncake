@@ -286,7 +286,7 @@ start_master() {
     ha_args=(--enable_ha=true --ha_backend_type=etcd
       --ha_backend_connstring="$ETCD_ENDPOINTS"
       --etcd_endpoints="$ETCD_ENDPOINTS" --cluster_id="$CLUSTER_ID"
-      --oplog_store_type="$OPLOG_STORE_TYPE"
+      --enable_oplog=true
       --oplog_batch_max_entries="$BATCH_ENTRIES"
       --batch_oplog_retry_timeout_sec="$RETRY_TIMEOUT_SEC")
   else

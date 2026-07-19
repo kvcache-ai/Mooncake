@@ -9,7 +9,7 @@
 #include <jsoncpp/json/json.h>
 
 #include "ha/oplog/oplog_batch_codec.h"
-#include "ha/oplog/oplog_store.h"
+#include "ha/oplog/oplog_types.h"
 
 namespace mooncake {
 namespace {

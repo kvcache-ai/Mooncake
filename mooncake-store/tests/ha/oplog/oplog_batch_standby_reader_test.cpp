@@ -94,7 +94,7 @@ OpLogBatchRecord MakeBatch(uint64_t batch_id, uint64_t first_seq,
 
 }  // namespace
 
-TEST(OpLogBatchStandbyReaderTest, LegacyPathIsUsedWhenDurablePrefixIsAbsent) {
+TEST(OpLogBatchStandbyReaderTest, MissingPrefixWaitsWithoutLegacyFallback) {
     FakeHaKvBackend backend;
     MockMetadataStore metadata_store;
     OpLogApplier applier(&metadata_store, "clusterA");
@@ -103,12 +103,12 @@ TEST(OpLogBatchStandbyReaderTest, LegacyPathIsUsedWhenDurablePrefixIsAbsent) {
     auto result = reader.PollOnce();
 
     ASSERT_EQ(ErrorCode::OK, result.error);
-    EXPECT_TRUE(result.used_legacy_path);
+    EXPECT_FALSE(result.durable_prefix_present);
     EXPECT_EQ(0u, result.applied_entries);
     EXPECT_EQ(1u, applier.GetExpectedSequenceId());
 }
 
-TEST(OpLogBatchStandbyReaderTest, MissingPrefixAfterBatchCutoverFailsClosed) {
+TEST(OpLogBatchStandbyReaderTest, MissingPrefixAfterObservationFailsClosed) {
     FakeHaKvBackend backend;
     ASSERT_EQ(ErrorCode::OK,
               backend.Put(BuildDurablePrefixKey("clusterA"),
@@ -125,7 +125,6 @@ TEST(OpLogBatchStandbyReaderTest, MissingPrefixAfterBatchCutoverFailsClosed) {
     auto result = reader.PollOnce();
 
     EXPECT_NE(ErrorCode::OK, result.error);
-    EXPECT_FALSE(result.used_legacy_path);
     EXPECT_EQ(OpLogBatchStandbyPollDisposition::FATAL, result.disposition);
 }
 
@@ -195,7 +194,7 @@ TEST(OpLogBatchStandbyReaderTest, DurablePrefixRegressionFailsClosed) {
     EXPECT_NE(ErrorCode::OK, reader.PollOnce().error);
 }
 
-TEST(OpLogBatchStandbyReaderTest, BatchZeroReportsLegacyCatchUpTarget) {
+TEST(OpLogBatchStandbyReaderTest, BatchZeroMustHaveZeroSequence) {
     FakeHaKvBackend backend;
     ASSERT_EQ(
         ErrorCode::OK,
@@ -207,9 +206,8 @@ TEST(OpLogBatchStandbyReaderTest, BatchZeroReportsLegacyCatchUpTarget) {
 
     auto result = reader.PollOnce();
 
-    ASSERT_EQ(ErrorCode::OK, result.error);
-    EXPECT_TRUE(result.waiting_for_legacy_catch_up);
-    EXPECT_EQ(42u, result.legacy_catch_up_target);
+    EXPECT_EQ(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, result.error);
+    EXPECT_EQ(OpLogBatchStandbyPollDisposition::FATAL, result.disposition);
 }
 
 TEST(OpLogBatchStandbyReaderTest, RangeReadsBatchesWhenDurablePrefixAdvances) {
@@ -227,7 +225,6 @@ TEST(OpLogBatchStandbyReaderTest, RangeReadsBatchesWhenDurablePrefixAdvances) {
     auto result = reader.PollOnce();
 
     ASSERT_EQ(ErrorCode::OK, result.error);
-    EXPECT_FALSE(result.used_legacy_path);
     EXPECT_EQ(1, backend.range_calls());
     EXPECT_EQ(2u, result.applied_entries);
     EXPECT_EQ(3u, applier.GetExpectedSequenceId());
@@ -250,7 +247,6 @@ TEST(OpLogBatchStandbyReaderTest, DoesNothingWhenDurablePrefixDoesNotAdvance) {
     auto second = reader.PollOnce();
 
     ASSERT_EQ(ErrorCode::OK, second.error);
-    EXPECT_FALSE(second.used_legacy_path);
     EXPECT_EQ(0u, second.applied_entries);
     EXPECT_EQ(range_calls_after_first_poll, backend.range_calls());
     EXPECT_EQ(2u, applier.GetExpectedSequenceId());
@@ -322,7 +318,7 @@ TEST(OpLogBatchStandbyReaderTest, AppliesExpandedEntriesInSequenceOrder) {
     EXPECT_EQ(4u, applier.GetExpectedSequenceId());
 }
 
-TEST(OpLogBatchStandbyReaderTest, AcceptsFirstBatchAtLegacyLatestPlusOne) {
+TEST(OpLogBatchStandbyReaderTest, AcceptsFirstBatchAfterSnapshotBaseline) {
     FakeHaKvBackend backend;
     ASSERT_EQ(ErrorCode::OK,
               backend.Put(BuildDurablePrefixKey("clusterA"),
@@ -340,48 +336,6 @@ TEST(OpLogBatchStandbyReaderTest, AcceptsFirstBatchAtLegacyLatestPlusOne) {
     ASSERT_EQ(ErrorCode::OK, result.error);
     EXPECT_EQ(2u, result.applied_entries);
     EXPECT_EQ(5u, applier.GetExpectedSequenceId());
-}
-
-TEST(OpLogBatchStandbyReaderTest, ReportsLegacyTargetBeforeFirstBatch) {
-    FakeHaKvBackend backend;
-    ASSERT_EQ(
-        ErrorCode::OK,
-        backend.Put(BuildDurablePrefixKey("clusterA"),
-                    EncodeDurablePrefix({.batch_id = 1, .last_seq = 44})));
-    ASSERT_EQ(ErrorCode::OK,
-              backend.Put(BuildBatchRecordKey("clusterA", 1),
-                          EncodeOpLogBatchRecord(MakeBatch(1, 43, 44))));
-    MockMetadataStore metadata_store;
-    OpLogApplier applier(&metadata_store, "clusterA");
-    OpLogBatchStandbyReader reader("clusterA", backend, applier);
-
-    auto result = reader.PollOnce();
-
-    ASSERT_EQ(ErrorCode::OK, result.error);
-    EXPECT_TRUE(result.waiting_for_legacy_catch_up);
-    EXPECT_EQ(42u, result.legacy_catch_up_target);
-}
-
-TEST(OpLogBatchStandbyReaderTest,
-     WaitsWhenLegacyHasNotReachedFirstBatchSequence) {
-    FakeHaKvBackend backend;
-    ASSERT_EQ(ErrorCode::OK,
-              backend.Put(BuildDurablePrefixKey("clusterA"),
-                          EncodeDurablePrefix({.batch_id = 1, .last_seq = 4})));
-    ASSERT_EQ(ErrorCode::OK,
-              backend.Put(BuildBatchRecordKey("clusterA", 1),
-                          EncodeOpLogBatchRecord(MakeBatch(1, 4, 4))));
-    MockMetadataStore metadata_store;
-    OpLogApplier applier(&metadata_store, "clusterA");
-    applier.Recover(2);
-    OpLogBatchStandbyReader reader("clusterA", backend, applier);
-
-    auto result = reader.PollOnce();
-
-    EXPECT_EQ(ErrorCode::OK, result.error);
-    EXPECT_TRUE(result.waiting_for_legacy_catch_up);
-    EXPECT_EQ(0u, result.applied_entries);
-    EXPECT_EQ(3u, applier.GetExpectedSequenceId());
 }
 
 TEST(OpLogBatchStandbyReaderTest, FailsWhenLaterBatchHasSequenceGap) {
@@ -402,7 +356,6 @@ TEST(OpLogBatchStandbyReaderTest, FailsWhenLaterBatchHasSequenceGap) {
     auto result = reader.PollOnce();
 
     EXPECT_NE(ErrorCode::OK, result.error);
-    EXPECT_FALSE(result.waiting_for_legacy_catch_up);
     EXPECT_EQ(2u, result.applied_entries);
     EXPECT_EQ(3u, applier.GetExpectedSequenceId());
 }
@@ -486,7 +439,7 @@ TEST(OpLogBatchStandbyReaderTest, ChecksumFailureMarksReaderUnhealthy) {
     EXPECT_EQ(1u, applier.GetExpectedSequenceId());
 }
 
-TEST(OpLogBatchStandbyReaderTest, BatchRecordModeDoesNotAdvanceAcrossGap) {
+TEST(OpLogBatchStandbyReaderTest, RejectsFutureFirstSequence) {
     FakeHaKvBackend backend;
     ASSERT_EQ(ErrorCode::OK,
               backend.Put(BuildDurablePrefixKey("clusterA"),
@@ -498,19 +451,11 @@ TEST(OpLogBatchStandbyReaderTest, BatchRecordModeDoesNotAdvanceAcrossGap) {
     OpLogApplier applier(&metadata_store, "clusterA");
     OpLogBatchStandbyReader reader("clusterA", backend, applier);
 
-    auto failed = reader.PollOnce();
-    EXPECT_EQ(ErrorCode::OK, failed.error);
-    EXPECT_TRUE(failed.waiting_for_legacy_catch_up);
+    auto result = reader.PollOnce();
+    EXPECT_EQ(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, result.error);
+    EXPECT_EQ(OpLogBatchStandbyPollDisposition::FATAL, result.disposition);
+    EXPECT_EQ(0u, result.applied_entries);
     EXPECT_EQ(1u, applier.GetExpectedSequenceId());
-
-    ASSERT_EQ(ErrorCode::OK,
-              backend.Put(BuildBatchRecordKey("clusterA", 1),
-                          EncodeOpLogBatchRecord(MakeBatch(1, 1, 2))));
-    auto repaired = reader.PollOnce();
-
-    ASSERT_EQ(ErrorCode::OK, repaired.error);
-    EXPECT_EQ(2u, repaired.applied_entries);
-    EXPECT_EQ(3u, applier.GetExpectedSequenceId());
 }
 
 TEST(OpLogBatchStandbyReaderTest, AlreadyAppliedEntriesAreSkipped) {

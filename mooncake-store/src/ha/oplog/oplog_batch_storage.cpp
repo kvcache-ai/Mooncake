@@ -6,7 +6,7 @@
 #include <glog/logging.h>
 
 #include "ha/oplog/oplog_batch_codec.h"
-#include "ha/oplog/oplog_store.h"
+#include "ha/oplog/oplog_types.h"
 #ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
 #include "ha_metric_manager.h"
 #endif
@@ -63,7 +63,11 @@ ErrorCode OpLogBatchStorage::InitDurablePrefix(DurablePrefix& prefix) {
     if (!IsValidClusterId()) {
         return ErrorCode::INVALID_PARAMS;
     }
-    ErrorCode err = ReadDurablePrefix(prefix);
+    ErrorCode err = RejectLegacyLayout();
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+    err = ReadDurablePrefix(prefix);
     if (err == ErrorCode::OK) {
         return ErrorCode::OK;
     }
@@ -86,14 +90,8 @@ ErrorCode OpLogBatchStorage::InitDurablePrefix(DurablePrefix& prefix) {
         return ErrorCode::INTERNAL_ERROR;
     }
 
-    uint64_t latest_seq = 0;
-    err = ReadMaxLegacySequence(latest_seq);
-    if (err != ErrorCode::OK) {
-        return err;
-    }
-
     const std::string durable_key = BuildDurablePrefixKey(cluster_id_);
-    DurablePrefix initial{.batch_id = 0, .last_seq = latest_seq};
+    DurablePrefix initial{.batch_id = 0, .last_seq = 0};
     KvTxn txn;
     txn.compares.push_back({.key = durable_key,
                             .kind = KvCompareKind::kKeyNotExists,
@@ -260,30 +258,47 @@ ErrorCode OpLogBatchStorage::ReadBatchesAfter(
 
 bool OpLogBatchStorage::IsValidClusterId() const { return cluster_id_valid_; }
 
-ErrorCode OpLogBatchStorage::ReadMaxLegacySequence(uint64_t& sequence_id) {
-    const std::string prefix = "/oplog/" + cluster_id_ + "/";
-    std::vector<KvPair> entries;
-    ErrorCode err =
-        backend_.Range(prefix + "00000000000000000000", prefix + ":",
-                       /*limit=*/0, entries);
-    if (err != ErrorCode::OK) {
+ErrorCode OpLogBatchStorage::RejectLegacyLayout() const {
+    const std::string root = "/oplog/" + cluster_id_ + "/";
+    std::string ignored;
+    ErrorCode err = backend_.Get(root + "latest", ignored);
+    if (err == ErrorCode::OK) {
+        LOG(ERROR) << "Legacy OpLog latest key exists for cluster="
+                   << cluster_id_
+                   << "; clear the legacy OpLog namespace before enabling "
+                      "batch-record OpLog";
+        return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+    }
+    if (err != ErrorCode::ETCD_KEY_NOT_EXIST) {
         return err;
     }
 
-    sequence_id = 0;
-    for (const auto& entry : entries) {
-        const std::string_view suffix(entry.key.data() + prefix.size(),
-                                      entry.key.size() - prefix.size());
-        if (suffix.size() != kOpLogBatchIdWidth) {
-            continue;
-        }
-        uint64_t current = 0;
-        auto parsed = std::from_chars(suffix.data(),
-                                      suffix.data() + suffix.size(), current);
-        if (parsed.ec == std::errc() &&
-            parsed.ptr == suffix.data() + suffix.size()) {
-            sequence_id = std::max(sequence_id, current);
-        }
+    std::vector<KvPair> entries;
+    err = backend_.Range(root + "00000000000000000000", root + ":",
+                         /*limit=*/1, entries);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+    if (!entries.empty()) {
+        LOG(ERROR) << "Legacy per-entry OpLog key exists for cluster="
+                   << cluster_id_
+                   << "; clear the legacy OpLog namespace before enabling "
+                      "batch-record OpLog";
+        return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+    }
+
+    entries.clear();
+    err = backend_.Range(root + "snapshot/", root + "snapshot0",
+                         /*limit=*/1, entries);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+    if (!entries.empty()) {
+        LOG(ERROR) << "Legacy OpLog snapshot sidecar exists for cluster="
+                   << cluster_id_
+                   << "; clear the legacy OpLog namespace before enabling "
+                      "batch-record OpLog";
+        return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
     }
     return ErrorCode::OK;
 }

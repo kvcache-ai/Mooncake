@@ -8,7 +8,6 @@
 #ifdef STORE_USE_ETCD
 #include "etcd_helper.h"
 #include "ha/kv/etcd_ha_kv_backend.h"
-#include "ha/oplog/etcd_oplog_store.h"
 #include "ha/oplog/oplog_batch_codec.h"
 #include "ha/oplog/oplog_batch_storage.h"
 #endif
@@ -106,7 +105,6 @@ class SnapshotChildProcessTest : public ::testing::Test {
                           .set_enable_oplog(true)
                           .set_ha_backend_type("etcd")
                           .set_ha_backend_connstring(etcd_endpoints)
-                          .set_oplog_store_type("etcd")
                           .set_cluster_id(cluster_id)
                           .set_snapshot_backup_dir(tmp_dir() + "/backup")
                           .set_snapshot_interval_seconds(100)
@@ -128,7 +126,6 @@ class SnapshotChildProcessTest : public ::testing::Test {
                           .set_enable_oplog(true)
                           .set_ha_backend_type("etcd")
                           .set_ha_backend_connstring(etcd_endpoints)
-                          .set_oplog_store_type("etcd_batch_record")
                           .set_cluster_id(cluster_id)
                           .set_snapshot_backup_dir(tmp_dir() + "/backup")
                           .set_snapshot_interval_seconds(100)
@@ -765,50 +762,6 @@ TEST_F(SnapshotChildProcessTest, LegacyEtcdConnstringFallbackIsPreserved) {
 
 #ifdef STORE_USE_ETCD
 TEST_F(SnapshotChildProcessTest,
-       PersistState_UsesEtcdOplogBoundaryInSnapshotDescriptor) {
-    const std::string etcd_endpoints = "127.0.0.1:2379";
-    auto connect_err =
-        EtcdHelper::ConnectToEtcdStoreClient(etcd_endpoints.c_str());
-    if (connect_err != ErrorCode::OK) {
-        GTEST_SKIP() << "etcd is unavailable: " << toString(connect_err);
-    }
-
-    const std::string cluster_id =
-        "snapshot-descriptor-" + UuidToString(generate_uuid());
-    constexpr ViewVersionId kViewVersion = 19;
-    constexpr uint64_t kLatestSequenceId = 123;
-    const std::string snapshot_id = "20240601_120000_456";
-
-    EtcdOpLogStore oplog_store(cluster_id);
-    auto init_err = oplog_store.Init();
-    if (init_err != ErrorCode::OK) {
-        GTEST_SKIP() << "failed to initialize etcd oplog store: "
-                     << toString(init_err);
-    }
-
-    auto update_err = oplog_store.UpdateLatestSequenceId(kLatestSequenceId);
-    if (update_err != ErrorCode::OK) {
-        GTEST_SKIP() << "failed to update etcd latest sequence id: "
-                     << toString(update_err);
-    }
-
-    CreateEtcdHASnapshotService(cluster_id, etcd_endpoints, kViewVersion);
-    auto persist_result = CallPersistState(snapshot_id);
-    ASSERT_TRUE(persist_result.has_value())
-        << "PersistState failed: " << persist_result.error().message;
-
-    auto* catalog_store = GetSnapshotCatalogStore();
-    ASSERT_NE(catalog_store, nullptr);
-    auto latest = catalog_store->GetLatest();
-    ASSERT_TRUE(latest.has_value());
-    ASSERT_TRUE(latest->has_value());
-
-    EXPECT_EQ(latest->value().last_included_seq, kLatestSequenceId);
-    EXPECT_EQ(latest->value().producer_view_version, kViewVersion);
-    EXPECT_GT(latest->value().created_at_ms, 0);
-}
-
-TEST_F(SnapshotChildProcessTest,
        PersistState_UsesBatchDurablePrefixBoundaryInSnapshotDescriptor) {
     const std::string etcd_endpoints = "127.0.0.1:2379";
     auto connect_err =
@@ -820,25 +773,12 @@ TEST_F(SnapshotChildProcessTest,
     const std::string cluster_id =
         "snapshot-batch-boundary-" + UuidToString(generate_uuid());
     constexpr ViewVersionId kViewVersion = 19;
-    constexpr uint64_t kLegacyLatest = 42;
     constexpr uint64_t kBatchLatest = 77;
-
-    EtcdOpLogStore legacy_store(cluster_id);
-    auto init_err = legacy_store.Init();
-    if (init_err != ErrorCode::OK) {
-        GTEST_SKIP() << "failed to initialize etcd oplog store: "
-                     << toString(init_err);
-    }
-    auto update_err = legacy_store.UpdateLatestSequenceId(kLegacyLatest);
-    if (update_err != ErrorCode::OK) {
-        GTEST_SKIP() << "failed to update etcd latest sequence id: "
-                     << toString(update_err);
-    }
 
     auto backend = std::make_shared<EtcdHaKvBackend>();
     OpLogBatchStorage storage(cluster_id, *backend);
     DurablePrefix prefix;
-    init_err = storage.InitDurablePrefix(prefix);
+    auto init_err = storage.InitDurablePrefix(prefix);
     if (init_err != ErrorCode::OK) {
         GTEST_SKIP() << "failed to initialize batch durable prefix: "
                      << toString(init_err);

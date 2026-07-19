@@ -285,13 +285,9 @@ DEFINE_string(cluster_id, mooncake::DEFAULT_CLUSTER_ID,
 
 // OpLog store configuration
 DEFINE_bool(enable_oplog, false,
-            "Enable HA metadata replication through the configured OpLog");
-DEFINE_string(oplog_store_type, "",
-              "OpLog store type: etcd, localfs. Empty means default.");
-DEFINE_string(oplog_store_root_dir, "/tmp/mooncake_oplog",
-              "Root directory for localfs OpLog store.");
+            "Enable HA metadata replication through batch-record OpLog");
 DEFINE_int32(oplog_poll_interval_ms, 1000,
-             "Poll interval for localfs OpLog store.");
+             "Batch-record standby poll interval.");
 DEFINE_uint32(oplog_batch_max_entries, 1024,
               "Maximum number of committed/reserved entries in the open "
               "batch-record OpLog waiting batch.");
@@ -567,12 +563,6 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                              FLAGS_cluster_id);
     default_config.GetBool("enable_oplog", &master_config.enable_oplog,
                            FLAGS_enable_oplog);
-    default_config.GetString("oplog_store_type",
-                             &master_config.oplog_store_type,
-                             FLAGS_oplog_store_type);
-    default_config.GetString("oplog_store_root_dir",
-                             &master_config.oplog_store_root_dir,
-                             FLAGS_oplog_store_root_dir);
     default_config.GetInt32("oplog_poll_interval_ms",
                             &master_config.oplog_poll_interval_ms,
                             FLAGS_oplog_poll_interval_ms);

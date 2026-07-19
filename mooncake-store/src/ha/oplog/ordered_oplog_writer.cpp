@@ -173,7 +173,7 @@ OrderedOpLogWriter::Commit(Reservation&& reservation, OpLogEntry entry,
     reservation.writer_ = nullptr;
     reservation.id_ = 0;
     entry.timestamp_ms = 0;
-    entry.checksum = OpLogManager::ComputeChecksum(entry.payload);
+    entry.checksum = ComputeOpLogChecksum(entry.payload);
     entry.prefix_hash = 0;
     entry.sequence_id = impl_->next_sequence_id++;
     const uint64_t sequence_id = entry.sequence_id;

@@ -16,9 +16,7 @@
 #include "ha/kv/ha_kv_backend.h"
 #include "ha/oplog/oplog_batch_codec.h"
 #include "ha/oplog/oplog_batch_storage.h"
-#include "ha/oplog/oplog_manager.h"
-#include "ha/oplog/oplog_store_factory.h"
-#include "ha/oplog/mock_oplog_store.h"
+#include "ha/oplog/oplog_types.h"
 #ifdef STORE_USE_ETCD
 #include "etcd_helper.h"
 #include "ha/kv/etcd_ha_kv_backend.h"
@@ -245,11 +243,6 @@ TEST_F(HotStandbyServiceTest, TestGetSyncStatus) {
     EXPECT_EQ(s1.state, s2.state);
 }
 
-TEST_F(HotStandbyServiceTest, SyncStatusReportsUnresolvedGapCount) {
-    auto status = service_->GetSyncStatus();
-    EXPECT_EQ(0u, status.unresolved_gap_count);
-}
-
 // ========== 6.1.4 Promotion tests ==========
 
 TEST_F(HotStandbyServiceTest, TestPromote_WhenNotReady) {
@@ -308,11 +301,6 @@ TEST_F(HotStandbyServiceTest, TestPromoteAndExportSnapshot_FinalCatchUp) {
     ASSERT_EQ(1u, post_snapshot.objects.size());
     EXPECT_EQ("key-1", post_snapshot.objects[0].key);
 }
-
-// The promotion catch-up tests above (TestPromote_*) have been replaced by the
-// mock-driven PromotionCatchUpTest fixture below. The new tests use
-// SetCatchUpOpLogStoreForTesting + MockOpLogStore with SetForceReadEmpty /
-// SetReadError seams, eliminating the STORE_USE_ETCD dependency.
 
 // ========== 6.1.5 Warm start tests ==========
 
@@ -547,7 +535,7 @@ OpLogEntry MakeEntry(uint64_t seq, OpType type, const std::string& key,
     e.op_type = type;
     e.object_key = key;
     e.payload = payload;
-    // Compute checksum and prefix_hash using the same algorithm as OpLogManager
+    // Compute checksum and prefix_hash using the production algorithm.
     e.checksum =
         static_cast<uint32_t>(XXH32(payload.data(), payload.size(), 0));
     e.prefix_hash =
@@ -635,46 +623,36 @@ OpLogBatchRecord MakeBatch(uint64_t batch_id, uint64_t first_seq,
 TEST_F(HotStandbyServiceTest,
        BatchRecordStandbyPollsInjectedBackendWithoutNotifier) {
     const std::string cluster_id = "batch-standby-injected-backend";
-    auto legacy_store = std::make_shared<MockOpLogStore>();
-    ASSERT_EQ(ErrorCode::OK,
-              legacy_store->WriteOpLog(MakeEntry(1, OpType::PUT_END, "legacy_1",
-                                                 MakeValidPayload())));
-    ASSERT_EQ(ErrorCode::OK,
-              legacy_store->WriteOpLog(MakeEntry(2, OpType::PUT_END, "legacy_2",
-                                                 MakeValidPayload())));
     auto batch_backend = std::make_shared<FakeHaKvBackend>();
     ASSERT_EQ(ErrorCode::OK,
               batch_backend->Put(
                   BuildDurablePrefixKey(cluster_id),
-                  EncodeDurablePrefix({.batch_id = 1, .last_seq = 3})));
+                  EncodeDurablePrefix({.batch_id = 1, .last_seq = 1})));
     ASSERT_EQ(ErrorCode::OK,
               batch_backend->Put(BuildBatchRecordKey(cluster_id, 1),
-                                 EncodeOpLogBatchRecord(MakeBatch(1, 3, 3))));
+                                 EncodeOpLogBatchRecord(MakeBatch(1, 1, 1))));
 
     HotStandbyConfig config = config_;
-    config.oplog_store_type = OpLogStoreType::ETCD_BATCH_RECORD;
     config.enable_snapshot_bootstrap = false;
     config.enable_oplog_following = true;
     config.oplog_poll_interval_ms = 1;
 
     auto service = std::make_unique<HotStandbyService>(config);
-    service->SetCatchUpOpLogStoreForTesting(legacy_store);
     service->SetCatchUpBatchKvBackendForTesting(batch_backend);
     ASSERT_EQ(ErrorCode::OK,
               service->Start("primary_unused", "unused", cluster_id));
 
-    for (int i = 0; i < 100 && service->GetLatestAppliedSequenceId() < 3; ++i) {
+    for (int i = 0; i < 100 && service->GetLatestAppliedSequenceId() < 1; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
 
     EXPECT_EQ(StandbyState::WATCHING, service->GetState());
-    EXPECT_EQ(3u, service->GetLatestAppliedSequenceId());
+    EXPECT_EQ(1u, service->GetLatestAppliedSequenceId());
     service->Stop();
 }
 
 TEST_F(HotStandbyServiceTest, BatchRecordRetriesTransientBackendFailure) {
     const std::string cluster_id = "batch-standby-transient-retry";
-    auto legacy_store = std::make_shared<MockOpLogStore>();
     auto batch_backend = std::make_shared<FakeHaKvBackend>();
     ASSERT_EQ(ErrorCode::OK,
               batch_backend->Put(
@@ -686,13 +664,11 @@ TEST_F(HotStandbyServiceTest, BatchRecordRetriesTransientBackendFailure) {
     batch_backend->FailNextGet(ErrorCode::ETCD_OPERATION_ERROR);
 
     HotStandbyConfig config = config_;
-    config.oplog_store_type = OpLogStoreType::ETCD_BATCH_RECORD;
     config.enable_snapshot_bootstrap = false;
     config.oplog_poll_interval_ms = 1;
     config.batch_oplog_retry_timeout_sec = 1;
 
     auto service = std::make_unique<HotStandbyService>(config);
-    service->SetCatchUpOpLogStoreForTesting(legacy_store);
     service->SetCatchUpBatchKvBackendForTesting(batch_backend);
     ASSERT_EQ(ErrorCode::OK,
               service->Start("primary_unused", "unused", cluster_id));
@@ -711,18 +687,15 @@ TEST_F(HotStandbyServiceTest, BatchRecordRetriesTransientBackendFailure) {
 }
 
 TEST_F(HotStandbyServiceTest, BatchRecordRetryTimeoutTransitionsToFailed) {
-    auto legacy_store = std::make_shared<MockOpLogStore>();
     auto batch_backend = std::make_shared<FakeHaKvBackend>();
     batch_backend->SetGetError(ErrorCode::ETCD_OPERATION_ERROR);
 
     HotStandbyConfig config = config_;
-    config.oplog_store_type = OpLogStoreType::ETCD_BATCH_RECORD;
     config.enable_snapshot_bootstrap = false;
     config.oplog_poll_interval_ms = 1;
     config.batch_oplog_retry_timeout_sec = 0;
 
     auto service = std::make_unique<HotStandbyService>(config);
-    service->SetCatchUpOpLogStoreForTesting(legacy_store);
     service->SetCatchUpBatchKvBackendForTesting(batch_backend);
     ASSERT_EQ(ErrorCode::OK, service->Start("primary_unused", "unused",
                                             "batch-standby-timeout"));
@@ -739,18 +712,15 @@ TEST_F(HotStandbyServiceTest, BatchRecordRetryTimeoutTransitionsToFailed) {
 }
 
 TEST_F(HotStandbyServiceTest, BatchRecordCanRestartAfterRetryTimeout) {
-    auto legacy_store = std::make_shared<MockOpLogStore>();
     auto batch_backend = std::make_shared<FakeHaKvBackend>();
     batch_backend->SetGetError(ErrorCode::ETCD_OPERATION_ERROR);
 
     HotStandbyConfig config = config_;
-    config.oplog_store_type = OpLogStoreType::ETCD_BATCH_RECORD;
     config.enable_snapshot_bootstrap = false;
     config.oplog_poll_interval_ms = 1;
     config.batch_oplog_retry_timeout_sec = 0;
 
     auto service = std::make_unique<HotStandbyService>(config);
-    service->SetCatchUpOpLogStoreForTesting(legacy_store);
     service->SetCatchUpBatchKvBackendForTesting(batch_backend);
     ASSERT_EQ(ErrorCode::OK, service->Start("primary_unused", "unused",
                                             "batch-standby-restart"));
@@ -774,18 +744,15 @@ class PromotionCatchUpTest : public HotStandbyServiceTest {
     void SetUp() override {
         HotStandbyServiceTest::SetUp();
         config_.enable_oplog_following = true;
-        config_.oplog_store_type = OpLogStoreType::LOCAL_FS;
-        config_.fail_closed_on_incomplete_catch_up = true;
-        config_.fail_closed_on_unresolved_gaps = true;
+        config_.enable_snapshot_bootstrap = false;
+        config_.oplog_poll_interval_ms = 1;
 
-        // Re-create the service with updated config
+        batch_backend_ = std::make_shared<FakeHaKvBackend>();
         service_ = std::make_unique<HotStandbyService>(config_);
-
-        mock_store_ = std::make_shared<MockOpLogStore>();
-        service_->SetCatchUpOpLogStoreForTesting(mock_store_);
+        service_->SetCatchUpBatchKvBackendForTesting(batch_backend_);
     }
 
-    std::shared_ptr<MockOpLogStore> mock_store_;
+    std::shared_ptr<FakeHaKvBackend> batch_backend_;
 };
 
 #ifdef STORE_USE_ETCD
@@ -814,7 +781,6 @@ TEST_F(HotStandbyServiceTest,
                   prefix));
 
     HotStandbyConfig config = config_;
-    config.oplog_store_type = OpLogStoreType::ETCD_BATCH_RECORD;
     config.enable_snapshot_bootstrap = false;
     config.enable_oplog_following = true;
     config.oplog_poll_interval_ms = 10;
@@ -836,160 +802,18 @@ TEST_F(HotStandbyServiceTest,
 }
 #endif
 
-TEST_F(PromotionCatchUpTest, EmptyReadBeforeMaxFailsClosed) {
-    for (uint64_t s = 1; s <= 5; ++s) {
-        auto e = MakeEntry(s, OpType::PUT_END, "key_" + std::to_string(s),
-                           MakeValidPayload());
-        ASSERT_EQ(ErrorCode::OK, mock_store_->WriteOpLog(e));
-    }
-    mock_store_->SetForceReadEmpty(true);
-
-    // Try to promote; the service needs to reach WATCHING first
-    auto err = service_->Start("", oplog_endpoints_, cluster_id_);
-    if (err != ErrorCode::OK) {
-        GTEST_SKIP() << "Service could not reach WATCHING state via LOCAL_FS; "
-                        "skipping promotion test";
-    }
-    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
-
-    // PromoteAndExportSnapshot should fail-closed because the mock store has
-    // durable entries (seq 1-5) but ReadOpLogSince returns empty.
-    StandbySnapshot out;
-    ErrorCode promote_err = service_->PromoteAndExportSnapshot(out);
-    EXPECT_EQ(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, promote_err);
-}
-
-TEST_F(PromotionCatchUpTest, ReadErrorFailsClosed) {
-    for (uint64_t s = 1; s <= 3; ++s) {
-        auto e = MakeEntry(s, OpType::PUT_END, "key_" + std::to_string(s),
-                           MakeValidPayload());
-        ASSERT_EQ(ErrorCode::OK, mock_store_->WriteOpLog(e));
-    }
-    mock_store_->SetReadError(ErrorCode::PERSISTENT_FAIL);
-
-    auto err = service_->Start("", oplog_endpoints_, cluster_id_);
-    if (err != ErrorCode::OK) {
-        GTEST_SKIP() << "Service could not reach WATCHING state via LOCAL_FS; "
-                        "skipping promotion test";
-    }
-    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
-
-    StandbySnapshot out;
-    ErrorCode promote_err = service_->PromoteAndExportSnapshot(out);
-    EXPECT_EQ(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, promote_err);
-}
-
-TEST_F(PromotionCatchUpTest, UnresolvedGapsFailClosed) {
-    auto err = service_->Start("", oplog_endpoints_, cluster_id_);
-    if (err != ErrorCode::OK) {
-        GTEST_SKIP() << "Service could not reach WATCHING state via LOCAL_FS; "
-                        "skipping promotion test";
-    }
-    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
-
-    // Seed a skipped gap into the applier. The gap cannot be resolved because
-    // no OpLogStore has the entry, so ResolvePromotionGapsLocked leaves it
-    // untouched. PromoteLockedInternal's post-catch-up gap check then fires.
-    auto* applier = service_->GetOpLogApplierForTesting();
-    ASSERT_NE(nullptr, applier);
-    applier->AddSkippedGapForTesting(999);
-
-    StandbySnapshot out;
-    ErrorCode promote_err = service_->PromoteAndExportSnapshot(out);
-    EXPECT_EQ(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, promote_err);
-    EXPECT_EQ(StandbyState::FAILED, service_->GetState());
-}
-
-TEST_F(PromotionCatchUpTest, BestEffortReturnsOkWhenFlagFalse) {
-    config_.fail_closed_on_incomplete_catch_up = false;
-
-    for (uint64_t s = 1; s <= 3; ++s) {
-        auto e = MakeEntry(s, OpType::PUT_END, "key_" + std::to_string(s),
-                           MakeValidPayload());
-        ASSERT_EQ(ErrorCode::OK, mock_store_->WriteOpLog(e));
-    }
-    mock_store_->SetForceReadEmpty(true);
-
-    // Re-create service to apply updated config
-    service_ = std::make_unique<HotStandbyService>(config_);
-    service_->SetCatchUpOpLogStoreForTesting(mock_store_);
-
-    auto err = service_->Start("", oplog_endpoints_, cluster_id_);
-    if (err != ErrorCode::OK) {
-        GTEST_SKIP() << "Service could not reach WATCHING state via LOCAL_FS; "
-                        "skipping promotion test";
-    }
-    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
-
-    // With fail_closed_on_incomplete_catch_up=false, the best-effort path
-    // should return OK despite read-empty behavior.
-    StandbySnapshot out;
-    ErrorCode promote_err = service_->PromoteAndExportSnapshot(out);
-    EXPECT_EQ(ErrorCode::OK, promote_err);
-}
-
-TEST_F(PromotionCatchUpTest, BypassesGapCheckWhenFlagFalse) {
-    config_.fail_closed_on_unresolved_gaps = false;
-
-    // Re-create service to apply updated config
-    service_ = std::make_unique<HotStandbyService>(config_);
-    service_->SetCatchUpOpLogStoreForTesting(mock_store_);
-
-    auto err = service_->Start("", oplog_endpoints_, cluster_id_);
-    if (err != ErrorCode::OK) {
-        GTEST_SKIP() << "Service could not reach WATCHING state via LOCAL_FS; "
-                        "skipping promotion test";
-    }
-    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
-
-    // Seed a gap; with fail_closed_on_unresolved_gaps=false the post-catch-up
-    // gap check is skipped, so promotion succeeds.
-    auto* applier = service_->GetOpLogApplierForTesting();
-    ASSERT_NE(nullptr, applier);
-    applier->AddSkippedGapForTesting(999);
-
-    StandbySnapshot out;
-    ErrorCode promote_err = service_->PromoteAndExportSnapshot(out);
-    EXPECT_EQ(ErrorCode::OK, promote_err);
-    // PromoteAndExportSnapshot calls Stop() on success, so state becomes
-    // STOPPED.
-    EXPECT_EQ(StandbyState::STOPPED, service_->GetState());
-}
-
-TEST_F(PromotionCatchUpTest, PromoteAppliesSameFailClosedChecks) {
-    auto err = service_->Start("", oplog_endpoints_, cluster_id_);
-    if (err != ErrorCode::OK) {
-        GTEST_SKIP() << "Service could not reach WATCHING state via LOCAL_FS; "
-                        "skipping promotion test";
-    }
-    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
-
-    // Seed a gap and verify Promote() (not PromoteAndExportSnapshot) applies
-    // the same fail-closed checks via PromoteLockedInternal.
-    auto* applier = service_->GetOpLogApplierForTesting();
-    ASSERT_NE(nullptr, applier);
-    applier->AddSkippedGapForTesting(999);
-
-    ErrorCode promote_err = service_->Promote();
-    EXPECT_EQ(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, promote_err);
-    EXPECT_EQ(StandbyState::FAILED, service_->GetState());
-}
-
 TEST_F(PromotionCatchUpTest, UsesDurablePrefixLastSeqAsCatchUpTarget) {
-    auto batch_backend = std::make_shared<FakeHaKvBackend>();
     ASSERT_EQ(ErrorCode::OK,
-              batch_backend->Put(
+              batch_backend_->Put(
                   BuildDurablePrefixKey(cluster_id_),
                   EncodeDurablePrefix({.batch_id = 1, .last_seq = 2})));
     ASSERT_EQ(ErrorCode::OK,
-              batch_backend->Put(BuildBatchRecordKey(cluster_id_, 1),
-                                 EncodeOpLogBatchRecord(MakeBatch(1, 1, 2))));
-    mock_store_->SetForceReadEmpty(true);
-    service_->SetCatchUpBatchKvBackendForTesting(batch_backend);
+              batch_backend_->Put(BuildBatchRecordKey(cluster_id_, 1),
+                                  EncodeOpLogBatchRecord(MakeBatch(1, 1, 2))));
 
     auto err = service_->Start("", oplog_endpoints_, cluster_id_);
     if (err != ErrorCode::OK) {
-        GTEST_SKIP() << "Service could not reach WATCHING state via LOCAL_FS; "
+        GTEST_SKIP() << "Service could not reach WATCHING state; "
                         "skipping promotion test";
     }
     EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
@@ -1020,30 +844,46 @@ TEST_F(PromotionCatchUpTest, RetriesTransientDurablePrefixReadFailure) {
     EXPECT_EQ(1u, out.oplog_sequence_id);
 }
 
-TEST_F(PromotionCatchUpTest, CompletesLegacyPrefixBeforeFirstBatch) {
+TEST_F(PromotionCatchUpTest, MissingDurablePrefixPromotesAtSequenceZero) {
     ASSERT_EQ(ErrorCode::OK,
-              mock_store_->WriteOpLog(MakeEntry(1, OpType::PUT_END, "legacy_1",
-                                                MakeValidPayload())));
-    ASSERT_EQ(ErrorCode::OK,
-              mock_store_->WriteOpLog(MakeEntry(2, OpType::PUT_END, "legacy_2",
-                                                MakeValidPayload())));
+              service_->Start("", oplog_endpoints_, cluster_id_));
+    ASSERT_EQ(StandbyState::WATCHING, service_->GetState());
+    StandbySnapshot out;
+    ASSERT_EQ(ErrorCode::OK, service_->PromoteAndExportSnapshot(out));
+    EXPECT_EQ(0u, out.oplog_sequence_id);
+}
 
-    auto batch_backend = std::make_shared<FakeHaKvBackend>();
-    ASSERT_EQ(ErrorCode::OK,
-              batch_backend->Put(
-                  BuildDurablePrefixKey(cluster_id_),
-                  EncodeDurablePrefix({.batch_id = 1, .last_seq = 3})));
-    ASSERT_EQ(ErrorCode::OK,
-              batch_backend->Put(BuildBatchRecordKey(cluster_id_, 1),
-                                 EncodeOpLogBatchRecord(MakeBatch(1, 3, 3))));
-    service_->SetCatchUpBatchKvBackendForTesting(batch_backend);
+TEST_F(PromotionCatchUpTest, MissingDurablePrefixRejectsNonzeroSequence) {
+    config_.enable_snapshot_bootstrap = true;
+    service_ = std::make_unique<HotStandbyService>(config_);
+    service_->SetCatchUpBatchKvBackendForTesting(batch_backend_);
+    service_->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
+        std::optional<LoadedSnapshot>(MakeSnapshot("baseline", 1, "key", 1))));
 
     ASSERT_EQ(ErrorCode::OK,
               service_->Start("", oplog_endpoints_, cluster_id_));
+    ASSERT_EQ(StandbyState::WATCHING, service_->GetState());
+    StandbySnapshot out;
+    EXPECT_EQ(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP,
+              service_->PromoteAndExportSnapshot(out));
+    EXPECT_EQ(StandbyState::FAILED, service_->GetState());
+}
+
+TEST_F(PromotionCatchUpTest, CatchesUpPrefixThatAppearsBeforePromotion) {
+    ASSERT_EQ(ErrorCode::OK,
+              service_->Start("", oplog_endpoints_, cluster_id_));
+    ASSERT_EQ(StandbyState::WATCHING, service_->GetState());
+    ASSERT_EQ(ErrorCode::OK,
+              batch_backend_->Put(
+                  BuildDurablePrefixKey(cluster_id_),
+                  EncodeDurablePrefix({.batch_id = 1, .last_seq = 1})));
+    ASSERT_EQ(ErrorCode::OK,
+              batch_backend_->Put(BuildBatchRecordKey(cluster_id_, 1),
+                                  EncodeOpLogBatchRecord(MakeBatch(1, 1, 1))));
 
     StandbySnapshot out;
     ASSERT_EQ(ErrorCode::OK, service_->PromoteAndExportSnapshot(out));
-    EXPECT_EQ(3u, out.oplog_sequence_id);
+    EXPECT_EQ(1u, out.oplog_sequence_id);
 }
 
 TEST_F(PromotionCatchUpTest, PaginatesBatchRecords) {
@@ -1064,7 +904,7 @@ TEST_F(PromotionCatchUpTest, PaginatesBatchRecords) {
 
     auto err = service_->Start("", oplog_endpoints_, cluster_id_);
     if (err != ErrorCode::OK) {
-        GTEST_SKIP() << "Service could not reach WATCHING state via LOCAL_FS; "
+        GTEST_SKIP() << "Service could not reach WATCHING state; "
                         "skipping promotion test";
     }
 
@@ -1074,15 +914,9 @@ TEST_F(PromotionCatchUpTest, PaginatesBatchRecords) {
 }
 
 TEST_F(PromotionCatchUpTest, FailsPromotionWhenDurablePrefixUnreadable) {
-    auto batch_backend = std::make_shared<FakeHaKvBackend>();
-    batch_backend->SetGetError(ErrorCode::PERSISTENT_FAIL);
-    service_->SetCatchUpBatchKvBackendForTesting(batch_backend);
-
-    auto err = service_->Start("", oplog_endpoints_, cluster_id_);
-    if (err != ErrorCode::OK) {
-        GTEST_SKIP() << "Service could not reach WATCHING state via LOCAL_FS; "
-                        "skipping promotion test";
-    }
+    ASSERT_EQ(ErrorCode::OK,
+              service_->Start("", oplog_endpoints_, cluster_id_));
+    batch_backend_->SetGetError(ErrorCode::PERSISTENT_FAIL);
 
     StandbySnapshot out;
     ErrorCode promote_err = service_->PromoteAndExportSnapshot(out);
@@ -1091,19 +925,13 @@ TEST_F(PromotionCatchUpTest, FailsPromotionWhenDurablePrefixUnreadable) {
 }
 
 TEST_F(PromotionCatchUpTest, FailsPromotionWhenTargetBatchUnreadable) {
-    auto batch_backend = std::make_shared<FakeHaKvBackend>();
     ASSERT_EQ(ErrorCode::OK,
-              batch_backend->Put(
+              service_->Start("", oplog_endpoints_, cluster_id_));
+    ASSERT_EQ(ErrorCode::OK,
+              batch_backend_->Put(
                   BuildDurablePrefixKey(cluster_id_),
                   EncodeDurablePrefix({.batch_id = 1, .last_seq = 1})));
-    batch_backend->SetRangeError(ErrorCode::PERSISTENT_FAIL);
-    service_->SetCatchUpBatchKvBackendForTesting(batch_backend);
-
-    auto err = service_->Start("", oplog_endpoints_, cluster_id_);
-    if (err != ErrorCode::OK) {
-        GTEST_SKIP() << "Service could not reach WATCHING state via LOCAL_FS; "
-                        "skipping promotion test";
-    }
+    batch_backend_->SetRangeError(ErrorCode::PERSISTENT_FAIL);
 
     StandbySnapshot out;
     ErrorCode promote_err = service_->PromoteAndExportSnapshot(out);

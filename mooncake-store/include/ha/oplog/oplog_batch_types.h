@@ -4,7 +4,7 @@
 #include <string>
 #include <vector>
 
-#include "ha/oplog/oplog_manager.h"
+#include "ha/oplog/oplog_types.h"
 
 namespace mooncake {
 

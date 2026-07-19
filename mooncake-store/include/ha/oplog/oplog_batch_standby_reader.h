@@ -23,9 +23,7 @@ struct OpLogBatchStandbyPollResult {
     OpLogBatchStandbyPollDisposition disposition{
         OpLogBatchStandbyPollDisposition::OK};
     ErrorCode error{ErrorCode::OK};
-    bool used_legacy_path{false};
-    bool waiting_for_legacy_catch_up{false};
-    uint64_t legacy_catch_up_target{0};
+    bool durable_prefix_present{false};
     size_t applied_entries{0};
     DurablePrefix durable_prefix{};
 };

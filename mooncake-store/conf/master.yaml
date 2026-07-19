@@ -28,12 +28,7 @@ client_live_ttl_sec: 60
 
 # OpLog store configuration for HA hot-standby replication
 enable_oplog: false
-# OpLog store type: "etcd_batch_record", "etcd", "localfs", or empty
-# (default: etcd_batch_record if compiled with etcd support, else localfs)
-oplog_store_type: ""
-# Root directory for localfs OpLog store
-oplog_store_root_dir: "/tmp/mooncake_oplog"
-# Poll interval in milliseconds for localfs and batch standby base polling/retry delay
+# Batch standby base polling/retry delay in milliseconds
 oplog_poll_interval_ms: 1000
 # Maximum consecutive retryable batch-standby failure window in seconds
 batch_oplog_retry_timeout_sec: 180

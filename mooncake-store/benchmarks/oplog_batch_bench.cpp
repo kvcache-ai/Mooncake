@@ -15,8 +15,7 @@
 #include "ha/kv/etcd_ha_kv_backend.h"
 #include "ha/oplog/oplog_batch_codec.h"
 #include "ha/oplog/oplog_batch_storage.h"
-#include "ha/oplog/oplog_manager.h"
-#include "ha/oplog/oplog_store.h"
+#include "ha/oplog/oplog_types.h"
 #include "ha/oplog/ordered_oplog_writer.h"
 
 DEFINE_string(endpoints, "127.0.0.1:2379", "Etcd endpoints");
@@ -82,7 +81,7 @@ OpLogEntry MakeEntry(uint64_t id) {
     entry.tenant_id = "default";
     entry.object_key = "bench-key-" + std::to_string(id);
     entry.payload.assign(FLAGS_entry_bytes, 'x');
-    entry.checksum = OpLogManager::ComputeChecksum(entry.payload);
+    entry.checksum = ComputeOpLogChecksum(entry.payload);
     return entry;
 }
 

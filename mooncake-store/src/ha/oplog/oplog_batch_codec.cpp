@@ -137,7 +137,7 @@ bool JsonEntryToOpLogEntry(const Json::Value& root, uint64_t sequence_id,
     entry->tenant_id = root[1].asString();
     entry->object_key = root[2].asString();
     entry->payload = std::move(payload);
-    entry->checksum = OpLogManager::ComputeChecksum(entry->payload);
+    entry->checksum = ComputeOpLogChecksum(entry->payload);
     entry->prefix_hash = 0;
     if (!ValidateOpLogBatchEntry(*entry, reason)) {
         return false;

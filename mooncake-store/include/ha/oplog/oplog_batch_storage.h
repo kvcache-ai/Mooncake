@@ -23,7 +23,7 @@ class OpLogBatchStorage {
 
    private:
     bool IsValidClusterId() const;
-    ErrorCode ReadMaxLegacySequence(uint64_t& sequence_id);
+    ErrorCode RejectLegacyLayout() const;
 
     std::string cluster_id_;
     HaKvBackend& backend_;

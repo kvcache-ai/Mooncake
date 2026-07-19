@@ -4,27 +4,23 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
-#include <map>
 #include <memory>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include <xxhash.h>
 
 #include "metadata_store.h"
 #include "mock_metadata_store.h"
-#include "mock_oplog_store.h"
-#include "ha/oplog/oplog_manager.h"
+#include "ha/oplog/oplog_types.h"
 #include "types.h"
 
 using mooncake::test::MockMetadataStore;
-using mooncake::test::MockOpLogStore;
 
 namespace mooncake::test {
 
 // Helper function to create a valid OpLogEntry with checksum
-// Uses the same checksum algorithm as OpLogManager (XXH32)
+// Uses the production checksum algorithm (XXH32).
 OpLogEntry MakeEntry(uint64_t seq, OpType type, const std::string& key,
                      const std::string& payload) {
     OpLogEntry e;
@@ -35,7 +31,7 @@ OpLogEntry MakeEntry(uint64_t seq, OpType type, const std::string& key,
     e.op_type = type;
     e.object_key = key;
     e.payload = payload;
-    // Compute checksum and prefix_hash using the same algorithm as OpLogManager
+    // Compute checksum and prefix_hash using the production algorithm.
     e.checksum =
         static_cast<uint32_t>(XXH32(payload.data(), payload.size(), 0));
     e.prefix_hash =
@@ -67,26 +63,6 @@ class OpLogApplierTest : public ::testing::Test {
     }
 
     void TearDown() override { google::ShutdownGoogleLogging(); }
-
-    // Helpers for gap-status tests. TEST_F creates a derived class, so the
-    // friend declaration on OpLogApplier does not propagate. These member
-    // functions are defined on the fixture base class and access the maps
-    // through the friend grant.
-    void ClearGaps() {
-        applier_->missing_sequence_ids_.clear();
-        applier_->skipped_sequence_ids_.clear();
-    }
-    void AddMissingGap(uint64_t seq) {
-        applier_->missing_sequence_ids_[seq] = std::chrono::steady_clock::now();
-    }
-    void AddSkippedGap(uint64_t seq) {
-        applier_->skipped_sequence_ids_[seq] = std::chrono::steady_clock::now();
-    }
-
-    // Helper to call private ApplyPutEndIfNewer from TEST_F bodies.
-    bool ApplyPutEndIfNewer(const OpLogEntry& entry) {
-        return applier_->ApplyPutEndIfNewer(entry);
-    }
 
     std::unique_ptr<MockMetadataStore> mock_metadata_store_;
     std::unique_ptr<OpLogApplier> applier_;
@@ -164,56 +140,28 @@ TEST_F(OpLogApplierTest, TestApplyInOrder) {
     EXPECT_TRUE(mock_metadata_store_->Exists("key3"));
 }
 
-TEST_F(OpLogApplierTest, TestApplyOutOfOrder) {
+TEST_F(OpLogApplierTest, FutureSequenceFailsWithoutBuffering) {
     std::string payload = MakeValidPayload();
     OpLogEntry entry1 = MakeEntry(1, OpType::PUT_END, "key1", payload);
-    OpLogEntry entry3 = MakeEntry(3, OpType::PUT_END, "key3", payload);
     OpLogEntry entry2 = MakeEntry(2, OpType::PUT_END, "key2", payload);
+    OpLogEntry entry3 = MakeEntry(3, OpType::PUT_END, "key3", payload);
 
     // Apply entry1 (seq=1) - should succeed
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry1));
     EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
 
-    // Apply entry3 (seq=3) - should be cached (out of order)
+    // A future entry fails and is not retained for later application.
     EXPECT_FALSE(applier_->ApplyOpLogEntry(entry3));
-    EXPECT_EQ(2u,
-              applier_->GetExpectedSequenceId());  // Still waiting for seq=2
+    EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
     EXPECT_FALSE(mock_metadata_store_->Exists("key3"));
 
-    // Apply entry2 (seq=2) - should succeed and trigger processing of entry3
-    // ApplyOpLogEntry internally calls ProcessPendingEntries(), so entry3
-    // should be processed
+    // Applying the expected entry does not resurrect the rejected future one.
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry2));
-    EXPECT_EQ(4u, applier_->GetExpectedSequenceId());  // Now at seq=4
+    EXPECT_EQ(3u, applier_->GetExpectedSequenceId());
 
-    // entry3 should already be processed by ApplyOpLogEntry
     EXPECT_TRUE(mock_metadata_store_->Exists("key1"));
     EXPECT_TRUE(mock_metadata_store_->Exists("key2"));
-    EXPECT_TRUE(mock_metadata_store_->Exists("key3"));
-
-    // ProcessPendingEntries may return 0 if entry3 was already processed
-    (void)applier_->ProcessPendingEntries();
-    EXPECT_EQ(4u, applier_->GetExpectedSequenceId());
-}
-
-TEST_F(OpLogApplierTest, TestApplyWithGap) {
-    std::string payload = MakeValidPayload();
-    OpLogEntry entry1 = MakeEntry(1, OpType::PUT_END, "key1", payload);
-    OpLogEntry entry4 = MakeEntry(4, OpType::PUT_END, "key4", payload);
-
-    // Apply entry1 (seq=1)
-    EXPECT_TRUE(applier_->ApplyOpLogEntry(entry1));
-    EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
-
-    // Apply entry4 (seq=4) - gap at seq=2,3
-    EXPECT_FALSE(applier_->ApplyOpLogEntry(entry4));
-    EXPECT_EQ(2u,
-              applier_->GetExpectedSequenceId());  // Still waiting for seq=2
-
-    // Process pending entries - should detect gap and schedule wait
-    (void)applier_->ProcessPendingEntries();
-    // May process 0 entries if gap resolution is still waiting
-    EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
+    EXPECT_FALSE(mock_metadata_store_->Exists("key3"));
 }
 
 TEST_F(OpLogApplierTest, TestApplyDuplicateSequenceId) {
@@ -231,93 +179,6 @@ TEST_F(OpLogApplierTest, TestApplyDuplicateSequenceId) {
     EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
     // key1_dup should not be added (treated as no-op)
     EXPECT_FALSE(mock_metadata_store_->Exists("key1_dup"));
-}
-
-// ========== 4.1.3 Gap resolution tests ==========
-
-class OpLogApplierGapTest : public ::testing::Test {
-   protected:
-    void SetUp() override {
-        google::InitGoogleLogging("OpLogApplierGapTest");
-        FLAGS_logtostderr = 1;
-        mock_metadata_store_ = std::make_unique<MockMetadataStore>();
-        mock_oplog_store_ = std::make_unique<MockOpLogStore>();
-        applier_ = std::make_unique<OpLogApplier>(mock_metadata_store_.get(),
-                                                  "test_cluster",
-                                                  mock_oplog_store_.get());
-    }
-    void TearDown() override { google::ShutdownGoogleLogging(); }
-
-    std::unique_ptr<MockMetadataStore> mock_metadata_store_;
-    std::unique_ptr<MockOpLogStore> mock_oplog_store_;
-    std::unique_ptr<OpLogApplier> applier_;
-};
-
-TEST_F(OpLogApplierGapTest, RequestMissingOpLog_Success) {
-    std::string payload = MakeValidPayload();
-    // Pre-populate seq=2 in mock store
-    OpLogEntry missing = MakeEntry(2, OpType::PUT_END, "key2", payload);
-    mock_oplog_store_->WriteOpLog(missing);
-
-    // Apply seq=1
-    EXPECT_TRUE(applier_->ApplyOpLogEntry(
-        MakeEntry(1, OpType::PUT_END, "key1", payload)));
-    // Apply seq=3 (gap at seq=2)
-    EXPECT_FALSE(applier_->ApplyOpLogEntry(
-        MakeEntry(3, OpType::PUT_END, "key3", payload)));
-
-    // First call registers the gap in missing_sequence_ids_
-    applier_->ProcessPendingEntries();
-    EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
-
-    // Wait for gap resolution trigger (kMissingEntryRequestSeconds = 1s)
-    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
-    applier_->ProcessPendingEntries();
-
-    // After gap resolution, all 3 should be applied
-    EXPECT_EQ(4u, applier_->GetExpectedSequenceId());
-    EXPECT_TRUE(mock_metadata_store_->Exists("key1"));
-    EXPECT_TRUE(mock_metadata_store_->Exists("key2"));
-    EXPECT_TRUE(mock_metadata_store_->Exists("key3"));
-}
-
-TEST_F(OpLogApplierGapTest, RequestMissingOpLog_StoreError) {
-    std::string payload = MakeValidPayload();
-    mock_oplog_store_->SetReadError(ErrorCode::ETCD_OPERATION_ERROR);
-
-    EXPECT_TRUE(applier_->ApplyOpLogEntry(
-        MakeEntry(1, OpType::PUT_END, "key1", payload)));
-    EXPECT_FALSE(applier_->ApplyOpLogEntry(
-        MakeEntry(3, OpType::PUT_END, "key3", payload)));
-
-    // First call registers the gap
-    applier_->ProcessPendingEntries();
-
-    // Gap resolution should fail gracefully
-    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
-    applier_->ProcessPendingEntries();
-
-    // seq=2 not resolved, expected still at 2
-    EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
-}
-
-TEST_F(OpLogApplierGapTest, RequestMissingOpLog_NotFound) {
-    std::string payload = MakeValidPayload();
-    // Don't preload seq=2 in mock store
-
-    EXPECT_TRUE(applier_->ApplyOpLogEntry(
-        MakeEntry(1, OpType::PUT_END, "key1", payload)));
-    EXPECT_FALSE(applier_->ApplyOpLogEntry(
-        MakeEntry(3, OpType::PUT_END, "key3", payload)));
-
-    // First call registers the gap
-    applier_->ProcessPendingEntries();
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
-    applier_->ProcessPendingEntries();
-
-    // Not found, should not advance
-    EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
 }
 
 // ========== 4.1.4 Checksum tests ==========
@@ -360,7 +221,7 @@ TEST_F(OpLogApplierTest, TestApplyOpLogEntry_ValidSize) {
     std::string payload = MakeValidPayload();
     OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", payload);
 
-    EXPECT_TRUE(OpLogManager::ValidateEntrySize(entry));
+    EXPECT_TRUE(ValidateOpLogEntrySize(entry));
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
 }
 
@@ -368,9 +229,9 @@ TEST_F(OpLogApplierTest, TestApplyOpLogEntry_InvalidSize) {
     OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", "");
 
     // Make key too large
-    entry.object_key.assign(OpLogManager::kMaxObjectKeySize + 1, 'k');
+    entry.object_key.assign(kMaxOpLogObjectKeySize + 1, 'k');
 
-    EXPECT_FALSE(OpLogManager::ValidateEntrySize(entry));
+    EXPECT_FALSE(ValidateOpLogEntrySize(entry));
     EXPECT_FALSE(applier_->ApplyOpLogEntry(entry));
     EXPECT_EQ(1u, applier_->GetExpectedSequenceId());  // Should not advance
     EXPECT_FALSE(mock_metadata_store_->Exists("key1"));
@@ -380,9 +241,9 @@ TEST_F(OpLogApplierTest, TestApplyOpLogEntry_PayloadTooLarge) {
     OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", "");
 
     // Make payload too large
-    entry.payload.assign(OpLogManager::kMaxPayloadSize + 1, 'p');
+    entry.payload.assign(kMaxOpLogPayloadSize + 1, 'p');
 
-    EXPECT_FALSE(OpLogManager::ValidateEntrySize(entry));
+    EXPECT_FALSE(ValidateOpLogEntrySize(entry));
     EXPECT_FALSE(applier_->ApplyOpLogEntry(entry));
     EXPECT_EQ(1u, applier_->GetExpectedSequenceId());  // Should not advance
 }
@@ -411,123 +272,6 @@ TEST_F(OpLogApplierTest, TestRecover_ZeroSequenceId) {
     OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", payload);
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
     EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
-}
-
-TEST_F(OpLogApplierTest, TestRecover_AfterGap) {
-    std::string payload = MakeValidPayload();
-    OpLogEntry entry1 = MakeEntry(1, OpType::PUT_END, "key1", payload);
-    OpLogEntry entry3 = MakeEntry(3, OpType::PUT_END, "key3", payload);
-
-    // Apply entry1
-    EXPECT_TRUE(applier_->ApplyOpLogEntry(entry1));
-    EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
-
-    // Apply entry3 (creates gap)
-    EXPECT_FALSE(applier_->ApplyOpLogEntry(entry3));
-
-    // Recover from seq=3 (skip the gap)
-    applier_->Recover(3);
-    EXPECT_EQ(4u, applier_->GetExpectedSequenceId());
-
-    // Now entry3 should be processable
-    (void)applier_->ProcessPendingEntries();
-    // entry3 should be in pending, but expected_seq is now 4, so it won't be
-    // processed This tests that recovery resets the expected sequence
-}
-
-// ========== 4.1.7 Pending entries tests ==========
-
-TEST_F(OpLogApplierTest, TestProcessPendingEntries) {
-    std::string payload = MakeValidPayload();
-    OpLogEntry entry1 = MakeEntry(1, OpType::PUT_END, "key1", payload);
-    OpLogEntry entry3 = MakeEntry(3, OpType::PUT_END, "key3", payload);
-    OpLogEntry entry2 = MakeEntry(2, OpType::PUT_END, "key2", payload);
-
-    // Apply entry1
-    EXPECT_TRUE(applier_->ApplyOpLogEntry(entry1));
-    EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
-
-    // Apply entry3 (out of order)
-    EXPECT_FALSE(applier_->ApplyOpLogEntry(entry3));
-    EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
-
-    // Process pending - should not process entry3 yet (waiting for seq=2)
-    size_t processed1 = applier_->ProcessPendingEntries();
-    EXPECT_EQ(0u, processed1);
-    EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
-
-    // Apply entry2 - this will internally call ProcessPendingEntries() and
-    // process entry3
-    EXPECT_TRUE(applier_->ApplyOpLogEntry(entry2));
-    EXPECT_EQ(4u, applier_->GetExpectedSequenceId());
-
-    // entry3 should already be processed by ApplyOpLogEntry
-    EXPECT_TRUE(mock_metadata_store_->Exists("key1"));
-    EXPECT_TRUE(mock_metadata_store_->Exists("key2"));
-    EXPECT_TRUE(mock_metadata_store_->Exists("key3"));
-
-    // ProcessPendingEntries may return 0 if entry3 was already processed
-    (void)applier_->ProcessPendingEntries();
-    EXPECT_EQ(4u, applier_->GetExpectedSequenceId());
-}
-
-TEST_F(OpLogApplierTest, TestPendingEntriesTimeout) {
-    std::string payload = MakeValidPayload();
-    OpLogEntry entry1 = MakeEntry(1, OpType::PUT_END, "key1", payload);
-    OpLogEntry entry3 = MakeEntry(3, OpType::PUT_END, "key3", payload);
-
-    // Apply entry1
-    EXPECT_TRUE(applier_->ApplyOpLogEntry(entry1));
-    EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
-
-    // Apply entry3 (creates gap at seq=2)
-    EXPECT_FALSE(applier_->ApplyOpLogEntry(entry3));
-
-    // Process pending entries multiple times to trigger timeout
-    // After kMissingEntrySkipSeconds (3s), the gap should be skipped
-    size_t processed = 0;
-    for (int i = 0; i < 10; ++i) {
-        processed = applier_->ProcessPendingEntries();
-        if (processed > 0 || applier_->GetExpectedSequenceId() > 2) {
-            break;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    }
-
-    // After timeout, gap should be skipped and entry3 should be processed
-    // Note: This test may be flaky due to timing, but it tests the timeout
-    // logic
-    EXPECT_GE(applier_->GetExpectedSequenceId(), 2u);
-}
-
-TEST_F(OpLogApplierTest, TestPendingEntriesSkip) {
-    std::string payload = MakeValidPayload();
-    OpLogEntry entry1 = MakeEntry(1, OpType::PUT_END, "key1", payload);
-    OpLogEntry entry4 = MakeEntry(4, OpType::PUT_END, "key4", payload);
-
-    // Apply entry1
-    EXPECT_TRUE(applier_->ApplyOpLogEntry(entry1));
-    EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
-
-    // Apply entry4 (creates gap at seq=2,3)
-    EXPECT_FALSE(applier_->ApplyOpLogEntry(entry4));
-
-    // Process pending entries to trigger skip logic
-    // After timeout (3 seconds), gaps should be skipped
-    for (int i = 0; i < 10; ++i) {
-        applier_->ProcessPendingEntries();
-        uint64_t expected = applier_->GetExpectedSequenceId();
-        if (expected >= 3) {  // Gap at seq=2 is skipped, expected becomes 3
-            break;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    }
-
-    // After skip, expected_seq should advance to 3 (gap at seq=2 is skipped)
-    // entry4 is still pending, waiting for seq=3
-    EXPECT_GE(applier_->GetExpectedSequenceId(), 3u);
-    // entry4 should still be pending (not applied yet)
-    EXPECT_FALSE(mock_metadata_store_->Exists("key4"));
 }
 
 // ========== 4.1.8 Payload deserialization tests ==========
@@ -603,21 +347,11 @@ TEST_F(OpLogApplierTest, TestApplyOpLogEntries_WithGaps) {
     entries.push_back(MakeEntry(2, OpType::PUT_END, "key2", payload));
 
     size_t applied = applier_->ApplyOpLogEntries(entries);
-    // entry1 should be applied, entry3 should be pending, entry2 should be
-    // applied and trigger processing of entry3
-    EXPECT_GE(applied, 2u);  // entry1 and entry2 are applied
-    EXPECT_LE(applied, 3u);
-
-    // entry2's ApplyOpLogEntry internally calls ProcessPendingEntries(), so
-    // entry3 should be processed
-    EXPECT_GE(applier_->GetExpectedSequenceId(), 4u);
+    EXPECT_EQ(2u, applied);
+    EXPECT_EQ(3u, applier_->GetExpectedSequenceId());
     EXPECT_TRUE(mock_metadata_store_->Exists("key1"));
     EXPECT_TRUE(mock_metadata_store_->Exists("key2"));
-    EXPECT_TRUE(mock_metadata_store_->Exists("key3"));
-
-    // ProcessPendingEntries may return 0 if entry3 was already processed
-    (void)applier_->ProcessPendingEntries();
-    EXPECT_GE(applier_->GetExpectedSequenceId(), 4u);
+    EXPECT_FALSE(mock_metadata_store_->Exists("key3"));
 }
 
 TEST_F(OpLogApplierTest, TestGetExpectedSequenceId) {
@@ -789,174 +523,6 @@ TEST_F(OpLogApplierTest, TestApplySegmentOperations_Mixed) {
     auto info3 = registry.GetSegment("192.168.1.3:12345");
     ASSERT_TRUE(info3.has_value());
     EXPECT_EQ(8192u, info3->capacity);
-}
-
-// ========== Issue 3 gap-status API ==========
-
-TEST_F(OpLogApplierTest, GetUnresolvedGapCountTracksMissingThenSkipped) {
-    EXPECT_EQ(0u, applier_->GetUnresolvedGapCount());
-    EXPECT_FALSE(applier_->HasUnresolvedGaps());
-
-    // Inject a missing entry via helper (uses friend access from fixture).
-    AddMissingGap(42);
-    EXPECT_EQ(1u, applier_->GetUnresolvedGapCount());
-    EXPECT_TRUE(applier_->HasUnresolvedGaps());
-
-    // Inject a skipped entry: unresolved count sums both maps.
-    AddSkippedGap(7);
-    EXPECT_EQ(2u, applier_->GetUnresolvedGapCount());
-    EXPECT_TRUE(applier_->HasUnresolvedGaps());
-
-    // Clear both maps via helper and verify zero.
-    ClearGaps();
-    EXPECT_EQ(0u, applier_->GetUnresolvedGapCount());
-    EXPECT_FALSE(applier_->HasUnresolvedGaps());
-}
-
-// ========== Issue 2 ApplyPutEndIfNewer ==========
-
-TEST_F(OpLogApplierTest, LateSkippedPutEndDoesNotOverwriteNewerMetadata) {
-    // Recover to expected=5, then apply seq=5 normally.
-    applier_->Recover(4);
-    auto newer =
-        MakeEntry(5, OpType::PUT_END, "key1", MakeValidPayload(1, 2, 8192));
-    newer.tenant_id = "default";
-    ASSERT_TRUE(applier_->ApplyOpLogEntry(newer));
-
-    // Friend-access: inject seq=3 into skipped_sequence_ids_ to force
-    // the late-skipped branch on the next ApplyOpLogEntry call.
-    AddSkippedGap(3);
-
-    // A late-arriving PUT_END with seq=3 for the same key1 must NOT
-    // overwrite the newer seq=5 metadata.
-    auto older =
-        MakeEntry(3, OpType::PUT_END, "key1", MakeValidPayload(1, 2, 1024));
-    older.tenant_id = "default";
-    EXPECT_TRUE(applier_->ApplyOpLogEntry(older));
-
-    auto meta = mock_metadata_store_->GetMetadata("default", "key1");
-    ASSERT_TRUE(meta.has_value());
-    EXPECT_EQ(8192u, meta->size);
-    EXPECT_EQ(5u, meta->last_sequence_id);
-}
-
-TEST_F(OpLogApplierTest, ApplyPutEndIfNewerRejectsStaleEntry) {
-    // Direct test of the helper via fixture method.
-    applier_->Recover(4);
-    auto newer =
-        MakeEntry(5, OpType::PUT_END, "key1", MakeValidPayload(1, 2, 8192));
-    newer.tenant_id = "default";
-    ASSERT_TRUE(applier_->ApplyOpLogEntry(newer));
-
-    auto older =
-        MakeEntry(3, OpType::PUT_END, "key1", MakeValidPayload(1, 2, 1024));
-    older.tenant_id = "default";
-    EXPECT_TRUE(ApplyPutEndIfNewer(older));
-
-    auto meta = mock_metadata_store_->GetMetadata("default", "key1");
-    ASSERT_TRUE(meta.has_value());
-    EXPECT_EQ(8192u, meta->size);
-}
-
-TEST_F(OpLogApplierTest, ApplyPutEndIfNewerAppliesWhenNoExistingMetadata) {
-    auto entry =
-        MakeEntry(1, OpType::PUT_END, "key1", MakeValidPayload(1, 2, 1024));
-    entry.tenant_id = "default";
-    EXPECT_TRUE(ApplyPutEndIfNewer(entry));
-    EXPECT_TRUE(mock_metadata_store_->Exists("key1"));
-}
-
-TEST_F(OpLogApplierTest, ApplyPutEndIfNewerAppliesWhenSameSequenceId) {
-    applier_->Recover(4);
-    auto first =
-        MakeEntry(5, OpType::PUT_END, "key1", MakeValidPayload(1, 2, 1024));
-    first.tenant_id = "default";
-    ASSERT_TRUE(applier_->ApplyOpLogEntry(first));
-
-    auto same_seq =
-        MakeEntry(5, OpType::PUT_END, "key1", MakeValidPayload(1, 2, 2048));
-    same_seq.tenant_id = "default";
-    EXPECT_TRUE(ApplyPutEndIfNewer(same_seq));
-
-    auto meta = mock_metadata_store_->GetMetadata("default", "key1");
-    ASSERT_TRUE(meta.has_value());
-    EXPECT_EQ(2048u, meta->size);
-}
-
-// ========== Issue 2 Promotion gap resolution ==========
-
-TEST_F(OpLogApplierTest, PromotionGapResolutionReplaysSkippedPutEnd) {
-    auto store = std::make_shared<MockOpLogStore>();
-    applier_->SetOpLogStore(store.get());
-
-    auto gap =
-        MakeEntry(1, OpType::PUT_END, "key1", MakeValidPayload(1, 2, 4096));
-    gap.tenant_id = "default";
-    ASSERT_EQ(ErrorCode::OK, store->WriteOpLog(gap, /*sync=*/true));
-
-    // Friend-access: directly register seq=1 as a skipped gap.
-    AddSkippedGap(1);
-
-    auto result = applier_->TryResolveGapsOnceForPromotion();
-
-    EXPECT_EQ(1u, result.attempted);
-    EXPECT_EQ(1u, result.fetched);
-    EXPECT_EQ(1u, result.applied_puts);
-    EXPECT_EQ(0u, result.applied_deletes);
-    EXPECT_FALSE(applier_->HasUnresolvedGaps());
-    EXPECT_TRUE(mock_metadata_store_->Exists("key1"));
-}
-
-TEST_F(OpLogApplierTest, PromotionGapResolutionFetchesMissingEntry) {
-    auto store = std::make_shared<MockOpLogStore>();
-    applier_->SetOpLogStore(store.get());
-
-    auto gap = MakeEntry(1, OpType::PUT_REVOKE, "key1", "");
-    gap.tenant_id = "default";
-    ASSERT_EQ(ErrorCode::OK, store->WriteOpLog(gap, /*sync=*/true));
-
-    AddMissingGap(1);
-
-    auto result = applier_->TryResolveGapsOnceForPromotion();
-
-    EXPECT_EQ(1u, result.attempted);
-    EXPECT_EQ(1u, result.fetched);
-    EXPECT_EQ(0u, result.applied_puts);
-    EXPECT_EQ(1u, result.applied_deletes);
-    EXPECT_FALSE(applier_->HasUnresolvedGaps());
-}
-
-// MockOpLogStore seam smoke test.
-TEST(MockOpLogStoreTest, ForceReadEmptyReturnsEmptyVector) {
-    MockOpLogStore store;
-    auto e1 = MakeEntry(1, OpType::PUT_END, "key1", MakeValidPayload());
-    auto e2 = MakeEntry(2, OpType::PUT_END, "key2", MakeValidPayload());
-    ASSERT_EQ(ErrorCode::OK, store.WriteOpLog(e1));
-    ASSERT_EQ(ErrorCode::OK, store.WriteOpLog(e2));
-
-    // Sanity: GetMaxSequenceId reports 2.
-    uint64_t max_seq = 0;
-    ASSERT_EQ(ErrorCode::OK, store.GetMaxSequenceId(max_seq));
-    EXPECT_EQ(2u, max_seq);
-
-    // Without force-empty, ReadOpLogSince returns both entries.
-    std::vector<OpLogEntry> batch;
-    ASSERT_EQ(ErrorCode::OK, store.ReadOpLogSince(0, 100, batch));
-    EXPECT_EQ(2u, batch.size());
-
-    // With force-empty, ReadOpLogSince returns OK + empty vector
-    // while GetMaxSequenceId still reports 2.
-    store.SetForceReadEmpty(true);
-    batch.clear();
-    ASSERT_EQ(ErrorCode::OK, store.ReadOpLogSince(0, 100, batch));
-    EXPECT_TRUE(batch.empty());
-    ASSERT_EQ(ErrorCode::OK, store.GetMaxSequenceId(max_seq));
-    EXPECT_EQ(2u, max_seq);
-
-    // Toggling back restores normal behavior.
-    store.SetForceReadEmpty(false);
-    ASSERT_EQ(ErrorCode::OK, store.ReadOpLogSince(0, 100, batch));
-    EXPECT_EQ(2u, batch.size());
 }
 
 }  // namespace mooncake::test
