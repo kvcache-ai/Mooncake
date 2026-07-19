@@ -1579,6 +1579,16 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                     read_res = uring_file->read_aligned(
                         plan.dest_slice.ptr, aligned_size, aligned_offset);
                     if (read_res) {
+                        if (read_res.value() < plan.dest_slice.size) {
+                            LOG(ERROR) << "uring read short of data for key: "
+                                       << plan.key
+                                       << ", bucket_id=" << plan.bucket_id
+                                       << ", expected>="
+                                       << plan.dest_slice.size
+                                       << ", got=" << read_res.value();
+                            return tl::make_unexpected(
+                                ErrorCode::FILE_READ_FAIL);
+                        }
                         batch_object.at(plan.key).ptr =
                             static_cast<char*>(plan.dest_slice.ptr) +
                             offset_in_buffer;
@@ -1605,31 +1615,73 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                 }
                 bucket_bytes += plan.data_size;
             } else {
-                // Merged group: one big pread into temp buffer, then scatter
-                int64_t seg_size = seg_end - seg_offset;
-                std::vector<char> merge_buf(static_cast<size_t>(seg_size));
-                iovec iov{merge_buf.data(), static_cast<size_t>(seg_size)};
-                auto read_res = file->vector_read(&iov, 1, seg_offset);
+                // Merged group: one big pread into an aligned temp buffer,
+                // then scatter to each key's dest_slice.
+                //
+                // O_DIRECT (UringFile) requires offset, length, and buffer
+                // address to all be 4096-aligned; seg_offset/seg_end are
+                // derived from key boundaries and are generally *not*
+                // aligned. Align the read range outward (matching the
+                // single-key path at the align_down/align_up calls above)
+                // and track where in the aligned buffer the actual data
+                // starts. Under buffered I/O (PosixFile) the extra bytes
+                // are simply ignored, so this path is safe for both backends.
+                int64_t aligned_offset =
+                    align_down(seg_offset, kDirectIOAlignment);
+                int64_t aligned_end = static_cast<int64_t>(align_up(
+                    static_cast<size_t>(seg_end), kDirectIOAlignment));
+                size_t aligned_size =
+                    static_cast<size_t>(aligned_end - aligned_offset);
+
+                void* raw_buf = nullptr;
+                int ret =
+                    posix_memalign(&raw_buf, kDirectIOAlignment, aligned_size);
+                if (ret != 0) {
+                    LOG(ERROR) << "merged posix_memalign failed for bucket_id="
+                               << bucket_id << ", aligned_size=" << aligned_size
+                               << ": " << strerror(ret);
+                    return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+                }
+                std::unique_ptr<void, void (*)(void*)> merge_buf(
+                    raw_buf, [](void* p) { free(p); });
+
+                iovec iov{merge_buf.get(), aligned_size};
+                auto read_res = file->vector_read(&iov, 1, aligned_offset);
                 if (!read_res) {
                     LOG(ERROR) << "merged vector_read failed for bucket_id="
-                               << bucket_id << ", seg_offset=" << seg_offset
-                               << ", seg_size=" << seg_size
+                               << bucket_id << ", aligned_offset="
+                               << aligned_offset
+                               << ", aligned_size=" << aligned_size
                                << ", error: " << read_res.error();
                     return tl::make_unexpected(read_res.error());
                 }
-                if (read_res.value() != static_cast<size_t>(seg_size)) {
-                    LOG(ERROR) << "merged read size mismatch, bucket_id="
-                               << bucket_id << ", expected=" << seg_size
+                // The pread may short-read at EOF if the aligned read range
+                // overshoots the file end by up to (kDirectIOAlignment - 1)
+                // bytes. The actual data range we care about is
+                // [seg_offset, seg_end), which maps to
+                // [seg_offset - aligned_offset, seg_end - aligned_offset)
+                // inside the buffer; got >= (seg_end - aligned_offset) is
+                // therefore sufficient. Each key's memcpy stays in bounds
+                // because key_offset + dest_slice.size <= seg_end.
+                size_t min_needed =
+                    static_cast<size_t>(seg_end - aligned_offset);
+                if (read_res.value() < min_needed) {
+                    LOG(ERROR) << "merged read short of data, bucket_id="
+                               << bucket_id << ", expected>=" << min_needed
                                << ", got=" << read_res.value();
                     return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
                 }
-                // Scatter: for each key, memcpy from merge_buf to dest_slice
+                // Scatter: for each key, memcpy from merge_buf to dest_slice.
+                // buf_offset accounts for the alignment padding before
+                // seg_offset (zero under buffered I/O when seg_offset happens
+                // to be aligned; positive under O_DIRECT otherwise).
+                char* merge_base = static_cast<char*>(merge_buf.get());
                 for (size_t k = group_start; k <= group_end; ++k) {
                     const auto& plan = *sorted_plans[k];
                     int64_t key_offset = plan.offset + plan.key_size;
-                    int64_t buf_offset = key_offset - seg_offset;
+                    int64_t buf_offset = key_offset - aligned_offset;
                     std::memcpy(plan.dest_slice.ptr,
-                                merge_buf.data() + buf_offset,
+                                merge_base + buf_offset,
                                 plan.dest_slice.size);
                     bucket_bytes += plan.data_size;
                 }
