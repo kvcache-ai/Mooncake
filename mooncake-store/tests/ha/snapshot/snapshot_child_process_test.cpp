@@ -1,5 +1,6 @@
 #include "master_service.h"
 #include "master_snapshot_manager.h"
+#include "master_snapshot_repository.h"
 #include "master_metric_manager.h"
 #include "ha/snapshot/catalog/snapshot_catalog_store.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
@@ -148,11 +149,12 @@ class SnapshotChildProcessTest : public ::testing::Test {
     void CallCleanupOldSnapshot(int keep_count,
                                 const std::string& snapshot_id) {
         if (service_->snapshot_manager_) {
-            service_->snapshot_manager_->CleanupOldSnapshot(keep_count,
-                                                            snapshot_id);
+            service_->snapshot_manager_->repository_->CleanupOldSnapshots(
+                keep_count, snapshot_id);
         } else {
             auto temp_manager = CreateTempSnapshotManager();
-            temp_manager->CleanupOldSnapshot(keep_count, snapshot_id);
+            temp_manager->repository_->CleanupOldSnapshots(keep_count,
+                                                           snapshot_id);
         }
     }
 
@@ -160,11 +162,11 @@ class SnapshotChildProcessTest : public ::testing::Test {
         const std::vector<uint8_t>& data, const std::string& path,
         const std::string& local_filename, const std::string& snapshot_id) {
         if (service_->snapshot_manager_) {
-            return service_->snapshot_manager_->UploadSnapshotPayloadFile(
+            return service_->snapshot_manager_->repository_->UploadPayloadFile(
                 data, path, local_filename, snapshot_id);
         } else {
             auto temp_manager = CreateTempSnapshotManager();
-            return temp_manager->UploadSnapshotPayloadFile(
+            return temp_manager->repository_->UploadPayloadFile(
                 data, path, local_filename, snapshot_id);
         }
     }

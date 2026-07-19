@@ -190,6 +190,7 @@ if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
 elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS" = "almalinux" ] || [ "$OS" = "euleros" ] || [ "$OS" = "openeuler" ]; then
     SYSTEM_PACKAGES="@development \
                      cmake \
+                     ninja-build \
                      git \
                      wget \
                      rdma-core-devel \

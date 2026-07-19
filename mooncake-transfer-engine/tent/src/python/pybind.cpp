@@ -703,6 +703,15 @@ PYBIND11_MODULE(tent, m) {
             py::arg("batch_id"), py::arg("request_list"), py::arg("name"),
             py::arg("message"))
 
+        .def(
+            "cancel_transfer",
+            [](TransferEngine& self, uint64_t batch_id, size_t task_id) {
+                py::gil_scoped_release release;
+                auto s = self.cancelTransfer((BatchID)batch_id, task_id);
+                ThrowStatus(s, "cancel_transfer");
+            },
+            py::arg("batch_id"), py::arg("task_id"))
+
         // ---------------------------------------------------------------------
         // notification send/receive
         // ---------------------------------------------------------------------

@@ -161,6 +161,8 @@ std::string gidBytesToString(const uint8_t *raw) {
 RdmaContext::RdmaContext(RdmaTransport &engine, const std::string &device_name)
     : device_name_(device_name),
       engine_(engine),
+      connect_pause_(
+          [] { return static_cast<uint64_t>(getCurrentTimeInNano()); }),
       next_comp_channel_index_(0),
       next_comp_vector_index_(0),
       next_cq_list_index_(0),
@@ -181,6 +183,13 @@ RdmaContext::~RdmaContext() {
 int RdmaContext::construct(size_t num_cq_list, size_t num_comp_channels,
                            uint8_t port, int gid_index, size_t max_cqe,
                            int max_endpoints) {
+    if (num_cq_list == 0 || num_comp_channels == 0) {
+        LOG(ERROR) << "Invalid RDMA completion configuration for device "
+                   << device_name_ << ": num_cq_list=" << num_cq_list
+                   << ", num_comp_channels=" << num_comp_channels;
+        return ERR_INVALID_ARGUMENT;
+    }
+
     // Create endpoint store based on configuration
     auto &config = globalConfig();
     switch (config.endpoint_store_type) {
@@ -199,6 +208,12 @@ int RdmaContext::construct(size_t num_cq_list, size_t num_comp_channels,
     if (openRdmaDevice(device_name_, port, gid_index)) {
         LOG(ERROR) << "Failed to open device " << device_name_ << " on port "
                    << port << " with GID " << gid_index;
+        return ERR_CONTEXT;
+    }
+
+    if (context_->num_comp_vectors <= 0) {
+        LOG(ERROR) << "RDMA device " << device_name_
+                   << " exposes no completion vectors";
         return ERR_CONTEXT;
     }
 
@@ -294,7 +309,28 @@ int RdmaContext::socketId() {
 int RdmaContext::deconstruct() {
     worker_pool_.reset();
 
-    endpoint_store_->destroyQPs();
+    // Graceful teardown order: QPs -> MRs.
+    if (endpoint_store_) {
+        endpoint_store_->disconnectQPs();
+
+        // In normal graceful shutdown, reclaim should finish quickly.
+        constexpr auto kReclaimTimeout = std::chrono::seconds(10);
+        auto start = std::chrono::steady_clock::now();
+        while (endpoint_store_->waitingListSize() > 0) {
+            endpoint_store_->reclaimEndpoint();
+            if (endpoint_store_->waitingListSize() == 0) break;
+            if (std::chrono::steady_clock::now() - start > kReclaimTimeout) {
+                LOG(WARNING) << "Endpoint reclaim timed out during graceful "
+                                "shutdown; forcing QP destruction";
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
+        if (endpoint_store_->destroyQPs()) {
+            LOG(ERROR) << "Failed to destroy all QPs before MR deregistration";
+        }
+    }
 
     for (auto &[_, entry] : memory_region_map_) {
         int ret = ibv_dereg_mr(entry.mr);
@@ -343,34 +379,26 @@ int RdmaContext::deconstruct() {
     return 0;
 }
 
-int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
-                                              int access,
-                                              MemoryRegionMeta &mrMeta) {
-    if (length > (size_t)globalConfig().max_mr_size) {
-        PLOG(WARNING) << "The buffer length exceeds device max_mr_size, "
-                      << "shrink it to " << globalConfig().max_mr_size;
-        length = (size_t)globalConfig().max_mr_size;
-    }
+int RdmaContext::exportDmabuf(void *addr, DmabufExport &out) {
+    out = DmabufExport{};
+    (void)addr;  // unused on the host-only (#else) build
 #if defined(USE_MLU) || defined(USE_MACA) || defined(USE_CUDA)
-    // Implement register memory in a way that does not assume the presence of
-    // nvidia-peermem. If memory is on CPU call ibv_reg_mr() as usual. If memory
-    // is on GPU then use ibv_reg_dmabuf_mr() instead which does not require
-    // nvidia-peermem.
+    // Decide host vs GPU without assuming the presence of nvidia-peermem. Host
+    // memory uses the plain ibv_reg_mr() path. GPU memory is exported once as a
+    // dma_buf fd that every NIC then imports, so the driver keeps a single
+    // BAR1 window for the buffer instead of one per NIC.
     CUmemorytype memType;
     CUresult result = cuPointerGetAttribute(
         &memType, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, (CUdeviceptr)addr);
 
-    // Register memory depending on whether memory is on host or GPU.
     if (result != CUDA_SUCCESS || memType == CU_MEMORYTYPE_HOST) {
-        mrMeta.addr = addr;
-        mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
+        out.method = DmabufExport::Method::kHostReg;
 #if defined(USE_CUDA)
     } else if (memType == CU_MEMORYTYPE_DEVICE &&
                Environ::Get().GetWithNvidiaPeermem()) {
         // WITH_NVIDIA_PEERMEM env var is set: use ibv_reg_mr() directly for
         // GPU memory (requires the nvidia-peermem kernel module to be loaded).
-        mrMeta.addr = addr;
-        mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
+        out.method = DmabufExport::Method::kHostReg;
 #endif
     } else if (memType == CU_MEMORYTYPE_DEVICE) {
 #if defined(USE_CUDA)
@@ -407,6 +435,8 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         }
 
         int dmabuf_fd;
+        // flags must be 0: the PCIE-BAR1 mapping flag is rejected (error 801)
+        // on some GPU/driver combinations (e.g. B200).
         result = cuMemGetHandleForAddressRange(
             &dmabuf_fd, allocBase, allocSize,
             CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
@@ -421,17 +451,9 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
 #endif
             return ERR_CONTEXT;
         }
-        mrMeta.addr = addr;
-        uint64_t dmabuf_offset = (uintptr_t)addr - (uintptr_t)allocBase;
-        mrMeta.mr = ibv_reg_dmabuf_mr(pd_, dmabuf_offset, length,
-                                      (uintptr_t)addr, dmabuf_fd, access);
-        const int regErrno = errno;
-        if (close(dmabuf_fd) != 0) {
-            PLOG(WARNING) << "Failed to close dmabuf fd";
-        }
-        if (!mrMeta.mr) {
-            errno = regErrno;
-        }
+        out.method = DmabufExport::Method::kDmabufReg;
+        out.fd = dmabuf_fd;
+        out.offset = (uintptr_t)addr - (uintptr_t)allocBase;
 #if defined(USE_CUDA)
         cuDevicePrimaryCtxRelease(cuDev);
 #endif
@@ -443,8 +465,7 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
     if (hipRes != hipSuccess || hipAttr.type == hipMemoryTypeHost ||
         hipAttr.type == hipMemoryTypeUnregistered) {
         // Host memory — standard ibv_reg_mr() path.
-        mrMeta.addr = addr;
-        mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
+        out.method = DmabufExport::Method::kHostReg;
     } else if (hipAttr.type == hipMemoryTypeManaged) {
         // Managed (unified) memory pages can migrate between host and device;
         // hsa_amd_portable_export_dmabuf captures the device-side handle at
@@ -453,19 +474,33 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         LOG(WARNING) << "HIP managed memory at " << (uintptr_t)addr
                      << " — dmabuf export skipped (pages may migrate); "
                         "falling back to ibv_reg_mr";
-        mrMeta.addr = addr;
-        mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
+        out.method = DmabufExport::Method::kHostReg;
     } else if (hipAttr.type == hipMemoryTypeDevice &&
                !isKernelDmabufSupported()) {
         // Kernel lacks CONFIG_PCI_P2PDMA / CONFIG_DMABUF_MOVE_NOTIFY —
         // ibv_reg_dmabuf_mr may succeed but transfers will silently fail.
-        // Fail at registration time instead.
-        mrMeta.addr = addr;
-        mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
+        // Fall back to ibv_reg_mr() instead.
+        out.method = DmabufExport::Method::kHostReg;
     } else if (hipAttr.type == hipMemoryTypeDevice) {
-        // Pin to the owning device while exporting the dmabuf fd.
-        HipDeviceGuard dev_guard(hipAttr.device);
-        if (!dev_guard.set_ok()) {
+        // Device memory + kernel support — export the dmabuf fd.
+        // Pin to the owning device for the duration of the export calls.
+        struct HipDeviceGuard {
+            int prev_device = 0;
+            bool need_restore = false;
+            bool set_ok = false;
+            explicit HipDeviceGuard(int target_device) {
+                if (hipGetDevice(&prev_device) == hipSuccess) {
+                    need_restore = (prev_device != target_device);
+                }
+                set_ok = (hipSetDevice(target_device) == hipSuccess);
+            }
+            ~HipDeviceGuard() {
+                if (need_restore) {
+                    (void)hipSetDevice(prev_device);
+                }
+            }
+        } dev_guard(hipAttr.device);
+        if (!dev_guard.set_ok) {
             LOG(ERROR) << "Failed to set HIP device to " << hipAttr.device
                        << " for dmabuf export of " << (uintptr_t)addr;
             return ERR_CONTEXT;
@@ -498,23 +533,51 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
             return ERR_CONTEXT;
         }
 
-        mrMeta.addr = addr;
+        out.method = DmabufExport::Method::kDmabufReg;
+        out.fd = dmabuf_fd;
         // Offset within the dmabuf-backed region: distance from the
         // allocation base, plus any offset hsa returned for the export.
-        uint64_t reg_offset =
-            (uintptr_t)addr - (uintptr_t)allocBase + hsa_dmabuf_offset;
-        mrMeta.mr = ibv_reg_dmabuf_mr(pd_, reg_offset, length, (uintptr_t)addr,
-                                      dmabuf_fd, access);
-        const int regErrno = errno;
-        if (close(dmabuf_fd) != 0) {
-            PLOG(WARNING) << "Failed to close dmabuf fd";
-        }
-        if (!mrMeta.mr) {
-            errno = regErrno;
-        }
+        out.offset = (uintptr_t)addr - (uintptr_t)allocBase + hsa_dmabuf_offset;
     }
 #else
+    out.method = DmabufExport::Method::kHostReg;
+#endif
+    return 0;
+}
+
+void RdmaContext::closeDmabufExport(DmabufExport &exp) {
+    if (exp.fd >= 0) {
+        if (close(exp.fd) != 0) {
+            PLOG(WARNING) << "Failed to close dmabuf fd";
+        }
+        exp.fd = -1;
+    }
+}
+
+int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
+                                              int access,
+                                              const DmabufExport &exp,
+                                              MemoryRegionMeta &mrMeta) {
+    if (length > (size_t)globalConfig().max_mr_size) {
+        PLOG(WARNING) << "The buffer length exceeds device max_mr_size, "
+                      << "shrink it to " << globalConfig().max_mr_size;
+        length = (size_t)globalConfig().max_mr_size;
+    }
     mrMeta.addr = addr;
+#if defined(USE_MLU) || defined(USE_MACA) || defined(USE_CUDA) || \
+    defined(USE_HIP_DMABUF)
+    if (exp.method == DmabufExport::Method::kDmabufReg) {
+        // Import the shared dma_buf fd into this NIC's PD. The fd is kept open
+        // by the caller until every NIC has registered; this MR takes its own
+        // reference, so all NICs share one dma_buf object (and one BAR1
+        // window).
+        mrMeta.mr = ibv_reg_dmabuf_mr(pd_, exp.offset, length, (uintptr_t)addr,
+                                      exp.fd, access);
+    } else {
+        mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
+    }
+#else
+    (void)exp;
     mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
 #endif
     if (!mrMeta.mr) {
@@ -524,15 +587,30 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
     return 0;
 }
 
-int RdmaContext::registerMemoryRegion(void *addr, size_t length, int access) {
+int RdmaContext::registerMemoryRegion(void *addr, size_t length, int access,
+                                      const DmabufExport &exp) {
     MemoryRegionMeta mrMeta;
-    int ret = registerMemoryRegionInternal(addr, length, access, mrMeta);
+    int ret = registerMemoryRegionInternal(addr, length, access, exp, mrMeta);
     if (ret != 0) {
         return ret;
     }
     RWSpinlock::WriteGuard guard(memory_regions_lock_);
     memory_region_map_[reinterpret_cast<uintptr_t>(mrMeta.addr)] = mrMeta;
     return 0;
+}
+
+int RdmaContext::registerMemoryRegion(void *addr, size_t length, int access) {
+    // Single-NIC convenience path: export, register, and close the fd here.
+    // The shared-fd benefit only matters when a buffer is registered against
+    // multiple NICs (see RdmaTransport::registerLocalMemoryInternal).
+    DmabufExport exp;
+    int ret = exportDmabuf(addr, exp);
+    if (ret != 0) {
+        return ret;
+    }
+    ret = registerMemoryRegion(addr, length, access, exp);
+    closeDmabufExport(exp);
+    return ret;
 }
 
 int RdmaContext::unregisterMemoryRegion(void *addr) {
@@ -550,9 +628,17 @@ int RdmaContext::unregisterMemoryRegion(void *addr) {
 }
 
 int RdmaContext::preTouchMemory(void *addr, size_t length) {
+    DmabufExport exp;
+    int ret = exportDmabuf(addr, exp);
+    if (ret != 0) {
+        return ret;
+    }
     MemoryRegionMeta mrMeta;
-    int ret = registerMemoryRegionInternal(addr, length, IBV_ACCESS_LOCAL_WRITE,
-                                           mrMeta);
+    ret = registerMemoryRegionInternal(addr, length, IBV_ACCESS_LOCAL_WRITE,
+                                       exp, mrMeta);
+    // The MR (if created) holds its own reference, so closing the fd now is
+    // safe and does not affect the subsequent dereg.
+    closeDmabufExport(exp);
     if (ret != 0) {
         return ret;
     }
@@ -601,7 +687,7 @@ RdmaContext::findMemoryRegionContaining(uintptr_t addr) const {
 
 std::shared_ptr<RdmaEndPoint> RdmaContext::endpoint(
     const std::string &peer_nic_path) {
-    if (!active_) {
+    if (!active_.load(std::memory_order_acquire)) {
         LOG(ERROR) << "Context is not active: " << deviceName();
         return nullptr;
     }
@@ -635,8 +721,39 @@ int RdmaContext::deleteEndpoint(const std::string &peer_nic_path) {
 }
 
 int RdmaContext::deleteEndpointByPtr(const RdmaEndPoint *endpoint_ptr) {
-    return endpoint_store_->deleteEndpointByPtr(endpoint_ptr);
+    // Tearing an endpoint down (path failure / QP fatal) means this peer is
+    // failing; pause active reconnection to its address so the CQ poller isn't
+    // blocked re-handshaking a likely-gone peer.
+    //
+    // Resolve the peer path *inside* the store, under its lock: the raw pointer
+    // may already be freed (e.g. an IBV_EVENT_QP_FATAL racing endpoint
+    // destruction), so we must not dereference it here. The store only compares
+    // pointer identity and returns the path from the live map key, and we arm
+    // the pause only if the endpoint was actually found. No-op when TTL is 0.
+    std::string deleted_peer_nic_path;
+    int ret = endpoint_store_->deleteEndpointByPtr(endpoint_ptr,
+                                                   &deleted_peer_nic_path);
+    if (!deleted_peer_nic_path.empty()) pauseConnect(deleted_peer_nic_path);
+    return ret;
 }
+
+void RdmaContext::pauseConnect(const std::string &peer_nic_path) {
+    int ttl_ms = globalConfig().conn_pause_ttl_ms;
+    if (ttl_ms <= 0) return;  // disabled
+    auto server_name = getServerNameFromNicPath(peer_nic_path);
+    if (server_name.empty()) return;
+    connect_pause_.pauseFor(server_name,
+                            static_cast<uint64_t>(ttl_ms) * 1000000ull);
+}
+
+bool RdmaContext::isConnectPaused(const std::string &peer_nic_path) {
+    if (globalConfig().conn_pause_ttl_ms <= 0) return false;  // disabled
+    auto server_name = getServerNameFromNicPath(peer_nic_path);
+    if (server_name.empty()) return false;
+    return connect_pause_.isPaused(server_name);
+}
+
+void RdmaContext::pruneConnectPause() { connect_pause_.prune(); }
 
 void RdmaContext::reclaimEndpoints() { endpoint_store_->reclaimEndpoint(); }
 
@@ -925,6 +1042,120 @@ bool RdmaContext::reprobeAutoGid(
     return true;
 }
 
+GidRefreshResult RdmaContext::refreshCurrentGid(std::string *previous_gid,
+                                                std::string *next_gid) {
+    std::lock_guard<std::mutex> reprobe_guard(gid_reprobe_lock_);
+    std::string current_gid_string;
+    int current_gid_index = -1;
+    int next_gid_index = -1;
+    uint16_t current_lid = 0;
+    ibv_context *current_context = nullptr;
+    uint8_t current_port = 0;
+    bool auto_gid_selection_enabled = false;
+    {
+        std::lock_guard<std::mutex> guard(gid_lock_);
+        if (!context_) {
+            return GidRefreshResult::FAILED;
+        }
+        current_gid_index = gid_index_;
+        current_gid_string = gidBytesToString(gid_.raw);
+        current_lid = lid_;
+        current_context = context_;
+        current_port = port_;
+        auto_gid_selection_enabled = auto_gid_selection_enabled_;
+    }
+
+    if (auto_gid_selection_enabled) {
+        ibv_port_attr port_attr;
+        if (ibv_query_port(current_context, current_port, &port_attr)) {
+            PLOG(WARNING) << "Failed to refresh port attributes on "
+                          << device_name_ << "/"
+                          << static_cast<int>(current_port);
+            return GidRefreshResult::FAILED;
+        }
+
+        std::vector<AutoGidCandidate> candidates;
+        candidates.reserve(port_attr.gid_tbl_len);
+        for (int i = 0; i < port_attr.gid_tbl_len; ++i) {
+            AutoGidCandidate candidate;
+            candidate.gid_index = i;
+
+            struct ibv_gid_entry gid_entry;
+            if (ibv_query_gid_ex(current_context, current_port, i, &gid_entry,
+                                 0)) {
+                candidate.query_succeeded = false;
+                candidates.push_back(candidate);
+                continue;
+            }
+
+            const auto *gid_addr =
+                reinterpret_cast<const struct in6_addr *>(gid_entry.gid.raw);
+            std::string ndev = readGidNdev(device_name_, current_port, i);
+            candidate.gid = gidBytesToString(gid_entry.gid.raw);
+            candidate.gid_type = gid_entry.gid_type;
+            candidate.has_network_device = !ndev.empty();
+            candidate.is_ipv4_mapped = ipv6_addr_v4mapped(gid_addr);
+            candidate.is_link_local_ipv6 = isLinkLocalIpv6(gid_addr);
+            candidate.is_overlay_network =
+                candidate.has_network_device && isOverlayNetwork(ndev);
+            candidate.is_overlay_ipv4 =
+                candidate.is_ipv4_mapped && isOverlayIPv4(gid_addr);
+            candidate.is_null_gid = isNullGid(&gid_entry.gid);
+            candidates.push_back(candidate);
+        }
+
+        auto selection = selectBestAutoGidCandidate(candidates);
+        if (!selection.has_value()) {
+            LOG(WARNING) << "No suitable GID found while refreshing "
+                         << device_name_ << "/"
+                         << static_cast<int>(current_port);
+            return GidRefreshResult::FAILED;
+        }
+        next_gid_index = selection->gid_index;
+    } else {
+        next_gid_index = current_gid_index;
+    }
+
+    ibv_gid new_gid = {};
+    std::string next_gid_string;
+    if (ibv_query_gid(current_context, current_port, next_gid_index,
+                      &new_gid)) {
+        return GidRefreshResult::FAILED;
+    }
+    if (isNullGid(&new_gid)) {
+        return GidRefreshResult::FAILED;
+    }
+    next_gid_string = gidBytesToString(new_gid.raw);
+
+    if (next_gid_index == current_gid_index &&
+        next_gid_string == current_gid_string) {
+        if (next_gid) *next_gid = current_gid_string;
+        return GidRefreshResult::UNCHANGED;
+    }
+
+    int publish_ret = engine_.refreshLocalDeviceDesc(device_name_, current_lid,
+                                                     next_gid_string);
+    if (publish_ret) {
+        LOG(ERROR) << "Failed to refresh local device descriptor for "
+                   << device_name_ << ": " << publish_ret;
+        return GidRefreshResult::FAILED;
+    }
+
+    {
+        std::lock_guard<std::mutex> guard(gid_lock_);
+        gid_ = new_gid;
+        gid_index_ = next_gid_index;
+    }
+    if (previous_gid) *previous_gid = current_gid_string;
+    if (next_gid) *next_gid = next_gid_string;
+
+    LOG(WARNING) << "Refreshed GID on " << device_name_ << "/"
+                 << static_cast<int>(port_) << ": index " << current_gid_index
+                 << " (" << current_gid_string << ") -> " << next_gid_index
+                 << " (" << next_gid_string << ")";
+    return GidRefreshResult::CHANGED;
+}
+
 int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
                                 int gid_index) {
     int num_devices = 0;
@@ -1195,5 +1426,17 @@ int RdmaContext::poll(int num_entries, ibv_wc *wc, int cq_index) {
 int RdmaContext::submitPostSend(
     const std::vector<Transport::Slice *> &slice_list) {
     return worker_pool_->submitPostSend(slice_list);
+}
+
+void RdmaContext::trackPostedSlices(
+    const std::vector<Transport::Slice *> &slice_list, size_t first,
+    size_t count) {
+    worker_pool_->trackPostedSlices(slice_list, first, count);
+}
+
+void RdmaContext::untrackPostedSlices(
+    const std::vector<Transport::Slice *> &slice_list, size_t first,
+    size_t count) {
+    worker_pool_->untrackPostedSlices(slice_list, first, count);
 }
 }  // namespace mooncake

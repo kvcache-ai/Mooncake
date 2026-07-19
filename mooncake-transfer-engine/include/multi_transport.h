@@ -20,7 +20,11 @@
 #include "transport/transport.h"
 
 namespace mooncake {
+class TransferEngineImplTestPeer;
+
 class MultiTransport {
+    friend class TransferEngineImplTestPeer;
+
    public:
     using BatchID = Transport::BatchID;
     using TransferRequest = Transport::TransferRequest;
