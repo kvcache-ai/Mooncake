@@ -24,7 +24,8 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from ...agent.coordination.scheduler import (
     AdmissionAction,
@@ -35,6 +36,18 @@ from ...agent.coordination.scheduler import (
     DegradeLevel,
     WorkerLoad,
 )
+from ...agent.state_clone import AgentStateCloner
+from ..state.agent_state_catalog import AgentStateCatalog, CatalogPageRef
+from ..state.kv_manifest import KVManifestError, KVStateManifest, manifest_checksum
+from ..state.kv_state_store import MooncakeKVStateStore
+from ..state.vllm_kv_materializer import VLLMKVMaterializer
+from ..state.kv_transfer_manifest_v2 import (
+    KVTransferLayoutV2,
+    KVTransferManifestError,
+    KVTransferManifestV2,
+)
+from ..state.hidden_cache_key import stable_multimodal_feature_id
+from ..state.page_manager import BlockRef
 from ..state.workflow_registry import WorkflowStateRecord, WorkflowStateRegistry
 from .connector_metrics import ConnectorMetricsReader
 from .kv_directory import LocalKVDirectory
@@ -84,19 +97,51 @@ class ServingControlPlaneConfig:
     target_agent_id: str = "decode"
     connector_metrics_dir: Optional[str] = None
     workflow_registry_wal_path: Optional[str] = None
+    # When unset, the catalog shares the workflow-registry WAL and uses a
+    # distinct ``kind`` field.  Keeping one journal by default makes a serving
+    # restart recover both aliases and page-ref facts atomically enough for the
+    # local control plane without adding a new deployment prerequisite.
+    agent_state_catalog_wal_path: Optional[str] = None
     request_state_ttl_seconds: float = 900.0
     owner_shards: int = 1
     kv_directory_rpc_url: Optional[str] = None
     enable_workflow_affinity: bool = True
     workflow_affinity_ttl_seconds: float = 900.0
+    # Topology locality is expressed in milliseconds and remains bounded by
+    # the congestion escape threshold; it is no longer a dominant fixed score.
+    affinity_benefit_ms: float = 3.0
+    affinity_congestion_escape_ms: float = 25.0
+    affinity_congestion_hysteresis_ms: float = 10.0
     strict_no_fallback: bool = False
+    # P->D control-plane envelope.  The connector owns pointer lifetime and
+    # transfer completion; this manifest prevents a stale or misrouted pull
+    # from reaching that data plane.
+    enable_kv_transfer_manifest_v2: bool = True
+    require_kv_transfer_manifest_v2: bool = False
+    require_kv_transfer_manifest_generation: bool = False
+    require_kv_transfer_manifest_compatibility: bool = False
+    kv_transfer_manifest_lease_seconds: float = 120.0
+    # Deployment-generated worker generations bind a manifest to one worker
+    # incarnation. They are fences, not credentials.
+    worker_generations: Tuple[Tuple[str, str], ...] = ()
+    worker_generation_dir: Optional[str] = None
     enable_agent_state_clone: bool = False
     agent_state_consume_requires_kv_handoff: bool = True
+    # Strict deployments require server-owned page refs/Store manifests.  The
+    # legacy external-block-id API remains available only for compatibility
+    # tests and must never be mistaken for a physical vLLM capture.
+    require_real_agent_state_store: bool = False
+    # A version-locked worker adapter supplies this acknowledgement callback.
+    # The proxy can materialize Store pages without it for CPU/control-plane
+    # validation, but strict Agent consumption may require the Decode-side
+    # connector to accept the newly allocated block ids before dispatch.
+    require_agent_state_connector_commit: bool = False
     mooncake_protocol: str = "tcp"
     high_prefill_worker_ids: Tuple[str, ...] = ()
     low_latency_decode_worker_ids: Tuple[str, ...] = ()
     standard_prefill_worker_ids: Tuple[str, ...] = ()
     standard_decode_worker_ids: Tuple[str, ...] = ()
+    scheduler_policy: str = "agent_aware"
     # Ordered Prefill -> Decode locality preferences. These remain soft so
     # admission can bypass a saturated Decode worker.
     prefill_decode_affinity: Tuple[Tuple[str, str], ...] = ()
@@ -136,6 +181,9 @@ class RequestContext:
     expected_output_tokens: int = 0
     agent_pd_profile: Dict[str, Any] = field(default_factory=dict)
     agent_state_id: Optional[str] = None
+    # Per-stage idempotent lifecycle:
+    # queued -> running -> first_token (Decode only) -> completed.
+    stage_lifecycle: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -153,8 +201,30 @@ class ServingControlPlane:
         config: Optional[ServingControlPlaneConfig] = None,
         kv_directory: Optional[Any] = None,
         workflow_registry: Optional[WorkflowStateRegistry] = None,
+        kv_state_store: Optional[MooncakeKVStateStore] = None,
+        agent_state_connector_committer: Optional[
+            Callable[[Mapping[str, Any]], Optional[Mapping[str, Any]]]
+        ] = None,
     ):
         self.config = config or ServingControlPlaneConfig()
+        if self.config.strict_no_fallback:
+            self.config.require_kv_transfer_manifest_v2 = True
+        if self.config.strict_no_fallback and self.config.worker_generation_dir:
+            self.config.require_kv_transfer_manifest_generation = True
+        if (
+            self.config.require_kv_transfer_manifest_v2
+            and not self.config.enable_kv_transfer_manifest_v2
+        ):
+            raise ValueError(
+                "require_kv_transfer_manifest_v2 requires enable_kv_transfer_manifest_v2"
+            )
+        if self.config.strict_no_fallback and self.config.enable_agent_state_clone:
+            # Strict serving must not acknowledge a client-supplied list of
+            # block identifiers as if it captured allocator-owned KV.  A real
+            # state store may still be absent when Agent clone is unused, in
+            # which case the capture endpoint fails closed on first use.
+            self.config.require_real_agent_state_store = True
+            self.config.require_agent_state_connector_commit = True
         if kv_directory is not None:
             self.kv_directory = kv_directory
         elif self.config.kv_directory_rpc_url:
@@ -165,6 +235,26 @@ class ServingControlPlane:
                 node_id=self.config.node_id,
             )
         self.workflow_registry = workflow_registry
+        self.kv_state_store = kv_state_store
+        self._vllm_kv_materializer = (
+            VLLMKVMaterializer(
+                kv_state_store,
+                commit_to_connector=agent_state_connector_committer,
+            )
+            if kv_state_store is not None
+            else None
+        )
+        self._agent_state_cloner = (
+            AgentStateCloner(kv_state_store=kv_state_store)
+            if kv_state_store is not None
+            else None
+        )
+        self._serving_kv_state_ids: Dict[str, str] = {}
+        # A real vLLM adapter captures allocator-owned refs during a Prefill
+        # request. Keep the request-to-public-state alias explicit rather than
+        # requiring an HTTP client to guess a state id; the alias is also
+        # persisted in WorkflowStateRecord telemetry for restart recovery.
+        self._agent_capture_by_request_id: Dict[str, str] = {}
         if self.workflow_registry is None and (
             self.config.workflow_registry_wal_path or self.config.enable_agent_state_clone
         ):
@@ -173,19 +263,37 @@ class ServingControlPlane:
             # path-less registry remains process-local; a configured path keeps
             # the same recovery semantics as the serving request registry.
             self.workflow_registry = WorkflowStateRegistry(self.config.workflow_registry_wal_path)
+        self.agent_state_catalog: Optional[AgentStateCatalog] = None
+        if self.config.enable_agent_state_clone:
+            catalog_wal = (
+                self.config.agent_state_catalog_wal_path
+                or self.config.workflow_registry_wal_path
+            )
+            self.agent_state_catalog = AgentStateCatalog(
+                catalog_wal,
+                page_reclaimer=self._reclaim_catalog_page_objects
+                if (
+                    self.kv_state_store is not None
+                    and self.kv_state_store.kv_page_store is not None
+                )
+                else None,
+            )
         if self.config.connector_metrics_dir is None:
             self.config.connector_metrics_dir = (
                 str(os.getenv("MOONCAKE_EPD_CONNECTOR_METRICS_DIR", "")).strip() or None
             )
         self._lock = threading.RLock()
-        self._prefill_scheduler = AgentScheduler([])
-        self._decode_scheduler = AgentScheduler([])
+        self._prefill_scheduler = AgentScheduler([], policy=self.config.scheduler_policy)
+        self._decode_scheduler = AgentScheduler([], policy=self.config.scheduler_policy)
         self._request_ctx: Dict[str, RequestContext] = {}
         self._worker_last_arrival: Dict[str, float] = {}
         self._workflow_latest: Dict[str, Dict[str, Any]] = {}
         self._workflow_affinity: Dict[str, Tuple[str, float]] = {}
         self._prefill_decode_affinity = self._normalize_prefill_decode_affinity(
             self.config.prefill_decode_affinity
+        )
+        self._worker_generations = self._normalize_worker_generations(
+            self.config.worker_generations
         )
         self._connector_metrics = ConnectorMetricsReader(self.config.connector_metrics_dir)
         self._metrics: Dict[str, Any] = {
@@ -202,6 +310,10 @@ class ServingControlPlane:
             "handoff_prepare_ms": [],
             "handoff_commit_ms": [],
             "handoff_rollback_ms": [],
+            "kv_transfer_manifests_created": 0,
+            "kv_transfer_manifests_validated": 0,
+            "kv_transfer_manifests_rebound": 0,
+            "kv_transfer_manifest_rejections": 0,
             "deadline_miss_risk": [],
             "degrade_level_counts": {},
             "transport_backend_counts": {},
@@ -327,6 +439,58 @@ class ServingControlPlane:
             normalized[source] = target
         return normalized
 
+    @staticmethod
+    def _normalize_worker_generations(
+        values: Sequence[Tuple[str, str]] | Sequence[str],
+    ) -> Dict[str, str]:
+        """Validate deployment-supplied worker incarnation fences."""
+
+        normalized: Dict[str, str] = {}
+        for raw in values or ():
+            if isinstance(raw, str):
+                worker_id, separator, generation = raw.partition("=")
+                if not separator:
+                    raise ValueError("worker generation entries must use worker_id=generation")
+            else:
+                try:
+                    worker_id, generation = raw
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "worker generation entries must contain worker_id and generation"
+                    ) from exc
+            worker = str(worker_id).strip()
+            fence = str(generation).strip()
+            if not worker or not fence or fence.lower() in {"unknown", "none", "null"}:
+                raise ValueError("worker generations must be explicit non-empty fences")
+            existing = normalized.get(worker)
+            if existing is not None and existing != fence:
+                raise ValueError(
+                    f"worker {worker!r} has conflicting generation fences"
+                )
+            normalized[worker] = fence
+        return normalized
+
+    def _generation_for_worker(self, worker_id: Optional[str]) -> Optional[str]:
+        if worker_id is None:
+            return None
+        worker = str(worker_id).strip()
+        generation_dir = str(self.config.worker_generation_dir or "").strip()
+        if generation_dir and worker and Path(worker).name == worker:
+            try:
+                root = Path(generation_dir).expanduser().resolve(strict=False)
+                path = (root / worker).resolve(strict=False)
+                if path.parent == root and path.is_file():
+                    value = path.read_text(encoding="utf-8")[:256].strip()
+                    if value and value.lower() not in {"unknown", "none", "null"}:
+                        return value
+            except OSError:
+                # The worker replaces this file atomically during startup. A
+                # transient read failure falls through to static compatibility
+                # configuration; strict compatibility rejects an unresolved
+                # generation at manifest validation time.
+                pass
+        return self._worker_generations.get(worker)
+
     def preferred_decode_worker_for_prefill(
         self, prefill_worker_id: Optional[str]
     ) -> Optional[str]:
@@ -392,11 +556,19 @@ class ServingControlPlane:
     def classify_request(self, req_data: Dict[str, Any]) -> Tuple[str, List[str]]:
         hashes: List[str] = []
         found_multimodal = False
+        mm_processor_kwargs = req_data.get("mm_processor_kwargs")
         for item in self._iter_content_items(req_data):
             item_type = str(item.get("type", "text"))
             if item_type in MULTIMODAL_CONTENT_TYPES:
                 found_multimodal = True
-                hashes.append(self._stable_mm_hash(item))
+                # Feature handles represent preprocessed hidden states, not
+                # raw bytes. Bind image identities to the request processor
+                # projection so a persistent E->P buffer cannot be reused at
+                # a different Qwen resize/grid setting.
+                if item_type in {"image", "image_url", "input_image"}:
+                    hashes.append(stable_multimodal_feature_id(item, mm_processor_kwargs))
+                else:
+                    hashes.append(self._stable_mm_hash(item))
         return ("multimodal" if found_multimodal else "text", hashes)
 
     def estimate_input_tokens(self, req_data: Dict[str, Any]) -> int:
@@ -513,6 +685,11 @@ class ServingControlPlane:
         ctx.block_ids = block_ids
         source_node_id = str(ctx.prefill_worker_id or "prefill")
         target_node_id = str(decode_worker_id or ctx.decode_worker_id or "decode")
+        self._upsert_kv_transfer_manifest(
+            ctx,
+            kv_transfer_params,
+            destination_engine_id=target_node_id,
+        )
         ctx.placeholder_block_ids = self._ensure_block_records(
             block_ids=block_ids,
             workflow_id=ctx.workflow_id,
@@ -600,6 +777,20 @@ class ServingControlPlane:
         kv["handoff_id"] = ctx.handoff_id
         kv["a2a_source_node"] = ctx.prefill_worker_id
         kv["a2a_target_node"] = decision.worker_id
+        self._upsert_kv_transfer_manifest(
+            ctx,
+            kv,
+            destination_engine_id=decision.worker_id,
+        )
+        ctx.reuse_telemetry = {
+            **dict(ctx.reuse_telemetry),
+            "kv_handoff": self._kv_handoff_payload(
+                kv,
+                block_ids=ctx.block_ids,
+                source_node_id=str(ctx.prefill_worker_id or self.config.source_agent_id),
+                target_node_id=decision.worker_id,
+            ),
+        }
         self._sync_request_registry(
             ctx,
             status="DECODE_DISPATCHED",
@@ -644,6 +835,22 @@ class ServingControlPlane:
                 "avoid_pool": self._avoid_pool_for_stage(stage, ctx),
                 "routing_target": ctx.agent_pd_profile.get("routing_target"),
                 "agent_pd_profile": dict(ctx.agent_pd_profile),
+                "affinity_benefit_ms": float(
+                    self.config.affinity_benefit_ms
+                ),
+                "affinity_congestion_escape_ms": float(
+                    self.config.affinity_congestion_escape_ms
+                ),
+                "affinity_congestion_hysteresis_ms": float(
+                    self.config.affinity_congestion_hysteresis_ms
+                ),
+                "estimated_transfer_bytes": float(
+                    ctx.reuse_telemetry.get("estimated_transfer_bytes", 0.0)
+                    or 0.0
+                ),
+                "control_cost_ms": float(
+                    ctx.reuse_telemetry.get("control_cost_ms", 0.0) or 0.0
+                ),
             },
         )
         decision = scheduler.admit(req)
@@ -710,11 +917,118 @@ class ServingControlPlane:
         self._record_backend(self.config.transport_backend)
         self._record_arrival(decision.worker.worker_id)
         self._record_agent_pd_decision(stage, ctx, decision)
+        ctx.stage_lifecycle[str(stage)] = {
+            "state": "queued",
+            "worker_id": str(decision.worker.worker_id),
+            "admitted_at": time.monotonic(),
+            "started_at": None,
+            "first_token_at": None,
+            "completed_at": None,
+            "success": None,
+            "scheduled_tokens": max(
+                1,
+                int(
+                    ctx.expected_output_tokens
+                    if str(stage) == "decode"
+                    else ctx.estimated_input_tokens
+                ),
+            ),
+        }
         return StageRouteDecision(
             worker_id=decision.worker.worker_id,
             decision=decision,
             wait_ms=wait_ms,
         )
+
+    def mark_stage_started(
+        self,
+        stage: str,
+        worker_id: str,
+        *,
+        ctx: Optional[RequestContext] = None,
+    ) -> bool:
+        scheduler = self._scheduler_for_stage(stage)
+        worker = next(
+            (w for w in scheduler.workers if w.worker_id == worker_id), None
+        )
+        if worker is None:
+            return False
+        now = time.monotonic()
+        record = (
+            ctx.stage_lifecycle.get(str(stage)) if ctx is not None else None
+        )
+        if record is not None:
+            if record.get("state") in {
+                "running",
+                "first_token",
+                "completed",
+                "failed",
+                "cancelled",
+            }:
+                return False
+            if str(record.get("worker_id") or "") != str(worker_id):
+                return False
+            admitted_at = float(record.get("admitted_at") or now)
+        else:
+            admitted_at = now
+        queue_wait_ms = max(0.0, (now - admitted_at) * 1000.0)
+        scheduler.mark_started(
+            worker,
+            queue_wait_ms=queue_wait_ms,
+            scheduled_tokens=int(
+                (record or {}).get("scheduled_tokens", 0) or 0
+            ),
+        )
+        if record is not None:
+            record["state"] = "running"
+            record["started_at"] = now
+            record["queue_wait_ms"] = queue_wait_ms
+        return True
+
+    def mark_stage_first_token(
+        self,
+        stage: str,
+        worker_id: str,
+        *,
+        ctx: Optional[RequestContext] = None,
+        first_token_ms: Optional[float] = None,
+    ) -> bool:
+        if str(stage).lower() != "decode":
+            return False
+        scheduler = self._scheduler_for_stage(stage)
+        worker = next(
+            (w for w in scheduler.workers if w.worker_id == worker_id), None
+        )
+        if worker is None:
+            return False
+        record = (
+            ctx.stage_lifecycle.get(str(stage)) if ctx is not None else None
+        )
+        if record is not None and record.get("state") == "queued":
+            self.mark_stage_started(stage, worker_id, ctx=ctx)
+        if record is not None and record.get("state") in {
+            "first_token",
+            "completed",
+            "failed",
+            "cancelled",
+        }:
+            return False
+        now = time.monotonic()
+        if first_token_ms is None:
+            started_at = (
+                float(record.get("started_at") or now)
+                if record is not None
+                else now
+            )
+            first_token_ms = max(0.0, (now - started_at) * 1000.0)
+        scheduler.mark_first_token(
+            worker, first_token_ms=max(0.0, float(first_token_ms))
+        )
+        if record is not None:
+            record["state"] = "first_token"
+            record["first_token_at"] = now
+            record["first_token_ms"] = max(0.0, float(first_token_ms))
+        return True
 
     def mark_stage_complete(
         self,
@@ -723,14 +1037,47 @@ class ServingControlPlane:
         *,
         latency_ms: float,
         success: bool = True,
+        ctx: Optional[RequestContext] = None,
     ) -> None:
         scheduler = self._scheduler_for_stage(stage)
         worker = next((w for w in scheduler.workers if w.worker_id == worker_id), None)
         if worker is None:
             return
         latency_ms = max(0.0, float(latency_ms))
-        worker.current_load = max(0, worker.current_load - 1)
-        worker.queue_size = max(0, worker.queue_size - 1)
+        record = (
+            ctx.stage_lifecycle.get(str(stage)) if ctx is not None else None
+        )
+        if record is not None and record.get("state") in {
+            "completed",
+            "failed",
+            "cancelled",
+        }:
+            return
+        if record is not None:
+            state = str(record.get("state") or "queued")
+            was_queued = state == "queued"
+            first_token_observed = state == "first_token"
+        else:
+            # Compatibility for callers that do not carry RequestContext.
+            was_queued = worker.current_load <= 0 and worker.queue_size > 0
+            first_token_observed = (
+                worker.worker_type == "decode"
+                and worker.first_token_pending < worker.current_load
+            )
+        scheduler.mark_complete(
+            worker,
+            latency_ms=latency_ms,
+            was_queued=was_queued,
+            first_token_observed=first_token_observed,
+            scheduled_tokens=int(
+                (record or {}).get("scheduled_tokens", 0) or 0
+            ),
+        )
+        if record is not None:
+            record["state"] = "completed" if success else "failed"
+            record["completed_at"] = time.monotonic()
+            record["latency_ms"] = latency_ms
+            record["success"] = bool(success)
         if latency_ms > 0:
             if worker.avg_latency_ms <= 0:
                 worker.avg_latency_ms = latency_ms
@@ -740,6 +1087,30 @@ class ServingControlPlane:
             worker.service_rate = max(1e-6, worker.service_rate * 0.8 + inst_service_rate * 0.2)
         if not success:
             worker.arrival_rate = max(0.0, worker.arrival_rate * 0.9)
+
+    def mark_stage_failed_or_cancelled(
+        self,
+        stage: str,
+        worker_id: str,
+        *,
+        ctx: Optional[RequestContext] = None,
+        latency_ms: float = 0.0,
+        cancelled: bool = False,
+    ) -> None:
+        """Idempotently release lifecycle counts on errors or cancellation."""
+
+        self.mark_stage_complete(
+            stage,
+            worker_id,
+            latency_ms=latency_ms,
+            success=False,
+            ctx=ctx,
+        )
+        record = (
+            ctx.stage_lifecycle.get(str(stage)) if ctx is not None else None
+        )
+        if record is not None and cancelled and record.get("state") == "failed":
+            record["state"] = "cancelled"
 
     # ------------------------------------------------------------------
     # A2A 2PC bookkeeping
@@ -844,11 +1215,24 @@ class ServingControlPlane:
                     "transport_backend": self.config.transport_backend,
                     "connector_metrics_dir": self.config.connector_metrics_dir,
                     "workflow_registry_wal_path": self.config.workflow_registry_wal_path,
+                    "agent_state_catalog_wal_path": (
+                        self.config.agent_state_catalog_wal_path
+                        or self.config.workflow_registry_wal_path
+                    ),
                     "owner_shards": int(self.config.owner_shards),
                     "kv_directory_rpc_url": self.config.kv_directory_rpc_url,
                     "enable_workflow_affinity": self.config.enable_workflow_affinity,
                     "strict_no_fallback": self.config.strict_no_fallback,
+                    "enable_kv_transfer_manifest_v2": self.config.enable_kv_transfer_manifest_v2,
+                    "require_kv_transfer_manifest_v2": self.config.require_kv_transfer_manifest_v2,
+                    "require_kv_transfer_manifest_generation": self.config.require_kv_transfer_manifest_generation,
+                    "require_kv_transfer_manifest_compatibility": self.config.require_kv_transfer_manifest_compatibility,
+                    "kv_transfer_manifest_lease_seconds": self.config.kv_transfer_manifest_lease_seconds,
+                    "worker_generations": dict(self._worker_generations),
+                    "worker_generation_dir": self.config.worker_generation_dir,
                     "enable_agent_state_clone": self.config.enable_agent_state_clone,
+                    "require_real_agent_state_store": self.config.require_real_agent_state_store,
+                    "require_agent_state_connector_commit": self.config.require_agent_state_connector_commit,
                     "agent_state_consume_requires_kv_handoff": self.config.agent_state_consume_requires_kv_handoff,
                     "mooncake_protocol": self.config.mooncake_protocol,
                     "warn_rho": self.config.warn_rho,
@@ -908,6 +1292,15 @@ class ServingControlPlane:
                         if connector_totals.peer_buffer_batches
                         else 0.0
                     ),
+                    "peer_buffer_native_engine_lock_wait_ms": (
+                        connector_totals.peer_buffer_native_engine_lock_wait_ms
+                    ),
+                    "peer_buffer_native_engine_lock_wait_ms_avg": (
+                        connector_totals.peer_buffer_native_engine_lock_wait_ms
+                        / connector_totals.peer_buffer_batches
+                        if connector_totals.peer_buffer_batches
+                        else 0.0
+                    ),
                     "peer_buffer_write_bandwidth_gbps": (
                         connector_totals.peer_buffer_bytes
                         * 8.0
@@ -916,6 +1309,15 @@ class ServingControlPlane:
                         if connector_totals.peer_buffer_write_ms > 0.0
                         else 0.0
                     ),
+                    "layered_source_ready_event_waits": connector_totals.source_ready_event_waits,
+                    "layered_source_ready_event_wait_ms": connector_totals.source_ready_event_wait_ms,
+                    "layered_source_ready_event_wait_ms_avg": (
+                        connector_totals.source_ready_event_wait_ms
+                        / connector_totals.source_ready_event_waits
+                        if connector_totals.source_ready_event_waits
+                        else 0.0
+                    ),
+                    "layered_source_ready_sync_fallbacks": connector_totals.source_ready_sync_fallbacks,
                     "fallback_batches": connector_totals.fallback_batches,
                     "fallback_bytes": connector_totals.fallback_bytes,
                     "layered_transfer_delay_ms": connector_totals.accumulated_group_delay_ms,
@@ -1107,6 +1509,214 @@ class ServingControlPlane:
     # Agent State Cloning / branch control
     # ------------------------------------------------------------------
     @staticmethod
+    def _optional_generation(
+        params: Mapping[str, Any],
+        *names: str,
+    ) -> Optional[str]:
+        for name in names:
+            value = params.get(name)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+        return None
+
+    def _kv_transfer_layout_from_params(
+        self,
+        params: Mapping[str, Any],
+    ) -> KVTransferLayoutV2:
+        raw_layout = params.get("kv_layout_v2")
+        if raw_layout is not None:
+            if not isinstance(raw_layout, Mapping):
+                raise KVTransferManifestError("kv_layout_v2 must be an object")
+            return KVTransferLayoutV2.from_control_payload(raw_layout)
+        try:
+            return KVTransferLayoutV2(
+                model_id=str(params.get("model_id") or params.get("model") or "unknown"),
+                model_revision=str(params.get("model_revision") or "unknown"),
+                vllm_adapter_version=str(params.get("vllm_adapter_version") or "unknown"),
+                dtype=str(params.get("kv_dtype") or params.get("dtype") or "unknown"),
+                block_size=int(params.get("kv_block_size", params.get("block_size", 0)) or 0),
+                num_layers=int(params.get("kv_num_layers", params.get("num_layers", 0)) or 0),
+                tp_size=int(params.get("tp_size", 1) or 1),
+                tp_rank=int(params.get("tp_rank", 0) or 0),
+                extra={"source": "legacy_kv_transfer_params"},
+            )
+        except (TypeError, ValueError) as exc:
+            raise KVTransferManifestError(f"invalid KV layout fields: {exc}") from exc
+
+    def _build_kv_transfer_manifest(
+        self,
+        ctx: RequestContext,
+        params: Mapping[str, Any],
+        *,
+        destination_engine_id: str,
+    ) -> KVTransferManifestV2:
+        source_engine_id = str(params.get("remote_engine_id") or "").strip()
+        if not source_engine_id:
+            raise KVTransferManifestError("remote_engine_id is required for a KV transfer manifest")
+        layout = self._kv_transfer_layout_from_params(params)
+        raw_layer_groups = params.get("kv_layer_groups_v2", params.get("layer_groups"))
+        if raw_layer_groups is None and int(layout.num_layers) > 0:
+            size = max(1, int(params.get("layers_per_group", self.config.layers_per_group) or 1))
+            raw_layer_groups = [
+                [start, min(int(layout.num_layers), start + size)]
+                for start in range(0, int(layout.num_layers), size)
+            ]
+        raw_transport = params.get("kv_transport_v2")
+        if raw_transport is None:
+            transport: Dict[str, Any] = {}
+        elif isinstance(raw_transport, Mapping):
+            transport = dict(raw_transport)
+        else:
+            raise KVTransferManifestError("kv_transport_v2 must be an object")
+        transport.setdefault("protocol", str(params.get("mooncake_protocol") or self.config.mooncake_protocol))
+        transport.setdefault("backend", str(params.get("transport_backend") or self.config.transport_backend))
+        transport.setdefault("remote_bootstrap_addr", str(params.get("remote_bootstrap_addr") or ""))
+        transport.setdefault("source_node_id", str(ctx.prefill_worker_id or self.config.source_agent_id))
+        transport.setdefault("destination_node_id", str(destination_engine_id))
+        try:
+            token_count = int(
+                params.get("remote_prefill_prompt_tokens", params.get("token_count", len(ctx.token_ids)))
+                or 0
+            )
+        except (TypeError, ValueError) as exc:
+            raise KVTransferManifestError(f"invalid KV transfer token_count: {exc}") from exc
+        return KVTransferManifestV2.create(
+            transfer_id=str(params.get("transfer_id") or ctx.transfer_id or ctx.request_id),
+            workflow_id=ctx.workflow_id,
+            source_engine_id=source_engine_id,
+            source_generation=(
+                self._optional_generation(
+                    params,
+                    "source_generation",
+                    "producer_generation",
+                    "remote_worker_generation",
+                )
+                or self._generation_for_worker(ctx.prefill_worker_id)
+                or "unknown"
+            ),
+            destination_engine_id=str(destination_engine_id),
+            destination_generation=(
+                self._generation_for_worker(destination_engine_id)
+                or self._optional_generation(
+                    params,
+                    "destination_generation",
+                    "consumer_generation",
+                    "target_worker_generation",
+                )
+                or "unknown"
+            ),
+            layout=layout,
+            remote_block_ids=params.get("remote_block_ids"),
+            token_count=token_count,
+            layer_groups=raw_layer_groups,
+            transport=transport,
+            attempt=int(params.get("kv_transfer_attempt", 0) or 0),
+            lease_seconds=max(0.0, float(self.config.kv_transfer_manifest_lease_seconds)),
+            metadata={
+                "routing_path": ctx.routing_path,
+                "request_id": ctx.request_id,
+                "source_node_id": str(ctx.prefill_worker_id or self.config.source_agent_id),
+                "destination_node_id": str(destination_engine_id),
+            },
+        )
+
+    def _upsert_kv_transfer_manifest(
+        self,
+        ctx: RequestContext,
+        params: Dict[str, Any],
+        *,
+        destination_engine_id: str,
+    ) -> Optional[KVTransferManifestV2]:
+        """Attach or validate the P-to-D envelope before connector dispatch.
+
+        The proxy owns a trusted Prefill response and may rebind a valid source
+        manifest when Decode admission changes the selected worker.  Rebinding
+        does not extend the original source lease; it only changes the
+        consumer-facing fence and increments the attempt.
+        """
+
+        raw_manifest = params.get("kv_transfer_manifest_v2")
+        if raw_manifest is None and not self.config.enable_kv_transfer_manifest_v2:
+            if self.config.require_kv_transfer_manifest_v2:
+                raise RuntimeError("KV transfer manifest v2 is required but disabled")
+            return None
+        try:
+            source_engine_id = str(params.get("remote_engine_id") or "").strip()
+            source_generation = (
+                self._optional_generation(
+                    params,
+                    "source_generation",
+                    "producer_generation",
+                    "remote_worker_generation",
+                )
+                or self._generation_for_worker(ctx.prefill_worker_id)
+            )
+            destination_generation = (
+                self._generation_for_worker(destination_engine_id)
+                or self._optional_generation(
+                    params,
+                    "destination_generation",
+                    "consumer_generation",
+                    "target_worker_generation",
+                )
+            )
+            if raw_manifest is None:
+                manifest = self._build_kv_transfer_manifest(
+                    ctx,
+                    params,
+                    destination_engine_id=destination_engine_id,
+                )
+                action = "created"
+            else:
+                manifest = KVTransferManifestV2.from_control_payload(raw_manifest)
+                manifest.validate_for_consumer(
+                    transfer_id=str(params.get("transfer_id") or ctx.transfer_id or ctx.request_id),
+                    workflow_id=ctx.workflow_id,
+                    source_engine_id=source_engine_id,
+                    source_generation=source_generation,
+                    require_generation_fences=self.config.require_kv_transfer_manifest_generation,
+                    require_compatibility=self.config.require_kv_transfer_manifest_compatibility,
+                )
+                target_changed = manifest.destination_engine_id != str(destination_engine_id)
+                generation_changed = (
+                    destination_generation is not None
+                    and manifest.destination_generation != destination_generation
+                )
+                if target_changed or generation_changed:
+                    manifest = manifest.rebind_destination(
+                        destination_engine_id=str(destination_engine_id),
+                        destination_generation=destination_generation or manifest.destination_generation,
+                    )
+                    action = "rebound"
+                else:
+                    action = "validated"
+            manifest.validate_for_consumer(
+                transfer_id=str(params.get("transfer_id") or ctx.transfer_id or ctx.request_id),
+                workflow_id=ctx.workflow_id,
+                source_engine_id=source_engine_id,
+                source_generation=source_generation,
+                destination_engine_id=str(destination_engine_id),
+                destination_generation=destination_generation,
+                require_generation_fences=self.config.require_kv_transfer_manifest_generation,
+                require_compatibility=self.config.require_kv_transfer_manifest_compatibility,
+            )
+        except (KVTransferManifestError, TypeError, ValueError) as exc:
+            with self._lock:
+                self._metrics["kv_transfer_manifest_rejections"] += 1
+                self._record_path_metric(ctx.routing_path, "kv_transfer_manifest_rejections")
+            raise RuntimeError(f"KV transfer manifest rejected: {exc}") from exc
+        params["kv_transfer_manifest_v2"] = manifest.as_control_payload()
+        with self._lock:
+            metric_key = {
+                "created": "kv_transfer_manifests_created",
+                "validated": "kv_transfer_manifests_validated",
+                "rebound": "kv_transfer_manifests_rebound",
+            }[action]
+            self._metrics[metric_key] += 1
+            self._record_path_metric(ctx.routing_path, metric_key)
+        return manifest
+
+    @staticmethod
     def _kv_handoff_payload(
         kv_transfer_params: Dict[str, Any],
         *,
@@ -1139,6 +1749,11 @@ class ServingControlPlane:
             "routing_path",
         }
         payload = {key: kv.get(key) for key in keep if kv.get(key) is not None}
+        # Agent state has a distinct lease/pinning protocol.  Persist the
+        # source P->D envelope for audit only; do not pass it through as an
+        # active manifest for a later branch with a different transfer id.
+        if kv.get("kv_transfer_manifest_v2") is not None:
+            payload["source_kv_transfer_manifest_v2"] = kv["kv_transfer_manifest_v2"]
         payload.update(
             {
                 "source_node_id": str(source_node_id),
@@ -1276,6 +1891,96 @@ class ServingControlPlane:
             self._record_path_metric(ctx.routing_path, "agent_state_consume_success")
         return kv
 
+    def _reclaim_catalog_page_objects(self, refs: Sequence[CatalogPageRef]) -> None:
+        """Delete only Store objects proven unreferenced by the catalog.
+
+        ``AgentStateCatalog`` owns the refcount decision and invokes this
+        callback only after a release transition is durable.  The page store
+        still performs per-key status validation, so a failed backend delete is
+        surfaced and retried rather than being reported as a successful GC.
+        """
+
+        if self.kv_state_store is None or self.kv_state_store.kv_page_store is None:
+            raise RuntimeError("catalog page GC requires a MooncakeKVPageStore")
+        keys = [
+            key
+            for ref in refs
+            for key in (ref.key_store_key, ref.value_store_key)
+        ]
+        self.kv_state_store.kv_page_store.remove_page_objects(keys)
+
+    def _catalog_register_store_state(
+        self,
+        *,
+        public_state_id: str,
+        descriptor,
+        target_node_id: str,
+        lease_deadline_unix: float,
+        status: str,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        """Persist a Store/state-store descriptor after real export succeeds."""
+
+        catalog = self.agent_state_catalog
+        if catalog is None:
+            return
+        catalog.register_state(
+            state_id=str(public_state_id),
+            workflow_id=str(descriptor.workflow_id),
+            state_store_id=str(descriptor.state_id),
+            manifests=descriptor.manifests,
+            owner_node_id=str(descriptor.owner_node_id),
+            target_node_id=str(target_node_id),
+            lease_deadline_unix=float(lease_deadline_unix),
+            status=str(status),
+            metadata={
+                "store_backed": bool(
+                    descriptor.manifests
+                    and all(manifest.has_store_payload for manifest in descriptor.manifests)
+                ),
+                **dict(metadata or {}),
+            },
+        )
+
+    def _restore_catalogued_store_state(
+        self,
+        public_state_id: str,
+        *,
+        target_node_id: str,
+        feature_hashes: Optional[Sequence[str]] = None,
+    ):
+        """Rehydrate a WAL-recovered state from immutable Store manifests.
+
+        A fresh proxy must not reuse a catalogued physical block id.  Instead,
+        the local state store performs destination allocation plus checked
+        ``batch_get_into`` import, then the normal materialize/fork paths see
+        newly allocated block refs.
+        """
+
+        if self.kv_state_store is None or self.agent_state_catalog is None:
+            return None
+        catalog_record = self.agent_state_catalog.get_record(public_state_id)
+        if catalog_record is None:
+            return None
+        if catalog_record.status == "RELEASED":
+            raise RuntimeError(f"catalogued Agent state is already released: {public_state_id}")
+        remaining = float(catalog_record.lease_deadline_unix) - time.time()
+        if remaining <= 0.0:
+            raise RuntimeError(f"catalogued Agent state lease expired: {public_state_id}")
+        store_state_id = catalog_record.state_store_id
+        descriptor = self.kv_state_store.get_state(store_state_id)
+        if descriptor is None:
+            descriptor = self.kv_state_store.restore_state_from_store(
+                store_state_id,
+                catalog_record.manifests,
+                target_node_id=str(target_node_id),
+                ttl_deadline=time.monotonic() + max(1.0, remaining),
+                metadata={"catalog_recovered": True, "public_state_id": public_state_id},
+                feature_hashes=feature_hashes,
+            )
+        self._serving_kv_state_ids[str(public_state_id)] = descriptor.state_id
+        return descriptor
+
     def fork_workflow_state(
         self,
         *,
@@ -1315,6 +2020,27 @@ class ServingControlPlane:
             workflow_id=workflow_id,
             parent_request_id=parent_request_id,
         )
+        parent_state_id = str(source.get("request_id") or parent_request_id or "")
+        if self._agent_state_cloner is not None and self.kv_state_store is not None:
+            catalog_parent = (
+                self.agent_state_catalog.get_record(parent_state_id)
+                if self.agent_state_catalog is not None
+                else None
+            )
+            if parent_state_id not in self._serving_kv_state_ids and catalog_parent is not None:
+                self._restore_catalogued_store_state(
+                    parent_state_id,
+                    target_node_id=str(catalog_parent.owner_node_id),
+                    feature_hashes=list(source.get("mm_hashes") or []),
+                )
+            if parent_state_id in self._serving_kv_state_ids:
+                return self._fork_store_workflow_state(
+                    workflow_id=workflow_id,
+                    parent_state_id=parent_state_id,
+                    branch_count=branch_count,
+                    target_node_id=target_node_id or self.kv_state_store.node_id,
+                    for_write=for_write,
+                )
         block_ids = [str(gid) for gid in list(source.get("block_ids") or []) if str(gid)]
         if not block_ids:
             with self._lock:
@@ -1338,6 +2064,17 @@ class ServingControlPlane:
         parent_state_id = str(source.get("request_id") or parent_request_id or "")
         parent_version_id = str(source.get("version_id") or source.get("registry_version_id") or "") or None
         source_kv_handoff = dict(source.get("kv_handoff") or {})
+        source_nodes = {
+            str(record.physical_node_id)
+            for gid in block_ids
+            for record in [self.kv_directory.get_record(gid)]
+            if record is not None
+        }
+        if not source_nodes:
+            with self._lock:
+                self._metrics["agent_state_clone_failures"] += 1
+            raise RuntimeError("cannot determine KV owner node for workflow fork")
+        same_node = len(source_nodes) == 1 and target in source_nodes
         now = time.monotonic()
         ttl_deadline = now + max(1.0, float(self.config.request_state_ttl_seconds))
         acquired_refs: List[str] = []
@@ -1362,7 +2099,11 @@ class ServingControlPlane:
                         "parent_request_id": parent_state_id,
                         "target_node_id": target,
                         "kv_block_ids": list(block_ids),
-                        "zero_copy": True,
+                        # No tensor bytes are copied by this control-plane
+                        # operation. Physical same-node zero-copy and
+                        # cross-node descriptor sharing are distinct contracts.
+                        "zero_copy": bool(same_node),
+                        "descriptor_shared": bool(not same_node),
                         "for_write": bool(for_write),
                         "consume_kv_transfer_params": self._build_agent_state_consume_kv_params(
                             record=WorkflowStateRecord(
@@ -1401,7 +2142,8 @@ class ServingControlPlane:
                             approximate=False,
                             reuse_telemetry={
                                 "agent_state_clone": True,
-                                "zero_copy": True,
+                                "zero_copy": bool(same_node),
+                                "descriptor_shared": bool(not same_node),
                                 "parent_request_id": parent_state_id,
                                 "branch_index": branch_index,
                                 "for_write": bool(for_write),
@@ -1452,7 +2194,7 @@ class ServingControlPlane:
         with self._lock:
             self._metrics["agent_state_clone_requests"] += 1
             self._metrics["agent_state_clone_branches"] += branch_count
-            self._metrics["agent_state_clone_zero_copy_branches"] += branch_count
+            self._metrics["agent_state_clone_zero_copy_branches"] += branch_count if same_node else 0
             # No tensor bytes are copied on the serving-control fork path.
             self._metrics["agent_state_clone_copied_bytes"] += 0
 
@@ -1464,8 +2206,176 @@ class ServingControlPlane:
             "kv_block_ids": list(block_ids),
             "refcounts": refcounts,
             "copied_bytes": 0,
-            "zero_copy_branches": branch_count,
-            "clone_semantics": "same_node_block_ref_zero_copy",
+            "zero_copy_branches": branch_count if same_node else 0,
+            "descriptor_shared_branches": branch_count if not same_node else 0,
+            "clone_semantics": (
+                "same_node_block_ref_zero_copy"
+                if same_node
+                else "cross_node_descriptor_share"
+            ),
+            "target_node_id": target,
+        }
+
+    def _fork_store_workflow_state(
+        self,
+        *,
+        workflow_id: str,
+        parent_state_id: str,
+        branch_count: int,
+        target_node_id: str,
+        for_write: bool,
+    ) -> Dict[str, Any]:
+        """Fork a server-captured KV state through the real state-store path.
+
+        No client-provided physical IDs participate here.  The state store
+        owns page references/leases, and a Store-backed cross-node child is
+        descriptor-only until ``materialize_agent_state`` requests target
+        blocks.  On any partial failure every child state is released.
+        """
+
+        assert self._agent_state_cloner is not None
+        assert self.kv_state_store is not None
+        parent_store_state_id = self._serving_kv_state_ids[parent_state_id]
+        parent = self.kv_state_store.get_state(parent_store_state_id)
+        if parent is None:
+            raise RuntimeError(f"captured Agent state is unavailable: {parent_state_id}")
+        target = str(target_node_id or self.kv_state_store.node_id)
+        catalog = self.agent_state_catalog
+        parent_catalog = catalog.get_record(parent_state_id) if catalog is not None else None
+        if catalog is not None and parent_catalog is None:
+            # Compatibility/recovery bridge for a descriptor registered before
+            # the catalog was enabled.  It still records only server-owned
+            # manifests, never an external physical-id placeholder.
+            self._catalog_register_store_state(
+                public_state_id=parent_state_id,
+                descriptor=parent,
+                target_node_id=parent.owner_node_id,
+                lease_deadline_unix=time.time()
+                + max(1.0, float(self.config.request_state_ttl_seconds)),
+                status="ACTIVE",
+                metadata={"catalog_backfilled": True},
+            )
+            parent_catalog = catalog.get_record(parent_state_id)
+        branches: List[Dict[str, Any]] = []
+        created: List[str] = []
+        catalog_created: List[str] = []
+        try:
+            for _ in range(int(branch_count)):
+                branch_id = f"{workflow_id}:branch:{uuid.uuid4().hex}"
+                if target == parent.owner_node_id:
+                    branch = self._agent_state_cloner.clone_kv_same_node_zero_copy(
+                        parent_store_state_id,
+                        branch_id,
+                    )
+                else:
+                    branch = self._agent_state_cloner.share_kv_state_descriptor_cross_node(
+                        parent_store_state_id,
+                        branch_id,
+                        target_node_id=target,
+                    )
+                descriptor = self.kv_state_store.get_state(branch.kv_state_id or branch_id)
+                if descriptor is None:
+                    raise RuntimeError(f"missing child descriptor for branch={branch_id}")
+                created.append(descriptor.state_id)
+                if catalog is not None:
+                    catalog.fork_state(
+                        parent_state_id=parent_state_id,
+                        child_state_id=branch_id,
+                        child_state_store_id=descriptor.state_id,
+                        manifests=descriptor.manifests,
+                        owner_node_id=descriptor.owner_node_id,
+                        target_node_id=target,
+                        lease_deadline_unix=(
+                            parent_catalog.lease_deadline_unix
+                            if parent_catalog is not None
+                            else time.time()
+                            + max(1.0, float(self.config.request_state_ttl_seconds))
+                        ),
+                        status=(
+                            "MATERIALIZE_REQUIRED"
+                            if target != parent.owner_node_id
+                            else "ACTIVE"
+                        ),
+                        metadata={"for_write": bool(for_write)},
+                    )
+                    catalog_created.append(branch_id)
+                self._serving_kv_state_ids[branch_id] = descriptor.state_id
+                manifests = [manifest.as_control_payload() for manifest in descriptor.manifests]
+                record = WorkflowStateRecord(
+                    state_id=branch_id,
+                    workflow_id=workflow_id,
+                    version_id=descriptor.version_id,
+                    parent_version_id=parent.version_id,
+                    snapshot_epoch=descriptor.snapshot_epoch,
+                    step_index=1,
+                    agent_id=target,
+                    status="AGENT_STATE_MATERIALIZE_REQUIRED" if target != parent.owner_node_id else "AGENT_BRANCH_ACTIVE",
+                    reuse_telemetry={
+                        "agent_state_clone": True,
+                        "store_backed": True,
+                        "clone_semantics": branch.clone_semantics,
+                        "for_write": bool(for_write),
+                        "clone_payload_bytes": 0,
+                    },
+                    ttl_deadline=descriptor.ttl_deadline,
+                    kv_block_ids=list(descriptor.block_ids),
+                    kv_logical_filled=[int(ref.filled) for ref in self.kv_state_store.get_refs(descriptor.state_id)],
+                    kv_manifests=manifests,
+                    target_agent_id=target,
+                    target_node_id=target,
+                )
+                if self.workflow_registry is not None:
+                    self.workflow_registry.upsert_record(
+                        record,
+                        event="AGENT_STATE_STORE_FORKED",
+                        preserve_existing_handoff=False,
+                    )
+                branches.append(
+                    {
+                        "branch_id": branch_id,
+                        "agent_state_store_state_id": descriptor.state_id,
+                        "clone_semantics": branch.clone_semantics,
+                        "zero_copy": branch.clone_semantics == "same_node_block_ref_zero_copy",
+                        "descriptor_shared": branch.clone_semantics == "cross_node_descriptor_share",
+                        "clone_payload_bytes": 0,
+                        "kv_block_ids": list(descriptor.block_ids),
+                        "kv_manifests": manifests,
+                        "target_node_id": target,
+                    }
+                )
+        except Exception:
+            if catalog is not None:
+                for branch_id in reversed(catalog_created):
+                    try:
+                        catalog.release_state(branch_id, reclaim=False)
+                    except Exception:
+                        pass
+            for state_id in reversed(created):
+                self.kv_state_store.release_state(state_id)
+            for branch_id in catalog_created:
+                self._serving_kv_state_ids.pop(branch_id, None)
+            for branch in branches:
+                self._serving_kv_state_ids.pop(str(branch["branch_id"]), None)
+            with self._lock:
+                self._metrics["agent_state_clone_failures"] += 1
+            raise
+        with self._lock:
+            self._metrics["agent_state_clone_requests"] += 1
+            self._metrics["agent_state_clone_branches"] += len(branches)
+            self._metrics["agent_state_clone_zero_copy_branches"] += sum(
+                1 for branch in branches if branch["zero_copy"]
+            )
+        return {
+            "workflow_id": workflow_id,
+            "parent_request_id": parent_state_id,
+            "branch_count": len(branches),
+            "branches": branches,
+            "copied_bytes": 0,
+            "clone_semantics": (
+                "same_node_physical_zero_copy"
+                if all(branch["zero_copy"] for branch in branches)
+                else "cross_node_manifest_clone"
+            ),
             "target_node_id": target,
         }
 
@@ -1474,7 +2384,10 @@ class ServingControlPlane:
         *,
         workflow_id: str,
         state_id: Optional[str] = None,
+        capture_request_id: Optional[str] = None,
         kv_block_ids: Sequence[str],
+        kv_refs: Optional[Sequence[BlockRef]] = None,
+        kv_logical_filled: Optional[Sequence[int]] = None,
         token_ids: Optional[Sequence[int]] = None,
         feature_hashes: Optional[Sequence[str]] = None,
         target_node_id: Optional[str] = None,
@@ -1498,16 +2411,20 @@ class ServingControlPlane:
         if not workflow_id:
             raise ValueError("workflow_id is required")
         block_ids = [str(gid) for gid in list(kv_block_ids or []) if str(gid)]
-        if not block_ids:
-            raise ValueError("kv_block_ids is required")
+        if not block_ids and not kv_refs:
+            raise ValueError("kv_block_ids or server-owned kv_refs is required")
         registry = self.workflow_registry
         if registry is None:  # defensive; __init__ creates it for clone-enabled planes.
             registry = WorkflowStateRegistry()
             self.workflow_registry = registry
 
         state_id = str(state_id or f"{workflow_id}:state:{uuid.uuid4().hex}")
+        capture_request_id = str(capture_request_id or state_id).strip()
         existing = registry.get_record(state_id)
         if existing is not None and existing.status != "RELEASED":
+            if capture_request_id:
+                with self._lock:
+                    self._agent_capture_by_request_id[capture_request_id] = state_id
             return {
                 "state_id": state_id,
                 "workflow_id": workflow_id,
@@ -1519,26 +2436,67 @@ class ServingControlPlane:
                     for gid in list(existing.kv_block_ids)
                 },
                 "status": existing.status,
+                "kv_manifests": list(existing.kv_manifests),
             }
 
         target = str(target_node_id or self.config.target_agent_id)
-        refcounts: Dict[str, int] = {}
-        for gid in block_ids:
-            current = self.kv_directory.get_record(gid)
-            if current is None:
-                self.kv_directory.ensure_block_record(
-                    gid,
-                    workflow_id=workflow_id,
-                    owner_shard=target,
-                    physical_node_id=target,
-                    external_placeholder=True,
-                )
-                refcounts[gid] = self.kv_directory.refcount(gid)
-            else:
-                refcounts[gid] = self.kv_directory.incref(gid)
-
         now = time.monotonic()
-        ttl_deadline = now + max(1.0, float(self.config.request_state_ttl_seconds))
+        ttl_seconds = max(1.0, float(self.config.request_state_ttl_seconds))
+        ttl_deadline = now + ttl_seconds
+        catalog_lease_deadline_unix = time.time() + ttl_seconds
+        refcounts: Dict[str, int] = {}
+        store_state_id: Optional[str] = None
+        manifests: List[Dict[str, Any]] = []
+        if kv_refs is not None:
+            if self.kv_state_store is None:
+                raise RuntimeError("server-owned kv_refs require MooncakeKVStateStore")
+            descriptor = self.kv_state_store.register_state(
+                list(kv_refs),
+                workflow_id=workflow_id,
+                state_id=state_id,
+                ttl_deadline=ttl_deadline,
+                metadata={"captured_by": "ServingControlPlane", "target_node_id": target},
+            )
+            try:
+                if self.kv_state_store.kv_page_store is not None:
+                    descriptor = self.kv_state_store.export_state_to_store(descriptor.state_id)
+                self._catalog_register_store_state(
+                    public_state_id=state_id,
+                    descriptor=descriptor,
+                    target_node_id=target,
+                    lease_deadline_unix=catalog_lease_deadline_unix,
+                    status="ACTIVE",
+                    metadata={"serving_status": str(status)},
+                )
+            except Exception:
+                self.kv_state_store.release_state(descriptor.state_id)
+                raise
+            store_state_id = descriptor.state_id
+            block_ids = list(descriptor.block_ids)
+            refcounts = {
+                gid: self.kv_state_store.pm.refcount(gid)
+                for gid in block_ids
+            }
+            manifests = [manifest.as_control_payload() for manifest in descriptor.manifests]
+        else:
+            if self.config.require_real_agent_state_store:
+                raise RuntimeError(
+                    "agent state capture requires server-owned KV refs; external block ids are disabled"
+                )
+            for gid in block_ids:
+                current = self.kv_directory.get_record(gid)
+                if current is None:
+                    self.kv_directory.ensure_block_record(
+                        gid,
+                        workflow_id=workflow_id,
+                        owner_shard=target,
+                        physical_node_id=target,
+                        external_placeholder=True,
+                    )
+                    refcounts[gid] = self.kv_directory.refcount(gid)
+                else:
+                    refcounts[gid] = self.kv_directory.incref(gid)
+
         record = WorkflowStateRecord(
             state_id=state_id,
             workflow_id=workflow_id,
@@ -1551,6 +2509,7 @@ class ServingControlPlane:
             approximate=False,
             reuse_telemetry={
                 "agent_state_registered": True,
+                "agent_state_capture_request_id": capture_request_id,
                 "kv_handoff": self._kv_handoff_payload(
                     dict(kv_transfer_params or {}),
                     block_ids=block_ids,
@@ -1563,6 +2522,8 @@ class ServingControlPlane:
             image_ids=[str(h) for h in list(feature_hashes or [])],
             feature_hashes=[str(h) for h in list(feature_hashes or [])],
             kv_block_ids=list(block_ids),
+            kv_logical_filled=[int(value) for value in list(kv_logical_filled or [])],
+            kv_manifests=manifests,
             target_agent_id=target,
             target_node_id=target,
             updated_at=now,
@@ -1572,6 +2533,11 @@ class ServingControlPlane:
             event="AGENT_STATE_REGISTERED",
             preserve_existing_handoff=False,
         )
+        if store_state_id is not None:
+            self._serving_kv_state_ids[state_id] = store_state_id
+        if capture_request_id:
+            with self._lock:
+                self._agent_capture_by_request_id[capture_request_id] = state_id
         with self._lock:
             self._metrics["agent_state_clone_retained_blocks"] += len(block_ids)
         return {
@@ -1582,6 +2548,183 @@ class ServingControlPlane:
             "kv_block_ids": list(block_ids),
             "refcounts": refcounts,
             "status": status,
+            "kv_manifests": manifests,
+            "store_backed": store_state_id is not None,
+        }
+
+    def capture_agent_state(
+        self,
+        *,
+        request_id: str,
+        state_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Return a previously server-captured Agent state for a request.
+
+        The public HTTP surface intentionally has no way to turn a client
+        supplied block id into a physical capture.  A version-locked vLLM
+        adapter must first call :meth:`register_agent_state` in-process with
+        allocator-owned ``kv_refs``.  This endpoint then provides an
+        idempotent request-id based handle for the serving proxy.  Until that
+        adapter capture exists it returns capability-unavailable rather than
+        fabricating an external-placeholder success.
+        """
+
+        request_id = str(request_id or "").strip()
+        public_state_id = str(state_id or "").strip()
+        if not request_id:
+            raise ValueError("request_id is required for Agent state capture")
+        if not public_state_id:
+            with self._lock:
+                public_state_id = str(self._agent_capture_by_request_id.get(request_id) or "")
+        if not public_state_id and self.workflow_registry is not None:
+            # The in-memory map is intentionally only a cache. WAL recovery
+            # reconstructs the request alias from the durable registry row.
+            for candidate in self.workflow_registry.all_records():
+                if str(candidate.reuse_telemetry.get("agent_state_capture_request_id") or "") == request_id:
+                    public_state_id = candidate.state_id
+                    break
+        if not public_state_id:
+            public_state_id = request_id
+        descriptor_id = self._serving_kv_state_ids.get(public_state_id)
+        descriptor = (
+            self.kv_state_store.get_state(descriptor_id)
+            if self.kv_state_store is not None and descriptor_id is not None
+            else None
+        )
+        if descriptor is None:
+            raise NotImplementedError(
+                "Agent state capture is unavailable for request_id="
+                f"{request_id}: the vLLM adapter has not registered "
+                "server-owned allocator KV refs"
+            )
+        result = self.get_agent_state(public_state_id)
+        result.update(
+            {
+                "captured": True,
+                "idempotent": True,
+                "capture_request_id": request_id,
+                "agent_state_store_state_id": descriptor.state_id,
+            }
+        )
+        return result
+
+    def get_agent_state(self, state_id: str) -> Dict[str, Any]:
+        """Expose durable Agent-state facts without exposing page payloads.
+
+        The response is operational metadata only: page/block ids are useful
+        to the internal connector, while physical pointers and tensor bytes
+        remain exclusively allocator/Store owned.
+        """
+
+        registry = self.workflow_registry
+        if registry is None:
+            raise KeyError("workflow registry is not enabled")
+        state_id = str(state_id or "").strip()
+        record = registry.get_record(state_id)
+        if record is None:
+            raise KeyError(f"unknown agent state_id={state_id}")
+        store_state_id = self._serving_kv_state_ids.get(state_id)
+        descriptor = (
+            self.kv_state_store.get_state(store_state_id)
+            if self.kv_state_store is not None and store_state_id is not None
+            else None
+        )
+        catalog_record = (
+            self.agent_state_catalog.get_record(state_id)
+            if self.agent_state_catalog is not None
+            else None
+        )
+        manifests = list(record.kv_manifests)
+        if descriptor is not None:
+            manifests = [manifest.as_control_payload() for manifest in descriptor.manifests]
+        elif catalog_record is not None:
+            manifests = list(catalog_record.manifests)
+        manifest_checksums = [
+            str(manifest.get("checksum") or "")
+            for manifest in manifests
+            if isinstance(manifest, Mapping)
+        ]
+        block_ids = list(descriptor.block_ids) if descriptor is not None else list(record.kv_block_ids)
+        owner_node_id = (
+            descriptor.owner_node_id
+            if descriptor is not None
+            else catalog_record.owner_node_id
+            if catalog_record is not None
+            else record.agent_id
+        )
+        target_node_id = (
+            catalog_record.target_node_id
+            if catalog_record is not None and catalog_record.target_node_id is not None
+            else record.target_node_id
+            or record.target_agent_id
+            or owner_node_id
+        )
+        return {
+            "state_id": state_id,
+            "workflow_id": record.workflow_id,
+            "status": record.status,
+            "version_id": record.version_id,
+            "parent_version_id": record.parent_version_id,
+            "snapshot_epoch": record.snapshot_epoch,
+            "owner_node_id": owner_node_id,
+            "target_node_id": target_node_id,
+            "lease": {
+                "workflow_deadline_monotonic": record.ttl_deadline,
+                "catalog_deadline_unix": (
+                    catalog_record.lease_deadline_unix
+                    if catalog_record is not None
+                    else None
+                ),
+            },
+            "physical_state": {
+                "store_backed": bool(
+                    descriptor is not None
+                    and descriptor.manifests
+                    and all(manifest.has_store_payload for manifest in descriptor.manifests)
+                )
+                or bool(
+                    catalog_record is not None
+                    and catalog_record.manifests
+                    and all(
+                        isinstance(manifest, Mapping)
+                        and manifest.get("key_store_key")
+                        and manifest.get("value_store_key")
+                        for manifest in catalog_record.manifests
+                    )
+                ),
+                "allocator_state_live": descriptor is not None,
+                "agent_state_store_state_id": store_state_id,
+                "materialized": bool(
+                    descriptor is not None
+                    and (
+                        descriptor.owner_node_id == str(target_node_id)
+                        or descriptor.metadata.get("materialized_from_owner_node_id")
+                    )
+                ),
+            },
+            "kv": {
+                "block_ids": block_ids,
+                "logical_filled": list(record.kv_logical_filled),
+                "manifest_checksums": manifest_checksums,
+                "manifest_count": len(manifests),
+            },
+            "catalog": (
+                {
+                    "status": catalog_record.status,
+                    "catalog_version": catalog_record.catalog_version,
+                    "fence_token": catalog_record.fence_token,
+                    "clone_payload_bytes": catalog_record.clone_payload_bytes,
+                    "materialized_bytes": catalog_record.materialized_bytes,
+                    "gc_completed": catalog_record.gc_completed,
+                }
+                if catalog_record is not None
+                else {"enabled": False}
+            ),
+            "orphan_block_count": len(
+                self.kv_directory.orphan_block_ids()
+                if hasattr(self.kv_directory, "orphan_block_ids")
+                else []
+            ),
         }
 
     def materialize_agent_state(
@@ -1617,6 +2760,131 @@ class ServingControlPlane:
                 self._metrics["agent_state_materialize_failures"] += 1
             raise RuntimeError(f"agent state_id={state_id} is already released")
         target = str(target_node_id or record.target_node_id or record.agent_id or self.config.node_id)
+        store_state_id = self._serving_kv_state_ids.get(state_id)
+        if (
+            self.kv_state_store is not None
+            and store_state_id is None
+            and self.agent_state_catalog is not None
+            and self.agent_state_catalog.get_record(state_id) is not None
+        ):
+            restored = self._restore_catalogued_store_state(
+                state_id,
+                target_node_id=target,
+                feature_hashes=list(record.feature_hashes),
+            )
+            store_state_id = None if restored is None else restored.state_id
+        if self.kv_state_store is not None and store_state_id is not None:
+            descriptor = self.kv_state_store.get_state(store_state_id)
+            if descriptor is None:
+                with self._lock:
+                    self._metrics["agent_state_materialize_failures"] += 1
+                raise RuntimeError(f"captured Agent state is unavailable: {state_id}")
+            catalog = self.agent_state_catalog
+            if catalog is not None:
+                catalog_record = catalog.get_record(state_id)
+                if catalog_record is None:
+                    self._catalog_register_store_state(
+                        public_state_id=state_id,
+                        descriptor=descriptor,
+                        target_node_id=target,
+                        lease_deadline_unix=time.time()
+                        + max(1.0, float(self.config.request_state_ttl_seconds)),
+                        status="ACTIVE",
+                        metadata={"catalog_backfilled": True},
+                    )
+                    catalog_record = catalog.get_record(state_id)
+                if (
+                    catalog_record is None
+                    or catalog_record.status == "RELEASED"
+                    or catalog_record.lease_deadline_unix <= time.time()
+                ):
+                    with self._lock:
+                        self._metrics["agent_state_materialize_failures"] += 1
+                    raise RuntimeError(f"Agent state catalog lease is unavailable: {state_id}")
+            else:
+                catalog_record = None
+            try:
+                if self._vllm_kv_materializer is None:
+                    raise RuntimeError("Agent state materializer is not configured")
+                materialization = (
+                    self._vllm_kv_materializer.materialize_write(
+                        store_state_id,
+                        target_node_id=target,
+                        require_connector_commit=bool(
+                            self.config.require_agent_state_connector_commit
+                        ),
+                    )
+                    if target != descriptor.owner_node_id or for_write
+                    else self._vllm_kv_materializer.materialize_read(
+                        store_state_id,
+                        target_node_id=target,
+                        require_connector_commit=bool(
+                            self.config.require_agent_state_connector_commit
+                        ),
+                    )
+                )
+                descriptor = self.kv_state_store.get_state(store_state_id)
+                if descriptor is None:
+                    raise RuntimeError(
+                        f"materializer did not retain Agent state descriptor: {state_id}"
+                    )
+                self._serving_kv_state_ids[state_id] = descriptor.state_id
+                materialized_bytes = int(materialization.materialized_bytes)
+                if catalog is not None:
+                    catalog.update_materialized(
+                        state_id,
+                        manifests=descriptor.manifests,
+                        owner_node_id=descriptor.owner_node_id,
+                        target_node_id=target,
+                        materialized_bytes=materialized_bytes,
+                        expected_version=(
+                            catalog_record.catalog_version
+                            if catalog_record is not None
+                            else None
+                        ),
+                    )
+                record.kv_block_ids = list(descriptor.block_ids)
+                record.kv_logical_filled = [
+                    int(ref.filled) for ref in self.kv_state_store.get_refs(descriptor.state_id)
+                ]
+                record.kv_manifests = [manifest.as_control_payload() for manifest in descriptor.manifests]
+                record.reuse_telemetry = {
+                    **dict(record.reuse_telemetry),
+                    "agent_state_materialized": True,
+                    "materialized_bytes": materialized_bytes,
+                }
+                updated = registry.upsert_record(
+                    record,
+                    event="AGENT_STATE_STORE_MATERIALIZED",
+                    preserve_existing_handoff=True,
+                    preserve_existing_reuse=False,
+                )
+            except Exception:
+                with self._lock:
+                    self._metrics["agent_state_materialize_failures"] += 1
+                raise
+            with self._lock:
+                self._metrics["agent_state_materialize_success"] += 1
+            return {
+                "state_id": state_id,
+                "workflow_id": record.workflow_id,
+                "materialized": True,
+                "for_write": bool(for_write),
+                "target_node_id": target,
+                "clone_semantics": (
+                    "same_node_physical_zero_copy"
+                    if descriptor.owner_node_id == self.kv_state_store.node_id
+                    else "cross_node_materialized_copy"
+                ),
+                "kv_block_ids": list(descriptor.block_ids),
+                "kv_manifests": list(record.kv_manifests),
+                "manifest_checksums": [manifest.checksum for manifest in descriptor.manifests],
+                "materialized_bytes": materialized_bytes,
+                "backend": materialization.backend,
+                "connector_committed": materialization.committed,
+                "connector_commit": materialization.connector_metadata.get("connector_commit"),
+                "status": updated.status,
+            }
         block_records = {
             gid: self.kv_directory.get_record(gid)
             for gid in list(record.kv_block_ids)
@@ -1717,6 +2985,9 @@ class ServingControlPlane:
         if record is None:
             raise KeyError(f"unknown agent state_id={state_id}")
         if record.status == "RELEASED" and bool(record.reuse_telemetry.get("agent_state_release_complete")):
+            catalog_gc_objects = 0
+            if self.agent_state_catalog is not None:
+                catalog_gc_objects = self.agent_state_catalog.collect_garbage()
             return {
                 "state_id": state_id,
                 "workflow_id": record.workflow_id,
@@ -1727,7 +2998,112 @@ class ServingControlPlane:
                     for gid in list(record.kv_block_ids)
                 },
                 "orphans_swept": 0,
+                "catalog_gc_objects": catalog_gc_objects,
                 "status": "RELEASED",
+            }
+
+        store_state_id = self._serving_kv_state_ids.pop(state_id, None)
+        with self._lock:
+            for request_id, captured_state_id in list(self._agent_capture_by_request_id.items()):
+                if captured_state_id == state_id:
+                    self._agent_capture_by_request_id.pop(request_id, None)
+        catalog_record = (
+            self.agent_state_catalog.get_record(state_id)
+            if self.agent_state_catalog is not None
+            else None
+        )
+        if (
+            self.kv_state_store is not None
+            and store_state_id is None
+            and catalog_record is not None
+        ):
+            recovered_descriptor = self.kv_state_store.get_state(catalog_record.state_store_id)
+            if recovered_descriptor is not None:
+                store_state_id = recovered_descriptor.state_id
+            else:
+                # The previous process no longer owns allocator pages.  Do
+                # not materialize merely to release; journal the catalog-only
+                # cleanup so immutable Store objects can be reclaimed.
+                record.status = "RELEASED"
+                record.released_at = record.released_at or time.monotonic()
+                record.updated_at = time.monotonic()
+                record.reuse_telemetry = {
+                    **dict(record.reuse_telemetry),
+                    "agent_state_release_complete": True,
+                    "store_state_released": False,
+                    "catalog_recovery_release": True,
+                }
+                released = registry.upsert_record(
+                    record,
+                    event="AGENT_STATE_CATALOG_RECOVERY_RELEASED",
+                    preserve_existing_handoff=False,
+                    preserve_existing_reuse=False,
+                )
+                catalog_released = self.agent_state_catalog.release_state(state_id)
+                return {
+                    "state_id": state_id,
+                    "workflow_id": record.workflow_id,
+                    "released": True,
+                    "idempotent": False,
+                    "freed_pages": 0,
+                    "refcounts": {
+                        gid: self.kv_directory.refcount(gid)
+                        for gid in list(record.kv_block_ids)
+                    },
+                    "orphans_swept": 0,
+                    "catalog_gc_objects": int(catalog_released.gc_completed),
+                    "status": released.status,
+                }
+        if self.kv_state_store is not None and store_state_id is not None:
+            freed = self.kv_state_store.release_state(store_state_id)
+            record.status = "RELEASED"
+            record.released_at = record.released_at or time.monotonic()
+            record.updated_at = time.monotonic()
+            record.reuse_telemetry = {
+                **dict(record.reuse_telemetry),
+                "agent_state_release_complete": True,
+                "store_state_released": True,
+            }
+            released = registry.upsert_record(
+                record,
+                event="AGENT_STATE_STORE_RELEASED",
+                preserve_existing_handoff=False,
+                preserve_existing_reuse=False,
+            )
+            catalog_gc_objects = 0
+            if self.agent_state_catalog is not None and self.agent_state_catalog.get_record(state_id) is not None:
+                # Page deletion is deliberately after allocator release and
+                # registry journaling.  A Store failure remains retryable via
+                # the idempotent release branch above.
+                page_store = self.kv_state_store.kv_page_store
+                gc_before = (
+                    int(page_store.stats().get("gc_objects", 0))
+                    if page_store is not None
+                    else 0
+                )
+                self.agent_state_catalog.release_state(state_id)
+                gc_after = (
+                    int(page_store.stats().get("gc_objects", 0))
+                    if page_store is not None
+                    else gc_before
+                )
+                # ``release_state`` performs durable GC before it returns,
+                # so its cleared reclaim queue cannot be used as a count.
+                # The Store adapter is the authoritative observation point.
+                catalog_gc_objects = max(0, gc_after - gc_before)
+            return {
+                "state_id": state_id,
+                "workflow_id": record.workflow_id,
+                "released": True,
+                "idempotent": False,
+                "freed_pages": freed,
+                "refcounts": {
+                    gid: self.kv_state_store.pm.refcount(gid)
+                    for gid in list(record.kv_block_ids)
+                },
+                "orphans_swept": 0,
+                "catalog_gc_objects": catalog_gc_objects,
+                "status": released.status,
             }
 
         refcounts: Dict[str, int] = {}
@@ -1797,6 +3173,11 @@ class ServingControlPlane:
                 else []
             ),
             "kv_directory": self.kv_directory.stats(),
+            "catalog": (
+                self.agent_state_catalog.stats()
+                if self.agent_state_catalog is not None
+                else {"enabled": False}
+            ),
             "orphans_swept": swept,
             "clone_semantics": {
                 "same_node": "block_ref_zero_copy",
@@ -1818,6 +3199,14 @@ class ServingControlPlane:
             return 0
         now_f = time.monotonic() if now is None else float(now)
         released = 0
+        # The state-store owns physical page leases.  Sweep it before the
+        # registry records so a crash-recovered catalog cannot leave pages
+        # retained merely because its in-memory state-id map was lost.
+        if self.kv_state_store is not None:
+            released += self.kv_state_store.sweep_expired_states(now=now_f)
+            for public_state_id, store_state_id in list(self._serving_kv_state_ids.items()):
+                if self.kv_state_store.get_state(store_state_id) is None:
+                    self._serving_kv_state_ids.pop(public_state_id, None)
         registry = self.workflow_registry
         if registry is not None:
             for record in list(registry.all_records()):
@@ -2437,6 +3826,17 @@ class ServingControlPlane:
     def _pool_tags_for_worker(self, stage: str, worker_id: str, *, ordinal: int, total: int) -> List[str]:
         stage = str(stage).lower()
         worker_id = str(worker_id)
+        # A one-worker stage is not physically partitioned into role pools.
+        # Deployment generation may still designate that worker as the first
+        # high/low member, but treating the explicit label as exclusive makes
+        # an otherwise valid interactive or thinking request look misrouted.
+        # Advertise both logical capabilities so Agent-PD correctness metrics
+        # describe the real 1P1D deployment rather than a nonexistent pool.
+        if int(total) <= 1:
+            if stage == "prefill":
+                return ["high_prefill_pool", "standard_prefill_pool"]
+            if stage == "decode":
+                return ["low_latency_decode_pool", "standard_decode_pool"]
         lowered = worker_id.lower()
         tags: List[str] = []
         if stage == "prefill":
@@ -2447,9 +3847,7 @@ class ServingControlPlane:
             if worker_id in explicit_standard or "standard" in lowered or "interactive" in lowered:
                 tags.append("standard_prefill_pool")
             if not tags:
-                if total <= 1:
-                    tags.extend(["high_prefill_pool", "standard_prefill_pool"])
-                elif ordinal == 0:
+                if ordinal == 0:
                     tags.append("high_prefill_pool")
                 else:
                     tags.append("standard_prefill_pool")
@@ -2461,9 +3859,7 @@ class ServingControlPlane:
             if worker_id in explicit_standard or "standard" in lowered or "thinking" in lowered:
                 tags.append("standard_decode_pool")
             if not tags:
-                if total <= 1:
-                    tags.extend(["low_latency_decode_pool", "standard_decode_pool"])
-                elif ordinal == 0:
+                if ordinal == 0:
                     tags.append("low_latency_decode_pool")
                 else:
                     tags.append("standard_decode_pool")
@@ -2585,8 +3981,8 @@ class ServingControlPlane:
         worker = decision.worker
         if worker is None:
             return
-        worker.current_load = max(0, worker.current_load - 1)
         worker.queue_size = max(0, worker.queue_size - 1)
+        worker.queued_requests = worker.queue_size
 
     def _record_arrival(self, worker_id: str) -> None:
         now = time.monotonic()
@@ -2748,10 +4144,46 @@ class ServingControlPlane:
             "worker_type": worker.worker_type,
             "current_load": worker.current_load,
             "queue_size": worker.queue_size,
+            "queued_requests": worker.queued_requests,
+            "running_requests": worker.running_requests,
+            "first_token_pending": worker.first_token_pending,
+            "active_decode_sequences": worker.active_decode_sequences,
+            "queued_tokens": worker.queued_tokens,
+            "running_tokens": worker.running_tokens,
+            "active_decode_tokens": worker.active_decode_tokens,
+            "avg_queue_wait_ms": worker.avg_queue_wait_ms,
+            "avg_first_token_ms": worker.avg_first_token_ms,
+            "avg_completion_ms": worker.avg_completion_ms,
             "avg_latency_ms": worker.avg_latency_ms,
             "gpu_utilization": worker.gpu_utilization,
             "service_rate": worker.service_rate,
             "arrival_rate": worker.arrival_rate,
             "rho": rho,
             "pool_tags": list(getattr(worker, "pool_tags", []) or []),
+            "telemetry": {
+                field_name: (
+                    getattr(worker, field_name)
+                    if worker.telemetry_is_known(field_name)
+                    else None
+                )
+                for field_name in (
+                    "gpu_utilization",
+                    "gpu_memory_bytes",
+                    "gpu_memory_free_bytes",
+                    "kv_free_blocks",
+                    "kv_cache_usage",
+                    "avg_tpot_ms",
+                    "output_tokens_per_s",
+                    "transfer_backlog_bytes",
+                    "transfer_bandwidth_bytes_per_s",
+                    "connector_lock_wait_ms",
+                    "http_queue_depth",
+                )
+            },
+            "telemetry_known": {
+                field_name: worker.telemetry_is_known(field_name)
+                for field_name in worker.telemetry_known
+            },
+            "telemetry_source": worker.telemetry_source,
+            "telemetry_updated_at": worker.telemetry_updated_at,
         }

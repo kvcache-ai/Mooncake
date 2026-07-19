@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mooncake-epd"
+version = "0.1.0"
+description = "Optional vLLM EPD, Agent state, and Omni prototype for Mooncake"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24",
+  "Pillow>=10",
+  "torch>=2.4",
+]
+
+[project.optional-dependencies]
+serving = [
+  "fastapi>=0.110",
+  "httpx>=0.27",
+  "uvicorn>=0.29",
+  "vllm==0.23.0",
+]
+test = ["pytest>=8", "pytest-timeout>=2"]
+
+[tool.setuptools]
+# Build artifacts and test modules can exist under this source directory after
+# local validation. They are not runtime packages and must never recursively
+# re-enter the distributable wheel.
+include-package-data = false
+
+[tool.setuptools.packages.find]
+where = [".."]
+include = ["mooncake_epd", "mooncake_epd.*"]
+exclude = [
+  "mooncake_epd.build*",
+  "mooncake_epd.tests*",
+  # ``compileall``/test runs can leave bytecode directories beside source
+  # packages. They are neither importable source packages nor distributable
+  # runtime data, and must not leak into a wheel.
+  "mooncake_epd.__pycache__*",
+  "mooncake_epd.*.__pycache__*",
+]
+namespaces = false

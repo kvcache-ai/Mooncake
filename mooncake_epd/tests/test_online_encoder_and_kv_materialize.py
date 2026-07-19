@@ -176,10 +176,134 @@ def test_online_encoder_service_publishes_direct_engine_feature_handle():
     assert handle["metadata"]["direct_bytes"] == 280
     assert handle["metadata"]["direct_transfer_timings_ms"]["write_ms"] >= 0.0
     assert fake.calls and fake.calls[0][0] == "prefill-session"
-
     provider = FeatureHandleProvider(FeatureHandleProviderConfig(device="cpu", strict=True))
     with pytest.raises(FeatureHandleError, match="epd-direct FeatureHandle"):
         provider.resolve_from_sources({"mm_feature_handles": [handle]}, device="cpu", dtype=torch.float32)
+
+
+def test_online_encoder_service_batches_multimodal_direct_publish_by_prefill_session():
+    """The describe/publish handshake must not issue one write per image."""
+
+    direct_engine = TransferEngine(protocol="tcp")
+    fake = _FakeMooncakeEngine()
+    direct_engine.bind_mooncake_backend(fake, initialized=True, owns_backend=False)
+    app = create_encoder_app(
+        EncoderServiceConfig(
+            publish_backend="direct_engine",
+            device="cpu",
+        ),
+        encoder=_DummyEncoder(),
+        direct_transfer_engine=direct_engine,
+    )
+    body = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": _png_data_url()}},
+                    {"type": "image_url", "image_url": {"url": _png_data_url()}},
+                    {"type": "text", "text": "describe both"},
+                ],
+            }
+        ]
+    }
+    targets = []
+    for image_index in range(2):
+        base = 100_000 + image_index * 20_000
+        targets.append(
+            {
+                "remote_session": "prefill-session",
+                "remote_pointers": {
+                    "last_hidden": base,
+                    "last_hidden:nbytes": 4 * 8 * 4,
+                    "grid_thw": base + 4_000,
+                    "grid_thw:nbytes": 1 * 3 * 8,
+                    "intermediate:1:0": base + 8_000,
+                    "intermediate:1:0:nbytes": 4 * 8 * 4,
+                },
+            }
+        )
+
+    with TestClient(app) as client:
+        describe = client.post("/describe", json=body)
+        assert describe.status_code == 200, describe.text
+        response = client.post(
+            "/publish_direct",
+            json={
+                "ticket": describe.json()["ticket"],
+                "metadata": {"mooncake_epd_direct_feature_targets": targets},
+            },
+        )
+        assert response.status_code == 200, response.text
+        payload = response.json()
+
+    assert payload["count"] == 2
+    assert len(fake.calls) == 1
+    remote_session, local_ptrs, remote_ptrs, lengths = fake.calls[0]
+    assert remote_session == "prefill-session"
+    assert len(local_ptrs) == len(remote_ptrs) == len(lengths) == 6
+    assert [handle["metadata"]["direct_transfer_timings_ms"]["batch_index"] for handle in payload["handles"]] == [
+        0.0,
+        1.0,
+    ]
+    assert all(
+        handle["metadata"]["direct_transfer_timings_ms"]["batch_feature_count"] == 2.0
+        for handle in payload["handles"]
+    )
+
+
+def test_online_encoder_service_batches_multimodal_compat_encode_direct_publish():
+    """The legacy /encode path retains the same E->P batching behavior."""
+
+    direct_engine = TransferEngine(protocol="tcp")
+    fake = _FakeMooncakeEngine()
+    direct_engine.bind_mooncake_backend(fake, initialized=True, owns_backend=False)
+    app = create_encoder_app(
+        EncoderServiceConfig(publish_backend="direct_engine", device="cpu"),
+        encoder=_DummyEncoder(),
+        direct_transfer_engine=direct_engine,
+    )
+    targets = []
+    for image_index in range(2):
+        base = 140_000 + image_index * 20_000
+        targets.append(
+            {
+                "remote_session": "prefill-session",
+                "remote_pointers": {
+                    "last_hidden": base,
+                    "last_hidden:nbytes": 4 * 8 * 4,
+                    "grid_thw": base + 4_000,
+                    "grid_thw:nbytes": 1 * 3 * 8,
+                    "intermediate:1:0": base + 8_000,
+                    "intermediate:1:0:nbytes": 4 * 8 * 4,
+                },
+            }
+        )
+    body = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": _png_data_url()}},
+                    {"type": "image_url", "image_url": {"url": _png_data_url()}},
+                ],
+            }
+        ],
+        "metadata": {"mooncake_epd_direct_feature_targets": targets},
+    }
+
+    with TestClient(app) as client:
+        response = client.post("/encode", json=body)
+        assert response.status_code == 200, response.text
+        payload = response.json()
+
+    assert payload["count"] == 2
+    assert len(fake.calls) == 1
+    assert len(fake.calls[0][1]) == 6
+    assert [handle["metadata"]["direct_transfer_timings_ms"]["batch_index"] for handle in payload["handles"]] == [
+        0.0,
+        1.0,
+    ]
 
 
 @pytest.mark.filterwarnings("ignore::DeprecationWarning")
@@ -346,6 +470,56 @@ def test_direct_feature_buffer_service_allocates_and_releases():
         assert client.get("/stats").json()["allocations"] == 1
         released = client.post("/release", json={"feature_ids": ["img-direct"]})
         assert released.status_code == 200
+        assert released.json()["stats"]["allocations"] == 0
+
+
+def test_direct_feature_buffer_service_reserves_and_releases_lookup_leases(monkeypatch):
+    from mooncake_epd.core.state import DirectFeatureBufferRegistry
+    from mooncake_epd.scripts import direct_feature_buffer_service as direct_service
+
+    create_direct_app = direct_service.create_app
+
+    bundle = FeatureBundle(
+        image_hash="img-direct-lease",
+        last_hidden=torch.ones((2, 3), dtype=torch.float32),
+    )
+    registry = DirectFeatureBufferRegistry(
+        worker_id="prefill-0",
+        device="cpu",
+        remote_session="prefill-session",
+        register_memory=False,
+    )
+    original_to_thread = direct_service.asyncio.to_thread
+    offloaded_calls: list[str] = []
+
+    async def tracking_to_thread(func, /, *args, **kwargs):
+        offloaded_calls.append(str(getattr(func, "__name__", "")))
+        return await original_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(direct_service.asyncio, "to_thread", tracking_to_thread)
+    app = create_direct_app(registry=registry)
+    with TestClient(app) as client:
+        allocated = client.post(
+            "/allocate", json={"descriptors": [bundle.descriptor().to_dict()]}
+        )
+        assert allocated.status_code == 200, allocated.text
+        assert client.post("/mark_ready", json={"feature_ids": [bundle.image_hash]}).status_code == 200
+        offloaded_calls.clear()
+        lookup = client.post(
+            "/lookup",
+            json={"feature_ids": [bundle.image_hash], "lease_count": 3},
+        )
+        assert lookup.status_code == 200, lookup.text
+        assert lookup.json()["lease_count"] == 3
+        assert lookup.json()["hits"][0]["target"]["lease_count"] == 3
+        assert lookup.json()["server_lookup_ms"] >= 0.0
+        assert offloaded_calls == ["_lookup_ready_targets"]
+        assert client.get("/stats").json()["ref_count"] == 4
+        released = client.post(
+            "/release",
+            json={"feature_ids": [bundle.image_hash] * 4},
+        )
+        assert released.status_code == 200, released.text
         assert released.json()["stats"]["allocations"] == 0
 
 
@@ -733,6 +907,115 @@ def test_proxy_direct_feature_singleflight_deduplicates_concurrent_publish(monke
     assert second[0]["metadata"]["direct_backend"] == "prefill_proxy_handle_cache"
     assert app.state.direct_feature_handle_singleflight_stats["created"] == 1
     assert app.state.direct_feature_handle_singleflight_stats["joined"] >= 1
+
+
+def test_proxy_direct_feature_singleflight_releases_followers_to_parallel_hot_lookups(monkeypatch):
+    """Only a cold E→P publish may be single-flighted.
+
+    Once the leader has made the direct buffer ready, every follower needs an
+    independent registry lease but must not wait behind other followers'
+    control-plane lookups.  This models the repeated-image portion of a C16
+    burst and protects the TTFT optimization from regressing to a per-image
+    serial queue.
+    """
+
+    import asyncio
+
+    from fastapi import FastAPI
+    import mooncake_epd.scripts.vllm_disagg_proxy as proxy_mod
+
+    app = FastAPI()
+    app.state.proxy_config = ProxyConfig(
+        encoder_service_url="http://encoder.local",
+        prefill_direct_buffer_service_url="http://prefill-direct.local",
+        release_direct_feature_buffers_after_prefill=True,
+    )
+    app.state.direct_feature_handle_singleflight_stats = {
+        "created": 0,
+        "joined": 0,
+        "evicted": 0,
+        "active": 0,
+    }
+    app.state.direct_feature_handle_inflight_flights = {}
+    state = {"ready": False, "publishes": 0, "active_lookups": 0, "max_active_lookups": 0}
+
+    def handle() -> dict:
+        return {
+            "handle_id": "h-img-parallel",
+            "feature_id": "img-parallel",
+            "store_id": "direct",
+            "uri": "epd-direct://direct/img-parallel",
+            "descriptor": {
+                "feature_id": "img-parallel",
+                "last_hidden": {
+                    "name": "last_hidden",
+                    "shape": [1, 1],
+                    "dtype": "float32",
+                    "nbytes": 4,
+                },
+                "grid_thw": None,
+                "intermediates": [],
+                "metadata": {},
+                "checksum": "abc",
+            },
+            "metadata": {
+                "direct_remote_session": "prefill-session",
+                "direct_plan": {
+                    "feature_id": "img-parallel",
+                    "targets": [
+                        {"name": "last_hidden", "remote_pointer": 1234, "nbytes": 4}
+                    ],
+                },
+            },
+            "target_worker_id": "prefill-0",
+        }
+
+    async def fake_lookup(*, app, feature_ids, target_worker_id):
+        assert feature_ids == ["img-parallel"]
+        assert target_worker_id == "prefill-0"
+        if not state["ready"]:
+            return []
+        state["active_lookups"] += 1
+        state["max_active_lookups"] = max(
+            state["max_active_lookups"], state["active_lookups"]
+        )
+        try:
+            # Yield long enough that every follower can enter the hot path.
+            await asyncio.sleep(0.03)
+            return [handle()]
+        finally:
+            state["active_lookups"] -= 1
+
+    async def fake_request(*, app, req_data, target_worker_id):
+        state["publishes"] += 1
+        await asyncio.sleep(0.05)
+        state["ready"] = True
+        return [handle()]
+
+    monkeypatch.setattr(proxy_mod, "_lookup_prefill_cached_direct_feature_handles", fake_lookup)
+    monkeypatch.setattr(proxy_mod, "_request_feature_handles_from_encoder_service", fake_request)
+
+    async def run_burst():
+        return await asyncio.gather(
+            *(
+                proxy_mod._request_feature_handles_from_encoder_service_singleflight(
+                    app=app,
+                    req_data={"metadata": {}},
+                    target_worker_id="prefill-0",
+                    feature_ids=["img-parallel"],
+                )
+                for _ in range(4)
+            )
+        )
+
+    results = asyncio.run(run_burst())
+
+    assert state["publishes"] == 1
+    assert state["max_active_lookups"] >= 2
+    assert all(items[0]["feature_id"] == "img-parallel" for items in results)
+    assert app.state.direct_feature_handle_singleflight_stats["created"] == 1
+    assert app.state.direct_feature_handle_singleflight_stats["joined"] >= 3
+    assert app.state.direct_feature_handle_inflight_flights == {}
 
 
 def test_proxy_direct_feature_handle_cache_is_bounded_and_ttl_expired(monkeypatch):

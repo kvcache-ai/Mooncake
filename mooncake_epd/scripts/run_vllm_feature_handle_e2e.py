@@ -196,7 +196,17 @@ def summarize_feature_handle_metrics(metrics_payload: Dict[str, Any]) -> Dict[st
         "peer_buffer_prepare_ms_avg": float(metrics.get("peer_buffer_prepare_ms_avg", 0.0) or 0.0),
         "peer_buffer_write_ms": float(metrics.get("peer_buffer_write_ms", 0.0) or 0.0),
         "peer_buffer_write_ms_avg": float(metrics.get("peer_buffer_write_ms_avg", 0.0) or 0.0),
+        "peer_buffer_native_engine_lock_wait_ms": float(
+            metrics.get("peer_buffer_native_engine_lock_wait_ms", 0.0) or 0.0
+        ),
+        "peer_buffer_native_engine_lock_wait_ms_avg": float(
+            metrics.get("peer_buffer_native_engine_lock_wait_ms_avg", 0.0) or 0.0
+        ),
         "peer_buffer_write_bandwidth_gbps": float(metrics.get("peer_buffer_write_bandwidth_gbps", 0.0) or 0.0),
+        "layered_source_ready_event_waits": int(metrics.get("layered_source_ready_event_waits", 0) or 0),
+        "layered_source_ready_event_wait_ms": float(metrics.get("layered_source_ready_event_wait_ms", 0.0) or 0.0),
+        "layered_source_ready_event_wait_ms_avg": float(metrics.get("layered_source_ready_event_wait_ms_avg", 0.0) or 0.0),
+        "layered_source_ready_sync_fallbacks": int(metrics.get("layered_source_ready_sync_fallbacks", 0) or 0),
         "layered_receive_kv_requests": int(metrics.get("layered_receive_kv_requests", 0) or 0),
         "layered_receive_kv_worker_roundtrips": int(metrics.get("layered_receive_kv_worker_roundtrips", 0) or 0),
         "layered_receive_kv_worker_ms_avg": float(metrics.get("layered_receive_kv_worker_ms_avg", 0.0) or 0.0),

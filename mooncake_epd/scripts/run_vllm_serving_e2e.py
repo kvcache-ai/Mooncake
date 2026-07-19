@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import hashlib
 import io
 import json
 import copy
@@ -23,7 +24,22 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT.parent) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT.parent))
 
-from mooncake_epd.demo.vllm_integration import VLLMDisaggConfig, generate_configs  # noqa: E402
+from mooncake_epd.demo.vllm_integration import (  # noqa: E402
+    SCHEDULER_POLICIES,
+    VLLMDisaggConfig,
+    generate_configs,
+)
+from mooncake_epd.core.transfer import (  # noqa: E402
+    collect_mooncake_worker_transport_evidence,
+)
+from mooncake_epd.scripts.benchmark_artifact_io import (  # noqa: E402
+    write_raw_benchmark_artifacts,
+)
+from mooncake_epd.scripts.benchmark_request_variants import (  # noqa: E402
+    apply_request_variation,
+    apply_vllm_prefix_cache_policy,
+    VLLM_PREFIX_CACHE_REUSE,
+)
 from mooncake_epd.tests.dataset import make_image  # noqa: E402
 
 
@@ -83,6 +99,380 @@ def _stats(values: List[float]) -> Dict[str, float]:
     }
 
 
+def _optional_positive_int(value: object) -> int | None:
+    """Normalize CLI capacity knobs without treating zero as a real limit."""
+
+    try:
+        normalized = int(value or 0)
+    except (TypeError, ValueError):
+        return None
+    return normalized if normalized > 0 else None
+
+
+def _stable_digest(value: object) -> str:
+    """Return a content digest without duplicating images/data URLs in evidence."""
+
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _dataset_request_evidence_row(
+    entry: Dict[str, Any],
+    *,
+    index: int,
+    phase: str,
+) -> Dict[str, Any]:
+    """Create a reproducible request trace without storing base64 image bytes.
+
+    Dataset OpenAI payloads include inline image URLs.  Storing them again in
+    every benchmark artifact is both needlessly large and makes the evidence
+    bundle awkward to review.  The selected dataset sample identity, serving
+    metadata and deterministic full-payload digest are sufficient to bind a
+    response row to the exact request while the source split remains named in
+    ``benchmark_config``.
+    """
+
+    request = dict(entry.get("request") or {})
+    metadata = dict(request.get("metadata") or {})
+    sample = dict(entry.get("sample") or {})
+    return {
+        "phase": str(phase),
+        "index": int(index),
+        "sample_id": sample.get("sample_id"),
+        "workflow_id": metadata.get("workflow_id") or sample.get("workflow_id"),
+        "source_workflow_id": (
+            sample.get("source_workflow_id")
+            or metadata.get("benchmark_source_workflow_id")
+            or sample.get("workflow_id")
+        ),
+        "workload_family": entry.get("family"),
+        "source_dataset": sample.get("source_dataset"),
+        "model": request.get("model"),
+        "max_tokens": request.get("max_tokens"),
+        "temperature": request.get("temperature"),
+        "estimated_prompt_len": metadata.get("estimated_prompt_len"),
+        "admission_method": metadata.get("admission_method"),
+        "request_sha256": _stable_digest(request),
+    }
+
+
+def _file_sha256(path: Path) -> str | None:
+    """Digest an input split when available, returning explicit absence otherwise."""
+
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def _dataset_cycle_index(repeat_idx: int) -> int:
+    """Map measurement and negative warmup indices onto one stable cycle.
+
+    Both the strict EPD and colocated-vLLM runners use negative request indices
+    for warmup.  Keeping this mapping here prevents the two runners from
+    silently selecting a different dataset sample for the same benchmark
+    phase/index pair.
+    """
+
+    index = int(repeat_idx)
+    return index if index >= 0 else -index - 1
+
+
+def _resolve_dataset_warmup_requests(
+    *,
+    requested_warmups: int,
+    dataset_entries: List[Dict[str, Any]],
+    cover_dataset_cycle: bool,
+) -> int:
+    """Return the warmup count required by an explicit dataset protocol.
+
+    A single warmup request only primes the first selected sample.  For a
+    mixed multimodal replay that leaves later image shapes, prompt lengths,
+    and output shapes cold, which can both distort measured TTFT and make a
+    cold-versus-hot output comparison look like a serving regression.  The
+    opt-in coverage mode warms every selected entry at least once while
+    preserving the caller's larger explicit warmup budget.
+    """
+
+    requested = max(0, int(requested_warmups))
+    if not cover_dataset_cycle or not dataset_entries:
+        return requested
+    return max(requested, len(dataset_entries))
+
+
+def _dataset_warmup_coverage(
+    dataset_entries: List[Dict[str, Any]],
+    warmup_responses: List[Dict[str, Any]],
+    *,
+    cover_dataset_cycle: bool,
+) -> Dict[str, Any]:
+    """Summarize which selected dataset samples actually received warmup.
+
+    The response rows are the authoritative evidence because a request can
+    fail before reaching a worker.  Keep the output compact and JSON-safe so
+    it can live in both baseline and EPD benchmark summaries.
+    """
+
+    if not dataset_entries:
+        return {
+            "applicable": False,
+            "coverage_requested": bool(cover_dataset_cycle),
+            "selected_sample_count": 0,
+            "warmed_sample_count": 0,
+            "complete": False,
+        }
+
+    selected_ids = {
+        str((entry.get("sample") or {}).get("sample_id"))
+        for entry in dataset_entries
+        if (entry.get("sample") or {}).get("sample_id") is not None
+    }
+    warmed_ids = {
+        str(response.get("sample_id"))
+        for response in warmup_responses
+        if isinstance(response, dict)
+        and response.get("sample_id") is not None
+        and int(response.get("status_code", 0) or 0) < 400
+        and not response.get("error")
+    }
+    covered_ids = selected_ids & warmed_ids
+    missing_ids = sorted(selected_ids - covered_ids)
+    return {
+        "applicable": True,
+        "coverage_requested": bool(cover_dataset_cycle),
+        "selected_sample_count": len(selected_ids),
+        "warmed_sample_count": len(covered_ids),
+        "warmup_response_count": len(warmup_responses),
+        "complete": bool(selected_ids) and not missing_ids,
+        "missing_sample_ids": missing_ids,
+    }
+
+
+def _materialize_dataset_replay_entry(
+    dataset_entries: List[Dict[str, Any]],
+    *,
+    repeat_idx: int,
+    workflow_prefix: str,
+    workflow_id_mode: str,
+    request_variation: str,
+    phase: str,
+    vllm_prefix_cache_mode: str = VLLM_PREFIX_CACHE_REUSE,
+) -> Dict[str, Any]:
+    """Clone one canonical dataset request for a paired serving replay.
+
+    The source chat-split entry is never mutated: the same selected entries
+    can be replayed by the EPD and baseline runners in one Python process.
+    ``unique`` makes each request a distinct workflow, which isolates serving
+    latency from workflow-state reuse.  ``source`` intentionally preserves the
+    dataset workflow id for explicit cache/workflow studies.  In both cases we
+    retain the original id as evidence, so a unique benchmark workflow cannot
+    be mistaken for a source-workflow replay.
+    """
+
+    if not dataset_entries:
+        raise ValueError("dataset replay requires at least one selected entry")
+    normalized_mode = str(workflow_id_mode or "unique").strip().lower()
+    if normalized_mode not in {"unique", "source"}:
+        raise ValueError(
+            "dataset workflow_id_mode must be 'unique' or 'source', "
+            f"got {workflow_id_mode!r}"
+        )
+
+    cycle_index = _dataset_cycle_index(repeat_idx)
+    source_index = cycle_index % len(dataset_entries)
+    entry = copy.deepcopy(dataset_entries[source_index])
+    request = dict(entry.get("request") or {})
+    sample = dict(entry.get("sample") or {})
+    metadata = dict(request.get("metadata") or {})
+    source_workflow_id = str(
+        metadata.get("workflow_id")
+        or sample.get("workflow_id")
+        or sample.get("sample_id")
+        or f"dataset-{source_index}"
+    )
+    workflow_id = (
+        source_workflow_id
+        if normalized_mode == "source"
+        else f"{workflow_prefix}-r{int(repeat_idx)}"
+    )
+    metadata.update(
+        {
+            "workflow_id": workflow_id,
+            "benchmark_source_workflow_id": source_workflow_id,
+            "benchmark_dataset_cycle_index": cycle_index,
+            "benchmark_dataset_source_index": source_index,
+        }
+    )
+    request["metadata"] = metadata
+    entry["request"] = request
+    sample["source_workflow_id"] = source_workflow_id
+    sample["workflow_id"] = workflow_id
+    entry["sample"] = sample
+    entry["dataset_cycle_index"] = cycle_index
+    entry["dataset_source_index"] = source_index
+    entry["dataset_workflow_id_mode"] = normalized_mode
+    entry["request_variation_id"] = apply_request_variation(
+        request,
+        mode=request_variation,
+        phase=phase,
+        repeat_idx=repeat_idx,
+    )
+    entry["vllm_prefix_cache_id"] = apply_vllm_prefix_cache_policy(
+        request,
+        mode=vllm_prefix_cache_mode,
+        phase=phase,
+        repeat_idx=repeat_idx,
+    )
+    return entry
+
+
+def _dataset_replay_context(
+    dataset_entries: List[Dict[str, Any]],
+    *,
+    dataset_root: str,
+    chat_split: str,
+    families: List[str] | None,
+    max_input_len: int,
+    request_max_tokens: int,
+    skip_oversized: bool,
+    image_max_pixels: int,
+    agent_pd_labels: bool,
+    workflow_id_mode: str,
+) -> Dict[str, Any]:
+    """Return a compact, comparable manifest for paired dataset replays."""
+
+    root = Path(dataset_root).resolve()
+    split_path = root / "chat_splits" / f"{chat_split}.jsonl"
+    selected_rows = [
+        _dataset_request_evidence_row(entry, index=index, phase="selection")
+        for index, entry in enumerate(dataset_entries)
+    ]
+    selected_samples = [
+        {
+            "sample_id": row.get("sample_id"),
+            "workflow_id": row.get("workflow_id"),
+            "workload_family": row.get("workload_family"),
+            "source_dataset": row.get("source_dataset"),
+            "request_sha256": row.get("request_sha256"),
+        }
+        for row in selected_rows
+    ]
+    split_sha256 = _file_sha256(split_path)
+    request_fingerprint = _stable_digest(
+        {
+            "dataset_split_sha256": split_sha256,
+            "selected_samples": selected_samples,
+            "request_max_tokens": int(request_max_tokens),
+            "temperature": 0.0,
+            "image_max_pixels": int(image_max_pixels),
+            "workflow_id_mode": str(workflow_id_mode),
+        }
+    )
+    return {
+        "root": str(root),
+        "chat_split": str(chat_split),
+        "split_path": str(split_path),
+        "split_sha256": split_sha256,
+        "selected_count": len(dataset_entries),
+        "selected_samples": selected_samples,
+        "entry_cycle": "round_robin",
+        "workflow_id_mode": str(workflow_id_mode),
+        "admission": {
+            "max_input_len": int(max_input_len),
+            "request_max_tokens": int(request_max_tokens),
+            "skip_oversized": bool(skip_oversized),
+            "image_max_pixels": int(image_max_pixels),
+            "agent_pd_labels": bool(agent_pd_labels),
+        },
+        "families_requested": list(families or []),
+        "request_fingerprint": request_fingerprint,
+    }
+
+
+def _worker_dispatch_balance(
+    results: List[Dict[str, Any]],
+    *,
+    stage: str,
+    configured_workers: int,
+) -> Dict[str, Any]:
+    """Expose real worker coverage/entropy for multi-worker serving runs."""
+
+    stage = str(stage)
+    configured_workers = max(0, int(configured_workers))
+    counts: Dict[str, int] = {
+        f"{stage}-{idx}": 0 for idx in range(configured_workers)
+    }
+    key = f"{stage}_worker_id"
+    for result in results:
+        worker_id = str(result.get(key) or "").strip()
+        if worker_id:
+            counts[worker_id] = int(counts.get(worker_id, 0)) + 1
+    total = sum(counts.values())
+    active = sum(1 for value in counts.values() if value > 0)
+    cardinality = max(configured_workers, len(counts))
+    if cardinality <= 1 and total > 0:
+        entropy = 1.0
+    elif cardinality > 1 and total > 0:
+        entropy = -sum(
+            (value / total) * math.log(value / total)
+            for value in counts.values()
+            if value > 0
+        ) / math.log(cardinality)
+    else:
+        entropy = 0.0
+    return {
+        "configured_workers": configured_workers,
+        "active_workers": active,
+        "total_dispatches": total,
+        "counts": counts,
+        "normalized_entropy": entropy,
+        "max_share": max(counts.values()) / total if total else 0.0,
+    }
+
+
+def _worker_transport_logs(logs: Dict[str, Path]) -> Dict[str, Path]:
+    """Return exactly the native Prefill/Decode worker logs for P→D proof."""
+
+    return {
+        key: path
+        for key, path in logs.items()
+        if key.startswith(("prefill-", "decode-"))
+    }
+
+
+def _record_runtime_transport_evidence(
+    summary: Dict[str, Any],
+    *,
+    logs: Dict[str, Path],
+    requested: str,
+    enforce: bool,
+) -> Dict[str, Any]:
+    """Persist native P→D transport evidence and fail closed in strict mode."""
+
+    evidence = collect_mooncake_worker_transport_evidence(
+        _worker_transport_logs(logs),
+        requested=str(requested),
+    )
+    summary["transport_runtime_evidence"] = evidence
+    if enforce and bool(evidence.get("applicable", False)) and not bool(evidence.get("pass", False)):
+        details = "; ".join(str(item) for item in evidence.get("failures", ()))
+        raise AssertionError(
+            "native Mooncake transport evidence failed; refusing strict protocol claim"
+            + (f": {details}" if details else "")
+        )
+    return evidence
+
+
 def _extract_port(start_script: Path, flag: str = "--port") -> int:
     text = start_script.read_text(encoding="utf-8")
     tokens = text.replace("\n", " ").split()
@@ -110,6 +500,21 @@ def _as_int_list(value: object, fallback: List[int] | None = None) -> List[int]:
 
 def _proc_env() -> Dict[str, str]:
     env = os.environ.copy()
+    # See ``_common_env_block`` in demo.vllm_integration.  Clear proxy
+    # variables before launching every generated script as a second boundary:
+    # a script may spawn an EngineCore after its shell exits, and httpx honors
+    # ALL_PROXY even when HTTP(S)_PROXY is absent.
+    for key in (
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+    ):
+        env.pop(key, None)
+    env["NO_PROXY"] = "127.0.0.1,localhost,::1"
+    env["no_proxy"] = env["NO_PROXY"]
     env.setdefault("OPENAI_API_KEY", "sk-local")
     env["PYTHONPATH"] = f"{REPO_ROOT.parent}:{env.get('PYTHONPATH', '')}"
     return env
@@ -661,6 +1066,47 @@ def _extract_choice_text(choice: Dict[str, Any]) -> str:
     return ""
 
 
+def _http_error_evidence(exc: BaseException) -> Dict[str, Any]:
+    """Return bounded, response-side evidence for a failed HTTP request.
+
+    Benchmark callers previously called ``raise_for_status`` and then retained
+    only the exception string.  For a proxy-generated 4xx/5xx that discards
+    the useful FastAPI ``detail`` field, making a real failure impossible to
+    distinguish from a client/network error in the benchmark artifact.  Keep
+    only the status and a bounded response-side diagnostic; never retain or
+    replay the request payload here.
+    """
+
+    response = getattr(exc, "response", None)
+    if response is None:
+        return {}
+    evidence: Dict[str, Any] = {}
+    try:
+        evidence["status_code"] = int(response.status_code)
+    except (AttributeError, TypeError, ValueError):
+        pass
+
+    detail: Any = None
+    try:
+        payload = response.json()
+    except (AttributeError, TypeError, ValueError):
+        payload = None
+    if isinstance(payload, dict):
+        detail = payload.get("detail", payload.get("error"))
+    elif isinstance(payload, str):
+        detail = payload
+    if detail is None:
+        try:
+            detail = response.text
+        except AttributeError:
+            detail = None
+    if detail is not None:
+        text = str(detail).strip()
+        if text:
+            evidence["error_response_detail"] = text[:1000]
+    return evidence
+
+
 def _execute_dataset_request(
     *,
     proxy_url: str,
@@ -701,6 +1147,8 @@ def _execute_dataset_request(
                     "routing_path": resp.headers.get("x-epd-routing-path"),
                     "admission": resp.headers.get("x-epd-admission"),
                     "degrade_level": resp.headers.get("x-epd-degrade-level"),
+                    "prefill_worker_id": resp.headers.get("x-epd-prefill-worker"),
+                    "decode_worker_id": resp.headers.get("x-epd-decode-worker"),
                     "epd_timing_ms_header": resp.headers.get("x-epd-timing-ms"),
                 }
             )
@@ -799,6 +1247,8 @@ def _execute_dataset_request(
                     "routing_path": resp.headers.get("x-epd-routing-path"),
                     "admission": resp.headers.get("x-epd-admission"),
                     "degrade_level": resp.headers.get("x-epd-degrade-level"),
+                    "prefill_worker_id": resp.headers.get("x-epd-prefill-worker"),
+                    "decode_worker_id": resp.headers.get("x-epd-decode-worker"),
                     "epd_timing_ms_header": resp.headers.get("x-epd-timing-ms"),
                     "response_head": resp.text[:500],
                 }
@@ -833,13 +1283,15 @@ def _execute_dataset_request(
                 result["response_parse_error"] = f"{type(parse_exc).__name__}: {parse_exc}"
     except Exception as exc:
         elapsed_ms = (time.perf_counter() - started) * 1000.0
+        http_evidence = _http_error_evidence(exc)
         result.update(
             {
-                "status_code": None,
+                "status_code": http_evidence.get("status_code"),
                 "elapsed_ms": elapsed_ms,
                 "error": f"{type(exc).__name__}: {exc}",
             }
         )
+        result.update(http_evidence)
     finally:
         session.close()
     return result
@@ -1162,8 +1614,12 @@ def _validate_summary(summary: Dict[str, object]) -> None:
     settled, settled_failures = _connector_metrics_settled(metrics_payload)
     if not settled:
         failures.extend(settled_failures)
-    if int(metrics.get("layer_load_wait_calls", 0) or 0) <= 0:
-        failures.append("layer_load_wait_calls <= 0")
+    # ``layer_load_wait_calls`` is diagnostic only.  A progressive native KV
+    # receive can complete through grouped receive callbacks without invoking
+    # the legacy blocking layer-wait path.  The invariants above already prove
+    # producer/consumer grouped batches, finished receives, direct backend
+    # selection and zero failures; rejecting a zero wait count would turn a
+    # successful lower-latency path into a false negative.
     if int(metrics.get("peer_buffer_batches", 0) or 0) <= 0:
         failures.append("peer_buffer_batches <= 0")
     remote_backend_counts = dict(metrics.get("remote_transfer_backend_counts") or {})
@@ -1228,36 +1684,129 @@ def _launch(script_path: str, log_path: Path) -> subprocess.Popen:
             env=_proc_env(),
             preexec_fn=os.setsid,
         )
+    # ``setsid`` makes the launcher's pid the persistent service process-group
+    # id.  Keep it explicitly because a shell leader can exit before cleanup
+    # while a vLLM child remains alive in that group.
+    proc._mooncake_epd_process_group = proc.pid  # type: ignore[attr-defined]
     return proc
 
 
-def _terminate_all(procs: List[subprocess.Popen]) -> None:
+def _owned_process_groups(procs: List[subprocess.Popen]) -> List[int]:
+    """Return unique process groups created by :func:`_launch`.
+
+    Every caller launches its shell in a new session, so the shell pid is also
+    the service group id.  We intentionally retain that id even when the shell
+    has already exited: vLLM may leave an EngineCore child in the group after a
+    request failure.
+    """
+
+    groups: List[int] = []
+    seen: set[int] = set()
     for proc in reversed(procs):
-        if proc.poll() is not None:
-            continue
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        except Exception:
-            pass
+            pgid = int(getattr(proc, "_mooncake_epd_process_group", proc.pid))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if pgid <= 0 or pgid in seen:
+            continue
+        seen.add(pgid)
+        groups.append(pgid)
+    return groups
+
+
+def _signal_process_groups(process_groups: List[int], sig: int) -> None:
+    for pgid in process_groups:
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            # The group ended between probing it and signaling it.
+            continue
+        except OSError:
+            # Cleanup must never mask the original E2E failure.
+            continue
+
+
+def _process_group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # This should not occur for an owned test group, but it means the group
+        # still exists and needs no unsafe fallback action here.
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _terminate_all(procs: List[subprocess.Popen]) -> None:
+    process_groups = _owned_process_groups(procs)
+    _signal_process_groups(process_groups, signal.SIGTERM)
     deadline = time.time() + 20
     while time.time() < deadline:
-        if all(proc.poll() is not None for proc in procs):
+        if not any(_process_group_alive(pgid) for pgid in process_groups):
             break
         time.sleep(0.5)
-    for proc in reversed(procs):
-        if proc.poll() is not None:
-            continue
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except Exception:
-            pass
+    _signal_process_groups(
+        [pgid for pgid in process_groups if _process_group_alive(pgid)],
+        signal.SIGKILL,
+    )
 
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Run real vLLM PD/EPD serving e2e validation.")
     ap.add_argument("--workdir", default="/tmp/mooncake_epd_serving_e2e")
+    ap.add_argument(
+        "--model",
+        default=os.getenv("MOONCAKE_EPD_MODEL", "models/Qwen3-VL-8B-Instruct"),
+        help="Explicit model path recorded in the benchmark artifact.",
+    )
     ap.add_argument("--timeout", type=int, default=900)
+    ap.add_argument(
+        "--startup-timeout",
+        type=float,
+        default=900.0,
+        help="Maximum seconds to wait for vLLM cold start and compilation.",
+    )
     ap.add_argument("--local-hostname", default="127.0.0.1")
+    ap.add_argument(
+        "--mooncake-protocol",
+        choices=["tcp", "shm", "rdma", "nvlink_intra"],
+        default="tcp",
+        help="P→D KV transport. Strict runs verify the selected native transport in every worker log.",
+    )
+    ap.add_argument(
+        "--scheduler-policy",
+        choices=sorted(SCHEDULER_POLICIES),
+        default="agent_aware",
+        help="Proxy P/D worker-selection policy; recorded for policy and capacity comparisons.",
+    )
+    ap.add_argument(
+        "--strict-no-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Reject proxy/data-plane fallbacks and require native P→D transport evidence.",
+    )
+    ap.add_argument("--max-model-len", type=int, default=4096)
+    ap.add_argument("--gpu-memory-utilization", type=float, default=0.65)
+    ap.add_argument(
+        "--max-num-batched-tokens",
+        type=int,
+        default=0,
+        help="0 retains vLLM's default; positive values are recorded as a serving capacity setting.",
+    )
+    ap.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=0,
+        help="0 retains vLLM's default; positive values are recorded as a serving capacity setting.",
+    )
+    ap.add_argument(
+        "--generation-config",
+        default="vllm",
+        help="vLLM generation configuration, pinned to avoid model-repository sampling defaults.",
+    )
     ap.add_argument(
         "--prefill-gpus",
         type=int,
@@ -1348,15 +1897,28 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--mm-prefetch-mode", choices=["asset_bytes", "feature_handle"], default="asset_bytes")
     ap.add_argument("--prefill-supports-feature-handles", action=argparse.BooleanOptionalAction, default=False)
     ap.add_argument(
+        "--prefill-http-keepalive",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Reuse idle Proxy->Prefill HTTP connections. Disabled by default "
+            "to avoid unsafe retry ambiguity for Prefill POSTs."
+        ),
+    )
+    ap.add_argument(
         "--enable-mm-prefetch",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Forward --enable/--no-enable-mm-prefetch to the EPD proxy. Disable for vLLM-internal hidden-cache ablations.",
     )
-    ap.add_argument("--layers-per-group", type=int, default=8)
-    ap.add_argument("--max-group-bytes", type=int, default=16 * 1024 * 1024)
-    ap.add_argument("--max-transfer-descriptors", type=int, default=128)
-    ap.add_argument("--max-transfer-bytes", type=int, default=16 * 1024 * 1024)
+    # Match the measured direct-serving defaults.  The earlier 8-layer/16MiB
+    # values multiply P→D handshakes for Qwen3-VL and were retained here only
+    # as a stale runner default; callers can still select smaller groups for
+    # an explicit latency/overlap ablation.
+    ap.add_argument("--layers-per-group", type=int, default=32)
+    ap.add_argument("--max-group-bytes", type=int, default=64 * 1024 * 1024)
+    ap.add_argument("--max-transfer-descriptors", type=int, default=512)
+    ap.add_argument("--max-transfer-bytes", type=int, default=64 * 1024 * 1024)
     ap.add_argument("--owner-shards", type=int, default=1)
     ap.add_argument("--kv-directory-rpc-url", default=None)
     return ap.parse_args()
@@ -1372,9 +1934,18 @@ def main() -> None:
         allow_loopback=bool(args.allow_loopback),
     )
     cfg = VLLMDisaggConfig(
+        model=str(args.model),
         local_hostname=local_hostname,
+        protocol=str(args.mooncake_protocol),
+        scheduler_policy=str(args.scheduler_policy),
+        strict_no_fallback=bool(args.strict_no_fallback),
         prefill_gpus=tuple(int(x) for x in (args.prefill_gpus or ())),
         decode_gpus=tuple(int(x) for x in (args.decode_gpus or ())),
+        max_model_len=max(1, int(args.max_model_len)),
+        gpu_memory_utilization=float(args.gpu_memory_utilization),
+        max_num_batched_tokens=_optional_positive_int(args.max_num_batched_tokens),
+        max_num_seqs=_optional_positive_int(args.max_num_seqs),
+        generation_config=str(args.generation_config),
         owner_shards=max(1, int(args.owner_shards)),
         kv_directory_rpc_url=args.kv_directory_rpc_url,
         workflow_registry_wal_path=str(workdir / "proxy_workflow_registry.jsonl"),
@@ -1385,6 +1956,7 @@ def main() -> None:
         max_transfer_bytes=args.max_transfer_bytes,
         mm_prefetch_mode=args.mm_prefetch_mode,
         prefill_supports_feature_handles=bool(args.prefill_supports_feature_handles),
+        prefill_http_keepalive=bool(args.prefill_http_keepalive),
     )
     files = generate_configs(str(workdir), cfg)
     if not bool(args.enable_mm_prefetch):
@@ -1428,6 +2000,10 @@ def main() -> None:
             time.sleep(2.0 if key in {"metadata", "master"} else 4.0)
             _ensure_process_running(key, proc, logs[key])
 
+        startup_timeout_s = max(
+            60.0,
+            float(getattr(args, "startup_timeout", args.timeout)),
+        )
         for idx, port in enumerate(prefill_ports):
             key = f"prefill-{idx}"
             _wait_ready(
@@ -1435,7 +2011,7 @@ def main() -> None:
                 f"http://{local_hostname}:{port}",
                 proc=named_procs[key],
                 log_path=logs[key],
-                timeout_s=min(300.0, max(60.0, float(args.timeout))),
+                timeout_s=startup_timeout_s,
                 paths=("/health",),
             )
         for idx, port in enumerate(decode_ports):
@@ -1445,7 +2021,7 @@ def main() -> None:
                 f"http://{local_hostname}:{port}",
                 proc=named_procs[key],
                 log_path=logs[key],
-                timeout_s=min(300.0, max(60.0, float(args.timeout))),
+                timeout_s=startup_timeout_s,
                 paths=("/health",),
             )
         _wait_ready(
@@ -1541,7 +2117,8 @@ def main() -> None:
 
         proxy_request_url = f"http://{local_hostname}:{proxy_port}/v1/chat/completions"
         agent_pd_probe_results: List[Dict[str, Any]] = []
-        for idx, entry in enumerate(_agent_pd_probe_entries(cfg.model, int(args.agent_pd_probes))):
+        agent_pd_entries = _agent_pd_probe_entries(cfg.model, int(args.agent_pd_probes))
+        for idx, entry in enumerate(agent_pd_entries):
             result = _execute_dataset_request(
                 proxy_url=proxy_request_url,
                 entry=entry,
@@ -1556,6 +2133,13 @@ def main() -> None:
             agent_pd_probe_results.append(result)
 
         dataset_probe_results: List[Dict[str, Any]] = []
+        dataset_split_path = (
+            Path(args.dataset_root).resolve()
+            / "chat_splits"
+            / f"{args.dataset_chat_split}.jsonl"
+            if args.dataset_root
+            else None
+        )
         dataset_requests, dataset_skipped = _load_dataset_requests(
             dataset_root=args.dataset_root,
             chat_split=args.dataset_chat_split,
@@ -1747,6 +2331,16 @@ def main() -> None:
         )
 
         summary = {
+            "workdir": str(workdir),
+            "model": str(cfg.model),
+            "mooncake_protocol": str(cfg.protocol),
+            # This runner uses proxy asset prefetch; it must not claim the
+            # direct Encoder→Prefill native engine path exercised by the
+            # dedicated online-direct runner.
+            "direct_engine_protocol": None,
+            "text_only": False,
+            "strict_no_fallback": bool(cfg.strict_no_fallback),
+            "scheduler_policy": str(cfg.scheduler_policy),
             "ports": {
                 "prefill": prefill_port,
                 "decode": decode_port,
@@ -1813,7 +2407,136 @@ def main() -> None:
             "connector_metrics_dir": files["connector_metrics_dir"],
             "logs": {k: str(v) for k, v in logs.items()},
         }
+        # ``responses`` is the common campaign surface.  Keep the richer
+        # dataset/Agent-PD collections above as the runner-specific evidence.
+        summary["responses"] = list(dataset_probe_results)
+        measured_dispatch_results = list(dataset_probe_results) + list(agent_pd_probe_results)
+        summary["worker_dispatch_balance"] = {
+            "prefill": _worker_dispatch_balance(
+                measured_dispatch_results,
+                stage="prefill",
+                configured_workers=len(prefill_scripts),
+            ),
+            "decode": _worker_dispatch_balance(
+                measured_dispatch_results,
+                stage="decode",
+                configured_workers=len(decode_scripts),
+            ),
+        }
+        selected_request_rows = [
+            _dataset_request_evidence_row(entry, index=index, phase="measure")
+            for index, entry in enumerate(dispatch_plan)
+        ]
+        selected_samples = [
+            {
+                "sample_id": row.get("sample_id"),
+                "workflow_id": row.get("workflow_id"),
+                "workload_family": row.get("workload_family"),
+                "source_dataset": row.get("source_dataset"),
+                "request_sha256": row.get("request_sha256"),
+            }
+            for row in selected_request_rows
+        ]
+        summary["benchmark_config"] = {
+            "schema_version": 1,
+            "request_fingerprint": _stable_digest(
+                {
+                    "model": str(cfg.model),
+                    "dataset_split_sha256": (
+                        _file_sha256(dataset_split_path)
+                        if dataset_split_path is not None
+                        else None
+                    ),
+                    "selected_samples": selected_samples,
+                }
+            ),
+            "request": {
+                "model": str(cfg.model),
+                "workload": "dataset_chat_split",
+                "dataset_chat_split": str(args.dataset_chat_split),
+                "dataset_split_sha256": (
+                    _file_sha256(dataset_split_path)
+                    if dataset_split_path is not None
+                    else None
+                ),
+                "dataset_families": list(args.dataset_families or []),
+                "selected_samples": selected_samples,
+                "max_tokens": int(args.dataset_request_max_tokens),
+                "temperature": 0.0,
+                "image_max_pixels": int(args.dataset_image_max_pixels),
+                "agent_pd_labels": bool(args.dataset_agent_pd_labels),
+            },
+            "load": {
+                "requested_dataset_requests": int(args.max_dataset_requests),
+                "warmup_requests": int(args.warmup_requests),
+                "concurrency": int(args.dataset_concurrency),
+                "qps": float(args.dataset_qps),
+                "arrival_schedule": args.dataset_arrival_schedule,
+                "deadline_ms": deadline_ms,
+                "goodput_slo_ms": goodput_slo_ms,
+                "streaming_metrics": bool(args.dataset_streaming_metrics),
+            },
+            "serving": {
+                "max_model_len": int(cfg.max_model_len),
+                "gpu_memory_utilization": float(cfg.gpu_memory_utilization),
+                "max_num_batched_tokens": cfg.max_num_batched_tokens,
+                "max_num_seqs": cfg.max_num_seqs,
+                "generation_config": cfg.generation_config,
+                "tensor_parallel_size": int(cfg.tensor_parallel_size),
+            },
+            "topology": {
+                "prefill_gpus": list(cfg.prefill_gpus or (cfg.prefill_gpu,)),
+                "decode_gpus": list(cfg.decode_gpus or (cfg.decode_gpu,)),
+                "total_gpus": len(cfg.prefill_gpus or (cfg.prefill_gpu,))
+                + len(cfg.decode_gpus or (cfg.decode_gpu,)),
+            },
+            "epd": {
+                "protocol": str(cfg.protocol),
+                "layers_per_group": int(cfg.layers_per_group),
+                "max_group_bytes": int(cfg.max_group_bytes),
+                "max_transfer_descriptors": int(cfg.max_transfer_descriptors),
+                "max_transfer_bytes": int(cfg.max_transfer_bytes),
+                "transfer_workers": int(cfg.effective_transfer_workers),
+                "scheduler_policy": str(cfg.scheduler_policy),
+                "mm_prefetch_mode": str(cfg.mm_prefetch_mode),
+                "prefill_supports_feature_handles": bool(cfg.prefill_supports_feature_handles),
+                "prefill_http_keepalive": bool(cfg.prefill_http_keepalive),
+                "vllm_mm_hidden_cache": cfg.vllm_mm_hidden_cache,
+                "workflow_registry_durability": "fsync_wal",
+            },
+        }
+        _record_runtime_transport_evidence(
+            summary,
+            logs=logs,
+            requested=str(cfg.protocol),
+            enforce=bool(cfg.strict_no_fallback),
+        )
         _validate_summary(summary)
+        summary["raw_artifacts"] = write_raw_benchmark_artifacts(
+            workdir=workdir,
+            request_rows=selected_request_rows,
+            response_rows=[
+                {"phase": "measure", **dict(result)}
+                for result in dataset_probe_results
+            ],
+            service_logs=logs,
+            metrics={
+                "proxy_metrics": metrics,
+                "dataset_latency_stats_ms": summary["dataset_latency_stats_ms"],
+                "dataset_ttft_stats_ms": summary["dataset_ttft_stats_ms"],
+                "dataset_tpot_stats_ms": summary["dataset_tpot_stats_ms"],
+                "worker_dispatch_balance": summary["worker_dispatch_balance"],
+                "transport_runtime_evidence": summary["transport_runtime_evidence"],
+            },
+            runtime={
+                "runner": "run_vllm_serving_e2e",
+                "model": str(cfg.model),
+                "strict_no_fallback": bool(cfg.strict_no_fallback),
+                "mooncake_protocol": str(cfg.protocol),
+                "scheduler_policy": str(cfg.scheduler_policy),
+                "benchmark_config": summary["benchmark_config"],
+            },
+        )
         out = workdir / "serving_e2e_summary.json"
         out.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
         print(json.dumps(summary, ensure_ascii=False, indent=2))

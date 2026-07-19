@@ -125,6 +125,10 @@ class WorkflowStateRecord:
     feature_hashes: List[str] = field(default_factory=list)
     kv_block_ids: List[str] = field(default_factory=list)
     kv_logical_filled: List[int] = field(default_factory=list)
+    # Persisted metadata-only Store/physical-page manifests.  Payload bytes
+    # never enter the WAL; this allows recovery to validate lease/fence/layout
+    # before asking a worker to materialize a branch.
+    kv_manifests: List[Dict[str, Any]] = field(default_factory=list)
     offload_handle: Optional[str] = None
     offload_checkpoint_path: Optional[str] = None
     handoff_id: Optional[str] = None

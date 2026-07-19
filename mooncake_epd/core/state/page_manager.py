@@ -20,14 +20,16 @@ consume reassembled pages without any format conversion.
 
 from __future__ import annotations
 
+import hashlib
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 
-from ..control import LocalKVDirectory
+if TYPE_CHECKING:
+    from ..control.kv_directory import LocalKVDirectory
 
 
 PageId = int
@@ -103,6 +105,12 @@ class PagedKVManager:
         kv_directory: Optional[LocalKVDirectory] = None,
         node_id: Optional[str] = None,
     ):
+        # Avoid importing control.__init__ while its ServingControlPlane is
+        # importing this state allocator.  The directory implementation is a
+        # leaf dependency and can be resolved lazily here.
+        if kv_directory is None:
+            from ..control.kv_directory import LocalKVDirectory
+
         self.page_size = page_size
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
@@ -178,6 +186,24 @@ class PagedKVManager:
         start = max(0, int(ref.virtual_offset))
         stop = min(start + int(ref.filled), key.shape[-2])
         return key[:, :, start:stop, :], value[:, :, start:stop, :]
+
+    def page_checksum(self, ref: BlockRef, *, filled_only: bool = True) -> str:
+        """Return an explicit audit-boundary checksum for one KV page.
+
+        This operation may synchronize a CUDA tensor and must only be used at
+        capture/materialize boundaries.  It is deliberately absent from the
+        decode-token hot path.
+        """
+
+        key, value = self.get_page_slice(ref) if filled_only else self.get_page(ref)
+        digest = hashlib.sha256()
+        for tensor in (key, value):
+            contiguous = tensor.detach().contiguous().to(device="cpu")
+            # NumPy has no bfloat16 dtype.  Hash the raw storage rather than
+            # converting values so checksums remain bit-exact for the dtype
+            # used by real vLLM KV caches (including bfloat16).
+            digest.update(contiguous.view(torch.uint8).numpy().tobytes())
+        return digest.hexdigest()
 
     def write_page_slots(
         self,
@@ -290,10 +316,37 @@ class PagedKVManager:
                 return False
             page.refcount = new_refcount
             if new_refcount <= 0:
+                record = self.kv_directory.get_record(gid)
+                if record is not None and int(record.lease_count) > 0:
+                    # A lease protects a page while it is exported or being
+                    # materialized.  The logical ref may disappear first.
+                    return False
                 del self._pages[physical_id]
                 self.kv_directory.release_physical(gid)
                 return True
             return False
+
+    def release_lease(self, block: Union[PageId, str]) -> int:
+        """Release a physical-retention lease and reclaim an unreferenced page.
+
+        Directory state alone cannot free the tensor allocation, so all page
+        leases must be released through the owning ``PagedKVManager``.
+        Recovery cleanup is idempotent because a previous replay may already
+        have deleted the directory record.
+        """
+
+        try:
+            physical_id, gid = self._normalize_block_identifier(block)
+        except KeyError:
+            return 0
+        remaining = self.kv_directory.release_lease(gid)
+        if remaining > 0 or self.kv_directory.refcount(gid) > 0:
+            return remaining
+        with self._shard_for(physical_id):
+            page = self._pages.pop(physical_id, None)
+        if page is not None:
+            self.kv_directory.release_physical(gid)
+        return remaining
 
     def refcount(self, pid: Union[PageId, str]) -> int:
         try:
@@ -364,16 +417,22 @@ class PagedKVManager:
         in parallel.
         """
         out: List[BlockRef] = []
-        for ref in refs:
-            self.incref(ref.global_block_id or ref.physical_id)
-            out.append(BlockRef(
-                physical_id=ref.physical_id,
-                filled=ref.filled,
-                global_block_id=ref.global_block_id or self.kv_directory.gid_for_physical_id(ref.physical_id) or f"local:{ref.physical_id}",
-                physical_node_id=ref.physical_node_id,
-                logical_index=ref.logical_index,
-                virtual_offset=ref.virtual_offset,
-            ))
+        try:
+            for ref in refs:
+                self.incref(ref.global_block_id or ref.physical_id)
+                out.append(BlockRef(
+                    physical_id=ref.physical_id,
+                    filled=ref.filled,
+                    global_block_id=ref.global_block_id or self.kv_directory.gid_for_physical_id(ref.physical_id) or f"local:{ref.physical_id}",
+                    physical_node_id=ref.physical_node_id,
+                    logical_index=ref.logical_index,
+                    virtual_offset=ref.virtual_offset,
+                ))
+        except Exception:
+            # Fork is a logical transaction.  A missing middle ref must not
+            # leak the increments already applied to earlier pages.
+            self.release_refs(out)
+            raise
         return out
 
     def reference_token_span(

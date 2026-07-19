@@ -8,6 +8,7 @@ metadata are available on the real vLLM serving path.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -18,6 +19,8 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Optional, Tuple
+
+from mooncake_epd.core.transfer import validate_mooncake_protocol_pair
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +61,27 @@ def _resolve_model_path() -> str:
 VENV_ROOT = _resolve_venv_root()
 MODEL_PATH = str(REPO_ROOT.parent / "models" / "Qwen3-VL-8B-Instruct")
 CONNECTOR_MODULE_PATH = "mooncake_epd.core.control.vllm_mooncake_connector"
+# Keep the deployment generator and proxy CLI on one explicit policy contract.
+# A benchmark must record the selected policy; silently falling back to the
+# proxy default makes a 2P2D capacity result impossible to reproduce.
+SCHEDULER_POLICIES = frozenset(
+    {"round_robin", "least_loaded", "static_type_route", "agent_aware"}
+)
+
+# vLLM's Mooncake sender binds its ZMQ side channel from the kernel ephemeral
+# range before it starts the upstream Bootstrap HTTP server.  Selecting a
+# Bootstrap port from that same range can therefore make one EngineCore race
+# with itself: the ZMQ listener wins, then Bootstrap fails to bind.  Keep
+# generated (non-explicit) Bootstrap ports outside the Linux ephemeral range
+# while retaining a wide enough pool for independent local deployments.
+_BOOTSTRAP_PORT_MIN = 20_000
+_BOOTSTRAP_PORT_MAX = 29_999
+
+
+def _effective_direct_engine_protocol(config: "VLLMDisaggConfig") -> str:
+    protocol = str(config.protocol).strip().lower()
+    direct = str(config.direct_engine_protocol or "").strip().lower()
+    return direct or ("tcp" if protocol == "shm" else protocol)
 
 
 def _port_in_use(port: int, host: str = "127.0.0.1") -> bool:
@@ -72,6 +96,61 @@ def _pick_free_port(preferred: int, host: str = "127.0.0.1") -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind((host, 0))
         return int(sock.getsockname()[1])
+
+
+def _can_bind_bootstrap_port(port: int) -> bool:
+    """Check the wildcard bind used by vLLM's Bootstrap server.
+
+    A TCP connect check against ``local_hostname`` is not sufficient here:
+    upstream binds Bootstrap on ``0.0.0.0``, so an existing listener on another
+    loopback alias can still cause startup to fail.  The socket is only a
+    probe; Bootstrap owns the actual bind at worker startup.
+    """
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("0.0.0.0", int(port)))
+    except OSError:
+        return False
+    return True
+
+
+def _bootstrap_port_candidates(seed: str):
+    """Yield a stable permutation of the non-ephemeral Bootstrap port pool."""
+
+    width = _BOOTSTRAP_PORT_MAX - _BOOTSTRAP_PORT_MIN + 1
+    digest = hashlib.sha256(seed.encode("utf-8")).digest()
+    start = int.from_bytes(digest[:8], "big") % width
+    for offset in range(width):
+        yield _BOOTSTRAP_PORT_MIN + ((start + offset) % width)
+
+
+def _pick_bootstrap_port(
+    preferred: int,
+    *,
+    seed: str,
+    reserved: set[int],
+) -> int:
+    """Select a unique Bootstrap port without entering the ephemeral range.
+
+    Explicit ports remain supported for deployment compatibility.  Generated
+    ports intentionally use the non-ephemeral range because vLLM allocates the
+    Mooncake ZMQ side channel dynamically during EngineCore initialization.
+    """
+
+    requested = int(preferred)
+    if (
+        requested > 0
+        and requested not in reserved
+        and _can_bind_bootstrap_port(requested)
+    ):
+        return requested
+    for candidate in _bootstrap_port_candidates(seed):
+        if candidate not in reserved and _can_bind_bootstrap_port(candidate):
+            return candidate
+    raise RuntimeError(
+        "no free non-ephemeral vLLM Mooncake Bootstrap port is available"
+    )
 
 
 @dataclass
@@ -98,6 +177,18 @@ class VLLMDisaggConfig:
     # runners opt into ``vllm`` explicitly and record it in their artifact.
     generation_config: Optional[str] = None
     protocol: str = "tcp"
+    # TCP's sender-side write completion is not a remote GPU-write completion.
+    # The patched Transfer Engine can wait for the receiver's post-cudaMemcpy
+    # acknowledgement. Keep it enabled for generated EPD deployments and make
+    # the switch explicit in artifacts for valid latency/throughput ablations.
+    tcp_write_completion_ack: bool = True
+    # Reusing TCP connections avoids connect setup, but the current TCP
+    # transport implementation has not yet passed the strict multimodal
+    # response-consistency campaign under concurrent P→D descriptor traffic.
+    # Never inherit this experimental mode from the launcher shell: generated
+    # deployments explicitly disable it unless the caller opts in and records
+    # a workload-specific correctness result.
+    tcp_connection_pool: bool = False
     # E→P FeatureBundle and P→D KV can use different data-plane transports.
     # On a host where an RDMA HCA cannot register the short-lived E→P buffers,
     # retaining TCP for E→P still lets the persistent vLLM KV connector use
@@ -139,10 +230,24 @@ class VLLMDisaggConfig:
     proxy_warn_rho: float = 0.85
     proxy_critical_rho: float = 0.95
     proxy_max_backpressure_delay_ms: float = 150.0
+    # The routing policy is a serving parameter, not a benchmark-only proxy
+    # flag.  Expose it here so generated deployment scripts and benchmark
+    # artifacts describe the policy that actually selected P/D workers.
+    scheduler_policy: str = "agent_aware"
     owner_shards: int = 1
     kv_directory_rpc_url: Optional[str] = None
+    # A sync-on-every-transition workflow WAL is required for restart-safe
+    # Agent-state recovery, but it is not on the correctness path of ordinary
+    # P→D serving.  Keep the durable default for generated deployments while
+    # allowing the serving benchmark to select the in-memory hot path
+    # explicitly and report that durability boundary in its artifact.
+    enable_workflow_registry_wal: bool = True
     workflow_registry_wal_path: Optional[str] = None
     connector_metrics_dir: Optional[str] = None
+    # Keep compiler artifacts off the usually space-constrained system volume.
+    # This is not a serving cache: it only avoids failed/repeated compilation
+    # during real multi-model benchmark campaigns.
+    vllm_cache_root: Optional[str] = None
     # Group-level connector accounting is written periodically and at terminal
     # boundaries; eager JSON snapshots are too expensive on the TCP P→D path.
     connector_metrics_flush_interval_ms: float = 250.0
@@ -155,20 +260,58 @@ class VLLMDisaggConfig:
     enable_direct_feature_handle_cache: bool = False
     direct_feature_handle_cache_max_entries: int = 4096
     direct_feature_handle_cache_ttl_s: float = 600.0
+    # Safe only with release-after-Prefill: reserve a bounded number of
+    # registry references for a generation-fenced repeated descriptor tuple.
+    # ``1`` keeps the historical serial one-lookup behavior; adaptive
+    # coalescing below may still serve a concurrent burst safely.
+    direct_feature_lease_prefetch: int = 1
+    direct_feature_lease_prefetch_max_entries: int = 64
+    direct_feature_lease_prefetch_ttl_s: float = 30.0
+    # With the fixed one-reference default, reserve extra references only for
+    # requests that are already concurrently waiting on the same descriptor.
+    # This preserves single-request TTFT behavior while reducing hot-burst
+    # Prefill registry RPC contention.
+    # Opt in only after a strict workload-specific run: coalescing changes the
+    # timing of concurrent admissions even though it preserves reference count.
+    direct_feature_adaptive_lease_prefetch: bool = False
+    direct_feature_adaptive_lease_prefetch_max: int = 2
+    # Cache vLLM's deterministic OpenAI /render output on the Proxy. This is
+    # distinct from the E->P direct FeatureHandle cache: it removes repeated
+    # control-plane rendering while every request still carries fresh P->D KV
+    # transfer parameters.
+    enable_rendered_prefill_cache: bool = True
+    rendered_prefill_cache_max_entries: int = 64
+    rendered_prefill_cache_max_bytes: int = 256 * 1024 * 1024
+    rendered_prefill_cache_ttl_s: float = 300.0
     direct_feature_buffer_root_routes: bool = False
     direct_feature_target_mode: str = "registered_tensor"
     direct_feature_register_memory: bool = True
     direct_feature_persistent_cache: bool = False
     direct_feature_cache_max_entries: int = 64
     direct_feature_cache_max_bytes: int = 2 * 1024 * 1024 * 1024
+    # ``None`` preserves the deployment environment's current default.  A
+    # benchmark may pin this switch so a cold/no-cache control cannot silently
+    # inherit a warm worker-level multimodal hidden-state cache.
+    vllm_mm_hidden_cache: Optional[bool] = None
     direct_feature_buffer_auth_token: Optional[str] = None
     release_direct_feature_buffers_after_prefill: bool = True
+    # Release is off the response path; a small batch reduces HTTP control
+    # traffic against the Prefill vLLM API without changing lease accounting.
+    direct_feature_release_batch_max_jobs: int = 16
     strict_no_fallback: bool = False
     # ``render_generate`` is the verified OpenAI-compatible continuation path.
     # The one-call ``openai_prompt_only`` variant may be selected explicitly
     # only for a vLLM version/workload pair that has passed output-equivalence
     # validation; see the proxy's strict-serving gate.
     prefill_dispatch_mode: str = "render_generate"
+    # Validate the v1 token envelope in shadow before enabling the compact
+    # media-free Decode leg for a real workload.
+    decode_dispatch_mode: str = "legacy"
+    allow_decode_token_fallback: bool = False
+    # Disable idle Proxy->Prefill HTTP/1.1 connection reuse by default. A
+    # transport error after a non-idempotent Prefill POST cannot be retried
+    # safely because the worker may have already produced a P->D KV handoff.
+    prefill_http_keepalive: bool = False
     allow_unverified_openai_prompt_only: bool = False
     feature_handle_store_url: Optional[str] = None
     feature_handle_store_id: Optional[str] = None
@@ -210,6 +353,11 @@ class VLLMDisaggConfig:
             "transfer_retry_attempts": self.transfer_retry_attempts,
             "transfer_retry_backoff_ms": self.transfer_retry_backoff_ms,
             "transport_backend": "mooncake_engine_direct",
+            # Strict real runs reject a Decode pull that lacks the checksummed
+            # P->D envelope. Compatibility checking stays opt-in until every
+            # worker reports a complete model/layout revision tuple.
+            "require_kv_transfer_manifest_v2": bool(self.strict_no_fallback),
+            "require_kv_transfer_manifest_generation": bool(self.strict_no_fallback),
         }
         if self.connector_metrics_dir:
             extra_config["connector_metrics_dir"] = self.connector_metrics_dir
@@ -292,17 +440,44 @@ def _common_env_block(
     # explicit so generated scripts are portable between the standalone tree and
     # the merged Mooncake repository.
     parent_path = str(REPO_ROOT.parent)
-    protocol = str(config.protocol).lower()
-    direct_engine_protocol = str(
-        config.direct_engine_protocol
-        or ("tcp" if protocol == "shm" else protocol)
-    ).lower()
+    protocol = str(config.protocol).strip().lower()
+    direct_engine_protocol = _effective_direct_engine_protocol(config)
     venv_root = _resolve_venv_root()
+    vllm_cache_root = str(
+        config.vllm_cache_root
+        or os.getenv(
+            "MOONCAKE_EPD_VLLM_CACHE_ROOT",
+            str(REPO_ROOT.parent / ".cache" / "vllm"),
+        )
+    )
+    mm_hidden_cache_env = (
+        "export MOONCAKE_EPD_VLLM_MM_HIDDEN_CACHE=${MOONCAKE_EPD_VLLM_MM_HIDDEN_CACHE:-1}"
+        if config.vllm_mm_hidden_cache is None
+        else "export MOONCAKE_EPD_VLLM_MM_HIDDEN_CACHE="
+        + ("1" if config.vllm_mm_hidden_cache else "0")
+    )
     lines = [
-        "unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY",
-        "export NO_PROXY=127.0.0.1,localhost",
+        # Mooncake's Bootstrap client uses httpx.  Leaving ALL_PROXY in the
+        # service environment makes local 127.0.0.1 registration attempt a
+        # SOCKS connection (and fail before KV caches are registered), even if
+        # HTTP(S)_PROXY were cleared.  Serving workers only communicate with
+        # local control-plane endpoints generated below, so isolate every
+        # proxy spelling rather than inheriting a developer shell's proxy.
+        "unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY",
+        "export NO_PROXY=127.0.0.1,localhost,::1",
+        "export no_proxy=${NO_PROXY}",
         f"export PYTHONPATH={parent_path}:${{PYTHONPATH:-}}",
-        "export MOONCAKE_EPD_ENABLE_VLLM_PATCHES=1",
+        # vLLM/Torch compile artifacts can exceed tens of GiB across model and
+        # shape variants. Keep them under the repo's data-volume cache by
+        # default, while preserving an explicit deployment override.
+        f"export VLLM_CACHE_ROOT={shlex.quote(vllm_cache_root)}",
+        "export TORCHINDUCTOR_CACHE_DIR=${VLLM_CACHE_ROOT}/torch_compile_cache",
+        "export TRITON_CACHE_DIR=${VLLM_CACHE_ROOT}/triton",
+        "mkdir -p \"${TORCHINDUCTOR_CACHE_DIR}\" \"${TRITON_CACHE_DIR}\"",
+        # vLLM hook activation is explicit in the worker launcher.  This
+        # prevents the workspace's sitecustomize module from mutating every
+        # Python interpreter that merely has the repository on PYTHONPATH.
+        "export MOONCAKE_EPD_ENABLE_VLLM_PATCHES=0",
         f"source {shlex.quote(str(venv_root / 'bin' / 'activate'))}",
         f"export MOONCAKE_CONFIG_PATH={mooncake_json}",
         f"export MOONCAKE_MASTER={config.master_server}",
@@ -319,12 +494,24 @@ def _common_env_block(
             if protocol == "nvlink_intra"
             else "unset MC_INTRANODE_NVLINK"
         ),
+        (
+            "export MC_TCP_WRITE_COMPLETION_ACK=1"
+            if config.tcp_write_completion_ack
+            and "tcp" in {protocol, direct_engine_protocol}
+            else "unset MC_TCP_WRITE_COMPLETION_ACK"
+        ),
+        (
+            "export MC_TCP_ENABLE_CONNECTION_POOL="
+            + ("1" if config.tcp_connection_pool else "0")
+            if "tcp" in {protocol, direct_engine_protocol}
+            else "unset MC_TCP_ENABLE_CONNECTION_POOL"
+        ),
         f"export MOONCAKE_LOCAL_HOSTNAME={config.local_hostname}",
         f"export VLLM_HOST_IP={config.local_hostname}",
         f"export MOONCAKE_GLOBAL_SEGMENT_SIZE={config.global_segment_size}",
         f"export MOONCAKE_LOCAL_BUFFER_SIZE={config.local_buffer_size}",
         "export OPENAI_API_KEY=sk-local",
-        "export MOONCAKE_EPD_VLLM_MM_HIDDEN_CACHE=${MOONCAKE_EPD_VLLM_MM_HIDDEN_CACHE:-1}",
+        mm_hidden_cache_env,
         "export MOONCAKE_EPD_VLLM_MM_HIDDEN_CACHE_MAX_ENTRIES=${MOONCAKE_EPD_VLLM_MM_HIDDEN_CACHE_MAX_ENTRIES:-64}",
         "export MOONCAKE_EPD_VLLM_MM_HIDDEN_CACHE_MAX_BYTES=${MOONCAKE_EPD_VLLM_MM_HIDDEN_CACHE_MAX_BYTES:-2147483648}",
         f"export MOONCAKE_EPD_REPO_ROOT={REPO_ROOT.parent}",
@@ -399,6 +586,16 @@ def _vllm_scheduler_flags(config: VLLMDisaggConfig) -> str:
 
 def generate_configs(output_dir: str, config: Optional[VLLMDisaggConfig] = None) -> Dict[str, object]:
     config = config or VLLMDisaggConfig()
+    out_dir = Path(output_dir)
+    validate_mooncake_protocol_pair(
+        config.protocol,
+        _effective_direct_engine_protocol(config),
+    )
+    if str(config.scheduler_policy) not in SCHEDULER_POLICIES:
+        allowed = ", ".join(sorted(SCHEDULER_POLICIES))
+        raise ValueError(
+            f"unsupported scheduler_policy={config.scheduler_policy!r}; expected one of {allowed}"
+        )
     prefill_gpus = list(config.prefill_gpus or (config.prefill_gpu,))
     decode_gpus = list(config.decode_gpus or (config.decode_gpu,))
     if not prefill_gpus:
@@ -419,23 +616,24 @@ def generate_configs(output_dir: str, config: Optional[VLLMDisaggConfig] = None)
     )
     prefill_ports = [_pick_free_port(port, config.local_hostname) for port in prefill_ports]
     decode_ports = [_pick_free_port(port, config.local_hostname) for port in decode_ports]
-    prefill_bootstrap_ports = [
-        _pick_free_port(port, config.local_hostname) for port in prefill_bootstrap_ports
-    ]
-    decode_bootstrap_ports = [
-        _pick_free_port(port, config.local_hostname) for port in decode_bootstrap_ports
-    ]
-    used_bootstrap = set()
+    used_bootstrap: set[int] = set()
+    bootstrap_seed_prefix = str(out_dir.expanduser().resolve())
     for idx, port in enumerate(prefill_bootstrap_ports):
-        while port in used_bootstrap:
-            port = _pick_free_port(0, config.local_hostname)
-        prefill_bootstrap_ports[idx] = port
-        used_bootstrap.add(port)
+        selected = _pick_bootstrap_port(
+            port,
+            seed=f"{bootstrap_seed_prefix}:prefill:{idx}",
+            reserved=used_bootstrap,
+        )
+        prefill_bootstrap_ports[idx] = selected
+        used_bootstrap.add(selected)
     for idx, port in enumerate(decode_bootstrap_ports):
-        while port in used_bootstrap:
-            port = _pick_free_port(0, config.local_hostname)
-        decode_bootstrap_ports[idx] = port
-        used_bootstrap.add(port)
+        selected = _pick_bootstrap_port(
+            port,
+            seed=f"{bootstrap_seed_prefix}:decode:{idx}",
+            reserved=used_bootstrap,
+        )
+        decode_bootstrap_ports[idx] = selected
+        used_bootstrap.add(selected)
     config.prefill_port = prefill_ports[0]
     config.decode_port = decode_ports[0]
     config.prefill_bootstrap_port = prefill_bootstrap_ports[0]
@@ -460,8 +658,25 @@ def generate_configs(output_dir: str, config: Optional[VLLMDisaggConfig] = None)
                 "prefill_direct_buffer_service_urls must have one URL or match prefill worker count: "
                 f"urls={len(config.prefill_direct_buffer_service_urls)} prefill={len(prefill_ports)}"
             )
-    out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    worker_generation_dir = out_dir / "worker_generations"
+    worker_generation_dir.mkdir(parents=True, exist_ok=True)
+
+    def _worker_generation_env(worker_id: str) -> str:
+        """Publish the current worker incarnation for Proxy-side fencing.
+
+        A restarted generated worker receives a new default generation before
+        vLLM starts.  The atomic rename prevents the Proxy from observing a
+        partially written fence while it dispatches a P->D handoff.
+        """
+
+        return (
+            f"export MOONCAKE_EPD_GENERATION_DIR={shlex.quote(str(worker_generation_dir))}\n"
+            "mkdir -p \"$MOONCAKE_EPD_GENERATION_DIR\"\n"
+            "export MOONCAKE_EPD_WORKER_GENERATION=\"${MOONCAKE_EPD_WORKER_GENERATION:-${MOONCAKE_EPD_ENGINE_ID}:$(date +%s%N)}\"\n"
+            f"printf '%s\\n' \"$MOONCAKE_EPD_WORKER_GENERATION\" > \"$MOONCAKE_EPD_GENERATION_DIR/.{worker_id}.$$\"\n"
+            f"mv \"$MOONCAKE_EPD_GENERATION_DIR/.{worker_id}.$$\" \"$MOONCAKE_EPD_GENERATION_DIR/{worker_id}\"\n"
+        )
 
     files: Dict[str, object] = {}
     scheduler_flags = _vllm_scheduler_flags(config)
@@ -471,10 +686,13 @@ def generate_configs(output_dir: str, config: Optional[VLLMDisaggConfig] = None)
         if generation_config
         else ""
     )
-    config.workflow_registry_wal_path = (
-        config.workflow_registry_wal_path
-        or str(out_dir / "proxy_workflow_registry.jsonl")
-    )
+    if config.enable_workflow_registry_wal:
+        config.workflow_registry_wal_path = (
+            config.workflow_registry_wal_path
+            or str(out_dir / "proxy_workflow_registry.jsonl")
+        )
+    else:
+        config.workflow_registry_wal_path = None
     config.connector_metrics_dir = (
         config.connector_metrics_dir
         or str(out_dir / "connector_metrics")
@@ -521,9 +739,12 @@ def generate_configs(output_dir: str, config: Optional[VLLMDisaggConfig] = None)
             )
             + "\n"
             + f"export MOONCAKE_EPD_ENGINE_ID={engine_id}\n"
+            + f"export MOONCAKE_EPD_MODEL_ID={shlex.quote(str(config.model))}\n"
+            + f"export MOONCAKE_EPD_VLLM_CAPABILITY_REPORT={out_dir / (engine_id + '-capabilities.json')}\n"
             + "export MOONCAKE_EPD_KV_ROLE=kv_producer\n"
             + "export MOONCAKE_EPD_VLLM_ROLE=prefill\n"
             + f"export MOONCAKE_EPD_WORKER_ID=prefill-{idx}\n"
+            + _worker_generation_env(f"prefill-{idx}")
             + (
                 "export MOONCAKE_EPD_ENABLE_DIRECT_FEATURE_BUFFER=1\n"
                 f"export MOONCAKE_EPD_DIRECT_BUFFER_WORKER_ID=prefill-{idx}\n"
@@ -542,7 +763,7 @@ def generate_configs(output_dir: str, config: Optional[VLLMDisaggConfig] = None)
                 if config.enable_prefill_direct_feature_buffer_routes
                 else ""
             )
-            + f"CUDA_VISIBLE_DEVICES={gpu} vllm serve {config.model} "
+            + f"CUDA_VISIBLE_DEVICES={gpu} python -m mooncake_epd.integrations.vllm.launcher -- vllm serve {config.model} "
             + f"--port {port} "
             + f"--tensor-parallel-size {config.tensor_parallel_size} "
             + f"--max-model-len {config.max_model_len} "
@@ -576,10 +797,13 @@ def generate_configs(output_dir: str, config: Optional[VLLMDisaggConfig] = None)
             )
             + "\n"
             + f"export MOONCAKE_EPD_ENGINE_ID={engine_id}\n"
+            + f"export MOONCAKE_EPD_MODEL_ID={shlex.quote(str(config.model))}\n"
+            + f"export MOONCAKE_EPD_VLLM_CAPABILITY_REPORT={out_dir / (engine_id + '-capabilities.json')}\n"
             + "export MOONCAKE_EPD_KV_ROLE=kv_consumer\n"
             + "export MOONCAKE_EPD_VLLM_ROLE=decode\n"
             + f"export MOONCAKE_EPD_WORKER_ID=decode-{idx}\n"
-            + f"CUDA_VISIBLE_DEVICES={gpu} vllm serve {config.model} "
+            + _worker_generation_env(f"decode-{idx}")
+            + f"CUDA_VISIBLE_DEVICES={gpu} python -m mooncake_epd.integrations.vllm.launcher -- vllm serve {config.model} "
             + f"--port {port} "
             + f"--tensor-parallel-size {config.tensor_parallel_size} "
             + f"--max-model-len {config.max_model_len} "
@@ -640,7 +864,12 @@ def generate_configs(output_dir: str, config: Optional[VLLMDisaggConfig] = None)
             else ""
         )
         + f"--connector-metrics-dir {config.connector_metrics_dir} "
-        + f"--workflow-registry-wal {config.workflow_registry_wal_path} "
+        + (
+            f"--workflow-registry-wal {shlex.quote(str(config.workflow_registry_wal_path))} "
+            if config.workflow_registry_wal_path
+            else ""
+        )
+        + f"--worker-generation-dir {shlex.quote(str(worker_generation_dir))} "
         + (f"--high-prefill-worker-ids {high_prefill_ids} " if high_prefill_ids else "")
         + (f"--standard-prefill-worker-ids {standard_prefill_ids} " if standard_prefill_ids else "")
         + (f"--low-latency-decode-worker-ids {low_decode_ids} " if low_decode_ids else "")
@@ -665,6 +894,7 @@ def generate_configs(output_dir: str, config: Optional[VLLMDisaggConfig] = None)
             if config.release_direct_feature_buffers_after_prefill
             else "--no-release-direct-feature-buffers-after-prefill "
         )
+        + f"--direct-feature-release-batch-max-jobs {max(1, min(1024, int(config.direct_feature_release_batch_max_jobs)))} "
         + (
             "--enable-direct-feature-handle-cache "
             if config.enable_direct_feature_handle_cache
@@ -672,13 +902,43 @@ def generate_configs(output_dir: str, config: Optional[VLLMDisaggConfig] = None)
         )
         + f"--direct-feature-handle-cache-max-entries {int(config.direct_feature_handle_cache_max_entries)} "
         + f"--direct-feature-handle-cache-ttl-s {float(config.direct_feature_handle_cache_ttl_s)} "
+        + f"--direct-feature-lease-prefetch {max(1, min(1024, int(config.direct_feature_lease_prefetch)))} "
+        + f"--direct-feature-lease-prefetch-max-entries {max(0, int(config.direct_feature_lease_prefetch_max_entries))} "
+        + f"--direct-feature-lease-prefetch-ttl-s {max(0.0, float(config.direct_feature_lease_prefetch_ttl_s))} "
+        + (
+            "--enable-direct-feature-adaptive-lease-prefetch "
+            if config.direct_feature_adaptive_lease_prefetch
+            else "--no-enable-direct-feature-adaptive-lease-prefetch "
+        )
+        + f"--direct-feature-adaptive-lease-prefetch-max {max(1, min(1024, int(config.direct_feature_adaptive_lease_prefetch_max)))} "
+        + (
+            "--enable-rendered-prefill-cache "
+            if config.enable_rendered_prefill_cache
+            else "--no-enable-rendered-prefill-cache "
+        )
+        + f"--rendered-prefill-cache-max-entries {int(config.rendered_prefill_cache_max_entries)} "
+        + f"--rendered-prefill-cache-max-bytes {int(config.rendered_prefill_cache_max_bytes)} "
+        + f"--rendered-prefill-cache-ttl-s {float(config.rendered_prefill_cache_ttl_s)} "
         + f"--prefill-dispatch-mode {config.prefill_dispatch_mode} "
+        + f"--decode-dispatch-mode {config.decode_dispatch_mode} "
+        + (
+            "--allow-decode-token-fallback "
+            if config.allow_decode_token_fallback
+            else "--no-allow-decode-token-fallback "
+        )
+        + (
+            "--prefill-http-keepalive "
+            if config.prefill_http_keepalive
+            else "--no-prefill-http-keepalive "
+        )
         + (
             "--allow-unverified-openai-prompt-only "
             if config.allow_unverified_openai_prompt_only
             else "--no-allow-unverified-openai-prompt-only "
         )
         + "--enable-agent-state-clone "
+        + ("--require-real-agent-state-store " if config.strict_no_fallback else "--no-require-real-agent-state-store ")
+        + f"--scheduler-policy {shlex.quote(str(config.scheduler_policy))} "
         + ("--strict-no-fallback " if config.strict_no_fallback else "--no-strict-no-fallback ")
         + f"--port {config.proxy_port}\n",
         encoding="utf-8",
@@ -687,6 +947,7 @@ def generate_configs(output_dir: str, config: Optional[VLLMDisaggConfig] = None)
     files["proxy"] = str(proxy_script)
     files["proxy_workflow_registry"] = config.workflow_registry_wal_path
     files["connector_metrics_dir"] = config.connector_metrics_dir
+    files["worker_generation_dir"] = str(worker_generation_dir)
 
     test_req = out_dir / "test_request.json"
     test_req.write_text(

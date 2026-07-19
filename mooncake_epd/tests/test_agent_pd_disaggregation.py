@@ -83,6 +83,35 @@ def test_agent_pd_routes_hybrid_to_high_prefill_and_low_latency_decode():
     assert snapshot["metrics"]["agent_pd_hybrid_fast_path"] == 1
 
 
+def test_single_worker_stage_is_a_member_of_both_logical_agent_pools():
+    """1P1D cannot be scored as an exclusive high/low physical partition."""
+
+    cp = ServingControlPlane(
+        ServingControlPlaneConfig(
+            high_prefill_worker_ids=("prefill-0",),
+            low_latency_decode_worker_ids=("decode-0",),
+        )
+    )
+    cp.register_stage_workers("prefill", ["prefill-0"])
+    cp.register_stage_workers("decode", ["decode-0"])
+
+    for index, (agent_type, target) in enumerate(
+        (
+            ("interactive", "low_latency_decode_pool"),
+            ("thinking", "high_prefill_pool"),
+            ("hybrid", "mixed"),
+        )
+    ):
+        ctx = cp.start_request(_request(agent_type, target, task_id=f"single-{index}"), f"single-{index}")
+        assert cp.admit_stage("prefill", ctx).worker_id == "prefill-0"
+        assert cp.admit_stage("decode", ctx).worker_id == "decode-0"
+
+    snapshot = cp.snapshot()
+    assert snapshot["metrics"]["agent_pd_route_total"] == 6
+    assert snapshot["metrics"]["agent_pd_route_correct"] == 6
+    assert snapshot["metrics"]["agent_pd_route_incorrect"] == 0
+
+
 def test_agent_pd_pool_preference_spills_when_preferred_prefill_is_congested():
     cp = _cp()
     cp.update_worker_load(
@@ -120,6 +149,16 @@ def test_cross_step_affinity_overrides_interactive_prefill_pool_when_reuse_is_av
             "remote_block_ids": [101, 102],
         },
         decode_worker_id="decode-standard-0",
+    )
+    cp.mark_stage_started(
+        "prefill", prefill0.worker_id, ctx=ctx0
+    )
+    cp.mark_stage_complete(
+        "prefill",
+        prefill0.worker_id,
+        latency_ms=10.0,
+        success=True,
+        ctx=ctx0,
     )
 
     second = _request("interactive", "low_latency_decode_pool", task_id="agent-reuse")

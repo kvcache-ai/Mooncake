@@ -20,8 +20,9 @@ Mooncake repository rather than maintained as a standalone demo.
   Encoder when the handle is valid.
 - Prefill-generated paged KV cache is transferred to Decode through the vLLM
   save/load connector path using grouped, layered Mooncake transfer.
-- Real Qwen3-VL launchers and strict no-fallback gates validate the complete
-  E-to-P-to-D path.
+- Real Qwen3-VL launchers and strict no-fallback artifact gates validate the
+  captured direct E-to-P-to-D path; current release still requires separate
+  deterministic-golden, restart, multi-node, and RDMA gates.
 
 ### 2. Agent State Cloning
 
@@ -52,6 +53,8 @@ Mooncake repository rather than maintained as a standalone demo.
   layer save/load events.
 - TCP provides a portable direct path; SHM, RDMA, and intra-node NVLink
   selections are exposed through the same transport policy and telemetry.
+  A CPU SHM smoke path is never labelled RDMA; the current environment has no
+  validated RDMA evidence.
 - Prefill-to-Decode affinity maps workers to favorable physical links while
   preserving load-aware routing.
 
@@ -75,8 +78,8 @@ Mooncake repository rather than maintained as a standalone demo.
 
 ### Upstream-ready contribution structure
 
-The implementation follows Mooncake ownership boundaries and is organized as
-four focused review areas inside one integration PR:
+The implementation follows Mooncake ownership boundaries and can be reviewed
+as four focused changes:
 
 1. Transfer Engine and intra-node transport.
 2. Encoder-to-Prefill FeatureHandle and hidden-state integration.
@@ -114,8 +117,7 @@ four focused review areas inside one integration PR:
 
 - Upstream project: <https://github.com/kvcache-ai/Mooncake>
 - Submission repository: <https://github.com/Pinoeer-kingxi/Mooncake>
-- Submission branch: `feature/epd-vllm-multimodal-agent`
-- Main upstream PR: <https://github.com/kvcache-ai/Mooncake/pull/2836>
+- Submission branch: `epd-vllm-serve-20260709-a6000`
 - Overview: [`README.md`](README.md)
 - Design: [`DESIGN.md`](DESIGN.md)
 - Evaluation: [`EVALUATION.md`](EVALUATION.md)
@@ -194,7 +196,7 @@ efficiency.
 
 | Verification | Result |
 | --- | ---: |
-| Full EPD regression | 371 passed, 1 skipped |
+| Full EPD regression (CPU checkout, 2026-07-13) | 439 passed, 19 skipped |
 | Mooncake Store service API | 72 passed |
 | Runtime/security boundary subset | 52 passed |
 | Strict real-EPD gate | Pass |
@@ -203,11 +205,19 @@ efficiency.
 The compact public evidence record is
 [`artifacts/2026-07-10/benchmark_summary.json`](artifacts/2026-07-10/benchmark_summary.json).
 
+RDMA, multi-node continuation, CUDA IPC/NVLink Omni, and real-model GPU
+results remain hardware-gated and are not claimed by the current CPU suite.
+`scripts/run_omni_worker_pipeline_e2e.py --transport rdma` reports an explicit
+capability skip rather than silently falling back to a TCP or SHM label.
+The archived 4-GPU-versus-1-GPU comparison is scale-out-only and its 12/16
+exact-text result does not satisfy deterministic or equal-resource throughput
+release criteria. Strong-system baselines and the complete ablation matrix
+remain planned hardware evidence, not completed claims.
+
 ## Community contribution
 
 This submission contributes reusable Mooncake infrastructure rather than a
 single fixed deployment: direct buffer lifecycle, layered transfer semantics,
 vLLM hot-path integration, Agent state ownership, scheduling/backpressure,
-artifact gates, and reproducible benchmark entry points. The primary PR keeps
-the end-to-end contract together while subsystem-oriented commits support
-focused upstream review; smaller follow-up PRs can be extracted when requested.
+artifact gates, and reproducible benchmark entry points. The proposed PR split
+keeps each ownership boundary small enough for focused upstream review.

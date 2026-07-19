@@ -1,10 +1,15 @@
-"""Workspace-scoped runtime patches for Mooncake EPD real vLLM serving.
+"""Temporary compatibility carrier for Mooncake EPD vLLM hooks.
 
 This module is loaded automatically by Python when the workspace root is on
 ``PYTHONPATH``. The generated vLLM serving scripts already export that path,
 so the patch stays local to this project instead of mutating site-packages.
 
-Patch scope:
+New EPD workers must use ``mooncake_epd.integrations.vllm.launcher``.  This
+module remains only for existing generated scripts that explicitly set
+``MOONCAKE_EPD_ENABLE_VLLM_PATCHES=1``; it never patches a normal Python/vLLM
+process.  The explicit adapter owns capability probing and installation.
+
+Legacy hook scope:
 1. Allow ``SamplingParams(max_tokens=0)`` for prompt-only prefill.
 2. Finalize prompt-only prefill requests after the prompt forward completes so
    KV handoff metadata is emitted without sampling a first decode token.
@@ -280,6 +285,396 @@ def _flush_decode_engine_timing_locked(*, force: bool) -> None:
 
     _flush_decode_engine_timing(force=force)
 
+
+def _remove_prompt_only_sample_outputs(
+    outputs: list[Any],
+    request_id: str,
+) -> list[Any]:
+    """Remove only sampled-token outputs for one prompt-only request.
+
+    vLLM computes prompt logits and may materialize one sampled token before
+    the scheduler patch finalizes ``max_tokens=0``.  That token has not been
+    forwarded through the model and is not part of the published prompt KV.
+    It must not escape through the OpenAI response, otherwise Prefill appears
+    to have generated a semantic continuation that Decode will independently
+    sample again.
+    """
+
+    retained: list[Any] = []
+    removed: list[Any] = []
+    for output in list(outputs or []):
+        same_request = str(getattr(output, "request_id", "") or "") == str(
+            request_id
+        )
+        sampled_tokens = list(getattr(output, "new_token_ids", None) or [])
+        if same_request and sampled_tokens:
+            removed.append(output)
+        else:
+            retained.append(output)
+    outputs[:] = retained
+    return removed
+
+
+def _patch_vllm_prompt_envelope_metadata() -> None:
+    """Capture exact MM placeholder spans from the already-executed render.
+
+    The prompt-only OpenAI response natively exposes prompt token IDs but not
+    the multimodal placeholder positions used to build its EngineInput.
+    Re-rendering in the proxy would repeat the expensive MM preprocessing that
+    stage B removes.  A task-local capture around the existing render call
+    exports only token IDs, hashes, and ranges; it never exports media bytes or
+    tensors.
+    """
+
+    try:
+        import contextvars
+        import hashlib
+        from vllm.entrypoints.openai.chat_completion.serving import (
+            OpenAIServingChat,
+        )
+    except Exception:
+        return
+    if getattr(
+        OpenAIServingChat.render_chat_request,
+        "_mooncake_epd_prompt_envelope_patch",
+        False,
+    ):
+        return
+
+    capture: contextvars.ContextVar[dict[str, Any] | None] = (
+        contextvars.ContextVar(
+            "mooncake_epd_prompt_envelope_capture", default=None
+        )
+    )
+    original_render = OpenAIServingChat.render_chat_request
+    original_create = OpenAIServingChat.create_chat_completion
+    structural_metadata_by_hash: OrderedDict[str, dict[str, Any]] = (
+        OrderedDict()
+    )
+    structural_metadata_limit = 4096
+
+    def _range_dict(value: Any) -> dict[str, int]:
+        if isinstance(value, dict):
+            offset = value.get("offset", 0)
+            length = value.get("length", 0)
+        else:
+            offset = getattr(value, "offset", 0)
+            length = getattr(value, "length", 0)
+        return {
+            # Preserve the exact renderer values.  The versioned envelope
+            # performs fail-closed range validation; coercing negatives here
+            # would turn corrupted metadata into a different valid range.
+            "offset": int(offset or 0),
+            "length": int(length or 0),
+        }
+
+    def _small_mm_metadata(engine_input: dict[str, Any]) -> dict[str, Any]:
+        allowed_keys = {
+            "image_grid_thw",
+            "video_grid_thw",
+            "second_per_grid_ts",
+            "image_sizes",
+        }
+        result: dict[str, list[dict[str, Any]]] = {}
+        raw_kwargs = engine_input.get("mm_kwargs") or {}
+        for modality, items in dict(raw_kwargs).items():
+            serialized_items: list[dict[str, Any]] = []
+            for item in list(items or []):
+                values = (
+                    item.get_data()
+                    if hasattr(item, "get_data")
+                    else dict(item or {})
+                )
+                serialized: dict[str, Any] = {}
+                for key in allowed_keys:
+                    if key not in values:
+                        continue
+                    value = values[key]
+                    if hasattr(value, "detach"):
+                        value = value.detach().cpu().tolist()
+                    elif hasattr(value, "tolist"):
+                        value = value.tolist()
+                    serialized[key] = value
+                serialized_items.append(serialized)
+            if serialized_items:
+                result[str(modality)] = serialized_items
+        return result
+
+    async def _patched_render(self: Any, request: Any) -> Any:
+        result = await original_render(self, request)
+        try:
+            if not isinstance(result, tuple) or len(result) != 2:
+                return result
+            engine_inputs = list(result[1] or [])
+            if len(engine_inputs) != 1:
+                return result
+            engine_input = engine_inputs[0]
+            if not isinstance(engine_input, dict):
+                return result
+            token_ids = [
+                int(token_id)
+                for token_id in list(
+                    engine_input.get("prompt_token_ids") or []
+                )
+            ]
+            raw_placeholders = dict(
+                engine_input.get("mm_placeholders") or {}
+            )
+            placeholders = {
+                str(modality): [
+                    _range_dict(item) for item in list(ranges or [])
+                ]
+                for modality, ranges in raw_placeholders.items()
+            }
+            raw_hashes = dict(engine_input.get("mm_hashes") or {})
+            mm_hashes = {
+                str(modality): [
+                    str(item) for item in list(items or [])
+                ]
+                for modality, items in raw_hashes.items()
+            }
+            mm_metadata = _small_mm_metadata(engine_input)
+            for modality, hashes in mm_hashes.items():
+                metadata_items = list(mm_metadata.get(modality) or [])
+                restored_items: list[dict[str, Any]] = []
+                for index, mm_hash in enumerate(hashes):
+                    item = (
+                        dict(metadata_items[index])
+                        if index < len(metadata_items)
+                        and metadata_items[index]
+                        else {}
+                    )
+                    if item:
+                        structural_metadata_by_hash[mm_hash] = dict(item)
+                        structural_metadata_by_hash.move_to_end(mm_hash)
+                        while (
+                            len(structural_metadata_by_hash)
+                            > structural_metadata_limit
+                        ):
+                            structural_metadata_by_hash.popitem(last=False)
+                    else:
+                        cached = structural_metadata_by_hash.get(mm_hash)
+                        if cached is not None:
+                            item = dict(cached)
+                            structural_metadata_by_hash.move_to_end(mm_hash)
+                    restored_items.append(item)
+                if restored_items:
+                    mm_metadata[modality] = restored_items
+            capture.set(
+                {
+                    "version": 1,
+                    "prompt_token_ids": token_ids,
+                    "prompt_token_sha256": hashlib.sha256(
+                        json.dumps(
+                            token_ids, separators=(",", ":")
+                        ).encode("utf-8")
+                    ).hexdigest(),
+                    "mm_placeholders": placeholders,
+                    "mm_hashes": mm_hashes,
+                    "mm_metadata": mm_metadata,
+                }
+            )
+        except Exception:
+            if _strict_no_fallback():
+                raise
+            logger.exception("Mooncake prompt envelope capture skipped")
+        return result
+
+    async def _patched_create(
+        self: Any,
+        request: Any,
+        raw_request: Any = None,
+    ) -> Any:
+        token = capture.set(None)
+        try:
+            response = await original_create(self, request, raw_request)
+            metadata = getattr(request, "metadata", None)
+            is_prompt_only = bool(
+                isinstance(metadata, dict)
+                and metadata.get("mooncake_epd_prompt_only_prefill")
+            )
+            captured = capture.get()
+            if is_prompt_only and captured is not None:
+                setattr(
+                    response,
+                    "mooncake_epd_prompt_envelope",
+                    dict(captured),
+                )
+            return response
+        finally:
+            capture.reset(token)
+
+    _patched_render._mooncake_epd_prompt_envelope_patch = True  # type: ignore[attr-defined]
+    _patched_create._mooncake_epd_prompt_envelope_patch = True  # type: ignore[attr-defined]
+    OpenAIServingChat.render_chat_request = _patched_render  # type: ignore[method-assign]
+    OpenAIServingChat.create_chat_completion = _patched_create  # type: ignore[method-assign]
+    logger.info("enabled Mooncake EPD prompt envelope metadata capture")
+
+
+def _patch_vllm_decode_token_multimodal_metadata() -> None:
+    """Restore MM request identity without restoring media on Decode.
+
+    vLLM renders a Completion token array as a text ``EngineInput``.  Remote
+    KV produced by a multimodal Chat request is keyed and scheduled with MM
+    placeholder/hash metadata; dropping that identity can produce valid HTTP
+    responses from the wrong continuation state.  The proxy's checksummed
+    envelope carries only Prefill-rendered hashes and token ranges.  Rebuild a
+    multimodal ``EngineInput`` with inert item descriptors so the scheduler
+    sees the same identity while never receiving image/video/audio bytes.
+
+    The inert descriptors are safe only for remote-prefill requests where all
+    MM placeholder tokens are covered by transferred KV.  If vLLM attempts to
+    schedule the encoder, the empty descriptor fails rather than recomputing.
+    """
+
+    try:
+        import hashlib
+        from vllm.entrypoints.openai.completion.serving import (
+            OpenAIServingCompletion,
+        )
+        from vllm.multimodal.inputs import (
+            MultiModalFieldElem,
+            MultiModalKwargsItem,
+            MultiModalSharedField,
+            PlaceholderRange,
+        )
+        import torch
+    except Exception:
+        return
+    if getattr(
+        OpenAIServingCompletion.render_completion_request,
+        "_mooncake_epd_decode_token_mm_patch",
+        False,
+    ):
+        return
+
+    original_render = OpenAIServingCompletion.render_completion_request
+
+    def _canonical_sha256(value: Any) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                value,
+                ensure_ascii=True,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+    async def _patched_render(self: Any, request: Any) -> Any:
+        result = await original_render(self, request)
+        metadata = getattr(request, "metadata", None)
+        if not isinstance(metadata, dict) or not bool(
+            metadata.get("mooncake_epd_decode_media_stripped")
+        ):
+            return result
+        envelope = metadata.get("mooncake_epd_decode_token_envelope")
+        if not isinstance(envelope, dict):
+            raise ValueError("missing Mooncake Decode token envelope metadata")
+        if (
+            envelope.get("kind")
+            != "mooncake_epd.decode_token_envelope"
+            or int(envelope.get("version", 0) or 0) != 1
+        ):
+            raise ValueError("unsupported Mooncake Decode token envelope")
+        if not isinstance(result, list) or len(result) != 1:
+            raise ValueError(
+                "Mooncake Decode token path requires one rendered prompt"
+            )
+        engine_input = result[0]
+        if not isinstance(engine_input, dict):
+            raise ValueError("Decode renderer did not return an EngineInput")
+        token_ids = [
+            int(token_id)
+            for token_id in list(
+                engine_input.get("prompt_token_ids") or []
+            )
+        ]
+        if int(envelope.get("prompt_token_count", -1)) != len(token_ids):
+            raise ValueError("Decode renderer prompt length mismatch")
+        if str(envelope.get("prompt_token_sha256") or "") != (
+            _canonical_sha256(token_ids)
+        ):
+            raise ValueError("Decode renderer prompt token digest mismatch")
+
+        spans = envelope.get("multimodal_placeholder_spans") or {}
+        mm_hashes = envelope.get("render_multimodal_hashes") or {}
+        mm_metadata = envelope.get("render_multimodal_metadata") or {}
+        if not spans and not mm_hashes:
+            return result
+        if not isinstance(spans, dict) or not isinstance(mm_hashes, dict):
+            raise ValueError("Decode renderer MM metadata must be objects")
+        if str(
+            envelope.get("multimodal_placeholder_spans_sha256") or ""
+        ) != _canonical_sha256(spans):
+            raise ValueError("Decode renderer MM placeholder digest mismatch")
+        if str(envelope.get("render_multimodal_hashes_sha256") or "") != (
+            _canonical_sha256(mm_hashes)
+        ):
+            raise ValueError("Decode renderer MM hash digest mismatch")
+        if str(
+            envelope.get("render_multimodal_metadata_sha256") or ""
+        ) != _canonical_sha256(mm_metadata):
+            raise ValueError("Decode renderer MM structural metadata mismatch")
+        if set(spans) != set(mm_hashes):
+            raise ValueError("Decode renderer MM modalities mismatch")
+        if set(spans) != set(mm_metadata):
+            raise ValueError(
+                "Decode renderer MM structural metadata modalities mismatch"
+            )
+
+        placeholders: dict[str, list[Any]] = {}
+        kwargs_items: dict[str, list[Any]] = {}
+        normalized_hashes: dict[str, list[str]] = {}
+        for modality, raw_ranges in spans.items():
+            hashes = [str(value) for value in list(mm_hashes[modality])]
+            ranges = list(raw_ranges or [])
+            metadata_items = list(mm_metadata[modality] or [])
+            if (
+                not ranges
+                or len(hashes) != len(ranges)
+                or len(metadata_items) != len(ranges)
+            ):
+                raise ValueError(
+                    "Decode renderer MM item count mismatch for "
+                    f"{modality!r}"
+                )
+            placeholders[str(modality)] = [
+                PlaceholderRange(
+                    offset=int(item["offset"]),
+                    length=int(item["length"]),
+                )
+                for item in ranges
+            ]
+            normalized_hashes[str(modality)] = hashes
+            rebuilt_items: list[Any] = []
+            for item in metadata_items:
+                if not isinstance(item, dict) or not item:
+                    raise ValueError(
+                        "Decode renderer MM structural item is empty"
+                    )
+                fields = {}
+                for key, value in item.items():
+                    tensor = torch.tensor(value)
+                    fields[str(key)] = MultiModalFieldElem(
+                        data=tensor,
+                        field=MultiModalSharedField(batch_size=1),
+                    )
+                rebuilt_items.append(MultiModalKwargsItem(fields))
+            kwargs_items[str(modality)] = rebuilt_items
+        rebuilt = dict(engine_input)
+        rebuilt["type"] = "multimodal"
+        rebuilt["mm_placeholders"] = placeholders
+        rebuilt["mm_hashes"] = normalized_hashes
+        rebuilt["mm_kwargs"] = kwargs_items
+        result[0] = rebuilt
+        return result
+
+    _patched_render._mooncake_epd_decode_token_mm_patch = True  # type: ignore[attr-defined]
+    OpenAIServingCompletion.render_completion_request = _patched_render  # type: ignore[method-assign]
+    logger.info("enabled Mooncake EPD media-free Decode MM identity")
+
+
 def _patch_vllm_prompt_only_prefill() -> None:
     try:
         from vllm.sampling_params import SamplingParams
@@ -382,6 +777,14 @@ def _patch_vllm_prompt_only_prefill() -> None:
             prompt_only_requests.append(request)
 
         for request in prompt_only_requests:
+            eco = engine_core_outputs.setdefault(
+                request.client_index,
+                EngineCoreOutputs(),
+            )
+            discarded_outputs = _remove_prompt_only_sample_outputs(
+                eco.outputs,
+                request.request_id,
+            )
             status_before_stop = request.status
             request.status = RequestStatus.FINISHED_LENGTH_CAPPED
             finish_reason = request.get_finished_reason()
@@ -393,17 +796,25 @@ def _patch_vllm_prompt_only_prefill() -> None:
             else:
                 self.waiting.remove_requests({request})
 
-            eco = engine_core_outputs.setdefault(
-                request.client_index,
-                EngineCoreOutputs(),
-            )
+            # Preserve events/prefill stats already detached by upstream while
+            # replacing only its sampled-token payload with the prompt-only
+            # terminal output.
+            discarded = discarded_outputs[-1] if discarded_outputs else None
+            events = request.take_events()
+            if not events and discarded is not None:
+                discarded_events = getattr(discarded, "events", None)
+                if discarded_events is not None:
+                    events = discarded_events
+            prefill_stats = request.take_prefill_stats()
+            if prefill_stats is None and discarded is not None:
+                prefill_stats = getattr(discarded, "prefill_stats", None)
             eco.outputs.append(
                 EngineCoreOutput(
                     request_id=request.request_id,
                     new_token_ids=[],
                     finish_reason=finish_reason,
-                    events=request.take_events(),
-                    prefill_stats=request.take_prefill_stats(),
+                    events=events,
+                    prefill_stats=prefill_stats,
                     kv_transfer_params=kv_transfer_params,
                     trace_headers=request.trace_headers,
                     num_nans_in_logits=request.num_nans_in_logits,
@@ -413,7 +824,10 @@ def _patch_vllm_prompt_only_prefill() -> None:
         return engine_core_outputs
 
     Scheduler.update_from_output = _patched_update_from_output  # type: ignore[method-assign]
+    _patched_update_from_output._mooncake_epd_prompt_only_patch = True  # type: ignore[attr-defined]
+    _patched_update_from_output._mooncake_epd_prompt_only_protocol_version = 2  # type: ignore[attr-defined]
     SamplingParams._mooncake_epd_prompt_only_patch = True  # type: ignore[attr-defined]
+    SamplingParams._mooncake_epd_prompt_only_protocol_version = 2  # type: ignore[attr-defined]
     logger.info("enabled Mooncake EPD prompt-only prefill patch for vLLM")
 
 
@@ -491,6 +905,14 @@ def _patch_vllm_feature_handle_injection() -> None:
         ("vllm.model_executor.models.qwen3_vl", "Qwen3VLForConditionalGeneration"),
         ("vllm.model_executor.models.qwen3_vl", "Qwen3VLModel"),
         ("vllm.model_executor.models.qwen2_5_vl", "Qwen2_5_VLForConditionalGeneration"),
+        # Qwen2.5-Omni Thinker's image input accepts the native
+        # ``image_embeds`` + ``image_grid_thw`` form.  This patch covers only
+        # the Thinker multimodal path; it does not imply full Omni talker /
+        # diffusion-pipeline support.
+        (
+            "vllm.model_executor.models.qwen2_5_omni_thinker",
+            "Qwen2_5OmniThinkerForConditionalGeneration",
+        ),
         ("vllm.model_executor.models.qwen2_vl", "Qwen2VLForConditionalGeneration"),
     )
     methods = (
@@ -520,6 +942,156 @@ def _patch_vllm_feature_handle_injection() -> None:
         raise RuntimeError(
             "Mooncake EPD strict mode requires a compatible Qwen-VL multimodal image_embeds hook"
         )
+
+
+def _patch_vllm_qwen25_omni_precomputed_image_embed_contract() -> bool:
+    """Normalize and observe vLLM 0.23 Qwen2.5-Omni image embeddings.
+
+    ``Qwen2_5OmniConditionalGenerationMixin._process_image_input`` returns a
+    single tensor directly for its ``image_embeds`` branch.  vLLM's
+    ``GPUModelRunner`` treats the return value as a sequence of per-image
+    outputs, so a ``[tokens, hidden]`` tensor is iterated as ``tokens`` image
+    outputs and the strict encoder-output sanity check fails.  Raw pixels take
+    the normal ``Tensor.split`` branch and are already a tuple.
+
+    Mooncake EPD intentionally supplies the same post-vision hidden tensor via
+    a FeatureHandle.  Wrap only that precomputed branch in a one-item tuple and
+    record it *after* vLLM has accepted the input.  The latter is deliberately
+    at ``_process_image_input`` rather than the earlier FeatureHandle injection
+    boundary: a positive metric then proves that the model consumed native
+    ``image_embeds`` rather than merely that the proxy constructed them.
+
+    Raw-pixel, video, and audio behavior is untouched.  This is a compatibility
+    repair and observability hook for the Thinker image path, not a claim of
+    full Omni talker/diffusion support.
+    """
+
+    try:
+        module = __import__(
+            "vllm.model_executor.models.qwen2_5_omni_thinker",
+            fromlist=["Qwen2_5OmniThinkerForConditionalGeneration"],
+        )
+        cls = getattr(module, "Qwen2_5OmniThinkerForConditionalGeneration")
+    except Exception:
+        return False
+
+    original = getattr(cls, "_process_image_input", None)
+    if original is None or getattr(
+        original,
+        "_mooncake_epd_qwen25_omni_image_embed_contract_patch",
+        False,
+    ):
+        return False
+    if not callable(original):
+        return False
+
+    def _patched(self: Any, image_input: Any, *args: Any, **kwargs: Any) -> Any:
+        result = original(self, image_input, *args, **kwargs)
+        try:
+            input_type = image_input.get("type") if hasattr(image_input, "get") else None
+            if input_type == "image_embeds":
+                import torch
+
+                # This is the exact vLLM model-side branch that skips
+                # ``self.visual(...)``.  Keep the accounting after `original`
+                # returns so malformed/failed model inputs cannot become false
+                # positive EPD evidence.
+                try:
+                    from mooncake_epd.core.state.vllm_mm_hidden_cache import (
+                        get_current_mm_hidden_cache_keys,
+                        record_vllm_precomputed_image_embeds_hit,
+                    )
+
+                    grid_thw = image_input.get("image_grid_thw")
+                    count = 1
+                    if isinstance(grid_thw, torch.Tensor) and grid_thw.ndim >= 2:
+                        count = max(1, int(grid_thw.shape[0]))
+                    record_vllm_precomputed_image_embeds_hit(
+                        count,
+                        stable_keys=get_current_mm_hidden_cache_keys(),
+                    )
+                except Exception:
+                    # Observability must not change vLLM model semantics.  The
+                    # strict runner separately requires a positive persisted
+                    # metric before accepting an EPD result.
+                    pass
+
+                if isinstance(result, torch.Tensor):
+                    return (result,)
+        except Exception:
+            # Preserve vLLM's native behavior if an unexpected custom input
+            # object cannot be inspected.  Strict FeatureHandle resolution is
+            # still enforced earlier in the injection path.
+            pass
+        return result
+
+    _patched._mooncake_epd_qwen25_omni_image_embed_contract_patch = True  # type: ignore[attr-defined]
+    _patched._mooncake_epd_feature_handle_patch = True  # type: ignore[attr-defined]
+    setattr(cls, "_process_image_input", _patched)
+    logger.info("enabled Mooncake EPD Qwen2.5-Omni precomputed image-embed contract patch")
+    return True
+
+
+def _patch_vllm_qwen25_vl_precomputed_image_embed_observability() -> bool:
+    """Record Qwen2.5-VL's actual native ``image_embeds`` consumption.
+
+    vLLM 0.23's Qwen2.5-VL implementation supports precomputed embeddings but
+    does not emit the hidden-state-skip metric used by the strict EPD gate.
+    The wrapper is intentionally limited to the successful model-side
+    ``_process_image_input`` call.  It neither changes tensors nor alters the
+    raw-pixel branch, so a non-zero metric remains evidence that the vision
+    tower was bypassed for that invocation.
+    """
+
+    try:
+        module = __import__(
+            "vllm.model_executor.models.qwen2_5_vl",
+            fromlist=["Qwen2_5_VLForConditionalGeneration"],
+        )
+        cls = getattr(module, "Qwen2_5_VLForConditionalGeneration")
+    except Exception:
+        return False
+
+    original = getattr(cls, "_process_image_input", None)
+    if original is None or getattr(
+        original,
+        "_mooncake_epd_qwen25_vl_precomputed_image_embed_metric_patch",
+        False,
+    ):
+        return False
+    if not callable(original):
+        return False
+
+    def _patched(self: Any, image_input: Any, *args: Any, **kwargs: Any) -> Any:
+        result = original(self, image_input, *args, **kwargs)
+        try:
+            input_type = image_input.get("type") if hasattr(image_input, "get") else None
+            if input_type == "image_embeds":
+                import torch
+                from mooncake_epd.core.state.vllm_mm_hidden_cache import (
+                    get_current_mm_hidden_cache_keys,
+                    record_vllm_precomputed_image_embeds_hit,
+                )
+
+                grid_thw = image_input.get("image_grid_thw")
+                count = 1
+                if isinstance(grid_thw, torch.Tensor) and grid_thw.ndim >= 2:
+                    count = max(1, int(grid_thw.shape[0]))
+                record_vllm_precomputed_image_embeds_hit(
+                    count,
+                    stable_keys=get_current_mm_hidden_cache_keys(),
+                )
+        except Exception:
+            # The strict result gate will reject missing evidence.  Never turn
+            # a telemetry write error into a model-serving error here.
+            pass
+        return result
+
+    _patched._mooncake_epd_qwen25_vl_precomputed_image_embed_metric_patch = True  # type: ignore[attr-defined]
+    _patched._mooncake_epd_feature_handle_patch = True  # type: ignore[attr-defined]
+    setattr(cls, "_process_image_input", _patched)
+    logger.info("enabled Mooncake EPD Qwen2.5-VL precomputed image-embed metric patch")
+    return True
 
 
 def _patch_vllm_gpu_model_runner_feature_handles() -> None:
@@ -631,12 +1203,6 @@ def _patch_vllm_gpu_model_runner_kv_params() -> None:
     logger.info("enabled Mooncake EPD GPUModelRunner kv_transfer_params attach hook")
 
 
-if _vllm_patches_enabled():
-    _patch_vllm_prompt_only_prefill()
-    _patch_vllm_feature_handle_injection()
-    _patch_vllm_gpu_model_runner_kv_params()
-    _patch_vllm_gpu_model_runner_feature_handles()
-
 # ---------------------------------------------------------------------------
 # Prefill-owned E→P direct FeatureBundle allocation routes
 # ---------------------------------------------------------------------------
@@ -647,6 +1213,188 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _install_vllm_capability_route(app: Any) -> None:
+    """Expose the installed adapter protocol from the actual API process."""
+
+    if getattr(app, "_mooncake_epd_capability_route", False):
+        return
+    try:
+        import hashlib
+        from mooncake_epd.integrations.vllm.adapter import (
+            adapter_installation_report,
+        )
+        from mooncake_epd.integrations.vllm.capabilities import (
+            PROMPT_ONLY_PROTOCOL_VERSION,
+        )
+        from mooncake_epd.core.control.decode_token_envelope import (
+            DECODE_TOKEN_ENVELOPE_PROTOCOL_VERSION,
+        )
+        from mooncake_epd.core.state.kv_transfer_manifest_v2 import (
+            KV_TRANSFER_MANIFEST_SCHEMA_V2,
+        )
+    except Exception as exc:
+        logger.error("Mooncake vLLM capability route install failed: %s", exc)
+        if _strict_no_fallback():
+            raise
+        return
+
+    model_contract: dict[str, str] | None = None
+
+    def _file_sha256(paths: list[Any]) -> str:
+        digest = hashlib.sha256()
+        included = 0
+        for path in paths:
+            try:
+                if not path.is_file():
+                    continue
+                payload = path.read_bytes()
+            except OSError:
+                continue
+            digest.update(path.name.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(payload)
+            digest.update(b"\0")
+            included += 1
+        return digest.hexdigest() if included else ""
+
+    def _model_contract() -> dict[str, str]:
+        nonlocal model_contract
+        if model_contract is not None:
+            return dict(model_contract)
+        from pathlib import Path
+
+        model_id = str(os.getenv("MOONCAKE_EPD_MODEL_ID", "") or "")
+        model_path = Path(model_id).expanduser()
+        config: dict[str, Any] = {}
+        tokenizer_config: dict[str, Any] = {}
+        try:
+            config = json.loads((model_path / "config.json").read_text())
+        except (OSError, TypeError, ValueError):
+            config = {}
+        try:
+            tokenizer_config = json.loads(
+                (model_path / "tokenizer_config.json").read_text()
+            )
+        except (OSError, TypeError, ValueError):
+            tokenizer_config = {}
+        architecture = ""
+        architectures = config.get("architectures")
+        if isinstance(architectures, list) and architectures:
+            architecture = str(architectures[0] or "")
+        model_family = (
+            str(config.get("model_type") or "")
+            or architecture
+            or model_path.name
+        )
+        chat_template = tokenizer_config.get("chat_template")
+        if isinstance(chat_template, dict):
+            chat_template = json.dumps(
+                chat_template,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            )
+        if not isinstance(chat_template, str):
+            chat_template = ""
+        if not chat_template:
+            try:
+                raw_template = json.loads(
+                    (model_path / "chat_template.json").read_text()
+                )
+                if isinstance(raw_template, dict):
+                    raw_template = raw_template.get("chat_template")
+                if isinstance(raw_template, str):
+                    chat_template = raw_template
+            except (OSError, TypeError, ValueError):
+                pass
+        tokenizer_paths = [
+            model_path / filename
+            for filename in (
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "special_tokens_map.json",
+                "vocab.json",
+                "merges.txt",
+                "tokenizer.model",
+                "sentencepiece.bpe.model",
+            )
+        ]
+        model_contract = {
+            "model_family": model_family,
+            "model_config_sha256": _file_sha256(
+                [model_path / "config.json"]
+            ),
+            "tokenizer_id_sha256": _file_sha256(tokenizer_paths),
+            "chat_template_sha256": (
+                hashlib.sha256(chat_template.encode("utf-8")).hexdigest()
+                if chat_template
+                else ""
+            ),
+        }
+        return dict(model_contract)
+
+    async def _capabilities() -> dict[str, Any]:
+        report = dict(adapter_installation_report() or {})
+        model_id = str(os.getenv("MOONCAKE_EPD_MODEL_ID", "") or "")
+        contract = _model_contract()
+        installed_protocol = int(
+            report.get("prompt_only_protocol_version", 0) or 0
+        )
+        report.update(
+            {
+                "role": str(os.getenv("MOONCAKE_EPD_VLLM_ROLE", "") or ""),
+                "kv_role": str(os.getenv("MOONCAKE_EPD_KV_ROLE", "") or ""),
+                "worker_id": str(os.getenv("MOONCAKE_EPD_WORKER_ID", "") or ""),
+                "engine_id": str(os.getenv("MOONCAKE_EPD_ENGINE_ID", "") or ""),
+                "model_id_sha256": (
+                    hashlib.sha256(model_id.encode("utf-8")).hexdigest()
+                    if model_id
+                    else ""
+                ),
+                **contract,
+                "kv_manifest_schema_version": (
+                    KV_TRANSFER_MANIFEST_SCHEMA_V2
+                ),
+                "prompt_only_protocol_expected": PROMPT_ONLY_PROTOCOL_VERSION,
+                "prompt_only_verified": bool(
+                    report.get("installed", False)
+                    and report.get("prompt_only_ready", False)
+                    and report.get("prompt_only_patch_installed", False)
+                    and installed_protocol == PROMPT_ONLY_PROTOCOL_VERSION
+                ),
+                # vLLM's Completion API accepts ``prompt`` as token IDs.  EPD
+                # uses that native path to avoid sending the original
+                # multimodal Chat body to Decode after the envelope has been
+                # validated by the proxy.
+                "decode_token_envelope_protocol_version": (
+                    DECODE_TOKEN_ENVELOPE_PROTOCOL_VERSION
+                ),
+                "decode_token_prompt_ready": bool(
+                    report.get("installed", False)
+                    and report.get(
+                        "decode_token_multimodal_patch_installed", False
+                    )
+                    and str(
+                        os.getenv("MOONCAKE_EPD_VLLM_ROLE", "") or ""
+                    ).strip().lower()
+                    == "decode"
+                    and str(
+                        os.getenv("MOONCAKE_EPD_KV_ROLE", "") or ""
+                    ).strip().lower()
+                    == "kv_consumer"
+                    and getattr(app.state, "openai_serving_completion", None)
+                    is not None
+                ),
+                "decode_token_endpoint": "/v1/completions",
+            }
+        )
+        return report
+
+    app.get("/mooncake_epd/capabilities")(_capabilities)
+    setattr(app, "_mooncake_epd_capability_route", True)
+    logger.info("enabled Mooncake EPD vLLM capability route")
 
 
 def _install_direct_feature_buffer_routes(app: Any) -> None:
@@ -779,6 +1527,45 @@ def _install_direct_feature_buffer_routes(app: Any) -> None:
         for feature_id in feature_ids:
             registry.release(feature_id)
 
+    def _lookup_ready_targets(
+        feature_ids: list[object],
+        *,
+        lease_count: int,
+    ) -> tuple[list[dict[str, Any]], list[str], float]:
+        """Resolve ready direct targets without blocking the ASGI event loop.
+
+        ``lookup_ready`` only holds the registry's narrow thread lock, but
+        exporting a direct target also reads CUDA-backed tensor pointers and
+        serializes the descriptor.  At concurrency that short synchronous
+        section previously ran on the Prefill vLLM API loop, where it could
+        delay unrelated ``/inference/v1/generate`` and release requests.  The
+        registry is explicitly thread-safe, so execute the whole lookup/export
+        unit in the default worker pool and report its service time separately
+        from proxy-to-server RTT.
+        """
+
+        started = time.perf_counter()
+        hits: list[dict[str, Any]] = []
+        misses: list[str] = []
+        for feature_id in feature_ids:
+            allocation = registry.lookup_ready(str(feature_id), lease_count=lease_count)
+            if allocation is None:
+                misses.append(str(feature_id))
+                continue
+            target = allocation.as_direct_target()
+            target["cache_hit"] = True
+            target["publish_required"] = False
+            target["ref_count"] = int(allocation.ref_count)
+            target["lease_count"] = lease_count
+            hits.append(
+                {
+                    "feature_id": str(feature_id),
+                    "descriptor": allocation.descriptor.to_dict(),
+                    "target": target,
+                }
+            )
+        return hits, misses, max(0.0, (time.perf_counter() - started) * 1000.0)
+
     async def _allocate(payload: dict[str, Any]) -> dict[str, Any]:
         raw_descriptors = payload.get("descriptors")
         if raw_descriptors is None and isinstance(payload.get("descriptor"), dict):
@@ -806,30 +1593,30 @@ def _install_direct_feature_buffer_routes(app: Any) -> None:
             raw = [raw]
         if not isinstance(raw, list) or not raw:
             raise HTTPException(status_code=400, detail="lookup requires feature_ids[]")
-        hits = []
-        misses = []
-        for feature_id in raw:
-            allocation = registry.lookup_ready(str(feature_id))
-            if allocation is None:
-                misses.append(str(feature_id))
-                continue
-            target = allocation.as_direct_target()
-            target["cache_hit"] = True
-            target["publish_required"] = False
-            target["ref_count"] = int(allocation.ref_count)
-            hits.append(
-                {
-                    "feature_id": str(feature_id),
-                    "descriptor": allocation.descriptor.to_dict(),
-                    "target": target,
-                }
+        try:
+            lease_count = int(payload.get("lease_count", 1) or 1)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="lookup lease_count must be an integer") from exc
+        # A lease batch is a bounded Proxy-side reservation.  It is only used
+        # with generation fencing and is released on expiry/eviction/shutdown.
+        if lease_count <= 0 or lease_count > 1024:
+            raise HTTPException(status_code=400, detail="lookup lease_count must be in [1, 1024]")
+        try:
+            hits, misses, server_lookup_ms = await asyncio.to_thread(
+                _lookup_ready_targets,
+                list(raw),
+                lease_count=lease_count,
             )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"direct buffer lookup failed: {exc}") from exc
         return {
             "hits": hits,
             "misses": misses,
             "count": len(hits),
             "all_hit": len(hits) == len(raw),
             "worker_id": registry.worker_id,
+            "lease_count": lease_count,
+            "server_lookup_ms": server_lookup_ms,
         }
 
     async def _mark_ready(payload: dict[str, Any]) -> dict[str, Any]:
@@ -910,6 +1697,7 @@ def _patch_vllm_openai_app_direct_feature_buffer_routes() -> None:
     def _patched_build_app(*args: Any, **kwargs: Any) -> Any:
         app = original(*args, **kwargs)
         try:
+            _install_vllm_capability_route(app)
             _install_direct_feature_buffer_routes(app)
         except Exception:
             if _strict_no_fallback():
@@ -922,5 +1710,34 @@ def _patch_vllm_openai_app_direct_feature_buffer_routes() -> None:
     logger.info("enabled Mooncake EPD vLLM build_app direct FeatureBuffer hook")
 
 
-if _vllm_patches_enabled():
-    _patch_vllm_openai_app_direct_feature_buffer_routes()
+def _install_legacy_vllm_adapter() -> None:
+    """Bridge old env-based launchers to the explicit adapter exactly once.
+
+    Keeping this thin avoids a global ``sitecustomize`` side effect in normal
+    Python processes while allowing already generated EPD launch scripts to
+    remain usable during the migration.
+    """
+
+    if not _vllm_patches_enabled():
+        return
+    if str(os.getenv("MOONCAKE_EPD_ADAPTER_COMPAT_BOOTSTRAP", "1")).strip() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        return
+    try:
+        from mooncake_epd.integrations.vllm.adapter import install_vllm_epd_adapter
+
+        install_vllm_epd_adapter()
+    except Exception:
+        if _strict_no_fallback():
+            raise
+        logger.exception(
+            "Mooncake EPD legacy sitecustomize compatibility adapter failed; "
+            "use mooncake_epd.integrations.vllm.launcher for a fail-closed startup"
+        )
+
+
+_install_legacy_vllm_adapter()

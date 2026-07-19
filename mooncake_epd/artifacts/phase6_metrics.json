@@ -1,0 +1,30 @@
+{
+  "dataset": {
+    "total_examples": 8,
+    "by_scenario": {
+      "tool_use_vqa": 2,
+      "multi_turn": 2,
+      "tree_of_thought": 3,
+      "a2a_handoff": 1
+    },
+    "by_image": {
+      "objects": 1,
+      "bar_chart": 1,
+      "room": 2,
+      "document": 1,
+      "map": 3
+    },
+    "unique_images": [
+      "bar_chart",
+      "document",
+      "map",
+      "objects",
+      "room"
+    ]
+  },
+  "selected_examples": [],
+  "baseline": [],
+  "epd_step0": [],
+  "cross_step_reuse": [],
+  "summary": {}
+}

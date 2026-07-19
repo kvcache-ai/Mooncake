@@ -18,6 +18,17 @@ class LayeredTransferWorkerMeta:
     peer_buffer_dispatch_ms: float = 0.0
     peer_buffer_prepare_ms: float = 0.0
     peer_buffer_write_ms: float = 0.0
+    # Time spent waiting to enter the native Mooncake engine transaction.
+    # Keep it separate from ``write_ms``: a saturated connector may have fast
+    # device writes but still queue behind register/transfer/unregister work.
+    peer_buffer_native_engine_lock_wait_ms: float = 0.0
+    # Time spent in the sender thread waiting for request-local CUDA events
+    # recorded after vLLM has enqueued the KV writes.  It is deliberately kept
+    # separate from transport write time so TTFT regressions can distinguish
+    # source-compute pressure from the Mooncake data plane.
+    source_ready_event_waits: int = 0
+    source_ready_event_wait_ms: float = 0.0
+    source_ready_sync_fallbacks: int = 0
     fallback_batches: int = 0
     fallback_bytes: int = 0
     accumulated_group_delay_ms: float = 0.0
@@ -57,6 +68,19 @@ class LayeredTransferWorkerMeta:
                 self.peer_buffer_prepare_ms + other.peer_buffer_prepare_ms
             ),
             peer_buffer_write_ms=self.peer_buffer_write_ms + other.peer_buffer_write_ms,
+            peer_buffer_native_engine_lock_wait_ms=(
+                self.peer_buffer_native_engine_lock_wait_ms
+                + other.peer_buffer_native_engine_lock_wait_ms
+            ),
+            source_ready_event_waits=(
+                self.source_ready_event_waits + other.source_ready_event_waits
+            ),
+            source_ready_event_wait_ms=(
+                self.source_ready_event_wait_ms + other.source_ready_event_wait_ms
+            ),
+            source_ready_sync_fallbacks=(
+                self.source_ready_sync_fallbacks + other.source_ready_sync_fallbacks
+            ),
             fallback_batches=self.fallback_batches + other.fallback_batches,
             fallback_bytes=self.fallback_bytes + other.fallback_bytes,
             accumulated_group_delay_ms=self.accumulated_group_delay_ms + other.accumulated_group_delay_ms,
@@ -118,6 +142,10 @@ class LayeredTransferWorkerMeta:
             and self.peer_buffer_dispatch_ms == 0.0
             and self.peer_buffer_prepare_ms == 0.0
             and self.peer_buffer_write_ms == 0.0
+            and self.peer_buffer_native_engine_lock_wait_ms == 0.0
+            and self.source_ready_event_waits == 0
+            and self.source_ready_event_wait_ms == 0.0
+            and self.source_ready_sync_fallbacks == 0
             and self.fallback_batches == 0
             and self.fallback_bytes == 0
             and self.accumulated_group_delay_ms == 0.0
@@ -154,6 +182,12 @@ class LayeredTransferWorkerMeta:
             "peer_buffer_dispatch_ms": float(self.peer_buffer_dispatch_ms),
             "peer_buffer_prepare_ms": float(self.peer_buffer_prepare_ms),
             "peer_buffer_write_ms": float(self.peer_buffer_write_ms),
+            "peer_buffer_native_engine_lock_wait_ms": float(
+                self.peer_buffer_native_engine_lock_wait_ms
+            ),
+            "source_ready_event_waits": int(self.source_ready_event_waits),
+            "source_ready_event_wait_ms": float(self.source_ready_event_wait_ms),
+            "source_ready_sync_fallbacks": int(self.source_ready_sync_fallbacks),
             "fallback_batches": int(self.fallback_batches),
             "fallback_bytes": int(self.fallback_bytes),
             "accumulated_group_delay_ms": float(self.accumulated_group_delay_ms),
@@ -192,6 +226,18 @@ class LayeredTransferWorkerMeta:
             peer_buffer_dispatch_ms=float(payload.get("peer_buffer_dispatch_ms", 0.0) or 0.0),
             peer_buffer_prepare_ms=float(payload.get("peer_buffer_prepare_ms", 0.0) or 0.0),
             peer_buffer_write_ms=float(payload.get("peer_buffer_write_ms", 0.0) or 0.0),
+            peer_buffer_native_engine_lock_wait_ms=float(
+                payload.get("peer_buffer_native_engine_lock_wait_ms", 0.0) or 0.0
+            ),
+            source_ready_event_waits=int(
+                payload.get("source_ready_event_waits", 0) or 0
+            ),
+            source_ready_event_wait_ms=float(
+                payload.get("source_ready_event_wait_ms", 0.0) or 0.0
+            ),
+            source_ready_sync_fallbacks=int(
+                payload.get("source_ready_sync_fallbacks", 0) or 0
+            ),
             fallback_batches=int(payload.get("fallback_batches", 0) or 0),
             fallback_bytes=int(payload.get("fallback_bytes", 0) or 0),
             accumulated_group_delay_ms=float(payload.get("accumulated_group_delay_ms", 0.0) or 0.0),

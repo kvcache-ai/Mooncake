@@ -20,6 +20,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT.parent) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT.parent))
 
+from mooncake_epd.demo.vllm_integration import SCHEDULER_POLICIES
 from mooncake_epd.scripts.check_real_epd_gate import validate_real_epd_summary
 from mooncake_epd.scripts.run_vllm_online_direct_e2e import run as run_online_direct
 
@@ -35,7 +36,26 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument("--encoder-device", default="cuda:0")
     ap.add_argument("--encoder-dtype", default="bfloat16")
-    ap.add_argument("--encoder-family", choices=["auto", "qwen3_vl", "qwen2_5_omni"], default="auto")
+    ap.add_argument(
+        "--encoder-family",
+        choices=["auto", "qwen3_vl", "qwen2_5_vl", "qwen2_5_omni"],
+        default="auto",
+    )
+    ap.add_argument(
+        "--encoder-runtime",
+        choices=["transformers", "vllm_native"],
+        default=os.getenv("MOONCAKE_EPD_ENCODER_RUNTIME", "transformers"),
+        help=(
+            "E-stage implementation; vllm_native is the Qwen3-VL native "
+            "vision-tower parity path."
+        ),
+    )
+    ap.add_argument(
+        "--direct-engine-protocol",
+        choices=["tcp", "rdma", "nvlink_intra"],
+        default=None,
+        help="Optional E->P FeatureBundle transport override.",
+    )
     ap.add_argument("--encoder-port", type=int, default=8330)
     ap.add_argument("--encoder-request-timeout-s", type=float, default=30.0)
     ap.add_argument("--prefill-gpu", type=int, default=1)
@@ -49,24 +69,122 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--max-num-batched-tokens", type=int, default=0, help="0 keeps the vLLM default")
     ap.add_argument("--max-num-seqs", type=int, default=0, help="0 keeps the vLLM default")
     ap.add_argument("--local-hostname", default="127.0.0.1")
+    ap.add_argument(
+        "--generation-config",
+        default="vllm",
+        help="vLLM generation config value recorded in the benchmark artifact.",
+    )
     ap.add_argument("--timeout", type=float, default=900.0)
+    ap.add_argument(
+        "--startup-timeout",
+        type=float,
+        default=900.0,
+        help="Maximum seconds to wait for vLLM cold start and compilation.",
+    )
     ap.add_argument("--request-timeout", type=float, default=300.0)
     ap.add_argument("--warmup-requests", type=int, default=1)
+    ap.add_argument(
+        "--warmup-cover-dataset-cycle",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "For dataset replay, warm every selected sample at least once before "
+            "measurement so image/prompt shapes are not left cold."
+        ),
+    )
     ap.add_argument("--min-warmup-per-decode", type=int, default=2)
     ap.add_argument("--warmup-concurrency", type=int, default=0)
     ap.add_argument("--repeat-requests", type=int, default=8)
     ap.add_argument("--concurrency", type=int, default=4)
     ap.add_argument("--between-repeat-sleep-s", type=float, default=0.0)
+    ap.add_argument(
+        "--reference-response-summary",
+        default=None,
+        help=(
+            "single_baseline_summary.json from an identical single-vLLM run; "
+            "enforces concurrent completion-hash set inclusion against it."
+        ),
+    )
     ap.add_argument("--prompt", default="Describe the image briefly.")
+    ap.add_argument("--prompt-file", default=None)
+    ap.add_argument(
+        "--request-variation",
+        choices=["none", "unique_prefix", "unique_suffix"],
+        default="none",
+    )
+    ap.add_argument(
+        "--vllm-prefix-cache-mode",
+        choices=["reuse", "isolate"],
+        default="isolate",
+        help=(
+            "isolate is the strict EPD default and uses per-request cache_salt "
+            "without changing model-visible prompt tokens; reuse is an explicit "
+            "prefix-cache ablation that requires output-equivalence evidence."
+        ),
+    )
     ap.add_argument("--workflow-id", default="real-qwenvl-epd-demo")
     ap.add_argument("--max-tokens", type=int, default=32)
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--demo-image", default="room")
     ap.add_argument("--image-url", default=None)
+    ap.add_argument(
+        "--image-urls",
+        nargs="+",
+        default=None,
+        help="Two or more image URLs/data URLs in one request; mutually exclusive with --image-url.",
+    )
+    ap.add_argument(
+        "--dataset-root",
+        default=None,
+        help="Root of mooncake_test_dataset for a strict paired chat-split EPD replay.",
+    )
+    ap.add_argument("--dataset-chat-split", default="dev-small")
+    ap.add_argument("--max-dataset-requests", type=int, default=0)
+    ap.add_argument("--dataset-families", nargs="+", default=None)
+    ap.add_argument(
+        "--dataset-workflow-id-mode",
+        choices=["unique", "source"],
+        default="unique",
+    )
+    ap.add_argument(
+        "--dataset-agent-pd-labels",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    ap.add_argument("--dataset-max-input-len", type=int, default=0)
+    ap.add_argument("--dataset-request-max-tokens", type=int, default=0)
+    ap.add_argument(
+        "--dataset-skip-oversized",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    ap.add_argument("--dataset-image-max-pixels", type=int, default=0)
     ap.add_argument("--layers-per-group", type=int, default=32)
     ap.add_argument("--max-group-bytes", type=int, default=64 * 1024 * 1024)
     ap.add_argument("--max-transfer-descriptors", type=int, default=512)
     ap.add_argument("--max-transfer-bytes", type=int, default=64 * 1024 * 1024)
+    ap.add_argument(
+        "--tcp-write-completion-ack",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Wait for the TCP receiver's post-GPU-copy acknowledgement before "
+            "Decode consumes a transferred KV group."
+        ),
+    )
+    ap.add_argument(
+        "--transfer-workers",
+        type=int,
+        default=0,
+        help="KV sender workers; 0 selects the protocol-aware default.",
+    )
+    ap.add_argument(
+        "--prefill-decode-affinity",
+        nargs="*",
+        default=None,
+        metavar="PREFILL=DECODE",
+        help="Optional P->D transport-locality pairs.",
+    )
     ap.add_argument(
         "--mooncake-protocol",
         choices=["tcp", "shm", "rdma", "nvlink_intra"],
@@ -80,8 +198,53 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--direct-proxy-handle-cache", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--direct-proxy-handle-cache-max-entries", type=int, default=4096)
     ap.add_argument("--direct-proxy-handle-cache-ttl-s", type=float, default=600.0)
+    ap.add_argument(
+        "--direct-feature-lease-prefetch",
+        type=int,
+        default=1,
+        help=(
+            "Reserve this many generation-fenced E->P direct-buffer references "
+            "per hot descriptor tuple; 1 disables lease pooling."
+        ),
+    )
+    ap.add_argument("--direct-feature-lease-prefetch-max-entries", type=int, default=64)
+    ap.add_argument("--direct-feature-lease-prefetch-ttl-s", type=float, default=30.0)
+    ap.add_argument(
+        "--enable-rendered-prefill-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Reuse generation-fenced Prefill /render artifacts for identical "
+            "immutable requests; disable for an explicit cache ablation."
+        ),
+    )
+    ap.add_argument("--rendered-prefill-cache-max-entries", type=int, default=64)
+    ap.add_argument(
+        "--rendered-prefill-cache-max-bytes",
+        type=int,
+        default=256 * 1024 * 1024,
+    )
+    ap.add_argument("--rendered-prefill-cache-ttl-s", type=float, default=300.0)
     ap.add_argument("--direct-cache-max-entries", type=int, default=64)
     ap.add_argument("--direct-cache-max-bytes", type=int, default=2 * 1024 * 1024 * 1024)
+    ap.add_argument(
+        "--release-direct-feature-buffers-after-prefill",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Release E->P direct-buffer leases after Prefill. Disable only "
+            "for an explicitly validated proxy FeatureHandle-cache experiment."
+        ),
+    )
+    ap.add_argument(
+        "--vllm-mm-hidden-cache",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Pin the vLLM worker multimodal hidden-state cache for a fair "
+            "cache A/B; omitted preserves the deployment default."
+        ),
+    )
     ap.add_argument("--prefill-dispatch-mode", choices=["render_generate", "openai_prompt_only"], default="render_generate")
     ap.add_argument(
         "--allow-unverified-openai-prompt-only",
@@ -91,6 +254,18 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument("--owner-shards", type=int, default=1)
     ap.add_argument("--kv-directory-rpc-url", default=None)
+    ap.add_argument(
+        "--scheduler-policy",
+        choices=sorted(SCHEDULER_POLICIES),
+        default="agent_aware",
+        help="Proxy Prefill/Decode worker-selection policy recorded in the artifact.",
+    )
+    ap.add_argument(
+        "--durable-workflow-registry",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable fsync WAL for restart-safe Agent-state recovery instead of benchmark hot-path mode.",
+    )
     ap.add_argument(
         "--strict-no-fallback",
         action=argparse.BooleanOptionalAction,

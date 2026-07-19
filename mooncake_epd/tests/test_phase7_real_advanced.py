@@ -52,7 +52,12 @@ from mooncake_epd.tests.conftest import (  # noqa: E402
 from mooncake_epd.tests.dataset import build_dataset, make_image  # noqa: E402
 
 
-pytestmark = [pytest.mark.real_model, pytest.mark.gpu, pytest.mark.slow]
+pytestmark = [
+    pytest.mark.real_model,
+    pytest.mark.gpu,
+    pytest.mark.gpu_single_node,
+    pytest.mark.slow,
+]
 
 GPU_ENC_ID = get_test_gpu_id("ENC", 3)
 GPU_PRE_ID = get_test_gpu_id("PRE", 4)

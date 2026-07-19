@@ -31,6 +31,38 @@ def check_serving_summary(path: str) -> List[str]:
     metrics = _nested(data, "metrics", "metrics", default={}) or {}
     backend_counts = metrics.get("remote_transfer_backend_counts") or {}
     failures: List[str] = []
+    requested_protocol = str(data.get("mooncake_protocol", "") or "").strip().lower()
+    def check_runtime_transport(
+        *,
+        requested: str,
+        evidence_key: str,
+        label: str,
+    ) -> None:
+        if requested not in {"tcp", "rdma", "nvlink_intra"}:
+            return
+        runtime_transport = data.get(evidence_key)
+        if not isinstance(runtime_transport, dict):
+            failures.append(f"{label} missing")
+        else:
+            if not bool(runtime_transport.get("pass", False)):
+                failures.append(f"{label}.pass is false")
+            if str(runtime_transport.get("requested_transport", "")).lower() != requested:
+                failures.append(f"{label} requested transport mismatch")
+            if str(runtime_transport.get("actual_transport", "")).lower() != requested:
+                failures.append(f"{label} actual transport mismatch")
+
+    check_runtime_transport(
+        requested=requested_protocol,
+        evidence_key="transport_runtime_evidence",
+        label="transport_runtime_evidence",
+    )
+    direct_protocol = str(data.get("direct_engine_protocol", "") or "").strip().lower()
+    if direct_protocol and not bool(data.get("text_only", False)):
+        check_runtime_transport(
+            requested=direct_protocol,
+            evidence_key="direct_transport_runtime_evidence",
+            label="direct_transport_runtime_evidence",
+        )
     if int(metrics.get("layered_receive_failures", 0) or 0) != 0:
         failures.append("layered_receive_failures != 0")
     if int(metrics.get("layered_transfer_failed_batches", 0) or 0) != 0:

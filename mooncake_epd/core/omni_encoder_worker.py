@@ -17,10 +17,13 @@ from PIL import Image
 
 from .epd_workers import _component_fingerprint
 from .state.feature_store import FeatureBundle
+from .state.hidden_cache_policy import HiddenCachePolicy
+from .state.mooncake_hidden_state_store import MooncakeHiddenStateStore
 from .state.omni_hidden_prefix_cache import (
     OmniHiddenPrefixCache,
     OmniHiddenPrefixCacheConfig,
     install_qwen2_5_omni_hidden_prefix_cache,
+    use_omni_hidden_cache_keys,
 )
 
 
@@ -50,7 +53,10 @@ class Qwen25OmniImageEncoderWorker:
         cache: Optional[OmniHiddenPrefixCache] = None,
         enable_hidden_prefix_cache: bool = True,
         allow_partial_prefix_reuse: bool = False,
+        partial_oracle_validated: bool = False,
         cache_metrics_path: Optional[str] = None,
+        l2_hidden_state_store: Optional[MooncakeHiddenStateStore] = None,
+        l2_hidden_cache_policy: Optional[HiddenCachePolicy] = None,
     ):
         self.model = model
         self.processor = processor
@@ -64,7 +70,10 @@ class Qwen25OmniImageEncoderWorker:
                     enabled=True,
                     metrics_path=cache_metrics_path,
                     allow_partial_prefix_reuse=bool(allow_partial_prefix_reuse),
-                )
+                    partial_oracle_validated=bool(partial_oracle_validated),
+                ),
+                l2_store=l2_hidden_state_store,
+                l2_policy=l2_hidden_cache_policy,
             )
         if self.cache is not None:
             install_qwen2_5_omni_hidden_prefix_cache(self.model, self.cache)
@@ -79,12 +88,17 @@ class Qwen25OmniImageEncoderWorker:
         *,
         image_ids: Sequence[str],
         prompt: str = "Describe the image.",
+        image_processor_kwargs: Optional[Dict[str, Any]] = None,
     ) -> OmniBatchEncoderOutput:
         if len(images) != len(image_ids):
             raise ValueError(f"images/image_ids length mismatch: {len(images)} != {len(image_ids)}")
         if not images:
             return OmniBatchEncoderOutput(outputs=[], encode_time_ms=0.0, cache_stats=self.cache_stats)
-        inputs = self._processor_inputs(images, prompt)
+        inputs = self._processor_inputs(
+            images,
+            prompt,
+            image_processor_kwargs=image_processor_kwargs,
+        )
         if "pixel_values" not in inputs or "image_grid_thw" not in inputs:
             raise RuntimeError(f"processor did not produce pixel_values/image_grid_thw; keys={list(inputs)}")
         pixel_values = inputs["pixel_values"].to(self.device)
@@ -96,11 +110,15 @@ class Qwen25OmniImageEncoderWorker:
 
         t0 = time.perf_counter()
         with torch.no_grad():
-            encoded = self.model.get_image_features(
-                pixel_values,
-                image_grid_thw=image_grid_thw,
-                return_dict=True,
-            )
+            # ``image_ids`` are stable content identities propagated by the
+            # encoder service.  They let the default exact cache avoid hashing
+            # the full preprocessed GPU image tensor on each lookup.
+            with use_omni_hidden_cache_keys(image_ids):
+                encoded = self.model.get_image_features(
+                    pixel_values,
+                    image_grid_thw=image_grid_thw,
+                    return_dict=True,
+                )
             hidden = getattr(encoded, "pooler_output", None)
         if hidden is None:
             raise RuntimeError("Qwen2.5-Omni get_image_features did not return pooler_output")
@@ -148,11 +166,12 @@ class Qwen25OmniImageEncoderWorker:
         image_grid_thw = image_grid_thw.to(self.device)
         t0 = time.perf_counter()
         with torch.no_grad():
-            encoded = self.model.get_image_features(
-                pixel_values,
-                image_grid_thw=image_grid_thw,
-                return_dict=True,
-            )
+            with use_omni_hidden_cache_keys([image_id or "omni-image"]):
+                encoded = self.model.get_image_features(
+                    pixel_values,
+                    image_grid_thw=image_grid_thw,
+                    return_dict=True,
+                )
             hidden = getattr(encoded, "pooler_output", None)
         if hidden is None:
             raise RuntimeError("Qwen2.5-Omni get_image_features did not return pooler_output")
@@ -174,14 +193,38 @@ class Qwen25OmniImageEncoderWorker:
         )
         return OmniEncoderOutput(bundle=bundle, encode_time_ms=encode_ms, image_id=feature_id)
 
-    def _processor_inputs(self, images: Sequence[Image.Image], prompt: str) -> Dict[str, torch.Tensor]:
+    def _processor_inputs(
+        self,
+        images: Sequence[Image.Image],
+        prompt: str,
+        *,
+        image_processor_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, torch.Tensor]:
+        image_processor_kwargs = dict(image_processor_kwargs or {})
+        image_processor = getattr(self.processor, "image_processor", None)
+        if callable(image_processor):
+            # The image processor is the exact vision-preprocessing portion of
+            # the Qwen/VLLM request path.  Calling it directly avoids template
+            # tokenization on the E-stage hot path and, crucially, preserves
+            # vLLM's resolved ``size`` grid for precomputed hidden states.
+            return image_processor(
+                images=[image.convert("RGB") for image in images],
+                return_tensors="pt",
+                **image_processor_kwargs,
+            )
         content: List[Dict[str, Any]] = [{"type": "image", "image": image.convert("RGB")} for image in images]
         content.append({"type": "text", "text": prompt or "Describe the image."})
         messages = [{"role": "user", "content": content}]
         # Qwen2.5-Omni processor uses text=[chat_template], images=[PIL...].
         if callable(self.processor) and hasattr(self.processor, "apply_chat_template"):
             text = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-            return self.processor(text=[text], images=list(images), return_tensors="pt", padding=True)
+            return self.processor(
+                text=[text],
+                images=list(images),
+                return_tensors="pt",
+                padding=True,
+                **image_processor_kwargs,
+            )
         # Test doubles may implement apply_chat_template returning tensors directly.
         if hasattr(self.processor, "apply_chat_template"):
             return self.processor.apply_chat_template(

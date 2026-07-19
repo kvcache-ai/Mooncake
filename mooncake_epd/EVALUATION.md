@@ -37,9 +37,18 @@ configuration:
 | Mooncake Python package | 0.3.11.post1 |
 | Multimodal model | Qwen3-VL-8B-Instruct |
 
-The same host provided a validated TCP direct path and an intra-node
-`nvlink_intra` topology. RDMA is not required to reproduce the published
+The same host provided a validated TCP direct path. A separately staged
+`USE_INTRA_NVLINK` engine also completed a strict text-only 1P1D P→D run on
+the NV4-connected GPU1↔GPU3 pair, with both worker logs proving native
+`nvlink_intra` selection. That is a transport-path result only: it does not
+validate full multimodal E→P→D, 2P2D NVLink, dual-node operation, or an
+installed-release package. RDMA is not required to reproduce the published TCP
 correctness results.
+
+The current environment has GPUs but no verified second host or RDMA fabric.
+Consequently, the newest hardware refresh below is deliberately labeled as a
+single-host TCP result; it is not relabeled as RDMA, NVLink EPD, or a
+dual-node result.
 
 ## Workloads and baselines
 
@@ -57,6 +66,16 @@ correctness results.
 
 This workload verifies the full E-to-P-to-D data flow, vLLM Vision Encoder
 skip, layered KV handoff, streaming responses, and resource cleanup.
+
+The current runner also supports a cold multi-image variant.  When all images
+route to one Prefill worker, E→P feature descriptors are coalesced into one
+Mooncake peer-buffer write, and the Prefill EngineCore groups same-session
+remote handles into one direct batch read into final hidden-state tensors.  The
+artifact records `image_count` and the shared publish timing; with multimodal
+trace enabled, `feature_handle_direct_remote_batch_resolved` records the read
+batch.  This is a hot-path optimization, not a published throughput claim
+until it has been measured against the same multi-image colocated baseline on
+equal resources.
 
 ### W1: colocated baseline and 2P2D scale-out
 
@@ -105,6 +124,40 @@ post-release ownership cleanup.
 
 ## Results
 
+### B/C/D Decode token-path diagnostic
+
+The current worktree completed a strict Qwen3-VL-8B-Instruct W3/C1 diagnostic
+on one host with Encoder GPU 5, Prefill GPU 1, Decode GPU 3, and the validated
+NVLink P-to-D path. Both arms used prompt-only Prefill; the only intended
+variable was shadow versus active Decode token-envelope dispatch.
+
+| Metric | Shadow / legacy Decode | Active token envelope | Change |
+| --- | ---: | ---: | ---: |
+| Decode request bytes | 1,145,006 | 16,718 | -98.54% |
+| Decode JSON encode | 18.361 ms | 0.766 ms | -95.83% |
+| Decode stream open | 61.347 ms | 8.239 ms | -86.57% |
+| TTFT | 378.245 ms | 341.123 ms | -9.81% |
+| End-to-end latency | 738.778 ms | 705.759 ms | -4.47% |
+| Fast path / media stripped / envelope validated | shadow only | 1 / 1 / 1 | pass |
+
+The token-path response exactly matched the shadow response and all six
+measured responses in the existing colocated baseline. Their common response
+SHA-256 is
+`c29089b34feccc282a94d04d4e6f1f6f350031cc8ecd79e436ea0d7a35f92c4c`.
+No fallback was enabled.
+
+Local artifacts:
+
+- `/tmp/mooncake_epd_20260719_qwen3_w3_c1_decode_shadow_bcd_r2/online_direct_e2e_summary.json`
+- `/tmp/mooncake_epd_20260719_qwen3_w3_c1_decode_token_ids_bcd_r5/online_direct_e2e_summary.json`
+- `/tmp/mooncake_baseline_20260716_qwen3_w3_isolate_2k_tokens_c1_gpu3_refresh/single_baseline_summary.json`
+
+This diagnostic used one warmup and one measured request per EPD arm. It
+validates semantics and proves that the compact path is exercised, but it is
+not used as a throughput claim. C4/C16 repeated trials with confidence
+intervals, Qwen2.5-VL coverage, and equal-resource comparisons remain required
+before publication.
+
 ### Real multimodal EPD
 
 | Metric | Result |
@@ -124,8 +177,101 @@ post-release ownership cleanup.
 | Layered send failures | 0 |
 | Layered receive failures | 0 |
 
-The strict real-EPD gate passed. The result demonstrates a complete real-model
-serving path with direct feature reuse and direct layered KV transport.
+The strict real-EPD artifact gate passed. It verifies the captured direct
+Encoder-to-Prefill-to-Decode path with feature reuse and layered KV transport
+on that host. It does **not** establish the later producer-restart fence,
+multi-node/RDMA behavior, or deterministic-golden acceptance; those require
+their own current-hardware gates.
+
+### 2026-07-14 strict single-host TCP refresh
+
+This worktree refresh validates the current public demo facade after it was
+expanded to forward the online runner's topology, scheduler, cache, transfer,
+and dispatch settings. In particular, it closes a facade/runner compatibility
+defect where the lower-level runner required `scheduler_policy` but the public
+demo parser did not define it.
+
+| Field | Value |
+| --- | --- |
+| Model | Qwen3-VL-8B-Instruct |
+| Topology | Encoder GPU 0, Prefill GPU 1, Decode GPU 3 on one host |
+| Transport | E→P TCP direct peer-buffer; P→D TCP direct peer-buffer |
+| Strict dispatch | `render_generate` |
+| Warmup / measured | 2 / 4 requests |
+| Concurrency / output budget | 1 / 16 tokens |
+| Gate | Strict no-fallback |
+
+| Metric | Result |
+| --- | ---: |
+| HTTP success | 4 / 4 measured requests |
+| Mean / p95 TTFT | 255.93 / 257.65 ms |
+| Mean latency | 614.15 ms |
+| Request / completion throughput | 1.628 RPS / 26.04 tok/s |
+| Measured P→D peer-buffer batches / bytes | 8 / 9,437,184 |
+| Measured P→D write bandwidth | 2.44 Gbit/s |
+| Fallback / layered send / receive failures | 0 / 0 / 0 |
+| Direct-feature cache hits | 4 / 4 measured requests |
+| Direct-buffer references after release | 0 |
+
+The measured timing split is the actionable outcome of this refresh:
+
+| Segment | Mean |
+| --- | ---: |
+| E→P direct-cache lookup | 4.84 ms |
+| Prefill `render_generate` | 167.84 ms |
+| Proxy Prefill→Decode dispatch | 1.58 ms |
+| P→D receive worker | 14.52 ms |
+| Decode engine request→first token | 69.27 ms |
+| Proxy Decode first content | 75.90 ms |
+
+For this stable, cache-warm, single-request workload, strict Prefill control
+processing is the largest measured TTFT component. The safe next step is to
+reduce that path only with output-equivalence coverage; historical
+`openai_prompt_only` probes are not sufficient for strict serving because they
+did not produce exact text for every request. This refresh is not a baseline
+comparison, equal-resource result, throughput-improvement claim, RDMA result,
+or two-node validation. Its raw artifact is intentionally outside the
+committed 2026-07-10 public evidence snapshot until repeated and reviewed.
+
+### 2026-07-15 strict rendered-Prefill-cache ablation
+
+The follow-up implements that safe control-path optimization without changing
+the strict dispatch protocol. The Proxy caches only the deterministic vLLM
+`/render` output, bounds it to 64 entries / 256 MiB / 300 seconds, scopes it
+to a Prefill worker-generation fence, and injects fresh FeatureHandles and
+P→D KV-transfer metadata into every `/inference/v1/generate` call. Requests
+with mutable external `http(s)://`, `file://`, or `ftp://` media bypass the
+cache.
+
+Both arms used Qwen3-VL-8B-Instruct; Encoder GPU 0, Prefill GPU 1, Decode GPU
+3; same-host TCP direct peer-buffer; `render_generate`; two warmups and six
+measured requests; concurrency one; and a 16-token output budget. Both passed
+the strict real-EPD gate, all 12 measured HTTP responses were 200, and the six
+cache-on outputs exactly matched the six cache-off outputs.
+
+| Metric | Cache off | Cache on | Change |
+| --- | ---: | ---: | ---: |
+| Mean TTFT | 276.90 ms | 210.19 ms | -24.1% (-66.71 ms) |
+| Mean latency | 635.12 ms | 555.19 ms | -12.6% |
+| Request throughput | 1.574 RPS | 1.800 RPS | +14.4% |
+| Completion throughput | 25.18 tok/s | 28.80 tok/s | +14.4% |
+| Prefill render control step | 87.33 ms | 1.69 ms | -98.1% |
+| Measured render-cache hits | 0 / 6 | 6 / 6 | pass |
+| Fallback / layered receive failures | 0 / 0 | 0 / 0 | pass |
+
+The cache held one 3.07 MiB artifact. This is a strict EPD cache ablation, not
+a comparison to colocated vLLM or another system, an equal-resource result, a
+multi-node result, or RDMA evidence. It remains outside the committed public
+snapshot pending repeated-run and artifact-digest review.
+
+An independent concurrency-four control (two warmups, 16 measured requests
+per arm, otherwise identical) also passed both strict gates with exact 16/16
+output equality and zero fallback/receive failures. Cache-on changed mean
+TTFT **469.05→379.13 ms** (-19.2%), request throughput **4.485→4.935 RPS**
+(+10.0%), completion throughput **71.77→78.97 tok/s** (+10.0%), and mean
+latency **866.18→779.01 ms** (-10.1%). Its measured render-cache hit rate was
+16/16; this is concurrent EPD ablation evidence, not a standalone or
+strong-system comparison.
 
 ### Scale-out comparison
 
@@ -139,10 +285,13 @@ serving path with direct feature reuse and direct layered KV transport.
 | P-to-D fallback / failures | N/A | 0 / 0 | Direct path clean |
 | Prefill-to-Decode affinity | N/A | 24 / 24 hits | 0 fallback |
 
-The measured EPD topology increased request and output-token throughput while
-reducing mean end-to-end latency and P95 TTFT. The paired deterministic-text
-check produced exact text identity for 12 of 16 measured requests; all requests
-completed successfully and the transport integrity gates passed.
+The archived scale-out topology observed higher request and output-token
+throughput and lower mean end-to-end latency/P95 TTFT than its 1-GPU baseline.
+It is not an equal-resource result and is not a deterministic-golden release:
+the paired text check produced exact identity for only 12 of 16 measured
+requests. All requests completed and the transport-integrity gates passed, but
+the observation must not be generalized into an equal-resource throughput
+claim.
 
 ### Agent State Cloning
 
@@ -173,14 +322,48 @@ orphan blocks.
 | Agent clone release cleanup | Pass |
 | Resource-count metadata present | Pass |
 
-Repository regression verification after the final runtime-boundary changes:
+Current-checkout CPU regression verification (2026-07-13; real-model/GPU/RDMA
+gates are explicitly skipped when their resources are unavailable):
 
 | Suite | Result |
 | --- | ---: |
-| `mooncake_epd/tests` | 371 passed, 1 skipped |
+| `mooncake_epd/tests` | 439 passed, 19 skipped |
 | Mooncake Store service API | 72 passed |
 | Runtime/security boundary subset | 52 passed |
 | Python compile, JSON validation, diff whitespace | Pass |
+| Public-demo facade / online-runner focused regression (2026-07-14) | 73 passed |
+| Rendered-Prefill-cache semantics/config/runner regression (2026-07-15) | 91 passed |
+
+### Current hardware-gated status
+
+The current development environment does not provide a verified RDMA fabric.
+The RDMA, two-node, CUDA IPC/NVLink Omni, and real-model GPU gates are kept as
+explicit skips/unavailable checks. In particular, a POSIX-SHM CPU process
+smoke result is not recorded as TCP, RDMA, or a real-Omni performance result.
+Use the following only to validate the local descriptor-only worker boundary:
+
+```bash
+PYTHONPATH=$PWD python mooncake_epd/scripts/run_omni_worker_pipeline_e2e.py \
+  --transport posix_shm --elements 64
+PYTHONPATH=$PWD python mooncake_epd/benchmarks/omni_pipeline_benchmark.py \
+  --transport posix_shm --warmup 1 --rounds 3
+```
+
+Both artifacts set `claim_supported=false`. The runner also has an actual local
+TCP-relay compatibility edge (`--transport tcp`); this is not a two-node
+result. `--transport rdma` emits a machine-readable skip until an actual
+adapter plus NIC/GID/remote-host evidence is available.
+
+### Current evidence gaps
+
+The CPU suite verifies contracts, fault handling, and local process transport;
+it does not replace the following release gates: a version-locked real vLLM
+Agent connector acknowledgement, repeated single-node GPU validation across a
+workload matrix, two-node TCP continuation, RDMA registration/GID/remote-host
+evidence, CUDA IPC/NVLink Omni semantic stages, 10k-request soak, complete
+A0--A9 ablations, or equal-resource comparison against the planned strong
+systems. These remain explicitly unavailable rather than inferred from the
+archived scale-out or CPU results.
 
 ## Reproduction
 
@@ -248,6 +431,47 @@ python mooncake_epd/scripts/run_real_qwenvl_epd_demo.py \
   --max-transfer-bytes 67108864
 ```
 
+The facade accepts the lower-level runner options used by current deployments,
+including `--prefill-gpus`, `--decode-gpus`, `--scheduler-policy`,
+`--transfer-workers`, direct-buffer release/cache switches, and
+`--prefill-dispatch-mode`. Keep `render_generate` for strict serving. The
+rendered-Prefill cache is enabled by default; use
+`--no-enable-rendered-prefill-cache` only for a matched cache ablation.
+`openai_prompt_only` requires an explicit compatibility override only after a
+version- and workload-specific output-equivalence artifact has passed.
+
+### Measure the multi-image E→P batching path
+
+Give both the EPD runner and the colocated runner the same ordered image list;
+the entries must be distinct assets when measuring cold publication rather than
+an exact-cache hit.  `--image-url` and `--image-urls` are mutually exclusive.
+
+```bash
+# Run the same command shape for EPD and the colocated baseline, changing only
+# the deployment-specific flags/GPU topology.
+python mooncake_epd/scripts/run_vllm_online_direct_e2e.py \
+  --workdir "$ARTIFACT_ROOT/multi-image-epd" \
+  --model "$MODEL_PATH" \
+  --image-urls "$IMAGE_URL_A" "$IMAGE_URL_B" \
+  --encoder-device "$ENCODER_DEVICE" \
+  --prefill-gpu "$PREFILL_GPU" --decode-gpu "${DECODE_GPU:-2}" \
+  --mooncake-protocol tcp
+
+python mooncake_epd/scripts/run_vllm_single_baseline_e2e.py \
+  --workdir "$ARTIFACT_ROOT/multi-image-colocated" \
+  --model "$MODEL_PATH" --gpu "$BASELINE_GPU" \
+  --image-urls "$IMAGE_URL_A" "$IMAGE_URL_B"
+```
+
+Verify that both summaries have the same request fingerprint and
+`benchmark_config.request.image_count`; in the EPD request timing metadata,
+`direct_publish_engine_batch_feature_count=2` and only one shared batch timing
+must be counted.  With `MOONCAKE_EPD_VLLM_MM_HIDDEN_TRACE=1`, the Prefill trace
+must also contain one `feature_handle_direct_remote_batch_resolved` event with
+`batch_feature_count=2` for that Encoder session.  Do not publish an
+improvement without the H5 equal-resource, repeat, confidence-interval, and
+raw-artifact gates.
+
 ### Generate the scale-out prompt
 
 ```bash
@@ -289,6 +513,12 @@ python mooncake_epd/scripts/run_vllm_single_baseline_e2e.py \
 ```
 
 ### Run 2P2D EPD
+
+`nvlink_intra` is valid here only if every paired Prefill→Decode GPU pair has a
+verified NVLink path and the deployed engine exposes
+`SUPPORT_INTRA_NVLINK=true`. The artifact-backed host currently has one tested
+GPU1↔GPU3 NV4 pair, so this 2P2D command is a topology-specific template, not
+evidence for a 2P2D NVLink result on that host.
 
 ```bash
 python mooncake_epd/scripts/run_vllm_online_direct_e2e.py \
@@ -367,8 +597,9 @@ SHA-256 digests for these logical source artifacts:
 ## Interpretation and next evaluation
 
 The current results establish real EPD serving, direct Vision Hidden State
-reuse, layered KV transfer integrity, scale-out throughput, topology affinity,
-and zero-copy Agent branch creation. The next public matrix will add matched
-1-GPU and 4-GPU resource pairs, cold/warm multimodal cache workloads, mixed
-Agent scheduling loads, and longer stability runs while preserving the same
-strict artifact gates.
+reuse, layered KV transfer integrity, a strict rendered-Prefill-cache TTFT
+ablation, scale-out throughput, topology affinity, and zero-copy Agent branch
+creation. The next public matrix will add matched 1-GPU and 4-GPU resource
+pairs, cold/warm multimodal cache workloads, mixed Agent scheduling loads, a
+strict Prefill-dispatch output-equivalence gate, and longer stability runs
+while preserving the same strict artifact gates.

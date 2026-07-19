@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import pickle
 import threading
 import time
 
@@ -28,6 +29,10 @@ from mooncake_epd.core.control.connector_metrics import (  # noqa: E402
     ConnectorMetricsSink,
 )
 from mooncake_epd.core.control.vllm_transfer_primitives import LayeredTransferWorkerMeta  # noqa: E402
+from mooncake_epd.core.state.kv_transfer_manifest_v2 import (  # noqa: E402
+    KVTransferLayoutV2,
+    KVTransferManifestV2,
+)
 
 
 def _make_consumer_worker() -> EPDMooncakeConnectorWorker:
@@ -53,6 +58,7 @@ def _make_consumer_worker() -> EPDMooncakeConnectorWorker:
     worker._connector_metrics_pending_by_path = {}
     worker._recv_request_routing_paths = {}
     worker._recv_transfer_routing_paths = {}
+    worker._recv_kv_transfer_manifests_by_request = {}
     worker._send_request_routing_paths = {}
     worker._send_transfer_routing_paths = {}
     worker.async_zmq_ctx = type("Ctx", (), {"term": lambda self: None})()
@@ -77,6 +83,7 @@ def _make_producer_worker() -> EPDMooncakeConnectorWorker:
     worker._layer_to_group = {"layer0": 0, "layer1": 0, "layer2": 1}
     worker._layer_to_index = {"layer0": 0, "layer1": 1, "layer2": 2}
     worker._layered_send_lock = threading.RLock()
+    worker._layered_source_to_send_lock = threading.Lock()
     worker._layered_send_states = {
         "xfer-0": _LayeredSendState.create("xfer-0", 2),
     }
@@ -117,6 +124,237 @@ def test_layered_connector_requires_piecewise_for_cudagraph():
     assert MooncakeConnector.requires_piecewise_for_cudagraph(
         {"layered_kv_transfer": True}
     ) is True
+
+
+def test_decode_scheduler_rejects_missing_or_wrong_target_kv_transfer_manifest():
+    scheduler = object.__new__(EPDMooncakeConnectorScheduler)
+    scheduler.require_kv_transfer_manifest_v2 = True
+    scheduler.require_kv_transfer_manifest_generation = True
+    scheduler.require_kv_transfer_manifest_compatibility = False
+    scheduler.worker_id = "decode-0"
+    scheduler.worker_generation = "decode-generation-1"
+    scheduler.kv_transfer_layout_v2 = KVTransferLayoutV2(
+        model_id="Qwen3-VL",
+        model_revision="revision-a",
+        vllm_adapter_version="adapter-1",
+        dtype="float16",
+        block_size=16,
+        num_layers=36,
+        tp_size=1,
+        tp_rank=0,
+    ).as_control_payload()
+    manifest = KVTransferManifestV2.create(
+        transfer_id="xfer-verified",
+        workflow_id="wf-verified",
+        source_engine_id="epd-prefill",
+        source_generation="prefill-generation-1",
+        destination_engine_id="decode-0",
+        destination_generation="decode-generation-1",
+        layout=KVTransferLayoutV2.from_control_payload(scheduler.kv_transfer_layout_v2),
+        remote_block_ids=[[1, 2]],
+        transport={"protocol": "tcp", "backend": "mooncake_engine_direct"},
+        lease_seconds=30.0,
+    )
+    params = {
+        "transfer_id": "xfer-verified",
+        "workflow_id": "wf-verified",
+        "remote_engine_id": "epd-prefill",
+        "source_generation": "prefill-generation-1",
+        "kv_transfer_manifest_v2": manifest.as_control_payload(),
+    }
+
+    scheduler._validate_kv_transfer_manifest_params(params)  # noqa: SLF001
+
+    wrong_target = manifest.rebind_destination(
+        destination_engine_id="decode-1",
+        destination_generation="decode-generation-1",
+    )
+    params["kv_transfer_manifest_v2"] = wrong_target.as_control_payload()
+    with pytest.raises(RuntimeError, match="destination_engine_id mismatch"):
+        scheduler._validate_kv_transfer_manifest_params(params)  # noqa: SLF001
+
+    wrong_generation = manifest.rebind_destination(
+        destination_engine_id="decode-0",
+        destination_generation="decode-generation-restarted",
+    )
+    params["kv_transfer_manifest_v2"] = wrong_generation.as_control_payload()
+    with pytest.raises(RuntimeError, match="destination_generation mismatch"):
+        scheduler._validate_kv_transfer_manifest_params(params)  # noqa: SLF001
+
+    with pytest.raises(RuntimeError, match="required"):
+        scheduler._validate_kv_transfer_manifest_params({})  # noqa: SLF001
+
+
+def test_decode_scheduler_preserves_manifest_sidecar_for_worker_transport():
+    scheduler = object.__new__(EPDMooncakeConnectorScheduler)
+    scheduler.is_kv_producer = False
+    scheduler.is_kv_consumer = True
+    scheduler._reqs_need_send = {}
+    scheduler._reqs_not_processed = set()
+    scheduler._validate_kv_transfer_manifest_params = lambda _params: None  # noqa: SLF001
+    manifest = KVTransferManifestV2.create(
+        transfer_id="xfer-sidecar",
+        workflow_id="wf-sidecar",
+        source_engine_id="epd-prefill",
+        source_generation="prefill-generation-1",
+        destination_engine_id="decode-0",
+        destination_generation="decode-generation-1",
+        remote_block_ids=[[1]],
+        transport={"protocol": "tcp", "backend": "mooncake_engine_direct"},
+    )
+    request = type(
+        "Req",
+        (),
+        {
+            "kv_transfer_params": {
+                "do_remote_prefill": True,
+                "transfer_id": "xfer-sidecar",
+                "remote_engine_id": "epd-prefill",
+                "remote_bootstrap_addr": "http://prefill-bootstrap",
+                "kv_transfer_manifest_v2": manifest.as_control_payload(),
+            }
+        },
+    )()
+    scheduler._reqs_need_recv = {"decode-request": (request, [[9]])}
+
+    metadata = scheduler.build_connector_meta(None)
+    restored = pickle.loads(pickle.dumps(metadata))
+
+    assert restored.epd_kv_transfer_manifests_v2 == {
+        "decode-request": manifest.as_control_payload()
+    }
+    pull_meta = restored.reqs_to_recv["epd-prefill"]["decode-request"]
+    assert pull_meta.epd_kv_transfer_manifest_v2 == manifest.as_control_payload()
+
+
+def test_decode_scheduler_retains_manifest_after_upstream_consumes_pull_marker():
+    """The upstream scheduler mutates do_remote_prefill after it records a pull."""
+
+    scheduler = object.__new__(EPDMooncakeConnectorScheduler)
+    scheduler.is_kv_producer = False
+    scheduler.is_kv_consumer = True
+    scheduler._reqs_need_send = {}
+    scheduler._reqs_not_processed = set()
+    scheduler._validate_kv_transfer_manifest_params = lambda _params: None  # noqa: SLF001
+    manifest = KVTransferManifestV2.create(
+        transfer_id="xfer-upstream-mutation",
+        workflow_id="wf-upstream-mutation",
+        source_engine_id="epd-prefill",
+        source_generation="prefill-generation-1",
+        destination_engine_id="decode-0",
+        destination_generation="decode-generation-1",
+        remote_block_ids=[[1]],
+        transport={"protocol": "tcp", "backend": "mooncake_engine_direct"},
+    )
+    original_params = {
+        "do_remote_prefill": True,
+        "transfer_id": "xfer-upstream-mutation",
+        "remote_engine_id": "epd-prefill",
+        "remote_bootstrap_addr": "http://prefill-bootstrap",
+        "kv_transfer_manifest_v2": manifest.as_control_payload(),
+    }
+    request = type(
+        "Req",
+        (),
+        {
+            # This is what the upstream connector leaves on the exact request
+            # object it places in _reqs_need_recv.
+            "kv_transfer_params": {**original_params, "do_remote_prefill": False}
+        },
+    )()
+    scheduler._reqs_need_recv = {"decode-request": (request, [[9]])}
+    scheduler._recv_kv_transfer_params_by_request = {"decode-request": original_params}
+
+    metadata = scheduler.build_connector_meta(None)
+
+    assert metadata.epd_kv_transfer_manifests_v2 == {
+        "decode-request": manifest.as_control_payload()
+    }
+    assert (
+        metadata.reqs_to_recv["epd-prefill"]["decode-request"].epd_kv_transfer_manifest_v2
+        == manifest.as_control_payload()
+    )
+    assert scheduler._recv_kv_transfer_params_by_request == {}
+
+
+def test_decode_worker_recovers_declared_pull_manifest_when_sidecar_is_stripped():
+    scheduler = object.__new__(EPDMooncakeConnectorScheduler)
+    scheduler.is_kv_producer = False
+    scheduler.is_kv_consumer = True
+    scheduler._reqs_need_send = {}
+    scheduler._reqs_not_processed = set()
+    scheduler._validate_kv_transfer_manifest_params = lambda _params: None  # noqa: SLF001
+    manifest = KVTransferManifestV2.create(
+        transfer_id="xfer-pull-meta",
+        workflow_id="wf-pull-meta",
+        source_engine_id="epd-prefill",
+        source_generation="prefill-generation-1",
+        destination_engine_id="decode-0",
+        destination_generation="decode-generation-1",
+        remote_block_ids=[[1]],
+        transport={"protocol": "tcp", "backend": "mooncake_engine_direct"},
+    )
+    request = type(
+        "Req",
+        (),
+        {
+            "kv_transfer_params": {
+                "do_remote_prefill": True,
+                "transfer_id": "xfer-pull-meta",
+                "remote_engine_id": "epd-prefill",
+                "remote_bootstrap_addr": "http://prefill-bootstrap",
+                "kv_transfer_manifest_v2": manifest.as_control_payload(),
+            }
+        },
+    )()
+    scheduler._reqs_need_recv = {"decode-request": (request, [[9]])}
+    metadata = pickle.loads(pickle.dumps(scheduler.build_connector_meta(None)))
+    del metadata.epd_kv_transfer_manifests_v2
+
+    worker = _make_consumer_worker()
+    worker.require_kv_transfer_manifest_v2 = True
+    worker._record_recv_kv_transfer_manifests(metadata)  # noqa: SLF001
+
+    assert worker._recv_kv_transfer_manifests_by_request == {  # noqa: SLF001
+        "decode-request": manifest.as_control_payload()
+    }
+
+
+def test_prefill_worker_rejects_stale_source_generation_before_kv_send():
+    worker = _make_producer_worker()
+    worker.engine_id = "epd-prefill"
+    worker.worker_generation = "prefill-generation-current"
+    worker.require_kv_transfer_manifest_v2 = True
+    worker.require_kv_transfer_manifest_generation = True
+    worker.require_kv_transfer_manifest_compatibility = False
+
+    stale_manifest = KVTransferManifestV2.create(
+        transfer_id="xfer-stale-source",
+        workflow_id="wf-stale-source",
+        source_engine_id="epd-prefill",
+        source_generation="prefill-generation-before-restart",
+        destination_engine_id="decode-0",
+        destination_generation="decode-generation-1",
+        remote_block_ids=[[1]],
+        transport={"protocol": "tcp", "backend": "mooncake_engine_direct"},
+    )
+    meta = LayeredMooncakeXferMetadata(
+        remote_hostname="127.0.0.1",
+        remote_port=9000,
+        remote_tp_size=1,
+        remote_tp_rank=0,
+        req_blocks={"decode-request": ("xfer-stale-source", [[9]])},
+        kv_caches_base_addr=[],
+        block_lens=[],
+        layered=True,
+        total_groups=2,
+        kv_transfer_manifests={
+            "decode-request": stale_manifest.as_control_payload(),
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="source_generation mismatch"):
+        worker._validate_kv_transfer_manifests_for_producer(meta)  # noqa: SLF001
 
 
 def test_wait_for_layer_load_blocks_until_group_event_arrives():
@@ -186,6 +424,7 @@ def test_connector_metrics_are_batched_until_terminal_boundary():
 def test_save_kv_layer_only_announces_group_tail():
     worker = _make_producer_worker()
     state = worker._layered_send_states["xfer-0"]  # noqa: SLF001
+    worker._current_send_transfer_ids = {"xfer-0"}  # noqa: SLF001
 
     worker.save_kv_layer("layer0", None, None)
     assert state.group_ready_events[0].is_set() is False
@@ -195,6 +434,41 @@ def test_save_kv_layer_only_announces_group_tail():
 
     worker.save_kv_layer("layer2", None, None)
     assert state.group_ready_events[1].is_set() is True
+
+
+def test_save_kv_layer_without_forward_scope_does_not_unlock_outstanding_transfer():
+    worker = _make_producer_worker()
+    state = worker._layered_send_states["xfer-0"]  # noqa: SLF001
+
+    worker.save_kv_layer("layer1", None, None)
+
+    assert state.group_ready_events[0].is_set() is False
+    assert state.group_ready_events[1].is_set() is False
+
+
+def test_save_kv_layer_attaches_one_source_event_to_each_newly_ready_group():
+    worker = _make_producer_worker()
+    worker._current_send_transfer_ids = {"xfer-0"}  # noqa: SLF001
+    state = worker._layered_send_states["xfer-0"]  # noqa: SLF001
+    source_event = object()
+    worker._record_source_ready_event = lambda _kv_layer: source_event  # type: ignore[method-assign]
+
+    # A later first callback conservatively releases earlier groups, and the
+    # same later CUDA fence proves that all of those earlier writes completed.
+    worker.save_kv_layer("layer2", object(), None)
+
+    assert state.source_ready_event(0) is source_event
+    assert state.source_ready_event(1) is source_event
+
+
+def test_wait_for_save_clears_only_the_completed_forward_scope():
+    worker = _make_producer_worker()
+    worker._current_send_transfer_ids = {"xfer-0"}  # noqa: SLF001
+
+    worker.wait_for_save()
+
+    assert worker._current_send_transfer_ids == set()  # noqa: SLF001
+    assert "xfer-0" in worker._layered_send_states  # noqa: SLF001
 
 
 def test_layered_group_wait_uses_sender_loop_event_not_executor_threads(monkeypatch):
@@ -218,6 +492,110 @@ def test_layered_group_wait_uses_sender_loop_event_not_executor_threads(monkeypa
         await task
 
     asyncio.run(_run())
+
+
+def test_source_ready_events_are_deduplicated_and_waited_before_send():
+    worker = _make_producer_worker()
+    calls: list[str] = []
+    shared_event = type(
+        "SourceEvent",
+        (), {"synchronize": lambda self: calls.append("source-ready")},
+    )()
+    first = _LayeredSendState.create("xfer-first", 2)
+    second = _LayeredSendState.create("xfer-second", 2)
+    first.mark_group_ready(0, source_ready_event=shared_event)
+    second.mark_group_ready(0, source_ready_event=shared_event)
+    worker._layered_send_states = {  # noqa: SLF001
+        "xfer-first": first,
+        "xfer-second": second,
+    }
+    worker._send_blocks = lambda *args, **kwargs: calls.append("send") or 0  # type: ignore[method-assign]
+    first_meta = SendBlockMeta(
+        p_req_id="prefill-first",
+        transfer_id="xfer-first",
+        local_block_ids=[],
+        ready=asyncio.Event(),
+    )
+    second_meta = SendBlockMeta(
+        p_req_id="prefill-second",
+        transfer_id="xfer-second",
+        local_block_ids=[],
+        ready=asyncio.Event(),
+    )
+
+    source_events = worker._source_ready_events_for_group(  # noqa: SLF001
+        (("decode-first", first_meta), ("decode-second", second_meta)),
+        0,
+    )
+    result = worker._wait_source_events_and_send_blocks(  # noqa: SLF001
+        source_events,
+        "peer-0",
+        [1],
+        [2],
+        [64],
+    )
+
+    assert result == 0
+    assert calls == ["source-ready", "send"]
+    assert worker._worker_meta.source_ready_event_waits == 1  # noqa: SLF001
+    assert worker._worker_meta.source_ready_event_wait_ms >= 0.0  # noqa: SLF001
+
+
+def test_source_ready_fence_and_peer_send_are_atomic_across_sender_workers():
+    """Do not let a completed source fence sit behind another transfer.
+
+    The connector may use several sender executor threads.  The source event
+    and its peer write must nevertheless execute as one transaction so vLLM
+    cannot recycle a physical KV block between the two operations.
+    """
+
+    worker = _make_producer_worker()
+    active_sends = 0
+    max_active_sends = 0
+    active_lock = threading.Lock()
+    start = threading.Barrier(3)
+
+    class _Event:
+        def synchronize(self):
+            # Release the GIL long enough that an implementation without the
+            # connector dispatch gate deterministically overlaps both tasks.
+            time.sleep(0.02)
+
+    def _send_blocks(_remote, src, *_args):
+        nonlocal active_sends, max_active_sends
+        with active_lock:
+            active_sends += 1
+            max_active_sends = max(max_active_sends, active_sends)
+        try:
+            time.sleep(0.02)
+            return 0
+        finally:
+            with active_lock:
+                active_sends -= 1
+
+    worker._send_blocks = _send_blocks  # type: ignore[method-assign]
+
+    def _dispatch(index: int) -> None:
+        start.wait(timeout=1.0)
+        worker._wait_source_events_and_send_blocks(  # noqa: SLF001
+            [_Event()],
+            "peer-atomic",
+            [index + 1],
+            [index + 101],
+            [64],
+        )
+
+    first = threading.Thread(target=_dispatch, args=(0,), daemon=True)
+    second = threading.Thread(target=_dispatch, args=(1,), daemon=True)
+    first.start()
+    second.start()
+    start.wait(timeout=1.0)
+    first.join(timeout=2.0)
+    second.join(timeout=2.0)
+
+    assert first.is_alive() is False
+    assert second.is_alive() is False
+    assert max_active_sends == 1
 
 
 def test_layered_receive_state_can_resize_groups_without_losing_progress():
@@ -354,6 +732,18 @@ def test_record_send_reqs_creates_ready_placeholder_for_early_layered_send():
     assert "xfer-ready" in worker._layered_send_states  # noqa: SLF001
 
 
+def test_record_send_reqs_does_not_replace_model_forward_send_scope():
+    worker = _make_producer_worker()
+    worker._current_send_transfer_ids = {"xfer-0"}  # noqa: SLF001
+    metadata = MooncakeConnectorMetadata()
+    metadata.reqs_to_send["req-later"] = ("xfer-later", [[10, 11]])
+
+    asyncio.run(worker.record_send_reqs(metadata))
+
+    assert worker._current_send_transfer_ids == {"xfer-0"}  # noqa: SLF001
+    assert "xfer-later" in worker._layered_send_states  # noqa: SLF001
+
+
 def test_record_send_reqs_keeps_pending_placeholder_unready():
     worker = _make_producer_worker()
     metadata = MooncakeConnectorMetadata()
@@ -486,6 +876,131 @@ def test_layered_send_dispatches_ready_subset_without_waiting_for_slow_batch_pee
     asyncio.run(run_case())
 
 
+def test_layered_send_batches_group_fences_and_peer_write():
+    """Keep one native transaction and one response per ready layered group.
+
+    A Decode pull treats a response as a group-level synchronization point for
+    every request represented by that response.  The producer must fence each
+    source event, but it must not split the wire protocol into independently
+    acknowledged request transactions.
+    """
+
+    class _Sock:
+        def __init__(self):
+            self.responses = []
+
+        async def send_multipart(self, parts):
+            self.responses.append(parts[1])
+
+    class _Loop:
+        async def run_in_executor(self, _executor, fn, *args):
+            return fn(*args)
+
+    async def run_case() -> None:
+        worker = _make_producer_worker()
+        worker.sender_loop = _Loop()
+        worker.transfer_topo = type("Topo", (), {"handshake_target_ranks": lambda self, _size: [0]})()
+        worker.tp_size = 1
+        worker.kv_caches_base_addr = []
+        worker.block_len_per_layer = []
+        worker._get_transfer_regions = lambda *args: []  # noqa: SLF001
+        worker._validate_regions = lambda *args: None  # noqa: SLF001
+        worker._encoder = type("Encoder", (), {"encode": lambda self, value: value})()
+        worker.resolve_need_send = lambda send_meta, _ranks: setattr(send_meta, "need_send", 1)
+        worker._publish_connector_metrics = lambda *args, **kwargs: None  # noqa: SLF001
+        worker.finished_sending_reqs = set()
+
+        build_calls: list[tuple[str, ...]] = []
+        dispatches: list[tuple[tuple[object, ...], tuple[int, ...]]] = []
+
+        async def build_params(*, ready_reqs, group_idx, **kwargs):
+            request_ids = tuple(d_req_id for d_req_id, _ in ready_reqs)
+            build_calls.append(request_ids)
+            assert set(request_ids) == {"decode-first", "decode-second"}
+            return (
+                [1000 + group_idx, 1100 + group_idx],
+                [2000 + group_idx, 2100 + group_idx],
+                [64, 64],
+                [],
+                None,
+                {},
+                "EPD",
+            )
+
+        def dispatch(source_events, _remote, src_ptrs, *_args):
+            dispatches.append((tuple(source_events), tuple(src_ptrs)))
+            return 0
+
+        worker._build_transfer_params_for_group = build_params  # type: ignore[method-assign]
+        worker._wait_source_events_and_send_blocks = dispatch  # type: ignore[method-assign]
+
+        first = SendBlockMeta(
+            p_req_id="prefill-first",
+            transfer_id="xfer-first",
+            local_block_ids=[[1], [2]],
+            ready=asyncio.Event(),
+        )
+        second = SendBlockMeta(
+            p_req_id="prefill-second",
+            transfer_id="xfer-second",
+            local_block_ids=[[3], [4]],
+            ready=asyncio.Event(),
+        )
+        first.ready.set()
+        second.ready.set()
+        first_event = object()
+        second_event = object()
+        first_state = _LayeredSendState.create("xfer-first", 2)
+        second_state = _LayeredSendState.create("xfer-second", 2)
+        for group_idx in range(2):
+            first_state.mark_group_ready(group_idx, source_ready_event=first_event)
+            second_state.mark_group_ready(group_idx, source_ready_event=second_event)
+        worker.reqs_need_send = {"xfer-first": first, "xfer-second": second}
+        worker._layered_send_states = {  # noqa: SLF001
+            "xfer-first": first_state,
+            "xfer-second": second_state,
+        }
+
+        meta = LayeredMooncakeXferMetadata(
+            remote_hostname="127.0.0.1",
+            remote_port=9000,
+            remote_tp_size=1,
+            remote_tp_rank=0,
+            req_blocks={
+                "decode-first": ("xfer-first", [[11], [12]]),
+                "decode-second": ("xfer-second", [[13], [14]]),
+            },
+            kv_caches_base_addr=[],
+            block_lens=[],
+            layered=True,
+            total_groups=2,
+        )
+        sock = _Sock()
+        await worker.send_kv_to_decode(b"peer", sock, meta)
+
+        assert len(build_calls) == 2
+        assert all(
+            set(request_ids) == {"decode-first", "decode-second"}
+            for request_ids in build_calls
+        )
+        assert len(dispatches) == 2
+        assert all(
+            set(source_events) == {first_event, second_event}
+            for source_events, _ in dispatches
+        )
+        assert all(
+            src_ptrs in {(1000, 1100), (1001, 1101)}
+            for _, src_ptrs in dispatches
+        )
+        assert all(
+            set(response.ok_reqs or []) == {"decode-first", "decode-second"}
+            for response in sock.responses
+        )
+        assert sock.responses[-1].status is MooncakeXferResponseStatus.FINISH
+
+    asyncio.run(run_case())
+
+
 def test_scheduler_build_connector_meta_captures_routing_paths():
     scheduler = object.__new__(EPDMooncakeConnectorScheduler)
     scheduler.is_kv_producer = True
@@ -587,6 +1102,7 @@ def test_send_region_group_records_peer_buffer_path_metrics():
             "dispatch_ms": 1.0,
             "prepare_ms": 0.1,
             "write_ms": 0.8,
+            "native_engine_lock_wait_ms": 0.05,
         },
     )()
     worker.engine = type(
@@ -608,6 +1124,7 @@ def test_send_region_group_records_peer_buffer_path_metrics():
     assert worker._worker_meta.peer_buffer_bytes == 64  # noqa: SLF001
     assert worker._worker_meta.peer_buffer_dispatch_ms == 1.0  # noqa: SLF001
     assert worker._worker_meta.peer_buffer_write_ms == 0.8  # noqa: SLF001
+    assert worker._worker_meta.peer_buffer_native_engine_lock_wait_ms == 0.05  # noqa: SLF001
     assert worker._worker_meta.backend_counts["peer_buffer_direct"] == 1  # noqa: SLF001
 
 
@@ -919,6 +1436,7 @@ def test_save_kv_layer_only_marks_active_transfer_scope():
 
 def test_save_kv_layer_marks_earlier_groups_when_late_tail_is_first():
     worker = _make_producer_worker()
+    worker._current_send_transfer_ids = {"xfer-0"}  # noqa: SLF001
 
     worker.save_kv_layer("layer2", None, None)
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -8,6 +9,7 @@ import torch
 from mooncake_epd.core.state import (
     DirectFeatureBufferRegistry,
     FeatureBundle,
+    FeatureBundleDescriptor,
     FeatureHandle,
     FeatureHandleError,
     FeatureHandleProvider,
@@ -24,6 +26,7 @@ from mooncake_epd.core.state import (
     unregister_direct_feature_buffer_registry,
     unregister_feature_handle_registry,
 )
+from mooncake_epd.core.transfer import TransferEngine
 
 
 def _bundle(feature_id: str, base: float) -> FeatureBundle:
@@ -285,6 +288,63 @@ class _BorrowedRegistrationMooncakeEngine(_ReadingMooncakeEngine):
         return -600
 
 
+class _ManagedReadingMooncakeEngine(_ReadingMooncakeEngine):
+    def __init__(self):
+        super().__init__()
+        self.managed = {}
+
+    def allocate_managed_buffer(self, nbytes):
+        import ctypes
+
+        buffer = ctypes.create_string_buffer(max(1, int(nbytes)))
+        pointer = int(ctypes.addressof(buffer))
+        self.managed[pointer] = buffer
+        return pointer
+
+    def free_managed_buffer(self, pointer, _nbytes):
+        self.managed.pop(int(pointer), None)
+        return 0
+
+    def read_bytes_from_buffer(self, pointer, nbytes):
+        import ctypes
+
+        return ctypes.string_at(int(pointer), int(nbytes))
+
+
+def _remote_direct_handle(
+    bundle: FeatureBundle,
+    *,
+    handle_id: str,
+    remote_session: str = "api-prefill-session",
+    source_mm_hash: str | None = None,
+) -> FeatureHandle:
+    """Build a real direct control-plane payload backed by source tensors."""
+
+    return FeatureHandle(
+        handle_id=handle_id,
+        feature_id=bundle.image_hash,
+        store_id="direct-store",
+        uri=f"epd-direct://direct-store/{bundle.image_hash}",
+        descriptor=bundle.descriptor(),
+        metadata={
+            "backend": "direct_engine",
+            "direct_remote_session": remote_session,
+            **({"source_mm_hash": source_mm_hash} if source_mm_hash else {}),
+            "direct_plan": {
+                "feature_id": bundle.image_hash,
+                "targets": [
+                    {
+                        "name": name,
+                        "remote_pointer": int(tensor.data_ptr()),
+                        "nbytes": int(tensor.nelement() * tensor.element_size()),
+                    }
+                    for name, tensor in TransferEngine.feature_bundle_tensor_items(bundle)
+                ],
+            },
+        },
+    )
+
+
 def test_direct_read_does_not_unregister_borrowed_registration(monkeypatch):
     import mooncake_epd.core.state.vllm_feature_handle_provider as provider_mod
     from mooncake_epd.core.transfer import TransferEngine
@@ -372,6 +432,252 @@ def test_epd_direct_remote_handle_reads_into_target_tensors(monkeypatch):
     assert fake.read_calls and fake.read_calls[0][0] == "api-prefill-session"
     assert len(fake.registered) == 3
     assert fake.unregistered == [ptr for ptr, _ in fake.registered]
+
+
+def test_direct_resolved_cache_is_scoped_to_reallocated_peer_buffer(monkeypatch):
+    """A repeated feature id must not return tensors from an old direct plan."""
+
+    import mooncake_epd.core.state.vllm_feature_handle_provider as provider_mod
+
+    clear_feature_handle_bundle_cache()
+    engine = TransferEngine(protocol="tcp")
+    fake = _ReadingMooncakeEngine()
+    engine.bind_mooncake_backend(fake, initialized=True, owns_backend=False)
+    monkeypatch.setattr(provider_mod, "_DIRECT_READ_ENGINE", engine)
+    monkeypatch.setenv("MOONCAKE_EPD_DIRECT_READ_MODE", "registered_tensor")
+
+    # Both bundles deliberately share content identity and descriptor shape,
+    # just like a non-persistent Prefill reallocation. Only the peer-buffer
+    # incarnation/pointers and payload differ.
+    first = _bundle("remote-direct-reallocated", 1.0)
+    second = _bundle("remote-direct-reallocated", 50.0)
+    first_handle = _remote_direct_handle(first, handle_id="direct-allocation-a")
+    second_handle = _remote_direct_handle(second, handle_id="direct-allocation-b")
+    first_handle.metadata["direct_allocation_id"] = "allocation-a"
+    second_handle.metadata["direct_allocation_id"] = "allocation-b"
+    provider = FeatureHandleProvider(
+        FeatureHandleProviderConfig(
+            worker_id="no-registry",
+            device="cpu",
+            strict=True,
+            resolved_cache_entries=4,
+            resolved_cache_max_bytes=1024 * 1024,
+        )
+    )
+
+    first_resolved = provider.resolve_from_sources(
+        {"mm_feature_handles": [first_handle.as_control_payload()]},
+        device="cpu",
+        dtype=torch.float32,
+    )
+    second_resolved = provider.resolve_from_sources(
+        {"mm_feature_handles": [second_handle.as_control_payload()]},
+        device="cpu",
+        dtype=torch.float32,
+    )
+
+    assert first_resolved is not None
+    assert second_resolved is not None
+    assert len(fake.read_calls) == 2
+    assert torch.equal(
+        second_resolved.image_embeds,
+        torch.cat([second.last_hidden, second.intermediates[0][1]], dim=-1),
+    )
+    assert not torch.equal(first_resolved.image_embeds, second_resolved.image_embeds)
+
+
+def test_epd_direct_remote_multi_handle_batch_read_uses_one_engine_call(monkeypatch):
+    import mooncake_epd.core.state.vllm_feature_handle_provider as provider_mod
+    from mooncake_epd.core.transfer import TransferEngine
+
+    clear_feature_handle_bundle_cache()
+    engine = TransferEngine(protocol="tcp")
+    fake = _ReadingMooncakeEngine()
+    engine.bind_mooncake_backend(fake, initialized=True, owns_backend=False)
+    monkeypatch.setattr(provider_mod, "_DIRECT_READ_ENGINE", engine)
+    monkeypatch.setenv("MOONCAKE_EPD_DIRECT_READ_MODE", "registered_tensor")
+
+    first = _bundle("remote-direct-batch-a", 2.0)
+    second = _bundle("remote-direct-batch-b", 20.0)
+    handles = [
+        _remote_direct_handle(first, handle_id="remote-direct-batch-a"),
+        _remote_direct_handle(second, handle_id="remote-direct-batch-b"),
+    ]
+    original_validate_bundle = FeatureBundleDescriptor.validate_bundle
+    validation_calls = []
+
+    def _counted_validate_bundle(self, *args, **kwargs):
+        validation_calls.append(self.feature_id)
+        return original_validate_bundle(self, *args, **kwargs)
+
+    monkeypatch.setattr(FeatureBundleDescriptor, "validate_bundle", _counted_validate_bundle)
+    provider = FeatureHandleProvider(
+        FeatureHandleProviderConfig(worker_id="no-registry", device="cpu", strict=True)
+    )
+    resolved_items = provider.resolve_individual_handles(
+        handles,
+        device="cpu",
+        dtype=torch.float32,
+    )
+
+    assert len(resolved_items) == 2
+    assert torch.equal(
+        resolved_items[0].image_embeds,
+        torch.cat([first.last_hidden, first.intermediates[0][1]], dim=-1),
+    )
+    assert torch.equal(
+        resolved_items[1].image_embeds,
+        torch.cat([second.last_hidden, second.intermediates[0][1]], dim=-1),
+    )
+    # Each FeatureBundle has last_hidden, grid_thw, and one deep-stack tensor;
+    # both bundles are carried by one same-session Mooncake batch read.
+    assert len(fake.read_calls) == 1
+    assert fake.read_calls[0][0] == "api-prefill-session"
+    assert len(fake.read_calls[0][1]) == 6
+    assert len(fake.registered) == 6
+    assert fake.unregistered == [ptr for ptr, _ in fake.registered]
+    # The direct reader validates each descriptor once.  The old single-handle
+    # path validated inside the reader and again in the provider hot path.
+    assert validation_calls == [first.image_hash, second.image_hash]
+
+
+def test_epd_direct_remote_batch_read_never_crosses_sessions(monkeypatch):
+    import mooncake_epd.core.state.vllm_feature_handle_provider as provider_mod
+
+    clear_feature_handle_bundle_cache()
+    engine = TransferEngine(protocol="tcp")
+    fake = _ReadingMooncakeEngine()
+    engine.bind_mooncake_backend(fake, initialized=True, owns_backend=False)
+    monkeypatch.setattr(provider_mod, "_DIRECT_READ_ENGINE", engine)
+    monkeypatch.setenv("MOONCAKE_EPD_DIRECT_READ_MODE", "registered_tensor")
+
+    first = _bundle("remote-direct-session-a", 4.0)
+    second = _bundle("remote-direct-session-b", 40.0)
+    first_handle = _remote_direct_handle(
+        first,
+        handle_id="remote-direct-session-a",
+        remote_session="encoder-session-a",
+    )
+    second_handle = _remote_direct_handle(
+        second,
+        handle_id="remote-direct-session-b",
+        remote_session="encoder-session-b",
+    )
+    provider = FeatureHandleProvider(
+        FeatureHandleProviderConfig(worker_id="no-registry", device="cpu", strict=True)
+    )
+
+    resolved = provider.resolve_from_sources(
+        {"mm_feature_handles": [first_handle.as_control_payload(), second_handle.as_control_payload()]},
+        device="cpu",
+        dtype=torch.float32,
+    )
+
+    assert resolved is not None
+    assert [call[0] for call in fake.read_calls] == ["encoder-session-a", "encoder-session-b"]
+    assert [len(call[1]) for call in fake.read_calls] == [3, 3]
+
+
+def test_epd_direct_remote_managed_buffer_batch_read_preserves_payloads(monkeypatch):
+    import mooncake_epd.core.state.vllm_feature_handle_provider as provider_mod
+
+    clear_feature_handle_bundle_cache()
+    engine = TransferEngine(protocol="tcp")
+    fake = _ManagedReadingMooncakeEngine()
+    engine.bind_mooncake_backend(fake, initialized=True, owns_backend=False)
+    monkeypatch.setattr(provider_mod, "_DIRECT_READ_ENGINE", engine)
+    monkeypatch.setenv("MOONCAKE_EPD_DIRECT_READ_MODE", "managed_buffer")
+
+    first = _bundle("remote-direct-managed-a", 5.0)
+    second = _bundle("remote-direct-managed-b", 50.0)
+    provider = FeatureHandleProvider(
+        FeatureHandleProviderConfig(worker_id="no-registry", device="cpu", strict=True)
+    )
+    resolved_items = provider.resolve_individual_handles(
+        [
+            _remote_direct_handle(first, handle_id="remote-direct-managed-a"),
+            _remote_direct_handle(second, handle_id="remote-direct-managed-b"),
+        ],
+        device="cpu",
+        dtype=torch.float32,
+    )
+
+    assert len(fake.read_calls) == 1
+    assert len(fake.read_calls[0][1]) == 6
+    assert fake.managed == {}
+    assert torch.equal(
+        resolved_items[0].image_embeds,
+        torch.cat([first.last_hidden, first.intermediates[0][1]], dim=-1),
+    )
+    assert torch.equal(
+        resolved_items[1].image_embeds,
+        torch.cat([second.last_hidden, second.intermediates[0][1]], dim=-1),
+    )
+
+
+def test_vllm_mm_injection_batches_same_session_direct_handles_across_requests(monkeypatch):
+    import mooncake_epd.core.state.vllm_feature_handle_provider as provider_mod
+    from mooncake_epd.core.transfer import TransferEngine
+
+    clear_feature_handle_bundle_cache()
+    engine = TransferEngine(protocol="tcp")
+    fake = _ReadingMooncakeEngine()
+    engine.bind_mooncake_backend(fake, initialized=True, owns_backend=False)
+    monkeypatch.setattr(provider_mod, "_DIRECT_READ_ENGINE", engine)
+    monkeypatch.setenv("MOONCAKE_EPD_DIRECT_READ_MODE", "registered_tensor")
+    monkeypatch.setattr(
+        provider_mod,
+        "_build_vllm_image_embedding_item",
+        lambda _original, resolved: {
+            "image_embeds": resolved.image_embeds,
+            "image_grid_thw": resolved.image_grid_thw,
+        },
+    )
+
+    first = _bundle("stable-mm-hash-a", 3.0)
+    second = _bundle("stable-mm-hash-b", 30.0)
+    handles = [
+        _remote_direct_handle(
+            first,
+            handle_id="inject-direct-a",
+            source_mm_hash="stable-mm-hash-a",
+        ),
+        _remote_direct_handle(
+            second,
+            handle_id="inject-direct-b",
+            source_mm_hash="stable-mm-hash-b",
+        ),
+    ]
+    first_request = SimpleNamespace(
+        kv_transfer_params={"mm_feature_handles": [handles[0].as_control_payload()]}
+    )
+    second_request = SimpleNamespace(
+        kv_transfer_params={"mm_feature_handles": [handles[1].as_control_payload()]}
+    )
+    provider = FeatureHandleProvider(
+        FeatureHandleProviderConfig(worker_id="no-registry", device="cpu", strict=True)
+    )
+
+    _, converted_kwargs, _ = provider_mod.inject_feature_handles_into_vllm_mm_kwargs(
+        mm_hashes=["stable-mm-hash-a", "stable-mm-hash-b"],
+        mm_kwargs=[("image", {"pixels": "first"}), ("image", {"pixels": "second"})],
+        mm_lora_refs=[("request-a", object()), ("request-b", object())],
+        requests={"request-a": first_request, "request-b": second_request},
+        device="cpu",
+        dtype=torch.float32,
+        provider=provider,
+    )
+
+    assert len(fake.read_calls) == 1
+    assert len(fake.read_calls[0][1]) == 6
+    assert torch.equal(
+        converted_kwargs[0][1]["image_embeds"],
+        torch.cat([first.last_hidden, first.intermediates[0][1]], dim=-1),
+    )
+    assert torch.equal(
+        converted_kwargs[1][1]["image_embeds"],
+        torch.cat([second.last_hidden, second.intermediates[0][1]], dim=-1),
+    )
 
 
 def test_maybe_inject_feature_handle_kwargs_preserves_existing_embeds(tmp_path):

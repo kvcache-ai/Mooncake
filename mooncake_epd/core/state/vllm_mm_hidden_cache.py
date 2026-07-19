@@ -35,6 +35,10 @@ from typing import Any, Callable, Dict, Iterable, Iterator, Optional, Sequence, 
 
 import torch
 
+from .hidden_cache_key import HiddenCacheKeyError, HiddenStateCacheKeyV2
+from .hidden_cache_policy import HiddenCachePolicy
+from .mooncake_hidden_state_store import MooncakeHiddenStateStore
+
 _CURRENT_MM_HIDDEN_CACHE_KEYS: contextvars.ContextVar[Optional[Tuple[str, ...]]] = (
     contextvars.ContextVar("mooncake_epd_vllm_mm_hidden_cache_keys", default=None)
 )
@@ -199,8 +203,18 @@ class VLLMMMHiddenStateCache:
     the original vision encoder path.
     """
 
-    def __init__(self) -> None:
-        self.enabled = _env_bool("MOONCAKE_EPD_VLLM_MM_HIDDEN_CACHE", True)
+    def __init__(
+        self,
+        *,
+        l2_store: Optional[MooncakeHiddenStateStore] = None,
+        l2_policy: Optional[HiddenCachePolicy] = None,
+    ) -> None:
+        self.l2_policy = l2_policy or HiddenCachePolicy.from_env()
+        self.l2_store = l2_store
+        self.enabled = bool(
+            self.l2_policy.enable_l1
+            and _env_bool("MOONCAKE_EPD_VLLM_MM_HIDDEN_CACHE", True)
+        )
         self.max_entries = _env_int("MOONCAKE_EPD_VLLM_MM_HIDDEN_CACHE_MAX_ENTRIES", 64, minimum=1)
         self.max_bytes = _env_int(
             "MOONCAKE_EPD_VLLM_MM_HIDDEN_CACHE_MAX_BYTES",
@@ -214,10 +228,7 @@ class VLLMMMHiddenStateCache:
             minimum=0,
         )
         self.debug = _env_bool("MOONCAKE_EPD_VLLM_MM_HIDDEN_CACHE_DEBUG", False)
-        self.allow_tensor_fallback = _env_bool(
-            "MOONCAKE_EPD_VLLM_MM_HIDDEN_CACHE_ALLOW_TENSOR_FALLBACK",
-            False,
-        )
+        self.allow_tensor_fallback = bool(self.l2_policy.allow_tensor_hash_fallback)
         self.metrics_flush_interval_s = _env_float(
             "MOONCAKE_EPD_VLLM_MM_HIDDEN_CACHE_METRICS_INTERVAL_S",
             0.25,
@@ -227,6 +238,12 @@ class VLLMMMHiddenStateCache:
         self._entries: "OrderedDict[str, MMHiddenCacheEntry]" = OrderedDict()
         self._bytes = 0
         self._last_flush = 0.0
+        # Worker inference can finish before the normal metrics interval
+        # elapses.  Keep one daemon timer so a model-side image_embeds hit is
+        # persisted shortly after the hot-path update without synchronously
+        # writing a JSON file on every request.
+        self._flush_timer_lock = threading.Lock()
+        self._flush_timer: Optional[threading.Timer] = None
         self._recent_keys: "deque[dict[str, Any]]" = deque(maxlen=16)
         self._metrics: Dict[str, Any] = {
             "enabled": bool(self.enabled),
@@ -248,6 +265,11 @@ class VLLMMMHiddenStateCache:
             "vision_compute_ms_total": 0.0,
             "cache_load_ms_total": 0.0,
             "hash_ms_total": 0.0,
+            "l2_lookups": 0,
+            "l2_hits": 0,
+            "l2_misses": 0,
+            "l2_stores": 0,
+            "l2_errors": 0,
             "errors": 0,
             "last_error": "",
         }
@@ -264,6 +286,10 @@ class VLLMMMHiddenStateCache:
             out["max_bytes"] = int(self.max_bytes)
             out["store_on_gpu"] = bool(self.store_on_gpu)
             out["allow_tensor_fallback"] = bool(self.allow_tensor_fallback)
+            out["l2_enabled"] = bool(
+                self.l2_store is not None and self.l2_policy.has_l2_identity
+            )
+            out["l2_partial_enabled"] = bool(self.l2_policy.partial_enabled)
             out["hit_rate"] = (
                 float(out["hits"]) / float(out["lookups"])
                 if int(out.get("lookups", 0) or 0) > 0
@@ -272,6 +298,24 @@ class VLLMMMHiddenStateCache:
             if self.debug:
                 out["recent_keys"] = list(self._recent_keys)
             return out
+
+    def configure_l2_store(
+        self,
+        store: Optional[MooncakeHiddenStateStore],
+        *,
+        policy: Optional[HiddenCachePolicy] = None,
+    ) -> None:
+        """Install an explicitly configured exact L2 Store adapter.
+
+        The adapter is injected by process bootstrap; this cache never creates
+        a Mooncake client from environment at import time.  Missing identity
+        fields leave L2 disabled/fail-closed while preserving exact L1.
+        """
+
+        with self._lock:
+            self.l2_store = store
+            if policy is not None:
+                self.l2_policy = policy
 
     def get_or_compute(
         self,
@@ -418,6 +462,16 @@ class VLLMMMHiddenStateCache:
             )
             for i in range(num_items)
         ]
+        l2_keys = [
+            self._l2_key_for_qwen3vl_item(
+                stable_key=keys[i],
+                grid_row=grid_thw[i],
+                visual=visual,
+                namespace=namespace,
+                output_tokens=output_sizes[i],
+            )
+            for i in range(num_items)
+        ]
 
         outputs: list[Optional[torch.Tensor]] = [None] * num_items
         missing: list[int] = []
@@ -427,6 +481,15 @@ class VLLMMMHiddenStateCache:
         for i, key in enumerate(cache_keys):
             self._remember_key_debug(mode="stable", key=key, source=keys[i], grid=grid_thw[i])
             cached = self._lookup(key, target_device=pixel_values.device, target_dtype=None)
+            if cached is None:
+                cached = self._lookup_l2(
+                    l2_keys[i],
+                    target_device=pixel_values.device,
+                )
+                if cached is not None:
+                    # L2 output is exact and immutable; retain an independent
+                    # L1 copy for low-latency repeat hits in this worker.
+                    self._store(key, cached)
             if cached is None:
                 missing.append(i)
             else:
@@ -455,6 +518,7 @@ class VLLMMMHiddenStateCache:
             for item_idx, tensor in zip(missing, miss_chunks):
                 outputs[item_idx] = tensor
                 self._store(cache_keys[item_idx], tensor)
+                self._store_l2(l2_keys[item_idx], tensor)
             trace_vllm_mm_hidden_event(
                 "qwen3vl_cache_compute_missing",
                 missing=missing,
@@ -541,6 +605,104 @@ class VLLMMMHiddenStateCache:
         )
         self._flush_metrics()
 
+    def _l2_key_for_qwen3vl_item(
+        self,
+        *,
+        stable_key: str,
+        grid_row: torch.Tensor,
+        visual: Any,
+        namespace: str,
+        output_tokens: int,
+    ) -> Optional[HiddenStateCacheKeyV2]:
+        """Build an exact L2 key from propagated identity metadata only.
+
+        ``grid_row`` is small layout metadata (normally three integers), not
+        image/hidden tensor content.  A pathological large metadata tensor is
+        rejected rather than copied from a CUDA device for cache keying.
+        """
+
+        if self.l2_store is None or not self.l2_policy.has_l2_identity:
+            return None
+        try:
+            if int(grid_row.numel()) <= 0 or int(grid_row.numel()) > 16:
+                return None
+            grid = tuple(
+                int(value)
+                for value in grid_row.detach().to(device="cpu").reshape(-1).tolist()
+            )
+            dtype = str(getattr(visual, "dtype", "") or "")
+            if not dtype or dtype == "unknown":
+                return None
+            return HiddenStateCacheKeyV2.from_vllm_stable_identity(
+                stable_asset_hash=str(stable_key),
+                modality="image",
+                model_id=str(self.l2_policy.model_id),
+                model_revision=str(self.l2_policy.model_revision),
+                processor_revision=str(self.l2_policy.processor_revision),
+                dtype=dtype,
+                output_schema=str(self.l2_policy.output_schema),
+                grid_thw=grid,
+                relevant_kwargs={
+                    "namespace": str(namespace),
+                    "output_tokens": int(output_tokens),
+                    "spatial_merge_size": int(
+                        getattr(visual, "spatial_merge_size", 1) or 1
+                    ),
+                },
+            )
+        except (HiddenCacheKeyError, TypeError, ValueError, RuntimeError) as exc:
+            # L2 identity being unavailable is a cache miss, never a request
+            # failure.  Keep a bounded error metric for rollout diagnosis.
+            with self._lock:
+                self._metrics["l2_errors"] += 1
+                self._metrics["last_error"] = f"{type(exc).__name__}: {exc}"[:500]
+            return None
+
+    def _lookup_l2(
+        self,
+        key: Optional[HiddenStateCacheKeyV2],
+        *,
+        target_device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        if key is None or self.l2_store is None:
+            return None
+        with self._lock:
+            self._metrics["l2_lookups"] += 1
+        try:
+            tensor = self.l2_store.get(key, target_device=target_device)
+        except Exception as exc:
+            with self._lock:
+                self._metrics["l2_errors"] += 1
+                self._metrics["last_error"] = f"{type(exc).__name__}: {exc}"[:500]
+            return None
+        with self._lock:
+            if tensor is None:
+                self._metrics["l2_misses"] += 1
+            else:
+                self._metrics["l2_hits"] += 1
+        return tensor
+
+    def _store_l2(
+        self,
+        key: Optional[HiddenStateCacheKeyV2],
+        tensor: torch.Tensor,
+    ) -> None:
+        if key is None or self.l2_store is None:
+            return
+        try:
+            self.l2_store.put(
+                key,
+                tensor,
+                lease_seconds=float(self.l2_policy.lease_seconds),
+            )
+        except Exception as exc:
+            with self._lock:
+                self._metrics["l2_errors"] += 1
+                self._metrics["last_error"] = f"{type(exc).__name__}: {exc}"[:500]
+            return
+        with self._lock:
+            self._metrics["l2_stores"] += 1
+
     def _tensor_key(self, *, pixel_values: torch.Tensor, grid_thw: torch.Tensor, namespace: str) -> str:
         h = hashlib.sha256()
         h.update(b"mooncake-vllm-mm-hidden-cache-tensor-v1\0")
@@ -611,7 +773,15 @@ class VLLMMMHiddenStateCache:
             entry.last_access_at = time.time()
             tensor = entry.tensor
             self._metrics["hits"] += 1
-        out = tensor.to(device=target_device, dtype=target_dtype, non_blocking=True) if target_dtype else tensor.to(device=target_device, non_blocking=True)
+        out = (
+            tensor.to(device=target_device, dtype=target_dtype, non_blocking=True)
+            if target_dtype
+            else tensor.to(device=target_device, non_blocking=True)
+        )
+        # CPU->CPU without a dtype change returns the cache's internal tensor.
+        # Never expose that mutable storage to model code or callers.
+        if out.data_ptr() == tensor.data_ptr():
+            out = out.clone()
         with self._lock:
             self._metrics["cache_load_ms_total"] += (time.perf_counter() - load_started) * 1000.0
         return out
@@ -691,8 +861,17 @@ class VLLMMMHiddenStateCache:
         if path is None:
             return
         now = time.time()
-        if not force and (now - self._last_flush) < self.metrics_flush_interval_s:
-            return
+        if not force:
+            remaining_s = self.metrics_flush_interval_s - (now - self._last_flush)
+            if remaining_s > 0.0:
+                # The runner waits for proxy metrics after the measured phase,
+                # but a cache that only sees one precomputed image would
+                # otherwise never write its post-hit snapshot before teardown.
+                # Coalesce to one delayed flush; do not add filesystem I/O to
+                # the FeatureHandle/model hot path.
+                self._schedule_metrics_flush(remaining_s)
+                return
+        self._cancel_scheduled_metrics_flush()
         with self._lock:
             self._last_flush = now
             payload = {
@@ -714,9 +893,43 @@ class VLLMMMHiddenStateCache:
             # Metrics must never affect serving.
             pass
 
+    def _schedule_metrics_flush(self, delay_s: float) -> None:
+        """Persist the latest snapshot after the rate-limit window.
+
+        This runs only when a normal flush was rate-limited.  A daemon timer is
+        intentionally used because vLLM workers are short-lived child
+        processes; it must not delay process shutdown or inference completion.
+        """
+
+        if self._metrics_path is None:
+            return
+        delay_s = max(0.001, float(delay_s))
+        with self._flush_timer_lock:
+            existing = self._flush_timer
+            if existing is not None and existing.is_alive():
+                return
+            timer = threading.Timer(delay_s, self._run_scheduled_metrics_flush)
+            timer.daemon = True
+            self._flush_timer = timer
+            timer.start()
+
+    def _run_scheduled_metrics_flush(self) -> None:
+        with self._flush_timer_lock:
+            self._flush_timer = None
+        self._flush_metrics(force=True)
+
+    def _cancel_scheduled_metrics_flush(self) -> None:
+        with self._flush_timer_lock:
+            timer = self._flush_timer
+            self._flush_timer = None
+        if timer is not None and timer is not threading.current_thread():
+            timer.cancel()
+
 
 _GLOBAL_CACHE: Optional[VLLMMMHiddenStateCache] = None
 _GLOBAL_LOCK = threading.Lock()
+_GLOBAL_L2_STORE: Optional[MooncakeHiddenStateStore] = None
+_GLOBAL_L2_POLICY: Optional[HiddenCachePolicy] = None
 
 
 def get_global_mm_hidden_cache() -> VLLMMMHiddenStateCache:
@@ -724,8 +937,34 @@ def get_global_mm_hidden_cache() -> VLLMMMHiddenStateCache:
     if _GLOBAL_CACHE is None:
         with _GLOBAL_LOCK:
             if _GLOBAL_CACHE is None:
-                _GLOBAL_CACHE = VLLMMMHiddenStateCache()
+                _GLOBAL_CACHE = VLLMMMHiddenStateCache(
+                    l2_store=_GLOBAL_L2_STORE,
+                    l2_policy=_GLOBAL_L2_POLICY,
+                )
     return _GLOBAL_CACHE
+
+
+def configure_vllm_mm_hidden_l2_store(
+    store: Optional[MooncakeHiddenStateStore],
+    *,
+    policy: Optional[HiddenCachePolicy] = None,
+) -> None:
+    """Inject an exact L2 Store adapter into this vLLM worker process.
+
+    Bootstrap code owns client construction and credentials.  This function is
+    intentionally explicit so importing the cache cannot accidentally create a
+    networked Store connection or enable L2 with an underspecified identity.
+    """
+
+    global _GLOBAL_L2_STORE, _GLOBAL_L2_POLICY
+    with _GLOBAL_LOCK:
+        _GLOBAL_L2_STORE = store
+        _GLOBAL_L2_POLICY = policy or HiddenCachePolicy.from_env()
+        if _GLOBAL_CACHE is not None:
+            _GLOBAL_CACHE.configure_l2_store(
+                _GLOBAL_L2_STORE,
+                policy=_GLOBAL_L2_POLICY,
+            )
 
 
 def record_vllm_precomputed_image_embeds_hit(

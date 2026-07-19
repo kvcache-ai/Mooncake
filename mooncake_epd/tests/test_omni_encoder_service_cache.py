@@ -9,8 +9,16 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from mooncake_epd.core.omni_encoder_worker import Qwen25OmniImageEncoderWorker
+from mooncake_epd.core.omni.workers.qwen25_omni import (
+    Qwen25OmniImageEncoderWorker as ProcessQwen25OmniImageEncoderWorker,
+)
 from mooncake_epd.core.state import FeatureHandleProvider, FeatureHandleProviderConfig
-from mooncake_epd.scripts.epd_encoder_service import EncoderServiceConfig, create_app
+from mooncake_epd.scripts.epd_encoder_service import (
+    EncoderServiceConfig,
+    _image_processor_kwargs_for_request,
+    _processor_inputs,
+    create_app,
+)
 
 
 class _FakeProcessor:
@@ -51,6 +59,25 @@ class _FakeOmniModel:
         return SimpleNamespace(pooler_output=pixel_values[:, :2].contiguous())
 
 
+class _CapturingImageProcessor:
+    size = {"shortest_edge": 65_536, "longest_edge": 16_777_216}
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, *, images, return_tensors, **kwargs):
+        self.calls.append({"images": images, "return_tensors": return_tensors, **kwargs})
+        return {
+            "pixel_values": torch.ones((4, 4), dtype=torch.float32),
+            "image_grid_thw": torch.tensor([[1, 2, 2]], dtype=torch.long),
+        }
+
+
+class _CapturingProcessor:
+    def __init__(self):
+        self.image_processor = _CapturingImageProcessor()
+
+
 def _image(color):
     return Image.new("RGB", (8, 8), color=color)
 
@@ -74,6 +101,28 @@ def _request() -> dict:
             }
         ]
     }
+
+
+def test_qwen25_omni_process_worker_import_preserves_encoder_service_adapter():
+    assert ProcessQwen25OmniImageEncoderWorker is Qwen25OmniImageEncoderWorker
+
+
+def test_encoder_maps_vllm_max_pixels_to_qwen_size_and_uses_image_processor_directly():
+    processor = _CapturingProcessor()
+    kwargs = _image_processor_kwargs_for_request(processor, {"max_pixels": 1_003_520})
+
+    assert kwargs == {
+        "size": {"shortest_edge": 65_536, "longest_edge": 1_003_520},
+    }
+    out = _processor_inputs(
+        processor,
+        _image((10, 20, 30)),
+        "unused when direct image processing is available",
+        image_processor_kwargs=kwargs,
+    )
+
+    assert tuple(out["image_grid_thw"].shape) == (1, 3)
+    assert processor.image_processor.calls[0]["size"]["longest_edge"] == 1_003_520
 
 
 def test_qwen25_omni_worker_exact_hidden_segment_cache_hits_on_repeat():

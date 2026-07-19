@@ -8,6 +8,7 @@ import time
 import hashlib
 import logging
 import os
+import threading
 from typing import Dict, Any, Optional, Tuple
 from dataclasses import dataclass, field
 from collections import OrderedDict
@@ -80,6 +81,8 @@ class HiddenStatePrefixCache:
         self._current_size_bytes = 0
         self._total_hits = 0
         self._total_misses = 0
+        self._rejected_entries = 0
+        self._lock = threading.RLock()
 
     def get(
         self, pixel_values: torch.Tensor,
@@ -88,22 +91,25 @@ class HiddenStatePrefixCache:
     ) -> Optional[Tuple[torch.Tensor, Dict[str, Any]]]:
         cache_key = str(stable_key) if stable_key else _fast_tensor_hash(pixel_values)
         now = time.monotonic()
+        with self._lock:
+            entry = self._cache.get(cache_key)
+            if entry is None:
+                self._total_misses += 1
+                return None
 
-        entry = self._cache.get(cache_key)
-        if entry is None:
-            self._total_misses += 1
-            return None
+            if now - entry.created_at > self.ttl_seconds:
+                self._evict(cache_key)
+                self._total_misses += 1
+                return None
 
-        if now - entry.created_at > self.ttl_seconds:
-            self._evict(cache_key)
-            self._total_misses += 1
-            return None
-
-        entry.last_accessed = now
-        entry.hit_count += 1
-        self._cache.move_to_end(cache_key)
-        self._total_hits += 1
-        return entry.hidden_states, entry.metadata
+            entry.last_accessed = now
+            entry.hit_count += 1
+            self._cache.move_to_end(cache_key)
+            self._total_hits += 1
+            # A cached hidden state is shared internally.  Returning its raw
+            # mutable tensor lets an accidental downstream in-place operation
+            # corrupt every later request, so expose an isolated snapshot.
+            return entry.hidden_states.clone(), dict(entry.metadata)
 
     def put(
         self,
@@ -115,25 +121,37 @@ class HiddenStatePrefixCache:
     ):
         cache_key = str(stable_key) if stable_key else _fast_tensor_hash(pixel_values)
 
-        if cache_key in self._cache:
-            self._cache.move_to_end(cache_key)
-            return
-
         size_bytes = hidden_states.nelement() * hidden_states.element_size()
+        with self._lock:
+            if cache_key in self._cache:
+                self._cache.move_to_end(cache_key)
+                return False
+            # An entry larger than the complete cache can never fit.  Reject it
+            # rather than looping forever after the final LRU item is evicted.
+            if (
+                size_bytes > self.max_cache_size_bytes
+                or self.max_entries <= 0
+                or self.max_cache_size_bytes <= 0
+            ):
+                self._rejected_entries += 1
+                return False
+            while self._should_evict(size_bytes):
+                if not self._cache:
+                    self._rejected_entries += 1
+                    return False
+                self._evict_lru()
 
-        while self._should_evict(size_bytes):
-            self._evict_lru()
-
-        now = time.monotonic()
-        self._cache[cache_key] = CachedHiddenState(
-            cache_key=cache_key,
-            hidden_states=hidden_states.clone(),
-            metadata={**metadata.copy(), "cache_key_mode": "stable" if stable_key else "tensor_sha256"},
-            created_at=now,
-            last_accessed=now,
-            size_bytes=size_bytes,
-        )
-        self._current_size_bytes += size_bytes
+            now = time.monotonic()
+            self._cache[cache_key] = CachedHiddenState(
+                cache_key=cache_key,
+                hidden_states=hidden_states.detach().clone(),
+                metadata={**metadata.copy(), "cache_key_mode": "stable" if stable_key else "tensor_sha256"},
+                created_at=now,
+                last_accessed=now,
+                size_bytes=size_bytes,
+            )
+            self._current_size_bytes += size_bytes
+            return True
 
     def _should_evict(self, additional_bytes: int) -> bool:
         return (
@@ -152,16 +170,19 @@ class HiddenStatePrefixCache:
             self._current_size_bytes -= entry.size_bytes
 
     def get_stats(self) -> Dict[str, Any]:
-        total = self._total_hits + self._total_misses
-        return {
-            "total_entries": len(self._cache),
-            "cache_size_mb": self._current_size_bytes / (1024 * 1024),
-            "max_size_mb": self.max_cache_size_bytes / (1024 * 1024),
-            "total_hits": self._total_hits,
-            "total_misses": self._total_misses,
-            "hit_rate": self._total_hits / max(total, 1),
-        }
+        with self._lock:
+            total = self._total_hits + self._total_misses
+            return {
+                "total_entries": len(self._cache),
+                "cache_size_mb": self._current_size_bytes / (1024 * 1024),
+                "max_size_mb": self.max_cache_size_bytes / (1024 * 1024),
+                "total_hits": self._total_hits,
+                "total_misses": self._total_misses,
+                "rejected_entries": self._rejected_entries,
+                "hit_rate": self._total_hits / max(total, 1),
+            }
 
     def clear(self):
-        self._cache.clear()
-        self._current_size_bytes = 0
+        with self._lock:
+            self._cache.clear()
+            self._current_size_bytes = 0

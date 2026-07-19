@@ -65,7 +65,14 @@ class EncoderOutput:
 
 
 class EncoderWorker:
-    """Runs the Qwen3-VL vision tower on a dedicated GPU."""
+    """Runs a Qwen-VL vision tower on a dedicated GPU.
+
+    Qwen3-VL exports optional DeepStack visual states while Qwen2.5-VL exports
+    only the pooled image embeddings.  Both share ``get_image_features`` and
+    the native vLLM ``image_embeds`` + ``image_grid_thw`` ABI, so the worker
+    keeps DeepStack strictly optional rather than treating it as a model-wide
+    invariant.
+    """
 
     def __init__(
         self,
@@ -80,9 +87,11 @@ class EncoderWorker:
         self.transfer = transfer
         self.model_fingerprint = _component_fingerprint(model)
         self.processor_fingerprint = _component_fingerprint(processor)
-        self.deepstack_indices: List[int] = list(
-            model.config.vision_config.deepstack_visual_indexes
-        )
+        vision_config = getattr(getattr(model, "config", None), "vision_config", None)
+        self.deepstack_indices: List[int] = [
+            int(index)
+            for index in (getattr(vision_config, "deepstack_visual_indexes", ()) or ())
+        ]
 
     def encode(
         self,

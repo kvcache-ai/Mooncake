@@ -93,8 +93,14 @@ implementation to be reviewed as small Mooncake subsystem changes.
 
 1. Encoder computes visual hidden states and DeepStack intermediate features.
 2. Prefill allocates target tensors for the descriptor.
-3. Encoder publishes tensor bytes to the Prefill-owned target through Mooncake direct peer-buffer metadata.
-4. Prefill validates descriptor compatibility before injecting precomputed image embeddings and skipping the vision tower.
+3. Encoder publishes tensor bytes to the Prefill-owned target through Mooncake direct peer-buffer metadata. For multiple publish-required features targeting the same Prefill session, their descriptors are coalesced into one Mooncake batch write; different sessions remain separate batches.
+4. In the Prefill EngineCore process, remote `epd-direct://` handles from the
+   same Encoder session are flattened into one Mooncake batch read directly
+   into their final tensors; handles from different sessions are never mixed,
+   and an in-process direct registry keeps its existing zero-copy ownership
+   path.
+5. Prefill validates descriptor compatibility before injecting precomputed image
+   embeddings and skipping the vision tower.
 
 **Artifact-backed status**
 
@@ -106,14 +112,22 @@ The real Qwen3-VL EPD artifact records `vision_encoder_skip_observed=true`, `pre
 
 - `MooncakeConnector` extension: `core/control/vllm_mooncake_connector.py`.
 - Transfer descriptors and counters: `core/control/vllm_transfer_primitives.py`.
+- P→D control-plane fence: `core/state/kv_transfer_manifest_v2.py`.
 - Config generation: `demo/vllm_integration.py`.
 
 **Data flow**
 
-1. Prefill runs as `kv_producer` and emits remote KV block metadata.
-2. The proxy records concrete block IDs and starts a directory-managed handoff.
-3. Decode runs as `kv_consumer` and receives grouped/layered KV blocks.
-4. The control plane commits or rolls back the handoff based on downstream completion.
+1. Prefill runs as `kv_producer` and emits remote KV block metadata plus its worker generation and serializable KV-layout fields.
+2. The proxy records concrete block IDs, creates a checksummed `KVTransferManifestV2`, and starts a directory-managed handoff.
+3. The manifest binds transfer/workflow IDs, source engine and target Decode worker IDs, source/destination generations, layout checksum, block groups, declared transport, and a wall-clock expiry. Each generated worker atomically publishes its current generation under `config/worker_generations`; the Proxy reads the target fence when it creates/rebinds the manifest. The layered pull carries the manifest to Prefill as well as Decode, so strict Decode validates its target fence before a pull and strict Prefill validates its own engine/generation/layout before exporting KV. A mismatched, stale, tampered, or destination-generation-mismatched manifest fails before the data plane starts.
+4. Decode runs as `kv_consumer` and receives grouped/layered KV blocks.
+5. The control plane commits or rolls back the handoff based on downstream completion.
+
+The source generation is required in a strict envelope, compared with the
+Prefill response metadata, and revalidated by the Prefill producer from the
+layered request immediately before export. CPU regression covers this fence.
+It still needs a real worker-restart/two-node hardware run before it is used as
+an operational reliability claim.
 
 The measured Qwen3-VL run used Mooncake direct peer-buffer over TCP for P→D. The real multimodal EPD artifact records 46 peer-buffer batches, 301,989,888 P→D peer-buffer bytes, zero fallback batches, zero layered transfer failures, and zero layered receive failures.
 
@@ -128,7 +142,11 @@ The code separates *policy* from *transport*:
 Public artifact boundary:
 
 - **TCP direct peer-buffer** is validated by the real multimodal EPD artifact.
-- **`nvlink_intra`** is validated by the same-host 2P2D scale-out artifact with explicit Prefill→Decode affinity.
+- **`nvlink_intra`** is validated only for a same-host, text-only 1P1D
+  Prefill→Decode run on the NV4-connected GPU1↔GPU3 pair.  The artifact uses
+  a separately staged `USE_INTRA_NVLINK` engine and records the native
+  `Using Intra-Node NVLink transport` marker for both workers.  It is not a
+  full multimodal E→P→D or 2P2D NVLink claim.
 - **SHM** is available as an intra-node deployment option for hosts that expose
   compatible shared-memory mappings.
 - **RDMA** is available through the transport abstraction for deployments with
@@ -224,7 +242,7 @@ Error and lifecycle mechanisms visible in code:
 | vLLM | Integrated through a repo-local `MooncakeConnector` module path and vLLM V1 `kv_transfer_config` roles. Artifact environment used vLLM 0.23.0. |
 | Qwen3-VL | Real artifacts use Qwen3-VL-8B-Instruct. Encoder code handles Qwen3-VL DeepStack fields and `grid_thw`. |
 | Mooncake | Uses Mooncake Python package and Transfer Engine APIs. Artifact environment used `mooncake_python=0.3.11.post1`. |
-| Hardware | Artifact-backed host: 8 × RTX A6000. TCP direct peer-buffer and same-host `nvlink_intra` are validated; RDMA is not required for correctness. |
+| Hardware | Artifact-backed host: 8 × RTX A6000. TCP direct peer-buffer and a staged-engine same-host P→D `nvlink_intra` path are validated; RDMA is not required for correctness. Full E→P→D NVLink and dual-node validation remain open. |
 | Python | Artifact environment and full regression suite used Python 3.10.12. |
 
 ## 10. Tradeoffs
@@ -245,5 +263,6 @@ Error and lifecycle mechanisms visible in code:
 - `mooncake_epd/artifacts/2026-07-10/benchmark_summary.json`
 - Raw artifact digests listed in `benchmark_summary.json`
 - Implementation files cited inline above
-- Full EPD regression: `371 passed, 1 skipped`
+- Current-checkout CPU EPD regression (2026-07-13): `439 passed, 19 skipped`
+  (skips are resource-gated real-model/GPU/RDMA cases)
 - Mooncake Store API regression: `72 passed`

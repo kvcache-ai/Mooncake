@@ -27,7 +27,7 @@ from mooncake_epd.tests.conftest import (  # noqa: E402
 )
 
 
-pytestmark = [pytest.mark.real_model, pytest.mark.gpu]
+pytestmark = [pytest.mark.real_model, pytest.mark.gpu, pytest.mark.gpu_single_node]
 
 DEVICE = torch.device("cuda:3")
 

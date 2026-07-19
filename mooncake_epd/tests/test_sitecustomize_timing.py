@@ -6,6 +6,12 @@ import sys
 import time
 from pathlib import Path
 
+import torch
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from mooncake_epd.core.state import FeatureBundle, unregister_direct_feature_buffer_registry
+
 
 def test_decode_timing_flush_is_batched_off_the_first_token_path(monkeypatch, tmp_path):
     patch_path = Path(__file__).resolve().parents[2] / "sitecustomize.py"
@@ -64,3 +70,65 @@ def test_decode_timing_flush_is_batched_off_the_first_token_path(monkeypatch, tm
     thread = runtime_patch._DECODE_ENGINE_TIMING_FLUSH_THREAD
     if thread is not None:
         thread.join(timeout=1.0)
+
+
+def test_embedded_direct_feature_lookup_offloads_registry_work(monkeypatch):
+    """The production Prefill hook must not block its ASGI loop on lookup."""
+
+    import mooncake_epd.core.transfer as transfer_module
+
+    class FakeTransferEngine:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+
+        def initialize(self):
+            return None
+
+    monkeypatch.setattr(transfer_module, "TransferEngine", FakeTransferEngine)
+    monkeypatch.setenv("MOONCAKE_EPD_ENABLE_DIRECT_FEATURE_BUFFER", "1")
+    monkeypatch.setenv("MOONCAKE_EPD_DIRECT_BUFFER_AUTH_TOKEN", "test-token")
+    monkeypatch.setenv("MOONCAKE_EPD_DIRECT_BUFFER_WORKER_ID", "prefill-site-test")
+    monkeypatch.setenv("MOONCAKE_EPD_DIRECT_BUFFER_DEVICE", "cpu")
+    monkeypatch.setenv("MOONCAKE_EPD_DIRECT_REMOTE_SESSION", "prefill-test-session")
+    monkeypatch.setenv("MOONCAKE_EPD_DIRECT_REGISTER_MEMORY", "0")
+
+    patch_path = Path(__file__).resolve().parents[2] / "sitecustomize.py"
+    module_name = "mooncake_epd_sitecustomize_direct_lookup_test"
+    spec = importlib.util.spec_from_file_location(module_name, patch_path)
+    assert spec is not None and spec.loader is not None
+    runtime_patch = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = runtime_patch
+    spec.loader.exec_module(runtime_patch)
+
+    app = FastAPI()
+    runtime_patch._install_direct_feature_buffer_routes(app)
+    registry = app._mooncake_epd_direct_feature_buffer_registry
+    bundle = FeatureBundle(
+        image_hash="site-direct-lookup",
+        last_hidden=torch.ones((1, 2), dtype=torch.float32),
+    )
+    registry.allocate_for_descriptor(bundle.descriptor(), zero_fill=False)
+    registry.mark_ready(bundle.image_hash)
+
+    original_to_thread = runtime_patch.asyncio.to_thread
+    offloaded_calls: list[str] = []
+
+    async def tracking_to_thread(func, /, *args, **kwargs):
+        offloaded_calls.append(str(getattr(func, "__name__", "")))
+        return await original_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(runtime_patch.asyncio, "to_thread", tracking_to_thread)
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                "/mooncake_epd/direct_feature_buffer/lookup",
+                json={"feature_ids": [bundle.image_hash], "lease_count": 1},
+                headers={"X-Mooncake-EPD-Token": "test-token"},
+            )
+        assert response.status_code == 200, response.text
+        assert response.json()["server_lookup_ms"] >= 0.0
+        assert "_lookup_ready_targets" in offloaded_calls
+    finally:
+        registry.release(bundle.image_hash)
+        registry.release(bundle.image_hash)
+        unregister_direct_feature_buffer_registry(registry.worker_id)

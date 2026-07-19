@@ -26,8 +26,9 @@ import math
 import os
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable, Mapping
 
 import msgspec
 
@@ -63,7 +64,15 @@ from .vllm_transfer_primitives import (
     chunk_transfer_descriptors,
 )
 from .connector_metrics import ConnectorMetricsSink
-from ..transfer import TransferEngine as PeerTransferEngine
+from ..transfer import (
+    TransferEngine as PeerTransferEngine,
+    require_mooncake_protocol_support,
+)
+from ..state.kv_transfer_manifest_v2 import (
+    KVTransferLayoutV2,
+    KVTransferManifestError,
+    KVTransferManifestV2,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -86,6 +95,23 @@ class _TransferDispatchResult:
     dispatch_ms: float = 0.0
     prepare_ms: float = 0.0
     write_ms: float = 0.0
+    native_engine_lock_wait_ms: float = 0.0
+
+
+@dataclass
+class _EPDPullReqMeta(PullReqMeta):
+    """Declared EPD extension of vLLM's Decode pull metadata.
+
+    vLLM's upstream ``PullReqMeta`` intentionally contains only the fields it
+    needs for its native Mooncake protocol.  A P->D manifest is an EPD control
+    envelope, not a data-plane pointer, so keeping it as a declared dataclass
+    field lets it follow the pull request through scheduler/worker transports
+    without changing the upstream wire format.  It also gives the worker a
+    request-local source of truth when an older executor strips metadata
+    sidecars while rebuilding connector metadata.
+    """
+
+    epd_kv_transfer_manifest_v2: dict[str, Any] | None = None
 
 
 @dataclass
@@ -93,6 +119,12 @@ class _LayeredSendState:
     transfer_id: str
     total_groups: int
     group_ready_events: list[threading.Event]
+    # A vLLM attention invocation only enqueues the writes to its KV cache
+    # before it calls ``save_kv_layer``.  The transfer engine runs from a
+    # different host thread, therefore the thread event alone is not enough to
+    # prove that a source region is readable.  Keep the CUDA event that fences
+    # each logical layer group alongside the host-side readiness event.
+    source_ready_events: list[Any | None]
     announced_groups: set[int] = field(default_factory=set)
     failed: str | None = None
     highest_announced_group: int = -1
@@ -111,19 +143,36 @@ class _LayeredSendState:
             transfer_id=transfer_id,
             total_groups=max(1, int(total_groups)),
             group_ready_events=[threading.Event() for _ in range(max(1, int(total_groups)))],
+            source_ready_events=[None for _ in range(max(1, int(total_groups)))],
         )
 
-    def mark_group_ready(self, group_idx: int) -> None:
+    def mark_group_ready(
+        self,
+        group_idx: int,
+        *,
+        source_ready_event: Any | None = None,
+    ) -> None:
         with self._lock:
             if group_idx < 0 or group_idx >= len(self.group_ready_events):
                 return
+            if (
+                source_ready_event is not None
+                and self.source_ready_events[group_idx] is None
+            ):
+                self.source_ready_events[group_idx] = source_ready_event
             if not self.group_ready_events[group_idx].is_set():
                 self.group_ready_events[group_idx].set()
                 self._wake_async_group_locked(group_idx)
             self.announced_groups.add(group_idx)
             self.highest_announced_group = max(self.highest_announced_group, group_idx)
 
-    def mark_groups_ready_through(self, group_idx: int, *, floor: int = 0) -> None:
+    def mark_groups_ready_through(
+        self,
+        group_idx: int,
+        *,
+        floor: int = 0,
+        source_ready_event: Any | None = None,
+    ) -> None:
         """Mark a contiguous ready range and wake async waiters once per group."""
 
         with self._lock:
@@ -132,10 +181,23 @@ class _LayeredSendState:
             if stop < start:
                 return
             for ready_group_idx in range(start, stop + 1):
+                if (
+                    source_ready_event is not None
+                    and self.source_ready_events[ready_group_idx] is None
+                ):
+                    self.source_ready_events[ready_group_idx] = source_ready_event
                 self.group_ready_events[ready_group_idx].set()
                 self.announced_groups.add(ready_group_idx)
                 self._wake_async_group_locked(ready_group_idx)
             self.highest_announced_group = max(self.highest_announced_group, stop)
+
+    def source_ready_event(self, group_idx: int) -> Any | None:
+        """Return the source-completion fence for one logical KV group."""
+
+        with self._lock:
+            if group_idx < 0 or group_idx >= len(self.source_ready_events):
+                return None
+            return self.source_ready_events[group_idx]
 
     def async_group_event(
         self,
@@ -323,6 +385,11 @@ class LayeredMooncakeXferMetadata(
     block_lens: list[int]
     layered: bool = False
     total_groups: int = 0
+    # The regular vLLM Mooncake metadata has no extension field.  Keep the
+    # checksummed P->D envelope in the repo-local layered side-channel so the
+    # producer can fence its own generation immediately before it uses remote
+    # pointer descriptors.  Keys are Decode request IDs, matching req_blocks.
+    kv_transfer_manifests: dict[str, dict[str, Any]] | None = None
 
 
 class LayeredMooncakeXferResponse(
@@ -354,6 +421,150 @@ class EPDMooncakeConnectorScheduler(UpstreamMooncakeConnectorScheduler):
         self.tp_size = int(getattr(parallel_config, "tensor_parallel_size", 1) or 1)
         extra = dict(vllm_config.kv_transfer_config.kv_connector_extra_config or {})
         self.layered_kv_transfer = bool(extra.get("layered_kv_transfer", False))
+        self.worker_id = str(
+            extra.get("worker_id")
+            or os.getenv("MOONCAKE_EPD_WORKER_ID")
+            or self.engine_id
+        )
+        self.worker_generation = str(
+            extra.get("worker_generation")
+            or os.getenv("MOONCAKE_EPD_WORKER_GENERATION")
+            or f"{self.engine_id}:{uuid.uuid4().hex}"
+        )
+        self.require_kv_transfer_manifest_v2 = self._as_enabled(
+            extra.get(
+                "require_kv_transfer_manifest_v2",
+                os.getenv("MOONCAKE_EPD_STRICT", "0"),
+            )
+        )
+        self.require_kv_transfer_manifest_generation = self._as_enabled(
+            extra.get(
+                "require_kv_transfer_manifest_generation",
+                os.getenv("MOONCAKE_EPD_STRICT", "0"),
+            )
+        )
+        self.require_kv_transfer_manifest_compatibility = self._as_enabled(
+            extra.get(
+                "require_kv_transfer_manifest_compatibility",
+                os.getenv("MOONCAKE_EPD_REQUIRE_KV_TRANSFER_MANIFEST_COMPATIBILITY", "0"),
+            )
+        )
+        self.kv_transfer_layout_v2 = self._build_kv_transfer_layout(vllm_config)
+        # vLLM's upstream Mooncake scheduler consumes ``do_remote_prefill``
+        # by mutating the request's KV parameters to ``False`` immediately
+        # after it records the pull.  EPD must retain the original control
+        # envelope until ``build_connector_meta`` serializes the pull for the
+        # worker; otherwise the V2 manifest is silently omitted from P->D.
+        self._recv_kv_transfer_params_by_request: dict[str, dict[str, Any]] = {}
+
+    @staticmethod
+    def _as_enabled(value: Any) -> bool:
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _first_config_value(*values: Any, default: Any = "unknown") -> Any:
+        for value in values:
+            if value is not None and str(value).strip() not in {"", "None"}:
+                return value
+        return default
+
+    @classmethod
+    def _build_kv_transfer_layout(cls, vllm_config: VllmConfig) -> dict[str, Any]:
+        """Capture a serializable source layout without relying on raw pointers."""
+
+        model_config = getattr(vllm_config, "model_config", None)
+        cache_config = getattr(vllm_config, "cache_config", None)
+        parallel_config = getattr(vllm_config, "parallel_config", None)
+        hf_config = getattr(model_config, "hf_config", None)
+        text_config = getattr(hf_config, "text_config", None)
+        num_layers = 0
+        for candidate in (model_config, hf_config, text_config):
+            for name in ("num_hidden_layers", "num_layers"):
+                value = getattr(candidate, name, None)
+                try:
+                    if value is not None and int(value) > 0:
+                        num_layers = int(value)
+                        break
+                except (TypeError, ValueError):
+                    continue
+            if num_layers:
+                break
+        try:
+            block_size = int(getattr(cache_config, "block_size", 0) or 0)
+        except (TypeError, ValueError):
+            block_size = 0
+        try:
+            tp_size = int(getattr(parallel_config, "tensor_parallel_size", 1) or 1)
+        except (TypeError, ValueError):
+            tp_size = 1
+        layout = KVTransferLayoutV2(
+            model_id=str(
+                cls._first_config_value(
+                    getattr(model_config, "model", None),
+                    getattr(model_config, "model_name", None),
+                )
+            ),
+            model_revision=str(cls._first_config_value(getattr(model_config, "revision", None))),
+            vllm_adapter_version=str(
+                os.getenv("MOONCAKE_EPD_VLLM_ADAPTER_VERSION", "mooncake-epd-v1")
+            ),
+            dtype=str(cls._first_config_value(getattr(model_config, "dtype", None))),
+            block_size=block_size,
+            num_layers=num_layers,
+            tp_size=max(1, tp_size),
+            tp_rank=0,
+            extra={"connector": "MooncakeConnector", "layout_source": "vllm_config"},
+        )
+        return layout.as_control_payload()
+
+    def _source_manifest_hints(self) -> dict[str, Any]:
+        return {
+            "source_worker_id": self.worker_id,
+            "source_generation": self.worker_generation,
+            "kv_layout_v2": dict(self.kv_transfer_layout_v2),
+        }
+
+    def _validate_kv_transfer_manifest_params(self, params: Mapping[str, Any]) -> None:
+        """Fail before a Decode worker receives stale/misrouted P->D KV."""
+
+        raw_manifest = params.get("kv_transfer_manifest_v2")
+        if raw_manifest is None:
+            if self.require_kv_transfer_manifest_v2:
+                raise RuntimeError("P->D KV transfer manifest v2 is required")
+            return
+        try:
+            manifest = KVTransferManifestV2.from_control_payload(raw_manifest)
+            source_generation = params.get("source_generation")
+            if source_generation is not None and not str(source_generation).strip():
+                source_generation = None
+            destination_generation: str | None = None
+            if str(manifest.destination_generation).strip().lower() not in {
+                "",
+                "unknown",
+                "none",
+                "null",
+            }:
+                destination_generation = self.worker_generation
+            manifest.validate_for_consumer(
+                transfer_id=str(params.get("transfer_id") or ""),
+                workflow_id=str(params.get("workflow_id") or ""),
+                source_engine_id=str(params.get("remote_engine_id") or ""),
+                source_generation=(str(source_generation) if source_generation is not None else None),
+                destination_engine_id=self.worker_id,
+                destination_generation=destination_generation,
+                require_generation_fences=self.require_kv_transfer_manifest_generation,
+                require_compatibility=self.require_kv_transfer_manifest_compatibility,
+            )
+            if self.require_kv_transfer_manifest_compatibility:
+                local_layout = KVTransferLayoutV2.from_control_payload(
+                    self.kv_transfer_layout_v2
+                )
+                if manifest.layout_checksum != local_layout.checksum:
+                    raise KVTransferManifestError(
+                        "KV transfer layout does not match this Decode worker"
+                    )
+        except (KVTransferManifestError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"P->D KV transfer manifest rejected: {exc}") from exc
 
     @staticmethod
     def _int_param(params: dict[str, Any], key: str) -> int | None:
@@ -424,11 +635,28 @@ class EPDMooncakeConnectorScheduler(UpstreamMooncakeConnectorScheduler):
 
     def update_state_after_alloc(self, request, blocks, num_external_tokens: int):
         params = dict(getattr(request, "kv_transfer_params", None) or {})
+        is_remote_prefill = bool(params.get("do_remote_prefill"))
+        if is_remote_prefill:
+            # Validate before upstream consumes the one-shot marker.  This
+            # makes a malformed strict P->D request fail at admission rather
+            # than later in the Decode worker after a partial scheduler step.
+            self._validate_kv_transfer_manifest_params(params)
         result = super().update_state_after_alloc(request, blocks, num_external_tokens)
-        if params.get("do_remote_prefill") and request.request_id in self._reqs_need_recv:
+        if is_remote_prefill and request.request_id in self._reqs_need_recv:
+            # Preserve the unmodified params separately.  The upstream call
+            # above intentionally flips request.kv_transfer_params[
+            # "do_remote_prefill"] to False to prevent a second pull, but
+            # the request is also the object stored in _reqs_need_recv.
+            # Re-reading it in build_connector_meta would therefore lose the
+            # manifest and all other EPD-only fields.
+            self._recv_kv_transfer_params_by_request[str(request.request_id)] = dict(params)
             recv_request, local_block_ids = self._reqs_need_recv[request.request_id]
             clipped_block_ids = self._clip_remote_prefill_recv_blocks(params, local_block_ids)
             self._reqs_need_recv[request.request_id] = (recv_request, clipped_block_ids)
+        elif is_remote_prefill:
+            # Do not retain an envelope when the upstream connector rejected
+            # the pull parameters and did not create a receive entry.
+            self._recv_kv_transfer_params_by_request.pop(str(request.request_id), None)
         if (
             self.layered_kv_transfer
             and params.get("do_remote_decode")
@@ -449,6 +677,15 @@ class EPDMooncakeConnectorScheduler(UpstreamMooncakeConnectorScheduler):
         params = dict(getattr(request, "kv_transfer_params", None) or {})
         delay_free_blocks, upstream_params = super().request_finished(request, block_ids)
         if upstream_params is not None:
+            if params.get("do_remote_decode"):
+                upstream_params = {
+                    **dict(upstream_params),
+                    **{
+                        key: value
+                        for key, value in self._source_manifest_hints().items()
+                        if key not in upstream_params
+                    },
+                }
             return delay_free_blocks, upstream_params
         if not params or not params.get("transfer_id"):
             return delay_free_blocks, None
@@ -458,7 +695,7 @@ class EPDMooncakeConnectorScheduler(UpstreamMooncakeConnectorScheduler):
             return delay_free_blocks, None
         if getattr(request, "status", None) != RequestStatus.FINISHED_LENGTH_CAPPED:
             return delay_free_blocks, None
-        return delay_free_blocks, {
+        result = {
             "do_remote_prefill": True,
             "do_remote_decode": False,
             "remote_block_ids": self.get_sw_clipped_blocks(block_ids),
@@ -467,22 +704,65 @@ class EPDMooncakeConnectorScheduler(UpstreamMooncakeConnectorScheduler):
             "tp_size": self.tp_size,
             "transfer_id": params["transfer_id"],
         }
+        result.update(self._source_manifest_hints())
+        return delay_free_blocks, result
 
     def build_connector_meta(self, scheduler_output) -> KVConnectorMetadata:
         del scheduler_output
         meta = MooncakeConnectorMetadata()
         request_routing_paths: dict[str, str] = {}
         transfer_routing_paths: dict[str, str] = {}
+        # ``MooncakeConnectorMetadata`` is a normal Python object transported
+        # from the Scheduler to the Worker by vLLM.  An explicit sidecar keeps
+        # V2 manifests out of upstream ``PullReqMeta`` while preserving them
+        # until the Worker constructs its ZMQ request to the producer.
+        kv_transfer_manifests_by_request: dict[str, dict[str, Any]] = {}
 
         if not self.is_kv_producer:
             for req_id, (req, block_ids) in self._reqs_need_recv.items():
                 assert req.kv_transfer_params is not None
-                params = dict(req.kv_transfer_params)
+                saved_recv_params = getattr(
+                    self, "_recv_kv_transfer_params_by_request", {}
+                ).pop(str(req_id), None)
+                # See update_state_after_alloc: use the captured one-shot
+                # envelope rather than the request object after upstream has
+                # consumed do_remote_prefill.
+                params = dict(saved_recv_params or req.kv_transfer_params)
+                manifest_payload: dict[str, Any] | None = None
+                if params.get("do_remote_prefill"):
+                    self._validate_kv_transfer_manifest_params(params)
+                    raw_manifest = params.get("kv_transfer_manifest_v2")
+                    if raw_manifest is not None:
+                        if not isinstance(raw_manifest, Mapping):
+                            raise RuntimeError(
+                                "P->D KV transfer manifest must be an object"
+                            )
+                        manifest_payload = dict(raw_manifest)
+                        kv_transfer_manifests_by_request[str(req_id)] = manifest_payload
                 meta.add_new_req(
                     request_id=req_id,
                     local_block_ids=block_ids,
                     kv_transfer_params=params,
                 )
+                if manifest_payload is not None:
+                    # Keep the manifest on the concrete pull request as well as
+                    # in the metadata sidecar.  Some vLLM executor paths rebuild
+                    # metadata objects, but retain the request entries they must
+                    # execute.  A declared dataclass field therefore preserves
+                    # the control envelope without relying on an undocumented
+                    # dynamic attribute on the outer metadata object.
+                    remote_engine_id = str(params["remote_engine_id"])
+                    upstream_pull_meta = meta.reqs_to_recv[remote_engine_id][req_id]
+                    meta.reqs_to_recv[remote_engine_id][req_id] = _EPDPullReqMeta(
+                        d_req_id=upstream_pull_meta.d_req_id,
+                        transfer_id=upstream_pull_meta.transfer_id,
+                        local_block_ids=upstream_pull_meta.local_block_ids,
+                        remote_engine_id=upstream_pull_meta.remote_engine_id,
+                        remote_bootstrap_addr=upstream_pull_meta.remote_bootstrap_addr,
+                        expire_time=upstream_pull_meta.expire_time,
+                        pull_tasks_count=upstream_pull_meta.pull_tasks_count,
+                        epd_kv_transfer_manifest_v2=manifest_payload,
+                    )
                 routing_path = str(params.get("routing_path") or "UNKNOWN").strip().upper() or "UNKNOWN"
                 request_routing_paths[str(req_id)] = routing_path
                 transfer_routing_paths[str(params["transfer_id"])] = routing_path
@@ -507,6 +787,11 @@ class EPDMooncakeConnectorScheduler(UpstreamMooncakeConnectorScheduler):
 
         meta.request_routing_paths = request_routing_paths
         meta.transfer_routing_paths = transfer_routing_paths
+        # Do not attach an empty field: older worker code can ignore the
+        # attribute, while strict current workers fail closed when a pull
+        # actually lacks a required manifest.
+        if kv_transfer_manifests_by_request:
+            meta.epd_kv_transfer_manifests_v2 = kv_transfer_manifests_by_request
         return meta
 
 
@@ -627,12 +912,66 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
     ):
         extra = dict(vllm_config.kv_transfer_config.kv_connector_extra_config or {})
         protocol = str(extra.get("mooncake_protocol", "")).strip().lower()
+        requested_protocol = protocol or str(
+            os.getenv("MOONCAKE_PROTOCOL", "tcp")
+        ).strip().lower()
+        # Upstream Mooncake initializes its native engine inside ``super``.
+        # Validate before that call: older engine.so builds otherwise log an
+        # nvlink_intra error and silently auto-select RDMA/TCP.
+        require_mooncake_protocol_support(requested_protocol)
+        if requested_protocol == "nvlink_intra":
+            os.environ.pop("MC_FORCE_TCP", None)
+            os.environ.setdefault("MC_INTRANODE_NVLINK", "1")
         force_tcp_transport = extra.get("force_tcp_transport", True)
         if protocol == "tcp" and force_tcp_transport:
             os.environ.setdefault("MC_FORCE_TCP", "1")
         super().__init__(vllm_config, engine_id, kv_cache_config)
         self.layered_kv_transfer = bool(extra.get("layered_kv_transfer", False))
-        self.mooncake_protocol = protocol or str(os.getenv("MOONCAKE_PROTOCOL", "tcp"))
+        self.mooncake_protocol = requested_protocol
+        # Scheduler and Worker run in different processes.  Both therefore
+        # read the deployment-provided incarnation fence rather than deriving
+        # an in-process random value.  In strict mode a missing/mismatched
+        # fence is a hard error before the producer dereferences a descriptor.
+        self.worker_id = str(
+            extra.get("worker_id")
+            or os.getenv("MOONCAKE_EPD_WORKER_ID")
+            or self.engine_id
+        )
+        self.worker_generation = str(
+            extra.get("worker_generation")
+            or os.getenv("MOONCAKE_EPD_WORKER_GENERATION")
+            or f"{self.engine_id}:{uuid.uuid4().hex}"
+        )
+        self.require_kv_transfer_manifest_v2 = (
+            EPDMooncakeConnectorScheduler._as_enabled(
+                extra.get(
+                    "require_kv_transfer_manifest_v2",
+                    os.getenv("MOONCAKE_EPD_STRICT", "0"),
+                )
+            )
+        )
+        self.require_kv_transfer_manifest_generation = (
+            EPDMooncakeConnectorScheduler._as_enabled(
+                extra.get(
+                    "require_kv_transfer_manifest_generation",
+                    os.getenv("MOONCAKE_EPD_STRICT", "0"),
+                )
+            )
+        )
+        self.require_kv_transfer_manifest_compatibility = (
+            EPDMooncakeConnectorScheduler._as_enabled(
+                extra.get(
+                    "require_kv_transfer_manifest_compatibility",
+                    os.getenv(
+                        "MOONCAKE_EPD_REQUIRE_KV_TRANSFER_MANIFEST_COMPATIBILITY",
+                        "0",
+                    ),
+                )
+            )
+        )
+        self.kv_transfer_layout_v2 = EPDMooncakeConnectorScheduler._build_kv_transfer_layout(
+            vllm_config
+        )
         self.layers_per_group = max(1, int(extra.get("layers_per_group", 4)))
         self.group_delay_ms = max(0.0, float(extra.get("group_delay_ms", 0.0)))
         self.max_group_bytes = max(0, int(extra.get("max_group_bytes", 0) or 0))
@@ -742,11 +1081,24 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
             flush_interval_s=self._connector_metrics_flush_interval_s,
         )
         self._peer_transfer_engine: PeerTransferEngine | None = None
+        # The producer's sender executor can run several ready layer groups in
+        # parallel.  A source-ready CUDA event proves that a group's KV bytes
+        # have been written *at that instant*, not that the scheduler will keep
+        # those physical blocks unchanged while the task waits behind another
+        # dispatch.  Keep the event fence and the corresponding native transfer
+        # in one small critical section.  This mirrors the verified single
+        # sender-worker semantics while retaining parallel metadata waits and
+        # request/group construction outside the lock.
+        self._layered_source_to_send_lock = threading.Lock()
         self._registered_region_count = 1
         self._send_request_routing_paths: dict[str, str] = {}
         self._send_transfer_routing_paths: dict[str, str] = {}
         self._recv_request_routing_paths: dict[str, str] = {}
         self._recv_transfer_routing_paths: dict[str, str] = {}
+        # Small, payload-free sidecar populated from Scheduler metadata.  It
+        # is consumed only to create the ZMQ control message and never treats
+        # raw pointers as durable state.
+        self._recv_kv_transfer_manifests_by_request: dict[str, dict[str, Any]] = {}
         self._layer_names: list[str] = []
         self._layer_base_counts: list[int] = []
         self._layer_to_index: dict[str, int] = {}
@@ -882,6 +1234,33 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
                 self._layered_send_states[transfer_id] = state
             return state
 
+    def _active_layered_send_states(self) -> list[_LayeredSendState]:
+        """Snapshot states belonging to the forward currently saving KV.
+
+        ``record_send_reqs`` runs asynchronously on the sender loop, whereas
+        ``save_kv_layer`` runs in the model-forward thread.  The latter must
+        never fall back to every outstanding transfer: a metadata update for a
+        later request can otherwise publish stale KV for an earlier one.
+        """
+
+        with self._layered_send_lock:
+            active_transfer_ids = set(
+                getattr(self, "_current_send_transfer_ids", set()) or set()
+            )
+            if not active_transfer_ids:
+                return []
+            return [
+                state
+                for transfer_id, state in self._layered_send_states.items()
+                if transfer_id in active_transfer_ids
+            ]
+
+    def _has_active_layered_send_scope(self) -> bool:
+        with self._layered_send_lock:
+            return bool(
+                getattr(self, "_current_send_transfer_ids", set()) or set()
+            )
+
     def _trace(self, message: str, *args: Any) -> None:
         if not self.trace_layered_kv:
             return
@@ -898,41 +1277,92 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
         except Exception:
             logger.debug("failed to append layered trace file", exc_info=True)
 
-    def _mark_group_ready(self, group_idx: int) -> None:
-        with self._layered_send_lock:
-            active_transfer_ids = set(getattr(self, "_current_send_transfer_ids", set()) or set())
-            if active_transfer_ids:
-                states = [
-                    state
-                    for transfer_id, state in self._layered_send_states.items()
-                    if transfer_id in active_transfer_ids
-                ]
-            else:
-                # Backward-compatible fallback for direct unit tests or older vLLM
-                # call paths that invoke save_kv_layer without a preceding
-                # start_load_kv metadata scope.
-                states = list(self._layered_send_states.values())
+    def _mark_group_ready(
+        self,
+        group_idx: int,
+        *,
+        source_ready_event: Any | None = None,
+    ) -> int:
+        states = self._active_layered_send_states()
         for state in states:
-            state.mark_group_ready(group_idx)
+            state.mark_group_ready(group_idx, source_ready_event=source_ready_event)
+        return len(states)
 
-    def _mark_ready_groups_up_to(self, group_idx: int) -> None:
-        with self._layered_send_lock:
-            active_transfer_ids = set(
-                getattr(self, "_current_send_transfer_ids", set()) or set()
-            )
-            if active_transfer_ids:
-                states = [
-                    state
-                    for transfer_id, state in self._layered_send_states.items()
-                    if transfer_id in active_transfer_ids
-                ]
-            else:
-                states = list(self._layered_send_states.values())
+    def _mark_ready_groups_up_to(
+        self,
+        group_idx: int,
+        *,
+        source_ready_event: Any | None = None,
+    ) -> int:
+        states = self._active_layered_send_states()
         for state in states:
             # Each state remembers its highest completed group. This preserves
             # the conservative earlier-group guarantee while avoiding the
             # previous O(groups^2 * active_transfers) repeated event scans.
-            state.mark_groups_ready_through(group_idx)
+            state.mark_groups_ready_through(
+                group_idx,
+                source_ready_event=source_ready_event,
+            )
+        return len(states)
+
+    @staticmethod
+    def _cuda_device_for_kv_layer(kv_layer: Any) -> Any | None:
+        """Best-effort CUDA-device extraction without coupling to cache shape."""
+
+        candidates: Iterable[Any]
+        if isinstance(kv_layer, (list, tuple)):
+            candidates = kv_layer
+        else:
+            candidates = (kv_layer,)
+        for candidate in candidates:
+            device = getattr(candidate, "device", None)
+            if getattr(device, "type", None) == "cuda":
+                return device
+        return None
+
+    def _record_source_ready_event(self, kv_layer: Any) -> Any | None:
+        """Fence a KV source group without globally synchronizing the GPU.
+
+        vLLM invokes ``save_kv_layer`` after the attention callable returns,
+        which guarantees only enqueue order.  Recording a CUDA event on that
+        stream gives the sender thread a request-local completion fence.  If
+        event creation itself fails, the conservative device synchronize is a
+        correctness fallback rather than silently allowing a stale read.
+        """
+
+        device = self._cuda_device_for_kv_layer(kv_layer)
+        if device is None:
+            return None
+        try:
+            import torch
+
+            with torch.cuda.device(device):
+                event = torch.cuda.Event(
+                    enable_timing=False,
+                    blocking=False,
+                    interprocess=False,
+                )
+                event.record(torch.cuda.current_stream(device=device))
+            return event
+        except Exception as exc:
+            try:
+                import torch
+
+                with torch.cuda.device(device):
+                    torch.cuda.synchronize(device=device)
+            except Exception as sync_exc:
+                raise RuntimeError(
+                    "failed to establish a source-KV completion fence"
+                ) from sync_exc
+            logger.warning(
+                "EPD layered KV could not record a CUDA source-ready event; "
+                "used a conservative device synchronize instead: %s",
+                exc,
+            )
+            self._accumulate_worker_meta(
+                LayeredTransferWorkerMeta(source_ready_sync_fallbacks=1)
+            )
+            return None
 
     def _fail_all_send_states(self, message: str) -> None:
         with self._layered_send_lock:
@@ -962,6 +1392,215 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
                 )
                 self._recv_request_routing_paths[str(req_id)] = routing_path
                 self._recv_transfer_routing_paths[str(pull_meta.transfer_id)] = routing_path
+
+    def _record_recv_kv_transfer_manifests(
+        self,
+        metadata: MooncakeConnectorMetadata,
+    ) -> None:
+        """Bind Scheduler-side V2 envelopes to Worker pull metadata.
+
+        Upstream ``PullReqMeta`` deliberately exposes only its stable fields.
+        We retain the EPD extension in a metadata sidecar and attach a copy in
+        this Worker process, so it crosses the later Decode->Prefill ZMQ hop in
+        ``LayeredMooncakeXferMetadata`` without requiring a vLLM fork.
+        """
+
+        raw_by_request = getattr(metadata, "epd_kv_transfer_manifests_v2", None)
+        if raw_by_request is None:
+            raw_by_request = {}
+        if not isinstance(raw_by_request, Mapping):
+            raise RuntimeError("P->D KV transfer manifest sidecar must be an object")
+
+        known_request_ids = {
+            str(req_id)
+            for pull_metas in metadata.reqs_to_recv.values()
+            for req_id in pull_metas
+        }
+        unknown_request_ids = sorted(
+            str(req_id) for req_id in raw_by_request if str(req_id) not in known_request_ids
+        )
+        if unknown_request_ids:
+            raise RuntimeError(
+                "P->D KV transfer manifest sidecar contains unknown requests: "
+                + ", ".join(unknown_request_ids[:8])
+            )
+
+        self._trace(
+            "consumer manifest metadata reqs=%s sidecar_keys=%s metadata_keys=%s",
+            sorted(known_request_ids),
+            sorted(str(req_id) for req_id in raw_by_request),
+            sorted(getattr(metadata, "__dict__", {}).keys()),
+        )
+
+        for pull_metas in metadata.reqs_to_recv.values():
+            for req_id, pull_meta in pull_metas.items():
+                request_key = str(req_id)
+                embedded_manifest = getattr(
+                    pull_meta,
+                    "epd_kv_transfer_manifest_v2",
+                    None,
+                )
+                sidecar_manifest = raw_by_request.get(request_key)
+                if (
+                    embedded_manifest is not None
+                    and sidecar_manifest is not None
+                    and embedded_manifest != sidecar_manifest
+                ):
+                    raise RuntimeError(
+                        "P->D KV transfer manifest mismatch between pull metadata "
+                        f"and sidecar for request={request_key}"
+                    )
+                raw_manifest = (
+                    embedded_manifest
+                    if embedded_manifest is not None
+                    else sidecar_manifest
+                )
+                if raw_manifest is None:
+                    if bool(getattr(self, "require_kv_transfer_manifest_v2", False)):
+                        raise RuntimeError(
+                            "P->D KV transfer manifest v2 is required in Worker metadata "
+                            f"for request={request_key}"
+                        )
+                    continue
+                if not isinstance(raw_manifest, Mapping):
+                    raise RuntimeError(
+                        "P->D KV transfer manifest must be an object "
+                        f"for request={request_key}"
+                    )
+                copied = dict(raw_manifest)
+                # PullReqMeta is a normal dataclass in the supported vLLM
+                # version.  The dynamic attribute remains local to this Worker
+                # process; the typed ZMQ envelope below is the wire contract.
+                setattr(pull_meta, "epd_kv_transfer_manifest_v2", copied)
+                self._recv_kv_transfer_manifests_by_request[request_key] = copied
+
+    def _validated_kv_transfer_manifests_for_pull_metas(
+        self,
+        pull_metas: Mapping[str, PullReqMeta],
+    ) -> dict[str, dict[str, Any]]:
+        """Return fresh consumer-validated manifests keyed by Decode request.
+
+        The Decode Scheduler validates before allocation, but the lease can
+        expire while the Worker waits for Prefill bootstrap or a ZMQ peer.  A
+        second check immediately before emitting pointer descriptors avoids a
+        time-of-check/time-of-use hole and gives the producer a trusted envelope
+        to validate against its own generation.
+        """
+
+        payloads: dict[str, dict[str, Any]] = {}
+        for req_id, pull_meta in pull_metas.items():
+            request_key = str(req_id)
+            raw_manifest = getattr(pull_meta, "epd_kv_transfer_manifest_v2", None)
+            if raw_manifest is None:
+                raw_manifest = self._recv_kv_transfer_manifests_by_request.get(request_key)
+            if raw_manifest is None:
+                if bool(getattr(self, "require_kv_transfer_manifest_v2", False)):
+                    raise RuntimeError(
+                        "P->D KV transfer manifest v2 is required before Decode sends "
+                        f"pointer descriptors for request={request_key}"
+                    )
+                continue
+            try:
+                manifest = KVTransferManifestV2.from_control_payload(raw_manifest)
+                manifest.validate_for_consumer(
+                    transfer_id=str(pull_meta.transfer_id),
+                    source_engine_id=str(pull_meta.remote_engine_id),
+                    destination_engine_id=(
+                        self.worker_id
+                        if bool(getattr(self, "require_kv_transfer_manifest_v2", False))
+                        else None
+                    ),
+                    destination_generation=(
+                        self.worker_generation
+                        if bool(
+                            getattr(self, "require_kv_transfer_manifest_generation", False)
+                        )
+                        else None
+                    ),
+                    require_generation_fences=bool(
+                        getattr(self, "require_kv_transfer_manifest_generation", False)
+                    ),
+                    require_compatibility=bool(
+                        getattr(self, "require_kv_transfer_manifest_compatibility", False)
+                    ),
+                )
+                if bool(getattr(self, "require_kv_transfer_manifest_compatibility", False)):
+                    local_layout = KVTransferLayoutV2.from_control_payload(
+                        self.kv_transfer_layout_v2
+                    )
+                    if manifest.layout_checksum != local_layout.checksum:
+                        raise KVTransferManifestError(
+                            "KV transfer layout does not match this Decode Worker"
+                        )
+            except (KVTransferManifestError, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "P->D KV transfer manifest rejected by Decode Worker "
+                    f"for request={request_key}: {exc}"
+                ) from exc
+            payloads[request_key] = manifest.as_control_payload()
+        return payloads
+
+    def _validate_kv_transfer_manifests_for_producer(
+        self,
+        meta: LayeredMooncakeXferMetadata,
+    ) -> None:
+        """Fence a ZMQ pull against the current Prefill worker incarnation."""
+
+        raw_by_request = meta.kv_transfer_manifests or {}
+        if not isinstance(raw_by_request, Mapping):
+            raise RuntimeError("P->D KV transfer manifests must be an object")
+        expected_request_ids = {str(req_id) for req_id in meta.req_blocks}
+        unknown_request_ids = sorted(
+            str(req_id) for req_id in raw_by_request if str(req_id) not in expected_request_ids
+        )
+        if unknown_request_ids:
+            raise RuntimeError(
+                "P->D KV transfer manifests contain unknown requests: "
+                + ", ".join(unknown_request_ids[:8])
+            )
+
+        for request_key, (transfer_id, _) in meta.req_blocks.items():
+            request_id = str(request_key)
+            raw_manifest = raw_by_request.get(request_id)
+            if raw_manifest is None:
+                if bool(getattr(self, "require_kv_transfer_manifest_v2", False)):
+                    raise RuntimeError(
+                        "P->D KV transfer manifest v2 is required before Prefill sends "
+                        f"KV for request={request_id}"
+                    )
+                continue
+            try:
+                manifest = KVTransferManifestV2.from_control_payload(raw_manifest)
+                manifest.validate_for_producer(
+                    transfer_id=str(transfer_id),
+                    source_engine_id=str(self.engine_id),
+                    source_generation=(
+                        self.worker_generation
+                        if bool(
+                            getattr(self, "require_kv_transfer_manifest_generation", False)
+                        )
+                        else None
+                    ),
+                    require_generation_fences=bool(
+                        getattr(self, "require_kv_transfer_manifest_generation", False)
+                    ),
+                    require_compatibility=bool(
+                        getattr(self, "require_kv_transfer_manifest_compatibility", False)
+                    ),
+                )
+                if bool(getattr(self, "require_kv_transfer_manifest_compatibility", False)):
+                    local_layout = KVTransferLayoutV2.from_control_payload(
+                        self.kv_transfer_layout_v2
+                    )
+                    if manifest.layout_checksum != local_layout.checksum:
+                        raise KVTransferManifestError(
+                            "KV transfer layout does not match this Prefill Worker"
+                        )
+            except (KVTransferManifestError, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "P->D KV transfer manifest rejected by Prefill Worker "
+                    f"for request={request_id}: {exc}"
+                ) from exc
 
     def _routing_path_for_send(
         self,
@@ -1025,6 +1664,11 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
         if self.layered_kv_transfer and not self.is_kv_producer and metadata.reqs_to_recv:
             self._record_recv_routing_paths(metadata)
+            self._record_recv_kv_transfer_manifests(metadata)
+            # Fail before Decode schedules a forward pass if Scheduler->Worker
+            # metadata lost, tampered with, or expired the V2 envelope.
+            for pull_metas in metadata.reqs_to_recv.values():
+                self._validated_kv_transfer_manifests_for_pull_metas(pull_metas)
             with self._layered_recv_lock:
                 self._current_recv_req_ids = [
                     req_id
@@ -1100,7 +1744,7 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
         attn_metadata: "AttentionMetadata",
         **kwargs,
     ) -> None:
-        del kv_layer, attn_metadata, kwargs
+        del attn_metadata, kwargs
         if not self.layered_kv_transfer or self.is_kv_consumer:
             return
         group_idx = self._group_for_layer(layer_name)
@@ -1108,21 +1752,48 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
             return
         if not self._is_group_tail_layer(layer_name):
             return
+        if not self._has_active_layered_send_scope():
+            # ``record_send_reqs`` is asynchronous and can observe unrelated
+            # scheduler metadata while this worker performs a no-send forward.
+            # Failing closed here is essential: publishing all outstanding
+            # states was able to copy another request's uninitialized KV.
+            self._trace(
+                "save_kv_layer ignored tail layer=%s group=%d without active send scope",
+                layer_name,
+                group_idx,
+            )
+            return
+        source_ready_event = self._record_source_ready_event(kv_layer)
         # vLLM's save_kv_layer callback is layer-scoped rather than
         # transfer_id-scoped.  Under chunked/prefill scheduling the first tail
         # callback observed by the connector can be a later layer group.  Marking
         # all earlier groups ready is conservative for waiters and prevents a
         # later-layer callback from leaving group-0 forever blocked.  The sender
-        # still waits for request block metadata before issuing any transfer.
-        self._mark_ready_groups_up_to(group_idx)
+        # still waits for request block metadata and the per-group CUDA source
+        # completion fence before issuing any transfer.
+        announced_states = self._mark_ready_groups_up_to(
+            group_idx,
+            source_ready_event=source_ready_event,
+        )
         self._trace(
-            "save_kv_layer tail layer=%s group=%d announced_up_to=%d",
+            "save_kv_layer tail layer=%s group=%d announced_up_to=%d states=%d source_event=%s",
             layer_name,
             group_idx,
             group_idx,
+            announced_states,
+            source_ready_event is not None,
         )
 
     def wait_for_save(self):
+        if self.layered_kv_transfer and not self.is_kv_consumer:
+            with self._layered_send_lock:
+                completed_scope = sorted(self._current_send_transfer_ids)
+                self._current_send_transfer_ids.clear()
+            if completed_scope:
+                self._trace(
+                    "producer wait_for_save cleared send scope=%s",
+                    completed_scope,
+                )
         return None
 
     def get_finished(self) -> tuple[set[str] | None, set[str] | None]:
@@ -1284,6 +1955,9 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
             return await super().receive_kv_from_single_worker(worker_addr, pull_metas)
 
         req_ids = set(pull_metas)
+        kv_transfer_manifests = self._validated_kv_transfer_manifests_for_pull_metas(
+            pull_metas
+        )
         metadata = LayeredMooncakeXferMetadata(
             remote_hostname=self.hostname,
             remote_port=self.rpc_port,
@@ -1297,6 +1971,7 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
             block_lens=self.block_len_per_layer,
             layered=True,
             total_groups=self._sender_group_count,
+            kv_transfer_manifests=kv_transfer_manifests or None,
         )
 
         encoded_data = self._encoder.encode(metadata)
@@ -1569,10 +2244,10 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
                 )
 
         with self._layered_send_lock:
-            self._current_send_transfer_ids = {
-                str(transfer_id)
-                for _, (transfer_id, _) in metadata.reqs_to_send.items()
-            }
+            # ``start_load_kv`` owns the model-forward scope synchronously.
+            # This coroutine runs on the sender loop and may lag or lead that
+            # forward; assigning _current_send_transfer_ids here used to make
+            # save_kv_layer announce unrelated outstanding transfers.
             for _, (transfer_id, _) in metadata.reqs_to_send.items():
                 self._layered_send_states.setdefault(
                     transfer_id,
@@ -1580,7 +2255,6 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
                 )
             for transfer_id in metadata.reqs_not_processed:
                 self._layered_send_states.pop(transfer_id, None)
-                self._current_send_transfer_ids.discard(str(transfer_id))
         self._trace(
             "record_send_reqs ready=%s pending=%s not_processed=%s",
             ready_transfers,
@@ -1595,11 +2269,30 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
         meta: MooncakeXferMetadata | LayeredMooncakeXferMetadata,
     ):
         if not self.layered_kv_transfer or not getattr(meta, "layered", False):
+            if bool(getattr(self, "require_kv_transfer_manifest_v2", False)):
+                # Upstream's non-layered wire struct has no extension field in
+                # the supported vLLM version.  Do not silently bypass the
+                # producer fence in a strict deployment.
+                raise RuntimeError(
+                    "strict P->D KV transfer manifests require the repo-local "
+                    "layered connector wire protocol"
+                )
             return await self._send_kv_to_decode_nonlayered(identity, sock, meta)
 
         from vllm import envs
 
         pending_reqs: dict[str, SendBlockMeta] = {}
+        try:
+            self._validate_kv_transfer_manifests_for_producer(meta)
+        except RuntimeError as exc:
+            response = LayeredMooncakeXferResponse(
+                status=MooncakeXferResponseStatus.ERROR,
+                err_reqs=list(meta.req_blocks),
+                err_msg=str(exc),
+                total_groups=self._sender_group_count,
+            )
+            await sock.send_multipart((identity, self._encoder.encode(response)))
+            return
         remote_tp_ranks = self.transfer_topo.handshake_target_ranks(meta.remote_tp_size)
         if meta.remote_tp_rank not in remote_tp_ranks:
             msg = (
@@ -1677,7 +2370,12 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
         # turns the slowest request into a head-of-line barrier for every fast
         # one. Drive the transfer as an event graph instead: a request enters
         # group 0 as soon as its metadata is ready, then advances group by
-        # group. Ready requests for the same group are still sent together.
+        # group.  Crucially, a grouped CUDA source fence only protects the
+        # physical KV blocks of *one* request.  Do not combine independently
+        # ready requests after their fences have been published: waiting for a
+        # second request's event can leave the first request's source blocks
+        # reusable before its peer write starts.  The transport may still
+        # coalesce contiguous descriptors inside that request/group.
         wait_tasks: dict[asyncio.Task[Any], tuple[str, int]] = {}
         active_req_ids = set(pending_reqs)
         sending_req_ids: set[str] = set()
@@ -1843,6 +2541,15 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
                     ]
                     if not ready_reqs:
                         continue
+                    # A layered pull is a group-level protocol: its consumer
+                    # advances all requests represented by this response as
+                    # one transport round.  Preserve that wire/ordering
+                    # contract while still fencing every request's exact CUDA
+                    # source event and coalescing their descriptors into one
+                    # native transaction.  Splitting this into independent
+                    # responses made cold concurrent Qwen3-VL requests
+                    # semantically corrupt even though every transfer reported
+                    # success.
                     (
                         src_ptrs,
                         dst_ptrs,
@@ -1864,19 +2571,32 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
                         for d_req_id, _ in ready_reqs
                         if d_req_id not in err_req_set
                     ]
-                    if src_ptrs:
-                        dispatch_ret = await self.sender_loop.run_in_executor(
-                            self._sender_executor,
-                            self._send_blocks,
-                            remote_session,
-                            src_ptrs,
-                            dst_ptrs,
-                            lengths,
-                            descriptor_paths,
-                            group_idx + 1 < total_groups,
+                    if src_ptrs and ok_reqs:
+                        source_events = self._source_ready_events_for_group(
+                            ready_reqs,
+                            group_idx,
                         )
+                        dispatch_error: str | None = None
+                        try:
+                            dispatch_ret = await self.sender_loop.run_in_executor(
+                                self._sender_executor,
+                                self._wait_source_events_and_send_blocks,
+                                source_events,
+                                remote_session,
+                                src_ptrs,
+                                dst_ptrs,
+                                lengths,
+                                descriptor_paths,
+                                group_idx + 1 < total_groups,
+                            )
+                        except Exception as exc:
+                            dispatch_ret = -1
+                            dispatch_error = (
+                                "source-ready fence or Mooncake transfer dispatch failed: "
+                                f"{exc}"
+                            )
                         if dispatch_ret != 0:
-                            transfer_err_msg = (
+                            transfer_err_msg = dispatch_error or (
                                 f"Mooncake transfer engine returned {dispatch_ret}"
                             )
                             err_msg = (
@@ -1888,20 +2608,20 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
                             err_reqs = list(err_req_set)
                             ok_reqs = []
 
-                    for d_req_id in err_req_set:
+                    for failed_req_id in err_req_set:
                         _finish_failure(
-                            d_req_id,
-                            pending_reqs[d_req_id],
+                            failed_req_id,
+                            pending_reqs[failed_req_id],
                             err_msg or "layered transfer failed",
                         )
-                    for d_req_id in ok_reqs:
-                        send_meta = pending_reqs[d_req_id]
+                    for succeeded_req_id in ok_reqs:
+                        succeeded_meta = pending_reqs[succeeded_req_id]
                         if group_idx + 1 >= total_groups:
-                            _finish_success(d_req_id, send_meta)
+                            _finish_success(succeeded_req_id, succeeded_meta)
                         else:
                             _schedule_group_wait(
-                                d_req_id,
-                                send_meta,
+                                succeeded_req_id,
+                                succeeded_meta,
                                 group_idx + 1,
                             )
                     await _send_response(
@@ -2151,6 +2871,87 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
                 ) from exc
             if state.failed is not None:
                 raise RuntimeError(state.failed)
+
+    def _source_ready_events_for_group(
+        self,
+        ready_reqs: Iterable[tuple[str, SendBlockMeta]],
+        group_idx: int,
+    ) -> list[Any]:
+        """Return deduplicated CUDA fences for the transfer's source groups."""
+
+        with self._layered_send_lock:
+            states_by_transfer = {
+                transfer_id: self._layered_send_states.get(transfer_id)
+                for _, send_meta in ready_reqs
+                if (transfer_id := str(send_meta.transfer_id))
+            }
+        events: list[Any] = []
+        seen_event_ids: set[int] = set()
+        for state in states_by_transfer.values():
+            if state is None:
+                continue
+            event = state.source_ready_event(group_idx)
+            if event is None or id(event) in seen_event_ids:
+                continue
+            seen_event_ids.add(id(event))
+            events.append(event)
+        return events
+
+    def _wait_source_events_and_send_blocks(
+        self,
+        source_events: Iterable[Any],
+        remote_session: str,
+        src_ptrs: list[int],
+        dst_ptrs: list[int],
+        lengths: list[int],
+        descriptor_paths: list[str] | str | None = None,
+        apply_logical_group_delay: bool = False,
+    ) -> int:
+        """Synchronize source KV events, then issue one grouped data-plane send.
+
+        This runs on the existing sender executor so the model-forward thread
+        never blocks on a transfer.  A CUDA event waits only for the matching
+        group's enqueued KV writes; it is intentionally narrower than
+        ``torch.cuda.synchronize`` and preserves producer/transfer overlap.
+        """
+
+        # Do not synchronize a source event and then queue behind another
+        # sender worker: vLLM may recycle the same KV block once a later batch
+        # advances.  The lock is intentionally acquired *before* the event
+        # wait, making completion-fence -> peer write an atomic source-lifetime
+        # boundary.  It is per producer worker, so independent Prefill workers
+        # and all decode-side work remain concurrent.
+        with self._layered_source_to_send_lock:
+            events: list[Any] = []
+            seen_event_ids: set[int] = set()
+            for event in source_events:
+                if event is None or id(event) in seen_event_ids:
+                    continue
+                seen_event_ids.add(id(event))
+                events.append(event)
+            if events:
+                start_time = time.perf_counter()
+                try:
+                    for event in events:
+                        event.synchronize()
+                finally:
+                    self._accumulate_worker_meta(
+                        LayeredTransferWorkerMeta(
+                            source_ready_event_waits=len(events),
+                            source_ready_event_wait_ms=(
+                                time.perf_counter() - start_time
+                            )
+                            * 1000.0,
+                        )
+                    )
+            return self._send_blocks(
+                remote_session,
+                src_ptrs,
+                dst_ptrs,
+                lengths,
+                descriptor_paths,
+                apply_logical_group_delay,
+            )
 
     def _validate_regions(
         self,
@@ -2451,6 +3252,9 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
             dispatch_ms=float(timings.get("total_ms", 0.0) or 0.0),
             prepare_ms=float(timings.get("prepare_ms", 0.0) or 0.0),
             write_ms=float(timings.get("write_ms", 0.0) or 0.0),
+            native_engine_lock_wait_ms=float(
+                timings.get("native_engine_lock_wait_ms", 0.0) or 0.0
+            ),
         )
 
     def _batched_transfer_regions(
@@ -2545,6 +3349,17 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
                 )
                 delta.peer_buffer_write_ms = max(
                     0.0, float(getattr(dispatch, "write_ms", 0.0) or 0.0)
+                )
+                delta.peer_buffer_native_engine_lock_wait_ms = max(
+                    0.0,
+                    float(
+                        getattr(
+                            dispatch,
+                            "native_engine_lock_wait_ms",
+                            0.0,
+                        )
+                        or 0.0
+                    ),
                 )
         elif backend_label == "batch_transfer_fallback":
             delta.fallback_batches = 1

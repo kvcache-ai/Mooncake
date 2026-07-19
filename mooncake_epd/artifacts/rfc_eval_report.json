@@ -1,0 +1,450 @@
+{
+  "main_results_table": {
+    "baseline_avg_ms": 100.0,
+    "baseline_avg_tps": 10.0,
+    "epd_ttft_avg_ms": 18.0,
+    "epd_total_avg_ms": 35.0,
+    "epd_decode_tps_avg": 31.0,
+    "cross_step_reuse_ratio": 0.75,
+    "failures": 0,
+    "serving_e2e_pass": false,
+    "serving_e2e_sanity_pass": false,
+    "serving_e2e_path_split_ok": false,
+    "serving_e2e_transfer_path_split_ok": false,
+    "serving_e2e_connector_path_totals_conserved": true,
+    "serving_e2e_connector_workers": 0,
+    "serving_e2e_registry_events": 0,
+    "serving_mm_prefetch_hot_path_ok": false,
+    "serving_mm_prefetch_completed": 0,
+    "serving_mm_hidden_cache_hot_path_ok": false,
+    "serving_mm_hidden_cache_encoder_skip_ok": false,
+    "serving_mm_hidden_cache_hits": 0,
+    "serving_mm_hidden_cache_hit_rate": 0.0,
+    "serving_cross_step_reuse_hot_path_ok": false,
+    "serving_cross_step_reuse_candidates": 0,
+    "serving_cross_step_reused_tokens": 0,
+    "serving_dataset_goodput_rps": 0.0,
+    "serving_dataset_deadline_miss_ratio": 0.0,
+    "feature_handle_e2e_available": false,
+    "feature_handle_e2e_pass": false,
+    "feature_handle_precomputed_hits": 0,
+    "feature_handle_vision_compute_ms_avg": 0.0,
+    "feature_handle_peer_buffer_direct_batches": 0,
+    "feature_handle_fallback_batches": 0,
+    "feature_handle_layered_receive_failures": 0,
+    "online_direct_e2e_available": false,
+    "online_direct_e2e_pass": false,
+    "online_direct_precomputed_hits": 0,
+    "online_direct_peer_buffer_direct_batches": 0,
+    "online_direct_fallback_batches": 0,
+    "online_direct_buffer_release_ok": false,
+    "feature_handle_paired_available": false,
+    "feature_handle_paired_pass": false,
+    "feature_handle_paired_ttft_reduction_pct": 0.0,
+    "feature_handle_paired_goodput_gain_pct": 0.0,
+    "feature_handle_paired_feature_precomputed_hits": 0,
+    "serving_correctness_available": true,
+    "serving_correctness_pass": true,
+    "serving_correctness_count": 5,
+    "serving_correctness_avg_token_jaccard": 0.8812,
+    "serving_correctness_same_finish_reason_rate": 1.0,
+    "ablation_ordering_pass": true
+  },
+  "stage_breakdown_table": {
+    "baseline_avg_ms": 100.0,
+    "epd_encode_avg_ms": 5.0,
+    "epd_prefill_avg_ms": 6.0,
+    "epd_ttft_avg_ms": 20.0,
+    "epd_decode_avg_ms": 7.0,
+    "epd_total_avg_ms": 40.0
+  },
+  "cache_reuse_table": {
+    "cross_step_avg_reuse_ratio": 0.75,
+    "avg_matched_tokens": 75.0,
+    "avg_delta_tokens": 25.0,
+    "by_scenario": {
+      "multi_turn": 0.75
+    }
+  },
+  "reliability_table": {
+    "failures": 0,
+    "samples": 2,
+    "gpu_peak_gb": {
+      "enc": 1.0,
+      "pre": 2.0,
+      "dec": 3.0,
+      "base": 4.0
+    }
+  },
+  "dataset_table": {
+    "workflow_traces": 1,
+    "soak_examples": 8,
+    "scenarios": {
+      "multi_turn": 4,
+      "tool_use_vqa": 4
+    },
+    "unique_images": 2
+  },
+  "scheduler_table": {
+    "backpressure_events": 0,
+    "reject_events": 0,
+    "degrade_level_counts": {}
+  },
+  "transport_table": {
+    "kv_transfer_gbps": 0.0,
+    "layered_transfer_batches_avg": 0.0,
+    "mm_prefetch_hit_rate": 0.0,
+    "mm_recompute_fallbacks": 0,
+    "remote_transfer_backend_counts": {}
+  },
+  "serving_e2e_table": {
+    "available": false,
+    "pd_route_ok": false,
+    "epd_route_ok": false,
+    "workflow_registry_enabled": false,
+    "workflow_registry_events": 0,
+    "connector_metric_workers": 0,
+    "layered_transfer_grouped_batches": 0,
+    "layered_receive_group_batches": 0,
+    "peer_buffer_batches": 0,
+    "path_stats_available": false,
+    "pd_requests_total": 0,
+    "epd_requests_total": 0,
+    "pd_handoff_committed": 0,
+    "epd_handoff_committed": 0,
+    "epd_mm_prefetch_announced": 0,
+    "epd_mm_prefetch_attempted": 0,
+    "epd_mm_prefetch_completed": 0,
+    "epd_mm_prefetch_failed": 0,
+    "mm_prefetch_attempted": 0,
+    "mm_prefetch_completed": 0,
+    "mm_prefetch_failed": 0,
+    "mm_prefetch_wait_ms_avg": 0.0,
+    "mm_prefetch_worker_cache_hits": 0,
+    "mm_prefetch_shared_store_hits": 0,
+    "mm_hidden_cache_workers": 0,
+    "mm_hidden_cache_lookups": 0,
+    "mm_hidden_cache_hits": 0,
+    "mm_hidden_cache_misses": 0,
+    "mm_hidden_cache_stores": 0,
+    "mm_hidden_cache_hit_rate": 0.0,
+    "mm_hidden_cache_vision_compute_ms_avg": 0.0,
+    "mm_hidden_cache_load_ms_avg": 0.0,
+    "mm_hidden_cache_errors": 0,
+    "serving_cross_step_reuse_candidates": 0,
+    "serving_cross_step_reused_tokens": 0,
+    "serving_workflow_state_commits": 0,
+    "serving_workflow_affinity_hits": 0,
+    "dataset_goodput_rps": 0.0,
+    "dataset_goodput_count": 0,
+    "dataset_success_count": 0,
+    "dataset_deadline_miss_ratio": 0.0,
+    "pd_stage_dispatches": {},
+    "epd_stage_dispatches": {},
+    "connector_path_stats_available": false,
+    "pd_transfer_grouped_descriptors": 0,
+    "epd_transfer_grouped_descriptors": 0,
+    "pd_transfer_grouped_bytes": 0,
+    "epd_transfer_grouped_bytes": 0,
+    "connector_path_stats": {},
+    "remote_transfer_backend_counts": {},
+    "serving_mm_prefetch_hit_rate": 0.0,
+    "serving_mm_prefetch_hot_path_ok": false,
+    "serving_mm_hidden_cache_hot_path_ok": false,
+    "serving_mm_hidden_cache_encoder_skip_ok": false,
+    "serving_cross_step_reuse_hot_path_ok": false,
+    "connector_path_conservation": {
+      "grouped_batches": {
+        "path_sum": 0,
+        "total": 0
+      },
+      "grouped_bytes": {
+        "path_sum": 0,
+        "total": 0
+      },
+      "grouped_descriptors": {
+        "path_sum": 0,
+        "total": 0
+      },
+      "peer_buffer_batches": {
+        "path_sum": 0,
+        "total": 0
+      },
+      "peer_buffer_bytes": {
+        "path_sum": 0,
+        "total": 0
+      },
+      "received_group_batches": {
+        "path_sum": 0,
+        "total": 0
+      },
+      "received_finished_reqs": {
+        "path_sum": 0,
+        "total": 0
+      }
+    },
+    "connector_path_totals_conserved": true,
+    "path_split_ok": false,
+    "transfer_path_split_ok": false
+  },
+  "serving_e2e_sanity_table": {
+    "available": false,
+    "connector_workers_ok": false,
+    "group_batch_parity_ok": false,
+    "finished_request_parity_ok": false,
+    "peer_backend_parity_ok": false,
+    "layer_wait_present": true,
+    "receive_failures_zero": true,
+    "group_batches_multiple_of_requests": false,
+    "wait_calls_multiple_of_receive_batches": false,
+    "descriptors_multiple_of_group_batches": false,
+    "wait_calls_per_receive_batch": 0.0,
+    "descriptors_per_group_batch": 0.0,
+    "group_batches_per_request": 0.0,
+    "sanity_pass": false
+  },
+  "serving_correctness_table": {
+    "available": true,
+    "count": 5,
+    "exact_match_rate": 0.0,
+    "normalized_exact_match_rate": 0.0,
+    "avg_token_jaccard": 0.8812,
+    "min_token_jaccard": 0.0,
+    "same_finish_reason_rate": 1.0,
+    "normalized_exact_or_high_overlap_rate": 0.0,
+    "control_plane_equivalent_rate": 0.0,
+    "control_plane_equivalent_count": 0,
+    "structural_completion_equivalent_rate": 0.0,
+    "structural_completion_equivalent_count": 0,
+    "pass_recommendation": true,
+    "pass_recommendation_label": "pass",
+    "gate_failures": [],
+    "gate_warnings": [],
+    "high_overlap_threshold": 0.7,
+    "min_pass_rate": 0.8,
+    "min_same_finish_reason_rate": 0.8,
+    "min_avg_token_jaccard_threshold": 0.75,
+    "min_token_jaccard_threshold": 0.6,
+    "baseline_elapsed_ms_avg": 0.0,
+    "serving_elapsed_ms_avg": 0.0,
+    "high_overlap_rate": 0.0,
+    "high_overlap_count": 0,
+    "same_finish_reason_count": 1,
+    "normalized_exact_or_high_overlap_count": 0
+  },
+  "feature_handle_e2e_table": {
+    "available": false,
+    "pass": false
+  },
+  "online_direct_e2e_table": {
+    "available": false,
+    "pass": false
+  },
+  "feature_handle_paired_table": {
+    "available": false,
+    "pass": false
+  },
+  "ablation_gap_table": [],
+  "b8_penalty_table": {},
+  "ablation_ordering_table": {
+    "available": true,
+    "rows": [
+      {
+        "id": "b2_lt_b1",
+        "label": "Prefix Cache should beat Native PD",
+        "lhs": "B2",
+        "rhs": "B1",
+        "expect": "lt",
+        "available": false,
+        "pass": false
+      },
+      {
+        "id": "b3_lt_b1",
+        "label": "Feature Cache should beat Native PD",
+        "lhs": "B3",
+        "rhs": "B1",
+        "expect": "lt",
+        "available": false,
+        "pass": false
+      },
+      {
+        "id": "b7_lt_b3",
+        "label": "Exact Reuse should beat Feature Cache",
+        "lhs": "B7",
+        "rhs": "B3",
+        "expect": "lt",
+        "available": false,
+        "pass": false
+      },
+      {
+        "id": "b8_gt_b7",
+        "label": "Approx Reuse currently carries TTFT penalty",
+        "lhs": "B8",
+        "rhs": "B7",
+        "expect": "gt",
+        "available": false,
+        "pass": false
+      }
+    ],
+    "ordering_pass": true
+  },
+  "workload_matrix_table": [
+    {
+      "workload": "W0",
+      "samples": 8,
+      "avg_steps": 1.0,
+      "image_reuse_rate": 0.0,
+      "scenarios": [
+        "a2a_handoff",
+        "multi_turn",
+        "tool_use_vqa",
+        "tree_of_thought"
+      ]
+    },
+    {
+      "workload": "W1",
+      "samples": 2,
+      "avg_steps": 4.0,
+      "image_reuse_rate": 1.0,
+      "scenarios": [
+        "multi_turn"
+      ]
+    },
+    {
+      "workload": "W2",
+      "samples": 2,
+      "avg_steps": 4.0,
+      "image_reuse_rate": 1.0,
+      "scenarios": [
+        "tool_use_vqa"
+      ]
+    },
+    {
+      "workload": "W3",
+      "samples": 3,
+      "avg_steps": 3.0,
+      "image_reuse_rate": 1.0,
+      "scenarios": [
+        "tree_of_thought"
+      ]
+    },
+    {
+      "workload": "W4",
+      "samples": 1,
+      "avg_steps": 3.0,
+      "image_reuse_rate": 1.0,
+      "scenarios": [
+        "a2a_handoff"
+      ]
+    },
+    {
+      "workload": "W5",
+      "samples": 20,
+      "avg_steps": 3.0,
+      "image_reuse_rate": 0.75,
+      "scenarios": [
+        "a2a_handoff",
+        "multi_turn",
+        "tool_use_vqa",
+        "tree_of_thought"
+      ]
+    }
+  ],
+  "baseline_matrix_table": [
+    {
+      "id": "B0",
+      "name": "Single-node colocated",
+      "config": "单机同置 vLLM / SGLang",
+      "purpose": "赛题要求的单机端到端基线",
+      "available": true,
+      "latency_ms": 100.0,
+      "decode_tps": 10.0
+    },
+    {
+      "id": "B1",
+      "name": "Native PD",
+      "config": "原生 PD 分离",
+      "purpose": "验证 EPD 相对传统 PD 的增益",
+      "available": true,
+      "latency_ms": 90.0,
+      "decode_tps": 11.0
+    },
+    {
+      "id": "B2",
+      "name": "PD + Prefix Cache",
+      "config": "PD + 文本 prefix cache",
+      "purpose": "隔离文本前缀缓存收益",
+      "available": false,
+      "latency_ms": null,
+      "decode_tps": null
+    },
+    {
+      "id": "B3",
+      "name": "PD + Feature Cache",
+      "config": "PD + 图像 FeatureBundle cache",
+      "purpose": "隔离视觉特征缓存收益",
+      "available": false,
+      "latency_ms": null,
+      "decode_tps": null
+    },
+    {
+      "id": "B4",
+      "name": "Naive EPD",
+      "config": "Encoder / Prefill / Decode 三阶段分离",
+      "purpose": "验证 TransferPolicy 与页级状态管理收益",
+      "available": true,
+      "latency_ms": 20.0,
+      "decode_tps": 30.0
+    },
+    {
+      "id": "B5",
+      "name": "EPD + Deep-copy Fork",
+      "config": "支持 fork，但深拷贝完整 KV",
+      "purpose": "验证页级引用计数 + CoW 的收益",
+      "available": false,
+      "latency_ms": null,
+      "decode_tps": null
+    },
+    {
+      "id": "B6",
+      "name": "EPD + CoW no cross-step",
+      "config": "支持 O(1) fork，无跨步骤复用",
+      "purpose": "隔离跨步骤复用收益",
+      "available": false,
+      "latency_ms": null,
+      "decode_tps": null
+    },
+    {
+      "id": "B7",
+      "name": "EPD + Exact Prefix",
+      "config": "只允许 exact prefix reuse",
+      "purpose": "验证安全复用上界",
+      "available": false,
+      "latency_ms": null,
+      "decode_tps": null
+    },
+    {
+      "id": "B8",
+      "name": "EPD + Approx Reuse",
+      "config": "加入近似 / 非连续复用",
+      "purpose": "验证激进复用策略收益与风险",
+      "available": false,
+      "latency_ms": null,
+      "decode_tps": null
+    },
+    {
+      "id": "B9",
+      "name": "Full System",
+      "config": "EPD + cache + CoW + scheduler + offload + A2A",
+      "purpose": "最终方案",
+      "available": true,
+      "latency_ms": 35.0,
+      "decode_tps": 31.0
+    }
+  ],
+  "source_artifacts": {
+    "phase6_metrics": "artifacts/phase6_metrics.json",
+    "soak_report": "artifacts/real_soak_report_post_kvdir.json",
+    "workflow_traces": "artifacts/workflow_traces.json"
+  }
+}

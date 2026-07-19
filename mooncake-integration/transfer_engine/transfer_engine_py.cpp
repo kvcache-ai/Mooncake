@@ -49,15 +49,19 @@ static void* (*allocateMemory)(size_t) = nullptr;
 static void (*freeMemory)(void*) = nullptr;
 static std::string g_protocol;
 
-//  Handle allocateMemory function pointer based on protocol
-void initMemoryAllocator(const char* protocol) {
+// Handle allocateMemory function pointer based on protocol.  This must fail
+// closed: returning after only logging an unsupported NVLink request lets the
+// later automatic selector install a different transport (usually RDMA/TCP),
+// which makes a requested NVLink run impossible to distinguish from fallback.
+bool initMemoryAllocator(const char* protocol) {
     if (allocateMemory != nullptr) {
         LOG(WARNING) << "Memory allocator already initialized with: "
                      << g_protocol;
-        return;
+        return true;
     }
-    g_protocol = protocol;
-    if (strcmp(protocol, "nvlink") == 0) {
+    const char* selected_protocol = protocol ? protocol : "";
+    g_protocol = selected_protocol;
+    if (strcmp(selected_protocol, "nvlink") == 0) {
 #ifdef USE_MNNVL
         allocateMemory = [](size_t s) -> void* {
             return mooncake::NvlinkTransport::allocatePinnedLocalMemory(s);
@@ -68,8 +72,9 @@ void initMemoryAllocator(const char* protocol) {
         LOG(INFO) << "Selected MNNVL (NVLink) memory allocator";
 #else
         LOG(ERROR) << "Protocol 'nvlink' requires -DUSE_MNNVL=ON";
+        return false;
 #endif
-    } else if (strcmp(protocol, "hip") == 0) {
+    } else if (strcmp(selected_protocol, "hip") == 0) {
 #ifdef USE_HIP
         allocateMemory = [](size_t s) -> void* {
             return mooncake::HipTransport::allocatePinnedLocalMemory(s);
@@ -80,8 +85,9 @@ void initMemoryAllocator(const char* protocol) {
         LOG(INFO) << "Selected HIP memory allocator";
 #else
         LOG(ERROR) << "Protocol 'hip' requires -DUSE_HIP=ON";
+        return false;
 #endif
-    } else if (strcmp(protocol, "nvlink_intra") == 0) {
+    } else if (strcmp(selected_protocol, "nvlink_intra") == 0) {
 #ifdef USE_INTRA_NVLINK
         allocateMemory = [](size_t s) -> void* {
             return mooncake::IntraNodeNvlinkTransport::
@@ -93,12 +99,15 @@ void initMemoryAllocator(const char* protocol) {
         LOG(INFO) << "Selected Intra-NVLink memory allocator";
 #else
         LOG(ERROR) << "Protocol 'nvlink_intra' requires -DUSE_INTRA_NVLINK=ON";
+        return false;
 #endif
     } else {
         allocateMemory = malloc;
         freeMemory = free;
-        LOG(WARNING) << "Using default malloc/free for protocol: " << protocol;
+        LOG(WARNING) << "Using default malloc/free for protocol: "
+                     << selected_protocol;
     }
+    return allocateMemory != nullptr && freeMemory != nullptr;
 }
 
 TransferEnginePy::TransferEnginePy() {
@@ -169,7 +178,11 @@ int TransferEnginePy::initialize(const char* local_hostname,
                                  const char* metadata_server,
                                  const char* protocol,
                                  const char* device_name) {
-    initMemoryAllocator(protocol);
+    if (!initMemoryAllocator(protocol)) {
+        LOG(ERROR) << "Mooncake Transfer Engine initialization rejected "
+                   << "unsupported protocol: " << (protocol ? protocol : "");
+        return -1;
+    }
 
     auto conn_string = parseConnectionString(metadata_server);
     return initializeExt(local_hostname, conn_string.second.c_str(), protocol,

@@ -37,6 +37,34 @@ from .kv_state_store import (
     MooncakeKVStateStore,
     MooncakeRemoteKVMaterializer,
 )
+from .kv_manifest import KVManifestError, KVStateManifest, manifest_checksum
+from .agent_state_catalog import (
+    AgentStateCatalog,
+    AgentStateCatalogConflict,
+    AgentStateCatalogError,
+    AgentStateCatalogRecord,
+    CatalogPageRef,
+)
+from .kv_transfer_manifest_v2 import (
+    KV_TRANSFER_MANIFEST_SCHEMA_V2,
+    KVTransferLayoutV2,
+    KVTransferManifestError,
+    KVTransferManifestV2,
+    kv_transfer_manifest_checksum,
+)
+from .mooncake_kv_page_store import KVPageStoreError, MooncakeKVPageStore
+from .vllm_kv_materializer import (
+    VLLMKVMaterializationError,
+    VLLMKVMaterializationResult,
+    VLLMKVMaterializer,
+)
+from .hidden_cache_key import HiddenCacheKeyError, HiddenStateCacheKeyV2
+from .hidden_cache_policy import HiddenCachePolicy
+from .mooncake_hidden_state_store import (
+    HiddenStateStoreError,
+    HiddenStateStoreManifestV2,
+    MooncakeHiddenStateStore,
+)
 from .vllm_feature_handle_provider import (
     FeatureHandleProvider,
     FeatureHandleProviderConfig,
@@ -57,6 +85,7 @@ from .state import HandoffTransaction, MultimodalState, StateLayer, StateMeta
 from .workflow_registry import WorkflowStateRecord, WorkflowStateRegistry
 from .vllm_mm_hidden_cache import (
     VLLMMMHiddenStateCache,
+    configure_vllm_mm_hidden_l2_store,
     get_current_mm_hidden_cache_keys,
     get_global_mm_hidden_cache,
     get_or_compute_qwen3vl_image_embeds,
@@ -68,7 +97,9 @@ from .vllm_mm_hidden_cache import (
 from .omni_hidden_prefix_cache import (
     OmniHiddenPrefixCache,
     OmniHiddenPrefixCacheConfig,
+    get_current_omni_hidden_cache_keys,
     install_qwen2_5_omni_hidden_prefix_cache,
+    use_omni_hidden_cache_keys,
 )
 from .relay_recompute import RelayRecompute, Segment, split_segments
 from .attention_similarity import AttentionSimilarityReuse, attention_similarity
@@ -103,15 +134,40 @@ __all__ = [
     "MooncakeFeatureStoreError",
     "KVStateDescriptor",
     "KVBlockDescriptor",
+    "AgentStateCatalog",
+    "AgentStateCatalogConflict",
+    "AgentStateCatalogError",
+    "AgentStateCatalogRecord",
+    "CatalogPageRef",
+    "KVManifestError",
+    "KV_TRANSFER_MANIFEST_SCHEMA_V2",
+    "KVTransferLayoutV2",
+    "KVTransferManifestError",
+    "KVTransferManifestV2",
+    "KVPageStoreError",
+    "KVStateManifest",
+    "MooncakeKVPageStore",
+    "VLLMKVMaterializationError",
+    "VLLMKVMaterializationResult",
+    "VLLMKVMaterializer",
+    "HiddenCacheKeyError",
+    "HiddenStateCacheKeyV2",
+    "HiddenCachePolicy",
+    "HiddenStateStoreError",
+    "HiddenStateStoreManifestV2",
+    "MooncakeHiddenStateStore",
     "MMStore",
     "MMStoreBackpressureError",
     "MMStoreEvent",
     "MMStoreHandle",
+    "manifest_checksum",
+    "kv_transfer_manifest_checksum",
     "MultimodalState",
     "PageId",
     "PagedKVManager",
     "OmniHiddenPrefixCache",
     "OmniHiddenPrefixCacheConfig",
+    "get_current_omni_hidden_cache_keys",
     "RadixTree",
     "RelayRecompute",
     "ResolvedFeatureHandles",
@@ -119,6 +175,7 @@ __all__ = [
     "StateLayer",
     "StateMeta",
     "VLLMMMHiddenStateCache",
+    "configure_vllm_mm_hidden_l2_store",
     "WorkflowStateRecord",
     "WorkflowStateRegistry",
     "attention_similarity",
@@ -126,6 +183,7 @@ __all__ = [
     "get_global_mm_hidden_cache",
     "get_or_compute_qwen3vl_image_embeds",
     "install_qwen2_5_omni_hidden_prefix_cache",
+    "use_omni_hidden_cache_keys",
     "extract_feature_handle_payloads",
     "inject_feature_handles_into_vllm_mm_kwargs",
     "maybe_inject_feature_handle_kwargs",

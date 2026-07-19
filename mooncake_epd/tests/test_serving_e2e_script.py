@@ -1,15 +1,24 @@
 from __future__ import annotations
 
+import sys
+
 import pytest
+import requests
 
 from mooncake_epd.scripts.run_vllm_serving_e2e import (
+    _http_error_evidence,
     _agent_pd_metadata_for_dataset,
     _connector_metrics_settled,
+    _dataset_request_evidence_row,
     _data_url_for_demo_image,
     _ensure_process_running,
     _load_dataset_requests,
+    _proc_env,
+    _terminate_all,
     _wait_for_metrics_settle,
+    _worker_dispatch_balance,
     _validate_summary,
+    parse_args,
 )
 from mooncake_epd.demo.vllm_integration import VLLMDisaggConfig, generate_configs
 
@@ -18,6 +27,59 @@ def test_data_url_for_demo_image_uses_inline_png_payload():
     payload = _data_url_for_demo_image("room")
     assert payload.startswith("data:image/png;base64,")
     assert len(payload.split(",", 1)[1]) > 128
+
+
+def test_http_error_evidence_retains_bounded_proxy_detail_without_request_data():
+    response = requests.Response()
+    response.status_code = 502
+    response._content = b'{"detail":"prefill response missing required KV handoff fields"}'
+    response.url = "http://proxy.local/v1/chat/completions"
+    error = requests.HTTPError("502 Server Error", response=response)
+
+    evidence = _http_error_evidence(error)
+
+    assert evidence == {
+        "status_code": 502,
+        "error_response_detail": "prefill response missing required KV handoff fields",
+    }
+
+
+def test_worker_launch_environment_removes_all_proxy_spellings(monkeypatch):
+    for key in (
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+    ):
+        monkeypatch.setenv(key, "socks5://127.0.0.1:7890")
+
+    env = _proc_env()
+
+    for key in (
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+    ):
+        assert key not in env
+    assert env["NO_PROXY"] == "127.0.0.1,localhost,::1"
+    assert env["no_proxy"] == env["NO_PROXY"]
+
+
+def test_serving_runner_defaults_use_measured_transfer_grouping(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["run_vllm_serving_e2e.py"])
+
+    args = parse_args()
+
+    assert args.layers_per_group == 32
+    assert args.max_group_bytes == 64 * 1024 * 1024
+    assert args.max_transfer_descriptors == 512
+    assert args.max_transfer_bytes == 64 * 1024 * 1024
+    assert args.prefill_http_keepalive is False
 
 
 def test_generate_configs_supports_real_multi_worker_pools(tmp_path):
@@ -60,6 +122,63 @@ def test_dataset_agent_pd_metadata_uses_workload_shape():
     assert hybrid["routing_target"] == "mixed"
     assert interactive["agent_type"] == "interactive"
     assert interactive["routing_target"] == "low_latency_decode_pool"
+
+
+def test_dataset_request_evidence_is_reproducible_without_inline_image_payload():
+    entry = {
+        "family": "W3",
+        "sample": {
+            "sample_id": "sample-1",
+            "workflow_id": "workflow-1",
+            "source_dataset": "mmmu",
+        },
+        "request": {
+            "model": "model",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64," + "a" * 4096},
+                        }
+                    ],
+                }
+            ],
+            "max_tokens": 32,
+            "temperature": 0.0,
+            "metadata": {
+                "workflow_id": "workflow-1",
+                "estimated_prompt_len": 512,
+                "admission_method": "processor",
+            },
+        },
+    }
+
+    row = _dataset_request_evidence_row(entry, index=3, phase="measure")
+
+    assert row["sample_id"] == "sample-1"
+    assert row["workflow_id"] == "workflow-1"
+    assert len(row["request_sha256"]) == 64
+    assert "messages" not in row
+    assert "base64" not in repr(row)
+
+
+def test_worker_dispatch_balance_includes_idle_configured_workers():
+    balance = _worker_dispatch_balance(
+        [
+            {"decode_worker_id": "decode-0"},
+            {"decode_worker_id": "decode-0"},
+            {"decode_worker_id": "decode-1"},
+        ],
+        stage="decode",
+        configured_workers=3,
+    )
+
+    assert balance["counts"] == {"decode-0": 2, "decode-1": 1, "decode-2": 0}
+    assert balance["active_workers"] == 2
+    assert balance["configured_workers"] == 3
+    assert 0.0 < balance["normalized_entropy"] < 1.0
 
 
 def _sample_summary(tmp_path):
@@ -128,6 +247,15 @@ def _sample_summary(tmp_path):
 
 def test_validate_summary_accepts_real_success_shape(tmp_path):
     _validate_summary(_sample_summary(tmp_path))
+
+
+def test_validate_summary_accepts_progressive_receive_without_legacy_layer_wait(tmp_path):
+    summary = _sample_summary(tmp_path)
+    summary["metrics"]["metrics"]["layer_load_wait_calls"] = 0
+
+    # Grouped producer/consumer parity and direct-backend evidence, not a
+    # legacy blocking wait counter, prove this native receive completed.
+    _validate_summary(summary)
 
 
 def test_validate_summary_rejects_missing_connector_metrics(tmp_path):
@@ -292,6 +420,27 @@ def test_ensure_process_running_raises_with_log_tail(tmp_path):
 
     assert "prefill exited early with code=17" in str(exc.value)
     assert "fatal error" in str(exc.value)
+
+
+def test_terminate_all_signals_service_group_after_shell_leader_exits(monkeypatch):
+    """An orphan EngineCore must not survive an E2E failure cleanup."""
+
+    from mooncake_epd.scripts import run_vllm_serving_e2e as runner
+
+    class _ExitedShell:
+        pid = 4242
+
+        @staticmethod
+        def poll():
+            return 1
+
+    calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(runner.os, "killpg", lambda pgid, sig: calls.append((pgid, sig)))
+    monkeypatch.setattr(runner, "_process_group_alive", lambda _pgid: False)
+
+    _terminate_all([_ExitedShell()])
+
+    assert calls == [(4242, runner.signal.SIGTERM)]
 
 
 def test_connector_metrics_settled_accepts_extra_internal_finished_reqs(tmp_path):

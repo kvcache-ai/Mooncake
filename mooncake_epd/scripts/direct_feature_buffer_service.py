@@ -14,6 +14,7 @@ import asyncio
 import logging
 import os
 import sys
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -136,6 +137,41 @@ def create_app(
         for feature_id in feature_ids:
             registry.release(feature_id)
 
+    def _lookup_ready_targets(
+        feature_ids: List[Any],
+        *,
+        lease_count: int,
+    ) -> tuple[List[Dict[str, Any]], List[str], float]:
+        """Look up and serialize direct targets outside the ASGI event loop.
+
+        The embedded production route and this diagnostic service must share
+        the same concurrency contract.  Registry access is protected by its
+        own thread lock, while target export can touch CUDA-backed tensors; do
+        not let that synchronous work delay unrelated API requests.
+        """
+
+        started = time.perf_counter()
+        hits: List[Dict[str, Any]] = []
+        misses: List[str] = []
+        for feature_id in feature_ids:
+            allocation = registry.lookup_ready(str(feature_id), lease_count=lease_count)
+            if allocation is None:
+                misses.append(str(feature_id))
+                continue
+            target = allocation.as_direct_target()
+            target["cache_hit"] = True
+            target["publish_required"] = False
+            target["ref_count"] = int(allocation.ref_count)
+            target["lease_count"] = lease_count
+            hits.append(
+                {
+                    "feature_id": str(feature_id),
+                    "descriptor": allocation.descriptor.to_dict(),
+                    "target": target,
+                }
+            )
+        return hits, misses, max(0.0, (time.perf_counter() - started) * 1000.0)
+
     @app.get("/health")
     async def health() -> Dict[str, Any]:
         return {
@@ -178,30 +214,31 @@ def create_app(
             raw = [raw]
         if not isinstance(raw, list) or not raw:
             raise HTTPException(status_code=400, detail="lookup requires feature_ids[]")
-        hits: List[Dict[str, Any]] = []
-        misses: List[str] = []
-        for feature_id in raw:
-            allocation = registry.lookup_ready(str(feature_id))
-            if allocation is None:
-                misses.append(str(feature_id))
-                continue
-            target = allocation.as_direct_target()
-            target["cache_hit"] = True
-            target["publish_required"] = False
-            target["ref_count"] = int(allocation.ref_count)
-            hits.append(
-                {
-                    "feature_id": str(feature_id),
-                    "descriptor": allocation.descriptor.to_dict(),
-                    "target": target,
-                }
+        try:
+            lease_count = int(payload.get("lease_count", 1) or 1)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="lookup lease_count must be an integer") from exc
+        # This is a bounded control-plane reference reservation, not an
+        # unbounded cache pin.  The Proxy releases every unused lease on TTL,
+        # eviction, explicit flush, and shutdown.
+        if lease_count <= 0 or lease_count > 1024:
+            raise HTTPException(status_code=400, detail="lookup lease_count must be in [1, 1024]")
+        try:
+            hits, misses, server_lookup_ms = await asyncio.to_thread(
+                _lookup_ready_targets,
+                list(raw),
+                lease_count=lease_count,
             )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"direct buffer lookup failed: {exc}") from exc
         return {
             "hits": hits,
             "misses": misses,
             "count": len(hits),
             "all_hit": len(hits) == len(raw),
             "worker_id": registry.worker_id,
+            "lease_count": lease_count,
+            "server_lookup_ms": server_lookup_ms,
         }
 
     @app.post("/mark_ready")

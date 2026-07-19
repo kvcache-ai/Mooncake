@@ -69,6 +69,43 @@ struct SessionHeader {
     uint8_t opcode;
 };
 
+// A TCP sender finishes its local async_write as soon as the kernel accepts
+// the final bytes.  That is not a remote-completion guarantee when the peer
+// subsequently copies those bytes into CUDA memory.  Keep the acknowledgement
+// opt-in for wire compatibility with pre-ACK Mooncake deployments; strict EPD
+// TCP launches set MC_TCP_WRITE_COMPLETION_ACK=1 on both peers.
+constexpr uint8_t kWriteCompletionAck = 0xA5;
+
+static bool waitForTcpWriteCompletionAck() {
+    const char* env = std::getenv("MC_TCP_WRITE_COMPLETION_ACK");
+    if (env == nullptr || env[0] == '\0') return false;
+    std::string value(env);
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return value != "0" && value != "false" && value != "no" &&
+           value != "off";
+}
+
+// A TCP READ completes locally after the client receives the payload and
+// copies it into its destination buffer.  For a pageable-host -> CUDA copy,
+// cudaMemcpy may return after host staging while the device DMA is still
+// queued on this transport thread's default stream.  Strict EPD deployments
+// already opt into MC_TCP_WRITE_COMPLETION_ACK; use that same explicit
+// correctness contract to fence GPU READ completion without changing the
+// default latency behavior of legacy TCP users.  A dedicated override makes
+// the policy independently controllable for diagnostics and non-EPD callers.
+static bool waitForTcpReadCompletionSync() {
+    const char* env = std::getenv("MC_TCP_READ_COMPLETION_SYNC");
+    if (env == nullptr || env[0] == '\0') {
+        return waitForTcpWriteCompletionAck();
+    }
+    std::string value(env);
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return value != "0" && value != "false" && value != "no" &&
+           value != "off";
+}
+
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
@@ -127,10 +164,19 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
     char* local_buffer_;
     std::function<void(TransferStatusEnum)> on_finalize_;
     std::mutex session_mutex_;
+    bool wait_for_write_completion_ack_ = false;
+    uint8_t completion_ack_ = kWriteCompletionAck;
+    // A synchronous H->D cudaMemcpy from pageable memory can return after the
+    // host staging step while the copy remains queued on this TCP thread's
+    // default CUDA stream.  Remember that stream's device so a strict write
+    // acknowledgement can prove the destination bytes are visible to Decode,
+    // rather than merely accepted by the TCP socket.
+    int write_cuda_device_ = -1;
 
     void start() {
         session_mutex_.lock();
         total_transferred_bytes_ = 0;
+        write_cuda_device_ = -1;
         readHeader();
     }
 
@@ -162,10 +208,71 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
                     session_mutex_.unlock();
                     return;
                 }
+                wait_for_write_completion_ack_ =
+                    header_.opcode == (uint8_t)TransferRequest::WRITE &&
+                    waitForTcpWriteCompletionAck();
                 if (header_.opcode == (uint8_t)TransferRequest::WRITE)
                     readBody();
                 else
                     writeBody();
+            });
+    }
+
+    void completeWriteRequest() {
+        if (!wait_for_write_completion_ack_) {
+            session_mutex_.unlock();
+            // Transfer complete, wait for next request on this connection.
+            start();
+            return;
+        }
+
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
+    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
+    defined(USE_COREX)
+        if (write_cuda_device_ >= 0) {
+            const cudaError_t set_device_status =
+                cudaSetDevice(write_cuda_device_);
+            // ``cudaMemcpy`` above is issued on the default stream associated
+            // with this TCP I/O thread.  Synchronizing that stream once at the
+            // logical WRITE boundary is much narrower than a device-wide sync
+            // and ensures the ACK is a real destination-completion fence.
+            const cudaError_t cuda_status =
+                set_device_status == cudaSuccess
+                    ? cudaStreamSynchronize(0)
+                    : set_device_status;
+            if (cuda_status != cudaSuccess) {
+                LOG(ERROR)
+                    << "ServerSession::completeWriteRequest failed to "
+                       "synchronize destination CUDA stream. Error: "
+                    << cudaGetErrorString(cuda_status);
+                asio::error_code close_ec;
+                socket_->close(close_ec);
+                session_mutex_.unlock();
+                return;
+            }
+        }
+#endif
+
+        auto self(shared_from_this());
+        asio::async_write(
+            *socket_, asio::buffer(&completion_ack_, sizeof(completion_ack_)),
+            [this, self](const asio::error_code& ec,
+                         std::size_t transferred_bytes) {
+                if (ec || transferred_bytes != sizeof(completion_ack_)) {
+                    LOG(WARNING)
+                        << "ServerSession::completeWriteRequest failed. Error: "
+                        << (ec ? ec.message() : "short completion acknowledgement")
+                        << " (value: " << ec.value() << ")";
+                    asio::error_code close_ec;
+                    socket_->close(close_ec);
+                    session_mutex_.unlock();
+                    return;
+                }
+                // The acknowledgement is issued only after all host-to-device
+                // copies have returned.  A sender that waits for it can safely
+                // publish a dependent control-plane completion.
+                session_mutex_.unlock();
+                start();
             });
     }
 
@@ -178,7 +285,7 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
             std::min(getChunkSize(), size - total_transferred_bytes_);
         if (buffer_size == 0) {
             session_mutex_.unlock();
-            // Transfer complete, wait for next request on this connection
+            // Transfer complete, wait for next request on this connection.
             start();
             return;
         }
@@ -246,9 +353,7 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
         size_t buffer_size =
             std::min(getChunkSize(), size - total_transferred_bytes_);
         if (buffer_size == 0) {
-            session_mutex_.unlock();
-            // Transfer complete, wait for next request on this connection
-            start();
+            completeWriteRequest();
             return;
         }
 
@@ -260,6 +365,7 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
     defined(USE_COREX)
         cuda_device = getCudaDeviceId(addr);
         if (cuda_device >= 0) {
+            write_cuda_device_ = cuda_device;
             dram_buffer = new char[buffer_size];
         }
 #endif
@@ -330,6 +436,13 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     std::function<void(TransferStatusEnum)> on_finalize_;
     std::function<void()> on_complete_;  // Callback when transfer completes
     std::mutex session_mutex_;
+    bool wait_for_write_completion_ack_ = false;
+    bool wait_for_read_completion_sync_ = false;
+    uint8_t completion_ack_ = 0;
+    // H->D copies issued by readBody run on the TCP I/O thread's default
+    // CUDA stream.  Remember their device and synchronize that stream once
+    // before reporting a strict READ as complete.
+    int read_cuda_device_ = -1;
 
     void initiate(void* buffer, uint64_t dest_addr, size_t size,
                   TransferRequest::OpCode opcode) {
@@ -338,11 +451,57 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         header_.addr = htole64(dest_addr);
         header_.size = htole64(size);
         header_.opcode = (uint8_t)opcode;
+        wait_for_write_completion_ack_ =
+            opcode == TransferRequest::WRITE && waitForTcpWriteCompletionAck();
+        wait_for_read_completion_sync_ =
+            opcode == TransferRequest::READ && waitForTcpReadCompletionSync();
+        read_cuda_device_ = -1;
         total_transferred_bytes_ = 0;
         writeHeader();
     }
 
    private:
+    void completeReadRequest() {
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
+    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
+    defined(USE_COREX)
+        if (wait_for_read_completion_sync_ && read_cuda_device_ >= 0) {
+            const cudaError_t set_device_status =
+                cudaSetDevice(read_cuda_device_);
+            const cudaError_t cuda_status =
+                set_device_status == cudaSuccess
+                    ? cudaStreamSynchronize(0)
+                    : set_device_status;
+            if (cuda_status != cudaSuccess) {
+                LOG(ERROR)
+                    << "ClientSession::completeReadRequest failed to "
+                       "synchronize destination CUDA stream. Error: "
+                    << cudaGetErrorString(cuda_status);
+                asio::post(
+                    socket_->get_executor(),
+                    [this, self = shared_from_this(),
+                     on_finalize = std::move(on_finalize_),
+                     on_complete = std::move(on_complete_)]() {
+                        if (on_finalize)
+                            on_finalize(TransferStatusEnum::FAILED);
+                        session_mutex_.unlock();
+                        if (on_complete) on_complete();
+                    });
+                return;
+            }
+        }
+#endif
+        asio::post(socket_->get_executor(),
+                   [this, self = shared_from_this(),
+                    on_finalize = std::move(on_finalize_),
+                    on_complete = std::move(on_complete_)]() {
+                       if (on_finalize)
+                           on_finalize(TransferStatusEnum::COMPLETED);
+                       session_mutex_.unlock();
+                       if (on_complete) on_complete();
+                   });
+    }
+
     void writeHeader() {
         auto self(shared_from_this());
         asio::async_write(
@@ -379,14 +538,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         size_t buffer_size =
             std::min(getChunkSize(), size - total_transferred_bytes_);
         if (buffer_size == 0) {
-            asio::post(socket_->get_executor(),
-                       [this, self, on_finalize = std::move(on_finalize_),
-                        on_complete = std::move(on_complete_)]() {
-                           if (on_finalize)
-                               on_finalize(TransferStatusEnum::COMPLETED);
-                           session_mutex_.unlock();
-                           if (on_complete) on_complete();
-                       });
+            completeReadRequest();
             return;
         }
 
@@ -398,6 +550,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     defined(USE_COREX)
         cuda_device = getCudaDeviceId(addr);
         if (cuda_device >= 0) {
+            read_cuda_device_ = cuda_device;
             dram_buffer = new char[buffer_size];
         }
 #endif
@@ -482,6 +635,10 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         size_t buffer_size =
             std::min(getChunkSize(), size - total_transferred_bytes_);
         if (buffer_size == 0) {
+            if (wait_for_write_completion_ack_) {
+                waitForWriteCompletionAck();
+                return;
+            }
             // Post cleanup to ensure it runs after callback returns
             asio::post(socket_->get_executor(),
                        [this, self, on_finalize = std::move(on_finalize_),
@@ -561,6 +718,40 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                 }
                 total_transferred_bytes_ += transferred_bytes;
                 writeBody();
+            });
+    }
+
+    void waitForWriteCompletionAck() {
+        auto self(shared_from_this());
+        asio::async_read(
+            *socket_, asio::buffer(&completion_ack_, sizeof(completion_ack_)),
+            [this, self](const asio::error_code& ec,
+                         std::size_t transferred_bytes) {
+                const bool complete = !ec &&
+                                      transferred_bytes == sizeof(completion_ack_) &&
+                                      completion_ack_ == kWriteCompletionAck;
+                if (!complete) {
+                    LOG(WARNING)
+                        << "ClientSession::waitForWriteCompletionAck failed. Error: "
+                        << (ec ? ec.message() : "invalid completion acknowledgement")
+                        << " (value: " << ec.value() << ")";
+                    asio::error_code close_ec;
+                    socket_->close(close_ec);
+                }
+                // Post cleanup to ensure it runs after the socket callback
+                // returns, matching the existing write/read completion paths.
+                asio::post(
+                    socket_->get_executor(),
+                    [this, self, complete,
+                     on_finalize = std::move(on_finalize_),
+                     on_complete = std::move(on_complete_)]() {
+                        if (on_finalize) {
+                            on_finalize(complete ? TransferStatusEnum::COMPLETED
+                                                 : TransferStatusEnum::FAILED);
+                        }
+                        session_mutex_.unlock();
+                        if (on_complete) on_complete();
+                    });
             });
     }
 };

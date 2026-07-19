@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import importlib
 import io
 import json
 import os
@@ -40,6 +41,78 @@ from .policy import (
 )
 from .cachegen import _compress_cachegen, _decompress_cachegen
 from ..strict_mode import strict_no_fallback_enabled
+
+
+class MooncakeProtocolError(RuntimeError):
+    """Raised when a requested Mooncake transport cannot be used safely."""
+
+
+class MooncakeProtocolCapabilityError(MooncakeProtocolError):
+    """Raised when the deployed native engine lacks a requested protocol."""
+
+
+def _normalize_mooncake_protocol(protocol: str | None) -> str:
+    return str(protocol or "").strip().lower()
+
+
+def validate_mooncake_protocol_pair(
+    kv_protocol: str | None,
+    direct_engine_protocol: str | None,
+) -> None:
+    """Reject unsafe P→D / E→P ``nvlink_intra`` protocol splits.
+
+    Mooncake's intra-node NVLink selection is process-scoped through
+    ``MC_INTRANODE_NVLINK``. A Prefill process can host both the vLLM KV
+    connector and the direct FeatureHandle reader, so mixing ``nvlink_intra``
+    with another native protocol would let one engine select the other's
+    transport. Refuse that configuration rather than silently falling back.
+    """
+
+    kv = _normalize_mooncake_protocol(kv_protocol)
+    direct = _normalize_mooncake_protocol(direct_engine_protocol)
+    if "nvlink_intra" in {kv, direct} and kv != direct:
+        raise MooncakeProtocolError(
+            "P→D and E→P Mooncake protocols must both be 'nvlink_intra' "
+            "when either selects intra-node NVLink; the native transport "
+            "selector is process-scoped and mixed protocols can silently "
+            f"select the wrong backend (P→D={kv!r}, E→P={direct!r})."
+        )
+
+
+def require_mooncake_protocol_support(
+    protocol: str | None,
+    *,
+    engine_module: Any | None = None,
+) -> None:
+    """Fail closed when a native-only Mooncake protocol is unavailable.
+
+    Older Mooncake ``engine.so`` builds log an error for ``nvlink_intra`` but
+    still initialize their automatic transport selector, which can choose
+    RDMA/TCP instead. The module capability attribute is compiled into newer
+    engines; an absent attribute is deliberately treated as unsupported so an
+    old binary cannot produce a misleading NVLink benchmark artifact.
+    """
+
+    requested = _normalize_mooncake_protocol(protocol)
+    capability_attr = {"nvlink_intra": "SUPPORT_INTRA_NVLINK"}.get(requested)
+    if capability_attr is None:
+        return
+    if engine_module is None:
+        try:
+            engine_module = importlib.import_module("mooncake.engine")
+        except Exception as exc:
+            raise MooncakeProtocolCapabilityError(
+                f"requested Mooncake protocol {requested!r}, but mooncake.engine "
+                "could not be imported. Rebuild and install Mooncake with "
+                "-DUSE_CUDA=ON -DUSE_INTRA_NVLINK=ON; refusing transport fallback."
+            ) from exc
+    if getattr(engine_module, capability_attr, None) is not True:
+        raise MooncakeProtocolCapabilityError(
+            f"requested Mooncake protocol {requested!r}, but the deployed "
+            f"mooncake.engine does not expose {capability_attr}=true. Rebuild "
+            "and install Mooncake with -DUSE_CUDA=ON -DUSE_INTRA_NVLINK=ON; "
+            "refusing silent transport fallback."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +339,17 @@ class TransferEngine:
         self.device_name = device_name
         self.stats = TransferStats()
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
+        # One vLLM worker can dispatch several E→P or P→D operations through
+        # the same bound Mooncake C++ TransferEngine.  The native TCP backend
+        # multiplexes its own I/O context, but the Python binding keeps
+        # request/session and registration state per engine instance.  In
+        # particular, overlapping register → transfer → unregister sequences
+        # can report success while one request observes another request's
+        # payload.  This re-entrant lock therefore protects every native-engine
+        # transaction, not only the P→D batch-write fast path.  CPU-side
+        # descriptor preparation and CUDA source fences stay outside whenever
+        # they do not touch the native backend.
+        self._native_transfer_lock = threading.RLock()
         self._mooncake = None
         self._store = None
         self._initialized = False
@@ -275,54 +359,70 @@ class TransferEngine:
     # Lifecycle
     # ------------------------------------------------------------------
     def initialize(self) -> None:
-        if self._initialized:
-            return
-        if self.protocol in ("tcp", "rdma"):
-            try:
-                if self.protocol == "tcp":
-                    # Mooncake's transfer engine can auto-discover RDMA HCAs
-                    # even when the public protocol parameter is "tcp".  On
-                    # hosts with present-but-unusable RDMA devices this makes
-                    # direct peer-buffer writes fail at QP creation time
-                    # (rc=-1).  `protocol=tcp` is an explicit transport
-                    # contract for EPD, so force the C++ engine to install TCP
-                    # only before it snapshots environment settings.
-                    os.environ.setdefault("MC_FORCE_TCP", "1")
-                from mooncake.engine import TransferEngine as _MTE
-                self._mooncake = _MTE()
-                self._mooncake.initialize(
-                    self.local_hostname,
-                    self.metadata_server,
-                    self.protocol,
-                    self.device_name,
-                )
-            except Exception as e:
-                raise RuntimeError(f"Mooncake Transfer Engine init failed: {e}") from e
-            if os.getenv("MOONCAKE_EPD_INIT_PYTHON_STORE_ON_ENGINE_INIT", "0").lower() in {
-                "1",
-                "true",
-                "yes",
-                "on",
-            }:
-                self._maybe_initialize_store()
-        self._initialized = True
+        with self._native_transfer_lock:
+            if self._initialized:
+                return
+            if self.protocol in ("tcp", "rdma", "nvlink_intra"):
+                try:
+                    if self.protocol == "tcp":
+                        # Mooncake's transfer engine can auto-discover RDMA HCAs
+                        # even when the public protocol parameter is "tcp".  On
+                        # hosts with present-but-unusable RDMA devices this makes
+                        # direct peer-buffer writes fail at QP creation time
+                        # (rc=-1).  `protocol=tcp` is an explicit transport
+                        # contract for EPD, so force the C++ engine to install TCP
+                        # only before it snapshots environment settings.
+                        os.environ.setdefault("MC_FORCE_TCP", "1")
+                    if self.protocol == "nvlink_intra":
+                        require_mooncake_protocol_support(self.protocol)
+                        # The current native selector consumes this process-level
+                        # setting during initialization. It is safe only after
+                        # the capability check above has ruled out the historical
+                        # RDMA/TCP auto-selection fallback.
+                        os.environ.pop("MC_FORCE_TCP", None)
+                        os.environ.setdefault("MC_INTRANODE_NVLINK", "1")
+                    engine_module = importlib.import_module("mooncake.engine")
+                    _MTE = engine_module.TransferEngine
+                    self._mooncake = _MTE()
+                    rc = self._mooncake.initialize(
+                        self.local_hostname,
+                        self.metadata_server,
+                        self.protocol,
+                        self.device_name,
+                    )
+                    if rc not in (None, 0):
+                        raise RuntimeError(
+                            "Mooncake Transfer Engine initialize returned "
+                            f"rc={rc} for protocol={self.protocol!r}"
+                        )
+                except Exception as e:
+                    raise RuntimeError(f"Mooncake Transfer Engine init failed: {e}") from e
+                if os.getenv("MOONCAKE_EPD_INIT_PYTHON_STORE_ON_ENGINE_INIT", "0").lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }:
+                    self._maybe_initialize_store()
+            self._initialized = True
 
     def shutdown(self) -> None:
-        if self._mooncake is not None and self._owns_mooncake_backend:
-            try:
-                self._mooncake.shutdown()
-            except Exception:
-                pass
-            self._mooncake = None
-        elif self._mooncake is not None:
-            self._mooncake = None
-        if self._store is not None:
-            with contextlib.suppress(Exception):
-                self._store.close()
-            self._store = None
+        with self._native_transfer_lock:
+            if self._mooncake is not None and self._owns_mooncake_backend:
+                try:
+                    self._mooncake.shutdown()
+                except Exception:
+                    pass
+                self._mooncake = None
+            elif self._mooncake is not None:
+                self._mooncake = None
+            if self._store is not None:
+                with contextlib.suppress(Exception):
+                    self._store.close()
+                self._store = None
+            self._initialized = False
+            self._owns_mooncake_backend = True
         self._executor.shutdown(wait=False)
-        self._initialized = False
-        self._owns_mooncake_backend = True
 
     def bind_mooncake_backend(
         self,
@@ -338,9 +438,10 @@ class TransferEngine:
         repo-level `TransferEngine` should act as a protocol-agnostic façade
         over that same backend rather than creating a second engine instance.
         """
-        self._mooncake = backend
-        self._initialized = bool(initialized)
-        self._owns_mooncake_backend = bool(owns_backend)
+        with self._native_transfer_lock:
+            self._mooncake = backend
+            self._initialized = bool(initialized)
+            self._owns_mooncake_backend = bool(owns_backend)
 
     def direct_remote_session(self) -> str:
         """Return the Mooncake session string peers use for one-sided writes.
@@ -352,95 +453,102 @@ class TransferEngine:
         """
 
         self.initialize()
-        if self._mooncake is None:
-            raise RuntimeError("Mooncake direct engine is not initialized")
-        if os.getenv("MOONCAKE_EPD_DIRECT_SESSION_INCLUDES_RPC_PORT", "0").lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }:
-            rpc_port = int(self._mooncake.get_rpc_port())
-            if rpc_port <= 0:
-                raise RuntimeError(f"Mooncake direct engine returned invalid rpc port: {rpc_port}")
-            return f"{self.local_hostname}:{rpc_port}"
-        return str(self.local_hostname)
+        with self._native_transfer_lock:
+            if self._mooncake is None:
+                raise RuntimeError("Mooncake direct engine is not initialized")
+            if os.getenv("MOONCAKE_EPD_DIRECT_SESSION_INCLUDES_RPC_PORT", "0").lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }:
+                rpc_port = int(self._mooncake.get_rpc_port())
+                if rpc_port <= 0:
+                    raise RuntimeError(f"Mooncake direct engine returned invalid rpc port: {rpc_port}")
+                return f"{self.local_hostname}:{rpc_port}"
+            return str(self.local_hostname)
 
     # ------------------------------------------------------------------
     # Direct engine peer-buffer helpers
     # ------------------------------------------------------------------
     def allocate_peer_buffer(self, size_bytes: int) -> DirectPeerBuffer:
         self.initialize()
-        if self._mooncake is None:
-            raise RuntimeError("Mooncake direct engine is not initialized")
-        ptr = int(self._mooncake.allocate_managed_buffer(int(size_bytes)))
-        if ptr <= 0:
-            raise RuntimeError(f"allocate_managed_buffer failed for size={size_bytes}")
-        return DirectPeerBuffer(pointer=ptr, size_bytes=int(size_bytes), registered=False)
+        with self._native_transfer_lock:
+            if self._mooncake is None:
+                raise RuntimeError("Mooncake direct engine is not initialized")
+            ptr = int(self._mooncake.allocate_managed_buffer(int(size_bytes)))
+            if ptr <= 0:
+                raise RuntimeError(f"allocate_managed_buffer failed for size={size_bytes}")
+            return DirectPeerBuffer(pointer=ptr, size_bytes=int(size_bytes), registered=False)
 
     def free_peer_buffer(self, handle: DirectPeerBuffer) -> None:
-        if self._mooncake is None:
-            return
-        rc = self._mooncake.free_managed_buffer(int(handle.pointer), int(handle.size_bytes))
-        if rc != 0:
-            raise RuntimeError(f"free_managed_buffer failed: rc={rc}")
+        with self._native_transfer_lock:
+            if self._mooncake is None:
+                return
+            rc = self._mooncake.free_managed_buffer(int(handle.pointer), int(handle.size_bytes))
+            if rc != 0:
+                raise RuntimeError(f"free_managed_buffer failed: rc={rc}")
 
     def write_peer_buffer(self, handle: DirectPeerBuffer, payload: bytes) -> None:
         self.initialize()
-        if self._mooncake is None:
-            raise RuntimeError("Mooncake direct engine is not initialized")
-        try:
-            rc = self._mooncake.write_bytes_to_buffer(
-                int(handle.pointer),
-                payload,
-                int(len(payload)),
-            )
-        except TypeError:
-            rc = self._mooncake.write_bytes_to_buffer(
-                int(handle.pointer),
-                payload.decode("latin1"),
-                int(len(payload)),
-            )
-        if rc != 0:
-            raise RuntimeError(f"write_bytes_to_buffer failed: rc={rc}")
+        with self._native_transfer_lock:
+            if self._mooncake is None:
+                raise RuntimeError("Mooncake direct engine is not initialized")
+            try:
+                rc = self._mooncake.write_bytes_to_buffer(
+                    int(handle.pointer),
+                    payload,
+                    int(len(payload)),
+                )
+            except TypeError:
+                rc = self._mooncake.write_bytes_to_buffer(
+                    int(handle.pointer),
+                    payload.decode("latin1"),
+                    int(len(payload)),
+                )
+            if rc != 0:
+                raise RuntimeError(f"write_bytes_to_buffer failed: rc={rc}")
 
     def read_peer_buffer(self, handle: DirectPeerBuffer, nbytes: int) -> bytes:
         self.initialize()
-        if self._mooncake is None:
-            raise RuntimeError("Mooncake direct engine is not initialized")
-        raw = self._mooncake.read_bytes_from_buffer(int(handle.pointer), int(nbytes))
-        if isinstance(raw, bytes):
-            return raw
-        if isinstance(raw, str):
-            return raw.encode("latin1")
-        return bytes(raw)
+        with self._native_transfer_lock:
+            if self._mooncake is None:
+                raise RuntimeError("Mooncake direct engine is not initialized")
+            raw = self._mooncake.read_bytes_from_buffer(int(handle.pointer), int(nbytes))
+            if isinstance(raw, bytes):
+                return raw
+            if isinstance(raw, str):
+                return raw.encode("latin1")
+            return bytes(raw)
 
     def register_tensor_memory(self, tensor: torch.Tensor) -> DirectPeerBuffer:
         self.initialize()
-        if self._mooncake is None:
-            raise RuntimeError("Mooncake direct engine is not initialized")
-        nbytes = int(tensor.nelement() * tensor.element_size())
-        ptr = int(tensor.data_ptr())
-        rc = self._mooncake.register_memory(ptr, nbytes)
-        if rc not in (0, -600):
-            raise RuntimeError(f"register_memory failed: rc={rc}, ptr={ptr}, nbytes={nbytes}")
-        return DirectPeerBuffer(
-            pointer=ptr,
-            size_bytes=nbytes,
-            registered=True,
-            owns_registration=(rc == 0),
-        )
+        with self._native_transfer_lock:
+            if self._mooncake is None:
+                raise RuntimeError("Mooncake direct engine is not initialized")
+            nbytes = int(tensor.nelement() * tensor.element_size())
+            ptr = int(tensor.data_ptr())
+            rc = self._mooncake.register_memory(ptr, nbytes)
+            if rc not in (0, -600):
+                raise RuntimeError(f"register_memory failed: rc={rc}, ptr={ptr}, nbytes={nbytes}")
+            return DirectPeerBuffer(
+                pointer=ptr,
+                size_bytes=nbytes,
+                registered=True,
+                owns_registration=(rc == 0),
+            )
 
     def unregister_tensor_memory(self, handle: DirectPeerBuffer) -> None:
-        if (
-            not handle.registered
-            or not handle.owns_registration
-            or self._mooncake is None
-        ):
-            return
-        rc = self._mooncake.unregister_memory(int(handle.pointer))
-        if rc not in (0, -601):
-            raise RuntimeError(f"unregister_memory failed: rc={rc}, ptr={handle.pointer}")
+        with self._native_transfer_lock:
+            if (
+                not handle.registered
+                or not handle.owns_registration
+                or self._mooncake is None
+            ):
+                return
+            rc = self._mooncake.unregister_memory(int(handle.pointer))
+            if rc not in (0, -601):
+                raise RuntimeError(f"unregister_memory failed: rc={rc}, ptr={handle.pointer}")
 
     def build_peer_transfer_plan(
         self,
@@ -582,22 +690,27 @@ class TransferEngine:
             total_bytes += int(length)
         prepare_ms = (time.perf_counter() - prepare_started) * 1000.0
 
-        write_started = time.perf_counter()
-        if len(src_ptrs) == 1:
-            rc = self._mooncake.transfer_sync_write(
-                str(remote_session),
-                int(src_ptrs[0]),
-                int(dst_ptrs[0]),
-                int(transfer_lengths[0]),
-            )
-        else:
-            rc = self._mooncake.batch_transfer_sync_write(
-                str(remote_session),
-                src_ptrs,
-                dst_ptrs,
-                transfer_lengths,
-            )
-        write_ms = (time.perf_counter() - write_started) * 1000.0
+        lock_wait_started = time.perf_counter()
+        with self._native_transfer_lock:
+            native_engine_lock_wait_ms = (
+                time.perf_counter() - lock_wait_started
+            ) * 1000.0
+            write_started = time.perf_counter()
+            if len(src_ptrs) == 1:
+                rc = self._mooncake.transfer_sync_write(
+                    str(remote_session),
+                    int(src_ptrs[0]),
+                    int(dst_ptrs[0]),
+                    int(transfer_lengths[0]),
+                )
+            else:
+                rc = self._mooncake.batch_transfer_sync_write(
+                    str(remote_session),
+                    src_ptrs,
+                    dst_ptrs,
+                    transfer_lengths,
+                )
+            write_ms = (time.perf_counter() - write_started) * 1000.0
         if rc != 0:
             raise RuntimeError(f"registered peer-buffer transfer failed: rc={rc}")
 
@@ -608,6 +721,7 @@ class TransferEngine:
                 "total_ms": (time.perf_counter() - total_started) * 1000.0,
                 "prepare_ms": prepare_ms,
                 "write_ms": write_ms,
+                "native_engine_lock_wait_ms": native_engine_lock_wait_ms,
                 "descriptor_count": float(len(src_ptrs)),
                 "nbytes": float(total_bytes),
                 "registered_pointer_fast_path": 1.0,
@@ -625,79 +739,76 @@ class TransferEngine:
         if not plan.descriptors:
             return PeerTransferResult(nbytes=0, descriptor_count=0)
 
-        cleanup_handles: List[DirectPeerBuffer] = []
+        mirrored: List[Optional[torch.Tensor]] = []
         local_ptrs: List[int] = []
         remote_ptrs: List[int] = []
         lengths: List[int] = []
-        mirrored: List[Optional[torch.Tensor]] = []
         total_bytes = 0
-
-        prepare_started = time.perf_counter()
+        prepare_ms = 0.0
         register_ms = 0.0
-        for desc in plan.descriptors:
-            if desc.local_buffer is not None:
-                if not desc.local_buffer.registered and desc.tensor is None:
-                    raise ValueError(
-                        "pointer-only peer-buffer descriptors must reference registered memory"
-                    )
-                local_ptr = int(desc.local_buffer.pointer)
-            elif desc.local_pointer:
-                local_ptr = int(desc.local_pointer)
-            elif desc.tensor is not None:
-                reg_started = time.perf_counter()
-                handle = self.register_tensor_memory(desc.tensor.detach())
-                register_ms += (time.perf_counter() - reg_started) * 1000.0
-                cleanup_handles.append(handle)
-                local_ptr = int(handle.pointer)
-                desc.needs_unregister = True
-            else:
-                raise ValueError("descriptor must provide tensor, local_pointer or local_buffer")
-
-            if (
-                desc.tensor is not None
-                and desc.local_buffer is None
-                and not desc.needs_unregister
-            ):
-                reg_started = time.perf_counter()
-                handle = self.register_tensor_memory(desc.tensor.detach())
-                register_ms += (time.perf_counter() - reg_started) * 1000.0
-                cleanup_handles.append(handle)
-                local_ptr = int(handle.pointer)
-                desc.needs_unregister = True
-
-            local_ptrs.append(local_ptr)
-            remote_ptrs.append(int(desc.remote_pointer))
-            lengths.append(int(desc.size_bytes))
-            total_bytes += int(desc.size_bytes)
-        prepare_ms = (time.perf_counter() - prepare_started) * 1000.0
-
         write_ms = 0.0
         unregister_ms = 0.0
-        try:
-            write_started = time.perf_counter()
-            if len(local_ptrs) == 1:
-                rc = self._mooncake.transfer_sync_write(
-                    str(plan.remote_session),
-                    int(local_ptrs[0]),
-                    int(remote_ptrs[0]),
-                    int(lengths[0]),
-                )
-            else:
-                rc = self._mooncake.batch_transfer_sync_write(
-                    str(plan.remote_session),
-                    local_ptrs,
-                    remote_ptrs,
-                    lengths,
-                )
-            write_ms = (time.perf_counter() - write_started) * 1000.0
-            if rc != 0:
-                raise RuntimeError(f"peer-buffer transfer failed: rc={rc}")
-        finally:
-            for handle in cleanup_handles:
-                with contextlib.suppress(Exception):
-                    unreg_started = time.perf_counter()
-                    self.unregister_tensor_memory(handle)
-                    unregister_ms += (time.perf_counter() - unreg_started) * 1000.0
+        lock_wait_started = time.perf_counter()
+        with self._native_transfer_lock:
+            native_engine_lock_wait_ms = (
+                time.perf_counter() - lock_wait_started
+            ) * 1000.0
+            cleanup_handles: List[DirectPeerBuffer] = []
+            try:
+                prepare_started = time.perf_counter()
+                for desc in plan.descriptors:
+                    if desc.local_buffer is not None:
+                        if not desc.local_buffer.registered and desc.tensor is None:
+                            raise ValueError(
+                                "pointer-only peer-buffer descriptors must reference registered memory"
+                            )
+                        local_ptr = int(desc.local_buffer.pointer)
+                    elif desc.tensor is not None:
+                        # A plan can be reused.  Register the tensor for this
+                        # transaction rather than retaining a stale pointer
+                        # registration from a prior call.
+                        reg_started = time.perf_counter()
+                        handle = self.register_tensor_memory(desc.tensor.detach())
+                        register_ms += (time.perf_counter() - reg_started) * 1000.0
+                        cleanup_handles.append(handle)
+                        local_ptr = int(handle.pointer)
+                    elif desc.local_pointer:
+                        local_ptr = int(desc.local_pointer)
+                    else:
+                        raise ValueError(
+                            "descriptor must provide tensor, local_pointer or local_buffer"
+                        )
+
+                    local_ptrs.append(local_ptr)
+                    remote_ptrs.append(int(desc.remote_pointer))
+                    lengths.append(int(desc.size_bytes))
+                    total_bytes += int(desc.size_bytes)
+                prepare_ms = (time.perf_counter() - prepare_started) * 1000.0
+
+                write_started = time.perf_counter()
+                if len(local_ptrs) == 1:
+                    rc = self._mooncake.transfer_sync_write(
+                        str(plan.remote_session),
+                        int(local_ptrs[0]),
+                        int(remote_ptrs[0]),
+                        int(lengths[0]),
+                    )
+                else:
+                    rc = self._mooncake.batch_transfer_sync_write(
+                        str(plan.remote_session),
+                        local_ptrs,
+                        remote_ptrs,
+                        lengths,
+                    )
+                write_ms = (time.perf_counter() - write_started) * 1000.0
+                if rc != 0:
+                    raise RuntimeError(f"peer-buffer transfer failed: rc={rc}")
+            finally:
+                for handle in cleanup_handles:
+                    with contextlib.suppress(Exception):
+                        unreg_started = time.perf_counter()
+                        self.unregister_tensor_memory(handle)
+                        unregister_ms += (time.perf_counter() - unreg_started) * 1000.0
 
         target_device = plan.target_device
         mirror_started = time.perf_counter()
@@ -725,6 +836,7 @@ class TransferEngine:
                 "write_ms": write_ms,
                 "unregister_memory_ms": unregister_ms,
                 "mirror_ms": mirror_ms,
+                "native_engine_lock_wait_ms": native_engine_lock_wait_ms,
                 "descriptor_count": float(len(plan.descriptors)),
                 "nbytes": float(total_bytes),
             },
@@ -756,44 +868,49 @@ class TransferEngine:
             raise ValueError("remote_session is required for peer-buffer read")
         if len(remote_pointers) != len(lengths):
             raise ValueError("remote_pointers and lengths must have identical lengths")
-        handles: List[DirectPeerBuffer] = []
-        local_pointers: List[int] = []
-        read_lengths: List[int] = []
-        try:
-            for length in lengths:
-                nbytes = int(length)
-                if nbytes < 0:
-                    raise ValueError(f"negative peer-buffer read length: {nbytes}")
-                handle = self.allocate_peer_buffer(max(1, nbytes))
-                handles.append(handle)
-                local_pointers.append(int(handle.pointer))
-                read_lengths.append(nbytes)
-            if not handles:
-                return []
-            if len(handles) == 1:
-                rc = self._mooncake.transfer_sync_read(
-                    str(remote_session),
-                    int(local_pointers[0]),
-                    int(remote_pointers[0]),
-                    int(read_lengths[0]),
-                )
-            else:
-                rc = self._mooncake.batch_transfer_sync_read(
-                    str(remote_session),
-                    local_pointers,
-                    [int(ptr) for ptr in remote_pointers],
-                    read_lengths,
-                )
-            if rc != 0:
-                raise RuntimeError(f"peer-buffer read failed: rc={rc}")
-            return [
-                self.read_peer_buffer(handle, nbytes)
-                for handle, nbytes in zip(handles, read_lengths)
-            ]
-        finally:
-            for handle in handles:
-                with contextlib.suppress(Exception):
-                    self.free_peer_buffer(handle)
+        # The managed buffer allocation, native read, payload extraction, and
+        # free form one ownership transaction.  Letting another request enter
+        # between these steps can reuse or unregister a buffer while its bytes
+        # are still being read from the same C++ engine instance.
+        with self._native_transfer_lock:
+            handles: List[DirectPeerBuffer] = []
+            local_pointers: List[int] = []
+            read_lengths: List[int] = []
+            try:
+                for length in lengths:
+                    nbytes = int(length)
+                    if nbytes < 0:
+                        raise ValueError(f"negative peer-buffer read length: {nbytes}")
+                    handle = self.allocate_peer_buffer(max(1, nbytes))
+                    handles.append(handle)
+                    local_pointers.append(int(handle.pointer))
+                    read_lengths.append(nbytes)
+                if not handles:
+                    return []
+                if len(handles) == 1:
+                    rc = self._mooncake.transfer_sync_read(
+                        str(remote_session),
+                        int(local_pointers[0]),
+                        int(remote_pointers[0]),
+                        int(read_lengths[0]),
+                    )
+                else:
+                    rc = self._mooncake.batch_transfer_sync_read(
+                        str(remote_session),
+                        local_pointers,
+                        [int(ptr) for ptr in remote_pointers],
+                        read_lengths,
+                    )
+                if rc != 0:
+                    raise RuntimeError(f"peer-buffer read failed: rc={rc}")
+                return [
+                    self.read_peer_buffer(handle, nbytes)
+                    for handle, nbytes in zip(handles, read_lengths)
+                ]
+            finally:
+                for handle in handles:
+                    with contextlib.suppress(Exception):
+                        self.free_peer_buffer(handle)
 
     def read_remote_peer_buffers_into_tensors(
         self,
@@ -819,57 +936,63 @@ class TransferEngine:
             raise ValueError("remote_session is required for peer-buffer read")
         if len(remote_pointers) != len(tensors):
             raise ValueError("remote_pointers and tensors must have identical lengths")
-        handles: List[DirectPeerBuffer] = []
-        local_pointers: List[int] = []
-        lengths: List[int] = []
         register_ms = 0.0
         transfer_ms = 0.0
         unregister_ms = 0.0
         completed = False
-        try:
-            for tensor in tensors:
-                if not tensor.is_contiguous():
-                    raise ValueError("direct peer-buffer read target tensors must be contiguous")
-                reg_started = time.perf_counter()
-                handle = self.register_tensor_memory(tensor)
-                register_ms += (time.perf_counter() - reg_started) * 1000.0
-                handles.append(handle)
-                local_pointers.append(int(handle.pointer))
-                lengths.append(int(handle.size_bytes))
-            if not handles:
-                return {
-                    "total_ms": (time.perf_counter() - total_started) * 1000.0,
-                    "register_memory_ms": 0.0,
-                    "read_ms": 0.0,
-                    "unregister_memory_ms": 0.0,
-                    "descriptor_count": 0.0,
-                    "nbytes": 0.0,
-                }
-            transfer_started = time.perf_counter()
-            if len(handles) == 1:
-                rc = self._mooncake.transfer_sync_read(
-                    str(remote_session),
-                    int(local_pointers[0]),
-                    int(remote_pointers[0]),
-                    int(lengths[0]),
-                )
-            else:
-                rc = self._mooncake.batch_transfer_sync_read(
-                    str(remote_session),
-                    local_pointers,
-                    [int(ptr) for ptr in remote_pointers],
-                    lengths,
-                )
-            transfer_ms = (time.perf_counter() - transfer_started) * 1000.0
-            if rc != 0:
-                raise RuntimeError(f"peer-buffer read failed: rc={rc}")
-            completed = True
-        finally:
-            for handle in handles:
-                with contextlib.suppress(Exception):
-                    unreg_started = time.perf_counter()
-                    self.unregister_tensor_memory(handle)
-                    unregister_ms += (time.perf_counter() - unreg_started) * 1000.0
+        lock_wait_started = time.perf_counter()
+        with self._native_transfer_lock:
+            native_engine_lock_wait_ms = (
+                time.perf_counter() - lock_wait_started
+            ) * 1000.0
+            handles: List[DirectPeerBuffer] = []
+            local_pointers: List[int] = []
+            lengths: List[int] = []
+            try:
+                for tensor in tensors:
+                    if not tensor.is_contiguous():
+                        raise ValueError("direct peer-buffer read target tensors must be contiguous")
+                    reg_started = time.perf_counter()
+                    handle = self.register_tensor_memory(tensor)
+                    register_ms += (time.perf_counter() - reg_started) * 1000.0
+                    handles.append(handle)
+                    local_pointers.append(int(handle.pointer))
+                    lengths.append(int(handle.size_bytes))
+                if not handles:
+                    return {
+                        "total_ms": (time.perf_counter() - total_started) * 1000.0,
+                        "register_memory_ms": 0.0,
+                        "read_ms": 0.0,
+                        "unregister_memory_ms": 0.0,
+                        "native_engine_lock_wait_ms": native_engine_lock_wait_ms,
+                        "descriptor_count": 0.0,
+                        "nbytes": 0.0,
+                    }
+                transfer_started = time.perf_counter()
+                if len(handles) == 1:
+                    rc = self._mooncake.transfer_sync_read(
+                        str(remote_session),
+                        int(local_pointers[0]),
+                        int(remote_pointers[0]),
+                        int(lengths[0]),
+                    )
+                else:
+                    rc = self._mooncake.batch_transfer_sync_read(
+                        str(remote_session),
+                        local_pointers,
+                        [int(ptr) for ptr in remote_pointers],
+                        lengths,
+                    )
+                transfer_ms = (time.perf_counter() - transfer_started) * 1000.0
+                if rc != 0:
+                    raise RuntimeError(f"peer-buffer read failed: rc={rc}")
+                completed = True
+            finally:
+                for handle in handles:
+                    with contextlib.suppress(Exception):
+                        unreg_started = time.perf_counter()
+                        self.unregister_tensor_memory(handle)
+                        unregister_ms += (time.perf_counter() - unreg_started) * 1000.0
         if not completed:
             raise RuntimeError("peer-buffer read did not complete")
         return {
@@ -877,6 +1000,7 @@ class TransferEngine:
             "register_memory_ms": register_ms,
             "read_ms": transfer_ms,
             "unregister_memory_ms": unregister_ms,
+            "native_engine_lock_wait_ms": native_engine_lock_wait_ms,
             "descriptor_count": float(len(handles)),
             "nbytes": float(sum(lengths)),
         }
@@ -965,17 +1089,71 @@ class TransferEngine:
         *,
         source_memory_mode: Optional[str] = None,
     ) -> FeatureBundlePeerBufferResult:
-        """Transfer FeatureBundle tensors through Mooncake direct peer buffers.
+        """Transfer one FeatureBundle through Mooncake direct peer buffers.
 
-        ``source_memory_mode`` controls the sender-side memory contract:
-        - ``registered_tensor``: use tensor.data_ptr() directly; caller/platform
-          must ensure the tensor memory is registered/registrable.
-        - ``managed_buffer``: stage each tensor into a local Mooncake managed
-          buffer, then write managed-buffer pointers to the remote targets.  This
-          remains a direct-engine data plane and avoids file/object-store
-          fallback on platforms where torch CUDA allocations cannot be
-          registered by Mooncake.
+        This compatibility entry point deliberately uses the same batching
+        primitive as the multi-feature hot path.  A one-item batch preserves
+        the former public contract while keeping registration, capacity
+        validation, timing fields, and cleanup identical to a real request
+        containing multiple images.
         """
+
+        return self.transfer_feature_bundle_peer_buffer_plans(
+            [bundle],
+            [plan],
+            source_memory_mode=source_memory_mode,
+        )[0]
+
+    def transfer_feature_bundle_peer_buffer_plans(
+        self,
+        bundles: Sequence[Any],
+        plans: Sequence[FeatureBundlePeerBufferPlan],
+        *,
+        source_memory_mode: Optional[str] = None,
+    ) -> List[FeatureBundlePeerBufferResult]:
+        """Transfer several FeatureBundles to one Prefill session in one write.
+
+        A multimodal request can contain several independent images.  Before
+        this helper, each image issued a separate Mooncake
+        ``batch_transfer_sync_write`` even though all of its destination
+        buffers belonged to the same Prefill worker.  Coalescing the tensor
+        descriptors into one engine batch removes those control/data-plane
+        dispatches from the E->P critical path without changing ownership:
+        Prefill still allocates every destination buffer and every bundle is
+        validated immediately before the write.
+
+        Mooncake's batch API accepts one remote session, so callers must group
+        entries by ``FeatureBundlePeerBufferPlan.remote_session``.  We fail
+        fast rather than silently splitting or falling back; the online
+        service performs that grouping while preserving the request's handle
+        order.
+
+        ``source_memory_mode`` has the same contract as the single-bundle
+        method: ``registered_tensor`` registers the source tensor memory for
+        the write, while ``managed_buffer`` stages it in a Mooncake managed
+        buffer.  Both modes perform exactly one peer-buffer write per batch.
+        """
+
+        if len(bundles) != len(plans):
+            raise ValueError("bundles and plans must have identical lengths")
+        if not bundles:
+            return []
+
+        remote_session = str(plans[0].remote_session or "")
+        if not remote_session:
+            raise ValueError("remote_session is required for FeatureBundle peer-buffer transfer")
+        differing_sessions = sorted(
+            {
+                str(plan.remote_session or "")
+                for plan in plans
+                if str(plan.remote_session or "") != remote_session
+            }
+        )
+        if differing_sessions:
+            raise ValueError(
+                "FeatureBundle peer-buffer batch requires one remote_session; "
+                f"expected={remote_session!r} got={differing_sessions!r}"
+            )
 
         self.initialize()
         if self._mooncake is None:
@@ -987,11 +1165,16 @@ class TransferEngine:
         if mode not in {"registered_tensor", "managed_buffer"}:
             raise ValueError(f"unsupported FeatureBundle direct source_memory_mode: {mode}")
 
-        tensors_by_name = {name: tensor for name, tensor in self.feature_bundle_tensor_items(bundle)}
-        if mode == "registered_tensor":
-            total_started = time.perf_counter()
-            tensors: List[torch.Tensor] = []
-            remote_pointers: List[int] = []
+        total_started = time.perf_counter()
+        tensors: List[torch.Tensor] = []
+        remote_pointers: List[int] = []
+        lengths: List[int] = []
+        per_bundle: List[Tuple[FeatureBundlePeerBufferPlan, int, int]] = []
+        for bundle, plan in zip(bundles, plans):
+            tensors_by_name = {
+                name: tensor for name, tensor in self.feature_bundle_tensor_items(bundle)
+            }
+            bundle_nbytes = 0
             for target in plan.targets:
                 tensor = tensors_by_name.get(target.name)
                 if tensor is None:
@@ -1004,86 +1187,84 @@ class TransferEngine:
                     )
                 tensors.append(tensor)
                 remote_pointers.append(int(target.remote_pointer))
+                lengths.append(nbytes)
+                bundle_nbytes += nbytes
+            per_bundle.append((plan, bundle_nbytes, len(plan.targets)))
+
+        if mode == "registered_tensor":
             build_started = time.perf_counter()
             peer_plan = self.build_peer_transfer_plan(
                 tensors=tensors,
-                remote_session=plan.remote_session,
+                remote_session=remote_session,
                 remote_pointers=remote_pointers,
                 mirror_local_copy=False,
             )
             build_plan_ms = (time.perf_counter() - build_started) * 1000.0
             result = self.transfer_peer_buffer_plan(peer_plan)
-            elapsed_ms = (time.perf_counter() - total_started) * 1000.0
-            self.stats.record("encoder_to_prefill_peer_buffer_direct", result.nbytes, elapsed_ms)
-            return FeatureBundlePeerBufferResult(
-                feature_id=plan.feature_id,
-                nbytes=int(result.nbytes),
-                tensor_count=len(plan.targets),
-                descriptor_count=int(result.descriptor_count),
-                timings_ms={
-                    "total_ms": elapsed_ms,
-                    "build_peer_plan_ms": build_plan_ms,
-                    **dict(result.timings_ms or {}),
-                },
-            )
-
-        total_started = time.perf_counter()
-        staging_ms = 0.0
-        local_pointers: List[int] = []
-        remote_pointers: List[int] = []
-        lengths: List[int] = []
-        staged_buffers: List[DirectPeerBuffer] = []
-        for target in plan.targets:
-            tensor = tensors_by_name.get(target.name)
-            if tensor is None:
-                raise ValueError(f"plan references tensor not present in bundle: {target.name}")
-            nbytes = int(tensor.nelement() * tensor.element_size())
-            if nbytes != int(target.nbytes):
-                raise ValueError(
-                    f"tensor byte size changed before transfer: {target.name} "
-                    f"plan={target.nbytes} actual={nbytes}"
+            staging_ms = 0.0
+        else:
+            staging_ms = 0.0
+            local_pointers: List[int] = []
+            staged_buffers: List[DirectPeerBuffer] = []
+            try:
+                for tensor, nbytes in zip(tensors, lengths):
+                    stage_started = time.perf_counter()
+                    handle = self.allocate_peer_buffer(nbytes)
+                    staged_buffers.append(handle)
+                    self.write_peer_buffer(handle, _tensor_raw_bytes(tensor))
+                    staging_ms += (time.perf_counter() - stage_started) * 1000.0
+                    local_pointers.append(int(handle.pointer))
+                build_started = time.perf_counter()
+                pointer_plan = self.build_pointer_transfer_plan(
+                    remote_session=remote_session,
+                    local_pointers=local_pointers,
+                    remote_pointers=remote_pointers,
+                    lengths=lengths,
+                    registered=True,
                 )
-            if mode == "managed_buffer":
-                stage_started = time.perf_counter()
-                handle = self.allocate_peer_buffer(nbytes)
-                staged_buffers.append(handle)
-                self.write_peer_buffer(handle, _tensor_raw_bytes(tensor))
-                staging_ms += (time.perf_counter() - stage_started) * 1000.0
-                local_pointers.append(int(handle.pointer))
-            else:
-                local_pointers.append(int(tensor.data_ptr()))
-            remote_pointers.append(int(target.remote_pointer))
-            lengths.append(nbytes)
+                build_plan_ms = (time.perf_counter() - build_started) * 1000.0
+                result = self.transfer_peer_buffer_plan(pointer_plan)
+            finally:
+                for handle in staged_buffers:
+                    with contextlib.suppress(Exception):
+                        self.free_peer_buffer(handle)
 
-        try:
-            build_started = time.perf_counter()
-            pointer_plan = self.build_pointer_transfer_plan(
-                remote_session=plan.remote_session,
-                local_pointers=local_pointers,
-                remote_pointers=remote_pointers,
-                lengths=lengths,
-                registered=True,
-            )
-            build_plan_ms = (time.perf_counter() - build_started) * 1000.0
-            result = self.transfer_peer_buffer_plan(pointer_plan)
-        finally:
-            for handle in staged_buffers:
-                with contextlib.suppress(Exception):
-                    self.free_peer_buffer(handle)
         elapsed_ms = (time.perf_counter() - total_started) * 1000.0
+        # One stat record denotes one actual Mooncake write.  Recording it once
+        # prevents a multi-image request from being misreported as N separate
+        # data-plane operations simply because it returns N control handles.
         self.stats.record("encoder_to_prefill_peer_buffer_direct", result.nbytes, elapsed_ms)
-        return FeatureBundlePeerBufferResult(
-            feature_id=plan.feature_id,
-            nbytes=int(result.nbytes),
-            tensor_count=len(plan.targets),
-            descriptor_count=int(result.descriptor_count),
-            timings_ms={
+        shared_timings = dict(result.timings_ms or {})
+        shared_timings.update(
+            {
                 "total_ms": elapsed_ms,
                 "staging_ms": staging_ms,
                 "build_peer_plan_ms": build_plan_ms,
-                **dict(result.timings_ms or {}),
-            },
+                "batch_total_ms": elapsed_ms,
+                "batch_write_ms": float((result.timings_ms or {}).get("write_ms", 0.0)),
+                "batch_feature_count": float(len(plans)),
+                "batch_descriptor_count": float(result.descriptor_count),
+                "batch_nbytes": float(result.nbytes),
+            }
         )
+        results: List[FeatureBundlePeerBufferResult] = []
+        for batch_index, (plan, bundle_nbytes, tensor_count) in enumerate(per_bundle):
+            timings = dict(shared_timings)
+            # The wall time is intentionally shared: all features become ready
+            # only when the single Mooncake batch completes.  The index makes
+            # it clear to telemetry consumers that these are per-handle views
+            # of one transfer rather than independent writes.
+            timings["batch_index"] = float(batch_index)
+            results.append(
+                FeatureBundlePeerBufferResult(
+                    feature_id=plan.feature_id,
+                    nbytes=int(bundle_nbytes),
+                    tensor_count=int(tensor_count),
+                    descriptor_count=int(tensor_count),
+                    timings_ms=timings,
+                )
+            )
+        return results
 
     def probe_direct_engine(self, buffer_bytes: int = 4096) -> Dict[str, Any]:
         """Best-effort smoke probe for the Mooncake direct-engine peer-buffer path.

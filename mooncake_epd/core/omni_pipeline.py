@@ -280,3 +280,35 @@ class OmniPipelineRuntime:
             "threads_alive": sum(1 for t in self._threads if t.is_alive()),
         }
         return out
+
+
+# Compatibility surface for callers that historically imported the monolithic
+# module. New worker-process code belongs in ``core.omni``; retaining these
+# explicit aliases avoids silently leaving old launchers on the thread-only
+# runtime when they opt into the process boundary.
+from .omni import (  # noqa: E402  (intentional end-of-module compatibility import)
+    OmniProcessPipeline,
+    PosixSharedMemoryTransport,
+    ProcessStage,
+    StageEnvelope,
+    StageTransportError,
+    TCPRelayTransport,
+    TensorRef,
+)
+
+
+__all__ = [
+    "EdgeTransferStats",
+    "OmniJob",
+    "OmniPipeline",
+    "OmniPipelineRuntime",
+    "OmniProcessPipeline",
+    "OmniStage",
+    "PosixSharedMemoryTransport",
+    "ProcessStage",
+    "StageEnvelope",
+    "StageStats",
+    "StageTransportError",
+    "TCPRelayTransport",
+    "TensorRef",
+]

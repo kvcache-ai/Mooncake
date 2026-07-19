@@ -1,0 +1,123 @@
+name: EPD Hardware Gates
+
+# Hardware gates are intentionally opt-in: a GitHub-hosted CPU runner must not
+# manufacture GPU/RDMA evidence. Repository administrators enable a tier with
+# the corresponding repository variable and provide the self-hosted labels and
+# commands documented in mooncake_epd/ci/README.md.
+on:
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+    inputs:
+      run_gpu_single_node:
+        description: 'Run the configured single-node GPU gate'
+        type: boolean
+        default: false
+      run_two_node_tcp:
+        description: 'Run the configured two-node TCP gate'
+        type: boolean
+        default: false
+      run_two_node_rdma:
+        description: 'Run the configured two-node RDMA gate'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  capability_plan:
+    runs-on: ubuntu-22.04
+    outputs:
+      gpu: ${{ steps.gates.outputs.gpu }}
+      tcp: ${{ steps.gates.outputs.tcp }}
+      rdma: ${{ steps.gates.outputs.rdma }}
+    steps:
+      - id: gates
+        env:
+          INPUT_GPU: ${{ inputs.run_gpu_single_node }}
+          INPUT_TCP: ${{ inputs.run_two_node_tcp }}
+          INPUT_RDMA: ${{ inputs.run_two_node_rdma }}
+          CONFIG_GPU: ${{ vars.MOONCAKE_EPD_ENABLE_GPU_GATE }}
+          CONFIG_TCP: ${{ vars.MOONCAKE_EPD_ENABLE_TWO_NODE_TCP_GATE }}
+          CONFIG_RDMA: ${{ vars.MOONCAKE_EPD_ENABLE_TWO_NODE_RDMA_GATE }}
+        run: |
+          enabled() {
+            test "$1" = true || test "$1" = 1 || test "$1" = yes
+          }
+          if enabled "$INPUT_GPU" || enabled "$CONFIG_GPU"; then echo "gpu=true" >> "$GITHUB_OUTPUT"; else echo "gpu=false" >> "$GITHUB_OUTPUT"; fi
+          if enabled "$INPUT_TCP" || enabled "$CONFIG_TCP"; then echo "tcp=true" >> "$GITHUB_OUTPUT"; else echo "tcp=false" >> "$GITHUB_OUTPUT"; fi
+          if enabled "$INPUT_RDMA" || enabled "$CONFIG_RDMA"; then echo "rdma=true" >> "$GITHUB_OUTPUT"; else echo "rdma=false" >> "$GITHUB_OUTPUT"; fi
+      - name: Record disabled hardware tiers truthfully
+        run: |
+          cat > epd_hardware_capability.json <<'EOF'
+          {
+            "claim_supported": false,
+            "note": "Disabled hardware tiers are skips, not passing transport or performance evidence."
+          }
+          EOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: epd-hardware-capability-plan
+          path: epd_hardware_capability.json
+
+  gpu-single-node:
+    needs: capability_plan
+    if: needs.capability_plan.outputs.gpu == 'true'
+    runs-on: [self-hosted, linux, gpu]
+    timeout-minutes: 90
+    env:
+      PYTHONPATH: ${{ github.workspace }}
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
+      MOONCAKE_EPD_ENABLE_VLLM_PATCHES: '0'
+      HF_HUB_OFFLINE: '1'
+      TRANSFORMERS_OFFLINE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Validate version-locked GPU/real-model cases
+        run: |
+          python -m compileall -q mooncake_epd sitecustomize.py
+          python -m pytest -q -m 'gpu_single_node or real_model' mooncake_epd/tests
+
+  two-node-tcp:
+    needs: capability_plan
+    if: needs.capability_plan.outputs.tcp == 'true'
+    runs-on: [self-hosted, linux, gpu, mooncake-tcp]
+    timeout-minutes: 120
+    env:
+      PYTHONPATH: ${{ github.workspace }}
+      EPD_TWO_NODE_TCP_COMMAND: ${{ vars.MOONCAKE_EPD_TWO_NODE_TCP_COMMAND }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Run configured two-node TCP correctness command
+        run: |
+          test -n "$EPD_TWO_NODE_TCP_COMMAND" || { echo 'Missing MOONCAKE_EPD_TWO_NODE_TCP_COMMAND'; exit 2; }
+          eval "$EPD_TWO_NODE_TCP_COMMAND"
+
+  two-node-rdma:
+    needs: capability_plan
+    if: needs.capability_plan.outputs.rdma == 'true'
+    runs-on: [self-hosted, linux, gpu, rdma]
+    timeout-minutes: 120
+    env:
+      PYTHONPATH: ${{ github.workspace }}
+      EPD_TWO_NODE_RDMA_COMMAND: ${{ vars.MOONCAKE_EPD_TWO_NODE_RDMA_COMMAND }}
+      EPD_RDMA_ARTIFACT: ${{ vars.MOONCAKE_EPD_RDMA_ARTIFACT }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Run configured two-node RDMA correctness command
+        run: |
+          test -n "$EPD_TWO_NODE_RDMA_COMMAND" || { echo 'Missing MOONCAKE_EPD_TWO_NODE_RDMA_COMMAND'; exit 2; }
+          eval "$EPD_TWO_NODE_RDMA_COMMAND"
+      - name: Reject non-RDMA evidence
+        run: |
+          test -n "$EPD_RDMA_ARTIFACT" || { echo 'Missing MOONCAKE_EPD_RDMA_ARTIFACT'; exit 2; }
+          test -f "$EPD_RDMA_ARTIFACT" || { echo "RDMA artifact not found: $EPD_RDMA_ARTIFACT"; exit 2; }
+          python mooncake_epd/scripts/check_epd_transport_evidence.py \
+            --artifact "$EPD_RDMA_ARTIFACT" --requested rdma --enforce

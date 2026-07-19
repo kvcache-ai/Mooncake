@@ -95,3 +95,80 @@ def test_feature_bundle_peer_buffer_transfer_uses_bound_direct_engine():
     assert fake.unregistered == [pointer for pointer, _ in fake.registered]
     snap = engine.stats.snapshot()
     assert snap["encoder_to_prefill_peer_buffer_direct"]["transfers"] == 1
+
+
+def test_feature_bundle_peer_buffer_batch_coalesces_multimodal_write():
+    """Several images for one Prefill worker issue one Mooncake write."""
+
+    engine = TransferEngine(protocol="tcp")
+    fake = _FakeMooncakeEngine()
+    engine.bind_mooncake_backend(fake, initialized=True, owns_backend=False)
+    first = _bundle()
+    second = FeatureBundle(
+        image_hash="img-direct-second",
+        last_hidden=torch.full((2, 4), 3.0, dtype=torch.float32),
+        intermediates=[(1, torch.full((2, 4), 4.0, dtype=torch.float32))],
+        grid_thw=torch.tensor([[1, 2, 1]], dtype=torch.int64),
+    )
+    bundles = [first, second]
+    plans = []
+    for bundle_index, bundle in enumerate(bundles):
+        remote = {
+            name: 40_000 + bundle_index * 16_384 + tensor_index * 4096
+            for tensor_index, (name, _tensor) in enumerate(
+                engine.feature_bundle_tensor_items(bundle)
+            )
+        }
+        plans.append(
+            engine.build_feature_bundle_peer_buffer_plan(
+                bundle,
+                remote_session="prefill-session",
+                remote_pointers=remote,
+            )
+        )
+
+    results = engine.transfer_feature_bundle_peer_buffer_plans(bundles, plans)
+
+    assert [result.feature_id for result in results] == [
+        "img-direct",
+        "img-direct-second",
+    ]
+    assert len(fake.calls) == 1
+    remote_session, local_ptrs, remote_ptrs, lengths = fake.calls[0]
+    assert remote_session == "prefill-session"
+    assert len(local_ptrs) == len(remote_ptrs) == len(lengths) == 6
+    assert results[0].nbytes == sum(target.nbytes for target in plans[0].targets)
+    assert results[1].nbytes == sum(target.nbytes for target in plans[1].targets)
+    assert results[0].timings_ms["batch_feature_count"] == 2.0
+    assert results[1].timings_ms["batch_index"] == 1.0
+    snap = engine.stats.snapshot()["encoder_to_prefill_peer_buffer_direct"]
+    assert snap["transfers"] == 1
+    assert snap["total_bytes"] == sum(result.nbytes for result in results)
+
+
+def test_feature_bundle_peer_buffer_batch_rejects_mixed_prefill_sessions():
+    engine = TransferEngine(protocol="tcp")
+    first = _bundle()
+    second = FeatureBundle(
+        image_hash="img-direct-second",
+        last_hidden=torch.ones((2, 4), dtype=torch.float32),
+    )
+    first_plan = engine.build_feature_bundle_peer_buffer_plan(
+        first,
+        remote_session="prefill-a",
+        remote_pointers={
+            name: 50_000 + index * 4096
+            for index, (name, _tensor) in enumerate(engine.feature_bundle_tensor_items(first))
+        },
+    )
+    second_plan = engine.build_feature_bundle_peer_buffer_plan(
+        second,
+        remote_session="prefill-b",
+        remote_pointers={"last_hidden": 90_000},
+    )
+
+    with pytest.raises(ValueError, match="requires one remote_session"):
+        engine.transfer_feature_bundle_peer_buffer_plans(
+            [first, second],
+            [first_plan, second_plan],
+        )

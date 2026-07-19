@@ -202,11 +202,12 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     int ret = metadata_->addRpcMetaEntry(local_server_name_, desc);
     if (ret) return ret;
 
-    // Universal TCP force mechanism: if MC_FORCE_TCP is set, skip all other
-    // transport installation logic and use TCP transport only. This allows
-    // running metadata-only instances without requiring specialized hardware
-    // (e.g., NPU for Ascend Direct, RDMA HCAs, etc.).
-    if (getenv("MC_FORCE_TCP")) {
+    // Universal TCP force mechanism: a non-empty MC_FORCE_TCP skips all other
+    // transport installation logic and uses TCP only. Treat an empty shell
+    // export as unset so it cannot override an explicit NVLink deployment.
+    const char* force_tcp_env = getenv("MC_FORCE_TCP");
+    const bool force_tcp = force_tcp_env && force_tcp_env[0] != '\0';
+    if (force_tcp) {
 #ifdef USE_TCP
         Transport* tcp_transport =
             multi_transports_->installTransport("tcp", nullptr);
@@ -293,7 +294,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 
         if (getenv("MC_MACA_HOST_TRANSPORT")) {
             if ((local_topology_->getHcaList().size() > 0 &&
-                 !getenv("MC_FORCE_TCP")) ||
+                 !force_tcp) ||
                 getenv("MC_FORCE_HCA")) {
                 Transport* t = multi_transports_->installTransport(
                     "rdma", local_topology_);
@@ -328,10 +329,13 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 
 #elif defined(USE_MNNVL) || defined(USE_INTRA_NVLINK)
 
-        const char* force_mnnvl = getenv("MC_FORCE_MNNVL");
+        const char* force_mnnvl_env = getenv("MC_FORCE_MNNVL");
+        const bool force_mnnvl =
+            force_mnnvl_env && force_mnnvl_env[0] != '\0';
         const char* intra_env = getenv("MC_INTRANODE_NVLINK");
+        const bool intra_node_nvlink = intra_env && intra_env[0] != '\0';
         // Explicit env var overrides take priority over HCA auto-detection
-        if (intra_env) {
+        if (intra_node_nvlink) {
             Transport* t =
                 multi_transports_->installTransport("nvlink_intra", nullptr);
             if (!t) {
@@ -364,7 +368,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
         // benchmark-specific setup, so it skips the default auto transport
         // path.
         if ((local_topology_->getHcaList().size() > 0 &&
-             !getenv("MC_FORCE_TCP")) ||
+             !force_tcp) ||
             getenv("MC_FORCE_HCA")) {
             // only install RDMA transport when there is at least one HCA
             Transport* rdma_transport = nullptr;

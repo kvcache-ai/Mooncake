@@ -160,3 +160,77 @@ def test_direct_feature_registry_singleflights_concurrent_allocation(monkeypatch
     assert len(results) == 2
     assert results[0] is results[1]
     assert results[0].ref_count == 2
+
+
+def test_direct_feature_registry_nonpersistent_release_honors_shared_refs():
+    bundle = _source_bundle()
+    registry = DirectFeatureBufferRegistry(
+        worker_id="prefill-0",
+        device="cpu",
+        remote_session="prefill-session",
+        register_memory=False,
+        persistent_cache=False,
+    )
+
+    first = registry.allocate_for_descriptor(bundle.descriptor())
+    second = registry.allocate_for_descriptor(bundle.descriptor())
+    assert first is second
+    assert registry.stats()["ref_count"] == 2
+
+    registry.mark_ready(bundle.image_hash)
+    registry.release(bundle.image_hash)
+    assert registry.stats()["allocations"] == 1
+    assert registry.stats()["ref_count"] == 1
+
+    registry.release(bundle.image_hash)
+    assert registry.stats()["allocations"] == 0
+    assert registry.stats()["bytes"] == 0
+
+
+def test_direct_feature_target_reallocation_gets_a_new_allocation_incarnation():
+    """A content-stable feature id must not identify a recycled GPU buffer."""
+
+    bundle = _source_bundle()
+    registry = DirectFeatureBufferRegistry(
+        worker_id="prefill-0",
+        device="cpu",
+        remote_session="prefill-session",
+        register_memory=False,
+        persistent_cache=False,
+    )
+
+    first = registry.allocate_for_descriptor(bundle.descriptor())
+    first_target = first.as_direct_target()
+    registry.mark_ready(bundle.image_hash)
+    registry.release(bundle.image_hash)
+    assert registry.get(bundle.image_hash) is None
+
+    second = registry.allocate_for_descriptor(bundle.descriptor())
+    second_target = second.as_direct_target()
+
+    assert first.feature_id == second.feature_id
+    assert first_target["allocation_id"] == first.allocation_id
+    assert second_target["allocation_id"] == second.allocation_id
+    assert second.allocation_id != first.allocation_id
+
+
+def test_direct_feature_registry_lookup_can_atomically_reserve_bounded_leases():
+    bundle = _source_bundle()
+    registry = DirectFeatureBufferRegistry(
+        worker_id="prefill-0",
+        device="cpu",
+        remote_session="prefill-session",
+        register_memory=False,
+        persistent_cache=False,
+    )
+    registry.allocate_for_descriptor(bundle.descriptor())
+    registry.mark_ready(bundle.image_hash)
+
+    allocation = registry.lookup_ready(bundle.image_hash, lease_count=3)
+
+    assert allocation is not None
+    # One allocation owner plus three atomically reserved request references.
+    assert registry.stats()["ref_count"] == 4
+    for _ in range(4):
+        registry.release(bundle.image_hash)
+    assert registry.stats()["allocations"] == 0

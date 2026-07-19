@@ -2,10 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from mooncake_epd.demo.vllm_integration import (
     CONNECTOR_MODULE_PATH,
     REPO_ROOT,
     VLLMDisaggConfig,
+    _BOOTSTRAP_PORT_MAX,
+    _BOOTSTRAP_PORT_MIN,
     _resolve_venv_root,
     generate_configs,
 )
@@ -41,9 +45,19 @@ def test_generate_configs_enables_repo_local_connector(tmp_path):
     assert '"connector_metrics_dir":"' in prefill_script
     assert '"connector_metrics_dir":"' in decode_script
     assert 'export PYTHONPATH=' in prefill_script
+    assert 'unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY' in prefill_script
+    assert 'export NO_PROXY=127.0.0.1,localhost,::1' in prefill_script
+    assert 'export no_proxy=${NO_PROXY}' in prefill_script
     assert 'export MOONCAKE_EPD_CONNECTOR_METRICS_DIR=' in prefill_script
     assert 'export MOONCAKE_EPD_CONNECTOR_METRICS_DIR=' in decode_script
     assert 'export MOONCAKE_EPD_CONNECTOR_METRICS_DIR=' in proxy_script
+    assert 'export MC_TCP_WRITE_COMPLETION_ACK=1' in prefill_script
+    assert 'export MC_TCP_WRITE_COMPLETION_ACK=1' in decode_script
+    assert 'export MC_TCP_ENABLE_CONNECTION_POOL=0' in prefill_script
+    assert 'export MC_TCP_ENABLE_CONNECTION_POOL=0' in decode_script
+    assert 'export VLLM_CACHE_ROOT=' in prefill_script
+    assert 'export TORCHINDUCTOR_CACHE_DIR=${VLLM_CACHE_ROOT}/torch_compile_cache' in prefill_script
+    assert 'export TRITON_CACHE_DIR=${VLLM_CACHE_ROOT}/triton' in prefill_script
     assert 'export VLLM_MOONCAKE_BOOTSTRAP_PORT=' in prefill_script
     assert 'export VLLM_MOONCAKE_BOOTSTRAP_PORT=' in decode_script
     assert 'export VLLM_MOONCAKE_BOOTSTRAP_PORT=' not in proxy_script
@@ -54,10 +68,111 @@ def test_generate_configs_enables_repo_local_connector(tmp_path):
     assert '--connector-metrics-dir ' in proxy_script
     assert '--enable-agent-state-clone' in proxy_script
     assert '--prefill-dispatch-mode render_generate' in proxy_script
+    assert "--no-prefill-http-keepalive" in proxy_script
     assert '--no-allow-unverified-openai-prompt-only' in proxy_script
+    assert "--enable-rendered-prefill-cache" in proxy_script
+    assert "--rendered-prefill-cache-max-entries 64" in proxy_script
+    assert "--rendered-prefill-cache-max-bytes 268435456" in proxy_script
+    assert "--no-enable-direct-feature-adaptive-lease-prefetch" in proxy_script
+    assert "--direct-feature-adaptive-lease-prefetch-max 2" in proxy_script
     assert "proxy_workflow_registry" in files
     assert "connector_metrics_dir" in files
     assert files["prefill"].endswith("start_prefill.sh")
+
+
+def test_generate_configs_uses_unique_non_ephemeral_bootstrap_ports(tmp_path):
+    config = VLLMDisaggConfig(
+        local_hostname="127.0.0.1",
+        prefill_gpus=(0, 1),
+        decode_gpus=(2, 3),
+    )
+    generate_configs(str(tmp_path), config)
+
+    scripts = [
+        tmp_path / "start_prefill.sh",
+        tmp_path / "start_prefill_1.sh",
+        tmp_path / "start_decode.sh",
+        tmp_path / "start_decode_1.sh",
+    ]
+    ports = [
+        int(
+            script.read_text(encoding="utf-8")
+            .split("export VLLM_MOONCAKE_BOOTSTRAP_PORT=", 1)[1]
+            .splitlines()[0]
+        )
+        for script in scripts
+    ]
+
+    assert len(ports) == len(set(ports))
+    assert all(_BOOTSTRAP_PORT_MIN <= port <= _BOOTSTRAP_PORT_MAX for port in ports)
+
+
+def test_generate_configs_can_enable_adaptive_direct_feature_leases(tmp_path):
+    config = VLLMDisaggConfig(
+        local_hostname="127.0.0.1",
+        direct_feature_adaptive_lease_prefetch=True,
+        direct_feature_adaptive_lease_prefetch_max=2,
+    )
+    generate_configs(str(tmp_path), config)
+    proxy_script = (tmp_path / "start_proxy.sh").read_text(encoding="utf-8")
+
+    assert "--enable-direct-feature-adaptive-lease-prefetch" in proxy_script
+    assert "--direct-feature-adaptive-lease-prefetch-max 2" in proxy_script
+
+
+def test_generate_configs_exports_selected_scheduler_policy(tmp_path):
+    config = VLLMDisaggConfig(
+        local_hostname="127.0.0.1",
+        scheduler_policy="least_loaded",
+    )
+    generate_configs(str(tmp_path), config)
+    proxy_script = (tmp_path / "start_proxy.sh").read_text(encoding="utf-8")
+
+    assert "--scheduler-policy least_loaded" in proxy_script
+
+
+def test_generate_configs_rejects_unknown_scheduler_policy(tmp_path):
+    config = VLLMDisaggConfig(
+        local_hostname="127.0.0.1",
+        scheduler_policy="opaque_magic",
+    )
+
+    with pytest.raises(ValueError, match="unsupported scheduler_policy"):
+        generate_configs(str(tmp_path), config)
+
+
+def test_generate_configs_can_disable_sync_workflow_wal_for_serving_hot_path(tmp_path):
+    config = VLLMDisaggConfig(
+        local_hostname="127.0.0.1",
+        enable_workflow_registry_wal=False,
+    )
+    files = generate_configs(str(tmp_path), config)
+    proxy_script = (tmp_path / "start_proxy.sh").read_text(encoding="utf-8")
+
+    assert "--workflow-registry-wal" not in proxy_script
+    assert files["proxy_workflow_registry"] is None
+
+
+def test_generate_configs_can_pin_vllm_multimodal_hidden_cache_mode(tmp_path):
+    disabled = VLLMDisaggConfig(
+        local_hostname="127.0.0.1",
+        vllm_mm_hidden_cache=False,
+    )
+    generate_configs(str(tmp_path / "disabled"), disabled)
+    disabled_script = (tmp_path / "disabled" / "start_prefill.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "export MOONCAKE_EPD_VLLM_MM_HIDDEN_CACHE=0" in disabled_script
+
+    enabled = VLLMDisaggConfig(
+        local_hostname="127.0.0.1",
+        vllm_mm_hidden_cache=True,
+    )
+    generate_configs(str(tmp_path / "enabled"), enabled)
+    enabled_script = (tmp_path / "enabled" / "start_prefill.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "export MOONCAKE_EPD_VLLM_MM_HIDDEN_CACHE=1" in enabled_script
 
 
 def test_generate_configs_can_pin_vllm_generation_config(tmp_path):
@@ -124,6 +239,19 @@ def test_generate_configs_exports_feature_handle_store_endpoint(tmp_path):
     assert "export MOONCAKE_EPD_FEATURE_HANDLE_REQUIRE_CHECKSUM=1" in prefill_script
 
 
+def test_online_encoder_checksum_flag_is_shared_with_prefill_validation(tmp_path):
+    """A diagnostic checksum must be emitted for both E and P, not just P."""
+
+    config = VLLMDisaggConfig(
+        local_hostname="127.0.0.1",
+        feature_handle_require_checksum=True,
+    )
+    generate_configs(str(tmp_path), config)
+
+    prefill_script = (tmp_path / "start_prefill.sh").read_text(encoding="utf-8")
+    assert "export MOONCAKE_EPD_FEATURE_HANDLE_REQUIRE_CHECKSUM=1" in prefill_script
+
+
 def test_generate_configs_enables_prefill_direct_feature_buffer_routes(tmp_path):
     config = VLLMDisaggConfig(
         local_hostname="127.0.0.1",
@@ -166,6 +294,15 @@ def test_generate_configs_can_enforce_strict_no_fallback(tmp_path):
         assert "export MOONCAKE_EPD_STRICT=1" in script
         assert "export MOONCAKE_EPD_VLLM_FEATURE_HANDLE_STRICT=1" in script
         assert "export MOONCAKE_EPD_ALLOW_TRANSFER_FALLBACK=0" in script
+    for script in (prefill_script, decode_script):
+        assert '"require_kv_transfer_manifest_v2":true' in script
+        assert '"require_kv_transfer_manifest_generation":true' in script
+        assert "export MOONCAKE_EPD_WORKER_GENERATION=" in script
+        assert "export MOONCAKE_EPD_GENERATION_DIR=" in script
+        assert '$(date +%s%N)' in script
+        assert 'mv "$MOONCAKE_EPD_GENERATION_DIR/' in script
+    assert f"--worker-generation-dir {tmp_path / 'worker_generations'}" in proxy_script
+    assert (tmp_path / "worker_generations").is_dir()
     assert "--strict-no-fallback" in proxy_script
 
 
@@ -183,6 +320,60 @@ def test_generate_configs_can_explicitly_allow_verified_prompt_only_mode(tmp_pat
     assert "--allow-unverified-openai-prompt-only" in proxy_script
 
 
+def test_generate_configs_wires_decode_token_envelope_mode(tmp_path):
+    config = VLLMDisaggConfig(
+        local_hostname="127.0.0.1",
+        decode_dispatch_mode="token_ids",
+        allow_decode_token_fallback=False,
+    )
+
+    files = generate_configs(str(tmp_path), config)
+    proxy_script = Path(files["proxy"]).read_text(encoding="utf-8")
+
+    assert "--decode-dispatch-mode token_ids" in proxy_script
+    assert "--no-allow-decode-token-fallback" in proxy_script
+
+
+def test_generate_configs_can_enable_prefill_http_keepalive(tmp_path):
+    config = VLLMDisaggConfig(
+        local_hostname="127.0.0.1",
+        prefill_http_keepalive=True,
+    )
+    generate_configs(str(tmp_path), config)
+    proxy_script = (tmp_path / "start_proxy.sh").read_text(encoding="utf-8")
+
+    assert "--prefill-http-keepalive" in proxy_script
+    assert "--no-prefill-http-keepalive" not in proxy_script
+
+
+def test_generate_configs_exposes_bounded_direct_release_batching(tmp_path):
+    config = VLLMDisaggConfig(
+        local_hostname="127.0.0.1",
+        direct_feature_release_batch_max_jobs=7,
+    )
+    generate_configs(str(tmp_path), config)
+    proxy_script = (tmp_path / "start_proxy.sh").read_text(encoding="utf-8")
+
+    assert "--direct-feature-release-batch-max-jobs 7" in proxy_script
+
+
+def test_generate_configs_can_disable_rendered_prefill_cache_for_ablation(tmp_path):
+    config = VLLMDisaggConfig(
+        local_hostname="127.0.0.1",
+        enable_rendered_prefill_cache=False,
+        rendered_prefill_cache_max_entries=7,
+        rendered_prefill_cache_max_bytes=123456,
+        rendered_prefill_cache_ttl_s=12.5,
+    )
+    generate_configs(str(tmp_path), config)
+    proxy_script = (tmp_path / "start_proxy.sh").read_text(encoding="utf-8")
+
+    assert "--no-enable-rendered-prefill-cache" in proxy_script
+    assert "--rendered-prefill-cache-max-entries 7" in proxy_script
+    assert "--rendered-prefill-cache-max-bytes 123456" in proxy_script
+    assert "--rendered-prefill-cache-ttl-s 12.5" in proxy_script
+
+
 def test_generate_configs_exports_rdma_and_shm_protocols(tmp_path):
     rdma_dir = tmp_path / "rdma"
     rdma_cfg = VLLMDisaggConfig(local_hostname="127.0.0.1", protocol="rdma")
@@ -196,6 +387,7 @@ def test_generate_configs_exports_rdma_and_shm_protocols(tmp_path):
     assert "unset MC_FORCE_TCP" in rdma_prefill
     assert "--mooncake-protocol rdma" in rdma_proxy
     assert '"mooncake_protocol":"rdma"' in rdma_prefill
+    assert "unset MC_TCP_WRITE_COMPLETION_ACK" in rdma_prefill
 
     shm_dir = tmp_path / "shm"
     shm_cfg = VLLMDisaggConfig(local_hostname="127.0.0.1", protocol="shm")
@@ -207,6 +399,7 @@ def test_generate_configs_exports_rdma_and_shm_protocols(tmp_path):
     assert "unset MC_FORCE_TCP" in shm_prefill
     assert "--mooncake-protocol shm" in shm_proxy
     assert '"mooncake_protocol":"shm"' in shm_prefill
+    assert "export MC_TCP_WRITE_COMPLETION_ACK=1" in shm_prefill
 
     split_dir = tmp_path / "rdma-kv-tcp-feature"
     split_cfg = VLLMDisaggConfig(
@@ -218,6 +411,31 @@ def test_generate_configs_exports_rdma_and_shm_protocols(tmp_path):
     split_prefill = (split_dir / "start_prefill.sh").read_text(encoding="utf-8")
     assert "export MOONCAKE_PROTOCOL=rdma" in split_prefill
     assert "export MOONCAKE_EPD_DIRECT_ENGINE_PROTOCOL=tcp" in split_prefill
+    assert "export MC_TCP_WRITE_COMPLETION_ACK=1" in split_prefill
+
+
+def test_generate_configs_can_disable_tcp_write_completion_ack_for_ablation(tmp_path):
+    config = VLLMDisaggConfig(
+        local_hostname="127.0.0.1",
+        protocol="tcp",
+        tcp_write_completion_ack=False,
+    )
+    generate_configs(str(tmp_path), config)
+    prefill_script = (tmp_path / "start_prefill.sh").read_text(encoding="utf-8")
+
+    assert "unset MC_TCP_WRITE_COMPLETION_ACK" in prefill_script
+
+
+def test_generate_configs_requires_explicit_tcp_connection_pool_opt_in(tmp_path):
+    config = VLLMDisaggConfig(
+        local_hostname="127.0.0.1",
+        protocol="tcp",
+        tcp_connection_pool=True,
+    )
+    generate_configs(str(tmp_path), config)
+    prefill_script = (tmp_path / "start_prefill.sh").read_text(encoding="utf-8")
+
+    assert "export MC_TCP_ENABLE_CONNECTION_POOL=1" in prefill_script
 
 
 def test_generate_configs_exports_intranode_nvlink_protocol(tmp_path):
@@ -247,10 +465,27 @@ def test_generate_configs_allows_explicit_nvlink_sender_worker_override(tmp_path
     assert '"num_workers":3' in prefill_script
 
 
+def test_generate_configs_rejects_mixed_nvlink_direct_protocol(tmp_path):
+    cfg = VLLMDisaggConfig(
+        local_hostname="127.0.0.1",
+        protocol="tcp",
+        direct_engine_protocol="nvlink_intra",
+    )
+
+    with pytest.raises(RuntimeError, match="process-scoped"):
+        generate_configs(str(tmp_path), cfg)
+
+
 def test_default_network_sender_workers_remain_four():
     cfg = VLLMDisaggConfig(local_hostname="127.0.0.1", protocol="tcp")
 
     assert cfg.effective_transfer_workers == 4
+
+
+def test_default_nvlink_sender_workers_use_two_submitters():
+    cfg = VLLMDisaggConfig(local_hostname="127.0.0.1", protocol="nvlink_intra")
+
+    assert cfg.effective_transfer_workers == 2
 
 
 def test_generate_configs_supports_multiple_decode_workers(tmp_path):

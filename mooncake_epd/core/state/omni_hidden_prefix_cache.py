@@ -12,6 +12,8 @@ audio prefix is reused while later turns append new content.
 from __future__ import annotations
 
 import dataclasses
+import contextlib
+import contextvars
 import hashlib
 import json
 import os
@@ -22,6 +24,36 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
+
+from .hidden_cache_key import HiddenCacheKeyError, HiddenStateCacheKeyV2
+from .hidden_cache_policy import HiddenCachePolicy
+from .mooncake_hidden_state_store import MooncakeHiddenStateStore
+
+
+_CURRENT_OMNI_HIDDEN_CACHE_KEYS: contextvars.ContextVar[Optional[Tuple[str, ...]]] = (
+    contextvars.ContextVar("mooncake_epd_omni_hidden_cache_keys", default=None)
+)
+
+
+@contextlib.contextmanager
+def use_omni_hidden_cache_keys(keys: Optional[Sequence[object]]):
+    """Expose ingest-time content identities to the wrapped Omni encoder.
+
+    The wrapper otherwise only sees preprocessed tensors.  Passing ids through
+    this narrow context avoids a full CUDA tensor -> CPU SHA-256 operation in
+    the normal exact-cache path.
+    """
+
+    normalized = None if keys is None else tuple(str(key or "") for key in keys)
+    token = _CURRENT_OMNI_HIDDEN_CACHE_KEYS.set(normalized)
+    try:
+        yield
+    finally:
+        _CURRENT_OMNI_HIDDEN_CACHE_KEYS.reset(token)
+
+
+def get_current_omni_hidden_cache_keys() -> Optional[Tuple[str, ...]]:
+    return _CURRENT_OMNI_HIDDEN_CACHE_KEYS.get()
 
 try:  # Transformers is present in production/vLLM envs; keep import soft for tests.
     from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling
@@ -63,6 +95,10 @@ class OmniHiddenPrefixCacheConfig:
     metrics_path: Optional[str] = None
     metrics_flush_interval_s: float = 0.25
     allow_partial_prefix_reuse: bool = False
+    partial_oracle_validated: bool = False
+    # Tensor-byte hashing is a compatibility-only fallback.  Exact production
+    # calls should propagate asset/content ids through ``use_*_cache_keys``.
+    allow_tensor_hash_fallback: bool = False
 
     @classmethod
     def from_env(cls) -> "OmniHiddenPrefixCacheConfig":
@@ -86,6 +122,14 @@ class OmniHiddenPrefixCacheConfig:
                 "MOONCAKE_EPD_OMNI_HIDDEN_PREFIX_CACHE_ALLOW_PARTIAL",
                 False,
             ),
+            partial_oracle_validated=_env_bool(
+                "MOONCAKE_EPD_OMNI_HIDDEN_PREFIX_CACHE_PARTIAL_ORACLE_VALIDATED",
+                False,
+            ),
+            allow_tensor_hash_fallback=_env_bool(
+                "MOONCAKE_EPD_OMNI_HIDDEN_PREFIX_CACHE_ALLOW_TENSOR_HASH_FALLBACK",
+                False,
+            ),
         )
 
 
@@ -104,8 +148,16 @@ class _CacheEntry:
 class OmniHiddenPrefixCache:
     """Thread-safe LRU cache for Omni image/audio hidden-state prefixes."""
 
-    def __init__(self, config: Optional[OmniHiddenPrefixCacheConfig] = None) -> None:
+    def __init__(
+        self,
+        config: Optional[OmniHiddenPrefixCacheConfig] = None,
+        *,
+        l2_store: Optional[MooncakeHiddenStateStore] = None,
+        l2_policy: Optional[HiddenCachePolicy] = None,
+    ) -> None:
         self.config = config or OmniHiddenPrefixCacheConfig.from_env()
+        self.l2_store = l2_store
+        self.l2_policy = l2_policy or HiddenCachePolicy.from_env()
         self._lock = threading.RLock()
         self._entries: "OrderedDict[str, _CacheEntry]" = OrderedDict()
         self._inflight: Dict[str, threading.Event] = {}
@@ -132,6 +184,14 @@ class OmniHiddenPrefixCache:
             "encoder_compute_ms_total": 0.0,
             "cache_load_ms_total": 0.0,
             "hash_ms_total": 0.0,
+            "stable_key_lookups": 0,
+            "tensor_key_lookups": 0,
+            "skipped_unkeyed_calls": 0,
+            "l2_lookups": 0,
+            "l2_hits": 0,
+            "l2_misses": 0,
+            "l2_stores": 0,
+            "l2_errors": 0,
             "coalesced_waits": 0,
             "coalesced_hits": 0,
             "errors": 0,
@@ -148,11 +208,28 @@ class OmniHiddenPrefixCache:
             out["max_entries"] = int(self.config.max_entries)
             out["max_bytes"] = int(self.config.max_bytes)
             out["store_on_gpu"] = bool(self.config.store_on_gpu)
+            out["allow_tensor_hash_fallback"] = bool(self.config.allow_tensor_hash_fallback)
+            out["partial_enabled"] = bool(
+                self.config.allow_partial_prefix_reuse
+                and self.config.partial_oracle_validated
+            )
+            out["l2_enabled"] = bool(
+                self.l2_store is not None and self.l2_policy.has_l2_identity
+            )
             total = int(out.get("lookups", 0) or 0)
             out["hit_rate"] = float(out.get("hits", 0) or 0) / total if total else 0.0
             batches = int(out.get("image_batches", 0) or 0) + int(out.get("audio_batches", 0) or 0)
             out["batch_full_hit_rate"] = float(out.get("full_hit_batches", 0) or 0) / batches if batches else 0.0
             return out
+
+    @property
+    def _partial_enabled(self) -> bool:
+        """Require both operator intent and a model-specific oracle result."""
+
+        return bool(
+            self.config.allow_partial_prefix_reuse
+            and self.config.partial_oracle_validated
+        )
 
     def get_or_compute_image(
         self,
@@ -167,13 +244,15 @@ class OmniHiddenPrefixCache:
             return original_fn(pixel_values, image_grid_thw=image_grid_thw, **kwargs)
         if kwargs.get("return_dict") is False:
             return original_fn(pixel_values, image_grid_thw=image_grid_thw, **kwargs)
-        if not self.config.allow_partial_prefix_reuse:
+        stable_keys = get_current_omni_hidden_cache_keys()
+        if not self._partial_enabled:
             return self._get_or_compute_image_exact_batch(
                 model=model,
                 original_fn=original_fn,
                 pixel_values=pixel_values,
                 image_grid_thw=image_grid_thw,
                 kwargs=kwargs,
+                stable_keys=stable_keys,
             )
         try:
             grid = image_grid_thw
@@ -186,18 +265,35 @@ class OmniHiddenPrefixCache:
             if item_count <= 0 or sum(input_sizes) != int(pixel_values.shape[0]):
                 return original_fn(pixel_values, image_grid_thw=image_grid_thw, **kwargs)
             chunks = list(torch.split(pixel_values, input_sizes, dim=0))
-            started_hash = time.perf_counter()
-            keys = [
-                self._tensor_key(
-                    modality="image",
-                    tensor=chunks[i],
-                    aux=grid[i],
-                    namespace=self._model_namespace(model),
-                    output_tokens=output_sizes[i],
-                )
-                for i in range(item_count)
-            ]
-            self._add_metric("hash_ms_total", (time.perf_counter() - started_hash) * 1000.0)
+            if self._valid_stable_keys(stable_keys, item_count):
+                keys = [
+                    self._stable_item_key(
+                        modality="image",
+                        stable_key=str(stable_keys[i]),
+                        aux=grid[i],
+                        namespace=self._model_namespace(model),
+                        output_tokens=output_sizes[i],
+                    )
+                    for i in range(item_count)
+                ]
+                self._add_metric("stable_key_lookups", item_count)
+            elif self.config.allow_tensor_hash_fallback:
+                started_hash = time.perf_counter()
+                keys = [
+                    self._tensor_key(
+                        modality="image",
+                        tensor=chunks[i],
+                        aux=grid[i],
+                        namespace=self._model_namespace(model),
+                        output_tokens=output_sizes[i],
+                    )
+                    for i in range(item_count)
+                ]
+                self._add_metric("hash_ms_total", (time.perf_counter() - started_hash) * 1000.0)
+                self._add_metric("tensor_key_lookups", item_count)
+            else:
+                self._add_metric("skipped_unkeyed_calls", 1)
+                return original_fn(pixel_values, image_grid_thw=image_grid_thw, **kwargs)
             prefix_hit, cached = self._lookup_prefix(keys, pixel_values.device, None)
             miss_count = item_count - prefix_hit
             with self._lock:
@@ -253,7 +349,8 @@ class OmniHiddenPrefixCache:
                 audio_feature_lengths=audio_feature_lengths,
                 **kwargs,
             )
-        if not self.config.allow_partial_prefix_reuse:
+        stable_keys = get_current_omni_hidden_cache_keys()
+        if not self._partial_enabled:
             return self._get_or_compute_audio_exact_batch(
                 model=model,
                 original_fn=original_fn,
@@ -261,6 +358,7 @@ class OmniHiddenPrefixCache:
                 feature_attention_mask=feature_attention_mask,
                 audio_feature_lengths=audio_feature_lengths,
                 kwargs=kwargs,
+                stable_keys=stable_keys,
             )
         try:
             item_count = int(input_features.shape[0])
@@ -277,18 +375,44 @@ class OmniHiddenPrefixCache:
                 feature_lens = audio_feature_lengths.to(device=input_features.device)  # type: ignore[union-attr]
             _, output_lens = model.audio_tower._get_feat_extract_output_lengths(feature_lens)
             output_sizes = [int(x) for x in output_lens.detach().cpu().tolist()]
-            started_hash = time.perf_counter()
-            keys = [
-                self._tensor_key(
-                    modality="audio",
-                    tensor=input_features[i],
-                    aux=(feature_attention_mask[i] if feature_attention_mask is not None else feature_lens[i]),
-                    namespace=self._model_namespace(model),
-                    output_tokens=output_sizes[i],
+            if self._valid_stable_keys(stable_keys, item_count):
+                keys = [
+                    self._stable_item_key(
+                        modality="audio",
+                        stable_key=str(stable_keys[i]),
+                        aux=(
+                            feature_attention_mask[i]
+                            if feature_attention_mask is not None
+                            else feature_lens[i]
+                        ),
+                        namespace=self._model_namespace(model),
+                        output_tokens=output_sizes[i],
+                    )
+                    for i in range(item_count)
+                ]
+                self._add_metric("stable_key_lookups", item_count)
+            elif self.config.allow_tensor_hash_fallback:
+                started_hash = time.perf_counter()
+                keys = [
+                    self._tensor_key(
+                        modality="audio",
+                        tensor=input_features[i],
+                        aux=(feature_attention_mask[i] if feature_attention_mask is not None else feature_lens[i]),
+                        namespace=self._model_namespace(model),
+                        output_tokens=output_sizes[i],
+                    )
+                    for i in range(item_count)
+                ]
+                self._add_metric("hash_ms_total", (time.perf_counter() - started_hash) * 1000.0)
+                self._add_metric("tensor_key_lookups", item_count)
+            else:
+                self._add_metric("skipped_unkeyed_calls", 1)
+                return original_fn(
+                    input_features,
+                    feature_attention_mask=feature_attention_mask,
+                    audio_feature_lengths=audio_feature_lengths,
+                    **kwargs,
                 )
-                for i in range(item_count)
-            ]
-            self._add_metric("hash_ms_total", (time.perf_counter() - started_hash) * 1000.0)
             prefix_hit, cached = self._lookup_prefix(keys, input_features.device, None)
             miss_count = item_count - prefix_hit
             with self._lock:
@@ -350,21 +474,45 @@ class OmniHiddenPrefixCache:
         pixel_values: torch.Tensor,
         image_grid_thw: torch.Tensor,
         kwargs: Dict[str, Any],
+        stable_keys: Optional[Sequence[str]],
     ) -> Any:
         try:
-            started_hash = time.perf_counter()
-            key = self._tensor_key(
-                modality="image-batch",
-                tensor=pixel_values,
-                aux=image_grid_thw,
-                namespace=self._model_namespace(model),
-                output_tokens=-1,
-            )
-            self._add_metric("hash_ms_total", (time.perf_counter() - started_hash) * 1000.0)
+            if self._valid_stable_keys(stable_keys, int(image_grid_thw.shape[0])):
+                key = self._stable_batch_key(
+                    modality="image-batch",
+                    stable_keys=stable_keys or (),
+                    aux=image_grid_thw,
+                    namespace=self._model_namespace(model),
+                    output_tokens=-1,
+                )
+                self._add_metric("stable_key_lookups", 1)
+            elif self.config.allow_tensor_hash_fallback:
+                started_hash = time.perf_counter()
+                key = self._tensor_key(
+                    modality="image-batch",
+                    tensor=pixel_values,
+                    aux=image_grid_thw,
+                    namespace=self._model_namespace(model),
+                    output_tokens=-1,
+                )
+                self._add_metric("hash_ms_total", (time.perf_counter() - started_hash) * 1000.0)
+                self._add_metric("tensor_key_lookups", 1)
+            else:
+                self._add_metric("skipped_unkeyed_calls", 1)
+                return original_fn(pixel_values, image_grid_thw=image_grid_thw, **kwargs)
             with self._lock:
                 self._metrics["image_batches"] += 1
                 self._metrics["lookups"] += 1
+            l2_key = self._l2_image_batch_key(
+                model=model,
+                stable_keys=stable_keys,
+                image_grid_thw=image_grid_thw,
+            )
             cached = self._lookup(key, target_device=pixel_values.device, target_dtype=None)
+            if cached is None:
+                cached = self._lookup_l2(l2_key, target_device=pixel_values.device)
+                if cached is not None:
+                    self._store(key, cached)
             if cached is not None:
                 with self._lock:
                     self._metrics["full_hit_batches"] += 1
@@ -401,6 +549,7 @@ class OmniHiddenPrefixCache:
                 if hidden is None:
                     return result
                 self._store(key, hidden)
+                self._store_l2(l2_key, hidden)
                 with self._lock:
                     self._metrics["image_encoder_calls"] += 1
                     self._metrics["encoder_compute_ms_total"] += float(compute_ms)
@@ -423,6 +572,7 @@ class OmniHiddenPrefixCache:
         feature_attention_mask: Optional[torch.Tensor],
         audio_feature_lengths: Optional[torch.Tensor],
         kwargs: Dict[str, Any],
+        stable_keys: Optional[Sequence[str]],
     ) -> Any:
         try:
             aux = feature_attention_mask if feature_attention_mask is not None else audio_feature_lengths
@@ -433,15 +583,34 @@ class OmniHiddenPrefixCache:
                     audio_feature_lengths=audio_feature_lengths,
                     **kwargs,
                 )
-            started_hash = time.perf_counter()
-            key = self._tensor_key(
-                modality="audio-batch",
-                tensor=input_features,
-                aux=aux,
-                namespace=self._model_namespace(model),
-                output_tokens=-1,
-            )
-            self._add_metric("hash_ms_total", (time.perf_counter() - started_hash) * 1000.0)
+            if self._valid_stable_keys(stable_keys, int(input_features.shape[0])):
+                key = self._stable_batch_key(
+                    modality="audio-batch",
+                    stable_keys=stable_keys or (),
+                    aux=aux,
+                    namespace=self._model_namespace(model),
+                    output_tokens=-1,
+                )
+                self._add_metric("stable_key_lookups", 1)
+            elif self.config.allow_tensor_hash_fallback:
+                started_hash = time.perf_counter()
+                key = self._tensor_key(
+                    modality="audio-batch",
+                    tensor=input_features,
+                    aux=aux,
+                    namespace=self._model_namespace(model),
+                    output_tokens=-1,
+                )
+                self._add_metric("hash_ms_total", (time.perf_counter() - started_hash) * 1000.0)
+                self._add_metric("tensor_key_lookups", 1)
+            else:
+                self._add_metric("skipped_unkeyed_calls", 1)
+                return original_fn(
+                    input_features,
+                    feature_attention_mask=feature_attention_mask,
+                    audio_feature_lengths=audio_feature_lengths,
+                    **kwargs,
+                )
             with self._lock:
                 self._metrics["audio_batches"] += 1
                 self._metrics["lookups"] += 1
@@ -547,7 +716,13 @@ class OmniHiddenPrefixCache:
             entry.last_access_at = time.monotonic()
             self._metrics["hits"] += 1
             tensor = entry.tensor
-        out = tensor.to(device=target_device, dtype=target_dtype, non_blocking=True) if target_dtype else tensor.to(target_device, non_blocking=True)
+        out = (
+            tensor.to(device=target_device, dtype=target_dtype, non_blocking=True)
+            if target_dtype
+            else tensor.to(target_device, non_blocking=True)
+        )
+        if out.data_ptr() == tensor.data_ptr():
+            out = out.clone()
         with self._lock:
             self._metrics["cache_load_ms_total"] += (time.perf_counter() - t0) * 1000.0
         return out
@@ -620,6 +795,150 @@ class OmniHiddenPrefixCache:
             event = self._inflight.pop(key, None)
             if event is not None:
                 event.set()
+
+    @staticmethod
+    def _valid_stable_keys(keys: Optional[Sequence[str]], count: int) -> bool:
+        return bool(keys and len(keys) == int(count) and all(str(key) for key in keys))
+
+    def _stable_batch_key(
+        self,
+        *,
+        modality: str,
+        stable_keys: Sequence[str],
+        aux: torch.Tensor,
+        namespace: str,
+        output_tokens: int,
+    ) -> str:
+        h = hashlib.sha256()
+        h.update(b"mooncake-epd-omni-hidden-stable-batch-v2\0")
+        h.update(str(self.config.namespace).encode("utf-8", errors="replace"))
+        h.update(b"\0model\0")
+        h.update(str(namespace).encode("utf-8", errors="replace"))
+        h.update(b"\0modality\0")
+        h.update(str(modality).encode("ascii", errors="replace"))
+        h.update(b"\0output\0")
+        h.update(str(int(output_tokens)).encode("ascii"))
+        h.update(b"\0assets\0")
+        h.update(json.dumps(list(stable_keys), separators=(",", ":"), ensure_ascii=True).encode())
+        h.update(b"\0layout\0")
+        # Layout metadata is bounded (grid/lengths), unlike the encoder input.
+        layout = aux.detach().to(device="cpu").reshape(-1).tolist()
+        h.update(json.dumps([int(value) for value in layout], separators=(",", ":")).encode())
+        return h.hexdigest()
+
+    def _stable_item_key(
+        self,
+        *,
+        modality: str,
+        stable_key: str,
+        aux: torch.Tensor,
+        namespace: str,
+        output_tokens: int,
+    ) -> str:
+        return self._stable_batch_key(
+            modality=modality,
+            stable_keys=[str(stable_key)],
+            aux=aux,
+            namespace=namespace,
+            output_tokens=output_tokens,
+        )
+
+    def _l2_image_batch_key(
+        self,
+        *,
+        model: Any,
+        stable_keys: Optional[Sequence[str]],
+        image_grid_thw: torch.Tensor,
+    ) -> Optional[HiddenStateCacheKeyV2]:
+        """Construct an Omni exact-batch L2 key without reading image bytes."""
+
+        if (
+            self.l2_store is None
+            or not self.l2_policy.has_l2_identity
+            or not self._valid_stable_keys(stable_keys, int(image_grid_thw.shape[0]))
+        ):
+            return None
+        try:
+            if int(image_grid_thw.numel()) <= 0 or int(image_grid_thw.numel()) > 1024:
+                return None
+            visual = getattr(model, "visual", None)
+            dtype = str(getattr(visual, "dtype", "") or "")
+            if not dtype or dtype == "unknown":
+                return None
+            asset_hash = hashlib.sha256(
+                json.dumps(list(stable_keys or ()), separators=(",", ":"), ensure_ascii=True).encode()
+            ).hexdigest()
+            grid = tuple(
+                int(value)
+                for value in image_grid_thw.detach().to(device="cpu").reshape(-1).tolist()
+            )
+            return HiddenStateCacheKeyV2.from_vllm_stable_identity(
+                stable_asset_hash=f"sha256:{asset_hash}",
+                modality="image",
+                model_id=str(self.l2_policy.model_id),
+                model_revision=str(self.l2_policy.model_revision),
+                processor_revision=str(self.l2_policy.processor_revision),
+                dtype=dtype,
+                output_schema=str(self.l2_policy.output_schema),
+                grid_thw=grid,
+                relevant_kwargs={
+                    "namespace": self._model_namespace(model),
+                    "batch_asset_count": len(stable_keys or ()),
+                    "spatial_merge_size": int(
+                        getattr(visual, "spatial_merge_size", 1) or 1
+                    ),
+                },
+            )
+        except (HiddenCacheKeyError, TypeError, ValueError, RuntimeError) as exc:
+            with self._lock:
+                self._metrics["l2_errors"] += 1
+                self._metrics["last_error"] = f"{type(exc).__name__}: {exc}"[:500]
+            return None
+
+    def _lookup_l2(
+        self,
+        key: Optional[HiddenStateCacheKeyV2],
+        *,
+        target_device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        if key is None or self.l2_store is None:
+            return None
+        with self._lock:
+            self._metrics["l2_lookups"] += 1
+        try:
+            tensor = self.l2_store.get(key, target_device=target_device)
+        except Exception as exc:
+            with self._lock:
+                self._metrics["l2_errors"] += 1
+                self._metrics["last_error"] = f"{type(exc).__name__}: {exc}"[:500]
+            return None
+        with self._lock:
+            if tensor is None:
+                self._metrics["l2_misses"] += 1
+            else:
+                self._metrics["l2_hits"] += 1
+        return tensor
+
+    def _store_l2(
+        self,
+        key: Optional[HiddenStateCacheKeyV2],
+        tensor: torch.Tensor,
+    ) -> None:
+        if key is None or self.l2_store is None:
+            return
+        try:
+            self.l2_store.put(
+                key,
+                tensor,
+                lease_seconds=float(self.l2_policy.lease_seconds),
+            )
+        except Exception as exc:
+            with self._lock:
+                self._metrics["l2_errors"] += 1
+                self._metrics["last_error"] = f"{type(exc).__name__}: {exc}"[:500]
+            return
+        with self._lock:
+            self._metrics["l2_stores"] += 1
 
     def _tensor_key(
         self,
@@ -768,5 +1087,7 @@ def install_qwen2_5_omni_hidden_prefix_cache(
 __all__ = [
     "OmniHiddenPrefixCache",
     "OmniHiddenPrefixCacheConfig",
+    "get_current_omni_hidden_cache_keys",
     "install_qwen2_5_omni_hidden_prefix_cache",
+    "use_omni_hidden_cache_keys",
 ]

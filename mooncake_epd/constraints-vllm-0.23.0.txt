@@ -1,0 +1,2 @@
+# The explicit adapter probes this exact minor line before patching vLLM.
+vllm==0.23.0

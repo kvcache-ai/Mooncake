@@ -1,0 +1,429 @@
+{
+  "schema_version": 1,
+  "campaign_id": "qwen3vl-epd-production-evidence-template",
+  "instructions": {
+    "model": "Set every real scenario to the same immutable Qwen3-VL model path and revision.",
+    "execution": "Replace each blocked_reason with an artifact summary path or a shell-free runner command, then invoke run_epd_benchmark_campaign.py --execute-commands.",
+    "claim_boundary": "Only comparisons with three independent runs, equal resources, exact outputs and a positive bootstrap lower bound may be described as a performance gain."
+  },
+  "scenarios": [
+    {
+      "id": "single-short-c1-r1",
+      "kind": "single_baseline",
+      "required": true,
+      "gate": "none",
+      "blocked_reason": "supply real single-node Qwen3-VL short-context artifact"
+    },
+    {
+      "id": "single-medium-c1-r1",
+      "kind": "single_baseline",
+      "required": true,
+      "gate": "none",
+      "blocked_reason": "supply real single-node Qwen3-VL medium-context artifact"
+    },
+    {
+      "id": "single-long-c4-r1",
+      "kind": "single_baseline",
+      "required": true,
+      "gate": "none",
+      "blocked_reason": "supply real single-node Qwen3-VL long-context concurrency-four artifact"
+    },
+    {
+      "id": "pd-tcp-short-c1-r1",
+      "kind": "pd_transport",
+      "required": true,
+      "gate": "serving",
+      "transport": "tcp",
+      "expected_routing_path": "PD",
+      "blocked_reason": "supply strict real TCP P-to-D short-context artifact"
+    },
+    {
+      "id": "pd-tcp-short-c1-r2",
+      "kind": "pd_transport",
+      "required": true,
+      "gate": "serving",
+      "transport": "tcp",
+      "expected_routing_path": "PD",
+      "blocked_reason": "independent repetition"
+    },
+    {
+      "id": "pd-tcp-short-c1-r3",
+      "kind": "pd_transport",
+      "required": true,
+      "gate": "serving",
+      "transport": "tcp",
+      "expected_routing_path": "PD",
+      "blocked_reason": "independent repetition"
+    },
+    {
+      "id": "pd-nvlink-short-c1-r1",
+      "kind": "pd_transport",
+      "required": true,
+      "gate": "serving",
+      "transport": "nvlink_intra",
+      "required_nvlink_pairs": [[1, 3]],
+      "expected_routing_path": "PD",
+      "blocked_reason": "supply strict real NVLink P-to-D short-context artifact"
+    },
+    {
+      "id": "pd-nvlink-short-c1-r2",
+      "kind": "pd_transport",
+      "required": true,
+      "gate": "serving",
+      "transport": "nvlink_intra",
+      "required_nvlink_pairs": [[1, 3]],
+      "expected_routing_path": "PD",
+      "blocked_reason": "independent repetition"
+    },
+    {
+      "id": "pd-nvlink-short-c1-r3",
+      "kind": "pd_transport",
+      "required": true,
+      "gate": "serving",
+      "transport": "nvlink_intra",
+      "required_nvlink_pairs": [[1, 3]],
+      "expected_routing_path": "PD",
+      "blocked_reason": "independent repetition"
+    },
+    {
+      "id": "pd-tcp-throughput-c4-r1",
+      "kind": "pd_transport",
+      "required": true,
+      "gate": "serving",
+      "transport": "tcp",
+      "expected_routing_path": "PD",
+      "blocked_reason": "supply strict TCP concurrency-four long-generation artifact"
+    },
+    {
+      "id": "pd-tcp-throughput-c4-r2",
+      "kind": "pd_transport",
+      "required": true,
+      "gate": "serving",
+      "transport": "tcp",
+      "expected_routing_path": "PD",
+      "blocked_reason": "independent repetition"
+    },
+    {
+      "id": "pd-tcp-throughput-c4-r3",
+      "kind": "pd_transport",
+      "required": true,
+      "gate": "serving",
+      "transport": "tcp",
+      "expected_routing_path": "PD",
+      "blocked_reason": "independent repetition"
+    },
+    {
+      "id": "pd-nvlink-throughput-c4-r1",
+      "kind": "pd_transport",
+      "required": true,
+      "gate": "serving",
+      "transport": "nvlink_intra",
+      "required_nvlink_pairs": [[1, 3]],
+      "expected_routing_path": "PD",
+      "blocked_reason": "supply strict NVLink concurrency-four long-generation artifact"
+    },
+    {
+      "id": "pd-nvlink-throughput-c4-r2",
+      "kind": "pd_transport",
+      "required": true,
+      "gate": "serving",
+      "transport": "nvlink_intra",
+      "required_nvlink_pairs": [[1, 3]],
+      "expected_routing_path": "PD",
+      "blocked_reason": "independent repetition"
+    },
+    {
+      "id": "pd-nvlink-throughput-c4-r3",
+      "kind": "pd_transport",
+      "required": true,
+      "gate": "serving",
+      "transport": "nvlink_intra",
+      "required_nvlink_pairs": [[1, 3]],
+      "expected_routing_path": "PD",
+      "blocked_reason": "independent repetition"
+    },
+    {
+      "id": "full-epd-multimodal-cold-r1",
+      "kind": "full_epd",
+      "required": true,
+      "gate": "serving",
+      "transport": "tcp",
+      "expected_routing_path": "EPD",
+      "cache_expectations": {
+        "direct_feature_cache_hits": {"max": 0},
+        "direct_feature_cache_hit_requests": {"max": 0},
+        "direct_buffer_persistent_cache": {"equals": false},
+        "hidden_cache_hits": {"max": 0}
+      },
+      "blocked_reason": "run real image Encoder-to-Prefill-to-Decode cold-cache artifact"
+    },
+    {
+      "id": "full-epd-multimodal-hot-r1",
+      "kind": "full_epd",
+      "required": true,
+      "gate": "serving",
+      "transport": "tcp",
+      "expected_routing_path": "EPD",
+      "cache_expectations": {
+        "direct_feature_cache_hits": {"min": 1},
+        "direct_feature_cache_hit_requests": {"min": 1},
+        "direct_buffer_persistent_cache": {"equals": true}
+      },
+      "blocked_reason": "run real image EPD exact-cache hot-path artifact"
+    },
+    {
+      "id": "full-epd-multimodal-c4-1p1d-r1",
+      "kind": "full_epd",
+      "required": true,
+      "gate": "serving",
+      "transport": "tcp",
+      "expected_routing_path": "EPD",
+      "require_all_stage_workers_dispatched": true,
+      "min_dispatch_entropy": 0.9,
+      "blocked_reason": "run same-image Qwen3-VL C4 throughput reference with one Prefill and one Decode worker; report any direct singleflight/cache coalescing"
+    },
+    {
+      "id": "full-epd-multimodal-c4-1p1d-r2",
+      "kind": "full_epd",
+      "required": true,
+      "gate": "serving",
+      "transport": "tcp",
+      "expected_routing_path": "EPD",
+      "require_all_stage_workers_dispatched": true,
+      "min_dispatch_entropy": 0.9,
+      "blocked_reason": "independent 1P1D C4 restart repetition"
+    },
+    {
+      "id": "full-epd-multimodal-c4-1p1d-r3",
+      "kind": "full_epd",
+      "required": true,
+      "gate": "serving",
+      "transport": "tcp",
+      "expected_routing_path": "EPD",
+      "require_all_stage_workers_dispatched": true,
+      "min_dispatch_entropy": 0.9,
+      "blocked_reason": "independent 1P1D C4 restart repetition"
+    },
+    {
+      "id": "full-epd-multimodal-c4-2p2d-r1",
+      "kind": "full_epd",
+      "required": true,
+      "gate": "serving",
+      "transport": "tcp",
+      "expected_routing_path": "EPD",
+      "require_all_stage_workers_dispatched": true,
+      "min_dispatch_entropy": 0.9,
+      "blocked_reason": "run same-image Qwen3-VL C4 capacity run with two Prefill and two Decode workers; report any direct singleflight/cache coalescing"
+    },
+    {
+      "id": "full-epd-multimodal-c4-2p2d-r2",
+      "kind": "full_epd",
+      "required": true,
+      "gate": "serving",
+      "transport": "tcp",
+      "expected_routing_path": "EPD",
+      "require_all_stage_workers_dispatched": true,
+      "min_dispatch_entropy": 0.9,
+      "blocked_reason": "independent 2P2D C4 restart repetition"
+    },
+    {
+      "id": "full-epd-multimodal-c4-2p2d-r3",
+      "kind": "full_epd",
+      "required": true,
+      "gate": "serving",
+      "transport": "tcp",
+      "expected_routing_path": "EPD",
+      "require_all_stage_workers_dispatched": true,
+      "min_dispatch_entropy": 0.9,
+      "blocked_reason": "independent 2P2D C4 restart repetition"
+    },
+    {
+      "id": "agent-clone-gpu-pages64-branches8-r1",
+      "kind": "agent_clone",
+      "required": true,
+      "gate": "agent_clone",
+      "require_raw_artifacts": false,
+      "blocked_reason": "run GPU Agent clone deep-copy versus zero-copy plus CoW benchmark"
+    },
+    {
+      "id": "agent-clone-gpu-pages64-branches8-r2",
+      "kind": "agent_clone",
+      "required": true,
+      "gate": "agent_clone",
+      "require_raw_artifacts": false,
+      "blocked_reason": "independent repetition"
+    },
+    {
+      "id": "agent-clone-gpu-pages64-branches8-r3",
+      "kind": "agent_clone",
+      "required": true,
+      "gate": "agent_clone",
+      "require_raw_artifacts": false,
+      "blocked_reason": "independent repetition"
+    },
+    {
+      "id": "hidden-cache-exact-hit",
+      "kind": "hidden_cache",
+      "required": true,
+      "gate": "none",
+      "cache_expectations": {
+        "hidden_cache_hits": {"min": 1}
+      },
+      "blocked_reason": "prove exact image/model/processor key reuse with a real cache-hit artifact"
+    },
+    {
+      "id": "hidden-cache-negative-prefix",
+      "kind": "hidden_cache",
+      "required": true,
+      "gate": "none",
+      "cache_expectations": {
+        "hidden_cache_hits": {"max": 0}
+      },
+      "blocked_reason": "prove exact reuse only and reject invalid partial-prefix reuse"
+    },
+    {
+      "id": "hidden-cache-asset-or-model-mismatch",
+      "kind": "hidden_cache",
+      "required": true,
+      "gate": "none",
+      "cache_expectations": {
+        "hidden_cache_hits": {"max": 0}
+      },
+      "blocked_reason": "prove asset/model/processor mismatch cannot reuse cached hidden states"
+    },
+    {
+      "id": "agent-pd-round-robin",
+      "kind": "scheduler",
+      "required": true,
+      "gate": "none",
+      "blocked_reason": "run fixed Agent-PD trace with scheduler_policy=round_robin and min-route-correct-rate=0"
+    },
+    {
+      "id": "agent-pd-least-loaded",
+      "kind": "scheduler",
+      "required": true,
+      "gate": "none",
+      "blocked_reason": "run fixed Agent-PD trace with scheduler_policy=least_loaded and min-route-correct-rate=0"
+    },
+    {
+      "id": "agent-pd-static-type-route",
+      "kind": "scheduler",
+      "required": true,
+      "gate": "none",
+      "blocked_reason": "run fixed Agent-PD trace with scheduler_policy=static_type_route and min-route-correct-rate=0"
+    },
+    {
+      "id": "agent-pd-agent-aware",
+      "kind": "scheduler",
+      "required": true,
+      "gate": "none",
+      "blocked_reason": "run fixed Agent-PD trace with scheduler_policy=agent_aware and default route-correctness gate"
+    },
+    {
+      "id": "epd-restart-fault-matrix",
+      "kind": "fault",
+      "required": true,
+      "gate": "none",
+      "blocked_reason": "test worker restart, stale manifest, release/GC and no-fallback behavior"
+    },
+    {
+      "id": "omni-worker-stage-pipeline",
+      "kind": "omni_pipeline",
+      "required": true,
+      "gate": "none",
+      "blocked_reason": "run semantic AR-to-Generation-to-Diffusion worker pipeline with true local transport evidence"
+    },
+    {
+      "id": "cross-node-tcp",
+      "kind": "cross_node",
+      "required": true,
+      "gate": "serving",
+      "transport": "tcp",
+      "blocked_reason": "requires a reachable second host; never replace with loopback"
+    },
+    {
+      "id": "cross-node-rdma",
+      "kind": "cross_node",
+      "required": true,
+      "gate": "serving",
+      "transport": "rdma",
+      "blocked_reason": "requires active RDMA hardware and verifiable NIC/GID/remote-host evidence"
+    }
+  ],
+  "comparisons": [
+    {
+      "id": "full-epd-cache-hot-vs-cold",
+      "kind": "cache_ab",
+      "baseline": ["full-epd-multimodal-cold-r1"],
+      "candidate": ["full-epd-multimodal-hot-r1"],
+      "baseline_transport": "tcp",
+      "candidate_transport": "tcp",
+      "quality": "status_only",
+      "primary_metric": "avg_ttft_ms",
+      "min_samples": 3
+    },
+    {
+      "id": "pd-short-nvlink-vs-tcp",
+      "kind": "transport_ab",
+      "baseline": ["pd-tcp-short-c1-r1", "pd-tcp-short-c1-r2", "pd-tcp-short-c1-r3"],
+      "candidate": ["pd-nvlink-short-c1-r1", "pd-nvlink-short-c1-r2", "pd-nvlink-short-c1-r3"],
+      "baseline_transport": "tcp",
+      "candidate_transport": "nvlink_intra",
+      "quality": "exact",
+      "primary_metric": "avg_ttft_ms",
+      "min_samples": 3
+    },
+    {
+      "id": "pd-throughput-nvlink-vs-tcp",
+      "kind": "transport_ab",
+      "baseline": ["pd-tcp-throughput-c4-r1", "pd-tcp-throughput-c4-r2", "pd-tcp-throughput-c4-r3"],
+      "candidate": ["pd-nvlink-throughput-c4-r1", "pd-nvlink-throughput-c4-r2", "pd-nvlink-throughput-c4-r3"],
+      "baseline_transport": "tcp",
+      "candidate_transport": "nvlink_intra",
+      "quality": "exact",
+      "primary_metric": "output_token_goodput_tps",
+      "min_samples": 3
+    },
+    {
+      "id": "full-epd-c4-2p2d-scale-out-capacity",
+      "kind": "scale_out_capacity",
+      "baseline": ["full-epd-multimodal-c4-1p1d-r1", "full-epd-multimodal-c4-1p1d-r2", "full-epd-multimodal-c4-1p1d-r3"],
+      "candidate": ["full-epd-multimodal-c4-2p2d-r1", "full-epd-multimodal-c4-2p2d-r2", "full-epd-multimodal-c4-2p2d-r3"],
+      "baseline_transport": "tcp",
+      "candidate_transport": "tcp",
+      "quality": "structural",
+      "primary_metric": "output_token_goodput_tps",
+      "min_samples": 3
+    },
+    {
+      "id": "agent-aware-vs-round-robin",
+      "kind": "tuning_ab",
+      "baseline": ["agent-pd-round-robin"],
+      "candidate": ["agent-pd-agent-aware"],
+      "allowed_config_differences": ["epd.scheduler_policy"],
+      "quality": "status_only",
+      "primary_metric": "route_correct_rate",
+      "min_samples": 1
+    },
+    {
+      "id": "agent-aware-vs-least-loaded",
+      "kind": "tuning_ab",
+      "baseline": ["agent-pd-least-loaded"],
+      "candidate": ["agent-pd-agent-aware"],
+      "allowed_config_differences": ["epd.scheduler_policy"],
+      "quality": "status_only",
+      "primary_metric": "route_correct_rate",
+      "min_samples": 1
+    },
+    {
+      "id": "agent-aware-vs-static-type-route",
+      "kind": "tuning_ab",
+      "baseline": ["agent-pd-static-type-route"],
+      "candidate": ["agent-pd-agent-aware"],
+      "allowed_config_differences": ["epd.scheduler_policy"],
+      "quality": "status_only",
+      "primary_metric": "route_correct_rate",
+      "min_samples": 1
+    }
+  ]
+}

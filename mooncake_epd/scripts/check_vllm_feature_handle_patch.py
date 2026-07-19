@@ -2,7 +2,7 @@
 """Check Mooncake EPD FeatureHandle hooks in the active vLLM runtime.
 
 This checker is intentionally read-only.  It validates whether the repo-local
-``sitecustomize`` hooks are active for:
+explicit EPD adapter hooks are active for:
 - GPUModelRunner request-level ``kv_transfer_params.mm_feature_handles`` injection
 - Qwen-VL model ``embed_multimodal`` / native ``image_embeds`` hidden-state path
 - Mooncake provider importability
@@ -32,9 +32,19 @@ def build_report() -> Dict[str, Any]:
         "gpu_model_runner_hook": False,
         "gpu_model_runner_kv_params_hook": False,
         "direct_feature_buffer_build_app_hook": False,
+        "qwen25_omni_precomputed_image_embed_contract": False,
+        "qwen25_vl_precomputed_image_embed_metric": False,
         "qwen_hooks": [],
         "errors": [],
+        "adapter": None,
     }
+    try:
+        from mooncake_epd.integrations.vllm import adapter_installation_report
+
+        report["adapter"] = adapter_installation_report()
+    except Exception as exc:
+        report["errors"].append(f"adapter report failed: {type(exc).__name__}: {exc}")
+
     try:
         import mooncake_epd.core.state.vllm_feature_handle_provider as provider
 
@@ -72,6 +82,10 @@ def build_report() -> Dict[str, Any]:
     for module_name, class_name in (
         ("vllm.model_executor.models.qwen3_vl", "Qwen3VLForConditionalGeneration"),
         ("vllm.model_executor.models.qwen2_5_vl", "Qwen2_5_VLForConditionalGeneration"),
+        (
+            "vllm.model_executor.models.qwen2_5_omni_thinker",
+            "Qwen2_5OmniThinkerForConditionalGeneration",
+        ),
         ("vllm.model_executor.models.qwen2_vl", "Qwen2VLForConditionalGeneration"),
     ):
         try:
@@ -84,6 +98,16 @@ def build_report() -> Dict[str, Any]:
                     "exists": method is not None,
                     "feature_handle_hook": _flag(method, "_mooncake_epd_feature_handle_patch"),
                 }
+            if module_name == "vllm.model_executor.models.qwen2_5_omni_thinker":
+                report["qwen25_omni_precomputed_image_embed_contract"] = _flag(
+                    getattr(cls, "_process_image_input", None),
+                    "_mooncake_epd_qwen25_omni_image_embed_contract_patch",
+                )
+            if module_name == "vllm.model_executor.models.qwen2_5_vl":
+                report["qwen25_vl_precomputed_image_embed_metric"] = _flag(
+                    getattr(cls, "_process_image_input", None),
+                    "_mooncake_epd_qwen25_vl_precomputed_image_embed_metric_patch",
+                )
             report["qwen_hooks"].append(
                 {"module": module_name, "class": class_name, "methods": hooks}
             )
@@ -115,12 +139,14 @@ def main() -> None:
             any(method.get("feature_handle_hook") for method in item.get("methods", {}).values())
             for item in report.get("qwen_hooks", [])
         )
+        adapter = report.get("adapter") or {}
         if (
             not report.get("provider_available")
             or not report.get("gpu_model_runner_hook")
             or not report.get("gpu_model_runner_kv_params_hook")
             or not report.get("direct_feature_buffer_build_app_hook")
             or not has_qwen_hook
+            or not adapter.get("installed", False)
         ):
             failed = True
     if failed:

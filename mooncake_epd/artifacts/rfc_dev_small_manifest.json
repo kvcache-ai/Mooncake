@@ -1,0 +1,547 @@
+{
+  "mix": {
+    "W0": 0.25,
+    "W1": 0.2,
+    "W2": 0.25,
+    "W3": 0.15,
+    "W4": 0.1,
+    "FAULT": 0.05
+  },
+  "summary": [
+    {
+      "workload": "W0",
+      "samples": 8,
+      "avg_steps": 1.0,
+      "image_reuse_rate": 0.0,
+      "scenarios": [
+        "a2a_handoff",
+        "multi_turn",
+        "tool_use_vqa",
+        "tree_of_thought"
+      ]
+    },
+    {
+      "workload": "W1",
+      "samples": 2,
+      "avg_steps": 4.0,
+      "image_reuse_rate": 1.0,
+      "scenarios": [
+        "multi_turn"
+      ]
+    },
+    {
+      "workload": "W2",
+      "samples": 2,
+      "avg_steps": 4.0,
+      "image_reuse_rate": 1.0,
+      "scenarios": [
+        "tool_use_vqa"
+      ]
+    },
+    {
+      "workload": "W3",
+      "samples": 3,
+      "avg_steps": 3.0,
+      "image_reuse_rate": 1.0,
+      "scenarios": [
+        "tree_of_thought"
+      ]
+    },
+    {
+      "workload": "W4",
+      "samples": 1,
+      "avg_steps": 3.0,
+      "image_reuse_rate": 1.0,
+      "scenarios": [
+        "a2a_handoff"
+      ]
+    },
+    {
+      "workload": "W5",
+      "samples": 20,
+      "avg_steps": 3.0,
+      "image_reuse_rate": 0.75,
+      "scenarios": [
+        "a2a_handoff",
+        "multi_turn",
+        "tool_use_vqa",
+        "tree_of_thought"
+      ]
+    }
+  ],
+  "workloads": {
+    "W0": [
+      {
+        "workload": "W0",
+        "scenario": "tool_use_vqa",
+        "image_name": "objects",
+        "image_hash": "118e2e3314bbc32a",
+        "step_count": 1,
+        "tool_steps": 4,
+        "shared_image_reuse": 0,
+        "prompt": "List every distinct object you can see in the image."
+      },
+      {
+        "workload": "W0",
+        "scenario": "tool_use_vqa",
+        "image_name": "bar_chart",
+        "image_hash": "bd6af62e7ffc0b4f",
+        "step_count": 1,
+        "tool_steps": 4,
+        "shared_image_reuse": 0,
+        "prompt": "Describe the chart. What is its title and how many bars are there?"
+      },
+      {
+        "workload": "W0",
+        "scenario": "multi_turn",
+        "image_name": "room",
+        "image_hash": "92e337ec6d40ccfc",
+        "step_count": 1,
+        "tool_steps": 0,
+        "shared_image_reuse": 0,
+        "prompt": "Describe the room in this image."
+      },
+      {
+        "workload": "W0",
+        "scenario": "multi_turn",
+        "image_name": "document",
+        "image_hash": "da605d3c26f3fa31",
+        "step_count": 1,
+        "tool_steps": 0,
+        "shared_image_reuse": 0,
+        "prompt": "What kind of document is this?"
+      },
+      {
+        "workload": "W0",
+        "scenario": "tree_of_thought",
+        "image_name": "map",
+        "image_hash": "313f7dd614a862a1",
+        "step_count": 1,
+        "tool_steps": 0,
+        "shared_image_reuse": 0,
+        "prompt": "Analyze this city map carefully. First, identify the main road layout."
+      },
+      {
+        "workload": "W0",
+        "scenario": "tree_of_thought",
+        "image_name": "map",
+        "image_hash": "313f7dd614a862a1",
+        "step_count": 1,
+        "tool_steps": 0,
+        "shared_image_reuse": 0,
+        "prompt": "Analyze this city map carefully. First, identify the main road layout."
+      },
+      {
+        "workload": "W0",
+        "scenario": "tree_of_thought",
+        "image_name": "map",
+        "image_hash": "313f7dd614a862a1",
+        "step_count": 1,
+        "tool_steps": 0,
+        "shared_image_reuse": 0,
+        "prompt": "Analyze this city map carefully. First, identify the main road layout."
+      },
+      {
+        "workload": "W0",
+        "scenario": "a2a_handoff",
+        "image_name": "room",
+        "image_hash": "92e337ec6d40ccfc",
+        "step_count": 1,
+        "tool_steps": 0,
+        "shared_image_reuse": 0,
+        "prompt": "Produce a detailed inventory of every visible object in the room."
+      }
+    ],
+    "W1": [
+      {
+        "workload": "W1",
+        "scenario": "multi_turn",
+        "image_name": "room",
+        "image_hash": "92e337ec6d40ccfc",
+        "step_count": 4,
+        "tool_steps": 0,
+        "shared_image_reuse": 1,
+        "turns": 4
+      },
+      {
+        "workload": "W1",
+        "scenario": "multi_turn",
+        "image_name": "document",
+        "image_hash": "da605d3c26f3fa31",
+        "step_count": 4,
+        "tool_steps": 0,
+        "shared_image_reuse": 1,
+        "turns": 4
+      }
+    ],
+    "W2": [
+      {
+        "workload": "W2",
+        "scenario": "tool_use_vqa",
+        "image_name": "objects",
+        "image_hash": "118e2e3314bbc32a",
+        "step_count": 4,
+        "tool_steps": 4,
+        "shared_image_reuse": 1,
+        "tool_wait_buckets_ms": [
+          50,
+          200,
+          1000,
+          5000
+        ]
+      },
+      {
+        "workload": "W2",
+        "scenario": "tool_use_vqa",
+        "image_name": "bar_chart",
+        "image_hash": "bd6af62e7ffc0b4f",
+        "step_count": 4,
+        "tool_steps": 4,
+        "shared_image_reuse": 1,
+        "tool_wait_buckets_ms": [
+          50,
+          200,
+          1000,
+          5000
+        ]
+      }
+    ],
+    "W3": [
+      {
+        "workload": "W3",
+        "scenario": "tree_of_thought",
+        "image_name": "map",
+        "image_hash": "313f7dd614a862a1",
+        "step_count": 3,
+        "tool_steps": 0,
+        "shared_image_reuse": 1,
+        "branch_widths": [
+          2,
+          4,
+          8,
+          16,
+          32
+        ]
+      },
+      {
+        "workload": "W3",
+        "scenario": "tree_of_thought",
+        "image_name": "map",
+        "image_hash": "313f7dd614a862a1",
+        "step_count": 3,
+        "tool_steps": 0,
+        "shared_image_reuse": 1,
+        "branch_widths": [
+          2,
+          4,
+          8,
+          16,
+          32
+        ]
+      },
+      {
+        "workload": "W3",
+        "scenario": "tree_of_thought",
+        "image_name": "map",
+        "image_hash": "313f7dd614a862a1",
+        "step_count": 3,
+        "tool_steps": 0,
+        "shared_image_reuse": 1,
+        "branch_widths": [
+          2,
+          4,
+          8,
+          16,
+          32
+        ]
+      }
+    ],
+    "W4": [
+      {
+        "workload": "W4",
+        "scenario": "a2a_handoff",
+        "image_name": "room",
+        "image_hash": "92e337ec6d40ccfc",
+        "step_count": 3,
+        "tool_steps": 0,
+        "shared_image_reuse": 1,
+        "handoff_steps": 2
+      }
+    ],
+    "W5": [
+      {
+        "workload": "W5",
+        "scenario": "tool_use_vqa",
+        "image_name": "objects",
+        "image_hash": "118e2e3314bbc32a",
+        "step_count": 1,
+        "tool_steps": 4,
+        "shared_image_reuse": 0,
+        "prompt": "List every distinct object you can see in the image.",
+        "mixed_from": "W0"
+      },
+      {
+        "workload": "W5",
+        "scenario": "tool_use_vqa",
+        "image_name": "bar_chart",
+        "image_hash": "bd6af62e7ffc0b4f",
+        "step_count": 1,
+        "tool_steps": 4,
+        "shared_image_reuse": 0,
+        "prompt": "Describe the chart. What is its title and how many bars are there?",
+        "mixed_from": "W0"
+      },
+      {
+        "workload": "W5",
+        "scenario": "multi_turn",
+        "image_name": "room",
+        "image_hash": "92e337ec6d40ccfc",
+        "step_count": 1,
+        "tool_steps": 0,
+        "shared_image_reuse": 0,
+        "prompt": "Describe the room in this image.",
+        "mixed_from": "W0"
+      },
+      {
+        "workload": "W5",
+        "scenario": "multi_turn",
+        "image_name": "document",
+        "image_hash": "da605d3c26f3fa31",
+        "step_count": 1,
+        "tool_steps": 0,
+        "shared_image_reuse": 0,
+        "prompt": "What kind of document is this?",
+        "mixed_from": "W0"
+      },
+      {
+        "workload": "W5",
+        "scenario": "tree_of_thought",
+        "image_name": "map",
+        "image_hash": "313f7dd614a862a1",
+        "step_count": 1,
+        "tool_steps": 0,
+        "shared_image_reuse": 0,
+        "prompt": "Analyze this city map carefully. First, identify the main road layout.",
+        "mixed_from": "W0"
+      },
+      {
+        "workload": "W5",
+        "scenario": "multi_turn",
+        "image_name": "room",
+        "image_hash": "92e337ec6d40ccfc",
+        "step_count": 4,
+        "tool_steps": 0,
+        "shared_image_reuse": 1,
+        "turns": 4,
+        "mixed_from": "W1"
+      },
+      {
+        "workload": "W5",
+        "scenario": "multi_turn",
+        "image_name": "document",
+        "image_hash": "da605d3c26f3fa31",
+        "step_count": 4,
+        "tool_steps": 0,
+        "shared_image_reuse": 1,
+        "turns": 4,
+        "mixed_from": "W1"
+      },
+      {
+        "workload": "W5",
+        "scenario": "multi_turn",
+        "image_name": "room",
+        "image_hash": "92e337ec6d40ccfc",
+        "step_count": 4,
+        "tool_steps": 0,
+        "shared_image_reuse": 1,
+        "turns": 4,
+        "mixed_from": "W1"
+      },
+      {
+        "workload": "W5",
+        "scenario": "multi_turn",
+        "image_name": "document",
+        "image_hash": "da605d3c26f3fa31",
+        "step_count": 4,
+        "tool_steps": 0,
+        "shared_image_reuse": 1,
+        "turns": 4,
+        "mixed_from": "W1"
+      },
+      {
+        "workload": "W5",
+        "scenario": "tool_use_vqa",
+        "image_name": "objects",
+        "image_hash": "118e2e3314bbc32a",
+        "step_count": 4,
+        "tool_steps": 4,
+        "shared_image_reuse": 1,
+        "tool_wait_buckets_ms": [
+          50,
+          200,
+          1000,
+          5000
+        ],
+        "mixed_from": "W2"
+      },
+      {
+        "workload": "W5",
+        "scenario": "tool_use_vqa",
+        "image_name": "bar_chart",
+        "image_hash": "bd6af62e7ffc0b4f",
+        "step_count": 4,
+        "tool_steps": 4,
+        "shared_image_reuse": 1,
+        "tool_wait_buckets_ms": [
+          50,
+          200,
+          1000,
+          5000
+        ],
+        "mixed_from": "W2"
+      },
+      {
+        "workload": "W5",
+        "scenario": "tool_use_vqa",
+        "image_name": "objects",
+        "image_hash": "118e2e3314bbc32a",
+        "step_count": 4,
+        "tool_steps": 4,
+        "shared_image_reuse": 1,
+        "tool_wait_buckets_ms": [
+          50,
+          200,
+          1000,
+          5000
+        ],
+        "mixed_from": "W2"
+      },
+      {
+        "workload": "W5",
+        "scenario": "tool_use_vqa",
+        "image_name": "bar_chart",
+        "image_hash": "bd6af62e7ffc0b4f",
+        "step_count": 4,
+        "tool_steps": 4,
+        "shared_image_reuse": 1,
+        "tool_wait_buckets_ms": [
+          50,
+          200,
+          1000,
+          5000
+        ],
+        "mixed_from": "W2"
+      },
+      {
+        "workload": "W5",
+        "scenario": "tool_use_vqa",
+        "image_name": "objects",
+        "image_hash": "118e2e3314bbc32a",
+        "step_count": 4,
+        "tool_steps": 4,
+        "shared_image_reuse": 1,
+        "tool_wait_buckets_ms": [
+          50,
+          200,
+          1000,
+          5000
+        ],
+        "mixed_from": "W2"
+      },
+      {
+        "workload": "W5",
+        "scenario": "tree_of_thought",
+        "image_name": "map",
+        "image_hash": "313f7dd614a862a1",
+        "step_count": 3,
+        "tool_steps": 0,
+        "shared_image_reuse": 1,
+        "branch_widths": [
+          2,
+          4,
+          8,
+          16,
+          32
+        ],
+        "mixed_from": "W3"
+      },
+      {
+        "workload": "W5",
+        "scenario": "tree_of_thought",
+        "image_name": "map",
+        "image_hash": "313f7dd614a862a1",
+        "step_count": 3,
+        "tool_steps": 0,
+        "shared_image_reuse": 1,
+        "branch_widths": [
+          2,
+          4,
+          8,
+          16,
+          32
+        ],
+        "mixed_from": "W3"
+      },
+      {
+        "workload": "W5",
+        "scenario": "tree_of_thought",
+        "image_name": "map",
+        "image_hash": "313f7dd614a862a1",
+        "step_count": 3,
+        "tool_steps": 0,
+        "shared_image_reuse": 1,
+        "branch_widths": [
+          2,
+          4,
+          8,
+          16,
+          32
+        ],
+        "mixed_from": "W3"
+      },
+      {
+        "workload": "W5",
+        "scenario": "a2a_handoff",
+        "image_name": "room",
+        "image_hash": "92e337ec6d40ccfc",
+        "step_count": 3,
+        "tool_steps": 0,
+        "shared_image_reuse": 1,
+        "handoff_steps": 2,
+        "mixed_from": "W4"
+      },
+      {
+        "workload": "W5",
+        "scenario": "a2a_handoff",
+        "image_name": "room",
+        "image_hash": "92e337ec6d40ccfc",
+        "step_count": 3,
+        "tool_steps": 0,
+        "shared_image_reuse": 1,
+        "handoff_steps": 2,
+        "mixed_from": "W4"
+      },
+      {
+        "workload": "W5",
+        "scenario": "tool_use_vqa",
+        "image_name": "objects",
+        "image_hash": "118e2e3314bbc32a",
+        "step_count": 4,
+        "tool_steps": 4,
+        "shared_image_reuse": 1,
+        "tool_wait_buckets_ms": [
+          50,
+          200,
+          1000,
+          5000
+        ],
+        "mixed_from": "FAULT",
+        "fault_injection": [
+          "offload_abort",
+          "handoff_rollback",
+          "overload"
+        ]
+      }
+    ]
+  }
+}

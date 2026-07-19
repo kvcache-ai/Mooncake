@@ -27,8 +27,13 @@ from .engine import (
     PeerTransferResult,
     TransferEngine,
     TransferHandle,
+    MooncakeProtocolCapabilityError,
+    MooncakeProtocolError,
     TransferStats,
+    require_mooncake_protocol_support,
+    validate_mooncake_protocol_pair,
 )
+from .transport_evidence import collect_mooncake_worker_transport_evidence
 
 __all__ = [
     "Channel",
@@ -40,6 +45,8 @@ __all__ = [
     "HwCaps",
     "LayerTransferBatch",
     "Mode",
+    "MooncakeProtocolCapabilityError",
+    "MooncakeProtocolError",
     "PeerTransferDescriptor",
     "PeerTransferPlan",
     "PeerTransferResult",
@@ -50,4 +57,7 @@ __all__ = [
     "TransferPolicy",
     "TransferStats",
     "default_policy_for",
+    "require_mooncake_protocol_support",
+    "validate_mooncake_protocol_pair",
+    "collect_mooncake_worker_transport_evidence",
 ]

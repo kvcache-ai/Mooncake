@@ -219,3 +219,22 @@ def test_p5_prefix_cache_uses_full_hash_and_stable_keys():
     assert got is not None
     assert torch.equal(got[0], torch.tensor([2.0]))
     assert got[1]["cache_key_mode"] == "stable"
+
+
+def test_p5_prefix_cache_rejects_oversize_entries_and_isolates_hits():
+    cache = HiddenStatePrefixCache(max_cache_size_bytes=8, max_entries=1)
+    pixels = torch.zeros(1)
+    assert cache.put(pixels, torch.zeros(4, dtype=torch.float32), {}) is False
+    assert cache.get_stats()["total_entries"] == 0
+    assert cache.get_stats()["rejected_entries"] == 1
+
+    cache = HiddenStatePrefixCache(max_cache_size_bytes=1024, max_entries=2)
+    assert cache.put(pixels, torch.tensor([1.0]), {}, stable_key="asset") is True
+    first = cache.get(pixels, stable_key="asset")
+    assert first is not None
+    first[0].fill_(99)
+    first[1]["mutated"] = True
+    second = cache.get(pixels, stable_key="asset")
+    assert second is not None
+    assert torch.equal(second[0], torch.tensor([1.0]))
+    assert "mutated" not in second[1]

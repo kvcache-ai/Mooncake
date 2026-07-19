@@ -201,6 +201,7 @@ def _make_control_plane(args: argparse.Namespace) -> ServingControlPlane:
             standard_prefill_worker_ids=("prefill-standard-0",),
             low_latency_decode_worker_ids=("decode-low-0", "decode-low-1"),
             standard_decode_worker_ids=("decode-standard-0",),
+            scheduler_policy=str(getattr(args, "scheduler_policy", "agent_aware")),
         )
     )
     cp.register_stage_workers("prefill", ["prefill-high-0", "prefill-high-1", "prefill-standard-0"])
@@ -230,6 +231,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     route_correct_rate = sum(1 for t in traces if t["route_correct"]) / len(traces)
     sla_rate = sum(1 for t in traces if t["sla_satisfied"]) / len(traces)
     summary = {
+        "scheduler_policy": str(getattr(args, "scheduler_policy", "agent_aware")),
         "tasks_jsonl": str(tasks_path),
         "traces_jsonl": str(traces_path),
         "count": len(traces),
@@ -252,10 +254,26 @@ def main() -> None:
     ap.add_argument("--output-dir", default="artifacts/agent_pd_dataset")
     ap.add_argument("--traces-jsonl", default=None)
     ap.add_argument("--model", default="Qwen3.5-9B")
+    ap.add_argument(
+        "--scheduler-policy",
+        choices=["round_robin", "least_loaded", "static_type_route", "agent_aware"],
+        default="agent_aware",
+        help="Run one deterministic production control-plane scheduling policy for an ablation.",
+    )
+    ap.add_argument(
+        "--min-route-correct-rate",
+        type=float,
+        default=0.98,
+        help=(
+            "Fail the process below this route-correctness threshold. Use 0 "
+            "for deliberately weaker ablation arms; the JSON still records "
+            "their observed route quality."
+        ),
+    )
     args = ap.parse_args()
     summary = run(args)
     print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
-    if summary["route_correct_rate"] < 0.98:
+    if summary["route_correct_rate"] < float(args.min_route_correct_rate):
         raise SystemExit(2)
 
 

@@ -74,6 +74,12 @@ def cleanup_torch(*objs, devices: Iterable[int] = ()) -> None:
 
 
 def pytest_configure(config):
+    config.addinivalue_line("markers", "unit: deterministic unit-level CPU validation")
+    config.addinivalue_line("markers", "integration: multi-component local integration validation")
+    config.addinivalue_line("markers", "gpu_single_node: requires one host with the configured GPU resources")
+    config.addinivalue_line("markers", "gpu_multi_node: requires two or more configured GPU hosts")
+    config.addinivalue_line("markers", "rdma: requires a real RDMA transport and evidence metadata")
+    config.addinivalue_line("markers", "benchmark: emits benchmark artifacts; never implies a claim by itself")
     config.addinivalue_line("markers", "real_model: requires loading the real Qwen3-VL model")
     config.addinivalue_line("markers", "gpu: requires CUDA GPUs")
     config.addinivalue_line("markers", "mooncake: requires running Mooncake services")

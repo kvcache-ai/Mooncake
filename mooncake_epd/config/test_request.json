@@ -1,0 +1,16 @@
+{
+  "model": "/data01/LWX/Qwen3-VL-8B-Instruct",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Please introduce Mooncake PD disaggregation briefly."
+        }
+      ]
+    }
+  ],
+  "max_tokens": 64,
+  "temperature": 0.0
+}

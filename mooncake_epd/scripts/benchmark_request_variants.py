@@ -9,6 +9,7 @@ independent Prefill work without relying on cache-disable internals.
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any, Dict
 
 
@@ -19,6 +20,15 @@ REQUEST_VARIATION_UNIQUE_PREFIX = "unique_prefix"
 # shares the entire expensive prompt prefix with vLLM's radix cache.
 REQUEST_VARIATION_UNIQUE_SUFFIX = "unique_suffix"
 REQUEST_VARIATION_SCHEMA_VERSION = 1
+
+# Keep prefix-cache policy separate from request variation. ``unique_prefix``
+# deliberately changes model-visible tokens and is useful for a cold-token
+# workload; vLLM's native cache salt isolates prefix-cache identity without
+# changing the prompt, which is the correct control for output-equivalence and
+# cache-causality experiments.
+VLLM_PREFIX_CACHE_REUSE = "reuse"
+VLLM_PREFIX_CACHE_ISOLATE = "isolate"
+VLLM_PREFIX_CACHE_SCHEMA_VERSION = 1
 
 
 def request_variation_spec(mode: str) -> Dict[str, Any]:
@@ -79,3 +89,50 @@ def apply_request_variation(
             item["text"] = f"{prefix}{str(item.get('text') or '')}"
             return variation_id
     raise ValueError("request variation requires at least one text content item")
+
+
+def vllm_prefix_cache_spec(mode: str) -> Dict[str, Any]:
+    """Return the artifact-stable vLLM prefix-cache policy definition."""
+
+    normalized = str(mode or VLLM_PREFIX_CACHE_REUSE).strip().lower()
+    if normalized not in {VLLM_PREFIX_CACHE_REUSE, VLLM_PREFIX_CACHE_ISOLATE}:
+        raise ValueError(f"unsupported vLLM prefix-cache mode: {mode!r}")
+    return {
+        "mode": normalized,
+        "schema_version": VLLM_PREFIX_CACHE_SCHEMA_VERSION,
+        "mechanism": "cache_salt",
+        "model_visible_prompt_mutation": False,
+    }
+
+
+def apply_vllm_prefix_cache_policy(
+    request_body: Dict[str, Any],
+    *,
+    mode: str,
+    phase: str,
+    repeat_idx: int,
+) -> str | None:
+    """Apply a deterministic vLLM prefix-cache policy without changing tokens.
+
+    ``cache_salt`` participates in vLLM's prefix-cache key but is not supplied
+    to the model tokenizer.  The isolate policy derives one opaque stable salt
+    per benchmark phase/index so paired EPD and baseline runners exercise the
+    same request semantics while neither can reuse a prior request's prefix.
+    The returned identifier is safe to record in an entry; the raw cache salt
+    is intentionally not duplicated into benchmark evidence.
+    """
+
+    spec = vllm_prefix_cache_spec(mode)
+    if spec["mode"] == VLLM_PREFIX_CACHE_REUSE:
+        return None
+
+    existing = request_body.get("cache_salt")
+    existing_text = existing if isinstance(existing, str) else ""
+    policy_id = (
+        f"epd-vllm-cache-salt-v{VLLM_PREFIX_CACHE_SCHEMA_VERSION}-"
+        f"{phase}-{int(repeat_idx)}"
+    )
+    request_body["cache_salt"] = hashlib.sha256(
+        f"{existing_text}\x00{policy_id}".encode("utf-8")
+    ).hexdigest()
+    return policy_id

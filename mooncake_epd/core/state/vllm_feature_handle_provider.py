@@ -95,6 +95,18 @@ class ResolvedFeatureHandles:
 
 
 @dataclass(frozen=True)
+class _DirectRemoteHandleLayout:
+    """Validated remote-buffer layout for one ``epd-direct://`` handle."""
+
+    handle: FeatureHandle
+    descriptor: FeatureBundleDescriptor
+    remote_session: str
+    ordered: Tuple[Tuple[str, TensorSpec, Optional[int]], ...]
+    remote_pointers: Tuple[int, ...]
+    lengths: Tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class FeatureHandleProviderConfig:
     worker_id: str = "prefill"
     device: str = "cpu"
@@ -266,6 +278,48 @@ def _move_feature_tensor(
     return tensor.to(device=device, dtype=target_dtype, non_blocking=True)
 
 
+def _direct_feature_allocation_cache_identity(handle: FeatureHandle) -> str:
+    """Return a stable, pointer-lifetime-aware identity for direct handles.
+
+    A direct ``FeatureHandle`` names immutable feature content, while its
+    ``direct_plan`` names one concrete Prefill-owned buffer allocation.  The
+    latter can be released and recreated without changing ``feature_id`` or
+    descriptor shape.  Resolved tensors are cached in this process, so omitting
+    that allocation incarnation could return tensors from an old peer buffer
+    after a non-persistent allocation is recycled.  Hash the opaque allocation
+    id plus the remote session and canonical pointer plan; retaining the plan
+    digest also protects legacy producers that predate ``allocation_id``.
+    """
+
+    if not str(handle.uri or "").startswith("epd-direct://"):
+        return ""
+    metadata = dict(handle.metadata or {})
+    plan = dict(metadata.get("direct_plan") or {})
+    targets = []
+    for raw in list(plan.get("targets") or []):
+        if not isinstance(raw, Mapping):
+            continue
+        targets.append(
+            {
+                "name": str(raw.get("name") or ""),
+                "remote_pointer": str(raw.get("remote_pointer") or ""),
+                "nbytes": str(raw.get("nbytes") or ""),
+            }
+        )
+    targets.sort(key=lambda item: (item["name"], item["remote_pointer"], item["nbytes"]))
+    canonical = json.dumps(
+        {
+            "allocation_id": str(metadata.get("direct_allocation_id") or ""),
+            "remote_session": str(metadata.get("direct_remote_session") or ""),
+            "targets": targets,
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _feature_bundle_cache_key(handle: FeatureHandle) -> str:
     descriptor = handle.descriptor
     checksum_parts: List[str] = []
@@ -283,6 +337,7 @@ def _feature_bundle_cache_key(handle: FeatureHandle) -> str:
             str(descriptor.feature_id or handle.feature_id or ""),
             str(descriptor.nbytes),
             checksum,
+            _direct_feature_allocation_cache_identity(handle),
         ]
     )
 
@@ -600,7 +655,10 @@ class FeatureHandleProvider:
             started = time.perf_counter()
             materialize_device = torch.device(device or self.config.device)
             resolve_started = time.perf_counter()
-            bundles = [self._resolve_one(handle, materialize_device=materialize_device) for handle in handles]
+            bundles = self._resolve_handles_batched(
+                handles,
+                materialize_device=materialize_device,
+            )
             resolve_ms = (time.perf_counter() - resolve_started) * 1000.0
             merge_started = time.perf_counter()
             resolved = self._merge(handles, bundles, device=device, dtype=dtype, source="feature_handle")
@@ -635,6 +693,152 @@ class FeatureHandleProvider:
                 raise
             return None
 
+    def resolve_individual_handles(
+        self,
+        handles: Sequence[FeatureHandle],
+        *,
+        device: Optional[torch.device | str] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> List[ResolvedFeatureHandles]:
+        """Resolve each handle independently while coalescing direct reads.
+
+        vLLM consumes multimodal inputs as one item per image.  Resolving those
+        items one at a time used to turn an N-image request into N direct-engine
+        reads, even when all E→P buffers belonged to the same Encoder session.
+        This API preserves one ``ResolvedFeatureHandles`` object per input item
+        (and therefore avoids an unnecessary per-image ``torch.cat``), while
+        allowing :meth:`_resolve_handles_batched` to issue one data-plane batch
+        read for compatible remote ``epd-direct://`` handles.
+
+        Errors are intentionally propagated.  The vLLM injection boundary owns
+        the existing fail-open/fail-closed policy because it must retain the
+        original pixel input when an individual multimodal item cannot be
+        replaced safely.
+        """
+
+        normalized = tuple(handles)
+        if not normalized:
+            return []
+        if any(not isinstance(handle, FeatureHandle) for handle in normalized):
+            raise TypeError("resolve_individual_handles requires FeatureHandle values")
+
+        started = time.perf_counter()
+        materialize_device = torch.device(device or self.config.device)
+        resolved_items: List[Optional[ResolvedFeatureHandles]] = [None] * len(normalized)
+        pending_indices: List[int] = []
+        for index, handle in enumerate(normalized):
+            resolved_key = _resolved_cache_key((handle,), device=device, dtype=dtype, config=self.config)
+            cached = _resolved_cache_get(resolved_key, config=self.config)
+            if cached is None:
+                pending_indices.append(index)
+                continue
+            record_vllm_precomputed_image_embeds_hit(
+                cached.count,
+                stable_keys=[h.metadata.get("source_mm_hash") or h.feature_id for h in cached.handles],
+            )
+            resolved_items[index] = cached
+
+        if pending_indices:
+            pending_handles = tuple(normalized[index] for index in pending_indices)
+            bundles = self._resolve_handles_batched(
+                pending_handles,
+                materialize_device=materialize_device,
+            )
+            for index, handle, bundle in zip(pending_indices, pending_handles, bundles):
+                resolved = self._merge(
+                    (handle,),
+                    (bundle,),
+                    device=device,
+                    dtype=dtype,
+                    source="feature_handle_individual",
+                )
+                resolved_key = _resolved_cache_key(
+                    (handle,),
+                    device=device,
+                    dtype=dtype,
+                    config=self.config,
+                )
+                _resolved_cache_put(resolved_key, resolved, config=self.config)
+                resolved_items[index] = resolved
+
+        if any(item is None for item in resolved_items):
+            raise RuntimeError("individual FeatureHandle resolution returned an incomplete result")
+        completed = [item for item in resolved_items if item is not None]
+        trace_vllm_mm_hidden_event(
+            "feature_handle_individual_resolve_complete",
+            count=len(completed),
+            cache_hits=len(normalized) - len(pending_indices),
+            elapsed_ms=(time.perf_counter() - started) * 1000.0,
+        )
+        return completed
+
+    def _has_local_direct_feature_buffers(self, handle: FeatureHandle) -> bool:
+        """Whether normal direct-registry resolution must retain ownership.
+
+        The worker-local registry has stronger lifetime semantics than a remote
+        read and must win whenever it exists.  In particular, preserve the
+        historic fail-closed behavior when a registry is installed for this
+        worker but the requested allocation is missing.
+        """
+
+        registry = get_direct_feature_buffer_registry(self.config.worker_id)
+        if registry is not None:
+            return True
+        return any(
+            candidate.get(handle.feature_id) is not None
+            for candidate in iter_direct_feature_buffer_registries()
+        )
+
+    def _uses_remote_direct_feature_buffers(self, handle: FeatureHandle) -> bool:
+        return (
+            str(handle.uri or "").startswith("epd-direct://")
+            and not self._has_local_direct_feature_buffers(handle)
+        )
+
+    def _resolve_handles_batched(
+        self,
+        handles: Sequence[FeatureHandle],
+        *,
+        materialize_device: torch.device,
+    ) -> List[FeatureBundle]:
+        """Resolve handles, coalescing compatible remote direct bundles.
+
+        Mooncake's batch read ABI requires one remote session per invocation.
+        Grouping by session therefore gives the largest safe batch without
+        crossing an ownership boundary.  Non-direct and in-process direct
+        handles deliberately keep their established resolution behavior.
+        """
+
+        resolved: List[Optional[FeatureBundle]] = [None] * len(handles)
+        remote_groups: "OrderedDict[str, List[Tuple[int, _DirectRemoteHandleLayout]]]" = OrderedDict()
+        for index, handle in enumerate(handles):
+            if not self._uses_remote_direct_feature_buffers(handle):
+                resolved[index] = self._resolve_one(
+                    handle,
+                    materialize_device=materialize_device,
+                )
+                continue
+            layout = self._direct_remote_handle_layout(handle)
+            remote_groups.setdefault(layout.remote_session, []).append((index, layout))
+
+        for remote_session, group in remote_groups.items():
+            layouts = tuple(layout for _, layout in group)
+            bundles = self._load_epd_direct_remote_layouts(
+                layouts,
+                materialize_device=materialize_device,
+            )
+            if len(bundles) != len(group):
+                raise RuntimeError(
+                    "direct FeatureHandle batch result count mismatch: "
+                    f"session={remote_session} expected={len(group)} got={len(bundles)}"
+                )
+            for (index, _), bundle in zip(group, bundles):
+                resolved[index] = bundle
+
+        if any(bundle is None for bundle in resolved):
+            raise RuntimeError("FeatureHandle batch resolution returned an incomplete bundle list")
+        return [bundle for bundle in resolved if bundle is not None]
+
     def _resolve_one(self, handle: FeatureHandle, *, materialize_device: Optional[torch.device] = None) -> FeatureBundle:
         with _REGISTRY_LOCK:
             registry = _REGISTRIES.get(handle.store_id)
@@ -651,6 +855,15 @@ class FeatureHandleProvider:
                 expected_model_fingerprint=self.config.expected_model_fingerprint,
                 expected_processor_fingerprint=self.config.expected_processor_fingerprint,
                 require_checksum=self.config.require_checksum,
+            )
+
+        # Remote direct reads validate in their batch reader.  Keep this branch
+        # separate from the generic path so direct E→P handles do not pay a
+        # second descriptor/checksum pass after data movement.
+        if self._uses_remote_direct_feature_buffers(handle):
+            return self._load_epd_direct_remote_bundle(
+                handle,
+                materialize_device=materialize_device,
             )
 
         bundle = self._load_from_uri_or_dirs(handle, materialize_device=materialize_device)
@@ -767,16 +980,8 @@ class FeatureHandleProvider:
                 "MOONCAKE_EPD_FEATURE_HANDLE_STORE_DIRS"
             )
 
-    def _load_epd_direct_remote_bundle(self, handle: FeatureHandle, *, materialize_device: Optional[torch.device] = None) -> FeatureBundle:
-        """Materialize an ``epd-direct://`` handle from remote peer buffers.
-
-        In real vLLM serving the direct allocation HTTP route is installed in
-        the API-server process, while multimodal encoder execution happens in
-        the EngineCore worker process.  The in-process registry is therefore
-        only an optimization/test path.  Production EngineCore consumption must
-        use the Mooncake direct engine to read API-owned peer buffers described
-        by the handle metadata.
-        """
+    def _direct_remote_handle_layout(self, handle: FeatureHandle) -> _DirectRemoteHandleLayout:
+        """Validate the remote-buffer ABI for one direct FeatureHandle."""
 
         descriptor: FeatureBundleDescriptor = handle.descriptor
         metadata = dict(handle.metadata or {})
@@ -809,114 +1014,251 @@ class FeatureHandleProvider:
             if target is None:
                 raise FeatureHandleError(f"epd-direct plan missing target {name}")
             nbytes = int(spec.nbytes)
-            target_nbytes = int(target.get("nbytes", -1))
+            try:
+                target_nbytes = int(target.get("nbytes", -1))
+            except (TypeError, ValueError) as exc:
+                raise FeatureHandleError(f"epd-direct target has invalid nbytes for {name}") from exc
             if target_nbytes < nbytes:
                 raise FeatureHandleError(
                     f"epd-direct target undersized for {name}: target={target_nbytes} required={nbytes}"
                 )
-            remote_pointers.append(int(target.get("remote_pointer")))
+            try:
+                remote_pointer = int(target.get("remote_pointer"))
+            except (TypeError, ValueError) as exc:
+                raise FeatureHandleError(f"epd-direct target has invalid remote_pointer for {name}") from exc
+            remote_pointers.append(remote_pointer)
             lengths.append(nbytes)
             ordered.append((name, spec, layer))
 
-        tensors: Dict[str, torch.Tensor] = {}
-        intermediates: List[Tuple[int, torch.Tensor]] = []
-        direct_read_mode = str(os.getenv("MOONCAKE_EPD_DIRECT_READ_MODE", "registered_tensor")).lower()
-        direct_read_timings: Dict[str, float] = {}
+        return _DirectRemoteHandleLayout(
+            handle=handle,
+            descriptor=descriptor,
+            remote_session=remote_session,
+            ordered=tuple(ordered),
+            remote_pointers=tuple(remote_pointers),
+            lengths=tuple(lengths),
+        )
+
+    @staticmethod
+    def _direct_remote_bundle_metadata(layout: _DirectRemoteHandleLayout) -> Dict[str, Any]:
+        metadata = dict(layout.descriptor.metadata or {})
+        if layout.descriptor.model_fingerprint:
+            metadata["model_fingerprint"] = layout.descriptor.model_fingerprint
+        if layout.descriptor.processor_fingerprint:
+            metadata["processor_fingerprint"] = layout.descriptor.processor_fingerprint
+        metadata.update(
+            {
+                "resolved_from": "epd-direct-peer-buffer",
+                "direct_remote_session": layout.remote_session,
+            }
+        )
+        return metadata
+
+    def _load_epd_direct_remote_bundle(
+        self,
+        handle: FeatureHandle,
+        *,
+        materialize_device: Optional[torch.device] = None,
+    ) -> FeatureBundle:
+        """Materialize one direct handle through the shared batch reader."""
+
+        bundles = self._load_epd_direct_remote_layouts(
+            (self._direct_remote_handle_layout(handle),),
+            materialize_device=torch.device(materialize_device or self.config.device),
+        )
+        if len(bundles) != 1:
+            raise RuntimeError("single direct FeatureHandle read returned an invalid result count")
+        return bundles[0]
+
+    def _load_epd_direct_remote_layouts(
+        self,
+        layouts: Sequence[_DirectRemoteHandleLayout],
+        *,
+        materialize_device: torch.device,
+    ) -> List[FeatureBundle]:
+        """Read one-session direct layouts in a single Mooncake batch call.
+
+        The registered-tensor mode remains the preferred production path: final
+        EngineCore tensors are registered once for the whole multimodal request
+        and Mooncake writes into them directly.  Managed-buffer mode retains the
+        same compatibility behavior, but now also receives all remote segments
+        in one batch before materializing tensors.
+        """
+
+        normalized = tuple(layouts)
+        if not normalized:
+            return []
+        remote_session = normalized[0].remote_session
+        if any(layout.remote_session != remote_session for layout in normalized):
+            raise FeatureHandleError(
+                "epd-direct batch read requires all FeatureHandles to use one remote session"
+            )
+
+        direct_read_mode = str(
+            os.getenv("MOONCAKE_EPD_DIRECT_READ_MODE", "registered_tensor")
+        ).lower()
         if direct_read_mode not in {"registered_tensor", "managed_buffer"}:
             raise FeatureHandleError(f"unsupported epd-direct read mode: {direct_read_mode}")
 
-        tensor_started = time.perf_counter()
+        batch_started = time.perf_counter()
+        flat_pointers: List[int] = []
+        flat_lengths: List[int] = []
+        for layout in normalized:
+            flat_pointers.extend(int(pointer) for pointer in layout.remote_pointers)
+            flat_lengths.extend(int(length) for length in layout.lengths)
+        if not flat_pointers:
+            raise FeatureHandleError("epd-direct batch read has no tensor descriptors")
+
+        materialized: List[List[torch.Tensor]] = []
+        allocation_ms = 0.0
+        direct_read_timings: Dict[str, float]
         if direct_read_mode == "registered_tensor":
-            allocated: List[torch.Tensor] = []
-            target_device = torch.device(materialize_device or self.config.device)
-            for name, spec, _ in ordered:
-                dtype = _dtype_from_spec(spec)
-                tensor = torch.empty(tuple(spec.shape), dtype=dtype, device=target_device)
-                if int(tensor.nelement() * tensor.element_size()) != int(spec.nbytes):
-                    raise FeatureHandleError(
-                        f"direct tensor allocation nbytes mismatch for {name}: "
-                        f"allocated={tensor.nelement() * tensor.element_size()} spec={spec.nbytes}"
+            allocation_started = time.perf_counter()
+            flat_tensors: List[torch.Tensor] = []
+            for layout in normalized:
+                per_feature: List[torch.Tensor] = []
+                for name, spec, _ in layout.ordered:
+                    tensor = torch.empty(
+                        tuple(spec.shape),
+                        dtype=_dtype_from_spec(spec),
+                        device=materialize_device,
                     )
-                allocated.append(tensor.contiguous())
-            allocation_ms = (time.perf_counter() - tensor_started) * 1000.0
+                    allocated_nbytes = int(tensor.nelement() * tensor.element_size())
+                    if allocated_nbytes != int(spec.nbytes):
+                        raise FeatureHandleError(
+                            f"direct tensor allocation nbytes mismatch for {name}: "
+                            f"allocated={allocated_nbytes} spec={spec.nbytes}"
+                        )
+                    per_feature.append(tensor)
+                    flat_tensors.append(tensor)
+                materialized.append(per_feature)
+            allocation_ms = (time.perf_counter() - allocation_started) * 1000.0
             read_started = time.perf_counter()
             try:
-                direct_read_timings = _get_direct_read_engine().read_remote_peer_buffers_into_tensors(
-                    remote_session=remote_session,
-                    remote_pointers=remote_pointers,
-                    tensors=allocated,
+                direct_read_timings = dict(
+                    _get_direct_read_engine().read_remote_peer_buffers_into_tensors(
+                        remote_session=remote_session,
+                        remote_pointers=flat_pointers,
+                        tensors=flat_tensors,
+                    )
+                    or {}
                 )
             except Exception as exc:
                 raise FeatureHandleError(
                     f"epd-direct FeatureHandle direct tensor materialization failed: {exc}"
                 ) from exc
             read_ms = (time.perf_counter() - read_started) * 1000.0
-            direct_read_timings = dict(direct_read_timings or {})
             direct_read_timings["allocation_ms"] = allocation_ms
-            for (name, _, layer), tensor in zip(ordered, allocated):
-                tensors[name] = tensor
-                if layer is not None:
-                    intermediates.append((int(layer), tensor))
         else:
             read_started = time.perf_counter()
             try:
                 raw_payloads = _get_direct_read_engine().read_remote_peer_buffers(
                     remote_session=remote_session,
-                    remote_pointers=remote_pointers,
-                    lengths=lengths,
+                    remote_pointers=flat_pointers,
+                    lengths=flat_lengths,
                 )
             except Exception as exc:
                 raise FeatureHandleError(
                     f"epd-direct FeatureHandle remote peer-buffer materialization failed: {exc}"
                 ) from exc
             read_ms = (time.perf_counter() - read_started) * 1000.0
-            direct_read_timings = {"read_ms": read_ms, "nbytes": float(sum(lengths)), "descriptor_count": float(len(lengths))}
-            for (name, spec, layer), raw in zip(ordered, raw_payloads):
-                tensor = _tensor_from_direct_bytes(raw, spec, device=materialize_device or self.config.device)
-                tensors[name] = tensor
+            if len(raw_payloads) != len(flat_lengths):
+                raise FeatureHandleError(
+                    "epd-direct managed-buffer batch read returned an invalid payload count: "
+                    f"expected={len(flat_lengths)} got={len(raw_payloads)}"
+                )
+            direct_read_timings = {
+                "read_ms": read_ms,
+                "nbytes": float(sum(flat_lengths)),
+                "descriptor_count": float(len(flat_lengths)),
+            }
+            payload_index = 0
+            for layout in normalized:
+                per_feature = []
+                for _, spec, _ in layout.ordered:
+                    per_feature.append(
+                        _tensor_from_direct_bytes(
+                            raw_payloads[payload_index],
+                            spec,
+                            device=materialize_device,
+                        )
+                    )
+                    payload_index += 1
+                materialized.append(per_feature)
+
+        tensor_materialize_ms = (time.perf_counter() - batch_started) * 1000.0
+        bundle_records: List[Tuple[_DirectRemoteHandleLayout, FeatureBundle, float]] = []
+        for layout, tensors in zip(normalized, materialized):
+            if len(tensors) != len(layout.ordered):
+                raise RuntimeError("epd-direct batch tensor reconstruction count mismatch")
+            named_tensors: Dict[str, torch.Tensor] = {}
+            intermediates: List[Tuple[int, torch.Tensor]] = []
+            for (name, _, layer), tensor in zip(layout.ordered, tensors):
+                named_tensors[name] = tensor
                 if layer is not None:
                     intermediates.append((int(layer), tensor))
-        tensor_ms = (time.perf_counter() - tensor_started) * 1000.0
+            try:
+                last_hidden = named_tensors["last_hidden"]
+            except KeyError as exc:
+                raise FeatureHandleError("epd-direct plan omitted last_hidden") from exc
+            bundle = FeatureBundle(
+                image_hash=layout.descriptor.feature_id,
+                last_hidden=last_hidden,
+                intermediates=intermediates,
+                grid_thw=named_tensors.get("grid_thw"),
+                metadata=self._direct_remote_bundle_metadata(layout),
+            )
+            validate_started = time.perf_counter()
+            layout.descriptor.validate_bundle(
+                bundle,
+                expected_model_fingerprint=self.config.expected_model_fingerprint,
+                expected_processor_fingerprint=self.config.expected_processor_fingerprint,
+                require_checksum=bool(self.config.require_checksum),
+            )
+            bundle_records.append(
+                (layout, bundle, (time.perf_counter() - validate_started) * 1000.0)
+            )
 
-        bundle_metadata = dict(descriptor.metadata or {})
-        if descriptor.model_fingerprint:
-            bundle_metadata["model_fingerprint"] = descriptor.model_fingerprint
-        if descriptor.processor_fingerprint:
-            bundle_metadata["processor_fingerprint"] = descriptor.processor_fingerprint
-        bundle_metadata.update(
-            {
-                "resolved_from": "epd-direct-peer-buffer",
-                "direct_remote_session": remote_session,
-            }
-        )
-        bundle = FeatureBundle(
-            image_hash=descriptor.feature_id,
-            last_hidden=tensors["last_hidden"],
-            intermediates=intermediates,
-            grid_thw=tensors.get("grid_thw"),
-            metadata=bundle_metadata,
-        )
-        validate_started = time.perf_counter()
-        descriptor.validate_bundle(
-            bundle,
-            expected_model_fingerprint=self.config.expected_model_fingerprint,
-            expected_processor_fingerprint=self.config.expected_processor_fingerprint,
-            require_checksum=bool(self.config.require_checksum),
-        )
-        validate_ms = (time.perf_counter() - validate_started) * 1000.0
+        batch_total_ms = (time.perf_counter() - batch_started) * 1000.0
+        batch_descriptor_count = len(flat_lengths)
+        batch_nbytes = sum(flat_lengths)
         trace_vllm_mm_hidden_event(
-            "feature_handle_direct_remote_resolved",
-            feature_id=handle.feature_id,
+            "feature_handle_direct_remote_batch_resolved",
             remote_session=remote_session,
-            tensor_count=len(ordered),
-            nbytes=sum(lengths),
             direct_read_mode=direct_read_mode,
-            remote_read_ms=read_ms,
-            tensor_materialize_ms=tensor_ms,
-            direct_read_timings_ms=direct_read_timings,
-            validate_ms=validate_ms,
+            batch_feature_count=len(normalized),
+            batch_descriptor_count=batch_descriptor_count,
+            batch_nbytes=batch_nbytes,
+            batch_read_ms=read_ms,
+            batch_total_ms=batch_total_ms,
         )
-        return bundle
+        bundles: List[FeatureBundle] = []
+        for batch_index, (layout, bundle, validate_ms) in enumerate(bundle_records):
+            timings = dict(direct_read_timings)
+            timings.update(
+                {
+                    "batch_feature_count": float(len(normalized)),
+                    "batch_index": float(batch_index),
+                    "batch_descriptor_count": float(batch_descriptor_count),
+                    "batch_nbytes": float(batch_nbytes),
+                    "batch_read_ms": read_ms,
+                    "batch_total_ms": batch_total_ms,
+                }
+            )
+            trace_vllm_mm_hidden_event(
+                "feature_handle_direct_remote_resolved",
+                feature_id=layout.handle.feature_id,
+                remote_session=remote_session,
+                tensor_count=len(layout.ordered),
+                nbytes=sum(layout.lengths),
+                direct_read_mode=direct_read_mode,
+                remote_read_ms=read_ms,
+                tensor_materialize_ms=tensor_materialize_ms,
+                direct_read_timings_ms=timings,
+                validate_ms=validate_ms,
+            )
+            bundles.append(bundle)
+        return bundles
 
     def _merge(
         self,
@@ -1122,7 +1464,9 @@ def inject_feature_handles_into_vllm_mm_kwargs(
     provider = provider or get_default_feature_handle_provider()
     out_kwargs: List[Tuple[str, Any]] = list(mm_kwargs)
     per_request_seen: Dict[str, int] = {}
+    grouped_items: "OrderedDict[str, List[Tuple[int, str, Any, FeatureHandle, str]]]" = OrderedDict()
     for idx, item in enumerate(list(mm_kwargs)):
+        handle: Optional[FeatureHandle] = None
         try:
             modality, original_item = item
             if modality != "image":
@@ -1136,28 +1480,19 @@ def inject_feature_handles_into_vllm_mm_kwargs(
             if not raw_payloads:
                 continue
             handles = [FeatureHandle.from_control_payload(dict(payload)) for payload in raw_payloads]
-            req_item_index = per_request_seen.get(req_id, 0)
-            per_request_seen[req_id] = req_item_index + 1
+            # An absent request id cannot safely imply that two scheduler items
+            # belong to one request.  Keep those items independent rather than
+            # accidentally combining remote buffers across requests.
+            group_key = req_id or f"__mooncake-unbound-mm-item-{idx}"
+            req_item_index = per_request_seen.get(group_key, 0)
+            per_request_seen[group_key] = req_item_index + 1
             mm_hash = str(mm_hashes[idx]) if idx < len(mm_hashes) else ""
             handle = _match_handle_for_mm_hash(handles, mm_hash, req_item_index)
             if handle is None:
                 continue
-            resolved = provider.resolve_from_sources(
-                {"mm_feature_handles": [handle.as_control_payload()]},
-                device=device,
-                dtype=dtype,
+            grouped_items.setdefault(group_key, []).append(
+                (idx, req_id, original_item, handle, mm_hash)
             )
-            if resolved is None:
-                continue
-            converted = _build_vllm_image_embedding_item(original_item, resolved)
-            if converted is not None:
-                out_kwargs[idx] = (modality, converted)
-                trace_vllm_mm_hidden_event(
-                    "feature_handle_injected_mm_item",
-                    req_id=req_id,
-                    mm_hash=mm_hash,
-                    handle_id=handle.handle_id,
-                )
         except Exception as exc:
             trace_vllm_mm_hidden_event(
                 "feature_handle_inject_mm_item_failed",
@@ -1166,8 +1501,7 @@ def inject_feature_handles_into_vllm_mm_kwargs(
                 strict=provider.config.strict,
             )
             direct_handle_failure = (
-                "handle" in locals()
-                and handle is not None
+                handle is not None
                 and str(handle.uri or "").startswith("epd-direct://")
             )
             if (
@@ -1179,6 +1513,94 @@ def inject_feature_handles_into_vllm_mm_kwargs(
             ):
                 raise
             continue
+
+    # The scheduler can batch image items from several requests.  Matching is
+    # intentionally request-local above, but once each item has a validated
+    # handle, peer-buffer reads are safe to coalesce across requests that share
+    # one Encoder remote session.  This removes another N-way control/data-plane
+    # dispatch in throughput-oriented scheduler batches without ever combining
+    # independent Mooncake sessions.
+    resolution_groups: "OrderedDict[Tuple[str, str], List[Tuple[int, str, Any, FeatureHandle, str]]]" = OrderedDict()
+    for request_key, request_entries in grouped_items.items():
+        for entry in request_entries:
+            index, _, _, handle, _ = entry
+            if provider._uses_remote_direct_feature_buffers(handle):
+                remote_session = str(
+                    dict(handle.metadata or {}).get("direct_remote_session") or ""
+                ).strip()
+                # Invalid metadata remains isolated so its failure cannot be
+                # confused with a valid remote session's batch.
+                group_key = (
+                    "remote-direct",
+                    remote_session or f"__invalid-remote-session-{index}",
+                )
+            else:
+                group_key = ("request", request_key)
+            resolution_groups.setdefault(group_key, []).append(entry)
+
+    for entries in resolution_groups.values():
+        handles = [handle for _, _, _, handle, _ in entries]
+        try:
+            resolved_items = provider.resolve_individual_handles(
+                handles,
+                device=device,
+                dtype=dtype,
+            )
+            if len(resolved_items) != len(entries):
+                raise RuntimeError(
+                    "individual FeatureHandle injection result count mismatch: "
+                    f"expected={len(entries)} got={len(resolved_items)}"
+                )
+        except Exception as exc:
+            for index, _, _, _, _ in entries:
+                trace_vllm_mm_hidden_event(
+                    "feature_handle_inject_mm_item_failed",
+                    index=index,
+                    error=f"{type(exc).__name__}: {exc}",
+                    strict=provider.config.strict,
+                )
+            direct_handle_failure = any(
+                str(handle.uri or "").startswith("epd-direct://")
+                for handle in handles
+            )
+            if (
+                provider.config.strict
+                or (
+                    direct_handle_failure
+                    and not provider.config.allow_direct_feature_fallback
+                )
+            ):
+                raise
+            continue
+
+        for (index, req_id, original_item, handle, mm_hash), resolved in zip(entries, resolved_items):
+            try:
+                converted = _build_vllm_image_embedding_item(original_item, resolved)
+                if converted is not None:
+                    out_kwargs[index] = ("image", converted)
+                    trace_vllm_mm_hidden_event(
+                        "feature_handle_injected_mm_item",
+                        req_id=req_id,
+                        mm_hash=mm_hash,
+                        handle_id=handle.handle_id,
+                    )
+            except Exception as exc:
+                trace_vllm_mm_hidden_event(
+                    "feature_handle_inject_mm_item_failed",
+                    index=index,
+                    error=f"{type(exc).__name__}: {exc}",
+                    strict=provider.config.strict,
+                )
+                direct_handle_failure = str(handle.uri or "").startswith("epd-direct://")
+                if (
+                    provider.config.strict
+                    or (
+                        direct_handle_failure
+                        and not provider.config.allow_direct_feature_fallback
+                    )
+                ):
+                    raise
+                continue
     return list(mm_hashes), out_kwargs, list(mm_lora_refs)
 
 

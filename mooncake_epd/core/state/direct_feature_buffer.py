@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
@@ -51,9 +52,16 @@ def _dtype_from_spec(spec: TensorSpec) -> torch.dtype:
 
 @dataclass
 class DirectFeatureBufferAllocation:
+    # ``feature_id`` identifies immutable feature *content*.  It does not
+    # identify one concrete GPU allocation: a non-persistent buffer may be
+    # released and later recreated for the same descriptor.  Keep an opaque
+    # allocation incarnation on the target/control-plane contract so vLLM's
+    # resolved-tensor cache can never retain a pointer-backed bundle across
+    # that lifetime boundary.
     feature_id: str
     descriptor: FeatureBundleDescriptor
     tensors: Dict[str, torch.Tensor]
+    allocation_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     nbytes: int = 0
     created_at: float = field(default_factory=time.monotonic)
     consumed: bool = False
@@ -90,6 +98,7 @@ class DirectFeatureBufferAllocation:
                 "Mooncake TransferEngine or explicit remote_session"
             )
         return {
+            "allocation_id": self.allocation_id,
             "feature_id": self.feature_id,
             "worker_id": self.worker_id,
             "remote_session": self.remote_session,
@@ -289,10 +298,23 @@ class DirectFeatureBufferRegistry:
         allocation_to_release: DirectFeatureBufferAllocation | None = None
         with self._lock:
             allocation = self._allocations.get(str(feature_id))
-            if allocation is not None and self.persistent_cache and allocation.ready:
-                allocation.ref_count = max(0, int(allocation.ref_count) - 1)
-                allocation.last_used_at = time.monotonic()
+            if allocation is None:
+                return
+
+            # Every /allocate or /lookup call owns one logical reference.  The
+            # old non-persistent branch removed the allocation unconditionally,
+            # so two concurrent requests sharing a feature could release the
+            # peer buffer while the second Prefill worker was still reading it.
+            # Keep the same refcount invariant for both cache modes.  A
+            # non-persistent allocation is removed only after its final request
+            # reference is released; a persistent allocation remains resident
+            # with ref_count=0 and is eligible for LRU eviction.
+            allocation.ref_count = max(0, int(allocation.ref_count) - 1)
+            allocation.last_used_at = time.monotonic()
+            if self.persistent_cache and allocation.ready:
                 victims = self._enforce_limits_locked()
+            elif allocation.ref_count > 0:
+                return
             else:
                 allocation_to_release = self._allocations.pop(str(feature_id), None)
                 if allocation_to_release is not None:
@@ -330,12 +352,33 @@ class DirectFeatureBufferRegistry:
             allocation.last_used_at = time.monotonic()
         return allocation
 
-    def lookup_ready(self, feature_id: str) -> Optional[DirectFeatureBufferAllocation]:
+    def lookup_ready(
+        self,
+        feature_id: str,
+        *,
+        lease_count: int = 1,
+    ) -> Optional[DirectFeatureBufferAllocation]:
+        """Return a ready allocation and acquire ``lease_count`` references.
+
+        A normal direct-feature lookup acquires one reference that the Proxy
+        releases after Prefill consumes the handle.  The Proxy can also reserve
+        a small, bounded batch of those references for an identical
+        generation-fenced request tuple.  Reserving them here is atomic with
+        the ready check, so a persistent-cache eviction can never reclaim the
+        peer buffer between a successful lookup and a later checkout.
+        """
+
+        try:
+            requested_leases = int(lease_count)
+        except (TypeError, ValueError) as exc:
+            raise FeatureHandleError("direct feature lease_count must be an integer") from exc
+        if requested_leases <= 0:
+            raise FeatureHandleError("direct feature lease_count must be positive")
         with self._lock:
             allocation = self._allocations.get(str(feature_id))
             if allocation is None or not allocation.ready:
                 return None
-            allocation.ref_count += 1
+            allocation.ref_count += requested_leases
             allocation.last_used_at = time.monotonic()
             return allocation
 
@@ -553,6 +596,14 @@ def _validate_direct_plan_matches_allocation(
     handle: FeatureHandle,
     allocation: DirectFeatureBufferAllocation,
 ) -> None:
+    expected_allocation_id = str(
+        dict(handle.metadata or {}).get("direct_allocation_id") or ""
+    ).strip()
+    if expected_allocation_id and expected_allocation_id != allocation.allocation_id:
+        raise FeatureHandleError(
+            "direct allocation incarnation mismatch: "
+            f"handle={expected_allocation_id} allocation={allocation.allocation_id}"
+        )
     plan = dict(handle.metadata.get("direct_plan") or {})
     raw_targets = list(plan.get("targets") or [])
     if not raw_targets:

@@ -13,6 +13,7 @@ from mooncake_epd.core.control.connector_metrics import ConnectorMetricsReader, 
 from mooncake_epd.core.control.vllm_transfer_primitives import LayeredTransferWorkerMeta
 from mooncake_epd.core.state import (
     FeatureStore,
+    KVTransferManifestV2,
     PagedKVManager,
     RadixTree,
     StateLayer,
@@ -71,6 +72,69 @@ def _build_refs(sl: StateLayer, token_ids) -> list:
         sl.pm.write_page_slots(ref, key, value, offset=0)
         refs.append(ref)
     return refs
+
+
+def test_stage_lifecycle_separates_queue_running_and_first_token():
+    cp = ServingControlPlane(
+        ServingControlPlaneConfig(node_id="proxy-lifecycle")
+    )
+    cp.register_stage_workers("decode", ["decode-0"])
+    ctx = cp.start_request(
+        {
+            "messages": [{"role": "user", "content": "hello"}],
+            "metadata": {"workflow_id": "wf-lifecycle"},
+        },
+        "req-lifecycle",
+    )
+
+    decision = cp.admit_stage("decode", ctx)
+    worker = cp.stage_workers("decode")[0]
+    assert decision.worker_id == "decode-0"
+    assert worker.queue_size == 1
+    assert worker.queued_requests == 1
+    assert worker.current_load == 0
+    assert worker.running_requests == 0
+
+    assert cp.mark_stage_started("decode", "decode-0", ctx=ctx) is True
+    assert cp.mark_stage_started("decode", "decode-0", ctx=ctx) is False
+    assert worker.queue_size == 0
+    assert worker.current_load == 1
+    assert worker.first_token_pending == 1
+    assert worker.active_decode_sequences == 1
+
+    assert (
+        cp.mark_stage_first_token(
+            "decode", "decode-0", ctx=ctx, first_token_ms=12.5
+        )
+        is True
+    )
+    assert (
+        cp.mark_stage_first_token(
+            "decode", "decode-0", ctx=ctx, first_token_ms=99.0
+        )
+        is False
+    )
+    assert worker.first_token_pending == 0
+    assert worker.avg_first_token_ms == pytest.approx(12.5)
+
+    cp.mark_stage_complete(
+        "decode",
+        "decode-0",
+        latency_ms=40.0,
+        success=True,
+        ctx=ctx,
+    )
+    cp.mark_stage_complete(
+        "decode",
+        "decode-0",
+        latency_ms=80.0,
+        success=True,
+        ctx=ctx,
+    )
+    assert worker.current_load == 0
+    assert worker.active_decode_sequences == 0
+    assert worker.avg_completion_ms == pytest.approx(40.0)
+    assert ctx.stage_lifecycle["decode"]["state"] == "completed"
 
 
 
@@ -141,6 +205,76 @@ def test_serving_control_plane_classifies_multimodal_and_builds_handoff():
     assert epd_stats["handoff_rolled_back"] == 0
     assert epd_stats["stage_dispatches"] == {"prefill": 1, "decode": 1}
     assert snapshot["metrics"]["path_stats"]["PD"]["requests_total"] == 0
+
+
+def test_serving_control_plane_binds_checksums_kv_transfer_manifest_before_decode(tmp_path):
+    generation_dir = tmp_path / "worker-generations"
+    generation_dir.mkdir()
+    (generation_dir / "prefill-0").write_text("prefill-generation-1\n", encoding="utf-8")
+    (generation_dir / "decode-0").write_text("decode-generation-runtime\n", encoding="utf-8")
+    cp = ServingControlPlane(
+        ServingControlPlaneConfig(
+            node_id="proxy-manifest",
+            require_kv_transfer_manifest_v2=True,
+            require_kv_transfer_manifest_compatibility=True,
+            worker_generation_dir=str(generation_dir),
+        )
+    )
+    cp.register_stage_workers("prefill", ["prefill-0"])
+    cp.register_stage_workers("decode", ["decode-0"])
+
+    ctx = cp.start_request(_mm_request(), "req-manifest")
+    prefill = cp.admit_stage("prefill", ctx)
+    cp.build_prefill_kv_params(ctx, prefill, decode_worker_id="decode-0")
+    handoff = cp.note_prefill_response(
+        ctx,
+        {
+            "transfer_id": "xfer-manifest",
+            "remote_engine_id": "epd-prefill",
+            "remote_bootstrap_addr": "http://prefill-bootstrap",
+            "remote_block_ids": [[101, 102], [103]],
+            "source_generation": "prefill-generation-1",
+            "destination_generation": "ignored-legacy-generation",
+            "mooncake_protocol": "tcp",
+            "transport_backend": "mooncake_engine_direct",
+            "kv_layout_v2": {
+                "model_id": "Qwen3-VL-8B-Instruct",
+                "model_revision": "revision-a",
+                "vllm_adapter_version": "mooncake-epd-adapter-1",
+                "dtype": "float16",
+                "block_size": 16,
+                "num_layers": 36,
+                "tp_size": 1,
+                "tp_rank": 0,
+            },
+        },
+        decode_worker_id="decode-0",
+    )
+    pre_dispatch = KVTransferManifestV2.from_control_payload(
+        handoff["kv_transfer_manifest_v2"]
+    )
+    assert pre_dispatch.destination_engine_id == "decode-0"
+    assert pre_dispatch.source_generation == "prefill-generation-1"
+
+    decode = cp.admit_stage("decode", ctx)
+    decode_kv = cp.build_decode_kv_params(ctx, decode, handoff)
+    manifest = KVTransferManifestV2.from_control_payload(
+        decode_kv["kv_transfer_manifest_v2"]
+    )
+    manifest.validate_for_consumer(
+        transfer_id="xfer-manifest",
+        workflow_id="wf-mm-1",
+        source_engine_id="epd-prefill",
+        source_generation="prefill-generation-1",
+        destination_engine_id="decode-0",
+        destination_generation="decode-generation-runtime",
+        require_compatibility=True,
+    )
+    assert "kv_transfer_manifest_v2" not in ctx.reuse_telemetry["kv_handoff"]
+    assert ctx.reuse_telemetry["kv_handoff"]["source_kv_transfer_manifest_v2"] == manifest.as_control_payload()
+    metrics = cp.snapshot()["metrics"]
+    assert metrics["kv_transfer_manifests_created"] == 1
+    assert metrics["kv_transfer_manifests_validated"] == 1
 
 
 def test_prefill_decode_transport_affinity_preserves_pair_and_bypasses_saturation():
@@ -406,6 +540,56 @@ def test_register_stage_workers_merges_incrementally():
     cp.register_stage_workers("decode", ["decode-0", "decode-1"])
     worker_ids = [worker.worker_id for worker in cp.stage_workers("decode")]
     assert worker_ids == ["decode-0", "decode-1"]
+
+
+def test_stage_lifecycle_tracks_tokens_and_idempotent_failure():
+    cp = ServingControlPlane(ServingControlPlaneConfig(node_id="proxy-tokens"))
+    cp.register_stage_workers("prefill", ["prefill-0"])
+    ctx = cp.start_request(
+        {
+            "messages": [{"role": "user", "content": "one two three"}],
+            "max_tokens": 8,
+        },
+        "req-token-lifecycle",
+    )
+    decision = cp.admit_stage("prefill", ctx)
+    worker = cp.stage_workers("prefill")[0]
+
+    assert worker.queued_tokens == 3
+    assert cp.mark_stage_started(
+        "prefill", decision.worker_id, ctx=ctx
+    )
+    assert worker.queued_tokens == 0
+    assert worker.running_tokens == 3
+
+    cp.mark_stage_failed_or_cancelled(
+        "prefill",
+        decision.worker_id,
+        ctx=ctx,
+        latency_ms=2.0,
+    )
+    cp.mark_stage_failed_or_cancelled(
+        "prefill",
+        decision.worker_id,
+        ctx=ctx,
+        latency_ms=3.0,
+    )
+
+    assert worker.running_tokens == 0
+    assert worker.running_requests == 0
+    assert ctx.stage_lifecycle["prefill"]["state"] == "failed"
+
+
+def test_worker_snapshot_exposes_unknown_telemetry_as_null():
+    cp = ServingControlPlane(
+        ServingControlPlaneConfig(node_id="proxy-unknown-telemetry")
+    )
+    cp.register_stage_workers("decode", ["decode-0"])
+
+    worker = cp.snapshot()["workers"]["decode"][0]
+
+    assert worker["telemetry"]["gpu_utilization"] is None
+    assert worker["telemetry_known"]["gpu_utilization"] is False
 
 
 
@@ -684,6 +868,14 @@ def test_serving_control_plane_records_cross_step_reuse_in_hot_path_registry(tmp
             "remote_block_ids": [[501, 502]],
         },
         decode_worker_id="decode-0",
+    )
+    cp.mark_stage_started("prefill", prefill0.worker_id, ctx=ctx0)
+    cp.mark_stage_complete(
+        "prefill",
+        prefill0.worker_id,
+        latency_ms=10.0,
+        success=True,
+        ctx=ctx0,
     )
     decode0 = cp.admit_stage("decode", ctx0)
     cp.build_decode_kv_params(ctx0, decode0, kv0)

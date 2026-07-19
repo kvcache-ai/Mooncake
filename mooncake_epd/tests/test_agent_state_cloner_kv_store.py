@@ -102,6 +102,10 @@ def test_agent_state_cloner_same_node_tensor_api_is_explicit_zero_copy():
     assert cached_key is key
     assert cached_value is value
     assert cloner.get_stats()["total_ref_counts"] == 2
+    cloner.release_branch("tensor-branch")
+    cloner.release_branch("tensor-parent")
+    assert cloner.get_stats()["total_kv_caches"] == 0
+    assert cloner.get_stats()["total_ref_counts"] == 0
 
 
 def test_agent_state_cloner_rejects_same_node_descriptor_share_api():

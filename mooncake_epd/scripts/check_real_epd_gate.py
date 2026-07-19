@@ -83,6 +83,60 @@ def validate_real_epd_summary(summary: Mapping[str, Any]) -> None:
     if int(response.get("response_content_len", 0) or 0) <= 0:
         failures.append("response content is empty")
 
+    # A transport or source-lifetime fault can yield a non-empty HTTP 200 and
+    # clean byte-count metrics while changing the model completion.  The online
+    # runner enables this exact-output check only for repeated deterministic
+    # request surfaces; honor that recorded requirement here so a later gate
+    # invocation cannot relabel a quality-failed artifact as a real EPD pass.
+    # New artifacts cover both warmup and measured requests. A cold-start
+    # corruption is a correctness failure even when a warmed cache happens to
+    # produce stable completions; retain the measured-only fallback for older
+    # artifacts.
+    response_consistency = summary.get(
+        "all_response_consistency", summary.get("response_consistency")
+    )
+    if isinstance(response_consistency, Mapping) and bool(
+        response_consistency.get("required", False)
+    ):
+        if not bool(response_consistency.get("applicable", False)):
+            failures.append(
+                "deterministic response-consistency gate was required but no request repeated"
+            )
+        elif not bool(response_consistency.get("pass", False)):
+            inconsistent = list(
+                response_consistency.get("inconsistent_group_ids") or []
+            )
+            failures.append(
+                "deterministic response-consistency failure"
+                + (f": groups={inconsistent}" if inconsistent else "")
+            )
+
+    reference_equivalence = summary.get("reference_response_equivalence")
+    if isinstance(reference_equivalence, Mapping) and bool(
+        reference_equivalence.get("required", False)
+    ):
+        if not bool(reference_equivalence.get("applicable", False)):
+            failures.append(
+                "reference response-equivalence gate was required but no comparable responses exist"
+            )
+        elif not bool(reference_equivalence.get("pass", False)):
+            unexpected = dict(
+                reference_equivalence.get("unexpected_candidate_hashes_by_group")
+                or {}
+            )
+            missing = list(
+                reference_equivalence.get("missing_reference_group_ids") or []
+            )
+            details: List[str] = []
+            if missing:
+                details.append(f"missing_groups={missing}")
+            if unexpected:
+                details.append(f"unexpected_hash_groups={sorted(unexpected)}")
+            failures.append(
+                "reference response-equivalence failure"
+                + (f": {', '.join(details)}" if details else "")
+            )
+
     if _as_int(metrics, "requests_multimodal") < 1:
         failures.append("requests_multimodal < 1")
     if _as_int(metrics, "precomputed_hits") < 1:

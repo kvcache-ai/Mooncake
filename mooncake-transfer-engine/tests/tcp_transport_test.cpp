@@ -60,6 +60,16 @@ class TCPTransportTest : public ::testing::Test {
         google::InitGoogleLogging("TCPTransportTest");
         FLAGS_logtostderr = 1;
 
+        // Exercise the TCP remote-write acknowledgement on the same real
+        // write/read path used by GPU-aware TCP. The sender must not complete
+        // a WRITE until the receiver has processed the full payload.
+        const char* ack_env = std::getenv("MC_TCP_WRITE_COMPLETION_ACK");
+        if (ack_env != nullptr) {
+            prior_write_completion_ack = ack_env;
+            had_prior_write_completion_ack = true;
+        }
+        setenv("MC_TCP_WRITE_COMPLETION_ACK", "1", 1);
+
         const char *env = std::getenv("MC_METADATA_SERVER");
         if (env)
             metadata_server = env;
@@ -76,12 +86,20 @@ class TCPTransportTest : public ::testing::Test {
     }
 
     void TearDown() override {
+        if (had_prior_write_completion_ack) {
+            setenv("MC_TCP_WRITE_COMPLETION_ACK",
+                   prior_write_completion_ack.c_str(), 1);
+        } else {
+            unsetenv("MC_TCP_WRITE_COMPLETION_ACK");
+        }
         // 清理 glog
         google::ShutdownGoogleLogging();
     }
 
     std::string metadata_server;
     std::string local_server_name;
+    std::string prior_write_completion_ack;
+    bool had_prior_write_completion_ack = false;
 };
 
 static void *allocateMemoryPool(size_t size, int socket_id,

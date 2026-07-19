@@ -26,7 +26,12 @@ from mooncake_epd.core.state import PagedKVManager  # noqa: E402
 from mooncake_epd.core.transfer import Channel, Mode, TransferEngine, TransferPolicy  # noqa: E402
 
 
-pytestmark = [pytest.mark.mooncake, pytest.mark.gpu, pytest.mark.slow]
+pytestmark = [
+    pytest.mark.mooncake,
+    pytest.mark.gpu,
+    pytest.mark.gpu_multi_node,
+    pytest.mark.slow,
+]
 
 GPU_SRC = torch.device("cuda:3")
 GPU_DST = torch.device("cuda:4")

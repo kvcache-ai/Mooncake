@@ -17,6 +17,7 @@ from .scheduler import (
     AgentScheduler,
     AgentType,
     DegradeLevel,
+    SchedulingPolicy,
     WorkerLoad,
 )
 
@@ -27,6 +28,7 @@ __all__ = [
     "AgentScheduler",
     "AgentType",
     "DegradeLevel",
+    "SchedulingPolicy",
     "ElasticEPDRatio",
     "OffloadManager",
     "ReusePipeline",

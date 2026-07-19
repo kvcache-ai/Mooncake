@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import ctypes
+import time
 from pathlib import Path
 
 import torch
@@ -8,12 +10,46 @@ import torch
 from mooncake_epd.core.control.connector_metrics import ConnectorMetricsReader, ConnectorMetricsSink
 from mooncake_epd.core.control.vllm_transfer_primitives import LayeredTransferWorkerMeta
 from mooncake_epd.core.state.vllm_mm_hidden_cache import VLLMMMHiddenStateCache
+from mooncake_epd.core.state.hidden_cache_policy import HiddenCachePolicy
+from mooncake_epd.core.state.mooncake_hidden_state_store import MooncakeHiddenStateStore
 
 
 class _Visual:
     spatial_merge_size = 2
     out_hidden_size = 8
     dtype = torch.float32
+
+
+class _RegisteredBufferStore:
+    def __init__(self) -> None:
+        self.payloads: dict[str, bytes] = {}
+        self.registered: set[int] = set()
+
+    def register_buffer(self, pointer: int, _size: int) -> int:
+        self.registered.add(int(pointer))
+        return 0
+
+    def unregister_buffer(self, pointer: int) -> int:
+        self.registered.discard(int(pointer))
+        return 0
+
+    def batch_put_from(self, keys, pointers, sizes):
+        for key, pointer, size in zip(keys, pointers, sizes):
+            assert int(pointer) in self.registered
+            self.payloads[str(key)] = ctypes.string_at(int(pointer), int(size))
+        return [0] * len(keys)
+
+    def batch_get_into(self, keys, pointers, sizes):
+        result = []
+        for key, pointer, size in zip(keys, pointers, sizes):
+            assert int(pointer) in self.registered
+            ctypes.memmove(int(pointer), self.payloads[str(key)], int(size))
+            result.append(int(size))
+        return result
+
+    def remove(self, key, _force=False):
+        self.payloads.pop(str(key), None)
+        return 0
 
 
 def test_vllm_mm_hidden_cache_skips_second_vision_compute(monkeypatch, tmp_path):
@@ -59,6 +95,100 @@ def test_vllm_mm_hidden_cache_skips_second_vision_compute(monkeypatch, tmp_path)
     assert len(payloads) == 1
     assert payloads[0]["kind"] == "mm_hidden_cache"
     assert payloads[0]["metrics"]["hits"] == 1
+
+
+def test_vllm_l1_hit_does_not_expose_mutable_internal_tensor(monkeypatch):
+    monkeypatch.setenv("MOONCAKE_EPD_VLLM_MM_HIDDEN_CACHE", "1")
+    cache = VLLMMMHiddenStateCache()
+    pixels = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    grid = torch.tensor([[1, 1, 3]], dtype=torch.long)
+    calls = {"count": 0}
+
+    def compute():
+        calls["count"] += 1
+        return torch.full((3, 2), 4.0, dtype=torch.float32)
+
+    first = cache.get_or_compute(
+        pixel_values=pixels,
+        grid_thw=grid,
+        compute_fn=compute,
+        namespace="l1-isolation",
+    )
+    # The first result is compute-owned.  Mutating the later L1 hit must not
+    # mutate the cached internal CPU tensor seen by subsequent requests.
+    second = cache.get_or_compute(
+        pixel_values=pixels,
+        grid_thw=grid,
+        compute_fn=compute,
+        namespace="l1-isolation",
+    )
+    second[0, 0] = -1
+    third = cache.get_or_compute(
+        pixel_values=pixels,
+        grid_thw=grid,
+        compute_fn=compute,
+        namespace="l1-isolation",
+    )
+    assert calls["count"] == 1
+    assert first[0, 0] == 4
+    assert third[0, 0] == 4
+
+
+def test_vllm_exact_l2_reuses_stable_hidden_state_across_workers(monkeypatch):
+    monkeypatch.setenv("MOONCAKE_EPD_VLLM_MM_HIDDEN_CACHE", "1")
+    policy = HiddenCachePolicy(
+        enable_l1=True,
+        enable_l2=True,
+        model_id="qwen-vl",
+        model_revision="model-r1",
+        processor_revision="processor-r1",
+        output_schema="qwen3vl-image-embeds-v1",
+        lease_seconds=30.0,
+    )
+    backing = _RegisteredBufferStore()
+    writer = VLLMMMHiddenStateCache(
+        l2_store=MooncakeHiddenStateStore(backing),
+        l2_policy=policy,
+    )
+    reader = VLLMMMHiddenStateCache(
+        l2_store=MooncakeHiddenStateStore(backing),
+        l2_policy=policy,
+    )
+
+    class Visual(_Visual):
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, pixel_values, *, grid_thw):
+            self.calls += 1
+            return torch.tensor([[10.0, 11.0]], dtype=torch.float32)
+
+    grid = torch.tensor([[1, 2, 2]], dtype=torch.long)
+    pixels = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    first_visual = Visual()
+    first = writer.get_or_compute_qwen3vl_items(
+        pixel_values=pixels,
+        grid_thw=grid,
+        visual=first_visual,
+        compute_fn=lambda: first_visual(pixels, grid_thw=grid),
+        namespace="qwen3vl:test",
+        stable_keys=["sha256:asset-a"],
+    )
+    assert first_visual.calls == 1
+    assert writer.stats["l2_stores"] == 1
+
+    second_visual = Visual()
+    second = reader.get_or_compute_qwen3vl_items(
+        pixel_values=pixels + 100,
+        grid_thw=grid,
+        visual=second_visual,
+        compute_fn=lambda: second_visual(pixels + 100, grid_thw=grid),
+        namespace="qwen3vl:test",
+        stable_keys=["sha256:asset-a"],
+    )
+    assert second_visual.calls == 0
+    assert torch.equal(second, first)
+    assert reader.stats["l2_hits"] == 1
 
 
 def test_connector_metrics_reader_aggregates_hidden_cache_without_polluting_kv_workers(tmp_path):
@@ -204,3 +334,27 @@ def test_precomputed_image_embeds_hit_is_counted(monkeypatch, tmp_path):
     assert stats["hits"] == 2
     assert stats["stable_key_lookups"] == 2
     assert stats["precomputed_image_embeds_hits"] == 2
+
+
+def test_precomputed_hit_is_persisted_after_rate_limited_initial_snapshot(monkeypatch, tmp_path):
+    """A one-request worker must not lose strict-gate evidence at teardown."""
+
+    monkeypatch.setenv("MOONCAKE_EPD_VLLM_MM_HIDDEN_CACHE", "1")
+    monkeypatch.setenv("MOONCAKE_EPD_VLLM_MM_HIDDEN_CACHE_METRICS_INTERVAL_S", "0.02")
+    monkeypatch.setenv("MOONCAKE_EPD_CONNECTOR_METRICS_DIR", str(tmp_path))
+    monkeypatch.setenv("MOONCAKE_EPD_ENGINE_ID", "deferred-flush-test")
+    monkeypatch.setenv("MOONCAKE_EPD_KV_ROLE", "kv_producer")
+
+    cache = VLLMMMHiddenStateCache()
+    cache.record_precomputed_image_embeds_hit(count=1, stable_keys=["image-a"])
+
+    deadline = time.monotonic() + 1.0
+    persisted = 0
+    while time.monotonic() < deadline:
+        payloads = [json.loads(path.read_text()) for path in tmp_path.glob("*.mm_hidden.json")]
+        if payloads:
+            persisted = int(payloads[0]["metrics"].get("precomputed_image_embeds_hits", 0) or 0)
+        if persisted == 1:
+            break
+        time.sleep(0.01)
+    assert persisted == 1

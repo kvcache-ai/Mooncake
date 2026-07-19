@@ -49,6 +49,8 @@ def test_layered_transfer_worker_meta_aggregate():
         grouped_descriptors=4,
         peer_buffer_batches=2,
         peer_buffer_bytes=128,
+        source_ready_event_waits=2,
+        source_ready_event_wait_ms=1.5,
         received_group_batches=1,
         received_finished_reqs=1,
         layer_wait_calls=2,
@@ -69,6 +71,9 @@ def test_layered_transfer_worker_meta_aggregate():
         failed_batches=1,
         fallback_batches=1,
         fallback_bytes=64,
+        source_ready_event_waits=1,
+        source_ready_event_wait_ms=0.5,
+        source_ready_sync_fallbacks=1,
         received_group_batches=2,
         received_finished_reqs=3,
         layer_wait_calls=1,
@@ -90,6 +95,9 @@ def test_layered_transfer_worker_meta_aggregate():
     assert merged.failed_batches == 1
     assert merged.peer_buffer_batches == 2
     assert merged.peer_buffer_bytes == 128
+    assert merged.source_ready_event_waits == 3
+    assert merged.source_ready_event_wait_ms == 2.0
+    assert merged.source_ready_sync_fallbacks == 1
     assert merged.fallback_batches == 1
     assert merged.fallback_bytes == 64
     assert merged.received_group_batches == 3
@@ -116,6 +124,9 @@ def test_layered_transfer_worker_meta_roundtrip_and_empty_detection():
         failed_batches=0,
         peer_buffer_batches=1,
         peer_buffer_bytes=256,
+        source_ready_event_waits=1,
+        source_ready_event_wait_ms=0.75,
+        source_ready_sync_fallbacks=1,
         fallback_batches=0,
         fallback_bytes=0,
         accumulated_group_delay_ms=1.5,

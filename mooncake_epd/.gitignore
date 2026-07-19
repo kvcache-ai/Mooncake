@@ -14,6 +14,3 @@ config/
 coding_plan/
 benchmarks/benchmark_results.json
 benchmarks/*_results.json
-artifacts/phase6_metrics.json
-artifacts/rfc_*.json
-artifacts/rfc_*.md

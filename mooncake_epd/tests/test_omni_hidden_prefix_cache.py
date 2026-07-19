@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import ctypes
 import threading
 import time
 from types import SimpleNamespace
@@ -11,11 +12,47 @@ from mooncake_epd.core.state.omni_hidden_prefix_cache import (
     OmniHiddenPrefixCache,
     OmniHiddenPrefixCacheConfig,
     install_qwen2_5_omni_hidden_prefix_cache,
+    use_omni_hidden_cache_keys,
 )
+from mooncake_epd.core.state.hidden_cache_policy import HiddenCachePolicy
+from mooncake_epd.core.state.mooncake_hidden_state_store import MooncakeHiddenStateStore
 
 
 class _FakeVisual:
     spatial_merge_size = 1
+    dtype = torch.float32
+
+
+class _RegisteredBufferStore:
+    def __init__(self) -> None:
+        self.payloads: dict[str, bytes] = {}
+        self.registered: set[int] = set()
+
+    def register_buffer(self, pointer: int, _size: int) -> int:
+        self.registered.add(int(pointer))
+        return 0
+
+    def unregister_buffer(self, pointer: int) -> int:
+        self.registered.discard(int(pointer))
+        return 0
+
+    def batch_put_from(self, keys, pointers, sizes):
+        for key, pointer, size in zip(keys, pointers, sizes):
+            assert int(pointer) in self.registered
+            self.payloads[str(key)] = ctypes.string_at(int(pointer), int(size))
+        return [0] * len(keys)
+
+    def batch_get_into(self, keys, pointers, sizes):
+        results = []
+        for key, pointer, size in zip(keys, pointers, sizes):
+            assert int(pointer) in self.registered
+            ctypes.memmove(int(pointer), self.payloads[str(key)], int(size))
+            results.append(int(size))
+        return results
+
+    def remove(self, key, _force=False):
+        self.payloads.pop(str(key), None)
+        return 0
 
 
 class _FakeAudioTower:
@@ -52,7 +89,15 @@ class _FakeOmniThinker:
 
 def _cache() -> OmniHiddenPrefixCache:
     return OmniHiddenPrefixCache(
-        OmniHiddenPrefixCacheConfig(enabled=True, max_entries=16, max_bytes=1024 * 1024, store_on_gpu=False, allow_partial_prefix_reuse=True)
+        OmniHiddenPrefixCacheConfig(
+            enabled=True,
+            max_entries=16,
+            max_bytes=1024 * 1024,
+            store_on_gpu=False,
+            allow_partial_prefix_reuse=True,
+            partial_oracle_validated=True,
+            allow_tensor_hash_fallback=True,
+        )
     )
 
 
@@ -110,7 +155,13 @@ def test_audio_hidden_prefix_cache_reuses_prefix_and_subsets_masks():
 def test_default_image_cache_uses_exact_batch_reuse_for_qwen25_safety():
     model = _FakeOmniThinker()
     cache = OmniHiddenPrefixCache(
-        OmniHiddenPrefixCacheConfig(enabled=True, max_entries=16, max_bytes=1024 * 1024, store_on_gpu=False)
+        OmniHiddenPrefixCacheConfig(
+            enabled=True,
+            max_entries=16,
+            max_bytes=1024 * 1024,
+            store_on_gpu=False,
+            allow_tensor_hash_fallback=True,
+        )
     )
     install_qwen2_5_omni_hidden_prefix_cache(model, cache)
 
@@ -133,6 +184,90 @@ def test_default_image_cache_uses_exact_batch_reuse_for_qwen25_safety():
     assert stats["partial_hit_batches"] == 0
 
 
+def test_default_omni_cache_requires_stable_identity_instead_of_hashing_full_tensor():
+    model = _FakeOmniThinker()
+    cache = OmniHiddenPrefixCache(
+        OmniHiddenPrefixCacheConfig(
+            enabled=True,
+            max_entries=16,
+            max_bytes=1024 * 1024,
+            store_on_gpu=False,
+            # Default false is the production-safe behavior under test.
+            allow_tensor_hash_fallback=False,
+        )
+    )
+    install_qwen2_5_omni_hidden_prefix_cache(model, cache)
+    grid = torch.tensor([[1, 1, 2]], dtype=torch.long)
+    pixels = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+
+    # No content identity: exact caching is intentionally bypassed.
+    model.get_image_features(pixels, image_grid_thw=grid, return_dict=True)
+    model.get_image_features(pixels, image_grid_thw=grid, return_dict=True)
+    assert model.image_calls == [2, 2]
+    assert cache.stats["hash_ms_total"] == 0.0
+    assert cache.stats["skipped_unkeyed_calls"] == 2
+
+    # Stable ingest-time identity enables exact L1 reuse without tensor hashing.
+    with use_omni_hidden_cache_keys(["sha256:asset-a"]):
+        first = model.get_image_features(pixels, image_grid_thw=grid, return_dict=True).pooler_output
+    with use_omni_hidden_cache_keys(["sha256:asset-a"]):
+        second = model.get_image_features(pixels, image_grid_thw=grid, return_dict=True).pooler_output
+    second[0, 0] = -1
+    with use_omni_hidden_cache_keys(["sha256:asset-a"]):
+        third = model.get_image_features(pixels, image_grid_thw=grid, return_dict=True).pooler_output
+    assert model.image_calls == [2, 2, 2]
+    assert torch.equal(first, pixels[:, :2])
+    assert third[0, 0] == pixels[0, 0]
+    assert cache.stats["stable_key_lookups"] >= 3
+
+
+def test_omni_exact_l2_reuses_stable_batch_across_workers():
+    policy = HiddenCachePolicy(
+        enable_l1=True,
+        enable_l2=True,
+        model_id="qwen2.5-omni",
+        model_revision="model-r1",
+        processor_revision="processor-r1",
+        output_schema="qwen2.5-omni-image-hidden-v1",
+        lease_seconds=30.0,
+    )
+    backing = _RegisteredBufferStore()
+    first_cache = OmniHiddenPrefixCache(
+        OmniHiddenPrefixCacheConfig(enabled=True, max_entries=16, max_bytes=1024 * 1024),
+        l2_store=MooncakeHiddenStateStore(backing),
+        l2_policy=policy,
+    )
+    first_model = _FakeOmniThinker()
+    install_qwen2_5_omni_hidden_prefix_cache(first_model, first_cache)
+    grid = torch.tensor([[1, 1, 2]], dtype=torch.long)
+    pixels = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    with use_omni_hidden_cache_keys(["sha256:asset-a"]):
+        first = first_model.get_image_features(
+            pixels,
+            image_grid_thw=grid,
+            return_dict=True,
+        ).pooler_output
+    assert first_model.image_calls == [2]
+    assert first_cache.stats["l2_stores"] == 1
+
+    second_cache = OmniHiddenPrefixCache(
+        OmniHiddenPrefixCacheConfig(enabled=True, max_entries=16, max_bytes=1024 * 1024),
+        l2_store=MooncakeHiddenStateStore(backing),
+        l2_policy=policy,
+    )
+    second_model = _FakeOmniThinker()
+    install_qwen2_5_omni_hidden_prefix_cache(second_model, second_cache)
+    with use_omni_hidden_cache_keys(["sha256:asset-a"]):
+        second = second_model.get_image_features(
+            pixels + 999,
+            image_grid_thw=grid,
+            return_dict=True,
+        ).pooler_output
+    assert second_model.image_calls == []
+    assert torch.equal(second, first)
+    assert second_cache.stats["l2_hits"] == 1
+
+
 def test_install_prefix_cache_is_idempotent():
     model = _FakeOmniThinker()
     cache = _cache()
@@ -149,7 +284,13 @@ def test_exact_batch_cache_coalesces_concurrent_image_misses():
 
     model = _SlowFakeOmniThinker()
     cache = OmniHiddenPrefixCache(
-        OmniHiddenPrefixCacheConfig(enabled=True, max_entries=16, max_bytes=1024 * 1024, store_on_gpu=False)
+        OmniHiddenPrefixCacheConfig(
+            enabled=True,
+            max_entries=16,
+            max_bytes=1024 * 1024,
+            store_on_gpu=False,
+            allow_tensor_hash_fallback=True,
+        )
     )
     install_qwen2_5_omni_hidden_prefix_cache(model, cache)
 
@@ -189,6 +330,7 @@ def test_metrics_path_can_be_relative_filename(tmp_path, monkeypatch):
             store_on_gpu=False,
             metrics_path=path,
             metrics_flush_interval_s=0.0,
+            allow_tensor_hash_fallback=True,
         )
     )
     model = _FakeOmniThinker()

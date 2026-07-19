@@ -1,0 +1,44 @@
+name: EPD CPU Regression
+
+on:
+  pull_request:
+    paths:
+      - 'mooncake_epd/**'
+      - 'sitecustomize.py'
+      - '.github/workflows/epd-cpu.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'mooncake_epd/**'
+      - 'sitecustomize.py'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  cpu:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    env:
+      PYTHONPATH: ${{ github.workspace }}
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
+      MOONCAKE_EPD_ENABLE_VLLM_PATCHES: '0'
+      HF_HUB_OFFLINE: '1'
+      TRANSFORMERS_OFFLINE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Install CPU test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install numpy Pillow fastapi httpx uvicorn pytest pytest-timeout
+      - name: Compile EPD modules
+        run: python -m compileall -q mooncake_epd sitecustomize.py
+      - name: Run EPD CPU regression suite
+        run: python -m pytest -q mooncake_epd/tests

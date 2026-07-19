@@ -91,10 +91,22 @@ class AgentStateCloner:
         kv_cache: Tuple[torch.Tensor, torch.Tensor],
     ):
         """注册一份 KV Cache 到 Store"""
+        if cache_id in self._caches or cache_id in self._branches:
+            raise ValueError(f"KV Cache '{cache_id}' is already registered")
         k, v = kv_cache
         size_bytes = k.nelement() * k.element_size() + v.nelement() * v.element_size()
         self._caches[cache_id] = _CacheEntry(
             kv_cache=kv_cache, ref_count=1, size_bytes=size_bytes,
+        )
+        # The parent is a real logical owner, not merely an anonymous cache
+        # entry.  Tracking it as a branch makes release deterministic and
+        # prevents the original tensor from leaking after every child exits.
+        self._branch_to_cache[cache_id] = cache_id
+        self._branches[cache_id] = BranchState(
+            branch_id=cache_id,
+            parent_id=None,
+            source_cache_id=cache_id,
+            clone_semantics="same_node_tensor_owner",
         )
         logger.info(f"Registered KV Cache '{cache_id}', size={size_bytes / 1024 / 1024:.1f}MB")
 
