@@ -24,6 +24,12 @@
 
 #include <ylt/util/tl/expected.hpp>
 #include "storage/distributed/distributed_storage_backend.h"
+#ifdef HAVE_OSS_ADAPTER
+#include "storage/distributed/oss_adapter.h"
+#endif
+#ifdef USE_3FS
+#include "storage/distributed/hf3fs_adapter.h"
+#endif
 
 namespace mooncake {
 
@@ -4352,6 +4358,13 @@ CreateStorageBackend(const FileStorageConfig& config) {
 #ifdef USE_3FS
                 adapter = std::make_unique<Hf3fsAdapter>();
 #else
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+#endif
+            } else if (distributed_config.fs_adapter_type == "oss") {
+#ifdef HAVE_OSS_ADAPTER
+                adapter = std::make_unique<OssFileSystemAdapter>();
+#else
+                LOG(ERROR) << "OSS adapter requires libcurl and OpenSSL";
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
 #endif
             } else {

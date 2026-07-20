@@ -28,7 +28,7 @@ bool DistributedStorageConfig::Validate() const {
         LOG(ERROR) << "DistributedStorageConfig: fs_adapter_type is empty";
         return false;
     }
-    if (fs_adapter_type != "hf3fs") {
+    if (fs_adapter_type != "hf3fs" && fs_adapter_type != "oss") {
         LOG(ERROR) << "DistributedStorageConfig: unsupported fs_adapter_type: "
                    << fs_adapter_type;
         return false;
@@ -77,13 +77,15 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::Init() {
     auto init_result = fs_adapter_->Init(root_dir_);
     if (!init_result) return init_result;
 
-    // Ensure root directory exists before health check
     std::error_code ec;
-    std::filesystem::create_directories(root_dir_, ec);
-    if (ec) {
-        LOG(ERROR) << "Failed to create root directory " << root_dir_ << ": "
-                   << ec.message();
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    if (fs_adapter_->RequiresLocalDirectories()) {
+        // POSIX-like adapters require the directory hierarchy to exist.
+        std::filesystem::create_directories(root_dir_, ec);
+        if (ec) {
+            LOG(ERROR) << "Failed to create root directory " << root_dir_
+                       << ": " << ec.message();
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
     }
 
     if (distributed_config_.enable_health_check) {
@@ -119,14 +121,16 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::Init() {
                   << fs_adapter_->GetName();
     }
 
-    // Ensure hash bucket directories exist
-    for (int i = 0; i < hash_bucket_count_; ++i) {
-        std::string bucket_dir = fmt::format("{}/{:02x}", root_dir_, i);
-        std::filesystem::create_directories(bucket_dir, ec);
-        if (ec) {
-            LOG(ERROR) << "Failed to create bucket directory " << bucket_dir
-                       << ": " << ec.message();
-            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    if (fs_adapter_->RequiresLocalDirectories()) {
+        // Ensure hash bucket directories exist.
+        for (int i = 0; i < hash_bucket_count_; ++i) {
+            std::string bucket_dir = fmt::format("{}/{:02x}", root_dir_, i);
+            std::filesystem::create_directories(bucket_dir, ec);
+            if (ec) {
+                LOG(ERROR) << "Failed to create bucket directory " << bucket_dir
+                           << ": " << ec.message();
+                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+            }
         }
     }
 

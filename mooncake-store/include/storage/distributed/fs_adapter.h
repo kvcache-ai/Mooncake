@@ -107,6 +107,9 @@ class FileSystemAdapter {
     // === Identity ===
 
     virtual const char* GetName() const = 0;
+
+    // Object stores have a flat namespace and do not need local directories.
+    virtual bool RequiresLocalDirectories() const { return true; }
 };
 
 }  // namespace mooncake
