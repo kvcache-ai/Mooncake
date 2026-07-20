@@ -167,7 +167,8 @@ class FakeSubBatch : public Transport::SubBatch {
 
 class FakeTransport : public Transport {
    public:
-    explicit FakeTransport(TransportType self_type) : self_type_(self_type) {
+    explicit FakeTransport(TransportType self_type, bool force_fail = false)
+        : self_type_(self_type), force_fail_(force_fail) {
         caps.dram_to_dram = true;
     }
     std::atomic<int> submit_calls{0};
@@ -196,7 +197,10 @@ class FakeTransport : public Transport {
         for (const auto& request : requests) {
             fake->requests.push_back(request);
             fake->statuses.push_back(
-                {TransferStatusEnum::COMPLETED, request.length});
+                force_fail_
+                    ? TransferStatus{TransferStatusEnum::FAILED, 0}
+                    : TransferStatus{TransferStatusEnum::COMPLETED,
+                                      request.length});
             ++fake->task_count;
         }
         batch->notifyProgress();
@@ -247,6 +251,7 @@ class FakeTransport : public Transport {
 
    private:
     TransportType self_type_;
+    bool force_fail_;
 };
 
 std::shared_ptr<Config> makeMetricsTestConfig() {
@@ -497,6 +502,55 @@ TEST_F(MetricsRecordingTest, FeasibleDeadlineRecordsMLU) {
     EXPECT_EQ(after.counter("tent_deadline_infeasible_total") -
                   before.counter("tent_deadline_infeasible_total"),
               0);
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
+}
+
+// ---------------------------------------------------------------------------
+// A failed transfer whose deadline was already in the past at submit must
+// also increment the infeasible counter. The infeasible-at-submit condition
+// is independent of the transfer outcome, so it is recorded for both
+// COMPLETED and FAILED (the MLU histogram, which needs actual latency, is
+// only recorded on COMPLETED).
+// ---------------------------------------------------------------------------
+TEST_F(MetricsRecordingTest, InfeasibleDeadlineRecordedOnFailedTransfer) {
+    auto cfg = makeMetricsTestConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake = std::make_shared<FakeTransport>(RDMA, /*force_fail=*/true);
+    installFakeRdma(engine, fake);
+
+    constexpr size_t kLen = 4096;
+    std::vector<uint8_t> buf(kLen, 0xBB);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), buf.size()).ok());
+
+    BatchID batch = engine.allocateBatch(4);
+    ASSERT_NE(batch, (BatchID)0);
+
+    auto before = MetricsSnapshot(TentMetrics::instance());
+    // deadline_ns = 1 is always in the past relative to steady_clock now.
+    ASSERT_TRUE(engine
+                    .submitTransfer(batch,
+                                    {makeLocalWrite(buf.data(), kLen, /*deadline_ns=*/1)})
+                    .ok());
+    // The failing transport reports FAILED; poll until terminal.
+    ASSERT_EQ(pollUntilTerminal(engine, batch, 0), TransferStatusEnum::FAILED);
+    auto after = MetricsSnapshot(TentMetrics::instance());
+
+    // Infeasible counter must increment even though the transfer failed.
+    EXPECT_EQ(after.counter("tent_deadline_infeasible_total") -
+                  before.counter("tent_deadline_infeasible_total"),
+              1);
+    // MLU histogram must not receive a sample (no completion, no latency).
+    EXPECT_EQ(after.histogramCount("tent_deadline_mlu_permille") -
+                  before.histogramCount("tent_deadline_mlu_permille"),
+              0);
+    // And the write failure was recorded.
+    EXPECT_EQ(after.counter("tent_write_failures_total") -
+                  before.counter("tent_write_failures_total"),
+              1);
 
     EXPECT_TRUE(engine.freeBatch(batch).ok());
     EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
