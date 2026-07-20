@@ -318,6 +318,55 @@ def test_upload_deduplicates_dp_and_commits_manifest_last() -> None:
     assert store.registered == set()
 
 
+def test_prepare_upload_selects_one_complete_generation_consistent_dp_replica() -> None:
+    sources = []
+    for manifest in source_manifests(dp=2, tp=2):
+        fragment = manifest.fragments[0]
+        if fragment.rank.dp == 0 and fragment.rank.tp == 1:
+            continue
+        if fragment.rank.dp == 1:
+            fragment = replace(fragment, lease_generation=2)
+            manifest = replace(manifest, fragments=(fragment,))
+        sources.append(manifest)
+
+    _, weight_store = make_weight_store()
+    plan = weight_store.prepare_upload(tuple(sources))
+
+    assert {operation.source.rank.dp for operation in plan.operations} == {1}
+    assert {operation.source.lease_generation for operation in plan.operations} == {2}
+
+
+def test_prepare_upload_rejects_complete_dp_replicas_at_different_generations() -> None:
+    sources = tuple(
+        replace(
+            manifest,
+            fragments=(
+                replace(
+                    manifest.fragments[0],
+                    lease_generation=manifest.fragments[0].rank.dp + 1,
+                ),
+            ),
+        )
+        for manifest in source_manifests(dp=2, tp=2)
+    )
+    _, weight_store = make_weight_store()
+
+    with pytest.raises(ValueError, match="inconsistent lease generations"):
+        weight_store.prepare_upload(sources)
+
+
+def test_prepare_upload_rejects_mixed_generations_within_one_dp_replica() -> None:
+    sources = list(source_manifests(dp=1, tp=2))
+    sources[1] = replace(
+        sources[1],
+        fragments=(replace(sources[1].fragments[0], lease_generation=2),),
+    )
+    _, weight_store = make_weight_store()
+
+    with pytest.raises(ValueError, match="generation-consistent DP replica"):
+        weight_store.prepare_upload(tuple(sources))
+
+
 def test_weight_group_objects_are_hard_pinned_and_typed() -> None:
     store, weight_store = make_weight_store()
     sources = source_manifests(dp=1, tp=2)

@@ -21,12 +21,21 @@ class DirectTransferReceipt:
 
 
 @dataclass(frozen=True)
+class DirectReadReceipt:
+    source_endpoint: str
+    target_worker_id: str
+    operation_count: int
+    nbytes: int
+
+
+@dataclass(frozen=True)
 class MemoryRegistrationLease:
     fragment_id: str
     worker_id: str
     address: int
     nbytes: int
     lease_generation: int
+    runtime_lease_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.fragment_id or not self.worker_id:
@@ -37,15 +46,25 @@ class MemoryRegistrationLease:
                 raise ValueError(f"registration lease {name} must be an integer")
         if self.address <= 0 or self.nbytes <= 0 or self.lease_generation < 0:
             raise ValueError("registration lease values are invalid")
+        if self.runtime_lease_id is not None and (
+            type(self.runtime_lease_id) is not str or not self.runtime_lease_id
+        ):
+            raise ValueError("registration runtime_lease_id must be a non-empty string")
 
     @classmethod
-    def from_fragment(cls, fragment: RuntimeFragment) -> MemoryRegistrationLease:
+    def from_fragment(
+        cls,
+        fragment: RuntimeFragment,
+        *,
+        runtime_lease_id: str | None = None,
+    ) -> MemoryRegistrationLease:
         return cls(
             fragment_id=fragment.fragment_id,
             worker_id=fragment.worker_id,
             address=fragment.address,
             nbytes=fragment.nbytes,
             lease_generation=fragment.lease_generation,
+            runtime_lease_id=runtime_lease_id,
         )
 
 
@@ -342,3 +361,281 @@ class MooncakeTransferEngineSink:
         )
         if result != 0:
             raise TransferEngineError(f"batch transfer to {endpoint} failed: {result}")
+
+
+class MooncakeTransferEngineReader:
+    """Execute a local target plan with target-initiated zero-copy reads."""
+
+    def __init__(self, engine: Any, *, max_batch_operations: int = 1024) -> None:
+        if max_batch_operations <= 0:
+            raise ValueError("max_batch_operations must be positive")
+        self.engine = engine
+        self.max_batch_operations = max_batch_operations
+
+    def execute(
+        self,
+        plan: TransferPlan,
+        source_manifests: Sequence[RuntimeManifest],
+        target_manifest: RuntimeManifest,
+        *,
+        source_pre_registered: bool = True,
+        source_registrations: Sequence[MemoryRegistrationLease] | None = None,
+        target_pre_registered: bool = False,
+        target_registrations: Sequence[MemoryRegistrationLease] | None = None,
+    ) -> tuple[DirectReadReceipt, ...]:
+        if not source_pre_registered:
+            raise TransferEngineError("remote source memory must be pre-registered")
+        source_registration_by_id = MooncakeTransferEngineSink._registration_map(
+            source_registrations, "source"
+        )
+        if target_registrations is not None and not target_pre_registered:
+            raise TransferEngineError(
+                "target_registrations require target_pre_registered=True"
+            )
+        MooncakeTransferEngineSink._validate_plan_identity(
+            plan, target_manifest, "target"
+        )
+        try:
+            target_executors = resolve_executor_plans(plan, target_manifest, "target")
+        except ValueError as error:
+            raise TransferEngineError(str(error)) from error
+        if len(target_executors) != 1:
+            raise TransferEngineError(
+                "target manifest must describe one local executor"
+            )
+        target_executor = target_executors[0]
+
+        sources: dict[str, RuntimeFragment] = {}
+        source_runtime_lease_ids: dict[str, str | None] = {}
+        source_ranks = set()
+        for manifest in source_manifests:
+            MooncakeTransferEngineSink._validate_plan_identity(plan, manifest, "source")
+            try:
+                executors = resolve_executor_plans(plan, manifest, "source")
+            except ValueError as error:
+                raise TransferEngineError(str(error)) from error
+            for executor in executors:
+                if executor.rank in source_ranks:
+                    raise TransferEngineError(
+                        f"duplicate source executor rank: {executor.rank}"
+                    )
+                source_ranks.add(executor.rank)
+            for fragment in manifest.fragments:
+                if fragment.fragment_id in sources:
+                    raise TransferEngineError(
+                        f"duplicate source fragment: {fragment.fragment_id}"
+                    )
+                sources[fragment.fragment_id] = fragment
+                source_runtime_lease_ids[fragment.fragment_id] = manifest.lease_id
+        expected_source_ranks = {executor.rank for executor in plan.source_executors}
+        if source_ranks != expected_source_ranks:
+            raise TransferEngineError("source executor set is incomplete")
+
+        targets = {
+            fragment.fragment_id: fragment for fragment in target_manifest.fragments
+        }
+        registration_by_id = (
+            MooncakeTransferEngineSink._registration_map(target_registrations, "target")
+            if target_pre_registered
+            else {}
+        )
+        operations_by_endpoint: dict[
+            str, list[tuple[CopyRange, RuntimeFragment, RuntimeFragment]]
+        ] = {}
+        used_targets: dict[str, RuntimeFragment] = {}
+        for index in target_executor.operation_indices:
+            operation = plan.operations[index]
+            if not isinstance(operation.source, RuntimeFragment):
+                raise TransferEngineError(
+                    "MooncakeTransferEngineReader requires runtime sources"
+                )
+            source = sources.get(operation.source.fragment_id)
+            target = targets.get(operation.target.fragment_id)
+            if source is None or not _same_snapshot(source, operation.source):
+                raise TransferEngineError(
+                    f"stale source fragment: {operation.source.fragment_id}"
+                )
+            runtime_lease_id = source_runtime_lease_ids[source.fragment_id]
+            if runtime_lease_id is None:
+                raise TransferEngineError(
+                    f"source runtime lease_id is required: {source.fragment_id}"
+                )
+            MooncakeTransferEngineSink._validate_registration(
+                source, source_registration_by_id, "source"
+            )
+            if (
+                source_registration_by_id[source.fragment_id].runtime_lease_id
+                != runtime_lease_id
+            ):
+                raise TransferEngineError(
+                    f"source registration lease mismatch: {source.fragment_id}"
+                )
+            if target is None or not _same_snapshot(target, operation.target):
+                raise TransferEngineError(
+                    f"stale target fragment: {operation.target.fragment_id}"
+                )
+            if target_pre_registered:
+                MooncakeTransferEngineSink._validate_registration(
+                    target, registration_by_id, "target"
+                )
+            operation.validate_bounds()
+            used_targets[target.fragment_id] = target
+            operations_by_endpoint.setdefault(source.endpoint, []).append(
+                (operation, source, target)
+            )
+
+        with self._registered_targets(
+            tuple(used_targets.values()), pre_registered=target_pre_registered
+        ):
+            receipts = []
+            for endpoint in sorted(operations_by_endpoint):
+                operations = sorted(
+                    operations_by_endpoint[endpoint],
+                    key=lambda item: (
+                        item[2].address + item[0].target_offset,
+                        item[1].address + item[0].source_offset,
+                    ),
+                )
+                target_addresses = []
+                source_addresses = []
+                sizes = []
+                operation_count = 0
+                total_bytes = 0
+                for operation, source, target in operations:
+                    source_base = source.address + operation.source_offset
+                    target_base = target.address + operation.target_offset
+                    next_segment = 0
+                    while next_segment < operation.repeat:
+                        batch_count = min(
+                            self.max_batch_operations - len(sizes),
+                            operation.repeat - next_segment,
+                        )
+                        source_start = (
+                            source_base + next_segment * operation.source_stride
+                        )
+                        target_start = (
+                            target_base + next_segment * operation.target_stride
+                        )
+                        next_source_addresses = (
+                            list(
+                                range(
+                                    source_start,
+                                    source_start
+                                    + batch_count * operation.source_stride,
+                                    operation.source_stride,
+                                )
+                            )
+                            if operation.source_stride
+                            else [source_start] * batch_count
+                        )
+                        next_target_addresses = (
+                            list(
+                                range(
+                                    target_start,
+                                    target_start
+                                    + batch_count * operation.target_stride,
+                                    operation.target_stride,
+                                )
+                            )
+                            if operation.target_stride
+                            else [target_start] * batch_count
+                        )
+                        if sizes:
+                            source_addresses.extend(next_source_addresses)
+                            target_addresses.extend(next_target_addresses)
+                            sizes.extend([operation.nbytes] * batch_count)
+                        else:
+                            source_addresses = next_source_addresses
+                            target_addresses = next_target_addresses
+                            sizes = [operation.nbytes] * batch_count
+                        operation_count += batch_count
+                        total_bytes += operation.nbytes * batch_count
+                        next_segment += batch_count
+                        if len(sizes) == self.max_batch_operations:
+                            self._transfer_batch(
+                                endpoint, target_addresses, source_addresses, sizes
+                            )
+                            target_addresses = []
+                            source_addresses = []
+                            sizes = []
+                if sizes:
+                    self._transfer_batch(
+                        endpoint, target_addresses, source_addresses, sizes
+                    )
+                receipts.append(
+                    DirectReadReceipt(
+                        source_endpoint=endpoint,
+                        target_worker_id=target_executor.worker_id,
+                        operation_count=operation_count,
+                        nbytes=total_bytes,
+                    )
+                )
+        return tuple(receipts)
+
+    @contextmanager
+    def _registered_targets(
+        self,
+        fragments: Sequence[RuntimeFragment],
+        *,
+        pre_registered: bool,
+    ) -> Iterator[None]:
+        if pre_registered:
+            yield
+            return
+        sizes_by_address: dict[int, int] = {}
+        for fragment in fragments:
+            sizes_by_address[fragment.address] = max(
+                sizes_by_address.get(fragment.address, 0), fragment.nbytes
+            )
+        owned = []
+        primary_error: BaseException | None = None
+        try:
+            for address, nbytes in sizes_by_address.items():
+                result = self.engine.register_memory(address, nbytes)
+                if result != 0:
+                    raise TransferEngineError(
+                        f"target register_memory failed for {address}: {result}"
+                    )
+                owned.append(address)
+            yield
+        except BaseException as error:
+            primary_error = error
+
+        failures = []
+        for address in reversed(owned):
+            try:
+                result = self.engine.unregister_memory(address)
+            except Exception as error:
+                failures.append((address, repr(error)))
+                continue
+            if result != 0:
+                failures.append((address, result))
+        if failures:
+            detail = f"target unregister_memory failed: {failures}"
+            if primary_error is not None:
+                raise TransferEngineError(
+                    f"{primary_error}; {detail}"
+                ) from primary_error
+            raise TransferEngineError(detail)
+        if primary_error is not None:
+            raise primary_error
+
+    def _transfer_batch(
+        self,
+        endpoint: str,
+        target_addresses: list[int],
+        source_addresses: list[int],
+        sizes: list[int],
+    ) -> None:
+        try:
+            result = self.engine.batch_transfer_sync_read(
+                endpoint, target_addresses, source_addresses, sizes
+            )
+        except Exception as error:
+            raise TransferEngineError(
+                f"batch transfer from {endpoint} failed: {error}"
+            ) from error
+        if result != 0:
+            raise TransferEngineError(
+                f"batch transfer from {endpoint} failed: {result}"
+            )

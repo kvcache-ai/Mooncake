@@ -11,6 +11,7 @@ from .planner import (
     ExecutorTransferPlan,
     TransferPlan,
     plan_runtime_transfer,
+    plan_runtime_transfer_to_local_target,
     plan_stored_transfer,
 )
 from .store import (
@@ -22,8 +23,10 @@ from .store import (
     WeightUploadPlan,
 )
 from .te import (
+    DirectReadReceipt,
     DirectTransferReceipt,
     MemoryRegistrationLease,
+    MooncakeTransferEngineReader,
     MooncakeTransferEngineSink,
     TransferEngineError,
 )
@@ -39,6 +42,7 @@ __all__ = [
     "ExecutorTransferPlan",
     "TransferPlan",
     "plan_runtime_transfer",
+    "plan_runtime_transfer_to_local_target",
     "plan_stored_transfer",
     "UploadOperation",
     "UploadReceipt",
@@ -46,8 +50,10 @@ __all__ = [
     "WeightStoreError",
     "WeightLoadPlan",
     "WeightUploadPlan",
+    "DirectReadReceipt",
     "DirectTransferReceipt",
     "MemoryRegistrationLease",
+    "MooncakeTransferEngineReader",
     "MooncakeTransferEngineSink",
     "TransferEngineError",
 ]

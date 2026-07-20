@@ -352,6 +352,17 @@ def _validate_tensor_sets(
         )
 
 
+def _validate_tensor_subset(
+    source_tensors: dict[str, TensorDescriptor],
+    target_tensors: dict[str, TensorDescriptor],
+) -> None:
+    unexpected = sorted(set(target_tensors) - set(source_tensors))
+    if unexpected:
+        raise ValueError(
+            f"target manifests contain unknown tensors: {', '.join(unexpected)}"
+        )
+
+
 def _validate_target_coverage(
     target_tensors: dict[str, TensorDescriptor],
     target_fragments: Sequence[RuntimeFragment],
@@ -361,37 +372,117 @@ def _validate_target_coverage(
     dp_ranks = sorted({fragment.rank.dp for fragment in target_fragments})
     for dp_rank in dp_ranks:
         for tensor in target_tensors.values():
-            geometries = {
-                (fragment.global_offset, fragment.local_shape): fragment
-                for fragment in target_fragments
-                if fragment.rank.dp == dp_rank
-                and fragment.tensor_id == tensor.tensor_id
-            }
-            fragments = tuple(geometries.values())
-            if tensor.partition_dim is None:
-                complete = len(fragments) == 1
-            else:
-                dim = tensor.partition_dim
-                intervals = sorted(
-                    (
-                        fragment.global_offset[dim],
-                        fragment.global_offset[dim] + fragment.local_shape[dim],
-                    )
-                    for fragment in fragments
-                )
-                cursor = 0
-                complete = True
-                for begin, end in intervals:
-                    if begin != cursor:
-                        complete = False
-                        break
-                    cursor = end
-                complete = complete and cursor == tensor.global_shape[dim]
-            if not complete:
+            fragments_by_owner: dict[tuple[int, int], list[RuntimeFragment]] = {}
+            for fragment in target_fragments:
+                if (
+                    fragment.rank.dp != dp_rank
+                    or fragment.tensor_id != tensor.tensor_id
+                ):
+                    continue
+                fragments_by_owner.setdefault(
+                    (fragment.rank.pp, fragment.rank.ep), []
+                ).append(fragment)
+            if not fragments_by_owner or any(
+                not _fragments_fully_cover_tensor(tensor, fragments)
+                for fragments in fragments_by_owner.values()
+            ):
                 raise ValueError(
                     f"target tensor is not fully covered: {tensor.tensor_id}: "
                     f"dp={dp_rank}"
                 )
+
+
+def _fragments_fully_cover_tensor(
+    tensor: TensorDescriptor,
+    fragments: Sequence[SourceFragment],
+) -> bool:
+    geometries = {
+        (fragment.global_offset, fragment.local_shape): fragment
+        for fragment in fragments
+        if fragment.tensor_id == tensor.tensor_id
+    }
+    unique_fragments = tuple(geometries.values())
+    if tensor.partition_dim is None:
+        return len(unique_fragments) == 1
+    dim = tensor.partition_dim
+    intervals = sorted(
+        (
+            fragment.global_offset[dim],
+            fragment.global_offset[dim] + fragment.local_shape[dim],
+        )
+        for fragment in unique_fragments
+    )
+    cursor = 0
+    for begin, end in intervals:
+        if begin != cursor:
+            return False
+        cursor = end
+    return cursor == tensor.global_shape[dim]
+
+
+def _complete_runtime_source_replicas(
+    source_tensors: dict[str, TensorDescriptor],
+    source_fragments: Sequence[RuntimeFragment],
+) -> dict[int, dict[str, tuple[int, int]]]:
+    replicas: dict[int, dict[str, tuple[int, int]]] = {}
+    generation_by_dp: dict[int, int] = {}
+    for dp_rank in sorted({fragment.rank.dp for fragment in source_fragments}):
+        replica_fragments = [
+            fragment for fragment in source_fragments if fragment.rank.dp == dp_rank
+        ]
+        generations = {fragment.lease_generation for fragment in replica_fragments}
+        if len(generations) != 1:
+            continue
+        owner_by_tensor: dict[str, tuple[int, int]] = {}
+        complete = True
+        for tensor in source_tensors.values():
+            fragments_by_owner: dict[tuple[int, int], list[RuntimeFragment]] = {}
+            for fragment in replica_fragments:
+                if fragment.tensor_id != tensor.tensor_id:
+                    continue
+                fragments_by_owner.setdefault(
+                    (fragment.rank.pp, fragment.rank.ep), []
+                ).append(fragment)
+            complete_owners = [
+                owner
+                for owner, fragments in fragments_by_owner.items()
+                if _fragments_fully_cover_tensor(tensor, fragments)
+            ]
+            if not fragments_by_owner or len(complete_owners) != len(
+                fragments_by_owner
+            ):
+                complete = False
+                break
+            owner_by_tensor[tensor.tensor_id] = min(complete_owners)
+        if complete:
+            replicas[dp_rank] = owner_by_tensor
+            generation_by_dp[dp_rank] = next(iter(generations))
+    if not replicas:
+        raise ValueError(
+            "source manifests have no complete DP replica; tensors are not fully covered"
+        )
+    if len(set(generation_by_dp.values())) != 1:
+        raise ValueError("source DP replicas have inconsistent lease generations")
+    return replicas
+
+
+def _validate_local_target_inventory(
+    target_tensors: dict[str, TensorDescriptor],
+    target_fragments: Sequence[RuntimeFragment],
+) -> None:
+    if not target_fragments:
+        raise ValueError("local target manifest has no fragments")
+    ranks = {fragment.rank for fragment in target_fragments}
+    workers = {fragment.worker_id for fragment in target_fragments}
+    if len(ranks) != 1 or len(workers) != 1:
+        raise ValueError("local target manifest must describe exactly one executor")
+    missing = sorted(
+        set(target_tensors) - {item.tensor_id for item in target_fragments}
+    )
+    if missing:
+        raise ValueError(
+            f"local target manifest is missing fragments: {', '.join(missing)}"
+        )
 
 
 def _geometry_key(fragment: SourceFragment) -> tuple:
@@ -494,9 +585,37 @@ def _plan_transfer(
     source_fragments: Sequence[SourceFragment],
     target_tensors: dict[str, TensorDescriptor],
     target_fragments: Sequence[RuntimeFragment],
+    *,
+    local_target: bool = False,
 ) -> TransferPlan:
-    _validate_tensor_sets(source_tensors, target_tensors)
-    _validate_target_coverage(target_tensors, target_fragments)
+    if local_target:
+        _validate_tensor_subset(source_tensors, target_tensors)
+        _validate_local_target_inventory(target_tensors, target_fragments)
+    else:
+        _validate_tensor_sets(source_tensors, target_tensors)
+        _validate_target_coverage(target_tensors, target_fragments)
+    runtime_sources = all(
+        isinstance(fragment, RuntimeFragment) for fragment in source_fragments
+    )
+    stored_sources = all(
+        isinstance(fragment, StoredFragment) for fragment in source_fragments
+    )
+    if not runtime_sources and not stored_sources:
+        raise ValueError("source fragments mix runtime and stored locations")
+    source_replicas = (
+        _complete_runtime_source_replicas(source_tensors, source_fragments)
+        if runtime_sources
+        else {}
+    )
+    source_dp_ranks = sorted(source_replicas)
+    source_dp_by_target_dp = (
+        {
+            target_dp: source_dp_ranks[target_dp % len(source_dp_ranks)]
+            for target_dp in {fragment.rank.dp for fragment in target_fragments}
+        }
+        if runtime_sources
+        else {}
+    )
     candidates: dict[str, dict[tuple, list[SourceFragment]]] = {}
     for fragment in source_fragments:
         candidates.setdefault(fragment.tensor_id, {}).setdefault(
@@ -516,11 +635,26 @@ def _plan_transfer(
 
         overlaps: list[tuple[int, int, SourceFragment]] = []
         for group in candidates.get(target.tensor_id, {}).values():
-            representative = group[0]
+            if runtime_sources:
+                source_dp = source_dp_by_target_dp[target.rank.dp]
+                source_owner = source_replicas[source_dp][target.tensor_id]
+                eligible = [
+                    fragment
+                    for fragment in group
+                    if isinstance(fragment, RuntimeFragment)
+                    and fragment.rank.dp == source_dp
+                    and (fragment.rank.pp, fragment.rank.ep) == source_owner
+                ]
+                if not eligible:
+                    continue
+                representative = eligible[0]
+                selected = representative
+            else:
+                representative = group[0]
+                selected = representative
             interval = _overlap(source_tensor, representative, target)
             if interval is None:
                 continue
-            selected = group[target.rank.dp % len(group)]
             overlaps.append((*interval, selected))
         overlaps.sort(key=lambda item: (item[0], item[1], item[2].fragment_id))
 
@@ -553,6 +687,233 @@ def _plan_transfer(
     )
 
 
+def _operation_sort_key(operation: CopyRange) -> tuple:
+    source_location = (
+        (
+            "runtime",
+            operation.source.worker_id,
+            operation.source.endpoint,
+            operation.source.lease_generation,
+            operation.source.address + operation.source_offset,
+        )
+        if isinstance(operation.source, RuntimeFragment)
+        else (
+            "stored",
+            operation.source.object_key,
+            operation.source.object_offset + operation.source_offset,
+        )
+    )
+    return (
+        operation.tensor_id,
+        operation.target.worker_id,
+        operation.target.endpoint,
+        operation.target.address + operation.target_offset,
+        source_location,
+    )
+
+
+def _source_copy_identity(operation: CopyRange) -> tuple:
+    if isinstance(operation.source, RuntimeFragment):
+        return (
+            "runtime",
+            operation.source.worker_id,
+            operation.source.endpoint,
+            operation.source.lease_generation,
+            operation.source.address + operation.source_offset,
+        )
+    return (
+        "stored",
+        operation.source.object_key,
+        operation.source.object_offset + operation.source_offset,
+    )
+
+
+def _target_copy_identity(operation: CopyRange) -> tuple:
+    return (
+        operation.target.worker_id,
+        operation.target.endpoint,
+        operation.target.lease_generation,
+        operation.target.address + operation.target_offset,
+        operation.nbytes,
+        operation.repeat,
+        operation.target_stride,
+    )
+
+
+def _descriptor_alias_key(descriptor: TensorDescriptor) -> tuple:
+    return (
+        descriptor.global_shape,
+        descriptor.dtype,
+        descriptor.itemsize,
+        descriptor.partition_dim,
+        descriptor.layer_id,
+        descriptor.expert_id,
+        descriptor.layout_fingerprint,
+    )
+
+
+def _is_declared_target_alias(
+    left: CopyRange,
+    right: CopyRange,
+    source_tensors: dict[str, TensorDescriptor],
+    target_tensors: dict[str, TensorDescriptor],
+) -> bool:
+    left_target = left.target
+    right_target = right.target
+    if (
+        len(left_target.aliases) < 2
+        or left_target.aliases != right_target.aliases
+        or left_target.worker_id != right_target.worker_id
+        or left_target.endpoint != right_target.endpoint
+        or left_target.lease_generation != right_target.lease_generation
+        or left_target.address != right_target.address
+        or left_target.nbytes != right_target.nbytes
+        or left_target.global_offset != right_target.global_offset
+        or left_target.local_shape != right_target.local_shape
+        or left.source.global_offset != right.source.global_offset
+        or left.source.local_shape != right.source.local_shape
+        or left.source_offset != right.source_offset
+        or left.source_stride != right.source_stride
+    ):
+        return False
+    return (
+        _descriptor_alias_key(source_tensors[left.tensor_id])
+        == _descriptor_alias_key(source_tensors[right.tensor_id])
+        == _descriptor_alias_key(target_tensors[left.tensor_id])
+        == _descriptor_alias_key(target_tensors[right.tensor_id])
+    )
+
+
+def _deduplicate_target_copies(
+    operations: Sequence[CopyRange],
+    source_tensors: dict[str, TensorDescriptor],
+    target_tensors: dict[str, TensorDescriptor],
+) -> tuple[CopyRange, ...]:
+    result = []
+    seen = set()
+    for operation in sorted(operations, key=_operation_sort_key):
+        identity = (
+            _source_copy_identity(operation),
+            _target_copy_identity(operation),
+            operation.nbytes,
+            operation.repeat,
+            operation.source_stride,
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        result.append(operation)
+
+    by_target: dict[tuple, CopyRange] = {}
+    deduplicated = []
+    for operation in result:
+        identity = _target_copy_identity(operation)
+        previous = by_target.get(identity)
+        if previous is None:
+            by_target[identity] = operation
+            deduplicated.append(operation)
+            continue
+        if _is_declared_target_alias(
+            previous,
+            operation,
+            source_tensors,
+            target_tensors,
+        ):
+            continue
+        deduplicated.append(operation)
+
+    result = sorted(
+        deduplicated,
+        key=lambda item: (
+            item.target.fragment_id,
+            item.target_offset,
+            item.source.fragment_id,
+            item.source_offset,
+        ),
+    )
+    _validate_target_physical_ranges(result)
+    return tuple(result)
+
+
+def _target_physical_bounds(operation: CopyRange) -> tuple[int, int]:
+    begin = operation.target.address + operation.target_offset
+    end = begin + (operation.repeat - 1) * operation.target_stride + operation.nbytes
+    return begin, end
+
+
+def _target_segments_overlap(left: CopyRange, right: CopyRange) -> bool:
+    left_begin = left.target.address + left.target_offset
+    right_begin = right.target.address + right.target_offset
+    left_repeat = 1 if left.target_stride == 0 else left.repeat
+    right_repeat = 1 if right.target_stride == 0 else right.repeat
+
+    if left.target_stride == right.target_stride and left.target_stride > 0:
+        stride = left.target_stride
+        difference = left_begin - right_begin
+        minimum = -(left.nbytes - 1)
+        maximum = right.nbytes - 1
+        lowest_delta = -(right_repeat - 1)
+        highest_delta = left_repeat - 1
+        first = max(lowest_delta, -((-(minimum - difference)) // stride))
+        last = min(highest_delta, (maximum - difference) // stride)
+        return first <= last
+
+    left_index = 0
+    right_index = 0
+    while left_index < left_repeat and right_index < right_repeat:
+        left_start = left_begin + left_index * left.target_stride
+        right_start = right_begin + right_index * right.target_stride
+        left_end = left_start + left.nbytes
+        right_end = right_start + right.nbytes
+        if left_end <= right_start:
+            if left.target_stride == 0:
+                return False
+            left_index = max(
+                left_index + 1,
+                (right_start - left.nbytes - left_begin) // left.target_stride + 1,
+            )
+        elif right_end <= left_start:
+            if right.target_stride == 0:
+                return False
+            right_index = max(
+                right_index + 1,
+                (left_start - right.nbytes - right_begin) // right.target_stride + 1,
+            )
+        else:
+            return True
+    return False
+
+
+def _validate_target_physical_ranges(operations: Sequence[CopyRange]) -> None:
+    by_executor: dict[tuple[str, str], list[CopyRange]] = {}
+    for operation in operations:
+        if operation.repeat > 1 and operation.target_stride < operation.nbytes:
+            raise ValueError(
+                f"conflicting target physical range: {operation.target.fragment_id}"
+            )
+        by_executor.setdefault(
+            (operation.target.worker_id, operation.target.endpoint), []
+        ).append(operation)
+
+    for scoped_operations in by_executor.values():
+        ordered = sorted(scoped_operations, key=_target_physical_bounds)
+        active: list[CopyRange] = []
+        for operation in ordered:
+            begin, _ = _target_physical_bounds(operation)
+            active = [
+                candidate
+                for candidate in active
+                if _target_physical_bounds(candidate)[1] > begin
+            ]
+            if any(
+                _target_segments_overlap(candidate, operation) for candidate in active
+            ):
+                raise ValueError(
+                    f"conflicting target physical range: {operation.target.fragment_id}"
+                )
+            active.append(operation)
+
+
 def plan_runtime_transfer(
     source_manifests: Sequence[RuntimeManifest],
     target_manifests: Sequence[RuntimeManifest],
@@ -573,16 +934,59 @@ def plan_runtime_transfer(
         target_tensors,
         target_fragments,
     )
+    operations = _deduplicate_target_copies(
+        transfer.operations, source_tensors, target_tensors
+    )
     return TransferPlan(
         model_id=transfer.model_id,
         revision=transfer.revision,
-        operations=transfer.operations,
-        source_executors=_build_executor_plans(
-            source_manifests, transfer.operations, "source"
-        ),
-        target_executors=_build_executor_plans(
-            target_manifests, transfer.operations, "target"
-        ),
+        operations=operations,
+        source_executors=_build_executor_plans(source_manifests, operations, "source"),
+        target_executors=_build_executor_plans(target_manifests, operations, "target"),
+    )
+
+
+def plan_runtime_transfer_to_local_target(
+    source_manifests: Sequence[RuntimeManifest],
+    target_manifest: RuntimeManifest,
+) -> TransferPlan:
+    """Plan the fragments needed by one independently starting target worker.
+
+    SGLang initializes every target worker in parallel and provides the global
+    startup barrier. A local plan therefore selects the tensors owned by one
+    PP/EP worker and the TP ranges resident on that worker, while retaining the
+    complete source executor snapshot for fencing and routing.
+    """
+
+    source_tensors, source_fragments = _collect_manifests(source_manifests, "source")
+    target_tensors, target_fragments = _collect_manifests((target_manifest,), "target")
+    source = source_manifests[0]
+    if source.model_id != target_manifest.model_id:
+        raise ValueError("source and target model_id differ")
+    if source.revision != target_manifest.revision:
+        raise ValueError("source and target revision differ")
+
+    transfer = _plan_transfer(
+        source.model_id,
+        source.revision,
+        source_tensors,
+        source_fragments,
+        target_tensors,
+        target_fragments,
+        local_target=True,
+    )
+    operations = _deduplicate_target_copies(
+        transfer.operations, source_tensors, target_tensors
+    )
+    target_executors = _build_executor_plans((target_manifest,), operations, "target")
+    if len(target_executors) != 1:
+        raise ValueError("local target manifest must describe exactly one executor")
+    return TransferPlan(
+        model_id=transfer.model_id,
+        revision=transfer.revision,
+        operations=operations,
+        source_executors=_build_executor_plans(source_manifests, operations, "source"),
+        target_executors=target_executors,
     )
 
 
@@ -605,11 +1009,12 @@ def plan_stored_transfer(
         target_tensors,
         target_fragments,
     )
+    operations = _deduplicate_target_copies(
+        transfer.operations, source_tensors, target_tensors
+    )
     return TransferPlan(
         model_id=transfer.model_id,
         revision=transfer.revision,
-        operations=transfer.operations,
-        target_executors=_build_executor_plans(
-            target_manifests, transfer.operations, "target"
-        ),
+        operations=operations,
+        target_executors=_build_executor_plans(target_manifests, operations, "target"),
     )

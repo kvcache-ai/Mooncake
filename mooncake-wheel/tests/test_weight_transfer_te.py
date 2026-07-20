@@ -11,9 +11,14 @@ from mooncake.weight_transfer.manifest import (
     RuntimeManifest,
     TensorDescriptor,
 )
-from mooncake.weight_transfer.planner import plan_runtime_transfer
+from mooncake.weight_transfer.planner import (
+    CopyRange,
+    plan_runtime_transfer,
+    plan_runtime_transfer_to_local_target,
+)
 from mooncake.weight_transfer.te import (
     MemoryRegistrationLease,
+    MooncakeTransferEngineReader,
     MooncakeTransferEngineSink,
     TransferEngineError,
 )
@@ -23,6 +28,7 @@ class FakeTransferEngine:
     def __init__(self) -> None:
         self.calls = []
         self.fail_endpoint: str | None = None
+        self.read_result: int | None = None
         self.register_calls: list[tuple[int, int]] = []
         self.unregister_calls: list[int] = []
 
@@ -42,6 +48,18 @@ class FakeTransferEngine:
         sizes: list[int],
     ) -> int:
         self.calls.append((endpoint, source_addresses, target_addresses, sizes))
+        return -5 if endpoint == self.fail_endpoint else 0
+
+    def batch_transfer_sync_read(
+        self,
+        endpoint: str,
+        target_addresses: list[int],
+        source_addresses: list[int],
+        sizes: list[int],
+    ) -> int:
+        self.calls.append((endpoint, target_addresses, source_addresses, sizes))
+        if self.read_result is not None:
+            return self.read_result
         return -5 if endpoint == self.fail_endpoint else 0
 
 
@@ -90,6 +108,7 @@ def manifests(
                 instance_id=worker_id,
                 tensors=(tensor,),
                 fragments=(fragment,),
+                lease_id=f"{worker_id}-runtime-lease",
             )
         )
     return tuple(result)
@@ -99,7 +118,10 @@ def registration_leases(
     manifests: tuple[RuntimeManifest, ...],
 ) -> tuple[MemoryRegistrationLease, ...]:
     return tuple(
-        MemoryRegistrationLease.from_fragment(fragment)
+        MemoryRegistrationLease.from_fragment(
+            fragment,
+            runtime_lease_id=manifest.lease_id,
+        )
         for manifest in manifests
         for fragment in manifest.fragments
     )
@@ -384,3 +406,269 @@ def test_te_receipt_identifies_worker_instead_of_serving_instance() -> None:
     )
 
     assert receipts[0].source_worker_id == "source-t0"
+
+
+def test_te_reader_pulls_local_target_ranges_without_source_rpc() -> None:
+    sources = manifests(tp=2, prefix="source", address_base=0x10000)
+    targets = manifests(tp=4, prefix="target", address_base=0x40000)
+    target = targets[1]
+    plan = plan_runtime_transfer_to_local_target(sources, target)
+    engine = FakeTransferEngine()
+
+    receipts = MooncakeTransferEngineReader(engine).execute(
+        plan,
+        sources,
+        target,
+        source_registrations=registration_leases(sources),
+        target_pre_registered=True,
+        target_registrations=registration_leases((target,)),
+    )
+
+    assert receipts[0].source_endpoint == "source-t0:12345"
+    assert receipts[0].target_worker_id == "target-t1"
+    assert receipts[0].nbytes == 2
+    assert engine.calls == [("source-t0:12345", [0x41000], [0x10002], [2])]
+    assert engine.register_calls == []
+    assert engine.unregister_calls == []
+
+
+def test_te_reader_requires_generation_bound_source_registration_leases() -> None:
+    sources = manifests(tp=2, prefix="source", address_base=0x10000)
+    target = manifests(tp=4, prefix="target", address_base=0x40000)[1]
+    plan = plan_runtime_transfer_to_local_target(sources, target)
+    reader = MooncakeTransferEngineReader(FakeTransferEngine())
+    target_leases = registration_leases((target,))
+
+    with pytest.raises(TransferEngineError, match="source registration leases"):
+        reader.execute(
+            plan,
+            sources,
+            target,
+            target_pre_registered=True,
+            target_registrations=target_leases,
+        )
+
+    stale_generation = list(registration_leases(sources))
+    stale_generation[0] = replace(stale_generation[0], lease_generation=2)
+    with pytest.raises(TransferEngineError, match="source registration lease mismatch"):
+        reader.execute(
+            plan,
+            sources,
+            target,
+            source_registrations=stale_generation,
+            target_pre_registered=True,
+            target_registrations=target_leases,
+        )
+
+    stale_runtime_lease = list(registration_leases(sources))
+    stale_runtime_lease[0] = replace(
+        stale_runtime_lease[0], runtime_lease_id="stale-runtime-lease"
+    )
+    with pytest.raises(TransferEngineError, match="source registration lease mismatch"):
+        reader.execute(
+            plan,
+            sources,
+            target,
+            source_registrations=stale_runtime_lease,
+            target_pre_registered=True,
+            target_registrations=target_leases,
+        )
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("address", 0x90000),
+        ("nbytes", 1),
+        ("lease_generation", 2),
+        ("runtime_lease_id", "stale-runtime-lease"),
+    ],
+)
+def test_te_reader_rejects_source_registration_snapshot_mismatch(
+    field: str, value: int | str
+) -> None:
+    sources = manifests(tp=2, prefix="source", address_base=0x10000)
+    target = manifests(tp=4, prefix="target", address_base=0x40000)[1]
+    plan = plan_runtime_transfer_to_local_target(sources, target)
+    leases = list(registration_leases(sources))
+    leases[0] = replace(leases[0], **{field: value})
+
+    with pytest.raises(TransferEngineError, match="source registration lease mismatch"):
+        MooncakeTransferEngineReader(FakeTransferEngine()).execute(
+            plan,
+            sources,
+            target,
+            source_registrations=leases,
+            target_pre_registered=True,
+            target_registrations=registration_leases((target,)),
+        )
+
+
+def test_te_reader_requires_runtime_lease_id_for_used_source_fragment() -> None:
+    sources = manifests(tp=2, prefix="source", address_base=0x10000)
+    sources = (replace(sources[0], lease_id=None), sources[1])
+    target = manifests(tp=4, prefix="target", address_base=0x40000)[1]
+    plan = plan_runtime_transfer_to_local_target(sources, target)
+
+    with pytest.raises(TransferEngineError, match="source runtime lease_id"):
+        MooncakeTransferEngineReader(FakeTransferEngine()).execute(
+            plan,
+            sources,
+            target,
+            source_registrations=registration_leases(sources),
+            target_pre_registered=True,
+            target_registrations=registration_leases((target,)),
+        )
+
+
+def test_te_reader_requires_registrations_only_for_used_source_fragments() -> None:
+    sources = manifests(tp=2, prefix="source", address_base=0x10000)
+    target = manifests(tp=4, prefix="target", address_base=0x40000)[1]
+    plan = plan_runtime_transfer_to_local_target(sources, target)
+    used_fragment_ids = {operation.source.fragment_id for operation in plan.operations}
+    source_registrations = tuple(
+        registration
+        for registration in registration_leases(sources)
+        if registration.fragment_id in used_fragment_ids
+    )
+
+    receipts = MooncakeTransferEngineReader(FakeTransferEngine()).execute(
+        plan,
+        sources,
+        target,
+        source_registrations=source_registrations,
+        target_pre_registered=True,
+        target_registrations=registration_leases((target,)),
+    )
+
+    assert sum(receipt.nbytes for receipt in receipts) == 2
+
+
+def test_te_reader_batches_large_repeats_without_segment_tuple_expansion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repeat = 8192
+    tensor = TensorDescriptor(
+        tensor_id="layers.0.mlp.down_proj.weight",
+        global_shape=(repeat, 8),
+        dtype="uint8",
+        itemsize=1,
+        partition_dim=1,
+        layer_id=0,
+        layout_fingerprint="sglang:qwen3.5:uint8:test",
+    )
+    sources = manifests(
+        tp=2,
+        prefix="source",
+        address_base=0x10000,
+        tensor=tensor,
+    )
+    target = manifests(
+        tp=1,
+        prefix="target",
+        address_base=0x40000,
+        tensor=tensor,
+    )[0]
+    plan = plan_runtime_transfer_to_local_target(sources, target)
+    engine = FakeTransferEngine()
+
+    assert [operation.repeat for operation in plan.operations] == [repeat, repeat]
+
+    def reject_segment_tuple_expansion(
+        self: CopyRange,
+    ) -> None:
+        raise AssertionError(
+            f"reader expanded {self.repeat} segments through iter_segments"
+        )
+
+    monkeypatch.setattr(CopyRange, "iter_segments", reject_segment_tuple_expansion)
+
+    receipts = MooncakeTransferEngineReader(engine, max_batch_operations=1024).execute(
+        plan,
+        sources,
+        target,
+        source_registrations=registration_leases(sources),
+        target_pre_registered=True,
+        target_registrations=registration_leases((target,)),
+    )
+
+    endpoints = [call[0] for call in engine.calls]
+    assert endpoints == ["source-t0:12345"] * 8 + ["source-t1:12345"] * 8
+    assert all(len(call[3]) == 1024 for call in engine.calls)
+    assert [receipt.operation_count for receipt in receipts] == [repeat, repeat]
+    assert [receipt.nbytes for receipt in receipts] == [repeat * 4, repeat * 4]
+    assert engine.calls[0][1][0] == 0x40000
+    assert engine.calls[7][1][-1] == 0x40000 + (repeat - 1) * 8
+    assert engine.calls[8][1][0] == 0x40004
+    assert engine.calls[15][1][-1] == 0x40004 + (repeat - 1) * 8
+
+
+def test_te_reader_requires_complete_planned_source_executor_set() -> None:
+    sources = manifests(tp=2, prefix="source", address_base=0x10000)
+    target = manifests(tp=4, prefix="target", address_base=0x40000)[1]
+    plan = plan_runtime_transfer_to_local_target(sources, target)
+
+    with pytest.raises(TransferEngineError, match="source executor set is incomplete"):
+        MooncakeTransferEngineReader(FakeTransferEngine()).execute(
+            plan,
+            sources[:1],
+            target,
+            source_registrations=registration_leases(sources[:1]),
+            target_pre_registered=True,
+            target_registrations=registration_leases((target,)),
+        )
+
+
+def test_te_reader_surfaces_source_endpoint_failure() -> None:
+    sources = manifests(tp=2, prefix="source", address_base=0x10000)
+    target = manifests(tp=4, prefix="target", address_base=0x40000)[1]
+    plan = plan_runtime_transfer_to_local_target(sources, target)
+    engine = FakeTransferEngine()
+    engine.fail_endpoint = "source-t0:12345"
+
+    with pytest.raises(TransferEngineError, match="source-t0:12345"):
+        MooncakeTransferEngineReader(engine).execute(
+            plan,
+            sources,
+            target,
+            source_registrations=registration_leases(sources),
+            target_pre_registered=True,
+            target_registrations=registration_leases((target,)),
+        )
+
+
+def test_te_reader_rejects_positive_nonzero_transfer_status() -> None:
+    sources = manifests(tp=2, prefix="source", address_base=0x10000)
+    target = manifests(tp=4, prefix="target", address_base=0x40000)[1]
+    plan = plan_runtime_transfer_to_local_target(sources, target)
+    engine = FakeTransferEngine()
+    engine.read_result = 5
+
+    with pytest.raises(TransferEngineError, match="failed: 5"):
+        MooncakeTransferEngineReader(engine).execute(
+            plan,
+            sources,
+            target,
+            source_registrations=registration_leases(sources),
+            target_pre_registered=True,
+            target_registrations=registration_leases((target,)),
+        )
+
+
+def test_te_reader_rejects_leases_without_pre_registered_mode() -> None:
+    sources = manifests(tp=2, prefix="source", address_base=0x10000)
+    target = manifests(tp=4, prefix="target", address_base=0x40000)[1]
+    plan = plan_runtime_transfer_to_local_target(sources, target)
+    engine = FakeTransferEngine()
+
+    with pytest.raises(TransferEngineError, match="target_pre_registered"):
+        MooncakeTransferEngineReader(engine).execute(
+            plan,
+            sources,
+            target,
+            source_registrations=registration_leases(sources),
+            target_registrations=registration_leases((target,)),
+        )
+
+    assert engine.register_calls == []
+    assert engine.unregister_calls == []

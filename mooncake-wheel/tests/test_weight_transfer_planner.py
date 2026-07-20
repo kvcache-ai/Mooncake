@@ -14,6 +14,7 @@ from mooncake.weight_transfer.manifest import (
 from mooncake.weight_transfer.planner import (
     CopyRange,
     plan_runtime_transfer,
+    plan_runtime_transfer_to_local_target,
     resolve_executor_plans,
 )
 
@@ -177,6 +178,230 @@ def test_runtime_plan_records_explicit_noop_source_executors() -> None:
     assert len(plan.target_executors) == len(targets)
     assert len(noop) == 2
     assert all(not executor.operation_indices for executor in noop)
+
+
+def test_runtime_plan_deduplicates_identical_physical_alias_copies() -> None:
+    tensors = tuple(
+        replace(
+            descriptor(),
+            tensor_id=tensor_id,
+            global_shape=(32,),
+            partition_dim=None,
+            layer_id=None,
+            expert_id=None,
+            layout_fingerprint="sglang:qwen3.5:vocab-parallel:v1",
+        )
+        for tensor_id in ("embed_tokens.weight", "lm_head.weight")
+    )
+
+    def manifest(prefix: str, address: int) -> RuntimeManifest:
+        worker_id = f"{prefix}-tp0"
+        return RuntimeManifest(
+            model_id="qwen3.5-0.8b",
+            revision="step-42",
+            instance_id=worker_id,
+            tensors=tensors,
+            fragments=tuple(
+                RuntimeFragment(
+                    fragment_id=f"{worker_id}-{tensor.tensor_id}",
+                    tensor_id=tensor.tensor_id,
+                    global_offset=(0,),
+                    local_shape=(32,),
+                    address=address,
+                    nbytes=64,
+                    worker_id=worker_id,
+                    endpoint=f"{worker_id}:12345",
+                    rank=ParallelRank(),
+                    lease_generation=1,
+                )
+                for tensor in tensors
+            ),
+        )
+
+    plan = plan_runtime_transfer(
+        (manifest("source", 0x10000),),
+        (manifest("target", 0x20000),),
+    )
+
+    assert len(plan.operations) == 1
+    assert plan.total_bytes == 64
+
+
+def test_runtime_plan_rejects_target_aliases_with_distinct_source_storage() -> None:
+    tensors = tuple(
+        replace(
+            descriptor(),
+            tensor_id=tensor_id,
+            global_shape=(32,),
+            partition_dim=None,
+            layer_id=None,
+            expert_id=None,
+            layout_fingerprint="sglang:qwen3.5:vocab-parallel:v1",
+        )
+        for tensor_id in ("embed_tokens.weight", "lm_head.weight")
+    )
+    source_worker = "source-tp0"
+    target_worker = "target-tp0"
+    source = RuntimeManifest(
+        model_id="qwen3.5-0.8b",
+        revision="step-42",
+        instance_id=source_worker,
+        tensors=tensors,
+        fragments=tuple(
+            RuntimeFragment(
+                fragment_id=f"{source_worker}-{tensor.tensor_id}",
+                tensor_id=tensor.tensor_id,
+                global_offset=(0,),
+                local_shape=(32,),
+                address=0x10000 + index * 0x1000,
+                nbytes=64,
+                worker_id=source_worker,
+                endpoint=f"{source_worker}:12345",
+                rank=ParallelRank(),
+                lease_generation=1,
+            )
+            for index, tensor in enumerate(tensors)
+        ),
+    )
+    target = RuntimeManifest(
+        model_id="qwen3.5-0.8b",
+        revision="step-42",
+        instance_id=target_worker,
+        tensors=tensors,
+        fragments=tuple(
+            RuntimeFragment(
+                fragment_id=f"{target_worker}-{tensor.tensor_id}",
+                tensor_id=tensor.tensor_id,
+                global_offset=(0,),
+                local_shape=(32,),
+                address=0x20000,
+                nbytes=64,
+                worker_id=target_worker,
+                endpoint=f"{target_worker}:12345",
+                rank=ParallelRank(),
+                lease_generation=1,
+            )
+            for tensor in tensors
+        ),
+    )
+
+    with pytest.raises(ValueError, match="conflicting target physical range"):
+        plan_runtime_transfer((source,), (target,))
+
+
+def test_runtime_plan_deduplicates_declared_target_alias_across_pp_sources() -> None:
+    tensors = tuple(
+        replace(
+            descriptor(),
+            tensor_id=tensor_id,
+            global_shape=(32,),
+            partition_dim=None,
+            layer_id=None,
+            expert_id=None,
+            layout_fingerprint="sglang:qwen3.5:vocab-parallel:v1",
+        )
+        for tensor_id in ("embed_tokens.weight", "lm_head.weight")
+    )
+    aliases = ("lm_head.weight", "model.embed_tokens.weight")
+    sources = tuple(
+        RuntimeManifest(
+            model_id="qwen3.5-0.8b",
+            revision="step-42",
+            instance_id=f"source-pp{pp_rank}",
+            tensors=(tensor,),
+            fragments=(
+                RuntimeFragment(
+                    fragment_id=f"source-pp{pp_rank}-{tensor.tensor_id}",
+                    tensor_id=tensor.tensor_id,
+                    global_offset=(0,),
+                    local_shape=(32,),
+                    address=0x10000 + pp_rank * 0x1000,
+                    nbytes=64,
+                    worker_id=f"source-pp{pp_rank}",
+                    endpoint=f"source-pp{pp_rank}:12345",
+                    rank=ParallelRank(pp=pp_rank),
+                    lease_generation=1,
+                ),
+            ),
+        )
+        for pp_rank, tensor in enumerate(tensors)
+    )
+    target_worker = "target-pp0"
+    target = RuntimeManifest(
+        model_id="qwen3.5-0.8b",
+        revision="step-42",
+        instance_id=target_worker,
+        tensors=tensors,
+        fragments=tuple(
+            RuntimeFragment(
+                fragment_id=f"{target_worker}-{tensor.tensor_id}",
+                tensor_id=tensor.tensor_id,
+                global_offset=(0,),
+                local_shape=(32,),
+                address=0x20000,
+                nbytes=64,
+                worker_id=target_worker,
+                endpoint=f"{target_worker}:12345",
+                rank=ParallelRank(),
+                lease_generation=1,
+                aliases=aliases,
+            )
+            for tensor in tensors
+        ),
+    )
+
+    plan = plan_runtime_transfer_to_local_target(sources, target)
+
+    assert len(plan.operations) == 1
+    assert plan.operations[0].tensor_id == "embed_tokens.weight"
+    assert plan.operations[0].source.worker_id == "source-pp0"
+
+
+def test_runtime_plan_rejects_partially_overlapping_target_physical_ranges() -> None:
+    tensors = tuple(
+        replace(
+            descriptor(),
+            tensor_id=tensor_id,
+            global_shape=(32,),
+            partition_dim=None,
+            layer_id=None,
+            expert_id=None,
+            layout_fingerprint="sglang:qwen3.5:vocab-parallel:v1",
+        )
+        for tensor_id in ("embed_tokens.weight", "lm_head.weight")
+    )
+
+    def manifest(
+        prefix: str, addresses: tuple[int, int], *, target: bool
+    ) -> RuntimeManifest:
+        worker_id = f"{prefix}-tp0"
+        return RuntimeManifest(
+            model_id="qwen3.5-0.8b",
+            revision="step-42",
+            instance_id=worker_id,
+            tensors=tensors,
+            fragments=tuple(
+                RuntimeFragment(
+                    fragment_id=f"{worker_id}-{tensor.tensor_id}",
+                    tensor_id=tensor.tensor_id,
+                    global_offset=(0,),
+                    local_shape=(32,),
+                    address=addresses[index],
+                    nbytes=64,
+                    worker_id=worker_id,
+                    endpoint=f"{worker_id}:12345",
+                    rank=ParallelRank(),
+                    lease_generation=1,
+                )
+                for index, tensor in enumerate(tensors)
+            ),
+        )
+
+    source = manifest("source", (0x10000, 0x11000), target=False)
+    target = manifest("target", (0x20000, 0x20020), target=True)
+
+    with pytest.raises(ValueError, match="conflicting target physical range"):
+        plan_runtime_transfer((source,), (target,))
 
 
 def test_runtime_plan_rejects_fragment_ids_reused_by_different_workers() -> None:
@@ -510,6 +735,65 @@ def test_all_parallel_axes_change_in_one_plan() -> None:
     assert {op.source.rank.dp for op in operation_for_target(plan, 0, 2)} == {0}
 
 
+def test_local_plan_uses_one_complete_source_dp_replica() -> None:
+    sources = list(
+        tp_manifests(
+            tp=2,
+            dp=2,
+            pp_rank=0,
+            ep_rank=0,
+            address_base=0x10000,
+            worker_prefix="source",
+        )
+    )
+    sources = [
+        manifest
+        for manifest in sources
+        if not (
+            manifest.fragments[0].rank.dp == 1 and manifest.fragments[0].rank.tp == 1
+        )
+    ]
+    target = tp_manifests(
+        tp=1,
+        dp=2,
+        pp_rank=0,
+        ep_rank=0,
+        address_base=0x40000,
+        worker_prefix="target",
+    )[1]
+
+    plan = plan_runtime_transfer_to_local_target(tuple(sources), target)
+
+    assert {operation.source.rank.dp for operation in plan.operations} == {0}
+
+
+def test_runtime_plan_rejects_target_tp_coverage_split_across_pp_owners() -> None:
+    sources = tp_manifests(
+        tp=2,
+        pp_rank=0,
+        ep_rank=0,
+        address_base=0x10000,
+        worker_prefix="source",
+    )
+    targets = list(
+        tp_manifests(
+            tp=2,
+            pp_rank=0,
+            ep_rank=0,
+            address_base=0x40000,
+            worker_prefix="target",
+        )
+    )
+    moved = replace(
+        targets[1].fragments[0],
+        rank=replace(targets[1].fragments[0].rank, pp=1),
+    )
+    targets[1] = replace(targets[1], fragments=(moved,))
+
+    with pytest.raises(ValueError, match="target tensor is not fully covered"):
+        plan_runtime_transfer(sources, tuple(targets))
+
+
 def test_multiple_layers_and_experts_move_pp_ep_tp_dp_ownership_together() -> None:
     source_manifests = []
     target_manifests = []
@@ -621,3 +905,120 @@ def test_planner_rejects_incompatible_tensor_semantics(field: str) -> None:
 
     with pytest.raises(ValueError, match="tensor descriptor mismatch"):
         plan_runtime_transfer(source, target)
+
+
+def test_local_target_plan_supports_independent_tp_rank_startup() -> None:
+    sources = tp_manifests(
+        tp=2,
+        pp_rank=0,
+        ep_rank=0,
+        address_base=0x10000,
+        worker_prefix="source",
+    )
+    targets = tp_manifests(
+        tp=4,
+        pp_rank=2,
+        ep_rank=3,
+        address_base=0x40000,
+        worker_prefix="target",
+    )
+
+    plan = plan_runtime_transfer_to_local_target(sources, targets[1])
+
+    assert len(plan.target_executors) == 1
+    assert plan.target_executors[0].rank == targets[1].fragments[0].rank
+    assert len(plan.operations) == 1
+    operation = plan.operations[0]
+    assert operation.source.rank.tp == 0
+    assert operation.target.rank.tp == 1
+    assert operation.source_offset == 2 * 4 * 2
+    assert operation.target_offset == 0
+    assert operation.nbytes == 2 * 4 * 2
+    assert len(plan.source_executors) == 2
+    assert not plan.source_executors[1].operation_indices
+
+
+def test_local_target_plan_allows_explicit_pp_ep_tensor_subset() -> None:
+    first = descriptor()
+    second = replace(
+        first,
+        tensor_id="layers.7.experts.5.w1",
+        layer_id=7,
+        expert_id=5,
+    )
+    sources = (
+        *tp_manifests(
+            tp=2,
+            pp_rank=0,
+            ep_rank=0,
+            address_base=0x10000,
+            worker_prefix="source-first",
+            tensor=first,
+        ),
+        *tp_manifests(
+            tp=2,
+            pp_rank=1,
+            ep_rank=1,
+            address_base=0x30000,
+            worker_prefix="source-second",
+            tensor=second,
+        ),
+    )
+    local_target = tp_manifests(
+        tp=4,
+        pp_rank=3,
+        ep_rank=2,
+        address_base=0x50000,
+        worker_prefix="target",
+        tensor=second,
+    )[2]
+
+    plan = plan_runtime_transfer_to_local_target(sources, local_target)
+
+    assert {operation.tensor_id for operation in plan.operations} == {second.tensor_id}
+    assert {operation.source.rank.pp for operation in plan.operations} == {1}
+    assert {operation.source.rank.ep for operation in plan.operations} == {1}
+    assert {operation.target.rank.pp for operation in plan.operations} == {3}
+    assert {operation.target.rank.ep for operation in plan.operations} == {2}
+
+
+def test_local_target_plan_rejects_unknown_target_tensor() -> None:
+    sources = tp_manifests(
+        tp=2,
+        pp_rank=0,
+        ep_rank=0,
+        address_base=0x10000,
+        worker_prefix="source",
+    )
+    target = tp_manifests(
+        tp=4,
+        pp_rank=0,
+        ep_rank=0,
+        address_base=0x40000,
+        worker_prefix="target",
+        tensor=replace(descriptor(), tensor_id="unknown.weight"),
+    )[0]
+
+    with pytest.raises(ValueError, match="unknown tensors"):
+        plan_runtime_transfer_to_local_target(sources, target)
+
+
+def test_local_target_plan_rejects_tensor_without_local_fragment() -> None:
+    sources = tp_manifests(
+        tp=2,
+        pp_rank=0,
+        ep_rank=0,
+        address_base=0x10000,
+        worker_prefix="source",
+    )
+    target = tp_manifests(
+        tp=4,
+        pp_rank=0,
+        ep_rank=0,
+        address_base=0x40000,
+        worker_prefix="target",
+    )[0]
+    target = replace(target, fragments=())
+
+    with pytest.raises(ValueError, match="no fragments"):
+        plan_runtime_transfer_to_local_target(sources, target)

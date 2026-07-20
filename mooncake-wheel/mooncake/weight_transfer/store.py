@@ -102,7 +102,7 @@ def _collect_upload_sources(
     model_id = manifests[0].model_id
     revision = manifests[0].revision
     tensor_by_id: dict[str, TensorDescriptor] = {}
-    candidates: dict[tuple, list[RuntimeFragment]] = {}
+    fragments_by_dp: dict[int, list[RuntimeFragment]] = {}
     fragment_ids: set[str] = set()
     for manifest in manifests:
         if manifest.model_id != model_id or manifest.revision != revision:
@@ -117,21 +117,44 @@ def _collect_upload_sources(
                     f"duplicate source fragment_id: {fragment.fragment_id}"
                 )
             fragment_ids.add(fragment.fragment_id)
-            candidates.setdefault(_geometry_key(fragment), []).append(fragment)
+            fragments_by_dp.setdefault(fragment.rank.dp, []).append(fragment)
 
-    selected = []
-    for group in candidates.values():
-        group.sort(key=_runtime_sort_key)
-        selected.append(group[0])
-    selected.sort(
-        key=lambda fragment: (
-            fragment.tensor_id,
-            fragment.global_offset,
-            fragment.local_shape,
-        )
-    )
     tensors = tuple(sorted(tensor_by_id.values(), key=lambda item: item.tensor_id))
-    _validate_upload_coverage(tensors, selected)
+    complete_replicas: list[tuple[int, int, list[RuntimeFragment]]] = []
+    for dp_rank, fragments in sorted(fragments_by_dp.items()):
+        generations = {fragment.lease_generation for fragment in fragments}
+        if len(generations) != 1:
+            continue
+        candidates: dict[tuple, list[RuntimeFragment]] = {}
+        for fragment in fragments:
+            candidates.setdefault(_geometry_key(fragment), []).append(fragment)
+        selected = []
+        for group in candidates.values():
+            group.sort(key=_runtime_sort_key)
+            selected.append(group[0])
+        selected.sort(
+            key=lambda fragment: (
+                fragment.tensor_id,
+                fragment.global_offset,
+                fragment.local_shape,
+            )
+        )
+        try:
+            _validate_upload_coverage(tensors, selected)
+        except ValueError:
+            continue
+        complete_replicas.append((dp_rank, next(iter(generations)), selected))
+
+    if not complete_replicas:
+        raise ValueError(
+            "source manifests have no complete generation-consistent DP replica"
+        )
+    generations = {generation for _, generation, _ in complete_replicas}
+    if len(generations) != 1:
+        raise ValueError(
+            "complete source DP replicas have inconsistent lease generations"
+        )
+    _, _, selected = complete_replicas[0]
     return model_id, revision, tensors, selected
 
 

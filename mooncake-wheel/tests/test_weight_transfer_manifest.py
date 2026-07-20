@@ -47,6 +47,34 @@ def runtime_fragment(**overrides) -> RuntimeFragment:
     return RuntimeFragment(**values)
 
 
+def framework_tensor(**overrides) -> SimpleNamespace:
+    values = {
+        "fragment_id": "sglang-fragment",
+        "tensor_id": "layers.2.experts.3.w1",
+        "global_shape": (8, 4),
+        "global_offset": (4, 0),
+        "local_shape": (4, 4),
+        "dtype": "bfloat16",
+        "itemsize": 2,
+        "partition_dim": 0,
+        "layer_id": 2,
+        "expert_id": 3,
+        "layout_fingerprint": "sglang:qwen3.5:moe-w13:v1",
+        "address": 0x9000,
+        "nbytes": 32,
+        "worker_id": "sglang-worker",
+        "endpoint": "sglang-worker:12345",
+        "rank": SimpleNamespace(dp=1, tp=2, pp=3, ep=4),
+        "lease_generation": 9,
+        "is_contiguous": True,
+        "stride": (4, 1),
+        "storage_offset": 16,
+        "byte_offset": 32,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
 def stored_fragment(**overrides) -> StoredFragment:
     values = {
         "fragment_id": "stored-0",
@@ -101,26 +129,7 @@ def test_runtime_manifest_keeps_addresses_ephemeral() -> None:
 def test_runtime_manifest_imports_framework_inventory_without_framework_dependency() -> (
     None
 ):
-    rank = SimpleNamespace(dp=1, tp=2, pp=3, ep=4)
-    tensor = SimpleNamespace(
-        fragment_id="sglang-fragment",
-        tensor_id="layers.2.experts.3.w1",
-        global_shape=(8, 4),
-        global_offset=(4, 0),
-        local_shape=(4, 4),
-        dtype="bfloat16",
-        itemsize=2,
-        partition_dim=0,
-        layer_id=2,
-        expert_id=3,
-        layout_fingerprint="sglang:qwen3.5:moe-w13:v1",
-        address=0x9000,
-        nbytes=32,
-        worker_id="sglang-worker",
-        endpoint="sglang-worker:12345",
-        rank=rank,
-        lease_generation=9,
-    )
+    tensor = framework_tensor(aliases=("model.embed_tokens.weight", "lm_head.weight"))
     inventory = SimpleNamespace(
         model_id="qwen3.5-0.8b",
         revision="step-42",
@@ -138,7 +147,85 @@ def test_runtime_manifest_imports_framework_inventory_without_framework_dependen
     assert manifest.tensors[0].tensor_id == tensor.tensor_id
     assert manifest.fragments[0].address == 0x9000
     assert manifest.fragments[0].rank == ParallelRank(dp=1, tp=2, pp=3, ep=4)
+    assert manifest.fragments[0].aliases == (
+        "lm_head.weight",
+        "model.embed_tokens.weight",
+    )
     assert manifest.fragments[0].owner == ("owner", "sglang-fragment")
+
+
+def test_runtime_manifest_accepts_contiguous_singleton_stride() -> None:
+    tensor = framework_tensor(
+        global_shape=(8, 1, 4),
+        global_offset=(4, 0, 0),
+        local_shape=(4, 1, 4),
+        stride=(4, 99, 1),
+    )
+    inventory = SimpleNamespace(
+        model_id="qwen3.5-0.8b",
+        revision="step-42",
+        instance_id="sglang-instance",
+        generation=9,
+        tensors=(tensor,),
+        format_version=1,
+    )
+
+    manifest = RuntimeManifest.from_runtime_inventory(inventory)
+
+    assert manifest.fragments[0].local_shape == (4, 1, 4)
+
+
+def test_runtime_fragment_preserves_positional_owner_argument() -> None:
+    owner = object()
+
+    fragment = RuntimeFragment(
+        "runtime-0",
+        "layers.2.experts.3.w1",
+        (0, 0),
+        (4, 4),
+        0x1000,
+        32,
+        "source-0",
+        "source-0:12345",
+        ParallelRank(dp=0, tp=0, pp=1, ep=1),
+        7,
+        owner,
+    )
+
+    assert fragment.owner is owner
+    assert fragment.aliases == ()
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"is_contiguous": False}, "contiguous"),
+        ({"is_contiguous": 1}, "contiguous"),
+        ({"stride": (1, 4)}, "canonical stride"),
+        ({"stride": (4, True)}, "stride"),
+        ({"storage_offset": 16, "byte_offset": 30}, "byte_offset"),
+        ({"storage_offset": 15, "byte_offset": 32}, "byte_offset"),
+        ({"storage_offset": 16.0}, "storage_offset"),
+        ({"storage_offset": -1, "byte_offset": -2}, "storage_offset"),
+        ({"byte_offset": 32.0}, "byte_offset"),
+        ({"nbytes": 30}, "byte size mismatch"),
+    ],
+)
+def test_runtime_manifest_rejects_unexplainable_runtime_views(
+    overrides: dict, message: str
+) -> None:
+    tensor = framework_tensor(**overrides)
+    inventory = SimpleNamespace(
+        model_id="qwen3.5-0.8b",
+        revision="step-42",
+        instance_id="sglang-instance",
+        generation=9,
+        tensors=(tensor,),
+        format_version=1,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        RuntimeManifest.from_runtime_inventory(inventory)
 
 
 @pytest.mark.parametrize(
@@ -207,24 +294,9 @@ def test_weight_manifest_rejects_duplicate_fragment_geometry() -> None:
 def test_runtime_manifest_rejects_incompatible_framework_inventory(
     overrides: dict, message: str
 ) -> None:
-    tensor = SimpleNamespace(
-        fragment_id="sglang-fragment",
-        tensor_id="layers.2.experts.3.w1",
-        global_shape=(8, 4),
+    tensor = framework_tensor(
         global_offset=(0, 0),
-        local_shape=(4, 4),
-        dtype="bfloat16",
-        itemsize=2,
-        partition_dim=0,
-        layer_id=2,
-        expert_id=3,
-        layout_fingerprint="sglang:qwen3.5:moe-w13:v1",
-        address=0x9000,
-        nbytes=32,
-        worker_id="sglang-worker",
-        endpoint="sglang-worker:12345",
         rank=SimpleNamespace(dp=0, tp=0, pp=0, ep=0),
-        lease_generation=9,
     )
     values = dict(
         model_id="qwen3.5-0.8b",
@@ -293,6 +365,19 @@ def test_manifest_types_cannot_cross_the_runtime_storage_boundary() -> None:
 def test_manifest_schema_rejects_non_integer_numeric_fields(factory) -> None:
     with pytest.raises(ValueError, match="integer"):
         factory()
+
+
+@pytest.mark.parametrize(
+    "aliases, message",
+    [
+        ("model.weight", "non-empty strings"),
+        (("model.weight", "model.weight"), "duplicates"),
+        (("model.weight", ""), "non-empty strings"),
+    ],
+)
+def test_runtime_fragment_rejects_invalid_aliases(aliases, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        runtime_fragment(aliases=aliases)
 
 
 def test_weight_manifest_json_rejects_non_finite_and_non_mapping_values() -> None:

@@ -61,6 +61,7 @@ class RuntimeFragment:
     rank: ParallelRank
     lease_generation: int
     owner: Any = field(default=None, compare=False, repr=False)
+    aliases: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -78,6 +79,17 @@ class RuntimeFragment:
         _require_integer(self.address, "address", minimum=1)
         _require_integer(self.nbytes, "nbytes", minimum=1)
         _require_integer(self.lease_generation, "lease_generation", minimum=0)
+        if isinstance(self.aliases, (str, bytes, bytearray)):
+            raise ValueError("aliases must contain non-empty strings")
+        try:
+            aliases = tuple(self.aliases)
+        except TypeError as error:
+            raise ValueError("aliases must contain non-empty strings") from error
+        if any(type(alias) is not str or not alias for alias in aliases):
+            raise ValueError("aliases must contain non-empty strings")
+        if len(aliases) != len(set(aliases)):
+            raise ValueError("aliases must not contain duplicates")
+        object.__setattr__(self, "aliases", tuple(sorted(aliases)))
         if not isinstance(self.rank, ParallelRank):
             raise ValueError("rank must be a ParallelRank")
 
@@ -159,6 +171,41 @@ def _read_optional_field(value: Any, name: str) -> Any | None:
     if isinstance(value, Mapping):
         return value.get(name)
     return getattr(value, name, None)
+
+
+def _canonical_stride(shape: tuple[int, ...]) -> tuple[int, ...]:
+    stride = []
+    running = 1
+    for extent in reversed(shape):
+        stride.append(running)
+        running *= extent
+    return tuple(reversed(stride))
+
+
+def _validate_runtime_view(record: Any, descriptor: TensorDescriptor) -> None:
+    is_contiguous = _read_field(record, "is_contiguous")
+    if type(is_contiguous) is not bool or not is_contiguous:
+        raise ValueError("runtime inventory tensor must be contiguous")
+
+    local_shape = _require_integer_tuple(
+        _read_field(record, "local_shape"), "local_shape", minimum=1
+    )
+    stride = _require_integer_tuple(_read_field(record, "stride"), "stride", minimum=0)
+    canonical_stride = _canonical_stride(local_shape)
+    if any(
+        extent != 1 and actual != canonical
+        for extent, actual, canonical in zip(
+            local_shape, stride, canonical_stride, strict=True
+        )
+    ):
+        raise ValueError("runtime inventory tensor must use canonical stride")
+
+    storage_offset = _read_field(record, "storage_offset")
+    byte_offset = _read_field(record, "byte_offset")
+    _require_integer(storage_offset, "storage_offset", minimum=0)
+    _require_integer(byte_offset, "byte_offset", minimum=0)
+    if byte_offset != storage_offset * descriptor.itemsize:
+        raise ValueError("runtime inventory byte_offset does not match storage_offset")
 
 
 def _require_exact_fields(
@@ -320,6 +367,7 @@ class RuntimeManifest:
                 raise ValueError(
                     f"runtime inventory descriptor mismatch: {descriptor.tensor_id}"
                 )
+            _validate_runtime_view(record, descriptor)
             rank = _read_field(record, "rank")
             lease_generation = _read_field(record, "lease_generation")
             _require_integer(lease_generation, "lease_generation", minimum=0)
@@ -345,6 +393,7 @@ class RuntimeManifest:
                         ep=_read_field(rank, "ep"),
                     ),
                     lease_generation=lease_generation,
+                    aliases=tuple(_read_optional_field(record, "aliases") or ()),
                     owner=(
                         owner_resolver(record) if owner_resolver is not None else None
                     ),
