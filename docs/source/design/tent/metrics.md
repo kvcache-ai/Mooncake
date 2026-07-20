@@ -347,7 +347,7 @@ Histogram bucket boundaries are fixed at compile time (defined as `static inline
 
 ### Compatibility
 
-The `metrics/latency_buckets` and `metrics/size_buckets` config keys, and the `TENT_METRICS_LATENCY_BUCKETS` / `TENT_METRICS_SIZE_BUCKETS` environment variables, were removed and are now silently ignored. Histogram buckets are fixed at compile time (see [Histogram Buckets](#histogram-buckets) above).
+The `metrics/latency_buckets` and `metrics/size_buckets` config keys, and the `TENT_METRICS_LATENCY_BUCKETS` / `TENT_METRICS_SIZE_BUCKETS` environment variables, were removed and are now silently ignored. Histogram buckets are fixed at compile time (see Histogram Buckets above).
 
 **Migration:** remove these keys from your `transfer-engine.json` and unset the environment variables. If custom bucket boundaries are required, edit `kLatencyBuckets` / `kSizeBuckets` in `tent/metrics/tent_metrics.h` and rebuild.
 
