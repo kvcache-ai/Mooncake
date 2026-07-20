@@ -79,7 +79,6 @@ if(USE_NCCL_DEVICE OR USE_NCCL_HOST)
 endif()
 
 if(USE_SUPA)
-  # libsupa.so (brumd/lib, driver su* API) + libsupart.so (supa/lib, runtime supa* API)
   target_link_libraries(transfer_engine PUBLIC supa supart)
 endif()
 
