@@ -3,6 +3,12 @@ import os
 import time
 import threading
 import random
+
+try:
+    import torch
+except ImportError:
+    torch = None
+
 from mooncake.store import MooncakeDistributedStore
 
 # The lease time of the kv object, should be set equal to
@@ -321,6 +327,163 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         self.assertEqual(self.store.unregister_buffer(large_buffer_ptr), 0, "Buffer unregistration should succeed")
         for key in keys:
             self.assertEqual(self.store.remove(key), 0)
+
+    def test_tensor_operations(self):
+        """Test tensor wrappers through dummy-client shared memory."""
+        import ctypes
+
+        if torch is None:
+            self.skipTest("PyTorch is not available")
+
+        key = f"test_dummy_tensor_{os.getpid()}"
+        key_from = f"{key}_from"
+        batch_keys = [f"{key}_batch_{i}" for i in range(2)]
+        upsert_key = f"{key}_upsert"
+        pub_key = f"{key}_pub"
+        tp_key = f"{key}_tp"
+        batch_tp_key = f"{key}_batch_tp"
+        parallel_key = f"{key}_parallel"
+        parallel_batch_keys = [f"{key}_parallel_batch_{i}" for i in range(2)]
+        parallel_from_key = f"{key}_parallel_from"
+        parallel_upsert_key = f"{key}_parallel_upsert"
+        parallel_upsert_from_key = f"{key}_parallel_upsert_from"
+        cleanup_keys = [key, key_from, *batch_keys, upsert_key, pub_key]
+        cleanup_keys.extend(
+            [
+                parallel_key,
+                *parallel_batch_keys,
+                parallel_from_key,
+                parallel_upsert_key,
+                parallel_upsert_from_key,
+            ]
+        )
+        cleanup_keys.extend(f"{tp_key}_tp_{rank}" for rank in range(2))
+        cleanup_keys.extend(f"{batch_tp_key}_tp_{rank}" for rank in range(2))
+        tensor = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+
+        self.assertEqual(self.store.put_tensor(key, tensor), 0)
+        retrieved = self.store.get_tensor(key)
+        self.assertIsNotNone(retrieved)
+        self.assertEqual(retrieved.dtype, tensor.dtype)
+        self.assertEqual(tuple(retrieved.shape), tuple(tensor.shape))
+        self.assertTrue(torch.equal(retrieved, tensor))
+
+        buffer_size = self.store.get_size(key)
+        self.assertGreater(buffer_size, 0)
+        buffer_ptr = self.store.alloc_from_mem_pool(buffer_size)
+        self.assertNotEqual(buffer_ptr, 0)
+        buffer = (ctypes.c_ubyte * buffer_size).from_address(buffer_ptr)
+        self.assertEqual(self.store.register_buffer(buffer_ptr, buffer_size), 0)
+        try:
+            ctypes.memset(buffer_ptr, 0, buffer_size)
+            into = self.store.get_tensor_into(key, buffer_ptr, buffer_size)
+            self.assertIsNotNone(into)
+            self.assertTrue(torch.equal(into, tensor))
+
+            mismatch = self.store.batch_get_tensor_into(
+                [key, f"{key}_missing_arg"], [buffer_ptr], [buffer_size]
+            )
+            self.assertEqual(len(mismatch), 2)
+            self.assertTrue(all(result < 0 for result in mismatch))
+
+            self.assertEqual(
+                self.store.put_tensor_from(key_from, buffer_ptr, buffer_size),
+                0,
+            )
+            from_tensor = self.store.get_tensor(key_from)
+            self.assertIsNotNone(from_tensor)
+            self.assertTrue(torch.equal(from_tensor, tensor))
+
+            batch_tensors = [tensor, tensor + 1]
+            batch_results = self.store.batch_put_tensor(batch_keys, batch_tensors)
+            self.assertEqual(list(batch_results), [0, 0])
+            batch_retrieved = self.store.batch_get_tensor(batch_keys)
+            for expected, actual in zip(batch_tensors, batch_retrieved):
+                self.assertIsNotNone(actual)
+                self.assertTrue(torch.equal(actual, expected))
+
+            updated = tensor + 2
+            self.assertEqual(self.store.upsert_tensor(upsert_key, updated), 0)
+            self.assertTrue(torch.equal(self.store.get_tensor(upsert_key), updated))
+
+            self.assertEqual(self.store.pub_tensor(pub_key, tensor + 3), 0)
+            self.assertTrue(torch.equal(self.store.get_tensor(pub_key), tensor + 3))
+
+            self.assertEqual(
+                self.store.put_tensor_with_tp(
+                    tp_key, tensor, tp_size=2, split_dim=1
+                ),
+                0,
+            )
+            tp_shards = torch.chunk(tensor, 2, dim=1)
+            for rank, expected in enumerate(tp_shards):
+                actual = self.store.get_tensor_with_tp(
+                    tp_key, tp_rank=rank, tp_size=2
+                )
+                self.assertIsNotNone(actual)
+                self.assertTrue(torch.equal(actual, expected.contiguous()))
+
+            batch_tp_results = self.store.batch_put_tensor_with_tp(
+                [batch_tp_key], [tensor], tp_size=2, split_dim=1
+            )
+            self.assertEqual(list(batch_tp_results), [0])
+
+            self.assertEqual(
+                self.store.put_tensor_with_parallelism(parallel_key, tensor),
+                0,
+            )
+            self.assertTrue(torch.equal(self.store.get_tensor(parallel_key), tensor))
+
+            parallel_batch = [tensor + 4, tensor + 5]
+            parallel_batch_results = self.store.batch_put_tensor_with_parallelism(
+                parallel_batch_keys, parallel_batch
+            )
+            self.assertEqual(list(parallel_batch_results), [0, 0])
+            parallel_batch_retrieved = self.store.batch_get_tensor(
+                parallel_batch_keys
+            )
+            for expected, actual in zip(parallel_batch, parallel_batch_retrieved):
+                self.assertIsNotNone(actual)
+                self.assertTrue(torch.equal(actual, expected))
+
+            self.assertEqual(
+                self.store.put_tensor_with_parallelism_from(
+                    parallel_from_key, buffer_ptr, buffer_size
+                ),
+                0,
+            )
+            self.assertTrue(
+                torch.equal(self.store.get_tensor(parallel_from_key), tensor)
+            )
+
+            parallel_update = tensor + 6
+            self.assertEqual(
+                self.store.upsert_tensor_with_parallelism(
+                    parallel_upsert_key, parallel_update
+                ),
+                0,
+            )
+            self.assertTrue(
+                torch.equal(
+                    self.store.get_tensor(parallel_upsert_key), parallel_update
+                )
+            )
+
+            parallel_upsert_from_results = (
+                self.store.batch_upsert_tensor_with_parallelism_from(
+                    [parallel_upsert_from_key], [buffer_ptr], [buffer_size]
+                )
+            )
+            self.assertEqual(list(parallel_upsert_from_results), [0])
+            self.assertTrue(
+                torch.equal(
+                    self.store.get_tensor(parallel_upsert_from_key), tensor
+                )
+            )
+        finally:
+            self.store.unregister_buffer(buffer_ptr)
+            for cleanup_key in cleanup_keys:
+                self.store.remove(cleanup_key)
 
     # Mark this test as zzz_ so that it is the last test to run
     def zzz_test_dict_fuzz_e2e(self):
