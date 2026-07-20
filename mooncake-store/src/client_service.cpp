@@ -3013,6 +3013,16 @@ std::vector<tl::expected<bool, ErrorCode>> Client::BatchIsExist(
     return response;
 }
 
+std::vector<tl::expected<bool, ErrorCode>> Client::RetainGroups(
+    const std::vector<std::string>& group_ids, uint64_t ttl_ms) {
+    auto response = master_client_.RetainGroups(group_ids, ttl_ms);
+    if (response.size() != group_ids.size()) {
+        return std::vector<tl::expected<bool, ErrorCode>>(
+            group_ids.size(), tl::unexpected(ErrorCode::RPC_FAIL));
+    }
+    return response;
+}
+
 void* Client::GetBaseAddr() { return transfer_engine_->getBaseAddr(); }
 
 tl::expected<void, ErrorCode> Client::MountLocalDiskSegment(

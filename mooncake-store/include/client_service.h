@@ -363,6 +363,9 @@ class Client {
     std::vector<tl::expected<bool, ErrorCode>> BatchIsExist(
         const std::vector<std::string>& keys);
 
+    std::vector<tl::expected<bool, ErrorCode>> RetainGroups(
+        const std::vector<std::string>& group_ids, uint64_t ttl_ms);
+
     /**
      * @brief Create a copy task to copy an object's replicas to target segments
      * @param key Object key

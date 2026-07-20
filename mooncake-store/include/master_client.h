@@ -120,6 +120,9 @@ class MasterClient {
     [[nodiscard]] std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
         const std::vector<std::string>& object_keys);
 
+    [[nodiscard]] std::vector<tl::expected<bool, ErrorCode>> RetainGroups(
+        const std::vector<std::string>& group_ids, uint64_t ttl_ms);
+
     /**
      * @brief Calculate Store-observed cache reuse metrics
      * @param object_keys None

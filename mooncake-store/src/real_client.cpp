@@ -2120,6 +2120,18 @@ std::vector<int> RealClient::batchIsExist(
     return results;
 }
 
+std::vector<int> RealClient::retainGroups(
+    const std::vector<std::string> &group_ids, uint64_t ttl_ms) {
+    auto internal_results = retainGroups_internal(group_ids, ttl_ms);
+    std::vector<int> results;
+    results.reserve(internal_results.size());
+    for (const auto &result : internal_results) {
+        results.push_back(result.has_value() ? (result.value() ? 1 : 0)
+                                             : toInt(result.error()));
+    }
+    return results;
+}
+
 tl::expected<int64_t, ErrorCode> RealClient::getSize_internal(
     const std::string &key) {
     if (!client_) {
@@ -4827,6 +4839,15 @@ std::vector<tl::expected<bool, ErrorCode>> RealClient::batchIsExist_internal(
 
     // Call client BatchIsExist and return the vector<expected> directly
     return client_->BatchIsExist(keys);
+}
+
+std::vector<tl::expected<bool, ErrorCode>> RealClient::retainGroups_internal(
+    const std::vector<std::string> &group_ids, uint64_t ttl_ms) {
+    if (!client_ || ttl_ms == 0) {
+        return std::vector<tl::expected<bool, ErrorCode>>(
+            group_ids.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    return client_->RetainGroups(group_ids, ttl_ms);
 }
 
 int RealClient::put_from_with_metadata(const std::string &key, void *buffer,

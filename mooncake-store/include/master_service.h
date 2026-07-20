@@ -212,6 +212,10 @@ class MasterService {
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
         const std::vector<std::string>& keys, const std::string& tenant_id);
 
+    std::vector<tl::expected<bool, ErrorCode>> RetainGroups(
+        const std::vector<std::string>& group_ids, uint64_t ttl_ms,
+        const std::string& tenant_id);
+
     /**
      * @brief Fetch all keys for a single tenant.
      * @return ErrorCode::OK if exists
@@ -1230,11 +1234,14 @@ class MasterService {
 
         std::unordered_map<std::string, std::unordered_set<std::string>>
             group_members;  // group_id → set of keys
+        std::unordered_map<std::string, std::chrono::system_clock::time_point>
+            group_retention_deadlines;
 
         bool Empty() const {
             return metadata.empty() && processing_keys.empty() &&
                    replication_tasks.empty() && offloading_tasks.empty() &&
-                   promotion_tasks.empty() && group_members.empty();
+                   promotion_tasks.empty() && group_members.empty() &&
+                   group_retention_deadlines.empty();
         }
     };
 
@@ -1409,6 +1416,7 @@ class MasterService {
                                const std::string& tenant_id,
                                const std::string& key,
                                const std::string& group_id);
+    void PruneExpiredGroupRetentions();
     std::unordered_map<std::string, ObjectMetadata>::iterator EraseMetadata(
         TenantState& tenant_state,
         std::unordered_map<std::string, ObjectMetadata>::iterator it,
@@ -1550,6 +1558,9 @@ class MasterService {
     // Lease related members
     const uint64_t default_kv_lease_ttl_;     // in milliseconds
     const uint64_t default_kv_soft_pin_ttl_;  // in milliseconds
+    const size_t max_retained_groups_;
+    const uint64_t max_group_retention_ttl_ms_;
+    std::atomic<size_t> retained_group_count_{0};
     const bool allow_evict_soft_pinned_objects_;
 
     // Eviction related members

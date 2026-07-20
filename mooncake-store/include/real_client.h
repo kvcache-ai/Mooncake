@@ -316,6 +316,9 @@ class RealClient : public PyClient {
      */
     std::vector<int> batchIsExist(const std::vector<std::string> &keys);
 
+    std::vector<int> retainGroups(const std::vector<std::string> &group_ids,
+                                  uint64_t ttl_ms);
+
     /**
      * @brief Get the size of an object
      * @param key Key of the object
@@ -658,6 +661,9 @@ class RealClient : public PyClient {
 
     std::vector<tl::expected<bool, ErrorCode>> batchIsExist_internal(
         const std::vector<std::string> &keys);
+
+    std::vector<tl::expected<bool, ErrorCode>> retainGroups_internal(
+        const std::vector<std::string> &group_ids, uint64_t ttl_ms);
 
     tl::expected<int64_t, ErrorCode> getSize_internal(const std::string &key);
 

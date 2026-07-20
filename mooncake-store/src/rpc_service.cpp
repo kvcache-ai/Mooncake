@@ -1,5 +1,7 @@
 #include "rpc_service.h"
 
+#include <algorithm>
+
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/util/tl/expected.hpp>
 
@@ -73,6 +75,18 @@ std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchExistKey(
     timer.LogResponse("total=", result.size(),
                       ", success=", result.size() - failure_count,
                       ", failures=", failure_count);
+    return result;
+}
+
+std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::RetainGroups(
+    const std::vector<std::string>& group_ids, uint64_t ttl_ms,
+    const std::string& tenant_id) {
+    auto result = master_service_.RetainGroups(group_ids, ttl_ms, tenant_id);
+    const auto accepted = std::count_if(
+        result.begin(), result.end(),
+        [](const auto& item) { return item.has_value() && item.value(); });
+    LOG(INFO) << "RetainGroups accepted " << accepted << "/" << group_ids.size()
+              << " groups for ttl_ms=" << ttl_ms << ", tenant_id=" << tenant_id;
     return result;
 }
 
@@ -1348,6 +1362,8 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::GetStorageConfig>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchExistKey>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::RetainGroups>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ServiceReady>(
         &wrapped_master_service);
