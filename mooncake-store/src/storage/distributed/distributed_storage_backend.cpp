@@ -139,8 +139,7 @@ tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
     std::function<ErrorCode(const std::vector<std::string>& keys,
                             std::vector<StorageObjectMetadata>& metadatas)>
         complete_handler,
-    std::function<void(const std::vector<std::string>& evicted_keys)>
-        eviction_handler) {
+    EvictionHandler eviction_handler) {
     if (!initialized_) {
         LOG(ERROR) << "DistributedStorageBackend is not initialized";
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);

@@ -710,7 +710,9 @@ SegmentSerializer::Serialize() {
         }
         std::sort(sorted_keys.begin(), sorted_keys.end());
 
-        packer.pack_array(2 + sorted_keys.size() * 2);
+        // Trailing ssd_total_capacity_bytes so a restored master keeps the
+        // client-reported SSD capacity across a snapshot restore (#2783).
+        packer.pack_array(2 + sorted_keys.size() * 2 + 1);
         packer.pack(segment->enable_offloading);
         packer.pack(static_cast<uint64_t>(sorted_keys.size()));
 
@@ -722,6 +724,7 @@ SegmentSerializer::Serialize() {
             packer.pack(task.key);
             packer.pack(task.size);
         }
+        packer.pack(segment->ssd_total_capacity_bytes);
     }
 
     // Compress entire data
@@ -1126,6 +1129,17 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
                                         .key = std::move(user_key),
                                         .size = task_obj.as<int64_t>()};
                 }
+            }
+
+            // ssd_total_capacity_bytes is appended after the offloading
+            // objects. Pre-#2783 snapshots omit it, so read it only when
+            // present; otherwise it keeps the default 0 until the client
+            // re-reports capacity.
+            size_t capacity_idx = 2 + count * 2;
+            if (client_value.via.array.size > capacity_idx &&
+                IsMsgpackInteger(client_value.via.array.ptr[capacity_idx])) {
+                segment->ssd_total_capacity_bytes =
+                    client_value.via.array.ptr[capacity_idx].as<int64_t>();
             }
 
             segment_manager_->client_local_disk_segment_[client_id] =

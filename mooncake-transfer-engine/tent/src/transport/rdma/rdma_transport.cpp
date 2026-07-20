@@ -831,5 +831,13 @@ void RdmaTransport::notifyWorkerThread() {
         usleep(notify_poll_interval_us_);
     }
 }
+
+double RdmaTransport::getEstimatedBandwidth() const {
+    if (!workers_) return -1.0;
+    auto* sel = workers_->getDeviceSelector();
+    if (!sel) return -1.0;
+    return sel->getAggregateEwmaBandwidth();
+}
+
 }  // namespace tent
 }  // namespace mooncake

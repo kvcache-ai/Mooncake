@@ -20,6 +20,20 @@ target_include_directories(metrics_config_loader_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME metrics_config_loader_test COMMAND metrics_config_loader_test)
 
+# TENT Metrics HTTP server test: validates that initialize() detects a busy
+# metrics port and degrades to log-only metrics instead of falsely reporting a
+# listening endpoint.
+add_executable(tent_metrics_http_server_test metrics_http_server_test.cpp)
+target_link_libraries(tent_metrics_http_server_test
+                      PRIVATE tent_metrics tent_common gtest gtest_main glog)
+if(TARGET asio_shared)
+  target_link_libraries(tent_metrics_http_server_test PRIVATE asio_shared)
+endif()
+target_include_directories(tent_metrics_http_server_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_metrics_http_server_test
+         COMMAND tent_metrics_http_server_test)
+
 add_executable(admission_queue_test admission_queue_test.cpp
                                     ../src/runtime/admission_queue.cpp)
 target_link_libraries(admission_queue_test PRIVATE tent_common gtest gtest_main)
@@ -27,8 +41,21 @@ target_include_directories(admission_queue_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME admission_queue_test COMMAND admission_queue_test)
 
-# Reproducible hot-path microbenchmark; intentionally not registered with ctest.
-# Run manually when changing deadline promotion partitioning.
+add_executable(receiver_credit_test receiver_credit_test.cpp
+                                    ../src/runtime/receiver_credit.cpp)
+target_link_libraries(receiver_credit_test PRIVATE tent_common gtest gtest_main)
+target_include_directories(receiver_credit_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME receiver_credit_test COMMAND receiver_credit_test)
+
+add_executable(bw_arbitration_test bw_arbitration_test.cpp)
+target_link_libraries(bw_arbitration_test PRIVATE tent_common gtest gtest_main)
+target_include_directories(bw_arbitration_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME bw_arbitration_test COMMAND bw_arbitration_test)
+
+# Reproducible hot-path microbenchmark; intentionally not registered with
+# ctest. Run manually when changing deadline promotion partitioning.
 add_executable(deadline_promotion_bench deadline_promotion_bench.cpp
                                         ../src/runtime/admission_queue.cpp)
 target_link_libraries(deadline_promotion_bench PRIVATE tent_common)
@@ -53,6 +80,12 @@ target_link_libraries(thread_local_storage_test PRIVATE gtest gtest_main)
 target_include_directories(thread_local_storage_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME thread_local_storage_test COMMAND thread_local_storage_test)
+
+add_executable(tent_rw_spinlock_test rw_spinlock_test.cpp)
+target_link_libraries(tent_rw_spinlock_test PRIVATE gtest gtest_main)
+target_include_directories(tent_rw_spinlock_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_rw_spinlock_test COMMAND tent_rw_spinlock_test)
 
 add_executable(tent_ip_utils_test ip_utils_test.cpp)
 target_link_libraries(tent_ip_utils_test PRIVATE tent_common gtest gtest_main)
@@ -110,6 +143,13 @@ target_link_libraries(tent_tcp_transport_test PRIVATE gtest gtest_main
 target_include_directories(tent_tcp_transport_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_tcp_transport_test COMMAND tent_tcp_transport_test)
+
+add_executable(tent_shm_transport_test shm_transport_test.cpp)
+target_link_libraries(tent_shm_transport_test PRIVATE gtest gtest_main
+                                                      tent_link_group)
+target_include_directories(tent_shm_transport_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_shm_transport_test COMMAND tent_shm_transport_test)
 
 add_executable(tent_failover_test failover_test.cpp)
 target_link_libraries(tent_failover_test PRIVATE gtest gtest_main
@@ -175,7 +215,15 @@ target_include_directories(tent_rail_monitor_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_rail_monitor_test COMMAND tent_rail_monitor_test)
 
-# Transport Selector Unit Test
+# QoS Contract Schema Unit Test
+add_executable(tent_qos_contract_test qos_contract_test.cpp
+                                      ../src/runtime/qos_contract.cpp)
+target_link_libraries(tent_qos_contract_test PRIVATE gtest gtest_main
+                                                     tent_common)
+target_include_directories(tent_qos_contract_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_qos_contract_test COMMAND tent_qos_contract_test)
+
 add_executable(tent_transport_selector_test transport_selector_test.cpp)
 target_link_libraries(tent_transport_selector_test PRIVATE gtest gtest_main
                                                            tent_link_group)
@@ -237,6 +285,18 @@ target_include_directories(tent_runtime_queue_dispatch_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_runtime_queue_dispatch_test
          COMMAND tent_runtime_queue_dispatch_test)
+
+# Causal chain stage decomposition: validates that dispatch_time and post_time
+# timestamps are populated on both queue and direct-commit paths.
+add_executable(causal_chain_test causal_chain_test.cpp)
+target_link_libraries(causal_chain_test PRIVATE gtest gtest_main
+                                                tent_link_group)
+if(TARGET asio_shared)
+  target_link_libraries(causal_chain_test PRIVATE asio_shared)
+endif()
+target_include_directories(causal_chain_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME causal_chain_test COMMAND causal_chain_test)
 
 # TPU PJRT shim test: exercises the dlopen'd adapter ABI (device-pointer
 # classification, D2H/H2D copy, device topology) against an in-process mock

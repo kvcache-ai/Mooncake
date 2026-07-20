@@ -20,6 +20,7 @@
 
 #include "real_client.h"
 #include "client_buffer.h"
+#include "replica_selection.h"
 #include "common.h"
 #include "config.h"
 #include "mutex.h"
@@ -278,46 +279,21 @@ inline tl::expected<void, ErrorCode> scatter_host_to_maybe_device(
     return {};
 }
 
-// Select the best replica from a list: prefer local MEMORY, then any
-// MEMORY, then LOCAL_DISK, then DISK.  Master may return replicas in any
-// order, so we always scan.
-inline const Replica::Descriptor *SelectBestReplica(
-    const std::vector<Replica::Descriptor> &replicas,
-    const std::unordered_set<std::string> &local_endpoints) {
-    const Replica::Descriptor *first_memory = nullptr;
-    const Replica::Descriptor *first_nof = nullptr;
-    for (const auto &r : replicas) {
-        if (r.status != ReplicaStatus::COMPLETE) continue;
-        if (r.is_memory_replica()) {
-            if (local_endpoints.count(
-                    r.get_memory_descriptor()
-                        .buffer_descriptor.transport_endpoint_)) {
-                return &r;  // local MEMORY — best case
-            }
-            if (!first_memory) first_memory = &r;
-        } else if (r.is_nof_replica()) {
-            if (local_endpoints.count(
-                    r.get_nof_descriptor()
-                        .buffer_descriptor.transport_endpoint_)) {
-                return &r;  // local NOF_SSD — also good
-            }
-            if (!first_nof) first_nof = &r;
-        }
+// Gather memory that may be GPU or host into a host destination.
+inline tl::expected<void, ErrorCode> gather_maybe_device_to_host(
+    void *dst, const void *src, size_t size, const std::string &context) {
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
+    if (!runtime_accelerator.CopyToHost(dst, src, size)) {
+        LOG(ERROR) << "D2H copy failed: " << context;
+        return tl::unexpected(ErrorCode::TRANSFER_FAIL);
     }
-    if (first_memory) return first_memory;
-    if (first_nof) return first_nof;
-
-    const Replica::Descriptor *best = nullptr;
-    for (const auto &r : replicas) {
-        if (r.status != ReplicaStatus::COMPLETE) continue;
-        if (r.is_local_disk_replica()) {
-            best = &r;  // LOCAL_DISK always overrides DISK
-        } else if (r.is_disk_replica() && !best) {
-            best = &r;
-        }
-    }
-    return best;
+    return {};
 }
+
+// SelectBestReplica and the replica-scoring helpers live in
+// replica_selection.h (included above) so they can be unit-tested directly.
+using mooncake::SelectBestReplica;
 
 // Build a QueryResult containing only the chosen replica so that
 // Client::Get / Client::BatchGet (which internally call
@@ -1794,7 +1770,7 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto &buffer_handle = *alloc_result;
-    auto scatter_result = scatter_host_to_maybe_device(
+    auto scatter_result = gather_maybe_device_to_host(
         buffer_handle.ptr(), value.data(), value.size_bytes(), "put:" + key);
     if (!scatter_result) {
         return tl::unexpected(scatter_result.error());
@@ -1876,9 +1852,9 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
         auto &buffer_handle = *alloc_result;
-        auto scatter_result = scatter_host_to_maybe_device(
-            buffer_handle.ptr(), value.data(), value.size_bytes(),
-            "put_batch:" + key);
+        auto scatter_result =
+            gather_maybe_device_to_host(buffer_handle.ptr(), value.data(),
+                                        value.size_bytes(), "put_batch:" + key);
         if (!scatter_result) {
             return tl::unexpected(scatter_result.error());
         }
@@ -1985,7 +1961,7 @@ tl::expected<void, ErrorCode> RealClient::put_parts_internal(
     // Copy all parts into the contiguous buffer
     size_t offset = 0;
     for (const auto &value : values) {
-        auto scatter_result = scatter_host_to_maybe_device(
+        auto scatter_result = gather_maybe_device_to_host(
             static_cast<char *>(buffer_handle.ptr()) + offset, value.data(),
             value.size_bytes(), "put_multi_value");
         if (!scatter_result) {
@@ -3303,9 +3279,42 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             return static_cast<int64_t>(total_size);
         }
 
+        auto runtime_accelerator =
+            device::GetAcceleratorRegistry().RuntimeAccelerators();
+        void *dst = static_cast<char *>(buffer) + dst_offset;
+        if (runtime_accelerator.FindDeviceForPointer(dst)) {
+            if (!client_buffer_allocator_) {
+                LOG(ERROR) << "Client buffer allocator is not provided";
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            auto alloc_result = client_buffer_allocator_->allocate(total_size);
+            if (!alloc_result) {
+                LOG(ERROR) << "Failed to allocate temp buffer for GPU memory "
+                           << "read, key: " << key << ", size: " << total_size;
+                return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+            }
+            BufferHandle tmp_handle(std::move(*alloc_result));
+            std::vector<mooncake::Slice> tmp_slices;
+            allocateSlices(tmp_slices, replica, tmp_handle.ptr());
+
+            auto filtered_qr = FilterQueryResult(query_result, replica);
+            auto get_result = client_->Get(key, filtered_qr, tmp_slices);
+            if (!get_result) {
+                LOG(ERROR) << "Get failed for key: " << key
+                           << " with error: " << toString(get_result.error());
+                return tl::unexpected(get_result.error());
+            }
+            if (auto r = scatter_host_to_maybe_device(
+                    dst, tmp_handle.ptr(), total_size,
+                    "MEMORY full read, key: " + key);
+                !r) {
+                return tl::unexpected(r.error());
+            }
+            return static_cast<int64_t>(total_size);
+        }
+
         std::vector<mooncake::Slice> slices;
-        allocateSlices(slices, replica,
-                       static_cast<char *>(buffer) + dst_offset);
+        allocateSlices(slices, replica, dst);
 
         auto filtered_qr = FilterQueryResult(query_result, replica);
         auto get_result = client_->Get(key, filtered_qr, slices);
@@ -3389,8 +3398,39 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         return tl::unexpected(ErrorCode::INVALID_REPLICA);
     }
 
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
+    void *dst = static_cast<char *>(buffer) + dst_offset;
+    if (runtime_accelerator.FindDeviceForPointer(dst)) {
+        if (!client_buffer_allocator_) {
+            LOG(ERROR) << "Client buffer allocator is not provided";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        auto alloc_result = client_buffer_allocator_->allocate(size);
+        if (!alloc_result) {
+            LOG(ERROR) << "Failed to allocate temp buffer for GPU ranged "
+                       << "read, key: " << key << ", size: " << size;
+            return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+        BufferHandle tmp_handle(std::move(*alloc_result));
+        std::vector<Slice> tmp_slices;
+        tmp_slices.emplace_back(Slice{tmp_handle.ptr(), size});
+
+        auto get_result =
+            client_->Get(key, query_result, tmp_slices, src_offset);
+        if (!get_result) {
+            return tl::unexpected(get_result.error());
+        }
+        if (auto r = scatter_host_to_maybe_device(
+                dst, tmp_handle.ptr(), size, "MEMORY ranged read, key: " + key);
+            !r) {
+            return tl::unexpected(r.error());
+        }
+        return static_cast<int64_t>(size);
+    }
+
     std::vector<Slice> slices;
-    slices.emplace_back(Slice{static_cast<char *>(buffer) + dst_offset, size});
+    slices.emplace_back(Slice{dst, size});
 
     auto get_result = client_->Get(key, query_result, slices, src_offset);
     if (!get_result) {
@@ -3825,7 +3865,7 @@ tl::expected<void, ErrorCode> RealClient::upsert_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto &buffer_handle = *alloc_result;
-    auto scatter_result = scatter_host_to_maybe_device(
+    auto scatter_result = gather_maybe_device_to_host(
         buffer_handle.ptr(), value.data(), value.size_bytes(), "upsert:" + key);
     if (!scatter_result) {
         return tl::unexpected(scatter_result.error());
@@ -4061,7 +4101,7 @@ tl::expected<void, ErrorCode> RealClient::upsert_parts_internal(
     auto &buffer_handle = *alloc_result;
     size_t offset = 0;
     for (const auto &value : values) {
-        auto scatter_result = scatter_host_to_maybe_device(
+        auto scatter_result = gather_maybe_device_to_host(
             static_cast<char *>(buffer_handle.ptr()) + offset, value.data(),
             value.size_bytes(), "upsert_parts:" + key);
         if (!scatter_result) {
@@ -4149,7 +4189,7 @@ tl::expected<void, ErrorCode> RealClient::upsert_batch_internal(
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
         auto &buffer_handle = *alloc_result;
-        auto scatter_result = scatter_host_to_maybe_device(
+        auto scatter_result = gather_maybe_device_to_host(
             buffer_handle.ptr(), value.data(), value.size_bytes(),
             "upsert_batch:" + key);
         if (!scatter_result) {
