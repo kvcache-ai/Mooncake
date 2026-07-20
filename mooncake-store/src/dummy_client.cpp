@@ -497,6 +497,23 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
         local_buffer_shm->registered = true;
         local_buffer_shm->is_local = true;
 
+        try {
+            client_buffer_allocator_ =
+                ClientBufferAllocator::create(base_addr, local_buffer_size);
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "Failed to create client buffer allocator: "
+                       << e.what();
+            unregister_shm();
+            shm_helper_->free(local_buffer_shm->base_addr);
+            return -1;
+        }
+        if (!client_buffer_allocator_) {
+            LOG(ERROR) << "Failed to create client buffer allocator";
+            unregister_shm();
+            shm_helper_->free(local_buffer_shm->base_addr);
+            return -1;
+        }
+
         // Best-effort: request hot cache shm from real client
         if (request_hot_cache_fd() != 0) {
             LOG(INFO)
@@ -510,6 +527,7 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
 }
 
 int DummyClient::tearDownAll() {
+    client_buffer_allocator_.reset();
     unregister_shm();
 
     // Cleanup hot cache shm mapping
@@ -1111,8 +1129,8 @@ std::vector<int> DummyClient::batch_put_from(
 
 int DummyClient::put_from(const std::string& key, void* buffer, size_t size,
                           const ReplicateConfig& config) {
-    // TODO: implement this function
-    return -1;
+    auto results = batch_put_from({key}, {buffer}, {size}, config);
+    return results.empty() ? -1 : results[0];
 }
 
 std::vector<int64_t> DummyClient::batch_get_into(
@@ -1143,8 +1161,9 @@ int DummyClient::put_from_with_metadata(const std::string& key, void* buffer,
                                         void* metadata_buffer, size_t size,
                                         size_t metadata_size,
                                         const ReplicateConfig& config) {
-    // TODO: implement this function
-    return -1;
+    auto results = batch_put_from_multi_buffers(
+        {key}, {{metadata_buffer, buffer}}, {{metadata_size, size}}, config);
+    return results.empty() ? -1 : results[0];
 }
 
 std::vector<int> DummyClient::batch_put_from_multi_buffers(
