@@ -18,6 +18,16 @@ concurrency:
   group: nightly-${{ github.ref_name }}
   cancel-in-progress: true
 
+# ── Workflow Design Notes ──────────────────────────────────────────────────────
+# 1. version-stamp computes a nightly version string for artifact naming and
+#    traceability (e.g. "0.8.0.dev20250716"). The actual wheel package version
+#    is determined by pyproject.toml inside the reusable _build-wheel.yaml.
+# 2. Build jobs use the reusable _build-wheel.yaml which does its own checkout
+#    and derives VERSION from GITHUB_REF_NAME / pyproject.toml.
+# 3. publish-testpypi uploads all nightly-* artifacts to TestPyPI.
+# 4. nightly-gate aggregates results; notify-failure files an issue on failure.
+# ──────────────────────────────────────────────────────────────────────────────
+
 env:
   SCCACHE_GHA_ENABLED: "true"
 
@@ -28,6 +38,10 @@ jobs:
       nightly_version: ${{ steps.version.outputs.nightly_version }}
     steps:
       - uses: actions/checkout@v4
+      # NOTE: nightly_version is used for artifact naming and traceability.
+      # Wheel package version comes from pyproject.toml via the reusable workflow.
+      # TODO: Add a `version-override` input to `_build-wheel.yaml` for proper
+      #       nightly versioning so downstream builds can stamp dev versions.
       - name: Compute nightly version
         id: version
         run: |
@@ -87,13 +101,17 @@ jobs:
 
   publish-testpypi:
     needs: [version-stamp, build-cuda128-x86, build-cuda128-arm64, build-cuda13-x86]
-    if: ${{ github.event.inputs.skip_publish != 'true' }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.skip_publish == 'true') }}
     runs-on: ubuntu-22.04
     environment: nightly
     permissions:
       contents: read
       id-token: write
     steps:
+      - name: Log nightly version
+        run: |
+          echo "Publishing nightly version: ${{ needs.version-stamp.outputs.nightly_version }}"
+
       - name: Download all nightly wheel artifacts
         uses: actions/download-artifact@v4
         with:
@@ -295,7 +313,7 @@ jobs:
           echo "All nightly jobs passed!"
 
   notify-failure:
-    if: failure() && needs.nightly-gate.result == 'failure'
+    if: ${{ always() && needs.nightly-gate.result == 'failure' }}
     needs: [nightly-gate]
     runs-on: ubuntu-22.04
     permissions:
