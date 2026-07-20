@@ -527,8 +527,15 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
 }
 
 int DummyClient::tearDownAll() {
+    void* local_buffer_base = client_buffer_allocator_
+                                  ? client_buffer_allocator_->getBase()
+                                  : nullptr;
     client_buffer_allocator_.reset();
     unregister_shm();
+    if (local_buffer_base && shm_helper_ &&
+        shm_helper_->free(local_buffer_base) != 0) {
+        LOG(ERROR) << "Failed to free dummy local shared memory";
+    }
 
     // Cleanup hot cache shm mapping
     if (hot_cache_base_) {
