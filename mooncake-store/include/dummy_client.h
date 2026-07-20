@@ -9,6 +9,7 @@
 
 #include "client_metric.h"
 #include "pyclient.h"
+#include "rpc_client_io_context.h"
 #include "shm_helper.h"
 #include <memory>
 
@@ -237,38 +238,10 @@ class DummyClient : public PyClient {
         return to_py_ret(result);
     }
 
-    /**
-     * @brief Accessor for the coro_rpc_client pool. Since coro_rpc_client
-     * pool cannot reconnect to a different address, a new coro_rpc_client
-     * pool is created if the address is different from the current one.
-     */
-    class RpcClientAccessor {
-       public:
-        void SetClientPool(
-            std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>>
-                client_pool) {
-            std::lock_guard<std::shared_mutex> lock(client_mutex_);
-            client_pool_ = client_pool;
-        }
-
-        std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>>
-        GetClientPool() {
-            std::shared_lock<std::shared_mutex> lock(client_mutex_);
-            return client_pool_;
-        }
-
-       private:
-        mutable std::shared_mutex client_mutex_;
-        std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>>
-            client_pool_;
-    };
-    RpcClientAccessor client_accessor_;
+    RpcClientPool client_accessor_;
 
     // The client identification.
     const UUID client_id_;
-
-    std::shared_ptr<coro_io::client_pools<coro_rpc::coro_rpc_client>>
-        client_pools_;
 
     // Mutex to insure the Connect function is atomic.
     mutable Mutex connect_mutex_;

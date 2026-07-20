@@ -16,6 +16,7 @@
 #include <glog/logging.h>
 #include <async_simple/executors/SimpleExecutor.h>
 
+#include "rpc_client_io_context.h"
 #include "tent/common/utils/ip.h"
 #include "tent/common/utils/random.h"
 
@@ -179,7 +180,8 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
     ClientLease lease{pool->acquire(), pool, false};
 
     if (!lease.client) {
-        lease.client = std::make_unique<coro_rpc_client>();
+        lease.client = std::make_unique<coro_rpc_client>(
+            GetRpcClientIoContextPool().get_executor());
         auto conn_result = co_await lease.client->connect(server_addr);
         if (conn_result.val() != 0) {
             lease.broken = true;

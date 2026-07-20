@@ -25,6 +25,7 @@ endif()
 set(MOONCAKE_COMMON_SOURCES
     default_config.cpp
     environ.cpp
+    rpc_client_io_context.cpp
 )
 
 add_library(asio_shared SHARED asio_impl.cpp)
@@ -60,8 +61,10 @@ target_include_directories(mooncake_common PUBLIC
 )
 
 target_link_libraries(mooncake_common PUBLIC
+    asio_shared
     yaml-cpp
     jsoncpp
+    yalantinglibs::yalantinglibs
 )
 
 if (BUILD_SHARED_LIBS)

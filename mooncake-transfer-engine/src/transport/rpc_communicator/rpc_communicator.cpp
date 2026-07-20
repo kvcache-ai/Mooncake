@@ -1,4 +1,5 @@
 #include "transport/rpc_communicator/rpc_communicator.h"
+#include <limits>
 #include <iostream>
 #include <thread>
 #include <functional>
@@ -11,6 +12,7 @@
 #include <pybind11/pytypes.h>
 #include "async_simple/coro/SyncAwait.h"
 #include "default_config.h"
+#include "rpc_client_io_context.h"
 
 namespace mooncake {
 namespace py = pybind11;
@@ -60,12 +62,20 @@ bool RpcCommunicator::initialize(const RpcCommunicatorConfig& config) {
         pool_conf.client_config.socket_config =
             coro_io::ib_socket_t::config_t{};
     }
+    if (config.pool_size > 0 &&
+        config.pool_size <= std::numeric_limits<uint32_t>::max()) {
+        pool_conf.max_connection = static_cast<uint32_t>(config.pool_size);
+    } else {
+        LOG(WARNING) << "Invalid RPC client per-target pool_size "
+                     << config.pool_size << "; using default "
+                     << pool_conf.max_connection;
+    }
     client_pools_ =
         std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(
-            pool_conf);
+            pool_conf, GetRpcClientIoContextPool());
 
-    LOG(INFO) << "create coro_rpc_client_pool with " << config.pool_size
-              << " threads";
+    LOG(INFO) << "Created coro_rpc client pools with up to "
+              << pool_conf.max_connection << " cached connections per target";
     if (!config.listen_address.empty()) {
         LOG(INFO) << "Initializing server on " << config.listen_address;
 

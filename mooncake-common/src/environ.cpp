@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cctype>
 #include <iostream>
+#include <limits>
 
 namespace mooncake {
 
@@ -84,6 +85,19 @@ std::string Environ::GetString(const char* name,
         return std::string(val);
     }
     return default_value;
+}
+
+unsigned Environ::GetRpcClientIoThreads(unsigned hardware_threads) {
+    constexpr char kEnvName[] = "MC_RPC_CLIENT_IO_THREADS";
+    const size_t default_value = std::max<size_t>(1, hardware_threads);
+    const size_t configured = GetSizeT(kEnvName, default_value);
+    if (configured == 0 || configured > std::numeric_limits<unsigned>::max()) {
+        std::cerr << "[Mooncake] Warning: invalid value '" << configured
+                  << "' for env " << kEnvName << ", using default "
+                  << default_value << std::endl;
+        return static_cast<unsigned>(default_value);
+    }
+    return static_cast<unsigned>(configured);
 }
 
 Environ::Environ() {

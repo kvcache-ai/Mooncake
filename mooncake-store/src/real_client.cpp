@@ -23,6 +23,7 @@
 #include "replica_selection.h"
 #include "common.h"
 #include "config.h"
+#include "rpc_client_io_context.h"
 #include "mutex.h"
 #include "types.h"
 #include "utils.h"
@@ -5730,7 +5731,7 @@ ClientRequester::ClientRequester() {
 
     client_pools_ =
         std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(
-            pool_conf);
+            pool_conf, GetRpcClientIoContextPool());
 }
 
 tl::expected<BatchGetOffloadObjectResponse, ErrorCode>

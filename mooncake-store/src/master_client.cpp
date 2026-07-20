@@ -419,10 +419,7 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
 
     MutexLocker lock(&connect_mutex_);
     if (client_addr_param_ != master_addr) {
-        // WARNING: The existing client pool cannot be erased. So if there are a
-        // lot of different addresses, there will be resource leak problems.
-        auto client_pool = client_pools_->at(master_addr);
-        client_accessor_.SetClientPool(client_pool);
+        client_accessor_.GetOrCreateClientPool(master_addr);
         client_addr_param_ = master_addr;
     }
     auto pool = client_accessor_.GetClientPool();
