@@ -1,0 +1,20 @@
+name: Code Coverage
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    uses: ./.github/workflows/core-build.yml
+    with:
+      collect-coverage: true
+    secrets: inherit
