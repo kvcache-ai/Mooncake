@@ -1,12 +1,19 @@
 include(${CMAKE_CURRENT_SOURCE_DIR}/../fabric_allocator.cmake)
 
 set(_extra_build_opts "")
+set(_extra_build_depends "")
 if(USE_HIP)
   list(APPEND _extra_build_opts --use-hipcc)
+  list(APPEND _extra_build_depends
+       ${CMAKE_CURRENT_SOURCE_DIR}/../include/gpu_vendor/hip.h)
 elseif(USE_MUSA)
   list(APPEND _extra_build_opts --use-mcc)
+  list(APPEND _extra_build_depends
+       ${CMAKE_CURRENT_SOURCE_DIR}/../include/gpu_vendor/musa.h)
 elseif(USE_MACA)
   list(APPEND _extra_build_opts --use-maca)
+  list(APPEND _extra_build_depends
+       ${CMAKE_CURRENT_SOURCE_DIR}/../include/gpu_vendor/maca.h)
 endif()
 
 set(_enable_nvlink_allocator_build FALSE)
@@ -30,6 +37,7 @@ add_fabric_allocator_build_target(
   ${CMAKE_CURRENT_SOURCE_DIR}/nvlink_allocator.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/../include/cuda_alike.h
   ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/allocator_build_common.sh
+  ${_extra_build_depends}
   COMMENT
   "Building nvlink allocator to ${CMAKE_CURRENT_BINARY_DIR}"
   ENABLE_BUILD
