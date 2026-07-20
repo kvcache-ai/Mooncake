@@ -22,8 +22,14 @@ add_fabric_allocator_build_target(
   build_nvlink_allocator
   BUILD_SCRIPT
   ${CMAKE_CURRENT_SOURCE_DIR}/build.sh
+  OUTPUT_NAME
+  nvlink_allocator.so
   BUILD_ARGS
   ${_extra_build_opts}
+  BUILD_DEPENDS
+  ${CMAKE_CURRENT_SOURCE_DIR}/nvlink_allocator.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/../include/cuda_alike.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/allocator_build_common.sh
   COMMENT
   "Building nvlink allocator to ${CMAKE_CURRENT_BINARY_DIR}"
   ENABLE_BUILD

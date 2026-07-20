@@ -1,7 +1,7 @@
 function(add_fabric_allocator_build_target)
   set(options)
-  set(oneValueArgs TARGET_NAME BUILD_SCRIPT COMMENT ENABLE_BUILD)
-  set(multiValueArgs BUILD_ARGS)
+  set(oneValueArgs TARGET_NAME BUILD_SCRIPT OUTPUT_NAME COMMENT ENABLE_BUILD)
+  set(multiValueArgs BUILD_ARGS BUILD_DEPENDS)
   cmake_parse_arguments(FAB "${options}" "${oneValueArgs}" "${multiValueArgs}"
                         ${ARGN})
 
@@ -16,25 +16,29 @@ function(add_fabric_allocator_build_target)
         "BUILD_SCRIPT is required for add_fabric_allocator_build_target")
   endif()
 
-  add_custom_target(${FAB_TARGET_NAME} DEPENDS transfer_engine)
-
-  get_target_property(_include_dirs ${FAB_TARGET_NAME} INCLUDE_DIRECTORIES)
-  if(NOT _include_dirs)
-    set(_include_dirs "")
-  endif()
-  string(REPLACE ";" " " _include_dirs_str "${_include_dirs}")
-
   if(FAB_ENABLE_BUILD)
+    if(NOT FAB_OUTPUT_NAME)
+      message(
+        FATAL_ERROR
+          "OUTPUT_NAME is required for enabled fabric allocator build targets")
+    endif()
+
+    set(_output_path "${CMAKE_CURRENT_BINARY_DIR}/${FAB_OUTPUT_NAME}")
+    # Track the allocator artifact so install targets do not rebuild it after a
+    # successful normal build.
     add_custom_command(
-      TARGET ${FAB_TARGET_NAME}
-      POST_BUILD
+      OUTPUT "${_output_path}"
       COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}
       COMMAND bash ${FAB_BUILD_SCRIPT} ${FAB_BUILD_ARGS}
-              ${CMAKE_CURRENT_BINARY_DIR} "${_include_dirs_str}"
+              ${CMAKE_CURRENT_BINARY_DIR} ""
+      DEPENDS ${FAB_BUILD_SCRIPT} ${FAB_BUILD_DEPENDS}
       WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
       COMMENT "${FAB_COMMENT}"
       VERBATIM)
+    add_custom_target(${FAB_TARGET_NAME} ALL DEPENDS "${_output_path}")
+  else()
+    add_custom_target(${FAB_TARGET_NAME} ALL)
   endif()
 
-  set_property(TARGET ${FAB_TARGET_NAME} PROPERTY EXCLUDE_FROM_ALL FALSE)
+  add_dependencies(${FAB_TARGET_NAME} transfer_engine)
 endfunction()
