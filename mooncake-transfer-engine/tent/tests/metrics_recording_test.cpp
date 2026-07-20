@@ -197,10 +197,9 @@ class FakeTransport : public Transport {
         for (const auto& request : requests) {
             fake->requests.push_back(request);
             fake->statuses.push_back(
-                force_fail_
-                    ? TransferStatus{TransferStatusEnum::FAILED, 0}
-                    : TransferStatus{TransferStatusEnum::COMPLETED,
-                                      request.length});
+                force_fail_ ? TransferStatus{TransferStatusEnum::FAILED, 0}
+                            : TransferStatus{TransferStatusEnum::COMPLETED,
+                                             request.length});
             ++fake->task_count;
         }
         batch->notifyProgress();
@@ -331,8 +330,8 @@ class MetricsRecordingTest : public ::testing::Test {
 };
 
 // ---------------------------------------------------------------------------
-// Fix A (Red -> Green): completed transfer records bytes, requests, latency.
-// Drives the real recordTaskCompletionMetrics path via FakeTransport.
+// Completed transfer records bytes, requests, latency. Drives the real
+// recordTaskCompletionMetrics path via FakeTransport.
 // ---------------------------------------------------------------------------
 TEST_F(MetricsRecordingTest, CompletedTransferRecordsBytesAndLatency) {
     auto cfg = makeMetricsTestConfig();
@@ -374,9 +373,9 @@ TEST_F(MetricsRecordingTest, CompletedTransferRecordsBytesAndLatency) {
 }
 
 // ---------------------------------------------------------------------------
-// Fix A (Red -> Green): failed transfer increments failures and requests but
-// NOT bytes or size histogram. Uses the direct API so the assertion is
-// deterministic and does not depend on engine failover behavior.
+// Failed transfer increments failures and requests but NOT bytes or size
+// histogram. Uses the direct API so the assertion is deterministic and does
+// not depend on engine failover behavior.
 // ---------------------------------------------------------------------------
 TEST_F(MetricsRecordingTest, FailedTransferCountsFailureNotBytes) {
     auto before = MetricsSnapshot(TentMetrics::instance());
@@ -415,10 +414,9 @@ TEST_F(MetricsRecordingTest, FailedTransferCountsFailureNotBytes) {
 }
 
 // ---------------------------------------------------------------------------
-// Fix B (Red): a transfer whose deadline was already in the past at submit
-// must increment a SEPARATE tent_deadline_infeasible_total counter, and must
-// NOT pollute the tent_deadline_mlu_permille histogram. Today there is no
-// such counter and the sentinel (5.0) lands in the histogram, so this fails.
+// A transfer whose deadline was already in the past at submit must increment
+// the dedicated tent_deadline_infeasible_total counter, and must NOT pollute
+// the tent_deadline_mlu_permille histogram with a sentinel value.
 // ---------------------------------------------------------------------------
 TEST_F(MetricsRecordingTest, InfeasibleDeadlineRecordsSeparateCounter) {
     auto cfg = makeMetricsTestConfig();
@@ -462,8 +460,8 @@ TEST_F(MetricsRecordingTest, InfeasibleDeadlineRecordsSeparateCounter) {
 }
 
 // ---------------------------------------------------------------------------
-// Fix B (companion): a transfer whose deadline is in the future records a
-// genuine MLU sample into the histogram (feasible or missed, but real).
+// A transfer whose deadline is in the future records a genuine MLU sample
+// into the histogram (feasible or missed, but real).
 // ---------------------------------------------------------------------------
 TEST_F(MetricsRecordingTest, FeasibleDeadlineRecordsMLU) {
     auto cfg = makeMetricsTestConfig();
@@ -532,8 +530,8 @@ TEST_F(MetricsRecordingTest, InfeasibleDeadlineRecordedOnFailedTransfer) {
     auto before = MetricsSnapshot(TentMetrics::instance());
     // deadline_ns = 1 is always in the past relative to steady_clock now.
     ASSERT_TRUE(engine
-                    .submitTransfer(batch,
-                                    {makeLocalWrite(buf.data(), kLen, /*deadline_ns=*/1)})
+                    .submitTransfer(batch, {makeLocalWrite(buf.data(), kLen,
+                                                           /*deadline_ns=*/1)})
                     .ok());
     // The failing transport reports FAILED; poll until terminal.
     ASSERT_EQ(pollUntilTerminal(engine, batch, 0), TransferStatusEnum::FAILED);
@@ -557,14 +555,9 @@ TEST_F(MetricsRecordingTest, InfeasibleDeadlineRecordedOnFailedTransfer) {
 }
 
 // ---------------------------------------------------------------------------
-// Fix D (regression guard): every histogram's JSON bucket keys must match its
-// compile-time boundary vector. Passes before AND after the parallel-vector
-// -> struct refactor; locks the invariant the refactor must preserve.
-//
-// Runs BEFORE BucketsAreCompileTimeDefaultsIgnoringConfig because that test
-// destructively reassigns the singleton's histogram members (pre-Fix-C), which
-// would pollute the bucket structure observed here. After Fix C removes the
-// reassignment, the ordering constraint is moot.
+// Regression guard: every histogram's JSON bucket keys must match its
+// compile-time boundary vector. Locks the invariant that the HistogramEntry
+// struct pairing must preserve.
 // ---------------------------------------------------------------------------
 TEST_F(MetricsRecordingTest, HistogramJsonBucketsMatchBoundaries) {
     struct HistSpec {
@@ -601,10 +594,10 @@ TEST_F(MetricsRecordingTest, HistogramJsonBucketsMatchBoundaries) {
 }
 
 // ---------------------------------------------------------------------------
-// Fix C (Green): histogram buckets are fixed at compile time. The runtime
-// config knob (latency_buckets/size_buckets) has been removed; buckets are
-// version-controlled in code for reproducible observability. This test
-// asserts the latency histogram exposes exactly the kLatencyBuckets keys.
+// Histogram buckets are fixed at compile time. The runtime config knob
+// (latency_buckets/size_buckets) has been removed; buckets are version-
+// controlled in code for reproducible observability. This test asserts the
+// latency histogram exposes exactly the kLatencyBuckets keys.
 // ---------------------------------------------------------------------------
 TEST_F(MetricsRecordingTest, BucketsAreCompileTimeDefaults) {
     // Record one sample so the histogram is non-empty.
