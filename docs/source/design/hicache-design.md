@@ -2,7 +2,7 @@
 
 With the rapid development of tasks such as Agentic Coding, the length of request contexts continues to grow. Increasing the capacity of the KV Cache to improve its hit rate has become increasingly important for enhancing throughput and reducing TTFT. In this context, SGLang introduces **HiCache**, which extends the original RadixAttention (previously limited to GPU memory) by adding hierarchical caching support and integrating with distributed storage backends such as Mooncake.
 
-Inspired by the classic three-level cache design of modern CPUs, HiCache organizes GPU memory as L1, host memory as L2, and distributed storage as L3. This hierarchy enables HiCache to fully exploit the "idle" storage space of GPUs and CPUs, while integrating distributed cache systems for global KV cache storage and scheduling. As a result, HiCache significantly expands KV cache capacity while maintaining strong read performance, especially in workloads such as multi-QA and long-context inference, where KV cache reuse is frequent. For detailed benchmark results, see [this document](https://kvcache-ai.github.io/Mooncake/performance/sglang/sglang-hicache-benchmark-results-v1.html).
+Inspired by the classic three-level cache design of modern CPUs, HiCache organizes GPU memory as L1, host memory as L2, and distributed storage as L3. This hierarchy enables HiCache to fully exploit the "idle" storage space of GPUs and CPUs, while integrating distributed cache systems for global KV cache storage and scheduling. As a result, HiCache significantly expands KV cache capacity while maintaining strong read performance, especially in workloads such as multi-QA and long-context inference, where KV cache reuse is frequent. For detailed benchmark results, see [this document](https://kvcache-ai.github.io/Mooncake/performance/sglang-hicache-benchmark-results-v1.html).
 
 While HiCache supports multiple L3 backends, this document focuses primarily on the **Mooncake** backend.
 
@@ -115,7 +115,7 @@ Furthermore, **Mooncake** supports efficient batch read and write operations and
 
 ## Integration with PD-Disaggregation Deployment Mode
 
-SGLang supports a PD (Prefill-Decode) disaggregation deployment mode through the **Mooncake TransferEngine** (for details, see [this document](https://docs.sglang.ai/advanced_features/pd_disaggregation.html)).
+SGLang supports a PD (Prefill-Decode) disaggregation deployment mode through the **Mooncake TransferEngine** (for details, see [this document](https://docs.sglang.ai/advanced_features/pd_disaggregation.html)). 
 
 In the PD-disaggregation deployment mode, HiCache can be enabled on the Prefill nodes to optimize prefill performance. With the hierarchical caching mechanism provided by **HiCache + Mooncake Store**, prefill nodes can handle long-context and multi-turn dialogue scenarios more efficiently, significantly improving performance during the prefill phase. HiCache can also be enabled on the decode nodes to write computation results back to L3.
 

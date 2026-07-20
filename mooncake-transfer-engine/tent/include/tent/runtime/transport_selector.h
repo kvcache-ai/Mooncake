@@ -82,8 +82,6 @@ struct SelectionContext {
     int priority_level;     // Request priority level (lower = more urgent)
     std::optional<std::string>
         policy_name;  // Optional: bind to specific policy by name
-    IntentType intent_type{
-        IntentType::INTENT_UNSPEC};  // Business intent for policy matching
 };
 
 /**
@@ -119,18 +117,6 @@ struct SelectionPolicy {
 
     // Transport preference list (evaluated in order)
     std::vector<TransportType> transports;
-
-    // Per-policy link-layer QoS. nullopt = fall back to the global RdmaParams
-    // value. InfiniBand Service Level (0-15) and Traffic Class / DSCP (0-255).
-    std::optional<int> service_level;
-    std::optional<int> traffic_class;
-    // Named QP pool this policy's traffic should land on; parsed and stored for
-    // now, routing to be wired later. Unset = the current single "data QP".
-    std::optional<std::string> qp_pool;
-
-    // Optional business-intent filter. nullopt preserves the historical
-    // catch-all behavior; otherwise the request intent must match exactly.
-    std::optional<IntentType> intent_type;
 };
 
 /**
@@ -139,10 +125,6 @@ struct SelectionPolicy {
 struct SelectionResult {
     TransportType transport = UNSPEC;
     uint64_t device_mask = ~0ULL;  // Bitmask of allowed devices (~0 = all)
-    // Resolved link-layer QoS from the matched policy (nullopt = default).
-    std::optional<int> service_level;
-    std::optional<int> traffic_class;
-    std::optional<std::string> qp_pool;
 };
 
 /**

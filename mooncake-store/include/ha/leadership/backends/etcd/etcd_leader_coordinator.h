@@ -50,7 +50,6 @@ class EtcdLeaderCoordinator final : public LeaderCoordinator {
     static LeadershipLossReason ClassifyLeadershipLossReason(ErrorCode err);
 
     ErrorCode EnsureConnected();
-    ErrorCode ResetConnection();
     ErrorCode ShutdownKeepAliveThread();
     void ClearLeadershipMonitorStateLocked();
     bool IsSameViewVersion(const std::optional<MasterView>& current_view,

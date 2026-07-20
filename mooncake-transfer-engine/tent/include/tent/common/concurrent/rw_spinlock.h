@@ -26,7 +26,6 @@ namespace tent {
 class RWSpinlock {
     union RWTicket {
         constexpr RWTicket() : whole(0) {}
-        constexpr RWTicket(uint64_t v) : whole(v) {}
         uint64_t whole;
         uint32_t readWrite;
         struct {
@@ -34,12 +33,26 @@ class RWSpinlock {
             uint16_t read;
             uint16_t users;
         };
-    };
+    } ticket;
 
-    std::atomic<uint64_t> ticket;
+   private:
+    static void asm_volatile_memory() { asm volatile("" ::: "memory"); }
+
+    template <class T>
+    static T load_acquire(T *addr) {
+        T t = *addr;
+        asm_volatile_memory();
+        return t;
+    }
+
+    template <class T>
+    static void store_release(T *addr, T v) {
+        asm_volatile_memory();
+        *addr = v;
+    }
 
    public:
-    RWSpinlock() : ticket(0) {}
+    RWSpinlock() {}
 
     RWSpinlock(RWSpinlock const &) = delete;
     RWSpinlock &operator=(RWSpinlock const &) = delete;
@@ -47,21 +60,17 @@ class RWSpinlock {
     void lock() { writeLockNice(); }
 
     bool tryLock() {
-        RWTicket t, expected;
-        expected.whole = ticket.load(std::memory_order_acquire);
-        t.whole = expected.whole;
+        RWTicket t;
+        uint64_t old = t.whole = load_acquire(&ticket.whole);
         if (t.users != t.write) return false;
         ++t.users;
-        return ticket.compare_exchange_weak(expected.whole, t.whole,
-                                            std::memory_order_acquire);
+        return __sync_bool_compare_and_swap(&ticket.whole, old, t.whole);
     }
 
     void writeLockAggressive() {
         uint32_t count = 0;
-        uint16_t val = fetch_add_users(1);
-        RWTicket t;
-        while (val !=
-               (t.whole = ticket.load(std::memory_order_acquire), t.write)) {
+        uint16_t val = __sync_fetch_and_add(&ticket.users, 1);
+        while (val != load_acquire(&ticket.write)) {
             PAUSE();
             if (++count > 1000) std::this_thread::yield();
         }
@@ -76,22 +85,16 @@ class RWSpinlock {
     }
 
     void unlockAndLockShared() {
-        uint16_t val = fetch_add_read(1);
+        uint16_t val = __sync_fetch_and_add(&ticket.read, 1);
         (void)val;
     }
 
     void unlock() {
-        uint64_t expected = ticket.load(std::memory_order_relaxed);
-        uint64_t new_val;
         RWTicket t;
-        do {
-            t.whole = expected;
-            ++t.read;
-            ++t.write;
-            new_val = t.whole;
-        } while (!ticket.compare_exchange_weak(expected, new_val,
-                                               std::memory_order_release,
-                                               std::memory_order_relaxed));
+        t.whole = load_acquire(&ticket.whole);
+        ++t.read;
+        ++t.write;
+        store_release(&ticket.readWrite, t.readWrite);
     }
 
     void lockShared() {
@@ -103,58 +106,15 @@ class RWSpinlock {
     }
 
     bool tryLockShared() {
-        RWTicket t, expected;
-        expected.whole = ticket.load(std::memory_order_acquire);
-        t.whole = expected.whole;
-        expected.users = expected.read;
+        RWTicket t, old;
+        old.whole = t.whole = load_acquire(&ticket.whole);
+        old.users = old.read;
         ++t.read;
         ++t.users;
-        return ticket.compare_exchange_weak(expected.whole, t.whole,
-                                            std::memory_order_acquire);
+        return __sync_bool_compare_and_swap(&ticket.whole, old.whole, t.whole);
     }
 
-    void unlockShared() { fetch_add_write(1); }
-
-   private:
-    uint16_t fetch_add_users(uint16_t delta) {
-        uint64_t expected = ticket.load(std::memory_order_relaxed);
-        uint64_t new_val;
-        RWTicket t;
-        do {
-            t.whole = expected;
-            t.users += delta;
-            new_val = t.whole;
-        } while (!ticket.compare_exchange_weak(expected, new_val,
-                                               std::memory_order_acquire,
-                                               std::memory_order_relaxed));
-        return static_cast<uint16_t>(t.users - delta);
-    }
-
-    uint16_t fetch_add_read(uint16_t delta) {
-        uint64_t expected = ticket.load(std::memory_order_relaxed);
-        uint64_t new_val;
-        RWTicket t;
-        do {
-            t.whole = expected;
-            t.read += delta;
-            new_val = t.whole;
-        } while (!ticket.compare_exchange_weak(expected, new_val,
-                                               std::memory_order_release));
-        return static_cast<uint16_t>(t.read - delta);
-    }
-
-    uint16_t fetch_add_write(uint16_t delta) {
-        uint64_t expected = ticket.load(std::memory_order_relaxed);
-        uint64_t new_val;
-        RWTicket t;
-        do {
-            t.whole = expected;
-            t.write += delta;
-            new_val = t.whole;
-        } while (!ticket.compare_exchange_weak(expected, new_val,
-                                               std::memory_order_release));
-        return static_cast<uint16_t>(t.write - delta);
-    }
+    void unlockShared() { __sync_fetch_and_add(&ticket.write, 1); }
 
    public:
     struct WriteGuard {

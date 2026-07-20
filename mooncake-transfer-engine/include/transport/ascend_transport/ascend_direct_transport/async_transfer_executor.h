@@ -58,9 +58,6 @@ class AsyncTransferExecutor : public TransferExecutorBase {
         // pending_batches for this route. Batches enqueued after disconnect
         // are not affected.
         bool fail_entire_route = false;
-        // When true with auto_connect, ADXL DisconnectOnError already ran;
-        // only forgetConnectedSegment is needed (if the route was recorded).
-        bool adxl_already_disconnected = false;
         std::string fail_reason;
     };
 
@@ -69,8 +66,7 @@ class AsyncTransferExecutor : public TransferExecutorBase {
     void processOneBatch(QueryBatch& batch, BatchPollResult& result);
     void failAllPendingOnRoute(size_t engine_idx, const std::string& target,
                                std::vector<QueryBatch>& pending,
-                               const std::string& reason,
-                               bool adxl_already_disconnected);
+                               const std::string& reason);
     void markBatchFailed(QueryBatch& batch, const std::string& reason,
                          bool log_error = true);
     void handleTaskFinished();

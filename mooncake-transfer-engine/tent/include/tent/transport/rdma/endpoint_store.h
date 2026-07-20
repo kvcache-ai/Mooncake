@@ -28,8 +28,6 @@ using namespace mooncake;
 
 namespace mooncake {
 namespace tent {
-class EndpointStoreTestAccess;
-
 class EndpointStore {
    public:
     virtual std::shared_ptr<RdmaEndPoint> get(const std::string &key) = 0;
@@ -39,11 +37,7 @@ class EndpointStore {
 
     virtual int remove(RdmaEndPoint *ep) = 0;
 
-    // Terminal context-shutdown operation. Unlike remove()/reclaim(), clear()
-    // synchronously releases every endpoint's verbs resources because workers
-    // have stopped and can no longer drain CQ flush completions. Callers must
-    // not use the store again after clear() returns.
-    virtual int clear() = 0;
+    virtual void clear() = 0;
 
     virtual size_t size() = 0;
 
@@ -63,7 +57,7 @@ class FIFOEndpointStore : public EndpointStore {
 
     int remove(RdmaEndPoint *ep) override;
 
-    int clear() override;
+    void clear();
 
     size_t size() override;
 
@@ -71,8 +65,6 @@ class FIFOEndpointStore : public EndpointStore {
     void reclaim() override;
 
    private:
-    friend class EndpointStoreTestAccess;
-
     RdmaContext &context_;
     RWSpinlock endpoint_map_lock_;
     std::unordered_map<std::string, std::shared_ptr<RdmaEndPoint>>
@@ -95,7 +87,7 @@ class SIEVEEndpointStore : public EndpointStore {
 
     std::shared_ptr<RdmaEndPoint> getOrInsert(const std::string &key) override;
 
-    int clear() override;
+    void clear();
 
     size_t size() override;
 
@@ -104,8 +96,6 @@ class SIEVEEndpointStore : public EndpointStore {
     void reclaim() override;
 
    private:
-    friend class EndpointStoreTestAccess;
-
     RdmaContext &context_;
     RWSpinlock endpoint_map_lock_;
     // The bool represents visited
@@ -121,6 +111,7 @@ class SIEVEEndpointStore : public EndpointStore {
     std::atomic<int> waiting_list_len_;
 
     size_t max_size_;
+    std::atomic<int> endpoints_count_{0};
 };
 }  // namespace tent
 }  // namespace mooncake

@@ -12,7 +12,6 @@
 
 #include "real_client.h"
 #include "dummy_client.h"
-#include "uds_transport.h"
 #include "utils.h"
 #include "utils/scoped_vlog_timer.h"
 #include "rpc_types.h"
@@ -378,21 +377,40 @@ int DummyClient::register_shm_via_ipc(const ShmHelper::ShmSegment* shm,
         return -1;
     }
 
-    UdsConnector connector(ipc_socket_path_);
-    LOG(INFO) << "Connecting to IPC socket: " << ipc_socket_path_;
-    auto connection_result = connector.connect();
-    if (!connection_result) {
-        LOG(ERROR) << "Failed to connect IPC socket '" << ipc_socket_path_
-                   << "': " << connection_result.error();
-        // This is expected if RealClient is down
+    int sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sock_fd < 0) {
+        LOG(ERROR) << "Failed to create IPC socket: " << strerror(errno);
         return -1;
     }
-    auto connection = std::move(connection_result.value());
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+
+    // Use abstract namespace
+    std::string abstract_name = ipc_socket_path_;
+    if (abstract_name.size() > sizeof(addr.sun_path) - 2) {
+        LOG(ERROR) << "IPC socket path too long";
+        close(sock_fd);
+        return -1;
+    }
+    addr.sun_path[0] = '\0';
+    strncpy(addr.sun_path + 1, abstract_name.c_str(),
+            sizeof(addr.sun_path) - 2);
+    socklen_t addr_len = sizeof(sa_family_t) + 1 + abstract_name.length();
+    LOG(INFO) << "Connecting to IPC socket: " << abstract_name;
+
+    if (::connect(sock_fd, (struct sockaddr*)&addr, addr_len) < 0) {
+        // This is expected if RealClient is down
+        close(sock_fd);
+        return -1;
+    }
 
     // Send request type first
     IpcRequestType type = IPC_SHM_REGISTER;
-    if (connection->sendRaw(&type, sizeof(type)) < 0) {
+    if (::send(sock_fd, &type, sizeof(type), 0) < 0) {
         LOG(ERROR) << "Failed to send IPC request type: " << strerror(errno);
+        close(sock_fd);
         return -1;
     }
 
@@ -405,16 +423,20 @@ int DummyClient::register_shm_via_ipc(const ShmHelper::ShmSegment* shm,
                                                      : kInvalidPhysicalDeviceId;
     req.is_local_buffer = is_local;
 
-    if (connection->sendFd(shm->fd, &req, sizeof(req)) < 0) {
+    if (ipc_send_fd(sock_fd, shm->fd, &req, sizeof(req)) < 0) {
         LOG(ERROR) << "Failed to send FD to RealClient: " << strerror(errno);
+        close(sock_fd);
         return -1;
     }
 
     int status = -1;
-    if (connection->recvRaw(&status, sizeof(status)) < 0) {
+    if (recv(sock_fd, &status, sizeof(status), 0) < 0) {
         LOG(ERROR) << "Failed to receive response from RealClient";
+        close(sock_fd);
         return -1;
     }
+
+    close(sock_fd);
 
     if (status != 0) {
         LOG(ERROR) << "RealClient failed to map shared memory, error code: "
@@ -1084,6 +1106,20 @@ std::string DummyClient::get_hostname() const {
     return "";
 }
 
+std::vector<DummyClient::RegisteredBufferInfo>
+DummyClient::get_registered_buffers() const {
+    std::vector<RegisteredBufferInfo> result;
+    if (!shm_helper_) return result;
+
+    const auto& shms = shm_helper_->get_shms();
+    for (const auto& shm : shms) {
+        if (shm->registered && shm->base_addr && shm->size > 0) {
+            result.push_back({shm->base_addr, shm->size, shm->is_local});
+        }
+    }
+    return result;
+}
+
 std::vector<int> DummyClient::batch_put_from(
     const std::vector<std::string>& keys, const std::vector<void*>& buffer_ptrs,
     const std::vector<size_t>& sizes, const ReplicateConfig& config) {
@@ -1111,8 +1147,10 @@ std::vector<int> DummyClient::batch_put_from(
 
 int DummyClient::put_from(const std::string& key, void* buffer, size_t size,
                           const ReplicateConfig& config) {
-    // TODO: implement this function
-    return -1;
+    uint64_t buf_addr = reinterpret_cast<uint64_t>(buffer);
+    auto result = invoke_rpc<&RealClient::put_from_dummy_helper, void>(
+        key, buf_addr, size, config, device_id_, client_id_);
+    return to_py_ret(result);
 }
 
 std::vector<int64_t> DummyClient::batch_get_into(
@@ -1361,19 +1399,30 @@ int DummyClient::health_check() {
 }
 
 int DummyClient::request_hot_cache_fd() {
-    UdsConnector connector(ipc_socket_path_);
-    auto connection_result = connector.connect();
-    if (!connection_result) {
-        LOG(ERROR) << "Failed to connect IPC socket '" << ipc_socket_path_
-                   << "': " << connection_result.error();
+    int sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sock_fd < 0) {
+        LOG(ERROR) << "Failed to create IPC socket: " << strerror(errno);
         return -1;
     }
-    auto connection = std::move(connection_result.value());
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    addr.sun_path[0] = '\0';
+    strncpy(addr.sun_path + 1, ipc_socket_path_.c_str(),
+            sizeof(addr.sun_path) - 2);
+    socklen_t addr_len = sizeof(sa_family_t) + 1 + ipc_socket_path_.length();
+
+    if (::connect(sock_fd, (struct sockaddr*)&addr, addr_len) < 0) {
+        close(sock_fd);
+        return -1;
+    }
 
     // Send request type
     IpcRequestType type = IPC_SHM_FD_REQUEST;
-    if (connection->sendRaw(&type, sizeof(type)) < 0) {
+    if (::send(sock_fd, &type, sizeof(type), 0) < 0) {
         LOG(ERROR) << "Failed to send IPC request type";
+        close(sock_fd);
         return -1;
     }
 
@@ -1382,14 +1431,16 @@ int DummyClient::request_hot_cache_fd() {
     req.client_id_first = client_id_.first;
     req.client_id_second = client_id_.second;
     req.segment_type = SHM_SEG_HOT_CACHE;
-    if (connection->sendRaw(&req, sizeof(req)) < 0) {
+    if (::send(sock_fd, &req, sizeof(req), 0) < 0) {
         LOG(ERROR) << "Failed to send ShmFdRequest";
+        close(sock_fd);
         return -1;
     }
 
     // Receive fd + response
     ShmFdResponse resp;
-    int fd = connection->recvFd(&resp, sizeof(resp));
+    int fd = ipc_recv_fd(sock_fd, &resp, sizeof(resp));
+    close(sock_fd);
 
     if (fd < 0 || resp.status != 0) {
         LOG(ERROR) << "Failed to receive hot cache fd, status=" << resp.status;

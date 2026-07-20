@@ -16,8 +16,7 @@ Thank you for your interest in contributing to Mooncake! Our community warmly we
 
 ### PR Title and Classification
 
-Use a prefixed PR title to indicate the type or module affected by the changes.
-Prefer one of the following documented prefixes:
+Use a prefixed PR title to indicate the type of changes. Please use one of the following:
 
 - ``[Bugfix]`` for bug fixes.
 - ``[CI/Build]`` for build or continuous integration improvements.
@@ -28,11 +27,6 @@ Prefer one of the following documented prefixes:
 - ``[TransferEngine]`` for changes in the ``mooncake-transfer-engine``.
 - ``[Misc]`` for PRs that do not fit the above categories. Please use this
   sparingly.
-
-The project history also contains common aliases and module prefixes. Use these
-when they better match the change scope: ``[Bug fix]``, ``[Build]``, ``[CI]``,
-``[Docs]``, ``[EP]``, ``[Feature]``, ``[MUSA]``, ``[PG]``, ``[TE]``,
-``[TENT]``, and ``[Wheel]``.
 
 ### RFC Discussion
 
@@ -56,7 +50,7 @@ Mooncake uses [pre-commit](https://pre-commit.com/) to enforce consistent format
 
 #### Setup
 ```bash
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 pre-commit install
 ```
 

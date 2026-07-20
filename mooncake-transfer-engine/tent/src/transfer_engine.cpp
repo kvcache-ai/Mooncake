@@ -140,10 +140,6 @@ Status TransferEngine::submitTransfer(BatchID batch_id,
     return impl_->submitTransfer(batch_id, request_list, notifi);
 }
 
-Status TransferEngine::cancelTransfer(BatchID batch_id, size_t task_id) {
-    return impl_->cancelTransfer(batch_id, task_id);
-}
-
 Status TransferEngine::sendNotification(SegmentID target_id,
                                         const Notification& notifi) {
     return impl_->sendNotification(target_id, notifi);

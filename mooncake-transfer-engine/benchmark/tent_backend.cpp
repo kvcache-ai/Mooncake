@@ -14,14 +14,13 @@
 
 #include "tent_backend.h"
 #include "utils.h"
-#include "char_util.h"
 #include "tent/common/types.h"
 #include "tent/runtime/platform.h"
 #include "tent/runtime/topology.h"
 #include "tent/runtime/transport_selector.h"
 
-#if defined(USE_CUDA) || defined(USE_SUNRISE)
-#include "cuda_alike.h"
+#ifdef USE_CUDA
+#include <cuda_runtime.h>
 #endif
 
 #ifdef USE_HIP
@@ -51,21 +50,14 @@ std::shared_ptr<Config> loadConfig() {
     config->set("metadata_type", XferBenchConfig::metadata_type);
     config->set("metadata_servers", XferBenchConfig::metadata_url_list);
     config->set("rpc_server_port", XferBenchConfig::rpc_server_port);
-    config->set("transports/rdma/deadline_bw_arbitration",
-                XferBenchConfig::deadline_bw_arbitration);
 
     // Configure transport types based on xport_type parameter
     if (!XferBenchConfig::xport_type.empty()) {
         // Map of transport names to their config keys (handle name mismatches)
         std::unordered_map<std::string, std::string> transport_map = {
-            {"rdma", "rdma"},
-            {"tcp", "tcp"},
-            {"shm", "shm"},
+            {"rdma", "rdma"},        {"tcp", "tcp"},     {"shm", "shm"},
             {"iouring", "io_uring"},  // Note: iouring -> io_uring
-            {"gds", "gds"},
-            {"mnnvl", "mnnvl"},
-            {"nvlink", "nvlink"},
-            {"sunrise_link", "sunrise_link"}};
+            {"gds", "gds"},          {"mnnvl", "mnnvl"}, {"nvlink", "nvlink"}};
 
         // Disable all transports by default
         for (const auto& entry : transport_map) {
@@ -90,28 +82,7 @@ static TransportType getTransportType(const std::string& xport_type) {
     if (xport_type == "nvlink") return NVLINK;
     if (xport_type == "tcp") return TCP;
     if (xport_type == "iouring") return IOURING;
-    if (xport_type == "sunrise_link") return SUNRISE_LINK;
     return UNSPEC;
-}
-
-static IntentType getIntentType(const std::string& intent_type) {
-    std::string normalized_intent = intent_type;
-    for (auto& c : normalized_intent) c = to_lower(c);
-
-    static const std::unordered_map<std::string, IntentType> kIntentTypes = {
-        {"unspec", IntentType::INTENT_UNSPEC},
-        {"intent_unspec", IntentType::INTENT_UNSPEC},
-        {"foreground_get", IntentType::FOREGROUND_GET},
-        {"background_prefetch", IntentType::BACKGROUND_PREFETCH},
-        {"migration", IntentType::MIGRATION},
-        {"checkpoint", IntentType::CHECKPOINT},
-        {"weight_loading", IntentType::WEIGHT_LOADING},
-        {"staging_internal", IntentType::STAGING_INTERNAL},
-    };
-    auto it = kIntentTypes.find(normalized_intent);
-    LOG_ASSERT(it != kIntentTypes.end())
-        << "Invalid --tent_intent_type=" << intent_type;
-    return it->second;
 }
 
 int TENTBenchRunner::allocateBuffers() {
@@ -126,13 +97,11 @@ int TENTBenchRunner::allocateBuffers() {
     if (seg_type == "DRAM") {
         device_prefix = "cpu";
         num_buffers = numa_num_configured_nodes();
-#if defined(USE_CUDA) || defined(USE_SUNRISE)
+#ifdef USE_CUDA
     } else if (seg_type == "VRAM") {
         device_prefix = "cuda";
         int gpu_count = 0;
-        auto err = cudaGetDeviceCount(&gpu_count);
-        LOG_ASSERT(err == cudaSuccess && gpu_count > 0)
-            << "cudaGetDeviceCount failed: " << cudaGetErrorString(err);
+        cudaGetDeviceCount(&gpu_count);
         start_idx = 0;
         num_buffers = gpu_count;
         if (XferBenchConfig::local_gpu_id != -1) {
@@ -169,7 +138,6 @@ int TENTBenchRunner::allocateBuffers() {
         MemoryOptions options;
         if (!xport_type.empty()) {
             options.type = getTransportType(xport_type);
-            options.location = location;
         }
 
         auto t0 = getCurrentTimeInNano();
@@ -183,15 +151,6 @@ int TENTBenchRunner::allocateBuffers() {
         }
         auto t1 = getCurrentTimeInNano();
 
-#ifdef USE_SUNRISE
-        if (seg_type == "VRAM") {
-            auto err = cudaSetDevice(start_idx + i);
-            CHECK_FAIL(err == cudaSuccess ? Status::OK()
-                                          : Status::InternalError(
-                                                "Failed to set Sunrise device "
-                                                "before registerLocalMemory"));
-        }
-#endif
         CHECK_FAIL(engine_->registerLocalMemory(pinned_buffer_list_[i],
                                                 total_buffer_size, options));
         auto t2 = getCurrentTimeInNano();
@@ -223,7 +182,6 @@ TENTBenchRunner::TENTBenchRunner() {
     engine_ = std::make_unique<TransferEngine>(loadConfig());
     transport_hint_ = TransportSelector::parseTransportType(
         XferBenchConfig::tent_transport_hint);
-    intent_type_ = getIntentType(XferBenchConfig::tent_intent_type);
     allocateBuffers();
 }
 
@@ -273,7 +231,7 @@ static inline int getNumaNodeFromPciDevice(const std::string& pci_bdf) {
     return numa_node;
 }
 
-#if defined(USE_CUDA) || defined(USE_SUNRISE)
+#ifdef USE_CUDA
 static inline int getGpuDeviceNumaID(int gpu_id) {
     char pci_bus_id[20];
     auto err = cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), gpu_id);
@@ -281,7 +239,7 @@ static inline int getGpuDeviceNumaID(int gpu_id) {
         LOG(WARNING) << "cudaDeviceGetPCIBusId: " << cudaGetErrorString(err);
         return 0;
     }
-    for (char* ch = pci_bus_id; (*ch = to_lower(*ch)); ch++);
+    for (char* ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
     return getNumaNodeFromPciDevice(pci_bus_id);
 }
 #elif defined(USE_HIP)
@@ -298,20 +256,6 @@ static inline int getGpuDeviceNumaID(int gpu_id) { return 0; }
 #endif
 
 void TENTBenchRunner::pinThread(int thread_id) {
-#ifdef USE_SUNRISE
-    if (XferBenchConfig::seg_type == "VRAM" && !pinned_buffer_list_.empty()) {
-        int base_gpu = std::max(0, XferBenchConfig::local_gpu_id);
-        int device_id =
-            base_gpu +
-            (thread_id % static_cast<int>(pinned_buffer_list_.size()));
-        auto err = cudaSetDevice(device_id);
-        LOG_ASSERT(err == cudaSuccess)
-            << "cudaSetDevice failed before getLocation: "
-            << cudaGetErrorString(err) << " device_id=" << device_id;
-        bindToSocket(getGpuDeviceNumaID(device_id));
-        return;
-    }
-#endif
     uint64_t addr =
         (uint64_t)pinned_buffer_list_[thread_id % pinned_buffer_list_.size()];
     auto result = Platform::getLoader().getLocation((void*)addr, 1);
@@ -360,8 +304,7 @@ int TENTBenchRunner::runInitiatorTasks(
 double TENTBenchRunner::runSingleTransfer(uint64_t local_addr,
                                           uint64_t target_addr,
                                           uint64_t block_size,
-                                          uint64_t batch_size, OpCode opcode,
-                                          uint64_t deadline_ns) {
+                                          uint64_t batch_size, OpCode opcode) {
     auto batch_id = engine_->allocateBatch(batch_size);
     std::vector<Request> requests;
     for (uint64_t i = 0; i < batch_size; ++i) {
@@ -372,8 +315,6 @@ double TENTBenchRunner::runSingleTransfer(uint64_t local_addr,
         entry.target_id = handle_;
         entry.target_offset = target_addr + block_size * i;
         entry.transport_hint = transport_hint_;
-        entry.deadline_ns = deadline_ns;
-        entry.intent_type = intent_type_;
         requests.emplace_back(entry);
     }
     XferBenchTimer timer;

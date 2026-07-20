@@ -267,7 +267,6 @@ Status IOUringTransport::getTransferStatus(SubBatchRef batch, int task_id,
             }
         }
         io_uring_cqe_seen(&io_uring_batch->ring, cqe);
-        batch->notifyProgress();
     }
     return Status::OK();
 }

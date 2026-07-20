@@ -7,8 +7,6 @@
 #define EP_STATIC_ASSERT(cond, reason) static_assert(cond, reason)
 #endif
 
-#ifndef MOONCAKE_EP_EXCEPTION_CLASS_DEFINED
-#define MOONCAKE_EP_EXCEPTION_CLASS_DEFINED
 class EPException : public std::exception {
    private:
     std::string message = {};
@@ -22,7 +20,6 @@ class EPException : public std::exception {
 
     const char* what() const noexcept override { return message.c_str(); }
 };
-#endif
 
 #ifndef CUDA_CHECK
 #define CUDA_CHECK(cmd)                                   \
@@ -45,15 +42,6 @@ class EPException : public std::exception {
 #endif
 
 #ifndef EP_DEVICE_ASSERT
-#if defined(MOONCAKE_EP_USE_MUSA) || defined(MOONCAKE_EP_USE_MACA)
-// MUSA SDK 4.3.x can turn kernels that merely contain a device-side __trap()
-// branch into illegal memory accesses, even when the assertion condition is
-// true.  Keep these invariants as host/static checks on MUSA builds.
-#define EP_DEVICE_ASSERT(cond) \
-    do {                       \
-        (void)sizeof(cond);    \
-    } while (0)
-#else
 #define EP_DEVICE_ASSERT(cond)                                           \
     do {                                                                 \
         if (not(cond)) {                                                 \
@@ -62,5 +50,4 @@ class EPException : public std::exception {
             __trap();                                                    \
         }                                                                \
     } while (0)
-#endif
 #endif

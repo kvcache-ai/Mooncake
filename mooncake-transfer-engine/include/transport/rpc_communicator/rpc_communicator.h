@@ -74,8 +74,7 @@ class RpcCommunicator {
     std::unique_ptr<coro_rpc::coro_rpc_server> server_;
     std::function<void(std::string_view, std::string_view)>
         data_receive_callback_;
-    struct PyCallbackHolder;
-    std::unique_ptr<PyCallbackHolder> py_callback_;
+    pybind11::handle py_callback_;
     std::shared_ptr<coro_io::client_pools<coro_rpc::coro_rpc_client>>
         client_pools_;
 };

@@ -3,9 +3,6 @@
 
 #include <chrono>
 #include <csignal>
-#include <filesystem>
-#include <fstream>
-#include <map>
 #include <memory>
 #include <string>
 #include <thread>
@@ -15,10 +12,8 @@
 #include <ylt/struct_json/json_writer.h>
 
 #include "ha/ha_types.h"
-#include "master_admin_service.h"
 #include "master_config.h"
 #include "rpc_service.h"
-#include "tenant_quota_policy_store.h"
 #include "types.h"
 #include "utils.h"
 
@@ -86,18 +81,6 @@ struct HttpSegmentsDetailResponse {
 };
 YLT_REFL(HttpSegmentsDetailResponse, total_segments);
 
-std::string WriteTenantQuotaPolicyForTest(
-    const std::map<std::string, uint64_t>& tenant_quotas) {
-    TenantQuotaPolicySnapshot snapshot;
-    snapshot.tenant_quotas = tenant_quotas;
-    auto path = std::filesystem::temp_directory_path() /
-                ("mooncake_admin_tenant_quota_" +
-                 UuidToString(generate_uuid()) + ".yaml");
-    std::ofstream out(path);
-    out << FormatTenantQuotaPolicyYaml(snapshot);
-    return path.string();
-}
-
 }  // namespace
 
 // =========================================================================
@@ -131,21 +114,6 @@ class MasterAdminServerTest : public ::testing::Test {
         coro_http::coro_http_client client;
         auto result = client.post(BaseUrl(port) + path, body,
                                   coro_http::req_content_type::json);
-        return {result.status, std::string(result.resp_body)};
-    }
-
-    HttpResponse HttpPutJson(int port, const std::string& path,
-                             const std::string& body) {
-        coro_http::coro_http_client client;
-        auto result = async_simple::coro::syncAwait(client.async_put(
-            BaseUrl(port) + path, body, coro_http::req_content_type::json));
-        return {result.status, std::string(result.resp_body)};
-    }
-
-    HttpResponse HttpDelete(int port, const std::string& path) {
-        coro_http::coro_http_client client;
-        auto result = async_simple::coro::syncAwait(client.async_delete(
-            BaseUrl(port) + path, "", coro_http::req_content_type::json));
         return {result.status, std::string(result.resp_body)};
     }
 };
@@ -471,10 +439,6 @@ TEST_F(MasterAdminServerTest, ServiceEndpointsReturn503WhenServiceUnavailable) {
     EXPECT_EQ(seg_status.http_status, 503);
     EXPECT_NE(seg_status.body.find(unavailable_msg), std::string::npos);
 
-    auto tenant_quotas = HttpGet(port, "/api/v1/tenant_quotas");
-    EXPECT_EQ(tenant_quotas.http_status, 503);
-    EXPECT_NE(tenant_quotas.body.find(unavailable_msg), std::string::npos);
-
     auto drain_create = HttpPostJson(port, "/api/v1/drain_jobs", "{}");
     EXPECT_EQ(drain_create.http_status, 503);
 
@@ -488,144 +452,6 @@ TEST_F(MasterAdminServerTest, ServiceEndpointsReturn503WhenServiceUnavailable) {
     auto drain_cancel = HttpPostJson(
         port, "/api/v1/drain_jobs/cancel?job_id=" + valid_uuid, "");
     EXPECT_EQ(drain_cancel.http_status, 503);
-
-    admin.Stop();
-}
-
-TEST_F(MasterAdminServerTest, TenantQuotaAdminLifecycleEndpoints) {
-    const std::string policy_path = WriteTenantQuotaPolicyForTest({});
-    WrappedMasterServiceConfig svc_config;
-    svc_config.default_kv_lease_ttl = 5000;
-    svc_config.enable_metric_reporting = false;
-    svc_config.enable_multi_tenants = true;
-    svc_config.tenant_quota_connector_type = "file";
-    svc_config.tenant_quota_connector_uri = policy_path;
-    auto service = std::make_shared<WrappedMasterService>(svc_config);
-
-    Segment segment;
-    segment.id = generate_uuid();
-    segment.name = "quota_admin_segment";
-    segment.base = 0x600000000;
-    segment.size = 2000;
-    UUID client_id = generate_uuid();
-    ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
-
-    int port = getFreeTcpPort();
-    MasterAdminServer admin(static_cast<uint16_t>(port), false);
-    ASSERT_TRUE(admin.Start());
-    admin.SetRuntimeState(ha::MasterRuntimeState::kServing);
-    admin.SetServiceDelegate(service);
-    admin.SetServiceAvailable(true);
-
-    auto upsert = HttpPutJson(port, "/api/v1/tenant_quotas?tenant_id=tenant-a",
-                              "{\"requested_quota_bytes\":800}");
-    EXPECT_EQ(upsert.http_status, 200);
-    EXPECT_NE(upsert.body.find("\"tenant_id\":\"tenant-a\""),
-              std::string::npos);
-    EXPECT_NE(upsert.body.find("\"requested_quota_bytes\":800"),
-              std::string::npos);
-    EXPECT_NE(upsert.body.find("\"effective_quota_bytes\":800"),
-              std::string::npos);
-    EXPECT_NE(upsert.body.find("\"has_explicit_policy\":true"),
-              std::string::npos);
-
-    auto list = HttpGet(port, "/api/v1/tenant_quotas");
-    EXPECT_EQ(list.http_status, 200);
-    EXPECT_NE(list.body.find("\"tenant_id\":\"tenant-a\""), std::string::npos);
-
-    auto one = HttpGet(port, "/api/v1/tenant_quotas?tenant_id=tenant-a");
-    EXPECT_EQ(one.http_status, 200);
-    EXPECT_NE(one.body.find("\"committed_count\":0"), std::string::npos);
-    EXPECT_NE(one.body.find("\"over_quota\":false"), std::string::npos);
-
-    ReplicateConfig cfg;
-    cfg.replica_num = 1;
-    auto put =
-        service->PutStart(client_id, "quota_admin_key", 100, cfg, "tenant-a");
-    ASSERT_TRUE(put.has_value()) << toString(put.error());
-    ASSERT_TRUE(service
-                    ->PutEnd(client_id, "quota_admin_key", ReplicaType::MEMORY,
-                             "tenant-a")
-                    .has_value());
-
-    auto delete_non_empty =
-        HttpDelete(port, "/api/v1/tenant_quotas?tenant_id=tenant-a");
-    EXPECT_EQ(delete_non_empty.http_status, 409);
-    EXPECT_NE(delete_non_empty.body.find("TENANT_NOT_EMPTY"),
-              std::string::npos);
-
-    ASSERT_TRUE(service->Remove("quota_admin_key", /*force=*/true, "tenant-a")
-                    .has_value());
-
-    auto deleted = HttpDelete(port, "/api/v1/tenant_quotas?tenant_id=tenant-a");
-    EXPECT_EQ(deleted.http_status, 200);
-
-    auto missing = HttpGet(port, "/api/v1/tenant_quotas?tenant_id=tenant-a");
-    EXPECT_EQ(missing.http_status, 404);
-
-    admin.Stop();
-    std::filesystem::remove(policy_path);
-}
-
-TEST_F(MasterAdminServerTest, TenantQuotaAdminValidationErrors) {
-    const std::string policy_path = WriteTenantQuotaPolicyForTest({});
-    WrappedMasterServiceConfig svc_config;
-    svc_config.default_kv_lease_ttl = 5000;
-    svc_config.enable_metric_reporting = false;
-    svc_config.enable_multi_tenants = true;
-    svc_config.tenant_quota_connector_type = "file";
-    svc_config.tenant_quota_connector_uri = policy_path;
-    auto service = std::make_shared<WrappedMasterService>(svc_config);
-
-    int port = getFreeTcpPort();
-    MasterAdminServer admin(static_cast<uint16_t>(port), false);
-    ASSERT_TRUE(admin.Start());
-    admin.SetRuntimeState(ha::MasterRuntimeState::kServing);
-    admin.SetServiceDelegate(service);
-    admin.SetServiceAvailable(true);
-
-    auto missing_tenant = HttpPutJson(port, "/api/v1/tenant_quotas",
-                                      "{\"requested_quota_bytes\":100}");
-    EXPECT_EQ(missing_tenant.http_status, 400);
-
-    auto empty_tenant = HttpPutJson(port, "/api/v1/tenant_quotas?tenant_id=",
-                                    "{\"requested_quota_bytes\":100}");
-    EXPECT_EQ(empty_tenant.http_status, 400);
-
-    auto zero_explicit =
-        HttpPutJson(port, "/api/v1/tenant_quotas?tenant_id=tenant-a",
-                    "{\"requested_quota_bytes\":0}");
-    EXPECT_EQ(zero_explicit.http_status, 400);
-
-    auto reserved_tenant =
-        HttpGet(port, "/api/v1/tenant_quotas?tenant_id=_system");
-    EXPECT_EQ(reserved_tenant.http_status, 400);
-
-    auto missing_query =
-        HttpGet(port, "/api/v1/tenant_quotas?tenant_id=missing");
-    EXPECT_EQ(missing_query.http_status, 404);
-
-    admin.Stop();
-    std::filesystem::remove(policy_path);
-}
-
-TEST_F(MasterAdminServerTest, TenantQuotaAdminDisabledModeReturns409) {
-    WrappedMasterServiceConfig svc_config;
-    svc_config.default_kv_lease_ttl = 5000;
-    svc_config.enable_metric_reporting = false;
-    svc_config.enable_multi_tenants = false;
-    auto service = std::make_shared<WrappedMasterService>(svc_config);
-
-    int port = getFreeTcpPort();
-    MasterAdminServer admin(static_cast<uint16_t>(port), false);
-    ASSERT_TRUE(admin.Start());
-    admin.SetRuntimeState(ha::MasterRuntimeState::kServing);
-    admin.SetServiceDelegate(service);
-    admin.SetServiceAvailable(true);
-
-    auto list = HttpGet(port, "/api/v1/tenant_quotas");
-    EXPECT_EQ(list.http_status, 409);
-    EXPECT_NE(list.body.find("UNAVAILABLE_IN_CURRENT_MODE"), std::string::npos);
 
     admin.Stop();
 }
@@ -1202,55 +1028,6 @@ TEST_F(MasterAdminServerTest, MultipleSegmentsAndKeys) {
     EXPECT_EQ(batch_resp.http_status, 200);
     EXPECT_NE(batch_resp.body.find("key_one"), std::string::npos);
     EXPECT_NE(batch_resp.body.find("key_two"), std::string::npos);
-
-    admin.Stop();
-}
-
-// /batch_query_keys returns replica metadata for disk-based keys via the
-// optional disk_values/local_disk_values/nof_values fields, while the existing
-// values field stays present (empty array) for backward compatibility.
-TEST_F(MasterAdminServerTest, BatchQueryKeysReturnsLocalDiskReplicaInfo) {
-    WrappedMasterServiceConfig svc_config;
-    svc_config.default_kv_lease_ttl = 5000;
-    svc_config.enable_metric_reporting = false;
-    svc_config.enable_offload = true;  // required to mount local-disk segments
-    auto service = std::make_shared<WrappedMasterService>(svc_config);
-
-    UUID client_id = generate_uuid();
-    Segment segment;
-    segment.id = generate_uuid();
-    segment.name = "ld_segment";
-    segment.base = 0x600000000;
-    segment.size = 8 * 1024 * 1024;
-    ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
-    ASSERT_TRUE(service->MountLocalDiskSegment(client_id, true).has_value());
-
-    const std::string key = "ld_only_key";
-    const std::string endpoint = "127.0.0.1:9999";
-    StorageObjectMetadata sm;
-    sm.bucket_id = 0;
-    sm.offset = 0;
-    sm.key_size = static_cast<int64_t>(key.size());
-    sm.data_size = 2048;
-    sm.transport_endpoint = endpoint;
-    OffloadTaskItem task{.tenant_id = "default", .key = key, .size = 2048};
-    ASSERT_TRUE(
-        service->NotifyOffloadSuccess(client_id, {task}, {sm}).has_value());
-
-    int port = getFreeTcpPort();
-    MasterAdminServer admin(static_cast<uint16_t>(port), false);
-    ASSERT_TRUE(admin.Start());
-    admin.SetRuntimeState(ha::MasterRuntimeState::kServing);
-    admin.SetServiceDelegate(service);
-    admin.SetServiceAvailable(true);
-
-    auto resp = HttpGet(port, "/batch_query_keys?keys=" + key);
-    EXPECT_EQ(resp.http_status, 200);
-    EXPECT_NE(resp.body.find("\"success\":true"), std::string::npos);
-    EXPECT_NE(resp.body.find("local_disk_values"), std::string::npos);
-    EXPECT_NE(resp.body.find(endpoint), std::string::npos);
-    // Backward compat: a disk-only key still reports an (empty) values array.
-    EXPECT_NE(resp.body.find("\"values\":[]"), std::string::npos);
 
     admin.Stop();
 }

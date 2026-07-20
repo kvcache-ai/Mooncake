@@ -23,9 +23,8 @@ Transport selection is driven by configuration with pattern-based rules.
 {
   "policy": [
     {
-      "name": "foreground_get",
+      "name": "high_prio_fast",
       "segment_type": "memory",
-      "intent_type": "foreground_get",
       "priority": "high",
       "devices": ["mlx5_0", "mlx5_1", "mlx5_2"],
       "transports": ["nvlink", "rdma", "shm"]
@@ -53,45 +52,8 @@ Transport selection is driven by configuration with pattern-based rules.
 | `name` | string | Yes | Policy identifier (for logging) |
 | `segment_type` | string | Yes | `"memory"` or `"file"` |
 | `priority` | string or int | No | Match only requests with this priority: `"high"` (0), `"medium"` (1), `"low"` (2) |
-| `intent_type` | string or int | No | Match a standard transfer intent such as `"foreground_get"`, `"background_prefetch"`, `"migration"`, `"checkpoint"`, `"weight_loading"`, or `"staging_internal"` |
 | `devices` | array[string] | No | List of allowed device names (empty = all devices) |
 | `transports` | array[string] | No | Transport preference list (evaluated in order) |
-
-### Intent-Based Policy Binding
-
-`Request::intent_type` can select an intent-specific policy before transport,
-device, QP-pool, and SL/TC resolution:
-
-```json
-{
-  "policy": [
-    {
-      "name": "foreground-kv",
-      "segment_type": "memory",
-      "intent_type": "foreground_get",
-      "qp_pool": "foreground",
-      "service_level": 3,
-      "traffic_class": 96,
-      "transports": ["rdma"]
-    },
-    {
-      "name": "memory-fallback",
-      "segment_type": "memory",
-      "transports": ["rdma", "tcp"]
-    }
-  ]
-}
-```
-
-Policies are evaluated in JSON order, so intent-specific entries should appear
-before a catch-all entry. A policy without `intent_type` retains the historical
-behavior and matches any intent. `INTENT_UNSPEC` therefore behaves exactly as
-before with existing configurations.
-
-An explicit `Request::policy_name` remains the strongest per-request override:
-it selects the named policy by segment type and bypasses the policy's other
-match filters, including `intent_type`. Invalid intent values cause that policy
-entry to be skipped rather than silently converted into a catch-all rule.
 
 ### Memory Type Filters
 
@@ -266,7 +228,6 @@ TransportSelector.select(context, transports, transport_index)
     ↓
 Match policy by:
   - segment_type (file/memory)
-  - intent_type (exact match if specified in policy)
   - priority (exact match if specified in policy)
   - location constraints
   - size constraints

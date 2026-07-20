@@ -85,7 +85,6 @@ html_theme_options = {
     # Prevents the full API being added to the left sidebar of every page.
     # Reduces build time by 2.5x and reduces build size from ~225MB to ~95MB.
     'collapse_navbar': True,
-    'show_navbar_depth': 2,
     # Makes API visible in the right sidebar on API reference pages.
     'show_toc_level': 3,
 }

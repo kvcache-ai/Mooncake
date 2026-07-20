@@ -15,21 +15,17 @@
 #ifndef MULTI_TRANSFER_ENGINE_H_
 #define MULTI_TRANSFER_ENGINE_H_
 
-#include <memory>
-
 #include "memory_location.h"
 #include "multi_transport.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
 
 namespace mooncake {
-class ShutdownToken;
 class TransferEngineImpl;
 namespace tent {
 class TransferEngine;
 };
-#if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
-    !defined(USE_CXI)
+#if defined(USE_CUDA) || defined(USE_MUSA)
 namespace device {
 class P2pTransport;
 class RdmaTransport;
@@ -75,10 +71,6 @@ class TransferEngine {
 
     TransferEngine(bool auto_discover, const std::vector<std::string>& filter);
 
-    TransferEngine(TransferEngine&& other) noexcept;
-
-    TransferEngine& operator=(TransferEngine&& other) noexcept;
-
     ~TransferEngine();
 
     int init(const std::string& metadata_conn_string,
@@ -95,8 +87,6 @@ class TransferEngine {
     std::string getLocalIpAndPort();
 
     int getRpcPort();
-
-    bool isUsingTent() const { return use_tent_; }
 
     SegmentHandle openSegment(const std::string& segment_name);
 
@@ -166,8 +156,7 @@ class TransferEngine {
 
     Transport* getTransport(const std::string& proto);
 
-#if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
-    !defined(USE_CXI)
+#if defined(USE_CUDA) || defined(USE_MUSA)
     // Device transport accessors (P2P + IBGDA).  Lazily created on first
     // call and owned by the TransferEngine.  These allow EP (and future
     // CPU-proxy paths) to obtain device transports from an engine instance
@@ -201,13 +190,9 @@ class TransferEngine {
 
     std::shared_ptr<Topology> getLocalTopology();
 
-    void enableGracefulShutdown();
-    std::string showLinks(bool json = false) const;
-
    private:
     std::shared_ptr<TransferEngineImpl> impl_;
     std::shared_ptr<mooncake::tent::TransferEngine> impl_tent_;
-    std::shared_ptr<ShutdownToken> shutdown_token_;
     bool use_tent_{false};
 };
 }  // namespace mooncake

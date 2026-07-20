@@ -4,7 +4,6 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
-#include <climits>
 #include <cstring>
 #include <string>
 #include <sys/mman.h>
@@ -243,16 +242,6 @@ class SharedUringRing {
         return std::max(s, MIN_CHUNK);
     }
 
-    static size_t max_rw_count() {
-        static const size_t value = [] {
-            long page_size = sysconf(_SC_PAGESIZE);
-            if (page_size <= 0) page_size = 4096;
-            return static_cast<size_t>(INT_MAX) &
-                   ~(static_cast<size_t>(page_size) - 1);
-        }();
-        return value;
-    }
-
     // Drain exactly @expected CQEs and accumulate bytes.
     tl::expected<size_t, ErrorCode> collect(int expected) {
         int ret = io_uring_submit_and_wait(&ring_, expected);
@@ -299,7 +288,7 @@ class SharedUringRing {
                 static_cast<unsigned>((remaining + cs - 1) / cs), QUEUE_DEPTH);
 
             for (unsigned i = 0; i < n; ++i) {
-                size_t chunk = std::min({cs, remaining, max_rw_count()});
+                size_t chunk = std::min(cs, remaining);
 
                 struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
                 if (!sqe) {
@@ -343,7 +332,6 @@ class SharedUringRing {
                                                   off_t off) {
         const ErrorCode err_code =
             is_write ? ErrorCode::FILE_WRITE_FAIL : ErrorCode::FILE_READ_FAIL;
-        const size_t max_io = max_rw_count();
 
         size_t total = 0;
         off_t cur = off;
@@ -351,23 +339,7 @@ class SharedUringRing {
         int idx = 0;
 
         while (remaining > 0) {
-            if (iovs[idx].iov_len > max_io) {
-                auto res = submit_rw(is_write, fd, iovs[idx].iov_base,
-                                     iovs[idx].iov_len, cur,
-                                     /*use_fixed_buf=*/false);
-                if (!res) return res;
-                total += res.value();
-                cur += static_cast<off_t>(iovs[idx].iov_len);
-                ++idx;
-                --remaining;
-                continue;
-            }
-
-            int batch = 0;
-            while (batch < remaining && batch < static_cast<int>(QUEUE_DEPTH) &&
-                   iovs[idx + batch].iov_len <= max_io) {
-                ++batch;
-            }
+            int batch = std::min(remaining, static_cast<int>(QUEUE_DEPTH));
 
             for (int i = 0; i < batch; ++i) {
                 struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);

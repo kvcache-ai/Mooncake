@@ -23,10 +23,13 @@ endif()
 target_include_directories(ub_transport
         PUBLIC
         ${urma_INCLUDE_DIR}
+        PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../../mooncake-integration/store
 )
 target_link_libraries(ub_transport
         PRIVATE
         JsonCpp::JsonCpp
         glog::glog
         pthread
+        UbDiag::ubdiag_lib
 )

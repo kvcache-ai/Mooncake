@@ -28,22 +28,9 @@ class EnvironTest : public ::testing::Test {
 
     void clearTestEnvVars() {
         unsetenv("MC_TEST_INT");
-        unsetenv("MC_TEST_INT64");
         unsetenv("MC_TEST_SIZET");
         unsetenv("MC_TEST_BOOL");
         unsetenv("MC_TEST_STRING");
-        // Make sure AWS vars don't leak in from the test runner's env.
-        unsetenv("MOONCAKE_AWS_REGION");
-        unsetenv("MOONCAKE_AWS_S3_ENDPOINT");
-        unsetenv("MOONCAKE_AWS_BUCKET_NAME");
-        unsetenv("MOONCAKE_AWS_ACCESS_KEY_ID");
-        unsetenv("MOONCAKE_AWS_SECRET_ACCESS_KEY");
-        unsetenv("MOONCAKE_AWS_USE_VIRTUAL_ADDRESSING");
-        unsetenv("MOONCAKE_AWS_USE_HTTPS");
-        unsetenv("MOONCAKE_AWS_REQUEST_CHECKSUM_CALCULATION");
-        unsetenv("MOONCAKE_AWS_RESPONSE_CHECKSUM_VALIDATION");
-        unsetenv("MOONCAKE_AWS_CONNECT_TIMEOUT_MS");
-        unsetenv("MOONCAKE_AWS_REQUEST_TIMEOUT_MS");
     }
 };
 
@@ -96,70 +83,6 @@ TEST_F(EnvironTest, GetIntMaxValue) {
 TEST_F(EnvironTest, GetIntMinValue) {
     setenv("MC_TEST_INT", std::to_string(INT_MIN).c_str(), 1);
     EXPECT_EQ(Environ::GetInt("MC_TEST_INT", 0), INT_MIN);
-}
-
-// --- GetInt64 ---
-
-TEST_F(EnvironTest, GetInt64ValidValue) {
-    setenv("MC_TEST_INT64", "123456789012", 1);
-    EXPECT_EQ(Environ::GetInt64("MC_TEST_INT64", 0), 123456789012LL);
-}
-
-TEST_F(EnvironTest, GetInt64Missing) {
-    EXPECT_EQ(Environ::GetInt64("MC_TEST_INT64", 9999), 9999);
-}
-
-TEST_F(EnvironTest, GetInt64Empty) {
-    setenv("MC_TEST_INT64", "", 1);
-    EXPECT_EQ(Environ::GetInt64("MC_TEST_INT64", 555), 555);
-}
-
-TEST_F(EnvironTest, GetInt64NonNumeric) {
-    setenv("MC_TEST_INT64", "abc", 1);
-    EXPECT_EQ(Environ::GetInt64("MC_TEST_INT64", 555), 555);
-}
-
-TEST_F(EnvironTest, GetInt64Overflow) {
-    setenv("MC_TEST_INT64", "99999999999999999999999999", 1);
-    EXPECT_EQ(Environ::GetInt64("MC_TEST_INT64", 555), 555);
-}
-
-// --- AWS / S3 fields ---
-//
-// NOTE: Environ is a singleton whose constructor caches every value the
-// first time Get() is called. So all AWS env vars must be set BEFORE the
-// first Environ::Get() in this process. We therefore cover the populate
-// path in a single test that takes the singleton's "first call" for
-// itself; the default-path behavior is implicitly covered by Environ's
-// constructor defaults (any earlier test would lock the cache to defaults
-// and prevent us from observing populated values here).
-
-TEST_F(EnvironTest, AwsFieldsPopulateFromEnv) {
-    setenv("MOONCAKE_AWS_REGION", "us-east-1", 1);
-    setenv("MOONCAKE_AWS_S3_ENDPOINT", "https://s3.example.com", 1);
-    setenv("MOONCAKE_AWS_BUCKET_NAME", "my-bucket", 1);
-    setenv("MOONCAKE_AWS_ACCESS_KEY_ID", "AKIA-test", 1);
-    setenv("MOONCAKE_AWS_SECRET_ACCESS_KEY", "secret", 1);
-    setenv("MOONCAKE_AWS_USE_VIRTUAL_ADDRESSING", "0", 1);
-    setenv("MOONCAKE_AWS_USE_HTTPS", "0", 1);
-    setenv("MOONCAKE_AWS_REQUEST_CHECKSUM_CALCULATION", "when_required", 1);
-    setenv("MOONCAKE_AWS_RESPONSE_CHECKSUM_VALIDATION", "when_supported", 1);
-    setenv("MOONCAKE_AWS_CONNECT_TIMEOUT_MS", "5000", 1);
-    // Bogus request timeout should fall back to the registered default.
-    setenv("MOONCAKE_AWS_REQUEST_TIMEOUT_MS", "bogus", 1);
-
-    const auto& e = Environ::Get();
-    EXPECT_EQ(e.GetAwsRegion(), "us-east-1");
-    EXPECT_EQ(e.GetAwsS3Endpoint(), "https://s3.example.com");
-    EXPECT_EQ(e.GetAwsBucketName(), "my-bucket");
-    EXPECT_EQ(e.GetAwsAccessKeyId(), "AKIA-test");
-    EXPECT_EQ(e.GetAwsSecretAccessKey(), "secret");
-    EXPECT_FALSE(e.GetAwsUseVirtualAddressing());
-    EXPECT_FALSE(e.GetAwsUseHttps());
-    EXPECT_EQ(e.GetAwsRequestChecksumCalculation(), "when_required");
-    EXPECT_EQ(e.GetAwsResponseChecksumValidation(), "when_supported");
-    EXPECT_EQ(e.GetAwsConnectTimeoutMs(), 5000);
-    EXPECT_EQ(e.GetAwsRequestTimeoutMs(), 30000);
 }
 
 // --- GetSizeT ---

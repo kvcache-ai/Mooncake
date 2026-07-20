@@ -1,6 +1,6 @@
 file(GLOB CORO_RPC_SOURCES "*.cpp")
 
-find_package(Python3 COMPONENTS Interpreter Development.Module REQUIRED)
+find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
 
 add_library(rpc_communicator OBJECT ${CORO_RPC_SOURCES})
 
@@ -10,6 +10,7 @@ target_link_libraries(rpc_communicator
     yalantinglibs::yalantinglibs 
     glog::glog 
     pthread 
+    ${Python3_LIBRARIES}
 )
 
 target_include_directories(rpc_communicator 

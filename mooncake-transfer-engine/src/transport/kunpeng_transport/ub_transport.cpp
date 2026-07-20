@@ -20,6 +20,7 @@
 #include "transport/kunpeng_transport/ub_transport.h"
 #include "transport/kunpeng_transport/ub_endpoint.h"
 #include "transport/kunpeng_transport/urma/urma_endpoint.h"
+#include "mooncake_logging.h"
 
 namespace mooncake {
 UbTransport::UbTransport(UB_ENDPOINT_TYPE endpoint_type)
@@ -186,18 +187,8 @@ Status UbTransport::submitTransfer(
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
     std::vector<TransferTask*> task_list;
-    task_list.reserve(entries.size());
-    for (auto& request : entries) {
-        auto& task = batch_desc.task_list[task_id];
-        ++task_id;
-        task.batch_id = batch_id;
-#ifdef USE_ASCEND_HETEROGENEOUS
-        task.request = const_cast<TransferRequest*>(&request);
-#else
-        task.request = &request;
-#endif
-        task_list.push_back(&task);
-    }
+    task_list.reserve(batch_desc.task_list.size());
+    for (auto& task : batch_desc.task_list) task_list.push_back(&task);
     return submitTransferTask(task_list);
 }
 
@@ -234,12 +225,15 @@ Status UbTransport::submitTransferTask(
             if (!slice->from_cache) {
                 nr_slices++;
             }
+            slice->peer_nic_path.clear();
+            slice->dest_rkeys.clear();
             bool merge_final_slice =
                 request.length - offset <= kBlockSize + kFragmentSize;
             slice->source_addr = (char*)request.source + offset;
             slice->length =
                 merge_final_slice ? request.length - offset : kBlockSize;
             slice->opcode = request.opcode;
+            slice->trace_id = mooncake::logging::CurrentTraceId();
             // LOG(INFO) << "target_offset : " << request.target_offset << ",
             // offset : " << offset;
             slice->ub.dest_addr = request.target_offset + offset;

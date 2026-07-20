@@ -37,7 +37,6 @@
 #include "tent/common/utils/string_builder.h"
 #include "tent/runtime/topology.h"
 #include "tent/common/utils/random.h"
-#include "tent/thirdparty/nlohmann/json.h"
 
 #define SET_DEVICE(key, param) \
     param = conf->get("transports/rdma/device/" #key, param)
@@ -193,49 +192,12 @@ static Status convertConfToRdmaParams(std::shared_ptr<Config> conf,
     else
         params->endpoint.path_mtu = IBV_MTU_512;
 
-    // Optional per-pool QP layout (RFC #2568 step 2). Each entry defines a
-    // named pool with its own QP count and link-layer SL/TC;
-    // SelectionPolicy.qp_pool references these by name. Absent/empty => single
-    // default pool (unchanged). The pool SL/TC live here in the RDMA config,
-    // not in SelectionPolicy, to keep the link-layer QoS definition in the
-    // transport layer; policies only reference a pool by name.
-    params->endpoint.qp_pools.clear();
-    auto qp_pools_json =
-        conf->getArray<nlohmann::json>("transports/rdma/endpoint/qp_pools");
-    for (const auto& pool_json : qp_pools_json) {
-        if (!pool_json.is_object()) {
-            LOG(WARNING) << "Ignore non-object entry in qp_pools";
-            continue;
-        }
-        if (!pool_json.contains("name") || !pool_json["name"].is_string()) {
-            LOG(WARNING) << "Ignore qp_pool entry without a string 'name'";
-            continue;
-        }
-        QpPoolSegment seg;
-        seg.name = pool_json["name"].get<std::string>();
-        seg.num_qp = pool_json.value("num_qp", 0);
-        if (seg.num_qp <= 0) {
-            LOG(WARNING) << "Ignore qp_pool '" << seg.name
-                         << "' with non-positive num_qp " << seg.num_qp;
-            continue;
-        }
-        seg.service_level = pool_json.value("service_level", -1);
-        seg.traffic_class = pool_json.value("traffic_class", -1);
-        params->endpoint.qp_pools.push_back(std::move(seg));
-    }
-    if (!params->endpoint.qp_pools.empty()) {
-        LOG(INFO) << "Configured " << params->endpoint.qp_pools.size()
-                  << " QP pool(s) for per-class link-layer isolation";
-    }
-
     SET_WORKERS(max_retry_count, params->workers.max_retry_count);
     SET_WORKERS(block_size, params->workers.block_size);
     SET_WORKERS(grace_period_ns, params->workers.grace_period_ns);
     SET_WORKERS(rail_topo_path, params->workers.rail_topo_path);
 
     params->verbose = conf->get("verbose", false);
-    params->log_slice_affinity =
-        conf->get("transports/rdma/log_slice_affinity", false);
     return Status::OK();
 }
 
@@ -437,14 +399,9 @@ Status RdmaTransport::submitTransferTasks(
         auto* task = RdmaTaskStorage::Get().allocate();
         rdma_batch->task_list.push_back(task);
         task->request = request;
-        task->qp_pool = rdma_batch->qp_pool;  // RFC #2568 step 3
         task->num_slices = 0;
         task->status_word = PENDING;
         task->transferred_bytes = 0;
-        task->success_slices.store(0, std::memory_order_relaxed);
-        task->resolved_slices.store(0, std::memory_order_relaxed);
-        task->first_error = PENDING;
-        task->cancel_requested.store(false, std::memory_order_relaxed);
         task->ref();  // Batch holds a reference to the task
 
         const double merge_ratio = 0.25;
@@ -496,7 +453,6 @@ Status RdmaTransport::submitTransferTasks(
             slice->length = length;
             slice->task = task;
             slice->retry_count = 0;
-            slice->quota_charged = false;
             slice->ep_weak_ptr.reset();
             slice->word = PENDING;
             slice->next = nullptr;
@@ -504,10 +460,8 @@ Status RdmaTransport::submitTransferTasks(
             slice->priority = request.priority;  // Copy priority from request
             task->num_slices++;
             task->ref();  // Each slice holds a reference to the task
-            if (slice_idx < slice_dev_ids.size()) {
+            if (slice_idx < slice_dev_ids.size())
                 slice->source_dev_id = slice_dev_ids[slice_idx];
-                slice->quota_charged = true;
-            }
             offset += length;
             int part_id = next_worker_idx % num_workers;
             auto& list = slice_lists[part_id];
@@ -541,19 +495,6 @@ Status RdmaTransport::getTransferStatus(SubBatchRef batch, int task_id,
     auto* task = rdma_batch->task_list[task_id];
     status = TransferStatus{task->status_word, task->transferred_bytes};
     return Status::OK();
-}
-
-Status RdmaTransport::cancelTransferTask(SubBatchRef batch, int task_id) {
-    auto* rdma_batch = dynamic_cast<RdmaSubBatch*>(batch);
-    if (!rdma_batch) {
-        return Status::InvalidArgument("Invalid RDMA sub-batch" LOC_MARK);
-    }
-    if (task_id < 0 || task_id >= (int)rdma_batch->task_list.size()) {
-        return Status::InvalidArgument("Invalid task ID" LOC_MARK);
-    }
-    auto* task = rdma_batch->task_list[task_id];
-    if (task->status_word != PENDING) return Status::OK();
-    return workers_->cancel(task);
 }
 
 bool RdmaTransport::warmupMemory(void* addr, size_t length) {
@@ -600,23 +541,22 @@ Status RdmaTransport::removeMemoryBuffer(BufferDesc& desc) {
 
 Status RdmaTransport::setupLocalSegment() {
     auto& manager = metadata_->segmentManager();
-    CHECK_STATUS(manager.updateLocal([&](SegmentDesc& segment) -> Status {
-        // Store RDMA server name for dual-NIC setups; when it differs from
-        // local_segment_name_ the peer will use it for NIC path construction.
-        if (rdma_server_name_ != local_segment_name_) {
-            segment.rdma_server_name = rdma_server_name_;
-        }
-        auto& detail = std::get<MemorySegmentDesc>(segment.detail);
-        for (auto& context : context_set_) {
-            if (context->status() != RdmaContext::DEVICE_ENABLED) continue;
-            DeviceDesc device_desc;
-            device_desc.name = context->name();
-            device_desc.lid = context->lid();
-            device_desc.gid = context->gid();
-            detail.devices.push_back(device_desc);
-        }
-        return Status::OK();
-    }));
+    auto segment = manager.getLocal();
+    assert(segment);
+    // Store RDMA server name for dual-NIC setups; when it differs from
+    // local_segment_name_ the peer will use it for NIC path construction.
+    if (rdma_server_name_ != local_segment_name_) {
+        segment->rdma_server_name = rdma_server_name_;
+    }
+    auto& detail = std::get<MemorySegmentDesc>(segment->detail);
+    for (auto& context : context_set_) {
+        if (context->status() != RdmaContext::DEVICE_ENABLED) continue;
+        DeviceDesc device_desc;
+        device_desc.name = context->name();
+        device_desc.lid = context->lid();
+        device_desc.gid = context->gid();
+        detail.devices.push_back(device_desc);
+    }
     return manager.synchronizeLocal();
 }
 
@@ -650,10 +590,6 @@ int RdmaTransport::onSetupRdmaConnections(const BootstrapDesc& peer_desc,
     }
     auto status = endpoint->accept(peer_desc, local_desc);
     if (!status.ok()) {
-        if (endpoint->status() == RdmaEndPoint::EP_DESTROYING ||
-            endpoint->status() == RdmaEndPoint::EP_DESTROYED) {
-            context->endpointStore()->remove(endpoint.get());
-        }
         LOG(ERROR) << status.ToString();
         local_desc.reply_msg = status.ToString();
         return -1;
@@ -664,11 +600,13 @@ int RdmaTransport::onSetupRdmaConnections(const BootstrapDesc& peer_desc,
 
 std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
                                                          int device_id) {
-    std::string rpc_server_addr, target_seg_name, target_dev_name,
-        target_nic_path_name;
+    SegmentDesc* segment_desc = nullptr;
+    std::string rpc_server_addr, target_seg_name, target_dev_name;
 
     auto status = metadata_->segmentManager().withCachedSegment(
         target_id, [&](SegmentDesc* segment) {
+            segment_desc = segment;
+
             if (segment->type != SegmentType::Memory) {
                 return Status::NeedsRefreshCache(
                     "Segment type is not Memory" LOC_MARK);
@@ -680,7 +618,6 @@ std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
 
             auto topo = &std::get<MemorySegmentDesc>(segment->detail).topology;
             target_seg_name = segment->name;
-            target_nic_path_name = segment->nicPathServerName();
             target_dev_name = topo->getNicName(device_id);
             if (target_seg_name.empty() || target_dev_name.empty()) {
                 return Status::NeedsRefreshCache(
@@ -699,7 +636,8 @@ std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
         return nullptr;
     }
     std::shared_ptr<RdmaEndPoint> endpoint;
-    std::string peer_name = MakeNicPath(target_nic_path_name, target_dev_name);
+    std::string peer_name =
+        MakeNicPath(segment_desc->nicPathServerName(), target_dev_name);
     endpoint = context->endpointStore()->getOrInsert(peer_name);
     if (!endpoint) {
         LOG(ERROR) << "Cannot allocate endpoint " << peer_name;
@@ -772,27 +710,20 @@ int RdmaTransport::processNotifyCompletions() {
 
         // Process each completion
         for (int i = 0; i < completed; ++i) {
-            // Find endpoint by QP number before interpreting errors. A flush
-            // completion after endpoint unpublication is expected during
-            // retirement and should not flood logs.
-            std::shared_ptr<RdmaEndPoint> endpoint;
+            if (wc[i].status != IBV_WC_SUCCESS) {
+                LOG(ERROR) << "Notification completion failed: " << wc[i].status
+                           << ", qp_num=" << wc[i].qp_num;
+                continue;
+            }
+
+            // Find endpoint by QP number
+            RdmaEndPoint* endpoint = nullptr;
             {
                 RWSpinlock::ReadGuard guard(notify_endpoint_map_lock_);
                 auto it = notify_qp_to_endpoint_.find(wc[i].qp_num);
                 if (it != notify_qp_to_endpoint_.end()) {
-                    endpoint = it->second.lock();
+                    endpoint = it->second;
                 }
-            }
-
-            if (wc[i].status != IBV_WC_SUCCESS) {
-                if (wc[i].status == IBV_WC_WR_FLUSH_ERR &&
-                    (!endpoint ||
-                     endpoint->status() != RdmaEndPoint::EP_READY)) {
-                    continue;
-                }
-                LOG(ERROR) << "Notification completion failed: " << wc[i].status
-                           << ", qp_num=" << wc[i].qp_num;
-                continue;
             }
 
             if (!endpoint) {
@@ -814,8 +745,7 @@ int RdmaTransport::processNotifyCompletions() {
     return total_completions;
 }
 
-void RdmaTransport::registerNotifyQp(
-    uint32_t qp_num, const std::shared_ptr<RdmaEndPoint>& endpoint) {
+void RdmaTransport::registerNotifyQp(uint32_t qp_num, RdmaEndPoint* endpoint) {
     RWSpinlock::WriteGuard guard(notify_endpoint_map_lock_);
     notify_qp_to_endpoint_[qp_num] = endpoint;
 }
@@ -831,13 +761,5 @@ void RdmaTransport::notifyWorkerThread() {
         usleep(notify_poll_interval_us_);
     }
 }
-
-double RdmaTransport::getEstimatedBandwidth() const {
-    if (!workers_) return -1.0;
-    auto* sel = workers_->getDeviceSelector();
-    if (!sel) return -1.0;
-    return sel->getAggregateEwmaBandwidth();
-}
-
 }  // namespace tent
 }  // namespace mooncake

@@ -142,10 +142,6 @@ class TcpTransport : public Transport {
         const std::string &host, uint16_t port);
     void returnConnection(const std::string &host, uint16_t port,
                           std::shared_ptr<asio::ip::tcp::socket> socket);
-    // Close `socket` and drop it from the pool: used for requests that did
-    // not terminate in a well-defined protocol state (#2086).
-    void discardConnection(const std::string &host, uint16_t port,
-                           std::shared_ptr<asio::ip::tcp::socket> socket);
     void cleanupIdleConnections();
 
     static constexpr std::chrono::seconds kConnectionIdleTimeout{60};

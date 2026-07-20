@@ -180,7 +180,7 @@ class UbContext {
 
     virtual void* retrieveRemoteSeg(const std::string& value) = 0;
 
-    virtual int openDevice(const std::string& device_name, uint8_t port,
+    virtual int openDevice(const std::string& device_name, int8_t port,
                            int& eid_index) = 0;
 
     // Polls one JFC and processes the slices internally:

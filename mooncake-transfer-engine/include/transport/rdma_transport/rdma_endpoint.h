@@ -15,14 +15,11 @@
 #ifndef RDMA_ENDPOINT_H
 #define RDMA_ENDPOINT_H
 
-#include <atomic>
 #include <queue>
 
 #include "rdma_context.h"
 
 namespace mooncake {
-
-class RdmaEndPointTestPeer;
 
 // RdmaEndPoint represents all QP connections between the local NIC1 (identified
 // by its RdmaContext) and the remote NIC2 (identified by peer_nic_path).
@@ -34,9 +31,7 @@ class RdmaEndPointTestPeer;
 //      which can be obtained from RdmaContext::nicPath() on the remote side
 //    - Remote side calls the setupConnectionsByPassive() function in its RPC
 //    service.
-//   After above steps, the RdmaEndPoint state is set to CONNECTED. With RDMA
-//   ready ACK enabled, QPs first enter CONNECTED_WAIT_READY_ACK after reaching
-//   RTS and become CONNECTED only after the ready-ACK phase completes.
+//   After above steps, the RdmaEndPoint state is set to CONNECTED
 //
 // If the user initiates a disconnect() call or an error is detected internally,
 // the connection is closed and the RdmaEndPoint state is set to UNCONNECTED.
@@ -47,13 +42,10 @@ class RdmaEndPoint {
         INITIALIZING,
         UNCONNECTED,
         CONNECTING,
-        CONNECTED_WAIT_READY_ACK,
         CONNECTED,
         DESTROYING,
         DESTROYED,
     };
-
-    friend class RdmaEndPointTestPeer;
 
    public:
     RdmaEndPoint(RdmaContext &context);
@@ -67,7 +59,6 @@ class RdmaEndPoint {
     int reconstruct();
     int deconstruct();
     int deconstructLocked();
-    void beginDestroyLocked();
 
    public:
     void setPeerNicPath(const std::string &peer_nic_path);
@@ -83,35 +74,22 @@ class RdmaEndPoint {
     int setupConnectionsByPassive(const HandShakeDesc &peer_desc,
                                   HandShakeDesc &local_desc);
 
-    bool active() const { return active_.load(std::memory_order_acquire); }
+    bool active() const { return active_; }
 
     void set_active(bool flag) {
         RWSpinlock::WriteGuard guard(lock_);
-        if (!flag)
-            inactive_time_.store(getCurrentTimeInNano(),
-                                 std::memory_order_relaxed);
-        active_.store(flag, std::memory_order_release);
+        active_ = flag;
+        if (!flag) inactive_time_ = getCurrentTimeInNano();
     }
 
     double inactiveTime() {
-        if (active_.load(std::memory_order_acquire)) return 0.0;
-        return (getCurrentTimeInNano() -
-                inactive_time_.load(std::memory_order_relaxed)) /
-               1000000000.0;
+        if (active_) return 0.0;
+        return (getCurrentTimeInNano() - inactive_time_) / 1000000000.0;
     }
 
    public:
-    bool connected() const { return isConnectedStatus(status()); }
-
-    // CONNECTED_WAIT_READY_ACK means local QPs have reached RTS but the RDMA
-    // ready-ACK phase has not completed yet. Only CONNECTED can post WRs.
-    bool readyToSend() const { return status() == CONNECTED; }
-
-    bool readyAckTimedOut() const;
-
-    bool retired() const {
-        auto status = status_.load(std::memory_order_relaxed);
-        return status == DESTROYING || status == DESTROYED;
+    bool connected() const {
+        return status_.load(std::memory_order_relaxed) == CONNECTED;
     }
 
     // Interrupts the connection, which can be triggered by user or by internal
@@ -135,11 +113,26 @@ class RdmaEndPoint {
    private:
     int disconnectUnlocked();
 
-    // Resets only pre-connected handshake attempts. Once an endpoint has ever
-    // reached CONNECTED, it is retired instead of being reused.
+    // Resets the connection.
+    //
+    // The main difference between this function and `disconnectUnlocked`
+    // is that it will reconstruct QPs when `CONFIG_ERDMA` is defined.
+    // Without `CONFIG_ERDMA`, it is essentially the same as
+    // `disconnectUnlocked` but with additional logging.
+    //
+    // This serves as a workaround for Aliyun eRDMA devices (i.e., once a QP is
+    // transitioned to the RTS state, it cannot be reset to RTS again directly).
+    // For more details:
+    // https://github.com/kvcache-ai/Mooncake/pull/1733#discussion_r2992088663
+    //
+    // In practice:
+    // - Call `resetConnection` if the QPs' state may have transitioned to RTS.
+    // - Call `disconnectUnlocked` otherwise.
+    //
+    // This is mainly used in `setupConnectionsByActive` or
+    // `setupConnectionsByPassive`. It is NOT invoked in the normal execution
+    // flow, so a `reason` argument is passed for internal logging purposes.
     int resetConnection(const std::string &reason);
-    int sendReadyAck(const std::string &peer_server_name,
-                     const HandShakeDesc &local_desc);
 
    public:
     const std::string toString() const;
@@ -169,17 +162,10 @@ class RdmaEndPoint {
         int sys_errno = 0;
     };
 
-    Status status() const { return status_.load(std::memory_order_relaxed); }
-
-    static bool isConnectedStatus(Status status) {
-        return status == CONNECTED_WAIT_READY_ACK || status == CONNECTED;
-    }
-
     std::vector<uint32_t> qpNum() const;
 
     int doSetupConnection(const std::string &peer_gid, uint16_t peer_lid,
                           std::vector<uint32_t> peer_qp_num_list,
-                          Status connected_status = CONNECTED,
                           std::string *reply_msg = nullptr,
                           SetupConnectionFailureInfo *failure_info = nullptr);
 
@@ -190,8 +176,6 @@ class RdmaEndPoint {
 
    private:
     static constexpr uint64_t kWaitExistingHandshakeTimeoutNano =
-        10 * 1000000000ull;  // 10 seconds
-    static constexpr uint64_t kReadyAckTimeoutNano =
         10 * 1000000000ull;  // 10 seconds
     static constexpr uint32_t kWaitExistingHandshakeSpinCount = 500;
     static constexpr uint32_t kWaitExistingHandshakeInitialSleepUs = 50;
@@ -215,17 +199,15 @@ class RdmaEndPoint {
 
     std::string peer_nic_path_;
     std::vector<uint32_t> peer_qp_num_list_;
-    bool has_connected_;
-    std::atomic<uint64_t> ready_wait_start_ts_;
 
-    std::atomic<int> *wr_depth_list_;
+    volatile int *wr_depth_list_;
     int max_wr_depth_;
     size_t max_sge_per_wr_;
     size_t max_inline_bytes_;
 
-    std::atomic<bool> active_;
-    std::atomic<int> *cq_outstanding_;
-    std::atomic<uint64_t> inactive_time_;
+    volatile bool active_;
+    volatile int *cq_outstanding_;
+    volatile uint64_t inactive_time_;
     int finish_destroy_retries_ = 0;
 };
 

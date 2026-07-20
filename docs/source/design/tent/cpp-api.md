@@ -75,7 +75,6 @@ For users migrating from Transfer Engine, the following table shows how TE APIs 
 | `allocateBatchID(batch_size)` | `allocateBatch(batch_size)` | Renamed |
 | `freeBatchID(batch_id)` | `freeBatch(batch_id)` | Renamed |
 | `submitTransfer(batch_id, entries)` | `submitTransfer(batch_id, request_list)` | `TransferRequest` → `Request` |
-| *Not available* | `cancelTransfer(batch_id, task_id)` | TENT-only: best-effort cancellation for queued and RDMA tasks |
 | `submitTransferWithNotify(batch_id, entries, notify_msg)` | `submitTransfer(batch_id, request_list, notifi)` | Unified API with optional notification |
 | `getTransferStatus(batch_id, task_id, status)` | `getTransferStatus(batch_id, task_id, status)` | Same |
 | `getBatchTransferStatus(batch_id, status)` | `getTransferStatus(batch_id, status)` | Overloaded; single `TransferStatus` output = overall status |
@@ -274,24 +273,6 @@ Queries the status of transfer requests.
 - `task_id`: Index of the specific task (for single-task query).
 - `status` / `status_list` / `overall_status`: Output parameter(s) for status.
 - Return value: `Status::OK()` on success; otherwise a non-OK status.
-
-#### TransferEngine::cancelTransfer
-
-```cpp
-Status cancelTransfer(BatchID batch_id, size_t task_id);
-```
-
-Requests best-effort cancellation of one public task. A task still waiting in
-the TENT admission queue becomes `CANCELED` without being dispatched. For RDMA,
-workers suppress slices they observe before `ibv_post_send`; work already
-posted to a QP is allowed to drain and may complete successfully. Consequently,
-the API returning `OK` means the cancellation request was accepted, not that
-the task is already terminal. Continue polling `getTransferStatus` before
-calling `freeBatch`.
-
-Cancellation is idempotent. Merged public tasks share one physical transfer,
-so canceling any alias cancels the shared task. Direct cancellation of staging
-or non-RDMA transport work currently returns `Status::NotImplemented`.
 
 #### TransferEngine::freeBatch
 

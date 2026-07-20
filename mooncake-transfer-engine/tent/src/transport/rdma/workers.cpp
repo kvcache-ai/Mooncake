@@ -16,14 +16,9 @@
 
 #include <sys/epoll.h>
 
-#include <algorithm>
 #include <cassert>
-#include <fstream>
-#include <sstream>
 
-#include "tent/transport/rdma/bw_arbitration.h"
 #include "tent/transport/rdma/endpoint_store.h"
-#include "tent/transport/rdma/promotion_policy.h"
 #include "tent/transport/rdma/shared_quota.h"
 #include "tent/common/utils/ip.h"
 #include "tent/common/utils/string_builder.h"
@@ -35,12 +30,6 @@ namespace tent {
 thread_local int tl_wid = -1;
 
 namespace {
-struct ArbitrationEntry {
-    RdmaSlice* slice;
-    double mlu;
-    size_t order;
-};
-
 // Look up (or create) the RailMonitor for `machine_id` on this worker's
 // map. Returning a stable reference is safe because the map stores values
 // via unique_ptr -- rehashes move the pointer slot, not the RailMonitor.
@@ -55,34 +44,10 @@ RailMonitor& getOrCreateRail(
 }  // namespace
 
 Workers::Workers(RdmaTransport* transport)
-    : transport_(transport),
-      num_workers_(0),
-      running_(false),
-      worker_context_(nullptr) {
+    : transport_(transport), num_workers_(0), running_(false) {
     device_selector_ = std::make_unique<DeviceSelector>();
     device_selector_->loadTopology(transport_->local_topology_);
     auto& conf = transport_->conf_;
-
-    // RailMonitor consumes JSON text, while the public configuration is a file
-    // path. Load it once here instead of reopening the file for every worker
-    // and every remote machine. Invalid/missing files fall back to automatic
-    // topology matching in RailMonitor::load().
-    const auto& rail_topo_path = transport_->params_->workers.rail_topo_path;
-    if (!rail_topo_path.empty()) {
-        std::ifstream input(rail_topo_path);
-        if (!input.is_open()) {
-            LOG(WARNING) << "Unable to open RDMA rail topology file "
-                         << rail_topo_path << "; using automatic rail mapping";
-        } else {
-            std::ostringstream contents;
-            contents << input.rdbuf();
-            rail_topo_json_ = contents.str();
-            if (rail_topo_json_.empty()) {
-                LOG(WARNING) << "RDMA rail topology file " << rail_topo_path
-                             << " is empty; using automatic rail mapping";
-            }
-        }
-    }
 
     // ============================================================
     // Core Scheduling Configuration
@@ -153,16 +118,6 @@ Workers::Workers(RdmaTransport* transport)
     priority_promotion_timeout_ns_ =
         conf->get("transports/rdma/priority_promotion_timeout_us", 10000) *
         1000ull;
-
-    // Opt-in deadline-aware bandwidth arbitration within a priority tier
-    // (RFC #2792). Default false = original FIFO order.
-    deadline_bw_arbitration_ =
-        conf->get("transports/rdma/deadline_bw_arbitration", false);
-
-    // Opt-in per-entry promotion (issue #2528). Default false = historical
-    // head-only "flush the tier" behavior.
-    priority_promotion_per_entry_ =
-        conf->get("transports/rdma/priority_promotion_per_entry", false);
 
     // ============================================================
     // Global Slot Coordination (Multi-Process)
@@ -270,42 +225,8 @@ Status Workers::submit(RdmaSlice* slice) {
     return submit(slice_list);
 }
 
-Status Workers::cancel(RdmaTask* task) {
-    if (!task) return Status::InvalidArgument("Invalid RDMA task" LOC_MARK);
-    if (task->cancel_requested.exchange(true, std::memory_order_acq_rel)) {
-        return Status::OK();
-    }
-    if (!running_.load(std::memory_order_acquire) || !worker_context_ ||
-        !num_workers_) {
-        return Status::OK();
-    }
-    // Wake every worker because one task may have slices distributed across
-    // several queues. Cancellation remains best effort for slices already
-    // posted to a QP; those drain through the normal CQ path.
-    for (size_t id = 0; id < num_workers_; ++id) {
-        auto& worker = worker_context_[id];
-        std::lock_guard<std::mutex> lock(worker.mutex);
-        if (worker.in_suspend) worker.cv.notify_all();
-    }
-    return Status::OK();
-}
-
-bool Workers::cancelUnpostedSlice(WorkerContext& worker, RdmaSlice* slice) {
-    if (!slice || !slice->task ||
-        !slice->task->cancel_requested.load(std::memory_order_acquire))
-        return false;
-    if (slice->word == PENDING) {
-        releaseSliceQuota(slice);
-        updateSliceStatus(slice, CANCELED);
-    }
-    worker.inflight_slices.fetch_sub(1);
-    return true;
-}
-
-void Workers::releaseSliceQuota(RdmaSlice* slice, double latency) {
-    if (!slice || !slice->quota_charged || !device_selector_) return;
-    device_selector_->release(slice->source_dev_id, slice->length, latency);
-    slice->quota_charged = false;
+Status Workers::cancel(RdmaSliceList& slice_list) {
+    return Status::NotImplemented("cancel not implemented" LOC_MARK);
 }
 
 std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
@@ -316,8 +237,8 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
     auto target_id = path.remote_segment_id;
     auto device_id = path.remote_device_id;
 
-    auto status = segment_manager.withCachedSegment(
-        target_id, hint.pin, [&](SegmentDesc* segment) {
+    auto status =
+        segment_manager.withCachedSegment(target_id, [&](SegmentDesc* segment) {
             hint.segment = segment;
             if (segment->type != SegmentType::Memory) {
                 return Status::NeedsRefreshCache(
@@ -403,23 +324,11 @@ void Workers::asyncPostSend() {
         if (slice_list.num_slices == 0) continue;
         auto slice = slice_list.first;
         for (int id = 0; id < slice_list.num_slices; ++id) {
-            if (cancelUnpostedSlice(worker, slice)) {
-                slice = slice->next;
-                continue;
-            }
             auto status = generatePostPath(slice);
             if (!status.ok()) {
                 LOG(ERROR) << "Failed to generate post path for slice " << slice
                            << ": " << status.ToString();
-                releaseSliceQuota(slice);
-                updateSliceStatus(slice, slice->task->cancel_requested.load(
-                                             std::memory_order_acquire)
-                                             ? CANCELED
-                                             : FAILED);
-                worker.inflight_slices.fetch_sub(1);
-            } else if (cancelUnpostedSlice(worker, slice)) {
-                slice = slice->next;
-                continue;
+                updateSliceStatus(slice, FAILED);
             } else {
                 PostPath path{
                     .local_device_id = slice->source_dev_id,
@@ -435,89 +344,29 @@ void Workers::asyncPostSend() {
         auto& path = entry.first;
         auto& slices = entry.second;
         if (slices.empty()) continue;
-        slices.erase(std::remove_if(slices.begin(), slices.end(),
-                                    [&](RdmaSlice* slice) {
-                                        return cancelUnpostedSlice(worker,
-                                                                   slice);
-                                    }),
-                     slices.end());
-        if (slices.empty()) continue;
         auto endpoint = getEndpoint(path);
         if (!endpoint) {
             std::vector<RdmaSlice*> clone;
             slices.swap(clone);
             for (auto slice : clone) {
-                if (cancelUnpostedSlice(worker, slice)) continue;
                 slice->retry_count++;
                 if (slice->retry_count >=
                     transport_->params_->workers.max_retry_count) {
                     LOG(WARNING)
                         << "Slice " << slice << " failed: retry count exceeded";
                     disableEndpoint(slice);
-                    releaseSliceQuota(slice);
                     updateSliceStatus(slice, FAILED);
                 } else {
-                    releaseSliceQuota(slice);
                     submit(slice);
                 }
-                worker.inflight_slices.fetch_sub(1);
             }
             continue;
-        }
-
-        // RFC #2792 (opt-in): these slices all contend for one NIC path
-        // (local NIC -> remote NIC). submitSlices posts as many as the QP
-        // budget allows and returns num_submitted; the rest wait for the next
-        // round. Ordering by deadline urgency here means a flow about to miss
-        // its deadline claims the shared NIC's QP slots ahead of looser flows.
-        // Default (deadline_bw_arbitration_ == false) leaves order untouched,
-        // so behavior is byte-identical to today's FIFO / equal split.
-        if (deadline_bw_arbitration_ && slices.size() > 1) {
-            const uint64_t now_ns = getCurrentTimeInNano();
-            const double bw_bps = device_selector_
-                                      ? device_selector_->getSchedulingParams()
-                                                .default_bandwidth_gbps *
-                                            1e9 / 8.0
-                                      : 0.0;
-            if (bw_bps > 0.0) {
-                thread_local std::vector<ArbitrationEntry> scratch;
-                scratch.clear();
-                scratch.reserve(slices.size());
-
-                for (size_t i = 0; i < slices.size(); ++i) {
-                    const RdmaSlice* s = slices[i];
-                    ArbFlow flow{0, 0};
-                    if (s && s->task) {
-                        flow = ArbFlow{s->task->request.deadline_ns, s->length};
-                    }
-                    scratch.push_back(ArbitrationEntry{
-                        slices[i], PredictedMlu(flow, now_ns, bw_bps), i});
-                }
-
-                std::sort(
-                    scratch.begin(), scratch.end(),
-                    [](const ArbitrationEntry& a, const ArbitrationEntry& b) {
-                        if (a.mlu > b.mlu) return true;
-                        if (a.mlu < b.mlu) return false;
-                        return a.order < b.order;
-                    });
-                for (size_t i = 0; i < scratch.size(); ++i) {
-                    slices[i] = scratch[i].slice;
-                }
-            }
         }
 
         int num_submitted = endpoint->submitSlices(slices, tl_wid);
         for (int id = 0; id < num_submitted; ++id) {
             auto slice = slices[id];
             if (slice->failed) {
-                releaseSliceQuota(slice);
-                if (slice->task->cancel_requested.load(
-                        std::memory_order_acquire)) {
-                    updateSliceStatus(slice, CANCELED);
-                    worker.inflight_slices.fetch_sub(1);
-                    continue;
-                }
                 slice->retry_count++;
                 if (slice->retry_count >=
                     transport_->params_->workers.max_retry_count) {
@@ -528,14 +377,14 @@ void Workers::asyncPostSend() {
                 } else {
                     submit(slice);
                 }
-                worker.inflight_slices.fetch_sub(1);
             } else {
                 slice->submit_ts = getCurrentTimeInNano();
-                worker.inflight_slice_set.insert(slice);
             }
         }
 
         if (num_submitted) {
+            worker.inflight_slice_set.insert(slices.begin(),
+                                             slices.begin() + num_submitted);
             slices.erase(slices.begin(), slices.begin() + num_submitted);
         }
     }
@@ -548,61 +397,40 @@ void Workers::promoteTimedOutRequests(WorkerContext& worker) {
     // Set next check time (1ms from now)
     worker.next_promotion_check_ns = current_ts + 1000000ull;
 
-    // Drain one level, promote the entries the policy selects to `to`, and put
-    // the rest back on `from` in their original order. Returns true if anything
-    // was promoted (used to preserve the historical "one level per tick" stop).
-    auto promote_level = [&](int from, int to) -> bool {
-        std::vector<RdmaSliceList> drained;
-        worker.queues[from].pop(drained);
-        if (drained.empty()) return false;
-
-        if (!priority_promotion_per_entry_) {
-            auto* slice = drained.front().first;
-            const bool head_timed_out = slice && slice->enqueue_ts > 0 &&
-                                        current_ts >= slice->enqueue_ts &&
-                                        (current_ts - slice->enqueue_ts) >=
-                                            priority_promotion_timeout_ns_;
-            for (auto& slice_list : drained) {
-                worker.queues[head_timed_out ? to : from].push(slice_list);
+    // Check MEDIUM -> HIGH promotion
+    std::vector<RdmaSliceList> promoted;
+    worker.queues[PRIO_MEDIUM].pop(promoted);
+    if (!promoted.empty()) {
+        auto* slice = promoted.front().first;
+        if (slice && slice->enqueue_ts > 0 &&
+            (current_ts - slice->enqueue_ts) >=
+                priority_promotion_timeout_ns_) {
+            for (auto& slice_list : promoted) {
+                worker.queues[PRIO_HIGH].push(slice_list);
             }
-            return head_timed_out;
+            return;
         }
-
-        std::vector<uint64_t> enqueue_ts;
-        enqueue_ts.reserve(drained.size());
-        for (auto& slice_list : drained) {
-            auto* slice = slice_list.first;
-            enqueue_ts.push_back(slice ? slice->enqueue_ts : 0);
+        for (auto& slice_list : promoted) {
+            worker.queues[PRIO_MEDIUM].push(slice_list);
         }
-
-        PromotionDecision decision = DecidePromotionPerEntry(
-            enqueue_ts, current_ts, priority_promotion_timeout_ns_);
-
-        if (!decision.promoted_any()) {
-            for (auto& slice_list : drained)
-                worker.queues[from].push(slice_list);
-            return false;
-        }
-
-        std::vector<bool> promote(drained.size(), false);
-        for (size_t idx : decision.promote_indices) {
-            if (idx < drained.size()) promote[idx] = true;
-        }
-        for (size_t i = 0; i < drained.size(); ++i) {
-            worker.queues[promote[i] ? to : from].push(drained[i]);
-        }
-        return true;
-    };
-
-    // Check MEDIUM -> HIGH promotion. Preserve the historical behavior of
-    // handling at most one level per tick when the head-only policy is active;
-    // with per-entry promotion, both levels are considered each tick so a
-    // starving LOW entry is not stalled behind an unrelated MEDIUM promotion.
-    bool promoted_medium = promote_level(PRIO_MEDIUM, PRIO_HIGH);
-    if (promoted_medium && !priority_promotion_per_entry_) return;
+    }
 
     // Check LOW -> MEDIUM promotion
-    promote_level(PRIO_LOW, PRIO_MEDIUM);
+    worker.queues[PRIO_LOW].pop(promoted);
+    if (!promoted.empty()) {
+        auto* slice = promoted.front().first;
+        if (slice && slice->enqueue_ts > 0 &&
+            (current_ts - slice->enqueue_ts) >=
+                priority_promotion_timeout_ns_) {
+            for (auto& slice_list : promoted) {
+                worker.queues[PRIO_MEDIUM].push(slice_list);
+            }
+            return;
+        }
+        for (auto& slice_list : promoted) {
+            worker.queues[PRIO_LOW].push(slice_list);
+        }
+    }
 }
 
 void Workers::asyncPollCq() {
@@ -649,7 +477,10 @@ void Workers::asyncPollCq() {
                 (slice->submit_ts - slice->enqueue_ts) / 1000.0;
             double inflight_lat = (poll_ts - slice->submit_ts) / 1000.0;
             double overall_lat_sec = (poll_ts - slice->enqueue_ts) / 1e9;
-            releaseSliceQuota(slice, overall_lat_sec);
+            if (slice->retry_count == 0) {
+                device_selector_->release(slice->source_dev_id, slice->length,
+                                          overall_lat_sec);
+            }
             if (slice->word != PENDING) continue;
             if (!ep) {
                 updateSliceStatus(slice, FAILED);
@@ -677,12 +508,7 @@ void Workers::asyncPollCq() {
                 } else {
                     num_slices += ep->acknowledge(slice, PENDING);
                     disableEndpoint(slice);
-                    if (slice->task->cancel_requested.load(
-                            std::memory_order_acquire)) {
-                        updateSliceStatus(slice, CANCELED);
-                    } else {
-                        submit(slice);
-                    }
+                    submit(slice);
                 }
             } else {
                 num_slices += ep->acknowledge(slice, COMPLETED);
@@ -821,7 +647,7 @@ Status Workers::getRouteHint(RouteHint& hint, SegmentID segment_id,
                              uint64_t addr, uint64_t length) {
     auto& segment_manager = transport_->metadata_->segmentManager();
     CHECK_STATUS(segment_manager.withCachedSegment(
-        segment_id, hint.pin, [&](SegmentDesc* segment) {
+        segment_id, [&](SegmentDesc* segment) {
             hint.segment = segment;
             hint.buffer = segment->findBuffer(addr, length);
             if (!hint.buffer)
@@ -859,7 +685,6 @@ Status Workers::getRouteHint(RouteHint& hint, SegmentID segment_id,
     auto mem_id = hint.topo->getMemId(location);
     if (mem_id < 0) mem_id = hint.topo->getMemId(kWildcardLocation);
     hint.topo_entry = hint.topo->getMemEntry(mem_id);
-    hint.location = std::move(location);
     return Status::OK();
 }
 
@@ -878,7 +703,6 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
     if (slice->source_dev_id < 0) {
         CHECK_STATUS(device_selector_->allocate(
             slice->length, source.buffer->location, slice->source_dev_id));
-        slice->quota_charged = true;
     }
 
     if (slice->source_dev_id < 0)
@@ -887,7 +711,7 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
 
     auto& rail = getOrCreateRail(worker.rails, target.segment->machine_id);
     if (!rail.ready() || target.topo != rail.remote())
-        rail.load(source.topo, target.topo, rail_topo_json_,
+        rail.load(source.topo, target.topo, /*rail_topo_json=*/"",
                   transport_->conf_.get());
     if (slice->target_dev_id < 0) {
         int mapped_dev_id = rail.findBestRemoteDevice(
@@ -1023,21 +847,6 @@ Status Workers::generatePostPath(RdmaSlice* slice) {
     // lookup on the hot path.
     slice->rail_monitor = &getOrCreateRail(worker_context_[tl_wid].rails,
                                            target.segment->machine_id);
-    if (transport_->params_->log_slice_affinity) {
-        const auto* local_nic = source.topo->getNicEntry(slice->source_dev_id);
-        const auto* remote_nic = target.topo->getNicEntry(slice->target_dev_id);
-        VLOG(1) << "RDMA slice affinity: source_location=" << source.location
-                << ", target_location=" << target.location
-                << ", local_device_name="
-                << (local_nic ? local_nic->name : "<unknown>")
-                << ", peer_device_name="
-                << (remote_nic ? remote_nic->name : "<unknown>")
-                << ", target_id=" << slice->task->request.target_id
-                << ", source_addr=" << static_cast<void*>(slice->source_addr)
-                << ", dest_addr=" << reinterpret_cast<void*>(slice->target_addr)
-                << ", length=" << slice->length
-                << ", retry_count=" << slice->retry_count;
-    }
     return Status::OK();
 }
 }  // namespace tent

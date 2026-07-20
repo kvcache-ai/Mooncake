@@ -84,7 +84,7 @@ TEST_F(TransferTaskTest, MemcpyWorkerPoolBasic) {
     operations.emplace_back(dest_data.data(), src_data.data(), data_size);
 
     // Create and submit task
-    MemcpyTask task(std::move(operations), state);
+    MemcpyTask task(std::move(operations), state, /*trace_id=*/0);
     pool.submitTask(std::move(task));
 
     // Wait for completion
@@ -126,7 +126,7 @@ TEST_F(TransferTaskTest, MemcpyWorkerPoolMultipleOperations) {
     }
 
     // Create and submit task
-    MemcpyTask task(std::move(operations), state);
+    MemcpyTask task(std::move(operations), state, /*trace_id=*/0);
     pool.submitTask(std::move(task));
 
     // Wait for completion

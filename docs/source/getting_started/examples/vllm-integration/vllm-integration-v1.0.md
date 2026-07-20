@@ -1,7 +1,3 @@
----
-orphan: true
----
-
 # vLLM v1 backend Disaggregated Serving with MooncakeConnector
 
 ```{admonition} Archived
@@ -54,7 +50,7 @@ vllm serve Qwen/Qwen2.5-7B-Instruct \
 #### Proxy Server
 
 ```bash
-# In vllm root directory.
+# In vllm root directory. 
 python tests/v1/kv_connector/nixl_integration/toy_proxy_server.py \
   --prefiller-host 192.168.0.2 --prefiller-port 8010 \
   --decoder-host 192.168.0.3 --decoder-port 8020
@@ -127,7 +123,7 @@ The following environment variables can be used to customize Mooncake behavior:
 
 ## Performance
 
-For detailed performance benchmarks and results, see the [vLLM PD Disaggregation Performance](../../../performance/vllm/vllm-v1-pd-performance.md) documentation.
+For detailed performance benchmarks and results, see the [vLLM Benchmark](../../../performance/vllm-v1-support-benchmark.md) documentation.
 
 ## Notes
 

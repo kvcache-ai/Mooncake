@@ -202,27 +202,6 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     int ret = metadata_->addRpcMetaEntry(local_server_name_, desc);
     if (ret) return ret;
 
-    // Universal TCP force mechanism: if MC_FORCE_TCP is set, skip all other
-    // transport installation logic and use TCP transport only. This allows
-    // running metadata-only instances without requiring specialized hardware
-    // (e.g., NPU for Ascend Direct, RDMA HCAs, etc.).
-    if (getenv("MC_FORCE_TCP")) {
-#ifdef USE_TCP
-        Transport* tcp_transport =
-            multi_transports_->installTransport("tcp", nullptr);
-        if (!tcp_transport) {
-            LOG(ERROR)
-                << "MC_FORCE_TCP is set but failed to install TCP transport";
-            return -1;
-        }
-        LOG(INFO) << "MC_FORCE_TCP is set, using TCP transport only";
-        return 0;
-#else
-        LOG(ERROR) << "MC_FORCE_TCP is set but USE_TCP is not compiled in";
-        return -1;
-#endif
-    }
-
 #if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
     Transport* ascend_transport =
         multi_transports_->installTransport("ascend", local_topology_);
@@ -465,8 +444,7 @@ int TransferEngineImpl::uninstallTransport(const std::string& proto) {
     return 0;
 }
 
-#if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
-    !defined(USE_CXI)
+#if defined(USE_CUDA) || defined(USE_MUSA)
 device::P2pTransport* TransferEngineImpl::getOrCreateP2pTransport(
     int num_ranks) {
     if (!p2p_transport_) {
@@ -587,30 +565,24 @@ int TransferEngineImpl::registerLocalMemory(void* addr, size_t length,
                                             const std::string& location,
                                             bool remote_accessible,
                                             bool update_metadata) {
+    if (checkOverlap(addr, length)) {
+        LOG(ERROR)
+            << "Transfer Engine does not support overlapped memory region";
+        return ERR_ADDRESS_OVERLAPPED;
+    }
     if (length == 0) {
         LOG(ERROR)
             << "Transfer Engine does not support zero length memory region";
         return ERR_INVALID_ARGUMENT;
     }
-
-    std::vector<MemoryRegion> regions = {
-        {addr, length, location, remote_accessible}};
-    if (!tryReserveMemoryRegions(regions)) {
-        LOG(ERROR)
-            << "Transfer Engine does not support overlapped memory region";
-        return ERR_ADDRESS_OVERLAPPED;
-    }
-
     for (auto transport : multi_transports_->listTransports()) {
         int ret = transport->registerLocalMemory(
             addr, length, location, remote_accessible, update_metadata);
-        if (ret < 0) {
-            releaseMemoryRegions(regions);
-            return ret;
-        }
+        if (ret < 0) return ret;
     }
 
-    commitMemoryRegions(regions);
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    insertMemoryRegionLocked({addr, length, location, remote_accessible});
     return 0;
 }
 
@@ -748,53 +720,22 @@ int TransferEngineImpl::mp_unregisterLocalMemory(
 
 int TransferEngineImpl::registerLocalMemoryBatch(
     const std::vector<BufferEntry>& buffer_list, const std::string& location) {
-    std::vector<BufferEntry> sorted_buffers = buffer_list;
-    std::sort(sorted_buffers.begin(), sorted_buffers.end(),
-              [](const BufferEntry& lhs, const BufferEntry& rhs) {
-                  return reinterpret_cast<uintptr_t>(lhs.addr) <
-                         reinterpret_cast<uintptr_t>(rhs.addr);
-              });
-
-    for (size_t i = 0; i < sorted_buffers.size(); ++i) {
-        const auto& buffer = sorted_buffers[i];
-        if (buffer.length == 0) {
+    for (auto& buffer : buffer_list) {
+        if (checkOverlap(buffer.addr, buffer.length)) {
             LOG(ERROR)
-                << "Transfer Engine does not support zero length memory region";
-            return ERR_INVALID_ARGUMENT;
-        }
-
-        if (i > 0) {
-            const auto& previous = sorted_buffers[i - 1];
-            auto address = reinterpret_cast<uintptr_t>(buffer.addr);
-            auto previous_address = reinterpret_cast<uintptr_t>(previous.addr);
-            if (address - previous_address < previous.length) {
-                LOG(ERROR) << "Transfer Engine does not support overlapped "
-                              "memory region";
-                return ERR_ADDRESS_OVERLAPPED;
-            }
+                << "Transfer Engine does not support overlapped memory region";
+            return ERR_ADDRESS_OVERLAPPED;
         }
     }
-
-    std::vector<MemoryRegion> regions;
-    regions.reserve(buffer_list.size());
-    for (const auto& buffer : buffer_list) {
-        regions.push_back({buffer.addr, buffer.length, location, true});
-    }
-    if (!tryReserveMemoryRegions(regions)) {
-        LOG(ERROR)
-            << "Transfer Engine does not support overlapped memory region";
-        return ERR_ADDRESS_OVERLAPPED;
-    }
-
     for (auto transport : multi_transports_->listTransports()) {
         int ret = transport->registerLocalMemoryBatch(buffer_list, location);
-        if (ret < 0) {
-            releaseMemoryRegions(regions);
-            return ret;
-        }
+        if (ret < 0) return ret;
     }
 
-    commitMemoryRegions(regions);
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    for (auto& buffer : buffer_list) {
+        insertMemoryRegionLocked({buffer.addr, buffer.length, location, true});
+    }
     return 0;
 }
 
@@ -812,27 +753,51 @@ int TransferEngineImpl::unregisterLocalMemoryBatch(
     return 0;
 }
 
-bool TransferEngineImpl::hasOverlapLocked(uintptr_t addr,
-                                          uint64_t length) const {
-    return hasOverlapInMapLocked(local_memory_regions_, addr, length) ||
-           hasOverlapInMapLocked(registering_memory_regions_, addr, length);
+TransferEngineImpl::MemoryRegionMap::iterator
+TransferEngineImpl::findMemoryRegionContaining(uintptr_t addr) {
+    auto upper = local_memory_regions_.upper_bound(addr);
+    if (upper == local_memory_regions_.begin()) {
+        return local_memory_regions_.end();
+    }
+    auto candidate = std::prev(upper);
+    return overlapWithRegion(addr, 1, candidate->second.addr,
+                             candidate->second.length)
+               ? candidate
+               : local_memory_regions_.end();
 }
 
-bool TransferEngineImpl::hasOverlapInMapLocked(const MemoryRegionMap& regions,
-                                               uintptr_t addr,
-                                               uint64_t length) const {
+TransferEngineImpl::MemoryRegionMap::const_iterator
+TransferEngineImpl::findMemoryRegionContaining(uintptr_t addr) const {
+    auto upper = local_memory_regions_.upper_bound(addr);
+    if (upper == local_memory_regions_.begin()) {
+        return local_memory_regions_.end();
+    }
+    auto candidate = std::prev(upper);
+    return overlapWithRegion(addr, 1, candidate->second.addr,
+                             candidate->second.length)
+               ? candidate
+               : local_memory_regions_.end();
+}
+
+bool TransferEngineImpl::hasOverlapLocked(uintptr_t addr,
+                                          uint64_t length) const {
     if (length == 0) {
         return false;
     }
 
-    auto next = regions.lower_bound(addr);
-    if (next != regions.end() &&
+    auto containing = findMemoryRegionContaining(addr);
+    if (containing != local_memory_regions_.end()) {
+        return true;
+    }
+
+    auto next = local_memory_regions_.lower_bound(addr);
+    if (next != local_memory_regions_.end() &&
         overlapWithRegion(addr, length, next->second.addr,
                           next->second.length)) {
         return true;
     }
 
-    if (next != regions.begin()) {
+    if (next != local_memory_regions_.begin()) {
         auto prev = std::prev(next);
         if (overlapWithRegion(addr, length, prev->second.addr,
                               prev->second.length)) {
@@ -841,45 +806,6 @@ bool TransferEngineImpl::hasOverlapInMapLocked(const MemoryRegionMap& regions,
     }
 
     return false;
-}
-
-bool TransferEngineImpl::tryReserveMemoryRegions(
-    const std::vector<MemoryRegion>& regions) {
-    std::unique_lock<std::shared_mutex> lock(mutex_);
-    std::vector<uintptr_t> reserved;
-    reserved.reserve(regions.size());
-
-    for (const auto& region : regions) {
-        auto addr = reinterpret_cast<uintptr_t>(region.addr);
-        if (hasOverlapLocked(addr, region.length)) {
-            for (auto reserved_addr : reserved) {
-                registering_memory_regions_.erase(reserved_addr);
-            }
-            return false;
-        }
-        registering_memory_regions_[addr] = region;
-        reserved.push_back(addr);
-    }
-    return true;
-}
-
-void TransferEngineImpl::commitMemoryRegions(
-    const std::vector<MemoryRegion>& regions) {
-    std::unique_lock<std::shared_mutex> lock(mutex_);
-    for (const auto& region : regions) {
-        registering_memory_regions_.erase(
-            reinterpret_cast<uintptr_t>(region.addr));
-        insertMemoryRegionLocked(region);
-    }
-}
-
-void TransferEngineImpl::releaseMemoryRegions(
-    const std::vector<MemoryRegion>& regions) {
-    std::unique_lock<std::shared_mutex> lock(mutex_);
-    for (const auto& region : regions) {
-        registering_memory_regions_.erase(
-            reinterpret_cast<uintptr_t>(region.addr));
-    }
 }
 
 void TransferEngineImpl::insertMemoryRegionLocked(const MemoryRegion& region) {

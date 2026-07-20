@@ -292,9 +292,7 @@ Status DeviceSelector::release(int dev_id, uint64_t length, double latency) {
     auto& dev = it->second;
     dev.releaseInflight(length);
 
-    // Cancellation of an unposted slice must release its inflight charge but
-    // has no latency sample from which to learn bandwidth.
-    if (!smart_selection_enabled_ || latency <= 0.0) {
+    if (!smart_selection_enabled_) {
         return Status::OK();
     }
 
@@ -356,14 +354,6 @@ int DeviceSelector::getDevicePriority(int dev_id) const {
         base_index = (base_index + rotation_offset) % num_devices;
     }
     return static_cast<int>(base_index);
-}
-
-double DeviceSelector::getAggregateEwmaBandwidth() const {
-    double total = 0.0;
-    for (const auto& [id, dev] : devices_) {
-        total += dev.getEwmaBandwidth();
-    }
-    return total > 0.0 ? total : -1.0;
 }
 
 }  // namespace tent

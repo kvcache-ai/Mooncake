@@ -125,6 +125,9 @@ class SsdMetricsProvider {
     virtual int64_t getSsdTotalCapacity(
         const std::string& segment_name) const = 0;
     virtual int64_t getSsdUsedBytes(const std::string& segment_name) const = 0;
+    virtual double getDdrUsedRatio(const std::string& segment_name) const {
+        return 0.0;
+    }
 };
 
 /**
@@ -558,9 +561,13 @@ class FreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
     }
 };
 
-class SsdFreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
+class SsdBalanceAllocationStrategy : public RandomAllocationStrategy {
    public:
-    SsdFreeRatioFirstAllocationStrategy() = default;
+    explicit SsdBalanceAllocationStrategy(
+        double ssd_high_watermark = kDefaultSsdHighWatermark,
+        double ddr_admission_watermark = 1.0)
+        : ssd_high_watermark_(ssd_high_watermark),
+          ddr_admission_watermark_(ddr_admission_watermark) {}
 
     tl::expected<std::vector<Replica>, ErrorCode> Allocate(
         const AllocatorManager& allocator_manager, const size_t slice_length,
@@ -583,11 +590,21 @@ class SsdFreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
         std::vector<Replica> replicas;
         replicas.reserve(replica_num);
         std::set<std::string> used_segments;
+        size_t ddr_rejected_count = 0;
 
         // Handle preferred segments first
         for (const auto& preferred_segment : preferred_segments) {
             if (excluded_segments.contains(preferred_segment) ||
                 used_segments.contains(preferred_segment)) {
+                continue;
+            }
+            if (ssd_provider &&
+                isSsdHighWatermark(preferred_segment, ssd_provider)) {
+                continue;
+            }
+            if (ssd_provider &&
+                isDdrHighWatermark(preferred_segment, ssd_provider)) {
+                ddr_rejected_count++;
                 continue;
             }
 
@@ -625,6 +642,13 @@ class SsdFreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
 
             if (excluded_segments.contains(name) ||
                 used_segments.contains(name)) {
+                continue;
+            }
+            if (ssd_provider && isSsdHighWatermark(name, ssd_provider)) {
+                continue;
+            }
+            if (ssd_provider && isDdrHighWatermark(name, ssd_provider)) {
+                ddr_rejected_count++;
                 continue;
             }
 
@@ -673,6 +697,13 @@ class SsdFreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
                 used_segments.contains(name)) {
                 continue;
             }
+            if (ssd_provider && isSsdHighWatermark(name, ssd_provider)) {
+                continue;
+            }
+            if (ssd_provider && isDdrHighWatermark(name, ssd_provider)) {
+                ddr_rejected_count++;
+                continue;
+            }
 
             auto buffer = allocateSingle(allocator_manager, name, slice_length,
                                          generator);
@@ -684,6 +715,9 @@ class SsdFreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
         }
 
         if (replicas.empty()) {
+            if (ddr_rejected_count > 0) {
+                return tl::make_unexpected(ErrorCode::DDR_ADMISSION_REJECTED);
+            }
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
         return replicas;
@@ -694,6 +728,28 @@ class SsdFreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
    private:
     static constexpr size_t kMaxRetryLimit = 100;
     static constexpr size_t kCandidateMultiplier = 6;
+    static constexpr double kDefaultSsdHighWatermark = 0.90;
+
+    const double ssd_high_watermark_;
+    const double ddr_admission_watermark_;
+
+    bool isSsdHighWatermark(const std::string& name,
+                            const SsdMetricsProvider* ssd_provider) const {
+        int64_t total = ssd_provider->getSsdTotalCapacity(name);
+        if (total <= 0) return false;
+        int64_t used = ssd_provider->getSsdUsedBytes(name);
+        double used_ratio =
+            static_cast<double>(used) / static_cast<double>(total);
+        return used_ratio >= ssd_high_watermark_;
+    }
+
+    bool isDdrHighWatermark(const std::string& name,
+                            const SsdMetricsProvider* provider) const {
+        if (ddr_admission_watermark_ <= 0.0 || ddr_admission_watermark_ >= 1.0)
+            return false;
+        double ratio = provider->getDdrUsedRatio(name);
+        return ratio >= ddr_admission_watermark_;
+    }
 
     double getSegmentSsdFreeRatio(
         const std::string& name, const SsdMetricsProvider* ssd_provider) const {
@@ -701,7 +757,6 @@ class SsdFreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
         int64_t total = ssd_provider->getSsdTotalCapacity(name);
         if (total <= 0) return 1.0;
         int64_t used = ssd_provider->getSsdUsedBytes(name);
-        used = std::clamp<int64_t>(used, 0, total);
         int64_t free_bytes = total - used;
         return static_cast<double>(free_bytes) / static_cast<double>(total);
     }
@@ -772,7 +827,8 @@ class CxlAllocationStrategy : public AllocationStrategy {
  * @brief Factory function to create allocation strategy based on type
  */
 inline std::shared_ptr<AllocationStrategy> CreateAllocationStrategy(
-    AllocationStrategyType type) {
+    AllocationStrategyType type, double ssd_high_watermark = 0.90,
+    double ddr_admission_watermark = 1.0) {
     switch (type) {
         case AllocationStrategyType::RANDOM:
             return std::make_shared<RandomAllocationStrategy>();
@@ -780,10 +836,9 @@ inline std::shared_ptr<AllocationStrategy> CreateAllocationStrategy(
             return std::make_shared<FreeRatioFirstAllocationStrategy>();
         case AllocationStrategyType::CXL:
             return std::make_shared<CxlAllocationStrategy>();
-        case AllocationStrategyType::SSD_FREE_RATIO_FIRST:
-            return std::make_shared<SsdFreeRatioFirstAllocationStrategy>();
-        case AllocationStrategyType::LOCAL_FIRST:
-            return std::make_shared<RandomAllocationStrategy>();
+        case AllocationStrategyType::SSD_BALANCE:
+            return std::make_shared<SsdBalanceAllocationStrategy>(
+                ssd_high_watermark, ddr_admission_watermark);
         default:
             return std::make_shared<RandomAllocationStrategy>();
     }

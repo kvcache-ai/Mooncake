@@ -20,10 +20,7 @@
 namespace mooncake {
 namespace tent {
 
-// MTYPE_TPU is appended last so the numeric values of the existing entries are
-// preserved. TPU HBM is not NIC-addressable, so transfers touching it are
-// staged through host DRAM by ProxyManager (see findStagingPolicy).
-enum MemoryType { MTYPE_UNKNOWN, MTYPE_CPU, MTYPE_CUDA, MTYPE_ROCM, MTYPE_TPU };
+enum MemoryType { MTYPE_UNKNOWN, MTYPE_CPU, MTYPE_CUDA, MTYPE_ROCM };
 
 class Platform {
    public:

@@ -18,16 +18,11 @@ def calc_percentiles(data):
         return {'avg_ms': 0, 'p50_ms': 0, 'p95_ms': 0, 'p99_ms': 0}
     import statistics
     sorted_data = sorted(data)
-
+    n = len(sorted_data)
     def get_percentile(p):
-        if len(sorted_data) == 1:
-            return sorted_data[0]
-        rank = (len(sorted_data) - 1) * (p / 100)
-        lower = int(rank)
-        upper = min(lower + 1, len(sorted_data) - 1)
-        weight = rank - lower
-        return sorted_data[lower] * (1.0 - weight) + sorted_data[upper] * weight
-
+        idx = int(n * p / 100)
+        if idx >= n: idx = n - 1
+        return sorted_data[idx]
     return {
         'avg_ms': statistics.mean(data),
         'p50_ms': get_percentile(50),

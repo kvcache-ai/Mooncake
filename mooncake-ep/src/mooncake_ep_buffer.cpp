@@ -1,20 +1,9 @@
 #include <mooncake_ep_buffer.h>
 #include <glog/logging.h>
-#include <algorithm>
-#include <cstdlib>
 #include <sstream>
 #include <transfer_engine.h>
 
 namespace mooncake {
-
-namespace {
-
-int active_qps_per_rank_for_ep(int qps_per_rank, bool is_roce, int cap) {
-    if (!is_roce) return qps_per_rank;
-    return std::min(qps_per_rank, cap);
-}
-
-}  // namespace
 
 // Initialize an RDMA transport: register memory, allocate control buffer,
 // create QPs.  Returns true on success, false if IBGDA is unavailable.
@@ -34,14 +23,6 @@ static bool initRdmaTransport(device::RdmaTransport* t, void* gdr_buffer,
     return ret == 0;
 }
 
-static bool macaHostPhaseFenceCoversPeers() {
-#ifdef MOONCAKE_EP_USE_MACA
-    return true;
-#else
-    return false;
-#endif
-}
-
 MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
                                    int64_t num_ep_buffer_bytes,
                                    TransferEngine* engine)
@@ -50,23 +31,6 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
       num_ep_buffer_bytes(num_ep_buffer_bytes),
       comm_stream(at::cuda::getStreamFromPool(true)) {
     USE_QP_COUNT = MAX_QP_COUNT / num_ranks * num_ranks;
-
-    // Optional runtime override for the RoCE active-QP cap (default 8).
-    // Set MOONCAKE_EP_ACTIVE_QPS_PER_RANK to a value >= the per-rank QP count
-    // (e.g. 256) to effectively disable the cap.
-    if (const char* env = std::getenv("MOONCAKE_EP_ACTIVE_QPS_PER_RANK")) {
-        char* end = nullptr;
-        long v = std::strtol(env, &end, 10);
-        if (end != env && *end == '\0' && v > 0) {
-            active_qps_cap_ = static_cast<int>(v);
-        } else {
-            LOG(WARNING) << "[EP] ignoring invalid "
-                            "MOONCAKE_EP_ACTIVE_QPS_PER_RANK='"
-                         << env << "'";
-        }
-    }
-    LOG(INFO) << "[EP] RoCE active QPs/rank cap = " << active_qps_cap_;
-
     // Get ranks
     CUDA_CHECK(cudaGetDevice(&device_id));
     CUDA_CHECK(cudaDeviceGetAttribute(&clock_rate_khz, cudaDevAttrClockRate,
@@ -184,10 +148,8 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
     BufferPair layout(gdr_buffer, num_max_dispatch_tokens_per_rank, hidden,
                       num_ranks, num_experts);
     EP_HOST_ASSERT(layout.total_bytes <= num_ep_buffer_bytes);
-    int current_buffer_idx = buffer_idx;
-    auto buffer = layout.buffers[current_buffer_idx];
+    auto buffer = layout.buffers[buffer_idx];
     auto next_buffer = layout.buffers[buffer_idx ^= 1];
-    int phase_epoch = ++phase_epochs[current_buffer_idx];
 
     // Wait previous tasks to be finished
     // NOTES: the hook mode will always use the default stream
@@ -236,33 +198,6 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
         rdma_transport_ ? rdma_transport_->qpDevCtxsPtr() : nullptr;
     int32_t* nvlink_avail = p2p_transport_->availableTablePtr();
     void** ipc_ptrs = p2p_transport_->peerPtrsTablePtr();
-    int active_qps_per_rank = active_qps_per_rank_for_ep(
-        USE_QP_COUNT / num_ranks, rdma_transport_ && rdma_transport_->isRoce(),
-        active_qps_cap_);
-
-    auto mark_send_done = [=]() {
-#ifdef MOONCAKE_EP_SPLIT_SEND_RECV
-        mooncake::mark_phase_ack(gdr_buffer, nvlink_avail, ipc_ptrs,
-                                 buffer.rdma_send_signal_buffer, rank,
-                                 num_ranks, phase_epoch, launch_stream);
-#endif
-    };
-
-    auto wait_peer_send_done = [=]() {
-#ifdef MOONCAKE_EP_SPLIT_SEND_RECV
-        mooncake::wait_phase_ack(buffer.rdma_send_signal_buffer, rank,
-                                 num_ranks, phase_epoch, launch_stream,
-                                 timeout_ticks);
-#endif
-    };
-
-    auto mark_and_wait_peer_send_done = [=]() {
-#ifdef MOONCAKE_EP_SPLIT_SEND_RECV
-        mooncake::mark_and_wait_phase_ack(
-            gdr_buffer, nvlink_avail, ipc_ptrs, buffer.rdma_send_signal_buffer,
-            rank, num_ranks, phase_epoch, launch_stream, timeout_ticks);
-#endif
-    };
 
     auto launcher = [=](int phases) {
         mooncake::dispatch(
@@ -277,20 +212,11 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
             topk_idx.data_ptr<int64_t>(), next_buffer.rdma_recv_signal_buffer,
             num_tokens, hidden, num_max_dispatch_tokens_per_rank, num_topk,
             num_experts, rank, num_ranks, use_fp8, workspace, launch_stream,
-            timeout_ticks, phases, active_qps_per_rank);
+            timeout_ticks, phases);
     };
-    if (return_recv_hook) {
-        launcher(LOW_LATENCY_SEND_PHASE);
-        mark_send_done();
-    } else {
-#ifdef MOONCAKE_EP_SPLIT_SEND_RECV
-        launcher(LOW_LATENCY_SEND_PHASE);
-        mark_and_wait_peer_send_done();
-        launcher(LOW_LATENCY_RECV_PHASE);
-#else
-        launcher(LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE);
-#endif
-    }
+    launcher(return_recv_hook
+                 ? LOW_LATENCY_SEND_PHASE
+                 : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
 
     // Wait streams
     std::optional<EventHandle> event;
@@ -299,8 +225,6 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
         // before the stream-wait happens, so in Python API, we must wrap
         // all tensors into the event handle.
         event = EventHandle(launch_stream);
-    } else if (return_recv_hook && macaHostPhaseFenceCoversPeers()) {
-        event = EventHandle(launch_stream);
     } else if (not return_recv_hook) {
         stream_wait(compute_stream, launch_stream);
     }
@@ -308,10 +232,7 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
     // Receiver callback
     std::optional<std::function<void()>> recv_hook = std::nullopt;
     if (return_recv_hook)
-        recv_hook = [=]() {
-            if (!macaHostPhaseFenceCoversPeers()) wait_peer_send_done();
-            launcher(LOW_LATENCY_RECV_PHASE);
-        };
+        recv_hook = [=]() { launcher(LOW_LATENCY_RECV_PHASE); };
 
     // Return values
     return {packed_recv_x,
@@ -363,10 +284,8 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
     BufferPair layout(gdr_buffer, num_max_dispatch_tokens_per_rank, hidden,
                       num_ranks, num_experts);
     EP_HOST_ASSERT(layout.total_bytes <= num_ep_buffer_bytes);
-    int current_buffer_idx = buffer_idx;
-    auto buffer = layout.buffers[current_buffer_idx];
+    auto buffer = layout.buffers[buffer_idx];
     auto next_buffer = layout.buffers[buffer_idx ^= 1];
-    int phase_epoch = ++phase_epochs[current_buffer_idx];
 
     // Wait previous tasks to be finished
     // NOTES: the hook mode will always use the default stream
@@ -397,33 +316,6 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
         rdma_transport_ ? rdma_transport_->qpDevCtxsPtr() : nullptr;
     int32_t* nvlink_avail = p2p_transport_->availableTablePtr();
     void** ipc_ptrs = p2p_transport_->peerPtrsTablePtr();
-    int active_qps_per_rank = active_qps_per_rank_for_ep(
-        USE_QP_COUNT / num_ranks, rdma_transport_ && rdma_transport_->isRoce(),
-        active_qps_cap_);
-
-    auto mark_send_done = [=]() {
-#ifdef MOONCAKE_EP_SPLIT_SEND_RECV
-        mooncake::mark_phase_ack(gdr_buffer, nvlink_avail, ipc_ptrs,
-                                 buffer.rdma_send_signal_buffer, rank,
-                                 num_ranks, phase_epoch, launch_stream);
-#endif
-    };
-
-    auto wait_peer_send_done = [=]() {
-#ifdef MOONCAKE_EP_SPLIT_SEND_RECV
-        mooncake::wait_phase_ack(buffer.rdma_send_signal_buffer, rank,
-                                 num_ranks, phase_epoch, launch_stream,
-                                 timeout_ticks);
-#endif
-    };
-
-    auto mark_and_wait_peer_send_done = [=]() {
-#ifdef MOONCAKE_EP_SPLIT_SEND_RECV
-        mooncake::mark_and_wait_phase_ack(
-            gdr_buffer, nvlink_avail, ipc_ptrs, buffer.rdma_send_signal_buffer,
-            rank, num_ranks, phase_epoch, launch_stream, timeout_ticks);
-#endif
-    };
 
     // Kernel launch
     auto launcher = [=](int phases) {
@@ -438,20 +330,11 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
             next_buffer.rdma_recv_signal_buffer, num_combined_tokens, hidden,
             num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank,
             num_ranks, workspace, launch_stream, timeout_ticks, phases,
-            zero_copy, active_qps_per_rank);
+            zero_copy);
     };
-    if (return_recv_hook) {
-        launcher(LOW_LATENCY_SEND_PHASE);
-        mark_send_done();
-    } else {
-#ifdef MOONCAKE_EP_SPLIT_SEND_RECV
-        launcher(LOW_LATENCY_SEND_PHASE);
-        mark_and_wait_peer_send_done();
-        launcher(LOW_LATENCY_RECV_PHASE);
-#else
-        launcher(LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE);
-#endif
-    }
+    launcher(return_recv_hook
+                 ? LOW_LATENCY_SEND_PHASE
+                 : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
 
     // Wait streams
     std::optional<EventHandle> event;
@@ -460,8 +343,6 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
         // before the stream-wait happens, so in Python API, we must wrap
         // all tensors into the event handle.
         event = EventHandle(launch_stream);
-    } else if (return_recv_hook && macaHostPhaseFenceCoversPeers()) {
-        event = EventHandle(launch_stream);
     } else if (not return_recv_hook) {
         stream_wait(compute_stream, launch_stream);
     }
@@ -469,10 +350,7 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
     // Receiver callback
     std::optional<std::function<void()>> recv_hook = std::nullopt;
     if (return_recv_hook)
-        recv_hook = [=]() {
-            if (!macaHostPhaseFenceCoversPeers()) wait_peer_send_done();
-            launcher(LOW_LATENCY_RECV_PHASE);
-        };
+        recv_hook = [=]() { launcher(LOW_LATENCY_RECV_PHASE); };
 
     // Return values
     return {combined_x, event, recv_hook};
@@ -485,7 +363,7 @@ torch::Tensor MooncakeEpBuffer::get_next_combine_buffer(
 
     auto buffer = layout.buffers[buffer_idx];
     auto dtype = torch::kBFloat16;
-    size_t num_bytes_per_combine_msg = hidden * EP_BF16_SIZE;
+    size_t num_bytes_per_combine_msg = hidden * sizeof(nv_bfloat16);
     auto num_msg_elems =
         static_cast<int>(num_bytes_per_combine_msg / elementSize(dtype));
 

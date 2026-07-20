@@ -31,23 +31,6 @@ int Environ::GetInt(const char* name, int default_value) {
     return default_value;
 }
 
-int64_t Environ::GetInt64(const char* name, int64_t default_value) {
-    const char* val = std::getenv(name);
-    if (val) {
-        char* endptr = nullptr;
-        errno = 0;
-        long long result = std::strtoll(val, &endptr, 10);
-        if (endptr == val || *endptr != '\0' || errno == ERANGE) {
-            std::cerr << "[Mooncake] Warning: invalid value '" << val
-                      << "' for env " << name << ", using default "
-                      << default_value << std::endl;
-            return default_value;
-        }
-        return static_cast<int64_t>(result);
-    }
-    return default_value;
-}
-
 size_t Environ::GetSizeT(const char* name, size_t default_value) {
     const char* val = std::getenv(name);
     if (val) {
@@ -125,26 +108,6 @@ Environ::Environ() {
     path_roundrobin_ = GetBool("MC_PATH_ROUNDROBIN", false);
     with_nvidia_peermem_ = GetBool("WITH_NVIDIA_PEERMEM", true);
     efa_cq_threads_ = GetInt("MC_EFA_CQ_THREADS", 1);
-
-    // AWS / S3 client configuration (consumed by s3_helper.cpp)
-    aws_region_ = GetString("MOONCAKE_AWS_REGION", "");
-    aws_s3_endpoint_ = GetString("MOONCAKE_AWS_S3_ENDPOINT", "");
-    aws_bucket_name_ = GetString("MOONCAKE_AWS_BUCKET_NAME", "");
-    aws_access_key_id_ = GetString("MOONCAKE_AWS_ACCESS_KEY_ID", "");
-    aws_secret_access_key_ = GetString("MOONCAKE_AWS_SECRET_ACCESS_KEY", "");
-    aws_use_virtual_addressing_ =
-        GetBool("MOONCAKE_AWS_USE_VIRTUAL_ADDRESSING", true);
-    aws_use_https_ = GetBool("MOONCAKE_AWS_USE_HTTPS", true);
-    // Empty string preserves "unset" semantics — s3_helper keeps the AWS SDK
-    // default in that case rather than forcing a value.
-    aws_request_checksum_calculation_ =
-        GetString("MOONCAKE_AWS_REQUEST_CHECKSUM_CALCULATION", "");
-    aws_response_checksum_validation_ =
-        GetString("MOONCAKE_AWS_RESPONSE_CHECKSUM_VALIDATION", "");
-    aws_connect_timeout_ms_ =
-        GetInt64("MOONCAKE_AWS_CONNECT_TIMEOUT_MS", 10000);
-    aws_request_timeout_ms_ =
-        GetInt64("MOONCAKE_AWS_REQUEST_TIMEOUT_MS", 30000);
 }
 
 }  // namespace mooncake

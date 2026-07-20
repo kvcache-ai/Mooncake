@@ -87,16 +87,6 @@ struct mlx5gda_qp_devctx {
     uint16_t wq_tail;    // last non-completed wqeid
 };
 
-struct mlx5gda_create_qp_failure {
-    bool valid;
-    uint32_t status;
-    uint32_t syndrome;
-    int sys_errno;
-};
-
-void mlx5gda_reset_create_qp_failure();
-mlx5gda_create_qp_failure mlx5gda_last_create_qp_failure();
-
 struct mlx5gda_qp *mlx5gda_create_rc_qp(struct mlx5dv_pd mpd, void *ctrl_buf,
                                         struct mlx5dv_devx_umem *ctrl_buf_umem,
                                         struct memheap *ctrl_buf_heap,

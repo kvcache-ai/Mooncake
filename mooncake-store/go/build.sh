@@ -41,7 +41,7 @@ CGO_LDFLAGS+=" -L${BUILD_DIR}/mooncake-transfer-engine/src"
 CGO_LDFLAGS+=" -L${BUILD_DIR}/mooncake-transfer-engine/src/common/base"
 CGO_LDFLAGS+=" -L${BUILD_DIR}/mooncake-common"
 CGO_LDFLAGS+=" -L${BUILD_DIR}/mooncake-common/src"
-CGO_LDFLAGS+=" -lmooncake_store -lcachelib_memory_allocator -ltransfer_engine -lbase -lasio -lmooncake_common -lxxhash -lyaml-cpp"
+CGO_LDFLAGS+=" -lmooncake_store -lcachelib_memory_allocator -ltransfer_engine -lbase -lasio -lmooncake_common -lxxhash"
 CGO_LDFLAGS+=" -lstdc++ -lnuma -lglog -lgflags -libverbs -lmlx5 -ljsoncpp -lzstd -lcurl -lm"
 
 if [ -d "/usr/local/cuda/lib64" ]; then
@@ -49,13 +49,6 @@ if [ -d "/usr/local/cuda/lib64" ]; then
 fi
 
 CGO_LDFLAGS+=" -luring"
-
-# KV events publisher (optional; linked when libzmq is installed).
-if ldconfig -p 2>/dev/null | grep -q libzmq \
-    || [ -f /usr/lib/x86_64-linux-gnu/libzmq.so ] \
-    || [ -f /usr/lib/libzmq.so ]; then
-    CGO_LDFLAGS+=" -lzmq"
-fi
 
 if [ "$USE_ETCD" = "ON" ]; then
     if [ "$USE_ETCD_LEGACY" = "ON" ]; then

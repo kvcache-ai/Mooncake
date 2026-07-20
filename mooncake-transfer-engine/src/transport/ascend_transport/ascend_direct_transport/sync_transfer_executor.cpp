@@ -76,10 +76,8 @@ TransferExecutorBase::ExecuteResult SyncTransferExecutor::execute(
                              op_descs, params_.transfer_timeout);
 
     if (status != adxl::SUCCESS) {
-        if (!params_.auto_connect) {
-            disconnect(local_engine_idx, target_adxl_engine_name,
-                       kDefaultDisconnectTime);
-        }
+        disconnect(local_engine_idx, target_adxl_engine_name,
+                   kDefaultDisconnectTime);
         return {.ret = -1, .status = status, .retryable = true};
     }
 

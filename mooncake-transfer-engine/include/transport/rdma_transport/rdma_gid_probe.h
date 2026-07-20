@@ -29,18 +29,9 @@ namespace mooncake {
 enum class AutoGidCandidateClass {
     kNetworkRoutable = 0,
     kNoNetworkRoutable = 1,
-    // Private-range (RFC 1918 / CGNAT) IPv4-mapped GIDs. Split out of the
-    // degraded tier (#2729): datacenter RoCE fabrics routinely address NICs
-    // from 10/8, and such a GID is at worst same-subnet-usable — unlike a
-    // link-local fe80:: GID, which can never work across subnets. The
-    // relative order of all pre-existing tiers is unchanged; only the former
-    // tie between private-range IPv4 and link-local/overlay entries within
-    // "degraded" is split.
-    kNetworkPrivateV4 = 2,
-    kNetworkDegraded = 3,
-    kNoNetworkPrivateV4 = 4,
-    kNoNetworkDegraded = 5,
-    kFallbackNonzero = 6,
+    kNetworkDegraded = 2,
+    kNoNetworkDegraded = 3,
+    kFallbackNonzero = 4,
 };
 
 enum class AutoGidRetryAction {
@@ -81,12 +72,8 @@ inline const char* autoGidCandidateClassToString(
             return "network-routable";
         case AutoGidCandidateClass::kNoNetworkRoutable:
             return "no-network-routable";
-        case AutoGidCandidateClass::kNetworkPrivateV4:
-            return "network-private-v4";
         case AutoGidCandidateClass::kNetworkDegraded:
             return "network-degraded";
-        case AutoGidCandidateClass::kNoNetworkPrivateV4:
-            return "no-network-private-v4";
         case AutoGidCandidateClass::kNoNetworkDegraded:
             return "no-network-degraded";
         case AutoGidCandidateClass::kFallbackNonzero:
@@ -108,26 +95,20 @@ inline std::optional<AutoGidCandidateClass> classifyAutoGidCandidate(
     }
 
     const bool is_roce_v2 = candidate.gid_type == IBV_GID_TYPE_ROCE_V2;
-    // Interface-name-based overlay detection (docker*/cni*/...) is the
-    // reliable demotion signal; a private address range alone is not — DC
-    // RoCE fabrics commonly use 10/8 (#2729).
-    const bool is_overlay_iface = is_roce_v2 && candidate.is_overlay_network;
-    const bool is_private_v4 = is_roce_v2 && !is_overlay_iface &&
-                               candidate.is_ipv4_mapped &&
-                               candidate.is_overlay_ipv4;
+    const bool is_overlay =
+        is_roce_v2 && (candidate.is_overlay_network ||
+                       (candidate.is_ipv4_mapped && candidate.is_overlay_ipv4));
     const bool is_link_local =
         is_roce_v2 && !candidate.is_ipv4_mapped && candidate.is_link_local_ipv6;
-    const bool is_degraded = is_overlay_iface || is_link_local;
+    const bool is_degraded = is_overlay || is_link_local;
 
     if (candidate.has_network_device) {
-        if (is_degraded) return AutoGidCandidateClass::kNetworkDegraded;
-        if (is_private_v4) return AutoGidCandidateClass::kNetworkPrivateV4;
-        return AutoGidCandidateClass::kNetworkRoutable;
+        return is_degraded ? AutoGidCandidateClass::kNetworkDegraded
+                           : AutoGidCandidateClass::kNetworkRoutable;
     }
 
-    if (is_degraded) return AutoGidCandidateClass::kNoNetworkDegraded;
-    if (is_private_v4) return AutoGidCandidateClass::kNoNetworkPrivateV4;
-    return AutoGidCandidateClass::kNoNetworkRoutable;
+    return is_degraded ? AutoGidCandidateClass::kNoNetworkDegraded
+                       : AutoGidCandidateClass::kNoNetworkRoutable;
 }
 
 inline int autoGidCandidateClassPriority(
@@ -137,18 +118,14 @@ inline int autoGidCandidateClassPriority(
             return 0;
         case AutoGidCandidateClass::kNoNetworkRoutable:
             return 1;
-        case AutoGidCandidateClass::kNetworkPrivateV4:
-            return 2;
         case AutoGidCandidateClass::kNetworkDegraded:
-            return 3;
-        case AutoGidCandidateClass::kNoNetworkPrivateV4:
-            return 4;
+            return 2;
         case AutoGidCandidateClass::kNoNetworkDegraded:
-            return 5;
+            return 3;
         case AutoGidCandidateClass::kFallbackNonzero:
-            return 6;
+            return 4;
     }
-    return 7;
+    return 5;
 }
 
 inline std::vector<AutoGidSelection> rankAutoGidCandidates(

@@ -1,16 +1,10 @@
 import random
-import os
 import torch
 import torch.distributed as dist
 from functools import partial
 
 from mooncake.mooncake_ep_buffer import Buffer
 from ep_test_utils import init_dist, bench, bench_kineto, calc_diff, hash_tensor, per_token_cast_back
-
-_USE_MACA = (
-    os.getenv("MOONCAKE_EP_USE_MACA", "").upper() in {"1", "ON", "TRUE", "YES"}
-    or bool(getattr(torch.version, "maca", None))
-)
 
 
 def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
@@ -40,7 +34,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
     hash_value, num_times = 0, 0
     active_ranks = torch.ones((num_tokens, ), dtype=torch.int32, device='cuda')
     for return_recv_hook in (False, True):
-        for dispatch_use_fp8 in ([False] if _USE_MACA else [False, True]):
+        for dispatch_use_fp8 in (False, True):
             num_times += 1
             for i in range((num_times % 2) + 1):
                 packed_recv_x, packed_recv_count, handle, event, hook = \

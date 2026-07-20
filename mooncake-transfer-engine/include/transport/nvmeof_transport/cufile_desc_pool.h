@@ -27,8 +27,6 @@
 
 namespace mooncake {
 
-class CUFileDescPoolTestPeer;
-
 // Wrapper for reusable CUfileBatchHandle_t
 // cuFileBatchIOSetUp is expensive, so we reuse handles (similar to GDS
 // transport)
@@ -42,16 +40,10 @@ struct BatchHandle {
 struct CUFileBatchDesc {
     BatchHandle* batch_handle;  // Pointer to reusable handle from pool
     std::vector<CUfileIOParams_t> io_params;
-    // Completion events returned by cuFile are correlated by cookie and cached
-    // by submission index. cuFileBatchIOGetStatus only returns completed I/Os,
-    // so its output cannot be treated as a positional status snapshot.
     std::vector<CUfileIOEvents_t> io_events;
-    std::vector<CUfileIOEvents_t> polled_events;
 };
 
 class CUFileDescPool {
-    friend class CUFileDescPoolTestPeer;
-
    public:
     explicit CUFileDescPool(size_t max_batch_size = 128);
     ~CUFileDescPool();
@@ -83,9 +75,6 @@ class CUFileDescPool {
     CUFileBatchDesc* getDesc(int idx);
 
    private:
-    static bool cachePolledEvent(std::vector<CUfileIOEvents_t>& io_events,
-                                 const CUfileIOEvents_t& event);
-
     static const size_t MAX_NR_DESC = 256;  // Max number of descriptors
     size_t max_batch_size_;
 

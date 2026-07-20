@@ -75,8 +75,6 @@ class ShmTransport : public Transport {
     virtual Status freeLocalMemory(void *addr, size_t size);
 
    private:
-    friend class ShmTransportTestPeer;
-
     void startTransfer(ShmTask *task, ShmSubBatch *batch);
 
     void *createSharedMemory(const std::string &path, size_t size);
@@ -91,15 +89,14 @@ class ShmTransport : public Transport {
     std::shared_ptr<ControlService> metadata_;
 
     struct OpenedShmEntry {
+        int shm_fd;
         void *shm_addr;
         uint64_t length;
     };
 
-    using RelocateMap = std::unordered_map<uint64_t, OpenedShmEntry>;
-    using HashMap = std::unordered_map<SegmentID, RelocateMap>;
-
-    static bool tryResolve(const RelocateMap &relocate_map, uint64_t &dest_addr,
-                           uint64_t length);
+    using HashMap =
+        std::unordered_map<SegmentID,
+                           std::unordered_map<uint64_t, OpenedShmEntry>>;
 
     RWSpinlock relocate_lock_;
     HashMap relocate_map_;

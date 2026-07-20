@@ -149,8 +149,6 @@ class DeviceSelector {
 
     void printTrafficStats();
 
-    double getAggregateEwmaBandwidth() const;
-
     void fillDevicePriorities();
     int getDevicePriority(int dev_id) const;
 

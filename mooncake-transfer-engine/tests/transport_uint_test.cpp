@@ -17,104 +17,17 @@
 #include <gtest/gtest.h>
 #include <sys/time.h>
 
-#include <array>
-#include <condition_variable>
 #include <cstdlib>
 #include <fstream>
-#include <future>
 #include <iomanip>
 #include <memory>
-#include <mutex>
-#include <utility>
 
 #include "transfer_engine.h"
-#include "transfer_engine_impl.h"
 #include "transport/transport.h"
 
 using namespace mooncake;
 
 namespace mooncake {
-
-class TransferEngineImplTestPeer {
-   public:
-    static void replaceTransports(TransferEngineImpl& engine,
-                                  std::shared_ptr<Transport> transport) {
-        engine.multi_transports_->transport_map_.clear();
-        engine.multi_transports_->transport_map_.emplace("blocking",
-                                                         std::move(transport));
-    }
-};
-
-class BlockingRegistrationTransport : public Transport {
-   public:
-    explicit BlockingRegistrationTransport(int first_registration_result = 0)
-        : first_registration_result_(first_registration_result) {}
-
-    void waitForFirstRegistration() {
-        std::unique_lock<std::mutex> lock(mutex_);
-        cv_.wait(lock, [this] { return first_registration_started_; });
-    }
-
-    void releaseFirstRegistration() {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            release_first_registration_ = true;
-        }
-        cv_.notify_all();
-    }
-
-    int registrationCalls() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return registration_calls_;
-    }
-
-    Status submitTransfer(BatchID,
-                          const std::vector<TransferRequest>&) override {
-        return Status::OK();
-    }
-
-    Status getTransferStatus(BatchID, size_t, TransferStatus&) override {
-        return Status::OK();
-    }
-
-   private:
-    int waitOnFirstRegistration() {
-        std::unique_lock<std::mutex> lock(mutex_);
-        ++registration_calls_;
-        if (registration_calls_ == 1) {
-            first_registration_started_ = true;
-            cv_.notify_all();
-            cv_.wait(lock, [this] { return release_first_registration_; });
-            return first_registration_result_;
-        }
-        return 0;
-    }
-
-    int registerLocalMemory(void*, size_t, const std::string&, bool,
-                            bool) override {
-        return waitOnFirstRegistration();
-    }
-
-    int unregisterLocalMemory(void*, bool) override { return 0; }
-
-    int registerLocalMemoryBatch(const std::vector<BufferEntry>&,
-                                 const std::string&) override {
-        return waitOnFirstRegistration();
-    }
-
-    int unregisterLocalMemoryBatch(const std::vector<void*>&) override {
-        return 0;
-    }
-
-    const char* getName() const override { return "blocking"; }
-
-    std::mutex mutex_;
-    std::condition_variable cv_;
-    int first_registration_result_;
-    int registration_calls_ = 0;
-    bool first_registration_started_ = false;
-    bool release_first_registration_ = false;
-};
 
 class TransportTest : public ::testing::Test {
    protected:
@@ -257,114 +170,6 @@ TEST_F(TransportTest, ReadEmptyFile) {
     EXPECT_EQ(bytesRead, static_cast<ssize_t>(0));
 
     close(fd);
-}
-
-TEST_F(TransportTest, RegisterLocalMemoryBatchRejectsOverlappingBuffers) {
-    TransferEngine engine(false);
-    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
-
-    std::array<char, 256> buffer{};
-    std::vector<BufferEntry> entries = {
-        {buffer.data() + 64, 128},
-        {buffer.data(), 128},
-    };
-
-    EXPECT_EQ(engine.registerLocalMemoryBatch(entries, "cpu:0"),
-              ERR_ADDRESS_OVERLAPPED);
-}
-
-TEST_F(TransportTest, RegisterLocalMemoryBatchRejectsZeroLengthBuffer) {
-    TransferEngine engine(false);
-    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
-
-    std::array<char, 1> buffer{};
-    std::vector<BufferEntry> entries = {
-        {buffer.data(), 0},
-    };
-
-    EXPECT_EQ(engine.registerLocalMemoryBatch(entries, "cpu:0"),
-              ERR_INVALID_ARGUMENT);
-}
-
-TEST_F(TransportTest, RegisterLocalMemoryBatchAllowsAdjacentBuffers) {
-    TransferEngine engine(false);
-    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
-
-    std::array<char, 256> buffer{};
-    std::vector<BufferEntry> entries = {
-        {buffer.data() + 128, 128},
-        {buffer.data(), 128},
-    };
-
-    EXPECT_EQ(engine.registerLocalMemoryBatch(entries, "cpu:0"), 0);
-}
-
-TEST_F(TransportTest, ConcurrentRegisterLocalMemoryRejectsOverlap) {
-    TransferEngineImpl engine(false);
-    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
-    auto transport = std::make_shared<BlockingRegistrationTransport>();
-    TransferEngineImplTestPeer::replaceTransports(engine, transport);
-
-    std::array<char, 128> buffer{};
-    auto first = std::async(std::launch::async, [&] {
-        return engine.registerLocalMemory(buffer.data(), buffer.size(),
-                                          "cpu:0");
-    });
-    transport->waitForFirstRegistration();
-
-    int second =
-        engine.registerLocalMemory(buffer.data(), buffer.size(), "cpu:0");
-    int registration_calls = transport->registrationCalls();
-    transport->releaseFirstRegistration();
-
-    EXPECT_EQ(second, ERR_ADDRESS_OVERLAPPED);
-    EXPECT_EQ(registration_calls, 1);
-    EXPECT_EQ(first.get(), 0);
-    EXPECT_EQ(engine.unregisterLocalMemory(buffer.data()), 0);
-}
-
-TEST_F(TransportTest, ConcurrentRegisterLocalMemoryBatchRejectsOverlap) {
-    TransferEngineImpl engine(false);
-    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
-    auto transport = std::make_shared<BlockingRegistrationTransport>();
-    TransferEngineImplTestPeer::replaceTransports(engine, transport);
-
-    std::array<char, 128> buffer{};
-    std::vector<BufferEntry> entries = {{buffer.data(), buffer.size()}};
-    auto first = std::async(std::launch::async, [&] {
-        return engine.registerLocalMemoryBatch(entries, "cpu:0");
-    });
-    transport->waitForFirstRegistration();
-
-    int second = engine.registerLocalMemoryBatch(entries, "cpu:0");
-    int registration_calls = transport->registrationCalls();
-    transport->releaseFirstRegistration();
-
-    EXPECT_EQ(second, ERR_ADDRESS_OVERLAPPED);
-    EXPECT_EQ(registration_calls, 1);
-    EXPECT_EQ(first.get(), 0);
-    EXPECT_EQ(engine.unregisterLocalMemoryBatch({buffer.data()}), 0);
-}
-
-TEST_F(TransportTest, FailedRegistrationReleasesReservedRegion) {
-    TransferEngineImpl engine(false);
-    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
-    auto transport =
-        std::make_shared<BlockingRegistrationTransport>(ERR_MEMORY);
-    TransferEngineImplTestPeer::replaceTransports(engine, transport);
-
-    std::array<char, 128> buffer{};
-    auto first = std::async(std::launch::async, [&] {
-        return engine.registerLocalMemory(buffer.data(), buffer.size(),
-                                          "cpu:0");
-    });
-    transport->waitForFirstRegistration();
-    transport->releaseFirstRegistration();
-
-    EXPECT_EQ(first.get(), ERR_MEMORY);
-    EXPECT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size(), "cpu:0"),
-              0);
-    EXPECT_EQ(engine.unregisterLocalMemory(buffer.data()), 0);
 }
 }  // namespace mooncake
 

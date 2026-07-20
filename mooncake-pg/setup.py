@@ -28,37 +28,13 @@ module_name = "mooncake.pg" + version_suffix
 
 abi_flag = int(torch._C._GLIBCXX_USE_CXX11_ABI)
 current_dir = os.path.abspath(os.path.dirname(__file__))
-repo_dir = os.path.abspath(os.path.join(current_dir, os.pardir))
-sysroot_dir = os.path.join(repo_dir, ".deps", "sysroot", "usr")
-
-
-def existing_dirs(*paths):
-    return [path for path in paths if os.path.isdir(path)]
-
-
-sysroot_include_dirs = existing_dirs(
-    os.path.join(sysroot_dir, "include"),
-    os.path.join(sysroot_dir, "include", "jsoncpp"),
-    os.path.join(sysroot_dir, "include", "libnl3"),
-)
-sysroot_library_dirs = existing_dirs(
-    os.path.join(sysroot_dir, "lib", "x86_64-linux-gnu"),
-    os.path.join(sysroot_dir, "lib"),
-)
 
 abi_define = f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}"
 cxx_args = [abi_define, "-std=c++20", "-O3", "-g0"]
 
 cuda_libraries = ["ibverbs", "mlx5"]
 cuda_library_dirs = []
-include_dirs = [
-    os.path.join(current_dir, "include"),
-    os.path.join(current_dir, "../mooncake-transfer-engine/include"),
-]
-use_maca = (
-    os.getenv("MOONCAKE_EP_USE_MACA", "").upper() in {"1", "ON", "TRUE", "YES"}
-    or (hasattr(torch.version, "maca") and torch.version.maca is not None)
-)
+use_maca = hasattr(torch.version, "maca") and torch.version.maca is not None
 
 if use_musa:
     musa_defines = ["-DUSE_MUSA", "-DMOONCAKE_EP_USE_MUSA=1"]
@@ -74,10 +50,7 @@ if use_musa:
     ]
 else:
     if use_maca:
-        cuda_libraries = []
-        cuda_library_dirs = sysroot_library_dirs.copy()
-        include_dirs += sysroot_include_dirs
-        cxx_args += ["-DUSE_MACA", "-DMOONCAKE_EP_USE_MACA=1"]
+        cxx_args.append("-DUSE_MACA")
     device_args = [
         abi_define,
         "-std=c++20",
@@ -87,10 +60,10 @@ else:
         "-g0",
     ]
     if use_maca:
-        device_args += ["-DUSE_MACA", "-DMOONCAKE_EP_USE_MACA=1"]
+        device_args.append("-DUSE_MACA")
     # Link against the CUDA driver stub library if available.
     # Same approach as mooncake-ep/setup.py.
-    if not use_maca and CUDA_HOME is not None:
+    if CUDA_HOME is not None:
         cuda_stub_dir = os.path.join(CUDA_HOME, "lib64", "stubs")
         cuda_stub_lib = os.path.join(cuda_stub_dir, "libcuda.so")
         if os.path.exists(cuda_stub_lib):
@@ -102,7 +75,10 @@ setup(
     ext_modules=[
         CUDAExtension(
             name=module_name,
-            include_dirs=include_dirs,
+            include_dirs=[
+                os.path.join(current_dir, "include"),
+                os.path.join(current_dir, "../mooncake-transfer-engine/include"),
+            ],
             sources=[
                 "src/pg_py.cpp",
                 "src/mooncake_backend.cpp",

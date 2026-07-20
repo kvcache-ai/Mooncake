@@ -30,9 +30,7 @@ class DummyClient : public PyClient {
                    const std::string &ipc_socket_path,
                    bool enable_ssd_offload = false,
                    const std::string &ssd_offload_path = "",
-                   const std::string &tenant_id = "default",
-                   bool enable_client_http_server = false,
-                   int client_http_port = DEFAULT_CLIENT_HTTP_PORT) {
+                   const std::string &tenant_id = "default") {
         // Dummy client does not support real setup
         return -1;
     };
@@ -131,6 +129,14 @@ class DummyClient : public PyClient {
                      const ReplicateConfig &config = ReplicateConfig{});
 
     [[nodiscard]] std::string get_hostname() const;
+
+    struct RegisteredBufferInfo {
+        void *ptr;
+        size_t size;
+        bool is_local;
+    };
+
+    std::vector<RegisteredBufferInfo> get_registered_buffers() const;
 
     // Check if a pointer falls within the hot cache shm region
     bool is_hot_cache_ptr(const void *ptr) const {

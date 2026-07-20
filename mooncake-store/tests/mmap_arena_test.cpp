@@ -651,11 +651,10 @@ TEST_F(MmapArenaTest, PagesArePhysicallyBackedAfterInit) {
                      << "), falling back to read-verification";
         // Read every page — if MAP_POPULATE didn't work, this would trigger
         // page faults (which is fine for CPU but would crash GPU DMA).
-        char sum = 0;
+        volatile char sink = 0;
         for (size_t off = 0; off < pool_size; off += sys_page_size) {
-            sum += static_cast<char*>(base)[off];
+            sink += static_cast<char*>(base)[off];
         }
-        volatile char sink = sum;
         (void)sink;
         // If we get here without SIGSEGV, at least CPU access works.
         // The real MAP_POPULATE guarantee is that DMA works too, which

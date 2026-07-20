@@ -1,5 +1,4 @@
 #include "master_service.h"
-#include "master_snapshot_manager.h"
 #include "master_metric_manager.h"
 #include "ha/snapshot/catalog/snapshot_catalog_store.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
@@ -116,57 +115,28 @@ class SnapshotChildProcessTest : public ::testing::Test {
     // Helper wrappers for private methods (friend access)
     std::string CallFormatTimestamp(
         const std::chrono::system_clock::time_point& tp) {
-        // FormatTimestamp is now in MasterSnapshotManager
-        if (service_->snapshot_manager_) {
-            return service_->snapshot_manager_->FormatTimestamp(tp);
-        }
-        // Fallback for tests without snapshot_manager_
-        auto temp_manager = CreateTempSnapshotManager();
-        return temp_manager->FormatTimestamp(tp);
+        return service_->FormatTimestamp(tp);
     }
 
     void CallHandleChildExit(pid_t pid, int status,
                              const std::string& snapshot_id) {
-        if (service_->snapshot_manager_) {
-            service_->snapshot_manager_->HandleChildExit(pid, status,
-                                                         snapshot_id);
-        } else {
-            auto temp_manager = CreateTempSnapshotManager();
-            temp_manager->HandleChildExit(pid, status, snapshot_id);
-        }
+        service_->HandleChildExit(pid, status, snapshot_id);
     }
 
     void CallHandleChildTimeout(pid_t pid, const std::string& snapshot_id) {
-        if (service_->snapshot_manager_) {
-            service_->snapshot_manager_->HandleChildTimeout(pid, snapshot_id);
-        } else {
-            auto temp_manager = CreateTempSnapshotManager();
-            temp_manager->HandleChildTimeout(pid, snapshot_id);
-        }
+        service_->HandleChildTimeout(pid, snapshot_id);
     }
 
     void CallCleanupOldSnapshot(int keep_count,
                                 const std::string& snapshot_id) {
-        if (service_->snapshot_manager_) {
-            service_->snapshot_manager_->CleanupOldSnapshot(keep_count,
-                                                            snapshot_id);
-        } else {
-            auto temp_manager = CreateTempSnapshotManager();
-            temp_manager->CleanupOldSnapshot(keep_count, snapshot_id);
-        }
+        service_->CleanupOldSnapshot(keep_count, snapshot_id);
     }
 
     tl::expected<void, SerializationError> CallUploadSnapshotPayloadFile(
         const std::vector<uint8_t>& data, const std::string& path,
         const std::string& local_filename, const std::string& snapshot_id) {
-        if (service_->snapshot_manager_) {
-            return service_->snapshot_manager_->UploadSnapshotPayloadFile(
-                data, path, local_filename, snapshot_id);
-        } else {
-            auto temp_manager = CreateTempSnapshotManager();
-            return temp_manager->UploadSnapshotPayloadFile(
-                data, path, local_filename, snapshot_id);
-        }
+        return service_->UploadSnapshotPayloadFile(data, path, local_filename,
+                                                   snapshot_id);
     }
 
     SnapshotObjectStore* GetSnapshotObjectStore() {
@@ -179,22 +149,12 @@ class SnapshotChildProcessTest : public ::testing::Test {
 
     tl::expected<void, SerializationError> CallPersistState(
         const std::string& snapshot_id) {
-        if (service_->snapshot_manager_) {
-            return service_->snapshot_manager_->PersistState(snapshot_id);
-        } else {
-            auto temp_manager = CreateTempSnapshotManager();
-            return temp_manager->PersistState(snapshot_id);
-        }
+        return service_->PersistState(snapshot_id);
     }
 
     tl::expected<void, SerializationError> CallPersistState(
         const ha::SnapshotDescriptor& descriptor) {
-        if (service_->snapshot_manager_) {
-            return service_->snapshot_manager_->PersistState(descriptor);
-        } else {
-            auto temp_manager = CreateTempSnapshotManager();
-            return temp_manager->PersistState(descriptor);
-        }
+        return service_->PersistState(descriptor);
     }
 
     bool GetUseSnapshotBackupDir() {
@@ -244,47 +204,6 @@ class SnapshotChildProcessTest : public ::testing::Test {
             }
         }
         return key + "_group";
-    }
-
-   private:
-    // Helper to create a temporary snapshot manager for tests
-    std::unique_ptr<MasterSnapshotManager> CreateTempSnapshotManager() {
-        EnsureSnapshotStores();
-
-        MasterSnapshotManagerOptions options;
-        options.enable_snapshot = true;
-        options.snapshot_interval_seconds =
-            service_->snapshot_interval_seconds_;
-        options.snapshot_child_timeout_seconds =
-            service_->snapshot_child_timeout_seconds_;
-        options.snapshot_retention_count = service_->snapshot_retention_count_;
-        options.snapshot_backup_dir = service_->snapshot_backup_dir_;
-        options.use_snapshot_backup_dir = service_->use_snapshot_backup_dir_;
-        options.snapshot_catalog_store_type =
-            service_->snapshot_catalog_store_type_;
-        options.snapshot_catalog_store_connstring =
-            service_->snapshot_catalog_store_connstring_;
-        options.ha_backend_type = service_->ha_backend_type_;
-        options.ha_backend_connstring = service_->ha_backend_connstring_;
-        options.cluster_id = service_->cluster_id_;
-        options.enable_ha = service_->enable_ha_;
-
-        return std::make_unique<MasterSnapshotManager>(
-            service_.get(), options, service_->snapshot_mutex_,
-            service_->snapshot_object_store_.get(),
-            service_->snapshot_catalog_store_.get());
-    }
-
-    void EnsureSnapshotStores() {
-        if (!service_->snapshot_object_store_) {
-            service_->snapshot_object_store_ = SnapshotObjectStore::Create(
-                SnapshotObjectStoreType::LOCAL_FILE);
-        }
-        if (!service_->snapshot_catalog_store_ &&
-            service_->snapshot_object_store_) {
-            service_->snapshot_catalog_store_ =
-                service_->CreateSnapshotCatalogStore();
-        }
     }
 
    private:
@@ -440,33 +359,6 @@ TEST_F(SnapshotChildProcessTest, UploadSnapshotPayloadFile_Success) {
 }
 
 // ========== Auto Snapshot Thread ==========
-
-TEST_F(SnapshotChildProcessTest, DestructorInterruptsSnapshotThreadSleep) {
-    auto config = MasterServiceConfigBuilder()
-                      .set_enable_snapshot(true)
-                      .set_enable_snapshot_restore(false)
-                      .set_snapshot_backup_dir(tmp_dir() + "/backup")
-                      .set_snapshot_interval_seconds(30)
-                      .set_snapshot_child_timeout_seconds(60)
-                      .set_snapshot_retention_count(3)
-                      .set_snapshot_object_store_type("local")
-                      .build();
-    auto auto_service = std::make_unique<MasterService>(config);
-
-    // Let the background thread enter its snapshot interval wait.
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-    const auto destroy_start = std::chrono::steady_clock::now();
-    auto_service.reset();
-    const auto elapsed_ms =
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - destroy_start)
-            .count();
-
-    EXPECT_LT(elapsed_ms, 5000)
-        << "MasterService shutdown should not wait for the full snapshot "
-           "interval";
-}
 
 TEST_F(SnapshotChildProcessTest, AutoSnapshot_GeneratesFiles) {
     // Create a service with snapshot enabled and short interval

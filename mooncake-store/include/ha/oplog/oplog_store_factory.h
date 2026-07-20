@@ -2,7 +2,6 @@
 #pragma once
 
 #include <algorithm>
-#include <cctype>
 #include <memory>
 #include <string>
 
@@ -32,8 +31,7 @@ static constexpr OpLogStoreType kDefaultOpLogStoreType =
 // Returns kDefaultOpLogStoreType for unrecognized strings.
 inline OpLogStoreType ParseOpLogStoreType(const std::string& type_str) {
     std::string lower = type_str;
-    std::transform(lower.begin(), lower.end(), lower.begin(),
-                   [](unsigned char c) -> char { return std::tolower(c); });
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
     if (lower == "localfs" || lower == "local_fs") {
         return OpLogStoreType::LOCAL_FS;
     }

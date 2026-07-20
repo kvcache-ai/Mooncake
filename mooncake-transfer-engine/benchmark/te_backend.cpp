@@ -17,7 +17,6 @@
 #include "te_backend.h"
 #include "utils.h"
 #include "common.h"
-#include "char_util.h"
 
 #if defined(USE_CUDA)
 #include <bits/stdint-uintn.h>
@@ -51,7 +50,7 @@ static inline int getCudaDeviceNumaID(int cuda_id) {
         LOG(WARNING) << "cudaDeviceGetPCIBusId: " << cudaGetErrorString(err);
         return 0;
     }
-    for (char* ch = pci_bus_id; (*ch = to_lower(*ch)); ch++);
+    for (char* ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
     return getNumaNodeFromPciDevice(pci_bus_id);
 }
 #elif defined(USE_SUNRISE)
@@ -64,7 +63,7 @@ static inline int getSunriseDeviceNumaID(int dev_id) {
                      << tangGetErrorString(err);
         return 0;
     }
-    for (char* ch = pci_bus_id; (*ch = to_lower(*ch)); ch++);
+    for (char* ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
     std::string sysfs_path =
         "/sys/bus/pci/devices/" + std::string(pci_bus_id) + "/numa_node";
     std::ifstream numa_file(sysfs_path);
@@ -292,7 +291,7 @@ void TEBenchRunner::pinThread(int thread_id) {
             (thread_id % static_cast<int>(pinned_buffer_list_.size()));
         auto err = cudaSetDevice(device_id);
         LOG_ASSERT(err == cudaSuccess)
-            << "cudaSetDevice failed before getMemoryLocation: "
+            << "tangSetDevice failed before getMemoryLocation: "
             << cudaGetErrorString(err) << " device_id=" << device_id;
     }
 #endif
@@ -349,9 +348,7 @@ int TEBenchRunner::runInitiatorTasks(
 double TEBenchRunner::runSingleTransfer(uint64_t local_addr,
                                         uint64_t target_addr,
                                         uint64_t block_size,
-                                        uint64_t batch_size, OpCode opcode,
-                                        uint64_t deadline_ns) {
-    (void)deadline_ns;
+                                        uint64_t batch_size, OpCode opcode) {
     auto batch_id = engine_->allocateBatchID(batch_size);
     std::vector<TransferRequest> requests;
     for (uint64_t i = 0; i < batch_size; ++i) {

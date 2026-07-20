@@ -16,12 +16,15 @@
 #define URMA_ENDPOINT_H
 #include <atomic>
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <utility>
 #include "common.h"
 #include "config.h"
 #include "urma_api.h"
+#include "urma_ubagg.h"
 #include "transport/kunpeng_transport/ub_context.h"
 #include "transport/kunpeng_transport/ub_endpoint.h"
 
@@ -78,13 +81,14 @@ class UrmaContext : public UbContext {
     urma_jfc_t* jfc();
     urma_jfr_t* jfr();
     urma_jfce_t* JFCE();
+    urma_transport_mode_t transMode() const { return trans_mode_; }
     static bool uninit();
     static bool init();
 
    private:
     int construct(GlobalConfig& config) override;
     int deconstruct() override;
-    int openDevice(const std::string& device_name, uint8_t port,
+    int openDevice(const std::string& device_name, int8_t port,
                    int& eid_index) override;
 
     urma_target_seg_t* seg(uint64_t addr);
@@ -129,6 +133,7 @@ class UrmaContext : public UbContext {
     std::vector<urma_target_seg_t*> local_tseg_list_;
     std::vector<urma_seg_t*> remote_seg_list_;
     std::vector<urma_target_seg_t*> imported_seg_list_;
+    std::shared_mutex import_tseg_mutex_;
 
     std::vector<UrmaJFR> jfr_list_;
 
@@ -146,6 +151,8 @@ class UrmaContext : public UbContext {
 
     urma_import_seg_flag_t import_flag_ = mooncake::import_flag;
     std::unordered_map<std::string, urma_target_seg_t*> import_tseg_map;
+
+    urma_transport_mode_t trans_mode_ = URMA_TM_RM;
 };
 
 // define the UrmaEndpoint class

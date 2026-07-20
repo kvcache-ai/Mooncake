@@ -207,16 +207,6 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
                   << engine_->getLocalTopology()->getHcaList().size()
                   << " devices.";
     }
-#elif defined(USE_CXI)
-
-    bool use_cxi = (proto == "cxi");
-    engine_ = std::make_unique<TransferEngine>(false, device_filter);
-    if (use_cxi) {
-        engine_->getLocalTopology()->discover(device_filter);
-        LOG(INFO) << "Topology discovery complete for CXI. Found "
-                  << engine_->getLocalTopology()->getHcaList().size()
-                  << " devices.";
-    }
 #else
     engine_ = std::make_unique<TransferEngine>(true, device_filter);
 #endif
@@ -250,29 +240,6 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
         // (RDMA QP creation fails on EFA devices).
         LOG(INFO)
             << "Installing TCP transport (auto_discover disabled in EFA build)";
-        auto transport = engine_->installTransport("tcp", nullptr);
-        if (!transport) {
-            LOG(ERROR) << "Failed to install TCP transport";
-            return -1;
-        }
-        LOG(INFO) << "TCP transport installed successfully";
-    }
-#elif defined(USE_CXI)
-    if (use_cxi) {
-        LOG(INFO)
-            << "Installing CXI transport as requested by protocol parameter";
-        auto transport = engine_->installTransport("cxi", nullptr);
-        if (!transport) {
-            LOG(ERROR) << "Failed to install CXI transport";
-            return -1;
-        }
-        LOG(INFO) << "CXI transport installed successfully";
-    } else {
-        // For non-EFA protocols (e.g. TCP), manually install TCP transport
-        // since auto_discover is disabled to prevent RDMA installation
-        // (RDMA QP creation fails on EFA devices).
-        LOG(INFO)
-            << "Installing TCP transport (auto_discover disabled in CXI build)";
         auto transport = engine_->installTransport("tcp", nullptr);
         if (!transport) {
             LOG(ERROR) << "Failed to install TCP transport";
@@ -639,9 +606,7 @@ batch_id_t TransferEnginePy::batchTransferAsync(
             handle = handle_map_[target_hostname];
         } else {
             handle = engine_->openSegment(target_hostname);
-            // batch_id_t is unsigned; 0 is the documented failure sentinel
-            // (-1 would surface as 2^64 - 1 in Python).
-            if (handle == (Transport::SegmentHandle)-1) return 0;
+            if (handle == (Transport::SegmentHandle)-1) return -1;
             handle_map_[target_hostname] = handle;
         }
     }
@@ -765,9 +730,7 @@ batch_id_t TransferEnginePy::transferSubmitWrite(
             handle = handle_map_[target_hostname];
         } else {
             handle = engine_->openSegment(target_hostname);
-            // batch_id_t is unsigned; 0 is the documented failure sentinel
-            // (-1 would surface as 2^64 - 1 in Python).
-            if (handle == (Transport::SegmentHandle)-1) return 0;
+            if (handle == (Transport::SegmentHandle)-1) return -1;
             handle_map_[target_hostname] = handle;
         }
     }
@@ -782,10 +745,7 @@ batch_id_t TransferEnginePy::transferSubmitWrite(
     entry.transport_hint = parseTransportHint(transport_hint);
 
     Status s = engine_->submitTransfer(batch_id, {entry});
-    if (!s.ok()) {
-        engine_->freeBatchID(batch_id);
-        return 0;
-    }
+    if (!s.ok()) return -1;
 
     return batch_id;
 }

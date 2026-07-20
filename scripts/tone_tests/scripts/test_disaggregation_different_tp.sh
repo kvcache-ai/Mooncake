@@ -16,20 +16,11 @@ run_test()
     local log_file="${BASE_DIR}/${TEST_CASE_RESULT_PATH}/${test_case_name}.log"
 
     echo "Running tests in container and saving output to: $log_file"
-
-    # Use local HF cache (offline) only when both models are already downloaded.
-    local off_mla=$(hf_offline_prefix "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct")
-    local off_llama=$(hf_offline_prefix "meta-llama/Llama-3.2-3B-Instruct")
-    local offline_prefix=""
-    if [ -n "$off_mla" ] && [ -n "$off_llama" ]; then
-        offline_prefix="$off_mla"
-    fi
-
     ${docker_exec} "\
-        cd /sgl-workspace/sglang/test/registered/disaggregation && \
+        cd /sgl-workspace/sglang/test/registered/distributed && \
         sed -i '0,/^class /s|^class |DEFAULT_MODEL_NAME_FOR_TEST_MLA = \"deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct\"\nDEFAULT_MODEL_NAME_FOR_TEST = \"meta-llama/Llama-3.2-3B-Instruct\"\n&|' test_disaggregation_different_tp.py && \
         echo 'Model override applied successfully' && \
-        ${offline_prefix}python3 -m pytest test_disaggregation_different_tp.py -v -s --tb=long" | tee "$log_file"
+        python3 -m pytest test_disaggregation_different_tp.py -v -s --tb=long" | tee "$log_file"
     
     return ${PIPESTATUS[0]}
 }

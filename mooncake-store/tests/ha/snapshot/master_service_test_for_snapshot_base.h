@@ -1,7 +1,6 @@
 #pragma once
 
 #include "master_service.h"
-#include "master_snapshot_manager.h"
 #include "master_metric_manager.h"
 #include "segment.h"
 #include "ha/snapshot/catalog/snapshot_catalog_store.h"
@@ -55,7 +54,6 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         // eviction behavior inconsistency and snapshot comparison failures
         MasterMetricManager::instance().reset_allocated_mem_size();
         MasterMetricManager::instance().reset_total_mem_capacity();
-        MasterMetricManager::instance().reset_cache_total_nums();
 
         // Create a unique temporary directory for this test
         namespace fs = std::filesystem;
@@ -160,55 +158,11 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
 
     // ==================== Snapshot Helper Methods ====================
 
-    // Wrapper method: Call MasterSnapshotManager's PersistState through
-    // MasterService This class is a friend of MasterService, so it can access
-    // private members
+    // Wrapper method: Call MasterService's private method PersistState
+    // This class is a friend of MasterService, so it can access private members
     static tl::expected<void, SerializationError> CallPersistState(
         MasterService* service, const std::string& snapshot_id) {
-        // If snapshot_manager_ exists, use it; otherwise create a temporary one
-        if (service->snapshot_manager_) {
-            return service->snapshot_manager_->PersistState(snapshot_id);
-        }
-
-        // For tests that don't have snapshot_manager_ initialized,
-        // we need to access the old implementation or create a temporary
-        // manager This is a temporary compatibility layer for tests
-        EnsureSnapshotStores(service);
-
-        MasterSnapshotManagerOptions options;
-        options.enable_snapshot = true;
-        options.snapshot_interval_seconds = 300;
-        options.snapshot_child_timeout_seconds = 300;
-        options.snapshot_retention_count = 3;
-        options.snapshot_backup_dir = "";
-        options.use_snapshot_backup_dir = false;
-        options.snapshot_catalog_store_type =
-            service->snapshot_catalog_store_type_;
-        options.snapshot_catalog_store_connstring =
-            service->snapshot_catalog_store_connstring_;
-        options.ha_backend_type = service->ha_backend_type_;
-        options.ha_backend_connstring = service->ha_backend_connstring_;
-        options.cluster_id = service->cluster_id_;
-        options.enable_ha = service->enable_ha_;
-
-        auto temp_manager = std::make_unique<MasterSnapshotManager>(
-            service, options, service->snapshot_mutex_,
-            service->snapshot_object_store_.get(),
-            service->snapshot_catalog_store_.get());
-
-        return temp_manager->PersistState(snapshot_id);
-    }
-
-    static void EnsureSnapshotStores(MasterService* service) {
-        if (!service->snapshot_object_store_) {
-            service->snapshot_object_store_ = SnapshotObjectStore::Create(
-                SnapshotObjectStoreType::LOCAL_FILE);
-        }
-        if (!service->snapshot_catalog_store_ &&
-            service->snapshot_object_store_) {
-            service->snapshot_catalog_store_ =
-                service->CreateSnapshotCatalogStore();
-        }
+        return service->PersistState(snapshot_id);
     }
 
     // Generate unique snapshot ID (timestamp format)
@@ -838,10 +792,19 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
             << "Use 'service_.reset(new MasterService(...))' instead of "
                "'std::unique_ptr<MasterService> service_(...)'";
 
+        // Ensure snapshot_object_store_ is initialized for PersistState
         // Some test configs may not enable snapshot/restore, so the backend
         // is not created in the constructor. We create it here for TearDown
         // validation.
-        EnsureSnapshotStores(service_.get());
+        if (!service_->snapshot_object_store_) {
+            service_->snapshot_object_store_ = SnapshotObjectStore::Create(
+                SnapshotObjectStoreType::LOCAL_FILE);
+        }
+        if (!service_->snapshot_catalog_store_ &&
+            service_->snapshot_object_store_) {
+            service_->snapshot_catalog_store_ =
+                service_->CreateSnapshotCatalogStore();
+        }
 
         // Test snapshot and restore functionality for all test cases
         TestSnapshotAndRestore(service_);

@@ -1,4 +1,4 @@
-#include "aligned_client_buffer.h"
+#include "aligned_client_buffer.hpp"
 
 #include <glog/logging.h>
 #include <sys/mman.h>
@@ -8,19 +8,13 @@
 
 #include "utils.h"
 
-#if defined(USE_SUNRISE)
-#include "sunrise_allocator.h"
-#endif
-
 namespace mooncake {
 namespace {
 constexpr std::string_view kAscendProtocol = "ascend";
 constexpr std::string_view kUbshmemProtocol = "ubshmem";
-constexpr std::string_view kSunriseLinkProtocol = "sunrise_link";
 
 bool UseProtocolAllocator(const std::string& protocol) {
-    return protocol == kAscendProtocol || protocol == kUbshmemProtocol ||
-           protocol == kSunriseLinkProtocol;
+    return protocol == kAscendProtocol || protocol == kUbshmemProtocol;
 }
 
 void FreeAlignedBuffer(void* buffer, size_t size, const std::string& protocol,
@@ -36,18 +30,6 @@ void FreeAlignedBuffer(void* buffer, size_t size, const std::string& protocol,
 
 void* AllocateProtocolAlignedBuffer(size_t aligned_size,
                                     const std::string& protocol) {
-#if defined(USE_SUNRISE)
-    if (protocol == kSunriseLinkProtocol) {
-        void* buf = sunrise_allocate_memory(
-            aligned_size, AlignedClientBufferAllocator::kDirectIOAlignment,
-            false);
-        if (!buf) {
-            LOG(ERROR) << "AlignedClientBufferAllocator: failed to allocate "
-                       << "sunrise_link host memory of size " << aligned_size;
-        }
-        return buf;
-    }
-#endif
     void* aligned_buffer = allocate_buffer_allocator_memory(
         aligned_size, protocol,
         AlignedClientBufferAllocator::kDirectIOAlignment);

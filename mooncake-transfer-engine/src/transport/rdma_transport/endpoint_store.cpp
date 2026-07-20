@@ -149,15 +149,9 @@ int FIFOEndpointStore::destroyQPs() {
 }
 
 int FIFOEndpointStore::disconnectQPs() {
-    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     for (auto &kv : endpoint_map_) {
-        kv.second->beginDestroy();
-        waiting_list_.insert(kv.second);
+        kv.second->disconnect();
     }
-    waiting_list_len_ += endpoint_map_.size();
-    endpoint_map_.clear();
-    fifo_list_.clear();
-    fifo_map_.clear();
     return 0;
 }
 
@@ -324,16 +318,8 @@ int SIEVEEndpointStore::destroyQPs() {
 }
 
 int SIEVEEndpointStore::disconnectQPs() {
-    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
-    for (auto &kv : endpoint_map_) {
-        kv.second.first->beginDestroy();
-        waiting_list_.insert(kv.second.first);
-    }
-    waiting_list_len_ += endpoint_map_.size();
-    endpoint_map_.clear();
-    fifo_list_.clear();
-    fifo_map_.clear();
-    hand_ = std::nullopt;
+    for (auto &endpoint : waiting_list_) endpoint->disconnect();
+    for (auto &kv : endpoint_map_) kv.second.first->disconnect();
     return 0;
 }
 

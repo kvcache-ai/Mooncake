@@ -1,4 +1,5 @@
 file(GLOB ENGINE_SOURCES "*.cpp")
+find_package(UbDiag REQUIRED)
 add_subdirectory(common)
 add_subdirectory(transport)
 
@@ -14,6 +15,9 @@ add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
 if(BUILD_SHARED_LIBS)
   install(TARGETS transfer_engine DESTINATION lib)
 endif()
+
+target_include_directories(transfer_engine PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-integration/store)
 
 add_compile_definitions(transfer_engine PUBLIC MOONCAKE_USE_ETCD CMAKE_INCLUDE)
 if(USE_ETCD)
@@ -56,7 +60,8 @@ target_link_libraries(
          JsonCpp::JsonCpp
          numa
          asio_shared
-         yalantinglibs::yalantinglibs)
+         yalantinglibs::yalantinglibs
+         UbDiag::ubdiag_lib)
 
 if(USE_BAREX)
   target_link_libraries(transfer_engine PUBLIC barex_transport)
@@ -64,11 +69,7 @@ endif()
 
 if(USE_CUDA)
   target_include_directories(transfer_engine PRIVATE /usr/local/cuda/include)
-  if(USE_CXI)
-    target_link_libraries(transfer_engine PUBLIC cuda cudart rt)
-  else()
-    target_link_libraries(transfer_engine PUBLIC cuda cudart rt mlx5)
-  endif()
+  target_link_libraries(transfer_engine PUBLIC cuda cudart rt mlx5)
   if(USE_NVMEOF)
     target_link_libraries(transfer_engine PUBLIC nvmeof_transport cufile)
   endif()
@@ -101,27 +102,17 @@ if(USE_HIP)
   target_include_directories(transfer_engine PRIVATE ${HIP_INCLUDE_DIRS})
   target_link_libraries(transfer_engine PUBLIC hip::host rt)
 
-  # Optional dmabuf MR registration path (requires hsa-runtime64 and a kernel
-  # with CONFIG_PCI_P2PDMA + CONFIG_DMABUF_MOVE_NOTIFY).
+  # Optional dmabuf MR registration path (requires hsa-runtime64 and a
+  # kernel with CONFIG_PCI_P2PDMA + CONFIG_DMABUF_MOVE_NOTIFY).
   option(USE_HIP_DMABUF "Enable HIP dmabuf RDMA MR registration" ON)
   if(USE_HIP_DMABUF)
     find_package(hsa-runtime64 CONFIG)
     if(hsa-runtime64_FOUND)
-      # The dmabuf MR-registration code lives in rdma_context.cpp, which is
-      # compiled in the rdma_transport OBJECT library and pulled into
-      # transfer_engine via $<TARGET_OBJECTS:transport>. A PRIVATE define on
-      # transfer_engine never reaches that object compilation, so the dmabuf
-      # path is silently compiled out and GPU MRs fall back to plain
-      # ibv_reg_mr (EINVAL on device memory). Put the define (and the hsa
-      # include/link usage requirements) on the target that actually compiles
-      # rdma_context.cpp.
-      target_compile_definitions(rdma_transport PRIVATE USE_HIP_DMABUF)
-      target_link_libraries(rdma_transport PUBLIC hsa-runtime64::hsa-runtime64)
+      target_compile_definitions(transfer_engine PRIVATE USE_HIP_DMABUF)
       target_link_libraries(transfer_engine PUBLIC hsa-runtime64::hsa-runtime64)
       message(STATUS "HIP dmabuf MR registration enabled (hsa-runtime64 found)")
     else()
-      message(
-        STATUS "HIP dmabuf MR registration disabled (hsa-runtime64 not found)")
+      message(STATUS "HIP dmabuf MR registration disabled (hsa-runtime64 not found)")
     endif()
   else()
     message(STATUS "HIP dmabuf MR registration disabled (USE_HIP_DMABUF=OFF)")
@@ -172,11 +163,6 @@ if(USE_EFA)
   message(STATUS "Enabled USE_EFA (AWS Elastic Fabric Adapter) support")
   target_link_libraries(transfer_engine PUBLIC fabric efa_transport)
 endif()
-if(USE_CXI)
-  message(STATUS "Enabled USE_CXI (HPE Cray Slingshot) support")
-  target_link_libraries(transfer_engine PUBLIC fabric cxi_transport)
-endif()
-
 if(USE_UB)
   message(STATUS "Enabled USE_UB protocol support")
   target_link_libraries(transfer_engine PUBLIC ub_transport)

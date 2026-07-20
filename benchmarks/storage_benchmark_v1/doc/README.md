@@ -9,7 +9,6 @@ The KVCache Storage Benchmark is a tool for evaluating storage performance of KV
 ### Basic Usage
 
 ```bash
-cd benchmarks/storage_benchmark_v1
 python benchmark.py --scenario conversation \
                     --trace-dir /path/to/Mooncake/FAST25-release/traces \
                     --storage-dir /path/to/test/drive
@@ -26,49 +25,14 @@ python benchmark.py --scenario conversation \
 | `--page-size-tokens` | `512` | Page size in tokens |
 | `--max-requests` | `None` | Maximum number of requests to process |
 | `--max-pages` | `2000` | Maximum number of pages (creates modulo mapping if trace is larger) |
-| `--fsync-mode` | `none` | When to fsync: `none`, `batch`, `always`, or `end` |
+| `--fsync-mode` | `none` | When to fsync: `none`, `batch`, `always` |
 | `--fsync-batch-size` | `100` | Number of writes between fsync in batch mode |
-| `--threads` | `1` | Number of benchmark client worker threads |
-| `--replay-scales` | `0` | Comma-separated trace fast-forward speeds; `0` means unpaced |
-| `--progress-interval` | `100` | Print progress every N requests; `0` disables per-request progress |
-
-### Replay Scale
-
-Use `--replay-scales` to run the same trace at different fast-forward speeds:
-
-```bash
-python benchmark.py --scenario toolagent \
-                    --trace-dir /path/to/Mooncake/FAST25-release/traces \
-                    --storage-dir /path/to/test/drive \
-                    --replay-scales 1,2,4,8
-```
-
-For example, `2` means 2x fast-forward and `8` means 8x fast-forward. `0`
-preserves the old unpaced behavior.
-
-### Client Threads
-
-Use `--threads` to add benchmark client worker threads:
-
-```bash
-python benchmark.py --scenario toolagent \
-                    --trace-dir /path/to/Mooncake/FAST25-release/traces \
-                    --storage-dir /path/to/test/drive \
-                    --threads 4
-```
-
-With `--threads > 1`, each benchmark client thread uses an independent storage
-file under `thread_N/data.bin`, similar to running multiple clients at the same
-time. Final results aggregate the per-thread counters and latency samples. For
-strict single-client trace-order read/write and hit-rate accounting, use
-`--threads 1`.
 
 ## Output Format
 
 ### Progress Output
 
-During execution, progress is printed every `--progress-interval` requests and
-at the end of the run:
+During execution, each request displays real-time statistics:
 
 ```
 [    10/12031] ids= 35 tokens= 18060 | QPS=   2.45 | R=    36 ( 22.01ms, 2435.2MB/s) | W=   963 ( 19.35ms, 2770.1MB/s)
@@ -91,25 +55,11 @@ Fields:
 
 [General]
   Model:            glm5
-  Threads:          1
-  Fast-forward:     unpaced
   Requests:         12031
   Tokens:           123456789
   Total I/O Time:   245.123 s
   QPS:              49.07
   Hit Rate:         3.25%
-
-[Request Wall Latency]
-  Avg:              20.912 ms
-  P50:              19.654 ms
-  P95:              28.123 ms
-  P99:              34.987 ms
-
-[Request Storage I/O Latency]
-  Avg:              20.312 ms
-  P50:              18.987 ms
-  P95:              27.456 ms
-  P99:              33.210 ms
 
 [Read Operations]
   Count:            390
@@ -138,28 +88,6 @@ Fields:
   Written Pages:    2000
   Sync Count:       0
 ```
-
-`Request Wall Latency` measures the benchmark client's wall-clock time spent
-processing a request after replay pacing. `Request Storage I/O Latency` is the
-sum of the request's page read/write latencies. Read/write operation latency is
-reported per page operation. Percentile values use linear interpolation.
-
-## Measurement Notes
-
-- The default `--fsync-mode none` measures page-cache-backed write behavior. It
-  does not represent durable write latency. Use `--fsync-mode always`, `batch`,
-  or `end` when persistence cost is part of the benchmark target.
-- `pread`/`pwrite` latency is measured from user space, so it can include page
-  cache effects, OS scheduling, and Python benchmark-client overhead. Treat the
-  reported latency as an observed storage-path latency, not raw device service
-  time.
-- With `--threads > 1`, each thread replays the full trace as an independent
-  benchmark client with its own storage file. This is a multi-client drive test,
-  not parallel execution of one trace stream.
-- For publication-quality numbers, use a fixed machine and storage device,
-  clear or isolate benchmark storage directories between runs, disable
-  per-request progress output with `--progress-interval 0`, and run multiple
-  trials before reporting stable statistics.
 
 ## Modulo Mapping
 

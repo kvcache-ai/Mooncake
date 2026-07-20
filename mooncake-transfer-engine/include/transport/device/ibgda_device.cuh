@@ -11,32 +11,6 @@
 #include <cstdint>
 #include "transport/device/device_ops.cuh"
 
-#ifdef MOONCAKE_EP_USE_MACA
-
-namespace mooncake {
-namespace device {
-
-struct IbgdaContext {
-    void* qp_devctxs;
-    const uint64_t* raddrs;
-    const uint32_t* rkeys;
-    const void* local_atomic_base;
-    const void* remote_atomic_base;
-};
-
-__device__ __forceinline__ void mc_ibgda_put(const IbgdaContext&, int, int, int,
-                                             int, const void*, uint64_t,
-                                             uint32_t) {}
-
-__device__ __forceinline__ void mc_ibgda_red_add(const IbgdaContext&, int, int,
-                                                 int, int, uint64_t, uint64_t,
-                                                 int32_t) {}
-
-}  // namespace device
-}  // namespace mooncake
-
-#else  // !MOONCAKE_EP_USE_MACA
-
 #ifndef MOONCAKE_EP_USE_MUSA
 #include <cuda/atomic>
 #endif
@@ -230,5 +204,3 @@ __device__ __forceinline__ void mc_ibgda_red_add(
 
 }  // namespace device
 }  // namespace mooncake
-
-#endif  // MOONCAKE_EP_USE_MACA

@@ -39,9 +39,6 @@ NVMeoFTransport::NVMeoFTransport() {
     desc_pool_ = std::make_shared<CUFileDescPool>();
 }
 
-NVMeoFTransport::NVMeoFTransport(std::shared_ptr<CUFileDescPool> desc_pool)
-    : desc_pool_(std::move(desc_pool)) {}
-
 NVMeoFTransport::~NVMeoFTransport() {}
 
 Transport::TransferStatusEnum from_cufile_transfer_status(
@@ -79,108 +76,38 @@ NVMeoFTransport::BatchID NVMeoFTransport::allocateBatchID(size_t batch_size) {
 
 Status NVMeoFTransport::getTransferStatus(BatchID batch_id, size_t task_id,
                                           TransferStatus &status) {
-    if (batch_id == 0) {
-        return Status::InvalidArgument("NVMeoFTransport: Invalid batch ID");
-    }
     auto &batch_desc = *((BatchDesc *)(batch_id));
-    if (task_id >= batch_desc.task_list.size()) {
-        return Status::InvalidArgument("NVMeoFTransport: Task ID out of range");
-    }
-    if (batch_desc.context == nullptr) {
-        return Status::InvalidArgument(
-            "NVMeoFTransport: Batch was not allocated by this transport");
-    }
     auto &task = batch_desc.task_list[task_id];
     auto &nvmeof_desc = *((NVMeoFBatchDesc *)(batch_desc.context));
-    if (task_id >= nvmeof_desc.task_to_slices.size()) {
-        return Status::InvalidArgument(
-            "NVMeoFTransport: Task has no submitted slices");
-    }
-
+    // LOG(DEBUG) << "get t n " << nr;
+    // 1. get task -> id map
+    TransferStatus transfer_status = {.s = Transport::PENDING,
+                                      .transferred_bytes = 0};
     auto [slice_id, slice_num] = nvmeof_desc.task_to_slices[task_id];
-    thread_local std::vector<TransferStatus> slice_statuses;
-    slice_statuses.clear();
-    slice_statuses.reserve(slice_num);
     for (size_t i = slice_id; i < slice_id + slice_num; ++i) {
+        // LOG(INFO) << "task " << task_id << " i " << i << " upper bound " <<
+        // slice_num;
         auto event = desc_pool_->getTransferStatus(nvmeof_desc.desc_idx_, i);
-        auto slice_status = from_cufile_transfer_status(event.status);
-        slice_statuses.push_back(TransferStatus{
-            .s = slice_status,
-            .transferred_bytes = slice_status == COMPLETED ? event.ret : 0});
+        transfer_status.s = from_cufile_transfer_status(event.status);
+        // TODO(FIXME): what to do if multi slices have different status?
+        if (transfer_status.s == COMPLETED) {
+            transfer_status.transferred_bytes += event.ret;
+        } else {
+            break;
+        }
     }
-
-    bool is_finished = false;
-    status = aggregateTransferStatus(slice_statuses, is_finished);
-    if (is_finished) {
+    if (transfer_status.s == COMPLETED) {
         task.is_finished = true;
     }
+    status = transfer_status;
     return Status::OK();
 }
 
+// Dummy implement for solving build issues, WIP
 Status NVMeoFTransport::submitTransferTask(
     const std::vector<TransferTask *> &task_list) {
-    // MultiTransport owns these generic BatchDesc objects, so this transport
-    // cannot attach or reclaim the NVMe-specific descriptor required by
-    // cuFile. No asynchronous work was started; make the tasks releasable.
-    for (auto *task : task_list) {
-        if (task != nullptr) task->is_finished = true;
-    }
-    return Status::NotImplemented(
-        "NVMeoFTransport does not support MultiTransport batches");
-}
-
-Transport::TransferStatus NVMeoFTransport::aggregateTransferStatus(
-    const std::vector<TransferStatus> &slice_statuses, bool &is_finished) {
-    TransferStatus result = {.s = COMPLETED, .transferred_bytes = 0};
-    is_finished = true;
-    bool has_pending = false;
-
-    // Terminal failures use a fixed precedence so the result does not depend
-    // on the order in which cuFile reports completions.
-    int failure_priority = 0;
-    for (const auto &slice_status : slice_statuses) {
-        switch (slice_status.s) {
-            case COMPLETED:
-                result.transferred_bytes += slice_status.transferred_bytes;
-                break;
-            case WAITING:
-                is_finished = false;
-                break;
-            case PENDING:
-                has_pending = true;
-                is_finished = false;
-                break;
-            case INVALID:
-                if (failure_priority < 1) {
-                    result.s = INVALID;
-                    failure_priority = 1;
-                }
-                break;
-            case CANCELED:
-                if (failure_priority < 2) {
-                    result.s = CANCELED;
-                    failure_priority = 2;
-                }
-                break;
-            case TIMEOUT:
-                if (failure_priority < 3) {
-                    result.s = TIMEOUT;
-                    failure_priority = 3;
-                }
-                break;
-            case FAILED:
-                result.s = FAILED;
-                failure_priority = 4;
-                break;
-        }
-    }
-
-    if (slice_statuses.empty()) {
-        result.s = INVALID;
-    } else if (!is_finished) {
-        result.s = has_pending ? PENDING : WAITING;
-    }
-    return result;
+    /* TBD */
+    return Status::OK();
 }
 
 Status NVMeoFTransport::submitTransfer(

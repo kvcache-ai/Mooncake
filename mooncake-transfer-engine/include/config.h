@@ -22,7 +22,6 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -60,11 +59,6 @@ struct GlobalConfig {
     // which is minutes. Override via MC_HANDSHAKE_CONNECT_TIMEOUT.
     int handshake_connect_timeout = 5;
     bool metacache = true;
-    // Periodically refresh Transfer Engine metadata-derived local caches. 0
-    // disables the background poller and preserves the manual
-    // syncSegmentCache() behavior. Currently refreshes cached remote segment
-    // descriptors. Override via MC_TE_METADATA_REFRESH_INTERVAL_SECONDS.
-    uint64_t te_metadata_refresh_interval_seconds = 0;
     int log_level = google::INFO;
     bool trace = false;
     int64_t slice_timeout = -1;
@@ -73,18 +67,10 @@ struct GlobalConfig {
     bool use_ipv6 = false;
     size_t fragment_limit = 16384;
     bool enable_dest_device_affinity = false;
-    bool enable_hca_peer_affinity = false;
-    std::unordered_map<std::string, std::vector<std::string>> nic_peer_affinity;
-    bool log_rdma_slice_affinity = false;
-    bool track_rdma_posted_slices = false;
     int parallel_reg_mr = -1;
     size_t eic_max_block_size = 64UL * 1024 * 1024;
     EndpointStoreType endpoint_store_type = EndpointStoreType::SIEVE;
     int ib_traffic_class = -1;
-    // InfiniBand Service Level (SL), 0-15. -1 = use default (0).
-    // Maps to a Virtual Lane on the switch for QoS isolation, e.g. to
-    // steer KV-cache traffic into a different VL than EP all-to-all.
-    int ib_service_level = -1;
     // mlx5 QP UDP source ports for ECMP path diversification.
     // Empty = no modification. QP at index i uses
     // mlx5_qp_udp_sports[i % size]. Requires mlx5 device + RoCEv2,
@@ -99,14 +85,6 @@ struct GlobalConfig {
     int ib_pci_relaxed_ordering_mode = 0;
     bool ascend_use_fabric_mem = false;
     bool ascend_agent_mode = false;
-    bool sunrise_use_device_mem = false;
-    // Transient flag scoped to a single TE init: set true by the Store entry
-    // (Client::InitTransferEngine) before installing the ascend transport, and
-    // reset to false right after. Lets ascend_direct distinguish a Store-init
-    // TE from a normal/P2P TE so each can resolve its own
-    // ASCEND_GLOBAL_RESOURCE_CONFIG (e.g. Store=RoCE, P2P=HCCS). Assumes TE
-    // inits are serialized within the process.
-    bool ascend_store_te_init = false;
     // ub config parameters
     size_t num_jfc_per_ctx = 2;
     size_t num_jfce_per_ctx = 2;
@@ -114,6 +92,19 @@ struct GlobalConfig {
     uint64_t max_seg_size = 0x10000000000;
     size_t max_jfc_e = 4096;  // urma is temporarily using this default value.
     size_t num_jetty_per_ep = 1;
+    // urma transport mode: "RM" (default), "RC", "UM"; override via
+    // MC_URMA_TRANS_MODE
+    std::string urma_trans_mode = "RM";
+    // urma active port: -1 (default) for auto-selection by scanning port
+    // attributes, >=0 for user-specified port index; override via
+    // MC_URMA_ACTIVE_PORT
+    int urma_active_port = -1;
+    // enable bonding BALANCE+PORT mode; default off (STANDALONE); override via
+    // MC_URMA_BONDING_BALANCE
+    bool urma_bonding_balance = false;
+    // enable bonding multipath mode; default off (STANDALONE); override via
+    // MC_URMA_BONDING_MULTIPATH_ENABLE
+    bool urma_bonding_multipath = false;
 };
 
 struct RpcCommunicatorConfig {

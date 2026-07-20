@@ -112,28 +112,21 @@ class Transport {
         size_t length;
         TransferRequest::OpCode opcode;
         SegmentID target_id;
+        uint64_t trace_id = 0;
         std::string peer_nic_path;
-        std::string source_location;
         SliceStatus status;
         TransferTask *task;
-        // EFA/CXI's libfabric MR keys are 64-bit (fi_mr_key()); RDMA verbs keys
-        // are 32-bit. Use a scoped alias so the width is defined in one place.
-#if defined(USE_EFA) || defined(USE_CXI)
-        using mr_key_t = uint64_t;
-#else
-        using mr_key_t = uint32_t;
-#endif
-        std::vector<mr_key_t> dest_rkeys;
+        std::vector<uint32_t> dest_rkeys;
         bool from_cache;
 
         union {
             struct {
                 uint64_t dest_addr;
-                mr_key_t source_lkey;
-                mr_key_t dest_rkey;
+                uint32_t source_lkey;
+                uint32_t dest_rkey;
                 int lkey_index;
                 int rkey_index;
-                std::atomic<int> *qp_depth;
+                volatile int *qp_depth;
                 uint32_t retry_cnt;
                 uint32_t max_retry_cnt;
                 RdmaEndPoint *endpoint;  // Endpoint used for this transfer
@@ -275,6 +268,8 @@ class Transport {
                 slice = lazy_delete_slices_[tail_ % kLazyDeleteSliceCapacity];
                 tail_++;
                 slice->from_cache = true;
+                slice->peer_nic_path.clear();
+                slice->dest_rkeys.clear();
             }
 
             return slice;

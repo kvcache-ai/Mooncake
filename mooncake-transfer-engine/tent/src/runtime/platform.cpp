@@ -22,8 +22,6 @@
 #include "tent/platform/sunrise.h"
 #elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
 #include "tent/platform/ascend.h"
-#elif defined(USE_TPU)
-#include "tent/platform/tpu.h"
 #else
 #include "tent/platform/cpu.h"
 #endif
@@ -43,8 +41,6 @@ Platform& Platform::getLoader(std::shared_ptr<Config> conf) {
         g_instance = std::make_shared<SunrisePlatform>(conf);
 #elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
         g_instance = std::make_shared<AscendPlatform>(conf);
-#elif defined(USE_TPU)
-        g_instance = std::make_shared<TpuPlatform>(conf);
 #else
         g_instance = std::make_shared<CpuPlatform>(conf);
 #endif

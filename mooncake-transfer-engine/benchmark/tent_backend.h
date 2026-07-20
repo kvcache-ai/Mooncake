@@ -72,7 +72,7 @@ class TENTBenchRunner : public BenchRunner {
 
     double runSingleTransfer(uint64_t local_addr, uint64_t target_addr,
                              uint64_t block_size, uint64_t batch_size,
-                             OpCode opcode, uint64_t deadline_ns);
+                             OpCode opcode);
 
    private:
     int allocateBuffers();
@@ -87,7 +87,6 @@ class TENTBenchRunner : public BenchRunner {
     SegmentID handle_;
     SegmentInfo info_;
     TransportType transport_hint_{UNSPEC};
-    IntentType intent_type_{IntentType::INTENT_UNSPEC};
 
     std::vector<std::function<int(int)>> current_task_;
     std::vector<std::thread> threads_;

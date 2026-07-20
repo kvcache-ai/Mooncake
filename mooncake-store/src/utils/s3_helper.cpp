@@ -6,15 +6,15 @@
 #include <aws/s3/model/DeleteObjectRequest.h>
 #include <aws/core/auth/AWSCredentials.h>
 #include <aws/core/utils/memory/stl/AWSVector.h>
-#include <aws/s3/model/ListObjectsV2Request.h>
+#include <aws/s3/model/ListObjectsRequest.h>
 #include <aws/s3/model/DeleteObjectsRequest.h>
 #include <aws/s3/model/ObjectIdentifier.h>
 #include <aws/s3/model/Delete.h>
-#include <algorithm>
 #include <optional>
 #include <fstream>
 #include <iostream>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cctype>
 #include <glog/logging.h>
@@ -27,30 +27,69 @@
 #include <aws/s3/model/CompleteMultipartUploadRequest.h>
 #include <aws/s3/model/AbortMultipartUploadRequest.h>
 #include <aws/s3/model/UploadPartRequest.h>
-#include <aws/core/client/ClientConfiguration.h>
-#include "environ.h"
+#include "utils/type_util.h"
 #include "fmt/format.h"
 
 namespace mooncake {
 
 namespace {
 
-// Parse a checksum-mode string ("when_supported" | "when_required") into the
-// AWS SDK enum. Returns std::nullopt when the value is unset or invalid — the
-// caller should then leave the AWS SDK's default in place. This is purely
-// string-to-enum logic (not getenv), so it lives next to the AWS types it
-// produces.
-template <typename T>
-std::optional<T> ParseChecksumMode(const std::string &value) {
-    if (value.empty()) return std::nullopt;
-    std::string lower = value;
-    std::transform(lower.begin(), lower.end(), lower.begin(),
-                   [](unsigned char ch) { return std::tolower(ch); });
-    if (lower == "when_required") return T::WHEN_REQUIRED;
-    if (lower == "when_supported") return T::WHEN_SUPPORTED;
-    LOG(WARNING) << "Invalid value: " << value
-                 << ", ignoring (keeping AWS SDK default)";
-    return std::nullopt;
+constexpr int64_t kDefaultS3ConnectTimeoutMs = 10000;
+constexpr int64_t kDefaultS3RequestTimeoutMs = 30000;
+
+struct S3Env {
+    std::string region;
+
+    std::string endpoint;
+
+    std::string bucket;
+
+    std::string access_key;
+
+    std::string secret_key;
+
+    bool use_virtual_addressing = true;
+
+    int64_t connect_timeout_ms = kDefaultS3ConnectTimeoutMs;
+
+    int64_t request_timeout_ms = kDefaultS3RequestTimeoutMs;
+};
+
+S3Env s3_env;
+
+void AssignStringFromEnv(const char *env_name, std::string &target) {
+    const char *env_value = std::getenv(env_name);
+    if (env_value && *env_value) {
+        target = env_value;
+    } else {
+        target.clear();
+    }
+}
+
+void AssignBoolFromEnv(const char *env_name, bool &target) {
+    const char *env_value = std::getenv(env_name);
+    if (env_value && *env_value) {
+        bool parsed = true;
+        if (TypeUtil::ParseBool(env_value, parsed)) {
+            target = parsed;
+            return;
+        }
+        LOG(WARNING) << "Invalid " << env_name << " value: " << env_value;
+    }
+}
+
+void AssignTimeoutFromEnv(const char *env_name, int64_t default_value,
+                          int64_t &target) {
+    const char *env_value = std::getenv(env_name);
+    if (env_value && *env_value) {
+        int64_t parsed;
+        if (TypeUtil::ParseInt64(env_value, parsed)) {
+            target = parsed;
+            return;
+        }
+        LOG(WARNING) << "Invalid " << env_name << " value: " << env_value;
+    }
+    target = default_value;
 }
 
 }  // namespace
@@ -63,10 +102,21 @@ void S3Helper::InitAPI() {
     Aws::InitAPI(options_);
     aws_initialized = true;
 
-    // Force Environ initialization so all MOONCAKE_AWS_* env vars are read
-    // once during startup, matching the previous "read once at InitAPI"
-    // behavior.
-    (void)Environ::Get();
+    // Read environment variables once during initialization (fallback as needed
+    // if not set)
+    AssignStringFromEnv("MOONCAKE_AWS_REGION", s3_env.region);
+    AssignStringFromEnv("MOONCAKE_AWS_S3_ENDPOINT", s3_env.endpoint);
+    AssignStringFromEnv("MOONCAKE_AWS_BUCKET_NAME", s3_env.bucket);
+    AssignStringFromEnv("MOONCAKE_AWS_ACCESS_KEY_ID", s3_env.access_key);
+    AssignStringFromEnv("MOONCAKE_AWS_SECRET_ACCESS_KEY", s3_env.secret_key);
+
+    AssignBoolFromEnv("MOONCAKE_AWS_USE_VIRTUAL_ADDRESSING",
+                      s3_env.use_virtual_addressing);
+
+    AssignTimeoutFromEnv("MOONCAKE_AWS_CONNECT_TIMEOUT_MS",
+                         kDefaultS3ConnectTimeoutMs, s3_env.connect_timeout_ms);
+    AssignTimeoutFromEnv("MOONCAKE_AWS_REQUEST_TIMEOUT_MS",
+                         kDefaultS3RequestTimeoutMs, s3_env.request_timeout_ms);
 }
 
 void S3Helper::ShutdownAPI() {
@@ -78,43 +128,30 @@ void S3Helper::ShutdownAPI() {
 
 S3Helper::S3Helper(const std::string &endpoint, const std::string &bucket,
                    const std::string &region) {
-    const auto &env = Environ::Get();
     Aws::Client::ClientConfiguration config(true);
 
-    config.connectTimeoutMs = env.GetAwsConnectTimeoutMs();
-    config.requestTimeoutMs = env.GetAwsRequestTimeoutMs();
-    config.scheme = env.GetAwsUseHttps() ? Aws::Http::Scheme::HTTPS
-                                         : Aws::Http::Scheme::HTTP;
-    if (auto request_checksum =
-            ParseChecksumMode<Aws::Client::RequestChecksumCalculation>(
-                env.GetAwsRequestChecksumCalculation())) {
-        config.checksumConfig.requestChecksumCalculation = *request_checksum;
-    }
-    if (auto response_checksum =
-            ParseChecksumMode<Aws::Client::ResponseChecksumValidation>(
-                env.GetAwsResponseChecksumValidation())) {
-        config.checksumConfig.responseChecksumValidation = *response_checksum;
-    }
+    config.connectTimeoutMs = s3_env.connect_timeout_ms;
+    config.requestTimeoutMs = s3_env.request_timeout_ms;
+    config.scheme = Aws::Http::Scheme::HTTPS;
 
     if (!region.empty()) {
         config.region = region;
     } else {
-        config.region = env.GetAwsRegion();
+        config.region = s3_env.region;
     }
 
     if (!endpoint.empty()) {
         config.endpointOverride = endpoint;
     } else {
-        config.endpointOverride = env.GetAwsS3Endpoint();
+        config.endpointOverride = s3_env.endpoint;
     }
 
-    bucket_ = env.GetAwsBucketName();
+    bucket_ = s3_env.bucket;
     if (!bucket.empty()) {
         bucket_ = bucket;
     }
 
-    Aws::Auth::AWSCredentials credentials(env.GetAwsAccessKeyId(),
-                                          env.GetAwsSecretAccessKey());
+    Aws::Auth::AWSCredentials credentials(s3_env.access_key, s3_env.secret_key);
 
     // Concatenate log information into member variable connection_info_
     connection_info_ = fmt::format(
@@ -132,14 +169,14 @@ S3Helper::S3Helper(const std::string &endpoint, const std::string &bucket,
         bucket_.empty() ? "unset" : bucket_, config.connectTimeoutMs,
         config.requestTimeoutMs,
         config.scheme == Aws::Http::Scheme::HTTPS ? "HTTPS" : "HTTP",
-        !env.GetAwsAccessKeyId().empty() ? "set" : "unset",
-        !env.GetAwsSecretAccessKey().empty() ? "set" : "unset",
-        env.GetAwsUseVirtualAddressing() ? "true" : "false");
+        !s3_env.access_key.empty() ? "set" : "unset",
+        !s3_env.secret_key.empty() ? "set" : "unset",
+        s3_env.use_virtual_addressing ? "true" : "false");
 
     s3_client_ = Aws::S3::S3Client(
         credentials, config,
         Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never,
-        env.GetAwsUseVirtualAddressing());
+        s3_env.use_virtual_addressing);
 }
 
 S3Helper::~S3Helper() = default;
@@ -781,7 +818,7 @@ tl::expected<void, std::string> S3Helper::ListObjectsWithPrefix(
     const std::string &prefix, std::vector<std::string> &object_keys) {
     object_keys.clear();
 
-    Aws::S3::Model::ListObjectsV2Request request;
+    Aws::S3::Model::ListObjectsRequest request;
     request.WithBucket(bucket_);
     request.WithPrefix(prefix);
 
@@ -791,10 +828,10 @@ tl::expected<void, std::string> S3Helper::ListObjectsWithPrefix(
 
     bool done = false;
     while (!done) {
-        auto outcome = s3_client_.ListObjectsV2(request);
+        auto outcome = s3_client_.ListObjects(request);
         if (!outcome.IsSuccess()) {
             return tl::make_unexpected(fmt::format(
-                "ListObjectsV2 error: {}", outcome.GetError().GetMessage()));
+                "ListObjects error: {}", outcome.GetError().GetMessage()));
         }
 
         const auto &result = outcome.GetResult();
@@ -806,13 +843,8 @@ tl::expected<void, std::string> S3Helper::ListObjectsWithPrefix(
 
         // Check if there are more objects to fetch
         if (result.GetIsTruncated()) {
-            const auto &next_token = result.GetNextContinuationToken();
-            if (next_token.empty()) {
-                return tl::make_unexpected(
-                    "ListObjectsV2 error: truncated response missing next "
-                    "continuation token");
-            }
-            request.SetContinuationToken(next_token);
+            // Set marker to get next page
+            request.WithMarker(result.GetNextMarker());
         } else {
             done = true;
         }

@@ -19,8 +19,6 @@
 #include <glog/logging.h>
 #include <infiniband/verbs.h>
 
-#include <atomic>
-
 #include "tent/common/status.h"
 
 namespace mooncake {
@@ -31,10 +29,6 @@ class RdmaContext;
 class RdmaCQ {
    public:
     RdmaCQ() : cq_(nullptr), cqe_now_(0), cqe_limit_(-1), context_(nullptr) {}
-    RdmaCQ(const RdmaCQ &) = delete;
-    RdmaCQ &operator=(const RdmaCQ &) = delete;
-    RdmaCQ(RdmaCQ &&) = delete;
-    RdmaCQ &operator=(RdmaCQ &&) = delete;
 
     ~RdmaCQ();
 
@@ -49,11 +43,11 @@ class RdmaCQ {
 
     void cancelQuota(int num_entries);
 
-    int getQuota() const { return cqe_now_.load(std::memory_order_relaxed); }
+    int getQuota() const { return cqe_now_; }
 
     int maxCqe() const { return cqe_limit_; }
 
-    bool empty() const { return cqe_now_.load(std::memory_order_relaxed) == 0; }
+    bool empty() const { return cqe_now_ == 0; }
 
     int poll(int num_entries, ibv_wc *wc);
 
@@ -63,7 +57,7 @@ class RdmaCQ {
 
    private:
     ibv_cq *cq_;
-    std::atomic<int> cqe_now_;
+    volatile int cqe_now_;
     int cqe_limit_;
     RdmaContext *context_;
 };

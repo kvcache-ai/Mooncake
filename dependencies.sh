@@ -24,7 +24,6 @@ NC="\033[0m" # No Color
 REPO_ROOT=`pwd`
 GITHUB_PROXY=${GITHUB_PROXY:-"https://github.com"}
 GOVER=1.25.9
-OS_RELEASE_FILE=${OS_RELEASE_FILE:-/etc/os-release}
 
 # Function to print section headers
 print_section() {
@@ -49,30 +48,16 @@ check_success() {
     fi
 }
 
-read_os_release_value() {
-    local key="$1"
-    awk -F= -v key="$key" '
-        $1 == key {
-            value = $0
-            sub(/^[^=]*=/, "", value)
-            gsub(/^"|"$/, "", value)
-            print value
-            exit
-        }
-    ' "$OS_RELEASE_FILE"
-}
-
 # Function to detect OS
 detect_os() {
-    if [ -f "$OS_RELEASE_FILE" ]; then
-        ID=$(read_os_release_value ID)
-        VERSION_ID=$(read_os_release_value VERSION_ID)
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
         OS=$(echo "$ID" | tr '[:upper:]' '[:lower:]')
         OS_VERSION=$VERSION_ID
     elif [ -f /etc/redhat-release ]; then
         OS="centos"
     else
-        print_error "Cannot detect OS. Supported OS: Ubuntu, Debian, CentOS, RHEL, Rocky, AlmaLinux, EulerOS, and openEuler."
+        print_error "Cannot detect OS. Supported OS: Ubuntu, Debian, CentOS, RHEL, Rocky, AlmaLinux, and openEuler."
     fi
 
     echo -e "${GREEN}Detected OS: $OS ${OS_VERSION:-unknown}${NC}"
@@ -135,9 +120,7 @@ print_section "Updating package lists"
 if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
     apt-get update
     check_success "Failed to update package lists"
-elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS" = "almalinux" ] || [ "$OS" = "euleros" ] || [ "$OS" = "openeuler" ]; then
-    yum install -y dnf-plugins-core epel-release || true
-    yum config-manager --set-enabled powertools || yum config-manager --set-enabled crb || true
+elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS" = "almalinux" ] || [ "$OS" = "openeuler" ]; then
     yum clean all
     yum makecache
     check_success "Failed to update package lists"
@@ -175,7 +158,6 @@ if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
                      liburing-dev \
                      libjemalloc-dev \
                      libmsgpack-dev \
-                     libzmq3-dev \
                      libzstd-dev \
                      libasio-dev \
                      libxxhash-dev \
@@ -187,29 +169,28 @@ if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
     apt-get install -y $SYSTEM_PACKAGES
     check_success "Failed to install system packages"
 
-elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS" = "almalinux" ] || [ "$OS" = "euleros" ] || [ "$OS" = "openeuler" ]; then
+elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS" = "almalinux" ] || [ "$OS" = "openeuler" ]; then
     SYSTEM_PACKAGES="@development \
                      cmake \
                      git \
                      wget \
                      rdma-core-devel \
                      glog-devel \
-                     gflags-devel \
                      gtest-devel \
                      jsoncpp-devel \
                      libunwind-devel \
                      numactl-devel \
                      python3-devel \
-                     boost1.78-devel \
+                     boost-devel \
                      openssl-devel \
+                     grpc-devel \
                      protobuf-devel \
                      yaml-cpp-devel \
+                     grpc-plugins \
                      libcurl-devel \
                      hiredis-devel \
                      liburing-devel \
                      jemalloc-devel \
-                     msgpack-devel \
-                     libzstd-devel \
                      pkgconf-pkg-config \
                      elfutils-libelf-devel \
                      patchelf  \

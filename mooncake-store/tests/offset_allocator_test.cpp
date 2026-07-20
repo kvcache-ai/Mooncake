@@ -1,4 +1,4 @@
-#include "offset_allocator/offset_allocator.h"
+#include "offset_allocator/offset_allocator.hpp"
 #include "mutex.h"
 #include "serializer.h"
 #include "types.h"

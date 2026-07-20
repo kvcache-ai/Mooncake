@@ -34,9 +34,9 @@ start_server()
 
     local kv_config_json="{\\\"kv_connector\\\":\\\"MooncakeConnector\\\",\\\"kv_role\\\":\\\"$kv_role\\\"}"
 
-    local extra_args="--tensor-parallel-size 2 --max-model-len 32768 --gpu-memory-utilization 0.85 --no-enable-prefix-caching --kv-transfer-config '$kv_config_json'"
+    local extra_args="--tensor-parallel-size 2 --max-model-len 32768 --no-enable-prefix-caching --kv-transfer-config '$kv_config_json'"
     
-    local env_vars="CUDA_VISIBLE_DEVICES=6,7"
+    local env_vars="CUDA_VISIBLE_DEVICES=0,1"
     
     if ! launch_vllm_server "$model_name" "$host" "$port" "$vllm_server_log_path" "$kv_role" "$extra_args" "$env_vars"; then
         return 1
@@ -62,7 +62,7 @@ run_proxy()
     local use_health_check=0
     if python3 -c "from packaging import version; import sys; sys.exit(0 if version.parse('$vllm_version') >= version.parse('0.16.0') else 1)" 2>/dev/null; then
         echo "Using Mooncake Connector Proxy (vLLM >= 0.16.0)"
-        proxy_script="python3 -u /vllm-workspace/examples/disaggregated/mooncake_connector/mooncake_connector_proxy.py --prefill http://$REMOTE_IP:8010 --decode http://$LOCAL_IP:8020 --host 0.0.0.0 --port 8000"
+        proxy_script="python3 -u /vllm-workspace/examples/online_serving/disaggregated_serving/mooncake_connector/mooncake_connector_proxy.py --prefill http://$REMOTE_IP:8010 --decode http://$LOCAL_IP:8020 --host 0.0.0.0 --port 8000"
         ready_pattern="All prefiller instances are ready."
     else
         echo "Using NIXL Proxy (vLLM < 0.16.0)"

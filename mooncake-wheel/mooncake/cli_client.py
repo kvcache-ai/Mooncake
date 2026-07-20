@@ -4,7 +4,6 @@ Minimal CLI module for mooncake_client.
 """
 
 import os
-import stat
 import sys
 import subprocess
 
@@ -19,9 +18,7 @@ def main():
     bin_path = os.path.join(package_dir, "mooncake_client")
 
     # Make sure the binary is executable
-    if not os.access(bin_path, os.X_OK):
-        st = os.stat(bin_path)
-        os.chmod(bin_path, st.st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    os.chmod(bin_path, 0o755)
 
     # Run the binary with all arguments passed through
     return subprocess.call([bin_path] + sys.argv[1:])

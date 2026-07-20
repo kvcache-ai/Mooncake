@@ -19,10 +19,21 @@
 #include <cassert>
 #include <sys/epoll.h>
 #include "config.h"
+#include "mooncake_logging.h"
 #include "transport/kunpeng_transport/ub_context.h"
 #include "transport/kunpeng_transport/ub_endpoint.h"
 
 namespace mooncake {
+namespace {
+std::unique_ptr<mooncake::logging::ScopedTraceId> RestoreTraceIfMissing(
+    uint64_t trace_id) {
+    if (trace_id == 0 || mooncake::logging::CurrentTraceId() != 0) {
+        return nullptr;
+    }
+    return std::make_unique<mooncake::logging::ScopedTraceId>(trace_id);
+}
+}  // namespace
+
 std::shared_ptr<UbEndPoint> UbSIEVEEndpointStore::getEndpoint(
     const std::string& peer_nic_path) {
     RWSpinlock::ReadGuard guard(endpoint_map_lock_);
@@ -342,6 +353,8 @@ void UbWorkerPool::performPostSend(int thread_id) {
     SliceList failed_slice_list;
     for (auto& entry : local_slice_queue) {
         if (entry.second.empty()) continue;
+        [[maybe_unused]] auto trace =
+            RestoreTraceIfMissing(entry.second.front()->trace_id);
 
 #ifdef USE_FAKE_POST_SEND
         for (auto& slice : entry.second) slice->markSuccess();
@@ -432,6 +445,7 @@ void UbWorkerPool::performPoll(int thread_id) {
             }
             slice->ub.retry_cnt++;
             if (slice->ub.retry_cnt >= slice->ub.max_retry_cnt) {
+                context_.deleteEndpoint(slice->peer_nic_path);
                 failed_slices.push_back(slice);
             } else {
                 collective_slice_queue_[thread_id][slice->peer_nic_path]

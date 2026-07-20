@@ -16,19 +16,7 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
               int hidden, int num_max_dispatch_tokens_per_rank, int num_topk,
               int num_experts, int rank, int num_ranks, bool use_fp8,
               void* workspace, cudaStream_t stream, int64_t timeout_ticks,
-              int phases, int active_qps_per_rank);
-
-void mark_phase_ack(void* mxa_buffer, const int32_t* nvlink_available,
-                    void* const* ipc_peer_ptrs, int* ack_buffer, int rank,
-                    int num_ranks, int epoch, cudaStream_t stream);
-
-void wait_phase_ack(int* ack_buffer, int rank, int num_ranks, int epoch,
-                    cudaStream_t stream, int64_t timeout_ticks);
-
-void mark_and_wait_phase_ack(void* mxa_buffer, const int32_t* nvlink_available,
-                             void* const* ipc_peer_ptrs, int* ack_buffer,
-                             int rank, int num_ranks, int epoch,
-                             cudaStream_t stream, int64_t timeout_ticks);
+              int phases);
 
 void combine(void* combined_x, int32_t* active_ranks, void* mxa_buffer,
              int* rdma_send_signal_buffer, int* rdma_recv_signal_buffer,
@@ -42,6 +30,6 @@ void combine(void* combined_x, int32_t* active_ranks, void* mxa_buffer,
              int num_max_dispatch_tokens_per_rank, int num_topk,
              int num_experts, int rank, int num_ranks, void* workspace,
              cudaStream_t stream, int64_t timeout_ticks, int phases,
-             bool zero_copy, int active_qps_per_rank);
+             bool zero_copy);
 
 }  // namespace mooncake

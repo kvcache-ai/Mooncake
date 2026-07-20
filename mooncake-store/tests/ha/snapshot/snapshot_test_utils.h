@@ -19,7 +19,7 @@
 #include "master_config.h"
 #include "replica.h"
 #include "segment.h"
-#include "serialize/serializer.h"
+#include "serialize/serializer.hpp"
 #include "types.h"
 #include "utils/zstd_util.h"
 
