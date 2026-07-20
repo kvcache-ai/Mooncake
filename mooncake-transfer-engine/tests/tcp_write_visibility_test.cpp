@@ -104,6 +104,9 @@ std::atomic<bool> connecting_lane_had_current{false};
 std::atomic<bool> retry_handler_entered{false};
 std::atomic<bool> release_retry_handler{false};
 std::atomic<bool> hold_retry_handler{false};
+std::atomic<bool> retry_armed_observer_entered{false};
+std::atomic<bool> release_retry_armed_observer{false};
+std::atomic<bool> hold_retry_armed_observer{false};
 std::atomic<size_t> maximum_observed_queue_depth{0};
 std::atomic<size_t> maximum_observed_socket_count{0};
 std::atomic<int> queue_rejection_count{0};
@@ -150,6 +153,9 @@ void resetLaneTestState() noexcept {
     retry_handler_entered.store(false, std::memory_order_release);
     release_retry_handler.store(false, std::memory_order_release);
     hold_retry_handler.store(false, std::memory_order_release);
+    retry_armed_observer_entered.store(false, std::memory_order_release);
+    release_retry_armed_observer.store(false, std::memory_order_release);
+    hold_retry_armed_observer.store(false, std::memory_order_release);
     maximum_observed_queue_depth.store(0, std::memory_order_release);
     maximum_observed_socket_count.store(0, std::memory_order_release);
     queue_rejection_count.store(0, std::memory_order_release);
@@ -192,6 +198,10 @@ void blockRetryHandler() noexcept {
     }
 }
 
+void releaseRetryArmedObserver() noexcept {
+    release_retry_armed_observer.store(true, std::memory_order_release);
+}
+
 void observeLaneState(int event, size_t queue_depth, uint64_t,
                       size_t active_sockets, bool lane_has_current) noexcept {
     updateMaximum(maximum_observed_queue_depth, queue_depth);
@@ -213,8 +223,16 @@ void observeLaneState(int event, size_t queue_depth, uint64_t,
         lane_shutdown_clean_count.fetch_add(1, std::memory_order_relaxed);
     if (event == kLaneLateHandler)
         late_lane_handler_count.fetch_add(1, std::memory_order_relaxed);
-    if (event == kLaneRetryArmed)
+    if (event == kLaneRetryArmed) {
         retry_armed_count.fetch_add(1, std::memory_order_relaxed);
+        if (hold_retry_armed_observer.load(std::memory_order_acquire)) {
+            retry_armed_observer_entered.store(true, std::memory_order_release);
+            while (
+                !release_retry_armed_observer.load(std::memory_order_acquire)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+    }
     if (event == kLaneRetryFired)
         retry_fired_count.fetch_add(1, std::memory_order_relaxed);
     if (event == kLaneRetryLate)
@@ -239,7 +257,8 @@ class ScopedLaneHooks {
    public:
     explicit ScopedLaneHooks(bool block_first_connect_handler = false,
                              bool block_after_busy = false,
-                             bool block_retry = false) {
+                             bool block_retry = false,
+                             bool block_retry_armed = false) {
         resetLaneTestState();
         tcpTransportSetLaneObserverHookForTest(observeLaneState);
         tcpTransportSetLaneFailureReasonHookForTest(observeWorkFailureReason);
@@ -255,6 +274,8 @@ class ScopedLaneHooks {
             hold_retry_handler.store(true, std::memory_order_release);
             tcpTransportSetLaneRetryHandlerHookForTest(blockRetryHandler);
         }
+        hold_retry_armed_observer.store(block_retry_armed,
+                                        std::memory_order_release);
     }
 
     ~ScopedLaneHooks() { reset(); }
@@ -263,6 +284,7 @@ class ScopedLaneHooks {
         if (!active_) return;
         releaseLaneConnectHandler();
         releaseRetryHandler();
+        releaseRetryArmedObserver();
         tcpTransportSetLaneConnectHandlerHookForTest(nullptr);
         tcpTransportSetLaneRetryHandlerHookForTest(nullptr);
         tcpTransportSetLaneObserverHookForTest(nullptr);
@@ -1509,6 +1531,98 @@ TEST(TcpWriteVisibilityTest,
     hooks.reset();
     (void)h.engine->freeBatchID(first_batch);
     (void)h.engine->freeBatchID(cooldown_batch);
+}
+
+TEST(TcpWriteVisibilityTest,
+     RetryTimerSerializesDelayedPumpAndCooldownTransition) {
+    ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "1");
+    ScopedEnvVar queue_capacity("MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER", "2");
+    ScopedLaneHooks hooks(/*block_first_connect_handler=*/false,
+                          /*block_after_busy=*/false,
+                          /*block_retry=*/false,
+                          /*block_retry_armed=*/true);
+    const char* env = std::getenv("MC_METADATA_SERVER");
+    const std::string metadata_server = env ? env : "P2PHANDSHAKE";
+
+    UnavailableTcpPeer unavailable_peer;
+    ASSERT_TRUE(unavailable_peer.ok());
+
+    EngineHandle h;
+    h.init(metadata_server, "127.0.0.2:17928", 64 * 1024);
+    ASSERT_TRUE(h.ok);
+
+    auto desc = h.engine->getMetadata()->getSegmentDescByID(h.segment_id);
+    ASSERT_NE(desc, nullptr);
+    desc->tcp_data_port = unavailable_peer.port();
+    desc->tcp_proto_version = 2;
+
+    TransferRequest request;
+    request.opcode = TransferRequest::WRITE;
+    request.length = 1;
+    request.source = h.pool;
+    request.target_id = h.segment_id;
+    request.target_offset = h.remote_base;
+
+    const auto exhausted_batch = h.engine->allocateBatchID(1);
+    ASSERT_TRUE(h.engine->submitTransfer(exhausted_batch, {request}).ok());
+    ASSERT_TRUE(waitForPredicate(
+        [] {
+            return cooldown_started_count.load(std::memory_order_acquire) >=
+                       1 &&
+                   connect_failure_count.load(std::memory_order_acquire) >= 1;
+        },
+        std::chrono::seconds(2)));
+
+    const auto first_pending_batch = h.engine->allocateBatchID(1);
+    ASSERT_TRUE(h.engine->submitTransfer(first_pending_batch, {request}).ok());
+    ASSERT_TRUE(waitForPredicate(
+        [] {
+            return retry_armed_observer_entered.load(std::memory_order_acquire);
+        },
+        std::chrono::seconds(2)));
+
+    // The worker is blocked after timer registration and outside the group
+    // mutex. This admission posts a pump before the deadline; keeping the
+    // worker blocked past expiry makes that pump run before the ready timer.
+    const auto second_pending_batch = h.engine->allocateBatchID(1);
+    ASSERT_TRUE(h.engine->submitTransfer(second_pending_batch, {request}).ok());
+    ASSERT_TRUE(waitForPredicate(
+        [] {
+            return maximum_observed_queue_depth.load(
+                       std::memory_order_acquire) == 2;
+        },
+        std::chrono::seconds(2)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+
+    EXPECT_EQ(retry_armed_count.load(std::memory_order_acquire), 1);
+    EXPECT_EQ(lane_connecting_count.load(std::memory_order_acquire), 1);
+    EXPECT_EQ(queue_rejection_count.load(std::memory_order_acquire), 0);
+    EXPECT_LE(maximum_observed_queue_depth.load(std::memory_order_acquire), 2u);
+
+    releaseRetryArmedObserver();
+    ASSERT_TRUE(waitForPredicate(
+        [] {
+            return retry_fired_count.load(std::memory_order_acquire) == 1 &&
+                   connect_failure_count.load(std::memory_order_acquire) == 3;
+        },
+        std::chrono::seconds(5)));
+
+    h.engine.reset();
+    expectEverySliceCompletedExactlyOnceAfterShutdown(exhausted_batch);
+    expectEverySliceCompletedExactlyOnceAfterShutdown(first_pending_batch);
+    expectEverySliceCompletedExactlyOnceAfterShutdown(second_pending_batch);
+    EXPECT_EQ(retry_armed_count.load(std::memory_order_acquire), 1);
+    EXPECT_EQ(retry_fired_count.load(std::memory_order_acquire), 1);
+    // One initial attempt plus one timer-owned retry proves the delayed pump
+    // neither reset an active round nor created an extra immediate attempt.
+    EXPECT_EQ(lane_connecting_count.load(std::memory_order_acquire), 2);
+    EXPECT_EQ(connect_failure_count.load(std::memory_order_acquire), 3);
+    EXPECT_LE(maximum_observed_queue_depth.load(std::memory_order_acquire), 2u);
+
+    hooks.reset();
+    reclaimBatchDescAfterEngineShutdownForTest(exhausted_batch);
+    reclaimBatchDescAfterEngineShutdownForTest(first_pending_batch);
+    reclaimBatchDescAfterEngineShutdownForTest(second_pending_batch);
 }
 
 TEST(TcpWriteVisibilityTest,

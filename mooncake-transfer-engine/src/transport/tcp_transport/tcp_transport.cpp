@@ -1426,12 +1426,18 @@ void TcpTransport::handleRetryTimer(
             late = true;
         } else {
             group->retry_timer.reset();
-            if (ec || group->state != GroupState::OPEN) {
+            if (group->state != GroupState::OPEN) {
                 late = group->state != GroupState::OPEN;
-            } else if (!group->queue.empty()) {
+            } else if (!group->queue.empty() && !ec &&
+                       !hasUsableLaneLocked(*group) &&
+                       group->probes_in_flight == 0 &&
+                       group->connect_attempts_in_round >=
+                           group->lanes.size()) {
                 beginConnectRoundLocked(*group);
                 pump_epoch = requestGroupPumpLocked(*group);
                 fired = true;
+            } else if (!group->queue.empty() && group->probes_in_flight == 0) {
+                pump_epoch = requestGroupPumpLocked(*group);
             }
         }
     }
@@ -1629,16 +1635,18 @@ void TcpTransport::runGroupPump(
             sessions[session_count++] = {lane, lane->operation_epoch};
         }
 
-        bool waiting_for_cooldown = false;
-        if (!group->queue.empty() && !hasUsableLaneLocked(*group) &&
-            group->probes_in_flight == 0 &&
+        // Once armed, the retry timer exclusively owns the transition out of
+        // cooldown. A delayed pump must not reset round accounting or start a
+        // probe before the matching timer handler validates the group.
+        bool waiting_for_cooldown = group->retry_timer != nullptr;
+        if (!waiting_for_cooldown && !group->queue.empty() &&
+            !hasUsableLaneLocked(*group) && group->probes_in_flight == 0 &&
             group->connect_attempts_in_round >= group->lanes.size()) {
             if (std::chrono::steady_clock::now() <
                 group->next_probe_not_before) {
-                const bool timer_was_armed = group->retry_timer != nullptr;
                 if (armRetryTimerLocked(group)) {
                     waiting_for_cooldown = true;
-                    retry_armed = !timer_was_armed && group->retry_timer;
+                    retry_armed = group->retry_timer != nullptr;
                 } else {
                     failed.swap(group->queue);
                     clearQueuedBytesLocked(*group);
