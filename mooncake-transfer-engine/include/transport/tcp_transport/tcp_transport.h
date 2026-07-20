@@ -34,6 +34,7 @@
 
 #include <asio/io_context.hpp>
 #include <asio/ip/tcp.hpp>
+#include <asio/steady_timer.hpp>
 
 #include "transfer_metadata.h"
 #include "transport/transport.h"
@@ -126,6 +127,14 @@ class TcpTransport : public Transport {
         SHUTDOWN,
     };
 
+    struct FailureCounters {
+        std::atomic<uint64_t> queue_full{0};
+        std::atomic<uint64_t> connect_failed{0};
+        std::atomic<uint64_t> runtime_unavailable{0};
+        std::atomic<uint64_t> session_failed{0};
+        std::atomic<uint64_t> shutdown{0};
+    };
+
     struct TcpWorkItem {
         Slice *slice = nullptr;
         bool use_v2 = false;
@@ -213,11 +222,13 @@ class TcpTransport : public Transport {
     struct PeerConnectionGroup {
         PeerConnectionGroup(ConnectionKey key_arg,
                             const asio::io_context::executor_type &executor_arg,
-                            size_t lane_count_arg, size_t queue_capacity_arg)
+                            size_t lane_count_arg, size_t queue_capacity_arg,
+                            std::shared_ptr<FailureCounters> counters_arg)
             : key(std::move(key_arg)),
               executor(executor_arg),
               lane_count(lane_count_arg),
-              queue_capacity(queue_capacity_arg) {}
+              queue_capacity(queue_capacity_arg),
+              failure_counters(std::move(counters_arg)) {}
 
         std::mutex mutex;
         GroupState state = GroupState::OPEN;
@@ -227,6 +238,7 @@ class TcpTransport : public Transport {
         size_t queue_capacity;
         std::deque<TcpWorkItem> queue;
         uint64_t queued_bytes = 0;
+        bool queued_bytes_saturated = false;
         uint64_t next_admission_sequence = 1;
         std::vector<std::shared_ptr<ConnectionLane>> lanes;
         bool pump_scheduled = false;
@@ -235,6 +247,11 @@ class TcpTransport : public Transport {
         size_t connect_attempts_in_round = 0;
         size_t probes_in_flight = 0;
         bool connect_round_had_success = false;
+        std::chrono::steady_clock::time_point next_probe_not_before{};
+        std::shared_ptr<asio::steady_timer> retry_timer;
+        uint64_t retry_epoch = 0;
+        uint64_t connect_failure_log_count = 0;
+        std::shared_ptr<FailureCounters> failure_counters;
     };
 
     struct ConnectionLaneState {
@@ -246,6 +263,8 @@ class TcpTransport : public Transport {
                            ConnectionKeyHash>
             groups;
         std::weak_ptr<ConnectionLaneRuntime> runtime;
+        std::shared_ptr<FailureCounters> failure_counters =
+            std::make_shared<FailureCounters>();
     };
 
     std::shared_ptr<ConnectionLaneRuntime> lane_runtime_;
@@ -278,6 +297,12 @@ class TcpTransport : public Transport {
         const std::shared_ptr<PeerConnectionGroup> &group,
         const std::shared_ptr<ConnectionLane> &lane, uint64_t epoch,
         const std::string &error);
+    static bool armRetryTimerLocked(
+        const std::shared_ptr<PeerConnectionGroup> &group);
+    static void handleRetryTimer(
+        const std::shared_ptr<PeerConnectionGroup> &group,
+        const std::shared_ptr<asio::steady_timer> &timer, uint64_t retry_epoch,
+        asio::error_code ec);
     static void startLaneSession(
         const std::shared_ptr<PeerConnectionGroup> &group,
         const std::shared_ptr<ConnectionLane> &lane, uint64_t epoch);
@@ -286,15 +311,26 @@ class TcpTransport : public Transport {
         const std::shared_ptr<ConnectionLane> &lane, uint64_t epoch,
         TransferStatusEnum status, bool connection_clean) noexcept;
     static void completeTerminalAction(TerminalAction action) noexcept;
-    static void failWorkItem(TcpWorkItem work,
-                             WorkFailureReason reason) noexcept;
-    static void failWorkItems(std::deque<TcpWorkItem> work,
-                              WorkFailureReason reason) noexcept;
+    static void failWorkItem(
+        TcpWorkItem work, WorkFailureReason reason,
+        const std::shared_ptr<FailureCounters> &counters) noexcept;
+    static void failWorkItems(
+        std::deque<TcpWorkItem> work, WorkFailureReason reason,
+        const std::shared_ptr<FailureCounters> &counters) noexcept;
+    static uint64_t recordWorkFailure(
+        WorkFailureReason reason,
+        const std::shared_ptr<FailureCounters> &counters) noexcept;
     static bool hasUsableLaneLocked(const PeerConnectionGroup &group);
 #ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
     static size_t activeSocketCountLocked(const PeerConnectionGroup &group);
 #endif
     static void beginConnectRoundLocked(PeerConnectionGroup &group);
+    static void enterReconnectCooldownLocked(PeerConnectionGroup &group);
+    static void addQueuedBytesLocked(PeerConnectionGroup &group,
+                                     uint64_t length);
+    static void removeQueuedBytesLocked(PeerConnectionGroup &group,
+                                        uint64_t length);
+    static void clearQueuedBytesLocked(PeerConnectionGroup &group);
     static void closeSocketNoThrow(
         const std::shared_ptr<asio::ip::tcp::socket> &socket) noexcept;
     void shutdownConnectionLanes();

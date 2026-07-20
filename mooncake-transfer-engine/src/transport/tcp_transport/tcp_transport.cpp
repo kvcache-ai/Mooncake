@@ -51,11 +51,15 @@ using tcpsocket = asio::ip::tcp::socket;
 #ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
 namespace {
 using LaneConnectHandlerHook = void (*)() noexcept;
+using LaneRetryHandlerHook = void (*)() noexcept;
 using LaneObserverHook = void (*)(int, size_t, uint64_t, size_t, bool) noexcept;
+using LaneFailureReasonHook = void (*)(int) noexcept;
 
 std::mutex lane_test_hook_mutex;
 LaneConnectHandlerHook lane_connect_handler_hook = nullptr;
+LaneRetryHandlerHook lane_retry_handler_hook = nullptr;
 LaneObserverHook lane_observer_hook = nullptr;
+LaneFailureReasonHook lane_failure_reason_hook = nullptr;
 
 enum LaneTestEvent {
     kLaneQueueAdmitted = 1,
@@ -65,6 +69,10 @@ enum LaneTestEvent {
     kLaneTerminal = 5,
     kLaneShutdownClean = 6,
     kLaneLateHandler = 7,
+    kLaneRetryArmed = 8,
+    kLaneRetryFired = 9,
+    kLaneRetryLate = 10,
+    kLaneCooldownStarted = 11,
 };
 
 void invokeLaneConnectHandlerHook() noexcept {
@@ -72,6 +80,15 @@ void invokeLaneConnectHandlerHook() noexcept {
     {
         std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
         hook = lane_connect_handler_hook;
+    }
+    if (hook) hook();
+}
+
+void invokeLaneRetryHandlerHook() noexcept {
+    LaneRetryHandlerHook hook;
+    {
+        std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
+        hook = lane_retry_handler_hook;
     }
     if (hook) hook();
 }
@@ -88,6 +105,15 @@ void invokeLaneObserverHook(int event, size_t queue_depth,
         hook(event, queue_depth, queued_bytes, active_sockets,
              lane_has_current);
 }
+
+void invokeLaneFailureReasonHook(int reason) noexcept {
+    LaneFailureReasonHook hook;
+    {
+        std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
+        hook = lane_failure_reason_hook;
+    }
+    if (hook) hook(reason);
+}
 }  // namespace
 
 void tcpTransportSetLaneConnectHandlerHookForTest(
@@ -99,6 +125,18 @@ void tcpTransportSetLaneConnectHandlerHookForTest(
 void tcpTransportSetLaneObserverHookForTest(LaneObserverHook hook) noexcept {
     std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
     lane_observer_hook = hook;
+}
+
+void tcpTransportSetLaneRetryHandlerHookForTest(
+    LaneRetryHandlerHook hook) noexcept {
+    std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
+    lane_retry_handler_hook = hook;
+}
+
+void tcpTransportSetLaneFailureReasonHookForTest(
+    LaneFailureReasonHook hook) noexcept {
+    std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
+    lane_failure_reason_hook = hook;
 }
 
 bool tcpTransportLaneTypesAreMoveOnlyForTest() noexcept {
@@ -1239,9 +1277,18 @@ std::shared_ptr<asio::ip::tcp::socket> TcpTransport::getConnection(
 
 namespace {
 constexpr size_t kMaxConcurrentLaneProbes = 1;
+// Conservative fixed policy for the first rate-limited implementation. The
+// exact cooldown/backoff policy remains subject to maintainer review.
+constexpr auto kReconnectRoundCooldown = std::chrono::seconds(1);
 constexpr auto kShutdownCancellationWait = std::chrono::seconds(2);
 
-struct LaneShutdownBarrier {
+bool shouldLogOccurrence(uint64_t occurrence) {
+    return occurrence != 0 && (occurrence & (occurrence - 1)) == 0;
+}
+
+// Tracks only whether executor-posted cancellation actions ran. It is not an
+// asynchronous-handler quiescence barrier; stop/join provides that boundary.
+struct LaneCancellationPostTracker {
     std::mutex mutex;
     std::condition_variable cv;
     size_t pending = 0;
@@ -1292,6 +1339,110 @@ void TcpTransport::beginConnectRoundLocked(PeerConnectionGroup& group) {
     if (group.connect_round == 0) group.connect_round = 1;
     group.connect_attempts_in_round = 0;
     group.connect_round_had_success = false;
+    group.next_probe_not_before = {};
+}
+
+void TcpTransport::enterReconnectCooldownLocked(PeerConnectionGroup& group) {
+    group.next_probe_not_before =
+        std::chrono::steady_clock::now() + kReconnectRoundCooldown;
+}
+
+void TcpTransport::addQueuedBytesLocked(PeerConnectionGroup& group,
+                                        uint64_t length) {
+    if (group.queued_bytes_saturated) return;
+    if (group.queued_bytes > std::numeric_limits<uint64_t>::max() - length) {
+        group.queued_bytes = std::numeric_limits<uint64_t>::max();
+        group.queued_bytes_saturated = true;
+        return;
+    }
+    group.queued_bytes += length;
+}
+
+void TcpTransport::removeQueuedBytesLocked(PeerConnectionGroup& group,
+                                           uint64_t length) {
+    if (!group.queued_bytes_saturated) {
+        group.queued_bytes =
+            group.queued_bytes >= length ? group.queued_bytes - length : 0;
+        return;
+    }
+
+    // Once saturated, UINT64_MAX is only an explicit lower-fidelity marker,
+    // not an exact sum. Recompute after removal so exact accounting resumes as
+    // soon as the remaining queue fits in uint64_t.
+    group.queued_bytes = 0;
+    group.queued_bytes_saturated = false;
+    for (const auto& item : group.queue) {
+        addQueuedBytesLocked(group, item.slice->length);
+        if (group.queued_bytes_saturated) break;
+    }
+}
+
+void TcpTransport::clearQueuedBytesLocked(PeerConnectionGroup& group) {
+    group.queued_bytes = 0;
+    group.queued_bytes_saturated = false;
+}
+
+bool TcpTransport::armRetryTimerLocked(
+    const std::shared_ptr<PeerConnectionGroup>& group) {
+    if (group->retry_timer || group->state != GroupState::OPEN ||
+        group->queue.empty()) {
+        return true;
+    }
+
+    try {
+        auto timer = std::make_shared<asio::steady_timer>(group->executor);
+        timer->expires_at(group->next_probe_not_before);
+        ++group->retry_epoch;
+        if (group->retry_epoch == 0) ++group->retry_epoch;
+        const uint64_t retry_epoch = group->retry_epoch;
+        group->retry_timer = timer;
+        // A handler abandoned by io_context.stop() is harmless: it holds only
+        // group/timer shared state and can only request a new connection round.
+        timer->async_wait([group, timer, retry_epoch](asio::error_code ec) {
+#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
+            invokeLaneRetryHandlerHook();
+#endif
+            handleRetryTimer(group, timer, retry_epoch, ec);
+        });
+        return true;
+    } catch (...) {
+        group->retry_timer.reset();
+        ++group->retry_epoch;
+        if (group->retry_epoch == 0) ++group->retry_epoch;
+        return false;
+    }
+}
+
+void TcpTransport::handleRetryTimer(
+    const std::shared_ptr<PeerConnectionGroup>& group,
+    const std::shared_ptr<asio::steady_timer>& timer, uint64_t retry_epoch,
+    asio::error_code ec) {
+    uint64_t pump_epoch = 0;
+    [[maybe_unused]] bool fired = false;
+    [[maybe_unused]] bool late = false;
+    {
+        std::lock_guard<std::mutex> lock(group->mutex);
+        if (group->retry_epoch != retry_epoch || group->retry_timer != timer) {
+            late = true;
+        } else {
+            group->retry_timer.reset();
+            if (ec || group->state != GroupState::OPEN) {
+                late = group->state != GroupState::OPEN;
+            } else if (!group->queue.empty()) {
+                beginConnectRoundLocked(*group);
+                pump_epoch = requestGroupPumpLocked(*group);
+                fired = true;
+            }
+        }
+    }
+
+#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
+    if (late)
+        invokeLaneObserverHook(kLaneRetryLate, 0, 0, 0, false);
+    else if (fired)
+        invokeLaneObserverHook(kLaneRetryFired, 0, 0, 0, false);
+#endif
+    if (pump_epoch != 0) postGroupPump(group, pump_epoch);
 }
 
 uint64_t TcpTransport::requestGroupPumpLocked(PeerConnectionGroup& group) {
@@ -1333,7 +1484,8 @@ void TcpTransport::enqueuePooledTransfer(const ConnectionKey& key,
                 if (group_it == state->groups.end()) {
                     group = std::make_shared<PeerConnectionGroup>(
                         key, runtime->executor, state->lanes_per_peer,
-                        state->max_queued_transfers_per_peer);
+                        state->max_queued_transfers_per_peer,
+                        state->failure_counters);
                     group->lanes.reserve(state->lanes_per_peer);
                     for (size_t i = 0; i < state->lanes_per_peer; ++i) {
                         group->lanes.push_back(
@@ -1353,24 +1505,15 @@ void TcpTransport::enqueuePooledTransfer(const ConnectionKey& key,
                 } else if (group->queue.size() >= group->queue_capacity) {
                     rejected.emplace(std::move(work));
                 } else {
-                    const bool was_empty = group->queue.empty();
+                    // Submissions arriving during cooldown remain subject to
+                    // the bounded queue and wait until the retry timer expires
+                    // and a new round begins, so their added latency is bounded
+                    // by the cooldown length.
                     work.admission_sequence = group->next_admission_sequence++;
                     work.enqueued_at = std::chrono::steady_clock::now();
                     group->queue.emplace_back(std::move(work));
-                    const uint64_t length = group->queue.back().slice->length;
-                    if (group->queued_bytes >
-                        std::numeric_limits<uint64_t>::max() - length) {
-                        group->queued_bytes =
-                            std::numeric_limits<uint64_t>::max();
-                    } else {
-                        group->queued_bytes += length;
-                    }
-                    if (was_empty && !hasUsableLaneLocked(*group) &&
-                        group->probes_in_flight == 0 &&
-                        group->connect_attempts_in_round >=
-                            group->lanes.size()) {
-                        beginConnectRoundLocked(*group);
-                    }
+                    addQueuedBytesLocked(*group,
+                                         group->queue.back().slice->length);
                     pump_epoch = requestGroupPumpLocked(*group);
 #ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
                     queue_depth = group->queue.size();
@@ -1403,7 +1546,8 @@ void TcpTransport::enqueuePooledTransfer(const ConnectionKey& key,
 #endif
 
     if (rejected)
-        failWorkItem(std::move(*rejected), rejection_reason);
+        failWorkItem(std::move(*rejected), rejection_reason,
+                     state->failure_counters);
     else if (pump_epoch != 0)
         postGroupPump(group, pump_epoch);
 }
@@ -1420,13 +1564,13 @@ void TcpTransport::postGroupPump(
             if (group->pump_scheduled && group->pump_epoch == pump_epoch) {
                 group->pump_scheduled = false;
                 failed.swap(group->queue);
-                group->queued_bytes = 0;
+                clearQueuedBytesLocked(*group);
             }
         }
         LOG(ERROR) << "Failed to schedule TCP lane pump for " << group->key.host
                    << ":" << group->key.port << ". Error: " << e.what();
-        failWorkItems(std::move(failed),
-                      WorkFailureReason::RUNTIME_UNAVAILABLE);
+        failWorkItems(std::move(failed), WorkFailureReason::RUNTIME_UNAVAILABLE,
+                      group->failure_counters);
     } catch (...) {
         std::deque<TcpWorkItem> failed;
         {
@@ -1434,13 +1578,13 @@ void TcpTransport::postGroupPump(
             if (group->pump_scheduled && group->pump_epoch == pump_epoch) {
                 group->pump_scheduled = false;
                 failed.swap(group->queue);
-                group->queued_bytes = 0;
+                clearQueuedBytesLocked(*group);
             }
         }
         LOG(ERROR) << "Failed to schedule TCP lane pump for " << group->key.host
                    << ":" << group->key.port;
-        failWorkItems(std::move(failed),
-                      WorkFailureReason::RUNTIME_UNAVAILABLE);
+        failWorkItems(std::move(failed), WorkFailureReason::RUNTIME_UNAVAILABLE,
+                      group->failure_counters);
     }
 }
 
@@ -1455,6 +1599,9 @@ void TcpTransport::runGroupPump(
     size_t session_count = 0;
     size_t connect_count = 0;
     std::deque<TcpWorkItem> failed;
+    WorkFailureReason failure_reason = WorkFailureReason::CONNECT_FAILED;
+    [[maybe_unused]] bool retry_armed = false;
+    [[maybe_unused]] bool cooldown_started = false;
 
     {
         std::lock_guard<std::mutex> lock(group->mutex);
@@ -1473,53 +1620,80 @@ void TcpTransport::runGroupPump(
 
             lane->current.emplace(std::move(group->queue.front()));
             const uint64_t length = lane->current->slice->length;
-            group->queued_bytes = group->queued_bytes >= length
-                                      ? group->queued_bytes - length
-                                      : 0;
             group->queue.pop_front();
-            if (group->queue.empty()) group->queued_bytes = 0;
+            removeQueuedBytesLocked(*group, length);
+            if (group->queue.empty()) clearQueuedBytesLocked(*group);
             lane->state = LaneState::BUSY;
             ++lane->operation_epoch;
             if (lane->operation_epoch == 0) ++lane->operation_epoch;
             sessions[session_count++] = {lane, lane->operation_epoch};
         }
 
-        const size_t probe_limit =
-            std::min(group->lane_count, kMaxConcurrentLaneProbes);
-        while (!group->queue.empty() && group->probes_in_flight < probe_limit) {
-            auto lane_it = std::find_if(
-                group->lanes.begin(), group->lanes.end(),
-                [&group](const auto& lane) {
-                    return lane->state == LaneState::DISCONNECTED &&
-                           lane->last_connect_round != group->connect_round;
-                });
-            if (lane_it == group->lanes.end()) break;
-
-            auto lane = *lane_it;
-            lane->state = LaneState::CONNECTING;
-            lane->connect_stage = LaneConnectStage::NONE;
-            lane->last_connect_round = group->connect_round;
-            ++lane->operation_epoch;
-            if (lane->operation_epoch == 0) ++lane->operation_epoch;
-            ++group->probes_in_flight;
-            ++group->connect_attempts_in_round;
-            connects[connect_count++] = {lane, lane->operation_epoch};
-        }
-
+        bool waiting_for_cooldown = false;
         if (!group->queue.empty() && !hasUsableLaneLocked(*group) &&
             group->probes_in_flight == 0 &&
             group->connect_attempts_in_round >= group->lanes.size()) {
-            failed.swap(group->queue);
-            group->queued_bytes = 0;
-            beginConnectRoundLocked(*group);
+            if (std::chrono::steady_clock::now() <
+                group->next_probe_not_before) {
+                const bool timer_was_armed = group->retry_timer != nullptr;
+                if (armRetryTimerLocked(group)) {
+                    waiting_for_cooldown = true;
+                    retry_armed = !timer_was_armed && group->retry_timer;
+                } else {
+                    failed.swap(group->queue);
+                    clearQueuedBytesLocked(*group);
+                    failure_reason = WorkFailureReason::RUNTIME_UNAVAILABLE;
+                }
+            } else {
+                beginConnectRoundLocked(*group);
+            }
+        }
+
+        if (!waiting_for_cooldown && failed.empty()) {
+            const size_t probe_limit =
+                std::min(group->lane_count, kMaxConcurrentLaneProbes);
+            while (!group->queue.empty() &&
+                   group->probes_in_flight < probe_limit) {
+                auto lane_it = std::find_if(
+                    group->lanes.begin(), group->lanes.end(),
+                    [&group](const auto& lane) {
+                        return lane->state == LaneState::DISCONNECTED &&
+                               lane->last_connect_round != group->connect_round;
+                    });
+                if (lane_it == group->lanes.end()) break;
+
+                auto lane = *lane_it;
+                lane->state = LaneState::CONNECTING;
+                lane->connect_stage = LaneConnectStage::NONE;
+                lane->last_connect_round = group->connect_round;
+                ++lane->operation_epoch;
+                if (lane->operation_epoch == 0) ++lane->operation_epoch;
+                ++group->probes_in_flight;
+                ++group->connect_attempts_in_round;
+                connects[connect_count++] = {lane, lane->operation_epoch};
+            }
+
+            if (!group->queue.empty() && !hasUsableLaneLocked(*group) &&
+                group->probes_in_flight == 0 &&
+                group->connect_attempts_in_round >= group->lanes.size()) {
+                failed.swap(group->queue);
+                clearQueuedBytesLocked(*group);
+                enterReconnectCooldownLocked(*group);
+                cooldown_started = true;
+            }
         }
     }
 
+#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
+    if (retry_armed) invokeLaneObserverHook(kLaneRetryArmed, 0, 0, 0, false);
+    if (cooldown_started)
+        invokeLaneObserverHook(kLaneCooldownStarted, 0, 0, 0, false);
+#endif
     for (size_t i = 0; i < connect_count; ++i)
         startLaneConnect(group, connects[i].lane, connects[i].epoch);
     for (size_t i = 0; i < session_count; ++i)
         startLaneSession(group, sessions[i].lane, sessions[i].epoch);
-    failWorkItems(std::move(failed), WorkFailureReason::CONNECT_FAILED);
+    failWorkItems(std::move(failed), failure_reason, group->failure_counters);
 }
 
 void TcpTransport::startLaneConnect(
@@ -1673,12 +1847,15 @@ void TcpTransport::handleLaneConnectFailure(
     std::deque<TcpWorkItem> failed;
     uint64_t pump_epoch = 0;
     bool stale = false;
+    [[maybe_unused]] bool cooldown_started = false;
+    uint64_t connect_failure_log_count = 0;
     {
         std::lock_guard<std::mutex> lock(group->mutex);
         if (lane->state != LaneState::CONNECTING ||
             lane->operation_epoch != epoch) {
             stale = true;
         } else {
+            connect_failure_log_count = ++group->connect_failure_log_count;
             if (group->probes_in_flight != 0) --group->probes_in_flight;
             resolver = std::move(lane->resolver);
             socket = std::move(lane->socket);
@@ -1691,8 +1868,9 @@ void TcpTransport::handleLaneConnectFailure(
                 !hasUsableLaneLocked(*group) && group->probes_in_flight == 0 &&
                 group->connect_attempts_in_round >= group->lanes.size()) {
                 failed.swap(group->queue);
-                group->queued_bytes = 0;
-                beginConnectRoundLocked(*group);
+                clearQueuedBytesLocked(*group);
+                enterReconnectCooldownLocked(*group);
+                cooldown_started = true;
             } else {
                 pump_epoch = requestGroupPumpLocked(*group);
             }
@@ -1706,14 +1884,18 @@ void TcpTransport::handleLaneConnectFailure(
         }
     }
     closeSocketNoThrow(socket);
-    if (!stale) {
+    if (!stale && shouldLogOccurrence(connect_failure_log_count)) {
         LOG(ERROR) << "TCP lane connection to " << group->key.host << ":"
-                   << group->key.port << " failed: " << error;
+                   << group->key.port << " failed: " << error
+                   << " (attempt failure " << connect_failure_log_count << ")";
     }
 #ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
     if (stale) invokeLaneObserverHook(kLaneLateHandler, 0, 0, 0, false);
+    if (cooldown_started)
+        invokeLaneObserverHook(kLaneCooldownStarted, 0, 0, 0, false);
 #endif
-    failWorkItems(std::move(failed), WorkFailureReason::CONNECT_FAILED);
+    failWorkItems(std::move(failed), WorkFailureReason::CONNECT_FAILED,
+                  group->failure_counters);
     if (pump_epoch != 0) postGroupPump(group, pump_epoch);
 }
 
@@ -1736,6 +1918,12 @@ void TcpTransport::startLaneSession(
         if (!lane->socket || !lane->socket->is_open()) {
             initiation_error = "lane socket is not open";
         } else {
+            // This function runs on the TCP executor. Keep construction and
+            // initial Asio initiation under the group lock so shutdown cannot
+            // invalidate the checked epoch between validation and initiation.
+            // Asio initiating functions do not invoke their completion handler
+            // inline, so this cannot call lane terminal completion under the
+            // mutex.
             try {
                 std::weak_ptr<PeerConnectionGroup> weak_group(group);
                 std::weak_ptr<ConnectionLane> weak_lane(lane);
@@ -1870,19 +2058,58 @@ void TcpTransport::completeTerminalAction(TerminalAction action) noexcept {
     }
 }
 
-void TcpTransport::failWorkItem(TcpWorkItem work,
-                                WorkFailureReason reason) noexcept {
-    (void)reason;
+uint64_t TcpTransport::recordWorkFailure(
+    WorkFailureReason reason,
+    const std::shared_ptr<FailureCounters>& counters) noexcept {
+    if (!counters) return 0;
+
+    std::atomic<uint64_t>* counter = nullptr;
+    switch (reason) {
+        case WorkFailureReason::QUEUE_FULL:
+            counter = &counters->queue_full;
+            break;
+        case WorkFailureReason::RUNTIME_UNAVAILABLE:
+            counter = &counters->runtime_unavailable;
+            break;
+        case WorkFailureReason::CONNECT_FAILED:
+            counter = &counters->connect_failed;
+            break;
+        case WorkFailureReason::SESSION_FAILED:
+            counter = &counters->session_failed;
+            break;
+        case WorkFailureReason::SHUTDOWN:
+            counter = &counters->shutdown;
+            break;
+    }
+    if (!counter) return 0;
+
+    const uint64_t occurrence =
+        counter->fetch_add(1, std::memory_order_relaxed) + 1;
+    if (reason == WorkFailureReason::QUEUE_FULL &&
+        shouldLogOccurrence(occurrence)) {
+        LOG(WARNING) << "TCP lane queue-full rejection count: " << occurrence;
+    }
+#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
+    invokeLaneFailureReasonHook(static_cast<int>(reason));
+#endif
+    return occurrence;
+}
+
+void TcpTransport::failWorkItem(
+    TcpWorkItem work, WorkFailureReason reason,
+    const std::shared_ptr<FailureCounters>& counters) noexcept {
+    recordWorkFailure(reason, counters);
     completeTerminalAction(
         TerminalAction(std::move(work), TransferStatusEnum::FAILED, false));
 }
 
-void TcpTransport::failWorkItems(std::deque<TcpWorkItem> work,
-                                 WorkFailureReason reason) noexcept {
+void TcpTransport::failWorkItems(
+    std::deque<TcpWorkItem> work, WorkFailureReason reason,
+    const std::shared_ptr<FailureCounters>& counters) noexcept {
     while (!work.empty()) {
         auto item = std::move(work.front());
         work.pop_front();
-        failWorkItem(std::move(item), reason);
+        failWorkItem(std::move(item), reason, counters);
     }
 }
 
@@ -1913,7 +2140,9 @@ void TcpTransport::shutdownConnectionLanes() {
             group->pump_scheduled = false;
             ++group->pump_epoch;
             queued.swap(group->queue);
-            group->queued_bytes = 0;
+            clearQueuedBytesLocked(*group);
+            ++group->retry_epoch;
+            if (group->retry_epoch == 0) ++group->retry_epoch;
             for (const auto& lane : group->lanes) {
                 ++lane->operation_epoch;
                 if (lane->operation_epoch == 0) ++lane->operation_epoch;
@@ -1921,21 +2150,24 @@ void TcpTransport::shutdownConnectionLanes() {
                     lane->state = LaneState::CLOSING;
             }
         }
-        failWorkItems(std::move(queued), WorkFailureReason::SHUTDOWN);
+        failWorkItems(std::move(queued), WorkFailureReason::SHUTDOWN,
+                      state->failure_counters);
     }
 
-    auto barrier = std::make_shared<LaneShutdownBarrier>();
+    auto cancellation_posts = std::make_shared<LaneCancellationPostTracker>();
     if (context_ && running_) {
         for (const auto& group : groups) {
-            barrier->add();
+            cancellation_posts->add();
             try {
-                asio::post(group->executor, [group, barrier] {
+                asio::post(group->executor, [group, cancellation_posts] {
                     std::vector<std::shared_ptr<ClientSession>> sessions;
                     std::vector<std::shared_ptr<asio::ip::tcp::resolver>>
                         resolvers;
                     std::vector<std::shared_ptr<asio::ip::tcp::socket>> sockets;
+                    std::shared_ptr<asio::steady_timer> retry_timer;
                     {
                         std::lock_guard<std::mutex> lock(group->mutex);
+                        retry_timer = group->retry_timer;
                         for (const auto& lane : group->lanes) {
                             if (lane->session)
                                 sessions.push_back(lane->session);
@@ -1955,14 +2187,18 @@ void TcpTransport::shutdownConnectionLanes() {
                     }
                     for (const auto& socket : sockets)
                         closeSocketNoThrow(socket);
-                    barrier->done();
+                    if (retry_timer) {
+                        asio::error_code timer_ec;
+                        retry_timer->cancel(timer_ec);
+                    }
+                    cancellation_posts->done();
                 });
             } catch (...) {
-                barrier->done();
+                cancellation_posts->done();
             }
         }
-        barrier->waitUntil(std::chrono::steady_clock::now() +
-                           kShutdownCancellationWait);
+        cancellation_posts->waitUntil(std::chrono::steady_clock::now() +
+                                      kShutdownCancellationWait);
     }
 
     running_ = false;
@@ -1973,10 +2209,13 @@ void TcpTransport::shutdownConnectionLanes() {
     std::vector<std::shared_ptr<ClientSession>> sessions;
     std::vector<std::shared_ptr<asio::ip::tcp::resolver>> resolvers;
     std::vector<std::shared_ptr<asio::ip::tcp::socket>> sockets;
+    std::vector<std::shared_ptr<asio::steady_timer>> retry_timers;
 
     for (const auto& group : groups) {
         {
             std::lock_guard<std::mutex> lock(group->mutex);
+            if (group->retry_timer)
+                retry_timers.push_back(std::move(group->retry_timer));
             for (const auto& lane : group->lanes) {
                 if (lane->current) {
                     deferred.emplace_back(std::move(*lane->current));
@@ -2010,11 +2249,30 @@ void TcpTransport::shutdownConnectionLanes() {
         }
     }
     for (const auto& socket : sockets) closeSocketNoThrow(socket);
+    for (const auto& timer : retry_timers) {
+        if (!timer) continue;
+        asio::error_code timer_ec;
+        timer->cancel(timer_ec);
+    }
     sessions.clear();
     resolvers.clear();
     sockets.clear();
+    retry_timers.clear();
 
-    failWorkItems(std::move(deferred), WorkFailureReason::SHUTDOWN);
+    failWorkItems(std::move(deferred), WorkFailureReason::SHUTDOWN,
+                  state->failure_counters);
+
+    const auto& counters = state->failure_counters;
+    VLOG(1) << "TCP lane failure totals: queue_full="
+            << counters->queue_full.load(std::memory_order_relaxed)
+            << ", connect_failed="
+            << counters->connect_failed.load(std::memory_order_relaxed)
+            << ", runtime_unavailable="
+            << counters->runtime_unavailable.load(std::memory_order_relaxed)
+            << ", session_failed="
+            << counters->session_failed.load(std::memory_order_relaxed)
+            << ", shutdown="
+            << counters->shutdown.load(std::memory_order_relaxed);
 
     {
         std::lock_guard<std::mutex> state_lock(state->mutex);
@@ -2098,7 +2356,8 @@ void TcpTransport::startTransferWithSocket(
                    << ". Exception: " << e.what();
         closeSocketNoThrow(socket);
         failWorkItem(TcpWorkItem(slice, use_v2),
-                     WorkFailureReason::SESSION_FAILED);
+                     WorkFailureReason::SESSION_FAILED,
+                     lane_state_->failure_counters);
     } catch (...) {
         LOG(ERROR) << "TcpTransport::startTransfer encountered an unknown "
                       "exception. Slice details - source_addr: "
@@ -2107,7 +2366,8 @@ void TcpTransport::startTransferWithSocket(
                    << ", target_id: " << slice->target_id;
         closeSocketNoThrow(socket);
         failWorkItem(TcpWorkItem(slice, use_v2),
-                     WorkFailureReason::SESSION_FAILED);
+                     WorkFailureReason::SESSION_FAILED,
+                     lane_state_->failure_counters);
     }
 }
 
