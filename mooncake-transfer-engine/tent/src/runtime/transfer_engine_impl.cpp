@@ -160,10 +160,10 @@ PreservedTentConfigOverrides captureExplicitTransferEngineConfig(
         config, "rpc_server_hostname", std::string());
     preserved.rpc_server_port =
         captureExplicitConfigValue(config, "rpc_server_port", json());
-    preserved.rdma_whitelist = captureExplicitConfigValue(
-        config, "topology/rdma_whitelist", json());
-    preserved.rdma_blacklist = captureExplicitConfigValue(
-        config, "topology/rdma_blacklist", json());
+    preserved.rdma_whitelist =
+        captureExplicitConfigValue(config, "topology/rdma_whitelist", json());
+    preserved.rdma_blacklist =
+        captureExplicitConfigValue(config, "topology/rdma_blacklist", json());
     return preserved;
 }
 

@@ -95,8 +95,7 @@ std::optional<uint16_t> reserveUnusedTcpPort() {
     }
 }
 
-TEST(TransferEngineTentCompatTest,
-     LegacyP2pHandshakeSelectsRpcIdentity) {
+TEST(TransferEngineTentCompatTest, LegacyP2pHandshakeSelectsRpcIdentity) {
     TempConfigFile conf_file(R"({
         "log_level": "warning",
         "transports": {
@@ -130,8 +129,7 @@ TEST(TransferEngineTentCompatTest,
     EXPECT_EQ(engine.getLocalIpAndPort(),
               "127.0.0.1:" + std::to_string(engine.getRpcPort()));
     EXPECT_EQ(engine.installTransport("rdma", nullptr), nullptr);
-    EXPECT_EQ(engine.installTransport("definitely_unknown", nullptr),
-              nullptr);
+    EXPECT_EQ(engine.installTransport("definitely_unknown", nullptr), nullptr);
     EXPECT_EQ(engine.uninstallTransport("definitely_unknown"), 0);
 }
 
@@ -159,9 +157,7 @@ TEST(TransferEngineTentCompatTest,
 
     TransferEngine engine(/*auto_discover=*/false,
                           {"mlx5_from_ctor", "mlx5_second"});
-    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:1", "127.0.0.1",
-                          *port),
-              0);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:1", "127.0.0.1", *port), 0);
 
     auto links = mooncake::tent::json::parse(engine.showLinks(true));
     ASSERT_EQ(links["mode"], "tent");
@@ -169,8 +165,7 @@ TEST(TransferEngineTentCompatTest,
               std::vector<std::string>({"mlx5_from_ctor", "mlx5_second"}));
 }
 
-TEST(TransferEngineTentCompatTest,
-     LegacySetterFilterAppliesBeforeTentInit) {
+TEST(TransferEngineTentCompatTest, LegacySetterFilterAppliesBeforeTentInit) {
     TempConfigFile conf_file(R"({
         "log_level": "warning",
         "transports": {
@@ -192,17 +187,14 @@ TEST(TransferEngineTentCompatTest,
 
     TransferEngine engine(/*auto_discover=*/false);
     engine.setWhitelistFilters({"mlx5_from_setter"});
-    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:1", "127.0.0.1",
-                          *port),
-              0);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:1", "127.0.0.1", *port), 0);
 
     auto links = mooncake::tent::json::parse(engine.showLinks(true));
     ASSERT_EQ(links["rdma_whitelist"],
               std::vector<std::string>({"mlx5_from_setter"}));
 }
 
-TEST(TransferEngineTentCompatTest,
-     LegacyMemoryRegistrationOptionsMapToTent) {
+TEST(TransferEngineTentCompatTest, LegacyMemoryRegistrationOptionsMapToTent) {
     TempConfigFile conf_file(R"({
         "log_level": "warning",
         "transports": {
@@ -223,14 +215,12 @@ TEST(TransferEngineTentCompatTest,
     if (!port) GTEST_SKIP() << "Loopback TCP sockets are not available";
 
     TransferEngine engine(/*auto_discover=*/false);
-    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:1", "127.0.0.1",
-                          *port),
-              0);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:1", "127.0.0.1", *port), 0);
 
     std::vector<uint8_t> buffer(4096);
-    ASSERT_EQ(engine.registerLocalMemory(
-                  buffer.data(), buffer.size(), "cpu:0",
-                  /*remote_accessible=*/false, /*update_metadata=*/false),
+    ASSERT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size(), "cpu:0",
+                                         /*remote_accessible=*/false,
+                                         /*update_metadata=*/false),
               0);
     EXPECT_TRUE(engine.checkOverlap(buffer.data(), buffer.size()));
     EXPECT_TRUE(engine.checkOverlap(buffer.data() + 128, 16));
@@ -265,9 +255,7 @@ TEST(TransferEngineTentCompatTest,
     if (!port) GTEST_SKIP() << "Loopback TCP sockets are not available";
 
     TransferEngine engine(/*auto_discover=*/false);
-    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:1", "127.0.0.1",
-                          *port),
-              0);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:1", "127.0.0.1", *port), 0);
 
     EXPECT_EQ(engine.getMetadata(), nullptr);
     EXPECT_NE(engine.getLocalTopology(), nullptr);
@@ -295,18 +283,14 @@ TEST(TransferEngineTentCompatTest,
     if (!port) GTEST_SKIP() << "Loopback TCP sockets are not available";
 
     TransferEngine engine(/*auto_discover=*/false);
-    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:1", "127.0.0.1",
-                          *port),
-              0);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:1", "127.0.0.1", *port), 0);
 
     std::vector<uint8_t> buffer(4096);
     EXPECT_EQ(engine.registerLocalMemory(buffer.data(), 0, "cpu:0"),
               ERR_INVALID_ARGUMENT);
-    ASSERT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size(),
-                                         "cpu:0"),
+    ASSERT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size(), "cpu:0"),
               0);
-    EXPECT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size(),
-                                         "cpu:0"),
+    EXPECT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size(), "cpu:0"),
               ERR_ADDRESS_OVERLAPPED);
     EXPECT_EQ(engine.registerLocalMemory(buffer.data() + 128, 16, "cpu:0"),
               ERR_ADDRESS_OVERLAPPED);
@@ -338,9 +322,7 @@ TEST(TransferEngineTentCompatTest, LegacyBatchRegistrationRejectsOverlap) {
     if (!port) GTEST_SKIP() << "Loopback TCP sockets are not available";
 
     TransferEngine engine(/*auto_discover=*/false);
-    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:1", "127.0.0.1",
-                          *port),
-              0);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:1", "127.0.0.1", *port), 0);
 
     std::vector<uint8_t> buffer(4096);
     std::vector<BufferEntry> entries = {
@@ -360,10 +342,8 @@ TEST(TransferEngineTentCompatTest,
     EXPECT_TRUE(engine.isUsingTent());
     EXPECT_EQ(engine.getRpcPort(), 0);
     EXPECT_TRUE(engine.getLocalIpAndPort().empty());
-    EXPECT_EQ(engine.openSegment("missing"),
-              static_cast<SegmentHandle>(-1));
-    EXPECT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size(),
-                                         "cpu:0"),
+    EXPECT_EQ(engine.openSegment("missing"), static_cast<SegmentHandle>(-1));
+    EXPECT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size(), "cpu:0"),
               ERR_CONTEXT);
     EXPECT_EQ(engine.allocateBatchID(1), INVALID_BATCH_ID);
 
@@ -397,9 +377,7 @@ TEST(TransferEngineTentCompatTest,
     if (!port) GTEST_SKIP() << "Loopback TCP sockets are not available";
 
     TransferEngine engine(/*auto_discover=*/false);
-    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:1", "127.0.0.1",
-                          *port),
-              0);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:1", "127.0.0.1", *port), 0);
 
     TransferStatus transfer_status{Transport::COMPLETED, 123};
     auto status =
@@ -409,8 +387,7 @@ TEST(TransferEngineTentCompatTest,
     EXPECT_EQ(transfer_status.transferred_bytes, 123);
 }
 
-TEST(TransferEngineTentCompatTest,
-     LegacyApiCanReadTentSegmentBufferBase) {
+TEST(TransferEngineTentCompatTest, LegacyApiCanReadTentSegmentBufferBase) {
     TempConfigFile conf_file(R"({
         "log_level": "warning",
         "transports": {
@@ -432,8 +409,7 @@ TEST(TransferEngineTentCompatTest,
     if (!target_port || !initiator_port) {
         GTEST_SKIP() << "Loopback TCP sockets are not available";
     }
-    const std::string target_seed =
-        "127.0.0.1:" + std::to_string(*target_port);
+    const std::string target_seed = "127.0.0.1:" + std::to_string(*target_port);
     const std::string initiator_seed =
         "127.0.0.1:" + std::to_string(*initiator_port);
 
@@ -443,10 +419,10 @@ TEST(TransferEngineTentCompatTest,
     int target_init_rc = 1;
     int initiator_init_rc = 1;
     try {
-        target_init_rc = target.init(P2PHANDSHAKE, target_seed, "127.0.0.1",
-                                     *target_port);
-        initiator_init_rc = initiator.init(
-            P2PHANDSHAKE, initiator_seed, "127.0.0.1", *initiator_port);
+        target_init_rc =
+            target.init(P2PHANDSHAKE, target_seed, "127.0.0.1", *target_port);
+        initiator_init_rc = initiator.init(P2PHANDSHAKE, initiator_seed,
+                                           "127.0.0.1", *initiator_port);
     } catch (const std::exception& e) {
         GTEST_SKIP() << "Loopback RPC server is not available: " << e.what();
     }
@@ -493,8 +469,7 @@ TEST(TransferEngineTentCompatTest, CApiCanUseTentForLoopbackTransfer) {
     if (!target_port || !initiator_port) {
         GTEST_SKIP() << "Loopback TCP sockets are not available";
     }
-    const std::string target_seed =
-        "127.0.0.1:" + std::to_string(*target_port);
+    const std::string target_seed = "127.0.0.1:" + std::to_string(*target_port);
     const std::string initiator_seed =
         "127.0.0.1:" + std::to_string(*initiator_port);
 
@@ -507,9 +482,9 @@ TEST(TransferEngineTentCompatTest, CApiCanUseTentForLoopbackTransfer) {
     EXPECT_EQ(::discoverTopology(initiator), 0);
 
     char target_name_buf[128] = {};
-    ASSERT_EQ(::getLocalIpAndPort(target, target_name_buf,
-                                  sizeof(target_name_buf)),
-              0);
+    ASSERT_EQ(
+        ::getLocalIpAndPort(target, target_name_buf, sizeof(target_name_buf)),
+        0);
     const std::string target_name = target_name_buf;
     auto c_segment = ::openSegment(initiator, target_name.c_str());
     ASSERT_GE(c_segment, 0);
@@ -538,8 +513,8 @@ TEST(TransferEngineTentCompatTest, CApiCanUseTentForLoopbackTransfer) {
     ASSERT_EQ(::submitTransfer(initiator, batch, &request, 1), 0);
 
     transfer_status_t status{};
-    const auto deadline = std::chrono::steady_clock::now() +
-                          std::chrono::seconds(5);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
     do {
         ASSERT_EQ(::getTransferStatus(initiator, batch, 0, &status), 0);
         if (status.status == STATUS_COMPLETED) break;

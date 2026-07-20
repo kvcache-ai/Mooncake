@@ -327,9 +327,9 @@ std::string TransferEngine::showLinks(bool json) const {
 namespace mooncake {
 namespace {
 
-mooncake::tent::MemoryOptions makeTentMemoryOptions(
-    const std::string& location, bool remote_accessible,
-    bool update_metadata) {
+mooncake::tent::MemoryOptions makeTentMemoryOptions(const std::string& location,
+                                                    bool remote_accessible,
+                                                    bool update_metadata) {
     mooncake::tent::MemoryOptions option;
     option.perm = remote_accessible ? mooncake::tent::kGlobalReadWrite
                                     : mooncake::tent::kLocalReadWrite;
@@ -340,8 +340,8 @@ mooncake::tent::MemoryOptions makeTentMemoryOptions(
     return option;
 }
 
-bool rangesOverlap(uintptr_t lhs_base, uint64_t lhs_length,
-                   uintptr_t rhs_base, uint64_t rhs_length) {
+bool rangesOverlap(uintptr_t lhs_base, uint64_t lhs_length, uintptr_t rhs_base,
+                   uint64_t rhs_length) {
     if (lhs_length == 0 || rhs_length == 0) return false;
     const auto max_addr = std::numeric_limits<uintptr_t>::max();
     const uintptr_t lhs_end =
@@ -414,19 +414,17 @@ int tentStatusToClassicReturn(const mooncake::tent::Status& status) {
 bool containsOverlappingRange(
     const std::vector<std::pair<uintptr_t, uint64_t>>& ranges, uintptr_t base,
     uint64_t length) {
-    return std::any_of(ranges.begin(), ranges.end(),
-                       [base, length](const auto& range) {
-                           return rangesOverlap(base, length, range.first,
-                                                range.second);
-                       });
+    return std::any_of(
+        ranges.begin(), ranges.end(), [base, length](const auto& range) {
+            return rangesOverlap(base, length, range.first, range.second);
+        });
 }
 
 bool containsRegisteredBase(
     const std::vector<std::pair<uintptr_t, uint64_t>>& ranges, uintptr_t base) {
-    return std::any_of(ranges.begin(), ranges.end(),
-                       [base](const auto& range) {
-                           return range.first == base;
-                       });
+    return std::any_of(ranges.begin(), ranges.end(), [base](const auto& range) {
+        return range.first == base;
+    });
 }
 
 bool batchHasInvalidOrOverlappingRanges(
@@ -649,8 +647,7 @@ int TransferEngine::init(const std::string& metadata_conn_string,
                            ip_or_host_name, rpc_port);
     } else {
         auto config = std::make_shared<mooncake::tent::Config>();
-        if (!local_server_name.empty() &&
-            metadata_conn_string != P2PHANDSHAKE)
+        if (!local_server_name.empty() && metadata_conn_string != P2PHANDSHAKE)
             config->set("local_segment_name", local_server_name);
         if (!ip_or_host_name.empty() && metadata_conn_string != P2PHANDSHAKE)
             config->set("rpc_server_hostname", ip_or_host_name);
@@ -711,8 +708,7 @@ Transport* TransferEngine::installTransport(const std::string& proto,
                 tent_whitelist_filters_ = std::move(filters);
             } else if (!filters.empty()) {
                 LOG(WARNING)
-                    << "TENT is already initialized; installTransport("
-                    << proto
+                    << "TENT is already initialized; installTransport(" << proto
                     << ") NIC hints cannot change the active TENT topology";
             }
         }
@@ -771,7 +767,8 @@ Status TransferEngine::getSegmentBufferBase(SegmentHandle handle,
                                             size_t buffer_index,
                                             uint64_t& base) {
     if (use_tent_) {
-        if (!impl_tent_) return Status::Context("TENT engine is not initialized");
+        if (!impl_tent_)
+            return Status::Context("TENT engine is not initialized");
         mooncake::tent::SegmentInfo info;
         auto status = impl_tent_->getSegmentInfo(handle, info);
         if (!status.ok()) return tentStatusToClassicStatus(status);
@@ -800,7 +797,8 @@ Status TransferEngine::getSegmentBufferBase(SegmentHandle handle,
 
 Status TransferEngine::CheckSegmentStatus(SegmentID sid) {
     if (use_tent_) {
-        if (!impl_tent_) return Status::Context("TENT engine is not initialized");
+        if (!impl_tent_)
+            return Status::Context("TENT engine is not initialized");
         mooncake::tent::SegmentInfo info;
         auto status = impl_tent_->getSegmentInfo(sid, info);
         return tentStatusToClassicStatus(status);
@@ -819,8 +817,9 @@ int TransferEngine::closeSegment(SegmentHandle handle) {
 
 int TransferEngine::removeLocalSegment(const std::string& segment_name) {
     if (use_tent_) {
-        LOG(WARNING) << "removeLocalSegment is not supported by TENT facade for "
-                     << segment_name;
+        LOG(WARNING)
+            << "removeLocalSegment is not supported by TENT facade for "
+            << segment_name;
         return -1;
     } else
         return impl_->removeLocalSegment(segment_name);
@@ -893,8 +892,9 @@ int TransferEngine::registerLocalMemoryBatch(
         if (batchHasInvalidOrOverlappingRanges(buffer_list)) {
             for (const auto& buffer : buffer_list) {
                 if (buffer.length == 0) {
-                    LOG(ERROR) << "Transfer Engine does not support zero length "
-                                  "memory region";
+                    LOG(ERROR)
+                        << "Transfer Engine does not support zero length "
+                           "memory region";
                     return ERR_INVALID_ARGUMENT;
                 }
             }
@@ -929,8 +929,7 @@ int TransferEngine::registerLocalMemoryBatch(
             std::lock_guard<std::mutex> lock(tent_compat_mutex_);
             for (auto& buffer : buffer_list) {
                 tent_registered_ranges_.push_back(
-                    {reinterpret_cast<uintptr_t>(buffer.addr),
-                     buffer.length});
+                    {reinterpret_cast<uintptr_t>(buffer.addr), buffer.length});
             }
         }
         return tentStatusToClassicReturn(status);
@@ -958,11 +957,10 @@ int TransferEngine::unregisterLocalMemoryBatch(
             std::lock_guard<std::mutex> lock(tent_compat_mutex_);
             for (auto* addr : addr_list) {
                 auto base = reinterpret_cast<uintptr_t>(addr);
-                auto it = std::find_if(tent_registered_ranges_.begin(),
-                                       tent_registered_ranges_.end(),
-                                       [base](const auto& range) {
-                                           return range.first == base;
-                                       });
+                auto it = std::find_if(
+                    tent_registered_ranges_.begin(),
+                    tent_registered_ranges_.end(),
+                    [base](const auto& range) { return range.first == base; });
                 if (it != tent_registered_ranges_.end()) {
                     tent_registered_ranges_.erase(it);
                 }
@@ -986,7 +984,8 @@ BatchID TransferEngine::allocateBatchID(size_t batch_size) {
 
 Status TransferEngine::freeBatchID(BatchID batch_id) {
     if (use_tent_) {
-        if (!impl_tent_) return Status::Context("TENT engine is not initialized");
+        if (!impl_tent_)
+            return Status::Context("TENT engine is not initialized");
         if (batch_id == INVALID_BATCH_ID) {
             return Status::InvalidArgument("Invalid batch ID");
         }
@@ -1000,7 +999,8 @@ Status TransferEngine::freeBatchID(BatchID batch_id) {
 Status TransferEngine::submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest>& entries) {
     if (use_tent_) {
-        if (!impl_tent_) return Status::Context("TENT engine is not initialized");
+        if (!impl_tent_)
+            return Status::Context("TENT engine is not initialized");
         if (entries.empty()) {
             return Status::InvalidArgument("entries must not be empty");
         }
@@ -1030,7 +1030,8 @@ Status TransferEngine::submitTransferWithNotify(
     BatchID batch_id, const std::vector<TransferRequest>& entries,
     TransferMetadata::NotifyDesc notify_msg) {
     if (use_tent_) {
-        if (!impl_tent_) return Status::Context("TENT engine is not initialized");
+        if (!impl_tent_)
+            return Status::Context("TENT engine is not initialized");
         if (entries.empty()) {
             return Status::InvalidArgument("entries must not be empty");
         }
@@ -1088,8 +1089,7 @@ int TransferEngine::mp_registerLocalMemory(
     std::vector<void*> registered_addrs;
     for (auto& buffer : unique_buffers) {
         int ret = registerLocalMemory(buffer.addr, buffer.length,
-                                      buffer.location,
-                                      buffer.remote_accessible,
+                                      buffer.location, buffer.remote_accessible,
                                       buffer.update_metadata);
         if (ret != 0) {
             for (auto it = registered_addrs.rbegin();
@@ -1231,7 +1231,8 @@ PeerLiveness TransferEngine::probePeerAliveByID(SegmentID target_id) {
 Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,
                                          TransferStatus& status) {
     if (use_tent_) {
-        if (!impl_tent_) return Status::Context("TENT engine is not initialized");
+        if (!impl_tent_)
+            return Status::Context("TENT engine is not initialized");
         if (batch_id == INVALID_BATCH_ID) {
             return Status::InvalidArgument("Invalid batch ID");
         }
@@ -1249,7 +1250,8 @@ Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,
 Status TransferEngine::getBatchTransferStatus(BatchID batch_id,
                                               TransferStatus& status) {
     if (use_tent_) {
-        if (!impl_tent_) return Status::Context("TENT engine is not initialized");
+        if (!impl_tent_)
+            return Status::Context("TENT engine is not initialized");
         if (batch_id == INVALID_BATCH_ID) {
             return Status::InvalidArgument("Invalid batch ID");
         }

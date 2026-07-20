@@ -82,9 +82,8 @@ segment_id_t openSegment(transfer_engine_t engine, const char *segment_name) {
     if (handle == static_cast<Transport::SegmentHandle>(-1)) {
         return ERR_INVALID_ARGUMENT;
     }
-    if (handle >
-        static_cast<Transport::SegmentHandle>(
-            std::numeric_limits<segment_id_t>::max())) {
+    if (handle > static_cast<Transport::SegmentHandle>(
+                     std::numeric_limits<segment_id_t>::max())) {
         LOG(ERROR) << "Segment handle " << handle
                    << " exceeds TE C API segment_id_t width";
         return ERR_INVALID_ARGUMENT;
@@ -101,9 +100,8 @@ segment_id_t openSegmentNoCache(transfer_engine_t engine,
     if (handle == static_cast<Transport::SegmentHandle>(-1)) {
         return ERR_INVALID_ARGUMENT;
     }
-    if (handle >
-        static_cast<Transport::SegmentHandle>(
-            std::numeric_limits<segment_id_t>::max())) {
+    if (handle > static_cast<Transport::SegmentHandle>(
+                     std::numeric_limits<segment_id_t>::max())) {
         LOG(ERROR) << "Segment handle " << handle
                    << " exceeds TE C API segment_id_t width";
         return ERR_INVALID_ARGUMENT;
