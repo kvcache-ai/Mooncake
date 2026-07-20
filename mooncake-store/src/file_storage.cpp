@@ -440,6 +440,39 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
     return batch_result;
 }
 
+void FileStorage::PartitionUnbucketedTasks(
+    const std::unordered_map<std::string, OffloadTaskItem>& task_by_storage_key,
+    const std::unordered_set<std::string>& all_bucket_keys,
+    const std::vector<std::string>& deferred_keys,
+    const std::unordered_map<std::string, OffloadTaskItem>& previously_carried,
+    std::vector<OffloadTaskItem>& failed_tasks,
+    std::unordered_map<std::string, OffloadTaskItem>& carried_tasks) {
+    for (const auto& storage_key : deferred_keys) {
+        auto it = task_by_storage_key.find(storage_key);
+        if (it != task_by_storage_key.end()) {
+            carried_tasks.emplace(storage_key, it->second);
+        }
+        // A deferred key with no known task can be neither carried nor
+        // NACKed; the pool will re-emit it and it will be dropped — the
+        // pre-fix behavior. Should be unreachable, since deferred keys are a
+        // subset of this cycle's input.
+    }
+    // Retain previously carried keys the backend did not emit this cycle:
+    // their pooled copies are still waiting (the pool only moves on a call
+    // with non-empty input), so their tasks must stay alive.
+    for (const auto& [storage_key, task] : previously_carried) {
+        if (all_bucket_keys.find(storage_key) == all_bucket_keys.end()) {
+            carried_tasks.emplace(storage_key, task);
+        }
+    }
+    for (const auto& [storage_key, task] : task_by_storage_key) {
+        if (all_bucket_keys.find(storage_key) == all_bucket_keys.end() &&
+            carried_tasks.find(storage_key) == carried_tasks.end()) {
+            failed_tasks.push_back(task);
+        }
+    }
+}
+
 tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     const std::vector<OffloadTaskItem>& offloading_objects) {
     if (offloading_objects.empty()) {
@@ -456,11 +489,24 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         task_by_storage_key.emplace(storage_key, task);
     }
 
+    // Merge in tasks carried across a bucket deferral (see
+    // deferred_task_by_storage_key_): the backend's ungrouped pool will
+    // re-emit those keys in a bucket this call, and they need their original
+    // tasks to be queried, stored and success-notified. emplace() keeps the
+    // freshly drained task on collision (a deferred key re-PUT in the
+    // meantime). Drop the key from storage_object_sizes so the backend does
+    // not group it a second time on top of its pooled copy.
+    for (const auto& [storage_key, task] : deferred_task_by_storage_key_) {
+        storage_object_sizes.erase(storage_key);
+        task_by_storage_key.emplace(storage_key, task);
+    }
+
     std::vector<std::vector<std::string>> buckets_keys;
+    std::vector<std::string> deferred_keys;
     if (auto bucket_backend =
             std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_)) {
         auto allocate_res = bucket_backend->AllocateOffloadingBuckets(
-            storage_object_sizes, buckets_keys);
+            storage_object_sizes, buckets_keys, &deferred_keys);
         if (!allocate_res) {
             LOG(ERROR) << "AllocateOffloadingBuckets failed with error: "
                        << allocate_res.error();
@@ -638,13 +684,22 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         }
     }
 
-    // Keys skipped by GroupOffloadingKeysByBucket don't appear in any bucket,
-    // so they never reach BatchOffload or complete_handler.
-    for (const auto& [storage_key, task] : task_by_storage_key) {
-        if (all_bucket_keys.find(storage_key) == all_bucket_keys.end()) {
-            failed_tasks.push_back(task);
-        }
+    // Keys absent from every bucket are either (a) deliberately skipped by
+    // GroupOffloadingKeysByBucket (size over bucket limit / already on disk)
+    // — NACK those so the master releases task + refcount — or (b) DEFERRED
+    // to the backend's ungrouped pool for the next cycle. Deferred keys must
+    // keep their tasks alive across the deferral instead of being NACKed:
+    // the pool carries only key+size, and a re-emitted key without a task
+    // was silently dropped above — the deferred-tail leak (upstream #3006).
+    std::unordered_map<std::string, OffloadTaskItem> carried_tasks;
+    PartitionUnbucketedTasks(task_by_storage_key, all_bucket_keys,
+                             deferred_keys, deferred_task_by_storage_key_,
+                             failed_tasks, carried_tasks);
+    if (!carried_tasks.empty()) {
+        VLOG(1) << "Carrying " << carried_tasks.size()
+                << " deferred offload task(s) to the next cycle";
     }
+    deferred_task_by_storage_key_ = std::move(carried_tasks);
 
     if (!failed_tasks.empty()) {
         std::vector<StorageObjectMetadata> failed_metadatas;

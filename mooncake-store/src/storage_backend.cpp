@@ -2260,8 +2260,10 @@ BucketStorageBackend::GetStoreMetadata() {
 
 tl::expected<void, ErrorCode> BucketStorageBackend::AllocateOffloadingBuckets(
     const std::unordered_map<std::string, int64_t>& offloading_objects,
-    std::vector<std::vector<std::string>>& buckets_keys) {
-    return GroupOffloadingKeysByBucket(offloading_objects, buckets_keys);
+    std::vector<std::vector<std::string>>& buckets_keys,
+    std::vector<std::string>* deferred_keys) {
+    return GroupOffloadingKeysByBucket(offloading_objects, buckets_keys,
+                                       deferred_keys);
 }
 
 void BucketStorageBackend::ClearUngroupedOffloadingObjects() {
@@ -2276,7 +2278,8 @@ size_t BucketStorageBackend::UngroupedOffloadingObjectsSize() const {
 
 tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
     const std::unordered_map<std::string, int64_t>& offloading_objects,
-    std::vector<std::vector<std::string>>& buckets_keys) {
+    std::vector<std::vector<std::string>>& buckets_keys,
+    std::vector<std::string>* deferred_keys) {
     MutexLocker offloading_locker(&offloading_mutex_);
     auto& ungrouped_offloading_objects = ungrouped_offloading_objects_;
     auto it = offloading_objects.cbegin();
@@ -2312,6 +2315,14 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
                 for (const auto& bucket_object : bucket_objects) {
                     ungrouped_offloading_objects.emplace(bucket_object.first,
                                                          bucket_object.second);
+                    // Report the deferral so the caller can keep these keys'
+                    // offload tasks alive until a later call re-emits them in
+                    // a bucket (upstream #3006: without this the tasks are
+                    // NACKed at deferral and the keys are silently dropped on
+                    // re-emission).
+                    if (deferred_keys != nullptr) {
+                        deferred_keys->push_back(bucket_object.first);
+                    }
                 }
                 VLOG(1) << "Add offloading objects to ungrouped pool. "
                         << "Total ungrouped count: "

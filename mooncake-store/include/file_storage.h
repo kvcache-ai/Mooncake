@@ -1,5 +1,7 @@
 #pragma once
 
+#include <unordered_set>
+
 #include "client_service.h"
 #include "client_buffer.h"
 #include "storage_backend.h"
@@ -143,6 +145,55 @@ class FileStorage {
     std::unordered_map<uint64_t, std::shared_ptr<AllocatedBatch>> GUARDED_BY(
         client_buffer_mutex_) client_buffer_allocated_batches_;
     std::atomic<uint64_t> next_batch_id_{1};
+
+    /**
+     * @brief Partition drained-but-unbucketed offload tasks into NACKs vs
+     * carries (pure function; extracted for direct unit testing).
+     *
+     * A key absent from all_bucket_keys was either deliberately skipped by
+     * the backend (size over bucket limit / already on disk) — those must be
+     * NACKed so the master releases the task and source-replica refcount — or
+     * DEFERRED to the backend's ungrouped pool to be written as part of a
+     * full bucket next cycle. Deferred keys must NOT be NACKed: the backend
+     * carries only key+size across the deferral, so their tasks must be
+     * carried here or the re-emitted keys arrive task-less and are silently
+     * dropped (upstream #3006 — measured as ~12% of pool entries never
+     * reaching the SSD tier).
+     *
+     * Previously carried keys must also be RETAINED while un-emitted: the
+     * backend's pool only moves on a call with non-empty input, so a cycle
+     * can pass without the pooled keys being either emitted or re-reported
+     * (empty effective input after the carry merge). Rebuilding the carry
+     * from deferred_keys alone would NACK such keys while the pool still
+     * holds them — re-introducing the task-less drop.
+     *
+     * @param task_by_storage_key All tasks known this cycle (drained +
+     * carried).
+     * @param all_bucket_keys Storage keys emitted in a bucket this cycle.
+     * @param deferred_keys Storage keys the backend deferred this cycle.
+     * @param previously_carried Carry map from the previous cycle; entries
+     * not emitted this cycle are retained in carried_tasks.
+     * @param failed_tasks Output: tasks to NACK (appended).
+     * @param carried_tasks Output: tasks to carry to the next cycle.
+     */
+    static void PartitionUnbucketedTasks(
+        const std::unordered_map<std::string, OffloadTaskItem>&
+            task_by_storage_key,
+        const std::unordered_set<std::string>& all_bucket_keys,
+        const std::vector<std::string>& deferred_keys,
+        const std::unordered_map<std::string, OffloadTaskItem>&
+            previously_carried,
+        std::vector<OffloadTaskItem>& failed_tasks,
+        std::unordered_map<std::string, OffloadTaskItem>& carried_tasks);
+
+    // Tasks for keys the bucket backend deferred to its ungrouped pool, keyed
+    // by tenant-scoped storage key. Consumed (merged into task_by_storage_key)
+    // on the next OffloadObjects call, when the backend re-emits those keys in
+    // a bucket. Only touched from the offload worker path (single-threaded);
+    // lost on restart together with the backend's in-memory ungrouped pool,
+    // in which case the master's TTL reaper reclaims the orphaned tasks.
+    std::unordered_map<std::string, OffloadTaskItem>
+        deferred_task_by_storage_key_;
 
     mutable Mutex offloading_mutex_;
     bool GUARDED_BY(offloading_mutex_) enable_offloading_;
