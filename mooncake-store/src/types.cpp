@@ -36,6 +36,7 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::REPLICA_IS_GONE, "REPLICA_IS_GONE"},
         {ErrorCode::OBJECT_REPLICA_BUSY, "OBJECT_REPLICA_BUSY"},
         {ErrorCode::TRANSFER_FAIL, "TRANSFER_FAIL"},
+        {ErrorCode::CHECKSUM_MISMATCH, "CHECKSUM_MISMATCH"},
         {ErrorCode::RPC_FAIL, "RPC_FAIL"},
         {ErrorCode::RPC_TIMEOUT, "RPC_TIMEOUT"},
         {ErrorCode::ETCD_OPERATION_ERROR, "ETCD_OPERATION_ERROR"},

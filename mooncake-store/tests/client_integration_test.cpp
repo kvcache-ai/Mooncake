@@ -2,11 +2,19 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#ifdef MOONCAKE_STORE_TEST_CUDA
+#include <cuda_runtime_api.h>
+#endif
+
+#include <array>
+#include <cstdlib>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <regex>
 #include <unordered_set>
@@ -20,6 +28,7 @@
 #include "utils.h"
 #include "test_server_helpers.h"
 #include "default_config.h"
+#include "store_checksum.h"
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
 DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");
@@ -50,6 +59,136 @@ UUID ParseClientId(const std::string& client_id_str) {
         LOG(ERROR) << "Invalid client_id format. Expected format: first-second";
     }
     return client_id;
+}
+
+class ScopedStoreChecksumEnv {
+   public:
+    ScopedStoreChecksumEnv() {
+        const char* previous = std::getenv("MOONCAKE_STORE_CHECKSUM");
+        if (previous != nullptr) {
+            previous_value_ = previous;
+        }
+        ::setenv("MOONCAKE_STORE_CHECKSUM", "1", 1);
+    }
+
+    ~ScopedStoreChecksumEnv() {
+        if (previous_value_.has_value()) {
+            ::setenv("MOONCAKE_STORE_CHECKSUM", previous_value_->c_str(), 1);
+        } else {
+            ::unsetenv("MOONCAKE_STORE_CHECKSUM");
+        }
+    }
+
+   private:
+    std::optional<std::string> previous_value_;
+};
+
+class StoreChecksumClient : public Client {
+   public:
+    StoreChecksumClient() : Client("localhost", "", "tcp") {}
+};
+
+TEST(StoreChecksumTest, MatchesCrc64EcmaKnownVector) {
+    constexpr std::string_view value = "123456789";
+    EXPECT_EQ(ComputeStoreChecksum(value.data(), value.size()),
+              0x6C40DF5F0B497347ULL);
+}
+
+TEST(StoreChecksumTest, StreamingMatchesContiguousForArbitraryLengths) {
+    const std::array<uint8_t, 17> value = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05,
+                                           0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B,
+                                           0x0C, 0x0D, 0x0E, 0x0F, 0x10};
+
+    StoreChecksum streaming;
+    streaming.Update(value.data(), 3);
+    streaming.Update(value.data() + 3, 7);
+    streaming.Update(value.data() + 10, value.size() - 10);
+
+    EXPECT_EQ(streaming.Finalize(),
+              ComputeStoreChecksum(value.data(), value.size()));
+    EXPECT_EQ(ComputeStoreChecksum(nullptr, 0), 0);
+}
+
+TEST(StoreChecksumTest, ClientVerifiesOnlyLogicalObjectBytes) {
+    ScopedStoreChecksumEnv checksum_env;
+
+    StoreChecksumClient client;
+    std::array<uint8_t, 20> value = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+                                     0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+                                     0x0E, 0x0F, 0xAA, 0xBB, 0xCC, 0xDD};
+    constexpr size_t object_size = 16;
+    std::vector<Slice> slices{{value.data(), value.size()}};
+    const uint64_t checksum = ComputeStoreChecksum(value.data(), object_size);
+
+    EXPECT_TRUE(client.VerifyStoreChecksum("key", slices, object_size, checksum)
+                    .has_value());
+    value[16] ^= 0xFF;
+    EXPECT_TRUE(client.VerifyStoreChecksum("key", slices, object_size, checksum)
+                    .has_value());
+    value[0] ^= 0xFF;
+    auto mismatch =
+        client.VerifyStoreChecksum("key", slices, object_size, checksum);
+    ASSERT_FALSE(mismatch.has_value());
+    EXPECT_EQ(mismatch.error(), ErrorCode::CHECKSUM_MISMATCH);
+}
+
+#ifdef MOONCAKE_STORE_TEST_CUDA
+TEST(StoreChecksumTest, VerifiesCudaDeviceBufferViaD2H) {
+    ScopedStoreChecksumEnv checksum_env;
+
+    int device_count = 0;
+    const auto device_count_result = cudaGetDeviceCount(&device_count);
+    if (device_count_result != cudaSuccess || device_count == 0) {
+        cudaGetLastError();
+        GTEST_SKIP() << "CUDA device is unavailable";
+    }
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+
+    constexpr size_t object_size = 8 * 1024 * 1024 + 17;
+    std::vector<uint8_t> host_data(object_size);
+    for (size_t i = 0; i < host_data.size(); ++i) {
+        host_data[i] = static_cast<uint8_t>(i);
+    }
+
+    void* raw_device_buffer = nullptr;
+    ASSERT_EQ(cudaMalloc(&raw_device_buffer, object_size), cudaSuccess);
+    std::unique_ptr<void, decltype(&cudaFree)> device_buffer(raw_device_buffer,
+                                                             cudaFree);
+    ASSERT_EQ(cudaMemcpy(device_buffer.get(), host_data.data(), object_size,
+                         cudaMemcpyHostToDevice),
+              cudaSuccess);
+
+    StoreChecksumClient client;
+    std::vector<Slice> slices{{device_buffer.get(), object_size}};
+    const uint64_t checksum =
+        ComputeStoreChecksum(host_data.data(), host_data.size());
+    EXPECT_TRUE(
+        client.VerifyStoreChecksum("cuda-key", slices, object_size, checksum)
+            .has_value());
+
+    host_data[object_size - 1] ^= 0x01;
+    ASSERT_EQ(
+        cudaMemcpy(static_cast<uint8_t*>(device_buffer.get()) + object_size - 1,
+                   &host_data[object_size - 1], 1, cudaMemcpyHostToDevice),
+        cudaSuccess);
+    auto mismatch =
+        client.VerifyStoreChecksum("cuda-key", slices, object_size, checksum);
+    ASSERT_FALSE(mismatch.has_value());
+    EXPECT_EQ(mismatch.error(), ErrorCode::CHECKSUM_MISMATCH);
+}
+#endif
+
+TEST(StoreChecksumTest, BatchPutStopsAfterChecksumPrecomputeFailure) {
+    ScopedStoreChecksumEnv checksum_env;
+    StoreChecksumClient client;
+    const std::vector<ObjectKey> keys{"invalid-slice"};
+    std::vector<std::vector<Slice>> slices{{Slice{nullptr, 1}}};
+
+    auto results = client.BatchPut(keys, slices, ReplicateConfig{});
+
+    ASSERT_EQ(results.size(), 1);
+    ASSERT_FALSE(results[0].has_value());
+    EXPECT_EQ(results[0].error(), ErrorCode::INVALID_PARAMS);
 }
 
 class ClientIdCaptureSink : public google::LogSink {
@@ -340,6 +479,44 @@ TEST_F(ClientIntegrationTest, BasicPutGetOperations) {
     ASSERT_TRUE(remove_result.has_value())
         << "Remove operation failed: " << toString(remove_result.error());
     client_buffer_allocator_->deallocate(buffer, test_data.size());
+}
+
+TEST_F(ClientIntegrationTest, StoreChecksumRejectsCorruptedObject) {
+    if (!StoreChecksumEnabled()) {
+        GTEST_SKIP() << "MOONCAKE_STORE_CHECKSUM is not enabled";
+    }
+
+    const std::string key = "checksum_corruption_key";
+    const std::string test_data = "0123456789abcdef";
+    void* source = client_buffer_allocator_->allocate(test_data.size());
+    memcpy(source, test_data.data(), test_data.size());
+    std::vector<Slice> slices{{source, test_data.size()}};
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto put_result = test_client_->Put(key, slices, config);
+    ASSERT_TRUE(put_result.has_value()) << toString(put_result.error());
+    client_buffer_allocator_->deallocate(source, test_data.size());
+
+    auto query_result = test_client_->Query(key);
+    ASSERT_TRUE(query_result.has_value()) << toString(query_result.error());
+    ASSERT_TRUE(query_result->store_checksum.has_value());
+    ASSERT_EQ(query_result->replicas.size(), 1);
+    ASSERT_TRUE(query_result->replicas[0].is_memory_replica());
+
+    auto& descriptor =
+        query_result->replicas[0].get_memory_descriptor().buffer_descriptor;
+    auto* stored_data = reinterpret_cast<char*>(descriptor.buffer_address_);
+    stored_data[0] ^= 0x01;
+
+    void* target = client_buffer_allocator_->allocate(test_data.size());
+    slices = {{target, test_data.size()}};
+    auto get_result = test_client_->Get(key, query_result.value(), slices);
+    ASSERT_FALSE(get_result.has_value());
+    EXPECT_EQ(get_result.error(), ErrorCode::CHECKSUM_MISMATCH);
+
+    stored_data[0] ^= 0x01;
+    client_buffer_allocator_->deallocate(target, test_data.size());
 }
 
 // Test Remove operation

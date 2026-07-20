@@ -83,7 +83,8 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> PutEnd(
         const UUID& client_id, const std::string& key,
         ReplicaType replica_type = ReplicaType::ALL,
-        const std::string& tenant_id = "default");
+        const std::string& tenant_id = "default",
+        std::optional<uint64_t> store_checksum = std::nullopt);
 
     tl::expected<void, ErrorCode> PutRevoke(
         const UUID& client_id, const std::string& key,
@@ -99,7 +100,8 @@ class WrappedMasterService {
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
         const UUID& client_id, const std::vector<std::string>& keys,
         ReplicaType replica_type = ReplicaType::ALL,
-        const std::string& tenant_id = "default");
+        const std::string& tenant_id = "default",
+        const std::vector<std::optional<uint64_t>>& store_checksums = {});
 
     std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
         const UUID& client_id, const std::vector<std::string>& keys,
@@ -114,7 +116,8 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> UpsertEnd(
         const UUID& client_id, const std::string& key,
         ReplicaType replica_type = ReplicaType::ALL,
-        const std::string& tenant_id = "default");
+        const std::string& tenant_id = "default",
+        std::optional<uint64_t> store_checksum = std::nullopt);
 
     tl::expected<void, ErrorCode> UpsertRevoke(
         const UUID& client_id, const std::string& key,
@@ -130,7 +133,8 @@ class WrappedMasterService {
 
     std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
         const UUID& client_id, const std::vector<std::string>& keys,
-        const std::string& tenant_id = "default");
+        const std::string& tenant_id = "default",
+        const std::vector<std::optional<uint64_t>>& store_checksums = {});
 
     std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevoke(
         const UUID& client_id, const std::vector<std::string>& keys,

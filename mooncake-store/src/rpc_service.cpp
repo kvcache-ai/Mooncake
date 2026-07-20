@@ -266,12 +266,12 @@ WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
 
 tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
     const UUID& client_id, const std::string& key, ReplicaType replica_type,
-    const std::string& tenant_id) {
+    const std::string& tenant_id, std::optional<uint64_t> store_checksum) {
     return execute_rpc(
         "PutEnd",
         [&] {
             return master_service_.PutEnd(client_id, key, tenant_id,
-                                          replica_type);
+                                          replica_type, store_checksum);
         },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key,
@@ -395,7 +395,8 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
 
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
     const UUID& client_id, const std::vector<std::string>& keys,
-    ReplicaType replica_type, const std::string& tenant_id) {
+    ReplicaType replica_type, const std::string& tenant_id,
+    const std::vector<std::optional<uint64_t>>& store_checksums) {
     ScopedVLogTimer timer(1, "BatchPutEnd");
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
@@ -404,9 +405,15 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(keys.size());
 
-    for (const auto& key : keys) {
-        results.emplace_back(
-            master_service_.PutEnd(client_id, key, tenant_id, replica_type));
+    if (!store_checksums.empty() && store_checksums.size() != keys.size()) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        results.emplace_back(master_service_.PutEnd(
+            client_id, keys[i], tenant_id, replica_type,
+            store_checksums.empty() ? std::nullopt : store_checksums[i]));
     }
 
     size_t failure_count = 0;
@@ -494,12 +501,12 @@ WrappedMasterService::UpsertStart(const UUID& client_id, const std::string& key,
 
 tl::expected<void, ErrorCode> WrappedMasterService::UpsertEnd(
     const UUID& client_id, const std::string& key, ReplicaType replica_type,
-    const std::string& tenant_id) {
+    const std::string& tenant_id, std::optional<uint64_t> store_checksum) {
     return execute_rpc(
         "UpsertEnd",
         [&] {
             return master_service_.UpsertEnd(client_id, key, tenant_id,
-                                             replica_type);
+                                             replica_type, store_checksum);
         },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key,
@@ -565,13 +572,15 @@ WrappedMasterService::BatchUpsertStart(
 
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchUpsertEnd(
     const UUID& client_id, const std::vector<std::string>& keys,
-    const std::string& tenant_id) {
+    const std::string& tenant_id,
+    const std::vector<std::optional<uint64_t>>& store_checksums) {
     ScopedVLogTimer timer(1, "BatchUpsertEnd");
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
     MasterMetricManager::instance().inc_batch_put_end_requests(total_keys);
 
-    auto results = master_service_.BatchUpsertEnd(client_id, keys, tenant_id);
+    auto results = master_service_.BatchUpsertEnd(client_id, keys, tenant_id,
+                                                  store_checksums);
 
     size_t failure_count = 0;
     for (size_t i = 0; i < results.size(); ++i) {

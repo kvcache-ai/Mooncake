@@ -613,6 +613,56 @@ TEST_F(SnapshotChildProcessTest, RestoreRebuildsGroupedObjectRouting) {
     EXPECT_FALSE(service_->ExistKey(key, "default").value_or(true));
 }
 
+TEST_F(SnapshotChildProcessTest, RestorePreservesStoreChecksum) {
+    auto make_config = [this]() {
+        return MasterServiceConfigBuilder()
+            .set_enable_snapshot(false)
+            .set_enable_snapshot_restore(true)
+            .set_snapshot_backup_dir(tmp_dir() + "/backup")
+            .set_snapshot_interval_seconds(100)
+            .set_snapshot_child_timeout_seconds(60)
+            .set_snapshot_retention_count(3)
+            .set_snapshot_object_store_type("local")
+            .set_default_kv_lease_ttl(600000)
+            .build();
+    };
+    service_ = std::make_unique<MasterService>(make_config());
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "checksum_snapshot_segment";
+    segment.base = 0x320000000;
+    segment.size = 1024 * 1024 * 16;
+    segment.te_endpoint = segment.name;
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+
+    constexpr uint64_t kChecksum = 0x123456789ABCDEF0ULL;
+    const std::string key = "snapshot_store_checksum_key";
+    ReplicateConfig replicate_config;
+    replicate_config.replica_num = 1;
+    auto put_start =
+        service_->PutStart(client_id, key, "default", 1024, replicate_config);
+    ASSERT_TRUE(put_start.has_value()) << toString(put_start.error());
+    ASSERT_TRUE(
+        service_
+            ->PutEnd(client_id, key, "default", ReplicaType::MEMORY, kChecksum)
+            .has_value());
+    ASSERT_TRUE(service_->ExistKey(key, "default").value_or(false));
+
+    auto persist_result = CallPersistState("20240701_140000_000");
+    ASSERT_TRUE(persist_result.has_value())
+        << "PersistState failed: " << persist_result.error().message;
+
+    service_.reset();
+    service_ = std::make_unique<MasterService>(make_config());
+
+    auto restored = service_->GetReplicaList(key, "default");
+    ASSERT_TRUE(restored.has_value());
+    ASSERT_TRUE(restored->store_checksum.has_value());
+    EXPECT_EQ(*restored->store_checksum, kChecksum);
+}
+
 TEST_F(SnapshotChildProcessTest,
        DeserializeLegacyMetadataWithoutGroupIdRestoresUngroupedObject) {
     CreateDefaultService();

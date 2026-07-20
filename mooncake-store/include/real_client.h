@@ -552,11 +552,12 @@ class RealClient : public PyClient {
     tl::expected<int64_t, ErrorCode> execute_ranged_read(
         const std::string &key, void *buffer, size_t dst_offset,
         size_t src_offset, size_t size, const RangedReadMetadata &metadata,
-        bool size_is_buffer_capacity = false);
+        bool size_is_buffer_capacity = false, bool verify_checksum = false);
 
     tl::expected<int64_t, ErrorCode> get_into_range_internal(
         const std::string &key, void *buffer, size_t dst_offset,
-        size_t src_offset, size_t size, bool size_is_buffer_capacity = false);
+        size_t src_offset, size_t size, bool size_is_buffer_capacity = false,
+        bool verify_checksum = false);
 
     std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
     get_into_ranges_internal(

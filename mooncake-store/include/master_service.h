@@ -388,7 +388,8 @@ class MasterService {
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
     auto PutEnd(const UUID& client_id, const std::string& key,
-                const std::string& tenant_id, ReplicaType replica_type)
+                const std::string& tenant_id, ReplicaType replica_type,
+                std::optional<uint64_t> store_checksum = std::nullopt)
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -416,7 +417,8 @@ class MasterService {
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::string& tenant_id,
-        ReplicaType replica_type = ReplicaType::ALL);
+        ReplicaType replica_type = ReplicaType::ALL,
+        const std::vector<std::optional<uint64_t>>& store_checksums = {});
 
     /**
      * @brief Revoke a batch of put operations
@@ -446,7 +448,8 @@ class MasterService {
      * @brief Complete an upsert operation. Delegates to PutEnd.
      */
     auto UpsertEnd(const UUID& client_id, const std::string& key,
-                   const std::string& tenant_id, ReplicaType replica_type)
+                   const std::string& tenant_id, ReplicaType replica_type,
+                   std::optional<uint64_t> store_checksum = std::nullopt)
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -471,7 +474,8 @@ class MasterService {
      */
     std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
         const UUID& client_id, const std::vector<std::string>& keys,
-        const std::string& tenant_id);
+        const std::string& tenant_id,
+        const std::vector<std::optional<uint64_t>>& store_checksums = {});
 
     /**
      * @brief Revoke a batch of upsert operations. Delegates to BatchPutRevoke.
@@ -913,6 +917,7 @@ class MasterService {
         // Updated by UpsertStart (Case B) to reset the discard timeout.
         std::chrono::system_clock::time_point put_start_time;
         const size_t size;
+        std::optional<uint64_t> store_checksum;
         const ObjectDataType data_type{ObjectDataType::UNKNOWN};
         const std::string group_id;
         const std::string tenant_id;

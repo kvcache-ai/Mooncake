@@ -1,5 +1,7 @@
 #pragma once
 
+#include <optional>
+
 #include "types.h"
 #include "replica.h"
 #include "task_manager.h"
@@ -32,14 +34,18 @@ YLT_REFL(PingResponse, view_version_id, client_status);
 struct GetReplicaListResponse {
     std::vector<Replica::Descriptor> replicas;
     uint64_t lease_ttl_ms;
+    std::optional<uint64_t> store_checksum;
 
     GetReplicaListResponse() : lease_ttl_ms(0) {}
-    GetReplicaListResponse(std::vector<Replica::Descriptor>&& replicas_param,
-                           uint64_t lease_ttl_ms_param)
+    GetReplicaListResponse(
+        std::vector<Replica::Descriptor>&& replicas_param,
+        uint64_t lease_ttl_ms_param,
+        std::optional<uint64_t> store_checksum_param = std::nullopt)
         : replicas(std::move(replicas_param)),
-          lease_ttl_ms(lease_ttl_ms_param) {}
+          lease_ttl_ms(lease_ttl_ms_param),
+          store_checksum(store_checksum_param) {}
 };
-YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms);
+YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms, store_checksum);
 
 struct CachedQueryResultResponse {
     bool success;
