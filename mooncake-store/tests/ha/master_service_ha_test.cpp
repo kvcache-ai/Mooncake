@@ -484,6 +484,21 @@ class MasterServiceHATest : public ::testing::Test {
         return accessor.Exists() ? accessor.Get().CountReplicas() : 0;
     }
 
+    static std::vector<Replica::Descriptor> ReplicaDescriptorsForTesting(
+        MasterService& service, const std::string& tenant_id,
+        const std::string& key) {
+        MasterService::MetadataAccessorRO accessor(
+            &service, MasterService::ObjectIdentity{tenant_id, key});
+        if (!accessor.Exists()) {
+            return {};
+        }
+        std::vector<Replica::Descriptor> descriptors;
+        for (const auto& replica : accessor.Get().GetAllReplicas()) {
+            descriptors.push_back(replica.get_descriptor());
+        }
+        return descriptors;
+    }
+
     static void PrepareUnmountSegmentForTesting(MasterService& service,
                                                 const UUID& segment_id) {
         auto segment_access = service.segment_manager_.getSegmentAccess();
@@ -535,6 +550,114 @@ class MasterServiceHATest : public ::testing::Test {
 };
 
 class MasterServiceBatchRecordE2ETest : public MasterServiceHATest {};
+
+TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesMemoryBufferDescriptor) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string endpoint = "standby_restore_segment";
+    const size_t size = 4096;
+    const uintptr_t address = 0x12345000;
+    auto object = MakeStandbyObject("standby_restore_key", endpoint, size);
+    auto& descriptor = object.metadata.replicas.front()
+                           .get_memory_descriptor()
+                           .buffer_descriptor;
+    descriptor.buffer_address_ = address;
+    descriptor.protocol_ = "tcp";
+
+    service.RestoreFromStandbySnapshot({object}, 7,
+                                       {MakeStandbyMemorySegment(endpoint)});
+
+    auto replicas = ReplicaDescriptorsForTesting(service, kDefaultTenant,
+                                                 "standby_restore_key");
+    ASSERT_EQ(replicas.size(), 1);
+    ASSERT_TRUE(replicas.front().is_memory_replica());
+    const auto& restored =
+        replicas.front().get_memory_descriptor().buffer_descriptor;
+    EXPECT_EQ(restored.size_, size);
+    EXPECT_EQ(restored.buffer_address_, address);
+    EXPECT_EQ(restored.protocol_, "tcp");
+    EXPECT_EQ(restored.transport_endpoint_, endpoint);
+}
+
+TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesCxlBufferDescriptor) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string segment_name = "standby_restore_cxl_segment";
+    const std::string transport_endpoint = "standby_restore_tcp_endpoint";
+    const size_t size = 4096;
+    const uintptr_t address = 0x12345000;
+    auto object =
+        MakeStandbyObject("standby_restore_cxl_key", segment_name, size);
+    auto& descriptor = object.metadata.replicas.front()
+                           .get_memory_descriptor()
+                           .buffer_descriptor;
+    descriptor.buffer_address_ = address;
+    descriptor.protocol_ = "cxl";
+
+    StandbySegmentInfo segment = MakeStandbyMemorySegment(transport_endpoint);
+    segment.segment_name = segment_name;
+    service.RestoreFromStandbySnapshot({object}, 7, {segment});
+
+    auto replicas = ReplicaDescriptorsForTesting(service, kDefaultTenant,
+                                                 "standby_restore_cxl_key");
+    ASSERT_EQ(replicas.size(), 1);
+    ASSERT_TRUE(replicas.front().is_memory_replica());
+    const auto& restored =
+        replicas.front().get_memory_descriptor().buffer_descriptor;
+    EXPECT_EQ(restored.size_, size);
+    EXPECT_EQ(restored.buffer_address_, address);
+    EXPECT_EQ(restored.protocol_, "cxl");
+    EXPECT_EQ(restored.transport_endpoint_, segment_name);
+
+    auto public_replicas =
+        service.GetReplicaList("standby_restore_cxl_key", kDefaultTenant);
+    ASSERT_FALSE(public_replicas.has_value());
+    EXPECT_EQ(public_replicas.error(), ErrorCode::REPLICA_IS_NOT_READY);
+}
+
+TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesNoFBufferDescriptor) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string endpoint = "standby_restore_nof_endpoint";
+    const size_t size = 4096;
+    const uintptr_t address = 0x12345000;
+    Replica::Descriptor replica;
+    replica.id = 1;
+    replica.status = ReplicaStatus::COMPLETE;
+    NoFDescriptor nof_descriptor;
+    nof_descriptor.buffer_descriptor = {static_cast<uint64_t>(size), address,
+                                        "nvmeof", endpoint};
+    replica.descriptor_variant = std::move(nof_descriptor);
+    StandbyObjectMetadata metadata;
+    metadata.client_id = generate_uuid();
+    metadata.size = size;
+    metadata.last_sequence_id = 1;
+    metadata.replicas.push_back(std::move(replica));
+    StandbyObjectEntry object{kDefaultTenant, "standby_restore_nof_key",
+                              std::move(metadata)};
+
+    service.RestoreFromStandbySnapshot({object}, 7, {});
+
+    auto replicas = ReplicaDescriptorsForTesting(service, kDefaultTenant,
+                                                 "standby_restore_nof_key");
+    ASSERT_EQ(replicas.size(), 1);
+    ASSERT_TRUE(replicas.front().is_nof_replica());
+    const auto& restored =
+        replicas.front().get_nof_descriptor().buffer_descriptor;
+    EXPECT_EQ(restored.size_, size);
+    EXPECT_EQ(restored.buffer_address_, address);
+    EXPECT_EQ(restored.protocol_, "nvmeof");
+    EXPECT_EQ(restored.transport_endpoint_, endpoint);
+
+    auto public_replicas =
+        service.GetReplicaList("standby_restore_nof_key", kDefaultTenant);
+    ASSERT_TRUE(public_replicas.has_value());
+    ASSERT_EQ(public_replicas->replicas.size(), 1);
+    EXPECT_TRUE(public_replicas->replicas.front().is_nof_replica());
+}
 
 TEST_F(MasterServiceHATest, OplogDisabledByDefaultDoesNotCreateWriter) {
     auto config = MasterServiceConfig::builder()

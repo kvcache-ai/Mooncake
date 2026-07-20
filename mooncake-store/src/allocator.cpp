@@ -28,6 +28,17 @@ AllocatedBuffer::~AllocatedBuffer() {
     }
 }
 
+AllocatedBuffer::AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
+                                 const AllocatedBuffer::Descriptor& descriptor)
+    : allocator_(std::move(allocator)),
+      buffer_ptr_(reinterpret_cast<void*>(descriptor.buffer_address_)),
+      size_(descriptor.size_),
+      protocol(descriptor.protocol_) {
+    if (protocol == "cxl") {
+        segment_name_ = descriptor.transport_endpoint_;
+    }
+}
+
 // Implementation of get_descriptor
 AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor() const {
     auto alloc = allocator_.lock();

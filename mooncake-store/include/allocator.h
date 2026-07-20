@@ -49,6 +49,9 @@ class AllocatedBuffer {
           size_(size),
           offset_handle_(std::move(offset_handle)) {}
 
+    AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
+                    const Descriptor& descriptor);
+
     ~AllocatedBuffer();
 
     AllocatedBuffer(const AllocatedBuffer&) = delete;

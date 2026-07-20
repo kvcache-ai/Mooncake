@@ -2611,12 +2611,18 @@ void MasterService::RestoreFromStandbySnapshot(
     invalid_replica_endpoints_.clear();
     for (const auto& seg : segments) {
         if (seg.is_memory_segment) {
-            standby_allocator_keepalive_[seg.transport_endpoint] =
-                std::make_shared<DummyBufferAllocator>(seg.segment_name,
-                                                       seg.transport_endpoint);
+            auto allocator = std::make_shared<DummyBufferAllocator>(
+                seg.segment_name, seg.transport_endpoint);
+            standby_allocator_keepalive_[seg.transport_endpoint] = allocator;
+            if (seg.segment_name != seg.transport_endpoint) {
+                standby_allocator_keepalive_[seg.segment_name] = allocator;
+            }
         }
         if (!segment_manager_.HasSegmentByEndpoint(seg.transport_endpoint)) {
             invalid_replica_endpoints_.insert(seg.transport_endpoint);
+            if (seg.segment_name != seg.transport_endpoint) {
+                invalid_replica_endpoints_.insert(seg.segment_name);
+            }
         }
     }
 
@@ -2665,9 +2671,10 @@ void MasterService::RestoreFromStandbySnapshot(
                     auto it = standby_allocator_keepalive_.find(endpoint);
                     if (it != standby_allocator_keepalive_.end()) {
                         auto alloc = it->second;
-                        replicas.emplace_back(std::make_unique<AllocatedBuffer>(
-                                                  alloc, nullptr, 0),
-                                              desc.status);
+                        replicas.emplace_back(
+                            std::make_unique<AllocatedBuffer>(
+                                alloc, mem_desc.buffer_descriptor),
+                            desc.status);
                     } else {
                         invalid_replica_endpoints_.insert(endpoint);
                     }
@@ -2675,16 +2682,15 @@ void MasterService::RestoreFromStandbySnapshot(
                     const auto& nof_desc = desc.get_nof_descriptor();
                     const std::string& endpoint =
                         nof_desc.buffer_descriptor.transport_endpoint_;
-                    auto it = standby_allocator_keepalive_.find(endpoint);
-                    if (it != standby_allocator_keepalive_.end()) {
-                        auto alloc = it->second;
-                        replicas.emplace_back(std::make_unique<AllocatedBuffer>(
-                                                  alloc, nullptr, 0),
-                                              desc.status,
-                                              ReplicaType::NOF_SSD);
-                    } else {
-                        invalid_replica_endpoints_.insert(endpoint);
+                    auto& alloc = standby_allocator_keepalive_[endpoint];
+                    if (!alloc) {
+                        alloc = std::make_shared<DummyBufferAllocator>(
+                            endpoint, endpoint);
                     }
+                    replicas.emplace_back(
+                        std::make_unique<AllocatedBuffer>(
+                            alloc, nof_desc.buffer_descriptor),
+                        desc.status, ReplicaType::NOF_SSD);
                 } else if (desc.is_disk_replica()) {
                     const auto& disk_desc = desc.get_disk_descriptor();
                     replicas.emplace_back(disk_desc.file_path,
