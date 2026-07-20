@@ -274,14 +274,16 @@ class P2PProxy {
    public:
     friend class P2PDeviceWorker;
 
-    enum class OpStatus : uint8_t { kPending = 0, kSuccess = 1, kFailed = 2 };
+    using OpStatus = MooncakeP2PWork::Status;
+
+    enum class IssueResult : uint8_t { kIssued, kNoCredit, kTimeout };
 
     struct Options {
         bool is_cpu = false;
         int rank = 0;
         int size = 0;
         int cuda_device_index = -1;
-        std::chrono::milliseconds transfer_timeout_ms{30000};
+        const int64_t* p2p_timeout_us = nullptr;
     };
 
     struct SendOp {
@@ -289,6 +291,7 @@ class P2PProxy {
         int peer_rank_ = -1;
         cudaStream_t cuda_stream_ = nullptr;
         std::shared_ptr<std::atomic<OpStatus>> status_;
+        int* failed_ranks_ = nullptr;
     };
 
     struct RecvOp {
@@ -297,6 +300,7 @@ class P2PProxy {
         int peer_rank_ = -1;
         cudaStream_t cuda_stream_ = nullptr;
         std::shared_ptr<std::atomic<OpStatus>> status_;
+        int* failed_ranks_ = nullptr;
     };
 
     P2PProxy(TransferEngine* engine, const Options& options);
@@ -405,6 +409,7 @@ class P2PProxy {
         // staging buffers.  When bytes_staged_ == total_bytes_ every chunk
         // has at least entered the Copy-In stage.
         uint64_t bytes_staged_ = 0;
+        int* failed_ranks_ = nullptr;
 
         std::chrono::steady_clock::time_point last_update_time_;
     };
@@ -447,6 +452,7 @@ class P2PProxy {
         int peer_rank_ = -1;
         cudaStream_t cuda_stream_ = nullptr;
         uint64_t total_bytes_ = 0;
+        int* failed_ranks_ = nullptr;
         // Number of bytes for which a RecvPool chunk has been reserved and a
         // CreditSlot has been sent to the peer.  When bytes_credited_ ==
         // total_bytes_ the entire tensor has been offered to the sender.
@@ -468,7 +474,7 @@ class P2PProxy {
     // to the peer to write data, and consumes AckSlots that the peer writes
     // back to acknowledge finished transfers.
     struct RecvPeerLane {
-        std::deque<RecvOp> pending_recv_ops_;
+        std::deque<RecvOpContext> pending_recv_ops_;
         std::optional<RecvOpContext> active_recv_op_;
         // Sequence number of the next CreditSlot to issue to this peer.
         uint64_t credit_issue_seq_ = 0;
@@ -498,15 +504,13 @@ class P2PProxy {
     bool isRecvOpCompleted(const RecvOpContext& op_ctx) const;
     void performRecvReset(int peer_rank);
 
-    bool tryIssueSendTask(SendOpContext& op_ctx, SendPeerLane& lane);
+    IssueResult tryIssueSendTask(SendOpContext& op_ctx, SendPeerLane& lane);
     bool stepSendTask(SendOpContext& op_ctx, SendTransferTask& task);
     bool stepSendCopyIn(SendTransferTask& task);
     bool stepSendWriteRemote(SendOpContext& op_ctx, SendTransferTask& task);
     bool stepSendAck(SendOpContext& op_ctx, SendTransferTask& task);
     bool isSendOpCompleted(const SendOpContext& op_ctx) const;
     void performSendReset(int peer_rank);
-
-    void reportBrokenPeer(int peer_rank);
 
     // These helpers are used only during reset or shutdown.
     // In the normal execution path, task and lane resources are released
@@ -515,7 +519,14 @@ class P2PProxy {
     void releaseRecvTaskResources(RecvTransferTask& task) const;
     void resetSendLane(SendPeerLane& lane);
     void resetRecvLane(RecvPeerLane& lane);
-    void resetPeerControlLanes(int peer_rank);
+    void resetPeerCreditLanes(int peer_rank);
+    void resetPeerAckLanes(int peer_rank);
+    // Clean up the active op on a lane
+    void cleanupFailedSendOp(SendOpContext& op_ctx);
+    void cleanupFailedRecvOp(RecvOpContext& op_ctx);
+    // Clean up, mark kFailed, and report the failure
+    void handleFailedSendOp(SendOpContext& op_ctx);
+    void handleFailedRecvOp(RecvOpContext& op_ctx);
 
     // Control lane addressing.
     //
@@ -539,7 +550,7 @@ class P2PProxy {
     template <typename T>
     bool isTimeout(const T& obj) const {
         return std::chrono::steady_clock::now() - obj.last_update_time_ >
-               transfer_timeout_ms_;
+               std::chrono::microseconds(*p2p_timeout_us_);
     }
 
    private:
@@ -559,7 +570,7 @@ class P2PProxy {
     int rank_ = 0;
     int size_ = 0;
     int cuda_device_index_ = -1;
-    std::chrono::milliseconds transfer_timeout_ms_{5000};  // 5s
+    const int64_t* p2p_timeout_us_ = nullptr;
     P2PResources resources_;
     bool resource_abandoned_{false};
 
@@ -571,7 +582,7 @@ class P2PProxy {
     std::queue<SendOpContext> send_queue_;
     std::mutex send_queue_mutex_;
 
-    std::queue<RecvOp> recv_queue_;
+    std::queue<RecvOpContext> recv_queue_;
     std::mutex recv_queue_mutex_;
 
     std::array<std::atomic<bool>, kMaxNumRanks> reset_send_req_;
