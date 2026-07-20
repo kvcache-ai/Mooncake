@@ -137,7 +137,7 @@ class P2PMasterService : public MasterService {
     // 1. max_replicas_per_key_ == 0 means no limitation
     // 2. max_replicas_per_key_ > 0 means the max client owner count
     uint64_t max_replicas_per_key_;
-    bool async_add_replica_oplog_{false};
+    bool async_oplog_{false};
 };
 
 }  // namespace mooncake

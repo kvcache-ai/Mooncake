@@ -16,10 +16,17 @@
 #include <hiredis/hiredis.h>
 
 #include "ha/oplog/oplog_store.h"
+#include "ha/oplog/p2p_oplog_types.h"
 #include "mutex.h"
 #include "redis_util.h"
 
 namespace mooncake {
+
+enum class OpLogAsyncQueueOverflowMode { REJECT, BYPASS };
+
+inline bool IsBestEffortRedisOpLog(OpType type) {
+    return type == OpType_ADD_REPLICA;
+}
 
 class RedisOpLogStore : public OpLogStore {
    public:
@@ -27,7 +34,11 @@ class RedisOpLogStore : public OpLogStore {
                     const std::string& redis_endpoint, bool enable_write,
                     int poll_interval_ms = 1000,
                     const std::string& password = "",
-                    const std::string& username = "", int db_index = 0);
+                    const std::string& username = "", int db_index = 0,
+                    size_t async_queue_max_entries = 100000,
+                    OpLogAsyncQueueOverflowMode async_queue_overflow_mode =
+                        OpLogAsyncQueueOverflowMode::REJECT,
+                    size_t best_effort_max_retries = 3);
     ~RedisOpLogStore() override;
 
     RedisOpLogStore(const RedisOpLogStore&) = delete;
@@ -86,9 +97,14 @@ class RedisOpLogStore : public OpLogStore {
     bool enable_write_;
     int poll_interval_ms_;
 
+    // P2P metadata is memory-first and is not transactionally coupled with its
+    // OpLog. Redis persistence runs on background workers. The queue is
+    // strictly bounded: overflow follows the configured reject/bypass
+    // degradation policy. Once admitted, required entries retry indefinitely,
+    // while best-effort entries use bounded retries.
+    //
     // Redis oplog key model:
-    // - latest: committed contiguous sequence watermark, safe for standby
-    // replay
+    // - latest: committed progress watermark; dropped entries may leave holes
     // - trimmed: highest sequence already removed by cleanup
     // - entry:<seq>: serialized oplog payload
     std::string key_tag_;
@@ -106,12 +122,15 @@ class RedisOpLogStore : public OpLogStore {
     std::map<uint64_t, std::shared_ptr<PendingWrite>> inflight_writes_
         GUARDED_BY(async_mutex_);
     std::set<uint64_t> persisted_sequences_ GUARDED_BY(async_mutex_);
+    std::set<uint64_t> dropped_sequences_ GUARDED_BY(async_mutex_);
     uint64_t committed_sequence_id_ GUARDED_BY(async_mutex_) = 0;
     std::atomic<bool> async_running_{false};
     std::vector<std::thread> async_workers_;
+    size_t async_queue_max_entries_;
+    OpLogAsyncQueueOverflowMode async_queue_overflow_mode_;
+    size_t best_effort_max_retries_;
 
     static constexpr size_t kAsyncWorkerCount = 4;
-    static constexpr size_t kMaxAsyncQueueSize = 100000;
     static constexpr size_t kCleanupBatchSize = 1000;
     static constexpr int kAsyncRetryDelayMs = 100;
     static constexpr int kSyncWaitTimeoutMs = 30000;

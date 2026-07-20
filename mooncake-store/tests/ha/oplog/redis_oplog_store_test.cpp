@@ -41,6 +41,15 @@ TEST(RedisOpLogStoreStandaloneTest, EndpointRequiresExplicitPort) {
     }
 }
 
+TEST(RedisOpLogStoreStandaloneTest, OnlyAddReplicaIsBestEffort) {
+    EXPECT_TRUE(IsBestEffortRedisOpLog(OpType_ADD_REPLICA));
+    EXPECT_FALSE(IsBestEffortRedisOpLog(OpType_REMOVE_REPLICA));
+    EXPECT_FALSE(IsBestEffortRedisOpLog(OpType_MOUNT_SEGMENT));
+    EXPECT_FALSE(IsBestEffortRedisOpLog(OpType_UNMOUNT_SEGMENT));
+    EXPECT_FALSE(IsBestEffortRedisOpLog(OpType_REGISTER_CLIENT));
+    EXPECT_FALSE(IsBestEffortRedisOpLog(OpType_UNREGISTER_CLIENT));
+}
+
 class RedisOpLogStoreTest : public ::testing::Test {
    protected:
     void SetUp() override {
@@ -256,19 +265,60 @@ TEST_F(RedisOpLogStoreTest, AsyncWriteDoesNotAdvanceLatestPastGap) {
     EXPECT_EQ(2u, latest);
 }
 
-TEST_F(RedisOpLogStoreTest, RewriteExistingSequenceIsIdempotent) {
+TEST_F(RedisOpLogStoreTest, BypassOverflowCreatesReadableGap) {
+    auto writer = std::make_unique<RedisOpLogStore>(
+        cluster_id_, redis_endpoint_, /*enable_write=*/true,
+        /*poll_interval_ms=*/10, redis_password_, redis_username_,
+        /*db_index=*/0, /*async_queue_max_entries=*/1,
+        OpLogAsyncQueueOverflowMode::BYPASS,
+        /*best_effort_max_retries=*/3);
+    ASSERT_EQ(ErrorCode::OK, writer->Init());
+
+    // seq=2 is persisted but retained in-flight because seq=1 is missing,
+    // making the one-entry queue deterministically full.
+    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(2), false));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(1), false));
+
+    uint64_t latest = 0;
+    for (int i = 0; i < 100 && latest != 2; ++i) {
+        ASSERT_EQ(ErrorCode::OK, writer->GetLatestSequenceId(latest));
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_EQ(2u, latest);
+
+    std::vector<OpLogEntry> entries;
+    ASSERT_EQ(ErrorCode::OK, writer->ReadOpLogSince(0, 10, entries));
+    ASSERT_EQ(1u, entries.size());
+    EXPECT_EQ(2u, entries.front().sequence_id);
+}
+
+TEST_F(RedisOpLogStoreTest, FactoryRejectsInvalidAsyncConfiguration) {
+    EXPECT_EQ(nullptr,
+              OpLogStoreFactory::Create(OpLogStoreType::REDIS, cluster_id_,
+                                        OpLogStoreRole::WRITER, redis_endpoint_,
+                                        10, redis_password_, redis_username_, 0,
+                                        0, "reject", 3));
+    EXPECT_EQ(nullptr,
+              OpLogStoreFactory::Create(OpLogStoreType::REDIS, cluster_id_,
+                                        OpLogStoreRole::WRITER, redis_endpoint_,
+                                        10, redis_password_, redis_username_, 0,
+                                        10, "invalid", 3));
+}
+
+TEST_F(RedisOpLogStoreTest, RewriteExistingSequenceOverwritesEntry) {
     auto writer = CreateWriter();
     auto entry = MakeEntry(1);
     ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(entry, true));
     EXPECT_EQ(ErrorCode::OK, writer->WriteOpLog(entry, true));
 
-    auto conflicting = entry;
-    conflicting.payload = "different_payload";
-    EXPECT_NE(ErrorCode::OK, writer->WriteOpLog(conflicting, true));
+    auto replacement = entry;
+    replacement.payload = "different_payload";
+    EXPECT_EQ(ErrorCode::OK, writer->WriteOpLog(replacement, true));
 
     OpLogEntry stored;
     ASSERT_EQ(ErrorCode::OK, writer->ReadOpLog(1, stored));
-    EXPECT_EQ(entry.payload, stored.payload);
+    EXPECT_EQ(replacement.payload, stored.payload);
 }
 
 TEST_F(RedisOpLogStoreTest, CleanupRemovesOldEntries) {

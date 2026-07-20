@@ -410,7 +410,7 @@ TEST_F(P2PRecordOplogTest,
     EXPECT_NE(service.GetClientManager().GetClient(req.client_id), nullptr);
 }
 
-TEST_F(P2PRecordOplogTest, AddReplicaDoesNotApplyWhenOplogPersistenceFails) {
+TEST_F(P2PRecordOplogTest, AddReplicaRemainsAppliedWhenOplogPersistenceFails) {
     P2PMasterService service(MakeConfig());
     const UUID client_id{32, 32};
     const UUID segment_id{33, 33};
@@ -428,8 +428,8 @@ TEST_F(P2PRecordOplogTest, AddReplicaDoesNotApplyWhenOplogPersistenceFails) {
     EXPECT_EQ(result.error(), ErrorCode::INTERNAL_ERROR);
 
     auto replicas = service.GetReplicaList(req.key);
-    ASSERT_FALSE(replicas.has_value());
-    EXPECT_EQ(replicas.error(), ErrorCode::OBJECT_NOT_FOUND);
+    ASSERT_TRUE(replicas.has_value());
+    ASSERT_EQ(1u, replicas->replicas.size());
 }
 
 TEST_F(P2PRecordOplogTest, RemoveReplicaDoesNotApplyWhenOplogPersistenceFails) {

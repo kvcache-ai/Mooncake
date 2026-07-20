@@ -5,7 +5,9 @@
 #include <xxhash.h>
 
 #include <cstdint>
+#include <chrono>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "ha/oplog/oplog_manager.h"
@@ -390,11 +392,7 @@ TEST(P2POpLogApplierTest, OutOfOrderEntryRejected) {
     EXPECT_EQ(applier.GetExpectedSequenceId(), 1u);
 }
 
-TEST(P2POpLogApplierTest, OutOfOrderEntryRejectedThenReplaySucceeds) {
-    // P2POpLogApplier does not buffer out-of-order entries (unlike base class
-    // which uses pending_entries_). Out-of-order entries are rejected, and
-    // the caller (OpLogReplicator) is responsible for re-delivering them
-    // after the gap is filled.
+TEST(P2POpLogApplierTest, OutOfOrderEntryBufferedThenGapFillDrainsIt) {
     P2PStandbyMetadataStore store;
     P2POpLogApplier applier(&store, "test-cluster");
 
@@ -413,19 +411,33 @@ TEST(P2POpLogApplierTest, OutOfOrderEntryRejectedThenReplaySucceeds) {
     p2.segment_id = seg;
     p2.size = 2048;
 
-    // seq=2 first — rejected (out-of-order)
+    // seq=2 first — reported pending and buffered by the common applier.
     EXPECT_FALSE(applier.ApplyOpLogEntry(MakeAddReplicaEntry(2, "key2", p2)));
     EXPECT_EQ(store.GetKeyCount(), 0u);
 
-    // seq=1 fills the gap — only key1 applied
+    // seq=1 fills the gap; the common pending queue then applies seq=2.
     EXPECT_TRUE(applier.ApplyOpLogEntry(MakeAddReplicaEntry(1, "key1", p1)));
-    EXPECT_EQ(store.GetKeyCount(), 1u);
-    EXPECT_EQ(applier.GetExpectedSequenceId(), 2u);
-
-    // Caller re-delivers seq=2 — now it succeeds
-    EXPECT_TRUE(applier.ApplyOpLogEntry(MakeAddReplicaEntry(2, "key2", p2)));
     EXPECT_EQ(store.GetKeyCount(), 2u);
     EXPECT_EQ(applier.GetExpectedSequenceId(), 3u);
+}
+
+TEST(P2POpLogApplierTest, MissingEntryTimeoutSkipsGapAndDrainsP2PEntry) {
+    P2PStandbyMetadataStore store;
+    P2POpLogApplier applier(&store, "test-cluster");
+
+    AddReplicaPayload payload;
+    payload.object_key = "after-gap";
+    payload.client_id = MakeUUID(1, 0);
+    payload.segment_id = MakeUUID(10, 0);
+    payload.size = 1024;
+
+    EXPECT_FALSE(
+        applier.ApplyOpLogEntry(MakeAddReplicaEntry(2, "after-gap", payload)));
+    applier.ProcessPendingEntries();  // start the common gap timer
+    std::this_thread::sleep_for(std::chrono::milliseconds(3100));
+    EXPECT_EQ(1u, applier.ProcessPendingEntries());
+    EXPECT_EQ(1u, store.GetKeyCount());
+    EXPECT_EQ(3u, applier.GetExpectedSequenceId());
 }
 
 // ============================================================================

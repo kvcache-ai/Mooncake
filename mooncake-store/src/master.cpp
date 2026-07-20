@@ -132,6 +132,12 @@ DEFINE_string(oplog_store_type, "localfs",
               "OpLog store backend type. Currently supports localfs");
 DEFINE_string(oplog_data_dir, "/tmp/mooncake_oplog",
               "Root directory for localfs OpLog data");
+DEFINE_uint64(oplog_async_queue_max_entries, 100000,
+              "Maximum number of queued/in-flight asynchronous OpLogs");
+DEFINE_string(oplog_async_queue_overflow_mode, "reject",
+              "Async OpLog queue overflow mode: reject or bypass");
+DEFINE_uint64(oplog_best_effort_max_retries, 3,
+              "Maximum Redis attempts for best-effort OpLogs");
 
 // Redis election backend configuration
 DEFINE_string(election_backend, "etcd",
@@ -204,6 +210,15 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                              FLAGS_oplog_store_type);
     default_config.GetString("oplog_data_dir", &master_config.oplog_data_dir,
                              FLAGS_oplog_data_dir);
+    default_config.GetUInt64("oplog_async_queue_max_entries",
+                             &master_config.oplog_async_queue_max_entries,
+                             FLAGS_oplog_async_queue_max_entries);
+    default_config.GetString("oplog_async_queue_overflow_mode",
+                             &master_config.oplog_async_queue_overflow_mode,
+                             FLAGS_oplog_async_queue_overflow_mode);
+    default_config.GetUInt64("oplog_best_effort_max_retries",
+                             &master_config.oplog_best_effort_max_retries,
+                             FLAGS_oplog_best_effort_max_retries);
     default_config.GetBool("enable_offload", &master_config.enable_offload,
                            FLAGS_enable_offload);
     default_config.GetString("etcd_endpoints", &master_config.etcd_endpoints,
@@ -414,6 +429,27 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.oplog_data_dir = FLAGS_oplog_data_dir;
+    }
+    if ((google::GetCommandLineFlagInfo("oplog_async_queue_max_entries",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.oplog_async_queue_max_entries =
+            FLAGS_oplog_async_queue_max_entries;
+    }
+    if ((google::GetCommandLineFlagInfo("oplog_async_queue_overflow_mode",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.oplog_async_queue_overflow_mode =
+            FLAGS_oplog_async_queue_overflow_mode;
+    }
+    if ((google::GetCommandLineFlagInfo("oplog_best_effort_max_retries",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.oplog_best_effort_max_retries =
+            FLAGS_oplog_best_effort_max_retries;
     }
     if ((google::GetCommandLineFlagInfo("enable_offload", &info) &&
          !info.is_default) ||
@@ -724,6 +760,12 @@ int main(int argc, char* argv[]) {
         << ", enable_oplog=" << master_config.enable_oplog
         << ", oplog_store_type=" << master_config.oplog_store_type
         << ", oplog_data_dir=" << master_config.oplog_data_dir
+        << ", oplog_async_queue_max_entries="
+        << master_config.oplog_async_queue_max_entries
+        << ", oplog_async_queue_overflow_mode="
+        << master_config.oplog_async_queue_overflow_mode
+        << ", oplog_best_effort_max_retries="
+        << master_config.oplog_best_effort_max_retries
         << ", enable_offload=" << master_config.enable_offload
         << ", etcd_endpoints=" << master_config.etcd_endpoints
         << ", client_ttl=" << master_config.client_live_ttl_sec
