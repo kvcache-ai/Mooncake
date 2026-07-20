@@ -1,0 +1,615 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from math import prod
+from typing import Iterable, Sequence
+
+from .manifest import (
+    ParallelRank,
+    RuntimeFragment,
+    RuntimeManifest,
+    StoredFragment,
+    TensorDescriptor,
+    WeightManifest,
+)
+
+
+SourceFragment = RuntimeFragment | StoredFragment
+
+
+@dataclass(frozen=True)
+class RuntimeLeaseSnapshot:
+    fragment_id: str
+    tensor_id: str
+    global_offset: tuple[int, ...]
+    local_shape: tuple[int, ...]
+    address: int
+    nbytes: int
+    worker_id: str
+    endpoint: str
+    lease_generation: int
+
+    @classmethod
+    def from_fragment(cls, fragment: RuntimeFragment) -> RuntimeLeaseSnapshot:
+        return cls(
+            fragment_id=fragment.fragment_id,
+            tensor_id=fragment.tensor_id,
+            global_offset=fragment.global_offset,
+            local_shape=fragment.local_shape,
+            address=fragment.address,
+            nbytes=fragment.nbytes,
+            worker_id=fragment.worker_id,
+            endpoint=fragment.endpoint,
+            lease_generation=fragment.lease_generation,
+        )
+
+
+@dataclass(frozen=True)
+class ExecutorTransferPlan:
+    instance_id: str
+    worker_id: str
+    rank: ParallelRank
+    fragment_ids: tuple[str, ...]
+    fragment_leases: tuple[RuntimeLeaseSnapshot, ...]
+    operation_indices: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "fragment_ids", tuple(self.fragment_ids))
+        object.__setattr__(self, "fragment_leases", tuple(self.fragment_leases))
+        object.__setattr__(self, "operation_indices", tuple(self.operation_indices))
+        if not self.instance_id or not self.worker_id or not self.fragment_ids:
+            raise ValueError("executor plan identifiers must not be empty")
+        if len(self.fragment_ids) != len(set(self.fragment_ids)):
+            raise ValueError("executor plan has duplicate fragment IDs")
+        if not all(
+            isinstance(lease, RuntimeLeaseSnapshot) for lease in self.fragment_leases
+        ):
+            raise ValueError("executor plan has invalid runtime lease metadata")
+        if (
+            tuple(lease.fragment_id for lease in self.fragment_leases)
+            != self.fragment_ids
+        ):
+            raise ValueError("executor plan fragment lease IDs do not match")
+        if any(type(index) is not int or index < 0 for index in self.operation_indices):
+            raise ValueError("executor operation indices must be non-negative integers")
+
+
+@dataclass(frozen=True)
+class CopyRange:
+    tensor_id: str
+    source: SourceFragment
+    target: RuntimeFragment
+    source_offset: int
+    target_offset: int
+    nbytes: int
+    repeat: int = 1
+    source_stride: int = 0
+    target_stride: int = 0
+
+    def __post_init__(self) -> None:
+        if not self.tensor_id:
+            raise ValueError("copy range tensor_id must not be empty")
+        if (
+            self.source.tensor_id != self.tensor_id
+            or self.target.tensor_id != self.tensor_id
+        ):
+            raise ValueError("copy range tensor mismatch")
+        for name in (
+            "source_offset",
+            "target_offset",
+            "nbytes",
+            "repeat",
+            "source_stride",
+            "target_stride",
+        ):
+            value = getattr(self, name)
+            if type(value) is not int:
+                raise ValueError(f"copy range {name} must be an integer")
+        if (
+            min(
+                self.source_offset,
+                self.target_offset,
+                self.source_stride,
+                self.target_stride,
+            )
+            < 0
+        ):
+            raise ValueError("copy range values must be non-negative")
+        if self.nbytes <= 0 or self.repeat <= 0:
+            raise ValueError("copy range size and repeat must be positive")
+        self.validate_bounds()
+
+    def validate_bounds(self) -> None:
+        source_end = (
+            self.source_offset + (self.repeat - 1) * self.source_stride + self.nbytes
+        )
+        if source_end > self.source.nbytes:
+            raise ValueError("copy range exceeds source fragment")
+        target_end = (
+            self.target_offset + (self.repeat - 1) * self.target_stride + self.nbytes
+        )
+        if target_end > self.target.nbytes:
+            raise ValueError("copy range exceeds target fragment")
+
+    @property
+    def total_bytes(self) -> int:
+        return self.nbytes * self.repeat
+
+    def iter_segments(self) -> Iterable[tuple[int, int, int]]:
+        for index in range(self.repeat):
+            yield (
+                self.source_offset + index * self.source_stride,
+                self.target_offset + index * self.target_stride,
+                self.nbytes,
+            )
+
+
+@dataclass(frozen=True)
+class TransferPlan:
+    model_id: str
+    revision: str
+    operations: tuple[CopyRange, ...]
+    source_executors: tuple[ExecutorTransferPlan, ...] = ()
+    target_executors: tuple[ExecutorTransferPlan, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "operations", tuple(self.operations))
+        object.__setattr__(self, "source_executors", tuple(self.source_executors))
+        object.__setattr__(self, "target_executors", tuple(self.target_executors))
+        if not self.model_id or not self.revision:
+            raise ValueError("transfer plan identifiers must not be empty")
+        for executor in (*self.source_executors, *self.target_executors):
+            if any(
+                index >= len(self.operations) for index in executor.operation_indices
+            ):
+                raise ValueError("executor operation index is out of range")
+
+    @property
+    def total_bytes(self) -> int:
+        return sum(operation.total_bytes for operation in self.operations)
+
+
+def _collect_manifests(
+    manifests: Sequence[RuntimeManifest], label: str
+) -> tuple[dict[str, TensorDescriptor], list[RuntimeFragment]]:
+    if not manifests:
+        raise ValueError(f"{label} manifests must not be empty")
+
+    model_id = manifests[0].model_id
+    revision = manifests[0].revision
+    tensors: dict[str, TensorDescriptor] = {}
+    fragments: list[RuntimeFragment] = []
+    fragment_ids: set[str] = set()
+    for manifest in manifests:
+        if manifest.model_id != model_id or manifest.revision != revision:
+            raise ValueError(f"{label} manifests describe different revisions")
+        for tensor in manifest.tensors:
+            previous = tensors.setdefault(tensor.tensor_id, tensor)
+            if previous != tensor:
+                raise ValueError(
+                    f"{label} tensor descriptor mismatch: {tensor.tensor_id}"
+                )
+        for fragment in manifest.fragments:
+            if fragment.fragment_id in fragment_ids:
+                raise ValueError(
+                    f"duplicate {label} fragment_id: {fragment.fragment_id}"
+                )
+            fragment_ids.add(fragment.fragment_id)
+            fragments.append(fragment)
+    return tensors, fragments
+
+
+def _build_executor_plans(
+    manifests: Sequence[RuntimeManifest],
+    operations: Sequence[CopyRange],
+    side: str,
+) -> tuple[ExecutorTransferPlan, ...]:
+    if side not in ("source", "target"):
+        raise ValueError(f"invalid executor side: {side}")
+    result = []
+    ranks: set[ParallelRank] = set()
+    operation_indices_by_fragment: dict[str, list[int]] = {}
+    for index, operation in enumerate(operations):
+        fragment_id = getattr(operation, side).fragment_id
+        operation_indices_by_fragment.setdefault(fragment_id, []).append(index)
+    for manifest in manifests:
+        if not manifest.fragments:
+            raise ValueError(f"{side} executor manifest has no fragments")
+        fragments_by_rank: dict[ParallelRank, list[RuntimeFragment]] = {}
+        for fragment in manifest.fragments:
+            fragments_by_rank.setdefault(fragment.rank, []).append(fragment)
+        for rank, fragments in fragments_by_rank.items():
+            workers = {fragment.worker_id for fragment in fragments}
+            if len(workers) != 1:
+                raise ValueError(f"{side} executor rank spans multiple workers: {rank}")
+            if rank in ranks:
+                raise ValueError(f"duplicate {side} executor rank: {rank}")
+            ranks.add(rank)
+            ordered_fragments = sorted(
+                fragments, key=lambda fragment: fragment.fragment_id
+            )
+            fragment_ids = tuple(fragment.fragment_id for fragment in ordered_fragments)
+            operation_indices = tuple(
+                sorted(
+                    index
+                    for fragment_id in fragment_ids
+                    for index in operation_indices_by_fragment.get(fragment_id, ())
+                )
+            )
+            result.append(
+                ExecutorTransferPlan(
+                    instance_id=manifest.instance_id,
+                    worker_id=next(iter(workers)),
+                    rank=rank,
+                    fragment_ids=fragment_ids,
+                    fragment_leases=tuple(
+                        RuntimeLeaseSnapshot.from_fragment(fragment)
+                        for fragment in ordered_fragments
+                    ),
+                    operation_indices=operation_indices,
+                )
+            )
+    result.sort(
+        key=lambda item: (item.rank.dp, item.rank.pp, item.rank.ep, item.rank.tp)
+    )
+    return tuple(result)
+
+
+def resolve_executor_plans(
+    plan: TransferPlan,
+    manifest: RuntimeManifest,
+    side: str,
+) -> tuple[ExecutorTransferPlan, ...]:
+    if side == "source":
+        executors = plan.source_executors
+    elif side == "target":
+        executors = plan.target_executors
+    else:
+        raise ValueError(f"invalid executor side: {side}")
+    if not executors:
+        raise ValueError(f"transfer plan has no {side} executor metadata")
+    if not manifest.fragments:
+        raise ValueError(f"{side} executor snapshot mismatch: no fragments")
+    expected_executors = tuple(
+        executor
+        for executor in executors
+        if executor.instance_id == manifest.instance_id
+    )
+    if not expected_executors:
+        raise ValueError(f"{side} executor snapshot mismatch: unknown instance")
+    executor_by_rank = {executor.rank: executor for executor in expected_executors}
+    fragments_by_rank: dict[ParallelRank, list[RuntimeFragment]] = {}
+    for fragment in manifest.fragments:
+        fragments_by_rank.setdefault(fragment.rank, []).append(fragment)
+    if set(fragments_by_rank) != set(executor_by_rank):
+        raise ValueError(f"{side} executor snapshot mismatch: executor set changed")
+    result = []
+    for rank, fragments in fragments_by_rank.items():
+        executor = executor_by_rank.get(rank)
+        workers = {fragment.worker_id for fragment in fragments}
+        ordered_fragments = sorted(fragments, key=lambda fragment: fragment.fragment_id)
+        current_ids = tuple(fragment.fragment_id for fragment in ordered_fragments)
+        current_leases = tuple(
+            RuntimeLeaseSnapshot.from_fragment(fragment)
+            for fragment in ordered_fragments
+        )
+        if executor is None or len(workers) != 1:
+            raise ValueError(f"{side} executor snapshot mismatch: unknown rank {rank}")
+        if (
+            manifest.instance_id != executor.instance_id
+            or next(iter(workers)) != executor.worker_id
+            or current_ids != executor.fragment_ids
+            or current_leases != executor.fragment_leases
+        ):
+            raise ValueError(f"{side} executor snapshot mismatch")
+        result.append(executor)
+    result.sort(
+        key=lambda item: (item.rank.dp, item.rank.pp, item.rank.ep, item.rank.tp)
+    )
+    return tuple(result)
+
+
+def resolve_executor_plan(
+    plan: TransferPlan,
+    manifest: RuntimeManifest,
+    side: str,
+) -> ExecutorTransferPlan:
+    executors = resolve_executor_plans(plan, manifest, side)
+    if len(executors) != 1:
+        raise ValueError(f"{side} executor snapshot contains multiple ranks")
+    return executors[0]
+
+
+def _validate_tensor_compatibility(
+    source: TensorDescriptor, target: TensorDescriptor
+) -> None:
+    if source.layout_fingerprint != target.layout_fingerprint:
+        raise ValueError(f"layout mismatch for tensor {source.tensor_id}")
+    if (
+        source.global_shape != target.global_shape
+        or source.dtype != target.dtype
+        or source.itemsize != target.itemsize
+        or source.partition_dim != target.partition_dim
+        or source.layer_id != target.layer_id
+        or source.expert_id != target.expert_id
+    ):
+        raise ValueError(f"tensor descriptor mismatch: {source.tensor_id}")
+
+
+def _validate_tensor_sets(
+    source_tensors: dict[str, TensorDescriptor],
+    target_tensors: dict[str, TensorDescriptor],
+) -> None:
+    source_ids = set(source_tensors)
+    target_ids = set(target_tensors)
+    missing = sorted(source_ids - target_ids)
+    if missing:
+        raise ValueError(f"target manifests are missing tensors: {', '.join(missing)}")
+    unexpected = sorted(target_ids - source_ids)
+    if unexpected:
+        raise ValueError(
+            f"target manifests contain unknown tensors: {', '.join(unexpected)}"
+        )
+
+
+def _validate_target_coverage(
+    target_tensors: dict[str, TensorDescriptor],
+    target_fragments: Sequence[RuntimeFragment],
+) -> None:
+    if not target_fragments:
+        raise ValueError("target manifests have no fragments")
+    dp_ranks = sorted({fragment.rank.dp for fragment in target_fragments})
+    for dp_rank in dp_ranks:
+        for tensor in target_tensors.values():
+            geometries = {
+                (fragment.global_offset, fragment.local_shape): fragment
+                for fragment in target_fragments
+                if fragment.rank.dp == dp_rank
+                and fragment.tensor_id == tensor.tensor_id
+            }
+            fragments = tuple(geometries.values())
+            if tensor.partition_dim is None:
+                complete = len(fragments) == 1
+            else:
+                dim = tensor.partition_dim
+                intervals = sorted(
+                    (
+                        fragment.global_offset[dim],
+                        fragment.global_offset[dim] + fragment.local_shape[dim],
+                    )
+                    for fragment in fragments
+                )
+                cursor = 0
+                complete = True
+                for begin, end in intervals:
+                    if begin != cursor:
+                        complete = False
+                        break
+                    cursor = end
+                complete = complete and cursor == tensor.global_shape[dim]
+            if not complete:
+                raise ValueError(
+                    f"target tensor is not fully covered: {tensor.tensor_id}: "
+                    f"dp={dp_rank}"
+                )
+
+
+def _geometry_key(fragment: SourceFragment) -> tuple:
+    return fragment.tensor_id, fragment.global_offset, fragment.local_shape
+
+
+def _source_sort_key(fragment: SourceFragment) -> tuple:
+    if isinstance(fragment, StoredFragment):
+        return (0, 0, 0, 0, fragment.object_key, fragment.fragment_id)
+    return (
+        fragment.rank.dp,
+        fragment.rank.pp,
+        fragment.rank.ep,
+        fragment.rank.tp,
+        fragment.worker_id,
+        fragment.fragment_id,
+    )
+
+
+def _target_interval(
+    tensor: TensorDescriptor, fragment: SourceFragment
+) -> tuple[int, int]:
+    if tensor.partition_dim is None:
+        return 0, 1
+    dim = tensor.partition_dim
+    start = fragment.global_offset[dim]
+    return start, start + fragment.local_shape[dim]
+
+
+def _overlap(
+    tensor: TensorDescriptor,
+    source: SourceFragment,
+    target: RuntimeFragment,
+) -> tuple[int, int] | None:
+    source_start, source_end = _target_interval(tensor, source)
+    target_start, target_end = _target_interval(tensor, target)
+    begin = max(source_start, target_start)
+    end = min(source_end, target_end)
+    if begin >= end:
+        return None
+    return begin, end
+
+
+def _copy_ranges(
+    tensor: TensorDescriptor,
+    source: SourceFragment,
+    target: RuntimeFragment,
+    begin: int,
+    end: int,
+) -> Iterable[CopyRange]:
+    dim = tensor.partition_dim
+    if dim is None:
+        yield CopyRange(
+            tensor_id=tensor.tensor_id,
+            source=source,
+            target=target,
+            source_offset=0,
+            target_offset=0,
+            nbytes=source.nbytes,
+        )
+        return
+
+    source_start, _ = _target_interval(tensor, source)
+    target_start, _ = _target_interval(tensor, target)
+    source_extent = source.local_shape[dim]
+    target_extent = target.local_shape[dim]
+    prefix = prod(tensor.global_shape[:dim])
+    suffix = prod(tensor.global_shape[dim + 1 :])
+    row_bytes = (end - begin) * suffix * tensor.itemsize
+
+    source_stride = source_extent * suffix * tensor.itemsize
+    target_stride = target_extent * suffix * tensor.itemsize
+    if source_stride == row_bytes and target_stride == row_bytes:
+        yield CopyRange(
+            tensor_id=tensor.tensor_id,
+            source=source,
+            target=target,
+            source_offset=(begin - source_start) * suffix * tensor.itemsize,
+            target_offset=(begin - target_start) * suffix * tensor.itemsize,
+            nbytes=row_bytes * prefix,
+        )
+        return
+    yield CopyRange(
+        tensor_id=tensor.tensor_id,
+        source=source,
+        target=target,
+        source_offset=(begin - source_start) * suffix * tensor.itemsize,
+        target_offset=(begin - target_start) * suffix * tensor.itemsize,
+        nbytes=row_bytes,
+        repeat=prefix,
+        source_stride=source_stride,
+        target_stride=target_stride,
+    )
+
+
+def _plan_transfer(
+    model_id: str,
+    revision: str,
+    source_tensors: dict[str, TensorDescriptor],
+    source_fragments: Sequence[SourceFragment],
+    target_tensors: dict[str, TensorDescriptor],
+    target_fragments: Sequence[RuntimeFragment],
+) -> TransferPlan:
+    _validate_tensor_sets(source_tensors, target_tensors)
+    _validate_target_coverage(target_tensors, target_fragments)
+    candidates: dict[str, dict[tuple, list[SourceFragment]]] = {}
+    for fragment in source_fragments:
+        candidates.setdefault(fragment.tensor_id, {}).setdefault(
+            _geometry_key(fragment), []
+        ).append(fragment)
+    for tensor_candidates in candidates.values():
+        for group in tensor_candidates.values():
+            group.sort(key=_source_sort_key)
+
+    operations: list[CopyRange] = []
+    for target in sorted(target_fragments, key=lambda item: item.fragment_id):
+        target_tensor = target_tensors[target.tensor_id]
+        source_tensor = source_tensors.get(target.tensor_id)
+        if source_tensor is None:
+            raise ValueError(f"missing source tensor: {target.tensor_id}")
+        _validate_tensor_compatibility(source_tensor, target_tensor)
+
+        overlaps: list[tuple[int, int, SourceFragment]] = []
+        for group in candidates.get(target.tensor_id, {}).values():
+            representative = group[0]
+            interval = _overlap(source_tensor, representative, target)
+            if interval is None:
+                continue
+            selected = group[target.rank.dp % len(group)]
+            overlaps.append((*interval, selected))
+        overlaps.sort(key=lambda item: (item[0], item[1], item[2].fragment_id))
+
+        target_start, target_end = _target_interval(target_tensor, target)
+        cursor = target_start
+        for begin, end, source in overlaps:
+            if begin != cursor:
+                raise ValueError(
+                    f"target fragment is not fully covered: {target.fragment_id}"
+                )
+            cursor = end
+            operations.extend(_copy_ranges(target_tensor, source, target, begin, end))
+        if cursor != target_end:
+            raise ValueError(
+                f"target fragment is not fully covered: {target.fragment_id}"
+            )
+
+    operations.sort(
+        key=lambda item: (
+            item.target.fragment_id,
+            item.target_offset,
+            item.source.fragment_id,
+            item.source_offset,
+        )
+    )
+    return TransferPlan(
+        model_id=model_id,
+        revision=revision,
+        operations=tuple(operations),
+    )
+
+
+def plan_runtime_transfer(
+    source_manifests: Sequence[RuntimeManifest],
+    target_manifests: Sequence[RuntimeManifest],
+) -> TransferPlan:
+    source_tensors, source_fragments = _collect_manifests(source_manifests, "source")
+    target_tensors, target_fragments = _collect_manifests(target_manifests, "target")
+    source = source_manifests[0]
+    target = target_manifests[0]
+    if source.model_id != target.model_id:
+        raise ValueError("source and target model_id differ")
+    if source.revision != target.revision:
+        raise ValueError("source and target revision differ")
+    transfer = _plan_transfer(
+        source.model_id,
+        source.revision,
+        source_tensors,
+        source_fragments,
+        target_tensors,
+        target_fragments,
+    )
+    return TransferPlan(
+        model_id=transfer.model_id,
+        revision=transfer.revision,
+        operations=transfer.operations,
+        source_executors=_build_executor_plans(
+            source_manifests, transfer.operations, "source"
+        ),
+        target_executors=_build_executor_plans(
+            target_manifests, transfer.operations, "target"
+        ),
+    )
+
+
+def plan_stored_transfer(
+    source_manifest: WeightManifest,
+    target_manifests: Sequence[RuntimeManifest],
+) -> TransferPlan:
+    target_tensors, target_fragments = _collect_manifests(target_manifests, "target")
+    target = target_manifests[0]
+    if source_manifest.model_id != target.model_id:
+        raise ValueError("source and target model_id differ")
+    if source_manifest.revision != target.revision:
+        raise ValueError("source and target revision differ")
+    source_tensors = {tensor.tensor_id: tensor for tensor in source_manifest.tensors}
+    transfer = _plan_transfer(
+        source_manifest.model_id,
+        source_manifest.revision,
+        source_tensors,
+        source_manifest.fragments,
+        target_tensors,
+        target_fragments,
+    )
+    return TransferPlan(
+        model_id=transfer.model_id,
+        revision=transfer.revision,
+        operations=transfer.operations,
+        target_executors=_build_executor_plans(
+            target_manifests, transfer.operations, "target"
+        ),
+    )
