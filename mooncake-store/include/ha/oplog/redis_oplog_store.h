@@ -16,6 +16,7 @@
 #include <hiredis/hiredis.h>
 
 #include "ha/oplog/oplog_store.h"
+#include "mutex.h"
 #include "redis_util.h"
 
 namespace mooncake {
@@ -94,16 +95,18 @@ class RedisOpLogStore : public OpLogStore {
     std::string latest_key_;
     std::string trimmed_key_;
     std::string snapshot_prefix_;
-    redisContext* ctx_{nullptr};
     mutable std::mutex mutex_;
+    redisContext* ctx_ GUARDED_BY(mutex_) = nullptr;
 
     mutable std::mutex async_mutex_;
     std::condition_variable async_cv_;
     std::condition_variable sync_cv_;
-    std::deque<std::shared_ptr<PendingWrite>> pending_writes_;
-    std::map<uint64_t, std::shared_ptr<PendingWrite>> inflight_writes_;
-    std::set<uint64_t> persisted_sequences_;
-    uint64_t committed_sequence_id_{0};
+    std::deque<std::shared_ptr<PendingWrite>> pending_writes_
+        GUARDED_BY(async_mutex_);
+    std::map<uint64_t, std::shared_ptr<PendingWrite>> inflight_writes_
+        GUARDED_BY(async_mutex_);
+    std::set<uint64_t> persisted_sequences_ GUARDED_BY(async_mutex_);
+    uint64_t committed_sequence_id_ GUARDED_BY(async_mutex_) = 0;
     std::atomic<bool> async_running_{false};
     std::vector<std::thread> async_workers_;
 

@@ -131,12 +131,6 @@ class P2PMasterService : public MasterService {
         MetadataShard& shard, std::string_view key, const UUID& client_id,
         const UUID& segment_id) NO_THREAD_SAFETY_ANALYSIS;
 
-    ErrorCode RecordOplogOrError(OpType type, const std::string& key,
-                                 const std::string& payload,
-                                 const char* operation,
-                                 const std::string& details = std::string(),
-                                 bool sync = true);
-
     std::shared_ptr<P2PClientManager> client_manager_;
     std::array<P2PMetadataShard, kNumShards> metadata_shards_;
     // for the number of clients owning a key:

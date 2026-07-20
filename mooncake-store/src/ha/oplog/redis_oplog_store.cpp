@@ -102,6 +102,9 @@ ErrorCode RedisOpLogStore::Init() {
     std::lock_guard<std::mutex> lock(mutex_);
     auto err = EnsureConnectedUnlocked();
     if (err != ErrorCode::OK) {
+        LOG(ERROR) << "RedisOpLogStore::Init: failed to ensure Redis "
+                      "connection"
+                   << ", error=" << toString(err);
         return err;
     }
     uint64_t latest = 0;
@@ -298,13 +301,18 @@ void RedisOpLogStore::AsyncWriteLoop(size_t worker_id) {
                 redisFree(ctx);
                 ctx = nullptr;
             }
-            ++pending->attempts;
+            size_t attempts;
+            {
+                // Mutable PendingWrite state is protected by async_mutex_.
+                std::lock_guard<std::mutex> lock(async_mutex_);
+                attempts = ++pending->attempts;
+            }
             // TODO(P2P HA): Add bounded exponential backoff, jitter, and
             // pending/retry metrics.
             LOG(WARNING) << "RedisOpLogStore: async write failed, retrying"
                          << ", worker_id=" << worker_id
                          << ", sequence_id=" << pending->entry.sequence_id
-                         << ", attempts=" << pending->attempts
+                         << ", attempts=" << attempts
                          << ", error=" << toString(err);
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(kAsyncRetryDelayMs));
@@ -444,6 +452,10 @@ ErrorCode RedisOpLogStore::ReadOpLogUnlocked(uint64_t sequence_id,
                                              OpLogEntry& entry) {
     auto err = EnsureConnectedUnlocked();
     if (err != ErrorCode::OK) {
+        LOG(ERROR) << "RedisOpLogStore::ReadOpLog: failed to ensure Redis "
+                      "connection"
+                   << ", sequence_id=" << sequence_id
+                   << ", error=" << toString(err);
         return err;
     }
 
@@ -484,6 +496,10 @@ ErrorCode RedisOpLogStore::ReadOpLogSince(uint64_t start_sequence_id,
     }
     auto err = EnsureConnectedUnlocked();
     if (err != ErrorCode::OK) {
+        LOG(ERROR) << "RedisOpLogStore::ReadOpLogSince: failed to ensure "
+                      "Redis connection"
+                   << ", start_sequence_id=" << start_sequence_id
+                   << ", limit=" << limit << ", error=" << toString(err);
         return err;
     }
 
@@ -613,6 +629,9 @@ ErrorCode RedisOpLogStore::GetLatestSequenceId(uint64_t& sequence_id) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto err = EnsureConnectedUnlocked();
     if (err != ErrorCode::OK) {
+        LOG(ERROR) << "RedisOpLogStore::GetLatestSequenceId: failed to ensure "
+                      "Redis connection"
+                   << ", error=" << toString(err);
         return err;
     }
     RedisReplyPtr reply((redisReply*)redisCommand(
@@ -636,6 +655,9 @@ ErrorCode RedisOpLogStore::GetLatestSequenceId(uint64_t& sequence_id) {
 ErrorCode RedisOpLogStore::GetMaxSequenceId(uint64_t& sequence_id) {
     auto err = GetLatestSequenceId(sequence_id);
     if (err != ErrorCode::OK) {
+        LOG(ERROR) << "RedisOpLogStore::GetMaxSequenceId: failed to get latest "
+                      "sequence ID"
+                   << ", error=" << toString(err);
         return err;
     }
     if (sequence_id == 0) {
@@ -650,6 +672,10 @@ ErrorCode RedisOpLogStore::UpdateLatestSequenceId(uint64_t sequence_id) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto err = EnsureConnectedUnlocked();
     if (err != ErrorCode::OK) {
+        LOG(ERROR) << "RedisOpLogStore::UpdateLatestSequenceId: failed to "
+                      "ensure Redis connection"
+                   << ", sequence_id=" << sequence_id
+                   << ", error=" << toString(err);
         return err;
     }
     const std::string seq = SequenceMember(sequence_id);
@@ -688,6 +714,11 @@ ErrorCode RedisOpLogStore::RecordSnapshotSequenceId(
     }
     auto err = EnsureConnectedUnlocked();
     if (err != ErrorCode::OK) {
+        LOG(ERROR) << "RedisOpLogStore::RecordSnapshotSequenceId: failed to "
+                      "ensure Redis connection"
+                   << ", snapshot_id=" << snapshot_id
+                   << ", sequence_id=" << sequence_id
+                   << ", error=" << toString(err);
         return err;
     }
     const std::string key = SnapshotKey(snapshot_id);
@@ -712,6 +743,10 @@ ErrorCode RedisOpLogStore::GetSnapshotSequenceId(const std::string& snapshot_id,
     }
     auto err = EnsureConnectedUnlocked();
     if (err != ErrorCode::OK) {
+        LOG(ERROR) << "RedisOpLogStore::GetSnapshotSequenceId: failed to "
+                      "ensure Redis connection"
+                   << ", snapshot_id=" << snapshot_id
+                   << ", error=" << toString(err);
         return err;
     }
     const std::string key = SnapshotKey(snapshot_id);
@@ -742,6 +777,10 @@ ErrorCode RedisOpLogStore::CleanupOpLogBefore(uint64_t before_sequence_id) {
         std::lock_guard<std::mutex> lock(mutex_);
         auto err = EnsureConnectedUnlocked();
         if (err != ErrorCode::OK) {
+            LOG(ERROR) << "RedisOpLogStore::CleanupOpLogBefore: failed to "
+                          "ensure Redis connection"
+                       << ", before_sequence_id=" << before_sequence_id
+                       << ", error=" << toString(err);
             return err;
         }
 
