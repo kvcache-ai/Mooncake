@@ -837,6 +837,8 @@ int TransferEngine::registerLocalMemory(void* addr, size_t length,
             return ERR_INVALID_ARGUMENT;
         }
         const auto base = reinterpret_cast<uintptr_t>(addr);
+        auto option =
+            makeTentMemoryOptions(location, remote_accessible, update_metadata);
         {
             std::lock_guard<std::mutex> lock(tent_compat_mutex_);
             if (containsOverlappingRange(tent_registered_ranges_, base,
@@ -846,15 +848,12 @@ int TransferEngine::registerLocalMemory(void* addr, size_t length,
                        "region";
                 return ERR_ADDRESS_OVERLAPPED;
             }
+            auto status = impl_tent_->registerLocalMemory(addr, length, option);
+            if (status.ok()) {
+                tent_registered_ranges_.push_back({base, length});
+            }
+            return tentStatusToClassicReturn(status);
         }
-        auto option =
-            makeTentMemoryOptions(location, remote_accessible, update_metadata);
-        auto status = impl_tent_->registerLocalMemory(addr, length, option);
-        if (status.ok()) {
-            std::lock_guard<std::mutex> lock(tent_compat_mutex_);
-            tent_registered_ranges_.push_back({base, length});
-        }
-        return tentStatusToClassicReturn(status);
     } else
         return impl_->registerLocalMemory(addr, length, location,
                                           remote_accessible, update_metadata);
@@ -902,6 +901,14 @@ int TransferEngine::registerLocalMemoryBatch(
                 << "Transfer Engine does not support overlapped memory region";
             return ERR_ADDRESS_OVERLAPPED;
         }
+        auto option = makeTentMemoryOptions(
+            location, /*remote_accessible=*/true, /*update_metadata=*/true);
+        std::vector<void*> addr_list;
+        std::vector<size_t> size_list;
+        for (auto& buffer : buffer_list) {
+            addr_list.push_back(buffer.addr);
+            size_list.push_back(buffer.length);
+        }
         {
             std::lock_guard<std::mutex> lock(tent_compat_mutex_);
             for (const auto& buffer : buffer_list) {
@@ -914,25 +921,17 @@ int TransferEngine::registerLocalMemoryBatch(
                     return ERR_ADDRESS_OVERLAPPED;
                 }
             }
-        }
-        auto option = makeTentMemoryOptions(
-            location, /*remote_accessible=*/true, /*update_metadata=*/true);
-        std::vector<void*> addr_list;
-        std::vector<size_t> size_list;
-        for (auto& buffer : buffer_list) {
-            addr_list.push_back(buffer.addr);
-            size_list.push_back(buffer.length);
-        }
-        auto status =
-            impl_tent_->registerLocalMemory(addr_list, size_list, option);
-        if (status.ok()) {
-            std::lock_guard<std::mutex> lock(tent_compat_mutex_);
-            for (auto& buffer : buffer_list) {
-                tent_registered_ranges_.push_back(
-                    {reinterpret_cast<uintptr_t>(buffer.addr), buffer.length});
+            auto status =
+                impl_tent_->registerLocalMemory(addr_list, size_list, option);
+            if (status.ok()) {
+                for (auto& buffer : buffer_list) {
+                    tent_registered_ranges_.push_back(
+                        {reinterpret_cast<uintptr_t>(buffer.addr),
+                         buffer.length});
+                }
             }
+            return tentStatusToClassicReturn(status);
         }
-        return tentStatusToClassicReturn(status);
     } else {
         return impl_->registerLocalMemoryBatch(buffer_list, location);
     }

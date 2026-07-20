@@ -125,6 +125,7 @@ TENT still uses a different internal model from classic TE, so a few TE APIs hav
 | `getMetadata()` | Returns `nullptr`; TENT does not expose classic `TransferMetadata`. | Use `getSegmentBufferBase(handle, index, base)` when legacy code needs a remote buffer base. |
 | `getLocalTopology()` / C API `discoverTopology()` | C++ returns an empty placeholder topology; the C API `discoverTopology()` is a no-op success. | Configure topology in TENT config or through init-time compatibility hints. |
 | `syncSegmentCache(...)` | No-op success; TENT manages segment cache internally. | Remove explicit cache sync calls when migrating to native TENT. |
+| `removeLocalSegment(...)` | Returns failure because TENT manages local segment lifecycle internally. | Do not depend on explicit local segment removal when `isUsingTent()` is true. |
 | `registerLocalMemory(...)` and batch variants | The shim preserves classic TE validation: zero-length regions are rejected, overlapping regions are rejected, and unregistering an unknown address returns `ERR_ADDRESS_NOT_REGISTERED`. | Existing TE registration error handling should continue to work. |
 | Transport registration failure during memory registration | TENT now reports the first transport failure and rolls back previously registered transport buffers. | Treat non-zero registration return values as fatal for that region, as with classic TE. |
 | `allocateBatchID(...)` | A TENT allocation failure is translated to `INVALID_BATCH_ID`. | Keep existing invalid-batch checks. |

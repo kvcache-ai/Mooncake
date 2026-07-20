@@ -78,6 +78,7 @@ void destroyTransferEngine(transfer_engine_t engine) {
 
 segment_id_t openSegment(transfer_engine_t engine, const char *segment_name) {
     TransferEngine *native = (TransferEngine *)engine;
+    if (!native || !segment_name) return ERR_INVALID_ARGUMENT;
     auto handle = native->openSegment(segment_name);
     if (handle == static_cast<Transport::SegmentHandle>(-1)) {
         return ERR_INVALID_ARGUMENT;
@@ -94,6 +95,7 @@ segment_id_t openSegment(transfer_engine_t engine, const char *segment_name) {
 segment_id_t openSegmentNoCache(transfer_engine_t engine,
                                 const char *segment_name) {
     TransferEngine *native = (TransferEngine *)engine;
+    if (!native || !segment_name) return ERR_INVALID_ARGUMENT;
     int rc = native->syncSegmentCache(segment_name);
     if (rc) return rc;
     auto handle = native->openSegment(segment_name);
