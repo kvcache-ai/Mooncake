@@ -27,8 +27,7 @@ mkdir -p /nvme/mooncake_offload
 
 ```bash
 mooncake_master \
-    --rpc_port=50051 \
-    --enable_offload=true
+    --rpc_port=50051
 ```
 
 ### Step 3A (Mode A): Start the application with embedded Real Client
@@ -100,7 +99,28 @@ store.setup_dummy(
 | `--protocol` | `tcp` | Transport protocol: `tcp` or `rdma` |
 | `--global_segment_size` | `4 GB` | Memory pool size allocated for this node |
 | `--enable_offload` | `false` | **Must be set to `true` to enable SSD offload** |
+| `--start_offload_rpc_server` | `true` | Start the offload RPC server used by DummyClients for SSD reads. Effective only when `--enable_offload=true`; disable only for write-only owners |
 | `--threads` | `1` | Number of RPC server threads |
+
+---
+
+## Master Offload Parameters
+
+These flags control when the master asks clients to persist objects to SSD, whether SSD-only objects can be promoted back to DRAM, and how much offload work can be queued during eviction.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--enable_offload` | `false` | Enables the master-side SSD offload control plane. Set this on the master and on every real client that owns SSD storage |
+| `--offload_on_evict` | `false` | Defer SSD persistence until memory eviction selects an object. When `false`, successful `Put` completion queues eager SSD persistence |
+| `--offload_force_evict` | `false` | If offload-on-evict exceeds the per-cycle offload cap, force-evict excess objects instead of leaving them in DRAM |
+| `--offloading_queue_limit` | `50000` | Maximum pending offload objects per local disk segment. Must be greater than `0` and at most `100000000` |
+| `--offload_cap_ratio` | `0.5` | Per-eviction-cycle cap as a fraction of `offloading_queue_limit`; range `[0.0, 1.0]`. Default cap is `25000` objects per cycle |
+| `--promotion_on_hit` | `false` | Promote SSD-resident objects back to DRAM after read hits |
+| `--promotion_admission_threshold` | `2` | Minimum CountMinSketch count before promotion is admitted. Set `1` to disable second-touch gating |
+| `--promotion_max_per_heartbeat` | `1` | Maximum promotion tasks returned to one client per heartbeat. Keep conservative for large objects because each task does SSD read plus memory write |
+| `--promotion_queue_limit` | `50000` | Maximum in-flight promotion tasks tracked by the master |
+
+Start with `--enable_offload=true` for eager SSD persistence. Add `--offload_on_evict=true` when SSD writes should happen only under memory pressure. For SSD-heavy workloads where offload-on-evict is dropping too many objects, raise both `--offloading_queue_limit` and `--offload_cap_ratio`; for example, `--offloading_queue_limit=500000 --offload_cap_ratio=0.8` allows up to `400000` objects to be queued in one eviction cycle.
 
 ---
 
@@ -234,7 +254,10 @@ The following example starts a master and a real client on a single machine.
 ```bash
 mooncake_master \
     --rpc_port=50051 \
-    --enable_offload=true
+    --enable_offload=true \
+    --offload_on_evict=true \
+    --promotion_on_hit=true \
+    --promotion_admission_threshold=2
 ```
 
 ### Start the real client (new terminal)
