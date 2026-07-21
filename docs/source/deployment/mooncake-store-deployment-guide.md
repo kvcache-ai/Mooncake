@@ -474,11 +474,11 @@ mooncake_master \
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--default_kv_lease_ttl` | `5000` ms | Lease TTL for KV objects. Supports `5000ms`, `5s`, `30m`, `1h` |
+| `--default_kv_lease_ttl` | `10000` ms | Lease TTL for KV objects. Supports `5000ms`, `5s`, `30m`, `1h` |
 | `--default_kv_soft_pin_ttl` | `1800000` ms | Soft pin TTL (30 min) |
 | `--allow_evict_soft_pinned_objects` | `true` | Allow evicting soft-pinned objects |
 | `--eviction_ratio` | `0.05` | Fraction evicted at high watermark |
-| `--eviction_high_watermark_ratio` | `0.95` | Usage ratio triggering eviction |
+| `--eviction_high_watermark_ratio` | `0.90` | Usage ratio triggering eviction |
 | `--client_ttl` | `10` s | Seconds before a silent client is considered disconnected |
 
 ### Tenant Quota
@@ -589,7 +589,7 @@ Master-side flags for the NVMe-oF SSD pool. They control eviction within the NoF
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--nof_eviction_ratio` | `0.05` | Fraction of objects evicted when NoF SSD space is full |
-| `--nof_eviction_high_watermark_ratio` | `0.95` | Usage ratio that triggers eviction in the NoF SSD tier |
+| `--nof_eviction_high_watermark_ratio` | `0.90` | Usage ratio that triggers eviction in the NoF SSD tier |
 | `--nof_heartbeat_interval_sec` | `10` | How often the master probes each mounted NoF segment |
 | `--nof_heartbeat_probe_timeout_ms` | `1000` | Timeout for a single NoF heartbeat probe |
 | `--nof_heartbeat_failures_threshold` | `3` | Consecutive NoF heartbeat failures before a segment is unmounted |
