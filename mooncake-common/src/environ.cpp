@@ -12,9 +12,6 @@ namespace mooncake {
 namespace {
 
 constexpr char kRpcClientIoThreadsEnv[] = "MC_RPC_CLIENT_IO_THREADS";
-constexpr char kStoreRpcClientIoThreadsEnv[] = "MC_STORE_RPC_CLIENT_IO_THREADS";
-constexpr char kTransferEngineRpcClientIoThreadsEnv[] =
-    "MC_TE_RPC_CLIENT_IO_THREADS";
 constexpr unsigned kDefaultRpcClientIoThreads = 16;
 
 unsigned GetRpcClientIoThreadsFor(const char* component_env,
@@ -130,15 +127,9 @@ unsigned Environ::GetRpcClientIoThreads(unsigned hardware_threads) {
     return GetRpcClientIoThreadsFor(nullptr, hardware_threads);
 }
 
-unsigned Environ::GetStoreRpcClientIoThreads(unsigned hardware_threads) {
-    return GetRpcClientIoThreadsFor(kStoreRpcClientIoThreadsEnv,
-                                    hardware_threads);
-}
-
-unsigned Environ::GetTransferEngineRpcClientIoThreads(
-    unsigned hardware_threads) {
-    return GetRpcClientIoThreadsFor(kTransferEngineRpcClientIoThreadsEnv,
-                                    hardware_threads);
+unsigned Environ::GetComponentRpcClientIoThreads(const char* component_env,
+                                                 unsigned hardware_threads) {
+    return GetRpcClientIoThreadsFor(component_env, hardware_threads);
 }
 
 Environ::Environ() {

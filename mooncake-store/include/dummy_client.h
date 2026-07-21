@@ -9,7 +9,7 @@
 
 #include "client_metric.h"
 #include "pyclient.h"
-#include "rpc_client_io_context.h"
+#include "store_rpc_client_io_context.h"
 #include "shm_helper.h"
 #include <memory>
 

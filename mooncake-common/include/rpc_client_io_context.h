@@ -14,15 +14,16 @@
 
 namespace mooncake {
 
-/**
- * Return the Store or Transfer Engine YLT RPC client I/O context pool.
- *
- * Each component has an independent pool so data-plane activity cannot starve
- * Store control-plane RPCs. Environment settings are read when the respective
- * function is first called; subsequent changes have no effect.
- */
-coro_io::io_context_pool& GetStoreRpcClientIoContextPool();
-coro_io::io_context_pool& GetTransferEngineRpcClientIoContextPool();
+std::shared_ptr<coro_io::io_context_pool> CreateRpcClientIoContextPool(
+    const char* component, unsigned thread_count);
+
+template <typename PoolTag>
+coro_io::io_context_pool& GetRpcClientIoContextPool(const char* component,
+                                                    unsigned thread_count) {
+    static const auto io_pool =
+        CreateRpcClientIoContextPool(component, thread_count);
+    return *io_pool;
+}
 
 /**
  * A replaceable client pool for callers that communicate with one target at a

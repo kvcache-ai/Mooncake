@@ -83,15 +83,23 @@ TEST_F(EnvironTest, ComponentRpcClientIoThreadsOverrideCommonValue) {
     setenv("MC_STORE_RPC_CLIENT_IO_THREADS", "4", 1);
     setenv("MC_TE_RPC_CLIENT_IO_THREADS", "6", 1);
 
-    EXPECT_EQ(Environ::GetStoreRpcClientIoThreads(64), 4U);
-    EXPECT_EQ(Environ::GetTransferEngineRpcClientIoThreads(64), 6U);
+    EXPECT_EQ(Environ::GetComponentRpcClientIoThreads(
+                  "MC_STORE_RPC_CLIENT_IO_THREADS", 64),
+              4U);
+    EXPECT_EQ(Environ::GetComponentRpcClientIoThreads(
+                  "MC_TE_RPC_CLIENT_IO_THREADS", 64),
+              6U);
 }
 
 TEST_F(EnvironTest, ComponentRpcClientIoThreadsUseCommonFallback) {
     setenv("MC_RPC_CLIENT_IO_THREADS", "8", 1);
 
-    EXPECT_EQ(Environ::GetStoreRpcClientIoThreads(64), 8U);
-    EXPECT_EQ(Environ::GetTransferEngineRpcClientIoThreads(64), 8U);
+    EXPECT_EQ(Environ::GetComponentRpcClientIoThreads(
+                  "MC_STORE_RPC_CLIENT_IO_THREADS", 64),
+              8U);
+    EXPECT_EQ(Environ::GetComponentRpcClientIoThreads(
+                  "MC_TE_RPC_CLIENT_IO_THREADS", 64),
+              8U);
 }
 
 TEST_F(EnvironTest, InvalidComponentRpcClientIoThreadsUseCommonFallback) {
@@ -99,8 +107,12 @@ TEST_F(EnvironTest, InvalidComponentRpcClientIoThreadsUseCommonFallback) {
     setenv("MC_STORE_RPC_CLIENT_IO_THREADS", "0", 1);
     setenv("MC_TE_RPC_CLIENT_IO_THREADS", "invalid", 1);
 
-    EXPECT_EQ(Environ::GetStoreRpcClientIoThreads(64), 8U);
-    EXPECT_EQ(Environ::GetTransferEngineRpcClientIoThreads(64), 8U);
+    EXPECT_EQ(Environ::GetComponentRpcClientIoThreads(
+                  "MC_STORE_RPC_CLIENT_IO_THREADS", 64),
+              8U);
+    EXPECT_EQ(Environ::GetComponentRpcClientIoThreads(
+                  "MC_TE_RPC_CLIENT_IO_THREADS", 64),
+              8U);
 }
 
 // --- GetInt ---

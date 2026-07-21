@@ -18,7 +18,7 @@
 #include "types.h"
 #include "rpc_types.h"
 #include "master_metric_manager.h"
-#include "rpc_client_io_context.h"
+#include "store_rpc_client_io_context.h"
 #include "task_manager.h"
 
 namespace mooncake {

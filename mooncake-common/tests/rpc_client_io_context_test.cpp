@@ -19,20 +19,32 @@ class AddressSwitchService {
     int id_;
 };
 
-TEST(RpcClientIoContextPoolTest, UsesConfiguredSizeAndReusesPool) {
-    auto& store_pool = GetStoreRpcClientIoContextPool();
-    auto& transfer_engine_pool = GetTransferEngineRpcClientIoContextPool();
-    ASSERT_EQ(store_pool.pool_size(), 2U);
-    ASSERT_EQ(transfer_engine_pool.pool_size(), 3U);
+struct FirstTestRpcClientIoContextPoolTag {};
+struct SecondTestRpcClientIoContextPoolTag {};
 
-    EXPECT_EQ(&GetStoreRpcClientIoContextPool(), &store_pool);
-    EXPECT_EQ(&GetTransferEngineRpcClientIoContextPool(),
-              &transfer_engine_pool);
-    EXPECT_NE(&store_pool, &transfer_engine_pool);
+coro_io::io_context_pool& GetFirstTestRpcClientIoContextPool() {
+    return GetRpcClientIoContextPool<FirstTestRpcClientIoContextPoolTag>(
+        "first test", 2);
+}
+
+coro_io::io_context_pool& GetSecondTestRpcClientIoContextPool() {
+    return GetRpcClientIoContextPool<SecondTestRpcClientIoContextPoolTag>(
+        "second test", 3);
+}
+
+TEST(RpcClientIoContextPoolTest, UsesConfiguredSizeAndReusesPool) {
+    auto& first_pool = GetFirstTestRpcClientIoContextPool();
+    auto& second_pool = GetSecondTestRpcClientIoContextPool();
+    ASSERT_EQ(first_pool.pool_size(), 2U);
+    ASSERT_EQ(second_pool.pool_size(), 3U);
+
+    EXPECT_EQ(&GetFirstTestRpcClientIoContextPool(), &first_pool);
+    EXPECT_EQ(&GetSecondTestRpcClientIoContextPool(), &second_pool);
+    EXPECT_NE(&first_pool, &second_pool);
 }
 
 TEST(RpcClientIoContextPoolTest, ReplacesPoolWhenTargetChanges) {
-    RpcClientPool pools(GetStoreRpcClientIoContextPool());
+    RpcClientPool pools(GetFirstTestRpcClientIoContextPool());
 
     auto first = pools.GetOrCreateClientPool("127.0.0.1:10001");
     std::weak_ptr<RpcClientPool::ClientPool> old_pool = first;
@@ -57,7 +69,7 @@ TEST(RpcClientIoContextPoolTest, SendsToNewAddressAfterSwitch) {
     ASSERT_FALSE(first_server.async_start().hasResult());
     ASSERT_FALSE(second_server.async_start().hasResult());
 
-    RpcClientPool pools(GetStoreRpcClientIoContextPool());
+    RpcClientPool pools(GetFirstTestRpcClientIoContextPool());
 
     const auto call = [&](uint16_t port) {
         auto pool =

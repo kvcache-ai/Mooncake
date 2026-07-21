@@ -12,7 +12,7 @@
 #include <pybind11/pytypes.h>
 #include "async_simple/coro/SyncAwait.h"
 #include "default_config.h"
-#include "rpc_client_io_context.h"
+#include "transfer_engine_rpc_client_io_context.h"
 
 namespace mooncake {
 namespace py = pybind11;

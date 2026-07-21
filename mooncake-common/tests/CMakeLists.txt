@@ -10,7 +10,3 @@ add_executable(rpc_client_io_context_test rpc_client_io_context_test.cpp)
 target_link_libraries(rpc_client_io_context_test PUBLIC mooncake_common gtest
                                                         ibverbs pthread)
 add_test(NAME rpc_client_io_context_test COMMAND rpc_client_io_context_test)
-set_tests_properties(
-  rpc_client_io_context_test
-  PROPERTIES ENVIRONMENT
-             "MC_STORE_RPC_CLIENT_IO_THREADS=2;MC_TE_RPC_CLIENT_IO_THREADS=3")

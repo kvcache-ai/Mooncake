@@ -23,7 +23,7 @@
 #include "replica_selection.h"
 #include "common.h"
 #include "config.h"
-#include "rpc_client_io_context.h"
+#include "store_rpc_client_io_context.h"
 #include "mutex.h"
 #include "types.h"
 #include "utils.h"
