@@ -38,6 +38,14 @@ def _extension_worker(
         )
         backend = ctx.get_backend()
 
+        # max_group_size only reserves capacity; the visible world size starts
+        # at the number of active ranks.
+        actual_ws = dist.get_world_size()
+        assert actual_ws == initial_world_size, (
+            f"rank {ctx.proc_rank}: initial world_size={actual_ws}, "
+            f"expected initial_world_size={initial_world_size}"
+        )
+
         # First collective
         tensor = torch.tensor([ctx.proc_rank + 1], dtype=torch.int32, device=device)
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
@@ -59,6 +67,14 @@ def _extension_worker(
         resp = pg.recover_ranks(backend, join_ranks)
         assert resp.status == pg.ViewUpdateStatus.Applied, \
             f"rank {ctx.proc_rank}: recover_ranks should apply, got {resp.status}"
+
+        # The Coordinator has committed the joiner as active, so the visible
+        # rank-space extent now covers the full group.
+        actual_ws_after = dist.get_world_size()
+        assert actual_ws_after == ctx.world_size, (
+            f"rank {ctx.proc_rank}: world_size after recover={actual_ws_after}, "
+            f"expected max_group_size={ctx.world_size}"
+        )
 
         # Final collective
         final_tensor = torch.tensor([ctx.proc_rank + 1], dtype=torch.int32, device=device)
@@ -82,6 +98,15 @@ def _extension_worker(
 
         backend = ctx.get_backend()
 
+        # PyTorch validates the declared full size before join_group() can run.
+        # Local-only behavior is provided by the active-rank mask, not by
+        # reporting a smaller world size from the isolated joiner.
+        actual_ws = dist.get_world_size()
+        assert actual_ws == ctx.world_size, (
+            f"extension rank: initial world_size={actual_ws}, "
+            f"expected {ctx.world_size}"
+        )
+
         # Before join_group, the joining backend executes collectives with an
         # effective {self} mask and does not involve the existing ranks.
         local_tensor = torch.tensor(
@@ -96,6 +121,12 @@ def _extension_worker(
             )
 
         pg.join_group(backend)
+
+        actual_ws_after = dist.get_world_size()
+        assert actual_ws_after == ctx.world_size, (
+            f"extension rank: world_size after join_group={actual_ws_after}, "
+            f"expected {ctx.world_size}"
+        )
 
         # Final collective
         final_tensor = torch.tensor([extension_rank + 1], dtype=torch.int32, device=device)

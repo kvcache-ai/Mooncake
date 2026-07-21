@@ -88,7 +88,7 @@ class MooncakeBackend;
 // getBackendName, supportsCoalescing).
 class MooncakeP2PShim final : public ::c10d::Backend {
    public:
-    explicit MooncakeP2PShim(MooncakeBackend* owner);
+    MooncakeP2PShim(MooncakeBackend* owner, int maxGroupSize);
 
     const std::string getBackendName() const override;
 
@@ -205,15 +205,19 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
 
     const std::string getBackendName() const override;
 
-    // Returns the group capacity (meta_->maxGroupSize), NOT the current
-    // active member count.
-    //
-    // PyTorch calls getSize() for rank validation in new_group():
-    //   https://github.com/pytorch/pytorch/blob/release/2.13/torch/distributed/distributed_c10d.py#L6012
-    // If we returned active member count, a joiner rank would appear out of
-    // range and new_group() would throw ValueError, the joiner's rank may be
-    // greater than or equal to the current world size.
-    int getSize() const override { return meta_ ? meta_->maxGroupSize : size_; }
+    // In Normal mode, return the active rank-space extent (highest active
+    // InGroupRank plus one). During bootstrap, PyTorch still needs the
+    // group_size declared at construction to validate future ranks passed to
+    // new_group() before joinGroup() can run:
+    // https://github.com/pytorch/pytorch/blob/release/2.13/torch/distributed/distributed_c10d.py#L6012
+    int getSize() const override {
+        if (!meta_) return size_;
+        if (meta_->extensionMode.load(std::memory_order_acquire) !=
+            CollectiveExtensionState::Normal) {
+            return size_;
+        }
+        return meta_->activeSize.load(std::memory_order_acquire);
+    }
 
     // Point-to-point send/recv for torch.distributed P2POp/batch_isend_irecv.
     // Only single-tensor ops are supported.

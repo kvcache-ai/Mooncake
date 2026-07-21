@@ -266,6 +266,7 @@ MooncakeBackend::MooncakeBackend(
         }
     }
     meta_->maxGroupSize = max_group_size_;  // slot capacity
+    meta_->activeSize.store(size, std::memory_order_relaxed);
     meta_->taskCount = 0;
     meta_->collectiveTimeoutUs = &ctx_.collective_timeout_us;
     meta_->engine = ctx_.engine;
@@ -316,7 +317,7 @@ MooncakeBackend::MooncakeBackend(
     // (batch_isend_irecv → _get_backend → getBackend) can find a registered
     // Backend for this ProcessGroup.  The shim delegates send/recv back to us.
     auto deviceType = isCpu ? c10::DeviceType::CPU : c10::DeviceType::CUDA;
-    auto shim = c10::make_intrusive<MooncakeP2PShim>(this);
+    auto shim = c10::make_intrusive<MooncakeP2PShim>(this, max_group_size_);
     setBackend(deviceType, BackendType::CUSTOM, shim);
 #ifndef MOONCAKE_EP_USE_MUSA
     setDefaultBackend(BackendType::CUSTOM);
@@ -390,8 +391,8 @@ const std::string MooncakeBackend::getBackendName() const { return "mooncake"; }
 
 // ---- MooncakeP2PShim implementation ----
 
-MooncakeP2PShim::MooncakeP2PShim(MooncakeBackend* owner)
-    : Backend(owner->getRank(), owner->getSize()), owner_(owner) {}
+MooncakeP2PShim::MooncakeP2PShim(MooncakeBackend* owner, int maxGroupSize)
+    : Backend(owner->getRank(), maxGroupSize), owner_(owner) {}
 
 const std::string MooncakeP2PShim::getBackendName() const { return "mooncake"; }
 
@@ -1180,6 +1181,18 @@ void MooncakeBackend::applyViewUpdate(const GroupView& view,
         static_cast<int32_t>(view.rank_order.size()) <= meta_->maxGroupSize,
         "Bad group view");
 
+    // Preserve stable in-group rank slots: activeSize is the upper bound of the
+    // active rank space, not the number of set bits. For example, an active
+    // mask of [true, false, true] has activeSize == 3.
+    int active_size = 0;
+    for (size_t local_rank = 0; local_rank < view.rank_order.size();
+         ++local_rank) {
+        const auto global_rank = view.rank_order[local_rank];
+        if (view.members[global_rank].isActive()) {
+            active_size = static_cast<int>(local_rank) + 1;
+        }
+    }
+
     // The execution mode determines the effective active ranks consumed by
     // kernels. Isolated and Quiescing use a local-only mask; Normal follows the
     // Coordinator's committed membership view.
@@ -1231,6 +1244,10 @@ void MooncakeBackend::applyViewUpdate(const GroupView& view,
     // Keep the Python-visible activeRanksTensor in sync with the view.
     // FIXME: potential deadlock?
     syncActiveRanksTensor();
+
+    // Publish the rank-space extent after the corresponding data-plane state.
+    // getSize() reads this from the Python/application thread.
+    meta_->activeSize.store(active_size, std::memory_order_release);
 
     // Publish epoch AFTER all data-plane state (activeRanks, segmentInfos,
     // etc.) is updated.  This ensures that a thread observing the new epoch

@@ -56,6 +56,8 @@ struct TransferGroupMeta {
     GlobalRank rank_order[kMaxNumRanks];
 
     int maxGroupSize;
+    // Highest active InGroupRank plus one.
+    std::atomic<int> activeSize{0};
     int taskCount;
 
     GroupId group_id;
