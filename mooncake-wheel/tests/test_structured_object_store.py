@@ -254,6 +254,23 @@ class FakeBufferPool:
         return FakeLease(self, size)
 
 
+class FailingBatchPutStore(InMemoryStore):
+    def __init__(self, *, fail_on_call: int) -> None:
+        super().__init__()
+        self.fail_on_call = fail_on_call
+
+    def batch_put_from(
+        self, keys: list[str], buffer_ptrs: list[int], sizes: list[int]
+    ) -> list[int]:
+        self.batch_put_from_calls += 1
+        if self.batch_put_from_calls == self.fail_on_call:
+            return [-1 for _key in keys]
+        results: list[int] = []
+        for key, ptr, size in zip(keys, buffer_ptrs, sizes):
+            results.append(self.put(key, ctypes.string_at(ptr, size)))
+        return results
+
+
 class GetOnlyStore(InMemoryStore):
     batch_get_into = None
 
@@ -757,6 +774,28 @@ def test_structured_object_multi_buffer_payload_uses_pool_batch_put() -> None:
     assert pool.acquire_sizes == [4, 2]
     assert pool.release_count == 2
     assert store.batch_put_from_calls == 2
+
+
+def test_structured_object_multi_buffer_put_cleans_all_chunk_keys_on_failure() -> None:
+    pool = FakeBufferPool()
+    store = FailingBatchPutStore(fail_on_call=2)
+    transfer = MooncakeBundleTransfer(store, key_prefix="test", buffer_pool=pool)
+    parts = [bytearray(b"ab"), bytearray(b"cd"), bytearray(b"ef")]
+    payload = StructuredObjectPayload(
+        metadata={},
+        buffers={
+            "raw": sos._MultiBufferPayload(
+                buffers=tuple(memoryview(part) for part in parts),
+                owners=tuple(parts),
+            )
+        },
+    )
+
+    with pytest.raises(RuntimeError):
+        transfer.put_structured_object(payload, chunk_bytes=2)
+
+    assert store.objects == {}
+    assert pool.release_count == 2
 
 
 def test_structured_object_slice_member_uses_partial_range_reads() -> None:

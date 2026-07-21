@@ -3881,7 +3881,7 @@ class _MooncakePayloadTransport:
                 results = batch_put_from([chunk_key], [lease.ptr], [size])
                 self._check_batch_put_results(results, [chunk_key], "batch_put_from")
             except Exception:
-                _cleanup_keys(self._store, [chunk_key], strict=False)
+                _cleanup_keys(self._store, chunk_keys, strict=False)
                 raise
             finally:
                 lease.release()
@@ -4623,15 +4623,14 @@ def _buffer_group_nbytes(buffers: Sequence[memoryview]) -> int:
 
 
 def _copy_memoryviews(buffers: Sequence[memoryview], destination: memoryview) -> None:
-    dst_arr = np.frombuffer(destination, dtype=np.uint8)
-    dst_ptr = dst_arr.ctypes.data
+    destination_bytes = destination.cast("B")
     offset = 0
     for buffer in buffers:
-        n = len(buffer)
+        source_bytes = buffer.cast("B")
+        n = len(source_bytes)
         if n == 0:
             continue
-        src_arr = np.frombuffer(buffer, dtype=np.uint8)
-        ctypes.memmove(dst_ptr + offset, src_arr.ctypes.data, n)
+        destination_bytes[offset : offset + n] = source_bytes
         offset += n
 
 
