@@ -948,8 +948,7 @@ extern "C" int __wrap_ibv_modify_qp(ibv_qp* qp, ibv_qp_attr* attr,
         recordRtrAttempt(device_name, sgid_index, gid_string);
         int injected_errno = injectedRtrErrnoOrZero(device_name, sgid_index);
         if (injected_errno != 0) {
-            errno = injected_errno;
-            return -1;
+            return injected_errno;
         }
     }
     return __real_ibv_modify_qp(qp, attr, attr_mask);
