@@ -55,12 +55,17 @@ if(USE_MACA)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:maca_transport>)
 endif()
 
+if(USE_MUSA)
+  add_subdirectory(musa_transport)
+  target_sources(transport PUBLIC $<TARGET_OBJECTS:musa_transport>)
+endif()
+
 if(USE_SUNRISE)
   add_subdirectory(sunrise_link)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:sunrise_link_transport>)
 endif()
 
-if(USE_MNNVL AND NOT USE_HIP)
+if(USE_MUSA OR (USE_MNNVL AND NOT USE_HIP))
   add_subdirectory(nvlink_transport)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:nvlink_transport>)
 endif()
@@ -87,7 +92,9 @@ if(USE_CXI)
   target_link_libraries(transport PRIVATE fabric)
 endif()
 
-if(USE_CUDA OR USE_MUSA OR USE_MACA)
+if(USE_CUDA
+   OR USE_MUSA
+   OR USE_MACA)
   add_subdirectory(device)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:device_transport>)
   # device_transport (ibgda_device_transport.cpp / mlx5gda.cpp) calls libmlx5

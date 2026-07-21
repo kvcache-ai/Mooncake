@@ -37,6 +37,10 @@
 #include "transport/nvlink_transport/nvlink_transport.h"
 #endif
 
+#ifdef USE_MUSA
+#include "transport/musa_transport/musa_transport.h"
+#endif
+
 #ifdef USE_INTRA_NVLINK
 #include "transport/intranode_nvlink_transport/intranode_nvlink_transport.h"
 #endif
@@ -68,6 +72,18 @@ void initMemoryAllocator(const char* protocol) {
         LOG(INFO) << "Selected MNNVL (NVLink) memory allocator";
 #else
         LOG(ERROR) << "Protocol 'nvlink' requires -DUSE_MNNVL=ON";
+#endif
+    } else if (strcmp(protocol, "musa") == 0) {
+#ifdef USE_MUSA
+        allocateMemory = [](size_t s) -> void* {
+            return mooncake::MusaTransport::allocatePinnedLocalMemory(s);
+        };
+        freeMemory = [](void* p) {
+            mooncake::MusaTransport::freePinnedLocalMemory(p);
+        };
+        LOG(INFO) << "Selected MUSA memory allocator";
+#else
+        LOG(ERROR) << "Protocol 'musa' requires -DUSE_MUSA=ON";
 #endif
     } else if (strcmp(protocol, "hip") == 0) {
 #ifdef USE_HIP
@@ -1132,6 +1148,12 @@ PYBIND11_MODULE(engine, m) {
     m.attr("SUPPORT_MNNVL") = true;
 #else
     m.attr("SUPPORT_MNNVL") = false;
+#endif
+
+#ifdef USE_MUSA
+    m.attr("SUPPORT_MUSA") = true;
+#else
+    m.attr("SUPPORT_MUSA") = false;
 #endif
 
 #ifdef USE_INTRA_NVLINK

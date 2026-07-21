@@ -326,10 +326,19 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             LOG(INFO) << "Using MACA transport";
         }
 
-#elif defined(USE_MNNVL) || defined(USE_INTRA_NVLINK)
+#elif defined(USE_MNNVL) || defined(USE_INTRA_NVLINK) || defined(USE_MUSA)
 
         const char* force_mnnvl = getenv("MC_FORCE_MNNVL");
         const char* intra_env = getenv("MC_INTRANODE_NVLINK");
+#ifdef USE_MUSA
+        const char* gpu_p2p_protocol = "musa";
+        const char* gpu_p2p_name = "MUSA";
+        const bool force_gpu_p2p = force_mnnvl || getenv("MC_FORCE_MUSA");
+#else
+        const char* gpu_p2p_protocol = "nvlink";
+        const char* gpu_p2p_name = "NVLink";
+        const bool force_gpu_p2p = force_mnnvl;
+#endif
         // Explicit env var overrides take priority over HCA auto-detection
         if (intra_env) {
             Transport* t =
@@ -340,15 +349,16 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             }
             LOG(INFO) << "Using Intra-Node NVLink transport "
                          "(MC_INTRANODE_NVLINK set)";
-        } else if (force_mnnvl || local_topology_->getHcaList().empty()) {
+        } else if (force_gpu_p2p || local_topology_->getHcaList().empty()) {
             Transport* t =
-                multi_transports_->installTransport("nvlink", nullptr);
+                multi_transports_->installTransport(gpu_p2p_protocol, nullptr);
             if (!t) {
-                LOG(ERROR) << "Failed to install NVLink transport";
+                LOG(ERROR) << "Failed to install " << gpu_p2p_name
+                           << " transport";
                 return -1;
             }
-            LOG(INFO) << "Using cross-node NVLink transport "
-                      << "(MC_FORCE_MNNVL or no HCA detected)";
+            LOG(INFO) << "Using " << gpu_p2p_name << " transport "
+                      << "(forced or no HCA detected)";
         } else {
             Transport* t =
                 multi_transports_->installTransport("rdma", local_topology_);
