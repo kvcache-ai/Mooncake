@@ -135,6 +135,24 @@ SegmentHandle TransferEngine::openSegment(const std::string& segment_name) {
     return impl_->openSegment(segment_name);
 }
 
+Status TransferEngine::getSegmentBufferBase(SegmentHandle handle,
+                                            size_t buffer_index,
+                                            uint64_t& base) {
+    auto metadata = impl_->getMetadata();
+    if (!metadata) {
+        return Status::Metadata("Transfer metadata is not available");
+    }
+    auto segment_desc = metadata->getSegmentDescByID(handle);
+    if (!segment_desc) {
+        return Status::Metadata("Unable to get target segment descriptor");
+    }
+    if (buffer_index >= segment_desc->buffers.size()) {
+        return Status::InvalidArgument("Segment buffer index out of range");
+    }
+    base = segment_desc->buffers[buffer_index].addr;
+    return Status::OK();
+}
+
 Status TransferEngine::CheckSegmentStatus(SegmentID sid) {
     return impl_->CheckSegmentStatus(sid);
 }
