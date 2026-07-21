@@ -50,12 +50,20 @@ expect_failure 1 "build directory does not exist" \
 expect_failure 1 "build directory does not exist" \
   "$SCRIPT" promotion-catchup-smoke --build-dir "$TEST_ROOT/missing-build"
 expect_failure 1 "build directory does not exist" \
+  "$SCRIPT" ha-failover-smoke --build-dir "$TEST_ROOT/missing-build"
+expect_failure 1 "build directory does not exist" \
   "$SCRIPT" non-ha-smoke --build-dir "$TEST_ROOT/missing-build"
 expect_failure 1 "master config does not exist" \
   "$SCRIPT" non-ha-smoke --build-dir "$TEST_ROOT" \
   --master-config "$TEST_ROOT/missing-master.yaml"
 expect_failure 1 "non-ha-workers must be positive" \
   "$SCRIPT" non-ha-smoke --build-dir "$TEST_ROOT" --non-ha-workers 0
+expect_failure 1 "ha-objects must be positive" \
+  "$SCRIPT" ha-failover-smoke --build-dir "$TEST_ROOT" --ha-objects 0
+expect_failure 1 "ha-payload-bytes must be positive" \
+  "$SCRIPT" ha-failover-smoke --build-dir "$TEST_ROOT" --ha-payload-bytes 0
+expect_failure 1 "ha-pressure-sec must be positive" \
+  "$SCRIPT" ha-failover-smoke --build-dir "$TEST_ROOT" --ha-pressure-sec 0
 EMPTY_BUILD="$TEST_ROOT/empty-build"
 mkdir -p "$EMPTY_BUILD"
 expect_failure 1 "missing executable" "$SCRIPT" up --build-dir "$EMPTY_BUILD"

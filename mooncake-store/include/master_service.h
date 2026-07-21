@@ -2294,6 +2294,13 @@ class MasterService {
     std::unordered_map<std::string, std::shared_ptr<BufferAllocatorBase>>
         standby_allocator_keepalive_;
 
+    // Conservative allocator recovery for promoted memory segments. The
+    // prefix reservation protects every restored descriptor, including holes,
+    // until allocator-level allocate-at support exists.
+    std::unordered_map<std::string, uintptr_t> standby_restored_buffer_ends_;
+    std::unordered_map<std::string, std::unique_ptr<AllocatedBuffer>>
+        standby_reserved_prefixes_;
+
     /**
      * Segment lifecycle persist helper. Tries to durably persist the
      * SEGMENT_MOUNT / SEGMENT_UNMOUNT entry up-front; on failure enqueues

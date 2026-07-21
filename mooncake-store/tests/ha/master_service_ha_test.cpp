@@ -580,6 +580,42 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesMemoryBufferDescriptor) {
     EXPECT_EQ(restored.transport_endpoint_, endpoint);
 }
 
+TEST_F(MasterServiceHATest, RemountMakesRestoredMemoryReplicaReady) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string endpoint = "standby_remount_segment";
+    const std::string key = "standby_remount_key";
+    auto restored_object = MakeStandbyObject(key, endpoint);
+    restored_object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    service.RestoreFromStandbySnapshot({restored_object}, 7,
+                                       {MakeStandbyMemorySegment(endpoint)});
+
+    auto before = service.GetReplicaList(key, kDefaultTenant);
+    ASSERT_FALSE(before.has_value());
+    EXPECT_EQ(before.error(), ErrorCode::REPLICA_IS_NOT_READY);
+
+    Segment segment = MakeSegment(endpoint);
+    ASSERT_TRUE(service.ReMountSegment({segment}, generate_uuid()).has_value());
+
+    auto after = service.GetReplicaList(key, kDefaultTenant);
+    ASSERT_TRUE(after.has_value()) << toString(after.error());
+    ASSERT_EQ(after->replicas.size(), 1);
+    EXPECT_TRUE(after->replicas.front().is_memory_replica());
+
+    const std::string new_key = "post_remount_allocation";
+    PutObjectOnSegment(service, generate_uuid(), new_key, endpoint);
+    auto new_replicas =
+        ReplicaDescriptorsForTesting(service, kDefaultTenant, new_key);
+    ASSERT_EQ(new_replicas.size(), 1);
+    EXPECT_GE(new_replicas.front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.buffer_address_,
+              kDefaultSegmentBase + 1024);
+}
+
 TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesCxlBufferDescriptor) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());

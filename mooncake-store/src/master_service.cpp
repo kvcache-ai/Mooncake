@@ -907,7 +907,7 @@ auto MasterService::MountNoFSegment(const NoFSegment& segment,
 auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                    const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    std::unique_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
     {
         std::unique_lock<std::shared_mutex> lock(client_mutex_);
         for (const auto& segment : segments) {
@@ -951,6 +951,73 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             ErrorCode err = segment_access.ReMountSegment(segments, client_id);
             if (err != ErrorCode::OK) {
                 return tl::make_unexpected(err);
+            }
+        }
+
+        {
+            ScopedAllocatorAccess allocator_access =
+                segment_manager_.getAllocatorAccess();
+            const auto& allocator_manager =
+                allocator_access.getAllocatorManager();
+            for (const auto& segment : segments) {
+                if (standby_reserved_prefixes_.contains(segment.name)) {
+                    continue;
+                }
+                auto end_it =
+                    standby_restored_buffer_ends_.find(segment.te_endpoint);
+                if (end_it == standby_restored_buffer_ends_.end()) {
+                    end_it = standby_restored_buffer_ends_.find(segment.name);
+                }
+                if (end_it == standby_restored_buffer_ends_.end()) {
+                    continue;
+                }
+                if (end_it->second <= segment.base ||
+                    end_it->second - segment.base > segment.size) {
+                    LOG(ERROR) << "segment_name=" << segment.name
+                               << ", error=invalid_restored_buffer_range"
+                               << ", segment_base=" << segment.base
+                               << ", segment_size=" << segment.size
+                               << ", restored_end=" << end_it->second;
+                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                }
+                const auto* allocators =
+                    allocator_manager.getAllocators(segment.name);
+                if (allocators == nullptr) {
+                    return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+                }
+                auto allocator_it =
+                    std::find_if(allocators->begin(), allocators->end(),
+                                 [&](const auto& allocator) {
+                                     return allocator->getTransportEndpoint() ==
+                                            segment.te_endpoint;
+                                 });
+                if (allocator_it == allocators->end()) {
+                    return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+                }
+                auto offset_allocator =
+                    std::dynamic_pointer_cast<OffsetBufferAllocator>(
+                        *allocator_it);
+                if (!offset_allocator) {
+                    LOG(ERROR) << "segment_name=" << segment.name
+                               << ", error=restored_prefix_requires_offset_"
+                                  "allocator";
+                    return tl::make_unexpected(
+                        ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+                }
+                auto reservation =
+                    offset_allocator->allocate(end_it->second - segment.base);
+                if (!reservation || reinterpret_cast<uintptr_t>(
+                                        reservation->data()) != segment.base) {
+                    LOG(ERROR) << "segment_name=" << segment.name
+                               << ", error=failed_to_reserve_restored_prefix";
+                    return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+                }
+                standby_reserved_prefixes_[segment.name] =
+                    std::move(reservation);
+            }
+            for (const auto& segment : segments) {
+                invalid_replica_endpoints_.erase(segment.te_endpoint);
+                invalid_replica_endpoints_.erase(segment.name);
             }
         }
 
@@ -2608,6 +2675,8 @@ void MasterService::RestoreFromStandbySnapshot(
 
     // 2. Build allocator keepalive map for standby segments.
     standby_allocator_keepalive_.clear();
+    standby_restored_buffer_ends_.clear();
+    standby_reserved_prefixes_.clear();
     invalid_replica_endpoints_.clear();
     for (const auto& seg : segments) {
         if (seg.is_memory_segment) {
@@ -2668,6 +2737,17 @@ void MasterService::RestoreFromStandbySnapshot(
                     const auto& mem_desc = desc.get_memory_descriptor();
                     const std::string& endpoint =
                         mem_desc.buffer_descriptor.transport_endpoint_;
+                    const auto& buffer = mem_desc.buffer_descriptor;
+                    if (buffer.protocol_ != "cxl" && buffer.size_ > 0 &&
+                        buffer.buffer_address_ <=
+                            std::numeric_limits<uintptr_t>::max() -
+                                buffer.size_) {
+                        auto& restored_end =
+                            standby_restored_buffer_ends_[endpoint];
+                        restored_end =
+                            std::max(restored_end,
+                                     buffer.buffer_address_ + buffer.size_);
+                    }
                     auto it = standby_allocator_keepalive_.find(endpoint);
                     if (it != standby_allocator_keepalive_.end()) {
                         auto alloc = it->second;

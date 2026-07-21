@@ -10,7 +10,7 @@ die() {
 }
 
 usage() {
-  echo "Usage: $0 <up|status|collect|restart|down|smoke|restart-smoke|failpoint-smoke|failpoint-crash-smoke|remove-boundary-smoke|standby-read-smoke|promotion-catchup-smoke|non-ha-smoke> [options]" >&2
+  echo "Usage: $0 <up|status|collect|restart|down|smoke|restart-smoke|failpoint-smoke|failpoint-crash-smoke|remove-boundary-smoke|standby-read-smoke|promotion-catchup-smoke|ha-failover-smoke|non-ha-smoke> [options]" >&2
 }
 
 parse_up_options() {
@@ -30,6 +30,9 @@ parse_up_options() {
   FAILPOINT_DIR=""
   FAILPOINT_TIMEOUT_SEC=30
   START_TIMEOUT_SEC=30
+  HA_OBJECTS=1000
+  HA_PAYLOAD_BYTES=4096
+  HA_PRESSURE_SEC=45
   ETCD_ENDPOINTS=""
   ETCD_BIN=${ETCD_BIN:-etcd}
   while (($#)); do
@@ -98,6 +101,21 @@ parse_up_options() {
         START_TIMEOUT_SEC=$2
         shift 2
         ;;
+      --ha-objects)
+        (($# >= 2)) || die "--ha-objects requires a value"
+        HA_OBJECTS=$2
+        shift 2
+        ;;
+      --ha-payload-bytes)
+        (($# >= 2)) || die "--ha-payload-bytes requires a value"
+        HA_PAYLOAD_BYTES=$2
+        shift 2
+        ;;
+      --ha-pressure-sec)
+        (($# >= 2)) || die "--ha-pressure-sec requires a value"
+        HA_PRESSURE_SEC=$2
+        shift 2
+        ;;
       --failpoint-dir)
         (($# >= 2)) || die "--failpoint-dir requires a value"
         FAILPOINT_DIR=$2
@@ -132,6 +150,11 @@ parse_up_options() {
     die "failpoint-timeout-sec must be positive"
   [[ "$NON_HA_WORKERS" =~ ^[1-9][0-9]*$ ]] ||
     die "non-ha-workers must be positive"
+  [[ "$HA_OBJECTS" =~ ^[1-9][0-9]*$ ]] || die "ha-objects must be positive"
+  [[ "$HA_PAYLOAD_BYTES" =~ ^[1-9][0-9]*$ ]] ||
+    die "ha-payload-bytes must be positive"
+  [[ "$HA_PRESSURE_SEC" =~ ^[1-9][0-9]*$ ]] ||
+    die "ha-pressure-sec must be positive"
   [[ "$PROTOCOL" == tcp || "$PROTOCOL" == rdma ]] ||
     die "protocol must be tcp or rdma"
   [[ -z "$MASTER_CONFIG" || -f "$MASTER_CONFIG" ]] ||
@@ -462,6 +485,40 @@ read_durable_sequence() {
   LSAN_OPTIONS=detect_leaks=0 "$INSPECTOR_BIN" summary \
     --endpoints="$ETCD_ENDPOINTS" --cluster_id="$CLUSTER_ID" --json |
     python3 -c 'import json,sys; print(json.load(sys.stdin)["durable_prefix"]["last_seq"])'
+}
+
+ready_leader_index() {
+  local index health found=""
+  for index in "${!ADMIN_PORTS[@]}"; do
+    health=$(curl --max-time 1 -fsS \
+      "http://127.0.0.1:${ADMIN_PORTS[$index]}/health" 2>/dev/null || true)
+    if grep -Eq '"service_ready"[[:space:]]*:[[:space:]]*true' \
+      <<<"$health"; then
+      [[ -z "$found" ]] || return 1
+      found=$index
+    fi
+  done
+  [[ -n "$found" ]] || return 1
+  printf '%s\n' "$found"
+}
+
+capture_ha_stage() {
+  local stage=$1 index
+  mkdir -p "$RUN_DIR/audit/$stage" "$RUN_DIR/metrics/$stage"
+  for index in "${!ADMIN_PORTS[@]}"; do
+    curl --max-time 1 -fsS \
+      "http://127.0.0.1:${ADMIN_PORTS[$index]}/health" \
+      >"$RUN_DIR/metrics/$stage/master-$index-health.json" 2>/dev/null || true
+    curl --max-time 1 -fsS \
+      "http://127.0.0.1:${ADMIN_PORTS[$index]}/metrics" \
+      >"$RUN_DIR/metrics/$stage/master-$index.prom" 2>/dev/null || true
+  done
+  LSAN_OPTIONS=detect_leaks=0 "$INSPECTOR_BIN" summary \
+    --endpoints="$ETCD_ENDPOINTS" --cluster_id="$CLUSTER_ID" --json \
+    >"$RUN_DIR/audit/$stage/summary.json"
+  LSAN_OPTIONS=detect_leaks=0 "$INSPECTOR_BIN" verify \
+    --endpoints="$ETCD_ENDPOINTS" --cluster_id="$CLUSTER_ID" --json \
+    >"$RUN_DIR/audit/$stage/verify.json"
 }
 
 smoke_cluster() {
@@ -1055,6 +1112,170 @@ promotion_catchup_smoke_cluster() {
   echo "PASS: promotion catch-up smoke completed; put metadata survived with replica rebuild required; remove did not resurrect; batch smoke passed; killed=master-$leader_index promoted_pid=$promoted_pid before_seq=$durable_before after_seq=$durable_after artifacts: $RUN_DIR"
 }
 
+ha_failover_smoke_cluster() {
+  local ha_client="$BUILD_DIR/mooncake-store/tests/e2e/oplog_ha_client"
+  local fault_ctl="$SCRIPT_DIR/oplog_fault_ctl.sh"
+  require_executable "$ha_client"
+  require_executable "$fault_ctl"
+  CLIENT_COUNT=0
+  up_cluster
+  export MC_STORE_CLUSTER_ID="$CLUSTER_ID"
+
+  local seed_manifest="$RUN_DIR/workload/seed.ack"
+  local pre_kill_manifest="$RUN_DIR/workload/seed.pre-kill.ack"
+  local seed_prefix="ha-seed-$CLUSTER_ID"
+  local pressure_prefix="ha-pressure-$CLUSTER_ID"
+  local pressure_pids=()
+  local leader_index durable_before index pid
+
+  for index in 0 1; do
+    start_process "provider-$index" "$ha_client" --mode=provider \
+      --port="$(find_free_port)" \
+      --master_server_entry="etcd://$ETCD_ENDPOINTS" \
+      --engine_meta_url="http://127.0.0.1:$METADATA_PORT/metadata" \
+      --protocol="$PROTOCOL"
+    wait_file_text "$RUN_DIR/logs/provider-$index.out" "provider_ready" \
+      "$START_TIMEOUT_SEC" || {
+      smoke_failed "provider-$index did not mount a storage segment"
+      return 1
+    }
+  done
+  if ! "$ha_client" --mode=seed --port="$(find_free_port)" \
+      --master_server_entry="etcd://$ETCD_ENDPOINTS" \
+      --engine_meta_url="http://127.0.0.1:$METADATA_PORT/metadata" \
+      --protocol="$PROTOCOL" --key_prefix="$seed_prefix" \
+      --count="$HA_OBJECTS" --payload_size="$HA_PAYLOAD_BYTES" \
+      --manifest="$seed_manifest" \
+      >"$RUN_DIR/workload/seed.log" 2>&1; then
+    smoke_failed "deterministic seed failed"
+    return 1
+  fi
+  if ! "$INSPECTOR_BIN" wait --endpoints="$ETCD_ENDPOINTS" \
+      --cluster_id="$CLUSTER_ID" --last_seq="$HA_OBJECTS" \
+      --timeout_sec="$START_TIMEOUT_SEC"; then
+    smoke_failed "seed OpLog did not become durable"
+    return 1
+  fi
+  durable_before=$(read_durable_sequence) || {
+    smoke_failed "failed to read pre-kill durable sequence"
+    return 1
+  }
+  cp "$seed_manifest" "$pre_kill_manifest"
+  if [[ $(wc -l <"$pre_kill_manifest") -ne "$HA_OBJECTS" ]]; then
+    smoke_failed "pre-kill manifest does not contain every acknowledged seed"
+    return 1
+  fi
+  leader_index=$(ready_leader_index) || {
+    smoke_failed "failed to identify pre-kill leader"
+    return 1
+  }
+  for index in "${!ADMIN_PORTS[@]}"; do
+    [[ "$index" == "$leader_index" ]] && continue
+    wait_master_metric_at_least "$index" ha_oplog_applied_sequence_id \
+      "$durable_before" "$START_TIMEOUT_SEC" || {
+      smoke_failed "master-$index did not apply pre-kill durable sequence"
+      return 1
+    }
+  done
+  capture_ha_stage pre-kill || {
+    smoke_failed "pre-kill evidence collection failed"
+    return 1
+  }
+  printf 'leader_index=%s\ndurable_before=%s\n' "$leader_index" \
+    "$durable_before" >"$RUN_DIR/audit/pre-kill-leader.txt"
+
+  "$fault_ctl" process kill --run-dir "$RUN_DIR" \
+    --name "master-$leader_index"
+  pid=$(<"$RUN_DIR/pids/master-$leader_index.pid")
+  wait "$pid" 2>/dev/null || true
+  if kill -0 "$pid" 2>/dev/null; then
+    smoke_failed "killed leader process is still alive"
+    return 1
+  fi
+  if ! wait_for_single_leader "$START_TIMEOUT_SEC"; then
+    smoke_failed "cluster did not promote a new leader"
+    return 1
+  fi
+  local promoted_index
+  promoted_index=$(ready_leader_index) || {
+    smoke_failed "promotion did not produce exactly one ready leader"
+    return 1
+  }
+  [[ "$promoted_index" != "$leader_index" ]] || {
+    smoke_failed "old leader remained ready after kill"
+    return 1
+  }
+  wait_master_metric_at_least "$promoted_index" master_active_clients 2 \
+    "$START_TIMEOUT_SEC" || {
+    smoke_failed "storage providers did not reconnect to promoted leader"
+    return 1
+  }
+  printf 'promoted_index=%s\n' "$promoted_index" \
+    >"$RUN_DIR/audit/post-promotion-leader.txt"
+  capture_ha_stage post-promotion || {
+    smoke_failed "post-promotion evidence collection failed"
+    return 1
+  }
+  if ! "$ha_client" --mode=verify --port="$(find_free_port)" \
+      --master_server_entry="etcd://$ETCD_ENDPOINTS" \
+      --engine_meta_url="http://127.0.0.1:$METADATA_PORT/metadata" \
+      --protocol="$PROTOCOL" --key_prefix="$seed_prefix" \
+      --payload_size="$HA_PAYLOAD_BYTES" --manifest="$pre_kill_manifest" \
+      >"$RUN_DIR/workload/post-promotion-verify.log" 2>&1; then
+    smoke_failed "acknowledged data was not readable after promotion"
+    return 1
+  fi
+
+  for ((index = 0; index < 2; ++index)); do
+    local pressure_manifest="$RUN_DIR/workload/pressure-$index.ack"
+    "$ha_client" --mode=pressure --port="$(find_free_port)" \
+      --master_server_entry="etcd://$ETCD_ENDPOINTS" \
+      --engine_meta_url="http://127.0.0.1:$METADATA_PORT/metadata" \
+      --protocol="$PROTOCOL" --key_prefix="$pressure_prefix-$index" \
+      --start_index=1000000 --payload_size="$HA_PAYLOAD_BYTES" \
+      --duration_sec="$HA_PRESSURE_SEC" --sleep_ms=25 \
+      --manifest="$pressure_manifest" \
+      >"$RUN_DIR/workload/pressure-$index.log" 2>&1 &
+    pressure_pids+=("$!")
+  done
+  local pressure_status=0 pressure_pid
+  for pressure_pid in "${pressure_pids[@]}"; do
+    wait "$pressure_pid" || pressure_status=1
+  done
+  if ((pressure_status != 0)); then
+    smoke_failed "post-promotion pressure workload failed"
+    return 1
+  fi
+  for index in 0 1; do
+    "$ha_client" --mode=verify --port="$(find_free_port)" \
+      --master_server_entry="etcd://$ETCD_ENDPOINTS" \
+      --engine_meta_url="http://127.0.0.1:$METADATA_PORT/metadata" \
+      --protocol="$PROTOCOL" --key_prefix="$pressure_prefix-$index" \
+      --payload_size="$HA_PAYLOAD_BYTES" \
+      --manifest="$RUN_DIR/workload/pressure-$index.ack" \
+      >"$RUN_DIR/workload/pressure-$index-verify.log" 2>&1 || {
+      smoke_failed "post-promotion pressure data verification failed"
+      return 1
+    }
+  done
+  if ! "$ha_client" --mode=verify --port="$(find_free_port)" \
+      --master_server_entry="etcd://$ETCD_ENDPOINTS" \
+      --engine_meta_url="http://127.0.0.1:$METADATA_PORT/metadata" \
+      --protocol="$PROTOCOL" --key_prefix="$seed_prefix" \
+      --payload_size="$HA_PAYLOAD_BYTES" --manifest="$pre_kill_manifest" \
+      >"$RUN_DIR/workload/post-pressure-seed-verify.log" 2>&1; then
+    smoke_failed "pressure corrupted pre-kill acknowledged data"
+    return 1
+  fi
+  capture_ha_stage post-pressure || {
+    smoke_failed "post-pressure evidence collection failed"
+    return 1
+  }
+  collect_cluster
+  down_cluster
+  echo "PASS: real HA failover completed; leader=$leader_index promoted=$promoted_index durable_before=$durable_before artifacts=$RUN_DIR"
+}
+
 non_ha_smoke_cluster() {
   local fault_ctl="$SCRIPT_DIR/oplog_fault_ctl.sh"
   require_executable "$fault_ctl"
@@ -1322,6 +1543,9 @@ down_cluster() {
   for pid_file in "$RUN_DIR"/pids/client-*.pid; do
     stop_pid_file "$pid_file"
   done
+  for pid_file in "$RUN_DIR"/pids/provider-*.pid; do
+    stop_pid_file "$pid_file"
+  done
   for pid_file in "$RUN_DIR"/pids/master-*.pid; do
     stop_pid_file "$pid_file"
   done
@@ -1339,7 +1563,7 @@ main() {
   local command=$1
   shift
   case "$command" in
-    up | smoke | restart-smoke | failpoint-smoke | failpoint-crash-smoke | remove-boundary-smoke | standby-read-smoke | promotion-catchup-smoke | non-ha-smoke)
+    up | smoke | restart-smoke | failpoint-smoke | failpoint-crash-smoke | remove-boundary-smoke | standby-read-smoke | promotion-catchup-smoke | ha-failover-smoke | non-ha-smoke)
       parse_up_options "$@"
       if [[ "$command" == non-ha-smoke ]]; then
         MASTER_COUNT=1
@@ -1362,6 +1586,8 @@ main() {
         standby_read_smoke_cluster
       elif [[ "$command" == promotion-catchup-smoke ]]; then
         promotion_catchup_smoke_cluster
+      elif [[ "$command" == ha-failover-smoke ]]; then
+        ha_failover_smoke_cluster
       elif [[ "$command" == non-ha-smoke ]]; then
         non_ha_smoke_cluster
       else
