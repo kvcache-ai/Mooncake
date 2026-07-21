@@ -154,7 +154,8 @@ parse_args() {
 get_staged_line_ranges() {
     local file="$1"
 
-    git diff --cached --unified=0 --diff-filter=ACMR -- "${file}" |
+    git -C "${PROJECT_ROOT}" diff --cached --unified=0 \
+        --diff-filter=ACMR -- "${file}" |
         sed -nE 's/^@@ -[0-9]+(,[0-9]+)? \+([0-9]+)(,([0-9]+))? @@.*/\2 \4/p'
 }
 
@@ -385,8 +386,12 @@ main() {
     if ${STAGED_MODE}; then
         local staged_files=("${INPUT_FILES[@]}")
         if [[ ${#staged_files[@]} -eq 0 ]]; then
-            mapfile -d '' staged_files < <(
-                git diff --cached --name-only -z --diff-filter=ACMR -- \
+            local file
+            while IFS= read -r -d '' file; do
+                staged_files+=("${file}")
+            done < <(
+                git -C "${PROJECT_ROOT}" diff --cached --name-only -z \
+                    --diff-filter=ACMR -- \
                     '*.c' '*.cc' '*.cpp' '*.cxx' '*.cu' '*.cuh' '*.h' '*.hpp'
             )
         fi
