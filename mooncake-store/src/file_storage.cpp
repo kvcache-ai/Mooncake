@@ -799,12 +799,21 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                     // this, the new leader's "SSD Storage" denominator stays
                     // at 0 and SSD-level eviction never triggers.
                     if (config_.total_size_limit > 0) {
-                        auto cap_result =
-                            client_->ReportSsdCapacity(config_.total_size_limit);
-                        if (!cap_result) {
-                            LOG(WARNING) << "ReportSsdCapacity failed after "
-                                         << "re-registration: "
+                        int retry_count = 3;
+                        tl::expected<void, ErrorCode> cap_result;
+                        for (int i = 0; i < retry_count; ++i) {
+                            cap_result = client_->ReportSsdCapacity(config_.total_size_limit);
+                            if (cap_result) {
+                                break;
+                            }
+                            LOG(WARNING) << "ReportSsdCapacity failed (attempt " << (i + 1) << "/" << retry_count << "): "
                                          << cap_result.error();
+                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        }
+                        if (!cap_result) {
+                            LOG(ERROR) << "ReportSsdCapacity failed after "
+                                       << retry_count << " attempts: "
+                                       << cap_result.error();
                         }
                     }
                     heartbeat_result = client_->OffloadObjectHeartbeat(
