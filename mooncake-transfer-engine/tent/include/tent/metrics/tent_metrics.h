@@ -77,8 +77,8 @@ class TentMetrics {
     // Record transfer operations
     void recordReadCompleted(size_t bytes, double latency_seconds = 0.0);
     void recordWriteCompleted(size_t bytes, double latency_seconds = 0.0);
-    void recordReadFailed(size_t bytes);
-    void recordWriteFailed(size_t bytes);
+    void recordReadFailed();
+    void recordWriteFailed();
     void recordTransportFailover();
 
     // Record the deadline feasibility ratio (MLU) for a completed transfer
@@ -86,6 +86,11 @@ class TentMetrics {
     // where window_seconds is (deadline - submit_time). mlu < 1 means the
     // transfer met its deadline; mlu >= 1 means it missed. Observability only.
     void recordDeadlineMLU(double mlu);
+
+    // Record a transfer whose deadline was already in the past at submit time
+    // (infeasible window). Recorded into a dedicated counter so it is
+    // distinguishable from genuine MLU samples in the histogram above.
+    void recordDeadlineInfeasible();
 
     enum class Stage {
         QueueWait,
@@ -166,12 +171,18 @@ class TentMetrics {
     ylt::metric::counter_t failover_total_{
         "tent_transport_failover_total",
         "Total cross-transport failover events"};
+    ylt::metric::counter_t deadline_infeasible_total_{
+        "tent_deadline_infeasible_total",
+        "Transfers whose deadline was already in the past at submit"};
 
-    // Histograms - stored as pointers for unified management
-    std::vector<ylt::metric::histogram_t*> histograms_;
-    // Store bucket boundaries separately since ylt histogram doesn't expose
-    // them publicly
-    std::vector<std::vector<double>> histogram_boundaries_;
+    // Histograms - paired with their bucket boundaries in a single vector so
+    // the two cannot drift out of sync (ylt histogram doesn't expose its
+    // boundaries publicly, so we hold them alongside the pointer).
+    struct HistogramEntry {
+        ylt::metric::histogram_t* h;
+        const std::vector<double>* boundaries;
+    };
+    std::vector<HistogramEntry> histograms_;
 
     // Latency histograms use microseconds (us) as unit
     // Default buckets: 100us, 500us, 1ms, 5ms, 10ms, 50ms, 100ms, 500ms, 1s
@@ -264,9 +275,9 @@ class ScopedLatencyRecorder {
         if (!enabled_) return;  // Skip if disabled
         failed_ = true;
         if (type_ == OperationType::Read) {
-            TentMetrics::instance().recordReadFailed(bytes_);
+            TentMetrics::instance().recordReadFailed();
         } else {
-            TentMetrics::instance().recordWriteFailed(bytes_);
+            TentMetrics::instance().recordWriteFailed();
         }
     }
 
@@ -295,19 +306,18 @@ class ScopedLatencyRecorder {
         }                                                                   \
     } while (0)
 
-#define TENT_RECORD_READ_FAILED(bytes)                                         \
-    do {                                                                       \
-        if (::mooncake::tent::TentMetrics::isEnabled()) {                      \
-            ::mooncake::tent::TentMetrics::instance().recordReadFailed(bytes); \
-        }                                                                      \
+#define TENT_RECORD_READ_FAILED()                                         \
+    do {                                                                  \
+        if (::mooncake::tent::TentMetrics::isEnabled()) {                 \
+            ::mooncake::tent::TentMetrics::instance().recordReadFailed(); \
+        }                                                                 \
     } while (0)
 
-#define TENT_RECORD_WRITE_FAILED(bytes)                                  \
-    do {                                                                 \
-        if (::mooncake::tent::TentMetrics::isEnabled()) {                \
-            ::mooncake::tent::TentMetrics::instance().recordWriteFailed( \
-                bytes);                                                  \
-        }                                                                \
+#define TENT_RECORD_WRITE_FAILED()                                         \
+    do {                                                                   \
+        if (::mooncake::tent::TentMetrics::isEnabled()) {                  \
+            ::mooncake::tent::TentMetrics::instance().recordWriteFailed(); \
+        }                                                                  \
     } while (0)
 
 #define TENT_RECORD_TRANSPORT_FAILOVER()                  \
@@ -348,8 +358,8 @@ class ScopedLatencyRecorder {
 // Zero-overhead macros when metrics are disabled at compile time
 #define TENT_RECORD_READ_COMPLETED(bytes, latency) ((void)0)
 #define TENT_RECORD_WRITE_COMPLETED(bytes, latency) ((void)0)
-#define TENT_RECORD_READ_FAILED(bytes) ((void)0)
-#define TENT_RECORD_WRITE_FAILED(bytes) ((void)0)
+#define TENT_RECORD_READ_FAILED() ((void)0)
+#define TENT_RECORD_WRITE_FAILED() ((void)0)
 #define TENT_RECORD_TRANSPORT_FAILOVER() ((void)0)
 #define TENT_SCOPED_READ_LATENCY(bytes) ((void)0)
 #define TENT_SCOPED_WRITE_LATENCY(bytes) ((void)0)

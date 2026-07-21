@@ -66,8 +66,6 @@ TEST(MetricsConfigLoaderTest, GetDefaultConfigReturnsExpectedDefaults) {
     EXPECT_EQ(config.report_interval_seconds, 30);
     EXPECT_TRUE(config.enable_prometheus);
     EXPECT_TRUE(config.enable_json);
-    EXPECT_TRUE(config.latency_buckets.empty());
-    EXPECT_TRUE(config.size_buckets.empty());
 }
 
 //------------------------------------------------------------------------------
@@ -83,9 +81,7 @@ TEST(MetricsConfigLoaderTest, LoadFromConfigWithAllValues) {
         "metrics/http_server_threads": 4,
         "metrics/report_interval_seconds": 60,
         "metrics/enable_prometheus": false,
-        "metrics/enable_json": true,
-        "metrics/latency_buckets": [0.001, 0.01, 0.1, 1.0],
-        "metrics/size_buckets": [1024, 10240, 102400]
+        "metrics/enable_json": true
     })";
     ASSERT_TRUE(config.load(json_content).ok());
 
@@ -98,11 +94,6 @@ TEST(MetricsConfigLoaderTest, LoadFromConfigWithAllValues) {
     EXPECT_EQ(metrics_config.report_interval_seconds, 60);
     EXPECT_FALSE(metrics_config.enable_prometheus);
     EXPECT_TRUE(metrics_config.enable_json);
-    ASSERT_EQ(metrics_config.latency_buckets.size(), 4);
-    EXPECT_DOUBLE_EQ(metrics_config.latency_buckets[0], 0.001);
-    EXPECT_DOUBLE_EQ(metrics_config.latency_buckets[3], 1.0);
-    ASSERT_EQ(metrics_config.size_buckets.size(), 3);
-    EXPECT_DOUBLE_EQ(metrics_config.size_buckets[0], 1024);
 }
 
 TEST(MetricsConfigLoaderTest, LoadFromConfigWithPartialValues) {
@@ -168,29 +159,6 @@ TEST(MetricsConfigLoaderTest, LoadFromEnvironmentWithPartialVars) {
     // Other values should be defaults
     EXPECT_TRUE(config.enabled);
     EXPECT_EQ(config.http_host, "0.0.0.0");
-}
-
-TEST(MetricsConfigLoaderTest, LoadFromEnvironmentWithLatencyBuckets) {
-    EnvVarGuard g1(config_keys::ENV_METRICS_LATENCY_BUCKETS,
-                   "0.001,0.005,0.01");
-
-    MetricsConfig config = MetricsConfigLoader::loadFromEnvironment();
-
-    ASSERT_EQ(config.latency_buckets.size(), 3);
-    EXPECT_DOUBLE_EQ(config.latency_buckets[0], 0.001);
-    EXPECT_DOUBLE_EQ(config.latency_buckets[1], 0.005);
-    EXPECT_DOUBLE_EQ(config.latency_buckets[2], 0.01);
-}
-
-TEST(MetricsConfigLoaderTest, LoadFromEnvironmentWithSizeBuckets) {
-    EnvVarGuard g1(config_keys::ENV_METRICS_SIZE_BUCKETS, "1024,2048,4096");
-
-    MetricsConfig config = MetricsConfigLoader::loadFromEnvironment();
-
-    ASSERT_EQ(config.size_buckets.size(), 3);
-    EXPECT_DOUBLE_EQ(config.size_buckets[0], 1024);
-    EXPECT_DOUBLE_EQ(config.size_buckets[1], 2048);
-    EXPECT_DOUBLE_EQ(config.size_buckets[2], 4096);
 }
 
 //------------------------------------------------------------------------------
@@ -271,45 +239,6 @@ TEST(MetricsConfigLoaderTest, ValidateConfigNoOutputFormatEnabled) {
     EXPECT_FALSE(MetricsConfigLoader::validateConfig(config, &error_msg));
     EXPECT_FALSE(error_msg.empty());
     EXPECT_NE(error_msg.find("format"), std::string::npos);
-}
-
-TEST(MetricsConfigLoaderTest, ValidateConfigUnsortedLatencyBuckets) {
-    MetricsConfig config = MetricsConfigLoader::getDefaultConfig();
-    config.latency_buckets = {0.1, 0.05, 0.2};  // Not sorted
-    std::string error_msg;
-
-    EXPECT_FALSE(MetricsConfigLoader::validateConfig(config, &error_msg));
-    EXPECT_FALSE(error_msg.empty());
-    EXPECT_NE(error_msg.find("Latency"), std::string::npos);
-}
-
-TEST(MetricsConfigLoaderTest, ValidateConfigUnsortedSizeBuckets) {
-    MetricsConfig config = MetricsConfigLoader::getDefaultConfig();
-    config.size_buckets = {1024, 512, 2048};  // Not sorted
-    std::string error_msg;
-
-    EXPECT_FALSE(MetricsConfigLoader::validateConfig(config, &error_msg));
-    EXPECT_FALSE(error_msg.empty());
-    EXPECT_NE(error_msg.find("Size"), std::string::npos);
-}
-
-TEST(MetricsConfigLoaderTest, ValidateConfigDuplicateBucketValues) {
-    MetricsConfig config = MetricsConfigLoader::getDefaultConfig();
-    config.latency_buckets = {0.1, 0.1, 0.2};  // Duplicate values
-    std::string error_msg;
-
-    EXPECT_FALSE(MetricsConfigLoader::validateConfig(config, &error_msg));
-    EXPECT_FALSE(error_msg.empty());
-}
-
-TEST(MetricsConfigLoaderTest, ValidateConfigValidSortedBuckets) {
-    MetricsConfig config = MetricsConfigLoader::getDefaultConfig();
-    config.latency_buckets = {0.001, 0.01, 0.1, 1.0};
-    config.size_buckets = {1024, 10240, 102400};
-    std::string error_msg;
-
-    EXPECT_TRUE(MetricsConfigLoader::validateConfig(config, &error_msg));
-    EXPECT_TRUE(error_msg.empty());
 }
 
 TEST(MetricsConfigLoaderTest, ValidateConfigNullErrorMsg) {
@@ -404,9 +333,6 @@ TEST(ConfigKeysTest, ConfigKeyConstants) {
     EXPECT_STREQ(config_keys::METRICS_ENABLE_PROMETHEUS,
                  "metrics/enable_prometheus");
     EXPECT_STREQ(config_keys::METRICS_ENABLE_JSON, "metrics/enable_json");
-    EXPECT_STREQ(config_keys::METRICS_LATENCY_BUCKETS,
-                 "metrics/latency_buckets");
-    EXPECT_STREQ(config_keys::METRICS_SIZE_BUCKETS, "metrics/size_buckets");
 }
 
 TEST(ConfigKeysTest, EnvVarConstants) {
@@ -422,10 +348,6 @@ TEST(ConfigKeysTest, EnvVarConstants) {
                  "TENT_METRICS_ENABLE_PROMETHEUS");
     EXPECT_STREQ(config_keys::ENV_METRICS_ENABLE_JSON,
                  "TENT_METRICS_ENABLE_JSON");
-    EXPECT_STREQ(config_keys::ENV_METRICS_LATENCY_BUCKETS,
-                 "TENT_METRICS_LATENCY_BUCKETS");
-    EXPECT_STREQ(config_keys::ENV_METRICS_SIZE_BUCKETS,
-                 "TENT_METRICS_SIZE_BUCKETS");
 }
 
 }  // namespace

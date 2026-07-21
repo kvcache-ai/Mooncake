@@ -42,35 +42,6 @@ Status TentMetrics::initialize(const MetricsConfig& config) {
     // Set runtime enabled state from config
     runtime_enabled_.store(config_.enabled, std::memory_order_relaxed);
 
-    // Configure histogram buckets if provided (recreate histograms)
-    // Note: config latency_buckets are in seconds, convert to microseconds for
-    // histogram
-    if (!config_.latency_buckets.empty()) {
-        // Convert seconds to microseconds for histogram buckets
-        std::vector<double> latency_buckets_us;
-        latency_buckets_us.reserve(config_.latency_buckets.size());
-        for (double bucket_sec : config_.latency_buckets) {
-            latency_buckets_us.push_back(bucket_sec *
-                                         1000000.0);  // seconds -> microseconds
-        }
-        read_latency_ = ylt::metric::histogram_t(
-            "tent_read_latency_us", "Read latency distribution in microseconds",
-            latency_buckets_us);
-        write_latency_ = ylt::metric::histogram_t(
-            "tent_write_latency_us",
-            "Write latency distribution in microseconds", latency_buckets_us);
-    }
-
-    // Configure size histogram buckets if provided
-    if (!config_.size_buckets.empty()) {
-        read_size_ = ylt::metric::histogram_t(
-            "tent_read_size_bytes", "Read request size distribution in bytes",
-            config_.size_buckets);
-        write_size_ = ylt::metric::histogram_t(
-            "tent_write_size_bytes", "Write request size distribution in bytes",
-            config_.size_buckets);
-    }
-
     // Register all metrics to vectors for unified serialization
     registerMetrics();
 
@@ -204,34 +175,32 @@ void TentMetrics::shutdown() {
     // Clear metric vectors
     counters_.clear();
     histograms_.clear();
-    histogram_boundaries_.clear();
 
     initialized_ = false;
     LOG(INFO) << "TENT metrics shutdown complete";
 }
 
 void TentMetrics::registerMetrics() {
-    // Pre-allocate vectors to avoid reallocation
-    counters_.reserve(7);
-    histograms_.reserve(8);
-    histogram_boundaries_.reserve(8);
-
     // Register all counters - add new counters here
     counters_ = {
-        &read_bytes_total_,     &write_bytes_total_,   &read_requests_total_,
-        &write_requests_total_, &read_failures_total_, &write_failures_total_,
-        &failover_total_,
+        &read_bytes_total_,    &write_bytes_total_,
+        &read_requests_total_, &write_requests_total_,
+        &read_failures_total_, &write_failures_total_,
+        &failover_total_,      &deadline_infeasible_total_,
     };
 
-    // Register all histograms - add new histograms here
-    // Note: histogram_boundaries_ must match the order of histograms_
+    // Register all histograms - add new histograms here. Each entry pairs the
+    // histogram with its compile-time bucket boundaries; the struct keeps the
+    // two in sync so getJsonMetrics() cannot mislabel buckets.
     histograms_ = {
-        &read_latency_, &write_latency_,    &read_size_,      &write_size_,
-        &deadline_mlu_, &stage_queue_wait_, &stage_dispatch_, &stage_transport_,
-    };
-    histogram_boundaries_ = {
-        kLatencyBuckets,     kLatencyBuckets, kSizeBuckets,  kSizeBuckets,
-        kMluPerMilleBuckets, kStageBuckets,   kStageBuckets, kStageBuckets,
+        {&read_latency_, &kLatencyBuckets},
+        {&write_latency_, &kLatencyBuckets},
+        {&read_size_, &kSizeBuckets},
+        {&write_size_, &kSizeBuckets},
+        {&deadline_mlu_, &kMluPerMilleBuckets},
+        {&stage_queue_wait_, &kStageBuckets},
+        {&stage_dispatch_, &kStageBuckets},
+        {&stage_transport_, &kStageBuckets},
     };
 }
 
@@ -274,6 +243,12 @@ void TentMetrics::recordDeadlineMLU(double mlu) {
     deadline_mlu_.observe(static_cast<int64_t>(mlu * 1000.0));
 }
 
+void TentMetrics::recordDeadlineInfeasible() {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    deadline_infeasible_total_.inc();
+}
+
 void TentMetrics::recordStageLatency(Stage stage, double latency_us) {
     if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
         return;
@@ -292,7 +267,7 @@ void TentMetrics::recordStageLatency(Stage stage, double latency_us) {
     }
 }
 
-void TentMetrics::recordReadFailed(size_t bytes) {
+void TentMetrics::recordReadFailed() {
     // Fast path: check runtime switch first
     if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
         return;
@@ -301,7 +276,7 @@ void TentMetrics::recordReadFailed(size_t bytes) {
     read_requests_total_.inc();  // Count failed requests too
 }
 
-void TentMetrics::recordWriteFailed(size_t bytes) {
+void TentMetrics::recordWriteFailed() {
     // Fast path: check runtime switch first
     if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
         return;
@@ -331,8 +306,8 @@ std::string TentMetrics::getPrometheusMetrics() {
         }
 
         // Serialize all histograms
-        for (auto* histogram : histograms_) {
-            histogram->serialize(result);
+        for (const auto& entry : histograms_) {
+            entry.h->serialize(result);
         }
 
         return result;
@@ -354,9 +329,9 @@ std::string TentMetrics::getJsonMetrics() {
         }
 
         // Serialize all histograms
-        for (size_t h = 0; h < histograms_.size(); ++h) {
-            auto* histogram = histograms_[h];
-            const auto& boundaries = histogram_boundaries_[h];
+        for (const auto& entry : histograms_) {
+            auto* histogram = entry.h;
+            const auto& boundaries = *entry.boundaries;
 
             auto bucket_counts = histogram->get_bucket_counts();
 
@@ -444,10 +419,11 @@ void TentMetrics::shutdown() { initialized_ = false; }
 
 void TentMetrics::recordReadCompleted(size_t, double) {}
 void TentMetrics::recordWriteCompleted(size_t, double) {}
-void TentMetrics::recordReadFailed(size_t) {}
-void TentMetrics::recordWriteFailed(size_t) {}
+void TentMetrics::recordReadFailed() {}
+void TentMetrics::recordWriteFailed() {}
 void TentMetrics::recordTransportFailover() {}
 void TentMetrics::recordDeadlineMLU(double) {}
+void TentMetrics::recordDeadlineInfeasible() {}
 void TentMetrics::recordStageLatency(Stage, double) {}
 
 std::string TentMetrics::getPrometheusMetrics() {
