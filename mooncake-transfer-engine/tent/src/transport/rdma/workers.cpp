@@ -823,19 +823,17 @@ void Workers::monitorThread() {
                 if (context->status() == RdmaContext::DEVICE_ENABLED) {
                     std::string previous_gid;
                     std::string next_gid;
-                    auto refresh_result = context->refreshCurrentGid(
-                        &previous_gid, &next_gid);
+                    auto refresh_result =
+                        context->refreshCurrentGid(&previous_gid, &next_gid);
                     if (refresh_result == GidRefreshResult::CHANGED) {
                         LOG(WARNING)
                             << "GID changed for RDMA context "
-                            << context->name() << ": " << previous_gid
-                            << " -> " << next_gid
-                            << ", clearing endpoints";
+                            << context->name() << ": " << previous_gid << " -> "
+                            << next_gid << ", clearing endpoints";
                         if (context->endpointStore()->clear()) {
-                            LOG(ERROR)
-                                << "Failed to clear endpoints after GID "
-                                   "refresh for RDMA context "
-                                << context->name();
+                            LOG(ERROR) << "Failed to clear endpoints after GID "
+                                          "refresh for RDMA context "
+                                       << context->name();
                         }
                     }
                 }
@@ -845,18 +843,17 @@ void Workers::monitorThread() {
                 uint64_t max_poll_interval_ns = 0;
                 for (size_t i = 0; i < num_workers_; ++i) {
                     auto& worker = worker_context_[i];
-                    inflight += worker.inflight_slices.load(
-                        std::memory_order_relaxed);
+                    inflight +=
+                        worker.inflight_slices.load(std::memory_order_relaxed);
                     uint64_t observed = worker.max_poll_interval_ns.exchange(
                         0, std::memory_order_acq_rel);
                     max_poll_interval_ns =
                         std::max(max_poll_interval_ns, observed);
                 }
                 if (inflight > 0) {
-                    LOG(WARNING)
-                        << "TENT RDMA outstanding slices=" << inflight
-                        << ", max poll interval="
-                        << (max_poll_interval_ns / 1000000.0) << " ms";
+                    LOG(WARNING) << "TENT RDMA outstanding slices=" << inflight
+                                 << ", max poll interval="
+                                 << (max_poll_interval_ns / 1000000.0) << " ms";
                 }
             }
             last_reclaim_time = current_time;

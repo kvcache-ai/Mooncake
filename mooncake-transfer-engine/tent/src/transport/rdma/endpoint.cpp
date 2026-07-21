@@ -97,11 +97,10 @@ static void applyMlx5QpTuning(ibv_qp* qp, int qp_index, RdmaContext* context,
                 uint8_t active_port = 0;
                 if (mlx5dv_query_qp_lag_port(qp, &configured_port,
                                              &active_port) == 0) {
-                    VLOG(1) << "[RDMA] QP[" << qp_index
-                            << "] qpn=" << qp->qp_num
-                            << " lag_port cfg="
-                            << static_cast<int>(configured_port)
-                            << " active=" << static_cast<int>(active_port);
+                    VLOG(1)
+                        << "[RDMA] QP[" << qp_index << "] qpn=" << qp->qp_num
+                        << " lag_port cfg=" << static_cast<int>(configured_port)
+                        << " active=" << static_cast<int>(active_port);
                 } else {
                     LOG_FIRST_N(WARNING, 4)
                         << "[RDMA] mlx5dv_query_qp_lag_port failed"
@@ -516,10 +515,9 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
                                      local_gid_selection);
 
             same_nic = (local_desc.local_nic_path == local_desc.peer_nic_path);
-            is_self =
-                (!same_nic &&
-                 (peer_server_name == transport.local_segment_name_ ||
-                  peer_server_name == transport.rdma_server_name_));
+            is_self = (!same_nic &&
+                       (peer_server_name == transport.local_segment_name_ ||
+                        peer_server_name == transport.rdma_server_name_));
         }
 
         // ===== Phase 2: Bootstrap (unlocked) =====
@@ -551,9 +549,8 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
                 return mooncake::tent::Status::InvalidArgument(
                     "Missing peer RPC server address" LOC_MARK);
             }
-            auto bootstrap_status =
-                ControlClient::bootstrap(rpc_server_addr, local_desc,
-                                         peer_desc);
+            auto bootstrap_status = ControlClient::bootstrap(
+                rpc_server_addr, local_desc, peer_desc);
             if (!bootstrap_status.ok()) {
                 RWSpinlock::WriteGuard guard(lock_);
                 const bool same_peer = peer_server_name_ == peer_server_name &&
@@ -739,8 +736,7 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
         std::string failure_message;
         SetupConnectionFailureInfo failure_info;
         int rc = setupAllQPs(peer_desc.local_gid, peer_desc.local_lid,
-                             peer_desc.qp_num, &failure_message,
-                             &failure_info);
+                             peer_desc.qp_num, &failure_message, &failure_info);
         if (rc == 0) break;
 
         if (!shouldAttemptAutoGidHandshakeRetry(
@@ -857,9 +853,9 @@ int RdmaEndPoint::setupAllQPs(const std::string& peer_gid, uint16_t peer_lid,
     }
 
     for (int qp_index = 0; qp_index < (int)qp_list_.size(); ++qp_index) {
-        int ret = setupOneQP(qp_index, peer_gid, peer_lid,
-                             peer_qp_num_list[qp_index], reply_msg,
-                             failure_info);
+        int ret =
+            setupOneQP(qp_index, peer_gid, peer_lid, peer_qp_num_list[qp_index],
+                       reply_msg, failure_info);
         if (ret) {
             return ret;
         }
@@ -875,8 +871,7 @@ int RdmaEndPoint::resetDataQPsToResetNoLock() {
     attr.qp_state = IBV_QPS_RESET;
     for (auto* qp : qp_list_) {
         if (!qp) continue;
-        int ret =
-            context_->verbs_.ibv_modify_qp(qp, &attr, IBV_QP_STATE);
+        int ret = context_->verbs_.ibv_modify_qp(qp, &attr, IBV_QP_STATE);
         if (ret) {
             std::stringstream ss;
             ss << "Failed to reset QP in endpoint " << peer_nic_name_ << " of "

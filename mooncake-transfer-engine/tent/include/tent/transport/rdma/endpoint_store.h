@@ -63,8 +63,7 @@ class FIFOEndpointStore : public EndpointStore {
 
     std::shared_ptr<RdmaEndPoint> getOrInsert(const std::string &key) override;
 
-    int remove(RdmaEndPoint *ep,
-               std::string *removed_key = nullptr) override;
+    int remove(RdmaEndPoint *ep, std::string *removed_key = nullptr) override;
 
     int clear() override;
 
@@ -102,8 +101,7 @@ class SIEVEEndpointStore : public EndpointStore {
 
     size_t size() override;
 
-    int remove(RdmaEndPoint *ep,
-               std::string *removed_key = nullptr) override;
+    int remove(RdmaEndPoint *ep, std::string *removed_key = nullptr) override;
     void evictOne() override;
     void reclaim() override;
 

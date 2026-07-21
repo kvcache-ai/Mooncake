@@ -107,8 +107,7 @@ bool waitBatchDone(TransferEngine& engine, BatchID batch) {
 }
 
 AutoGidCandidate makeGidCandidate(int gid_index, uint32_t gid_type,
-                                  bool has_network_device,
-                                  bool is_ipv4_mapped,
+                                  bool has_network_device, bool is_ipv4_mapped,
                                   bool is_link_local_ipv6,
                                   bool is_overlay_network = false,
                                   bool is_overlay_ipv4 = false,
@@ -306,8 +305,8 @@ TEST(RdmaGidProbeTest, ReprobeSkipsAlreadyTriedCandidates) {
                          false, false, true, "00:11:33"),
     };
 
-    auto selection = reselectAutoGidCandidate(
-        candidates, 1, "00:11:21", {{1, "00:11:22"}});
+    auto selection =
+        reselectAutoGidCandidate(candidates, 1, "00:11:21", {{1, "00:11:22"}});
     ASSERT_TRUE(selection.has_value());
     EXPECT_EQ(selection->gid_index, 3);
     EXPECT_EQ(selection->gid, "00:11:33");

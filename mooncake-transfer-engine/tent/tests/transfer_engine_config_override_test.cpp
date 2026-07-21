@@ -311,8 +311,8 @@ TEST(TransferEngineConfigOverrideTest,
     EXPECT_EQ(config.getArray<uint16_t>(
                   "transports/rdma/endpoint/mlx5_qp_udp_sports"),
               expected_sports);
-    EXPECT_TRUE(config.get(
-        "transports/rdma/endpoint/mlx5_qp_lag_port_balance", false));
+    EXPECT_TRUE(
+        config.get("transports/rdma/endpoint/mlx5_qp_lag_port_balance", false));
     EXPECT_TRUE(
         config.get("transports/rdma/workers/track_posted_slices", false));
 }

@@ -295,9 +295,8 @@ static inline const std::string statusToString(
 RdmaContext::RdmaContext(RdmaTransport& transport)
     : transport_(transport),
       status_(DEVICE_UNINIT),
-      connect_pause_([] {
-          return static_cast<uint64_t>(getCurrentTimeInNano());
-      }),
+      connect_pause_(
+          [] { return static_cast<uint64_t>(getCurrentTimeInNano()); }),
       verbs_(IbvLoader::Instance().sym()) {
     static std::once_flag g_once_flag;
     auto fork_init = [&]() {
@@ -521,8 +520,8 @@ void RdmaContext::markContextSuccess() {
 }
 
 void RdmaContext::markContextFailure() {
-    int count = context_failure_count_.fetch_add(1, std::memory_order_acq_rel) +
-                1;
+    int count =
+        context_failure_count_.fetch_add(1, std::memory_order_acq_rel) + 1;
     if (count < kContextFailureThreshold) return;
 
     DeviceStatus expected = DEVICE_ENABLED;
@@ -673,9 +672,7 @@ int RdmaContext::unregisterMemReg(MemReg id) {
     return 0;
 }
 
-std::string RdmaContext::gid() const {
-    return gidSelection().gid;
-}
+std::string RdmaContext::gid() const { return gidSelection().gid; }
 
 GidSelectionSnapshot RdmaContext::gidSelection() const {
     std::lock_guard<std::mutex> guard(gid_lock_);
@@ -736,8 +733,8 @@ bool RdmaContext::reprobeAutoGid(
     ibv_port_attr port_attr;
     if (verbs_.ibv_query_port_default(current_context, current_port,
                                       &port_attr)) {
-        PLOG(WARNING) << "Failed to reprobe port attributes on "
-                      << device_name_ << "/" << static_cast<int>(current_port);
+        PLOG(WARNING) << "Failed to reprobe port attributes on " << device_name_
+                      << "/" << static_cast<int>(current_port);
         return false;
     }
 

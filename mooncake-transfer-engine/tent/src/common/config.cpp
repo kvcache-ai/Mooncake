@@ -88,8 +88,8 @@ static inline void setPortArrayConfig(Config& config,
         try {
             unsigned long port = std::stoul(item);
             if (port == 0 || port > 65535) {
-                LOG(WARNING) << "Ignoring invalid port in " << env_key << ": "
-                             << item;
+                LOG(WARNING)
+                    << "Ignoring invalid port in " << env_key << ": " << item;
                 continue;
             }
             ports.push_back(static_cast<uint16_t>(port));
