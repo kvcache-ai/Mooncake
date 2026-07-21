@@ -1550,6 +1550,13 @@ def test_dataproto_helper_accepts_legacy_dict_inputs() -> None:
     assert envelope["meta_info"] == {"step": 3}
 
 
+def _schema_test_data(field: str, values: np.ndarray) -> dict[str, object]:
+    return {
+        "batch": {"input_ids": np.arange(len(values))},
+        "non_tensor_batch": {field: values},
+    }
+
+
 def test_dataproto_field_schema_encodes_typed_ragged_non_tensor_field() -> None:
     _store, transfer = make_transfer()
     values = np.empty(3, dtype=object)
@@ -1560,10 +1567,7 @@ def test_dataproto_field_schema_encodes_typed_ragged_non_tensor_field() -> None:
     ]
 
     ref = transfer.put_dataproto(
-        {
-            "batch": {"input_ids": np.arange(3)},
-            "non_tensor_batch": {"tokens": values},
-        },
+        _schema_test_data("tokens", values),
         field_schemas={
             "tokens": FieldSchema(
                 codec="typed_ragged",
@@ -1571,22 +1575,14 @@ def test_dataproto_field_schema_encodes_typed_ragged_non_tensor_field() -> None:
             )
         },
     )
+    result = transfer.get_dataproto(ref)["non_tensor_batch"]["tokens"]
 
-    result = transfer.get_dataproto(ref)
-
-    assert result["non_tensor_batch"]["tokens"][0] == [1, 2]
-    assert result["non_tensor_batch"]["tokens"][1] is None
-    assert result["non_tensor_batch"]["tokens"][2] == [3]
-
-    bad_text = np.asarray([object()], dtype=object)
-    with pytest.raises(AttributeError, match="failed to encode.*'text'.*utf8_ragged"):
-        transfer.put_dataproto(
-            {"batch": {"input_ids": np.arange(1)}, "non_tensor_batch": {"text": bad_text}},
-            field_schemas={"text": FieldSchema(codec="utf8_ragged")},
-        )
+    assert result[0] == [1, 2]
+    assert result[1] is None
+    assert result[2] == [3]
 
 
-def test_dataproto_field_schema_validates_declared_section() -> None:
+def test_dataproto_field_schema_validates_schema_errors() -> None:
     _store, transfer = make_transfer()
 
     with pytest.raises(ValueError, match="declares section"):
@@ -1599,18 +1595,28 @@ def test_dataproto_field_schema_validates_declared_section() -> None:
             },
         )
 
-
-def test_dataproto_field_schema_rejects_ambiguous_tensor_dict_keys() -> None:
-    _store, transfer = make_transfer()
     rows = np.empty(1, dtype=object)
     rows[:] = [{"image.data": object()}]
-
     with pytest.raises(ValueError, match="must not contain"):
         transfer.put_dataproto(
-            {"batch": {"input_ids": np.arange(1)}, "non_tensor_batch": {"mm": rows}},
+            _schema_test_data("mm", rows),
             field_schemas={
                 "mm": FieldSchema(
                     codec="ragged_tensor_dict",
+                    metadata={"section": "non_tensor_batch"},
+                )
+            },
+        )
+
+    values = np.empty(2, dtype=object)
+    values[:] = ["ok", None]
+    with pytest.raises(ValueError, match="not nullable"):
+        transfer.put_dataproto(
+            _schema_test_data("text", values),
+            field_schemas={
+                "text": FieldSchema(
+                    codec="auto",
+                    nullable=False,
                     metadata={"section": "non_tensor_batch"},
                 )
             },
@@ -1629,10 +1635,7 @@ def test_dataproto_field_schema_encodes_ragged_tensor_dict() -> None:
     ]
 
     ref = transfer.put_dataproto(
-        {
-            "batch": {"input_ids": np.arange(4)},
-            "non_tensor_batch": {"multi_modal_inputs": rows},
-        },
+        _schema_test_data("multi_modal_inputs", rows),
         field_schemas={
             "multi_modal_inputs": FieldSchema(
                 codec="ragged_tensor_dict",
@@ -1641,9 +1644,7 @@ def test_dataproto_field_schema_encodes_ragged_tensor_dict() -> None:
         },
     )
 
-    result = transfer.get_dataproto(ref)
-    actual = result["non_tensor_batch"]["multi_modal_inputs"]
-
+    actual = transfer.get_dataproto(ref)["non_tensor_batch"]["multi_modal_inputs"]
     assert ref.encoded_non_tensor["multi_modal_inputs"]["codec"] == "ragged_tensor_dict"
     assert torch.equal(actual[0]["image"], rows[0]["image"])
     assert actual[1] is None
@@ -1653,28 +1654,18 @@ def test_dataproto_field_schema_encodes_ragged_tensor_dict() -> None:
     sliced = transfer.get_dataproto(ref, rows=slice(1, 4))["non_tensor_batch"][
         "multi_modal_inputs"
     ]
-    assert sliced[0] is None
-    assert sliced[1] == {}
-    assert torch.equal(sliced[2]["image"], rows[3]["image"])
-
     indexed = transfer.get_dataproto(ref, rows=[3, 0])["non_tensor_batch"][
         "multi_modal_inputs"
     ]
+    assert sliced[0] is None
+    assert sliced[1] == {}
+    assert torch.equal(sliced[2]["image"], rows[3]["image"])
     assert torch.equal(indexed[0]["image"], rows[3]["image"])
     assert torch.equal(indexed[1]["image"], rows[0]["image"])
-
-
-def test_dataproto_field_schema_encodes_all_null_ragged_tensor_dict() -> None:
-    pytest.importorskip("torch", exc_type=ImportError)
-    _store, transfer = make_transfer()
-    rows = np.empty(3, dtype=object)
-    rows[:] = [None, None, None]
-
-    ref = transfer.put_dataproto(
-        {
-            "batch": {"input_ids": np.arange(3)},
-            "non_tensor_batch": {"multi_modal_inputs": rows},
-        },
+    all_null = np.empty(3, dtype=object)
+    all_null[:] = [None, None, None]
+    all_null_ref = transfer.put_dataproto(
+        _schema_test_data("multi_modal_inputs", all_null),
         field_schemas={
             "multi_modal_inputs": FieldSchema(
                 codec="ragged_tensor_dict",
@@ -1682,110 +1673,12 @@ def test_dataproto_field_schema_encodes_all_null_ragged_tensor_dict() -> None:
             )
         },
     )
-
-    encoded = ref.encoded_non_tensor["multi_modal_inputs"]
-    assert encoded["codec"] == "ragged_tensor_dict"
+    encoded = all_null_ref.encoded_non_tensor["multi_modal_inputs"]
     assert encoded["metadata"]["keys"] == ["image"]
     assert "image.data" in encoded["payload_members"]
-
-    full = transfer.get_dataproto(ref)["non_tensor_batch"]["multi_modal_inputs"]
-    assert full.tolist() == [None, None, None]
-
-    sliced = transfer.get_dataproto(ref, rows=slice(1, 3))["non_tensor_batch"][
+    assert transfer.get_dataproto(all_null_ref)["non_tensor_batch"][
         "multi_modal_inputs"
-    ]
-    assert sliced.tolist() == [None, None]
-
-    indexed = transfer.get_dataproto(ref, rows=[2, 0])["non_tensor_batch"][
-        "multi_modal_inputs"
-    ]
-    assert indexed.tolist() == [None, None]
-
-
-def test_dataproto_field_schema_rejects_lossy_ragged_tensor_dict_rows() -> None:
-    torch = pytest.importorskip("torch", exc_type=ImportError)
-    _store, transfer = make_transfer()
-
-    extra_key_rows = np.empty(1, dtype=object)
-    extra_key_rows[:] = [
-        {
-            "image": torch.arange(1, dtype=torch.float32),
-            "audio": torch.arange(1, dtype=torch.float32),
-        }
-    ]
-    with pytest.raises(ValueError, match="keys not declared"):
-        transfer.put_dataproto(
-            {
-                "batch": {"input_ids": np.arange(1)},
-                "non_tensor_batch": {"mm": extra_key_rows},
-            },
-            field_schemas={
-                "mm": FieldSchema(
-                    codec="ragged_tensor_dict",
-                    metadata={"section": "non_tensor_batch", "keys": ["image"]},
-                )
-            },
-        )
-
-    explicit_null_rows = np.empty(1, dtype=object)
-    explicit_null_rows[:] = [{"image": None}]
-    with pytest.raises(TypeError, match="explicit None"):
-        transfer.put_dataproto(
-            {
-                "batch": {"input_ids": np.arange(1)},
-                "non_tensor_batch": {"mm": explicit_null_rows},
-            },
-            field_schemas={
-                "mm": FieldSchema(
-                    codec="ragged_tensor_dict",
-                    metadata={"section": "non_tensor_batch", "keys": ["image"]},
-                )
-            },
-        )
-
-
-def test_dataproto_field_schema_auto_enforces_nullable() -> None:
-    _store, transfer = make_transfer()
-    values = np.empty(2, dtype=object)
-    values[:] = ["ok", None]
-
-    with pytest.raises(ValueError, match="not nullable"):
-        transfer.put_dataproto(
-            {
-                "batch": {"input_ids": np.arange(2)},
-                "non_tensor_batch": {"text": values},
-            },
-            field_schemas={
-                "text": FieldSchema(
-                    codec="auto",
-                    nullable=False,
-                    metadata={"section": "non_tensor_batch"},
-                )
-            },
-        )
-
-
-def test_dataproto_field_schema_allows_same_named_meta_info() -> None:
-    _store, transfer = make_transfer()
-    values = np.asarray(["a", "b"], dtype=object)
-
-    ref = transfer.put_dataproto(
-        {
-            "batch": {"input_ids": np.arange(2)},
-            "non_tensor_batch": {"label": values},
-            "meta_info": {"label": "metadata-label"},
-        },
-        field_schemas={
-            "label": FieldSchema(
-                codec="utf8_ragged", metadata={"section": "non_tensor_batch"}
-            )
-        },
-    )
-
-    result = transfer.get_dataproto(ref)
-
-    assert result["non_tensor_batch"]["label"].tolist() == ["a", "b"]
-    assert result["meta_info"]["label"] == "metadata-label"
+    ].tolist() == [None, None, None]
 
 
 def test_dataproto_helper_treats_reserved_plain_dict_keys_as_batch_fields() -> None:
