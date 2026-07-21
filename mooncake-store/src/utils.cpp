@@ -769,9 +769,9 @@ static std::string SanitizeKey(const std::string &key) {
     return sanitized_key;
 }
 
-std::string ResolveLegacyPathFromKey(const std::string &key,
-                                     const std::string &root_dir,
-                                     const std::string &fsdir) {
+std::string ResolvePathFromKey(const std::string &key,
+                               const std::string &root_dir,
+                               const std::string &fsdir) {
     // Compute hash of the key
     size_t hash = std::hash<std::string>{}(key);
 
@@ -792,9 +792,15 @@ std::string ResolveLegacyPathFromKey(const std::string &key,
     return full_path.lexically_normal().string();
 }
 
-std::string ResolvePathFromKey(const std::string &key,
-                               const std::string &root_dir,
-                               const std::string &fsdir) {
+std::string ResolveLegacyPathFromKey(const std::string &key,
+                                     const std::string &root_dir,
+                                     const std::string &fsdir) {
+    return ResolvePathFromKey(key, root_dir, fsdir);
+}
+
+std::string ResolveFilePerKeyPathFromKey(const std::string &key,
+                                         const std::string &root_dir,
+                                         const std::string &fsdir) {
     const XXH128_hash_t hash = XXH3_128bits(key.data(), key.size());
     std::array<char, 33> digest{};
     std::snprintf(digest.data(), digest.size(), "%016llx%016llx",

@@ -10,17 +10,29 @@
 
 using namespace mooncake;
 
-TEST(UtilsTest, ResolvePathFromKeyUsesBoundedStableDigest) {
+TEST(UtilsTest, ResolveFilePerKeyPathFromKeyUsesBoundedStableDigest) {
     const std::string root = "/tmp/mooncake";
     const std::string fsdir = "file_per_key";
     const std::string key(4096, '/');
 
-    const auto first = ResolvePathFromKey(key, root, fsdir);
-    const auto second = ResolvePathFromKey(key, root, fsdir);
+    const auto first = ResolveFilePerKeyPathFromKey(key, root, fsdir);
+    const auto second = ResolveFilePerKeyPathFromKey(key, root, fsdir);
     EXPECT_EQ(first, second);
     EXPECT_EQ(std::filesystem::path(first).filename().string().size(), 32);
-    EXPECT_NE(first, ResolvePathFromKey(key + "x", root, fsdir));
+    EXPECT_NE(first, ResolveFilePerKeyPathFromKey(key + "x", root, fsdir));
     EXPECT_GT(ResolveLegacyPathFromKey(key, root, fsdir).size(), first.size());
+}
+
+TEST(UtilsTest, ResolvePathFromKeyPreservesLegacyLayout) {
+    const std::string root = "/tmp/mooncake";
+    const std::string fsdir = "mooncake_cluster";
+    const std::string key = "legacy/disk:key";
+
+    const auto path = ResolvePathFromKey(key, root, fsdir);
+    EXPECT_EQ(path, ResolveLegacyPathFromKey(key, root, fsdir));
+    EXPECT_EQ(std::filesystem::path(path).filename().string(),
+              "legacy_disk_key");
+    EXPECT_NE(path, ResolveFilePerKeyPathFromKey(key, root, fsdir));
 }
 
 TEST(UtilsTest, ByteSizeToString) {
