@@ -1892,6 +1892,7 @@ def test_unified_dict_put_passes_store_config_to_batch_put_writes() -> None:
     assert store.batch_put_from_configs
     assert all(item is config for item in store.batch_put_from_configs)
 
+
 def test_unified_dict_put_accepts_field_schemas() -> None:
     _store, transfer = make_transfer()
     values = np.empty(3, dtype=object)
@@ -1901,13 +1902,12 @@ def test_unified_dict_put_accepts_field_schemas() -> None:
         np.asarray([3], dtype=np.int32),
     ]
 
-    ref = transfer.put(
+    ref = transfer.put_dict(
         {
             "input_ids": np.arange(3),
             "tokens": values,
             "step": 7,
         },
-        type="dict",
         field_schemas={
             "tokens": FieldSchema(
                 codec="typed_ragged",

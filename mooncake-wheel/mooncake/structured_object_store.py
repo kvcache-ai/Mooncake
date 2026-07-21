@@ -1355,6 +1355,7 @@ class MooncakeBundleTransfer:
         chunk_bytes: Optional[int] = None,
         policy: Optional[BundleTransferPolicy] = None,
         config: Any = None,
+        field_schemas: Optional[Mapping[str, FieldSchema]] = None,
     ) -> MooncakeDataProtoRef:
         """Store a flat dict as a structured object."""
         return self.put(
@@ -1366,6 +1367,7 @@ class MooncakeBundleTransfer:
             chunk_bytes=chunk_bytes,
             policy=policy,
             config=config,
+            field_schemas=field_schemas,
         )
 
     def get_dict(self, ref: DataProtoRefLike) -> dict[str, Any]:
