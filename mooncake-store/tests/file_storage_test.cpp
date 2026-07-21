@@ -100,6 +100,17 @@ class FileStorageTest : public ::testing::Test {
             offloading_objects, buckets_keys, deferred_keys);
     }
 
+    tl::expected<void, ErrorCode> FileStorageOffloadObjects(
+        FileStorage& fileStorage,
+        const std::vector<OffloadTaskItem>& offloading_objects) {
+        return fileStorage.OffloadObjects(offloading_objects);
+    }
+
+    std::unordered_map<std::string, OffloadTaskItem>
+    GetDeferredTaskByStorageKey(FileStorage& fileStorage) {
+        return fileStorage.deferred_task_by_storage_key_;
+    }
+
     static void FileStoragePartitionUnbucketedTasks(
         const std::unordered_map<std::string, OffloadTaskItem>&
             task_by_storage_key,
@@ -466,6 +477,63 @@ TEST_F(FileStorageTest, PartitionUnbucketedTasks_carries_deferred_not_nacked) {
     }
     // Deliberately skipped keys are still NACKed.
     ASSERT_EQ(failed_tasks.size(), 2u);
+}
+
+// Regression (upstream #3006, integration): drive the deferral carry through
+// OffloadObjects itself. A cycle in which every key defers emits no bucket,
+// so nothing touches the master client — which makes the integrated path
+// (carry merge, deferral report plumbing, partition, carry assignment)
+// testable without a client. Phase 3 exercises the retained-carry corner:
+// a drain consisting solely of a re-PUT of a carried key empties the
+// effective input, the pool is neither emitted nor re-reported, and the
+// carry must survive by retention rather than the deferral report.
+TEST_F(FileStorageTest, OffloadObjects_deferred_tail_tasks_carried) {
+    auto make_task = [](const std::string& key) {
+        return OffloadTaskItem{.tenant_id = "default", .key = key, .size = 1};
+    };
+    auto carried_user_keys =
+        [](const std::unordered_map<std::string, OffloadTaskItem>& carry) {
+            std::unordered_set<std::string> keys;
+            for (const auto& [_, task] : carry) keys.insert(task.key);
+            return keys;
+        };
+
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "10");
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+
+    // Phase 1: two tasks, far below bucket capacity -> the whole drain is
+    // the tail: no bucket emitted, both tasks carried, none NACKed (no
+    // client call happens -- client_ is null, so reaching it would crash).
+    ASSERT_TRUE(FileStorageOffloadObjects(fileStorage,
+                                          {make_task("d1"), make_task("d2")}));
+    auto carry = GetDeferredTaskByStorageKey(fileStorage);
+    ASSERT_EQ(carry.size(), 2u);
+    EXPECT_EQ(carried_user_keys(carry),
+              (std::unordered_set<std::string>{"d1", "d2"}));
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 2);
+
+    // Phase 2: one more task; pool + new input still cannot fill a bucket,
+    // so all three are re-deferred and re-carried.
+    ASSERT_TRUE(FileStorageOffloadObjects(fileStorage, {make_task("d3")}));
+    carry = GetDeferredTaskByStorageKey(fileStorage);
+    ASSERT_EQ(carry.size(), 3u);
+    EXPECT_EQ(carried_user_keys(carry),
+              (std::unordered_set<std::string>{"d1", "d2", "d3"}));
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 3);
+
+    // Phase 3 (the retained-carry corner): a drain that is ONLY a re-PUT of
+    // a carried key. The merge removes it from the effective input, the
+    // grouping loop never runs, the pool is untouched and nothing is
+    // re-reported -- yet every carried task must survive, and none may be
+    // NACKed while the pool still holds the keys.
+    ASSERT_TRUE(FileStorageOffloadObjects(fileStorage, {make_task("d1")}));
+    carry = GetDeferredTaskByStorageKey(fileStorage);
+    ASSERT_EQ(carry.size(), 3u);
+    EXPECT_EQ(carried_user_keys(carry),
+              (std::unordered_set<std::string>{"d1", "d2", "d3"}));
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 3);
 }
 
 TEST_F(FileStorageTest, DefaultValuesWhenNoEnvSet) {
