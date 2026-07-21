@@ -382,6 +382,8 @@ TransferEngine::TransferEngine(bool auto_discover,
     }
     if (!use_tent_) {
         impl_ = std::make_shared<TransferEngineImpl>(auto_discover, filter);
+    } else {
+        tent_device_filter_ = filter;
     }
 }
 
@@ -456,6 +458,8 @@ int TransferEngine::init(const std::string& metadata_conn_string,
             if (!type.empty()) config->set("metadata_type", type);
             if (!servers.empty()) config->set("metadata_servers", servers);
         }
+        if (!tent_device_filter_.empty())
+            config->set("topology/rdma_whitelist", tent_device_filter_);
         impl_tent_ = std::make_shared<mooncake::tent::TransferEngine>(config);
         return impl_tent_->available() ? 0 : 1;
     }
@@ -825,7 +829,11 @@ void TransferEngine::setAutoDiscover(bool auto_discover) {
 }
 
 void TransferEngine::setWhitelistFilters(std::vector<std::string>&& filters) {
-    if (!use_tent_) impl_->setWhitelistFilters(std::move(filters));
+    if (!use_tent_) {
+        impl_->setWhitelistFilters(std::move(filters));
+    } else {
+        tent_device_filter_ = std::move(filters);
+    }
 }
 
 int TransferEngine::numContexts() const {

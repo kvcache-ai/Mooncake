@@ -212,6 +212,9 @@ class TransferEngine {
     std::shared_ptr<mooncake::tent::TransferEngine> impl_tent_;
     std::shared_ptr<ShutdownToken> shutdown_token_;
     bool use_tent_{false};
+    // Device filter passed at construction, kept so init() can forward it to
+    // TENT via topology/rdma_whitelist (TENT otherwise ignores the filter).
+    std::vector<std::string> tent_device_filter_;
 };
 }  // namespace mooncake
 
