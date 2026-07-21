@@ -1,19 +1,12 @@
 #pragma once
 
-#include <thread>
-
 #include "environ.h"
 #include "rpc_client_io_context.h"
 
 namespace mooncake {
 
-inline constexpr char kStoreRpcClientIoThreadsEnv[] =
-    "MC_STORE_RPC_CLIENT_IO_THREADS";
-
-inline unsigned GetStoreRpcClientIoThreads(
-    unsigned hardware_threads = std::thread::hardware_concurrency()) {
-    return Environ::GetComponentRpcClientIoThreads(kStoreRpcClientIoThreadsEnv,
-                                                   hardware_threads);
+inline unsigned GetStoreRpcClientIoThreads() {
+    return Environ::Get().GetStoreRpcClientIoThreads();
 }
 
 namespace detail {

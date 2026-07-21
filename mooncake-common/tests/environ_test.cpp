@@ -32,9 +32,6 @@ class EnvironTest : public ::testing::Test {
         unsetenv("MC_TEST_SIZET");
         unsetenv("MC_TEST_BOOL");
         unsetenv("MC_TEST_STRING");
-        unsetenv("MC_RPC_CLIENT_IO_THREADS");
-        unsetenv("MC_STORE_RPC_CLIENT_IO_THREADS");
-        unsetenv("MC_TE_RPC_CLIENT_IO_THREADS");
         // Make sure AWS vars don't leak in from the test runner's env.
         unsetenv("MOONCAKE_AWS_REGION");
         unsetenv("MOONCAKE_AWS_S3_ENDPOINT");
@@ -49,71 +46,6 @@ class EnvironTest : public ::testing::Test {
         unsetenv("MOONCAKE_AWS_REQUEST_TIMEOUT_MS");
     }
 };
-
-TEST_F(EnvironTest, RpcClientIoThreadsUsesHardwareConcurrencyByDefault) {
-    EXPECT_EQ(Environ::GetRpcClientIoThreads(12), 12U);
-    EXPECT_EQ(Environ::GetRpcClientIoThreads(64), 16U);
-}
-
-TEST_F(EnvironTest, RpcClientIoThreadsAcceptsPositiveInteger) {
-    setenv("MC_RPC_CLIENT_IO_THREADS", "7", 1);
-    EXPECT_EQ(Environ::GetRpcClientIoThreads(12), 7U);
-}
-
-TEST_F(EnvironTest, RpcClientIoThreadsRejectsInvalidValues) {
-    setenv("MC_RPC_CLIENT_IO_THREADS", "7threads", 1);
-    EXPECT_EQ(Environ::GetRpcClientIoThreads(12), 12U);
-
-    setenv("MC_RPC_CLIENT_IO_THREADS", "0", 1);
-    EXPECT_EQ(Environ::GetRpcClientIoThreads(12), 12U);
-
-    setenv("MC_RPC_CLIENT_IO_THREADS", "99999999999999999999", 1);
-    EXPECT_EQ(Environ::GetRpcClientIoThreads(12), 12U);
-}
-
-TEST_F(EnvironTest, RpcClientIoThreadsUsesOneWhenHardwareConcurrencyIsZero) {
-    EXPECT_EQ(Environ::GetRpcClientIoThreads(0), 1U);
-
-    setenv("MC_RPC_CLIENT_IO_THREADS", "invalid", 1);
-    EXPECT_EQ(Environ::GetRpcClientIoThreads(0), 1U);
-}
-
-TEST_F(EnvironTest, ComponentRpcClientIoThreadsOverrideCommonValue) {
-    setenv("MC_RPC_CLIENT_IO_THREADS", "8", 1);
-    setenv("MC_STORE_RPC_CLIENT_IO_THREADS", "4", 1);
-    setenv("MC_TE_RPC_CLIENT_IO_THREADS", "6", 1);
-
-    EXPECT_EQ(Environ::GetComponentRpcClientIoThreads(
-                  "MC_STORE_RPC_CLIENT_IO_THREADS", 64),
-              4U);
-    EXPECT_EQ(Environ::GetComponentRpcClientIoThreads(
-                  "MC_TE_RPC_CLIENT_IO_THREADS", 64),
-              6U);
-}
-
-TEST_F(EnvironTest, ComponentRpcClientIoThreadsUseCommonFallback) {
-    setenv("MC_RPC_CLIENT_IO_THREADS", "8", 1);
-
-    EXPECT_EQ(Environ::GetComponentRpcClientIoThreads(
-                  "MC_STORE_RPC_CLIENT_IO_THREADS", 64),
-              8U);
-    EXPECT_EQ(Environ::GetComponentRpcClientIoThreads(
-                  "MC_TE_RPC_CLIENT_IO_THREADS", 64),
-              8U);
-}
-
-TEST_F(EnvironTest, InvalidComponentRpcClientIoThreadsUseCommonFallback) {
-    setenv("MC_RPC_CLIENT_IO_THREADS", "8", 1);
-    setenv("MC_STORE_RPC_CLIENT_IO_THREADS", "0", 1);
-    setenv("MC_TE_RPC_CLIENT_IO_THREADS", "invalid", 1);
-
-    EXPECT_EQ(Environ::GetComponentRpcClientIoThreads(
-                  "MC_STORE_RPC_CLIENT_IO_THREADS", 64),
-              8U);
-    EXPECT_EQ(Environ::GetComponentRpcClientIoThreads(
-                  "MC_TE_RPC_CLIENT_IO_THREADS", 64),
-              8U);
-}
 
 // --- GetInt ---
 

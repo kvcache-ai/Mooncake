@@ -802,10 +802,10 @@ The following `MC_*` variables are read directly by the engine/client at runtime
 | `MC_USE_TENT` / `MC_USE_TEV1` | unset | Set to any value to enable the TENT (next-gen) transfer engine |
 | `MC_STORE_CLUSTER_ID` | unset | Cluster ID label attached to client metrics |
 
-RPC client I/O pool settings are read once when the corresponding component
-first initializes its pool. Changes therefore require a process restart. When
-Store and Transfer Engine run in the same process, each component owns the
-configured number of threads and `io_context` instances.
+RPC client I/O pool settings are read and resolved once when the process-wide
+`Environ` singleton is initialized. Changes therefore require a process
+restart. When Store and Transfer Engine run in the same process, each component
+owns the configured number of threads and `io_context` instances.
 
 #### Topology Discovery
 

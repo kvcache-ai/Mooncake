@@ -3,7 +3,6 @@
 #include <string>
 #include <cstdint>
 #include <cstdlib>
-#include <thread>
 
 namespace mooncake {
 
@@ -73,6 +72,13 @@ class Environ {
     }
     int64_t GetAwsConnectTimeoutMs() const { return aws_connect_timeout_ms_; }
     int64_t GetAwsRequestTimeoutMs() const { return aws_request_timeout_ms_; }
+    unsigned GetRpcClientIoThreads() const { return rpc_client_io_threads_; }
+    unsigned GetStoreRpcClientIoThreads() const {
+        return store_rpc_client_io_threads_;
+    }
+    unsigned GetTransferEngineRpcClientIoThreads() const {
+        return transfer_engine_rpc_client_io_threads_;
+    }
 
     // Helper method to get int from env
     static int GetInt(const char* name, int default_value);
@@ -84,16 +90,6 @@ class Environ {
     // Helper method to get string from env
     static std::string GetString(const char* name,
                                  const std::string& default_value);
-    // RPC client I/O contexts use one thread per context. The common setting
-    // defaults to the smaller of 16 and the online hardware thread count, with
-    // a minimum of 1.
-    static unsigned GetRpcClientIoThreads(
-        unsigned hardware_threads = std::thread::hardware_concurrency());
-    // Resolve a component-specific setting, falling back to the common RPC
-    // client I/O thread setting.
-    static unsigned GetComponentRpcClientIoThreads(
-        const char* component_env,
-        unsigned hardware_threads = std::thread::hardware_concurrency());
 
    private:
     Environ();
@@ -136,6 +132,9 @@ class Environ {
     bool path_roundrobin_;
     bool with_nvidia_peermem_;
     int efa_cq_threads_;
+    unsigned rpc_client_io_threads_;
+    unsigned store_rpc_client_io_threads_;
+    unsigned transfer_engine_rpc_client_io_threads_;
 
     // AWS / S3 client configuration
     std::string aws_region_;
