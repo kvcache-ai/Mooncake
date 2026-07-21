@@ -3533,6 +3533,10 @@ RealClient::get_into_ranges_internal(
             const auto &src_offsets = src_groups[j];
             const auto &sizes = size_groups[j];
             auto &range_results = results[i][j];
+            if (dst_offsets.size() != src_offsets.size() ||
+                dst_offsets.size() != sizes.size()) {
+                continue;
+            }
             auto &metadata_result = metadata_for(keys[j]);
             if (!metadata_result) {
                 std::fill(range_results.begin(), range_results.end(),
@@ -3572,10 +3576,6 @@ RealClient::get_into_ranges_internal(
                 continue;
             }
 
-            if (dst_offsets.size() != src_offsets.size() ||
-                dst_offsets.size() != sizes.size()) {
-                continue;
-            }
             for (size_t k = 0; k < range_results.size(); ++k) {
                 const size_t dst_offset = dst_offsets[k];
                 if (dst_offset > capacities[i] ||
