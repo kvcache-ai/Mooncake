@@ -204,6 +204,17 @@ int tent_register_memory_batch_ex(tent_engine_t engine, void** addrs,
 int tent_task_status_list(tent_engine_t engine, tent_batch_id_t batch_id,
                           tent_status_t* statuses, size_t* count);
 
+struct tent_nic_load_stat {
+    char device_name[64];
+    uint64_t inflight_bytes;
+    double ewma_bandwidth_bps;
+};
+
+typedef struct tent_nic_load_stat tent_nic_load_stat_t;
+
+int tent_get_nic_load_stats(tent_engine_t engine, tent_nic_load_stat_t* stats,
+                            size_t* count);
+
 #ifdef __cplusplus
 }
 #endif  // __cplusplus
@@ -328,6 +339,8 @@ class TransferEngine {
     // wait for completion must invoke it in a loop. PENDING means "make
     // progress later"; terminal states (COMPLETED/FAILED) will not be revived.
     Status progressBatch(BatchID batch_id, TransferStatus& overall_status);
+
+    Status getNicLoadStats(std::vector<NicLoadStats>& stats) const;
 
    private:
     std::unique_ptr<TransferEngineImpl> impl_;
