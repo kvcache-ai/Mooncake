@@ -80,7 +80,7 @@ class OpLogManager {
 
     // Persist an already-allocated entry to the store using its sequence_id.
     // Does NOT modify sequence counters.
-    ErrorCode PersistEntry(const OpLogEntry& entry) const;
+    ErrorCode PersistEntry(const OpLogEntry& entry, bool sync = true) const;
 
     // Append a new entry and durably persist it to the store (if OpLogStore is
     // set).
@@ -96,7 +96,7 @@ class OpLogManager {
     //   entry (sequence_id fixed and "smaller" than later entries).
     tl::expected<uint64_t, ErrorCode> AppendAndPersist(
         OpType type, const std::string& key,
-        const std::string& payload = std::string());
+        const std::string& payload = std::string(), bool sync = true);
 
     // Get the latest assigned sequence id. Returns 0 if no entry exists.
     uint64_t GetLastSequenceId() const;

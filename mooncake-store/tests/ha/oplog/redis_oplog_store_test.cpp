@@ -2,8 +2,10 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdlib>
 #include <string>
+#include <thread>
 
 #include <unistd.h>
 #include <hiredis/hiredis.h>
@@ -172,9 +174,9 @@ TEST_F(RedisOpLogStoreTest, WriteReadAndLatestSequence) {
 
 TEST_F(RedisOpLogStoreTest, ReadSinceReturnsOrderedEntries) {
     auto writer = CreateWriter();
-    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(3), true));
     ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(1), true));
     ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(2), true));
+    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(3), true));
 
     std::vector<OpLogEntry> entries;
     ASSERT_EQ(ErrorCode::OK, writer->ReadOpLogSince(1, 10, entries));
@@ -186,9 +188,10 @@ TEST_F(RedisOpLogStoreTest, ReadSinceReturnsOrderedEntries) {
 TEST_F(RedisOpLogStoreTest, ReadSinceKeepsUint64Ordering) {
     auto writer = CreateWriter();
     constexpr uint64_t kBase = 9007199254740993ULL;
-    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(kBase + 2), true));
+    ASSERT_EQ(ErrorCode::OK, writer->UpdateLatestSequenceId(kBase - 1));
     ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(kBase), true));
     ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(kBase + 1), true));
+    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(kBase + 2), true));
 
     std::vector<OpLogEntry> entries;
     ASSERT_EQ(ErrorCode::OK, writer->ReadOpLogSince(kBase, 10, entries));
@@ -205,15 +208,67 @@ TEST_F(RedisOpLogStoreTest, ReadSinceKeepsUint64Ordering) {
     EXPECT_EQ(kBase + 2, max_sequence_id);
 }
 
-TEST_F(RedisOpLogStoreTest, RewriteDifferentPayloadFails) {
+TEST_F(RedisOpLogStoreTest, AsyncWriteEventuallyAdvancesLatest) {
+    auto writer = CreateWriter();
+    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(1), false));
+    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(2), false));
+
+    uint64_t latest = 0;
+    for (int i = 0; i < 100; ++i) {
+        ASSERT_EQ(ErrorCode::OK, writer->GetLatestSequenceId(latest));
+        if (latest == 2) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(2u, latest);
+
+    std::vector<OpLogEntry> entries;
+    ASSERT_EQ(ErrorCode::OK, writer->ReadOpLogSince(0, 10, entries));
+    ASSERT_EQ(2u, entries.size());
+    EXPECT_EQ(1u, entries[0].sequence_id);
+    EXPECT_EQ(2u, entries[1].sequence_id);
+}
+
+TEST_F(RedisOpLogStoreTest, ReadSinceHonorsCommittedLatest) {
+    auto writer = CreateWriter();
+    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(1), true));
+    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(2), true));
+    ASSERT_EQ(ErrorCode::OK, writer->UpdateLatestSequenceId(1));
+
+    std::vector<OpLogEntry> entries;
+    ASSERT_EQ(ErrorCode::OK, writer->ReadOpLogSince(0, 10, entries));
+    ASSERT_EQ(1u, entries.size());
+    EXPECT_EQ(1u, entries[0].sequence_id);
+}
+
+TEST_F(RedisOpLogStoreTest, AsyncWriteDoesNotAdvanceLatestPastGap) {
+    auto writer = CreateWriter();
+    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(2), false));
+
+    uint64_t latest = 0;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    ASSERT_EQ(ErrorCode::OK, writer->GetLatestSequenceId(latest));
+    EXPECT_EQ(0u, latest);
+
+    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(1), true));
+    ASSERT_EQ(ErrorCode::OK, writer->GetLatestSequenceId(latest));
+    EXPECT_EQ(2u, latest);
+}
+
+TEST_F(RedisOpLogStoreTest, RewriteExistingSequenceIsIdempotent) {
     auto writer = CreateWriter();
     auto entry = MakeEntry(1);
     ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(entry, true));
-    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(entry, true));
+    EXPECT_EQ(ErrorCode::OK, writer->WriteOpLog(entry, true));
 
     auto conflicting = entry;
     conflicting.payload = "different_payload";
     EXPECT_NE(ErrorCode::OK, writer->WriteOpLog(conflicting, true));
+
+    OpLogEntry stored;
+    ASSERT_EQ(ErrorCode::OK, writer->ReadOpLog(1, stored));
+    EXPECT_EQ(entry.payload, stored.payload);
 }
 
 TEST_F(RedisOpLogStoreTest, CleanupRemovesOldEntries) {
@@ -232,6 +287,10 @@ TEST_F(RedisOpLogStoreTest, CleanupRemovesOldEntries) {
     ASSERT_EQ(2u, entries.size());
     EXPECT_EQ(4u, entries[0].sequence_id);
     EXPECT_EQ(5u, entries[1].sequence_id);
+
+    uint64_t max_sequence_id = 0;
+    ASSERT_EQ(ErrorCode::OK, writer->GetMaxSequenceId(max_sequence_id));
+    EXPECT_EQ(5u, max_sequence_id);
 }
 
 TEST_F(RedisOpLogStoreTest, SnapshotSequenceRoundTrip) {
