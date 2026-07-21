@@ -1750,9 +1750,9 @@ def test_dataproto_field_schema_encodes_typed_ragged_non_tensor_field() -> None:
     )
     result = transfer.get_dataproto(ref)["non_tensor_batch"]["tokens"]
 
-    assert result[0] == [1, 2]
+    assert result[0].tolist() == [1, 2]
     assert result[1] is None
-    assert result[2] == [3]
+    assert result[2].tolist() == [3]
 
     bad_text = np.asarray([object()], dtype=object)
     with pytest.raises(AttributeError, match="failed to encode.*'text'.*utf8_ragged"):
@@ -2214,8 +2214,9 @@ def test_typed_ragged_single_ndarray_pack_reuses_source_memory() -> None:
     payload, metadata = sos._encode_typed_ragged_values([row])
 
     assert metadata["physical_layout"] == "contiguous_flat"
+    assert isinstance(payload["data"], sos._MultiBufferPayload)
     assert payload["data"].shape == (8,)
-    assert np.shares_memory(payload["data"], row)
+    assert np.shares_memory(payload["data"].owners[0], row)
 
 
 def test_typed_ragged_regular_ndarray_rows_pack_as_contiguous_block() -> None:
