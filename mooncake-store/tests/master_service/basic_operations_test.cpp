@@ -859,6 +859,8 @@ TEST_F(MasterServiceTest, ConcurrentWriteAndRemoveAll) {
     std::vector<std::thread> writers;
     for (int i = 0; i < num_threads; ++i) {
         writers.emplace_back([&, i]() {
+            std::mt19937 generator(static_cast<std::mt19937::result_type>(i));
+            std::uniform_int_distribution<int> distribution(0, 9);
             for (int j = 0; j < objects_per_thread; ++j) {
                 std::string key =
                     "key_" + std::to_string(i) + "_" + std::to_string(j);
@@ -879,7 +881,7 @@ TEST_F(MasterServiceTest, ConcurrentWriteAndRemoveAll) {
 
                 // Random sleep to increase concurrency complexity
                 std::this_thread::sleep_for(
-                    std::chrono::milliseconds(rand() % 10));
+                    std::chrono::milliseconds(distribution(generator)));
             }
         });
     }
@@ -950,7 +952,9 @@ TEST_F(MasterServiceTest, ConcurrentReadAndRemoveAll) {
     // Reader threads
     std::vector<std::thread> readers;
     for (int i = 0; i < 4; ++i) {
-        readers.emplace_back([&]() {
+        readers.emplace_back([&, i]() {
+            std::mt19937 generator(static_cast<std::mt19937::result_type>(i));
+            std::uniform_int_distribution<int> distribution(0, 4);
             for (int j = 0; j < num_objects; ++j) {
                 std::string key = "pre_key_" + std::to_string(j);
                 auto get_result = service_->GetReplicaList(key, "default");
@@ -960,7 +964,7 @@ TEST_F(MasterServiceTest, ConcurrentReadAndRemoveAll) {
 
                 // Random sleep to increase concurrency complexity
                 std::this_thread::sleep_for(
-                    std::chrono::milliseconds(rand() % 5));
+                    std::chrono::milliseconds(distribution(generator)));
             }
         });
     }

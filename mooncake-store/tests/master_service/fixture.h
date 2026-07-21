@@ -69,8 +69,12 @@ class ScopedEnvVar {
 class MasterServiceTest : public ::testing::Test {
    protected:
     void SetUp() override {
-        google::InitGoogleLogging("MasterServiceTest");
-        FLAGS_logtostderr = true;
+        static const bool glog_initialized = [] {
+            google::InitGoogleLogging("MasterServiceTest");
+            FLAGS_logtostderr = true;
+            return true;
+        }();
+        (void)glog_initialized;
     }
 
     struct MountedSegmentContext {
@@ -320,7 +324,6 @@ class MasterServiceTest : public ::testing::Test {
             std::error_code ec;
             std::filesystem::remove(path, ec);
         }
-        google::ShutdownGoogleLogging();
     }
 };
 
