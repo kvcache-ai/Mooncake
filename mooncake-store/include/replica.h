@@ -240,12 +240,12 @@ class Replica {
         MasterMetricManager::instance().inc_allocated_file_size(object_size);
     }
 
-    // External callers do not know the current segment generation. AddReplica
-    // binds it before storing the replica, so unbound replicas fail closed.
+    // AddReplica replaces this compatibility lifetime with the current
+    // segment generation before storing the replica.
     Replica(UUID client_id, uint64_t object_size,
             std::string transport_endpoint, ReplicaStatus status)
         : Replica(client_id, object_size, std::move(transport_endpoint),
-                  SegmentLifetime::Unavailable(), status) {}
+                  SegmentLifetime::Available(), status) {}
 
     Replica(UUID client_id, uint64_t object_size,
             std::string transport_endpoint, SegmentLifetime segment_lifetime,

@@ -171,10 +171,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
       nof_eviction_ratio_(config.nof_eviction_ratio),
       nof_eviction_high_watermark_ratio_(
           config.nof_eviction_high_watermark_ratio),
-      replica_cleanup_worker_([this] {
-          std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
-          SweepUnavailableReplicas();
-      }),
+      replica_cleanup_worker_([this] { SweepUnavailableReplicas(); }),
       view_version_(config.view_version),
       client_live_ttl_sec_(config.client_live_ttl_sec),
       nof_heartbeat_interval_sec_(
@@ -5884,17 +5881,16 @@ auto MasterService::MountLocalDiskSegment(const UUID& client_id,
     auto err =
         segment_access.MountLocalDiskSegment(client_id, enable_offloading);
     if (err == ErrorCode::SEGMENT_ALREADY_EXISTS) {
-        // Keep the mount idempotent, but still refresh ClientMonitor below.
-        // This is required after snapshot restore, where the segment already
-        // exists before the client reconnects.
+        // Return OK because this is an idempotent operation
+        return {};
     } else if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);
     }
 
     // Notify the client monitor thread to start tracking this client's TTL.
     // Without this, a client that only mounts a LOCAL_DISK segment (and
-    // doesn't ping) never enters ClientMonitor, so its LOCAL_DISK replicas
-    // would remain available after the client disconnects.
+    // doesn't ping) would be considered expired by ClientMonitorFunc, which
+    // would then clear all its LOCAL_DISK replicas.
     PodUUID pod_client_id;
     pod_client_id.first = client_id.first;
     pod_client_id.second = client_id.second;
@@ -7675,26 +7671,6 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
         } else {
             LOG(ERROR) << "[Restore] Failed to get all segments, error: "
                        << err;
-        }
-    }
-
-    // LOCAL_DISK-only clients are absent from GetAllSegments(). Start their
-    // restored lifetime grace period too, so ClientMonitor invalidates them if
-    // they do not reconnect after restore.
-    {
-        std::vector<UUID> local_disk_clients;
-        {
-            ScopedLocalDiskSegmentAccess local_disk_access =
-                segment_manager_.getLocalDiskSegmentAccess();
-            const auto& segments =
-                local_disk_access.getClientLocalDiskSegment();
-            local_disk_clients.reserve(segments.size());
-            for (const auto& entry : segments) {
-                local_disk_clients.push_back(entry.first);
-            }
-        }
-        for (const auto& client_id : local_disk_clients) {
-            Ping(client_id);
         }
     }
 
