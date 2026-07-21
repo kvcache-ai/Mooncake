@@ -22,6 +22,7 @@ OpLogApplier::OpLogApplier(MetadataStore* metadata_store,
     if (metadata_store_ == nullptr) {
         LOG(FATAL) << "OpLogApplier: metadata_store cannot be null";
     }
+    HAMetricManager::instance().set_standby_degraded(0);
     if (!NormalizeAndValidateClusterId(cluster_id_)) {
         LOG(FATAL) << "Invalid cluster_id for OpLogApplier: '" << cluster_id_
                    << "'. Allowed chars: [A-Za-z0-9_.-], max_len=128.";
@@ -116,6 +117,8 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
         }
 
         pending_entries_[entry.sequence_id] = entry;
+        HAMetricManager::instance().set_oplog_pending_entries(
+            static_cast<int64_t>(pending_entries_.size()));
         VLOG(1) << "OpLogApplier: future entry buffered, sequence_id="
                 << entry.sequence_id << ", expected=" << expected
                 << ", key=" << entry.object_key
@@ -175,6 +178,7 @@ std::string OpLogApplier::GetFailureReason() const {
 bool OpLogApplier::HandleApplyFailure(const OpLogEntry& entry,
                                       const char* reason) {
     if (IsBestEffortOpLogEntry(entry)) {
+        HAMetricManager::instance().inc_oplog_best_effort_apply_skipped();
         LOG(ERROR) << "OpLogApplier: skipping best-effort entry after apply "
                       "failure"
                    << ", sequence_id=" << entry.sequence_id
@@ -201,6 +205,8 @@ bool OpLogApplier::HandleApplyFailure(const OpLogEntry& entry,
     failed_op_type_.store(static_cast<int>(entry.op_type));
     failed_sequence_id_.store(entry.sequence_id);
     healthy_.store(false);
+    HAMetricManager::instance().inc_oplog_apply_failures();
+    HAMetricManager::instance().set_standby_degraded(1);
     LOG(ERROR) << "OpLogApplier: critical apply failure"
                << ", sequence_id=" << entry.sequence_id
                << ", op_type=" << static_cast<int>(entry.op_type)
@@ -353,6 +359,8 @@ size_t OpLogApplier::ProcessPendingEntries() {
         // Apply outside lock.
         if (!ApplyOpLogEntryInternal(entry_copy)) {
             if (IsBestEffortOpLogEntry(entry_copy)) {
+                HAMetricManager::instance()
+                    .inc_oplog_best_effort_apply_skipped();
                 LOG(ERROR)
                     << "OpLogApplier: skipping failed best-effort pending entry"
                     << ", sequence_id=" << entry_copy.sequence_id

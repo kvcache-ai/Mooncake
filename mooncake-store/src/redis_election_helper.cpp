@@ -8,6 +8,8 @@
 #include <cstring>
 #include <json/json.h>
 
+#include "ha_metric_manager.h"
+
 namespace mooncake {
 
 // ============================================================
@@ -123,13 +125,16 @@ ErrorCode RedisElectionHelper::Connect() {
 
 void RedisElectionHelper::ElectLeader(const std::string& master_address,
                                       ViewVersionId& version, int& lease_id) {
+    const auto election_start = std::chrono::steady_clock::now();
     while (!cancel_election_) {
+        HAMetricManager::instance().inc_election_attempts();
         bool connected = false;
         {
             std::lock_guard<std::mutex> lock(election_mutex_);
             if (!election_ctx_) {
                 election_ctx_ = CreateConnection();
                 if (!election_ctx_) {
+                    HAMetricManager::instance().inc_election_failures();
                     LOG(ERROR) << "ElectLeader: connect failed, retry in 1s";
                 }
             }
@@ -150,6 +155,7 @@ void RedisElectionHelper::ElectLeader(const std::string& master_address,
         }
 
         if (!reply) {
+            HAMetricManager::instance().inc_election_failures();
             LOG(ERROR)
                 << "ElectLeader: GET failed (connection error), retry in 1s";
             {
@@ -170,6 +176,11 @@ void RedisElectionHelper::ElectLeader(const std::string& master_address,
                 elected = TryElectOnce(master_address, version);
             }
             if (elected) {
+                HAMetricManager::instance().set_election_is_leader(1);
+                HAMetricManager::instance().observe_election_duration_ms(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - election_start)
+                        .count());
                 lease_id = next_lease_id_++;
                 LOG(INFO) << "ElectLeader: elected as leader, epoch=" << version
                           << " lease_id=" << lease_id;
@@ -203,6 +214,7 @@ void RedisElectionHelper::ElectLeader(const std::string& master_address,
         int reply_type = reply->type;
         reply.reset();
         LOG(ERROR) << "ElectLeader: unexpected reply type=" << reply_type;
+        HAMetricManager::instance().inc_election_failures();
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 }
@@ -216,6 +228,7 @@ bool RedisElectionHelper::TryElectOnce(const std::string& master_address,
                                                   master_epoch_key_.size()));
 
     if (!reply || reply->type != REDIS_REPLY_INTEGER) {
+        HAMetricManager::instance().inc_election_failures();
         LOG(ERROR) << "TryElectOnce: INCR failed";
         return false;
     }
@@ -232,6 +245,7 @@ bool RedisElectionHelper::TryElectOnce(const std::string& master_address,
         master_view_key_.size(), value.data(), value.size(), ttl_sec_));
 
     if (!reply) {
+        HAMetricManager::instance().inc_election_failures();
         LOG(ERROR) << "TryElectOnce: SET NX EX failed (connection error)";
         our_value_.clear();
         return false;
@@ -268,6 +282,8 @@ void RedisElectionHelper::WatchLeader() {
     }
 
     // Slow path (fallback): pure polling — use a separate connection
+    HAMetricManager::instance().inc_election_watch_failures();
+    HAMetricManager::instance().inc_election_polling_fallbacks();
     WatchLeaderPolling();
 }
 
@@ -512,6 +528,7 @@ void RedisElectionHelper::KeepLeader(int lease_id) {
         }
 
         if (!renewed) {
+            HAMetricManager::instance().inc_election_leadership_lost();
             break;  // Lost leadership
         }
 
@@ -520,6 +537,7 @@ void RedisElectionHelper::KeepLeader(int lease_id) {
     }
 
     keep_alive_running_ = false;
+    HAMetricManager::instance().set_election_is_leader(0);
     LOG(INFO) << "KeepLeader: exited renewal loop";
 }
 
@@ -599,6 +617,7 @@ bool RedisElectionHelper::Reconnect(redisContext*& ctx) {
     }
 
     LOG(INFO) << "Reconnect: successfully reconnected to Redis";
+    HAMetricManager::instance().inc_election_reconnects();
     return true;
 }
 

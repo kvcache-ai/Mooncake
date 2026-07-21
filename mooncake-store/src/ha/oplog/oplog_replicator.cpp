@@ -2,7 +2,10 @@
 
 #include <glog/logging.h>
 
+#include <algorithm>
+
 #include "ha/oplog/oplog_applier.h"
+#include "ha_metric_manager.h"
 
 namespace mooncake {
 
@@ -53,6 +56,11 @@ bool OpLogReplicator::StartFromSequenceId(uint64_t start_seq_id) {
             const uint64_t expected = applier_->GetExpectedSequenceId();
             if (expected > 0) {
                 AdvanceLastProcessedSequenceId(expected - 1);
+                const int64_t latest =
+                    HAMetricManager::instance().get_oplog_last_sequence_id();
+                const int64_t applied = static_cast<int64_t>(expected - 1);
+                HAMetricManager::instance().set_oplog_standby_lag(
+                    std::max<int64_t>(0, latest - applied));
             }
         };
 

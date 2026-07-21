@@ -44,9 +44,9 @@ TEST_F(HAMetricManagerTest, TestSetOpLogPendingEntries) {
     EXPECT_EQ(7, M().get_oplog_pending_entries());
 }
 
-TEST_F(HAMetricManagerTest, TestSetPendingMutationQueueSize) {
-    M().set_pending_mutation_queue_size(5);
-    EXPECT_EQ(5, M().get_pending_mutation_queue_size());
+TEST_F(HAMetricManagerTest, TestSetOpLogAsyncQueueSize) {
+    M().set_oplog_async_queue_size(5);
+    EXPECT_EQ(5, M().get_oplog_async_queue_size());
 }
 
 TEST_F(HAMetricManagerTest, TestIncOpLogSkippedEntries) {
@@ -72,15 +72,15 @@ TEST_F(HAMetricManagerTest, TestIncGapResolveCounters) {
     EXPECT_EQ(before_success + 1, M().get_oplog_gap_resolve_success_total());
 }
 
-TEST_F(HAMetricManagerTest, TestIncOpLogEtcdWriteFailuresAndRetries) {
-    auto before_failures = M().get_oplog_etcd_write_failures_total();
-    auto before_retries = M().get_oplog_etcd_write_retries_total();
+TEST_F(HAMetricManagerTest, TestIncOpLogWriteFailuresAndRetries) {
+    auto before_failures = M().get_oplog_write_failures_total();
+    auto before_retries = M().get_oplog_write_retries_total();
 
-    M().inc_oplog_etcd_write_failures(4);
-    M().inc_oplog_etcd_write_retries(5);
+    M().inc_oplog_write_failures(4);
+    M().inc_oplog_write_retries(5);
 
-    EXPECT_EQ(before_failures + 4, M().get_oplog_etcd_write_failures_total());
-    EXPECT_EQ(before_retries + 5, M().get_oplog_etcd_write_retries_total());
+    EXPECT_EQ(before_failures + 4, M().get_oplog_write_failures_total());
+    EXPECT_EQ(before_retries + 5, M().get_oplog_write_retries_total());
 }
 
 TEST_F(HAMetricManagerTest, TestIncWatchDisconnectionsAndAppliedEntries) {
@@ -94,10 +94,10 @@ TEST_F(HAMetricManagerTest, TestIncWatchDisconnectionsAndAppliedEntries) {
     EXPECT_EQ(before_applied + 10, M().get_oplog_applied_entries_total());
 }
 
-TEST_F(HAMetricManagerTest, TestRecordOpLogEtcdWriteLatency) {
+TEST_F(HAMetricManagerTest, TestRecordOpLogWriteLatency) {
     // Call histogram observe functions, mainly to ensure they do not crash
-    M().observe_oplog_etcd_write_latency_us(100);
-    M().observe_oplog_etcd_write_latency_us(5000);
+    M().observe_oplog_write_latency_us(100);
+    M().observe_oplog_write_latency_us(5000);
     SUCCEED();
 }
 
@@ -113,6 +113,10 @@ TEST_F(HAMetricManagerTest, TestSerializeMetrics) {
     M().set_oplog_last_sequence_id(1);
     M().set_oplog_applied_sequence_id(1);
     M().set_oplog_standby_lag(0);
+    M().inc_election_attempts();
+    M().inc_oplog_best_effort_dropped();
+    M().inc_promotion_skipped_replicas();
+    M().inc_oplog_sync_batch_commits();
 
     std::string text = M().serialize_metrics();
     EXPECT_FALSE(text.empty());
@@ -121,6 +125,74 @@ TEST_F(HAMetricManagerTest, TestSerializeMetrics) {
     EXPECT_NE(std::string::npos, text.find("ha_oplog_last_sequence_id"));
     EXPECT_NE(std::string::npos, text.find("ha_oplog_applied_sequence_id"));
     EXPECT_NE(std::string::npos, text.find("ha_oplog_standby_lag"));
+    EXPECT_NE(std::string::npos, text.find("ha_election_attempts_total"));
+    EXPECT_NE(std::string::npos,
+              text.find("ha_oplog_best_effort_dropped_total"));
+    EXPECT_NE(std::string::npos,
+              text.find("ha_promotion_skipped_replicas_total"));
+    EXPECT_NE(std::string::npos,
+              text.find("ha_oplog_sync_batch_commits_total"));
+    EXPECT_EQ(std::string::npos, text.find("ha_oplog_etcd_write"));
+}
+
+TEST_F(HAMetricManagerTest, TestHaFailureMetricsAreExported) {
+    M().set_election_is_leader(1);
+    M().set_oplog_async_workers_running(1);
+    M().set_standby_degraded(1);
+    M().set_primary_degraded(1);
+    M().set_oplog_last_successful_poll_timestamp_ms(12345);
+    M().observe_election_duration_ms(10);
+    M().inc_election_attempts();
+    M().inc_election_failures();
+    M().inc_election_leadership_lost();
+    M().inc_election_reconnects();
+    M().inc_election_watch_failures();
+    M().inc_election_polling_fallbacks();
+    M().inc_oplog_write_failures();
+    M().inc_oplog_write_retries();
+    M().inc_oplog_queue_rejected();
+    M().inc_oplog_queue_bypassed();
+    M().inc_oplog_sync_wait_timeouts();
+    M().inc_oplog_read_failures();
+    M().inc_oplog_apply_failures();
+    M().inc_oplog_best_effort_apply_skipped();
+    M().inc_oplog_confirmed_holes();
+    M().inc_force_promotions();
+    M().inc_promotion_catchup_incomplete();
+    M().inc_promotion_restore_failures();
+    M().inc_promotion_skipped_replicas();
+    M().inc_promotion_skipped_objects();
+
+    const std::string text = M().serialize_metrics();
+    for (const char* name : {
+             "ha_election_is_leader",
+             "ha_oplog_async_workers_running",
+             "ha_standby_degraded",
+             "ha_primary_degraded",
+             "ha_oplog_last_successful_poll_timestamp_ms",
+             "ha_election_failures_total",
+             "ha_election_leadership_lost_total",
+             "ha_election_reconnects_total",
+             "ha_election_watch_failures_total",
+             "ha_election_polling_fallbacks_total",
+             "ha_oplog_write_failures_total",
+             "ha_oplog_write_retries_total",
+             "ha_oplog_queue_rejected_total",
+             "ha_oplog_queue_bypassed_total",
+             "ha_oplog_sync_wait_timeouts_total",
+             "ha_oplog_read_failures_total",
+             "ha_oplog_apply_failures_total",
+             "ha_oplog_best_effort_apply_skipped_total",
+             "ha_oplog_confirmed_holes_total",
+             "ha_force_promotions_total",
+             "ha_promotion_catchup_incomplete_total",
+             "ha_election_duration_ms",
+             "ha_promotion_restore_failures_total",
+             "ha_promotion_skipped_replicas_total",
+             "ha_promotion_skipped_objects_total",
+         }) {
+        EXPECT_NE(std::string::npos, text.find(name)) << name;
+    }
 }
 
 TEST_F(HAMetricManagerTest, TestGetSummaryString) {

@@ -2,6 +2,8 @@
 
 #include <glog/logging.h>
 
+#include "ha_metric_manager.h"
+
 namespace mooncake {
 
 PollingOpLogChangeNotifier::PollingOpLogChangeNotifier(OpLogStore* store,
@@ -52,6 +54,15 @@ void PollingOpLogChangeNotifier::PollLoop() {
         if (err == ErrorCode::OK) {
             missing_sequence_ids = FindMissingSequenceIds(
                 last_seq, entries, progress.last_scanned_sequence_id);
+            HAMetricManager::instance()
+                .set_oplog_last_successful_poll_timestamp_ms(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch())
+                        .count());
+            if (!missing_sequence_ids.empty()) {
+                HAMetricManager::instance().inc_oplog_confirmed_holes(
+                    static_cast<int64_t>(missing_sequence_ids.size()));
+            }
         }
 
         if (err == ErrorCode::OK && !entries.empty()) {
@@ -67,6 +78,7 @@ void PollingOpLogChangeNotifier::PollLoop() {
             // Data available — poll again immediately to drain backlog
             continue;
         } else if (err != ErrorCode::OK) {
+            HAMetricManager::instance().inc_oplog_read_failures();
             if (on_error_) {
                 on_error_(err);
             }

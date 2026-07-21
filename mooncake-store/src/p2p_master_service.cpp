@@ -7,6 +7,7 @@
 #include "ha/oplog/p2p_oplog_types.h"
 #include "ha/oplog/oplog_store_factory.h"
 #include "p2p_client_meta.h"
+#include "ha_metric_manager.h"
 
 namespace mooncake {
 
@@ -666,6 +667,7 @@ ErrorCode P2PMasterService::RestoreFromStandbyMetadata(
     const P2PStandbyMetadataStore::ExportedMetadata& metadata,
     uint64_t last_applied_sequence_id) {
     if (GetKeyCount() != 0 || !client_manager_->GetAllClients().empty()) {
+        HAMetricManager::instance().inc_promotion_restore_failures();
         LOG(ERROR) << "RestoreFromStandbyMetadata: target service is not empty"
                    << ", existing_keys=" << GetKeyCount()
                    << ", existing_clients="
@@ -689,6 +691,7 @@ ErrorCode P2PMasterService::RestoreFromStandbyMetadata(
     size_t restored_objects = 0;
     size_t restored_replicas = 0;
     size_t skipped_replicas = 0;
+    size_t skipped_objects = 0;
 
     for (const auto& [client_id, client_info] : metadata.clients) {
         RegisterClientRequest req;
@@ -700,6 +703,7 @@ ErrorCode P2PMasterService::RestoreFromStandbyMetadata(
 
         auto result = MasterService::RegisterClient(req);
         if (!result.has_value()) {
+            HAMetricManager::instance().inc_promotion_restore_failures();
             LOG(ERROR) << "RestoreFromStandbyMetadata: failed to restore client"
                        << ", client_id=" << client_id
                        << ", error=" << toString(result.error());
@@ -770,6 +774,7 @@ ErrorCode P2PMasterService::RestoreFromStandbyMetadata(
                 << "RestoreFromStandbyMetadata: skip object with no restorable "
                    "replicas"
                 << ", key=" << key;
+            ++skipped_objects;
             continue;
         }
 
@@ -779,6 +784,7 @@ ErrorCode P2PMasterService::RestoreFromStandbyMetadata(
                                                          std::move(replicas));
         auto [it, inserted] = shard.metadata.emplace(key, std::move(new_meta));
         if (!inserted) {
+            HAMetricManager::instance().inc_promotion_restore_failures();
             LOG(ERROR)
                 << "RestoreFromStandbyMetadata: object already exists despite "
                    "empty-target check"
@@ -794,11 +800,20 @@ ErrorCode P2PMasterService::RestoreFromStandbyMetadata(
         ++restored_objects;
     }
 
+    if (skipped_replicas > 0 || skipped_objects > 0) {
+        HAMetricManager::instance().set_primary_degraded(1);
+        HAMetricManager::instance().inc_promotion_skipped_replicas(
+            static_cast<int64_t>(skipped_replicas));
+        HAMetricManager::instance().inc_promotion_skipped_objects(
+            static_cast<int64_t>(skipped_objects));
+    }
+
     LOG(INFO) << "RestoreFromStandbyMetadata: restored"
               << ", clients=" << restored_clients
               << ", objects=" << restored_objects
               << ", replicas=" << restored_replicas
               << ", skipped_replicas=" << skipped_replicas
+              << ", skipped_objects=" << skipped_objects
               << ", last_applied_sequence_id=" << last_applied_sequence_id;
     return ErrorCode::OK;
 }
