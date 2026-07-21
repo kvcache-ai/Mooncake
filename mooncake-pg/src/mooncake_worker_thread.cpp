@@ -16,6 +16,13 @@ enum WorkerTaskStatus {
 
 static constexpr size_t kInvalidTaskId = static_cast<size_t>(-1);
 
+static void setActiveRanksTensorValue(TransferGroupMeta* group, int rank,
+                                      int value) {
+    if (group->activeRanksTensor.device().is_cpu()) {
+        group->activeRanksTensor[rank] = value;
+    }
+}
+
 void MooncakeWorker::Start() {
     bool expected = false;
     if (started_.compare_exchange_strong(expected, true)) {
@@ -195,28 +202,21 @@ void MooncakeWorker::startWorker() {
                             if (status.s != TransferStatusEnum::COMPLETED) {
                                 if (status.s == TransferStatusEnum::FAILED ||
                                     (j != group->rank &&
-                                     diff.count() >
-                                         *group->collectiveTimeoutUs &&
+                                     diff.count() > kPingTimeoutMicroseconds_ &&
                                      group->engine->probePeerAliveByID(
                                          group->segmentIDs[j]) !=
                                          PeerLiveness::Alive)) {
-                                    task.failedRanksHost[j] = 1;
-                                    if (group->autoDeactivateOnFailure) {
-                                        // Mark peer as disconnected so the
-                                        // connection poller reconnects it.
-                                        group->peerConnected[j] = false;
-                                        group->activeRanks[j] = false;
-                                        // Do NOT modify activeRanksTensor,
-                                        // It may be a CUDA tensor, and
-                                        // modifying it may trigger unintended
-                                        // synchronization.
+                                    LOG(ERROR)
+                                        << "Rank " << group->rank
+                                        << " marking peer " << j
+                                        << " as broken during transferring op "
+                                        << (int)task.opType;
 
-                                        LOG(ERROR) << "Rank " << group->rank
-                                                   << " marking peer " << j
-                                                   << " as broken during "
-                                                      "transferring op "
-                                                   << (int)task.opType;
-                                    }
+                                    // Set peerConnected to notify the
+                                    // connection poller to reconnect it.
+                                    group->peerConnected[j] = false;
+                                    group->activeRanks[j] = false;
+                                    setActiveRanksTensorValue(group, j, 0);
                                 } else {
                                     batch_done = false;
                                     break;
@@ -292,27 +292,27 @@ void MooncakeWorker::startWorker() {
                             status.s != TransferStatusEnum::COMPLETED) {
                             if (status.s == TransferStatusEnum::FAILED ||
                                 (j != group->rank &&
-                                 diff.count() > *group->collectiveTimeoutUs &&
+                                 diff.count() > kPingTimeoutMicroseconds_ &&
                                  group->engine->probePeerAliveByID(
                                      group->segmentIDs[j]) !=
                                      PeerLiveness::Alive)) {
-                                task.failedRanksHost[j] = 1;
-                                if (group->autoDeactivateOnFailure) {
-                                    group->peerConnected[j] = false;
-                                    group->activeRanks[j] = false;
-                                    LOG(ERROR)
-                                        << "Rank " << group->rank
-                                        << " marking peer " << j
-                                        << " as broken during syncing op "
-                                        << (int)task.opType;
-                                }
+                                LOG(ERROR) << "Rank " << group->rank
+                                           << " marking peer " << j
+                                           << " as broken during syncing op "
+                                           << (int)task.opType;
+
+                                // Set peerConnected to notify the
+                                // connection poller to reconnect it.
+                                group->peerConnected[j] = false;
+                                group->activeRanks[j] = false;
+                                setActiveRanksTensorValue(group, j, 0);
                             } else {
                                 task_done = false;
                                 break;
                             }
                         }
                     }
-                    if (diff.count() > *group->collectiveTimeoutUs) {
+                    if (diff.count() > kPingTimeoutMicroseconds_) {
                         // reset timer
                         activeTime[i] = clock::now();
                     }

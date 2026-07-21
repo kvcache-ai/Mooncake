@@ -122,7 +122,6 @@ def mooncake_backend_options(
     active_value: int = 0,
     is_extension: bool = False,
     max_world_size: int | None = None,
-    auto_deactivate_on_failure: bool = True,
 ) -> pg.MooncakeBackendOptions:
     device = torch.device(device_type)
     tensor_size = world_size if max_world_size is None else int(max_world_size)
@@ -132,12 +131,11 @@ def mooncake_backend_options(
         dtype=torch.int32,
         device=device,
     )
-    return pg.MooncakeBackendOptions(
-        active_ranks,
-        bool(is_extension),
-        tensor_size,
-        bool(auto_deactivate_on_failure),
-    )
+    if max_world_size is None:
+        if is_extension:
+            return pg.MooncakeBackendOptions(active_ranks, True)
+        return pg.MooncakeBackendOptions(active_ranks)
+    return pg.MooncakeBackendOptions(active_ranks, bool(is_extension), tensor_size)
 
 
 def mooncake_cpu_options(world_size: int) -> pg.MooncakeBackendOptions:
@@ -164,7 +162,6 @@ def init_mooncake_group(
     is_extension: bool = False,
     active_value: int | None = None,
     max_world_size: int | None = None,
-    auto_deactivate_on_failure: bool = True,
 ) -> torch.device:
     device = require_test_device(rank, device_type)
     configure_mooncake_device_filter(device_filters)
@@ -183,7 +180,6 @@ def init_mooncake_group(
             active_value=resolved_active_value,
             is_extension=is_extension,
             max_world_size=max_world_size,
-            auto_deactivate_on_failure=auto_deactivate_on_failure,
         )
     dist.init_process_group(**kwargs)
     return device
@@ -242,7 +238,6 @@ class MooncakePGWorkerContext:
         is_extension: bool = False,
         active_value: int | None = None,
         max_world_size: int | None = None,
-        auto_deactivate_on_failure: bool = True,
     ) -> torch.device:
         self._device = init_mooncake_group(
             self.proc_rank if rank is None else rank,
@@ -256,7 +251,6 @@ class MooncakePGWorkerContext:
             is_extension=is_extension,
             active_value=active_value,
             max_world_size=max_world_size,
-            auto_deactivate_on_failure=auto_deactivate_on_failure,
         )
         return self._device
 
