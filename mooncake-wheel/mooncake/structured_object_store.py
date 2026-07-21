@@ -1274,7 +1274,9 @@ class MooncakeBundleTransfer:
             field_updates[name] = StructuredFieldLocation(stage, member, "batch")
         encoded_updates: dict[str, Any] = {}
         for name, value in non_tensor_batch.items():
-            schema = field_schemas.get(name) if field_schemas else None
+            schema = _schema_for_section(
+                field_schemas, name, "non_tensor_batch"
+            )
             encoded: _EncodedStructuredLeaf | None = None
             if schema is not None:
                 try:
@@ -1696,6 +1698,20 @@ def _schema_section(name: str, schema: FieldSchema) -> str | None:
     return section
 
 
+def _schema_for_section(
+    field_schemas: Optional[Mapping[str, FieldSchema]],
+    name: str,
+    section: str,
+) -> FieldSchema | None:
+    if not field_schemas:
+        return None
+    schema = field_schemas.get(name)
+    if schema is None:
+        return None
+    declared = _schema_section(name, schema)
+    return schema if declared is None or declared == section else None
+
+
 def _schema_ndarray_dtype(
     schema: FieldSchema, *, required: bool = False
 ) -> np.dtype[Any] | None:
@@ -1723,23 +1739,27 @@ def _validate_dataproto_schema_sections(
 ) -> None:
     if not field_schemas:
         return
-    actual_sections = {
-        name: section
-        for section, fields in {
-            "batch": batch,
-            "non_tensor_batch": non_tensor_batch,
-            "meta_info": meta_info,
-        }.items()
-        for name in fields
+    sections = {
+        "batch": batch,
+        "non_tensor_batch": non_tensor_batch,
+        "meta_info": meta_info,
     }
+    actual_sections: dict[str, set[str]] = {}
+    for section, fields in sections.items():
+        for name in fields:
+            actual_sections.setdefault(name, set()).add(section)
     for name, schema in field_schemas.items():
         declared = _schema_section(name, schema)
+        if declared is None:
+            continue
         actual = actual_sections.get(name)
-        if declared is not None and actual is not None and actual != declared:
-            raise ValueError(
-                f"FieldSchema for {name!r} declares section {declared!r}, "
-                f"but data contains it in {actual!r}"
-            )
+        if not actual or declared in actual:
+            continue
+        actual_text = ", ".join(repr(section) for section in sorted(actual))
+        raise ValueError(
+            f"FieldSchema for {name!r} declares section {declared!r}, "
+            f"but data contains it in {actual_text}"
+        )
 
 def _coerce_schema_non_tensor_value(name: str, value: Any) -> np.ndarray:
     if isinstance(value, np.ndarray):

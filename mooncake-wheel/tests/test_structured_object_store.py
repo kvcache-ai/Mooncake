@@ -1581,6 +1581,15 @@ def test_dataproto_field_schema_encodes_typed_ragged_non_tensor_field() -> None:
     assert result[1] is None
     assert result[2] == [3]
 
+    bad_text = np.asarray([object()], dtype=object)
+    with pytest.raises(AttributeError, match="failed to encode.*'text'.*utf8_ragged"):
+        transfer.put_dataproto(
+            _schema_test_data("text", bad_text),
+            field_schemas={
+                "text": FieldSchema(codec="utf8_ragged")
+            },
+        )
+
 
 def test_dataproto_field_schema_validates_schema_errors() -> None:
     _store, transfer = make_transfer()
@@ -1634,6 +1643,51 @@ def test_dataproto_field_schema_validates_schema_errors() -> None:
         rows[:] = [row_value]
         with pytest.raises(error_type, match=message):
             transfer.put_dataproto(_schema_test_data("mm", rows), field_schemas=schema)
+
+
+def test_dataproto_field_schema_allows_same_named_meta_info() -> None:
+    _store, transfer = make_transfer()
+    values = np.asarray(["a", "b"], dtype=object)
+
+    ref = transfer.put_dataproto(
+        {
+            "batch": {"input_ids": np.arange(2)},
+            "non_tensor_batch": {"label": values},
+            "meta_info": {"label": "metadata-label"},
+        },
+        field_schemas={
+            "label": FieldSchema(
+                codec="utf8_ragged", metadata={"section": "non_tensor_batch"}
+            )
+        },
+    )
+
+    result = transfer.get_dataproto(ref)
+
+    assert result["non_tensor_batch"]["label"].tolist() == ["a", "b"]
+    assert result["meta_info"]["label"] == "metadata-label"
+
+
+def test_dataproto_field_schema_does_not_apply_meta_info_schema_to_non_tensor() -> None:
+    _store, transfer = make_transfer()
+    values = np.asarray([{"k": 1}, {"k": 2}], dtype=object)
+
+    ref = transfer.put_dataproto(
+        {
+            "batch": {"input_ids": np.arange(2)},
+            "non_tensor_batch": {"label": values},
+            "meta_info": {"label": "metadata-label"},
+        },
+        field_schemas={
+            "label": FieldSchema(
+                codec="utf8_ragged", metadata={"section": "meta_info"}
+            )
+        },
+    )
+
+    result = transfer.get_dataproto(ref)
+    assert result["non_tensor_batch"]["label"].tolist() == [{"k": 1}, {"k": 2}]
+    assert result["meta_info"]["label"] == "metadata-label"
 
 
 def test_dataproto_field_schema_encodes_ragged_tensor_dict() -> None:
