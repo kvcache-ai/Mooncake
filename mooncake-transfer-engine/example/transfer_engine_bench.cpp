@@ -47,7 +47,7 @@
     defined(USE_UBSHMEM) || defined(USE_SUNRISE)
 #include <cassert>
 
-#if defined(USE_MNNVL) || defined(USE_UBSHMEM)
+#if defined(USE_MNNVL) || defined(USE_MUSA) || defined(USE_UBSHMEM)
 #include "gpu_vendor/mnnvl.h"
 #endif
 
@@ -90,7 +90,7 @@ DEFINE_string(operation, "read", "Operation type: read or write");
 
 DEFINE_string(protocol, "rdma",
               "Transfer protocol: "
-              "rdma|barex|tcp|efa|nvlink|nvlink_intra|hip|sunrise_link");
+              "rdma|barex|tcp|efa|nvlink|musa|nvlink_intra|hip|sunrise_link");
 
 DEFINE_string(device_name, "mlx5_2",
               "Device name to use, valid if protocol=rdma");
@@ -139,13 +139,14 @@ static void* allocateMemoryPool(size_t size, int buffer_id,
         LOG(INFO) << "Allocating memory on GPU " << gpu_id;
         checkCudaError(cudaSetDevice(gpu_id), "Failed to set device");
 #endif
-        if (FLAGS_protocol == "nvlink" || FLAGS_protocol == "hip") {
-#ifdef USE_MNNVL
+        if (FLAGS_protocol == "nvlink" || FLAGS_protocol == "musa" ||
+            FLAGS_protocol == "hip") {
+#if defined(USE_MNNVL) || defined(USE_MUSA)
             d_buf = allocateFabricMemory(size);
-            LOG(INFO) << "Using MNNVL fabric memory allocation";
+            LOG(INFO) << "Using GPU fabric/IPC memory allocation";
 #else
-            LOG(ERROR)
-                << "--protocol=nvlink or --protocol=hip requires USE_MNNVL=ON";
+            LOG(ERROR) << "--protocol=nvlink/musa/hip requires USE_MNNVL=ON or "
+                          "USE_MUSA=ON";
             return nullptr;
 #endif
         } else if (FLAGS_protocol == "nvlink_intra") {
@@ -196,8 +197,9 @@ static void freeMemoryPool(void* addr, size_t size) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
     defined(USE_UBSHMEM) || defined(USE_SUNRISE)
-    if (FLAGS_protocol == "nvlink" || FLAGS_protocol == "hip") {
-#ifdef USE_MNNVL
+    if (FLAGS_protocol == "nvlink" || FLAGS_protocol == "musa" ||
+        FLAGS_protocol == "hip") {
+#if defined(USE_MNNVL) || defined(USE_MUSA)
         if (FLAGS_use_vram) {
             freeFabricMemory(addr);
             return;
@@ -511,7 +513,8 @@ static Transport* installTransportFromFlags(TransferEngine* engine) {
         engine->getLocalTopology()->discover({});
         xport = engine->installTransport("efa", nullptr);
     } else if (FLAGS_protocol == "tcp" || FLAGS_protocol == "nvlink" ||
-               FLAGS_protocol == "hip" || FLAGS_protocol == "nvlink_intra" ||
+               FLAGS_protocol == "musa" || FLAGS_protocol == "hip" ||
+               FLAGS_protocol == "nvlink_intra" ||
                FLAGS_protocol == "ubshmem" ||
                FLAGS_protocol == "sunrise_link") {
         xport = engine->installTransport(FLAGS_protocol.c_str(), nullptr);
