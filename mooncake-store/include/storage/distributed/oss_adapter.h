@@ -57,7 +57,8 @@ class OssFileSystemAdapter : public FileSystemAdapter {
         const std::string& method, const std::string& key,
         const std::map<std::string, std::string>& query = {},
         const char* body = nullptr, size_t body_size = 0,
-        const std::string& range = "") const;
+        const std::string& range = "", const iovec* upload_iov = nullptr,
+        int upload_iovcnt = 0) const;
     tl::expected<std::vector<FileInfo>, ErrorCode> ListFilesInternal(
         const std::string& dir) const;
 

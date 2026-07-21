@@ -59,6 +59,9 @@ TEST(OssFileSystemAdapterTest, ObjectLifecycleAndVectorIO) {
     EXPECT_EQ(std::string(read_left.data(), read_left.size()), "bc");
     EXPECT_EQ(std::string(read_right.data(), read_right.size()), "de");
 
+    EXPECT_EQ(*adapter.ReadFile(second_path, nullptr, 0), 0U);
+    EXPECT_EQ(*adapter.VectorReadFile(second_path, nullptr, 0, 0), 0U);
+
     auto files = adapter.ListFilesWithInfo("/mooncake-oss-adapter-test/00");
     ASSERT_TRUE(files);
     ASSERT_EQ(files->size(), 2U);

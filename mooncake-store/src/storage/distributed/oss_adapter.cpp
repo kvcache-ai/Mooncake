@@ -4,11 +4,12 @@
 #include <openssl/hmac.h>
 #include <openssl/sha.h>
 
+#include <boost/algorithm/string.hpp>
+
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <chrono>
-#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <limits>
@@ -17,39 +18,12 @@
 
 #include <glog/logging.h>
 
+#include "environ.h"
+
 namespace mooncake {
 namespace {
 
 std::once_flag curl_init_once;
-
-std::string GetEnv(const char* name, const char* fallback = nullptr) {
-    const char* value = std::getenv(name);
-    if ((!value || !*value) && fallback) value = std::getenv(fallback);
-    return value ? value : "";
-}
-
-bool GetEnvBool(const char* name, bool default_value) {
-    auto value = GetEnv(name);
-    std::transform(value.begin(), value.end(), value.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
-    if (value.empty()) return default_value;
-    return value == "1" || value == "true" || value == "yes" || value == "on";
-}
-
-std::string Trim(std::string value) {
-    auto not_space = [](unsigned char c) { return !std::isspace(c); };
-    value.erase(value.begin(),
-                std::find_if(value.begin(), value.end(), not_space));
-    value.erase(std::find_if(value.rbegin(), value.rend(), not_space).base(),
-                value.end());
-    return value;
-}
-
-std::string Lower(std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
-    return value;
-}
 
 std::string UriEncode(std::string_view value, bool preserve_slash = false) {
     static constexpr char hex[] = "0123456789ABCDEF";
@@ -187,11 +161,45 @@ size_t HeaderCallback(char* data, size_t size, size_t count, void* user_data) {
     std::string_view line(data, size * count);
     const size_t colon = line.find(':');
     if (colon != std::string_view::npos) {
-        std::string name = Lower(std::string(line.substr(0, colon)));
-        std::string value = Trim(std::string(line.substr(colon + 1)));
+        std::string name(line.substr(0, colon));
+        std::string value(line.substr(colon + 1));
+        boost::algorithm::to_lower(name);
+        boost::algorithm::trim(value);
         (*headers)[std::move(name)] = std::move(value);
     }
     return size * count;
+}
+
+struct IovecUploadContext {
+    const iovec* iov = nullptr;
+    int iovcnt = 0;
+    int index = 0;
+    size_t offset = 0;
+};
+
+size_t IovecUploadCallback(char* buffer, size_t size, size_t count,
+                           void* user_data) {
+    auto* context = static_cast<IovecUploadContext*>(user_data);
+    const size_t capacity = size * count;
+    size_t copied = 0;
+    while (copied < capacity && context->index < context->iovcnt) {
+        const iovec& current = context->iov[context->index];
+        const size_t available = current.iov_len - context->offset;
+        const size_t chunk = std::min(capacity - copied, available);
+        if (chunk > 0) {
+            std::memcpy(
+                buffer + copied,
+                static_cast<const char*>(current.iov_base) + context->offset,
+                chunk);
+        }
+        copied += chunk;
+        context->offset += chunk;
+        if (context->offset == current.iov_len) {
+            ++context->index;
+            context->offset = 0;
+        }
+    }
+    return copied;
 }
 
 bool IsSuccess(long status) { return status >= 200 && status < 300; }
@@ -202,16 +210,23 @@ OssFileSystemAdapter::~OssFileSystemAdapter() { Shutdown(); }
 
 tl::expected<void, ErrorCode> OssFileSystemAdapter::Init(
     const std::string& mount_path) {
-    endpoint_ = GetEnv("MOONCAKE_OSS_ENDPOINT", "OSS_ENDPOINT");
-    bucket_ = GetEnv("MOONCAKE_OSS_BUCKET", "OSS_BUCKET");
-    region_ = GetEnv("MOONCAKE_OSS_REGION", "OSS_REGION");
-    access_key_id_ = GetEnv("MOONCAKE_OSS_ACCESS_KEY_ID", "OSS_ACCESS_KEY_ID");
+    endpoint_ = Environ::GetString("MOONCAKE_OSS_ENDPOINT",
+                                   Environ::GetString("OSS_ENDPOINT", ""));
+    bucket_ = Environ::GetString("MOONCAKE_OSS_BUCKET",
+                                 Environ::GetString("OSS_BUCKET", ""));
+    region_ = Environ::GetString("MOONCAKE_OSS_REGION",
+                                 Environ::GetString("OSS_REGION", ""));
+    access_key_id_ =
+        Environ::GetString("MOONCAKE_OSS_ACCESS_KEY_ID",
+                           Environ::GetString("OSS_ACCESS_KEY_ID", ""));
     access_key_secret_ =
-        GetEnv("MOONCAKE_OSS_ACCESS_KEY_SECRET", "OSS_ACCESS_KEY_SECRET");
+        Environ::GetString("MOONCAKE_OSS_ACCESS_KEY_SECRET",
+                           Environ::GetString("OSS_ACCESS_KEY_SECRET", ""));
     security_token_ =
-        GetEnv("MOONCAKE_OSS_SECURITY_TOKEN", "OSS_SESSION_TOKEN");
-    path_style_ = GetEnvBool("MOONCAKE_OSS_PATH_STYLE", false);
-    anonymous_ = GetEnvBool("MOONCAKE_OSS_ANONYMOUS", false);
+        Environ::GetString("MOONCAKE_OSS_SECURITY_TOKEN",
+                           Environ::GetString("OSS_SESSION_TOKEN", ""));
+    path_style_ = Environ::GetBool("MOONCAKE_OSS_PATH_STYLE", false);
+    anonymous_ = Environ::GetBool("MOONCAKE_OSS_ANONYMOUS", false);
 
     while (!endpoint_.empty() && endpoint_.back() == '/') endpoint_.pop_back();
     mount_path_ = mount_path;
@@ -278,9 +293,13 @@ std::string OssFileSystemAdapter::BuildAuthorization(
     std::string canonical_headers = "x-oss-content-sha256:UNSIGNED-PAYLOAD\n";
     canonical_headers += "x-oss-date:" + timestamp + "\n";
     if (!security_token_.empty()) {
-        canonical_headers +=
-            "x-oss-security-token:" + Trim(security_token_) + "\n";
+        canonical_headers += "x-oss-security-token:" +
+                             boost::algorithm::trim_copy(security_token_) +
+                             "\n";
     }
+    // OSS V4 signs Content-Type, Content-MD5, and x-oss-* headers by
+    // default. AdditionalHeaders is therefore empty because this request
+    // does not sign any optional, non-default headers.
     const std::string canonical_request =
         method + "\n" + canonical_uri + "\n" + CanonicalQuery(query) + "\n" +
         canonical_headers + "\n\nUNSIGNED-PAYLOAD";
@@ -305,7 +324,8 @@ tl::expected<OssFileSystemAdapter::Response, ErrorCode>
 OssFileSystemAdapter::Request(const std::string& method, const std::string& key,
                               const std::map<std::string, std::string>& query,
                               const char* body, size_t body_size,
-                              const std::string& range) const {
+                              const std::string& range, const iovec* upload_iov,
+                              int upload_iovcnt) const {
     if (!initialized_) {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
@@ -313,6 +333,7 @@ OssFileSystemAdapter::Request(const std::string& method, const std::string& key,
     CURL* curl = curl_easy_init();
     if (!curl) return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
     Response response;
+    IovecUploadContext upload_context;
     curl_slist* headers = nullptr;
     auto add_header = [&](const std::string& header) {
         headers = curl_slist_append(headers, header.c_str());
@@ -343,9 +364,18 @@ OssFileSystemAdapter::Request(const std::string& method, const std::string& key,
     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 120000L);
     if (method == "HEAD") curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
     if (method == "PUT") {
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body ? body : "");
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE,
-                         static_cast<curl_off_t>(body_size));
+        if (upload_iov) {
+            upload_context = {upload_iov, upload_iovcnt};
+            curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
+            curl_easy_setopt(curl, CURLOPT_READFUNCTION, IovecUploadCallback);
+            curl_easy_setopt(curl, CURLOPT_READDATA, &upload_context);
+            curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE,
+                             static_cast<curl_off_t>(body_size));
+        } else {
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body ? body : "");
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE,
+                             static_cast<curl_off_t>(body_size));
+        }
     }
 
     const CURLcode result = curl_easy_perform(curl);
@@ -376,9 +406,9 @@ tl::expected<size_t, ErrorCode> OssFileSystemAdapter::WriteFile(
 
 tl::expected<size_t, ErrorCode> OssFileSystemAdapter::ReadFile(
     const std::string& path, void* buf, size_t len) {
-    if (!buf && len > 0) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    std::string range;
-    if (len > 0) range = "bytes=0-" + std::to_string(len - 1);
+    if (len == 0) return 0;
+    if (!buf) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    const std::string range = "bytes=0-" + std::to_string(len - 1);
     auto response = Request("GET", PathToKey(path), {}, nullptr, 0, range);
     if (!response) return tl::make_unexpected(response.error());
     if (response->status == 404)
@@ -400,15 +430,13 @@ tl::expected<size_t, ErrorCode> OssFileSystemAdapter::VectorWriteFile(
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         total += iov[i].iov_len;
     }
-    std::string data;
-    data.reserve(total);
-    for (int i = 0; i < iovcnt; ++i) {
-        if (iov[i].iov_len > 0) {
-            data.append(static_cast<const char*>(iov[i].iov_base),
-                        iov[i].iov_len);
-        }
-    }
-    return WriteFile(path, std::span<const char>(data.data(), data.size()));
+    if (total == 0) return WriteFile(path, {});
+    auto response =
+        Request("PUT", PathToKey(path), {}, nullptr, total, "", iov, iovcnt);
+    if (!response) return tl::make_unexpected(response.error());
+    if (!IsSuccess(response->status))
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    return total;
 }
 
 tl::expected<size_t, ErrorCode> OssFileSystemAdapter::VectorReadFile(
@@ -422,11 +450,10 @@ tl::expected<size_t, ErrorCode> OssFileSystemAdapter::VectorReadFile(
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         total += iov[i].iov_len;
     }
-    std::string range;
-    if (total > 0) {
-        range = "bytes=" + std::to_string(offset) + "-" +
-                std::to_string(static_cast<uint64_t>(offset) + total - 1);
-    }
+    if (total == 0) return 0;
+    const std::string range =
+        "bytes=" + std::to_string(offset) + "-" +
+        std::to_string(static_cast<uint64_t>(offset) + total - 1);
     auto response = Request("GET", PathToKey(path), {}, nullptr, 0, range);
     if (!response) return tl::make_unexpected(response.error());
     if (response->status == 404)
@@ -522,8 +549,8 @@ OssFileSystemAdapter::ListFilesInternal(const std::string& dir) const {
             pos = end + 11;
         }
         token = UriDecode(XmlValue(response->body, "NextContinuationToken"));
-        const std::string truncated =
-            Lower(XmlValue(response->body, "IsTruncated"));
+        const std::string truncated = boost::algorithm::to_lower_copy(
+            XmlValue(response->body, "IsTruncated"));
         if (truncated != "true") token.clear();
         if (truncated == "true" && token.empty())
             return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
