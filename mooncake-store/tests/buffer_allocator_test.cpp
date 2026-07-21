@@ -337,8 +337,7 @@ TEST_F(BufferAllocatorTest, CachelibImportRejectsChunkInSlabTail) {
     constexpr uintptr_t kBase = 0x1E0000000ULL;
     constexpr size_t kCapacity = 2 * facebook::cachelib::Slab::kSize;
     constexpr uint32_t kAllocSize = facebook::cachelib::Slab::kSize - 16;
-    const size_t header_size =
-        sizeof(facebook::cachelib::SlabHeader) * 2 + 1;
+    const size_t header_size = sizeof(facebook::cachelib::SlabHeader) * 2 + 1;
     auto headers = std::make_unique<char[]>(header_size);
     facebook::cachelib::MemoryAllocator allocator(
         facebook::cachelib::MemoryAllocator::Config({kAllocSize}),
@@ -362,9 +361,9 @@ TEST_F(BufferAllocatorTest, RestoreCachelibRejectsNonMemoryDescriptors) {
                      .has_value());
 
     descriptors[0].protocol_ = "cxl";
-    EXPECT_FALSE(RestoreCachelibBufferAllocator(
-                     "cachelib-memory-only", kBase, kCapacity, endpoint,
-                     descriptors)
+    EXPECT_FALSE(RestoreCachelibBufferAllocator("cachelib-memory-only", kBase,
+                                                kCapacity, endpoint,
+                                                descriptors)
                      .has_value());
 
     descriptors[0].protocol_ = "rdma";
@@ -374,8 +373,7 @@ TEST_F(BufferAllocatorTest, RestoreCachelibRejectsNonMemoryDescriptors) {
     const auto restored = rdma->buffers[0]->get_descriptor();
     EXPECT_EQ(restored.protocol_, descriptors[0].protocol_);
     EXPECT_EQ(restored.buffer_address_, descriptors[0].buffer_address_);
-    EXPECT_EQ(restored.transport_endpoint_,
-              descriptors[0].transport_endpoint_);
+    EXPECT_EQ(restored.transport_endpoint_, descriptors[0].transport_endpoint_);
 }
 
 // Test allocation request larger than available space

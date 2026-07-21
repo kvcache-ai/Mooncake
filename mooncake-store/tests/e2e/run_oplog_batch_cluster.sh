@@ -10,7 +10,7 @@ die() {
 }
 
 usage() {
-  echo "Usage: $0 <up|status|collect|restart|down|smoke|restart-smoke|failpoint-smoke|failpoint-crash-smoke|remove-boundary-smoke|standby-read-smoke|promotion-catchup-smoke|ha-failover-smoke|non-ha-smoke> [options]" >&2
+  echo "Usage: $0 <up|status|collect|restart|down|smoke|restart-smoke|failpoint-smoke|failpoint-crash-smoke|remove-boundary-smoke|standby-read-smoke|promotion-catchup-smoke|ha-failover-smoke|allocator-recovery-smoke|allocator-recovery-matrix|non-ha-smoke> [options]" >&2
 }
 
 parse_up_options() {
@@ -33,6 +33,12 @@ parse_up_options() {
   HA_OBJECTS=1000
   HA_PAYLOAD_BYTES=4096
   HA_PRESSURE_SEC=45
+  MEMORY_ALLOCATOR=""
+  RECOVERY_PAYLOAD_SIZES=64,128,4096,65536,1048576
+  RECOVERY_SEED_OBJECTS=240
+  RECOVERY_REFILL_OBJECTS=120
+  RECOVERY_PRESSURE_SEC=10
+  RECOVERY_SEGMENT_BYTES=268435456
   ETCD_ENDPOINTS=""
   ETCD_BIN=${ETCD_BIN:-etcd}
   while (($#)); do
@@ -116,6 +122,36 @@ parse_up_options() {
         HA_PRESSURE_SEC=$2
         shift 2
         ;;
+      --memory-allocator)
+        (($# >= 2)) || die "--memory-allocator requires a value"
+        MEMORY_ALLOCATOR=$2
+        shift 2
+        ;;
+      --recovery-payload-sizes)
+        (($# >= 2)) || die "--recovery-payload-sizes requires a value"
+        RECOVERY_PAYLOAD_SIZES=$2
+        shift 2
+        ;;
+      --recovery-seed-objects)
+        (($# >= 2)) || die "--recovery-seed-objects requires a value"
+        RECOVERY_SEED_OBJECTS=$2
+        shift 2
+        ;;
+      --recovery-refill-objects)
+        (($# >= 2)) || die "--recovery-refill-objects requires a value"
+        RECOVERY_REFILL_OBJECTS=$2
+        shift 2
+        ;;
+      --recovery-pressure-sec)
+        (($# >= 2)) || die "--recovery-pressure-sec requires a value"
+        RECOVERY_PRESSURE_SEC=$2
+        shift 2
+        ;;
+      --recovery-segment-bytes)
+        (($# >= 2)) || die "--recovery-segment-bytes requires a value"
+        RECOVERY_SEGMENT_BYTES=$2
+        shift 2
+        ;;
       --failpoint-dir)
         (($# >= 2)) || die "--failpoint-dir requires a value"
         FAILPOINT_DIR=$2
@@ -155,6 +191,19 @@ parse_up_options() {
     die "ha-payload-bytes must be positive"
   [[ "$HA_PRESSURE_SEC" =~ ^[1-9][0-9]*$ ]] ||
     die "ha-pressure-sec must be positive"
+  [[ -z "$MEMORY_ALLOCATOR" || "$MEMORY_ALLOCATOR" == offset ||
+     "$MEMORY_ALLOCATOR" == cachelib ]] ||
+    die "memory-allocator must be offset or cachelib"
+  [[ "$RECOVERY_SEED_OBJECTS" =~ ^[1-9][0-9]*$ ]] ||
+    die "recovery-seed-objects must be positive"
+  [[ "$RECOVERY_REFILL_OBJECTS" =~ ^[1-9][0-9]*$ ]] ||
+    die "recovery-refill-objects must be positive"
+  [[ "$RECOVERY_PRESSURE_SEC" =~ ^[1-9][0-9]*$ ]] ||
+    die "recovery-pressure-sec must be positive"
+  [[ "$RECOVERY_SEGMENT_BYTES" =~ ^[1-9][0-9]*$ ]] ||
+    die "recovery-segment-bytes must be positive"
+  [[ "$RECOVERY_PAYLOAD_SIZES" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] ||
+    die "recovery-payload-sizes must be positive CSV integers"
   [[ "$PROTOCOL" == tcp || "$PROTOCOL" == rdma ]] ||
     die "protocol must be tcp or rdma"
   [[ -z "$MASTER_CONFIG" || -f "$MASTER_CONFIG" ]] ||
@@ -304,7 +353,10 @@ start_master() {
   local -a ha_args=(--enable_ha=false)
   local -a non_ha_args=()
   local -a config_args=()
+  local -a allocator_args=()
   [[ -z "$MASTER_CONFIG" ]] || config_args=(--config_path="$MASTER_CONFIG")
+  [[ -z "$MEMORY_ALLOCATOR" ]] ||
+    allocator_args=(--memory_allocator="$MEMORY_ALLOCATOR")
   if [[ "$ENABLE_HA" == true ]]; then
     ha_args=(--enable_ha=true --ha_backend_type=etcd
       --ha_backend_connstring="$ETCD_ENDPOINTS"
@@ -317,6 +369,7 @@ start_master() {
   fi
   start_process "master-$index" "${environment[@]}" "$MASTER_BIN" \
     "${config_args[@]}" "${ha_args[@]}" "${non_ha_args[@]}" \
+    "${allocator_args[@]}" \
     --rpc_address=127.0.0.1 --rpc_port="${RPC_PORTS[$index]}" \
     --metrics_port="${ADMIN_PORTS[$index]}" \
     --enable_http_metadata_server=false --logtostderr=true
@@ -341,6 +394,7 @@ write_cluster_env() {
     printf 'START_TIMEOUT_SEC=%q\n' "$START_TIMEOUT_SEC"
     printf 'FAILPOINT_DIR=%q\n' "$FAILPOINT_DIR"
     printf 'FAILPOINT_TIMEOUT_SEC=%q\n' "$FAILPOINT_TIMEOUT_SEC"
+    printf 'MEMORY_ALLOCATOR=%q\n' "$MEMORY_ALLOCATOR"
     printf 'RPC_PORTS=%q\n' "${RPC_PORTS[*]}"
     printf 'ADMIN_PORTS=%q\n' "${ADMIN_PORTS[*]}"
     printf 'INSPECTOR_BIN=%q\n' "$INSPECTOR_BIN"
@@ -376,6 +430,7 @@ load_cluster_env() {
   START_TIMEOUT_SEC=${START_TIMEOUT_SEC:-30}
   FAILPOINT_DIR=${FAILPOINT_DIR:-}
   FAILPOINT_TIMEOUT_SEC=${FAILPOINT_TIMEOUT_SEC:-30}
+  MEMORY_ALLOCATOR=${MEMORY_ALLOCATOR:-}
   MASTER_BIN="$BUILD_DIR/mooncake-store/src/mooncake_master"
 }
 
@@ -1276,6 +1331,244 @@ ha_failover_smoke_cluster() {
   echo "PASS: real HA failover completed; leader=$leader_index promoted=$promoted_index durable_before=$durable_before artifacts=$RUN_DIR"
 }
 
+allocator_recovery_smoke_cluster() {
+  local ha_client="$BUILD_DIR/mooncake-store/tests/e2e/oplog_ha_client"
+  local fault_ctl="$SCRIPT_DIR/oplog_fault_ctl.sh"
+  require_executable "$ha_client"
+  require_executable "$fault_ctl"
+  CLIENT_COUNT=0
+  [[ -n "$MEMORY_ALLOCATOR" ]] || MEMORY_ALLOCATOR=offset
+  up_cluster
+  export MC_STORE_CLUSTER_ID="$CLUSTER_ID"
+
+  local seed_prefix="allocator-seed-$CLUSTER_ID"
+  local refill_prefix="allocator-refill-$CLUSTER_ID"
+  local pressure_prefix="allocator-pressure-$CLUSTER_ID"
+  local seed_manifest="$RUN_DIR/workload/seed.ack"
+  local survivor_manifest="$RUN_DIR/workload/survivor.ack"
+  local deleted_manifest="$RUN_DIR/workload/deleted.ack"
+  local refill_manifest="$RUN_DIR/workload/refill.ack"
+  local pressure_manifest="$RUN_DIR/workload/pressure.ack"
+  local -a client_args=(
+    --master_server_entry="etcd://$ETCD_ENDPOINTS"
+    --engine_meta_url="http://127.0.0.1:$METADATA_PORT/metadata"
+    --protocol="$PROTOCOL")
+  local index leader_index promoted_index pid durable_start durable_before expected
+
+  for index in 0 1; do
+    start_process "provider-$index" "$ha_client" --mode=provider \
+      --port="$(find_free_port)" --segment_size="$RECOVERY_SEGMENT_BYTES" \
+      "${client_args[@]}"
+    wait_file_text "$RUN_DIR/logs/provider-$index.out" provider_ready \
+      "$START_TIMEOUT_SEC" || {
+      smoke_failed "provider-$index did not mount a storage segment"
+      return 1
+    }
+  done
+  durable_start=$(read_durable_sequence) || {
+    smoke_failed "failed to read initial durable sequence"
+    return 1
+  }
+
+  "$ha_client" --mode=seed --port="$(find_free_port)" \
+    "${client_args[@]}" --key_prefix="$seed_prefix" \
+    --count="$RECOVERY_SEED_OBJECTS" \
+    --payload_sizes="$RECOVERY_PAYLOAD_SIZES" --manifest="$seed_manifest" \
+    >"$RUN_DIR/workload/seed.log" 2>&1 || {
+    smoke_failed "mixed-size seed failed"
+    return 1
+  }
+  awk 'NR % 3 == 0' "$seed_manifest" >"$deleted_manifest"
+  awk 'NR % 3 != 0' "$seed_manifest" >"$survivor_manifest"
+  [[ -s "$deleted_manifest" && -s "$survivor_manifest" ]] || {
+    smoke_failed "failed to split seed manifest into holes and survivors"
+    return 1
+  }
+  "$ha_client" --mode=delete --port="$(find_free_port)" \
+    "${client_args[@]}" --key_prefix="$seed_prefix" \
+    --manifest="$deleted_manifest" >"$RUN_DIR/workload/delete.log" 2>&1 || {
+    smoke_failed "failed to create allocator holes"
+    return 1
+  }
+  "$ha_client" --mode=verify --port="$(find_free_port)" \
+    "${client_args[@]}" --key_prefix="$seed_prefix" \
+    --payload_sizes="$RECOVERY_PAYLOAD_SIZES" \
+    --manifest="$survivor_manifest" \
+    >"$RUN_DIR/workload/pre-kill-survivor.log" 2>&1 || {
+    smoke_failed "survivors were corrupted while creating holes"
+    return 1
+  }
+  "$ha_client" --mode=verify-absent --port="$(find_free_port)" \
+    "${client_args[@]}" --key_prefix="$seed_prefix" \
+    --manifest="$deleted_manifest" \
+    >"$RUN_DIR/workload/pre-kill-absent.log" 2>&1 || {
+    smoke_failed "deleted objects remained visible"
+    return 1
+  }
+
+  expected=$((durable_start + RECOVERY_SEED_OBJECTS + $(wc -l <"$deleted_manifest")))
+  "$INSPECTOR_BIN" wait --endpoints="$ETCD_ENDPOINTS" \
+    --cluster_id="$CLUSTER_ID" --last_seq="$expected" \
+    --timeout_sec="$START_TIMEOUT_SEC" || {
+    smoke_failed "seed and delete OpLog did not become durable"
+    return 1
+  }
+  durable_before=$(read_durable_sequence) || {
+    smoke_failed "failed to read pre-kill durable sequence"
+    return 1
+  }
+  leader_index=$(ready_leader_index) || {
+    smoke_failed "failed to identify pre-kill leader"
+    return 1
+  }
+  for index in "${!ADMIN_PORTS[@]}"; do
+    [[ "$index" == "$leader_index" ]] && continue
+    wait_master_metric_at_least "$index" ha_oplog_applied_sequence_id \
+      "$durable_before" "$START_TIMEOUT_SEC" || {
+      smoke_failed "master-$index did not apply allocator state"
+      return 1
+    }
+  done
+  capture_ha_stage allocator-pre-kill || {
+    smoke_failed "pre-kill evidence collection failed"
+    return 1
+  }
+
+  "$fault_ctl" process kill --run-dir "$RUN_DIR" \
+    --name "master-$leader_index"
+  pid=$(<"$RUN_DIR/pids/master-$leader_index.pid")
+  wait "$pid" 2>/dev/null || true
+  wait_for_single_leader "$START_TIMEOUT_SEC" || {
+    smoke_failed "cluster did not promote a new leader"
+    return 1
+  }
+  promoted_index=$(ready_leader_index) || {
+    smoke_failed "promotion did not produce exactly one ready leader"
+    return 1
+  }
+  [[ "$promoted_index" != "$leader_index" ]] || {
+    smoke_failed "old leader remained ready after kill"
+    return 1
+  }
+  wait_master_metric_at_least "$promoted_index" master_active_clients 2 \
+    "$START_TIMEOUT_SEC" || {
+    smoke_failed "storage providers did not reconnect to promoted leader"
+    return 1
+  }
+
+  "$ha_client" --mode=verify --port="$(find_free_port)" \
+    "${client_args[@]}" --key_prefix="$seed_prefix" \
+    --payload_sizes="$RECOVERY_PAYLOAD_SIZES" \
+    --manifest="$survivor_manifest" \
+    >"$RUN_DIR/workload/post-promotion-survivor.log" 2>&1 || {
+    smoke_failed "survivors were not readable after allocator recovery"
+    return 1
+  }
+  "$ha_client" --mode=verify-absent --port="$(find_free_port)" \
+    "${client_args[@]}" --key_prefix="$seed_prefix" \
+    --manifest="$deleted_manifest" \
+    >"$RUN_DIR/workload/post-promotion-absent.log" 2>&1 || {
+    smoke_failed "deleted objects reappeared after allocator recovery"
+    return 1
+  }
+  "$ha_client" --mode=seed --port="$(find_free_port)" \
+    "${client_args[@]}" --key_prefix="$refill_prefix" \
+    --start_index=100000 --count="$RECOVERY_REFILL_OBJECTS" \
+    --payload_sizes="$RECOVERY_PAYLOAD_SIZES" --manifest="$refill_manifest" \
+    >"$RUN_DIR/workload/refill.log" 2>&1 || {
+    smoke_failed "post-promotion mixed-size refill failed"
+    return 1
+  }
+  "$ha_client" --mode=verify --port="$(find_free_port)" \
+    "${client_args[@]}" --key_prefix="$seed_prefix" \
+    --payload_sizes="$RECOVERY_PAYLOAD_SIZES" --manifest="$survivor_manifest" \
+    >"$RUN_DIR/workload/pre-pressure-survivor.log" 2>&1 || {
+    smoke_failed "survivors failed after refill"
+    return 1
+  }
+  "$ha_client" --mode=verify --port="$(find_free_port)" \
+    "${client_args[@]}" --key_prefix="$refill_prefix" \
+    --payload_sizes="$RECOVERY_PAYLOAD_SIZES" --manifest="$refill_manifest" \
+    >"$RUN_DIR/workload/pre-pressure-refill.log" 2>&1 || {
+    smoke_failed "refill data failed before pressure"
+    return 1
+  }
+  "$ha_client" --mode=verify-absent --port="$(find_free_port)" \
+    "${client_args[@]}" --key_prefix="$seed_prefix" \
+    --manifest="$deleted_manifest" \
+    >"$RUN_DIR/workload/pre-pressure-absent.log" 2>&1 || {
+    smoke_failed "deleted objects reappeared after refill"
+    return 1
+  }
+  "$ha_client" --mode=pressure --port="$(find_free_port)" \
+    "${client_args[@]}" --key_prefix="$pressure_prefix" \
+    --start_index=1000000 --payload_sizes="$RECOVERY_PAYLOAD_SIZES" \
+    --duration_sec="$RECOVERY_PRESSURE_SEC" --sleep_ms=25 \
+    --manifest="$pressure_manifest" \
+    >"$RUN_DIR/workload/pressure.log" 2>&1 || {
+    smoke_failed "post-promotion mixed-size pressure failed"
+    return 1
+  }
+
+  for index in survivor refill pressure; do
+    local prefix=$seed_prefix
+    local manifest=$survivor_manifest
+    [[ "$index" != refill ]] || {
+      prefix=$refill_prefix
+      manifest=$refill_manifest
+    }
+    [[ "$index" != pressure ]] || {
+      prefix=$pressure_prefix
+      manifest=$pressure_manifest
+    }
+    "$ha_client" --mode=verify --port="$(find_free_port)" \
+      "${client_args[@]}" --key_prefix="$prefix" \
+      --payload_sizes="$RECOVERY_PAYLOAD_SIZES" --manifest="$manifest" \
+      >"$RUN_DIR/workload/final-$index.log" 2>&1 || {
+      smoke_failed "final $index verification failed"
+      return 1
+    }
+  done
+  "$ha_client" --mode=verify-absent --port="$(find_free_port)" \
+    "${client_args[@]}" --key_prefix="$seed_prefix" \
+    --manifest="$deleted_manifest" \
+    >"$RUN_DIR/workload/final-absent.log" 2>&1 || {
+    smoke_failed "deleted objects reappeared during post-promotion writes"
+    return 1
+  }
+  expected=$((durable_before + RECOVERY_REFILL_OBJECTS + $(wc -l <"$pressure_manifest")))
+  "$INSPECTOR_BIN" wait --endpoints="$ETCD_ENDPOINTS" \
+    --cluster_id="$CLUSTER_ID" --last_seq="$expected" \
+    --timeout_sec="$START_TIMEOUT_SEC" || {
+    smoke_failed "post-promotion writes did not become durable"
+    return 1
+  }
+  capture_ha_stage allocator-final || {
+    smoke_failed "final OpLog verification failed"
+    return 1
+  }
+  collect_cluster
+  down_cluster
+  echo "PASS: allocator recovery completed; allocator=$MEMORY_ALLOCATOR leader=$leader_index promoted=$promoted_index artifacts=$RUN_DIR"
+}
+
+allocator_recovery_matrix() {
+  local base_run_dir=$RUN_DIR
+  local base_cluster_id=$CLUSTER_ID
+  local base_etcd_endpoints=$ETCD_ENDPOINTS
+  local allocator
+  for allocator in offset cachelib; do
+    RUN_DIR="$base_run_dir-$allocator"
+    CLUSTER_ID="$base_cluster_id-$allocator"
+    ETCD_ENDPOINTS=$base_etcd_endpoints
+    MEMORY_ALLOCATOR=$allocator
+    RPC_PORTS=()
+    ADMIN_PORTS=()
+    allocator_recovery_smoke_cluster || return 1
+  done
+  echo "PASS: allocator recovery matrix completed; artifacts=$base_run_dir-{offset,cachelib}"
+}
+
 non_ha_smoke_cluster() {
   local fault_ctl="$SCRIPT_DIR/oplog_fault_ctl.sh"
   require_executable "$fault_ctl"
@@ -1563,8 +1856,13 @@ main() {
   local command=$1
   shift
   case "$command" in
-    up | smoke | restart-smoke | failpoint-smoke | failpoint-crash-smoke | remove-boundary-smoke | standby-read-smoke | promotion-catchup-smoke | ha-failover-smoke | non-ha-smoke)
+    up | smoke | restart-smoke | failpoint-smoke | failpoint-crash-smoke | remove-boundary-smoke | standby-read-smoke | promotion-catchup-smoke | ha-failover-smoke | allocator-recovery-smoke | allocator-recovery-matrix | non-ha-smoke)
       parse_up_options "$@"
+      if [[ "$command" == allocator-recovery-smoke ||
+            "$command" == allocator-recovery-matrix ]] &&
+         [[ "$MASTER_COUNT" != 3 ]]; then
+        die "allocator recovery requires exactly 3 masters"
+      fi
       if [[ "$command" == non-ha-smoke ]]; then
         MASTER_COUNT=1
         ENABLE_HA=false
@@ -1588,6 +1886,10 @@ main() {
         promotion_catchup_smoke_cluster
       elif [[ "$command" == ha-failover-smoke ]]; then
         ha_failover_smoke_cluster
+      elif [[ "$command" == allocator-recovery-smoke ]]; then
+        allocator_recovery_smoke_cluster
+      elif [[ "$command" == allocator-recovery-matrix ]]; then
+        allocator_recovery_matrix
       elif [[ "$command" == non-ha-smoke ]]; then
         non_ha_smoke_cluster
       else

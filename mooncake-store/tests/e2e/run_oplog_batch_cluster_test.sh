@@ -52,6 +52,10 @@ expect_failure 1 "build directory does not exist" \
 expect_failure 1 "build directory does not exist" \
   "$SCRIPT" ha-failover-smoke --build-dir "$TEST_ROOT/missing-build"
 expect_failure 1 "build directory does not exist" \
+  "$SCRIPT" allocator-recovery-smoke --build-dir "$TEST_ROOT/missing-build"
+expect_failure 1 "build directory does not exist" \
+  "$SCRIPT" allocator-recovery-matrix --build-dir "$TEST_ROOT/missing-build"
+expect_failure 1 "build directory does not exist" \
   "$SCRIPT" non-ha-smoke --build-dir "$TEST_ROOT/missing-build"
 expect_failure 1 "master config does not exist" \
   "$SCRIPT" non-ha-smoke --build-dir "$TEST_ROOT" \
@@ -64,9 +68,31 @@ expect_failure 1 "ha-payload-bytes must be positive" \
   "$SCRIPT" ha-failover-smoke --build-dir "$TEST_ROOT" --ha-payload-bytes 0
 expect_failure 1 "ha-pressure-sec must be positive" \
   "$SCRIPT" ha-failover-smoke --build-dir "$TEST_ROOT" --ha-pressure-sec 0
+expect_failure 1 "memory-allocator must be offset or cachelib" \
+  "$SCRIPT" allocator-recovery-smoke --build-dir "$TEST_ROOT" \
+  --memory-allocator invalid
+expect_failure 1 "recovery-seed-objects must be positive" \
+  "$SCRIPT" allocator-recovery-smoke --build-dir "$TEST_ROOT" \
+  --recovery-seed-objects 0
+expect_failure 1 "recovery-refill-objects must be positive" \
+  "$SCRIPT" allocator-recovery-smoke --build-dir "$TEST_ROOT" \
+  --recovery-refill-objects 0
+expect_failure 1 "recovery-pressure-sec must be positive" \
+  "$SCRIPT" allocator-recovery-smoke --build-dir "$TEST_ROOT" \
+  --recovery-pressure-sec 0
+expect_failure 1 "recovery-segment-bytes must be positive" \
+  "$SCRIPT" allocator-recovery-smoke --build-dir "$TEST_ROOT" \
+  --recovery-segment-bytes 0
+expect_failure 1 "recovery-payload-sizes must be positive CSV integers" \
+  "$SCRIPT" allocator-recovery-smoke --build-dir "$TEST_ROOT" \
+  --recovery-payload-sizes 64,0,4096
+expect_failure 1 "allocator recovery requires exactly 3 masters" \
+  "$SCRIPT" allocator-recovery-smoke --build-dir "$TEST_ROOT" --masters 2
 EMPTY_BUILD="$TEST_ROOT/empty-build"
 mkdir -p "$EMPTY_BUILD"
 expect_failure 1 "missing executable" "$SCRIPT" up --build-dir "$EMPTY_BUILD"
+expect_failure 1 "missing executable" "$SCRIPT" allocator-recovery-smoke \
+  --build-dir "$EMPTY_BUILD"
 expect_failure 1 "missing executable" "$SCRIPT" non-ha-smoke \
   --build-dir "$EMPTY_BUILD" --no-etcd-observer
 expect_failure 1 "run directory does not exist" \

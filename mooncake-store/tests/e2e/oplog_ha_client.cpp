@@ -26,6 +26,7 @@ DEFINE_string(key_prefix, "ha-e2e", "Key prefix");
 DEFINE_uint64(start_index, 0, "First object index");
 DEFINE_uint64(count, 1000, "Number of objects for seed");
 DEFINE_uint64(payload_size, 4096, "Payload bytes per object");
+DEFINE_string(payload_sizes, "", "Comma-separated payload sizes");
 DEFINE_string(manifest, "", "Acknowledged-write manifest path");
 DEFINE_uint64(duration_sec, 45, "Pressure duration");
 DEFINE_uint64(sleep_ms, 25, "Delay between pressure operations");
@@ -35,17 +36,45 @@ DEFINE_uint64(segment_size, 134217728, "Provider memory-segment bytes");
 namespace mooncake::testing {
 namespace {
 
+std::vector<uint64_t> payload_sizes;
+
 std::string Key(uint64_t index) {
     return FLAGS_key_prefix + "-" + std::to_string(index);
 }
 
 std::string Payload(uint64_t index) {
-    std::string value(FLAGS_payload_size, '\0');
-    for (uint64_t offset = 0; offset < FLAGS_payload_size; ++offset) {
+    const uint64_t size = payload_sizes.empty()
+                              ? FLAGS_payload_size
+                              : payload_sizes[index % payload_sizes.size()];
+    std::string value(size, '\0');
+    for (uint64_t offset = 0; offset < size; ++offset) {
         value[offset] = static_cast<char>(
             (index * 1315423911ULL + offset * 2654435761ULL) & 0xff);
     }
     return value;
+}
+
+bool ParsePayloadSizes() {
+    if (FLAGS_payload_sizes.empty()) return true;
+    size_t begin = 0;
+    while (begin <= FLAGS_payload_sizes.size()) {
+        const size_t end = FLAGS_payload_sizes.find(',', begin);
+        const std::string item = FLAGS_payload_sizes.substr(begin, end - begin);
+        try {
+            size_t parsed = 0;
+            if (item.empty() ||
+                item.find_first_not_of("0123456789") != std::string::npos)
+                return false;
+            const uint64_t size = std::stoull(item, &parsed);
+            if (parsed != item.size() || size == 0) return false;
+            payload_sizes.push_back(size);
+        } catch (const std::exception&) {
+            return false;
+        }
+        if (end == std::string::npos) break;
+        begin = end + 1;
+    }
+    return !payload_sizes.empty();
 }
 
 std::shared_ptr<ClientTestWrapper> CreateClient() {
@@ -165,6 +194,39 @@ int Verify(ClientTestWrapper& client) {
     return 0;
 }
 
+int Delete(ClientTestWrapper& client) {
+    std::vector<uint64_t> indexes;
+    if (!ReadManifest(indexes)) return 2;
+    for (uint64_t index : indexes) {
+        const ErrorCode error = client.Delete(Key(index));
+        if (error != ErrorCode::OK) {
+            std::cerr << "delete_failed index=" << index
+                      << " error=" << toString(error) << '\n';
+            return 20;
+        }
+    }
+    std::cout << "summary mode=delete delete_ok=" << indexes.size()
+              << " delete_fail=0\n";
+    return 0;
+}
+
+int VerifyAbsent(ClientTestWrapper& client) {
+    std::vector<uint64_t> indexes;
+    if (!ReadManifest(indexes)) return 2;
+    for (uint64_t index : indexes) {
+        std::string value;
+        const ErrorCode error = client.Get(Key(index), value);
+        if (error != ErrorCode::OBJECT_NOT_FOUND) {
+            std::cerr << "unexpected_present index=" << index
+                      << " error=" << toString(error) << '\n';
+            return 21;
+        }
+    }
+    std::cout << "summary mode=verify-absent absent_ok=" << indexes.size()
+              << " absent_fail=0\n";
+    return 0;
+}
+
 int Pressure(ClientTestWrapper& client) {
     AckManifest manifest(FLAGS_manifest);
     if (!manifest.valid()) return 2;
@@ -210,8 +272,10 @@ int main(int argc, char** argv) {
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     google::InitGoogleLogging(argv[0]);
     FLAGS_logtostderr = 1;
-    if ((FLAGS_mode != "provider" && FLAGS_mode != "seed" &&
-         FLAGS_mode != "verify" && FLAGS_mode != "pressure") ||
+    if (!mooncake::testing::ParsePayloadSizes() ||
+        (FLAGS_mode != "provider" && FLAGS_mode != "seed" &&
+         FLAGS_mode != "verify" && FLAGS_mode != "delete" &&
+         FLAGS_mode != "verify-absent" && FLAGS_mode != "pressure") ||
         (FLAGS_mode != "provider" && FLAGS_manifest.empty()) ||
         FLAGS_key_prefix.empty() || FLAGS_payload_size == 0 ||
         FLAGS_connect_timeout_sec == 0 ||
@@ -226,5 +290,8 @@ int main(int argc, char** argv) {
     if (FLAGS_mode == "provider") return mooncake::testing::Provider(*client);
     if (FLAGS_mode == "seed") return mooncake::testing::Seed(*client);
     if (FLAGS_mode == "verify") return mooncake::testing::Verify(*client);
+    if (FLAGS_mode == "delete") return mooncake::testing::Delete(*client);
+    if (FLAGS_mode == "verify-absent")
+        return mooncake::testing::VerifyAbsent(*client);
     return mooncake::testing::Pressure(*client);
 }
