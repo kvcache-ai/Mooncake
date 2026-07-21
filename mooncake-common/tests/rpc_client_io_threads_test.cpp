@@ -12,8 +12,6 @@ namespace {
 
 class MockEnvironSource : public EnvironSource {
    public:
-    MockEnvironSource() = default;
-
     MockEnvironSource(
         std::initializer_list<std::pair<const std::string, std::string>> values)
         : values_(values) {}
@@ -31,19 +29,11 @@ class MockEnvironSource : public EnvironSource {
     std::unordered_map<std::string, std::string> values_;
 };
 
-TEST(RpcClientIoThreadsTest, UsesConservativeDefault) {
-    const MockEnvironSource source;
-
-    EXPECT_EQ(Environ(source, 12).GetRpcClientIoThreads(), 12U);
-    EXPECT_EQ(Environ(source, 64).GetRpcClientIoThreads(), 16U);
-    EXPECT_EQ(Environ(source, 0).GetRpcClientIoThreads(), 1U);
-}
-
 TEST(RpcClientIoThreadsTest, UsesComponentOverridesAndFreezesValues) {
     MockEnvironSource source{{"MC_RPC_CLIENT_IO_THREADS", "8"},
                              {"MC_STORE_RPC_CLIENT_IO_THREADS", "4"},
                              {"MC_TE_RPC_CLIENT_IO_THREADS", "6"}};
-    const Environ env(source, 64);
+    const Environ env(source);
 
     EXPECT_EQ(env.GetRpcClientIoThreads(), 8U);
     EXPECT_EQ(env.GetStoreRpcClientIoThreads(), 4U);
@@ -57,22 +47,11 @@ TEST(RpcClientIoThreadsTest, UsesComponentOverridesAndFreezesValues) {
     EXPECT_EQ(env.GetTransferEngineRpcClientIoThreads(), 6U);
 }
 
-TEST(RpcClientIoThreadsTest, InvalidValuesUseFallbacks) {
-    const MockEnvironSource source{{"MC_RPC_CLIENT_IO_THREADS", "invalid"},
-                                   {"MC_STORE_RPC_CLIENT_IO_THREADS", "0"},
-                                   {"MC_TE_RPC_CLIENT_IO_THREADS", "-1"}};
-    const Environ env(source, 12);
-
-    EXPECT_EQ(env.GetRpcClientIoThreads(), 12U);
-    EXPECT_EQ(env.GetStoreRpcClientIoThreads(), 12U);
-    EXPECT_EQ(env.GetTransferEngineRpcClientIoThreads(), 12U);
-}
-
 TEST(RpcClientIoThreadsTest, ComponentValuesUseCommonFallback) {
     const MockEnvironSource source{{"MC_RPC_CLIENT_IO_THREADS", "8"},
                                    {"MC_STORE_RPC_CLIENT_IO_THREADS", "0"},
                                    {"MC_TE_RPC_CLIENT_IO_THREADS", "invalid"}};
-    const Environ env(source, 64);
+    const Environ env(source);
 
     EXPECT_EQ(env.GetRpcClientIoThreads(), 8U);
     EXPECT_EQ(env.GetStoreRpcClientIoThreads(), 8U);

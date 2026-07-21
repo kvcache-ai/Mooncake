@@ -19,7 +19,7 @@ class Environ {
 
     // Construct from an injected source. Production code should use Get();
     // this constructor allows tests to provide deterministic environment data.
-    Environ(const EnvironSource& source, uint32_t hardware_threads);
+    explicit Environ(const EnvironSource& source);
 
     // Getters for Environment Variables
     int GetNumCqPerCtx() const { return num_cq_per_ctx_; }

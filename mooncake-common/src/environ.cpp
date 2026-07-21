@@ -112,9 +112,7 @@ uint32_t ResolveRpcClientIoThreads(const EnvironSource& source,
 }  // namespace
 
 Environ& Environ::Get() {
-    static Environ instance(
-        GetOsEnvironSource(),
-        static_cast<uint32_t>(std::thread::hardware_concurrency()));
+    static Environ instance(GetOsEnvironSource());
     return instance;
 }
 
@@ -139,7 +137,9 @@ std::string Environ::GetString(const char* name,
     return ReadString(GetOsEnvironSource(), name, default_value);
 }
 
-Environ::Environ(const EnvironSource& source, uint32_t hardware_threads) {
+Environ::Environ(const EnvironSource& source) {
+    const uint32_t hardware_threads =
+        static_cast<uint32_t>(std::thread::hardware_concurrency());
     const uint32_t default_rpc_client_io_threads = std::min(
         kDefaultRpcClientIoThreads, std::max(uint32_t{1}, hardware_threads));
     rpc_client_io_threads_ = ResolveRpcClientIoThreads(
