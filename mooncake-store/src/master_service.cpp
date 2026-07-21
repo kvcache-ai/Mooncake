@@ -197,14 +197,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
       offloading_queue_limit_(config.offloading_queue_limit),
       offload_cap_ratio_(config.offload_cap_ratio),
       task_manager_(config.task_manager_config) {
-    const auto now = std::chrono::system_clock::now();
-    const auto max_representable_ttl =
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::time_point::max() - now)
-            .count();
-    if (default_kv_soft_pin_ttl_ > max_kv_soft_pin_ttl_ ||
-        max_representable_ttl < 0 ||
-        max_kv_soft_pin_ttl_ > static_cast<uint64_t>(max_representable_ttl)) {
+    if (default_kv_soft_pin_ttl_ > max_kv_soft_pin_ttl_) {
         LOG(ERROR) << "Invalid soft-pin TTL configuration: default="
                    << default_kv_soft_pin_ttl_
                    << ", max=" << max_kv_soft_pin_ttl_;
@@ -1375,6 +1368,9 @@ MasterService::EraseMetadata(
 
     ReleaseLocalDiskUsage(metadata.GetAllReplicas());
     AccountCacheTotalRemoval(metadata);
+    if (metadata.GetCommittedSoftPinTimeout()) {
+        soft_pin_deadline_index_.Remove(tenant_id.MakeScopedKey(key));
+    }
     switch (quota_mode) {
         case QuotaEraseMode::kFull:
             AbortTenantQuota(tenant_id, metadata.reserved_quota_charge_bytes);
@@ -1454,6 +1450,100 @@ void MasterService::RebuildGroupRoutingIndex() {
     }
 }
 
+void MasterService::SoftPinDeadlineIndex::MaybeCompactLocked() {
+    const size_t live_count = registrations_.size();
+    const size_t ratio_limit =
+        live_count > std::numeric_limits<size_t>::max() / kCompactionRatio
+            ? std::numeric_limits<size_t>::max()
+            : live_count * kCompactionRatio;
+    const size_t threshold = std::max(kMinCompactionThreshold, ratio_limit);
+    if (heap_.size() <= threshold) {
+        return;
+    }
+
+    decltype(heap_) rebuilt;
+    for (const auto& [scoped_key, registration] : registrations_) {
+        rebuilt.push(
+            Entry{registration.deadline, registration.shard_idx, scoped_key});
+    }
+    heap_.swap(rebuilt);
+}
+
+void MasterService::SoftPinDeadlineIndex::Upsert(std::string scoped_key,
+                                                 size_t shard_idx,
+                                                 const TimePoint& deadline) {
+    std::lock_guard lock(mutex_);
+    const auto it = registrations_.find(scoped_key);
+    if (it != registrations_.end() && it->second.deadline == deadline &&
+        it->second.shard_idx == shard_idx) {
+        return;
+    }
+
+    auto [registration_it, inserted] = registrations_.insert_or_assign(
+        scoped_key, Registration{deadline, shard_idx});
+    (void)inserted;
+    heap_.push(Entry{deadline, shard_idx, registration_it->first});
+    MaybeCompactLocked();
+}
+
+void MasterService::SoftPinDeadlineIndex::Remove(
+    const std::string& scoped_key) {
+    std::lock_guard lock(mutex_);
+    if (registrations_.erase(scoped_key) > 0) {
+        MaybeCompactLocked();
+    }
+}
+
+void MasterService::SoftPinDeadlineIndex::RemoveIfMatches(
+    const std::string& scoped_key, size_t shard_idx,
+    const TimePoint& deadline) {
+    std::lock_guard lock(mutex_);
+    const auto it = registrations_.find(scoped_key);
+    if (it != registrations_.end() && it->second.deadline == deadline &&
+        it->second.shard_idx == shard_idx) {
+        registrations_.erase(it);
+        MaybeCompactLocked();
+    }
+}
+
+std::vector<MasterService::SoftPinDeadlineIndex::Entry>
+MasterService::SoftPinDeadlineIndex::PopExpired(const TimePoint& now) {
+    std::vector<Entry> expired;
+    std::lock_guard lock(mutex_);
+    while (!heap_.empty() && heap_.top().deadline <= now) {
+        Entry entry = heap_.top();
+        heap_.pop();
+
+        const auto it = registrations_.find(entry.scoped_key);
+        if (it == registrations_.end() ||
+            it->second.deadline != entry.deadline ||
+            it->second.shard_idx != entry.shard_idx) {
+            continue;
+        }
+        registrations_.erase(it);
+        expired.push_back(std::move(entry));
+    }
+    MaybeCompactLocked();
+    return expired;
+}
+
+void MasterService::SoftPinDeadlineIndex::Clear() {
+    std::lock_guard lock(mutex_);
+    registrations_.clear();
+    decltype(heap_) empty;
+    heap_.swap(empty);
+}
+
+size_t MasterService::SoftPinDeadlineIndex::HeapSizeForTest() const {
+    std::lock_guard lock(mutex_);
+    return heap_.size();
+}
+
+size_t MasterService::SoftPinDeadlineIndex::RegistrationCountForTest() const {
+    std::lock_guard lock(mutex_);
+    return registrations_.size();
+}
+
 auto MasterService::ResolveSoftPinRequest(const ReplicateConfig& config) const
     -> tl::expected<ResolvedSoftPinRequest, ErrorCode> {
     switch (config.soft_pin_action) {
@@ -1492,29 +1582,100 @@ void MasterService::ApplySoftPinMetricDelta(int metric_delta) {
     }
 }
 
+size_t MasterService::GetMetadataShardIndex(
+    const ObjectMetadata& metadata) const {
+    return metadata.group_id.empty()
+               ? getShardIndex(metadata.tenant_id, metadata.user_key)
+               : getShardIndex(metadata.group_id);
+}
+
+void MasterService::ApplySoftPinEvaluation(
+    const ObjectMetadata& metadata,
+    const ObjectMetadata::SoftPinEvaluation& result) const {
+    if (!result.deadline_to_index && !result.removed_deadline) {
+        ApplySoftPinMetricDelta(result.metric_delta);
+        return;
+    }
+
+    const size_t shard_idx = GetMetadataShardIndex(metadata);
+    const auto scoped_key = metadata.tenant_id.MakeScopedKey(metadata.user_key);
+    if (result.deadline_to_index) {
+        soft_pin_deadline_index_.Upsert(scoped_key, shard_idx,
+                                        *result.deadline_to_index);
+    } else if (result.removed_deadline) {
+        soft_pin_deadline_index_.RemoveIfMatches(scoped_key, shard_idx,
+                                                 *result.removed_deadline);
+    }
+    ApplySoftPinMetricDelta(result.metric_delta);
+}
+
+void MasterService::RegisterCommittedSoftPin(const ObjectMetadata& metadata,
+                                             size_t shard_idx) const {
+    const auto deadline = metadata.GetCommittedSoftPinTimeout();
+    if (!deadline) {
+        return;
+    }
+    soft_pin_deadline_index_.Upsert(
+        metadata.tenant_id.MakeScopedKey(metadata.user_key), shard_idx,
+        *deadline);
+}
+
+void MasterService::RebuildSoftPinDeadlineIndex() {
+    soft_pin_deadline_index_.Clear();
+    for (size_t shard_idx = 0; shard_idx < kNumShards; ++shard_idx) {
+        auto& shard = metadata_shards_[shard_idx];
+        for (const auto& [tenant_id, tenant_state] : shard.tenants) {
+            for (const auto& [key, metadata] : tenant_state.metadata) {
+                RegisterCommittedSoftPin(metadata, shard_idx);
+            }
+        }
+    }
+}
+
 bool MasterService::IsSoftPinActive(
     const ObjectMetadata& metadata,
     const std::chrono::system_clock::time_point& now) const {
     const auto evaluation = metadata.EvaluateSoftPin(now);
-    ApplySoftPinMetricDelta(evaluation.metric_delta);
+    ApplySoftPinEvaluation(metadata, evaluation);
     return evaluation.active;
 }
 
 void MasterService::CleanupExpiredSoftPins(
     const std::chrono::system_clock::time_point& now) {
+    auto expired_entries = soft_pin_deadline_index_.PopExpired(now);
+    std::sort(expired_entries.begin(), expired_entries.end(),
+              [](const auto& lhs, const auto& rhs) {
+                  return lhs.shard_idx < rhs.shard_idx;
+              });
+
     int expired_count = 0;
-    for (size_t shard_idx = 0; shard_idx < kNumShards; ++shard_idx) {
-        int shard_expired_count = 0;
-        {
-            MetadataShardAccessorRO shard(this, shard_idx);
-            for (auto& [tenant_id, tenant_state] : shard->tenants) {
-                for (auto& [key, metadata] : tenant_state.metadata) {
-                    shard_expired_count -=
-                        metadata.EvaluateSoftPin(now).metric_delta;
-                }
+    for (size_t begin = 0; begin < expired_entries.size();) {
+        const size_t shard_idx = expired_entries[begin].shard_idx;
+        size_t end = begin + 1;
+        while (end < expired_entries.size() &&
+               expired_entries[end].shard_idx == shard_idx) {
+            ++end;
+        }
+
+        MetadataShardAccessorRO shard(this, shard_idx);
+        for (size_t i = begin; i < end; ++i) {
+            const auto& entry = expired_entries[i];
+            const auto [tenant_id, key] =
+                TenantId::ParseScopedKey(entry.scoped_key);
+            const auto tenant_it = shard->tenants.find(tenant_id);
+            if (tenant_it == shard->tenants.end()) {
+                continue;
+            }
+            const auto metadata_it = tenant_it->second.metadata.find(key);
+            if (metadata_it == tenant_it->second.metadata.end()) {
+                continue;
+            }
+            if (metadata_it->second.ExpireSoftPinIfDeadlineMatches(
+                    entry.deadline, now)) {
+                ++expired_count;
             }
         }
-        expired_count += shard_expired_count;
+        begin = end;
     }
     if (expired_count > 0) {
         MasterMetricManager::instance().dec_soft_pin_key_count(expired_count);
@@ -1524,7 +1685,6 @@ void MasterService::CleanupExpiredSoftPins(
 void MasterService::GrantLeaseForGroup(const TenantState& tenant_state,
                                        const std::string& key,
                                        const ObjectMetadata& metadata) const {
-    (void)IsSoftPinActive(metadata, std::chrono::system_clock::now());
     if (!metadata.IsGrouped()) {
         metadata.GrantReadLease(default_kv_lease_ttl_);
         return;
@@ -1763,7 +1923,6 @@ auto MasterService::ExistKey(const std::string& key, const TenantId& tenant_id)
         if (ts) {
             GrantLeaseForGroup(*ts, key, metadata);
         } else {
-            (void)IsSoftPinActive(metadata, std::chrono::system_clock::now());
             metadata.GrantReadLease(default_kv_lease_ttl_);
         }
         return true;
@@ -2237,7 +2396,6 @@ auto MasterService::GetReplicaList(const std::string& key,
         if (ts) {
             GrantLeaseForGroup(*ts, key, metadata);
         } else {
-            (void)IsSoftPinActive(metadata, std::chrono::system_clock::now());
             metadata.GrantReadLease(default_kv_lease_ttl_);
         }
 
@@ -2509,12 +2667,12 @@ auto MasterService::AllocateAndInsertMetadata(
     MetadataShardAccessorRW& shard, const UUID& client_id,
     const std::string& key, uint64_t value_length,
     const ReplicateConfig& config, const std::string& group_id,
-    const TenantId& tenant_id,
-    const std::chrono::system_clock::time_point& now,
+    const TenantId& tenant_id, const std::chrono::system_clock::time_point& now,
     const ResolvedSoftPinRequest& soft_pin_request,
     std::optional<std::chrono::system_clock::time_point>
         committed_soft_pin_timeout)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+    const auto deadline_to_index = committed_soft_pin_timeout;
     auto& tenant_state = shard->tenants[tenant_id];
     if (tenant_state.metadata.contains(key)) {
         LOG(INFO) << "key=" << key << ", info=object_already_exists";
@@ -2724,6 +2882,11 @@ auto MasterService::AllocateAndInsertMetadata(
     IncrementTenantMetadataObjectCount(tenant_id);
     it->second.BeginSoftPinAction(soft_pin_request,
                                   std::move(eligible_replica_ids));
+    if (deadline_to_index) {
+        soft_pin_deadline_index_.Upsert(tenant_id.MakeScopedKey(key),
+                                        GetMetadataShardIndex(it->second),
+                                        *deadline_to_index);
+    }
     it->second.reserved_quota_charge_bytes = reserved_quota_charge;
     RegisterGroupMember(tenant_state, tenant_id, key, group_id);
     tenant_state.processing_keys.insert(key);
@@ -2957,7 +3120,7 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
         metadata.HasReplica(&Replica::fn_is_completed)) {
         const auto soft_pin_result =
             metadata.CommitPendingSoftPin(std::chrono::system_clock::now());
-        ApplySoftPinMetricDelta(soft_pin_result.metric_delta);
+        ApplySoftPinEvaluation(metadata, soft_pin_result);
     }
 
     const bool has_memory_replica = metadata.HasMemReplica();
@@ -6170,6 +6333,12 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
                   << MasterMetricManager::instance().get_allocated_mem_size();
     }
 
+    // The deadline index is derived runtime state. Rebuild it only after the
+    // restored metadata has gone through the existing expiration and lease
+    // survival rules. Tests that intentionally skip cleanup still register
+    // expired deadlines so the next sweep can normalize them.
+    RebuildSoftPinDeadlineIndex();
+
     // Rebuild total capacity metrics
     {
         MasterMetricManager::instance().reset_total_mem_capacity();
@@ -7676,6 +7845,7 @@ MasterService::MetadataSerializer::Deserialize(
 }
 
 void MasterService::MetadataSerializer::Reset() {
+    service_->soft_pin_deadline_index_.Clear();
     for (auto& shard : service_->metadata_shards_) {
         shard.tenants.clear();
     }

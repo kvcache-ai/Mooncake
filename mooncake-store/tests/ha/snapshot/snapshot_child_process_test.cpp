@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <regex>
 #include <string>
 #include <thread>
@@ -212,6 +213,31 @@ class SnapshotChildProcessTest : public ::testing::Test {
         return tenant_it != shard.tenants.end() &&
                tenant_it->second.metadata.find(key) !=
                    tenant_it->second.metadata.end();
+    }
+
+    size_t SoftPinRegistrationCount(MasterService* svc) {
+        return svc->soft_pin_deadline_index_.RegistrationCountForTest();
+    }
+
+    std::optional<std::chrono::system_clock::time_point> GetSoftPinDeadline(
+        MasterService* svc, const std::string& key) {
+        const size_t shard_idx =
+            svc->getMetadataShardIndex(TenantId::Default(), key);
+        MasterService::MetadataShardAccessorRO shard(svc, shard_idx);
+        const auto tenant_it = shard->tenants.find(TenantId::Default());
+        if (tenant_it == shard->tenants.end()) {
+            return std::nullopt;
+        }
+        const auto metadata_it = tenant_it->second.metadata.find(key);
+        if (metadata_it == tenant_it->second.metadata.end()) {
+            return std::nullopt;
+        }
+        return metadata_it->second.GetCommittedSoftPinTimeout();
+    }
+
+    void CleanupExpiredSoftPinsAt(
+        MasterService* svc, const std::chrono::system_clock::time_point& now) {
+        svc->CleanupExpiredSoftPins(now);
     }
 
     uint32_t GetShardIndexForTest(const std::string& key) {
@@ -950,6 +976,17 @@ TEST_F(SnapshotChildProcessTest,
     EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
               soft_pin_baseline + 1)
         << "Fallback restore must not double-count active soft pins";
+    EXPECT_EQ(SoftPinRegistrationCount(restored_service.get()), 1u)
+        << "Fallback restore must rebuild only the successful snapshot index";
+
+    const auto restored_deadline =
+        GetSoftPinDeadline(restored_service.get(), key1);
+    ASSERT_TRUE(restored_deadline.has_value());
+    CleanupExpiredSoftPinsAt(restored_service.get(), *restored_deadline);
+    EXPECT_FALSE(GetSoftPinDeadline(restored_service.get(), key1).has_value());
+    EXPECT_EQ(SoftPinRegistrationCount(restored_service.get()), 0u);
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              soft_pin_baseline);
 
     restored_service.reset();
 }
@@ -1165,11 +1202,14 @@ TEST_F(SnapshotChildProcessTest, RestoreCleansExpiredLease) {
     EXPECT_FALSE(KeyExistsInMetadata(restored_service.get(), expired_key))
         << "Lease-expired object should be cleaned during restore";
     EXPECT_TRUE(
-        restored_service->ExistKey(soft_expired_key, "default").value_or(false))
+        restored_service->ExistKey(soft_expired_key, TenantId::Default())
+            .value_or(false))
         << "Expired soft pin with a valid read lease should restore as cache";
     EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
               soft_pin_baseline)
         << "Expired restored soft pins must not remain in the active gauge";
+    EXPECT_EQ(SoftPinRegistrationCount(restored_service.get()), 0u)
+        << "Expired restored soft pins must not remain in the deadline index";
 
     restored_service.reset();
 }

@@ -10,9 +10,11 @@
 #include <cstdint>
 #include <functional>
 #include <list>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <queue>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
@@ -88,6 +90,7 @@ class BatchEvictBench;
  * 4. metadata_shards_[shard_idx_].mutex
  * 5. tenant_quota_recompute_mutex_
  * 6. ShardedTenantQuotaTable internal mutex or segment_mutex_
+ * 7. soft_pin_deadline_index_ mutex
  *
  * Strict tenant admission and policy mutation paths that need both
  * tenant_quota_policy_mutex_ and snapshot_mutex_ must acquire the tenant
@@ -877,6 +880,10 @@ class MasterService {
         struct SoftPinEvaluation {
             bool active{false};
             int metric_delta{0};
+            std::optional<std::chrono::system_clock::time_point>
+                removed_deadline;
+            std::optional<std::chrono::system_clock::time_point>
+                deadline_to_index;
         };
 
         struct PendingSoftPinAction {
@@ -1142,10 +1149,49 @@ class MasterService {
             const std::chrono::system_clock::time_point& now) const {
             SpinLocker locker(&lock);
             if (soft_pin_timeout && now >= *soft_pin_timeout) {
+                const auto removed_deadline = *soft_pin_timeout;
                 soft_pin_timeout.reset();
-                return {.active = false, .metric_delta = -1};
+                return {.active = false,
+                        .metric_delta = -1,
+                        .removed_deadline = removed_deadline,
+                        .deadline_to_index = std::nullopt};
             }
-            return {.active = soft_pin_timeout.has_value(), .metric_delta = 0};
+            return {.active = soft_pin_timeout.has_value(),
+                    .metric_delta = 0,
+                    .removed_deadline = std::nullopt,
+                    .deadline_to_index = std::nullopt};
+        }
+
+        bool ExpireSoftPinIfDeadlineMatches(
+            const std::chrono::system_clock::time_point& expected_deadline,
+            const std::chrono::system_clock::time_point& now) const {
+            SpinLocker locker(&lock);
+            if (!soft_pin_timeout || *soft_pin_timeout != expected_deadline ||
+                now < expected_deadline) {
+                return false;
+            }
+            soft_pin_timeout.reset();
+            return true;
+        }
+
+        static std::chrono::system_clock::time_point ComputeSoftPinDeadline(
+            const std::chrono::system_clock::time_point& now, uint64_t ttl_ms) {
+            using Milliseconds = std::chrono::milliseconds;
+            using MillisecondsRep = Milliseconds::rep;
+            const auto max_time = std::chrono::system_clock::time_point::max();
+            if (ttl_ms > static_cast<uint64_t>(
+                             std::numeric_limits<MillisecondsRep>::max())) {
+                return max_time;
+            }
+            const auto remaining_ms =
+                std::chrono::duration_cast<Milliseconds>(max_time - now)
+                    .count();
+            if (remaining_ms < 0 ||
+                ttl_ms > static_cast<uint64_t>(remaining_ms)) {
+                return max_time;
+            }
+            const auto ttl = Milliseconds(static_cast<MillisecondsRep>(ttl_ms));
+            return now + ttl;
         }
 
         std::optional<std::chrono::system_clock::time_point>
@@ -1185,7 +1231,12 @@ class MasterService {
 
             SpinLocker locker(&lock);
             int metric_delta = 0;
+            std::optional<std::chrono::system_clock::time_point>
+                removed_deadline;
+            std::optional<std::chrono::system_clock::time_point>
+                deadline_to_index;
             if (soft_pin_timeout && now >= *soft_pin_timeout) {
+                removed_deadline = *soft_pin_timeout;
                 soft_pin_timeout.reset();
                 --metric_delta;
             }
@@ -1196,6 +1247,7 @@ class MasterService {
                 case SoftPinAction::ENABLE:
                     if (pending.ttl_ms == 0) {
                         if (soft_pin_timeout) {
+                            removed_deadline = *soft_pin_timeout;
                             soft_pin_timeout.reset();
                             --metric_delta;
                         }
@@ -1204,18 +1256,25 @@ class MasterService {
                             ++metric_delta;
                         }
                         soft_pin_timeout =
-                            now + std::chrono::milliseconds(pending.ttl_ms);
+                            ComputeSoftPinDeadline(now, pending.ttl_ms);
+                        deadline_to_index = soft_pin_timeout;
+                        // Upserting the latest registration supersedes any
+                        // expired or previously active deadline.
+                        removed_deadline.reset();
                     }
                     break;
                 case SoftPinAction::DISABLE:
                     if (soft_pin_timeout) {
+                        removed_deadline = *soft_pin_timeout;
                         soft_pin_timeout.reset();
                         --metric_delta;
                     }
                     break;
             }
             return {.active = soft_pin_timeout.has_value(),
-                    .metric_delta = metric_delta};
+                    .metric_delta = metric_delta,
+                    .removed_deadline = removed_deadline,
+                    .deadline_to_index = deadline_to_index};
         }
 
         void ClearPendingSoftPinIfNoViableReplica() {
@@ -1385,6 +1444,53 @@ class MasterService {
         long disk_object_count GUARDED_BY(mutex) = 0;
     };
     std::array<MetadataShard, kNumShards> metadata_shards_;
+
+    class SoftPinDeadlineIndex {
+       public:
+        using TimePoint = std::chrono::system_clock::time_point;
+
+        struct Entry {
+            TimePoint deadline;
+            size_t shard_idx;
+            std::string scoped_key;
+        };
+
+        void Upsert(std::string scoped_key, size_t shard_idx,
+                    const TimePoint& deadline);
+        void Remove(const std::string& scoped_key);
+        void RemoveIfMatches(const std::string& scoped_key, size_t shard_idx,
+                             const TimePoint& deadline);
+        std::vector<Entry> PopExpired(const TimePoint& now);
+        void Clear();
+
+        size_t HeapSizeForTest() const;
+        size_t RegistrationCountForTest() const;
+
+       private:
+        struct Registration {
+            TimePoint deadline;
+            size_t shard_idx;
+        };
+
+        struct EarlierDeadline {
+            bool operator()(const Entry& lhs, const Entry& rhs) const {
+                return lhs.deadline > rhs.deadline;
+            }
+        };
+
+        static constexpr size_t kMinCompactionThreshold = 4096;
+        static constexpr size_t kCompactionRatio = 2;
+
+        void MaybeCompactLocked() REQUIRES(mutex_);
+
+        mutable std::mutex mutex_;
+        std::priority_queue<Entry, std::vector<Entry>, EarlierDeadline> heap_
+            GUARDED_BY(mutex_);
+        std::unordered_map<std::string, Registration> registrations_
+            GUARDED_BY(mutex_);
+    };
+
+    mutable SoftPinDeadlineIndex soft_pin_deadline_index_;
 
     static bool HasCompletedMemoryCacheReplica(const ObjectMetadata& metadata);
     static bool HasCompletedDiskCacheReplica(const ObjectMetadata& metadata);
@@ -1568,6 +1674,13 @@ class MasterService {
                             const std::string& key,
                             const ObjectMetadata& metadata) const;
     static void ApplySoftPinMetricDelta(int metric_delta);
+    size_t GetMetadataShardIndex(const ObjectMetadata& metadata) const;
+    void ApplySoftPinEvaluation(
+        const ObjectMetadata& metadata,
+        const ObjectMetadata::SoftPinEvaluation& result) const;
+    void RegisterCommittedSoftPin(const ObjectMetadata& metadata,
+                                  size_t shard_idx) const;
+    void RebuildSoftPinDeadlineIndex();
     bool IsSoftPinActive(
         const ObjectMetadata& metadata,
         const std::chrono::system_clock::time_point& now) const;

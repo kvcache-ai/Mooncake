@@ -1842,6 +1842,16 @@ TEST_F(MasterServiceSnapshotTest, SoftPinExpiresAndGetDoesNotReactivate) {
         std::chrono::milliseconds(kv_soft_pin_ttl + 10));
     ASSERT_TRUE(
         service_->GetReplicaList("pin_key", TenantId::Default()).has_value());
+
+    ReplicateConfig preserve;
+    ASSERT_TRUE(service_
+                    ->UpsertStart(client_id, "pin_key", TenantId::Default(),
+                                  value_size, preserve)
+                    .has_value());
+    ASSERT_TRUE(service_
+                    ->UpsertEnd(client_id, "pin_key", TenantId::Default(),
+                                ReplicaType::MEMORY)
+                    .has_value());
     EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
               baseline);
 }
