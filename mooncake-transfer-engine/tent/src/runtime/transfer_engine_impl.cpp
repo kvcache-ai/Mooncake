@@ -963,7 +963,7 @@ Status TransferEngineImpl::validateTransportHint(const Request& req,
     if (!transport_list_[req.transport_hint]) {
         return Status::InvalidArgument(
             "transport_hint=" +
-            TransportSelector::transportTypeName(req.transport_hint) +
+            std::string(transportTypeName(req.transport_hint)) +
             " is not enabled in config (request[" +
             std::to_string(request_index) + "])" LOC_MARK);
     }
@@ -1067,34 +1067,6 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
 
     return transport_selector_->select(ctx, transport_list_, transport_index,
                                        hint);
-}
-
-static const char* transportTypeName(TransportType type) {
-    switch (type) {
-        case UNSPEC:
-            return "UNSPEC";
-        case RDMA:
-            return "RDMA";
-        case MNNVL:
-            return "MNNVL";
-        case SHM:
-            return "SHM";
-        case NVLINK:
-            return "NVLINK";
-        case GDS:
-            return "GDS";
-        case IOURING:
-            return "IOURING";
-        case TCP:
-            return "TCP";
-        case AscendDirect:
-            return "AscendDirect";
-        case SUNRISE_LINK:
-            return "SUNRISE_LINK";
-        case TPU:
-            return "TPU";
-    }
-    return "UNKNOWN";
 }
 
 std::string printRequest(const Request& request) {

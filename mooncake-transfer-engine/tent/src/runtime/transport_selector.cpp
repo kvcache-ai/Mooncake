@@ -25,37 +25,6 @@
 namespace mooncake {
 namespace tent {
 
-// Transport type name mapping
-static const std::unordered_map<std::string, TransportType> kTransportNameMap =
-    {
-        {"unspec", UNSPEC},
-        {"rdma", RDMA},
-        {"mnnvl", MNNVL},
-        {"shm", SHM},
-        {"nvlink", NVLINK},
-        {"gds", GDS},
-        {"io_uring", IOURING},
-        {"tcp", TCP},
-        {"ascend", AscendDirect},
-        {"sunrise_link", SUNRISE_LINK},
-        {"tpu", TPU},
-};
-
-static const std::unordered_map<TransportType, std::string>
-    kTransportTypeNames = {
-        {UNSPEC, "unspec"},
-        {RDMA, "rdma"},
-        {MNNVL, "mnnvl"},
-        {SHM, "shm"},
-        {NVLINK, "nvlink"},
-        {GDS, "gds"},
-        {IOURING, "io_uring"},
-        {TCP, "tcp"},
-        {AscendDirect, "ascend"},
-        {SUNRISE_LINK, "sunrise_link"},
-        {TPU, "tpu"},
-};
-
 // Memory type name mapping for pattern matching
 static const std::string kMemoryTypeCpu = "cpu";
 static const std::string kMemoryTypeCuda = "cuda";
@@ -100,23 +69,6 @@ static std::optional<IntentType> parseIntentType(const json& value) {
     }
 
     return std::nullopt;
-}
-
-std::string TransportSelector::transportTypeName(TransportType type) {
-    auto it = kTransportTypeNames.find(type);
-    if (it != kTransportTypeNames.end()) {
-        return it->second;
-    }
-    return "unknown";
-}
-
-TransportType TransportSelector::parseTransportType(const std::string& str) {
-    auto it = kTransportNameMap.find(str);
-    if (it != kTransportNameMap.end()) {
-        return it->second;
-    }
-    LOG(WARNING) << "Unknown transport type: " << str;
-    return UNSPEC;
 }
 
 std::vector<SelectionPolicy> TransportSelector::getDefaultPolicies() {
@@ -270,8 +222,11 @@ void TransportSelector::loadPolicies() {
         if (policy_json.contains("transports")) {
             for (const auto& transport_str : policy_json["transports"]) {
                 if (!transport_str.is_string()) continue;
-                TransportType type =
-                    parseTransportType(transport_str.get<std::string>());
+                const auto name = transport_str.get<std::string>();
+                TransportType type = parseTransportType(name);
+                if (type == UNSPEC && name != "unspec") {
+                    LOG(WARNING) << "Unknown transport type: " << name;
+                }
                 if (type != UNSPEC) {
                     policy.transports.push_back(type);
                 }

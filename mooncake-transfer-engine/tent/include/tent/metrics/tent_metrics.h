@@ -202,24 +202,6 @@ class TentMetrics {
         "Transfers whose deadline was already in the past at submit",
         kTransportLabel};
 
-    // Pre-constructed label value lookup table, indexed by TransportType enum
-    // (see tent/common/types.h:46). Keeps label values in a closed set — no
-    // arbitrary strings can reach the metrics. Defined in tent_metrics.cpp.
-    static const std::array<std::string, kNumTransportTypes>
-        kTransportLabelNames;
-
-    // Bounds-checked lookup of the label string for a TransportType.
-    // Returns "unknown" if tp is out of range (defensive — should not happen
-    // with the closed-set enum, but guards against memory corruption or a
-    // new transport type added without updating the table).
-    static const std::string& transportLabel(TransportType tp) {
-        if (tp < 0 || tp >= kNumTransportTypes) {
-            static const std::string kUnknown = "unknown";
-            return kUnknown;
-        }
-        return kTransportLabelNames[tp];
-    }
-
     // Histograms - paired with their bucket boundaries in a single vector so
     // the two cannot drift out of sync (ylt histogram doesn't expose its
     // boundaries publicly, so we hold them alongside the pointer).
