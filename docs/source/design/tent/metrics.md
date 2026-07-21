@@ -172,32 +172,30 @@ The HTTP server provides multiple endpoints:
 ```
 # HELP tent_read_bytes_total Total bytes read via TENT
 # TYPE tent_read_bytes_total counter
-tent_read_bytes_total 1048576
+tent_read_bytes_total{transport="rdma"} 1048576
+tent_read_bytes_total{transport="tcp"} 524288
 
 # HELP tent_write_bytes_total Total bytes written via TENT
 # TYPE tent_write_bytes_total counter
-tent_write_bytes_total 524288
+tent_write_bytes_total{transport="rdma"} 524288
 
 # HELP tent_read_requests_total Total read requests via TENT
 # TYPE tent_read_requests_total counter
-tent_read_requests_total 100
-
-# HELP tent_write_requests_total Total write requests via TENT
-# TYPE tent_write_requests_total counter
-tent_write_requests_total 50
+tent_read_requests_total{transport="rdma"} 100
+tent_read_requests_total{transport="tcp"} 50
 
 # HELP tent_read_failures_total Total read failures via TENT
 # TYPE tent_read_failures_total counter
-tent_read_failures_total 2
+tent_read_failures_total{transport="tcp"} 2
 
-# HELP tent_write_failures_total Total write failures via TENT
-# TYPE tent_write_failures_total counter
-tent_write_failures_total 1
+# HELP tent_transport_failover_total Total cross-transport failover events
+# TYPE tent_transport_failover_total counter
+tent_transport_failover_total{from="rdma",to="tcp"} 1
 
 # HELP tent_read_latency_us Read latency distribution in microseconds
 # TYPE tent_read_latency_us histogram
-tent_read_latency_us_bucket{le="100"} 10
-tent_read_latency_us_bucket{le="500"} 50
+tent_read_latency_us_bucket{transport="rdma",le="100"} 10
+tent_read_latency_us_bucket{transport="rdma",le="500"} 50
 ...
 ```
 
@@ -220,30 +218,53 @@ Read: 1.00 MB (100 reqs, 2 fails) | Write: 512.00 KB (50 reqs, 1 fails)
 
 ## Available Metrics
 
-| Metric Name | Type | Description |
-|-------------|------|-------------|
-| `tent_read_bytes_total` | Counter | Total bytes read via TENT (success only; failures record no bytes) |
-| `tent_write_bytes_total` | Counter | Total bytes written via TENT (success only) |
-| `tent_read_requests_total` | Counter | Total read requests via TENT (success + failure) |
-| `tent_write_requests_total` | Counter | Total write requests via TENT (success + failure) |
-| `tent_read_failures_total` | Counter | Total read failures via TENT |
-| `tent_write_failures_total` | Counter | Total write failures via TENT |
-| `tent_transport_failover_total` | Counter | Total cross-transport failover events |
-| `tent_deadline_infeasible_total` | Counter | Transfers whose deadline was already in the past at submit time |
-| `tent_read_latency_us` | Histogram | Read latency distribution in microseconds |
-| `tent_write_latency_us` | Histogram | Write latency distribution in microseconds |
-| `tent_read_size_bytes` | Histogram | Read request size distribution in bytes |
-| `tent_write_size_bytes` | Histogram | Write request size distribution in bytes |
-| `tent_deadline_mlu_permille` | Histogram | Deadline feasibility ratio (MLU x 1000); 1000 = MLU 1.0 (the met/missed boundary) |
-| `tent_stage_queue_wait_us` | Histogram | Causal chain: queue wait latency in microseconds |
-| `tent_stage_dispatch_us` | Histogram | Causal chain: dispatch latency in microseconds |
-| `tent_stage_transport_us` | Histogram | Causal chain: transport execution latency in microseconds |
+| Metric Name | Type | Labels | Description |
+|-------------|------|--------|-------------|
+| `tent_read_bytes_total` | Counter | `transport` | Total bytes read via TENT (success only; failures record no bytes) |
+| `tent_write_bytes_total` | Counter | `transport` | Total bytes written via TENT (success only) |
+| `tent_read_requests_total` | Counter | `transport` | Total read requests via TENT (success + failure) |
+| `tent_write_requests_total` | Counter | `transport` | Total write requests via TENT (success + failure) |
+| `tent_read_failures_total` | Counter | `transport` | Total read failures via TENT |
+| `tent_write_failures_total` | Counter | `transport` | Total write failures via TENT |
+| `tent_transport_failover_total` | Counter | `from`, `to` | Total cross-transport failover events |
+| `tent_deadline_infeasible_total` | Counter | `transport` | Transfers whose deadline was already in the past at submit time |
+| `tent_read_latency_us` | Histogram | `transport` | Read latency distribution in microseconds |
+| `tent_write_latency_us` | Histogram | `transport` | Write latency distribution in microseconds |
+| `tent_read_size_bytes` | Histogram | `transport` | Read request size distribution in bytes |
+| `tent_write_size_bytes` | Histogram | `transport` | Write request size distribution in bytes |
+| `tent_deadline_mlu_permille` | Histogram | `transport` | Deadline feasibility ratio (MLU x 1000); 1000 = MLU 1.0 (the met/missed boundary) |
+| `tent_stage_queue_wait_us` | Histogram | `transport` | Causal chain: queue wait latency in microseconds |
+| `tent_stage_dispatch_us` | Histogram | `transport` | Causal chain: dispatch latency in microseconds |
+| `tent_stage_transport_us` | Histogram | `transport` | Causal chain: transport execution latency in microseconds |
 
 **Notes**:
 - `*_requests_total` counts both successful and failed requests. To compute the success rate, use `1 - (failures / requests)`.
 - `*_failures_total` does not record bytes; failed transfers transfer no bytes.
 - `tent_deadline_infeasible_total` is a dedicated counter (not a histogram sentinel) so infeasible-at-submit cases are distinguishable from genuine high-MLU samples.
 - yalantinglibs omits zero-valued counters/histograms from the Prometheus output, so a metric only appears once it has been observed at least once.
+
+### Labels
+
+All metrics carry a `transport` label (the `tent_transport_failover_total`
+counter uses `from` and `to` instead) so every metric can be sliced by
+transport without grepping logs. Label values come exclusively from the
+`TransportType` enum closed set — no arbitrary strings are accepted, and
+the closed set is enforced at the type level via a pre-built lookup table
+indexed by enum.
+
+| Label | Values | Description |
+|-------|--------|-------------|
+| `transport` | `unspec`, `rdma`, `mnnvl`, `shm`, `nvlink`, `gds`, `io_uring`, `tcp`, `ascend`, `sunrise_link`, `tpu` | The transport that handled the transfer |
+| `from` | (same set) | Transport that failed before failover |
+| `to` | (same set) | Transport that the failover switched to |
+
+Label values are aligned with `TransportSelector::transportTypeName()`.
+`unspec` covers transfers that failed before a transport was selected.
+
+**Cardinality**: the `transport` label has 11 values; the failover
+`from`/`to` pair has at most 11x11 = 121 combinations (in practice only a
+few pairs ever occur). Total series across all metrics is bounded at
+~1500.
 
 ## Integration with TransferEngine
 
@@ -379,18 +400,31 @@ scrape_configs:
 ### Grafana Queries
 
 ```promql
-# Transfer throughput (MB/s)
+# Transfer throughput (MB/s) — all transports
 rate(tent_read_bytes_total[5m]) / 1024 / 1024
 rate(tent_write_bytes_total[5m]) / 1024 / 1024
+
+# Transfer throughput (MB/s) — per transport
+rate(tent_read_bytes_total{transport="rdma"}[5m]) / 1024 / 1024
+rate(tent_read_bytes_total{transport="tcp"}[5m]) / 1024 / 1024
 
 # Request rate
 rate(tent_read_requests_total[5m])
 rate(tent_write_requests_total[5m])
 
-# Failure rate
+# Failure rate (all transports)
 rate(tent_read_failures_total[5m]) / rate(tent_read_requests_total[5m])
+
+# Failure rate (per transport)
+rate(tent_read_failures_total{transport="tcp"}[5m]) / rate(tent_read_requests_total{transport="tcp"}[5m])
 
 # P99 latency (note: latency is in microseconds, convert to seconds for display)
 histogram_quantile(0.99, rate(tent_read_latency_us_bucket[5m])) / 1000000
 histogram_quantile(0.99, rate(tent_write_latency_us_bucket[5m])) / 1000000
+
+# P99 latency per transport
+histogram_quantile(0.99, rate(tent_read_latency_us_bucket{transport="rdma"}[5m])) / 1000000
+
+# Failover rate by transport pair
+rate(tent_transport_failover_total{from="rdma",to="tcp"}[5m])
 ```
