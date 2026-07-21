@@ -214,7 +214,8 @@ std::vector<tl::expected<ResultType, ErrorCode>> DummyClient::invoke_batch_rpc(
 }
 
 DummyClient::DummyClient()
-    : client_id_(generate_uuid()),
+    : client_accessor_(GetStoreRpcClientIoContextPool()),
+      client_id_(generate_uuid()),
       metrics_(ClientMetric::Create(merge_labels({{"client_mode", "dummy"}}),
                                     false)) {
     // Initialize logging severity (leave as before)

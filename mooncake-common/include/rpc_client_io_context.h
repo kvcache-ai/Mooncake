@@ -15,12 +15,14 @@
 namespace mooncake {
 
 /**
- * Return Mooncake's process-wide YLT RPC client I/O context pool.
+ * Return the Store or Transfer Engine YLT RPC client I/O context pool.
  *
- * MC_RPC_CLIENT_IO_THREADS is read when this function is first called.
- * Subsequent environment changes have no effect.
+ * Each component has an independent pool so data-plane activity cannot starve
+ * Store control-plane RPCs. Environment settings are read when the respective
+ * function is first called; subsequent changes have no effect.
  */
-coro_io::io_context_pool& GetRpcClientIoContextPool();
+coro_io::io_context_pool& GetStoreRpcClientIoContextPool();
+coro_io::io_context_pool& GetTransferEngineRpcClientIoContextPool();
 
 /**
  * A replaceable client pool for callers that communicate with one target at a
@@ -32,9 +34,9 @@ class RpcClientPool {
     using ClientPool = coro_io::client_pool<coro_rpc::coro_rpc_client>;
     using PoolConfig = ClientPool::pool_config;
 
-    RpcClientPool() : RpcClientPool(PoolConfig{}) {}
-
-    explicit RpcClientPool(PoolConfig config) : config_(std::move(config)) {
+    explicit RpcClientPool(coro_io::io_context_pool& io_context_pool,
+                           PoolConfig config = {})
+        : io_context_pool_(io_context_pool), config_(std::move(config)) {
         // Address replacement supersedes background recovery of the old host.
         config_.host_alive_detect_duration = std::chrono::seconds(0);
     }
@@ -43,8 +45,8 @@ class RpcClientPool {
         std::string_view address) {
         std::lock_guard<std::shared_mutex> lock(mutex_);
         if (!client_pool_ || address_ != address) {
-            client_pool_ = ClientPool::create(address, config_,
-                                              GetRpcClientIoContextPool());
+            client_pool_ =
+                ClientPool::create(address, config_, io_context_pool_);
             address_ = address;
         }
         return client_pool_;
@@ -57,6 +59,7 @@ class RpcClientPool {
 
    private:
     mutable std::shared_mutex mutex_;
+    coro_io::io_context_pool& io_context_pool_;
     PoolConfig config_;
     std::string address_;
     std::shared_ptr<ClientPool> client_pool_;

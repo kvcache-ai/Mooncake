@@ -75,7 +75,8 @@ class MasterClient {
    public:
     MasterClient(const UUID& client_id, MasterClientMetric* metrics = nullptr,
                  std::string tenant_id = "default")
-        : client_accessor_(detail::MakeMasterRpcClientPoolConfig()),
+        : client_accessor_(GetStoreRpcClientIoContextPool(),
+                           detail::MakeMasterRpcClientPoolConfig()),
           client_id_(client_id),
           tenant_id_(NormalizeTenantId(std::move(tenant_id))),
           metrics_(metrics) {}

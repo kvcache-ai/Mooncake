@@ -9,6 +9,45 @@
 
 namespace mooncake {
 
+namespace {
+
+constexpr char kRpcClientIoThreadsEnv[] = "MC_RPC_CLIENT_IO_THREADS";
+constexpr char kStoreRpcClientIoThreadsEnv[] = "MC_STORE_RPC_CLIENT_IO_THREADS";
+constexpr char kTransferEngineRpcClientIoThreadsEnv[] =
+    "MC_TE_RPC_CLIENT_IO_THREADS";
+constexpr unsigned kDefaultRpcClientIoThreads = 16;
+
+unsigned GetRpcClientIoThreadsFor(const char* component_env,
+                                  unsigned hardware_threads) {
+    const size_t default_value = std::min<size_t>(
+        kDefaultRpcClientIoThreads, std::max<size_t>(1, hardware_threads));
+    const size_t common_value =
+        Environ::GetSizeT(kRpcClientIoThreadsEnv, default_value);
+    const size_t common_fallback =
+        common_value == 0 || common_value > std::numeric_limits<unsigned>::max()
+            ? default_value
+            : common_value;
+    if (common_fallback != common_value) {
+        std::cerr << "[Mooncake] Warning: invalid value '" << common_value
+                  << "' for env " << kRpcClientIoThreadsEnv
+                  << ", using default " << default_value << std::endl;
+    }
+
+    const size_t configured =
+        component_env == nullptr
+            ? common_fallback
+            : Environ::GetSizeT(component_env, common_fallback);
+    if (configured == 0 || configured > std::numeric_limits<unsigned>::max()) {
+        std::cerr << "[Mooncake] Warning: invalid value '" << configured
+                  << "' for env " << component_env << ", using fallback "
+                  << common_fallback << std::endl;
+        return static_cast<unsigned>(common_fallback);
+    }
+    return static_cast<unsigned>(configured);
+}
+
+}  // namespace
+
 Environ& Environ::Get() {
     static Environ instance;
     return instance;
@@ -88,16 +127,18 @@ std::string Environ::GetString(const char* name,
 }
 
 unsigned Environ::GetRpcClientIoThreads(unsigned hardware_threads) {
-    constexpr char kEnvName[] = "MC_RPC_CLIENT_IO_THREADS";
-    const size_t default_value = std::max<size_t>(1, hardware_threads);
-    const size_t configured = GetSizeT(kEnvName, default_value);
-    if (configured == 0 || configured > std::numeric_limits<unsigned>::max()) {
-        std::cerr << "[Mooncake] Warning: invalid value '" << configured
-                  << "' for env " << kEnvName << ", using default "
-                  << default_value << std::endl;
-        return static_cast<unsigned>(default_value);
-    }
-    return static_cast<unsigned>(configured);
+    return GetRpcClientIoThreadsFor(nullptr, hardware_threads);
+}
+
+unsigned Environ::GetStoreRpcClientIoThreads(unsigned hardware_threads) {
+    return GetRpcClientIoThreadsFor(kStoreRpcClientIoThreadsEnv,
+                                    hardware_threads);
+}
+
+unsigned Environ::GetTransferEngineRpcClientIoThreads(
+    unsigned hardware_threads) {
+    return GetRpcClientIoThreadsFor(kTransferEngineRpcClientIoThreadsEnv,
+                                    hardware_threads);
 }
 
 Environ::Environ() {

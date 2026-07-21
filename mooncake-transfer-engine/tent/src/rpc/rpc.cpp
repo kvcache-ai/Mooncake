@@ -181,7 +181,7 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
 
     if (!lease.client) {
         lease.client = std::make_unique<coro_rpc_client>(
-            GetRpcClientIoContextPool().get_executor());
+            GetTransferEngineRpcClientIoContextPool().get_executor());
         auto conn_result = co_await lease.client->connect(server_addr);
         if (conn_result.val() != 0) {
             lease.broken = true;

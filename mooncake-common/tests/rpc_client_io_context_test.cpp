@@ -20,14 +20,19 @@ class AddressSwitchService {
 };
 
 TEST(RpcClientIoContextPoolTest, UsesConfiguredSizeAndReusesPool) {
-    auto& io_pool = GetRpcClientIoContextPool();
-    ASSERT_EQ(io_pool.pool_size(), 2U);
+    auto& store_pool = GetStoreRpcClientIoContextPool();
+    auto& transfer_engine_pool = GetTransferEngineRpcClientIoContextPool();
+    ASSERT_EQ(store_pool.pool_size(), 2U);
+    ASSERT_EQ(transfer_engine_pool.pool_size(), 3U);
 
-    EXPECT_EQ(&GetRpcClientIoContextPool(), &io_pool);
+    EXPECT_EQ(&GetStoreRpcClientIoContextPool(), &store_pool);
+    EXPECT_EQ(&GetTransferEngineRpcClientIoContextPool(),
+              &transfer_engine_pool);
+    EXPECT_NE(&store_pool, &transfer_engine_pool);
 }
 
 TEST(RpcClientIoContextPoolTest, ReplacesPoolWhenTargetChanges) {
-    RpcClientPool pools;
+    RpcClientPool pools(GetStoreRpcClientIoContextPool());
 
     auto first = pools.GetOrCreateClientPool("127.0.0.1:10001");
     std::weak_ptr<RpcClientPool::ClientPool> old_pool = first;
@@ -52,7 +57,7 @@ TEST(RpcClientIoContextPoolTest, SendsToNewAddressAfterSwitch) {
     ASSERT_FALSE(first_server.async_start().hasResult());
     ASSERT_FALSE(second_server.async_start().hasResult());
 
-    RpcClientPool pools;
+    RpcClientPool pools(GetStoreRpcClientIoContextPool());
 
     const auto call = [&](uint16_t port) {
         auto pool =

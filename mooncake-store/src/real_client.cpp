@@ -5731,7 +5731,7 @@ ClientRequester::ClientRequester() {
 
     client_pools_ =
         std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(
-            pool_conf, GetRpcClientIoContextPool());
+            pool_conf, GetStoreRpcClientIoContextPool());
 }
 
 tl::expected<BatchGetOffloadObjectResponse, ErrorCode>

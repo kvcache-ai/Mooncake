@@ -132,7 +132,8 @@ struct RpcCommunicatorConfig {
     size_t thread_count = 0;
     size_t timeout_seconds = 30;
     // Maximum number of cached RPC client connections per target endpoint.
-    // RPC client I/O threads are configured by MC_RPC_CLIENT_IO_THREADS.
+    // RPC client I/O threads are configured by
+    // MC_TE_RPC_CLIENT_IO_THREADS/MC_RPC_CLIENT_IO_THREADS.
     size_t pool_size = 10;
 };
 

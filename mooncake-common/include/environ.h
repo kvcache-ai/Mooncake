@@ -84,9 +84,14 @@ class Environ {
     // Helper method to get string from env
     static std::string GetString(const char* name,
                                  const std::string& default_value);
-    // RPC client I/O contexts use one thread per context. Invalid values and
-    // zero fall back to the online hardware thread count, with a minimum of 1.
+    // RPC client I/O contexts use one thread per context. Component-specific
+    // settings fall back to MC_RPC_CLIENT_IO_THREADS, then to the smaller of
+    // 16 and the online hardware thread count (with a minimum of 1).
     static unsigned GetRpcClientIoThreads(
+        unsigned hardware_threads = std::thread::hardware_concurrency());
+    static unsigned GetStoreRpcClientIoThreads(
+        unsigned hardware_threads = std::thread::hardware_concurrency());
+    static unsigned GetTransferEngineRpcClientIoThreads(
         unsigned hardware_threads = std::thread::hardware_concurrency());
 
    private:

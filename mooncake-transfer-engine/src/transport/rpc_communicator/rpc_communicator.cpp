@@ -72,7 +72,7 @@ bool RpcCommunicator::initialize(const RpcCommunicatorConfig& config) {
     }
     client_pools_ =
         std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(
-            pool_conf, GetRpcClientIoContextPool());
+            pool_conf, GetTransferEngineRpcClientIoContextPool());
 
     LOG(INFO) << "Created coro_rpc client pools with up to "
               << pool_conf.max_connection << " cached connections per target";
