@@ -411,6 +411,26 @@ int tentStatusToClassicReturn(const mooncake::tent::Status& status) {
     }
 }
 
+TransferStatusEnum tentTransferStatusToClassic(
+    mooncake::tent::TransferStatusEnum status) {
+    switch (status) {
+        case mooncake::tent::TransferStatusEnum::INITIAL:
+        case mooncake::tent::TransferStatusEnum::PENDING:
+            return TransferStatusEnum::WAITING;
+        case mooncake::tent::TransferStatusEnum::INVALID:
+            return TransferStatusEnum::INVALID;
+        case mooncake::tent::TransferStatusEnum::CANCELED:
+            return TransferStatusEnum::CANCELED;
+        case mooncake::tent::TransferStatusEnum::COMPLETED:
+            return TransferStatusEnum::COMPLETED;
+        case mooncake::tent::TransferStatusEnum::TIMEOUT:
+            return TransferStatusEnum::TIMEOUT;
+        case mooncake::tent::TransferStatusEnum::FAILED:
+        default:
+            return TransferStatusEnum::FAILED;
+    }
+}
+
 bool containsOverlappingRange(
     const std::vector<std::pair<uintptr_t, uint64_t>>& ranges, uintptr_t base,
     uint64_t length) {
@@ -1238,7 +1258,7 @@ Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,
         mooncake::tent::TransferStatus tent_status;
         auto s = impl_tent_->getTransferStatus(batch_id, task_id, tent_status);
         if (!s.ok()) return tentStatusToClassicStatus(s);
-        status.s = (TransferStatusEnum)(int)tent_status.s;
+        status.s = tentTransferStatusToClassic(tent_status.s);
         status.transferred_bytes = tent_status.transferred_bytes;
         return Status::OK();
     } else {
@@ -1257,7 +1277,7 @@ Status TransferEngine::getBatchTransferStatus(BatchID batch_id,
         mooncake::tent::TransferStatus tent_status;
         auto s = impl_tent_->getTransferStatus(batch_id, tent_status);
         if (!s.ok()) return tentStatusToClassicStatus(s);
-        status.s = (TransferStatusEnum)(int)tent_status.s;
+        status.s = tentTransferStatusToClassic(tent_status.s);
         status.transferred_bytes = tent_status.transferred_bytes;
         return Status::OK();
     } else
