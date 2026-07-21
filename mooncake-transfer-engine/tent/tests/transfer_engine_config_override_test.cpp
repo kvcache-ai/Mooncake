@@ -317,6 +317,19 @@ TEST(TransferEngineConfigOverrideTest,
         config.get("transports/rdma/workers/track_posted_slices", false));
 }
 
+TEST(TransferEngineConfigOverrideTest, LegacyMlx5UdpSportsDropsInvalidPorts) {
+    EnvVarGuard guard("MC_MLX5_QP_UDP_SPORTS",
+                      "40000, invalid, 0, 65536, 40001");
+
+    Config config;
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+
+    std::vector<uint16_t> expected_sports{40000, 40001};
+    EXPECT_EQ(config.getArray<uint16_t>(
+                  "transports/rdma/endpoint/mlx5_qp_udp_sports"),
+              expected_sports);
+}
+
 TEST(TransferEngineConfigOverrideTest, FilterNicEnvLoadsRdmaWhitelist) {
     EnvVarGuard guard("MC_TE_FILTERS", "mlx5_0,mlx5_1");
 

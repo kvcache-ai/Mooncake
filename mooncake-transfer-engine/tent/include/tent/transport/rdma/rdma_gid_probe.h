@@ -120,6 +120,11 @@ inline std::optional<AutoGidCandidateClass> classifyAutoGidCandidate(
     return AutoGidCandidateClass::kNoNetworkRoutable;
 }
 
+inline int autoGidCandidateClassPriority(
+    AutoGidCandidateClass candidate_class) {
+    return static_cast<int>(candidate_class);
+}
+
 inline std::vector<AutoGidSelection> rankAutoGidCandidates(
     const std::vector<AutoGidCandidate>& candidates) {
     std::vector<AutoGidSelection> ranked;
@@ -144,8 +149,10 @@ inline std::vector<AutoGidSelection> rankAutoGidCandidates(
     std::stable_sort(
         ranked.begin(), ranked.end(),
         [](const AutoGidSelection& lhs, const AutoGidSelection& rhs) {
-            int lhs_priority = static_cast<int>(lhs.candidate_class);
-            int rhs_priority = static_cast<int>(rhs.candidate_class);
+            int lhs_priority =
+                autoGidCandidateClassPriority(lhs.candidate_class);
+            int rhs_priority =
+                autoGidCandidateClassPriority(rhs.candidate_class);
             if (lhs_priority != rhs_priority) {
                 return lhs_priority < rhs_priority;
             }

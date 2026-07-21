@@ -162,6 +162,26 @@ TEST_P(EndpointStoreTest, RemoveReturnsPeerKeyForConnectPause) {
     EXPECT_EQ(store->size(), 0);
 }
 
+TEST_P(EndpointStoreTest, RemoveRemainsCompatibleWithoutPeerKeyOutput) {
+    auto store = makeStore();
+    auto endpoint = std::make_shared<RdmaEndPoint>();
+    auto* raw = endpoint.get();
+    insertActive(*store, "127.0.0.1:1234@mlx5_0", std::move(endpoint));
+
+    EXPECT_EQ(store->remove(raw), 0);
+    EXPECT_EQ(store->size(), 0);
+}
+
+TEST_P(EndpointStoreTest, RemoveMissDoesNotOverwritePeerKeyOutput) {
+    auto store = makeStore();
+    auto endpoint = std::make_shared<RdmaEndPoint>();
+    std::string removed_key = "sentinel";
+
+    EXPECT_NE(store->remove(endpoint.get(), &removed_key), 0);
+    EXPECT_EQ(removed_key, "sentinel");
+    EXPECT_EQ(store->size(), 0);
+}
+
 TEST_P(EndpointStoreTest, ReclaimDrainsBacklogWithoutActiveMapEntries) {
     auto store = makeStore();
 
