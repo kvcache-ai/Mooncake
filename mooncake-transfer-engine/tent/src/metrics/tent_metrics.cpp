@@ -31,22 +31,23 @@ TentMetrics::~TentMetrics() { shutdown(); }
 #if TENT_METRICS_ENABLED
 
 Status TentMetrics::initialize(const MetricsConfig& config) {
-    // Use compare_exchange to prevent race condition during initialization
-    bool expected = false;
-    if (!initialized_.compare_exchange_strong(expected, true)) {
-        return Status::OK();  // Already initialized by another thread
-    }
-
-    // Validate configuration before doing anything else. An invalid config
+    // Validate configuration before touching initialized_. An invalid config
     // (e.g. port 0, zero HTTP threads) would otherwise cause confusing
     // failures inside initHttpServer(); fail fast with a clear error instead.
+    // Validating before the compare_exchange avoids a window where
+    // initialized_ is set to true and then rolled back on failure.
     std::string error_msg;
     if (!MetricsConfigLoader::validateConfig(config, &error_msg)) {
         LOG(ERROR) << "Invalid TENT metrics config: " << error_msg
                    << "; metrics disabled";
-        initialized_.store(false, std::memory_order_relaxed);
         return Status::InvalidArgument(
             "Invalid TENT metrics config: " + error_msg + LOC_MARK);
+    }
+
+    // Use compare_exchange to prevent race condition during initialization
+    bool expected = false;
+    if (!initialized_.compare_exchange_strong(expected, true)) {
+        return Status::OK();  // Already initialized by another thread
     }
 
     config_ = config;
