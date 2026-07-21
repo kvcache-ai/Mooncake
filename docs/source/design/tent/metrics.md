@@ -118,28 +118,28 @@ tent_metrics.initialize(config);
 
 ```cpp
 // Using convenience macros (recommended)
-TENT_RECORD_READ_COMPLETED(1024*1024, 0.025);   // 1MB read in 25ms
-TENT_RECORD_WRITE_COMPLETED(512*1024, 0.015);   // 512KB write in 15ms
-TENT_RECORD_READ_FAILED();                       // read failed (no bytes recorded)
-TENT_RECORD_WRITE_FAILED();                      // write failed (no bytes recorded)
-TENT_RECORD_TRANSPORT_FAILOVER();                // cross-transport failover event
+TENT_RECORD_READ_COMPLETED(RDMA, 1024*1024, 0.025);   // 1MB read in 25ms
+TENT_RECORD_WRITE_COMPLETED(RDMA, 512*1024, 0.015);    // 512KB write in 15ms
+TENT_RECORD_READ_FAILED(TCP);                           // read failed (no bytes recorded)
+TENT_RECORD_WRITE_FAILED(TCP);                          // write failed (no bytes recorded)
+TENT_RECORD_TRANSPORT_FAILOVER(RDMA, TCP);              // cross-transport failover event
 
 // Direct API usage
 auto& tent_metrics = TentMetrics::instance();
-tent_metrics.recordReadCompleted(1024*1024, 0.025);
-tent_metrics.recordWriteCompleted(512*1024, 0.015);
-tent_metrics.recordReadFailed();
-tent_metrics.recordWriteFailed();
-tent_metrics.recordTransportFailover();
+tent_metrics.recordReadCompleted(RDMA, 1024*1024, 0.025);
+tent_metrics.recordWriteCompleted(RDMA, 512*1024, 0.015);
+tent_metrics.recordReadFailed(TCP);
+tent_metrics.recordWriteFailed(TCP);
+tent_metrics.recordTransportFailover(RDMA, TCP);
 
 // Deadline feasibility (RFC #2519, observability only):
-tent_metrics.recordDeadlineMLU(0.8);        // MLU < 1 met the deadline
-tent_metrics.recordDeadlineInfeasible();     // deadline was in the past at submit
+tent_metrics.recordDeadlineMLU(RDMA, 0.8);        // MLU < 1 met the deadline
+tent_metrics.recordDeadlineInfeasible(TCP);        // deadline was in the past at submit
 
 // Causal-chain per-stage latency breakdown (microseconds):
-tent_metrics.recordStageLatency(TentMetrics::Stage::QueueWait, 12.0);
-tent_metrics.recordStageLatency(TentMetrics::Stage::Dispatch, 45.0);
-tent_metrics.recordStageLatency(TentMetrics::Stage::Transport, 130.0);
+tent_metrics.recordStageLatency(TentMetrics::Stage::QueueWait, RDMA, 12.0);
+tent_metrics.recordStageLatency(TentMetrics::Stage::Dispatch, RDMA, 45.0);
+tent_metrics.recordStageLatency(TentMetrics::Stage::Transport, RDMA, 130.0);
 ```
 
 ### RAII Latency Measurement
@@ -147,12 +147,12 @@ tent_metrics.recordStageLatency(TentMetrics::Stage::Transport, 130.0);
 ```cpp
 // Automatic latency measurement using RAII
 {
-    TENT_SCOPED_READ_LATENCY(1024 * 1024); // e.g. 1MB
+    TENT_SCOPED_READ_LATENCY(RDMA, 1024 * 1024); // e.g. 1MB
     // ... perform read operation ...
 }  // latency automatically recorded when scope exits
 
 {
-    TENT_SCOPED_WRITE_LATENCY(512 * 1024); // e.g. 512KB
+    TENT_SCOPED_WRITE_LATENCY(RDMA, 512 * 1024); // e.g. 512KB
     // ... perform write operation ...
 }
 ```

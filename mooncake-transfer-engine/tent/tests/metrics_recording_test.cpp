@@ -674,6 +674,27 @@ TEST_F(MetricsHttpTest, PrometheusEndpointExposesAllCounters) {
               std::string::npos);
 }
 
+TEST_F(MetricsHttpTest, PrometheusLabelsDistinguishTransports) {
+    // Record the same metric with different transports.
+    TentMetrics::instance().recordReadCompleted(RDMA, 1024, 0.001);
+    TentMetrics::instance().recordReadCompleted(TCP, 2048, 0.002);
+    TentMetrics::instance().recordTransportFailover(RDMA, TCP);
+
+    auto resp = retryGet("/metrics");
+    EXPECT_EQ(resp.http_status, 200);
+
+    // Per-transport labels must appear as separate lines.
+    EXPECT_NE(resp.body.find("tent_read_bytes_total{transport=\"rdma\"}"),
+              std::string::npos);
+    EXPECT_NE(resp.body.find("tent_read_bytes_total{transport=\"tcp\"}"),
+              std::string::npos);
+
+    // Failover counter must carry from/to labels.
+    EXPECT_NE(resp.body.find(
+                  "tent_transport_failover_total{from=\"rdma\",to=\"tcp\"}"),
+              std::string::npos);
+}
+
 TEST_F(MetricsHttpTest, JsonEndpointValid) {
     TentMetrics::instance().recordReadCompleted(UNSPEC, 512, 0.0005);
 
