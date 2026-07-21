@@ -344,6 +344,15 @@ TEST_F(TransportTest, RegisterLocalMemoryBatchRejectsOverlappingBuffers) {
               ERR_ADDRESS_OVERLAPPED);
 }
 
+TEST_F(TransportTest, NvlinkFabricCapabilityDefaultsToFalse) {
+    TransferEngine engine(false);
+    EXPECT_FALSE(engine.supportsNvlinkFabricMemory());
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    EXPECT_FALSE(engine.supportsNvlinkFabricMemory());
+    ASSERT_NE(engine.installTransport("tcp", nullptr), nullptr);
+    EXPECT_FALSE(engine.supportsNvlinkFabricMemory());
+}
+
 TEST_F(TransportTest, RegisterLocalMemoryBatchRejectsZeroLengthBuffer) {
     TransferEngine engine(false);
     ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);

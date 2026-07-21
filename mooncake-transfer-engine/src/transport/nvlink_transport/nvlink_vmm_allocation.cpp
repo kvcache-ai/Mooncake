@@ -26,6 +26,7 @@
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include <glog/logging.h>
 
@@ -132,9 +133,14 @@ bool retryCleanupPendingVmmOwners() noexcept {
                 "cleanup-pending VMM retry threw an unknown exception");
         }
         if (!status.ok()) {
-            LOG(ERROR) << "NvlinkVmmAllocation: cleanup-pending owner retry "
-                          "failed; retaining CUDA ownership: "
-                       << status;
+            LOG_EVERY_N(ERROR, 100)
+                << "NvlinkVmmAllocation: cleanup-pending owner retry failed; "
+                   "retaining CUDA ownership: base="
+                << node->owner->base() << ", length=" << node->owner->length()
+                << ", location_type="
+                << static_cast<int>(node->owner->location_type())
+                << ", location_id=" << node->owner->location_id()
+                << ", error=" << status;
             all_released = false;
             quarantineCleanupPendingVmmOwner(std::move(node));
         }
@@ -382,12 +388,17 @@ Status NvlinkVmmAllocation::Release() {
     if (handle_owned_) {
         if (!driver_api_.mem_release)
             return missingDriverFunction("cuMemRelease");
-        CUresult result = driver_api_.mem_release(
-            static_cast<CUmemGenericAllocationHandle>(allocation_handle_));
-        if (result != CUDA_SUCCESS)
-            return cudaDriverFailure("cuMemRelease", result);
+        const CUmemGenericAllocationHandle handle =
+            static_cast<CUmemGenericAllocationHandle>(allocation_handle_);
+        // CUDA documents that a driver call may surface an earlier
+        // asynchronous error. Once cuMemRelease is invoked its outcome is
+        // therefore ambiguous on failure; retrying the same opaque handle can
+        // become a double release if the reference was already consumed.
         handle_owned_ = false;
         allocation_handle_ = 0;
+        CUresult result = driver_api_.mem_release(handle);
+        if (result != CUDA_SUCCESS)
+            return cudaDriverFailure("cuMemRelease", result);
     }
 
     base_ = nullptr;
@@ -515,8 +526,10 @@ Status NvlinkVmmAllocation::CreateWithDriverApi(
     std::unique_ptr<NvlinkVmmAllocation>& allocation) {
     allocation.reset();
     if (!RetryCleanupPendingOwners()) {
+        const size_t pending_count = CleanupPendingOwnerCount();
         return Status::Memory(
-            "a previous VMM factory rollback is still pending cleanup");
+            "a previous VMM factory rollback is still pending cleanup; " +
+            std::to_string(pending_count) + " owner(s) retained");
     }
     if (options.requested_length == 0)
         return Status::InvalidArgument(
@@ -591,6 +604,46 @@ Status NvlinkVmmAllocation::CreateWithDriverApi(
     owner->fabric_exportable_ = options.fabric_exportable;
     owner->driver_api_ = api;
 
+    // Build the complete access descriptor batch before acquiring any CUDA
+    // resource. A vector allocation failure must not enter the rollback path,
+    // whose ownership recording is deliberately allocation-free.
+    std::vector<CUmemAccessDesc> access_descs;
+    int device_count = 0;
+    CUresult result = api.device_get_count(&device_count);
+    if (result != CUDA_SUCCESS)
+        return cudaDriverFailure("cuDeviceGetCount", result);
+    if (device_count <= 0) {
+        return Status::NotSupportedTransport(
+            "VMM allocation requires at least one visible CUDA device");
+    }
+    try {
+        access_descs.reserve(
+            static_cast<size_t>(device_count) +
+            (options.location_type == LocationType::HOST_NUMA ? 1U : 0U));
+        if (options.location_type == LocationType::HOST_NUMA) {
+            CUmemAccessDesc access = {};
+            access.location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
+            access.location.id = options.location_id;
+            access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+            access_descs.push_back(access);
+        }
+        for (int ordinal = 0; ordinal < device_count; ++ordinal) {
+            CUdevice device;
+            result = api.device_get(&device, ordinal);
+            if (result != CUDA_SUCCESS)
+                return cudaDriverFailure("cuDeviceGet", result);
+            CUmemAccessDesc access = {};
+            access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+            access.location.id = device;
+            access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+            access_descs.push_back(access);
+        }
+    } catch (const std::exception& error) {
+        return Status::Memory(std::string("VMM access descriptor allocation "
+                                          "failed: ") +
+                              error.what());
+    }
+
     auto rollback = [&](Status cause) -> Status {
         Status cleanup;
         try {
@@ -612,7 +665,7 @@ Status NvlinkVmmAllocation::CreateWithDriverApi(
     };
 
     CUmemGenericAllocationHandle handle;
-    CUresult result = api.mem_create(&handle, length, &prop, 0);
+    result = api.mem_create(&handle, length, &prop, 0);
     if (result != CUDA_SUCCESS) return cudaDriverFailure("cuMemCreate", result);
     owner->allocation_handle_ = static_cast<uint64_t>(handle);
     owner->handle_owned_ = true;
@@ -633,57 +686,23 @@ Status NvlinkVmmAllocation::CreateWithDriverApi(
     }
     owner->mapped_ = true;
 
-    auto grant_access = [&](CUmemLocationType location_type,
-                            int location_id) -> Status {
-        CUmemAccessDesc access = {};
-        access.location.type = location_type;
-        access.location.id = location_id;
-        access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-        CUresult access_result = api.mem_set_access(ptr, length, &access, 1);
-        if (access_result != CUDA_SUCCESS)
-            return cudaDriverFailure("cuMemSetAccess", access_result);
-        return Status::OK();
-    };
-
-    if (options.location_type == LocationType::HOST_NUMA) {
-        status =
-            grant_access(CU_MEM_LOCATION_TYPE_HOST_NUMA, options.location_id);
-        if (!status.ok()) {
-            return rollback(status);
-        }
-    }
-
-    int device_count = 0;
-    result = api.device_get_count(&device_count);
+    result = api.mem_set_access(ptr, length, access_descs.data(),
+                                access_descs.size());
     if (result != CUDA_SUCCESS) {
-        status = cudaDriverFailure("cuDeviceGetCount", result);
+        status = cudaDriverFailure("cuMemSetAccess", result);
         return rollback(status);
     }
-    if (device_count <= 0) {
-        return rollback(Status::NotSupportedTransport(
-            "VMM allocation requires at least one visible CUDA device"));
-    }
 
-    for (int ordinal = 0; ordinal < device_count; ++ordinal) {
-        CUdevice device;
-        result = api.device_get(&device, ordinal);
-        if (result != CUDA_SUCCESS) {
-            status = cudaDriverFailure("cuDeviceGet", result);
-            return rollback(status);
-        }
-        status = grant_access(CU_MEM_LOCATION_TYPE_DEVICE, device);
-        if (!status.ok()) {
-            return rollback(status);
-        }
-    }
-
+    // Treat the release as at-most-once. A non-success result can be an
+    // earlier asynchronous CUDA error, so rollback must not invoke
+    // cuMemRelease on this opaque handle again.
+    owner->handle_owned_ = false;
+    owner->allocation_handle_ = 0;
     result = api.mem_release(handle);
     if (result != CUDA_SUCCESS) {
         status = cudaDriverFailure("cuMemRelease", result);
         return rollback(status);
     }
-    owner->handle_owned_ = false;
-    owner->allocation_handle_ = 0;
     if (options.location_type == LocationType::HOST_NUMA &&
         options.fabric_exportable) {
         if (!RegisterOwnedRange(owner->base_, owner->length_)) {

@@ -179,6 +179,8 @@ class FakeCudaDriver {
             ++release_calls;
             if (release_failures_remaining > 0) {
                 --release_failures_remaining;
+                if (release_error_consumes_handle && owned_handles > 0)
+                    --owned_handles;
                 return CUDA_ERROR_INVALID_VALUE;
             }
             if (owned_handles > 0) --owned_handles;
@@ -208,6 +210,7 @@ class FakeCudaDriver {
     int unmap_failures_remaining = 0;
     int address_free_failures_remaining = 0;
     int release_failures_remaining = 0;
+    bool release_error_consumes_handle = false;
 
     int owned_handles = 0;
     int reserved_ranges = 0;
@@ -280,6 +283,7 @@ TEST(NvlinkVmmAllocationTest, DeviceExportableHonorsRequiredVaAlignment) {
     EXPECT_EQ(driver.created_size, 256 * 1024);
     EXPECT_EQ(driver.reserved_alignment, 256 * 1024);
     ASSERT_EQ(driver.access_descriptors.size(), 2);
+    EXPECT_EQ(driver.access_call_count, 1);
     EXPECT_EQ(driver.access_descriptors[0].location.type,
               CU_MEM_LOCATION_TYPE_DEVICE);
     EXPECT_EQ(driver.access_descriptors[1].location.type,
@@ -319,6 +323,7 @@ TEST(NvlinkVmmAllocationTest, HostNumaLocalOnlyGrantsCpuAndAllGpuAccess) {
     EXPECT_EQ(driver.last_prop.requestedHandleTypes,
               static_cast<CUmemAllocationHandleType>(0));
     ASSERT_EQ(driver.access_descriptors.size(), 3);
+    EXPECT_EQ(driver.access_call_count, 1);
     EXPECT_EQ(driver.access_descriptors[0].location.type,
               CU_MEM_LOCATION_TYPE_HOST_NUMA);
     EXPECT_EQ(driver.access_descriptors[0].location.id, 3);
@@ -373,40 +378,10 @@ TEST(NvlinkVmmAllocationTest, CleansEveryCreateFailureStage) {
     }
 }
 
-TEST(NvlinkVmmAllocationTest, CleansEveryAccessDescriptorFailure) {
-    ScopedIpcEnvironment environment;
-    for (int fail_call = 0; fail_call < 3; ++fail_call) {
-        FakeCudaDriver driver;
-        driver.fail_access_call = fail_call;
-        NvlinkVmmAllocation::Options options;
-        options.location_type = NvlinkVmmAllocation::LocationType::HOST_NUMA;
-        options.location_id = 0;
-        options.requested_length = 64 * 1024;
-
-        std::unique_ptr<NvlinkVmmAllocation> allocation;
-        EXPECT_FALSE(NvlinkTransportTestPeer::CreateWithDriverApi(
-                         options, driver.api(), allocation)
-                         .ok());
-        EXPECT_EQ(allocation, nullptr);
-        driver.expectNoResources();
-        EXPECT_EQ(driver.unmap_calls, 1);
-        EXPECT_EQ(driver.address_free_calls, 1);
-        EXPECT_EQ(driver.release_calls, 1);
-        ASSERT_GE(driver.operations.size(), 3);
-        EXPECT_EQ(
-            std::vector<std::string>(driver.operations.end() - 3,
-                                     driver.operations.end()),
-            (std::vector<std::string>{"unmap", "address_free", "release"}));
-    }
-}
-
-TEST(NvlinkVmmAllocationTest, RetriesOriginalHandleReleaseDuringRollback) {
+TEST(NvlinkVmmAllocationTest, CleansBatchedAccessDescriptorFailure) {
     ScopedIpcEnvironment environment;
     FakeCudaDriver driver;
-    // The normal post-map release fails, the first rollback release also
-    // fails, and the owner's non-throwing destructor retries only that
-    // remaining stage.
-    driver.release_failures_remaining = 2;
+    driver.fail_access_call = 0;
     NvlinkVmmAllocation::Options options;
     options.location_type = NvlinkVmmAllocation::LocationType::HOST_NUMA;
     options.location_id = 0;
@@ -417,21 +392,45 @@ TEST(NvlinkVmmAllocationTest, RetriesOriginalHandleReleaseDuringRollback) {
                      options, driver.api(), allocation)
                      .ok());
     EXPECT_EQ(allocation, nullptr);
-    EXPECT_EQ(NvlinkTransportTestPeer::CleanupPendingOwnerCount(), 1U);
-    EXPECT_EQ(driver.owned_handles, 1);
-    EXPECT_EQ(driver.release_calls, 2);
+    driver.expectNoResources();
+    EXPECT_EQ(driver.access_call_count, 1);
+    EXPECT_EQ(driver.access_descriptors.size(), 3U);
     EXPECT_EQ(driver.unmap_calls, 1);
     EXPECT_EQ(driver.address_free_calls, 1);
-
-    EXPECT_TRUE(NvlinkTransportTestPeer::RetryCleanupPendingOwners());
-    EXPECT_EQ(NvlinkTransportTestPeer::CleanupPendingOwnerCount(), 0U);
-    driver.expectNoResources();
-    EXPECT_EQ(driver.release_calls, 3);
-    ASSERT_GE(driver.operations.size(), 5);
-    EXPECT_EQ(std::vector<std::string>(driver.operations.end() - 5,
+    EXPECT_EQ(driver.release_calls, 1);
+    ASSERT_GE(driver.operations.size(), 3);
+    EXPECT_EQ(std::vector<std::string>(driver.operations.end() - 3,
                                        driver.operations.end()),
-              (std::vector<std::string>{"release", "unmap", "address_free",
-                                        "release", "release"}));
+              (std::vector<std::string>{"unmap", "address_free", "release"}));
+}
+
+TEST(NvlinkVmmAllocationTest, PostMapReleaseErrorIsNotRetried) {
+    ScopedIpcEnvironment environment;
+    FakeCudaDriver driver;
+    // Model a CUDA call that returns an earlier asynchronous error after
+    // consuming the handle reference. Retrying would double-release it.
+    driver.release_failures_remaining = 1;
+    driver.release_error_consumes_handle = true;
+    NvlinkVmmAllocation::Options options;
+    options.location_type = NvlinkVmmAllocation::LocationType::HOST_NUMA;
+    options.location_id = 0;
+    options.requested_length = 64 * 1024;
+
+    std::unique_ptr<NvlinkVmmAllocation> allocation;
+    EXPECT_FALSE(NvlinkTransportTestPeer::CreateWithDriverApi(
+                     options, driver.api(), allocation)
+                     .ok());
+    EXPECT_EQ(allocation, nullptr);
+    EXPECT_EQ(NvlinkTransportTestPeer::CleanupPendingOwnerCount(), 0U);
+    EXPECT_EQ(driver.owned_handles, 0);
+    EXPECT_EQ(driver.release_calls, 1);
+    EXPECT_EQ(driver.unmap_calls, 1);
+    EXPECT_EQ(driver.address_free_calls, 1);
+    driver.expectNoResources();
+    EXPECT_EQ(driver.operations,
+              (std::vector<std::string>{"granularity", "create", "reserve",
+                                        "map", "access", "release", "unmap",
+                                        "address_free"}));
 }
 
 TEST(NvlinkVmmAllocationTest,
@@ -457,38 +456,20 @@ TEST(NvlinkVmmAllocationTest,
     EXPECT_EQ(driver.address_free_calls, 0);
     EXPECT_EQ(driver.release_calls, 0);
 
+    std::unique_ptr<NvlinkVmmAllocation> blocked_allocation;
+    Status blocked = NvlinkTransportTestPeer::CreateWithDriverApi(
+        options, driver.api(), blocked_allocation);
+    EXPECT_FALSE(blocked.ok());
+    EXPECT_EQ(blocked_allocation, nullptr);
+    EXPECT_NE(blocked.ToString().find("1 owner(s) retained"),
+              std::string::npos);
+
     driver.unmap_failures_remaining = 0;
     EXPECT_TRUE(NvlinkTransportTestPeer::RetryCleanupPendingOwners());
     EXPECT_EQ(NvlinkTransportTestPeer::CleanupPendingOwnerCount(), 0U);
     driver.expectNoResources();
     EXPECT_EQ(driver.address_free_calls, 1);
     EXPECT_EQ(driver.release_calls, 1);
-}
-
-TEST(NvlinkVmmAllocationTest,
-     PersistentRollbackHandleFailureRetainsOwnerForRetry) {
-    ScopedIpcEnvironment environment;
-    FakeCudaDriver driver;
-    driver.release_failures_remaining = 1000;
-    NvlinkVmmAllocation::Options options;
-    options.location_type = NvlinkVmmAllocation::LocationType::HOST_NUMA;
-    options.location_id = 0;
-    options.requested_length = 64 * 1024;
-
-    std::unique_ptr<NvlinkVmmAllocation> allocation;
-    EXPECT_FALSE(NvlinkTransportTestPeer::CreateWithDriverApi(
-                     options, driver.api(), allocation)
-                     .ok());
-    EXPECT_EQ(allocation, nullptr);
-    EXPECT_EQ(NvlinkTransportTestPeer::CleanupPendingOwnerCount(), 1U);
-    EXPECT_EQ(driver.mapped_ranges, 0);
-    EXPECT_EQ(driver.reserved_ranges, 0);
-    EXPECT_EQ(driver.owned_handles, 1);
-
-    driver.release_failures_remaining = 0;
-    EXPECT_TRUE(NvlinkTransportTestPeer::RetryCleanupPendingOwners());
-    EXPECT_EQ(NvlinkTransportTestPeer::CleanupPendingOwnerCount(), 0U);
-    driver.expectNoResources();
 }
 
 TEST(NvlinkVmmAllocationTest, ReleaseRetriesUnmapBeforeLaterStages) {

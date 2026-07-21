@@ -50,7 +50,7 @@ class TransferMetadata {
         std::string gid;
         std::string eid;  // for ub
 
-        bool operator==(const DeviceDesc& other) const = default;
+        bool operator==(const DeviceDesc &other) const = default;
     };
 
     struct BufferDesc {
@@ -75,7 +75,7 @@ class TransferMetadata {
         std::vector<std::string> tseg;      // for ub/urma
         std::vector<uint32_t> l_seg_index;  // for ub/urma
 
-        bool operator==(const BufferDesc& other) const = default;
+        bool operator==(const BufferDesc &other) const = default;
     };
 
     struct NVMeoFBufferDesc {
@@ -83,7 +83,7 @@ class TransferMetadata {
         uint64_t length;
         std::unordered_map<std::string, std::string> local_path_map;
 
-        bool operator==(const NVMeoFBufferDesc& other) const = default;
+        bool operator==(const NVMeoFBufferDesc &other) const = default;
     };
 
     struct RankInfoDesc {
@@ -98,7 +98,7 @@ class TransferMetadata {
         uint64_t pid;
         std::vector<std::string> endpoints;
 
-        bool operator==(const RankInfoDesc& other) const = default;
+        bool operator==(const RankInfoDesc &other) const = default;
     };
 
     using SegmentID = uint64_t;
@@ -135,12 +135,12 @@ class TransferMetadata {
         // Returns the server name to use for NIC path construction.
         // Uses rdma_server_name when available, otherwise falls back
         // to name.
-        const std::string& nicPathServerName() const {
+        const std::string &nicPathServerName() const {
             return rdma_server_name.empty() ? name : rdma_server_name;
         }
 
-        bool operator==(const SegmentDesc& other) const;
-        bool operator!=(const SegmentDesc& other) const {
+        bool operator==(const SegmentDesc &other) const;
+        bool operator!=(const SegmentDesc &other) const {
             return !(*this == other);
         }
         void dump() const;
@@ -186,66 +186,66 @@ class TransferMetadata {
     };
 
    public:
-    TransferMetadata(const std::string& conn_string);
+    TransferMetadata(const std::string &conn_string);
 
     ~TransferMetadata();
 
     std::shared_ptr<SegmentDesc> getSegmentDescByName(
-        const std::string& segment_name, bool force_update = false);
+        const std::string &segment_name, bool force_update = false);
 
     std::shared_ptr<SegmentDesc> getSegmentDescByID(SegmentID segment_id,
                                                     bool force_update = false);
 
     int updateLocalSegmentDesc(SegmentID segment_id = LOCAL_SEGMENT_ID);
 
-    int updateSegmentDesc(const std::string& segment_name,
-                          const SegmentDesc& desc);
+    int updateSegmentDesc(const std::string &segment_name,
+                          const SegmentDesc &desc);
 
     std::shared_ptr<SegmentDesc> getSegmentDesc(
-        const std::string& segment_name);
+        const std::string &segment_name);
 
-    SegmentID getSegmentID(const std::string& segment_name);
+    SegmentID getSegmentID(const std::string &segment_name);
 
-    int syncSegmentCache(const std::string& segment_name);
+    int syncSegmentCache(const std::string &segment_name);
 
-    int removeSegmentDesc(const std::string& segment_name);
+    int removeSegmentDesc(const std::string &segment_name);
 
-    int addLocalMemoryBuffer(const BufferDesc& buffer_desc,
+    int addLocalMemoryBuffer(const BufferDesc &buffer_desc,
                              bool update_metadata);
 
-    int removeLocalMemoryBuffer(void* addr, bool update_metadata);
+    int removeLocalMemoryBuffer(void *addr, bool update_metadata);
 
-    int addLocalSegment(SegmentID segment_id, const std::string& segment_name,
-                        std::shared_ptr<SegmentDesc>&& desc);
+    int addLocalSegment(SegmentID segment_id, const std::string &segment_name,
+                        std::shared_ptr<SegmentDesc> &&desc);
 
-    int removeLocalSegment(const std::string& segment_name);
+    int removeLocalSegment(const std::string &segment_name);
 
-    int addRpcMetaEntry(const std::string& server_name, RpcMetaDesc& desc);
+    int addRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc);
 
-    int removeRpcMetaEntry(const std::string& server_name);
+    int removeRpcMetaEntry(const std::string &server_name);
 
     // Re-publish the local RPC meta entry to the HTTP metadata server.
-    int rePublishRpcMetaEntry(const std::string& server_name);
+    int rePublishRpcMetaEntry(const std::string &server_name);
 
-    int getRpcMetaEntry(const std::string& server_name, RpcMetaDesc& desc);
-    int getNotifies(std::vector<NotifyDesc>& notifies);
+    int getRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc);
+    int getNotifies(std::vector<NotifyDesc> &notifies);
 
-    const RpcMetaDesc& localRpcMeta() const { return local_rpc_meta_; }
+    const RpcMetaDesc &localRpcMeta() const { return local_rpc_meta_; }
 
-    using OnReceiveHandShake = std::function<int(const HandShakeDesc& peer_desc,
-                                                 HandShakeDesc& local_desc)>;
+    using OnReceiveHandShake = std::function<int(const HandShakeDesc &peer_desc,
+                                                 HandShakeDesc &local_desc)>;
     int startHandshakeDaemon(OnReceiveHandShake on_receive_handshake,
                              uint16_t listen_port, int sockfd);
 
-    int sendHandshake(const std::string& peer_server_name,
-                      const HandShakeDesc& local_desc,
-                      HandShakeDesc& peer_desc);
+    int sendHandshake(const std::string &peer_server_name,
+                      const HandShakeDesc &local_desc,
+                      HandShakeDesc &peer_desc);
 
-    int sendNotify(const std::string& peer_server_name,
-                   const NotifyDesc& local_desc, NotifyDesc& peer_desc);
-    int sendProbe(const std::string& peer_server_name);
+    int sendNotify(const std::string &peer_server_name,
+                   const NotifyDesc &local_desc, NotifyDesc &peer_desc);
+    int sendProbe(const std::string &peer_server_name);
 
-    void dumpMetadataContent(const std::string& segment_name = "",
+    void dumpMetadataContent(const std::string &segment_name = "",
                              uint64_t offset = 0, uint64_t length = 0);
 
     void dumpMetadataContentUnlocked();
@@ -253,15 +253,15 @@ class TransferMetadata {
    private:
     friend class TransferMetadataTestPeer;
 
-    int encodeSegmentDesc(const SegmentDesc& desc, Json::Value& segmentJSON);
+    int encodeSegmentDesc(const SegmentDesc &desc, Json::Value &segmentJSON);
     std::shared_ptr<TransferMetadata::SegmentDesc> decodeSegmentDesc(
-        Json::Value& segmentJSON, const std::string& segment_name);
-    int receivePeerMetadata(const Json::Value& peer_json,
-                            Json::Value& local_json);
-    int receivePeerNotify(const Json::Value& peer_json,
-                          Json::Value& local_json);
-    int receivePeerProbe(const Json::Value& peer_json, Json::Value& local_json);
-    std::string getFullMetadataKey(const std::string& segment_name) const;
+        Json::Value &segmentJSON, const std::string &segment_name);
+    int receivePeerMetadata(const Json::Value &peer_json,
+                            Json::Value &local_json);
+    int receivePeerNotify(const Json::Value &peer_json,
+                          Json::Value &local_json);
+    int receivePeerProbe(const Json::Value &peer_json, Json::Value &local_json);
+    std::string getFullMetadataKey(const std::string &segment_name) const;
     void startMetadataRefreshPollingIfNeeded();
     void stopMetadataRefreshPollingThread();
     void metadataRefreshPollingLoop(uint64_t refresh_interval_seconds);

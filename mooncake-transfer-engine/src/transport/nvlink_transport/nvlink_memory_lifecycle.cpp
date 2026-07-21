@@ -105,13 +105,10 @@ class NvlinkTransport::FabricMappingAttempt {
 
     CUresult releaseHandle() {
         if (!cleanup_.handle_owned) return CUDA_SUCCESS;
-        CUresult result =
-            transport_.fabric_driver_api_.mem_release(cleanup_.handle);
-        if (result == CUDA_SUCCESS) {
-            cleanup_.handle_owned = false;
-            cleanup_.handle = 0;
-        }
-        return result;
+        const CUmemGenericAllocationHandle handle = cleanup_.handle;
+        cleanup_.handle_owned = false;
+        cleanup_.handle = 0;
+        return transport_.fabric_driver_api_.mem_release(handle);
     }
 
     void transferMappingOwnership() {
@@ -140,8 +137,7 @@ class NvlinkTransport::RetainedHandleGuard {
 
     ~RetainedHandleGuard() {
         if (owned_) {
-            transport_.releaseOrQuarantineRetainedHandle(handle_,
-                                                         failure_stage_);
+            transport_.releaseRetainedHandleAtMostOnce(handle_, failure_stage_);
         }
     }
 
@@ -198,15 +194,18 @@ bool NvlinkTransport::cleanupFabricMapping(FabricMappingCleanup& cleanup,
                            << failure_stage;
                 return false;
             }
-            const CUresult result =
-                fabric_driver_api_.mem_release(cleanup.handle);
-            if (result != CUDA_SUCCESS) {
-                LOG(ERROR) << "NvlinkTransport: cuMemRelease failed while "
-                           << failure_stage << ": " << result;
-                return false;
-            }
+            const CUmemGenericAllocationHandle handle = cleanup.handle;
             cleanup.handle_owned = false;
             cleanup.handle = 0;
+            const CUresult result = fabric_driver_api_.mem_release(handle);
+            if (result != CUDA_SUCCESS) {
+                LOG(ERROR)
+                    << "NvlinkTransport: cuMemRelease outcome is ambiguous "
+                       "while "
+                    << failure_stage << ": " << result
+                    << "; the handle will not be retried";
+                return false;
+            }
         }
 
         cleanup.length = 0;
@@ -221,11 +220,17 @@ bool NvlinkTransport::cleanupFabricMapping(FabricMappingCleanup& cleanup,
     return false;
 }
 
+bool NvlinkTransport::hasPendingFabricCleanup(
+    const FabricMappingCleanup& cleanup) noexcept {
+    return cleanup.mapped || cleanup.address_reserved || cleanup.handle_owned;
+}
+
 bool NvlinkTransport::retryQuarantinedFabricMappings() noexcept {
     auto retained = quarantined_fabric_mappings_.begin();
     for (auto it = quarantined_fabric_mappings_.begin();
          it != quarantined_fabric_mappings_.end(); ++it) {
-        if (!cleanupFabricMapping(*it, "retrying lazy Fabric cleanup")) {
+        if (!cleanupFabricMapping(*it, "retrying lazy Fabric cleanup") &&
+            hasPendingFabricCleanup(*it)) {
             if (retained != it) *retained = *it;
             ++retained;
         }
@@ -258,6 +263,7 @@ void NvlinkTransport::preserveProcessLifetimeFabricCleanup(
 void NvlinkTransport::releaseOrQuarantineFabricMapping(
     FabricMappingCleanup cleanup, const char* failure_stage) noexcept {
     if (cleanupFabricMapping(cleanup, failure_stage)) return;
+    if (!hasPendingFabricCleanup(cleanup)) return;
 
     try {
         // relocateSharedMemoryAddress() reserves this slot before importing a
@@ -366,20 +372,6 @@ NvlinkTransport::~NvlinkTransport() {
     }
 
     std::lock_guard<std::mutex> lock(register_mutex_);
-    size_t retained_registration_count = 0;
-    for (const auto& [_, registration] : local_registrations_) {
-        retained_registration_count += registration.retained_handle_owned;
-    }
-    try {
-        quarantined_retained_handles_.reserve(
-            quarantined_retained_handles_.size() + retained_registration_count);
-    } catch (const std::exception& error) {
-        // releaseOrQuarantineRetainedHandle() falls back to the process-wide
-        // quarantine if this transport-local vector cannot grow.
-        LOG(ERROR) << "NvlinkTransport: unable to reserve teardown "
-                      "retained-handle quarantine: "
-                   << error.what();
-    }
     for (auto& [_, registration] : local_registrations_) {
         if (!registration.retained_handle_owned) continue;
         if (registration.published) {
@@ -393,71 +385,24 @@ NvlinkTransport::~NvlinkTransport() {
                           "registration handle until process exit";
             continue;
         }
-        releaseOrQuarantineRetainedHandle(
+        releaseRetainedHandleAtMostOnce(
             static_cast<CUmemGenericAllocationHandle>(
                 registration.retained_handle),
             "transport teardown");
-    }
-    if (!retryQuarantinedRetainedHandles()) {
-        const size_t pending_count = quarantined_retained_handles_.size();
-        for (uint64_t handle : quarantined_retained_handles_) {
-            quarantineRetainedHandleForProcessLifetime(handle);
-        }
-        LOG(ERROR) << "NvlinkTransport: " << pending_count
-                   << " retained registration handle(s) remain live after "
-                      "teardown retries; preserving ownership in the "
-                      "process-lifetime quarantine";
-        quarantined_retained_handles_.clear();
     }
 #endif
     local_registrations_.clear();
 }
 
 #if defined(USE_MNNVL) && defined(USE_CUDA)
-bool NvlinkTransport::retryQuarantinedRetainedHandles() {
-    auto retained = quarantined_retained_handles_.begin();
-    for (auto it = quarantined_retained_handles_.begin();
-         it != quarantined_retained_handles_.end(); ++it) {
-        const CUresult result = fabric_driver_api_.mem_release(
-            static_cast<CUmemGenericAllocationHandle>(*it));
-        if (result != CUDA_SUCCESS) {
-            LOG(ERROR) << "NvlinkTransport: quarantined registration "
-                          "cuMemRelease retry failed: "
-                       << result;
-            *retained++ = *it;
-        }
-    }
-    quarantined_retained_handles_.erase(retained,
-                                        quarantined_retained_handles_.end());
-    return quarantined_retained_handles_.empty();
-}
-
-void NvlinkTransport::releaseOrQuarantineRetainedHandle(
+void NvlinkTransport::releaseRetainedHandleAtMostOnce(
     CUmemGenericAllocationHandle handle, const char* failure_stage) noexcept {
     const CUresult result = fabric_driver_api_.mem_release(handle);
     if (result == CUDA_SUCCESS) return;
-
-    // registerLocalMemory() reserves one quarantine slot before retaining a
-    // handle. Teardown also reserves for every live registration; if an
-    // allocation still fails, retain the marker in a process-lifetime owner.
-    try {
-        quarantined_retained_handles_.push_back(static_cast<uint64_t>(handle));
-    } catch (const std::exception& error) {
-        LOG(ERROR) << "NvlinkTransport: local retained-handle quarantine "
-                      "allocation failed: "
-                   << error.what();
-        quarantineRetainedHandleForProcessLifetime(
-            static_cast<uint64_t>(handle));
-    } catch (...) {
-        LOG(ERROR) << "NvlinkTransport: unknown failure while quarantining "
-                      "a retained registration handle";
-        quarantineRetainedHandleForProcessLifetime(
-            static_cast<uint64_t>(handle));
-    }
-    LOG(ERROR) << "NvlinkTransport: registration cleanup cuMemRelease failed "
-                  "after "
+    LOG(ERROR) << "NvlinkTransport: registration cleanup cuMemRelease outcome "
+                  "is ambiguous after "
                << failure_stage << ": " << result
-               << "; retaining ownership for a later retry";
+               << "; the handle will not be retried";
 }
 #endif
 
@@ -540,21 +485,6 @@ int NvlinkTransport::registerLocalMemory(void* addr, size_t length,
             LOG(ERROR) << "NvlinkTransport: incomplete Fabric driver adapter "
                           "for registration";
             return ERR_CONTEXT;
-        }
-        if (!retryQuarantinedRetainedHandles()) {
-            LOG(ERROR)
-                << "NvlinkTransport: a retained registration handle "
-                   "is still pending cleanup; refusing to retain another";
-            return ERR_MEMORY;
-        }
-        try {
-            quarantined_retained_handles_.reserve(
-                quarantined_retained_handles_.size() + 1);
-        } catch (const std::exception& error) {
-            LOG(ERROR) << "NvlinkTransport: failed to reserve retained-handle "
-                          "cleanup ownership: "
-                       << error.what();
-            return ERR_MEMORY;
         }
         Status capability =
             NvlinkVmmAllocation::CheckStrictFabricCapabilityWithDriverApi(
@@ -784,15 +714,17 @@ int NvlinkTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
 
 #if defined(USE_MNNVL) && defined(USE_CUDA)
     if (registration.retained_handle_owned) {
+        registration.retained_handle_owned = false;
         CUresult result = fabric_driver_api_.mem_release(
             static_cast<CUmemGenericAllocationHandle>(
                 registration.retained_handle));
         if (result != CUDA_SUCCESS) {
-            LOG(ERROR) << "NvlinkTransport: registration cuMemRelease failed: "
-                       << result;
+            LOG(ERROR)
+                << "NvlinkTransport: registration cuMemRelease outcome is "
+                   "ambiguous during unregistration: "
+                << result << "; the handle will not be retried";
             return ERR_MEMORY;
         }
-        registration.retained_handle_owned = false;
     }
 #endif
     local_registrations_.erase(it);
@@ -899,17 +831,46 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
                                "import another handle";
                         return ERR_MEMORY;
                     }
+                    int device_count = 0;
+                    auto result =
+                        fabric_driver_api_.device_get_count(&device_count);
+                    if (result != CUDA_SUCCESS || device_count <= 0) {
+                        LOG(ERROR) << "NvlinkTransport: cuDeviceGetCount "
+                                      "failed during lazy import: "
+                                   << result;
+                        return ERR_CONTEXT;
+                    }
+                    std::vector<CUmemAccessDesc> access_descs;
                     try {
+                        access_descs.reserve(static_cast<size_t>(device_count));
+                        for (int ordinal = 0; ordinal < device_count;
+                             ++ordinal) {
+                            CUdevice device;
+                            result =
+                                fabric_driver_api_.device_get(&device, ordinal);
+                            if (result != CUDA_SUCCESS) {
+                                LOG(ERROR)
+                                    << "NvlinkTransport: cuDeviceGet failed "
+                                       "during lazy import: "
+                                    << result;
+                                return ERR_CONTEXT;
+                            }
+                            CUmemAccessDesc access = {};
+                            access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+                            access.location.id = device;
+                            access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+                            access_descs.push_back(access);
+                        }
                         quarantined_fabric_mappings_.reserve(
                             quarantined_fabric_mappings_.size() + 1);
                     } catch (const std::exception& error) {
-                        LOG(ERROR) << "NvlinkTransport: failed to reserve "
-                                      "lazy Fabric cleanup ownership: "
+                        LOG(ERROR) << "NvlinkTransport: failed to prepare "
+                                      "lazy Fabric import ownership: "
                                    << error.what();
                         return ERR_MEMORY;
                     }
                     FabricMappingAttempt attempt(*this);
-                    auto result =
+                    result =
                         fabric_driver_api_.mem_import_from_shareable_handle(
                             attempt.handleOut(), &export_handle,
                             CU_MEM_HANDLE_TYPE_FABRIC);
@@ -943,38 +904,14 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
                     }
                     attempt.markMapped();
 
-                    int device_count = 0;
-                    result = fabric_driver_api_.device_get_count(&device_count);
-                    if (result != CUDA_SUCCESS || device_count <= 0) {
-                        LOG(ERROR) << "NvlinkTransport: cuDeviceGetCount "
-                                      "failed during lazy import: "
+                    result = fabric_driver_api_.mem_set_access(
+                        attempt.address(), entry.length, access_descs.data(),
+                        access_descs.size());
+                    if (result != CUDA_SUCCESS) {
+                        LOG(ERROR) << "NvlinkTransport: cuMemSetAccess failed "
+                                      "for visible devices: "
                                    << result;
-                        return ERR_CONTEXT;
-                    }
-
-                    for (int ordinal = 0; ordinal < device_count; ++ordinal) {
-                        CUdevice device;
-                        result =
-                            fabric_driver_api_.device_get(&device, ordinal);
-                        if (result != CUDA_SUCCESS) {
-                            LOG(ERROR) << "NvlinkTransport: cuDeviceGet failed "
-                                          "during lazy import: "
-                                       << result;
-                            return ERR_CONTEXT;
-                        }
-                        CUmemAccessDesc access = {};
-                        access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-                        access.location.id = device;
-                        access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-                        result = fabric_driver_api_.mem_set_access(
-                            attempt.address(), entry.length, &access, 1);
-                        if (result != CUDA_SUCCESS) {
-                            LOG(ERROR)
-                                << "NvlinkTransport: cuMemSetAccess failed for "
-                                   "visible device "
-                                << ordinal << ": " << result;
-                            return ERR_MEMORY;
-                        }
+                        return ERR_MEMORY;
                     }
 
                     result = attempt.releaseHandle();

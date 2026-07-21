@@ -121,6 +121,8 @@ class NvlinkTransport : public Transport {
     class FabricMappingAttempt;
     bool cleanupFabricMapping(FabricMappingCleanup& cleanup,
                               const char* failure_stage) noexcept;
+    static bool hasPendingFabricCleanup(
+        const FabricMappingCleanup& cleanup) noexcept;
     bool retryQuarantinedFabricMappings() noexcept;
     void releaseOrQuarantineFabricMapping(FabricMappingCleanup cleanup,
                                           const char* failure_stage) noexcept;
@@ -128,10 +130,8 @@ class NvlinkTransport : public Transport {
         FabricMappingCleanup cleanup) noexcept;
     std::vector<FabricMappingCleanup> quarantined_fabric_mappings_;
     class RetainedHandleGuard;
-    bool retryQuarantinedRetainedHandles();
-    void releaseOrQuarantineRetainedHandle(CUmemGenericAllocationHandle handle,
-                                           const char* failure_stage) noexcept;
-    std::vector<uint64_t> quarantined_retained_handles_;
+    void releaseRetainedHandleAtMostOnce(CUmemGenericAllocationHandle handle,
+                                         const char* failure_stage) noexcept;
     static bool trackPinnedVmmAllocation(
         std::unique_ptr<NvlinkVmmAllocation> owner);
     static bool releasePinnedVmmAllocation(void* ptr);
