@@ -164,6 +164,11 @@ Status TransferEngine::submitTransfer(
     return impl_->submitTransfer(batch_id, entries);
 }
 
+Status TransferEngine::transferScatter(
+    const std::vector<ScatterTransferRange>& ranges) {
+    return impl_->transferScatter(ranges);
+}
+
 Status TransferEngine::submitTransferWithNotify(
     BatchID batch_id, const std::vector<TransferRequest>& entries,
     TransferMetadata::NotifyDesc notify_msg) {
