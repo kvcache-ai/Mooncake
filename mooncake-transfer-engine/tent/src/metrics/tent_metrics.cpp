@@ -37,6 +37,18 @@ Status TentMetrics::initialize(const MetricsConfig& config) {
         return Status::OK();  // Already initialized by another thread
     }
 
+    // Validate configuration before doing anything else. An invalid config
+    // (e.g. port 0, zero HTTP threads) would otherwise cause confusing
+    // failures inside initHttpServer(); fail fast with a clear error instead.
+    std::string error_msg;
+    if (!MetricsConfigLoader::validateConfig(config, &error_msg)) {
+        LOG(ERROR) << "Invalid TENT metrics config: " << error_msg
+                   << "; metrics disabled";
+        initialized_.store(false, std::memory_order_relaxed);
+        return Status::InvalidArgument(
+            "Invalid TENT metrics config: " + error_msg + LOC_MARK);
+    }
+
     config_ = config;
 
     // Set runtime enabled state from config
