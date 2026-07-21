@@ -3,17 +3,22 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <csignal>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
+
+#include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 #include "ha/oplog/oplog_replicator.h"
 #include "ha/oplog/oplog_store_factory.h"
 #include "ha/oplog/p2p_oplog_applier.h"
 #include "ha/oplog/p2p_standby_metadata_store.h"
+#include "ha/oplog/p2p_standby_snapshot_service.h"
 #include "standby_state_machine.h"
 #include "types.h"
 
@@ -30,6 +35,11 @@ struct P2PHotStandbyConfig {
     int oplog_poll_interval_ms{kDefaultOpLogPollIntervalMs};
     int reconnect_initial_backoff_ms{100};
     int reconnect_max_backoff_ms{5000};
+    uint16_t snapshot_service_port{0};
+    // TODO: Discover alive snapshot sources from the Redis Master registry by
+    // default, while keeping explicit endpoints as an override.
+    std::vector<std::string> snapshot_source_endpoints;
+    uint32_t snapshot_chunk_size{256};
 };
 
 struct P2PStandbySyncStatus {
@@ -84,6 +94,8 @@ class P2PHotStandbyService {
     P2PStandbyMetadataStore* GetMetadataStore() const {
         return metadata_store_.get();
     }
+    const std::string& GetClusterId() const { return config_.cluster_id; }
+    bool IsReadyForSnapshot() const;
 
    private:
     ErrorCode StartOplogFollowingLocked(uint64_t baseline_sequence_id);
@@ -97,6 +109,13 @@ class P2PHotStandbyService {
     void RestoreRecoveryWorker();
     void RequestRecovery();
     void RecoveryLoop();
+    ErrorCode BootstrapFromSnapshotSources(uint64_t& baseline_sequence_id);
+    ErrorCode GetLatestOpLogSequenceId(uint64_t& sequence_id) const;
+    bool WaitForAppliedSequenceLocked(
+        uint64_t sequence_id,
+        std::chrono::milliseconds timeout = std::chrono::seconds(30)) const;
+    ErrorCode StartSnapshotServer();
+    void StopSnapshotServer();
 
     P2PHotStandbyConfig config_;
     ReaderStoreFactory reader_store_factory_;
@@ -117,6 +136,9 @@ class P2PHotStandbyService {
     std::thread recovery_thread_;
     bool recovery_requested_{false};
     bool recovery_stopping_{false};
+
+    std::unique_ptr<P2PStandbySnapshotService> snapshot_service_;
+    std::unique_ptr<coro_rpc::coro_rpc_server> snapshot_server_;
 };
 
 }  // namespace mooncake

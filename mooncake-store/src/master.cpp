@@ -139,6 +139,12 @@ DEFINE_string(oplog_async_queue_overflow_mode, "reject",
               "Async OpLog queue overflow mode: reject or bypass");
 DEFINE_uint64(oplog_best_effort_max_retries, 3,
               "Maximum Redis attempts for best-effort OpLogs");
+DEFINE_uint32(standby_snapshot_service_port, 0,
+              "RPC port used to serve Standby metadata snapshots; 0 disables");
+DEFINE_string(standby_snapshot_sources, "",
+              "Comma-separated explicit Standby snapshot source endpoints");
+DEFINE_uint32(standby_snapshot_chunk_size, 256,
+              "Maximum metadata records per Standby snapshot RPC chunk");
 
 // Redis election backend configuration
 DEFINE_string(election_backend, "etcd",
@@ -220,6 +226,15 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt64("oplog_best_effort_max_retries",
                              &master_config.oplog_best_effort_max_retries,
                              FLAGS_oplog_best_effort_max_retries);
+    default_config.GetUInt32("standby_snapshot_service_port",
+                             &master_config.standby_snapshot_service_port,
+                             FLAGS_standby_snapshot_service_port);
+    default_config.GetString("standby_snapshot_sources",
+                             &master_config.standby_snapshot_sources,
+                             FLAGS_standby_snapshot_sources);
+    default_config.GetUInt32("standby_snapshot_chunk_size",
+                             &master_config.standby_snapshot_chunk_size,
+                             FLAGS_standby_snapshot_chunk_size);
     default_config.GetBool("enable_offload", &master_config.enable_offload,
                            FLAGS_enable_offload);
     default_config.GetString("etcd_endpoints", &master_config.etcd_endpoints,
@@ -451,6 +466,24 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.oplog_best_effort_max_retries =
             FLAGS_oplog_best_effort_max_retries;
+    }
+    if ((google::GetCommandLineFlagInfo("standby_snapshot_service_port",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.standby_snapshot_service_port =
+            FLAGS_standby_snapshot_service_port;
+    }
+    if ((google::GetCommandLineFlagInfo("standby_snapshot_sources", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.standby_snapshot_sources = FLAGS_standby_snapshot_sources;
+    }
+    if ((google::GetCommandLineFlagInfo("standby_snapshot_chunk_size", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.standby_snapshot_chunk_size =
+            FLAGS_standby_snapshot_chunk_size;
     }
     if ((google::GetCommandLineFlagInfo("enable_offload", &info) &&
          !info.is_default) ||

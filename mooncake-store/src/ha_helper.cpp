@@ -3,10 +3,12 @@
 #include "centralized_rpc_service.h"
 #include "ha/oplog/p2p_hot_standby_service.h"
 #include "p2p_rpc_service.h"
+#include "utils.h"
 #ifdef STORE_USE_REDIS
 #include "redis_master_view_helper.h"
 #endif
 
+#include <limits>
 #include <optional>
 
 namespace mooncake {
@@ -163,6 +165,17 @@ int MasterServiceSupervisor::Start() {
         std::unique_ptr<P2PHotStandbyService> p2p_standby;
         if (config_.deployment_mode == DeploymentMode::P2P &&
             config_.enable_oplog) {
+            if (config_.standby_snapshot_service_port >
+                    std::numeric_limits<uint16_t>::max() ||
+                config_.standby_snapshot_chunk_size == 0 ||
+                config_.standby_snapshot_chunk_size >
+                    kMaxStandbySnapshotChunkSize) {
+                LOG(ERROR) << "Invalid standby snapshot configuration"
+                           << ", port=" << config_.standby_snapshot_service_port
+                           << ", chunk_size="
+                           << config_.standby_snapshot_chunk_size;
+                return -1;
+            }
             P2PHotStandbyConfig standby_config;
             standby_config.cluster_id = config_.cluster_id;
             standby_config.oplog_store_type =
@@ -172,6 +185,14 @@ int MasterServiceSupervisor::Start() {
             standby_config.redis_username = config_.redis_username;
             standby_config.redis_password = config_.redis_password;
             standby_config.redis_db_index = config_.redis_db_index;
+            standby_config.snapshot_service_port =
+                static_cast<uint16_t>(config_.standby_snapshot_service_port);
+            standby_config.snapshot_chunk_size =
+                config_.standby_snapshot_chunk_size;
+            if (!config_.standby_snapshot_sources.empty()) {
+                standby_config.snapshot_source_endpoints = splitString(
+                    config_.standby_snapshot_sources, ',', /*trim=*/true);
+            }
 
             p2p_standby =
                 std::make_unique<P2PHotStandbyService>(standby_config);

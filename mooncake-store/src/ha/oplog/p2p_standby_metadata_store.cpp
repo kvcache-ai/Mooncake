@@ -48,6 +48,12 @@ size_t P2PStandbyMetadataStore::GetKeyCount() const {
     return objects_.size();
 }
 
+void P2PStandbyMetadataStore::RestoreMetadata(
+    const std::string& key, const StandbyObjectMetadata& metadata) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    objects_[key] = metadata;
+}
+
 // ============================================================================
 // P2P-specific operations
 // ============================================================================
@@ -301,6 +307,36 @@ P2PStandbyMetadataStore::ExportMetadata() const {
     }
 
     return result;
+}
+
+std::vector<std::string> P2PStandbyMetadataStore::ListObjectKeys() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<std::string> keys;
+    keys.reserve(objects_.size());
+    for (const auto& [key, metadata] : objects_) {
+        keys.push_back(key);
+    }
+    return keys;
+}
+
+std::vector<UUID> P2PStandbyMetadataStore::ListClientIds() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<UUID> ids;
+    ids.reserve(clients_.size());
+    for (const auto& [id, client] : clients_) {
+        ids.push_back(id);
+    }
+    return ids;
+}
+
+std::optional<P2PStandbyClientInfo> P2PStandbyMetadataStore::GetClientInfo(
+    const UUID& client_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = clients_.find(client_id);
+    if (it == clients_.end()) {
+        return std::nullopt;
+    }
+    return it->second;
 }
 
 // ============================================================================
