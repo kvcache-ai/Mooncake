@@ -82,9 +82,19 @@ def _extension_worker(
 
         backend = ctx.get_backend()
 
-        # Inactive extension ranks can NOT participate in collectives until the
-        # coordinator activates them.  Block here until one existing rank call
-        # recover_ranks() for this slot.
+        # Before join_group, the joining backend executes collectives with an
+        # effective {self} mask and does not involve the existing ranks.
+        local_tensor = torch.tensor(
+            [extension_rank + 1], dtype=torch.int32, device=device
+        )
+        dist.all_reduce(local_tensor, op=dist.ReduceOp.SUM)
+        local_value = int(local_tensor.cpu().item())
+        if local_value != extension_rank + 1:
+            raise AssertionError(
+                f"extension rank expected local-only sum "
+                f"{extension_rank + 1}, got {local_value}"
+            )
+
         pg.join_group(backend)
 
         # Final collective
@@ -385,10 +395,17 @@ def _extension_worker_with_subgroups(
         b_backend = get_mooncake_backend(group_b, device_type=ctx.device_type) if ctx.proc_rank == 3 else None
         c_backend = get_mooncake_backend(group_c, device_type=ctx.device_type)
 
-        # Inactive extension ranks cannot participate in collectives.  Block
-        # on each group in the same order the primaries created them; the
-        # corresponding recover_ranks() calls from the primaries will activate
-        # these slots.
+        # Before any join_group call, WORLD collectives are local-only on each
+        # joining rank and do not involve the primary ranks.
+        t = torch.tensor([ctx.proc_rank + 1], dtype=torch.int32, device=device)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        local_value = int(t.cpu().item())
+        if local_value != ctx.proc_rank + 1:
+            raise AssertionError(
+                f"WORLD local-only: expected {ctx.proc_rank + 1}, "
+                f"got {local_value}"
+            )
+
         # Join groups in same order primaries created them
         pg.join_group(world_backend)
         if ctx.proc_rank == 2:

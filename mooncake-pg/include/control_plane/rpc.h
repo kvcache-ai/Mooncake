@@ -67,6 +67,17 @@ struct RegisterGroupResponse {
     std::string reject_reason;
 };
 
+struct ConfirmReadyForActivationRequest {
+    GroupId group_id;
+    GlobalRank rank = kInvalidGlobalRank;
+    uint64_t agent_session_epoch = 0;
+};
+
+struct ConfirmReadyForActivationResponse {
+    bool success = false;
+    std::string reject_reason;
+};
+
 enum class ViewUpdateStatus : uint8_t {
     Rejected = 0,
     Applied = 1,
@@ -287,6 +298,9 @@ class CoordinatorRpcService {
     virtual void registerGroup(coro_rpc::context<RegisterGroupResponse> ctx,
                                RegisterGroupRequest req) = 0;
     virtual void unregisterGroup(UnregisterGroupRequest req) = 0;
+    virtual void confirmReadyForActivation(
+        coro_rpc::context<ConfirmReadyForActivationResponse> ctx,
+        ConfirmReadyForActivationRequest req) = 0;
     virtual void proposeViewUpdate(
         coro_rpc::context<ProposeViewUpdateResponse> ctx,
         ProposeViewUpdateRequest req) = 0;

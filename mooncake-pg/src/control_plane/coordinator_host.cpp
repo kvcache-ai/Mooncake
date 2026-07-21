@@ -28,6 +28,12 @@ void CoordinatorRpcServiceImpl::unregisterGroup(UnregisterGroupRequest req) {
     host_.postUnregisterGroup(std::move(req));
 }
 
+void CoordinatorRpcServiceImpl::confirmReadyForActivation(
+    coro_rpc::context<ConfirmReadyForActivationResponse> ctx,
+    ConfirmReadyForActivationRequest req) {
+    host_.postConfirmReadyForActivation(std::move(ctx), std::move(req));
+}
+
 void CoordinatorRpcServiceImpl::proposeViewUpdate(
     coro_rpc::context<ProposeViewUpdateResponse> ctx,
     ProposeViewUpdateRequest req) {
@@ -68,15 +74,17 @@ CoordinatorHost::~CoordinatorHost() { shutdown(); }
 void CoordinatorHost::start() {
     rpc_server_ = std::make_unique<RpcServer>(/*port=*/0, /*thread_num=*/2);
     rpc_impl_ = std::make_unique<CoordinatorRpcServiceImpl>(*this);
-    rpc_server_->registerHandler<&CoordinatorRpcService::registerAgent,
-                                 &CoordinatorRpcService::heartbeat,
-                                 &CoordinatorRpcService::registerGroup,
-                                 &CoordinatorRpcService::unregisterGroup,
-                                 &CoordinatorRpcService::proposeViewUpdate,
-                                 &CoordinatorRpcService::publishEndpoint,
-                                 &CoordinatorRpcService::reportLinkEvent,
-                                 &CoordinatorRpcService::syncAfterFailure>(
-        rpc_impl_.get());
+    rpc_server_
+        ->registerHandler<&CoordinatorRpcService::registerAgent,
+                          &CoordinatorRpcService::heartbeat,
+                          &CoordinatorRpcService::registerGroup,
+                          &CoordinatorRpcService::unregisterGroup,
+                          &CoordinatorRpcService::confirmReadyForActivation,
+                          &CoordinatorRpcService::proposeViewUpdate,
+                          &CoordinatorRpcService::publishEndpoint,
+                          &CoordinatorRpcService::reportLinkEvent,
+                          &CoordinatorRpcService::syncAfterFailure>(
+            rpc_impl_.get());
 
     bool server_started = rpc_server_->start();
     if (!server_started) {
@@ -150,6 +158,17 @@ void CoordinatorHost::postUnregisterGroup(UnregisterGroupRequest req) {
         auto result = state_machine_.handleUnregisterGroup(req);
         runEffects(result.effects);
     });
+}
+
+void CoordinatorHost::postConfirmReadyForActivation(
+    coro_rpc::context<ConfirmReadyForActivationResponse> ctx,
+    ConfirmReadyForActivationRequest req) {
+    executor_.post(
+        [this, ctx = std::move(ctx), req = std::move(req)]() mutable {
+            auto result = state_machine_.handleConfirmReadyForActivation(req);
+            runEffects(result.effects);
+            ctx.response_msg(std::move(result.response));
+        });
 }
 
 void CoordinatorHost::postProposeViewUpdate(

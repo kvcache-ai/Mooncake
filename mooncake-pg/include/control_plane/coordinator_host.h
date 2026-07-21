@@ -70,6 +70,10 @@ class CoordinatorRpcServiceImpl : public CoordinatorRpcService {
 
     void unregisterGroup(UnregisterGroupRequest req) override;
 
+    void confirmReadyForActivation(
+        coro_rpc::context<ConfirmReadyForActivationResponse> ctx,
+        ConfirmReadyForActivationRequest req) override;
+
     void publishEndpoint(coro_rpc::context<PublishEndpointResponse> ctx,
                          PublishEndpointRequest req) override;
 
@@ -107,6 +111,10 @@ class CoordinatorHost {
                            RegisterGroupRequest req);
 
     void postUnregisterGroup(UnregisterGroupRequest req);
+
+    void postConfirmReadyForActivation(
+        coro_rpc::context<ConfirmReadyForActivationResponse> ctx,
+        ConfirmReadyForActivationRequest req);
 
     void postProposeViewUpdate(coro_rpc::context<ProposeViewUpdateResponse> ctx,
                                ProposeViewUpdateRequest req);

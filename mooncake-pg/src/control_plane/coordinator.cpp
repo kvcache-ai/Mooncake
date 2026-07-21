@@ -57,8 +57,7 @@ CentralizedCoordinatorStateMachine::handleRegisterAgent(
 
     // A new session makes old endpoints invalid
     bool session_changed =
-        (info.state != RankState::Offline &&
-         info.agent_session_epoch != req.agent_session_epoch);
+        (!same_peer || info.agent_session_epoch != req.agent_session_epoch);
 
     info.agent_addr = req.agent_addr;
     info.te_server_name = req.te_server_name;
@@ -72,10 +71,29 @@ CentralizedCoordinatorStateMachine::handleRegisterAgent(
     if (session_changed) {
         for (auto& [group_id, view] : group_views_) {
             auto& member = view.members[req.rank];
-            if (member.agent_session_epoch.has_value() &&
-                *member.agent_session_epoch != req.agent_session_epoch) {
-                member.agent_session_epoch = std::nullopt;
+            // AwaitingActivation is an uncommitted promise made by the old
+            // Agent session, so a new session cancels it. Active membership is
+            // already committed and must only be changed by the Coordinator's
+            // explicit or automatic deactivation paths, never by registration.
+            bool view_changed = false;
+            if (member.isAwaitingActivation()) {
+                member.status = GroupMemberState::Inactive;
+                view_changed = true;
+            }
+
+            // The published endpoints belong to the process incarnation
+            // represented by the Agent session. The Offline path clears them
+            // while waiting for re-registration; repeat that reset on a
+            // confirmed session change to cover fast replacements that register
+            // before the old session is declared Offline.
+            if (member.hasEndpoint()) {
                 member.endpoint = std::nullopt;
+                view_changed = true;
+            }
+
+            if (view_changed) {
+                view.epoch++;
+                result.effects.push_back(PushViewUpdate{view});
             }
         }
     }
@@ -150,6 +168,40 @@ CentralizedCoordinatorStateMachine::handleRegisterGroup(
     return result;
 }
 
+CoordinatorApplyResult<ConfirmReadyForActivationResponse>
+CentralizedCoordinatorStateMachine::handleConfirmReadyForActivation(
+    const ConfirmReadyForActivationRequest& req) {
+    CoordinatorApplyResult<ConfirmReadyForActivationResponse> result;
+    if (!hasValidSession(req.rank, req.agent_session_epoch)) {
+        result.response.reject_reason =
+            "rank is out of range or has a stale session";
+        return result;
+    }
+
+    auto group_it = group_views_.find(req.group_id);
+    if (group_it == group_views_.end()) {
+        result.response.reject_reason = "group not found";
+        return result;
+    }
+
+    auto& view = group_it->second;
+    auto& member = view.members[req.rank];
+    if (member.isAwaitingActivation()) {
+        result.response.success = true;
+        return result;
+    }
+    if (member.status != GroupMemberState::Inactive) {
+        result.response.reject_reason = "rank is not an inactive member";
+        return result;
+    }
+
+    member.status = GroupMemberState::AwaitingActivation;
+    view.epoch++;
+    result.effects.push_back(PushViewUpdate{view});
+    result.response.success = true;
+    return result;
+}
+
 CoordinatorApplyResult<void>
 CentralizedCoordinatorStateMachine::handleUnregisterGroup(
     const UnregisterGroupRequest& req) {
@@ -170,7 +222,6 @@ CentralizedCoordinatorStateMachine::handleUnregisterGroup(
     }
 
     member.status = GroupMemberState::Left;
-    member.agent_session_epoch = std::nullopt;
     member.endpoint = std::nullopt;
     view.epoch++;
     rejectPendingSyncs(req.group_id, req.rank, "rank left the group",
@@ -206,7 +257,6 @@ CentralizedCoordinatorStateMachine::handlePublishEndpoint(
 
         auto& view = it->second;
         auto& member = view.members[req.rank];
-        member.agent_session_epoch = req.agent_session_epoch;
         member.endpoint = ep.endpoint_info;
         member.endpoint->endpoint_epoch = ++endpoint_epochs_[req.rank];
 
@@ -289,7 +339,6 @@ CentralizedCoordinatorStateMachine::handleProposeViewUpdate(
         for (GlobalRank rank : req.requested_ranks) {
             if (view.members[rank].isActive()) {
                 view.members[rank].status = GroupMemberState::Inactive;
-                view.members[rank].agent_session_epoch = std::nullopt;
                 view.members[rank].endpoint = std::nullopt;
                 changed = true;
             }
@@ -534,17 +583,36 @@ void CentralizedCoordinatorStateMachine::transitionToOffline(
         rejectPendingSyncs(group_id, rank, "rank went offline", effects);
     }
 
-    // For auto_deactivate=true groups, mark the failed rank as inactive.
     for (auto& [group_id, view] : group_views_) {
-        if (!view.auto_deactivate) continue;
         auto& member = view.members[rank];
-        if (member.status != GroupMemberState::Active) continue;
+        bool view_changed = false;
 
-        member.status = GroupMemberState::Inactive;
-        member.agent_session_epoch = std::nullopt;
-        member.endpoint = std::nullopt;
-        view.epoch++;
-        effects.push_back(PushViewUpdate{view});
+        // AwaitingActivation must be revoked in every group when the rank goes
+        // Offline, independently of that group's auto_deactivate policy. Active
+        // membership is handled below and is demoted only when auto_deactivate
+        // is enabled for the group.
+        if (member.isAwaitingActivation()) {
+            member.status = GroupMemberState::Inactive;
+            view_changed = true;
+        }
+
+        // Endpoint validity is independent of collective membership. Once a
+        // rank is Offline, every group must discard its published endpoint and
+        // wait for AgentHost to publish it again after re-registration.
+        if (member.hasEndpoint()) {
+            member.endpoint = std::nullopt;
+            view_changed = true;
+        }
+
+        if (view.auto_deactivate && member.isActive()) {
+            member.status = GroupMemberState::Inactive;
+            view_changed = true;
+        }
+
+        if (view_changed) {
+            view.epoch++;
+            effects.push_back(PushViewUpdate{view});
+        }
     }
 
     effects.push_back(makeRankStateEffect(rank));
@@ -679,7 +747,6 @@ void CentralizedCoordinatorStateMachine::applyAutoDeactivate(
                                         i) != healthy_set.end();
             if (!in_healthy) {
                 view.members[i].status = GroupMemberState::Inactive;
-                view.members[i].agent_session_epoch = std::nullopt;
                 view.members[i].endpoint = std::nullopt;
                 deactivated_ranks.push_back(i);
                 LOG(INFO) << "[COORD] auto_deactivate group=" << group_id
@@ -745,12 +812,8 @@ bool CentralizedCoordinatorStateMachine::isRankActivatable(
     }
 
     const auto& member = group->second.members[rank];
-    bool member_ok = member.isMember();
-    bool endpoint_ok = member.hasEndpoint();
-    bool session_ok =
-        member.agent_session_epoch.has_value() &&
-        *member.agent_session_epoch == ranks_[rank].agent_session_epoch;
-    return member_ok && endpoint_ok && session_ok;
+    return (member.isActive() || member.isAwaitingActivation()) &&
+           member.hasEndpoint();
 }
 
 void CentralizedCoordinatorStateMachine::checkGroupTransitions(
@@ -884,12 +947,10 @@ bool CentralizedCoordinatorStateMachine::processGroupRegistration(
         view_changed = true;
     }
 
-    // Any rank that (re-)registers with the group needs to receive view
-    // updates from the Coordinator before it becomes active.  Only promote
-    // None -> Inactive: replacement ranks may already be Active.
     auto& view = group_views_[group_id];
-    if (view.members[joining_rank].status == GroupMemberState::None) {
-        view.members[joining_rank].status = GroupMemberState::Inactive;
+    auto& joining_member = view.members[joining_rank];
+    if (joining_member.status == GroupMemberState::None) {
+        joining_member.status = GroupMemberState::Inactive;
         view_changed = true;
     }
 

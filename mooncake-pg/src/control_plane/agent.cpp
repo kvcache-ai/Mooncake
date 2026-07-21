@@ -22,8 +22,10 @@ static ApplyViewToBackend makeApplyViewEffect(
     for (size_t i = 0; i < view.rank_order.size(); ++i) {
         GlobalRank gr = view.rank_order[i];
         bool healthy = rank_states[gr] == RankState::Healthy;
-        activatable[i] = healthy && view.members[gr].isMember() &&
-                         view.members[gr].hasEndpoint();
+        const auto& member = view.members[gr];
+        activatable[i] = healthy &&
+                         (member.isActive() || member.isAwaitingActivation()) &&
+                         member.hasEndpoint();
     }
     return {view.group_id, view, rank_states, std::move(activatable)};
 }
@@ -154,6 +156,11 @@ std::pair<AgentApplyResult, bool> AgentStateMachine::applyGroupView(
         }
     }
 
+    // Applying the view must happen-before waking group/rank waiters: callers
+    // may submit a collective as soon as waitUntilGroupReady()/joinGroup()
+    // returns, and that collective must observe the new data-plane metadata.
+    effects.push_back(makeApplyViewEffect(view, global_rank_states_));
+
     // Detect rank activation transitions.
     if (!old_view.members.empty()) {
         std::vector<GlobalRank> newly_activated;
@@ -177,8 +184,6 @@ std::pair<AgentApplyResult, bool> AgentStateMachine::applyGroupView(
     }
 
     it->second = view;
-
-    effects.push_back(makeApplyViewEffect(view, global_rank_states_));
 
     // Must come AFTER ApplyViewToBackend: refreshSegmentID requires
     // latest meta_->rank_order.

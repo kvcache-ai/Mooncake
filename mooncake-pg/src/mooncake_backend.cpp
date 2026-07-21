@@ -418,14 +418,21 @@ c10::intrusive_ptr<c10d::Work> MooncakeP2PShim::barrier(
 }
 
 void MooncakeBackend::prepareOp(c10d::OpType op) const {
+    auto mode = meta_->extensionMode.load(std::memory_order_acquire);
     TORCH_CHECK(meta_->rankStates[meta_->globalRank] != RankState::Offline,
                 "Rank ", meta_->globalRank,
                 " is Offline. Cannot perform operations.");
     // P2P operations don't require the rank to be active in the group.
     if (op != c10d::OpType::SEND && op != c10d::OpType::RECV) {
-        TORCH_CHECK(meta_->activeRanks[rank_], "Rank ", meta_->globalRank,
-                    " is not active in this group. "
-                    "Cannot perform collective operations.");
+        TORCH_CHECK(mode != CollectiveExtensionState::Quiescing, "Rank ",
+                    meta_->globalRank,
+                    " is quiescing (joinGroup has not finished) and cannot "
+                    "perform collective operations.");
+        TORCH_CHECK(mode == CollectiveExtensionState::Isolated ||
+                        meta_->activeRanks[rank_],
+                    "Rank ", meta_->globalRank,
+                    " is not active in this group. Cannot perform "
+                    "collective operations.");
     }
 }
 
@@ -1100,9 +1107,33 @@ ProposeViewUpdateResponse MooncakeBackend::deactivateRanks(
 }
 
 void MooncakeBackend::joinGroup() {
+    auto mode = meta_->extensionMode.load(std::memory_order_acquire);
+    TORCH_CHECK(mode == CollectiveExtensionState::Isolated,
+                "joinGroup may only be called once on an isolated joining "
+                "backend; rank ",
+                meta_->globalRank, " has extension state ",
+                static_cast<int>(mode));
+
+    // Stop admitting isolated collectives before advertising readiness.
+    meta_->extensionMode.store(CollectiveExtensionState::Quiescing,
+                               std::memory_order_release);
+    if (!worker_->drainTasks(meta_.get())) {
+        TORCH_CHECK(false,
+                    "Timed out draining join preparation collectives for "
+                    "rank ",
+                    meta_->globalRank);
+    }
+
+    agent_.confirmReadyForActivation(meta_->group_id);
+
     // Block until the Coordinator activates this rank in the group.
     agent_.waitUntilRankActive(meta_->group_id, meta_->globalRank,
                                std::chrono::seconds(30));
+    const bool normal_and_active =
+        meta_->extensionMode.load(std::memory_order_acquire) ==
+            CollectiveExtensionState::Normal &&
+        meta_->activeRanks[rank_];
+    TORCH_CHECK(normal_and_active, "Bad waitUntilRankActive");
     LOG(INFO) << "joinGroup rank=" << meta_->globalRank
               << " group=" << meta_->group_id << " activated";
 }
@@ -1122,28 +1153,66 @@ void MooncakeBackend::applyViewUpdate(const GroupView& view,
         return;
     }
 
-    // Membership boundary (activation/deactivation): reset the
-    // collective sequence so that all ranks, including joiners and
-    // replacements, agree on the double-buffer parity.
-    bool epoch_changed = false;
-    if (meta_->epoch.load(std::memory_order_acquire) != view.epoch) {
+    bool epoch_changed = current_epoch != view.epoch;
+
+    if (epoch_changed) {
         meta_->taskCount = 0;
-        epoch_changed = true;
     }
 
-    // Rank order
+    // An authoritative view in which self is Active is the common commit point
+    // for enabling normal collective execution:
+    //
+    //   founding ranks: Isolated  -> Normal
+    //   joining ranks:  Quiescing -> Normal
+    //
+    // A non-Active view deliberately does not determine the local mode. A new
+    // joiner must remain Isolated until joinGroup is called; a joiner awaiting
+    // activation must remain Quiescing; and an auto-deactivated backend must
+    // remain Normal so its inactive self bit makes the next collective fail
+    // fast.
+    auto mode = meta_->extensionMode.load(std::memory_order_acquire);
+    auto next_mode = mode;
+    if (view.members[meta_->globalRank].isActive()) {
+        next_mode = CollectiveExtensionState::Normal;
+    }
+
+    TORCH_CHECK(
+        static_cast<int32_t>(view.rank_order.size()) <= meta_->maxGroupSize,
+        "Bad group view");
+
+    // The execution mode determines the effective active ranks consumed by
+    // kernels. Isolated and Quiescing use a local-only mask; Normal follows the
+    // Coordinator's committed membership view.
+    switch (next_mode) {
+        case CollectiveExtensionState::Isolated:
+        case CollectiveExtensionState::Quiescing:
+            for (int local_rank = 0; local_rank < meta_->maxGroupSize;
+                 ++local_rank) {
+                meta_->activeRanks[local_rank] = local_rank == rank_;
+            }
+            break;
+        case CollectiveExtensionState::Normal:
+            for (int local_rank = 0; local_rank < meta_->maxGroupSize;
+                 ++local_rank) {
+                meta_->activeRanks[local_rank] = false;
+            }
+            for (size_t local_rank = 0; local_rank < view.rank_order.size();
+                 ++local_rank) {
+                const auto global_rank = view.rank_order[local_rank];
+                meta_->activeRanks[local_rank] =
+                    view.members[global_rank].isActive();
+            }
+            break;
+    }
+
+    // Rank order and endpoint metadata.
     for (size_t local_rank = 0; local_rank < view.rank_order.size();
          ++local_rank) {
-        TORCH_CHECK(static_cast<int32_t>(local_rank) < meta_->maxGroupSize,
-                    "Bad group view");
-
         // rank order
         meta_->rank_order[local_rank] = view.rank_order[local_rank];
         const auto global_rank = view.rank_order[local_rank];
 
-        // active ranks
         const auto& member = view.members[global_rank];
-        meta_->activeRanks[local_rank] = member.isActive();
         if (member.endpoint.has_value()) {
             meta_->segmentInfos[local_rank] = *member.endpoint;
         }
@@ -1168,6 +1237,10 @@ void MooncakeBackend::applyViewUpdate(const GroupView& view,
     // via getCurrentEpoch() (acquire) sees the complete membership state.
     if (epoch_changed) {
         meta_->epoch.store(view.epoch, std::memory_order_release);
+    }
+
+    if (next_mode != mode) {
+        meta_->extensionMode.store(next_mode, std::memory_order_release);
     }
 }
 

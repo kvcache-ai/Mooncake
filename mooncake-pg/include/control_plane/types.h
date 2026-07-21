@@ -51,25 +51,44 @@ struct GroupEndpointInfo {
     bool operator==(const GroupEndpointInfo&) const = default;
 };
 
-// Membership state of one rank inside a single GroupView.
+// State of one rank inside a GroupView.
+//
+// Founding member:
+//   None ------------(initial group declaration)-----------> Active
+//
+// Joining member:
+//   None ----------------(registerGroup)-------------------> Inactive
+//   Inactive ---(joinGroup confirms local preparation)-----> AwaitingActivation
+//   AwaitingActivation --(Coordinator activates the rank)--> Active
+//
+// Active -----------------------(deactivate)-----------------------> Inactive
+// AwaitingActivation ------(new agent session or offline)----------> Inactive
+// Inactive/AwaitingActivation/Active ----(unregisterGroup)---------> Left
+//
+// Only Active participates in collectives.
+// AwaitingActivation may become activatable once its endpoint, health, and
+// connectivity are ready; Inactive may not.
 enum class GroupMemberState : uint8_t {
-    None = 0,      // slot has never belonged to this group
-    Left = 1,      // explicitly left the group (called destroy_group)
-    Inactive = 2,  // inactive member
-    Active = 3,    // active member
+    None = 0,                // slot has not registered with this group
+    Inactive = 1,            // registered, but not ready for activation
+    AwaitingActivation = 2,  // local join preparation is complete
+    Active = 3,              // committed collective participant
+    Left = 4,                // explicitly left (called destroy_group)
 };
 
 // Rank state inside a single GroupView.
 struct GroupMember {
     GroupMemberState status = GroupMemberState::None;
     std::optional<GroupEndpointInfo> endpoint;
-    // session that published endpoint
-    std::optional<uint64_t> agent_session_epoch;
 
     bool isActive() const { return status == GroupMemberState::Active; }
+    bool isAwaitingActivation() const {
+        return status == GroupMemberState::AwaitingActivation;
+    }
     bool isMember() const {
-        return status == GroupMemberState::Active ||
-               status == GroupMemberState::Inactive;
+        return status == GroupMemberState::Inactive ||
+               status == GroupMemberState::AwaitingActivation ||
+               status == GroupMemberState::Active;
     }
     bool hasLeft() const { return status == GroupMemberState::Left; }
     bool hasEndpoint() const { return endpoint.has_value(); }

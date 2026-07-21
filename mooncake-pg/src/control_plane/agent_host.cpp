@@ -242,6 +242,7 @@ void AgentHost::registerGroup(const GroupView& group, bool auto_deactivate,
                 }
                 group_ready_promises_.erase(it);
             }
+            return;
         }
     });
 }
@@ -258,6 +259,20 @@ void AgentHost::unregisterGroup(GroupId group_id) {
         rpc_client_->send<&CoordinatorRpcService::unregisterGroup>(
             coordinator_addr_, req);
     });
+}
+
+void AgentHost::confirmReadyForActivation(GroupId group_id) {
+    ConfirmReadyForActivationRequest req;
+    req.group_id = std::move(group_id);
+    req.rank = rank_;
+    req.agent_session_epoch = agent_.getAgentSessionEpoch();
+    auto resp =
+        rpc_client_->call<&CoordinatorRpcService::confirmReadyForActivation>(
+            coordinator_addr_, std::move(req));
+    if (!resp.success) {
+        throw std::runtime_error("confirmReadyForActivation rejected: " +
+                                 resp.reject_reason);
+    }
 }
 
 void AgentHost::sendPublishEndpointRpc(GroupEndpointPublication endpoint) {

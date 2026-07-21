@@ -32,6 +32,10 @@ class CoordinatorStateMachine {
     virtual CoordinatorApplyResult<void> handleUnregisterGroup(
         const UnregisterGroupRequest& req) = 0;
 
+    virtual CoordinatorApplyResult<ConfirmReadyForActivationResponse>
+    handleConfirmReadyForActivation(
+        const ConfirmReadyForActivationRequest& req) = 0;
+
     virtual CoordinatorApplyResult<PublishEndpointResponse>
     handlePublishEndpoint(const PublishEndpointRequest& req) = 0;
 
@@ -72,6 +76,10 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
 
     CoordinatorApplyResult<void> handleUnregisterGroup(
         const UnregisterGroupRequest& req) override;
+
+    CoordinatorApplyResult<ConfirmReadyForActivationResponse>
+    handleConfirmReadyForActivation(
+        const ConfirmReadyForActivationRequest& req) override;
 
     CoordinatorApplyResult<PublishEndpointResponse> handlePublishEndpoint(
         const PublishEndpointRequest& req) override;

@@ -29,6 +29,26 @@ static constexpr size_t kBufferSize = 1u << 24;
 
 class MooncakeBackend;
 
+// Local collective extension state. Every backend starts in Isolated.
+//
+// Founding member:
+//   Isolated --(Active view)--> Normal
+//
+// Joining member:
+//   Isolated --(joinGroup: drain preparation collectives)--> Quiescing
+//            -----------------(Active view)----------------> Normal
+//
+// Isolated admits local-only collectives with an {self} active ranks mask.
+// Quiescing rejects new collectives while waiting for activation. Normal uses
+// the Coordinator's committed membership as active ranks. These are local
+// extension phases, not membership states: an auto-deactivated backend remains
+// Normal and fails its next collective through the inactive self bit.
+enum class CollectiveExtensionState : uint8_t {
+    Isolated = 0,   // Local-only collectives
+    Quiescing = 1,  // awaiting activation; no collectives may be issued.
+    Normal = 2,  // Collectives use the membership committed by the coordinator.
+};
+
 struct TransferGroupMeta {
     InGroupRank rank;
     GlobalRank globalRank;
@@ -40,6 +60,8 @@ struct TransferGroupMeta {
 
     GroupId group_id;
     std::atomic<uint64_t> epoch{0};
+    std::atomic<CollectiveExtensionState> extensionMode{
+        CollectiveExtensionState::Isolated};
 
     bool* activeRanks;
     bool* activeRanksDevice;

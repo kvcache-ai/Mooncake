@@ -76,6 +76,8 @@ class AgentInterface {
 
     virtual void unregisterGroup(GroupId group_id) = 0;
 
+    virtual void confirmReadyForActivation(GroupId group_id) = 0;
+
     virtual void publishLocalEndpoint(GroupEndpointPublication endpoint) = 0;
 
     virtual ProposeViewUpdateResponse proposeActivate(
@@ -138,6 +140,7 @@ class AgentHost : public AgentInterface {
     void registerGroup(const GroupView& group, bool auto_deactivate,
                        MooncakeBackend* backend) override;
     void unregisterGroup(GroupId group_id) override;
+    void confirmReadyForActivation(GroupId group_id) override;
     void publishLocalEndpoint(GroupEndpointPublication endpoint) override;
 
     ProposeViewUpdateResponse proposeActivate(
