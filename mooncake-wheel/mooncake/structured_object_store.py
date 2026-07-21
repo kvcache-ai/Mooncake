@@ -29,7 +29,7 @@ STRUCTURED_FIELD_SPECS_KEY = "__mooncake_structured_fields__"
 
 
 class BundleStore(Protocol):
-    def put(self, key: str, value: Any) -> int: ...
+    def put(self, key: str, value: Any, config: Any = None) -> int: ...
 
     def get(self, key: str) -> bytes: ...
 
@@ -435,6 +435,7 @@ class MooncakeBundleTransfer:
         policy: Optional[BundleTransferPolicy] = None,
         max_inflight_put: Optional[int] = None,
         pre_registered_buffers: Optional[Mapping[str, bool]] = None,
+        config: Any = None,
     ) -> RemoteBundleRef:
         """Store raw metadata bytes plus named buffers as a low-level bundle."""
         return self._bundle_store.put_bundle(
@@ -445,6 +446,7 @@ class MooncakeBundleTransfer:
             policy=policy,
             max_inflight_put=max_inflight_put,
             pre_registered_buffers=pre_registered_buffers,
+            config=config,
         )
 
     def remove_bundle(self, ref: RemoteBundleRef | Mapping[str, Any]) -> None:
@@ -459,6 +461,7 @@ class MooncakeBundleTransfer:
         policy: Optional[BundleTransferPolicy] = None,
         max_inflight_put: Optional[int] = None,
         pre_registered_buffers: Optional[Mapping[str, bool]] = None,
+        config: Any = None,
     ) -> RemoteBundleRef:
         """Store a structured object described by JSON metadata plus named members."""
         return self._structured_store.put_structured_object(
@@ -468,6 +471,7 @@ class MooncakeBundleTransfer:
             policy=policy,
             max_inflight_put=max_inflight_put,
             pre_registered_buffers=pre_registered_buffers,
+            config=config,
         )
 
     def put_object(
@@ -477,6 +481,7 @@ class MooncakeBundleTransfer:
         chunk_bytes: Optional[int] = None,
         policy: Optional[BundleTransferPolicy] = None,
         max_inflight_put: Optional[int] = None,
+        config: Any = None,
     ) -> RemoteBundleRef:
         """Store a mapping object or a single tensor/array value."""
         if isinstance(obj, Mapping):
@@ -492,6 +497,7 @@ class MooncakeBundleTransfer:
             chunk_bytes=chunk_bytes,
             policy=policy,
             max_inflight_put=max_inflight_put,
+            config=config,
         )
 
     def get_object(self, ref: RemoteBundleRef | Mapping[str, Any]) -> Any:
@@ -564,6 +570,68 @@ class MooncakeBundleTransfer:
 
         visit(result)
 
+    def put(
+        self,
+        data: Any,
+        *,
+        type: Literal["dataproto", "dict"] = "dataproto",
+        namespace: str = "default",
+        partition: str = "default",
+        stage: str = "default",
+        chunk_bytes: Optional[int] = None,
+        policy: Optional[BundleTransferPolicy] = None,
+        config: Any = None,
+        field_schemas: Optional[Mapping[str, FieldSchema]] = None,
+    ) -> MooncakeDataProtoRef:
+        """Store a DataProto-like object or flat dict as a structured object."""
+        if type == "dataproto":
+            stage_data = data
+        elif type == "dict":
+            stage_data = _flat_dict_to_envelope(data)
+        else:
+            raise ValueError(f"unsupported Mooncake payload type: {type!r}")
+        return self._put_dataproto_stage(
+            None,
+            stage_data,
+            namespace=namespace,
+            partition=partition,
+            stage=stage,
+            chunk_bytes=chunk_bytes,
+            policy=policy,
+            overwrite=False,
+            config=config,
+            field_schemas=field_schemas,
+        )
+
+    def get(
+        self,
+        ref: DataProtoRefLike,
+        *,
+        type: Literal["dataproto", "dict"] = "dataproto",
+        fields: Optional[Sequence[str]] = None,
+        batch_fields: Optional[Sequence[str]] = None,
+        non_tensor_fields: Optional[Sequence[str]] = None,
+        meta_info_keys: Optional[Sequence[str]] = None,
+        data_cls: Optional[Any] = None,
+        destinations: Optional[Mapping[str, Any]] = None,
+        rows: slice | StructuredMemberSlice | Sequence[int] | None = None,
+    ) -> Any:
+        """Materialize a DataProto-like object or flat dict."""
+        if type not in {"dataproto", "dict"}:
+            raise ValueError(f"unsupported Mooncake payload type: {type!r}")
+        result = self.get_dataproto(
+            ref,
+            fields=fields,
+            batch_fields=batch_fields,
+            non_tensor_fields=non_tensor_fields,
+            meta_info_keys=meta_info_keys,
+            data_cls=dict if type == "dict" else data_cls,
+            destinations=destinations,
+            rows=rows,
+        )
+        return _envelope_to_flat_dict(result) if type == "dict" else result
+
+
     def put_dataproto(
         self,
         data: Any,
@@ -574,18 +642,19 @@ class MooncakeBundleTransfer:
         chunk_bytes: Optional[int] = None,
         policy: Optional[BundleTransferPolicy] = None,
         field_schemas: Optional[Mapping[str, FieldSchema]] = None,
+        config: Any = None,
     ) -> MooncakeDataProtoRef:
-        """Store DataProto fields, optionally using schema hints for non-tensor fields."""
-        return self._put_dataproto_stage(
-            None,
+        """Store a DataProto-like object as a stage-level structured object."""
+        return self.put(
             data,
+            type="dataproto",
             namespace=namespace,
             partition=partition,
             stage=stage,
             chunk_bytes=chunk_bytes,
             policy=policy,
-            overwrite=False,
             field_schemas=field_schemas,
+            config=config,
         )
 
     def append_dataproto_fields(
@@ -598,6 +667,7 @@ class MooncakeBundleTransfer:
         chunk_bytes: Optional[int] = None,
         policy: Optional[BundleTransferPolicy] = None,
         field_schemas: Optional[Mapping[str, FieldSchema]] = None,
+        config: Any = None,
     ) -> MooncakeDataProtoRef:
         """Append DataProto fields, optionally using schema hints for new fields."""
         ref = _resolve_dataproto_ref(ref)
@@ -611,6 +681,7 @@ class MooncakeBundleTransfer:
             policy=policy,
             overwrite=overwrite,
             field_schemas=field_schemas,
+            config=config,
         )
 
     def dataproto_manifest_view(self, ref: DataProtoRefLike) -> dict[str, Any]:
@@ -1274,6 +1345,37 @@ class MooncakeBundleTransfer:
             seen.add(stage_ref.manifest_key)
             self.remove_bundle(stage_ref)
 
+    def put_dict(
+        self,
+        data: Mapping[str, Any],
+        *,
+        namespace: str = "default",
+        partition: str = "default",
+        stage: str = "default",
+        chunk_bytes: Optional[int] = None,
+        policy: Optional[BundleTransferPolicy] = None,
+        config: Any = None,
+    ) -> MooncakeDataProtoRef:
+        """Store a flat dict as a structured object."""
+        return self.put(
+            data,
+            type="dict",
+            namespace=namespace,
+            partition=partition,
+            stage=stage,
+            chunk_bytes=chunk_bytes,
+            policy=policy,
+            config=config,
+        )
+
+    def get_dict(self, ref: DataProtoRefLike) -> dict[str, Any]:
+        """Materialize a flat dict stored by put_dict()."""
+        return self.get(ref, type="dict")
+
+    def remove_dict(self, ref: DataProtoRefLike) -> None:
+        """Remove a flat dict stored by put_dict()."""
+        self.cleanup_dataproto(ref)
+
     def _append_dataproto_stage_manifest(
         self,
         old_stage_ref: RemoteBundleRef,
@@ -1282,12 +1384,14 @@ class MooncakeBundleTransfer:
         partition: str,
         chunk_bytes: Optional[int],
         policy: Optional[BundleTransferPolicy],
+        config: Any = None,
     ) -> RemoteBundleRef:
         new_stage_ref = self.put_structured_object(
             payload,
             partition=partition,
             chunk_bytes=chunk_bytes,
             policy=policy,
+            config=config,
         )
         try:
             old_manifest = self._bundle_store.resolve_manifest(old_stage_ref)
@@ -1316,6 +1420,7 @@ class MooncakeBundleTransfer:
                     self._bundle_store.manifest_key(old_stage_ref),
                     *self._bundle_store.payload_keys(old_manifest["meta"]),
                 ],
+                config=config,
             )
         except Exception:
             self.remove_bundle(new_stage_ref)
@@ -1339,6 +1444,7 @@ class MooncakeBundleTransfer:
         policy: Optional[BundleTransferPolicy],
         overwrite: bool,
         field_schemas: Optional[Mapping[str, FieldSchema]] = None,
+        config: Any = None,
     ) -> MooncakeDataProtoRef:
         batch, non_tensor_batch, meta_info = _split_dataproto_like(data)
         _validate_dataproto_schema_sections(
@@ -1466,6 +1572,7 @@ class MooncakeBundleTransfer:
                 partition=partition,
                 chunk_bytes=chunk_bytes,
                 policy=policy,
+                config=config,
             )
         else:
             stage_ref = self.put_structured_object(
@@ -1473,6 +1580,7 @@ class MooncakeBundleTransfer:
                 partition=partition,
                 chunk_bytes=chunk_bytes,
                 policy=policy,
+                config=config,
             )
             if (
                 existing_stage_ref is not None
@@ -1575,6 +1683,93 @@ def _dataproto_manifest_view(
             for stage, stage_ref in ref.stage_refs.items()
         },
     }
+
+
+def _flat_dict_to_envelope(data: Mapping[str, Any]) -> dict[str, Any]:
+    if not isinstance(data, Mapping):
+        raise TypeError("flat dict payload must be a mapping")
+    row_count = _flat_dict_auto_row_count(data)
+    batch: dict[str, Any] = {}
+    non_tensor_batch: dict[str, Any] = {}
+    meta_info: dict[str, Any] = {}
+    for name, value in data.items():
+        if _is_row_aligned_dense_field(value, row_count):
+            batch[name] = value
+        elif _is_non_string_sequence(value) and len(value) == row_count:
+            non_tensor_batch[name] = _coerce_flat_dict_non_tensor_field(
+                name, value, row_count
+            )
+        else:
+            meta_info[name] = value
+    return {"batch": batch, "non_tensor_batch": non_tensor_batch, "meta_info": meta_info}
+
+
+def _flat_dict_auto_row_count(data: Mapping[str, Any]) -> int:
+    sizes = {
+        len(value)
+        for value in data.values()
+        if (
+            (_torch is not None and isinstance(value, _torch.Tensor) and value.ndim > 0)
+            or (isinstance(value, np.ndarray) and value.ndim > 0)
+            or _is_non_string_sequence(value)
+        )
+    }
+    if not sizes:
+        return 0
+    if len(sizes) != 1:
+        raise ValueError(
+            f"flat dict fields have ambiguous batch sizes: {sorted(sizes)}"
+        )
+    return sizes.pop()
+
+
+def _coerce_flat_dict_non_tensor_field(name: str, value: Any, row_count: int) -> Any:
+    if isinstance(value, np.ndarray):
+        if len(value) != row_count:
+            raise ValueError(
+                f"flat dict non_tensor_batch field {name!r} has batch size {len(value)}, expected {row_count}"
+            )
+        return value
+    if _is_non_string_sequence(value):
+        if len(value) != row_count:
+            raise ValueError(
+                f"flat dict non_tensor_batch field {name!r} has batch size {len(value)}, expected {row_count}"
+            )
+        array = np.empty(row_count, dtype=object)
+        array[:] = list(value)
+        return array
+    raise TypeError(
+        f"flat dict non_tensor_batch field {name!r} must be an ndarray or non-string sequence"
+    )
+
+
+def _is_non_string_sequence(value: Any) -> bool:
+    return isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray))
+
+
+def _is_row_aligned_dense_field(value: Any, row_count: int) -> bool:
+    if row_count == 0:
+        return False
+    if _torch is not None and isinstance(value, _torch.Tensor):
+        return value.shape[:1] == (row_count,)
+    return (
+        isinstance(value, np.ndarray)
+        and value.dtype != object
+        and value.shape[:1] == (row_count,)
+    )
+
+
+def _envelope_to_flat_dict(data: Mapping[str, Any]) -> dict[str, Any]:
+    result = dict(_mapping_to_dict(data.get("meta_info")))
+    result.update(_mapping_to_dict(data.get("batch")))
+    for name, value in _mapping_to_dict(data.get("non_tensor_batch")).items():
+        result[name] = (
+            value.tolist()
+            if isinstance(value, np.ndarray) and value.dtype == object
+            else value
+        )
+    return result
+
 
 
 def _build_dataproto_like_result(
@@ -2733,6 +2928,7 @@ class _StructuredObjectLayer:
         policy: Optional[BundleTransferPolicy],
         max_inflight_put: Optional[int],
         pre_registered_buffers: Optional[Mapping[str, bool]],
+        config: Any = None,
     ) -> RemoteBundleRef:
         metadata, buffers = _encode_structured_fields(payload.metadata, payload.buffers)
         transfer_policy = self._bundle_store._policy(
@@ -2750,6 +2946,7 @@ class _StructuredObjectLayer:
             policy=transfer_policy,
             max_inflight_put=None,
             pre_registered_buffers=pre_registered_buffers,
+            config=config,
         )
 
     def read_spec(
@@ -3014,6 +3211,7 @@ class _BundleManifestStore:
         policy: Optional[BundleTransferPolicy],
         max_inflight_put: Optional[int],
         pre_registered_buffers: Optional[Mapping[str, bool]] = None,
+        config: Any = None,
     ) -> RemoteBundleRef:
         _validate_key_segment(partition, "partition")
         meta_view = _bytes_view(meta, "meta")
@@ -3034,6 +3232,7 @@ class _BundleManifestStore:
                 target_chunk_bytes,
                 _copy_transfer_policy(transfer_policy),
                 pre_registered=False,
+                config=config,
             )
             written_keys.extend(meta_keys)
             for name, value in buffers.items():
@@ -3044,6 +3243,7 @@ class _BundleManifestStore:
                         payload_key,
                         value,
                         transfer_policy,
+                        config=config,
                     )
                 else:
                     payload_spec, payload_keys = self._put_payload(
@@ -3052,6 +3252,7 @@ class _BundleManifestStore:
                         target_chunk_bytes,
                         transfer_policy,
                         pre_registered=bool(pre_registered_map.get(name, False)),
+                        config=config,
                     )
                 buffer_specs[name] = payload_spec
                 written_keys.extend(payload_keys)
@@ -3064,7 +3265,9 @@ class _BundleManifestStore:
             }
             manifest_blob = _encode_manifest(manifest)
             _check_status(
-                self._store.put(manifest_key, manifest_blob), "put", manifest_key
+                _put_with_optional_config(self._store, manifest_key, manifest_blob, config),
+                "put",
+                manifest_key,
             )
             written_keys.append(manifest_key)
         except Exception:
@@ -3081,6 +3284,7 @@ class _BundleManifestStore:
         chunk_bytes: Optional[int],
         policy: Optional[BundleTransferPolicy],
         cleanup_keys: Optional[Sequence[str]] = None,
+        config: Any = None,
     ) -> RemoteBundleRef:
         _validate_key_segment(partition, "partition")
         meta_view = _bytes_view(meta, "meta")
@@ -3099,6 +3303,7 @@ class _BundleManifestStore:
                 target_chunk_bytes,
                 _copy_transfer_policy(transfer_policy),
                 pre_registered=False,
+                config=config,
             )
             written_keys.extend(meta_keys)
             manifest = {
@@ -3121,7 +3326,9 @@ class _BundleManifestStore:
             self._validate_manifest(manifest)
             manifest_blob = _encode_manifest(manifest)
             _check_status(
-                self._store.put(manifest_key, manifest_blob), "put", manifest_key
+                _put_with_optional_config(self._store, manifest_key, manifest_blob, config),
+                "put",
+                manifest_key,
             )
             written_keys.append(manifest_key)
         except Exception:
@@ -3262,9 +3469,10 @@ class _BundleManifestStore:
         key: str,
         value: _TensorPayload | _TensorObjectBufferPayload,
         transfer_policy: BundleTransferPolicy,
+        config: Any = None,
     ) -> tuple[dict[str, Any], list[str]]:
         if isinstance(value, _TensorObjectBufferPayload):
-            total_bytes = self._transport.put_tensor_object_buffer(key, value)
+            total_bytes = self._transport.put_tensor_object_buffer(key, value, config)
             return {
                 "key": key,
                 "bytes": total_bytes,
@@ -3275,11 +3483,11 @@ class _BundleManifestStore:
                 raise ValueError(
                     "zero-copy structured tensor fields require a BufferPool tensor-object buffer"
                 )
-            tensor_spec = self._transport.put_tensor_payload_direct(key, value)
+            tensor_spec = self._transport.put_tensor_payload_direct(key, value, config)
             if tensor_spec is not None:
                 return tensor_spec, [key]
             try:
-                total_bytes = self._transport.put_tensor_payload_from_pool(key, value)
+                total_bytes = self._transport.put_tensor_payload_from_pool(key, value, config)
                 return {
                     "key": key,
                     "bytes": total_bytes,
@@ -3295,6 +3503,7 @@ class _BundleManifestStore:
                 len(payload) or 1,
                 transfer_policy,
                 pre_registered=False,
+                config=config,
             )
             payload_spec["format"] = "torch_save"
             return payload_spec, payload_keys
@@ -3305,6 +3514,7 @@ class _BundleManifestStore:
             len(payload) or 1,
             transfer_policy,
             pre_registered=False,
+            config=config,
         )
         payload_spec["metadata_bytes"] = metadata_bytes
         return payload_spec, payload_keys
@@ -3316,6 +3526,7 @@ class _BundleManifestStore:
         chunk_bytes: int,
         transfer_policy: BundleTransferPolicy,
         pre_registered: bool,
+        config: Any = None,
     ) -> tuple[dict[str, Any], list[str]]:
         if len(value) == 0:
             return {"key": key, "bytes": 0, "chunks": []}, []
@@ -3329,6 +3540,7 @@ class _BundleManifestStore:
             chunks,
             transfer_policy,
             pre_registered=pre_registered,
+            config=config,
         )
         payload_spec = {
             "key": key,
@@ -3503,19 +3715,20 @@ class _MooncakePayloadTransport:
         chunks: Sequence[memoryview],
         transfer_policy: BundleTransferPolicy,
         pre_registered: bool,
+        config: Any = None,
     ) -> list[str]:
         if transfer_policy.copy_mode == "copy":
-            return self._put_chunks_direct(chunk_keys, chunks)
+            return self._put_chunks_direct(chunk_keys, chunks, config=config)
         if not self._has_batch_put_support():
             if transfer_policy.copy_mode == "zero_copy":
                 raise RuntimeError(
                     "zero-copy put requested but batch_put_from is unavailable"
                 )
-            return self._put_chunks_direct(chunk_keys, chunks)
+            return self._put_chunks_direct(chunk_keys, chunks, config=config)
         put_mode = self._resolve_put_mode(chunks, transfer_policy)
         if put_mode == "batch":
             self.batch_put_chunks_from(
-                chunk_keys, chunks, pre_registered=pre_registered
+                chunk_keys, chunks, pre_registered=pre_registered, config=config
             )
             return list(chunk_keys)
         return self._put_chunks_parallel(
@@ -3523,6 +3736,7 @@ class _MooncakePayloadTransport:
             list(chunks),
             transfer_policy.max_inflight_put,
             pre_registered=pre_registered,
+            config=config,
         )
 
     def read_payload(self, payload_spec: Mapping[str, Any]) -> bytes:
@@ -3686,12 +3900,16 @@ class _MooncakePayloadTransport:
         self,
         key: str,
         value: _TensorObjectBufferPayload,
+        config: Any = None,
     ) -> int:
         put_tensor_from = self._put_tensor_from
-        if not callable(put_tensor_from):
-            raise RuntimeError("put_tensor_from is unavailable")
+        put_from = getattr(self._store, "put_from", None)
+        if not callable(put_tensor_from) and not callable(put_from):
+            raise RuntimeError("put_from is unavailable")
         _check_status(
-            put_tensor_from(key, value.ptr, value.size), "put_tensor_from", key
+            _put_from_with_optional_config(self._store, key, value.ptr, value.size, config),
+            "put_from",
+            key,
         )
         _ = value.owner
         return value.size
@@ -3700,7 +3918,10 @@ class _MooncakePayloadTransport:
         self,
         key: str,
         value: _TensorPayload,
+        config: Any = None,
     ) -> dict[str, Any] | None:
+        if config is not None:
+            return None
         put_tensor = getattr(self._store, "put_tensor", None)
         if not callable(put_tensor):
             return None
@@ -3723,12 +3944,14 @@ class _MooncakePayloadTransport:
         self,
         key: str,
         value: _TensorPayload,
+        config: Any = None,
     ) -> int:
         if self._buffer_pool is None:
             raise RuntimeError("structured tensor zero-copy requires a BufferPool")
         put_tensor_from = self._put_tensor_from
-        if not callable(put_tensor_from):
-            raise RuntimeError("put_tensor_from is unavailable")
+        put_from = getattr(self._store, "put_from", None)
+        if not callable(put_tensor_from) and not callable(put_from):
+            raise RuntimeError("put_from is unavailable")
         metadata, data_ptr, tensor_nbytes, owner = _tensor_payload_parts(value)
         total_bytes = len(metadata) + tensor_nbytes
         lease = self._buffer_pool.acquire(total_bytes)
@@ -3741,7 +3964,9 @@ class _MooncakePayloadTransport:
             view.release()
             view = None
             _check_status(
-                put_tensor_from(key, lease.ptr, total_bytes), "put_tensor_from", key
+                _put_from_with_optional_config(self._store, key, lease.ptr, total_bytes, config),
+                "put_from",
+                key,
             )
             _ = owner
             return total_bytes
@@ -3755,6 +3980,7 @@ class _MooncakePayloadTransport:
         chunk_keys: Sequence[str],
         chunks: Sequence[memoryview],
         pre_registered: bool,
+        config: Any = None,
     ) -> None:
         batch_put_from = self._batch_put_from
         if not callable(batch_put_from):
@@ -3768,7 +3994,9 @@ class _MooncakePayloadTransport:
             buffer_ptrs, sizes, pre_registered, "bundle source payload"
         )
         try:
-            results = batch_put_from(list(chunk_keys), buffer_ptrs, sizes)
+            results = _batch_put_from_with_optional_config(
+                batch_put_from, list(chunk_keys), buffer_ptrs, sizes, config
+            )
             if len(results) != len(chunk_keys):
                 raise RuntimeError(
                     f"batch_put_from returned {len(results)} results for {len(chunk_keys)} chunks"
@@ -3785,11 +4013,16 @@ class _MooncakePayloadTransport:
         self,
         chunk_keys: Sequence[str],
         chunks: Sequence[memoryview],
+        config: Any = None,
     ) -> list[str]:
         written_keys: list[str] = []
         try:
             for chunk_key, chunk in zip(chunk_keys, chunks):
-                _check_status(self._store.put(chunk_key, chunk), "put", chunk_key)
+                _check_status(
+                    _put_with_optional_config(self._store, chunk_key, chunk, config),
+                    "put",
+                    chunk_key,
+                )
                 written_keys.append(chunk_key)
         except Exception:
             _cleanup_keys(self._store, written_keys, strict=False)
@@ -3802,6 +4035,7 @@ class _MooncakePayloadTransport:
         chunks: list[memoryview],
         max_inflight_put: int,
         pre_registered: bool,
+        config: Any = None,
     ) -> list[str]:
         groups = self._group_chunk_ranges(chunk_keys, chunks, max_inflight_put)
         futures: list[Future[None]] = []
@@ -3815,6 +4049,7 @@ class _MooncakePayloadTransport:
                         group_keys,
                         group_chunks,
                         pre_registered,
+                        config,
                     )
                     for group_keys, group_chunks in groups
                 ]
@@ -4669,6 +4904,43 @@ def _decode_json_dict(payload: bytes, label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{label} must decode to a dict")
     return value
+
+
+def _call_write_with_optional_config(fn: Any, *args: Any, config: Any = None) -> Any:
+    if config is None:
+        return fn(*args)
+    return fn(*args, config=config)
+
+
+def _put_with_optional_config(
+    store: BundleStore, key: str, value: Any, config: Any = None
+) -> int:
+    return _call_write_with_optional_config(store.put, key, value, config=config)
+
+
+def _put_from_with_optional_config(
+    store: BundleStore, key: str, ptr: int, size: int, config: Any = None
+) -> int:
+    put_tensor_from = getattr(store, "put_tensor_from", None)
+    if config is None and callable(put_tensor_from):
+        return put_tensor_from(key, ptr, size)
+    put_from = getattr(store, "put_from", None)
+    if callable(put_from):
+        return _call_write_with_optional_config(put_from, key, ptr, size, config=config)
+    raise RuntimeError("put_from is unavailable")
+
+
+def _batch_put_from_with_optional_config(
+    batch_put_from: Any,
+    keys: Sequence[str],
+    ptrs: Sequence[int],
+    sizes: Sequence[int],
+    config: Any = None,
+) -> Sequence[int]:
+    return _call_write_with_optional_config(
+        batch_put_from, list(keys), list(ptrs), list(sizes), config=config
+    )
+
 
 
 def _check_status(status: Any, operation: str, key: str) -> None:
