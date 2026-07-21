@@ -4,10 +4,11 @@ import ctypes
 import io
 import json
 import uuid
+from collections.abc import Iterable
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Iterator, Literal, Mapping, Optional, Protocol, Sequence
+from typing import Any, Callable, Iterator, Literal, Mapping, Optional, Protocol, Sequence
 
 import numpy as np
 
@@ -42,6 +43,19 @@ class BundleTransferPolicy:
     max_inflight_put: int = 1
     put_mode: Literal["auto", "batch", "parallel"] = "auto"
     copy_mode: Literal["auto", "zero_copy", "copy"] = "auto"
+
+
+@dataclass(frozen=True)
+class FieldSchema:
+    """Schema hint for DataProto fields.
+
+    ``metadata["section"]`` may pin a field to ``batch``,
+    ``non_tensor_batch``, or ``meta_info``.
+    """
+
+    codec: str
+    nullable: bool = True
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -471,8 +485,9 @@ class MooncakeBundleTransfer:
         stage: str = "default",
         chunk_bytes: Optional[int] = None,
         policy: Optional[BundleTransferPolicy] = None,
+        field_schemas: Optional[Mapping[str, FieldSchema]] = None,
     ) -> MooncakeDataProtoRef:
-        """Store a DataProto-like object as a stage-level structured object."""
+        """Store DataProto fields, optionally using schema hints for non-tensor fields."""
         return self._put_dataproto_stage(
             None,
             data,
@@ -482,6 +497,7 @@ class MooncakeBundleTransfer:
             chunk_bytes=chunk_bytes,
             policy=policy,
             overwrite=False,
+            field_schemas=field_schemas,
         )
 
     def append_dataproto_fields(
@@ -493,8 +509,9 @@ class MooncakeBundleTransfer:
         overwrite: bool = False,
         chunk_bytes: Optional[int] = None,
         policy: Optional[BundleTransferPolicy] = None,
+        field_schemas: Optional[Mapping[str, FieldSchema]] = None,
     ) -> MooncakeDataProtoRef:
-        """Append fields from a later DataProto stage without rewriting previous stages."""
+        """Append DataProto fields, optionally using schema hints for new fields."""
         ref = _resolve_dataproto_ref(ref)
         return self._put_dataproto_stage(
             ref,
@@ -505,6 +522,7 @@ class MooncakeBundleTransfer:
             chunk_bytes=chunk_bytes,
             policy=policy,
             overwrite=overwrite,
+            field_schemas=field_schemas,
         )
 
     def dataproto_manifest_view(self, ref: DataProtoRefLike) -> dict[str, Any]:
@@ -909,6 +927,16 @@ class MooncakeBundleTransfer:
                 "nulls": read_member_indices("nulls", indices),
             }, metadata
 
+        if codec == "ragged_tensor_dict":
+            return self._read_ragged_tensor_dict_payload(
+                payload_members,
+                metadata,
+                read_null_mask=lambda: read_member_indices("null_mask", indices),
+                read_key_payload=lambda encoded: self._read_structured_non_tensor_payload_indices(
+                    stage_ref, encoded, indices
+                ),
+            )
+
         if codec in {"media_bytes", "bytes_ragged", "utf8_ragged", "msgpack_ragged", "json_ragged"}:
             offsets = read_member_indices(
                 "offsets", [index for row in indices for index in (row, row + 1)]
@@ -1074,6 +1102,16 @@ class MooncakeBundleTransfer:
                 "nulls": read_member("nulls", start, end),
             }, metadata
 
+        if codec == "ragged_tensor_dict":
+            return self._read_ragged_tensor_dict_payload(
+                payload_members,
+                metadata,
+                read_null_mask=lambda: read_member("null_mask", start, end),
+                read_key_payload=lambda encoded: self._read_structured_non_tensor_payload_slice(
+                    stage_ref, encoded, row_slice, total_rows
+                ),
+            )
+
         if codec in {"media_bytes", "bytes_ragged", "utf8_ragged", "msgpack_ragged", "json_ragged"}:
             offsets = read_member("offsets", start, end + 1)
             base = int(offsets[0])
@@ -1108,6 +1146,35 @@ class MooncakeBundleTransfer:
             }, metadata
 
         raise ValueError(f"unknown structured non-tensor codec: {codec}")
+
+    def _read_ragged_tensor_dict_payload(
+        self,
+        payload_members: Mapping[str, str],
+        metadata: dict[str, Any],
+        *,
+        read_null_mask: Callable[[], Any],
+        read_key_payload: Callable[
+            [Mapping[str, Any]], tuple[dict[str, Any], Mapping[str, Any]]
+        ],
+    ) -> tuple[dict[str, Any], Mapping[str, Any]]:
+        key_codecs = dict(metadata.get("key_codecs") or {})
+        metadata["key_codecs"] = key_codecs
+        dict_payload: dict[str, Any] = {"null_mask": read_null_mask()}
+        for key in _normalize_ragged_tensor_dict_keys(metadata.get("keys", [])):
+            key_members = _ragged_tensor_dict_payload_items(
+                payload_members, key, kind="manifest"
+            )
+            key_payload, key_metadata = read_key_payload(
+                {
+                    "codec": "ragged_tensor",
+                    "metadata": key_codecs.get(key) or {},
+                    "payload_members": key_members,
+                }
+            )
+            key_codecs[key] = key_metadata
+            for name, value in key_payload.items():
+                dict_payload[f"{key}.{name}"] = value
+        return dict_payload, metadata
 
     def cleanup_dataproto(self, ref: DataProtoRefLike) -> None:
         """Remove all structured object stages referenced by a DataProto handle."""
@@ -1183,8 +1250,12 @@ class MooncakeBundleTransfer:
         chunk_bytes: Optional[int],
         policy: Optional[BundleTransferPolicy],
         overwrite: bool,
+        field_schemas: Optional[Mapping[str, FieldSchema]] = None,
     ) -> MooncakeDataProtoRef:
         batch, non_tensor_batch, meta_info = _split_dataproto_like(data)
+        _validate_dataproto_schema_sections(
+            batch, non_tensor_batch, meta_info, field_schemas
+        )
         batch_size = _dataproto_batch_size(batch, non_tensor_batch)
         if ref is not None and batch_size != ref.batch_size:
             raise ValueError(
@@ -1203,10 +1274,31 @@ class MooncakeBundleTransfer:
             field_updates[name] = StructuredFieldLocation(stage, member, "batch")
         encoded_updates: dict[str, Any] = {}
         for name, value in non_tensor_batch.items():
-            if _should_encode_non_tensor_field(value):
+            schema = _schema_for_section(
+                field_schemas, name, "non_tensor_batch"
+            )
+            encoded: _EncodedStructuredLeaf | None = None
+            if schema is not None:
+                try:
+                    encode_value = _coerce_schema_non_tensor_value(name, value)
+                    if schema.codec == "auto":
+                        _validate_schema_nullable(
+                            f"non_tensor_batch.{name}", encode_value, schema
+                        )
+                    else:
+                        encoded = _encode_with_schema(
+                            f"non_tensor_batch.{name}", encode_value, schema
+                        )
+                except (TypeError, ValueError, RuntimeError, AttributeError) as exc:
+                    raise type(exc)(
+                        f"failed to encode non_tensor_batch field {name!r} "
+                        f"with FieldSchema codec {schema.codec!r}: {exc}"
+                    ) from exc
+            if encoded is None and _should_encode_non_tensor_field(value):
                 encoded = _encode_structured_non_tensor_field(
                     f"non_tensor_batch.{name}", value
                 )
+            if encoded is not None:
                 payload_members: dict[str, str] = {}
                 for payload_name, payload_value in encoded.payload.items():
                     member = f"non_tensor_batch.{name}.{payload_name}"
@@ -1585,6 +1677,107 @@ def _select_mapping(
     return {key: value[key] for key in keys if key in value}
 
 
+_DATAPROTO_SCHEMA_SECTIONS = frozenset({"batch", "non_tensor_batch", "meta_info"})
+_FIELD_SCHEMA_CODECS = frozenset({
+    "auto", "ragged_tensor_dict", "ragged_tensor", "typed_ragged", "ndarray",
+    "bytes_ragged", "media_bytes", "media_list_ragged", "utf8_ragged",
+    "msgpack_ragged", "json_ragged",
+})
+_RAGGED_TENSOR_PAYLOAD_NAMES = frozenset({"data", "offsets", "shapes", "ndims", "nulls"})
+
+
+def _schema_section(name: str, schema: FieldSchema) -> str | None:
+    section = schema.metadata.get("section")
+    if section is None:
+        return None
+    if section not in _DATAPROTO_SCHEMA_SECTIONS:
+        raise ValueError(
+            f"FieldSchema for {name!r} metadata['section'] must be one of "
+            f"{sorted(_DATAPROTO_SCHEMA_SECTIONS)}"
+        )
+    return section
+
+
+def _schema_for_section(
+    field_schemas: Optional[Mapping[str, FieldSchema]],
+    name: str,
+    section: str,
+) -> FieldSchema | None:
+    if not field_schemas:
+        return None
+    schema = field_schemas.get(name)
+    if schema is None:
+        return None
+    declared = _schema_section(name, schema)
+    return schema if declared is None or declared == section else None
+
+
+def _schema_ndarray_dtype(
+    schema: FieldSchema, *, required: bool = False
+) -> np.dtype[Any] | None:
+    dtype_name = schema.metadata.get("dtype")
+    if dtype_name is None:
+        if required:
+            raise ValueError("FieldSchema metadata['dtype'] is required")
+        return None
+    try:
+        dtype = np.dtype(dtype_name)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid FieldSchema metadata['dtype']: {dtype_name!r}") from exc
+    if dtype.kind not in "biufc":
+        raise ValueError(
+            f"FieldSchema metadata['dtype'] must be numeric or bool, got {dtype}"
+        )
+    return dtype
+
+
+def _validate_dataproto_schema_sections(
+    batch: Mapping[str, Any],
+    non_tensor_batch: Mapping[str, Any],
+    meta_info: Mapping[str, Any],
+    field_schemas: Optional[Mapping[str, FieldSchema]],
+) -> None:
+    if not field_schemas:
+        return
+    sections = {
+        "batch": batch,
+        "non_tensor_batch": non_tensor_batch,
+        "meta_info": meta_info,
+    }
+    actual_sections: dict[str, set[str]] = {}
+    for section, fields in sections.items():
+        for name in fields:
+            actual_sections.setdefault(name, set()).add(section)
+    for name, schema in field_schemas.items():
+        declared = _schema_section(name, schema)
+        if declared is None:
+            continue
+        actual = actual_sections.get(name)
+        if not actual or declared in actual:
+            continue
+        actual_text = ", ".join(repr(section) for section in sorted(actual))
+        raise ValueError(
+            f"FieldSchema for {name!r} declares section {declared!r}, "
+            f"but data contains it in {actual_text}"
+        )
+
+def _coerce_schema_non_tensor_value(name: str, value: Any) -> np.ndarray:
+    if isinstance(value, np.ndarray):
+        return value
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        result = np.empty(len(value), dtype=object)
+        result[:] = list(value)
+        return result
+    raise TypeError(
+        f"non_tensor_batch field {name!r} with FieldSchema must be an ndarray or non-string sequence"
+    )
+
+
+def _validate_schema_nullable(path: str, value: np.ndarray, schema: FieldSchema) -> None:
+    if not schema.nullable and any(item is None for item in value):
+        raise ValueError(f"FieldSchema for {path!r} is not nullable")
+
+
 def _should_encode_non_tensor_field(value: Any) -> bool:
     return isinstance(value, np.ndarray) and value.dtype == object
 
@@ -1600,6 +1793,66 @@ def _encode_structured_non_tensor_field(
         return _encode_recursive_structured_non_tensor_field(path, values, leaves, nodes)
     decision = _choose_leaf_codec(values)
     return _encode_structured_leaf(values, decision)
+
+
+def _encode_with_schema(
+    path: str, value: np.ndarray, schema: FieldSchema
+) -> _EncodedStructuredLeaf:
+    values = list(value)
+    _validate_schema_nullable(path, value, schema)
+    codec = schema.codec
+    if codec not in _FIELD_SCHEMA_CODECS:
+        raise ValueError(f"unsupported schema codec: {codec!r}")
+    if codec == "auto":
+        return _encode_structured_non_tensor_field(path, value)
+    if codec == "ragged_tensor_dict":
+        return _encode_ragged_tensor_dict_values(values, schema)
+    if codec == "ragged_tensor":
+        payload, metadata = _encode_ragged_tensor_values(values)
+    elif codec == "typed_ragged":
+        payload, metadata = _encode_typed_ragged_values(
+            values, dtype_hint=_schema_ndarray_dtype(schema)
+        )
+    elif codec == "ndarray":
+        dtype = _schema_ndarray_dtype(schema, required=True)
+        decision = _CodecDecision(
+            True, "ndarray", "schema", "numeric scalar", {"dtype": str(dtype)}
+        )
+        payload, metadata = _encode_numeric_scalar_values(values, decision)
+    elif codec in ("bytes_ragged", "media_bytes"):
+        payload, metadata = _encode_bytes_like_values(values)
+    elif codec == "media_list_ragged":
+        payload, metadata = _encode_media_list_values(values)
+    elif codec == "utf8_ragged":
+        payload, metadata = _encode_bytes_like_values(
+            [None if item is None else item.encode("utf-8") for item in values]
+        )
+    elif codec == "msgpack_ragged":
+        payload, metadata = _encode_bytes_like_values(
+            [
+                None
+                if item is None
+                else _msgpack.packb(item, use_bin_type=True, strict_types=True)
+                for item in values
+            ]
+        )
+    elif codec == "json_ragged":
+        payload, metadata = _encode_bytes_like_values(
+            [
+                None
+                if item is None
+                else json.dumps(item, ensure_ascii=False, separators=(",", ":")).encode(
+                    "utf-8"
+                )
+                for item in values
+            ]
+        )
+    else:
+        raise ValueError(f"unsupported schema codec: {codec!r}")
+    metadata.update({"schema_source": "field_schema"})
+    return _EncodedStructuredLeaf(
+        codec=codec, rows=len(values), payload=payload, metadata=metadata
+    )
 
 
 def _should_encode_recursive_structure(leaves: Sequence[_InferredLeaf]) -> bool:
@@ -1920,6 +2173,8 @@ def _decode_structured_leaf(
 ) -> list[Any]:
     if codec == "ragged_tensor":
         return _decode_ragged_tensor_values(payload, rows)
+    if codec == "ragged_tensor_dict":
+        return _decode_ragged_tensor_dict_values(payload, rows, metadata or {})
     if codec == "typed_ragged":
         return _decode_typed_ragged_values(payload, rows)
     if codec == "media_list_ragged":
@@ -2026,11 +2281,132 @@ def _decode_ragged_tensor_values(payload: dict[str, Any], rows: int) -> list[Any
     return values
 
 
-def _encode_typed_ragged_values(
+def _normalize_ragged_tensor_dict_keys(keys: Any) -> list[str]:
+    if isinstance(keys, (str, bytes, bytearray)) or not isinstance(keys, Iterable):
+        raise TypeError("ragged_tensor_dict keys must be an iterable of strings")
+    normalized = list(keys)
+    if any(not isinstance(key, str) for key in normalized):
+        raise TypeError("ragged_tensor_dict keys must contain only strings")
+    if any(not key for key in normalized):
+        raise ValueError("ragged_tensor_dict keys must not be empty")
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("ragged_tensor_dict keys must not contain duplicates")
+    if any(separator in key for key in normalized for separator in (".", "/", "\\")):
+        raise ValueError("ragged_tensor_dict keys must not contain path separators")
+    return normalized
+
+
+def _ragged_tensor_dict_payload_items(
+    payload: Mapping[str, Any], key: str, *, kind: str
+) -> dict[str, Any]:
+    prefix = f"{key}."
+    items = {
+        name[len(prefix) :]: value
+        for name, value in payload.items()
+        if name.startswith(prefix)
+    }
+    missing = sorted(_RAGGED_TENSOR_PAYLOAD_NAMES - set(items))
+    if missing:
+        raise ValueError(
+            f"ragged_tensor_dict {kind} for key {key!r} is missing payloads: {missing}"
+        )
+    return items
+
+
+def _encode_ragged_tensor_dict_values(
     values: list[Any],
+    schema: FieldSchema,
+) -> _EncodedStructuredLeaf:
+    rows = len(values)
+    null_mask = np.asarray([item is None for item in values], dtype=np.bool_)
+    schema_keys = schema.metadata.get("keys")
+    keys = None if schema_keys is None else _normalize_ragged_tensor_dict_keys(schema_keys)
+    declared_keys = None if keys is None else set(keys)
+    inferred_keys: set[str] = set()
+    for row, item in enumerate(values):
+        if item is None:
+            continue
+        if not isinstance(item, Mapping):
+            raise TypeError(
+                "ragged_tensor_dict rows must be mappings or None; "
+                f"row {row} is {type(item).__name__}"
+            )
+        explicit_null_keys = sorted(key for key, value in item.items() if value is None)
+        if explicit_null_keys:
+            raise TypeError(
+                "ragged_tensor_dict rows cannot contain explicit None tensor values; "
+                f"row {row} has {explicit_null_keys}"
+            )
+        if declared_keys is None:
+            inferred_keys.update(item)
+            continue
+        extra_keys = sorted(set(item) - declared_keys)
+        if extra_keys:
+            raise ValueError(
+                "ragged_tensor_dict rows contain keys not declared in "
+                f"FieldSchema metadata['keys']; row {row} has {extra_keys}"
+            )
+    if keys is None:
+        keys = _normalize_ragged_tensor_dict_keys(sorted(inferred_keys))
+    if keys and _torch is None:
+        raise RuntimeError("torch is required to encode ragged_tensor_dict fields")
+    payload: dict[str, Any] = {"null_mask": null_mask}
+    key_codecs: dict[str, Any] = {}
+    for key in keys:
+        sub_payload, sub_metadata = _encode_ragged_tensor_values(
+            [None if item is None else item.get(key) for item in values]
+        )
+        payload.update(
+            {f"{key}.{name}": value for name, value in sub_payload.items()}
+        )
+        key_codecs[key] = sub_metadata
+    return _EncodedStructuredLeaf(
+        codec="ragged_tensor_dict",
+        rows=rows,
+        payload=payload,
+        metadata={
+            "keys": list(keys),
+            "key_codecs": key_codecs,
+            "schema_source": "field_schema",
+        },
+    )
+
+def _decode_ragged_tensor_dict_values(
+    payload: dict[str, Any], rows: int, metadata: Mapping[str, Any]
+) -> list[Any]:
+    null_mask = payload["null_mask"]
+    if len(null_mask) != rows:
+        raise ValueError(
+            f"ragged_tensor_dict null_mask row count {len(null_mask)} != expected {rows}"
+        )
+    key_values = {
+        key: _decode_ragged_tensor_values(
+            _ragged_tensor_dict_payload_items(payload, key, kind="payload"), rows
+        )
+        for key in _normalize_ragged_tensor_dict_keys(metadata.get("keys", []))
+    }
+    result: list[Any] = []
+    for row in range(rows):
+        if bool(null_mask[row]):
+            result.append(None)
+        else:
+            result.append({
+                key: values[row]
+                for key, values in key_values.items()
+                if values[row] is not None
+            })
+    return result
+
+def _encode_typed_ragged_values(
+    values: list[Any], dtype_hint: np.dtype[Any] | None = None
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    source_arrays = [np.asarray(value) for value in values if value is not None]
-    dtype = np.result_type(*source_arrays) if source_arrays else np.dtype(np.int64)
+    if dtype_hint is None:
+        source_arrays = [np.asarray(value) for value in values if value is not None]
+        dtype = np.result_type(*source_arrays) if source_arrays else np.dtype(np.int64)
+    else:
+        dtype = np.dtype(dtype_hint)
+    if dtype.hasobject:
+        raise ValueError("typed_ragged codec requires non-object dtype")
     arrays = [
         np.asarray([], dtype=dtype)
         if value is None
