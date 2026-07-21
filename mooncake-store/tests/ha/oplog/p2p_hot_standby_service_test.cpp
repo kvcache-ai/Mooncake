@@ -11,6 +11,8 @@
 #include <thread>
 #include <variant>
 
+#include <xxhash.h>
+
 #include "ha/oplog/localfs_oplog_store.h"
 #include "p2p_master_service.h"
 #include "p2p_rpc_service.h"
@@ -218,6 +220,64 @@ TEST_F(P2PHotStandbyServiceTest, PromoteFinalCatchUpExportsLateEntry) {
     auto object_it = exported.objects.find("key-late");
     ASSERT_NE(object_it, exported.objects.end());
     EXPECT_EQ(object_it->second.size, 8192);
+}
+
+TEST_F(P2PHotStandbyServiceTest, PromotionFailsOnFinalCatchUpApplyFailure) {
+    LocalFsOpLogStore writer(kClusterId, test_dir_.string(),
+                             /*enable_batch_write=*/true,
+                             /*poll_interval_ms=*/10);
+    ASSERT_EQ(writer.Init(), ErrorCode::OK);
+
+    auto config = MakeStandbyConfig();
+    config.oplog_poll_interval_ms = 10000;
+    P2PHotStandbyService standby(std::move(config));
+    ASSERT_EQ(standby.Start(), ErrorCode::OK);
+
+    OpLogEntry invalid_entry;
+    invalid_entry.sequence_id = 1;
+    invalid_entry.op_type = OpType_REGISTER_CLIENT;
+    invalid_entry.payload = "invalid-payload";
+    invalid_entry.checksum =
+        XXH32(invalid_entry.payload.data(), invalid_entry.payload.size(), 0);
+    ASSERT_EQ(writer.WriteOpLog(invalid_entry, /*sync=*/true), ErrorCode::OK);
+
+    EXPECT_EQ(standby.Promote(), ErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(standby.GetState(), StandbyState::FAILED);
+    EXPECT_FALSE(standby.GetSyncStatus().apply_healthy);
+}
+
+TEST_F(P2PHotStandbyServiceTest, ForcePromoteAfterApplyFailure) {
+    LocalFsOpLogStore writer(kClusterId, test_dir_.string(),
+                             /*enable_batch_write=*/true,
+                             /*poll_interval_ms=*/10);
+    ASSERT_EQ(writer.Init(), ErrorCode::OK);
+
+    OpLogEntry invalid_entry;
+    invalid_entry.sequence_id = 1;
+    invalid_entry.op_type = OpType_REGISTER_CLIENT;
+    invalid_entry.payload = "invalid-payload";
+    invalid_entry.checksum =
+        XXH32(invalid_entry.payload.data(), invalid_entry.payload.size(), 0);
+    ASSERT_EQ(writer.WriteOpLog(invalid_entry, /*sync=*/true), ErrorCode::OK);
+
+    P2PHotStandbyService standby(MakeStandbyConfig());
+    ASSERT_EQ(standby.Start(), ErrorCode::OK);
+    for (int i = 0; i < 100 && standby.GetState() != StandbyState::FAILED;
+         ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    auto status = standby.GetSyncStatus();
+    ASSERT_EQ(status.state, StandbyState::FAILED);
+    EXPECT_FALSE(status.apply_healthy);
+    EXPECT_EQ(status.failed_sequence_id, 1u);
+    EXPECT_EQ(status.failed_op_type, static_cast<int>(OpType_REGISTER_CLIENT));
+    EXPECT_EQ(status.failure_reason, "operation apply failed");
+    EXPECT_EQ(standby.Promote(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+
+    EXPECT_EQ(standby.Promote(/*force=*/true), ErrorCode::OK);
+    EXPECT_EQ(standby.GetState(), StandbyState::PROMOTED);
+    EXPECT_EQ(standby.GetLatestAppliedSequenceId(), 0u);
 }
 
 TEST_F(P2PHotStandbyServiceTest, RestoreExportedMetadataIntoP2PMasterService) {

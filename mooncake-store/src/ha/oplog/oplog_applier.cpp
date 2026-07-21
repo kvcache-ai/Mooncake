@@ -29,13 +29,17 @@ OpLogApplier::OpLogApplier(MetadataStore* metadata_store,
 }
 
 bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
+    if (!healthy_.load()) {
+        return false;
+    }
+
     // Basic DoS protection: validate key/payload sizes before parsing/applying.
     std::string size_reason;
     if (!OpLogManager::ValidateEntrySize(entry, &size_reason)) {
         LOG(ERROR) << "OpLogApplier: entry size rejected, sequence_id="
                    << entry.sequence_id << ", key=" << entry.object_key
                    << ", reason=" << size_reason;
-        return false;
+        return HandleApplyFailure(entry, "entry size rejected");
     }
 
     // Verify checksum to detect data corruption or tampering.
@@ -45,7 +49,7 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
             << entry.sequence_id << ", key=" << entry.object_key
             << ". Possible data corruption or tampering. Discarding entry.";
         HAMetricManager::instance().inc_oplog_checksum_failures();
-        return false;
+        return HandleApplyFailure(entry, "checksum mismatch");
     }
 
     // Global ordering only.
@@ -124,7 +128,7 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
                    << static_cast<int>(entry.op_type)
                    << ", sequence_id=" << entry.sequence_id
                    << ", key=" << entry.object_key;
-        return false;
+        return HandleApplyFailure(entry, "operation apply failed");
     }
 
     // Update expected sequence ID
@@ -159,6 +163,51 @@ bool OpLogApplier::ApplyOpLogEntryInternal(const OpLogEntry& entry) {
     }
 }
 
+bool OpLogApplier::IsBestEffortOpLogEntry(const OpLogEntry&) const {
+    return false;
+}
+
+std::string OpLogApplier::GetFailureReason() const {
+    std::lock_guard<std::mutex> lock(failure_mutex_);
+    return failure_reason_;
+}
+
+bool OpLogApplier::HandleApplyFailure(const OpLogEntry& entry,
+                                      const char* reason) {
+    if (IsBestEffortOpLogEntry(entry)) {
+        LOG(ERROR) << "OpLogApplier: skipping best-effort entry after apply "
+                      "failure"
+                   << ", sequence_id=" << entry.sequence_id
+                   << ", op_type=" << static_cast<int>(entry.op_type)
+                   << ", reason=" << reason;
+        const uint64_t expected = expected_sequence_id_.load();
+        if (IsSequenceNewer(entry.sequence_id, expected)) {
+            std::lock_guard<std::mutex> lock(pending_mutex_);
+            confirmed_missing_sequence_ids_.insert(entry.sequence_id);
+            return false;
+        }
+        if (IsSequenceOlder(entry.sequence_id, expected)) {
+            return true;
+        }
+        expected_sequence_id_.store(entry.sequence_id + 1);
+        ProcessPendingEntries();
+        return true;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(failure_mutex_);
+        failure_reason_ = reason;
+    }
+    failed_op_type_.store(static_cast<int>(entry.op_type));
+    failed_sequence_id_.store(entry.sequence_id);
+    healthy_.store(false);
+    LOG(ERROR) << "OpLogApplier: critical apply failure"
+               << ", sequence_id=" << entry.sequence_id
+               << ", op_type=" << static_cast<int>(entry.op_type)
+               << ", reason=" << reason;
+    return false;
+}
+
 size_t OpLogApplier::ApplyOpLogEntries(const std::vector<OpLogEntry>& entries) {
     size_t applied_count = 0;
     for (const auto& entry : entries) {
@@ -180,9 +229,21 @@ void OpLogApplier::Recover(uint64_t last_applied_sequence_id) {
               << expected_sequence_id_.load();
 }
 
+void OpLogApplier::ConfirmMissingSequenceIds(
+    const std::vector<uint64_t>& missing_sequence_ids) {
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    const uint64_t expected = expected_sequence_id_.load();
+    for (uint64_t sequence_id : missing_sequence_ids) {
+        if (!IsSequenceOlder(sequence_id, expected)) {
+            confirmed_missing_sequence_ids_.insert(sequence_id);
+        }
+    }
+}
+
 size_t OpLogApplier::ProcessPendingEntries() {
-    // TODO(P2P HA): Drive this periodically in production so a final gap can
-    // time out even when no newer OpLog arrives.
+    if (!healthy_.load()) {
+        return 0;
+    }
     // Check for missing sequence IDs, possibly skip after timeout, and/or
     // request them.
     uint64_t missing_seq_to_request = 0;
@@ -191,11 +252,25 @@ size_t OpLogApplier::ProcessPendingEntries() {
         std::lock_guard<std::mutex> lock(pending_mutex_);
         auto now = std::chrono::steady_clock::now();
         for (;;) {
+            const uint64_t expected = expected_sequence_id_.load();
+            auto confirmed_it = confirmed_missing_sequence_ids_.find(expected);
+            if (confirmed_it != confirmed_missing_sequence_ids_.end()) {
+                confirmed_missing_sequence_ids_.erase(confirmed_it);
+                skipped_sequence_ids_[expected] = now;
+                missing_sequence_ids_.erase(expected);
+                expected_sequence_id_.store(expected + 1);
+                skipped_count++;
+                HAMetricManager::instance().inc_oplog_skipped_entries();
+                LOG(WARNING) << "OpLogApplier: skipped confirmed missing entry "
+                                "seq="
+                             << expected;
+                continue;
+            }
+
             if (pending_entries_.empty()) {
                 break;
             }
             const uint64_t first_pending_seq = pending_entries_.begin()->first;
-            const uint64_t expected = expected_sequence_id_.load();
             if (IsSequenceOlderOrEqual(first_pending_seq, expected)) {
                 break;
             }
@@ -277,9 +352,19 @@ size_t OpLogApplier::ProcessPendingEntries() {
 
         // Apply outside lock.
         if (!ApplyOpLogEntryInternal(entry_copy)) {
+            if (IsBestEffortOpLogEntry(entry_copy)) {
+                LOG(ERROR)
+                    << "OpLogApplier: skipping failed best-effort pending entry"
+                    << ", sequence_id=" << entry_copy.sequence_id
+                    << ", op_type=" << static_cast<int>(entry_copy.op_type);
+                expected_sequence_id_.store(entry_copy.sequence_id + 1);
+                processed_count++;
+                continue;
+            }
             LOG(ERROR) << "OpLogApplier: failed to apply pending entry"
                        << ", sequence_id=" << entry_copy.sequence_id
                        << ", op_type=" << static_cast<int>(entry_copy.op_type);
+            HandleApplyFailure(entry_copy, "pending operation apply failed");
             std::lock_guard<std::mutex> lock(pending_mutex_);
             pending_entries_.emplace(entry_copy.sequence_id,
                                      std::move(entry_copy));

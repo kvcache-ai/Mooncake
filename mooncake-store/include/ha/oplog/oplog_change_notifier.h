@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <vector>
 
 #include "ha/oplog/oplog_manager.h"
 #include "types.h"
@@ -22,6 +23,8 @@ namespace mooncake {
 //   (expected_sequence_id_) and handle gaps, duplicates, and late arrivals
 //   independently.
 //
+//   Entry and maintenance callbacks are invoked serially by the notifier.
+//
 // Implementations: EtcdOpLogChangeNotifier (push via Watch),
 //                  PollingOpLogChangeNotifier (poll via ReadOpLogSince)
 class OpLogChangeNotifier {
@@ -30,9 +33,14 @@ class OpLogChangeNotifier {
 
     using EntryCallback = std::function<void(const OpLogEntry& entry)>;
     using ErrorCallback = std::function<void(ErrorCode error)>;
+    // Runs after each polling cycle with sequence IDs confirmed missing by the
+    // store, including cycles with no new entries.
+    using MaintenanceCallback =
+        std::function<void(const std::vector<uint64_t>&)>;
 
     virtual ErrorCode Start(uint64_t start_sequence_id, EntryCallback on_entry,
-                            ErrorCallback on_error) = 0;
+                            ErrorCallback on_error,
+                            MaintenanceCallback on_maintenance = {}) = 0;
     virtual void Stop() = 0;
     virtual bool IsHealthy() const = 0;
 };

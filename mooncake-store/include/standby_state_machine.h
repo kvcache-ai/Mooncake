@@ -108,9 +108,10 @@ inline const char* StandbyStateToString(StandbyState state) {
  */
 enum class StandbyEvent : uint8_t {
     // User/system actions
-    START,    // Start() called
-    STOP,     // Stop() called
-    PROMOTE,  // Promote() called
+    START,          // Start() called
+    STOP,           // Stop() called
+    PROMOTE,        // Promote() called
+    FORCE_PROMOTE,  // Operator-approved promotion from a degraded standby
 
     // Connection events
     CONNECTED,          // Successfully connected to etcd
@@ -146,6 +147,8 @@ inline const char* StandbyEventToString(StandbyEvent event) {
             return "STOP";
         case StandbyEvent::PROMOTE:
             return "PROMOTE";
+        case StandbyEvent::FORCE_PROMOTE:
+            return "FORCE_PROMOTE";
         case StandbyEvent::CONNECTED:
             return "CONNECTED";
         case StandbyEvent::CONNECTION_FAILED:

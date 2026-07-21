@@ -32,6 +32,10 @@ struct P2PStandbySyncStatus {
     uint64_t primary_seq_id{0};
     uint64_t lag_entries{0};
     bool is_connected{false};
+    bool apply_healthy{true};
+    uint64_t failed_sequence_id{0};
+    int failed_op_type{-1};
+    std::string failure_reason;
     StandbyState state{StandbyState::STOPPED};
     std::chrono::milliseconds time_in_state{0};
 };
@@ -54,7 +58,10 @@ class P2PHotStandbyService {
 
     ErrorCode Start(uint64_t baseline_sequence_id = 0);
     void Stop();
-    ErrorCode Promote();
+    // TODO(P2P HA): Expose force promotion only through an explicit operator
+    // CLI/RPC that reports the failed sequence/type/reason and requires
+    // confirmation. The supervisor must not enable it automatically.
+    ErrorCode Promote(bool force = false);
 
     P2PStandbySyncStatus GetSyncStatus() const;
     bool IsReadyForPromotion() const;

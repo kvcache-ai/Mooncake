@@ -359,6 +359,16 @@ TEST_F(StandbyStateMachineTest, TestFailedToConnecting) {
     EXPECT_EQ(StandbyState::CONNECTING, machine_->GetState());
 }
 
+TEST_F(StandbyStateMachineTest, TestForcePromoteFromFailed) {
+    machine_->ProcessEvent(StandbyEvent::START);
+    machine_->ProcessEvent(StandbyEvent::FATAL_ERROR);
+
+    auto result = machine_->ProcessEvent(StandbyEvent::FORCE_PROMOTE);
+    EXPECT_TRUE(result.allowed);
+    EXPECT_EQ(StandbyState::FAILED, result.old_state);
+    EXPECT_EQ(StandbyState::PROMOTING, result.new_state);
+}
+
 // ========== Promoted State Tests ==========
 
 TEST_F(StandbyStateMachineTest, TestPromotedToStopped) {

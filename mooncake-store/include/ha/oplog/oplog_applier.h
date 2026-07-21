@@ -6,6 +6,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -64,6 +65,11 @@ class OpLogApplier {
      */
     uint64_t GetExpectedSequenceId() const;
 
+    bool IsHealthy() const { return healthy_.load(); }
+    uint64_t GetFailedSequenceId() const { return failed_sequence_id_.load(); }
+    int GetFailedOpType() const { return failed_op_type_.load(); }
+    std::string GetFailureReason() const;
+
     /**
      * @brief Recover from a given sequence ID
      * @param last_applied_sequence_id Last applied sequence ID
@@ -75,6 +81,11 @@ class OpLogApplier {
      * @return Number of entries processed
      */
     size_t ProcessPendingEntries();
+
+    // Mark sequence IDs that the store scanned but did not contain. Confirmed
+    // holes can be skipped without waiting for the generic gap timeout.
+    void ConfirmMissingSequenceIds(
+        const std::vector<uint64_t>& missing_sequence_ids);
 
     // Promotion helper:
     // Try to resolve current gaps ONCE (no waiting) by fetching missing/skipped
@@ -95,6 +106,8 @@ class OpLogApplier {
     // Subclasses implement backend-specific operations while reusing the
     // common validation, ordering, gap buffering and timeout-skip machinery.
     virtual bool ApplyCustomOpLogEntry(const OpLogEntry& entry);
+
+    virtual bool IsBestEffortOpLogEntry(const OpLogEntry& entry) const;
 
    private:
     bool ApplyOpLogEntryInternal(const OpLogEntry& entry);
@@ -131,6 +144,8 @@ class OpLogApplier {
      */
     bool RequestMissingOpLog(uint64_t missing_seq_id);
 
+    bool HandleApplyFailure(const OpLogEntry& entry, const char* reason);
+
     MetadataStore* metadata_store_;
 
     // OpLogStore for requesting missing OpLog entries (optional, not owned)
@@ -148,6 +163,8 @@ class OpLogApplier {
     std::map<uint64_t, std::chrono::steady_clock::time_point>
         missing_sequence_ids_;
 
+    std::set<uint64_t> confirmed_missing_sequence_ids_;
+
     // Sequence IDs we chose to skip (gap-timeout). If the late entry arrives:
     // - REMOVE / PUT_REVOKE: delete the key (safe)
     // - PUT_END: discard (do not resurrect potentially stale metadata)
@@ -157,6 +174,11 @@ class OpLogApplier {
     // Next expected global sequence_id. Read frequently from monitoring thread,
     // updated by watch/apply thread. Use atomic to avoid data races.
     std::atomic<uint64_t> expected_sequence_id_{1};
+    std::atomic<bool> healthy_{true};
+    std::atomic<uint64_t> failed_sequence_id_{0};
+    std::atomic<int> failed_op_type_{-1};
+    mutable std::mutex failure_mutex_;
+    std::string failure_reason_;
 
     // Constants for missing entry handling
     // IMPORTANT: request must happen BEFORE skip, otherwise we will never

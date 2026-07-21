@@ -17,7 +17,8 @@ class PollingOpLogChangeNotifier : public OpLogChangeNotifier {
     ~PollingOpLogChangeNotifier();
 
     ErrorCode Start(uint64_t start_sequence_id, EntryCallback on_entry,
-                    ErrorCallback on_error) override;
+                    ErrorCallback on_error,
+                    MaintenanceCallback on_maintenance = {}) override;
     void Stop() override;
     bool IsHealthy() const override;
 
@@ -29,10 +30,11 @@ class PollingOpLogChangeNotifier : public OpLogChangeNotifier {
 
     EntryCallback on_entry_;
     ErrorCallback on_error_;
+    MaintenanceCallback on_maintenance_;
 
     std::atomic<bool> running_{false};
     std::thread poll_thread_;
-    std::atomic<uint64_t> last_sequence_id_{0};
+    std::atomic<uint64_t> last_scanned_sequence_id_{0};
     std::atomic<bool> healthy_{false};
 
     // For interruptible sleep on Stop()

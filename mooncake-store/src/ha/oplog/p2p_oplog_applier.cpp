@@ -36,6 +36,10 @@ bool P2POpLogApplier::ApplyCustomOpLogEntry(const OpLogEntry& entry) {
     return false;
 }
 
+bool P2POpLogApplier::IsBestEffortOpLogEntry(const OpLogEntry& entry) const {
+    return IsBestEffortP2POpLog(entry.op_type);
+}
+
 bool P2POpLogApplier::ApplyAddReplica(const OpLogEntry& entry) {
     AddReplicaPayload payload;
     if (!DeserializeP2PPayload(entry.payload, payload)) {

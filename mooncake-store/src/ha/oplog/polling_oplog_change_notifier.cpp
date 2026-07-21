@@ -10,16 +10,17 @@ PollingOpLogChangeNotifier::PollingOpLogChangeNotifier(OpLogStore* store,
 
 PollingOpLogChangeNotifier::~PollingOpLogChangeNotifier() { Stop(); }
 
-ErrorCode PollingOpLogChangeNotifier::Start(uint64_t start_sequence_id,
-                                            EntryCallback on_entry,
-                                            ErrorCallback on_error) {
+ErrorCode PollingOpLogChangeNotifier::Start(
+    uint64_t start_sequence_id, EntryCallback on_entry, ErrorCallback on_error,
+    MaintenanceCallback on_maintenance) {
     if (running_.load()) {
         return ErrorCode::INTERNAL_ERROR;
     }
 
     on_entry_ = std::move(on_entry);
     on_error_ = std::move(on_error);
-    last_sequence_id_.store(start_sequence_id);
+    on_maintenance_ = std::move(on_maintenance);
+    last_scanned_sequence_id_.store(start_sequence_id);
     running_.store(true);
     healthy_.store(true);
     poll_thread_ = std::thread(&PollingOpLogChangeNotifier::PollLoop, this);
@@ -42,17 +43,27 @@ bool PollingOpLogChangeNotifier::IsHealthy() const {
 
 void PollingOpLogChangeNotifier::PollLoop() {
     while (running_.load()) {
-        uint64_t last_seq = last_sequence_id_.load();
+        uint64_t last_seq = last_scanned_sequence_id_.load();
         std::vector<OpLogEntry> entries;
-        auto err = store_->ReadOpLogSince(last_seq, kPollBatchSize, entries);
+        OpLogReadProgress progress;
+        auto err = store_->ReadOpLogSinceWithProgress(last_seq, kPollBatchSize,
+                                                      entries, progress);
+        std::vector<uint64_t> missing_sequence_ids;
+        if (err == ErrorCode::OK) {
+            missing_sequence_ids = FindMissingSequenceIds(
+                last_seq, entries, progress.last_scanned_sequence_id);
+        }
 
         if (err == ErrorCode::OK && !entries.empty()) {
             for (const auto& entry : entries) {
                 if (!running_.load()) break;
                 on_entry_(entry);
             }
-            last_sequence_id_.store(entries.back().sequence_id);
+            last_scanned_sequence_id_.store(progress.last_scanned_sequence_id);
             healthy_.store(true);
+            if (on_maintenance_) {
+                on_maintenance_(missing_sequence_ids);
+            }
             // Data available — poll again immediately to drain backlog
             continue;
         } else if (err != ErrorCode::OK) {
@@ -60,6 +71,13 @@ void PollingOpLogChangeNotifier::PollLoop() {
                 on_error_(err);
             }
             healthy_.store(false);
+        }
+
+        if (err == ErrorCode::OK) {
+            last_scanned_sequence_id_.store(progress.last_scanned_sequence_id);
+        }
+        if (on_maintenance_) {
+            on_maintenance_(missing_sequence_ids);
         }
 
         // Interruptible sleep: wakes immediately on Stop()

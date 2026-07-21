@@ -24,10 +24,6 @@ namespace mooncake {
 
 enum class OpLogAsyncQueueOverflowMode { REJECT, BYPASS };
 
-inline bool IsBestEffortRedisOpLog(OpType type) {
-    return type == OpType_ADD_REPLICA;
-}
-
 class RedisOpLogStore : public OpLogStore {
    public:
     RedisOpLogStore(const std::string& cluster_id,
@@ -49,6 +45,10 @@ class RedisOpLogStore : public OpLogStore {
     ErrorCode ReadOpLog(uint64_t sequence_id, OpLogEntry& entry) override;
     ErrorCode ReadOpLogSince(uint64_t start_sequence_id, size_t limit,
                              std::vector<OpLogEntry>& entries) override;
+    ErrorCode ReadOpLogSinceWithProgress(uint64_t start_sequence_id,
+                                         size_t limit,
+                                         std::vector<OpLogEntry>& entries,
+                                         OpLogReadProgress& progress) override;
     ErrorCode GetLatestSequenceId(uint64_t& sequence_id) override;
     ErrorCode GetMaxSequenceId(uint64_t& sequence_id) override;
     ErrorCode UpdateLatestSequenceId(uint64_t sequence_id) override;

@@ -42,12 +42,12 @@ TEST(RedisOpLogStoreStandaloneTest, EndpointRequiresExplicitPort) {
 }
 
 TEST(RedisOpLogStoreStandaloneTest, OnlyAddReplicaIsBestEffort) {
-    EXPECT_TRUE(IsBestEffortRedisOpLog(OpType_ADD_REPLICA));
-    EXPECT_FALSE(IsBestEffortRedisOpLog(OpType_REMOVE_REPLICA));
-    EXPECT_FALSE(IsBestEffortRedisOpLog(OpType_MOUNT_SEGMENT));
-    EXPECT_FALSE(IsBestEffortRedisOpLog(OpType_UNMOUNT_SEGMENT));
-    EXPECT_FALSE(IsBestEffortRedisOpLog(OpType_REGISTER_CLIENT));
-    EXPECT_FALSE(IsBestEffortRedisOpLog(OpType_UNREGISTER_CLIENT));
+    EXPECT_TRUE(IsBestEffortP2POpLog(OpType_ADD_REPLICA));
+    EXPECT_FALSE(IsBestEffortP2POpLog(OpType_REMOVE_REPLICA));
+    EXPECT_FALSE(IsBestEffortP2POpLog(OpType_MOUNT_SEGMENT));
+    EXPECT_FALSE(IsBestEffortP2POpLog(OpType_UNMOUNT_SEGMENT));
+    EXPECT_FALSE(IsBestEffortP2POpLog(OpType_REGISTER_CLIENT));
+    EXPECT_FALSE(IsBestEffortP2POpLog(OpType_UNREGISTER_CLIENT));
 }
 
 class RedisOpLogStoreTest : public ::testing::Test {
@@ -291,6 +291,47 @@ TEST_F(RedisOpLogStoreTest, BypassOverflowCreatesReadableGap) {
     ASSERT_EQ(ErrorCode::OK, writer->ReadOpLogSince(0, 10, entries));
     ASSERT_EQ(1u, entries.size());
     EXPECT_EQ(2u, entries.front().sequence_id);
+
+    OpLogReadProgress progress;
+    ASSERT_EQ(ErrorCode::OK,
+              writer->ReadOpLogSinceWithProgress(0, 10, entries, progress));
+    ASSERT_EQ(1u, entries.size());
+    EXPECT_EQ(2u, progress.last_scanned_sequence_id);
+}
+
+TEST_F(RedisOpLogStoreTest, SparseReadLimitsScannedSequenceRange) {
+    auto writer = CreateWriter();
+    ASSERT_EQ(ErrorCode::OK, writer->UpdateLatestSequenceId(2500));
+    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(2500), false));
+
+    OpLogEntry stored;
+    for (int i = 0; i < 100; ++i) {
+        if (writer->ReadOpLog(2500, stored) == ErrorCode::OK) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_EQ(2500u, stored.sequence_id);
+
+    std::vector<OpLogEntry> entries;
+    OpLogReadProgress progress;
+    ASSERT_EQ(ErrorCode::OK,
+              writer->ReadOpLogSinceWithProgress(0, 1000, entries, progress));
+    EXPECT_TRUE(entries.empty());
+    EXPECT_EQ(1000u, progress.last_scanned_sequence_id);
+
+    ASSERT_EQ(ErrorCode::OK,
+              writer->ReadOpLogSinceWithProgress(
+                  progress.last_scanned_sequence_id, 1000, entries, progress));
+    EXPECT_TRUE(entries.empty());
+    EXPECT_EQ(2000u, progress.last_scanned_sequence_id);
+
+    ASSERT_EQ(ErrorCode::OK,
+              writer->ReadOpLogSinceWithProgress(
+                  progress.last_scanned_sequence_id, 1000, entries, progress));
+    ASSERT_EQ(1u, entries.size());
+    EXPECT_EQ(2500u, entries.front().sequence_id);
+    EXPECT_EQ(2500u, progress.last_scanned_sequence_id);
 }
 
 TEST_F(RedisOpLogStoreTest, FactoryRejectsInvalidAsyncConfiguration) {

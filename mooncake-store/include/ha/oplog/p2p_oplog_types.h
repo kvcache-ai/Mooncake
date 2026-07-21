@@ -26,6 +26,10 @@ constexpr OpType OpType_REMOVE_ALL = static_cast<OpType>(14);
 constexpr OpType OpType_REGISTER_CLIENT = static_cast<OpType>(15);
 constexpr OpType OpType_UNREGISTER_CLIENT = static_cast<OpType>(16);
 
+inline bool IsBestEffortP2POpLog(OpType type) {
+    return type == OpType_ADD_REPLICA;
+}
+
 // ============================================================================
 // P2P Payload structures for OpLog entries
 // ============================================================================
