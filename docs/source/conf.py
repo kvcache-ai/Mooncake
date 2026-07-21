@@ -255,36 +255,70 @@ navigation_with_keys = False
 # Preserve published URLs when documentation is reorganized. Redirect targets
 # are relative to the generated location of each legacy page.
 redirects = {
+    "deployment/ssd-offload": "ssd/ssd-offload.html",
+    "deployment/nvmf-ssd-deployment-guide":
+    "ssd/nvmf-ssd-deployment-guide.html",
+    "integrations/index": "../deployment/index.html",
+    "integrations/lmcache":
+    "../deployment/integrations/lmcache/index.html",
+    "integrations/lmdeploy":
+    "../deployment/integrations/lmdeploy.html",
+    "integrations/sglang/index":
+    "../../deployment/integrations/sglang/index.html",
+    "integrations/sglang/hicache-integration-v1":
+    "../../deployment/integrations/sglang/hicache-integration-v1.html",
+    "integrations/sglang/hicache-quick-start":
+    "../../deployment/integrations/sglang/hicache-quick-start.html",
+    "integrations/sglang/pd-disaggregation":
+    "../../deployment/integrations/sglang/pd-disaggregation.html",
+    "integrations/vllm/index":
+    "../../deployment/integrations/vllm/index.html",
+    "integrations/vllm/disagg-prefill-decode":
+    "../../deployment/integrations/vllm/disagg-prefill-decode.html",
+    "integrations/vllm/kv-cache-storage":
+    "../../deployment/integrations/vllm/kv-cache-storage.html",
+    "integrations/vllm/vllm-integration-v0.2":
+    "../../deployment/integrations/vllm/vllm-integration-v0.2.html",
+    "integrations/vllm/vllm-integration-v0.3":
+    "../../deployment/integrations/vllm/vllm-integration-v0.3.html",
+    "integrations/vllm/vllm-integration-v1.0":
+    "../../deployment/integrations/vllm/vllm-integration-v1.0.html",
+    "integrations/vllm/vllm-mooncakestoreconnector":
+    "../../deployment/integrations/vllm/vllm-mooncakestoreconnector.html",
+    "integrations/vllm/vllmv1-lmcache-integration":
+    "../../deployment/integrations/lmcache/vllmv1-lmcache-integration.html",
+    "integrations/vllm/vllmv1-lmcache-mp-integration":
+    "../../deployment/integrations/lmcache/vllmv1-lmcache-mp-integration.html",
     "getting_started/examples/lmcache-integration":
-    "../../integrations/lmcache.html",
+    "../../deployment/integrations/lmcache/index.html",
     "getting_started/examples/lmdeploy-integration-v0.9":
-    "../../integrations/lmdeploy.html",
+    "../../deployment/integrations/lmdeploy.html",
     "getting_started/examples/sglang-integration-v1":
-    "../../integrations/sglang/pd-disaggregation.html",
+    "../../deployment/integrations/sglang/pd-disaggregation.html",
     "getting_started/examples/sglang-integration/index":
-    "../../../integrations/sglang/index.html",
+    "../../../deployment/integrations/sglang/index.html",
     "getting_started/examples/sglang-integration/hicache-integration-v1":
-    "../../../integrations/sglang/hicache-integration-v1.html",
+    "../../../deployment/integrations/sglang/hicache-integration-v1.html",
     "getting_started/examples/sglang-integration/hicache-quick-start":
-    "../../../integrations/sglang/hicache-quick-start.html",
+    "../../../deployment/integrations/sglang/hicache-quick-start.html",
     "getting_started/examples/vllm-integration/index":
-    "../../../integrations/vllm/index.html",
+    "../../../deployment/integrations/vllm/index.html",
     "getting_started/examples/vllm-integration/disagg-prefill-decode":
-    "../../../integrations/vllm/disagg-prefill-decode.html",
+    "../../../deployment/integrations/vllm/disagg-prefill-decode.html",
     "getting_started/examples/vllm-integration/kv-cache-storage":
-    "../../../integrations/vllm/kv-cache-storage.html",
+    "../../../deployment/integrations/vllm/kv-cache-storage.html",
     "getting_started/examples/vllm-integration/vllm-integration-v0.2":
-    "../../../integrations/vllm/vllm-integration-v0.2.html",
+    "../../../deployment/integrations/vllm/vllm-integration-v0.2.html",
     "getting_started/examples/vllm-integration/vllm-integration-v0.3":
-    "../../../integrations/vllm/vllm-integration-v0.3.html",
+    "../../../deployment/integrations/vllm/vllm-integration-v0.3.html",
     "getting_started/examples/vllm-integration/vllm-integration-v1.0":
-    "../../../integrations/vllm/vllm-integration-v1.0.html",
+    "../../../deployment/integrations/vllm/vllm-integration-v1.0.html",
     "getting_started/examples/vllm-integration/vllm-mooncakestoreconnector":
-    "../../../integrations/vllm/vllm-mooncakestoreconnector.html",
+    "../../../deployment/integrations/vllm/vllm-mooncakestoreconnector.html",
     "getting_started/examples/vllm-integration/vllmv1-lmcache-integration":
-    "../../../integrations/vllm/vllmv1-lmcache-integration.html",
+    "../../../deployment/integrations/lmcache/vllmv1-lmcache-integration.html",
     "getting_started/examples/vllm-integration/vllmv1-lmcache-mp-integration":
-    "../../../integrations/vllm/vllmv1-lmcache-mp-integration.html",
+    "../../../deployment/integrations/lmcache/vllmv1-lmcache-mp-integration.html",
     "python-api-reference/dataproto-structured-object-transfer":
     "../api-reference/python/dataproto-structured-object-transfer.html",
     "python-api-reference/ep-backend":

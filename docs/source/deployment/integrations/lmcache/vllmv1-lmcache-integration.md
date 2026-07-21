@@ -28,7 +28,7 @@ your environment.
 Install Mooncake, vLLM, and LMCache on both machines. For installation details,
 refer to the official documentation of each project:
 
-- [Mooncake build guide](../../getting_started/build.md)
+- [Mooncake build guide](../../../getting_started/build.md)
 - [LMCache installation](https://docs.lmcache.ai/getting_started/installation.html)
 - [vLLM installation](https://docs.vllm.ai/en/latest/getting_started/installation/)
 
@@ -186,6 +186,6 @@ together:
 
 ## Additional Resources
 
-* [Mooncake x LMCache: Unite to Pioneer KVCache-Centric LLM Serving System](../lmcache.md)
+* [Mooncake x LMCache: Unite to Pioneer KVCache-Centric LLM Serving System](index.md)
 * [Using Mooncake in LMCache](https://docs.lmcache.ai/kv_cache/storage_backends/mooncake.html)
 * [Using LMCache in vLLM](https://github.com/vllm-project/vllm/tree/main/examples/others/lmcache)

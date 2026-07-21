@@ -61,8 +61,8 @@ PD disaggregation paths use Mooncake Transfer Engine for direct KV transfer
 between prefill and decode workers. Configure these paths through the serving
 framework guides, not by calling Transfer Engine APIs directly:
 
-- [SGLang Integration Overview](../integrations/sglang/index.md)
-- [vLLM Integration Overview](../integrations/vllm/index.md)
+- [SGLang Integration Overview](../deployment/integrations/sglang/index.md)
+- [vLLM Integration Overview](../deployment/integrations/vllm/index.md)
 
 ### Mooncake Store
 
@@ -71,8 +71,8 @@ HiCache:
 
 | Framework | Use case | Setup guide |
 |-----------|----------|-------------|
-| SGLang | HiCache L3 storage backend with Mooncake Store | [SGLang HiCache Quick Start](../integrations/sglang/hicache-quick-start.md) |
-| vLLM | KV cache storage and sharing with `MooncakeStoreConnector` | [vLLM KV Cache Storage & Sharing](../integrations/vllm/kv-cache-storage.md) |
+| SGLang | HiCache L3 storage backend with Mooncake Store | [SGLang HiCache Quick Start](../deployment/integrations/sglang/hicache-quick-start.md) |
+| vLLM | KV cache storage and sharing with `MooncakeStoreConnector` | [vLLM KV Cache Storage & Sharing](../deployment/integrations/vllm/kv-cache-storage.md) |
 
 The serving framework guides include the required Mooncake Store service
 startup and connector configuration for each path.

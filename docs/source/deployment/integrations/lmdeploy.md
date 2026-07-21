@@ -16,7 +16,7 @@ pip install mooncake-transfer-engine
 
 Note:
 
--   If any `.so` file is missing, uninstall the pip package with `pip3 uninstall mooncake-transfer-engine`, and build the binaries manually from source following the [build instructions](../getting_started/build.md).
+-   If any `.so` file is missing, uninstall the pip package with `pip3 uninstall mooncake-transfer-engine`, and build the binaries manually from source following the [build instructions](../../getting_started/build.md).
 
 ### Install the latest version of LMDeploy
 

@@ -22,7 +22,7 @@ Main changes from v0.x to v1:
 
 **_Please note that this is still an experimental version and will be modified anytime based on feedback from the vLLM community._**
  - **Update(Apr 10, 2025)**: We are working on the vLLM v1 integration now. Stay tuned.
- - **Update(Sep 5, 2025)**: We have released the vLLM v1 integration with Mooncake Store and LMCache. Please refer to [vllmv1-lmcache-integration](vllmv1-lmcache-integration.md) for more details.
+ - **Update(Sep 5, 2025)**: We have released the vLLM v1 integration with Mooncake Store and LMCache. Please refer to [vLLM V1 LMCache integration](../lmcache/vllmv1-lmcache-integration.md) for more details.
 
 ## Installation
 
@@ -33,7 +33,7 @@ pip3 install mooncake-transfer-engine
 ```
 
 Note:
-  - If you encounter problems such as missing `lib*.so`, you should uninstall this package by `pip3 uninstall mooncake-transfer-engine`, and build the binaries manually according to the [instructions](../../getting_started/build.md).
+  - If you encounter problems such as missing `lib*.so`, you should uninstall this package by `pip3 uninstall mooncake-transfer-engine`, and build the binaries manually according to the [instructions](../../../getting_started/build.md).
 - For vLLM version <= v0.8.4, it requires mooncake-transfer-engine <= 0.3.3.post2. In the latest release, interface `mooncake_vllm_adaptor` has been deprecated.
 
 ### Install the latest version of vLLM

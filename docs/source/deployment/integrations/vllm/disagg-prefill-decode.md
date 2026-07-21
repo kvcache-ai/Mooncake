@@ -37,7 +37,7 @@ pip install mooncake-transfer-engine
 ```
 
 ```{note}
-If you encounter problems such as missing `lib*.so`, uninstall this package by `pip3 uninstall mooncake-transfer-engine`, and build the binaries manually according to the [instructions](../../getting_started/build.md).
+If you encounter problems such as missing `lib*.so`, uninstall this package by `pip3 uninstall mooncake-transfer-engine`, and build the binaries manually according to the [instructions](../../../getting_started/build.md).
 ```
 
 #### Install vLLM
@@ -135,7 +135,7 @@ vllm serve Qwen/Qwen2.5-7B-Instruct \
 
 ### Performance
 
-For detailed performance benchmarks and results, see the [vLLM PD Disaggregation Performance](../../performance/vllm/vllm-v1-pd-performance.md) documentation.
+For detailed performance benchmarks and results, see the [vLLM PD Disaggregation Performance](../../../performance/vllm/vllm-v1-pd-performance.md) documentation.
 
 ---
 
@@ -157,7 +157,7 @@ pip3 install mooncake-transfer-engine
 ```
 
 ```{note}
-- If you encounter problems such as missing `lib*.so`, uninstall this package by `pip3 uninstall mooncake-transfer-engine`, and build the binaries manually according to the [instructions](../../getting_started/build.md).
+- If you encounter problems such as missing `lib*.so`, uninstall this package by `pip3 uninstall mooncake-transfer-engine`, and build the binaries manually according to the [instructions](../../../getting_started/build.md).
 - For vLLM version ≤ v0.8.4, it requires `mooncake-transfer-engine ≤ 0.3.3.post2`. In the latest release, the interface `mooncake_vllm_adaptor` has been deprecated.
 ```
 
