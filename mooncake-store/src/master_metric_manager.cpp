@@ -277,10 +277,16 @@ MasterMetricManager::MasterMetricManager()
       file_cache_hit_nums_("file_cache_hit_nums_",
                            "Total number of GetReplicaList results served from "
                            "the SSD cache"),
+      mem_cache_hit_bytes_("mem_cache_hit_bytes_total",
+                           "Total bytes of GetReplicaList results served from "
+                           "the memory pool"),
+      file_cache_hit_bytes_("file_cache_hit_bytes_total",
+                            "Total bytes of GetReplicaList results served from "
+                            "the SSD cache"),
       mem_cache_nums_("mem_cache_nums_",
                       "Current number of cached values in the memory pool"),
       file_cache_nums_("file_cache_nums_",
-                       "Current number of cached values in the SSD cache"),
+                       "Current number of cached values in SSD cache"),
       valid_get_nums_("valid_get_nums_",
                       "Total number of GetReplicaList operations that returned "
                       "at least one completed replica"),
@@ -368,6 +374,28 @@ MasterMetricManager::MasterMetricManager()
           "master_promotion_rejected_cap_total",
           "Promotion attempts rejected because promotion_in_flight was at "
           "promotion_queue_limit"),
+      promotion_candidate_recorded_(
+          "master_promotion_candidate_recorded_total",
+          "New promotion retry candidate entries created"),
+      promotion_candidate_admitted_(
+          "master_promotion_candidate_admitted_total",
+          "Promotion retry candidates successfully queued on background retry"),
+      promotion_candidate_admission_rejected_(
+          "master_promotion_candidate_admission_rejected_total",
+          "Promotion retry candidates that hit a gate again during retry scan"),
+      promotion_candidate_expired_evaluated_(
+          "master_promotion_candidate_expired_evaluated_total",
+          "Promotion retry candidates expired or exhausted during a retry "
+          "scan"),
+      promotion_candidate_expired_unevaluated_(
+          "master_promotion_candidate_expired_unevaluated_total",
+          "Promotion retry candidates that aged out before the background "
+          "scheduler ever evaluated them (scan budget too small to reach "
+          "their shard within the TTL window)"),
+      promotion_candidate_dropped_limit_(
+          "master_promotion_candidate_dropped_limit_total",
+          "Promotion retry candidates dropped at record time because the "
+          "global candidate count limit was reached"),
       tenant_quota_reject_total_(
           "mooncake_tenant_quota_reject_total",
           "Total number of tenant quota admission rejects",
@@ -476,6 +504,12 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     promotion_rejected_frequency_.inc(0);
     promotion_rejected_watermark_.inc(0);
     promotion_rejected_cap_.inc(0);
+    promotion_candidate_recorded_.inc(0);
+    promotion_candidate_admitted_.inc(0);
+    promotion_candidate_admission_rejected_.inc(0);
+    promotion_candidate_expired_evaluated_.inc(0);
+    promotion_candidate_expired_unevaluated_.inc(0);
+    promotion_candidate_dropped_limit_.inc(0);
     put_start_requests_.inc(0);
     put_start_failures_.inc(0);
     put_start_alloc_failures_.inc(0);
@@ -571,6 +605,8 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     // Update Store-observed cache reuse metrics
     mem_cache_hit_nums_.inc(0);
     file_cache_hit_nums_.inc(0);
+    mem_cache_hit_bytes_.inc(0);
+    file_cache_hit_bytes_.inc(0);
     valid_get_nums_.inc(0);
     total_get_nums_.inc(0);
 
@@ -831,11 +867,29 @@ void MasterMetricManager::inc_mem_cache_hit_nums(int64_t val) {
 void MasterMetricManager::inc_file_cache_hit_nums(int64_t val) {
     file_cache_hit_nums_.inc(val);
 }
+void MasterMetricManager::inc_mem_cache_hit_bytes(int64_t val) {
+    mem_cache_hit_bytes_.inc(val);
+}
+void MasterMetricManager::inc_file_cache_hit_bytes(int64_t val) {
+    file_cache_hit_bytes_.inc(val);
+}
+int64_t MasterMetricManager::get_mem_cache_hit_bytes() {
+    return mem_cache_hit_bytes_.value();
+}
+int64_t MasterMetricManager::get_file_cache_hit_bytes() {
+    return file_cache_hit_bytes_.value();
+}
 void MasterMetricManager::inc_mem_cache_nums(int64_t val) {
     mem_cache_nums_.inc(val);
 }
 void MasterMetricManager::inc_file_cache_nums(int64_t val) {
     file_cache_nums_.inc(val);
+}
+int64_t MasterMetricManager::get_mem_cache_nums() {
+    return mem_cache_nums_.value();
+}
+int64_t MasterMetricManager::get_file_cache_nums() {
+    return file_cache_nums_.value();
 }
 void MasterMetricManager::dec_mem_cache_nums(int64_t val) {
     mem_cache_nums_.dec(val);
@@ -1118,6 +1172,27 @@ void MasterMetricManager::inc_promotion_rejected_watermark(int64_t val) {
 }
 void MasterMetricManager::inc_promotion_rejected_cap(int64_t val) {
     promotion_rejected_cap_.inc(val);
+}
+void MasterMetricManager::inc_promotion_candidate_recorded(int64_t val) {
+    promotion_candidate_recorded_.inc(val);
+}
+void MasterMetricManager::inc_promotion_candidate_admitted(int64_t val) {
+    promotion_candidate_admitted_.inc(val);
+}
+void MasterMetricManager::inc_promotion_candidate_admission_rejected(
+    int64_t val) {
+    promotion_candidate_admission_rejected_.inc(val);
+}
+void MasterMetricManager::inc_promotion_candidate_expired_evaluated(
+    int64_t val) {
+    promotion_candidate_expired_evaluated_.inc(val);
+}
+void MasterMetricManager::inc_promotion_candidate_expired_unevaluated(
+    int64_t val) {
+    promotion_candidate_expired_unevaluated_.inc(val);
+}
+void MasterMetricManager::inc_promotion_candidate_dropped_limit(int64_t val) {
+    promotion_candidate_dropped_limit_.inc(val);
 }
 
 void MasterMetricManager::inc_tenant_quota_reject(const std::string& tenant_id,
@@ -1514,6 +1589,24 @@ int64_t MasterMetricManager::get_promotion_rejected_watermark() {
 int64_t MasterMetricManager::get_promotion_rejected_cap() {
     return promotion_rejected_cap_.value();
 }
+int64_t MasterMetricManager::get_promotion_candidate_recorded() {
+    return promotion_candidate_recorded_.value();
+}
+int64_t MasterMetricManager::get_promotion_candidate_admitted() {
+    return promotion_candidate_admitted_.value();
+}
+int64_t MasterMetricManager::get_promotion_candidate_admission_rejected() {
+    return promotion_candidate_admission_rejected_.value();
+}
+int64_t MasterMetricManager::get_promotion_candidate_expired_evaluated() {
+    return promotion_candidate_expired_evaluated_.value();
+}
+int64_t MasterMetricManager::get_promotion_candidate_expired_unevaluated() {
+    return promotion_candidate_expired_unevaluated_.value();
+}
+int64_t MasterMetricManager::get_promotion_candidate_dropped_limit() {
+    return promotion_candidate_dropped_limit_.value();
+}
 
 // CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke Metrics
 void MasterMetricManager::inc_copy_start_requests(int64_t val) {
@@ -1687,6 +1780,10 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(mem_total_capacity_);
     serialize_metric(mem_allocated_size_per_segment_);
     serialize_metric(mem_total_capacity_per_segment_);
+    serialize_metric(nof_allocated_size_);
+    serialize_metric(nof_total_capacity_);
+    serialize_metric(nof_allocated_size_per_segment_);
+    serialize_metric(nof_total_capacity_per_segment_);
     serialize_metric(file_allocated_size_);
     serialize_metric(file_total_capacity_);
     serialize_metric(key_count_);
@@ -1722,6 +1819,12 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(unmount_segment_failures_);
     serialize_metric(remount_segment_requests_);
     serialize_metric(remount_segment_failures_);
+    serialize_metric(mount_nof_segment_requests_);
+    serialize_metric(mount_nof_segment_failures_);
+    serialize_metric(unmount_nof_segment_requests_);
+    serialize_metric(unmount_nof_segment_failures_);
+    serialize_metric(remount_nof_segment_requests_);
+    serialize_metric(remount_nof_segment_failures_);
     serialize_metric(ping_requests_);
     serialize_metric(ping_failures_);
     serialize_metric(nof_heartbeat_success_total_);
@@ -1763,24 +1866,63 @@ std::string MasterMetricManager::serialize_metrics() {
     // Serialize Batch Request Counters
     serialize_metric(batch_exist_key_requests_);
     serialize_metric(batch_exist_key_failures_);
+    serialize_metric(batch_exist_key_partial_successes_);
+    serialize_metric(batch_exist_key_items_);
+    serialize_metric(batch_exist_key_failed_items_);
     serialize_metric(batch_query_ip_requests_);
     serialize_metric(batch_query_ip_failures_);
+    serialize_metric(batch_query_ip_partial_successes_);
+    serialize_metric(batch_query_ip_items_);
+    serialize_metric(batch_query_ip_failed_items_);
     serialize_metric(batch_replica_clear_requests_);
     serialize_metric(batch_replica_clear_failures_);
+    serialize_metric(batch_replica_clear_partial_successes_);
+    serialize_metric(batch_replica_clear_items_);
+    serialize_metric(batch_replica_clear_failed_items_);
     serialize_metric(batch_get_replica_list_requests_);
     serialize_metric(batch_get_replica_list_failures_);
+    serialize_metric(batch_get_replica_list_partial_successes_);
+    serialize_metric(batch_get_replica_list_items_);
+    serialize_metric(batch_get_replica_list_failed_items_);
     serialize_metric(batch_put_start_requests_);
     serialize_metric(batch_put_start_failures_);
+    serialize_metric(batch_put_start_partial_successes_);
+    serialize_metric(batch_put_start_items_);
+    serialize_metric(batch_put_start_failed_items_);
     serialize_metric(batch_put_end_requests_);
     serialize_metric(batch_put_end_failures_);
+    serialize_metric(batch_put_end_partial_successes_);
+    serialize_metric(batch_put_end_items_);
+    serialize_metric(batch_put_end_failed_items_);
     serialize_metric(batch_put_revoke_requests_);
     serialize_metric(batch_put_revoke_failures_);
+    serialize_metric(batch_put_revoke_partial_successes_);
+    serialize_metric(batch_put_revoke_items_);
+    serialize_metric(batch_put_revoke_failed_items_);
+
+    // Serialize Store-observed cache reuse metrics
+    serialize_metric(mem_cache_hit_nums_);
+    serialize_metric(file_cache_hit_nums_);
+    serialize_metric(mem_cache_hit_bytes_);
+    serialize_metric(file_cache_hit_bytes_);
+    serialize_metric(mem_cache_nums_);
+    serialize_metric(file_cache_nums_);
+    serialize_metric(valid_get_nums_);
+    serialize_metric(total_get_nums_);
 
     // Serialize Eviction Counters
     serialize_metric(eviction_success_);
     serialize_metric(eviction_attempts_);
     serialize_metric(evicted_key_count_);
     serialize_metric(evicted_size_);
+    serialize_metric(mem_eviction_success_);
+    serialize_metric(mem_eviction_attempts_);
+    serialize_metric(mem_evicted_key_count_);
+    serialize_metric(mem_evicted_size_);
+    serialize_metric(nof_eviction_success_);
+    serialize_metric(nof_eviction_attempts_);
+    serialize_metric(nof_evicted_key_count_);
+    serialize_metric(nof_evicted_size_);
 
     // Serialize PutStart Discard Metrics
     serialize_metric(put_start_discard_cnt_);
@@ -1798,6 +1940,12 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(promotion_rejected_frequency_);
     serialize_metric(promotion_rejected_watermark_);
     serialize_metric(promotion_rejected_cap_);
+    serialize_metric(promotion_candidate_recorded_);
+    serialize_metric(promotion_candidate_admitted_);
+    serialize_metric(promotion_candidate_admission_rejected_);
+    serialize_metric(promotion_candidate_expired_evaluated_);
+    serialize_metric(promotion_candidate_expired_unevaluated_);
+    serialize_metric(promotion_candidate_dropped_limit_);
     serialize_metric(tenant_quota_reject_total_);
     serialize_metric(tenant_evict_bytes_total_);
 
@@ -1901,7 +2049,7 @@ std::string MasterMetricManager::get_summary_string(
     int64_t nof_allocated = nof_allocated_size_.value();
     int64_t nof_capacity = nof_total_capacity_.value();
     int64_t file_allocated = file_allocated_size_.value();
-    int64_t file_capacity = file_total_capacity_.value();
+    [[maybe_unused]] int64_t file_capacity = file_total_capacity_.value();
     int64_t keys = key_count_.value();
     int64_t soft_pin_keys = soft_pin_key_count_.value();
     int64_t active_clients = active_clients_.value();

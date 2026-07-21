@@ -55,6 +55,24 @@ static inline void setConfig(Config& config, const std::string& env_key,
     if (val) config.setFromString(config_key, std::string(val));
 }
 
+// Like setConfig, but parses the env value as a comma-separated list and
+// stores it as a string array. Empty/whitespace-only items are dropped so a
+// trailing comma or spaces around names are tolerated (e.g. "mlx5_0, mlx5_1").
+static inline void setArrayConfig(Config& config, const std::string& env_key,
+                                  const std::string& config_key) {
+    const char* val = std::getenv(env_key.c_str());
+    if (!val) return;
+    std::vector<std::string> items;
+    std::stringstream ss(val);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        item.erase(0, item.find_first_not_of(" \t"));
+        item.erase(item.find_last_not_of(" \t") + 1);
+        if (!item.empty()) items.push_back(item);
+    }
+    if (!items.empty()) config.set(config_key, items);
+}
+
 Status ConfigHelper::loadFromEnv(Config& config) {
     const char* conf_str = std::getenv("MC_TENT_CONF");
     Status status = Status::OK();
@@ -107,6 +125,7 @@ Status ConfigHelper::loadFromEnv(Config& config) {
     setConfig(config, "MC_PKEY_INDEX", "transports/rdma/endpoint/pkey_index");
     setConfig(config, "MC_MTU", "transports/rdma/endpoint/path_mtu");
     setConfig(config, "MC_IB_TC", "transports/rdma/endpoint/traffic_class");
+    setConfig(config, "MC_IB_SL", "transports/rdma/endpoint/service_level");
     setConfig(config, "MC_IB_PCI_RELAXED_ORDERING",
               "transports/rdma/pci_relaxed_ordering");
     setConfig(config, "MC_WORKERS_PER_CTX",
@@ -116,6 +135,16 @@ Status ConfigHelper::loadFromEnv(Config& config) {
               "transports/rdma/workers/max_retry_count");
     setConfig(config, "MC_DISABLE_GPU_DIRECT_RDMA",
               "transports/rdma/disable_gpu_direct_rdma");
+    setConfig(config, "MC_LOG_RDMA_SLICE_AFFINITY",
+              "transports/rdma/log_slice_affinity");
+    // Restrict which RDMA NICs the engine discovers/uses (comma-separated
+    // device names). MC_TE_FILTERS is an allow-list — same name and semantics
+    // as the legacy Transfer Engine's device whitelist, so a single env works
+    // across both engines. MC_TE_FILTERS_EXCLUDE is a deny-list (new; the
+    // legacy engine has no deny-list). Unset = discover all (default).
+    // Consumed by filterInfiniBandDevices() in the platform probes.
+    setArrayConfig(config, "MC_TE_FILTERS", "topology/rdma_whitelist");
+    setArrayConfig(config, "MC_TE_FILTERS_EXCLUDE", "topology/rdma_blacklist");
     return status;
 }
 

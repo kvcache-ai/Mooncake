@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 # vLLM V0 Disaggregated Serving with MooncakeStore
 
 ```{admonition} Archived

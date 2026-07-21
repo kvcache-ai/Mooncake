@@ -9,11 +9,17 @@
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <map>
 #include <memory>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include <unistd.h>
+
+#include "tenant_quota_policy_store.h"
 #include "types.h"
 
 namespace mooncake::test {
@@ -32,7 +38,13 @@ class PromotionOnHitTest : public ::testing::Test {
         FLAGS_logtostderr = true;
     }
 
-    void TearDown() override { google::ShutdownGoogleLogging(); }
+    void TearDown() override {
+        for (const auto& path : policy_files_) {
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+        }
+        google::ShutdownGoogleLogging();
+    }
 
     // Friend access to MasterService::promotion_admission_threshold_, which
     // is otherwise private. PromotionOnHitTest is friended; TEST_F-generated
@@ -42,7 +54,54 @@ class PromotionOnHitTest : public ::testing::Test {
         return service->promotion_admission_threshold_;
     }
 
+    static size_t CountPromotionCandidatesForTesting(
+        MasterService* service, const std::string& tenant) {
+        return service->CountCandidatesForTesting(tenant);
+    }
+
+    static void ResetCandidateBackoffsForTesting(MasterService* service) {
+        service->ResetCandidateBackoffsForTesting();
+    }
+
+    static size_t RunPromotionCandidateRetryForTesting(MasterService* service) {
+        return service->RunPromotionCandidateRetryForTesting();
+    }
+
+    static size_t RunPromotionCandidateRetryForTesting(MasterService* service,
+                                                       size_t shards_to_scan) {
+        return service->RunPromotionCandidateRetry(shards_to_scan);
+    }
+
+    static void ClearCandidatesForReloadForTesting(MasterService* service) {
+        service->ClearCandidatesForReload();
+    }
+
+    static uint64_t GetPromotionCandidateCountForTesting(
+        MasterService* service) {
+        return service->promotion_candidate_count_.load(
+            std::memory_order_relaxed);
+    }
+
+    static uint64_t GetPromotionInFlightForTesting(MasterService* service) {
+        return service->promotion_in_flight_.load(std::memory_order_relaxed);
+    }
+
     static constexpr size_t kDefaultSegmentBase = 0x300000000;
+
+    std::string WriteTenantQuotaPolicyFile(
+        const std::map<std::string, uint64_t>& tenant_quotas) {
+        TenantQuotaPolicySnapshot snapshot;
+        snapshot.tenant_quotas = tenant_quotas;
+        auto path =
+            std::filesystem::temp_directory_path() /
+            ("mooncake_promotion_tenant_policy_" + std::to_string(::getpid()) +
+             "_" + std::to_string(next_policy_file_++) + ".yaml");
+        std::ofstream out(path);
+        out << FormatTenantQuotaPolicyYaml(snapshot);
+        out.close();
+        policy_files_.push_back(path.string());
+        return path.string();
+    }
 
     Segment MakeSegment(std::string name, size_t base, size_t size) const {
         Segment segment;
@@ -116,6 +175,9 @@ class PromotionOnHitTest : public ::testing::Test {
         EXPECT_TRUE(mount_ld.has_value());
         return client_id;
     }
+
+    std::vector<std::string> policy_files_;
+    size_t next_policy_file_ = 0;
 };
 
 // Sanity: with promotion disabled, no path mutates promotion_objects.
@@ -249,6 +311,91 @@ TEST_F(PromotionOnHitTest, BatchGetReplicaListPromotesLocalDiskOnlyObject) {
     EXPECT_EQ(pending->size(), 2u);
     EXPECT_EQ(CountPromotionTask(*pending, single_key), 1u);
     EXPECT_EQ(CountPromotionTask(*pending, batch_key), 1u);
+
+    service->RemoveAll();
+}
+
+// The read-only admin batch query must NOT trigger promotion-on-hit, even for a
+// LOCAL_DISK-only key. Contrast with BatchGetReplicaListPromotesLocalDiskOnly
+// Object above, where the client-facing BatchGetReplicaList admits the key for
+// promotion.
+TEST_F(PromotionOnHitTest,
+       BatchGetReplicaListForAdminDoesNotPromoteLocalDiskOnlyObject) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.promotion_max_per_heartbeat = 2;
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx = PrepareSegment(*service, "test_segment_admin",
+                              kDefaultSegmentBase, seg_size);
+
+    const std::string key = "k_batch_admin_no_promote";
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, ctx.client_id, key, 1024,
+                                       ctx.segment_name));
+
+    auto& mm = MasterMetricManager::instance();
+    const int64_t admitted_pre = mm.get_promotion_admitted();
+    const int64_t in_flight_pre = mm.get_promotion_in_flight();
+
+    auto result = service->BatchGetReplicaListForAdmin(
+        std::vector<std::string>{key}, "default");
+    ASSERT_EQ(result.size(), 1u);
+    ASSERT_TRUE(result[0].has_value());
+    ASSERT_EQ(result[0]->replicas.size(), 1u);
+    EXPECT_TRUE(result[0]->replicas[0].is_local_disk_replica());
+
+    // No promotion admitted or enqueued by the read-only admin path.
+    EXPECT_EQ(mm.get_promotion_admitted() - admitted_pre, 0);
+    EXPECT_EQ(mm.get_promotion_in_flight() - in_flight_pre, 0);
+    auto pending = service->PromotionObjectHeartbeat(ctx.client_id);
+    ASSERT_TRUE(pending.has_value());
+    EXPECT_EQ(pending->size(), 0u);
+    EXPECT_EQ(CountPromotionTask(*pending, key), 0u);
+
+    service->RemoveAll();
+}
+
+// The read-only admin batch query must NOT update the store-observed cache-hit
+// counters. Contrast with the client-facing BatchGetReplicaList, which bumps
+// the memory-cache-hit counter for a MEMORY replica.
+TEST_F(PromotionOnHitTest,
+       BatchGetReplicaListForAdminDoesNotUpdateCacheHitMetrics) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx = PrepareSegment(*service, "metrics_segment", kDefaultSegmentBase,
+                              seg_size);
+
+    const std::string key = "k_admin_no_metric";
+    PutObject(*service, ctx.client_id, key, 1024);
+
+    using CacheHitStat = MasterMetricManager::CacheHitStat;
+    auto mem_hits = []() {
+        auto stats = MasterMetricManager::instance().calculate_cache_stats();
+        return stats[CacheHitStat::MEMORY_HITS];
+    };
+
+    const double before_admin = mem_hits();
+
+    // Read-only admin query must leave the memory-cache-hit counter untouched.
+    auto admin_result = service->BatchGetReplicaListForAdmin(
+        std::vector<std::string>{key}, "default");
+    ASSERT_EQ(admin_result.size(), 1u);
+    ASSERT_TRUE(admin_result[0].has_value());
+    EXPECT_EQ(mem_hits(), before_admin);
+
+    // The client-facing path does bump it, proving the assertion above is
+    // meaningful rather than a counter that never moves.
+    (void)service->BatchGetReplicaList(std::vector<std::string>{key},
+                                       "default");
+    EXPECT_GT(mem_hits(), before_admin);
 
     service->RemoveAll();
 }
@@ -2035,17 +2182,21 @@ TEST_F(PromotionOnHitTest, MetricsRejectionCountersIncrementOnGateMiss) {
 TEST_F(PromotionOnHitTest, AdmissionFrequencyIsTenantScoped) {
     MasterServiceConfig config;
     config.enable_offload = true;
+    config.enable_multi_tenants = true;
+    config.tenant_quota_connector_type = "file";
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 2;
     config.default_kv_lease_ttl = 2000;
+    const std::string key = "shared_hot_key";
+    const std::string tenant_a = "tenant_promotion_a";
+    const std::string tenant_b = "tenant_promotion_b";
+    config.tenant_quota_connector_uri = WriteTenantQuotaPolicyFile(
+        {{tenant_a, 64 * 1024 * 1024}, {tenant_b, 64 * 1024 * 1024}});
     auto service = std::make_unique<MasterService>(config);
 
     constexpr size_t seg_size = 1024 * 1024 * 16;
     auto seg =
         PrepareSegment(*service, "seg_tenant", kDefaultSegmentBase, seg_size);
-    const std::string key = "shared_hot_key";
-    const std::string tenant_a = "tenant_promotion_a";
-    const std::string tenant_b = "tenant_promotion_b";
     ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, key, 1024,
                                        seg.segment_name, tenant_a));
     ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, key, 1024,
@@ -2189,6 +2340,291 @@ TEST_F(PromotionOnHitTest, MetricsRemoveMidPromotionCountsAsCancelled) {
 
     EXPECT_EQ(mm.get_promotion_in_flight() - in_flight_pre, 0);
     EXPECT_EQ(mm.get_promotion_cancelled() - cancelled_pre, 1);
+
+    service->RemoveAll();
+}
+
+// --- Promotion retry candidate tests ---
+
+// A transient watermark rejection records a candidate; the retry scheduler
+// can later see and process it.
+TEST_F(PromotionOnHitTest, RetryCandidate_WatermarkRejectionRecordsCandidate) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.default_kv_lease_ttl = 2000;
+    config.eviction_high_watermark_ratio = 0.0;  // all promotions rejected
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto seg =
+        PrepareSegment(*service, "retry_seg", kDefaultSegmentBase, seg_size);
+    // LOCAL_DISK-only key: inject without a prior PutStart.
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_wm", 1024,
+                                       seg.segment_name));
+
+    auto& mm = MasterMetricManager::instance();
+    const int64_t recorded_pre = mm.get_promotion_candidate_recorded();
+
+    // Get triggers frequency gate (threshold=1 → passes) then hits watermark=0.
+    {
+        auto r = service->GetReplicaList("k_wm", "default");
+        ASSERT_TRUE(r.has_value());
+    }
+
+    EXPECT_EQ(mm.get_promotion_candidate_recorded() - recorded_pre, 1)
+        << "Expected one candidate recorded on watermark rejection";
+    EXPECT_EQ(CountPromotionCandidatesForTesting(service.get(), "default"), 1u);
+
+    // A second Get on the same key should update last_seen but not add a
+    // duplicate candidate.
+    {
+        auto r = service->GetReplicaList("k_wm", "default");
+        ASSERT_TRUE(r.has_value());
+    }
+    EXPECT_EQ(CountPromotionCandidatesForTesting(service.get(), "default"), 1u)
+        << "Duplicate candidate must not be created";
+
+    service->RemoveAll();
+}
+
+// A candidate recorded while the promotion queue is full is admitted once the
+// active slot is released and the retry scanner reaches it.
+TEST_F(PromotionOnHitTest, RetryCandidate_CapRejectedThenQueuedOnRetry) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.default_kv_lease_ttl = 2000;
+    config.promotion_queue_limit = 1;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto seg = PrepareSegment(*service, "retry_cap_seg", kDefaultSegmentBase,
+                              seg_size);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_busy", 1024,
+                                       seg.segment_name));
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_retry", 1024,
+                                       seg.segment_name));
+
+    auto& mm = MasterMetricManager::instance();
+    const int64_t candidate_admitted_pre =
+        mm.get_promotion_candidate_admitted();
+    const int64_t promotion_admitted_pre = mm.get_promotion_admitted();
+
+    {
+        auto r = service->GetReplicaList("k_busy", "default");
+        ASSERT_TRUE(r.has_value());
+    }
+    ASSERT_EQ(mm.get_promotion_admitted() - promotion_admitted_pre, 1);
+    ASSERT_EQ(GetPromotionInFlightForTesting(service.get()), 1u);
+
+    {
+        auto r = service->GetReplicaList("k_retry", "default");
+        ASSERT_TRUE(r.has_value());
+    }
+    ASSERT_EQ(CountPromotionCandidatesForTesting(service.get(), "default"), 1u);
+
+    auto failed =
+        service->NotifyPromotionFailure(seg.client_id, "k_busy", "default");
+    ASSERT_TRUE(failed.has_value());
+    ASSERT_EQ(GetPromotionInFlightForTesting(service.get()), 0u);
+
+    ResetCandidateBackoffsForTesting(service.get());
+    EXPECT_EQ(RunPromotionCandidateRetryForTesting(service.get()), 1u);
+
+    EXPECT_EQ(CountPromotionCandidatesForTesting(service.get(), "default"), 0u);
+    EXPECT_EQ(GetPromotionInFlightForTesting(service.get()), 1u);
+    EXPECT_EQ(mm.get_promotion_candidate_admitted() - candidate_admitted_pre,
+              1);
+
+    auto heartbeat = service->PromotionObjectHeartbeat(seg.client_id);
+    ASSERT_TRUE(heartbeat.has_value());
+    ASSERT_EQ(heartbeat->size(), 1u);
+    EXPECT_EQ(heartbeat->front().key, "k_retry");
+
+    service->RemoveAll();
+}
+
+TEST_F(PromotionOnHitTest, RetryCandidate_NoCandidatesOrNoShardBudgetNoops) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.default_kv_lease_ttl = 2000;
+    config.eviction_high_watermark_ratio = 0.0;
+    auto service = std::make_unique<MasterService>(config);
+
+    EXPECT_EQ(RunPromotionCandidateRetryForTesting(service.get()), 0u);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto seg = PrepareSegment(*service, "retry_noop_seg", kDefaultSegmentBase,
+                              seg_size);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_noop", 1024,
+                                       seg.segment_name));
+
+    {
+        auto r = service->GetReplicaList("k_noop", "default");
+        ASSERT_TRUE(r.has_value());
+    }
+    ASSERT_EQ(CountPromotionCandidatesForTesting(service.get(), "default"), 1u);
+
+    EXPECT_EQ(RunPromotionCandidateRetryForTesting(service.get(),
+                                                   /*shards_to_scan=*/0),
+              0u);
+    EXPECT_EQ(CountPromotionCandidatesForTesting(service.get(), "default"), 1u);
+
+    service->RemoveAll();
+}
+
+// Candidate is cleaned up after kPromotionCandidateMaxRetries scans.
+TEST_F(PromotionOnHitTest, RetryCandidate_ExhaustedAfterMaxRetries) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.default_kv_lease_ttl = 2000;
+    config.eviction_high_watermark_ratio = 0.0;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto seg =
+        PrepareSegment(*service, "exhaust_seg", kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_exhaust",
+                                       1024, seg.segment_name));
+
+    // Record a candidate via a Get (watermark=0 rejects).
+    {
+        auto r = service->GetReplicaList("k_exhaust", "default");
+        ASSERT_TRUE(r.has_value());
+    }
+    ASSERT_EQ(CountPromotionCandidatesForTesting(service.get(), "default"), 1u);
+
+    auto& mm = MasterMetricManager::instance();
+    const int64_t expired_pre = mm.get_promotion_candidate_expired_evaluated();
+
+    // Drive retries; each scan increments retry_count until exhausted.
+    // Reset backoff timestamps before each scan so wall-clock time doesn't
+    // gate retries and the loop completes without sleeping.
+    for (int i = 0; i <= 10; ++i) {
+        ResetCandidateBackoffsForTesting(service.get());
+        RunPromotionCandidateRetryForTesting(service.get());
+    }
+
+    EXPECT_EQ(CountPromotionCandidatesForTesting(service.get(), "default"), 0u)
+        << "Candidate must be erased after max retries";
+    EXPECT_GT(mm.get_promotion_candidate_expired_evaluated() - expired_pre, 0);
+
+    service->RemoveAll();
+}
+
+// When an object is removed while a candidate is pending, the retry scan
+// cleans up the candidate without promoting.
+TEST_F(PromotionOnHitTest, RetryCandidate_ObjectRemovedMidRetry) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.default_kv_lease_ttl = 2000;
+    config.eviction_high_watermark_ratio = 0.0;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto seg =
+        PrepareSegment(*service, "rm_seg", kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_rm", 1024,
+                                       seg.segment_name));
+
+    auto& mm = MasterMetricManager::instance();
+    const int64_t admitted_pre = mm.get_promotion_candidate_admitted();
+
+    // Record candidate.
+    {
+        auto r = service->GetReplicaList("k_rm", "default");
+        ASSERT_TRUE(r.has_value());
+    }
+    ASSERT_EQ(CountPromotionCandidatesForTesting(service.get(), "default"), 1u);
+
+    // Remove the object while candidate is pending.
+    auto rm = service->Remove("k_rm", "default", /*force=*/true);
+    ASSERT_TRUE(rm.has_value());
+
+    // Retry scan should find object gone and erase candidate.
+    RunPromotionCandidateRetryForTesting(service.get());
+    EXPECT_EQ(CountPromotionCandidatesForTesting(service.get(), "default"), 0u);
+
+    EXPECT_EQ(mm.get_promotion_candidate_admitted() - admitted_pre, 0);
+
+    service->RemoveAll();
+}
+
+// Records multiple candidates and verifies per-key tracking is correct.
+TEST_F(PromotionOnHitTest, RetryCandidate_MultipleKeysTracked) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.default_kv_lease_ttl = 2000;
+    config.eviction_high_watermark_ratio = 0.0;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 64;
+    auto seg =
+        PrepareSegment(*service, "multi_seg", kDefaultSegmentBase, seg_size);
+
+    auto& mm = MasterMetricManager::instance();
+    const int64_t recorded_pre = mm.get_promotion_candidate_recorded();
+    const int64_t unevaluated_pre =
+        mm.get_promotion_candidate_expired_unevaluated();
+
+    constexpr int kKeys = 5;
+    for (int i = 0; i < kKeys; i++) {
+        std::string key = "k_multi_" + std::to_string(i);
+        ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, key, 512,
+                                           seg.segment_name));
+        auto r = service->GetReplicaList(key, "default");
+        ASSERT_TRUE(r.has_value());
+    }
+
+    EXPECT_EQ(mm.get_promotion_candidate_recorded() - recorded_pre, kKeys);
+    EXPECT_EQ(
+        mm.get_promotion_candidate_expired_unevaluated() - unevaluated_pre, 0);
+    EXPECT_EQ(CountPromotionCandidatesForTesting(service.get(), "default"),
+              static_cast<size_t>(kKeys));
+
+    service->RemoveAll();
+}
+
+// ClearCandidatesForReload resets all candidate state and the global count.
+TEST_F(PromotionOnHitTest, RetryCandidate_ClearOnReload) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.default_kv_lease_ttl = 2000;
+    config.eviction_high_watermark_ratio = 0.0;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto seg =
+        PrepareSegment(*service, "reload_seg", kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_reload",
+                                       1024, seg.segment_name));
+
+    // Record a candidate.
+    {
+        auto r = service->GetReplicaList("k_reload", "default");
+        ASSERT_TRUE(r.has_value());
+    }
+    ASSERT_EQ(CountPromotionCandidatesForTesting(service.get(), "default"), 1u);
+
+    // Simulate metadata reload.
+    ClearCandidatesForReloadForTesting(service.get());
+
+    EXPECT_EQ(CountPromotionCandidatesForTesting(service.get(), "default"), 0u);
+    EXPECT_EQ(GetPromotionCandidateCountForTesting(service.get()), 0u);
+    EXPECT_EQ(GetPromotionInFlightForTesting(service.get()), 0u);
 
     service->RemoveAll();
 }

@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 import asyncio
 import json
+import logging
+import signal
 import sys
+import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -16,9 +22,10 @@ except ModuleNotFoundError:
     web_module = types.ModuleType("aiohttp.web")
 
     class Response:
-        def __init__(self, status=200, text="", content_type=None):
+        def __init__(self, status=200, text="", body=None, content_type=None):
             self.status = status
             self.text = text
+            self.body = body
             self.content_type = content_type
 
     web_module.Response = Response
@@ -37,7 +44,12 @@ except ModuleNotFoundError:
     store_module.MooncakeDistributedStore = MooncakeDistributedStore
     sys.modules["mooncake.store"] = store_module
 
-from mooncake.mooncake_store_service import MooncakeStoreService, _shm_name_to_path
+from mooncake.mooncake_store_service import (
+    MooncakeStoreService,
+    _install_shutdown_signal_handlers,
+    _shm_name_to_path,
+    main as store_service_main,
+)
 
 
 class FakeStore:
@@ -49,6 +61,11 @@ class FakeStore:
         self.unmount_failures = set()
         self.allocated_mount_calls = []
         self.free_unmount_calls = []
+        self.setup_calls = []
+
+    def setup(self, *args):
+        self.setup_calls.append(args)
+        return 0
 
     def mount_segment(self, path, size, offset, protocol, location):
         self.mount_calls.append((path, size, offset, protocol, location))
@@ -105,6 +122,69 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         self.service.mounted_segment_ids = []
         self.service.last_mount_info = {}
         self.service._state_lock = asyncio.Lock()
+
+    async def test_start_store_service_passes_tenant_id_to_setup(self):
+        fake_store = FakeStore()
+        self.service.config = SimpleNamespace(
+            local_hostname="localhost",
+            metadata_server="P2PHANDSHAKE",
+            global_segment_size=1024,
+            local_buffer_size=2048,
+            protocol="tcp",
+            device_name="",
+            master_server_address="127.0.0.1:50051",
+            enable_ssd_offload=False,
+            ssd_offload_path="",
+            tenant_id="tenant-a",
+            enable_client_http_server=False,
+            client_http_port=9300,
+        )
+
+        with patch(
+            "mooncake.mooncake_store_service.MooncakeDistributedStore",
+            return_value=fake_store,
+        ):
+            result = await self.service.start_store_service(max_wait_time=1)
+
+        self.assertTrue(result)
+        self.assertEqual(
+            fake_store.setup_calls,
+            [
+                (
+                    {
+                        "local_hostname": "localhost",
+                        "metadata_server": "P2PHANDSHAKE",
+                        "global_segment_size": 1024,
+                        "local_buffer_size": 2048,
+                        "protocol": "tcp",
+                        "rdma_devices": "",
+                        "master_server_addr": "127.0.0.1:50051",
+                        "enable_ssd_offload": False,
+                        "ssd_offload_path": "",
+                        "tenant_id": "tenant-a",
+                        "enable_client_http_server": False,
+                        "client_http_port": 9300,
+                    },
+                )
+            ],
+        )
+
+    async def test_cli_config_can_override_tenant_id(self):
+        config = {
+            "local_hostname": "localhost",
+            "metadata_server": "P2PHANDSHAKE",
+            "master_server_address": "127.0.0.1:50051",
+            "tenant_id": "tenant-from-file",
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.json"
+            config_path.write_text(json.dumps(config))
+            service = MooncakeStoreService(
+                str(config_path), {"tenant_id": "tenant-from-cli"}
+            )
+
+        self.assertEqual(service.config.tenant_id, "tenant-from-cli")
 
     async def test_mount_shm_then_unmount_shm_api(self):
         mount_resp = await self.service.handle_mount_shm(
@@ -306,6 +386,7 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
     # ==================== /api/get/{key} tests ====================
 
     async def test_handle_get_success(self):
+        self.fake_store.is_exist = lambda key: True
         self.fake_store.get = lambda key: b"payload_bytes"
         request = FakeRequest({})
         request.match_info = {"key": "my_key"}
@@ -314,7 +395,8 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.body, b"payload_bytes")
 
     async def test_handle_get_not_found(self):
-        self.fake_store.get = lambda key: None
+        self.fake_store.is_exist = lambda key: 0
+        self.fake_store.get = lambda key: b""
         request = FakeRequest({})
         request.match_info = {"key": "missing_key"}
         resp = await self.service.handle_get(request)
@@ -322,7 +404,28 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         body = json.loads(resp.text)
         self.assertIn("Key not found", body["error"])
 
+    async def test_handle_get_exist_check_failure(self):
+        self.fake_store.is_exist = lambda key: -1
+        self.fake_store.get = lambda key: b""
+        request = FakeRequest({})
+        request.match_info = {"key": "error_key"}
+        resp = await self.service.handle_get(request)
+        self.assertEqual(resp.status, 500)
+        body = json.loads(resp.text)
+        self.assertIn("Exist check failed", body["error"])
+
     async def test_handle_get_empty_bytes(self):
+        self.fake_store.is_exist = lambda key: True
+        self.fake_store.get = lambda key: b""
+        request = FakeRequest({})
+        request.match_info = {"key": "empty_value_key"}
+        resp = await self.service.handle_get(request)
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(resp.body, b"")
+
+    async def test_handle_get_empty_bytes_rechecks_existence(self):
+        existence_results = iter([1, 0])
+        self.fake_store.is_exist = lambda key: next(existence_results)
         self.fake_store.get = lambda key: b""
         request = FakeRequest({})
         request.match_info = {"key": "empty_value_key"}
@@ -331,10 +434,21 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         body = json.loads(resp.text)
         self.assertIn("Key not found", body["error"])
 
+    async def test_handle_get_none_value_is_store_failure(self):
+        self.fake_store.is_exist = lambda key: True
+        self.fake_store.get = lambda key: None
+        request = FakeRequest({})
+        request.match_info = {"key": "empty_value_key"}
+        resp = await self.service.handle_get(request)
+        self.assertEqual(resp.status, 500)
+        body = json.loads(resp.text)
+        self.assertIn("GET operation failed", body["error"])
+
     async def test_handle_get_store_exception(self):
         def raise_error(key):
             raise RuntimeError("store crashed")
 
+        self.fake_store.is_exist = lambda key: True
         self.fake_store.get = raise_error
         request = FakeRequest({})
         request.match_info = {"key": "crash_key"}
@@ -374,6 +488,19 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.status, 500)
         body = json.loads(resp.text)
         self.assertIn("exist check crashed", body["error"])
+
+    async def test_handle_exist_store_error(self):
+        # is_exist returns -1 when the store is unhealthy; this should surface
+        # as HTTP 500, not as HTTP 200 {"exists": true} (bool(-1) == True).
+        self.fake_store.is_exist = lambda key: -1
+        request = FakeRequest({})
+        request.match_info = {"key": "some_key"}
+        resp = await self.service.handle_exist(request)
+        self.assertEqual(resp.status, 500)
+        body = json.loads(resp.text)
+        # Assert the specific message so this pins the exists < 0 branch rather
+        # than any 500 (the except path returns {"error": str(e)} too).
+        self.assertEqual(body["error"], "Exist check failed")
 
     # ==================== /api/remove/{key} tests ====================
 
@@ -635,6 +762,157 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
     async def test_unmount_shm_empty_list(self):
         resp = await self.service.handle_unmount_shm(FakeRequest({"segment_ids": []}))
         self.assertEqual(resp.status, 400)
+
+
+class StoreServiceShutdownTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.service = MooncakeStoreService.__new__(MooncakeStoreService)
+        self.service.store = None
+        self.service.config = SimpleNamespace(
+            local_hostname="localhost",
+            metadata_server="P2PHANDSHAKE",
+            global_segment_size=1,
+            local_buffer_size=0,
+            protocol="tcp",
+            device_name="",
+            master_server_address="localhost:50051",
+            enable_ssd_offload=False,
+            ssd_offload_path="",
+            tenant_id="",
+        )
+
+    async def test_shutdown_event_stops_startup_retry_sleep(self):
+        class FailingStore:
+            def setup(self, *_args):
+                raise RuntimeError("setup failed")
+
+        shutdown_event = asyncio.Event()
+
+        async def trigger_shutdown():
+            await asyncio.sleep(0)
+            shutdown_event.set()
+
+        with mock.patch(
+            "mooncake.mooncake_store_service.MooncakeDistributedStore",
+            FailingStore,
+        ):
+            shutdown_task = asyncio.create_task(trigger_shutdown())
+            start_time = time.perf_counter()
+            with self.assertLogs(level=logging.WARNING):
+                result = await self.service.start_store_service(
+                    max_wait_time=2, shutdown_event=shutdown_event
+                )
+            elapsed = time.perf_counter() - start_time
+            await shutdown_task
+
+        self.assertFalse(result)
+        self.assertLess(elapsed, 0.5)
+
+    async def test_shutdown_during_setup_is_observed_before_success(self):
+        shutdown_event = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        class SchedulingStore(FakeStore):
+            def __init__(self):
+                super().__init__()
+                self.close_calls = 0
+
+            def setup(self, *args):
+                ret = super().setup(*args)
+                loop.call_soon(shutdown_event.set)
+                return ret
+
+            def close(self):
+                self.close_calls += 1
+                return 0
+
+        store = SchedulingStore()
+        with mock.patch(
+            "mooncake.mooncake_store_service.MooncakeDistributedStore",
+            return_value=store,
+        ):
+            result = await self.service.start_store_service(
+                max_wait_time=1, shutdown_event=shutdown_event
+            )
+
+        self.assertFalse(result)
+        self.assertEqual(store.close_calls, 1)
+        self.assertIsNone(self.service.store)
+
+    async def test_stop_logs_nonzero_close_return(self):
+        store = mock.Mock()
+        store.close.return_value = 7
+        self.service.store = store
+
+        with self.assertLogs(level=logging.WARNING) as logs:
+            await self.service.stop()
+
+        self.assertIsNone(self.service.store)
+        self.assertTrue(
+            any("close returned 7" in message for message in logs.output)
+        )
+        await self.service.stop()
+        store.close.assert_called_once_with()
+
+    async def test_signal_handler_requests_shutdown(self):
+        loop = mock.Mock()
+        shutdown_event = asyncio.Event()
+
+        _install_shutdown_signal_handlers(loop, shutdown_event)
+
+        sigterm_call = next(
+            call
+            for call in loop.add_signal_handler.call_args_list
+            if call.args[0] == signal.SIGTERM
+        )
+        sigterm_call.args[1](sigterm_call.args[2])
+        self.assertTrue(shutdown_event.is_set())
+
+    async def test_main_closes_store_when_shutdown_requested_during_startup(self):
+        args = SimpleNamespace(
+            config=None,
+            define=[],
+            max_wait_time=60,
+            port=8080,
+        )
+        service = mock.Mock()
+        service.start_store_service = mock.AsyncMock(return_value=False)
+        service.start_http_service = mock.AsyncMock(return_value=True)
+        service.stop = mock.AsyncMock()
+
+        startup_calls = []
+
+        def request_shutdown(_loop, shutdown_event):
+            startup_calls.append("install")
+            shutdown_event.set()
+
+        def unblock_shutdown_signals():
+            startup_calls.append("unblock")
+
+        with (
+            mock.patch(
+                "mooncake.mooncake_store_service.parse_arguments",
+                return_value=args,
+            ),
+            mock.patch(
+                "mooncake.mooncake_store_service.MooncakeStoreService",
+                return_value=service,
+            ),
+            mock.patch(
+                "mooncake.mooncake_store_service._unblock_shutdown_signals",
+                side_effect=unblock_shutdown_signals,
+            ),
+            mock.patch(
+                "mooncake.mooncake_store_service._install_shutdown_signal_handlers",
+                side_effect=request_shutdown,
+            ),
+        ):
+            await store_service_main()
+
+        service.start_store_service.assert_awaited_once()
+        service.start_http_service.assert_not_awaited()
+        service.stop.assert_awaited_once()
+        self.assertEqual(startup_calls, ["install", "unblock"])
 
 
 class ShmNameToPathTest(unittest.TestCase):

@@ -121,10 +121,10 @@ int main(int argc, char* argv[]) {
 
         // Simulate some failures
         if (i % 3 == 0) {
-            TENT_RECORD_READ_FAILED(1024);
+            TENT_RECORD_READ_FAILED();
         }
         if (i % 4 == 0) {
-            TENT_RECORD_WRITE_FAILED(512);
+            TENT_RECORD_WRITE_FAILED();
         }
 
         std::cout << "  Iteration " << (i + 1) << ": Read "

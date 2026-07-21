@@ -2,7 +2,9 @@
 
 #include <boost/functional/hash.hpp>
 #include <chrono>
+#include <map>
 #include <ostream>
+#include <set>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
@@ -15,6 +17,9 @@
 #include "types.h"
 
 namespace mooncake {
+using HostSegmentIndex =
+    std::map<std::string, std::map<std::string, std::set<UUID>>>;
+
 /**
  * @brief Status of a mounted segment in master
  */
@@ -86,6 +91,7 @@ struct LocalDiskSegment {
     mutable Mutex offloading_mutex_;
     bool enable_offloading;
     int64_t ssd_total_capacity_bytes = 0;  // last reported by client heartbeat
+    std::atomic<int64_t> ssd_used_bytes{0};
     std::unordered_map<std::string, OffloadTaskItem> GUARDED_BY(
         offloading_mutex_) offloading_objects;
     // Promotion-on-hit pending work for this client. Populated by master's
@@ -172,6 +178,9 @@ class ScopedSegmentAccess {
      */
     ErrorCode GetAllSegments(
         std::vector<std::pair<Segment, UUID>>& all_segments);
+
+    std::vector<std::string> GetHostOrderedSegments(
+        const std::string& writer_host_id, const std::string& key) const;
 
     ErrorCode GetAllSegmentNames(std::vector<std::string>& all_segment_names);
 
@@ -316,10 +325,21 @@ class ScopedAllocatorAccess {
                                    std::shared_mutex& mutex)
         : allocator_manager_(allocator_manager), lock_(mutex) {}
 
+    explicit ScopedAllocatorAccess(const AllocatorManager& allocator_manager,
+                                   const HostSegmentIndex& segments_by_host,
+                                   std::shared_mutex& mutex)
+        : allocator_manager_(allocator_manager),
+          segments_by_host_(&segments_by_host),
+          lock_(mutex) {}
+
     const AllocatorManager& getAllocatorManager() { return allocator_manager_; }
+
+    std::vector<std::string> GetHostOrderedSegments(
+        const std::string& writer_host_id, const std::string& key) const;
 
    private:
     const AllocatorManager& allocator_manager_;
+    const HostSegmentIndex* segments_by_host_{nullptr};
     std::shared_lock<std::shared_mutex> lock_;
 };
 
@@ -327,7 +347,7 @@ class ScopedAllocatorAccess {
  * @brief RAII-style access to LocalDiskOffloadingQueues for thread-safe
  * LocalDiskOffloadingQueue usage
  */
-class ScopedLocalDiskSegmentAccess {
+class ScopedLocalDiskSegmentAccess : public SsdMetricsProvider {
    public:
     explicit ScopedLocalDiskSegmentAccess(
         std::unordered_map<std::string, UUID>& client_by_name,
@@ -347,6 +367,9 @@ class ScopedLocalDiskSegmentAccess {
     getClientLocalDiskSegment() {
         return client_local_disk_segment_;
     }
+
+    int64_t getSsdTotalCapacity(const std::string& segment_name) const override;
+    int64_t getSsdUsedBytes(const std::string& segment_name) const override;
 
    private:
     const std::unordered_map<std::string, UUID>&
@@ -420,7 +443,8 @@ class SegmentManager {
      * @return ScopedAllocatorAccess object that holds the lock
      */
     ScopedAllocatorAccess getAllocatorAccess() {
-        return ScopedAllocatorAccess(allocator_manager_, segment_mutex_);
+        return ScopedAllocatorAccess(allocator_manager_, segments_by_host_,
+                                     segment_mutex_);
     }
 
     ScopedLocalDiskSegmentAccess getLocalDiskSegmentAccess() {
@@ -451,7 +475,9 @@ class SegmentManager {
     std::unordered_map<std::string, UUID>
         client_by_name_;  // segment name -> client_id
     std::unordered_map<std::string, UUID>
-        segment_id_by_name_;  // segment name -> segment_id
+        segment_id_by_name_;             // segment name -> segment_id
+    HostSegmentIndex segments_by_host_;  // host_id -> segment name -> segment
+                                         // ids for allocatable segments
     std::unordered_map<UUID, std::shared_ptr<LocalDiskSegment>,
                        boost::hash<UUID>>
         client_local_disk_segment_;  // client_id -> local_disk_segment

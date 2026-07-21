@@ -24,6 +24,8 @@
 #include <sched.h>
 #include <thread>
 #include <set>
+#include <utility>
+#include <vector>
 #include <ylt/struct_json/json_reader.h>
 
 #include "transfer_engine.h"
@@ -33,17 +35,13 @@
 #include "config.h"
 #include "ha/leadership/leader_coordinator_factory.h"
 #include "types.h"
-#include "client_buffer.hpp"
+#include "client_buffer.h"
 #include "utils.h"
 #include "rpc_types.h"
 #include "local_hot_cache.h"
-#include "gpu_staging_utils.h"
+#include "device/accelerator_registry.h"
 
 namespace mooncake {
-
-using gpu_staging::CopyDeviceToHost;
-using gpu_staging::IsDevicePointer;
-using gpu_staging::SetDevice;
 
 namespace {
 
@@ -280,12 +278,16 @@ Client::Client(const std::string& local_hostname,
                      metrics_ ? &metrics_->master_client_metric : nullptr,
                      tenant_id),
       local_hostname_(local_hostname),
+      host_id_(ResolveMooncakeHostId(local_hostname)),
       metadata_connstring_(metadata_connstring),
       protocol_(protocol),
       pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
       write_thread_pool_(2),
       task_thread_pool_(4) {
     LOG(INFO) << "client_id=" << client_id_;
+    if (!host_id_.empty()) {
+        LOG(INFO) << "client_id=" << client_id_ << ", host_id=" << host_id_;
+    }
 
     if (metrics_) {
         if (metrics_->GetReportingInterval() > 0) {
@@ -390,21 +392,34 @@ Client::~Client() {
     hot_cache_.reset();
 }
 
+ReplicateConfig Client::AttachHostId(const ReplicateConfig& config) const {
+    ReplicateConfig client_cfg = config;
+    if (!host_id_.empty()) {
+        client_cfg.host_id = host_id_;
+    }
+    return client_cfg;
+}
+
 static std::optional<bool> get_auto_discover() {
     const char* ev_ad = std::getenv("MC_MS_AUTO_DISC");
     if (ev_ad) {
-        int iv = std::stoi(ev_ad);
-        if (iv == 1) {
-            LOG(INFO) << "auto discovery set by env MC_MS_AUTO_DISC";
-            return true;
-        } else if (iv == 0) {
-            LOG(INFO) << "auto discovery not set by env MC_MS_AUTO_DISC";
-            return false;
-        } else {
-            LOG(WARNING)
-                << "invalid MC_MS_AUTO_DISC value: " << ev_ad
-                << ", should be 0 or 1, using default: auto discovery not set";
+        try {
+            int iv = std::stoi(ev_ad);
+            if (iv == 1) {
+                LOG(INFO) << "auto discovery set by env MC_MS_AUTO_DISC";
+                return true;
+            } else if (iv == 0) {
+                LOG(INFO) << "auto discovery not set by env MC_MS_AUTO_DISC";
+                return false;
+            }
+        } catch (const std::exception&) {
+            // A non-numeric or out-of-range value makes std::stoi throw; fall
+            // through to the warning below and use the default instead of
+            // letting the exception abort client initialization.
         }
+        LOG(WARNING)
+            << "invalid MC_MS_AUTO_DISC value: " << ev_ad
+            << ", should be 0 or 1, using default: auto discovery not set";
     }
     return std::nullopt;
 }
@@ -648,9 +663,10 @@ ErrorCode Client::InitTransferEngine(
     }
 
     // Check if using TENT mode - TENT handles transport configuration
-    // internally
-    bool use_tent = (std::getenv("MC_USE_TENT") != nullptr) ||
-                    (std::getenv("MC_USE_TEV1") != nullptr);
+    // internally. Use the engine's own check rather than the raw env var:
+    // if Mooncake was built without USE_TENT, the env var has no effect on
+    // the TransferEngine, so the store must still install transports.
+    bool use_tent = transfer_engine_->isUsingTent();
 
     bool auto_discover = false;
     if (!use_tent) {
@@ -694,6 +710,15 @@ ErrorCode Client::InitTransferEngine(
             std::getenv("ASCEND_ENABLE_USE_FABRIC_MEM");
         if (ascend_use_fabric_mem) {
             globalConfig().ascend_use_fabric_mem = true;
+        }
+    }
+    if (protocol == "sunrise_link") {
+        const char* sunrise_use_device_mem_env =
+            std::getenv("SUNRISE_USE_DEVICE_MEM");
+        if (sunrise_use_device_mem_env) {
+            globalConfig().sunrise_use_device_mem = true;
+            LOG(INFO) << "SUNRISE_USE_DEVICE_MEM enabled: segments will be "
+                      << "allocated in device memory via tangMalloc";
         }
     }
     auto [hostname, port] = parseHostNameWithPort(local_hostname);
@@ -770,7 +795,8 @@ ErrorCode Client::InitTransferEngine(
                 LOG(ERROR) << "Failed to install TCP transport";
                 return ErrorCode::INTERNAL_ERROR;
             }
-        } else if (protocol == "ascend" || protocol == "ubshmem") {
+        } else if (protocol == "ascend" || protocol == "ubshmem" ||
+                   protocol == "sunrise_link") {
             if (device_names.has_value()) {
                 LOG(WARNING) << protocol
                              << " protocol does not use device names, ignoring";
@@ -805,6 +831,13 @@ ErrorCode Client::InitTransferEngine(
             if (!transport) {
                 LOG(ERROR) << "Failed to install CXL transport";
                 return ErrorCode::INTERNAL_ERROR;
+            }
+        } else if (protocol == "cxi") {
+            try {
+                transport = transfer_engine_->installTransport("cxi", nullptr);
+            } catch (std::exception& e) {
+                LOG(ERROR) << "cxi_transport_install_failed error_message=\""
+                           << e.what() << "\"";
             }
         } else if (protocol == "ub") {
             auto deviceName = device_names.value_or("bonding_dev_0");
@@ -1504,7 +1537,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         slice_lengths.emplace_back(slices[i].size);
     }
 
-    ReplicateConfig client_cfg = config;
+    ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
@@ -1614,7 +1647,7 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         slice_lengths.emplace_back(slices[i].size);
     }
 
-    ReplicateConfig client_cfg = config;
+    ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
@@ -1700,7 +1733,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config) {
-    ReplicateConfig client_cfg = config;
+    ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
@@ -2536,7 +2569,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config) {
-    ReplicateConfig client_cfg = config;
+    ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
@@ -2786,6 +2819,7 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
         segment.base = reinterpret_cast<uintptr_t>(buffer);
         segment.size = size;
         segment.protocol = protocol;
+        segment.host_id = host_id_;
         if (metadata_connstring_ == P2PHANDSHAKE) {
             segment.te_endpoint = transfer_engine_->getLocalIpAndPort();
         } else {
@@ -3341,16 +3375,21 @@ void Client::PutToLocalFile(const std::string& key,
     // (BatchPut has not yet returned to Python, so blocks are not reused).
     std::string value;
     value.reserve(total_size);
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
 
     for (const auto& slice : slices) {
-        int device_id = -1;
-        if (IsDevicePointer(slice.ptr, &device_id)) {
-            SetDevice(device_id);
+        device::PointerInfo info{};
+        auto* device =
+            runtime_accelerator.FindDeviceForPointer(slice.ptr, &info);
+        if (device) {
+            device->SetContext(info.device_id);
             auto buf = pinned_buffer_pool_->Acquire(slice.size);
-            if (!CopyDeviceToHost(buf.data, slice.ptr, slice.size)) {
+            if (!device->Copy(buf.data, slice.ptr, slice.size,
+                              device::CopyDirection::kDeviceToHost)) {
                 LOG(ERROR) << "D2H copy failed for key: " << key
                            << ", triggering PutRevoke for disk replica";
-                pinned_buffer_pool_->Release(buf);
+                pinned_buffer_pool_->Release(std::move(buf));
                 // Must revoke to avoid phantom replica in master
                 auto revoke_result =
                     master_client_.PutRevoke(key, ReplicaType::DISK);
@@ -3361,7 +3400,7 @@ void Client::PutToLocalFile(const std::string& key,
                 return;
             }
             value.append(buf.data, slice.size);
-            pinned_buffer_pool_->Release(buf);
+            pinned_buffer_pool_->Release(std::move(buf));
         } else {
             value.append(static_cast<char*>(slice.ptr), slice.size);
         }
@@ -3370,9 +3409,34 @@ void Client::PutToLocalFile(const std::string& key,
     // Async StoreObject + PutEnd (unchanged from original)
     write_thread_pool_.enqueue([this, backend = storage_backend_, key,
                                 value = std::move(value), path] {
-        // Store the object
-        auto store_result = backend->StoreObject(path, value, key);
         ReplicaType replica_type = ReplicaType::DISK;
+        // Store the object
+        auto store_result = backend->StoreObject(
+            path, value, key,
+            [this, replica_type](const std::vector<std::string>& evicted_keys)
+                -> tl::expected<void, ErrorCode> {
+                auto evict_results = master_client_.BatchEvictDiskReplica(
+                    evicted_keys, replica_type);
+                if (evict_results.size() != evicted_keys.size()) {
+                    return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+                }
+                for (size_t i = 0; i < evict_results.size(); ++i) {
+                    if (!evict_results[i]) {
+                        if (evict_results[i].error() ==
+                            ErrorCode::OBJECT_NOT_FOUND) {
+                            VLOG(1) << "Master no longer tracks evicted key: "
+                                    << evicted_keys[i];
+                            continue;
+                        }
+                        LOG(WARNING)
+                            << "Failed to notify master about evicted key: "
+                            << evicted_keys[i]
+                            << ", error: " << evict_results[i].error();
+                        return tl::make_unexpected(evict_results[i].error());
+                    }
+                }
+                return {};
+            });
 
         if (!store_result) {
             // If storage failed, revoke the put operation
@@ -3382,21 +3446,6 @@ void Client::PutToLocalFile(const std::string& key,
                 LOG(ERROR) << "Failed to revoke put operation for key: " << key;
             }
             return;
-        }
-
-        // Notify master about any evicted disk replicas (batch)
-        if (!store_result.value().empty()) {
-            const auto& evicted_keys = store_result.value();
-            auto evict_results = master_client_.BatchEvictDiskReplica(
-                evicted_keys, replica_type);
-            for (size_t i = 0; i < evict_results.size(); ++i) {
-                if (!evict_results[i]) {
-                    LOG(WARNING)
-                        << "Failed to notify master about evicted key: "
-                        << evicted_keys[i]
-                        << ", error: " << evict_results[i].error();
-                }
-            }
         }
 
         // If storage succeeded, end the put operation

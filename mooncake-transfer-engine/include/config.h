@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -58,19 +59,43 @@ struct GlobalConfig {
     // torn-down pod IP) it stalls for the kernel's full SYN-retry cycle,
     // which is minutes. Override via MC_HANDSHAKE_CONNECT_TIMEOUT.
     int handshake_connect_timeout = 5;
+    // Cooldown before retrying a failed RDMA peer rail. Override via
+    // MC_RDMA_RAIL_PAUSE_SECONDS.
+    uint64_t rdma_rail_pause_seconds = 30;
     bool metacache = true;
+    // Periodically refresh Transfer Engine metadata-derived local caches. 0
+    // disables the background poller and preserves the manual
+    // syncSegmentCache() behavior. Currently refreshes cached remote segment
+    // descriptors. Override via MC_TE_METADATA_REFRESH_INTERVAL_SECONDS.
+    uint64_t te_metadata_refresh_interval_seconds = 0;
     int log_level = google::INFO;
     bool trace = false;
     int64_t slice_timeout = -1;
+    // Active-connect circuit-breaker. After an endpoint to a peer is torn down
+    // (path failure / QP fatal), pause active reconnection to that peer's
+    // address for this many milliseconds, so the posting worker is not
+    // blocked re-handshaking a likely-gone peer (a k8s rolling restart brings
+    // the pod back at a different podIP:port, so the old address is dead). The
+    // not-yet-posted slices fail/redispatch instead of hanging. 0 disables.
+    // Override via MC_CONN_PAUSE_TTL_MS.
+    int conn_pause_ttl_ms = 0;
     uint16_t rpc_min_port = 15000;
     uint16_t rpc_max_port = 17000;
     bool use_ipv6 = false;
     size_t fragment_limit = 16384;
     bool enable_dest_device_affinity = false;
+    bool enable_hca_peer_affinity = false;
+    std::unordered_map<std::string, std::vector<std::string>> nic_peer_affinity;
+    bool log_rdma_slice_affinity = false;
+    bool track_rdma_posted_slices = false;
     int parallel_reg_mr = -1;
     size_t eic_max_block_size = 64UL * 1024 * 1024;
     EndpointStoreType endpoint_store_type = EndpointStoreType::SIEVE;
     int ib_traffic_class = -1;
+    // InfiniBand Service Level (SL), 0-15. -1 = use default (0).
+    // Maps to a Virtual Lane on the switch for QoS isolation, e.g. to
+    // steer KV-cache traffic into a different VL than EP all-to-all.
+    int ib_service_level = -1;
     // mlx5 QP UDP source ports for ECMP path diversification.
     // Empty = no modification. QP at index i uses
     // mlx5_qp_udp_sports[i % size]. Requires mlx5 device + RoCEv2,
@@ -85,6 +110,7 @@ struct GlobalConfig {
     int ib_pci_relaxed_ordering_mode = 0;
     bool ascend_use_fabric_mem = false;
     bool ascend_agent_mode = false;
+    bool sunrise_use_device_mem = false;
     // Transient flag scoped to a single TE init: set true by the Store entry
     // (Client::InitTransferEngine) before installing the ascend transport, and
     // reset to false right after. Lets ascend_direct distinguish a Store-init

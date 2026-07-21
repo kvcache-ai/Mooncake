@@ -24,9 +24,11 @@
 #include <netdb.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -47,6 +49,8 @@ class TransferMetadata {
         uint16_t lid;
         std::string gid;
         std::string eid;  // for ub
+
+        bool operator==(const DeviceDesc &other) const = default;
     };
 
     struct BufferDesc {
@@ -56,10 +60,10 @@ class TransferMetadata {
 #ifdef ENABLE_MULTI_PROTOCOL
         std::string protocol;  // for multi-protocol mode (cxl/tcp/rdma)
 #endif
-        // EFA's libfabric provider returns 64-bit MR keys (fi_mr_key()), so
+        // EFA/CXI's libfabric provider returns 64-bit MR keys (fi_mr_key()), so
         // these must be 64-bit wide to avoid truncation. RDMA verbs keys are
-        // 32-bit and the non-EFA path keeps them as such.
-#ifdef USE_EFA
+        // 32-bit and the non-EFA/CXI path keeps them as such.
+#if defined(USE_EFA) || defined(USE_CXI)
         using mr_key_t = uint64_t;
 #else
         using mr_key_t = uint32_t;
@@ -70,12 +74,16 @@ class TransferMetadata {
         uint64_t offset;                    // for cxl
         std::vector<std::string> tseg;      // for ub/urma
         std::vector<uint32_t> l_seg_index;  // for ub/urma
+
+        bool operator==(const BufferDesc &other) const = default;
     };
 
     struct NVMeoFBufferDesc {
         std::string file_path;
         uint64_t length;
         std::unordered_map<std::string, std::string> local_path_map;
+
+        bool operator==(const NVMeoFBufferDesc &other) const = default;
     };
 
     struct RankInfoDesc {
@@ -89,6 +97,8 @@ class TransferMetadata {
         uint64_t devicePort;
         uint64_t pid;
         std::vector<std::string> endpoints;
+
+        bool operator==(const RankInfoDesc &other) const = default;
     };
 
     using SegmentID = uint64_t;
@@ -111,6 +121,10 @@ class TransferMetadata {
         RankInfoDesc rank_info;
 
         int tcp_data_port;
+        // TCP data-plane protocol version advertised by this segment's
+        // server. v2 adds acknowledged WRITE framing and status-prefixed
+        // READ responses (#2086); absent/1 = legacy unacknowledged framing.
+        int tcp_proto_version{1};
 
         // In dual-NIC setups (MC_RDMA_BIND_ADDRESS), the RDMA-reachable
         // address may differ from the TCP-routable segment name.  When
@@ -125,6 +139,10 @@ class TransferMetadata {
             return rdma_server_name.empty() ? name : rdma_server_name;
         }
 
+        bool operator==(const SegmentDesc &other) const;
+        bool operator!=(const SegmentDesc &other) const {
+            return !(*this == other);
+        }
         void dump() const;
     };
 
@@ -149,9 +167,16 @@ class TransferMetadata {
         uint16_t barex_port;
 #endif
         std::vector<uint32_t> qp_num;
+        bool ready_ack = false;
+        // Capability marker. Encoded only by transports that opt into
+        // ready_ack; decoded from field presence to detect peer support.
+        bool ready_ack_supported = false;
         std::string reply_msg;  // on error
 #ifdef USE_EFA
         std::string efa_addr;  // EFA endpoint address (hex encoded)
+#endif
+#ifdef USE_CXI
+        std::string cxi_addr;
 #endif
     };
 
@@ -235,6 +260,9 @@ class TransferMetadata {
                           Json::Value &local_json);
     int receivePeerProbe(const Json::Value &peer_json, Json::Value &local_json);
     std::string getFullMetadataKey(const std::string &segment_name) const;
+    void startMetadataRefreshPollingIfNeeded();
+    void stopMetadataRefreshPollingThread();
+    void metadataRefreshPollingLoop(uint64_t refresh_interval_seconds);
 
     bool p2p_handshake_mode_{false};
     std::string common_key_prefix_;
@@ -255,6 +283,10 @@ class TransferMetadata {
 
     std::shared_ptr<HandShakePlugin> handshake_plugin_;
     std::shared_ptr<MetadataStoragePlugin> storage_plugin_;
+    std::mutex metadata_refresh_mutex_;
+    std::condition_variable metadata_refresh_cv_;
+    std::atomic<bool> should_stop_metadata_refresh_thread_{false};
+    std::thread metadata_refresh_thread_;
 };
 
 }  // namespace mooncake

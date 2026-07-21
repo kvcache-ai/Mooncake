@@ -57,7 +57,11 @@ impl ReplicateConfig {
     fn to_ffi(
         &self,
     ) -> Result<
-        (ffi::mooncake_replicate_config_t, Vec<CString>, Vec<*const libc::c_char>),
+        (
+            ffi::mooncake_replicate_config_t,
+            Vec<CString>,
+            Vec<*const libc::c_char>,
+        ),
         StoreError,
     > {
         let strings: Vec<CString> = self
@@ -277,8 +281,7 @@ impl MooncakeStore {
     pub fn get(&self, key: &str) -> Result<Vec<u8>, StoreError> {
         let size = self.get_size(key)?;
         let mut buf = vec![0u8; size as usize];
-        let written =
-            unsafe { self.get_into(key, buf.as_mut_ptr() as *mut c_void, buf.len())? };
+        let written = unsafe { self.get_into(key, buf.as_mut_ptr() as *mut c_void, buf.len())? };
         buf.truncate(written as usize);
         Ok(buf)
     }
@@ -345,9 +348,8 @@ impl MooncakeStore {
     /// read by another client.
     pub fn remove(&self, key: &str, force: bool) -> Result<(), StoreError> {
         let key_c = CString::new(key)?;
-        let rc = unsafe {
-            ffi::mooncake_store_remove(self.handle, key_c.as_ptr(), i32::from(force))
-        };
+        let rc =
+            unsafe { ffi::mooncake_store_remove(self.handle, key_c.as_ptr(), i32::from(force)) };
         if rc != 0 {
             return Err(StoreError::OperationFailed(rc));
         }
@@ -451,8 +453,7 @@ impl MooncakeStore {
             .iter()
             .map(|k| CString::new(*k))
             .collect::<Result<_, _>>()?;
-        let key_ptrs: Vec<*const libc::c_char> =
-            key_strings.iter().map(|s| s.as_ptr()).collect();
+        let key_ptrs: Vec<*const libc::c_char> = key_strings.iter().map(|s| s.as_ptr()).collect();
 
         let (_c_config, _strings, _ptrs) = Self::prepare_config(config)?;
         let cfg_ptr = _c_config
@@ -506,8 +507,7 @@ impl MooncakeStore {
             .iter()
             .map(|k| CString::new(*k))
             .collect::<Result<_, _>>()?;
-        let key_ptrs: Vec<*const libc::c_char> =
-            key_strings.iter().map(|s| s.as_ptr()).collect();
+        let key_ptrs: Vec<*const libc::c_char> = key_strings.iter().map(|s| s.as_ptr()).collect();
 
         let mut results = vec![0i64; count];
 
@@ -528,10 +528,7 @@ impl MooncakeStore {
     }
 
     /// Batch check existence of multiple keys.
-    pub fn batch_is_exist(
-        &self,
-        keys: &[&str],
-    ) -> Result<Vec<bool>, StoreError> {
+    pub fn batch_is_exist(&self, keys: &[&str]) -> Result<Vec<bool>, StoreError> {
         let count = keys.len();
         if count == 0 {
             return Ok(Vec::new());
@@ -540,8 +537,7 @@ impl MooncakeStore {
             .iter()
             .map(|k| CString::new(*k))
             .collect::<Result<_, _>>()?;
-        let key_ptrs: Vec<*const libc::c_char> =
-            key_strings.iter().map(|s| s.as_ptr()).collect();
+        let key_ptrs: Vec<*const libc::c_char> = key_strings.iter().map(|s| s.as_ptr()).collect();
 
         let mut results = vec![0i32; count];
 
@@ -665,15 +661,13 @@ mod tests {
             preferred_segments: vec!["bad\0segment".to_string()],
         };
 
-        assert!(matches!(
-            config.to_ffi(),
-            Err(StoreError::InvalidString(_))
-        ));
+        assert!(matches!(config.to_ffi(), Err(StoreError::InvalidString(_))));
     }
 
     #[test]
     fn prepare_config_none_returns_null_config() {
-        let (c_cfg, strings, ptrs) = MooncakeStore::prepare_config(None).expect("prepare should succeed");
+        let (c_cfg, strings, ptrs) =
+            MooncakeStore::prepare_config(None).expect("prepare should succeed");
         assert!(c_cfg.is_none());
         assert!(strings.is_empty());
         assert!(ptrs.is_empty());
@@ -706,7 +700,9 @@ mod tests {
     #[test]
     fn batch_is_exist_empty() {
         let store = MooncakeStore::new().expect("new should succeed");
-        let results = store.batch_is_exist(&[]).expect("empty batch should succeed");
+        let results = store
+            .batch_is_exist(&[])
+            .expect("empty batch should succeed");
         assert!(results.is_empty());
     }
 
@@ -718,10 +714,7 @@ mod tests {
         let sizes = &[100usize, 200];
 
         let result = unsafe { store.batch_put_from(keys, &buffers, sizes, None) };
-        assert!(matches!(
-            result,
-            Err(StoreError::InvalidArgument(_))
-        ));
+        assert!(matches!(result, Err(StoreError::InvalidArgument(_))));
     }
 
     #[test]
@@ -732,9 +725,6 @@ mod tests {
         let sizes = &[100usize];
 
         let result = unsafe { store.batch_get_into(keys, &buffers, sizes) };
-        assert!(matches!(
-            result,
-            Err(StoreError::InvalidArgument(_))
-        ));
+        assert!(matches!(result, Err(StoreError::InvalidArgument(_))));
     }
 }

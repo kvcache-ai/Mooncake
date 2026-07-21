@@ -72,9 +72,11 @@ coro_http::status_type ErrorCodeToHttpStatus(ErrorCode error) {
         case ErrorCode::JOB_NOT_FOUND:
         case ErrorCode::SEGMENT_NOT_FOUND:
         case ErrorCode::OBJECT_NOT_FOUND:
+        case ErrorCode::TENANT_NOT_REGISTERED:
             return coro_http::status_type::not_found;
         case ErrorCode::UNAVAILABLE_IN_CURRENT_MODE:
         case ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS:
+        case ErrorCode::TENANT_NOT_EMPTY:
             return coro_http::status_type::conflict;
         default:
             return coro_http::status_type::internal_server_error;
@@ -176,12 +178,13 @@ struct HttpTenantQuotaSnapshot {
     uint64_t used_bytes{0};
     uint64_t reserved_bytes{0};
     uint64_t committed_count{0};
+    uint64_t metadata_object_count{0};
     bool over_quota{false};
     bool has_explicit_policy{false};
 };
 YLT_REFL(HttpTenantQuotaSnapshot, tenant_id, requested_quota_bytes,
          effective_quota_bytes, used_bytes, reserved_bytes, committed_count,
-         over_quota, has_explicit_policy);
+         metadata_object_count, over_quota, has_explicit_policy);
 
 HttpTenantQuotaSnapshot ToHttpTenantQuotaSnapshot(
     const TenantQuotaSnapshot& snapshot) {
@@ -192,6 +195,7 @@ HttpTenantQuotaSnapshot ToHttpTenantQuotaSnapshot(
         .used_bytes = snapshot.used_bytes,
         .reserved_bytes = snapshot.reserved_bytes,
         .committed_count = snapshot.committed_count,
+        .metadata_object_count = snapshot.metadata_object_count,
         .over_quota = snapshot.over_quota,
         .has_explicit_policy = snapshot.has_explicit_policy,
     };
@@ -220,12 +224,6 @@ struct HttpTenantQuotaPolicyRequest {
 };
 YLT_REFL(HttpTenantQuotaPolicyRequest, requested_quota_bytes);
 
-struct HttpDefaultTenantQuotaResponse {
-    bool success{true};
-    uint64_t requested_quota_bytes{0};
-};
-YLT_REFL(HttpDefaultTenantQuotaResponse, success, requested_quota_bytes);
-
 tl::expected<std::string, ErrorCode> ParseAdminTenantId(
     coro_http::coro_http_request& req) {
     auto tenant_id_view = req.get_decode_query_value("tenant_id");
@@ -233,7 +231,7 @@ tl::expected<std::string, ErrorCode> ParseAdminTenantId(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     std::string tenant_id = NormalizeTenantId(std::string(tenant_id_view));
-    if (tenant_id.empty() || tenant_id.front() == '_') {
+    if (!IsValidTenantId(tenant_id)) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     return tenant_id;
@@ -402,6 +400,9 @@ std::string MasterAdminServer::BuildTenantQuotaMetricsText() const {
         << "# HELP mooncake_tenant_quota_committed_count Tenant committed "
            "object count\n"
         << "# TYPE mooncake_tenant_quota_committed_count gauge\n"
+        << "# HELP mooncake_tenant_quota_metadata_object_count Tenant "
+           "metadata object count\n"
+        << "# TYPE mooncake_tenant_quota_metadata_object_count gauge\n"
         << "# HELP mooncake_tenant_quota_over_quota Tenant over-quota flag\n"
         << "# TYPE mooncake_tenant_quota_over_quota gauge\n"
         << "# HELP mooncake_tenant_quota_explicit_policy Tenant explicit "
@@ -423,6 +424,9 @@ std::string MasterAdminServer::BuildTenantQuotaMetricsText() const {
                        << tenant << "\"} " << snapshot.reserved_bytes << "\n";
         tenant_metrics << "mooncake_tenant_quota_committed_count{tenant_id=\""
                        << tenant << "\"} " << snapshot.committed_count << "\n";
+        tenant_metrics
+            << "mooncake_tenant_quota_metadata_object_count{tenant_id=\""
+            << tenant << "\"} " << snapshot.metadata_object_count << "\n";
         tenant_metrics << "mooncake_tenant_quota_over_quota{tenant_id=\""
                        << tenant << "\"} " << (snapshot.over_quota ? 1 : 0)
                        << "\n";
@@ -556,6 +560,31 @@ void MasterAdminServer::HandleHaStatus(coro_http::coro_http_request&,
     resp.add_header("Content-Type", "text/plain; charset=utf-8");
     resp.set_status_and_content(coro_http::status_type::ok,
                                 ha::MasterRuntimeStateToString(snapshot.state));
+}
+
+struct HttpKvEventsStatusResponse {
+    bool enabled{false};
+    uint64_t published_batches{0};
+    uint64_t published_events{0};
+    uint64_t dropped_events{0};
+    uint64_t skipped_unparsed_keys{0};
+};
+YLT_REFL(HttpKvEventsStatusResponse, enabled, published_batches,
+         published_events, dropped_events, skipped_unparsed_keys);
+
+void MasterAdminServer::HandleKvEventsStatus(
+    coro_http::coro_http_request&, coro_http::coro_http_response& resp) {
+    WithActiveService(
+        resp, [&](const std::shared_ptr<WrappedMasterService>& service) {
+            const auto stats = service->GetKvEventStats();
+            HttpKvEventsStatusResponse payload;
+            payload.enabled = service->KvEventsEnabled();
+            payload.published_batches = stats.published_batches;
+            payload.published_events = stats.published_events;
+            payload.dropped_events = stats.dropped_events;
+            payload.skipped_unparsed_keys = stats.skipped_unparsed_keys;
+            WriteJsonResponse(resp, coro_http::status_type::ok, payload);
+        });
 }
 
 void MasterAdminServer::HandleQueryKey(coro_http::coro_http_request& req,
@@ -916,12 +945,30 @@ void MasterAdminServer::HandleSegmentStatus(
     });
 }
 
+struct HttpDiskReplicaInfo {
+    std::string file_path;
+    uint64_t object_size = 0;
+    YLT_REFL(HttpDiskReplicaInfo, file_path, object_size);
+};
+
+struct HttpLocalDiskReplicaInfo {
+    std::string client_id;
+    uint64_t object_size = 0;
+    std::string transport_endpoint;
+    YLT_REFL(HttpLocalDiskReplicaInfo, client_id, object_size,
+             transport_endpoint);
+};
+
 struct HttpBatchQueryKeyResult {
     bool ok{false};
     std::optional<std::string> error;
     std::optional<std::vector<AllocatedBuffer::Descriptor>> values;
+    std::optional<std::vector<HttpDiskReplicaInfo>> disk_values;
+    std::optional<std::vector<HttpLocalDiskReplicaInfo>> local_disk_values;
+    std::optional<std::vector<AllocatedBuffer::Descriptor>> nof_values;
 };
-YLT_REFL(HttpBatchQueryKeyResult, ok, error, values);
+YLT_REFL(HttpBatchQueryKeyResult, ok, error, values, disk_values,
+         local_disk_values, nof_values);
 
 struct HttpBatchQueryKeysResponse {
     bool success{false};
@@ -931,63 +978,81 @@ YLT_REFL(HttpBatchQueryKeysResponse, success, data);
 
 void MasterAdminServer::HandleBatchQueryKeys(
     coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
-    auto service = GetActiveService();
-    if (!service) {
-        WriteSimpleErrorResponse(resp,
-                                 coro_http::status_type::service_unavailable,
-                                 "service plane is not active");
-        return;
-    }
-
-    auto keys_str = req.get_query_value("keys");
-    std::vector<std::string> keys;
-    if (!keys_str.empty()) {
-        std::string_view sv(keys_str);
-        size_t pos = 0;
-        while ((pos = sv.find(',')) != std::string_view::npos) {
-            keys.emplace_back(sv.substr(0, pos));
-            sv.remove_prefix(pos + 1);
-        }
-        keys.emplace_back(sv);
-    }
-
-    if (keys.empty()) {
-        WriteSimpleErrorResponse(resp, coro_http::status_type::bad_request,
-                                 "No keys provided. Use ?keys=key1,key2,...");
-        return;
-    }
-
-    auto results = service->BatchGetReplicaList(keys, "default");
-    const size_t n = std::min(keys.size(), results.size());
-    HttpBatchQueryKeysResponse payload;
-    payload.success = true;
-
-    for (size_t i = 0; i < n; ++i) {
-        const auto& result = results[i];
-        HttpBatchQueryKeyResult item;
-        if (!result.has_value()) {
-            item.error = toString(result.error());
-            payload.data.emplace(keys[i], std::move(item));
-            continue;
+    WithActiveService(resp, [&](auto service) {
+        auto keys_str = req.get_decode_query_value("keys");
+        std::vector<std::string> keys;
+        if (!keys_str.empty()) {
+            std::string_view sv(keys_str);
+            size_t pos = 0;
+            while ((pos = sv.find(',')) != std::string_view::npos) {
+                keys.emplace_back(sv.substr(0, pos));
+                sv.remove_prefix(pos + 1);
+            }
+            keys.emplace_back(sv);
         }
 
-        item.ok = true;
-        item.values = std::vector<AllocatedBuffer::Descriptor>{};
-        for (const auto& replica : result.value().replicas) {
-            if (!replica.is_memory_replica()) {
+        if (keys.empty()) {
+            WriteSimpleErrorResponse(
+                resp, coro_http::status_type::bad_request,
+                "No keys provided. Use ?keys=key1,key2,...");
+            return;
+        }
+
+        auto results = service->BatchGetReplicaListForAdmin(keys, "default");
+        const size_t n = std::min(keys.size(), results.size());
+        HttpBatchQueryKeysResponse payload;
+        payload.success = true;
+
+        for (size_t i = 0; i < n; ++i) {
+            const auto& result = results[i];
+            HttpBatchQueryKeyResult item;
+            if (!result.has_value()) {
+                item.error = toString(result.error());
+                payload.data.emplace(keys[i], std::move(item));
                 continue;
             }
-            item.values->emplace_back(
-                replica.get_memory_descriptor().buffer_descriptor);
-        }
-        payload.data.emplace(keys[i], std::move(item));
-    }
 
-    if (results.size() != keys.size()) {
-        LOG(WARNING) << "BatchGetReplicaList size mismatch: keys="
-                     << keys.size() << " results=" << results.size();
-    }
-    WriteJsonResponse(resp, coro_http::status_type::ok, payload);
+            item.ok = true;
+            item.values = std::vector<AllocatedBuffer::Descriptor>{};
+            for (const auto& replica : result.value().replicas) {
+                if (replica.is_memory_replica()) {
+                    item.values->emplace_back(
+                        replica.get_memory_descriptor().buffer_descriptor);
+                } else if (replica.is_disk_replica()) {
+                    if (!item.disk_values.has_value()) {
+                        item.disk_values = std::vector<HttpDiskReplicaInfo>{};
+                    }
+                    auto& d = replica.get_disk_descriptor();
+                    item.disk_values->emplace_back(
+                        HttpDiskReplicaInfo{d.file_path, d.object_size});
+                } else if (replica.is_local_disk_replica()) {
+                    if (!item.local_disk_values.has_value()) {
+                        item.local_disk_values =
+                            std::vector<HttpLocalDiskReplicaInfo>{};
+                    }
+                    auto& d = replica.get_local_disk_descriptor();
+                    item.local_disk_values->emplace_back(
+                        HttpLocalDiskReplicaInfo{UuidToString(d.client_id),
+                                                 d.object_size,
+                                                 d.transport_endpoint});
+                } else if (replica.is_nof_replica()) {
+                    if (!item.nof_values.has_value()) {
+                        item.nof_values =
+                            std::vector<AllocatedBuffer::Descriptor>{};
+                    }
+                    item.nof_values->emplace_back(
+                        replica.get_nof_descriptor().buffer_descriptor);
+                }
+            }
+            payload.data.emplace(keys[i], std::move(item));
+        }
+
+        if (results.size() != keys.size()) {
+            LOG(WARNING) << "BatchGetReplicaListForAdmin size mismatch: keys="
+                         << keys.size() << " results=" << results.size();
+        }
+        WriteJsonResponse(resp, coro_http::status_type::ok, payload);
+    });
 }
 
 void MasterAdminServer::HandleGetTenantQuotas(
@@ -1092,45 +1157,6 @@ void MasterAdminServer::HandleDeleteTenantQuota(
     });
 }
 
-void MasterAdminServer::HandleGetDefaultTenantQuota(
-    coro_http::coro_http_request&, coro_http::coro_http_response& resp) {
-    WithActiveService(resp, [&](auto service) {
-        auto result = service->GetDefaultTenantQuotaPolicy();
-        if (!result.has_value()) {
-            WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
-                               result.error());
-            return;
-        }
-        WriteJsonResponse(resp, coro_http::status_type::ok,
-                          HttpDefaultTenantQuotaResponse{
-                              .requested_quota_bytes = result.value()});
-    });
-}
-
-void MasterAdminServer::HandleSetDefaultTenantQuota(
-    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
-    auto body_result = ParseQuotaPolicyBody(req);
-    if (!body_result.has_value()) {
-        WriteErrorResponse(resp, coro_http::status_type::bad_request,
-                           ErrorCode::INVALID_PARAMS, body_result.error());
-        return;
-    }
-
-    WithActiveService(resp, [&](auto service) {
-        auto result = service->SetDefaultTenantQuotaPolicy(
-            body_result->requested_quota_bytes);
-        if (!result.has_value()) {
-            WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
-                               result.error());
-            return;
-        }
-        WriteJsonResponse(
-            resp, coro_http::status_type::ok,
-            HttpDefaultTenantQuotaResponse{
-                .requested_quota_bytes = body_result->requested_quota_bytes});
-    });
-}
-
 void MasterAdminServer::RegisterHandler() {
     using namespace coro_http;
 
@@ -1154,6 +1180,11 @@ void MasterAdminServer::RegisterHandler() {
     http_server_.set_http_handler<GET>(
         "/ha_status", [this](coro_http_request& req, coro_http_response& resp) {
             HandleHaStatus(req, resp);
+        });
+    http_server_.set_http_handler<GET>(
+        "/kv_events/status",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleKvEventsStatus(req, resp);
         });
     http_server_.set_http_handler<GET>(
         "/leader", [this](coro_http_request& req, coro_http_response& resp) {
@@ -1218,16 +1249,6 @@ void MasterAdminServer::RegisterHandler() {
         "/api/v1/tenant_quotas",
         [this](coro_http_request& req, coro_http_response& resp) {
             HandleDeleteTenantQuota(req, resp);
-        });
-    http_server_.set_http_handler<GET>(
-        "/api/v1/tenant_quotas/default",
-        [this](coro_http_request& req, coro_http_response& resp) {
-            HandleGetDefaultTenantQuota(req, resp);
-        });
-    http_server_.set_http_handler<PUT>(
-        "/api/v1/tenant_quotas/default",
-        [this](coro_http_request& req, coro_http_response& resp) {
-            HandleSetDefaultTenantQuota(req, resp);
         });
     http_server_.set_http_handler<GET>(
         "/batch_query_keys",

@@ -55,11 +55,15 @@ struct TaskInfo {
     int xport_priority{0};        // transport priority (for fallback)
     int failover_count{0};        // number of failover attempts
     uint64_t device_mask{~0ULL};  // Device mask for quota allocation
+    std::string qp_pool;          // Named QP pool (RFC #2568 step 3), "" = none
     Request request;
     bool staging{false};
+    bool cancel_requested{false};
     TransferStatusEnum status{TransferStatusEnum::PENDING};
     volatile TransferStatusEnum staging_status{TransferStatusEnum::PENDING};
-    std::chrono::steady_clock::time_point start_time{};  // For latency tracking
+    std::chrono::steady_clock::time_point start_time{};     // Submit time
+    std::chrono::steady_clock::time_point dispatch_time{};  // Dispatch entry
+    std::chrono::steady_clock::time_point post_time{};      // Transport post
 };
 
 class TransferEngineImpl {
@@ -139,6 +143,8 @@ class TransferEngineImpl {
                           const std::vector<Request>& request_list,
                           const Notification& notifi);
 
+    Status cancelTransfer(BatchID batch_id, size_t task_id);
+
     Status sendNotification(SegmentID target_id, const Notification& notifi);
 
     Status receiveNotification(std::vector<Notification>& notifi_list);
@@ -154,6 +160,8 @@ class TransferEngineImpl {
     Status getTransferStatus(BatchID batch_id, TransferStatus& overall_status);
 
     Status progressBatch(BatchID batch_id, TransferStatus& overall_status);
+
+    Status getNicLoadStats(std::vector<NicLoadStats>& stats) const;
 
     Status waitTransferCompletion(BatchID batch_id);
 
@@ -244,6 +252,8 @@ class TransferEngineImpl {
 
     Status finishQueuedOwner(QueueOwnerId owner_id,
                              TransferStatusEnum terminal_status);
+
+    Status cancelQueuedOwner(QueueOwnerId owner_id);
 
     Status retireQueueForBatch(Batch* batch);
 

@@ -41,6 +41,17 @@ namespace mooncake {
 static bool MCIbRelaxedOrderingEnabled = false;
 static int MCIbRelaxedOrderingMode = 2;
 
+static std::string resolveBufferLocation(
+    const TransferMetadata::BufferDesc &buffer, uint64_t offset) {
+    std::string location = buffer.name;
+    SegmentsLocationInfo seg_info;
+    if (parseSegmentsLocation(buffer.name, seg_info)) {
+        location = resolveSegmentsLocation(seg_info, buffer.length,
+                                           offset - buffer.addr);
+    }
+    return location;
+}
+
 // Mode definition for MC_IB_PCI_RELAXED_ORDERING env.
 // 0 - disabled, 1 - enabled if supported, 2 - auto (default, same as 1 today).
 static int getIbRelaxedOrderingMode() {
@@ -239,8 +250,24 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         }
     }
 
+    // Export a single dma_buf fd for the buffer and import it into every NIC's
+    // PD below, closing it once after all registrations. One dma_buf object
+    // shared across NICs lets the GPU driver reserve a single BAR1 window for
+    // the buffer instead of one per NIC. Host memory yields an empty export and
+    // takes the plain ibv_reg_mr path. The fd must stay open across all
+    // registrations (each MR takes its own reference); see exportDmabuf().
+    DmabufExport dmabuf_exp;
+    if (!context_list_.empty()) {
+        int eret = RdmaContext::exportDmabuf(addr, dmabuf_exp);
+        if (eret != 0) {
+            LOG(ERROR) << "Failed to export dma_buf for addr=" << addr;
+            return eret;
+        }
+    }
+
     auto reg_start = std::chrono::steady_clock::now();
 
+    int reg_error = 0;
     if (use_parallel_reg) {
         std::vector<std::thread> reg_threads;
         reg_threads.reserve(context_list_.size());
@@ -248,10 +275,11 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         const int ar = access_rights;  // Local copy for lambda capture
 
         for (size_t i = 0; i < context_list_.size(); ++i) {
-            reg_threads.emplace_back([this, &ret_codes, i, addr, length, ar]() {
-                ret_codes[i] =
-                    context_list_[i]->registerMemoryRegion(addr, length, ar);
-            });
+            reg_threads.emplace_back(
+                [this, &ret_codes, &dmabuf_exp, i, addr, length, ar]() {
+                    ret_codes[i] = context_list_[i]->registerMemoryRegion(
+                        addr, length, ar, dmabuf_exp);
+                });
         }
 
         for (auto &thread : reg_threads) {
@@ -262,19 +290,30 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
             if (ret_codes[i] != 0) {
                 LOG(ERROR) << "Failed to register memory region with context "
                            << i;
-                return ret_codes[i];
+                reg_error = ret_codes[i];
+                break;
             }
         }
     } else {
         for (size_t i = 0; i < context_list_.size(); ++i) {
-            int ret = context_list_[i]->registerMemoryRegion(addr, length,
-                                                             access_rights);
+            int ret = context_list_[i]->registerMemoryRegion(
+                addr, length, access_rights, dmabuf_exp);
             if (ret) {
                 LOG(ERROR) << "Failed to register memory region with context "
                            << i;
-                return ret;
+                reg_error = ret;
+                break;
             }
         }
+    }
+
+    // Close the single dma_buf fd now that all NIC registrations are done.
+    // Each successful MR holds its own reference, so the underlying dma_buf
+    // (and its BAR1 window) stays alive until those MRs are deregistered.
+    RdmaContext::closeDmabufExport(dmabuf_exp);
+
+    if (reg_error != 0) {
+        return reg_error;
     }
 
     auto reg_end = std::chrono::steady_clock::now();
@@ -442,6 +481,7 @@ int RdmaTransport::registerLocalMemoryBatch(
                 LOG(WARNING)
                     << "RdmaTransport: Failed to register memory: addr "
                     << buffer.addr << " length " << buffer.length;
+                return ret;
             }
         }
     } else {
@@ -457,14 +497,18 @@ int RdmaTransport::registerLocalMemoryBatch(
                 }));
         }
 
+        int first_error = 0;
         for (size_t i = 0; i < buffer_list.size(); ++i) {
-            if (results[i].get()) {
+            int ret = results[i].get();
+            if (ret) {
                 LOG(WARNING)
                     << "RdmaTransport: Failed to register memory: addr "
                     << buffer_list[i].addr << " length "
                     << buffer_list[i].length;
+                if (!first_error) first_error = ret;
             }
         }
+        if (first_error) return first_error;
 #if defined(USE_CUDA)
     }  // Environ::Get().GetWithNvidiaPeermem()
 #endif
@@ -483,13 +527,17 @@ int RdmaTransport::unregisterLocalMemoryBatch(
             }));
     }
 
+    int first_error = 0;
     for (size_t i = 0; i < addr_list.size(); ++i) {
-        if (results[i].get())
+        int ret = results[i].get();
+        if (ret) {
             LOG(WARNING) << "RdmaTransport: Failed to unregister memory: addr "
                          << addr_list[i];
+            if (!first_error) first_error = ret;
+        }
     }
-
-    return metadata_->updateLocalSegmentDesc();
+    int metadata_ret = metadata_->updateLocalSegmentDesc();
+    return first_error ? first_error : metadata_ret;
 }
 
 Status RdmaTransport::submitTransfer(
@@ -506,7 +554,17 @@ Status RdmaTransport::submitTransfer(
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
     std::vector<TransferTask *> task_list;
-    for (auto &task : batch_desc.task_list) task_list.push_back(&task);
+    for (auto &request : entries) {
+        auto &task = batch_desc.task_list[task_id];
+        ++task_id;
+        task.batch_id = batch_id;
+#ifdef USE_ASCEND_HETEROGENEOUS
+        task.request = const_cast<TransferRequest *>(&request);
+#else
+        task.request = &request;
+#endif
+        task_list.push_back(&task);
+    }
     return submitTransferTask(task_list);
 }
 
@@ -551,6 +609,7 @@ Status RdmaTransport::submitTransferTask(
             slice->source_addr = (char *)request.source + offset;
             slice->length =
                 merge_final_slice ? request.length - offset : kBlockSize;
+            slice->source_location.clear();
             slice->opcode = request.opcode;
             slice->rdma.dest_addr = request.target_offset + offset;
             slice->rdma.retry_cnt = request.advise_retry_cnt;
@@ -565,9 +624,12 @@ Status RdmaTransport::submitTransferTask(
                 retry_cnt = request.advise_retry_cnt;
             bool found_device = false;
             if (request_buffer_id >= 0 && request_device_id >= 0) {
-                found_device = true;
-                buffer_id = request_buffer_id;
-                device_id = request_device_id;
+                auto &request_context = context_list_[request_device_id];
+                if (request_context && request_context->active()) {
+                    found_device = true;
+                    buffer_id = request_buffer_id;
+                    device_id = request_device_id;
+                }
             }
             while (retry_cnt < kMaxRetryCount && !found_device) {
                 if (selectDevice(local_segment_desc.get(),
@@ -607,6 +669,11 @@ Status RdmaTransport::submitTransferTask(
                 }
                 slice->rdma.source_lkey =
                     local_segment_desc->buffers[buffer_id].lkey[device_id];
+                if (globalConfig().log_rdma_slice_affinity) {
+                    slice->source_location = resolveBufferLocation(
+                        local_segment_desc->buffers[buffer_id],
+                        reinterpret_cast<uint64_t>(slice->source_addr));
+                }
                 slices_to_post[context].push_back(slice);
                 task.total_bytes += slice->length;
                 __sync_fetch_and_add(&task.slice_count, 1);
@@ -686,7 +753,11 @@ RdmaTransport::SegmentID RdmaTransport::getSegmentID(
 int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
                                           HandShakeDesc &local_desc) {
     auto local_nic_name = getNicNameFromNicPath(peer_desc.peer_nic_path);
-    if (local_nic_name.empty()) return ERR_INVALID_ARGUMENT;
+    if (local_nic_name.empty()) {
+        local_desc.reply_msg =
+            "Invalid peer_nic_path in handshake: " + peer_desc.peer_nic_path;
+        return ERR_INVALID_ARGUMENT;
+    }
 
     std::shared_ptr<RdmaContext> context;
     int index = 0;
@@ -697,12 +768,43 @@ int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
         }
         index++;
     }
-    if (!context) return ERR_INVALID_ARGUMENT;
+    if (!context) {
+        local_desc.reply_msg =
+            "Local RDMA context not found for handshake NIC: " + local_nic_name;
+        return ERR_INVALID_ARGUMENT;
+    }
 
     // Use existing endpoint or create new one.
     auto endpoint = context->endpoint(peer_desc.local_nic_path);
-    if (!endpoint) return ERR_ENDPOINT;
-    return endpoint->setupConnectionsByPassive(peer_desc, local_desc);
+    if (!endpoint) {
+        local_desc.reply_msg = "Local RDMA endpoint unavailable for " +
+                               local_nic_name + " <- " +
+                               peer_desc.local_nic_path;
+        return ERR_ENDPOINT;
+    }
+    int ret = endpoint->setupConnectionsByPassive(peer_desc, local_desc);
+    if (endpoint->retired()) {
+        context->deleteEndpointByPtr(endpoint.get());
+        if (ret == ERR_ENDPOINT) {
+            // setupConnectionsByPassive() can retire a stale endpoint before
+            // creating a usable passive connection for this incoming handshake.
+            // That is a local endpoint-store race, not necessarily a peer
+            // handshake failure, so absorb it once with a fresh endpoint.
+            local_desc = HandShakeDesc();
+            endpoint = context->endpoint(peer_desc.local_nic_path);
+            if (!endpoint) {
+                local_desc.reply_msg =
+                    "Fresh local RDMA endpoint unavailable after retiring "
+                    "stale endpoint for " +
+                    local_nic_name + " <- " + peer_desc.local_nic_path;
+                return ERR_ENDPOINT;
+            }
+            ret = endpoint->setupConnectionsByPassive(peer_desc, local_desc);
+            if (endpoint->retired())
+                context->deleteEndpointByPtr(endpoint.get());
+        }
+    }
+    return ret;
 }
 
 int RdmaTransport::initializeRdmaResources() {
@@ -748,6 +850,17 @@ int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
          ++buffer_id) {
         const auto &buffer = buffers[buffer_id];
 
+#ifdef ENABLE_MULTI_PROTOCOL
+        // The RDMA transport must only bind buffers registered under the rdma
+        // protocol. Device (hip) buffers alias the same GPU addresses but carry
+        // no lkey/rkey, so picking one yields an empty-lkey out-of-bounds read
+        // in the submit path. The !empty() guard leaves legacy single-protocol
+        // descriptors (empty protocol field) unaffected.
+        if (!buffer.protocol.empty() && buffer.protocol != "rdma") {
+            continue;
+        }
+#endif
+
         // Check if offset is within buffer range
         if (offset < buffer.addr || length > buffer.length ||
             offset - buffer.addr > buffer.length - length) {
@@ -771,6 +884,39 @@ int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
                                        kWildcardLocation, retry_count)
                                  : desc->topology.selectDevice(
                                        kWildcardLocation, hint, retry_count);
+        if (device_id >= 0) return 0;
+    }
+    return ERR_ADDRESS_NOT_REGISTERED;
+}
+
+int RdmaTransport::selectDeviceByLocalHca(SegmentDesc *desc, uint64_t offset,
+                                          size_t length,
+                                          std::string_view local_hca,
+                                          int &buffer_id, int &device_id,
+                                          int retry_count) {
+    if (desc == nullptr) return ERR_ADDRESS_NOT_REGISTERED;
+    const auto &buffers = desc->buffers;
+    for (buffer_id = 0; buffer_id < static_cast<int>(buffers.size());
+         ++buffer_id) {
+        const auto &buffer = buffers[buffer_id];
+
+#ifdef ENABLE_MULTI_PROTOCOL
+        if (!buffer.protocol.empty() && buffer.protocol != "rdma") {
+            continue;
+        }
+#endif
+
+        if (offset < buffer.addr || length > buffer.length ||
+            offset - buffer.addr > buffer.length - length) {
+            continue;
+        }
+
+        const auto location = resolveBufferLocation(buffer, offset);
+        device_id = desc->topology.selectDeviceByLocalHca(location, local_hca,
+                                                          retry_count);
+        if (device_id >= 0) return 0;
+        device_id = desc->topology.selectDeviceByLocalHca(
+            kWildcardLocation, local_hca, retry_count);
         if (device_id >= 0) return 0;
     }
     return ERR_ADDRESS_NOT_REGISTERED;

@@ -290,6 +290,19 @@ void TransferExecutorBase::recordConnectedSegment(size_t engine_idx,
     connected_segments_[engine_idx].insert(remote);
 }
 
+void TransferExecutorBase::forgetConnectedSegment(size_t engine_idx,
+                                                  const std::string& remote) {
+    std::lock_guard<std::mutex> lock(connection_mutex_);
+    auto it = connected_segments_.find(engine_idx);
+    if (it == connected_segments_.end()) {
+        return;
+    }
+    it->second.erase(remote);
+    if (it->second.empty()) {
+        connected_segments_.erase(it);
+    }
+}
+
 int TransferExecutorBase::disconnect(size_t engine_idx,
                                      const std::string& target_adxl_engine_name,
                                      int32_t timeout_in_millis) {

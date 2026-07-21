@@ -48,7 +48,7 @@ struct VecInt<16> {
 };
 
 // ---- TMA / mbarrier helpers (CUDA only) ----
-#ifndef MOONCAKE_EP_USE_MUSA
+#if !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
 
 __device__ __forceinline__ void fence_view_async_shared() {
     asm volatile("fence.proxy.async.shared::cta; \n" ::);
@@ -136,7 +136,7 @@ __device__ __forceinline__ void tma_store_wait() {
     asm volatile("cp.async.bulk.wait_group.read %0;" ::"n"(N) : "memory");
 }
 
-#endif  // MOONCAKE_EP_USE_MUSA
+#endif  // !MOONCAKE_EP_USE_MUSA && !MOONCAKE_EP_USE_MACA
 
 template <typename dtype_t>
 __host__ __device__ dtype_t cell_div(dtype_t a, dtype_t b) {

@@ -37,6 +37,7 @@
 #include "common.h"
 #include "rdma_gid_probe.h"
 #include "rdma_transport.h"
+#include "transport/rdma_transport/connect_pause_tracker.h"
 #include "transport/transport.h"
 
 namespace mooncake {
@@ -59,10 +60,25 @@ struct GidSelectionSnapshot {
     int gid_index = -1;
 };
 
+enum class GidRefreshResult {
+    UNCHANGED = 0,
+    CHANGED = 1,
+    FAILED = 2,
+};
+
 struct RdmaCq {
     RdmaCq() : native(nullptr), outstanding(0) {}
+    RdmaCq(const RdmaCq &) = delete;
+    RdmaCq &operator=(const RdmaCq &) = delete;
+    RdmaCq(RdmaCq &&other) noexcept
+        : native(other.native),
+          outstanding(other.outstanding.load(std::memory_order_relaxed)) {
+        other.native = nullptr;
+    }
+    RdmaCq &operator=(RdmaCq &&) = delete;
+
     ibv_cq *native;
-    volatile int outstanding;
+    std::atomic<int> outstanding;
 };
 
 struct MemoryRegionMeta {
@@ -72,11 +88,25 @@ struct MemoryRegionMeta {
     struct ibv_mr *mr;
 };
 
+// A dma_buf handle exported once for a buffer and shared across every NIC's
+// registration of that buffer. Exporting a single fd (instead of one per NIC)
+// collapses the per-NIC dma_buf objects into one kernel object, so the GPU
+// driver reserves a single BAR1 window for the buffer rather than one window
+// per NIC. Host memory (and the nvidia-peermem path) yields kHostReg with no
+// fd, taking the plain ibv_reg_mr path.
+struct DmabufExport {
+    enum class Method { kHostReg, kDmabufReg };
+    Method method = Method::kHostReg;
+    int fd = -1;          // live dma_buf fd; -1 when not applicable
+    uint64_t offset = 0;  // offset of addr within the exported allocation
+};
+
 // RdmaContext represents the set of resources controlled by each local NIC,
 // including Memory Region, CQ, EndPoint (QPs), etc.
 class RdmaContext {
    public:
     friend class RdmaContextTestPeer;
+    friend class WorkerPool;
 
     RdmaContext(RdmaTransport &engine, const std::string &device_name);
 
@@ -93,6 +123,26 @@ class RdmaContext {
     // Memory Region Management
     int registerMemoryRegion(void *addr, size_t length, int access);
 
+    // Shared-fd variant: the caller exports a single dma_buf fd for the buffer
+    // via exportDmabuf(), passes the same handle to every NIC's registration,
+    // then closes the fd once via closeDmabufExport() AFTER all registrations
+    // have completed. This keeps one dma_buf object alive across all NICs so
+    // the GPU driver reserves a single BAR1 window for the buffer.
+    int registerMemoryRegion(void *addr, size_t length, int access,
+                             const DmabufExport &exp);
+
+    // Exports a single dma_buf fd for the allocation backing addr. GPU device
+    // memory yields kDmabufReg with a live fd; host memory and the
+    // nvidia-peermem path yield kHostReg with no fd. Any fd placed in out.fd
+    // MUST be closed by the caller (via closeDmabufExport) AFTER every
+    // registerMemoryRegion() call consuming it has returned — each successful
+    // registration takes its own reference, so closing earlier would invalidate
+    // the fd for the remaining NICs.
+    static int exportDmabuf(void *addr, DmabufExport &out);
+
+    // Closes the fd held by a DmabufExport, if any. Idempotent.
+    static void closeDmabufExport(DmabufExport &exp);
+
     int unregisterMemoryRegion(void *addr);
 
     int preTouchMemory(void *addr, size_t length);
@@ -103,6 +153,7 @@ class RdmaContext {
 
    private:
     int registerMemoryRegionInternal(void *addr, size_t length, int access,
+                                     const DmabufExport &exp,
                                      MemoryRegionMeta &mrMeta);
 
     using MemoryRegionMap = std::map<uintptr_t, MemoryRegionMeta>;
@@ -113,9 +164,11 @@ class RdmaContext {
         uintptr_t addr) const;
 
    public:
-    bool active() const { return active_; }
+    bool active() const { return active_.load(std::memory_order_acquire); }
 
-    void set_active(bool flag) { active_ = flag; }
+    void set_active(bool flag) {
+        active_.store(flag, std::memory_order_release);
+    }
 
    public:
     // EndPoint Management
@@ -126,6 +179,16 @@ class RdmaContext {
 
     int deleteEndpoint(const std::string &peer_nic_path);
     int deleteEndpointByPtr(const RdmaEndPoint *endpoint_ptr);
+
+    // Active-connect circuit-breaker. After deleteEndpointByPtr tears an
+    // endpoint down, active reconnection to that peer's address is paused for
+    // globalConfig().conn_pause_ttl_ms so the CQ poller isn't blocked
+    // re-handshaking a likely-gone peer. Entries expire (lazily on
+    // isConnectPaused, and via pruneConnectPause from the monitor tick). All
+    // no-ops when the TTL is 0. Keyed by peer server name (the peer IP).
+    void pauseConnect(const std::string &peer_nic_path);
+    bool isConnectPaused(const std::string &peer_nic_path);
+    void pruneConnectPause();
 
     // Drain the endpoint store's waiting list. Safe to call on any thread;
     // intended to be invoked periodically from monitorWorker so reclaim is
@@ -170,6 +233,12 @@ class RdmaContext {
         const std::vector<AutoGidSelectionIdentity> &tried_selections = {},
         std::string *previous_gid = nullptr, std::string *next_gid = nullptr);
 
+    // Refresh the runtime GID after IBV_EVENT_GID_CHANGE. Auto-GID mode uses
+    // the same candidate filtering/ranking as initial device open; explicit
+    // MC_GID_INDEX keeps the configured index and refreshes only its value.
+    GidRefreshResult refreshCurrentGid(std::string *previous_gid = nullptr,
+                                       std::string *next_gid = nullptr);
+
     ibv_context *context() const { return context_; }
 
     RdmaTransport &engine() const { return engine_; }
@@ -181,6 +250,7 @@ class RdmaContext {
     uint8_t numLagPorts() const { return num_lag_ports_; }
 
     int activeSpeed() const { return active_speed_; }
+    int activeWidth() const { return active_width_; }
 
     ibv_mtu activeMTU() const { return active_mtu_; }
 
@@ -192,7 +262,7 @@ class RdmaContext {
 
     ibv_cq *cq();
 
-    volatile int *cqOutstandingCount(int cq_index) {
+    std::atomic<int> *cqOutstandingCount(int cq_index) {
         return &cq_list_[cq_index].outstanding;
     }
 
@@ -216,6 +286,11 @@ class RdmaContext {
    public:
     int submitPostSend(const std::vector<Transport::Slice *> &slice_list);
 
+    void trackPostedSlices(const std::vector<Transport::Slice *> &slice_list,
+                           size_t first, size_t count);
+    void untrackPostedSlices(const std::vector<Transport::Slice *> &slice_list,
+                             size_t first, size_t count);
+
    private:
     const std::string device_name_;
     RdmaTransport &engine_;
@@ -232,6 +307,7 @@ class RdmaContext {
     uint16_t lid_ = 0;
     int gid_index_ = -1;
     int active_speed_ = -1;
+    int active_width_ = 1;
     ibv_mtu active_mtu_;
     uint8_t num_lag_ports_ = 0;  // 0/1 = not in LAG; ≥2 = LAG active
     ibv_gid gid_;
@@ -245,6 +321,9 @@ class RdmaContext {
 
     std::shared_ptr<EndpointStore> endpoint_store_;
 
+    // Active-connect circuit-breaker (keyed by peer server name).
+    ConnectPauseTracker connect_pause_;
+
     std::vector<std::thread> background_thread_;
     std::atomic<bool> threads_running_;
 
@@ -254,7 +333,7 @@ class RdmaContext {
 
     std::shared_ptr<WorkerPool> worker_pool_;
 
-    volatile bool active_;
+    std::atomic<bool> active_;
 };
 
 }  // namespace mooncake

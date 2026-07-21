@@ -85,6 +85,12 @@ class Transport {
         size_t transferred_bytes;
     };
 
+    struct NicLoadStats {
+        std::string device_name;
+        uint64_t inflight_bytes{0};
+        double ewma_bandwidth_bps{0.0};
+    };
+
     struct BatchDesc;
     struct TransferTask;
 
@@ -113,11 +119,12 @@ class Transport {
         TransferRequest::OpCode opcode;
         SegmentID target_id;
         std::string peer_nic_path;
+        std::string source_location;
         SliceStatus status;
         TransferTask *task;
-        // EFA's libfabric MR keys are 64-bit (fi_mr_key()); RDMA verbs keys
+        // EFA/CXI's libfabric MR keys are 64-bit (fi_mr_key()); RDMA verbs keys
         // are 32-bit. Use a scoped alias so the width is defined in one place.
-#ifdef USE_EFA
+#if defined(USE_EFA) || defined(USE_CXI)
         using mr_key_t = uint64_t;
 #else
         using mr_key_t = uint32_t;
@@ -132,7 +139,7 @@ class Transport {
                 mr_key_t dest_rkey;
                 int lkey_index;
                 int rkey_index;
-                volatile int *qp_depth;
+                std::atomic<int> *qp_depth;
                 uint32_t retry_cnt;
                 uint32_t max_retry_cnt;
                 RdmaEndPoint *endpoint;  // Endpoint used for this transfer

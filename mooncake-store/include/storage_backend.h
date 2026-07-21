@@ -2,18 +2,21 @@
 
 #include <glog/logging.h>
 
+#include <array>
 #include <atomic>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "file_interface.h"
 #include "mutex.h"
-#include "offset_allocator/offset_allocator.hpp"
+#include "offset_allocator/offset_allocator.h"
 #include "types.h"
 
 namespace mooncake {
@@ -200,6 +203,44 @@ struct BucketBackendConfig {
     static BucketBackendConfig FromEnvironment();
 };
 
+enum class OffsetEvictionPolicy {
+    NONE,  // No eviction
+    FIFO,  // Evict oldest key first (by insertion order)
+    LRU,   // Approximate LRU via cross-shard sampling (phase 2)
+};
+
+struct OffsetAllocatorBackendConfig {
+    OffsetEvictionPolicy eviction_policy = OffsetEvictionPolicy::NONE;
+
+    // Watermark thresholds: eviction triggers when total_size_ exceeds high,
+    // drives down to low. 0 = auto-resolved in Init() from ratios.
+    int64_t high_watermark_bytes = 0;
+    int64_t low_watermark_bytes = 0;
+    double high_ratio = 0.90;
+    double low_ratio = 0.80;
+
+    // Key-count watermarks (symmetric with byte watermarks).
+    // high triggers eviction, drives down to low.
+    int64_t high_watermark_keys = 0;
+    int64_t low_watermark_keys = 0;
+    double keys_high_ratio = 0.95;
+    double keys_low_ratio = 0.90;
+
+    // Eviction caps
+    size_t max_evict_per_offload = 4096;
+    size_t fallback_evict_batch = 16;
+
+    // Allocator node capacity override.
+    // 0 = auto-derived from capacity_ / kMinObjectSize (capped at RAM budget).
+    // Must be <= UINT32_MAX (OffsetAllocator::create takes uint32
+    // max_capacity).
+    int64_t max_capacity_nodes = 0;
+
+    bool Validate() const;
+
+    static OffsetAllocatorBackendConfig FromEnvironment();
+};
+
 struct FileStorageConfig {
     // type of the storage backend
     StorageBackendType storage_backend_type = StorageBackendType::kBucket;
@@ -229,6 +270,12 @@ struct FileStorageConfig {
     // Use io_uring for file I/O instead of POSIX pread/pwrite
     bool use_uring = false;
 
+    // Proactively evict local disk objects from the heartbeat thread once
+    // backend usage crosses the high watermark.
+    bool enable_disk_watermark_eviction = true;
+    double disk_eviction_high_watermark_ratio = 0.90;
+    double disk_eviction_low_watermark_ratio = 0.80;
+
     // Validates the configuration for correctness and consistency
     bool Validate() const;
 
@@ -250,6 +297,9 @@ class StorageBackendInterface {
    public:
     StorageBackendInterface(const FileStorageConfig& file_storage_config);
 
+    using EvictionHandler = std::function<tl::expected<void, ErrorCode>(
+        const std::vector<std::string>& evicted_keys)>;
+
     virtual tl::expected<void, ErrorCode> Init() = 0;
 
     virtual tl::expected<int64_t, ErrorCode> BatchOffload(
@@ -257,8 +307,7 @@ class StorageBackendInterface {
         std::function<ErrorCode(const std::vector<std::string>& keys,
                                 std::vector<StorageObjectMetadata>& metadatas)>
             complete_handler,
-        std::function<void(const std::vector<std::string>& evicted_keys)>
-            eviction_handler = nullptr) = 0;
+        EvictionHandler eviction_handler = nullptr) = 0;
 
     virtual tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batched_slices) = 0;
@@ -284,6 +333,13 @@ class StorageBackendInterface {
     virtual void SetTestFailurePredicate(
         std::function<bool(const std::string& key)> /* predicate */) {
         // Default: no-op (no test failures injected)
+    }
+
+    virtual tl::expected<std::vector<std::string>, ErrorCode>
+    EvictAboveDiskWatermark(double /* high_watermark_ratio */,
+                            double /* low_watermark_ratio */,
+                            EvictionHandler /* eviction_handler */ = nullptr) {
+        return std::vector<std::string>{};
     }
 
     FileStorageConfig file_storage_config_;
@@ -384,7 +440,8 @@ class StorageBackend {
      */
     tl::expected<std::vector<std::string>, ErrorCode> StoreObject(
         const std::string& path, const std::vector<Slice>& slices,
-        const std::string& key = "");
+        const std::string& key = "",
+        StorageBackendInterface::EvictionHandler eviction_handler = nullptr);
 
     /**
      * @brief Stores an object from a string
@@ -395,7 +452,8 @@ class StorageBackend {
      */
     tl::expected<std::vector<std::string>, ErrorCode> StoreObject(
         const std::string& path, const std::string& str,
-        const std::string& key = "");
+        const std::string& key = "",
+        StorageBackendInterface::EvictionHandler eviction_handler = nullptr);
 
     /**
      * @brief Stores an object from a span of data
@@ -406,7 +464,14 @@ class StorageBackend {
      */
     tl::expected<std::vector<std::string>, ErrorCode> StoreObject(
         const std::string& path, std::span<const char> data,
-        const std::string& key = "");
+        const std::string& key = "",
+        StorageBackendInterface::EvictionHandler eviction_handler = nullptr);
+
+    tl::expected<std::vector<std::string>, ErrorCode> EvictAboveDiskWatermark(
+        double high_watermark_ratio, double low_watermark_ratio,
+        StorageBackendInterface::EvictionHandler eviction_handler = nullptr);
+
+    void UpdateFileRecordKey(const std::string& path, const std::string& key);
 
     /**
      * @brief Loads an object into slices
@@ -464,8 +529,11 @@ class StorageBackend {
     std::list<FileRecord> file_write_queue_;
     std::unordered_map<std::string, std::list<FileRecord>::iterator>
         file_queue_map_;
+    std::unordered_set<std::string> pending_eviction_paths_;
     mutable std::shared_mutex
         file_queue_mutex_;  // Mutex to protect file queue operations
+    static constexpr size_t kFilePathLockCount = 64;
+    std::array<Mutex, kFilePathLockCount> file_path_mutexes_;
 
     // Storage space tracking variables
     mutable std::shared_mutex
@@ -497,6 +565,12 @@ class StorageBackend {
      */
     FileRecord EvictFile();
 
+    FileRecord PopFileToEvictByFIFO();
+
+    void RestoreFileToWriteQueueFront(const FileRecord& record);
+
+    tl::expected<void, ErrorCode> DeleteEvictedFile(const FileRecord& record);
+
     /**
      * @brief Add file to write queue for FIFO tracking
      * @param path Path of the file to add to queue
@@ -519,13 +593,6 @@ class StorageBackend {
     bool CheckDiskSpace(size_t required_size);
 
     /**
-     * @brief Select a file to evict based on FIFO order (earliest written
-     * first)
-     * @return The file to evict, or empty structure if no file found
-     */
-    FileRecord SelectFileToEvictByFIFO();
-
-    /**
      * @brief Ensures that a specified amount of disk space is available,
      * performing evictions if necessary.
      *
@@ -536,7 +603,8 @@ class StorageBackend {
      *         attempting evictions up to the maximum attempt limit.
      */
     tl::expected<std::vector<std::string>, ErrorCode> EnsureDiskSpace(
-        size_t required_size);
+        size_t required_size,
+        StorageBackendInterface::EvictionHandler eviction_handler = nullptr);
 
     /**
      * @brief Releases a specified amount of disk space and updates internal
@@ -563,6 +631,10 @@ class StorageBackend {
      * @return true if eviction is enabled, false otherwise.
      */
     bool IsEvictionEnabled() const;
+
+    Mutex& GetFilePathMutex(const std::string& path);
+
+    bool IsFilePendingEviction(const std::string& path) const;
 
     /**
      * @brief Helper: Creates a file for writing and handles errors
@@ -628,8 +700,7 @@ class StorageBackendAdaptor : public StorageBackendInterface {
         std::function<ErrorCode(const std::vector<std::string>& keys,
                                 std::vector<StorageObjectMetadata>& metadatas)>
             complete_handler,
-        std::function<void(const std::vector<std::string>& evicted_keys)>
-            eviction_handler = nullptr) override;
+        EvictionHandler eviction_handler = nullptr) override;
 
     tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batched_slices) override;
@@ -650,6 +721,10 @@ class StorageBackendAdaptor : public StorageBackendInterface {
         std::function<bool(const std::string& key)> predicate) override {
         test_failure_predicate_ = std::move(predicate);
     }
+
+    tl::expected<std::vector<std::string>, ErrorCode> EvictAboveDiskWatermark(
+        double high_watermark_ratio, double low_watermark_ratio,
+        EvictionHandler eviction_handler = nullptr) override;
 
    private:
     const FilePerKeyConfig file_per_key_config_;
@@ -703,8 +778,7 @@ class BucketStorageBackend : public StorageBackendInterface {
         std::function<ErrorCode(const std::vector<std::string>& keys,
                                 std::vector<StorageObjectMetadata>& metadatas)>
             complete_handler,
-        std::function<void(const std::vector<std::string>& evicted_keys)>
-            eviction_handler = nullptr) override;
+        EvictionHandler eviction_handler = nullptr) override;
 
     /**
      * @brief Retrieves metadata for multiple objects in a single batch
@@ -835,6 +909,10 @@ class BucketStorageBackend : public StorageBackendInterface {
      */
     tl::expected<void, ErrorCode> DeleteBucket(int64_t bucket_id);
 
+    tl::expected<std::vector<std::string>, ErrorCode> EvictAboveDiskWatermark(
+        double high_watermark_ratio, double low_watermark_ratio,
+        EvictionHandler eviction_handler = nullptr) override;
+
    private:
     tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode> BuildBucket(
         int64_t bucket_id,
@@ -874,20 +952,38 @@ class BucketStorageBackend : public StorageBackendInterface {
     tl::expected<bool, ErrorCode> HasNext();
 
     /**
-     * @brief Cleanup orphaned bucket files (data + metadata) for a given bucket
-     * ID. Called when BatchOffload fails due to duplicate keys after files were
-     * written.
+     * @brief Remove any remaining data and metadata files for a bucket.
+     * Used by write rollback and startup recovery of incomplete buckets.
      * @param bucket_id The bucket ID whose files should be deleted.
      */
     void CleanupOrphanedBucket(int64_t bucket_id);
 
+    /**
+     * @brief Rollback a committed bucket from the local index when
+     * NotifyOffloadSuccess fails after local commit. Removes keys from
+     * object_bucket_map_, removes the bucket from buckets_ and lru_index_,
+     * waits for inflight reads to drain, then cleans up on-disk files.
+     *
+     * Called from BatchOffload when complete_handler fails after the local
+     * index has already been committed.
+     *
+     * @param bucket_id The bucket ID to roll back.
+     * @param keys The keys that were committed.
+     */
+    void RollbackCommittedBucket(int64_t bucket_id,
+                                 const std::vector<std::string>& keys);
+
     // Holds eviction state between PrepareEviction and FinalizeEviction.
     // PrepareEviction removes buckets from metadata maps and returns this.
-    // FinalizeEviction waits for in-flight reads and deletes the files.
+    // FinalizeEviction removes persisted metadata, waits for in-flight reads,
+    // and then deletes the data files.
     struct PendingEviction {
         std::vector<std::string> keys;  // All keys in evicted buckets
         std::vector<std::pair<int64_t, std::shared_ptr<BucketMetadata>>>
             buckets;  // (bucket_id, metadata) for file deletion
+        std::vector<std::string> write_keys;
+        int64_t evicted_size = 0;
+        int64_t write_size = 0;
     };
 
     /**
@@ -898,7 +994,18 @@ class BucketStorageBackend : public StorageBackendInterface {
      * @param required_size Size of the incoming bucket to be written.
      * @return PendingEviction with all keys and bucket metadata removed.
      */
-    PendingEviction PrepareEviction(int64_t required_size);
+    tl::expected<PendingEviction, ErrorCode> PrepareEviction(
+        int64_t required_size, const std::vector<std::string>& write_keys = {});
+
+    void RestorePreparedEviction(PendingEviction&& pending);
+
+    void RestorePreparedEvictionLocked(PendingEviction&& pending);
+
+    void CommitPreparedEviction(const PendingEviction& pending);
+
+    void ReleasePreparedWrite(const PendingEviction& pending);
+
+    void ReleasePreparedWriteLocked(const PendingEviction& pending);
 
     /**
      * @brief Select the next bucket to evict according to the configured
@@ -910,12 +1017,16 @@ class BucketStorageBackend : public StorageBackendInterface {
     SelectEvictionCandidate();
 
     /**
-     * @brief Phase 2 of eviction: wait for in-flight reads on each evicted
-     * bucket to drain, then delete the data and metadata files.
+     * @brief Phase 2 of eviction: delete persisted metadata for each evicted
+     * bucket, wait for in-flight reads to drain, then delete the data file.
+     * When metadata removal succeeds, doing it first prevents a later read
+     * timeout or data-file deletion failure from leaving a bucket that Init()
+     * could recover.
      * Must be called AFTER master has been notified via eviction_handler.
      * @param pending The result of a prior PrepareEviction call.
      */
-    void FinalizeEviction(const PendingEviction& pending);
+    tl::expected<void, ErrorCode> FinalizeEviction(
+        const PendingEviction& pending);
 
    public:
     /**
@@ -963,6 +1074,10 @@ class BucketStorageBackend : public StorageBackendInterface {
     int64_t total_size_ GUARDED_BY(mutex_) = 0;
     std::unordered_map<std::string, StorageObjectMetadata> GUARDED_BY(mutex_)
         object_bucket_map_;
+    std::unordered_set<std::string> GUARDED_BY(mutex_) pending_eviction_keys_;
+    std::unordered_set<std::string> GUARDED_BY(mutex_) pending_write_keys_;
+    int64_t pending_eviction_size_ GUARDED_BY(mutex_) = 0;
+    int64_t pending_write_size_ GUARDED_BY(mutex_) = 0;
     std::map<int64_t, std::shared_ptr<BucketMetadata>> GUARDED_BY(
         mutex_) buckets_;
     // LRU eviction index: ordered set of {last_access_ns_, bucket_id}.
@@ -992,7 +1107,8 @@ class BucketStorageBackend : public StorageBackendInterface {
 class OffsetAllocatorStorageBackend : public StorageBackendInterface {
    public:
     OffsetAllocatorStorageBackend(
-        const FileStorageConfig& file_storage_config_);
+        const FileStorageConfig& file_storage_config_,
+        const OffsetAllocatorBackendConfig& offset_backend_config = {});
 
     /**
      * @brief Initializes the offset allocator storage backend.
@@ -1015,8 +1131,7 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
         std::function<ErrorCode(const std::vector<std::string>& keys,
                                 std::vector<StorageObjectMetadata>& metadatas)>
             complete_handler,
-        std::function<void(const std::vector<std::string>& evicted_keys)>
-            eviction_handler = nullptr) override;
+        EvictionHandler eviction_handler = nullptr) override;
 
     /**
      * @brief Loads data for multiple objects in a batch operation.
@@ -1060,6 +1175,15 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     void SetTestFailurePredicate(
         std::function<bool(const std::string& key)> predicate) override {
         test_failure_predicate_ = std::move(predicate);
+    }
+
+    // Returns the number of keys skipped after fallback eviction
+    // could not make enough room (fragmentation, extents pinned by
+    // in-flight reads, or allocator node exhaustion).  Monotonically
+    // increasing; useful for distinguishing "watermark working" from
+    // "thrashing but unable to free space".
+    int64_t GetEvictionSkips() const {
+        return eviction_skips_.load(std::memory_order_relaxed);
     }
 
    private:
@@ -1132,12 +1256,25 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
 
         // Refcounted handle keeps physical extent alive during reads
         AllocationPtr allocation;
+
+        // Monotonic insertion sequence number. Points back to the slot in
+        // fifo_index_ (seq -> key). Used during eviction to detect stale
+        // index entries (lazy-repair) and to remove old slots on overwrite.
+        uint64_t fifo_seq = 0;
+
         ObjectEntry(uint64_t off, uint32_t total, uint32_t val,
-                    AllocationPtr alloc_ptr)
+                    AllocationPtr alloc_ptr, uint64_t seq = 0)
             : offset(off),
               total_size(total),
               value_size(val),
-              allocation(std::move(alloc_ptr)) {}
+              allocation(std::move(alloc_ptr)),
+              fifo_seq(seq) {}
+    };
+
+    // Keeps evicted metadata and allocation handles alive until the master
+    // accepts the replica-removal notification.
+    struct PendingEviction {
+        std::vector<std::pair<std::string, ObjectEntry>> objects;
     };
 
     // Returns full path to data file: {storage_path_}/kv_cache.data
@@ -1200,6 +1337,48 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     // Total number of keys, updated atomically (avoids locking all shards for
     // counting)
     std::atomic<int64_t> total_keys_{0};
+
+    // ===== Eviction-related members =====
+    OffsetAllocatorBackendConfig cfg_;
+
+    // Counter for keys skipped due to fallback eviction exhaustion.
+    // See GetEvictionSkips() for the public accessor.
+    std::atomic<int64_t> eviction_skips_{0};
+
+    // Mutex protecting fifo_index_ and insert_seq_. Must be acquired BEFORE
+    // any shard mutex (shards_[i].mutex) when both are held.
+    mutable Mutex eviction_mutex_;
+
+    // Global FIFO index: insertion sequence number -> key.
+    // begin() = oldest key, the default eviction victim.
+    // Entries allowed to be stale; lazy-repair at eviction time.
+    std::map<uint64_t, std::string> fifo_index_;
+
+    // Monotonic sequence number source for fifo_index_.
+    std::atomic<uint64_t> insert_seq_{0};
+
+    // Resolved watermark thresholds (bytes), computed in Init().
+    int64_t high_watermark_bytes_ = 0;
+    int64_t low_watermark_bytes_ = 0;
+
+    // Resolved watermark thresholds (key count), computed in Init().
+    int64_t high_watermark_keys_ = 0;
+    int64_t low_watermark_keys_ = 0;
+
+    // Evict keys from the FIFO index until both byte and key-count watermarks
+    // are satisfied (or until the eviction cap is reached). Allocations remain
+    // pinned in out_pending until notification succeeds.
+    void EvictToMakeRoom(int64_t required_bytes, size_t min_victims,
+                         const std::unordered_set<std::string>& batch_keys,
+                         PendingEviction& out_pending);
+
+    // Restore prepared victims when the master rejects their removal.
+    void RestorePreparedEviction(PendingEviction&& pending);
+
+    // Notify the master, then release prepared allocations on success or
+    // restore their metadata on failure.
+    tl::expected<void, ErrorCode> NotifyAndCommitPreparedEviction(
+        const EvictionHandler& eviction_handler, PendingEviction& pending);
 
     // Test-only: Predicate to determine which keys should fail in BatchOffload.
     // Used for deterministic testing of partial success behavior.

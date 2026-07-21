@@ -1,24 +1,72 @@
 #include "file_storage.h"
 
+#include <cmath>
+#include <locale>
 #include <memory>
+#include <optional>
+#include <sstream>
+#include <utility>
 #include <vector>
 
-#include "aligned_client_buffer.hpp"
+#include "aligned_client_buffer.h"
 #include "storage_backend.h"
 #include "client_metric.h"
 #include "utils.h"
-#include "gpu_staging_utils.h"
+#include "device/accelerator_registry.h"
 #ifdef USE_URING
 #include "file_interface.h"
 #endif
 
 namespace mooncake {
 
-using gpu_staging::CopyDeviceToHost;
-using gpu_staging::IsDevicePointer;
-using gpu_staging::SetDevice;
-
 namespace {
+
+double ParseEnvRatioOr(const std::string& raw_value, double default_value) {
+    if (raw_value.empty()) {
+        return default_value;
+    }
+
+    std::istringstream stream(raw_value);
+    stream.imbue(std::locale::classic());
+
+    double value = 0.0;
+    stream >> value;
+    if (stream.fail()) {
+        return default_value;
+    }
+    if (!stream.eof() || !std::isfinite(value) || value <= 0.0 || value > 1.0) {
+        return default_value;
+    }
+    return value;
+}
+
+double GetEnvRatioOr(const char* name, double default_value) {
+    const auto raw_value = GetEnvStringOr(name, "");
+    return ParseEnvRatioOr(raw_value, default_value);
+}
+
+double GetEnvRatioOr(const char* preferred_name, const char* fallback_name,
+                     double default_value) {
+    const auto preferred_value = GetEnvStringOr(preferred_name, "");
+    if (!preferred_value.empty()) {
+        return ParseEnvRatioOr(preferred_value, default_value);
+    }
+    return GetEnvRatioOr(fallback_name, default_value);
+}
+
+bool GetEnvBoolStringOr(const char* name, bool default_value) {
+    const auto raw_value =
+        GetEnvStringOr(name, default_value ? "true" : "false");
+    if (raw_value == "1" || raw_value == "true" || raw_value == "TRUE" ||
+        raw_value == "True") {
+        return true;
+    }
+    if (raw_value == "0" || raw_value == "false" || raw_value == "FALSE" ||
+        raw_value == "False") {
+        return false;
+    }
+    return default_value;
+}
 
 std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
     const std::vector<std::string>& storage_keys,
@@ -85,6 +133,18 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
     config.client_buffer_gc_ttl_ms =
         GetEnvOr<uint64_t>("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS",
                            config.client_buffer_gc_ttl_ms);
+
+    config.enable_disk_watermark_eviction =
+        GetEnvBoolStringOr("MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION",
+                           config.enable_disk_watermark_eviction);
+    config.disk_eviction_high_watermark_ratio =
+        GetEnvRatioOr("MOONCAKE_OFFLOAD_DISK_EVICTION_HIGH_WATERMARK_RATIO",
+                      "MOONCAKE_DISK_EVICTION_HIGH_WATERMARK_RATIO",
+                      config.disk_eviction_high_watermark_ratio);
+    config.disk_eviction_low_watermark_ratio =
+        GetEnvRatioOr("MOONCAKE_OFFLOAD_DISK_EVICTION_LOW_WATERMARK_RATIO",
+                      "MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO",
+                      config.disk_eviction_low_watermark_ratio);
 
     auto use_uring_str =
         GetEnvStringOr("MOONCAKE_OFFLOAD_USE_URING",
@@ -169,6 +229,25 @@ bool FileStorageConfig::Validate() const {
     }
     if (heartbeat_interval_seconds <= 0) {
         LOG(ERROR) << "FileStorageConfig: heartbeat_interval_seconds must > 0";
+        return false;
+    }
+    if (disk_eviction_low_watermark_ratio <= 0.0 ||
+        disk_eviction_low_watermark_ratio > 1.0) {
+        LOG(ERROR) << "FileStorageConfig: "
+                   << "disk_eviction_low_watermark_ratio must be in (0, 1]";
+        return false;
+    }
+    if (disk_eviction_high_watermark_ratio <= 0.0 ||
+        disk_eviction_high_watermark_ratio > 1.0) {
+        LOG(ERROR) << "FileStorageConfig: "
+                   << "disk_eviction_high_watermark_ratio must be in (0, 1]";
+        return false;
+    }
+    if (disk_eviction_low_watermark_ratio >=
+        disk_eviction_high_watermark_ratio) {
+        LOG(ERROR) << "FileStorageConfig: "
+                   << "disk_eviction_low_watermark_ratio must be lower than "
+                   << "disk_eviction_high_watermark_ratio";
         return false;
     }
     return true;
@@ -416,14 +495,21 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         }
         auto result = client_->NotifyOffloadSuccess(tasks, metadatas);
         if (!result) {
-            LOG(ERROR) << "NotifyOffloadSuccess failed with error: "
-                       << result.error();
+            LOG(ERROR) << "[OFFLOAD] NotifyOffloadSuccess failed with error: "
+                       << result.error() << " keys count: " << keys.size();
             return result.error();
         }
         return ErrorCode::OK;
     };
 
+    // Collect keys drained from master queue but not actually offloaded.
+    // Report them back with data_size=-1 sentinel so the master can clean up
+    // orphaned offloading_tasks and release source replica refcounts.
+    std::vector<OffloadTaskItem> failed_tasks;
+    std::unordered_set<std::string> all_bucket_keys;
+
     for (const auto& keys : buckets_keys) {
+        for (const auto& k : keys) all_bucket_keys.insert(k);
         std::unordered_map<std::string, std::vector<Slice>> batch_object;
         std::unordered_map<std::string, std::vector<std::string>>
             storage_keys_by_tenant;
@@ -438,22 +524,22 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             std::vector<std::string> user_keys;
             user_keys.reserve(storage_keys.size());
             for (const auto& storage_key : storage_keys) {
-                user_keys.push_back(task_by_storage_key[storage_key].key);
+                user_keys.push_back(task_by_storage_key.at(storage_key).key);
             }
             std::unordered_map<std::string, std::vector<Slice>>
                 user_batch_object;
-            auto query_result = BatchQuerySegmentSlices(user_keys, tenant_id,
-                                                        user_batch_object);
-            if (!query_result) {
-                LOG(ERROR) << "BatchQuerySlices failed with error: "
-                           << query_result.error();
-                continue;
-            }
-            for (size_t i = 0; i < storage_keys.size(); ++i) {
-                auto it = user_batch_object.find(user_keys[i]);
+            [[maybe_unused]] auto query_result = BatchQuerySegmentSlices(
+                user_keys, tenant_id, user_batch_object);
+            // BatchQuerySegmentSlices is now best-effort: it always returns
+            // OK. Keys present in user_batch_object go to batch_object; the
+            // rest are reported as failed.
+            for (const auto& storage_key : storage_keys) {
+                const auto& task = task_by_storage_key.at(storage_key);
+                auto it = user_batch_object.find(task.key);
                 if (it != user_batch_object.end()) {
-                    batch_object.emplace(storage_keys[i],
-                                         std::move(it->second));
+                    batch_object.emplace(storage_key, std::move(it->second));
+                } else {
+                    failed_tasks.push_back(task);
                 }
             }
         }
@@ -461,53 +547,34 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             continue;
         }
 
-        auto eviction_handler = [this](const std::vector<std::string>&
-                                           evicted_keys) {
-            if (evicted_keys.empty()) return;
-            std::unordered_map<std::string, std::vector<std::string>>
-                keys_by_tenant;
-            for (const auto& storage_key : evicted_keys) {
-                auto [tenant_id, key] =
-                    ParseTenantScopedStorageKey(storage_key);
-                keys_by_tenant[tenant_id].push_back(key);
-            }
-            for (const auto& [tenant_id, keys] : keys_by_tenant) {
-                auto results = client_->BatchEvictDiskReplica(
-                    keys, tenant_id, ReplicaType::LOCAL_DISK);
-                for (size_t i = 0; i < results.size(); ++i) {
-                    if (!results[i]) {
-                        LOG(WARNING)
-                            << "Failed to notify master about evicted local "
-                               "disk key: "
-                            << keys[i] << ", tenant_id=" << tenant_id
-                            << ", error: " << results[i].error();
-                    }
-                }
-            }
-        };
-
         // D2H staging: replace device slices with host memory slices
         // so that storage_backend (ConcatSlicesToString / BuildBucket /
         // WriteBucket) always receives host pointers.
         std::unordered_map<std::string, std::vector<Slice>> host_batch_object;
         std::vector<PinnedBufferPool::Buffer> staging_bufs;
+        auto runtime_accelerator =
+            device::GetAcceleratorRegistry().RuntimeAccelerators();
 
         for (auto& [obj_key, slices] : batch_object) {
             std::vector<Slice> host_slices;
             bool obj_success = true;
             for (const auto& slice : slices) {
-                int device_id = -1;
-                if (IsDevicePointer(slice.ptr, &device_id)) {
-                    SetDevice(device_id);
+                device::PointerInfo info{};
+                auto* device =
+                    runtime_accelerator.FindDeviceForPointer(slice.ptr, &info);
+                if (device) {
+                    device->SetContext(info.device_id);
                     auto buf = pinned_buffer_pool_->Acquire(slice.size);
-                    if (!CopyDeviceToHost(buf.data, slice.ptr, slice.size)) {
+                    if (!device->Copy(buf.data, slice.ptr, slice.size,
+                                      device::CopyDirection::kDeviceToHost)) {
                         LOG(ERROR) << "D2H staging failed for key: " << obj_key;
-                        pinned_buffer_pool_->Release(buf);
+                        pinned_buffer_pool_->Release(std::move(buf));
                         obj_success = false;
+                        failed_tasks.push_back(task_by_storage_key.at(obj_key));
                         break;
                     }
                     host_slices.emplace_back(Slice{buf.data, slice.size});
-                    staging_bufs.push_back(buf);
+                    staging_bufs.push_back(std::move(buf));
                 } else {
                     host_slices.push_back(slice);
                 }
@@ -544,11 +611,14 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             return res;
         };
         auto offload_res = storage_backend_->BatchOffload(
-            host_batch_object, bucket_complete_handler, eviction_handler);
+            host_batch_object, bucket_complete_handler,
+            [this](const std::vector<std::string>& evicted_keys) {
+                return NotifyEvictedDiskReplicas(evicted_keys);
+            });
 
-        // Release staging buffers back to pool (Buffer is POD, no destructor)
+        // Release staging buffers back to pool.
         for (auto& buf : staging_bufs) {
-            pinned_buffer_pool_->Release(buf);
+            pinned_buffer_pool_->Release(std::move(buf));
         }
         if (!offload_res) {
             LOG(ERROR) << "Failed to store objects with error: "
@@ -558,10 +628,107 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                 enable_offloading_ = false;
                 return tl::make_unexpected(offload_res.error());
             }
-            if (offload_res.error() != ErrorCode::INVALID_READ) {
+            if (offload_res.error() == ErrorCode::INVALID_READ) {
+                for (const auto& [key, _] : host_batch_object) {
+                    failed_tasks.push_back(task_by_storage_key.at(key));
+                }
+            } else {
                 return tl::make_unexpected(offload_res.error());
             }
         }
+    }
+
+    // Keys skipped by GroupOffloadingKeysByBucket don't appear in any bucket,
+    // so they never reach BatchOffload or complete_handler.
+    for (const auto& [storage_key, task] : task_by_storage_key) {
+        if (all_bucket_keys.find(storage_key) == all_bucket_keys.end()) {
+            failed_tasks.push_back(task);
+        }
+    }
+
+    if (!failed_tasks.empty()) {
+        std::vector<StorageObjectMetadata> failed_metadatas;
+        failed_metadatas.reserve(failed_tasks.size());
+        for (size_t i = 0; i < failed_tasks.size(); ++i) {
+            failed_metadatas.push_back(StorageObjectMetadata{-1, 0, 0, -1, ""});
+        }
+        auto result =
+            client_->NotifyOffloadSuccess(failed_tasks, failed_metadatas);
+        if (!result) {
+            LOG(WARNING) << "[OFFLOAD] NotifyOffloadSuccess for failed tasks "
+                            "returned error: "
+                         << result.error() << " count: " << failed_tasks.size();
+        }
+    }
+
+    return {};
+}
+
+tl::expected<void, ErrorCode> FileStorage::NotifyEvictedDiskReplicas(
+    const std::vector<std::string>& evicted_keys) {
+    if (evicted_keys.empty()) return {};
+
+    std::optional<ErrorCode> first_error;
+    std::unordered_map<std::string, std::vector<std::string>> keys_by_tenant;
+    for (const auto& storage_key : evicted_keys) {
+        auto [tenant_id, key] = ParseTenantScopedStorageKey(storage_key);
+        keys_by_tenant[tenant_id].push_back(key);
+    }
+
+    for (const auto& [tenant_id, keys] : keys_by_tenant) {
+        auto results = client_->BatchEvictDiskReplica(keys, tenant_id,
+                                                      ReplicaType::LOCAL_DISK);
+        if (results.size() != keys.size()) {
+            LOG(ERROR) << "BatchEvictDiskReplica returned " << results.size()
+                       << " result(s) for " << keys.size()
+                       << " key(s), tenant_id=" << tenant_id;
+            if (!first_error.has_value()) {
+                first_error = ErrorCode::INTERNAL_ERROR;
+            }
+            continue;
+        }
+
+        for (size_t i = 0; i < results.size(); ++i) {
+            if (!results[i]) {
+                if (results[i].error() == ErrorCode::OBJECT_NOT_FOUND) {
+                    VLOG(1)
+                        << "Master no longer tracks evicted local disk key: "
+                        << keys[i] << ", tenant_id=" << tenant_id;
+                    continue;
+                }
+                if (!first_error.has_value()) {
+                    first_error = results[i].error();
+                }
+                LOG(WARNING)
+                    << "Failed to notify master about evicted local disk key: "
+                    << keys[i] << ", tenant_id=" << tenant_id
+                    << ", error: " << results[i].error();
+            }
+        }
+    }
+    if (first_error.has_value()) {
+        return tl::make_unexpected(first_error.value());
+    }
+    return {};
+}
+
+tl::expected<void, ErrorCode> FileStorage::RunDiskWatermarkEviction() {
+    if (!config_.enable_disk_watermark_eviction) {
+        return {};
+    }
+
+    auto eviction_result = storage_backend_->EvictAboveDiskWatermark(
+        config_.disk_eviction_high_watermark_ratio,
+        config_.disk_eviction_low_watermark_ratio,
+        [this](const std::vector<std::string>& evicted_keys) {
+            return NotifyEvictedDiskReplicas(evicted_keys);
+        });
+    if (!eviction_result) {
+        return tl::make_unexpected(eviction_result.error());
+    }
+    if (!eviction_result.value().empty()) {
+        LOG(INFO) << "Disk watermark eviction removed "
+                  << eviction_result.value().size() << " LOCAL_DISK key(s)";
     }
     return {};
 }
@@ -677,24 +844,32 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         }
     }
 
-    if (offloading_objects.empty()) {
-        return {};
-    }
     // === STEP 2: Persist offloaded objects (trigger actual data migration) ===
-    auto offload_result = OffloadObjects(offloading_objects);
-    if (!offload_result) {
-        LOG(ERROR) << "Failed to persist objects with error: "
-                   << offload_result.error();
-        return offload_result;
+    if (!offloading_objects.empty()) {
+        auto offload_result = OffloadObjects(offloading_objects);
+        if (!offload_result) {
+            LOG(ERROR) << "Failed to persist objects with error: "
+                       << offload_result.error();
+            return offload_result;
+        }
     }
+
+    VLOG(1) << "Completed heartbeat with offloaded objects count: "
+            << offloading_objects.size();
 
     // Drive any pending L2->L1 promotion work for this client. Failures
     // inside ProcessPromotionTasks are logged per-key and do not propagate;
     // promotion is best-effort and must never break offload.
     (void)ProcessPromotionTasks();
 
-    // TODO(eviction): Implement an LRU eviction mechanism to manage local
-    // storage capacity.
+    // Proactive disk watermarks keep LOCAL_DISK usage below the configured
+    // low watermark even when no new write arrives to trigger reactive
+    // eviction.
+    auto disk_eviction_result = RunDiskWatermarkEviction();
+    if (!disk_eviction_result) {
+        LOG(WARNING) << "Disk watermark eviction failed: "
+                     << disk_eviction_result.error();
+    }
     return {};
 }
 
@@ -880,8 +1055,9 @@ tl::expected<void, ErrorCode> FileStorage::BatchQuerySegmentSlices(
     const std::vector<std::string>& keys, const std::string& tenant_id,
     std::unordered_map<std::string, std::vector<Slice>>& batched_slices) {
     auto batched_query_results = client_->BatchQuery(keys, tenant_id);
-    if (batched_query_results.empty())
-        return tl::make_unexpected(ErrorCode::INVALID_REPLICA);
+    if (batched_query_results.empty()) {
+        return {};
+    }
     for (size_t i = 0; i < batched_query_results.size(); ++i) {
         if (batched_query_results[i]) {
             for (const auto& descriptor :
@@ -898,13 +1074,6 @@ tl::expected<void, ErrorCode> FileStorage::BatchQuerySegmentSlices(
                     break;
                 }
             }
-            if (batched_slices.find(keys[i]) == batched_slices.end()) {
-                LOG(ERROR) << "Key not found: " << keys[i];
-                return tl::make_unexpected(ErrorCode::INVALID_KEY);
-            }
-        } else {
-            LOG(ERROR) << "Key not found: " << keys[i];
-            return tl::make_unexpected(batched_query_results[i].error());
         }
     }
     return {};
