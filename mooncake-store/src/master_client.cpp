@@ -422,7 +422,6 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
         client_accessor_.GetOrCreateClientPool(master_addr);
         client_addr_param_ = master_addr;
     }
-    auto pool = client_accessor_.GetClientPool();
     // The client pool does not have native connection check method, so we need
     // to use custom ServiceReady API.
     auto result =

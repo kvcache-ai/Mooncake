@@ -256,7 +256,6 @@ ErrorCode DummyClient::connect(const std::string& server_address) {
         client_accessor_.GetOrCreateClientPool(server_address);
         client_addr_param_ = server_address;
     }
-    auto pool = client_accessor_.GetClientPool();
     // The client pool does not have native connection check method, so we need
     // to use custom ServiceReady API.
     auto result = invoke_rpc<&RealClient::service_ready_internal, void>();

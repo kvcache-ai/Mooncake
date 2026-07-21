@@ -148,6 +148,9 @@ foreach(
     target_link_libraries(tent_link_group INTERFACE ${tgt})
   endif()
 endforeach()
+if(TARGET mooncake_common)
+  target_link_libraries(tent_link_group INTERFACE mooncake_common)
+endif()
 target_link_libraries(tent_link_group INTERFACE "-Wl,--end-group")
 install(
   TARGETS tent_shared
