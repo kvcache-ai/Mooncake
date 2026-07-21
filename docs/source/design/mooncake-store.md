@@ -682,9 +682,9 @@ Hard pin is set at object creation time through the `with_hard_pin` field in `Re
 
 Key differences from soft pin:
 
-- Hard pin never expires. Soft pin status is removed after a configurable TTL if the object is not accessed.
+- Hard pin never expires. Soft pin expires at a fixed deadline that starts when the first replica becomes readable, regardless of later accesses.
 - Hard-pinned objects are completely skipped during eviction. Soft-pinned objects may still be evicted when no other candidates are available.
-- Hard pin is immutable once set. Soft pin status is automatically refreshed on access.
+- Hard pin is immutable once set. Soft pin can be explicitly preserved, enabled, or disabled by write requests; reads do not refresh or reactivate it.
 
 ## Zombie Object Cleanup
 
