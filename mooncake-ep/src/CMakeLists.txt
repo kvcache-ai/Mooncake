@@ -9,14 +9,6 @@ set(MOONCAKE_EP_SOURCES
 pybind11_add_module(_ep MODULE ${MOONCAKE_EP_SOURCES})
 set_target_properties(_ep PROPERTIES POSITION_INDEPENDENT_CODE ON)
 set_target_properties(_ep PROPERTIES INSTALL_RPATH "$ORIGIN")
-if(DEFINED EP_PG_STAGING_DIR)
-  add_custom_command(
-      TARGET _ep
-      POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E make_directory "${EP_PG_STAGING_DIR}"
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:_ep>"
-              "${EP_PG_STAGING_DIR}/$<TARGET_FILE_NAME:_ep>")
-endif()
 if(USE_CUDA)
   set_target_properties(_ep PROPERTIES CUDA_ARCHITECTURES "90")
 endif()

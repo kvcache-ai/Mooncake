@@ -107,10 +107,6 @@ if (WITH_EP)
       message(STATUS "Detected CUDA version: ${CUDAToolkit_VERSION}")
     endif()
 
-    # Stage the native EP and PG extensions for build_wheel.sh.  The wheel
-    # injects this directory after auditwheel to preserve accelerator fatbins.
-    set(EP_PG_STAGING_DIR "${CMAKE_BINARY_DIR}/ep_pg_staging")
-
     add_subdirectory(mooncake-ep)
     include_directories(mooncake-ep/include)
 
@@ -132,6 +128,10 @@ if (WITH_EP)
     endif()
     set(TORCH_CUDA_ARCH_LIST "${TORCH_CUDA_ARCH_LIST}" CACHE STRING
         "CUDA arch list for EP/PG extension builds (e.g. \"8.0;9.0\")")
+
+    # PG extensions are staged during their setup.py builds and injected after
+    # auditwheel so their original accelerator fatbins remain untouched.
+    set(EP_PG_STAGING_DIR "${CMAKE_BINARY_DIR}/ep_pg_staging")
 
     # Convert semicolon-separated lists to pipe-separated strings so they survive
     # CMake's COMMAND list-splitting (semicolons are CMake list separators).
