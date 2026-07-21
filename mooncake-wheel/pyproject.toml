@@ -37,6 +37,9 @@ classifiers = ["Development Status :: 5 - Production/Stable", "Environment :: GP
 [project.optional-dependencies]
 file-io = ["safetensors", "torch"]
 
+[project.entry-points."vllm.general_plugins"]
+mooncake_model_loader = "mooncake.model_loader.vllm_loader:register"
+
 [project.urls]
 Homepage = "https://github.com/kvcache-ai/Mooncake"
 Documentation = "https://kvcache-ai.github.io/Mooncake"
@@ -53,6 +56,8 @@ transfer_engine_bench = "mooncake.cli_bench:main"
 mooncake_http_metadata_server = "mooncake.http_metadata_server:main"
 mc_store_rest_server = "mooncake.mooncake_store_service:sync_main"
 transfer_engine_topology_dump = "mooncake.transfer_engine_topology_dump:main"
+mooncake_save_model_remote = "mooncake.model_loader.save_model_remote:main"
+mooncake_sglang_launch = "mooncake.model_loader.sglang_launch:main"
 
 [tool.setuptools]
 zip-safe = false
