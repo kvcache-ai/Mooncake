@@ -601,7 +601,8 @@ int TransferEngine::unregisterLocalMemoryBatch(
 
 BatchID TransferEngine::allocateBatchID(size_t batch_size) {
     if (use_tent_) {
-        return impl_tent_->allocateBatch(batch_size);
+        const auto batch_id = impl_tent_->allocateBatch(batch_size);
+        return batch_id == 0 ? INVALID_BATCH_ID : batch_id;
     } else {
         return impl_->allocateBatchID(batch_size);
     }

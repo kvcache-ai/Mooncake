@@ -163,7 +163,9 @@ TEST_F(TransferTaskTest, TransferScatterWritesGpuDestinationDirectly) {
 
     TransferEngine engine(false);
     ASSERT_EQ(engine.init("P2PHANDSHAKE", "localhost:17932"), 0);
-    ASSERT_NE(engine.installTransport("tcp", nullptr), nullptr);
+    if (!engine.isUsingTent()) {
+        ASSERT_NE(engine.installTransport("tcp", nullptr), nullptr);
+    }
     ASSERT_EQ(engine.registerLocalMemory(source.data(), source.size(), "cpu:0"),
               0);
     ASSERT_EQ(engine.registerLocalMemory(gpu_destination, kDestSize, "cuda:0"),

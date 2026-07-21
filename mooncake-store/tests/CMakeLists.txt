@@ -91,6 +91,14 @@ if(USE_CUDA)
   find_package(CUDAToolkit REQUIRED)
   target_compile_definitions(transfer_task_test PRIVATE USE_CUDA)
   target_link_libraries(transfer_task_test PRIVATE CUDA::cudart)
+  if(USE_TENT)
+    add_test(
+      NAME transfer_scatter_tent_test
+      COMMAND transfer_task_test
+              --gtest_filter=TransferTaskTest.TransferScatterWritesGpuDestinationDirectly)
+    set_tests_properties(transfer_scatter_tent_test
+                         PROPERTIES ENVIRONMENT "MC_USE_TENT=1")
+  endif()
 endif()
 add_store_test(tenant_quota_test tenant_quota_test.cpp)
 add_store_test(tenant_id_test tenant_id_test.cpp)
