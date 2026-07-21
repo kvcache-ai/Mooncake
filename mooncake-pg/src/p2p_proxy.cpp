@@ -162,7 +162,7 @@ P2PProxy::P2PProxy(TransferEngine* engine, const Options& options)
       rank_(options.rank),
       size_(options.size),
       cuda_device_index_(options.cuda_device_index),
-      p2p_timeout_us_(options.p2p_timeout_us) {
+      transfer_timeout_ms_(options.transfer_timeout_ms) {
     if (!is_cpu_ && cuda_device_index_ < 0) {
         int current_device = -1;
         const cudaError_t get_device_error = cudaGetDevice(&current_device);
@@ -306,61 +306,25 @@ void P2PProxy::resetPeerState(int peer_rank) {
 // Reset sender state for peer_rank.
 void P2PProxy::performSendReset(int peer_rank) {
     resetSendLane(send_peer_lanes_[peer_rank]);
-    resetPeerAckLanes(peer_rank);
+    resetPeerControlLanes(peer_rank);
 }
 
 // Reset receiver state for peer_rank.
 void P2PProxy::performRecvReset(int peer_rank) {
     resetRecvLane(recv_peer_lanes_[peer_rank]);
-    resetPeerCreditLanes(peer_rank);
+    resetPeerControlLanes(peer_rank);
 }
 
-void P2PProxy::cleanupFailedSendOp(SendOpContext& op_ctx) {
-    for (auto& task : op_ctx.tasks_) {
-        releaseSendTaskResources(task);
+void P2PProxy::reportBrokenPeer(int peer_rank) {
+    resetPeerState(peer_rank);
+    // Set peerConnected to notify the connection poller to reconnect it.
+    meta_->peerConnected[peer_rank] = false;
+    meta_->activeRanks[peer_rank] = false;
+    if (meta_->activeRanksTensor.device().is_cpu()) {
+        meta_->activeRanksTensor[peer_rank] = 0;
     }
-    op_ctx.tasks_.clear();
-    active_send_tasks_.fetch_sub(1, std::memory_order_release);
-}
-
-void P2PProxy::cleanupFailedRecvOp(RecvOpContext& op_ctx) {
-    for (auto& task : op_ctx.tasks_) {
-        releaseRecvTaskResources(task);
-    }
-    op_ctx.tasks_.clear();
-    active_recv_tasks_.fetch_sub(1, std::memory_order_release);
-}
-
-void P2PProxy::handleFailedSendOp(SendOpContext& op_ctx) {
-    cleanupFailedSendOp(op_ctx);
-    op_ctx.failed_ranks_[op_ctx.peer_rank_] = 1;
-    if (meta_->autoDeactivateOnFailure) {
-        resetPeerState(op_ctx.peer_rank_);
-        meta_->peerConnected[op_ctx.peer_rank_] = false;
-        meta_->activeRanks[op_ctx.peer_rank_] = false;
-        meta_->activeRanksTensor[op_ctx.peer_rank_] = 0;
-    }
-    // Transition to kFailed after writing failedRanks so that wait()
-    // never returns before the failed ranks is visible.
-    op_ctx.status_->store(OpStatus::kFailed, std::memory_order_release);
-    LOG(ERROR) << "Rank " << meta_->rank << ": P2P SendOp to peer "
-               << op_ctx.peer_rank_ << " failed.";
-}
-
-void P2PProxy::handleFailedRecvOp(RecvOpContext& op_ctx) {
-    cleanupFailedRecvOp(op_ctx);
-    op_ctx.failed_ranks_[op_ctx.peer_rank_] = 1;
-    if (meta_->autoDeactivateOnFailure) {
-        resetPeerState(op_ctx.peer_rank_);
-        meta_->peerConnected[op_ctx.peer_rank_] = false;
-        meta_->activeRanks[op_ctx.peer_rank_] = false;
-        if (meta_->activeRanksTensor.device().is_cpu()) {
-            meta_->activeRanksTensor[op_ctx.peer_rank_] = 0;
-        }
-    }
-    op_ctx.status_->store(OpStatus::kFailed, std::memory_order_release);
-    LOG(ERROR) << "Rank " << meta_->rank << ": P2P RecvOp from peer "
-               << op_ctx.peer_rank_ << " failed.";
+    LOG(ERROR) << "Rank " << meta_->rank << " marking peer " << peer_rank
+               << " as broken during P2P transfer.";
 }
 
 void P2PProxy::releaseSendTaskResources(SendTransferTask& task) const {
@@ -391,12 +355,19 @@ void P2PProxy::releaseRecvTaskResources(RecvTransferTask& task) const {
 
 void P2PProxy::resetSendLane(SendPeerLane& lane) {
     for (auto& pending : lane.pending_send_ops_) {
-        handleFailedSendOp(pending);
+        pending.status_->store(OpStatus::kFailed, std::memory_order_release);
+        active_send_tasks_.fetch_sub(1, std::memory_order_release);
     }
     lane.pending_send_ops_.clear();
 
     if (lane.active_send_op_.has_value()) {
-        handleFailedSendOp(*lane.active_send_op_);
+        auto& op_ctx = lane.active_send_op_.value();
+        for (auto& task : op_ctx.tasks_) {
+            releaseSendTaskResources(task);
+        }
+        op_ctx.tasks_.clear();
+        op_ctx.status_->store(OpStatus::kFailed, std::memory_order_release);
+        active_send_tasks_.fetch_sub(1, std::memory_order_release);
         lane.active_send_op_.reset();
     }
     lane.credit_consume_seq_ = 0;
@@ -404,28 +375,30 @@ void P2PProxy::resetSendLane(SendPeerLane& lane) {
 
 void P2PProxy::resetRecvLane(RecvPeerLane& lane) {
     for (auto& pending : lane.pending_recv_ops_) {
-        handleFailedRecvOp(pending);
+        pending.status_->store(OpStatus::kFailed, std::memory_order_release);
+        active_recv_tasks_.fetch_sub(1, std::memory_order_release);
     }
     lane.pending_recv_ops_.clear();
 
     if (lane.active_recv_op_.has_value()) {
-        handleFailedRecvOp(*lane.active_recv_op_);
+        auto& op_ctx = lane.active_recv_op_.value();
+        for (auto& task : op_ctx.tasks_) {
+            releaseRecvTaskResources(task);
+        }
+        op_ctx.tasks_.clear();
+        op_ctx.status_->store(OpStatus::kFailed, std::memory_order_release);
+        active_recv_tasks_.fetch_sub(1, std::memory_order_release);
         lane.active_recv_op_.reset();
     }
     lane.credit_issue_seq_ = 0;
     lane.ack_consume_seq_ = 0;
 }
 
-void P2PProxy::resetPeerCreditLanes(int peer_rank) {
+void P2PProxy::resetPeerControlLanes(int peer_rank) {
     auto* credit_lane = getLocalCreditLane(peer_rank);
-    for (uint32_t i = 0; i < kP2PControlRingSize; ++i) {
-        credit_lane[i].reset();
-    }
-}
-
-void P2PProxy::resetPeerAckLanes(int peer_rank) {
     auto* ack_lane = getLocalAckLane(peer_rank);
     for (uint32_t i = 0; i < kP2PControlRingSize; ++i) {
+        credit_lane[i].reset();
         ack_lane[i].reset();
     }
 }
@@ -503,7 +476,7 @@ void P2PProxy::enqueueSend(SendOp op) {
 void P2PProxy::enqueueRecv(RecvOp op) {
     {
         std::lock_guard<std::mutex> lock(recv_queue_mutex_);
-        recv_queue_.emplace(std::move(op));
+        recv_queue_.push(std::move(op));
     }
     active_recv_tasks_.fetch_add(1, std::memory_order_release);
     if (device_worker_) device_worker_->wakeUpRecv();
@@ -525,8 +498,7 @@ P2PProxy::SendOpContext::SendOpContext(SendOp&& op_in)
     : status_(std::move(op_in.status_)),
       tensor_(std::move(op_in.tensor_)),
       peer_rank_(op_in.peer_rank_),
-      cuda_stream_(op_in.cuda_stream_),
-      failed_ranks_(op_in.failed_ranks_) {
+      cuda_stream_(op_in.cuda_stream_) {
     total_bytes_ =
         tensor_.numel() * static_cast<uint64_t>(tensor_.element_size());
     last_update_time_ = std::chrono::steady_clock::now();
@@ -550,8 +522,7 @@ P2PProxy::RecvOpContext::RecvOpContext(RecvOp&& op_in)
       tensor_(std::move(op_in.tensor_)),
       original_tensor_(std::move(op_in.original_tensor_)),
       peer_rank_(op_in.peer_rank_),
-      cuda_stream_(op_in.cuda_stream_),
-      failed_ranks_(op_in.failed_ranks_) {
+      cuda_stream_(op_in.cuda_stream_) {
     total_bytes_ =
         tensor_.numel() * static_cast<uint64_t>(tensor_.element_size());
 }
@@ -733,20 +704,20 @@ bool P2PProxy::stepRecvCopyOut(RecvTransferTask& task) {
 // chunk from SendPool, copy the corresponding slice of the user tensor into
 // it, and advance the cursor.  If the pool is full or no credit has
 // arrived we return false immediately (non-blocking).
-P2PProxy::IssueResult P2PProxy::tryIssueSendTask(SendOpContext& op_ctx,
-                                                 SendPeerLane& lane) {
+bool P2PProxy::tryIssueSendTask(SendOpContext& op_ctx, SendPeerLane& lane) {
     // Check for timeout while waiting for the peer's CreditSlot.
     if (isTimeout(op_ctx)) {
         LOG(ERROR) << "P2P wait-for-credit timeout, peer=" << op_ctx.peer_rank_;
-        return IssueResult::kTimeout;
+        op_ctx.status_->store(OpStatus::kFailed, std::memory_order_release);
+        return false;
     }
 
     if (op_ctx.bytes_staged_ >= op_ctx.total_bytes_) {
-        return IssueResult::kNoCredit;
+        return false;
     }
 
     if (op_ctx.tasks_.size() >= kP2PControlRingSize) {
-        return IssueResult::kNoCredit;
+        return false;
     }
 
     CreditSlot* local_credit = getLocalCreditLane(op_ctx.peer_rank_);
@@ -760,7 +731,7 @@ P2PProxy::IssueResult P2PProxy::tryIssueSendTask(SendOpContext& op_ctx,
     uint32_t slot_seq = 0;
     if (!slot.tryLoad(recv_addr, chunk_len, slot_epoch, slot_seq)) {
         // Slot is either empty or torn (partial RDMA write). Retry next poll.
-        return IssueResult::kNoCredit;
+        return false;
     }
 
     // Step 2 -- Stale packet: the slot carries data from a previous epoch
@@ -773,17 +744,17 @@ P2PProxy::IssueResult P2PProxy::tryIssueSendTask(SendOpContext& op_ctx,
                      << " slot.epoch=" << slot_epoch
                      << " curr_epoch=" << curr_epoch;
         slot.reset();
-        return IssueResult::kIssued;
+        return true;
     }
 
     // Step 3 -- Sequence check: make sure this is exactly the slot we expect.
     if (slot_seq != static_cast<uint32_t>(seq)) {
-        return IssueResult::kNoCredit;
+        return false;
     }
 
     void* staging_addr = send_pool_->acquire();
     if (staging_addr == nullptr) {
-        return IssueResult::kNoCredit;
+        return false;
     }
 
     const uint32_t expected_chunk_len =
@@ -829,7 +800,7 @@ P2PProxy::IssueResult P2PProxy::tryIssueSendTask(SendOpContext& op_ctx,
     ++lane.credit_consume_seq_;
     op_ctx.bytes_staged_ += task.chunk_len_;
     task.last_update_time_ = std::chrono::steady_clock::now();
-    return IssueResult::kIssued;
+    return true;
 }
 
 // Drive a single sender chunk through its state machine.
@@ -1046,40 +1017,33 @@ bool P2PProxy::stepSend() {
         auto& op_ctx = lane.active_send_op_.value();
 
         // Pull as many credits as we have free chunks
-        IssueResult issue;
-        do {
-            issue = tryIssueSendTask(op_ctx, lane);
-            did_work |= issue == IssueResult::kIssued;
-        } while (issue == IssueResult::kIssued);
-
-        if (issue == IssueResult::kTimeout) {
-            handleFailedSendOp(op_ctx);
-            lane.active_send_op_.reset();
+        while (tryIssueSendTask(op_ctx, lane)) {
             did_work = true;
-            continue;
         }
 
         // Advance every chunk through the sender state machine.
-        bool op_failed = false;
-        for (auto it = op_ctx.tasks_.begin(); it != op_ctx.tasks_.end();) {
-            if (stepSendTask(op_ctx, *it)) {
-                did_work = true;
-            }
-            if (it->state_ == SendTaskState::kFinished) {
-                it = op_ctx.tasks_.erase(it);
-                did_work = true;
-            } else if (it->state_ == SendTaskState::kFailed) {
-                op_failed = true;
-                break;
-            } else {
-                ++it;
+        // send op may fail due to credit-wait timeout in tryIssueSendTask.
+        auto op_status = op_ctx.status_->load(std::memory_order_acquire);
+        bool op_failed = op_status == OpStatus::kFailed;
+        if (!op_failed) {
+            for (auto it = op_ctx.tasks_.begin(); it != op_ctx.tasks_.end();) {
+                if (stepSendTask(op_ctx, *it)) {
+                    did_work = true;
+                }
+                if (it->state_ == SendTaskState::kFinished) {
+                    it = op_ctx.tasks_.erase(it);
+                    did_work = true;
+                } else if (it->state_ == SendTaskState::kFailed) {
+                    op_failed = true;
+                    break;
+                } else {
+                    ++it;
+                }
             }
         }
 
         if (op_failed) {
-            handleFailedSendOp(op_ctx);
-            lane.active_send_op_.reset();
-
+            reportBrokenPeer(peer_rank);
             did_work = true;
             continue;
         }
@@ -1207,10 +1171,10 @@ bool P2PProxy::stepRecv() {
     {
         std::lock_guard<std::mutex> lock(recv_queue_mutex_);
         while (!recv_queue_.empty()) {
-            RecvOpContext op_ctx = std::move(recv_queue_.front());
+            RecvOp op = std::move(recv_queue_.front());
             recv_queue_.pop();
-            recv_peer_lanes_[op_ctx.peer_rank_].pending_recv_ops_.push_back(
-                std::move(op_ctx));
+            recv_peer_lanes_[op.peer_rank_].pending_recv_ops_.push_back(
+                std::move(op));
             did_work = true;
         }
     }
@@ -1222,8 +1186,9 @@ bool P2PProxy::stepRecv() {
             lane.pending_recv_ops_.empty()) {
             continue;
         }
-        RecvOpContext op_ctx = std::move(lane.pending_recv_ops_.front());
+        RecvOp recv_op = std::move(lane.pending_recv_ops_.front());
         lane.pending_recv_ops_.pop_front();
+        RecvOpContext op_ctx(std::move(recv_op));
         lane.active_recv_op_ = std::move(op_ctx);
         did_work = true;
     }
@@ -1271,8 +1236,7 @@ bool P2PProxy::stepRecv() {
         }
 
         if (op_failed) {
-            handleFailedRecvOp(op_ctx);
-            lane.active_recv_op_.reset();
+            reportBrokenPeer(peer_rank);
             did_work = true;
             continue;
         }
