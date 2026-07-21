@@ -595,8 +595,9 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
 
         // If every object in this bucket failed D2H staging, host_batch_object
         // is empty (those keys are already in failed_tasks). Skip BatchOffload,
-        // which rejects an empty map as INVALID_KEY and would otherwise trip the
-        // whole-cycle abort below for a bucket that has nothing left to persist.
+        // which rejects an empty map as INVALID_KEY and would otherwise trip
+        // the whole-cycle abort below for a bucket that has nothing left to
+        // persist.
         if (host_batch_object.empty()) {
             continue;
         }
