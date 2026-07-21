@@ -380,8 +380,8 @@ TEST_F(MetricsRecordingTest, CompletedTransferRecordsBytesAndLatency) {
 TEST_F(MetricsRecordingTest, FailedTransferCountsFailureNotBytes) {
     auto before = MetricsSnapshot(TentMetrics::instance());
 
-    TentMetrics::instance().recordReadFailed();
-    TentMetrics::instance().recordWriteFailed();
+    TentMetrics::instance().recordReadFailed(UNSPEC);
+    TentMetrics::instance().recordWriteFailed(UNSPEC);
 
     auto after = MetricsSnapshot(TentMetrics::instance());
 
@@ -601,7 +601,7 @@ TEST_F(MetricsRecordingTest, HistogramJsonBucketsMatchBoundaries) {
 // ---------------------------------------------------------------------------
 TEST_F(MetricsRecordingTest, BucketsAreCompileTimeDefaults) {
     // Record one sample so the histogram is non-empty.
-    TentMetrics::instance().recordReadCompleted(4096, 0.001);
+    TentMetrics::instance().recordReadCompleted(UNSPEC, 4096, 0.001);
 
     auto snap = MetricsSnapshot(TentMetrics::instance());
     auto keys = snap.bucketKeys("tent_read_latency_us");
@@ -660,9 +660,9 @@ class MetricsHttpTest : public ::testing::Test {
 
 TEST_F(MetricsHttpTest, PrometheusEndpointExposesAllCounters) {
     // Record a mix of operations so the counters are non-zero.
-    TentMetrics::instance().recordReadCompleted(1024, 0.001);
-    TentMetrics::instance().recordWriteCompleted(2048, 0.002);
-    TentMetrics::instance().recordDeadlineInfeasible();
+    TentMetrics::instance().recordReadCompleted(UNSPEC, 1024, 0.001);
+    TentMetrics::instance().recordWriteCompleted(UNSPEC, 2048, 0.002);
+    TentMetrics::instance().recordDeadlineInfeasible(UNSPEC);
 
     auto resp = retryGet("/metrics");
     EXPECT_EQ(resp.http_status, 200);
@@ -675,7 +675,7 @@ TEST_F(MetricsHttpTest, PrometheusEndpointExposesAllCounters) {
 }
 
 TEST_F(MetricsHttpTest, JsonEndpointValid) {
-    TentMetrics::instance().recordReadCompleted(512, 0.0005);
+    TentMetrics::instance().recordReadCompleted(UNSPEC, 512, 0.0005);
 
     auto resp = retryGet("/metrics/json");
     EXPECT_EQ(resp.http_status, 200);
