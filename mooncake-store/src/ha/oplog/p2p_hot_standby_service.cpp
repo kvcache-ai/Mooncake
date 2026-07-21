@@ -2,6 +2,7 @@
 
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -10,8 +11,10 @@
 
 namespace mooncake {
 
-P2PHotStandbyService::P2PHotStandbyService(P2PHotStandbyConfig config)
-    : config_(std::move(config)) {
+P2PHotStandbyService::P2PHotStandbyService(
+    P2PHotStandbyConfig config, ReaderStoreFactory reader_store_factory)
+    : config_(std::move(config)),
+      reader_store_factory_(std::move(reader_store_factory)) {
     metadata_store_ = std::make_unique<P2PStandbyMetadataStore>();
     oplog_applier_ = std::make_unique<P2POpLogApplier>(metadata_store_.get(),
                                                        config_.cluster_id);
@@ -20,6 +23,7 @@ P2PHotStandbyService::P2PHotStandbyService(P2PHotStandbyConfig config)
 P2PHotStandbyService::~P2PHotStandbyService() { Stop(); }
 
 ErrorCode P2PHotStandbyService::Start(uint64_t baseline_sequence_id) {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
     std::lock_guard<std::mutex> lock(mutex_);
     if (state_machine_.IsRunning()) {
         LOG(WARNING) << "P2PHotStandbyService is already running";
@@ -50,6 +54,7 @@ ErrorCode P2PHotStandbyService::Start(uint64_t baseline_sequence_id) {
     }
 
     state_machine_.ProcessEvent(StandbyEvent::SYNC_COMPLETE);
+    StartRecoveryWorker();
     LOG(INFO) << "P2PHotStandbyService started"
               << ", cluster_id=" << config_.cluster_id
               << ", baseline_sequence_id=" << baseline_sequence_id;
@@ -60,13 +65,7 @@ ErrorCode P2PHotStandbyService::StartOplogFollowingLocked(
     uint64_t baseline_sequence_id) {
     ResetOplogFollowingLocked();
 
-    watcher_oplog_store_ = OpLogStoreFactory::Create(
-        config_.oplog_store_type, config_.cluster_id, OpLogStoreRole::READER,
-        config_.oplog_store_type == OpLogStoreType::REDIS
-            ? config_.redis_endpoint
-            : config_.oplog_store_root_dir,
-        config_.oplog_poll_interval_ms, config_.redis_password,
-        config_.redis_username, config_.redis_db_index);
+    watcher_oplog_store_ = CreateReaderStore();
     if (!watcher_oplog_store_) {
         LOG(ERROR) << "P2PHotStandbyService: failed to create reader store"
                    << ", cluster_id=" << config_.cluster_id;
@@ -103,6 +102,19 @@ ErrorCode P2PHotStandbyService::StartOplogFollowingLocked(
     return ErrorCode::INTERNAL_ERROR;
 }
 
+std::unique_ptr<OpLogStore> P2PHotStandbyService::CreateReaderStore() const {
+    if (reader_store_factory_) {
+        return reader_store_factory_();
+    }
+    return OpLogStoreFactory::Create(
+        config_.oplog_store_type, config_.cluster_id, OpLogStoreRole::READER,
+        config_.oplog_store_type == OpLogStoreType::REDIS
+            ? config_.redis_endpoint
+            : config_.oplog_store_root_dir,
+        config_.oplog_poll_interval_ms, config_.redis_password,
+        config_.redis_username, config_.redis_db_index);
+}
+
 void P2PHotStandbyService::ResetOplogFollowingLocked() {
     if (oplog_replicator_) {
         oplog_replicator_->Stop();
@@ -116,6 +128,8 @@ void P2PHotStandbyService::ResetOplogFollowingLocked() {
 }
 
 void P2PHotStandbyService::Stop() {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    StopRecoveryWorker();
     std::lock_guard<std::mutex> lock(mutex_);
 
     ResetOplogFollowingLocked();
@@ -131,6 +145,22 @@ void P2PHotStandbyService::Stop() {
 }
 
 ErrorCode P2PHotStandbyService::Promote(bool force) {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const bool apply_failed =
+            oplog_applier_ != nullptr && !oplog_applier_->IsHealthy();
+        const bool force_apply_failure =
+            force && apply_failed && GetState() == StandbyState::FAILED;
+        if (!IsReadyForPromotion() && !force_apply_failure) {
+            LOG(ERROR) << "P2PHotStandbyService: not ready for promotion"
+                       << ", state=" << StandbyStateToString(GetState())
+                       << ", apply_healthy=" << !apply_failed;
+            return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+        }
+    }
+
+    StopRecoveryWorker();
     std::lock_guard<std::mutex> lock(mutex_);
     const bool apply_failed =
         oplog_applier_ != nullptr && !oplog_applier_->IsHealthy();
@@ -140,6 +170,7 @@ ErrorCode P2PHotStandbyService::Promote(bool force) {
         LOG(ERROR) << "P2PHotStandbyService: not ready for promotion"
                    << ", state=" << StandbyStateToString(GetState())
                    << ", apply_healthy=" << !apply_failed;
+        RestoreRecoveryWorker();
         return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     }
 
@@ -149,6 +180,7 @@ ErrorCode P2PHotStandbyService::Promote(bool force) {
     if (!promote_result.allowed) {
         LOG(ERROR) << "P2PHotStandbyService: cannot promote: "
                    << promote_result.reason;
+        RestoreRecoveryWorker();
         return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     }
 
@@ -207,13 +239,7 @@ ErrorCode P2PHotStandbyService::Promote(bool force) {
 
 ErrorCode P2PHotStandbyService::FinalCatchUpForPromotionLocked(
     uint64_t current_applied_seq_id) {
-    auto catch_up_store = OpLogStoreFactory::Create(
-        config_.oplog_store_type, config_.cluster_id, OpLogStoreRole::READER,
-        config_.oplog_store_type == OpLogStoreType::REDIS
-            ? config_.redis_endpoint
-            : config_.oplog_store_root_dir,
-        config_.oplog_poll_interval_ms, config_.redis_password,
-        config_.redis_username, config_.redis_db_index);
+    auto catch_up_store = CreateReaderStore();
     if (!catch_up_store) {
         LOG(ERROR) << "P2PHotStandbyService: failed to create catch-up store";
         return ErrorCode::INTERNAL_ERROR;
@@ -349,8 +375,124 @@ void P2PHotStandbyService::OnWatcherEvent(StandbyEvent event) {
                 << ", event=" << StandbyEventToString(event)
                 << ", reason=" << result.reason;
     }
-    // TODO: Add service-level recovery orchestration for RECONNECTING and
-    // RECOVERING states in the follow-up error handling PR.
+    if (result.allowed && result.new_state == StandbyState::RECONNECTING) {
+        RequestRecovery();
+    }
+}
+
+void P2PHotStandbyService::StartRecoveryWorker() {
+    std::lock_guard<std::mutex> lock(recovery_mutex_);
+    if (recovery_thread_.joinable()) {
+        return;
+    }
+    recovery_stopping_ = false;
+    recovery_thread_ = std::thread(&P2PHotStandbyService::RecoveryLoop, this);
+}
+
+void P2PHotStandbyService::StopRecoveryWorker() {
+    {
+        std::lock_guard<std::mutex> lock(recovery_mutex_);
+        recovery_stopping_ = true;
+        recovery_requested_ = false;
+    }
+    recovery_cv_.notify_all();
+    if (recovery_thread_.joinable()) {
+        recovery_thread_.join();
+    }
+}
+
+void P2PHotStandbyService::RestoreRecoveryWorker() {
+    StartRecoveryWorker();
+    if (state_machine_.GetState() == StandbyState::RECONNECTING) {
+        RequestRecovery();
+    }
+}
+
+void P2PHotStandbyService::RequestRecovery() {
+    {
+        std::lock_guard<std::mutex> lock(recovery_mutex_);
+        if (recovery_stopping_) {
+            return;
+        }
+        recovery_requested_ = true;
+    }
+    recovery_cv_.notify_one();
+}
+
+void P2PHotStandbyService::RecoveryLoop() {
+    std::unique_lock<std::mutex> recovery_lock(recovery_mutex_);
+    while (true) {
+        recovery_cv_.wait(recovery_lock, [this] {
+            return recovery_stopping_ || recovery_requested_;
+        });
+        if (recovery_stopping_) {
+            return;
+        }
+        recovery_requested_ = false;
+        const int max_backoff_ms =
+            std::max(1, config_.reconnect_max_backoff_ms);
+        int backoff_ms = std::min(
+            std::max(1, config_.reconnect_initial_backoff_ms), max_backoff_ms);
+
+        while (!recovery_stopping_) {
+            recovery_lock.unlock();
+
+            ErrorCode err = ErrorCode::INTERNAL_ERROR;
+            uint64_t resume_sequence_id = 0;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (state_machine_.GetState() != StandbyState::RECONNECTING) {
+                    recovery_lock.lock();
+                    break;
+                }
+                resume_sequence_id = GetLocalLastAppliedSequenceIdLocked();
+                HAMetricManager::instance()
+                    .inc_oplog_reader_reconnect_attempts();
+                err = StartOplogFollowingLocked(resume_sequence_id);
+                if (err == ErrorCode::OK) {
+                    const bool watching =
+                        state_machine_.GetState() == StandbyState::WATCHING;
+                    const bool healthy =
+                        oplog_replicator_ && oplog_replicator_->IsHealthy();
+                    if (!watching || !healthy) {
+                        if (watching) {
+                            state_machine_.ProcessEvent(
+                                StandbyEvent::WATCH_BROKEN);
+                        }
+                        LOG(ERROR)
+                            << "P2PHotStandbyService: recovered OpLog reader "
+                               "is not healthy"
+                            << ", state="
+                            << StandbyStateToString(state_machine_.GetState());
+                        err = ErrorCode::INTERNAL_ERROR;
+                    }
+                } else {
+                    state_machine_.ProcessEvent(StandbyEvent::RECOVERY_FAILED);
+                }
+            }
+
+            recovery_lock.lock();
+            if (recovery_stopping_) {
+                return;
+            }
+            if (err == ErrorCode::OK) {
+                HAMetricManager::instance().inc_oplog_reader_reconnects();
+                LOG(INFO) << "P2PHotStandbyService: OpLog reader reconnected"
+                          << ", resume_sequence_id=" << resume_sequence_id;
+                break;
+            }
+
+            HAMetricManager::instance().inc_oplog_reader_reconnect_failures();
+            LOG(WARNING) << "P2PHotStandbyService: OpLog reader reconnect "
+                            "failed"
+                         << ", resume_sequence_id=" << resume_sequence_id
+                         << ", retry_in_ms=" << backoff_ms;
+            recovery_cv_.wait_for(recovery_lock,
+                                  std::chrono::milliseconds(backoff_ms),
+                                  [this] { return recovery_stopping_; });
+            backoff_ms += std::min(backoff_ms, max_backoff_ms - backoff_ms);
+        }
+    }
 }
 
 }  // namespace mooncake

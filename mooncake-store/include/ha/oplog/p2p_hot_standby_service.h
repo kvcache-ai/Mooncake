@@ -2,10 +2,13 @@
 #pragma once
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 
 #include "ha/oplog/oplog_replicator.h"
 #include "ha/oplog/oplog_store_factory.h"
@@ -25,6 +28,8 @@ struct P2PHotStandbyConfig {
     std::string redis_password;
     int redis_db_index{0};
     int oplog_poll_interval_ms{kDefaultOpLogPollIntervalMs};
+    int reconnect_initial_backoff_ms{100};
+    int reconnect_max_backoff_ms{5000};
 };
 
 struct P2PStandbySyncStatus {
@@ -50,7 +55,10 @@ struct P2PStandbySyncStatus {
 // layer P2P-specific.
 class P2PHotStandbyService {
    public:
-    explicit P2PHotStandbyService(P2PHotStandbyConfig config);
+    using ReaderStoreFactory = std::function<std::unique_ptr<OpLogStore>()>;
+
+    explicit P2PHotStandbyService(P2PHotStandbyConfig config,
+                                  ReaderStoreFactory reader_store_factory = {});
     ~P2PHotStandbyService();
 
     P2PHotStandbyService(const P2PHotStandbyService&) = delete;
@@ -79,12 +87,19 @@ class P2PHotStandbyService {
 
    private:
     ErrorCode StartOplogFollowingLocked(uint64_t baseline_sequence_id);
+    std::unique_ptr<OpLogStore> CreateReaderStore() const;
     void ResetOplogFollowingLocked();
     ErrorCode FinalCatchUpForPromotionLocked(uint64_t current_applied_seq_id);
     uint64_t GetLocalLastAppliedSequenceIdLocked() const;
     void OnWatcherEvent(StandbyEvent event);
+    void StartRecoveryWorker();
+    void StopRecoveryWorker();
+    void RestoreRecoveryWorker();
+    void RequestRecovery();
+    void RecoveryLoop();
 
     P2PHotStandbyConfig config_;
+    ReaderStoreFactory reader_store_factory_;
 
     std::unique_ptr<P2PStandbyMetadataStore> metadata_store_;
     std::unique_ptr<P2POpLogApplier> oplog_applier_;
@@ -93,7 +108,15 @@ class P2PHotStandbyService {
     std::unique_ptr<OpLogReplicator> oplog_replicator_;
 
     StandbyStateMachine state_machine_;
+    // Serializes Start(), Stop(), and Promote().
+    std::mutex lifecycle_mutex_;
     mutable std::mutex mutex_;
+
+    std::mutex recovery_mutex_;
+    std::condition_variable recovery_cv_;
+    std::thread recovery_thread_;
+    bool recovery_requested_{false};
+    bool recovery_stopping_{false};
 };
 
 }  // namespace mooncake

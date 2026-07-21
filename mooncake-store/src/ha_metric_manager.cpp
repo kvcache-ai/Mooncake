@@ -87,6 +87,15 @@ HAMetricManager::HAMetricManager()
           "Total number of synchronous OpLog wait timeouts"),
       oplog_read_failures_total_("ha_oplog_read_failures_total",
                                  "Total number of Standby OpLog read failures"),
+      oplog_reader_reconnect_attempts_total_(
+          "ha_oplog_reader_reconnect_attempts_total",
+          "Total Standby OpLog reader reconnect attempts"),
+      oplog_reader_reconnect_failures_total_(
+          "ha_oplog_reader_reconnect_failures_total",
+          "Total failed Standby OpLog reader reconnect attempts"),
+      oplog_reader_reconnects_total_(
+          "ha_oplog_reader_reconnects_total",
+          "Total successful Standby OpLog reader reconnects"),
       oplog_apply_failures_total_(
           "ha_oplog_apply_failures_total",
           "Total number of critical Standby OpLog apply failures"),
@@ -312,6 +321,15 @@ void HAMetricManager::inc_oplog_sync_wait_timeouts(int64_t val) {
 void HAMetricManager::inc_oplog_read_failures(int64_t val) {
     oplog_read_failures_total_.inc(val);
 }
+void HAMetricManager::inc_oplog_reader_reconnect_attempts(int64_t val) {
+    oplog_reader_reconnect_attempts_total_.inc(val);
+}
+void HAMetricManager::inc_oplog_reader_reconnect_failures(int64_t val) {
+    oplog_reader_reconnect_failures_total_.inc(val);
+}
+void HAMetricManager::inc_oplog_reader_reconnects(int64_t val) {
+    oplog_reader_reconnects_total_.inc(val);
+}
 void HAMetricManager::inc_oplog_apply_failures(int64_t val) {
     oplog_apply_failures_total_.inc(val);
 }
@@ -452,6 +470,9 @@ std::string HAMetricManager::serialize_metrics() {
     serialize_metric(oplog_queue_bypassed_total_);
     serialize_metric(oplog_sync_wait_timeouts_total_);
     serialize_metric(oplog_read_failures_total_);
+    serialize_metric(oplog_reader_reconnect_attempts_total_);
+    serialize_metric(oplog_reader_reconnect_failures_total_);
+    serialize_metric(oplog_reader_reconnects_total_);
     serialize_metric(oplog_apply_failures_total_);
     serialize_metric(oplog_best_effort_apply_skipped_total_);
     serialize_metric(oplog_confirmed_holes_total_);

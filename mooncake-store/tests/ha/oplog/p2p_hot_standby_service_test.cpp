@@ -4,6 +4,7 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -14,12 +15,94 @@
 #include <xxhash.h>
 
 #include "ha/oplog/localfs_oplog_store.h"
+#include "mock_oplog_store.h"
 #include "p2p_master_service.h"
 #include "p2p_rpc_service.h"
 #include "p2p_rpc_types.h"
 
 namespace mooncake::test {
 namespace {
+
+struct ControlledNotifierState {
+    std::mutex mutex;
+    std::condition_variable cv;
+    OpLogChangeNotifier::ErrorCallback on_error;
+    uint64_t start_sequence_id{0};
+    int active_callbacks{0};
+    bool healthy_on_start{true};
+    bool healthy{false};
+};
+
+class ControlledNotifier : public OpLogChangeNotifier {
+   public:
+    explicit ControlledNotifier(std::shared_ptr<ControlledNotifierState> state)
+        : state_(std::move(state)) {}
+
+    ErrorCode Start(uint64_t start_sequence_id, EntryCallback,
+                    ErrorCallback on_error, MaintenanceCallback = {}) override {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        state_->start_sequence_id = start_sequence_id;
+        state_->on_error = std::move(on_error);
+        state_->healthy = state_->healthy_on_start;
+        return ErrorCode::OK;
+    }
+
+    void Stop() override {
+        std::unique_lock<std::mutex> lock(state_->mutex);
+        state_->healthy = false;
+        state_->cv.wait(lock, [this] { return state_->active_callbacks == 0; });
+    }
+
+    bool IsHealthy() const override {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        return state_->healthy;
+    }
+
+   private:
+    std::shared_ptr<ControlledNotifierState> state_;
+};
+
+class ControlledReaderStore : public MockOpLogStore {
+   public:
+    explicit ControlledReaderStore(
+        std::shared_ptr<ControlledNotifierState> state)
+        : state_(std::move(state)) {}
+
+    std::unique_ptr<OpLogChangeNotifier> CreateChangeNotifier(
+        const std::string&) override {
+        return std::make_unique<ControlledNotifier>(state_);
+    }
+
+   private:
+    std::shared_ptr<ControlledNotifierState> state_;
+};
+
+void InjectNotifierErrors(const std::shared_ptr<ControlledNotifierState>& state,
+                          ErrorCode error, int count = 1) {
+    OpLogChangeNotifier::ErrorCallback callback;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        callback = state->on_error;
+        ++state->active_callbacks;
+    }
+    if (!callback) {
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            --state->active_callbacks;
+        }
+        state->cv.notify_all();
+        ADD_FAILURE() << "Notifier error callback is not installed";
+        return;
+    }
+    for (int i = 0; i < count; ++i) {
+        callback(error);
+    }
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        --state->active_callbacks;
+    }
+    state->cv.notify_all();
+}
 
 class P2PHotStandbyServiceTest : public ::testing::Test {
    protected:
@@ -173,6 +256,186 @@ TEST_F(P2PHotStandbyServiceTest, ReplicatesMasterWrittenP2POplog) {
     EXPECT_EQ(desc.segment_id, segment_id);
     EXPECT_EQ(desc.ip_address, "127.0.0.1");
     EXPECT_EQ(desc.rpc_port, 50051);
+}
+
+TEST_F(P2PHotStandbyServiceTest, ReconnectsFromLastAppliedSequence) {
+    std::mutex states_mutex;
+    std::vector<std::shared_ptr<ControlledNotifierState>> states;
+    std::atomic<int> factory_calls{0};
+    auto factory = [&]() -> std::unique_ptr<OpLogStore> {
+        const int call = ++factory_calls;
+        auto state = std::make_shared<ControlledNotifierState>();
+        if (call == 2) {
+            state->healthy_on_start = false;
+        }
+        {
+            std::lock_guard<std::mutex> lock(states_mutex);
+            states.push_back(state);
+        }
+        return std::make_unique<ControlledReaderStore>(state);
+    };
+
+    auto config = MakeStandbyConfig();
+    config.reconnect_initial_backoff_ms = 1;
+    config.reconnect_max_backoff_ms = 5;
+    P2PHotStandbyService standby(config, factory);
+    ASSERT_EQ(standby.Start(/*baseline_sequence_id=*/7), ErrorCode::OK);
+    std::shared_ptr<ControlledNotifierState> first_state;
+    {
+        std::lock_guard<std::mutex> lock(states_mutex);
+        ASSERT_EQ(states.size(), 1);
+        first_state = states.front();
+    }
+    InjectNotifierErrors(first_state, ErrorCode::INTERNAL_ERROR);
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline) {
+        size_t state_count = 0;
+        {
+            std::lock_guard<std::mutex> lock(states_mutex);
+            state_count = states.size();
+        }
+        if (state_count >= 2 && standby.GetState() == StandbyState::WATCHING) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    std::shared_ptr<ControlledNotifierState> second_state;
+    {
+        std::lock_guard<std::mutex> lock(states_mutex);
+        ASSERT_GE(states.size(), 3);
+        second_state = states.back();
+    }
+    EXPECT_GE(factory_calls.load(), 3);
+    {
+        std::lock_guard<std::mutex> lock(second_state->mutex);
+        EXPECT_EQ(second_state->start_sequence_id, 7);
+        EXPECT_TRUE(second_state->healthy);
+    }
+    EXPECT_EQ(standby.GetState(), StandbyState::WATCHING);
+    standby.Stop();
+}
+
+TEST_F(P2PHotStandbyServiceTest, CoalescesRepeatedWatchErrors) {
+    std::mutex states_mutex;
+    std::vector<std::shared_ptr<ControlledNotifierState>> states;
+    std::atomic<int> factory_calls{0};
+    auto factory = [&]() -> std::unique_ptr<OpLogStore> {
+        ++factory_calls;
+        auto state = std::make_shared<ControlledNotifierState>();
+        {
+            std::lock_guard<std::mutex> lock(states_mutex);
+            states.push_back(state);
+        }
+        return std::make_unique<ControlledReaderStore>(state);
+    };
+
+    P2PHotStandbyService standby(MakeStandbyConfig(), factory);
+    ASSERT_EQ(standby.Start(), ErrorCode::OK);
+
+    std::shared_ptr<ControlledNotifierState> first_state;
+    {
+        std::lock_guard<std::mutex> lock(states_mutex);
+        first_state = states.front();
+    }
+    InjectNotifierErrors(first_state, ErrorCode::INTERNAL_ERROR, 2);
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline &&
+           (factory_calls.load() < 2 ||
+            standby.GetState() != StandbyState::WATCHING)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    EXPECT_EQ(factory_calls.load(), 2);
+    EXPECT_EQ(standby.GetState(), StandbyState::WATCHING);
+    standby.Stop();
+}
+
+TEST_F(P2PHotStandbyServiceTest, StopInterruptsReconnectBackoff) {
+    std::shared_ptr<ControlledNotifierState> first_state;
+    std::atomic<int> factory_calls{0};
+    auto factory = [&]() -> std::unique_ptr<OpLogStore> {
+        const int call = ++factory_calls;
+        if (call > 1) {
+            return nullptr;
+        }
+        first_state = std::make_shared<ControlledNotifierState>();
+        return std::make_unique<ControlledReaderStore>(first_state);
+    };
+
+    auto config = MakeStandbyConfig();
+    config.reconnect_initial_backoff_ms = 1000;
+    config.reconnect_max_backoff_ms = 1000;
+    P2PHotStandbyService standby(config, factory);
+    ASSERT_EQ(standby.Start(), ErrorCode::OK);
+    InjectNotifierErrors(first_state, ErrorCode::INTERNAL_ERROR);
+
+    const auto reconnect_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < reconnect_deadline &&
+           factory_calls.load() < 2) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_GE(factory_calls.load(), 2);
+
+    const auto stop_start = std::chrono::steady_clock::now();
+    standby.Stop();
+    const auto stop_elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - stop_start);
+
+    EXPECT_LT(stop_elapsed, std::chrono::milliseconds(250));
+    EXPECT_EQ(standby.GetState(), StandbyState::STOPPED);
+    const int calls_after_stop = factory_calls.load();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_EQ(factory_calls.load(), calls_after_stop);
+}
+
+TEST_F(P2PHotStandbyServiceTest, CapsInitialReconnectBackoffAtMaximum) {
+    std::shared_ptr<ControlledNotifierState> first_state;
+    std::atomic<int> factory_calls{0};
+    auto factory = [&]() -> std::unique_ptr<OpLogStore> {
+        if (++factory_calls > 1) {
+            return nullptr;
+        }
+        first_state = std::make_shared<ControlledNotifierState>();
+        return std::make_unique<ControlledReaderStore>(first_state);
+    };
+
+    auto config = MakeStandbyConfig();
+    config.reconnect_initial_backoff_ms = 1000;
+    config.reconnect_max_backoff_ms = 1;
+    P2PHotStandbyService standby(config, factory);
+    ASSERT_EQ(standby.Start(), ErrorCode::OK);
+    InjectNotifierErrors(first_state, ErrorCode::INTERNAL_ERROR);
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+    while (std::chrono::steady_clock::now() < deadline &&
+           factory_calls.load() < 3) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_GE(factory_calls.load(), 3);
+    standby.Stop();
+}
+
+TEST_F(P2PHotStandbyServiceTest, SerializesConcurrentPromoteAndStop) {
+    P2PHotStandbyService standby(MakeStandbyConfig());
+    ASSERT_EQ(standby.Start(), ErrorCode::OK);
+
+    ErrorCode promote_result = ErrorCode::INTERNAL_ERROR;
+    std::thread promote_thread([&] { promote_result = standby.Promote(); });
+    std::thread stop_thread([&] { standby.Stop(); });
+    promote_thread.join();
+    stop_thread.join();
+
+    EXPECT_TRUE(promote_result == ErrorCode::OK ||
+                promote_result == ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    EXPECT_EQ(standby.GetState(), StandbyState::STOPPED);
 }
 
 TEST_F(P2PHotStandbyServiceTest, UnmountSegmentCascadeIsReplayed) {
