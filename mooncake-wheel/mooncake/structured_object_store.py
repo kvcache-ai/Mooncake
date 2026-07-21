@@ -545,28 +545,21 @@ class MooncakeBundleTransfer:
             if owner is not None:
                 release_owner(owner)
                 return
+
+            items_to_visit = None
             if isinstance(value, Mapping):
+                items_to_visit = value.values()
+            elif isinstance(value, (list, tuple)):
+                items_to_visit = value
+            elif isinstance(value, np.ndarray) and value.dtype == object:
+                items_to_visit = value.flat
+
+            if items_to_visit is not None:
                 container_id = id(value)
                 if container_id in visited_containers:
                     return
                 visited_containers.add(container_id)
-                for item in value.values():
-                    visit(item)
-                return
-            if isinstance(value, (list, tuple)):
-                container_id = id(value)
-                if container_id in visited_containers:
-                    return
-                visited_containers.add(container_id)
-                for item in value:
-                    visit(item)
-                return
-            if isinstance(value, np.ndarray) and value.dtype == object:
-                container_id = id(value)
-                if container_id in visited_containers:
-                    return
-                visited_containers.add(container_id)
-                for item in value.flat:
+                for item in items_to_visit:
                     visit(item)
 
         visit(result)
