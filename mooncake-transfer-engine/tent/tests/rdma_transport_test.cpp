@@ -29,7 +29,9 @@
 #include "tent/common/config.h"
 #include "tent/common/types.h"
 #include "tent/transfer_engine.h"
+#include "tent/transport/rdma/connect_pause_tracker.h"
 #include "tent/transport/rdma/params.h"
+#include "tent/transport/rdma/rdma_gid_probe.h"
 #include "tent/transport/rdma/rdma_transport.h"
 
 namespace mooncake {
@@ -109,6 +111,59 @@ TEST(RdmaParamsTest, DefaultsKeepLaneCountsAligned) {
     EXPECT_EQ(params.endpoint.qp_mul_factor, params.num_lanes);
     EXPECT_EQ(params.workers.num_workers, params.num_lanes);
     EXPECT_EQ(params.endpoint.path_mtu, IBV_MTU_4096);
+    EXPECT_EQ(params.endpoint.conn_pause_ttl_ms, 1000);
+    EXPECT_EQ(params.device.auto_gid_max_retries, 2);
+    EXPECT_TRUE(params.endpoint.mlx5_qp_udp_sports.empty());
+    EXPECT_FALSE(params.endpoint.mlx5_qp_lag_port_balance);
+    EXPECT_FALSE(params.workers.track_posted_slices);
+}
+
+TEST(AutoGidProbeTest, RanksPrivateV4AheadOfDegradedOverlay) {
+    AutoGidCandidate overlay;
+    overlay.gid_index = 1;
+    overlay.gid = "overlay";
+    overlay.gid_type = IBV_GID_TYPE_ROCE_V2;
+    overlay.has_network_device = true;
+    overlay.is_ipv4_mapped = true;
+    overlay.is_overlay_network = true;
+
+    AutoGidCandidate private_v4;
+    private_v4.gid_index = 2;
+    private_v4.gid = "private";
+    private_v4.gid_type = IBV_GID_TYPE_ROCE_V2;
+    private_v4.has_network_device = true;
+    private_v4.is_ipv4_mapped = true;
+    private_v4.is_overlay_ipv4 = true;
+
+    auto selection = selectBestAutoGidCandidate({overlay, private_v4});
+
+    ASSERT_TRUE(selection.has_value());
+    EXPECT_EQ(selection->gid_index, 2);
+    EXPECT_EQ(selection->candidate_class,
+              AutoGidCandidateClass::kNetworkPrivateV4);
+}
+
+TEST(ConnectPauseTrackerTest, PausesUntilExpiryAndPrunes) {
+    uint64_t now = 100;
+    ConnectPauseTracker tracker([&] { return now; });
+
+    EXPECT_FALSE(tracker.isPaused("peer-a"));
+    tracker.pauseFor("peer-a", 50);
+    tracker.pauseFor("peer-b", 100);
+    EXPECT_TRUE(tracker.isPaused("peer-a"));
+    EXPECT_TRUE(tracker.isPaused("peer-b"));
+
+    now = 151;
+    EXPECT_FALSE(tracker.isPaused("peer-a"));
+    EXPECT_TRUE(tracker.isPaused("peer-b"));
+    tracker.prune();
+    EXPECT_FALSE(tracker.isPaused("peer-a"));
+    EXPECT_TRUE(tracker.isPaused("peer-b"));
+
+    now = 201;
+    tracker.prune();
+    EXPECT_FALSE(tracker.isPaused("peer-a"));
+    EXPECT_FALSE(tracker.isPaused("peer-b"));
 }
 
 TEST(RdmaSubBatchTest, ReportsTaskCount) {

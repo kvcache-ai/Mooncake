@@ -20,6 +20,7 @@
 #include <atomic>
 #include <memory>
 #include <optional>
+#include <string>
 
 #include "context.h"
 #include "endpoint.h"
@@ -37,7 +38,8 @@ class EndpointStore {
     virtual std::shared_ptr<RdmaEndPoint> getOrInsert(
         const std::string &key) = 0;
 
-    virtual int remove(RdmaEndPoint *ep) = 0;
+    virtual int remove(RdmaEndPoint *ep,
+                       std::string *removed_key = nullptr) = 0;
 
     // Terminal context-shutdown operation. Unlike remove()/reclaim(), clear()
     // synchronously releases every endpoint's verbs resources because workers
@@ -61,7 +63,8 @@ class FIFOEndpointStore : public EndpointStore {
 
     std::shared_ptr<RdmaEndPoint> getOrInsert(const std::string &key) override;
 
-    int remove(RdmaEndPoint *ep) override;
+    int remove(RdmaEndPoint *ep,
+               std::string *removed_key = nullptr) override;
 
     int clear() override;
 
@@ -99,7 +102,8 @@ class SIEVEEndpointStore : public EndpointStore {
 
     size_t size() override;
 
-    int remove(RdmaEndPoint *ep) override;
+    int remove(RdmaEndPoint *ep,
+               std::string *removed_key = nullptr) override;
     void evictOne() override;
     void reclaim() override;
 

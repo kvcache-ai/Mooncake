@@ -33,6 +33,15 @@ class EndpointStoreTestAccess {
         store.waiting_list_.insert(std::move(endpoint));
     }
 
+    static void insertActive(FIFOEndpointStore& store, const std::string& key,
+                             std::shared_ptr<RdmaEndPoint> endpoint) {
+        RWSpinlock::WriteGuard guard(store.endpoint_map_lock_);
+        store.endpoint_map_[key] = endpoint;
+        store.fifo_list_.push_back(key);
+        auto it = store.fifo_list_.end();
+        store.fifo_map_[key] = --it;
+    }
+
     static void insertWaiting(SIEVEEndpointStore& store,
                               std::shared_ptr<RdmaEndPoint> endpoint) {
         endpoint->beginDestroy();
@@ -40,6 +49,14 @@ class EndpointStoreTestAccess {
         if (store.waiting_list_.insert(std::move(endpoint)).second) {
             store.waiting_list_len_.fetch_add(1, std::memory_order_relaxed);
         }
+    }
+
+    static void insertActive(SIEVEEndpointStore& store, const std::string& key,
+                             std::shared_ptr<RdmaEndPoint> endpoint) {
+        RWSpinlock::WriteGuard guard(store.endpoint_map_lock_);
+        store.endpoint_map_[key] = std::make_pair(endpoint, false);
+        store.fifo_list_.push_front(key);
+        store.fifo_map_[key] = store.fifo_list_.begin();
     }
 
     static size_t waitingListSize(FIFOEndpointStore& store) {
@@ -76,6 +93,19 @@ class EndpointStoreTest : public testing::TestWithParam<StoreType> {
         } else {
             EndpointStoreTestAccess::insertWaiting(
                 static_cast<SIEVEEndpointStore&>(store), std::move(endpoint));
+        }
+    }
+
+    void insertActive(EndpointStore& store, const std::string& key,
+                      std::shared_ptr<RdmaEndPoint> endpoint) {
+        if (GetParam() == StoreType::FIFO) {
+            EndpointStoreTestAccess::insertActive(
+                static_cast<FIFOEndpointStore&>(store), key,
+                std::move(endpoint));
+        } else {
+            EndpointStoreTestAccess::insertActive(
+                static_cast<SIEVEEndpointStore&>(store), key,
+                std::move(endpoint));
         }
     }
 
@@ -117,6 +147,19 @@ TEST_P(EndpointStoreTest, ReclaimIsIdempotentWhenEmpty) {
 
     store->reclaim();
     EXPECT_EQ(waitingListSize(*store), 0);
+}
+
+TEST_P(EndpointStoreTest, RemoveReturnsPeerKeyForConnectPause) {
+    auto store = makeStore();
+    auto endpoint = std::make_shared<RdmaEndPoint>();
+    auto* raw = endpoint.get();
+    const std::string key = "127.0.0.1:1234@mlx5_0";
+    insertActive(*store, key, std::move(endpoint));
+
+    std::string removed_key;
+    EXPECT_EQ(store->remove(raw, &removed_key), 0);
+    EXPECT_EQ(removed_key, key);
+    EXPECT_EQ(store->size(), 0);
 }
 
 TEST_P(EndpointStoreTest, ReclaimDrainsBacklogWithoutActiveMapEntries) {

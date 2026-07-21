@@ -161,9 +161,11 @@ static Status convertConfToRdmaParams(std::shared_ptr<Config> conf,
     SET_DEVICE(num_comp_channels, params->device.num_comp_channels);
     SET_DEVICE(port, params->device.port);
     SET_DEVICE(gid_index, params->device.gid_index);
+    SET_DEVICE(auto_gid_max_retries, params->device.auto_gid_max_retries);
     SET_DEVICE(max_cqe, params->device.max_cqe);
 
     SET_ENDPOINT(endpoint_store_cap, params->endpoint.endpoint_store_cap);
+    SET_ENDPOINT(conn_pause_ttl_ms, params->endpoint.conn_pause_ttl_ms);
     SET_ENDPOINT(max_sge, params->endpoint.max_sge);
     SET_ENDPOINT(max_qp_wr, params->endpoint.max_qp_wr);
     SET_ENDPOINT(max_inline_bytes, params->endpoint.max_inline_bytes);
@@ -177,6 +179,9 @@ static Status convertConfToRdmaParams(std::shared_ptr<Config> conf,
     SET_ENDPOINT(rq_psn, params->endpoint.rq_psn);
     SET_ENDPOINT(max_dest_rd_atomic, params->endpoint.max_dest_rd_atomic);
     SET_ENDPOINT(min_rnr_timer, params->endpoint.min_rnr_timer);
+    SET_ENDPOINT(mlx5_qp_udp_sports, params->endpoint.mlx5_qp_udp_sports);
+    SET_ENDPOINT(mlx5_qp_lag_port_balance,
+                 params->endpoint.mlx5_qp_lag_port_balance);
     SET_ENDPOINT(sq_psn, params->endpoint.sq_psn);
     SET_ENDPOINT(send_timeout, params->endpoint.send_timeout);
     SET_ENDPOINT(send_retry_count, params->endpoint.send_retry_count);
@@ -232,6 +237,7 @@ static Status convertConfToRdmaParams(std::shared_ptr<Config> conf,
     SET_WORKERS(block_size, params->workers.block_size);
     SET_WORKERS(grace_period_ns, params->workers.grace_period_ns);
     SET_WORKERS(rail_topo_path, params->workers.rail_topo_path);
+    SET_WORKERS(track_posted_slices, params->workers.track_posted_slices);
 
     params->verbose = conf->get("verbose", false);
     params->log_slice_affinity =

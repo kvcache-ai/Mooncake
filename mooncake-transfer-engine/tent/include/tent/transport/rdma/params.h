@@ -30,6 +30,7 @@ struct DeviceParams {
     int num_comp_channels = 1;
     uint8_t port = 1;
     int gid_index = -1;  // -1 means auto-select, >= 0 means explicit index
+    int auto_gid_max_retries = 2;
     int max_cqe = 4096;
 };
 
@@ -53,6 +54,7 @@ struct QpPoolSegment {
 
 struct EndPointParams {
     int endpoint_store_cap = 65536;
+    int conn_pause_ttl_ms = 1000;
     int qp_mul_factor = 6;  // Derived from RdmaParams::num_lanes.
     int max_sge = 4;
     int max_qp_wr = 256;
@@ -78,6 +80,11 @@ struct EndPointParams {
     uint32_t rq_psn = 0;
     uint8_t max_dest_rd_atomic = 16;
     uint8_t min_rnr_timer = 12;
+    // Optional mlx5 direct-verbs tuning. Empty/false keeps default driver
+    // behavior. Requires USE_MLX5DV at build time; otherwise ignored with a
+    // one-time warning.
+    std::vector<uint16_t> mlx5_qp_udp_sports;
+    bool mlx5_qp_lag_port_balance = false;
     // RTS State
     uint32_t sq_psn = 0;
     uint8_t send_timeout = 14;
@@ -154,6 +161,7 @@ struct WorkerParams {
     uint64_t grace_period_ns = 5000000;  // 5ms
     std::string rail_topo_path;
     bool show_latency_info = false;
+    bool track_posted_slices = false;
 };
 
 struct RdmaParams {

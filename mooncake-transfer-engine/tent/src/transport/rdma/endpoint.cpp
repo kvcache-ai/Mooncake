@@ -24,10 +24,15 @@
 #include <queue>
 #include <mutex>
 
+#ifdef USE_MLX5DV
+#include <infiniband/mlx5dv.h>
+#endif
+
 #include "tent/common/status.h"
 #include "tent/common/types.h"
 #include "tent/transport/rdma/context.h"
 #include "tent/transport/rdma/endpoint_store.h"
+#include "tent/transport/rdma/rdma_gid_probe.h"
 #include "tent/common/utils/os.h"
 #include "tent/common/utils/string_builder.h"
 #include "tent/thirdparty/nlohmann/json.h"
@@ -58,6 +63,80 @@ static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
                                    uint16_t pkey_index,
                                    uint8_t service_level = 0,
                                    uint8_t traffic_class = 0);
+
+static void rememberAutoGidSelection(
+    std::vector<AutoGidSelectionIdentity>& attempted_selections,
+    const GidSelectionSnapshot& selection) {
+    auto already_attempted =
+        std::any_of(attempted_selections.begin(), attempted_selections.end(),
+                    [&](const AutoGidSelectionIdentity& attempted) {
+                        return attempted.gid_index == selection.gid_index &&
+                               attempted.gid == selection.gid;
+                    });
+    if (!already_attempted)
+        attempted_selections.push_back({selection.gid_index, selection.gid});
+}
+
+static void applyMlx5QpTuning(ibv_qp* qp, int qp_index, RdmaContext* context,
+                              const EndPointParams* params) {
+    if (params->mlx5_qp_lag_port_balance) {
+#ifdef USE_MLX5DV
+        uint8_t num_lag_ports = context->numLagPorts();
+        if (num_lag_ports > 1) {
+            uint8_t target_port =
+                static_cast<uint8_t>(qp_index % num_lag_ports) + 1;
+            int lag_ret = mlx5dv_modify_qp_lag_port(qp, target_port);
+            if (lag_ret) {
+                LOG_FIRST_N(WARNING, 4)
+                    << "[RDMA] mlx5dv_modify_qp_lag_port failed"
+                    << " (qp_index=" << qp_index
+                    << ", target_port=" << static_cast<int>(target_port)
+                    << "): " << strerror(lag_ret);
+            } else {
+                uint8_t configured_port = 0;
+                uint8_t active_port = 0;
+                if (mlx5dv_query_qp_lag_port(qp, &configured_port,
+                                             &active_port) == 0) {
+                    VLOG(1) << "[RDMA] QP[" << qp_index
+                            << "] qpn=" << qp->qp_num
+                            << " lag_port cfg="
+                            << static_cast<int>(configured_port)
+                            << " active=" << static_cast<int>(active_port);
+                } else {
+                    LOG_FIRST_N(WARNING, 4)
+                        << "[RDMA] mlx5dv_query_qp_lag_port failed"
+                        << " (qp_index=" << qp_index << ")";
+                }
+            }
+        }
+#else
+        LOG_FIRST_N(WARNING, 1)
+            << "MC_MLX5_QP_LAG_PORT_BALANCE is set but TENT was not built "
+               "with USE_MLX5DV; ignoring";
+#endif
+    }
+
+    const auto& udp_sports = params->mlx5_qp_udp_sports;
+    if (!udp_sports.empty()) {
+#ifdef USE_MLX5DV
+        uint16_t sport = udp_sports[qp_index % udp_sports.size()];
+        int sport_ret = mlx5dv_modify_qp_udp_sport(qp, sport);
+        if (sport_ret) {
+            LOG_FIRST_N(WARNING, 4)
+                << "[RDMA] mlx5dv_modify_qp_udp_sport failed (qp_index="
+                << qp_index << ", sport=" << sport
+                << "): " << strerror(sport_ret);
+        } else {
+            VLOG(1) << "[RDMA] QP[" << qp_index << "] qpn=" << qp->qp_num
+                    << " udp_sport=" << sport;
+        }
+#else
+        LOG_FIRST_N(WARNING, 1)
+            << "MC_MLX5_QP_UDP_SPORTS is set but TENT was not built with "
+               "USE_MLX5DV; ignoring";
+#endif
+    }
+}
 
 RdmaEndPoint::RdmaEndPoint()
     : status_(EP_UNINIT),
@@ -398,149 +477,187 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
                              const std::string& peer_nic_name,
                              const std::string& peer_rpc_server_addr) {
     auto& transport = context_->transport_;
-    std::vector<uint32_t> qp_num;
-    BootstrapDesc local_desc, peer_desc;
-    bool same_nic = false;
-    bool is_self = false;
+    int auto_gid_retry_count = 0;
+    std::vector<AutoGidSelectionIdentity> attempted_auto_gid_selections;
 
-    // ===== Phase 1: Prepare (locked) =====
-    // Validate state and build bootstrap descriptors under lock, then release
-    // before any blocking call to avoid self-deadlock when the bootstrap RPC
-    // loops back into the same tent instance.
-    {
-        RWSpinlock::WriteGuard guard(lock_);
-        if (peer_server_name.empty() || peer_nic_name.empty()) {
-            return mooncake::tent::Status::InvalidArgument(
-                "Invalid peer path" LOC_MARK);
-        }
-        if (status_.load(std::memory_order_relaxed) == EP_READY) {
-            return mooncake::tent::Status::OK();
-        }
-        if (status_.load(std::memory_order_relaxed) != EP_HANDSHAKING) {
-            return mooncake::tent::Status::InvalidArgument(
-                "Endpoint not in handshaking state" LOC_MARK);
-        }
+    for (;;) {
+        std::vector<uint32_t> qp_num;
+        BootstrapDesc local_desc, peer_desc;
+        bool same_nic = false;
+        bool is_self = false;
+        GidSelectionSnapshot local_gid_selection;
 
-        local_desc.local_nic_path =
-            MakeNicPath(transport.rdma_server_name_, context_->name());
-        local_desc.peer_nic_path = MakeNicPath(peer_server_name, peer_nic_name);
-        qp_num = qpNum();
-        local_desc.qp_num = qp_num;
-        local_desc.notify_qp_num = notifyQpNum();
-        local_desc.local_lid = context_->lid();
-        local_desc.local_gid = context_->gid();
-
-        same_nic = (local_desc.local_nic_path == local_desc.peer_nic_path);
-        is_self =
-            (!same_nic && (peer_server_name == transport.local_segment_name_ ||
-                           peer_server_name == transport.rdma_server_name_));
-    }
-
-    // ===== Phase 2: Bootstrap (unlocked) =====
-    // Blocking operations (RPC / direct call) happen here without holding
-    // lock_, so the RPC handler can freely acquire locks on peer endpoints.
-    std::string peer_gid;
-    uint16_t peer_lid = 0;
-    if (same_nic) {
-        peer_gid = context_->gid();
-        peer_lid = context_->lid();
-    } else if (is_self) {
-        // Same server, different NIC: call handler directly, bypass RPC
-        int rc = transport.onSetupRdmaConnections(local_desc, peer_desc);
-        if (rc != 0) {
-            return mooncake::tent::Status::InternalError(
-                "Local bootstrap failed: " + peer_desc.reply_msg + LOC_MARK);
-        }
-        qp_num = peer_desc.qp_num;
-        peer_gid = peer_desc.local_gid;
-        peer_lid = peer_desc.local_lid;
-    } else {
-        // Remote server: use RPC
-        std::string rpc_server_addr = peer_rpc_server_addr;
-        if (rpc_server_addr.empty()) {
-            SegmentDescRef segment_desc;
-            auto& manager = transport.metadata_->segmentManager();
-            auto status = manager.getRemote(segment_desc, peer_server_name);
-            if (!status.ok()) return status;
-            rpc_server_addr = segment_desc->rpc_server_addr;
-        }
-        if (rpc_server_addr.empty()) {
-            return mooncake::tent::Status::InvalidArgument(
-                "Missing peer RPC server address" LOC_MARK);
-        }
-        auto bootstrap_status =
-            ControlClient::bootstrap(rpc_server_addr, local_desc, peer_desc);
-        if (!bootstrap_status.ok()) {
-            // With simultaneous open, the peer's bootstrap request may finish
-            // our passive setup while this outbound RPC is still in flight.
-            // A timeout therefore does not necessarily mean that connection
-            // establishment failed. Reuse only the exact endpoint generation
-            // that issued this RPC; EP_READY alone is not sufficient.
+        // ===== Phase 1: Prepare (locked) =====
+        {
             RWSpinlock::WriteGuard guard(lock_);
-            const bool same_peer = peer_server_name_ == peer_server_name &&
-                                   peer_nic_name_ == peer_nic_name;
-            const bool same_local_qps = qpNum() == local_desc.qp_num;
-            if (status_.load(std::memory_order_relaxed) == EP_READY &&
-                same_peer && same_local_qps) {
-                LOG(WARNING)
-                    << "Bootstrap RPC failed after simultaneous-open passive "
-                       "setup completed; reusing the established endpoint "
-                    << endpoint_name_ << ": " << bootstrap_status.ToString();
+            if (peer_server_name.empty() || peer_nic_name.empty()) {
+                return mooncake::tent::Status::InvalidArgument(
+                    "Invalid peer path" LOC_MARK);
+            }
+            if (status_.load(std::memory_order_relaxed) == EP_READY) {
                 return mooncake::tent::Status::OK();
             }
-            return bootstrap_status;
-        }
-        qp_num = peer_desc.qp_num;
-        peer_gid = peer_desc.local_gid;
-        peer_lid = peer_desc.local_lid;
-    }
+            if (status_.load(std::memory_order_relaxed) != EP_HANDSHAKING) {
+                return mooncake::tent::Status::InvalidArgument(
+                    "Endpoint not in handshaking state" LOC_MARK);
+            }
 
-    if (peer_gid.empty()) {
-        return mooncake::tent::Status::InvalidArgument(
-            "Missing peer GID in bootstrap" LOC_MARK);
-    }
+            local_desc.local_nic_path =
+                MakeNicPath(transport.rdma_server_name_, context_->name());
+            local_desc.peer_nic_path =
+                MakeNicPath(peer_server_name, peer_nic_name);
+            qp_num = qpNum();
+            local_desc.qp_num = qp_num;
+            local_desc.notify_qp_num = notifyQpNum();
+            local_desc.local_lid = context_->lid();
+            local_gid_selection = context_->gidSelection();
+            local_desc.local_gid = local_gid_selection.gid;
+            rememberAutoGidSelection(attempted_auto_gid_selections,
+                                     local_gid_selection);
 
-    // ===== Phase 3: Finalize (locked) =====
-    // Re-acquire lock and re-validate: another thread may have completed the
-    // connection while we were doing bootstrap without the lock.
-    {
-        RWSpinlock::WriteGuard guard(lock_);
-        if (status_.load(std::memory_order_relaxed) == EP_READY) {
-            return mooncake::tent::Status::OK();
+            same_nic = (local_desc.local_nic_path == local_desc.peer_nic_path);
+            is_self =
+                (!same_nic &&
+                 (peer_server_name == transport.local_segment_name_ ||
+                  peer_server_name == transport.rdma_server_name_));
         }
-        if (status_.load(std::memory_order_relaxed) != EP_HANDSHAKING) {
+
+        // ===== Phase 2: Bootstrap (unlocked) =====
+        std::string peer_gid;
+        uint16_t peer_lid = 0;
+        if (same_nic) {
+            peer_gid = context_->gid();
+            peer_lid = context_->lid();
+        } else if (is_self) {
+            int rc = transport.onSetupRdmaConnections(local_desc, peer_desc);
+            if (rc != 0) {
+                return mooncake::tent::Status::InternalError(
+                    "Local bootstrap failed: " + peer_desc.reply_msg +
+                    LOC_MARK);
+            }
+            qp_num = peer_desc.qp_num;
+            peer_gid = peer_desc.local_gid;
+            peer_lid = peer_desc.local_lid;
+        } else {
+            std::string rpc_server_addr = peer_rpc_server_addr;
+            if (rpc_server_addr.empty()) {
+                SegmentDescRef segment_desc;
+                auto& manager = transport.metadata_->segmentManager();
+                auto status = manager.getRemote(segment_desc, peer_server_name);
+                if (!status.ok()) return status;
+                rpc_server_addr = segment_desc->rpc_server_addr;
+            }
+            if (rpc_server_addr.empty()) {
+                return mooncake::tent::Status::InvalidArgument(
+                    "Missing peer RPC server address" LOC_MARK);
+            }
+            auto bootstrap_status =
+                ControlClient::bootstrap(rpc_server_addr, local_desc,
+                                         peer_desc);
+            if (!bootstrap_status.ok()) {
+                RWSpinlock::WriteGuard guard(lock_);
+                const bool same_peer = peer_server_name_ == peer_server_name &&
+                                       peer_nic_name_ == peer_nic_name;
+                const bool same_local_qps = qpNum() == local_desc.qp_num;
+                if (status_.load(std::memory_order_relaxed) == EP_READY &&
+                    same_peer && same_local_qps) {
+                    LOG(WARNING)
+                        << "Bootstrap RPC failed after simultaneous-open "
+                           "passive setup completed; reusing endpoint "
+                        << endpoint_name_ << ": "
+                        << bootstrap_status.ToString();
+                    return mooncake::tent::Status::OK();
+                }
+                return bootstrap_status;
+            }
+            qp_num = peer_desc.qp_num;
+            peer_gid = peer_desc.local_gid;
+            peer_lid = peer_desc.local_lid;
+        }
+
+        if (peer_gid.empty()) {
             return mooncake::tent::Status::InvalidArgument(
-                "Endpoint state changed during bootstrap" LOC_MARK);
+                "Missing peer GID in bootstrap" LOC_MARK);
         }
 
-        assert(qp_num.size());
-        peer_server_name_ = peer_server_name;
-        peer_nic_name_ = peer_nic_name;
-        int rc = setupAllQPs(peer_gid, peer_lid, qp_num);
-        if (rc) {
-            beginDestroyNoLock();
-            return mooncake::tent::Status::InternalError(
-                "Failed to configure RDMA endpoint" LOC_MARK);
-        }
-        peer_qp_num_list_ = qp_num;
+        bool retry_with_new_gid = false;
+        {
+            RWSpinlock::WriteGuard guard(lock_);
+            if (status_.load(std::memory_order_relaxed) == EP_READY) {
+                return mooncake::tent::Status::OK();
+            }
+            if (status_.load(std::memory_order_relaxed) != EP_HANDSHAKING) {
+                return mooncake::tent::Status::InvalidArgument(
+                    "Endpoint state changed during bootstrap" LOC_MARK);
+            }
 
-        // Setup notification QP connection if peer supports it
-        if (peer_desc.notify_qp_num != 0 && notify_qp_) {
-            rc = setupNotifyQpConnection(
-                notify_qp_, context_, peer_gid, peer_lid,
-                peer_desc.notify_qp_num, params_->pkey_index,
-                params_->service_level, params_->traffic_class);
+            assert(qp_num.size());
+            peer_server_name_ = peer_server_name;
+            peer_nic_name_ = peer_nic_name;
+            std::string failure_message;
+            SetupConnectionFailureInfo failure_info;
+            int rc = setupAllQPs(peer_gid, peer_lid, qp_num, &failure_message,
+                                 &failure_info);
             if (rc) {
-                LOG(WARNING)
-                    << "Failed to setup notification QP, notification disabled";
-                notify_connected_ = false;
+                if (shouldAttemptAutoGidHandshakeRetry(
+                        context_->autoGidSelectionEnabled(),
+                        auto_gid_retry_count,
+                        context_->params().device.auto_gid_max_retries,
+                        failure_info.stage == SetupConnectionFailureStage::kRtr,
+                        failure_info.sys_errno)) {
+                    bool reprobe_changed = context_->reprobeAutoGid(
+                        local_gid_selection, attempted_auto_gid_selections);
+                    auto current_gid_selection = context_->gidSelection();
+                    auto retry_action = decideAutoGidRetryAction(
+                        reprobe_changed, local_gid_selection.gid_index,
+                        local_gid_selection.gid,
+                        current_gid_selection.gid_index,
+                        current_gid_selection.gid);
+                    if (retry_action != AutoGidRetryAction::kDoNotRetry &&
+                        resetDataQPsToResetNoLock() == 0) {
+                        ++auto_gid_retry_count;
+                        retry_with_new_gid = true;
+                        LOG(WARNING)
+                            << "Retry active bootstrap with updated local GID "
+                               "on "
+                            << context_->name() << ": "
+                            << local_gid_selection.gid << " -> "
+                            << current_gid_selection.gid << " (attempt "
+                            << auto_gid_retry_count << "/"
+                            << context_->params().device.auto_gid_max_retries
+                            << ")";
+                    }
+                }
+                if (!retry_with_new_gid) {
+                    beginDestroyNoLock();
+                    return mooncake::tent::Status::InternalError(
+                        "Failed to configure RDMA endpoint: " +
+                        failure_message + LOC_MARK);
+                }
             } else {
-                notify_connected_ = true;
-                repostAllNotifyRecvs();
-                context_->transport_.registerNotifyQp(notify_qp_->qp_num,
-                                                      shared_from_this());
+                peer_qp_num_list_ = qp_num;
+
+                if (peer_desc.notify_qp_num != 0 && notify_qp_) {
+                    rc = setupNotifyQpConnection(
+                        notify_qp_, context_, peer_gid, peer_lid,
+                        peer_desc.notify_qp_num, params_->pkey_index,
+                        params_->service_level, params_->traffic_class);
+                    if (rc) {
+                        LOG(WARNING) << "Failed to setup notification QP, "
+                                        "notification disabled";
+                        notify_connected_ = false;
+                    } else {
+                        notify_connected_ = true;
+                        repostAllNotifyRecvs();
+                        context_->transport_.registerNotifyQp(
+                            notify_qp_->qp_num, shared_from_this());
+                    }
+                }
             }
         }
+
+        if (retry_with_new_gid) continue;
+        break;
     }
 
     return mooncake::tent::Status::OK();
@@ -604,7 +721,8 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
     local_desc.peer_nic_path = peer_nic_path;
     local_desc.qp_num = qpNum();
     local_desc.local_lid = context_->lid();
-    local_desc.local_gid = context_->gid();
+    auto local_gid_selection = context_->gidSelection();
+    local_desc.local_gid = local_gid_selection.gid;
     local_desc.notify_qp_num = notifyQpNum();  // Pass notification QP number
     if (peer_desc.local_gid.empty()) {
         return mooncake::tent::Status::InvalidArgument(
@@ -612,18 +730,59 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
     }
     peer_server_name_ = peer_server_name;
     peer_nic_name_ = peer_nic_name;
-    int rc =
-        setupAllQPs(peer_desc.local_gid, peer_desc.local_lid, peer_desc.qp_num);
-    if (rc) {
-        beginDestroyNoLock();
-        return mooncake::tent::Status::InternalError(
-            "Failed to configure RDMA endpoint" LOC_MARK);
+
+    int auto_gid_retry_count = 0;
+    std::vector<AutoGidSelectionIdentity> attempted_auto_gid_selections;
+    for (;;) {
+        rememberAutoGidSelection(attempted_auto_gid_selections,
+                                 local_gid_selection);
+        std::string failure_message;
+        SetupConnectionFailureInfo failure_info;
+        int rc = setupAllQPs(peer_desc.local_gid, peer_desc.local_lid,
+                             peer_desc.qp_num, &failure_message,
+                             &failure_info);
+        if (rc == 0) break;
+
+        if (!shouldAttemptAutoGidHandshakeRetry(
+                context_->autoGidSelectionEnabled(), auto_gid_retry_count,
+                context_->params().device.auto_gid_max_retries,
+                failure_info.stage == SetupConnectionFailureStage::kRtr,
+                failure_info.sys_errno)) {
+            beginDestroyNoLock();
+            return mooncake::tent::Status::InternalError(
+                "Failed to configure RDMA endpoint: " + failure_message +
+                LOC_MARK);
+        }
+
+        bool reprobe_changed = context_->reprobeAutoGid(
+            local_gid_selection, attempted_auto_gid_selections);
+        auto current_gid_selection = context_->gidSelection();
+        auto retry_action = decideAutoGidRetryAction(
+            reprobe_changed, local_gid_selection.gid_index,
+            local_gid_selection.gid, current_gid_selection.gid_index,
+            current_gid_selection.gid);
+        if (retry_action == AutoGidRetryAction::kDoNotRetry ||
+            resetDataQPsToResetNoLock() != 0) {
+            beginDestroyNoLock();
+            return mooncake::tent::Status::InternalError(
+                "Failed to configure RDMA endpoint: " + failure_message +
+                LOC_MARK);
+        }
+
+        ++auto_gid_retry_count;
+        LOG(WARNING) << "Retry passive bootstrap with updated local GID on "
+                     << context_->name() << ": " << local_gid_selection.gid
+                     << " -> " << current_gid_selection.gid << " (attempt "
+                     << auto_gid_retry_count << "/"
+                     << context_->params().device.auto_gid_max_retries << ")";
+        local_gid_selection = current_gid_selection;
+        local_desc.local_gid = current_gid_selection.gid;
     }
     peer_qp_num_list_ = peer_desc.qp_num;
 
     // Setup notification QP connection if peer supports it
     if (peer_desc.notify_qp_num != 0 && notify_qp_) {
-        rc = setupNotifyQpConnection(
+        int rc = setupNotifyQpConnection(
             notify_qp_, context_, peer_desc.local_gid, peer_desc.local_lid,
             peer_desc.notify_qp_num, params_->pkey_index,
             params_->service_level, params_->traffic_class);
@@ -661,7 +820,9 @@ int RdmaEndPoint::resetConnection(const std::string& reason) {
     // Delete from endpoint store so endpoint() won't return this endpoint.
     // Store removal happens after releasing lock_ so remove() can safely take
     // the endpoint lock and remains valid for async-event callers too.
-    context_->endpointStore()->remove(endpoint_ptr);
+    std::string removed_key;
+    context_->endpointStore()->remove(endpoint_ptr, &removed_key);
+    if (!removed_key.empty()) context_->pauseConnect(removed_key);
     return 0;
 }
 
@@ -675,12 +836,17 @@ const QpPoolSegment* RdmaEndPoint::poolForQp(int qp_index) const {
 
 int RdmaEndPoint::setupAllQPs(const std::string& peer_gid, uint16_t peer_lid,
                               std::vector<uint32_t> peer_qp_num_list,
-                              std::string* reply_msg) {
+                              std::string* reply_msg,
+                              SetupConnectionFailureInfo* failure_info) {
     if (status_.load(std::memory_order_relaxed) == EP_READY) {
         return -1;
     }
 
     if (qp_list_.size() != peer_qp_num_list.size()) {
+        if (failure_info) {
+            failure_info->stage = SetupConnectionFailureStage::kPeerValidation;
+            failure_info->sys_errno = 0;
+        }
         std::stringstream ss;
         ss << "Inconsistent RDMA lane count: local " << qp_list_.size()
            << " peer " << peer_qp_num_list.size() << " for endpoint "
@@ -692,13 +858,34 @@ int RdmaEndPoint::setupAllQPs(const std::string& peer_gid, uint16_t peer_lid,
 
     for (int qp_index = 0; qp_index < (int)qp_list_.size(); ++qp_index) {
         int ret = setupOneQP(qp_index, peer_gid, peer_lid,
-                             peer_qp_num_list[qp_index], reply_msg);
+                             peer_qp_num_list[qp_index], reply_msg,
+                             failure_info);
         if (ret) {
             return ret;
         }
     }
 
     status_.store(EP_READY, std::memory_order_relaxed);
+    return 0;
+}
+
+int RdmaEndPoint::resetDataQPsToResetNoLock() {
+    ibv_qp_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.qp_state = IBV_QPS_RESET;
+    for (auto* qp : qp_list_) {
+        if (!qp) continue;
+        int ret =
+            context_->verbs_.ibv_modify_qp(qp, &attr, IBV_QP_STATE);
+        if (ret) {
+            std::stringstream ss;
+            ss << "Failed to reset QP in endpoint " << peer_nic_name_ << " of "
+               << peer_server_name_ << ", error code " << errno << ":"
+               << strerror(errno);
+            LOG(ERROR) << ss.str();
+            return ret;
+        }
+    }
     return 0;
 }
 
@@ -882,7 +1069,8 @@ void RdmaEndPoint::cancelQuota(int qp_index, int num_entries) {
 
 int RdmaEndPoint::setupOneQP(int qp_index, const std::string& peer_gid,
                              uint16_t peer_lid, uint32_t peer_qp_num,
-                             std::string* reply_msg) {
+                             std::string* reply_msg,
+                             SetupConnectionFailureInfo* failure_info) {
     assert(qp_index >= 0 && qp_index < (int)qp_list_.size());
     auto& qp = qp_list_[qp_index];
 
@@ -911,6 +1099,10 @@ int RdmaEndPoint::setupOneQP(int qp_index, const std::string& peer_gid,
         qp, &attr,
         IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
     if (ret) {
+        if (failure_info) {
+            failure_info->stage = SetupConnectionFailureStage::kInit;
+            failure_info->sys_errno = errno;
+        }
         std::stringstream ss;
         ss << "Failed to modify QP's state to INIT in endpoint "
            << peer_nic_name_ << " of " << peer_server_name_
@@ -954,6 +1146,10 @@ int RdmaEndPoint::setupOneQP(int qp_index, const std::string& peer_gid,
         IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_MIN_RNR_TIMER | IBV_QP_AV |
             IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN);
     if (ret) {
+        if (failure_info) {
+            failure_info->stage = SetupConnectionFailureStage::kRtr;
+            failure_info->sys_errno = errno;
+        }
         std::stringstream ss;
         ss << "Failed to modify QP's state to RTR in endpoint "
            << peer_nic_name_ << " of " << peer_server_name_
@@ -978,6 +1174,10 @@ int RdmaEndPoint::setupOneQP(int qp_index, const std::string& peer_gid,
         IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
             IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC);
     if (ret) {
+        if (failure_info) {
+            failure_info->stage = SetupConnectionFailureStage::kRts;
+            failure_info->sys_errno = errno;
+        }
         std::stringstream ss;
         ss << "Failed to modify QP's state to RTS in endpoint "
            << peer_nic_name_ << " of " << peer_server_name_ << ", error code "
@@ -986,6 +1186,8 @@ int RdmaEndPoint::setupOneQP(int qp_index, const std::string& peer_gid,
         if (reply_msg) *reply_msg = ss.str();
         return -1;
     }
+
+    applyMlx5QpTuning(qp, qp_index, context_, params_);
 
     return 0;
 }

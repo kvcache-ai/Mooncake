@@ -166,12 +166,27 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     }
 
    private:
+    enum class SetupConnectionFailureStage {
+        kNone = 0,
+        kPeerValidation = 1,
+        kInit = 2,
+        kRtr = 3,
+        kRts = 4,
+    };
+
+    struct SetupConnectionFailureInfo {
+        SetupConnectionFailureStage stage = SetupConnectionFailureStage::kNone;
+        int sys_errno = 0;
+    };
+
     int setupAllQPs(const std::string& peer_gid, uint16_t peer_lid,
                     std::vector<uint32_t> peer_qp_num_list,
-                    std::string* reply_msg = nullptr);
+                    std::string* reply_msg = nullptr,
+                    SetupConnectionFailureInfo* failure_info = nullptr);
 
     int setupOneQP(int qp_index, const std::string& peer_gid, uint16_t peer_lid,
-                   uint32_t peer_qp_num, std::string* reply_msg = nullptr);
+                   uint32_t peer_qp_num, std::string* reply_msg = nullptr,
+                   SetupConnectionFailureInfo* failure_info = nullptr);
 
     // Returns the pool segment owning qp_index, or nullptr when no pools are
     // configured (the default single-pool case). Read-only after construct().
@@ -185,6 +200,7 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     // Caller must hold lock_ in write mode.
     void beginDestroyNoLock();
     int deconstructUnlocked();
+    int resetDataQPsToResetNoLock();
 
     void resetInflightSlices();
 
