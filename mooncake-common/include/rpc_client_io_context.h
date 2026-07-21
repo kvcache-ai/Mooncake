@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <chrono>
 #include <memory>
 #include <mutex>
@@ -15,13 +16,11 @@
 namespace mooncake {
 
 std::shared_ptr<coro_io::io_context_pool> CreateRpcClientIoContextPool(
-    const char* component, unsigned thread_count);
+    uint32_t thread_count);
 
 template <typename PoolTag>
-coro_io::io_context_pool& GetRpcClientIoContextPool(const char* component,
-                                                    unsigned thread_count) {
-    static const auto io_pool =
-        CreateRpcClientIoContextPool(component, thread_count);
+coro_io::io_context_pool& GetRpcClientIoContextPool(uint32_t thread_count) {
+    static const auto io_pool = CreateRpcClientIoContextPool(thread_count);
     return *io_pool;
 }
 

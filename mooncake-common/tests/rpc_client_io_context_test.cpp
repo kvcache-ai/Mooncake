@@ -23,13 +23,11 @@ struct FirstTestRpcClientIoContextPoolTag {};
 struct SecondTestRpcClientIoContextPoolTag {};
 
 coro_io::io_context_pool& GetFirstTestRpcClientIoContextPool() {
-    return GetRpcClientIoContextPool<FirstTestRpcClientIoContextPoolTag>(
-        "first test", 2);
+    return GetRpcClientIoContextPool<FirstTestRpcClientIoContextPoolTag>(2);
 }
 
 coro_io::io_context_pool& GetSecondTestRpcClientIoContextPool() {
-    return GetRpcClientIoContextPool<SecondTestRpcClientIoContextPoolTag>(
-        "second test", 3);
+    return GetRpcClientIoContextPool<SecondTestRpcClientIoContextPoolTag>(3);
 }
 
 TEST(RpcClientIoContextPoolTest, UsesConfiguredSizeAndReusesPool) {

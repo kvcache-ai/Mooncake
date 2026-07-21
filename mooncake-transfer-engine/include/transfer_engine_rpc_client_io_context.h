@@ -5,7 +5,7 @@
 
 namespace mooncake {
 
-inline unsigned GetTransferEngineRpcClientIoThreads() {
+inline uint32_t GetTransferEngineRpcClientIoThreads() {
     return Environ::Get().GetTransferEngineRpcClientIoThreads();
 }
 
@@ -16,7 +16,7 @@ struct TransferEngineRpcClientIoContextPoolTag {};
 inline coro_io::io_context_pool& GetTransferEngineRpcClientIoContextPool() {
     static auto& io_pool = GetRpcClientIoContextPool<
         detail::TransferEngineRpcClientIoContextPoolTag>(
-        "Transfer Engine", GetTransferEngineRpcClientIoThreads());
+        GetTransferEngineRpcClientIoThreads());
     return io_pool;
 }
 

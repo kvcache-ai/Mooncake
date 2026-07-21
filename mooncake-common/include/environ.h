@@ -6,10 +6,20 @@
 
 namespace mooncake {
 
+class EnvironSource {
+   public:
+    virtual ~EnvironSource() = default;
+    virtual const char* Get(const char* name) const = 0;
+};
+
 class Environ {
    public:
     // Singleton access
     static Environ& Get();
+
+    // Construct from an injected source. Production code should use Get();
+    // this constructor allows tests to provide deterministic environment data.
+    Environ(const EnvironSource& source, uint32_t hardware_threads);
 
     // Getters for Environment Variables
     int GetNumCqPerCtx() const { return num_cq_per_ctx_; }
@@ -72,11 +82,11 @@ class Environ {
     }
     int64_t GetAwsConnectTimeoutMs() const { return aws_connect_timeout_ms_; }
     int64_t GetAwsRequestTimeoutMs() const { return aws_request_timeout_ms_; }
-    unsigned GetRpcClientIoThreads() const { return rpc_client_io_threads_; }
-    unsigned GetStoreRpcClientIoThreads() const {
+    uint32_t GetRpcClientIoThreads() const { return rpc_client_io_threads_; }
+    uint32_t GetStoreRpcClientIoThreads() const {
         return store_rpc_client_io_threads_;
     }
-    unsigned GetTransferEngineRpcClientIoThreads() const {
+    uint32_t GetTransferEngineRpcClientIoThreads() const {
         return transfer_engine_rpc_client_io_threads_;
     }
 
@@ -92,8 +102,6 @@ class Environ {
                                  const std::string& default_value);
 
    private:
-    Environ();
-
     // Member variables
     int num_cq_per_ctx_;
     int num_comp_channels_per_ctx_;
@@ -132,9 +140,9 @@ class Environ {
     bool path_roundrobin_;
     bool with_nvidia_peermem_;
     int efa_cq_threads_;
-    unsigned rpc_client_io_threads_;
-    unsigned store_rpc_client_io_threads_;
-    unsigned transfer_engine_rpc_client_io_threads_;
+    uint32_t rpc_client_io_threads_;
+    uint32_t store_rpc_client_io_threads_;
+    uint32_t transfer_engine_rpc_client_io_threads_;
 
     // AWS / S3 client configuration
     std::string aws_region_;

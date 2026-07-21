@@ -5,7 +5,7 @@
 
 namespace mooncake {
 
-inline unsigned GetStoreRpcClientIoThreads() {
+inline uint32_t GetStoreRpcClientIoThreads() {
     return Environ::Get().GetStoreRpcClientIoThreads();
 }
 
@@ -16,7 +16,7 @@ struct StoreRpcClientIoContextPoolTag {};
 inline coro_io::io_context_pool& GetStoreRpcClientIoContextPool() {
     static auto& io_pool =
         GetRpcClientIoContextPool<detail::StoreRpcClientIoContextPoolTag>(
-            "Store", GetStoreRpcClientIoThreads());
+            GetStoreRpcClientIoThreads());
     return io_pool;
 }
 
