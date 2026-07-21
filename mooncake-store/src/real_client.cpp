@@ -67,6 +67,31 @@ std::shared_ptr<RegisteredPinnedRegion> TryPinStoreSegment(
             " protocol=" + protocol);
 }
 
+bool ReleasePinnedRegionForFree(
+    std::shared_ptr<RegisteredPinnedRegion> &pinned_region,
+    const char *segment_owner) {
+    if (!pinned_region) return true;
+    const bool safe_to_free = pinned_region->release();
+    pinned_region.reset();
+    if (!safe_to_free) {
+        LOG(ERROR) << "Leaking " << segment_owner
+                   << " backing memory because cudaHostUnregister failed";
+    }
+    return safe_to_free;
+}
+
+bool ReleasePinnedRegionsForFree(
+    std::vector<std::shared_ptr<RegisteredPinnedRegion>> &pinned_regions,
+    const char *segment_owner) {
+    bool safe_to_free = true;
+    for (auto &pinned_region : pinned_regions) {
+        safe_to_free &= ReleasePinnedRegionForFree(pinned_region,
+                                                   segment_owner);
+    }
+    pinned_regions.clear();
+    return safe_to_free;
+}
+
 #ifdef USE_ASCEND_DIRECT
 bool checkAcl(aclError result, const char *message) {
     if (result != ACL_ERROR_NONE) {
@@ -890,7 +915,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             auto mount_result =
                 client_->MountSegment(ptr, mapped_size, protocol, seg_location);
             if (!mount_result.has_value()) {
-                pinned_region.reset();
+                if (!ReleasePinnedRegionForFree(pinned_region,
+                                                "Store setup segment")) {
+                    setup_segment_memory_must_leak_ = true;
+                }
                 LOG(ERROR) << "Failed to mount segment: "
                            << toString(mount_result.error());
                 return tl::unexpected(mount_result.error());
@@ -1210,13 +1238,19 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     ReleaseAllAllocatedSegmentRecords();
     client_buffer_allocator_.reset();
     port_binder_.reset();
-    setup_segment_pinned_regions_.clear();
+    const bool setup_segments_safe_to_free = ReleasePinnedRegionsForFree(
+        setup_segment_pinned_regions_, "Store setup segment");
+    if (!setup_segments_safe_to_free || setup_segment_memory_must_leak_) {
+        for (auto &ptr : hugepage_segment_ptrs_) ptr.release();
+        for (auto &ptr : segment_ptrs_) ptr.release();
+        setup_segment_memory_must_leak_ = false;
+    }
     hugepage_segment_ptrs_.clear();
+    segment_ptrs_.clear();
     ub_segment_ptrs_.clear();
 #if defined(USE_SUNRISE)
     sunrise_segment_ptrs_.clear();
 #endif
-    segment_ptrs_.clear();
     local_hostname = "";
     device_name = "";
     protocol = "";
@@ -1391,6 +1425,14 @@ void RealClient::ReleaseAllMountedSegmentRecords() {
     }
 }
 
+void RealClient::FreeAllocatedStoreSegment(AllocatedSegmentRecord &record) {
+    if (record.base &&
+        ReleasePinnedRegionForFree(record.pinned_region,
+                                   "allocated Store segment")) {
+        free_memory(record.protocol, record.base);
+    }
+}
+
 void RealClient::ReleaseAllocatedSegmentRecord(const std::string &segment_id) {
     AllocatedSegmentRecord record;
     bool found = false;
@@ -1404,8 +1446,7 @@ void RealClient::ReleaseAllocatedSegmentRecord(const std::string &segment_id) {
         }
     }
     if (found && record.base) {
-        record.pinned_region.reset();
-        free_memory(record.protocol, record.base);
+        FreeAllocatedStoreSegment(record);
     }
 }
 
@@ -1416,10 +1457,7 @@ void RealClient::ReleaseAllAllocatedSegmentRecords() {
         records.swap(allocated_segment_records_);
     }
     for (auto &entry : records) {
-        if (entry.second.base) {
-            entry.second.pinned_region.reset();
-            free_memory(entry.second.protocol, entry.second.base);
-        }
+        FreeAllocatedStoreSegment(entry.second);
     }
 }
 
@@ -1565,8 +1603,10 @@ int RealClient::allocateAndMountSegment(
             client_->MountSegmentAndGetId(ptr, chunk_size, protocol, location);
         if (!result.has_value()) {
             LOG(ERROR) << "MountSegmentAndGetId failed";
-            pinned_region.reset();
-            free_memory(protocol, ptr);
+            if (ReleasePinnedRegionForFree(pinned_region,
+                                           "allocated Store segment")) {
+                free_memory(protocol, ptr);
+            }
             break;
         }
 
@@ -1585,9 +1625,7 @@ int RealClient::allocateAndMountSegment(
                 client_->UnmountSegmentById(id);
             }
             if (allocated_records[i].base) {
-                allocated_records[i].pinned_region.reset();
-                free_memory(allocated_records[i].protocol,
-                            allocated_records[i].base);
+                FreeAllocatedStoreSegment(allocated_records[i]);
             }
         }
         out_segment_ids.clear();
@@ -1673,10 +1711,7 @@ int RealClient::unmountAndFreeSegment(
     }
 
     for (auto &p : to_cleanup) {
-        if (p.second.base) {
-            p.second.pinned_region.reset();
-            free_memory(p.second.protocol, p.second.base);
-        }
+        FreeAllocatedStoreSegment(p.second);
     }
 
     return first_error;

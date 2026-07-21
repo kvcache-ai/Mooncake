@@ -18,6 +18,8 @@ class RegisteredPinnedRegion {
     RegisteredPinnedRegion& operator=(const RegisteredPinnedRegion&) = delete;
     ~RegisteredPinnedRegion();
 
+    bool release();
+
    private:
     friend class RegisteredPinnedMemoryManager;
 
@@ -28,6 +30,7 @@ class RegisteredPinnedRegion {
     RegisteredPinnedMemoryManager* manager_ = nullptr;
     void* addr_ = nullptr;
     size_t size_ = 0;
+    bool release_succeeded_ = true;
 };
 
 class RegisteredPinnedMemoryManager {
@@ -65,7 +68,7 @@ class RegisteredPinnedMemoryManager {
    private:
 #endif
 
-    void release(RegisteredPinnedRegion* region);
+    bool release(RegisteredPinnedRegion* region);
     void remove_inactive_region_locked(void* addr, size_t size);
 
     const bool enabled_;

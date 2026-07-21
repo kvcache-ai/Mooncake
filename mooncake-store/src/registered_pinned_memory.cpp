@@ -79,7 +79,15 @@ RegisteredPinnedMemoryManager::PinOps DefaultPinOps() {
 }  // namespace
 
 RegisteredPinnedRegion::~RegisteredPinnedRegion() {
-    if (manager_) manager_->release(this);
+    release();
+}
+
+bool RegisteredPinnedRegion::release() {
+    if (!manager_) return release_succeeded_;
+    auto* manager = manager_;
+    manager_ = nullptr;
+    release_succeeded_ = manager->release(this);
+    return release_succeeded_;
 }
 
 RegisteredPinnedMemoryManager& RegisteredPinnedMemoryManager::instance() {
@@ -189,8 +197,8 @@ std::shared_ptr<RegisteredPinnedRegion> RegisteredPinnedMemoryManager::try_pin(
     return region;
 }
 
-void RegisteredPinnedMemoryManager::release(RegisteredPinnedRegion* region) {
-    if (!region || !region->addr_ || region->size_ == 0) return;
+bool RegisteredPinnedMemoryManager::release(RegisteredPinnedRegion* region) {
+    if (!region || !region->addr_ || region->size_ == 0) return true;
 
     bool should_unregister = false;
     {
@@ -204,13 +212,11 @@ void RegisteredPinnedMemoryManager::release(RegisteredPinnedRegion* region) {
             }
         }
     }
-    if (!should_unregister) return;
+    if (!should_unregister) return true;
 
     std::string error_message;
     auto unregister_result =
         pin_ops_.unregister_region(region->addr_, &error_message);
-    // Treat CUDA unregistration as best-effort cleanup: drop manager state so
-    // stale raw tracking pointers do not outlive the Store segment owner.
     if (unregister_result != UnregisterResult::kSuccess) {
         if (unregister_result == UnregisterResult::kRuntimeUnloading) {
             LOG(WARNING) << "Skip cudaHostUnregister because CUDA runtime "
@@ -219,12 +225,15 @@ void RegisteredPinnedMemoryManager::release(RegisteredPinnedRegion* region) {
         } else {
             LOG(ERROR) << "cudaHostUnregister failed, size=" << region->size_
                        << ", error=" << error_message
-                       << ". Continue with best-effort cleanup.";
+                       << ". Keep the range reserved; backing memory must not "
+                          "be freed.";
+            return false;
         }
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
     remove_inactive_region_locked(region->addr_, region->size_);
+    return true;
 }
 
 void RegisteredPinnedMemoryManager::remove_inactive_region_locked(void* addr,

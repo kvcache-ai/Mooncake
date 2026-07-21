@@ -760,6 +760,8 @@ class RealClient : public PyClient {
         std::shared_ptr<RegisteredPinnedRegion> pinned_region;
     };
 
+    void FreeAllocatedStoreSegment(AllocatedSegmentRecord &record);
+
     std::unique_ptr<AutoPortBinder> port_binder_ = nullptr;
 
     struct SegmentDeleter {
@@ -820,6 +822,7 @@ class RealClient : public PyClient {
 #endif
     std::vector<std::shared_ptr<RegisteredPinnedRegion>>
         setup_segment_pinned_regions_;
+    bool setup_segment_memory_must_leak_ = false;
     std::string protocol;
     std::string device_name;
     std::string local_hostname;

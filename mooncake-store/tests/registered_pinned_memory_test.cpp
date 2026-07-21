@@ -97,28 +97,37 @@ TEST_F(RegisteredPinnedMemoryManagerTest, OverlapAndDuplicateAreRejected) {
     ExpectCalls(2, 2);
 }
 
-TEST_F(RegisteredPinnedMemoryManagerTest, FailurePathsRefundReservations) {
+TEST_F(RegisteredPinnedMemoryManagerTest, RegisterFailureRefundsReservation) {
+    auto manager = MakeManager(32);
+
+    State().register_succeeds = false;
+    EXPECT_EQ(Pin(manager, 0, 32), nullptr);
+    ExpectCalls(1, 0);
+
+    State().register_succeeds = true;
+    auto retried = Pin(manager, 0, 32);
+    ASSERT_NE(retried, nullptr);
+    ExpectCalls(2, 0);
+
+    retried.reset();
+    ExpectCalls(2, 1);
+}
+
+TEST_F(RegisteredPinnedMemoryManagerTest,
+       UnregisterFailureRetainsReservation) {
     auto manager = MakeManager(32);
 
     auto first = Pin(manager, 0, 32);
     ASSERT_NE(first, nullptr);
 
     State().unregister_result = UnregisterResult::kError;
-    first.reset();
+    EXPECT_FALSE(first->release());
     ExpectCalls(1, 1);
 
     State().unregister_result = UnregisterResult::kSuccess;
-    State().register_succeeds = false;
     EXPECT_EQ(Pin(manager, 0, 32), nullptr);
-    ExpectCalls(2, 1);
-
-    State().register_succeeds = true;
-    auto retried = Pin(manager, 0, 32);
-    ASSERT_NE(retried, nullptr);
-    ExpectCalls(3, 1);
-
-    retried.reset();
-    ExpectCalls(3, 2);
+    EXPECT_EQ(Pin(manager, 32, 32), nullptr);
+    ExpectCalls(1, 1);
 }
 
 }  // namespace
