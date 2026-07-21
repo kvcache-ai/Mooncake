@@ -356,6 +356,10 @@ def import_dataproto_ref(handle: Mapping[str, Any]) -> MooncakeDataProtoRef:
     )
 
 
+export_ref = export_dataproto_ref
+import_ref = import_dataproto_ref
+
+
 def _resolve_dataproto_ref(ref: DataProtoRefLike) -> MooncakeDataProtoRef:
     if isinstance(ref, MooncakeDataProtoRef):
         return ref
@@ -587,7 +591,7 @@ class MooncakeBundleTransfer:
         if type == "dataproto":
             stage_data = data
         elif type == "dict":
-            stage_data = _flat_dict_to_envelope(data)
+            stage_data = _flat_dict_to_envelope(data, field_schemas)
         else:
             raise ValueError(f"unsupported Mooncake payload type: {type!r}")
         return self._put_dataproto_stage(
@@ -1378,6 +1382,16 @@ class MooncakeBundleTransfer:
         """Remove a flat dict stored by put_dict()."""
         self.cleanup_dataproto(ref)
 
+    @staticmethod
+    def release_result(result: Any) -> None:
+        """Compatibility hook for releasing GET results.
+
+        This PR does not add BufferPool-backed GET semantics, so there is
+        nothing to release yet.  The BufferPool split PR will replace this
+        hook with the actual lease release implementation.
+        """
+        return None
+
     def _append_dataproto_stage_manifest(
         self,
         old_stage_ref: RemoteBundleRef,
@@ -1687,63 +1701,124 @@ def _dataproto_manifest_view(
     }
 
 
-def _flat_dict_to_envelope(data: Mapping[str, Any]) -> dict[str, Any]:
+def _flat_dict_to_envelope_with_schema(
+    data: Mapping[str, Any], field_schemas: Mapping[str, FieldSchema] | None
+) -> dict[str, Any]:
     if not isinstance(data, Mapping):
         raise TypeError("flat dict payload must be a mapping")
-    row_count = _flat_dict_auto_row_count(data)
+    if not field_schemas:
+        field_schemas = {}
+    schema_row_count = _flat_dict_schema_row_count(data, field_schemas)
+    row_count = schema_row_count
+    if row_count == 0:
+        schema_meta_fields = {
+            name
+            for name, schema in field_schemas.items()
+            if name in data and _schema_section(name, schema) == "meta_info"
+        }
+        row_count = _flat_dict_auto_row_count(data, exclude=schema_meta_fields)
     batch: dict[str, Any] = {}
     non_tensor_batch: dict[str, Any] = {}
     meta_info: dict[str, Any] = {}
-    for name, value in data.items():
-        if _is_row_aligned_dense_field(value, row_count):
-            batch[name] = value
-        elif _is_flat_non_tensor_field(value) and len(value) == row_count:
-            non_tensor_batch[name] = _coerce_flat_dict_non_tensor_field(
-                name, value, row_count
+    for key, value in data.items():
+        schema = field_schemas.get(key)
+        section = None if schema is None else _schema_section(key, schema)
+        if section is None:
+            if _is_row_aligned_dense_field(value, row_count):
+                batch[key] = value
+            elif (
+                schema_row_count == 0
+                and _is_non_string_sequence(value)
+                and len(value) == row_count
+            ):
+                non_tensor_batch[key] = _coerce_flat_dict_non_tensor_field(
+                    key, value, row_count, schema
+                )
+            else:
+                meta_info[key] = value
+            continue
+        if section == "batch":
+            batch[key] = value
+        elif section == "non_tensor_batch":
+            non_tensor_batch[key] = _coerce_flat_dict_non_tensor_field(
+                key, value, row_count, schema
             )
         else:
-            meta_info[name] = value
-    return {"batch": batch, "non_tensor_batch": non_tensor_batch, "meta_info": meta_info}
-
-
-def _flat_dict_auto_row_count(data: Mapping[str, Any]) -> int:
-    dense_sizes = {
-        len(value)
-        for value in data.values()
-        if (
-            (_torch is not None and isinstance(value, _torch.Tensor) and value.ndim > 0)
-            or (
-                isinstance(value, np.ndarray)
-                and value.dtype != object
-                and value.ndim > 0
-            )
-        )
+            meta_info[key] = value
+    return {
+        "batch": batch,
+        "non_tensor_batch": non_tensor_batch,
+        "meta_info": meta_info,
     }
-    if len(dense_sizes) > 1:
-        raise ValueError(
-            f"flat dict dense fields have ambiguous batch sizes: {sorted(dense_sizes)}"
-        )
-    if dense_sizes:
-        return dense_sizes.pop()
 
+
+def _flat_dict_to_envelope(
+    data: Mapping[str, Any],
+    field_schemas: Optional[Mapping[str, FieldSchema]] = None,
+) -> dict[str, Any]:
+    return _flat_dict_to_envelope_with_schema(data, field_schemas)
+
+
+def _flat_dict_schema_row_count(
+    data: Mapping[str, Any], field_schemas: Mapping[str, FieldSchema]
+) -> int:
     sizes = {
-        len(value) for value in data.values() if _is_flat_non_tensor_field(value)
+        _field_len(name, data[name])
+        for name, schema in field_schemas.items()
+        if name in data and _schema_section(name, schema) in {"batch", "non_tensor_batch"}
+    }
+    if not sizes:
+        return 0
+    if len(sizes) != 1:
+        raise ValueError(f"flat dict fields have inconsistent batch sizes: {sorted(sizes)}")
+    return sizes.pop()
+
+
+def _field_len(name: str, value: Any) -> int:
+    try:
+        return len(value)
+    except TypeError as error:
+        raise ValueError(f"flat dict row-aligned field {name!r} must be sized") from error
+
+
+def _flat_dict_auto_row_count(
+    data: Mapping[str, Any], exclude: set[str] | frozenset[str] = frozenset()
+) -> int:
+    sizes = {
+        len(value)
+        for key, value in data.items()
+        if key not in exclude and (
+            (_torch is not None and isinstance(value, _torch.Tensor) and value.ndim > 0)
+            or (isinstance(value, np.ndarray) and value.ndim > 0)
+            or _is_non_string_sequence(value)
+        )
     }
     if not sizes:
         return 0
     if len(sizes) != 1:
         raise ValueError(
-            f"flat dict fields have ambiguous batch sizes: {sorted(sizes)}"
+            f"flat dict fields have ambiguous batch sizes: {sorted(sizes)}; "
+            "pass FieldSchema metadata['section'] for list-valued metadata fields"
         )
     return sizes.pop()
 
 
-def _coerce_flat_dict_non_tensor_field(name: str, value: Any, row_count: int) -> Any:
+def _coerce_flat_dict_non_tensor_field(
+    name: str, value: Any, row_count: int, schema: Optional[FieldSchema] = None
+) -> Any:
     if isinstance(value, np.ndarray):
         if len(value) != row_count:
             raise ValueError(
                 f"flat dict non_tensor_batch field {name!r} has batch size {len(value)}, expected {row_count}"
             )
+        schema_dtype = _schema_ndarray_dtype(schema) if schema is not None else None
+        if (
+            schema is not None
+            and schema.codec == "ndarray"
+            and schema_dtype is not None
+            and (value.dtype != object or all(item is not None for item in value))
+        ):
+            return np.asarray(value, dtype=schema_dtype)
         return value
     if _is_non_string_sequence(value):
         if len(value) != row_count:
@@ -1756,12 +1831,6 @@ def _coerce_flat_dict_non_tensor_field(name: str, value: Any, row_count: int) ->
     raise TypeError(
         f"flat dict non_tensor_batch field {name!r} must be an ndarray or non-string sequence"
     )
-
-
-def _is_flat_non_tensor_field(value: Any) -> bool:
-    return (
-        isinstance(value, np.ndarray) and value.dtype == object and value.ndim > 0
-    ) or _is_non_string_sequence(value)
 
 
 def _is_non_string_sequence(value: Any) -> bool:

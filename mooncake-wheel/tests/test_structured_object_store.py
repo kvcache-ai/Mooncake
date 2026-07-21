@@ -18,7 +18,9 @@ from mooncake.structured_object_store import (
     StructuredObjectReadSpec,
     _envelope_to_flat_dict,
     export_dataproto_ref,
+    export_ref,
     import_dataproto_ref,
+    import_ref,
     is_dataproto_ref_handle,
     raw_destination,
     tensor_object_buffer,
@@ -1923,6 +1925,61 @@ def test_unified_dict_put_accepts_field_schemas() -> None:
     assert result["tokens"][1] is None
     assert result["tokens"][2] == [3]
     assert result["step"] == 7
+
+
+def test_unified_dict_put_uses_schema_sections_for_metadata_lists() -> None:
+    _store, transfer = make_transfer()
+
+    ref = transfer.put_dict(
+        {
+            "partition": [0, 1],
+            "tokens": [np.asarray([1, 2]), np.asarray([3])],
+            "response_lengths": [2, 1],
+            "global_batch_sizes": [2],
+            "num_microbatches": 1,
+        },
+        field_schemas={
+            "partition": FieldSchema(
+                codec="ndarray",
+                metadata={"section": "non_tensor_batch", "dtype": "int64"},
+            ),
+            "tokens": FieldSchema(
+                codec="typed_ragged",
+                metadata={"section": "non_tensor_batch", "dtype": "int64"},
+            ),
+            "response_lengths": FieldSchema(
+                codec="ndarray",
+                metadata={"section": "non_tensor_batch", "dtype": "int64"},
+            ),
+            "global_batch_sizes": FieldSchema(
+                codec="auto",
+                metadata={"section": "meta_info"},
+            ),
+            "num_microbatches": FieldSchema(
+                codec="auto",
+                metadata={"section": "meta_info"},
+            ),
+        },
+    )
+
+    result = transfer.get(ref, type="dict")
+
+    assert result["partition"] == [0, 1]
+    assert result["response_lengths"] == [2, 1]
+    assert result["global_batch_sizes"] == [2]
+    assert result["num_microbatches"] == 1
+
+
+def test_ref_aliases_match_dataproto_ref_helpers() -> None:
+    assert export_ref is export_dataproto_ref
+    assert import_ref is import_dataproto_ref
+
+
+def test_release_result_is_available_for_split_api_compatibility() -> None:
+    result = {"tokens": [np.asarray([1, 2]), None]}
+
+    assert MooncakeBundleTransfer.release_result(result) is None
+    assert result["tokens"][0].tolist() == [1, 2]
 
 
 def test_unified_dict_get_rejects_flattened_key_collision() -> None:
