@@ -3750,6 +3750,33 @@ RealClient::batch_put_from_dummy_helper(
     return batch_put_from_internal(keys, buffers_result.value(), sizes, config);
 }
 
+tl::expected<void, ErrorCode> RealClient::put_from_dummy_helper(
+    const std::string &key, uint64_t dummy_buffer, size_t size,
+    const ReplicateConfig &config, int32_t device_id, const UUID &client_id) {
+#ifdef USE_ASCEND_DIRECT
+    if (!ContextManager::getInstance().setCurrentContextByPhysicalId(
+            device_id)) {
+        LOG(ERROR) << "Failed to set context for physical device " << device_id;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+#endif
+
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto &context = it->second;
+
+    auto buffers_result = map_dummy_addrs_to_real_ptrs(
+        context, {dummy_buffer}, {size}, client_id);
+    if (!buffers_result) {
+        return tl::unexpected(buffers_result.error());
+    }
+    return put_from_internal(key, buffers_result.value()[0], size, config);
+}
+
 std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
     const std::vector<std::string> &keys, const std::vector<void *> &buffers,
     const std::vector<size_t> &sizes, const ReplicateConfig &config) {
@@ -5367,11 +5394,29 @@ void RealClient::dummy_client_monitor_func() {
         // Update the client status to NEED_REMOUNT
         if (!expired_clients.empty()) {
             for (auto &client_id : expired_clients) {
+                {
+                    std::shared_lock<std::shared_mutex> lock(
+                        dummy_client_mutex_);
+                    if (shm_contexts_.find(client_id) ==
+                        shm_contexts_.end()) {
+                        LOG(INFO)
+                            << "client_id=" << client_id
+                            << ", action=shm_already_unmapped_by_other_path";
+                        continue;
+                    }
+                }
+
                 // Unmap mapped_shms associated with this client
+                tl::expected<void, ErrorCode> result;
                 if (globalConfig().ascend_agent_mode) {
-                    ascend_unmap_shm_internal(client_id);
+                    result = ascend_unmap_shm_internal(client_id);
                 } else {
-                    unmap_shm_internal(client_id);
+                    result = unmap_shm_internal(client_id);
+                }
+                if (!result) {
+                    // Client already unmapped (e.g., by other thread or earlier cleanup)
+                    LOG(INFO) << "client_id=" << client_id
+                              << ", action=client_already_unmapped";
                 }
             }
         }

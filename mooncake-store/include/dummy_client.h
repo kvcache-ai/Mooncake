@@ -132,6 +132,14 @@ class DummyClient : public PyClient {
 
     [[nodiscard]] std::string get_hostname() const;
 
+    struct RegisteredBufferInfo {
+        void *ptr;
+        size_t size;
+        bool is_local;
+    };
+
+    std::vector<RegisteredBufferInfo> get_registered_buffers() const;
+
     // Check if a pointer falls within the hot cache shm region
     bool is_hot_cache_ptr(const void *ptr) const {
         if (!hot_cache_base_) return false;
