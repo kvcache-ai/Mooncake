@@ -523,7 +523,8 @@ SegmentHandle TransferEngine::openSegment(const std::string& segment_name) {
     if (use_tent_) {
         SegmentHandle handle;
         auto status = impl_tent_->openSegment(handle, segment_name);
-        if (!status.ok()) return (SegmentHandle)(-1);
+        if (!status.ok())
+            return static_cast<SegmentHandle>(ERR_INVALID_ARGUMENT);
         return handle;
     } else
         return impl_->openSegment(segment_name);
@@ -893,7 +894,18 @@ Status TransferEngine::transferScatter(
     const std::vector<ScatterTransferRange>& ranges) {
     std::vector<TransferRequest> requests;
     std::vector<std::pair<size_t, size_t>> request_fragments;
-    std::unordered_map<std::string, SegmentHandle> segment_cache;
+    struct SegmentCache {
+        TransferEngine& engine;
+        std::unordered_map<std::string, SegmentHandle> handles;
+
+        ~SegmentCache() {
+            for (const auto& entry : handles) {
+                if (entry.second !=
+                    static_cast<SegmentHandle>(ERR_INVALID_ARGUMENT))
+                    engine.closeSegment(entry.second);
+            }
+        }
+    } segment_cache{*this, {}};
 
     auto complete = [&](size_t range_index, size_t fragment_index,
                         const Status& status) {
@@ -939,7 +951,7 @@ Status TransferEngine::transferScatter(
                 continue;
             }
 
-            auto [seg_it, inserted] = segment_cache.emplace(
+            auto [seg_it, inserted] = segment_cache.handles.emplace(
                 range.remote_segment,
                 static_cast<SegmentHandle>(ERR_INVALID_ARGUMENT));
             if (inserted) seg_it->second = openSegment(range.remote_segment);
