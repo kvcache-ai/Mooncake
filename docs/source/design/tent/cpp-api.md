@@ -106,6 +106,7 @@ export MC_USE_TENT=1
 
 When this variable is set, the `mooncake::TransferEngine` class internally delegates to `mooncake::tent::TransferEngine`. Most TE APIs are translated automatically. APIs that have no TENT equivalent (e.g., `installTransport`, `getMetadata`) become no-ops or return placeholder values.
 
+(transfer-engine-compatibility-mode-semantics)=
 ### Transfer Engine Compatibility Mode Semantics
 
 The compatibility shim is intended to preserve the common TE application flow while running on the TENT runtime:
