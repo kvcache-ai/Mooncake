@@ -156,11 +156,6 @@ void MasterSnapshotManager::SnapshotThreadFunc() {
             std::unique_lock<std::shared_mutex> lock(snapshot_mutex_);
             LOG(INFO) << "[Snapshot] Locking snapshot mutex, snapshot_id="
                       << snapshot_id;
-            // Unmount can invalidate a generation before asynchronous metadata
-            // cleanup runs. Sweep unavailable replicas before fork; generation
-            // lifetime tokens prevent confusing a remount with the generation
-            // being removed.
-            master_service_->SweepUnavailableReplicas();
             pid = fork();
         }
         if (pid == -1) {

@@ -403,8 +403,6 @@ class SegmentView {
     ErrorCode GetMountedSegment(const UUID& segment_id,
                                 MountedSegment& mountedSegment) const;
 
-    SegmentLifetime GetLocalDiskSegmentLifetime(const UUID& client_id) const;
-
    private:
     const SegmentManager* segment_manager_;
 };

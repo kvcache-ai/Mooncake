@@ -585,15 +585,6 @@ ErrorCode SegmentView::GetMountedSegment(const UUID& segment_id,
     return ErrorCode::OK;
 }
 
-SegmentLifetime SegmentView::GetLocalDiskSegmentLifetime(
-    const UUID& client_id) const {
-    auto it = segment_manager_->client_local_disk_segment_.find(client_id);
-    if (it == segment_manager_->client_local_disk_segment_.end()) {
-        return SegmentLifetime::Unavailable();
-    }
-    return it->second->lifetime;
-}
-
 tl::expected<std::vector<uint8_t>, SerializationError>
 SegmentSerializer::Serialize() {
     if (!segment_manager_) {
@@ -975,26 +966,18 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
     // order
     segment_manager_->allocator_manager_ = AllocatorManager();
 
-    // Add allocator names in their saved order. Registrations sharing a name
-    // are rebuilt in stable segment-id order because names_ stores each name
-    // only once.
+    // Add allocators in saved original order
     for (const auto& name : saved_allocator_names) {
-        std::vector<UUID> matching_segment_ids;
-        for (const auto& [segment_id, mounted_segment] :
-             segment_manager_->mounted_segments_) {
+        for (auto& pair : segment_manager_->mounted_segments_) {
+            MountedSegment& mounted_segment = pair.second;
             if (mounted_segment.segment.name == name &&
                 mounted_segment.status == SegmentStatus::OK &&
                 mounted_segment.buf_allocator) {
-                matching_segment_ids.push_back(segment_id);
+                mounted_segment.allocator_registration =
+                    segment_manager_->allocator_manager_.addAllocator(
+                        name, mounted_segment.buf_allocator);
+                break;
             }
-        }
-        std::sort(matching_segment_ids.begin(), matching_segment_ids.end());
-        for (const auto& segment_id : matching_segment_ids) {
-            auto& mounted_segment =
-                segment_manager_->mounted_segments_.at(segment_id);
-            mounted_segment.allocator_registration =
-                segment_manager_->allocator_manager_.addAllocator(
-                    name, mounted_segment.buf_allocator);
         }
     }
 

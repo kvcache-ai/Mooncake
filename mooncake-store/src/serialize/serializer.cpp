@@ -643,14 +643,7 @@ auto Serializer<AllocatedBuffer>::deserialize(const msgpack::object &obj,
     // Create AllocatedBuffer object
     auto buffer = std::make_unique<AllocatedBuffer>(allocator, buffer_ptr, size,
                                                     std::move(offsetHandle));
-    if (!mountedSegment.allocator_registration) {
-        return tl::unexpected(SerializationError(
-            ErrorCode::DESERIALIZE_FAIL,
-            fmt::format("deserialize_msgpack AllocatedBuffer missing allocator "
-                        "registration for segment {}",
-                        segment_id)));
-    }
-    mountedSegment.allocator_registration->bindSegmentLifetime(*buffer);
+    // buffer->status = status;
 
     return buffer;
 }
@@ -815,11 +808,8 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
                                 client_id_str)));
             }
 
-            // Fail closed: an orphan LOCAL_DISK replica must stay unavailable
-            // unless the corresponding restored segment generation exists.
             replica = std::make_shared<Replica>(
-                client_id, object_size, std::move(transport_endpoint),
-                segment_view.GetLocalDiskSegmentLifetime(client_id), status);
+                client_id, object_size, std::move(transport_endpoint), status);
             break;
         }
         default:

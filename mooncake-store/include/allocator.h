@@ -119,7 +119,9 @@ class AllocatedBuffer {
     }
 
     std::weak_ptr<BufferAllocatorBase> allocator_;
-    SegmentLifetime segment_lifetime_ = SegmentLifetime::Unavailable();
+    // Managed allocations replace this compatibility lifetime with their
+    // segment generation.
+    SegmentLifetime segment_lifetime_ = SegmentLifetime::Available();
     std::string segment_name_;
     void* buffer_ptr_{nullptr};
     std::size_t size_{0};

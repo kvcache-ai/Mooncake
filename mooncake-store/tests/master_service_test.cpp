@@ -5322,34 +5322,6 @@ TEST_F(MasterServiceTest, ConcurrentMountLocalDiskSegment) {
     EXPECT_GT(success_count, 0);
 }
 
-TEST_F(MasterServiceTest, IdempotentLocalDiskMountRefreshesClientLifetime) {
-    auto config = MasterServiceConfig::builder()
-                      .set_enable_offload(true)
-                      .set_client_live_ttl_sec(2)
-                      .build();
-    auto service = std::make_unique<MasterService>(config);
-    const UUID client_id = generate_uuid();
-    const std::string key = "idempotent_local_disk_mount";
-
-    ASSERT_TRUE(service->MountLocalDiskSegment(client_id, false).has_value());
-    Replica replica(client_id, 1024, "local_disk_endpoint",
-                    ReplicaStatus::COMPLETE);
-    ASSERT_TRUE(
-        service->AddReplica(client_id, key, "default", replica).has_value());
-
-    // Let ClientMonitor consume the initial mount, then refresh the same
-    // already-mounted generation. At the final check the first TTL has
-    // expired, while the refreshed TTL is still live.
-    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
-    ASSERT_TRUE(service->MountLocalDiskSegment(client_id, false).has_value());
-    std::this_thread::sleep_for(std::chrono::milliseconds(2200));
-
-    auto result = service->GetReplicaList(key, "default");
-    ASSERT_TRUE(result.has_value());
-    ASSERT_EQ(1u, result->replicas.size());
-    EXPECT_TRUE(result->replicas.front().is_local_disk_replica());
-}
-
 TEST_F(MasterServiceTest, OffloadObjectHeartbeat) {
     constexpr size_t key_cnt = 3000;
     MasterServiceConfig config;
