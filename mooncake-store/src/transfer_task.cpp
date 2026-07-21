@@ -1077,6 +1077,11 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
     return future;
 }
 
+Status TransferSubmitter::transferScatter(
+    const std::vector<TransferEngine::ScatterTransferRange>& transfers) {
+    return engine_.transferScatter(transfers);
+}
+
 std::optional<TransferFuture>
 TransferSubmitter::submit_batch_get_offload_object(
     const std::string& transfer_engine_addr,

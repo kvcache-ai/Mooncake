@@ -179,6 +179,9 @@ class Client {
                                       const QueryResult& query_result,
                                       std::vector<Slice>& slices,
                                       uint64_t src_offset);
+    Status TransferScatter(
+        const std::vector<TransferEngine::ScatterTransferRange>& transfers);
+
     /**
      * @brief Transfers data using pre-queried object information
      * @param object_keys Keys of the objects
