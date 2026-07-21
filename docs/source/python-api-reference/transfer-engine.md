@@ -119,6 +119,42 @@ Gets the RPC port that the transfer engine is listening on.
 **Returns:**
 - `int`: The RPC port number
 
+### Module-level Host Buffer
+
+These functions are exported from `mooncake.engine` and do **not** require a
+`TransferEngine` instance. They allocate raw host memory for decode offload /
+ACL graph capture. Callers must `register_memory` separately if the buffer will
+be used for TE transfers.
+
+#### allocate_host_buffer()
+
+```python
+from mooncake.engine import allocate_host_buffer
+
+allocate_host_buffer(size, protocol="")
+```
+
+**Parameters:**
+- `size` (int): Buffer size in bytes
+- `protocol` (str): Optional. Empty/`ascend`/`ubshmem` on Ascend builds routes
+  to `ascend_allocate_memory` (fabric mem or `aclrtMallocHost`). Other builds
+  use `aligned_alloc`. Explicit `ascend`/`ubshmem` on non-Ascend builds returns 0.
+
+**Returns:**
+- `int`: Buffer address, or 0 on failure
+
+#### free_host_buffer()
+
+```python
+from mooncake.engine import free_host_buffer
+
+free_host_buffer(ptr, protocol="")
+```
+
+**Parameters:**
+- `ptr` (int): Address returned by `allocate_host_buffer`
+- `protocol` (str): Must match the value used at allocation
+
 ### Buffer Management
 
 #### allocate_managed_buffer()

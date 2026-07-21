@@ -15,8 +15,10 @@
 #include "transfer_engine_py.h"
 
 #include <cassert>
-#include <numeric>
+#include <cstdlib>
 #include <fstream>
+#include <numeric>
+#include <string>
 
 #include <pybind11/stl.h>
 #include "transport/rpc_communicator/rpc_interface.h"
@@ -45,6 +47,9 @@
 #include <cuda_runtime.h>
 #endif
 
+#if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
+#include "ascend_allocator.h"
+#endif
 static void* (*allocateMemory)(size_t) = nullptr;
 static void (*freeMemory)(void*) = nullptr;
 static std::string g_protocol;
@@ -1103,6 +1108,72 @@ int TransferEnginePy::sendProbe(const std::string& peer_server_name) {
 
 namespace py = pybind11;
 
+namespace {
+
+constexpr size_t kHostBufferAlignment = 4096;
+
+bool IsAscendHostProtocol(const std::string& protocol) {
+    return protocol.empty() || protocol == "ascend" || protocol == "ubshmem";
+}
+
+// Module-level host buffer allocation for decode offload / graph capture.
+// Does not register with TransferEngine; callers use register_memory
+// separately.
+uintptr_t allocateHostBuffer(size_t size, const std::string& protocol = "") {
+    if (size == 0) {
+        return 0;
+    }
+#if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
+    if (IsAscendHostProtocol(protocol)) {
+        const std::string effective =
+            protocol.empty() ? std::string("ascend") : protocol;
+        void* ptr = mooncake::ascend_allocate_memory(size, effective);
+        return reinterpret_cast<uintptr_t>(ptr);
+    }
+#else
+    if (protocol == "ascend" || protocol == "ubshmem") {
+        LOG(ERROR) << "allocate_host_buffer protocol='" << protocol
+                   << "' requires Ascend build "
+                      "(USE_ASCEND_DIRECT / USE_UBSHMEM)";
+        return 0;
+    }
+#endif
+    const size_t aligned_size = (size + kHostBufferAlignment - 1) /
+                                kHostBufferAlignment * kHostBufferAlignment;
+    void* ptr = aligned_alloc(kHostBufferAlignment, aligned_size);
+    if (ptr == nullptr) {
+        LOG(ERROR) << "allocate_host_buffer aligned_alloc failed, size="
+                   << aligned_size;
+        return 0;
+    }
+    return reinterpret_cast<uintptr_t>(ptr);
+}
+
+void freeHostBuffer(uintptr_t ptr, const std::string& protocol = "") {
+    if (ptr == 0) {
+        return;
+    }
+    void* p = reinterpret_cast<void*>(ptr);
+#if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
+    if (IsAscendHostProtocol(protocol)) {
+        const std::string effective =
+            protocol.empty() ? std::string("ascend") : protocol;
+        mooncake::ascend_free_memory(effective, p);
+        return;
+    }
+#else
+    if (protocol == "ascend" || protocol == "ubshmem") {
+        LOG(ERROR) << "free_host_buffer protocol='" << protocol
+                   << "' requires Ascend build "
+                      "(USE_ASCEND_DIRECT / USE_UBSHMEM)";
+        return;
+    }
+#endif
+    free(p);
+}
+
+}  // namespace
+
 // Implementation of coro_rpc_interface binding function
 void bind_coro_rpc_interface(py::module_& m) {
     // Note: RpcInterface, ReceivedData and ReceivedTensor are already
@@ -1145,6 +1216,17 @@ PYBIND11_MODULE(engine, m) {
 #else
     m.attr("SUPPORT_CUDA") = false;
 #endif
+
+    m.def("allocate_host_buffer", &allocateHostBuffer, py::arg("size"),
+          py::arg("protocol") = "",
+          "Allocate a host buffer for decode offload / graph capture. "
+          "On Ascend builds, empty/ascend/ubshmem routes to "
+          "ascend_allocate_memory (fabric mem or aclrtMallocHost). "
+          "Does not register with TransferEngine. Returns 0 on failure.");
+    m.def("free_host_buffer", &freeHostBuffer, py::arg("ptr"),
+          py::arg("protocol") = "",
+          "Free a buffer returned by allocate_host_buffer. "
+          "protocol must match the value used at allocation.");
 
     py::enum_<TransferEnginePy::TransferOpcode> transfer_opcode(
         m, "TransferOpcode", py::arithmetic());
