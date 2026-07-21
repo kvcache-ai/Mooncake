@@ -9,6 +9,7 @@ import time
 import numpy as np
 import pytest
 
+import mooncake.structured_object_store as sos
 from mooncake.structured_object_store import (
     BundleTransferPolicy,
     FieldSchema,
@@ -733,6 +734,29 @@ def test_structured_object_ndarray_read_can_use_buffer_pool() -> None:
     assert pool.release_count == 1
     MooncakeBundleTransfer.release_result(result.objects)
     assert pool.release_count == 1
+
+
+def test_structured_object_multi_buffer_payload_uses_pool_batch_put() -> None:
+    pool = FakeBufferPool()
+    store, transfer = make_transfer(buffer_pool=pool)
+    parts = [bytearray(b"ab"), bytearray(b"cd"), bytearray(b"ef")]
+    payload = StructuredObjectPayload(
+        metadata={},
+        buffers={
+            "raw": sos._MultiBufferPayload(
+                buffers=tuple(memoryview(part) for part in parts),
+                owners=tuple(parts),
+            )
+        },
+    )
+
+    ref = transfer.put_structured_object(payload, chunk_bytes=4)
+    result = transfer.materialize(transfer.read_spec(ref))
+
+    assert result.objects["raw"] == b"abcdef"
+    assert pool.acquire_sizes == [4, 2]
+    assert pool.release_count == 2
+    assert store.batch_put_from_calls == 2
 
 
 def test_structured_object_slice_member_uses_partial_range_reads() -> None:
@@ -2730,6 +2754,25 @@ def test_dataproto_helper_object_non_tensor_codecs_roundtrip() -> None:
     ]
     assert result["non_tensor_batch"]["blob"].tolist() == [b"a", None, b"bc", b"def"]
     assert result["non_tensor_batch"]["nullable_int"].tolist() == [1, None, 3, 4]
+
+
+def test_dataproto_helper_typed_ragged_uses_multi_buffer_put() -> None:
+    pool = FakeBufferPool()
+    _store, transfer = make_transfer(buffer_pool=pool)
+    rows = np.empty(3, dtype=object)
+    rows[:] = [
+        np.asarray([1, 2], dtype=np.int32),
+        None,
+        np.asarray([3, 4, 5], dtype=np.int32),
+    ]
+    data = SimpleDataProto(non_tensor_batch={"tokens": rows})
+
+    ref = transfer.put_dataproto(data)
+    result = transfer.get_dataproto(ref)
+
+    assert ref.encoded_non_tensor["tokens"]["codec"] == "typed_ragged"
+    assert result["non_tensor_batch"]["tokens"].tolist() == [[1, 2], None, [3, 4, 5]]
+    assert rows[0].nbytes + rows[2].nbytes in pool.acquire_sizes
 
 
 def test_dataproto_helper_rejects_unsupported_object_non_tensor() -> None:
