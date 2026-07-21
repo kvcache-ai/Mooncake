@@ -31,6 +31,7 @@ struct ClientOffboardingJob {
     bool all_segments_prepared{true};
     std::chrono::steady_clock::time_point enqueued_at{
         std::chrono::steady_clock::now()};
+    uint64_t snapshot_barrier_generation{0};
 };
 
 // Completes terminal Client offboarding after MasterService has synchronously
@@ -51,6 +52,7 @@ class ClientOffboardingWorker {
     [[nodiscard]] bool HasPending() const {
         return pending_jobs_.load(std::memory_order_acquire) != 0;
     }
+    [[nodiscard]] bool ShouldSkipSnapshot();
 
    private:
     void ThreadFunc();
@@ -63,6 +65,8 @@ class ClientOffboardingWorker {
     std::mutex mutex_;
     std::condition_variable cv_;
     std::atomic<size_t> pending_jobs_{0};
+    uint64_t snapshot_barrier_generation_{0};
+    bool failed_job_requires_snapshot_skip_{false};
 };
 
 }  // namespace mooncake

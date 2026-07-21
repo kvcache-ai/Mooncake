@@ -81,7 +81,7 @@ MasterMetricManager::MasterMetricManager()
           "Store Client Suspected to Offline transitions"),
       pending_client_offboarding_jobs_metric_(
           "master_client_offboarding_queue_depth",
-          "Queued, running, or incomplete Store Client offboarding jobs"),
+          "Queued or running Store Client offboarding jobs"),
       client_offboarding_duration_ms_(
           "master_client_offboarding_duration_ms",
           "Asynchronous Store Client offboarding duration in milliseconds",

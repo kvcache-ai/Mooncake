@@ -61,11 +61,27 @@ bool ClientOffboardingWorker::Schedule(ClientOffboardingJob job) {
         if (!running_) {
             return false;
         }
+        job.snapshot_barrier_generation = snapshot_barrier_generation_;
         jobs_.push_back(std::move(job));
         pending_jobs_.fetch_add(1, std::memory_order_release);
         MasterMetricManager::instance().inc_client_offboarding_queue_depth();
     }
     cv_.notify_one();
+    return true;
+}
+
+bool ClientOffboardingWorker::ShouldSkipSnapshot() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (pending_jobs_.load(std::memory_order_acquire) == 0 &&
+        !failed_job_requires_snapshot_skip_) {
+        return false;
+    }
+
+    // One skipped snapshot cycle covers every job scheduled in the current
+    // generation. A failed job requests a skip only when no snapshot attempt
+    // observed it while it was pending.
+    ++snapshot_barrier_generation_;
+    failed_job_requires_snapshot_skip_ = false;
     return true;
 }
 
@@ -159,11 +175,28 @@ void ClientOffboardingWorker::ThreadFunc() {
         for (size_t job_index = 0; job_index < jobs.size(); ++job_index) {
             const auto& job = jobs[job_index];
             if (!jobs_completed[job_index]) {
-                // Keep the logical job pending. This preserves both the
-                // ReMount barrier and the scheduled-snapshot barrier instead
-                // of persisting partially offboarded state.
+                bool snapshot_skip_already_observed = false;
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    snapshot_skip_already_observed =
+                        job.snapshot_barrier_generation !=
+                        snapshot_barrier_generation_;
+                    if (!snapshot_skip_already_observed) {
+                        failed_job_requires_snapshot_skip_ = true;
+                    }
+                    pending_jobs_.fetch_sub(1, std::memory_order_acq_rel);
+                }
+                MasterMetricManager::instance()
+                    .dec_client_offboarding_queue_depth();
+
+                // The Offline record remains as a ReMount barrier, but this
+                // failed job does not permanently block later snapshots. If
+                // no snapshot cycle observed it while pending, preserve one
+                // consumable skip for the next snapshot attempt.
                 LOG(ERROR) << "client_id=" << job.client_id
-                           << ", error=client_offboarding_incomplete";
+                           << ", error=client_offboarding_incomplete"
+                           << ", snapshot_skip_already_observed="
+                           << snapshot_skip_already_observed;
                 continue;
             }
 
@@ -181,7 +214,10 @@ void ClientOffboardingWorker::ThreadFunc() {
                 }
             }
 
-            pending_jobs_.fetch_sub(1, std::memory_order_release);
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                pending_jobs_.fetch_sub(1, std::memory_order_acq_rel);
+            }
             MasterMetricManager::instance().dec_client_offboarding_queue_depth();
             const auto duration_ms =
                 std::chrono::duration_cast<std::chrono::milliseconds>(

@@ -1940,8 +1940,8 @@ class MasterService {
     std::atomic<bool> client_monitor_running_{false};
     static constexpr uint64_t kClientMonitorSleepMs =
         1000;  // 1000 ms sleep between client monitor checks
-    [[nodiscard]] bool HasPendingClientOffboarding() const {
-        return client_offboarding_worker_.HasPending();
+    [[nodiscard]] bool ShouldSkipSnapshotForClientOffboarding() {
+        return client_offboarding_worker_.ShouldSkipSnapshot();
     }
     ClientOffboardingWorker client_offboarding_worker_{this};
     const int64_t client_active_ttl_sec_;

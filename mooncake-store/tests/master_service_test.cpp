@@ -197,6 +197,26 @@ class MasterServiceTest : public ::testing::Test {
                                                              : it->second;
     }
 
+    bool ScheduleClientOffboardingForTest(MasterService& service,
+                                          ClientOffboardingJob job) const {
+        return service.client_offboarding_worker_.Schedule(std::move(job));
+    }
+
+    bool HasPendingClientOffboardingForTest(
+        const MasterService& service) const {
+        return service.client_offboarding_worker_.HasPending();
+    }
+
+    bool ShouldSkipSnapshotForClientOffboardingForTest(
+        MasterService& service) const {
+        return service.ShouldSkipSnapshotForClientOffboarding();
+    }
+
+    std::unique_lock<std::shared_mutex> LockSnapshotForTest(
+        MasterService& service) const {
+        return std::unique_lock<std::shared_mutex>(service.snapshot_mutex_);
+    }
+
     std::string FindGroupIdOnDifferentShard(const std::string& key) const {
         static constexpr size_t kMetadataShardCountForTest = 1024;
         const size_t key_shard =
@@ -5220,6 +5240,61 @@ TEST_F(MasterServiceTest,
     EXPECT_EQ(unmounted_segments,
               (std::unordered_set<std::string>{"expired_segment_a",
                                                "expired_segment_b"}));
+}
+
+TEST_F(MasterServiceTest,
+       FailedClientOffboardingSkipsOnlyOneSnapshotCycle) {
+    auto service = std::make_unique<MasterService>(MasterServiceConfig{});
+    ClientOffboardingJob job{
+        .client_id = generate_uuid(),
+        .liveness = std::make_shared<ClientLivenessRecord>(
+            ClientLivenessRecord::Clock::now()),
+        .segments = {},
+        .all_segments_prepared = false,
+        .enqueued_at = std::chrono::steady_clock::now(),
+    };
+
+    ASSERT_TRUE(ScheduleClientOffboardingForTest(*service, std::move(job)));
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (HasPendingClientOffboardingForTest(*service) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    ASSERT_FALSE(HasPendingClientOffboardingForTest(*service));
+    EXPECT_TRUE(ShouldSkipSnapshotForClientOffboardingForTest(*service));
+    EXPECT_FALSE(ShouldSkipSnapshotForClientOffboardingForTest(*service));
+}
+
+TEST_F(MasterServiceTest,
+       PendingClientOffboardingSkipDoesNotLeakAfterJobFails) {
+    auto service = std::make_unique<MasterService>(MasterServiceConfig{});
+    ClientOffboardingJob job{
+        .client_id = generate_uuid(),
+        .liveness = std::make_shared<ClientLivenessRecord>(
+            ClientLivenessRecord::Clock::now()),
+        .segments = {},
+        .all_segments_prepared = false,
+        .enqueued_at = std::chrono::steady_clock::now(),
+    };
+
+    // Keep the worker behind snapshot access so this check deterministically
+    // observes the job while it is pending.
+    auto snapshot_lock = LockSnapshotForTest(*service);
+    ASSERT_TRUE(ScheduleClientOffboardingForTest(*service, std::move(job)));
+    EXPECT_TRUE(ShouldSkipSnapshotForClientOffboardingForTest(*service));
+    snapshot_lock.unlock();
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (HasPendingClientOffboardingForTest(*service) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    ASSERT_FALSE(HasPendingClientOffboardingForTest(*service));
+    EXPECT_FALSE(ShouldSkipSnapshotForClientOffboardingForTest(*service));
 }
 
 TEST_F(MasterServiceTest, PutStartExpiringTest) {
