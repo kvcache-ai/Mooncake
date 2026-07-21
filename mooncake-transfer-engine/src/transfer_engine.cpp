@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <chrono>
+#include <limits>
+#include <thread>
+#include <unordered_map>
+
 #ifndef USE_TENT
 #include "transfer_engine.h"
 #include "show_links.h"
@@ -162,11 +167,6 @@ int TransferEngine::unregisterLocalMemory(void* addr, bool update_metadata) {
 Status TransferEngine::submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest>& entries) {
     return impl_->submitTransfer(batch_id, entries);
-}
-
-Status TransferEngine::transferScatter(
-    const std::vector<ScatterTransferRange>& ranges) {
-    return impl_->transferScatter(ranges);
 }
 
 Status TransferEngine::submitTransferWithNotify(
@@ -873,3 +873,142 @@ std::string TransferEngine::showLinks(bool json) const {
 
 }  // namespace mooncake
 #endif
+
+namespace mooncake {
+
+Status TransferEngine::transferScatter(
+    const std::vector<ScatterTransferRange>& ranges) {
+    std::vector<TransferRequest> requests;
+    std::vector<std::pair<size_t, size_t>> request_fragments;
+    std::unordered_map<std::string, SegmentHandle> segment_cache;
+
+    auto complete = [&](size_t range_index, size_t fragment_index,
+                        const Status& status) {
+        const auto& callback = ranges[range_index].on_fragment_complete;
+        if (callback) callback(fragment_index, status);
+    };
+
+    for (size_t range_index = 0; range_index < ranges.size(); ++range_index) {
+        const auto& range = ranges[range_index];
+        const size_t fragment_count = range.local_offsets.size();
+        if (range.remote_offsets.size() != fragment_count ||
+            range.lengths.size() != fragment_count ||
+            range.local_buffer == nullptr || range.remote_segment.empty()) {
+            const auto status =
+                Status::InvalidArgument("invalid scatter transfer range");
+            for (size_t i = 0; i < fragment_count; ++i) {
+                complete(range_index, i, status);
+            }
+            continue;
+        }
+
+        for (size_t fragment_index = 0; fragment_index < fragment_count;
+             ++fragment_index) {
+            const size_t length = range.lengths[fragment_index];
+            const size_t local_offset = range.local_offsets[fragment_index];
+            const size_t remote_offset = range.remote_offsets[fragment_index];
+            if (local_offset > range.local_capacity ||
+                length > range.local_capacity - local_offset ||
+                remote_offset > range.remote_size ||
+                length > range.remote_size - remote_offset ||
+                range.remote_base_offset >
+                    std::numeric_limits<uint64_t>::max() - remote_offset ||
+                length > std::numeric_limits<uint64_t>::max() -
+                             (range.remote_base_offset + remote_offset)) {
+                complete(range_index, fragment_index,
+                         Status::InvalidArgument(
+                             "invalid scatter transfer fragment"));
+                continue;
+            }
+
+            if (length == 0) {
+                complete(range_index, fragment_index, Status::OK());
+                continue;
+            }
+
+            auto [seg_it, inserted] = segment_cache.emplace(
+                range.remote_segment,
+                static_cast<SegmentHandle>(ERR_INVALID_ARGUMENT));
+            if (inserted) seg_it->second = openSegment(range.remote_segment);
+            if (seg_it->second ==
+                static_cast<SegmentHandle>(ERR_INVALID_ARGUMENT)) {
+                complete(range_index, fragment_index,
+                         Status::InvalidArgument(
+                             "failed to open scatter transfer segment"));
+                continue;
+            }
+
+            requests.push_back(TransferRequest{
+                .opcode = range.opcode,
+                .source = static_cast<char*>(range.local_buffer) + local_offset,
+                .target_id = seg_it->second,
+                .target_offset = range.remote_base_offset + remote_offset,
+                .length = length,
+            });
+            request_fragments.emplace_back(range_index, fragment_index);
+        }
+    }
+
+    if (requests.empty()) return Status::OK();
+
+    std::vector<uint8_t> terminated(requests.size(), false);
+    auto fail_pending = [&](const Status& status) {
+        for (size_t i = 0; i < request_fragments.size(); ++i) {
+            if (terminated[i]) continue;
+            const auto [range_index, fragment_index] = request_fragments[i];
+            complete(range_index, fragment_index, status);
+        }
+    };
+
+    BatchID batch_id = allocateBatchID(requests.size());
+    if (batch_id == INVALID_BATCH_ID) {
+        Status status = Status::InvalidArgument(
+            "failed to allocate scatter transfer batch");
+        fail_pending(status);
+        return status;
+    }
+    auto abort = [&](Status status) {
+        fail_pending(status);
+        freeBatchID(batch_id);
+        return status;
+    };
+    Status result = submitTransfer(batch_id, requests);
+    if (!result.ok()) return abort(result);
+
+    constexpr auto timeout = std::chrono::seconds(60);
+    auto start = std::chrono::steady_clock::now();
+    size_t remaining = requests.size();
+    bool has_failure = false;
+    while (remaining > 0) {
+        for (size_t i = 0; i < requests.size(); ++i) {
+            if (terminated[i]) continue;
+            TransferStatus status;
+            result = getTransferStatus(batch_id, i, status);
+            if (!result.ok()) return abort(result);
+
+            const auto [range_index, fragment_index] = request_fragments[i];
+            if (status.s == TransferStatusEnum::COMPLETED) {
+                complete(range_index, fragment_index, Status::OK());
+                terminated[i] = true;
+                --remaining;
+            } else if (status.s != TransferStatusEnum::WAITING &&
+                       status.s != TransferStatusEnum::PENDING) {
+                complete(range_index, fragment_index,
+                         Status::Socket("scatter transfer fragment failed"));
+                terminated[i] = true;
+                --remaining;
+                has_failure = true;
+            }
+        }
+        if (remaining == 0) break;
+        if (std::chrono::steady_clock::now() - start > timeout) {
+            return abort(Status::Socket("scatter transfer timed out"));
+        }
+        std::this_thread::yield();
+    }
+    freeBatchID(batch_id);
+    return has_failure ? Status::Socket("scatter transfer failed")
+                       : Status::OK();
+}
+
+}  // namespace mooncake

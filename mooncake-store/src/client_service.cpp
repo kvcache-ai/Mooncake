@@ -1212,9 +1212,7 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
 
 Status Client::TransferScatter(
     const std::vector<TransferEngine::ScatterTransferRange>& transfers) {
-    if (transfers.empty()) {
-        return Status::OK();
-    }
+    if (transfers.empty()) return Status::OK();
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         return Status::InvalidArgument("TransferSubmitter not initialized");

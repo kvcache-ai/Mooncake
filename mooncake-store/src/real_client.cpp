@@ -3188,12 +3188,21 @@ RealClient::resolve_writable_buffer_region(void *buffer) const {
 }
 
 tl::expected<RealClient::RangedReadMetadata, ErrorCode>
-RealClient::resolve_ranged_read_metadata(const std::string &key) {
+RealClient::resolve_ranged_read_metadata(
+    const std::string &key, const QueryResultCache *query_result_cache) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    if (query_result_cache) {
+        auto cached = query_result_cache->find(key);
+        if (cached != query_result_cache->end() &&
+            (!cached->second || !cached->second->IsLeaseExpired())) {
+            return build_ranged_read_metadata_from_query_result(key,
+                                                                cached->second);
+        }
+    }
     return build_ranged_read_metadata_from_query_result(key,
                                                         client_->Query(key));
 }
@@ -3499,20 +3508,8 @@ RealClient::get_into_ranges_internal(
     auto metadata_for = [&](const std::string &key) -> auto & {
         auto found = metadata_cache.find(key);
         if (found != metadata_cache.end()) return found->second;
-
-        auto query = [&]() -> tl::expected<QueryResult, ErrorCode> {
-            if (query_result_cache) {
-                auto cached = query_result_cache->find(key);
-                if (cached != query_result_cache->end() &&
-                    (!cached->second || !cached->second->IsLeaseExpired())) {
-                    return cached->second;
-                }
-            }
-            return client_->Query(key);
-        }();
         return metadata_cache
-            .emplace(key, build_ranged_read_metadata_from_query_result(
-                              key, std::move(query)))
+            .emplace(key, resolve_ranged_read_metadata(key, query_result_cache))
             .first->second;
     };
 
@@ -3521,16 +3518,22 @@ RealClient::get_into_ranges_internal(
         if (!buffers[i] || (!buffer_capacities && capacities[i] == 0)) {
             continue;
         }
-        const size_t key_count = all_keys[i].size();
-        if (key_count != all_dst_offsets[i].size() ||
-            key_count != all_src_offsets[i].size() ||
-            key_count != all_sizes[i].size()) {
+        const auto &keys = all_keys[i];
+        const auto &dst_groups = all_dst_offsets[i];
+        const auto &src_groups = all_src_offsets[i];
+        const auto &size_groups = all_sizes[i];
+        if (keys.size() != dst_groups.size() ||
+            keys.size() != src_groups.size() ||
+            keys.size() != size_groups.size()) {
             continue;
         }
 
-        for (size_t j = 0; j < key_count; ++j) {
+        for (size_t j = 0; j < keys.size(); ++j) {
+            const auto &dst_offsets = dst_groups[j];
+            const auto &src_offsets = src_groups[j];
+            const auto &sizes = size_groups[j];
             auto &range_results = results[i][j];
-            auto &metadata_result = metadata_for(all_keys[i][j]);
+            auto &metadata_result = metadata_for(keys[j]);
             if (!metadata_result) {
                 std::fill(range_results.begin(), range_results.end(),
                           tl::unexpected(metadata_result.error()));
@@ -3541,8 +3544,6 @@ RealClient::get_into_ranges_internal(
             if (metadata.replica.is_memory_replica()) {
                 const auto &handle =
                     metadata.replica.get_memory_descriptor().buffer_descriptor;
-                auto *range_output = &range_results;
-                const auto *range_sizes = &all_sizes[i][j];
                 memory_transfers.push_back(TransferEngine::ScatterTransferRange{
                     .opcode = TransferRequest::READ,
                     .remote_segment = handle.transport_endpoint_,
@@ -3550,42 +3551,41 @@ RealClient::get_into_ranges_internal(
                     .remote_size = handle.size_,
                     .local_buffer = buffers[i],
                     .local_capacity = capacities[i],
-                    .local_offsets = all_dst_offsets[i][j],
-                    .remote_offsets = all_src_offsets[i][j],
-                    .lengths = all_sizes[i][j],
+                    .local_offsets = dst_offsets,
+                    .remote_offsets = src_offsets,
+                    .lengths = sizes,
                     .on_fragment_complete =
-                        [range_output, range_sizes,
+                        [results = &range_results, sizes = &sizes,
                          query_result = &metadata.query_result](
                             size_t k, const Status &status) {
-                            if (!status.ok()) {
-                                (*range_output)[k] = tl::unexpected(
-                                    scatter_transfer_error(status));
-                            } else if (query_result->IsLeaseExpired()) {
-                                (*range_output)[k] =
-                                    tl::unexpected(ErrorCode::LEASE_EXPIRED);
-                            } else {
-                                (*range_output)[k] =
-                                    static_cast<int64_t>((*range_sizes)[k]);
+                            if (status.ok() &&
+                                !query_result->IsLeaseExpired()) {
+                                (*results)[k] =
+                                    static_cast<int64_t>((*sizes)[k]);
+                                return;
                             }
+                            (*results)[k] = tl::unexpected(
+                                status.ok() ? ErrorCode::LEASE_EXPIRED
+                                            : scatter_transfer_error(status));
                         },
                 });
                 continue;
             }
 
-            if (all_dst_offsets[i][j].size() != all_src_offsets[i][j].size() ||
-                all_dst_offsets[i][j].size() != all_sizes[i][j].size()) {
+            if (dst_offsets.size() != src_offsets.size() ||
+                dst_offsets.size() != sizes.size()) {
                 continue;
             }
             for (size_t k = 0; k < range_results.size(); ++k) {
-                const size_t dst_offset = all_dst_offsets[i][j][k];
+                const size_t dst_offset = dst_offsets[k];
                 if (dst_offset > capacities[i] ||
-                    all_sizes[i][j][k] > capacities[i] - dst_offset) {
+                    sizes[k] > capacities[i] - dst_offset) {
                     continue;
                 }
 
-                range_results[k] = execute_ranged_read(
-                    all_keys[i][j], buffers[i], dst_offset,
-                    all_src_offsets[i][j][k], all_sizes[i][j][k], metadata);
+                range_results[k] =
+                    execute_ranged_read(keys[j], buffers[i], dst_offset,
+                                        src_offsets[k], sizes[k], metadata);
             }
         }
     }
