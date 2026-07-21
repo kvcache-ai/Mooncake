@@ -167,8 +167,8 @@ TEST_F(MasterServiceSnapshotTest, GetReplicaListByRegex) {
 }
 
 // Helper function to put an object, making the test cleaner
-void put_object(MasterService& service, const UUID& client_id,
-                const std::string& key) {
+static void put_object(MasterService& service, const UUID& client_id,
+                       const std::string& key) {
     uint64_t value_length = 1024;
     ReplicateConfig config;
     config.replica_num = 1;
@@ -727,22 +727,22 @@ TEST_F(MasterServiceSnapshotTest, ConcurrentWriteAndRemoveAll) {
 
     constexpr int num_threads = 4;
     constexpr int objects_per_thread = 100;
-    std::atomic success_writes(0);
-    std::atomic remove_all_done(false);
-    std::atomic total_removed(0);
+    std::atomic<int> success_writes(0);
+    std::atomic<bool> remove_all_done(false);
+    std::atomic<int> total_removed(0);
 
     // Writer threads
     std::vector<std::thread> writers;
     for (int i = 0; i < num_threads; ++i) {
         writers.emplace_back([&, i]() {
+            std::mt19937 generator(static_cast<std::mt19937::result_type>(i));
+            std::uniform_int_distribution<int> distribution(0, 9);
             for (int j = 0; j < objects_per_thread; ++j) {
                 std::string key =
                     "key_" + std::to_string(i) + "_" + std::to_string(j);
                 uint64_t slice_length = 1024;
                 ReplicateConfig config;
                 config.replica_num = 1;
-                std::vector<Replica::Descriptor> replica_list;
-
                 auto put_start_result = service_->PutStart(
                     client_id, key, "default", slice_length, config);
                 if (put_start_result.has_value()) {
@@ -755,7 +755,7 @@ TEST_F(MasterServiceSnapshotTest, ConcurrentWriteAndRemoveAll) {
 
                 // Random sleep to increase concurrency complexity
                 std::this_thread::sleep_for(
-                    std::chrono::milliseconds(rand() % 10));
+                    std::chrono::milliseconds(distribution(generator)));
             }
         });
     }
@@ -827,7 +827,9 @@ TEST_F(MasterServiceSnapshotTest, ConcurrentReadAndRemoveAll) {
     // Reader threads
     std::vector<std::thread> readers;
     for (int i = 0; i < 4; ++i) {
-        readers.emplace_back([&]() {
+        readers.emplace_back([&, i]() {
+            std::mt19937 generator(static_cast<std::mt19937::result_type>(i));
+            std::uniform_int_distribution<int> distribution(0, 4);
             for (int j = 0; j < num_objects; ++j) {
                 std::string key = "pre_key_" + std::to_string(j);
                 auto get_result = service_->GetReplicaList(key, "default");
@@ -837,7 +839,7 @@ TEST_F(MasterServiceSnapshotTest, ConcurrentReadAndRemoveAll) {
 
                 // Random sleep to increase concurrency complexity
                 std::this_thread::sleep_for(
-                    std::chrono::milliseconds(rand() % 5));
+                    std::chrono::milliseconds(distribution(generator)));
             }
         });
     }

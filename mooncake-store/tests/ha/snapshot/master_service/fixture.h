@@ -14,7 +14,7 @@ namespace mooncake::test {
 
 class MasterServiceSnapshotTest : public MasterServiceSnapshotTestBase {
    protected:
-    static bool glog_initialized_;
+    inline static bool glog_initialized_ = false;
 
     void SetUp() override {
         // Call base class SetUp first to reset MasterMetricManager state
@@ -28,11 +28,9 @@ class MasterServiceSnapshotTest : public MasterServiceSnapshotTestBase {
     }
 };
 
-bool MasterServiceSnapshotTest::glog_initialized_ = false;
-
-std::string GenerateKeyForSegment(const UUID& client_id,
-                                  const std::unique_ptr<MasterService>& service,
-                                  const std::string& segment_name) {
+inline std::string GenerateKeyForSegment(
+    const UUID& client_id, const std::unique_ptr<MasterService>& service,
+    const std::string& segment_name) {
     static std::atomic<uint64_t> counter(0);
 
     while (true) {
