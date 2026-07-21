@@ -1,9 +1,11 @@
 #include <cuda_alike.h>
+#include <exception>
 #include <thread>
 #include <mooncake_worker.cuh>
 #include <mooncake_backend.h>
 #include <glog/logging.h>
 #include <transfer_engine.h>
+#include "control_plane/rpc.h"
 #include "pg_utils.h"
 #include "control_plane/agent_host.h"
 
@@ -75,8 +77,30 @@ void MooncakeWorker::startWorker() {
         }
         std::atomic<WorkerTaskStatus> task_status[kNumTasks_];
         using clock = std::chrono::high_resolution_clock;
+
+        // Per-slot state owned exclusively by this worker thread.
         clock::time_point activeTime[kNumTasks_];
         size_t rankToTaskId[kNumTasks_][kMaxNumRanks];
+        int32_t failedRanks[kNumTasks_][kMaxNumRanks]{};
+        int32_t attemptedRanks[kNumTasks_][kMaxNumRanks]{};
+        // Pins an optional hint tensor selected at admission until this slot's
+        // task completes, even if its graph route is concurrently removed.
+        at::Tensor active_hint_tensors[kNumTasks_];
+        bool task_detected_failure[kNumTasks_]{};
+
+        auto hasFailed = [&failedRanks](size_t task_id, int rank) {
+            return failedRanks[task_id][rank] != 0;
+        };
+        auto markFailed = [&failedRanks](size_t task_id, int rank) {
+            failedRanks[task_id][rank] = 1;
+        };
+        auto hasAttempted = [&attemptedRanks](size_t task_id, int rank) {
+            return attemptedRanks[task_id][rank] != 0;
+        };
+        auto markAttempted = [&attemptedRanks](size_t task_id, int rank) {
+            attemptedRanks[task_id][rank] = 1;
+        };
+
         while (running_) {
             PAUSE();
             for (size_t i = 0; i < kNumTasks_; ++i) {
@@ -96,6 +120,34 @@ void MooncakeWorker::startWorker() {
 
                 if (task_status[i].load(std::memory_order_acquire) == IDLE) {
                     const auto submit_sequence = task.submitSequence;
+                    const auto hint_route_id = task.hintRouteId;
+
+                    // A slot is reused by unrelated tasks. Start with fresh
+                    // task-local observations so stale failures/attempts from
+                    // the previous occupant cannot affect this task.
+                    for (size_t j = 0; j < kMaxNumRanks; ++j) {
+                        failedRanks[i][j] = 0;
+                        attemptedRanks[i][j] = 0;
+                    }
+                    task_detected_failure[i] = false;
+                    active_hint_tensors[i] = at::Tensor();
+
+                    {
+                        std::lock_guard<std::mutex> lock(hint_routes_mutex_);
+                        auto it = hint_routes_by_id_.find(hint_route_id);
+                        if (it != hint_routes_by_id_.end()) {
+                            active_hint_tensors[i] = it->second.tensor;
+                        }
+                    }
+                    if (task.resetFailedRanksHint &&
+                        active_hint_tensors[i].defined()) {
+                        // A graph replay carries the captured first-chunk flag,
+                        // so it starts a fresh hint in the same tensor storage.
+                        auto* failed = active_hint_tensors[i].data_ptr<int>();
+                        for (int j = 0; j < group->maxGroupSize; ++j) {
+                            failed[j] = 0;
+                        }
+                    }
                     if (skipTransfer) {
                         submitted_task_sequence_[i].store(
                             submit_sequence, std::memory_order_release);
@@ -109,8 +161,7 @@ void MooncakeWorker::startWorker() {
                     std::vector<TransferRequest> entries;
                     entries.reserve(group->maxGroupSize);
                     for (int j = 0; j < group->maxGroupSize; ++j) {
-                        if (!group->activeRanks[j] ||
-                            task_failed_tensor_[i][j].item<int>()) {
+                        if (!group->activeRanks[j] || hasFailed(i, j)) {
                             continue;
                         }
                         if (((c10d::OpType)task.opType ==
@@ -173,7 +224,7 @@ void MooncakeWorker::startWorker() {
                         });
 
                         // Attempted to transfer to this peer
-                        task_attempted_tensor_[i][j] = 1;
+                        markAttempted(i, j);
                     }
                     task.batchID =
                         group->engine->allocateBatchID(entries.size());
@@ -193,8 +244,7 @@ void MooncakeWorker::startWorker() {
                         auto diff = std::chrono::duration_cast<
                             std::chrono::microseconds>(now - activeTime[i]);
                         for (int j = 0; j < group->maxGroupSize; ++j) {
-                            if (!group->activeRanks[j] ||
-                                task_failed_tensor_[i][j].item<int>()) {
+                            if (!group->activeRanks[j] || hasFailed(i, j)) {
                                 continue;
                             }
                             if (rankToTaskId[i][j] == kInvalidTaskId) {
@@ -215,7 +265,8 @@ void MooncakeWorker::startWorker() {
                                         PeerLiveness::Alive;
                                 }
                                 if (peer_dead) {
-                                    task_failed_tensor_[i][j] = 1;
+                                    markFailed(i, j);
+                                    task_detected_failure[i] = true;
                                     LOG(ERROR)
                                         << "Rank " << group->globalRank
                                         << " [DATA] transfer to peer " << j
@@ -255,8 +306,7 @@ void MooncakeWorker::startWorker() {
                     std::vector<TransferRequest> entries;
                     entries.reserve(group->maxGroupSize);
                     for (int j = 0; j < group->maxGroupSize; ++j) {
-                        if (!group->activeRanks[j] ||
-                            task_failed_tensor_[i][j].item<int>()) {
+                        if (!group->activeRanks[j] || hasFailed(i, j)) {
                             continue;
                         }
                         *source_ptr = 1;
@@ -270,6 +320,7 @@ void MooncakeWorker::startWorker() {
                                              group->rank * sizeof(int32_t),
                             .length = sizeof(int32_t),
                         });
+                        markAttempted(i, j);
                     }
                     task.batchID =
                         group->engine->allocateBatchID(entries.size());
@@ -289,8 +340,7 @@ void MooncakeWorker::startWorker() {
 
                     TransferStatus status;
                     for (int j = 0; j < group->maxGroupSize; ++j) {
-                        if (!group->activeRanks[j] ||
-                            task_failed_tensor_[i][j].item<int>()) {
+                        if (!group->activeRanks[j] || hasFailed(i, j)) {
                             continue;
                         }
                         if (rankToTaskId[i][j] == kInvalidTaskId) {
@@ -311,7 +361,8 @@ void MooncakeWorker::startWorker() {
                                             PeerLiveness::Alive;
                             }
                             if (peer_dead) {
-                                task_failed_tensor_[i][j] = 1;
+                                markFailed(i, j);
+                                task_detected_failure[i] = true;
                                 LOG(ERROR)
                                     << "Rank " << group->globalRank
                                     << " [SYNC] sync to peer " << j
@@ -335,13 +386,20 @@ void MooncakeWorker::startWorker() {
                             signal_ptr[j] = 0;
                         }
 
+                        if (active_hint_tensors[i].defined()) {
+                            auto* failed =
+                                active_hint_tensors[i].data_ptr<int>();
+                            for (int j = 0; j < group->maxGroupSize; ++j) {
+                                failed[j] |= failedRanks[i][j];
+                            }
+                            active_hint_tensors[i] = at::Tensor();
+                        }
+
                         // Push link event via backend's Agent.
                         if (group->backend) {
-                            auto& att_tensor = task_attempted_tensor_[i];
-                            auto& fail_tensor = task_failed_tensor_[i];
                             bool has_any_attempted = false;
                             for (int j = 0; j < group->maxGroupSize; ++j) {
-                                if (att_tensor[j].item<int>()) {
+                                if (hasAttempted(i, j)) {
                                     has_any_attempted = true;
                                     break;
                                 }
@@ -352,13 +410,45 @@ void MooncakeWorker::startWorker() {
                                                     LinkEvent::EventType::None);
                                 for (int j = 0; j < group->maxGroupSize; ++j) {
                                     int32_t peer_global = group->rank_order[j];
-                                    if (!att_tensor[j].item<int>()) continue;
+                                    if (!hasAttempted(i, j)) continue;
                                     event.events[peer_global] =
-                                        fail_tensor[j].item<int>()
+                                        hasFailed(i, j)
                                             ? LinkEvent::EventType::Failure
                                             : LinkEvent::EventType::Success;
                                 }
                                 group->backend->getAgent().pushLinkEvent(event);
+                            }
+                        }
+
+                        auto s = group->engine->freeBatchID(task.batchID);
+                        if (!s.ok()) {
+                            LOG(WARNING)
+                                << "BatchID leaked due to freeBatchID "
+                                   "failure (likely caused by a timeout): "
+                                << s.message();
+                        }
+
+                        if (task_detected_failure[i] &&
+                            group->autoSyncOnFailure) {
+                            SyncAfterFailureResponse response;
+                            try {
+                                response = group->backend->syncAfterFailure();
+                            } catch (const std::exception& e) {
+                                LOG(FATAL)
+                                    << "syncAfterFailure RPC failed for rank "
+                                    << group->globalRank << ": " << e.what();
+                            } catch (...) {
+                                LOG(FATAL)
+                                    << "syncAfterFailure RPC failed for rank "
+                                    << group->globalRank
+                                    << " with an unknown exception";
+                            }
+                            if (response.status ==
+                                SyncAfterFailureStatus::Rejected) {
+                                LOG(FATAL)
+                                    << "syncAfterFailure rejected for rank "
+                                    << group->globalRank << ": "
+                                    << response.reject_reason;
                             }
                         }
 
@@ -370,13 +460,6 @@ void MooncakeWorker::startWorker() {
                             auto callback = std::move(callbacks_[i]);
                             hasCallback_[i] = false;
                             callback();
-                        }
-                        auto s = group->engine->freeBatchID(task.batchID);
-                        if (!s.ok()) {
-                            LOG(WARNING)
-                                << "BatchID leaked due to freeBatchID "
-                                   "failure (likely caused by a timeout): "
-                                << s.message();
                         }
                     }
                 }

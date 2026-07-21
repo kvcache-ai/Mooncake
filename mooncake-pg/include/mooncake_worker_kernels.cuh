@@ -21,6 +21,8 @@ __global__
     int64_t broadcastRoot;
     int bufferOffset;
     uint64_t submitSequence = 0;
+    uint64_t hintRouteId = 0;
+    bool resetFailedRanksHint = false;
     BatchID batchID;
     void* transferGroupMeta;
 };
@@ -32,7 +34,8 @@ __global__
 #if defined(__CUDACC__) || defined(__MUSA__)
 __global__ void enqueueTaskKernel(int opType, size_t tensorSize,
                                   int64_t broadcastRoot, int bufferOffset,
-                                  uint64_t submitSequence, void* meta,
+                                  uint64_t submitSequence, uint64_t hintRouteId,
+                                  bool resetFailedRanksHint, void* meta,
                                   Task* tasks, size_t taskId);
 
 template <typename scalar_t>
@@ -49,7 +52,8 @@ __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
 
 void launchEnqueueTaskKernel(int opType, size_t tensorSize,
                              int64_t broadcastRoot, int bufferOffset,
-                             uint64_t submitSequence, void* meta, Task* tasks,
+                             uint64_t submitSequence, uint64_t hintRouteId,
+                             bool resetFailedRanksHint, void* meta, Task* tasks,
                              size_t taskId, cudaStream_t stream);
 
 void launchReduceKernel_uint8(uint8_t* dst, const uint8_t* src,

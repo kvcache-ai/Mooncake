@@ -16,19 +16,13 @@ namespace mooncake {
 struct TransferGroupMeta;
 class MooncakeWorker;
 
-// Per-operation failedRanksHint / attemptedRanks buffer
-//
-// Both tensors are CPU tensors backed by Torch's refcounted storage.  The
-// worker thread holds a copy of each tensor to keep the memory alive until
-// the task completes, even if the Work handle is destroyed early.
+// Per-operation failedRanksHint buffer
 struct FailedRanksHint {
     at::Tensor tensor;
-    at::Tensor attempted_tensor;
 
     FailedRanksHint() = default;
-    FailedRanksHint(at::Tensor tensor_in, at::Tensor attempted_tensor_in)
-        : tensor(std::move(tensor_in)),
-          attempted_tensor(std::move(attempted_tensor_in)) {}
+    explicit FailedRanksHint(at::Tensor tensor_in)
+        : tensor(std::move(tensor_in)) {}
 
     FailedRanksHint(const FailedRanksHint&) = delete;
     FailedRanksHint& operator=(const FailedRanksHint&) = delete;
@@ -38,7 +32,6 @@ struct FailedRanksHint {
     ~FailedRanksHint() = default;
 
     int* data() { return tensor.data_ptr<int>(); }
-    int* attemptedData() { return attempted_tensor.data_ptr<int>(); }
     const int* data() const { return tensor.data_ptr<int>(); }
 
     bool isLocalSuccess(int size) const {
@@ -58,11 +51,16 @@ class MooncakeWorkCpu : public ::c10d::Work {
     MooncakeWorkCpu(c10d::OpType opType,
                     c10::intrusive_ptr<c10::ivalue::Future> future,
                     std::shared_ptr<TransferGroupMeta> meta,
+                    MooncakeWorker* worker, uint64_t hintRouteId,
                     FailedRanksHint failedRanksHint)
         : Work(-1, opType),
           future_(std::move(future)),
           meta_(std::move(meta)),
+          worker_(worker),
+          hintRouteId_(hintRouteId),
           failedRanksHint_(std::move(failedRanksHint)) {}
+
+    ~MooncakeWorkCpu() override;
 
     bool isCompleted() override { return future_->completed(); }
 
@@ -74,6 +72,8 @@ class MooncakeWorkCpu : public ::c10d::Work {
    private:
     c10::intrusive_ptr<c10::ivalue::Future> future_;
     std::shared_ptr<TransferGroupMeta> meta_;
+    MooncakeWorker* worker_;
+    uint64_t hintRouteId_;
     FailedRanksHint failedRanksHint_;
 };
 
@@ -86,15 +86,18 @@ class MooncakeWorkCuda : public ::c10d::Work {
    public:
     MooncakeWorkCuda(c10d::OpType opType, std::shared_ptr<torch::Event> event,
                      std::shared_ptr<TransferGroupMeta> meta,
-                     const MooncakeWorker* worker,
+                     MooncakeWorker* worker, uint64_t hintRouteId,
                      std::vector<CudaTaskSubmissionToken> submitted_tasks,
                      FailedRanksHint failedRanksHint)
         : Work(-1, opType),
           event_(std::move(event)),
           meta_(std::move(meta)),
           worker_(worker),
+          hintRouteId_(hintRouteId),
           submitted_tasks_(std::move(submitted_tasks)),
           failedRanksHint_(std::move(failedRanksHint)) {}
+
+    ~MooncakeWorkCuda() override;
 
     bool isCompleted() override { return event_->query(); }
 
@@ -106,7 +109,8 @@ class MooncakeWorkCuda : public ::c10d::Work {
    protected:
     std::shared_ptr<torch::Event> event_;
     std::shared_ptr<TransferGroupMeta> meta_;
-    const MooncakeWorker* worker_;
+    MooncakeWorker* worker_;
+    uint64_t hintRouteId_;
     std::vector<CudaTaskSubmissionToken> submitted_tasks_;
     FailedRanksHint failedRanksHint_;
 };

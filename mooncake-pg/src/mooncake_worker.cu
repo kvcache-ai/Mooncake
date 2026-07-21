@@ -19,7 +19,8 @@ namespace mooncake {
 
 __global__ void enqueueTaskKernel(int opType, size_t tensorSize,
                                   int64_t broadcastRoot, int bufferOffset,
-                                  uint64_t submitSequence, void* meta,
+                                  uint64_t submitSequence, uint64_t hintRouteId,
+                                  bool resetFailedRanksHint, void* meta,
                                   Task* tasks, size_t taskId) {
     // Copy task into slot
     tasks[taskId].opType = opType;
@@ -27,6 +28,8 @@ __global__ void enqueueTaskKernel(int opType, size_t tensorSize,
     tasks[taskId].broadcastRoot = broadcastRoot;
     tasks[taskId].bufferOffset = bufferOffset;
     tasks[taskId].submitSequence = submitSequence;
+    tasks[taskId].hintRouteId = hintRouteId;
+    tasks[taskId].resetFailedRanksHint = resetFailedRanksHint;
     tasks[taskId].transferGroupMeta = meta;
 
     // Publish task metadata before notifying the host worker thread.
@@ -135,11 +138,12 @@ namespace mooncake {
 
 void launchEnqueueTaskKernel(int opType, size_t tensorSize,
                              int64_t broadcastRoot, int bufferOffset,
-                             uint64_t submitSequence, void* meta, Task* tasks,
+                             uint64_t submitSequence, uint64_t hintRouteId,
+                             bool resetFailedRanksHint, void* meta, Task* tasks,
                              size_t taskId, cudaStream_t stream) {
-    enqueueTaskKernel<<<1, 1, 0, stream>>>(opType, tensorSize, broadcastRoot,
-                                           bufferOffset, submitSequence, meta,
-                                           tasks, taskId);
+    enqueueTaskKernel<<<1, 1, 0, stream>>>(
+        opType, tensorSize, broadcastRoot, bufferOffset, submitSequence,
+        hintRouteId, resetFailedRanksHint, meta, tasks, taskId);
 }
 
 #define DEF_LAUNCH_REDUCE(scalar_t, suffix)                                   \

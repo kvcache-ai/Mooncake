@@ -130,7 +130,11 @@ class MooncakeWorker {
         std::chrono::milliseconds timeout) const;
 
    private:
+    friend class MooncakeWorkCpu;
+    friend class MooncakeWorkCuda;
+
     void startWorker();
+    void removeHintRoute(uint64_t hint_route_id);
 
     static constexpr size_t kNumTasks_ = 4;
 
@@ -147,12 +151,19 @@ class MooncakeWorker {
     int cpuTaskCount = 0;
     int cudaTaskCount = 0;
     std::atomic<uint64_t> next_cuda_task_sequence_{1};
+    std::atomic<uint64_t> next_hint_route_id_{1};
     std::atomic<uint64_t> submitted_task_sequence_[kNumTasks_]{};
 
-    // Per-slot tensor references keep the bitmap memory alive until the
-    // worker is done.
-    at::Tensor task_failed_tensor_[kNumTasks_];
-    at::Tensor task_attempted_tensor_[kNumTasks_];
+    // Optional failed-ranks hint routing. Task execution and link reporting use
+    // worker-local state and remain independent of whether a route exists.
+    struct HintRoute {
+        at::Tensor tensor;
+    };
+
+    // Routes remain registered while their Work handle is alive so captured
+    // CUDA tasks can resolve the same hint across replays.
+    std::mutex hint_routes_mutex_;
+    std::unordered_map<uint64_t, HintRoute> hint_routes_by_id_;
 
     std::thread worker_thread_;
 };

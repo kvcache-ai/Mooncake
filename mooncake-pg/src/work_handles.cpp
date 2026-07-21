@@ -10,22 +10,24 @@ namespace mooncake {
 FailedRanksHint FailedRanksHint::allocate(int n) {
     auto options =
         torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU);
-    return {torch::zeros({n}, options), torch::zeros({n}, options)};
+    return FailedRanksHint(torch::zeros({n}, options));
 }
 
 bool MooncakeWorkCpu::wait(std::chrono::milliseconds timeout) {
     future_->wait();
-    bool ok = future_->completed() && !future_->hasError();
+    return future_->completed() && !future_->hasError();
+}
 
-    if (meta_->autoSyncOnFailure) {
-        if (ok && !getLocalSuccess()) {
-            LOG(INFO) << "Local failure detected on cpu work, triggering "
-                         "syncAfterFailure";
-            meta_->backend->syncAfterFailure();
-        }
+MooncakeWorkCpu::~MooncakeWorkCpu() {
+    if (worker_) {
+        worker_->removeHintRoute(hintRouteId_);
     }
+}
 
-    return ok;
+MooncakeWorkCuda::~MooncakeWorkCuda() {
+    if (worker_) {
+        worker_->removeHintRoute(hintRouteId_);
+    }
 }
 
 bool MooncakeWorkCuda::wait(std::chrono::milliseconds timeout) {
@@ -103,16 +105,6 @@ bool MooncakeWorkCuda::wait(std::chrono::milliseconds timeout) {
     auto current_stream = at::cuda::getCurrentCUDAStream();
     event_->block(current_stream);
 
-    // Auto sync-on-failure.
-    // WARNING: getLocalSuccess() synchronizes the GPU event, blocking the
-    // calling thread.  With autoSyncOnFailure=true, every collective is
-    // effectively synchronous (async_op=True is defeated).
-    if (meta_->autoSyncOnFailure) {
-        if (!getLocalSuccess()) {
-            meta_->backend->syncAfterFailure();
-        }
-    }
-
     return true;
 }
 
@@ -131,25 +123,12 @@ bool MooncakeBarrierWorkCuda::wait(std::chrono::milliseconds timeout) {
 
     if (timeout == kNoTimeout) {
         event_->synchronize();
-        if (!getLocalSuccess()) {
-            if (meta_->autoSyncOnFailure) {
-                meta_->backend->syncAfterFailure();
-            }
-        }
         return true;
     }
 
     BackoffWaiter waiter(
         BackoffWaiterConfig::constantSleep(std::chrono::microseconds(10)));
-    bool ok = waiter.wait_for(timeout, [this] { return event_->query(); });
-
-    if (ok && meta_->autoSyncOnFailure) {
-        if (!getLocalSuccess()) {
-            meta_->backend->syncAfterFailure();
-        }
-    }
-
-    return ok;
+    return waiter.wait_for(timeout, [this] { return event_->query(); });
 }
 
 at::Tensor MooncakeWorkCpu::getFailedRanksHint() const {

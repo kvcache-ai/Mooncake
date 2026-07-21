@@ -165,18 +165,14 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
         // Default: MOONCAKE_PG_AUTO_DEACTIVATE_ON_FAILURE (1)
         bool autoDeactivateOnFailure_ = true;
 
-        // Synchronize with the Coordinator after a local failure is detected.
+        // Fence a failed collective on Coordinator reconciliation.
         //
-        // When true (default), Work::wait() calls
-        // Coordinator::syncAfterFailure() after a local failure, ensuring
-        // get_peer_state() reflects the authoritative membership decision
-        // before wait() returns.
-        //
-        // IMPORTANT: Enabling this option defeats async_op=true semantics.
-        // To detect failures, wait() must call getLocalSuccess(), which
-        // synchronizes the GPU event and blocks the calling thread until the
-        // collective completes. As a result, every collective becomes
-        // effectively synchronous, regardless of whether it succeeds or fails.
+        // When true (default), the worker reports a locally detected transfer
+        // failure and waits for the authoritative membership view to be
+        // applied before completing the task. Consequently, CPU work and
+        // CUDA stream execution cannot pass the failed collective before the
+        // view is updated. CUDA Work::wait() itself remains asynchronous and
+        // does not imply that the host can immediately observe the new view.
         //
         // Requires autoDeactivateOnFailure_ == true.
         //
