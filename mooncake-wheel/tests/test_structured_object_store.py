@@ -1621,6 +1621,19 @@ def test_dataproto_field_schema_validates_schema_errors() -> None:
                 )
             },
         )
+    schema = {
+        "mm": FieldSchema(
+            codec="ragged_tensor_dict",
+            metadata={"section": "non_tensor_batch", "keys": ["image"]},
+        )
+    }
+    for row_value, error_type, message in [
+        ({"image": object(), "audio": object()}, ValueError, "keys not declared"),
+        ({"image": None}, TypeError, "explicit None"),
+    ]:
+        rows[:] = [row_value]
+        with pytest.raises(error_type, match=message):
+            transfer.put_dataproto(_schema_test_data("mm", rows), field_schemas=schema)
 
 
 def test_dataproto_field_schema_encodes_ragged_tensor_dict() -> None:
@@ -1679,6 +1692,12 @@ def test_dataproto_field_schema_encodes_ragged_tensor_dict() -> None:
     assert transfer.get_dataproto(all_null_ref)["non_tensor_batch"][
         "multi_modal_inputs"
     ].tolist() == [None, None, None]
+    assert transfer.get_dataproto(all_null_ref, rows=slice(1, 3))[
+        "non_tensor_batch"
+    ]["multi_modal_inputs"].tolist() == [None, None]
+    assert transfer.get_dataproto(all_null_ref, rows=[2, 0])["non_tensor_batch"][
+        "multi_modal_inputs"
+    ].tolist() == [None, None]
 
 
 def test_dataproto_helper_treats_reserved_plain_dict_keys_as_batch_fields() -> None:
