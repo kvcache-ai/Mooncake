@@ -22,16 +22,12 @@ class RegisteredPinnedRegion {
     friend class RegisteredPinnedMemoryManager;
 
     RegisteredPinnedRegion(RegisteredPinnedMemoryManager* manager, void* addr,
-                           size_t size, std::string owner)
-        : manager_(manager),
-          addr_(addr),
-          size_(size),
-          owner_(std::move(owner)) {}
+                           size_t size)
+        : manager_(manager), addr_(addr), size_(size) {}
 
     RegisteredPinnedMemoryManager* manager_ = nullptr;
     void* addr_ = nullptr;
     size_t size_ = 0;
-    std::string owner_;
 };
 
 class RegisteredPinnedMemoryManager {
@@ -60,7 +56,6 @@ class RegisteredPinnedMemoryManager {
     };
 
     RegisteredPinnedMemoryManager();
-    explicit RegisteredPinnedMemoryManager(std::pair<bool, uint64_t> config);
 #if defined(MOONCAKE_STORE_TEST)
    public:
 #endif

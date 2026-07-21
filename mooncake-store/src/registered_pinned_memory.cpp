@@ -1,13 +1,12 @@
 #include "registered_pinned_memory.h"
 
-#include <cctype>
-#include <charconv>
 #include <cstdlib>
-#include <optional>
 #include <string>
-#include <system_error>
+#include <string_view>
 
 #include <glog/logging.h>
+
+#include "utils/type_util.h"
 
 #if defined(USE_CUDA)
 #include <cuda_runtime_api.h>
@@ -16,51 +15,31 @@
 namespace mooncake {
 namespace {
 
-std::pair<const char*, const char*> TrimAsciiWhitespace(const char* value) {
-    const char* begin = value;
-    while (std::isspace(static_cast<unsigned char>(*begin))) {
-        ++begin;
-    }
-
-    const char* end = begin;
-    while (*end != '\0') {
-        ++end;
-    }
-    while (end > begin &&
-           std::isspace(static_cast<unsigned char>(*(end - 1)))) {
-        --end;
-    }
-
-    return {begin, end};
-}
-
-std::optional<uint64_t> ParsePinnedMemoryLimit() {
-    const char* value = std::getenv("MC_STORE_PIN_MEMORY_MAX_BYTES");
-    if (!value || value[0] == '\0') return 0;
-
-    auto [number, end] = TrimAsciiWhitespace(value);
-    if (*number == '-') {
-        LOG(WARNING) << "Invalid MC_STORE_PIN_MEMORY_MAX_BYTES='" << value
-                     << "', disabling Store segment pinning";
-        return std::nullopt;
-    }
-
-    uint64_t parsed = 0;
-    auto [ptr, ec] = std::from_chars(number, end, parsed);
-    if (ec != std::errc{} || ptr != end) {
-        LOG(WARNING) << "Invalid MC_STORE_PIN_MEMORY_MAX_BYTES='" << value
-                     << "', disabling Store segment pinning";
-        return std::nullopt;
-    }
-    return parsed;
+std::string_view TrimAsciiWhitespace(std::string_view value) {
+    constexpr std::string_view whitespace = " \t\r\n\f\v";
+    size_t begin = value.find_first_not_of(whitespace);
+    if (begin == std::string_view::npos) return {};
+    size_t end = value.find_last_not_of(whitespace);
+    return value.substr(begin, end - begin + 1);
 }
 
 std::pair<bool, uint64_t> ParsePinnedMemoryConfig() {
-    auto limit = ParsePinnedMemoryLimit();
-    if (!limit.has_value() || *limit == 0) {
+    const char* raw_value = std::getenv("MC_STORE_PIN_MEMORY_MAX_BYTES");
+    if (!raw_value || raw_value[0] == '\0') return {false, 0};
+
+    uint64_t limit = 0;
+    auto value = TrimAsciiWhitespace(raw_value);
+    if (value.empty() || !TypeUtil::ParseUint64(value, limit)) {
+        LOG(WARNING) << "Invalid MC_STORE_PIN_MEMORY_MAX_BYTES='" << raw_value
+                     << "', disabling Store segment pinning";
         return {false, 0};
     }
-    return {true, *limit};
+    return {limit != 0, limit};
+}
+
+void LogPinSkip(const std::string& owner, const char* reason, size_t size) {
+    LOG(WARNING) << "Skip cudaHostRegister for " << owner << ": " << reason
+                 << ", size=" << size;
 }
 
 #if defined(USE_CUDA)
@@ -110,11 +89,8 @@ RegisteredPinnedMemoryManager& RegisteredPinnedMemoryManager::instance() {
 }
 
 RegisteredPinnedMemoryManager::RegisteredPinnedMemoryManager()
-    : RegisteredPinnedMemoryManager(ParsePinnedMemoryConfig()) {}
-
-RegisteredPinnedMemoryManager::RegisteredPinnedMemoryManager(
-    std::pair<bool, uint64_t> config)
-    : RegisteredPinnedMemoryManager(config, DefaultPinOps()) {}
+    : RegisteredPinnedMemoryManager(ParsePinnedMemoryConfig(),
+                                    DefaultPinOps()) {}
 
 RegisteredPinnedMemoryManager::RegisteredPinnedMemoryManager(
     std::pair<bool, uint64_t> config, PinOps pin_ops)
@@ -141,17 +117,15 @@ std::shared_ptr<RegisteredPinnedRegion> RegisteredPinnedMemoryManager::try_pin(
     const auto start = reinterpret_cast<uintptr_t>(addr);
     const auto end = start + size;
     if (end < start) {
-        LOG(WARNING) << "Skip cudaHostRegister for " << owner
-                     << ": address range overflow, size=" << size;
+        LogPinSkip(owner, "address range overflow", size);
         return nullptr;
     }
 
     std::shared_ptr<RegisteredPinnedRegion> region;
     try {
-        region.reset(new RegisteredPinnedRegion(this, addr, size, owner));
+        region.reset(new RegisteredPinnedRegion(this, addr, size));
     } catch (...) {
-        LOG(WARNING) << "Skip cudaHostRegister for " << owner
-                     << ": failed to allocate pin tracking, size=" << size;
+        LogPinSkip(owner, "failed to allocate pin tracking", size);
         return nullptr;
     }
 
@@ -160,18 +134,9 @@ std::shared_ptr<RegisteredPinnedRegion> RegisteredPinnedMemoryManager::try_pin(
         for (const auto& entry : regions_) {
             const auto region_start = reinterpret_cast<uintptr_t>(entry.addr);
             const auto region_end = region_start + entry.size;
-            if (region_end < region_start) {
-                LOG(WARNING)
-                    << "Skip cudaHostRegister for " << owner
-                    << ": existing active range overflow, size=" << entry.size;
-                return nullptr;
-            }
-
             const bool overlaps = start < region_end && end > region_start;
             if (overlaps) {
-                LOG(WARNING)
-                    << "Skip cudaHostRegister for " << owner
-                    << ": overlaps an active pinned region, size=" << size;
+                LogPinSkip(owner, "overlaps an active pinned region", size);
                 return nullptr;
             }
         }
@@ -187,8 +152,7 @@ std::shared_ptr<RegisteredPinnedRegion> RegisteredPinnedMemoryManager::try_pin(
         try {
             regions_.push_back({addr, size, nullptr});
         } catch (...) {
-            LOG(WARNING) << "Skip cudaHostRegister for " << owner
-                         << ": failed to allocate pin tracking, size=" << size;
+            LogPinSkip(owner, "failed to allocate pin tracking", size);
             return nullptr;
         }
         pinned_bytes_ += size;
@@ -208,7 +172,6 @@ std::shared_ptr<RegisteredPinnedRegion> RegisteredPinnedMemoryManager::try_pin(
         return nullptr;
     }
 
-    bool tracking_ready = false;
     uint64_t pinned_bytes = 0;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -216,25 +179,9 @@ std::shared_ptr<RegisteredPinnedRegion> RegisteredPinnedMemoryManager::try_pin(
             if (entry.addr == addr && entry.size == size && !entry.region) {
                 entry.region = region.get();
                 pinned_bytes = pinned_bytes_;
-                tracking_ready = true;
                 break;
             }
         }
-    }
-    if (!tracking_ready) {
-        error_message.clear();
-        auto unregister_result =
-            pin_ops_.unregister_region(addr, &error_message);
-        if (unregister_result != UnregisterResult::kSuccess) {
-            LOG(ERROR) << "cudaHostUnregister failed after active range "
-                          "tracking mismatch for "
-                       << owner << ", size=" << size
-                       << ", error=" << error_message
-                       << ". Continue with best-effort cleanup.";
-        }
-        std::lock_guard<std::mutex> lock(mutex_);
-        remove_inactive_region_locked(addr, size);
-        return nullptr;
     }
 
     LOG(INFO) << "cudaHostRegister succeeded for " << owner << ", size=" << size
@@ -266,12 +213,11 @@ void RegisteredPinnedMemoryManager::release(RegisteredPinnedRegion* region) {
     // stale raw tracking pointers do not outlive the Store segment owner.
     if (unregister_result != UnregisterResult::kSuccess) {
         if (unregister_result == UnregisterResult::kRuntimeUnloading) {
-            LOG(WARNING) << "Skip cudaHostUnregister for " << region->owner_
-                         << " because CUDA runtime is unloading, size="
+            LOG(WARNING) << "Skip cudaHostUnregister because CUDA runtime "
+                            "is unloading, size="
                          << region->size_;
         } else {
-            LOG(ERROR) << "cudaHostUnregister failed for " << region->owner_
-                       << ", size=" << region->size_
+            LOG(ERROR) << "cudaHostUnregister failed, size=" << region->size_
                        << ", error=" << error_message
                        << ". Continue with best-effort cleanup.";
         }

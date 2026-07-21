@@ -8,10 +8,12 @@
 namespace mooncake {
 namespace {
 
+using Manager = RegisteredPinnedMemoryManager;
+using UnregisterResult = Manager::UnregisterResult;
+
 struct FakePinState {
     bool register_succeeds = true;
-    RegisteredPinnedMemoryManager::UnregisterResult unregister_result =
-        RegisteredPinnedMemoryManager::UnregisterResult::kSuccess;
+    UnregisterResult unregister_result = UnregisterResult::kSuccess;
     int register_calls = 0;
     int unregister_calls = 0;
 };
@@ -21,120 +23,102 @@ FakePinState& State() {
     return state;
 }
 
-void ResetState() { State() = FakePinState(); }
-
-bool FakeRegister(void* addr, size_t size, std::string* error_message) {
-    (void)addr;
-    (void)size;
+bool FakeRegister(void*, size_t, std::string* error_message) {
     ++State().register_calls;
     if (State().register_succeeds) return true;
     if (error_message) *error_message = "fake register failure";
     return false;
 }
 
-RegisteredPinnedMemoryManager::UnregisterResult FakeUnregister(
-    void* addr, std::string* error_message) {
-    (void)addr;
+UnregisterResult FakeUnregister(void*, std::string* error_message) {
     ++State().unregister_calls;
-    if (State().unregister_result ==
-            RegisteredPinnedMemoryManager::UnregisterResult::kError &&
+    if (State().unregister_result == UnregisterResult::kError &&
         error_message) {
         *error_message = "fake unregister failure";
     }
     return State().unregister_result;
 }
 
-RegisteredPinnedMemoryManager::PinOps FakeOps() {
-    return {FakeRegister, FakeUnregister};
-}
-
 class RegisteredPinnedMemoryManagerTest : public ::testing::Test {
    protected:
-    void SetUp() override { ResetState(); }
+    void SetUp() override { State() = FakePinState(); }
+
+    Manager MakeManager(size_t limit) {
+        return Manager({true, limit}, {FakeRegister, FakeUnregister});
+    }
+
+    std::shared_ptr<RegisteredPinnedRegion> Pin(Manager& manager, size_t offset,
+                                                size_t size) {
+        return manager.try_pin(buffer_.data() + offset, size, "segment");
+    }
+
+    void ExpectCalls(int register_calls, int unregister_calls) {
+        EXPECT_EQ(State().register_calls, register_calls);
+        EXPECT_EQ(State().unregister_calls, unregister_calls);
+    }
 
     std::array<char, 128> buffer_{};
 };
 
 TEST_F(RegisteredPinnedMemoryManagerTest, QuotaRejectsAndReleaseRefunds) {
-    RegisteredPinnedMemoryManager manager({true, 64}, FakeOps());
+    auto manager = MakeManager(64);
 
-    auto first = manager.try_pin(buffer_.data(), 64, "first");
+    auto first = Pin(manager, 0, 64);
     ASSERT_NE(first, nullptr);
-
-    auto over_quota = manager.try_pin(buffer_.data() + 64, 1, "over quota");
-    EXPECT_EQ(over_quota, nullptr);
-    EXPECT_EQ(State().register_calls, 1);
+    EXPECT_EQ(Pin(manager, 64, 1), nullptr);
+    ExpectCalls(1, 0);
 
     first.reset();
-    EXPECT_EQ(State().unregister_calls, 1);
+    ExpectCalls(1, 1);
 
-    auto second = manager.try_pin(buffer_.data() + 64, 64, "second");
+    auto second = Pin(manager, 64, 64);
     ASSERT_NE(second, nullptr);
-    EXPECT_EQ(State().register_calls, 2);
+    ExpectCalls(2, 1);
 
     second.reset();
-    EXPECT_EQ(State().unregister_calls, 2);
+    ExpectCalls(2, 2);
 }
 
 TEST_F(RegisteredPinnedMemoryManagerTest, OverlapAndDuplicateAreRejected) {
-    RegisteredPinnedMemoryManager manager({true, 128}, FakeOps());
+    auto manager = MakeManager(128);
 
-    auto first = manager.try_pin(buffer_.data() + 16, 32, "first");
+    auto first = Pin(manager, 16, 32);
     ASSERT_NE(first, nullptr);
 
-    auto duplicate = manager.try_pin(buffer_.data() + 16, 32, "duplicate");
-    EXPECT_EQ(duplicate, nullptr);
+    EXPECT_EQ(Pin(manager, 16, 32), nullptr);
+    EXPECT_EQ(Pin(manager, 32, 16), nullptr);
 
-    auto overlap = manager.try_pin(buffer_.data() + 32, 16, "overlap");
-    EXPECT_EQ(overlap, nullptr);
-
-    auto adjacent = manager.try_pin(buffer_.data() + 48, 16, "adjacent");
+    auto adjacent = Pin(manager, 48, 16);
     ASSERT_NE(adjacent, nullptr);
+    ExpectCalls(2, 0);
 
-    EXPECT_EQ(State().register_calls, 2);
     adjacent.reset();
     first.reset();
-    EXPECT_EQ(State().unregister_calls, 2);
+    ExpectCalls(2, 2);
 }
 
-TEST_F(RegisteredPinnedMemoryManagerTest,
-       UnregisterFailureDropsTrackingAndRefunds) {
-    RegisteredPinnedMemoryManager manager({true, 32}, FakeOps());
+TEST_F(RegisteredPinnedMemoryManagerTest, FailurePathsRefundReservations) {
+    auto manager = MakeManager(32);
 
-    auto first = manager.try_pin(buffer_.data(), 32, "first");
+    auto first = Pin(manager, 0, 32);
     ASSERT_NE(first, nullptr);
 
-    State().unregister_result =
-        RegisteredPinnedMemoryManager::UnregisterResult::kError;
+    State().unregister_result = UnregisterResult::kError;
     first.reset();
-    EXPECT_EQ(State().unregister_calls, 1);
+    ExpectCalls(1, 1);
 
-    State().unregister_result =
-        RegisteredPinnedMemoryManager::UnregisterResult::kSuccess;
-    auto second = manager.try_pin(buffer_.data(), 32, "second");
-    ASSERT_NE(second, nullptr);
-    EXPECT_EQ(State().register_calls, 2);
-
-    second.reset();
-    EXPECT_EQ(State().unregister_calls, 2);
-}
-
-TEST_F(RegisteredPinnedMemoryManagerTest, RegisterFailureRefundsReservation) {
-    RegisteredPinnedMemoryManager manager({true, 32}, FakeOps());
-
+    State().unregister_result = UnregisterResult::kSuccess;
     State().register_succeeds = false;
-    auto failed = manager.try_pin(buffer_.data(), 32, "failed");
-    EXPECT_EQ(failed, nullptr);
-    EXPECT_EQ(State().register_calls, 1);
-    EXPECT_EQ(State().unregister_calls, 0);
+    EXPECT_EQ(Pin(manager, 0, 32), nullptr);
+    ExpectCalls(2, 1);
 
     State().register_succeeds = true;
-    auto retried = manager.try_pin(buffer_.data(), 32, "retried");
+    auto retried = Pin(manager, 0, 32);
     ASSERT_NE(retried, nullptr);
-    EXPECT_EQ(State().register_calls, 2);
+    ExpectCalls(3, 1);
 
     retried.reset();
-    EXPECT_EQ(State().unregister_calls, 1);
+    ExpectCalls(3, 2);
 }
 
 }  // namespace
