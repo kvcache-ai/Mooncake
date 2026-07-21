@@ -616,6 +616,10 @@ MasterService::~MasterService() {
     if (snapshot_manager_) {
         snapshot_manager_.reset();
     }
+    for (const auto& [segment, bytes] : standby_accounted_memory_bytes_) {
+        MasterMetricManager::instance().dec_allocated_mem_size(
+            segment, static_cast<int64_t>(bytes));
+    }
 }
 
 ErrorCode MasterService::SetBatchOpLogBackendForTesting(
@@ -904,6 +908,29 @@ auto MasterService::MountNoFSegment(const NoFSegment& segment,
 #endif
 }
 
+ErrorCode MasterService::ValidateStandbyRemountSegment(
+    const Segment& segment) const {
+    const StandbySegmentInfo* match = nullptr;
+    for (const auto& standby : standby_memory_segments_) {
+        if (standby.transport_endpoint == segment.te_endpoint ||
+            standby.segment_name == segment.name) {
+            if (match != nullptr && match != &standby) {
+                return ErrorCode::INVALID_PARAMS;
+            }
+            match = &standby;
+        }
+    }
+    if (match != nullptr && segment.protocol == "cxl") {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
+    }
+    if (match != nullptr && (match->segment_name != segment.name ||
+                             match->transport_endpoint != segment.te_endpoint ||
+                             match->capacity != segment.size)) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    return ErrorCode::OK;
+}
+
 auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                    const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
@@ -916,6 +943,21 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                 break;
             }
         }
+        {
+            auto segment_access = segment_manager_.getSegmentAccess();
+            for (const auto& segment : segments) {
+                auto standby_validation =
+                    ValidateStandbyRemountSegment(segment);
+                if (standby_validation != ErrorCode::OK) {
+                    return tl::make_unexpected(standby_validation);
+                }
+                auto validation =
+                    segment_access.ValidateRemountSegment(segment, client_id);
+                if (validation != ErrorCode::OK) {
+                    return tl::make_unexpected(validation);
+                }
+            }
+        }
         if (ok_client_.contains(client_id)) {
             LOG(WARNING) << "client_id=" << client_id
                          << ", warn=client_already_remounted";
@@ -926,6 +968,37 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         {
             ScopedSegmentAccess segment_access =
                 segment_manager_.getSegmentAccess();
+            std::vector<bool> segment_existed(segments.size());
+            for (size_t i = 0; i < segments.size(); ++i) {
+                segment_existed[i] =
+                    segment_access.GetAllocator(segments[i].id) != nullptr;
+            }
+            auto rollback_new_segments = [&] {
+                for (size_t i = 0; i < segments.size(); ++i) {
+                    if (segment_existed[i] ||
+                        !segment_access.GetAllocator(segments[i].id)) {
+                        continue;
+                    }
+                    size_t capacity = 0;
+                    if (segment_access.PrepareUnmountSegment(
+                            segments[i].id, capacity) != ErrorCode::OK) {
+                        LOG(ERROR) << "segment_name=" << segments[i].name
+                                   << ", error=remount_rollback_prepare_failed";
+                        continue;
+                    }
+                    if (segment_access.CommitUnmountSegment(
+                            segments[i].id, client_id, capacity) !=
+                        ErrorCode::OK) {
+                        LOG(ERROR) << "segment_name=" << segments[i].name
+                                   << ", error=remount_rollback_commit_failed";
+                    }
+                }
+            };
+            auto fail_remount =
+                [&](ErrorCode error) -> tl::expected<void, ErrorCode> {
+                rollback_new_segments();
+                return tl::make_unexpected(error);
+            };
 
             // Tell the client monitor thread to start timing for this client.
             // To avoid the following undesired situations, this message must be
@@ -950,74 +1023,171 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
 
             ErrorCode err = segment_access.ReMountSegment(segments, client_id);
             if (err != ErrorCode::OK) {
-                return tl::make_unexpected(err);
+                return fail_remount(err);
             }
-        }
 
-        {
-            ScopedAllocatorAccess allocator_access =
-                segment_manager_.getAllocatorAccess();
-            const auto& allocator_manager =
-                allocator_access.getAllocatorManager();
+            struct SegmentRestore {
+                Segment segment;
+                std::shared_ptr<BufferAllocatorBase> old_allocator;
+                std::shared_ptr<BufferAllocatorBase> restored_allocator;
+                std::vector<Replica*> replicas;
+                std::vector<AllocatedBuffer::Descriptor> descriptors;
+                std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
+                uint64_t imported_size{0};
+            };
+            std::vector<SegmentRestore> restores;
+            restores.reserve(segments.size());
             for (const auto& segment : segments) {
-                if (standby_reserved_prefixes_.contains(segment.name)) {
-                    continue;
+                auto allocator = segment_access.GetAllocator(segment.id);
+                Segment authoritative;
+                if (!allocator ||
+                    !segment_access.GetSegment(segment.id, authoritative)) {
+                    return fail_remount(ErrorCode::INTERNAL_ERROR);
                 }
-                auto end_it =
-                    standby_restored_buffer_ends_.find(segment.te_endpoint);
-                if (end_it == standby_restored_buffer_ends_.end()) {
-                    end_it = standby_restored_buffer_ends_.find(segment.name);
-                }
-                if (end_it == standby_restored_buffer_ends_.end()) {
-                    continue;
-                }
-                if (end_it->second <= segment.base ||
-                    end_it->second - segment.base > segment.size) {
-                    LOG(ERROR) << "segment_name=" << segment.name
-                               << ", error=invalid_restored_buffer_range"
-                               << ", segment_base=" << segment.base
-                               << ", segment_size=" << segment.size
-                               << ", restored_end=" << end_it->second;
-                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-                }
-                const auto* allocators =
-                    allocator_manager.getAllocators(segment.name);
-                if (allocators == nullptr) {
-                    return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-                }
-                auto allocator_it =
-                    std::find_if(allocators->begin(), allocators->end(),
-                                 [&](const auto& allocator) {
-                                     return allocator->getTransportEndpoint() ==
-                                            segment.te_endpoint;
-                                 });
-                if (allocator_it == allocators->end()) {
-                    return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-                }
-                auto offset_allocator =
-                    std::dynamic_pointer_cast<OffsetBufferAllocator>(
-                        *allocator_it);
-                if (!offset_allocator) {
-                    LOG(ERROR) << "segment_name=" << segment.name
-                               << ", error=restored_prefix_requires_offset_"
-                                  "allocator";
-                    return tl::make_unexpected(
-                        ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
-                }
-                auto reservation =
-                    offset_allocator->allocate(end_it->second - segment.base);
-                if (!reservation || reinterpret_cast<uintptr_t>(
-                                        reservation->data()) != segment.base) {
-                    LOG(ERROR) << "segment_name=" << segment.name
-                               << ", error=failed_to_reserve_restored_prefix";
-                    return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
-                }
-                standby_reserved_prefixes_[segment.name] =
-                    std::move(reservation);
+                restores.push_back({std::move(authoritative),
+                                    std::move(allocator),
+                                    nullptr,
+                                    {},
+                                    {},
+                                    {},
+                                    0});
             }
-            for (const auto& segment : segments) {
-                invalid_replica_endpoints_.erase(segment.te_endpoint);
-                invalid_replica_endpoints_.erase(segment.name);
+
+            bool ambiguous_endpoint = false;
+            bool unsupported_cxl = false;
+            for (size_t shard_index = 0; shard_index < kNumShards;
+                 ++shard_index) {
+                MetadataShardAccessorRW shard(this, shard_index);
+                for (auto& [tenant_id, tenant] : shard->tenants) {
+                    (void)tenant_id;
+                    for (auto& [key, metadata] : tenant.metadata) {
+                        (void)key;
+                        metadata.VisitReplicas(
+                            [](const Replica& replica) {
+                                return replica.is_memory_replica() &&
+                                       replica.status() !=
+                                           ReplicaStatus::REMOVED &&
+                                       replica.status() !=
+                                           ReplicaStatus::FAILED;
+                            },
+                            [&](Replica& replica) {
+                                auto descriptor = replica.get_descriptor()
+                                                      .get_memory_descriptor()
+                                                      .buffer_descriptor;
+                                SegmentRestore* match = nullptr;
+                                for (auto& restore : restores) {
+                                    if (descriptor.transport_endpoint_ ==
+                                            restore.segment.te_endpoint ||
+                                        descriptor.transport_endpoint_ ==
+                                            restore.segment.name) {
+                                        if (match != nullptr) {
+                                            ambiguous_endpoint = true;
+                                            return;
+                                        }
+                                        match = &restore;
+                                    }
+                                }
+                                if (match != nullptr) {
+                                    if (descriptor.protocol_ == "cxl") {
+                                        unsupported_cxl = true;
+                                        return;
+                                    }
+                                    descriptor.transport_endpoint_ =
+                                        match->segment.te_endpoint;
+                                    match->replicas.push_back(&replica);
+                                    match->descriptors.push_back(descriptor);
+                                }
+                            });
+                    }
+                }
+            }
+            if (ambiguous_endpoint) {
+                return fail_remount(ErrorCode::INVALID_PARAMS);
+            }
+            if (unsupported_cxl) {
+                return fail_remount(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+            }
+
+            for (auto& restore : restores) {
+                if (restore.descriptors.empty()) {
+                    continue;
+                }
+                if (std::dynamic_pointer_cast<OffsetBufferAllocator>(
+                        restore.old_allocator)) {
+                    auto restored = RestoreOffsetBufferAllocator(
+                        restore.segment.name, restore.segment.base,
+                        restore.segment.size, restore.segment.te_endpoint,
+                        restore.descriptors);
+                    if (!restored) {
+                        return fail_remount(ErrorCode::INVALID_PARAMS);
+                    }
+                    restore.restored_allocator = std::move(restored->allocator);
+                    restore.buffers = std::move(restored->buffers);
+                } else if (std::dynamic_pointer_cast<CachelibBufferAllocator>(
+                               restore.old_allocator)) {
+                    auto restored = RestoreCachelibBufferAllocator(
+                        restore.segment.name, restore.segment.base,
+                        restore.segment.size, restore.segment.te_endpoint,
+                        restore.descriptors);
+                    if (!restored) {
+                        return fail_remount(ErrorCode::INVALID_PARAMS);
+                    }
+                    restore.restored_allocator = std::move(restored->allocator);
+                    restore.buffers = std::move(restored->buffers);
+                } else {
+                    return fail_remount(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+                }
+            }
+
+            std::vector<ScopedSegmentAccess::AllocatorReplacement>
+                allocator_replacements;
+            for (auto& restore : restores) {
+                if (restore.restored_allocator) {
+                    if (restore.buffers.size() != restore.replicas.size() ||
+                        std::any_of(
+                            restore.buffers.begin(), restore.buffers.end(),
+                            [](const auto& buffer) { return !buffer; })) {
+                        return fail_remount(ErrorCode::INTERNAL_ERROR);
+                    }
+                    restore.imported_size = std::accumulate(
+                        restore.descriptors.begin(), restore.descriptors.end(),
+                        uint64_t{0}, [](uint64_t sum, const auto& descriptor) {
+                            return sum + descriptor.size_;
+                        });
+                    auto accounted = standby_accounted_memory_bytes_.find(
+                        restore.segment.name);
+                    if (accounted == standby_accounted_memory_bytes_.end() ||
+                        accounted->second < restore.imported_size) {
+                        return fail_remount(ErrorCode::INTERNAL_ERROR);
+                    }
+                    allocator_replacements.push_back(
+                        {restore.segment.id, restore.old_allocator,
+                         restore.restored_allocator});
+                }
+            }
+            if (!segment_access.ReplaceAllocators(allocator_replacements)) {
+                return fail_remount(ErrorCode::INTERNAL_ERROR);
+            }
+            for (auto& restore : restores) {
+                if (restore.imported_size != 0) {
+                    MasterMetricManager::instance().dec_allocated_mem_size(
+                        restore.segment.name,
+                        static_cast<int64_t>(restore.imported_size));
+                    auto accounted = standby_accounted_memory_bytes_.find(
+                        restore.segment.name);
+                    accounted->second -= restore.imported_size;
+                    if (accounted->second == 0) {
+                        standby_accounted_memory_bytes_.erase(accounted);
+                    }
+                }
+                for (size_t i = 0; i < restore.replicas.size(); ++i) {
+                    (void)restore.replicas[i]->replace_memory_buffer(
+                        std::move(restore.buffers[i]));
+                }
+                invalid_replica_endpoints_.erase(restore.segment.te_endpoint);
+                invalid_replica_endpoints_.erase(restore.segment.name);
+                standby_allocator_keepalive_.erase(restore.segment.te_endpoint);
+                standby_allocator_keepalive_.erase(restore.segment.name);
             }
         }
 
@@ -2674,12 +2844,17 @@ void MasterService::RestoreFromStandbySnapshot(
     (void)initial_oplog_sequence_id;
 
     // 2. Build allocator keepalive map for standby segments.
+    for (const auto& [segment, bytes] : standby_accounted_memory_bytes_) {
+        MasterMetricManager::instance().dec_allocated_mem_size(
+            segment, static_cast<int64_t>(bytes));
+    }
+    standby_accounted_memory_bytes_.clear();
+    standby_memory_segments_.clear();
     standby_allocator_keepalive_.clear();
-    standby_restored_buffer_ends_.clear();
-    standby_reserved_prefixes_.clear();
     invalid_replica_endpoints_.clear();
     for (const auto& seg : segments) {
         if (seg.is_memory_segment) {
+            standby_memory_segments_.push_back(seg);
             auto allocator = std::make_shared<DummyBufferAllocator>(
                 seg.segment_name, seg.transport_endpoint);
             standby_allocator_keepalive_[seg.transport_endpoint] = allocator;
@@ -2737,17 +2912,6 @@ void MasterService::RestoreFromStandbySnapshot(
                     const auto& mem_desc = desc.get_memory_descriptor();
                     const std::string& endpoint =
                         mem_desc.buffer_descriptor.transport_endpoint_;
-                    const auto& buffer = mem_desc.buffer_descriptor;
-                    if (buffer.protocol_ != "cxl" && buffer.size_ > 0 &&
-                        buffer.buffer_address_ <=
-                            std::numeric_limits<uintptr_t>::max() -
-                                buffer.size_) {
-                        auto& restored_end =
-                            standby_restored_buffer_ends_[endpoint];
-                        restored_end =
-                            std::max(restored_end,
-                                     buffer.buffer_address_ + buffer.size_);
-                    }
                     auto it = standby_allocator_keepalive_.find(endpoint);
                     if (it != standby_allocator_keepalive_.end()) {
                         auto alloc = it->second;
@@ -2755,6 +2919,13 @@ void MasterService::RestoreFromStandbySnapshot(
                             std::make_unique<AllocatedBuffer>(
                                 alloc, mem_desc.buffer_descriptor),
                             desc.status);
+                        MasterMetricManager::instance().inc_allocated_mem_size(
+                            alloc->getSegmentName(),
+                            static_cast<int64_t>(
+                                mem_desc.buffer_descriptor.size_));
+                        standby_accounted_memory_bytes_
+                            [alloc->getSegmentName()] +=
+                            mem_desc.buffer_descriptor.size_;
                     } else {
                         invalid_replica_endpoints_.insert(endpoint);
                     }
@@ -3087,6 +3258,25 @@ auto MasterService::BatchReplicaClear(
     return cleared_keys;
 }
 
+bool MasterService::IsReplicaReadable(const Replica& replica) const {
+    if (!replica.is_completed() || replica.has_invalid_mem_handle() ||
+        replica.has_invalid_nof_handle()) {
+        return false;
+    }
+    const auto descriptor = replica.get_descriptor();
+    std::optional<std::string> endpoint;
+    if (descriptor.is_memory_replica()) {
+        endpoint = descriptor.get_memory_descriptor()
+                       .buffer_descriptor.transport_endpoint_;
+    } else if (descriptor.is_nof_replica()) {
+        endpoint = descriptor.get_nof_descriptor()
+                       .buffer_descriptor.transport_endpoint_;
+    } else if (descriptor.is_local_disk_replica()) {
+        endpoint = descriptor.get_local_disk_descriptor().transport_endpoint;
+    }
+    return !endpoint || !invalid_replica_endpoints_.contains(*endpoint);
+}
+
 auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
                                           const TenantId& tenant_id)
     -> tl::expected<
@@ -3115,28 +3305,11 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
             if (std::regex_search(key, pattern)) {
                 std::vector<Replica::Descriptor> replica_list;
                 metadata.VisitReplicas(
-                    &Replica::fn_is_completed,
-                    [&replica_list, this](const Replica& replica) {
-                        auto desc = replica.get_descriptor();
-                        // Filter invalid standby memory endpoints
-                        std::optional<std::string> endpoint;
-                        if (desc.is_memory_replica()) {
-                            endpoint =
-                                desc.get_memory_descriptor()
-                                    .buffer_descriptor.transport_endpoint_;
-                        } else if (desc.is_nof_replica()) {
-                            endpoint =
-                                desc.get_nof_descriptor()
-                                    .buffer_descriptor.transport_endpoint_;
-                        } else if (desc.is_local_disk_replica()) {
-                            endpoint = desc.get_local_disk_descriptor()
-                                           .transport_endpoint;
-                        }
-                        if (endpoint.has_value() &&
-                            invalid_replica_endpoints_.count(*endpoint) > 0) {
-                            return;
-                        }
-                        replica_list.emplace_back(std::move(desc));
+                    [this](const Replica& replica) {
+                        return IsReplicaReadable(replica);
+                    },
+                    [&replica_list](const Replica& replica) {
+                        replica_list.emplace_back(replica.get_descriptor());
                     });
 
                 if (replica_list.empty()) {
@@ -3176,34 +3349,12 @@ auto MasterService::GetReplicaList(const std::string& key,
 
         std::vector<Replica::Descriptor> replica_list;
         metadata.VisitReplicas(
-            &Replica::fn_is_completed, [&replica_list](const Replica& replica) {
+            [this](const Replica& replica) {
+                return IsReplicaReadable(replica);
+            },
+            [&replica_list](const Replica& replica) {
                 replica_list.emplace_back(replica.get_descriptor());
             });
-
-        // Filter out replicas pointing to invalid endpoints from standby.
-        if (!invalid_replica_endpoints_.empty()) {
-            replica_list.erase(
-                std::remove_if(
-                    replica_list.begin(), replica_list.end(),
-                    [&](const Replica::Descriptor& desc) {
-                        std::optional<std::string> endpoint;
-                        if (desc.is_memory_replica()) {
-                            endpoint =
-                                desc.get_memory_descriptor()
-                                    .buffer_descriptor.transport_endpoint_;
-                        } else if (desc.is_nof_replica()) {
-                            endpoint =
-                                desc.get_nof_descriptor()
-                                    .buffer_descriptor.transport_endpoint_;
-                        } else if (desc.is_local_disk_replica()) {
-                            endpoint = desc.get_local_disk_descriptor()
-                                           .transport_endpoint;
-                        }
-                        return endpoint.has_value() &&
-                               invalid_replica_endpoints_.count(*endpoint) > 0;
-                    }),
-                replica_list.end());
-        }
 
         if (replica_list.empty()) {
             if (metadata.AllReplicas([](const Replica& replica) {
@@ -3362,7 +3513,9 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                 const auto& metadata = metadata_it->second;
                 std::vector<Replica::Descriptor> replica_list;
                 metadata.VisitReplicas(
-                    &Replica::fn_is_completed,
+                    [this](const Replica& replica) {
+                        return IsReplicaReadable(replica);
+                    },
                     [&replica_list](const Replica& replica) {
                         replica_list.emplace_back(replica.get_descriptor());
                     });

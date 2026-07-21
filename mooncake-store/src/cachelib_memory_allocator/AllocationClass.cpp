@@ -99,6 +99,38 @@ void* AllocationClass::addSlabAndAllocate(Slab* slab) {
   })();
 }
 
+bool AllocationClass::importSlab(
+    Slab* slab, const std::vector<uint32_t>& occupiedChunkIndexes) {
+  XDCHECK_NE(nullptr, slab);
+  std::unique_lock l(lock_);
+  const uint32_t count = getAllocsPerSlab();
+  if (!std::is_sorted(occupiedChunkIndexes.begin(),
+                      occupiedChunkIndexes.end()) ||
+      std::adjacent_find(occupiedChunkIndexes.begin(),
+                         occupiedChunkIndexes.end()) !=
+          occupiedChunkIndexes.end() ||
+      (!occupiedChunkIndexes.empty() &&
+       occupiedChunkIndexes.back() >= count)) {
+    return false;
+  }
+  auto* header = slabAlloc_.getSlabHeader(slab);
+  header->classId = classId_;
+  header->allocSize = allocationSize_;
+  allocatedSlabs_.push_back(slab);
+
+  size_t occupiedPos = 0;
+  for (uint32_t index = 0; index < count; ++index) {
+    if (occupiedPos < occupiedChunkIndexes.size() &&
+        occupiedChunkIndexes[occupiedPos] == index) {
+      ++occupiedPos;
+    } else {
+      freedAllocations_.push_back(getAllocForIdx(slab, index));
+    }
+  }
+  canAllocate_ = !freedAllocations_.empty();
+  return true;
+}
+
 void* AllocationClass::allocateFromCurrentSlabLocked() noexcept {
   XDCHECK(canAllocateFromCurrentSlabLocked());
   void* ret = currSlab_->memoryAtOffset(currOffset_);

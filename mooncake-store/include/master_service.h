@@ -2293,13 +2293,12 @@ class MasterService {
     // Key: transport_endpoint, Value: allocator.
     std::unordered_map<std::string, std::shared_ptr<BufferAllocatorBase>>
         standby_allocator_keepalive_;
+    std::vector<StandbySegmentInfo> standby_memory_segments_;
+    std::unordered_map<std::string, uint64_t> standby_accounted_memory_bytes_;
 
-    // Conservative allocator recovery for promoted memory segments. The
-    // prefix reservation protects every restored descriptor, including holes,
-    // until allocator-level allocate-at support exists.
-    std::unordered_map<std::string, uintptr_t> standby_restored_buffer_ends_;
-    std::unordered_map<std::string, std::unique_ptr<AllocatedBuffer>>
-        standby_reserved_prefixes_;
+    ErrorCode ValidateStandbyRemountSegment(const Segment& segment) const;
+
+    bool IsReplicaReadable(const Replica& replica) const;
 
     /**
      * Segment lifecycle persist helper. Tries to durably persist the

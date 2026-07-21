@@ -237,6 +237,10 @@ ErrorCode ScopedSegmentAccess::MountLocalDiskSegment(const UUID& client_id,
 ErrorCode ScopedSegmentAccess::ReMountSegment(
     const std::vector<Segment>& segments, const UUID& client_id) {
     for (const auto& segment : segments) {
+        auto validation = ValidateRemountSegment(segment, client_id);
+        if (validation != ErrorCode::OK) {
+            return validation;
+        }
         ErrorCode err = MountSegment(segment, client_id);
         if (err == ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS ||
             err == ErrorCode::INTERNAL_ERROR) {
@@ -261,6 +265,74 @@ ErrorCode ScopedSegmentAccess::ReMountSegment(
     }
 
     return ErrorCode::OK;
+}
+
+ErrorCode ScopedSegmentAccess::ValidateRemountSegment(
+    const Segment& segment, const UUID& client_id) const {
+    auto mounted = segment_manager_->mounted_segments_.find(segment.id);
+    if (mounted == segment_manager_->mounted_segments_.end()) {
+        return ErrorCode::OK;
+    }
+    const auto owner = segment_manager_->client_segments_.find(client_id);
+    const bool owned = owner != segment_manager_->client_segments_.end() &&
+                       std::find(owner->second.begin(), owner->second.end(),
+                                 segment.id) != owner->second.end();
+    const auto& authoritative = mounted->second.segment;
+    if (!owned || authoritative.id != segment.id ||
+        authoritative.name != segment.name ||
+        authoritative.base != segment.base ||
+        authoritative.size != segment.size ||
+        authoritative.te_endpoint != segment.te_endpoint ||
+        authoritative.protocol != segment.protocol ||
+        authoritative.host_id != segment.host_id) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    return ErrorCode::OK;
+}
+
+bool ScopedSegmentAccess::GetSegment(const UUID& segment_id,
+                                     Segment& segment) const {
+    auto mounted = segment_manager_->mounted_segments_.find(segment_id);
+    if (mounted == segment_manager_->mounted_segments_.end()) {
+        return false;
+    }
+    segment = mounted->second.segment;
+    return true;
+}
+
+bool ScopedSegmentAccess::ReplaceAllocators(
+    const std::vector<AllocatorReplacement>& replacements) {
+    std::vector<AllocatorManager::Replacement> manager_replacements;
+    manager_replacements.reserve(replacements.size());
+    for (const auto& replacement : replacements) {
+        auto mounted =
+            segment_manager_->mounted_segments_.find(replacement.segment_id);
+        if (mounted == segment_manager_->mounted_segments_.end() ||
+            mounted->second.buf_allocator != replacement.expected ||
+            !replacement.replacement) {
+            return false;
+        }
+        manager_replacements.push_back({mounted->second.segment.name,
+                                        replacement.expected,
+                                        replacement.replacement});
+    }
+    if (!segment_manager_->allocator_manager_.replaceAllocators(
+            manager_replacements)) {
+        return false;
+    }
+    for (const auto& replacement : replacements) {
+        segment_manager_->mounted_segments_.at(replacement.segment_id)
+            .buf_allocator = replacement.replacement;
+    }
+    return true;
+}
+
+std::shared_ptr<BufferAllocatorBase> ScopedSegmentAccess::GetAllocator(
+    const UUID& segment_id) const {
+    auto mounted = segment_manager_->mounted_segments_.find(segment_id);
+    return mounted == segment_manager_->mounted_segments_.end()
+               ? nullptr
+               : mounted->second.buf_allocator;
 }
 
 ErrorCode ScopedSegmentAccess::PrepareUnmountSegment(

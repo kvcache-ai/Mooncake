@@ -143,6 +143,22 @@ class ScopedSegmentAccess {
     ErrorCode ReMountSegment(const std::vector<Segment>& segments,
                              const UUID& client_id);
 
+    ErrorCode ValidateRemountSegment(const Segment& segment,
+                                     const UUID& client_id) const;
+
+    bool GetSegment(const UUID& segment_id, Segment& segment) const;
+
+    struct AllocatorReplacement {
+        UUID segment_id;
+        std::shared_ptr<BufferAllocatorBase> expected;
+        std::shared_ptr<BufferAllocatorBase> replacement;
+    };
+    bool ReplaceAllocators(
+        const std::vector<AllocatorReplacement>& replacements);
+
+    std::shared_ptr<BufferAllocatorBase> GetAllocator(
+        const UUID& segment_id) const;
+
     /**
      * @brief Prepare to unmount a segment by deleting its allocator
      */
