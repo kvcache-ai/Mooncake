@@ -20,9 +20,12 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <iomanip>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -84,11 +87,18 @@ class PerDeviceStreamPool {
                   std::to_string(prop.pciBusID) + ":" +
                   std::to_string(prop.pciDeviceID);
         }
-        const char *visible = getenv("CUDA_VISIBLE_DEVICES");
+        const char *visible =
+#ifdef USE_MUSA
+            getenv("MUSA_VISIBLE_DEVICES");
+        constexpr const char *visible_name = "MUSA_VISIBLE_DEVICES";
+#else
+            getenv("CUDA_VISIBLE_DEVICES");
+        constexpr const char *visible_name = "CUDA_VISIBLE_DEVICES";
+#endif
         LOG(INFO) << "NvlinkTransport: NVLink CUDA stream created on device "
-                  << device_id << " [physical: " << pci
-                  << "] CUDA_VISIBLE_DEVICES="
-                  << (visible ? visible : "(not set)") << " pid=" << getpid();
+                  << device_id << " [physical: " << pci << "] " << visible_name
+                  << "=" << (visible ? visible : "(not set)")
+                  << " pid=" << getpid();
         pool_[device_id] = entry;
         return entry;
     }
@@ -172,6 +182,52 @@ static CudaStreamEntry getStreamForRequest(const void *source) {
     }
     return tl_device_stream_pool.getOrCreate(device_id);
 }
+
+#ifdef USE_MUSA
+static bool useMetadataIpcOpenDevice() {
+    static const bool enabled = [] {
+        const char *env = std::getenv("MC_MUSA_IPC_OPEN_DEVICE");
+        if (!env || std::string(env) == "current") return false;
+        if (std::string(env) == "metadata") {
+            LOG(INFO) << "NvlinkTransport: opening MUSA IPC handles on the "
+                         "metadata device; all processes must use the same "
+                         "ordered MUSA_VISIBLE_DEVICES mapping";
+            return true;
+        }
+        LOG(WARNING) << "NvlinkTransport: unknown MC_MUSA_IPC_OPEN_DEVICE="
+                     << env << ", falling back to current";
+        return false;
+    }();
+    return enabled;
+}
+
+static int musaDeviceFromLocation(const std::string &location) {
+    // Buffer locations carry a logical ordinal (for example, "musa:1").
+    // The caller must therefore give every peer the same ordered visibility
+    // list; this function cannot recover a physical UUID from the metadata.
+    if (location.rfind(GPU_PREFIX, 0) != 0) return -1;
+
+    const char *begin = location.c_str() + GPU_PREFIX.size();
+    if (*begin == '\0') return -1;
+    errno = 0;
+    char *end = nullptr;
+    long value = std::strtol(begin, &end, 10);
+    if (errno == ERANGE || end == begin || *end != '\0' || value < 0 ||
+        value > std::numeric_limits<int>::max()) {
+        return -1;
+    }
+
+    int device_count = 0;
+    cudaError_t err = cudaGetDeviceCount(&device_count);
+    if (err != cudaSuccess) {
+        LOG(ERROR) << "NvlinkTransport: cudaGetDeviceCount failed while "
+                      "parsing MUSA buffer location: "
+                   << cudaGetErrorString(err);
+        return -1;
+    }
+    return value < device_count ? static_cast<int>(value) : -1;
+}
+#endif
 
 }  // anonymous namespace
 
@@ -426,9 +482,45 @@ NvlinkTransport::~NvlinkTransport() {
             freePinnedLocalMemory(entry.second.shm_addr);
         }
     } else {
+#ifdef USE_MUSA
+        int saved_device = -1;
+        cudaError_t saved_device_err = cudaGetDevice(&saved_device);
+        if (saved_device_err != cudaSuccess) {
+            LOG(ERROR) << "NvlinkTransport: cudaGetDevice failed before IPC "
+                          "handle cleanup: "
+                       << cudaGetErrorString(saved_device_err);
+        }
+        for (auto &entry : remap_entries_) {
+            if (entry.second.device_id >= 0) {
+                cudaError_t set_err = cudaSetDevice(entry.second.device_id);
+                if (set_err != cudaSuccess) {
+                    LOG(ERROR) << "NvlinkTransport: cudaSetDevice("
+                               << entry.second.device_id
+                               << ") failed before IPC handle cleanup: "
+                               << cudaGetErrorString(set_err);
+                    continue;
+                }
+            }
+            cudaError_t close_err =
+                cudaIpcCloseMemHandle(entry.second.shm_addr);
+            if (close_err != cudaSuccess) {
+                LOG(ERROR) << "NvlinkTransport: cudaIpcCloseMemHandle failed: "
+                           << cudaGetErrorString(close_err);
+            }
+        }
+        if (saved_device_err == cudaSuccess) {
+            cudaError_t restore_err = cudaSetDevice(saved_device);
+            if (restore_err != cudaSuccess) {
+                LOG(ERROR) << "NvlinkTransport: failed to restore device "
+                           << saved_device << " after IPC handle cleanup: "
+                           << cudaGetErrorString(restore_err);
+            }
+        }
+#else
         for (auto &entry : remap_entries_) {
             cudaIpcCloseMemHandle(entry.second.shm_addr);
         }
+#endif
     }
     remap_entries_.clear();
 }
@@ -768,8 +860,65 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                     cudaIpcMemHandle_t handle;
                     memcpy(&handle, output_buffer.data(), sizeof(handle));
                     void *shm_addr = nullptr;
+#ifdef USE_MUSA
+                    int saved_device = -1;
+                    cudaError_t saved_device_err = cudaGetDevice(&saved_device);
+                    if (saved_device_err != cudaSuccess) {
+                        LOG(ERROR) << "NvlinkTransport: cudaGetDevice failed "
+                                      "before IPC handle open: "
+                                   << cudaGetErrorString(saved_device_err);
+                        return -1;
+                    }
+
+                    int ipc_device = saved_device;
+                    bool switched_device = false;
+                    if (useMetadataIpcOpenDevice()) {
+                        ipc_device = musaDeviceFromLocation(entry.name);
+                        if (ipc_device < 0) {
+                            LOG(ERROR)
+                                << "NvlinkTransport: cannot select MUSA IPC "
+                                   "open device from buffer location "
+                                << entry.name;
+                            return -1;
+                        }
+                        if (ipc_device != saved_device) {
+                            cudaError_t set_err = cudaSetDevice(ipc_device);
+                            if (set_err != cudaSuccess) {
+                                LOG(ERROR)
+                                    << "NvlinkTransport: cudaSetDevice("
+                                    << ipc_device
+                                    << ") failed before IPC handle open: "
+                                    << cudaGetErrorString(set_err);
+                                return -1;
+                            }
+                            switched_device = true;
+                        }
+                    }
+#endif
                     cudaError_t err = cudaIpcOpenMemHandle(
                         &shm_addr, handle, cudaIpcMemLazyEnablePeerAccess);
+#ifdef USE_MUSA
+                    if (switched_device) {
+                        cudaError_t restore_err = cudaSetDevice(saved_device);
+                        if (restore_err != cudaSuccess) {
+                            LOG(ERROR)
+                                << "NvlinkTransport: failed to restore device "
+                                << saved_device << " after IPC handle open: "
+                                << cudaGetErrorString(restore_err);
+                            if (err == cudaSuccess) {
+                                cudaError_t close_err =
+                                    cudaIpcCloseMemHandle(shm_addr);
+                                if (close_err != cudaSuccess) {
+                                    LOG(ERROR)
+                                        << "NvlinkTransport: failed to close "
+                                           "IPC handle after restore error: "
+                                        << cudaGetErrorString(close_err);
+                                }
+                            }
+                            return -1;
+                        }
+                    }
+#endif
                     if (err != cudaSuccess) {
                         LOG(ERROR)
                             << "NvlinkTransport: cudaIpcOpenMemHandle failed: "
@@ -779,6 +928,9 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                     OpenedShmEntry shm_entry;
                     shm_entry.shm_addr = shm_addr;
                     shm_entry.length = entry.length;
+#ifdef USE_MUSA
+                    shm_entry.device_id = ipc_device;
+#endif
                     remap_entries_[std::make_pair(target_id, entry.addr)] =
                         shm_entry;
                 } else if (output_buffer.size() == sizeof(CUmemFabricHandle) &&

@@ -70,6 +70,7 @@ class NvlinkTransport : public Transport {
     struct OpenedShmEntry {
         void* shm_addr;
         uint64_t length;
+        int device_id{-1};
     };
 
     std::unordered_map<std::pair<uint64_t, uint64_t>, OpenedShmEntry, PairHash>
