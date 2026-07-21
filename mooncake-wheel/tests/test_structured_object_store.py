@@ -223,6 +223,36 @@ class InMemoryStore:
             self._exit_get(len(keys))
 
 
+class FakeLease:
+    def __init__(self, pool: "FakeBufferPool", size: int) -> None:
+        self.pool = pool
+        self.size = size
+        self._buffer = ctypes.create_string_buffer(size)
+        self.ptr = ctypes.addressof(self._buffer)
+        self.released = False
+
+    @property
+    def buffer(self):
+        return memoryview(self._buffer)
+
+    def release(self) -> None:
+        if not self.released:
+            self.pool.release_count += 1
+            self.released = True
+
+
+class FakeBufferPool:
+    def __init__(self) -> None:
+        self.acquire_count = 0
+        self.release_count = 0
+        self.acquire_sizes: list[int] = []
+
+    def acquire(self, size: int) -> FakeLease:
+        self.acquire_count += 1
+        self.acquire_sizes.append(size)
+        return FakeLease(self, size)
+
+
 class GetOnlyStore(InMemoryStore):
     batch_get_into = None
 
@@ -682,6 +712,27 @@ def test_structured_object_multichunk_ndarray_uses_range_gather() -> None:
     assert np.array_equal(result.objects["weights"], array)
     assert store.get_into_ranges_calls > 0
     assert store.batch_get_into_calls == batch_get_into_calls + 1
+
+
+def test_structured_object_ndarray_read_can_use_buffer_pool() -> None:
+    pool = FakeBufferPool()
+    store, transfer = make_transfer(buffer_pool=pool)
+    array = np.arange(64, dtype=np.int16).reshape(8, 8)
+    payload = structured_payload(weights=array)
+
+    ref = transfer.put_structured_object(payload, chunk_bytes=32)
+    before_range_reads = store.get_into_ranges_calls
+    result = transfer.materialize(transfer.read_spec(ref))
+
+    assert np.array_equal(result.objects["weights"], array)
+    assert hasattr(result.objects["weights"], "_mooncake_pool_owner")
+    assert store.get_into_ranges_calls == before_range_reads + 1
+    assert pool.acquire_sizes == [array.nbytes]
+
+    MooncakeBundleTransfer.release_result(result.objects)
+    assert pool.release_count == 1
+    MooncakeBundleTransfer.release_result(result.objects)
+    assert pool.release_count == 1
 
 
 def test_structured_object_slice_member_uses_partial_range_reads() -> None:
