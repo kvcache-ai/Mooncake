@@ -1,6 +1,7 @@
 # Pre-commit hooks configuration for Mooncake
 # Install: pip install -r requirements-dev.txt && pre-commit install
-# Run manually: pre-commit run --all-files
+# Run manually on all files: pre-commit run --all-files
+# Format all C/C++ files explicitly: ./scripts/code_format.sh --all
 # Note: clang-format should already be available (installed via system packages or dependencies.sh)
 # Exclusions: build artifacts, vendored extern code, generated wheels.
 
@@ -26,11 +27,11 @@ repos:
   - repo: local
     hooks:
       - id: mooncake-code-format
-        name: Run Mooncake code format script
-        entry: ./scripts/code_format.sh
+        name: Format staged C/C++ changes
+        entry: ./scripts/code_format.sh --staged
         language: system
-        pass_filenames: false
-        always_run: true
+        files: '\.(c|cc|cpp|cxx|cu|cuh|h|hpp)$'
+        exclude: '^(extern/|build/|.*/build/|FAST25-release/|.*cachelib_memory_allocator/|.*/thirdparty/.*)'
         require_serial: true
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
@@ -48,13 +49,6 @@ repos:
       - id: codespell
         exclude: '^(extern/|FAST25-release/)'
         args: ['--ignore-words-list=te,mooncake,KVCache,cann,hsa']
-
-  - repo: https://github.com/pre-commit/mirrors-clang-format
-    rev: v20.1.8
-    hooks:
-      - id: clang-format
-        files: '\.(c|cc|cpp|cxx|h|hpp)$'
-        exclude: '^(extern/|build/|.*/build/|FAST25-release/|.*/thirdparty/.*)'
 
   - repo: https://github.com/cheshirekow/cmake-format-precommit
     rev: v0.6.13
