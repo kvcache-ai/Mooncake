@@ -224,9 +224,13 @@ export MTHREADS_VISIBLE_DEVICES=4,5
 export MUSA_VISIBLE_DEVICES=4,5
 export MC_FORCE_MUSA=1
 
-# Defaults shown explicitly. "default" rolls back to per-slice copies.
-export MC_MUSA_IPC_OPEN_DEVICE=metadata
+# Safe defaults shown explicitly. Opt in to metadata after checking the
+# visibility contract below; "default" rolls back to per-slice copies.
+export MC_MUSA_IPC_OPEN_DEVICE=current
 export MC_MUSA_COPY_API=auto
+
+# Performance path after both peers use the same ordered physical IDs.
+export MC_MUSA_IPC_OPEN_DEVICE=metadata
 ```
 
 `MTHREADS_VISIBLE_DEVICES` and `MUSA_VISIBLE_DEVICES` must contain the same
@@ -235,8 +239,9 @@ logical ordinals such as `musa:0`; using `MTHREADS_VISIBLE_DEVICES=4,5` together
 with `MUSA_VISIBLE_DEVICES=0,1` can select physical GPUs outside the intended
 pair and is rejected locally. Both peers must run a version that recognizes the
 `musa` protocol; rolling interoperability with an older peer advertising only
-`nvlink` is not supported. Use `MC_MUSA_IPC_OPEN_DEVICE=current` only as a
-diagnostic rollback. Python bindings that register the default wildcard
+`nvlink` is not supported. `MC_MUSA_IPC_OPEN_DEVICE=current` is the safe
+default; select `metadata` only when both peers satisfy the ordered visibility
+contract above. Python bindings that register the default wildcard
 location (`*`) resolve the owning MUSA device during registration; an older
 peer that still advertises `*` falls back to the current-device open path.
 

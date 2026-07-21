@@ -59,7 +59,7 @@ int deviceFromLocation(const std::string& location) {
 bool openOnMetadataDevice() {
     static const bool enabled = [] {
         const char* value = std::getenv("MC_MUSA_IPC_OPEN_DEVICE");
-        if (!value || std::string(value) == "metadata") {
+        if (value && std::string(value) == "metadata") {
             const char* musa_visible = std::getenv("MUSA_VISIBLE_DEVICES");
             const char* mthreads_visible =
                 std::getenv("MTHREADS_VISIBLE_DEVICES");
@@ -72,14 +72,14 @@ bool openOnMetadataDevice() {
                       << ")";
             return true;
         }
-        if (std::string(value) == "current") {
+        if (!value || std::string(value) == "current") {
             LOG(INFO) << "MusaTransport: opening IPC handles on the current "
-                         "device (A/B mode)";
+                         "device";
             return false;
         }
         LOG(WARNING) << "MusaTransport: unknown MC_MUSA_IPC_OPEN_DEVICE="
-                     << value << ", using metadata";
-        return true;
+                     << value << ", using current";
+        return false;
     }();
     return enabled;
 }
