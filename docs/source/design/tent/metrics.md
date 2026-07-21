@@ -349,7 +349,7 @@ The `metrics/latency_buckets` and `metrics/size_buckets` config keys, and the `T
 
 The `metrics/enable_prometheus` and `metrics/enable_json` config keys, and the `TENT_METRICS_ENABLE_PROMETHEUS` / `TENT_METRICS_ENABLE_JSON` environment variables, were removed and are now silently ignored. The `/metrics` and `/metrics/json` HTTP endpoints are now registered unconditionally and cannot be toggled independently — both are read-only and served on the same port, so there was no real scenario where a deployment wanted one disabled.
 
-**Migration:** remove these keys from your `transfer-engine.json` and unset the environment variables. If you need to disable the HTTP endpoint entirely, set `metrics/enabled` to `false` (or `TENT_METRICS_ENABLED=false`) to run in log-only mode.
+**Migration:** remove these keys from your `transfer-engine.json` and unset the environment variables. To fully disable the metrics subsystem (no HTTP server, no periodic summary logging, no recording), set `metrics/enabled` to `false` (or `TENT_METRICS_ENABLED=false`). Note that "log-only mode" — where periodic summaries are still logged but `/metrics` is unavailable — only occurs when metrics are enabled but the HTTP port cannot be bound (e.g. port conflict); it is not triggered by `metrics/enabled=false`.
 
 ### Validation
 
