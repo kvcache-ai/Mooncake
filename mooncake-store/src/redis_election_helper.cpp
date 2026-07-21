@@ -5,12 +5,76 @@
 #include <glog/logging.h>
 
 #include <chrono>
+#include <cerrno>
 #include <cstring>
+#include <functional>
+#include <iomanip>
 #include <json/json.h>
+#include <poll.h>
+#include <random>
+#include <sstream>
 
 #include "ha_metric_manager.h"
 
 namespace mooncake {
+
+namespace {
+
+class ScopeGuard {
+   public:
+    explicit ScopeGuard(std::function<void()> callback)
+        : callback_(std::move(callback)) {}
+    ~ScopeGuard() {
+        if (callback_) {
+            callback_();
+        }
+    }
+
+    ScopeGuard(const ScopeGuard&) = delete;
+    ScopeGuard& operator=(const ScopeGuard&) = delete;
+
+   private:
+    std::function<void()> callback_;
+};
+
+std::string GenerateCandidateId() {
+    std::random_device random;
+    std::mt19937_64 generator(random());
+    std::ostringstream stream;
+    stream << std::hex << std::setfill('0') << std::setw(16) << generator()
+           << std::setw(16) << generator();
+    return stream.str();
+}
+
+bool ParseElectionValue(const std::string& value, std::string& address,
+                        ViewVersionId& epoch, std::string* candidate_id) {
+    Json::Value root;
+    Json::CharReaderBuilder builder;
+    std::istringstream stream(value);
+    std::string errors;
+    if (!Json::parseFromStream(builder, stream, &root, &errors)) {
+        LOG(ERROR) << "ParseLeaderValue: JSON parse failed: " << errors;
+        return false;
+    }
+
+    if (!root.isMember("address") || !root["address"].isString() ||
+        !root.isMember("epoch") || !root["epoch"].isInt64()) {
+        return false;
+    }
+
+    address = root["address"].asString();
+    epoch = root["epoch"].asInt64();
+    if (candidate_id) {
+        if (!root.isMember("candidate_id") ||
+            !root["candidate_id"].isString()) {
+            return false;
+        }
+        *candidate_id = root["candidate_id"].asString();
+    }
+    return true;
+}
+
+}  // namespace
 
 // ============================================================
 // Construction / Destruction
@@ -45,11 +109,13 @@ RedisElectionHelper::RedisElectionHelper(const std::string& cluster_id,
 }
 
 RedisElectionHelper::~RedisElectionHelper() {
-    CancelElection();
-    CancelKeepAlive();
-    if (subscribe_ctx_) {
-        redisFree(subscribe_ctx_);
-        subscribe_ctx_ = nullptr;
+    Shutdown();
+    {
+        std::lock_guard<std::mutex> lock(subscribe_mutex_);
+        if (subscribe_ctx_) {
+            redisFree(subscribe_ctx_);
+            subscribe_ctx_ = nullptr;
+        }
     }
     {
         std::lock_guard<std::mutex> lock(election_mutex_);
@@ -75,6 +141,18 @@ redisContext* RedisElectionHelper::CreateConnection() {
 // ============================================================
 
 ErrorCode RedisElectionHelper::Connect() {
+    std::unique_lock<std::mutex> operation_lock(operation_mutex_);
+    operation_cv_.wait(operation_lock, [this] {
+        return shutting_down_ || active_blocking_operations_ == 0;
+    });
+    if (shutting_down_) {
+        LOG(ERROR) << "Connect: helper is shutting down";
+        return ErrorCode::INTERNAL_ERROR;
+    }
+
+    cancel_election_ = false;
+    cancel_keep_alive_ = false;
+
     // Election connection
     {
         std::lock_guard<std::mutex> lock(election_mutex_);
@@ -91,28 +169,15 @@ ErrorCode RedisElectionHelper::Connect() {
         }
     }
 
-    // Subscribe connection (separate, as SUBSCRIBE blocks).
-    // Set a 1-second read timeout so that redisGetReply in WatchLeader's
-    // subscribe loop returns periodically, allowing the loop to check
-    // cancel flags even when no Pub/Sub message arrives
-    // (e.g. leader key expired without graceful handoff).
-    if (subscribe_ctx_) {
-        redisFree(subscribe_ctx_);
-        subscribe_ctx_ = nullptr;
-    }
-    subscribe_ctx_ = CreateConnection();
-    if (subscribe_ctx_) {
-        struct timeval sub_timeout = {1, 0};  // 1 second
-        redisSetTimeout(subscribe_ctx_, sub_timeout);
-    } else {
-        // Non-fatal: WatchLeader will fall back to polling when
-        // subscribe_ctx_ is null. We intentionally do NOT retry
-        // here — reconnect is deferred to the next Connect() call
-        // (e.g. during a leadership re-election cycle), which is
-        // sufficient because the polling path provides a correct
-        // (if slower) fallback.
-        LOG(ERROR) << "Failed to create subscribe connection to Redis at "
-                   << redis_endpoint_;
+    // Subscribe connection (separate, as SUBSCRIBE changes connection mode).
+    {
+        std::lock_guard<std::mutex> lock(subscribe_mutex_);
+        if (!ReconnectSubscribeLocked(/*record_metric=*/false)) {
+            // Non-fatal: WatchLeader will fall back to polling when
+            // subscribe_ctx_ is null.
+            LOG(ERROR) << "Failed to create subscribe connection to Redis at "
+                       << redis_endpoint_;
+        }
     }
 
     LOG(INFO) << "Connected to Redis";
@@ -125,6 +190,10 @@ ErrorCode RedisElectionHelper::Connect() {
 
 void RedisElectionHelper::ElectLeader(const std::string& master_address,
                                       ViewVersionId& version, int& lease_id) {
+    if (!BeginBlockingOperation()) {
+        return;
+    }
+    ScopeGuard operation([this] { EndBlockingOperation(); });
     const auto election_start = std::chrono::steady_clock::now();
     while (!cancel_election_) {
         HAMetricManager::instance().inc_election_attempts();
@@ -141,134 +210,133 @@ void RedisElectionHelper::ElectLeader(const std::string& master_address,
             connected = (election_ctx_ != nullptr);
         }
         if (!connected) {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+            WaitForElectionCancellation(std::chrono::seconds(1));
             continue;
         }
 
-        // Step 1: Check if a leader already exists
-        RedisReplyPtr reply(nullptr);
+        ElectionAttemptResult attempt = ElectionAttemptResult::ERROR;
+        std::string existing_value;
         {
             std::lock_guard<std::mutex> lock(election_mutex_);
-            reply.reset((redisReply*)redisCommand(election_ctx_, "GET %b",
-                                                  master_view_key_.data(),
-                                                  master_view_key_.size()));
+            attempt = TryElectOnce(master_address, version, existing_value);
         }
-
-        if (!reply) {
-            HAMetricManager::instance().inc_election_failures();
-            LOG(ERROR)
-                << "ElectLeader: GET failed (connection error), retry in 1s";
+        if (attempt == ElectionAttemptResult::ERROR) {
+            WaitForElectionCancellation(std::chrono::seconds(1));
+            continue;
+        }
+        if (attempt == ElectionAttemptResult::ELECTED) {
             {
                 std::lock_guard<std::mutex> lock(election_mutex_);
-                Reconnect(election_ctx_);
+                PublishLeaderEvent(master_address, version);
             }
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-            continue;
+            HAMetricManager::instance().set_election_is_leader(true);
+            HAMetricManager::instance().observe_election_duration_ms(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - election_start)
+                    .count());
+            lease_id = next_lease_id_++;
+            LOG(INFO) << "ElectLeader: elected as leader, epoch=" << version
+                      << " lease_id=" << lease_id;
+            return;
         }
 
-        if (reply->type == REDIS_REPLY_NIL) {
-            // No leader exists — try to elect ourselves
-            reply.reset();
-
-            bool elected = false;
-            {
-                std::lock_guard<std::mutex> lock(election_mutex_);
-                elected = TryElectOnce(master_address, version);
-            }
-            if (elected) {
-                HAMetricManager::instance().set_election_is_leader(true);
-                HAMetricManager::instance().observe_election_duration_ms(
-                    std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now() - election_start)
-                        .count());
-                lease_id = next_lease_id_++;
-                LOG(INFO) << "ElectLeader: elected as leader, epoch=" << version
-                          << " lease_id=" << lease_id;
-                return;
-            }
-            // TryElectOnce failed (someone else won) — loop back and wait
-            continue;
+        std::string current_addr;
+        ViewVersionId current_epoch = 0;
+        if (ParseLeaderValue(existing_value, current_addr, current_epoch)) {
+            LOG(INFO) << "ElectLeader: current leader=" << current_addr
+                      << " epoch=" << current_epoch << ", waiting...";
+        } else {
+            LOG(WARNING) << "ElectLeader: leader key exists but unparsable: "
+                         << existing_value << ", waiting...";
         }
-
-        if (reply->type == REDIS_REPLY_STRING) {
-            // A leader exists — watch until the key expires
-            std::string current_value(reply->str, reply->len);
-            reply.reset();
-
-            std::string current_addr;
-            ViewVersionId current_epoch = 0;
-            if (ParseLeaderValue(current_value, current_addr, current_epoch)) {
-                LOG(INFO) << "ElectLeader: current leader=" << current_addr
-                          << " epoch=" << current_epoch << ", waiting...";
-            } else {
-                LOG(WARNING)
-                    << "ElectLeader: leader key exists but unparsable: "
-                    << current_value << ", waiting...";
-            }
-
-            WatchLeader();  // Blocks until key expires or "vacant" received
-            continue;
-        }
-
-        // Unexpected reply type
-        int reply_type = reply->type;
-        reply.reset();
-        LOG(ERROR) << "ElectLeader: unexpected reply type=" << reply_type;
-        HAMetricManager::instance().inc_election_failures();
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+        WatchLeader();  // Blocks until key expires or an election event arrives
     }
 }
 
-bool RedisElectionHelper::TryElectOnce(const std::string& master_address,
-                                       ViewVersionId& out_epoch) {
+RedisElectionHelper::ElectionAttemptResult RedisElectionHelper::TryElectOnce(
+    const std::string& master_address, ViewVersionId& out_epoch,
+    std::string& existing_value) {
     // Caller must hold election_mutex_
-    // Step 2: INCR epoch counter
-    RedisReplyPtr reply((redisReply*)redisCommand(election_ctx_, "INCR %b",
-                                                  master_epoch_key_.data(),
-                                                  master_epoch_key_.size()));
+    const char* election_script =
+        "local current = redis.call('GET', KEYS[1]) "
+        "if current then return {0, current} end "
+        "local epoch = redis.call('INCR', KEYS[2]) "
+        "local value = cjson.encode({address=ARGV[1], epoch=epoch, "
+        "  ts=tonumber(ARGV[2]), ttl=tonumber(ARGV[3]), "
+        "  candidate_id=ARGV[4]}) "
+        "redis.call('SET', KEYS[1], value, 'EX', ARGV[3]) "
+        "return {1, tostring(epoch), value}";
 
-    if (!reply || reply->type != REDIS_REPLY_INTEGER) {
-        HAMetricManager::instance().inc_election_failures();
-        LOG(ERROR) << "TryElectOnce: INCR failed";
-        return false;
-    }
-    out_epoch = reply->integer;
-    reply.reset();
-
-    // Step 3: SET NX EX — atomically create leader key only if it doesn't exist
-    std::string value =
-        SerializeLeaderValue(master_address, out_epoch, ttl_sec_);
-    our_value_ = value;
-
-    reply.reset((redisReply*)redisCommand(
-        election_ctx_, "SET %b %b EX %d NX", master_view_key_.data(),
-        master_view_key_.size(), value.data(), value.size(), ttl_sec_));
+    const std::string candidate_id = GenerateCandidateId();
+    const auto timestamp_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count();
+    RedisReplyPtr reply((redisReply*)redisCommand(
+        election_ctx_, "EVAL %s 2 %b %b %b %lld %d %b", election_script,
+        master_view_key_.data(), master_view_key_.size(),
+        master_epoch_key_.data(), master_epoch_key_.size(),
+        master_address.data(), master_address.size(),
+        static_cast<long long>(timestamp_ms), ttl_sec_, candidate_id.data(),
+        candidate_id.size()));
 
     if (!reply) {
         HAMetricManager::instance().inc_election_failures();
-        LOG(ERROR) << "TryElectOnce: SET NX EX failed (connection error)";
-        our_value_.clear();
-        return false;
+        LOG(ERROR) << "TryElectOnce: election script failed (connection error)";
+
+        // The script may have completed before the response was lost. After
+        // reconnecting, identify our write by its per-attempt candidate ID.
+        if (!Reconnect(election_ctx_)) {
+            return ElectionAttemptResult::ERROR;
+        }
+        RedisReplyPtr current((redisReply*)redisCommand(
+            election_ctx_, "GET %b", master_view_key_.data(),
+            master_view_key_.size()));
+        if (!current || current->type != REDIS_REPLY_STRING) {
+            return ElectionAttemptResult::ERROR;
+        }
+        std::string value(current->str, current->len);
+        std::string address;
+        std::string stored_candidate_id;
+        ViewVersionId epoch = 0;
+        if (ParseElectionValue(value, address, epoch, &stored_candidate_id) &&
+            stored_candidate_id == candidate_id) {
+            out_epoch = epoch;
+            our_value_ = std::move(value);
+            LOG(INFO) << "TryElectOnce: confirmed election after reconnect";
+            return ElectionAttemptResult::ELECTED;
+        }
+        return ElectionAttemptResult::ERROR;
     }
 
-    if (reply->type == REDIS_REPLY_STATUS &&
-        strncmp(reply->str, "OK", 2) == 0) {
-        // We won the election!
-        reply.reset();
-
-        // Publish election event
-        std::string event =
-            "elected:" + master_address + ":" + std::to_string(out_epoch);
-        PublishLeaderEvent(event);
-
-        return true;
+    if (reply->type != REDIS_REPLY_ARRAY || reply->elements < 2 ||
+        reply->element[0]->type != REDIS_REPLY_INTEGER) {
+        HAMetricManager::instance().inc_election_failures();
+        LOG(ERROR) << "TryElectOnce: unexpected election script reply";
+        return ElectionAttemptResult::ERROR;
     }
 
-    // Key already exists — someone else won
-    reply.reset();
-    our_value_.clear();
-    LOG(INFO) << "TryElectOnce: someone else won the election, retrying";
-    return false;
+    if (reply->element[0]->integer == 0) {
+        if (reply->element[1]->type != REDIS_REPLY_STRING) {
+            return ElectionAttemptResult::ERROR;
+        }
+        existing_value.assign(reply->element[1]->str, reply->element[1]->len);
+        return ElectionAttemptResult::CONTENDED;
+    }
+
+    if (reply->elements != 3 || reply->element[1]->type != REDIS_REPLY_STRING ||
+        reply->element[2]->type != REDIS_REPLY_STRING) {
+        return ElectionAttemptResult::ERROR;
+    }
+    try {
+        out_epoch = std::stoll(
+            std::string(reply->element[1]->str, reply->element[1]->len));
+    } catch (const std::exception& error) {
+        LOG(ERROR) << "TryElectOnce: invalid epoch: " << error.what();
+        return ElectionAttemptResult::ERROR;
+    }
+    our_value_.assign(reply->element[2]->str, reply->element[2]->len);
+    return ElectionAttemptResult::ELECTED;
 }
 
 // ============================================================
@@ -277,7 +345,7 @@ bool RedisElectionHelper::TryElectOnce(const std::string& master_address,
 
 void RedisElectionHelper::WatchLeader() {
     // Fast path: SUBSCRIBE for leader event notification
-    if (subscribe_ctx_ && WatchLeaderSubscribe()) {
+    if (WatchLeaderSubscribe()) {
         return;
     }
 
@@ -288,6 +356,7 @@ void RedisElectionHelper::WatchLeader() {
 }
 
 bool RedisElectionHelper::WatchLeaderSubscribe() {
+    std::lock_guard<std::mutex> subscribe_lock(subscribe_mutex_);
     // Attempt SUBSCRIBE; return true if successful, false to fall back to
     // polling.
     if (!subscribe_ctx_) return false;
@@ -299,6 +368,7 @@ bool RedisElectionHelper::WatchLeaderSubscribe() {
     if (!reply || reply->type != REDIS_REPLY_ARRAY || reply->elements < 3 ||
         reply->element[0]->type != REDIS_REPLY_STRING ||
         strncmp(reply->element[0]->str, "subscribe", 9) != 0) {
+        ReconnectSubscribeLocked();
         return false;  // Fall back to polling
     }
     reply.reset();
@@ -311,21 +381,13 @@ bool RedisElectionHelper::WatchLeaderSubscribe() {
         RedisReplyPtr unsub((redisReply*)redisCommand(
             subscribe_ctx_, "UNSUBSCRIBE %b", leader_event_channel_.data(),
             leader_event_channel_.size()));
-        DrainSubscribeContext();
         return false;
     }
 
     // Polling thread: check if key still exists periodically.
-    // The subscribe_ctx_ has a 1-second timeout set in Connect(),
-    // so redisGetReply returns at least once per second regardless
-    // of whether a Pub/Sub message arrives, allowing the subscribe
-    // loop to check leader_lost/cancel_election_ flags.
     std::thread polling_thread([this, &leader_lost, polling_ctx]() {
         auto interval = std::chrono::seconds(ttl_sec_);
         while (!leader_lost && !cancel_election_) {
-            std::this_thread::sleep_for(interval);
-            if (leader_lost || cancel_election_) break;
-
             RedisReplyPtr r((redisReply*)redisCommand(polling_ctx, "GET %b",
                                                       master_view_key_.data(),
                                                       master_view_key_.size()));
@@ -336,47 +398,47 @@ bool RedisElectionHelper::WatchLeaderSubscribe() {
             }
             if (r->type == REDIS_REPLY_NIL) {
                 leader_lost = true;
+                cancel_cv_.notify_all();
+                break;
             }
+
+            std::unique_lock<std::mutex> lock(cancel_mutex_);
+            cancel_cv_.wait_for(lock, interval, [&] {
+                return leader_lost.load() || cancel_election_.load();
+            });
         }
     });
 
-    // Subscribe loop: read messages until leader vacancy is detected.
-    // redisGetReply returns at least every 1s (subscribe_ctx_ timeout)
-    // so the loop can check leader_lost/cancel_election_ promptly.
-    int subscribe_errors = 0;
+    // Wait for socket readability before calling hiredis. This distinguishes
+    // an idle subscription from a broken socket without mutating hiredis
+    // internal error state and keeps cancellation responsive.
+    bool subscribe_failed = false;
     while (!leader_lost && !cancel_election_) {
-        redisReply* msg = nullptr;
-        if (redisGetReply(subscribe_ctx_, (void**)&msg) != REDIS_OK) {
-            // redisGetReply returns REDIS_ERR for both read timeouts
-            // (benign — the 1s timeout we set on subscribe_ctx_) and
-            // real connection errors. We cannot reliably distinguish
-            // them purely from subscribe_ctx_->err because Hiredis sets
-            // err=REDIS_ERR_IO even on timeout. Instead, clear the
-            // error state on the context and only treat persistent
-            // failures (3 consecutive errors without a successful read
-            // between them) as a broken connection.
-            if (subscribe_ctx_ && subscribe_ctx_->err != 0) {
-                subscribe_errors++;
-                LOG(WARNING) << "WatchLeaderSubscribe: subscribe connection "
-                             << "error (" << subscribe_errors
-                             << "): err=" << subscribe_ctx_->errstr;
-                // Clear error state so the next redisGetReply can retry.
-                // For timeouts, this allows normal operation to resume.
-                // For real connection errors, the next call will fail
-                // again and increment subscribe_errors.
-                subscribe_ctx_->err = 0;
-                subscribe_ctx_->errstr[0] = '\0';
-                if (subscribe_errors >= 3) {
-                    LOG(ERROR) << "WatchLeaderSubscribe: subscribe connection "
-                               << "unhealthy after 3 consecutive errors, "
-                               << "giving up";
-                    break;
-                }
-            }
-            // Timeout or cleared transient error — re-check flags
+        pollfd descriptor{subscribe_ctx_->fd, POLLIN, 0};
+        int poll_result = ::poll(&descriptor, 1, 200);
+        if (poll_result == 0) {
             continue;
         }
-        subscribe_errors = 0;  // Reset on successful read
+        if (poll_result < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            subscribe_failed = true;
+            break;
+        }
+        if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+            subscribe_failed = true;
+            break;
+        }
+        if ((descriptor.revents & POLLIN) == 0) {
+            continue;
+        }
+
+        redisReply* msg = nullptr;
+        if (redisGetReply(subscribe_ctx_, (void**)&msg) != REDIS_OK) {
+            subscribe_failed = true;
+            break;
+        }
 
         if (msg) {
             RedisReplyPtr msg_guard(msg);
@@ -385,6 +447,7 @@ bool RedisElectionHelper::WatchLeaderSubscribe() {
                 if (msg_guard->element[0]->type == REDIS_REPLY_STRING &&
                     strncmp(msg_guard->element[0]->str, "message", 7) == 0) {
                     leader_lost = true;
+                    cancel_cv_.notify_all();
                 }
             }
         }
@@ -392,8 +455,9 @@ bool RedisElectionHelper::WatchLeaderSubscribe() {
 
     // If the loop exited without leader_lost or cancel_election_, the
     // subscribe connection is broken — fall back to pure polling.
-    const bool subscribe_failed = !leader_lost && !cancel_election_;
+    subscribe_failed = subscribe_failed && !leader_lost && !cancel_election_;
     leader_lost = true;  // Signal polling thread to stop
+    cancel_cv_.notify_all();
     if (polling_thread.joinable()) {
         polling_thread.join();
     }
@@ -404,8 +468,7 @@ bool RedisElectionHelper::WatchLeaderSubscribe() {
     }
 
     if (subscribe_failed) {
-        // Subscribe connection is broken — skip UNSUBSCRIBE (it would fail
-        // anyway) and let WatchLeader fall back to pure polling.
+        ReconnectSubscribeLocked();
         return false;
     }
 
@@ -413,10 +476,6 @@ bool RedisElectionHelper::WatchLeaderSubscribe() {
     RedisReplyPtr unsub((redisReply*)redisCommand(
         subscribe_ctx_, "UNSUBSCRIBE %b", leader_event_channel_.data(),
         leader_event_channel_.size()));
-
-    // Drain any buffered message frames remaining in the socket
-    // so the next SUBSCRIBE gets a clean reply.
-    DrainSubscribeContext();
 
     return true;
 }
@@ -427,26 +486,27 @@ void RedisElectionHelper::WatchLeaderPolling() {
     redisContext* polling_ctx = CreateConnection();
     auto interval = std::chrono::seconds(ttl_sec_);
     while (!cancel_election_) {
-        std::this_thread::sleep_for(interval);
-
         if (!polling_ctx) {
             // Connection was never established or previously lost — retry
             polling_ctx = CreateConnection();
-            continue;
+        } else {
+            RedisReplyPtr reply((redisReply*)redisCommand(
+                polling_ctx, "GET %b", master_view_key_.data(),
+                master_view_key_.size()));
+            if (reply) {
+                if (reply->type == REDIS_REPLY_NIL) {
+                    redisFree(polling_ctx);
+                    return;  // Key expired
+                }
+            } else {
+                // Connection error — reconnect on the next iteration.
+                redisFree(polling_ctx);
+                polling_ctx = nullptr;
+            }
         }
 
-        RedisReplyPtr reply((redisReply*)redisCommand(polling_ctx, "GET %b",
-                                                      master_view_key_.data(),
-                                                      master_view_key_.size()));
-        if (reply) {
-            if (reply->type == REDIS_REPLY_NIL) {
-                redisFree(polling_ctx);
-                return;  // Key expired
-            }
-        } else {
-            // Connection error — reconnect
-            redisFree(polling_ctx);
-            polling_ctx = nullptr;  // Will retry CreateConnection next loop
+        if (WaitForElectionCancellation(interval)) {
+            break;
         }
     }
     if (polling_ctx) redisFree(polling_ctx);
@@ -457,9 +517,12 @@ void RedisElectionHelper::WatchLeaderPolling() {
 // ============================================================
 
 void RedisElectionHelper::KeepLeader(int lease_id) {
+    if (!BeginKeepAliveOperation()) {
+        return;
+    }
+    ScopeGuard operation([this] { EndKeepAliveOperation(); });
     (void)lease_id;  // Reserved for future lease validation
     keep_alive_running_ = true;
-    cancel_keep_alive_ = false;
 
     // Lua script: atomically check ownership and renew TTL
     // KEYS[1] = master_view_key
@@ -491,30 +554,20 @@ void RedisElectionHelper::KeepLeader(int lease_id) {
                 LOG(ERROR)
                     << "KeepLeader: Lua renewal failed (connection error)";
                 if (Reconnect(election_ctx_)) {
-                    // Reconnected — check if we still own the key
-                    RedisReplyPtr check((redisReply*)redisCommand(
-                        election_ctx_, "GET %b", master_view_key_.data(),
-                        master_view_key_.size()));
-                    if (check && check->type == REDIS_REPLY_STRING &&
-                        check->len == our_value_.size() &&
-                        memcmp(check->str, our_value_.data(),
-                               our_value_.size()) == 0) {
-                        // Still ours — renew TTL after reconnection
-                        check.reset();
-                        RedisReplyPtr expire_reply((redisReply*)redisCommand(
-                            election_ctx_, "EXPIRE %b %d",
-                            master_view_key_.data(), master_view_key_.size(),
-                            ttl_sec_));
-                        if (expire_reply &&
-                            expire_reply->type == REDIS_REPLY_INTEGER &&
-                            expire_reply->integer == 1) {
-                            renewed = true;
-                        } else {
-                            LOG(WARNING) << "KeepLeader: EXPIRE failed after "
-                                            "reconnect, key may have changed";
-                        }
+                    // Re-run the ownership check and renewal atomically after
+                    // reconnect. GET followed by EXPIRE would allow another
+                    // node to replace the key between the two commands.
+                    RedisReplyPtr retry((redisReply*)redisCommand(
+                        election_ctx_, "EVAL %s 1 %b %d %b", renewal_script,
+                        master_view_key_.data(), master_view_key_.size(),
+                        ttl_sec_, our_value_.data(), our_value_.size()));
+                    if (retry && retry->type == REDIS_REPLY_INTEGER &&
+                        retry->integer == 1) {
+                        renewed = true;
+                    } else {
+                        LOG(WARNING) << "KeepLeader: Lua renewal failed after "
+                                        "reconnect, key may have changed";
                     }
-                    // check is auto-freed by RedisReplyPtr
                 }
             } else if (reply->type == REDIS_REPLY_INTEGER &&
                        reply->integer == 1) {
@@ -532,7 +585,7 @@ void RedisElectionHelper::KeepLeader(int lease_id) {
             break;  // Lost leadership
         }
 
-        std::this_thread::sleep_for(
+        WaitForKeepAliveCancellation(
             std::chrono::seconds(heartbeat_interval_sec_));
     }
 
@@ -544,9 +597,26 @@ void RedisElectionHelper::KeepLeader(int lease_id) {
 void RedisElectionHelper::CancelKeepAlive() {
     cancel_keep_alive_ = true;
     keep_alive_running_ = false;
+    cancel_cv_.notify_all();
 }
 
-void RedisElectionHelper::CancelElection() { cancel_election_ = true; }
+void RedisElectionHelper::CancelElection() {
+    cancel_election_ = true;
+    cancel_cv_.notify_all();
+}
+
+void RedisElectionHelper::Shutdown() {
+    {
+        std::lock_guard<std::mutex> lock(operation_mutex_);
+        shutting_down_ = true;
+    }
+    CancelElection();
+    CancelKeepAlive();
+
+    std::unique_lock<std::mutex> lock(operation_mutex_);
+    operation_cv_.wait(lock,
+                       [this] { return active_blocking_operations_ == 0; });
+}
 
 // ============================================================
 // GetMasterView
@@ -594,13 +664,19 @@ ErrorCode RedisElectionHelper::GetMasterView(std::string& master_address,
 // Internal helpers
 // ============================================================
 
-void RedisElectionHelper::PublishLeaderEvent(const std::string& event) {
-    // Caller must hold election_mutex_
-    if (!election_ctx_) return;
+void RedisElectionHelper::PublishLeaderEvent(const std::string& master_address,
+                                             ViewVersionId epoch) {
+    // TBase does not broadcast PUBLISH invoked inside EVAL through its proxy,
+    // so publish from the client after the atomic election script succeeds.
+    const std::string event =
+        "elected:" + master_address + ":" + std::to_string(epoch);
     RedisReplyPtr reply((redisReply*)redisCommand(
         election_ctx_, "PUBLISH %b %b", leader_event_channel_.data(),
         leader_event_channel_.size(), event.data(), event.size()));
-    // Reply is auto-freed — we don't need to inspect it.
+    if (!reply) {
+        LOG(WARNING) << "PublishLeaderEvent: PUBLISH failed; polling will "
+                        "detect the leader change";
+    }
 }
 
 bool RedisElectionHelper::Reconnect(redisContext*& ctx) {
@@ -621,27 +697,72 @@ bool RedisElectionHelper::Reconnect(redisContext*& ctx) {
     return true;
 }
 
-void RedisElectionHelper::DrainSubscribeContext() {
-    if (!subscribe_ctx_) return;
-    // After UNSUBSCRIBE, buffered message frames may still be in the
-    // read buffer. Drain them so the next SUBSCRIBE gets a clean reply.
-    while (true) {
-        redisReply* raw_reply = nullptr;
-        if (redisGetReply(subscribe_ctx_, (void**)&raw_reply) != REDIS_OK ||
-            !raw_reply) {
-            break;  // No more data or connection error
-        }
-        RedisReplyPtr reply(raw_reply);
-        bool is_unsub_ack =
-            (reply->type == REDIS_REPLY_ARRAY && reply->elements >= 3 &&
-             reply->element[0]->type == REDIS_REPLY_STRING &&
-             strncmp(reply->element[0]->str, "unsubscribe", 11) == 0);
-        if (is_unsub_ack) {
-            // We've consumed the UNSUBSCRIBE acknowledgment — anything
-            // after this would be from a future SUBSCRIBE cycle.
-            break;
-        }
+bool RedisElectionHelper::ReconnectSubscribeLocked(bool record_metric) {
+    if (subscribe_ctx_) {
+        redisFree(subscribe_ctx_);
+        subscribe_ctx_ = nullptr;
     }
+    subscribe_ctx_ = CreateConnection();
+    if (!subscribe_ctx_) {
+        LOG(ERROR) << "ReconnectSubscribe: failed to connect to Redis";
+        return false;
+    }
+    LOG(INFO) << "ReconnectSubscribe: subscribe connection ready";
+    if (record_metric) {
+        HAMetricManager::instance().inc_election_reconnects();
+    }
+    return true;
+}
+
+bool RedisElectionHelper::BeginBlockingOperation() {
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    if (shutting_down_) {
+        return false;
+    }
+    ++active_blocking_operations_;
+    return true;
+}
+
+bool RedisElectionHelper::BeginKeepAliveOperation() {
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    if (shutting_down_ || keep_alive_operation_active_) {
+        return false;
+    }
+    cancel_keep_alive_ = false;
+    keep_alive_operation_active_ = true;
+    ++active_blocking_operations_;
+    return true;
+}
+
+void RedisElectionHelper::EndBlockingOperation() {
+    {
+        std::lock_guard<std::mutex> lock(operation_mutex_);
+        --active_blocking_operations_;
+    }
+    operation_cv_.notify_all();
+}
+
+void RedisElectionHelper::EndKeepAliveOperation() {
+    {
+        std::lock_guard<std::mutex> lock(operation_mutex_);
+        keep_alive_operation_active_ = false;
+        --active_blocking_operations_;
+    }
+    operation_cv_.notify_all();
+}
+
+bool RedisElectionHelper::WaitForElectionCancellation(
+    std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(cancel_mutex_);
+    return cancel_cv_.wait_for(lock, timeout,
+                               [this] { return cancel_election_.load(); });
+}
+
+bool RedisElectionHelper::WaitForKeepAliveCancellation(
+    std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(cancel_mutex_);
+    return cancel_cv_.wait_for(lock, timeout,
+                               [this] { return cancel_keep_alive_.load(); });
 }
 
 // ============================================================
@@ -669,23 +790,7 @@ std::string RedisElectionHelper::SerializeLeaderValue(
 bool RedisElectionHelper::ParseLeaderValue(const std::string& json,
                                            std::string& out_address,
                                            ViewVersionId& out_epoch) {
-    Json::Value root;
-    Json::CharReaderBuilder builder;
-    std::istringstream stream(json);
-    std::string errors;
-    if (!Json::parseFromStream(builder, stream, &root, &errors)) {
-        LOG(ERROR) << "ParseLeaderValue: JSON parse failed: " << errors;
-        return false;
-    }
-
-    if (!root.isMember("address") || !root["address"].isString() ||
-        !root.isMember("epoch") || !root["epoch"].isInt64()) {
-        return false;
-    }
-
-    out_address = root["address"].asString();
-    out_epoch = root["epoch"].asInt64();
-    return true;
+    return ParseElectionValue(json, out_address, out_epoch, nullptr);
 }
 
 }  // namespace mooncake
