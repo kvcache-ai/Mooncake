@@ -73,6 +73,19 @@ class MasterServiceNicLoadTest : public ::testing::Test {
         std::lock_guard<std::mutex> lock(service.nic_load_stats_mutex_);
         return service.nic_load_stats_.size();
     }
+
+    // Force the endpoint index to rebuild on the next query.
+    static void ExpireEndpointIndex(MasterService& service) {
+        std::lock_guard<std::mutex> lock(service.endpoint_index_mutex_);
+        service.endpoint_index_built_at_ms_ = 0;
+    }
+
+    // Pin the endpoint index so it cannot expire during the test.
+    static void PinEndpointIndex(MasterService& service) {
+        std::lock_guard<std::mutex> lock(service.endpoint_index_mutex_);
+        service.endpoint_index_built_at_ms_ =
+            std::numeric_limits<uint64_t>::max() / 2;
+    }
 };
 
 // --- ReportNicLoadStats ---
@@ -303,6 +316,35 @@ TEST_F(MasterServiceNicLoadTest, BatchGetByMultipleEndpoints) {
         {"endpoint_a", "endpoint_b", "endpoint_c_no_stats", "unknown"});
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(2u, result->size());
+}
+
+TEST_F(MasterServiceNicLoadTest, EndpointIndexCachedWithinTtl) {
+    auto service = CreateMasterService();
+    UUID client_a = MountSegment(*service, "endpoint_a", 0x300000000);
+    ASSERT_TRUE(
+        service->ReportNicLoadStats(client_a, MakeStats({{"eth0", 100}}))
+            .has_value());
+
+    // First query builds the endpoint index; pin it so it cannot expire
+    // mid-test on a slow machine.
+    auto result = service->BatchGetNicLoadStatsByEndpoints({"endpoint_a"});
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(1u, result->size());
+    PinEndpointIndex(*service);
+
+    // A segment mounted within the TTL is invisible until the index expires.
+    UUID client_b = MountSegment(*service, "endpoint_b", 0x310000000);
+    ASSERT_TRUE(
+        service->ReportNicLoadStats(client_b, MakeStats({{"eth0", 200}}))
+            .has_value());
+    result = service->BatchGetNicLoadStatsByEndpoints({"endpoint_b"});
+    ASSERT_TRUE(result.has_value());
+    EXPECT_TRUE(result->empty());
+
+    ExpireEndpointIndex(*service);
+    result = service->BatchGetNicLoadStatsByEndpoints({"endpoint_b"});
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(1u, result->size());
 }
 
 // --- Eviction ---

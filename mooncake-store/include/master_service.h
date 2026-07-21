@@ -673,7 +673,8 @@ class MasterService {
 
     /**
      * @brief Like BatchGetNicLoadStats but resolves clients by their
-     *        segment name or TE endpoint address.
+     *        segment name or TE endpoint address. The endpoint mapping is
+     *        cached and may lag mounts by up to kEndpointIndexTtlMs.
      * @param endpoints Endpoint strings to resolve.
      */
     auto BatchGetNicLoadStatsByEndpoints(
@@ -2107,6 +2108,12 @@ class MasterService {
     mutable std::mutex nic_load_stats_mutex_;
     std::unordered_map<UUID, ClientNicLoadStats, boost::hash<UUID>>
         nic_load_stats_;
+    // Endpoint -> client index rebuilt from segments at most once per
+    // kEndpointIndexTtlMs, so per-heartbeat queries avoid full segment scans.
+    static constexpr uint64_t kEndpointIndexTtlMs = 1000;  // 1 sec
+    mutable std::mutex endpoint_index_mutex_;
+    std::unordered_map<std::string, UUID> endpoint_to_client_;
+    uint64_t endpoint_index_built_at_ms_ = 0;
 
     bool enable_snapshot_restore_ = false;
 
