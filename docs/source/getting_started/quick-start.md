@@ -61,8 +61,8 @@ PD disaggregation paths use Mooncake Transfer Engine for direct KV transfer
 between prefill and decode workers. Configure these paths through the serving
 framework guides, not by calling Transfer Engine APIs directly:
 
-- [SGLang Integration Overview](examples/sglang-integration/index.md)
-- [vLLM Integration Overview](examples/vllm-integration/index.md)
+- [SGLang Integration Overview](../integrations/sglang/index.md)
+- [vLLM Integration Overview](../integrations/vllm/index.md)
 
 ### Mooncake Store
 
@@ -71,8 +71,8 @@ HiCache:
 
 | Framework | Use case | Setup guide |
 |-----------|----------|-------------|
-| SGLang | HiCache L3 storage backend with Mooncake Store | [SGLang HiCache Quick Start](examples/sglang-integration/hicache-quick-start.md) |
-| vLLM | KV cache storage and sharing with `MooncakeStoreConnector` | [vLLM KV Cache Storage & Sharing](examples/vllm-integration/kv-cache-storage.md) |
+| SGLang | HiCache L3 storage backend with Mooncake Store | [SGLang HiCache Quick Start](../integrations/sglang/hicache-quick-start.md) |
+| vLLM | KV cache storage and sharing with `MooncakeStoreConnector` | [vLLM KV Cache Storage & Sharing](../integrations/vllm/kv-cache-storage.md) |
 
 The serving framework guides include the required Mooncake Store service
 startup and connector configuration for each path.
@@ -132,5 +132,5 @@ For production deployment, standalone store services, high availability,
 allocation strategies, SSD offload, and runtime tuning, continue to the
 [Mooncake Store Deployment & Tuning Guide](../deployment/mooncake-store-deployment-guide.md).
 
-For API details, see the [Mooncake Store Python API](../python-api-reference/mooncake-store.md)
+For API details, see the [Mooncake Store Python API](../api-reference/python/mooncake-store.md)
 and [Mooncake Store design](../design/mooncake-store.md).

@@ -16,7 +16,7 @@ pip install mooncake-transfer-engine
 
 Note:
 
--   If any `.so` file is missing, uninstall the pip package with `pip3 uninstall mooncake-transfer-engine`, and build the binaries manually from source following the [build instructions](../build.md).
+-   If any `.so` file is missing, uninstall the pip package with `pip3 uninstall mooncake-transfer-engine`, and build the binaries manually from source following the [build instructions](../getting_started/build.md).
 
 ### Install the latest version of LMDeploy
 
@@ -63,10 +63,10 @@ lmdeploy serve proxy \
 
 ```bash
 lmdeploy serve api_server Qwen/Qwen3-8B \
-	--server-name 192.168.0.101 \ 
-	--server-port 23333 \  
-	--role Prefill \   
-	--proxy-url http://192.168.0.147:8000 \   
+	--server-name 192.168.0.101 \
+	--server-port 23333 \
+	--role Prefill \
+	--proxy-url http://192.168.0.147:8000 \
 	--backend pytorch \
 	--migration-backend Mooncake
 ```
@@ -80,10 +80,10 @@ lmdeploy serve api_server Qwen/Qwen3-8B \
 
 ```bash
 lmdeploy serve api_server Qwen/Qwen3-8B \
-	--server-name 192.168.0.147 \ 
-	--server-port 23334 \  
-	--role Decode \   
-	--proxy-url http://192.168.0.147:8000 \   
+	--server-name 192.168.0.147 \
+	--server-port 23334 \
+	--role Decode \
+	--proxy-url http://192.168.0.147:8000 \
 	--backend pytorch \
 	--migration-backend Mooncake
 ```
@@ -137,10 +137,10 @@ lmdeploy serve api_server Qwen/Qwen3-8B \
 ```bash
 CUDA_VISIBLE_DEVICES=1 \
 lmdeploy serve api_server Qwen/Qwen3-8B \
-	--server-name 192.168.0.147 \ 
-	--server-port 23334 \  
-	--role Decode \   
-	--proxy-url http://192.168.0.147:8000 \   
+	--server-name 192.168.0.147 \
+	--server-port 23334 \
+	--role Decode \
+	--proxy-url http://192.168.0.147:8000 \
 	--backend pytorch \
 	--migration-backend Mooncake
 ```

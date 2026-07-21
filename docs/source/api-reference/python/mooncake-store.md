@@ -2939,7 +2939,7 @@ For methods that return data (`get`, `get_batch`, `get_buffer`, `get_tensor`):
 - Return the requested data on success
 - Return empty/None on failure or key not found
 
-📋 **Complete Error Codes Reference**: See [Error Code Explanation](../troubleshooting/error-code.md) for detailed descriptions of all error codes and their meanings.
+📋 **Complete Error Codes Reference**: See [Error Code Explanation](../../troubleshooting/error-code.md) for detailed descriptions of all error codes and their meanings.
 
 ---
 

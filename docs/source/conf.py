@@ -45,6 +45,7 @@ extensions = [
     "sphinxarg.ext",
     "sphinx_design",
     "sphinx_togglebutton",
+    "sphinx_reredirects",
     "sphinxcontrib.mermaid",
 ]
 myst_enable_extensions = [
@@ -250,3 +251,53 @@ intersphinx_mapping = {
 }
 
 navigation_with_keys = False
+
+# Preserve published URLs when documentation is reorganized. Redirect targets
+# are relative to the generated location of each legacy page.
+redirects = {
+    "getting_started/examples/lmcache-integration":
+    "../../integrations/lmcache.html",
+    "getting_started/examples/lmdeploy-integration-v0.9":
+    "../../integrations/lmdeploy.html",
+    "getting_started/examples/sglang-integration-v1":
+    "../../integrations/sglang/pd-disaggregation.html",
+    "getting_started/examples/sglang-integration/index":
+    "../../../integrations/sglang/index.html",
+    "getting_started/examples/sglang-integration/hicache-integration-v1":
+    "../../../integrations/sglang/hicache-integration-v1.html",
+    "getting_started/examples/sglang-integration/hicache-quick-start":
+    "../../../integrations/sglang/hicache-quick-start.html",
+    "getting_started/examples/vllm-integration/index":
+    "../../../integrations/vllm/index.html",
+    "getting_started/examples/vllm-integration/disagg-prefill-decode":
+    "../../../integrations/vllm/disagg-prefill-decode.html",
+    "getting_started/examples/vllm-integration/kv-cache-storage":
+    "../../../integrations/vllm/kv-cache-storage.html",
+    "getting_started/examples/vllm-integration/vllm-integration-v0.2":
+    "../../../integrations/vllm/vllm-integration-v0.2.html",
+    "getting_started/examples/vllm-integration/vllm-integration-v0.3":
+    "../../../integrations/vllm/vllm-integration-v0.3.html",
+    "getting_started/examples/vllm-integration/vllm-integration-v1.0":
+    "../../../integrations/vllm/vllm-integration-v1.0.html",
+    "getting_started/examples/vllm-integration/vllm-mooncakestoreconnector":
+    "../../../integrations/vllm/vllm-mooncakestoreconnector.html",
+    "getting_started/examples/vllm-integration/vllmv1-lmcache-integration":
+    "../../../integrations/vllm/vllmv1-lmcache-integration.html",
+    "getting_started/examples/vllm-integration/vllmv1-lmcache-mp-integration":
+    "../../../integrations/vllm/vllmv1-lmcache-mp-integration.html",
+    "python-api-reference/dataproto-structured-object-transfer":
+    "../api-reference/python/dataproto-structured-object-transfer.html",
+    "python-api-reference/ep-backend":
+    "../api-reference/python/ep-backend.html",
+    "python-api-reference/mooncake-store":
+    "../api-reference/python/mooncake-store.html",
+    "python-api-reference/transfer-engine":
+    "../api-reference/python/transfer-engine.html",
+    "http-api-reference/http-service":
+    "../api-reference/http/http-service.html",
+    "design/transfer-engine/cpp-api":
+    "../../api-reference/cpp/transfer-engine.html",
+    "design/tent/cpp-api": "../../api-reference/cpp/tent.html",
+    "design/conductor/indexer-api-design":
+    "../../api-reference/http/conductor-indexer.html",
+}

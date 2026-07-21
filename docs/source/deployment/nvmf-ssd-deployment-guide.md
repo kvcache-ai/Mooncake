@@ -233,7 +233,7 @@ Enter the SPDK directory on the target node and run the following commands.
 ### 6.2 Use NoF with vLLM + LMCache
 
 For the general VLLM + LMCache + Mooncake deployment flow, see
-[vLLM V1 Disaggregated Serving with Mooncake Store and LMCache](../getting_started/examples/vllm-integration/vllmv1-lmcache-integration.md).
+[vLLM V1 Disaggregated Serving with Mooncake Store and LMCache](../integrations/vllm/vllmv1-lmcache-integration.md).
 After the NVMe-oF SSD pool is registered with Mooncake, add the NoF-specific
 Mooncake configuration below.
 
