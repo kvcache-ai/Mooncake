@@ -78,9 +78,6 @@ int main(int argc, char* argv[]) {
     std::cout << "\nConfiguration:" << std::endl;
     std::cout << "  - HTTP Server: " << config.http_host << ":"
               << config.http_port << std::endl;
-    std::cout << "  - Prometheus: "
-              << (config.enable_prometheus ? "enabled" : "disabled")
-              << std::endl;
     std::cout << "  - Runtime metrics: "
               << (config.enabled ? "enabled" : "disabled") << std::endl;
 

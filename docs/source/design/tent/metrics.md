@@ -65,9 +65,7 @@ TENT metrics configuration is integrated into the main `transfer-engine.json` co
     "http_port": 9100,
     "http_host": "0.0.0.0",
     "http_server_threads": 2,
-    "report_interval_seconds": 30,
-    "enable_prometheus": true,
-    "enable_json": true
+    "report_interval_seconds": 30
   },
   "transports": {
     // ... transport configuration
@@ -88,10 +86,6 @@ TENT_METRICS_HTTP_PORT=9100
 TENT_METRICS_HTTP_HOST=0.0.0.0
 TENT_METRICS_HTTP_SERVER_THREADS=2
 TENT_METRICS_REPORT_INTERVAL=30  # Set to 0 to disable periodic logging
-
-# Output formats
-TENT_METRICS_ENABLE_PROMETHEUS=true
-TENT_METRICS_ENABLE_JSON=true
 ```
 
 ## Quick Start
@@ -352,6 +346,10 @@ The `metrics/latency_buckets` and `metrics/size_buckets` config keys, and the `T
 **Migration:** remove these keys from your `transfer-engine.json` and unset the environment variables. If custom bucket boundaries are required, edit `kLatencyBuckets` / `kSizeBuckets` in `tent/metrics/tent_metrics.h` and rebuild.
 
 > **Note:** the previous runtime-configurable implementation had a latent bug — the JSON output labeled custom buckets with the compile-time default boundaries, so `/metrics/json` was already mislabeled for custom-bucket deployments. Removing the knob fixes this rather than preserving a buggy code path.
+
+The `metrics/enable_prometheus` and `metrics/enable_json` config keys, and the `TENT_METRICS_ENABLE_PROMETHEUS` / `TENT_METRICS_ENABLE_JSON` environment variables, were removed and are now silently ignored. The `/metrics` and `/metrics/json` HTTP endpoints are now registered unconditionally and cannot be toggled independently — both are read-only and served on the same port, so there was no real scenario where a deployment wanted one disabled.
+
+**Migration:** remove these keys from your `transfer-engine.json` and unset the environment variables. To fully disable the metrics subsystem (no HTTP server, no periodic summary logging, no recording), set `metrics/enabled` to `false` (or `TENT_METRICS_ENABLED=false`). Note that "log-only mode" — where periodic summaries are still logged but `/metrics` is unavailable — only occurs when metrics are enabled but the HTTP port cannot be bound (e.g. port conflict); it is not triggered by `metrics/enabled=false`.
 
 ### Validation
 

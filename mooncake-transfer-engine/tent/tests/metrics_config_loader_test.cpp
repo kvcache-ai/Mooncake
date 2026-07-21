@@ -64,8 +64,6 @@ TEST(MetricsConfigLoaderTest, GetDefaultConfigReturnsExpectedDefaults) {
     EXPECT_EQ(config.http_port, 9100);
     EXPECT_EQ(config.http_server_threads, 2);
     EXPECT_EQ(config.report_interval_seconds, 30);
-    EXPECT_TRUE(config.enable_prometheus);
-    EXPECT_TRUE(config.enable_json);
 }
 
 //------------------------------------------------------------------------------
@@ -79,9 +77,7 @@ TEST(MetricsConfigLoaderTest, LoadFromConfigWithAllValues) {
         "metrics/http_port": 8080,
         "metrics/http_host": "127.0.0.1",
         "metrics/http_server_threads": 4,
-        "metrics/report_interval_seconds": 60,
-        "metrics/enable_prometheus": false,
-        "metrics/enable_json": true
+        "metrics/report_interval_seconds": 60
     })";
     ASSERT_TRUE(config.load(json_content).ok());
 
@@ -92,8 +88,6 @@ TEST(MetricsConfigLoaderTest, LoadFromConfigWithAllValues) {
     EXPECT_EQ(metrics_config.http_host, "127.0.0.1");
     EXPECT_EQ(metrics_config.http_server_threads, 4);
     EXPECT_EQ(metrics_config.report_interval_seconds, 60);
-    EXPECT_FALSE(metrics_config.enable_prometheus);
-    EXPECT_TRUE(metrics_config.enable_json);
 }
 
 TEST(MetricsConfigLoaderTest, LoadFromConfigWithPartialValues) {
@@ -136,8 +130,6 @@ TEST(MetricsConfigLoaderTest, LoadFromEnvironmentWithAllVars) {
     EnvVarGuard g3(config_keys::ENV_METRICS_HTTP_HOST, "192.168.1.1");
     EnvVarGuard g4(config_keys::ENV_METRICS_HTTP_SERVER_THREADS, "8");
     EnvVarGuard g5(config_keys::ENV_METRICS_REPORT_INTERVAL, "120");
-    EnvVarGuard g6(config_keys::ENV_METRICS_ENABLE_PROMETHEUS, "true");
-    EnvVarGuard g7(config_keys::ENV_METRICS_ENABLE_JSON, "false");
 
     MetricsConfig config = MetricsConfigLoader::loadFromEnvironment();
 
@@ -146,8 +138,6 @@ TEST(MetricsConfigLoaderTest, LoadFromEnvironmentWithAllVars) {
     EXPECT_EQ(config.http_host, "192.168.1.1");
     EXPECT_EQ(config.http_server_threads, 8);
     EXPECT_EQ(config.report_interval_seconds, 120);
-    EXPECT_TRUE(config.enable_prometheus);
-    EXPECT_FALSE(config.enable_json);
 }
 
 TEST(MetricsConfigLoaderTest, LoadFromEnvironmentWithPartialVars) {
@@ -228,17 +218,6 @@ TEST(MetricsConfigLoaderTest, ValidateConfigInvalidThreadsZero) {
     EXPECT_FALSE(MetricsConfigLoader::validateConfig(config, &error_msg));
     EXPECT_FALSE(error_msg.empty());
     EXPECT_NE(error_msg.find("threads"), std::string::npos);
-}
-
-TEST(MetricsConfigLoaderTest, ValidateConfigNoOutputFormatEnabled) {
-    MetricsConfig config = MetricsConfigLoader::getDefaultConfig();
-    config.enable_prometheus = false;
-    config.enable_json = false;
-    std::string error_msg;
-
-    EXPECT_FALSE(MetricsConfigLoader::validateConfig(config, &error_msg));
-    EXPECT_FALSE(error_msg.empty());
-    EXPECT_NE(error_msg.find("format"), std::string::npos);
 }
 
 TEST(MetricsConfigLoaderTest, ValidateConfigNullErrorMsg) {
@@ -330,9 +309,6 @@ TEST(ConfigKeysTest, ConfigKeyConstants) {
                  "metrics/http_server_threads");
     EXPECT_STREQ(config_keys::METRICS_REPORT_INTERVAL,
                  "metrics/report_interval_seconds");
-    EXPECT_STREQ(config_keys::METRICS_ENABLE_PROMETHEUS,
-                 "metrics/enable_prometheus");
-    EXPECT_STREQ(config_keys::METRICS_ENABLE_JSON, "metrics/enable_json");
 }
 
 TEST(ConfigKeysTest, EnvVarConstants) {
@@ -344,10 +320,6 @@ TEST(ConfigKeysTest, EnvVarConstants) {
                  "TENT_METRICS_HTTP_SERVER_THREADS");
     EXPECT_STREQ(config_keys::ENV_METRICS_REPORT_INTERVAL,
                  "TENT_METRICS_REPORT_INTERVAL");
-    EXPECT_STREQ(config_keys::ENV_METRICS_ENABLE_PROMETHEUS,
-                 "TENT_METRICS_ENABLE_PROMETHEUS");
-    EXPECT_STREQ(config_keys::ENV_METRICS_ENABLE_JSON,
-                 "TENT_METRICS_ENABLE_JSON");
 }
 
 }  // namespace
