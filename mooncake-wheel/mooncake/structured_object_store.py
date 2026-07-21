@@ -1695,7 +1695,7 @@ def _flat_dict_to_envelope(data: Mapping[str, Any]) -> dict[str, Any]:
     for name, value in data.items():
         if _is_row_aligned_dense_field(value, row_count):
             batch[name] = value
-        elif _is_non_string_sequence(value) and len(value) == row_count:
+        elif _is_flat_non_tensor_field(value) and len(value) == row_count:
             non_tensor_batch[name] = _coerce_flat_dict_non_tensor_field(
                 name, value, row_count
             )
@@ -1705,14 +1705,27 @@ def _flat_dict_to_envelope(data: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _flat_dict_auto_row_count(data: Mapping[str, Any]) -> int:
-    sizes = {
+    dense_sizes = {
         len(value)
         for value in data.values()
         if (
             (_torch is not None and isinstance(value, _torch.Tensor) and value.ndim > 0)
-            or (isinstance(value, np.ndarray) and value.ndim > 0)
-            or _is_non_string_sequence(value)
+            or (
+                isinstance(value, np.ndarray)
+                and value.dtype != object
+                and value.ndim > 0
+            )
         )
+    }
+    if len(dense_sizes) > 1:
+        raise ValueError(
+            f"flat dict dense fields have ambiguous batch sizes: {sorted(dense_sizes)}"
+        )
+    if dense_sizes:
+        return dense_sizes.pop()
+
+    sizes = {
+        len(value) for value in data.values() if _is_flat_non_tensor_field(value)
     }
     if not sizes:
         return 0
@@ -1743,6 +1756,12 @@ def _coerce_flat_dict_non_tensor_field(name: str, value: Any, row_count: int) ->
     )
 
 
+def _is_flat_non_tensor_field(value: Any) -> bool:
+    return (
+        isinstance(value, np.ndarray) and value.dtype == object and value.ndim > 0
+    ) or _is_non_string_sequence(value)
+
+
 def _is_non_string_sequence(value: Any) -> bool:
     return isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray))
 
@@ -1760,17 +1779,28 @@ def _is_row_aligned_dense_field(value: Any, row_count: int) -> bool:
 
 
 def _envelope_to_flat_dict(data: Mapping[str, Any]) -> dict[str, Any]:
-    result = dict(_mapping_to_dict(data.get("meta_info")))
-    result.update(_mapping_to_dict(data.get("batch")))
-    for name, value in _mapping_to_dict(data.get("non_tensor_batch")).items():
+    meta_info = _mapping_to_dict(data.get("meta_info"))
+    batch = _mapping_to_dict(data.get("batch"))
+    non_tensor_batch = _mapping_to_dict(data.get("non_tensor_batch"))
+    overlap = (
+        (set(meta_info) & set(batch))
+        | (set(meta_info) & set(non_tensor_batch))
+        | (set(batch) & set(non_tensor_batch))
+    )
+    if overlap:
+        raise ValueError(
+            f"Duplicate keys found across DataProto sections: {sorted(overlap)}"
+        )
+
+    result = dict(meta_info)
+    result.update(batch)
+    for name, value in non_tensor_batch.items():
         result[name] = (
-            value.tolist()
+            list(value)
             if isinstance(value, np.ndarray) and value.dtype == object
             else value
         )
     return result
-
-
 
 def _build_dataproto_like_result(
     batch: dict[str, Any],
