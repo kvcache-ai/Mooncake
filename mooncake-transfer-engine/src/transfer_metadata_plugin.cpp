@@ -762,6 +762,11 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                 Json::Value local, peer;
 
                 auto [type, json_str] = readString(conn_fd);
+                if (type == HandShakeRequestType::Invalid) {
+                    close(conn_fd);
+                    continue;
+                }
+
                 std::string errs;
                 if (!parseJsonString(json_str, peer, &errs)) {
                     LOG(ERROR)
