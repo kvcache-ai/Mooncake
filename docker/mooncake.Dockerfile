@@ -9,13 +9,16 @@ ARG UBUNTU_VERSION=22.04
 FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
 
 ARG PYTHON_VERSION=3.10
 ARG PYPA_INDEX_URL=https://bootstrap.pypa.io
 ARG CMAKE_BUILD_TYPE=Release
 ARG EP_TORCH_VERSIONS="2.12.1"
 ARG TORCH_CUDA_ARCH_LIST="8.0;9.0"
+# CI can opt in to removing /workspace/build from the builder layer.
+ARG CLEAN_BUILD_ARTIFACTS=0
 
 ENV PYTHON_VERSION=${PYTHON_VERSION} \
     BUILD_WITH_EP=1 \
@@ -50,7 +53,9 @@ COPY . /workspace
 # Install Mooncake dependencies (yalantinglibs, Go, etc.)
 RUN bash dependencies.sh -y
 
-# Configure & build Mooncake
+# Configure and build the wheel in one layer, then remove build/ only after
+# auditwheel has resolved libraries from it. The large intermediate tree is
+# therefore not retained in the builder image or BuildKit cache.
 RUN mkdir -p build && \
     cd build && \
     cmake -G Ninja .. \
@@ -63,18 +68,19 @@ RUN mkdir -p build && \
         -DPython3_EXECUTABLE=/usr/bin/python${PYTHON_VERSION} \
         -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} && \
     export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH && \
-    cmake --build .
-
-# Build nvlink allocator to make wheel self-contained for CUDA paths
-RUN export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH && \
+    cmake --build . && \
+    cd /workspace && \
+    export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH && \
     export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH && \
     export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH && \
     mkdir -p build/mooncake-transfer-engine/nvlink-allocator && \
     cd mooncake-transfer-engine/nvlink-allocator && \
-    bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
-
-# Build the Python wheel from local sources
-RUN OUTPUT_DIR=dist ./scripts/build_wheel.sh
+    bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/ && \
+    cd /workspace && \
+    OUTPUT_DIR=dist ./scripts/build_wheel.sh && \
+    if [ "${CLEAN_BUILD_ARTIFACTS}" = "1" ]; then \
+        rm -rf build; \
+    fi
 
 ###############################################################################
 # Stage 2: install the freshly built wheel into a runtime image
