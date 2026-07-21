@@ -334,6 +334,9 @@ void RedisOpLogStore::AsyncWriteLoop(size_t worker_id) {
                     attempts >= best_effort_max_retries_) {
                     dropped_sequences_.insert(pending->entry.sequence_id);
                     inflight_writes_.erase(pending->entry.sequence_id);
+                    pending->done = true;
+                    pending->result = ErrorCode::INTERNAL_ERROR;
+                    sync_cv_.notify_all();
                     LOG(ERROR) << "RedisOpLogStore: dropping best-effort oplog"
                                << ", sequence_id=" << pending->entry.sequence_id
                                << ", attempts=" << attempts;
@@ -550,8 +553,8 @@ ErrorCode RedisOpLogStore::ReadOpLogSince(uint64_t start_sequence_id,
     uint64_t next_sequence_id = effective_start + 1;
     while (next_sequence_id <= latest_sequence_id && entries.size() < limit) {
         const uint64_t remaining = latest_sequence_id - next_sequence_id + 1;
-        const size_t batch_size = static_cast<size_t>(
-            std::min<uint64_t>(remaining, static_cast<uint64_t>(limit)));
+        const size_t batch_size = static_cast<size_t>(std::min<uint64_t>(
+            remaining, static_cast<uint64_t>(limit - entries.size())));
         const uint64_t batch_start = next_sequence_id;
 
         for (size_t i = 0; i < batch_size; ++i) {
