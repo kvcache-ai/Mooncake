@@ -17,7 +17,9 @@ from mooncake.structured_object_store import (
     StructuredObjectPayload,
     StructuredObjectReadSpec,
     export_dataproto_ref,
+    export_ref,
     import_dataproto_ref,
+    import_ref,
     is_dataproto_ref_handle,
     raw_destination,
     tensor_object_buffer,
@@ -60,6 +62,8 @@ class InMemoryStore:
         self.batch_remove_calls = 0
         self.put_tensor_calls = 0
         self.get_tensor_calls = 0
+        self.put_configs: list[object] = []
+        self.batch_put_from_configs: list[object] = []
 
     def _enter_put(self) -> None:
         with self.lock:
@@ -79,7 +83,8 @@ class InMemoryStore:
         with self.lock:
             self.active_gets -= count
 
-    def put(self, key: str, value) -> int:
+    def put(self, key: str, value, config=None) -> int:
+        self.put_configs.append(config)
         self._enter_put()
         try:
             time.sleep(0.01)
@@ -122,13 +127,14 @@ class InMemoryStore:
         return [0 for _key in keys]
 
     def batch_put_from(
-        self, keys: list[str], buffer_ptrs: list[int], sizes: list[int]
+        self, keys: list[str], buffer_ptrs: list[int], sizes: list[int], config=None
     ) -> list[int]:
         self.batch_put_from_calls += 1
+        self.batch_put_from_configs.append(config)
         results: list[int] = []
         for key, ptr, size in zip(keys, buffer_ptrs, sizes):
             data = ctypes.string_at(ptr, size)
-            results.append(self.put(key, data))
+            results.append(self.put(key, data, config=config))
         return results
 
     def put_tensor_from(self, key: str, buffer_ptr: int, size: int) -> int:
@@ -1600,7 +1606,6 @@ def test_dataproto_helper_accepts_legacy_dict_inputs() -> None:
     assert envelope["non_tensor_batch"]["uid"].tolist() == ["a", "b", "c"]
     assert envelope["meta_info"] == {"step": 3}
 
-
 def _schema_test_data(field: str, values: np.ndarray) -> dict[str, object]:
     return {
         "batch": {"input_ids": np.arange(len(values))},
@@ -1803,6 +1808,126 @@ def test_dataproto_field_schema_encodes_ragged_tensor_dict() -> None:
     assert transfer.get_dataproto(all_null_ref, rows=[2, 0])["non_tensor_batch"][
         "multi_modal_inputs"
     ].tolist() == [None, None]
+
+
+def test_unified_put_get_roundtrips_flat_dict() -> None:
+    _store, transfer = make_transfer()
+    data = {
+        "input_ids": np.arange(6, dtype=np.int64).reshape(3, 2),
+        "tokens": [np.asarray([1, 2]), None, np.asarray([3])],
+        "uid": ["a", "b", "c"],
+        "tags": ["science", "math"],
+        "step": 7,
+    }
+
+    ref = transfer.put(data, type="dict")
+    result = transfer.get(ref, type="dict")
+
+    assert np.array_equal(result["input_ids"], data["input_ids"])
+    assert result["tokens"][1] is None
+    assert np.array_equal(result["tokens"][0], np.asarray([1, 2]))
+    assert np.array_equal(result["tokens"][2], np.asarray([3]))
+    assert result["uid"] == ["a", "b", "c"]
+    assert result["tags"] == ["science", "math"]
+    assert result["step"] == 7
+
+
+def test_unified_put_rejects_unknown_type() -> None:
+    _store, transfer = make_transfer()
+
+    with pytest.raises(ValueError, match="unsupported Mooncake payload type"):
+        transfer.put({}, type="unknown")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("policy", "config_attr"),
+    [
+        (BundleTransferPolicy(copy_mode="copy"), "put_configs"),
+        (None, "batch_put_from_configs"),
+    ],
+)
+def test_unified_dict_put_passes_store_config_to_writes(policy, config_attr) -> None:
+    store, transfer = make_transfer()
+    config = object()
+    data = {"input_ids": np.arange(12, dtype=np.int64).reshape(4, 3)}
+    kwargs = {"config": config}
+    if policy is not None:
+        kwargs["policy"] = policy
+
+    ref = transfer.put(data, type="dict", **kwargs)
+    result = transfer.get(ref, type="dict")
+
+    assert np.array_equal(result["input_ids"], data["input_ids"])
+    configs = getattr(store, config_attr)
+    assert configs
+    assert all(item is config for item in configs)
+
+
+def test_unified_dict_put_accepts_field_schemas() -> None:
+    def schema(codec: str, section: str, dtype: str | None = None) -> FieldSchema:
+        metadata = {"section": section}
+        if dtype is not None:
+            metadata["dtype"] = dtype
+        return FieldSchema(codec=codec, metadata=metadata)
+
+    _store, transfer = make_transfer()
+    values = np.empty(2, dtype=object)
+    values[:] = [np.asarray([1, 2], dtype=np.int32), None]
+
+    ref = transfer.put(
+        {
+            "input_ids": np.arange(2),
+            "tokens": values,
+            "partition": [0, 1],
+            "response_lengths": [2, 0],
+            "global_batch_sizes": [2],
+            "num_microbatches": 1,
+            "step": 7,
+        },
+        field_schemas={
+            "tokens": schema("typed_ragged", "non_tensor_batch", "int32"),
+            "partition": schema("ndarray", "non_tensor_batch", "int64"),
+            "response_lengths": schema("ndarray", "non_tensor_batch", "int64"),
+            "global_batch_sizes": schema("auto", "meta_info"),
+            "num_microbatches": schema("auto", "meta_info"),
+        },
+        type="dict",
+    )
+
+    result = transfer.get(ref, type="dict")
+
+    assert np.array_equal(result["input_ids"], np.arange(2))
+    assert result["tokens"] == [[1, 2], None]
+    assert result["partition"] == [0, 1]
+    assert result["response_lengths"] == [2, 0]
+    assert result["global_batch_sizes"] == [2]
+    assert result["num_microbatches"] == 1
+    assert result["step"] == 7
+
+
+def test_ref_aliases_match_dataproto_ref_helpers() -> None:
+    assert export_ref is export_dataproto_ref
+    assert import_ref is import_dataproto_ref
+
+
+def test_release_result_is_available_for_split_api_compatibility() -> None:
+    result = {"tokens": [np.asarray([1, 2]), None]}
+
+    assert MooncakeBundleTransfer.release_result(result) is None
+    assert result["tokens"][0].tolist() == [1, 2]
+
+
+def test_unified_dict_get_rejects_flattened_key_collision() -> None:
+    _store, transfer = make_transfer()
+    ref = transfer.put_dataproto(
+        {
+            "batch": {"uid": np.arange(3)},
+            "meta_info": {"uid": "meta-value"},
+        }
+    )
+
+    with pytest.raises(ValueError, match="Duplicate keys"):
+        transfer.get(ref, type="dict")
 
 
 def test_dataproto_helper_treats_reserved_plain_dict_keys_as_batch_fields() -> None:
