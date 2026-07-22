@@ -79,16 +79,15 @@ bool synchronizeCallerStream(const char* transport_name) {
     cudaEvent_t sync_event = nullptr;
     auto err = cudaEventCreateWithFlags(&sync_event, cudaEventDisableTiming);
     if (err != cudaSuccess) {
-        LOG(ERROR) << transport_name
-                   << ": cudaEventCreateWithFlags failed: "
+        LOG(ERROR) << transport_name << ": cudaEventCreateWithFlags failed: "
                    << cudaGetErrorString(err);
         return false;
     }
 
     err = cudaEventRecord(sync_event, cudaStreamPerThread);
     if (err != cudaSuccess) {
-        LOG(ERROR) << transport_name << ": cudaEventRecord failed: "
-                   << cudaGetErrorString(err);
+        LOG(ERROR) << transport_name
+                   << ": cudaEventRecord failed: " << cudaGetErrorString(err);
         cudaEventDestroy(sync_event);
         return false;
     }
@@ -311,8 +310,7 @@ void NVLinkTransport::startTransfer(std::vector<NVLinkTask*>& tasks,
                    << ", size=" << sizes[fail_idx]
                    << "): " << cudaGetErrorString(err);
         markTasksFailedFrom(tasks, fail_idx);
-    } else if (err != cudaSuccess &&
-               err != cudaErrorCallRequiresNewerDriver) {
+    } else if (err != cudaSuccess && err != cudaErrorCallRequiresNewerDriver) {
         LOG(ERROR) << "NVLinkTransport::startTransfer internal error: "
                    << "cudaMemcpyBatchAsync failed without a valid fail index: "
                    << cudaGetErrorString(err);

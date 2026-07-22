@@ -321,8 +321,8 @@ int RdmaContext::construct(const std::string& device_name,
     if (params_->device.num_cq_list <= 0 ||
         params_->device.num_comp_channels <= 0) {
         LOG(ERROR) << "Invalid RDMA completion configuration for device "
-                   << device_name_ << ": num_cq_list="
-                   << params_->device.num_cq_list
+                   << device_name_
+                   << ": num_cq_list=" << params_->device.num_cq_list
                    << ", num_comp_channels="
                    << params_->device.num_comp_channels;
         return -1;

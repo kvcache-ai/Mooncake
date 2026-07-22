@@ -117,10 +117,9 @@ static inline void warnDisabledParallelRegMr() {
     std::transform(lower_val.begin(), lower_val.end(), lower_val.begin(),
                    [](unsigned char c) { return std::tolower(c); });
     if (lower_val == "0" || lower_val == "false" || lower_val == "off") {
-        LOG(WARNING)
-            << "MC_ENABLE_PARALLEL_REG_MR=OFF is ignored by TENT "
-               "compatibility mode; TENT enables parallel RDMA memory "
-               "registration by default";
+        LOG(WARNING) << "MC_ENABLE_PARALLEL_REG_MR=OFF is ignored by TENT "
+                        "compatibility mode; TENT enables parallel RDMA memory "
+                        "registration by default";
     }
 }
 

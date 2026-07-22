@@ -108,16 +108,15 @@ static bool synchronizeCallerStream(const char *transport_name) {
     cudaEvent_t sync_event = nullptr;
     auto err = cudaEventCreateWithFlags(&sync_event, cudaEventDisableTiming);
     if (err != cudaSuccess) {
-        LOG(ERROR) << transport_name
-                   << ": cudaEventCreateWithFlags failed: "
+        LOG(ERROR) << transport_name << ": cudaEventCreateWithFlags failed: "
                    << cudaGetErrorString(err);
         return false;
     }
 
     err = cudaEventRecord(sync_event, cudaStreamPerThread);
     if (err != cudaSuccess) {
-        LOG(ERROR) << transport_name << ": cudaEventRecord failed: "
-                   << cudaGetErrorString(err);
+        LOG(ERROR) << transport_name
+                   << ": cudaEventRecord failed: " << cudaGetErrorString(err);
         cudaEventDestroy(sync_event);
         return false;
     }

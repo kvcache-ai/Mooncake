@@ -329,7 +329,8 @@ TEST(TransferEngineConfigOverrideTest,
               "FIFO");
 }
 
-TEST(TransferEngineConfigOverrideTest, LegacyFragmentRatioEnvLoadsFragmentLimit) {
+TEST(TransferEngineConfigOverrideTest,
+     LegacyFragmentRatioEnvLoadsFragmentLimit) {
     EnvVarGuard slice_guard("MC_SLICE_SIZE", "1024");
     EnvVarGuard fragment_guard("MC_FRAGMENT_RATIO", "4");
 
