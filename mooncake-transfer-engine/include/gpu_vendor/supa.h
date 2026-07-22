@@ -131,9 +131,6 @@ const static std::string GPU_PREFIX = "supa:";
 #define cuMemExportToShareableHandle     suMemExportToShareableHandle
 #define cuMemImportFromShareableHandle   suMemImportFromShareableHandle
 #define cuMemGetAllocationGranularity    suMemGetAllocationGranularity
-// Driver-level ctx/ordinal aliases (gap per decisions.md §3 — SU* exposed in
-// $BIREN_HOME/supa/include/supa_driver.h: suDevicePrimaryCtxRetain/Release,
-// suCtxSetCurrent, SU_POINTER_ATTRIBUTE_DEVICE_ORDINAL, hence branch A).
 #define cuDevicePrimaryCtxRetain         suDevicePrimaryCtxRetain
 #define cuDevicePrimaryCtxRelease        suDevicePrimaryCtxRelease
 #define cuCtxSetCurrent                  suCtxSetCurrent
