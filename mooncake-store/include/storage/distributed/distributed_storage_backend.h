@@ -3,6 +3,7 @@
 #include <memory>
 
 #include "fs_adapter.h"
+#include "storage/adapter/object_storage_adapter.h"
 #include "storage_backend.h"
 
 namespace mooncake {
@@ -18,10 +19,11 @@ struct DistributedStorageConfig {
 };
 
 /**
- * @brief Distributed filesystem storage backend.
+ * @brief Distributed filesystem and object storage backend.
  *
- * Implements StorageBackendInterface, delegating I/O to a FileSystemAdapter.
- * Does not handle eviction (DFS manages its own space).
+ * Implements StorageBackendInterface using either a FileSystemAdapter for
+ * per-object files or an ObjectStorageAdapter for object storage services.
+ * Does not handle eviction.
  */
 class DistributedStorageBackend : public StorageBackendInterface {
    public:
@@ -29,6 +31,14 @@ class DistributedStorageBackend : public StorageBackendInterface {
         const FileStorageConfig& file_storage_config,
         const DistributedStorageConfig& distributed_config,
         std::unique_ptr<FileSystemAdapter> fs_adapter);
+
+    // At least one adapter must be non-null. When object_storage_adapter is
+    // provided, the backend uses object storage mode.
+    DistributedStorageBackend(
+        const FileStorageConfig& file_storage_config,
+        const DistributedStorageConfig& distributed_config,
+        std::unique_ptr<FileSystemAdapter> fs_adapter,
+        std::unique_ptr<ObjectStorageAdapter> object_storage_adapter);
 
     tl::expected<void, ErrorCode> Init() override;
 
@@ -57,9 +67,11 @@ class DistributedStorageBackend : public StorageBackendInterface {
     static std::string UnescapeFilename(const std::string& name);
 
     std::unique_ptr<FileSystemAdapter> fs_adapter_;
+    std::unique_ptr<ObjectStorageAdapter> object_storage_adapter_;
     DistributedStorageConfig distributed_config_;
     std::string root_dir_;
     int hash_bucket_count_;
+    bool use_object_storage_ = false;
     bool initialized_ = false;
 };
 

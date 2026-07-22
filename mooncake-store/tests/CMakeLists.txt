@@ -116,6 +116,7 @@ add_store_test(master_service_test_for_snapshot
                ha/snapshot/master_service_test_for_snapshot.cpp)
 add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)
 add_store_test(storage_backend_test storage_backend_test.cpp)
+add_store_test(object_storage_adapter_test object_storage_adapter_test.cpp)
 add_store_test(mutex_test mutex_test.cpp)
 add_store_test(file_storage_test file_storage_test.cpp)
 add_store_test(task_manager_test task_manager_test.cpp)
