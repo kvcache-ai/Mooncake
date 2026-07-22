@@ -11,6 +11,7 @@ wqs = "wqs"
 hsa = "hsa"
 Optin = "Optin"
 HPE = "HPE"
+thw = "thw"
 
 [files]
 extend-exclude = [

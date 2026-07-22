@@ -1,6 +1,6 @@
-# DataProto structured object usage
+# DataProto and flat dict structured object usage
 
-Mooncake can store DataProto-like objects as structured objects so callers can pass a lightweight handle between stages and materialize only the fields they need.
+Mooncake can store DataProto-like objects and flat dictionaries as structured objects so callers can pass a lightweight handle between stages and materialize only the fields they need.
 
 A DataProto-like object is any object with these mapping-like attributes:
 
@@ -8,7 +8,7 @@ A DataProto-like object is any object with these mapping-like attributes:
 - `non_tensor_batch`: per-row non-tensor fields.
 - `meta_info`: small metadata for the whole batch.
 
-Plain dictionaries are also accepted. A dictionary with only `batch`, `non_tensor_batch`, and `meta_info` keys is treated as an envelope; other dictionaries are treated as `batch` fields.
+Plain dictionaries are also accepted on the DataProto path. A dictionary with only `batch`, `non_tensor_batch`, and `meta_info` keys is treated as an envelope; other dictionaries are treated as `batch` fields. Use `type="dict"` for the flat dictionary path when the input is an ordinary dictionary and should be routed into `batch`, `non_tensor_batch`, and `meta_info` by Mooncake.
 
 ## Public API
 
@@ -23,23 +23,22 @@ from mooncake.structured_object_store import (
 
 transfer = MooncakeBundleTransfer(store, key_prefix="rl")
 
-ref = transfer.put_dataproto(
-    data,
-    namespace="rollout",
-    partition="step-1",
-    stage="rollout",
-)
+ref = transfer.put(data, type="dataproto")
+subset = transfer.get(ref, type="dataproto", fields=["input_ids", "old_log_probs"])
+
+dict_ref = transfer.put(payload_dict, type="dict")
+dict_result = transfer.get(dict_ref, type="dict")
+
+# Compatibility helpers remain available for callers that prefer typed names.
+ref = transfer.put_dataproto(data)
+subset = transfer.get_dataproto(ref, fields=["input_ids", "old_log_probs"])
+dict_ref = transfer.put_dict(payload_dict)
+dict_result = transfer.get_dict(dict_ref)
 
 ref = transfer.append_dataproto_fields(
     ref,
     logprob_data,
     stage="old_log_prob",
-)
-
-subset = transfer.get_dataproto(
-    ref,
-    fields=["input_ids", "old_log_probs"],
-    meta_info_keys=["step"],
 )
 
 handle = export_dataproto_ref(ref)
@@ -61,11 +60,26 @@ For process boundaries, use `export_dataproto_ref(ref)`. The exported handle is 
 
 ## Writing fields
 
-`put_dataproto()` writes one structured object for the requested stage. `append_dataproto_fields()` writes another structured object and updates the handle. Existing fields are not rewritten.
+`put(..., type="dataproto")` writes one structured object for the requested stage. `append_dataproto_fields()` writes another structured object and updates the handle. Existing fields are not rewritten.
+
+`put(..., type="dict")` writes a flat dictionary through the same structured object path. Numeric tensor-like values are stored as `batch` fields, row-aligned non-tensor sequences are stored as `non_tensor_batch`, and scalar or global metadata stays in `meta_info`. Pass `field_schemas` when list-valued metadata would otherwise be ambiguous.
+
+`put_dataproto()` / `get_dataproto()` and `put_dict()` / `get_dict()` are thin compatibility helpers over the unified `put()` / `get()` API. Older `put_legacy_dict()` / `get_legacy_dict()` names are kept as aliases.
 
 Duplicate field names are rejected by default. Use `overwrite=True` only when replacing all fields from an existing stage; after the new stage object is written successfully, the old stage object is removed.
 
 Field names are global within a ref. A `batch` field and a `non_tensor_batch` field cannot use the same name.
+
+Store write configuration is passed through with `config`. Mooncake does not interpret this object in the structured layer; it forwards it to the lower-level write APIs such as `put`, `put_from`, and `batch_put_from`. For example, callers can use the same `ReplicateConfig` object they would pass to the lower-level store APIs:
+
+```python
+from mooncake.store import ReplicateConfig
+
+config = ReplicateConfig()
+config.replica_num = 2
+
+ref = transfer.put(data, type="dict", config=config)
+```
 
 ## Reading fields
 
@@ -162,6 +176,8 @@ transfer.put_structured_object(payload, policy=policy)
 ```
 
 `copy_mode="zero_copy"` requires tensor payloads to be provided as `tensor_object_buffer`; plain torch tensors are rejected because they do not expose a registered tensor-object buffer.
+
+`policy` controls how structured payload buffers are copied or transferred. `config` is separate: it is forwarded to the underlying Mooncake Store write calls and can carry store-level placement or replication options.
 
 ## Cleanup
 
