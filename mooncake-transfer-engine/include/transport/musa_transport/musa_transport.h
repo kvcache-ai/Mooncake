@@ -66,9 +66,10 @@ class MusaTransport : public Transport {
     const char* getName() const override { return "musa"; }
 
    private:
-    void rememberStreamDevices(
-        const std::vector<std::pair<cudaStream_t, int>>& streams);
-    int streamDevice(cudaStream_t stream, const void* destination);
+    void rememberSliceDevices(
+        const std::vector<std::pair<Slice*, int>>& slices);
+    int sliceDevice(const Slice* slice, const void* destination);
+    void forgetSliceDevice(const Slice* slice);
 
     std::atomic_bool running_;
 
@@ -83,8 +84,8 @@ class MusaTransport : public Transport {
     RWSpinlock remap_lock_;
 
     std::mutex register_mutex_;
-    std::mutex stream_device_mutex_;
-    std::unordered_map<cudaStream_t, int> stream_devices_;
+    std::mutex slice_device_mutex_;
+    std::unordered_map<const Slice*, int> slice_devices_;
 };
 
 }  // namespace mooncake

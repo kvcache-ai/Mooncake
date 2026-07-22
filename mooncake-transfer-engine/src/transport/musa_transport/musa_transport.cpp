@@ -16,7 +16,6 @@
 
 #include <glog/logging.h>
 
-#include <cassert>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -151,12 +150,6 @@ class PerDeviceEventPool {
 
 static thread_local PerDeviceEventPool tl_device_event_pool;
 
-static cudaEvent_t getCallerSyncEvent() {
-    int current_device = 0;
-    cudaGetDevice(&current_device);
-    return tl_device_event_pool.getOrCreate(current_device);
-}
-
 // cudaMemcpyAsync is issued against the current device context on MUSA.  Keep
 // the caller's device intact while submitting work to a per-device stream.
 class ScopedCudaDevice {
@@ -195,6 +188,56 @@ static int getDeviceForPointer(const void *ptr) {
         return -1;
     }
     return (attr.type == cudaMemoryTypeDevice) ? attr.device : -1;
+}
+
+static Status synchronizeCallerBuffers(
+    const std::vector<const void *> &local_buffers) {
+    if (local_buffers.empty()) return Status::OK();
+
+    int current_device = -1;
+    cudaError_t err = cudaGetDevice(&current_device);
+    if (err != cudaSuccess) {
+        return Status::Context("cudaGetDevice failed: " +
+                               std::string(cudaGetErrorString(err)));
+    }
+
+    std::map<int, bool> devices;
+    for (const void *buffer : local_buffers) {
+        int device = getDeviceForPointer(buffer);
+        devices[device >= 0 ? device : current_device] = true;
+    }
+
+    for (const auto &[device, unused] : devices) {
+        (void)unused;
+        ScopedCudaDevice guard(device);
+        if (!guard.ok()) {
+            return Status::Context("failed to select caller buffer device " +
+                                   std::to_string(device));
+        }
+        cudaEvent_t sync_event = tl_device_event_pool.getOrCreate(device);
+        if (!sync_event) {
+            return Status::Context(
+                "failed to create caller sync event on "
+                "device " +
+                std::to_string(device));
+        }
+        err = cudaEventRecord(sync_event, cudaStreamPerThread);
+        if (err != cudaSuccess) {
+            LOG(ERROR) << "MusaTransport: cudaEventRecord failed on device "
+                       << device << ": " << cudaGetErrorString(err);
+            return Status::Context("cudaEventRecord failed: " +
+                                   std::string(cudaGetErrorString(err)));
+        }
+        err = cudaEventSynchronize(sync_event);
+        if (err != cudaSuccess) {
+            LOG(ERROR) << "MusaTransport: cudaEventSynchronize failed on "
+                          "device "
+                       << device << ": " << cudaGetErrorString(err);
+            return Status::Context("cudaEventSynchronize failed: " +
+                                   std::string(cudaGetErrorString(err)));
+        }
+    }
+    return Status::OK();
 }
 
 static int deviceFromLocation(const std::string &location) {
@@ -246,7 +289,13 @@ static bool openOnMetadataDevice() {
 static bool localVisibilityMappingIsConsistent() {
     const char *musa_visible = std::getenv("MUSA_VISIBLE_DEVICES");
     const char *mthreads_visible = std::getenv("MTHREADS_VISIBLE_DEVICES");
-    if (!musa_visible || !mthreads_visible) return true;
+    if (!musa_visible && !mthreads_visible) return true;
+    if (!musa_visible || !mthreads_visible) {
+        LOG(ERROR) << "MusaTransport: metadata-device IPC requires both "
+                      "MUSA_VISIBLE_DEVICES and MTHREADS_VISIBLE_DEVICES to be "
+                      "set, or both to be unset";
+        return false;
+    }
     if (std::string(musa_visible) == std::string(mthreads_visible)) return true;
     LOG(ERROR) << "MusaTransport: MUSA_VISIBLE_DEVICES=" << musa_visible
                << " differs from MTHREADS_VISIBLE_DEVICES=" << mthreads_visible
@@ -515,9 +564,8 @@ struct CopyGroup {
 static bool submitBatchMemcpyByDevice(
     const std::vector<Slice *> &slices, const std::vector<void *> &srcs,
     const std::vector<void *> &dsts, const std::vector<size_t> &sizes,
-    std::vector<std::pair<cudaStream_t, int>> &stream_devices,
-    std::string &error) {
-    stream_devices.clear();
+    std::vector<std::pair<Slice *, int>> &slice_devices, std::string &error) {
+    slice_devices.clear();
     if (slices.empty()) return true;
     if (srcs.size() != slices.size() || dsts.size() != slices.size() ||
         sizes.size() != slices.size()) {
@@ -597,7 +645,8 @@ static bool submitBatchMemcpyByDevice(
             fail_pending(slices);
             return false;
         }
-        stream_devices.emplace_back(stream, first_device);
+        for (Slice *slice : slices)
+            slice_devices.emplace_back(slice, first_device);
         return true;
     }
 
@@ -627,27 +676,36 @@ static bool submitBatchMemcpyByDevice(
             return false;
         }
     }
-    for (const auto &[device, group] : groups)
-        stream_devices.emplace_back(group.stream, device);
+    for (const auto &[device, group] : groups) {
+        for (Slice *slice : group.slices)
+            slice_devices.emplace_back(slice, device);
+    }
     return true;
 }
 
 MusaTransport::MusaTransport() = default;
 
-void MusaTransport::rememberStreamDevices(
-    const std::vector<std::pair<cudaStream_t, int>> &streams) {
-    std::lock_guard<std::mutex> lock(stream_device_mutex_);
-    for (const auto &[stream, device] : streams)
-        stream_devices_[stream] = device;
+void MusaTransport::rememberSliceDevices(
+    const std::vector<std::pair<Slice *, int>> &slices) {
+    std::lock_guard<std::mutex> lock(slice_device_mutex_);
+    for (const auto &[slice, device] : slices) {
+        if (slice && slice->status == Slice::POSTED)
+            slice_devices_[slice] = device;
+    }
 }
 
-int MusaTransport::streamDevice(cudaStream_t stream, const void *destination) {
+int MusaTransport::sliceDevice(const Slice *slice, const void *destination) {
     {
-        std::lock_guard<std::mutex> lock(stream_device_mutex_);
-        auto it = stream_devices_.find(stream);
-        if (it != stream_devices_.end()) return it->second;
+        std::lock_guard<std::mutex> lock(slice_device_mutex_);
+        auto it = slice_devices_.find(slice);
+        if (it != slice_devices_.end()) return it->second;
     }
     return selectStreamDevice(destination);
+}
+
+void MusaTransport::forgetSliceDevice(const Slice *slice) {
+    std::lock_guard<std::mutex> lock(slice_device_mutex_);
+    slice_devices_.erase(slice);
 }
 
 MusaTransport::~MusaTransport() {
@@ -699,44 +757,44 @@ Status MusaTransport::submitTransfer(
             std::to_string(batch_id));
     }
 
-    size_t task_id = batch_desc.task_list.size();
-    batch_desc.task_list.resize(task_id + entries.size());
+    if (entries.empty()) return Status::OK();
 
-    // Synchronize with the caller's GPU work (e.g., PyTorch gather operations)
-    // that produced the source data. We use cudaEventSynchronize (CPU-blocking)
-    // instead of cudaStreamWaitEvent to avoid expensive cross-device event
-    // operations on non-NVIDIA GPUs. The CPU blocking is acceptable because
-    // the transfer depends on the caller's work anyway — they cannot overlap.
-    cudaEvent_t sync_event = getCallerSyncEvent();
-    cudaError_t sync_err = cudaEventRecord(sync_event, cudaStreamPerThread);
-    if (sync_err != cudaSuccess) {
-        LOG(ERROR) << "MusaTransport: cudaEventRecord failed: "
-                   << cudaGetErrorString(sync_err);
-        return Status::Context("cudaEventRecord failed: " +
-                               std::string(cudaGetErrorString(sync_err)));
-    }
-    sync_err = cudaEventSynchronize(sync_event);
-    if (sync_err != cudaSuccess) {
-        LOG(ERROR) << "MusaTransport: cudaEventSynchronize failed: "
-                   << cudaGetErrorString(sync_err);
-        return Status::Context("cudaEventSynchronize failed: " +
-                               std::string(cudaGetErrorString(sync_err)));
-    }
+    // Complete every fallible preflight before extending task_list. This keeps
+    // failed submissions releasable and avoids zero-slice tasks being reported
+    // as completed.
+    std::vector<const void *> local_buffers;
+    local_buffers.reserve(entries.size());
+    for (const auto &request : entries) local_buffers.push_back(request.source);
+    Status sync_status = synchronizeCallerBuffers(local_buffers);
+    if (!sync_status.ok()) return sync_status;
 
-    // Phase 1: Prepare slices and collect memcpy parameters
-    std::vector<void *> dsts, srcs;
-    std::vector<size_t> sizes;
-    std::vector<Slice *> slices;
-
-    for (auto &request : entries) {
-        TransferTask &task = batch_desc.task_list[task_id];
-        ++task_id;
+    std::vector<uint64_t> dest_addrs;
+    dest_addrs.reserve(entries.size());
+    for (const auto &request : entries) {
         uint64_t dest_addr = request.target_offset;
         if (request.target_id != LOCAL_SEGMENT_ID) {
             int rc = relocateSharedMemoryAddress(dest_addr, request.length,
                                                  request.target_id);
             if (rc) return Status::Memory("device memory not registered");
         }
+        dest_addrs.push_back(dest_addr);
+    }
+
+    size_t task_id = batch_desc.task_list.size();
+    batch_desc.task_list.resize(task_id + entries.size());
+
+    // Phase 1: Prepare slices and collect memcpy parameters
+    std::vector<void *> dsts, srcs;
+    std::vector<size_t> sizes;
+    std::vector<Slice *> slices;
+
+    for (size_t index = 0; index < entries.size(); ++index) {
+        const auto &request = entries[index];
+        TransferTask &task = batch_desc.task_list[task_id];
+        ++task_id;
+        uint64_t dest_addr = dest_addrs[index];
+        task.batch_id = batch_id;
+        task.transport_ = this;
         task.total_bytes = request.length;
         Slice *slice = getSliceCache().allocate();
         slice->source_addr = (char *)request.source;
@@ -764,13 +822,13 @@ Status MusaTransport::submitTransfer(
 
     // Phase 2: Let the backend choose the submission device after IPC address
     // relocation, grouping a mixed-target batch by the selected device.
-    std::vector<std::pair<cudaStream_t, int>> stream_devices;
+    std::vector<std::pair<Slice *, int>> slice_devices;
     std::string submit_error;
-    if (!submitBatchMemcpyByDevice(slices, srcs, dsts, sizes, stream_devices,
+    if (!submitBatchMemcpyByDevice(slices, srcs, dsts, sizes, slice_devices,
                                    submit_error)) {
         return Status::Context(submit_error);
     }
-    rememberStreamDevices(stream_devices);
+    rememberSliceDevices(slice_devices);
 
     return Status::OK();
 }
@@ -795,7 +853,7 @@ Status MusaTransport::getTransferStatus(BatchID batch_id, size_t task_id,
                 slice->opcode == TransferRequest::READ
                     ? slice->source_addr
                     : static_cast<void *>(slice->local.dest_addr);
-            const int stream_device = streamDevice(stream, destination);
+            const int stream_device = sliceDevice(slice, destination);
             auto &device_cache = stream_status_cache[stream_device];
             auto it = device_cache.find(stream);
             cudaError_t cuda_err;
@@ -803,6 +861,7 @@ Status MusaTransport::getTransferStatus(BatchID batch_id, size_t task_id,
                 ScopedCudaDevice guard(stream_device);
                 if (!guard.ok()) {
                     slice->markFailed();
+                    forgetSliceDevice(slice);
                     continue;
                 }
                 cuda_err = cudaStreamQuery(stream);
@@ -812,8 +871,10 @@ Status MusaTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             }
             if (cuda_err == cudaSuccess) {
                 slice->markSuccess();
+                forgetSliceDevice(slice);
             } else if (cuda_err != cudaErrorNotReady) {
                 slice->markFailed();
+                forgetSliceDevice(slice);
             }
         }
     }
@@ -835,22 +896,27 @@ Status MusaTransport::getTransferStatus(BatchID batch_id, size_t task_id,
 
 Status MusaTransport::submitTransferTask(
     const std::vector<TransferTask *> &task_list) {
-    // Synchronize with caller's GPU work via cudaEventSynchronize.
-    cudaEvent_t sync_event = getCallerSyncEvent();
-    cudaError_t sync_err = cudaEventRecord(sync_event, cudaStreamPerThread);
-    if (sync_err != cudaSuccess) {
-        LOG(ERROR) << "MusaTransport: cudaEventRecord failed: "
-                   << cudaGetErrorString(sync_err);
-        return Status::Context("cudaEventRecord failed: " +
-                               std::string(cudaGetErrorString(sync_err)));
+    if (task_list.empty()) return Status::OK();
+
+    std::vector<const void *> local_buffers;
+    std::vector<uint64_t> dest_addrs;
+    local_buffers.reserve(task_list.size());
+    dest_addrs.reserve(task_list.size());
+    for (TransferTask *task : task_list) {
+        if (!task || !task->request)
+            return Status::InvalidArgument("invalid MUSA transfer task");
+        const auto &request = *task->request;
+        local_buffers.push_back(request.source);
+        uint64_t dest_addr = request.target_offset;
+        if (request.target_id != LOCAL_SEGMENT_ID) {
+            int rc = relocateSharedMemoryAddress(dest_addr, request.length,
+                                                 request.target_id);
+            if (rc) return Status::Memory("device memory not registered");
+        }
+        dest_addrs.push_back(dest_addr);
     }
-    sync_err = cudaEventSynchronize(sync_event);
-    if (sync_err != cudaSuccess) {
-        LOG(ERROR) << "MusaTransport: cudaEventSynchronize failed: "
-                   << cudaGetErrorString(sync_err);
-        return Status::Context("cudaEventSynchronize failed: " +
-                               std::string(cudaGetErrorString(sync_err)));
-    }
+    Status sync_status = synchronizeCallerBuffers(local_buffers);
+    if (!sync_status.ok()) return sync_status;
 
     // Phase 1: Prepare slices and collect memcpy parameters
     std::vector<void *> dsts, srcs;
@@ -858,16 +924,9 @@ Status MusaTransport::submitTransferTask(
     std::vector<Slice *> slices;
 
     for (size_t index = 0; index < task_list.size(); ++index) {
-        assert(task_list[index]);
         auto &task = *task_list[index];
-        assert(task.request);
         auto &request = *task.request;
-        uint64_t dest_addr = request.target_offset;
-        if (request.target_id != LOCAL_SEGMENT_ID) {
-            int rc = relocateSharedMemoryAddress(dest_addr, request.length,
-                                                 request.target_id);
-            if (rc) return Status::Memory("device memory not registered");
-        }
+        uint64_t dest_addr = dest_addrs[index];
         task.total_bytes = request.length;
         Slice *slice = getSliceCache().allocate();
         slice->source_addr = (char *)request.source;
@@ -894,13 +953,13 @@ Status MusaTransport::submitTransferTask(
     }
 
     // Phase 2: See submitTransfer() for backend-specific stream grouping.
-    std::vector<std::pair<cudaStream_t, int>> stream_devices;
+    std::vector<std::pair<Slice *, int>> slice_devices;
     std::string submit_error;
-    if (!submitBatchMemcpyByDevice(slices, srcs, dsts, sizes, stream_devices,
+    if (!submitBatchMemcpyByDevice(slices, srcs, dsts, sizes, slice_devices,
                                    submit_error)) {
         return Status::Context(submit_error);
     }
-    rememberStreamDevices(stream_devices);
+    rememberSliceDevices(slice_devices);
 
     return Status::OK();
 }
@@ -933,7 +992,6 @@ int MusaTransport::registerLocalMemory(void *addr, size_t length,
     }
 
     (void)remote_accessible;
-    (void)update_metadata;
     BufferDesc desc;
     desc.addr = (uint64_t)addr;
     desc.length = length;
@@ -942,7 +1000,7 @@ int MusaTransport::registerLocalMemory(void *addr, size_t length,
 #ifdef ENABLE_MULTI_PROTOCOL
     desc.protocol = "musa";
 #endif
-    return metadata_->addLocalMemoryBuffer(desc, true);
+    return metadata_->addLocalMemoryBuffer(desc, update_metadata);
 }
 
 int MusaTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
