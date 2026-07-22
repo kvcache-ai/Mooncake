@@ -567,6 +567,18 @@ RealClient::RealClient() {
     mooncake::init_ylt_log_level();
     const char *hp = std::getenv("MC_STORE_USE_HUGEPAGE");
     use_hugepage_ = (hp != nullptr);
+
+    // GDS worker pool size.  Default: min(4, hardware_concurrency),
+    // clamped to >= 1 (hardware_concurrency may return 0).
+    const char *nw = std::getenv("MOONCAKE_GDS_NUM_WORKERS");
+    if (nw != nullptr && std::atoi(nw) > 0) {
+        gds_num_workers_ = std::atoi(nw);
+    } else {
+        unsigned hc = std::thread::hardware_concurrency();
+        gds_num_workers_ = static_cast<int>(std::min(4u, hc));
+        if (gds_num_workers_ < 1) gds_num_workers_ = 1;
+    }
+    LOG(INFO) << "GDS worker pool size: " << gds_num_workers_;
 }
 
 RealClient::~RealClient() {
@@ -585,35 +597,52 @@ RealClient::~RealClient() {
 void RealClient::SubmitGdsTask(std::function<void()> task) {
     {
         std::lock_guard<std::mutex> lock(gds_worker_mutex_);
+        // Reject submissions after stop: no worker will ever consume the
+        // task, and the caller would otherwise sit out the full 120s
+        // future timeout.  Dropping the task destroys the captured
+        // promise, which makes the caller's future ready immediately
+        // with std::future_error (broken promise) -- a fast-fail
+        // surfaced in the caller's catch block.
+        if (gds_worker_stop_) {
+            LOG(WARNING) << "GDS worker pool stopped, rejecting task "
+                            "(caller fails fast via broken promise)";
+            return;
+        }
         if (!gds_worker_started_) {
-            gds_worker_stop_ = false;
-            gds_worker_thread_ = std::thread([this]() {
+            for (int i = 0; i < gds_num_workers_; ++i) {
+                gds_worker_threads_.emplace_back([this]() {
 #ifdef USE_CUDA
-                // CUDA context is thread-local.  A fresh std::thread has no
-                // context, so cudaPointerGetAttributes() (called by
-                // FindDeviceForPointer inside WriteRecord/ReadRecord) would
-                // fail to recognise GPU pointers and silently fall back to
-                // CPU pwrite.  cudaFree(nullptr) is a guaranteed no-op that
-                // triggers lazy primary-context initialisation — done once
-                // here for the whole lifetime of the worker thread.
-                cudaFree(nullptr);
+                    // CUDA context is thread-local.  A fresh std::thread
+                    // has no context, so cudaPointerGetAttributes()
+                    // (called by FindDeviceForPointer inside
+                    // WriteRecord/ReadRecord) would fail to recognise
+                    // GPU pointers and silently fall back to CPU pwrite.
+                    // cudaFree(nullptr) is a guaranteed no-op that
+                    // triggers lazy primary-context initialisation.
+                    // No cudaSetDevice here: WriteRecord switches
+                    // context per slice via FindDeviceForPointer +
+                    // SetContext (gds_context.cpp), so a fixed binding
+                    // is unnecessary.
+                    cudaFree(nullptr);
 #endif
-                std::unique_lock<std::mutex> lk(gds_worker_mutex_);
-                while (true) {
-                    gds_worker_cv_.wait(lk, [this]() {
-                        return gds_worker_stop_ || !gds_worker_queue_.empty();
-                    });
-                    if (gds_worker_queue_.empty()) {
-                        if (gds_worker_stop_) return;
-                        continue;
+                    std::unique_lock<std::mutex> lk(gds_worker_mutex_);
+                    while (true) {
+                        gds_worker_cv_.wait(lk, [this]() {
+                            return gds_worker_stop_ ||
+                                   !gds_worker_queue_.empty();
+                        });
+                        if (gds_worker_queue_.empty()) {
+                            if (gds_worker_stop_) return;
+                            continue;
+                        }
+                        auto work = std::move(gds_worker_queue_.front());
+                        gds_worker_queue_.pop_front();
+                        lk.unlock();
+                        work();
+                        lk.lock();
                     }
-                    auto work = std::move(gds_worker_queue_.front());
-                    gds_worker_queue_.pop_front();
-                    lk.unlock();
-                    work();
-                    lk.lock();
-                }
-            });
+                });
+            }
             gds_worker_started_ = true;
         }
         gds_worker_queue_.push_back(std::move(task));
@@ -627,8 +656,17 @@ void RealClient::StopGdsWorker() {
         if (!gds_worker_started_) return;
         gds_worker_stop_ = true;
     }
-    gds_worker_cv_.notify_one();
-    if (gds_worker_thread_.joinable()) gds_worker_thread_.join();
+    // notify_all is mandatory: with K workers, notify_one would wake a
+    // single worker and the remaining K-1 would sleep forever on an
+    // empty queue, hanging the joins below (process exit deadlock).
+    gds_worker_cv_.notify_all();
+    for (auto &t : gds_worker_threads_) {
+        if (t.joinable()) t.join();
+    }
+    gds_worker_threads_.clear();
+    // gds_worker_started_ intentionally stays true: the pool is not
+    // restartable, and SubmitGdsTask rejects late tasks via the
+    // gds_worker_stop_ check above.
 }
 
 std::shared_ptr<RealClient> RealClient::create() {

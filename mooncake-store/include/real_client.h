@@ -908,25 +908,28 @@ class RealClient : public PyClient {
     // Reserve/Complete RPCs. Set via MOONCAKE_GDS_STORE_SERVICE_ADDR.
     std::string store_service_addr_;
 
-    // ── GDS worker ──
-    // Persistent worker thread for GDS DMA tasks.  Replaces per-batch
-    // detached threads: the CUDA primary context is initialised once on
-    // this thread (instead of a cudaFree(nullptr) trick per batch), and
-    // the thread is joined on destruction so no DMA outlives the client.
-    // Tasks are executed FIFO on this single thread, which also matches
-    // the single-writer expectation of the offload path.
+    // ── GDS worker pool ──
+    // Persistent worker-thread pool for GDS DMA tasks.  Replaces
+    // per-batch detached threads: the CUDA primary context is
+    // initialised once per worker (instead of a cudaFree(nullptr)
+    // per batch), and all workers are joined on destruction so no DMA
+    // outlives the client.  Tasks are executed FIFO across the pool;
+    // the worker count is set by MOONCAKE_GDS_NUM_WORKERS (default:
+    // min(4, hardware_concurrency)).
     std::mutex gds_worker_mutex_;
     std::condition_variable gds_worker_cv_;
     std::deque<std::function<void()>> gds_worker_queue_;
-    std::thread gds_worker_thread_;
+    std::vector<std::thread> gds_worker_threads_;
     bool gds_worker_stop_ = false;
     bool gds_worker_started_ = false;
+    int gds_num_workers_ = 1;  // real value set in the constructor
 
-    // Enqueue a task on the persistent GDS worker (started lazily on
-    // first use).  Results are reported through promises captured by the
-    // task itself.
+    // Enqueue a task on the GDS worker pool (started lazily on first
+    // use).  Results are reported through promises captured by the task
+    // itself.  Tasks submitted after StopGdsWorker() are rejected (their
+    // promises break, so callers fail fast instead of hanging 120s).
     void SubmitGdsTask(std::function<void()> task);
-    // Signal the worker to drain and exit, then join it.  Called from
+    // Signal all workers to drain and exit, then join them.  Called from
     // the destructor before any member teardown.
     void StopGdsWorker();
 
