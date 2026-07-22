@@ -28,3 +28,4 @@ jobs:
             /review-pr
             REPO:${{ github.repository }} PR_NUMBER:${{ github.event.pull_request.number }}
             NO_AUTO_APPROVE: true
+            When submitting the review via mcp__qoder_github__submit_pending_pull_request_review, you MUST use event type "COMMENT" only. The available event types are "APPROVE", "REQUEST_CHANGES", and "COMMENT". DO NOT use "APPROVE" or "REQUEST_CHANGES". Human maintainers must approve pull requests.
