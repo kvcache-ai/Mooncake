@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <memory>
@@ -23,6 +24,7 @@
 #include <vector>
 
 #include "tent/common/status.h"
+#include "tent/common/types.h"
 #include "tent/metrics/config_loader.h"
 
 // Compile-time metrics enable/disable switch
@@ -74,23 +76,29 @@ class TentMetrics {
         return runtime_enabled_.load(std::memory_order_relaxed);
     }
 
-    // Record transfer operations
-    void recordReadCompleted(size_t bytes, double latency_seconds = 0.0);
-    void recordWriteCompleted(size_t bytes, double latency_seconds = 0.0);
-    void recordReadFailed();
-    void recordWriteFailed();
-    void recordTransportFailover();
+    // Record transfer operations. The TransportType argument labels the
+    // metric with the transport that handled (or attempted) the transfer,
+    // so Prometheus queries can break down traffic by transport.
+    void recordReadCompleted(TransportType tp, size_t bytes,
+                             double latency_seconds = 0.0);
+    void recordWriteCompleted(TransportType tp, size_t bytes,
+                              double latency_seconds = 0.0);
+    void recordReadFailed(TransportType tp);
+    void recordWriteFailed(TransportType tp);
+    // Failover counter is labeled with both the source and destination
+    // transport types so failover flows (e.g. rdma->tcp) are queryable.
+    void recordTransportFailover(TransportType from, TransportType to);
 
     // Record the deadline feasibility ratio (MLU) for a completed transfer
     // that carried a deadline. mlu = actual_transfer_seconds / window_seconds,
     // where window_seconds is (deadline - submit_time). mlu < 1 means the
     // transfer met its deadline; mlu >= 1 means it missed. Observability only.
-    void recordDeadlineMLU(double mlu);
+    void recordDeadlineMLU(TransportType tp, double mlu);
 
     // Record a transfer whose deadline was already in the past at submit time
     // (infeasible window). Recorded into a dedicated counter so it is
     // distinguishable from genuine MLU samples in the histogram above.
-    void recordDeadlineInfeasible();
+    void recordDeadlineInfeasible(TransportType tp);
 
     enum class Stage {
         QueueWait,
@@ -99,7 +107,7 @@ class TentMetrics {
     };
 
     // Causal chain: record per-stage latency breakdown (microseconds).
-    void recordStageLatency(Stage stage, double latency_us);
+    void recordStageLatency(Stage stage, TransportType tp, double latency_us);
 
     // Get metrics for HTTP server
     std::string getPrometheusMetrics();
@@ -154,32 +162,69 @@ class TentMetrics {
     std::mutex metric_report_mutex_;
     std::condition_variable metric_report_cv_;
 
-    // Counters - stored as pointers for unified management
-    std::vector<ylt::metric::counter_t*> counters_;
-    ylt::metric::counter_t read_bytes_total_{"tent_read_bytes_total",
-                                             "Total bytes read via TENT"};
-    ylt::metric::counter_t write_bytes_total_{"tent_write_bytes_total",
-                                              "Total bytes written via TENT"};
-    ylt::metric::counter_t read_requests_total_{"tent_read_requests_total",
-                                                "Total read requests via TENT"};
-    ylt::metric::counter_t write_requests_total_{
-        "tent_write_requests_total", "Total write requests via TENT"};
-    ylt::metric::counter_t read_failures_total_{"tent_read_failures_total",
-                                                "Total read failures via TENT"};
-    ylt::metric::counter_t write_failures_total_{
-        "tent_write_failures_total", "Total write failures via TENT"};
-    ylt::metric::counter_t failover_total_{
+    // Counters — stored as base pointers (metric_t*) so that counters with
+    // different label arities (N=1 for per-transport, N=2 for failover
+    // from→to) share one vector for Prometheus serialize(). The concrete
+    // typed members below are used directly for JSON/summary aggregation
+    // (which need to iterate label values via copy()).
+    std::vector<ylt::metric::metric_t*> counters_;
+
+    // Label name arrays for dynamic metric construction.
+    static inline const std::array<std::string, 1> kTransportLabel{"transport"};
+    static inline const std::array<std::string, 2> kFailoverLabels{"from",
+                                                                   "to"};
+
+    // Per-transport counters (label: transport). Values are int64_t.
+    ylt::metric::basic_dynamic_counter<int64_t, 1> read_bytes_total_{
+        "tent_read_bytes_total", "Total bytes read via TENT", kTransportLabel};
+    ylt::metric::basic_dynamic_counter<int64_t, 1> write_bytes_total_{
+        "tent_write_bytes_total", "Total bytes written via TENT",
+        kTransportLabel};
+    ylt::metric::basic_dynamic_counter<int64_t, 1> read_requests_total_{
+        "tent_read_requests_total", "Total read requests via TENT",
+        kTransportLabel};
+    ylt::metric::basic_dynamic_counter<int64_t, 1> write_requests_total_{
+        "tent_write_requests_total", "Total write requests via TENT",
+        kTransportLabel};
+    ylt::metric::basic_dynamic_counter<int64_t, 1> read_failures_total_{
+        "tent_read_failures_total", "Total read failures via TENT",
+        kTransportLabel};
+    ylt::metric::basic_dynamic_counter<int64_t, 1> write_failures_total_{
+        "tent_write_failures_total", "Total write failures via TENT",
+        kTransportLabel};
+    // Failover counter has two labels (from, to) so failover flows are
+    // queryable as e.g. tent_transport_failover_total{from="rdma",to="tcp"}.
+    ylt::metric::basic_dynamic_counter<int64_t, 2> failover_total_{
         "tent_transport_failover_total",
-        "Total cross-transport failover events"};
-    ylt::metric::counter_t deadline_infeasible_total_{
+        "Total cross-transport failover events", kFailoverLabels};
+    ylt::metric::basic_dynamic_counter<int64_t, 1> deadline_infeasible_total_{
         "tent_deadline_infeasible_total",
-        "Transfers whose deadline was already in the past at submit"};
+        "Transfers whose deadline was already in the past at submit",
+        kTransportLabel};
+
+    // Pre-constructed label value lookup table, indexed by TransportType enum
+    // (see tent/common/types.h:46). Keeps label values in a closed set — no
+    // arbitrary strings can reach the metrics. Defined in tent_metrics.cpp.
+    static const std::array<std::string, kNumTransportTypes>
+        kTransportLabelNames;
+
+    // Bounds-checked lookup of the label string for a TransportType.
+    // Returns "unknown" if tp is out of range (defensive — should not happen
+    // with the closed-set enum, but guards against memory corruption or a
+    // new transport type added without updating the table).
+    static const std::string& transportLabel(TransportType tp) {
+        if (tp < 0 || tp >= kNumTransportTypes) {
+            static const std::string kUnknown = "unknown";
+            return kUnknown;
+        }
+        return kTransportLabelNames[tp];
+    }
 
     // Histograms - paired with their bucket boundaries in a single vector so
     // the two cannot drift out of sync (ylt histogram doesn't expose its
     // boundaries publicly, so we hold them alongside the pointer).
     struct HistogramEntry {
-        ylt::metric::histogram_t* h;
+        ylt::metric::basic_dynamic_histogram<int64_t, 1>* h;
         const std::vector<double>* boundaries;
     };
     std::vector<HistogramEntry> histograms_;
@@ -188,24 +233,24 @@ class TentMetrics {
     // Default buckets: 100us, 500us, 1ms, 5ms, 10ms, 50ms, 100ms, 500ms, 1s
     static inline const std::vector<double> kLatencyBuckets{
         100, 500, 1000, 5000, 10000, 50000, 100000, 500000, 1000000};
-    ylt::metric::histogram_t read_latency_{
+    ylt::metric::basic_dynamic_histogram<int64_t, 1> read_latency_{
         "tent_read_latency_us", "Read latency distribution in microseconds",
-        kLatencyBuckets};
-    ylt::metric::histogram_t write_latency_{
+        kLatencyBuckets, kTransportLabel};
+    ylt::metric::basic_dynamic_histogram<int64_t, 1> write_latency_{
         "tent_write_latency_us", "Write latency distribution in microseconds",
-        kLatencyBuckets};
+        kLatencyBuckets, kTransportLabel};
     // Size histograms for request size distribution (in bytes)
     // Default buckets: 1KB, 4KB, 16KB, 64KB, 256KB, 1MB, 4MB, 16MB, 64MB,
     // 256MB, 1GB
     static inline const std::vector<double> kSizeBuckets{
         1024,    4096,     16384,    65536,     262144,    1048576,
         4194304, 16777216, 67108864, 268435456, 1073741824};
-    ylt::metric::histogram_t read_size_{
+    ylt::metric::basic_dynamic_histogram<int64_t, 1> read_size_{
         "tent_read_size_bytes", "Read request size distribution in bytes",
-        kSizeBuckets};
-    ylt::metric::histogram_t write_size_{
+        kSizeBuckets, kTransportLabel};
+    ylt::metric::basic_dynamic_histogram<int64_t, 1> write_size_{
         "tent_write_size_bytes", "Write request size distribution in bytes",
-        kSizeBuckets};
+        kSizeBuckets, kTransportLabel};
 
     // Deadline feasibility ratio (MLU) distribution for transfers that carried
     // a deadline. Stored in per-mille (MLU x 1000) so the histogram can use
@@ -213,25 +258,27 @@ class TentMetrics {
     // feasible/infeasible line (< 1000 met the deadline, >= 1000 missed it).
     static inline const std::vector<double> kMluPerMilleBuckets{
         100, 250, 500, 750, 900, 1000, 1250, 1500, 2000, 5000};
-    ylt::metric::histogram_t deadline_mlu_{
+    ylt::metric::basic_dynamic_histogram<int64_t, 1> deadline_mlu_{
         "tent_deadline_mlu_permille",
         "Deadline feasibility ratio (MLU x 1000) distribution",
-        kMluPerMilleBuckets};
+        kMluPerMilleBuckets, kTransportLabel};
 
     // Causal chain stage latency histograms (microseconds)
     // Buckets span 10us to 500ms to capture both fast RDMA and slower TCP.
     static inline const std::vector<double> kStageBuckets{
         10, 50, 100, 500, 1000, 5000, 10000, 50000, 100000, 500000};
-    ylt::metric::histogram_t stage_queue_wait_{
+    ylt::metric::basic_dynamic_histogram<int64_t, 1> stage_queue_wait_{
         "tent_stage_queue_wait_us",
-        "Causal chain: queue wait latency in microseconds", kStageBuckets};
-    ylt::metric::histogram_t stage_dispatch_{
+        "Causal chain: queue wait latency in microseconds", kStageBuckets,
+        kTransportLabel};
+    ylt::metric::basic_dynamic_histogram<int64_t, 1> stage_dispatch_{
         "tent_stage_dispatch_us",
-        "Causal chain: dispatch latency in microseconds", kStageBuckets};
-    ylt::metric::histogram_t stage_transport_{
+        "Causal chain: dispatch latency in microseconds", kStageBuckets,
+        kTransportLabel};
+    ylt::metric::basic_dynamic_histogram<int64_t, 1> stage_transport_{
         "tent_stage_transport_us",
         "Causal chain: transport execution latency in microseconds",
-        kStageBuckets};
+        kStageBuckets, kTransportLabel};
 
     // Helper to register all metrics to the vectors
     void registerMetrics();
@@ -250,98 +297,102 @@ class ScopedLatencyRecorder {
    public:
     enum class OperationType { Read, Write };
 
-    ScopedLatencyRecorder(OperationType type, size_t bytes)
-        : type_(type), bytes_(bytes), enabled_(TentMetrics::isEnabled()) {
-        // Only record start time if metrics are enabled (avoid clock overhead
-        // when disabled)
+    ScopedLatencyRecorder(OperationType type, TransportType tp, size_t bytes)
+        : type_(type),
+          tp_(tp),
+          bytes_(bytes),
+          enabled_(TentMetrics::isEnabled()) {
         if (enabled_) {
             start_ = std::chrono::steady_clock::now();
         }
     }
 
     ~ScopedLatencyRecorder() {
-        if (!enabled_ || failed_)
-            return;  // Skip if disabled or already marked as failed
+        if (!enabled_ || failed_) return;
         auto end = std::chrono::steady_clock::now();
         double latency = std::chrono::duration<double>(end - start_).count();
         if (type_ == OperationType::Read) {
-            TentMetrics::instance().recordReadCompleted(bytes_, latency);
+            TentMetrics::instance().recordReadCompleted(tp_, bytes_, latency);
         } else {
-            TentMetrics::instance().recordWriteCompleted(bytes_, latency);
+            TentMetrics::instance().recordWriteCompleted(tp_, bytes_, latency);
         }
     }
 
     void markFailed() {
-        if (!enabled_) return;  // Skip if disabled
+        if (!enabled_) return;
         failed_ = true;
         if (type_ == OperationType::Read) {
-            TentMetrics::instance().recordReadFailed();
+            TentMetrics::instance().recordReadFailed(tp_);
         } else {
-            TentMetrics::instance().recordWriteFailed();
+            TentMetrics::instance().recordWriteFailed(tp_);
         }
     }
 
    private:
     OperationType type_;
+    TransportType tp_;
     size_t bytes_;
     std::chrono::steady_clock::time_point start_;
-    bool enabled_;  // Captured at construction time for consistent behavior
+    bool enabled_;
     bool failed_ = false;
 };
 
-// Convenience macros for recording metrics (enabled version)
-#define TENT_RECORD_READ_COMPLETED(bytes, latency)                         \
+// Convenience macros for recording metrics (enabled version).
+// The TransportType argument labels each metric so Prometheus queries can
+// break down traffic by transport. For failover, from→to labels the flow.
+#define TENT_RECORD_READ_COMPLETED(tp, bytes, latency)                     \
     do {                                                                   \
         if (::mooncake::tent::TentMetrics::isEnabled()) {                  \
             ::mooncake::tent::TentMetrics::instance().recordReadCompleted( \
-                bytes, latency);                                           \
+                tp, bytes, latency);                                       \
         }                                                                  \
     } while (0)
 
-#define TENT_RECORD_WRITE_COMPLETED(bytes, latency)                         \
+#define TENT_RECORD_WRITE_COMPLETED(tp, bytes, latency)                     \
     do {                                                                    \
         if (::mooncake::tent::TentMetrics::isEnabled()) {                   \
             ::mooncake::tent::TentMetrics::instance().recordWriteCompleted( \
-                bytes, latency);                                            \
+                tp, bytes, latency);                                        \
         }                                                                   \
     } while (0)
 
-#define TENT_RECORD_READ_FAILED()                                         \
-    do {                                                                  \
-        if (::mooncake::tent::TentMetrics::isEnabled()) {                 \
-            ::mooncake::tent::TentMetrics::instance().recordReadFailed(); \
-        }                                                                 \
+#define TENT_RECORD_READ_FAILED(tp)                                         \
+    do {                                                                    \
+        if (::mooncake::tent::TentMetrics::isEnabled()) {                   \
+            ::mooncake::tent::TentMetrics::instance().recordReadFailed(tp); \
+        }                                                                   \
     } while (0)
 
-#define TENT_RECORD_WRITE_FAILED()                                         \
-    do {                                                                   \
-        if (::mooncake::tent::TentMetrics::isEnabled()) {                  \
-            ::mooncake::tent::TentMetrics::instance().recordWriteFailed(); \
-        }                                                                  \
+#define TENT_RECORD_WRITE_FAILED(tp)                                         \
+    do {                                                                     \
+        if (::mooncake::tent::TentMetrics::isEnabled()) {                    \
+            ::mooncake::tent::TentMetrics::instance().recordWriteFailed(tp); \
+        }                                                                    \
     } while (0)
 
-#define TENT_RECORD_TRANSPORT_FAILOVER()                  \
-    do {                                                  \
-        if (::mooncake::tent::TentMetrics::isEnabled()) { \
-            ::mooncake::tent::TentMetrics::instance()     \
-                .recordTransportFailover();               \
-        }                                                 \
+#define TENT_RECORD_TRANSPORT_FAILOVER(from, to)                               \
+    do {                                                                       \
+        if (::mooncake::tent::TentMetrics::isEnabled()) {                      \
+            ::mooncake::tent::TentMetrics::instance().recordTransportFailover( \
+                from, to);                                                     \
+        }                                                                      \
     } while (0)
 
-// RAII macro for automatic latency measurement
-#define TENT_SCOPED_READ_LATENCY(bytes)                              \
-    ::mooncake::tent::ScopedLatencyRecorder _tent_latency_recorder_( \
-        ::mooncake::tent::ScopedLatencyRecorder::OperationType::Read, bytes)
+#define TENT_SCOPED_READ_LATENCY(tp, bytes)                               \
+    ::mooncake::tent::ScopedLatencyRecorder _tent_latency_recorder_(      \
+        ::mooncake::tent::ScopedLatencyRecorder::OperationType::Read, tp, \
+        bytes)
 
-#define TENT_SCOPED_WRITE_LATENCY(bytes)                             \
-    ::mooncake::tent::ScopedLatencyRecorder _tent_latency_recorder_( \
-        ::mooncake::tent::ScopedLatencyRecorder::OperationType::Write, bytes)
+#define TENT_SCOPED_WRITE_LATENCY(tp, bytes)                               \
+    ::mooncake::tent::ScopedLatencyRecorder _tent_latency_recorder_(       \
+        ::mooncake::tent::ScopedLatencyRecorder::OperationType::Write, tp, \
+        bytes)
 
-#define TENT_RECORD_STAGE_LATENCY(stage, latency_us)                      \
+#define TENT_RECORD_STAGE_LATENCY(stage, tp, latency_us)                  \
     do {                                                                  \
         if (::mooncake::tent::TentMetrics::isEnabled()) {                 \
             ::mooncake::tent::TentMetrics::instance().recordStageLatency( \
-                stage, latency_us);                                       \
+                stage, tp, latency_us);                                   \
         }                                                                 \
     } while (0)
 
@@ -351,19 +402,19 @@ class ScopedLatencyRecorder {
 class ScopedLatencyRecorder {
    public:
     enum class OperationType { Read, Write };
-    ScopedLatencyRecorder(OperationType, size_t) {}
+    ScopedLatencyRecorder(OperationType, TransportType, size_t) {}
     void markFailed() {}
 };
 
 // Zero-overhead macros when metrics are disabled at compile time
-#define TENT_RECORD_READ_COMPLETED(bytes, latency) ((void)0)
-#define TENT_RECORD_WRITE_COMPLETED(bytes, latency) ((void)0)
-#define TENT_RECORD_READ_FAILED() ((void)0)
-#define TENT_RECORD_WRITE_FAILED() ((void)0)
-#define TENT_RECORD_TRANSPORT_FAILOVER() ((void)0)
-#define TENT_SCOPED_READ_LATENCY(bytes) ((void)0)
-#define TENT_SCOPED_WRITE_LATENCY(bytes) ((void)0)
-#define TENT_RECORD_STAGE_LATENCY(stage, latency_us) ((void)0)
+#define TENT_RECORD_READ_COMPLETED(tp, bytes, latency) ((void)0)
+#define TENT_RECORD_WRITE_COMPLETED(tp, bytes, latency) ((void)0)
+#define TENT_RECORD_READ_FAILED(tp) ((void)0)
+#define TENT_RECORD_WRITE_FAILED(tp) ((void)0)
+#define TENT_RECORD_TRANSPORT_FAILOVER(from, to) ((void)0)
+#define TENT_SCOPED_READ_LATENCY(tp, bytes) ((void)0)
+#define TENT_SCOPED_WRITE_LATENCY(tp, bytes) ((void)0)
+#define TENT_RECORD_STAGE_LATENCY(stage, tp, latency_us) ((void)0)
 
 #endif  // TENT_METRICS_ENABLED
 
