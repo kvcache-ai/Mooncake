@@ -17,7 +17,7 @@ package main
 
 /*
 #cgo LDFLAGS: -L${SRCDIR}/../../../build/mooncake-store/src -Wl,-rpath,${SRCDIR}/../../../build/mooncake-store/src -lmooncake_store -lstdc++ -lnuma -lglog -lgflags -ljsoncpp -lcurl -luring
-#cgo CFLAGS: -I/home/w00889253/Mooncake/mooncake-store/include
+#cgo CFLAGS: -I${SRCDIR}/../../../include
 
 #include <sched.h>
 #include <stdlib.h>
