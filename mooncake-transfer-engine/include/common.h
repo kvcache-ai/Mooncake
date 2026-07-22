@@ -37,7 +37,6 @@
 #include <string_view>
 #include <thread>
 #include <vector>
-#include <vector>
 
 #include "error.h"
 
