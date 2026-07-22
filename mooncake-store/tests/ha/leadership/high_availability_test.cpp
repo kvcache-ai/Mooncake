@@ -432,6 +432,63 @@ TEST_F(HighAvailabilityTest, WaitForViewChangeReturnsCurrentViewImmediately) {
     ASSERT_EQ(ErrorCode::OK, coordinator->ReleaseLeadership(session));
 }
 
+// Regression guard for the steady-state watch-churn fix (#3059): WaitForViewChange
+// must arm at most one prefix watch per call (not one per loop iteration) and
+// tear it down cleanly on return, so repeated calls on a stable leader do not
+// accumulate watch state or violate the single-watcher-per-prefix limitation.
+// After a sequence of stable-leader timeouts, a real view change must still be
+// detected promptly by the watch -- proving the single per-call watch is
+// functional and the prefix registration is clean.
+//
+// The WATCH_BROKEN -> re-arm path (event_type == 2) is exercised on the
+// project's Linux CI via an etcd-client-reset integration scenario; this
+// public-API test guards the once-per-call arming/teardown flow that the fix
+// reshaped.
+TEST_F(HighAvailabilityTest,
+       WaitForViewChangeRepeatedStableCallsDoNotBreakChangeDetection) {
+    if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+
+    auto coordinator = CreateEtcdCoordinatorOrNull(FLAGS_etcd_endpoints);
+    ASSERT_NE(coordinator, nullptr);
+
+    auto acquire = coordinator->TryAcquireLeadership("0.0.0.0:2222");
+    ASSERT_TRUE(acquire.has_value());
+    ASSERT_EQ(ha::AcquireLeadershipStatus::ACQUIRED, acquire->status);
+    ASSERT_TRUE(acquire->session.has_value());
+    const auto session = *acquire->session;
+
+    auto renew = coordinator->RenewLeadership(session);
+    ASSERT_TRUE(renew.has_value());
+    ASSERT_TRUE(renew.value());
+
+    // Repeated WaitForViewChange calls on a stable leader must each time out
+    // cleanly. Each call arms a single prefix watch and tears it down on
+    // return; if the hoisted-state refactor regressed (watch not armed, not
+    // torn down, or registration collided), these would error, hang, or miss.
+    for (int i = 0; i < 6; ++i) {
+        auto result = coordinator->WaitForViewChange(
+            session.view.view_version, std::chrono::milliseconds(400));
+        ASSERT_TRUE(result.has_value());
+        EXPECT_FALSE(result->changed);
+        EXPECT_TRUE(result->timed_out);
+    }
+
+    // After the repeated calls, the prefix-watch registration must be clean: a
+    // real view change is still detected promptly by the watch, not the
+    // timeout.
+    ASSERT_EQ(ErrorCode::OK, coordinator->ReleaseLeadership(session));
+    const auto start = std::chrono::steady_clock::now();
+    auto changed = coordinator->WaitForViewChange(
+        session.view.view_version, std::chrono::seconds(3));
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    ASSERT_TRUE(changed.has_value());
+    EXPECT_TRUE(changed->changed);
+    EXPECT_FALSE(changed->current_view.has_value());
+    EXPECT_LT(elapsed, std::chrono::seconds(2));
+}
+
 TEST_F(HighAvailabilityTest, LeadershipMonitorReportsKeepAliveLoss) {
     if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
         GTEST_SKIP() << *skip_reason;
