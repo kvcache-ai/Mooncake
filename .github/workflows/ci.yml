@@ -1019,7 +1019,7 @@ jobs:
     secrets: inherit
 
   integration-test:
-    needs: [build, check-paths]
+    needs: [build, build-wheel-cu13, check-paths]
     if: needs.check-paths.outputs.should-run-downstream == 'true'
     uses: ./.github/workflows/integration-test.yml
     secrets: inherit

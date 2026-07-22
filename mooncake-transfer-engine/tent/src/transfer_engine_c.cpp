@@ -492,3 +492,25 @@ int tent_task_status_list(tent_engine_t engine, tent_batch_id_t batch_id,
     *count = status_list.size();
     return 0;
 }
+
+int tent_get_nic_load_stats(tent_engine_t engine, tent_nic_load_stat_t* stats,
+                            size_t* count) {
+    CHECK_POINTER(engine);
+    CHECK_POINTER(stats);
+    CHECK_POINTER(count);
+    std::vector<mooncake::tent::NicLoadStats> native_stats;
+    auto status = CAST(engine)->getNicLoadStats(native_stats);
+    if (!status.ok()) {
+        LOG(ERROR) << "tent_get_nic_load_stats: " << status.ToString();
+        return -1;
+    }
+    size_t to_copy = std::min(native_stats.size(), *count);
+    for (size_t i = 0; i < to_copy; ++i) {
+        snprintf(stats[i].device_name, sizeof(stats[i].device_name), "%s",
+                 native_stats[i].device_name.c_str());
+        stats[i].inflight_bytes = native_stats[i].inflight_bytes;
+        stats[i].ewma_bandwidth_bps = native_stats[i].ewma_bandwidth_bps;
+    }
+    *count = native_stats.size();
+    return 0;
+}

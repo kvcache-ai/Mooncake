@@ -2333,6 +2333,17 @@ Status TransferEngineImpl::progressBatch(BatchID batch_id,
     return getBatchStatus(batch_id, overall_status, true);
 }
 
+Status TransferEngineImpl::getNicLoadStats(
+    std::vector<NicLoadStats>& stats) const {
+    stats.clear();
+    for (const auto& transport : transport_list_) {
+        if (transport) {
+            CHECK_STATUS(transport->getNicLoadStats(stats));
+        }
+    }
+    return Status::OK();
+}
+
 void TransferEngineImpl::notifyBatchMaybeReady(BatchID batch_id) {
     if (progress_worker_) progress_worker_->notifyBatchMaybeReady(batch_id);
 }
@@ -2388,6 +2399,7 @@ Status TransferEngineImpl::unlockStageBuffer(uint64_t addr) {
 void TransferEngineImpl::recordTaskCompletionMetrics(
     TaskInfo& task, TransferStatusEnum prev_status,
     TransferStatusEnum new_status) {
+#if TENT_METRICS_ENABLED
     if (prev_status == PENDING && new_status != PENDING && !task.derived) {
         auto start_time = task.start_time;
         if (start_time.time_since_epoch().count() > 0) {
@@ -2402,7 +2414,6 @@ void TransferEngineImpl::recordTaskCompletionMetrics(
                     TentMetrics::instance().recordWriteCompleted(
                         task.request.length, latency_seconds);
                 }
-#if TENT_METRICS_ENABLED
                 // Causal chain stage decomposition
                 if (task.dispatch_time.time_since_epoch().count() > 0) {
                     double queue_wait_us =
@@ -2426,40 +2437,43 @@ void TransferEngineImpl::recordTaskCompletionMetrics(
                                                   transport_us);
                     }
                 }
-#endif
-                // Observability only (RFC #2519): if this transfer carried a
-                // deadline, emit the post-hoc feasibility ratio MLU =
-                // actual_transfer_time / available_window, where the window is
-                // (deadline - submit_time). MLU < 1 met the deadline; >= 1
-                // missed it. This does not drive any admission/scheduling yet.
-                if (task.request.deadline_ns != 0) {
-                    uint64_t start_ns = static_cast<uint64_t>(
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            start_time.time_since_epoch())
-                            .count());
-                    if (task.request.deadline_ns > start_ns) {
+            } else if (new_status == FAILED) {
+                if (task.request.opcode == Request::READ) {
+                    TentMetrics::instance().recordReadFailed();
+                } else {
+                    TentMetrics::instance().recordWriteFailed();
+                }
+            }
+            // Observability only (RFC #2519): deadline feasibility. The
+            // infeasible-at-submit case (deadline already in the past when
+            // the transfer was submitted) is independent of whether the
+            // transfer ultimately completed or failed, so it is recorded for
+            // both outcomes. The feasible MLU ratio requires the actual
+            // transfer latency, so it is only recorded on COMPLETED.
+            if (task.request.deadline_ns != 0) {
+                uint64_t start_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        start_time.time_since_epoch())
+                        .count());
+                if (task.request.deadline_ns > start_ns) {
+                    if (new_status == COMPLETED) {
                         double window_seconds =
                             (task.request.deadline_ns - start_ns) / 1e9;
                         TentMetrics::instance().recordDeadlineMLU(
                             latency_seconds / window_seconds);
-                    } else {
-                        // Deadline already in the past at submit: infeasible.
-                        TentMetrics::instance().recordDeadlineMLU(5.0);
                     }
-                }
-            } else if (new_status == FAILED) {
-                if (task.request.opcode == Request::READ) {
-                    TentMetrics::instance().recordReadFailed(
-                        task.request.length);
                 } else {
-                    TentMetrics::instance().recordWriteFailed(
-                        task.request.length);
+                    // Deadline already in the past at submit: infeasible.
+                    // Recorded into a dedicated counter so it does not
+                    // pollute the MLU histogram with a sentinel value.
+                    TentMetrics::instance().recordDeadlineInfeasible();
                 }
             }
             // Reset start_time to prevent duplicate recording
             task.start_time = std::chrono::steady_clock::time_point{};
         }
     }
+#endif  // TENT_METRICS_ENABLED
 }
 
 }  // namespace tent
