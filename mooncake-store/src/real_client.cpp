@@ -3574,6 +3574,7 @@ RealClient::get_into_ranges_internal(
                         .first;
             }
             auto &metadata_result = metadata_it->second;
+            std::optional<RangedReadMetadata> refreshed_metadata;
 
             for (size_t k = 0; k < prepared.results[i][j].size(); ++k) {
                 if (!prepared.valid_fragments[i][j][k]) {
@@ -3608,10 +3609,28 @@ RealClient::get_into_ranges_internal(
                     continue;
                 }
 
-                prepared.results[i][j][k] = execute_ranged_read(
-                    all_keys[i][j], buffers[i], all_dst_offsets[i][j][k],
-                    all_src_offsets[i][j][k], all_sizes[i][j][k],
-                    metadata_result.value());
+                auto read_range = [&](const RangedReadMetadata &metadata) {
+                    return execute_ranged_read(
+                        all_keys[i][j], buffers[i], all_dst_offsets[i][j][k],
+                        all_src_offsets[i][j][k], all_sizes[i][j][k], metadata);
+                };
+                auto range_result =
+                    read_range(refreshed_metadata ? *refreshed_metadata
+                                                  : metadata_result.value());
+                if (!range_result &&
+                    range_result.error() == ErrorCode::LEASE_EXPIRED) {
+                    auto refreshed =
+                        build_ranged_read_metadata_from_query_result(
+                            all_keys[i][j], client_->Query(all_keys[i][j]));
+                    if (refreshed) {
+                        refreshed_metadata.emplace(
+                            std::move(refreshed.value()));
+                        range_result = read_range(*refreshed_metadata);
+                    } else {
+                        range_result = tl::unexpected(refreshed.error());
+                    }
+                }
+                prepared.results[i][j][k] = std::move(range_result);
             }
         }
     }
