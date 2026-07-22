@@ -177,10 +177,16 @@ TEST_P(CatalogBackedSnapshotProviderTest,
 }
 
 TEST_P(CatalogBackedSnapshotProviderTest, LoadLatestSnapshotWithGroupId) {
-    // 10 + replica_count: current writer format (data_type + hard_pinned +
-    // trailing group_id). Regression test for the live snapshot restore
-    // failure against the latest metadata layout.
+    // 10 + replica_count: data_type + hard_pinned + trailing group_id.
     PublishSnapshotPayload(SnapshotMetadataFormat::kWithGroupId);
+    ExpectLoadsDefaultObject();
+}
+
+TEST_P(CatalogBackedSnapshotProviderTest, LoadLatestSnapshotWithWorkloadHints) {
+    // 11 + replica_count: current writer format, with workload hints encoded
+    // as one trailing [session_id, retention_priority] array. The standby does
+    // not use the hints, but it must accept snapshots that contain them.
+    PublishSnapshotPayload(SnapshotMetadataFormat::kWithWorkloadHints);
     ExpectLoadsDefaultObject();
 }
 

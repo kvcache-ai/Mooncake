@@ -76,6 +76,23 @@ inline std::ostream& operator<<(std::ostream& os,
 }
 
 /**
+ * @brief Workload-level hints associated with an object.
+ */
+struct WorkloadHints {
+    std::string session_id{};       // Empty means unset.
+    int32_t retention_priority{0};  // Zero means unset.
+
+    bool operator==(const WorkloadHints&) const = default;
+
+    friend std::ostream& operator<<(std::ostream& os,
+                                    const WorkloadHints& hints) noexcept {
+        return os << "{ session_id: " << hints.session_id
+                  << ", retention_priority: " << hints.retention_priority
+                  << " }";
+    }
+};
+
+/**
  * @brief Configuration for replica management
  */
 struct ReplicateConfig {
@@ -96,6 +113,11 @@ struct ReplicateConfig {
     // ungrouped. Grouped keys share metadata routing, coalesced lease refresh,
     // and memory eviction behavior.
     std::optional<std::vector<std::string>> group_ids{};
+    WorkloadHints workload_hints{};
+
+    bool operator==(const ReplicateConfig&) const = default;
+
+    bool IsDefault() const { return *this == ReplicateConfig{}; }
 
     ReplicateConfig ForSingleKey(size_t key_index) const {
         ReplicateConfig key_config = *this;
@@ -142,6 +164,7 @@ struct ReplicateConfig {
             }
             os << "]";
         }
+        os << ", workload_hints: " << config.workload_hints;
         os << " }";
         return os;
     }
