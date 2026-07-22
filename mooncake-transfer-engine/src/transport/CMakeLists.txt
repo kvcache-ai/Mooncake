@@ -65,7 +65,7 @@ if(USE_SUNRISE)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:sunrise_link_transport>)
 endif()
 
-if(USE_MUSA OR (USE_MNNVL AND NOT USE_HIP))
+if(USE_MNNVL AND NOT USE_HIP)
   add_subdirectory(nvlink_transport)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:nvlink_transport>)
 endif()

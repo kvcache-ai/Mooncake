@@ -20,13 +20,9 @@
 
 #include <algorithm>
 #include <cassert>
-#include <cerrno>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <iomanip>
-#include <limits>
-#include <map>
 #include <memory>
 #include <vector>
 
@@ -88,18 +84,11 @@ class PerDeviceStreamPool {
                   std::to_string(prop.pciBusID) + ":" +
                   std::to_string(prop.pciDeviceID);
         }
-        const char *visible =
-#ifdef USE_MUSA
-            getenv("MUSA_VISIBLE_DEVICES");
-        constexpr const char *visible_name = "MUSA_VISIBLE_DEVICES";
-#else
-            getenv("CUDA_VISIBLE_DEVICES");
-        constexpr const char *visible_name = "CUDA_VISIBLE_DEVICES";
-#endif
+        const char *visible = getenv("CUDA_VISIBLE_DEVICES");
         LOG(INFO) << "NvlinkTransport: NVLink CUDA stream created on device "
-                  << device_id << " [physical: " << pci << "] " << visible_name
-                  << "=" << (visible ? visible : "(not set)")
-                  << " pid=" << getpid();
+                  << device_id << " [physical: " << pci
+                  << "] CUDA_VISIBLE_DEVICES="
+                  << (visible ? visible : "(not set)") << " pid=" << getpid();
         pool_[device_id] = entry;
         return entry;
     }
@@ -166,37 +155,6 @@ static cudaEvent_t getCallerSyncEvent() {
     return tl_device_event_pool.getOrCreate(current_device);
 }
 
-// cudaMemcpyAsync is issued against the current device context on MUSA.  Keep
-// the caller's device intact while submitting work to a per-device stream.
-class ScopedCudaDevice {
-   public:
-    explicit ScopedCudaDevice(int device) {
-        status_ = cudaGetDevice(&saved_device_);
-        if (status_ != cudaSuccess) return;
-        if (saved_device_ != device) {
-            status_ = cudaSetDevice(device);
-            changed_ = status_ == cudaSuccess;
-        }
-    }
-
-    ~ScopedCudaDevice() {
-        if (changed_) {
-            cudaError_t err = cudaSetDevice(saved_device_);
-            if (err != cudaSuccess) {
-                LOG(ERROR) << "NvlinkTransport: failed to restore device "
-                           << saved_device_ << ": " << cudaGetErrorString(err);
-            }
-        }
-    }
-
-    bool ok() const { return status_ == cudaSuccess; }
-
-   private:
-    int saved_device_{-1};
-    cudaError_t status_{cudaSuccess};
-    bool changed_{false};
-};
-
 static int getDeviceForPointer(const void *ptr) {
     cudaPointerAttributes attr;
     if (cudaPointerGetAttributes(&attr, ptr) != cudaSuccess) {
@@ -206,39 +164,13 @@ static int getDeviceForPointer(const void *ptr) {
     return (attr.type == cudaMemoryTypeDevice) ? attr.device : -1;
 }
 
-class DefaultNvlinkTransportPolicy final : public GpuIpcTransportPolicy {
-   public:
-    const char *protocol() const override { return "nvlink"; }
-    const char *displayName() const override { return "NvlinkTransport"; }
-
-    int selectStreamDevice(const void *local_buffer, const void * /*source*/,
-                           const void * /*destination*/) const override {
-        int device_id = getDeviceForPointer(local_buffer);
-        if (device_id < 0) cudaGetDevice(&device_id);
-        return device_id < 0 ? 0 : device_id;
+static CudaStreamEntry getStreamForRequest(const void *source) {
+    int device_id = getDeviceForPointer(source);
+    if (device_id < 0) {
+        cudaGetDevice(&device_id);
+        if (device_id < 0) device_id = 0;
     }
-
-    cudaError_t openIpcMemHandle(void **address, cudaIpcMemHandle_t handle,
-                                 const std::string & /*location*/,
-                                 int &opened_device) const override {
-        // Keep the legacy CUDA path byte-for-byte in terms of context
-        // ownership.  The recorded device is only needed by policies (MUSA)
-        // whose IPC close operation is context-sensitive.
-        opened_device = -1;
-        return cudaIpcOpenMemHandle(address, handle,
-                                    cudaIpcMemLazyEnablePeerAccess);
-    }
-
-    cudaError_t closeIpcMemHandle(void *address,
-                                  int /*opened_device*/) const override {
-        return cudaIpcCloseMemHandle(address);
-    }
-};
-
-static std::shared_ptr<GpuIpcTransportPolicy> makeDefaultNvlinkPolicy() {
-    static std::shared_ptr<GpuIpcTransportPolicy> policy =
-        std::make_shared<DefaultNvlinkTransportPolicy>();
-    return policy;
+    return tl_device_stream_pool.getOrCreate(device_id);
 }
 
 }  // anonymous namespace
@@ -258,42 +190,11 @@ static void submitBatchMemcpy(const std::vector<Slice *> &slices,
                               const std::vector<void *> &srcs,
                               const std::vector<void *> &dsts,
                               const std::vector<size_t> &sizes,
-                              const GpuIpcTransportPolicy *policy,
-                              cudaStream_t stream, int stream_device) {
+                              cudaStream_t stream) {
     if (slices.empty()) return;
 
     const size_t count = slices.size();
-
-    // A vendor policy may provide a lower-CPU batch primitive.  MUSA uses
-    // muMemoryTransferBatchAsync here; CUDA keeps the existing runtime paths
-    // below.  A handled failure is terminal for this group: retrying with
-    // per-slice copies could duplicate operations already accepted by the
-    // driver.
-    if (policy) {
-        size_t fail_index = std::numeric_limits<size_t>::max();
-        if (policy->submitBatchCopies(srcs, dsts, sizes, stream, fail_index)) {
-            if (fail_index == count) {
-                for (size_t i = 0; i < count; ++i) {
-                    slices[i]->status = Slice::POSTED;
-                    slices[i]->local.cuda_stream = (void *)stream;
-                    slices[i]->local.cuda_device = stream_device;
-                }
-            } else {
-                const size_t posted = fail_index < count ? fail_index : 0;
-                for (size_t i = 0; i < posted; ++i) {
-                    slices[i]->status = Slice::POSTED;
-                    slices[i]->local.cuda_stream = (void *)stream;
-                    slices[i]->local.cuda_device = stream_device;
-                }
-                for (size_t i = posted; i < count; ++i) {
-                    if (slices[i]->status == Slice::PENDING) {
-                        slices[i]->markFailed();
-                    }
-                }
-            }
-            return;
-        }
-    }
+    cudaError_t err = cudaSuccess;
 
     // Log the active memcpy path once per process lifetime
     static const bool logged_once = [] {
@@ -312,7 +213,6 @@ static void submitBatchMemcpy(const std::vector<Slice *> &slices,
     (void)logged_once;
 
 #if CUDART_VERSION >= 12080
-    cudaError_t err = cudaSuccess;
     // srcAccessOrderStream is REQUIRED for P2P copies — without it, the GPU
     // does not insert necessary memory barriers for cross-device access,
     // resulting in segmentation faults. The caller also establishes a
@@ -346,7 +246,6 @@ static void submitBatchMemcpy(const std::vector<Slice *> &slices,
         for (size_t i = 0; i < count; ++i) {
             slices[i]->status = Slice::POSTED;
             slices[i]->local.cuda_stream = (void *)stream;
-            slices[i]->local.cuda_device = stream_device;
         }
     }
 #elif CUDART_VERSION >= 12080
@@ -366,19 +265,14 @@ static void submitBatchMemcpy(const std::vector<Slice *> &slices,
             LOG(ERROR) << "NvlinkTransport: cudaMemcpyBatchAsync "
                        << "failed: " << cudaGetErrorString(err);
         }
-        // Copies [0, fail_idx) were submitted successfully → POSTED.  The
-        // runtime does not guarantee a useful index on every error; an
-        // out-of-range value therefore means that no slice is safe to mark
-        // POSTED.
+        // Copies [0, fail_idx) were submitted successfully → POSTED.
         // Copy [fail_idx] failed → FAILED.
         // Copies (fail_idx, count) were never submitted → FAILED.
-        const size_t posted = fail_idx < count ? fail_idx : 0;
-        for (size_t i = 0; i < posted; ++i) {
+        for (size_t i = 0; i < fail_idx; ++i) {
             slices[i]->status = Slice::POSTED;
             slices[i]->local.cuda_stream = (void *)stream;
-            slices[i]->local.cuda_device = stream_device;
         }
-        for (size_t i = posted; i < count; ++i) {
+        for (size_t i = fail_idx; i < count; ++i) {
             if (slices[i]->status == Slice::PENDING) {
                 slices[i]->markFailed();
             }
@@ -387,7 +281,6 @@ static void submitBatchMemcpy(const std::vector<Slice *> &slices,
         for (size_t i = 0; i < count; ++i) {
             slices[i]->status = Slice::POSTED;
             slices[i]->local.cuda_stream = (void *)stream;
-            slices[i]->local.cuda_device = stream_device;
         }
     }
 #else
@@ -404,154 +297,9 @@ static void submitBatchMemcpy(const std::vector<Slice *> &slices,
         }
         slices[i]->status = Slice::POSTED;
         slices[i]->local.cuda_stream = (void *)stream;
-        slices[i]->local.cuda_device = stream_device;
     }
     return;  // Slice states already set above
 #endif
-}
-
-struct CopyGroup {
-    std::vector<Slice *> slices;
-    std::vector<void *> srcs;
-    std::vector<void *> dsts;
-    std::vector<size_t> sizes;
-    cudaStream_t stream{nullptr};
-};
-
-// A single Mooncake batch may contain requests targeting different GPU
-// ordinals.  MUSA groups by its policy-selected destination device so every
-// copy uses the matching stream/context.  NVIDIA intentionally keeps its
-// legacy behavior: one stream selected from the first request-local buffer.
-static bool submitBatchMemcpyByDevice(
-    const std::shared_ptr<GpuIpcTransportPolicy> &policy,
-    const std::vector<Slice *> &slices, const std::vector<void *> &srcs,
-    const std::vector<void *> &dsts, const std::vector<size_t> &sizes,
-    std::string &error) {
-    if (slices.empty()) return true;
-    if (srcs.size() != slices.size() || dsts.size() != slices.size() ||
-        sizes.size() != slices.size()) {
-        error =
-            std::string(policy->displayName()) + ": invalid copy vector sizes";
-        return false;
-    }
-
-    auto fail_pending = [](const std::vector<Slice *> &failed_slices) {
-        for (Slice *slice : failed_slices) {
-            if (slice && slice->status == Slice::PENDING) slice->markFailed();
-        }
-    };
-
-    auto prepare_stream = [&](int device, cudaStream_t &stream) {
-        CudaStreamEntry stream_entry =
-            tl_device_stream_pool.getOrCreate(device);
-        if (!stream_entry.stream) {
-            error = std::string(policy->displayName()) +
-                    ": failed to create transfer stream on device " +
-                    std::to_string(device);
-            return false;
-        }
-        if (policy->requiresStreamDeviceGuard()) {
-            ScopedCudaDevice guard(device);
-            if (!guard.ok()) {
-                error = std::string(policy->displayName()) +
-                        ": failed to select transfer device " +
-                        std::to_string(device);
-                return false;
-            }
-        }
-        stream = stream_entry.stream;
-        return true;
-    };
-
-    auto submit_group =
-        [&](int device, const std::vector<Slice *> &group_slices,
-            const std::vector<void *> &group_srcs,
-            const std::vector<void *> &group_dsts,
-            const std::vector<size_t> &group_sizes, cudaStream_t stream) {
-            if (policy->requiresStreamDeviceGuard()) {
-                ScopedCudaDevice guard(device);
-                if (!guard.ok()) {
-                    error = std::string(policy->displayName()) +
-                            ": failed to select transfer device " +
-                            std::to_string(device);
-                    return false;
-                }
-                submitBatchMemcpy(group_slices, group_srcs, group_dsts,
-                                  group_sizes, policy.get(), stream, device);
-                return true;
-            }
-            submitBatchMemcpy(group_slices, group_srcs, group_dsts, group_sizes,
-                              policy.get(), stream, device);
-            return true;
-        };
-
-    // Preserve the NVLink hot path and avoid allocation/copy overhead for the
-    // common MUSA case where every entry selects the same destination device.
-    int first_device = policy->selectStreamDevice(slices.front()->source_addr,
-                                                  srcs.front(), dsts.front());
-    if (first_device < 0) {
-        error = std::string(policy->displayName()) +
-                ": policy returned an invalid stream device";
-        fail_pending(slices);
-        return false;
-    }
-
-    bool homogeneous = true;
-    std::vector<int> devices;
-    if (policy->groupTransfersByDevice()) {
-        devices.reserve(slices.size());
-        devices.push_back(first_device);
-        for (size_t i = 1; i < slices.size(); ++i) {
-            int device = policy->selectStreamDevice(slices[i]->source_addr,
-                                                    srcs[i], dsts[i]);
-            if (device < 0) {
-                error = std::string(policy->displayName()) +
-                        ": policy returned an invalid stream device";
-                fail_pending(slices);
-                return false;
-            }
-            devices.push_back(device);
-            homogeneous = homogeneous && device == first_device;
-        }
-    }
-
-    if (!policy->groupTransfersByDevice() || homogeneous) {
-        cudaStream_t stream = nullptr;
-        if (!prepare_stream(first_device, stream) ||
-            !submit_group(first_device, slices, srcs, dsts, sizes, stream)) {
-            fail_pending(slices);
-            return false;
-        }
-        return true;
-    }
-
-    std::map<int, CopyGroup> groups;
-    auto append_to_group = [&](size_t i, int device) {
-        auto &group = groups[device];
-        group.slices.push_back(slices[i]);
-        group.srcs.push_back(srcs[i]);
-        group.dsts.push_back(dsts[i]);
-        group.sizes.push_back(sizes[i]);
-    };
-    for (size_t i = 0; i < slices.size(); ++i) append_to_group(i, devices[i]);
-
-    // Preflight every stream/context before submitting any group, so a setup
-    // failure cannot leave a mixed-device task half POSTED and half PENDING.
-    for (auto &[device, group] : groups) {
-        if (!prepare_stream(device, group.stream)) {
-            fail_pending(slices);
-            return false;
-        }
-    }
-
-    for (auto &[device, group] : groups) {
-        if (!submit_group(device, group.slices, group.srcs, group.dsts,
-                          group.sizes, group.stream)) {
-            fail_pending(slices);
-            return false;
-        }
-    }
-    return true;
 }
 
 static int getNumDevices() {
@@ -644,14 +392,7 @@ static bool enableP2PAccess(int src_device_id, int dst_device_id) {
     return true;
 }
 
-NvlinkTransport::NvlinkTransport()
-    : NvlinkTransport(makeDefaultNvlinkPolicy(), supportFabricMem()) {}
-
-NvlinkTransport::NvlinkTransport(std::shared_ptr<GpuIpcTransportPolicy> policy,
-                                 bool use_fabric_mem)
-    : use_fabric_mem_(use_fabric_mem), policy_(std::move(policy)) {
-    if (!policy_) LOG(FATAL) << "NvlinkTransport requires a runtime policy";
-}
+NvlinkTransport::NvlinkTransport() : use_fabric_mem_(supportFabricMem()) {}
 //     int num_devices = getNumDevices();
 //     if (globalConfig().trace) {
 //         LOG(INFO) << "NvlinkTransport: use_fabric_mem_:" << use_fabric_mem_
@@ -686,13 +427,7 @@ NvlinkTransport::~NvlinkTransport() {
         }
     } else {
         for (auto &entry : remap_entries_) {
-            cudaError_t close_err = policy_->closeIpcMemHandle(
-                entry.second.shm_addr, entry.second.device_id);
-            if (close_err != cudaSuccess) {
-                LOG(ERROR) << policy_->displayName()
-                           << ": cudaIpcCloseMemHandle failed: "
-                           << cudaGetErrorString(close_err);
-            }
+            cudaIpcCloseMemHandle(entry.second.shm_addr);
         }
     }
     remap_entries_.clear();
@@ -707,24 +442,7 @@ int NvlinkTransport::install(std::string &local_server_name,
     auto desc = std::make_shared<SegmentDesc>();
     if (!desc) return ERR_MEMORY;
     desc->name = local_server_name_;
-#ifdef ENABLE_MULTI_PROTOCOL
-    if (policy_->preserveExistingMetadata()) {
-        auto old_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
-        if (old_desc) *desc = *old_desc;
-        desc->name = local_server_name_;
-        if (desc->protocol.empty()) {
-            desc->protocol = policy_->protocol();
-        } else if (desc->protocol.find(policy_->protocol()) ==
-                   std::string::npos) {
-            desc->protocol += ",";
-            desc->protocol += policy_->protocol();
-        }
-    } else {
-        desc->protocol = policy_->protocol();
-    }
-#else
-    desc->protocol = policy_->protocol();
-#endif
+    desc->protocol = "nvlink";
     metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
                                std::move(desc));
     return 0;
@@ -744,6 +462,12 @@ Status NvlinkTransport::submitTransfer(
 
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
+
+    // Get per-device transfer stream for the source buffer's device.
+    CudaStreamEntry stream_entry =
+        getStreamForRequest(entries.empty() ? nullptr : entries[0].source);
+    cudaStream_t stream = stream_entry.stream;
+    if (!stream) return Status::Context("Failed to create NVLink CUDA stream");
 
     // Synchronize with the caller's GPU work (e.g., PyTorch gather operations)
     // that produced the source data. We use cudaEventSynchronize (CPU-blocking)
@@ -805,13 +529,8 @@ Status NvlinkTransport::submitTransfer(
         slices.push_back(slice);
     }
 
-    // Phase 2: Let the backend choose the submission device after IPC address
-    // relocation, grouping a mixed-target batch by the selected device.
-    std::string submit_error;
-    if (!submitBatchMemcpyByDevice(policy_, slices, srcs, dsts, sizes,
-                                   submit_error)) {
-        return Status::Context(submit_error);
-    }
+    // Phase 2: Submit all memcpy operations
+    submitBatchMemcpy(slices, srcs, dsts, sizes, stream);
 
     return Status::OK();
 }
@@ -826,31 +545,20 @@ Status NvlinkTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             std::to_string(batch_id));
     }
     auto &task = batch_desc.task_list[task_id];
-    // Poll POSTED slices for async completion via cudaStreamQuery.  MUSA's
-    // destination-owned stream may differ from the caller's current device;
-    // its policy switches context for the query while CUDA keeps the legacy
-    // direct-query behavior.
-    std::map<int, std::unordered_map<cudaStream_t, cudaError_t>>
-        stream_status_cache;
+    // Poll POSTED slices for async completion via cudaStreamQuery.
+    // Cache the query result per stream to avoid redundant driver calls.
+    // With SGLang-side torch.cuda.device(gpu_id), the calling thread's
+    // active device matches the stream's device, so no device switching
+    // is needed.
+    std::unordered_map<cudaStream_t, cudaError_t> stream_status_cache;
     for (auto *slice : task.slice_list) {
         if (slice && slice->status == Slice::POSTED) {
             cudaStream_t stream = (cudaStream_t)slice->local.cuda_stream;
-            const int stream_device = slice->local.cuda_device;
-            auto &device_cache = stream_status_cache[stream_device];
-            auto it = device_cache.find(stream);
+            auto it = stream_status_cache.find(stream);
             cudaError_t cuda_err;
-            if (it == device_cache.end()) {
-                if (policy_->requiresStreamDeviceGuard()) {
-                    ScopedCudaDevice guard(stream_device);
-                    if (!guard.ok()) {
-                        slice->markFailed();
-                        continue;
-                    }
-                    cuda_err = cudaStreamQuery(stream);
-                } else {
-                    cuda_err = cudaStreamQuery(stream);
-                }
-                device_cache[stream] = cuda_err;
+            if (it == stream_status_cache.end()) {
+                cuda_err = cudaStreamQuery(stream);
+                stream_status_cache[stream] = cuda_err;
             } else {
                 cuda_err = it->second;
             }
@@ -879,6 +587,11 @@ Status NvlinkTransport::getTransferStatus(BatchID batch_id, size_t task_id,
 
 Status NvlinkTransport::submitTransferTask(
     const std::vector<TransferTask *> &task_list) {
+    // Get per-device transfer stream. See submitTransfer() for rationale.
+    CudaStreamEntry stream_entry = getStreamForRequest(
+        task_list.empty() ? nullptr : task_list[0]->request->source);
+    cudaStream_t stream = stream_entry.stream;
+    if (!stream) return Status::Context("Failed to create NVLink CUDA stream");
     // Synchronize with caller's GPU work via cudaEventSynchronize.
     cudaEvent_t sync_event = getCallerSyncEvent();
     cudaError_t sync_err = cudaEventRecord(sync_event, cudaStreamPerThread);
@@ -937,12 +650,8 @@ Status NvlinkTransport::submitTransferTask(
         slices.push_back(slice);
     }
 
-    // Phase 2: See submitTransfer() for backend-specific stream grouping.
-    std::string submit_error;
-    if (!submitBatchMemcpyByDevice(policy_, slices, srcs, dsts, sizes,
-                                   submit_error)) {
-        return Status::Context(submit_error);
-    }
+    // Phase 2: Submit all memcpy operations
+    submitBatchMemcpy(slices, srcs, dsts, sizes, stream);
 
     return Status::OK();
 }
@@ -980,13 +689,9 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
         BufferDesc desc;
         desc.addr = (uint64_t)addr;
         desc.length = length;
-        desc.name = policy_->normalizeMemoryLocation(addr, location);
+        desc.name = location;
         desc.shm_name =
             serializeBinaryData(&handle, sizeof(cudaIpcMemHandle_t));
-#ifdef ENABLE_MULTI_PROTOCOL
-        if (policy_->preserveExistingMetadata())
-            desc.protocol = policy_->protocol();
-#endif
         return metadata_->addLocalMemoryBuffer(desc, true);
     } else {
         CUmemGenericAllocationHandle handle;
@@ -1025,13 +730,9 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
         BufferDesc desc;
         desc.addr = (uint64_t)real_addr;  // (uint64_t)addr;
         desc.length = real_size;          // length;
-        desc.name = policy_->normalizeMemoryLocation(addr, location);
+        desc.name = location;
         desc.shm_name =
             serializeBinaryData(&export_handle, sizeof(CUmemFabricHandle));
-#ifdef ENABLE_MULTI_PROTOCOL
-        if (policy_->preserveExistingMetadata())
-            desc.protocol = policy_->protocol();
-#endif
         return metadata_->addLocalMemoryBuffer(desc, true);
     }
 }
@@ -1067,21 +768,17 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                     cudaIpcMemHandle_t handle;
                     memcpy(&handle, output_buffer.data(), sizeof(handle));
                     void *shm_addr = nullptr;
-                    int ipc_device = -1;
-                    cudaError_t err = policy_->openIpcMemHandle(
-                        &shm_addr, handle, entry.name, ipc_device);
+                    cudaError_t err = cudaIpcOpenMemHandle(
+                        &shm_addr, handle, cudaIpcMemLazyEnablePeerAccess);
                     if (err != cudaSuccess) {
-                        LOG(ERROR) << policy_->displayName()
-                                   << ": cudaIpcOpenMemHandle failed: "
-                                   << cudaGetErrorString(err);
+                        LOG(ERROR)
+                            << "NvlinkTransport: cudaIpcOpenMemHandle failed: "
+                            << cudaGetErrorString(err);
                         return -1;
                     }
                     OpenedShmEntry shm_entry;
                     shm_entry.shm_addr = shm_addr;
                     shm_entry.length = entry.length;
-#ifdef USE_MUSA
-                    shm_entry.device_id = ipc_device;
-#endif
                     remap_entries_[std::make_pair(target_id, entry.addr)] =
                         shm_entry;
                 } else if (output_buffer.size() == sizeof(CUmemFabricHandle) &&
