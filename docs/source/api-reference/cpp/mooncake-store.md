@@ -46,13 +46,37 @@ tl::expected<void, ErrorCode> Put(const ObjectKey& key,
 The data structure details of `ReplicateConfig` are as follows:
 
 ```C++
+struct AgentHints {
+    std::string workflow_id{};
+    std::string agent_id{};
+    std::string step_id{};
+    int64_t step_index{0};
+    int64_t total_steps{0};
+    std::string parent_step_id{};
+    std::vector<std::string> children_step_ids{};
+    std::string tool_name{};
+    int64_t expected_tool_duration_ms{0};
+    int64_t cache_ttl_ms{0};
+    std::string shared_prefix_hash{};
+    std::string reuse_hint{"neutral"}; // "keep", "discard", or "neutral"
+};
+
 struct ReplicateConfig {
     size_t replica_num{1};                    // Total number of replicas for the object
     bool with_soft_pin{false};               // Whether to enable soft pin mechanism for this object
     bool with_hard_pin{false};               // Whether to enable hard pin (never evicted)
     std::string preferred_segment{};         // Preferred segment for allocation
+    std::optional<std::vector<std::string>> group_ids{};
+    std::optional<AgentHints> agent_hints{}; // Optional agent workflow metadata
 };
 ```
+
+`agent_hints` is optional Store-side metadata for agentic workloads. In the
+current implementation, `reuse_hint="keep"` requests soft-pin retention and
+`cache_ttl_ms` can extend the soft-pin timeout. `reuse_hint="neutral"` and
+`reuse_hint="discard"` do not add retention by themselves, and `workflow_id` is
+stored as metadata only. Mooncake Store does not automatically map
+`workflow_id` to `group_ids`.
 
 ### Upsert
 
