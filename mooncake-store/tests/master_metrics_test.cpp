@@ -257,6 +257,13 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_TRUE(unmount_result.has_value());
     ASSERT_EQ(metrics.get_unmount_segment_requests(), 1);
     ASSERT_EQ(metrics.get_unmount_segment_failures(), 0);
+
+    const auto cleanup_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (metrics.get_key_count() != 0 &&
+           std::chrono::steady_clock::now() < cleanup_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
     ASSERT_EQ(metrics.get_key_count(), 0);
     ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
     ASSERT_EQ(metrics.get_total_mem_capacity(), 0);

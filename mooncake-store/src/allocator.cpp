@@ -10,6 +10,9 @@
 namespace mooncake {
 
 std::string AllocatedBuffer::getSegmentName() const noexcept {
+    if (protocol == "cxl") {
+        return segment_name_;
+    }
     auto alloc = allocator_.lock();
     if (alloc) {
         return alloc->getSegmentName();
@@ -44,6 +47,15 @@ AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor() const {
 
     return {static_cast<uint64_t>(size()),
             reinterpret_cast<uintptr_t>(buffer_ptr_), this->protocol, endpoint};
+}
+
+bool AllocatedBuffer::getDescriptorIfAvailable(Descriptor& descriptor) const {
+    if (!isAvailable()) {
+        return false;
+    }
+
+    descriptor = get_descriptor();
+    return isAvailable();
 }
 
 void AllocatedBuffer::change_to_cxl(std::string client_segment_name) {
@@ -310,6 +322,24 @@ size_t OffsetBufferAllocator::getLargestFreeRegion() const {
     try {
         auto report = offset_allocator_->storageReport();
         return report.largestFreeRegion;
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Failed to get storage report: " << e.what()
+                   << " segment=" << segment_name_;
+        return 0;
+    } catch (...) {
+        LOG(ERROR) << "Unknown error getting storage report"
+                   << " segment=" << segment_name_;
+        return 0;
+    }
+}
+
+size_t OffsetBufferAllocator::getTotalFreeSpace() const {
+    if (!offset_allocator_) {
+        return 0;
+    }
+
+    try {
+        return offset_allocator_->storageReport().totalFreeSpace;
     } catch (const std::exception& e) {
         LOG(ERROR) << "Failed to get storage report: " << e.what()
                    << " segment=" << segment_name_;

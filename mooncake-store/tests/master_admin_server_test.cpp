@@ -741,6 +741,41 @@ TEST_F(MasterAdminServerWithServiceTest, GetAllKeysExcludesRemovedKey) {
     EXPECT_EQ(resp.body.find(key), std::string::npos);
 }
 
+TEST_F(MasterAdminServerWithServiceTest,
+       GetAllKeysCanIncludeInvalidMetadataWhenRequested) {
+    const std::string key =
+        "admin_unfinished_key_" + UuidToString(generate_uuid());
+    UUID client_id = generate_uuid();
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "admin_filter_segment_" + UuidToString(generate_uuid());
+    segment.base = 0x500000000;
+    segment.size = 8 * 1024 * 1024;
+    ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+
+    ReplicateConfig cfg;
+    cfg.replica_num = 1;
+    ASSERT_TRUE(service_->PutStart(client_id, key, 1024, cfg).has_value());
+
+    auto default_resp = HttpGet("/get_all_keys");
+    EXPECT_EQ(default_resp.http_status, 200);
+    EXPECT_EQ(default_resp.body.find(key), std::string::npos);
+
+    auto explicit_filtered_resp = HttpGet("/get_all_keys?filter_invalid=true");
+    EXPECT_EQ(explicit_filtered_resp.http_status, 200);
+    EXPECT_EQ(explicit_filtered_resp.body.find(key), std::string::npos);
+
+    auto unfiltered_resp = HttpGet("/get_all_keys?filter_invalid=false");
+    EXPECT_EQ(unfiltered_resp.http_status, 200);
+    EXPECT_NE(unfiltered_resp.body.find(key), std::string::npos);
+}
+
+TEST_F(MasterAdminServerWithServiceTest,
+       GetAllKeysRejectsInvalidFilterInvalidParameter) {
+    auto resp = HttpGet("/get_all_keys?filter_invalid=maybe");
+    EXPECT_EQ(resp.http_status, 400);
+}
+
 // -----------------------------------------------------------------------
 // GET /query_key
 // -----------------------------------------------------------------------

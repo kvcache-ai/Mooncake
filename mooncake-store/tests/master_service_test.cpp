@@ -963,6 +963,32 @@ TEST_F(MasterServiceTest, GetAllKeysListsOnlyRequestedTenant) {
         tenant_keys->end());
 }
 
+TEST_F(MasterServiceTest, GetAllKeysFiltersUnavailableMetadataByDefault) {
+    auto service = std::make_unique<MasterService>();
+    const auto context = PrepareSimpleSegment(*service, "listing_segment");
+    const std::string key =
+        GenerateKeyForSegment(context.client_id, service, "listing_segment");
+
+    auto filtered_before = service->GetAllKeys("default");
+    ASSERT_TRUE(filtered_before.has_value());
+    EXPECT_NE(std::find(filtered_before->begin(), filtered_before->end(), key),
+              filtered_before->end());
+
+    auto unfiltered_before = service->GetAllKeys("default", false);
+    ASSERT_TRUE(unfiltered_before.has_value());
+    EXPECT_NE(
+        std::find(unfiltered_before->begin(), unfiltered_before->end(), key),
+        unfiltered_before->end());
+
+    ASSERT_TRUE(service->UnmountSegment(context.segment_id, context.client_id)
+                    .has_value());
+
+    auto filtered_after = service->GetAllKeys("default");
+    ASSERT_TRUE(filtered_after.has_value());
+    EXPECT_EQ(std::find(filtered_after->begin(), filtered_after->end(), key),
+              filtered_after->end());
+}
+
 TEST_F(MasterServiceTest,
        ConcurrentGroupedAndUngroupedFirstCreateDoesNotDuplicateMetadata) {
     std::unique_ptr<MasterService> service_(new MasterService());
@@ -3585,7 +3611,7 @@ TEST_F(MasterServiceTest, SingleSliceMultiReplicaFlow) {
     }
 }
 
-TEST_F(MasterServiceTest, CleanupStaleHandlesTest) {
+TEST_F(MasterServiceTest, ClientLivenessCleanupTest) {
     std::unique_ptr<MasterService> service_(new MasterService());
 
     // Mount a segment for testing
@@ -3869,7 +3895,7 @@ TEST_F(MasterServiceTest, ConcurrentRemoveAllOperations) {
     }
 }
 
-TEST_F(MasterServiceTest, UnmountSegmentImmediateCleanup) {
+TEST_F(MasterServiceTest, UnmountSegmentHidesUnavailableReplicas) {
     std::unique_ptr<MasterService> service_(new MasterService());
 
     // Mount two segments for testing
@@ -3894,15 +3920,38 @@ TEST_F(MasterServiceTest, UnmountSegmentImmediateCleanup) {
     ReplicateConfig config;
     config.replica_num = 1;
 
-    // Unmount segment1
+    // Unmount segment1. Metadata cleanup is asynchronous, but query paths
+    // must stop exposing replicas from it immediately.
     auto unmount_result1 = service_->UnmountSegment(segment1.id, client_id);
     ASSERT_TRUE(unmount_result1.has_value());
-    // Umount will remove all objects in the segment, include the key1
-    ASSERT_EQ(1, service_->GetKeyCount());
-    // Verify objects in segment1 is gone
+
     auto get_result1 = service_->GetReplicaList(key1, "default");
     ASSERT_FALSE(get_result1.has_value());
     ASSERT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result1.error());
+
+    auto exist_result = service_->ExistKey(key1, "default");
+    ASSERT_TRUE(exist_result.has_value());
+    EXPECT_FALSE(exist_result.value());
+
+    auto batch_exist_result = service_->BatchExistKey({key1, key2}, "default");
+    ASSERT_EQ(2u, batch_exist_result.size());
+    ASSERT_TRUE(batch_exist_result[0].has_value());
+    EXPECT_FALSE(batch_exist_result[0].value());
+    ASSERT_TRUE(batch_exist_result[1].has_value());
+    EXPECT_TRUE(batch_exist_result[1].value());
+
+    auto batch_get_result =
+        service_->BatchGetReplicaList({key1, key2}, "default");
+    ASSERT_EQ(2u, batch_get_result.size());
+    ASSERT_FALSE(batch_get_result[0].has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, batch_get_result[0].error());
+    ASSERT_TRUE(batch_get_result[1].has_value());
+
+    auto regex_result = service_->GetReplicaListByRegex("key_.*", "default");
+    ASSERT_TRUE(regex_result.has_value());
+    EXPECT_EQ(1u, regex_result->size());
+    EXPECT_EQ(0u, regex_result->count(key1));
+    EXPECT_EQ(1u, regex_result->count(key2));
 
     // Verify objects in segment2 is still there
     auto get_result2 = service_->GetReplicaList(key2, "default");
@@ -3977,6 +4026,12 @@ TEST_F(MasterServiceTest, ReadableAfterPartialUnmountWithReplication) {
     auto get_after_unmount = service_->GetReplicaList(key, "default");
     ASSERT_TRUE(get_after_unmount.has_value())
         << "Object should remain accessible with surviving replica";
+    const auto replicas_after_unmount = get_after_unmount.value().replicas;
+    ASSERT_EQ(1u, replicas_after_unmount.size());
+    ASSERT_TRUE(replicas_after_unmount[0].is_memory_replica());
+    EXPECT_EQ(segment2.name, replicas_after_unmount[0]
+                                 .get_memory_descriptor()
+                                 .buffer_descriptor.transport_endpoint_);
 }
 
 TEST_F(MasterServiceTest, UnmountSegmentPerformance) {

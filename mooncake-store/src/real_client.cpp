@@ -5722,8 +5722,8 @@ ClientRequester::ClientRequester() {
     // - host_alive_detect_duration: Duration for background alive detection.
     //   Set to 0 to disable infinite background reconnection attempts when
     //   a Store node goes down. This prevents continuous "Connection refused"
-    //   logs. When Master cleans up stale local_disk replicas (via
-    //   CleanupStaleHandles), new requests won't route to dead nodes anyway.
+    //   logs. Once Master removes stale local_disk replicas during
+    //   client-liveness cleanup, new requests won't route to dead nodes anyway.
     pool_conf.connect_retry_count = 3;
     pool_conf.reconnect_wait_time = std::chrono::milliseconds{1000};
     pool_conf.host_alive_detect_duration = std::chrono::milliseconds{0};

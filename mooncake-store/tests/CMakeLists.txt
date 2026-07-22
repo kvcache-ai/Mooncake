@@ -41,22 +41,26 @@ add_test(
   NAME replica_selection_env_opt_in_test
   COMMAND replica_selection_test
           --gtest_filter=ReplicaSelectionTest.EnvironmentOptInUsesBuiltinScorer)
-set_tests_properties(
-  replica_selection_env_opt_in_test
-  PROPERTIES ENVIRONMENT "MC_STORE_REPLICA_SCORING=1")
+set_tests_properties(replica_selection_env_opt_in_test
+                     PROPERTIES ENVIRONMENT "MC_STORE_REPLICA_SCORING=1")
 add_store_test(eviction_strategy_test eviction_strategy_test.cpp)
 add_store_test(deadline_scheduler_test deadline_scheduler_test.cpp)
+add_store_test(background_worker_test background_worker_test.cpp)
 add_store_test(kv_event_publisher_test kv_event_publisher_test.cpp)
 if(ENABLE_KV_EVENTS)
-  find_library(KV_EVENT_TEST_ZMQ_LIBRARY NAMES zmq libzmq PATHS /usr/lib
-               /usr/local/lib /usr/lib64)
-  find_path(KV_EVENT_TEST_ZMQ_INCLUDE_DIR NAMES zmq.h PATHS /usr/include
-            /usr/local/include)
-  target_compile_definitions(kv_event_publisher_test PRIVATE
-                             MOONCAKE_ENABLE_KV_EVENTS=1)
+  find_library(
+    KV_EVENT_TEST_ZMQ_LIBRARY
+    NAMES zmq libzmq
+    PATHS /usr/lib /usr/local/lib /usr/lib64)
+  find_path(
+    KV_EVENT_TEST_ZMQ_INCLUDE_DIR
+    NAMES zmq.h
+    PATHS /usr/include /usr/local/include)
+  target_compile_definitions(kv_event_publisher_test
+                             PRIVATE MOONCAKE_ENABLE_KV_EVENTS=1)
   if(KV_EVENT_TEST_ZMQ_LIBRARY AND KV_EVENT_TEST_ZMQ_INCLUDE_DIR)
     target_include_directories(kv_event_publisher_test
-                             PRIVATE ${KV_EVENT_TEST_ZMQ_INCLUDE_DIR})
+                               PRIVATE ${KV_EVENT_TEST_ZMQ_INCLUDE_DIR})
     target_link_libraries(kv_event_publisher_test
                           PRIVATE ${KV_EVENT_TEST_ZMQ_LIBRARY})
   endif()

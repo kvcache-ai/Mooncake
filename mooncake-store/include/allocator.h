@@ -30,8 +30,33 @@ enum class ReplicaType {
 static constexpr size_t kAllocatorUnknownFreeSpace =
     std::numeric_limits<size_t>::max();
 
+class SegmentLifetime {
+   public:
+    static SegmentLifetime Available() { return SegmentLifetime(true); }
+    static SegmentLifetime Unavailable() { return SegmentLifetime(false); }
+
+    [[nodiscard]] bool isAvailable() const {
+        return available_->load(std::memory_order_acquire);
+    }
+
+    void invalidate() const {
+        available_->store(false, std::memory_order_release);
+    }
+
+    [[nodiscard]] bool isSameGeneration(const SegmentLifetime& other) const {
+        return available_ == other.available_;
+    }
+
+   private:
+    explicit SegmentLifetime(bool available)
+        : available_(std::make_shared<std::atomic<bool>>(available)) {}
+
+    std::shared_ptr<std::atomic<bool>> available_;
+};
+
 // Forward declarations
 class BufferAllocatorBase;
+class SegmentAllocator;
 
 class AllocatedBuffer {
    public:
@@ -60,9 +85,11 @@ class AllocatedBuffer {
 
     [[nodiscard]] std::size_t size() const noexcept { return this->size_; }
 
-    [[nodiscard]] bool isAllocatorValid() const {
-        return !allocator_.expired();
+    [[nodiscard]] bool isAvailable() const {
+        return !allocator_.expired() && segment_lifetime_.isAvailable();
     }
+
+    [[nodiscard]] bool getDescriptorIfAvailable(Descriptor& descriptor) const;
 
     // Serialize the buffer into a descriptor for transfer
     [[nodiscard]] Descriptor get_descriptor() const;
@@ -87,7 +114,14 @@ class AllocatedBuffer {
     void* get_vaddr_from_cxl();
 
    private:
+    void bindSegmentLifetime(SegmentLifetime lifetime) {
+        segment_lifetime_ = std::move(lifetime);
+    }
+
     std::weak_ptr<BufferAllocatorBase> allocator_;
+    // Managed allocations replace this compatibility lifetime with their
+    // segment generation.
+    SegmentLifetime segment_lifetime_ = SegmentLifetime::Available();
     std::string segment_name_;
     void* buffer_ptr_{nullptr};
     std::size_t size_{0};
@@ -97,6 +131,7 @@ class AllocatedBuffer {
         std::nullopt};
 
     friend class Serializer<AllocatedBuffer>;
+    friend class SegmentAllocator;
 };
 
 /**
@@ -113,6 +148,12 @@ class BufferAllocatorBase {
     virtual size_t size() const = 0;
     virtual std::string getSegmentName() const = 0;
     virtual std::string getTransportEndpoint() const = 0;
+
+    /**
+     * Returns the total free space available in this allocator. Allocators
+     * that cannot report this precisely return kAllocatorUnknownFreeSpace.
+     */
+    virtual size_t getTotalFreeSpace() const = 0;
 
     /**
      * Returns the largest free region available in this allocator.
@@ -178,6 +219,10 @@ class CachelibBufferAllocator
         return kAllocatorUnknownFreeSpace;
     }
 
+    size_t getTotalFreeSpace() const override {
+        return kAllocatorUnknownFreeSpace;
+    }
+
    private:
     // metadata
     const std::string segment_name_;
@@ -226,6 +271,8 @@ class OffsetBufferAllocator
      * Returns the actual largest free region from the offset allocator.
      */
     size_t getLargestFreeRegion() const override;
+
+    size_t getTotalFreeSpace() const override;
 
     // Public method to get offset_allocator
     std::shared_ptr<offset_allocator::OffsetAllocator> getOffsetAllocator()

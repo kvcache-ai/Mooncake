@@ -8,7 +8,6 @@
 #include <cstdint>
 #include <memory>
 #include <string>
-#include <unordered_set>
 #include <variant>
 #include <vector>
 #include <unordered_map>
@@ -181,6 +180,7 @@ struct LocalDiskReplicaData {
     UUID client_id;
     uint64_t object_size = 0;
     std::string transport_endpoint;
+    SegmentLifetime segment_lifetime = SegmentLifetime::Unavailable();
 };
 
 struct MemoryDescriptor {
@@ -240,12 +240,20 @@ class Replica {
         MasterMetricManager::instance().inc_allocated_file_size(object_size);
     }
 
-    // local disk replica constructor
+    // AddReplica replaces this compatibility lifetime with the current
+    // segment generation before storing the replica.
     Replica(UUID client_id, uint64_t object_size,
             std::string transport_endpoint, ReplicaStatus status)
+        : Replica(client_id, object_size, std::move(transport_endpoint),
+                  SegmentLifetime::Available(), status) {}
+
+    Replica(UUID client_id, uint64_t object_size,
+            std::string transport_endpoint, SegmentLifetime segment_lifetime,
+            ReplicaStatus status)
         : id_(next_id_.fetch_add(1)),
           data_(LocalDiskReplicaData{client_id, object_size,
-                                     std::move(transport_endpoint)}),
+                                     std::move(transport_endpoint),
+                                     std::move(segment_lifetime)}),
           status_(status),
           refcnt_(0) {
         MasterMetricManager::instance().inc_allocated_file_size(object_size);
@@ -305,6 +313,7 @@ class Replica {
     }
 
     [[nodiscard]] Descriptor get_descriptor() const;
+    [[nodiscard]] std::optional<Descriptor> get_available_descriptor() const;
 
     [[nodiscard]] ReplicaID id() const { return id_; }
 
@@ -368,37 +377,29 @@ class Replica {
         return replica.is_local_disk_replica();
     }
 
-    [[nodiscard]] bool has_invalid_mem_handle() const {
+    [[nodiscard]] bool is_available() const {
         if (is_memory_replica()) {
-            const auto& mem_data = std::get<MemoryReplicaData>(data_);
-            return !mem_data.buffer->isAllocatorValid();
+            const auto& data = std::get<MemoryReplicaData>(data_);
+            return data.buffer && data.buffer->isAvailable();
         }
-        return false;  // DiskReplicaData does not have handles
-    }
-
-    [[nodiscard]] bool has_invalid_nof_handle() const {
         if (is_nof_replica()) {
-            const auto& nof_data = std::get<NoFReplicaData>(data_);
-            return !nof_data.buffer->isAllocatorValid();
+            const auto& data = std::get<NoFReplicaData>(data_);
+            return data.buffer && data.buffer->isAvailable();
         }
-        return false;
+        if (is_local_disk_replica()) {
+            return std::get<LocalDiskReplicaData>(data_)
+                .segment_lifetime.isAvailable();
+        }
+        return true;
     }
 
-    /**
-     * @brief Check if a local_disk replica's owner client is still alive.
-     * Used by CleanupStaleHandles to remove replicas belonging to expired
-     * clients. For non-local_disk replicas, always returns false.
-     * @param alive_clients Set of currently alive client IDs.
-     * @return true if this is a local_disk replica whose client is not alive.
-     */
-    [[nodiscard]] bool has_stale_local_disk_client(
-        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients)
-        const {
-        auto client_id = get_local_disk_client_id();
-        if (client_id.has_value()) {
-            return alive_clients.find(client_id.value()) == alive_clients.end();
-        }
-        return false;
+    [[nodiscard]] bool is_completed_and_available() const {
+        return is_completed() && is_available();
+    }
+
+    [[nodiscard]] static bool fn_is_completed_and_available(
+        const Replica& replica) {
+        return replica.is_completed_and_available();
     }
 
     /**
@@ -573,6 +574,10 @@ class Replica {
     };
 
    private:
+    void bind_local_disk_lifetime(const SegmentLifetime& lifetime) {
+        std::get<LocalDiskReplicaData>(data_).segment_lifetime = lifetime;
+    }
+
     inline static std::atomic<ReplicaID> next_id_{1};
 
     ReplicaID id_;
@@ -633,12 +638,49 @@ inline Replica::Descriptor Replica::get_descriptor() const {
     return desc;
 }
 
+inline std::optional<Replica::Descriptor> Replica::get_available_descriptor()
+    const {
+    if (!is_memory_replica() && !is_nof_replica()) {
+        if (!is_available()) {
+            return std::nullopt;
+        }
+        return get_descriptor();
+    }
+
+    AllocatedBuffer* buffer = nullptr;
+    if (is_memory_replica()) {
+        buffer = std::get<MemoryReplicaData>(data_).buffer.get();
+    } else {
+        buffer = std::get<NoFReplicaData>(data_).buffer.get();
+    }
+    if (buffer == nullptr) {
+        return std::nullopt;
+    }
+
+    AllocatedBuffer::Descriptor buffer_descriptor;
+    if (!buffer->getDescriptorIfAvailable(buffer_descriptor)) {
+        return std::nullopt;
+    }
+
+    Descriptor descriptor;
+    descriptor.id = id_;
+    descriptor.status = status_;
+    if (is_memory_replica()) {
+        descriptor.descriptor_variant =
+            MemoryDescriptor{std::move(buffer_descriptor)};
+    } else {
+        descriptor.descriptor_variant =
+            NoFDescriptor{std::move(buffer_descriptor)};
+    }
+    return descriptor;
+}
+
 inline std::vector<std::optional<std::string>> Replica::get_segment_names()
     const {
     if (is_memory_replica()) {
         const auto& mem_data = std::get<MemoryReplicaData>(data_);
         std::vector<std::optional<std::string>> segment_names;
-        if (mem_data.buffer && mem_data.buffer->isAllocatorValid()) {
+        if (mem_data.buffer && mem_data.buffer->isAvailable()) {
             segment_names.push_back(mem_data.buffer->getSegmentName());
         } else {
             segment_names.push_back(std::nullopt);
@@ -647,7 +689,7 @@ inline std::vector<std::optional<std::string>> Replica::get_segment_names()
     } else if (is_nof_replica()) {
         const auto& nof_data = std::get<NoFReplicaData>(data_);
         std::vector<std::optional<std::string>> segment_names;
-        if (nof_data.buffer && nof_data.buffer->isAllocatorValid()) {
+        if (nof_data.buffer && nof_data.buffer->isAvailable()) {
             segment_names.push_back(nof_data.buffer->getSegmentName());
         } else {
             segment_names.push_back(std::nullopt);
