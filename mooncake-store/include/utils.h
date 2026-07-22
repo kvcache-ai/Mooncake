@@ -537,7 +537,20 @@ std::string GetEnvStringOr(const char* name, const std::string& default_value);
 
 std::string ResolveMooncakeHostId(const std::string& local_hostname);
 
+// Resolves the long-lived path layout used by master-managed DISK replicas.
+// Keep this layout stable because existing replica metadata stores these paths.
 std::string ResolvePathFromKey(const std::string& key,
                                const std::string& root_dir,
                                const std::string& fsdir);
+
+// Resolves the digest-based canonical layout used by the file-per-key backend.
+std::string ResolveFilePerKeyPathFromKey(const std::string& key,
+                                         const std::string& root_dir,
+                                         const std::string& fsdir);
+
+// Explicit alias for the pre-digest file-per-key layout, kept for reading and
+// migrating cache files written before digest filenames were introduced.
+std::string ResolveLegacyPathFromKey(const std::string& key,
+                                     const std::string& root_dir,
+                                     const std::string& fsdir);
 }  // namespace mooncake

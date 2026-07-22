@@ -6,8 +6,10 @@
 #include <sys/uio.h>
 #include <errno.h>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 
+#include <limits>
 #include <optional>
 #include <regex>
 #include <string>
@@ -231,6 +233,23 @@ tl::expected<void, ErrorCode> StorageBackend::Init(uint64_t quota_bytes = 0) {
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
     }
+
+    const fs::path staging_root = storage_root / ".staging";
+    const bool staging_exists = fs::exists(staging_root, ec);
+    if (ec) {
+        LOG(ERROR) << "Init: Failed to inspect staging directory: "
+                   << ec.message();
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    if (staging_exists) {
+        fs::remove_all(staging_root, ec);
+        if (ec) {
+            LOG(ERROR) << "Init: Failed to remove uncommitted staging files: "
+                       << ec.message();
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+    }
+
     const auto space_info = fs::space(storage_root, ec);
     if (ec) {
         LOG(ERROR) << "Init: Failed to get disk space info: " << ec.message();
@@ -485,6 +504,229 @@ tl::expected<std::vector<std::string>, ErrorCode> StorageBackend::StoreObject(
     return evicted_keys;
 }
 
+tl::expected<bool, ErrorCode> StorageBackend::StoreObjectAndRemoveFileIf(
+    const std::string& path, std::span<const char> data, const std::string& key,
+    const std::string& retire_path,
+    const std::function<tl::expected<bool, ErrorCode>(
+        const std::string& retire_path, const std::string& guard_path)>&
+        validator,
+    StorageBackendInterface::EvictionHandler eviction_handler) {
+    namespace fs = std::filesystem;
+
+    const uint64_t file_total_size = data.size();
+    uint64_t reserved_size = 0;
+
+    auto erase_tracked_record = [&](const std::string& record_path) {
+        uint64_t tracked_size = 0;
+        std::unique_lock<std::shared_mutex> lock(file_queue_mutex_);
+        auto it = file_queue_map_.find(record_path);
+        if (it != file_queue_map_.end()) {
+            tracked_size = it->second->size;
+            file_write_queue_.erase(it->second);
+            file_queue_map_.erase(it);
+        }
+        return tracked_size;
+    };
+
+    const fs::path staging_root =
+        fs::path(root_dir_) / GetActualFsdir() / ".staging";
+    std::string temp_path;
+
+    auto store_locked = [&]() -> tl::expected<bool, ErrorCode> {
+        if (IsEvictionEnabled()) {
+            std::shared_lock<std::shared_mutex> lock(file_queue_mutex_);
+            if (pending_eviction_paths_.find(path) !=
+                    pending_eviction_paths_.end() ||
+                pending_eviction_paths_.find(retire_path) !=
+                    pending_eviction_paths_.end()) {
+                lock.unlock();
+                ReleaseSpace(reserved_size);
+                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+            }
+        }
+
+        std::error_code staging_ec;
+        fs::create_directories(staging_root, staging_ec);
+        if (staging_ec) {
+            ReleaseSpace(reserved_size);
+            LOG(ERROR) << "Failed to create staging directory: " << staging_root
+                       << ", error: " << staging_ec.message();
+            return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+        }
+
+        std::string temp_template =
+            (staging_root / (fs::path(path).filename().string() + ".XXXXXX"))
+                .string();
+        std::vector<char> temp_buffer(temp_template.begin(),
+                                      temp_template.end());
+        temp_buffer.push_back('\0');
+        const int temp_fd = mkstemp(temp_buffer.data());
+        if (temp_fd < 0) {
+            ReleaseSpace(reserved_size);
+            LOG(ERROR) << "Failed to create exclusive staging file in: "
+                       << staging_root << ", error: " << strerror(errno);
+            return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+        }
+        temp_path = temp_buffer.data();
+        if (fchmod(temp_fd, 0644) != 0 ||
+            fcntl(temp_fd, F_SETFD, FD_CLOEXEC) == -1) {
+            const int setup_errno = errno;
+            close(temp_fd);
+            std::error_code remove_ec;
+            fs::remove(temp_path, remove_ec);
+            const bool removed =
+                !remove_ec || remove_ec == std::errc::no_such_file_or_directory;
+            if (IsEvictionEnabled()) {
+                if (removed) {
+                    ReleaseSpace(reserved_size);
+                } else {
+                    AddFileToWriteQueue(temp_path, file_total_size, "");
+                }
+            }
+            LOG(ERROR) << "Failed to configure staging file: " << temp_path
+                       << ", error: " << strerror(setup_errno);
+            return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+        }
+
+        std::unique_ptr<StorageFile> temp_file;
+#ifdef USE_URING
+        if (use_uring_) {
+            temp_file =
+                std::make_unique<UringFile>(temp_path, temp_fd, 32, false);
+        } else {
+#endif
+            temp_file = std::make_unique<PosixFile>(temp_path, temp_fd);
+#ifdef USE_URING
+        }
+#endif
+
+        auto discard_temp =
+            [&](ErrorCode error) -> tl::expected<bool, ErrorCode> {
+            std::error_code remove_ec;
+            fs::remove(temp_path, remove_ec);
+            const bool removed =
+                !remove_ec || remove_ec == std::errc::no_such_file_or_directory;
+            if (IsEvictionEnabled()) {
+                if (removed) {
+                    ReleaseSpace(reserved_size);
+                } else {
+                    // Conservatively retain the full reservation until the
+                    // uncommitted temp file is evicted.
+                    AddFileToWriteQueue(temp_path, file_total_size, "");
+                }
+            }
+            if (!removed) {
+                LOG(ERROR) << "Failed to remove uncommitted temp file: "
+                           << temp_path << ", error: " << remove_ec.message();
+            }
+            return tl::make_unexpected(error);
+        };
+
+        // Stage on the same filesystem and commit with one rename. The old
+        // canonical file and FIFO authority remain intact on every pre-commit
+        // failure.
+        auto write_result = WriteDataToFile(temp_file, temp_path, data,
+                                            /*reserved_size=*/0);
+        if (!write_result) {
+            temp_file.reset();
+            return discard_temp(write_result.error());
+        }
+        temp_file.reset();
+
+        auto validation_result = validator(retire_path, temp_path);
+        if (!validation_result) {
+            return discard_temp(validation_result.error());
+        }
+
+        std::error_code parent_ec;
+        fs::create_directories(fs::path(path).parent_path(), parent_ec);
+        if (parent_ec) {
+            LOG(ERROR) << "Failed to create canonical parent directory for: "
+                       << path << ", error: " << parent_ec.message();
+            return discard_temp(ErrorCode::FILE_WRITE_FAIL);
+        }
+
+        std::error_code rename_ec;
+        fs::rename(temp_path, path, rename_ec);
+        if (rename_ec) {
+            LOG(ERROR) << "Failed to commit canonical file: " << path
+                       << ", error: " << rename_ec.message();
+            return discard_temp(ErrorCode::FILE_WRITE_FAIL);
+        }
+
+        bool retire_remove_failed = false;
+        if (validation_result.value()) {
+            std::error_code remove_ec;
+            fs::remove(retire_path, remove_ec);
+            if (remove_ec &&
+                remove_ec != std::errc::no_such_file_or_directory) {
+                std::unique_lock<std::shared_mutex> lock(file_queue_mutex_);
+                auto it = file_queue_map_.find(retire_path);
+                if (it != file_queue_map_.end()) {
+                    it->second->key.clear();
+                }
+                retire_remove_failed = true;
+                LOG(ERROR) << "Failed to retire validated file: " << retire_path
+                           << ", error: " << remove_ec.message();
+            } else if (IsEvictionEnabled()) {
+                const uint64_t retired_size = erase_tracked_record(retire_path);
+                ReleaseSpace(retired_size);
+            }
+        }
+
+        if (IsEvictionEnabled()) {
+            AddFileToWriteQueue(path, file_total_size, key);
+        }
+        return retire_remove_failed;
+    };
+
+    const std::unordered_set<std::string> protected_paths = {path, retire_path};
+    bool paths_protected = false;
+    if (IsEvictionEnabled()) {
+        if (!initialized_.load(std::memory_order_acquire)) {
+            LOG(ERROR)
+                << "StorageBackend is not initialized. Call Init() before "
+                   "storing objects.";
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        if (!ProtectPathsFromEviction(protected_paths)) {
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        paths_protected = true;
+
+        auto space_result =
+            EnsureDiskSpace(file_total_size, eviction_handler, protected_paths);
+        if (!space_result) {
+            UnprotectPathsFromEviction(protected_paths);
+            return tl::make_unexpected(space_result.error());
+        }
+        reserved_size = file_total_size;
+    }
+
+    auto run_store_locked = [&]() -> tl::expected<bool, ErrorCode> {
+        Mutex* path_mutex = &GetFilePathMutex(path);
+        Mutex* retire_mutex = &GetFilePathMutex(retire_path);
+        if (path_mutex == retire_mutex) {
+            MutexLocker locker(path_mutex);
+            return store_locked();
+        }
+        if (std::less<Mutex*>{}(path_mutex, retire_mutex)) {
+            MutexLocker path_locker(path_mutex);
+            MutexLocker retire_locker(retire_mutex);
+            return store_locked();
+        }
+        MutexLocker retire_locker(retire_mutex);
+        MutexLocker path_locker(path_mutex);
+        return store_locked();
+    };
+
+    auto result = run_store_locked();
+    if (paths_protected) {
+        UnprotectPathsFromEviction(protected_paths);
+    }
+    return result;
+}
+
 tl::expected<void, ErrorCode> StorageBackend::LoadObject(
     const std::string& path, std::vector<Slice>& slices, int64_t length) {
     ResolvePath(path);
@@ -643,6 +885,178 @@ void StorageBackend::RemoveFile(const std::string& path) {
     RemoveFileFromWriteQueue(path);
 
     ReleaseSpace(file_size);
+}
+
+tl::expected<void, ErrorCode> StorageBackend::CleanupStagingFiles() {
+    namespace fs = std::filesystem;
+
+    const fs::path staging_root =
+        fs::path(root_dir_) / GetActualFsdir() / ".staging";
+    std::error_code ec;
+    const bool staging_exists = fs::exists(staging_root, ec);
+    if (ec) {
+        LOG(ERROR) << "Failed to inspect staging directory: " << staging_root
+                   << ", error: " << ec.message();
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+    if (!staging_exists) {
+        return {};
+    }
+
+    for (auto it = fs::directory_iterator(staging_root, ec);
+         !ec && it != fs::directory_iterator(); it.increment(ec)) {
+        const bool is_regular_file = it->is_regular_file(ec);
+        if (ec) break;
+        if (!is_regular_file) {
+            LOG(ERROR) << "Unexpected entry in staging directory: "
+                       << it->path();
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+
+        const auto staged_path = it->path().string();
+        RemoveFile(staged_path);
+        std::error_code verify_ec;
+        const bool staged_exists = fs::exists(staged_path, verify_ec);
+        if (verify_ec) {
+            LOG(ERROR) << "Failed to verify staged file cleanup: "
+                       << staged_path << ", error: " << verify_ec.message();
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+        if (staged_exists) {
+            LOG(ERROR) << "Staged file remains after cleanup: " << staged_path;
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+    }
+    if (ec) {
+        LOG(ERROR) << "Failed while scanning staging directory: "
+                   << staging_root << ", error: " << ec.message();
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+
+    fs::remove(staging_root, ec);
+    if (ec) {
+        LOG(ERROR) << "Failed to remove staging directory: " << staging_root
+                   << ", error: " << ec.message();
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    return {};
+}
+
+tl::expected<bool, ErrorCode> StorageBackend::RemoveFileIf(
+    const std::string& path, const std::string& guard_path,
+    const std::string& guard_key,
+    const std::function<tl::expected<bool, ErrorCode>(
+        const std::string& path, const std::string& guard_path)>& validator) {
+    namespace fs = std::filesystem;
+
+    bool pending_eviction = false;
+    auto remove_if_locked = [&]() -> tl::expected<bool, ErrorCode> {
+        uint64_t tracked_size = 0;
+        bool tracked = false;
+        {
+            std::shared_lock<std::shared_mutex> lock(file_queue_mutex_);
+            if (pending_eviction_paths_.find(path) !=
+                    pending_eviction_paths_.end() ||
+                pending_eviction_paths_.find(guard_path) !=
+                    pending_eviction_paths_.end()) {
+                pending_eviction = true;
+                return false;
+            }
+            auto map_it = file_queue_map_.find(path);
+            if (map_it != file_queue_map_.end()) {
+                tracked = true;
+                tracked_size = map_it->second->size;
+            }
+        }
+
+        auto validation_result = validator(path, guard_path);
+        if (!validation_result) {
+            return tl::make_unexpected(validation_result.error());
+        }
+
+        auto update_file_records = [&](bool remove_retired_record,
+                                       bool disarm_retired_record) {
+            std::unique_lock<std::shared_mutex> lock(file_queue_mutex_);
+            auto retired_it = file_queue_map_.find(path);
+            if (retired_it != file_queue_map_.end()) {
+                if (remove_retired_record) {
+                    file_write_queue_.erase(retired_it->second);
+                    file_queue_map_.erase(retired_it);
+                } else if (disarm_retired_record) {
+                    retired_it->second->key.clear();
+                }
+            }
+
+            auto guard_it = file_queue_map_.find(guard_path);
+            if (guard_it != file_queue_map_.end()) {
+                guard_it->second->key = guard_key;
+            }
+        };
+
+        if (!validation_result.value()) {
+            update_file_records(false, false);
+            return false;
+        }
+
+        std::error_code ec;
+        const bool removed = fs::remove(path, ec);
+        if (ec && ec != std::errc::no_such_file_or_directory) {
+            // The canonical guard is authoritative after validation. Prevent a
+            // later eviction of the same-key legacy shadow from notifying the
+            // master while leaving physical accounting intact for retry.
+            update_file_records(false, true);
+            LOG(ERROR) << "Failed to conditionally remove file: " << path
+                       << ", error: " << ec.message();
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+
+        update_file_records(true, false);
+        if (tracked) {
+            ReleaseSpace(tracked_size);
+        }
+        return removed || !ec || ec == std::errc::no_such_file_or_directory;
+    };
+
+    Mutex* path_mutex = &GetFilePathMutex(path);
+    Mutex* guard_mutex = &GetFilePathMutex(guard_path);
+    auto run_with_path_locks = [&]() -> tl::expected<bool, ErrorCode> {
+        if (path_mutex == guard_mutex) {
+            MutexLocker locker(path_mutex);
+            return remove_if_locked();
+        }
+
+        if (std::less<Mutex*>{}(path_mutex, guard_mutex)) {
+            MutexLocker path_locker(path_mutex);
+            MutexLocker guard_locker(guard_mutex);
+            return remove_if_locked();
+        }
+
+        MutexLocker guard_locker(guard_mutex);
+        MutexLocker path_locker(path_mutex);
+        return remove_if_locked();
+    };
+
+    while (true) {
+        pending_eviction = false;
+        auto result = run_with_path_locks();
+        if (!pending_eviction) {
+            return result;
+        }
+
+        std::unique_lock<std::shared_mutex> lock(file_queue_mutex_);
+        const bool ready =
+            pending_eviction_cv_.wait_for(lock, std::chrono::seconds(5), [&]() {
+                return pending_eviction_paths_.find(path) ==
+                           pending_eviction_paths_.end() &&
+                       pending_eviction_paths_.find(guard_path) ==
+                           pending_eviction_paths_.end();
+            });
+        if (!ready) {
+            LOG(ERROR) << "Timed out waiting for file eviction before retiring "
+                       << path;
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+    }
 }
 
 void StorageBackend::RemoveByRegex(const std::string& regex_pattern) {
@@ -970,34 +1384,86 @@ void StorageBackend::RemoveFileFromWriteQueue(const std::string& path) {
     }
 }
 
-FileRecord StorageBackend::PopFileToEvictByFIFO() {
+bool StorageBackend::ProtectPathsFromEviction(
+    const std::unordered_set<std::string>& paths) {
+    std::unique_lock<std::shared_mutex> lock(file_queue_mutex_);
+    for (const auto& path : paths) {
+        if (pending_eviction_paths_.find(path) !=
+            pending_eviction_paths_.end()) {
+            return false;
+        }
+    }
+    for (const auto& path : paths) {
+        ++eviction_protected_path_counts_[path];
+    }
+    return true;
+}
+
+void StorageBackend::UnprotectPathsFromEviction(
+    const std::unordered_set<std::string>& paths) {
+    std::unique_lock<std::shared_mutex> lock(file_queue_mutex_);
+    for (const auto& path : paths) {
+        auto it = eviction_protected_path_counts_.find(path);
+        if (it == eviction_protected_path_counts_.end()) {
+            continue;
+        }
+        if (--it->second == 0) {
+            eviction_protected_path_counts_.erase(it);
+        }
+    }
+}
+
+FileRecord StorageBackend::PopFileToEvictByFIFO(
+    const std::unordered_set<std::string>& excluded_paths) {
+    auto is_excluded = [&](const FileRecord& record) {
+        for (const auto& excluded_path : excluded_paths) {
+            if (record.path == excluded_path) {
+                return true;
+            }
+        }
+        for (const auto& [protected_path, count] :
+             eviction_protected_path_counts_) {
+            if (count > 0 && record.path == protected_path) {
+                return true;
+            }
+        }
+        return false;
+    };
+
     while (true) {
         std::string candidate_path;
         {
             std::shared_lock<std::shared_mutex> lock(file_queue_mutex_);
-            if (file_write_queue_.empty()) {
-                LOG(WARNING) << "Queue is empty, cannot select file to evict";
+            const auto candidate = std::find_if(
+                file_write_queue_.begin(), file_write_queue_.end(),
+                [&](const FileRecord& record) { return !is_excluded(record); });
+            if (candidate == file_write_queue_.end()) {
+                LOG(WARNING) << "Queue has no eligible file to evict";
                 return {};
             }
-            candidate_path = file_write_queue_.front().path;
+            candidate_path = candidate->path;
         }
 
         MutexLocker path_locker(&GetFilePathMutex(candidate_path));
         std::unique_lock<std::shared_mutex> lock(file_queue_mutex_);
-        if (file_write_queue_.empty() ||
-            file_write_queue_.front().path != candidate_path) {
+        const auto candidate = std::find_if(
+            file_write_queue_.begin(), file_write_queue_.end(),
+            [&](const FileRecord& record) { return !is_excluded(record); });
+        if (candidate == file_write_queue_.end()) {
+            return {};
+        }
+        if (candidate->path != candidate_path) {
             continue;
         }
 
         auto map_it = file_queue_map_.find(candidate_path);
-        if (map_it == file_queue_map_.end() ||
-            map_it->second != file_write_queue_.begin()) {
+        if (map_it == file_queue_map_.end() || map_it->second != candidate) {
             continue;
         }
 
-        FileRecord record = file_write_queue_.front();
+        FileRecord record = *candidate;
         file_queue_map_.erase(map_it);
-        file_write_queue_.pop_front();
+        file_write_queue_.erase(candidate);
         pending_eviction_paths_.insert(record.path);
         return record;
     }
@@ -1013,6 +1479,7 @@ void StorageBackend::RestoreFileToWriteQueueFront(const FileRecord& record) {
         MutexLocker path_locker(&GetFilePathMutex(record.path));
         std::unique_lock<std::shared_mutex> lock(file_queue_mutex_);
         pending_eviction_paths_.erase(record.path);
+        pending_eviction_cv_.notify_all();
         if (file_queue_map_.find(record.path) != file_queue_map_.end()) {
             was_replaced = true;
         } else {
@@ -1043,6 +1510,7 @@ tl::expected<void, ErrorCode> StorageBackend::DeleteEvictedFile(
             // accounting without deleting the new file.
             was_replaced = true;
             pending_eviction_paths_.erase(record.path);
+            pending_eviction_cv_.notify_all();
         }
     }
     if (was_replaced) {
@@ -1057,6 +1525,7 @@ tl::expected<void, ErrorCode> StorageBackend::DeleteEvictedFile(
         {
             std::unique_lock<std::shared_mutex> queue_lock(file_queue_mutex_);
             pending_eviction_paths_.erase(record.path);
+            pending_eviction_cv_.notify_all();
         }
         ReleaseSpace(record.size);
         return {};
@@ -1070,7 +1539,8 @@ tl::expected<void, ErrorCode> StorageBackend::DeleteEvictedFile(
 tl::expected<std::vector<std::string>, ErrorCode>
 StorageBackend::EnsureDiskSpace(
     size_t required_size,
-    StorageBackendInterface::EvictionHandler eviction_handler) {
+    StorageBackendInterface::EvictionHandler eviction_handler,
+    const std::unordered_set<std::string>& excluded_paths) {
     std::vector<std::string> evicted_keys;
     // If eviction is disabled, skip space checking and eviction
     if (!IsEvictionEnabled()) {
@@ -1094,7 +1564,7 @@ StorageBackend::EnsureDiskSpace(
     std::vector<FileRecord> pending_evictions;
     while (projected_available_space < required_size &&
            attempts < kMaxEvictionAttempts) {
-        FileRecord pending = PopFileToEvictByFIFO();
+        FileRecord pending = PopFileToEvictByFIFO(excluded_paths);
         if (pending.path.empty()) {
             LOG(ERROR) << "Failed to evict file to make space.";
             for (auto it = pending_evictions.rbegin();
@@ -1293,6 +1763,99 @@ StorageBackendAdaptor::StorageBackendAdaptor(
       total_keys(0),
       total_size(0) {}
 
+tl::expected<std::optional<StorageBackendAdaptor::LoadedKVEntry>, ErrorCode>
+StorageBackendAdaptor::TryLoadKvEntry(const std::string& path,
+                                      bool unrepresentable_is_missing) {
+    namespace fs = std::filesystem;
+
+    std::error_code ec;
+    const auto size = fs::file_size(path, ec);
+    if (ec) {
+        if (ec == std::errc::no_such_file_or_directory ||
+            (unrepresentable_is_missing &&
+             (ec == std::errc::filename_too_long ||
+              ec == std::errc::is_a_directory))) {
+            return std::nullopt;
+        }
+        LOG(ERROR) << "Failed to inspect file-per-key entry: " << path
+                   << ", error: " << ec.message();
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+
+    if (size > static_cast<uintmax_t>(std::numeric_limits<int64_t>::max())) {
+        LOG(ERROR) << "File-per-key entry is too large to read: " << path;
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+
+    std::string kv_buf;
+    auto load_result =
+        storage_backend_->LoadObject(path, kv_buf, static_cast<int64_t>(size));
+    if (!load_result) {
+        return tl::make_unexpected(load_result.error());
+    }
+
+    try {
+        KVEntry kv;
+        struct_pb::from_pb(kv, kv_buf);
+        return std::optional<LoadedKVEntry>(
+            LoadedKVEntry{std::move(kv), static_cast<int64_t>(size)});
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Failed to decode file-per-key entry: " << path
+                   << ", error: " << e.what();
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+}
+
+tl::expected<bool, ErrorCode> StorageBackendAdaptor::CleanupLegacyFile(
+    const std::string& key) {
+    namespace fs = std::filesystem;
+
+    const auto canonical_path = ResolveFilePerKeyPathFromKey(
+        key, file_storage_config_.storage_filepath, file_per_key_config_.fsdir);
+    const auto legacy_path = ResolveLegacyPathFromKey(
+        key, file_storage_config_.storage_filepath, file_per_key_config_.fsdir);
+    if (fs::path(canonical_path).lexically_normal() ==
+        fs::path(legacy_path).lexically_normal()) {
+        return false;
+    }
+
+    return storage_backend_->RemoveFileIf(
+        legacy_path, canonical_path, key,
+        [this, &key](
+            const std::string& candidate_path,
+            const std::string& guard_path) -> tl::expected<bool, ErrorCode> {
+            auto canonical_entry = TryLoadKvEntry(guard_path);
+            if (!canonical_entry) {
+                return tl::make_unexpected(canonical_entry.error());
+            }
+            if (!canonical_entry.value() ||
+                canonical_entry.value()->kv.key != key) {
+                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            }
+
+            auto legacy_entry =
+                TryLoadKvEntry(candidate_path,
+                               /*unrepresentable_is_missing=*/true);
+            if (!legacy_entry) {
+                return tl::make_unexpected(legacy_entry.error());
+            }
+            return legacy_entry.value() && legacy_entry.value()->kv.key == key;
+        });
+}
+
+void StorageBackendAdaptor::UpsertKeyAccounting(const std::string& key,
+                                                int64_t serialized_size) {
+    auto [it, inserted] = accounted_size_by_key_.emplace(key, serialized_size);
+    if (inserted) {
+        total_keys++;
+        total_size += serialized_size;
+        return;
+    }
+
+    total_size += serialized_size - it->second;
+    it->second = serialized_size;
+}
+
 tl::expected<void, ErrorCode> StorageBackendAdaptor::Init() {
     std::string storage_root =
         file_storage_config_.storage_filepath + file_per_key_config_.fsdir;
@@ -1338,56 +1901,123 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
         return tl::make_unexpected(ErrorCode::INVALID_KEY);
     }
 
-    auto enable_offloading_res = IsEnableOffloading();
-    if (!enable_offloading_res) {
-        return tl::make_unexpected(enable_offloading_res.error());
-    }
     std::vector<StorageObjectMetadata> metadatas;
     std::vector<std::string> keys;
     metadatas.reserve(batch_object.size());
     keys.reserve(batch_object.size());
 
-    // Process each key; continue on individual failures to support partial
-    // success
-    for (auto& object : batch_object) {
-        KVEntry kv;
-        kv.key = object.first;
-        auto value = object.second;
-
-        // Test-only: Check if this key should fail (deterministic failure
-        // injection)
-        if (test_failure_predicate_ && test_failure_predicate_(kv.key)) {
-            LOG(INFO) << "[TEST] Injecting failure for key: " << kv.key
-                      << " (test failure predicate)";
-            continue;  // Simulate StoreObject failure
+    {
+        // Serialize ScanMeta with the whole write/legacy-retirement window so
+        // active staging files can never be mistaken for crash leftovers.
+        MutexLocker batch_lock(&mutex_);
+        if (!file_per_key_config_.enable_eviction) {
+            if (!meta_scanned_.load(std::memory_order_acquire)) {
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            if (total_keys > file_storage_config_.total_keys_limit ||
+                total_size > file_storage_config_.total_size_limit) {
+                return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
+            }
         }
 
-        auto path =
-            ResolvePathFromKey(kv.key, file_storage_config_.storage_filepath,
-                               file_per_key_config_.fsdir);
-        kv.value = ConcatSlicesToString(value);
+        // Process each key; continue on individual failures to support partial
+        // success
+        for (auto& object : batch_object) {
+            KVEntry kv;
+            kv.key = object.first;
+            auto value = object.second;
 
-        std::string kv_buf;
-        struct_pb::to_pb(kv, kv_buf);
-        auto store_result = storage_backend_->StoreObject(path, kv_buf, kv.key,
-                                                          eviction_handler);
-        if (!store_result) {
-            LOG(ERROR) << "Failed to store object for key: " << kv.key
-                       << ", error: " << store_result.error()
-                       << " - continuing with remaining keys";
-            continue;  // Continue processing other keys
+            // Test-only: Check if this key should fail (deterministic failure
+            // injection)
+            if (test_failure_predicate_ && test_failure_predicate_(kv.key)) {
+                LOG(INFO) << "[TEST] Injecting failure for key: " << kv.key
+                          << " (test failure predicate)";
+                continue;  // Simulate StoreObject failure
+            }
+
+            auto path = ResolveFilePerKeyPathFromKey(
+                kv.key, file_storage_config_.storage_filepath,
+                file_per_key_config_.fsdir);
+            kv.value = ConcatSlicesToString(value);
+
+            std::string kv_buf;
+            struct_pb::to_pb(kv, kv_buf);
+            int64_t accounted_size = static_cast<int64_t>(kv_buf.size());
+            const auto legacy_path = ResolveLegacyPathFromKey(
+                kv.key, file_storage_config_.storage_filepath,
+                file_per_key_config_.fsdir);
+            int64_t validated_legacy_size = 0;
+            bool legacy_remove_failed = false;
+            tl::expected<bool, ErrorCode> store_result = false;
+            if (std::filesystem::path(path).lexically_normal() ==
+                std::filesystem::path(legacy_path).lexically_normal()) {
+                auto direct_store = storage_backend_->StoreObject(
+                    path, kv_buf, kv.key, eviction_handler);
+                if (!direct_store) {
+                    store_result = tl::make_unexpected(direct_store.error());
+                }
+            } else {
+                store_result = storage_backend_->StoreObjectAndRemoveFileIf(
+                    path, std::span<const char>(kv_buf.data(), kv_buf.size()),
+                    kv.key, legacy_path,
+                    [this, &kv, &validated_legacy_size](
+                        const std::string& candidate_path,
+                        const std::string&) -> tl::expected<bool, ErrorCode> {
+                        auto legacy_entry =
+                            TryLoadKvEntry(candidate_path,
+                                           /*unrepresentable_is_missing=*/true);
+                        if (!legacy_entry) {
+                            return tl::make_unexpected(legacy_entry.error());
+                        }
+                        if (!legacy_entry.value() ||
+                            legacy_entry.value()->kv.key != kv.key) {
+                            return false;
+                        }
+                        validated_legacy_size =
+                            legacy_entry.value()->serialized_size;
+                        return true;
+                    },
+                    eviction_handler);
+            }
+            if (!store_result) {
+                LOG(ERROR) << "Failed to atomically store object for key: "
+                           << kv.key << ", error: " << store_result.error()
+                           << " - continuing with remaining keys";
+                if (!file_per_key_config_.enable_eviction) {
+                    meta_scanned_.store(false, std::memory_order_release);
+                }
+                continue;
+            }
+            legacy_remove_failed = store_result.value();
+            if (legacy_remove_failed) {
+                LOG(WARNING)
+                    << "Failed to remove validated legacy file for key: "
+                    << kv.key
+                    << ". Its FIFO record was disarmed and cleanup will be "
+                       "retried "
+                       "by ScanMeta.";
+                if (!file_per_key_config_.enable_eviction) {
+                    if (validated_legacy_size < 0 ||
+                        validated_legacy_size >
+                            std::numeric_limits<int64_t>::max() -
+                                accounted_size) {
+                        LOG(ERROR)
+                            << "Failed to account legacy shadow for key: "
+                            << kv.key;
+                        meta_scanned_.store(false, std::memory_order_release);
+                        continue;
+                    }
+                    accounted_size += validated_legacy_size;
+                }
+            }
+
+            UpsertKeyAccounting(kv.key, accounted_size);
+
+            metadatas.emplace_back(StorageObjectMetadata{
+                -1, 0, static_cast<int64_t>(kv.key.size()),
+                static_cast<int64_t>(kv.value.size()), ""});
+            keys.emplace_back(kv.key);
         }
-
-        {
-            MutexLocker lock(&mutex_);
-            total_keys++;
-            total_size += kv_buf.size();
-        }
-
-        metadatas.emplace_back(
-            StorageObjectMetadata{-1, 0, static_cast<int64_t>(kv.key.size()),
-                                  static_cast<int64_t>(kv.value.size()), ""});
-        keys.emplace_back(kv.key);
     }
 
     // Only report successful keys to master
@@ -1421,10 +2051,32 @@ StorageBackendAdaptor::EvictAboveDiskWatermark(
 
 tl::expected<bool, ErrorCode> StorageBackendAdaptor::IsExist(
     const std::string& key) {
-    auto path = ResolvePathFromKey(key, file_storage_config_.storage_filepath,
-                                   file_per_key_config_.fsdir);
     namespace fs = std::filesystem;
-    return fs::exists(path);
+    const auto path = ResolveFilePerKeyPathFromKey(
+        key, file_storage_config_.storage_filepath, file_per_key_config_.fsdir);
+    std::error_code canonical_ec;
+    const bool canonical_exists = fs::exists(path, canonical_ec);
+    if (canonical_ec) {
+        LOG(ERROR) << "Failed to inspect canonical file-per-key entry: " << path
+                   << ", error: " << canonical_ec.message();
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+    if (canonical_exists) {
+        return true;
+    }
+
+    const auto legacy_path = ResolveLegacyPathFromKey(
+        key, file_storage_config_.storage_filepath, file_per_key_config_.fsdir);
+    // Legacy filenames can collide and contain no independent key metadata, so
+    // ownership cannot be established from existence alone. This compatibility
+    // path reads and decodes the full object; a prefix-only parser can optimize
+    // it in a follow-up without weakening the key check.
+    auto legacy_entry =
+        TryLoadKvEntry(legacy_path, /*unrepresentable_is_missing=*/true);
+    if (!legacy_entry) {
+        return tl::make_unexpected(legacy_entry.error());
+    }
+    return legacy_entry.value() && legacy_entry.value()->kv.key == key;
 }
 
 tl::expected<void, ErrorCode> StorageBackendAdaptor::BatchLoad(
@@ -1432,9 +2084,33 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::BatchLoad(
     for (const auto& [key, slice] : batched_slices) {
         KVEntry kv;
         kv.key = key;
-        auto path =
-            ResolvePathFromKey(kv.key, file_storage_config_.storage_filepath,
-                               file_per_key_config_.fsdir);
+        auto path = ResolveFilePerKeyPathFromKey(
+            kv.key, file_storage_config_.storage_filepath,
+            file_per_key_config_.fsdir);
+        std::error_code canonical_ec;
+        const bool canonical_exists =
+            std::filesystem::exists(path, canonical_ec);
+        if (canonical_ec) {
+            LOG(ERROR) << "Failed to inspect canonical file for key: " << key
+                       << ", error: " << canonical_ec.message();
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+        if (!canonical_exists) {
+            const auto legacy_path = ResolveLegacyPathFromKey(
+                kv.key, file_storage_config_.storage_filepath,
+                file_per_key_config_.fsdir);
+            std::error_code legacy_ec;
+            const bool legacy_exists =
+                std::filesystem::exists(legacy_path, legacy_ec);
+            if (legacy_ec) {
+                LOG(ERROR) << "Failed to inspect legacy file for key: " << key
+                           << ", error: " << legacy_ec.message();
+                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            }
+            if (legacy_exists) {
+                path = legacy_path;
+            }
+        }
 
         kv.value.resize(slice.size);
 
@@ -1447,7 +2123,25 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::BatchLoad(
             return tl::make_unexpected(r.error());
         }
 
-        struct_pb::from_pb(kv, kv_buf);
+        try {
+            struct_pb::from_pb(kv, kv_buf);
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "Failed to decode file for key: " << key
+                       << ", error: " << e.what();
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+
+        if (kv.key != key) {
+            LOG(ERROR) << "Stored key does not match requested key";
+            return tl::make_unexpected(ErrorCode::INVALID_KEY);
+        }
+        if (kv.value.size() != slice.size) {
+            LOG(ERROR)
+                << "Stored value size does not match destination for key: "
+                << key << ", expected: " << slice.size
+                << ", got: " << kv.value.size();
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
 
         if (!kv.value.empty()) {
             std::memcpy(slice.ptr, kv.value.data(), kv.value.size());
@@ -1461,12 +2155,12 @@ tl::expected<bool, ErrorCode> StorageBackendAdaptor::IsEnableOffloading() {
         return true;
     }
 
+    MutexLocker lock(&mutex_);
+
     if (!meta_scanned_.load(std::memory_order_acquire)) {
         LOG(ERROR) << "Metadata has not been loaded yet";
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-
-    MutexLocker lock(&mutex_);
 
     auto is_enable_offloading =
         total_keys <= file_storage_config_.total_keys_limit &&
@@ -1481,15 +2175,38 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
                   std::vector<StorageObjectMetadata>& metadatas)>& handler) {
     namespace fs = std::filesystem;
 
+    MutexLocker lock(&mutex_);
+
+    // Rebuild accounting from the current on-disk snapshot. Offloading remains
+    // disabled until the whole scan and any legacy cleanup succeed.
+    meta_scanned_.store(false, std::memory_order_release);
+    accounted_size_by_key_.clear();
+    total_keys = 0;
+    total_size = 0;
+
     fs::path root = fs::path(file_storage_config_.storage_filepath) /
                     file_per_key_config_.fsdir;
-    if (!fs::exists(root)) {
+    std::error_code root_ec;
+    const bool root_exists = fs::exists(root, root_ec);
+    if (root_ec) {
+        LOG(ERROR) << "Failed to inspect file-per-key root: " << root
+                   << ", error: " << root_ec.message();
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+    if (!root_exists) {
         meta_scanned_.store(true, std::memory_order_release);
         return {};
     }
 
+    auto staging_cleanup = storage_backend_->CleanupStagingFiles();
+    if (!staging_cleanup) {
+        return tl::make_unexpected(staging_cleanup.error());
+    }
+
     std::vector<std::string> keys;
     std::vector<StorageObjectMetadata> metas;
+    std::vector<std::string> legacy_keys_to_cleanup;
+    std::unordered_set<std::string> registered_keys;
 
     auto flush = [&]() -> tl::expected<void, ErrorCode> {
         if (keys.empty()) return {};
@@ -1500,13 +2217,33 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
         return {};
     };
 
-    MutexLocker lock(&mutex_);
+    auto register_entry =
+        [&](const std::string& key, int64_t value_size, int64_t serialized_size,
+            const std::string& path) -> tl::expected<void, ErrorCode> {
+        if (!registered_keys.emplace(key).second) {
+            return {};
+        }
+
+        storage_backend_->UpdateFileRecordKey(path, key);
+        UpsertKeyAccounting(key, serialized_size);
+        keys.emplace_back(key);
+        metas.emplace_back(StorageObjectMetadata{
+            -1, 0, static_cast<int64_t>(key.size()), value_size, ""});
+
+        if (static_cast<int64_t>(keys.size()) >=
+            file_storage_config_.scanmeta_iterator_keys_limit) {
+            return flush();
+        }
+        return {};
+    };
 
     std::error_code ec_root;
     for (auto it1 = fs::directory_iterator(root, ec_root);
          !ec_root && it1 != fs::directory_iterator(); it1.increment(ec_root)) {
         if (ec_root) break;
-        if (!it1->is_directory(ec_root) || ec_root) continue;
+        const bool is_first_level_directory = it1->is_directory(ec_root);
+        if (ec_root) break;
+        if (!is_first_level_directory) continue;
 
         const auto& d1 = it1->path();
 
@@ -1514,7 +2251,9 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
         for (auto it2 = fs::directory_iterator(d1, ec_d1);
              !ec_d1 && it2 != fs::directory_iterator(); it2.increment(ec_d1)) {
             if (ec_d1) break;
-            if (!it2->is_directory(ec_d1) || ec_d1) continue;
+            const bool is_second_level_directory = it2->is_directory(ec_d1);
+            if (ec_d1) break;
+            if (!is_second_level_directory) continue;
 
             const auto& leaf = it2->path();
 
@@ -1524,37 +2263,110 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
                  it.increment(ec_leaf)) {
                 if (ec_leaf) break;
                 const auto& p = it->path();
-                if (!it->is_regular_file(ec_leaf) || ec_leaf) continue;
+                const bool is_regular_file = it->is_regular_file(ec_leaf);
+                if (ec_leaf) break;
+                if (!is_regular_file) continue;
 
                 uintmax_t sz = fs::file_size(p, ec_leaf);
-                if (ec_leaf) continue;
+                if (ec_leaf) break;
 
                 std::string buf;
                 auto r =
                     storage_backend_->LoadObject(p.string(), buf, (int64_t)sz);
-                if (!r) continue;
+                if (!r) {
+                    LOG(ERROR) << "Failed to read file-per-key metadata: " << p
+                               << ", error: " << r.error();
+                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                }
 
                 KVEntry kv;
                 struct_pb::from_pb(kv, buf);
-                storage_backend_->UpdateFileRecordKey(p.string(), kv.key);
 
-                total_keys++;
-                total_size += buf.size();
-
-                keys.emplace_back(std::move(kv.key));
-                metas.emplace_back(StorageObjectMetadata{
-                    -1, 0, (int64_t)keys.back().size(),
-                    static_cast<int64_t>(kv.value.size()), ""});
-
-                if ((int64_t)keys.size() >=
-                    file_storage_config_.scanmeta_iterator_keys_limit) {
-                    auto fr = flush();
-                    if (!fr) return fr;
+                const auto canonical_path = ResolveFilePerKeyPathFromKey(
+                    kv.key, file_storage_config_.storage_filepath,
+                    file_per_key_config_.fsdir);
+                if (p.lexically_normal() !=
+                    fs::path(canonical_path).lexically_normal()) {
+                    auto canonical_entry = TryLoadKvEntry(canonical_path);
+                    if (!canonical_entry) {
+                        return tl::make_unexpected(canonical_entry.error());
+                    }
+                    if (canonical_entry.value() &&
+                        canonical_entry.value()->kv.key == kv.key) {
+                        auto register_result = register_entry(
+                            canonical_entry.value()->kv.key,
+                            static_cast<int64_t>(
+                                canonical_entry.value()->kv.value.size()),
+                            canonical_entry.value()->serialized_size,
+                            canonical_path);
+                        if (!register_result) {
+                            return register_result;
+                        }
+                        const auto legacy_path = ResolveLegacyPathFromKey(
+                            kv.key, file_storage_config_.storage_filepath,
+                            file_per_key_config_.fsdir);
+                        if (p.lexically_normal() ==
+                            fs::path(legacy_path).lexically_normal()) {
+                            legacy_keys_to_cleanup.emplace_back(kv.key);
+                        }
+                        continue;
+                    }
                 }
+                auto register_result = register_entry(
+                    kv.key, static_cast<int64_t>(kv.value.size()),
+                    static_cast<int64_t>(buf.size()), p.string());
+                if (!register_result) {
+                    return register_result;
+                }
+            }
+
+            if (ec_leaf) {
+                LOG(ERROR) << "Failed while scanning file-per-key directory: "
+                           << leaf << ", error: " << ec_leaf.message();
+                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
             }
 
             auto fr = flush();
             if (!fr) return fr;
+        }
+
+        if (ec_d1) {
+            LOG(ERROR) << "Failed while scanning file-per-key directory: " << d1
+                       << ", error: " << ec_d1.message();
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+    }
+
+    if (ec_root) {
+        LOG(ERROR) << "Failed while scanning file-per-key root: " << root
+                   << ", error: " << ec_root.message();
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+
+    for (const auto& key : legacy_keys_to_cleanup) {
+        auto cleanup_result = CleanupLegacyFile(key);
+        if (!cleanup_result) {
+            return tl::make_unexpected(cleanup_result.error());
+        }
+        if (cleanup_result.value()) {
+            continue;
+        }
+
+        const auto legacy_path =
+            ResolveLegacyPathFromKey(key, file_storage_config_.storage_filepath,
+                                     file_per_key_config_.fsdir);
+        std::error_code legacy_ec;
+        const bool legacy_exists = fs::exists(legacy_path, legacy_ec);
+        if (legacy_ec) {
+            LOG(ERROR) << "Failed to verify legacy cleanup for key: " << key
+                       << ", error: " << legacy_ec.message();
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+        if (legacy_exists) {
+            LOG(ERROR) << "Legacy file remains after canonical recovery for "
+                          "key: "
+                       << key;
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
     }
 

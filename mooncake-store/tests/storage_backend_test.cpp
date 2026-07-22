@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include <filesystem>
+#include <array>
 #include <iostream>
 #include <limits>
 #include <ranges>
@@ -22,6 +23,28 @@
 
 namespace fs = std::filesystem;
 namespace mooncake::test {
+
+static std::pair<std::string, std::string> FindLegacyPathCollision(
+    const std::string& root_dir, const std::string& fsdir) {
+    constexpr std::array<char, 10> kChars = {'_', '/', '\\', ':', '*',
+                                             '?', '"', '<',  '>', '|'};
+    std::unordered_map<std::string, std::string> key_by_path;
+    const std::string tenant_prefix("default\0", 8);
+    for (size_t value = 0; value < 10000; ++value) {
+        size_t remaining = value;
+        std::string key = tenant_prefix;
+        for (size_t i = 0; i < 4; ++i) {
+            key.push_back(kChars[remaining % kChars.size()]);
+            remaining /= kChars.size();
+        }
+        const auto path = ResolveLegacyPathFromKey(key, root_dir, fsdir);
+        auto [it, inserted] = key_by_path.emplace(path, key);
+        if (!inserted && it->second != key) {
+            return {it->second, key};
+        }
+    }
+    return {};
+}
 
 class StorageBackendTest : public ::testing::Test {
    protected:
@@ -708,6 +731,858 @@ TEST_F(StorageBackendTest, AdaptorBatchOffloadAndBatchLoad) {
     }
 }
 
+TEST_F(StorageBackendTest, AdaptorSeparatesLegacyPathCollisions) {
+    FileStorageConfig cfg;
+    cfg.storage_filepath = data_path;
+    FilePerKeyConfig backend_config;
+    backend_config.fsdir = "file_per_key_collision";
+    backend_config.enable_eviction = false;
+
+    auto [first_key, second_key] =
+        FindLegacyPathCollision(cfg.storage_filepath, backend_config.fsdir);
+    ASSERT_FALSE(first_key.empty());
+    ASSERT_EQ(ResolveLegacyPathFromKey(first_key, cfg.storage_filepath,
+                                       backend_config.fsdir),
+              ResolveLegacyPathFromKey(second_key, cfg.storage_filepath,
+                                       backend_config.fsdir));
+    ASSERT_NE(ResolveFilePerKeyPathFromKey(first_key, cfg.storage_filepath,
+                                           backend_config.fsdir),
+              ResolveFilePerKeyPathFromKey(second_key, cfg.storage_filepath,
+                                           backend_config.fsdir));
+
+    StorageBackendAdaptor adaptor(cfg, backend_config);
+    ASSERT_TRUE(adaptor.Init());
+    ASSERT_TRUE(adaptor.ScanMeta(
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+
+    std::string first_value(64, 'a');
+    std::string second_value(64, 'b');
+    std::unordered_map<std::string, std::vector<Slice>> batch = {
+        {first_key, {{first_value.data(), first_value.size()}}},
+        {second_key, {{second_value.data(), second_value.size()}}},
+    };
+    auto offload_result = adaptor.BatchOffload(
+        batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_TRUE(offload_result);
+    EXPECT_EQ(offload_result.value(), 2);
+
+    std::array<char, 64> first_output{};
+    std::array<char, 64> second_output{};
+    std::unordered_map<std::string, Slice> loads = {
+        {first_key, {first_output.data(), first_output.size()}},
+        {second_key, {second_output.data(), second_output.size()}},
+    };
+    ASSERT_TRUE(adaptor.BatchLoad(loads));
+    EXPECT_EQ(std::string(first_output.data(), first_output.size()),
+              first_value);
+    EXPECT_EQ(std::string(second_output.data(), second_output.size()),
+              second_value);
+}
+
+TEST_F(StorageBackendTest, AdaptorValidatesLegacyFallbackKey) {
+    FileStorageConfig cfg;
+    cfg.storage_filepath = data_path;
+    FilePerKeyConfig backend_config;
+    backend_config.fsdir = "file_per_key_legacy_fallback";
+    backend_config.enable_eviction = false;
+
+    auto [stored_key, colliding_key] =
+        FindLegacyPathCollision(cfg.storage_filepath, backend_config.fsdir);
+    ASSERT_FALSE(stored_key.empty());
+
+    StorageBackendAdaptor adaptor(cfg, backend_config);
+    ASSERT_TRUE(adaptor.Init());
+    ASSERT_TRUE(adaptor.ScanMeta(
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+
+    std::string value(64, 'v');
+    std::unordered_map<std::string, std::vector<Slice>> batch = {
+        {stored_key, {{value.data(), value.size()}}},
+    };
+    ASSERT_TRUE(adaptor.BatchOffload(
+        batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+
+    const auto canonical_path = ResolveFilePerKeyPathFromKey(
+        stored_key, cfg.storage_filepath, backend_config.fsdir);
+    const auto legacy_path = ResolveLegacyPathFromKey(
+        stored_key, cfg.storage_filepath, backend_config.fsdir);
+    fs::create_directories(fs::path(legacy_path).parent_path());
+    fs::rename(canonical_path, legacy_path);
+
+    auto stored_exists = adaptor.IsExist(stored_key);
+    ASSERT_TRUE(stored_exists);
+    EXPECT_TRUE(stored_exists.value());
+    auto colliding_exists = adaptor.IsExist(colliding_key);
+    ASSERT_TRUE(colliding_exists);
+    EXPECT_FALSE(colliding_exists.value());
+
+    std::array<char, 64> output{};
+    std::unordered_map<std::string, Slice> valid_load = {
+        {stored_key, {output.data(), output.size()}},
+    };
+    ASSERT_TRUE(adaptor.BatchLoad(valid_load));
+    EXPECT_EQ(std::string(output.data(), output.size()), value);
+
+    std::unordered_map<std::string, Slice> wrong_load = {
+        {colliding_key, {output.data(), output.size()}},
+    };
+    auto wrong_result = adaptor.BatchLoad(wrong_load);
+    ASSERT_FALSE(wrong_result);
+    EXPECT_EQ(wrong_result.error(), ErrorCode::INVALID_KEY);
+
+    std::string colliding_value(64, 'c');
+    std::unordered_map<std::string, std::vector<Slice>> colliding_batch = {
+        {colliding_key, {{colliding_value.data(), colliding_value.size()}}},
+    };
+    ASSERT_TRUE(adaptor.BatchOffload(
+        colliding_batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+    EXPECT_TRUE(fs::exists(legacy_path))
+        << "The colliding legacy file belongs to the first key";
+
+    std::array<char, 64> stored_output{};
+    std::array<char, 64> colliding_output{};
+    std::unordered_map<std::string, Slice> collision_load = {
+        {stored_key, {stored_output.data(), stored_output.size()}},
+        {colliding_key, {colliding_output.data(), colliding_output.size()}},
+    };
+    ASSERT_TRUE(adaptor.BatchLoad(collision_load));
+    EXPECT_EQ(std::string(stored_output.data(), stored_output.size()), value);
+    EXPECT_EQ(std::string(colliding_output.data(), colliding_output.size()),
+              colliding_value);
+
+    ASSERT_TRUE(fs::remove(legacy_path));
+    auto removed_exists = adaptor.IsExist(stored_key);
+    ASSERT_TRUE(removed_exists);
+    EXPECT_FALSE(removed_exists.value());
+}
+
+TEST_F(StorageBackendTest,
+       AdaptorOffloadsLongKeyWithoutLegacyPathProbeFailure) {
+    FileStorageConfig cfg;
+    cfg.storage_filepath = data_path;
+    FilePerKeyConfig backend_config;
+    backend_config.fsdir = "file_per_key_long_key";
+    backend_config.enable_eviction = false;
+
+    const std::string key(4096, '/');
+    std::string value(64, 'v');
+    const auto canonical_path = ResolveFilePerKeyPathFromKey(
+        key, cfg.storage_filepath, backend_config.fsdir);
+    const auto legacy_path = ResolveLegacyPathFromKey(key, cfg.storage_filepath,
+                                                      backend_config.fsdir);
+    ASSERT_EQ(fs::path(canonical_path).filename().string().size(), 32);
+    ASSERT_GT(fs::path(legacy_path).filename().string().size(), 255);
+    fs::create_directories(fs::path(legacy_path).parent_path());
+    std::error_code legacy_status_ec;
+    const auto legacy_size = fs::file_size(legacy_path, legacy_status_ec);
+    EXPECT_EQ(legacy_size, static_cast<uintmax_t>(-1));
+    ASSERT_EQ(legacy_status_ec,
+              std::make_error_code(std::errc::filename_too_long));
+
+    {
+        StorageBackendAdaptor adaptor(cfg, backend_config);
+        ASSERT_TRUE(adaptor.Init());
+        ASSERT_TRUE(adaptor.ScanMeta(
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+
+        std::unordered_map<std::string, std::vector<Slice>> batch = {
+            {key, {{value.data(), value.size()}}},
+        };
+        auto offload_result = adaptor.BatchOffload(
+            batch,
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+        ASSERT_TRUE(offload_result);
+        EXPECT_EQ(offload_result.value(), 1);
+        EXPECT_TRUE(fs::exists(canonical_path));
+
+        auto exists_result = adaptor.IsExist(key);
+        ASSERT_TRUE(exists_result);
+        EXPECT_TRUE(exists_result.value());
+
+        std::array<char, 64> output{};
+        std::unordered_map<std::string, Slice> load = {
+            {key, {output.data(), output.size()}},
+        };
+        ASSERT_TRUE(adaptor.BatchLoad(load));
+        EXPECT_EQ(std::string(output.data(), output.size()), value);
+    }
+
+    StorageBackendAdaptor restart_adaptor(cfg, backend_config);
+    ASSERT_TRUE(restart_adaptor.Init());
+    std::vector<std::string> recovered_keys;
+    ASSERT_TRUE(
+        restart_adaptor.ScanMeta([&](const std::vector<std::string>& keys,
+                                     std::vector<StorageObjectMetadata>&) {
+            recovered_keys.insert(recovered_keys.end(), keys.begin(),
+                                  keys.end());
+            return ErrorCode::OK;
+        }));
+    EXPECT_EQ(recovered_keys, std::vector<std::string>{key});
+}
+
+TEST_F(StorageBackendTest,
+       AdaptorOffloadsDotKeysWhenLegacyPathsAreDirectories) {
+    FileStorageConfig cfg;
+    cfg.storage_filepath = data_path;
+    FilePerKeyConfig backend_config;
+    backend_config.fsdir = "file_per_key_dot_keys";
+    backend_config.enable_eviction = false;
+
+    const std::vector<std::string> keys = {".", ".."};
+    std::vector<std::string> values = {std::string(64, 'a'),
+                                       std::string(64, 'b')};
+    for (const auto& key : keys) {
+        const auto legacy_path = ResolveLegacyPathFromKey(
+            key, cfg.storage_filepath, backend_config.fsdir);
+        fs::create_directories(legacy_path);
+        ASSERT_TRUE(fs::is_directory(legacy_path));
+    }
+
+    {
+        StorageBackendAdaptor adaptor(cfg, backend_config);
+        ASSERT_TRUE(adaptor.Init());
+        ASSERT_TRUE(adaptor.ScanMeta(
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+
+        std::unordered_map<std::string, std::vector<Slice>> batch;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            batch.emplace(keys[i], std::vector<Slice>{
+                                       {values[i].data(), values[i].size()}});
+        }
+        auto offload_result = adaptor.BatchOffload(
+            batch,
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+        ASSERT_TRUE(offload_result);
+        EXPECT_EQ(offload_result.value(), keys.size());
+
+        std::array<char, 64> dot_output{};
+        std::array<char, 64> dot_dot_output{};
+        std::unordered_map<std::string, Slice> load = {
+            {keys[0], {dot_output.data(), dot_output.size()}},
+            {keys[1], {dot_dot_output.data(), dot_dot_output.size()}},
+        };
+        ASSERT_TRUE(adaptor.BatchLoad(load));
+        EXPECT_EQ(std::string(dot_output.data(), dot_output.size()), values[0]);
+        EXPECT_EQ(std::string(dot_dot_output.data(), dot_dot_output.size()),
+                  values[1]);
+    }
+
+    StorageBackendAdaptor restart_adaptor(cfg, backend_config);
+    ASSERT_TRUE(restart_adaptor.Init());
+    std::vector<std::string> recovered_keys;
+    ASSERT_TRUE(
+        restart_adaptor.ScanMeta([&](const std::vector<std::string>& found,
+                                     std::vector<StorageObjectMetadata>&) {
+            recovered_keys.insert(recovered_keys.end(), found.begin(),
+                                  found.end());
+            return ErrorCode::OK;
+        }));
+    std::ranges::sort(recovered_keys);
+    EXPECT_EQ(recovered_keys, keys);
+}
+
+TEST_F(StorageBackendTest,
+       AdaptorScanMetaFailsClosedOnCanonicalDirectoryEntryError) {
+    FileStorageConfig cfg;
+    cfg.storage_filepath = data_path;
+    FilePerKeyConfig backend_config;
+    backend_config.fsdir = "file_per_key_scan_entry_error";
+    backend_config.enable_eviction = false;
+
+    const std::string key = "canonical-entry-error";
+    const auto canonical_path = ResolveFilePerKeyPathFromKey(
+        key, cfg.storage_filepath, backend_config.fsdir);
+    fs::create_directories(fs::path(canonical_path).parent_path());
+    std::error_code symlink_ec;
+    fs::create_symlink(fs::absolute(canonical_path), canonical_path,
+                       symlink_ec);
+    ASSERT_FALSE(symlink_ec) << symlink_ec.message();
+
+    StorageBackendAdaptor adaptor(cfg, backend_config);
+    ASSERT_TRUE(adaptor.Init());
+    bool handler_called = false;
+    auto scan_result =
+        adaptor.ScanMeta([&](const std::vector<std::string>&,
+                             std::vector<StorageObjectMetadata>&) {
+            handler_called = true;
+            return ErrorCode::OK;
+        });
+    ASSERT_FALSE(scan_result);
+    EXPECT_EQ(scan_result.error(), ErrorCode::FILE_READ_FAIL);
+    EXPECT_FALSE(handler_called);
+
+    auto is_enabled = adaptor.IsEnableOffloading();
+    ASSERT_FALSE(is_enabled);
+    EXPECT_EQ(is_enabled.error(), ErrorCode::INTERNAL_ERROR);
+
+    std::error_code cleanup_ec;
+    fs::remove(canonical_path, cleanup_ec);
+    EXPECT_FALSE(cleanup_ec) << cleanup_ec.message();
+}
+
+TEST_F(StorageBackendTest,
+       AdaptorFailedLegacyValidationPreservesCanonicalAuthority) {
+    for (const bool enable_eviction : {false, true}) {
+        FileStorageConfig cfg;
+        cfg.storage_filepath = data_path;
+        FilePerKeyConfig backend_config;
+        backend_config.fsdir = enable_eviction
+                                   ? "file_per_key_atomic_rollback_evict"
+                                   : "file_per_key_atomic_rollback_no_evict";
+        backend_config.enable_eviction = enable_eviction;
+
+        const std::string key = "atomic-rollback-key";
+        std::string old_value(64, 'o');
+        StorageBackendAdaptor adaptor(cfg, backend_config);
+        ASSERT_TRUE(adaptor.Init());
+        if (!enable_eviction) {
+            ASSERT_TRUE(
+                adaptor.ScanMeta([](const std::vector<std::string>&,
+                                    std::vector<StorageObjectMetadata>&) {
+                    return ErrorCode::OK;
+                }));
+        }
+
+        std::unordered_map<std::string, std::vector<Slice>> initial = {
+            {key, {{old_value.data(), old_value.size()}}},
+        };
+        ASSERT_TRUE(adaptor.BatchOffload(
+            initial,
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+
+        const auto canonical_path = ResolveFilePerKeyPathFromKey(
+            key, cfg.storage_filepath, backend_config.fsdir);
+        const auto legacy_path = ResolveLegacyPathFromKey(
+            key, cfg.storage_filepath, backend_config.fsdir);
+        fs::create_directories(fs::path(legacy_path).parent_path());
+        std::error_code symlink_ec;
+        fs::create_symlink(fs::absolute(legacy_path), legacy_path, symlink_ec);
+        ASSERT_FALSE(symlink_ec) << symlink_ec.message();
+
+        std::string new_value(64, 'n');
+        std::unordered_map<std::string, std::vector<Slice>> replacement = {
+            {key, {{new_value.data(), new_value.size()}}},
+        };
+        bool replacement_reported = false;
+        auto replacement_result = adaptor.BatchOffload(
+            replacement, [&](const std::vector<std::string>&,
+                             std::vector<StorageObjectMetadata>&) {
+                replacement_reported = true;
+                return ErrorCode::OK;
+            });
+        ASSERT_TRUE(replacement_result);
+        EXPECT_EQ(replacement_result.value(), 0);
+        EXPECT_FALSE(replacement_reported);
+        EXPECT_TRUE(fs::is_regular_file(canonical_path));
+
+        std::array<char, 64> output{};
+        std::unordered_map<std::string, Slice> load = {
+            {key, {output.data(), output.size()}},
+        };
+        ASSERT_TRUE(adaptor.BatchLoad(load));
+        EXPECT_EQ(std::string(output.data(), output.size()), old_value);
+
+        if (enable_eviction) {
+            std::vector<std::string> notified_keys;
+            auto evict_result = adaptor.EvictAboveDiskWatermark(
+                /*high_watermark_ratio=*/0.0,
+                /*low_watermark_ratio=*/0.0,
+                [&](const std::vector<std::string>& keys)
+                    -> tl::expected<void, ErrorCode> {
+                    notified_keys = keys;
+                    return {};
+                });
+            ASSERT_TRUE(evict_result);
+            EXPECT_EQ(evict_result.value(), std::vector<std::string>{key});
+            EXPECT_EQ(notified_keys, std::vector<std::string>{key});
+        } else {
+            auto is_enabled = adaptor.IsEnableOffloading();
+            ASSERT_FALSE(is_enabled);
+            EXPECT_EQ(is_enabled.error(), ErrorCode::INTERNAL_ERROR);
+        }
+    }
+}
+
+TEST_F(StorageBackendTest, AdaptorScanMetaCleansCrashStagingFiles) {
+    for (const bool keep_canonical : {false, true}) {
+        FileStorageConfig cfg;
+        cfg.storage_filepath = data_path;
+        FilePerKeyConfig backend_config;
+        backend_config.fsdir = keep_canonical
+                                   ? "file_per_key_staging_with_canonical"
+                                   : "file_per_key_staging_without_canonical";
+        backend_config.enable_eviction = true;
+
+        const std::string key = "staged-key";
+        std::string value(64, 's');
+        {
+            StorageBackendAdaptor adaptor(cfg, backend_config);
+            ASSERT_TRUE(adaptor.Init());
+            std::unordered_map<std::string, std::vector<Slice>> batch = {
+                {key, {{value.data(), value.size()}}},
+            };
+            ASSERT_TRUE(adaptor.BatchOffload(
+                batch, [](const std::vector<std::string>&,
+                          std::vector<StorageObjectMetadata>&) {
+                    return ErrorCode::OK;
+                }));
+        }
+
+        const auto canonical_path = ResolveFilePerKeyPathFromKey(
+            key, cfg.storage_filepath, backend_config.fsdir);
+        const fs::path staging_root =
+            fs::path(cfg.storage_filepath) / backend_config.fsdir / ".staging";
+        fs::create_directories(staging_root);
+        const fs::path staged_path = staging_root / "crash-residue";
+        if (keep_canonical) {
+            ASSERT_TRUE(fs::copy_file(canonical_path, staged_path));
+        } else {
+            fs::rename(canonical_path, staged_path);
+        }
+
+        StorageBackendAdaptor restart_adaptor(cfg, backend_config);
+        ASSERT_TRUE(restart_adaptor.Init());
+        std::vector<std::string> recovered_keys;
+        ASSERT_TRUE(
+            restart_adaptor.ScanMeta([&](const std::vector<std::string>& keys,
+                                         std::vector<StorageObjectMetadata>&) {
+                recovered_keys.insert(recovered_keys.end(), keys.begin(),
+                                      keys.end());
+                return ErrorCode::OK;
+            }));
+
+        EXPECT_FALSE(fs::exists(staged_path));
+        EXPECT_FALSE(fs::exists(staging_root));
+        if (keep_canonical) {
+            EXPECT_EQ(recovered_keys, std::vector<std::string>{key});
+            std::vector<std::string> notified_keys;
+            auto evict_result = restart_adaptor.EvictAboveDiskWatermark(
+                /*high_watermark_ratio=*/0.0,
+                /*low_watermark_ratio=*/0.0,
+                [&](const std::vector<std::string>& keys)
+                    -> tl::expected<void, ErrorCode> {
+                    notified_keys = keys;
+                    return {};
+                });
+            ASSERT_TRUE(evict_result);
+            EXPECT_EQ(evict_result.value(), std::vector<std::string>{key});
+            EXPECT_EQ(notified_keys, std::vector<std::string>{key});
+        } else {
+            EXPECT_TRUE(recovered_keys.empty());
+        }
+    }
+}
+
+TEST_F(StorageBackendTest,
+       StorageBackendInitCleansStagingBeforeQuotaReconstruction) {
+    const std::string fsdir = "staging_quota_reconstruction";
+    const fs::path storage_root = fs::path(data_path) / fsdir;
+    const fs::path committed_path = storage_root / "aa" / "bb" / "committed";
+    const fs::path staging_root = storage_root / ".staging";
+    const fs::path staged_path = staging_root / "crash-residue";
+    fs::create_directories(committed_path.parent_path());
+    {
+        std::ofstream committed_file(committed_path, std::ios::binary);
+        const std::string contents(1024, 'c');
+        committed_file.write(contents.data(), contents.size());
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    fs::create_directories(staging_root);
+    {
+        std::ofstream staged_file(staged_path, std::ios::binary);
+        const std::string contents(1024, 's');
+        staged_file.write(contents.data(), contents.size());
+    }
+
+    StorageBackend backend(data_path, fsdir, /*enable_eviction=*/true);
+    ASSERT_TRUE(backend.Init(/*quota_bytes=*/1536));
+    EXPECT_TRUE(fs::is_regular_file(committed_path));
+    EXPECT_FALSE(fs::exists(staged_path));
+    EXPECT_FALSE(fs::exists(staging_root));
+}
+
+TEST_F(StorageBackendTest, AdaptorScanMetaRemovesSupersededLegacyFile) {
+    for (const bool enable_eviction : {false, true}) {
+        FileStorageConfig cfg;
+        cfg.storage_filepath = data_path;
+        FilePerKeyConfig backend_config;
+        backend_config.fsdir = enable_eviction ? "file_per_key_shadow_evict"
+                                               : "file_per_key_shadow_no_evict";
+        backend_config.enable_eviction = enable_eviction;
+
+        const std::string key = enable_eviction ? "evict-key" : "plain-key";
+        std::string value(128, enable_eviction ? 'e' : 'p');
+        {
+            StorageBackendAdaptor adaptor(cfg, backend_config);
+            ASSERT_TRUE(adaptor.Init());
+            if (!enable_eviction) {
+                ASSERT_TRUE(
+                    adaptor.ScanMeta([](const std::vector<std::string>&,
+                                        std::vector<StorageObjectMetadata>&) {
+                        return ErrorCode::OK;
+                    }));
+            }
+            std::unordered_map<std::string, std::vector<Slice>> batch = {
+                {key, {{value.data(), value.size()}}},
+            };
+            ASSERT_TRUE(adaptor.BatchOffload(
+                batch, [](const std::vector<std::string>&,
+                          std::vector<StorageObjectMetadata>&) {
+                    return ErrorCode::OK;
+                }));
+        }
+
+        const auto canonical_path = ResolveFilePerKeyPathFromKey(
+            key, cfg.storage_filepath, backend_config.fsdir);
+        const auto legacy_path = ResolveLegacyPathFromKey(
+            key, cfg.storage_filepath, backend_config.fsdir);
+        fs::create_directories(fs::path(legacy_path).parent_path());
+        ASSERT_TRUE(fs::copy_file(canonical_path, legacy_path));
+
+        StorageBackendAdaptor restart_adaptor(cfg, backend_config);
+        ASSERT_TRUE(restart_adaptor.Init());
+        std::vector<std::string> recovered_keys;
+        ASSERT_TRUE(
+            restart_adaptor.ScanMeta([&](const std::vector<std::string>& keys,
+                                         std::vector<StorageObjectMetadata>&) {
+                recovered_keys.insert(recovered_keys.end(), keys.begin(),
+                                      keys.end());
+                return ErrorCode::OK;
+            }));
+
+        EXPECT_EQ(recovered_keys, std::vector<std::string>{key});
+        EXPECT_TRUE(fs::exists(canonical_path));
+        EXPECT_FALSE(fs::exists(legacy_path));
+
+        if (enable_eviction) {
+            std::vector<std::string> notified_keys;
+            auto evict_result = restart_adaptor.EvictAboveDiskWatermark(
+                /*high_watermark_ratio=*/0.0,
+                /*low_watermark_ratio=*/0.0,
+                [&](const std::vector<std::string>& keys)
+                    -> tl::expected<void, ErrorCode> {
+                    notified_keys = keys;
+                    return {};
+                });
+            ASSERT_TRUE(evict_result);
+            EXPECT_EQ(evict_result.value(), std::vector<std::string>{key});
+            EXPECT_EQ(notified_keys, std::vector<std::string>{key});
+        }
+    }
+}
+
+TEST_F(StorageBackendTest, AdaptorOnlineRewriteRetiresLegacyAccounting) {
+    FileStorageConfig cfg;
+    cfg.storage_filepath = data_path;
+    cfg.total_keys_limit = 1;
+    FilePerKeyConfig backend_config;
+    backend_config.fsdir = "file_per_key_online_migration";
+    backend_config.enable_eviction = false;
+
+    const std::string key = "migrated-key";
+    std::string old_value(64, 'o');
+    {
+        StorageBackendAdaptor adaptor(cfg, backend_config);
+        ASSERT_TRUE(adaptor.Init());
+        ASSERT_TRUE(adaptor.ScanMeta(
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+        std::unordered_map<std::string, std::vector<Slice>> batch = {
+            {key, {{old_value.data(), old_value.size()}}},
+        };
+        ASSERT_TRUE(adaptor.BatchOffload(
+            batch,
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+    }
+
+    const auto canonical_path = ResolveFilePerKeyPathFromKey(
+        key, cfg.storage_filepath, backend_config.fsdir);
+    const auto legacy_path = ResolveLegacyPathFromKey(key, cfg.storage_filepath,
+                                                      backend_config.fsdir);
+    fs::create_directories(fs::path(legacy_path).parent_path());
+    fs::rename(canonical_path, legacy_path);
+
+    StorageBackendAdaptor restart_adaptor(cfg, backend_config);
+    ASSERT_TRUE(restart_adaptor.Init());
+    ASSERT_TRUE(restart_adaptor.ScanMeta(
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+    ASSERT_TRUE(restart_adaptor.IsEnableOffloading().value_or(false));
+
+    std::string new_value(64, 'n');
+    std::unordered_map<std::string, std::vector<Slice>> replacement = {
+        {key, {{new_value.data(), new_value.size()}}},
+    };
+    ASSERT_TRUE(restart_adaptor.BatchOffload(
+        replacement,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+
+    EXPECT_TRUE(fs::exists(canonical_path));
+    EXPECT_FALSE(fs::exists(legacy_path));
+    EXPECT_TRUE(restart_adaptor.IsEnableOffloading().value_or(false))
+        << "Rewriting a recovered key must not count it twice";
+
+    std::array<char, 64> output{};
+    std::unordered_map<std::string, Slice> load = {
+        {key, {output.data(), output.size()}},
+    };
+    ASSERT_TRUE(restart_adaptor.BatchLoad(load));
+    EXPECT_EQ(std::string(output.data(), output.size()), new_value);
+}
+
+TEST_F(StorageBackendTest, AdaptorOnlineRewriteTransfersEvictionAuthority) {
+    FileStorageConfig cfg;
+    cfg.storage_filepath = data_path;
+    FilePerKeyConfig backend_config;
+    backend_config.fsdir = "file_per_key_online_eviction_migration";
+    backend_config.enable_eviction = true;
+
+    const std::string key = "eviction-migrated-key";
+    std::string old_value(64, 'o');
+    {
+        StorageBackendAdaptor adaptor(cfg, backend_config);
+        ASSERT_TRUE(adaptor.Init());
+        std::unordered_map<std::string, std::vector<Slice>> batch = {
+            {key, {{old_value.data(), old_value.size()}}},
+        };
+        ASSERT_TRUE(adaptor.BatchOffload(
+            batch,
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+    }
+
+    const auto canonical_path = ResolveFilePerKeyPathFromKey(
+        key, cfg.storage_filepath, backend_config.fsdir);
+    const auto legacy_path = ResolveLegacyPathFromKey(key, cfg.storage_filepath,
+                                                      backend_config.fsdir);
+    fs::create_directories(fs::path(legacy_path).parent_path());
+    fs::rename(canonical_path, legacy_path);
+
+    StorageBackendAdaptor restart_adaptor(cfg, backend_config);
+    ASSERT_TRUE(restart_adaptor.Init());
+    ASSERT_TRUE(restart_adaptor.ScanMeta(
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+
+    std::string new_value(64, 'n');
+    std::unordered_map<std::string, std::vector<Slice>> replacement = {
+        {key, {{new_value.data(), new_value.size()}}},
+    };
+    ASSERT_TRUE(restart_adaptor.BatchOffload(
+        replacement,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+    EXPECT_TRUE(fs::exists(canonical_path));
+    EXPECT_FALSE(fs::exists(legacy_path));
+
+    std::array<char, 64> output{};
+    std::unordered_map<std::string, Slice> load = {
+        {key, {output.data(), output.size()}},
+    };
+    ASSERT_TRUE(restart_adaptor.BatchLoad(load));
+    EXPECT_EQ(std::string(output.data(), output.size()), new_value);
+
+    std::vector<std::string> notified_keys;
+    auto evict_result = restart_adaptor.EvictAboveDiskWatermark(
+        /*high_watermark_ratio=*/0.0, /*low_watermark_ratio=*/0.0,
+        [&](const std::vector<std::string>& keys)
+            -> tl::expected<void, ErrorCode> {
+            notified_keys = keys;
+            return {};
+        });
+    ASSERT_TRUE(evict_result);
+    EXPECT_EQ(evict_result.value(), std::vector<std::string>{key});
+    EXPECT_EQ(notified_keys, std::vector<std::string>{key});
+}
+
+TEST_F(StorageBackendTest,
+       AdaptorBatchLoadReturnsFileReadFailOnCanonicalStatusError) {
+    FileStorageConfig cfg;
+    cfg.storage_filepath = data_path;
+    FilePerKeyConfig backend_config;
+    backend_config.fsdir = "file_per_key_canonical_status_error";
+    backend_config.enable_eviction = false;
+
+    const std::string key = "canonical-status-key";
+    std::string value(64, 'v');
+    StorageBackendAdaptor adaptor(cfg, backend_config);
+    ASSERT_TRUE(adaptor.Init());
+    ASSERT_TRUE(adaptor.ScanMeta(
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+    std::unordered_map<std::string, std::vector<Slice>> batch = {
+        {key, {{value.data(), value.size()}}},
+    };
+    ASSERT_TRUE(adaptor.BatchOffload(
+        batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+
+    const auto canonical_path = ResolveFilePerKeyPathFromKey(
+        key, cfg.storage_filepath, backend_config.fsdir);
+    const auto legacy_path = ResolveLegacyPathFromKey(key, cfg.storage_filepath,
+                                                      backend_config.fsdir);
+    fs::create_directories(fs::path(legacy_path).parent_path());
+    fs::rename(canonical_path, legacy_path);
+
+    std::error_code symlink_ec;
+    fs::create_symlink(fs::absolute(canonical_path), canonical_path,
+                       symlink_ec);
+    ASSERT_FALSE(symlink_ec) << symlink_ec.message();
+    std::error_code status_ec;
+    EXPECT_FALSE(fs::exists(canonical_path, status_ec));
+    EXPECT_EQ(status_ec,
+              std::make_error_code(std::errc::too_many_symbolic_link_levels));
+
+    auto exists_result = adaptor.IsExist(key);
+    EXPECT_FALSE(exists_result);
+    if (!exists_result) {
+        EXPECT_EQ(exists_result.error(), ErrorCode::FILE_READ_FAIL);
+    }
+
+    std::array<char, 64> output{};
+    std::unordered_map<std::string, Slice> load = {
+        {key, {output.data(), output.size()}},
+    };
+    auto load_result = adaptor.BatchLoad(load);
+    EXPECT_FALSE(load_result);
+    if (!load_result) {
+        EXPECT_EQ(load_result.error(), ErrorCode::FILE_READ_FAIL);
+    }
+
+    std::error_code cleanup_ec;
+    fs::remove(canonical_path, cleanup_ec);
+    EXPECT_FALSE(cleanup_ec) << cleanup_ec.message();
+}
+
+TEST_F(StorageBackendTest,
+       AdaptorBatchLoadReturnsFileReadFailOnLegacyStatusError) {
+    FileStorageConfig cfg;
+    cfg.storage_filepath = data_path;
+    FilePerKeyConfig backend_config;
+    backend_config.fsdir = "file_per_key_legacy_status_error";
+    backend_config.enable_eviction = false;
+
+    const std::string key = "legacy-status-key";
+    StorageBackendAdaptor adaptor(cfg, backend_config);
+    ASSERT_TRUE(adaptor.Init());
+    ASSERT_TRUE(adaptor.ScanMeta(
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+
+    const auto legacy_path = ResolveLegacyPathFromKey(key, cfg.storage_filepath,
+                                                      backend_config.fsdir);
+    fs::create_directories(fs::path(legacy_path).parent_path());
+    std::error_code symlink_ec;
+    fs::create_symlink(fs::absolute(legacy_path), legacy_path, symlink_ec);
+    ASSERT_FALSE(symlink_ec) << symlink_ec.message();
+
+    std::array<char, 64> output{};
+    std::unordered_map<std::string, Slice> load = {
+        {key, {output.data(), output.size()}},
+    };
+    auto load_result = adaptor.BatchLoad(load);
+    EXPECT_FALSE(load_result);
+    if (!load_result) {
+        EXPECT_EQ(load_result.error(), ErrorCode::FILE_READ_FAIL);
+    }
+
+    std::error_code cleanup_ec;
+    fs::remove(legacy_path, cleanup_ec);
+    EXPECT_FALSE(cleanup_ec) << cleanup_ec.message();
+}
+
+TEST_F(StorageBackendTest,
+       AdaptorScanMetaReturnsFileReadFailOnCanonicalStatusError) {
+    FileStorageConfig cfg;
+    cfg.storage_filepath = data_path;
+    FilePerKeyConfig backend_config;
+    backend_config.fsdir = "file_per_key_scan_status_error";
+    backend_config.enable_eviction = false;
+
+    const std::string key = "scan-status-key";
+    std::string value(64, 's');
+    {
+        StorageBackendAdaptor adaptor(cfg, backend_config);
+        ASSERT_TRUE(adaptor.Init());
+        ASSERT_TRUE(adaptor.ScanMeta(
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+        std::unordered_map<std::string, std::vector<Slice>> batch = {
+            {key, {{value.data(), value.size()}}},
+        };
+        ASSERT_TRUE(adaptor.BatchOffload(
+            batch,
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+    }
+
+    const auto canonical_path = ResolveFilePerKeyPathFromKey(
+        key, cfg.storage_filepath, backend_config.fsdir);
+    const auto legacy_path = ResolveLegacyPathFromKey(key, cfg.storage_filepath,
+                                                      backend_config.fsdir);
+    fs::create_directories(fs::path(legacy_path).parent_path());
+    fs::rename(canonical_path, legacy_path);
+
+    StorageBackendAdaptor restart_adaptor(cfg, backend_config);
+    ASSERT_TRUE(restart_adaptor.Init());
+    bool handler_called = false;
+    ASSERT_TRUE(
+        restart_adaptor.ScanMeta([&](const std::vector<std::string>&,
+                                     std::vector<StorageObjectMetadata>&) {
+            handler_called = true;
+            return ErrorCode::OK;
+        }));
+    EXPECT_TRUE(handler_called);
+    auto initially_enabled = restart_adaptor.IsEnableOffloading();
+    ASSERT_TRUE(initially_enabled);
+    EXPECT_TRUE(initially_enabled.value());
+
+    std::error_code symlink_ec;
+    fs::create_symlink(fs::absolute(canonical_path), canonical_path,
+                       symlink_ec);
+    ASSERT_FALSE(symlink_ec) << symlink_ec.message();
+
+    handler_called = false;
+    auto scan_result =
+        restart_adaptor.ScanMeta([&](const std::vector<std::string>&,
+                                     std::vector<StorageObjectMetadata>&) {
+            handler_called = true;
+            return ErrorCode::OK;
+        });
+    EXPECT_FALSE(scan_result);
+    if (!scan_result) {
+        EXPECT_EQ(scan_result.error(), ErrorCode::FILE_READ_FAIL);
+    }
+    EXPECT_FALSE(handler_called);
+    EXPECT_TRUE(fs::is_regular_file(legacy_path));
+    auto is_enabled = restart_adaptor.IsEnableOffloading();
+    EXPECT_FALSE(is_enabled);
+    if (!is_enabled) {
+        EXPECT_EQ(is_enabled.error(), ErrorCode::INTERNAL_ERROR);
+    }
+
+    std::error_code cleanup_ec;
+    fs::remove(canonical_path, cleanup_ec);
+    EXPECT_FALSE(cleanup_ec) << cleanup_ec.message();
+}
+
 TEST_F(StorageBackendTest, AdaptorBatchOffload_PartialSuccess) {
     FileStorageConfig cfg;
     cfg.storage_filepath = data_path;
@@ -819,8 +1694,7 @@ TEST_F(StorageBackendTest, AdaptorScanMetaAndIsEnableOffloading) {
     ASSERT_TRUE(enable_after_write);
     EXPECT_TRUE(enable_after_write.value());
 
-    // Verify scan results via a fresh adaptor instance to avoid double-counting
-    // totals if ScanMeta is called again on the same adaptor.
+    // Verify restart recovery through a fresh adaptor instance.
     StorageBackendAdaptor restart_adaptor(cfg, file_per_key_config);
     ASSERT_TRUE(restart_adaptor.Init());
 
@@ -845,7 +1719,7 @@ TEST_F(StorageBackendTest, AdaptorScanMetaAndIsEnableOffloading) {
 
     FileStorageConfig strict_cfg = cfg;
     strict_cfg.total_keys_limit = 1;
-    strict_cfg.total_size_limit = 1;
+    strict_cfg.total_size_limit = cfg.total_size_limit;
 
     StorageBackendAdaptor strict_adaptor(strict_cfg, file_per_key_config);
     ASSERT_TRUE(strict_adaptor.Init());
@@ -858,6 +1732,19 @@ TEST_F(StorageBackendTest, AdaptorScanMetaAndIsEnableOffloading) {
     auto enable_strict = strict_adaptor.IsEnableOffloading();
     ASSERT_TRUE(enable_strict);
     EXPECT_FALSE(enable_strict.value());
+
+    const auto removed_path = ResolveFilePerKeyPathFromKey(
+        "k1", cfg.storage_filepath, file_per_key_config.fsdir);
+    std::error_code remove_ec;
+    EXPECT_TRUE(fs::remove(removed_path, remove_ec));
+    ASSERT_FALSE(remove_ec) << remove_ec.message();
+
+    ASSERT_TRUE(strict_adaptor.ScanMeta(
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+    auto enable_after_rescan = strict_adaptor.IsEnableOffloading();
+    ASSERT_TRUE(enable_after_rescan);
+    EXPECT_TRUE(enable_after_rescan.value());
 }
 
 TEST_F(StorageBackendTest, AdaptorScanMetaAndBatchLoadAcrossRestart) {
@@ -2769,6 +3656,66 @@ TEST_F(StorageBackendTest, StoreObjectReturnsEvictedKeys) {
     auto evicted = r3.value();
     ASSERT_FALSE(evicted.empty());
     EXPECT_EQ(evicted[0], "key_a");
+}
+
+TEST_F(StorageBackendTest, AtomicOverwriteAtQuotaPinsOldCanonicalUntilCommit) {
+    const std::string test_dir = data_path + "/atomic_tight_quota_test";
+    std::filesystem::create_directories(test_dir);
+
+    StorageBackend backend(test_dir, "", true);
+    ASSERT_TRUE(backend.Init(/*quota_bytes=*/2048));
+
+    const std::string canonical_path = test_dir + "/canonical";
+    const std::string legacy_path = test_dir + "/legacy";
+    const std::string victim_path = test_dir + "/victim";
+    const std::string key = "target-key";
+    const std::string old_data(1024, 'o');
+    const std::string new_data(1024, 'n');
+    ASSERT_TRUE(backend.StoreObject(canonical_path, old_data, key));
+    ASSERT_TRUE(backend.StoreObject(victim_path, old_data, "victim-key"));
+
+    std::vector<std::string> notified_keys;
+    auto eviction_handler = [&](const std::vector<std::string>& keys)
+        -> tl::expected<void, ErrorCode> {
+        notified_keys.insert(notified_keys.end(), keys.begin(), keys.end());
+        return {};
+    };
+    auto failed_replacement = backend.StoreObjectAndRemoveFileIf(
+        canonical_path, std::span<const char>(new_data.data(), new_data.size()),
+        key, legacy_path,
+        [](const std::string&,
+           const std::string&) -> tl::expected<bool, ErrorCode> {
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        },
+        eviction_handler);
+    ASSERT_FALSE(failed_replacement);
+    EXPECT_EQ(failed_replacement.error(), ErrorCode::FILE_READ_FAIL);
+    EXPECT_EQ(notified_keys, std::vector<std::string>{"victim-key"});
+    EXPECT_FALSE(fs::exists(victim_path));
+
+    std::string loaded;
+    ASSERT_TRUE(backend.LoadObject(canonical_path, loaded, old_data.size()));
+    EXPECT_EQ(loaded, old_data);
+
+    auto committed_replacement = backend.StoreObjectAndRemoveFileIf(
+        canonical_path, std::span<const char>(new_data.data(), new_data.size()),
+        key, legacy_path,
+        [](const std::string&, const std::string&)
+            -> tl::expected<bool, ErrorCode> { return false; },
+        eviction_handler);
+    ASSERT_TRUE(committed_replacement);
+    EXPECT_FALSE(committed_replacement.value());
+    EXPECT_EQ(notified_keys, std::vector<std::string>{"victim-key"});
+
+    ASSERT_TRUE(backend.LoadObject(canonical_path, loaded, new_data.size()));
+    EXPECT_EQ(loaded, new_data);
+
+    auto eviction_result = backend.EvictAboveDiskWatermark(
+        /*high_watermark_ratio=*/0.0, /*low_watermark_ratio=*/0.0,
+        eviction_handler);
+    ASSERT_TRUE(eviction_result);
+    EXPECT_EQ(eviction_result.value(), std::vector<std::string>{key});
+    EXPECT_EQ(notified_keys, (std::vector<std::string>{"victim-key", key}));
 }
 
 TEST_F(StorageBackendTest, StoreObjectEvictionWithEmptyKey) {

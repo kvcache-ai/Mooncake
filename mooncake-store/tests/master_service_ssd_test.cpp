@@ -9,6 +9,7 @@
 
 #include "master_metric_manager.h"
 #include "types.h"
+#include "utils.h"
 
 namespace mooncake::test {
 
@@ -119,7 +120,14 @@ TEST_F(MasterServiceSSDTest, PutEndBothReplica) {
     bool has_mem = false, has_disk = false;
     for (const auto& r : replicas) {
         if (r.is_memory_replica()) has_mem = true;
-        if (r.is_disk_replica()) has_disk = true;
+        if (r.is_disk_replica()) {
+            has_disk = true;
+            const auto& file_path = r.get_disk_descriptor().file_path;
+            EXPECT_EQ(file_path, ResolveLegacyPathFromKey(key, "/mnt/ssd",
+                                                          DEFAULT_CLUSTER_ID));
+            EXPECT_NE(file_path, ResolveFilePerKeyPathFromKey(
+                                     key, "/mnt/ssd", DEFAULT_CLUSTER_ID));
+        }
     }
     EXPECT_TRUE(has_mem);
     EXPECT_TRUE(has_disk);

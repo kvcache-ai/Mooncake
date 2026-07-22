@@ -14,11 +14,14 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <boost/algorithm/string.hpp>
+#include <xxhash.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <csignal>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -787,5 +790,29 @@ std::string ResolvePathFromKey(const std::string &key,
         fs::path(root_dir) / fsdir / dir_path / SanitizeKey(key);
 
     return full_path.lexically_normal().string();
+}
+
+std::string ResolveLegacyPathFromKey(const std::string &key,
+                                     const std::string &root_dir,
+                                     const std::string &fsdir) {
+    return ResolvePathFromKey(key, root_dir, fsdir);
+}
+
+std::string ResolveFilePerKeyPathFromKey(const std::string &key,
+                                         const std::string &root_dir,
+                                         const std::string &fsdir) {
+    const XXH128_hash_t hash = XXH3_128bits(key.data(), key.size());
+    std::array<char, 33> digest{};
+    std::snprintf(digest.data(), digest.size(), "%016llx%016llx",
+                  static_cast<unsigned long long>(hash.high64),
+                  static_cast<unsigned long long>(hash.low64));
+
+    const std::string digest_string(digest.data());
+    namespace fs = std::filesystem;
+    const fs::path dir_path =
+        fs::path(digest_string.substr(0, 2)) / digest_string.substr(2, 2);
+    return (fs::path(root_dir) / fsdir / dir_path / digest_string)
+        .lexically_normal()
+        .string();
 }
 }  // namespace mooncake
