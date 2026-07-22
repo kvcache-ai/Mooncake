@@ -22,18 +22,6 @@
 namespace mooncake::tent {
 
 // Pre-constructed label values indexed by TransportType enum. Keeps the
-// label space closed: only these 11 strings can ever appear as the
-// "transport" (or "from"/"to") label value in Prometheus output.
-// Values align with TransportSelector::transportTypeName()
-// (transport_selector.cpp:45) so Prometheus labels match log messages. Enum
-// order (tent/common/types.h:46): UNSPEC, RDMA, MNNVL, SHM, NVLINK, GDS,
-// IOURING, TCP, AscendDirect, SUNRISE_LINK, TPU.
-const std::array<std::string, kNumTransportTypes>
-    TentMetrics::kTransportLabelNames = {
-        "unspec",   "rdma", "mnnvl",  "shm",          "nvlink", "gds",
-        "io_uring", "tcp",  "ascend", "sunrise_link", "tpu",
-};
-
 TentMetrics& TentMetrics::instance() {
     static TentMetrics instance;
     return instance;
@@ -42,6 +30,18 @@ TentMetrics& TentMetrics::instance() {
 TentMetrics::~TentMetrics() { shutdown(); }
 
 #if TENT_METRICS_ENABLED
+
+// Pre-constructed label value lookup table, indexed by TransportType enum
+// (see tent/common/types.h:46). Keeps label values in a closed set — no
+// arbitrary strings can reach the metrics. Label values aligned with
+// TransportSelector::transportTypeName().
+// Enum order: UNSPEC, RDMA, MNNVL, SHM, NVLINK, GDS,
+// IOURING, TCP, AscendDirect, SUNRISE_LINK, TPU.
+const std::array<std::string, kNumTransportTypes>
+    TentMetrics::kTransportLabelNames = {
+        "unspec",   "rdma", "mnnvl",  "shm",          "nvlink", "gds",
+        "io_uring", "tcp",  "ascend", "sunrise_link", "tpu",
+};
 
 Status TentMetrics::initialize(const MetricsConfig& config) {
     // Validate configuration before touching initialized_. An invalid config
