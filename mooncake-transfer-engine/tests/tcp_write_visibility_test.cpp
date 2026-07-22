@@ -57,6 +57,8 @@ void tcpTransportSetLaneObserverHookForTest(
     void (*hook)(int, size_t, uint64_t, size_t, bool) noexcept) noexcept;
 void tcpTransportSetLaneRetryHandlerHookForTest(
     void (*hook)() noexcept) noexcept;
+void tcpTransportSetLaneAdmissionHandlerHookForTest(
+    void (*hook)() noexcept) noexcept;
 void tcpTransportSetLaneFailureReasonHookForTest(
     void (*hook)(int) noexcept) noexcept;
 bool tcpTransportLaneTypesAreMoveOnlyForTest() noexcept;
@@ -86,14 +88,21 @@ enum LaneTestEvent {
     kLaneRetryFired = 9,
     kLaneRetryLate = 10,
     kLaneCooldownStarted = 11,
+    kLaneAdmissionPending = 12,
+    kLaneAdmissionPromoted = 13,
+    kLaneAdmissionTimerArmed = 14,
+    kLaneAdmissionTimerFired = 15,
+    kLaneAdmissionTimerLate = 16,
+    kLaneAdmissionHardRejected = 17,
 };
 
 enum WorkFailureReasonForTest {
     kWorkQueueFull = 0,
-    kWorkRuntimeUnavailable = 1,
-    kWorkConnectFailed = 2,
-    kWorkSessionFailed = 3,
-    kWorkShutdown = 4,
+    kWorkQueueTimeout = 1,
+    kWorkRuntimeUnavailable = 2,
+    kWorkConnectFailed = 3,
+    kWorkSessionFailed = 4,
+    kWorkShutdown = 5,
 };
 
 std::atomic<bool> lane_connect_handler_entered{false};
@@ -107,7 +116,11 @@ std::atomic<bool> hold_retry_handler{false};
 std::atomic<bool> retry_armed_observer_entered{false};
 std::atomic<bool> release_retry_armed_observer{false};
 std::atomic<bool> hold_retry_armed_observer{false};
+std::atomic<bool> admission_handler_entered{false};
+std::atomic<bool> release_admission_handler{false};
+std::atomic<bool> hold_admission_handler{false};
 std::atomic<size_t> maximum_observed_queue_depth{0};
+std::atomic<size_t> maximum_observed_pending_depth{0};
 std::atomic<size_t> maximum_observed_socket_count{0};
 std::atomic<int> queue_rejection_count{0};
 std::atomic<int> lane_connecting_count{0};
@@ -119,7 +132,14 @@ std::atomic<int> retry_armed_count{0};
 std::atomic<int> retry_fired_count{0};
 std::atomic<int> retry_late_count{0};
 std::atomic<int> cooldown_started_count{0};
+std::atomic<int> admission_pending_count{0};
+std::atomic<int> admission_promoted_count{0};
+std::atomic<int> admission_timer_armed_count{0};
+std::atomic<int> admission_timer_fired_count{0};
+std::atomic<int> admission_timer_late_count{0};
+std::atomic<int> admission_hard_rejection_count{0};
 std::atomic<int> queue_full_failure_count{0};
+std::atomic<int> queue_timeout_failure_count{0};
 std::atomic<int> connect_failure_count{0};
 std::atomic<int> runtime_unavailable_failure_count{0};
 std::atomic<int> shutdown_failure_count{0};
@@ -156,7 +176,11 @@ void resetLaneTestState() noexcept {
     retry_armed_observer_entered.store(false, std::memory_order_release);
     release_retry_armed_observer.store(false, std::memory_order_release);
     hold_retry_armed_observer.store(false, std::memory_order_release);
+    admission_handler_entered.store(false, std::memory_order_release);
+    release_admission_handler.store(false, std::memory_order_release);
+    hold_admission_handler.store(false, std::memory_order_release);
     maximum_observed_queue_depth.store(0, std::memory_order_release);
+    maximum_observed_pending_depth.store(0, std::memory_order_release);
     maximum_observed_socket_count.store(0, std::memory_order_release);
     queue_rejection_count.store(0, std::memory_order_release);
     lane_connecting_count.store(0, std::memory_order_release);
@@ -168,7 +192,14 @@ void resetLaneTestState() noexcept {
     retry_fired_count.store(0, std::memory_order_release);
     retry_late_count.store(0, std::memory_order_release);
     cooldown_started_count.store(0, std::memory_order_release);
+    admission_pending_count.store(0, std::memory_order_release);
+    admission_promoted_count.store(0, std::memory_order_release);
+    admission_timer_armed_count.store(0, std::memory_order_release);
+    admission_timer_fired_count.store(0, std::memory_order_release);
+    admission_timer_late_count.store(0, std::memory_order_release);
+    admission_hard_rejection_count.store(0, std::memory_order_release);
     queue_full_failure_count.store(0, std::memory_order_release);
+    queue_timeout_failure_count.store(0, std::memory_order_release);
     connect_failure_count.store(0, std::memory_order_release);
     runtime_unavailable_failure_count.store(0, std::memory_order_release);
     shutdown_failure_count.store(0, std::memory_order_release);
@@ -202,9 +233,22 @@ void releaseRetryArmedObserver() noexcept {
     release_retry_armed_observer.store(true, std::memory_order_release);
 }
 
+void releaseAdmissionHandler() noexcept {
+    release_admission_handler.store(true, std::memory_order_release);
+}
+
+void blockAdmissionHandler() noexcept {
+    if (!hold_admission_handler.load(std::memory_order_acquire)) return;
+    admission_handler_entered.store(true, std::memory_order_release);
+    while (!release_admission_handler.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
 void observeLaneState(int event, size_t queue_depth, uint64_t,
                       size_t active_sockets, bool lane_has_current) noexcept {
-    updateMaximum(maximum_observed_queue_depth, queue_depth);
+    if (event < kLaneAdmissionPending || event > kLaneAdmissionHardRejected)
+        updateMaximum(maximum_observed_queue_depth, queue_depth);
     updateMaximum(maximum_observed_socket_count, active_sockets);
     if (event == kLaneConnecting && lane_has_current)
         connecting_lane_had_current.store(true, std::memory_order_release);
@@ -239,11 +283,29 @@ void observeLaneState(int event, size_t queue_depth, uint64_t,
         retry_late_count.fetch_add(1, std::memory_order_relaxed);
     if (event == kLaneCooldownStarted)
         cooldown_started_count.fetch_add(1, std::memory_order_relaxed);
+    if (event == kLaneAdmissionPending) {
+        admission_pending_count.fetch_add(1, std::memory_order_relaxed);
+        updateMaximum(maximum_observed_pending_depth, queue_depth);
+    }
+    if (event == kLaneAdmissionPromoted) {
+        admission_promoted_count.fetch_add(1, std::memory_order_relaxed);
+        updateMaximum(maximum_observed_pending_depth, queue_depth);
+    }
+    if (event == kLaneAdmissionTimerArmed)
+        admission_timer_armed_count.fetch_add(1, std::memory_order_relaxed);
+    if (event == kLaneAdmissionTimerFired)
+        admission_timer_fired_count.fetch_add(1, std::memory_order_relaxed);
+    if (event == kLaneAdmissionTimerLate)
+        admission_timer_late_count.fetch_add(1, std::memory_order_relaxed);
+    if (event == kLaneAdmissionHardRejected)
+        admission_hard_rejection_count.fetch_add(1, std::memory_order_relaxed);
 }
 
 void observeWorkFailureReason(int reason) noexcept {
     if (reason == kWorkQueueFull)
         queue_full_failure_count.fetch_add(1, std::memory_order_relaxed);
+    if (reason == kWorkQueueTimeout)
+        queue_timeout_failure_count.fetch_add(1, std::memory_order_relaxed);
     if (reason == kWorkConnectFailed)
         connect_failure_count.fetch_add(1, std::memory_order_relaxed);
     if (reason == kWorkRuntimeUnavailable)
@@ -258,7 +320,8 @@ class ScopedLaneHooks {
     explicit ScopedLaneHooks(bool block_first_connect_handler = false,
                              bool block_after_busy = false,
                              bool block_retry = false,
-                             bool block_retry_armed = false) {
+                             bool block_retry_armed = false,
+                             bool block_admission = false) {
         resetLaneTestState();
         tcpTransportSetLaneObserverHookForTest(observeLaneState);
         tcpTransportSetLaneFailureReasonHookForTest(observeWorkFailureReason);
@@ -276,6 +339,11 @@ class ScopedLaneHooks {
         }
         hold_retry_armed_observer.store(block_retry_armed,
                                         std::memory_order_release);
+        if (block_admission) {
+            hold_admission_handler.store(true, std::memory_order_release);
+            tcpTransportSetLaneAdmissionHandlerHookForTest(
+                blockAdmissionHandler);
+        }
     }
 
     ~ScopedLaneHooks() { reset(); }
@@ -285,8 +353,10 @@ class ScopedLaneHooks {
         releaseLaneConnectHandler();
         releaseRetryHandler();
         releaseRetryArmedObserver();
+        releaseAdmissionHandler();
         tcpTransportSetLaneConnectHandlerHookForTest(nullptr);
         tcpTransportSetLaneRetryHandlerHookForTest(nullptr);
+        tcpTransportSetLaneAdmissionHandlerHookForTest(nullptr);
         tcpTransportSetLaneObserverHookForTest(nullptr);
         tcpTransportSetLaneFailureReasonHookForTest(nullptr);
         active_ = false;
@@ -601,7 +671,8 @@ class UnavailableTcpPeer {
 // multiple request/ack exchanges on each one.
 class ReusingWriteServer {
    public:
-    ReusingWriteServer() {
+    explicit ReusingWriteServer(bool hold_first_ack = false)
+        : hold_first_ack_(hold_first_ack) {
         listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
         if (listen_fd_ < 0) return;
         int one = 1;
@@ -640,6 +711,24 @@ class ReusingWriteServer {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         return request_count_.load() >= count;
+    }
+
+    bool waitForFirstRequest(std::chrono::seconds timeout) const {
+        return waitForPredicate(
+            [this] {
+                return first_request_received_.load(std::memory_order_acquire);
+            },
+            timeout);
+    }
+
+    void releaseFirstAck() noexcept {
+        release_first_ack_.store(true, std::memory_order_release);
+    }
+
+    bool waitForFirstAckSent(std::chrono::seconds timeout) const {
+        return waitForPredicate(
+            [this] { return first_ack_sent_.load(std::memory_order_acquire); },
+            timeout);
     }
 
     std::vector<uint64_t> requestAddresses() const {
@@ -710,9 +799,21 @@ class ReusingWriteServer {
             }
             if (!keep_serving) break;
 
+            const int request_index =
+                requests_received_.fetch_add(1, std::memory_order_acq_rel);
+            if (hold_first_ack_ && request_index == 0) {
+                first_request_received_.store(true, std::memory_order_release);
+                while (!release_first_ack_.load(std::memory_order_acquire) &&
+                       !stopped_.load(std::memory_order_acquire)) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            }
+
             constexpr uint64_t kStatusOk = 0x4D435456ull << 32;
             const uint64_t status = htole64(kStatusOk);
             if (!sendExact(fd, &status, sizeof(status))) break;
+            if (hold_first_ack_ && request_index == 0)
+                first_ack_sent_.store(true, std::memory_order_release);
             request_count_.fetch_add(1);
         }
         {
@@ -725,6 +826,7 @@ class ReusingWriteServer {
 
     void stop() {
         if (stopped_.exchange(true)) return;
+        releaseFirstAck();
         if (listen_fd_ >= 0) (void)shutdown(listen_fd_, SHUT_RDWR);
         if (accept_thread_.joinable()) accept_thread_.join();
 
@@ -749,6 +851,11 @@ class ReusingWriteServer {
     std::atomic<bool> stopped_{false};
     std::atomic<int> accepted_count_{0};
     std::atomic<int> request_count_{0};
+    const bool hold_first_ack_;
+    std::atomic<int> requests_received_{0};
+    std::atomic<bool> first_request_received_{false};
+    std::atomic<bool> release_first_ack_{false};
+    std::atomic<bool> first_ack_sent_{false};
 };
 
 struct EngineHandle {
@@ -795,6 +902,26 @@ struct EngineHandle {
         ok = true;
     }
 };
+
+void pointTcpSegmentAt(EngineHandle& handle, uint16_t port) {
+    auto desc =
+        handle.engine->getMetadata()->getSegmentDescByID(handle.segment_id);
+    ASSERT_NE(desc, nullptr);
+    desc->tcp_data_port = port;
+    desc->tcp_proto_version = 2;
+}
+
+TransferRequest makeWriteRequest(const EngineHandle& handle, size_t length,
+                                 uint64_t target_offset = 0) {
+    TransferRequest request;
+    request.opcode = TransferRequest::WRITE;
+    request.length = length;
+    request.source = handle.pool;
+    request.target_id = handle.segment_id;
+    request.target_offset =
+        target_offset == 0 ? handle.remote_base : target_offset;
+    return request;
+}
 
 // Submit one request and poll until terminal state; returns final status.
 TransferStatusEnum runOne(TransferEngine* engine, TransferRequest entry) {
@@ -863,6 +990,25 @@ void expectEverySliceCompletedExactlyOnceAfterShutdown(
                         slice->status == Transport::Slice::FAILED)
                 << "task " << task_id;
         }
+    }
+}
+
+void expectEverySliceSucceededExactlyOnceAfterShutdown(
+    Transport::BatchID batch_id) {
+    const auto& batch = Transport::toBatchDesc(batch_id);
+    for (size_t task_id = 0; task_id < batch.task_list.size(); ++task_id) {
+        const auto& task = batch.task_list[task_id];
+        const uint64_t success =
+            __atomic_load_n(&task.success_slice_count, __ATOMIC_RELAXED);
+        const uint64_t failed =
+            __atomic_load_n(&task.failed_slice_count, __ATOMIC_RELAXED);
+        const uint64_t slices =
+            __atomic_load_n(&task.slice_count, __ATOMIC_RELAXED);
+        EXPECT_EQ(success, slices) << "task " << task_id;
+        EXPECT_EQ(failed, 0u) << "task " << task_id;
+        for (const auto* slice : task.slice_list)
+            EXPECT_EQ(slice->status, Transport::Slice::SUCCESS)
+                << "task " << task_id;
     }
 }
 
@@ -1078,16 +1224,26 @@ TEST(TcpWriteVisibilityTest, V2ReadRoundTripAndRejectedRead) {
     EXPECT_EQ(runOne(h.engine.get(), r), TransferStatusEnum::COMPLETED);
 }
 
-// Mixed-version quadrant: a legacy (v1) initiator against the v2 server —
-// selected via the MC_TCP_PROTO=1 escape hatch — still transfers data
-// correctly (with the old weaker completion semantics).
-TEST(TcpWriteVisibilityTest, LegacyInitiatorInteropWithV2Server) {
+// Mixed-version quadrant: a pooled legacy (v1) initiator against the current
+// server still transfers data correctly over repeated exchanges on one fixed
+// lane (with the old weaker WRITE completion semantics).
+TEST(TcpWriteVisibilityTest,
+     PooledLegacyInitiatorInteroperatesWithCurrentServer) {
     const char* env = std::getenv("MC_METADATA_SERVER");
     std::string metadata_server = env ? env : "P2PHANDSHAKE";
     // Set the process environment before the engine starts any threads, and
     // restore it only after those threads have stopped. POSIX does not require
     // setenv()/unsetenv() to synchronize with concurrent getenv() calls.
+    ScopedEnvVar pooling("MC_TCP_ENABLE_CONNECTION_POOL", "1");
+    ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "1");
+    ScopedEnvVar queue_capacity("MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER", "2");
+    ScopedEnvVar pending_capacity("MC_TCP_MAX_PENDING_ADMISSIONS_PER_PEER",
+                                  "2");
+    ScopedEnvVar admission_timeout("MC_TCP_ADMISSION_TIMEOUT_MS", "10000");
     ScopedEnvVar legacy_proto("MC_TCP_PROTO", "1");
+#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
+    ScopedLaneHooks hooks;
+#endif
     {
         EngineHandle h;
         h.init(metadata_server, "127.0.0.2:17903", 16ull << 20);
@@ -1123,7 +1279,15 @@ TEST(TcpWriteVisibilityTest, LegacyInitiatorInteropWithV2Server) {
         r.target_offset = h.remote_base;
         EXPECT_EQ(runOne(h.engine.get(), r), TransferStatusEnum::COMPLETED);
         EXPECT_EQ(memcmp(dst, src, kSmallLength), 0);
+#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
+        EXPECT_EQ(lane_connecting_count.load(std::memory_order_acquire), 1);
+        EXPECT_LE(maximum_observed_socket_count.load(std::memory_order_acquire),
+                  1u);
+#endif
     }
+#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
+    hooks.reset();
+#endif
 }
 
 // A cached v2 descriptor can briefly outlive a server downgrade/restart. A
@@ -1454,6 +1618,9 @@ TEST(TcpWriteVisibilityTest,
     constexpr int kCooldownRequestCount = 4;
     ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "1");
     ScopedEnvVar queue_capacity("MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER", "3");
+    ScopedEnvVar pending_capacity("MC_TCP_MAX_PENDING_ADMISSIONS_PER_PEER",
+                                  "1");
+    ScopedEnvVar admission_timeout("MC_TCP_ADMISSION_TIMEOUT_MS", "500");
     ScopedLaneHooks hooks;
     const char* env = std::getenv("MC_METADATA_SERVER");
     const std::string metadata_server = env ? env : "P2PHANDSHAKE";
@@ -1498,8 +1665,9 @@ TEST(TcpWriteVisibilityTest,
         [] { return retry_armed_count.load(std::memory_order_acquire) == 1; },
         std::chrono::seconds(2)));
 
-    // The first three requests are admitted during cooldown; the fourth is
-    // rejected by the bounded queue. No second round starts before the timer.
+    // The first three requests enter the work queue; the fourth waits in the
+    // pending-admission FIFO instead of failing synchronously. No second
+    // connection round starts before the retry timer.
     for (int task_id = 0; task_id < 3; ++task_id) {
         TransferStatus status;
         status.s = TransferStatusEnum::WAITING;
@@ -1511,10 +1679,16 @@ TEST(TcpWriteVisibilityTest,
     overflow_status.s = TransferStatusEnum::WAITING;
     ASSERT_TRUE(
         h.engine->getTransferStatus(cooldown_batch, 3, overflow_status).ok());
-    EXPECT_EQ(overflow_status.s, TransferStatusEnum::FAILED);
-    EXPECT_EQ(queue_full_failure_count.load(std::memory_order_acquire), 1);
+    EXPECT_EQ(overflow_status.s, TransferStatusEnum::WAITING);
+    EXPECT_EQ(queue_full_failure_count.load(std::memory_order_acquire), 0);
+    EXPECT_EQ(admission_pending_count.load(std::memory_order_acquire), 1);
     EXPECT_LE(maximum_observed_queue_depth.load(std::memory_order_acquire), 3u);
-    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    ASSERT_TRUE(waitForPredicate(
+        [] {
+            return queue_timeout_failure_count.load(
+                       std::memory_order_acquire) == 1;
+        },
+        std::chrono::seconds(2)));
     EXPECT_EQ(lane_connecting_count.load(std::memory_order_acquire), 1);
     EXPECT_EQ(retry_armed_count.load(std::memory_order_acquire), 1);
 
@@ -1831,10 +2005,169 @@ TEST(TcpWriteVisibilityTest, OneLaneReusesCleanSocketInFifoOrder) {
 
 #ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
 TEST(TcpWriteVisibilityTest,
-     QueueOverflowFailsSlicesImmediatelyWithoutGivingConnectingLaneWork) {
+     PendingAdmissionWaitsInsteadOfFailingSynchronously) {
+    ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "1");
+    ScopedEnvVar queue_capacity("MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER", "1");
+    ScopedEnvVar pending_capacity("MC_TCP_MAX_PENDING_ADMISSIONS_PER_PEER",
+                                  "2");
+    ScopedEnvVar admission_timeout("MC_TCP_ADMISSION_TIMEOUT_MS", "10000");
+    ScopedLaneHooks hooks(/*block_first_connect_handler=*/true);
+    const char* env = std::getenv("MC_METADATA_SERVER");
+    const std::string metadata_server = env ? env : "P2PHANDSHAKE";
+
+    HoldingWriteServer fake_peer;
+    ASSERT_TRUE(fake_peer.ok());
+
+    EngineHandle h;
+    h.init(metadata_server, "127.0.0.2:17929", 64 * 1024);
+    ASSERT_TRUE(h.ok);
+    pointTcpSegmentAt(h, fake_peer.port());
+
+    const auto request = makeWriteRequest(h, 1);
+    const auto batch_id = h.engine->allocateBatchID(2);
+    const auto submit_start = std::chrono::steady_clock::now();
+    ASSERT_TRUE(h.engine->submitTransfer(batch_id, {request, request}).ok());
+    const auto submit_elapsed = std::chrono::steady_clock::now() - submit_start;
+    ASSERT_TRUE(waitForPredicate(
+        [] {
+            return lane_connect_handler_entered.load(
+                       std::memory_order_acquire) &&
+                   admission_pending_count.load(std::memory_order_acquire) == 1;
+        },
+        std::chrono::seconds(5)));
+
+    TransferStatus pending_status;
+    pending_status.s = TransferStatusEnum::WAITING;
+    ASSERT_TRUE(h.engine->getTransferStatus(batch_id, 1, pending_status).ok());
+    EXPECT_EQ(pending_status.s, TransferStatusEnum::WAITING);
+    EXPECT_LT(submit_elapsed, std::chrono::seconds(2));
+    EXPECT_EQ(queue_full_failure_count.load(std::memory_order_acquire), 0);
+    EXPECT_EQ(queue_timeout_failure_count.load(std::memory_order_acquire), 0);
+    EXPECT_EQ(maximum_observed_queue_depth.load(std::memory_order_acquire), 1u);
+    EXPECT_EQ(maximum_observed_pending_depth.load(std::memory_order_acquire),
+              1u);
+
+    releaseLaneConnectHandler();
+    h.engine.reset();
+    expectEverySliceCompletedExactlyOnceAfterShutdown(batch_id);
+    hooks.reset();
+    reclaimBatchDescAfterEngineShutdownForTest(batch_id);
+}
+
+TEST(TcpWriteVisibilityTest, PendingAdmissionTimesOutExactlyOnce) {
+    constexpr size_t kLength = 64 * 1024;
+    ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "1");
+    ScopedEnvVar queue_capacity("MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER", "1");
+    ScopedEnvVar pending_capacity("MC_TCP_MAX_PENDING_ADMISSIONS_PER_PEER",
+                                  "1");
+    ScopedEnvVar admission_timeout("MC_TCP_ADMISSION_TIMEOUT_MS", "100");
+    ScopedLaneHooks hooks;
+    const char* env = std::getenv("MC_METADATA_SERVER");
+    const std::string metadata_server = env ? env : "P2PHANDSHAKE";
+
+    HoldingWriteServer fake_peer;
+    ASSERT_TRUE(fake_peer.ok());
+
+    EngineHandle h;
+    h.init(metadata_server, "127.0.0.2:17930", kLength);
+    ASSERT_TRUE(h.ok);
+    pointTcpSegmentAt(h, fake_peer.port());
+
+    const auto request = makeWriteRequest(h, kLength);
+    const auto active_batch = h.engine->allocateBatchID(1);
+    ASSERT_TRUE(h.engine->submitTransfer(active_batch, {request}).ok());
+    ASSERT_TRUE(waitForPredicate(
+        [] { return lane_busy_count.load(std::memory_order_acquire) >= 1; },
+        std::chrono::seconds(5)));
+    ASSERT_TRUE(fake_peer.waitForAccepted(1, std::chrono::seconds(5)));
+
+    const auto queued_batch = h.engine->allocateBatchID(1);
+    const auto pending_batch = h.engine->allocateBatchID(1);
+    ASSERT_TRUE(h.engine->submitTransfer(queued_batch, {request}).ok());
+    ASSERT_TRUE(h.engine->submitTransfer(pending_batch, {request}).ok());
+    ASSERT_TRUE(waitForPredicate(
+        [] {
+            return queue_timeout_failure_count.load(
+                       std::memory_order_acquire) == 1;
+        },
+        std::chrono::seconds(5)));
+
+    EXPECT_EQ(queue_full_failure_count.load(std::memory_order_acquire), 0);
+    EXPECT_EQ(admission_timer_fired_count.load(std::memory_order_acquire), 1);
+    EXPECT_EQ(admission_promoted_count.load(std::memory_order_acquire), 0);
+    h.engine.reset();
+    expectEverySliceCompletedExactlyOnceAfterShutdown(active_batch);
+    expectEverySliceCompletedExactlyOnceAfterShutdown(queued_batch);
+    expectEverySliceCompletedExactlyOnceAfterShutdown(pending_batch);
+    EXPECT_EQ(queue_timeout_failure_count.load(std::memory_order_acquire), 1);
+
+    hooks.reset();
+    reclaimBatchDescAfterEngineShutdownForTest(active_batch);
+    reclaimBatchDescAfterEngineShutdownForTest(queued_batch);
+    reclaimBatchDescAfterEngineShutdownForTest(pending_batch);
+}
+
+TEST(TcpWriteVisibilityTest, PendingAdmissionsPromoteInFifoOrder) {
     constexpr int kRequestCount = 4;
     ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "1");
-    ScopedEnvVar queue_capacity("MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER", "2");
+    ScopedEnvVar queue_capacity("MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER", "1");
+    ScopedEnvVar pending_capacity("MC_TCP_MAX_PENDING_ADMISSIONS_PER_PEER",
+                                  "3");
+    ScopedEnvVar admission_timeout("MC_TCP_ADMISSION_TIMEOUT_MS", "10000");
+    ScopedLaneHooks hooks(/*block_first_connect_handler=*/true);
+    const char* env = std::getenv("MC_METADATA_SERVER");
+    const std::string metadata_server = env ? env : "P2PHANDSHAKE";
+
+    ReusingWriteServer fake_peer;
+    ASSERT_TRUE(fake_peer.ok());
+
+    EngineHandle h;
+    h.init(metadata_server, "127.0.0.2:17931", 64 * 1024);
+    ASSERT_TRUE(h.ok);
+    pointTcpSegmentAt(h, fake_peer.port());
+
+    std::vector<TransferRequest> requests;
+    std::vector<uint64_t> expected_addresses;
+    for (int i = 0; i < kRequestCount; ++i) {
+        const uint64_t address = h.remote_base + static_cast<uint64_t>(i);
+        requests.push_back(makeWriteRequest(h, 1, address));
+        expected_addresses.push_back(address);
+    }
+
+    const auto batch_id = h.engine->allocateBatchID(kRequestCount);
+    ASSERT_TRUE(h.engine->submitTransfer(batch_id, requests).ok());
+    ASSERT_TRUE(waitForPredicate(
+        [] {
+            return lane_connect_handler_entered.load(
+                       std::memory_order_acquire) &&
+                   admission_pending_count.load(std::memory_order_acquire) == 3;
+        },
+        std::chrono::seconds(5)));
+    EXPECT_EQ(maximum_observed_queue_depth.load(std::memory_order_acquire), 1u);
+    EXPECT_EQ(maximum_observed_pending_depth.load(std::memory_order_acquire),
+              3u);
+
+    releaseLaneConnectHandler();
+    ASSERT_TRUE(
+        fake_peer.waitForRequests(kRequestCount, std::chrono::seconds(10)));
+    ASSERT_TRUE(waitForBatchTerminal(h.engine.get(), batch_id, kRequestCount,
+                                     std::chrono::seconds(5)));
+    EXPECT_EQ(fake_peer.requestAddresses(), expected_addresses);
+    EXPECT_GE(admission_promoted_count.load(std::memory_order_acquire), 1);
+    EXPECT_EQ(queue_full_failure_count.load(std::memory_order_acquire), 0);
+    EXPECT_EQ(queue_timeout_failure_count.load(std::memory_order_acquire), 0);
+
+    hooks.reset();
+    (void)h.engine->freeBatchID(batch_id);
+}
+
+TEST(TcpWriteVisibilityTest, PendingAdmissionHardBoundRejectsImmediately) {
+    constexpr int kRequestCount = 3;
+    ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "1");
+    ScopedEnvVar queue_capacity("MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER", "1");
+    ScopedEnvVar pending_capacity("MC_TCP_MAX_PENDING_ADMISSIONS_PER_PEER",
+                                  "1");
+    ScopedEnvVar admission_timeout("MC_TCP_ADMISSION_TIMEOUT_MS", "10000");
     ScopedLaneHooks hooks(/*block_first_connect_handler=*/true);
     const char* env = std::getenv("MC_METADATA_SERVER");
     const std::string metadata_server = env ? env : "P2PHANDSHAKE";
@@ -1845,11 +2178,7 @@ TEST(TcpWriteVisibilityTest,
     EngineHandle h;
     h.init(metadata_server, "127.0.0.2:17923", 64 * 1024);
     ASSERT_TRUE(h.ok);
-
-    auto desc = h.engine->getMetadata()->getSegmentDescByID(h.segment_id);
-    ASSERT_NE(desc, nullptr);
-    desc->tcp_data_port = fake_peer.port();
-    desc->tcp_proto_version = 2;
+    pointTcpSegmentAt(h, fake_peer.port());
 
     std::vector<TransferRequest> requests(kRequestCount);
     for (auto& request : requests) {
@@ -1868,26 +2197,245 @@ TEST(TcpWriteVisibilityTest,
         },
         std::chrono::seconds(5)));
 
-    EXPECT_EQ(queue_rejection_count.load(std::memory_order_acquire), 2);
-    EXPECT_EQ(queue_full_failure_count.load(std::memory_order_acquire), 2);
+    EXPECT_EQ(queue_rejection_count.load(std::memory_order_acquire), 1);
+    EXPECT_EQ(admission_hard_rejection_count.load(std::memory_order_acquire),
+              1);
+    EXPECT_EQ(queue_full_failure_count.load(std::memory_order_acquire), 1);
+    EXPECT_EQ(queue_timeout_failure_count.load(std::memory_order_acquire), 0);
     EXPECT_EQ(connect_failure_count.load(std::memory_order_acquire), 0);
-    EXPECT_EQ(maximum_observed_queue_depth.load(std::memory_order_acquire), 2u);
+    EXPECT_EQ(maximum_observed_queue_depth.load(std::memory_order_acquire), 1u);
+    EXPECT_EQ(maximum_observed_pending_depth.load(std::memory_order_acquire),
+              1u);
     EXPECT_FALSE(connecting_lane_had_current.load(std::memory_order_acquire));
-    for (int task_id = 2; task_id < kRequestCount; ++task_id) {
+    for (int task_id = 0; task_id < kRequestCount; ++task_id) {
         TransferStatus status;
         status.s = TransferStatusEnum::WAITING;
         ASSERT_TRUE(
             h.engine->getTransferStatus(batch_id, task_id, status).ok());
-        EXPECT_EQ(status.s, TransferStatusEnum::FAILED);
+        EXPECT_EQ(status.s, task_id == kRequestCount - 1
+                                ? TransferStatusEnum::FAILED
+                                : TransferStatusEnum::WAITING);
     }
 
     releaseLaneConnectHandler();
-    ASSERT_TRUE(fake_peer.waitForAccepted(1, std::chrono::seconds(5)));
-    fake_peer.closePeer();
-    ASSERT_TRUE(waitForBatchTerminal(h.engine.get(), batch_id, kRequestCount,
-                                     std::chrono::seconds(10)));
+    h.engine.reset();
+    expectEverySliceCompletedExactlyOnceAfterShutdown(batch_id);
     hooks.reset();
-    (void)h.engine->freeBatchID(batch_id);
+    reclaimBatchDescAfterEngineShutdownForTest(batch_id);
+}
+
+TEST(TcpWriteVisibilityTest,
+     ShutdownWithPendingAdmissionsAndArmedTimerCompletesOnce) {
+    constexpr size_t kLength = 64 * 1024;
+    ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "1");
+    ScopedEnvVar queue_capacity("MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER", "1");
+    ScopedEnvVar pending_capacity("MC_TCP_MAX_PENDING_ADMISSIONS_PER_PEER",
+                                  "1");
+    ScopedEnvVar admission_timeout("MC_TCP_ADMISSION_TIMEOUT_MS", "10000");
+    ScopedLaneHooks hooks;
+    const char* env = std::getenv("MC_METADATA_SERVER");
+    const std::string metadata_server = env ? env : "P2PHANDSHAKE";
+
+    HoldingWriteServer fake_peer;
+    ASSERT_TRUE(fake_peer.ok());
+
+    EngineHandle h;
+    h.init(metadata_server, "127.0.0.2:17932", kLength);
+    ASSERT_TRUE(h.ok);
+    pointTcpSegmentAt(h, fake_peer.port());
+
+    const auto request = makeWriteRequest(h, kLength);
+    const auto active_batch = h.engine->allocateBatchID(1);
+    ASSERT_TRUE(h.engine->submitTransfer(active_batch, {request}).ok());
+    ASSERT_TRUE(waitForPredicate(
+        [] { return lane_busy_count.load(std::memory_order_acquire) >= 1; },
+        std::chrono::seconds(5)));
+    ASSERT_TRUE(fake_peer.waitForAccepted(1, std::chrono::seconds(5)));
+
+    const auto queued_batch = h.engine->allocateBatchID(1);
+    const auto pending_batch = h.engine->allocateBatchID(1);
+    ASSERT_TRUE(h.engine->submitTransfer(queued_batch, {request}).ok());
+    ASSERT_TRUE(h.engine->submitTransfer(pending_batch, {request}).ok());
+    ASSERT_TRUE(waitForPredicate(
+        [] {
+            return admission_pending_count.load(std::memory_order_acquire) ==
+                       1 &&
+                   admission_timer_armed_count.load(
+                       std::memory_order_acquire) == 1;
+        },
+        std::chrono::seconds(5)));
+
+    const auto shutdown_start = std::chrono::steady_clock::now();
+    h.engine.reset();
+    EXPECT_LT(std::chrono::steady_clock::now() - shutdown_start,
+              std::chrono::seconds(5));
+    expectEverySliceCompletedExactlyOnceAfterShutdown(active_batch);
+    expectEverySliceCompletedExactlyOnceAfterShutdown(queued_batch);
+    expectEverySliceCompletedExactlyOnceAfterShutdown(pending_batch);
+    EXPECT_EQ(shutdown_failure_count.load(std::memory_order_acquire), 3);
+    EXPECT_EQ(queue_timeout_failure_count.load(std::memory_order_acquire), 0);
+    EXPECT_EQ(admission_promoted_count.load(std::memory_order_acquire), 0);
+    EXPECT_EQ(admission_timer_fired_count.load(std::memory_order_acquire), 0);
+
+    hooks.reset();
+    reclaimBatchDescAfterEngineShutdownForTest(active_batch);
+    reclaimBatchDescAfterEngineShutdownForTest(queued_batch);
+    reclaimBatchDescAfterEngineShutdownForTest(pending_batch);
+}
+
+TEST(TcpWriteVisibilityTest,
+     AdmissionTimeoutWinsBeforeCapacityReleasePreservesOneOwner) {
+    ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "1");
+    ScopedEnvVar queue_capacity("MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER", "1");
+    ScopedEnvVar pending_capacity("MC_TCP_MAX_PENDING_ADMISSIONS_PER_PEER",
+                                  "1");
+    ScopedEnvVar admission_timeout("MC_TCP_ADMISSION_TIMEOUT_MS", "100");
+    ScopedLaneHooks hooks(/*block_first_connect_handler=*/false,
+                          /*block_after_busy=*/false,
+                          /*block_retry=*/false,
+                          /*block_retry_armed=*/false,
+                          /*block_admission=*/true);
+    const char* env = std::getenv("MC_METADATA_SERVER");
+    const std::string metadata_server = env ? env : "P2PHANDSHAKE";
+
+    ReusingWriteServer fake_peer(/*hold_first_ack=*/true);
+    ASSERT_TRUE(fake_peer.ok());
+
+    EngineHandle h;
+    h.init(metadata_server, "127.0.0.2:17933", 64 * 1024);
+    ASSERT_TRUE(h.ok);
+    pointTcpSegmentAt(h, fake_peer.port());
+
+    const auto request = makeWriteRequest(h, 1);
+    const auto active_batch = h.engine->allocateBatchID(1);
+    ASSERT_TRUE(h.engine->submitTransfer(active_batch, {request}).ok());
+    ASSERT_TRUE(fake_peer.waitForFirstRequest(std::chrono::seconds(5)));
+
+    const auto queued_batch = h.engine->allocateBatchID(1);
+    const auto pending_batch = h.engine->allocateBatchID(1);
+    ASSERT_TRUE(h.engine->submitTransfer(queued_batch, {request}).ok());
+    ASSERT_TRUE(h.engine->submitTransfer(pending_batch, {request}).ok());
+    ASSERT_TRUE(waitForPredicate(
+        [] {
+            return admission_handler_entered.load(std::memory_order_acquire);
+        },
+        std::chrono::seconds(5)));
+
+    // The expired timer handler is paused outside the group mutex. Make the
+    // active session's capacity release ready, then let the timer and queued
+    // completion contend in a deterministic order on the single io worker.
+    fake_peer.releaseFirstAck();
+    ASSERT_TRUE(fake_peer.waitForFirstAckSent(std::chrono::seconds(5)));
+    releaseAdmissionHandler();
+    ASSERT_TRUE(waitForPredicate(
+        [] {
+            return queue_timeout_failure_count.load(
+                       std::memory_order_acquire) == 1;
+        },
+        std::chrono::seconds(5)));
+    ASSERT_TRUE(fake_peer.waitForRequests(2, std::chrono::seconds(5)));
+
+    h.engine.reset();
+    expectEverySliceCompletedExactlyOnceAfterShutdown(active_batch);
+    expectEverySliceCompletedExactlyOnceAfterShutdown(queued_batch);
+    expectEverySliceCompletedExactlyOnceAfterShutdown(pending_batch);
+    EXPECT_EQ(queue_timeout_failure_count.load(std::memory_order_acquire), 1);
+    EXPECT_EQ(queue_full_failure_count.load(std::memory_order_acquire), 0);
+    EXPECT_EQ(admission_promoted_count.load(std::memory_order_acquire), 0);
+    EXPECT_EQ(admission_timer_fired_count.load(std::memory_order_acquire), 1);
+
+    hooks.reset();
+    reclaimBatchDescAfterEngineShutdownForTest(active_batch);
+    reclaimBatchDescAfterEngineShutdownForTest(queued_batch);
+    reclaimBatchDescAfterEngineShutdownForTest(pending_batch);
+}
+
+TEST(TcpWriteVisibilityTest,
+     CapacityReleasePromotesBeforeDeadlineAndCancelledTimerIsLate) {
+    ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "1");
+    ScopedEnvVar queue_capacity("MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER", "1");
+    ScopedEnvVar pending_capacity("MC_TCP_MAX_PENDING_ADMISSIONS_PER_PEER",
+                                  "1");
+    ScopedEnvVar admission_timeout("MC_TCP_ADMISSION_TIMEOUT_MS", "10000");
+    ScopedLaneHooks hooks(/*block_first_connect_handler=*/false,
+                          /*block_after_busy=*/false,
+                          /*block_retry=*/false,
+                          /*block_retry_armed=*/false,
+                          /*block_admission=*/true);
+    const char* env = std::getenv("MC_METADATA_SERVER");
+    const std::string metadata_server = env ? env : "P2PHANDSHAKE";
+
+    ReusingWriteServer fake_peer(/*hold_first_ack=*/true);
+    ASSERT_TRUE(fake_peer.ok());
+
+    EngineHandle h;
+    h.init(metadata_server, "127.0.0.2:17934", 64 * 1024);
+    ASSERT_TRUE(h.ok);
+    pointTcpSegmentAt(h, fake_peer.port());
+
+    const auto request = makeWriteRequest(h, 1);
+    const auto active_batch = h.engine->allocateBatchID(1);
+    ASSERT_TRUE(h.engine->submitTransfer(active_batch, {request}).ok());
+    ASSERT_TRUE(fake_peer.waitForFirstRequest(std::chrono::seconds(5)));
+
+    const auto queued_batch = h.engine->allocateBatchID(1);
+    const auto pending_batch = h.engine->allocateBatchID(1);
+    ASSERT_TRUE(h.engine->submitTransfer(queued_batch, {request}).ok());
+    ASSERT_TRUE(h.engine->submitTransfer(pending_batch, {request}).ok());
+    ASSERT_TRUE(waitForPredicate(
+        [] {
+            return admission_pending_count.load(std::memory_order_acquire) ==
+                       1 &&
+                   admission_timer_armed_count.load(
+                       std::memory_order_acquire) == 1;
+        },
+        std::chrono::seconds(5)));
+
+    // Completing the active exchange frees a work-queue slot before the long
+    // deadline. The pump promotes the pending item, invalidates the timer
+    // epoch, and cancels the now-unneeded shared admission timer.
+    fake_peer.releaseFirstAck();
+    ASSERT_TRUE(fake_peer.waitForFirstAckSent(std::chrono::seconds(5)));
+    ASSERT_TRUE(waitForPredicate(
+        [] {
+            return admission_promoted_count.load(std::memory_order_acquire) >=
+                   1;
+        },
+        std::chrono::seconds(5)));
+    ASSERT_TRUE(waitForPredicate(
+        [] {
+            return admission_handler_entered.load(std::memory_order_acquire);
+        },
+        std::chrono::seconds(5)));
+    EXPECT_EQ(queue_timeout_failure_count.load(std::memory_order_acquire), 0);
+    EXPECT_EQ(admission_timer_fired_count.load(std::memory_order_acquire), 0);
+
+    releaseAdmissionHandler();
+    ASSERT_TRUE(waitForPredicate(
+        [] {
+            return admission_timer_late_count.load(std::memory_order_acquire) >=
+                   1;
+        },
+        std::chrono::seconds(5)));
+    ASSERT_TRUE(fake_peer.waitForRequests(3, std::chrono::seconds(5)));
+    ASSERT_TRUE(waitForPredicate(
+        [] { return lane_terminal_count.load(std::memory_order_acquire) >= 3; },
+        std::chrono::seconds(5)));
+
+    h.engine.reset();
+    expectEverySliceSucceededExactlyOnceAfterShutdown(active_batch);
+    expectEverySliceSucceededExactlyOnceAfterShutdown(queued_batch);
+    expectEverySliceSucceededExactlyOnceAfterShutdown(pending_batch);
+    EXPECT_EQ(queue_timeout_failure_count.load(std::memory_order_acquire), 0);
+    EXPECT_EQ(queue_full_failure_count.load(std::memory_order_acquire), 0);
+    EXPECT_GE(admission_promoted_count.load(std::memory_order_acquire), 1);
+    EXPECT_EQ(admission_timer_fired_count.load(std::memory_order_acquire), 0);
+    EXPECT_GE(admission_timer_late_count.load(std::memory_order_acquire), 1);
+
+    hooks.reset();
+    reclaimBatchDescAfterEngineShutdownForTest(active_batch);
+    reclaimBatchDescAfterEngineShutdownForTest(queued_batch);
+    reclaimBatchDescAfterEngineShutdownForTest(pending_batch);
 }
 
 TEST(TcpWriteVisibilityTest,
@@ -1897,6 +2445,9 @@ TEST(TcpWriteVisibilityTest,
     constexpr size_t kQueueCapacity = 8;
     ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "2");
     ScopedEnvVar queue_capacity("MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER", "8");
+    ScopedEnvVar pending_capacity("MC_TCP_MAX_PENDING_ADMISSIONS_PER_PEER",
+                                  "1");
+    ScopedEnvVar admission_timeout("MC_TCP_ADMISSION_TIMEOUT_MS", "10000");
     ScopedLaneHooks hooks(/*block_first_connect_handler=*/false,
                           /*block_after_busy=*/true);
     const char* env = std::getenv("MC_METADATA_SERVER");
@@ -1960,7 +2511,9 @@ TEST(TcpWriteVisibilityTest,
               2u);
     EXPECT_FALSE(connecting_lane_had_current.load(std::memory_order_acquire));
     EXPECT_EQ(queue_rejection_count.load(std::memory_order_acquire),
-              static_cast<int>(kSubmissionCount - (kQueueCapacity - 1)));
+              static_cast<int>(kSubmissionCount - (kQueueCapacity - 1) - 1));
+    EXPECT_LE(maximum_observed_pending_depth.load(std::memory_order_acquire),
+              1u);
 
     auto engine = std::move(h.engine);
     auto destruction =

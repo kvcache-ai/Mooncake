@@ -122,6 +122,7 @@ class TcpTransport : public Transport {
 
     enum class WorkFailureReason {
         QUEUE_FULL,
+        QUEUE_TIMEOUT,
         RUNTIME_UNAVAILABLE,
         CONNECT_FAILED,
         SESSION_FAILED,
@@ -130,6 +131,7 @@ class TcpTransport : public Transport {
 
     struct FailureCounters {
         std::atomic<uint64_t> queue_full{0};
+        std::atomic<uint64_t> queue_timeout{0};
         std::atomic<uint64_t> connect_failed{0};
         std::atomic<uint64_t> runtime_unavailable{0};
         std::atomic<uint64_t> session_failed{0};
@@ -141,6 +143,7 @@ class TcpTransport : public Transport {
         bool use_v2 = false;
         uint64_t admission_sequence = 0;
         std::chrono::steady_clock::time_point enqueued_at;
+        std::chrono::steady_clock::time_point admission_deadline;
 
         TcpWorkItem() = default;
         TcpWorkItem(Slice *slice_arg, bool use_v2_arg)
@@ -149,7 +152,8 @@ class TcpTransport : public Transport {
             : slice(other.slice),
               use_v2(other.use_v2),
               admission_sequence(other.admission_sequence),
-              enqueued_at(other.enqueued_at) {
+              enqueued_at(other.enqueued_at),
+              admission_deadline(other.admission_deadline) {
             other.slice = nullptr;
         }
         TcpWorkItem &operator=(TcpWorkItem &&) = delete;
@@ -224,11 +228,15 @@ class TcpTransport : public Transport {
         PeerConnectionGroup(ConnectionKey key_arg,
                             const asio::io_context::executor_type &executor_arg,
                             size_t lane_count_arg, size_t queue_capacity_arg,
+                            size_t pending_admission_capacity_arg,
+                            std::chrono::milliseconds admission_timeout_arg,
                             std::shared_ptr<FailureCounters> counters_arg)
             : key(std::move(key_arg)),
               executor(executor_arg),
               lane_count(lane_count_arg),
               queue_capacity(queue_capacity_arg),
+              pending_admission_capacity(pending_admission_capacity_arg),
+              admission_timeout(admission_timeout_arg),
               failure_counters(std::move(counters_arg)) {}
 
         std::mutex mutex;
@@ -238,6 +246,12 @@ class TcpTransport : public Transport {
         size_t lane_count;
         size_t queue_capacity;
         std::deque<TcpWorkItem> queue;
+        std::deque<TcpWorkItem> pending_admissions;
+        size_t pending_admission_capacity;
+        std::chrono::milliseconds admission_timeout;
+        std::shared_ptr<asio::steady_timer> admission_timer;
+        bool admission_timer_armed = false;
+        uint64_t admission_epoch = 0;
         uint64_t queued_bytes = 0;
         bool queued_bytes_saturated = false;
         uint64_t next_admission_sequence = 1;
@@ -260,6 +274,8 @@ class TcpTransport : public Transport {
         bool shutting_down = false;
         size_t lanes_per_peer = 4;
         size_t max_queued_transfers_per_peer = 1024;
+        size_t max_pending_admissions_per_peer = 1024;
+        std::chrono::milliseconds admission_timeout{1000};
         std::unordered_map<ConnectionKey, std::shared_ptr<PeerConnectionGroup>,
                            ConnectionKeyHash>
             groups;
@@ -304,6 +320,19 @@ class TcpTransport : public Transport {
         const std::shared_ptr<PeerConnectionGroup> &group,
         const std::shared_ptr<asio::steady_timer> &timer, uint64_t retry_epoch,
         asio::error_code ec);
+    static size_t expirePendingAdmissionsLocked(
+        PeerConnectionGroup &group, std::chrono::steady_clock::time_point now,
+        std::deque<TcpWorkItem> &expired);
+    static size_t promotePendingAdmissionsLocked(PeerConnectionGroup &group);
+    static void refreshAdmissionTimerLocked(
+        const std::shared_ptr<PeerConnectionGroup> &group,
+        std::deque<TcpWorkItem> &runtime_failed,
+        std::shared_ptr<asio::steady_timer> &timer_to_cancel,
+        bool &timer_armed);
+    static void handleAdmissionTimer(
+        const std::shared_ptr<PeerConnectionGroup> &group,
+        const std::shared_ptr<asio::steady_timer> &timer,
+        uint64_t admission_epoch, asio::error_code ec);
     static void startLaneSession(
         const std::shared_ptr<PeerConnectionGroup> &group,
         const std::shared_ptr<ConnectionLane> &lane, uint64_t epoch);
