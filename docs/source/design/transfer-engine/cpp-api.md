@@ -10,6 +10,10 @@ For conceptual background, see [Transfer Engine](index.md).
 - Core APIs form the minimal path to move data: initialize the engine, register memory, open segments, submit transfers, and query status.
 - Advanced APIs are optional; they help with transport control, notifications, metadata/cache maintenance, topology discovery, and debugging.
 
+**TENT compatibility mode**
+- When Mooncake is built with TENT support, setting `MC_USE_TENT=1` or `MC_USE_TEV1=1` makes this `TransferEngine` API delegate to the TENT runtime.
+- The common TE workflow is preserved, but APIs that expose classic TE internals have compatibility-specific behavior. See [TENT Transfer Engine compatibility mode](../tent/cpp-api.md#transfer-engine-compatibility-mode-semantics) for the full behavior table.
+
 ## Core APIs
 
 ### Core Usage Path (C++)

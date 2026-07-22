@@ -18,10 +18,13 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -29,7 +32,10 @@
 #include "tent/common/config.h"
 #include "tent/common/types.h"
 #include "tent/transfer_engine.h"
+#include "tent/transport/rdma/connect_pause_tracker.h"
+#include "tent/transport/rdma/context.h"
 #include "tent/transport/rdma/params.h"
+#include "tent/transport/rdma/rdma_gid_probe.h"
 #include "tent/transport/rdma/rdma_transport.h"
 
 namespace mooncake {
@@ -101,6 +107,29 @@ bool waitBatchDone(TransferEngine& engine, BatchID batch) {
     return false;
 }
 
+AutoGidCandidate makeGidCandidate(int gid_index, uint32_t gid_type,
+                                  bool has_network_device, bool is_ipv4_mapped,
+                                  bool is_link_local_ipv6,
+                                  bool is_overlay_network = false,
+                                  bool is_overlay_ipv4 = false,
+                                  bool is_null_gid = false,
+                                  bool query_succeeded = true,
+                                  std::string gid = "") {
+    AutoGidCandidate candidate;
+    candidate.gid_index = gid_index;
+    candidate.gid =
+        gid.empty() ? "gid-" + std::to_string(gid_index) : std::move(gid);
+    candidate.gid_type = gid_type;
+    candidate.has_network_device = has_network_device;
+    candidate.is_ipv4_mapped = is_ipv4_mapped;
+    candidate.is_link_local_ipv6 = is_link_local_ipv6;
+    candidate.is_overlay_network = is_overlay_network;
+    candidate.is_overlay_ipv4 = is_overlay_ipv4;
+    candidate.is_null_gid = is_null_gid;
+    candidate.query_succeeded = query_succeeded;
+    return candidate;
+}
+
 TEST(RdmaParamsTest, DefaultsKeepLaneCountsAligned) {
     RdmaParams params;
 
@@ -109,6 +138,458 @@ TEST(RdmaParamsTest, DefaultsKeepLaneCountsAligned) {
     EXPECT_EQ(params.endpoint.qp_mul_factor, params.num_lanes);
     EXPECT_EQ(params.workers.num_workers, params.num_lanes);
     EXPECT_EQ(params.endpoint.path_mtu, IBV_MTU_4096);
+    EXPECT_EQ(params.endpoint.conn_pause_ttl_ms, 1000);
+    EXPECT_EQ(params.device.auto_gid_max_retries, 2);
+    EXPECT_TRUE(params.endpoint.mlx5_qp_udp_sports.empty());
+    EXPECT_FALSE(params.endpoint.mlx5_qp_lag_port_balance);
+    EXPECT_FALSE(params.workers.track_posted_slices);
+}
+
+TEST(RdmaParamsTest, RejectsEmptyCompletionResourcesBeforeOpeningDevice) {
+    RdmaTransport transport;
+
+    {
+        auto params = std::make_shared<RdmaParams>();
+        params->device.num_cq_list = 0;
+        params->device.num_comp_channels = 1;
+        RdmaContext context(transport);
+        EXPECT_NE(context.construct("invalid-rdma-device", params), 0);
+    }
+
+    {
+        auto params = std::make_shared<RdmaParams>();
+        params->device.num_cq_list = 1;
+        params->device.num_comp_channels = 0;
+        RdmaContext context(transport);
+        EXPECT_NE(context.construct("invalid-rdma-device", params), 0);
+    }
+}
+
+TEST(RdmaGidProbeTest, PrefersNetworkBackedRoutableCandidate) {
+    std::vector<AutoGidCandidate> candidates = {
+        makeGidCandidate(0, IBV_GID_TYPE_ROCE_V2, false, true, false),
+        makeGidCandidate(1, IBV_GID_TYPE_ROCE_V2, true, true, false),
+    };
+
+    auto selection = selectBestAutoGidCandidate(candidates);
+    ASSERT_TRUE(selection.has_value());
+    EXPECT_EQ(selection->gid_index, 1);
+    EXPECT_EQ(selection->candidate_class,
+              AutoGidCandidateClass::kNetworkRoutable);
+}
+
+TEST(RdmaGidProbeTest, DemotesLinkLocalBehindRoutableNetworkCandidate) {
+    std::vector<AutoGidCandidate> candidates = {
+        makeGidCandidate(0, IBV_GID_TYPE_ROCE_V2, true, false, true),
+        makeGidCandidate(1, IBV_GID_TYPE_ROCE_V2, true, true, false),
+    };
+
+    auto selection = selectBestAutoGidCandidate(candidates);
+    ASSERT_TRUE(selection.has_value());
+    EXPECT_EQ(selection->gid_index, 1);
+    EXPECT_EQ(selection->candidate_class,
+              AutoGidCandidateClass::kNetworkRoutable);
+}
+
+TEST(RdmaGidProbeTest, DemotesOverlayCandidateBehindNormalNetworkCandidate) {
+    std::vector<AutoGidCandidate> candidates = {
+        makeGidCandidate(0, IBV_GID_TYPE_ROCE_V2, true, true, false, true),
+        makeGidCandidate(1, IBV_GID_TYPE_ROCE_V2, true, true, false),
+    };
+
+    auto selection = selectBestAutoGidCandidate(candidates);
+    ASSERT_TRUE(selection.has_value());
+    EXPECT_EQ(selection->gid_index, 1);
+}
+
+TEST(RdmaGidProbeTest,
+     PrefersNoNetworkRoutableOverDegradedNetworkBackedCandidate) {
+    std::vector<AutoGidCandidate> candidates = {
+        makeGidCandidate(0, IBV_GID_TYPE_ROCE_V2, true, false, true),
+        makeGidCandidate(1, IBV_GID_TYPE_ROCE_V2, false, true, false),
+    };
+
+    auto selection = selectBestAutoGidCandidate(candidates);
+    ASSERT_TRUE(selection.has_value());
+    EXPECT_EQ(selection->gid_index, 1);
+    EXPECT_EQ(selection->candidate_class,
+              AutoGidCandidateClass::kNoNetworkRoutable);
+}
+
+TEST(RdmaGidProbeTest, KeepsNoNetworkFallbackAsLastResort) {
+    std::vector<AutoGidCandidate> candidates = {
+        makeGidCandidate(3, IBV_GID_TYPE_ROCE_V2, false, true, false),
+    };
+
+    auto selection = selectBestAutoGidCandidate(candidates);
+    ASSERT_TRUE(selection.has_value());
+    EXPECT_EQ(selection->gid_index, 3);
+    EXPECT_EQ(selection->candidate_class,
+              AutoGidCandidateClass::kNoNetworkRoutable);
+}
+
+TEST(RdmaGidProbeTest, FallsBackToFirstNonzeroCandidateWhenNeeded) {
+    std::vector<AutoGidCandidate> candidates = {
+        makeGidCandidate(0, IBV_GID_TYPE_ROCE_V1, false, false, false),
+        makeGidCandidate(2, IBV_GID_TYPE_ROCE_V1, false, false, false),
+    };
+
+    auto selection = selectBestAutoGidCandidate(candidates);
+    ASSERT_TRUE(selection.has_value());
+    EXPECT_EQ(selection->gid_index, 0);
+    EXPECT_EQ(selection->candidate_class,
+              AutoGidCandidateClass::kFallbackNonzero);
+}
+
+TEST(RdmaGidProbeTest, DoesNotTreatIbCandidateAsLinkLocalIpv6Penalty) {
+    std::vector<AutoGidCandidate> candidates = {
+        makeGidCandidate(0, IBV_GID_TYPE_IB, true, false, true),
+        makeGidCandidate(1, IBV_GID_TYPE_ROCE_V2, false, true, false),
+    };
+
+    auto selection = selectBestAutoGidCandidate(candidates);
+    ASSERT_TRUE(selection.has_value());
+    EXPECT_EQ(selection->gid_index, 0);
+    EXPECT_EQ(selection->candidate_class,
+              AutoGidCandidateClass::kNetworkRoutable);
+}
+
+TEST(RdmaGidProbeTest, SkipsInvalidAndNullCandidates) {
+    std::vector<AutoGidCandidate> candidates = {
+        makeGidCandidate(0, IBV_GID_TYPE_ROCE_V2, true, true, false, false,
+                         false, false, false),
+        makeGidCandidate(1, IBV_GID_TYPE_ROCE_V2, true, true, false, false,
+                         false, true),
+        makeGidCandidate(2, IBV_GID_TYPE_ROCE_V2, true, true, false),
+    };
+
+    auto selection = selectBestAutoGidCandidate(candidates);
+    ASSERT_TRUE(selection.has_value());
+    EXPECT_EQ(selection->gid_index, 2);
+}
+
+TEST(RdmaGidProbeTest, KeepsStableOrderingWithinSameCandidateClass) {
+    std::vector<AutoGidCandidate> candidates = {
+        makeGidCandidate(3, IBV_GID_TYPE_ROCE_V2, true, true, false),
+        makeGidCandidate(1, IBV_GID_TYPE_ROCE_V2, true, true, false),
+    };
+
+    auto ranked = rankAutoGidCandidates(candidates);
+    ASSERT_EQ(ranked.size(), 2u);
+    EXPECT_EQ(ranked[0].gid_index, 1);
+    EXPECT_EQ(ranked[1].gid_index, 3);
+}
+
+TEST(RdmaGidProbeTest, ReprobeStillPicksBestCandidateFromFreshSnapshot) {
+    std::vector<AutoGidCandidate> candidates = {
+        makeGidCandidate(1, IBV_GID_TYPE_ROCE_V2, true, true, false),
+        makeGidCandidate(3, IBV_GID_TYPE_ROCE_V2, false, true, false),
+    };
+
+    auto selection = selectBestAutoGidCandidate(candidates);
+    ASSERT_TRUE(selection.has_value());
+    EXPECT_EQ(selection->gid_index, 1);
+    EXPECT_EQ(selection->candidate_class,
+              AutoGidCandidateClass::kNetworkRoutable);
+}
+
+TEST(RdmaGidProbeTest, ReprobeDetectsSameIndexGidRefresh) {
+    std::vector<AutoGidCandidate> candidates = {
+        makeGidCandidate(1, IBV_GID_TYPE_ROCE_V2, true, true, false, false,
+                         false, false, true, "00:11:22"),
+        makeGidCandidate(3, IBV_GID_TYPE_ROCE_V2, false, true, false),
+    };
+
+    auto selection = reselectAutoGidCandidate(candidates, 1, "00:11:21");
+    ASSERT_TRUE(selection.has_value());
+    EXPECT_EQ(selection->gid_index, 1);
+    EXPECT_EQ(selection->gid, "00:11:22");
+    EXPECT_EQ(selection->candidate_class,
+              AutoGidCandidateClass::kNetworkRoutable);
+}
+
+TEST(RdmaGidProbeTest, ReprobeSkipsRetryWhenBestSelectionDidNotChange) {
+    std::vector<AutoGidCandidate> candidates = {
+        makeGidCandidate(1, IBV_GID_TYPE_ROCE_V2, true, true, false, false,
+                         false, false, true, "00:11:22"),
+    };
+
+    auto selection = reselectAutoGidCandidate(candidates, 1, "00:11:22");
+    EXPECT_FALSE(selection.has_value());
+}
+
+TEST(RdmaGidProbeTest, ReprobeSkipsAlreadyTriedCandidates) {
+    std::vector<AutoGidCandidate> candidates = {
+        makeGidCandidate(1, IBV_GID_TYPE_ROCE_V2, true, true, false, false,
+                         false, false, true, "00:11:22"),
+        makeGidCandidate(3, IBV_GID_TYPE_ROCE_V2, false, true, false, false,
+                         false, false, true, "00:11:33"),
+    };
+
+    auto selection =
+        reselectAutoGidCandidate(candidates, 1, "00:11:21", {{1, "00:11:22"}});
+    ASSERT_TRUE(selection.has_value());
+    EXPECT_EQ(selection->gid_index, 3);
+    EXPECT_EQ(selection->gid, "00:11:33");
+}
+
+TEST(RdmaGidProbeTest, DetectsSameIndexGidByteChangesAsSelectionChanges) {
+    EXPECT_TRUE(didAutoGidSelectionChange(1, "00:11:22", 1, "00:11:23"));
+    EXPECT_FALSE(didAutoGidSelectionChange(1, "00:11:22", 1, "00:11:22"));
+}
+
+TEST(RdmaGidProbeTest, HandshakeRetryRespectsConfiguredRetryBudget) {
+    EXPECT_TRUE(shouldAttemptAutoGidHandshakeRetry(true, 0, 2, true, EINVAL));
+    EXPECT_TRUE(shouldAttemptAutoGidHandshakeRetry(true, 1, 2, true, EINVAL));
+    EXPECT_FALSE(shouldAttemptAutoGidHandshakeRetry(false, 0, 2, true, EINVAL));
+    EXPECT_FALSE(shouldAttemptAutoGidHandshakeRetry(true, 2, 2, true, EINVAL));
+    EXPECT_FALSE(shouldAttemptAutoGidHandshakeRetry(true, 0, 0, true, EINVAL));
+}
+
+TEST(RdmaGidProbeTest, HandshakeRetryOnlyTriggersForRtrEinval) {
+    EXPECT_FALSE(shouldAttemptAutoGidHandshakeRetry(true, 0, 2, false, EINVAL));
+    EXPECT_FALSE(shouldAttemptAutoGidHandshakeRetry(true, 0, 2, true, ENOENT));
+}
+
+TEST(RdmaGidProbeTest, RetryActionRequiresObservedOrReprobedChange) {
+    EXPECT_EQ(decideAutoGidRetryAction(false, 1, "00:11:22", 1, "00:11:22"),
+              AutoGidRetryAction::kDoNotRetry);
+    EXPECT_EQ(decideAutoGidRetryAction(true, 1, "00:11:22", 1, "00:11:23"),
+              AutoGidRetryAction::kRetryWithReprobedGid);
+    EXPECT_EQ(decideAutoGidRetryAction(false, 1, "00:11:22", 1, "00:11:23"),
+              AutoGidRetryAction::kRetryWithObservedChange);
+}
+
+TEST(RdmaGidProbeTest, PrefersPrivateRangeV4OverLinkLocal) {
+    std::vector<AutoGidCandidate> candidates = {
+        makeGidCandidate(0, IBV_GID_TYPE_ROCE_V1, true, false, true),
+        makeGidCandidate(1, IBV_GID_TYPE_ROCE_V2, true, false, true),
+        makeGidCandidate(2, IBV_GID_TYPE_ROCE_V1, true, true, false, false,
+                         true),
+        makeGidCandidate(3, IBV_GID_TYPE_ROCE_V2, true, true, false, false,
+                         true),
+    };
+
+    auto selection = selectBestAutoGidCandidate(candidates);
+    ASSERT_TRUE(selection.has_value());
+    EXPECT_EQ(selection->gid_index, 3);
+    EXPECT_EQ(selection->candidate_class,
+              AutoGidCandidateClass::kNetworkPrivateV4);
+}
+
+TEST(RdmaGidProbeTest, RoutableV4StillOutranksPrivateRangeV4) {
+    std::vector<AutoGidCandidate> candidates = {
+        makeGidCandidate(1, IBV_GID_TYPE_ROCE_V2, true, true, false, false,
+                         true),
+        makeGidCandidate(5, IBV_GID_TYPE_ROCE_V2, true, true, false),
+    };
+
+    auto selection = selectBestAutoGidCandidate(candidates);
+    ASSERT_TRUE(selection.has_value());
+    EXPECT_EQ(selection->gid_index, 5);
+    EXPECT_EQ(selection->candidate_class,
+              AutoGidCandidateClass::kNetworkRoutable);
+}
+
+TEST(RdmaGidProbeTest, OverlayInterfaceStaysDemotedBelowPrivateRangeV4) {
+    std::vector<AutoGidCandidate> candidates = {
+        makeGidCandidate(1, IBV_GID_TYPE_ROCE_V2, true, true, false, true,
+                         true),
+        makeGidCandidate(4, IBV_GID_TYPE_ROCE_V2, true, true, false, false,
+                         true),
+    };
+
+    auto selection = selectBestAutoGidCandidate(candidates);
+    ASSERT_TRUE(selection.has_value());
+    EXPECT_EQ(selection->gid_index, 4);
+    EXPECT_EQ(selection->candidate_class,
+              AutoGidCandidateClass::kNetworkPrivateV4);
+}
+
+TEST(RdmaGidProbeTest, NetworkLinkLocalStillOutranksNoNetworkPrivateV4) {
+    std::vector<AutoGidCandidate> candidates = {
+        makeGidCandidate(1, IBV_GID_TYPE_ROCE_V2, true, false, true),
+        makeGidCandidate(3, IBV_GID_TYPE_ROCE_V2, false, true, false, false,
+                         true),
+    };
+
+    auto selection = selectBestAutoGidCandidate(candidates);
+    ASSERT_TRUE(selection.has_value());
+    EXPECT_EQ(selection->gid_index, 1);
+    EXPECT_EQ(selection->candidate_class,
+              AutoGidCandidateClass::kNetworkDegraded);
+}
+
+TEST(RdmaGidProbeTest, ClassPriorityAndNameTablesAreComplete) {
+    const AutoGidCandidateClass all[] = {
+        AutoGidCandidateClass::kNetworkRoutable,
+        AutoGidCandidateClass::kNoNetworkRoutable,
+        AutoGidCandidateClass::kNetworkPrivateV4,
+        AutoGidCandidateClass::kNetworkDegraded,
+        AutoGidCandidateClass::kNoNetworkPrivateV4,
+        AutoGidCandidateClass::kNoNetworkDegraded,
+        AutoGidCandidateClass::kFallbackNonzero,
+    };
+    int expected_priority = 0;
+    std::set<std::string> names;
+    for (auto cls : all) {
+        EXPECT_EQ(autoGidCandidateClassPriority(cls), expected_priority++);
+        std::string name = autoGidCandidateClassToString(cls);
+        EXPECT_NE(name, "unknown");
+        EXPECT_TRUE(names.insert(name).second)
+            << "duplicate class name: " << name;
+    }
+}
+
+TEST(RdmaGidProbeTest, LinkLocalOnlyKeepsLowestIndexTieBreak) {
+    std::vector<AutoGidCandidate> candidates = {
+        makeGidCandidate(1, IBV_GID_TYPE_ROCE_V2, true, false, true),
+        makeGidCandidate(2, IBV_GID_TYPE_ROCE_V2, true, false, true),
+    };
+
+    auto selection = selectBestAutoGidCandidate(candidates);
+    ASSERT_TRUE(selection.has_value());
+    EXPECT_EQ(selection->gid_index, 1);
+    EXPECT_EQ(selection->candidate_class,
+              AutoGidCandidateClass::kNetworkDegraded);
+}
+
+struct FakeClock {
+    std::atomic<uint64_t> now{0};
+    uint64_t operator()() const { return now.load(std::memory_order_relaxed); }
+};
+
+ConnectPauseTracker makeTracker(std::shared_ptr<FakeClock> clk) {
+    return ConnectPauseTracker([clk] { return (*clk)(); });
+}
+
+TEST(ConnectPauseTrackerTest, UnknownPeerNotPaused) {
+    auto clk = std::make_shared<FakeClock>();
+    auto tracker = makeTracker(clk);
+
+    EXPECT_FALSE(tracker.isPaused("10.0.0.1:1234"));
+}
+
+TEST(ConnectPauseTrackerTest, PausesUntilExpiryAndPrunes) {
+    uint64_t now = 100;
+    ConnectPauseTracker tracker([&] { return now; });
+
+    EXPECT_FALSE(tracker.isPaused("peer-a"));
+    tracker.pauseFor("peer-a", 50);
+    tracker.pauseFor("peer-b", 100);
+    EXPECT_TRUE(tracker.isPaused("peer-a"));
+    EXPECT_TRUE(tracker.isPaused("peer-b"));
+
+    now = 151;
+    EXPECT_FALSE(tracker.isPaused("peer-a"));
+    EXPECT_TRUE(tracker.isPaused("peer-b"));
+    tracker.prune();
+    EXPECT_FALSE(tracker.isPaused("peer-a"));
+    EXPECT_TRUE(tracker.isPaused("peer-b"));
+
+    now = 201;
+    tracker.prune();
+    EXPECT_FALSE(tracker.isPaused("peer-a"));
+    EXPECT_FALSE(tracker.isPaused("peer-b"));
+}
+
+TEST(ConnectPauseTrackerTest, LaterPauseExtendsExistingDeadline) {
+    uint64_t now = 100;
+    ConnectPauseTracker tracker([&] { return now; });
+
+    tracker.pauseFor("peer-a", 50);
+    now = 120;
+    tracker.pauseFor("peer-a", 100);
+
+    now = 151;
+    EXPECT_TRUE(tracker.isPaused("peer-a"));
+    now = 221;
+    EXPECT_FALSE(tracker.isPaused("peer-a"));
+}
+
+TEST(ConnectPauseTrackerTest, RepeatedChecksDoNotExtendHardDeadline) {
+    auto clk = std::make_shared<FakeClock>();
+    auto tracker = makeTracker(clk);
+    const std::string peer = "10.0.0.1:1234";
+    tracker.pauseFor(peer, 1000);
+
+    for (uint64_t now = 100; now < 1000; now += 100) {
+        clk->now = now;
+        EXPECT_TRUE(tracker.isPaused(peer));
+    }
+
+    clk->now = 1000;
+    EXPECT_FALSE(tracker.isPaused(peer));
+}
+
+TEST(ConnectPauseTrackerTest, RefreshExtendsWindow) {
+    auto clk = std::make_shared<FakeClock>();
+    auto tracker = makeTracker(clk);
+    const std::string peer = "peer";
+    tracker.pauseFor(peer, 100);
+    clk->now = 50;
+    tracker.pauseFor(peer, 150);
+
+    clk->now = 150;
+    EXPECT_TRUE(tracker.isPaused(peer));
+    clk->now = 200;
+    EXPECT_FALSE(tracker.isPaused(peer));
+}
+
+TEST(ConnectPauseTrackerTest, PruneDropsOnlyExpired) {
+    auto clk = std::make_shared<FakeClock>();
+    auto tracker = makeTracker(clk);
+    tracker.pauseFor("a", 100);
+    tracker.pauseFor("b", 300);
+
+    clk->now = 200;
+    tracker.prune();
+
+    EXPECT_FALSE(tracker.isPaused("a"));
+    EXPECT_TRUE(tracker.isPaused("b"));
+}
+
+TEST(ConnectPauseTrackerTest, PerPeerIndependent) {
+    auto clk = std::make_shared<FakeClock>();
+    auto tracker = makeTracker(clk);
+    tracker.pauseFor("a", 100);
+    tracker.pauseFor("b", 1000);
+
+    clk->now = 150;
+    EXPECT_FALSE(tracker.isPaused("a"));
+    EXPECT_TRUE(tracker.isPaused("b"));
+}
+
+TEST(ConnectPauseTrackerTest, ConcurrentAccessIsRaceFree) {
+    auto clk = std::make_shared<FakeClock>();
+    auto tracker = makeTracker(clk);
+    constexpr int kIters = 5000;
+    constexpr uint64_t kFarFuture = 1ull << 40;
+    std::vector<std::thread> threads;
+
+    for (int i = 0; i < 4; ++i) {
+        threads.emplace_back([&tracker, i] {
+            std::string server = "peer" + std::to_string(i % 3);
+            for (int k = 0; k < kIters; ++k) {
+                tracker.pauseFor(server, kFarFuture);
+            }
+        });
+    }
+    for (int i = 0; i < 4; ++i) {
+        threads.emplace_back([&tracker] {
+            for (int k = 0; k < kIters; ++k) {
+                (void)tracker.isPaused("peer0");
+            }
+        });
+    }
+    threads.emplace_back([&tracker] {
+        for (int k = 0; k < kIters; ++k) {
+            tracker.prune();
+        }
+    });
+
+    for (auto& thread : threads) thread.join();
+    SUCCEED();
 }
 
 TEST(RdmaSubBatchTest, ReportsTaskCount) {

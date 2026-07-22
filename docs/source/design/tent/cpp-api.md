@@ -11,7 +11,7 @@ For conceptual background, see [TENT Overview](overview.md).
 - **Build** with `-DUSE_TENT=ON` to enable TENT.
 - TENT provides two API surfaces:
   - **TENT-native API** (documented below).
-  - **TE-compatible API** via the compatibility shim (set `MC_USE_TENT=1`). For TE-compatible API, see [TE C++ API Reference](../transfer-engine/cpp-api.md)
+  - **TE-compatible API** via the compatibility shim (set `MC_USE_TENT=1`). For TE-compatible API, see TE C++ API Reference.
 
 **Core APIs vs Advanced APIs**
 - Core APIs form the minimal path to move data: create the engine, register memory, open segments, submit transfers, and query status.
@@ -105,6 +105,36 @@ export MC_USE_TENT=1
 ```
 
 When this variable is set, the `mooncake::TransferEngine` class internally delegates to `mooncake::tent::TransferEngine`. Most TE APIs are translated automatically. APIs that have no TENT equivalent (e.g., `installTransport`, `getMetadata`) become no-ops or return placeholder values.
+
+(transfer-engine-compatibility-mode-semantics)=
+### Transfer Engine Compatibility Mode Semantics
+
+The compatibility shim is intended to preserve the common TE application flow while running on the TENT runtime:
+
+```text
+init -> register memory -> open segment -> allocate batch -> submit/poll -> cleanup
+```
+
+TENT still uses a different internal model from classic TE, so a few TE APIs have compatibility-specific behavior. Code that depends on TE internals should use the public compatibility APIs below rather than directly reading classic metadata or topology state.
+
+| TE API or behavior | TENT compatibility behavior (`MC_USE_TENT=1`) | Migration guidance |
+|--------------------|-----------------------------------------------|--------------------|
+| `init(...)` | Builds a TENT `Config` and constructs the TENT engine. Failure returns a classic TE-style error code. | Treat any non-zero return as initialization failure, as with classic TE. |
+| `installTransport(proto, args)` | Does not dynamically install transports after initialization. Recognized legacy proto names are accepted for compatibility; RDMA/Barex NIC hints can be captured before `init()`. The return value is `nullptr` in TENT mode. | Do not assert the returned transport pointer when `isUsingTent()` is true. Configure transports through TENT config. |
+| `uninstallTransport(proto)` | No-op, matching the classic implementation's current behavior. | No migration needed; do not use it to change active TENT topology. |
+| `getTransport(proto)` | Returns `nullptr`. | Use transfer requests and optional `transport_hint` instead of direct transport access. |
+| `getMetadata()` | Returns `nullptr`; TENT does not expose classic `TransferMetadata`. | Use `getSegmentBufferBase(handle, index, base)` when legacy code needs a remote buffer base. |
+| `getLocalTopology()` / C API `discoverTopology()` | C++ returns an empty placeholder topology; the C API `discoverTopology()` is a no-op success. | Configure topology in TENT config or through init-time compatibility hints. |
+| `syncSegmentCache(...)` | No-op success; TENT manages segment cache internally. | Remove explicit cache sync calls when migrating to native TENT. |
+| `removeLocalSegment(...)` | Returns failure because TENT manages local segment lifecycle internally. | Do not depend on explicit local segment removal when `isUsingTent()` is true. |
+| `registerLocalMemory(...)` and batch variants | The shim preserves classic TE validation: zero-length regions are rejected, overlapping regions are rejected, and unregistering an unknown address returns `ERR_ADDRESS_NOT_REGISTERED`. | Existing TE registration error handling should continue to work. |
+| Transport registration failure during memory registration | TENT now reports the first transport failure and rolls back previously registered transport buffers. | Treat non-zero registration return values as fatal for that region, as with classic TE. |
+| `allocateBatchID(...)` | A TENT allocation failure is translated to `INVALID_BATCH_ID`. | Keep existing invalid-batch checks. |
+| `getTransferStatus(...)` | On error, the output status is left unchanged. | Check the returned `Status` before reading the output status. |
+| `mp_*` APIs | TENT uses a unified memory registration model. `mp_submitTransfer` maps the requested protocol string to TENT `transport_hint`; duplicate `addr+len` registrations across protocols are de-duplicated. | Use `transport_hint` for per-request transport preference when possible. |
+| TE C API `segment_id_t` | The TE C API remains 32-bit for ABI compatibility, while TENT segment handles are 64-bit internally. The shim returns an error if a handle would be truncated. | Prefer the C++ API or native TENT C API if very large numbers of remote segment handles are expected. |
+
+The compatibility shim deliberately fails soft for APIs whose classic TE behavior cannot be represented by TENT internals. For new code, prefer the TENT-native API and configuration model.
 
 ## Core APIs
 

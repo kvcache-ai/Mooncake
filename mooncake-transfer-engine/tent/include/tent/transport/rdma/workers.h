@@ -210,8 +210,11 @@ class Workers {
         // invalidate pointers into RailMonitor stored on in-flight slices
         // (see RdmaSlice::rail_monitor).
         std::unordered_map<std::string, std::unique_ptr<RailMonitor>> rails;
+        std::atomic<uint64_t> last_poll_ts_ns{0};
+        std::atomic<uint64_t> last_poll_interval_ns{0};
+        std::atomic<uint64_t> max_poll_interval_ns{0};
         PerfMetricSummary perf;
-        uint64_t padding[15];
+        uint64_t padding[9];
     };
 
     // Promote timed-out low priority requests to higher priority queues

@@ -161,9 +161,23 @@ static Status convertConfToRdmaParams(std::shared_ptr<Config> conf,
     SET_DEVICE(num_comp_channels, params->device.num_comp_channels);
     SET_DEVICE(port, params->device.port);
     SET_DEVICE(gid_index, params->device.gid_index);
+    SET_DEVICE(auto_gid_max_retries, params->device.auto_gid_max_retries);
     SET_DEVICE(max_cqe, params->device.max_cqe);
 
     SET_ENDPOINT(endpoint_store_cap, params->endpoint.endpoint_store_cap);
+    const auto endpoint_store_type = conf->get(
+        "transports/rdma/endpoint/endpoint_store_type", std::string("SIEVE"));
+    if (endpoint_store_type == "FIFO" || endpoint_store_type == "fifo") {
+        params->endpoint.endpoint_store_type = EndpointStoreType::FIFO;
+    } else if (endpoint_store_type == "SIEVE" ||
+               endpoint_store_type == "sieve") {
+        params->endpoint.endpoint_store_type = EndpointStoreType::SIEVE;
+    } else {
+        LOG(WARNING) << "Ignore unsupported RDMA endpoint_store_type '"
+                     << endpoint_store_type << "', using SIEVE";
+        params->endpoint.endpoint_store_type = EndpointStoreType::SIEVE;
+    }
+    SET_ENDPOINT(conn_pause_ttl_ms, params->endpoint.conn_pause_ttl_ms);
     SET_ENDPOINT(max_sge, params->endpoint.max_sge);
     SET_ENDPOINT(max_qp_wr, params->endpoint.max_qp_wr);
     SET_ENDPOINT(max_inline_bytes, params->endpoint.max_inline_bytes);
@@ -177,6 +191,9 @@ static Status convertConfToRdmaParams(std::shared_ptr<Config> conf,
     SET_ENDPOINT(rq_psn, params->endpoint.rq_psn);
     SET_ENDPOINT(max_dest_rd_atomic, params->endpoint.max_dest_rd_atomic);
     SET_ENDPOINT(min_rnr_timer, params->endpoint.min_rnr_timer);
+    SET_ENDPOINT(mlx5_qp_udp_sports, params->endpoint.mlx5_qp_udp_sports);
+    SET_ENDPOINT(mlx5_qp_lag_port_balance,
+                 params->endpoint.mlx5_qp_lag_port_balance);
     SET_ENDPOINT(sq_psn, params->endpoint.sq_psn);
     SET_ENDPOINT(send_timeout, params->endpoint.send_timeout);
     SET_ENDPOINT(send_retry_count, params->endpoint.send_retry_count);
@@ -230,8 +247,10 @@ static Status convertConfToRdmaParams(std::shared_ptr<Config> conf,
 
     SET_WORKERS(max_retry_count, params->workers.max_retry_count);
     SET_WORKERS(block_size, params->workers.block_size);
+    SET_WORKERS(fragment_limit, params->workers.fragment_limit);
     SET_WORKERS(grace_period_ns, params->workers.grace_period_ns);
     SET_WORKERS(rail_topo_path, params->workers.rail_topo_path);
+    SET_WORKERS(track_posted_slices, params->workers.track_posted_slices);
 
     params->verbose = conf->get("verbose", false);
     params->log_slice_affinity =
@@ -419,6 +438,7 @@ Status RdmaTransport::submitTransferTasks(
         return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
 
     const size_t default_block_size = params_->workers.block_size;
+    const size_t fragment_limit = params_->workers.fragment_limit;
     const int num_workers = params_->workers.num_workers;
     std::vector<RdmaSliceList> slice_lists(num_workers);
     std::vector<RdmaSlice*> slice_tails(num_workers, nullptr);
@@ -447,7 +467,6 @@ Status RdmaTransport::submitTransferTasks(
         task->cancel_requested.store(false, std::memory_order_relaxed);
         task->ref();  // Batch holds a reference to the task
 
-        const double merge_ratio = 0.25;
         uint64_t base_block = default_block_size;
         uint64_t num_slices = (request.length + base_block - 1) / base_block;
         num_slices = std::max<uint64_t>(
@@ -455,8 +474,7 @@ Status RdmaTransport::submitTransferTasks(
 
         if (num_slices > 1) {
             uint64_t tail = request.length % base_block;
-            if (tail > 0 &&
-                tail < static_cast<uint64_t>(base_block * merge_ratio)) {
+            if (tail > 0 && tail <= fragment_limit) {
                 num_slices = std::max<uint64_t>(1, num_slices - 1);
             }
         }

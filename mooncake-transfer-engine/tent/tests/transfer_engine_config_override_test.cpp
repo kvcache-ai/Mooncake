@@ -293,6 +293,67 @@ TEST(TransferEngineConfigOverrideTest,
     EXPECT_TRUE(config.get("transports/rdma/log_slice_affinity", false));
 }
 
+TEST(TransferEngineConfigOverrideTest,
+     LegacyRdmaFailureEnvLoadsIntoTentConfig) {
+    EnvVarGuard gid_guard("MC_AUTO_GID_MAX_RETRIES", "4");
+    EnvVarGuard pause_guard("MC_CONN_PAUSE_TTL_MS", "2500");
+    EnvVarGuard track_guard("MC_TRACK_RDMA_POSTED_SLICES", "true");
+    EnvVarGuard udp_sports_guard("MC_MLX5_QP_UDP_SPORTS", "40000, 40001");
+    EnvVarGuard lag_guard("MC_MLX5_QP_LAG_PORT_BALANCE", "true");
+
+    Config config;
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+
+    EXPECT_EQ(config.get("transports/rdma/device/auto_gid_max_retries", 0), 4);
+    EXPECT_EQ(config.get("transports/rdma/endpoint/conn_pause_ttl_ms", 0),
+              2500);
+    std::vector<uint16_t> expected_sports{40000, 40001};
+    EXPECT_EQ(config.getArray<uint16_t>(
+                  "transports/rdma/endpoint/mlx5_qp_udp_sports"),
+              expected_sports);
+    EXPECT_TRUE(
+        config.get("transports/rdma/endpoint/mlx5_qp_lag_port_balance", false));
+    EXPECT_TRUE(
+        config.get("transports/rdma/workers/track_posted_slices", false));
+}
+
+TEST(TransferEngineConfigOverrideTest,
+     LegacyEndpointStoreTypeEnvLoadsIntoTentConfig) {
+    EnvVarGuard guard("MC_ENDPOINT_STORE_TYPE", "FIFO");
+
+    Config config;
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+
+    EXPECT_EQ(config.get("transports/rdma/endpoint/endpoint_store_type",
+                         std::string("")),
+              "FIFO");
+}
+
+TEST(TransferEngineConfigOverrideTest,
+     LegacyFragmentRatioEnvLoadsFragmentLimit) {
+    EnvVarGuard slice_guard("MC_SLICE_SIZE", "1024");
+    EnvVarGuard fragment_guard("MC_FRAGMENT_RATIO", "4");
+
+    Config config;
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+
+    EXPECT_EQ(config.get("transports/rdma/workers/block_size", 0), 1024);
+    EXPECT_EQ(config.get("transports/rdma/workers/fragment_limit", 0), 256);
+}
+
+TEST(TransferEngineConfigOverrideTest, LegacyMlx5UdpSportsDropsInvalidPorts) {
+    EnvVarGuard guard("MC_MLX5_QP_UDP_SPORTS",
+                      "40000, invalid, 0, 65536, 40001");
+
+    Config config;
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+
+    std::vector<uint16_t> expected_sports{40000, 40001};
+    EXPECT_EQ(config.getArray<uint16_t>(
+                  "transports/rdma/endpoint/mlx5_qp_udp_sports"),
+              expected_sports);
+}
+
 TEST(TransferEngineConfigOverrideTest, FilterNicEnvLoadsRdmaWhitelist) {
     EnvVarGuard guard("MC_TE_FILTERS", "mlx5_0,mlx5_1");
 

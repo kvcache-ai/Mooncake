@@ -54,6 +54,56 @@ Status restoreCudaDeviceForLocation(const LocationParser& location,
     return Status::OK();
 }
 
+void markPendingTasksFailed(const std::vector<NVLinkTask*>& tasks) {
+    for (auto* task : tasks) {
+        if (task->status_word == TransferStatusEnum::PENDING)
+            task->status_word = TransferStatusEnum::FAILED;
+    }
+}
+
+void markTasksFailedFrom(const std::vector<NVLinkTask*>& tasks,
+                         size_t fail_idx) {
+    for (size_t i = fail_idx; i < tasks.size(); ++i) {
+        if (tasks[i]->status_word == TransferStatusEnum::PENDING)
+            tasks[i]->status_word = TransferStatusEnum::FAILED;
+    }
+}
+
+bool hasPendingTasks(const std::vector<NVLinkTask*>& tasks) {
+    return std::any_of(tasks.begin(), tasks.end(), [](auto* task) {
+        return task->status_word == TransferStatusEnum::PENDING;
+    });
+}
+
+bool synchronizeCallerStream(const char* transport_name) {
+    cudaEvent_t sync_event = nullptr;
+    auto err = cudaEventCreateWithFlags(&sync_event, cudaEventDisableTiming);
+    if (err != cudaSuccess) {
+        LOG(ERROR) << transport_name << ": cudaEventCreateWithFlags failed: "
+                   << cudaGetErrorString(err);
+        return false;
+    }
+
+    err = cudaEventRecord(sync_event, cudaStreamPerThread);
+    if (err != cudaSuccess) {
+        LOG(ERROR) << transport_name
+                   << ": cudaEventRecord failed: " << cudaGetErrorString(err);
+        cudaEventDestroy(sync_event);
+        return false;
+    }
+
+    err = cudaEventSynchronize(sync_event);
+    if (err != cudaSuccess) {
+        LOG(ERROR) << transport_name << ": cudaEventSynchronize failed: "
+                   << cudaGetErrorString(err);
+        cudaEventDestroy(sync_event);
+        return false;
+    }
+
+    cudaEventDestroy(sync_event);
+    return true;
+}
+
 }  // namespace
 
 NVLinkTransport::NVLinkTransport() : installed_(false) {}
@@ -222,6 +272,11 @@ void NVLinkTransport::startTransfer(std::vector<NVLinkTask*>& tasks,
         sizes.push_back(task->request.length);
     }
 
+    if (!synchronizeCallerStream("NVLinkTransport")) {
+        markPendingTasksFailed(tasks);
+        return;
+    }
+
     cudaError_t err;
 
 #if CUDART_VERSION >= 13000
@@ -232,6 +287,13 @@ void NVLinkTransport::startTransfer(std::vector<NVLinkTask*>& tasks,
                                const_cast<const void**>(srcs.data()),
                                sizes.data(), srcs.size(), &attr, &attrs_idx, 1,
                                batch->async_stream.get());
+    if (err != cudaSuccess) {
+        LOG(ERROR) << "NVLinkTransport::startTransfer internal error: "
+                   << "cudaMemcpyBatchAsync failed: "
+                   << cudaGetErrorString(err);
+        markPendingTasksFailed(tasks);
+        return;
+    }
 #elif CUDART_VERSION >= 12080
     cudaMemcpyAttributes attr{};
     attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
@@ -247,7 +309,13 @@ void NVLinkTransport::startTransfer(std::vector<NVLinkTask*>& tasks,
                    << " (src=" << srcs[fail_idx] << ", dst=" << dsts[fail_idx]
                    << ", size=" << sizes[fail_idx]
                    << "): " << cudaGetErrorString(err);
-        tasks[fail_idx]->status_word = TransferStatusEnum::FAILED;
+        markTasksFailedFrom(tasks, fail_idx);
+    } else if (err != cudaSuccess && err != cudaErrorCallRequiresNewerDriver) {
+        LOG(ERROR) << "NVLinkTransport::startTransfer internal error: "
+                   << "cudaMemcpyBatchAsync failed without a valid fail index: "
+                   << cudaGetErrorString(err);
+        markPendingTasksFailed(tasks);
+        return;
     }
 #else
     err = cudaErrorCallRequiresNewerDriver;
@@ -261,18 +329,18 @@ void NVLinkTransport::startTransfer(std::vector<NVLinkTask*>& tasks,
                 cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], cudaMemcpyDefault,
                                 batch->async_stream.get());
             if (single_err != cudaSuccess) {
+                LOG(ERROR) << "NVLinkTransport::startTransfer internal error: "
+                           << "cudaMemcpyAsync failed at task index " << i
+                           << " (src=" << srcs[i] << ", dst=" << dsts[i]
+                           << ", size=" << sizes[i]
+                           << "): " << cudaGetErrorString(single_err);
                 tasks[i]->status_word = TransferStatusEnum::FAILED;
                 err = single_err;
             }
         }
     }
 
-    if (err != cudaSuccess) {
-        for (auto* task : tasks) {
-            if (task->status_word == TransferStatusEnum::PENDING)
-                task->status_word = TransferStatusEnum::FAILED;
-        }
-    }
+    if (!hasPendingTasks(tasks)) return;
 
     // Save and set device to match the stream's device to ensure event
     // creation and recording happen on the correct device (fix for #2722).
@@ -282,8 +350,7 @@ void NVLinkTransport::startTransfer(std::vector<NVLinkTask*>& tasks,
         if (err != cudaSuccess) {
             LOG(ERROR) << "NVLinkTransport: cudaGetDevice failed: "
                        << cudaGetErrorString(err);
-            for (auto* task : tasks)
-                task->status_word = TransferStatusEnum::FAILED;
+            markPendingTasksFailed(tasks);
             return;
         }
         if (saved_device != batch->stream_device_id) {
@@ -291,8 +358,7 @@ void NVLinkTransport::startTransfer(std::vector<NVLinkTask*>& tasks,
             if (err != cudaSuccess) {
                 LOG(ERROR) << "NVLinkTransport: cudaSetDevice failed: "
                            << cudaGetErrorString(err);
-                for (auto* task : tasks)
-                    task->status_word = TransferStatusEnum::FAILED;
+                markPendingTasksFailed(tasks);
                 return;
             }
         }
@@ -307,7 +373,7 @@ void NVLinkTransport::startTransfer(std::vector<NVLinkTask*>& tasks,
         if (saved_device >= 0 && saved_device != batch->stream_device_id) {
             cudaSetDevice(saved_device);
         }
-        for (auto* task : tasks) task->status_word = TransferStatusEnum::FAILED;
+        markPendingTasksFailed(tasks);
         return;
     }
     auto record_err = cudaEventRecord(event, batch->async_stream.get());
@@ -319,7 +385,7 @@ void NVLinkTransport::startTransfer(std::vector<NVLinkTask*>& tasks,
         if (saved_device >= 0 && saved_device != batch->stream_device_id) {
             cudaSetDevice(saved_device);
         }
-        for (auto* task : tasks) task->status_word = TransferStatusEnum::FAILED;
+        markPendingTasksFailed(tasks);
         return;
     }
 
@@ -329,7 +395,10 @@ void NVLinkTransport::startTransfer(std::vector<NVLinkTask*>& tasks,
     }
 
     batch->completion_events.push_back(event);
-    for (auto* task : tasks) task->completion_event = event;
+    for (auto* task : tasks) {
+        if (task->status_word == TransferStatusEnum::PENDING)
+            task->completion_event = event;
+    }
 }
 
 Status NVLinkTransport::getTransferStatus(SubBatchRef batch, int task_id,

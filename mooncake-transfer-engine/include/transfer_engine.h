@@ -15,7 +15,11 @@
 #ifndef MULTI_TRANSFER_ENGINE_H_
 #define MULTI_TRANSFER_ENGINE_H_
 
+#include <cstdint>
 #include <memory>
+#include <mutex>
+#include <utility>
+#include <vector>
 
 #include "memory_location.h"
 #include "multi_transport.h"
@@ -100,6 +104,9 @@ class TransferEngine {
     bool isUsingTent() const { return use_tent_; }
 
     SegmentHandle openSegment(const std::string& segment_name);
+
+    Status getSegmentBufferBase(SegmentHandle handle, size_t buffer_index,
+                                uint64_t& base);
 
     Status CheckSegmentStatus(SegmentID sid);
 
@@ -211,6 +218,9 @@ class TransferEngine {
     std::shared_ptr<TransferEngineImpl> impl_;
     std::shared_ptr<mooncake::tent::TransferEngine> impl_tent_;
     std::shared_ptr<ShutdownToken> shutdown_token_;
+    mutable std::mutex tent_compat_mutex_;
+    std::vector<std::string> tent_whitelist_filters_;
+    std::vector<std::pair<uintptr_t, uint64_t>> tent_registered_ranges_;
     bool use_tent_{false};
 };
 }  // namespace mooncake

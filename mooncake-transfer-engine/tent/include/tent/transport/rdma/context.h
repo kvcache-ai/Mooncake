@@ -29,8 +29,10 @@
 #include <unordered_map>
 
 #include "cq.h"
-#include "params.h"
+#include "connect_pause_tracker.h"
 #include "ibv_loader.h"
+#include "params.h"
+#include "rdma_gid_probe.h"
 #include "rdma_transport.h"
 #include "tent/common/status.h"
 
@@ -41,6 +43,17 @@ class RdmaCQ;
 class RdmaEndPoint;
 class EndpointStore;
 class RdmaTransport;
+
+struct GidSelectionSnapshot {
+    std::string gid;
+    int gid_index = -1;
+};
+
+enum class GidRefreshResult {
+    UNCHANGED = 0,
+    CHANGED = 1,
+    FAILED = 2,
+};
 
 class RdmaContext {
     friend class RdmaCQ;
@@ -72,6 +85,15 @@ class RdmaContext {
 
     DeviceStatus status() const { return status_; }
 
+    bool contextHealthy() const {
+        return context_failure_count_.load(std::memory_order_acquire) <
+               kContextFailureThreshold;
+    }
+
+    void markContextSuccess();
+
+    void markContextFailure();
+
    public:
     using MemReg = void *;
 
@@ -93,12 +115,30 @@ class RdmaContext {
 
     const std::string name() const { return device_name_; }
 
+    void pauseConnect(const std::string &peer_nic_path);
+
+    bool isConnectPaused(const std::string &peer_nic_path);
+
+    void pruneConnectPause();
+
    public:
     uint16_t lid() const { return lid_; }
 
     std::string gid() const;
 
-    int gidIndex() const { return gid_index_; }
+    GidSelectionSnapshot gidSelection() const;
+
+    int gidIndex() const;
+
+    bool autoGidSelectionEnabled() const { return auto_gid_selection_enabled_; }
+
+    bool reprobeAutoGid(
+        const GidSelectionSnapshot &expected_selection,
+        const std::vector<AutoGidSelectionIdentity> &tried_selections = {},
+        std::string *previous_gid = nullptr, std::string *next_gid = nullptr);
+
+    GidRefreshResult refreshCurrentGid(std::string *previous_gid = nullptr,
+                                       std::string *next_gid = nullptr);
 
     ibv_context *nativeContext() const { return native_context_; }
 
@@ -114,6 +154,8 @@ class RdmaContext {
 
     RdmaParams &params() const { return *params_.get(); }
 
+    uint8_t numLagPorts() const { return num_lag_ports_; }
+
     // PCIe Relaxed Ordering support
     bool isRelaxedOrderingEnabled() const { return relaxed_ordering_enabled_; }
 
@@ -122,6 +164,9 @@ class RdmaContext {
 
    private:
     int openDevice(const std::string &device_name, uint8_t port);
+
+    Status refreshPublishedLocalDeviceDesc(uint16_t lid,
+                                           const std::string &gid);
 
    private:
     // initialized during ctor, will never be changed during the context's
@@ -142,6 +187,10 @@ class RdmaContext {
     uint16_t lid_ = 0;
     int gid_index_ = -1;
     ibv_gid gid_;
+    mutable std::mutex gid_lock_;
+    mutable std::mutex gid_reprobe_lock_;
+    bool auto_gid_selection_enabled_ = false;
+    uint8_t num_lag_ports_ = 0;
 
     std::mutex mr_set_mutex_;
     std::unordered_set<ibv_mr *> mr_set_;
@@ -154,6 +203,12 @@ class RdmaContext {
 
     // PCIe Relaxed Ordering support
     bool relaxed_ordering_enabled_ = false;
+
+    ConnectPauseTracker connect_pause_;
+
+    std::atomic<int> context_failure_count_{0};
+
+    static constexpr int kContextFailureThreshold = 32;
 
     const IbvSymbols &verbs_;
 };

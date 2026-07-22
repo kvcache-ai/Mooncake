@@ -343,6 +343,7 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
     }
 
     auto context = transport_->context_set_[path.local_device_id].get();
+    if (!context->contextHealthy()) return nullptr;
     if (context->status() != RdmaContext::DEVICE_ENABLED) {
         // LOG(WARNING) << "Context " << context->name() << " is not serving";
         return nullptr;  // experimental: force to fail this slice and mark this
@@ -350,9 +351,13 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
     }
     std::shared_ptr<RdmaEndPoint> endpoint;
     auto peer_name = MakeNicPath(target_nic_path_name, target_dev_name);
+    if (context->isConnectPaused(peer_name)) {
+        return nullptr;
+    }
     endpoint = context->endpointStore()->getOrInsert(peer_name);
     if (!endpoint) {
         LOG(ERROR) << "Cannot allocate endpoint " << peer_name;
+        context->markContextFailure();
         return nullptr;
     }
     if (endpoint->status() != RdmaEndPoint::EP_READY) {
@@ -366,9 +371,11 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
                 LOG(ERROR) << "Unable to connect endpoint " << peer_name << ": "
                            << status.ToString();
             }
+            context->markContextFailure();
             return nullptr;
         }
     }
+    context->markContextSuccess();
     return endpoint;
 }
 
@@ -613,6 +620,19 @@ void Workers::asyncPollCq() {
     int num_slices = 0;
 
     uint64_t current_ts = getCurrentTimeInNano();
+    uint64_t previous_poll_ts =
+        worker.last_poll_ts_ns.exchange(current_ts, std::memory_order_acq_rel);
+    if (previous_poll_ts) {
+        uint64_t interval = current_ts - previous_poll_ts;
+        worker.last_poll_interval_ns.store(interval, std::memory_order_release);
+        uint64_t observed =
+            worker.max_poll_interval_ns.load(std::memory_order_relaxed);
+        while (interval > observed &&
+               !worker.max_poll_interval_ns.compare_exchange_weak(
+                   observed, interval, std::memory_order_acq_rel,
+                   std::memory_order_relaxed)) {
+        }
+    }
     std::vector<RdmaSlice*> slice_to_remove;
     for (auto& slice : worker.inflight_slice_set) {
         if (slice->word != PENDING) continue;
@@ -764,7 +784,9 @@ int Workers::handleContextEvents(std::shared_ptr<RdmaContext>& context) {
     if (event.event_type == IBV_EVENT_QP_FATAL ||
         event.event_type == IBV_EVENT_WQ_FATAL) {
         auto endpoint = (RdmaEndPoint*)event.element.qp->qp_context;
-        context->endpointStore()->remove(endpoint);
+        std::string removed_key;
+        context->endpointStore()->remove(endpoint, &removed_key);
+        if (!removed_key.empty()) context->pauseConnect(removed_key);
     } else if (event.event_type == IBV_EVENT_CQ_ERR) {
         context->pause();
         context->resume();
@@ -797,6 +819,42 @@ void Workers::monitorThread() {
         if (time_since_last_reclaim >= 1000) {  // 1 second = 1000 ms
             for (auto& context : transport_->context_set_) {
                 context->endpointStore()->reclaim();
+                context->pruneConnectPause();
+                if (context->status() == RdmaContext::DEVICE_ENABLED) {
+                    std::string previous_gid;
+                    std::string next_gid;
+                    auto refresh_result =
+                        context->refreshCurrentGid(&previous_gid, &next_gid);
+                    if (refresh_result == GidRefreshResult::CHANGED) {
+                        LOG(WARNING)
+                            << "GID changed for RDMA context "
+                            << context->name() << ": " << previous_gid << " -> "
+                            << next_gid << ", clearing endpoints";
+                        if (context->endpointStore()->clear()) {
+                            LOG(ERROR) << "Failed to clear endpoints after GID "
+                                          "refresh for RDMA context "
+                                       << context->name();
+                        }
+                    }
+                }
+            }
+            if (transport_->params_->workers.track_posted_slices) {
+                int64_t inflight = 0;
+                uint64_t max_poll_interval_ns = 0;
+                for (size_t i = 0; i < num_workers_; ++i) {
+                    auto& worker = worker_context_[i];
+                    inflight +=
+                        worker.inflight_slices.load(std::memory_order_relaxed);
+                    uint64_t observed = worker.max_poll_interval_ns.exchange(
+                        0, std::memory_order_acq_rel);
+                    max_poll_interval_ns =
+                        std::max(max_poll_interval_ns, observed);
+                }
+                if (inflight > 0) {
+                    LOG(WARNING) << "TENT RDMA outstanding slices=" << inflight
+                                 << ", max poll interval="
+                                 << (max_poll_interval_ns / 1000000.0) << " ms";
+                }
             }
             last_reclaim_time = current_time;
         }
