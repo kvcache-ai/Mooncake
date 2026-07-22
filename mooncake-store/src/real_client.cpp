@@ -2828,8 +2828,7 @@ RealClient::allocate_buffer_dummy(size_t size, const UUID &client_id) {
     for (const auto &shm : context.mapped_shms) {
         const uint64_t shm_start = reinterpret_cast<uint64_t>(shm.shm_buffer);
         const uint64_t shm_end = shm_start + shm.shm_size;
-        if (real_addr >= shm_start &&
-            allocated_size <= shm_end - real_addr) {
+        if (real_addr >= shm_start && allocated_size <= shm_end - real_addr) {
             const uint64_t dummy_addr = real_addr - shm.shm_addr_offset;
             context.active_handles[dummy_addr] = std::move(handle);
             return std::make_tuple(dummy_addr, allocated_size);
