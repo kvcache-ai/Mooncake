@@ -860,8 +860,8 @@ Status MusaTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             if (it == device_cache.end()) {
                 ScopedCudaDevice guard(stream_device);
                 if (!guard.ok()) {
-                    slice->markFailed();
                     forgetSliceDevice(slice);
+                    slice->markFailed();
                     continue;
                 }
                 cuda_err = cudaStreamQuery(stream);
@@ -870,11 +870,11 @@ Status MusaTransport::getTransferStatus(BatchID batch_id, size_t task_id,
                 cuda_err = it->second;
             }
             if (cuda_err == cudaSuccess) {
+                forgetSliceDevice(slice);
                 slice->markSuccess();
-                forgetSliceDevice(slice);
             } else if (cuda_err != cudaErrorNotReady) {
-                slice->markFailed();
                 forgetSliceDevice(slice);
+                slice->markFailed();
             }
         }
     }
@@ -897,26 +897,53 @@ Status MusaTransport::getTransferStatus(BatchID batch_id, size_t task_id,
 Status MusaTransport::submitTransferTask(
     const std::vector<TransferTask *> &task_list) {
     if (task_list.empty()) return Status::OK();
+    for (TransferTask *task : task_list) {
+        if (!task || !task->request)
+            return Status::InvalidArgument("invalid MUSA transfer task");
+    }
+
+    auto fail_tasks = [&task_list]() {
+        for (TransferTask *task : task_list) {
+            if (task->slice_list.empty()) {
+                const auto &request = *task->request;
+                Slice *slice = getSliceCache().allocate();
+                slice->task = task;
+                slice->source_addr = request.source;
+                slice->length = request.length;
+                slice->opcode = request.opcode;
+                slice->status = Slice::PENDING;
+                task->slice_list.push_back(slice);
+                task->slice_count = task->slice_count + 1;
+            }
+            for (Slice *slice : task->slice_list) {
+                if (slice->status == Slice::PENDING) slice->markFailed();
+            }
+        }
+    };
 
     std::vector<const void *> local_buffers;
     std::vector<uint64_t> dest_addrs;
     local_buffers.reserve(task_list.size());
     dest_addrs.reserve(task_list.size());
     for (TransferTask *task : task_list) {
-        if (!task || !task->request)
-            return Status::InvalidArgument("invalid MUSA transfer task");
         const auto &request = *task->request;
         local_buffers.push_back(request.source);
         uint64_t dest_addr = request.target_offset;
         if (request.target_id != LOCAL_SEGMENT_ID) {
             int rc = relocateSharedMemoryAddress(dest_addr, request.length,
                                                  request.target_id);
-            if (rc) return Status::Memory("device memory not registered");
+            if (rc) {
+                fail_tasks();
+                return Status::Memory("device memory not registered");
+            }
         }
         dest_addrs.push_back(dest_addr);
     }
     Status sync_status = synchronizeCallerBuffers(local_buffers);
-    if (!sync_status.ok()) return sync_status;
+    if (!sync_status.ok()) {
+        fail_tasks();
+        return sync_status;
+    }
 
     // Phase 1: Prepare slices and collect memcpy parameters
     std::vector<void *> dsts, srcs;
