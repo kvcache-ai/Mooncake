@@ -437,13 +437,16 @@ TEST_F(HighAvailabilityTest, WaitForViewChangeReturnsCurrentViewImmediately) {
 // tear it down cleanly on return, so repeated calls on a stable leader do not
 // accumulate watch state or violate the single-watcher-per-prefix limitation.
 // After a sequence of stable-leader timeouts, a real view change must still be
-// detected promptly by the watch -- proving the single per-call watch is
-// functional and the prefix registration is clean.
-//
-// The WATCH_BROKEN -> re-arm path (event_type == 2) is exercised on the
-// project's Linux CI via an etcd-client-reset integration scenario; this
-// public-API test guards the once-per-call arming/teardown flow that the fix
-// reshaped.
+// detected by the long-lived watch. The final leg releases leadership from a
+// concurrent thread while WaitForViewChange is blocked on the watch (not
+// before it, which the synchronous loop-top read would catch regardless of
+// whether the watch is armed), so the change is delivered as a watch DELETE
+// event. The detection latency is then asserted strictly below
+// kViewChangeFallbackPollInterval (200ms): a poll-only regression (watch never
+// armed) would be stranded in a 200ms poll sleep and could not reliably meet
+// the bound, while the event-driven watch delivers in tens of ms. See
+// WaitForViewChangeRearmsAndStillDetectsAfterWatchBroken for the WATCH_BROKEN
+// -> re-arm path.
 TEST_F(HighAvailabilityTest,
        WaitForViewChangeRepeatedStableCallsDoNotBreakChangeDetection) {
     if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
@@ -475,18 +478,112 @@ TEST_F(HighAvailabilityTest,
         EXPECT_TRUE(result->timed_out);
     }
 
-    // After the repeated calls, the prefix-watch registration must be clean: a
-    // real view change is still detected promptly by the watch, not the
-    // timeout.
-    ASSERT_EQ(ErrorCode::OK, coordinator->ReleaseLeadership(session));
-    const auto start = std::chrono::steady_clock::now();
+    // Release leadership from a concurrent thread while the final
+    // WaitForViewChange is blocked on the long-lived prefix watch, so the view
+    // change is delivered as a watch DELETE event -- not caught by the
+    // synchronous loop-top read that a pre-release would make trivial for any
+    // implementation (watch or poll).
+    std::chrono::steady_clock::time_point key_deleted;
+    std::thread releaser([&]() {
+        // Let WaitForViewChange arm the watch and block on the condition var.
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        coordinator->ReleaseLeadership(session);
+        // ReleaseLeadership returns after RevokeLease, which deletes the
+        // master_view key synchronously on the etcd server.
+        key_deleted = std::chrono::steady_clock::now();
+    });
     auto changed = coordinator->WaitForViewChange(
         session.view.view_version, std::chrono::seconds(3));
-    const auto elapsed = std::chrono::steady_clock::now() - start;
+    const auto detected = std::chrono::steady_clock::now();
+    releaser.join();
+
     ASSERT_TRUE(changed.has_value());
     EXPECT_TRUE(changed->changed);
     EXPECT_FALSE(changed->current_view.has_value());
-    EXPECT_LT(elapsed, std::chrono::seconds(2));
+    // Detection latency from key deletion (RevokeLease return) to
+    // WaitForViewChange return. The long-lived watch delivers the DELETE event
+    // in tens of ms; a poll-only regression (watch never armed) would sleep
+    // kViewChangeFallbackPollInterval (200ms) between reads and could not
+    // reliably meet < 150ms. The 150ms bound sits below the 200ms poll floor
+    // with slack for CI jitter on the watch-event delivery path.
+    EXPECT_LT(detected - key_deleted, std::chrono::milliseconds(150));
+}
+
+// Coordinator-level guard for the WATCH_BROKEN -> re-arm + re-read path in
+// WaitForViewChange (the `if (watch_broken)` block in the wait loop): while
+// WaitForViewChange is blocked on the long-lived prefix watch, reset the etcd
+// store client to force a WATCH_BROKEN (event_type == 2). The Go wrapper's
+// cancelAllStorePrefixWatches marks the watch broken before cancelling its
+// context, so the watch goroutine delivers exactly one WATCH_BROKEN callback
+// (the same mechanism as EtcdStoreClientResetTriggersPrefixWatchBrokenAnd
+// Reconnect, but driven through WaitForViewChange's own watch). The
+// coordinator must re-arm the watch and re-read so a subsequent view change
+// is still detected before the deadline -- proving the re-arm path does not
+// drop the watch, deadlock, or crash. (The reset also errors out the
+// keepalive goroutine; the lease remains valid for
+// DEFAULT_MASTER_VIEW_LEASE_TTL_SEC=5s, enough headroom for the explicit
+// ReleaseLeadership below.)
+TEST_F(HighAvailabilityTest, WaitForViewChangeRearmsAndStillDetectsAfterWatchBroken) {
+    if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+
+    auto coordinator = CreateEtcdCoordinatorOrNull(FLAGS_etcd_endpoints);
+    ASSERT_NE(coordinator, nullptr);
+
+    auto acquire = coordinator->TryAcquireLeadership("0.0.0.0:1111");
+    ASSERT_TRUE(acquire.has_value());
+    ASSERT_EQ(ha::AcquireLeadershipStatus::ACQUIRED, acquire->status);
+    ASSERT_TRUE(acquire->session.has_value());
+    const auto session = *acquire->session;
+
+    auto renew = coordinator->RenewLeadership(session);
+    ASSERT_TRUE(renew.has_value());
+    ASSERT_TRUE(renew.value());
+
+    // Run WaitForViewChange on a thread with a long timeout so it arms the
+    // long-lived prefix watch and blocks on it. A flag carries the outcome
+    // back across the thread boundary (read after join, which synchronizes).
+    bool view_changed = false;
+    std::thread waiter([&]() {
+        auto result = coordinator->WaitForViewChange(
+            session.view.view_version, std::chrono::seconds(15));
+        view_changed = result.has_value() && result->changed;
+    });
+
+    // Let WaitForViewChange arm the watch and block. The watch is armed
+    // before the loop-top read; give it time to establish server-side (matches
+    // the 500ms settle used by the wrapper-level prefix-watch tests).
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+    // Break the watch by resetting the etcd store client. The Go wrapper
+    // delivers WATCH_BROKEN (event_type == 2) to the registered callback,
+    // which flips watch_healthy=false and wakes WaitForViewChange to re-arm.
+    ASSERT_EQ(ErrorCode::OK,
+              EtcdHelper::ResetEtcdStoreClient(FLAGS_etcd_endpoints));
+
+    // Let the coordinator process WATCH_BROKEN, re-arm the watch, re-read
+    // (view unchanged), reset the flags, and block again on the freshly
+    // re-armed watch. The settle window covers WATCH_BROKEN delivery +
+    // WaitWatchWithPrefixStopped + the new watch's server confirmation.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+
+    // Now make a real view change: revoke the lease, deleting the master_view
+    // key. The re-armed watch must deliver the DELETE event so WaitForViewChange
+    // returns promptly with changed=true (not via the 15s deadline).
+    const auto change_start = std::chrono::steady_clock::now();
+    ASSERT_EQ(ErrorCode::OK, coordinator->ReleaseLeadership(session));
+    waiter.join();
+    const auto elapsed = std::chrono::steady_clock::now() - change_start;
+
+    EXPECT_TRUE(view_changed)
+        << "WaitForViewChange did not detect the view change after re-arm; "
+           "the WATCH_BROKEN -> re-arm path may have dropped the watch";
+    // Detected well before the 15s deadline. A broken re-arm that left the
+    // watch disarmed would still detect via the 200ms poll fallback within
+    // ~200ms; a path that dropped the watch AND skipped the poll would hit the
+    // 15s deadline. The bound proves neither hang nor crash occurred.
+    EXPECT_LT(elapsed, std::chrono::seconds(3));
 }
 
 TEST_F(HighAvailabilityTest, LeadershipMonitorReportsKeepAliveLoss) {
