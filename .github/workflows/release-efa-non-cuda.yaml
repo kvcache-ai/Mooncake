@@ -79,7 +79,7 @@ jobs:
       - name: Build project
         run: |
           cd build
-          make -j
+          make -j3
           sudo make install
         shell: bash
 
