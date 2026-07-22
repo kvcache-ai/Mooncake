@@ -71,6 +71,10 @@ class OpLogStore {
     // Sequence ID management
     virtual ErrorCode GetLatestSequenceId(uint64_t& sequence_id) = 0;
     virtual ErrorCode GetMaxSequenceId(uint64_t& sequence_id) = 0;
+    virtual ErrorCode GetTrimmedSequenceId(uint64_t& sequence_id) {
+        sequence_id = 0;
+        return ErrorCode::OK;
+    }
     virtual ErrorCode UpdateLatestSequenceId(uint64_t sequence_id) = 0;
 
     // Snapshot

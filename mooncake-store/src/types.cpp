@@ -47,6 +47,8 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::ETCD_KEY_NOT_EXIST, "ETCD_KEY_NOT_EXIST"},
         {ErrorCode::ETCD_TRANSACTION_FAIL, "ETCD_TRANSACTION_FAIL"},
         {ErrorCode::ETCD_CTX_CANCELLED, "ETCD_CTX_CANCELLED"},
+        {ErrorCode::OPLOG_ENTRY_NOT_FOUND, "OPLOG_ENTRY_NOT_FOUND"},
+        {ErrorCode::OPLOG_TRIMMED, "OPLOG_TRIMMED"},
         {ErrorCode::CLIENT_ALREADY_EXISTS, "CLIENT_ALREADY_EXISTS"},
         {ErrorCode::CLIENT_UNHEALTHY, "CLIENT_UNHEALTHY"},
         {ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS,

@@ -2,6 +2,8 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <string>
@@ -12,6 +14,7 @@
 
 #include "ha/oplog/oplog_store_factory.h"
 #include "ha/oplog/redis_oplog_store.h"
+#include "ha/oplog/p2p_standby_snapshot_service.h"
 #include "p2p_master_service.h"
 #include "redis_util.h"
 #include "../../redis_test_utils.h"
@@ -374,7 +377,11 @@ TEST_F(RedisOpLogStoreTest, CleanupRemovesOldEntries) {
     ASSERT_EQ(ErrorCode::OK, writer->ReadOpLog(4, entry));
 
     std::vector<OpLogEntry> entries;
-    ASSERT_EQ(ErrorCode::OK, writer->ReadOpLogSince(0, 10, entries));
+    EXPECT_EQ(ErrorCode::OPLOG_TRIMMED, writer->ReadOpLogSince(0, 10, entries));
+    uint64_t trimmed_sequence_id = 0;
+    ASSERT_EQ(ErrorCode::OK, writer->GetTrimmedSequenceId(trimmed_sequence_id));
+    EXPECT_EQ(3u, trimmed_sequence_id);
+    ASSERT_EQ(ErrorCode::OK, writer->ReadOpLogSince(3, 10, entries));
     ASSERT_EQ(2u, entries.size());
     EXPECT_EQ(4u, entries[0].sequence_id);
     EXPECT_EQ(5u, entries[1].sequence_id);
@@ -382,6 +389,85 @@ TEST_F(RedisOpLogStoreTest, CleanupRemovesOldEntries) {
     uint64_t max_sequence_id = 0;
     ASSERT_EQ(ErrorCode::OK, writer->GetMaxSequenceId(max_sequence_id));
     EXPECT_EQ(5u, max_sequence_id);
+}
+
+TEST_F(RedisOpLogStoreTest, MasterRegistryDiscoversAliveInstances) {
+    RedisMasterRegistry registry(cluster_id_, redis_endpoint_, redis_username_,
+                                 redis_password_, 0);
+    RedisMasterRegistryEntry standby{"instance-a",
+                                     "127.0.0.1:51051",
+                                     "127.0.0.1:53051",
+                                     "standby",
+                                     true,
+                                     42};
+    RedisMasterRegistryEntry primary{"instance-b",
+                                     "127.0.0.1:51052",
+                                     "127.0.0.1:53052",
+                                     "primary",
+                                     false,
+                                     43};
+    ASSERT_EQ(registry.Refresh(standby), ErrorCode::OK);
+    ASSERT_EQ(registry.Refresh(primary), ErrorCode::OK);
+
+    std::vector<RedisMasterRegistryEntry> masters;
+    ASSERT_EQ(registry.DiscoverAlive(std::chrono::seconds(10), masters),
+              ErrorCode::OK);
+    ASSERT_EQ(masters.size(), 2);
+    auto standby_it = std::find_if(
+        masters.begin(), masters.end(),
+        [](const auto& master) { return master.instance_id == "instance-a"; });
+    ASSERT_NE(standby_it, masters.end());
+    EXPECT_EQ(standby_it->master_endpoint, standby.master_endpoint);
+    EXPECT_EQ(standby_it->snapshot_endpoint, standby.snapshot_endpoint);
+    EXPECT_EQ(standby_it->role, "standby");
+    EXPECT_TRUE(standby_it->snapshot_ready);
+    EXPECT_EQ(standby_it->applied_sequence_id, 42);
+
+    EXPECT_EQ(registry.Remove(standby.instance_id), ErrorCode::OK);
+    EXPECT_EQ(registry.Remove(primary.instance_id), ErrorCode::OK);
+}
+
+TEST_F(RedisOpLogStoreTest, MasterRegistryHeartbeatUpdatesAndUnregisters) {
+    auto registry = std::make_unique<RedisMasterRegistry>(
+        cluster_id_, redis_endpoint_, redis_username_, redis_password_, 0);
+    RedisMasterRegistryHeartbeat heartbeat(
+        std::move(registry),
+        RedisMasterRegistryEntry{"heartbeat-instance", "127.0.0.1:51051",
+                                 "127.0.0.1:53051", "starting", false},
+        std::chrono::seconds(10));
+    ASSERT_EQ(heartbeat.Start(), ErrorCode::OK);
+    std::atomic<bool> snapshot_ready{false};
+    heartbeat.SetAppliedSequenceProvider([] { return 42; });
+    heartbeat.SetSnapshotReadyProvider(
+        [&snapshot_ready] { return snapshot_ready.load(); });
+    snapshot_ready.store(true);
+    heartbeat.UpdateRole("standby", false);
+
+    RedisMasterRegistry reader(cluster_id_, redis_endpoint_, redis_username_,
+                               redis_password_, 0);
+    std::vector<RedisMasterRegistryEntry> masters;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    do {
+        ASSERT_EQ(reader.DiscoverAlive(std::chrono::seconds(10), masters),
+                  ErrorCode::OK);
+        if (masters.size() == 1 && masters.front().role == "standby" &&
+            masters.front().snapshot_ready &&
+            masters.front().applied_sequence_id == 42) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    } while (std::chrono::steady_clock::now() < deadline);
+    ASSERT_EQ(masters.size(), 1);
+    EXPECT_EQ(masters.front().instance_id, "heartbeat-instance");
+    EXPECT_EQ(masters.front().role, "standby");
+    EXPECT_TRUE(masters.front().snapshot_ready);
+    EXPECT_EQ(masters.front().applied_sequence_id, 42);
+
+    heartbeat.Stop();
+    ASSERT_EQ(reader.DiscoverAlive(std::chrono::seconds(10), masters),
+              ErrorCode::OK);
+    EXPECT_TRUE(masters.empty());
 }
 
 TEST_F(RedisOpLogStoreTest, SnapshotSequenceRoundTrip) {

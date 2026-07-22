@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cerrno>
 #include <cstring>
+#include <fstream>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -20,6 +21,7 @@
 #include "client_wrapper.h"
 #include "e2e_utils.h"
 #include "ha/oplog/p2p_oplog_types.h"
+#include "ha/oplog/p2p_standby_snapshot_service.h"
 #include "ha/oplog/redis_oplog_store.h"
 #include "process_handler.h"
 #include "redis_master_view_helper.h"
@@ -48,6 +50,7 @@ DEFINE_int32(redis_heartbeat_interval_sec, 2,
 constexpr int kMasterPortBase = 51051;
 constexpr int kMasterNum = 3;
 constexpr int kClientPortBase = 52051;
+constexpr int kSnapshotPortBase = 53051;
 
 namespace mooncake {
 namespace testing {
@@ -109,6 +112,10 @@ void CleanupRedisKeys() {
     }
 
     std::vector<std::string> keys = {MasterViewKey(), MasterEpochKey()};
+    keys.push_back("mooncake:{" + FLAGS_redis_cluster_id +
+                   "}:masters:heartbeat");
+    keys.push_back("mooncake:{" + FLAGS_redis_cluster_id +
+                   "}:masters:metadata");
     std::string oplog_pattern =
         "mooncake:{" + FLAGS_redis_cluster_id + "}:oplog*";
     redisReply* keys_reply = static_cast<redisReply*>(redisCommand(
@@ -375,6 +382,7 @@ class RedisChaosTest : public ::testing::Test {
         config.oplog_store_type = "redis";
         config.oplog_data_dir = FLAGS_redis_endpoint;
         config.max_client_per_key = 0;
+        config.standby_snapshot_service_port_base = kSnapshotPortBase;
 
         for (int i = 0; i < kMasterNum; ++i) {
             masters_.emplace_back(std::make_unique<MasterProcessHandler>(
@@ -545,6 +553,44 @@ class RedisChaosTest : public ::testing::Test {
         return false;
     }
 
+    bool WaitForMasterLog(int index, const std::string& needle,
+                          std::chrono::seconds timeout) {
+        const std::string path =
+            FLAGS_out_dir + "/master_" + std::to_string(index) + ".err";
+        auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            std::ifstream input(path);
+            std::string content((std::istreambuf_iterator<char>(input)),
+                                std::istreambuf_iterator<char>());
+            if (content.find(needle) != std::string::npos) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        return false;
+    }
+
+    bool WaitForSnapshotBaseline(int source_index, uint64_t expected_sequence,
+                                 std::chrono::seconds timeout) {
+        const std::string endpoint =
+            "127.0.0.1:" + std::to_string(kSnapshotPortBase + source_index);
+        auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            P2PStandbyMetadataStore metadata;
+            P2PStandbySnapshotClient snapshot_client;
+            uint64_t baseline_sequence_id = 0;
+            if (snapshot_client.Bootstrap(endpoint, FLAGS_redis_cluster_id,
+                                          &metadata, baseline_sequence_id,
+                                          /*chunk_size=*/256) ==
+                    ErrorCode::OK &&
+                baseline_sequence_id >= expected_sequence) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        return false;
+    }
+
     std::vector<std::unique_ptr<MasterProcessHandler>> masters_;
     std::unique_ptr<RedisMasterViewHelper> master_view_helper_;
     inline static struct sigaction old_sigpipe_action_ = {};
@@ -565,6 +611,52 @@ TEST_F(RedisChaosTest, LeaderKilledFailover) {
         WaitForNewLeader(leader_index, version, new_leader_index, new_version));
     EXPECT_NE(new_leader_index, leader_index);
     EXPECT_GT(new_version, version);
+}
+
+TEST_F(RedisChaosTest, TrimmedStandbyAutoDiscoversPeerAndBootstraps) {
+    int leader_index = -1;
+    ViewVersionId version = 0;
+    ASSERT_TRUE(WaitForLeader(leader_index, version, std::chrono::seconds(10)));
+    WaitForLeaderServiceReady();
+
+    const int lagging_index = (leader_index + 1) % kMasterNum;
+    const int source_index = (leader_index + 2) % kMasterNum;
+    ASSERT_TRUE(WaitForMasterLog(source_index, "Redis Master registered",
+                                 std::chrono::seconds(10)));
+    ASSERT_TRUE(masters_[lagging_index]->kill());
+
+    auto client = CreateRedisClient(/*index=*/20, std::chrono::seconds(15));
+    ASSERT_NE(client, nullptr);
+    const std::string key = "trim_rebootstrap_key";
+    const std::string value = "trim_rebootstrap_value";
+    ASSERT_EQ(client->Put(key, value), ErrorCode::OK);
+    ASSERT_TRUE(WaitForReplicaOpLog(key, std::chrono::seconds(10)));
+
+    RedisOpLogStore store(FLAGS_redis_cluster_id, FLAGS_redis_endpoint,
+                          /*enable_write=*/false, /*poll_interval_ms=*/100,
+                          FLAGS_redis_password, FLAGS_redis_username);
+    ASSERT_EQ(store.Init(), ErrorCode::OK);
+    uint64_t latest_sequence_id = 0;
+    ASSERT_EQ(store.GetLatestSequenceId(latest_sequence_id), ErrorCode::OK);
+    ASSERT_GT(latest_sequence_id, 0);
+    ASSERT_TRUE(WaitForSnapshotBaseline(source_index, latest_sequence_id,
+                                        std::chrono::seconds(10)));
+    ASSERT_EQ(store.CleanupOpLogBefore(latest_sequence_id + 1), ErrorCode::OK);
+
+    ASSERT_TRUE(masters_[lagging_index]->start());
+    ASSERT_TRUE(WaitForMasterLog(lagging_index,
+                                 "Standby snapshot: bootstrap completed",
+                                 std::chrono::seconds(20)));
+
+    ASSERT_TRUE(masters_[source_index]->kill());
+    ASSERT_TRUE(masters_[leader_index]->kill());
+    int new_leader_index = -1;
+    ViewVersionId new_version = 0;
+    ASSERT_TRUE(
+        WaitForNewLeader(leader_index, version, new_leader_index, new_version));
+    ASSERT_EQ(new_leader_index, lagging_index);
+    ASSERT_TRUE(
+        WaitForClientGet(*client, key, value, std::chrono::seconds(20)));
 }
 
 TEST_F(RedisChaosTest, LeaderKeyDeletedTriggersReElection) {

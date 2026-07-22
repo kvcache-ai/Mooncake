@@ -180,6 +180,7 @@ enum class ErrorCode : int32_t {
     ETCD_TRANSACTION_FAIL = -1002,  ///< etcd transaction failed.
     ETCD_CTX_CANCELLED = -1003,     ///< etcd context cancelled.
     OPLOG_ENTRY_NOT_FOUND = -1004,  ///< OpLog entry not found.
+    OPLOG_TRIMMED = -1005,          ///< Requested OpLog range was trimmed.
     UNAVAILABLE_IN_CURRENT_STATUS =
         -1010,  ///< Request cannot be done in current status.
     UNAVAILABLE_IN_CURRENT_MODE =

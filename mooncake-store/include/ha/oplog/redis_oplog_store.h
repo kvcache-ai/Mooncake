@@ -51,6 +51,7 @@ class RedisOpLogStore : public OpLogStore {
                                          OpLogReadProgress& progress) override;
     ErrorCode GetLatestSequenceId(uint64_t& sequence_id) override;
     ErrorCode GetMaxSequenceId(uint64_t& sequence_id) override;
+    ErrorCode GetTrimmedSequenceId(uint64_t& sequence_id) override;
     ErrorCode UpdateLatestSequenceId(uint64_t sequence_id) override;
     ErrorCode RecordSnapshotSequenceId(const std::string& snapshot_id,
                                        uint64_t sequence_id) override;

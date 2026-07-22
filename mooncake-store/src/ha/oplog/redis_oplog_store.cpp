@@ -586,11 +586,14 @@ ErrorCode RedisOpLogStore::ReadOpLogSinceWithProgress(
         return ErrorCode::INTERNAL_ERROR;
     }
 
-    // TODO(P2P HA): Do not silently advance a lagging standby past the trim
-    // horizon. Detect start_sequence_id < trimmed_sequence_id and handle it
-    // together with standby snapshot/bootstrap recovery.
-    const uint64_t effective_start =
-        std::max(start_sequence_id, trimmed_sequence_id);
+    if (start_sequence_id < trimmed_sequence_id) {
+        LOG(WARNING) << "RedisOpLogStore::ReadOpLogSince: requested range was "
+                        "trimmed"
+                     << ", start_sequence_id=" << start_sequence_id
+                     << ", trimmed_sequence_id=" << trimmed_sequence_id;
+        return ErrorCode::OPLOG_TRIMMED;
+    }
+    const uint64_t effective_start = start_sequence_id;
     progress.last_scanned_sequence_id = effective_start;
     if (effective_start >= latest_sequence_id) {
         return ErrorCode::OK;
@@ -711,6 +714,30 @@ ErrorCode RedisOpLogStore::GetMaxSequenceId(uint64_t& sequence_id) {
     }
     if (sequence_id == 0) {
         return ErrorCode::OPLOG_ENTRY_NOT_FOUND;
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode RedisOpLogStore::GetTrimmedSequenceId(uint64_t& sequence_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto err = EnsureConnectedUnlocked();
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+    RedisReplyPtr reply((redisReply*)redisCommand(
+        ctx_, "GET %b", trimmed_key_.data(), trimmed_key_.size()));
+    if (!reply || reply->type == REDIS_REPLY_ERROR) {
+        LOG(ERROR) << "RedisOpLogStore::GetTrimmedSequenceId: GET failed";
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    if (reply->type == REDIS_REPLY_NIL) {
+        sequence_id = 0;
+        return ErrorCode::OK;
+    }
+    if (reply->type != REDIS_REPLY_STRING ||
+        !ParseUint64(std::string(reply->str, reply->len), sequence_id)) {
+        LOG(ERROR) << "RedisOpLogStore::GetTrimmedSequenceId: invalid value";
+        return ErrorCode::INTERNAL_ERROR;
     }
     return ErrorCode::OK;
 }
