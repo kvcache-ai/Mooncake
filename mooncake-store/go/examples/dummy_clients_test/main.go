@@ -19,14 +19,15 @@ package main
 #cgo LDFLAGS: -L${SRCDIR}/../../../build/mooncake-store/src -Wl,-rpath,${SRCDIR}/../../../build/mooncake-store/src -lmooncake_store -lstdc++ -lnuma -lglog -lgflags -ljsoncpp -lcurl -luring
 #cgo CFLAGS: -I${SRCDIR}/../../../include
 
+#define _GNU_SOURCE
 #include <sched.h>
 #include <stdlib.h>
 
-static int set_cpu_affinity(int pid, const unsigned long *mask, size_t size) {
-    return sched_setaffinity(pid, size, (cpu_set_t*)mask);
+static int set_cpu_affinity(int pid, const void *mask, size_t size) {
+    return sched_setaffinity(pid, size, (const cpu_set_t*)mask);
 }
 
-static int get_cpu_affinity(int pid, unsigned long *mask, size_t size) {
+static int get_cpu_affinity(int pid, void *mask, size_t size) {
     return sched_getaffinity(pid, size, (cpu_set_t*)mask);
 }
 */
@@ -45,8 +46,6 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
-
-	"github.com/edsrzf/mmap-go"
 
 	store "github.com/kvcache-ai/Mooncake/mooncake-store/go/mooncakestore"
 )
@@ -117,6 +116,14 @@ func validateConfig() error {
 	if *flagBatchSize == 0 {
 		return fmt.Errorf("batch-size must be > 0, got %d", *flagBatchSize)
 	}
+	if *flagBatchSize > ^uint64(0) / *flagValueSize {
+		return fmt.Errorf("batch-size * value-size overflows uint64")
+	}
+	bufferSize := *flagBatchSize * *flagValueSize
+	maxInt := uint64(^uint(0) >> 1)
+	if bufferSize > maxInt {
+		return fmt.Errorf("required buffer size %d exceeds platform int range", bufferSize)
+	}
 	if *flagGlobalSize == 0 {
 		return fmt.Errorf("global-size must be > 0, got %d", *flagGlobalSize)
 	}
@@ -133,6 +140,13 @@ func validateConfig() error {
 		return fmt.Errorf("invalid worker-id: %d (must be in [0, %d))", *flagWorkerID, *flagWorkers)
 	}
 	return nil
+}
+
+func requiredBufferSize() uint64 {
+	if *flagPhase == "read" {
+		return *flagBatchSize * *flagValueSize
+	}
+	return *flagValueSize
 }
 
 // calculateKeyRange 计算每个 worker 负责的键范围
@@ -338,6 +352,10 @@ func allocateAndRegisterBuffer(s *store.Store, workerID int) (buf []byte, ptr ui
 	if err == nil && count > 0 {
 		bufInfo, err := s.RegisteredBufferAt(0)
 		if err == nil && bufInfo.Size > 0 {
+			requiredSize := requiredBufferSize()
+			if bufInfo.Size < requiredSize {
+				log.Fatalf("[WORKER-%d] Pre-registered buffer too small: got %d bytes, need %d", workerID, bufInfo.Size, requiredSize)
+			}
 			ptr = bufInfo.Ptr
 			// 通过 unsafe 构造 []byte 切片，便于后续使用
 			buf = unsafe.Slice((*byte)(unsafe.Pointer(ptr)), bufInfo.Size)
@@ -384,38 +402,6 @@ func allocateAndRegisterBuffer(s *store.Store, workerID int) (buf []byte, ptr ui
 		}
 	}
 	return
-}
-
-func allocateAndRegisterBufferViaMmap(s *store.Store, workerID int) (mmap.MMap, uintptr) {
-	bufSize := *flagBatchSize * *flagValueSize * 16
-	log.Printf("[WORKER-%d] Buffer size required: %d MB", workerID, bufSize/(1024*1024))
-
-	pageSize := int64(syscall.Getpagesize())
-	alignedSize := (int64(bufSize) + pageSize - 1) / pageSize * pageSize
-	log.Printf("[WORKER-%d] Aligned buffer size: %d bytes (page size: %d)", workerID, alignedSize, pageSize)
-
-	filePath := fmt.Sprintf("/dev/shm/mooncake_dummy_client%d.dat", workerID) // 每个worker独立文件
-	f, err := os.OpenFile(filePath, os.O_RDWR|os.O_CREATE, 0644)
-	if err != nil {
-		log.Fatalf("[WORKER-%d] Open file failed: %v", workerID, err)
-	}
-	defer f.Close()
-
-	if err := f.Truncate(alignedSize); err != nil {
-		log.Fatalf("[WORKER-%d] Truncate file failed: %v", workerID, err)
-	}
-
-	mm, err := mmap.MapRegion(f, int(alignedSize), mmap.RDWR, 0, 0)
-	if err != nil {
-		log.Fatalf("[WORKER-%d] mmap.MapRegion failed: %v", workerID, err)
-	}
-
-	ptr := uintptr(unsafe.Pointer(&mm[0]))
-	if err := s.RegisterBuffer(ptr, uint64(bufSize)); err != nil {
-		mm.Unmap()
-		log.Fatalf("[WORKER-%d] RegisterBuffer failed: %v", workerID, err)
-	}
-	return mm, ptr
 }
 
 // executePhase 根据阶段执行操作
@@ -578,10 +564,13 @@ func MakeKey(idx uint64) string {
 
 // FillBuffer 使用特定模式填充 buffer（模拟 C++ 的 FillBuffer）
 func FillBuffer(buf []byte, seed uint64) {
+	if len(buf) == 0 {
+		return
+	}
 	pattern := seed * 0x9E3779B97F4A7C15
 	numWords := len(buf) / 8
 
-	ptr := (*[1 << 30]uint64)(unsafe.Pointer(&buf[0]))
+	ptr := unsafe.Slice((*uint64)(unsafe.Pointer(&buf[0])), numWords)
 	for i := 0; i < numWords; i++ {
 		ptr[i] = pattern + uint64(i)
 	}
@@ -605,7 +594,7 @@ func CheckBuffer(buf []byte, seed uint64) bool {
 	pattern := seed * 0x9E3779B97F4A7C15
 	numWords := len(buf) / 8
 
-	ptr := (*[1 << 30]uint64)(unsafe.Pointer(&buf[0]))
+	ptr := unsafe.Slice((*uint64)(unsafe.Pointer(&buf[0])), numWords)
 	for i := 0; i < numWords; i++ {
 		if ptr[i] != pattern+uint64(i) {
 			log.Printf("CheckBuffer: Mismatch at word %d: expected %d, got %d",
@@ -699,18 +688,18 @@ func setToString(set map[int]bool) string {
 
 // getCurrentAffinityList 获取当前进程的 CPU 亲和性列表
 func getCurrentAffinityList() (string, int, error) {
-	mask := make([]C.ulong, cpuSetSizeBytes/8)
+	mask := make([]byte, cpuSetSizeBytes)
 
-	result := C.get_cpu_affinity(0, &mask[0], C.size_t(cpuSetSizeBytes))
+	result := C.get_cpu_affinity(0, unsafe.Pointer(&mask[0]), C.size_t(cpuSetSizeBytes))
 	if result != 0 {
 		return "", 0, fmt.Errorf("sched_getaffinity failed: result=%d", result)
 	}
 
 	set := make(map[int]bool)
 	for i := 0; i < cpuSetSizeBytes*8; i++ {
-		wordIdx := i / (8 * 8)
-		bitIdx := i % (8 * 8)
-		if mask[wordIdx]&(1<<C.ulong(bitIdx)) != 0 {
+		byteIdx := i / 8
+		bitIdx := uint(i % 8)
+		if mask[byteIdx]&(1<<bitIdx) != 0 {
 			set[i] = true
 		}
 	}
@@ -743,18 +732,18 @@ func bindProcessAffinity(cpuList string) cpuBindResult {
 	_, beforeCount, _ := getCurrentAffinityList()
 	result.BeforeCount = beforeCount
 
-	mask := make([]C.ulong, cpuSetSizeBytes/8)
+	mask := make([]byte, cpuSetSizeBytes)
 	for cpu := range targetSet {
 		if cpu >= cpuSetSizeBytes*8 {
 			log.Printf("[CPU-BIND] Warning: CPU %d exceeds mask size %d, ignored", cpu, cpuSetSizeBytes*8)
 			continue
 		}
-		wordIdx := cpu / (8 * 8)
-		bitIdx := cpu % (8 * 8)
-		mask[wordIdx] |= 1 << C.ulong(bitIdx)
+		byteIdx := cpu / 8
+		bitIdx := uint(cpu % 8)
+		mask[byteIdx] |= 1 << bitIdx
 	}
 
-	cResult := C.set_cpu_affinity(0, &mask[0], C.size_t(cpuSetSizeBytes))
+	cResult := C.set_cpu_affinity(0, unsafe.Pointer(&mask[0]), C.size_t(cpuSetSizeBytes))
 	if cResult != 0 {
 		result.ErrorMessage = fmt.Sprintf("sched_setaffinity failed: result=%d", cResult)
 		return result

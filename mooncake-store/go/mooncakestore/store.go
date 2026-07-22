@@ -26,9 +26,11 @@ import (
 	"unsafe"
 )
 
+type ClientType int
+
 const (
-	MOONCAKE_CLIENT_REAL  = C.MOONCAKE_CLIENT_REAL
-	MOONCAKE_CLIENT_DUMMY = C.MOONCAKE_CLIENT_DUMMY
+	MOONCAKE_CLIENT_REAL  ClientType = C.MOONCAKE_CLIENT_REAL
+	MOONCAKE_CLIENT_DUMMY ClientType = C.MOONCAKE_CLIENT_DUMMY
 )
 
 // Store wraps a Mooncake Store client handle.
@@ -39,13 +41,13 @@ type Store struct {
 // New creates a new Store instance. Call Setup before performing operations,
 // and Close when done.
 func New() (*Store, error) {
-	return NewWithType(C.MOONCAKE_CLIENT_REAL)
+	return NewWithType(MOONCAKE_CLIENT_REAL)
 }
 
 // NewWithType creates a new Store instance with the specified client type.
 // Use MOONCAKE_CLIENT_REAL or MOONCAKE_CLIENT_DUMMY.
-func NewWithType(clientType C.mooncake_client_type_t) (*Store, error) {
-	h := C.mooncake_store_create(clientType)
+func NewWithType(clientType ClientType) (*Store, error) {
+	h := C.mooncake_store_create(C.mooncake_client_type_t(clientType))
 	if h == nil {
 		return nil, ErrStoreNil
 	}
@@ -612,16 +614,22 @@ func (s *Store) UnregisterAllBuffers() (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	unregistered := 0
+
+	ptrs := make([]uintptr, 0, count)
 	for i := 0; i < count; i++ {
 		bufInfo, err := s.RegisteredBufferAt(i)
-		if err != nil {
-			continue
+		if err == nil {
+			ptrs = append(ptrs, bufInfo.Ptr)
 		}
-		if err := s.UnregisterBuffer(bufInfo.Ptr); err == nil {
+	}
+
+	unregistered := 0
+	for _, ptr := range ptrs {
+		if err := s.UnregisterBuffer(ptr); err == nil {
 			unregistered++
 		}
 	}
+
 	return unregistered, nil
 }
 
