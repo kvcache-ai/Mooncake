@@ -918,6 +918,9 @@ Status MusaTransport::submitTransferTask(
             for (Slice *slice : task->slice_list) {
                 if (slice->status == Slice::PENDING) slice->markFailed();
             }
+#ifndef USE_EVENT_DRIVEN_COMPLETION
+            task->is_finished = true;
+#endif
         }
     };
 
