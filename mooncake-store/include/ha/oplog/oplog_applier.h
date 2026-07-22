@@ -97,6 +97,8 @@ class OpLogApplier {
     virtual bool ApplyCustomOpLogEntry(const OpLogEntry& entry);
 
    private:
+    bool ApplyOpLogEntryInternal(const OpLogEntry& entry);
+
     /**
      * @brief Check if the entry's sequence order is valid
      * @param entry OpLog entry

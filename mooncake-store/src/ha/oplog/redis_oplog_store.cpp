@@ -169,7 +169,6 @@ ErrorCode RedisOpLogStore::EnqueueWrite(const OpLogEntry& entry, bool sync) {
     }
 
     std::shared_ptr<PendingWrite> pending;
-    const bool wait_for_completion = sync;
     {
         std::lock_guard<std::mutex> lock(async_mutex_);
         if (!async_running_.load()) {
@@ -206,7 +205,7 @@ ErrorCode RedisOpLogStore::EnqueueWrite(const OpLogEntry& entry, bool sync) {
     }
     async_cv_.notify_one();
 
-    if (!wait_for_completion) {
+    if (!sync) {
         return ErrorCode::OK;
     }
 
@@ -374,6 +373,10 @@ ErrorCode RedisOpLogStore::PersistEntryNoLatest(redisContext* ctx,
                                                 const OpLogEntry& entry) {
     const std::string entry_key = EntryKey(entry.sequence_id);
     const std::string serialized = SerializeOpLogEntry(entry);
+    // A previous Primary may leave an uncommitted entry beyond latest; the
+    // current Primary must be able to overwrite it and continue the sequence.
+    // TODO(P2P HA): Atomically reject conflicting overwrites at or below the
+    // committed latest while still allowing overwrites beyond latest.
     RedisReplyPtr reply((redisReply*)redisCommand(
         ctx, "SET %b %b", entry_key.data(), entry_key.size(), serialized.data(),
         serialized.size()));

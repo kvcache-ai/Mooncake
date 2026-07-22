@@ -119,25 +119,12 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
         return false;
     }
 
-    // Apply the operation based on type
-    switch (entry.op_type) {
-        case OpType::PUT_END:
-            ApplyPutEnd(entry);
-            break;
-        case OpType::PUT_REVOKE:
-            ApplyPutRevoke(entry);
-            break;
-        case OpType::REMOVE:
-            ApplyRemove(entry);
-            break;
-        default:
-            if (!ApplyCustomOpLogEntry(entry)) {
-                LOG(ERROR) << "OpLogApplier: unsupported or failed op_type="
-                           << static_cast<int>(entry.op_type)
-                           << ", sequence_id=" << entry.sequence_id
-                           << ", key=" << entry.object_key;
-                return false;
-            }
+    if (!ApplyOpLogEntryInternal(entry)) {
+        LOG(ERROR) << "OpLogApplier: unsupported or failed op_type="
+                   << static_cast<int>(entry.op_type)
+                   << ", sequence_id=" << entry.sequence_id
+                   << ", key=" << entry.object_key;
+        return false;
     }
 
     // Update expected sequence ID
@@ -155,6 +142,22 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
 }
 
 bool OpLogApplier::ApplyCustomOpLogEntry(const OpLogEntry&) { return false; }
+
+bool OpLogApplier::ApplyOpLogEntryInternal(const OpLogEntry& entry) {
+    switch (entry.op_type) {
+        case OpType::PUT_END:
+            ApplyPutEnd(entry);
+            return true;
+        case OpType::PUT_REVOKE:
+            ApplyPutRevoke(entry);
+            return true;
+        case OpType::REMOVE:
+            ApplyRemove(entry);
+            return true;
+        default:
+            return ApplyCustomOpLogEntry(entry);
+    }
+}
 
 size_t OpLogApplier::ApplyOpLogEntries(const std::vector<OpLogEntry>& entries) {
     size_t applied_count = 0;
@@ -273,23 +276,7 @@ size_t OpLogApplier::ProcessPendingEntries() {
         }
 
         // Apply outside lock.
-        bool applied = true;
-        switch (entry_copy.op_type) {
-            case OpType::PUT_END:
-                ApplyPutEnd(entry_copy);
-                break;
-            case OpType::PUT_REVOKE:
-                ApplyPutRevoke(entry_copy);
-                break;
-            case OpType::REMOVE:
-                ApplyRemove(entry_copy);
-                break;
-            default:
-                applied = ApplyCustomOpLogEntry(entry_copy);
-                break;
-        }
-
-        if (!applied) {
+        if (!ApplyOpLogEntryInternal(entry_copy)) {
             LOG(ERROR) << "OpLogApplier: failed to apply pending entry"
                        << ", sequence_id=" << entry_copy.sequence_id
                        << ", op_type=" << static_cast<int>(entry_copy.op_type);
