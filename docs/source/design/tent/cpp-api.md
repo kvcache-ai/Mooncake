@@ -11,7 +11,7 @@ For conceptual background, see [TENT Overview](overview.md).
 - **Build** with `-DUSE_TENT=ON` to enable TENT.
 - TENT provides two API surfaces:
   - **TENT-native API** (documented below).
-  - **TE-compatible API** via the compatibility shim (set `MC_USE_TENT=1`). For TE-compatible API, see [TE C++ API Reference](../transfer-engine/cpp-api.md)
+  - **TE-compatible API** via the compatibility shim (set `MC_USE_TENT=1`). For TE-compatible API, see TE C++ API Reference.
 
 **Core APIs vs Advanced APIs**
 - Core APIs form the minimal path to move data: create the engine, register memory, open segments, submit transfers, and query status.
@@ -106,6 +106,7 @@ export MC_USE_TENT=1
 
 When this variable is set, the `mooncake::TransferEngine` class internally delegates to `mooncake::tent::TransferEngine`. Most TE APIs are translated automatically. APIs that have no TENT equivalent (e.g., `installTransport`, `getMetadata`) become no-ops or return placeholder values.
 
+(transfer-engine-compatibility-mode-semantics)=
 ### Transfer Engine Compatibility Mode Semantics
 
 The compatibility shim is intended to preserve the common TE application flow while running on the TENT runtime:
