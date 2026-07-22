@@ -777,12 +777,48 @@ class MooncakeBundleTransfer:
         )
 
     @staticmethod
-    def release_result(result: Any) -> None:
+    def release(
+        result: Any, *, type: Literal["dataproto", "dict"] = "dataproto"
+    ) -> None:
         """Release pool-backed buffers in a GET result.
 
-        After get_dataproto / get_dict, ndarray payloads may be backed by
-        the BufferPool. Call this to release those leases deterministically
-        instead of waiting for GC ``__del__``.
+        ``type`` selects the public lifecycle path. DataProto and flat-dict
+        results currently share the same buffer-owner walker, but the split is
+        kept explicit so future type-specific lifecycle rules have a stable
+        dispatch point.
+        """
+        if type == "dataproto":
+            return MooncakeBundleTransfer.release_dataproto(result)
+        if type == "dict":
+            return MooncakeBundleTransfer.release_dict(result)
+        raise ValueError(f"unsupported Mooncake payload type: {type!r}")
+
+    @staticmethod
+    def release_dataproto(result: Any) -> None:
+        """Release pool-backed buffers in a DataProto GET result."""
+        MooncakeBundleTransfer._release_result(result)
+
+    @staticmethod
+    def release_dict(result: Any) -> None:
+        """Release pool-backed buffers in a flat-dict GET result."""
+        MooncakeBundleTransfer._release_result(result)
+
+    @staticmethod
+    def release_result(result: Any) -> None:
+        """Release pool-backed buffers in a structured GET result.
+
+        This compatibility helper uses the DataProto release path, which also
+        accepts flat dicts. New code should use ``release(..., type=...)``.
+        """
+        MooncakeBundleTransfer.release_dataproto(result)
+
+    @staticmethod
+    def _release_result(result: Any) -> None:
+        """Release pool-backed buffers in a GET result.
+
+        After get(..., type="dataproto"), get(..., type="dict"), or
+        get_dataproto, ndarray payloads may be backed by the BufferPool. Call
+        this to release those leases deterministically instead of waiting for GC ``__del__``.
 
         Works for both flat dicts and nested envelope dicts
         (dataproto: {batch: {...}, non_tensor_batch: {...}, meta_info: {...}}).
@@ -1769,8 +1805,35 @@ class MooncakeBundleTransfer:
                 dict_payload[f"{key}.{name}"] = value
         return dict_payload, metadata
 
+    def cleanup(
+        self, ref: DataProtoRefLike, *, type: Literal["dataproto", "dict"] = "dataproto"
+    ) -> None:
+        """Remove all structured object stages referenced by a structured handle.
+
+        ``type`` selects the public lifecycle path. DataProto and flat-dict
+        refs currently share the same structured-ref cleanup mechanics, but the
+        split is kept explicit so future type-specific lifecycle rules have a
+        stable dispatch point.
+        """
+        if type == "dataproto":
+            return self.cleanup_dataproto(ref)
+        if type == "dict":
+            return self.cleanup_dict(ref)
+        raise ValueError(f"unsupported Mooncake payload type: {type!r}")
+
     def cleanup_dataproto(self, ref: DataProtoRefLike) -> None:
         """Remove all structured object stages referenced by a DataProto handle."""
+        self._cleanup_structured_ref(ref)
+
+    def cleanup_dict(self, ref: DataProtoRefLike) -> None:
+        """Remove all structured object stages referenced by a flat-dict handle.
+
+        Refs returned by ``put(..., type="dict")`` use the same structured
+        handle representation as DataProto refs.
+        """
+        self._cleanup_structured_ref(ref)
+
+    def _cleanup_structured_ref(self, ref: DataProtoRefLike) -> None:
         ref = _resolve_dataproto_ref(ref)
         seen: set[str] = set()
         for stage_ref in ref.stage_refs.values():
