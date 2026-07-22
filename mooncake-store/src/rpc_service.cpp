@@ -1127,10 +1127,10 @@ WrappedMasterService::GetTenantQuotaAllocatableCapacityBytes() {
 }
 
 tl::expected<std::vector<std::string>, ErrorCode>
-WrappedMasterService::GetAllKeysForAdmin() {
+WrappedMasterService::GetAllKeysForAdmin(bool filter_invalid) {
     // Compatibility endpoint: /get_all_keys historically listed only the
     // default tenant's keys.
-    return master_service_.GetAllKeys("default");
+    return master_service_.GetAllKeys("default", filter_invalid);
 }
 
 tl::expected<std::vector<std::string>, ErrorCode>
