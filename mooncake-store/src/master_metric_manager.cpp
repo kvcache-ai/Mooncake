@@ -61,6 +61,37 @@ MasterMetricManager::MasterMetricManager()
       // Initialize cluster metrics
       active_clients_("master_active_clients",
                       "Total number of active clients"),
+      client_liveness_active_clients_(
+          "master_client_liveness_active_clients",
+          "Store Client liveness records currently Active"),
+      client_liveness_suspected_clients_(
+          "master_client_liveness_suspected_clients",
+          "Store Client liveness records currently Suspected"),
+      client_liveness_offline_clients_(
+          "master_client_liveness_offline_clients",
+          "Store Client liveness records currently Offline"),
+      client_liveness_suspected_transitions_(
+          "master_client_liveness_suspected_transitions_total",
+          "Store Client Active to Suspected transitions"),
+      client_liveness_recoveries_(
+          "master_client_liveness_recoveries_total",
+          "Store Client Suspected to Active recoveries"),
+      client_liveness_offline_transitions_(
+          "master_client_liveness_offline_transitions_total",
+          "Store Client Suspected to Offline transitions"),
+      pending_client_offboarding_jobs_metric_(
+          "master_client_offboarding_queue_depth",
+          "Queued or running Store Client offboarding jobs"),
+      client_offboarding_duration_ms_(
+          "master_client_offboarding_duration_ms",
+          "Asynchronous Store Client offboarding duration in milliseconds",
+          {1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000, 30000}),
+      client_offboarding_failures_(
+          "master_client_offboarding_failures_total",
+          "Failed Store Client offboarding prepare or commit attempts"),
+      client_offboarding_retries_(
+          "master_client_offboarding_retries_total",
+          "Retried Store Client offboarding attempts"),
 
       // Initialize Request Counters
       put_start_requests_("master_put_start_requests_total",
@@ -489,6 +520,10 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     key_count_.update(0);
     soft_pin_key_count_.update(0);
     active_clients_.update(0);
+    client_liveness_active_clients_.update(0);
+    client_liveness_suspected_clients_.update(0);
+    client_liveness_offline_clients_.update(0);
+    pending_client_offboarding_jobs_metric_.update(0);
     mem_cache_nums_.update(0);
     file_cache_nums_.update(0);
     put_start_discarded_staging_size_.update(0);
@@ -496,6 +531,11 @@ void MasterMetricManager::update_metrics_for_zero_output() {
 
     // Update Counters (use inc(0) to mark as changed)
     promotion_admitted_.inc(0);
+    client_liveness_suspected_transitions_.inc(0);
+    client_liveness_recoveries_.inc(0);
+    client_liveness_offline_transitions_.inc(0);
+    client_offboarding_failures_.inc(0);
+    client_offboarding_retries_.inc(0);
     promotion_completed_.inc(0);
     promotion_completed_bytes_.inc(0);
     promotion_expired_.inc(0);
@@ -622,6 +662,7 @@ void MasterMetricManager::update_metrics_for_zero_output() {
 
     // Update Histogram (use observe(0) to mark as changed)
     value_size_distribution_.observe(0);
+    client_offboarding_duration_ms_.observe(0);
     nof_heartbeat_probe_latency_ms_.observe(0);
 
     // Note: dynamic_gauge_1t (mem_allocated_size_per_segment_ and
@@ -858,6 +899,79 @@ void MasterMetricManager::dec_active_clients(int64_t val) {
 
 int64_t MasterMetricManager::get_active_clients() {
     return active_clients_.value();
+}
+
+void MasterMetricManager::client_liveness_record_created() {
+    client_liveness_active_clients_.inc(1);
+}
+
+void MasterMetricManager::client_liveness_became_suspected() {
+    client_liveness_active_clients_.dec(1);
+    client_liveness_suspected_clients_.inc(1);
+    client_liveness_suspected_transitions_.inc(1);
+}
+
+void MasterMetricManager::client_liveness_recovered() {
+    client_liveness_suspected_clients_.dec(1);
+    client_liveness_active_clients_.inc(1);
+    client_liveness_recoveries_.inc(1);
+}
+
+void MasterMetricManager::client_liveness_became_offline() {
+    client_liveness_suspected_clients_.dec(1);
+    client_liveness_offline_clients_.inc(1);
+    client_liveness_offline_transitions_.inc(1);
+}
+
+void MasterMetricManager::on_client_liveness_record_removed(
+    ClientLivenessState state) {
+    switch (state) {
+        case ClientLivenessState::ACTIVE:
+            client_liveness_active_clients_.dec(1);
+            break;
+        case ClientLivenessState::SUSPECTED:
+            client_liveness_suspected_clients_.dec(1);
+            break;
+        case ClientLivenessState::OFFLINE:
+            client_liveness_offline_clients_.dec(1);
+            break;
+    }
+}
+
+void MasterMetricManager::reset_client_liveness_metrics(
+    int64_t active_records) {
+    client_liveness_active_clients_.dec(
+        client_liveness_active_clients_.value());
+    client_liveness_suspected_clients_.dec(
+        client_liveness_suspected_clients_.value());
+    client_liveness_offline_clients_.dec(
+        client_liveness_offline_clients_.value());
+    pending_client_offboarding_jobs_metric_.dec(
+        pending_client_offboarding_jobs_metric_.value());
+    if (active_records > 0) {
+        client_liveness_active_clients_.inc(active_records);
+    }
+}
+
+void MasterMetricManager::inc_client_offboarding_queue_depth(int64_t jobs) {
+    pending_client_offboarding_jobs_metric_.inc(jobs);
+}
+
+void MasterMetricManager::dec_client_offboarding_queue_depth(int64_t jobs) {
+    pending_client_offboarding_jobs_metric_.dec(jobs);
+}
+
+void MasterMetricManager::inc_client_offboarding_failure() {
+    client_offboarding_failures_.inc(1);
+}
+
+void MasterMetricManager::inc_client_offboarding_retry() {
+    client_offboarding_retries_.inc(1);
+}
+
+void MasterMetricManager::observe_client_offboarding_duration_ms(
+    int64_t duration_ms) {
+    client_offboarding_duration_ms_.observe(duration_ms);
 }
 
 // Store-observed cache reuse metrics
@@ -1789,9 +1903,20 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(key_count_);
     serialize_metric(soft_pin_key_count_);
     serialize_metric(active_clients_);
+    serialize_metric(client_liveness_active_clients_);
+    serialize_metric(client_liveness_suspected_clients_);
+    serialize_metric(client_liveness_offline_clients_);
+    serialize_metric(pending_client_offboarding_jobs_metric_);
 
     // Serialize Histogram
     serialize_metric(value_size_distribution_);
+    serialize_metric(client_offboarding_duration_ms_);
+
+    serialize_metric(client_liveness_suspected_transitions_);
+    serialize_metric(client_liveness_recoveries_);
+    serialize_metric(client_liveness_offline_transitions_);
+    serialize_metric(client_offboarding_failures_);
+    serialize_metric(client_offboarding_retries_);
 
     // Serialize Request Counters
     serialize_metric(exist_key_requests_);

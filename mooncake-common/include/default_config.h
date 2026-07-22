@@ -122,6 +122,10 @@ class DefaultConfig {
     void GetString(const std::string& key, std::string* val,
                    const std::string& default_value = "") const;
 
+    [[nodiscard]] bool Contains(const std::string& key) const {
+        return data_.find(key) != data_.end();
+    }
+
     void SetPath(const std::string& path) { path_ = path; }
 
    private:

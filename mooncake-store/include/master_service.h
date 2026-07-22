@@ -3,7 +3,6 @@
 #include <array>
 #include <atomic>
 #include <boost/functional/hash.hpp>
-#include <boost/lockfree/queue.hpp>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -22,6 +21,9 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "allocation_strategy.h"
+#include "client_lifecycle_event.h"
+#include "client_liveness.h"
+#include "client_offboarding.h"
 #include "count_min_sketch.h"
 #include "deadline_scheduler.h"
 #include "master_metric_manager.h"
@@ -56,8 +58,6 @@ class EtcdOpLogStore;
 // Forward declarations
 class AllocationStrategy;
 class EvictionStrategy;
-class HttpMetadataServer;
-struct MetadataStoragePlugin;
 
 // Forward declarations for test classes
 namespace test {
@@ -70,6 +70,7 @@ class SnapshotChildProcessTest;
 // exposing test-only accessors on MasterService itself.
 class PromotionOnHitTest;
 class MasterServiceTenantQuotaTest;
+class MasterServiceTest;
 }  // namespace test
 namespace benchmarks {
 class BatchEvictBench;
@@ -85,6 +86,10 @@ class BatchEvictBench;
  * 5. tenant_quota_shards_[shard_idx_].mutex
  * 6. segment_mutex_
  *
+ * A ClientLivenessRecord transition mutex may be acquired after
+ * client_mutex_ and snapshot_mutex_. It must not be held across metadata-shard
+ * scans, and callbacks executed under it must not reacquire client_mutex_.
+ *
  * Strict tenant admission and policy mutation paths that need both
  * tenant_quota_policy_mutex_ and snapshot_mutex_ must acquire the tenant
  * policy mutex first, then snapshot_mutex_.
@@ -96,8 +101,10 @@ class MasterService {
     friend class test::PromotionOnHitTest;
     friend class benchmarks::BatchEvictBench;
     friend class test::MasterServiceTenantQuotaTest;
+    friend class test::MasterServiceTest;
     friend class MasterSnapshotManager;    // Allow access to internal state for
                                            // snapshot
+    friend class ClientOffboardingWorker;
     friend class ha::MasterSnapshotCodec;  // Allow codec to access private
                                            // members
     friend class ha::MasterSnapshotCodecTest;  // codec round-trip unit test
@@ -109,6 +116,13 @@ class MasterService {
     MasterService();
     MasterService(const MasterServiceConfig& config);
     ~MasterService();
+
+    // Register a non-blocking observer for expired client leases. Callbacks
+    // are invoked in registration order after client resources have been
+    // reclaimed and all MasterService internal locks have been released. The
+    // callback is retained for the lifetime of this MasterService.
+    void RegisterClientLeaseExpiredCallback(
+        ClientLeaseExpiredCallback callback);
 
     void SetNoFProbeFnForTesting(NoFProbeFn fn);
     size_t GetMountedNoFSegmentCountForTesting();
@@ -789,29 +803,12 @@ class MasterService {
     tl::expected<void, ErrorCode> MarkTaskToComplete(
         const UUID& client_id, const TaskCompleteRequest& request);
 
-    /**
-     * @brief Set the HttpMetadataServer pointer for cleanup on client timeout.
-     * @param server Pointer to HttpMetadataServer. If nullptr, cleanup is
-     * disabled.
-     */
-    void setHttpMetadataServer(HttpMetadataServer* server);
-
-    /**
-     * @brief Configure cleanup against a separately-deployed HTTP metadata
-     * server (not co-located in the master process). The master sends HTTP
-     * DELETE requests to this endpoint when a client times out. Only http://
-     * and https:// connection strings are supported; other schemes (etcd /
-     * redis / P2PHANDSHAKE) are ignored with a warning and leave cleanup
-     * disabled.
-     * @param metadata_connstring e.g. "http://host:8080/metadata".
-     */
-    void setHttpMetadataRemoteUrl(const std::string& metadata_connstring);
-
    private:
     std::unique_ptr<ha::SnapshotCatalogStore> CreateSnapshotCatalogStore();
 
     // Restore master state
     void RestoreState();
+    void RebuildClientLivenessAfterRestore();
     void ResetStateAfterFailedRestoreAttempt();
 
     /**
@@ -841,9 +838,10 @@ class MasterService {
     TenantQuotaEvictionResult EvictTenantMemoryForQuota(
         const std::string& tenant_id, uint64_t target_bytes);
 
-    // Helper to get a snapshot of alive clients (under client_mutex_ shared
-    // lock)
-    std::unordered_set<UUID, boost::hash<UUID>> getAliveClientsSnapshot() const;
+    std::shared_ptr<ClientLivenessRecord> FindClientRecord(
+        const UUID& client_id) const;
+    std::unordered_set<UUID, boost::hash<UUID>>
+    GetRetainedClientIdsSnapshot() const;
     void UpdateClientHostId(const UUID& client_id, const std::string& host_id);
     std::string GetClientHostId(const UUID& client_id) const;
 
@@ -1037,6 +1035,13 @@ class MasterService {
             return it != replicas_.end() ? &(*it) : nullptr;
         }
 
+        const Replica* GetFirstReplica(
+            const std::function<bool(const Replica&)>& pred_fn) const {
+            const auto it =
+                std::find_if(replicas_.begin(), replicas_.end(), pred_fn);
+            return it != replicas_.end() ? &(*it) : nullptr;
+        }
+
         Replica* GetReplicaByID(const ReplicaID& id) {
             return GetFirstReplica(
                 [&id](const Replica& replica) { return replica.id() == id; });
@@ -1083,6 +1088,17 @@ class MasterService {
                     }
                 }
                 return false;
+            });
+        }
+
+        const Replica* GetReplicaBySegmentName(
+            const std::string& segment_name) const {
+            return GetFirstReplica([&segment_name](const Replica& replica) {
+                const auto names = replica.get_segment_names();
+                return std::any_of(
+                    names.begin(), names.end(), [&](const auto& name_opt) {
+                        return name_opt == segment_name;
+                    });
             });
         }
 
@@ -1169,6 +1185,43 @@ class MasterService {
         // Use the accessors to visit and modify the replicas.
         std::vector<Replica> replicas_;
     };
+
+    class ClientServingReadView {
+       public:
+        explicit ClientServingReadView(const MasterService* service)
+            : service_(service), lock_(service->client_mutex_) {}
+
+        [[nodiscard]] bool IsServing(const UUID& client_id) const {
+            const auto it =
+                service_->client_liveness_records_.find(client_id);
+            return it != service_->client_liveness_records_.end() &&
+                   it->second->IsServing();
+        }
+
+        [[nodiscard]] std::shared_ptr<ClientLivenessRecord> FindRecord(
+            const UUID& client_id) const {
+            const auto it =
+                service_->client_liveness_records_.find(client_id);
+            return it == service_->client_liveness_records_.end()
+                       ? nullptr
+                       : it->second;
+        }
+
+       private:
+        const MasterService* service_;
+        std::shared_lock<std::shared_mutex> lock_;
+    };
+
+    [[nodiscard]] bool IsReplicaServing(
+        const Replica& replica,
+        const ClientServingReadView& clients) const;
+    [[nodiscard]] bool HasVisibleCompletedReplica(
+        const ObjectMetadata& metadata,
+        const ClientServingReadView& clients) const;
+    [[nodiscard]] std::vector<Replica::Descriptor>
+    GetVisibleReplicaDescriptors(
+        const ObjectMetadata& metadata,
+        const ClientServingReadView& clients) const;
 
     struct ReplicationTask {
         UUID client_id;
@@ -1925,23 +1978,26 @@ class MasterService {
 
     // Client related members
     mutable std::shared_mutex client_mutex_;
+    std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
+                       boost::hash<UUID>>
+        client_liveness_records_;
     std::unordered_set<UUID, boost::hash<UUID>>
         ok_client_;  // client with ok status
     std::unordered_map<UUID, std::string, boost::hash<UUID>> client_host_id_;
     void ClientMonitorFunc();
+    void NotifyClientLeaseExpired(const ClientLeaseExpiredEvent& event);
     std::thread client_monitor_thread_;
     std::atomic<bool> client_monitor_running_{false};
     static constexpr uint64_t kClientMonitorSleepMs =
         1000;  // 1000 ms sleep between client monitor checks
-    // boost lockfree queue requires trivial assignment operator
-    struct PodUUID {
-        uint64_t first;
-        uint64_t second;
-    };
-    static constexpr size_t kClientPingQueueSize =
-        128 * 1024;  // Size of the client ping queue
-    boost::lockfree::queue<PodUUID> client_ping_queue_{kClientPingQueueSize};
-    const int64_t client_live_ttl_sec_;
+    [[nodiscard]] bool ShouldSkipSnapshotForClientOffboarding() {
+        return client_offboarding_worker_.ShouldSkipSnapshot();
+    }
+    ClientOffboardingWorker client_offboarding_worker_{this};
+    const int64_t client_active_ttl_sec_;
+    const int64_t client_suspicion_ttl_sec_;
+    std::mutex client_lease_expired_callbacks_mutex_;
+    std::vector<ClientLeaseExpiredCallback> client_lease_expired_callbacks_;
     const std::chrono::seconds nof_heartbeat_interval_sec_;
     const std::chrono::milliseconds nof_heartbeat_probe_timeout_ms_;
     const uint32_t nof_heartbeat_failures_threshold_;
@@ -2028,32 +2084,6 @@ class MasterService {
     std::unique_ptr<TenantQuotaPolicyStore> tenant_quota_policy_store_;
     mutable std::mutex tenant_quota_policy_mutex_;
     mutable std::mutex tenant_quota_recompute_mutex_;
-
-    // HTTP metadata server pointer for cleanup on client timeout
-    // nullptr means cleanup is disabled
-    HttpMetadataServer* http_metadata_server_{nullptr};
-
-    // Remote HTTP metadata client, used when the metadata server is deployed
-    // separately. nullptr = no remote cleanup (co-located prefers the pointer).
-    std::shared_ptr<MetadataStoragePlugin> http_metadata_remote_;
-
-    // Cached HTTP metadata key prefix (initialized once at startup)
-    std::string http_metadata_prefix_;
-
-    // Async worker for remote cleanup: segments are enqueued from the client
-    // monitor thread so a slow/unreachable server never blocks heartbeats.
-    std::thread http_metadata_cleanup_thread_;
-    std::atomic<bool> http_metadata_cleanup_running_{false};
-    std::mutex http_metadata_cleanup_mutex_;
-    std::condition_variable http_metadata_cleanup_cv_;
-    std::vector<std::string> http_metadata_cleanup_queue_;
-
-    void HttpMetadataCleanupThreadFunc();
-
-    // Clean up HTTP metadata (mooncake/ram/*, mooncake/rpc_meta/*) for a
-    // segment. For the co-located case this is synchronous (no network I/O);
-    // for the remote case it enqueues to the async cleanup worker.
-    void cleanupHttpMetadata(const std::string& segment_name);
 
     bool use_disk_replica_{false};
 

@@ -8,14 +8,17 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -186,6 +189,34 @@ class MasterServiceTest : public ::testing::Test {
         return key;
     }
 
+    std::shared_ptr<ClientLivenessRecord> GetClientLivenessRecord(
+        MasterService& service, const UUID& client_id) const {
+        std::shared_lock<std::shared_mutex> lock(service.client_mutex_);
+        const auto it = service.client_liveness_records_.find(client_id);
+        return it == service.client_liveness_records_.end() ? nullptr
+                                                             : it->second;
+    }
+
+    bool ScheduleClientOffboardingForTest(MasterService& service,
+                                          ClientOffboardingJob job) const {
+        return service.client_offboarding_worker_.Schedule(std::move(job));
+    }
+
+    bool HasPendingClientOffboardingForTest(
+        const MasterService& service) const {
+        return service.client_offboarding_worker_.HasPending();
+    }
+
+    bool ShouldSkipSnapshotForClientOffboardingForTest(
+        MasterService& service) const {
+        return service.ShouldSkipSnapshotForClientOffboarding();
+    }
+
+    std::unique_lock<std::shared_mutex> LockSnapshotForTest(
+        MasterService& service) const {
+        return std::unique_lock<std::shared_mutex>(service.snapshot_mutex_);
+    }
+
     std::string FindGroupIdOnDifferentShard(const std::string& key) const {
         static constexpr size_t kMetadataShardCountForTest = 1024;
         const size_t key_shard =
@@ -319,6 +350,49 @@ class MasterServiceTest : public ::testing::Test {
         google::ShutdownGoogleLogging();
     }
 };
+
+TEST_F(MasterServiceTest, PingUnknownClientRequestsRemount) {
+    MasterService service;
+
+    auto response = service.Ping(generate_uuid());
+
+    ASSERT_TRUE(response.has_value());
+    EXPECT_EQ(response->client_status, ClientStatus::NEED_REMOUNT);
+}
+
+TEST_F(MasterServiceTest, RemountEstablishesReadinessWithoutHeartbeatQueue) {
+    MasterService service;
+    const UUID client_id = generate_uuid();
+
+    ASSERT_TRUE(service.ReMountSegment({}, client_id).has_value());
+    auto response = service.Ping(client_id);
+
+    ASSERT_TRUE(response.has_value());
+    EXPECT_EQ(response->client_status, ClientStatus::OK);
+}
+
+TEST_F(MasterServiceTest, MemoryDescriptorFollowsClientLiveness) {
+    MasterService service;
+    constexpr std::string_view kSegmentName = "liveness_visibility_segment";
+    const auto context = PrepareSimpleSegment(service, std::string(kSegmentName));
+    const auto key = PutObjectOnSegment(service, generate_uuid(),
+                                        std::string(kSegmentName));
+
+    ASSERT_TRUE(service.GetReplicaList(key, "default").has_value());
+    auto record = GetClientLivenessRecord(service, context.client_id);
+    ASSERT_NE(record, nullptr);
+    ASSERT_EQ(record->Evaluate(ClientLivenessRecord::Clock::now(),
+                               ClientLivenessRecord::Clock::duration::zero(),
+                               std::chrono::seconds(60)),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+
+    auto hidden = service.GetReplicaList(key, "default");
+    ASSERT_FALSE(hidden.has_value());
+    EXPECT_EQ(hidden.error(), ErrorCode::REPLICA_IS_NOT_READY);
+
+    ASSERT_TRUE(service.Ping(context.client_id).has_value());
+    EXPECT_TRUE(service.GetReplicaList(key, "default").has_value());
+}
 
 TEST(TenantScopedStorageKeyTest, RoundTripsAndParsesLegacyKeys) {
     const auto scoped =
@@ -2498,7 +2572,7 @@ TEST_F(MasterServiceTest, CopyStart) {
     [[maybe_unused]] const auto context4 =
         PrepareSimpleSegment(*service_, "segment_4");
 
-    UUID client_id = generate_uuid();
+    const UUID client_id = context1.client_id;
 
     // Test Case 1: CopyStart a non-existent key, should fail.
     auto copy_result = service_->CopyStart(
@@ -2637,8 +2711,8 @@ TEST_F(MasterServiceTest, CopyEnd) {
     [[maybe_unused]] const auto context3 =
         PrepareSimpleSegment(*service_, "segment_3");
 
-    UUID client_id = generate_uuid();
-    UUID invalid_client_id = generate_uuid();
+    const UUID client_id = context1.client_id;
+    const UUID invalid_client_id = context2.client_id;
 
     // Test Case 1: CopyEnd a non-existent key, should fail.
     auto copy_end_result =
@@ -2748,8 +2822,8 @@ TEST_F(MasterServiceTest, CopyRevoke) {
     [[maybe_unused]] const auto context2 =
         PrepareSimpleSegment(*service_, "segment_2");
 
-    UUID client_id = generate_uuid();
-    UUID invalid_client_id = generate_uuid();
+    const UUID client_id = context1.client_id;
+    const UUID invalid_client_id = context2.client_id;
 
     // Test Case 1: CopyRevoke a non-existent key, should fail.
     auto copy_revoke_result =
@@ -2841,7 +2915,7 @@ TEST_F(MasterServiceTest, MoveStart) {
     [[maybe_unused]] const auto context3 =
         PrepareSimpleSegment(*service_, "segment_3");
 
-    UUID client_id = generate_uuid();
+    const UUID client_id = context1.client_id;
 
     // Test Case 1: MoveStart a non-existent key, should fail.
     auto move_start_result = service_->MoveStart(
@@ -2977,8 +3051,8 @@ TEST_F(MasterServiceTest, MoveEnd) {
     [[maybe_unused]] const auto context2 =
         PrepareSimpleSegment(*service_, "segment_2");
 
-    UUID client_id = generate_uuid();
-    UUID invalid_client_id = generate_uuid();
+    const UUID client_id = context1.client_id;
+    const UUID invalid_client_id = context2.client_id;
 
     // Test Case 1: MoveEnd a non-existent key, should fail.
     auto move_end_result =
@@ -3057,8 +3131,8 @@ TEST_F(MasterServiceTest, MoveRevoke) {
     [[maybe_unused]] const auto context2 =
         PrepareSimpleSegment(*service_, "segment_2");
 
-    UUID client_id = generate_uuid();
-    UUID invalid_client_id = generate_uuid();
+    const UUID client_id = context1.client_id;
+    const UUID invalid_client_id = context2.client_id;
 
     // Test Case 1: MoveRevoke a non-existent key, should fail.
     auto move_revoke_result =
@@ -3155,7 +3229,7 @@ TEST_F(MasterServiceTest, ProtectCopyMoveSourceFromEviction) {
     [[maybe_unused]] const auto context2 =
         PrepareSimpleSegment(*service_, "segment_2", kBaseAddr, kSegmentSize);
 
-    UUID client_id = generate_uuid();
+    const UUID client_id = context1.client_id;
 
     const std::string copy_key = "copy_key";
     const std::string move_key = "move_key";
@@ -3240,7 +3314,7 @@ TEST_F(MasterServiceTest, DiscardTimeoutCopyMove) {
     [[maybe_unused]] const auto context2 =
         PrepareSimpleSegment(*service_, "segment_2", kBaseAddr, kSegmentSize);
 
-    UUID client_id = generate_uuid();
+    const UUID client_id = context1.client_id;
 
     const std::string copy_key = "copy_key";
     const std::string move_key = "move_key";
@@ -5090,6 +5164,139 @@ TEST_F(MasterServiceTest, BatchQueryIpMixedIpv4AndIpv6Test) {
     EXPECT_NE(ip_set.find("::1"), ip_set.end());
 }
 
+TEST_F(MasterServiceTest,
+       ClientLeaseExpiredCallbacksRunAfterResourceReclamation) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.client_active_ttl_sec = 1;
+    config.client_suspicion_ttl_sec = 1;
+    auto service = std::make_unique<MasterService>(config);
+
+    const UUID mounted_client_id = generate_uuid();
+    const UUID empty_client_id = generate_uuid();
+    Segment segment_a = MakeSegment("expired_segment_a");
+    Segment segment_b = MakeSegment("expired_segment_b",
+                                    kDefaultSegmentBase + kDefaultSegmentSize);
+    ASSERT_TRUE(
+        service->MountSegment(segment_a, mounted_client_id).has_value());
+    ASSERT_TRUE(
+        service->MountSegment(segment_b, mounted_client_id).has_value());
+
+    std::mutex events_mutex;
+    std::condition_variable events_cv;
+    std::vector<ClientLeaseExpiredEvent> events;
+    std::atomic<int> throwing_callback_count{0};
+    bool resources_were_reclaimed_before_callback = true;
+
+    service->RegisterClientLeaseExpiredCallback(
+        [&](const ClientLeaseExpiredEvent&) {
+            throwing_callback_count.fetch_add(1);
+            throw std::runtime_error("expected test exception");
+        });
+    service->RegisterClientLeaseExpiredCallback(
+        [&](const ClientLeaseExpiredEvent& event) {
+            for (const auto& segment_name :
+                 event.unmounted_memory_segment_names) {
+                if (service->QuerySegments(segment_name).has_value()) {
+                    resources_were_reclaimed_before_callback = false;
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lock(events_mutex);
+                events.push_back(event);
+            }
+            events_cv.notify_one();
+        });
+
+    ASSERT_TRUE(service->Ping(mounted_client_id).has_value());
+    ASSERT_TRUE(service->MountLocalDiskSegment(empty_client_id,
+                                               /*enable_offloading=*/true)
+                    .has_value());
+
+    {
+        std::unique_lock<std::mutex> lock(events_mutex);
+        ASSERT_TRUE(events_cv.wait_for(lock, std::chrono::seconds(6),
+                                       [&] { return events.size() == 2; }));
+    }
+
+    EXPECT_EQ(throwing_callback_count.load(), 2);
+    EXPECT_TRUE(resources_were_reclaimed_before_callback);
+
+    const ClientLeaseExpiredEvent* mounted_event = nullptr;
+    const ClientLeaseExpiredEvent* empty_event = nullptr;
+    for (const auto& event : events) {
+        if (event.client_id == mounted_client_id) {
+            mounted_event = &event;
+        } else if (event.client_id == empty_client_id) {
+            empty_event = &event;
+        }
+    }
+    ASSERT_NE(mounted_event, nullptr);
+    ASSERT_NE(empty_event, nullptr);
+    EXPECT_TRUE(empty_event->unmounted_memory_segment_names.empty());
+    const std::unordered_set<std::string> unmounted_segments(
+        mounted_event->unmounted_memory_segment_names.begin(),
+        mounted_event->unmounted_memory_segment_names.end());
+    EXPECT_EQ(unmounted_segments,
+              (std::unordered_set<std::string>{"expired_segment_a",
+                                               "expired_segment_b"}));
+}
+
+TEST_F(MasterServiceTest,
+       FailedClientOffboardingSkipsOnlyOneSnapshotCycle) {
+    auto service = std::make_unique<MasterService>(MasterServiceConfig{});
+    ClientOffboardingJob job{
+        .client_id = generate_uuid(),
+        .liveness = std::make_shared<ClientLivenessRecord>(
+            ClientLivenessRecord::Clock::now()),
+        .segments = {},
+        .all_segments_prepared = false,
+        .enqueued_at = std::chrono::steady_clock::now(),
+    };
+
+    ASSERT_TRUE(ScheduleClientOffboardingForTest(*service, std::move(job)));
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (HasPendingClientOffboardingForTest(*service) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    ASSERT_FALSE(HasPendingClientOffboardingForTest(*service));
+    EXPECT_TRUE(ShouldSkipSnapshotForClientOffboardingForTest(*service));
+    EXPECT_FALSE(ShouldSkipSnapshotForClientOffboardingForTest(*service));
+}
+
+TEST_F(MasterServiceTest,
+       PendingClientOffboardingSkipDoesNotLeakAfterJobFails) {
+    auto service = std::make_unique<MasterService>(MasterServiceConfig{});
+    ClientOffboardingJob job{
+        .client_id = generate_uuid(),
+        .liveness = std::make_shared<ClientLivenessRecord>(
+            ClientLivenessRecord::Clock::now()),
+        .segments = {},
+        .all_segments_prepared = false,
+        .enqueued_at = std::chrono::steady_clock::now(),
+    };
+
+    // Keep the worker behind snapshot access so this check deterministically
+    // observes the job while it is pending.
+    auto snapshot_lock = LockSnapshotForTest(*service);
+    ASSERT_TRUE(ScheduleClientOffboardingForTest(*service, std::move(job)));
+    EXPECT_TRUE(ShouldSkipSnapshotForClientOffboardingForTest(*service));
+    snapshot_lock.unlock();
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (HasPendingClientOffboardingForTest(*service) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    ASSERT_FALSE(HasPendingClientOffboardingForTest(*service));
+    EXPECT_FALSE(ShouldSkipSnapshotForClientOffboardingForTest(*service));
+}
+
 TEST_F(MasterServiceTest, PutStartExpiringTest) {
     // Reset storage space metrics.
     MasterMetricManager::instance().reset_allocated_mem_size();
@@ -6724,11 +6931,11 @@ TEST_F(MasterServiceTest, UpsertConflictReplicationTask) {
                               .build();
     std::unique_ptr<MasterService> service_(new MasterService(service_config));
 
-    [[maybe_unused]] const auto ctx1 =
+    const auto ctx1 =
         PrepareSimpleSegment(*service_, "segment_1");
     [[maybe_unused]] const auto ctx2 =
         PrepareSimpleSegment(*service_, "segment_2");
-    UUID client_id = generate_uuid();
+    const UUID client_id = ctx1.client_id;
 
     std::string key = "upsert_conflict_copy";
     uint64_t slice_length = 1024;

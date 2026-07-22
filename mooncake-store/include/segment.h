@@ -55,6 +55,7 @@ struct MountedSegment {
     Segment segment;
     SegmentStatus status;
     std::shared_ptr<BufferAllocatorBase> buf_allocator;
+    SegmentAllocatorRegistration allocator_registration;
 };
 
 struct MountedNoFSegment {
@@ -62,6 +63,7 @@ struct MountedNoFSegment {
     UUID client_id;
     SegmentStatus status;
     std::shared_ptr<BufferAllocatorBase> buf_allocator;
+    SegmentAllocatorRegistration allocator_registration;
 };
 
 struct MountedNoFSegmentSnapshot {
@@ -100,8 +102,26 @@ struct LocalDiskSegment {
     // offloading_objects (offloading_mutex_).
     std::unordered_map<std::string, PromotionTaskItem> GUARDED_BY(
         offloading_mutex_) promotion_objects;
-    explicit LocalDiskSegment(bool enable_offloading)
-        : enable_offloading(enable_offloading) {}
+    std::shared_ptr<ClientLivenessRecord> client_liveness;
+
+    explicit LocalDiskSegment(
+        bool enable_offloading,
+        std::shared_ptr<ClientLivenessRecord> client_liveness = nullptr)
+        : enable_offloading(enable_offloading),
+          client_liveness(std::move(client_liveness)) {}
+
+    [[nodiscard]] bool IsServing() const {
+        return client_liveness && client_liveness->IsServing();
+    }
+
+    [[nodiscard]] bool ShouldRetainResources() const {
+        return client_liveness && client_liveness->ShouldRetainResources();
+    }
+
+    void BindClientLiveness(
+        std::shared_ptr<ClientLivenessRecord> liveness_record) {
+        client_liveness = std::move(liveness_record);
+    }
 
     LocalDiskSegment(const LocalDiskSegment&) = delete;
     LocalDiskSegment& operator=(const LocalDiskSegment&) = delete;
@@ -129,10 +149,13 @@ class ScopedSegmentAccess {
     /**
      * @brief Mount a segment
      */
-    ErrorCode MountSegment(const Segment& segment, const UUID& client_id);
+    ErrorCode MountSegment(
+        const Segment& segment, const UUID& client_id,
+        std::shared_ptr<ClientLivenessRecord> client_liveness);
 
-    ErrorCode MountLocalDiskSegment(const UUID& client_id,
-                                    bool enable_offloading);
+    ErrorCode MountLocalDiskSegment(
+        const UUID& client_id, bool enable_offloading,
+        std::shared_ptr<ClientLivenessRecord> client_liveness);
 
     /**
      * @brief Re-mount a segment. To avoid infinite remount trying, only the
@@ -141,7 +164,9 @@ class ScopedSegmentAccess {
      * mounted while the return value will be OK.
      */
     ErrorCode ReMountSegment(const std::vector<Segment>& segments,
-                             const UUID& client_id);
+                             const UUID& client_id,
+                             std::shared_ptr<ClientLivenessRecord>
+                                 client_liveness);
 
     /**
      * @brief Prepare to unmount a segment by deleting its allocator
@@ -167,6 +192,21 @@ class ScopedSegmentAccess {
      */
     ErrorCode GetClientSegments(const UUID& client_id,
                                 std::vector<Segment>& segments) const;
+
+    /**
+     * @brief Return every Store Client that owns a restored memory or local
+     *        disk segment.
+     */
+    std::vector<UUID> GetStoreClientIds() const;
+
+    /**
+     * @brief Rebind restored client-owned segment resources to a fresh
+     *        liveness record. Segment snapshots intentionally do not persist
+     *        record implementation state.
+     */
+    void BindClientLiveness(
+        const UUID& client_id,
+        const std::shared_ptr<ClientLivenessRecord>& client_liveness);
 
     /**
      * @brief Get the names of all the segments

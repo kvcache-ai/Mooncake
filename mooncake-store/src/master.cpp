@@ -7,6 +7,7 @@
 #include <cstdlib>  // For std::getenv
 #include <fstream>  // For std::ifstream
 #include <memory>   // For std::unique_ptr
+#include <optional>
 #include <string>
 #include <thread>  // For std::thread
 #include <json/json.h>
@@ -259,9 +260,15 @@ DEFINE_string(
     "Endpoints of ETCD server, separated by semicolon, required in HA mode");
 DEFINE_int64(
     client_ttl, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
-    "Seconds a client stays considered alive after the last heartbeat. "
-    "If this TTL elapses without a refresh, the master treats the "
-    "client as disconnected and may unmount its segments");
+    "Deprecated alias for --client_active_ttl_sec");
+DEFINE_int64(client_active_ttl_sec, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
+             "Seconds a client remains active after its last liveness "
+             "observation");
+DEFINE_int64(client_suspicion_ttl_sec,
+             mooncake::DEFAULT_CLIENT_SUSPICION_TTL_SEC,
+             "Seconds a suspected client may recover before going offline; "
+             "defaults to 20 seconds, or to an explicitly configured active "
+             "TTL when omitted");
 DEFINE_int64(nof_heartbeat_interval_sec,
              mooncake::DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC,
              "How often master probes each mounted NoF segment");
@@ -462,9 +469,6 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetDouble("nof_eviction_high_watermark_ratio",
                              &master_config.nof_eviction_high_watermark_ratio,
                              FLAGS_nof_eviction_high_watermark_ratio);
-    default_config.GetInt64("client_live_ttl_sec",
-                            &master_config.client_live_ttl_sec,
-                            FLAGS_client_ttl);
     default_config.GetInt64("nof_heartbeat_interval_sec",
                             &master_config.nof_heartbeat_interval_sec,
                             FLAGS_nof_heartbeat_interval_sec);
@@ -946,11 +950,6 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.etcd_endpoints = FLAGS_etcd_endpoints;
     }
-    if ((google::GetCommandLineFlagInfo("client_ttl", &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.client_live_ttl_sec = FLAGS_client_ttl;
-    }
     if ((google::GetCommandLineFlagInfo("nof_heartbeat_interval_sec", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -1220,6 +1219,63 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
     }
 }
 
+std::optional<int64_t> GetConfiguredInt64(
+    const mooncake::DefaultConfig* default_config, const std::string& key) {
+    if (default_config == nullptr || !default_config->Contains(key)) {
+        return std::nullopt;
+    }
+    int64_t value = 0;
+    default_config->GetInt64(key, &value);
+    return value;
+}
+
+std::optional<int64_t> GetExplicitInt64Flag(const char* name, int64_t value) {
+    google::CommandLineFlagInfo info;
+    if (google::GetCommandLineFlagInfo(name, &info) && !info.is_default) {
+        return value;
+    }
+    return std::nullopt;
+}
+
+void InitClientLivenessConf(
+    const mooncake::DefaultConfig* default_config,
+    mooncake::MasterConfig& master_config) {
+    const mooncake::ClientLivenessConfigSource config_file{
+        .active_ttl_sec =
+            GetConfiguredInt64(default_config, "client_active_ttl_sec"),
+        .legacy_ttl_sec =
+            GetConfiguredInt64(default_config, "client_live_ttl_sec"),
+        .suspicion_ttl_sec =
+            GetConfiguredInt64(default_config, "client_suspicion_ttl_sec"),
+    };
+    const mooncake::ClientLivenessConfigSource command_line{
+        .active_ttl_sec = GetExplicitInt64Flag(
+            "client_active_ttl_sec", FLAGS_client_active_ttl_sec),
+        .legacy_ttl_sec =
+            GetExplicitInt64Flag("client_ttl", FLAGS_client_ttl),
+        .suspicion_ttl_sec = GetExplicitInt64Flag(
+            "client_suspicion_ttl_sec", FLAGS_client_suspicion_ttl_sec),
+    };
+
+    const auto resolved = mooncake::ResolveClientLivenessConfig(
+        config_file, command_line, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
+        mooncake::DEFAULT_CLIENT_SUSPICION_TTL_SEC);
+    if (resolved.config_active_conflict) {
+        LOG(WARNING) << "Both client_active_ttl_sec and deprecated "
+                        "client_live_ttl_sec are configured with different "
+                        "values; using client_active_ttl_sec="
+                     << *config_file.active_ttl_sec;
+    }
+    if (resolved.command_line_active_conflict) {
+        LOG(WARNING) << "Both --client_active_ttl_sec and deprecated "
+                        "--client_ttl are set with different values; using "
+                        "--client_active_ttl_sec="
+                     << *command_line.active_ttl_sec;
+    }
+    master_config.client_active_ttl_sec = resolved.active_ttl_sec;
+    master_config.client_suspicion_ttl_sec = resolved.suspicion_ttl_sec;
+}
+
 // Function to start HTTP metadata server
 std::unique_ptr<mooncake::HttpMetadataServer> StartHttpMetadataServer(
     int port, const std::string& host) {
@@ -1267,8 +1323,9 @@ int main(int argc, char* argv[]) {
     // Initialize the master configuration
     mooncake::MasterConfig master_config;
     std::string conf_path = FLAGS_config_path;
+    mooncake::DefaultConfig default_config;
+    const mooncake::DefaultConfig* loaded_default_config = nullptr;
     if (!conf_path.empty()) {
-        mooncake::DefaultConfig default_config;
         default_config.SetPath(conf_path);
         try {
             default_config.Load();
@@ -1277,8 +1334,16 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         InitMasterConf(default_config, master_config);
+        loaded_default_config = &default_config;
     }
     LoadConfigFromCmdline(master_config, !conf_path.empty());
+    try {
+        InitClientLivenessConf(loaded_default_config, master_config);
+    } catch (const std::invalid_argument& error) {
+        LOG(ERROR) << "Invalid Client liveness configuration: "
+                   << error.what();
+        return 1;
+    }
     ResolveRpcAddressFromInterfaceOrDie(master_config);
 
     // Fall back to environment variables for pod identity (K8s Downward API)
@@ -1387,7 +1452,10 @@ int main(int argc, char* argv[]) {
         << ", ha_backend_type=" << master_config.ha_backend_type
         << ", ha_backend_connstring=" << ha_backend_connstring
         << ", etcd_endpoints=" << master_config.etcd_endpoints
-        << ", client_ttl=" << master_config.client_live_ttl_sec
+        << ", client_active_ttl_sec="
+        << master_config.client_active_ttl_sec
+        << ", client_suspicion_ttl_sec="
+        << master_config.client_suspicion_ttl_sec
         << ", rpc_thread_num=" << master_config.rpc_thread_num
         << ", rpc_port=" << master_config.rpc_port
         << ", rpc_address=" << master_config.rpc_address

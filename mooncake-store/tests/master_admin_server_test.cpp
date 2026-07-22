@@ -646,7 +646,7 @@ class MasterAdminServerWithServiceTest : public ::testing::Test {
         WrappedMasterServiceConfig svc_config;
         svc_config.default_kv_lease_ttl = 5000;
         svc_config.enable_metric_reporting = false;
-        svc_config.client_live_ttl_sec =
+        svc_config.client_active_ttl_sec =
             3600;  // prevent client expiry in slow CI
         service_ = std::make_shared<WrappedMasterService>(svc_config);
 
