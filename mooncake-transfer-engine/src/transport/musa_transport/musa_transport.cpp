@@ -645,8 +645,10 @@ static bool submitBatchMemcpyByDevice(
             fail_pending(slices);
             return false;
         }
-        for (Slice *slice : slices)
-            slice_devices.emplace_back(slice, first_device);
+        for (Slice *slice : slices) {
+            if (slice->status == Slice::POSTED)
+                slice_devices.emplace_back(slice, first_device);
+        }
         return true;
     }
 
@@ -675,12 +677,33 @@ static bool submitBatchMemcpyByDevice(
             fail_pending(slices);
             return false;
         }
-    }
-    for (const auto &[device, group] : groups) {
-        for (Slice *slice : group.slices)
-            slice_devices.emplace_back(slice, device);
+        // Record each successfully posted group immediately. A later device
+        // can still fail to restore its context, and callers must retain the
+        // already submitted slices long enough to drain their streams.
+        for (Slice *slice : group.slices) {
+            if (slice->status == Slice::POSTED)
+                slice_devices.emplace_back(slice, device);
+        }
     }
     return true;
+}
+
+static void finishTerminalTasksForPolling(const std::vector<Slice *> &slices) {
+#ifndef USE_EVENT_DRIVEN_COMPLETION
+    for (Slice *slice : slices) {
+        if (!slice || !slice->task) continue;
+        Transport::TransferTask *task = slice->task;
+        const uint64_t completed =
+            __atomic_load_n(&task->success_slice_count, __ATOMIC_RELAXED) +
+            __atomic_load_n(&task->failed_slice_count, __ATOMIC_RELAXED);
+        const uint64_t total =
+            __atomic_load_n(&task->slice_count, __ATOMIC_RELAXED);
+        if (total != 0 && completed == total)
+            __atomic_store_n(&task->is_finished, true, __ATOMIC_RELAXED);
+    }
+#else
+    (void)slices;
+#endif
 }
 
 MusaTransport::MusaTransport() = default;
@@ -826,6 +849,17 @@ Status MusaTransport::submitTransfer(
     std::string submit_error;
     if (!submitBatchMemcpyByDevice(slices, srcs, dsts, sizes, slice_devices,
                                    submit_error)) {
+        rememberSliceDevices(slice_devices);
+        if (!slice_devices.empty()) {
+            // Some device groups are already in flight. Returning an error
+            // would make synchronous wrappers free the batch immediately;
+            // keep the accepted async submission alive so polling can drain
+            // those streams and report the task as FAILED.
+            LOG(ERROR) << submit_error
+                       << "; draining partially submitted MUSA batch";
+            return Status::OK();
+        }
+        finishTerminalTasksForPolling(slices);
         return Status::Context(submit_error);
     }
     rememberSliceDevices(slice_devices);
@@ -987,6 +1021,13 @@ Status MusaTransport::submitTransferTask(
     std::string submit_error;
     if (!submitBatchMemcpyByDevice(slices, srcs, dsts, sizes, slice_devices,
                                    submit_error)) {
+        rememberSliceDevices(slice_devices);
+        if (!slice_devices.empty()) {
+            LOG(ERROR) << submit_error
+                       << "; draining partially submitted MUSA batch";
+            return Status::OK();
+        }
+        finishTerminalTasksForPolling(slices);
         return Status::Context(submit_error);
     }
     rememberSliceDevices(slice_devices);
