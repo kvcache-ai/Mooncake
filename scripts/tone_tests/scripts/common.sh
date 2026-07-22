@@ -408,8 +408,8 @@ wait_gpu_idle() {
     local threshold_mb=${2:-1024}
 
     if ! command -v nvidia-smi >/dev/null 2>&1; then
-        echo "nvidia-smi not available, skipping GPU drain wait"
-        return 0
+        echo "ERROR: nvidia-smi not available; cannot verify GPU drain" >&2
+        return 1
     fi
 
     echo "Waiting for GPU memory to drain (threshold ${threshold_mb}MB, timeout ${max_seconds}s)..."
@@ -417,7 +417,10 @@ wait_gpu_idle() {
     local max_used=0
     while [ $elapsed -lt $max_seconds ]; do
         max_used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | sort -n | tail -n 1)
-        [ -z "$max_used" ] && { echo "nvidia-smi query failed, skipping GPU drain wait"; return 0; }
+        if ! [[ "$max_used" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: nvidia-smi query failed; cannot verify GPU drain" >&2
+            return 1
+        fi
         if [ "$max_used" -le "$threshold_mb" ]; then
             echo "GPU memory drained (max used ${max_used}MB)"
             return 0
@@ -429,34 +432,79 @@ wait_gpu_idle() {
     return 1
 }
 
-# Force-kill every host process still holding GPU memory. This catches leftovers
-# that an in-container pkill cannot reach: processes reparented to the host
-# (orphans) or in a different PID namespace. Only GPU-holding PIDs are targeted.
-force_kill_gpu_procs() {
-    command -v nvidia-smi >/dev/null 2>&1 || return 0
-    local pids
-    pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | tr -cd '0-9\n' | grep -E '^[0-9]+$' | sort -u)
-    [ -z "$pids" ] && return 0
-    echo "Force-killing GPU-holding PIDs: $(echo $pids | tr '\n' ' ')"
-    for pid in $pids; do
-        kill -9 "$pid" 2>/dev/null || true
+# Kill only GPU processes whose cgroup still identifies them as belonging to
+# the reused test container. Unknown or unrelated processes must be left alone;
+# the caller will quarantine the environment if GPU memory remains occupied.
+gpu_pid_belongs_to_container() {
+    local pid=$1
+    local container_id=$2
+    [ -r "/proc/${pid}/cgroup" ] && grep -Fq "$container_id" "/proc/${pid}/cgroup"
+}
+
+force_kill_container_gpu_procs() {
+    command -v nvidia-smi >/dev/null 2>&1 || return 1
+
+    local container_id
+    container_id=$(docker inspect --format '{{.Id}}' "${CONTAINER_NAME}" 2>/dev/null) || {
+        echo "ERROR: Cannot inspect container ${CONTAINER_NAME}; refusing to kill host GPU processes" >&2
+        return 1
+    }
+    if [ -z "$container_id" ]; then
+        echo "ERROR: Empty container ID for ${CONTAINER_NAME}; refusing to kill host GPU processes" >&2
+        return 1
+    fi
+
+    local gpu_pids
+    gpu_pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | tr -cd '0-9\n' | grep -E '^[0-9]+$' | sort -u)
+    [ -z "$gpu_pids" ] && return 0
+
+    local container_pids=""
+    local pid
+    for pid in $gpu_pids; do
+        if gpu_pid_belongs_to_container "$pid" "$container_id"; then
+            container_pids="${container_pids} ${pid}"
+        else
+            echo "WARNING: GPU PID ${pid} is not owned by ${CONTAINER_NAME}; leaving it untouched" >&2
+        fi
+    done
+
+    if [ -z "$container_pids" ]; then
+        echo "No container-owned GPU processes are safe to kill"
+        return 0
+    fi
+
+    echo "Force-killing container-owned GPU PIDs:${container_pids}"
+    for pid in $container_pids; do
+        if ! kill -9 "$pid" 2>/dev/null; then
+            echo "ERROR: Failed to kill container-owned GPU PID ${pid}" >&2
+            return 1
+        fi
     done
     sleep 3
 }
 
-# Fully clear GPU memory on the current node: graceful in-container kill first,
-# then host-level force-kill of any process still holding GPU memory.
+# Fully clear GPU memory on the current node: restart the container first, then
+# kill only container-owned GPU processes that survived the restart.
 # Restart the reused container to reset all in-container state (processes, GPU
 # memory, ERDMA queue-pairs / RDMA contexts). 'docker restart' keeps the
 # writable layer, so the mooncake wheel and ERDMA drivers are NOT reinstalled.
-# force_kill_gpu_procs stays as a fallback for leftovers restart cannot reclaim.
 drain_gpu_local() {
     echo "Restarting container ${CONTAINER_NAME} to reset GPU/ERDMA state..."
-    docker restart ${CONTAINER_NAME} >/dev/null 2>&1 || true
-    if ! wait_gpu_idle 60; then
-        force_kill_gpu_procs
-        wait_gpu_idle 45 || echo "WARNING: GPU still occupied after restart+force-kill (possible stuck/zombie process or GPU fault)"
+    if ! docker restart "${CONTAINER_NAME}" >/dev/null 2>&1; then
+        echo "ERROR: Failed to restart container ${CONTAINER_NAME}; environment is unhealthy" >&2
+        return 1
     fi
+
+    if ! wait_gpu_idle 60; then
+        echo "GPU memory remains occupied; checking for container-owned processes..."
+        force_kill_container_gpu_procs || return 1
+        if ! wait_gpu_idle 45; then
+            echo "ERROR: GPU still occupied after bounded cleanup; environment is unhealthy" >&2
+            return 1
+        fi
+    fi
+
+    return 0
 }
 
 # Between test cases in run-all the container is reused; reset in-container
@@ -464,16 +512,26 @@ drain_gpu_local() {
 # lightweight container restart (no wheel / ERDMA driver reinstall).
 drain_gpu_between_tests() {
     echo "===== Resetting environment between test cases ====="
-    drain_gpu_local
+    local reset_failed=false
+    if ! drain_gpu_local; then
+        echo "ERROR: Failed to reset the local test environment" >&2
+        reset_failed=true
+    fi
 
     if [ -n "$REMOTE_IP" ]; then
         echo "Resetting environment on remote node $REMOTE_IP..."
-        ${SSH_CMD} "$REMOTE_IP" "
+        if ! ${SSH_CMD} "$REMOTE_IP" "
             source ${REMOTE_TEST_DIR}/run/.shrc && \
             source ${REMOTE_TEST_DIR}/scripts/common.sh && \
             drain_gpu_local
-        " 2>/dev/null || true
+        "; then
+            echo "ERROR: Failed to reset the remote test environment on ${REMOTE_IP}" >&2
+            reset_failed=true
+        fi
     fi
+
+    $reset_failed && return 1
+    return 0
 }
 
 setup_node_env() {
