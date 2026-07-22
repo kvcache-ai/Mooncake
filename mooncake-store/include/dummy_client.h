@@ -178,6 +178,8 @@ class DummyClient : public PyClient {
 
     tl::expected<QueryTaskResponse, ErrorCode> query_task(const UUID &task_id);
 
+    std::optional<BufferHandle> allocate_client_buffer(size_t size) override;
+
    private:
     ErrorCode connect(const std::string &server_address);
 
@@ -278,6 +280,7 @@ class DummyClient : public PyClient {
     // For shared memory management
     ShmHelper *shm_helper_ = nullptr;
     std::string ipc_socket_path_;
+    void *local_buffer_base_ = nullptr;
 
     // Hot cache shm mapping (obtained from real client via IPC)
     void *hot_cache_base_ = nullptr;
