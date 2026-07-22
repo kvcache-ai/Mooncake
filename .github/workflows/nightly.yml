@@ -19,13 +19,12 @@ concurrency:
   cancel-in-progress: true
 
 # ── Workflow Design Notes ──────────────────────────────────────────────────────
-# 1. version-stamp computes a nightly version string for artifact naming and
-#    traceability (e.g. "0.8.0.dev20250716"). The actual wheel package version
-#    is determined by pyproject.toml inside the reusable _build-wheel.yaml.
-# 2. Build jobs use the reusable _build-wheel.yaml which does its own checkout
-#    and derives VERSION from GITHUB_REF_NAME / pyproject.toml.
+# 1. version-stamp computes a forward-looking nightly version (next patch + .devYYYYMMDD)
+#    that sorts AFTER the current release per PEP 440, e.g. "0.3.12.dev20260720".
+# 2. Build jobs pass the nightly version via `version-override` to _build-wheel.yaml
+#    so each wheel is stamped with the correct dev version for TestPyPI.
 # 3. publish-testpypi uploads all nightly-* artifacts to TestPyPI.
-# 4. nightly-gate aggregates results; notify-failure files an issue on failure.
+# 4. nightly-gate aggregates ALL build + test results; notify-failure files an issue.
 # ──────────────────────────────────────────────────────────────────────────────
 
 env:
@@ -38,15 +37,17 @@ jobs:
       nightly_version: ${{ steps.version.outputs.nightly_version }}
     steps:
       - uses: actions/checkout@v4
-      # NOTE: nightly_version is used for artifact naming and traceability.
-      # Wheel package version comes from pyproject.toml via the reusable workflow.
-      # TODO: Add a `version-override` input to `_build-wheel.yaml` for proper
-      #       nightly versioning so downstream builds can stamp dev versions.
       - name: Compute nightly version
         id: version
         run: |
           BASE_VERSION=$(grep -Po '(?<=^version = ")[^"]+' mooncake-wheel/pyproject.toml)
-          NIGHTLY_VERSION="${BASE_VERSION}.dev$(date -u +%Y%m%d)"
+          # Strip .postN suffix if present, then bump patch for forward-looking version
+          CLEAN_VERSION=$(echo "$BASE_VERSION" | sed 's/\.post[0-9]*$//')
+          MAJOR=$(echo "$CLEAN_VERSION" | cut -d. -f1)
+          MINOR=$(echo "$CLEAN_VERSION" | cut -d. -f2)
+          PATCH=$(echo "$CLEAN_VERSION" | cut -d. -f3)
+          NEXT_PATCH=$((PATCH + 1))
+          NIGHTLY_VERSION="${MAJOR}.${MINOR}.${NEXT_PATCH}.dev$(date -u +%Y%m%d)"
           echo "nightly_version=$NIGHTLY_VERSION" >> "$GITHUB_OUTPUT"
           echo "Nightly version: $NIGHTLY_VERSION"
 
@@ -66,6 +67,7 @@ jobs:
         -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON
         -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
       artifact-prefix: nightly-cuda128-x86
+      version-override: ${{ needs.version-stamp.outputs.nightly_version }}
 
   build-cuda128-arm64:
     needs: version-stamp
@@ -80,6 +82,7 @@ jobs:
         -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=OFF
         -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
       artifact-prefix: nightly-cuda128-arm64
+      version-override: ${{ needs.version-stamp.outputs.nightly_version }}
 
   build-cuda13-x86:
     needs: version-stamp
@@ -98,6 +101,7 @@ jobs:
         -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON
         -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
       artifact-prefix: nightly-cuda13-x86
+      version-override: ${{ needs.version-stamp.outputs.nightly_version }}
 
   publish-testpypi:
     needs: [version-stamp, build-cuda128-x86, build-cuda128-arm64, build-cuda13-x86]
@@ -106,7 +110,6 @@ jobs:
     environment: nightly
     permissions:
       contents: read
-      id-token: write
     steps:
       - name: Log nightly version
         run: |
@@ -124,6 +127,11 @@ jobs:
           find dist-all -name "*.whl" -exec cp {} dist-publish/ \;
           echo "Collected wheels:"
           ls -la dist-publish/
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
 
       - name: Install twine
         run: pip install twine
@@ -163,7 +171,7 @@ jobs:
           sudo mv etcd-v3.6.1-linux-amd64/etcd* /usr/local/bin/
           etcd --advertise-client-urls http://127.0.0.1:2379 --listen-client-urls http://127.0.0.1:2379 &
           sleep 3
-          etcdctl --endpoints=http://127.0.0.1:2379 endpoint health
+          ETCDCTL_API=3 etcdctl --endpoints=http://127.0.0.1:2379 endpoint health
 
       - name: Free up disk space
         run: |
@@ -229,7 +237,7 @@ jobs:
           export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
           MC_METADATA_SERVER=http://127.0.0.1:8080/metadata \
           DEFAULT_KV_LEASE_TTL=500 \
-            ctest -j --output-on-failure
+            ctest --parallel $(nproc) --output-on-failure
 
       - name: Run Mooncake Store Rust smoke test
         run: |
@@ -294,18 +302,35 @@ jobs:
 
   nightly-gate:
     if: always()
-    needs: [publish-testpypi, nightly-test]
+    needs: [build-cuda128-x86, build-cuda128-arm64, build-cuda13-x86, publish-testpypi, nightly-test]
     runs-on: ubuntu-22.04
     steps:
       - name: Check results
         run: |
           echo "=== Nightly Gate Summary ==="
+          echo "Build CUDA 12.8 x86: ${{ needs.build-cuda128-x86.result }}"
+          echo "Build CUDA 12.8 arm64: ${{ needs.build-cuda128-arm64.result }}"
+          echo "Build CUDA 13 x86: ${{ needs.build-cuda13-x86.result }}"
           echo "Publish: ${{ needs.publish-testpypi.result }}"
           echo "Test: ${{ needs.nightly-test.result }}"
+          # Fail if any build job did not succeed
+          if [ "${{ needs.build-cuda128-x86.result }}" != "success" ]; then
+            echo "::error::Build CUDA 12.8 x86 failed!"
+            exit 1
+          fi
+          if [ "${{ needs.build-cuda128-arm64.result }}" != "success" ]; then
+            echo "::error::Build CUDA 12.8 arm64 failed!"
+            exit 1
+          fi
+          if [ "${{ needs.build-cuda13-x86.result }}" != "success" ]; then
+            echo "::error::Build CUDA 13 x86 failed!"
+            exit 1
+          fi
           if [ "${{ needs.nightly-test.result }}" != "success" ]; then
             echo "::error::Nightly tests failed!"
             exit 1
           fi
+          # publish-testpypi may be skipped (skip_publish=true) — only fail on actual failure
           if [ "${{ needs.publish-testpypi.result }}" == "failure" ]; then
             echo "::error::Nightly publish failed!"
             exit 1
@@ -323,6 +348,25 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
+            const labelName = 'nightly-failure';
+            // Ensure the label exists
+            try {
+              await github.rest.issues.getLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: labelName,
+              });
+            } catch (e) {
+              if (e.status === 404) {
+                await github.rest.issues.createLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: labelName,
+                  color: 'd73a4a',
+                  description: 'Nightly CI workflow failure',
+                });
+              }
+            }
             const title = `Nightly build/test failure - ${new Date().toISOString().slice(0, 10)}`;
             const body = [
               '## Nightly Failure Report',
@@ -338,5 +382,5 @@ jobs:
               repo: context.repo.repo,
               title,
               body,
-              labels: ['nightly-failure'],
+              labels: [labelName],
             });
