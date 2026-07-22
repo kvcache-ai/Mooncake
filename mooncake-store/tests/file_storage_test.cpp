@@ -534,6 +534,23 @@ TEST_F(FileStorageTest, OffloadObjects_deferred_tail_tasks_carried) {
     EXPECT_EQ(carried_user_keys(carry),
               (std::unordered_set<std::string>{"d1", "d2", "d3"}));
     ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 3);
+
+    // Phase 4 (re-drain collision semantics): a carried key re-PUT with a
+    // DIFFERENT size while deferred. The fresh drain must win entirely —
+    // pooled copy (stale size) removed, fresh task carried — rather than
+    // the fresh task winning the task map while the stale size wins the
+    // packing accounting.
+    OffloadTaskItem d2_fresh{.tenant_id = "default", .key = "d2", .size = 2};
+    ASSERT_TRUE(FileStorageOffloadObjects(fileStorage, {d2_fresh}));
+    carry = GetDeferredTaskByStorageKey(fileStorage);
+    ASSERT_EQ(carry.size(), 3u);
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 3);
+    for (const auto& [_, task] : carry) {
+        if (task.key == "d2") {
+            EXPECT_EQ(task.size, 2) << "fresh drained task must supersede "
+                                       "the stale carried/pooled copy";
+        }
+    }
 }
 
 TEST_F(FileStorageTest, DefaultValuesWhenNoEnvSet) {

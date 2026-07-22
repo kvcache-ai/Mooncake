@@ -2271,6 +2271,12 @@ void BucketStorageBackend::ClearUngroupedOffloadingObjects() {
     ungrouped_offloading_objects_.clear();
 }
 
+bool BucketStorageBackend::RemoveUngroupedOffloadingObject(
+    const std::string& key) {
+    MutexLocker locker(&offloading_mutex_);
+    return ungrouped_offloading_objects_.erase(key) > 0;
+}
+
 size_t BucketStorageBackend::UngroupedOffloadingObjectsSize() const {
     MutexLocker locker(&offloading_mutex_);
     return ungrouped_offloading_objects_.size();

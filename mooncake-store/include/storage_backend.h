@@ -871,6 +871,15 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     void ClearUngroupedOffloadingObjects();
 
+    /**
+     * @brief Remove a single key from the ungrouped (deferred) pool.
+     * Used when a deferred key is re-drained before re-emission: the caller
+     * discards the pooled copy (stale size) so the freshly drained entry
+     * flows through grouping as new input with current size accounting.
+     * @return true if the key was present and removed.
+     */
+    bool RemoveUngroupedOffloadingObject(const std::string& key);
+
     size_t UngroupedOffloadingObjectsSize() const;
 
     /**
