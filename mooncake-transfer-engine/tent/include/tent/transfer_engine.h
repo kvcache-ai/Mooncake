@@ -174,6 +174,9 @@ void tent_free_notifs(tent_notifi_info* info);
 int tent_task_status(tent_engine_t engine, tent_batch_id_t batch_id,
                      size_t task_id, tent_status_t* status);
 
+int tent_cancel_task(tent_engine_t engine, tent_batch_id_t batch_id,
+                     size_t task_id);
+
 int tent_overall_status(tent_engine_t engine, tent_batch_id_t batch_id,
                         tent_status_t* status);
 
@@ -200,6 +203,17 @@ int tent_register_memory_batch_ex(tent_engine_t engine, void** addrs,
 
 int tent_task_status_list(tent_engine_t engine, tent_batch_id_t batch_id,
                           tent_status_t* statuses, size_t* count);
+
+struct tent_nic_load_stat {
+    char device_name[64];
+    uint64_t inflight_bytes;
+    double ewma_bandwidth_bps;
+};
+
+typedef struct tent_nic_load_stat tent_nic_load_stat_t;
+
+int tent_get_nic_load_stats(tent_engine_t engine, tent_nic_load_stat_t* stats,
+                            size_t* count);
 
 #ifdef __cplusplus
 }
@@ -299,6 +313,11 @@ class TransferEngine {
                           const std::vector<Request>& request_list,
                           const Notification& notifi);
 
+    // Best-effort task cancellation. Work that has not reached the transport
+    // is prevented from being submitted. Device work already posted may still
+    // complete, so callers must continue polling for a terminal status.
+    Status cancelTransfer(BatchID batch_id, size_t task_id);
+
     Status sendNotification(SegmentID target_id, const Notification& notifi);
 
     Status receiveNotification(std::vector<Notification>& notifi_list);
@@ -320,6 +339,8 @@ class TransferEngine {
     // wait for completion must invoke it in a loop. PENDING means "make
     // progress later"; terminal states (COMPLETED/FAILED) will not be revived.
     Status progressBatch(BatchID batch_id, TransferStatus& overall_status);
+
+    Status getNicLoadStats(std::vector<NicLoadStats>& stats) const;
 
    private:
     std::unique_ptr<TransferEngineImpl> impl_;

@@ -79,6 +79,10 @@ class RdmaTransport : public Transport {
     virtual Status getTransferStatus(SubBatchRef batch, int task_id,
                                      TransferStatus& status);
 
+    bool supportsCancellation() const override { return true; }
+
+    Status cancelTransferTask(SubBatchRef batch, int task_id) override;
+
     virtual Status addMemoryBuffer(BufferDesc& desc,
                                    const MemoryOptions& options);
 
@@ -90,6 +94,9 @@ class RdmaTransport : public Transport {
     bool warmupMemory(void* addr, size_t length) override;
 
     virtual const char* getName() const { return "rdma"; }
+
+    double getEstimatedBandwidth() const override;
+    Status getNicLoadStats(std::vector<NicLoadStats>& stats) const override;
 
     virtual bool supportNotification() const override { return true; }
 
