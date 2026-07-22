@@ -1,0 +1,50 @@
+{
+  "conductor": {
+    "address": "http://127.0.0.1:13333",
+    "query_timeout_seconds": 1.0,
+    "registration_timeout_seconds": 5.0
+  },
+  "prefill": {
+    "config": {
+      "modelname": "Qwen/Qwen2.5-7B-Instruct",
+      "block_size": 16,
+      "tenant_id": "default",
+      "lora_name": "",
+      "hash_profile": {
+        "strategy": "vllm_v1",
+        "algorithm": "sha256_cbor",
+        "python_hash_seed": "0",
+        "index_projection": "low64_be"
+      }
+    },
+    "instances": [
+      {
+        "instance_id": "prefill-a",
+        "http_endpoint": "http://127.0.0.1:8100",
+        "registrations": [
+          {
+            "endpoint": "tcp://127.0.0.1:5557",
+            "dp_rank": 0
+          }
+        ]
+      },
+      {
+        "instance_id": "prefill-b",
+        "http_endpoint": "http://127.0.0.1:8101",
+        "registrations": [
+          {
+            "endpoint": "tcp://127.0.0.1:5559",
+            "dp_rank": 0
+          }
+        ]
+      }
+    ]
+  },
+  "decode": {
+    "instances": [
+      {
+        "http_endpoint": "http://127.0.0.1:8200"
+      }
+    ]
+  }
+}
