@@ -9,6 +9,7 @@ import time
 import numpy as np
 import pytest
 
+import mooncake.structured_object_store as sos
 from mooncake.structured_object_store import (
     BundleTransferPolicy,
     FieldSchema,
@@ -257,6 +258,23 @@ class FakeBufferPool:
         self.acquire_count += 1
         self.acquire_sizes.append(size)
         return FakeLease(self, size)
+
+
+class FailingBatchPutStore(InMemoryStore):
+    def __init__(self, *, fail_on_call: int) -> None:
+        super().__init__()
+        self.fail_on_call = fail_on_call
+
+    def batch_put_from(
+        self, keys: list[str], buffer_ptrs: list[int], sizes: list[int]
+    ) -> list[int]:
+        self.batch_put_from_calls += 1
+        if self.batch_put_from_calls == self.fail_on_call:
+            return [-1 for _key in keys]
+        results: list[int] = []
+        for key, ptr, size in zip(keys, buffer_ptrs, sizes):
+            results.append(self.put(key, ctypes.string_at(ptr, size)))
+        return results
 
 
 class GetOnlyStore(InMemoryStore):
@@ -739,6 +757,56 @@ def test_structured_object_ndarray_read_can_use_buffer_pool() -> None:
     assert pool.release_count == 1
     MooncakeBundleTransfer.release_result(result.objects)
     assert pool.release_count == 1
+
+
+def test_structured_object_multi_buffer_payload_uses_pool_batch_put() -> None:
+    pool = FakeBufferPool()
+    store, transfer = make_transfer(buffer_pool=pool)
+    parts = [bytearray(b"ab"), bytearray(b"cd"), bytearray(b"ef")]
+    payload = StructuredObjectPayload(
+        metadata={},
+        buffers={
+            "raw": sos._MultiBufferPayload(
+                buffers=tuple(memoryview(part) for part in parts),
+                owners=tuple(parts),
+            )
+        },
+    )
+
+    ref = transfer.put_structured_object(payload, chunk_bytes=4)
+    result = transfer.materialize(transfer.read_spec(ref))
+
+    raw = result.objects["raw"]
+    raw_bytes = raw if isinstance(raw, bytes) else raw.tobytes()
+    assert raw_bytes == b"abcdef"
+    assert pool.acquire_sizes == [4, 2, 6]
+    assert pool.release_count == 2
+    assert store.batch_put_from_calls == 2
+
+    MooncakeBundleTransfer.release_result(result.objects)
+    assert pool.release_count == 3
+
+
+def test_structured_object_multi_buffer_put_cleans_all_chunk_keys_on_failure() -> None:
+    pool = FakeBufferPool()
+    store = FailingBatchPutStore(fail_on_call=2)
+    transfer = MooncakeBundleTransfer(store, key_prefix="test", buffer_pool=pool)
+    parts = [bytearray(b"ab"), bytearray(b"cd"), bytearray(b"ef")]
+    payload = StructuredObjectPayload(
+        metadata={},
+        buffers={
+            "raw": sos._MultiBufferPayload(
+                buffers=tuple(memoryview(part) for part in parts),
+                owners=tuple(parts),
+            )
+        },
+    )
+
+    with pytest.raises(RuntimeError):
+        transfer.put_structured_object(payload, chunk_bytes=2)
+
+    assert store.objects == {}
+    assert pool.release_count == 2
 
 
 def test_structured_object_slice_member_uses_partial_range_reads() -> None:
@@ -2855,6 +2923,25 @@ def test_dataproto_helper_object_non_tensor_codecs_roundtrip() -> None:
     ]
     assert result["non_tensor_batch"]["blob"].tolist() == [b"a", None, b"bc", b"def"]
     assert result["non_tensor_batch"]["nullable_int"].tolist() == [1, None, 3, 4]
+
+
+def test_dataproto_helper_typed_ragged_uses_multi_buffer_put() -> None:
+    pool = FakeBufferPool()
+    _store, transfer = make_transfer(buffer_pool=pool)
+    rows = np.empty(3, dtype=object)
+    rows[:] = [
+        np.asarray([1, 2], dtype=np.int32),
+        None,
+        np.asarray([3, 4, 5], dtype=np.int32),
+    ]
+    data = SimpleDataProto(non_tensor_batch={"tokens": rows})
+
+    ref = transfer.put_dataproto(data)
+    result = transfer.get_dataproto(ref)
+
+    assert ref.encoded_non_tensor["tokens"]["codec"] == "typed_ragged"
+    assert result["non_tensor_batch"]["tokens"].tolist() == [[1, 2], None, [3, 4, 5]]
+    assert rows[0].nbytes + rows[2].nbytes in pool.acquire_sizes
 
 
 def test_dataproto_helper_rejects_unsupported_object_non_tensor() -> None:
