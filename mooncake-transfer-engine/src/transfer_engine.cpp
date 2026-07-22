@@ -333,6 +333,7 @@ std::string TransferEngine::showLinks(bool json) const {
 #include "tent/common/config.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 #include <limits>
 #include <mutex>
@@ -597,10 +598,21 @@ void detachShutdownToken(std::shared_ptr<ShutdownToken>& token) {
     token.reset();
 }
 
+bool shouldUseTentCompatibilityMode() {
+    if (getenv("MC_USE_TENT")) return true;
+    if (getenv("MC_USE_TEV1")) {
+        LOG(WARNING)
+            << "MC_USE_TEV1 is a deprecated alias for TENT compatibility "
+               "mode; use MC_USE_TENT=1 for forward compatibility";
+        return true;
+    }
+    return false;
+}
+
 }  // namespace
 
 TransferEngine::TransferEngine(bool auto_discover) {
-    if (getenv("MC_USE_TENT") || getenv("MC_USE_TEV1")) {
+    if (shouldUseTentCompatibilityMode()) {
         use_tent_ = true;
     }
     if (!use_tent_) {
@@ -610,7 +622,7 @@ TransferEngine::TransferEngine(bool auto_discover) {
 
 TransferEngine::TransferEngine(bool auto_discover,
                                const std::vector<std::string>& filter) {
-    if (getenv("MC_USE_TENT") || getenv("MC_USE_TEV1")) {
+    if (shouldUseTentCompatibilityMode()) {
         use_tent_ = true;
     }
     if (!use_tent_) {

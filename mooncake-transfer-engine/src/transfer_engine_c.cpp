@@ -47,7 +47,12 @@ transfer_engine_t createTransferEngine(const char *metadata_conn_string,
 int discoverTopology(transfer_engine_t engine) {
     TransferEngine *native = (TransferEngine *)engine;
     if (!native) return ERR_INVALID_ARGUMENT;
-    if (native->isUsingTent()) return 0;
+    if (native->isUsingTent()) {
+        LOG(WARNING)
+            << "discoverTopology is a compatibility no-op in TENT mode; "
+               "TENT discovers topology from config and platform probes";
+        return 0;
+    }
     auto topology = native->getLocalTopology();
     if (!topology) return ERR_CONTEXT;
     return topology->discover({});
@@ -55,6 +60,7 @@ int discoverTopology(transfer_engine_t engine) {
 
 int getLocalIpAndPort(transfer_engine_t engine, char *buf_out, size_t buf_len) {
     TransferEngine *native = (TransferEngine *)engine;
+    if (!native || !buf_out || buf_len == 0) return ERR_INVALID_ARGUMENT;
     auto str = native->getLocalIpAndPort();
     snprintf(buf_out, buf_len, "%s", str.c_str());
     return 0;
@@ -63,11 +69,13 @@ int getLocalIpAndPort(transfer_engine_t engine, char *buf_out, size_t buf_len) {
 transport_t installTransport(transfer_engine_t engine, const char *proto,
                              void **args) {
     TransferEngine *native = (TransferEngine *)engine;
+    if (!native || !proto) return nullptr;
     return (transport_t)native->installTransport(proto, args);
 }
 
 int uninstallTransport(transfer_engine_t engine, const char *proto) {
     TransferEngine *native = (TransferEngine *)engine;
+    if (!native || !proto) return ERR_INVALID_ARGUMENT;
     return native->uninstallTransport(proto);
 }
 
@@ -113,19 +121,26 @@ segment_id_t openSegmentNoCache(transfer_engine_t engine,
 
 int closeSegment(transfer_engine_t engine, segment_id_t segment_id) {
     TransferEngine *native = (TransferEngine *)engine;
+    if (!native) return ERR_INVALID_ARGUMENT;
     return native->closeSegment(segment_id);
 }
 
 int warmupEfaSegment(transfer_engine_t engine, const char *segment_name) {
-#ifdef USE_EFA
     TransferEngine *native = (TransferEngine *)engine;
+    if (!native) return ERR_INVALID_ARGUMENT;
+    if (native->isUsingTent()) {
+        LOG(WARNING)
+            << "warmupEfaSegment is a compatibility no-op in TENT mode; "
+               "EFA warmup is classic-TE only";
+        return 0;
+    }
+#ifdef USE_EFA
     auto *t = native->getTransport("efa");
     if (!t) return 0;  // Non-EFA build or EFA not installed; nothing to do.
     auto *efa = dynamic_cast<EfaTransport *>(t);
     if (!efa) return 0;
     return efa->warmupSegment(segment_name ? segment_name : "");
 #else
-    (void)engine;
     (void)segment_name;
     return 0;
 #endif
@@ -133,18 +148,21 @@ int warmupEfaSegment(transfer_engine_t engine, const char *segment_name) {
 
 int removeLocalSegment(transfer_engine_t engine, const char *segment_name) {
     TransferEngine *native = (TransferEngine *)engine;
+    if (!native || !segment_name) return ERR_INVALID_ARGUMENT;
     return native->removeLocalSegment(segment_name);
 }
 
 int registerLocalMemory(transfer_engine_t engine, void *addr, size_t length,
                         const char *location, int remote_accessible) {
     TransferEngine *native = (TransferEngine *)engine;
+    if (!native || !addr) return ERR_INVALID_ARGUMENT;
     return native->registerLocalMemory(addr, length, location,
                                        remote_accessible, true);
 }
 
 int unregisterLocalMemory(transfer_engine_t engine, void *addr) {
     TransferEngine *native = (TransferEngine *)engine;
+    if (!native || !addr) return ERR_INVALID_ARGUMENT;
     return native->unregisterLocalMemory(addr);
 }
 
@@ -152,6 +170,8 @@ int registerLocalMemoryBatch(transfer_engine_t engine,
                              buffer_entry_t *buffer_list, size_t buffer_len,
                              const char *location) {
     TransferEngine *native = (TransferEngine *)engine;
+    if (!native || (buffer_len > 0 && !buffer_list))
+        return ERR_INVALID_ARGUMENT;
     std::vector<BufferEntry> native_buffer_list;
     for (size_t i = 0; i < buffer_len; ++i) {
         BufferEntry entry;
@@ -165,6 +185,7 @@ int registerLocalMemoryBatch(transfer_engine_t engine,
 int unregisterLocalMemoryBatch(transfer_engine_t engine, void **addr_list,
                                size_t addr_len) {
     TransferEngine *native = (TransferEngine *)engine;
+    if (!native || (addr_len > 0 && !addr_list)) return ERR_INVALID_ARGUMENT;
     std::vector<void *> native_addr_list;
     for (size_t i = 0; i < addr_len; ++i)
         native_addr_list.push_back(addr_list[i]);
@@ -173,12 +194,14 @@ int unregisterLocalMemoryBatch(transfer_engine_t engine, void **addr_list,
 
 batch_id_t allocateBatchID(transfer_engine_t engine, size_t batch_size) {
     TransferEngine *native = (TransferEngine *)engine;
+    if (!native) return INVALID_BATCH;
     return (batch_id_t)native->allocateBatchID(batch_size);
 }
 
 int submitTransfer(transfer_engine_t engine, batch_id_t batch_id,
                    struct transfer_request *entries, size_t count) {
     TransferEngine *native = (TransferEngine *)engine;
+    if (!native || (count > 0 && !entries)) return ERR_INVALID_ARGUMENT;
     std::vector<Transport::TransferRequest> native_entries;
     native_entries.resize(count);
     for (size_t index = 0; index < count; index++) {
@@ -198,6 +221,9 @@ int submitTransferWithNotify(transfer_engine_t engine, batch_id_t batch_id,
                              struct transfer_request *entries, size_t count,
                              notify_msg_t notify_msg) {
     TransferEngine *native = (TransferEngine *)engine;
+    if (!native || (count > 0 && !entries) || !notify_msg.name ||
+        !notify_msg.msg)
+        return ERR_INVALID_ARGUMENT;
     std::vector<Transport::TransferRequest> native_entries;
     native_entries.resize(count);
     for (size_t index = 0; index < count; index++) {
@@ -219,6 +245,7 @@ int submitTransferWithNotify(transfer_engine_t engine, batch_id_t batch_id,
 int getTransferStatus(transfer_engine_t engine, batch_id_t batch_id,
                       size_t task_id, struct transfer_status *status) {
     TransferEngine *native = (TransferEngine *)engine;
+    if (!native || !status) return ERR_INVALID_ARGUMENT;
     Transport::TransferStatus native_status;
     Status s = native->getTransferStatus((Transport::BatchID)batch_id, task_id,
                                          native_status);
@@ -231,6 +258,7 @@ int getTransferStatus(transfer_engine_t engine, batch_id_t batch_id,
 
 notify_msg_t *getNotifsFromEngine(transfer_engine_t engine, int *size) {
     TransferEngine *native = (TransferEngine *)engine;
+    if (!native || !size) return nullptr;
     std::vector<TransferMetadata::NotifyDesc> notifies_desc;
     native->getNotifies(notifies_desc);
     *size = notifies_desc.size();
@@ -254,6 +282,7 @@ notify_msg_t *getNotifsFromEngine(transfer_engine_t engine, int *size) {
 }
 
 int freeNotifsMsgBuf(notify_msg_t *msg, int size) {
+    if (!msg && size > 0) return ERR_INVALID_ARGUMENT;
     for (int i = 0; i < size; i++) {
         if (msg[i].name) free(msg[i].name);
         if (msg[i].msg) free(msg[i].msg);
@@ -265,6 +294,8 @@ int freeNotifsMsgBuf(notify_msg_t *msg, int size) {
 int genNotifyInEngine(transfer_engine_t engine, uint64_t target_id,
                       notify_msg_t notify_msg) {
     TransferEngine *native = (TransferEngine *)engine;
+    if (!native || !notify_msg.name || !notify_msg.msg)
+        return ERR_INVALID_ARGUMENT;
     TransferMetadata::NotifyDesc notify;
     notify.name.assign(notify_msg.name);
     notify.notify_msg.assign(notify_msg.msg);
@@ -273,17 +304,20 @@ int genNotifyInEngine(transfer_engine_t engine, uint64_t target_id,
 
 int freeBatchID(transfer_engine_t engine, batch_id_t batch_id) {
     TransferEngine *native = (TransferEngine *)engine;
+    if (!native) return ERR_INVALID_ARGUMENT;
     Status s = native->freeBatchID(batch_id);
     return (int)s.code();
 }
 
 int syncSegmentCache(transfer_engine_t engine) {
     TransferEngine *native = (TransferEngine *)engine;
+    if (!native) return ERR_INVALID_ARGUMENT;
     return native->syncSegmentCache();
 }
 
 void enableGracefulShutdown(transfer_engine_t engine) {
     TransferEngine *native = (TransferEngine *)engine;
+    if (!native) return;
     native->enableGracefulShutdown();
 }
 

@@ -1590,6 +1590,7 @@ Status TransferEngineImpl::commitPreparedSubmit(
         merged_task_id_map[merged_task_id] = task;
     }
 
+    Status overall_status = Status::OK();
     for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
         if (classified_request_list[type].empty()) continue;
         auto& transport = transport_list_[type];
@@ -1608,6 +1609,7 @@ Status TransferEngineImpl::commitPreparedSubmit(
         auto status = transport->submitTransferTasks(
             sub_batch, classified_request_list[type]);
         if (!status.ok()) {
+            if (overall_status.ok()) overall_status = status;
             for (auto& task_id : task_id_list[type])
                 batch->task_list[task_id].type = UNSPEC;
         } else {
@@ -1617,7 +1619,7 @@ Status TransferEngineImpl::commitPreparedSubmit(
         }
     }
 
-    return Status::OK();
+    return overall_status;
 }
 
 Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
@@ -1899,6 +1901,11 @@ Status TransferEngineImpl::submitTransfer(
     CHECK_STATUS(retainBatch(batch_id, batch));
     BatchRef batch_ref(*this, batch);
     const size_t start_task_id = batch_ref.get()->task_list.size();
+    if (start_task_id > batch_ref.get()->max_size ||
+        request_list.size() > batch_ref.get()->max_size - start_task_id) {
+        return Status::TooManyRequests(
+            "batch public task capacity exceeded" LOC_MARK);
+    }
     PreparedSubmit prepared;
     CHECK_STATUS(prepareSubmit(batch_ref.get(), request_list, prepared));
 

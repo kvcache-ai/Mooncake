@@ -33,6 +33,7 @@
 #include "tent/common/types.h"
 #include "tent/transfer_engine.h"
 #include "tent/transport/rdma/connect_pause_tracker.h"
+#include "tent/transport/rdma/context.h"
 #include "tent/transport/rdma/params.h"
 #include "tent/transport/rdma/rdma_gid_probe.h"
 #include "tent/transport/rdma/rdma_transport.h"
@@ -142,6 +143,26 @@ TEST(RdmaParamsTest, DefaultsKeepLaneCountsAligned) {
     EXPECT_TRUE(params.endpoint.mlx5_qp_udp_sports.empty());
     EXPECT_FALSE(params.endpoint.mlx5_qp_lag_port_balance);
     EXPECT_FALSE(params.workers.track_posted_slices);
+}
+
+TEST(RdmaParamsTest, RejectsEmptyCompletionResourcesBeforeOpeningDevice) {
+    RdmaTransport transport;
+
+    {
+        auto params = std::make_shared<RdmaParams>();
+        params->device.num_cq_list = 0;
+        params->device.num_comp_channels = 1;
+        RdmaContext context(transport);
+        EXPECT_NE(context.construct("invalid-rdma-device", params), 0);
+    }
+
+    {
+        auto params = std::make_shared<RdmaParams>();
+        params->device.num_cq_list = 1;
+        params->device.num_comp_channels = 0;
+        RdmaContext context(transport);
+        EXPECT_NE(context.construct("invalid-rdma-device", params), 0);
+    }
 }
 
 TEST(RdmaGidProbeTest, PrefersNetworkBackedRoutableCandidate) {

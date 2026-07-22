@@ -317,6 +317,29 @@ TEST(TransferEngineConfigOverrideTest,
         config.get("transports/rdma/workers/track_posted_slices", false));
 }
 
+TEST(TransferEngineConfigOverrideTest,
+     LegacyEndpointStoreTypeEnvLoadsIntoTentConfig) {
+    EnvVarGuard guard("MC_ENDPOINT_STORE_TYPE", "FIFO");
+
+    Config config;
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+
+    EXPECT_EQ(config.get("transports/rdma/endpoint/endpoint_store_type",
+                         std::string("")),
+              "FIFO");
+}
+
+TEST(TransferEngineConfigOverrideTest, LegacyFragmentRatioEnvLoadsFragmentLimit) {
+    EnvVarGuard slice_guard("MC_SLICE_SIZE", "1024");
+    EnvVarGuard fragment_guard("MC_FRAGMENT_RATIO", "4");
+
+    Config config;
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+
+    EXPECT_EQ(config.get("transports/rdma/workers/block_size", 0), 1024);
+    EXPECT_EQ(config.get("transports/rdma/workers/fragment_limit", 0), 256);
+}
+
 TEST(TransferEngineConfigOverrideTest, LegacyMlx5UdpSportsDropsInvalidPorts) {
     EnvVarGuard guard("MC_MLX5_QP_UDP_SPORTS",
                       "40000, invalid, 0, 65536, 40001");

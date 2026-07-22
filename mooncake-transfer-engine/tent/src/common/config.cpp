@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <sstream>
 
 namespace mooncake {
@@ -101,6 +102,48 @@ static inline void setPortArrayConfig(Config& config,
     if (!ports.empty()) config.set(config_key, ports);
 }
 
+static inline void warnUnsupportedLegacyEnv(const std::string& env_key,
+                                            const std::string& reason) {
+    const char* val = std::getenv(env_key.c_str());
+    if (!val) return;
+    LOG(WARNING) << env_key << " is a classic Transfer Engine setting and is "
+                 << "ignored by TENT compatibility mode: " << reason;
+}
+
+static inline void warnDisabledParallelRegMr() {
+    const char* val = std::getenv("MC_ENABLE_PARALLEL_REG_MR");
+    if (!val) return;
+    std::string lower_val(val);
+    std::transform(lower_val.begin(), lower_val.end(), lower_val.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    if (lower_val == "0" || lower_val == "false" || lower_val == "off") {
+        LOG(WARNING)
+            << "MC_ENABLE_PARALLEL_REG_MR=OFF is ignored by TENT "
+               "compatibility mode; TENT enables parallel RDMA memory "
+               "registration by default";
+    }
+}
+
+static inline void setFragmentRatioConfig(Config& config) {
+    const char* val = std::getenv("MC_FRAGMENT_RATIO");
+    if (!val) return;
+
+    char* end = nullptr;
+    unsigned long ratio = std::strtoul(val, &end, 10);
+    const auto block_size = static_cast<unsigned long>(
+        config.get("transports/rdma/workers/block_size", 65536));
+    if (end != val && *end == '\0' && ratio > 0 && ratio < block_size) {
+        config.set("transports/rdma/workers/fragment_limit",
+                   block_size / ratio);
+        return;
+    }
+
+    LOG(WARNING)
+        << "Ignore value from environment variable MC_FRAGMENT_RATIO and "
+           "set TENT RDMA fragment_limit to block_size / 4";
+    config.set("transports/rdma/workers/fragment_limit", block_size / 4);
+}
+
 Status ConfigHelper::loadFromEnv(Config& config) {
     const char* conf_str = std::getenv("MC_TENT_CONF");
     Status status = Status::OK();
@@ -146,6 +189,8 @@ Status ConfigHelper::loadFromEnv(Config& config) {
     setConfig(config, "MC_MAX_CQE_PER_CTX", "transports/rdma/device/max_cqe");
     setConfig(config, "MC_MAX_EP_PER_CTX",
               "transports/rdma/endpoint/endpoint_store_cap");
+    setConfig(config, "MC_ENDPOINT_STORE_TYPE",
+              "transports/rdma/endpoint/endpoint_store_type");
     setConfig(config, "MC_CONN_PAUSE_TTL_MS",
               "transports/rdma/endpoint/conn_pause_ttl_ms");
     setConfig(config, "MC_NUM_QP_PER_EP",
@@ -167,6 +212,7 @@ Status ConfigHelper::loadFromEnv(Config& config) {
     setConfig(config, "MC_WORKERS_PER_CTX",
               "transports/rdma/workers/num_workers");
     setConfig(config, "MC_SLICE_SIZE", "transports/rdma/workers/block_size");
+    setFragmentRatioConfig(config);
     setConfig(config, "MC_RETRY_CNT",
               "transports/rdma/workers/max_retry_count");
     setConfig(config, "MC_TRACK_RDMA_POSTED_SLICES",
@@ -183,6 +229,28 @@ Status ConfigHelper::loadFromEnv(Config& config) {
     // Consumed by filterInfiniBandDevices() in the platform probes.
     setArrayConfig(config, "MC_TE_FILTERS", "topology/rdma_whitelist");
     setArrayConfig(config, "MC_TE_FILTERS_EXCLUDE", "topology/rdma_blacklist");
+
+    warnUnsupportedLegacyEnv(
+        "MC_MAX_MR_SIZE",
+        "TENT registers the user-provided memory regions directly and does not "
+        "split RDMA MRs using the classic max_mr_size knob");
+    warnUnsupportedLegacyEnv(
+        "MC_MIN_REG_SIZE",
+        "TENT RDMA warm-up uses its own page-pinning path and does not expose "
+        "the classic eager-registration block-size knob");
+    warnUnsupportedLegacyEnv(
+        "MC_ENABLE_DEST_DEVICE_AFFINITY",
+        "TENT uses its RDMA rail monitor and transport selection policy rather "
+        "than the classic destination-device affinity switch");
+    warnUnsupportedLegacyEnv(
+        "MC_ENABLE_HCA_PEER_AFFINITY",
+        "TENT uses its RDMA rail monitor and transport selection policy rather "
+        "than the classic HCA peer-affinity switch");
+    warnUnsupportedLegacyEnv(
+        "MC_NIC_PEER_AFFINITY",
+        "TENT does not consume the classic local_hca=peer_hca affinity map; "
+        "configure topology/selection policy in MC_TENT_CONF");
+    warnDisabledParallelRegMr();
     return status;
 }
 

@@ -41,7 +41,7 @@ void tent_set_config(const char* key, const char* value) {
 tent_engine_t tent_create_engine() {
     auto config = std::make_shared<mooncake::tent::Config>();
     if (!tl_settings.path.empty()) {
-        auto status = config->load(tl_settings.path);
+        auto status = config->loadFile(tl_settings.path);
         if (!status.ok()) {
             LOG(WARNING) << "tent_create_engine: " << status.ToString()
                          << ", fallback to default config";

@@ -318,8 +318,22 @@ int RdmaContext::construct(const std::string& device_name,
     }
     device_name_ = device_name;
     params_ = params;
-    endpoint_store_ = std::make_shared<SIEVEEndpointStore>(
-        *this, params_->endpoint.endpoint_store_cap);
+    if (params_->device.num_cq_list <= 0 ||
+        params_->device.num_comp_channels <= 0) {
+        LOG(ERROR) << "Invalid RDMA completion configuration for device "
+                   << device_name_ << ": num_cq_list="
+                   << params_->device.num_cq_list
+                   << ", num_comp_channels="
+                   << params_->device.num_comp_channels;
+        return -1;
+    }
+    if (params_->endpoint.endpoint_store_type == EndpointStoreType::FIFO) {
+        endpoint_store_ = std::make_shared<FIFOEndpointStore>(
+            *this, params_->endpoint.endpoint_store_cap);
+    } else {
+        endpoint_store_ = std::make_shared<SIEVEEndpointStore>(
+            *this, params_->endpoint.endpoint_store_cap);
+    }
     status_ = DEVICE_DISABLED;
     return enable();
 }
@@ -897,6 +911,11 @@ int RdmaContext::openDevice(const std::string& device_name, uint8_t port) {
     int ret = verbs_.ibv_query_device(context.get(), &device_attr);
     if (ret) {
         PLOG(WARNING) << "ibv_query_device";
+        return -1;
+    }
+    if (context->num_comp_vectors <= 0) {
+        LOG(ERROR) << "RDMA device " << device_name
+                   << " exposes no completion vectors";
         return -1;
     }
 

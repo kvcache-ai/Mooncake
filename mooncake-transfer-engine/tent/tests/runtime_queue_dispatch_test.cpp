@@ -62,6 +62,7 @@ class FakeTransport : public Transport {
     std::atomic<int> status_calls{0};
     std::atomic<int> cancel_calls{0};
     bool cancellation_supported{true};
+    Status submit_status = Status::OK();
 
     Status install(std::string&, std::shared_ptr<ControlService>,
                    std::shared_ptr<Topology>,
@@ -83,6 +84,7 @@ class FakeTransport : public Transport {
     Status submitTransferTasks(SubBatchRef batch,
                                const std::vector<Request>& requests) override {
         ++submit_calls;
+        if (!submit_status.ok()) return submit_status;
         auto* fake = static_cast<FakeSubBatch*>(batch);
         for (const auto& request : requests) {
             fake->requests.push_back(request);
@@ -239,6 +241,70 @@ TEST(RuntimeQueueDispatch, RejectsOverfullBatchBeforePublishingTasks) {
     TransferStatus task_status{};
     EXPECT_TRUE(
         engine.getTransferStatus(batch, 0, task_status).IsInvalidArgument());
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(RuntimeQueueDispatch, DirectSubmitRejectsOverfullBatch) {
+    auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
+    cfg->set("enable_runtime_queue", false);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    installFakeRdma(engine, fake_rdma);
+
+    constexpr size_t kReqLen = 4096;
+    std::vector<uint8_t> buffer(kReqLen * 2, 0x33);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+
+    BatchID batch = engine.allocateBatch(1);
+    ASSERT_NE(batch, (BatchID)0);
+
+    auto status = engine.submitTransfer(
+        batch, {makeLocalWrite(buffer.data(), kReqLen),
+                makeLocalWrite(buffer.data() + kReqLen, kReqLen)});
+    EXPECT_TRUE(status.IsTooManyRequests()) << status.ToString();
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 0);
+
+    TransferStatus task_status{};
+    EXPECT_TRUE(
+        engine.getTransferStatus(batch, 0, task_status).IsInvalidArgument());
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(RuntimeQueueDispatch, DirectSubmitPropagatesTransportError) {
+    auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
+    cfg->set("enable_runtime_queue", false);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    fake_rdma->submit_status =
+        Status::InternalError("injected submit failure" LOC_MARK);
+    installFakeRdma(engine, fake_rdma);
+
+    constexpr size_t kReqLen = 4096;
+    std::vector<uint8_t> buffer(kReqLen, 0x44);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+
+    BatchID batch = engine.allocateBatch(1);
+    ASSERT_NE(batch, (BatchID)0);
+
+    auto status =
+        engine.submitTransfer(batch, {makeLocalWrite(buffer.data(), kReqLen)});
+    EXPECT_TRUE(status.IsInternalError()) << status.ToString();
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
+
+    TransferStatus task_status{};
+    ASSERT_TRUE(engine.getTransferStatus(batch, 0, task_status).ok());
+    EXPECT_EQ(task_status.s, TransferStatusEnum::FAILED);
+    EXPECT_EQ(task_status.transferred_bytes, 0);
 
     EXPECT_TRUE(engine.freeBatch(batch).ok());
     EXPECT_TRUE(

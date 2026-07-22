@@ -25,6 +25,11 @@
 namespace mooncake {
 namespace tent {
 
+enum class EndpointStoreType {
+    FIFO,
+    SIEVE,
+};
+
 struct DeviceParams {
     int num_cq_list = 6;  // Derived from RdmaParams::num_lanes.
     int num_comp_channels = 1;
@@ -54,6 +59,7 @@ struct QpPoolSegment {
 
 struct EndPointParams {
     int endpoint_store_cap = 65536;
+    EndpointStoreType endpoint_store_type = EndpointStoreType::SIEVE;
     int conn_pause_ttl_ms = 1000;
     int qp_mul_factor = 6;  // Derived from RdmaParams::num_lanes.
     int max_sge = 4;
@@ -158,6 +164,7 @@ struct WorkerParams {
     int num_workers = 6;  // Derived from RdmaParams::num_lanes.
     int max_retry_count = 9;
     int block_size = 65536;
+    int fragment_limit = 16384;
     uint64_t grace_period_ns = 5000000;  // 5ms
     std::string rail_topo_path;
     bool show_latency_info = false;
