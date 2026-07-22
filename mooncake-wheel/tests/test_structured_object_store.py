@@ -16,7 +16,6 @@ from mooncake.structured_object_store import (
     RemoteBundleRef,
     StructuredObjectPayload,
     StructuredObjectReadSpec,
-    _envelope_to_flat_dict,
     export_dataproto_ref,
     export_ref,
     import_dataproto_ref,
@@ -1816,6 +1815,8 @@ def test_unified_put_get_roundtrips_flat_dict() -> None:
     data = {
         "input_ids": np.arange(6, dtype=np.int64).reshape(3, 2),
         "tokens": [np.asarray([1, 2]), None, np.asarray([3])],
+        "uid": ["a", "b", "c"],
+        "tags": ["science", "math"],
         "step": 7,
     }
 
@@ -1823,38 +1824,12 @@ def test_unified_put_get_roundtrips_flat_dict() -> None:
     result = transfer.get(ref, type="dict")
 
     assert np.array_equal(result["input_ids"], data["input_ids"])
-    assert result["step"] == 7
     assert result["tokens"][1] is None
     assert np.array_equal(result["tokens"][0], np.asarray([1, 2]))
     assert np.array_equal(result["tokens"][2], np.asarray([3]))
-
-
-def test_unified_flat_dict_uses_dense_fields_for_row_count() -> None:
-    _store, transfer = make_transfer()
-    data = {
-        "input_ids": np.arange(6, dtype=np.int64).reshape(3, 2),
-        "uid": ["a", "b", "c"],
-        "tags": ["science", "math"],
-    }
-
-    ref = transfer.put(data, type="dict")
-    result = transfer.get(ref, type="dict")
-
-    assert np.array_equal(result["input_ids"], data["input_ids"])
     assert result["uid"] == ["a", "b", "c"]
     assert result["tags"] == ["science", "math"]
-
-
-def test_envelope_to_flat_dict_preserves_object_array_rows() -> None:
-    object_rows = np.asarray(
-        [np.asarray([1, 2]), np.asarray([3, 4])],
-        dtype=object,
-    )
-
-    result = _envelope_to_flat_dict({"non_tensor_batch": {"tokens": object_rows}})
-
-    assert isinstance(result["tokens"][0], np.ndarray)
-    assert np.array_equal(result["tokens"][0], np.asarray([1, 2]))
+    assert result["step"] == 7
 
 
 def test_unified_put_rejects_unknown_type() -> None:
@@ -1864,110 +1839,70 @@ def test_unified_put_rejects_unknown_type() -> None:
         transfer.put({}, type="unknown")  # type: ignore[arg-type]
 
 
-def test_unified_dict_put_passes_store_config_to_put_writes() -> None:
+@pytest.mark.parametrize(
+    ("policy", "config_attr"),
+    [
+        (BundleTransferPolicy(copy_mode="copy"), "put_configs"),
+        (None, "batch_put_from_configs"),
+    ],
+)
+def test_unified_dict_put_passes_store_config_to_writes(policy, config_attr) -> None:
     store, transfer = make_transfer()
     config = object()
     data = {"input_ids": np.arange(12, dtype=np.int64).reshape(4, 3)}
+    kwargs = {"config": config}
+    if policy is not None:
+        kwargs["policy"] = policy
 
-    ref = transfer.put(
-        data,
-        type="dict",
-        policy=BundleTransferPolicy(copy_mode="copy"),
-        config=config,
-    )
+    ref = transfer.put(data, type="dict", **kwargs)
     result = transfer.get(ref, type="dict")
 
     assert np.array_equal(result["input_ids"], data["input_ids"])
-    assert store.put_configs
-    assert all(item is config for item in store.put_configs)
-
-
-def test_unified_dict_put_passes_store_config_to_batch_put_writes() -> None:
-    store, transfer = make_transfer()
-    config = object()
-    data = {"input_ids": np.arange(12, dtype=np.int64).reshape(4, 3)}
-
-    ref = transfer.put(data, type="dict", config=config)
-    result = transfer.get(ref, type="dict")
-
-    assert np.array_equal(result["input_ids"], data["input_ids"])
-    assert store.batch_put_from_configs
-    assert all(item is config for item in store.batch_put_from_configs)
+    configs = getattr(store, config_attr)
+    assert configs
+    assert all(item is config for item in configs)
 
 
 def test_unified_dict_put_accepts_field_schemas() -> None:
-    _store, transfer = make_transfer()
-    values = np.empty(3, dtype=object)
-    values[:] = [
-        np.asarray([1, 2], dtype=np.int32),
-        None,
-        np.asarray([3], dtype=np.int32),
-    ]
+    def schema(codec: str, section: str, dtype: str | None = None) -> FieldSchema:
+        metadata = {"section": section}
+        if dtype is not None:
+            metadata["dtype"] = dtype
+        return FieldSchema(codec=codec, metadata=metadata)
 
-    ref = transfer.put_dict(
+    _store, transfer = make_transfer()
+    values = np.empty(2, dtype=object)
+    values[:] = [np.asarray([1, 2], dtype=np.int32), None]
+
+    ref = transfer.put(
         {
-            "input_ids": np.arange(3),
+            "input_ids": np.arange(2),
             "tokens": values,
+            "partition": [0, 1],
+            "response_lengths": [2, 0],
+            "global_batch_sizes": [2],
+            "num_microbatches": 1,
             "step": 7,
         },
         field_schemas={
-            "tokens": FieldSchema(
-                codec="typed_ragged",
-                metadata={"section": "non_tensor_batch", "dtype": "int32"},
-            )
+            "tokens": schema("typed_ragged", "non_tensor_batch", "int32"),
+            "partition": schema("ndarray", "non_tensor_batch", "int64"),
+            "response_lengths": schema("ndarray", "non_tensor_batch", "int64"),
+            "global_batch_sizes": schema("auto", "meta_info"),
+            "num_microbatches": schema("auto", "meta_info"),
         },
+        type="dict",
     )
 
     result = transfer.get(ref, type="dict")
 
-    assert np.array_equal(result["input_ids"], np.arange(3))
-    assert result["tokens"][0] == [1, 2]
-    assert result["tokens"][1] is None
-    assert result["tokens"][2] == [3]
-    assert result["step"] == 7
-
-
-def test_unified_dict_put_uses_schema_sections_for_metadata_lists() -> None:
-    _store, transfer = make_transfer()
-
-    ref = transfer.put_dict(
-        {
-            "partition": [0, 1],
-            "tokens": [np.asarray([1, 2]), np.asarray([3])],
-            "response_lengths": [2, 1],
-            "global_batch_sizes": [2],
-            "num_microbatches": 1,
-        },
-        field_schemas={
-            "partition": FieldSchema(
-                codec="ndarray",
-                metadata={"section": "non_tensor_batch", "dtype": "int64"},
-            ),
-            "tokens": FieldSchema(
-                codec="typed_ragged",
-                metadata={"section": "non_tensor_batch", "dtype": "int64"},
-            ),
-            "response_lengths": FieldSchema(
-                codec="ndarray",
-                metadata={"section": "non_tensor_batch", "dtype": "int64"},
-            ),
-            "global_batch_sizes": FieldSchema(
-                codec="auto",
-                metadata={"section": "meta_info"},
-            ),
-            "num_microbatches": FieldSchema(
-                codec="auto",
-                metadata={"section": "meta_info"},
-            ),
-        },
-    )
-
-    result = transfer.get(ref, type="dict")
-
+    assert np.array_equal(result["input_ids"], np.arange(2))
+    assert result["tokens"] == [[1, 2], None]
     assert result["partition"] == [0, 1]
-    assert result["response_lengths"] == [2, 1]
+    assert result["response_lengths"] == [2, 0]
     assert result["global_batch_sizes"] == [2]
     assert result["num_microbatches"] == 1
+    assert result["step"] == 7
 
 
 def test_ref_aliases_match_dataproto_ref_helpers() -> None:

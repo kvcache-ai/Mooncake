@@ -1349,49 +1349,6 @@ class MooncakeBundleTransfer:
             seen.add(stage_ref.manifest_key)
             self.remove_bundle(stage_ref)
 
-    def put_dict(
-        self,
-        data: Mapping[str, Any],
-        *,
-        namespace: str = "default",
-        partition: str = "default",
-        stage: str = "default",
-        chunk_bytes: Optional[int] = None,
-        policy: Optional[BundleTransferPolicy] = None,
-        config: Any = None,
-        field_schemas: Optional[Mapping[str, FieldSchema]] = None,
-    ) -> MooncakeDataProtoRef:
-        """Store a flat dict as a structured object."""
-        return self.put(
-            data,
-            type="dict",
-            namespace=namespace,
-            partition=partition,
-            stage=stage,
-            chunk_bytes=chunk_bytes,
-            policy=policy,
-            config=config,
-            field_schemas=field_schemas,
-        )
-
-    def get_dict(self, ref: DataProtoRefLike) -> dict[str, Any]:
-        """Materialize a flat dict stored by put_dict()."""
-        return self.get(ref, type="dict")
-
-    def remove_dict(self, ref: DataProtoRefLike) -> None:
-        """Remove a flat dict stored by put_dict()."""
-        self.cleanup_dataproto(ref)
-
-    @staticmethod
-    def release_result(result: Any) -> None:
-        """Compatibility hook for releasing GET results.
-
-        This PR does not add BufferPool-backed GET semantics, so there is
-        nothing to release yet.  The BufferPool split PR will replace this
-        hook with the actual lease release implementation.
-        """
-        return None
-
     def _append_dataproto_stage_manifest(
         self,
         old_stage_ref: RemoteBundleRef,
@@ -1701,8 +1658,9 @@ def _dataproto_manifest_view(
     }
 
 
-def _flat_dict_to_envelope_with_schema(
-    data: Mapping[str, Any], field_schemas: Mapping[str, FieldSchema] | None
+def _flat_dict_to_envelope(
+    data: Mapping[str, Any],
+    field_schemas: Optional[Mapping[str, FieldSchema]] = None,
 ) -> dict[str, Any]:
     if not isinstance(data, Mapping):
         raise TypeError("flat dict payload must be a mapping")
@@ -1752,13 +1710,6 @@ def _flat_dict_to_envelope_with_schema(
     }
 
 
-def _flat_dict_to_envelope(
-    data: Mapping[str, Any],
-    field_schemas: Optional[Mapping[str, FieldSchema]] = None,
-) -> dict[str, Any]:
-    return _flat_dict_to_envelope_with_schema(data, field_schemas)
-
-
 def _flat_dict_schema_row_count(
     data: Mapping[str, Any], field_schemas: Mapping[str, FieldSchema]
 ) -> int:
@@ -1784,12 +1735,28 @@ def _field_len(name: str, value: Any) -> int:
 def _flat_dict_auto_row_count(
     data: Mapping[str, Any], exclude: set[str] | frozenset[str] = frozenset()
 ) -> int:
+    dense_sizes = {
+        len(value)
+        for key, value in data.items()
+        if key not in exclude
+        and (
+            (_torch is not None and isinstance(value, _torch.Tensor) and value.ndim > 0)
+            or (isinstance(value, np.ndarray) and value.dtype != object and value.ndim > 0)
+        )
+    }
+    if len(dense_sizes) > 1:
+        raise ValueError(
+            f"flat dict dense fields have ambiguous batch sizes: {sorted(dense_sizes)}"
+        )
+    if dense_sizes:
+        return dense_sizes.pop()
+
     sizes = {
         len(value)
         for key, value in data.items()
-        if key not in exclude and (
-            (_torch is not None and isinstance(value, _torch.Tensor) and value.ndim > 0)
-            or (isinstance(value, np.ndarray) and value.ndim > 0)
+        if key not in exclude
+        and (
+            (isinstance(value, np.ndarray) and value.ndim > 0)
             or _is_non_string_sequence(value)
         )
     }
