@@ -30,3 +30,23 @@ python -m mooncake.vllm_v1_proxy_server --prefiller-host 192.168.0.2 --prefiller
 ```
 
 Now you can send requests to the proxy server on default port 8000.
+
+## model_loader (remote weight save/load)
+
+First-party remote model weight I/O for Mooncake Store (`mooncake:///<name>`),
+compatible with SGLang's remote loader key layout and usable as a vLLM
+`--load-format mooncake` plugin.
+
+See `docs/source/design/remote-model-loader.md` for seed/load recipes. Quick start:
+
+```python
+from mooncake.model_loader import seed_model_from_files, load_weights_into
+
+seed_model_from_files("/path/to/ckpt", "mooncake:///my-model", tp_rank=0)
+load_weights_into(model, "mooncake:///my-model", rank=0)
+```
+
+```bash
+vllm serve ... --load-format mooncake \
+  --model-loader-extra-config '{"url":"mooncake:///my-model"}'
+```

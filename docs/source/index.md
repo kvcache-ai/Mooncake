@@ -132,6 +132,8 @@ design/transfer-engine/index
 design/hicache-design
 design/engram
 design/unified-parallel-tensor-io
+design/artifact-file-io
+design/remote-model-loader
 design/tent/overview
 design/tent/tebench
 design/conductor/conductor-architecture-design

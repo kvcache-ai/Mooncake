@@ -3,6 +3,7 @@ import os
 import time
 import tempfile
 import uuid
+from pathlib import Path
 from mooncake.store import MooncakeDistributedStore
 
 # The lease time of the kv object, should be set equal to
@@ -330,6 +331,354 @@ class TestSafetensorFunctions(unittest.TestCase):
             )
         finally:
             # Clean up the temporary file if it was created
+            if os.path.exists(temp_filename):
+                os.remove(temp_filename)
+
+    def test_save_and_load_tensor_from_standard_file(self):
+        """Test generic tensor persistence with standard torch files."""
+        import torch
+
+        tensor = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+        key_suffix = uuid.uuid4().hex
+        original_key = f"test_standard_tensor_{key_suffix}"
+        restored_key = f"test_standard_tensor_restored_{key_suffix}"
+
+        result = self.store.put_tensor(original_key, tensor)
+        self.assertEqual(result, 0)
+
+        with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as temp_file:
+            temp_filename = temp_file.name
+
+        try:
+            save_result = self.store.save_tensor_to_file(original_key, temp_filename)
+            self.assertEqual(save_result, 0)
+            self.assertTrue(os.path.exists(temp_filename))
+
+            loaded_tensor = self.store.load_tensor_from_file(
+                restored_key, temp_filename, filesystem="file"
+            )
+            self.assertIsNotNone(loaded_tensor)
+
+            restored_tensor = self.store.get_tensor(restored_key)
+            self.assertIsNotNone(restored_tensor)
+            self.assertTrue(torch.allclose(tensor, restored_tensor))
+        finally:
+            if os.path.exists(temp_filename):
+                os.remove(temp_filename)
+
+            time.sleep(default_kv_lease_ttl / 1000)
+            self.store.remove(original_key)
+            self.store.remove(restored_key)
+
+    def test_save_and_load_safetensor_with_filesystem_uri(self):
+        """Test filesystem-aware safetensor persistence through the client API."""
+        import torch
+
+        tensor = torch.tensor([[11.0, 12.0], [13.0, 14.0]], dtype=torch.float32)
+        key_suffix = uuid.uuid4().hex
+        original_key = f"test_fs_tensor_{key_suffix}"
+        restored_key = f"test_fs_tensor_restored_{key_suffix}"
+
+        result = self.store.put_tensor(original_key, tensor)
+        self.assertEqual(result, 0)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target_path = Path(temp_dir) / "nested" / "kv_cache.safetensors"
+            file_uri = target_path.as_uri()
+
+            save_result = self.store.save_tensor_to_safetensor(
+                original_key,
+                file_uri,
+                filesystem="file",
+                tensor_name="kv_cache",
+            )
+            self.assertEqual(save_result, 0)
+            self.assertTrue(target_path.exists())
+
+            loaded_tensor = self.store.load_tensor_from_safetensor(
+                restored_key,
+                file_uri,
+                filesystem="file",
+                tensor_name="kv_cache",
+            )
+            self.assertIsNotNone(loaded_tensor)
+
+            restored_tensor = self.store.get_tensor(restored_key)
+            self.assertIsNotNone(restored_tensor)
+            self.assertTrue(torch.allclose(tensor, restored_tensor))
+
+        time.sleep(default_kv_lease_ttl / 1000)
+        self.store.remove(original_key)
+        self.store.remove(restored_key)
+
+    def test_save_and_load_kv_cache_aliases(self):
+        """Test KV cache aliases for file persistence."""
+        import torch
+
+        tensor = torch.tensor([21.0, 22.0, 23.0], dtype=torch.float32)
+        key_suffix = uuid.uuid4().hex
+        original_key = f"test_kv_cache_{key_suffix}"
+        restored_key = f"test_kv_cache_restored_{key_suffix}"
+
+        result = self.store.put_tensor(original_key, tensor)
+        self.assertEqual(result, 0)
+
+        with tempfile.NamedTemporaryFile(
+            suffix=".safetensors", delete=False
+        ) as temp_file:
+            temp_filename = temp_file.name
+
+        try:
+            save_result = self.store.save_kv_cache_to_file(
+                original_key,
+                temp_filename,
+                format="safetensors",
+                filesystem="file",
+            )
+            self.assertEqual(save_result, 0)
+
+            loaded_tensor = self.store.load_kv_cache_from_file(
+                restored_key,
+                temp_filename,
+                format="safetensors",
+                filesystem="file",
+            )
+            self.assertIsNotNone(loaded_tensor)
+
+            restored_tensor = self.store.get_tensor(restored_key)
+            self.assertIsNotNone(restored_tensor)
+            self.assertTrue(torch.allclose(tensor, restored_tensor))
+        finally:
+            if os.path.exists(temp_filename):
+                os.remove(temp_filename)
+
+            time.sleep(default_kv_lease_ttl / 1000)
+            self.store.remove(original_key)
+            self.store.remove(restored_key)
+
+    def test_multi_entry_safetensor_rejects_unknown_tensor_name(self):
+        """Multi-entry safetensors files must not silently pick the wrong tensor."""
+        import torch
+        from safetensors.torch import save_file
+
+        tensors = {
+            "tensor_a": torch.tensor([1.0, 2.0], dtype=torch.float32),
+            "tensor_b": torch.tensor([3.0, 4.0], dtype=torch.float32),
+        }
+
+        with tempfile.NamedTemporaryFile(
+            suffix=".safetensors", delete=False
+        ) as temp_file:
+            temp_filename = temp_file.name
+
+        try:
+            save_file(tensors, temp_filename)
+            result = self.store.load_tensor_from_file(
+                "restored_key",
+                temp_filename,
+                format="safetensors",
+                tensor_name="missing_entry",
+            )
+            self.assertIsNone(
+                result,
+                "Unknown tensor_name in multi-entry file should fail loudly",
+            )
+            self.assertIsNone(self.store.get_tensor("restored_key"))
+        finally:
+            if os.path.exists(temp_filename):
+                os.remove(temp_filename)
+
+    def test_remote_torch_load_is_rejected_by_default(self):
+        """Remote torch checkpoints require an explicit unsafe opt-in."""
+        result = self.store.load_tensor_from_file(
+            "remote_key",
+            "s3://example-bucket/checkpoints/model.pt",
+            format="torch",
+        )
+        self.assertIsNone(result)
+        self.assertIsNone(self.store.get_tensor("remote_key"))
+
+    def test_torch_load_rejects_non_tensor_checkpoint(self):
+        """Torch checkpoints must contain a single tensor payload."""
+        import torch
+
+        with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as temp_file:
+            temp_filename = temp_file.name
+
+        try:
+            torch.save(
+                {"weight": torch.tensor([1.0, 2.0], dtype=torch.float32)},
+                temp_filename,
+            )
+            result = self.store.load_tensor_from_file(
+                "bad_checkpoint",
+                temp_filename,
+                format="torch",
+            )
+            self.assertIsNone(result)
+            self.assertIsNone(self.store.get_tensor("bad_checkpoint"))
+        finally:
+            if os.path.exists(temp_filename):
+                os.remove(temp_filename)
+
+    def test_save_tensor_put_only(self):
+        """General save_tensor API can write directly to Store."""
+        import torch
+
+        tensor = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32)
+        key_suffix = uuid.uuid4().hex
+        key = f"test_save_tensor_put_{key_suffix}"
+
+        result = self.store.save_tensor(key, tensor)
+        self.assertEqual(result, 0)
+
+        try:
+            retrieved = self.store.load_tensor(key)
+            self.assertIsNotNone(retrieved)
+            self.assertTrue(torch.allclose(tensor, retrieved))
+        finally:
+            time.sleep(default_kv_lease_ttl / 1000)
+            self.store.remove(key)
+
+    def test_save_tensor_put_and_export(self):
+        """General save_tensor API can write to Store and export in one call."""
+        import torch
+
+        tensor = torch.tensor([4.0, 5.0, 6.0], dtype=torch.float32)
+        key_suffix = uuid.uuid4().hex
+        key = f"test_save_tensor_export_{key_suffix}"
+
+        with tempfile.NamedTemporaryFile(
+            suffix=".safetensors", delete=False
+        ) as temp_file:
+            temp_filename = temp_file.name
+
+        try:
+            result = self.store.save_tensor(
+                key,
+                tensor,
+                file_name=temp_filename,
+                artifact_kind="safetensor",
+                tensor_name="payload",
+            )
+            self.assertEqual(result, 0)
+            self.assertTrue(os.path.exists(temp_filename))
+
+            restored_key = f"{key}_restored"
+            loaded = self.store.load_tensor(
+                restored_key,
+                file_name=temp_filename,
+                artifact_kind="safetensor",
+                tensor_name="payload",
+            )
+            self.assertIsNotNone(loaded)
+            self.assertTrue(torch.allclose(tensor, loaded))
+        finally:
+            if os.path.exists(temp_filename):
+                os.remove(temp_filename)
+
+            time.sleep(default_kv_lease_ttl / 1000)
+            self.store.remove(key)
+            self.store.remove(f"{key}_restored")
+
+    def test_save_tensor_routes_kv_cache_kind(self):
+        """General save_tensor routes kv_cache artifacts through KV cache aliases."""
+        import torch
+
+        tensor = torch.tensor([7.0, 8.0], dtype=torch.float32)
+        key_suffix = uuid.uuid4().hex
+        key = f"test_save_tensor_kv_{key_suffix}"
+
+        with tempfile.NamedTemporaryFile(
+            suffix=".safetensors", delete=False
+        ) as temp_file:
+            temp_filename = temp_file.name
+
+        try:
+            result = self.store.save_tensor(
+                key,
+                tensor,
+                file_name=temp_filename,
+                artifact_kind="kv_cache",
+            )
+            self.assertEqual(result, 0)
+
+            restored_key = f"{key}_restored"
+            loaded = self.store.load_tensor(
+                restored_key,
+                file_name=temp_filename,
+                artifact_kind="kv_cache",
+            )
+            self.assertIsNotNone(loaded)
+            self.assertTrue(torch.allclose(tensor, loaded))
+        finally:
+            if os.path.exists(temp_filename):
+                os.remove(temp_filename)
+
+            time.sleep(default_kv_lease_ttl / 1000)
+            self.store.remove(key)
+            self.store.remove(f"{key}_restored")
+
+    def test_load_tensor_from_store_only(self):
+        """General load_tensor API can read directly from Store."""
+        import torch
+
+        tensor = torch.tensor([9.0, 10.0], dtype=torch.float32)
+        key_suffix = uuid.uuid4().hex
+        key = f"test_load_tensor_store_{key_suffix}"
+
+        self.assertEqual(self.store.put_tensor(key, tensor), 0)
+        try:
+            loaded = self.store.load_tensor(key)
+            self.assertIsNotNone(loaded)
+            self.assertTrue(torch.allclose(tensor, loaded))
+        finally:
+            time.sleep(default_kv_lease_ttl / 1000)
+            self.store.remove(key)
+
+    def test_save_tensor_invalid_artifact_kind(self):
+        """Unsupported artifact_kind should map to INVALID_PARAMS, not raise."""
+        import torch
+        from mooncake.store_file_io import INVALID_PARAMS
+
+        tensor = torch.tensor([1.0], dtype=torch.float32)
+        key_suffix = uuid.uuid4().hex
+        key = f"test_save_tensor_bad_kind_{key_suffix}"
+
+        with tempfile.NamedTemporaryFile(
+            suffix=".safetensors", delete=False
+        ) as temp_file:
+            temp_filename = temp_file.name
+
+        try:
+            result = self.store.save_tensor(
+                key,
+                tensor,
+                file_name=temp_filename,
+                artifact_kind="not-a-real-kind",
+            )
+            self.assertEqual(result, INVALID_PARAMS)
+        finally:
+            if os.path.exists(temp_filename):
+                os.remove(temp_filename)
+            time.sleep(default_kv_lease_ttl / 1000)
+            self.store.remove(key)
+
+    def test_load_tensor_invalid_artifact_kind(self):
+        """Unsupported artifact_kind on load should return None, not raise."""
+        with tempfile.NamedTemporaryFile(
+            suffix=".safetensors", delete=False
+        ) as temp_file:
+            temp_filename = temp_file.name
+
+        try:
+            loaded = self.store.load_tensor(
+                "unused_key",
+                file_name=temp_filename,
+                artifact_kind="not-a-real-kind",
+            )
+            self.assertIsNone(loaded)
+        finally:
             if os.path.exists(temp_filename):
                 os.remove(temp_filename)
 

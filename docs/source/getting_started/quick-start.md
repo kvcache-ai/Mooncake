@@ -73,6 +73,7 @@ HiCache:
 |-----------|----------|-------------|
 | SGLang | HiCache L3 storage backend with Mooncake Store | [SGLang HiCache Quick Start](examples/sglang-integration/hicache-quick-start.md) |
 | vLLM | KV cache storage and sharing with `MooncakeStoreConnector` | [vLLM KV Cache Storage & Sharing](examples/vllm-integration/kv-cache-storage.md) |
+| SGLang / vLLM | Remote model weight save/load via `mooncake:///` | [Remote Model Loader](examples/remote-model-loader.md) |
 
 The serving framework guides include the required Mooncake Store service
 startup and connector configuration for each path.

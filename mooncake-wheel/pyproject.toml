@@ -29,10 +29,16 @@ authors = [
 ]
 requires-python = ">=3.10"
 readme = "README.md"   # local copy of ../README.md, materialized at build time by scripts/build_wheel.sh
-dependencies = ["aiohttp", "requests", "msgpack"]
+dependencies = ["aiohttp", "fsspec", "requests", "msgpack"]
 # Single-line arrays: sed-substituted by scripts/build_wheel.sh for each variant.
 keywords = ["mooncake", "transfer engine", "kv cache", "llm inference", "rdma"]
 classifiers = ["Development Status :: 5 - Production/Stable", "Environment :: GPU :: NVIDIA CUDA", "Intended Audience :: Developers", "Intended Audience :: Science/Research", "License :: OSI Approved :: Apache Software License", "Operating System :: POSIX :: Linux", "Programming Language :: C++", "Programming Language :: Python :: 3", "Programming Language :: Python :: 3 :: Only", "Programming Language :: Python :: 3.10", "Programming Language :: Python :: 3.11", "Programming Language :: Python :: 3.12", "Programming Language :: Python :: 3.13", "Programming Language :: Python :: Implementation :: CPython", "Topic :: Scientific/Engineering :: Artificial Intelligence", "Topic :: System :: Distributed Computing"]
+
+[project.optional-dependencies]
+file-io = ["safetensors", "torch"]
+
+[project.entry-points."vllm.general_plugins"]
+mooncake_model_loader = "mooncake.model_loader.vllm_loader:register"
 
 [project.urls]
 Homepage = "https://github.com/kvcache-ai/Mooncake"
@@ -50,6 +56,8 @@ transfer_engine_bench = "mooncake.cli_bench:main"
 mooncake_http_metadata_server = "mooncake.http_metadata_server:main"
 mc_store_rest_server = "mooncake.mooncake_store_service:sync_main"
 transfer_engine_topology_dump = "mooncake.transfer_engine_topology_dump:main"
+mooncake_save_model_remote = "mooncake.model_loader.save_model_remote:main"
+mooncake_sglang_launch = "mooncake.model_loader.sglang_launch:main"
 
 [tool.setuptools]
 zip-safe = false
