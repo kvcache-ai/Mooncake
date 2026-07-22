@@ -744,17 +744,22 @@ Transport* TransferEngine::installTransport(const std::string& proto,
             if (!filters.empty() && !impl_tent_) {
                 std::lock_guard<std::mutex> lock(tent_compat_mutex_);
                 tent_whitelist_filters_ = std::move(filters);
+                LOG(WARNING)
+                    << "installTransport(" << proto
+                    << ") in TENT compatibility mode does not install a "
+                       "transport or return a transport pointer; RDMA/Barex "
+                       "arguments were only captured as init-time whitelist "
+                       "hints";
             } else if (!filters.empty()) {
                 LOG(WARNING)
                     << "TENT is already initialized; installTransport(" << proto
                     << ") NIC hints cannot change the active TENT topology";
             }
         }
-        static bool g_present = false;
-        if (!g_present) {
-            LOG(INFO) << "installTransport not used by TENT";
-            g_present = true;
-        }
+        LOG(WARNING)
+            << "installTransport(" << proto
+            << ") is a compatibility no-op in TENT mode and returns nullptr; "
+               "configure transports through TENT config";
         return nullptr;
     } else {
         return impl_->installTransport(proto, args);
@@ -767,6 +772,11 @@ int TransferEngine::uninstallTransport(const std::string& proto) {
         if (!protoToTentTransportHint(proto, ignored)) {
             LOG(WARNING) << "uninstallTransport(" << proto
                          << ") ignored by TENT compatibility mode";
+        } else {
+            LOG(WARNING)
+                << "uninstallTransport(" << proto
+                << ") is a compatibility no-op in TENT mode; active "
+                   "transports cannot be changed after TENT initialization";
         }
         return 0;
     } else
@@ -1303,45 +1313,70 @@ Status TransferEngine::getBatchTransferStatus(BatchID batch_id,
 }
 
 Transport* TransferEngine::getTransport(const std::string& proto) {
-    if (use_tent_)
+    if (use_tent_) {
+        LOG(WARNING)
+            << "getTransport(" << proto
+            << ") is not supported in TENT compatibility mode and returns "
+               "nullptr; use request transport_hint or TENT config instead";
         return nullptr;
-    else
+    } else
         return impl_->getTransport(proto);
 }
 
 #if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
     !defined(USE_CXI)
 device::P2pTransport* TransferEngine::getOrCreateP2pTransport(int num_ranks) {
-    if (use_tent_) return nullptr;
+    if (use_tent_) {
+        LOG(WARNING) << "getOrCreateP2pTransport is not supported in TENT "
+                        "compatibility mode and returns nullptr";
+        return nullptr;
+    }
     return impl_->getOrCreateP2pTransport(num_ranks);
 }
 
 device::RdmaTransport* TransferEngine::getOrCreateRdmaTransport(
     const std::vector<std::string>& device_filter) {
-    if (use_tent_) return nullptr;
+    if (use_tent_) {
+        LOG(WARNING)
+            << "getOrCreateRdmaTransport is not supported in TENT "
+               "compatibility mode and returns nullptr; configure RDMA "
+               "through TENT config or init-time whitelist hints";
+        return nullptr;
+    }
     return impl_->getOrCreateRdmaTransport(device_filter);
 }
 #endif
 
 bool TransferEngine::isTcpOnly() const {
-    if (use_tent_)
+    if (use_tent_) {
         // TENT already rejects TCP loopback transfers when MC_STORE_MEMCPY
         // is disabled, so auto-enabling memcpy is unnecessary in TENT mode.
+        LOG(WARNING)
+            << "isTcpOnly returns false in TENT compatibility mode; TENT "
+               "selects transports internally";
         return false;
-    else
+    } else
         return impl_->isTcpOnly();
 }
 
 int TransferEngine::syncSegmentCache(const std::string& segment_name) {
-    if (use_tent_)
+    if (use_tent_) {
+        LOG(WARNING)
+            << "syncSegmentCache("
+            << (segment_name.empty() ? std::string("<all>") : segment_name)
+            << ") is a compatibility no-op in TENT mode; TENT manages the "
+               "segment cache internally";
         return 0;
-    else
+    } else
         return impl_->syncSegmentCache(segment_name);
 }
 
 std::shared_ptr<TransferMetadata> TransferEngine::getMetadata() {
     if (use_tent_) {
-        LOG(WARNING) << "API deprecated in Mooncake TENT";
+        LOG(WARNING)
+            << "getMetadata is not supported in TENT compatibility mode and "
+               "returns nullptr; TENT does not expose classic "
+               "TransferMetadata";
         return nullptr;
     } else
         return impl_->getMetadata();
@@ -1359,7 +1394,14 @@ bool TransferEngine::checkOverlap(void* addr, uint64_t length) {
 }
 
 void TransferEngine::setAutoDiscover(bool auto_discover) {
-    if (!use_tent_) impl_->setAutoDiscover(auto_discover);
+    if (!use_tent_) {
+        impl_->setAutoDiscover(auto_discover);
+        return;
+    }
+    LOG(WARNING)
+        << "setAutoDiscover(" << auto_discover
+        << ") is ignored in TENT compatibility mode; discovery is controlled "
+           "by TENT config and platform probes";
 }
 
 void TransferEngine::setWhitelistFilters(std::vector<std::string>&& filters) {
@@ -1377,15 +1419,21 @@ void TransferEngine::setWhitelistFilters(std::vector<std::string>&& filters) {
 }
 
 int TransferEngine::numContexts() const {
-    if (use_tent_)
+    if (use_tent_) {
+        LOG(WARNING)
+            << "numContexts returns a placeholder value in TENT compatibility "
+               "mode; TENT does not expose classic RDMA context counts";
         return 1;  // placeholder
-    else
+    } else
         return impl_->numContexts();
 }
 
 std::shared_ptr<Topology> TransferEngine::getLocalTopology() {
     if (use_tent_) {
-        LOG(WARNING) << "API deprecated in Mooncake TENT";
+        LOG(WARNING)
+            << "getLocalTopology returns an empty placeholder topology in "
+               "TENT compatibility mode; configure topology through TENT "
+               "config instead";
         return std::make_shared<Topology>();
     } else
         return impl_->getLocalTopology();
@@ -1394,6 +1442,9 @@ std::shared_ptr<Topology> TransferEngine::getLocalTopology() {
 void* TransferEngine::getBaseAddr() {
     if (use_tent_) {
         // TENT version does not support CXL base address
+        LOG(WARNING)
+            << "getBaseAddr is not supported in TENT compatibility mode and "
+               "returns nullptr; CXL base-address access is classic-TE only";
         return nullptr;
     } else
         return impl_->getBaseAddr();
