@@ -61,7 +61,22 @@ if(ENABLE_KV_EVENTS)
                           PRIVATE ${KV_EVENT_TEST_ZMQ_LIBRARY})
   endif()
 endif()
-add_store_test(master_service_test master_service_test.cpp)
+add_store_test(master_service_test master_service/basic_operations_test.cpp)
+add_store_test(master_service_metadata_test
+               master_service/group_metadata_test.cpp)
+add_store_test(master_service_tenant_isolation_test
+               master_service/tenant_isolation_test.cpp)
+add_store_test(master_service_upsert_test master_service/upsert_test.cpp)
+add_store_test(master_service_allocation_test
+               master_service/allocation_test.cpp)
+add_store_test(master_service_eviction_test master_service/retention_test.cpp)
+add_store_test(master_service_replica_cleanup_test
+               master_service/replica_cleanup_test.cpp)
+add_store_test(master_service_copy_move_test master_service/copy_move_test.cpp)
+add_store_test(master_service_copy_move_eviction_test
+               master_service/copy_move_eviction_test.cpp)
+add_store_test(master_service_copy_move_timeout_test
+               master_service/copy_move_timeout_test.cpp)
 add_store_test(master_service_tenant_quota_test
                master_service_tenant_quota_test.cpp)
 add_store_test(batch_remove_test batch_remove_test.cpp)
