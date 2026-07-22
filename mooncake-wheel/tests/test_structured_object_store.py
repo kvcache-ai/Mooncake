@@ -770,10 +770,15 @@ def test_structured_object_multi_buffer_payload_uses_pool_batch_put() -> None:
     ref = transfer.put_structured_object(payload, chunk_bytes=4)
     result = transfer.materialize(transfer.read_spec(ref))
 
-    assert result.objects["raw"] == b"abcdef"
-    assert pool.acquire_sizes == [4, 2]
+    raw = result.objects["raw"]
+    raw_bytes = raw if isinstance(raw, bytes) else raw.tobytes()
+    assert raw_bytes == b"abcdef"
+    assert pool.acquire_sizes == [4, 2, 6]
     assert pool.release_count == 2
     assert store.batch_put_from_calls == 2
+
+    MooncakeBundleTransfer.release_result(result.objects)
+    assert pool.release_count == 3
 
 
 def test_structured_object_multi_buffer_put_cleans_all_chunk_keys_on_failure() -> None:
