@@ -38,16 +38,27 @@ CentralizedCoordinatorStateMachine::handleRegisterAgent(
     }
     auto& info = ranks_[req.rank];
 
-    // Identity check
-    // If the rank is currently Healthy AND the request comes from a different
-    // process -> reject.  A failed / auto-deactivated rank (Synced or Offline)
-    // may be replaced immediately; waiting for heartbeat timeout is not
-    // required because the Coordinator has already removed it from the healthy
-    // set.
-    bool same_peer = (info.agent_addr == req.agent_addr &&
-                      info.te_server_name == req.te_server_name);
+    // agent_session_id is the idempotency key for a logical registration.
+    // Retrying an already-accepted registration must not invalidate link
+    // evidence, demote rank state, or rebroadcast lifecycle events.
+    const bool same_session = info.agent_session_id == req.agent_session_id;
+    if (same_session) {
+        if (info.state == RankState::Offline) {
+            result.response.success = false;
+            result.response.reject_reason =
+                "agent session is Offline; start a new registration session";
+            result.response.require_new_session = true;
+            return result;
+        }
+        info.last_heartbeat = std::chrono::steady_clock::now();
+        populateRegisterAgentResponse(result.response, req.rank);
+        return result;
+    }
 
-    if (info.state == RankState::Healthy && !same_peer) {
+    // A failed / auto-deactivated rank (Synced or Offline) may be replaced
+    // immediately. A different logical session may not take ownership from a
+    // Healthy rank.
+    if (info.state == RankState::Healthy) {
         result.response.success = false;
         result.response.reject_reason =
             "rank already registered and is Healthy; replacement must wait "
@@ -55,97 +66,99 @@ CentralizedCoordinatorStateMachine::handleRegisterAgent(
         return result;
     }
 
-    // A new session makes old endpoints invalid
-    bool session_changed =
-        (!same_peer || info.agent_session_epoch != req.agent_session_epoch);
-
+    ++info.rank_epoch;
     info.agent_addr = req.agent_addr;
     info.te_server_name = req.te_server_name;
-    info.agent_session_epoch = req.agent_session_epoch;
+    info.agent_session_id = req.agent_session_id;
     info.warmup_recv_addr = req.warmup_recv_addr;
     info.last_heartbeat = std::chrono::steady_clock::now();
+
+    // A new rank epoch invalidates both outgoing and incoming observations for
+    // the previous incarnation. No old edge is allowed to make the replacement
+    // Healthy before fresh, epoch-matched evidence arrives.
     info.link_status.assign(max_world_size_, 0);
+    for (auto& peer : ranks_) {
+        peer.link_status[req.rank] = 0;
+    }
     info.link_status[req.rank] = 1;
     info.last_link_event_report_id = 0;
 
-    if (session_changed) {
-        for (auto& [group_id, view] : group_views_) {
-            auto& member = view.members[req.rank];
-            // AwaitingActivation is an uncommitted promise made by the old
-            // Agent session, so a new session cancels it. Active membership is
-            // already committed and must only be changed by the Coordinator's
-            // explicit or automatic deactivation paths, never by registration.
-            bool view_changed = false;
-            if (member.isAwaitingActivation()) {
-                member.status = GroupMemberState::Inactive;
-                view_changed = true;
-            }
+    for (auto& [group_id, view] : group_views_) {
+        auto& member = view.members[req.rank];
+        // AwaitingActivation is an uncommitted promise made by the old Agent
+        // session, so a new rank epoch cancels it. Active membership is already
+        // committed and must only be changed by explicit or automatic
+        // deactivation paths, never by registration.
+        bool view_changed = false;
+        if (member.isAwaitingActivation()) {
+            member.status = GroupMemberState::Inactive;
+            view_changed = true;
+        }
 
-            // The published endpoints belong to the process incarnation
-            // represented by the Agent session. The Offline path clears them
-            // while waiting for re-registration; repeat that reset on a
-            // confirmed session change to cover fast replacements that register
-            // before the old session is declared Offline.
-            if (member.hasEndpoint()) {
-                member.endpoint = std::nullopt;
-                view_changed = true;
-            }
+        // Published endpoints belong to one rank epoch. Repeat the Offline
+        // reset here for replacements accepted before heartbeat timeout.
+        if (member.hasEndpoint()) {
+            member.endpoint = std::nullopt;
+            view_changed = true;
+        }
 
-            if (view_changed) {
-                view.epoch++;
-                result.effects.push_back(PushViewUpdate{view});
-            }
+        if (view_changed) {
+            view.epoch++;
+            result.effects.push_back(PushViewUpdate{view});
         }
     }
 
-    // Broadcast PeerJoinedPush to all online ranks.
-    result.effects.push_back(BroadcastPeerJoined{
-        PeerJoinedPush{req.rank, info.te_server_name, info.warmup_recv_addr}});
-
-    // Transition to Synced.
     info.state = RankState::Synced;
+    ++info.rank_state_version;
+
+    result.effects.push_back(BroadcastPeerJoined{
+        PeerJoinedPush{req.rank, info.rank_epoch, info.te_server_name,
+                       info.warmup_recv_addr}});
     result.effects.push_back(makeRankStateEffect(req.rank));
 
-    // Build response.
-    auto& resp = result.response;
-    resp.success = true;
-    resp.all_rank_states.resize(max_world_size_);
-    for (int32_t i = 0; i < max_world_size_; ++i) {
-        resp.all_rank_states[i] = ranks_[i].state;
-    }
-    resp.groups.reserve(group_views_.size());
-    for (const auto& [gid, view] : group_views_) {
-        resp.groups.push_back(view);
-    }
-    resp.rank_connections.reserve(max_world_size_);
-    for (int32_t i = 0; i < max_world_size_; ++i) {
-        if (i == req.rank) continue;
-        if (ranks_[i].state == RankState::Offline) continue;
-        RankConnectionMetadata conn;
-        conn.rank = i;
-        conn.agent_addr = ranks_[i].agent_addr;
-        conn.te_server_name = ranks_[i].te_server_name;
-        conn.warmup_recv_addr = ranks_[i].warmup_recv_addr;
-        resp.rank_connections.push_back(conn);
-    }
-
+    populateRegisterAgentResponse(result.response, req.rank);
     return result;
+}
+
+void CentralizedCoordinatorStateMachine::populateRegisterAgentResponse(
+    RegisterAgentResponse& response, GlobalRank rank) const {
+    response.success = true;
+    response.rank_epoch = ranks_[rank].rank_epoch;
+    response.all_rank_states.resize(max_world_size_);
+    response.all_rank_epochs.resize(max_world_size_);
+    response.all_rank_state_versions.resize(max_world_size_);
+    for (int32_t i = 0; i < max_world_size_; ++i) {
+        response.all_rank_states[i] = ranks_[i].state;
+        response.all_rank_epochs[i] = ranks_[i].rank_epoch;
+        response.all_rank_state_versions[i] = ranks_[i].rank_state_version;
+    }
+    response.groups.reserve(group_views_.size());
+    for (const auto& [group_id, view] : group_views_) {
+        response.groups.push_back(view);
+    }
+    response.rank_connections.reserve(max_world_size_);
+    for (int32_t i = 0; i < max_world_size_; ++i) {
+        if (i == rank || ranks_[i].state == RankState::Offline) continue;
+        RankConnectionMetadata connection;
+        connection.rank = i;
+        connection.rank_epoch = ranks_[i].rank_epoch;
+        connection.agent_addr = ranks_[i].agent_addr;
+        connection.te_server_name = ranks_[i].te_server_name;
+        connection.warmup_recv_addr = ranks_[i].warmup_recv_addr;
+        response.rank_connections.push_back(std::move(connection));
+    }
 }
 
 CoordinatorApplyResult<HeartbeatResponse>
 CentralizedCoordinatorStateMachine::handleHeartbeat(
     const HeartbeatRequest& req) {
     CoordinatorApplyResult<HeartbeatResponse> result;
-    if (!hasValidSession(req.rank, req.agent_session_epoch)) {
-        result.response.acknowledge = false;
-        result.response.require_reregister = true;
+    if (!hasValidSession(req.rank, req.agent_session_id)) {
+        result.response.require_new_session = true;
         return result;
     }
     auto& info = ranks_[req.rank];
     info.last_heartbeat = std::chrono::steady_clock::now();
-
-    result.response.acknowledge = true;
-    result.response.require_reregister = false;
     return result;
 }
 
@@ -153,7 +166,7 @@ CoordinatorApplyResult<RegisterGroupResponse>
 CentralizedCoordinatorStateMachine::handleRegisterGroup(
     const RegisterGroupRequest& req) {
     CoordinatorApplyResult<RegisterGroupResponse> result;
-    if (!hasValidSession(req.rank, req.agent_session_epoch)) {
+    if (!hasValidSession(req.rank, req.agent_session_id)) {
         result.response.success = false;
         result.response.reject_reason = "rank out of range or stale session";
         return result;
@@ -172,7 +185,7 @@ CoordinatorApplyResult<ConfirmReadyForActivationResponse>
 CentralizedCoordinatorStateMachine::handleConfirmReadyForActivation(
     const ConfirmReadyForActivationRequest& req) {
     CoordinatorApplyResult<ConfirmReadyForActivationResponse> result;
-    if (!hasValidSession(req.rank, req.agent_session_epoch)) {
+    if (!hasValidSession(req.rank, req.agent_session_id)) {
         result.response.reject_reason =
             "rank is out of range or has a stale session";
         return result;
@@ -206,7 +219,7 @@ CoordinatorApplyResult<void>
 CentralizedCoordinatorStateMachine::handleUnregisterGroup(
     const UnregisterGroupRequest& req) {
     CoordinatorApplyResult<void> result;
-    if (!hasValidSession(req.rank, req.agent_session_epoch)) {
+    if (!hasValidSession(req.rank, req.agent_session_id)) {
         return result;
     }
 
@@ -241,7 +254,7 @@ CoordinatorApplyResult<PublishEndpointResponse>
 CentralizedCoordinatorStateMachine::handlePublishEndpoint(
     const PublishEndpointRequest& req) {
     CoordinatorApplyResult<PublishEndpointResponse> result;
-    if (!hasValidSession(req.rank, req.agent_session_epoch)) {
+    if (!hasValidSession(req.rank, req.agent_session_id)) {
         result.response.success = false;
         result.response.reject_reason = "rank out of range or stale session";
         return result;
@@ -287,13 +300,13 @@ CentralizedCoordinatorStateMachine::handleProposeViewUpdate(
     bool changed = false;
 
     // Reject stale or offline proposer.
-    if (!hasValidSession(req.source_rank, req.agent_session_epoch)) {
+    if (!hasValidSession(req.source_rank, req.agent_session_id)) {
         result.effects.push_back(
             ReplyProposal{propose_id,
                           {ViewUpdateStatus::Rejected,
                            view.epoch,
                            {},
-                           "source rank is Offline or stale session epoch"}});
+                           "source rank is Offline or has a stale session"}});
         return result;
     }
 
@@ -403,17 +416,21 @@ void CentralizedCoordinatorStateMachine::tryCloseReconciliationWindow(
 
 void CentralizedCoordinatorStateMachine::processLinkEventReport(
     const LinkEventReport& report, std::vector<CoordinatorEffect>& effects) {
-    if (!hasValidSession(report.reporter_rank, report.agent_session_epoch)) {
+    if (!hasValidSession(report.reporter_rank, report.agent_session_id)) {
         return;
     }
+    const auto& reporter_info = ranks_[report.reporter_rank];
+    if (report.reporter_rank_epoch != reporter_info.rank_epoch) return;
+
     if (report.events.size() != static_cast<size_t>(max_world_size_) ||
-        report.report_id == 0) {
+        report.target_rank_epochs.size() !=
+            static_cast<size_t>(max_world_size_)) {
         LOG(WARNING) << "[COORD] invalid LinkEventReport vectors";
         return;
     }
 
     effects.push_back(AckLinkEventReport{LinkEventReportAck{
-        report.reporter_rank, report.agent_session_epoch, report.report_id}});
+        report.reporter_rank, report.reporter_rank_epoch, report.report_id}});
 
     auto& reporter = ranks_[report.reporter_rank];
     if (report.report_id <= reporter.last_link_event_report_id) return;
@@ -424,6 +441,12 @@ void CentralizedCoordinatorStateMachine::processLinkEventReport(
     for (int32_t peer = 0; peer < max_world_size_; ++peer) {
         auto type = report.events[peer];
         if (type == LinkEvent::EventType::None) continue;
+
+        const auto& target = ranks_[peer];
+        if (target.state == RankState::Offline ||
+            report.target_rank_epochs[peer] != target.rank_epoch) {
+            continue;
+        }
 
         bool was_up = reporter.link_status[peer] != 0;
         bool is_up = type == LinkEvent::EventType::Success;
@@ -456,7 +479,7 @@ CentralizedCoordinatorStateMachine::handleSyncAfterFailure(
     uint64_t sync_id, const SyncAfterFailureRequest& req) {
     CoordinatorApplyResult<void> result;
 
-    if (!hasValidSession(req.reporter_rank, req.agent_session_epoch)) {
+    if (!hasValidSession(req.reporter_rank, req.agent_session_id)) {
         SyncAfterFailureResponse response;
         response.status = SyncAfterFailureStatus::Rejected;
         response.reject_reason = "rank out of range or stale session";
@@ -475,13 +498,13 @@ CentralizedCoordinatorStateMachine::handleSyncAfterFailure(
     // Apply piggybacked link event report inline.
     if (req.link_event_report.has_value() &&
         req.link_event_report->reporter_rank == req.reporter_rank &&
-        req.link_event_report->agent_session_epoch == req.agent_session_epoch) {
+        req.link_event_report->agent_session_id == req.agent_session_id) {
         processLinkEventReport(*req.link_event_report, result.effects);
     }
 
     if (reconciliation_ctx_.active) {
         reconciliation_ctx_.pending_syncs[req.group_id][req.reporter_rank]
-            .push_back(PendingSync{sync_id, req.agent_session_epoch});
+            .push_back(PendingSync{sync_id, req.agent_session_id});
         return result;
     }
 
@@ -562,10 +585,13 @@ CoordinatorApplyResult<void> CentralizedCoordinatorStateMachine::tick() {
 void CentralizedCoordinatorStateMachine::transitionToOffline(
     GlobalRank rank, const char* reason,
     std::vector<CoordinatorEffect>& effects) {
+    if (ranks_[rank].state == RankState::Offline) return;
+
     LOG(INFO) << "[COORD] transitionToOffline rank=" << rank
               << " state=" << static_cast<int>(ranks_[rank].state)
               << " reason=" << reason;
     ranks_[rank].state = RankState::Offline;
+    ++ranks_[rank].rank_state_version;
     ranks_[rank].link_status.assign(max_world_size_, 0);
 
     // Clear this rank's connectivity from all peers.
@@ -721,9 +747,11 @@ void CentralizedCoordinatorStateMachine::updateRankStates(
 
         if (in_healthy && ranks_[i].state != RankState::Healthy) {
             ranks_[i].state = RankState::Healthy;
+            ++ranks_[i].rank_state_version;
             effects.push_back(makeRankStateEffect(i));
         } else if (!in_healthy && ranks_[i].state == RankState::Healthy) {
             ranks_[i].state = RankState::Synced;
+            ++ranks_[i].rank_state_version;
             effects.push_back(makeRankStateEffect(i));
         }
     }
@@ -1011,7 +1039,9 @@ void CentralizedCoordinatorStateMachine::eraseGroup(
 
 CoordinatorEffect CentralizedCoordinatorStateMachine::makeRankStateEffect(
     GlobalRank rank) {
-    return BroadcastRankState{RankStatePush{rank, ranks_[rank].state}};
+    return BroadcastRankState{RankStatePush{rank, ranks_[rank].rank_epoch,
+                                            ranks_[rank].rank_state_version,
+                                            ranks_[rank].state}};
 }
 
 void CentralizedCoordinatorStateMachine::commitBarrier(
@@ -1104,7 +1134,7 @@ void CentralizedCoordinatorStateMachine::resolvePendingSyncs(
     for (auto& [group_id, ranks] : reconciliation_ctx_.pending_syncs) {
         for (auto& [rank, pending_requests] : ranks) {
             for (const PendingSync& pending : pending_requests) {
-                auto status = hasValidSession(rank, pending.agent_session_epoch)
+                auto status = hasValidSession(rank, pending.agent_session_id)
                                   ? SyncAfterFailureStatus::Reconciled
                                   : SyncAfterFailureStatus::Rejected;
                 auto response = makeSyncResponse(status, group_id);

@@ -20,12 +20,13 @@ struct RegisterAgentRequest {
     GlobalRank rank = kInvalidGlobalRank;
     std::string agent_addr;
     std::string te_server_name;
-    uint64_t agent_session_epoch = 0;
+    uint64_t agent_session_id = 0;
     uint64_t warmup_recv_addr = 0;
 };
 
 struct RankConnectionMetadata {
     GlobalRank rank = kInvalidGlobalRank;
+    uint64_t rank_epoch = 0;
     std::string agent_addr;
     std::string te_server_name;
     uint64_t warmup_recv_addr = 0;
@@ -34,31 +35,42 @@ struct RankConnectionMetadata {
 struct RegisterAgentResponse {
     bool success = false;
     std::string reject_reason;
+    // The request reached the Coordinator, but this logical registration can
+    // no longer be accepted.
+    bool require_new_session = false;
+    // Coordinator-assigned epoch for the accepted incarnation of the
+    // registering rank. Zero means that no incarnation has been accepted.
+    uint64_t rank_epoch = 0;
     std::vector<RankState> all_rank_states;
+    std::vector<uint64_t> all_rank_epochs;
+    std::vector<uint64_t> all_rank_state_versions;
     std::vector<GroupView> groups;
     std::vector<RankConnectionMetadata> rank_connections;
 };
 
 struct LinkEventReport {
     GlobalRank reporter_rank = kInvalidGlobalRank;
-    uint64_t agent_session_epoch = 0;
+    uint64_t agent_session_id = 0;
+    uint64_t reporter_rank_epoch = 0;
     uint64_t report_id = 0;
     std::vector<LinkEvent::EventType> events;
+    // Parallel to events. Each entry identifies the target
+    // incarnation against which the observation was made.
+    std::vector<uint64_t> target_rank_epochs;
 };
 
 struct HeartbeatRequest {
     GlobalRank rank = kInvalidGlobalRank;
-    uint64_t agent_session_epoch = 0;
+    uint64_t agent_session_id = 0;
 };
 
 struct HeartbeatResponse {
-    bool acknowledge = false;
-    bool require_reregister = false;
+    bool require_new_session = false;
 };
 
 struct RegisterGroupRequest {
     GlobalRank rank = kInvalidGlobalRank;
-    uint64_t agent_session_epoch = 0;
+    uint64_t agent_session_id = 0;
     GroupView group;
 };
 
@@ -70,7 +82,7 @@ struct RegisterGroupResponse {
 struct ConfirmReadyForActivationRequest {
     GroupId group_id;
     GlobalRank rank = kInvalidGlobalRank;
-    uint64_t agent_session_epoch = 0;
+    uint64_t agent_session_id = 0;
 };
 
 struct ConfirmReadyForActivationResponse {
@@ -87,7 +99,7 @@ enum class ViewUpdateStatus : uint8_t {
 struct ProposeViewUpdateRequest {
     GroupId group_id;
     GlobalRank source_rank = kInvalidGlobalRank;
-    uint64_t agent_session_epoch = 0;
+    uint64_t agent_session_id = 0;
     std::vector<GlobalRank> requested_ranks;
     bool is_activation = false;
 };
@@ -106,7 +118,7 @@ struct GroupEndpointPublication {
 
 struct PublishEndpointRequest {
     GlobalRank rank = kInvalidGlobalRank;
-    uint64_t agent_session_epoch = 0;
+    uint64_t agent_session_id = 0;
     std::vector<GroupEndpointPublication> endpoints;
 };
 
@@ -118,13 +130,13 @@ struct PublishEndpointResponse {
 struct UnregisterGroupRequest {
     GroupId group_id;
     GlobalRank rank = kInvalidGlobalRank;
-    uint64_t agent_session_epoch = 0;
+    uint64_t agent_session_id = 0;
 };
 
 struct SyncAfterFailureRequest {
     GroupId group_id;
     GlobalRank reporter_rank = kInvalidGlobalRank;
-    uint64_t agent_session_epoch = 0;
+    uint64_t agent_session_id = 0;
     uint64_t current_epoch = 0;
     // Piggybacked link event report.
     std::optional<LinkEventReport> link_event_report;
@@ -147,18 +159,21 @@ struct SyncAfterFailureResponse {
 
 struct PeerJoinedPush {
     GlobalRank rank = kInvalidGlobalRank;
+    uint64_t rank_epoch = 0;
     std::string te_server_name;
     uint64_t warmup_recv_addr = 0;
 };
 
 struct RankStatePush {
     GlobalRank rank = kInvalidGlobalRank;
+    uint64_t rank_epoch = 0;
+    uint64_t rank_state_version = 0;
     RankState new_state = RankState::Offline;
 };
 
 struct LinkEventReportAck {
-    GlobalRank rank = kInvalidGlobalRank;
-    uint64_t agent_session_epoch = 0;
+    GlobalRank reporter_rank = kInvalidGlobalRank;
+    uint64_t reporter_rank_epoch = 0;
     uint64_t report_id = 0;
 };
 
@@ -211,6 +226,7 @@ using CoordinatorEffect =
 
 struct EnablePeerProbe {
     GlobalRank rank = kInvalidGlobalRank;
+    uint64_t rank_epoch = 0;
     std::string te_server_name;
     uint64_t warmup_recv_addr = 0;
 };
@@ -239,6 +255,7 @@ struct ApplyViewToBackend {
     GroupId group_id;
     GroupView view;
     std::vector<RankState> rank_states;
+    std::vector<uint64_t> rank_epochs;
     std::vector<bool> activatable;
 };
 

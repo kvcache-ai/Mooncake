@@ -15,9 +15,8 @@ namespace mooncake {
 
 namespace {
 
-// Generate a process-unique starting point for agent_session_epoch so that
-// replacement processes cannot collide with the old rank's session epoch.
-uint64_t generateInitialAgentSessionEpoch() {
+// Generate a process-unique key for one logical registration.
+uint64_t generateInitialAgentSessionId() {
     auto now = std::chrono::steady_clock::now().time_since_epoch().count();
     uint64_t pid = static_cast<uint64_t>(getpid());
     uint64_t base = (pid << 32) ^ static_cast<uint64_t>(now);
@@ -54,7 +53,7 @@ AgentHost::AgentHost(c10::intrusive_ptr<c10d::Store> store,
       host_ip_(host_ip),
       rank_(rank),
       max_world_size_(max_world_size),
-      agent_session_epoch_(generateInitialAgentSessionEpoch()),
+      agent_session_id_(generateInitialAgentSessionId()),
       rpc_client_(std::make_unique<RpcClient>(
           std::chrono::duration_cast<std::chrono::milliseconds>(
               std::chrono::microseconds(fault_reconciliation_window_us) * 2))) {
@@ -67,7 +66,9 @@ void AgentHost::start() {
         if (event.peer < 0 || event.peer >= max_world_size_) return;
         LinkEvent link_event;
         link_event.events.assign(max_world_size_, LinkEvent::EventType::None);
+        link_event.target_rank_epochs.assign(max_world_size_, 0);
         link_event.events[event.peer] = LinkEvent::EventType::Success;
+        link_event.target_rank_epochs[event.peer] = event.target_rank_epoch;
         pushLinkEvent(link_event);
     });
 
@@ -224,7 +225,7 @@ void AgentHost::registerGroup(const GroupView& group, bool auto_deactivate,
 
         RegisterGroupRequest req;
         req.rank = rank_;
-        req.agent_session_epoch = agent_.getAgentSessionEpoch();
+        req.agent_session_id = agent_.getAgentSessionId();
         req.group = std::move(group);
         req.group.auto_deactivate = auto_deactivate;
 
@@ -255,7 +256,7 @@ void AgentHost::unregisterGroup(GroupId group_id) {
         UnregisterGroupRequest req;
         req.group_id = group_id;
         req.rank = rank_;
-        req.agent_session_epoch = agent_.getAgentSessionEpoch();
+        req.agent_session_id = agent_.getAgentSessionId();
         rpc_client_->send<&CoordinatorRpcService::unregisterGroup>(
             coordinator_addr_, req);
     });
@@ -265,7 +266,7 @@ void AgentHost::confirmReadyForActivation(GroupId group_id) {
     ConfirmReadyForActivationRequest req;
     req.group_id = std::move(group_id);
     req.rank = rank_;
-    req.agent_session_epoch = agent_.getAgentSessionEpoch();
+    req.agent_session_id = agent_.getAgentSessionId();
     auto resp =
         rpc_client_->call<&CoordinatorRpcService::confirmReadyForActivation>(
             coordinator_addr_, std::move(req));
@@ -278,7 +279,7 @@ void AgentHost::confirmReadyForActivation(GroupId group_id) {
 void AgentHost::sendPublishEndpointRpc(GroupEndpointPublication endpoint) {
     PublishEndpointRequest req;
     req.rank = rank_;
-    req.agent_session_epoch = agent_.getAgentSessionEpoch();
+    req.agent_session_id = agent_.getAgentSessionId();
     req.endpoints.push_back(std::move(endpoint));
     rpc_client_->call<&CoordinatorRpcService::publishEndpoint>(
         coordinator_addr_, std::move(req));
@@ -296,7 +297,7 @@ ProposeViewUpdateResponse AgentHost::proposeViewUpdateInternal(
     ProposeViewUpdateRequest req;
     req.group_id = group_id;
     req.source_rank = rank_;
-    req.agent_session_epoch = agent_.getAgentSessionEpoch();
+    req.agent_session_id = agent_.getAgentSessionId();
     req.requested_ranks = ranks;
     req.is_activation = is_activation;
     return rpc_client_->call<&CoordinatorRpcService::proposeViewUpdate>(
@@ -324,7 +325,7 @@ SyncAfterFailureResponse AgentHost::syncAfterFailure(GroupId group_id) {
 
     executor_.postAndWait([this, &req]() {
         req.reporter_rank = rank_;
-        req.agent_session_epoch = agent_.getAgentSessionEpoch();
+        req.agent_session_id = agent_.getAgentSessionId();
         req.link_event_report = agent_.getLinkEventReport();
         req.current_epoch = agent_.getGroupView(req.group_id).epoch;
     });
@@ -335,25 +336,24 @@ SyncAfterFailureResponse AgentHost::syncAfterFailure(GroupId group_id) {
     auto response = rpc_client_->call<&CoordinatorRpcService::syncAfterFailure>(
         coordinator_addr_, req);
 
-    executor_.postAndWait([this, group_id,
-                           request_session = req.agent_session_epoch,
-                           &response]() {
-        if (request_session != agent_.getAgentSessionEpoch()) {
-            response.status = SyncAfterFailureStatus::Rejected;
-            response.reject_reason = "agent session changed while syncing";
-            return;
-        }
+    executor_.postAndWait(
+        [this, group_id, request_session = req.agent_session_id, &response]() {
+            if (request_session != agent_.getAgentSessionId()) {
+                response.status = SyncAfterFailureStatus::Rejected;
+                response.reject_reason = "agent session changed while syncing";
+                return;
+            }
 
-        if (response.status == SyncAfterFailureStatus::Rejected) return;
+            if (response.status == SyncAfterFailureStatus::Rejected) return;
 
-        auto [effects, applied] =
-            agent_.applyGroupView(group_id, response.view);
-        runEffects(std::move(effects));
-        if (!applied) {
-            response.status = SyncAfterFailureStatus::Rejected;
-            response.reject_reason = "failed to apply group view";
-        }
-    });
+            auto [effects, applied] =
+                agent_.applyGroupView(group_id, response.view);
+            runEffects(std::move(effects));
+            if (!applied) {
+                response.status = SyncAfterFailureStatus::Rejected;
+                response.reject_reason = "failed to apply group view";
+            }
+        });
     return response;
 }
 
@@ -393,7 +393,7 @@ void AgentHost::postViewUpdate(coro_rpc::context<ViewUpdateAck> ctx,
     });
 }
 
-void AgentHost::startAgentRegistration() {
+void AgentHost::startAgentRegistration(bool start_new_session) {
     // Avoid duplicate registration RPCs.  This also covers the case where a
     // heartbeat response callback asks for re-registration while another
     // registration is already in flight.
@@ -401,6 +401,15 @@ void AgentHost::startAgentRegistration() {
         AgentStateMachine::CoordinatorConnection::AgentRegistering) {
         return;
     }
+    if (start_new_session) {
+        ++agent_session_id_;
+        agent_session_initialized_ = false;
+    }
+    if (!agent_session_initialized_) {
+        runEffects(agent_.reset(agent_session_id_));
+        agent_session_initialized_ = true;
+    }
+
     agent_.setCoordinatorConnection(
         AgentStateMachine::CoordinatorConnection::AgentRegistering);
 
@@ -409,67 +418,78 @@ void AgentHost::startAgentRegistration() {
     req.agent_addr = rpc_server_->getListenAddr(host_ip_);
     req.te_server_name = link_manager_.localServerName();
     req.warmup_recv_addr = link_manager_.getWarmupRecvAddr();
-    req.agent_session_epoch = ++agent_session_epoch_;
-    runEffects(agent_.reset(agent_session_epoch_));
+    req.agent_session_id = agent_session_id_;
+    const uint64_t request_session_id = req.agent_session_id;
 
     rpc_client_->callAsync<&CoordinatorRpcService::registerAgent>(
-        coordinator_addr_, std::move(req), [this](RegisterAgentResponse resp) {
-            executor_.post([this, resp = std::move(resp)]() mutable {
-                auto effects = agent_.applyRegisterAgentResponse(resp);
-                runEffects(effects);
+        coordinator_addr_, std::move(req),
+        [this, request_session_id](RegisterAgentResponse resp) {
+            executor_.post(
+                [this, request_session_id, resp = std::move(resp)]() mutable {
+                    if (request_session_id != agent_.getAgentSessionId())
+                        return;
 
-                if (resp.success) {
-                    next_heartbeat_at_ = std::chrono::steady_clock::now();
-                    if (!agent_registration_done_) {
-                        agent_registration_done_ = true;
-                        for (auto& p : agent_registration_promises_) {
-                            p->set_value();
-                        }
-                        agent_registration_promises_.clear();
-                    }
+                    auto effects = agent_.applyRegisterAgentResponse(resp);
+                    runEffects(effects);
 
-                    // Re-publish all local backends' endpoints after
-                    // (re-)reg. (Old session endpoints were cleared by
-                    // Coordinator.)
-                    forEachBackend([&](auto backend) {
-                        sendPublishEndpointRpc(
-                            backend->buildEndpointMetadata());
-                    });
-                } else {
-                    auto now = std::chrono::steady_clock::now();
-                    if (last_agent_register_error_log_time_
-                                .time_since_epoch() ==
-                            std::chrono::steady_clock::duration{} ||
-                        now - last_agent_register_error_log_time_ >=
-                            kAgentRegisterErrorLogInterval) {
-                        std::string suppressed_msg;
-                        if (agent_register_error_log_suppressed_ > 0) {
-                            suppressed_msg =
-                                " (suppressed " +
-                                std::to_string(
-                                    agent_register_error_log_suppressed_) +
-                                " identical log" +
-                                (agent_register_error_log_suppressed_ > 1
-                                     ? "s"
-                                     : "") +
-                                " since last print)";
+                    if (agent_.getCoordinatorConnection() ==
+                        AgentStateMachine::CoordinatorConnection::Connected) {
+                        next_heartbeat_at_ = std::chrono::steady_clock::now();
+                        if (!agent_registration_done_) {
+                            agent_registration_done_ = true;
+                            for (auto& p : agent_registration_promises_) {
+                                p->set_value();
+                            }
+                            agent_registration_promises_.clear();
                         }
-                        LOG(ERROR) << "AgentHost: registerAgent failed: "
-                                   << resp.reject_reason
-                                   << " (will retry after heartbeat "
-                                      "interval; if this "
-                                      "persists, the Coordinator may be "
-                                      "rejecting a "
-                                      "replacement rank before the old one "
-                                      "times out)"
-                                   << suppressed_msg;
-                        last_agent_register_error_log_time_ = now;
-                        agent_register_error_log_suppressed_ = 0;
+
+                        // Re-publish all local backends' endpoints after
+                        // (re-)reg. (Old session endpoints were cleared by
+                        // Coordinator.)
+                        forEachBackend([&](auto backend) {
+                            sendPublishEndpointRpc(
+                                backend->buildEndpointMetadata());
+                        });
                     } else {
-                        ++agent_register_error_log_suppressed_;
+                        auto now = std::chrono::steady_clock::now();
+                        if (last_agent_register_error_log_time_
+                                    .time_since_epoch() ==
+                                std::chrono::steady_clock::duration{} ||
+                            now - last_agent_register_error_log_time_ >=
+                                kAgentRegisterErrorLogInterval) {
+                            std::string suppressed_msg;
+                            if (agent_register_error_log_suppressed_ > 0) {
+                                suppressed_msg =
+                                    " (suppressed " +
+                                    std::to_string(
+                                        agent_register_error_log_suppressed_) +
+                                    " identical log" +
+                                    (agent_register_error_log_suppressed_ > 1
+                                         ? "s"
+                                         : "") +
+                                    " since last print)";
+                            }
+                            LOG(ERROR) << "AgentHost: registerAgent failed: "
+                                       << resp.reject_reason
+                                       << " (will retry after heartbeat "
+                                          "interval; if this "
+                                          "persists, the Coordinator may be "
+                                          "rejecting a "
+                                          "replacement rank before the old one "
+                                          "times out)"
+                                       << suppressed_msg;
+                            last_agent_register_error_log_time_ = now;
+                            agent_register_error_log_suppressed_ = 0;
+                        } else {
+                            ++agent_register_error_log_suppressed_;
+                        }
+
+                        if (resp.require_new_session) {
+                            // The accepted session has gone Offline.
+                            startAgentRegistration(/*start_new_session=*/true);
+                        }
                     }
-                }
-            });
+                });
         });
 }
 
@@ -493,17 +513,27 @@ void AgentHost::tick() {
     if (now < next_heartbeat_at_) return;
     next_heartbeat_at_ = now + kHeartbeatInterval;
 
+    // Link reports are delivery-ACKed and idempotent by report_id. Retry the
+    // latest unacknowledged snapshot with the heartbeat cadence so a dropped
+    // fire-and-forget report (or ACK) cannot permanently suppress the only
+    // LinkUp observation for an epoch.
+    if (auto report = agent_.getLinkEventReport()) {
+        rpc_client_->send<&CoordinatorRpcService::reportLinkEvent>(
+            coordinator_addr_, std::move(*report));
+    }
+
     auto req = agent_.buildHeartbeat();
-    req.agent_session_epoch = agent_.getAgentSessionEpoch();
-    auto request_session = req.agent_session_epoch;
+    req.agent_session_id = agent_.getAgentSessionId();
+    auto request_session = req.agent_session_id;
 
     rpc_client_->callAsync<&CoordinatorRpcService::heartbeat>(
         coordinator_addr_, std::move(req),
         [this, request_session](HeartbeatResponse resp) {
             executor_.post([this, request_session, resp]() {
-                if (request_session != agent_.getAgentSessionEpoch()) return;
-                if (resp.require_reregister) {
-                    startAgentRegistration();
+                if (request_session != agent_.getAgentSessionId()) return;
+                if (resp.require_new_session) {
+                    // The current session is no longer valid.
+                    startAgentRegistration(/*start_new_session=*/true);
                 }
             });
         });
@@ -514,7 +544,8 @@ void AgentHost::runEffects(const AgentApplyResult& effects) {
         std::visit(
             overloaded{
                 [this](const EnablePeerProbe& e) {
-                    link_manager_.enablePeerProbe(e.rank, e.te_server_name,
+                    link_manager_.enablePeerProbe(e.rank, e.rank_epoch,
+                                                  e.te_server_name,
                                                   e.warmup_recv_addr);
                 },
                 [this](const DisconnectLink& e) {
@@ -577,7 +608,7 @@ void AgentHost::runEffects(const AgentApplyResult& effects) {
                 [this](const ApplyViewToBackend& e) {
                     withBackend(e.group_id, [&](auto backend) {
                         backend->applyViewUpdate(e.view, e.rank_states,
-                                                 e.activatable);
+                                                 e.rank_epochs, e.activatable);
                     });
                 },
                 [this](const NotifyGroupReady& e) {

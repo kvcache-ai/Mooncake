@@ -155,7 +155,7 @@ uint64_t LinkManager::getWarmupRecvAddr() const {
     return reinterpret_cast<uint64_t>(warmup_recv_region_.get());
 }
 
-void LinkManager::enablePeerProbe(GlobalRank peer,
+void LinkManager::enablePeerProbe(GlobalRank peer, uint64_t target_rank_epoch,
                                   const std::string& server_name,
                                   uint64_t warmup_recv_addr) {
     if (peer == rank_) return;
@@ -163,6 +163,14 @@ void LinkManager::enablePeerProbe(GlobalRank peer,
 
     std::lock_guard<std::mutex> lock(peers_mutex_);
     auto& link = peers_[peer];
+
+    // Peer lifecycle pushes can arrive out of order.  Never let metadata for
+    // an older rank incarnation replace the current probe target.
+    if (target_rank_epoch < link.target_rank_epoch) return;
+    if (target_rank_epoch > link.target_rank_epoch) {
+        tearDownPeerLink(peer);
+        link.target_rank_epoch = target_rank_epoch;
+    }
     link.server_name = server_name;
     link.warmup_recv_addr = warmup_recv_addr;
     link.is_candidate = true;
@@ -393,7 +401,8 @@ bool LinkManager::advanceHealthCheck(GlobalRank peer) {
         link.probe_batch_id = std::nullopt;
         link.health_check_requested = false;
         link.probe_backoff = PeerLink::kProbeBackoffMin;
-        emit(TELinkUpEvent{.peer = peer});
+        emit(TELinkUpEvent{.peer = peer,
+                           .target_rank_epoch = link.target_rank_epoch});
         return true;
     }
 
@@ -439,6 +448,7 @@ bool LinkManager::advanceConnection(GlobalRank peer) {
                 publishLinkUp(peer, segment_id);
                 emit(TELinkUpEvent{
                     .peer = peer,
+                    .target_rank_epoch = link.target_rank_epoch,
                 });
                 return true;
             }
@@ -485,6 +495,7 @@ bool LinkManager::advanceConnection(GlobalRank peer) {
                 publishLinkUp(peer, link.target_id.value());
                 emit(TELinkUpEvent{
                     .peer = peer,
+                    .target_rank_epoch = link.target_rank_epoch,
                 });
                 return true;
             }
@@ -514,13 +525,17 @@ bool LinkManager::advanceConnection(GlobalRank peer) {
                 return false;
             }
 
-            if (*reinterpret_cast<volatile int32_t*>(
-                    &warmup_recv_region_[peer])) {
+            auto* warmup_flag = reinterpret_cast<volatile int32_t*>(
+                &warmup_recv_region_[peer]);
+            if (*warmup_flag) {
+                // Consume the one-shot signal here.
+                *warmup_flag = 0;
                 link.state = PeerLinkState::Connected;
                 link.probe_backoff = PeerLink::kProbeBackoffMin;
                 publishLinkUp(peer, link.target_id.value());
                 emit(TELinkUpEvent{
                     .peer = peer,
+                    .target_rank_epoch = link.target_rank_epoch,
                 });
                 return true;
             }

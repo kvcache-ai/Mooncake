@@ -90,7 +90,7 @@ class AgentInterface {
 
     virtual SyncAfterFailureResponse syncAfterFailure(GroupId group_id) = 0;
 
-    virtual uint64_t getAgentSessionEpoch() = 0;
+    virtual uint64_t getAgentSessionId() = 0;
 };
 
 class AgentHost;
@@ -153,9 +153,7 @@ class AgentHost : public AgentInterface {
 
     SyncAfterFailureResponse syncAfterFailure(GroupId group_id) override;
 
-    uint64_t getAgentSessionEpoch() override {
-        return agent_.getAgentSessionEpoch();
-    }
+    uint64_t getAgentSessionId() override { return agent_.getAgentSessionId(); }
     void postPeerJoined(PeerJoinedPush push);
     void postRankStateUpdate(RankStatePush push);
     void postLinkEventReportAck(LinkEventReportAck ack);
@@ -174,7 +172,8 @@ class AgentHost : public AgentInterface {
     int max_world_size_;
 
     std::string coordinator_addr_;
-    uint64_t agent_session_epoch_ = 0;
+    uint64_t agent_session_id_ = 0;
+    bool agent_session_initialized_ = false;
     std::chrono::steady_clock::time_point next_heartbeat_at_;
 
     // RPC infrastructure.
@@ -211,7 +210,7 @@ class AgentHost : public AgentInterface {
     // Accessed only from the executor thread.
     std::unordered_map<GroupId, MooncakeBackend*> backends_;
 
-    void startAgentRegistration();
+    void startAgentRegistration(bool start_new_session = false);
     void tick();
 
     void sendPublishEndpointRpc(GroupEndpointPublication endpoint);

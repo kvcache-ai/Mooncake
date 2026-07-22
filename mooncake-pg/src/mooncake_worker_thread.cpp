@@ -408,13 +408,18 @@ void MooncakeWorker::startWorker() {
                                 LinkEvent event;
                                 event.events.assign(kMaxNumRanks,
                                                     LinkEvent::EventType::None);
+                                event.target_rank_epochs.assign(kMaxNumRanks,
+                                                                0);
                                 for (int j = 0; j < group->maxGroupSize; ++j) {
-                                    int32_t peer_global = group->rank_order[j];
+                                    const auto peer_global =
+                                        group->rank_order[j];
                                     if (!hasAttempted(i, j)) continue;
                                     event.events[peer_global] =
                                         hasFailed(i, j)
                                             ? LinkEvent::EventType::Failure
                                             : LinkEvent::EventType::Success;
+                                    event.target_rank_epochs[peer_global] =
+                                        group->rankEpochs[peer_global];
                                 }
                                 group->backend->getAgent().pushLinkEvent(event);
                             }

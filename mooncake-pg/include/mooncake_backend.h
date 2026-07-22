@@ -323,6 +323,7 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     // machine.
     void applyViewUpdate(const GroupView& view,
                          const std::vector<RankState>& rank_states,
+                         const std::vector<uint64_t>& rank_epochs,
                          const std::vector<bool>& activatable);
 
     // Returns the current GroupView epoch.

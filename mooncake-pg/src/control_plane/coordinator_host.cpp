@@ -261,10 +261,10 @@ void CoordinatorHost::runEffects(
                     }
                 },
                 [this](const AckLinkEventReport& e) {
-                    if (state_machine_.getRankState(e.ack.rank) !=
+                    if (state_machine_.getRankState(e.ack.reporter_rank) !=
                         RankState::Offline) {
                         pushToAgent<&AgentRpcService::onLinkEventReportAck>(
-                            e.ack.rank, e.ack);
+                            e.ack.reporter_rank, e.ack);
                     }
                 },
             },

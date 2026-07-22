@@ -132,6 +132,10 @@ struct LinkEvent {
     };
 
     std::vector<EventType> events;
+    // The Coordinator-assigned epoch of the target rank observed by the
+    // event source.  This is parallel to events and prevents a late event for
+    // an old process incarnation from being attributed to its replacement.
+    std::vector<uint64_t> target_rank_epochs;
 };
 
 }  // namespace mooncake

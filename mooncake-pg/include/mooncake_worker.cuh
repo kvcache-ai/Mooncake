@@ -70,6 +70,7 @@ struct TransferGroupMeta {
     at::Tensor activeRanksTensor;
     bool* maybeActivatable;
     RankState rankStates[kMaxNumRanks];  // per GlobalRank
+    uint64_t rankEpochs[kMaxNumRanks];
     TransferEngine* engine;
     TransferMetadata::SegmentID segmentIDs[kMaxNumRanks];
     GroupEndpointInfo segmentInfos[kMaxNumRanks];

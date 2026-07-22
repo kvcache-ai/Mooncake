@@ -21,6 +21,7 @@ namespace mooncake {
 
 struct TELinkUpEvent {
     GlobalRank peer = kInvalidGlobalRank;
+    uint64_t target_rank_epoch = 0;
 };
 
 // Process-level manager for shared TE states.
@@ -40,7 +41,8 @@ class LinkManager {
 
     uint64_t getWarmupRecvAddr() const;
 
-    void enablePeerProbe(GlobalRank peer, const std::string& server_name,
+    void enablePeerProbe(GlobalRank peer, uint64_t target_rank_epoch,
+                         const std::string& server_name,
                          uint64_t warmup_recv_addr = 0);
 
     void disconnect(GlobalRank peer);
@@ -81,6 +83,7 @@ class LinkManager {
 
     struct PeerLink {
         PeerLinkState state = PeerLinkState::Idle;
+        uint64_t target_rank_epoch = 0;
         std::string server_name;
         bool is_candidate = false;
         bool skip_warmup = false;

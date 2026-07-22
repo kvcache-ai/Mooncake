@@ -252,6 +252,7 @@ MooncakeBackend::MooncakeBackend(
     meta_ = std::make_shared<TransferGroupMeta>();
     for (int i = 0; i < kMaxNumRanks; ++i) {
         meta_->segmentIDs[i] = static_cast<TransferMetadata::SegmentID>(-1);
+        meta_->rankEpochs[i] = 0;
     }
     meta_->rank = rank;
     meta_->globalRank = initial_rank_order[rank];
@@ -367,7 +368,7 @@ MooncakeBackend::MooncakeBackend(
     agent_.publishLocalEndpoint(buildEndpointMetadata());
 
     auto view =
-        agent_.waitUntilGroupReady(meta_->group_id, std::chrono::seconds(30));
+        agent_.waitUntilGroupReady(meta_->group_id, std::chrono::seconds(300));
 
     // Initialize all peer segment IDs from the LinkManager.
     // Subsequent updates (endpoint changes, disconnects) are handled by
@@ -459,7 +460,6 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::send(
     }
 
     auto failed_ranks = FailedRanksHint::allocate(meta_->maxGroupSize);
-
     TORCH_CHECK(p2p_proxy_, "P2P send proxy is not initialized.");
     p2p_proxy_->enqueueSend(P2PProxy::SendOp{
         .tensor_ = std::move(contiguous),
@@ -495,7 +495,6 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::recv(
     }
 
     auto failed_ranks = FailedRanksHint::allocate(meta_->maxGroupSize);
-
     TORCH_CHECK(p2p_proxy_, "P2P recv proxy is not initialized.");
     p2p_proxy_->enqueueRecv(P2PProxy::RecvOp{
         .tensor_ = target,
@@ -1040,7 +1039,7 @@ void MooncakeBackend::syncActiveRanksTensor() {
         meta_->activeRanksTensor = cpu_tensor;
         return;
     }
-    meta_->activeRanksTensor.copy_(cpu_tensor);
+    meta_->activeRanksTensor.copy_(cpu_tensor, /*non_blocking=*/true);
 }
 
 void MooncakeBackend::extendGroupSizeTo(int newSize) {
@@ -1129,7 +1128,7 @@ void MooncakeBackend::joinGroup() {
 
     // Block until the Coordinator activates this rank in the group.
     agent_.waitUntilRankActive(meta_->group_id, meta_->globalRank,
-                               std::chrono::seconds(30));
+                               std::chrono::seconds(300));
     const bool normal_and_active =
         meta_->extensionMode.load(std::memory_order_acquire) ==
             CollectiveExtensionState::Normal &&
@@ -1145,6 +1144,7 @@ SyncAfterFailureResponse MooncakeBackend::syncAfterFailure() {
 
 void MooncakeBackend::applyViewUpdate(const GroupView& view,
                                       const std::vector<RankState>& rank_states,
+                                      const std::vector<uint64_t>& rank_epochs,
                                       const std::vector<bool>& activatable) {
     if (!meta_) return;
 
@@ -1234,6 +1234,9 @@ void MooncakeBackend::applyViewUpdate(const GroupView& view,
     // Rank states
     for (size_t i = 0; i < rank_states.size(); ++i) {
         meta_->rankStates[i] = rank_states[i];
+    }
+    for (size_t i = 0; i < rank_epochs.size(); ++i) {
+        meta_->rankEpochs[i] = rank_epochs[i];
     }
 
     // Best-effort Activatable

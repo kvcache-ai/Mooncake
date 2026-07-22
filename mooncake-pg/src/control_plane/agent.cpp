@@ -12,22 +12,27 @@ AgentStateMachine::AgentStateMachine(GlobalRank rank, int max_world_size)
         << "max_world_size " << max_world_size_ << " exceeds kMaxNumRanks ("
         << kMaxNumRanks << ")";
     global_rank_states_ = std::vector<RankState>(max_world_size_);
+    global_rank_epochs_.assign(max_world_size_, 0);
+    global_rank_state_versions_.assign(max_world_size_, 0);
     rank_connections_.resize(max_world_size_);
     observed_link_state_.assign(max_world_size_, LinkEvent::EventType::None);
+    observed_target_rank_epochs_.assign(max_world_size_, 0);
 }
 
-static ApplyViewToBackend makeApplyViewEffect(
-    const GroupView& view, const std::vector<RankState>& rank_states) {
+void AgentStateMachine::appendApplyViewEffect(const GroupView& view,
+                                              AgentApplyResult& effects) const {
     std::vector<bool> activatable(view.rank_order.size());
     for (size_t i = 0; i < view.rank_order.size(); ++i) {
         GlobalRank gr = view.rank_order[i];
-        bool healthy = rank_states[gr] == RankState::Healthy;
+        bool healthy = global_rank_states_[gr] == RankState::Healthy;
         const auto& member = view.members[gr];
         activatable[i] = healthy &&
                          (member.isActive() || member.isAwaitingActivation()) &&
                          member.hasEndpoint();
     }
-    return {view.group_id, view, rank_states, std::move(activatable)};
+    effects.push_back(
+        ApplyViewToBackend{view.group_id, view, global_rank_states_,
+                           global_rank_epochs_, std::move(activatable)});
 }
 
 void AgentStateMachine::registerGroup(const GroupView& group,
@@ -49,6 +54,31 @@ GroupView AgentStateMachine::getGroupView(GroupId group_id) const {
     return GroupView{};
 }
 
+void AgentStateMachine::appendApplyViewEffectsForRank(
+    GlobalRank rank, AgentApplyResult& effects) const {
+    for (const auto& [group_id, view] : groups_) {
+        if (std::find(view.rank_order.begin(), view.rank_order.end(), rank) !=
+            view.rank_order.end()) {
+            appendApplyViewEffect(view, effects);
+        }
+    }
+}
+
+void AgentStateMachine::resetRankForNewEpoch(GlobalRank rank,
+                                             uint64_t rank_epoch,
+                                             AgentApplyResult& effects) {
+    global_rank_epochs_[rank] = rank_epoch;
+    global_rank_state_versions_[rank] = 0;
+    global_rank_states_[rank] = RankState::Offline;
+    rank_connections_[rank].reset();
+
+    if (rank != rank_) {
+        effects.push_back(DisconnectLink{rank});
+        effects.push_back(StopReconnect{rank});
+        effects.push_back(NotifyLinkRefreshed{rank});
+    }
+}
+
 AgentApplyResult AgentStateMachine::handlePeerJoined(
     const PeerJoinedPush& push) {
     AgentApplyResult effects;
@@ -59,20 +89,30 @@ AgentApplyResult AgentStateMachine::handlePeerJoined(
     }
     if (push.rank == rank_) return effects;
 
-    auto old = rank_connections_[push.rank];
-    if (old.has_value() && old->te_server_name != push.te_server_name) {
-        effects.push_back(DisconnectLink{push.rank});
-        effects.push_back(NotifyLinkRefreshed{push.rank});
+    if (push.rank_epoch < global_rank_epochs_[push.rank]) return effects;
+
+    const bool new_rank_epoch =
+        push.rank_epoch > global_rank_epochs_[push.rank];
+    if (new_rank_epoch) {
+        resetRankForNewEpoch(push.rank, push.rank_epoch, effects);
+        appendApplyViewEffectsForRank(push.rank, effects);
+    } else if (global_rank_states_[push.rank] == RankState::Offline) {
+        // Offline is terminal within a rank epoch. A delayed PeerJoined for
+        // that epoch must not restart the old connection.
+        return effects;
     }
+
+    if (rank_connections_[push.rank].has_value()) return effects;
 
     rank_connections_[push.rank] = RankConnectionMetadata{
         .rank = push.rank,
+        .rank_epoch = push.rank_epoch,
         .te_server_name = push.te_server_name,
         .warmup_recv_addr = push.warmup_recv_addr,
     };
-
-    effects.push_back(
-        EnablePeerProbe{push.rank, push.te_server_name, push.warmup_recv_addr});
+    effects.push_back(EnablePeerProbe{push.rank, push.rank_epoch,
+                                      push.te_server_name,
+                                      push.warmup_recv_addr});
     return effects;
 }
 
@@ -85,25 +125,29 @@ AgentApplyResult AgentStateMachine::handleRankStateUpdate(
         return effects;
     }
 
-    global_rank_states_[push.rank] = push.new_state;
-    if (push.rank == rank_) {
-        rank_state_ = push.new_state;
+    if (push.rank_epoch < global_rank_epochs_[push.rank]) return effects;
+
+    const bool new_rank_epoch =
+        push.rank_epoch > global_rank_epochs_[push.rank];
+    if (new_rank_epoch) {
+        resetRankForNewEpoch(push.rank, push.rank_epoch, effects);
     }
 
-    // Rank state changed: recompute activatable for every group that
-    // contains this rank and push updated ApplyViewToBackend effects.
-    for (const auto& [group_id, view] : groups_) {
-        if (std::find(view.rank_order.begin(), view.rank_order.end(),
-                      push.rank) != view.rank_order.end()) {
-            effects.push_back(makeApplyViewEffect(view, global_rank_states_));
-        }
-    }
+    if (push.rank_state_version <= global_rank_state_versions_[push.rank])
+        return effects;
+
+    global_rank_states_[push.rank] = push.new_state;
+    global_rank_state_versions_[push.rank] = push.rank_state_version;
+    appendApplyViewEffectsForRank(push.rank, effects);
 
     // Remote Offline: tear down TE link AND stop candidate probe.
     if (push.rank != rank_ && push.new_state == RankState::Offline) {
-        effects.push_back(DisconnectLink{push.rank});
-        effects.push_back(StopReconnect{push.rank});
-        effects.push_back(NotifyLinkRefreshed{push.rank});
+        rank_connections_[push.rank].reset();
+        if (!new_rank_epoch) {
+            effects.push_back(DisconnectLink{push.rank});
+            effects.push_back(StopReconnect{push.rank});
+            effects.push_back(NotifyLinkRefreshed{push.rank});
+        }
     }
 
     return effects;
@@ -159,7 +203,7 @@ std::pair<AgentApplyResult, bool> AgentStateMachine::applyGroupView(
     // Applying the view must happen-before waking group/rank waiters: callers
     // may submit a collective as soon as waitUntilGroupReady()/joinGroup()
     // returns, and that collective must observe the new data-plane metadata.
-    effects.push_back(makeApplyViewEffect(view, global_rank_states_));
+    appendApplyViewEffect(view, effects);
 
     // Detect rank activation transitions.
     if (!old_view.members.empty()) {
@@ -214,45 +258,55 @@ AgentApplyResult AgentStateMachine::applyRegisterAgentResponse(
         return effects;
     }
 
-    if (static_cast<int>(resp.all_rank_states.size()) != max_world_size_) {
-        LOG(ERROR) << "AgentStateMachine: all_rank_states size mismatch (got "
-                   << resp.all_rank_states.size() << ", expected "
-                   << max_world_size_ << "); rejecting.";
+    if (static_cast<int>(resp.all_rank_states.size()) != max_world_size_ ||
+        static_cast<int>(resp.all_rank_epochs.size()) != max_world_size_ ||
+        static_cast<int>(resp.all_rank_state_versions.size()) !=
+            max_world_size_) {
+        LOG(ERROR) << "AgentStateMachine: malformed RegisterAgentResponse";
+        coordinator_connection_ = CoordinatorConnection::Disconnected;
         return effects;
     }
+
+    self_rank_epoch_.store(resp.rank_epoch, std::memory_order_release);
     global_rank_states_ = resp.all_rank_states;
-    rank_state_ = resp.all_rank_states[rank_];
+    global_rank_epochs_ = resp.all_rank_epochs;
+    global_rank_state_versions_ = resp.all_rank_state_versions;
 
     for (const auto& gv : resp.groups) {
         groups_[gv.group_id] = gv;
-        effects.push_back(makeApplyViewEffect(gv, global_rank_states_));
+        appendApplyViewEffect(gv, effects);
     }
 
-    for (const auto& conn : resp.rank_connections) {
-        if (conn.rank == rank_) continue;
-        rank_connections_[conn.rank] = conn;
-        effects.push_back(EnablePeerProbe{conn.rank, conn.te_server_name,
-                                          conn.warmup_recv_addr});
+    for (const auto& connection : resp.rank_connections) {
+        rank_connections_[connection.rank] = connection;
+        effects.push_back(EnablePeerProbe{
+            .rank = connection.rank,
+            .rank_epoch = connection.rank_epoch,
+            .te_server_name = connection.te_server_name,
+            .warmup_recv_addr = connection.warmup_recv_addr,
+        });
     }
 
     coordinator_connection_ = CoordinatorConnection::Connected;
-    if (auto report = getLinkEventReport()) {
-        effects.push_back(SendLinkEventReport{std::move(*report)});
-    }
     return effects;
 }
 
-AgentApplyResult AgentStateMachine::reset(uint64_t new_epoch) {
+AgentApplyResult AgentStateMachine::reset(uint64_t new_session_id) {
     AgentApplyResult effects;
 
-    agent_session_epoch_.store(new_epoch, std::memory_order_release);
+    agent_session_id_.store(new_session_id, std::memory_order_release);
+    self_rank_epoch_.store(0, std::memory_order_release);
     std::fill(observed_link_state_.begin(), observed_link_state_.end(),
               LinkEvent::EventType::None);
+    std::fill(observed_target_rank_epochs_.begin(),
+              observed_target_rank_epochs_.end(), 0);
     link_state_version_ = 0;
     acked_link_state_version_ = 0;
-    rank_state_ = RankState::Offline;
     groups_.clear();
     global_rank_states_ = std::vector<RankState>(max_world_size_);
+    std::fill(global_rank_epochs_.begin(), global_rank_epochs_.end(), 0);
+    std::fill(global_rank_state_versions_.begin(),
+              global_rank_state_versions_.end(), 0);
     for (auto& conn : rank_connections_) conn.reset();
 
     effects.push_back(DisconnectAllLinks{});
@@ -264,7 +318,9 @@ AgentApplyResult AgentStateMachine::reset(uint64_t new_epoch) {
 AgentApplyResult AgentStateMachine::pushLinkEvent(const LinkEvent& event) {
     AgentApplyResult effects;
 
-    if (event.events.size() != static_cast<size_t>(max_world_size_)) {
+    if (event.events.size() != static_cast<size_t>(max_world_size_) ||
+        event.target_rank_epochs.size() !=
+            static_cast<size_t>(max_world_size_)) {
         LOG(WARNING) << "AgentStateMachine: invalid LinkEvent size. "
                      << "Expected max_world_size=" << max_world_size_
                      << "; dropping.";
@@ -275,7 +331,8 @@ AgentApplyResult AgentStateMachine::pushLinkEvent(const LinkEvent& event) {
     for (int peer = 0; peer < max_world_size_; ++peer) {
         auto type = event.events[peer];
         if (type == LinkEvent::EventType::None) continue;
-        if (!recordLinkEvent(peer, type)) continue;
+        if (!recordLinkEvent(peer, event.target_rank_epochs[peer], type))
+            continue;
 
         changed = true;
         if (type == LinkEvent::EventType::Failure) {
@@ -302,17 +359,18 @@ std::optional<LinkEventReport> AgentStateMachine::getLinkEventReport() const {
 
     LinkEventReport report;
     report.reporter_rank = rank_;
-    report.agent_session_epoch = getAgentSessionEpoch();
+    report.agent_session_id = getAgentSessionId();
+    report.reporter_rank_epoch = getRankEpoch();
     report.report_id = link_state_version_;
     report.events = observed_link_state_;
+    report.target_rank_epochs = observed_target_rank_epochs_;
     return report;
 }
 
 void AgentStateMachine::handleLinkEventReportAck(
     const LinkEventReportAck& ack) {
-    if (ack.rank != rank_ ||
-        ack.agent_session_epoch != getAgentSessionEpoch() ||
-        ack.report_id > link_state_version_) {
+    if (ack.reporter_rank != rank_ ||
+        ack.reporter_rank_epoch != getRankEpoch()) {
         return;
     }
     acked_link_state_version_ =
@@ -320,9 +378,16 @@ void AgentStateMachine::handleLinkEventReportAck(
 }
 
 bool AgentStateMachine::recordLinkEvent(GlobalRank peer,
+                                        uint64_t target_rank_epoch,
                                         LinkEvent::EventType type) {
-    if (observed_link_state_[peer] == type) return false;
+    if (target_rank_epoch != global_rank_epochs_[peer]) return false;
 
+    if (observed_target_rank_epochs_[peer] == target_rank_epoch &&
+        observed_link_state_[peer] == type) {
+        return false;
+    }
+
+    observed_target_rank_epochs_[peer] = target_rank_epoch;
     observed_link_state_[peer] = type;
     ++link_state_version_;
     return true;

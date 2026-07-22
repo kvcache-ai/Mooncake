@@ -339,11 +339,14 @@ void P2PProxy::handleFailedSendOp(SendOpContext& op_ctx) {
     // Reset P2P session state (epoch, lanes).
     resetPeerState(op_ctx.peer_rank_);
     // link event vector is indexed by GlobalRank.
-    int32_t peer_global = meta_->rank_order[op_ctx.peer_rank_];
+    const auto peer_global = meta_->rank_order[op_ctx.peer_rank_];
+    const auto target_rank_epoch = meta_->rankEpochs[peer_global];
     if (meta_->backend) {
         LinkEvent event;
         event.events.assign(kMaxNumRanks, LinkEvent::EventType::None);
+        event.target_rank_epochs.assign(kMaxNumRanks, 0);
         event.events[peer_global] = LinkEvent::EventType::Failure;
+        event.target_rank_epochs[peer_global] = target_rank_epoch;
         meta_->backend->getAgent().pushLinkEvent(event);
     }
     op_ctx.status_->store(OpStatus::kFailed, std::memory_order_release);
@@ -358,11 +361,14 @@ void P2PProxy::handleFailedRecvOp(RecvOpContext& op_ctx) {
     // Reset P2P session state (epoch, lanes).
     resetPeerState(op_ctx.peer_rank_);
     // link event vector is indexed by GlobalRank.
-    int32_t peer_global = meta_->rank_order[op_ctx.peer_rank_];
+    const auto peer_global = meta_->rank_order[op_ctx.peer_rank_];
+    const auto target_rank_epoch = meta_->rankEpochs[peer_global];
     if (meta_->backend) {
         LinkEvent event;
         event.events.assign(kMaxNumRanks, LinkEvent::EventType::None);
+        event.target_rank_epochs.assign(kMaxNumRanks, 0);
         event.events[peer_global] = LinkEvent::EventType::Failure;
+        event.target_rank_epochs[peer_global] = target_rank_epoch;
         meta_->backend->getAgent().pushLinkEvent(event);
     }
     op_ctx.status_->store(OpStatus::kFailed, std::memory_order_release);

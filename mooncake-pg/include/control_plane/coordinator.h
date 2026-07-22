@@ -116,7 +116,13 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
         RankState state = RankState::Offline;
         std::string agent_addr;
         std::string te_server_name;
-        uint64_t agent_session_epoch = 0;
+        // Agent-generated key for one logical registration.
+        uint64_t agent_session_id = 0;
+        // Coordinator-assigned, monotonically increasing incarnation of this
+        // GlobalRank. Zero means no Agent has ever been accepted for it.
+        uint64_t rank_epoch = 0;
+        // Monotonically increasing version of the authoritative rank state.
+        uint64_t rank_state_version = 0;
         std::chrono::steady_clock::time_point last_heartbeat;
         std::vector<uint8_t> link_status;
         uint64_t last_link_event_report_id = 0;
@@ -154,7 +160,7 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
 
     struct PendingSync {
         uint64_t sync_id = 0;
-        uint64_t agent_session_epoch = 0;
+        uint64_t agent_session_id = 0;
     };
 
     using PendingSyncs = std::unordered_map<
@@ -189,6 +195,9 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     void tryCloseReconciliationWindow(std::vector<CoordinatorEffect>& effects);
     void processLinkEventReport(const LinkEventReport& report,
                                 std::vector<CoordinatorEffect>& effects);
+
+    void populateRegisterAgentResponse(RegisterAgentResponse& response,
+                                       GlobalRank rank) const;
 
     SyncAfterFailureResponse makeSyncResponse(SyncAfterFailureStatus status,
                                               GroupId group_id) const;
@@ -242,9 +251,9 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
                             std::vector<CoordinatorEffect>& effects);
 
     // Request validation: rank must be in range, online, and matching session.
-    bool hasValidSession(GlobalRank rank, uint64_t session_epoch) const {
+    bool hasValidSession(GlobalRank rank, uint64_t session_id) const {
         return rankInRange(rank) && ranks_[rank].state != RankState::Offline &&
-               ranks_[rank].agent_session_epoch == session_epoch;
+               ranks_[rank].agent_session_id == session_id;
     }
 
     bool rankInRange(GlobalRank rank) const {
