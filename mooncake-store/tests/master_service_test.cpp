@@ -320,6 +320,40 @@ class MasterServiceTest : public ::testing::Test {
     }
 };
 
+TEST_F(MasterServiceTest, StoreChecksumIsStoredAndClearedByUpsert) {
+    MasterService service;
+    const auto segment = PrepareSimpleSegment(service, "checksum_segment");
+    const std::string key = "checksum_key";
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "checksum_segment";
+
+    ASSERT_TRUE(
+        service.PutStart(segment.client_id, key, "default", 1024, config)
+            .has_value());
+    constexpr uint64_t kChecksum = 0;
+    ASSERT_TRUE(service
+                    .PutEnd(segment.client_id, key, "default",
+                            ReplicaType::MEMORY, kChecksum)
+                    .has_value());
+
+    auto query = service.GetReplicaList(key, "default");
+    ASSERT_TRUE(query.has_value());
+    ASSERT_TRUE(query->store_checksum.has_value());
+    EXPECT_EQ(*query->store_checksum, kChecksum);
+
+    ASSERT_TRUE(
+        service.UpsertStart(segment.client_id, key, "default", 1024, config)
+            .has_value());
+    ASSERT_TRUE(service
+                    .UpsertEnd(segment.client_id, key, "default",
+                               ReplicaType::MEMORY, std::nullopt)
+                    .has_value());
+    query = service.GetReplicaList(key, "default");
+    ASSERT_TRUE(query.has_value());
+    EXPECT_FALSE(query->store_checksum.has_value());
+}
+
 TEST(TenantScopedStorageKeyTest, RoundTripsAndParsesLegacyKeys) {
     const auto scoped =
         MakeTenantScopedStorageKey("tenant:with:colon", "path/key:with:colon");

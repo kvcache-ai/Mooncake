@@ -389,6 +389,8 @@ enum class ErrorCode : int32_t {
 
     // Transfer errors (Range: -800 to -899)
     TRANSFER_FAIL = -800,  ///< Transfer operation failed.
+    /// Store checksum verification failed.
+    CHECKSUM_MISMATCH = -801,
 
     // RPC errors (Range: -900 to -999)
     RPC_FAIL = -900,     ///< RPC operation failed.

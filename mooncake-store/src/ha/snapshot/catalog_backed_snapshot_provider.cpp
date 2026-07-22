@@ -141,11 +141,12 @@ DeserializeStandbyObjectMetadata(
         //   v3: 9 + replica_count, data_type + hard_pinned or
         //       hard_pinned + group_id
         //   v4: 10 + replica_count, data_type + hard_pinned + group_id
+        //   v5: 11 + replica_count, v4 + store_checksum (ignored here)
         // 64-bit arithmetic keeps an attacker-controlled near-UINT32_MAX
         // replica_count from wrapping the bounds and slipping an out-of-bounds
         // index through.
         constexpr uint64_t kBaseFieldCount = 7;
-        constexpr uint64_t kMaxOptionalFieldCount = 3;
+        constexpr uint64_t kMaxOptionalFieldCount = 4;
         const uint64_t total_elements = object.via.array.size;
         const uint64_t min_elements = kBaseFieldCount + replica_count;
         if (total_elements < min_elements ||
