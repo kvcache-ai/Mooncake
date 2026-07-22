@@ -3001,7 +3001,7 @@ keys = ["block0", "block1"]
 object_sizes = [page * layers] * len(keys)
 
 # Prepare one registered buffer per layer for each key
-src = [np.arange(page, dtype=np.uint8) + i for i in range(layers)]
+src = [np.full(page, i, dtype=np.uint8) for i in range(layers)]
 dst = [np.zeros(page, dtype=np.uint8) for _ in range(layers)]
 for buf in src + dst:
     store.register_buffer(buf.ctypes.data, buf.nbytes)
