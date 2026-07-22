@@ -78,9 +78,7 @@ RegisteredPinnedMemoryManager::PinOps DefaultPinOps() {
 
 }  // namespace
 
-RegisteredPinnedRegion::~RegisteredPinnedRegion() {
-    release();
-}
+RegisteredPinnedRegion::~RegisteredPinnedRegion() { release(); }
 
 bool RegisteredPinnedRegion::release() {
     if (!manager_) return release_succeeded_;

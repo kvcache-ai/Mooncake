@@ -113,8 +113,7 @@ TEST_F(RegisteredPinnedMemoryManagerTest, RegisterFailureRefundsReservation) {
     ExpectCalls(2, 1);
 }
 
-TEST_F(RegisteredPinnedMemoryManagerTest,
-       UnregisterFailureRetainsReservation) {
+TEST_F(RegisteredPinnedMemoryManagerTest, UnregisterFailureRetainsReservation) {
     auto manager = MakeManager(32);
 
     auto first = Pin(manager, 0, 32);

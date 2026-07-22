@@ -85,8 +85,8 @@ bool ReleasePinnedRegionsForFree(
     const char *segment_owner) {
     bool safe_to_free = true;
     for (auto &pinned_region : pinned_regions) {
-        safe_to_free &= ReleasePinnedRegionForFree(pinned_region,
-                                                   segment_owner);
+        safe_to_free &=
+            ReleasePinnedRegionForFree(pinned_region, segment_owner);
     }
     pinned_regions.clear();
     return safe_to_free;
@@ -1426,9 +1426,8 @@ void RealClient::ReleaseAllMountedSegmentRecords() {
 }
 
 void RealClient::FreeAllocatedStoreSegment(AllocatedSegmentRecord &record) {
-    if (record.base &&
-        ReleasePinnedRegionForFree(record.pinned_region,
-                                   "allocated Store segment")) {
+    if (record.base && ReleasePinnedRegionForFree(record.pinned_region,
+                                                  "allocated Store segment")) {
         free_memory(record.protocol, record.base);
     }
 }
