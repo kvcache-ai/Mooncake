@@ -3249,6 +3249,16 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
                                            std::chrono::system_clock::now()});
                         task_created = true;
                     }
+                } else {
+                    // A failed enqueue must not vanish silently: emit a
+                    // sampled warning, mirroring the eviction-path callers of
+                    // PushOffloadingQueue (#2997). The failure itself is
+                    // counted inside PushOffloadingQueue.
+                    LOG_EVERY_N(WARNING, 100)
+                        << "[PUT] PushOffloadingQueue failed for key "
+                        << object_id.user_key << ": "
+                        << toString(result.error())
+                        << " (this enqueue attempt failed)";
                 }
             });
     }
@@ -5119,6 +5129,12 @@ auto MasterService::NotifyOffloadSuccess(
 
 tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
     const ObjectIdentity& object_id, Replica& replica) {
+    // Count every failed enqueue attempt here so no caller can drop it
+    // silently (#2997).
+    auto fail = [](ErrorCode code) {
+        MasterMetricManager::instance().inc_offload_enqueue_failed();
+        return tl::make_unexpected(code);
+    };
     const auto& segment_names = replica.get_segment_names();
     if (segment_names.empty()) {
         return {};
@@ -5133,28 +5149,37 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
             local_disk_segment_access.getClientByName();
         auto client_id_it = client_by_name.find(segment_name_it.value());
         if (client_id_it == client_by_name.end()) {
-            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+            return fail(ErrorCode::SEGMENT_NOT_FOUND);
         }
         auto& client_local_disk_segment =
             local_disk_segment_access.getClientLocalDiskSegment();
         auto local_disk_segment_it =
             client_local_disk_segment.find(client_id_it->second);
         if (local_disk_segment_it == client_local_disk_segment.end()) {
-            return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
+            return fail(ErrorCode::UNABLE_OFFLOADING);
         }
         MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
         if (!local_disk_segment_it->second->enable_offloading) {
-            return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
+            return fail(ErrorCode::UNABLE_OFFLOADING);
         }
-        if (local_disk_segment_it->second->offloading_objects.size() >=
-            offloading_queue_limit_) {
-            return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
+        auto& offloading_objects =
+            local_disk_segment_it->second->offloading_objects;
+        const auto storage_key =
+            object_id.tenant_id.MakeScopedKey(object_id.user_key);
+        if (offloading_objects.contains(storage_key)) {
+            // A duplicate enqueue is benign (eager and eviction paths can
+            // race); report it to the caller but do not count it as a
+            // failure, even when the queue is otherwise full.
+            return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+        }
+        if (offloading_objects.size() >= offloading_queue_limit_) {
+            return fail(ErrorCode::KEYS_ULTRA_LIMIT);
         }
         const int64_t size = replica.get_descriptor()
                                  .get_memory_descriptor()
                                  .buffer_descriptor.size_;
-        auto res = local_disk_segment_it->second->offloading_objects.emplace(
-            object_id.tenant_id.MakeScopedKey(object_id.user_key),
+        auto res = offloading_objects.emplace(
+            storage_key,
             OffloadTaskItem{.tenant_id = object_id.tenant_id.value(),
                             .key = object_id.user_key,
                             .size = size});
