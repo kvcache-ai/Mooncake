@@ -293,9 +293,9 @@ TEST(HandshakeFrameTest, RejectsTlsProbe) {
     const uint8_t client_hello_prefix[] = {0x16, 0x03, 0x01, 0x05,
                                            0xc2, 0x01, 0x00, 0x05};
 
-    ASSERT_EQ(writeFully(fds[0], client_hello_prefix,
-                         sizeof(client_hello_prefix)),
-              static_cast<ssize_t>(sizeof(client_hello_prefix)));
+    ASSERT_EQ(
+        writeFully(fds[0], client_hello_prefix, sizeof(client_hello_prefix)),
+        static_cast<ssize_t>(sizeof(client_hello_prefix)));
 
     auto [read_type, payload] = readString(fds[1]);
     EXPECT_EQ(read_type, HandShakeRequestType::Invalid);
