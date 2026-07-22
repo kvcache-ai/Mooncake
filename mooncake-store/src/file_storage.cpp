@@ -793,6 +793,14 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                 auto remount_result =
                     client_->MountLocalDiskSegment(enable_offloading_);
                 if (remount_result) {
+                    if (config_.total_size_limit > 0) {
+                        auto cap_result = client_->ReportSsdCapacity(
+                            config_.total_size_limit);
+                        if (!cap_result) {
+                            LOG(WARNING) << "ReportSsdCapacity failed: "
+                                         << cap_result.error();
+                        }
+                    }
                     heartbeat_result = client_->OffloadObjectHeartbeat(
                         enable_offloading_, offloading_objects);
                     if (!heartbeat_result) {
