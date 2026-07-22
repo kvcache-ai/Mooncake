@@ -37,7 +37,7 @@ std::vector<int> batch_write_tensor_impl(const std::vector<std::string> &keys,
 
     {
         py::gil_scoped_release release_gil;
-        if (!store_->client_buffer_allocator_) {
+        if (!store_->client_buffer_allocator_ && !use_dummy_client_) {
             LOG(ERROR) << operation_name
                        << ": client buffer allocator is not available";
             return std::vector<int>(keys.size(),
@@ -60,8 +60,7 @@ std::vector<int> batch_write_tensor_impl(const std::vector<std::string> &keys,
 
             size_t total_size =
                 infos[i].metadata.header.data_offset + infos[i].tensor_size;
-            auto alloc_result =
-                store_->client_buffer_allocator_->allocate(total_size);
+            auto alloc_result = store_->allocate_client_buffer(total_size);
 
             if (!alloc_result) {
                 LOG(ERROR) << "Failed to allocate buffer for " << operation_name

@@ -2804,6 +2804,41 @@ tl::expected<void, ErrorCode> RealClient::release_buffer_dummy(
     return {};
 }
 
+tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>
+RealClient::allocate_buffer_dummy(size_t size, const UUID &client_id) {
+    std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto &context = it->second;
+    if (!context.client_buffer_allocator) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto alloc_result = context.client_buffer_allocator->allocate(size);
+    if (!alloc_result) {
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+
+    auto handle = std::make_shared<BufferHandle>(std::move(*alloc_result));
+    const uint64_t real_addr = reinterpret_cast<uint64_t>(handle->ptr());
+    const size_t allocated_size = handle->size();
+    for (const auto &shm : context.mapped_shms) {
+        const uint64_t shm_start = reinterpret_cast<uint64_t>(shm.shm_buffer);
+        const uint64_t shm_end = shm_start + shm.shm_size;
+        if (real_addr >= shm_start &&
+            allocated_size <= shm_end - real_addr) {
+            const uint64_t dummy_addr = real_addr - shm.shm_addr_offset;
+            context.active_handles[dummy_addr] = std::move(handle);
+            return std::make_tuple(dummy_addr, allocated_size);
+        }
+    }
+
+    return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+}
+
 std::vector<tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>>
 RealClient::batch_acquire_hot_cache(const std::vector<std::string> &keys) {
     std::vector<tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>> results;
