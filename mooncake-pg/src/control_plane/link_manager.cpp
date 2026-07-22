@@ -525,8 +525,8 @@ bool LinkManager::advanceConnection(GlobalRank peer) {
                 return false;
             }
 
-            auto* warmup_flag = reinterpret_cast<volatile int32_t*>(
-                &warmup_recv_region_[peer]);
+            auto* warmup_flag =
+                reinterpret_cast<volatile int32_t*>(&warmup_recv_region_[peer]);
             if (*warmup_flag) {
                 // Consume the one-shot signal here.
                 *warmup_flag = 0;

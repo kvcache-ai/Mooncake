@@ -1156,10 +1156,6 @@ void MooncakeBackend::applyViewUpdate(const GroupView& view,
 
     bool epoch_changed = current_epoch != view.epoch;
 
-    if (epoch_changed) {
-        meta_->taskCount = 0;
-    }
-
     // An authoritative view in which self is Active is the common commit point
     // for enabling normal collective execution:
     //
@@ -1193,6 +1189,11 @@ void MooncakeBackend::applyViewUpdate(const GroupView& view,
         }
     }
 
+    std::vector<bool> previous_active_ranks(meta_->maxGroupSize);
+    for (int local_rank = 0; local_rank < meta_->maxGroupSize; ++local_rank) {
+        previous_active_ranks[local_rank] = meta_->activeRanks[local_rank];
+    }
+
     // The execution mode determines the effective active ranks consumed by
     // kernels. Isolated and Quiescing use a local-only mask; Normal follows the
     // Coordinator's committed membership view.
@@ -1217,6 +1218,16 @@ void MooncakeBackend::applyViewUpdate(const GroupView& view,
             }
             break;
     }
+
+    // Only a change in execution mode or effective participants starts a new
+    // collective taskCount. Endpoint, AwaitingActivation updates, ... keep the
+    // current taskCount even though they advance the view epoch.
+    bool reset_task_count = next_mode != mode;
+    for (int local_rank = 0; local_rank < meta_->maxGroupSize; ++local_rank) {
+        reset_task_count |=
+            previous_active_ranks[local_rank] != meta_->activeRanks[local_rank];
+    }
+    if (reset_task_count) meta_->taskCount = 0;
 
     // Rank order and endpoint metadata.
     for (size_t local_rank = 0; local_rank < view.rank_order.size();

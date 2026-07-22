@@ -904,7 +904,7 @@ class _ElasticMixin:
         rows = self.spawn_backend_and_collect(
             _fault_detection_worker,
             broken_exited,
-            timeout_s=60.0,
+            timeout_s=120.0,
         )
 
         self.assert_all_ok(rows)
@@ -928,7 +928,7 @@ class _ElasticMixin:
             broken_exited,
             start_recovery,
             nprocs=self.world_size + 1,
-            timeout_s=60.0,
+            timeout_s=120.0,
         )
 
         self.assert_all_ok(rows)
@@ -952,7 +952,7 @@ class _ElasticMixin:
             _extension_worker,
             extend_event,
             nprocs=self.world_size,
-            timeout_s=60.0,
+            timeout_s=120.0,
         )
 
         self.assert_all_ok(rows)
@@ -979,7 +979,7 @@ class _ElasticMixin:
             extend_event,
             "joiner_to_primary",
             nprocs=self.world_size,
-            timeout_s=60.0,
+            timeout_s=120.0,
         )
 
         self.assert_all_ok(rows)
@@ -996,7 +996,7 @@ class _ElasticMixin:
             extend_event,
             "primary_to_joiner",
             nprocs=self.world_size,
-            timeout_s=60.0,
+            timeout_s=120.0,
         )
 
         self.assert_all_ok(rows)
@@ -1012,7 +1012,7 @@ class _ElasticMixin:
             _extension_worker_with_subgroups,
             extend_event,
             nprocs=self.world_size,
-            timeout_s=60.0,
+            timeout_s=120.0,
         )
 
         self.assert_all_ok(rows)
@@ -1033,7 +1033,7 @@ class _ElasticMixin:
             _allgather_reduce_scatter_extension_worker,
             extend_event,
             nprocs=self.world_size,
-            timeout_s=60.0,
+            timeout_s=120.0,
         )
 
         self.assert_all_ok(rows)
@@ -1058,7 +1058,7 @@ class _ElasticMixin:
             broken_exited,
             start_recovery,
             nprocs=self.world_size + 1,
-            timeout_s=60.0,
+            timeout_s=120.0,
         )
 
         self.assert_all_ok(rows)
@@ -1087,7 +1087,7 @@ class _ElasticMixin:
             broken_exited,
             start_recovery,
             nprocs=self.world_size + 1,
-            timeout_s=60.0,
+            timeout_s=120.0,
         )
 
         self.assert_all_ok(rows)

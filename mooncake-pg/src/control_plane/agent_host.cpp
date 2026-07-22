@@ -221,7 +221,7 @@ void AgentHost::registerGroup(const GroupView& group, bool auto_deactivate,
                            backend]() mutable {
         auto group_id = group.group_id;
         backends_.insert_or_assign(group_id, backend);
-        agent_.registerGroup(group, auto_deactivate);
+        runEffects(agent_.registerGroup(group, auto_deactivate));
 
         RegisterGroupRequest req;
         req.rank = rank_;

@@ -35,11 +35,21 @@ void AgentStateMachine::appendApplyViewEffect(const GroupView& view,
                            global_rank_epochs_, std::move(activatable)});
 }
 
-void AgentStateMachine::registerGroup(const GroupView& group,
-                                      bool auto_deactivate) {
+AgentApplyResult AgentStateMachine::registerGroup(const GroupView& group,
+                                                  bool auto_deactivate) {
+    AgentApplyResult effects;
+    auto it = groups_.find(group.group_id);
+    if (it != groups_.end()) {
+        // RegisterAgent may have installed the Coordinator snapshot before
+        // this backend existed. Preserve and replay that authoritative view.
+        appendApplyViewEffect(it->second, effects);
+        return effects;
+    }
+
     GroupView view = group;
     view.auto_deactivate = auto_deactivate;
-    groups_[group.group_id] = std::move(view);
+    groups_.emplace(group.group_id, std::move(view));
+    return effects;
 }
 
 void AgentStateMachine::unregisterGroup(GroupId group_id) {
@@ -268,16 +278,38 @@ AgentApplyResult AgentStateMachine::applyRegisterAgentResponse(
     }
 
     self_rank_epoch_.store(resp.rank_epoch, std::memory_order_release);
-    global_rank_states_ = resp.all_rank_states;
-    global_rank_epochs_ = resp.all_rank_epochs;
-    global_rank_state_versions_ = resp.all_rank_state_versions;
+
+    // PeerJoined and RankState pushes use independent RPCs and can arrive while
+    // the RegisterAgent response is in flight. Merge its snapshot monotonically
+    // so it cannot roll a rank back to an older epoch or state version.
+    for (int rank = 0; rank < max_world_size_; ++rank) {
+        const auto response_epoch = resp.all_rank_epochs[rank];
+        const auto response_version = resp.all_rank_state_versions[rank];
+        if (response_epoch < global_rank_epochs_[rank] ||
+            (response_epoch == global_rank_epochs_[rank] &&
+             response_version < global_rank_state_versions_[rank]))
+            continue;
+
+        if (response_epoch > global_rank_epochs_[rank]) {
+            resetRankForNewEpoch(rank, response_epoch, effects);
+        }
+        global_rank_states_[rank] = resp.all_rank_states[rank];
+        global_rank_epochs_[rank] = response_epoch;
+        global_rank_state_versions_[rank] = response_version;
+    }
 
     for (const auto& gv : resp.groups) {
         groups_[gv.group_id] = gv;
         appendApplyViewEffect(gv, effects);
     }
 
+    // The connection list belongs to the same snapshot. Do not install an
+    // entry invalidated by above.
     for (const auto& connection : resp.rank_connections) {
+        if (connection.rank_epoch != global_rank_epochs_[connection.rank] ||
+            global_rank_states_[connection.rank] == RankState::Offline)
+            continue;
+
         rank_connections_[connection.rank] = connection;
         effects.push_back(EnablePeerProbe{
             .rank = connection.rank,
