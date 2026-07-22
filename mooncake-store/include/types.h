@@ -147,7 +147,8 @@ enum class ObjectDataType : uint8_t {
     OPTIMIZER_STATE = 7,
     METADATA = 8,
     GENERAL = 9,
-    // 10-255 reserved for future types
+    HIDDEN_STATE = 10,
+    // 11-255 reserved for future types
 };
 
 inline std::ostream& operator<<(std::ostream& os,
@@ -162,7 +163,8 @@ inline std::ostream& operator<<(std::ostream& os,
                      {ObjectDataType::GRADIENT, "GRADIENT"},
                      {ObjectDataType::OPTIMIZER_STATE, "OPTIMIZER_STATE"},
                      {ObjectDataType::METADATA, "METADATA"},
-                     {ObjectDataType::GENERAL, "GENERAL"}};
+                     {ObjectDataType::GENERAL, "GENERAL"},
+                     {ObjectDataType::HIDDEN_STATE, "HIDDEN_STATE"}};
 
     auto it = type_strings.find(type);
     os << (it != type_strings.end() ? it->second : "UNKNOWN");
