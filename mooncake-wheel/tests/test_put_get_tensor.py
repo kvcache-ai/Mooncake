@@ -289,7 +289,7 @@ class TestCodecInference(unittest.TestCase):
     def test_tensor_mixed_dtype(self):
         import torch
         d = _choose_leaf_codec([torch.tensor([1], dtype=torch.float32), torch.tensor([1], dtype=torch.int64)])
-        self.assertTrue(d.accepted)
+        self.assertFalse(d.accepted)
         self.assertEqual(d.codec, "ragged_tensor")
 
     def test_tensor_mixed_ndim(self):

@@ -26,6 +26,13 @@ MISSING_OBJECT_ERROR = (
     -704
 )  # Mooncake remove returns -704 for an already-missing object.
 STRUCTURED_FIELD_SPECS_KEY = "__mooncake_structured_fields__"
+_ENCODING_FALLBACK_ERRORS = (
+    TypeError,
+    ValueError,
+    OverflowError,
+    RuntimeError,
+    RecursionError,
+)
 
 
 class BundleStore(Protocol):
@@ -2462,11 +2469,6 @@ def _decode_structured_recursive_field(
         values = _decode_structured_leaf(
             leaf["codec"], leaf_payload, rows, leaf.get("metadata")
         )
-        if leaf["codec"] == "typed_ragged":
-            values = [
-                value.tolist() if isinstance(value, np.ndarray) else value
-                for value in values
-            ]
         missing = payload[leaf_payload_members["missing"]]
         leaf_values[leaf["path"]] = [
             MISSING if bool(missing[row]) else values[row] for row in range(rows)
@@ -2658,8 +2660,10 @@ def _normalize_ragged_tensor_dict_keys(keys: Any) -> list[str]:
     for key in iterable:
         if not isinstance(key, str):
             raise TypeError("ragged_tensor_dict keys must be strings")
-        if "." in key:
-            raise ValueError("ragged_tensor_dict keys must not contain '.'")
+        if not key:
+            raise ValueError("ragged_tensor_dict keys must not be empty")
+        if any(separator in key for separator in (".", "/", "\\")):
+            raise ValueError("ragged_tensor_dict keys must not contain '.', '/', or '\\'")
         if key in seen:
             raise ValueError(f"ragged_tensor_dict keys contain duplicate key {key!r}")
         seen.add(key)
@@ -5309,54 +5313,26 @@ def _encode_msgpack_ragged_values(
 
 def _decode_msgpack_ragged_values(payload: dict[str, Any], rows: int) -> list[Any]:
     data = payload["data"]
+    offsets = payload["offsets"]
     nulls = payload["nulls"]
-    has_nulls = bool(nulls.any()) if rows > 0 else False
+    if len(offsets) != rows + 1:
+        raise ValueError(
+            f"msgpack_ragged offsets length {len(offsets)} does not match rows {rows}"
+        )
+    if len(nulls) != rows:
+        raise ValueError(
+            f"msgpack_ragged nulls length {len(nulls)} does not match rows {rows}"
+        )
     raw_data = bytes(data) if not isinstance(data, bytes) else data
-    if not has_nulls:
-        unpacker = _msgpack.Unpacker(raw=False)
-        unpacker.feed(raw_data)
-        return list(unpacker)
-    # With nulls: stream decode non-null values, insert None at null positions
-    unpacker = _msgpack.Unpacker(raw=False)
-    unpacker.feed(raw_data)
-    non_null_iter = iter(unpacker)
     values = []
-    for is_null in nulls:
+    for row, is_null in enumerate(nulls):
         if bool(is_null):
             values.append(None)
         else:
-            values.append(next(non_null_iter))
+            begin = int(offsets[row])
+            end = int(offsets[row + 1])
+            values.append(_msgpack.unpackb(raw_data[begin:end], raw=False))
     return values
-
-
-
-def _json_default(value: Any) -> Any:
-    if isinstance(value, np.generic):
-        return value.item()
-    if hasattr(value, "__int__"):
-        return int(value)
-    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
-
-
-
-def _parse_torch_dtype(dtype_str: str) -> Any:
-    """Parse torch dtype string (e.g. 'torch.float32') to torch.dtype object."""
-    name = dtype_str.removeprefix("torch.")
-    dtype = getattr(_torch, name, None)
-    if dtype is None or not isinstance(dtype, _torch.dtype):
-        raise ValueError(f"unknown torch dtype: {dtype_str}")
-    return dtype
-
-
-
-def _torch_dtype_to_numpy(dtype_str: str) -> np.dtype:
-    """Convert torch dtype string to numpy dtype for buffer interpretation."""
-    torch_dtype = _parse_torch_dtype(dtype_str)
-    # bfloat16 has no numpy equivalent; use float16 (same element size)
-    if torch_dtype == _torch.bfloat16:
-        return np.dtype(np.float16)
-    return _torch.empty(0, dtype=torch_dtype).numpy().dtype
-
 
 
 class _OwnerBackedList(list):
@@ -5930,6 +5906,14 @@ def _choose_leaf_codec(values: list[Any]) -> _CodecDecision:
     if not nn:
         return _CodecDecision(False, "msgpack_ragged", "all rows are null", "msgpack")
     if _torch is not None and all(isinstance(value, _torch.Tensor) for value in nn):
+        dtypes = {value.dtype for value in nn}
+        if len(dtypes) != 1:
+            return _CodecDecision(
+                False,
+                "ragged_tensor",
+                f"mixed tensor dtype: {sorted(str(dtype) for dtype in dtypes)}",
+                "torch.Tensor",
+            )
         dtype = str(nn[0].dtype)
         return _CodecDecision(True, "ragged_tensor", "all non-null rows are Tensor", "torch.Tensor", {"dtype": dtype})
     if all(_is_media_list(value) for value in nn):
