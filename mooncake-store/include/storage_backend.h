@@ -270,6 +270,8 @@ struct FileStorageConfig {
     // Use io_uring for file I/O instead of POSIX pread/pwrite
     bool use_uring = false;
 
+    // DFS page-offset mode. Enabled automatically for kDistributed.
+    bool enable_dfs = false;
     // Proactively evict local disk objects from the heartbeat thread once
     // backend usage crosses the high watermark.
     bool enable_disk_watermark_eviction = true;
@@ -296,6 +298,7 @@ struct FileStorageConfig {
 class StorageBackendInterface {
    public:
     StorageBackendInterface(const FileStorageConfig& file_storage_config);
+    virtual ~StorageBackendInterface() = default;
 
     using EvictionHandler = std::function<tl::expected<void, ErrorCode>(
         const std::vector<std::string>& evicted_keys)>;

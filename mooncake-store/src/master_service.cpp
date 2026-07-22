@@ -44,6 +44,7 @@
 #include "ha/snapshot/snapshot_logger.h"
 #include "utils/zstd_util.h"
 #include "utils/file_util.h"
+#include "storage/distributed/dfs_global_allocator.h"
 #include "utils.h"
 #include "kv_event/kv_event_config.h"
 #include "master_snapshot_manager.h"
@@ -103,7 +104,7 @@ uint64_t SaturatingMultiply(uint64_t lhs, uint64_t rhs) {
 bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
                                   size_t allocated_memory_replicas,
                                   size_t allocated_nof_replicas) {
-    if (config.nof_replica_num == 0) {
+    if (config.nof_replica_num == 0 && config.dfs_replica_num == 0) {
         return allocated_memory_replicas > 0;
     }
     if (DetermineReplicaWriteMode(config) ==
@@ -399,6 +400,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
                   << ")";
     }
 
+    InitDfsAllocatorFromEnvironment();
     kv_event_publisher_ =
         std::make_unique<KvEventPublisher>(BuildKvEventConfig(config));
 
@@ -479,6 +481,51 @@ MasterService::MasterService(const MasterServiceConfig& config)
         segment_manager_.initializeCxlAllocator(cxl_path_, cxl_size_);
         VLOG(1) << "action=start_cxl_global_allocator";
     }
+}
+
+void MasterService::InitDfsAllocatorFromEnvironment() {
+    enable_dfs_ = GetEnvOr<bool>("MOONCAKE_ENABLE_DFS",
+                                 GetEnvOr<bool>("MOONCAKE_DFS_ENABLED", false));
+    if (!enable_dfs_) return;
+
+    const bool single_tenant =
+        GetEnvOr<bool>("MOONCAKE_DFS_SINGLE_TENANT", true);
+    if (!single_tenant) {
+        LOG(ERROR) << "Currently, DFS backend is not supported in "
+                      "multi-tenant mode";
+        enable_dfs_ = false;
+        return;
+    }
+
+    const std::string root_dir = GetEnvStringOr(
+        "MOONCAKE_DFS_ROOT_DIR",
+        GetEnvStringOr("MOONCAKE_DISTRIBUTED_ROOT_DIR", "/mnt/3fs/mooncake"));
+    const int shard_count = GetEnvOr<int>("MOONCAKE_DFS_SHARD_COUNT", 64);
+    const uint64_t shard_capacity = GetEnvOr<uint64_t>(
+        "MOONCAKE_DFS_SHARD_CAPACITY", 4ULL * 1024 * 1024 * 1024);
+    const uint64_t alignment =
+        GetEnvOr<uint64_t>("MOONCAKE_DFS_ALIGNMENT", 4096);
+
+    dfs_allocator_ = std::make_unique<DfsGlobalAllocator>();
+    if (!dfs_allocator_->Init(root_dir, shard_count, shard_capacity,
+                              alignment)) {
+        LOG(ERROR) << "Failed to initialize DFS allocator, root_dir="
+                   << root_dir << ", shard_count=" << shard_count
+                   << ", shard_capacity=" << shard_capacity
+                   << ", alignment=" << alignment;
+        dfs_allocator_.reset();
+        enable_dfs_ = false;
+        return;
+    }
+
+    dfs_allocator_->SetEvictCallback(
+        [this](const std::string& key, int shard_idx, uint64_t offset) {
+            RemoveDfsReplicaByOffset(key, shard_idx, offset);
+        });
+    LOG(INFO) << "DFS allocator initialized, root_dir=" << root_dir
+              << ", shard_count=" << shard_count
+              << ", shard_capacity=" << shard_capacity
+              << ", alignment=" << alignment;
 }
 
 std::unique_ptr<ha::SnapshotCatalogStore>
@@ -1713,6 +1760,7 @@ size_t MasterService::EraseReplicasWithCacheTotalAccounting(
     // Release SSD/local-disk usage for any local-disk replicas being removed.
     // No-op for memory/noF replicas, so it is safe to call unconditionally.
     ReleaseLocalDiskUsage(erased_replicas);
+    FreeDfsReplicas(metadata.user_key, erased_replicas);
     return erased_replicas.size();
 }
 
@@ -1766,6 +1814,7 @@ MasterService::EraseMetadata(
     ErasePromotionTaskIfPresent(tenant_state, key, tenant_id);
 
     ReleaseLocalDiskUsage(metadata.GetAllReplicas());
+    FreeDfsReplicas(key, metadata.GetAllReplicas());
     AccountCacheTotalRemoval(metadata);
     switch (quota_mode) {
         case QuotaEraseMode::kFull:
@@ -2533,8 +2582,14 @@ auto MasterService::GetReplicaList(const std::string& key,
 
         std::vector<Replica::Descriptor> replica_list;
         metadata.VisitReplicas(
-            &Replica::fn_is_completed, [&replica_list](const Replica& replica) {
+            &Replica::fn_is_completed,
+            [this, &key, &replica_list](const Replica& replica) {
                 replica_list.emplace_back(replica.get_descriptor());
+                if (replica.is_dfs_replica() && dfs_allocator_) {
+                    const auto& desc = replica.get_dfs_descriptor();
+                    dfs_allocator_->UpdateAccess(key, desc.shard_idx,
+                                                 desc.offset);
+                }
             });
 
         if (replica_list.empty()) {
@@ -2998,6 +3053,21 @@ auto MasterService::AllocateAndInsertMetadata(
                               ReplicaStatus::PROCESSING);
     }
 
+    if (config.dfs_replica_num > 0) {
+        if (!dfs_allocator_ || !dfs_allocator_->IsInitialized()) {
+            LOG(ERROR) << "Failed to allocate DFS replica for key=" << key
+                       << ", error=dfs_allocator_not_initialized";
+            return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+        }
+        auto alloc = dfs_allocator_->Allocate(key, value_length);
+        if (!alloc) {
+            LOG(ERROR) << "Failed to allocate DFS replica for key=" << key
+                       << ", error=" << alloc.error();
+            return tl::make_unexpected(alloc.error());
+        }
+        replicas.emplace_back(std::move(*alloc), ReplicaStatus::PROCESSING);
+    }
+
     std::vector<Replica::Descriptor> replica_list;
     replica_list.reserve(replicas.size());
     int i = 0;
@@ -3019,6 +3089,11 @@ auto MasterService::AllocateAndInsertMetadata(
                     << nof_desc.buffer_descriptor.buffer_address_
                     << ", transport_endpoint="
                     << nof_desc.buffer_descriptor.transport_endpoint_;
+        } else if (replica.is_dfs_replica()) {
+            const auto& dfs_desc = desc.get_dfs_descriptor();
+            VLOG(1) << "Replica #" << ++i << ": dfs_file=" << dfs_desc.file_path
+                    << ", offset=" << dfs_desc.offset
+                    << ", shard_idx=" << dfs_desc.shard_idx;
         }
     }
 
@@ -3028,6 +3103,7 @@ auto MasterService::AllocateAndInsertMetadata(
                               config.with_soft_pin, config.with_hard_pin,
                               config.data_type, group_id, tenant_id, key));
     if (!inserted) {
+        FreeDfsReplicas(key, replicas);
         LOG(INFO) << "key=" << key << ", info=object_already_exists";
         abort_reserved_quota();
         return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
@@ -3050,13 +3126,32 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(normalized_tenant_result.error());
     }
     const ObjectIdentity object_id{normalized_tenant_result.value(), key};
-    if ((config.replica_num == 0 && config.nof_replica_num == 0) ||
+    if ((config.replica_num == 0 && config.nof_replica_num == 0 &&
+         config.dfs_replica_num == 0) ||
         key.empty() || slice_length == 0) {
         LOG(ERROR) << "key=" << key << ", replica_num=" << config.replica_num
                    << ", nof_replica_num=" << config.nof_replica_num
+                   << ", dfs_replica_num=" << config.dfs_replica_num
                    << ", slice_length=" << slice_length
                    << ", key_size=" << key.size() << ", error=invalid_params";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (config.dfs_replica_num > 1 ||
+        (config.dfs_replica_num > 0 && config.replica_num == 0)) {
+        LOG(ERROR) << "key=" << key << ", replica_num=" << config.replica_num
+                   << ", dfs_replica_num=" << config.dfs_replica_num
+                   << ", error=invalid_dfs_replica_config";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (config.dfs_replica_num > 0 && object_id.tenant_id != "default") {
+        LOG(ERROR) << "key=" << key << ", tenant_id=" << tenant_id
+                   << ", error=dfs_currently_requires_default_tenant";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (config.dfs_replica_num > 0 &&
+        (!enable_dfs_ || !dfs_allocator_ || !dfs_allocator_->IsInitialized())) {
+        LOG(ERROR) << "key=" << key << ", error=dfs_allocator_not_initialized";
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
     }
     if (config.prefer_alloc_in_same_node && config.nof_replica_num > 0) {
         LOG(ERROR) << "key=" << key
@@ -3145,6 +3240,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                     auto replicas =
                         metadata.PopReplicas(&Replica::fn_is_processing);
                     if (!replicas.empty()) {
+                        FreeDfsReplicas(key, replicas);
                         std::lock_guard lock(discarded_replicas_mutex_);
                         discarded_replicas_.emplace_back(
                             std::move(replicas),
@@ -3246,7 +3342,13 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
             }
             return replica.type() == replica_type;
         },
-        [](Replica& replica) { replica.mark_complete(); });
+        [this, &key](Replica& replica) {
+            replica.mark_complete();
+            if (replica.is_dfs_replica() && dfs_allocator_) {
+                const auto& desc = replica.get_dfs_descriptor();
+                dfs_allocator_->UpdateAccess(key, desc.shard_idx, desc.offset);
+            }
+        });
 
     const bool has_memory_replica = metadata.HasMemReplica();
     const bool should_settle_quota =
@@ -3272,7 +3374,52 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
         metadata.pending_replaced_quota_charge_bytes = 0;
     }
 
-    if (enable_offload_ && !offload_on_evict_) {
+    if (replica_type == ReplicaType::DFS) {
+        auto& tenant_state = accessor.GetTenantState();
+        auto task_it = tenant_state.offloading_tasks.find(object_id.user_key);
+        if (task_it != tenant_state.offloading_tasks.end()) {
+            auto source = metadata.GetReplicaByID(task_it->second.source_id);
+            if (source != nullptr) {
+                source->dec_refcnt();
+            }
+            tenant_state.offloading_tasks.erase(task_it);
+        }
+    }
+
+    if (replica_type != ReplicaType::DFS && enable_dfs_ && dfs_allocator_ &&
+        metadata.HasReplica([](const Replica& replica) {
+            return replica.is_dfs_replica() && replica.is_processing();
+        })) {
+        auto& tenant_state = accessor.GetTenantState();
+        if (!tenant_state.offloading_tasks.contains(object_id.user_key)) {
+            auto* source = metadata.GetFirstReplica([](const Replica& replica) {
+                return replica.is_memory_replica() && replica.is_completed() &&
+                       !replica.has_invalid_mem_handle();
+            });
+            if (source == nullptr) {
+                LOG(WARNING) << "key=" << key
+                             << ", error=no_completed_memory_replica_for_dfs";
+            } else {
+                auto result = PushDfsOffloadQueue(object_id, *source);
+                if (result) {
+                    source->inc_refcnt();
+                    tenant_state.offloading_tasks.emplace(
+                        object_id.user_key,
+                        OffloadingTask{source->id(),
+                                       std::chrono::system_clock::now()});
+                } else if (result.error() != ErrorCode::OBJECT_ALREADY_EXISTS) {
+                    LOG(ERROR)
+                        << "Failed to push DFS offload queue for key=" << key
+                        << ", error=" << result.error();
+                }
+            }
+        }
+    }
+
+    if (replica_type != ReplicaType::DFS && enable_offload_ &&
+        !offload_on_evict_ && !metadata.HasReplica([](const Replica& replica) {
+            return replica.is_dfs_replica() && replica.is_processing();
+        })) {
         auto& tenant_state = accessor.GetTenantState();
         bool task_created = false;
         metadata.VisitReplicas(
@@ -3390,14 +3537,15 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
 
-    auto processing_rep = metadata.GetFirstReplica([replica_type](
-                                                       const Replica& replica) {
-        if (replica_type == ReplicaType::ALL) {
-            return (replica.is_memory_replica() || replica.is_nof_replica()) &&
-                   !replica.is_processing();
-        }
-        return replica.type() == replica_type && !replica.is_processing();
-    });
+    auto processing_rep =
+        metadata.GetFirstReplica([replica_type](const Replica& replica) {
+            if (replica_type == ReplicaType::ALL) {
+                return (replica.is_memory_replica() ||
+                        replica.is_nof_replica() || replica.is_dfs_replica()) &&
+                       !replica.is_processing();
+            }
+            return replica.type() == replica_type && !replica.is_processing();
+        });
     if (processing_rep != nullptr) {
         LOG(ERROR) << "key=" << key << ", status=" << processing_rep->status()
                    << ", error=invalid_replica_status";
@@ -3408,7 +3556,8 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     EraseReplicasWithCacheTotalAccounting(
         metadata, [replica_type](const Replica& replica) {
             if (replica_type == ReplicaType::ALL) {
-                return replica.is_memory_replica() || replica.is_nof_replica();
+                return replica.is_memory_replica() ||
+                       replica.is_nof_replica() || replica.is_dfs_replica();
             }
             return replica.type() == replica_type;
         });
@@ -3482,13 +3631,36 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     }
     const ObjectIdentity object_id{normalized_tenant_result.value(), key};
     // --- Parameter validation (same as PutStart) ---
-    if ((config.replica_num == 0 && config.nof_replica_num == 0) ||
+    if ((config.replica_num == 0 && config.nof_replica_num == 0 &&
+         config.dfs_replica_num == 0) ||
         key.empty() || slice_length == 0) {
         LOG(ERROR) << "key=" << key << ", replica_num=" << config.replica_num
                    << ", nof_replica_num=" << config.nof_replica_num
+                   << ", dfs_replica_num=" << config.dfs_replica_num
                    << ", slice_length=" << slice_length
                    << ", key_size=" << key.size() << ", error=invalid_params";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (config.dfs_replica_num > 1 ||
+        (config.dfs_replica_num > 0 && config.replica_num == 0)) {
+        LOG(ERROR) << "key=" << key << ", replica_num=" << config.replica_num
+                   << ", dfs_replica_num=" << config.dfs_replica_num
+                   << ", error=invalid_dfs_replica_config";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (config.dfs_replica_num > 0 &&
+        NormalizeTenantId(tenant_id) != "default") {
+        LOG(ERROR) << "key=" << key << ", tenant_id=" << tenant_id
+                   << ", error=dfs_currently_requires_default_tenant";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (config.dfs_replica_num > 0 &&
+        (!enable_dfs_ || dfs_allocator_ == nullptr ||
+         !dfs_allocator_->IsInitialized())) {
+        LOG(ERROR) << "key=" << key
+                   << ", dfs_replica_num=" << config.dfs_replica_num
+                   << ", error=dfs_service_unavailable";
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
     }
     if (config.prefer_alloc_in_same_node && config.nof_replica_num > 0) {
         LOG(ERROR) << "key=" << key
@@ -3611,6 +3783,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     auto processing_replicas =
                         metadata.PopReplicas(&Replica::fn_is_processing);
                     if (!processing_replicas.empty()) {
+                        FreeDfsReplicas(key, processing_replicas);
                         std::lock_guard lock(discarded_replicas_mutex_);
                         discarded_replicas_.emplace_back(
                             std::move(processing_replicas),
@@ -3736,6 +3909,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 auto old_replicas =
                     PopReplicasWithCacheTotalAccounting(metadata);
                 if (!old_replicas.empty()) {
+                    FreeDfsReplicas(key, old_replicas);
                     std::lock_guard lock(discarded_replicas_mutex_);
                     discarded_replicas_.emplace_back(
                         std::move(old_replicas),
@@ -4411,6 +4585,7 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
             return replica.id() == source_id;
         });
     if (!source_replica.empty()) {
+        FreeDfsReplicas(key, source_replica);
         std::lock_guard lock(discarded_replicas_mutex_);
         discarded_replicas_.emplace_back(
             std::move(source_replica),
@@ -4814,6 +4989,35 @@ bool MasterService::CleanupStaleHandles(
     return !metadata.IsValid();
 }
 
+void MasterService::FreeDfsReplicas(const std::string& key,
+                                    const std::vector<Replica>& replicas) {
+    if (!dfs_allocator_) return;
+    for (const auto& replica : replicas) {
+        if (!replica.is_dfs_replica()) continue;
+        const auto& desc = replica.get_dfs_descriptor();
+        dfs_allocator_->Free(desc.offset, desc.aligned_size, desc.shard_idx,
+                             key);
+    }
+}
+
+void MasterService::RemoveDfsReplicaByOffset(const std::string& key,
+                                             int shard_idx, uint64_t offset) {
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    const auto object_id = MakeObjectIdentity(key, "default");
+    MetadataAccessorRW accessor(this, object_id);
+    if (!accessor.Exists()) return;
+
+    auto& metadata = accessor.Get();
+    metadata.EraseReplicas([shard_idx, offset](const Replica& replica) {
+        return replica.is_dfs_replica() && !replica.is_processing() &&
+               replica.get_dfs_descriptor().shard_idx == shard_idx &&
+               replica.get_dfs_descriptor().offset == offset;
+    });
+    if (!metadata.IsValid()) {
+        accessor.Erase();
+    }
+}
+
 size_t MasterService::GetKeyCount() const {
     size_t total = 0;
     for (size_t i = 0; i < kNumShards; i++) {
@@ -4965,6 +5169,32 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
         }
     }
     return {};
+}
+
+auto MasterService::PullDfsOffloadTasks(const UUID& client_id)
+    -> tl::expected<std::vector<OffloadTaskItem>, ErrorCode> {
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    ScopedLocalDiskSegmentAccess local_disk_segment_access =
+        segment_manager_.getLocalDiskSegmentAccess();
+    auto& client_local_disk_segment =
+        local_disk_segment_access.getClientLocalDiskSegment();
+    auto local_disk_segment_it = client_local_disk_segment.find(client_id);
+    if (local_disk_segment_it == client_local_disk_segment.end()) {
+        LOG(ERROR) << "Local disk segment not found with client id = "
+                   << client_id;
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
+
+    MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
+    std::vector<OffloadTaskItem> result;
+    result.reserve(
+        local_disk_segment_it->second->dfs_offloading_objects.size());
+    for (const auto& [_, task] :
+         local_disk_segment_it->second->dfs_offloading_objects) {
+        result.push_back(task);
+    }
+    local_disk_segment_it->second->dfs_offloading_objects.clear();
+    return result;
 }
 
 auto MasterService::ReportSsdCapacity(const UUID& client_id,
@@ -5188,6 +5418,57 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
             OffloadTaskItem{.tenant_id = object_id.tenant_id,
                             .key = object_id.user_key,
                             .size = size});
+        if (!res.second) {
+            return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+        }
+    }
+    return {};
+}
+
+tl::expected<void, ErrorCode> MasterService::PushDfsOffloadQueue(
+    const ObjectIdentity& object_id, Replica& replica) {
+    const auto& segment_names = replica.get_segment_names();
+    if (segment_names.empty()) {
+        return {};
+    }
+    for (const auto& segment_name_it : segment_names) {
+        if (!segment_name_it.has_value()) {
+            continue;
+        }
+        ScopedLocalDiskSegmentAccess local_disk_segment_access =
+            segment_manager_.getLocalDiskSegmentAccess();
+        const auto& client_by_name =
+            local_disk_segment_access.getClientByName();
+        auto client_id_it = client_by_name.find(segment_name_it.value());
+        if (client_id_it == client_by_name.end()) {
+            LOG(ERROR) << "Segment " << segment_name_it.value() << " not found";
+            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        }
+        auto& client_local_disk_segment =
+            local_disk_segment_access.getClientLocalDiskSegment();
+        auto local_disk_segment_it =
+            client_local_disk_segment.find(client_id_it->second);
+        if (local_disk_segment_it == client_local_disk_segment.end()) {
+            return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
+        }
+        MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
+        if (!local_disk_segment_it->second->enable_offloading) {
+            return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
+        }
+        if (local_disk_segment_it->second->dfs_offloading_objects.size() >=
+            offloading_queue_limit_) {
+            return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
+        }
+        const int64_t size = replica.get_descriptor()
+                                 .get_memory_descriptor()
+                                 .buffer_descriptor.size_;
+        auto res =
+            local_disk_segment_it->second->dfs_offloading_objects.emplace(
+                MakeTenantScopedStorageKey(object_id.tenant_id,
+                                           object_id.user_key),
+                OffloadTaskItem{.tenant_id = object_id.tenant_id,
+                                .key = object_id.user_key,
+                                .size = size});
         if (!res.second) {
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
         }
@@ -6084,6 +6365,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
                 auto replicas =
                     metadata.PopReplicas(&Replica::fn_is_processing);
                 if (!replicas.empty()) {
+                    FreeDfsReplicas(*key_it, replicas);
                     discarded_replicas.emplace_back(std::move(replicas), ttl);
                 }
                 if (!metadata.IsValid()) {
@@ -6131,6 +6413,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
                     return it != replica_ids.end();
                 });
             if (!replicas.empty()) {
+                FreeDfsReplicas(task_it->first, replicas);
                 discarded_replicas.emplace_back(std::move(replicas), ttl);
             }
             if (!metadata.IsValid()) {

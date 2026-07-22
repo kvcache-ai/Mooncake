@@ -24,6 +24,10 @@
 
 #include <ylt/util/tl/expected.hpp>
 #include "storage/distributed/distributed_storage_backend.h"
+#include "storage/distributed/posix_fs_adapter.h"
+#ifdef USE_3FS
+#include "storage/distributed/hf3fs_adapter.h"
+#endif
 
 namespace mooncake {
 
@@ -4348,7 +4352,9 @@ CreateStorageBackend(const FileStorageConfig& config) {
                     "Invalid DistributedStorage configuration");
             }
             std::unique_ptr<FileSystemAdapter> adapter;
-            if (distributed_config.fs_adapter_type == "hf3fs") {
+            if (distributed_config.fs_adapter_type == "posix") {
+                adapter = std::make_unique<PosixFsAdapter>();
+            } else if (distributed_config.fs_adapter_type == "hf3fs") {
 #ifdef USE_3FS
                 adapter = std::make_unique<Hf3fsAdapter>();
 #else
