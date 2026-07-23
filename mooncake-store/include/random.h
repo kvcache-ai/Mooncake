@@ -11,15 +11,6 @@ using RandomEngine = std::mt19937_64;
 
 namespace detail {
 
-template <typename Integer>
-concept UniformDistributionInteger =
-    std::same_as<Integer, short> || std::same_as<Integer, int> ||
-    std::same_as<Integer, long> || std::same_as<Integer, long long> ||
-    std::same_as<Integer, unsigned short> ||
-    std::same_as<Integer, unsigned int> ||
-    std::same_as<Integer, unsigned long> ||
-    std::same_as<Integer, unsigned long long>;
-
 template <typename Result, std::integral DistributionInteger,
           std::uniform_random_bit_generator Generator>
 Result sampleUniform(Result lower_bound, Result upper_bound,
@@ -66,10 +57,7 @@ Integer randomUniform(Integer lower_bound, Integer upper_bound,
         throw std::invalid_argument(
             "randomUniform lower bound must not exceed upper bound");
     }
-    if constexpr (detail::UniformDistributionInteger<Integer>) {
-        return detail::sampleUniform<Integer, Integer>(lower_bound, upper_bound,
-                                                       generator);
-    } else if constexpr (std::signed_integral<Integer>) {
+    if constexpr (std::signed_integral<Integer>) {
         return detail::sampleUniform<Integer, long long>(
             lower_bound, upper_bound, generator);
     } else {
