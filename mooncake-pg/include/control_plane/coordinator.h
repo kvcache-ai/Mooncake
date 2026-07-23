@@ -26,11 +26,14 @@ class CoordinatorStateMachine {
     virtual CoordinatorApplyResult<HeartbeatResponse> handleHeartbeat(
         const HeartbeatRequest& req) = 0;
 
+    virtual CoordinatorApplyResult<UnregisterAgentResponse>
+    handleUnregisterAgent(const UnregisterAgentRequest& req) = 0;
+
     virtual CoordinatorApplyResult<RegisterGroupResponse> handleRegisterGroup(
         const RegisterGroupRequest& req) = 0;
 
-    virtual CoordinatorApplyResult<void> handleUnregisterGroup(
-        const UnregisterGroupRequest& req) = 0;
+    virtual CoordinatorApplyResult<UnregisterGroupResponse>
+    handleUnregisterGroup(const UnregisterGroupRequest& req) = 0;
 
     virtual CoordinatorApplyResult<ConfirmReadyForActivationResponse>
     handleConfirmReadyForActivation(
@@ -42,7 +45,7 @@ class CoordinatorStateMachine {
     virtual CoordinatorApplyResult<void> handleProposeViewUpdate(
         uint64_t propose_id, const ProposeViewUpdateRequest& req) = 0;
 
-    virtual CoordinatorApplyResult<void> handleLinkEventReport(
+    virtual CoordinatorApplyResult<LinkEventReportAck> handleLinkEventReport(
         const LinkEventReport& req) = 0;
 
     virtual CoordinatorApplyResult<void> handleSyncAfterFailure(
@@ -54,6 +57,8 @@ class CoordinatorStateMachine {
                                                              bool applied) = 0;
 
     virtual CoordinatorApplyResult<void> tick() = 0;
+
+    virtual CoordinatorApplyResult<void> requestShutdown() = 0;
 };
 
 // CentralizedCoordinatorStateMachine - single-node implementation of the
@@ -71,10 +76,13 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     CoordinatorApplyResult<HeartbeatResponse> handleHeartbeat(
         const HeartbeatRequest& req) override;
 
+    CoordinatorApplyResult<UnregisterAgentResponse> handleUnregisterAgent(
+        const UnregisterAgentRequest& req) override;
+
     CoordinatorApplyResult<RegisterGroupResponse> handleRegisterGroup(
         const RegisterGroupRequest& req) override;
 
-    CoordinatorApplyResult<void> handleUnregisterGroup(
+    CoordinatorApplyResult<UnregisterGroupResponse> handleUnregisterGroup(
         const UnregisterGroupRequest& req) override;
 
     CoordinatorApplyResult<ConfirmReadyForActivationResponse>
@@ -87,7 +95,7 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     CoordinatorApplyResult<void> handleProposeViewUpdate(
         uint64_t propose_id, const ProposeViewUpdateRequest& req) override;
 
-    CoordinatorApplyResult<void> handleLinkEventReport(
+    CoordinatorApplyResult<LinkEventReportAck> handleLinkEventReport(
         const LinkEventReport& req) override;
 
     CoordinatorApplyResult<void> handleSyncAfterFailure(
@@ -99,6 +107,8 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
                                                      bool applied) override;
 
     CoordinatorApplyResult<void> tick() override;
+
+    CoordinatorApplyResult<void> requestShutdown() override;
 
     RankState getRankState(GlobalRank rank) const {
         if (!rankInRange(rank)) return RankState::Offline;
@@ -167,6 +177,7 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     struct PendingSync {
         uint64_t sync_id = 0;
         uint64_t agent_session_id = 0;
+        std::optional<LinkEventReportAck> link_event_report_ack;
     };
 
     using PendingSyncs = std::unordered_map<
@@ -180,10 +191,18 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     FaultReconciliationContext reconciliation_ctx_;
     std::chrono::microseconds fault_reconciliation_window_;
 
+    // requestShutdown() freezes the ranks whose current Agent sessions must
+    // end before the state machine asks the Host to stop serving RPCs. New
+    // sessions cannot take ownership after this snapshot is created.
+    bool shutdown_requested_ = false;
+    std::unordered_set<GlobalRank> shutdown_pending_ranks_;
+
     static constexpr auto kProposeTimeout = std::chrono::seconds(20);
     static constexpr auto kHeartbeatTimeout = std::chrono::seconds(30);
 
-    void transitionToOffline(GlobalRank rank, const char* reason,
+    bool invalidateAgentSession(GlobalRank rank);
+
+    void handleTimedOutAgent(GlobalRank rank, const char* reason,
                              std::vector<CoordinatorEffect>& effects);
 
     // Recompute the authoritative healthy set (max clique) and update
@@ -199,8 +218,8 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     // An existing window is not extended.
     void tryOpenReconciliationWindow();
     void tryCloseReconciliationWindow(std::vector<CoordinatorEffect>& effects);
-    void processLinkEventReport(const LinkEventReport& report,
-                                std::vector<CoordinatorEffect>& effects);
+    std::optional<LinkEventReportAck> processLinkEventReport(
+        const LinkEventReport& report, std::vector<CoordinatorEffect>& effects);
 
     void populateRegisterAgentResponse(RegisterAgentResponse& response,
                                        GlobalRank rank) const;

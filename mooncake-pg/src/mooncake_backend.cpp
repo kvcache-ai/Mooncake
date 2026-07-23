@@ -10,6 +10,7 @@
 #include <chrono>
 #include <atomic>
 #include <cstdlib>
+#include <exception>
 #include <memory>
 #include <vector>
 #include "control_plane/types.h"
@@ -325,13 +326,14 @@ MooncakeBackend::MooncakeBackend(
 }
 
 MooncakeBackend::~MooncakeBackend() {
-    // Ensure this backend is removed from backends_ BEFORE shutdown.
-    // Blocks until the executor thread has erased the raw pointer so that
-    // in-flight ViewUpdates cannot find a backend with freed resources.
-    if (meta_) {
-        agent_.unregisterGroup(meta_->group_id);
+    try {
+        shutdown();
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "MooncakeBackend: shutdown failed during destruction: "
+                   << e.what();
+    } catch (...) {
+        LOG(ERROR) << "MooncakeBackend: shutdown failed during destruction";
     }
-    shutdown();
 }
 
 const std::string MooncakeBackend::getBackendName() const { return "mooncake"; }
@@ -915,6 +917,11 @@ void MooncakeBackend::shutdown() {
         return;
     }
     isShutdown_ = true;
+
+    // Group teardown is independent from process-level Agent teardown. Remove
+    // this backend from AgentHost before releasing resources so a concurrent
+    // ViewUpdate cannot dereference it.
+    agent_.unregisterGroup(meta_->group_id);
 
     // If we encounter any hung operations, don't release resources
     // to avoid potential crash. Instead, we allow those resources to leak

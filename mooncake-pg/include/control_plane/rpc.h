@@ -59,6 +59,12 @@ struct LinkEventReport {
     std::vector<uint64_t> target_rank_epochs;
 };
 
+struct LinkEventReportAck {
+    GlobalRank reporter_rank = kInvalidGlobalRank;
+    uint64_t reporter_rank_epoch = 0;
+    uint64_t report_id = 0;
+};
+
 struct HeartbeatRequest {
     GlobalRank rank = kInvalidGlobalRank;
     uint64_t agent_session_id = 0;
@@ -66,6 +72,16 @@ struct HeartbeatRequest {
 
 struct HeartbeatResponse {
     bool require_new_session = false;
+};
+
+struct UnregisterAgentRequest {
+    GlobalRank rank = kInvalidGlobalRank;
+    uint64_t agent_session_id = 0;
+};
+
+struct UnregisterAgentResponse {
+    bool success = false;
+    std::string reject_reason;
 };
 
 struct RegisterGroupRequest {
@@ -137,6 +153,11 @@ struct UnregisterGroupRequest {
     uint64_t agent_session_id = 0;
 };
 
+struct UnregisterGroupResponse {
+    bool success = false;
+    std::string reject_reason;
+};
+
 struct SyncAfterFailureRequest {
     GroupId group_id;
     GlobalRank reporter_rank = kInvalidGlobalRank;
@@ -155,6 +176,8 @@ enum class SyncAfterFailureStatus : uint8_t {
 struct SyncAfterFailureResponse {
     SyncAfterFailureStatus status = SyncAfterFailureStatus::Rejected;
     GroupView view;
+    // Piggybacked link event report ack.
+    std::optional<LinkEventReportAck> link_event_report_ack;
     std::string reject_reason;
 };
 
@@ -172,12 +195,6 @@ struct RankStatePush {
     uint64_t rank_epoch = 0;
     uint64_t rank_state_version = 0;
     RankState new_state = RankState::Offline;
-};
-
-struct LinkEventReportAck {
-    GlobalRank reporter_rank = kInvalidGlobalRank;
-    uint64_t reporter_rank_epoch = 0;
-    uint64_t report_id = 0;
 };
 
 struct ViewUpdatePush {
@@ -216,13 +233,11 @@ struct ReplySync {
     SyncAfterFailureResponse response;
 };
 
-struct AckLinkEventReport {
-    LinkEventReportAck ack;
-};
+struct ShutdownCoordinatorHost {};
 
 using CoordinatorEffect =
     std::variant<BroadcastRankState, PushViewUpdate, ReplyProposal,
-                 BroadcastPeerJoined, ReplySync, AckLinkEventReport>;
+                 BroadcastPeerJoined, ReplySync, ShutdownCoordinatorHost>;
 
 // Agent effects
 
@@ -313,9 +328,12 @@ class CoordinatorRpcService {
                                RegisterAgentRequest req) = 0;
     virtual void heartbeat(coro_rpc::context<HeartbeatResponse> ctx,
                            HeartbeatRequest req) = 0;
+    virtual void unregisterAgent(coro_rpc::context<UnregisterAgentResponse> ctx,
+                                 UnregisterAgentRequest req) = 0;
     virtual void registerGroup(coro_rpc::context<RegisterGroupResponse> ctx,
                                RegisterGroupRequest req) = 0;
-    virtual void unregisterGroup(UnregisterGroupRequest req) = 0;
+    virtual void unregisterGroup(coro_rpc::context<UnregisterGroupResponse> ctx,
+                                 UnregisterGroupRequest req) = 0;
     virtual void confirmReadyForActivation(
         coro_rpc::context<ConfirmReadyForActivationResponse> ctx,
         ConfirmReadyForActivationRequest req) = 0;
@@ -324,7 +342,8 @@ class CoordinatorRpcService {
         ProposeViewUpdateRequest req) = 0;
     virtual void publishEndpoint(coro_rpc::context<PublishEndpointResponse> ctx,
                                  PublishEndpointRequest req) = 0;
-    virtual void reportLinkEvent(LinkEventReport req) = 0;
+    virtual void reportLinkEvent(coro_rpc::context<LinkEventReportAck> ctx,
+                                 LinkEventReport req) = 0;
     virtual void syncAfterFailure(
         coro_rpc::context<SyncAfterFailureResponse> ctx,
         SyncAfterFailureRequest req) = 0;
@@ -336,7 +355,6 @@ class AgentRpcService {
 
     virtual void onPeerJoined(PeerJoinedPush push) = 0;
     virtual void onRankStateUpdate(RankStatePush push) = 0;
-    virtual void onLinkEventReportAck(LinkEventReportAck ack) = 0;
     virtual void onViewUpdate(coro_rpc::context<ViewUpdateAck> ctx,
                               ViewUpdatePush push) = 0;
 };

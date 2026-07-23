@@ -254,11 +254,6 @@ AgentApplyResult AgentStateMachine::applyRegisterAgentResponse(
     const RegisterAgentResponse& resp) {
     AgentApplyResult effects;
 
-    if (!resp.success) {
-        coordinator_connection_ = CoordinatorConnection::Disconnected;
-        return effects;
-    }
-
     if (static_cast<int>(resp.all_rank_states.size()) != max_world_size_ ||
         static_cast<int>(resp.all_rank_epochs.size()) != max_world_size_ ||
         static_cast<int>(resp.all_rank_state_versions.size()) !=

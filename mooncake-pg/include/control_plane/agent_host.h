@@ -1,6 +1,7 @@
 #ifndef MOONCAKE_PG_AGENT_HOST_H
 #define MOONCAKE_PG_AGENT_HOST_H
 
+#include <atomic>
 #include <chrono>
 #include <future>
 #include <memory>
@@ -77,6 +78,8 @@ class AgentInterface {
                                   bool auto_deactivate,
                                   MooncakeBackend* backend) = 0;
 
+    virtual void detachBackend(GroupId group_id) = 0;
+
     virtual void unregisterGroup(GroupId group_id) = 0;
 
     virtual void confirmReadyForActivation(GroupId group_id) = 0;
@@ -105,7 +108,6 @@ class AgentRpcServiceImpl : public AgentRpcService {
 
     void onPeerJoined(PeerJoinedPush push) override;
     void onRankStateUpdate(RankStatePush push) override;
-    void onLinkEventReportAck(LinkEventReportAck ack) override;
     void onViewUpdate(coro_rpc::context<ViewUpdateAck> ctx,
                       ViewUpdatePush push) override;
 
@@ -145,6 +147,7 @@ class AgentHost : public AgentInterface {
                           std::vector<GlobalRank> rank_order,
                           bool auto_deactivate,
                           MooncakeBackend* backend) override;
+    void detachBackend(GroupId group_id) override;
     void unregisterGroup(GroupId group_id) override;
     void confirmReadyForActivation(GroupId group_id) override;
     void publishLocalEndpoint(GroupEndpointPublication endpoint) override;
@@ -162,7 +165,6 @@ class AgentHost : public AgentInterface {
     uint64_t getAgentSessionId() override { return agent_.getAgentSessionId(); }
     void postPeerJoined(PeerJoinedPush push);
     void postRankStateUpdate(RankStatePush push);
-    void postLinkEventReportAck(LinkEventReportAck ack);
     void postViewUpdate(coro_rpc::context<ViewUpdateAck> ctx,
                         ViewUpdatePush push);
 
@@ -180,6 +182,7 @@ class AgentHost : public AgentInterface {
     std::string coordinator_addr_;
     uint64_t agent_session_id_ = 0;
     bool agent_session_initialized_ = false;
+    std::atomic<bool> shutdown_requested_{false};
     std::chrono::steady_clock::time_point next_heartbeat_at_;
 
     // RPC infrastructure.
@@ -194,7 +197,6 @@ class AgentHost : public AgentInterface {
 
     // Throttling state for registerAgent error logs
     std::chrono::steady_clock::time_point last_agent_register_error_log_time_;
-    uint64_t agent_register_error_log_suppressed_ = 0;
 
     // group_ready_promises_ is fulfilled when registerGroup returns and
     // the GroupView is applied.
@@ -217,9 +219,13 @@ class AgentHost : public AgentInterface {
     std::unordered_map<GroupId, MooncakeBackend*> backends_;
 
     void startAgentRegistration(bool start_new_session = false);
+    bool shouldLogAgentRegistrationError();
+    void unregisterAgent();
     void tick();
 
     void sendPublishEndpointRpc(GroupEndpointPublication endpoint);
+
+    void sendLinkEventReport(LinkEventReport report);
 
     ProposeViewUpdateResponse proposeViewUpdateInternal(
         GroupId group_id, const std::vector<InGroupRank>& ranks,

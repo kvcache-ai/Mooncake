@@ -65,6 +65,7 @@ struct GroupEndpointInfo {
 // Active -----------------------(deactivate)-----------------------> Inactive
 // AwaitingActivation ------(new agent session or offline)----------> Inactive
 // Inactive/AwaitingActivation/Active ----(unregisterGroup)---------> Left
+// Left --------------------------(registerGroup)-------------------> Inactive
 //
 // Only Active participates in collectives.
 // AwaitingActivation may become activatable once its endpoint, health, and
@@ -82,6 +83,7 @@ struct GroupMember {
     GroupMemberState status = GroupMemberState::None;
     std::optional<GroupEndpointInfo> endpoint;
 
+    bool isNone() const { return status == GroupMemberState::None; }
     bool isActive() const { return status == GroupMemberState::Active; }
     bool isAwaitingActivation() const {
         return status == GroupMemberState::AwaitingActivation;

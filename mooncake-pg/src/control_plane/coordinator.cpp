@@ -56,6 +56,12 @@ CentralizedCoordinatorStateMachine::handleRegisterAgent(
         return result;
     }
 
+    if (shutdown_requested_) {
+        result.response.success = false;
+        result.response.reject_reason = "coordinator is shutting down";
+        return result;
+    }
+
     // A failed / auto-deactivated rank (Synced or Offline) may be replaced
     // immediately. A different logical session may not take ownership from a
     // Healthy rank.
@@ -121,6 +127,24 @@ CentralizedCoordinatorStateMachine::handleRegisterAgent(
     return result;
 }
 
+CoordinatorApplyResult<void>
+CentralizedCoordinatorStateMachine::requestShutdown() {
+    CoordinatorApplyResult<void> result;
+    if (shutdown_requested_) return result;
+
+    shutdown_requested_ = true;
+    for (GlobalRank rank = 0; rank < max_world_size_; ++rank) {
+        const auto& info = ranks_[rank];
+        if (info.state != RankState::Offline) {
+            shutdown_pending_ranks_.insert(rank);
+        }
+    }
+    if (shutdown_pending_ranks_.empty()) {
+        result.effects.push_back(ShutdownCoordinatorHost{});
+    }
+    return result;
+}
+
 void CentralizedCoordinatorStateMachine::populateRegisterAgentResponse(
     RegisterAgentResponse& response, GlobalRank rank) const {
     response.success = true;
@@ -160,6 +184,36 @@ CentralizedCoordinatorStateMachine::handleHeartbeat(
     }
     auto& info = ranks_[req.rank];
     info.last_heartbeat = std::chrono::steady_clock::now();
+    return result;
+}
+
+CoordinatorApplyResult<UnregisterAgentResponse>
+CentralizedCoordinatorStateMachine::handleUnregisterAgent(
+    const UnregisterAgentRequest& req) {
+    CoordinatorApplyResult<UnregisterAgentResponse> result;
+    if (!rankInRange(req.rank)) {
+        result.response.reject_reason = "rank out of valid range";
+        return result;
+    }
+
+    auto& info = ranks_[req.rank];
+    if (info.agent_session_id != req.agent_session_id) {
+        result.response.reject_reason = "stale agent_session_id";
+        return result;
+    }
+
+    // Agent lifetime is process-scoped and independent from every group. This
+    // RPC does not change GroupView; group lifecycle and fault handling remain
+    // separate operations.
+    if (invalidateAgentSession(req.rank)) {
+        result.effects.push_back(makeRankStateEffect(req.rank));
+        updateRankStates(result.effects);
+        if (shutdown_requested_ && shutdown_pending_ranks_.empty()) {
+            result.effects.push_back(ShutdownCoordinatorHost{});
+        }
+    }
+
+    result.response.success = true;
     return result;
 }
 
@@ -233,22 +287,30 @@ CentralizedCoordinatorStateMachine::handleConfirmReadyForActivation(
     return result;
 }
 
-CoordinatorApplyResult<void>
+CoordinatorApplyResult<UnregisterGroupResponse>
 CentralizedCoordinatorStateMachine::handleUnregisterGroup(
     const UnregisterGroupRequest& req) {
-    CoordinatorApplyResult<void> result;
+    CoordinatorApplyResult<UnregisterGroupResponse> result;
     if (!hasValidSession(req.rank, req.agent_session_id)) {
+        result.response.reject_reason =
+            "rank is out of range, Offline, or has a stale session";
         return result;
     }
 
     auto it = group_views_.find(req.group_id);
     if (it == group_views_.end()) {
+        result.response.success = true;
         return result;
     }
 
     auto& view = it->second;
     auto& member = view.members[req.rank];
     if (member.hasLeft()) {
+        result.response.success = true;
+        return result;
+    }
+    if (member.isNone()) {
+        result.response.reject_reason = "rank is not registered in the group";
         return result;
     }
 
@@ -265,6 +327,7 @@ CentralizedCoordinatorStateMachine::handleUnregisterGroup(
     if (canEraseGroup(view)) {
         eraseGroup(req.group_id, result.effects);
     }
+    result.response.success = true;
     return result;
 }
 
@@ -402,11 +465,13 @@ CentralizedCoordinatorStateMachine::handleProposeViewUpdate(
 // shared reconciliation window; the healthy-set and membership decision is
 // deferred until that window closes. Positive-only transitions are applied
 // immediately only when no reconciliation is already in progress.
-CoordinatorApplyResult<void>
+CoordinatorApplyResult<LinkEventReportAck>
 CentralizedCoordinatorStateMachine::handleLinkEventReport(
     const LinkEventReport& req) {
-    CoordinatorApplyResult<void> result;
-    processLinkEventReport(req, result.effects);
+    CoordinatorApplyResult<LinkEventReportAck> result;
+    if (auto ack = processLinkEventReport(req, result.effects)) {
+        result.response = *ack;
+    }
     return result;
 }
 
@@ -435,26 +500,29 @@ void CentralizedCoordinatorStateMachine::tryCloseReconciliationWindow(
     reconciliation_ctx_.active = false;
 }
 
-void CentralizedCoordinatorStateMachine::processLinkEventReport(
+std::optional<LinkEventReportAck>
+CentralizedCoordinatorStateMachine::processLinkEventReport(
     const LinkEventReport& report, std::vector<CoordinatorEffect>& effects) {
     if (!hasValidSession(report.reporter_rank, report.agent_session_id)) {
-        return;
+        return std::nullopt;
     }
     const auto& reporter_info = ranks_[report.reporter_rank];
-    if (report.reporter_rank_epoch != reporter_info.rank_epoch) return;
+    if (report.reporter_rank_epoch != reporter_info.rank_epoch) {
+        return std::nullopt;
+    }
 
     if (report.events.size() != static_cast<size_t>(max_world_size_) ||
         report.target_rank_epochs.size() !=
             static_cast<size_t>(max_world_size_)) {
         LOG(WARNING) << "[COORD] invalid LinkEventReport vectors";
-        return;
+        return std::nullopt;
     }
 
-    effects.push_back(AckLinkEventReport{LinkEventReportAck{
-        report.reporter_rank, report.reporter_rank_epoch, report.report_id}});
+    LinkEventReportAck ack{report.reporter_rank, report.reporter_rank_epoch,
+                           report.report_id};
 
     auto& reporter = ranks_[report.reporter_rank];
-    if (report.report_id <= reporter.last_link_event_report_id) return;
+    if (report.report_id <= reporter.last_link_event_report_id) return ack;
     reporter.last_link_event_report_id = report.report_id;
 
     bool has_positive = false;
@@ -492,6 +560,7 @@ void CentralizedCoordinatorStateMachine::processLinkEventReport(
         updateRankStates(effects);
         checkGroupTransitions(effects);
     }
+    return ack;
 }
 
 // handleSyncAfterFailure - sync-after-failure RPC handler.
@@ -516,16 +585,20 @@ CentralizedCoordinatorStateMachine::handleSyncAfterFailure(
         return result;
     }
 
+    std::optional<LinkEventReportAck> link_event_report_ack;
+
     // Apply piggybacked link event report inline.
     if (req.link_event_report.has_value() &&
         req.link_event_report->reporter_rank == req.reporter_rank &&
         req.link_event_report->agent_session_id == req.agent_session_id) {
-        processLinkEventReport(*req.link_event_report, result.effects);
+        link_event_report_ack =
+            processLinkEventReport(*req.link_event_report, result.effects);
     }
 
     if (reconciliation_ctx_.active) {
         reconciliation_ctx_.pending_syncs[req.group_id][req.reporter_rank]
-            .push_back(PendingSync{sync_id, req.agent_session_id});
+            .push_back(PendingSync{sync_id, req.agent_session_id,
+                                   std::move(link_event_report_ack)});
         return result;
     }
 
@@ -534,6 +607,7 @@ CentralizedCoordinatorStateMachine::handleSyncAfterFailure(
     // and let AgentHost apply it synchronously before exposing the response.
     auto response =
         makeSyncResponse(SyncAfterFailureStatus::NoPending, req.group_id);
+    response.link_event_report_ack = std::move(link_event_report_ack);
     result.effects.push_back(ReplySync{sync_id, std::move(response)});
     return result;
 }
@@ -578,7 +652,7 @@ CoordinatorApplyResult<void> CentralizedCoordinatorStateMachine::tick() {
         auto& info = ranks_[rank];
         if (info.state == RankState::Offline) continue;
         if (now - info.last_heartbeat > kHeartbeatTimeout) {
-            transitionToOffline(rank, "heartbeat timeout", result.effects);
+            handleTimedOutAgent(rank, "heartbeat timeout", result.effects);
         }
     }
 
@@ -603,14 +677,10 @@ CoordinatorApplyResult<void> CentralizedCoordinatorStateMachine::tick() {
     return result;
 }
 
-void CentralizedCoordinatorStateMachine::transitionToOffline(
-    GlobalRank rank, const char* reason,
-    std::vector<CoordinatorEffect>& effects) {
-    if (ranks_[rank].state == RankState::Offline) return;
+bool CentralizedCoordinatorStateMachine::invalidateAgentSession(
+    GlobalRank rank) {
+    if (ranks_[rank].state == RankState::Offline) return false;
 
-    LOG(INFO) << "[COORD] transitionToOffline rank=" << rank
-              << " state=" << static_cast<int>(ranks_[rank].state)
-              << " reason=" << reason;
     ranks_[rank].state = RankState::Offline;
     ++ranks_[rank].rank_state_version;
     ranks_[rank].link_status.assign(max_world_size_, 0);
@@ -621,14 +691,20 @@ void CentralizedCoordinatorStateMachine::transitionToOffline(
             peer.link_status[rank] = 0;
     }
 
-    std::vector<GroupId> pending_groups;
-    pending_groups.reserve(reconciliation_ctx_.pending_syncs.size());
-    for (const auto& [group_id, _] : reconciliation_ctx_.pending_syncs) {
-        pending_groups.push_back(group_id);
-    }
-    for (const auto& group_id : pending_groups) {
-        rejectPendingSyncs(group_id, rank, "rank went offline", effects);
-    }
+    if (shutdown_requested_) shutdown_pending_ranks_.erase(rank);
+
+    return true;
+}
+
+void CentralizedCoordinatorStateMachine::handleTimedOutAgent(
+    GlobalRank rank, const char* reason,
+    std::vector<CoordinatorEffect>& effects) {
+    const auto previous_state = ranks_[rank].state;
+    if (!invalidateAgentSession(rank)) return;
+
+    LOG(INFO) << "[COORD] handleTimedOutAgent rank=" << rank
+              << " state=" << static_cast<int>(previous_state)
+              << " reason=" << reason;
 
     for (auto& [group_id, view] : group_views_) {
         auto& member = view.members[rank];
@@ -666,6 +742,10 @@ void CentralizedCoordinatorStateMachine::transitionToOffline(
     updateRankStates(effects);
     applyAutoDeactivate(effects);
     checkGroupTransitions(effects);
+
+    if (shutdown_requested_ && shutdown_pending_ranks_.empty()) {
+        effects.push_back(ShutdownCoordinatorHost{});
+    }
 }
 
 bool CentralizedCoordinatorStateMachine::isMutuallyConnected(
@@ -1112,8 +1192,10 @@ bool CentralizedCoordinatorStateMachine::processGroupRegistration(
 
     auto& view = group_views_[group_id];
     auto& joining_member = view.members[request.rank];
-    if (joining_member.status == GroupMemberState::None) {
+    if (joining_member.status == GroupMemberState::None ||
+        joining_member.status == GroupMemberState::Left) {
         joining_member.status = GroupMemberState::Inactive;
+        joining_member.endpoint = std::nullopt;
         view_changed = true;
     }
 
@@ -1225,7 +1307,7 @@ void CentralizedCoordinatorStateMachine::commitBarrier(
                         }
                     }
                     for (GlobalRank rank : dropped) {
-                        transitionToOffline(rank, "ViewUpdate barrier timeout",
+                        handleTimedOutAgent(rank, "ViewUpdate barrier timeout",
                                             effects);
                     }
                 }
@@ -1256,6 +1338,7 @@ void CentralizedCoordinatorStateMachine::rejectPendingSyncs(
     for (const PendingSync& pending : rank_it->second) {
         auto resp =
             makeSyncResponse(SyncAfterFailureStatus::Rejected, group_id);
+        resp.link_event_report_ack = pending.link_event_report_ack;
         resp.reject_reason = reason;
         effects.push_back(ReplySync{pending.sync_id, std::move(resp)});
     }
@@ -1307,6 +1390,7 @@ void CentralizedCoordinatorStateMachine::resolvePendingSyncs(
                                   ? SyncAfterFailureStatus::Reconciled
                                   : SyncAfterFailureStatus::Rejected;
                 auto response = makeSyncResponse(status, group_id);
+                response.link_event_report_ack = pending.link_event_report_ack;
                 if (status == SyncAfterFailureStatus::Rejected) {
                     response.reject_reason = "stale agent session";
                 }

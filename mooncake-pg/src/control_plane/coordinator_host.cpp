@@ -19,13 +19,21 @@ void CoordinatorRpcServiceImpl::heartbeat(
     host_.postHeartbeat(std::move(ctx), std::move(req));
 }
 
+void CoordinatorRpcServiceImpl::unregisterAgent(
+    coro_rpc::context<UnregisterAgentResponse> ctx,
+    UnregisterAgentRequest req) {
+    host_.postUnregisterAgent(std::move(ctx), std::move(req));
+}
+
 void CoordinatorRpcServiceImpl::registerGroup(
     coro_rpc::context<RegisterGroupResponse> ctx, RegisterGroupRequest req) {
     host_.postRegisterGroup(std::move(ctx), std::move(req));
 }
 
-void CoordinatorRpcServiceImpl::unregisterGroup(UnregisterGroupRequest req) {
-    host_.postUnregisterGroup(std::move(req));
+void CoordinatorRpcServiceImpl::unregisterGroup(
+    coro_rpc::context<UnregisterGroupResponse> ctx,
+    UnregisterGroupRequest req) {
+    host_.postUnregisterGroup(std::move(ctx), std::move(req));
 }
 
 void CoordinatorRpcServiceImpl::confirmReadyForActivation(
@@ -45,8 +53,9 @@ void CoordinatorRpcServiceImpl::publishEndpoint(
     host_.postPublishEndpoint(std::move(ctx), std::move(req));
 }
 
-void CoordinatorRpcServiceImpl::reportLinkEvent(LinkEventReport req) {
-    host_.postLinkEventReport(std::move(req));
+void CoordinatorRpcServiceImpl::reportLinkEvent(
+    coro_rpc::context<LinkEventReportAck> ctx, LinkEventReport req) {
+    host_.postLinkEventReport(std::move(ctx), std::move(req));
 }
 
 void CoordinatorRpcServiceImpl::syncAfterFailure(
@@ -77,6 +86,7 @@ void CoordinatorHost::start() {
     rpc_server_
         ->registerHandler<&CoordinatorRpcService::registerAgent,
                           &CoordinatorRpcService::heartbeat,
+                          &CoordinatorRpcService::unregisterAgent,
                           &CoordinatorRpcService::registerGroup,
                           &CoordinatorRpcService::unregisterGroup,
                           &CoordinatorRpcService::confirmReadyForActivation,
@@ -103,6 +113,21 @@ void CoordinatorHost::start() {
 }
 
 void CoordinatorHost::shutdown() {
+    if (shutdown_requested_.exchange(true, std::memory_order_acq_rel)) return;
+
+    if (rpc_server_) {
+        auto shutdown_confirmation = shutdown_confirmation_.get_future();
+        executor_.postAndWait([this]() {
+            auto result = state_machine_.requestShutdown();
+            runEffects(result.effects);
+        });
+
+        if (shutdown_confirmation.wait_for(kShutdownDrainTimeout) !=
+            std::future_status::ready) {
+            LOG(WARNING) << "[COORD] shutdown drain timed out";
+        }
+    }
+
     if (rpc_server_) rpc_server_->shutdown();
     executor_.shutdown();
 
@@ -138,8 +163,19 @@ void CoordinatorHost::postHeartbeat(coro_rpc::context<HeartbeatResponse> ctx,
     executor_.post(
         [this, ctx = std::move(ctx), req = std::move(req)]() mutable {
             auto result = state_machine_.handleHeartbeat(req);
-            ctx.response_msg(std::move(result.response));
             runEffects(result.effects);
+            ctx.response_msg(std::move(result.response));
+        });
+}
+
+void CoordinatorHost::postUnregisterAgent(
+    coro_rpc::context<UnregisterAgentResponse> ctx,
+    UnregisterAgentRequest req) {
+    executor_.post(
+        [this, ctx = std::move(ctx), req = std::move(req)]() mutable {
+            auto result = state_machine_.handleUnregisterAgent(req);
+            runEffects(result.effects);
+            ctx.response_msg(std::move(result.response));
         });
 }
 
@@ -148,16 +184,20 @@ void CoordinatorHost::postRegisterGroup(
     executor_.post(
         [this, ctx = std::move(ctx), req = std::move(req)]() mutable {
             auto result = state_machine_.handleRegisterGroup(req);
-            ctx.response_msg(std::move(result.response));
             runEffects(result.effects);
+            ctx.response_msg(std::move(result.response));
         });
 }
 
-void CoordinatorHost::postUnregisterGroup(UnregisterGroupRequest req) {
-    executor_.post([this, req = std::move(req)]() {
-        auto result = state_machine_.handleUnregisterGroup(req);
-        runEffects(result.effects);
-    });
+void CoordinatorHost::postUnregisterGroup(
+    coro_rpc::context<UnregisterGroupResponse> ctx,
+    UnregisterGroupRequest req) {
+    executor_.post(
+        [this, ctx = std::move(ctx), req = std::move(req)]() mutable {
+            auto result = state_machine_.handleUnregisterGroup(req);
+            runEffects(result.effects);
+            ctx.response_msg(std::move(result.response));
+        });
 }
 
 void CoordinatorHost::postConfirmReadyForActivation(
@@ -189,16 +229,19 @@ void CoordinatorHost::postPublishEndpoint(
     executor_.post(
         [this, ctx = std::move(ctx), req = std::move(req)]() mutable {
             auto result = state_machine_.handlePublishEndpoint(req);
-            ctx.response_msg(std::move(result.response));
             runEffects(result.effects);
+            ctx.response_msg(std::move(result.response));
         });
 }
 
-void CoordinatorHost::postLinkEventReport(LinkEventReport req) {
-    executor_.post([this, req = std::move(req)]() {
-        auto result = state_machine_.handleLinkEventReport(req);
-        runEffects(result.effects);
-    });
+void CoordinatorHost::postLinkEventReport(
+    coro_rpc::context<LinkEventReportAck> ctx, LinkEventReport req) {
+    executor_.post(
+        [this, ctx = std::move(ctx), req = std::move(req)]() mutable {
+            auto result = state_machine_.handleLinkEventReport(req);
+            runEffects(result.effects);
+            ctx.response_msg(std::move(result.response));
+        });
 }
 
 void CoordinatorHost::postSyncAfterFailure(
@@ -260,12 +303,8 @@ void CoordinatorHost::runEffects(
                         }
                     }
                 },
-                [this](const AckLinkEventReport& e) {
-                    if (state_machine_.getRankState(e.ack.reporter_rank) !=
-                        RankState::Offline) {
-                        pushToAgent<&AgentRpcService::onLinkEventReportAck>(
-                            e.ack.reporter_rank, e.ack);
-                    }
+                [this](const ShutdownCoordinatorHost&) {
+                    shutdown_confirmation_.set_value();
                 },
             },
             effect);
@@ -289,7 +328,10 @@ void CoordinatorHost::pushViewUpdate(const PushViewUpdate& effect) {
             continue;
 
         rpc_client_->callAsync<&AgentRpcService::onViewUpdate>(
-            addr, push, [this, group_id, rank = i](ViewUpdateAck ack) {
+            addr, push,
+            [this, group_id,
+             rank = i](coro_rpc::rpc_error error, ViewUpdateAck ack) {
+                if (error) return;
                 postViewUpdateAck(group_id, rank, ack.epoch, ack.applied);
             });
     }

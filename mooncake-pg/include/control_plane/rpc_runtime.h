@@ -9,6 +9,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -53,54 +54,32 @@ class RpcClient {
         std::chrono::milliseconds connect_timeout = kConnectTimeout);
     ~RpcClient() = default;
 
-   private:
-    template <typename T>
-    static void setRpcError(T&, ...) {}  // fallback: do nothing
-
-    template <typename T>
-    static auto setRpcError(T& resp, const std::string& msg)
-        -> decltype(resp.reject_reason, void()) {
-        resp.reject_reason = msg;
-    }
-
-    template <typename T>
-    static auto setRpcError(T& resp, const std::string& msg)
-        -> decltype(resp.error_msg, void()) {
-        resp.error_msg = msg;
-    }
-
-   public:
-    // Synchronous call.
-    template <auto Func, typename Req>
-    auto call(const std::string& addr, Req req,
-              std::optional<std::chrono::milliseconds> timeout = std::nullopt) {
+    template <auto Func, typename Req, typename Response>
+    coro_rpc::rpc_error call(
+        const std::string& addr, Req req, Response& response,
+        std::optional<std::chrono::milliseconds> timeout = std::nullopt) {
         using ResponseType = decltype(coro_rpc::get_return_type<Func>());
+        static_assert(std::is_same_v<Response, ResponseType>);
 
         auto client = createSyncClient();
         auto request_timeout = timeout.value_or(state_->request_timeout);
 
         auto ec = async_simple::coro::syncAwait(client->connect(addr));
         if (ec) {
-            LOG(ERROR) << "RpcClient: call connect failed to " << addr << ": "
-                       << ec.message();
-            ResponseType resp{};
-            setRpcError(resp,
-                        "RPC connect failed: " + std::string(ec.message()));
-            return resp;
+            return coro_rpc::rpc_error{coro_rpc::errc::not_connected,
+                                       ec.message()};
         }
         auto result = async_simple::coro::syncAwait(
             client->call_for<Func>(request_timeout, req));
         if (!result) {
-            LOG(ERROR) << "RpcClient: call RPC failed: " << result.error().msg;
-            ResponseType resp{};
-            setRpcError(resp,
-                        "RPC call failed: " + std::string(result.error().msg));
-            return resp;
+            return std::move(result.error());
         }
-        return std::move(result.value());
+        response = std::move(result.value());
+        return {};
     }
 
-    // Async call with callback.
+    // Async call with callback. The response is valid only when
+    // the error is empty.
     template <auto Func, typename Req, typename Callback>
     void callAsync(const std::string& addr, Req req, Callback cb) {
         using ResponseType = decltype(coro_rpc::get_return_type<Func>());
@@ -178,7 +157,8 @@ class RpcClient {
             if (!state->shutdown.load(std::memory_order_acquire)) {
                 VLOG(1) << "RpcClient: callAsync failed to connect to " << addr;
             }
-            cb(ResponseType{});
+            cb(coro_rpc::rpc_error{coro_rpc::errc::not_connected},
+               ResponseType{});
             co_return;
         }
         try {
@@ -187,17 +167,18 @@ class RpcClient {
             auto res = co_await std::move(send_lazy);
             if (state->shutdown.load(std::memory_order_acquire)) co_return;
             if (res) {
-                cb(std::move(res.value().result()));
+                cb(coro_rpc::rpc_error{}, std::move(res.value().result()));
             } else {
                 VLOG(1) << "RpcClient: async rpc to " << addr
                         << " failed: " << res.error().msg;
-                cb(ResponseType{});
+                cb(std::move(res.error()), ResponseType{});
             }
         } catch (const std::exception& e) {
             if (!state->shutdown.load(std::memory_order_acquire)) {
                 VLOG(1) << "RpcClient: async rpc caught exception: "
                         << e.what();
-                cb(ResponseType{});
+                cb(coro_rpc::rpc_error{coro_rpc::errc::io_error, e.what()},
+                   ResponseType{});
             }
         }
     }

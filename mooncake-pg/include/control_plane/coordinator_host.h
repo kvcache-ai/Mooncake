@@ -1,6 +1,9 @@
 #ifndef MOONCAKE_PG_COORDINATOR_HOST_H
 #define MOONCAKE_PG_COORDINATOR_HOST_H
 
+#include <atomic>
+#include <chrono>
+#include <future>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -65,10 +68,14 @@ class CoordinatorRpcServiceImpl : public CoordinatorRpcService {
     void heartbeat(coro_rpc::context<HeartbeatResponse> ctx,
                    HeartbeatRequest req) override;
 
+    void unregisterAgent(coro_rpc::context<UnregisterAgentResponse> ctx,
+                         UnregisterAgentRequest req) override;
+
     void registerGroup(coro_rpc::context<RegisterGroupResponse> ctx,
                        RegisterGroupRequest req) override;
 
-    void unregisterGroup(UnregisterGroupRequest req) override;
+    void unregisterGroup(coro_rpc::context<UnregisterGroupResponse> ctx,
+                         UnregisterGroupRequest req) override;
 
     void confirmReadyForActivation(
         coro_rpc::context<ConfirmReadyForActivationResponse> ctx,
@@ -80,7 +87,8 @@ class CoordinatorRpcServiceImpl : public CoordinatorRpcService {
     void proposeViewUpdate(coro_rpc::context<ProposeViewUpdateResponse> ctx,
                            ProposeViewUpdateRequest req) override;
 
-    void reportLinkEvent(LinkEventReport req) override;
+    void reportLinkEvent(coro_rpc::context<LinkEventReportAck> ctx,
+                         LinkEventReport req) override;
 
     void syncAfterFailure(coro_rpc::context<SyncAfterFailureResponse> ctx,
                           SyncAfterFailureRequest req) override;
@@ -107,10 +115,14 @@ class CoordinatorHost {
     void postHeartbeat(coro_rpc::context<HeartbeatResponse> ctx,
                        HeartbeatRequest req);
 
+    void postUnregisterAgent(coro_rpc::context<UnregisterAgentResponse> ctx,
+                             UnregisterAgentRequest req);
+
     void postRegisterGroup(coro_rpc::context<RegisterGroupResponse> ctx,
                            RegisterGroupRequest req);
 
-    void postUnregisterGroup(UnregisterGroupRequest req);
+    void postUnregisterGroup(coro_rpc::context<UnregisterGroupResponse> ctx,
+                             UnregisterGroupRequest req);
 
     void postConfirmReadyForActivation(
         coro_rpc::context<ConfirmReadyForActivationResponse> ctx,
@@ -122,7 +134,8 @@ class CoordinatorHost {
     void postPublishEndpoint(coro_rpc::context<PublishEndpointResponse> ctx,
                              PublishEndpointRequest req);
 
-    void postLinkEventReport(LinkEventReport req);
+    void postLinkEventReport(coro_rpc::context<LinkEventReportAck> ctx,
+                             LinkEventReport req);
 
     void postSyncAfterFailure(coro_rpc::context<SyncAfterFailureResponse> ctx,
                               SyncAfterFailureRequest req);
@@ -154,6 +167,13 @@ class CoordinatorHost {
     uint64_t next_sync_id_{1};
     std::unordered_map<uint64_t, coro_rpc::context<SyncAfterFailureResponse>>
         pending_sync_ctxs_;
+
+    static constexpr auto kShutdownDrainTimeout = std::chrono::seconds(30);
+
+    // The Host requests shutdown from the state machine and stops the RPC
+    // server once all sessions in the shutdown snapshot have unregistered.
+    std::atomic<bool> shutdown_requested_{false};
+    std::promise<void> shutdown_confirmation_;
 
     void runEffects(const std::vector<CoordinatorEffect>& effects);
     void pushViewUpdate(const PushViewUpdate& effect);
