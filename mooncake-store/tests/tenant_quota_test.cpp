@@ -1,4 +1,4 @@
-#include "tenant_quota.h"
+#include "tenant_quota_sharded.h"
 #include "tenant_quota_policy_store.h"
 #include "types.h"
 
