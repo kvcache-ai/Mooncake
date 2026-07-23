@@ -21,7 +21,6 @@
 
 namespace mooncake::tent {
 
-// Pre-constructed label values indexed by TransportType enum. Keeps the
 TentMetrics& TentMetrics::instance() {
     static TentMetrics instance;
     return instance;
@@ -30,18 +29,6 @@ TentMetrics& TentMetrics::instance() {
 TentMetrics::~TentMetrics() { shutdown(); }
 
 #if TENT_METRICS_ENABLED
-
-// Pre-constructed label value lookup table, indexed by TransportType enum
-// (see tent/common/types.h:46). Keeps label values in a closed set — no
-// arbitrary strings can reach the metrics. Label values aligned with
-// TransportSelector::transportTypeName().
-// Enum order: UNSPEC, RDMA, MNNVL, SHM, NVLINK, GDS,
-// IOURING, TCP, AscendDirect, SUNRISE_LINK, TPU.
-const std::array<std::string, kNumTransportTypes>
-    TentMetrics::kTransportLabelNames = {
-        "unspec",   "rdma", "mnnvl",  "shm",          "nvlink", "gds",
-        "io_uring", "tcp",  "ascend", "sunrise_link", "tpu",
-};
 
 Status TentMetrics::initialize(const MetricsConfig& config) {
     // Validate configuration before touching initialized_. An invalid config
@@ -242,7 +229,7 @@ void TentMetrics::recordReadCompleted(TransportType tp, size_t bytes,
     if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
         return;
 
-    auto label = std::array<std::string, 1>{transportLabel(tp)};
+    auto label = std::array<std::string, 1>{transportTypeName(tp)};
     read_bytes_total_.inc(label, static_cast<int64_t>(bytes));
     read_requests_total_.inc(label);
     read_size_.observe(label, static_cast<int64_t>(bytes));
@@ -257,7 +244,7 @@ void TentMetrics::recordWriteCompleted(TransportType tp, size_t bytes,
     if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
         return;
 
-    auto label = std::array<std::string, 1>{transportLabel(tp)};
+    auto label = std::array<std::string, 1>{transportTypeName(tp)};
     write_bytes_total_.inc(label, static_cast<int64_t>(bytes));
     write_requests_total_.inc(label);
     write_size_.observe(label, static_cast<int64_t>(bytes));
@@ -271,7 +258,7 @@ void TentMetrics::recordDeadlineMLU(TransportType tp, double mlu) {
     if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
         return;
     if (mlu < 0.0) return;
-    auto label = std::array<std::string, 1>{transportLabel(tp)};
+    auto label = std::array<std::string, 1>{transportTypeName(tp)};
     deadline_mlu_.observe(label, static_cast<int64_t>(mlu * 1000.0));
 }
 
@@ -279,7 +266,7 @@ void TentMetrics::recordDeadlineInfeasible(TransportType tp) {
     if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
         return;
     deadline_infeasible_total_.inc(
-        std::array<std::string, 1>{transportLabel(tp)});
+        std::array<std::string, 1>{transportTypeName(tp)});
 }
 
 void TentMetrics::recordStageLatency(Stage stage, TransportType tp,
@@ -287,7 +274,7 @@ void TentMetrics::recordStageLatency(Stage stage, TransportType tp,
     if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
         return;
     if (latency_us < 0.0) return;
-    auto label = std::array<std::string, 1>{transportLabel(tp)};
+    auto label = std::array<std::string, 1>{transportTypeName(tp)};
     int64_t val = static_cast<int64_t>(latency_us);
     switch (stage) {
         case Stage::QueueWait:
@@ -305,7 +292,7 @@ void TentMetrics::recordStageLatency(Stage stage, TransportType tp,
 void TentMetrics::recordReadFailed(TransportType tp) {
     if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
         return;
-    auto label = std::array<std::string, 1>{transportLabel(tp)};
+    auto label = std::array<std::string, 1>{transportTypeName(tp)};
     read_failures_total_.inc(label);
     read_requests_total_.inc(label);
 }
@@ -313,7 +300,7 @@ void TentMetrics::recordReadFailed(TransportType tp) {
 void TentMetrics::recordWriteFailed(TransportType tp) {
     if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
         return;
-    auto label = std::array<std::string, 1>{transportLabel(tp)};
+    auto label = std::array<std::string, 1>{transportTypeName(tp)};
     write_failures_total_.inc(label);
     write_requests_total_.inc(label);
 }
@@ -322,8 +309,8 @@ void TentMetrics::recordTransportFailover(TransportType from,
                                           TransportType to) {
     if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
         return;
-    failover_total_.inc(
-        std::array<std::string, 2>{transportLabel(from), transportLabel(to)});
+    failover_total_.inc(std::array<std::string, 2>{transportTypeName(from),
+                                                   transportTypeName(to)});
 }
 
 std::string TentMetrics::getPrometheusMetrics() {
