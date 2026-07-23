@@ -235,6 +235,45 @@ mooncake_master \
 
 The master resolves the current IPv4 address of `eth0` at startup and uses it as the advertised RPC address.
 
+---
+
+### Multi-Model KV Cache Isolation
+
+Mooncake Store treats object keys as opaque strings. When multiple models share one Mooncake Store, configure the model identifier in the inference framework to keep their KV cache entries separate.
+
+#### SGLang
+
+With an SGLang version that includes [model-aware Mooncake key isolation](https://github.com/sgl-project/sglang/pull/31920), set a stable and unique `--served-model-name`:
+
+```bash
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-8B \
+  --served-model-name qwen3-8b \
+  --enable-hierarchical-cache \
+  --hicache-storage-backend mooncake
+```
+
+Use the same `--served-model-name` on all SGLang instances that should share KV cache entries.
+
+#### vLLM
+
+The vLLM `MooncakeStoreConnector` automatically uses the final component of the model passed to `vllm serve` as the model identifier, so no separate model-name setting is required. To isolate deployments whose model paths end with the same name, assign each deployment a distinct `cache_prefix`:
+
+```bash
+MOONCAKE_CONFIG_PATH=/path/to/mooncake_config.json \
+vllm serve Qwen/Qwen3-8B \
+  --kv-transfer-config '{
+    "kv_connector": "MooncakeStoreConnector",
+    "kv_role": "kv_both",
+    "kv_connector_extra_config": {
+      "cache_prefix": "qwen3-8b-production"
+    }
+  }'
+```
+
+Use the same model and `cache_prefix` on all vLLM instances that should share KV cache entries.
+
+Separately, enabling `--enable_multi_tenants=true` adds a `tenant_id`-scoped object namespace and per-tenant quota admission. See [Tenant Quota Management](#tenant-quota-management) for configuration details.
 
 ---
 
