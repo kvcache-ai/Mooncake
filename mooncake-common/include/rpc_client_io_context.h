@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <chrono>
+#include <csignal>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
