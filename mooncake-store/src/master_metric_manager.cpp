@@ -2044,12 +2044,20 @@ std::string MasterMetricManager::get_summary_string(
     std::stringstream ss;
 
     // --- Get current values ---
-    int64_t mem_allocated = mem_allocated_size_.value();
-    int64_t mem_capacity = mem_total_capacity_.value();
-    int64_t nof_allocated = nof_allocated_size_.value();
-    int64_t nof_capacity = nof_total_capacity_.value();
-    int64_t file_allocated = file_allocated_size_.value();
-    [[maybe_unused]] int64_t file_capacity = file_total_capacity_.value();
+    // Clamp to non-negative: gauges default to -1 when no segment has been
+    // mounted, and passing negative values through byte_size_to_string() would
+    // display a huge garbage number (e.g. "16777216.00 TB") due to implicit
+    // int64_t → uint64_t conversion of -1.
+    auto clamp_non_negative = [](int64_t val) -> int64_t {
+        return val < 0 ? 0 : val;
+    };
+    int64_t mem_allocated = clamp_non_negative(mem_allocated_size_.value());
+    int64_t mem_capacity = clamp_non_negative(mem_total_capacity_.value());
+    int64_t nof_allocated = clamp_non_negative(nof_allocated_size_.value());
+    int64_t nof_capacity = clamp_non_negative(nof_total_capacity_.value());
+    int64_t file_allocated = clamp_non_negative(file_allocated_size_.value());
+    [[maybe_unused]] int64_t file_capacity =
+        clamp_non_negative(file_total_capacity_.value());
     int64_t keys = key_count_.value();
     int64_t soft_pin_keys = soft_pin_key_count_.value();
     int64_t active_clients = active_clients_.value();

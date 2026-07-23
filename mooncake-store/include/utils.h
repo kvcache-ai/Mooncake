@@ -150,6 +150,10 @@ std::string expected_to_str(const tl::expected<T, ErrorCode>& expected) {
 
     std::ostringstream oss;
     oss << std::fixed << std::setprecision(2);
+    if (bytes == 0) {
+        oss << "0 B";
+        return oss.str();
+    }
     if (static_cast<int64_t>(bytes) == std::numeric_limits<int64_t>::max()) {
         oss << "infinite";
     } else if (bytes >= static_cast<uint64_t>(TB)) {
