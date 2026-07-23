@@ -30,6 +30,25 @@ std::string genGpuNodeName(int node) {
     return kWildcardLocation;
 }
 
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
+    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
+    defined(USE_COREX) || defined(USE_SUNRISE)
+// A GPU-less host (e.g. an RDMA-only sidecar) has no device for
+// cudaPointerGetAttributes to classify, yet a CUDA-enabled build probes
+// every buffer, each call failing and logging a per-buffer ERROR that
+// buries real logs. Detect the absence once and skip the probe.
+static bool detectCudaDevicePresent() {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess ||
+        device_count == 0) {
+        LOG(WARNING) << "No CUDA device detected; treating buffers as "
+                        "host memory";
+        return false;
+    }
+    return true;
+}
+#endif
+
 const std::vector<MemoryLocationEntry> getMemoryLocation(void *start,
                                                          size_t len,
                                                          bool only_first_page) {
@@ -38,20 +57,7 @@ const std::vector<MemoryLocationEntry> getMemoryLocation(void *start,
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX) || defined(USE_SUNRISE)
-    // A GPU-less host (e.g. an RDMA-only sidecar) has no device for
-    // cudaPointerGetAttributes to classify, yet a CUDA-enabled build probes
-    // every buffer, each call failing and logging a per-buffer ERROR that
-    // buries real logs. Detect the absence once and skip the probe.
-    static const bool cuda_device_present = [] {
-        int device_count = 0;
-        if (cudaGetDeviceCount(&device_count) != cudaSuccess ||
-            device_count == 0) {
-            LOG(WARNING) << "No CUDA device detected; treating buffers as "
-                            "host memory";
-            return false;
-        }
-        return true;
-    }();
+    static const bool cuda_device_present = detectCudaDevicePresent();
 
     if (cuda_device_present) {
         cudaPointerAttributes attributes;
