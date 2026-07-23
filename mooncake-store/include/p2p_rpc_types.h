@@ -18,9 +18,23 @@ struct WriteRouteRequestConfig {
     static constexpr size_t RETURN_ALL_CANDIDATES = 0;
     size_t max_candidates = 2;
     ObjectIterateStrategy strategy = ObjectIterateStrategy::CAPACITY_PRIORITY;
-    bool allow_local = true;   // whether to filter local client
-    bool prefer_local = true;  // enhance the priority of local client
-                               // works only when allow_local==true
+    // Remote-write weight in [0, 1]. Controls local-vs-remote routing via
+    // multiplicative scoring on the master side:
+    //   score = free_ratio * (is_local ? (1 - remote_weight) : remote_weight)
+    //   0   -> local only  (client writes locally);
+    //   0.5 -> pure capacity order (local and remote weighted equally);
+    //   1   -> remote only (master never returns the local client).
+    double remote_weight = 0.5;
+
+    // Local-write waterline in [0, 1]. When the client's local utilization
+    // (1 - free/total over eligible tiers) is below this threshold, the client
+    // writes locally without asking the master. 0 = disabled.
+    double local_write_waterline = 0.5;
+
+    // Capacity metric used when scoring a client:
+    //   false = sum free/total over all tiers;
+    //   true  = only account the highest-priority eligible tier's free/total
+    bool top_tier_only = true;
     bool early_return = true;  // whether to return immediately once candidates
                                // meet conditions of config
 
@@ -29,16 +43,25 @@ struct WriteRouteRequestConfig {
     std::vector<std::string> tag_filters;
     // filter the segments whose priority is lower than priority_limit
     int priority_limit = 0;
+
+    bool IsValid() const {
+        // contradictory:
+        // waterline=0 means "never write locally",
+        // remote_weight=0 means "master only returns local route".
+        return !(local_write_waterline <= 0.0 && remote_weight <= 0.0);
+    }
 };
-YLT_REFL(WriteRouteRequestConfig, max_candidates, strategy, allow_local,
-         prefer_local, early_return, tag_filters, priority_limit);
+YLT_REFL(WriteRouteRequestConfig, max_candidates, strategy, remote_weight,
+         local_write_waterline, top_tier_only, early_return, tag_filters,
+         priority_limit);
 
 inline std::ostream& operator<<(std::ostream& os,
                                 const WriteRouteRequestConfig& config) {
     os << "WriteRouteRequestConfig: { max_candidates: " << config.max_candidates
        << ", strategy: " << config.strategy
-       << ", allow_local: " << (config.allow_local ? "true" : "false")
-       << ", prefer_local: " << (config.prefer_local ? "true" : "false")
+       << ", remote_weight: " << config.remote_weight
+       << ", local_write_waterline: " << config.local_write_waterline
+       << ", top_tier_only: " << (config.top_tier_only ? "true" : "false")
        << ", early_return: " << (config.early_return ? "true" : "false")
        << ", priority_limit: " << config.priority_limit << " }";
     return os;
@@ -60,11 +83,14 @@ YLT_REFL(WriteRouteRequest, key, client_id, size, config);
  * @brief Candidate node for writing route
  */
 struct WriteCandidate {
-    P2PProxyDescriptor replica;
+    UUID client_id;
+    std::string ip_address;
+    uint16_t rpc_port = 0;
     size_t available_capacity = 0;
-    int priority = 0;
+    double score = 0.0;
 };
-YLT_REFL(WriteCandidate, replica, available_capacity, priority);
+YLT_REFL(WriteCandidate, client_id, ip_address, rpc_port, available_capacity,
+         score);
 
 /**
  * @brief Response structure for getting write route.

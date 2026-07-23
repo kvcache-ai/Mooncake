@@ -4,6 +4,7 @@
 
 #include <csignal>
 #include <algorithm>
+#include <limits>
 #include <coroutine>
 #include <cstring>
 #include <cstdlib>
@@ -297,7 +298,11 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
     // proceed.
     ha_manager_->SetReadyForRecovery();
 
-    runtime_config_store_->loadFromJson(config.runtime_config_json);
+    if (!runtime_config_store_->loadFromJson(config.runtime_config_json)) {
+        LOG(WARNING) << "runtime config validation failed during startup, "
+                     << "using defaults for invalid fields";
+        return ErrorCode::INTERNAL_ERROR;
+    }
 
     // 12. Apply periodic metric-reporting config
     if (metrics_) {
@@ -705,6 +710,10 @@ std::vector<tl::expected<void, ErrorCode>> P2PClientService::BatchPut(
         LOG(ERROR) << "P2PClientService expects WriteRouteRequestConfig";
         std::fill(results.begin(), results.end(),
                   tl::unexpected(ErrorCode::INVALID_PARAMS));
+    } else if (!route_cfg_ptr->IsValid()) {
+        LOG(ERROR) << "invalid WriteRouteRequestConfig: " << *route_cfg_ptr;
+        std::fill(results.begin(), results.end(),
+                  tl::unexpected(ErrorCode::INVALID_PARAMS));
     } else {
         results = InnerBatchPut(keys, batched_slices, *route_cfg_ptr);
     }
@@ -742,18 +751,60 @@ std::vector<tl::expected<void, ErrorCode>> P2PClientService::BatchPut(
     return results;
 }
 
+bool P2PClientService::IsLocalWrite(const WriteRouteRequestConfig& cfg) const {
+    return (ha_manager_ && ha_manager_->IsLocalService()) ||
+           cfg.remote_weight <= 0.0 || IsBelowLocalWaterline(cfg);
+}
+
+bool P2PClientService::IsBelowLocalWaterline(
+    const WriteRouteRequestConfig& cfg) const {
+    if (cfg.local_write_waterline <= 0.0 || !data_manager_) return false;
+
+    auto tiers = data_manager_->GetTierViews();
+    auto eligible = [&](const TierView& t) {
+        if (t.priority < cfg.priority_limit) return false;
+        for (const auto& tag : cfg.tag_filters)
+            if (std::find(t.tags.begin(), t.tags.end(), tag) != t.tags.end())
+                return false;
+        return true;
+    };
+
+    // Single pass: accumulate all-tier and top-tier stats.
+    size_t all_free = 0, all_total = 0, top_free = 0, top_total = 0;
+    int max_priority = std::numeric_limits<int>::min();
+    for (const auto& t : tiers) {
+        if (!eligible(t)) continue;
+        all_total += t.capacity;
+        all_free += t.free_space;
+        if (t.priority > max_priority) {
+            max_priority = t.priority;
+            top_free = t.free_space;
+            top_total = t.capacity;
+        } else if (t.priority == max_priority) {
+            top_total += t.capacity;
+            top_free += t.free_space;
+        }
+    }
+
+    const size_t total = cfg.top_tier_only ? top_total : all_total;
+    const size_t free = cfg.top_tier_only ? top_free : all_free;
+    if (total == 0) return false;
+    const double utilization = 1.0 - static_cast<double>(free) / total;
+    return utilization < cfg.local_write_waterline;
+}
+
 std::vector<tl::expected<void, ErrorCode>> P2PClientService::InnerBatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const WriteRouteRequestConfig& route_config) {
-    if (ha_manager_ && ha_manager_->IsLocalService()) {
-        return InnerBatchPutDegraded(keys, batched_slices);
+    if (IsLocalWrite(route_config)) {
+        return InnerBatchPutLocalOnly(keys, batched_slices);
     }
     return InnerBatchPutNormal(keys, batched_slices, route_config);
 }
 
 std::vector<tl::expected<void, ErrorCode>>
-P2PClientService::InnerBatchPutDegraded(
+P2PClientService::InnerBatchPutLocalOnly(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices) {
     // Phase 1: dispatch all local writes.
@@ -825,9 +876,13 @@ P2PClientService::InnerBatchPutNormal(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const WriteRouteRequestConfig& route_config) {
+    std::vector<size_t> sizes(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        sizes[i] = ClientService::CalculateSliceSize(batched_slices[i]);
+    }
+
     // Phase 1: fetch write routes from master.
-    auto batch_routes =
-        BatchFetchWriteRoutes(keys, batched_slices, route_config);
+    auto batch_routes = BatchFetchWriteRoutes(keys, sizes, route_config);
     if (!batch_routes) {
         LOG(ERROR) << "BatchGetWriteRoute RPC failed: " << batch_routes.error();
         return std::vector<tl::expected<void, ErrorCode>>(
@@ -837,28 +892,22 @@ P2PClientService::InnerBatchPutNormal(
     // Phase 2:
     // 2.1: async dispatch first-candidate writes for each key
     // 2.2: wrap each key in a retry chain based on rotute
-    auto handles = CreatePutHandlesFromRoute(keys, batched_slices, route_config,
-                                             batch_routes.value());
+    auto handles = CreatePutHandlesFromRoute(
+        keys, batched_slices, sizes, route_config, batch_routes.value());
 
     // Phase 3: wait every retry chain and collect results.
     return CollectResults(handles, keys);
 }
 
 tl::expected<BatchGetWriteRouteResponse, ErrorCode>
-P2PClientService::BatchFetchWriteRoutes(
-    const std::vector<ObjectKey>& keys,
-    const std::vector<std::vector<Slice>>& batched_slices,
-    const WriteRouteRequestConfig& config) {
+P2PClientService::BatchFetchWriteRoutes(const std::vector<ObjectKey>& keys,
+                                        const std::vector<size_t>& sizes,
+                                        const WriteRouteRequestConfig& config) {
     BatchGetWriteRouteRequest req;
     req.client_id = client_id_;
     req.config = config;
-    req.keys.reserve(keys.size());
-    req.sizes.reserve(keys.size());
-    for (size_t i = 0; i < keys.size(); ++i) {
-        req.keys.push_back(keys[i]);
-        req.sizes.push_back(
-            ClientService::CalculateSliceSize(batched_slices[i]));
-    }
+    req.keys.assign(keys.begin(), keys.end());
+    req.sizes = sizes;
     auto batch_route_result = master_client_.BatchGetWriteRoute(req);
     if (!batch_route_result) {
         LOG(ERROR) << "BatchGetWriteRoute RPC failed: "
@@ -872,6 +921,7 @@ std::vector<tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>>
 P2PClientService::CreatePutHandlesFromRoute(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
+    const std::vector<size_t>& sizes,
     const WriteRouteRequestConfig& route_config,
     BatchGetWriteRouteResponse& batch_resp) {
     struct WriteTask {
@@ -889,8 +939,9 @@ P2PClientService::CreatePutHandlesFromRoute(
             tasks.push_back(tl::unexpected(batch_resp.error_codes[i]));
             continue;
         }
-        auto ops = BuildWriteOps(keys[i], batched_slices[i], route_config,
-                                 std::move(batch_resp.responses[i].candidates));
+        auto ops =
+            BuildWriteOps(keys[i], batched_slices[i], sizes[i], route_config,
+                          std::move(batch_resp.responses[i].candidates));
         if (!ops) {
             LOG(ERROR) << "fail to build write ops"
                        << ", key=" << keys[i] << ", error=" << ops.error();
@@ -944,6 +995,7 @@ P2PClientService::CreatePutHandlesFromRoute(
 
 auto P2PClientService::BuildWriteOps(std::string_view key,
                                      std::vector<Slice>& slices,
+                                     size_t object_size,
                                      const WriteRouteRequestConfig& config,
                                      std::vector<WriteCandidate> candidates)
     -> tl::expected<std::vector<std::unique_ptr<WriteOp>>, ErrorCode> {
@@ -964,13 +1016,12 @@ auto P2PClientService::BuildWriteOps(std::string_view key,
 
     std::vector<std::unique_ptr<WriteOp>> write_ops;
     for (auto& candidate : candidates) {
-        auto& proxy = candidate.replica;
-        if (proxy.client_id == client_id_) {
+        if (candidate.client_id == client_id_) {
             // Defensive check: master should not return local candidates when
-            // allow_local=false, but if it does, just skip it.
-            if (!config.allow_local) {
+            // remote_weight>=1 (force remote), but if it does, just skip it.
+            if (config.remote_weight >= 1.0) {
                 LOG(WARNING) << "Master returned local candidate but "
-                                "allow_local=false, skipping";
+                                "remote_weight>=1 (force remote), skipping";
                 continue;
             } else if (!data_manager_.has_value()) {
                 LOG(ERROR) << "Data manager not initialized";
@@ -980,7 +1031,7 @@ auto P2PClientService::BuildWriteOps(std::string_view key,
                 std::make_unique<LocalWriteOp>(&*data_manager_, key, &slices));
         } else {
             std::string endpoint =
-                proxy.ip_address + ":" + std::to_string(proxy.rpc_port);
+                candidate.ip_address + ":" + std::to_string(candidate.rpc_port);
             auto* peer = &GetOrCreatePeerClient(endpoint);
             if (transfer_direction_mode_ == TransferDirectionMode::FORWARD) {
                 if (!data_manager_.has_value()) {
@@ -999,6 +1050,13 @@ auto P2PClientService::BuildWriteOps(std::string_view key,
                     peer, metrics_.get(), write_req, endpoint, &slices,
                     std::move(te_transfer)));
             } else {
+                // segment_id is intentionally left unset: the write route is
+                // client-granular; the remote peer picks the concrete segment.
+                P2PProxyDescriptor proxy;
+                proxy.client_id = candidate.client_id;
+                proxy.ip_address = candidate.ip_address;
+                proxy.rpc_port = candidate.rpc_port;
+                proxy.object_size = object_size;
                 write_ops.push_back(std::make_unique<RemoteReverseWriteOp>(
                     peer, write_req, std::move(proxy),
                     route_cache_ ? &*route_cache_ : nullptr, endpoint));

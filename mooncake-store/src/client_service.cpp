@@ -1009,7 +1009,12 @@ void ClientService::RegisterRuntimeConfigHttpMethods() {
                                          coro_http_response& resp) {
             Json::Value json;
             if (!parse_body(req, resp, json)) return;
-            runtime_config_store_->loadFromJson(json);
+            if (!runtime_config_store_->loadFromJson(json)) {
+                resp.set_status_and_content(
+                    status_type::bad_request,
+                    "invalid write config: waterline<=0 && remote_weight<=0");
+                return;
+            }
             respond_json(resp, runtime_config_store_->exportConfig());
         });
 
@@ -1020,7 +1025,12 @@ void ClientService::RegisterRuntimeConfigHttpMethods() {
                                          coro_http_response& resp) {
             Json::Value json;
             if (!parse_body(req, resp, json)) return;
-            runtime_config_store_->updateWriteConfig(json);
+            if (!runtime_config_store_->updateWriteConfig(json)) {
+                resp.set_status_and_content(
+                    status_type::bad_request,
+                    "invalid write config: waterline<=0 && remote_weight<=0");
+                return;
+            }
             LOG(INFO) << "Runtime write config updated via HTTP";
             respond_json(resp, runtime_config_store_->exportConfig()["write"]);
         });
@@ -1037,7 +1047,7 @@ void ClientService::RegisterRuntimeConfigHttpMethods() {
             respond_json(resp, runtime_config_store_->exportConfig()["read"]);
         });
 
-    // GET /config/get?section=write&key=prefer_local — get single field
+    // GET /config/get?section=write&key=remote_weight — get single field
     http_server_->set_http_handler<GET>(
         "/config/get",
         [this, respond_json](coro_http_request& req, coro_http_response& resp) {
@@ -1060,7 +1070,7 @@ void ClientService::RegisterRuntimeConfigHttpMethods() {
             respond_json(resp, full[sec][k]);
         });
 
-    // POST /config/set?section=write&key=prefer_local — set single field
+    // POST /config/set?section=write&key=remote_weight — set single field
     // Body: the JSON value
     http_server_->set_http_handler<POST>(
         "/config/set", [this, parse_json, respond_json](
@@ -1091,7 +1101,13 @@ void ClientService::RegisterRuntimeConfigHttpMethods() {
             Json::Value patch;
             patch[k] = value;
             if (sec == "write") {
-                runtime_config_store_->updateWriteConfig(patch);
+                if (!runtime_config_store_->updateWriteConfig(patch)) {
+                    resp.set_status_and_content(
+                        status_type::bad_request,
+                        "invalid write config: waterline<=0 && "
+                        "remote_weight<=0");
+                    return;
+                }
             } else {
                 runtime_config_store_->updateReadConfig(patch);
             }

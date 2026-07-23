@@ -286,7 +286,11 @@ ErrorCode CentralizedClientService::Init(
 
     StartHttpServer();
 
-    runtime_config_store_->loadFromJson(config.runtime_config_json);
+    if (!runtime_config_store_->loadFromJson(config.runtime_config_json)) {
+        LOG(WARNING) << "runtime config validation failed during startup, "
+                     << "using defaults for invalid fields";
+        return ErrorCode::INVALID_PARAMS;
+    }
 
     if (metrics_) {
         metrics_->StartMetricReporting(config.metric_report_interval_seconds);

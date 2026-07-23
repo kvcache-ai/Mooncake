@@ -277,12 +277,15 @@ class P2PClientService final : public ClientService {
     HeartbeatRequest build_heartbeat_request() override;
 
    private:
+    bool IsLocalWrite(const WriteRouteRequestConfig& cfg) const;
+    bool IsBelowLocalWaterline(const WriteRouteRequestConfig& cfg) const;
+
     std::vector<tl::expected<void, ErrorCode>> InnerBatchPut(
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
         const WriteRouteRequestConfig& route_config);
 
-    std::vector<tl::expected<void, ErrorCode>> InnerBatchPutDegraded(
+    std::vector<tl::expected<void, ErrorCode>> InnerBatchPutLocalOnly(
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices);
 
@@ -294,6 +297,7 @@ class P2PClientService final : public ClientService {
     std::vector<tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>>
     CreatePutHandlesFromRoute(const std::vector<ObjectKey>& keys,
                               std::vector<std::vector<Slice>>& batched_slices,
+                              const std::vector<size_t>& sizes,
                               const WriteRouteRequestConfig& route_config,
                               BatchGetWriteRouteResponse& batch_resp);
 
@@ -306,8 +310,7 @@ class P2PClientService final : public ClientService {
         const std::vector<ObjectKey>& keys);
 
     tl::expected<BatchGetWriteRouteResponse, ErrorCode> BatchFetchWriteRoutes(
-        const std::vector<ObjectKey>& keys,
-        const std::vector<std::vector<Slice>>& batched_slices,
+        const std::vector<ObjectKey>& keys, const std::vector<size_t>& sizes,
         const WriteRouteRequestConfig& config);
 
     struct WriteOp {
@@ -388,7 +391,7 @@ class P2PClientService final : public ClientService {
 
     tl::expected<std::vector<std::unique_ptr<WriteOp>>, ErrorCode>
     BuildWriteOps(std::string_view key, std::vector<Slice>& slices,
-                  const WriteRouteRequestConfig& config,
+                  size_t object_size, const WriteRouteRequestConfig& config,
                   std::vector<WriteCandidate> candidates);
 
     async_simple::coro::Lazy<void> RunWriteWithRetry(

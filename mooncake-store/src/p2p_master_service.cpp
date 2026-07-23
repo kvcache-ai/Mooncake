@@ -2,6 +2,8 @@
 
 #include <glog/logging.h>
 #include <algorithm>
+#include <tuple>
+#include <unordered_map>
 #include <variant>
 
 #include "ha/oplog/p2p_oplog_types.h"
@@ -11,8 +13,7 @@
 namespace mooncake {
 
 P2PMasterService::P2PMasterService(const MasterServiceConfig& config)
-    : MasterService(config),
-      max_replicas_per_key_(config.max_replicas_per_key),
+    : MasterService(config), max_client_per_key_(config.max_client_per_key),
       enable_async_oplog_write_(ParseOpLogStoreType(config.oplog_store_type) ==
                                 OpLogStoreType::REDIS) {
     client_manager_ = std::make_shared<P2PClientManager>(
@@ -185,7 +186,10 @@ std::vector<Replica::Descriptor> P2PMasterService::FilterReplicas(
     const GetReplicaListRequestConfig& config, const ObjectMetadata& metadata) {
     const auto& p2p_config = config.p2p_config ? config.p2p_config.value()
                                                : P2PGetReplicaListConfigExtra();
+    // candidates kept at client granularity
     std::vector<std::pair<uint32_t, Replica::Descriptor>> candidates;
+    std::unordered_map<UUID, size_t, boost::hash<UUID>> best_by_client;
+
     // 1. filter qualified replicas
     for (const auto& replica : metadata.replicas_) {
         if (!replica.is_p2p_proxy_replica()) {
@@ -225,7 +229,17 @@ std::vector<Replica::Descriptor> P2PMasterService::FilterReplicas(
         }
         if (*priority_opt < p2p_config.priority_limit) continue;
 
-        candidates.push_back({*priority_opt, replica.get_descriptor()});
+        // 1.3 client-granularity: keep the highest-priority replica
+        auto cid_opt = replica.get_p2p_client_id();
+        if (!cid_opt) continue;
+        const UUID cid = *cid_opt;
+        auto it = best_by_client.find(cid);
+        if (it == best_by_client.end()) {
+            best_by_client[cid] = candidates.size();
+            candidates.push_back({*priority_opt, replica.get_descriptor()});
+        } else if (*priority_opt > candidates[it->second].first) {
+            candidates[it->second] = {*priority_opt, replica.get_descriptor()};
+        }
     }  // iter replicas over
 
     if (config.max_candidates ==
@@ -240,7 +254,7 @@ std::vector<Replica::Descriptor> P2PMasterService::FilterReplicas(
         return result;
     }
 
-    // 2. the number of qualified replicas is larger than limit,
+    // 3. the number of qualified replicas is larger than limit,
     // choose the best ones.
     std::sort(candidates.begin(), candidates.end(),
               [](const auto& a, const auto& b) { return a.first > b.first; });
@@ -255,65 +269,94 @@ std::vector<Replica::Descriptor> P2PMasterService::FilterReplicas(
 
 auto P2PMasterService::GetWriteRoute(const WriteRouteRequest& req)
     -> tl::expected<WriteRouteResponse, ErrorCode> {
-    // GetWriteRoute represents an external write request. In-client tier
-    // migration updates metadata through AddReplica directly, so once the
-    // owner limit is reached no client can accept another routed write.
-    if (!req.key.empty() && max_replicas_per_key_ > 0) {
+    if (!req.config.IsValid()) {
+        LOG(ERROR) << "invalid write route config: " << req.config
+                   << ", client_id: " << req.client_id;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // 1. Collect existing replica owners and enforce the client limit.
+    OwnerClientSet owners;
+    if (!req.key.empty()) {
         MetadataAccessorRO accessor(this, req.key);
         if (accessor.Exists()) {
-            auto& metadata = accessor.Get();
-            auto owner_clients_res =
-                CollectReplicaOwnerClients(metadata, req.key);
-            if (!owner_clients_res.has_value()) {
+            auto res = CollectReplicaOwnerClients(accessor.Get(), req.key);
+            if (!res) {
                 LOG(ERROR) << "failed to collect replica owner clients"
                            << ", key: " << req.key
-                           << ", error: " << owner_clients_res.error();
-                return tl::make_unexpected(owner_clients_res.error());
+                           << ", error: " << res.error();
+                return tl::make_unexpected(res.error());
             }
-            const auto& owner_clients = owner_clients_res.value();
-            if (owner_clients.size() >= max_replicas_per_key_) {
+            if (max_client_per_key_ > 0 && res->size() >= max_client_per_key_) {
                 LOG(WARNING)
                     << "replica owner client num exceeded"
                     << ", key: " << req.key << ", client_id: " << req.client_id
-                    << ", current owner client num: " << owner_clients.size()
-                    << ", max owner client num: " << max_replicas_per_key_;
+                    << ", current: " << res->size()
+                    << ", max: " << max_client_per_key_;
                 return tl::make_unexpected(ErrorCode::REPLICA_NUM_EXCEEDED);
             }
+            owners = std::move(*res);
         }
     }
 
+    // 2. Single pass: collect and score all candidates.
+    //    score = free_ratio * (is_local ? (1 - remote_weight) : remote_weight)
+    const double remote_weight = std::clamp(req.config.remote_weight, 0.0, 1.0);
     std::vector<WriteCandidate> candidates;
-    // find qualified segments across all clients
+    const bool can_early_stop =
+        req.config.early_return &&
+        req.config.max_candidates !=
+            WriteRouteRequestConfig::RETURN_ALL_CANDIDATES;
+
     client_manager_->ForEachClient(
         req.config.strategy,
         [&](const std::shared_ptr<ClientMeta>& client)
             -> tl::expected<bool, ErrorCode> {
-            auto p2p_client = std::static_pointer_cast<P2PClientMeta>(client);
-            if (!p2p_client) {
+            auto p2p = std::static_pointer_cast<P2PClientMeta>(client);
+            if (!p2p) {
                 LOG(ERROR) << "unexpected client meta type";
                 return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
             }
-            return p2p_client->CollectWriteRouteCandidates(req, candidates);
+            const UUID cid = p2p->get_client_id();
+            if (owners.count(cid)) {
+                return false;
+            }
+            const bool is_local = (cid == req.client_id);
+            const double weight =
+                is_local ? (1.0 - remote_weight) : remote_weight;
+            if (weight <= 0.0) {
+                return false;
+            }
+
+            if (auto cand = p2p->GetWriteRouteCandidate(req)) {
+                cand->score *= weight;
+                candidates.push_back(std::move(*cand));
+                if (can_early_stop &&
+                    candidates.size() >= req.config.max_candidates)
+                    return true;
+            }
+            return false;
         });
 
-    WriteRouteResponse response;
+    // 3. Sort by score desc (capacity desc as tiebreaker), then truncate.
     if (candidates.empty()) {
         LOG(ERROR) << "no candidate found for key: " << req.key
                    << ", client_id: " << req.client_id
                    << ", size: " << req.size;
-        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
-    } else {
-        std::sort(candidates.begin(), candidates.end(),
-                  [](const auto& a, const auto& b) {
-                      return a.priority > b.priority;
-                  });
-        if (req.config.max_candidates !=
-                WriteRouteRequestConfig::RETURN_ALL_CANDIDATES &&
-            candidates.size() > req.config.max_candidates) {
-            candidates.resize(req.config.max_candidates);
-        }
-        response.candidates = std::move(candidates);
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_CANDIDATE);
     }
+    std::sort(candidates.begin(), candidates.end(),
+              [](const auto& a, const auto& b) {
+                  return std::tie(b.score, b.available_capacity) <
+                         std::tie(a.score, a.available_capacity);
+              });
+    if (req.config.max_candidates !=
+            WriteRouteRequestConfig::RETURN_ALL_CANDIDATES &&
+        candidates.size() > req.config.max_candidates) {
+        candidates.resize(req.config.max_candidates);
+    }
+    WriteRouteResponse response;
+    response.candidates = std::move(candidates);
     return response;
 }
 
@@ -400,17 +443,17 @@ tl::expected<void, ErrorCode> P2PMasterService::InnerAddReplica(
             }
         }
         // AddReplica is also used by in-client tier migration to publish a new
-        // physical replica. Existing owner clients may add replicas, but a new
-        // owner client must still honor max_replicas_per_key_.
-        if (max_replicas_per_key_ > 0 &&
+        // physical replica. Existing owner clients may add replicas on new
+        // segments, but a new owner client must honor max_client_per_key_.
+        if (max_client_per_key_ > 0 &&
             owner_clients.find(client_id) == owner_clients.end() &&
-            owner_clients.size() >= max_replicas_per_key_) {
+            owner_clients.size() >= max_client_per_key_) {
             LOG(WARNING) << "replica owner client num exceeded"
                          << ", key: " << key << ", client_id: " << client_id
                          << ", segment_id: " << segment_id
                          << ", current owner client num:"
                          << owner_clients.size()
-                         << ", max owner client num: " << max_replicas_per_key_;
+                         << ", max owner client num: " << max_client_per_key_;
             return tl::make_unexpected(ErrorCode::REPLICA_NUM_EXCEEDED);
         }
         AddReplicaPayload payload;
