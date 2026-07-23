@@ -259,6 +259,13 @@ int main(int argc, char* argv[]) {
                       "intent_type";
         return EXIT_FAILURE;
     }
+    if (!workload_classes.empty() &&
+        (XferBenchConfig::deadline_us != 0 ||
+         XferBenchConfig::deadline_tight_threads != 0)) {
+        LOG(ERROR) << "--deadline_us and --deadline_tight_threads cannot be "
+                      "combined with per-class workload deadlines";
+        return EXIT_FAILURE;
+    }
     if (!workload_classes.empty() && XferBenchConfig::backend != "tent") {
         for (const auto& config : workload_classes) {
             if (config.deadline_us != 0 ||

@@ -53,10 +53,12 @@ DEFINE_string(qos_output_jsonl, "",
               "Append versioned QoS metric records to this JSONL file.");
 DEFINE_uint64(deadline_us, 0,
               "tent only: relative per-transfer deadline in microseconds for "
-              "tight worker threads (0 disables deadline tagging).");
+              "tight worker threads (0 disables deadline tagging); cannot be "
+              "combined with --workload_classes_json.");
 DEFINE_int32(deadline_tight_threads, 0,
              "tent only: workers [0, N) that carry --deadline_us; remaining "
-             "workers have no deadline.");
+             "workers have no deadline; cannot be combined with "
+             "--workload_classes_json.");
 DEFINE_bool(deadline_bw_arbitration, false,
             "tent only: enable deadline-aware RDMA bandwidth arbitration.");
 DEFINE_int32(local_gpu_id, 0, "Local GPU ID to be used, -1 for all GPUs");
