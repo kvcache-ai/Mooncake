@@ -244,7 +244,7 @@ TEST(OrderedOpLogWriterAdmissionTest,
     auto invalid_reservation = writer.Reserve();
     ASSERT_TRUE(invalid_reservation.has_value());
     auto invalid = MakeEntry("bad");
-    invalid.tenant_id.clear();
+    invalid.tenant_id = "_reserved";
     bool callback_called = false;
     auto rejected =
         writer.Commit(std::move(*invalid_reservation), std::move(invalid),
