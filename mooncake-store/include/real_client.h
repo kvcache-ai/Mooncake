@@ -2,9 +2,13 @@
 
 #include <atomic>
 #include <boost/lockfree/queue.hpp>
+#include <condition_variable>
 #include <csignal>
+#include <deque>
+#include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -616,6 +620,13 @@ class RealClient : public PyClient {
         std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
             nullptr);
 
+    // Normal-mode + GDS: reserve offsets from store_service RPC,
+    // DMA write via WriteAtOffset, complete via RPC.
+    std::vector<tl::expected<void, ErrorCode>> batch_put_with_store_reservation(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<Slice>> &batched_slices,
+        const ReplicateConfig &config);
+
     std::vector<tl::expected<void, ErrorCode>> batch_put_from_internal(
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
@@ -683,6 +694,13 @@ class RealClient : public PyClient {
         const std::string &segment_name = "") override;
 
     tl::expected<PingResponse, ErrorCode> ping(const UUID &client_id);
+
+    async_simple::coro::Lazy<
+        tl::expected<BatchReserveOffloadSpaceResponse, ErrorCode>>
+    batch_reserve_offload_space(const BatchReserveOffloadSpaceRequest &req);
+
+    async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
+    batch_complete_offload_space(const BatchCompleteOffloadSpaceRequest &req);
 
     async_simple::coro::Lazy<
         tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
@@ -892,6 +910,35 @@ class RealClient : public PyClient {
 
     // Counts every LOCAL_DISK read served via peer offload-RPC.
     std::atomic<int64_t> offload_rpc_read_count_{0};
+
+    // store_service coro_rpc address for normal-mode GDS
+    // Reserve/Complete RPCs. Set via MOONCAKE_GDS_STORE_SERVICE_ADDR.
+    std::string store_service_addr_;
+
+    // ── GDS worker pool ──
+    // Persistent worker-thread pool for GDS DMA tasks.  Replaces
+    // per-batch detached threads: the CUDA primary context is
+    // initialised once per worker (instead of a cudaFree(nullptr)
+    // per batch), and all workers are joined on destruction so no DMA
+    // outlives the client.  Tasks are executed FIFO across the pool;
+    // the worker count is set by MOONCAKE_GDS_NUM_WORKERS (default:
+    // min(4, hardware_concurrency)).
+    std::mutex gds_worker_mutex_;
+    std::condition_variable gds_worker_cv_;
+    std::deque<std::function<void()>> gds_worker_queue_;
+    std::vector<std::thread> gds_worker_threads_;
+    bool gds_worker_stop_ = false;
+    bool gds_worker_started_ = false;
+    int gds_num_workers_ = 1;  // real value set in the constructor
+
+    // Enqueue a task on the GDS worker pool (started lazily on first
+    // use).  Results are reported through promises captured by the task
+    // itself.  Tasks submitted after StopGdsWorker() are rejected (their
+    // promises break, so callers fail fast instead of hanging 120s).
+    void SubmitGdsTask(std::function<void()> task);
+    // Signal all workers to drain and exit, then join them.  Called from
+    // the destructor before any member teardown.
+    void StopGdsWorker();
 
     // Dummy Client manage related members
     void dummy_client_monitor_func();

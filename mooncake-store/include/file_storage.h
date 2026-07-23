@@ -3,6 +3,10 @@
 #include "client_service.h"
 #include "client_buffer.h"
 #include "storage_backend.h"
+
+namespace mooncake {
+struct BatchReserveOffloadSpaceResponse;
+}
 #include "pinned_buffer_pool.h"
 
 namespace mooncake {
@@ -48,6 +52,50 @@ class FileStorage {
      * @return true if batch was found and released, false otherwise
      */
     bool ReleaseBuffer(uint64_t batch_id);
+
+    // ── GDS two-phase commit (Part B: normal-mode + GDS) ──
+
+    // store_service side: allocate offsets for vLLM DMA writes.
+    tl::expected<BatchReserveOffloadSpaceResponse, ErrorCode>
+    BatchReserveOffloadSpace(const std::vector<std::string>& keys,
+                             const std::vector<uint64_t>& value_sizes);
+
+    // store_service side: clear dirty_ flags after vLLM DMA completes.
+    tl::expected<void, ErrorCode> BatchCompleteOffloadSpace(
+        const std::vector<std::string>& keys);
+
+    // Return the absolute path to the data file, for vLLM to open()
+    // and register for cuFile DMA.
+    std::string GetDataFilePath() const;
+
+    // Write raw record data at a pre-allocated offset (from
+    // store_service s BatchReserveOffloadSpace RPC). Used by vLLM
+    // in normal-mode + GDS to DMA-write into the shared file.
+    tl::expected<void, ErrorCode> WriteAtOffset(
+        const std::string& key, const std::vector<Slice>& slices,
+        uint64_t offset);
+
+    // ── Direct GPU offload (standalone-mode GDS) ──
+
+    tl::expected<size_t, ErrorCode> DirectGdsOffload(
+        const std::vector<std::string>& keys,
+        const std::vector<std::vector<Slice>>& slices_per_key,
+        const std::string& tenant_id,
+        std::shared_ptr<std::promise<bool>> notify_barrier = nullptr);
+
+    bool IsGdsEnabled() const {
+        return storage_backend_->SupportsGds() &&
+               storage_backend_->IsGdsEnabled();
+    }
+
+    tl::expected<void, ErrorCode> DirectGdsBatchLoad(
+        std::unordered_map<std::string, Slice>& batch_object);
+
+    // Multi-fragment variant: each key's value is read into the given
+    // slices consecutively (per-layer GPU buffers).  Requires the
+    // OffsetAllocator backend.
+    tl::expected<void, ErrorCode> DirectGdsBatchLoadMulti(
+        std::unordered_map<std::string, std::vector<Slice>>& batch_object);
 
    private:
     friend class FileStorageTest;

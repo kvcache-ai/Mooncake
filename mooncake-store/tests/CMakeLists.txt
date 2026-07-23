@@ -231,3 +231,12 @@ if(STORE_USE_REDIS)
     target_link_libraries(${target} PRIVATE ${MOONCAKE_STORE_HIREDIS_LIBRARY})
   endforeach()
 endif()
+# Requires CUDA (cudaMalloc/cudaFree).  find_package must be called in
+# this directory scope — CUDAToolkit_FOUND set under src/ does not
+# propagate here.
+find_package(CUDAToolkit QUIET)
+if(CUDAToolkit_FOUND)
+    add_store_test(gds_batch_put_smoke gds_batch_put_smoke.cpp)
+endif()
+
+add_store_test(gds_context_test gds_context_test.cpp)

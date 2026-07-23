@@ -1,4 +1,5 @@
 #include "storage_backend.h"
+#include "gds/gds_context.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -352,6 +353,18 @@ bool StorageBackend::InitQuotaEvict() {
 
         FileRecord evicted = EvictFile();
         if (evicted.path.empty()) {
+            // Queue is populated only on WriteBucket/WriteFile.
+            // After restart with stale on-disk data, used_space_
+            // may exceed total_space_ but the queue is empty.
+            // Not fatal — runtime eviction will bring space under
+            // quota when new writes come in.
+            if (initial_queue_size == 0) {
+                LOG(WARNING)
+                    << "Eviction queue empty at init. "
+                    << "used=" << used_space_ << " total=" << total_space_
+                    << ". Deferring to runtime eviction.";
+                break;
+            }
             LOG(ERROR) << "Failed to evict file to meet quota. "
                        << "The queue might be empty or a file is unremovable.";
             return false;
@@ -360,9 +373,15 @@ bool StorageBackend::InitQuotaEvict() {
     }
 
     if (used_space_ > total_space_) {
-        LOG(ERROR) << "Could not bring storage usage under quota after "
-                   << eviction_attempts << " eviction attempts.";
-        return false;
+        if (initial_queue_size == 0) {
+            LOG(WARNING) << "Eviction queue was empty at init. "
+                         << "used=" << used_space_ << " total=" << total_space_
+                         << ". Deferring to runtime eviction.";
+        } else {
+            LOG(ERROR) << "Could not bring storage usage under quota after "
+                       << eviction_attempts << " eviction attempts.";
+            return false;
+        }
     }
 
     // Recalculate available_space_ after eviction
@@ -3401,10 +3420,184 @@ OffsetAllocatorStorageBackend::OffsetAllocatorStorageBackend(
       storage_path_(file_storage_config_.storage_filepath),
       cfg_(offset_backend_config) {
     capacity_ = file_storage_config_.total_size_limit;
+    if (file_storage_config_.enable_gds) {
+        gds_ctx_ = std::make_unique<GdsContext>();
+    }
 }
 
 std::string OffsetAllocatorStorageBackend::GetDataFilePath() const {
     return (std::filesystem::path(storage_path_) / "kv_cache.data").string();
+}
+tl::expected<OffloadSpaceReservation, ErrorCode>
+OffsetAllocatorStorageBackend::ReserveOffloadSpace(const std::string& key,
+                                                   uint32_t value_size) {
+    // The record layout (with alignment padding) is derived here so that
+    // reserver and reader can never disagree on the on-disk format.
+    const uint64_t record_size_64 =
+        RecordHeader::RecordSize(static_cast<uint32_t>(key.size()), value_size);
+    if (record_size_64 > UINT32_MAX) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    const uint32_t record_size = static_cast<uint32_t>(record_size_64);
+
+    auto allocation = allocator_->allocate(record_size);
+    if (!allocation) return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
+
+    uint64_t offset = allocation->address();
+
+    const bool eviction_on =
+        (cfg_.eviction_policy != OffsetEvictionPolicy::NONE);
+
+    auto& shard = shards_[ShardForKey(key)];
+    {
+        // Lock order: eviction_mutex_ -> shard.mutex (same as BatchOffload).
+        std::optional<MutexLocker> ev_lock;
+        if (eviction_on) ev_lock.emplace(&eviction_mutex_);
+        SharedMutexLocker locker(&shard.mutex);
+        // Refuse to overwrite an existing record: the old AllocationPtr
+        // would be destroyed, its offset recycled, and any in-flight DMA
+        // to the old offset would corrupt the new allocator assignment.
+        auto existing = shard.map.find(key);
+        if (existing != shard.map.end()) {
+            LOG(WARNING) << "ReserveOffloadSpace: key '" << key
+                         << "' already reserved (dirty="
+                         << existing->second.dirty_.load(
+                                std::memory_order_acquire)
+                         << "), refusing duplicate reservation";
+            // allocator_->allocate() is RAII: going out of scope frees it.
+            return tl::make_unexpected(ErrorCode::INVALID_KEY);
+        }
+        uint64_t seq = 0;
+        if (eviction_on)
+            seq = insert_seq_.fetch_add(1, std::memory_order_relaxed);
+        auto alloc_ptr = std::make_shared<RefCountedAllocationHandle>(
+            std::move(*allocation));
+        ObjectEntry entry(offset, record_size, value_size, std::move(alloc_ptr),
+                          seq);
+        entry.dirty_.store(true, std::memory_order_release);
+        entry.quarantined_.store(false, std::memory_order_release);
+        entry.reserved_at =
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count();
+        shard.map[key] = std::move(entry);
+        // Reserved space is real usage: account for it and make the record
+        // visible to FIFO eviction (once completed it behaves exactly like
+        // an offloaded record; while dirty, EvictToMakeRoom skips it).
+        total_size_.fetch_add(record_size, std::memory_order_relaxed);
+        total_keys_.fetch_add(1, std::memory_order_relaxed);
+        if (eviction_on) fifo_index_.emplace(seq, key);
+    }
+
+    return OffloadSpaceReservation{key, offset, record_size, value_size};
+}
+
+std::optional<OffloadSpaceCompletion>
+OffsetAllocatorStorageBackend::CompleteOffloadSpace(const std::string& key) {
+    auto& shard = shards_[ShardForKey(key)];
+    SharedMutexLocker locker(&shard.mutex, shared_lock);
+    auto it = shard.map.find(key);
+    if (it == shard.map.end()) {
+        LOG(WARNING) << "CompleteOffloadSpace: unknown key '" << key << "'";
+        return std::nullopt;
+    }
+    OffloadSpaceCompletion info;
+    info.offset = it->second.offset;
+    info.total_size = it->second.total_size;
+    info.value_size = it->second.value_size;
+    info.was_dirty =
+        it->second.dirty_.exchange(false, std::memory_order_acq_rel);
+    it->second.quarantined_.store(false, std::memory_order_release);
+    return info;
+}
+
+tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::WriteAtOffset(
+    const std::string& key, const std::vector<Slice>& slices, uint64_t offset) {
+    if (!gds_ctx_ || !gds_ctx_->enabled_) {
+        return tl::make_unexpected(ErrorCode::GDS_NOT_AVAILABLE);
+    }
+    // WriteRecord handles IsDevicePointer detection internally:
+    // GPU pointer -> cuFileWrite DMA, CPU pointer -> pwrite.
+    return gds_ctx_->WriteRecord(key, slices, offset);
+}
+void OffsetAllocatorStorageBackend::CleanupStaleDirtyRecords(
+    int64_t now_seconds) {
+    // The quarantine window must be far larger than the client-side DMA
+    // wait (120s in RealClient): a client whose DMA is merely slow — not
+    // dead — may still be writing to the reserved offset.  Reclaiming too
+    // early lets a new record reuse the offset while the stale DMA keeps
+    // writing into it.  10 minutes of grace makes that vanishingly
+    // unlikely; the space cost of a leaked record is bounded and
+    // recoverable, a torn record is not.
+    static constexpr int64_t kOverdirtyTimeoutSec = 600;
+    static constexpr int64_t kQuarantineTimeoutSec = 600;
+
+    for (size_t i = 0; i < kNumShards; ++i) {
+        auto& shard = shards_[i];
+
+        // Phase A — "overdirty": promote dirty to quarantine
+        {
+            SharedMutexLocker locker(&shard.mutex, shared_lock);
+            for (auto& [key, entry] : shard.map) {
+                if (entry.dirty_.load(std::memory_order_acquire) &&
+                    (now_seconds - entry.reserved_at) > kOverdirtyTimeoutSec) {
+                    bool expected = false;
+                    if (entry.quarantined_.compare_exchange_strong(
+                            expected, true, std::memory_order_acq_rel)) {
+                        // Won the CAS. Re-verify dirty_: if
+                        // CompleteOffloadSpace cleared it concurrently,
+                        // undo quarantine.
+                        if (!entry.dirty_.load(std::memory_order_acquire)) {
+                            entry.quarantined_.store(false,
+                                                     std::memory_order_release);
+                            continue;
+                        }
+                        entry.quarantined_at = now_seconds;
+                        LOG(WARNING)
+                            << "GDS dirty record quarantined: " << key
+                            << " (reserved "
+                            << (now_seconds - entry.reserved_at) << "s ago)";
+                    }
+                }
+            }
+        }
+
+        // Phase B — "zombie release": free quarantined records that
+        // have been in quarantine long enough (DMA is definitely dead).
+        {
+            // Lock order: eviction_mutex_ -> shard.mutex (fifo_index_ and
+            // the usage counters are maintained together with the erase).
+            MutexLocker ev_lock(&eviction_mutex_);
+            SharedMutexLocker locker(&shard.mutex);
+            auto it = shard.map.begin();
+            while (it != shard.map.end()) {
+                auto& entry = it->second;
+                if (entry.dirty_.load(std::memory_order_acquire) &&
+                    entry.quarantined_.load(std::memory_order_acquire) &&
+                    (now_seconds - entry.quarantined_at) >
+                        kQuarantineTimeoutSec) {
+                    // Mirror the accounting done in ReserveOffloadSpace:
+                    // release usage counters and the FIFO slot, then erase
+                    // (destroying the AllocationPtr frees the offset).
+                    DCHECK_GE(total_size_.load(std::memory_order_relaxed),
+                              entry.total_size);
+                    DCHECK_GE(total_keys_.load(std::memory_order_relaxed), 1);
+                    total_size_.fetch_sub(entry.total_size,
+                                          std::memory_order_relaxed);
+                    total_keys_.fetch_sub(1, std::memory_order_relaxed);
+                    fifo_index_.erase(entry.fifo_seq);
+                    LOG(WARNING)
+                        << "GDS zombie offset released: key=" << it->first
+                        << " offset=" << entry.offset
+                        << " size=" << entry.total_size << " (quarantined "
+                        << (now_seconds - entry.quarantined_at) << "s ago)";
+                    it = shard.map.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+    }
 }
 
 //-----------------------------------------------------------------------------
@@ -3441,174 +3634,209 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
         // Get data file path
         data_file_path_ = GetDataFilePath();
 
-        // RAII wrapper to ensure fd is closed on all error paths
-        struct FdGuard {
-            int fd;
-            explicit FdGuard(int fd) : fd(fd) {}
-            ~FdGuard() {
-                if (fd >= 0) {
-                    close(fd);
+        // GDS Init
+        // gds_client_only (vLLM in normal-mode+GDS): open existing file
+        // for DMA only; store_service owns OffsetAllocator and the file.
+        // Normal mode: full Init with O_TRUNC + posix_fallocate.
+        if (gds_ctx_) {
+            tl::expected<void, ErrorCode> gds_init;
+            if (file_storage_config_.gds_client_only) {
+                gds_init = gds_ctx_->InitClientDma(data_file_path_);
+            } else {
+                gds_init = gds_ctx_->Init(data_file_path_, capacity_);
+            }
+            if (!gds_init) {
+                LOG(WARNING) << "GDS init failed (err=" << gds_init.error()
+                             << "), falling back to non-GDS I/O";
+                gds_ctx_->Shutdown();
+                gds_ctx_.reset();
+            }
+        }
+
+        // StorageFile creation (only when GDS is not active)
+        // Also skip when gds_client_only: the file is owned by store_service,
+        // creating it here would O_TRUNC shared data.
+        if ((!gds_ctx_ || !gds_ctx_->enabled_) &&
+            !file_storage_config_.gds_client_only) {
+            // RAII wrapper to ensure fd is closed on all error paths
+            struct FdGuard {
+                int fd;
+                explicit FdGuard(int fd) : fd(fd) {}
+                ~FdGuard() {
+                    if (fd >= 0) {
+                        close(fd);
+                    }
+                }
+                // Release ownership (caller takes responsibility)
+                int release() {
+                    int ret = fd;
+                    fd = -1;
+                    return ret;
+                }
+                // Get fd without releasing (for operations)
+                int get() const { return fd; }
+            };
+
+            // Open/truncate data file in read-write mode
+            // We need raw fd for fallocate, so open directly
+            int flags = O_CLOEXEC | O_RDWR | O_CREAT | O_TRUNC;
+            int raw_fd = open(data_file_path_.c_str(), flags, 0644);
+            if (raw_fd < 0) {
+                LOG(ERROR) << "Failed to open data file: " << data_file_path_;
+                return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+            }
+            FdGuard fd_guard(raw_fd);
+
+            // Use fallocate if available, otherwise ftruncate
+            if (fallocate(fd_guard.get(), 0, 0, capacity_) != 0) {
+                // Fallback to ftruncate
+                if (ftruncate(fd_guard.get(), capacity_) != 0) {
+                    LOG(ERROR)
+                        << "Failed to preallocate file: " << data_file_path_
+                        << ", capacity: " << capacity_
+                        << ", error: " << strerror(errno);
+                    return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
                 }
             }
-            // Release ownership (caller takes responsibility)
-            int release() {
-                int ret = fd;
-                fd = -1;
-                return ret;
+
+            // Release fd to StorageFile (takes ownership and will close it)
+#ifdef USE_URING
+            if (file_storage_config_.use_uring) {
+                data_file_ = std::make_unique<UringFile>(
+                    data_file_path_, fd_guard.release(), 32, true);
+            } else
+#endif
+            {
+                data_file_ = std::make_unique<PosixFile>(data_file_path_,
+                                                         fd_guard.release());
             }
-            // Get fd without releasing (for operations)
-            int get() const { return fd; }
-        };
 
-        // Open/truncate data file in read-write mode
-        // We need raw fd for fallocate, so open directly
-        int flags = O_CLOEXEC | O_RDWR | O_CREAT | O_TRUNC;
-        int raw_fd = open(data_file_path_.c_str(), flags, 0644);
-        if (raw_fd < 0) {
-            LOG(ERROR) << "Failed to open data file: " << data_file_path_;
-            return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
-        }
-        FdGuard fd_guard(raw_fd);
+        }  // end if (!gds_ctx_)
 
-        // Use fallocate if available, otherwise ftruncate
-        if (fallocate(fd_guard.get(), 0, 0, capacity_) != 0) {
-            // Fallback to ftruncate
-            if (ftruncate(fd_guard.get(), capacity_) != 0) {
-                LOG(ERROR) << "Failed to preallocate file: " << data_file_path_
-                           << ", capacity: " << capacity_
-                           << ", error: " << strerror(errno);
+        // Create allocator with base=0, size=capacity.
+        // Skip in gds_client_only mode: store_service owns the allocator.
+        if (!file_storage_config_.gds_client_only) {
+            // Resolve watermark thresholds from config
+            high_watermark_bytes_ =
+                cfg_.high_watermark_bytes > 0
+                    ? cfg_.high_watermark_bytes
+                    : static_cast<int64_t>(capacity_ * cfg_.high_ratio);
+            low_watermark_bytes_ =
+                cfg_.low_watermark_bytes > 0
+                    ? cfg_.low_watermark_bytes
+                    : static_cast<int64_t>(capacity_ * cfg_.low_ratio);
+            high_watermark_keys_ =
+                cfg_.high_watermark_keys > 0
+                    ? cfg_.high_watermark_keys
+                    : static_cast<int64_t>(
+                          file_storage_config_.total_keys_limit *
+                          cfg_.keys_high_ratio);
+            low_watermark_keys_ =
+                cfg_.low_watermark_keys > 0
+                    ? cfg_.low_watermark_keys
+                    : static_cast<int64_t>(
+                          file_storage_config_.total_keys_limit *
+                          cfg_.keys_low_ratio);
+
+            // Auto-nudge ratio-derived low watermarks when integer truncation
+            // collapses them to the same value as high (e.g. limit=5, ratio
+            // 0.95->4, ratio 0.90->4 => low==high==4).  Only applies to
+            // auto-derived values; explicit config values are validated
+            // strictly.
+            if (cfg_.low_watermark_bytes == 0 && high_watermark_bytes_ > 0 &&
+                low_watermark_bytes_ >= high_watermark_bytes_) {
+                low_watermark_bytes_ =
+                    std::max<int64_t>(1, high_watermark_bytes_ - 1);
+            }
+            if (cfg_.low_watermark_keys == 0 && high_watermark_keys_ > 0 &&
+                low_watermark_keys_ >= high_watermark_keys_) {
+                low_watermark_keys_ =
+                    std::max<int64_t>(1, high_watermark_keys_ - 1);
+            }
+
+            // Validate watermarks
+            if (low_watermark_bytes_ >= high_watermark_bytes_) {
+                LOG(ERROR) << "Invalid watermark: low_bytes="
+                           << low_watermark_bytes_
+                           << " >= high_bytes=" << high_watermark_bytes_;
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            if (low_watermark_keys_ >= high_watermark_keys_) {
+                LOG(ERROR) << "Invalid watermark: low_keys="
+                           << low_watermark_keys_
+                           << " >= high_keys=" << high_watermark_keys_;
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+
+            // Clamp watermarks to not exceed capacity / total_keys_limit
+            if (high_watermark_bytes_ > static_cast<int64_t>(capacity_)) {
+                LOG(WARNING)
+                    << "high_watermark_bytes clamped from "
+                    << high_watermark_bytes_ << " to capacity=" << capacity_;
+                high_watermark_bytes_ = static_cast<int64_t>(capacity_);
+                low_watermark_bytes_ =
+                    std::min(low_watermark_bytes_, high_watermark_bytes_ - 1);
+            }
+            if (high_watermark_keys_ > file_storage_config_.total_keys_limit) {
+                LOG(WARNING) << "high_watermark_keys clamped from "
+                             << high_watermark_keys_ << " to total_keys_limit="
+                             << file_storage_config_.total_keys_limit;
+                high_watermark_keys_ = file_storage_config_.total_keys_limit;
+                low_watermark_keys_ =
+                    std::min(low_watermark_keys_, high_watermark_keys_ - 1);
+            }
+
+            // Guard against zero low-watermark on very small capacity
+            if (low_watermark_bytes_ <= 0 && high_watermark_bytes_ > 0) {
+                low_watermark_bytes_ =
+                    std::max<int64_t>(1, high_watermark_bytes_ / 2);
+            }
+            if (low_watermark_keys_ <= 0 && high_watermark_keys_ > 0) {
+                low_watermark_keys_ =
+                    std::max<int64_t>(1, high_watermark_keys_ / 2);
+            }
+
+            // Create allocator with tuned node capacity
+            constexpr int64_t kMinObjectSize = 256;
+            constexpr int64_t kMaxNodeRamBytes =
+                512LL * 1024 * 1024;  // 512MB node RAM budget
+            constexpr uint32_t kRamBasedMaxNodes =
+                static_cast<uint32_t>(kMaxNodeRamBytes / 56);
+            constexpr uint32_t kAbsoluteMaxNodes =
+                std::min<uint32_t>(kRamBasedMaxNodes, 32U << 20);
+
+            uint32_t max_nodes = (1U << 20);  // default 1M nodes
+            if (cfg_.max_capacity_nodes > 0) {
+                if (cfg_.max_capacity_nodes > kAbsoluteMaxNodes) {
+                    LOG(WARNING)
+                        << "max_capacity_nodes " << cfg_.max_capacity_nodes
+                        << " exceeds RAM budget; clamped to "
+                        << kAbsoluteMaxNodes;
+                    max_nodes = kAbsoluteMaxNodes;
+                } else {
+                    max_nodes = static_cast<uint32_t>(cfg_.max_capacity_nodes);
+                }
+            } else {
+                int64_t auto_nodes = std::max<int64_t>(
+                    1LL << 20, std::min<int64_t>(capacity_ / kMinObjectSize,
+                                                 kAbsoluteMaxNodes));
+                max_nodes = static_cast<uint32_t>(auto_nodes);
+            }
+            uint32_t init_nodes = std::min<uint32_t>(128U * 1024, max_nodes);
+            allocator_ = offset_allocator::OffsetAllocator::create(
+                0, capacity_, init_nodes, max_nodes);
+            if (!allocator_) {
+                LOG(ERROR) << "Failed to create OffsetAllocator";
                 return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
             }
-        }
 
-        // Release fd to StorageFile (takes ownership and will close it)
-#ifdef USE_URING
-        if (file_storage_config_.use_uring) {
-            data_file_ = std::make_unique<UringFile>(
-                data_file_path_, fd_guard.release(), 32, true);
-        } else
-#endif
-        {
-            data_file_ = std::make_unique<PosixFile>(data_file_path_,
-                                                     fd_guard.release());
-        }
-
-        // Resolve watermark thresholds from config
-        high_watermark_bytes_ =
-            cfg_.high_watermark_bytes > 0
-                ? cfg_.high_watermark_bytes
-                : static_cast<int64_t>(capacity_ * cfg_.high_ratio);
-        low_watermark_bytes_ =
-            cfg_.low_watermark_bytes > 0
-                ? cfg_.low_watermark_bytes
-                : static_cast<int64_t>(capacity_ * cfg_.low_ratio);
-        high_watermark_keys_ =
-            cfg_.high_watermark_keys > 0
-                ? cfg_.high_watermark_keys
-                : static_cast<int64_t>(file_storage_config_.total_keys_limit *
-                                       cfg_.keys_high_ratio);
-        low_watermark_keys_ =
-            cfg_.low_watermark_keys > 0
-                ? cfg_.low_watermark_keys
-                : static_cast<int64_t>(file_storage_config_.total_keys_limit *
-                                       cfg_.keys_low_ratio);
-
-        // Auto-nudge ratio-derived low watermarks when integer truncation
-        // collapses them to the same value as high (e.g. limit=5, ratio
-        // 0.95->4, ratio 0.90->4 => low==high==4).  Only applies to
-        // auto-derived values; explicit config values are validated strictly.
-        if (cfg_.low_watermark_bytes == 0 && high_watermark_bytes_ > 0 &&
-            low_watermark_bytes_ >= high_watermark_bytes_) {
-            low_watermark_bytes_ =
-                std::max<int64_t>(1, high_watermark_bytes_ - 1);
-        }
-        if (cfg_.low_watermark_keys == 0 && high_watermark_keys_ > 0 &&
-            low_watermark_keys_ >= high_watermark_keys_) {
-            low_watermark_keys_ =
-                std::max<int64_t>(1, high_watermark_keys_ - 1);
-        }
-
-        // Validate watermarks
-        if (low_watermark_bytes_ >= high_watermark_bytes_) {
-            LOG(ERROR) << "Invalid watermark: low_bytes="
-                       << low_watermark_bytes_
-                       << " >= high_bytes=" << high_watermark_bytes_;
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        if (low_watermark_keys_ >= high_watermark_keys_) {
-            LOG(ERROR) << "Invalid watermark: low_keys=" << low_watermark_keys_
-                       << " >= high_keys=" << high_watermark_keys_;
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-
-        // Clamp watermarks to not exceed capacity / total_keys_limit
-        if (high_watermark_bytes_ > static_cast<int64_t>(capacity_)) {
-            LOG(WARNING) << "high_watermark_bytes clamped from "
-                         << high_watermark_bytes_
-                         << " to capacity=" << capacity_;
-            high_watermark_bytes_ = static_cast<int64_t>(capacity_);
-            low_watermark_bytes_ =
-                std::min(low_watermark_bytes_, high_watermark_bytes_ - 1);
-        }
-        if (high_watermark_keys_ > file_storage_config_.total_keys_limit) {
-            LOG(WARNING) << "high_watermark_keys clamped from "
-                         << high_watermark_keys_ << " to total_keys_limit="
-                         << file_storage_config_.total_keys_limit;
-            high_watermark_keys_ = file_storage_config_.total_keys_limit;
-            low_watermark_keys_ =
-                std::min(low_watermark_keys_, high_watermark_keys_ - 1);
-        }
-
-        // Guard against zero low-watermark on very small capacity
-        if (low_watermark_bytes_ <= 0 && high_watermark_bytes_ > 0) {
-            low_watermark_bytes_ =
-                std::max<int64_t>(1, high_watermark_bytes_ / 2);
-        }
-        if (low_watermark_keys_ <= 0 && high_watermark_keys_ > 0) {
-            low_watermark_keys_ =
-                std::max<int64_t>(1, high_watermark_keys_ / 2);
-        }
-
-        // Create allocator with tuned node capacity
-        constexpr int64_t kMinObjectSize = 256;
-        constexpr int64_t kMaxNodeRamBytes =
-            512LL * 1024 * 1024;  // 512MB node RAM budget
-        constexpr uint32_t kRamBasedMaxNodes =
-            static_cast<uint32_t>(kMaxNodeRamBytes / 56);
-        constexpr uint32_t kAbsoluteMaxNodes =
-            std::min<uint32_t>(kRamBasedMaxNodes, 32U << 20);
-
-        uint32_t max_nodes = (1U << 20);  // default 1M nodes
-        if (cfg_.max_capacity_nodes > 0) {
-            if (cfg_.max_capacity_nodes > kAbsoluteMaxNodes) {
-                LOG(WARNING)
-                    << "max_capacity_nodes " << cfg_.max_capacity_nodes
-                    << " exceeds RAM budget; clamped to " << kAbsoluteMaxNodes;
-                max_nodes = kAbsoluteMaxNodes;
-            } else {
-                max_nodes = static_cast<uint32_t>(cfg_.max_capacity_nodes);
+            // Initialize eviction index
+            {
+                MutexLocker ev(&eviction_mutex_);
+                fifo_index_.clear();
+                insert_seq_.store(0, std::memory_order_relaxed);
             }
-        } else {
-            int64_t auto_nodes = std::max<int64_t>(
-                1LL << 20, std::min<int64_t>(capacity_ / kMinObjectSize,
-                                             kAbsoluteMaxNodes));
-            max_nodes = static_cast<uint32_t>(auto_nodes);
         }
-        uint32_t init_nodes = std::min<uint32_t>(128U * 1024, max_nodes);
-        allocator_ = offset_allocator::OffsetAllocator::create(
-            0, capacity_, init_nodes, max_nodes);
-        if (!allocator_) {
-            LOG(ERROR) << "Failed to create OffsetAllocator";
-            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-        }
-
-        // Initialize eviction index
-        {
-            MutexLocker ev(&eviction_mutex_);
-            fifo_index_.clear();
-            insert_seq_.store(0, std::memory_order_relaxed);
-        }
-
         initialized_.store(true, std::memory_order_release);
         LOG(INFO) << "OffsetAllocatorStorageBackend initialized, capacity: "
                   << capacity_
@@ -3652,15 +3880,36 @@ void OffsetAllocatorStorageBackend::EvictToMakeRoom(
         uint64_t vseq = oldest->first;
         std::string vkey = oldest->second;
 
-        // Skip batch_keys prefix — keys being written in this batch.
-        // Do NOT erase their FIFO slots (they may fail allocate() and
-        // need the slot to remain in the index for future eviction).
-        // Worst-case comparison cost: O(|batch_keys_prefix|), bounded.
-        while (oldest != fifo_index_.end() &&
-               batch_keys.count(oldest->second)) {
+        // Skip slots that must not be evicted right now:
+        //  - batch_keys: keys being written in this batch.  Do NOT erase
+        //    their FIFO slots (they may fail allocate() and need the slot
+        //    to remain in the index for future eviction).
+        //  - dirty GDS reservations: a client DMA write may still be in
+        //    flight to the reserved offset; evicting would recycle the
+        //    offset under the writer.  The slot stays — the record either
+        //    completes (becomes evictable) or is reclaimed by
+        //    CleanupStaleDirtyRecords.
+        //  Worst-case comparison cost is bounded by the index size.
+        while (oldest != fifo_index_.end()) {
+            if (batch_keys.count(oldest->second)) {
+                ++oldest;
+                continue;
+            }
+            bool candidate_dirty = false;
+            {
+                auto& cand_shard = shards_[ShardForKey(oldest->second)];
+                SharedMutexLocker cand_lk(&cand_shard.mutex, shared_lock);
+                auto cand_it = cand_shard.map.find(oldest->second);
+                if (cand_it != cand_shard.map.end() &&
+                    cand_it->second.fifo_seq == oldest->first) {
+                    candidate_dirty =
+                        cand_it->second.dirty_.load(std::memory_order_acquire);
+                }
+            }
+            if (!candidate_dirty) break;  // evictable (or orphan) candidate
             ++oldest;
         }
-        if (oldest == fifo_index_.end()) break;  // all are batch_keys
+        if (oldest == fifo_index_.end()) break;  // nothing evictable
         vkey = oldest->second;
         vseq = oldest->first;
 
@@ -3687,9 +3936,11 @@ void OffsetAllocatorStorageBackend::EvictToMakeRoom(
             DCHECK_GE(total_size_.load(std::memory_order_relaxed),
                       it->second.total_size);
             DCHECK_GE(total_keys_.load(std::memory_order_relaxed), 1);
-            out_pending.objects.emplace_back(vkey, it->second);
-            total_size_.fetch_sub(it->second.total_size,
-                                  std::memory_order_relaxed);
+            // ObjectEntry is move-only (atomic dirty_/quarantined_), so
+            // hoist the size and move the entry into the pending list.
+            const uint32_t victim_size = it->second.total_size;
+            out_pending.objects.emplace_back(vkey, std::move(it->second));
+            total_size_.fetch_sub(victim_size, std::memory_order_relaxed);
             total_keys_.fetch_sub(1, std::memory_order_relaxed);
             shard.map.erase(it);
         }
@@ -3851,7 +4102,7 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
         RecordHeader header{.key_len = static_cast<uint32_t>(key.size()),
                             .value_len = value_size};
         size_t record_size =
-            RecordHeader::SIZE + header.key_len + header.value_len;
+            RecordHeader::RecordSize(header.key_len, header.value_len);
 
         // Guard against record_size exceeding what the on-disk format
         // can represent (ObjectEntry::total_size is uint32_t).
@@ -3948,9 +4199,13 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
 
         uint64_t offset = allocation->address();
 
-        // ---- (E) Disk write (unchanged from original) ----
+        // ---- (E) Disk write ----
+        // Layout: header | key | zero padding | value — the value region
+        // starts at a 4 KiB aligned offset so the GDS path can DMA it
+        // (see RecordHeader in gds/gds_context.h).  Both the GDS and the
+        // vector_write paths must produce the identical layout.
         std::vector<iovec> iovs;
-        iovs.reserve(2 + 1 + slices.size());
+        iovs.reserve(2 + 2 + slices.size());
         iovs.push_back(
             {const_cast<char*>(reinterpret_cast<const char*>(&header.key_len)),
              sizeof(header.key_len)});
@@ -3959,12 +4214,22 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
                         sizeof(header.value_len)});
         iovs.push_back({const_cast<char*>(key.data()),
                         static_cast<size_t>(header.key_len)});
+        static const char kZeroPad[RecordHeader::kValueAlignment] = {};
+        iovs.push_back({const_cast<char*>(kZeroPad),
+                        RecordHeader::ValuePadding(header.key_len)});
         for (const auto& slice : slices) {
             iovs.push_back({slice.ptr, slice.size});
         }
 
-        auto write_result =
-            data_file_->vector_write(iovs.data(), iovs.size(), offset);
+        tl::expected<size_t, ErrorCode> write_result;
+        if (gds_ctx_ && gds_ctx_->enabled_) {
+            auto rec = gds_ctx_->WriteRecord(key, slices, offset);
+            write_result = rec ? tl::expected<size_t, ErrorCode>(record_size)
+                               : tl::make_unexpected(rec.error());
+        } else {
+            write_result =
+                data_file_->vector_write(iovs.data(), iovs.size(), offset);
+        }
         if (!write_result) {
             LOG(ERROR) << "Failed to write record for key: " << key
                        << ", error: " << write_result.error();
@@ -3994,6 +4259,20 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
             auto it = shard.map.find(key);
             int64_t size_delta = static_cast<int64_t>(record_size);
             bool is_new_key = (it == shard.map.end());
+
+            // GDS dirty guard: never overwrite a record whose reserved
+            // DMA write may still be in flight.  Replacing the entry
+            // would destroy the old AllocationPtr, recycle the offset,
+            // and let a future record be torn by the stale DMA writer.
+            // The fresh allocation above is RAII-freed by skipping.
+            if (!is_new_key &&
+                it->second.dirty_.load(std::memory_order_acquire)) {
+                LOG(WARNING) << "BatchOffload: key " << key
+                             << " has an in-flight GDS reservation (dirty), "
+                                "skipping offload for this key";
+                continue;
+            }
+
             uint64_t seq = 0;
 
             if (eviction_on) {
@@ -4056,6 +4335,17 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
 
 tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
     std::unordered_map<std::string, Slice>& batched_slices) {
+    // Single-slice adapter over the multi-destination implementation.
+    std::unordered_map<std::string, std::vector<Slice>> multi;
+    multi.reserve(batched_slices.size());
+    for (const auto& [key, dest] : batched_slices) {
+        multi.emplace(key, std::vector<Slice>{dest});
+    }
+    return BatchLoadMultiDest(multi);
+}
+
+tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoadMultiDest(
+    std::unordered_map<std::string, std::vector<Slice>>& batched_slices) {
     if (!initialized_.load(std::memory_order_acquire)) {
         LOG(ERROR)
             << "Storage backend is not initialized. Call Init() before use.";
@@ -4069,13 +4359,13 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
         uint64_t offset;
         uint32_t value_size;
         AllocationPtr allocation;  // Refcounted handle keeps allocation alive
-        Slice dest_slice;
+        std::vector<Slice> dest_slices;
     };
 
     std::vector<ReadPlan> read_plans;
     read_plans.reserve(batched_slices.size());
 
-    for (const auto& [key, dest_slice] : batched_slices) {
+    for (const auto& [key, dest_slices] : batched_slices) {
         size_t shard_idx = ShardForKey(key);
         auto& shard = shards_[shard_idx];
         SharedMutexLocker lock(&shard.mutex, /*shared_mode=*/shared_lock);
@@ -4090,11 +4380,27 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
         const auto& entry = it->second;
 
         // Validate destination size matches stored value size
-        if (dest_slice.size != entry.value_size) {
+        size_t dest_total = 0;
+        for (const auto& s : dest_slices) dest_total += s.size;
+        if (dest_total != entry.value_size) {
             LOG(ERROR) << "Size mismatch for key: " << key
                        << ", expected: " << entry.value_size
-                       << ", got: " << dest_slice.size;
+                       << ", got: " << dest_total;
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+
+        // GDS dirty_ guard: if the record was reserved but DMA has not
+        // completed yet, skip it. Reading would return stale data
+        // regardless of I/O method (pread or cuFileRead).
+        if (entry.dirty_.load(std::memory_order_acquire)) {
+            if (entry.quarantined_.load(std::memory_order_acquire)) {
+                LOG(WARNING)
+                    << "Key " << key << " is quarantined (DMA presumed lost)";
+            }
+            LOG_FIRST_N(WARNING, 10)
+                << "Key " << key
+                << " is dirty (DMA in progress), skipping read";
+            return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
         }
 
         // Copy metadata and increment refcount on allocation
@@ -4102,7 +4408,7 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
         read_plans.push_back(
             ReadPlan{key, entry.offset, entry.value_size,
                      entry.allocation,  // shared_ptr copy, increments refcount
-                     dest_slice});
+                     dest_slices});
 
         // Lock released here; allocation stays alive via shared_ptr
     }
@@ -4114,6 +4420,13 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
         RecordHeader header;
         iovec header_iovs[2] = {{&header.key_len, sizeof(header.key_len)},
                                 {&header.value_len, sizeof(header.value_len)}};
+        if (gds_ctx_ && gds_ctx_->enabled_) {
+            auto rec = gds_ctx_->ReadRecord(plan.key, plan.dest_slices,
+                                            plan.offset, plan.value_size);
+            if (!rec) return tl::make_unexpected(rec.error());
+            continue;
+        }
+
         auto read_header_result =
             data_file_->vector_read(header_iovs, 2, plan.offset);
         if (!read_header_result) {
@@ -4157,21 +4470,28 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
             return tl::make_unexpected(validate_result.error());
         }
 
-        // Read value into destination slice
-        iovec value_iov = {plan.dest_slice.ptr, plan.dest_slice.size};
-        auto read_value_result = data_file_->vector_read(
-            &value_iov, 1, plan.offset + RecordHeader::SIZE + header.key_len);
-        if (!read_value_result) {
-            LOG(ERROR) << "Failed to read value for key: " << plan.key
-                       << ", error: " << read_value_result.error();
-            return tl::make_unexpected(read_value_result.error());
-        }
+        // Read value into the destination slices, starting at the aligned
+        // value offset (see RecordHeader in gds/gds_context.h).
+        uint64_t value_offset =
+            plan.offset + RecordHeader::ValueOffsetInRecord(header.key_len);
+        for (const auto& dest : plan.dest_slices) {
+            if (dest.size == 0) continue;
+            iovec value_iov = {dest.ptr, dest.size};
+            auto read_value_result =
+                data_file_->vector_read(&value_iov, 1, value_offset);
+            if (!read_value_result) {
+                LOG(ERROR) << "Failed to read value for key: " << plan.key
+                           << ", error: " << read_value_result.error();
+                return tl::make_unexpected(read_value_result.error());
+            }
 
-        if (read_value_result.value() != header.value_len) {
-            LOG(ERROR) << "Value read size mismatch for key: " << plan.key
-                       << ", expected: " << header.value_len
-                       << ", got: " << read_value_result.value();
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            if (read_value_result.value() != dest.size) {
+                LOG(ERROR) << "Value read size mismatch for key: " << plan.key
+                           << ", expected: " << dest.size
+                           << ", got: " << read_value_result.value();
+                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            }
+            value_offset += dest.size;
         }
     }
 
@@ -4277,12 +4597,18 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::ScanMeta(
         // Scan all shards, calling handler when limit is reached
         for (size_t i = 0; i < kNumShards; ++i) {
             for (const auto& [key, entry] : shards_[i].map) {
+                // Skip dirty GDS reservations: their DMA has not completed
+                // (or never will), so they must not be advertised to the
+                // master as readable replicas.
+                if (entry.dirty_.load(std::memory_order_acquire)) continue;
                 keys.push_back(key);
                 metadatas.push_back(StorageObjectMetadata{
                     0,  // bucket_id not used
                     static_cast<int64_t>(entry.offset),
-                    static_cast<int64_t>(entry.total_size - RecordHeader::SIZE -
-                                         entry.value_size),  // key_size
+                    // key_size is the record key length — the map key
+                    // itself (total_size also covers padding, so it
+                    // cannot be derived from it).
+                    static_cast<int64_t>(key.size()),
                     static_cast<int64_t>(entry.value_size), ""});
 
                 // Call handler when batch limit is reached
@@ -4366,6 +4692,17 @@ CreateStorageBackend(const FileStorageConfig& config) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
     }
+}
+
+// ── GDS destructor and helpers ──
+OffsetAllocatorStorageBackend::~OffsetAllocatorStorageBackend() {
+    if (gds_ctx_) {
+        gds_ctx_->Shutdown();
+    }
+}
+
+bool OffsetAllocatorStorageBackend::IsGdsEnabled() const {
+    return gds_ctx_ && gds_ctx_->enabled_;
 }
 
 }  // namespace mooncake

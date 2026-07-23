@@ -74,7 +74,8 @@ set(MOONCAKE_STORE_SOURCES
     store_c.cpp
     memory_alloc.cpp
     ssd_register_client.cpp
-    engram/engram_store.cpp)
+    engram/engram_store.cpp
+)
 
 set(EXTRA_LIBS "")
 set(SPDK_STATIC_LIBS "")
@@ -269,6 +270,12 @@ endif()
 
 # The cache_allocator library
 include_directories(${Python3_INCLUDE_DIRS})
+set(GDS_CORE_SOURCES
+    gds/gds_context.cpp
+    gds/fallback_gds_device.cpp
+    gds/gds_device_factory.cpp
+)
+list(APPEND MOONCAKE_STORE_SOURCES ${GDS_CORE_SOURCES})
 add_library(mooncake_store ${MOONCAKE_STORE_SOURCES})
 if(KV_EVENTS_ZMQ_FOUND)
   target_compile_definitions(mooncake_store PRIVATE MOONCAKE_ENABLE_KV_EVENTS=1)
@@ -386,6 +393,47 @@ if(CUDAToolkit_FOUND)
                              PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
   target_link_libraries(mooncake_store PRIVATE CUDA::cudart)
   target_link_libraries(mooncake_client PRIVATE CUDA::cudart)
+endif()
+
+# GDS (GPU Direct Storage) — multi-vendor support
+# USE_GDS_BACKEND: guards gds_context.cpp (existing, retained)
+# USE_GDS_NVIDIA:  enables nvidia_gds_device.cpp
+option(USE_GDS_BACKEND "Build with GPUDirect Storage (vendor SDK required)" OFF)
+
+# GDS core sources — always compiled
+
+if(USE_GDS_BACKEND)
+    find_package(CUDAToolkit REQUIRED)
+    find_library(CUFILE_LIB NAMES cufile cuFile
+        PATHS ${CUDAToolkit_LIBRARY_DIR}
+              /usr/local/cuda/lib64
+              /usr/lib/x86_64-linux-gnu
+              /usr/lib64)
+    find_path(CUFILE_INCLUDE cufile.h
+        PATHS ${CUDAToolkit_INCLUDE_DIRS}
+              /usr/local/cuda/include)
+
+    if(CUFILE_LIB AND CUFILE_INCLUDE)
+        message(STATUS "GDS: NVIDIA cuFile found -> USE_GDS_NVIDIA")
+        add_library(cufile_gds INTERFACE)
+        target_compile_definitions(cufile_gds INTERFACE
+            USE_GDS_BACKEND USE_GDS_NVIDIA)
+        target_include_directories(cufile_gds INTERFACE ${CUFILE_INCLUDE})
+        target_link_libraries(cufile_gds INTERFACE
+            ${CUFILE_LIB} CUDA::cudart)
+        target_link_libraries(mooncake_store PRIVATE cufile_gds)
+        target_link_libraries(mooncake_client PRIVATE cufile_gds)
+        target_link_libraries(mooncake_master PRIVATE cufile_gds)
+        target_sources(mooncake_store PRIVATE gds/nvidia_gds_device.cpp)
+    else()
+        message(FATAL_ERROR
+            "USE_GDS_BACKEND=ON but cuFile not found. "
+            "Set -DCUDAToolkit_ROOT=/path/to/cuda or ensure "
+            "the nvidia-fs kernel module is loaded.")
+    endif()
+else()
+    message(STATUS "GDS backend disabled "
+                   "(set -DUSE_GDS_BACKEND=ON to enable)")
 endif()
 
 if(NOT CUDAToolkit_FOUND)

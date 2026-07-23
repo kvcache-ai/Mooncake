@@ -151,6 +151,8 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
                        GetEnvStringOr("MOONCAKE_USE_URING", "false"));
     config.use_uring = (use_uring_str == "true" || use_uring_str == "1");
 
+    config.enable_gds = GetEnvOr<bool>("MOONCAKE_ENABLE_GDS", false);
+
     return config;
 }
 
@@ -311,34 +313,45 @@ FileStorage::~FileStorage() {
 }
 
 tl::expected<void, ErrorCode> FileStorage::Init() {
-    auto register_memory_result = RegisterLocalMemory();
-    if (!register_memory_result) {
-        LOG(ERROR) << "Failed to register local memory: "
-                   << register_memory_result.error();
-        return register_memory_result;
+    if (!config_.gds_client_only) {
+        auto register_memory_result = RegisterLocalMemory();
+        if (!register_memory_result) {
+            LOG(ERROR) << "Failed to register local memory: "
+                       << register_memory_result.error();
+            return register_memory_result;
+        }
     }
+
     auto init_storage_backend_result = storage_backend_->Init();
     if (!init_storage_backend_result) {
         LOG(ERROR) << "Failed to init storage backend: "
                    << init_storage_backend_result.error();
         return init_storage_backend_result;
     }
-    auto enable_offloading_result = IsEnableOffloading();
-    if (enable_offloading_result.has_value()) {
-        LOG(INFO) << "IsEnableOffloading result: "
-                  << (enable_offloading_result.value() ? "true" : "false");
-    } else {
-        LOG(INFO) << "IsEnableOffloading result: error: "
-                  << enable_offloading_result.error();
+
+    // Resolve enable_offloading: GDS-only skips IsEnableOffloading()
+    // (standalone-store has no memory replicas to offload).
+    bool enable_offloading = false;
+    if (!config_.gds_client_only) {
+        auto enable_offloading_result = IsEnableOffloading();
+        if (enable_offloading_result.has_value()) {
+            LOG(INFO) << "IsEnableOffloading result: "
+                      << (enable_offloading_result.value() ? "true" : "false");
+        } else {
+            LOG(INFO) << "IsEnableOffloading result: error: "
+                      << enable_offloading_result.error();
+        }
+        if (!enable_offloading_result) {
+            LOG(ERROR) << "Failed to get enable persist result, error : "
+                       << enable_offloading_result.error();
+            return tl::make_unexpected(enable_offloading_result.error());
+        }
+        enable_offloading = enable_offloading_result.value();
     }
-    if (!enable_offloading_result) {
-        LOG(ERROR) << "Failed to get enable persist result, error : "
-                   << enable_offloading_result.error();
-        return tl::make_unexpected(enable_offloading_result.error());
-    }
+
     {
         MutexLocker locker(&offloading_mutex_);
-        enable_offloading_ = enable_offloading_result.value();
+        enable_offloading_ = enable_offloading;
         auto mount_file_storage_result =
             client_->MountLocalDiskSegment(enable_offloading_);
         if (!mount_file_storage_result) {
@@ -347,10 +360,9 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
             return mount_file_storage_result;
         }
     }
+
     // Report configured SSD capacity to Master so it can populate
     // file_total_capacity_ (the denominator in "SSD Storage: X / Y").
-    // Called once at init; old Masters that lack this RPC will log an error
-    // but FileStorage continues normally.
     if (config_.total_size_limit > 0) {
         auto cap_result = client_->ReportSsdCapacity(config_.total_size_limit);
         if (!cap_result) {
@@ -382,20 +394,29 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
         return scan_meta_result;
     }
 
-    heartbeat_running_.store(true);
-    heartbeat_thread_ = std::thread([this]() {
-        LOG(INFO) << "Starting periodic task with interval: "
-                  << config_.heartbeat_interval_seconds
-                  << "s, running is: " << heartbeat_running_.load();
-        while (heartbeat_running_.load()) {
-            Heartbeat();
-            std::this_thread::sleep_for(
-                std::chrono::seconds(config_.heartbeat_interval_seconds));
-        }
-    });
-    client_buffer_gc_running_.store(true);
-    client_buffer_gc_thread_ =
-        std::thread(&FileStorage::ClientBufferGCThreadFunc, this);
+    // GDS-only mode skips heartbeat, client_buffer GC, and offload worker
+    // pool: no offload/promotion work needed. DirectGdsBatchLoad reads
+    // directly into user GPU buffers via BatchLoad → cuFileRead.
+    if (!config_.gds_client_only) {
+        heartbeat_running_.store(true);
+        heartbeat_thread_ = std::thread([this]() {
+            LOG(INFO) << "Heartbeat thread started, interval="
+                      << config_.heartbeat_interval_seconds << "s";
+            while (heartbeat_running_.load()) {
+                Heartbeat();
+                auto now_s =
+                    std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+                storage_backend_->CleanupStaleDirtyRecords(now_s);
+                std::this_thread::sleep_for(
+                    std::chrono::seconds(config_.heartbeat_interval_seconds));
+            }
+        });
+        client_buffer_gc_running_.store(true);
+        client_buffer_gc_thread_ =
+            std::thread(&FileStorage::ClientBufferGCThreadFunc, this);
+    }
     return {};
 }
 
@@ -439,6 +460,233 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
             << "us, key size: " << keys.size() << ", batch_id: " << batch_id;
     return batch_result;
 }
+
+// =====================================================================
+// DirectGdsOffload (GDS sync offload with raw GPU buffers)
+// =====================================================================
+tl::expected<size_t, ErrorCode> FileStorage::DirectGdsOffload(
+    const std::vector<std::string>& keys,
+    const std::vector<std::vector<Slice>>& slices_per_key,
+    const std::string& tenant_id,
+    std::shared_ptr<std::promise<bool>> notify_barrier) {
+    if (keys.size() != slices_per_key.size()) {
+        LOG(ERROR) << "DirectGdsOffload: size mismatch (keys=" << keys.size()
+                   << " vs slices=" << slices_per_key.size() << ")";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (keys.empty()) return 0;
+
+    std::unordered_map<std::string, std::vector<Slice>> batch_object;
+    std::vector<OffloadTaskItem> tasks;
+    tasks.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto sk = MakeTenantScopedStorageKey(tenant_id, keys[i]);
+        // ★ Pass all slices directly — non-contiguous GPU buffers OK.
+        // GdsContext::WriteRecord handles each slice independently, and
+        // OffsetAllocatorStorageBackend::BatchOffload sums sizes for
+        // allocation. Slice is {ptr, size}, cheap to copy.
+        batch_object[sk] = slices_per_key[i];
+        int64_t total_size = 0;
+        for (const auto& s : slices_per_key[i]) total_size += s.size;
+        tasks.push_back(OffloadTaskItem{
+            .tenant_id = tenant_id, .key = keys[i], .size = total_size});
+    }
+
+    auto offload_start = std::chrono::steady_clock::now();
+    auto complete_handler =
+        [this, tasks = std::move(tasks), offload_start, notify_barrier](
+            const std::vector<std::string>& succeeded_keys,
+            std::vector<StorageObjectMetadata>& metadatas) -> ErrorCode {
+        for (auto& meta : metadatas) meta.transport_endpoint = local_rpc_addr_;
+
+        std::vector<OffloadTaskItem> succeeded_tasks;
+        for (const auto& sk : succeeded_keys) {
+            auto [tid, uk] = ParseTenantScopedStorageKey(sk);
+            for (const auto& t : tasks)
+                if (t.tenant_id == tid && t.key == uk) {
+                    succeeded_tasks.push_back(t);
+                    break;
+                }
+        }
+
+        if (notify_barrier) {
+            auto barrier_future = notify_barrier->get_future();
+            auto status = barrier_future.wait_for(std::chrono::seconds(120));
+            if (status == std::future_status::timeout) {
+                LOG(ERROR) << "GDS notify barrier timed out after 120s. "
+                           << "BatchPut may have thrown or the main thread "
+                           << "crashed. NotifyOffloadSuccess will NOT be "
+                           << "sent — DISK replica lost for this batch.";
+                return ErrorCode::INTERNAL_ERROR;
+            }
+            try {
+                bool batch_put_ok = barrier_future.get();
+                if (!batch_put_ok) {
+                    LOG(WARNING) << "GDS: BatchPut returned failure for "
+                                 << "some keys. Skipping NotifyOffloadSuccess "
+                                 << "to avoid orphan DISK replicas. "
+                                 << "No DISK replica is registered for this "
+                                 << "batch (the on-disk data stays "
+                                 << "unreferenced).";
+                    return ErrorCode::INTERNAL_ERROR;
+                }
+            } catch (const std::future_error& e) {
+                LOG(WARNING) << "GDS notify barrier broken: " << e.what();
+                return ErrorCode::INTERNAL_ERROR;
+            }
+        }
+
+        auto result = client_->NotifyOffloadSuccess(succeeded_tasks, metadatas);
+        if (!result) {
+            LOG(ERROR) << "DirectGdsOffload: NotifyOffloadSuccess failed: "
+                       << result.error();
+            return result.error();
+        }
+
+        if (ssd_metric_) {
+            auto elapsed_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - offload_start)
+                    .count();
+            int64_t total_bytes = 0;
+            for (const auto& meta : metadatas) total_bytes += meta.data_size;
+            size_t n = metadatas.size();
+            ssd_metric_->ssd_write_ops.inc(n);
+            ssd_metric_->ssd_write_bytes.inc(total_bytes);
+            ssd_metric_->ssd_write_latency_us.observe(elapsed_us);
+            ssd_metric_->ssd_write_latency_summary.observe(elapsed_us);
+            ssd_metric_->ssd_total_ops.inc(n);
+            ssd_metric_->ssd_total_bytes.inc(total_bytes);
+            ssd_metric_->ssd_total_latency_us.observe(elapsed_us);
+            ssd_metric_->ssd_total_latency_summary.observe(elapsed_us);
+        }
+        return ErrorCode::OK;
+    };
+
+    auto res = storage_backend_->BatchOffload(batch_object, complete_handler,
+                                              /*eviction_handler=*/nullptr);
+    if (!res) return tl::make_unexpected(res.error());
+    return static_cast<size_t>(res.value());
+}
+
+// DirectGdsBatchLoad — public wrapper for GDS local read path
+tl::expected<void, ErrorCode> FileStorage::DirectGdsBatchLoad(
+    std::unordered_map<std::string, Slice>& batch_object) {
+    return BatchLoad(batch_object);
+}
+
+// DirectGdsBatchLoadMulti — multi-fragment GDS local read path:
+// one cuFileRead per destination slice, no D2D/H2D staging copies.
+tl::expected<void, ErrorCode> FileStorage::DirectGdsBatchLoadMulti(
+    std::unordered_map<std::string, std::vector<Slice>>& batch_object) {
+    auto* oa =
+        dynamic_cast<OffsetAllocatorStorageBackend*>(storage_backend_.get());
+    if (!oa) return tl::make_unexpected(ErrorCode::GDS_NOT_AVAILABLE);
+    return oa->BatchLoadMultiDest(batch_object);
+}
+
+// =====================================================================
+// GDS two-phase commit: store_service side
+// =====================================================================
+
+tl::expected<BatchReserveOffloadSpaceResponse, ErrorCode>
+FileStorage::BatchReserveOffloadSpace(
+    const std::vector<std::string>& keys,
+    const std::vector<uint64_t>& value_sizes) {
+    if (keys.size() != value_sizes.size()) {
+        LOG(ERROR) << "BatchReserveOffloadSpace: keys/value_sizes size "
+                   << "mismatch (" << keys.size() << " vs "
+                   << value_sizes.size() << ")";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto* oa =
+        dynamic_cast<OffsetAllocatorStorageBackend*>(storage_backend_.get());
+    if (!oa) {
+        LOG(ERROR) << "BatchReserveOffloadSpace: storage backend does not "
+                      "support offset reservation";
+        return tl::make_unexpected(ErrorCode::GDS_NOT_AVAILABLE);
+    }
+
+    BatchReserveOffloadSpaceResponse resp;
+    resp.data_file_path = storage_backend_->GetDataFilePath();
+    resp.reservations.reserve(keys.size());
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        // keys are tenant-scoped storage keys (MakeTenantScopedStorageKey);
+        // they are stored as-is so the read path (which also looks up
+        // scoped keys) can find the records.
+        const auto& key = keys[i];
+        uint64_t vsize = value_sizes[i];
+        if (key.empty() || key.size() > UINT32_MAX || vsize == 0 ||
+            vsize > UINT32_MAX) {
+            LOG(ERROR) << "BatchReserveOffloadSpace: invalid key/value size "
+                       << "for key " << key << " (key_len=" << key.size()
+                       << ", value_size=" << vsize << ")";
+            continue;  // key absent from reservations => treated as failed
+        }
+        auto res = oa->ReserveOffloadSpace(key, static_cast<uint32_t>(vsize));
+        if (!res) {
+            LOG(WARNING) << "BatchReserveOffloadSpace: reserve failed for "
+                         << "key " << key << ": " << res.error();
+            continue;
+        }
+        resp.reservations.push_back(*res);
+    }
+    return resp;
+}
+
+tl::expected<void, ErrorCode> FileStorage::BatchCompleteOffloadSpace(
+    const std::vector<std::string>& keys) {
+    // Phase 2 of the GDS two-phase commit: clear dirty_ for DMA-completed
+    // records, then register their DISK replicas with the master.  Without
+    // this notification the master never learns about the on-disk copies
+    // and the GDS-written data stays invisible to readers.
+    std::vector<OffloadTaskItem> tasks;
+    std::vector<StorageObjectMetadata> metadatas;
+    tasks.reserve(keys.size());
+    metadatas.reserve(keys.size());
+
+    for (const auto& key : keys) {  // tenant-scoped storage keys
+        auto info = storage_backend_->CompleteOffloadSpace(key);
+        if (!info.has_value()) continue;  // unknown key (evicted?)
+        if (!info->was_dirty) continue;   // duplicate Complete (retry)
+        auto [tenant_id, user_key] = ParseTenantScopedStorageKey(key);
+        tasks.push_back(OffloadTaskItem{
+            .tenant_id = tenant_id, .key = user_key, .size = info->value_size});
+        metadatas.push_back(StorageObjectMetadata{
+            0, static_cast<int64_t>(info->offset),
+            static_cast<int64_t>(key.size()),
+            static_cast<int64_t>(info->value_size), local_rpc_addr_});
+    }
+
+    if (tasks.empty()) return {};
+
+    auto result = client_->NotifyOffloadSuccess(tasks, metadatas);
+    if (!result) {
+        // The data is on disk and readable; only the master metadata is
+        // missing.  It is reconciled by ReRegisterOffloadedObjects (ScanMeta)
+        // on store restart or LOCAL_DISK segment re-mount.
+        LOG(ERROR) << "BatchCompleteOffloadSpace: NotifyOffloadSuccess failed "
+                   << "for " << tasks.size() << " key(s): " << result.error()
+                   << " — DISK replicas will be re-registered on next "
+                      "metadata rescan";
+    }
+    return {};
+}
+
+std::string FileStorage::GetDataFilePath() const {
+    return storage_backend_->GetDataFilePath();
+}
+
+tl::expected<void, ErrorCode> FileStorage::WriteAtOffset(
+    const std::string& key, const std::vector<Slice>& slices, uint64_t offset) {
+    auto* oa =
+        dynamic_cast<OffsetAllocatorStorageBackend*>(storage_backend_.get());
+    if (!oa) return tl::make_unexpected(ErrorCode::GDS_NOT_AVAILABLE);
+    return oa->WriteAtOffset(key, slices, offset);
+}
+
+// =====================================================================
 
 tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     const std::vector<OffloadTaskItem>& offloading_objects) {

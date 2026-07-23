@@ -9,6 +9,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <unordered_set>
@@ -20,6 +21,23 @@
 #include "types.h"
 
 namespace mooncake {
+struct OffloadSpaceReservation;
+
+// Result of completing a previously reserved offload record.
+// Returned by StorageBackendInterface::CompleteOffloadSpace so the
+// caller (FileStorage) can register the DISK replica with the master.
+struct OffloadSpaceCompletion {
+    uint64_t offset = 0;
+    uint32_t total_size = 0;  // record size on disk (header+key+pad+value)
+    uint32_t value_size = 0;  // value bytes only
+    bool was_dirty = false;   // true if this call transitioned dirty->clean
+};
+}  // namespace mooncake
+
+#include "gds/gds_context.h"  // GdsContext complete type (needed by any class with unique_ptr<GdsContext>)
+
+namespace mooncake {
+
 struct FileRecord {
     std::string path;
     uint64_t size;
@@ -270,6 +288,14 @@ struct FileStorageConfig {
     // Use io_uring for file I/O instead of POSIX pread/pwrite
     bool use_uring = false;
 
+    // ── GDS ──
+    bool enable_gds = false;  // env: MOONCAKE_ENABLE_GDS
+
+    // GDS-only mode: skip RegisterLocalMemory (MR slots not consumed)
+    // and skip offload RPC server. Used when MOONCAKE_ENABLE_GDS=1
+    // but enable_ssd_offload is not in the config JSON.
+    bool gds_client_only = false;
+
     // Proactively evict local disk objects from the heartbeat thread once
     // backend usage crosses the high watermark.
     bool enable_disk_watermark_eviction = true;
@@ -334,6 +360,43 @@ class StorageBackendInterface {
         std::function<bool(const std::string& key)> /* predicate */) {
         // Default: no-op (no test failures injected)
     }
+
+    virtual ~StorageBackendInterface() = default;
+
+    // Returns true if this backend type supports GDS DMA acceleration.
+    //
+    // Only OffsetAllocatorStorageBackend currently supports GDS — its
+    // on-disk RecordHeader format and direct Slice passthrough allow
+    // each Slice to be written via cuFileWrite (GPU pointer) or pwrite
+    // (CPU pointer) based on IsDevicePointer.
+    //
+    // BucketStorageBackend does NOT support GDS: its bucket format
+    // (bucket_id-indexed, metadata inline) differs from RecordHeader,
+    // and UringFile write_aligned path copies data to a CPU staging
+    // buffer which defeats DMA.
+    //
+    // StorageBackendAdaptor (FilePerKey) does NOT support GDS:
+    // ConcatSlicesToString merges all slices into a CPU std::string
+    // before writing — cuFileWrite would always fallback to pwrite.
+    virtual bool SupportsGds() const { return false; }
+
+    // Whether GDS is actually enabled on this instance
+    // (true after Init() if probe passed).
+    virtual bool IsGdsEnabled() const { return false; }
+
+    // Complete DMA write; on success returns the record's completion info
+    // (std::nullopt when the key is unknown or already completed).
+    // Default: no-op (no test failures injected).
+    virtual std::optional<OffloadSpaceCompletion> CompleteOffloadSpace(
+        const std::string& /*key*/) {
+        return std::nullopt;
+    }
+    // Return data file path (default empty; OffsetAllocator overrides).
+    virtual std::string GetDataFilePath() const { return {}; }
+
+    // Heartbeat-driven reclamation of stale dirty records.
+    // Only relevant for OffsetAllocatorStorageBackend; others are no-ops.
+    virtual void CleanupStaleDirtyRecords(int64_t /*now_seconds*/) {}
 
     virtual tl::expected<std::vector<std::string>, ErrorCode>
     EvictAboveDiskWatermark(double /* high_watermark_ratio */,
@@ -844,13 +907,15 @@ class BucketStorageBackend : public StorageBackendInterface {
     /**
      * @brief Checks whether the backend is allowed to continue offloading.
      * @return tl::expected<bool, ErrorCode>
-     * - On success: true 表示可以继续 offload；false 表示达到上限/不允许继续。
-     * - On failure: 返回错误码（例如 IO/内部错误）。
+     * - On success: true if offloading can proceed; false if the limit is
+     * reached or disallowed.
+     * - On failure: returns the error code (e.g. IO or internal error).
      */
     tl::expected<bool, ErrorCode> IsEnableOffloading() override;
 
     /**
-     * @brief 根据后端 bucket 限制（keys/size）将 offloading_objects 分桶。
+     * @brief Split offloading_objects into buckets according to backend bucket
+     * limits (keys/size).
      * @param offloading_objects Input map of object keys and their sizes
      * (bytes).
      * @param buckets_keys Output: bucketized keys; each inner vector is a
@@ -1110,6 +1175,13 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
         const FileStorageConfig& file_storage_config_,
         const OffsetAllocatorBackendConfig& offset_backend_config = {});
 
+    // ── GDS support ──
+    ~OffsetAllocatorStorageBackend();  // defined in .cpp
+                                       // (unique_ptr<GdsContext> requires
+                                       // complete type)
+    bool SupportsGds() const override { return true; }
+    bool IsGdsEnabled() const override;  // gds_ctx_ && gds_ctx_->enabled_
+
     /**
      * @brief Initializes the offset allocator storage backend.
      * Creates/truncates the data file and initializes the allocator.
@@ -1187,41 +1259,11 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     }
 
    private:
-    // On-disk record header: [u32 key_len][u32 value_len] (8 bytes total)
-    struct RecordHeader {
-        // Length of key in bytes
-        uint32_t key_len;
-
-        // Length of value in bytes
-        uint32_t value_len;
-
-        // Header size: 8 bytes (2 * uint32_t). Currently assumes max object
-        // size is 4GB. If we need to support larger objects, change this to 16
-        // bytes.
-        static constexpr size_t SIZE = sizeof(uint32_t) * 2;
-
-        // Validate header against expected metadata
-        bool ValidateAgainstMetadata(uint32_t expected_value_len) const {
-            return value_len == expected_value_len;
-        }
-
-        // Validate key matches expected key
-        tl::expected<void, ErrorCode> ValidateKey(
-            const std::string& expected_key,
-            const std::string& stored_key) const {
-            if (stored_key.size() != key_len) {
-                LOG(ERROR) << "Key length mismatch: expected " << key_len
-                           << ", got " << stored_key.size();
-                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-            }
-            if (stored_key != expected_key) {
-                LOG(ERROR) << "Key mismatch: expected " << expected_key
-                           << ", got " << stored_key;
-                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-            }
-            return {};
-        }
-    };
+    // On-disk record header: [u32 key_len][u32 value_len] (8 bytes total),
+    // defined once in gds/gds_context.h (mooncake::RecordHeader) so the GDS
+    // and non-GDS record layouts can never drift apart.  The value region
+    // starts at a 4 KiB aligned offset within the record (see
+    // RecordHeader::ValueOffsetInRecord).
 
     // Refcounted wrapper for move-only OffsetAllocationHandle. Physical extent
     // freed when last shared_ptr reference drops.
@@ -1257,11 +1299,27 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
         // Refcounted handle keeps physical extent alive during reads
         AllocationPtr allocation;
 
+        // ── GDS two-phase commit (Part B) ──
+        // dirty_=true: offset reserved but DMA not yet complete.
+        // BatchLoad must skip dirty records (read would see stale data).
+        std::atomic<bool> dirty_{false};
+
+        // quarantined_=true: DMA presumed lost; offset pending reclamation.
+        // Set by heartbeat Phase A (overdirty), cleared by Phase B (zombie
+        // release via erase). See CleanupStaleDirtyRecords in
+        // storage_backend.cpp for the full protocol.
+        std::atomic<bool> quarantined_{false};
+
+        // Timestamps for heartbeat stale-dirty cleanup (monotonic seconds).
+        int64_t reserved_at{0};
+        int64_t quarantined_at{0};
+
         // Monotonic insertion sequence number. Points back to the slot in
         // fifo_index_ (seq -> key). Used during eviction to detect stale
         // index entries (lazy-repair) and to remove old slots on overwrite.
         uint64_t fifo_seq = 0;
 
+        ObjectEntry() : offset(0), total_size(0), value_size(0) {}
         ObjectEntry(uint64_t off, uint32_t total, uint32_t val,
                     AllocationPtr alloc_ptr, uint64_t seq = 0)
             : offset(off),
@@ -1269,6 +1327,36 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
               value_size(val),
               allocation(std::move(alloc_ptr)),
               fifo_seq(seq) {}
+        // Explicit move — std::atomic<bool> deletes implicit move.
+        // NOTE: every member must be carried over here — including
+        // fifo_seq, which the FIFO eviction index cross-checks against
+        // fifo_index_ (dropping it after insert_or_assign() makes the
+        // fresh slot look like an orphan and leaks the key from eviction).
+        ObjectEntry(ObjectEntry&& other) noexcept
+            : offset(other.offset),
+              total_size(other.total_size),
+              value_size(other.value_size),
+              allocation(std::move(other.allocation)),
+              reserved_at(other.reserved_at),
+              quarantined_at(other.quarantined_at),
+              fifo_seq(other.fifo_seq) {
+            dirty_.store(other.dirty_.load(std::memory_order_acquire));
+            quarantined_.store(
+                other.quarantined_.load(std::memory_order_acquire));
+        }
+        ObjectEntry& operator=(ObjectEntry&& other) noexcept {
+            offset = other.offset;
+            total_size = other.total_size;
+            value_size = other.value_size;
+            allocation = std::move(other.allocation);
+            dirty_.store(other.dirty_.load(std::memory_order_acquire));
+            quarantined_.store(
+                other.quarantined_.load(std::memory_order_acquire));
+            reserved_at = other.reserved_at;
+            quarantined_at = other.quarantined_at;
+            fifo_seq = other.fifo_seq;
+            return *this;
+        }
     };
 
     // Keeps evicted metadata and allocation handles alive until the master
@@ -1277,8 +1365,37 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
         std::vector<std::pair<std::string, ObjectEntry>> objects;
     };
 
+    // ── GDS two-phase commit (Part B) ──
+   public:
+    // Phase 1: allocate file space and insert metadata with dirty_=true.
+    // The record size (including alignment padding) is derived from the
+    // key/value sizes.  Returns the file offset for the caller to
+    // DMA-write into.
+    tl::expected<OffloadSpaceReservation, ErrorCode> ReserveOffloadSpace(
+        const std::string& key, uint32_t value_size);
+
+    // Phase 2: caller completed DMA → clear dirty_ flag and return the
+    // record's completion info (for master DISK-replica registration).
+    std::optional<OffloadSpaceCompletion> CompleteOffloadSpace(
+        const std::string& key) override;
+
+    // Write raw record data at a pre-allocated offset.
+    // Used by vLLM in normal-mode + GDS: offset was obtained from
+    // store_service via BatchReserveOffloadSpace RPC.
+    tl::expected<void, ErrorCode> WriteAtOffset(
+        const std::string& key, const std::vector<Slice>& slices,
+        uint64_t offset);
+
+    // Multi-destination BatchLoad: each key's value is read into the
+    // given slices consecutively (multi-fragment values, e.g. per-layer
+    // GPU buffers).  The GDS path issues one cuFileRead per slice.
+    tl::expected<void, ErrorCode> BatchLoadMultiDest(
+        std::unordered_map<std::string, std::vector<Slice>>& batched_slices);
+
+    void CleanupStaleDirtyRecords(int64_t now_seconds) override;
+
     // Returns full path to data file: {storage_path_}/kv_cache.data
-    std::string GetDataFilePath() const;
+    std::string GetDataFilePath() const override;
 
     static constexpr size_t kNumShards =
         1024;  // Number of shards (must be power of 2 for bitwise optimization)
@@ -1382,6 +1499,11 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
 
     // Test-only: Predicate to determine which keys should fail in BatchOffload.
     // Used for deterministic testing of partial success behavior.
+    // ── GDS ──
+    std::unique_ptr<GdsContext> gds_ctx_;  // nullptr = GDS not enabled
+    // Always 8 bytes in class layout; size independent of USE_GDS_BACKEND
+    // Complete type only introduced in .cpp
+
     std::function<bool(const std::string& key)> test_failure_predicate_;
 };
 
