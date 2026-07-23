@@ -78,11 +78,11 @@ class MasterClient {
         : client_accessor_(GetStoreRpcClientIoContextPool(),
                            detail::MakeMasterRpcClientPoolConfig()),
           client_id_(client_id),
-          tenant_id_(NormalizeTenantId(std::move(tenant_id))),
+          tenant_id_(std::move(tenant_id)),
           metrics_(metrics) {}
     ~MasterClient();
 
-    const std::string& tenant_id() const { return tenant_id_; }
+    const std::string& tenant_id() const { return tenant_id_.value(); }
 
     MasterClient(const MasterClient&) = delete;
     MasterClient& operator=(const MasterClient&) = delete;
@@ -666,7 +666,7 @@ class MasterClient {
     const UUID client_id_;
 
     // Tenant identity for this client instance.
-    const std::string tenant_id_;
+    const TenantId tenant_id_;
 
     // Metrics for tracking RPC operations
     MasterClientMetric* metrics_;
