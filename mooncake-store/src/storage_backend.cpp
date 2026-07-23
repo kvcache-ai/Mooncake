@@ -1945,10 +1945,34 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                     plan.dest_slice.ptr, aligned_size, aligned_offset);
 
                 if (read_res) {
-                    // Adjust ptr to point to actual data start (no memcpy)
+                    // Verify the aligned read returned enough bytes
+                    // to cover the actual data region.  read_aligned
+                    // reads the full aligned range [aligned_offset,
+                    // aligned_end); the caller-visible data starts at
+                    // offset_in_buffer into that buffer and spans
+                    // plan.dest_slice.size bytes.
+                    size_t min_required =
+                        static_cast<size_t>(offset_in_buffer) +
+                        plan.dest_slice.size;
+                    if (read_res.value() < min_required) {
+                        LOG(ERROR)
+                            << "read_aligned short read for key: " << plan.key
+                            << ", bucket_id=" << plan.bucket_id
+                            << ", expected at least: " << min_required
+                            << " (aligned_size=" << aligned_size
+                            << ", data_size=" << plan.dest_slice.size << ")"
+                            << ", got: " << read_res.value();
+                        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                    }
+                    // Adjust ptr to point to actual data start
+                    // (zero-copy: no memcpy, buffer was oversized by
+                    // AllocateBatch to accommodate the aligned read)
                     batch_object.at(plan.key).ptr =
                         static_cast<char*>(plan.dest_slice.ptr) +
                         offset_in_buffer;
+                    // Normalize read_res so the common validation
+                    // below passes.  The real short-read check was
+                    // already done above (min_required).
                     read_res = plan.dest_slice.size;
                 }
             } else
