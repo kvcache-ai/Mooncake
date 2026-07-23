@@ -106,10 +106,7 @@ jobs:
         python-version: ${{ matrix.python-version }}
 
     - name: Free up disk space
-      run: |
-        sudo rm -rf /usr/share/dotnet
-        sudo rm -rf /opt/ghc
-        sudo rm -rf /opt/hostedtoolcache/CodeQL
+      uses: ./.github/actions/free-disk-space
 
     - name: Install CUDA Toolkit 13.0 (arm64 SBSA)
       run: |
@@ -221,12 +218,7 @@ jobs:
       shell: bash
 
     - name: Free up disk space
-      run: |
-        sudo rm -rf /usr/share/dotnet
-        sudo rm -rf /opt/ghc
-        sudo rm -rf /opt/hostedtoolcache/CodeQL
-        sudo rm -rf /usr/local/lib/android
-        df -h
+      uses: ./.github/actions/free-disk-space
 
     - name: Install CUDA Toolkit
       uses: Jimver/cuda-toolkit@v0.2.24
@@ -362,6 +354,9 @@ jobs:
       TORCH_CUDA_ARCH_LIST: "8.0;9.0"
       SCCACHE_GHA_ENABLED: "true"
       PIP_NO_CACHE_DIR: "1"
+      MAX_JOBS: "2"
+      EP_TORCH_VERSIONS: "2.11.0;2.12.0;2.12.1"
+      CMAKE_RELWITHDEBINFO_FLAGS: "-O2 -DNDEBUG"
 
     steps:
     - uses: actions/checkout@v4
@@ -374,12 +369,7 @@ jobs:
         python-version: ${{ matrix.python-version }}
 
     - name: Free up disk space
-      run: |
-        sudo rm -rf /usr/share/dotnet
-        sudo rm -rf /opt/ghc
-        sudo rm -rf /opt/hostedtoolcache/CodeQL
-        sudo rm -rf /usr/local/lib/android
-        df -h
+      uses: ./.github/actions/free-disk-space
 
     - name: Install CUDA Toolkit
       uses: Jimver/cuda-toolkit@v0.2.24
@@ -418,9 +408,27 @@ jobs:
         cd build
         export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
         export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
-        cmake -G Ninja .. -DUSE_ETCD=OFF -DUSE_CXL=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=OFF -DUSE_MNNVL=OFF -DUSE_UB=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs" -DENABLE_DEBUG_SYMBOLS=OFF
+        cmake -G Ninja .. \
+          -DUSE_ETCD=OFF \
+          -DUSE_CXL=ON \
+          -DUSE_REDIS=ON \
+          -DUSE_HTTP=ON \
+          -DWITH_METRICS=ON \
+          -DBUILD_UNIT_TESTS=ON \
+          -DBUILD_EXAMPLES=ON \
+          -DENABLE_SCCACHE=ON \
+          -DUSE_CUDA=OFF \
+          -DUSE_MNNVL=OFF \
+          -DUSE_UB=OFF \
+          -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs" \
+          "-DCMAKE_C_FLAGS_RELWITHDEBINFO=${CMAKE_RELWITHDEBINFO_FLAGS}" \
+          "-DCMAKE_CXX_FLAGS_RELWITHDEBINFO=${CMAKE_RELWITHDEBINFO_FLAGS}" \
+          -DENABLE_DEBUG_SYMBOLS=OFF
         cmake --build .
         sudo cmake --install .
+        df -h
+        cd ..
+        rm -rf build
         df -h
       shell: bash
 
@@ -428,7 +436,25 @@ jobs:
       run: |
         mkdir build
         cd build
-        cmake -G Ninja .. -DUSE_ETCD=ON -DUSE_CXL=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=ON -DUSE_MNNVL=OFF -DUSE_UB=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs" -DENABLE_DEBUG_SYMBOLS=OFF
+        # ENABLE_DEBUG_SYMBOLS=OFF alone still leaves CMake's RelWithDebInfo -g.
+        cmake -G Ninja .. \
+          -DUSE_ETCD=ON \
+          -DUSE_CXL=ON \
+          -DUSE_REDIS=ON \
+          -DUSE_HTTP=ON \
+          -DWITH_STORE=ON \
+          -DWITH_P2P_STORE=ON \
+          -DWITH_METRICS=ON \
+          -DBUILD_UNIT_TESTS=ON \
+          -DBUILD_EXAMPLES=ON \
+          -DENABLE_SCCACHE=ON \
+          -DUSE_CUDA=ON \
+          -DUSE_MNNVL=OFF \
+          -DUSE_UB=OFF \
+          -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs" \
+          "-DCMAKE_C_FLAGS_RELWITHDEBINFO=${CMAKE_RELWITHDEBINFO_FLAGS}" \
+          "-DCMAKE_CXX_FLAGS_RELWITHDEBINFO=${CMAKE_RELWITHDEBINFO_FLAGS}" \
+          -DENABLE_DEBUG_SYMBOLS=OFF
       shell: bash
       # TODO: lack USE_NVMEOF,USE_MNNVL
 
@@ -472,13 +498,22 @@ jobs:
         MOONCAKE_STORE_LIB_DIR=$GITHUB_WORKSPACE/build/mooncake-store/src \
         MOONCAKE_STORE_INCLUDE_DIR=$GITHUB_WORKSPACE/mooncake-store/include \
           cargo test --examples --tests --no-run
+        cargo clean
       shell: bash
 
     - name: Configure project
       run: |
         cd build
         rm -r */tests
-        cmake -G Ninja .. -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DUSE_CXL=ON -DWITH_EP=ON -DEP_TORCH_VERSIONS="2.11.0;2.12.0;2.12.1" -DENABLE_DEBUG_SYMBOLS=OFF
+        cmake -G Ninja .. \
+          -DBUILD_UNIT_TESTS=OFF \
+          -DBUILD_EXAMPLES=OFF \
+          -DUSE_HTTP=ON \
+          -DENABLE_SCCACHE=ON \
+          -DUSE_CXL=ON \
+          -DWITH_EP=ON \
+          "-DEP_TORCH_VERSIONS=${EP_TORCH_VERSIONS}" \
+          -DENABLE_DEBUG_SYMBOLS=OFF
       shell: bash
 
     - name: Build project
@@ -540,6 +575,9 @@ jobs:
       with:
         persist-credentials: false
 
+    - name: Free up disk space
+      uses: ./.github/actions/free-disk-space
+
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v2
 
@@ -548,6 +586,7 @@ jobs:
         docker build -f docker/mooncake.Dockerfile \
           --build-arg PYTHON_VERSION=3.10 \
           --build-arg EP_TORCH_VERSIONS="2.12.1" \
+          --build-arg CLEAN_BUILD_ARTIFACTS=1 \
           -t mooncake:from-source .
 
   spell-check:
@@ -702,12 +741,14 @@ jobs:
               - 'CMakeLists.txt'
               - 'dependencies.sh'
               - 'scripts/**'
+              - '.github/actions/**'
               - '.github/workflows/**'
             tent:
               - 'mooncake-transfer-engine/**'
               - 'mooncake-common/**'
               - 'CMakeLists.txt'
               - 'dependencies.sh'
+              - '.github/actions/**'
               - '.github/workflows/ci.yml'
             docker:
               - 'docker/**'
@@ -716,6 +757,7 @@ jobs:
               - 'CMakeLists.txt'
               - 'mooncake-wheel/**'
               - 'scripts/build_wheel.sh'
+              - '.github/actions/**'
               - '.github/workflows/ci.yml'
             arm64:
               - 'mooncake-common/**/*.h'
@@ -741,6 +783,7 @@ jobs:
               - '**/CMakeLists.txt'
               - 'dependencies.sh'
               - 'scripts/build_wheel.sh'
+              - '.github/actions/**'
               - '.github/workflows/ci.yml'
             musa:
               - 'docker/musa.Dockerfile'
@@ -760,6 +803,7 @@ jobs:
               - '**/CMakeLists.txt'
               - 'dependencies.sh'
               - 'scripts/build_wheel.sh'
+              - '.github/actions/**'
               - '.github/workflows/ci.yml'
             ascend:
               - 'scripts/ascend/**'
@@ -775,6 +819,7 @@ jobs:
               - 'mooncake-transfer-engine/src/transfer_metadata.cpp'
               - '**/CMakeLists.txt'
               - 'dependencies.sh'
+              - '.github/actions/**'
               - '.github/workflows/ci.yml'
               - '.github/workflows/ci_ascend.yml'
             efa:
@@ -788,6 +833,7 @@ jobs:
               - '**/CMakeLists.txt'
               - 'dependencies.sh'
               - 'scripts/build_wheel.sh'
+              - '.github/actions/**'
               - '.github/workflows/ci.yml'
               - '.github/workflows/ci_efa.yml'
 
@@ -867,12 +913,7 @@ jobs:
 
     - name: Free up disk space
       if: matrix.name == 'cuda-on'
-      run: |
-        sudo rm -rf /usr/share/dotnet
-        sudo rm -rf /opt/ghc
-        sudo rm -rf /opt/hostedtoolcache/CodeQL
-        sudo rm -rf /usr/local/lib/android
-        df -h
+      uses: ./.github/actions/free-disk-space
 
     - name: Install CUDA Toolkit
       if: matrix.name == 'cuda-on'

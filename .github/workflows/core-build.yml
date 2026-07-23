@@ -48,10 +48,7 @@ jobs:
       shell: bash
 
     - name: Free up disk space
-      run: |
-        sudo rm -rf /usr/share/dotnet
-        sudo rm -rf /opt/ghc
-        sudo rm -rf /opt/hostedtoolcache/CodeQL
+      uses: ./.github/actions/free-disk-space
 
     - name: Install CUDA Toolkit
       uses: Jimver/cuda-toolkit@v0.2.24
