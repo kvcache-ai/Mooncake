@@ -432,19 +432,20 @@ TEST_F(HighAvailabilityTest, WaitForViewChangeReturnsCurrentViewImmediately) {
     ASSERT_EQ(ErrorCode::OK, coordinator->ReleaseLeadership(session));
 }
 
-// Regression guard for the steady-state watch-churn fix (#3059): WaitForViewChange
-// must arm at most one prefix watch per call (not one per loop iteration) and
-// tear it down cleanly on return, so repeated calls on a stable leader do not
-// accumulate watch state or violate the single-watcher-per-prefix limitation.
-// After a sequence of stable-leader timeouts, a real view change must still be
-// detected by the long-lived watch. The final leg releases leadership from a
-// concurrent thread while WaitForViewChange is blocked on the watch (not
-// before it, which the synchronous loop-top read would catch regardless of
-// whether the watch is armed), so the change is delivered as a watch DELETE
-// event. The detection latency is then asserted strictly below
-// kViewChangeFallbackPollInterval (200ms): a poll-only regression (watch never
-// armed) would be stranded in a 200ms poll sleep and could not reliably meet
-// the bound, while the event-driven watch delivers in tens of ms. See
+// Regression guard for the steady-state watch-churn fix (#3059):
+// WaitForViewChange must arm at most one prefix watch per call (not one per
+// loop iteration) and tear it down cleanly on return, so repeated calls on a
+// stable leader do not accumulate watch state or violate the
+// single-watcher-per-prefix limitation. After a sequence of stable-leader
+// timeouts, a real view change must still be detected by the long-lived watch.
+// The final leg releases leadership from a concurrent thread while
+// WaitForViewChange is blocked on the watch (not before it, which the
+// synchronous loop-top read would catch regardless of whether the watch is
+// armed), so the change is delivered as a watch DELETE event. The detection
+// latency is then asserted strictly below kViewChangeFallbackPollInterval
+// (200ms): a poll-only regression (watch never armed) would be stranded in a
+// 200ms poll sleep and could not reliably meet the bound, while the
+// event-driven watch delivers in tens of ms. See
 // WaitForViewChangeRearmsAndStillDetectsAfterWatchBroken for the WATCH_BROKEN
 // -> re-arm path.
 TEST_F(HighAvailabilityTest,
@@ -492,8 +493,8 @@ TEST_F(HighAvailabilityTest,
         // master_view key synchronously on the etcd server.
         key_deleted = std::chrono::steady_clock::now();
     });
-    auto changed = coordinator->WaitForViewChange(
-        session.view.view_version, std::chrono::seconds(3));
+    auto changed = coordinator->WaitForViewChange(session.view.view_version,
+                                                  std::chrono::seconds(3));
     const auto detected = std::chrono::steady_clock::now();
     releaser.join();
 
@@ -523,7 +524,8 @@ TEST_F(HighAvailabilityTest,
 // keepalive goroutine; the lease remains valid for
 // DEFAULT_MASTER_VIEW_LEASE_TTL_SEC=5s, enough headroom for the explicit
 // ReleaseLeadership below.)
-TEST_F(HighAvailabilityTest, WaitForViewChangeRearmsAndStillDetectsAfterWatchBroken) {
+TEST_F(HighAvailabilityTest,
+       WaitForViewChangeRearmsAndStillDetectsAfterWatchBroken) {
     if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
         GTEST_SKIP() << *skip_reason;
     }
@@ -546,8 +548,8 @@ TEST_F(HighAvailabilityTest, WaitForViewChangeRearmsAndStillDetectsAfterWatchBro
     // back across the thread boundary (read after join, which synchronizes).
     bool view_changed = false;
     std::thread waiter([&]() {
-        auto result = coordinator->WaitForViewChange(
-            session.view.view_version, std::chrono::seconds(15));
+        auto result = coordinator->WaitForViewChange(session.view.view_version,
+                                                     std::chrono::seconds(15));
         view_changed = result.has_value() && result->changed;
     });
 
@@ -569,8 +571,9 @@ TEST_F(HighAvailabilityTest, WaitForViewChangeRearmsAndStillDetectsAfterWatchBro
     std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 
     // Now make a real view change: revoke the lease, deleting the master_view
-    // key. The re-armed watch must deliver the DELETE event so WaitForViewChange
-    // returns promptly with changed=true (not via the 15s deadline).
+    // key. The re-armed watch must deliver the DELETE event so
+    // WaitForViewChange returns promptly with changed=true (not via the 15s
+    // deadline).
     const auto change_start = std::chrono::steady_clock::now();
     ASSERT_EQ(ErrorCode::OK, coordinator->ReleaseLeadership(session));
     waiter.join();

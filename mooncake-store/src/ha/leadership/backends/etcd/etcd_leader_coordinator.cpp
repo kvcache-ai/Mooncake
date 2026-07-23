@@ -377,29 +377,32 @@ EtcdLeaderCoordinator::WaitForViewChange(
     // allocate ONCE per WaitForViewChange call. The previous per-iteration
     // arming churned Go watch goroutines; when WaitWatchWithPrefixStopped did
     // not complete in time the guard leaked state (UAF-safe) and a goroutine
-    // lingered -- the ~7-threads/min leak in #3059. Re-arm ONLY on WATCH_BROKEN.
+    // lingered -- the ~7-threads/min leak in #3059. Re-arm ONLY on
+    // WATCH_BROKEN.
     auto* state = new ViewChangeWatchState();
     PrefixWatchGuard guard(master_view_key_, state);
 
-    // Arm the watch ONCE before entering the loop. Arm-before-read: the watch is
-    // established at revision R_watch; the first ReadCurrentView observes
+    // Arm the watch ONCE before entering the loop. Arm-before-read: the watch
+    // is established at revision R_watch; the first ReadCurrentView observes
     // R_read >= R_watch. A change at revision C is caught by C < R_read (the
     // read) or C >= R_watch (the watch), and the ranges overlap, so a change
     // between read and watch cannot be missed. start_revision = 0 avoids a
     // possibly-compacted revision. A long-lived watch keeps this for all later
-    // changes; the gap reopens only on re-arm after WATCH_BROKEN (handled below).
+    // changes; the gap reopens only on re-arm after WATCH_BROKEN (handled
+    // below).
     bool watching = false;
     {
-        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-            deadline - std::chrono::steady_clock::now());
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now());
         if (remaining > kViewChangeFallbackPollInterval) {
             // Defensively clear any lingering watch on this key, then arm a new
             // one. Both calls are no-ops when nothing is registered.
             EtcdHelper::CancelWatchWithPrefix(master_view_key_.c_str(),
                                               master_view_key_.size());
-            EtcdHelper::WaitWatchWithPrefixStopped(
-                master_view_key_.c_str(), master_view_key_.size(),
-                kWatchStopTimeoutMs);
+            EtcdHelper::WaitWatchWithPrefixStopped(master_view_key_.c_str(),
+                                                   master_view_key_.size(),
+                                                   kWatchStopTimeoutMs);
             auto watch_err = EtcdHelper::WatchWithPrefixFromRevision(
                 master_view_key_.c_str(), master_view_key_.size(),
                 /*start_revision=*/0, state, &ViewChangeWatchCallback);
@@ -449,9 +452,9 @@ EtcdLeaderCoordinator::WaitForViewChange(
             if (remaining > kViewChangeFallbackPollInterval) {
                 EtcdHelper::CancelWatchWithPrefix(master_view_key_.c_str(),
                                                   master_view_key_.size());
-                EtcdHelper::WaitWatchWithPrefixStopped(
-                    master_view_key_.c_str(), master_view_key_.size(),
-                    kWatchStopTimeoutMs);
+                EtcdHelper::WaitWatchWithPrefixStopped(master_view_key_.c_str(),
+                                                       master_view_key_.size(),
+                                                       kWatchStopTimeoutMs);
                 auto watch_err = EtcdHelper::WatchWithPrefixFromRevision(
                     master_view_key_.c_str(), master_view_key_.size(),
                     /*start_revision=*/0, state, &ViewChangeWatchCallback);
