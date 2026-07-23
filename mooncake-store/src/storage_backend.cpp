@@ -3578,18 +3578,6 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
             }
         }
 
-        // Release fd to StorageFile (takes ownership and will close it)
-#ifdef USE_URING
-        if (file_storage_config_.use_uring) {
-            data_file_ = std::make_shared<UringFile>(
-                data_file_path_, fd_guard.release(), 32, true);
-        } else
-#endif
-        {
-            data_file_ = std::make_shared<PosixFile>(data_file_path_,
-                                                     fd_guard.release());
-        }
-
         // ---- Resolve watermarks ----
         high_watermark_bytes_ =
             cfg_.high_watermark_bytes > 0
@@ -3741,12 +3729,12 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
         // Release fd to StorageFile (takes ownership and will close it)
 #ifdef USE_URING
         if (file_storage_config_.use_uring) {
-            data_file_ = std::make_unique<UringFile>(
+            data_file_ = std::make_shared<UringFile>(
                 data_file_path_, fd_guard.release(), 32, true);
         } else
 #endif
         {
-            data_file_ = std::make_unique<PosixFile>(data_file_path_,
+            data_file_ = std::make_shared<PosixFile>(data_file_path_,
                                                      fd_guard.release());
         }
         if (cfg_.persist_mode != OffsetPersistMode::kDisabled) {
@@ -4528,12 +4516,12 @@ OffsetAllocatorStorageBackend::TryRecoverFromMetadata() {
 
 #ifdef USE_URING
         if (file_storage_config_.use_uring) {
-            data_file_ = std::make_unique<UringFile>(
+            data_file_ = std::make_shared<UringFile>(
                 data_file_path_, fd_guard.release(), 32, true);
         } else
 #endif
         {
-            data_file_ = std::make_unique<PosixFile>(data_file_path_,
+            data_file_ = std::make_shared<PosixFile>(data_file_path_,
                                                      fd_guard.release());
         }
         data_file_->SetDeleteOnWriteFail(false);
