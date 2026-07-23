@@ -134,7 +134,7 @@ struct RpcCommunicatorConfig {
     // Maximum number of cached RPC client connections per target endpoint.
     // RPC client I/O threads are configured by
     // MC_TE_RPC_CLIENT_IO_THREADS/MC_RPC_CLIENT_IO_THREADS.
-    size_t pool_size = 10;
+    size_t pool_size = 100;
 };
 
 void loadGlobalConfig(GlobalConfig& config);
