@@ -4,6 +4,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstring>
 #include <filesystem>
 #include <functional>
 #include <map>
@@ -209,6 +210,12 @@ enum class OffsetEvictionPolicy {
     LRU,   // Approximate LRU via cross-shard sampling (phase 2)
 };
 
+enum class OffsetPersistMode {
+    kDisabled,  // No persistence (default)
+    kRelaxed,   // Periodic checkpoint
+    kStrict,    // Every BatchOffload is durable
+};
+
 struct OffsetAllocatorBackendConfig {
     OffsetEvictionPolicy eviction_policy = OffsetEvictionPolicy::NONE;
 
@@ -239,7 +246,49 @@ struct OffsetAllocatorBackendConfig {
     bool Validate() const;
 
     static OffsetAllocatorBackendConfig FromEnvironment();
+
+    // ---- Persistence settings ----
+    OffsetPersistMode persist_mode = OffsetPersistMode::kDisabled;
+    int64_t persist_interval_seconds = 60;
+
+    // ---- Record integrity ----
+    // When true (default), every written record carries a CRC-32C over
+    // header-prefix + key + value (RecordHeader::kFlagHasCrc), verified
+    // once on recovery.  Disable only when torn writes are otherwise
+    // impossible (kStrict mode on storage that honors fsync ordering,
+    // e.g. power-loss-protected NVMe) or when values never pass through
+    // the CPU (future DMA/GDS writers): unchecksummed records are then
+    // validated by checkpoint ordering (seq guard) alone.
+    bool enable_record_crc = true;
 };
+
+// ===== Persistence metadata structures =====
+
+struct PersistedFifoEntry {
+    uint64_t seq;
+    std::string key;
+};
+YLT_REFL(PersistedFifoEntry, seq, key);
+
+struct OffsetAllocatorPersistedMetadata {
+    uint32_t version = 1;
+    std::string allocator_state;
+    uint64_t insert_seq = 0;
+    std::vector<PersistedFifoEntry> fifo_entries;
+    std::vector<std::string> evicted_keys_this_batch;
+};
+YLT_REFL(OffsetAllocatorPersistedMetadata, version, allocator_state, insert_seq,
+         fifo_entries, evicted_keys_this_batch);
+
+// Current on-disk format version of OffsetAllocatorPersistedMetadata.
+// v2: RecordHeader grew from 8 to 20 bytes (added per-record seq + CRC-32C).
+// v3: RecordHeader is 24 bytes (added `flags`; CRC-32C is now optional per
+//     record) and the value region is aligned to 4 KiB within the record
+//     (zero padding derived from key_len), so that DMA writers (e.g. GDS)
+//     can share the layout.
+// Older metadata is rejected on load (fresh start) because its data-file
+// records cannot be parsed with the current record layout.
+inline constexpr uint32_t kOffsetAllocatorPersistVersion = 3;
 
 struct FileStorageConfig {
     // type of the storage backend
@@ -1118,6 +1167,15 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
         const FileStorageConfig& file_storage_config_,
         const OffsetAllocatorBackendConfig& offset_backend_config = {});
 
+    ~OffsetAllocatorStorageBackend();
+    OffsetAllocatorStorageBackend(OffsetAllocatorStorageBackend&&) = default;
+    OffsetAllocatorStorageBackend& operator=(OffsetAllocatorStorageBackend&&) =
+        default;
+    OffsetAllocatorStorageBackend(const OffsetAllocatorStorageBackend&) =
+        delete;
+    OffsetAllocatorStorageBackend& operator=(
+        const OffsetAllocatorStorageBackend&) = delete;
+
     /**
      * @brief Initializes the offset allocator storage backend.
      * Creates/truncates the data file and initializes the allocator.
@@ -1196,19 +1254,116 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
 
     void RemoveAll() override;
 
-   private:
-    // On-disk record header: [u32 key_len][u32 value_len] (8 bytes total)
+    // On-disk record layout v3 (single definition, shared by the write,
+    // read and recovery paths of this backend, and by future DMA writers
+    // such as GDS):
+    //
+    //   [u32 key_len][u32 value_len][u64 seq][u32 flags][u32 crc32]
+    //   [key bytes][zero padding][value bytes]
+    //
+    // The value region always starts at a kValueAlignment boundary within
+    // the record so that DMA engines (e.g. cuFile) operate on aligned file
+    // offsets.  The padding is a pure function of key_len, so writer,
+    // reader and recovery derive the same layout independently.
+    //
+    // `seq` is the write's insert_seq_ stamp; on recovery any record with
+    // seq >= the checkpoint's insert_seq was written after that checkpoint
+    // and is dropped (its extent may hold a torn write).
+    //
+    // `flags` bit kFlagHasCrc: when set, `crc32` is a CRC-32C over the
+    // header prefix (everything before crc32), the key and the value,
+    // verified once on recovery so torn/stale records are detected and
+    // skipped instead of being served as valid data.  When clear (records
+    // whose value never touched the CPU, or CRC disabled via config),
+    // recovery skips the checksum and trusts checkpoint ordering alone.
     struct RecordHeader {
         // Length of key in bytes
         uint32_t key_len;
 
-        // Length of value in bytes
+        // Length of value in bytes. Currently assumes max object size is
+        // 4GB. If we need to support larger objects, change this to 8 bytes.
         uint32_t value_len;
 
-        // Header size: 8 bytes (2 * uint32_t). Currently assumes max object
-        // size is 4GB. If we need to support larger objects, change this to 16
-        // bytes.
-        static constexpr size_t SIZE = sizeof(uint32_t) * 2;
+        // insert_seq_ stamp of this write (monotonic per BatchOffload entry)
+        uint64_t seq;
+
+        // Record flags; see kFlag* constants below.
+        uint32_t flags;
+
+        // CRC-32C over [key_len|value_len|seq|flags] + key + value.
+        // Valid only when (flags & kFlagHasCrc).
+        uint32_t crc32;
+
+        // flags: crc32 field carries a valid CRC-32C of this record.
+        static constexpr uint32_t kFlagHasCrc = 1u << 0;
+
+        // All currently defined flag bits; recovery drops records with
+        // unknown bits set (written by a newer format).
+        static constexpr uint32_t kKnownFlags = kFlagHasCrc;
+
+        // File-offset alignment of the value region within a record.
+        // 4 KiB covers the logical block size of currently supported NVMe
+        // devices (cuFile requirement for DMA).
+        static constexpr uint32_t kValueAlignment = 4096;
+
+        // Header size: 24 bytes on disk (fields are (de)serialized
+        // field-by-field; do NOT use sizeof(RecordHeader), which includes
+        // padding).
+        static constexpr size_t SIZE =
+            sizeof(uint32_t) * 2 + sizeof(uint64_t) + sizeof(uint32_t) * 2;
+
+        // Size of the crc-covered header prefix (everything before crc32).
+        static constexpr size_t PREFIX_SIZE =
+            sizeof(uint32_t) * 2 + sizeof(uint64_t) + sizeof(uint32_t);
+
+        // Zero-padding between key and value for the given key length.
+        static constexpr uint32_t ValuePadding(uint32_t key_len) {
+            const uint64_t head = SIZE + key_len;
+            return static_cast<uint32_t>(
+                (kValueAlignment - head % kValueAlignment) % kValueAlignment);
+        }
+
+        // Offset of the value region relative to the record start.
+        static constexpr uint64_t ValueOffsetInRecord(uint32_t key_len) {
+            return SIZE + key_len + ValuePadding(key_len);
+        }
+
+        // Total on-disk record size including padding.
+        static constexpr uint64_t RecordSize(uint32_t key_len,
+                                             uint32_t value_len) {
+            return ValueOffsetInRecord(key_len) + value_len;
+        }
+
+        bool HasCrc() const { return (flags & kFlagHasCrc) != 0; }
+
+        void WritePrefixTo(char* out) const {
+            std::memcpy(out, &key_len, sizeof(key_len));
+            std::memcpy(out + sizeof(key_len), &value_len, sizeof(value_len));
+            std::memcpy(out + sizeof(key_len) + sizeof(value_len), &seq,
+                        sizeof(seq));
+            std::memcpy(out + sizeof(key_len) + sizeof(value_len) + sizeof(seq),
+                        &flags, sizeof(flags));
+        }
+
+        void WriteTo(char* out) const {
+            WritePrefixTo(out);
+            std::memcpy(out + PREFIX_SIZE, &crc32, sizeof(crc32));
+        }
+
+        static RecordHeader ReadFrom(const char* buf) {
+            RecordHeader h{};
+            size_t off = 0;
+            std::memcpy(&h.key_len, buf + off, sizeof(h.key_len));
+            off += sizeof(h.key_len);
+            std::memcpy(&h.value_len, buf + off, sizeof(h.value_len));
+            off += sizeof(h.value_len);
+            std::memcpy(&h.seq, buf + off, sizeof(h.seq));
+            off += sizeof(h.seq);
+            std::memcpy(&h.flags, buf + off, sizeof(h.flags));
+            off += sizeof(h.flags);
+            std::memcpy(&h.crc32, buf + off, sizeof(h.crc32));
+            return h;
+        }
 
         // Validate header against expected metadata
         bool ValidateAgainstMetadata(uint32_t expected_value_len) const {
@@ -1232,6 +1387,12 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
             return {};
         }
     };
+
+   private:
+    // Maximum key length accepted by BatchOffload and trusted on recovery.
+    // Write-side enforcement (BatchOffload) and recovery-side validation
+    // (RebuildShardMapsFromAllocator) must agree on this bound.
+    static constexpr uint32_t kMaxKeyLen = 1024 * 1024;
 
     // Refcounted wrapper for move-only OffsetAllocationHandle. Physical extent
     // freed when last shared_ptr reference drops.
@@ -1258,7 +1419,8 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
         // Byte offset in data file where record is stored
         uint64_t offset;
 
-        // Total record size: header (8) + key + value
+        // Total record size: header + key + padding + value
+        // (see RecordHeader::RecordSize)
         uint32_t total_size;
 
         // Value size only (excluding header and key)
@@ -1394,9 +1556,86 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     tl::expected<void, ErrorCode> NotifyAndCommitPreparedEviction(
         const EvictionHandler& eviction_handler, PendingEviction& pending);
 
+    // Record restart-persistence tombstones for prepared victims whose
+    // eviction has become final.  No-op when persistence is disabled.
+    void RecordEvictionTombstones(const PendingEviction& pending);
+
+    // ===== Persistence methods =====
+
+    std::string GetMetaFilePath() const;
+
+    bool ShouldPersistNow() const;
+
+    tl::expected<void, ErrorCode> SaveMetadata(
+        const std::unordered_set<std::string>& evicted_keys_this_batch);
+
+    tl::expected<OffsetAllocatorPersistedMetadata, ErrorCode> LoadMetadata();
+
+    // Outcome of a recovery attempt.  Distinguishes "safe to start fresh"
+    // (kNoMeta / kCorrupt) from "must not touch the persisted data"
+    // (kTransientError, e.g. fd exhaustion or OOM — retrying Init later may
+    // succeed, while a fresh start would destroy a recoverable cache).
+    enum class RecoveryResult {
+        kRecovered,       // persisted state fully restored
+        kNoMeta,          // no metadata file: genuine first boot
+        kCorrupt,         // meta/data missing, incompatible or corrupt
+        kTransientError,  // temporary resource error: do NOT wipe data
+    };
+
+    RecoveryResult TryRecoverFromMetadata();
+
+    // Rebuilds shard maps by scanning extents marked used in the
+    // deserialized allocator.  Records stamped with
+    // seq >= checkpoint_insert_seq were written after the checkpoint and
+    // are dropped (their extents may hold torn writes).
+    void RebuildShardMapsFromAllocator(uint64_t checkpoint_insert_seq);
+
+    void RestoreAndRepairFifoIndex(
+        const OffsetAllocatorPersistedMetadata& meta);
+
     // Test-only: Predicate to determine which keys should fail in BatchOffload.
     // Used for deterministic testing of partial success behavior.
     std::function<bool(const std::string& key)> test_failure_predicate_;
+
+   private:
+    // ---- Persistence state ----
+    std::atomic<int64_t> last_persist_time_us_{0};
+    std::unordered_set<std::string> all_evicted_this_batch_;
+    std::atomic<bool> metadata_dirty_{false};
+
+    // ---- Persistence metrics ----
+    std::atomic<int64_t> last_save_metadata_cost_us_{0};
+    std::atomic<int64_t> metadata_save_failures_{0};
+    std::atomic<int64_t> metadata_load_fallbacks_{0};
+    std::atomic<int64_t> metadata_consecutive_failures_{0};
+
+    // ---- Test-only hooks ----
+    std::atomic<int> test_metadata_write_failure_step_{0};
+    // Skip the destructor's final checkpoint (simulates an abrupt crash).
+    std::atomic<bool> test_skip_final_checkpoint_{false};
+
+   public:
+    // ---- Test accessors ----
+    void SetMetadataWriteFailure(int step) {
+        test_metadata_write_failure_step_ = step;
+    }
+    void SetSkipFinalCheckpointForTest() {
+        test_skip_final_checkpoint_.store(true, std::memory_order_relaxed);
+    }
+    size_t GetAllEvictedThisBatchSizeForTest() const {
+        return all_evicted_this_batch_.size();
+    }
+    int64_t GetMetadataSaveFailures() const {
+        return metadata_save_failures_.load(std::memory_order_relaxed);
+    }
+    int64_t GetMetadataLoadFallbacks() const {
+        return metadata_load_fallbacks_.load(std::memory_order_relaxed);
+    }
+    int64_t GetMetadataConsecutiveFailures() const {
+        return metadata_consecutive_failures_.load(std::memory_order_relaxed);
+    }
+
+   private:
 };
 
 tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>

@@ -15,7 +15,7 @@ SGLang uses Mooncake's Transfer Engine for direct zero-copy KV cache transfer be
   +-----------+                            +------------+
 ```
 
-**Related:** [Full PD Disaggregation Guide](../sglang-integration-v1) — installation, cross-node/same-node setup, XpYd topology, EP backend for MoE models, and EPD backend for multimodal models.
+**Related:** [Full PD Disaggregation Guide](pd-disaggregation) — installation, cross-node/same-node setup, XpYd topology, EP backend for MoE models, and EPD backend for multimodal models.
 
 **Benchmark:** [PD Disaggregation Performance](../../../performance/sglang/sglang-benchmark-results-v1) — compares 1P1D disaggregation with regular SGLang instances.
 
@@ -48,7 +48,7 @@ HiCache extends SGLang's RadixAttention with three memory tiers, using Mooncake 
 :maxdepth: 1
 :hidden:
 
-../sglang-integration-v1
+pd-disaggregation
 hicache-quick-start
 hicache-integration-v1
 ::::

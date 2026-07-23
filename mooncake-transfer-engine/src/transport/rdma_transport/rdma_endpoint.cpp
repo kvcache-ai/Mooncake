@@ -77,6 +77,18 @@ static std::string qpListToString(const std::vector<uint32_t> &qp_num) {
     return oss.str();
 }
 
+static std::string gidToString(const ibv_gid &gid) {
+    char buffer[48];
+    snprintf(buffer, sizeof(buffer),
+             "%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:"
+             "%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x",
+             gid.raw[0], gid.raw[1], gid.raw[2], gid.raw[3], gid.raw[4],
+             gid.raw[5], gid.raw[6], gid.raw[7], gid.raw[8], gid.raw[9],
+             gid.raw[10], gid.raw[11], gid.raw[12], gid.raw[13], gid.raw[14],
+             gid.raw[15]);
+    return buffer;
+}
+
 RdmaEndPoint::RdmaEndPoint(RdmaContext &context)
     : context_(context),
       status_(INITIALIZING),
@@ -199,8 +211,9 @@ int RdmaEndPoint::deconstructLocked() {
     int result = 0;
     for (size_t i = 0; i < qp_list_.size(); ++i) {
         if (!qp_list_[i]) continue;  // already destroyed in a previous call
-        if (ibv_destroy_qp(qp_list_[i])) {
-            PLOG(ERROR) << "Failed to destroy QP[" << i << "]";
+        int ret = ibv_destroy_qp(qp_list_[i]);
+        if (ret) {
+            LOG(ERROR) << "Failed to destroy QP[" << i << "]: " << strerror(ret);
             result = ERR_ENDPOINT;
         } else {
             qp_list_[i] = nullptr;
@@ -232,14 +245,23 @@ void RdmaEndPoint::beginDestroyLocked() {
     status_.store(DESTROYING, std::memory_order_release);
     ready_wait_start_ts_.store(0, std::memory_order_relaxed);
 
-    // Transition QPs to ERR state so hardware flushes all inflight WRs to CQ.
-    // This allows performPollCq to drain them naturally.
-    ibv_qp_attr attr;
-    memset(&attr, 0, sizeof(attr));
-    attr.qp_state = IBV_QPS_ERR;
+    // Only endpoints that reached CONNECTED can have user WRs to flush. For
+    // pre-connected endpoints, skip RESET/INIT -> ERR because there are no WRs
+    // and some providers reject that state transition.
+    if (!has_connected_) return;
+
+    // Transition connected QPs to ERR state so hardware flushes inflight WRs to
+    // CQ. This allows performPollCq to drain them naturally.
     for (size_t i = 0; i < qp_list_.size(); ++i) {
-        if (ibv_modify_qp(qp_list_[i], &attr, IBV_QP_STATE)) {
-            PLOG(WARNING) << "Failed to modify QP to ERR during beginDestroy";
+        if (!qp_list_[i]) continue;
+
+        ibv_qp_attr attr;
+        memset(&attr, 0, sizeof(attr));
+        attr.qp_state = IBV_QPS_ERR;
+        int ret = ibv_modify_qp(qp_list_[i], &attr, IBV_QP_STATE);
+        if (ret) {
+            LOG(WARNING) << "Failed to modify QP[" << i
+                         << "] to ERR during beginDestroy: " << strerror(ret);
         }
     }
 }
@@ -805,33 +827,17 @@ int RdmaEndPoint::disconnectUnlocked() {
     ready_wait_start_ts_.store(0, std::memory_order_relaxed);
 
     if (!has_connected_) {
-        // Pre-connected handshake retries are allowed to reuse this endpoint:
-        // no user WR has been posted yet. eRDMA still needs fresh QPs because
-        // a QP that reached RTS cannot be reliably reset back to RTS.
-#ifdef CONFIG_ERDMA
+        // This endpoint has not posted user WRs yet, but its handshake may
+        // already have reached the peer. The peer can cache our QP numbers and
+        // rebuild its passive endpoint around them before the active side sees
+        // a setup failure. Reusing the same local QPs after RESET would make a
+        // later retry ambiguous with that partially processed handshake, so
+        // retry with fresh QP numbers instead.
         for (size_t i = 0; i < qp_list_.size(); ++i) {
             CHECK_EQ(wr_depth_list_[i].load(std::memory_order_relaxed), 0)
                 << "Pre-connected endpoint must not have outstanding WRs";
         }
         return reconstruct();
-#else
-        ibv_qp_attr attr;
-        memset(&attr, 0, sizeof(attr));
-        attr.qp_state = IBV_QPS_RESET;
-        int ret = 0;
-        for (size_t i = 0; i < qp_list_.size(); ++i) {
-            int curr_ret = ibv_modify_qp(qp_list_[i], &attr, IBV_QP_STATE);
-            if (curr_ret) {
-                PLOG(ERROR) << "Failed to modify pre-connected QP to RESET";
-                ret = ERR_ENDPOINT;
-            }
-            CHECK_EQ(wr_depth_list_[i].load(std::memory_order_relaxed), 0)
-                << "Pre-connected endpoint must not have outstanding WRs";
-        }
-        peer_qp_num_list_.clear();
-        status_.store(UNCONNECTED, std::memory_order_release);
-        return ret;
-#endif
     }
 
     beginDestroyLocked();
@@ -983,7 +989,7 @@ int RdmaEndPoint::submitPostSend(
         context_.trackPostedSlices(slice_list, start, wr_count);
         int rc = ibv_post_send(qp_list_[qp_index], wr_list.data(), &bad_wr);
         if (rc) {
-            PLOG(ERROR) << "Failed to ibv_post_send";
+            LOG(ERROR) << "Failed to ibv_post_send: " << strerror(rc);
             const size_t first_failed =
                 bad_wr ? static_cast<size_t>(bad_wr - wr_list.data()) : 0;
             context_.untrackPostedSlices(slice_list, start + first_failed,
@@ -1118,11 +1124,11 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
     int ret = ibv_modify_qp(qp, &attr, IBV_QP_STATE);
     if (ret) {
         std::string message = "Failed to modify QP to RESET";
-        PLOG(ERROR) << "[Handshake] " << message;
-        if (reply_msg) *reply_msg = message + ": " + strerror(errno);
+        LOG(ERROR) << "[Handshake] " << message << ": " << strerror(ret);
+        if (reply_msg) *reply_msg = message + ": " + strerror(ret);
         if (failure_info) {
             failure_info->stage = SetupConnectionFailureStage::kReset;
-            failure_info->sys_errno = errno;
+            failure_info->sys_errno = ret;
         }
         return ERR_ENDPOINT;
     }
@@ -1140,11 +1146,11 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
     if (ret) {
         std::string message =
             "Failed to modify QP to INIT, check local context port num";
-        PLOG(ERROR) << "[Handshake] " << message;
-        if (reply_msg) *reply_msg = message + ": " + strerror(errno);
+        LOG(ERROR) << "[Handshake] " << message << ": " << strerror(ret);
+        if (reply_msg) *reply_msg = message + ": " + strerror(ret);
         if (failure_info) {
             failure_info->stage = SetupConnectionFailureStage::kInit;
-            failure_info->sys_errno = errno;
+            failure_info->sys_errno = ret;
         }
         return ERR_ENDPOINT;
     }
@@ -1185,11 +1191,22 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
     if (ret) {
         std::string message =
             "Failed to modify QP to RTR, check mtu, gid, peer lid, peer qp num";
-        PLOG(ERROR) << "[Handshake] " << message;
-        if (reply_msg) *reply_msg = message + ": " + strerror(errno);
+        LOG(ERROR) << "[Handshake] " << message
+                   << ": local=" << context_.nicPath()
+                   << ", peer=" << peer_nic_path_ << ", qp_index=" << qp_index
+                   << ", local_qp=" << qp->qp_num
+                   << ", peer_qp=" << peer_qp_num
+                   << ", local_gid=" << context_.gid()
+                   << ", local_gid_index=" << local_gid_index
+                   << ", peer_gid=" << gidToString(peer_gid)
+                   << ", peer_lid=" << peer_lid
+                   << ", path_mtu=" << attr.path_mtu
+                   << ", port_num=" << static_cast<int>(context_.portNum())
+                   << ": " << strerror(ret);
+        if (reply_msg) *reply_msg = message + ": " + strerror(ret);
         if (failure_info) {
             failure_info->stage = SetupConnectionFailureStage::kRtr;
-            failure_info->sys_errno = errno;
+            failure_info->sys_errno = ret;
         }
         return ERR_ENDPOINT;
     }
@@ -1208,11 +1225,11 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
                             IBV_QP_MAX_QP_RD_ATOMIC);
     if (ret) {
         std::string message = "Failed to modify QP to RTS";
-        PLOG(ERROR) << "[Handshake] " << message;
-        if (reply_msg) *reply_msg = message + ": " + strerror(errno);
+        LOG(ERROR) << "[Handshake] " << message << ": " << strerror(ret);
+        if (reply_msg) *reply_msg = message + ": " + strerror(ret);
         if (failure_info) {
             failure_info->stage = SetupConnectionFailureStage::kRts;
-            failure_info->sys_errno = errno;
+            failure_info->sys_errno = ret;
         }
         return ERR_ENDPOINT;
     }
