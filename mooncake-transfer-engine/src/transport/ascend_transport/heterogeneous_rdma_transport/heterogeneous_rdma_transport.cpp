@@ -23,7 +23,16 @@ bool isCpuMemory(void *addr) {
 HeterogeneousRdmaTransport::~HeterogeneousRdmaTransport() {
     running_ = false;
     transfer_queue_cv_.notify_one();
+    block_queue_cv_.notify_one();
     transfer_thread_.join();
+    if (int ret = aclrtSetDevice(logic_device_id_)) {
+        LOG(ERROR) << "HeterogeneousRdmaTransport: aclrtSetDevice failed in "
+                      "destructor, ret: "
+                   << ret;
+    }
+    if (stream_copy_created_) {
+        aclrtDestroyStream(stream_copy_);
+    }
     free(host_addr_);
     host_addr_ = nullptr;
     aclrtFree(dev_addr_);
@@ -37,19 +46,24 @@ void HeterogeneousRdmaTransport::transferLoop() {
     if (ret) {
         LOG(ERROR) << "HeterogeneousRdmaTransport: aclrtSetDevice error, ret: "
                    << ret;
+        return;
     }
 
+    bool stream_d2h_created = false;
     ret = aclrtCreateStream(&stream_d2h);
     if (ret) {
         LOG(ERROR)
             << "HeterogeneousRdmaTransport: aclrtCreateStream error, ret: "
             << ret;
+    } else {
+        stream_d2h_created = true;
     }
 
     while (running_) {
         auto transfer_info = getTransfer();
         const auto &task_list = transfer_info.tasks;
         if (task_list.empty()) {
+            if (!running_) break;
             LOG(ERROR)
                 << "HeterogeneousRdmaTransport: empty transfer task batch";
             continue;
@@ -96,6 +110,9 @@ void HeterogeneousRdmaTransport::transferLoop() {
                 << "HeterogeneousRdmaTransport: Rdma submitTransferTask error";
         }
         releaseBlock(transfer_info.block);  // 释放block
+    }
+    if (stream_d2h_created) {
+        aclrtDestroyStream(stream_d2h);
     }
 }
 
