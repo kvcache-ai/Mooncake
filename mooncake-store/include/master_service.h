@@ -84,12 +84,15 @@ class BatchEvictBench;
  * 2. tenant_quota_policy_mutex_
  * 3. snapshot_mutex_
  * 4. metadata_shards_[shard_idx_].mutex
- * 5. ShardedTenantQuotaTable internal shard mutex
- * 6. segment_mutex_
+ * 5. tenant_quota_recompute_mutex_
+ * 6. ShardedTenantQuotaTable internal mutex or segment_mutex_
  *
  * Strict tenant admission and policy mutation paths that need both
  * tenant_quota_policy_mutex_ and snapshot_mutex_ must acquire the tenant
  * policy mutex first, then snapshot_mutex_.
+ * tenant_quota_recompute_mutex_ serializes the capacity snapshot and the
+ * corresponding quota-table update. The segment mutex is released before
+ * entering ShardedTenantQuotaTable, so these two locks are never nested.
  */
 class MasterService {
     // Test friend class for snapshot/restore testing
@@ -1997,6 +2000,7 @@ class MasterService {
     const std::string tenant_quota_connector_uri_;
     std::unique_ptr<TenantQuotaPolicyStore> tenant_quota_policy_store_;
     mutable std::mutex tenant_quota_policy_mutex_;
+    mutable std::mutex tenant_quota_recompute_mutex_;
     ShardedTenantQuotaTable<1024> tenant_quota_table_;
 
     // HTTP metadata server pointer for cleanup on client timeout

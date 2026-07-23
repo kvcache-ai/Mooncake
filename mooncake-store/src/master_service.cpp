@@ -642,9 +642,11 @@ MasterService::DeleteTenantQuotaPolicy(const TenantId& tenant_id) {
     const uint64_t requested_quota_bytes = policy_it->second;
 
     auto restore_policy = [&] {
+        std::lock_guard<std::mutex> recompute_lock(
+            tenant_quota_recompute_mutex_);
+        const uint64_t capacity = GetTenantQuotaAllocatableCapacityBytes();
         auto result = tenant_quota_table_.UpsertTenantPolicy(
-            tenant_id, requested_quota_bytes,
-            GetTenantQuotaAllocatableCapacityBytes());
+            tenant_id, requested_quota_bytes, capacity);
         if (!result) {
             LOG(ERROR) << "failed to restore tenant quota policy tenant="
                        << tenant_id.value();
@@ -950,8 +952,9 @@ void MasterService::ApplyTenantQuotaPolicies(
          snapshot.tenant_quotas) {
         policies.emplace(TenantId(tenant_id), requested_quota_bytes);
     }
-    tenant_quota_table_.ApplyTenantPolicies(
-        policies, GetTenantQuotaAllocatableCapacityBytes());
+    std::lock_guard<std::mutex> recompute_lock(tenant_quota_recompute_mutex_);
+    const uint64_t capacity = GetTenantQuotaAllocatableCapacityBytes();
+    tenant_quota_table_.ApplyTenantPolicies(policies, capacity);
 }
 
 void MasterService::LoadTenantQuotaPoliciesFromStoreOrThrow() {
@@ -1014,8 +1017,9 @@ void MasterService::RecomputeTenantEffectiveQuotas() {
     if (!enable_multi_tenants_) {
         return;
     }
-    tenant_quota_table_.RecomputeEffectiveQuotas(
-        GetTenantQuotaAllocatableCapacityBytes());
+    std::lock_guard<std::mutex> recompute_lock(tenant_quota_recompute_mutex_);
+    const uint64_t capacity = GetTenantQuotaAllocatableCapacityBytes();
+    tenant_quota_table_.RecomputeEffectiveQuotas(capacity);
 }
 
 tl::expected<void, ErrorCode> MasterService::ReserveTenantQuota(
@@ -1157,8 +1161,9 @@ void MasterService::RebuildTenantQuotaUsageFromMetadata() {
                    "creating orphan quota state";
         }
     }
-    tenant_quota_table_.RebuildUsage(usage,
-                                     GetTenantQuotaAllocatableCapacityBytes());
+    std::lock_guard<std::mutex> recompute_lock(tenant_quota_recompute_mutex_);
+    const uint64_t capacity = GetTenantQuotaAllocatableCapacityBytes();
+    tenant_quota_table_.RebuildUsage(usage, capacity);
 }
 
 std::optional<std::string> MasterService::GetGroupRoute(

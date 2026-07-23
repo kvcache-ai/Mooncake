@@ -243,6 +243,31 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         return std::unique_lock<std::shared_mutex>(service.snapshot_mutex_);
     }
 
+    std::unique_lock<std::mutex> LockTenantQuotaRecomputeForTest(
+        MasterService& service) {
+        return std::unique_lock<std::mutex>(
+            service.tenant_quota_recompute_mutex_);
+    }
+
+    ErrorCode MountSegmentWithoutQuotaRecomputeForTest(MasterService& service,
+                                                       size_t size,
+                                                       std::string name) {
+        Segment segment;
+        segment.id = generate_uuid();
+        segment.name = std::move(name);
+        segment.base = kSegmentBase + next_segment_offset_;
+        segment.size = size;
+        segment.te_endpoint = segment.name;
+        next_segment_offset_ += size + 4096;
+
+        auto segment_access = service.segment_manager_.getSegmentAccess();
+        return segment_access.MountSegment(segment, generate_uuid());
+    }
+
+    void RecomputeTenantEffectiveQuotasForTest(MasterService& service) {
+        service.RecomputeTenantEffectiveQuotas();
+    }
+
     bool WaitForTenantQuotaPolicyMutexContention(MasterService& service) {
         for (int i = 0; i < 500; ++i) {
             if (!service.tenant_quota_policy_mutex_.try_lock()) {
@@ -806,6 +831,36 @@ TEST_F(MasterServiceTenantQuotaTest,
               100);
     EXPECT_EQ(Snapshot(service, TenantId("tenant-b")).effective_quota_bytes,
               200);
+}
+
+TEST_F(MasterServiceTenantQuotaTest,
+       CapacityIsSampledInsideQuotaRecomputeCoordination) {
+    MasterService service(MakeConfig({{TenantId("tenant-a"), 1000}}));
+    auto recompute_lock = LockTenantQuotaRecomputeForTest(service);
+    ASSERT_EQ(MountSegmentWithoutQuotaRecomputeForTest(service, /*size=*/100,
+                                                       "capacity-a"),
+              ErrorCode::OK);
+
+    std::promise<void> recompute_started;
+    auto recompute_started_future = recompute_started.get_future();
+    auto recompute = std::async(std::launch::async, [&] {
+        recompute_started.set_value();
+        RecomputeTenantEffectiveQuotasForTest(service);
+    });
+    recompute_started_future.wait();
+
+    EXPECT_EQ(recompute.wait_for(std::chrono::milliseconds(100)),
+              std::future_status::timeout);
+    const auto second_mount_result = MountSegmentWithoutQuotaRecomputeForTest(
+        service, /*size=*/50, "capacity-b");
+    recompute_lock.unlock();
+
+    ASSERT_EQ(second_mount_result, ErrorCode::OK);
+    ASSERT_EQ(recompute.wait_for(std::chrono::seconds(5)),
+              std::future_status::ready);
+    recompute.get();
+    EXPECT_EQ(Snapshot(service, TenantId("tenant-a")).effective_quota_bytes,
+              150);
 }
 
 TEST_F(MasterServiceTenantQuotaTest,
