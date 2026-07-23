@@ -161,7 +161,7 @@ class MasterServiceHATest : public ::testing::Test {
     static constexpr size_t kDefaultSegmentBase = 0x300000000;
     static constexpr size_t kDefaultSegmentSize = 1024 * 1024 * 16;
     static constexpr uint64_t kStrictTenantQuotaBytes = 4 * 1024 * 1024;
-    static constexpr const char* kDefaultTenant = "default";
+    inline static const TenantId kDefaultTenant = TenantId::Default();
 
     void SetUp() override {
         ::setenv("MOONCAKE_SNAPSHOT_LOCAL_PATH", LegacyOpLogRootDir().c_str(),
@@ -202,8 +202,8 @@ class MasterServiceHATest : public ::testing::Test {
     }
 
     MasterServiceConfig MakeStrictHAConfig(
-        const std::vector<std::string>& tenants = {kDefaultTenant,
-                                                   "tenant_a"}) {
+        const std::vector<std::string>& tenants = {
+            std::string(kDefaultTenant.value()), "tenant_a"}) {
         std::map<std::string, uint64_t> tenant_quotas;
         for (const auto& tenant : tenants) {
             tenant_quotas.emplace(tenant, kStrictTenantQuotaBytes);
@@ -353,12 +353,12 @@ class MasterServiceHATest : public ::testing::Test {
                                     size_t slice_length = 1024) const {
         ReplicateConfig config;
         config.replica_num = 1;
+        const TenantId tenant(tenant_id);
         auto put_start =
-            service.PutStart(client_id, key, tenant_id, slice_length, config);
+            service.PutStart(client_id, key, tenant, slice_length, config);
         EXPECT_TRUE(put_start.has_value());
-        EXPECT_TRUE(
-            service.PutEnd(client_id, key, tenant_id, ReplicaType::MEMORY)
-                .has_value());
+        EXPECT_TRUE(service.PutEnd(client_id, key, tenant, ReplicaType::MEMORY)
+                        .has_value());
         return key;
     }
 
@@ -371,12 +371,12 @@ class MasterServiceHATest : public ::testing::Test {
         ReplicateConfig config;
         config.replica_num = 1;
         config.preferred_segments = {segment_name};
+        const TenantId tenant(tenant_id);
         auto put_start =
-            service.PutStart(client_id, key, tenant_id, slice_length, config);
+            service.PutStart(client_id, key, tenant, slice_length, config);
         EXPECT_TRUE(put_start.has_value());
-        EXPECT_TRUE(
-            service.PutEnd(client_id, key, tenant_id, ReplicaType::MEMORY)
-                .has_value());
+        EXPECT_TRUE(service.PutEnd(client_id, key, tenant, ReplicaType::MEMORY)
+                        .has_value());
         return key;
     }
 
@@ -424,12 +424,9 @@ class MasterServiceHATest : public ::testing::Test {
     // going through the on-hit admission gate (which is currently
     // restricted to the "default" tenant). Used only by the non-default
     // tenant promotion tests.
-    static void SeedPromotionTaskForTesting(MasterService* service,
-                                            const std::string& tenant,
-                                            const std::string& key,
-                                            const UUID& holder_id,
-                                            ReplicaID alloc_id,
-                                            uint64_t object_size) {
+    static void SeedPromotionTaskForTesting(
+        MasterService* service, const TenantId& tenant, const std::string& key,
+        const UUID& holder_id, ReplicaID alloc_id, uint64_t object_size) {
         const size_t shard_idx = service->getMetadataShardIndex(tenant, key);
         auto shard_access =
             MasterService::MetadataShardAccessorRW(service, shard_idx);
@@ -454,12 +451,27 @@ class MasterServiceHATest : public ::testing::Test {
                                                        payload);
     }
 
+    static tl::expected<uint64_t, ErrorCode> AppendVisibleForTesting(
+        MasterService& service, OpType type, const TenantId& tenant_id,
+        const std::string& key, const std::string& payload) {
+        return service.AppendOpLogVisibleBeforeDurable(type, tenant_id.value(),
+                                                       key, payload);
+    }
+
     static tl::expected<OpLogEntry, ErrorCode> AppendFinalizeForTesting(
         MasterService& service, OpType type, const std::string& tenant_id,
         const std::string& key, const std::string& payload,
         MasterService::DurableFinalizeCallback callback) {
         return service.AppendOpLogWithDurableFinalize(
             type, tenant_id, key, payload, std::move(callback));
+    }
+
+    static tl::expected<OpLogEntry, ErrorCode> AppendFinalizeForTesting(
+        MasterService& service, OpType type, const TenantId& tenant_id,
+        const std::string& key, const std::string& payload,
+        MasterService::DurableFinalizeCallback callback) {
+        return service.AppendOpLogWithDurableFinalize(
+            type, tenant_id.value(), key, payload, std::move(callback));
     }
 
     static tl::expected<OrderedOpLogWriter::Reservation, ErrorCode>
@@ -477,7 +489,7 @@ class MasterServiceHATest : public ::testing::Test {
     }
 
     static size_t ReplicaCountForTesting(MasterService& service,
-                                         const std::string& tenant_id,
+                                         const TenantId& tenant_id,
                                          const std::string& key) {
         MasterService::MetadataAccessorRO accessor(
             &service, MasterService::ObjectIdentity{tenant_id, key});
@@ -485,7 +497,7 @@ class MasterServiceHATest : public ::testing::Test {
     }
 
     static std::vector<Replica::Descriptor> ReplicaDescriptorsForTesting(
-        MasterService& service, const std::string& tenant_id,
+        MasterService& service, const TenantId& tenant_id,
         const std::string& key) {
         MasterService::MetadataAccessorRO accessor(
             &service, MasterService::ObjectIdentity{tenant_id, key});
@@ -500,7 +512,7 @@ class MasterServiceHATest : public ::testing::Test {
     }
 
     static bool HasInvalidMemoryHandleForTesting(MasterService& service,
-                                                 const std::string& tenant_id,
+                                                 const TenantId& tenant_id,
                                                  const std::string& key) {
         MasterService::MetadataAccessorRO accessor(
             &service, MasterService::ObjectIdentity{tenant_id, key});
@@ -528,7 +540,7 @@ class MasterServiceHATest : public ::testing::Test {
     }
 
     static void EraseObjectForTesting(MasterService& service,
-                                      const std::string& tenant_id,
+                                      const TenantId& tenant_id,
                                       const std::string& key) {
         MasterService::MetadataAccessorRW accessor(
             &service, MasterService::ObjectIdentity{tenant_id, key});
@@ -545,7 +557,7 @@ class MasterServiceHATest : public ::testing::Test {
     }
 
     static std::vector<ReplicaID> MarkCompletedReplicasRemovedForTesting(
-        MasterService& service, const std::string& tenant_id,
+        MasterService& service, const TenantId& tenant_id,
         const std::string& key) {
         MasterService::MetadataAccessorRW accessor(
             &service, MasterService::ObjectIdentity{tenant_id, key});
@@ -1035,7 +1047,7 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesNoFBufferDescriptor) {
     metadata.size = size;
     metadata.last_sequence_id = 1;
     metadata.replicas.push_back(std::move(replica));
-    StandbyObjectEntry object{kDefaultTenant, "standby_restore_nof_key",
+    StandbyObjectEntry object{kDefaultTenant.value(), "standby_restore_nof_key",
                               std::move(metadata)};
 
     service.RestoreFromStandbySnapshot({object}, 7, {});
@@ -1383,7 +1395,7 @@ TEST_F(MasterServiceBatchRecordE2ETest,
     ReadBatchEventually(storage, 2, batch);
     ASSERT_EQ(1u, batch.entries.size());
     EXPECT_EQ(OpType::PUT_END, batch.entries[0].op_type);
-    EXPECT_EQ(kDefaultTenant, batch.entries[0].tenant_id);
+    EXPECT_EQ(kDefaultTenant.value(), batch.entries[0].tenant_id);
     EXPECT_EQ(key, batch.entries[0].object_key);
     EXPECT_EQ(2u, batch.entries[0].sequence_id);
     EXPECT_FALSE(batch.entries[0].payload.empty());
@@ -1430,7 +1442,7 @@ TEST_F(MasterServiceBatchRecordE2ETest, StandbyAppliesPrimaryBatchRecords) {
     ASSERT_EQ(ErrorCode::OK, result.error);
     EXPECT_EQ(2u, result.applied_entries);
     EXPECT_EQ(3u, applier.GetExpectedSequenceId());
-    EXPECT_TRUE(standby_metadata.Exists(kDefaultTenant, key));
+    EXPECT_TRUE(standby_metadata.Exists(kDefaultTenant.value(), key));
 }
 
 TEST_F(MasterServiceBatchRecordE2ETest, PromotionCatchesUpToDurablePrefix) {
@@ -1684,7 +1696,7 @@ TEST_F(MasterServiceBatchRecordE2ETest,
             .set_enable_multi_tenants(true)
             .set_tenant_quota_connector_type("file")
             .set_tenant_quota_connector_uri(
-                WriteTenantPolicyFile({{kDefaultTenant, 1024}}))
+                WriteTenantPolicyFile({{kDefaultTenant.value(), 1024}}))
             .build();
     MasterService service(service_config);
     ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
@@ -1738,7 +1750,7 @@ TEST_F(MasterServiceBatchRecordE2ETest,
             .set_enable_multi_tenants(true)
             .set_tenant_quota_connector_type("file")
             .set_tenant_quota_connector_uri(
-                WriteTenantPolicyFile({{kDefaultTenant, 1024}}))
+                WriteTenantPolicyFile({{kDefaultTenant.value(), 1024}}))
             .build();
     MasterService service(service_config);
     ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
@@ -1803,7 +1815,7 @@ TEST_F(MasterServiceBatchRecordE2ETest,
             .set_enable_multi_tenants(true)
             .set_tenant_quota_connector_type("file")
             .set_tenant_quota_connector_uri(
-                WriteTenantPolicyFile({{kDefaultTenant, 1024}}))
+                WriteTenantPolicyFile({{kDefaultTenant.value(), 1024}}))
             .build();
     MasterService service(service_config);
     ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
@@ -1869,7 +1881,7 @@ TEST_F(MasterServiceBatchRecordE2ETest,
             .set_enable_multi_tenants(true)
             .set_tenant_quota_connector_type("file")
             .set_tenant_quota_connector_uri(
-                WriteTenantPolicyFile({{kDefaultTenant, 1024}}))
+                WriteTenantPolicyFile({{kDefaultTenant.value(), 1024}}))
             .build();
     MasterService service(service_config);
     ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
@@ -1947,7 +1959,8 @@ TEST_F(MasterServiceBatchRecordE2ETest,
                        "batch_e2e_partial_evict_seg");
     ReadBatchEventually(storage, 2, batch);
 
-    OffloadTaskItem task{.tenant_id = kDefaultTenant, .key = key, .size = 1024};
+    OffloadTaskItem task{
+        .tenant_id = kDefaultTenant.value(), .key = key, .size = 1024};
     StorageObjectMetadata metadata;
     metadata.data_size = 1024;
     metadata.transport_endpoint = "batch_e2e_partial_evict_disk";
@@ -2071,7 +2084,7 @@ TEST_F(MasterServiceBatchRecordE2ETest,
     ReadBatchEventually(storage, 2, batch);
 
     OffloadTaskItem task{
-        .tenant_id = kDefaultTenant, .key = offload_key, .size = 1024};
+        .tenant_id = kDefaultTenant.value(), .key = offload_key, .size = 1024};
     StorageObjectMetadata metadata;
     metadata.data_size = 1024;
     metadata.transport_endpoint = "batch_e2e_offload_endpoint";
@@ -2210,7 +2223,7 @@ TEST_F(MasterServiceHATest, PutEndWritesBatchRecordOpLog) {
     ASSERT_EQ(ErrorCode::OK, read_err);
     ASSERT_EQ(1u, batch.entries.size());
     EXPECT_EQ(OpType::PUT_END, batch.entries[0].op_type);
-    EXPECT_EQ(kDefaultTenant, batch.entries[0].tenant_id);
+    EXPECT_EQ(kDefaultTenant.value(), batch.entries[0].tenant_id);
     EXPECT_EQ(key, batch.entries[0].object_key);
     EXPECT_EQ(2u, batch.entries[0].sequence_id);
 
@@ -2458,7 +2471,8 @@ TEST_F(MasterServiceHATest,
     }
     ASSERT_EQ(ErrorCode::OK, read_err);
 
-    OffloadTaskItem task{.tenant_id = kDefaultTenant, .key = key, .size = 1024};
+    OffloadTaskItem task{
+        .tenant_id = kDefaultTenant.value(), .key = key, .size = 1024};
     StorageObjectMetadata metadata;
     metadata.data_size = 1024;
     metadata.transport_endpoint = "local_disk_endpoint";
@@ -2483,7 +2497,7 @@ TEST_F(MasterServiceHATest,
     ASSERT_EQ(ErrorCode::OK, read_err);
     ASSERT_EQ(1u, batch.entries.size());
     EXPECT_EQ(OpType::PUT_END, batch.entries[0].op_type);
-    EXPECT_EQ(kDefaultTenant, batch.entries[0].tenant_id);
+    EXPECT_EQ(kDefaultTenant.value(), batch.entries[0].tenant_id);
     EXPECT_EQ(key, batch.entries[0].object_key);
     EXPECT_EQ(3u, batch.entries[0].sequence_id);
     EXPECT_FALSE(batch.entries[0].payload.empty());
@@ -2513,7 +2527,8 @@ TEST_F(MasterServiceHATest,
                        "batch_offload_visible_seg");
     ReadBatchEventually(storage, 2, batch);
 
-    OffloadTaskItem task{.tenant_id = kDefaultTenant, .key = key, .size = 1024};
+    OffloadTaskItem task{
+        .tenant_id = kDefaultTenant.value(), .key = key, .size = 1024};
     StorageObjectMetadata metadata;
     metadata.data_size = 1024;
     metadata.transport_endpoint = "local_disk_visible_endpoint";
@@ -2654,7 +2669,7 @@ TEST_F(MasterServiceHATest, NotifyPromotionSuccessWritesBatchRecordOpLog) {
     ASSERT_EQ(ErrorCode::OK, read_err);
     ASSERT_EQ(1u, batch.entries.size());
     EXPECT_EQ(OpType::PUT_END, batch.entries[0].op_type);
-    EXPECT_EQ(kDefaultTenant, batch.entries[0].tenant_id);
+    EXPECT_EQ(kDefaultTenant.value(), batch.entries[0].tenant_id);
     EXPECT_EQ(key, batch.entries[0].object_key);
     EXPECT_EQ(2u, batch.entries[0].sequence_id);
     EXPECT_FALSE(batch.entries[0].payload.empty());
@@ -2744,7 +2759,7 @@ TEST_F(MasterServiceHATest, RemoveWritesBatchRecordOpLog) {
 
     ASSERT_EQ(1u, batch.entries.size());
     EXPECT_EQ(OpType::REMOVE, batch.entries[0].op_type);
-    EXPECT_EQ(kDefaultTenant, batch.entries[0].tenant_id);
+    EXPECT_EQ(kDefaultTenant.value(), batch.entries[0].tenant_id);
     EXPECT_EQ(key, batch.entries[0].object_key);
     EXPECT_EQ(3u, batch.entries[0].sequence_id);
 }
@@ -2762,7 +2777,7 @@ TEST_F(MasterServiceHATest, RemoveHidesBeforeDurableAndReleasesAfterFinalize) {
             .set_enable_multi_tenants(true)
             .set_tenant_quota_connector_type("file")
             .set_tenant_quota_connector_uri(
-                WriteTenantPolicyFile({{kDefaultTenant, 1024}}))
+                WriteTenantPolicyFile({{kDefaultTenant.value(), 1024}}))
             .build();
     MasterService service(service_config);
     ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
@@ -2832,7 +2847,7 @@ TEST_F(MasterServiceHATest, BatchRemoveWritesBatchRecordOpLog) {
 
     ASSERT_EQ(1u, batch.entries.size());
     EXPECT_EQ(OpType::REMOVE, batch.entries[0].op_type);
-    EXPECT_EQ(kDefaultTenant, batch.entries[0].tenant_id);
+    EXPECT_EQ(kDefaultTenant.value(), batch.entries[0].tenant_id);
     EXPECT_EQ(key, batch.entries[0].object_key);
     EXPECT_EQ(3u, batch.entries[0].sequence_id);
 }
@@ -2850,7 +2865,7 @@ TEST_F(MasterServiceHATest, BatchRemoveFinalizesEachObjectAfterDurable) {
             .set_enable_multi_tenants(true)
             .set_tenant_quota_connector_type("file")
             .set_tenant_quota_connector_uri(
-                WriteTenantPolicyFile({{kDefaultTenant, 1024}}))
+                WriteTenantPolicyFile({{kDefaultTenant.value(), 1024}}))
             .build();
     MasterService service(service_config);
     ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
@@ -2921,7 +2936,7 @@ TEST_F(MasterServiceHATest, RemoveAllWritesBatchRecordOpLog) {
 
     ASSERT_EQ(1u, batch.entries.size());
     EXPECT_EQ(OpType::REMOVE, batch.entries[0].op_type);
-    EXPECT_EQ(kDefaultTenant, batch.entries[0].tenant_id);
+    EXPECT_EQ(kDefaultTenant.value(), batch.entries[0].tenant_id);
     EXPECT_EQ(key, batch.entries[0].object_key);
     EXPECT_EQ(3u, batch.entries[0].sequence_id);
 }
@@ -2939,7 +2954,7 @@ TEST_F(MasterServiceHATest, RemoveAllFinalizesAfterDurable) {
             .set_enable_multi_tenants(true)
             .set_tenant_quota_connector_type("file")
             .set_tenant_quota_connector_uri(
-                WriteTenantPolicyFile({{kDefaultTenant, 1024}}))
+                WriteTenantPolicyFile({{kDefaultTenant.value(), 1024}}))
             .build();
     MasterService service(service_config);
     ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
@@ -3010,7 +3025,7 @@ TEST_F(MasterServiceHATest, BatchReplicaClearAllWritesBatchRecordOpLog) {
 
     ASSERT_EQ(1u, batch.entries.size());
     EXPECT_EQ(OpType::REMOVE, batch.entries[0].op_type);
-    EXPECT_EQ(kDefaultTenant, batch.entries[0].tenant_id);
+    EXPECT_EQ(kDefaultTenant.value(), batch.entries[0].tenant_id);
     EXPECT_EQ(key, batch.entries[0].object_key);
     EXPECT_EQ(3u, batch.entries[0].sequence_id);
 }
@@ -3058,7 +3073,7 @@ TEST_F(MasterServiceHATest, BatchReplicaClearSegmentWritesBatchRecordOpLog) {
 
     ASSERT_EQ(1u, batch.entries.size());
     EXPECT_EQ(OpType::PUT_END, batch.entries[0].op_type);
-    EXPECT_EQ(kDefaultTenant, batch.entries[0].tenant_id);
+    EXPECT_EQ(kDefaultTenant.value(), batch.entries[0].tenant_id);
     EXPECT_EQ(key, batch.entries[0].object_key);
     EXPECT_EQ(4u, batch.entries[0].sequence_id);
     EXPECT_FALSE(batch.entries[0].payload.empty());
@@ -3077,7 +3092,7 @@ TEST_F(MasterServiceHATest, BatchReplicaClearAllReleasesAfterDurable) {
             .set_enable_multi_tenants(true)
             .set_tenant_quota_connector_type("file")
             .set_tenant_quota_connector_uri(
-                WriteTenantPolicyFile({{kDefaultTenant, 1024}}))
+                WriteTenantPolicyFile({{kDefaultTenant.value(), 1024}}))
             .build();
     MasterService service(service_config);
     ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
@@ -3133,7 +3148,7 @@ TEST_F(MasterServiceHATest, BatchReplicaClearSegmentReleasesAfterDurable) {
             .set_enable_multi_tenants(true)
             .set_tenant_quota_connector_type("file")
             .set_tenant_quota_connector_uri(
-                WriteTenantPolicyFile({{kDefaultTenant, 2048}}))
+                WriteTenantPolicyFile({{kDefaultTenant.value(), 2048}}))
             .build();
     MasterService service(service_config);
     ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
@@ -3228,7 +3243,7 @@ TEST_F(MasterServiceHATest, BatchEvictWritesBatchRecordOpLog) {
 
     ASSERT_EQ(1u, batch.entries.size());
     EXPECT_EQ(OpType::REMOVE, batch.entries[0].op_type);
-    EXPECT_EQ(kDefaultTenant, batch.entries[0].tenant_id);
+    EXPECT_EQ(kDefaultTenant.value(), batch.entries[0].tenant_id);
     EXPECT_EQ(key, batch.entries[0].object_key);
     EXPECT_EQ(3u, batch.entries[0].sequence_id);
 }
@@ -3246,7 +3261,7 @@ TEST_F(MasterServiceHATest, BatchEvictReleasesMemoryAfterDurable) {
             .set_enable_multi_tenants(true)
             .set_tenant_quota_connector_type("file")
             .set_tenant_quota_connector_uri(
-                WriteTenantPolicyFile({{kDefaultTenant, 1024}}))
+                WriteTenantPolicyFile({{kDefaultTenant.value(), 1024}}))
             .build();
     MasterService service(service_config);
     ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
@@ -3326,7 +3341,7 @@ TEST_F(MasterServiceHATest, EvictDiskReplicaWritesBatchRecordOpLog) {
 
     ASSERT_EQ(1u, batch.entries.size());
     EXPECT_EQ(OpType::PUT_END, batch.entries[0].op_type);
-    EXPECT_EQ(kDefaultTenant, batch.entries[0].tenant_id);
+    EXPECT_EQ(kDefaultTenant.value(), batch.entries[0].tenant_id);
     EXPECT_EQ(key, batch.entries[0].object_key);
     EXPECT_EQ(4u, batch.entries[0].sequence_id);
     EXPECT_FALSE(batch.entries[0].payload.empty());
@@ -3430,7 +3445,7 @@ TEST_F(MasterServiceHATest, NoFBatchEvictWritesBatchRecordOpLog) {
 
     ASSERT_EQ(1u, batch.entries.size());
     EXPECT_EQ(OpType::REMOVE, batch.entries[0].op_type);
-    EXPECT_EQ(kDefaultTenant, batch.entries[0].tenant_id);
+    EXPECT_EQ(kDefaultTenant.value(), batch.entries[0].tenant_id);
     EXPECT_EQ(key, batch.entries[0].object_key);
     EXPECT_EQ(2u, batch.entries[0].sequence_id);
 }
@@ -3532,7 +3547,7 @@ TEST_F(MasterServiceHATest, PutStartExpiredOverwriteWritesBatchRecordOpLog) {
 
     ASSERT_EQ(1u, batch.entries.size());
     EXPECT_EQ(OpType::REMOVE, batch.entries[0].op_type);
-    EXPECT_EQ(kDefaultTenant, batch.entries[0].tenant_id);
+    EXPECT_EQ(kDefaultTenant.value(), batch.entries[0].tenant_id);
     EXPECT_EQ(key, batch.entries[0].object_key);
     EXPECT_EQ(2u, batch.entries[0].sequence_id);
 }
@@ -3581,7 +3596,7 @@ TEST_F(MasterServiceHATest,
 
     ASSERT_EQ(1u, batch.entries.size());
     EXPECT_EQ(OpType::PUT_END, batch.entries[0].op_type);
-    EXPECT_EQ(kDefaultTenant, batch.entries[0].tenant_id);
+    EXPECT_EQ(kDefaultTenant.value(), batch.entries[0].tenant_id);
     EXPECT_EQ(key, batch.entries[0].object_key);
     EXPECT_EQ(3u, batch.entries[0].sequence_id);
     EXPECT_FALSE(batch.entries[0].payload.empty());
@@ -3631,7 +3646,7 @@ TEST_F(MasterServiceHATest,
 
     ASSERT_EQ(1u, batch.entries.size());
     EXPECT_EQ(OpType::PUT_END, batch.entries[0].op_type);
-    EXPECT_EQ(kDefaultTenant, batch.entries[0].tenant_id);
+    EXPECT_EQ(kDefaultTenant.value(), batch.entries[0].tenant_id);
     EXPECT_EQ(key, batch.entries[0].object_key);
     EXPECT_EQ(4u, batch.entries[0].sequence_id);
     EXPECT_FALSE(batch.entries[0].payload.empty());

@@ -87,7 +87,7 @@ bool ValidateOpLogBatchEntry(const OpLogEntry& entry, std::string* reason) {
         SetReason(reason, "op_type is outside the valid enum range");
         return false;
     }
-    if (!IsValidTenantId(entry.tenant_id)) {
+    if (!TenantId(entry.tenant_id).IsValid()) {
         SetReason(reason, "tenant_id is empty or invalid");
         return false;
     }

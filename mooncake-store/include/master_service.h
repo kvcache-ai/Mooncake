@@ -2322,8 +2322,9 @@ class MasterService {
      */
     tl::expected<void, ErrorCode> PersistRemoveForHA(const char* why,
                                                      const std::string& key);
-    tl::expected<void, ErrorCode> PersistRemoveForHA(
-        const char* why, const TenantId& tenant_id, const std::string& key);
+    tl::expected<void, ErrorCode> PersistRemoveForHA(const char* why,
+                                                     const TenantId& tenant_id,
+                                                     const std::string& key);
 
     /**
      * Build replica descriptors after removing replicas matching pred_fn.

@@ -2060,10 +2060,11 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
 void MasterService::FinalizeMetadataEraseAfterDurable(
     const OpLogEntry& durable_entry, QuotaEraseMode quota_mode) {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    const size_t shard_idx = getMetadataShardIndex(durable_entry.tenant_id,
-                                                   durable_entry.object_key);
+    const TenantId tenant_id(durable_entry.tenant_id);
+    const size_t shard_idx =
+        getMetadataShardIndex(tenant_id, durable_entry.object_key);
     MetadataShardAccessorRW shard(this, shard_idx);
-    auto tenant_it = shard->tenants.find(durable_entry.tenant_id);
+    auto tenant_it = shard->tenants.find(tenant_id);
     if (tenant_it == shard->tenants.end()) {
         return;
     }
@@ -2072,8 +2073,7 @@ void MasterService::FinalizeMetadataEraseAfterDurable(
     if (metadata_it == tenant_state.metadata.end()) {
         return;
     }
-    EraseMetadata(tenant_state, metadata_it, durable_entry.tenant_id,
-                  quota_mode, &shard);
+    EraseMetadata(tenant_state, metadata_it, tenant_id, quota_mode, &shard);
     if (tenant_state.Empty()) {
         shard->tenants.erase(tenant_it);
     }
@@ -2084,9 +2084,8 @@ void MasterService::FinalizeExpiredProcessingReplicasAfterDurable(
     const std::chrono::system_clock::time_point& ttl) {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const TenantId tenant_id(durable_entry.tenant_id);
-    MetadataAccessorRW accessor(
-        this, MakeObjectIdentityForRequest(durable_entry.object_key,
-                                           tenant_id));
+    MetadataAccessorRW accessor(this, MakeObjectIdentityForRequest(
+                                          durable_entry.object_key, tenant_id));
     if (!accessor.Exists()) {
         return;
     }
@@ -2115,9 +2114,8 @@ void MasterService::FinalizeExpiredReplicationTaskAfterDurable(
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const TenantId tenant_id(durable_entry.tenant_id);
-    MetadataAccessorRW accessor(
-        this, MakeObjectIdentityForRequest(durable_entry.object_key,
-                                           tenant_id));
+    MetadataAccessorRW accessor(this, MakeObjectIdentityForRequest(
+                                          durable_entry.object_key, tenant_id));
     if (!accessor.Exists()) {
         return;
     }
@@ -2171,9 +2169,8 @@ MasterService::BuildStaleHandleCleanupPlan(
 }
 
 tl::expected<void, ErrorCode> MasterService::PersistStaleHandleCleanupForHA(
-    const std::string& why, const TenantId& tenant_id,
-    const std::string& key, ObjectMetadata& metadata,
-    const StaleHandleCleanupPlan& plan) {
+    const std::string& why, const TenantId& tenant_id, const std::string& key,
+    ObjectMetadata& metadata, const StaleHandleCleanupPlan& plan) {
     if (plan.removed_ids.empty() || !enable_oplog_) {
         return {};
     }
@@ -2197,7 +2194,8 @@ tl::expected<void, ErrorCode> MasterService::PersistStaleHandleCleanupForHA(
         [&ids](const Replica& replica) { return ids.contains(replica.id()); },
         [](Replica& replica) { replica.mark_removed(); });
     auto result = AppendReservedOpLogWithDurableFinalize(
-        std::move(reservation.value()), op_type, tenant_id.value(), key, payload,
+        std::move(reservation.value()), op_type, tenant_id.value(), key,
+        payload,
         [this,
          removed_ids = plan.removed_ids](const OpLogEntry& durable_entry) {
             FinalizeRemovedReplicasAfterDurable(durable_entry, removed_ids,
@@ -2872,8 +2870,7 @@ void MasterService::RestoreFromStandbySnapshot(
 
     // 3. Restore object metadata.
     const auto resolve_standby_object = [](const StandbyObjectEntry& entry) {
-        auto [scoped_tenant_id, user_key] =
-            TenantId::ParseScopedKey(entry.key);
+        auto [scoped_tenant_id, user_key] = TenantId::ParseScopedKey(entry.key);
         TenantId tenant_id(entry.tenant_id);
         if (tenant_id.IsDefault() && !scoped_tenant_id.IsDefault()) {
             tenant_id = std::move(scoped_tenant_id);
@@ -3047,7 +3044,8 @@ auto MasterService::BatchReplicaClear(
     if (!requested_tenant.IsValid()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    const TenantId& normalized_tenant = ResolveRequestTenantId(requested_tenant);
+    const TenantId& normalized_tenant =
+        ResolveRequestTenantId(requested_tenant);
 
     for (const auto& key : object_keys) {
         if (key.empty()) {
@@ -8960,19 +8958,16 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                                             QuotaEraseMode::kFull);
                                     });
                         } else {
-                            persist_result =
-                                AppendReservedOpLogWithDurableFinalize(
-                                    std::move(reservation.value()),
-                                    OpType::PUT_END, tenant_it->first.value(),
-                                    it->first,
-                                    SerializeMetadataForOpLogFromReplicaDescriptors(
-                                        metadata.client_id, metadata.size,
-                                        remaining, metadata.group_id,
-                                        metadata.data_type),
-                                    [this,
-                                     removed_ids = std::move(removed_ids)](
-                                        const OpLogEntry& durable_entry) {
-                                        FinalizeRemovedReplicasAfterDurable(
+                            persist_result = AppendReservedOpLogWithDurableFinalize(
+                                std::move(reservation.value()), OpType::PUT_END,
+                                tenant_it->first.value(), it->first,
+                                SerializeMetadataForOpLogFromReplicaDescriptors(
+                                    metadata.client_id, metadata.size,
+                                    remaining, metadata.group_id,
+                                    metadata.data_type),
+                                [this, removed_ids = std::move(removed_ids)](
+                                    const OpLogEntry& durable_entry) {
+                                    FinalizeRemovedReplicasAfterDurable(
                                         durable_entry, removed_ids,
                                         QuotaEraseMode::kFull);
                                 });
@@ -8996,8 +8991,8 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                     tl::expected<OpLogEntry, ErrorCode> persist_result;
                     if (remaining.empty()) {
                         persist_result = AppendOpLogWithDurableFinalize(
-                            OpType::REMOVE, tenant_it->first.value(),
-                            it->first, {}, nullptr);
+                            OpType::REMOVE, tenant_it->first.value(), it->first,
+                            {}, nullptr);
                     } else {
                         persist_result = AppendOpLogWithDurableFinalize(
                             OpType::PUT_END, tenant_it->first.value(),
@@ -11087,9 +11082,10 @@ MasterService::AppendOpLogVisibleBeforeDurable(OpType type,
         return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
-    const std::string resolved_tenant =
-        enable_multi_tenants_ ? tenant_id : std::string("default");
-    if (!IsValidTenantId(resolved_tenant)) {
+    const TenantId resolved_tenant(enable_multi_tenants_
+                                       ? tenant_id
+                                       : std::string(TenantId::kDefaultValue));
+    if (!resolved_tenant.IsValid()) {
         return tl::unexpected(ErrorCode::TENANT_NOT_REGISTERED);
     }
 
@@ -11099,7 +11095,7 @@ MasterService::AppendOpLogVisibleBeforeDurable(OpType type,
     }
     OpLogEntry entry;
     entry.op_type = type;
-    entry.tenant_id = resolved_tenant;
+    entry.tenant_id = resolved_tenant.value();
     entry.object_key = key;
     entry.payload = payload;
     auto pending = ordered_oplog_writer_->Commit(std::move(reservation.value()),
@@ -11146,14 +11142,15 @@ MasterService::AppendReservedOpLogWithDurableFinalize(
     if (!enable_oplog_) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    const std::string resolved_tenant =
-        enable_multi_tenants_ ? tenant_id : std::string("default");
-    if (!IsValidTenantId(resolved_tenant)) {
+    const TenantId resolved_tenant(enable_multi_tenants_
+                                       ? tenant_id
+                                       : std::string(TenantId::kDefaultValue));
+    if (!resolved_tenant.IsValid()) {
         return tl::unexpected(ErrorCode::TENANT_NOT_REGISTERED);
     }
     OpLogEntry entry;
     entry.op_type = type;
-    entry.tenant_id = resolved_tenant;
+    entry.tenant_id = resolved_tenant.value();
     entry.object_key = key;
     entry.payload = payload;
     auto pending = ordered_oplog_writer_->Commit(std::move(reservation), entry,
@@ -11182,18 +11179,19 @@ tl::expected<void, ErrorCode> MasterService::PersistRemoveForHA(
     return {};
 }
 
-void MasterService::PersistSegmentOpForHAOrEnqueue(
-    const char* why, OpType type, const std::string& key,
-    const std::string& payload) {
+void MasterService::PersistSegmentOpForHAOrEnqueue(const char* why, OpType type,
+                                                   const std::string& key,
+                                                   const std::string& payload) {
     PersistSegmentOpForHAOrEnqueue(why, type, TenantId::Default(), key,
                                    payload);
 }
 
-void MasterService::PersistSegmentOpForHAOrEnqueue(
-    const char* why, OpType type, const TenantId& tenant_id,
-    const std::string& key, const std::string& payload) {
-    auto result = AppendOpLogVisibleBeforeDurable(type, tenant_id.value(), key,
-                                                  payload);
+void MasterService::PersistSegmentOpForHAOrEnqueue(const char* why, OpType type,
+                                                   const TenantId& tenant_id,
+                                                   const std::string& key,
+                                                   const std::string& payload) {
+    auto result =
+        AppendOpLogVisibleBeforeDurable(type, tenant_id.value(), key, payload);
     if (!result) {
         LOG(WARNING) << why << ": segment OpLog queue failed for key=" << key
                      << ", type=" << static_cast<int>(type)
