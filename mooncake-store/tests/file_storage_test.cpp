@@ -10,6 +10,7 @@
 #include "client_metric.h"
 #include "file_storage.h"
 #include "storage_backend.h"
+#include "tenant_id.h"
 #include "test_server_helpers.h"
 #include "utils/common.h"
 
@@ -509,8 +510,8 @@ TEST_F(FileStorageTest, NotifyEvictedDiskReplicasUsesTenantScopedKeys) {
     }
 
     auto notify_result = FileStorageNotifyEvictedDiskReplicas(
-        file_storage, {MakeTenantScopedStorageKey("tenant_a", key),
-                       MakeTenantScopedStorageKey("tenant_b", key)});
+        file_storage, {TenantId("tenant_a").MakeScopedKey(key),
+                       TenantId("tenant_b").MakeScopedKey(key)});
     ASSERT_TRUE(notify_result.has_value());
 
     for (const auto& task : tasks) {
