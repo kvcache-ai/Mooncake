@@ -90,10 +90,11 @@ DEFINE_string(operation, "read", "Operation type: read or write");
 
 DEFINE_string(protocol, "rdma",
               "Transfer protocol: "
-              "rdma|barex|tcp|efa|nvlink|nvlink_intra|hip|sunrise_link");
+              "rdma|barex|tcp|efa|ub|nvlink|nvlink_intra|hip|ubshmem|"
+              "sunrise_link");
 
 DEFINE_string(device_name, "mlx5_2",
-              "Device name to use, valid if protocol=rdma");
+              "Device name to use, valid if protocol=rdma|ub");
 DEFINE_string(nic_priority_matrix, "",
               "Path to RDMA NIC priority matrix file (Advanced)");
 
@@ -672,6 +673,17 @@ std::shared_ptr<mooncake::tent::Config> createTentConfig() {
     config->set("metadata_servers", metadata_servers);
     config->set("local_segment_name", FLAGS_local_server_name);
     config->set("verbose", true);
+
+    // Propagate --device_name to the UB/RDMA transport so that
+    // UbTentTransport::install() can filter which device to use
+    // (important for bonded-device setups like bonding_dev_0).
+    if (!FLAGS_device_name.empty()) {
+        if (FLAGS_protocol == "rdma") {
+            config->set("transports/rdma/device_name", FLAGS_device_name);
+        } else if (FLAGS_protocol == "ub") {
+            config->set("transports/ub/device_name", FLAGS_device_name);
+        }
+    }
 
     return config;
 }

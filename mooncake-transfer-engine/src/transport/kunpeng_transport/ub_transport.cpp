@@ -86,15 +86,49 @@ int UbTransport::registerLocalMemory(void* addr, size_t length,
                                      bool update_metadata) {
     (void)remote_accessible;
     BufferDesc buffer_desc;
-    for (auto& context : context_list_) {
-        int ret = context->registerMemoryRegion((uint64_t)addr, length);
+    if (context_list_.empty()) {
+        LOG(ERROR) << "UbTransport: no available context to register memory";
+        return ERR_DEVICE_NOT_FOUND;
+    }
+
+    // URMA registers host memory into a host-global ubva space, so a given host
+    // virtual address may be registered with the driver exactly once per host
+    // (re-registering the same VA on another context is rejected by the driver
+    // as a duplicate, e.g. "registered twice within 500ms").  Register the
+    // buffer on the primary context, then share the resulting segment with the
+    // remaining contexts so every device's data path still has a valid local
+    // segment handle for this buffer.
+    int ret = context_list_[0]->registerMemoryRegion((uint64_t)addr, length);
+    if (ret) {
+        LOG(ERROR) << "UbTransport: cannot register LocalMemory on primary "
+                      "context";
+        return ret;
+    }
+    void* shared_seg = context_list_[0]->lastRegisteredSeg();
+    if (!shared_seg) {
+        LOG(ERROR) << "UbTransport: primary context returned null segment";
+        context_list_[0]->unregisterMemoryRegion((uint64_t)addr);
+        return ERR_CONTEXT;
+    }
+
+    for (size_t i = 1; i < context_list_.size(); ++i) {
+        ret =
+            context_list_[i]->adoptLocalSeg((uint64_t)addr, length, shared_seg);
         if (ret) {
-            LOG(ERROR) << "UbTransport: cannot register LocalMemory";
+            LOG(ERROR) << "UbTransport: cannot share segment to context " << i;
+            for (size_t j = 0; j < i; ++j)
+                context_list_[j]->unregisterMemoryRegion((uint64_t)addr);
             return ret;
         }
-        ret = context->buildLocalBufferDesc((uint64_t)addr, buffer_desc);
+    }
+
+    for (size_t i = 0; i < context_list_.size(); ++i) {
+        ret =
+            context_list_[i]->buildLocalBufferDesc((uint64_t)addr, buffer_desc);
         if (ret) {
             LOG(ERROR) << "UbTransport: build buffer description failed";
+            for (size_t j = 0; j < context_list_.size(); ++j)
+                context_list_[j]->unregisterMemoryRegion((uint64_t)addr);
             return ret;
         }
     }
@@ -211,19 +245,29 @@ Status UbTransport::submitTransfer(
 
 Status UbTransport::submitTransferTask(
     const std::vector<TransferTask*>& task_list) {
-    std::unordered_map<std::shared_ptr<UbContext>, std::vector<Slice*>>
-        slices_to_post;
     auto local_segment_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     const size_t kBlockSize = globalConfig().slice_size;
     const int kMaxRetryCount = globalConfig().retry_cnt;
     const size_t kFragmentSize = globalConfig().fragment_limit;
     const size_t kSubmitWatermark =
         globalConfig().max_wr * globalConfig().num_qp_per_ep;
-    uint64_t nr_slices;
-    for (size_t index = 0; index < task_list.size(); ++index) {
-        assert(task_list[index]);
-        auto& task = *task_list[index];
-        nr_slices = 0;
+
+    struct PlannedSlice {
+        TransferTask* task;
+        std::shared_ptr<UbContext> context;
+        uint64_t offset;
+        size_t length;
+        int buffer_id;
+        int device_id;
+    };
+    std::vector<PlannedSlice> plan;
+
+    // Validate and route the complete submission before mutating TransferTask
+    // state or posting any work. This guarantees that a non-OK return has no
+    // partial submission for the caller to roll back.
+    for (auto* task_ptr : task_list) {
+        assert(task_ptr);
+        auto& task = *task_ptr;
         assert(task.request);
         auto& request = *task.request;
         auto request_buffer_id = -1, request_device_id = -1;
@@ -237,27 +281,11 @@ Status UbTransport::submitTransferTask(
 
         for (uint64_t offset = 0; offset < request.length;
              offset += kBlockSize) {
-            Slice* slice = getSliceCache().allocate();
-            assert(slice);
-            if (!slice->from_cache) {
-                nr_slices++;
-            }
             bool merge_final_slice =
                 request.length - offset <= kBlockSize + kFragmentSize;
-            slice->source_addr = (char*)request.source + offset;
-            slice->length =
+            auto* source_addr = static_cast<char*>(request.source) + offset;
+            size_t slice_length =
                 merge_final_slice ? request.length - offset : kBlockSize;
-            slice->opcode = request.opcode;
-            // LOG(INFO) << "target_offset : " << request.target_offset << ",
-            // offset : " << offset;
-            slice->ub.dest_addr = request.target_offset + offset;
-            slice->ub.retry_cnt = 0;
-            slice->ub.max_retry_cnt = kMaxRetryCount;
-            slice->task = &task;
-            slice->target_id = request.target_id;
-            slice->ts = 0;
-            slice->status = Slice::PENDING;
-            task.slice_list.push_back(slice);
 
             int buffer_id = -1, device_id = -1,
                 retry_cnt = request.advise_retry_cnt;
@@ -269,8 +297,9 @@ Status UbTransport::submitTransferTask(
             }
             while (retry_cnt < kMaxRetryCount && !found_device) {
                 if (selectDevice(local_segment_desc.get(),
-                                 (uint64_t)slice->source_addr, slice->length,
-                                 buffer_id, device_id, retry_cnt++))
+                                 reinterpret_cast<uint64_t>(source_addr),
+                                 slice_length, buffer_id, device_id,
+                                 retry_cnt++))
                     continue;
                 assert(device_id >= 0 &&
                        static_cast<size_t>(device_id) < context_list_.size());
@@ -285,10 +314,7 @@ Status UbTransport::submitTransferTask(
                 found_device = true;
                 break;
             }
-            if (device_id < 0) {
-                auto source_addr = slice->source_addr;
-                for (auto& entry : slices_to_post)
-                    for (auto s : entry.second) getSliceCache().deallocate(s);
+            if (!found_device || device_id < 0) {
                 LOG(ERROR)
                     << "UbTransport: Address not registered by any device(s) "
                     << source_addr;
@@ -304,22 +330,54 @@ Status UbTransport::submitTransferTask(
                 return Status::InvalidArgument(
                     "Device " + std::to_string(device_id) + " is not active");
             }
-            auto local_tseg_index =
-                local_segment_desc->buffers[buffer_id].l_seg_index[device_id];
-            slice->ub.l_seg = context->localSegWithIndex(local_tseg_index);
-            slices_to_post[context].push_back(slice);
-            task.total_bytes += slice->length;
-            __sync_fetch_and_add(&task.slice_count, 1);
-            if (nr_slices >= kSubmitWatermark) {
-                for (auto& entry : slices_to_post)
-                    entry.first->submitPostSend(entry.second);
-                slices_to_post.clear();
-                nr_slices = 0;
-            }
 
-            if (merge_final_slice) {
-                break;
-            }
+            plan.push_back(
+                {&task, context, offset, slice_length, buffer_id, device_id});
+
+            if (merge_final_slice) break;
+        }
+    }
+
+    std::unordered_map<std::shared_ptr<UbContext>, std::vector<Slice*>>
+        slices_to_post;
+    TransferTask* current_task = nullptr;
+    uint64_t nr_slices = 0;
+    for (const auto& planned : plan) {
+        auto& task = *planned.task;
+        auto& request = *task.request;
+        if (current_task != &task) {
+            current_task = &task;
+            nr_slices = 0;
+        }
+
+        Slice* slice = getSliceCache().allocate();
+        assert(slice);
+        if (!slice->from_cache) ++nr_slices;
+        slice->source_addr =
+            static_cast<char*>(request.source) + planned.offset;
+        slice->length = planned.length;
+        slice->opcode = request.opcode;
+        slice->ub.dest_addr = request.target_offset + planned.offset;
+        slice->ub.retry_cnt = 0;
+        slice->ub.max_retry_cnt = kMaxRetryCount;
+        slice->task = &task;
+        slice->target_id = request.target_id;
+        slice->ts = 0;
+        slice->status = Slice::PENDING;
+        task.slice_list.push_back(slice);
+
+        auto& context = planned.context;
+        auto local_tseg_index = local_segment_desc->buffers[planned.buffer_id]
+                                    .l_seg_index[planned.device_id];
+        slice->ub.l_seg = context->localSegWithIndex(local_tseg_index);
+        slices_to_post[context].push_back(slice);
+        task.total_bytes += slice->length;
+        __sync_fetch_and_add(&task.slice_count, 1);
+        if (nr_slices >= kSubmitWatermark) {
+            for (auto& entry : slices_to_post)
+                entry.first->submitPostSend(entry.second);
+            slices_to_post.clear();
+            nr_slices = 0;
         }
     }
     for (auto& entry : slices_to_post)

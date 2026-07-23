@@ -39,6 +39,7 @@ static const std::unordered_map<std::string, TransportType> kTransportNameMap =
         {"ascend", AscendDirect},
         {"sunrise_link", SUNRISE_LINK},
         {"tpu", TPU},
+        {"ub", UB},
 };
 
 static const std::unordered_map<TransportType, std::string>
@@ -54,6 +55,7 @@ static const std::unordered_map<TransportType, std::string>
         {AscendDirect, "ascend"},
         {SUNRISE_LINK, "sunrise_link"},
         {TPU, "tpu"},
+        {UB, "ub"},
 };
 
 // Memory type name mapping for pattern matching

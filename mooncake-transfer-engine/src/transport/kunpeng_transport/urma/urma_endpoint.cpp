@@ -35,13 +35,22 @@ UrmaContext::UrmaContext(UbTransport& engine, std::string device_name,
       next_jfr_list_index_(0) {}
 
 UrmaContext::~UrmaContext() {
+    // toString() calls getAsyncFd() which dereferences urma_context_.
+    // getAsyncFd() must tolerate nullptr before we call it here.
     auto thisString = toString();
+
+    // worker_pool_ is a shared_ptr; reset on null is safe.
     worker_pool_.reset();
     LOG(INFO) << "destroy worker pool done.";
+
+    // endpoint_store_ may be null if construction failed before doConstruct().
     if (endpoint_store_) {
         endpoint_store_->destroy();
+        LOG(INFO) << "destroy endpoint store done.";
+    } else {
+        LOG(INFO) << "endpoint store is null, skip destroy.";
     }
-    LOG(INFO) << "destroy endpoint store done.";
+
     if (urma_context_) deconstruct();
     LOG(WARNING) << "finished destroy context : " << thisString;
 }
@@ -54,7 +63,10 @@ std::string UrmaContext::toString() {
     return ss.str();
 }
 
-int UrmaContext::getAsyncFd() { return urma_context_->async_fd; }
+int UrmaContext::getAsyncFd() {
+    if (urma_context_ == nullptr) return -1;
+    return urma_context_->async_fd;
+}
 
 int UrmaContext::submitPostSend(
     const std::vector<Transport::Slice*>& slice_list) {
@@ -158,12 +170,29 @@ int UrmaContext::construct(GlobalConfig& config) {
 
 int UrmaContext::deconstruct() {
     for (auto& entry : seg_region_list_) {
-        int ret = urma_unregister_seg(entry.first);
+        urma_target_seg_t* seg_ptr = entry.first;
+        // Release the application-side reference in local_tseg_list_ BEFORE
+        // calling urma_unregister_seg.  URMA uses reference counting: if the
+        // app still holds the pointer, the count stays > 0 and the VA range
+        // is not freed.  A subsequent urma_register_seg for the same VA would
+        // then fail with "duplicate".
+        for (auto& tseg : local_tseg_list_) {
+            if (tseg == seg_ptr) {
+                tseg = nullptr;
+                break;
+            }
+        }
+        // Only unregister segments this context actually registered with the
+        // driver; adopted (shared) segments are owned by another context.
+        if (owned_segs_.find(seg_ptr) == owned_segs_.end()) continue;
+        int ret = urma_unregister_seg(seg_ptr);
         if (ret) {
             PLOG(ERROR) << "Failed to unregister segment";
         }
     }
     seg_region_list_.clear();
+    local_tseg_list_.clear();
+    owned_segs_.clear();
 
     for (auto& seg : imported_seg_list_) {
         int ret = urma_unimport_seg(seg);
@@ -231,7 +260,11 @@ int UrmaContext::deconstruct() {
         urma_context_ = nullptr;
     }
 
-    urma_uninit();
+    // urma_uninit() is a global teardown and must only be called once via
+    // the static UrmaContext::uninit() (invoked by UbTransport::uninit()).
+    // Calling it here per-context would tear down the URMA runtime while
+    // other UrmaContext objects are still alive, causing the second and
+    // subsequent contexts to fail on urma_delete_context().
     return 0;
 }
 
@@ -266,6 +299,21 @@ int UrmaContext::registerMemoryRegion(uint64_t va, size_t length) {
                       << "shrink it to " << globalConfig().max_seg_size;
         length = (size_t)globalConfig().max_seg_size;
     }
+
+    // urma_register_seg on Kunpeng hardware requires a page-aligned start
+    // address.  Round down to the page boundary and extend the length to cover
+    // the original range, then round the length up to the next page boundary.
+    static const uint64_t kPageMask = ~(uint64_t)(4096 - 1);
+    uint64_t aligned_va = va & kPageMask;
+    if (aligned_va != va) {
+        LOG(WARNING) << "registerMemoryRegion: va " << va
+                     << " is not page-aligned, rounding down to " << aligned_va;
+        length += (va - aligned_va);
+        va = aligned_va;
+    }
+    // Round length up to a multiple of the page size.
+    length = (length + 4095) & (size_t)kPageMask;
+
     LOG(INFO) << "Register memory region " << va << " length " << length;
     urma_reg_seg_flag_t flag = {};
     flag.bs.token_policy = URMA_TOKEN_NONE;
@@ -290,9 +338,42 @@ int UrmaContext::registerMemoryRegion(uint64_t va, size_t length) {
     }
     LOG(INFO) << "Local seg token id : " << seg->seg.token_id;
     local_tseg_list_.push_back(seg);
+    owned_segs_.insert(seg);
 
     RWSpinlock::WriteGuard guard(seg_region_lock_);
     seg_region_list_.emplace_back(seg, length);
+    return 0;
+}
+
+void* UrmaContext::lastRegisteredSeg() {
+    for (auto iter = local_tseg_list_.rbegin(); iter != local_tseg_list_.rend();
+         ++iter) {
+        if (*iter) return *iter;
+    }
+    return nullptr;
+}
+
+int UrmaContext::adoptLocalSeg(uint64_t va, size_t length, void* seg) {
+    // URMA registers memory into a host-global ubva space: a given host VA can
+    // only be registered with the driver once (re-registering the same VA is
+    // rejected as a duplicate).  When the transport spans multiple devices we
+    // register the buffer on the primary context and reference the resulting
+    // segment here instead of calling urma_register_seg again.  This segment is
+    // NOT inserted into owned_segs_, so it will not be passed to
+    // urma_unregister_seg by this context.
+    (void)va;
+    (void)length;
+    auto* tseg = static_cast<urma_target_seg_t*>(seg);
+    if (!tseg) {
+        LOG(ERROR) << "adoptLocalSeg: null segment for va " << va;
+        return ERR_CONTEXT;
+    }
+    local_tseg_list_.push_back(tseg);
+
+    RWSpinlock::WriteGuard guard(seg_region_lock_);
+    // Use the segment's registered (page-aligned) range so seg() lookups by the
+    // original, possibly unaligned, address still match.
+    seg_region_list_.emplace_back(tseg, tseg->seg.len);
     return 0;
 }
 
@@ -305,12 +386,32 @@ int UrmaContext::unregisterMemoryRegion(uint64_t addr) {
              iter != seg_region_list_.end(); ++iter) {
             if ((*iter).first->seg.ubva.va <= addr &&
                 addr < (*iter).first->seg.ubva.va + (*iter).second) {
-                if (urma_unregister_seg((*iter).first)) {
-                    LOG(ERROR) << "Failed to unregister memory "
-                               << (*iter).first->seg.ubva.va;
-                    return ERR_CONTEXT;
+                urma_target_seg_t* seg_ptr = (*iter).first;
+                uint64_t seg_va = seg_ptr->seg.ubva.va;
+
+                // l_seg_index is published in BufferDesc and remains valid for
+                // the lifetime of the context. Keep this slot as a tombstone;
+                // erasing it would shift indices for other registered buffers.
+                for (auto& tseg : local_tseg_list_) {
+                    if (tseg == seg_ptr) {
+                        tseg = nullptr;
+                        break;
+                    }
                 }
+
                 seg_region_list_.erase(iter);
+
+                // Only the context that actually registered the segment with
+                // the URMA driver may unregister it.  Adopted (shared) segments
+                // belonging to another context are simply dereferenced here.
+                auto owned_it = owned_segs_.find(seg_ptr);
+                if (owned_it != owned_segs_.end()) {
+                    owned_segs_.erase(owned_it);
+                    if (urma_unregister_seg(seg_ptr)) {
+                        LOG(ERROR) << "Failed to unregister memory " << seg_va;
+                        return ERR_CONTEXT;
+                    }
+                }
                 has_removed = true;
                 break;
             }
@@ -747,6 +848,7 @@ int UrmaEndpoint::setupConnectionsByActive() {
     local_desc.local_nic_path = context_->nicPath();
     local_desc.peer_nic_path = peer_nic_path_;
     local_desc.jetty_num = JettyNum();
+    local_desc.local_eid = context_->getEid();
 
     auto peer_server_name = getServerNameFromNicPath(peer_nic_path_);
     auto peer_nic_name = getNicNameFromNicPath(peer_nic_path_);
@@ -772,6 +874,10 @@ int UrmaEndpoint::setupConnectionsByActive() {
                    << ", peer.local_nic_path: " << peer_desc.local_nic_path
                    << ", peer.peer_nic_path: " << peer_desc.peer_nic_path;
         return ERR_REJECT_HANDSHAKE;
+    }
+
+    if (!peer_desc.local_eid.empty()) {
+        return doSetupConnection(peer_desc.local_eid, peer_desc.jetty_num);
     }
 
     auto segment_desc =
@@ -846,6 +952,12 @@ int UrmaEndpoint::setupConnectionsByPassive(const HandShakeDesc& peer_desc,
     local_desc.local_nic_path = context_->nicPath();
     local_desc.peer_nic_path = peer_nic_path_;
     local_desc.jetty_num = JettyNum();
+    local_desc.local_eid = context_->getEid();
+
+    if (!peer_desc.local_eid.empty()) {
+        return doSetupConnection(peer_desc.local_eid, peer_desc.jetty_num,
+                                 &local_desc.reply_msg);
+    }
 
     auto segment_desc =
         context_->engine().meta()->getSegmentDescByName(peer_server_name);

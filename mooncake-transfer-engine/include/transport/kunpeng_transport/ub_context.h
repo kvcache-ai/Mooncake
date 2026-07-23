@@ -174,6 +174,19 @@ class UbContext {
    public:
     virtual int registerMemoryRegion(uint64_t va, size_t length) = 0;
 
+    // Returns the most recently registered local segment handle on this
+    // context (the one produced by the last successful registerMemoryRegion),
+    // or nullptr if none.  Used to share a single host-global URMA segment
+    // across all contexts (see UbTransport::registerLocalMemory).
+    virtual void* lastRegisteredSeg() = 0;
+
+    // Adopts a segment that was registered on another context for the same
+    // host virtual address.  URMA registers memory into a host-global ubva
+    // space, so a given host VA must be registered with the driver exactly
+    // once; the other contexts reference that single segment instead of
+    // re-registering it (which the driver rejects as a duplicate).
+    virtual int adoptLocalSeg(uint64_t va, size_t length, void* seg) = 0;
+
     virtual int unregisterMemoryRegion(uint64_t va) = 0;
 
     virtual int doProcessContextEvents() = 0;

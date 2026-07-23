@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -54,6 +55,23 @@ struct BootstrapDesc {
                                    notify_qp_num);
 };
 
+// UB/URMA-specific bootstrap descriptor for peer-to-peer jetty exchange.
+struct UbBootstrapDesc {
+    std::string local_nic_path;
+    std::string peer_nic_path;
+    std::vector<uint32_t> jetty_num;
+    std::string local_eid;
+    std::string reply_msg;
+
+   public:
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(UbBootstrapDesc, local_nic_path,
+                                   peer_nic_path, jetty_num, local_eid,
+                                   reply_msg);
+};
+
+using OnReceiveUbBootstrap =
+    std::function<int(const UbBootstrapDesc&, UbBootstrapDesc&)>;
+
 struct XferDataDesc {
     uint64_t peer_mem_addr;
     size_t length;
@@ -77,6 +95,10 @@ class ControlClient {
     static Status bootstrap(const std::string& server_addr,
                             const BootstrapDesc& request,
                             BootstrapDesc& response);
+
+    static Status bootstrapUb(const std::string& server_addr,
+                              const UbBootstrapDesc& request,
+                              UbBootstrapDesc& response);
 
     static Status sendData(const std::string& server_addr,
                            uint64_t peer_mem_addr, void* local_mem_addr,
@@ -125,6 +147,11 @@ class ControlService {
         bootstrap_callback_ = callback;
     }
 
+    void setBootstrapUbCallback(const OnReceiveUbBootstrap& callback) {
+        std::lock_guard<std::mutex> lock(ub_bootstrap_callback_mutex_);
+        ub_bootstrap_callback_ = callback;
+    }
+
     void setNotifyCallback(const OnNotify& callback) {
         notify_callback_ = callback;
     }
@@ -137,6 +164,8 @@ class ControlService {
 
     void onBootstrapRdma(const std::string_view& request,
                          std::string& response);
+
+    void onBootstrapUb(const std::string_view& request, std::string& response);
 
     void onSendData(const std::string_view& request, std::string& response);
 
@@ -165,6 +194,8 @@ class ControlService {
     std::shared_ptr<CoroRpcAgent> rpc_server_;
 
     OnReceiveBootstrap bootstrap_callback_;
+    std::mutex ub_bootstrap_callback_mutex_;
+    OnReceiveUbBootstrap ub_bootstrap_callback_;
     OnNotify notify_callback_;
     TransferEngineImpl* impl_;
 };

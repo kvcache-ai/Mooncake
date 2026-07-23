@@ -162,6 +162,7 @@ class TransferMetadata {
         std::string peer_nic_path;
 #ifdef USE_UB
         std::vector<uint32_t> jetty_num;  // for ub/urma
+        std::string local_eid;            // for ub/urma
 #endif
 #ifdef USE_BAREX
         uint16_t barex_port;
@@ -188,13 +189,13 @@ class TransferMetadata {
    public:
     TransferMetadata(const std::string &conn_string);
 
-    ~TransferMetadata();
+    virtual ~TransferMetadata();
 
-    std::shared_ptr<SegmentDesc> getSegmentDescByName(
+    virtual std::shared_ptr<SegmentDesc> getSegmentDescByName(
         const std::string &segment_name, bool force_update = false);
 
-    std::shared_ptr<SegmentDesc> getSegmentDescByID(SegmentID segment_id,
-                                                    bool force_update = false);
+    virtual std::shared_ptr<SegmentDesc> getSegmentDescByID(
+        SegmentID segment_id, bool force_update = false);
 
     int updateLocalSegmentDesc(SegmentID segment_id = LOCAL_SEGMENT_ID);
 
@@ -204,7 +205,7 @@ class TransferMetadata {
     std::shared_ptr<SegmentDesc> getSegmentDesc(
         const std::string &segment_name);
 
-    SegmentID getSegmentID(const std::string &segment_name);
+    virtual SegmentID getSegmentID(const std::string &segment_name);
 
     int syncSegmentCache(const std::string &segment_name);
 
@@ -234,12 +235,12 @@ class TransferMetadata {
 
     using OnReceiveHandShake = std::function<int(const HandShakeDesc &peer_desc,
                                                  HandShakeDesc &local_desc)>;
-    int startHandshakeDaemon(OnReceiveHandShake on_receive_handshake,
-                             uint16_t listen_port, int sockfd);
+    virtual int startHandshakeDaemon(OnReceiveHandShake on_receive_handshake,
+                                     uint16_t listen_port, int sockfd);
 
-    int sendHandshake(const std::string &peer_server_name,
-                      const HandShakeDesc &local_desc,
-                      HandShakeDesc &peer_desc);
+    virtual int sendHandshake(const std::string &peer_server_name,
+                              const HandShakeDesc &local_desc,
+                              HandShakeDesc &peer_desc);
 
     int sendNotify(const std::string &peer_server_name,
                    const NotifyDesc &local_desc, NotifyDesc &peer_desc);

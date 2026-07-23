@@ -677,6 +677,7 @@ std::vector<TransportType> TransferEngineImpl::getSupportedTransports(
     if (transport_list_[NVLINK]) result.push_back(NVLINK);
     if (transport_list_[RDMA]) result.push_back(RDMA);
     if (transport_list_[SUNRISE_LINK]) result.push_back(SUNRISE_LINK);
+    if (transport_list_[UB]) result.push_back(UB);
     if (transport_list_[AscendDirect]) result.push_back(AscendDirect);
     if (transport_list_[SHM]) result.push_back(SHM);
     if (transport_list_[TCP]) result.push_back(TCP);
@@ -1091,6 +1092,10 @@ static const char* transportTypeName(TransportType type) {
             return "AscendDirect";
         case SUNRISE_LINK:
             return "SUNRISE_LINK";
+        case UB:
+            return "UB";
+        default:
+            break;
         case TPU:
             return "TPU";
     }
@@ -1575,6 +1580,13 @@ Status TransferEngineImpl::commitPreparedSubmit(
         auto status = transport->submitTransferTasks(
             sub_batch, classified_request_list[type]);
         if (!status.ok()) {
+            // LOG(WARNING) << "Failed to submit SubBatch " << type << ":"
+            //              << status.ToString();
+            for (auto& task_id : task_id_list[type]) {
+                // Mark as UNSPEC so pollTaskStatus returns FAILED and
+                // updateTaskStatusAfterPoll can try the next transport.
+                batch->task_list[task_id].type = UNSPEC;
+            }
             for (auto& task_id : task_id_list[type])
                 batch->task_list[task_id].type = UNSPEC;
         } else {
@@ -2090,10 +2102,13 @@ void TransferEngineImpl::updateTaskStatusAfterPoll(Batch* batch, size_t task_id,
                                                    bool allow_failover) {
     auto& task = batch->task_list[task_id];
     task.status = task_status.s;
+    if (!allow_failover || task_status.s != FAILED) return;
     if (!allow_failover || task.cancel_requested || task_status.s != FAILED ||
         task.type == UNSPEC)
         return;
 
+    // Allow resubmission for UNSPEC tasks: these occur when submitTransferTasks
+    // failed (e.g., UB transport submission error).
     if (resubmitTransferTask(batch, task_id).ok()) {
         task_status.s = PENDING;
         task.status = PENDING;

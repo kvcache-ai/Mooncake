@@ -18,6 +18,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #include "common.h"
 #include "config.h"
@@ -55,6 +56,8 @@ class UrmaContext : public UbContext {
                 int max_endpoints);
     ~UrmaContext();
     int registerMemoryRegion(uint64_t va, size_t length) override;
+    void* lastRegisteredSeg() override;
+    int adoptLocalSeg(uint64_t va, size_t length, void* seg) override;
     int unregisterMemoryRegion(uint64_t va) override;
     int doProcessContextEvents() override;
     void* retrieveRemoteSeg(const std::string& value) override;
@@ -127,6 +130,10 @@ class UrmaContext : public UbContext {
     RWSpinlock seg_region_lock_;
     std::vector<std::pair<urma_target_seg_t*, uint64_t>> seg_region_list_;
     std::vector<urma_target_seg_t*> local_tseg_list_;
+    // Local segments actually registered with the URMA driver by THIS context
+    // (as opposed to segments adopted from another context for the same
+    // host-global VA).  Only owned segments are passed to urma_unregister_seg.
+    std::unordered_set<urma_target_seg_t*> owned_segs_;
     std::vector<urma_seg_t*> remote_seg_list_;
     std::vector<urma_target_seg_t*> imported_seg_list_;
 
