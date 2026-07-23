@@ -16,14 +16,12 @@ class AgentStateMachine {
    public:
     AgentStateMachine(GlobalRank rank, int max_world_size);
 
-    AgentApplyResult registerGroup(const GroupView& group,
-                                   bool auto_deactivate);
+    AgentApplyResult registerGroup(const GroupView& group);
     void unregisterGroup(GroupId group_id);
 
     AgentApplyResult handlePeerJoined(const PeerJoinedPush& push);
     AgentApplyResult handleRankStateUpdate(const RankStatePush& push);
-    std::pair<AgentApplyResult, bool> applyGroupView(GroupId group_id,
-                                                     const GroupView& view);
+    std::pair<AgentApplyResult, bool> applyGroupView(const GroupView& view);
     std::pair<AgentApplyResult, bool> handleViewUpdate(
         const ViewUpdatePush& push);
 

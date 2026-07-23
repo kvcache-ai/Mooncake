@@ -30,25 +30,15 @@ void AgentStateMachine::appendApplyViewEffect(const GroupView& view,
                          (member.isActive() || member.isAwaitingActivation()) &&
                          member.hasEndpoint();
     }
-    effects.push_back(
-        ApplyViewToBackend{view.group_id, view, global_rank_states_,
-                           global_rank_epochs_, std::move(activatable)});
+    effects.push_back(ApplyViewToBackend{view, global_rank_states_,
+                                         global_rank_epochs_,
+                                         std::move(activatable)});
 }
 
-AgentApplyResult AgentStateMachine::registerGroup(const GroupView& group,
-                                                  bool auto_deactivate) {
+AgentApplyResult AgentStateMachine::registerGroup(const GroupView& group) {
     AgentApplyResult effects;
-    auto it = groups_.find(group.group_id);
-    if (it != groups_.end()) {
-        // RegisterAgent may have installed the Coordinator snapshot before
-        // this backend existed. Preserve and replay that authoritative view.
-        appendApplyViewEffect(it->second, effects);
-        return effects;
-    }
-
-    GroupView view = group;
-    view.auto_deactivate = auto_deactivate;
-    groups_.emplace(group.group_id, std::move(view));
+    groups_.insert_or_assign(group.group_id, group);
+    appendApplyViewEffect(group, effects);
     return effects;
 }
 
@@ -164,8 +154,9 @@ AgentApplyResult AgentStateMachine::handleRankStateUpdate(
 }
 
 std::pair<AgentApplyResult, bool> AgentStateMachine::applyGroupView(
-    GroupId group_id, const GroupView& view) {
+    const GroupView& view) {
     AgentApplyResult effects;
+    const auto& group_id = view.group_id;
     auto it = groups_.find(group_id);
     if (it == groups_.end()) {
         LOG(WARNING) << "[AGENT] applyGroupView group=" << group_id
@@ -250,7 +241,7 @@ std::pair<AgentApplyResult, bool> AgentStateMachine::applyGroupView(
 
 std::pair<AgentApplyResult, bool> AgentStateMachine::handleViewUpdate(
     const ViewUpdatePush& push) {
-    return applyGroupView(push.group_id, push.view);
+    return applyGroupView(push.view);
 }
 
 HeartbeatRequest AgentStateMachine::buildHeartbeat() const {

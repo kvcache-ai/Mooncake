@@ -11,11 +11,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <memory>
-#include <mutex>
-#include <random>
-#include <unordered_map>
 #include <vector>
-#include <unistd.h>
 #include "control_plane/types.h"
 #include "memory_location.h"
 #include "mooncake_worker.cuh"
@@ -31,52 +27,6 @@ constexpr const char* MULTI_DEVICE_ERROR_MSG =
     "Expecting one tensor only but got multiple.";
 constexpr const char* SPARSE_ERROR_MSG = "Sparse op not supported.";
 constexpr int kBarrierDummyTensorSize = 1;
-
-// PyTorch may reuse the same logical group_id (e.g. "0") when a process
-// group is destroyed and recreated.  The Coordinator keys group state by
-// group_id, so reusing an id causes stale membership (e.g. Left) from the
-// previous incarnation to leak into the new group.
-//
-// We therefore generate a fresh Mooncake-specific group_id for every backend
-// instance.  The in-group leader (group_rank == 0) generates the id and
-// publishes it on the group-local store; the other ranks wait for the key.
-// A per-logical-group counter is used to build a unique store key for each
-// init round, avoiding stale reads when the same store is reused.
-static std::string makeMooncakeGroupId(c10d::DistributedBackendOptions& opts) {
-    const std::string& base = opts.group_id;
-    if (base.empty()) {
-        return base;
-    }
-
-    static std::mutex mu;
-    static std::unordered_map<std::string, int64_t> counter;
-    int64_t seq;
-    {
-        std::lock_guard<std::mutex> lk(mu);
-        seq = ++counter[base];
-    }
-
-    const std::string sync_key =
-        "mooncake_group_id_" + base + "_" + std::to_string(seq);
-
-    if (opts.group_rank == 0) {
-        auto now = std::chrono::steady_clock::now().time_since_epoch();
-        auto us =
-            std::chrono::duration_cast<std::chrono::microseconds>(now).count();
-        std::random_device rd;
-        std::mt19937_64 gen(rd());
-        std::uniform_int_distribution<uint64_t> dis;
-        std::string unique = base + "_" + std::to_string(us) + "_" +
-                             std::to_string(getpid()) + "_" +
-                             std::to_string(dis(gen));
-
-        opts.store->set(sync_key, unique);
-    }
-
-    opts.store->wait({sync_key});
-    std::string unique = opts.store->get_to_str(sync_key);
-    return unique;
-}
 
 /**
  * @brief Initialize Mooncake backend state from the PyTorch process-group
@@ -308,11 +258,12 @@ MooncakeBackend::MooncakeBackend(
     };
 
     TORCH_CHECK(!distBackendOpts.group_id.empty(),
-                "MooncakeBackend: distBackendOpts.group_id must not be empty");
-    std::string mooncake_group_id = makeMooncakeGroupId(distBackendOpts);
-    TORCH_CHECK(!mooncake_group_id.empty(),
-                "MooncakeBackend: mooncake_group_id must not be empty");
-    meta_->group_id = std::move(mooncake_group_id);
+                "MooncakeBackend: group_id must not be empty");
+    // PyTorch's group_id is only a bootstrap id. The Coordinator resolves it
+    // together with rank_order into a process-lifetime GroupId. CPU and device
+    // backends use independent namespaces.
+    GroupBootstrapId group_bootstrap_id =
+        std::string(isCpu_ ? "cpu:" : "device:") + distBackendOpts.group_id;
 
     // Register a lightweight Backend shim so that PyTorch's P2P dispatch path
     // (batch_isend_irecv → _get_backend → getBackend) can find a registered
@@ -334,14 +285,6 @@ MooncakeBackend::MooncakeBackend(
 
     // Register this group with the Agent, publish local endpoint, and block
     // until the Coordinator says ready.
-    GroupView initial_group;
-    initial_group.group_id = meta_->group_id;
-    initial_group.max_group_size = max_group_size_;
-    initial_group.rank_order = std::move(initial_rank_order);
-    initial_group.members.resize(ctx_.max_world_size);
-    for (GlobalRank r : initial_group.rank_order) {
-        initial_group.members[r].status = GroupMemberState::Active;
-    }
     bool auto_deactivate = [&]() -> bool {
         if (options_) return options_->autoDeactivateOnFailure_;
         if (const char* val =
@@ -364,7 +307,9 @@ MooncakeBackend::MooncakeBackend(
     meta_->autoSyncOnFailure = auto_sync_on_failure;
 
     // Register group is synchronous.
-    agent_.registerGroup(initial_group, auto_deactivate, this);
+    meta_->group_id = agent_.registerGroup(
+        std::move(group_bootstrap_id), max_group_size_,
+        std::move(initial_rank_order), auto_deactivate, this);
 
     agent_.publishLocalEndpoint(buildEndpointMetadata());
 

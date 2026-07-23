@@ -309,7 +309,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     py::class_<SyncAfterFailureResponse>(m, "SyncAfterFailureResponse")
         .def_readonly("status", &SyncAfterFailureResponse::status)
-        .def_readonly("new_epoch", &SyncAfterFailureResponse::new_epoch)
         .def_readonly("reject_reason",
                       &SyncAfterFailureResponse::reject_reason);
 

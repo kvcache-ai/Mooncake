@@ -273,7 +273,7 @@ void CoordinatorHost::runEffects(
 }
 
 void CoordinatorHost::pushViewUpdate(const PushViewUpdate& effect) {
-    ViewUpdatePush push{effect.view.group_id, effect.view};
+    ViewUpdatePush push{effect.view};
     auto group_id = effect.view.group_id;
 
     for (int32_t i = 0; i < max_world_size_; ++i) {

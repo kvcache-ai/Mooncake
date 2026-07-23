@@ -18,6 +18,7 @@ namespace mooncake {
 using GlobalRank = int32_t;
 using InGroupRank = int32_t;
 
+using GroupBootstrapId = std::string;
 using GroupId = std::string;
 
 constexpr GlobalRank kInvalidGlobalRank = -1;

@@ -215,30 +215,39 @@ void AgentHost::waitUntilRankActive(GroupId group_id, GlobalRank rank,
     }
 }
 
-void AgentHost::registerGroup(const GroupView& group, bool auto_deactivate,
-                              MooncakeBackend* backend) {
-    executor_.postAndWait([this, group = group, auto_deactivate,
-                           backend]() mutable {
-        auto group_id = group.group_id;
-        RegisterGroupRequest req;
-        req.rank = rank_;
-        req.agent_session_id = agent_.getAgentSessionId();
-        req.group = group;
-        req.group.auto_deactivate = auto_deactivate;
+GroupId AgentHost::registerGroup(GroupBootstrapId group_bootstrap_id,
+                                 int32_t max_group_size,
+                                 std::vector<GlobalRank> rank_order,
+                                 bool auto_deactivate,
+                                 MooncakeBackend* backend) {
+    return executor_.postAndWait(
+        [this, group_bootstrap_id = std::move(group_bootstrap_id),
+         max_group_size, rank_order = std::move(rank_order), auto_deactivate,
+         backend]() mutable {
+            RegisterGroupRequest req;
+            req.rank = rank_;
+            req.agent_session_id = agent_.getAgentSessionId();
+            req.group_bootstrap_id = std::move(group_bootstrap_id);
+            req.max_group_size = max_group_size;
+            req.rank_order = std::move(rank_order);
+            req.auto_deactivate = auto_deactivate;
 
-        auto resp = rpc_client_->call<&CoordinatorRpcService::registerGroup>(
-            coordinator_addr_, std::move(req));
+            auto resp =
+                rpc_client_->call<&CoordinatorRpcService::registerGroup>(
+                    coordinator_addr_, std::move(req));
 
-        if (!resp.success) {
-            LOG(ERROR) << "AgentHost: registerGroup failed for group "
-                       << group_id << ": " << resp.reject_reason;
-            throw std::runtime_error("registerGroup rejected: " +
-                                     resp.reject_reason);
-        }
+            if (!resp.success) {
+                LOG(ERROR) << "AgentHost: registerGroup failed: "
+                           << resp.reject_reason;
+                throw std::runtime_error("registerGroup rejected: " +
+                                         resp.reject_reason);
+            }
 
-        backends_.insert_or_assign(group_id, backend);
-        runEffects(agent_.registerGroup(group, auto_deactivate));
-    });
+            const auto& group_id = resp.view.group_id;
+            backends_.insert_or_assign(group_id, backend);
+            runEffects(agent_.registerGroup(resp.view));
+            return group_id;
+        });
 }
 
 void AgentHost::unregisterGroup(GroupId group_id) {
@@ -330,7 +339,7 @@ SyncAfterFailureResponse AgentHost::syncAfterFailure(GroupId group_id) {
         coordinator_addr_, req);
 
     executor_.postAndWait(
-        [this, group_id, request_session = req.agent_session_id, &response]() {
+        [this, request_session = req.agent_session_id, &response]() {
             if (request_session != agent_.getAgentSessionId()) {
                 response.status = SyncAfterFailureStatus::Rejected;
                 response.reject_reason = "agent session changed while syncing";
@@ -339,8 +348,7 @@ SyncAfterFailureResponse AgentHost::syncAfterFailure(GroupId group_id) {
 
             if (response.status == SyncAfterFailureStatus::Rejected) return;
 
-            auto [effects, applied] =
-                agent_.applyGroupView(group_id, response.view);
+            auto [effects, applied] = agent_.applyGroupView(response.view);
             runEffects(std::move(effects));
             if (!applied) {
                 response.status = SyncAfterFailureStatus::Rejected;
@@ -370,7 +378,7 @@ void AgentHost::postLinkEventReportAck(LinkEventReportAck ack) {
 
 void AgentHost::postViewUpdate(coro_rpc::context<ViewUpdateAck> ctx,
                                ViewUpdatePush push) {
-    auto group_id = push.group_id;
+    auto group_id = push.view.group_id;
     auto epoch = push.view.epoch;
 
     executor_.post([this, ctx = std::move(ctx), push = std::move(push),
@@ -599,7 +607,7 @@ void AgentHost::runEffects(const AgentApplyResult& effects) {
                     }
                 },
                 [this](const ApplyViewToBackend& e) {
-                    withBackend(e.group_id, [&](auto backend) {
+                    withBackend(e.view.group_id, [&](auto backend) {
                         backend->applyViewUpdate(e.view, e.rank_states,
                                                  e.rank_epochs, e.activatable);
                     });

@@ -134,6 +134,12 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
 
     std::unordered_map<GroupId, GroupView> group_views_;
 
+    // A bootstrap id may name multiple disjoint groups
+    std::unordered_map<GroupBootstrapId, std::vector<GroupId>>
+        group_ids_by_bootstrap_id_;
+    std::unordered_map<GroupId, GroupBootstrapId> group_bootstrap_ids_;
+    uint64_t next_group_id_ = 1;
+
     // Coordinator-assigned endpoint epoch counter per GlobalRank.
     // Incremented on every successful publishEndpoint for that rank so the
     // Agent can detect endpoint changes.
@@ -218,10 +224,19 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     // Called after every state-changing operation.
     void checkGroupTransitions(std::vector<CoordinatorEffect>& effects);
 
-    bool processGroupRegistration(GlobalRank joining_rank,
-                                  const GroupView& group, bool auto_deactivate,
+    bool processGroupRegistration(const RegisterGroupRequest& request,
+                                  const GroupId& group_id,
                                   RegisterGroupResponse& response,
                                   std::vector<CoordinatorEffect>& effects);
+
+    bool validateGroupRegistration(const RegisterGroupRequest& request,
+                                   RegisterGroupResponse& response) const;
+    std::optional<GroupId> resolveGroupId(
+        const GroupBootstrapId& group_bootstrap_id,
+        const std::vector<GlobalRank>& rank_order,
+        RegisterGroupResponse& response, bool& new_group);
+    void bindGroupBootstrapId(GroupId group_id,
+                              GroupBootstrapId group_bootstrap_id);
 
     bool canEraseGroup(const GroupView& view) const;
     void eraseGroup(GroupId group_id, std::vector<CoordinatorEffect>& effects);

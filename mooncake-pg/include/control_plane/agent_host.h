@@ -71,8 +71,11 @@ class AgentInterface {
     virtual void waitUntilRankActive(GroupId group_id, GlobalRank rank,
                                      std::chrono::milliseconds timeout) = 0;
 
-    virtual void registerGroup(const GroupView& group, bool auto_deactivate,
-                               MooncakeBackend* backend) = 0;
+    virtual GroupId registerGroup(GroupBootstrapId group_bootstrap_id,
+                                  int32_t max_group_size,
+                                  std::vector<GlobalRank> rank_order,
+                                  bool auto_deactivate,
+                                  MooncakeBackend* backend) = 0;
 
     virtual void unregisterGroup(GroupId group_id) = 0;
 
@@ -137,8 +140,11 @@ class AgentHost : public AgentInterface {
     void waitUntilRankActive(GroupId group_id, GlobalRank rank,
                              std::chrono::milliseconds timeout) override;
 
-    void registerGroup(const GroupView& group, bool auto_deactivate,
-                       MooncakeBackend* backend) override;
+    GroupId registerGroup(GroupBootstrapId group_bootstrap_id,
+                          int32_t max_group_size,
+                          std::vector<GlobalRank> rank_order,
+                          bool auto_deactivate,
+                          MooncakeBackend* backend) override;
     void unregisterGroup(GroupId group_id) override;
     void confirmReadyForActivation(GroupId group_id) override;
     void publishLocalEndpoint(GroupEndpointPublication endpoint) override;

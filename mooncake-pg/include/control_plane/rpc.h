@@ -71,12 +71,16 @@ struct HeartbeatResponse {
 struct RegisterGroupRequest {
     GlobalRank rank = kInvalidGlobalRank;
     uint64_t agent_session_id = 0;
-    GroupView group;
+    GroupBootstrapId group_bootstrap_id;
+    int32_t max_group_size = 0;
+    std::vector<GlobalRank> rank_order;
+    bool auto_deactivate = true;
 };
 
 struct RegisterGroupResponse {
     bool success = false;
     std::string reject_reason;
+    GroupView view;
 };
 
 struct ConfirmReadyForActivationRequest {
@@ -150,7 +154,6 @@ enum class SyncAfterFailureStatus : uint8_t {
 
 struct SyncAfterFailureResponse {
     SyncAfterFailureStatus status = SyncAfterFailureStatus::Rejected;
-    uint64_t new_epoch = 0;
     GroupView view;
     std::string reject_reason;
 };
@@ -178,7 +181,6 @@ struct LinkEventReportAck {
 };
 
 struct ViewUpdatePush {
-    GroupId group_id;
     GroupView view;
 };
 
@@ -252,7 +254,6 @@ struct DisconnectAllLinks {};
 struct ClearAllPeerMetadata {};
 
 struct ApplyViewToBackend {
-    GroupId group_id;
     GroupView view;
     std::vector<RankState> rank_states;
     std::vector<uint64_t> rank_epochs;
