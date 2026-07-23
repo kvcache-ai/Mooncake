@@ -989,6 +989,7 @@ Status TransferEngine::transferScatter(
     if (!result.ok()) return abort(result);
 
     constexpr auto timeout = std::chrono::seconds(60);
+    constexpr auto poll_interval = std::chrono::microseconds(10);
     auto start = std::chrono::steady_clock::now();
     size_t remaining = requests.size();
     bool has_failure = false;
@@ -1017,7 +1018,7 @@ Status TransferEngine::transferScatter(
         if (std::chrono::steady_clock::now() - start > timeout) {
             return abort(Status::Socket("scatter transfer timed out"));
         }
-        std::this_thread::yield();
+        std::this_thread::sleep_for(poll_interval);
     }
     freeBatchID(batch_id);
     return has_failure ? Status::Socket("scatter transfer failed")
