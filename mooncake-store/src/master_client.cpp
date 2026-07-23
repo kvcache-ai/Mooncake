@@ -1190,12 +1190,13 @@ tl::expected<void, ErrorCode> MasterClient::MoveEnd(const std::string& key) {
 }
 
 tl::expected<void, ErrorCode> MasterClient::MoveEnd(
-    const std::string& key, const std::string& tenant_id) {
+    const std::string& key, const std::string& tenant_id, bool is_drain) {
     ScopedVLogTimer timer(1, "MasterClient::MoveEnd");
-    timer.LogRequest("key=", key, ", tenant_id=", tenant_id);
+    timer.LogRequest("key=", key, ", tenant_id=", tenant_id,
+                     ", is_drain=", is_drain);
 
     auto result = invoke_rpc<&WrappedMasterService::MoveEnd, void>(
-        client_id_, key, tenant_id);
+        client_id_, key, tenant_id, is_drain);
     timer.LogResponseExpected(result);
     return result;
 }

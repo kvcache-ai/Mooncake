@@ -724,6 +724,24 @@ class RealClient : public PyClient {
                        uint64_t grace_period_seconds = 0);
 
     /**
+     * @brief Mount a LOCAL_DISK (SSD offload) segment for this client on the
+     *        master. Required before the master will allocate LOCAL_DISK
+     *        replicas for this client's objects and push offload tasks to this
+     *        client's FileStorage. Wraps Client::MountLocalDiskSegment.
+     * @param enable_offloading If true, enables offloading (write-to-file).
+     * @return 0 on success, negative value on error.
+     */
+    int mountLocalDiskSegment(bool enable_offloading = true);
+
+    /**
+     * @brief Offload RPC address used as the LOCAL_DISK replica segment name.
+     *        This is the address the master records for LOCAL_DISK replicas of
+     *        this client, and is the value to pass as the drain job's source
+     *        segment when draining this client's LOCAL_DISK data.
+     */
+    std::string getOffloadRpcAddr() const { return local_rpc_addr; }
+
+    /**
      * @brief Allocate memory internally and mount segments to master.
      *        If size > max_mr_size, it will be split into multiple chunks.
      *        Memory is allocated via allocate_buffer_allocator_memory.

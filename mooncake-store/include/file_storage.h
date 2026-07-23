@@ -87,11 +87,10 @@ class FileStorage {
      * @return shared_ptr<AllocatedBatch> on success, error on failure
      */
     tl::expected<std::shared_ptr<AllocatedBatch>, ErrorCode>
-    LoadBatchFromLocalDisk(const std::string& key,
-                           const std::string& tenant_id, uint64_t size);
+    LoadBatchFromLocalDisk(const std::string& key, const std::string& tenant_id,
+                           uint64_t size);
 
    private:
-
     /**
      * @brief Offload object data and metadata.
      * @return tl::expected<void, ErrorCode> indicating operation status.

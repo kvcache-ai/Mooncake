@@ -543,7 +543,8 @@ class MasterService {
 
     tl::expected<void, ErrorCode> MoveEnd(const UUID& client_id,
                                           const std::string& key,
-                                          const std::string& tenant_id);
+                                          const std::string& tenant_id,
+                                          bool is_drain = false);
 
     tl::expected<void, ErrorCode> MoveRevoke(const UUID& client_id,
                                              const std::string& key,
@@ -725,12 +726,15 @@ class MasterService {
     /**
      * @brief Create a move task to move an object's replica from source segment
      * to target segment
+     * @param is_drain True when the move is created by a drain job. Only drain
+     * moves drop the source client's redundant LOCAL_DISK metadata in MoveEnd.
      * @return Move task ID on success, ErrorCode on failure
      */
     tl::expected<UUID, ErrorCode> CreateMoveTask(const std::string& key,
                                                  const std::string& tenant_id,
                                                  const std::string& source,
-                                                 const std::string& target);
+                                                 const std::string& target,
+                                                 bool is_drain = false);
 
     /**
      * @brief Create a drain job to gracefully evacuate one or more segments.

@@ -1275,6 +1275,7 @@ struct InProcMasterConfig {
     std::optional<std::string> root_fs_dir;
     std::optional<bool> enable_disk_eviction;
     std::optional<uint64_t> quota_bytes;
+    std::optional<bool> offload_on_evict;
 };
 
 // Builder class for InProcMasterConfig
@@ -1292,6 +1293,7 @@ class InProcMasterConfigBuilder {
     std::optional<std::string> root_fs_dir_ = std::nullopt;
     std::optional<bool> enable_disk_eviction_ = std::nullopt;
     std::optional<uint64_t> quota_bytes_ = std::nullopt;
+    std::optional<bool> offload_on_evict_ = std::nullopt;
 
    public:
     InProcMasterConfigBuilder() = default;
@@ -1360,6 +1362,11 @@ class InProcMasterConfigBuilder {
         return *this;
     }
 
+    InProcMasterConfigBuilder& set_offload_on_evict(bool enable) {
+        offload_on_evict_ = enable;
+        return *this;
+    }
+
     InProcMasterConfig build() const;
 };
 
@@ -1378,6 +1385,7 @@ inline InProcMasterConfig InProcMasterConfigBuilder::build() const {
     config.root_fs_dir = root_fs_dir_;
     config.enable_disk_eviction = enable_disk_eviction_;
     config.quota_bytes = quota_bytes_;
+    config.offload_on_evict = offload_on_evict_;
     return config;
 }
 

@@ -32,7 +32,6 @@ namespace mooncake {
 class FileStorage;
 }
 
-
 namespace mooncake {
 
 class PutOperation;
@@ -914,7 +913,8 @@ class Client {
     tl::expected<void, ErrorCode> Move(const std::string& key,
                                        const std::string& tenant_id,
                                        const std::string& source,
-                                       const std::string& target);
+                                       const std::string& target,
+                                       bool is_drain = false);
 
     // Task thread pool for async task execution
     ThreadPool task_thread_pool_;
