@@ -12,7 +12,10 @@ namespace mooncake {
 std::unique_ptr<OpLogStore> OpLogStoreFactory::Create(
     OpLogStoreType type, const std::string& cluster_id, OpLogStoreRole role,
     const std::string& oplog_root_dir, int poll_interval_ms,
-    const std::string& password, const std::string& username, int db_index) {
+    const std::string& password, const std::string& username, int db_index,
+    size_t async_queue_max_entries,
+    const std::string& async_queue_overflow_mode,
+    size_t best_effort_max_retries) {
     switch (type) {
         case OpLogStoreType::ETCD: {
             // EtcdOpLogStore is not yet ported to this branch.
@@ -37,10 +40,26 @@ std::unique_ptr<OpLogStore> OpLogStoreFactory::Create(
         }
         case OpLogStoreType::REDIS: {
 #ifdef STORE_USE_REDIS
+            if (async_queue_max_entries == 0 || best_effort_max_retries == 0 ||
+                (async_queue_overflow_mode != "reject" &&
+                 async_queue_overflow_mode != "bypass")) {
+                LOG(ERROR) << "OpLogStoreFactory: invalid Redis async OpLog "
+                              "configuration"
+                           << ", queue_max_entries=" << async_queue_max_entries
+                           << ", overflow_mode=" << async_queue_overflow_mode
+                           << ", best_effort_max_retries="
+                           << best_effort_max_retries;
+                return nullptr;
+            }
             bool enable_write = (role == OpLogStoreRole::WRITER);
+            const auto overflow_mode =
+                async_queue_overflow_mode == "bypass"
+                    ? OpLogAsyncQueueOverflowMode::BYPASS
+                    : OpLogAsyncQueueOverflowMode::REJECT;
             auto store = std::make_unique<RedisOpLogStore>(
                 cluster_id, oplog_root_dir, enable_write, poll_interval_ms,
-                password, username, db_index);
+                password, username, db_index, async_queue_max_entries,
+                overflow_mode, best_effort_max_retries);
             if (store->Init() != ErrorCode::OK) {
                 LOG(ERROR)
                     << "OpLogStoreFactory: failed to init RedisOpLogStore"

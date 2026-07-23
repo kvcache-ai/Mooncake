@@ -32,6 +32,9 @@ struct MasterConfig {
     bool enable_oplog = false;
     std::string oplog_store_type = "localfs";
     std::string oplog_data_dir = "/tmp/mooncake_oplog";
+    uint64_t oplog_async_queue_max_entries = 100000;
+    std::string oplog_async_queue_overflow_mode = "reject";
+    uint64_t oplog_best_effort_max_retries = 3;
     bool enable_offload;
     std::string etcd_endpoints;
 
@@ -127,6 +130,9 @@ class MasterServiceSupervisorConfig {
     bool enable_oplog = false;
     std::string oplog_store_type = "localfs";
     std::string oplog_data_dir = "/tmp/mooncake_oplog";
+    uint64_t oplog_async_queue_max_entries = 100000;
+    std::string oplog_async_queue_overflow_mode = "reject";
+    uint64_t oplog_best_effort_max_retries = 3;
     uint32_t max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
     uint32_t max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS;
     uint32_t max_total_processing_tasks = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
@@ -194,6 +200,10 @@ class MasterServiceSupervisorConfig {
         enable_oplog = config.enable_oplog;
         oplog_store_type = config.oplog_store_type;
         oplog_data_dir = config.oplog_data_dir;
+        oplog_async_queue_max_entries = config.oplog_async_queue_max_entries;
+        oplog_async_queue_overflow_mode =
+            config.oplog_async_queue_overflow_mode;
+        oplog_best_effort_max_retries = config.oplog_best_effort_max_retries;
 
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
@@ -318,6 +328,9 @@ class WrappedMasterServiceConfig {
     bool enable_oplog = false;
     std::string oplog_store_type = "localfs";
     std::string oplog_data_dir = "/tmp/mooncake_oplog";
+    uint64_t oplog_async_queue_max_entries = 100000;
+    std::string oplog_async_queue_overflow_mode = "reject";
+    uint64_t oplog_best_effort_max_retries = 3;
     std::string redis_endpoint;
     std::string redis_username;
     std::string redis_password;
@@ -367,6 +380,10 @@ class WrappedMasterServiceConfig {
         enable_oplog = config.enable_oplog;
         oplog_store_type = config.oplog_store_type;
         oplog_data_dir = config.oplog_data_dir;
+        oplog_async_queue_max_entries = config.oplog_async_queue_max_entries;
+        oplog_async_queue_overflow_mode =
+            config.oplog_async_queue_overflow_mode;
+        oplog_best_effort_max_retries = config.oplog_best_effort_max_retries;
         redis_endpoint = config.redis_endpoint;
         redis_username = config.redis_username;
         redis_password = config.redis_password;
@@ -421,6 +438,10 @@ class WrappedMasterServiceConfig {
         enable_oplog = config.enable_oplog;
         oplog_store_type = config.oplog_store_type;
         oplog_data_dir = config.oplog_data_dir;
+        oplog_async_queue_max_entries = config.oplog_async_queue_max_entries;
+        oplog_async_queue_overflow_mode =
+            config.oplog_async_queue_overflow_mode;
+        oplog_best_effort_max_retries = config.oplog_best_effort_max_retries;
         redis_endpoint = config.redis_endpoint;
         redis_username = config.redis_username;
         redis_password = config.redis_password;
@@ -470,6 +491,9 @@ class MasterServiceConfigBuilder {
     bool enable_oplog_ = false;
     std::string oplog_store_type_ = "localfs";
     std::string oplog_data_dir_ = "/tmp/mooncake_oplog";
+    uint64_t oplog_async_queue_max_entries_ = 100000;
+    std::string oplog_async_queue_overflow_mode_ = "reject";
+    uint64_t oplog_best_effort_max_retries_ = 3;
     bool enable_offload_ = false;
     std::string cluster_id_ = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir_ = DEFAULT_ROOT_FS_DIR;
@@ -553,6 +577,24 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_oplog_data_dir(const std::string& dir) {
         oplog_data_dir_ = dir;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_oplog_async_queue_max_entries(
+        uint64_t max_entries) {
+        oplog_async_queue_max_entries_ = max_entries;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_oplog_async_queue_overflow_mode(
+        const std::string& mode) {
+        oplog_async_queue_overflow_mode_ = mode;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_oplog_best_effort_max_retries(
+        uint64_t max_retries) {
+        oplog_best_effort_max_retries_ = max_retries;
         return *this;
     }
 
@@ -671,6 +713,9 @@ class MasterServiceConfig {
     bool enable_oplog = false;
     std::string oplog_store_type = "localfs";
     std::string oplog_data_dir = "/tmp/mooncake_oplog";
+    uint64_t oplog_async_queue_max_entries = 100000;
+    std::string oplog_async_queue_overflow_mode = "reject";
+    uint64_t oplog_best_effort_max_retries = 3;
     std::string redis_endpoint;
     std::string redis_username;
     std::string redis_password;
@@ -716,6 +761,10 @@ class MasterServiceConfig {
         enable_oplog = config.enable_oplog;
         oplog_store_type = config.oplog_store_type;
         oplog_data_dir = config.oplog_data_dir;
+        oplog_async_queue_max_entries = config.oplog_async_queue_max_entries;
+        oplog_async_queue_overflow_mode =
+            config.oplog_async_queue_overflow_mode;
+        oplog_best_effort_max_retries = config.oplog_best_effort_max_retries;
         redis_endpoint = config.redis_endpoint;
         redis_username = config.redis_username;
         redis_password = config.redis_password;
@@ -765,6 +814,9 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.enable_oplog = enable_oplog_;
     config.oplog_store_type = oplog_store_type_;
     config.oplog_data_dir = oplog_data_dir_;
+    config.oplog_async_queue_max_entries = oplog_async_queue_max_entries_;
+    config.oplog_async_queue_overflow_mode = oplog_async_queue_overflow_mode_;
+    config.oplog_best_effort_max_retries = oplog_best_effort_max_retries_;
     config.enable_offload = enable_offload_;
     config.cluster_id = cluster_id_;
     config.root_fs_dir = root_fs_dir_;

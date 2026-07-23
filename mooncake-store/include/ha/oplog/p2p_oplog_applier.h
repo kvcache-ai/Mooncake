@@ -33,13 +33,11 @@ class P2POpLogApplier : public OpLogApplier {
                              const std::string& cluster_id = std::string(),
                              OpLogStore* oplog_store = nullptr);
 
-    /// Override to handle P2P-specific OpTypes.
-    /// Falls back to OpLogApplier::ApplyOpLogEntry for PUT_END, PUT_REVOKE,
-    /// and REMOVE.
-    bool ApplyOpLogEntry(const OpLogEntry& entry) override;
-
     /// Get the underlying P2P metadata store.
     P2PStandbyMetadataStore* GetP2PMetadataStore() const { return p2p_store_; }
+
+   protected:
+    bool ApplyCustomOpLogEntry(const OpLogEntry& entry) override;
 
    private:
     // Apply individual P2P OpTypes. Return true on success.

@@ -5,6 +5,7 @@
 #include <variant>
 
 #include "ha/oplog/p2p_oplog_types.h"
+#include "ha/oplog/oplog_store_factory.h"
 #include "p2p_client_meta.h"
 
 namespace mooncake {
@@ -12,7 +13,8 @@ namespace mooncake {
 P2PMasterService::P2PMasterService(const MasterServiceConfig& config)
     : MasterService(config),
       max_replicas_per_key_(config.max_replicas_per_key),
-      async_add_replica_oplog_(config.oplog_store_type == "redis") {
+      enable_async_oplog_write_(ParseOpLogStoreType(config.oplog_store_type) ==
+                                OpLogStoreType::REDIS) {
     client_manager_ = std::make_shared<P2PClientManager>(
         config.client_live_ttl_sec, config.client_crashed_ttl_sec,
         config.view_version);
@@ -21,7 +23,7 @@ P2PMasterService::P2PMasterService(const MasterServiceConfig& config)
 }
 
 ErrorCode P2PMasterService::RecordOplog(OpType type, const std::string& key,
-                                        const std::string& payload, bool sync) {
+                                        const std::string& payload) {
     // TODO: Record remaining failover-visible P2P mutations: client crash
     // cleanup, heartbeat state transitions, replica eviction/rebalance, and
     // task metadata.
@@ -30,7 +32,8 @@ ErrorCode P2PMasterService::RecordOplog(OpType type, const std::string& key,
         return ErrorCode::OK;
     }
 
-    auto result = manager->AppendAndPersist(type, key, payload, sync);
+    auto result = manager->AppendAndPersist(
+        type, key, payload, /*sync=*/!enable_async_oplog_write_);
     if (!result.has_value()) {
         LOG(ERROR) << "P2PMasterService: failed to persist oplog"
                    << ", op_type=" << static_cast<int>(type) << ", key=" << key
@@ -40,8 +43,6 @@ ErrorCode P2PMasterService::RecordOplog(OpType type, const std::string& key,
     return ErrorCode::OK;
 }
 
-// XXX(P2P HA): Lifecycle mutations update memory before OpLog persistence,
-// unlike WAL-first designs. Revisit this ordering.
 auto P2PMasterService::RegisterClient(const RegisterClientRequest& req)
     -> tl::expected<RegisterClientResponse, ErrorCode> {
     if (GetClientManager().GetClient(req.client_id)) {
@@ -374,6 +375,8 @@ tl::expected<void, ErrorCode> P2PMasterService::InnerAddReplica(
     Replica new_replica(P2PProxyReplicaData(client, segment_res.value(), size),
                         ReplicaStatus::COMPLETE);
 
+    // AddReplica commits the in-memory route first. OpLog is best-effort;
+    // returning an OpLog error could make the client delete its local replica.
     auto it = shard.metadata.find(key);
     if (it != shard.metadata.end()) {
         auto& metadata = *it->second;
@@ -415,20 +418,19 @@ tl::expected<void, ErrorCode> P2PMasterService::InnerAddReplica(
         payload.client_id = client_id;
         payload.segment_id = segment_id;
         payload.size = size;
+        AddReplicaToSegmentIndex(shard, it->first, new_replica);
+        OnReplicaAdded(new_replica);
+        metadata.replicas_.push_back(std::move(new_replica));
         ErrorCode record_err =
             RecordOplog(OpType_ADD_REPLICA, payload.object_key,
-                        SerializeP2PPayload(payload),
-                        /*sync=*/!async_add_replica_oplog_);
+                        SerializeP2PPayload(payload));
         if (record_err != ErrorCode::OK) {
             LOG(ERROR) << "AddReplica(P2P): failed to record oplog"
                        << ", client_id=" << client_id
                        << ", segment_id=" << segment_id
-                       << ", error=" << toString(record_err);
-            return tl::make_unexpected(record_err);
+                       << ", error=" << toString(record_err)
+                       << "; keeping the in-memory route";
         }
-        AddReplicaToSegmentIndex(shard, it->first, new_replica);
-        OnReplicaAdded(new_replica);
-        metadata.replicas_.push_back(std::move(new_replica));
     } else {
         std::vector<Replica> replicas;
         replicas.push_back(std::move(new_replica));
@@ -439,22 +441,21 @@ tl::expected<void, ErrorCode> P2PMasterService::InnerAddReplica(
         payload.client_id = client_id;
         payload.segment_id = segment_id;
         payload.size = size;
-        ErrorCode record_err =
-            RecordOplog(OpType_ADD_REPLICA, payload.object_key,
-                        SerializeP2PPayload(payload),
-                        /*sync=*/!async_add_replica_oplog_);
-        if (record_err != ErrorCode::OK) {
-            LOG(ERROR) << "AddReplica(P2P): failed to record oplog"
-                       << ", client_id=" << client_id
-                       << ", segment_id=" << segment_id
-                       << ", error=" << toString(record_err);
-            return tl::make_unexpected(record_err);
-        }
         auto emplace_it =
             shard.metadata.emplace(std::string(key), std::move(new_meta)).first;
         AddReplicaToSegmentIndex(shard, emplace_it->first,
                                  emplace_it->second->replicas_[0]);
         OnReplicaAdded(emplace_it->second->replicas_[0]);
+        ErrorCode record_err =
+            RecordOplog(OpType_ADD_REPLICA, payload.object_key,
+                        SerializeP2PPayload(payload));
+        if (record_err != ErrorCode::OK) {
+            LOG(ERROR) << "AddReplica(P2P): failed to record oplog"
+                       << ", client_id=" << client_id
+                       << ", segment_id=" << segment_id
+                       << ", error=" << toString(record_err)
+                       << "; keeping the in-memory route";
+        }
     }
     return {};
 }

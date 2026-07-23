@@ -91,7 +91,14 @@ class OpLogApplier {
     };
     GapResolveResult TryResolveGapsOnceForPromotion(size_t max_ids = 1024);
 
+   protected:
+    // Subclasses implement backend-specific operations while reusing the
+    // common validation, ordering, gap buffering and timeout-skip machinery.
+    virtual bool ApplyCustomOpLogEntry(const OpLogEntry& entry);
+
    private:
+    bool ApplyOpLogEntryInternal(const OpLogEntry& entry);
+
     /**
      * @brief Check if the entry's sequence order is valid
      * @param entry OpLog entry

@@ -38,7 +38,10 @@ MasterService::MasterService(const MasterServiceConfig& config)
     auto store = OpLogStoreFactory::Create(
         store_type, config.cluster_id, OpLogStoreRole::WRITER, store_location,
         kDefaultOpLogPollIntervalMs, config.redis_password,
-        config.redis_username, config.redis_db_index);
+        config.redis_username, config.redis_db_index,
+        config.oplog_async_queue_max_entries,
+        config.oplog_async_queue_overflow_mode,
+        config.oplog_best_effort_max_retries);
     if (!store) {
         LOG(ERROR) << "MasterService: failed to initialize OpLogStore"
                    << ", type=" << config.oplog_store_type

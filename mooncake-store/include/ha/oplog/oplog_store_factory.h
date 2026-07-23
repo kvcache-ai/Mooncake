@@ -76,7 +76,9 @@ class OpLogStoreFactory {
         const std::string& oplog_root_dir = kDefaultOpLogRootDir,
         int poll_interval_ms = kDefaultOpLogPollIntervalMs,
         const std::string& password = "", const std::string& username = "",
-        int db_index = 0);
+        int db_index = 0, size_t async_queue_max_entries = 100000,
+        const std::string& async_queue_overflow_mode = "reject",
+        size_t best_effort_max_retries = 3);
 };
 
 }  // namespace mooncake

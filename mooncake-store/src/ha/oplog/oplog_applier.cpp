@@ -70,6 +70,8 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
             }
         }
         if (was_skipped) {
+            // TODO(P2P HA): Define type-aware handling for late P2P entries as
+            // part of the standby out-of-order/error-handling work.
             if (entry.op_type == OpType::REMOVE ||
                 entry.op_type == OpType::PUT_REVOKE) {
                 // Safe: ensure we don't keep stale metadata.
@@ -117,23 +119,12 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
         return false;
     }
 
-    // Apply the operation based on type
-    switch (entry.op_type) {
-        case OpType::PUT_END:
-            ApplyPutEnd(entry);
-            break;
-        case OpType::PUT_REVOKE:
-            ApplyPutRevoke(entry);
-            break;
-        case OpType::REMOVE:
-            ApplyRemove(entry);
-            break;
-        default:
-            LOG(ERROR) << "OpLogApplier: unsupported op_type="
-                       << static_cast<int>(entry.op_type)
-                       << ", sequence_id=" << entry.sequence_id
-                       << ", key=" << entry.object_key;
-            return false;
+    if (!ApplyOpLogEntryInternal(entry)) {
+        LOG(ERROR) << "OpLogApplier: unsupported or failed op_type="
+                   << static_cast<int>(entry.op_type)
+                   << ", sequence_id=" << entry.sequence_id
+                   << ", key=" << entry.object_key;
+        return false;
     }
 
     // Update expected sequence ID
@@ -148,6 +139,24 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
     ProcessPendingEntries();
 
     return true;
+}
+
+bool OpLogApplier::ApplyCustomOpLogEntry(const OpLogEntry&) { return false; }
+
+bool OpLogApplier::ApplyOpLogEntryInternal(const OpLogEntry& entry) {
+    switch (entry.op_type) {
+        case OpType::PUT_END:
+            ApplyPutEnd(entry);
+            return true;
+        case OpType::PUT_REVOKE:
+            ApplyPutRevoke(entry);
+            return true;
+        case OpType::REMOVE:
+            ApplyRemove(entry);
+            return true;
+        default:
+            return ApplyCustomOpLogEntry(entry);
+    }
 }
 
 size_t OpLogApplier::ApplyOpLogEntries(const std::vector<OpLogEntry>& entries) {
@@ -172,6 +181,8 @@ void OpLogApplier::Recover(uint64_t last_applied_sequence_id) {
 }
 
 size_t OpLogApplier::ProcessPendingEntries() {
+    // TODO(P2P HA): Drive this periodically in production so a final gap can
+    // time out even when no newer OpLog arrives.
     // Check for missing sequence IDs, possibly skip after timeout, and/or
     // request them.
     uint64_t missing_seq_to_request = 0;
@@ -265,23 +276,20 @@ size_t OpLogApplier::ProcessPendingEntries() {
         }
 
         // Apply outside lock.
-        switch (entry_copy.op_type) {
-            case OpType::PUT_END:
-                ApplyPutEnd(entry_copy);
-                break;
-            case OpType::PUT_REVOKE:
-                ApplyPutRevoke(entry_copy);
-                break;
-            case OpType::REMOVE:
-                ApplyRemove(entry_copy);
-                break;
-            default:
-                LOG(ERROR)
-                    << "OpLogApplier: unsupported op_type in pending entry";
-                break;
+        if (!ApplyOpLogEntryInternal(entry_copy)) {
+            LOG(ERROR) << "OpLogApplier: failed to apply pending entry"
+                       << ", sequence_id=" << entry_copy.sequence_id
+                       << ", op_type=" << static_cast<int>(entry_copy.op_type);
+            std::lock_guard<std::mutex> lock(pending_mutex_);
+            pending_entries_.emplace(entry_copy.sequence_id,
+                                     std::move(entry_copy));
+            break;
         }
 
         expected_sequence_id_.store(entry_copy.sequence_id + 1);
+        HAMetricManager::instance().inc_oplog_applied_entries();
+        HAMetricManager::instance().set_oplog_applied_sequence_id(
+            static_cast<int64_t>(entry_copy.sequence_id));
 
         {
             std::lock_guard<std::mutex> lock(pending_mutex_);

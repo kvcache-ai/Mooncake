@@ -8,9 +8,9 @@
 #include <cstring>
 #include <iomanip>
 #include <sstream>
-#include <string_view>
 
 #include "ha/oplog/oplog_serializer.h"
+#include "ha/oplog/p2p_oplog_types.h"
 #include "ha/oplog/polling_oplog_change_notifier.h"
 
 namespace mooncake {
@@ -40,18 +40,21 @@ std::string SequenceMember(uint64_t value) {
 
 }  // namespace
 
-RedisOpLogStore::RedisOpLogStore(const std::string& cluster_id,
-                                 const std::string& redis_endpoint,
-                                 bool enable_write, int poll_interval_ms,
-                                 const std::string& password,
-                                 const std::string& username, int db_index)
+RedisOpLogStore::RedisOpLogStore(
+    const std::string& cluster_id, const std::string& redis_endpoint,
+    bool enable_write, int poll_interval_ms, const std::string& password,
+    const std::string& username, int db_index, size_t async_queue_max_entries,
+    OpLogAsyncQueueOverflowMode overflow_mode, size_t best_effort_max_retries)
     : cluster_id_(cluster_id),
       redis_endpoint_(redis_endpoint),
       username_(username),
       password_(password),
       db_index_(db_index),
       enable_write_(enable_write),
-      poll_interval_ms_(poll_interval_ms) {
+      poll_interval_ms_(poll_interval_ms),
+      async_queue_max_entries_(async_queue_max_entries),
+      async_queue_overflow_mode_(overflow_mode),
+      best_effort_max_retries_(best_effort_max_retries) {
     if (!NormalizeAndValidateClusterId(cluster_id_)) {
         LOG(FATAL) << "Invalid cluster_id for RedisOpLogStore: '" << cluster_id
                    << "'. Allowed chars: [A-Za-z0-9_.-], max_len=128.";
@@ -155,11 +158,6 @@ std::string RedisOpLogStore::SnapshotKey(const std::string& snapshot_id) const {
     return snapshot_prefix_ + snapshot_id;
 }
 
-// TODO(P2P HA): Redis now uses latest as a committed watermark. Async
-// workers may persist entries out of order, but latest only advances across
-// contiguous successful sequence IDs. A future throughput optimization can add
-// larger pipelined batches per worker; standby should continue to replay only
-// entries <= committed latest.
 ErrorCode RedisOpLogStore::WriteOpLog(const OpLogEntry& entry, bool sync) {
     return EnqueueWrite(entry, sync);
 }
@@ -171,7 +169,6 @@ ErrorCode RedisOpLogStore::EnqueueWrite(const OpLogEntry& entry, bool sync) {
     }
 
     std::shared_ptr<PendingWrite> pending;
-    bool wait_for_completion = sync;
     {
         std::lock_guard<std::mutex> lock(async_mutex_);
         if (!async_running_.load()) {
@@ -185,24 +182,30 @@ ErrorCode RedisOpLogStore::EnqueueWrite(const OpLogEntry& entry, bool sync) {
         if (existing != inflight_writes_.end()) {
             pending = existing->second;
         } else {
-            if (!sync && pending_writes_.size() + inflight_writes_.size() >=
-                             kMaxAsyncQueueSize) {
-                wait_for_completion = true;
-                LOG(WARNING) << "RedisOpLogStore: async queue full, falling "
-                                "back to sync write"
-                             << ", sequence_id=" << entry.sequence_id
-                             << ", queue_size=" << pending_writes_.size()
-                             << ", inflight_size=" << inflight_writes_.size();
+            if (!sync && inflight_writes_.size() >= async_queue_max_entries_) {
+                dropped_sequences_.insert(entry.sequence_id);
+                async_cv_.notify_one();
+                LOG(WARNING)
+                    << "RedisOpLogStore: async queue overflow"
+                    << ", sequence_id=" << entry.sequence_id
+                    << ", queue_size=" << inflight_writes_.size() << ", mode="
+                    << (async_queue_overflow_mode_ ==
+                                OpLogAsyncQueueOverflowMode::BYPASS
+                            ? "bypass"
+                            : "reject");
+                return async_queue_overflow_mode_ ==
+                               OpLogAsyncQueueOverflowMode::BYPASS
+                           ? ErrorCode::OK
+                           : ErrorCode::INTERNAL_ERROR;
             }
-            pending =
-                std::make_shared<PendingWrite>(entry, wait_for_completion);
+            pending = std::make_shared<PendingWrite>(entry, sync);
             inflight_writes_[entry.sequence_id] = pending;
             pending_writes_.push_back(pending);
         }
     }
     async_cv_.notify_one();
 
-    if (!wait_for_completion) {
+    if (!sync) {
         return ErrorCode::OK;
     }
 
@@ -271,13 +274,17 @@ void RedisOpLogStore::AsyncWriteLoop(size_t worker_id) {
         {
             std::unique_lock<std::mutex> lock(async_mutex_);
             async_cv_.wait(lock, [&] {
-                return !async_running_.load() || !pending_writes_.empty();
+                return !async_running_.load() || !pending_writes_.empty() ||
+                       dropped_sequences_.count(committed_sequence_id_ + 1) !=
+                           0;
             });
             if (!async_running_.load() && pending_writes_.empty()) {
                 break;
             }
-            pending = pending_writes_.front();
-            pending_writes_.pop_front();
+            if (!pending_writes_.empty()) {
+                pending = pending_writes_.front();
+                pending_writes_.pop_front();
+            }
         }
 
         if (!ctx || ctx->err) {
@@ -287,9 +294,25 @@ void RedisOpLogStore::AsyncWriteLoop(size_t worker_id) {
             ctx = CreateConnection();
         }
         // TODO(P2P HA): Batch several queued entries per worker and pipeline
-        // their SET NX commands to reduce Redis round trips. Keep the current
+        // their SET commands to reduce Redis round trips. Keep the current
         // one-entry retry path until batch error handling and partial reply
         // draining are covered by tests.
+        if (!pending) {
+            bool advanced = false;
+            {
+                std::lock_guard<std::mutex> lock(async_mutex_);
+                advanced =
+                    ctx && AdvanceCommittedLatestUnlocked(ctx) == ErrorCode::OK;
+            }
+            if (advanced) continue;
+            if (ctx) {
+                redisFree(ctx);
+                ctx = nullptr;
+            }
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(kAsyncRetryDelayMs));
+            continue;
+        }
         ErrorCode err = ctx ? PersistEntryNoLatest(ctx, pending->entry)
                             : ErrorCode::INTERNAL_ERROR;
         if (err != ErrorCode::OK) {
@@ -306,6 +329,19 @@ void RedisOpLogStore::AsyncWriteLoop(size_t worker_id) {
                 // Mutable PendingWrite state is protected by async_mutex_.
                 std::lock_guard<std::mutex> lock(async_mutex_);
                 attempts = ++pending->attempts;
+                if (IsBestEffortRedisOpLog(pending->entry.op_type) &&
+                    attempts >= best_effort_max_retries_) {
+                    dropped_sequences_.insert(pending->entry.sequence_id);
+                    inflight_writes_.erase(pending->entry.sequence_id);
+                    pending->done = true;
+                    pending->result = ErrorCode::INTERNAL_ERROR;
+                    sync_cv_.notify_all();
+                    LOG(ERROR) << "RedisOpLogStore: dropping best-effort oplog"
+                               << ", sequence_id=" << pending->entry.sequence_id
+                               << ", attempts=" << attempts;
+                    async_cv_.notify_one();
+                    continue;
+                }
             }
             // TODO(P2P HA): Add bounded exponential backoff, jitter, and
             // pending/retry metrics.
@@ -337,53 +373,26 @@ ErrorCode RedisOpLogStore::PersistEntryNoLatest(redisContext* ctx,
                                                 const OpLogEntry& entry) {
     const std::string entry_key = EntryKey(entry.sequence_id);
     const std::string serialized = SerializeOpLogEntry(entry);
+    // A previous Primary may leave an uncommitted entry beyond latest; the
+    // current Primary must be able to overwrite it and continue the sequence.
+    // TODO(P2P HA): Atomically reject conflicting overwrites at or below the
+    // committed latest while still allowing overwrites beyond latest.
     RedisReplyPtr reply((redisReply*)redisCommand(
-        ctx, "SET %b %b NX", entry_key.data(), entry_key.size(),
-        serialized.data(), serialized.size()));
-    if (!reply || reply->type == REDIS_REPLY_ERROR) {
+        ctx, "SET %b %b", entry_key.data(), entry_key.size(), serialized.data(),
+        serialized.size()));
+    if (!reply || reply->type != REDIS_REPLY_STATUS) {
         LOG(ERROR) << "RedisOpLogStore::PersistEntryNoLatest: Redis command "
                       "failed"
                    << ", sequence_id=" << entry.sequence_id;
         return ErrorCode::INTERNAL_ERROR;
     }
-    if (reply->type == REDIS_REPLY_STATUS) {
-        return ErrorCode::OK;
-    }
-    if (reply->type == REDIS_REPLY_NIL) {
-        RedisReplyPtr existing((redisReply*)redisCommand(
-            ctx, "GET %b", entry_key.data(), entry_key.size()));
-        if (!existing || existing->type == REDIS_REPLY_ERROR) {
-            LOG(ERROR) << "RedisOpLogStore::PersistEntryNoLatest: GET existing "
-                          "entry failed"
-                       << ", sequence_id=" << entry.sequence_id;
-            return ErrorCode::INTERNAL_ERROR;
-        }
-        if (existing->type == REDIS_REPLY_STRING &&
-            std::string_view(existing->str, existing->len) == serialized) {
-            return ErrorCode::OK;
-        }
-        if (existing->type == REDIS_REPLY_NIL) {
-            LOG(WARNING) << "RedisOpLogStore::PersistEntryNoLatest: existing "
-                            "entry disappeared before comparison, retrying"
-                         << ", sequence_id=" << entry.sequence_id;
-            return ErrorCode::INTERNAL_ERROR;
-        }
-        LOG(ERROR) << "RedisOpLogStore::PersistEntryNoLatest: conflicting "
-                      "entry already exists"
-                   << ", sequence_id=" << entry.sequence_id;
-        return ErrorCode::INVALID_PARAMS;
-    }
-    LOG(ERROR) << "RedisOpLogStore::PersistEntryNoLatest: unexpected reply "
-                  "type"
-               << ", type=" << reply->type
-               << ", sequence_id=" << entry.sequence_id;
-    return ErrorCode::INTERNAL_ERROR;
+    return ErrorCode::OK;
 }
 
 ErrorCode RedisOpLogStore::AdvanceCommittedLatestUnlocked(redisContext* ctx) {
     uint64_t target = committed_sequence_id_;
-    while (persisted_sequences_.find(target + 1) !=
-           persisted_sequences_.end()) {
+    while (persisted_sequences_.count(target + 1) != 0 ||
+           dropped_sequences_.count(target + 1) != 0) {
         ++target;
     }
     if (target == committed_sequence_id_) {
@@ -403,6 +412,7 @@ ErrorCode RedisOpLogStore::AdvanceCommittedLatestUnlocked(redisContext* ctx) {
     for (uint64_t seq_id = committed_sequence_id_ + 1; seq_id <= target;
          ++seq_id) {
         persisted_sequences_.erase(seq_id);
+        dropped_sequences_.erase(seq_id);
         auto it = inflight_writes_.find(seq_id);
         if (it != inflight_writes_.end()) {
             it->second->done = true;
@@ -542,85 +552,74 @@ ErrorCode RedisOpLogStore::ReadOpLogSince(uint64_t start_sequence_id,
         return ErrorCode::OK;
     }
 
-    std::vector<uint64_t> sequence_ids;
-    const uint64_t available = latest_sequence_id - effective_start;
-    const size_t read_count =
-        static_cast<size_t>(std::min<uint64_t>(available, limit));
-    sequence_ids.reserve(read_count);
-    for (uint64_t sequence_id = effective_start + 1;
-         sequence_id <= latest_sequence_id && sequence_ids.size() < read_count;
-         ++sequence_id) {
-        sequence_ids.push_back(sequence_id);
-    }
+    entries.reserve(limit);
+    uint64_t next_sequence_id = effective_start + 1;
+    while (next_sequence_id <= latest_sequence_id && entries.size() < limit) {
+        const uint64_t remaining = latest_sequence_id - next_sequence_id + 1;
+        const size_t batch_size = static_cast<size_t>(std::min<uint64_t>(
+            remaining, static_cast<uint64_t>(limit - entries.size())));
+        const uint64_t batch_start = next_sequence_id;
 
-    for (uint64_t sequence_id : sequence_ids) {
-        const std::string entry_key = EntryKey(sequence_id);
-        if (redisAppendCommand(ctx_, "GET %b", entry_key.data(),
-                               entry_key.size()) != REDIS_OK) {
-            LOG(ERROR) << "RedisOpLogStore::ReadOpLogSince: append GET failed"
-                       << ", sequence_id=" << sequence_id;
-            redisFree(ctx_);
-            ctx_ = nullptr;
-            entries.clear();
-            return ErrorCode::INTERNAL_ERROR;
-        }
-    }
-
-    entries.reserve(sequence_ids.size());
-    for (size_t i = 0; i < sequence_ids.size(); ++i) {
-        redisReply* raw_reply = nullptr;
-        if (redisGetReply(ctx_, reinterpret_cast<void**>(&raw_reply)) !=
-                REDIS_OK ||
-            !raw_reply) {
-            LOG(ERROR) << "RedisOpLogStore::ReadOpLogSince: pipeline GET failed"
-                       << ", sequence_id=" << sequence_ids[i];
-            redisFree(ctx_);
-            ctx_ = nullptr;
-            entries.clear();
-            return ErrorCode::INTERNAL_ERROR;
-        }
-        RedisReplyPtr entry_reply(raw_reply);
-        if (entry_reply->type == REDIS_REPLY_NIL) {
-            LOG(ERROR) << "RedisOpLogStore::ReadOpLogSince: missing committed "
-                          "entry"
-                       << ", sequence_id=" << sequence_ids[i]
-                       << ", latest_sequence_id=" << latest_sequence_id;
-            redisFree(ctx_);
-            ctx_ = nullptr;
-            entries.clear();
-            return ErrorCode::OPLOG_ENTRY_NOT_FOUND;
-        }
-        if (entry_reply->type == REDIS_REPLY_ERROR) {
-            LOG(ERROR) << "RedisOpLogStore::ReadOpLogSince: GET failed"
-                       << ", sequence_id=" << sequence_ids[i] << ", error="
-                       << (entry_reply->str ? entry_reply->str : "null");
-            redisFree(ctx_);
-            ctx_ = nullptr;
-            entries.clear();
-            return ErrorCode::INTERNAL_ERROR;
-        }
-        if (entry_reply->type != REDIS_REPLY_STRING) {
-            LOG(ERROR)
-                << "RedisOpLogStore::ReadOpLogSince: unexpected GET reply type"
-                << ", type=" << entry_reply->type
-                << ", sequence_id=" << sequence_ids[i];
-            redisFree(ctx_);
-            ctx_ = nullptr;
-            entries.clear();
-            return ErrorCode::INTERNAL_ERROR;
+        for (size_t i = 0; i < batch_size; ++i) {
+            const uint64_t sequence_id = batch_start + i;
+            const std::string entry_key = EntryKey(sequence_id);
+            if (redisAppendCommand(ctx_, "GET %b", entry_key.data(),
+                                   entry_key.size()) != REDIS_OK) {
+                LOG(ERROR)
+                    << "RedisOpLogStore::ReadOpLogSince: append GET failed"
+                    << ", sequence_id=" << sequence_id;
+                redisFree(ctx_);
+                ctx_ = nullptr;
+                entries.clear();
+                return ErrorCode::INTERNAL_ERROR;
+            }
         }
 
-        OpLogEntry entry;
-        std::string serialized(entry_reply->str, entry_reply->len);
-        if (!DeserializeOpLogEntry(serialized, entry)) {
-            LOG(ERROR) << "RedisOpLogStore::ReadOpLogSince: deserialize failed"
-                       << ", sequence_id=" << sequence_ids[i];
-            redisFree(ctx_);
-            ctx_ = nullptr;
-            entries.clear();
-            return ErrorCode::INTERNAL_ERROR;
+        for (size_t i = 0; i < batch_size; ++i) {
+            const uint64_t sequence_id = batch_start + i;
+            redisReply* raw_reply = nullptr;
+            if (redisGetReply(ctx_, reinterpret_cast<void**>(&raw_reply)) !=
+                    REDIS_OK ||
+                !raw_reply) {
+                LOG(ERROR)
+                    << "RedisOpLogStore::ReadOpLogSince: pipeline GET failed"
+                    << ", sequence_id=" << sequence_id;
+                redisFree(ctx_);
+                ctx_ = nullptr;
+                entries.clear();
+                return ErrorCode::INTERNAL_ERROR;
+            }
+            RedisReplyPtr entry_reply(raw_reply);
+            if (entry_reply->type == REDIS_REPLY_NIL) {
+                continue;
+            }
+            if (entry_reply->type != REDIS_REPLY_STRING) {
+                LOG(ERROR) << "RedisOpLogStore::ReadOpLogSince: unexpected GET "
+                              "reply type"
+                           << ", type=" << entry_reply->type
+                           << ", sequence_id=" << sequence_id;
+                redisFree(ctx_);
+                ctx_ = nullptr;
+                entries.clear();
+                return ErrorCode::INTERNAL_ERROR;
+            }
+
+            if (entries.size() < limit) {
+                OpLogEntry entry;
+                std::string serialized(entry_reply->str, entry_reply->len);
+                if (!DeserializeOpLogEntry(serialized, entry)) {
+                    LOG(ERROR)
+                        << "RedisOpLogStore::ReadOpLogSince: deserialize failed"
+                        << ", sequence_id=" << sequence_id;
+                    redisFree(ctx_);
+                    ctx_ = nullptr;
+                    entries.clear();
+                    return ErrorCode::INTERNAL_ERROR;
+                }
+                entries.push_back(std::move(entry));
+            }
         }
-        entries.push_back(std::move(entry));
+        next_sequence_id += batch_size;
     }
     return ErrorCode::OK;
 }
@@ -692,6 +691,8 @@ ErrorCode RedisOpLogStore::UpdateLatestSequenceId(uint64_t sequence_id) {
         persisted_sequences_.erase(
             persisted_sequences_.begin(),
             persisted_sequences_.upper_bound(sequence_id));
+        dropped_sequences_.erase(dropped_sequences_.begin(),
+                                 dropped_sequences_.upper_bound(sequence_id));
     }
     sync_cv_.notify_all();
     return ErrorCode::OK;
