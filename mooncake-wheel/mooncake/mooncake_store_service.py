@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import json
 import logging
+import signal
 import time
 
 from aiohttp import web
@@ -31,6 +32,32 @@ def _shm_name_to_path(name):
     if not normalized or "/" in normalized or normalized in {".", ".."}:
         return None
     return f"/dev/shm/{normalized}"
+
+
+def _unblock_shutdown_signals():
+    try:
+        signal.pthread_sigmask(
+            signal.SIG_UNBLOCK, {signal.SIGINT, signal.SIGTERM}
+        )
+    except AttributeError:
+        pass
+
+
+def _install_shutdown_signal_handlers(loop, shutdown_event):
+    def request_shutdown(signum):
+        logging.info("Received signal %s, shutting down", signum)
+        shutdown_event.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, request_shutdown, sig)
+        except (NotImplementedError, RuntimeError):
+            signal.signal(
+                sig,
+                lambda signum, _frame: loop.call_soon_threadsafe(
+                    request_shutdown, signum
+                ),
+            )
 
 
 class MooncakeStoreService:
@@ -94,12 +121,15 @@ class MooncakeStoreService:
             format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         )
 
-    async def start_store_service(self, max_wait_time: float = 60):
+    async def start_store_service(
+        self, max_wait_time: float = 60, shutdown_event=None
+    ):
         """
         Start the store service with retry mechanism.
 
         Args:
             max_wait_time: Maximum total wait time in seconds (default: 60)
+            shutdown_event: Optional asyncio event used to cancel startup
 
         Returns:
             True if successful, False otherwise
@@ -108,7 +138,15 @@ class MooncakeStoreService:
         retry_interval = 1.0  # Fixed retry interval: 1 second
         start_time = time.perf_counter()
 
+        if shutdown_event is not None:
+            # Process any signal callback queued immediately before startup.
+            await asyncio.sleep(0)
+
         while True:
+            if shutdown_event is not None and shutdown_event.is_set():
+                logging.info("Store startup cancelled by shutdown request")
+                return False
+
             elapsed = time.perf_counter() - start_time
             if elapsed >= max_wait_time:
                 logging.error(
@@ -143,6 +181,17 @@ class MooncakeStoreService:
                     }
                 )
 
+                if shutdown_event is not None:
+                    # setup() is synchronous. Give asyncio signal callbacks a
+                    # chance to publish a shutdown requested while it ran.
+                    await asyncio.sleep(0)
+                    if shutdown_event.is_set():
+                        logging.info(
+                            "Store startup cancelled by shutdown request"
+                        )
+                        await self.stop()
+                        return False
+
                 if ret != 0:
                     raise RuntimeError("Store initialization failed")
 
@@ -168,7 +217,20 @@ class MooncakeStoreService:
 
                 # Wait before retry, but don't exceed max_wait_time
                 if actual_sleep_time > 0:
-                    await asyncio.sleep(actual_sleep_time)
+                    if shutdown_event is not None:
+                        try:
+                            await asyncio.wait_for(
+                                shutdown_event.wait(),
+                                timeout=actual_sleep_time,
+                            )
+                            logging.info(
+                                "Store startup cancelled by shutdown request"
+                            )
+                            return False
+                        except asyncio.TimeoutError:
+                            pass
+                    else:
+                        await asyncio.sleep(actual_sleep_time)
 
     async def start_http_service(self, port: int = 8080):
         app = web.Application(client_max_size=1024 * 1024 * 100)  # 100MB limit
@@ -231,28 +293,50 @@ class MooncakeStoreService:
                     )
 
                 async with self._state_lock:
-                    # If already in decode mode with mounted segments, unmount them first
-                    if self.mounted_segment_ids:
-                        logging.info(
-                            "Reconfigure decode: unmounting previous segments before remount"
-                        )
-                        ret = self.store.unmount_segment(self.mounted_segment_ids)
-                        if ret != 0:
-                            return web.Response(
-                                status=500,
-                                text=json.dumps(
-                                    {
-                                        "error": f"Unmount of previous segments failed, ret={ret}"
-                                    }
-                                ),
-                                content_type="application/json",
-                            )
-                        self.mounted_segment_ids.clear()
-
+                    # Make-before-break remount: capture the currently serving
+                    # segments so a failed remount can keep them alive instead of
+                    # dropping all capacity.
+                    previous_segment_ids = list(self.mounted_segment_ids)
+                    # /api/reconfigure binds through store.mount_segment ->
+                    # MooncakeDistributedStore.mount_segment -> RealClient::mountSegment
+                    # -> Client::MountSegmentAndGetId -> MasterClient::MountSegment,
+                    # the standard allocator path: each mount mints a fresh UUID
+                    # and the duplicate check is UUID-keyed. That path never calls
+                    # MountNoFSegment or enters ScopedNoFSegmentAccess, so the NoF
+                    # te_endpoint dedup restriction does not apply here even in a
+                    # USE_NOF build. A same-path make-before-break therefore cannot
+                    # collide, and the old and new segments can coexist; keeping
+                    # the old segments live across a failed replacement mount
+                    # preserves decode capacity (the bug this PR fixes). Mount the
+                    # new segment first, and only retire the previous segments
+                    # per-id once the new mount succeeds.
                     result = self.store.mount_segment(
                         path, size, offset, protocol, location
                     )
                     if result["ret"] != 0:
+                        if previous_segment_ids:
+                            # New mount failed but the previous segments are still
+                            # healthy; keep serving from them instead of demoting.
+                            logging.warning(
+                                "Reconfigure decode: mount of %s failed (ret=%s); "
+                                "keeping previous decode segments",
+                                path,
+                                result["ret"],
+                            )
+                            return web.Response(
+                                status=500,
+                                text=json.dumps(
+                                    {
+                                        "error": (
+                                            f"Mount failed, ret={result['ret']}; "
+                                            "keeping previous decode segments"
+                                        ),
+                                        "mode": self.current_mode,
+                                    }
+                                ),
+                                content_type="application/json",
+                            )
+                        # Nothing healthy to fall back to; roll back to prefill.
                         self.current_mode = "prefill"
                         self.mounted_segment_ids.clear()
                         self.last_mount_info.clear()
@@ -270,7 +354,32 @@ class MooncakeStoreService:
                             content_type="application/json",
                         )
 
-                    self.mounted_segment_ids = list(result["segment_ids"])
+                    # New mount succeeded; retire any previously serving segments.
+                    # unmount_segment returns the first error for the whole batch,
+                    # so a single call can't tell which ids were actually freed.
+                    # Unmount one id at a time (as handle_unmount_shm does) and keep
+                    # only the ids whose cleanup genuinely failed: this neither leaks
+                    # them (dropping all ids on failure) nor retains stale ids for
+                    # segments that were already removed (keeping all ids on failure).
+                    failed_unmount_ids = []
+                    for sid in previous_segment_ids:
+                        ret = self.store.unmount_segment([sid])
+                        if ret != 0:
+                            failed_unmount_ids.append(sid)
+                    if failed_unmount_ids:
+                        # The new segment is already live; a failed cleanup only
+                        # leaves the old ids around. Keep them tracked so a later
+                        # unmount (or a switch back to prefill) can retry them.
+                        logging.warning(
+                            "Reconfigure decode: new mount succeeded but unmount of "
+                            "previous segments %s failed; keeping them tracked for "
+                            "future cleanup",
+                            failed_unmount_ids,
+                        )
+
+                    self.mounted_segment_ids = (
+                        list(result["segment_ids"]) + failed_unmount_ids
+                    )
                     self.current_mode = "decode"
                     self.last_mount_info = {
                         "path": path,
@@ -667,8 +776,12 @@ class MooncakeStoreService:
 
     async def stop(self):
         if self.store:
-            self.store.close()
-            logging.info("Mooncake service stopped")
+            ret = self.store.close()
+            self.store = None
+            if ret != 0:
+                logging.warning("Mooncake service close returned %s", ret)
+            else:
+                logging.info("Mooncake service stopped")
 
 
 def parse_arguments():
@@ -713,25 +826,39 @@ async def main():
             logging.warning(f"Ignoring invalid CLI config: {item}")
 
     service = MooncakeStoreService(args.config, cli_config)
+    shutdown_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    _install_shutdown_signal_handlers(loop, shutdown_event)
+    _unblock_shutdown_signals()
 
     try:
-        if not await service.start_store_service(max_wait_time=args.max_wait_time):
+        if not await service.start_store_service(
+            max_wait_time=args.max_wait_time,
+            shutdown_event=shutdown_event,
+        ):
+            if shutdown_event.is_set():
+                return
             raise RuntimeError("Failed to start store service")
+
+        _unblock_shutdown_signals()
+        await asyncio.sleep(0)
+        if shutdown_event.is_set():
+            return
 
         if not await service.start_http_service(args.port):
             raise RuntimeError("Failed to start HTTP service")
 
-        logging.info("Mooncake Store Service is running. Press Ctrl+C to stop.")
-        while True:
-            await asyncio.sleep(1)
+        logging.info("Mooncake Store Service is running")
+        await shutdown_event.wait()
 
     except KeyboardInterrupt:
-        logging.info("Received shutdown signal")
-        await service.stop()
+        logging.info("Received keyboard interrupt, shutting down")
     except Exception as e:
         logging.error("Service error: %s", e)
-        await service.stop()
         raise
+    finally:
+        await service.stop()
 
 
 def sync_main():

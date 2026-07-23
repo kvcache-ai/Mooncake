@@ -16,7 +16,7 @@ Mooncake Store.
 ## 1. Build Mooncake with NoF Support
 
 Follow the "Build with NVMe-oF SSD Pool" section in the
-[Build Guide](../getting_started/build.md) to install SPDK dependencies and
+[Build Guide](../../getting_started/build.md) to install SPDK dependencies and
 build Mooncake with `-DUSE_NOF=ON`.
 
 ## 2. Deploy Mooncake Services
@@ -233,7 +233,7 @@ Enter the SPDK directory on the target node and run the following commands.
 ### 6.2 Use NoF with vLLM + LMCache
 
 For the general VLLM + LMCache + Mooncake deployment flow, see
-[vLLM V1 Disaggregated Serving with Mooncake Store and LMCache](../getting_started/examples/vllm-integration/vllmv1-lmcache-integration.md).
+[vLLM V1 Disaggregated Serving with Mooncake Store and LMCache](../integrations/lmcache/vllmv1-lmcache-integration.md).
 After the NVMe-oF SSD pool is registered with Mooncake, add the NoF-specific
 Mooncake configuration below.
 
@@ -254,7 +254,6 @@ remote_url: "mooncakestore://192.168.65.81:50051/"
 remote_serde: "naive"
 local_cpu: True
 max_local_cpu_size: 8
-enable_mooncake_nof_pool: True
 
 extra_config:
   local_hostname: "localhost"
@@ -268,8 +267,12 @@ extra_config:
 
 **Notes**:
 
-- `enable_mooncake_nof_pool=True` enables writing KV cache objects to the
-  registered NoF pool.
+- Writing KV cache objects to the registered NoF pool is controlled per put
+  by `nof_replica_num` in the store client's `ReplicateConfig` (exposed in
+  the Python binding), and the master must be built with `USE_NOF`. The
+  LMCache Mooncake connector does not currently parse or forward such a
+  setting, so enabling the NoF pool for LMCache writes needs a connector
+  change or a direct store client.
 - `global_segment_size: 0` means the inference process does not contribute a
   memory segment to the Mooncake cluster.
 - Keep `local_buffer_size` non-zero because the client still needs local

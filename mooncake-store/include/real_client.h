@@ -29,6 +29,7 @@
 namespace mooncake {
 
 class RealClient;
+class RegisteredPinnedRegion;
 class UdsAcceptor;
 class UdsConnection;
 
@@ -756,7 +757,10 @@ class RealClient : public PyClient {
         void *base = nullptr;
         size_t size = 0;
         std::string protocol;
+        std::shared_ptr<RegisteredPinnedRegion> pinned_region;
     };
+
+    void FreeAllocatedStoreSegment(AllocatedSegmentRecord &record);
 
     std::unique_ptr<AutoPortBinder> port_binder_ = nullptr;
 
@@ -816,6 +820,9 @@ class RealClient : public PyClient {
     std::vector<std::unique_ptr<void, SunriseSegmentDeleter>>
         sunrise_segment_ptrs_;
 #endif
+    std::vector<std::shared_ptr<RegisteredPinnedRegion>>
+        setup_segment_pinned_regions_;
+    bool setup_segment_memory_must_leak_ = false;
     std::string protocol;
     std::string device_name;
     std::string local_hostname;

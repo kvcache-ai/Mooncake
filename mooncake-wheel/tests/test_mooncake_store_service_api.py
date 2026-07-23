@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 import asyncio
 import json
+import logging
+import signal
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -40,7 +44,12 @@ except ModuleNotFoundError:
     store_module.MooncakeDistributedStore = MooncakeDistributedStore
     sys.modules["mooncake.store"] = store_module
 
-from mooncake.mooncake_store_service import MooncakeStoreService, _shm_name_to_path
+from mooncake.mooncake_store_service import (
+    MooncakeStoreService,
+    _install_shutdown_signal_handlers,
+    _shm_name_to_path,
+    main as store_service_main,
+)
 
 
 class FakeStore:
@@ -249,6 +258,30 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.service.current_mode, "decode")
 
     async def test_reconfigure_decode_mount_failure_rolls_back_to_prefill(self):
+        # Fresh prefill -> decode mount that fails: there are no previously
+        # serving segments to preserve, so the node still rolls back to prefill.
+        self.service.current_mode = "prefill"
+        self.service.mounted_segment_ids = []
+        self.service.last_mount_info = {}
+        self.fake_store.fail_mount = True
+
+        resp = await self.service.handle_reconfigure(
+            FakeRequest({"mode": "decode", "path": "/dev/shm/new", "size": 4096})
+        )
+
+        self.assertEqual(resp.status, 500)
+        body = json.loads(resp.text)
+        self.assertEqual(body["mode"], "prefill")
+        self.assertIn("rolled back to prefill", body["error"])
+        self.assertEqual(self.fake_store.unmount_calls, [])
+        self.assertEqual(self.service.mounted_segment_ids, [])
+        self.assertEqual(self.service.current_mode, "prefill")
+        self.assertEqual(self.service.last_mount_info, {})
+
+    async def test_reconfigure_decode_remount_failure_keeps_previous_segments(self):
+        # A remount to a DIFFERENT path that fails to mount must not destroy the
+        # still-healthy previous segments: the node keeps serving from them and
+        # stays in decode mode (make-before-break).
         old_id = "00000000-0000-0000-0000-000000000001"
         self.service.current_mode = "decode"
         self.service.mounted_segment_ids = [old_id]
@@ -267,12 +300,132 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(resp.status, 500)
         body = json.loads(resp.text)
-        self.assertEqual(body["mode"], "prefill")
-        self.assertIn("rolled back to prefill", body["error"])
+        self.assertEqual(body["mode"], "decode")
+        self.assertIn("keeping previous decode segments", body["error"])
+        # Nothing was unmounted, capacity preserved, mode unchanged.
+        self.assertEqual(self.fake_store.unmount_calls, [])
+        self.assertEqual(self.service.mounted_segment_ids, [old_id])
+        self.assertEqual(self.service.current_mode, "decode")
+        # last_mount_info still points at the previous (working) path so a
+        # subsequent same-path detection keeps working.
+        self.assertEqual(self.service.last_mount_info["path"], "/dev/shm/old")
+
+    async def test_reconfigure_decode_same_path_remount_failure_keeps_previous_segments(self):
+        # A remount to the SAME path that fails to mount must not destroy the
+        # still-healthy previous segments: the node keeps serving from them and
+        # stays in decode mode (make-before-break). Same-path MBB is safe here
+        # because /api/reconfigure binds through MasterClient::MountSegment,
+        # which mints a fresh UUID per mount and does not enter the NoF
+        # te_endpoint-dedup path, so old and new cannot collide on the same path.
+        old_id = "00000000-0000-0000-0000-000000000001"
+        self.service.current_mode = "decode"
+        self.service.mounted_segment_ids = [old_id]
+        self.service.last_mount_info = {
+            "path": "/dev/shm/same",
+            "offset": 0,
+            "size": 4096,
+            "protocol": "tcp",
+            "location": "",
+        }
+        self.fake_store.fail_mount = True
+
+        resp = await self.service.handle_reconfigure(
+            FakeRequest({"mode": "decode", "path": "/dev/shm/same", "size": 4096})
+        )
+
+        self.assertEqual(resp.status, 500)
+        body = json.loads(resp.text)
+        self.assertEqual(body["mode"], "decode")
+        self.assertIn("keeping previous decode segments", body["error"])
+        # Nothing was unmounted, capacity preserved, mode unchanged.
+        self.assertEqual(self.fake_store.unmount_calls, [])
+        self.assertEqual(self.service.mounted_segment_ids, [old_id])
+        self.assertEqual(self.service.current_mode, "decode")
+        # last_mount_info still points at the previous (working) same path so a
+        # subsequent remount keeps working.
+        self.assertEqual(self.service.last_mount_info["path"], "/dev/shm/same")
+
+    async def test_reconfigure_decode_remount_success_is_make_before_break(self):
+        # A successful remount to a DIFFERENT path must mount the new segment
+        # BEFORE retiring the old one (make-before-break), then leave only the
+        # new segment serving. Distinct ids let old and new be told apart.
+        old_id = "00000000-0000-0000-0000-000000000001"
+        new_id = "00000000-0000-0000-0000-000000000002"
+        self.service.current_mode = "decode"
+        self.service.mounted_segment_ids = [old_id]
+        self.service.last_mount_info = {
+            "path": "/dev/shm/old",
+            "offset": 0,
+            "size": 4096,
+            "protocol": "tcp",
+            "location": "",
+        }
+
+        order = {"old_still_mounted_at_new_mount": None}
+
+        def mount_new(path, size, offset, protocol, location):
+            # The old segment must still be serving when the new one is mounted.
+            order["old_still_mounted_at_new_mount"] = (
+                old_id in self.service.mounted_segment_ids
+            )
+            return {"ret": 0, "segment_ids": [new_id]}
+
+        self.fake_store.mount_segment = mount_new
+
+        resp = await self.service.handle_reconfigure(
+            FakeRequest({"mode": "decode", "path": "/dev/shm/new", "size": 8192})
+        )
+
+        self.assertEqual(resp.status, 200)
+        body = json.loads(resp.text)
+        self.assertEqual(body["mode"], "decode")
+        # Make-before-break: the old segment was still mounted when the new one
+        # was created, and it is retired only after the new mount succeeds.
+        self.assertTrue(order["old_still_mounted_at_new_mount"])
         self.assertEqual(self.fake_store.unmount_calls, [([old_id], 0)])
-        self.assertEqual(self.service.mounted_segment_ids, [])
-        self.assertEqual(self.service.current_mode, "prefill")
-        self.assertEqual(self.service.last_mount_info, {})
+        # Only the new segment is left serving; the old one is gone.
+        self.assertEqual(self.service.mounted_segment_ids, [new_id])
+        self.assertEqual(self.service.current_mode, "decode")
+        self.assertEqual(self.service.last_mount_info["path"], "/dev/shm/new")
+
+    async def test_reconfigure_decode_partial_unmount_failure_keeps_only_failed_ids(self):
+        # New mount succeeds, but retiring the previous segments only PARTIALLY
+        # fails. unmount_segment reports the first error for a batch, so the old
+        # ids must be unmounted individually; mounted_segment_ids must then hold
+        # the new id plus ONLY the id whose cleanup actually failed -- not the
+        # whole previous set (which would retain a stale, already-freed id) and
+        # not none of it (which would silently leak the still-live old segment).
+        old_ok = "00000000-0000-0000-0000-0000000000a1"
+        old_fail = "00000000-0000-0000-0000-0000000000a2"
+        new_id = "00000000-0000-0000-0000-0000000000b1"
+        self.service.current_mode = "decode"
+        self.service.mounted_segment_ids = [old_ok, old_fail]
+        self.service.last_mount_info = {
+            "path": "/dev/shm/old",
+            "offset": 0,
+            "size": 4096,
+            "protocol": "tcp",
+            "location": "",
+        }
+        self.fake_store.unmount_failures = {old_fail}
+
+        def mount_new(path, size, offset, protocol, location):
+            return {"ret": 0, "segment_ids": [new_id]}
+
+        self.fake_store.mount_segment = mount_new
+
+        resp = await self.service.handle_reconfigure(
+            FakeRequest({"mode": "decode", "path": "/dev/shm/new", "size": 8192})
+        )
+
+        self.assertEqual(resp.status, 200)
+        # Each previous id was unmounted on its own, not as a single batch.
+        self.assertEqual(
+            self.fake_store.unmount_calls, [([old_ok], 0), ([old_fail], 0)]
+        )
+        # New id serves; the freed id is dropped, the un-freed id stays tracked.
+        self.assertEqual(self.service.mounted_segment_ids, [new_id, old_fail])
+        self.assertEqual(self.service.current_mode, "decode")
 
     async def test_mount_allocates_and_frees_on_unmount(self):
         mount_resp = await self.service.handle_mount(
@@ -753,6 +906,157 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
     async def test_unmount_shm_empty_list(self):
         resp = await self.service.handle_unmount_shm(FakeRequest({"segment_ids": []}))
         self.assertEqual(resp.status, 400)
+
+
+class StoreServiceShutdownTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.service = MooncakeStoreService.__new__(MooncakeStoreService)
+        self.service.store = None
+        self.service.config = SimpleNamespace(
+            local_hostname="localhost",
+            metadata_server="P2PHANDSHAKE",
+            global_segment_size=1,
+            local_buffer_size=0,
+            protocol="tcp",
+            device_name="",
+            master_server_address="localhost:50051",
+            enable_ssd_offload=False,
+            ssd_offload_path="",
+            tenant_id="",
+        )
+
+    async def test_shutdown_event_stops_startup_retry_sleep(self):
+        class FailingStore:
+            def setup(self, *_args):
+                raise RuntimeError("setup failed")
+
+        shutdown_event = asyncio.Event()
+
+        async def trigger_shutdown():
+            await asyncio.sleep(0)
+            shutdown_event.set()
+
+        with mock.patch(
+            "mooncake.mooncake_store_service.MooncakeDistributedStore",
+            FailingStore,
+        ):
+            shutdown_task = asyncio.create_task(trigger_shutdown())
+            start_time = time.perf_counter()
+            with self.assertLogs(level=logging.WARNING):
+                result = await self.service.start_store_service(
+                    max_wait_time=2, shutdown_event=shutdown_event
+                )
+            elapsed = time.perf_counter() - start_time
+            await shutdown_task
+
+        self.assertFalse(result)
+        self.assertLess(elapsed, 0.5)
+
+    async def test_shutdown_during_setup_is_observed_before_success(self):
+        shutdown_event = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        class SchedulingStore(FakeStore):
+            def __init__(self):
+                super().__init__()
+                self.close_calls = 0
+
+            def setup(self, *args):
+                ret = super().setup(*args)
+                loop.call_soon(shutdown_event.set)
+                return ret
+
+            def close(self):
+                self.close_calls += 1
+                return 0
+
+        store = SchedulingStore()
+        with mock.patch(
+            "mooncake.mooncake_store_service.MooncakeDistributedStore",
+            return_value=store,
+        ):
+            result = await self.service.start_store_service(
+                max_wait_time=1, shutdown_event=shutdown_event
+            )
+
+        self.assertFalse(result)
+        self.assertEqual(store.close_calls, 1)
+        self.assertIsNone(self.service.store)
+
+    async def test_stop_logs_nonzero_close_return(self):
+        store = mock.Mock()
+        store.close.return_value = 7
+        self.service.store = store
+
+        with self.assertLogs(level=logging.WARNING) as logs:
+            await self.service.stop()
+
+        self.assertIsNone(self.service.store)
+        self.assertTrue(
+            any("close returned 7" in message for message in logs.output)
+        )
+        await self.service.stop()
+        store.close.assert_called_once_with()
+
+    async def test_signal_handler_requests_shutdown(self):
+        loop = mock.Mock()
+        shutdown_event = asyncio.Event()
+
+        _install_shutdown_signal_handlers(loop, shutdown_event)
+
+        sigterm_call = next(
+            call
+            for call in loop.add_signal_handler.call_args_list
+            if call.args[0] == signal.SIGTERM
+        )
+        sigterm_call.args[1](sigterm_call.args[2])
+        self.assertTrue(shutdown_event.is_set())
+
+    async def test_main_closes_store_when_shutdown_requested_during_startup(self):
+        args = SimpleNamespace(
+            config=None,
+            define=[],
+            max_wait_time=60,
+            port=8080,
+        )
+        service = mock.Mock()
+        service.start_store_service = mock.AsyncMock(return_value=False)
+        service.start_http_service = mock.AsyncMock(return_value=True)
+        service.stop = mock.AsyncMock()
+
+        startup_calls = []
+
+        def request_shutdown(_loop, shutdown_event):
+            startup_calls.append("install")
+            shutdown_event.set()
+
+        def unblock_shutdown_signals():
+            startup_calls.append("unblock")
+
+        with (
+            mock.patch(
+                "mooncake.mooncake_store_service.parse_arguments",
+                return_value=args,
+            ),
+            mock.patch(
+                "mooncake.mooncake_store_service.MooncakeStoreService",
+                return_value=service,
+            ),
+            mock.patch(
+                "mooncake.mooncake_store_service._unblock_shutdown_signals",
+                side_effect=unblock_shutdown_signals,
+            ),
+            mock.patch(
+                "mooncake.mooncake_store_service._install_shutdown_signal_handlers",
+                side_effect=request_shutdown,
+            ),
+        ):
+            await store_service_main()
+
+        service.start_store_service.assert_awaited_once()
+        service.start_http_service.assert_not_awaited()
+        service.stop.assert_awaited_once()
+        self.assertEqual(startup_calls, ["install", "unblock"])
 
 
 class ShmNameToPathTest(unittest.TestCase):

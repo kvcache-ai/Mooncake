@@ -47,6 +47,7 @@ using SegmentID = Transport::SegmentID;
 using BatchID = Transport::BatchID;
 const static BatchID INVALID_BATCH_ID = UINT64_MAX;
 using BufferEntry = Transport::BufferEntry;
+using NicLoadStats = Transport::NicLoadStats;
 
 enum class PeerLiveness : uint8_t {
     Alive = 0,
@@ -170,6 +171,8 @@ class TransferEngine {
                              TransferStatus& status);
 
     Status getBatchTransferStatus(BatchID batch_id, TransferStatus& status);
+
+    Status getNicLoadStats(std::vector<NicLoadStats>& stats) const;
 
     Transport* getTransport(const std::string& proto);
 
