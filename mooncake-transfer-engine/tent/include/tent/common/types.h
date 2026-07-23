@@ -90,9 +90,10 @@ inline const char* transportTypeName(TransportType type) {
             return "sunrise_link";
         case TPU:
             return "tpu";
-        default:
+        case kNumTransportTypes:
             return "unknown";
     }
+    return "unknown";
 }
 
 inline TransportType parseTransportType(const std::string& str) {
