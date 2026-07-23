@@ -23,7 +23,7 @@ jobs:
       cuda: container
       build-with-ep: '1'
       torch-cuda-arch-list: '8.0;9.0'
-      ep-torch-versions: '2.11.0;2.12.0;2.12.1'
+      ep-torch-versions: '2.11.0;2.12.0;2.12.1;2.13.0'
       build-nvlink-allocator: true
       cmake-args: >-
         -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON
@@ -52,7 +52,7 @@ jobs:
       build-with-ep: '1'
       variant-flag: CU13_BUILD
       torch-cuda-arch-list: '8.0;9.0'
-      ep-torch-versions: '2.11.0;2.12.0;2.12.1'
+      ep-torch-versions: '2.11.0;2.12.0;2.12.1;2.13.0'
       build-nvlink-allocator: true
       cmake-args: >-
         -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON
