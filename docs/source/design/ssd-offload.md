@@ -150,7 +150,7 @@ Each object is stored as an individual file. The file path is derived from the k
 
 ### OffsetAllocatorStorageBackend
 
-A single pre-allocated file (`kv_cache.data`) is shared by all objects. Space within the file is managed by an `OffsetAllocator`. Metadata is sharded across 1024 independent maps to reduce lock contention under high concurrency. Records follow the layout `[key_len: u32 | value_len: u32 | key | value]`.
+A single pre-allocated file (`kv_cache.data`) is shared by all objects. Space within the file is managed by an `OffsetAllocator`. Metadata is sharded across 1024 independent maps to reduce lock contention under high concurrency. Records follow the layout `[key_len: u32 | value_len: u32 | seq: u64 | flags: u32 | crc32: u32 | key | zero padding | value]`. The value region always starts at a 4 KiB boundary within the record (padding is a pure function of `key_len`) so that DMA writers (e.g. GDS/cuFile) can use aligned file offsets. `seq` is a monotonic stamp used by restart recovery to drop post-checkpoint writes; `crc32` is a CRC-32C over header prefix + key + value and is present only when `flags & kFlagHasCrc` (see `enable_record_crc` in `OffsetAllocatorBackendConfig`).
 
 ---
 
