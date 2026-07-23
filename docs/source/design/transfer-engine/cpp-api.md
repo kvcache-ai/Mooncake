@@ -12,7 +12,7 @@ For conceptual background, see [Transfer Engine](index.md).
 
 **TENT compatibility mode**
 - When Mooncake is built with TENT support, setting `MC_USE_TENT=1` or `MC_USE_TEV1=1` makes this `TransferEngine` API delegate to the TENT runtime.
-- The common TE workflow is preserved, but APIs that expose classic TE internals have compatibility-specific behavior. See [TENT Transfer Engine compatibility mode](../tent/cpp-api.md#transfer-engine-compatibility-mode-semantics) for the full behavior table.
+- The common TE workflow is preserved, but APIs that expose classic TE internals have compatibility-specific behavior. See TENT Transfer Engine compatibility mode for the full behavior table.
 
 ## Core APIs
 
