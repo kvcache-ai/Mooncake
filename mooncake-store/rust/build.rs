@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Helpers below are only exercised by the `link` build path; a pure `dlopen`
+// build returns early from main() and leaves them unused.
+#![allow(dead_code)]
+
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -164,6 +168,16 @@ fn add_compiler_runtime_search_dir(search_dirs: &mut Vec<PathBuf>, file_name: &s
 }
 
 fn main() {
+    // The `dlopen` feature loads libmooncake_store.so at run time via libloading
+    // (see src/ffi_dlopen.rs) and needs neither a Mooncake C++ build tree nor
+    // bindgen-generated bindings. Skip all link/bindgen work unless the `link`
+    // feature (the default) is active. Build scripts do not get feature cfgs, so
+    // we read the CARGO_FEATURE_* env var Cargo sets for each active feature.
+    if env::var_os("CARGO_FEATURE_LINK").is_none() {
+        println!("cargo:rerun-if-env-changed=CARGO_FEATURE_LINK");
+        return;
+    }
+
     // -----------------------------------------------------------------------
     // Library search path
     //

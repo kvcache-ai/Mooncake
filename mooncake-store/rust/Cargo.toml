@@ -14,9 +14,26 @@ crate-type = ["rlib"]
 name = "basic_usage"
 path = "examples/basic_usage.rs"
 
+[features]
+default = ["link"]
+# Statically link `libmooncake_store` at build time. build.rs generates the FFI
+# with bindgen and links the Mooncake C++ static-library graph, so a built
+# Mooncake tree (libraries + `store_c.h`) must be present at build time. This is
+# the historical behavior.
+link = []
+# Load `libmooncake_store.so` at run time via `dlopen` (libloading). The crate
+# builds with no Mooncake C++ toolchain, headers, or generated bindings present;
+# the shared library is only required at run time. See `src/ffi_dlopen.rs`.
+dlopen = ["dep:libloading"]
+
 [dependencies]
 thiserror = "2.0"
 libc = "0.2"
+libloading = { version = "0.8", optional = true }
 
+# NOTE: bindgen is only invoked by build.rs under the `link` feature. It is kept
+# as a normal build-dependency (not optional) because Cargo build scripts do not
+# receive feature cfgs, so build.rs must be able to name `bindgen::` regardless;
+# under `dlopen` it is compiled but never called (no libclang needed at build).
 [build-dependencies]
 bindgen = "0.70"

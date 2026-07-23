@@ -44,4 +44,24 @@ pub enum StoreError {
     /// One or more arguments are invalid (e.g. mismatched array lengths).
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+
+    /// The Mooncake shared library could not be loaded at run time.
+    ///
+    /// Only produced by the `dlopen` backend (see [`crate::load_library`]).
+    #[cfg(feature = "dlopen")]
+    #[error("failed to load Mooncake shared library: {0}")]
+    LibraryLoad(String),
+
+    /// A required symbol was missing from the loaded Mooncake library, i.e. the
+    /// library does not export the expected `store_c.h` C ABI.
+    ///
+    /// Only produced by the `dlopen` backend.
+    #[cfg(feature = "dlopen")]
+    #[error("missing symbol `{symbol}` in Mooncake shared library: {detail}")]
+    SymbolLoad {
+        /// Name of the symbol that could not be resolved.
+        symbol: &'static str,
+        /// Underlying loader error message.
+        detail: String,
+    },
 }

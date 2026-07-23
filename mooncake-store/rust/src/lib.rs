@@ -41,8 +41,25 @@
 //! store.remove("hello", false)?;
 //! ```
 
+//! ## Backends (features)
+//!
+//! - `link` (default): statically link `libmooncake_store` at build time
+//!   (bindgen; requires a built Mooncake C++ tree + `store_c.h`).
+//! - `dlopen`: load `libmooncake_store.so` at run time; builds with no C++
+//!   toolchain present. See [`load_library`].
+
+#[cfg(not(any(feature = "link", feature = "dlopen")))]
+compile_error!("enable exactly one of the `link` (default) or `dlopen` features");
+
 pub mod error;
 pub mod store;
 
+// Runtime dlopen backend; `link` wins if both are enabled.
+#[cfg(all(feature = "dlopen", not(feature = "link")))]
+mod ffi_dlopen;
+
 pub use error::StoreError;
 pub use store::{MooncakeStore, ReplicateConfig};
+
+#[cfg(all(feature = "dlopen", not(feature = "link")))]
+pub use ffi_dlopen::load_library;
