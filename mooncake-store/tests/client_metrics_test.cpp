@@ -124,6 +124,26 @@ TEST_F(ClientMetricsTest, TransferMetricsSummaryTest) {
     std::cout << "Transfer Metrics Summary:\n" << summary << std::endl;
 }
 
+TEST_F(ClientMetricsTest, TransferPathMetricsSeparateManagedAndUnmanaged) {
+    TransferMetric metrics;
+
+    metrics.ObserveTransferPath("foreground_get", "transfer_engine", 4096,
+                                true);
+    metrics.ObserveTransferPath("background_prefetch", "file", 8192, false);
+
+    std::string serialized;
+    metrics.serialize(serialized);
+
+    EXPECT_NE(serialized.find("mooncake_store_transfer_path_bytes"),
+              std::string::npos);
+    EXPECT_NE(serialized.find("intent=\"foreground_get\""), std::string::npos);
+    EXPECT_NE(serialized.find("path=\"transfer_engine\""), std::string::npos);
+    EXPECT_NE(serialized.find("mooncake_store_unmanaged_transfer_bytes"),
+              std::string::npos);
+    EXPECT_NE(serialized.find("intent=\"background_prefetch\""),
+              std::string::npos);
+}
+
 TEST_F(ClientMetricsTest, MasterClientMetricsSummaryTest) {
     MasterClientMetric metrics;
 

@@ -103,11 +103,22 @@ Result execute_timed_operation(Operation&& operation, SuccessFn&& success_fn,
 enum class TransferOperationKind { kRead, kWrite };
 
 struct TransferMetric {
+    std::array<std::string, 2> transfer_path_label_names = {"intent", "path"};
+    std::array<std::string, 1> transfer_intent_label_names = {"intent"};
+
     TransferMetric(std::map<std::string, std::string> labels = {})
         : total_read_bytes("mooncake_transfer_read_bytes", "Total bytes read",
                            labels),
           total_write_bytes("mooncake_transfer_write_bytes",
                             "Total bytes written", labels),
+          transfer_path_bytes(
+              "mooncake_store_transfer_path_bytes",
+              "Store transfer bytes by normalized intent and executed path",
+              labels, transfer_path_label_names),
+          unmanaged_transfer_bytes(
+              "mooncake_store_unmanaged_transfer_bytes",
+              "Store transfer bytes executed outside Transfer Engine control",
+              labels, transfer_intent_label_names),
           batch_put_latency_us("mooncake_transfer_batch_put_latency",
                                "Batch Put transfer latency (us)",
                                kLatencyBucket, labels),
@@ -122,6 +133,8 @@ struct TransferMetric {
 
     ylt::metric::counter_t total_read_bytes;
     ylt::metric::counter_t total_write_bytes;
+    ylt::metric::hybrid_counter_2t transfer_path_bytes;
+    ylt::metric::hybrid_counter_1t unmanaged_transfer_bytes;
     ylt::metric::histogram_t batch_put_latency_us;
     ylt::metric::histogram_t batch_get_latency_us;
     ylt::metric::histogram_t get_latency_us;
@@ -130,10 +143,20 @@ struct TransferMetric {
     void serialize(std::string& str) {
         total_read_bytes.serialize(str);
         total_write_bytes.serialize(str);
+        transfer_path_bytes.serialize(str);
+        unmanaged_transfer_bytes.serialize(str);
         batch_put_latency_us.serialize(str);
         batch_get_latency_us.serialize(str);
         get_latency_us.serialize(str);
         put_latency_us.serialize(str);
+    }
+
+    void ObserveTransferPath(const std::string& intent, const std::string& path,
+                             uint64_t bytes, bool transfer_engine_managed) {
+        transfer_path_bytes.inc({intent, path}, bytes);
+        if (!transfer_engine_managed) {
+            unmanaged_transfer_bytes.inc({intent}, bytes);
+        }
     }
 
     std::string summary_metrics(bool include_bandwidth = true) {

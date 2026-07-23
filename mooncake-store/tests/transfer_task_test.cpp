@@ -175,6 +175,26 @@ TEST_F(TransferTaskTest, IsSameProcessEndpoint) {
     EXPECT_FALSE(TransferSubmitter::isSameProcessEndpoint("host-a", "host-b"));
 }
 
+TEST_F(TransferTaskTest, StoreTransferIntentNormalization) {
+    EXPECT_EQ(TransferSubmitter::effectiveIntent({}, TransferRequest::READ),
+              StoreTransferIntent::FOREGROUND_GET);
+    EXPECT_EQ(TransferSubmitter::effectiveIntent({}, TransferRequest::WRITE),
+              StoreTransferIntent::UNSPECIFIED);
+
+    StoreTransferContext context{.intent =
+                                     StoreTransferIntent::BACKGROUND_PREFETCH};
+    EXPECT_EQ(
+        TransferSubmitter::effectiveIntent(context, TransferRequest::READ),
+        StoreTransferIntent::BACKGROUND_PREFETCH);
+    EXPECT_STREQ(TransferSubmitter::intentName(context.intent),
+                 "background_prefetch");
+    EXPECT_STREQ(
+        TransferSubmitter::pathName(StoreTransferPath::TRANSFER_ENGINE),
+        "transfer_engine");
+    EXPECT_STREQ(TransferSubmitter::pathName(StoreTransferPath::LOCAL_MEMCPY),
+                 "local_memcpy");
+}
+
 // Test TransferStrategy enum and stream operator
 TEST_F(TransferTaskTest, TransferStrategyEnum) {
     // Test enum values

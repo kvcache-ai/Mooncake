@@ -519,6 +519,28 @@ class FilereadWorkerPool {
     std::shared_ptr<StorageBackend> backend_;
 };
 
+// A bounded, transport-independent intent vocabulary for Store transfers.
+// Phase 0 only records this context. Scheduling behavior remains unchanged.
+enum class StoreTransferIntent {
+    UNSPECIFIED = 0,
+    FOREGROUND_GET,
+    BACKGROUND_PREFETCH,
+    MIGRATION,
+    WEIGHT_LOADING,
+};
+
+struct StoreTransferContext {
+    StoreTransferIntent intent = StoreTransferIntent::UNSPECIFIED;
+};
+
+enum class StoreTransferPath {
+    UNKNOWN = 0,
+    TRANSFER_ENGINE,
+    LOCAL_MEMCPY,
+    NVME_OF,
+    FILE,
+};
+
 /**
  * @brief Submitter class for asynchronous transfer operations
  *
@@ -550,7 +572,8 @@ class TransferSubmitter {
     std::optional<TransferFuture> submit(const Replica::Descriptor& replica,
                                          std::vector<Slice>& slices,
                                          TransferRequest::OpCode op_code,
-                                         void* ptr = nullptr, size_t size = 0);
+                                         void* ptr = nullptr, size_t size = 0,
+                                         StoreTransferContext context = {});
 
     /**
      * @brief Submit a range read: read [src_offset, src_offset+size) from
@@ -558,12 +581,12 @@ class TransferSubmitter {
      */
     std::optional<TransferFuture> submitRangeRead(
         const Replica::Descriptor& replica, std::vector<Slice>& slices,
-        uint64_t src_offset);
+        uint64_t src_offset, StoreTransferContext context = {});
 
     std::optional<TransferFuture> submit_batch(
         const std::vector<Replica::Descriptor>& replicas,
         std::vector<std::vector<Slice>>& all_slices,
-        TransferRequest::OpCode op_code);
+        TransferRequest::OpCode op_code, StoreTransferContext context = {});
 
     std::optional<TransferFuture> submit_batch_get_offload_object(
         const std::string& transfer_engine_addr,
@@ -571,6 +594,11 @@ class TransferSubmitter {
         const std::vector<uint64_t>& pointers,
         const std::unordered_map<std::string, std::vector<Slice>>&
             batched_slices);
+
+    static StoreTransferIntent effectiveIntent(StoreTransferContext context,
+                                               TransferRequest::OpCode op_code);
+    static const char* intentName(StoreTransferIntent intent);
+    static const char* pathName(StoreTransferPath path);
 
     /**
      * @brief Pure comparison helper: returns true iff both endpoints are
@@ -654,7 +682,9 @@ class TransferSubmitter {
      * @brief Calculate total bytes for transfer operation and update metrics
      */
     void updateTransferMetrics(const std::vector<Slice>& slices,
-                               TransferRequest::OpCode op);
+                               TransferRequest::OpCode op,
+                               StoreTransferContext context,
+                               StoreTransferPath path);
 
     std::optional<TransferFuture> submitTransfer(
         std::vector<TransferRequest>& requests);
