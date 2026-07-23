@@ -59,6 +59,7 @@ class EtcdOpLogStore;
 class AllocationStrategy;
 class EvictionStrategy;
 class HttpMetadataServer;
+class StorageBackendInterface;
 struct MetadataStoragePlugin;
 
 // Forward declarations for test classes
@@ -246,6 +247,15 @@ class MasterService {
      */
     auto GetNoFSegmentsByName(const std::string& segment_name)
         -> tl::expected<std::vector<NoFSegmentOwnerInfo>, ErrorCode>;
+
+    auto ListNoFDeviceMetadata()
+        -> tl::expected<std::vector<StorageDeviceMetadata>, ErrorCode>;
+
+    auto UpdateNoFDeviceMetadata(const StorageDeviceMetadataUpdate& update)
+        -> tl::expected<StorageDeviceMetadata, ErrorCode>;
+
+    auto BuildNoFDeviceMaintenancePlan()
+        -> tl::expected<StorageDeviceMaintenancePlan, ErrorCode>;
 
     /**
      * @brief Detailed information about a single segment.
@@ -738,21 +748,14 @@ class MasterService {
                                                  const std::string& source,
                                                  const std::string& target);
 
-    /**
-     * @brief Create a drain job to gracefully evacuate one or more segments.
-     */
     tl::expected<UUID, ErrorCode> CreateDrainJob(
         const CreateDrainJobRequest& request);
-
-    /**
-     * @brief Query the status of a drain job.
-     */
-    tl::expected<QueryJobResponse, ErrorCode> QueryDrainJob(const UUID& job_id);
-
-    /**
-     * @brief Cancel an in-flight drain job and restore draining segments to OK.
-     */
-    tl::expected<void, ErrorCode> CancelDrainJob(const UUID& job_id);
+    tl::expected<UUID, ErrorCode> CreateRebuildJob(
+        const CreateRebuildJobRequest& request);
+    tl::expected<QueryJobResponse, ErrorCode> QueryMigrationJob(
+        const UUID& job_id);
+    tl::expected<void, ErrorCode> CancelMigrationJob(const UUID& job_id);
+    std::optional<UUID> FindActiveRebuildJobForDevice(const UUID& device_id);
 
     /**
      * @brief Query current segment lifecycle state by segment name.
@@ -765,6 +768,10 @@ class MasterService {
      */
     tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatusById(
         const UUID& segment_id);
+
+    tl::expected<DeviceCleanupResponse, ErrorCode> CleanupDevice(
+        const DeviceCleanupRequest& request,
+        std::shared_ptr<StorageBackendInterface> storage_backend);
 
     /**
      * @brief Query the status of a task
@@ -2116,7 +2123,7 @@ class MasterService {
     // Task manager
     ClientTaskManager task_manager_;
 
-    struct ActiveDrainTask {
+    struct MigrationTask {
         UUID task_id;
         TenantId tenant_id;
         std::string key;
@@ -2126,12 +2133,11 @@ class MasterService {
         std::string unit_key;
     };
 
-    struct DrainJob {
+    struct MigrationJob {
         mutable std::mutex mutex;
         UUID id;
         JobType type{JobType::DRAIN};
         JobStatus status{JobStatus::CREATED};
-        CreateDrainJobRequest request;
         std::chrono::system_clock::time_point created_at;
         std::chrono::system_clock::time_point last_updated_at;
         std::string message;
@@ -2139,37 +2145,58 @@ class MasterService {
         uint64_t failed_units{0};
         uint64_t blocked_units{0};
         uint64_t migrated_bytes{0};
-        std::unordered_map<UUID, ActiveDrainTask, boost::hash<UUID>>
-            active_tasks;
+        std::unordered_map<UUID, MigrationTask, boost::hash<UUID>> active_tasks;
         std::unordered_set<std::string> completed_unit_keys;
         std::unordered_map<std::string, uint32_t> retry_counts;
         std::unordered_set<std::string> terminal_failed_unit_keys;
+
+        CreateDrainJobRequest drain_request;
+        CreateRebuildJobRequest rebuild_request;
+        std::unordered_set<std::string> device_segment_names;
+
+        uint32_t max_concurrency() const {
+            return type == JobType::DRAIN ? drain_request.max_concurrency
+                                          : rebuild_request.max_concurrency;
+        }
+        const std::vector<std::string>& target_segments() const {
+            return type == JobType::DRAIN ? drain_request.target_segments
+                                          : rebuild_request.target_segments;
+        }
     };
 
-    static constexpr uint32_t kMaxDrainUnitRetries = 3;
+    static constexpr uint32_t kMaxMigrationUnitRetries = 3;
 
     tl::expected<void, ErrorCode> ValidateDrainRequest(
         const CreateDrainJobRequest& request);
     tl::expected<void, ErrorCode> ValidateDrainRequestLocked(
         ScopedSegmentAccess& segment_access,
         const CreateDrainJobRequest& request);
-    void ProcessDrainJobs();
-    void RefreshDrainJobTasks(DrainJob& job);
-    void ScheduleDrainJobTasks(DrainJob& job);
-    bool MaybeCompleteDrainJob(DrainJob& job);
+
+    void ProcessMigrationJobs();
+    void RefreshJobTasks(MigrationJob& job);
+    void ScheduleMigrationUnits(MigrationJob& job);
+    bool MaybeCompleteMigrationJob(MigrationJob& job);
+    QueryJobResponse BuildQueryJobResponse(const MigrationJob& job) const;
+
     std::optional<std::string> SelectDrainTargetForKey(
         const ObjectMetadata& metadata, const std::string& source_segment,
         const std::vector<std::string>& requested_targets);
-    std::string MakeDrainUnitKey(const TenantId& tenant_id,
-                                 const std::string& key,
-                                 const std::string& source_segment) const;
+    std::optional<std::string> SelectRebuildTargetForKey(
+        const ObjectMetadata& metadata,
+        const std::unordered_set<std::string>& excluded_segments,
+        const std::vector<std::string>& requested_targets);
+
+    std::string MakeMigrationUnitKey(const std::string& prefix,
+                                     const TenantId& tenant_id,
+                                     const std::string& key,
+                                     const std::string& source_segment) const;
 
     std::thread job_dispatch_thread_;
     std::atomic<bool> job_dispatch_running_{false};
     static constexpr uint64_t kJobDispatchThreadSleepMs = 500;
     std::mutex job_mutex_;
-    std::unordered_map<UUID, std::shared_ptr<DrainJob>, boost::hash<UUID>>
-        drain_jobs_ GUARDED_BY(job_mutex_);
+    std::unordered_map<UUID, std::shared_ptr<MigrationJob>, boost::hash<UUID>>
+        migration_jobs_ GUARDED_BY(job_mutex_);
 
     std::unique_ptr<KvEventPublisher> kv_event_publisher_;
 
@@ -2190,6 +2217,12 @@ class MasterService {
                                     const std::string& medium,
                                     const ObjectMetadata& metadata,
                                     const TenantId& tenant_id);
+
+    mutable std::mutex cleanup_mutex_;
+    std::unordered_set<std::string> active_cleanups_;
+    bool CanCleanupKey(const std::string& key, const TenantId& tenant_id,
+                       uint64_t* payload_size,
+                       std::chrono::system_clock::time_point* rank_time) const;
 };
 
 }  // namespace mooncake

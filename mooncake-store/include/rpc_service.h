@@ -2,6 +2,7 @@
 
 #include <csignal>
 
+#include <optional>
 #include <string>
 #include <boost/functional/hash.hpp>
 #include <cstdint>
@@ -9,6 +10,8 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "master_service.h"
+#include "storage_backend.h"
+#include "storage_device_view.h"
 #include "types.h"
 #include "rpc_types.h"
 #include "master_config.h"
@@ -33,6 +36,9 @@ class WrappedMasterService {
                          const std::string& http_metadata_remote_url = "");
 
     ~WrappedMasterService();
+
+    void SetStorageBackendForAdmin(
+        std::shared_ptr<StorageBackendInterface> storage_backend);
 
     tl::expected<bool, ErrorCode> ExistKey(
         const std::string& key, const std::string& tenant_id = "default");
@@ -204,6 +210,33 @@ class WrappedMasterService {
     tl::expected<std::vector<MasterService::SegmentDetailInfo>, ErrorCode>
     GetSegmentsDetailForAdmin();
 
+    tl::expected<std::vector<StorageDeviceMetadata>, ErrorCode>
+    GetDeviceMetadataForAdmin();
+
+    tl::expected<StorageDeviceMetadata, ErrorCode> UpdateDeviceMetadataForAdmin(
+        const StorageDeviceMetadataUpdate& update);
+
+    tl::expected<StorageDeviceMetadata, ErrorCode> RecoverDeviceForAdmin(
+        const UUID& device_id, const std::string& action,
+        const StorageDeviceMetadataUpdate& nof_update,
+        std::string* out_rebuild_job_id = nullptr);
+
+    tl::expected<StorageDeviceMetadata, ErrorCode> ProbeDeviceForAdmin(
+        const UUID& device_id, const std::string& action,
+        const std::string& reason,
+        const StorageDeviceMetadataUpdate& nof_update);
+
+    tl::expected<StorageDeviceMaintenancePlan, ErrorCode>
+    GetDeviceMaintenancePlanForAdmin();
+
+    // Run a provider probe against every storage-backend-owned device (e.g.
+    // NVMe KV namespaces) and return the number of devices probed. Used by the
+    // background probe worker. NoF logical pools are not probed here.
+    size_t ProbeStorageBackendDevicesForAdmin();
+
+    tl::expected<DeviceCleanupResponse, ErrorCode> CleanupDeviceForAdmin(
+        const DeviceCleanupRequest& request);
+
     tl::expected<std::pair<uint64_t, uint64_t>, ErrorCode> QuerySegmentForAdmin(
         const std::string& segment);
 
@@ -239,10 +272,11 @@ class WrappedMasterService {
 
     tl::expected<UUID, ErrorCode> CreateDrainJob(
         const CreateDrainJobRequest& request);
-
-    tl::expected<QueryJobResponse, ErrorCode> QueryDrainJob(const UUID& job_id);
-
-    tl::expected<void, ErrorCode> CancelDrainJob(const UUID& job_id);
+    tl::expected<UUID, ErrorCode> CreateRebuildJob(
+        const CreateRebuildJobRequest& request);
+    tl::expected<QueryJobResponse, ErrorCode> QueryMigrationJob(
+        const UUID& job_id);
+    tl::expected<void, ErrorCode> CancelMigrationJob(const UUID& job_id);
 
     tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatus(
         const std::string& segment_name);
@@ -304,7 +338,17 @@ class WrappedMasterService {
     KvEventPublisher::Stats GetKvEventStats() const;
 
    private:
+    StorageDeviceView StorageDeviceViewForAdmin() const;
+
+    std::optional<UUID> FindActiveRebuildJobForDevice(const UUID& device_id) {
+        return master_service_.FindActiveRebuildJobForDevice(device_id);
+    }
+    void TryAutoCleanupDevices();
+
     MasterService master_service_;
+    std::shared_ptr<StorageBackendInterface> storage_backend_;
+    double cleanup_high_watermark_{0.98};
+    double cleanup_low_watermark_{0.95};
 };
 
 void RegisterRpcService(coro_rpc::coro_rpc_server& server,

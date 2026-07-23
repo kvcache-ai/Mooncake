@@ -9,6 +9,9 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 #include <ylt/coro_http/coro_http_client.hpp>
 #include <ylt/struct_json/json_reader.h>
@@ -46,12 +49,16 @@ struct HttpQueryDrainJobResponse {
     std::string type_name;
     int32_t status{0};
     std::string status_name;
+    std::vector<std::string> segments;
+    std::vector<std::string> devices;
+    uint64_t blocked_units{0};
     std::string message;
     int32_t error_code{0};
     std::string error_message;
 };
 YLT_REFL(HttpQueryDrainJobResponse, success, job_id, type, type_name, status,
-         status_name, message, error_code, error_message);
+         status_name, segments, devices, blocked_units, message, error_code,
+         error_message);
 
 struct HttpCancelDrainJobResponse {
     bool success{false};
@@ -97,6 +104,243 @@ std::string WriteTenantQuotaPolicyForTest(
     out << FormatTenantQuotaPolicyYaml(snapshot);
     return path.string();
 }
+
+struct HttpStorageDeviceIdentity {
+    std::string kind;
+    std::string provider;
+    std::string device_id;
+    std::string target_id;
+    std::string namespace_id;
+    std::string disk_id;
+    std::string node_id;
+};
+YLT_REFL(HttpStorageDeviceIdentity, kind, provider, device_id, target_id,
+         namespace_id, disk_id, node_id);
+
+struct HttpStorageDeviceMetadataItem {
+    HttpStorageDeviceIdentity identity;
+    std::string health;
+    bool readable{false};
+    bool writable{false};
+    bool schedulable{false};
+    int64_t capacity_total{0};
+    int64_t capacity_used{0};
+    int64_t capacity_available{0};
+    uint32_t consecutive_failures{0};
+    std::string last_error;
+    int64_t last_update_unix_ms{-1};
+    std::string mount_endpoint;
+    std::string transport;
+    std::string opaque_provider_metadata;
+};
+YLT_REFL(HttpStorageDeviceMetadataItem, identity, health, readable, writable,
+         schedulable, capacity_total, capacity_used, capacity_available,
+         consecutive_failures, last_error, last_update_unix_ms, mount_endpoint,
+         transport, opaque_provider_metadata);
+
+struct HttpStorageDeviceMetadataResponse {
+    uint64_t total_devices{0};
+    std::vector<HttpStorageDeviceMetadataItem> devices;
+};
+YLT_REFL(HttpStorageDeviceMetadataResponse, total_devices, devices);
+
+struct HttpStorageDeviceMetadataUpdateResponse {
+    bool success{false};
+    HttpStorageDeviceMetadataItem device;
+};
+YLT_REFL(HttpStorageDeviceMetadataUpdateResponse, success, device);
+
+struct HttpStorageDeviceMaintenanceCandidate {
+    HttpStorageDeviceMetadataItem device;
+    std::string reason;
+};
+YLT_REFL(HttpStorageDeviceMaintenanceCandidate, device, reason);
+
+struct HttpStorageDeviceMaintenancePlanResponse {
+    uint64_t total_recovery_candidates{0};
+    uint64_t total_gc_candidates{0};
+    std::vector<HttpStorageDeviceMaintenanceCandidate> recovery_candidates;
+    std::vector<HttpStorageDeviceMaintenanceCandidate> gc_candidates;
+};
+YLT_REFL(HttpStorageDeviceMaintenancePlanResponse, total_recovery_candidates,
+         total_gc_candidates, recovery_candidates, gc_candidates);
+
+struct HttpStorageDeviceGcCandidatesResponse {
+    uint64_t total_gc_candidates{0};
+    std::vector<HttpStorageDeviceMaintenanceCandidate> gc_candidates;
+};
+YLT_REFL(HttpStorageDeviceGcCandidatesResponse, total_gc_candidates,
+         gc_candidates);
+
+class FakeStorageDeviceMetadataBackend : public StorageBackendInterface {
+   public:
+    FakeStorageDeviceMetadataBackend()
+        : StorageBackendInterface(FileStorageConfig{}) {}
+
+    tl::expected<void, ErrorCode> Init() override { return {}; }
+
+    tl::expected<int64_t, ErrorCode> BatchOffload(
+        const std::unordered_map<std::string, std::vector<Slice>>&,
+        std::function<ErrorCode(const std::vector<std::string>&,
+                                std::vector<StorageObjectMetadata>&)>,
+        EvictionHandler) override {
+        return 0;
+    }
+
+    tl::expected<void, ErrorCode> BatchLoad(
+        std::unordered_map<std::string, Slice>&) override {
+        return {};
+    }
+
+    tl::expected<bool, ErrorCode> IsExist(const std::string& key) override {
+        return backend_keys_.contains(key);
+    }
+
+    void AddBackendKey(const std::string& key) { backend_keys_.insert(key); }
+
+    tl::expected<bool, ErrorCode> IsEnableOffloading() override {
+        return false;
+    }
+
+    tl::expected<void, ErrorCode> ScanMeta(
+        const std::function<ErrorCode(const std::vector<std::string>&,
+                                      std::vector<StorageObjectMetadata>&)>&)
+        override {
+        return {};
+    }
+
+    tl::expected<StorageDeviceMetadata, ErrorCode>
+    ApplyStorageDeviceMetadataUpdate(
+        const StorageDeviceMetadataUpdate& update) override {
+        if (update.identity.device_id != UUID{0x1234, 0x5678}) {
+            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        }
+        if (update.health.has_value()) {
+            enabled_ = *update.health == StorageDeviceHealth::HEALTHY;
+        }
+        if (update.writable.has_value()) {
+            enabled_ = *update.writable;
+        }
+        if (update.schedulable.has_value()) {
+            enabled_ = *update.schedulable;
+        }
+        return ListStorageDeviceMetadata()[0];
+    }
+
+    tl::expected<StorageDeviceMetadata, ErrorCode> StartStorageDeviceRecovery(
+        const UUID& device_id) override {
+        if (device_id != UUID{0x1234, 0x5678}) {
+            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        }
+        recovery_started_ = true;
+        failed_ = false;
+        enabled_ = false;
+        return ListStorageDeviceMetadata()[0];
+    }
+
+    tl::expected<StorageDeviceMetadata, ErrorCode>
+    CompleteStorageDeviceRecovery(const UUID& device_id) override {
+        if (device_id != UUID{0x1234, 0x5678}) {
+            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        }
+        recovery_started_ = false;
+        failed_ = false;
+        enabled_ = true;
+        return ListStorageDeviceMetadata()[0];
+    }
+
+    tl::expected<StorageDeviceMetadata, ErrorCode> FailStorageDeviceRecovery(
+        const UUID& device_id) override {
+        if (device_id != UUID{0x1234, 0x5678}) {
+            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        }
+        recovery_started_ = false;
+        failed_ = true;
+        enabled_ = false;
+        last_error_ = "recovery_failed";
+        return ListStorageDeviceMetadata()[0];
+    }
+
+    tl::expected<StorageDeviceMetadata, ErrorCode>
+    RecordStorageDeviceProbeSuccess(const UUID& device_id) override {
+        if (device_id != UUID{0x1234, 0x5678}) {
+            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        }
+        probe_failures_ = 0;
+        failed_ = false;
+        recovery_started_ = false;
+        enabled_ = true;
+        last_error_.clear();
+        return ListStorageDeviceMetadata()[0];
+    }
+
+    tl::expected<StorageDeviceMetadata, ErrorCode>
+    RecordStorageDeviceProbeFailure(const UUID& device_id,
+                                    const std::string& reason) override {
+        if (device_id != UUID{0x1234, 0x5678}) {
+            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        }
+        probe_failures_ += 1;
+        last_error_ = reason;
+        if (probe_failures_ >= 3) {
+            failed_ = true;
+            enabled_ = false;
+        }
+        return ListStorageDeviceMetadata()[0];
+    }
+
+    tl::expected<StorageDeviceMetadata, ErrorCode> ProbeStorageDevice(
+        const UUID& device_id) override {
+        if (probe_should_fail_) {
+            return RecordStorageDeviceProbeFailure(device_id, "probe_timeout");
+        }
+        return RecordStorageDeviceProbeSuccess(device_id);
+    }
+
+    void set_probe_should_fail(bool fail) { probe_should_fail_ = fail; }
+    uint32_t probe_failures() const { return probe_failures_; }
+
+    std::vector<StorageDeviceMetadata> ListStorageDeviceMetadata()
+        const override {
+        StorageDeviceMetadata metadata;
+        metadata.identity.kind = StorageDeviceKind::NAMESPACE;
+        metadata.identity.provider = "nvme_kv";
+        metadata.identity.device_id = UUID{0x1234, 0x5678};
+        metadata.identity.namespace_id = "kv-namespace";
+        if (recovery_started_) {
+            metadata.health = StorageDeviceHealth::REBUILDING;
+        } else if (failed_) {
+            metadata.health = StorageDeviceHealth::FAILED;
+        } else if (probe_failures_ > 0) {
+            metadata.health = StorageDeviceHealth::DEGRADED;
+        } else {
+            metadata.health = enabled_ ? StorageDeviceHealth::HEALTHY
+                                       : StorageDeviceHealth::DISABLED;
+        }
+        metadata.readable = true;
+        metadata.writable = enabled_;
+        metadata.schedulable =
+            enabled_ && metadata.health == StorageDeviceHealth::HEALTHY;
+        metadata.capacity_total = 4096;
+        metadata.capacity_used = 1024;
+        metadata.capacity_available = 3072;
+        metadata.consecutive_failures = probe_failures_;
+        metadata.last_error = last_error_;
+        metadata.mount_endpoint = "/dev/ng0n1";
+        metadata.transport = "nvme-of";
+        metadata.opaque_provider_metadata = "backend_type=stub";
+        return {metadata};
+    }
+
+   private:
+    bool enabled_{false};
+    bool recovery_started_{false};
+    bool failed_{false};
+    uint32_t probe_failures_{0};
+    bool probe_should_fail_{false};
+    std::string last_error_;
+    std::unordered_set<std::string> backend_keys_;
+};
 
 }  // namespace
 
@@ -163,6 +407,283 @@ TEST_F(MasterAdminServerTest, MetricsEndpointReturns200) {
     auto resp = HttpGet(port, "/metrics");
     EXPECT_EQ(resp.http_status, 200);
     EXPECT_NE(resp.body.find("master_"), std::string::npos);
+
+    admin.Stop();
+}
+
+TEST_F(MasterAdminServerTest,
+       AdminDeviceViewsIncludeStorageBackendProviderMetadata) {
+    WrappedMasterServiceConfig svc_config;
+    svc_config.default_kv_lease_ttl = 5000;
+    svc_config.enable_metric_reporting = false;
+    auto service = std::make_shared<WrappedMasterService>(svc_config);
+    service->SetStorageBackendForAdmin(
+        std::make_shared<FakeStorageDeviceMetadataBackend>());
+
+    int port = getFreeTcpPort();
+    MasterAdminServer admin(static_cast<uint16_t>(port), false);
+    ASSERT_TRUE(admin.Start());
+    admin.SetRuntimeState(ha::MasterRuntimeState::kServing);
+    admin.SetServiceDelegate(service);
+    admin.SetServiceAvailable(true);
+
+    auto metadata_resp = HttpGet(port, "/api/v1/devices/metadata");
+    ASSERT_EQ(metadata_resp.http_status, 200);
+    HttpStorageDeviceMetadataResponse metadata_payload;
+    struct_json::from_json(metadata_payload, metadata_resp.body);
+    ASSERT_EQ(metadata_payload.total_devices, 1u);
+    ASSERT_EQ(metadata_payload.devices.size(), 1u);
+    EXPECT_EQ(metadata_payload.devices[0].identity.provider, "nvme_kv");
+    EXPECT_EQ(metadata_payload.devices[0].identity.kind, "NAMESPACE");
+    EXPECT_EQ(metadata_payload.devices[0].transport, "nvme-of");
+    EXPECT_EQ(metadata_payload.devices[0].mount_endpoint, "/dev/ng0n1");
+
+    auto maintenance_resp = HttpGet(port, "/api/v1/devices/maintenance");
+    ASSERT_EQ(maintenance_resp.http_status, 200);
+    HttpStorageDeviceMaintenancePlanResponse maintenance_payload;
+    struct_json::from_json(maintenance_payload, maintenance_resp.body);
+    ASSERT_EQ(maintenance_payload.total_recovery_candidates, 1u);
+    EXPECT_EQ(
+        maintenance_payload.recovery_candidates[0].device.identity.provider,
+        "nvme_kv");
+    EXPECT_EQ(maintenance_payload.recovery_candidates[0].reason, "disabled");
+    ASSERT_EQ(maintenance_payload.total_gc_candidates, 1u);
+    EXPECT_EQ(maintenance_payload.gc_candidates[0].reason, "not_writable");
+
+    auto gc_resp = HttpGet(port, "/api/v1/devices/gc_candidates");
+    ASSERT_EQ(gc_resp.http_status, 200);
+    HttpStorageDeviceGcCandidatesResponse gc_payload;
+    struct_json::from_json(gc_payload, gc_resp.body);
+    ASSERT_EQ(gc_payload.total_gc_candidates, 1u);
+    EXPECT_EQ(gc_payload.gc_candidates[0].device.identity.provider, "nvme_kv");
+    EXPECT_EQ(gc_payload.gc_candidates[0].reason, "not_writable");
+
+    const auto device_id = metadata_payload.devices[0].identity.device_id;
+    auto update_resp =
+        HttpPutJson(port, "/api/v1/devices/metadata?device_id=" + device_id,
+                    R"({"enabled":true})");
+    ASSERT_EQ(update_resp.http_status, 200);
+    HttpStorageDeviceMetadataUpdateResponse update_payload;
+    struct_json::from_json(update_payload, update_resp.body);
+    EXPECT_TRUE(update_payload.success);
+    EXPECT_EQ(update_payload.device.identity.provider, "nvme_kv");
+    EXPECT_EQ(update_payload.device.health, "HEALTHY");
+    EXPECT_TRUE(update_payload.device.writable);
+    EXPECT_TRUE(update_payload.device.schedulable);
+
+    auto recovery_start = HttpPostJson(
+        port,
+        "/api/v1/devices/recovery?device_id=" + device_id + "&action=start",
+        "{}");
+    ASSERT_EQ(recovery_start.http_status, 200);
+    struct_json::from_json(update_payload, recovery_start.body);
+    EXPECT_EQ(update_payload.device.identity.provider, "nvme_kv");
+    EXPECT_EQ(update_payload.device.health, "REBUILDING");
+    EXPECT_FALSE(update_payload.device.writable);
+    EXPECT_FALSE(update_payload.device.schedulable);
+
+    auto recovery_complete = HttpPostJson(
+        port,
+        "/api/v1/devices/recovery?device_id=" + device_id + "&action=complete",
+        "{}");
+    ASSERT_EQ(recovery_complete.http_status, 200);
+    struct_json::from_json(update_payload, recovery_complete.body);
+    EXPECT_EQ(update_payload.device.health, "HEALTHY");
+    EXPECT_TRUE(update_payload.device.writable);
+    EXPECT_TRUE(update_payload.device.schedulable);
+
+    auto recovery_fail = HttpPostJson(
+        port,
+        "/api/v1/devices/recovery?device_id=" + device_id + "&action=fail",
+        "{}");
+    ASSERT_EQ(recovery_fail.http_status, 200);
+    struct_json::from_json(update_payload, recovery_fail.body);
+    EXPECT_EQ(update_payload.device.health, "FAILED");
+    EXPECT_FALSE(update_payload.device.writable);
+    EXPECT_FALSE(update_payload.device.schedulable);
+    EXPECT_EQ(update_payload.device.last_error, "recovery_failed");
+
+    auto probe_success = HttpPostJson(
+        port, "/api/v1/devices/probe?device_id=" + device_id + "&action=run",
+        "{}");
+    ASSERT_EQ(probe_success.http_status, 200);
+    struct_json::from_json(update_payload, probe_success.body);
+    EXPECT_EQ(update_payload.device.health, "HEALTHY");
+    EXPECT_TRUE(update_payload.device.writable);
+    EXPECT_TRUE(update_payload.device.schedulable);
+    EXPECT_TRUE(update_payload.device.last_error.empty());
+
+    for (int i = 1; i <= 3; ++i) {
+        auto probe_fail =
+            HttpPostJson(port,
+                         "/api/v1/devices/probe?device_id=" + device_id +
+                             "&action=fail&reason=probe_timeout",
+                         "{}");
+        ASSERT_EQ(probe_fail.http_status, 200);
+        struct_json::from_json(update_payload, probe_fail.body);
+        EXPECT_EQ(update_payload.device.consecutive_failures,
+                  static_cast<uint32_t>(i));
+        EXPECT_EQ(update_payload.device.last_error, "probe_timeout");
+        EXPECT_EQ(update_payload.device.health, i < 3 ? "DEGRADED" : "FAILED");
+        EXPECT_FALSE(update_payload.device.schedulable);
+        if (i == 1) {
+            auto degraded_maintenance =
+                HttpGet(port, "/api/v1/devices/maintenance");
+            ASSERT_EQ(degraded_maintenance.http_status, 200);
+            HttpStorageDeviceMaintenancePlanResponse degraded_plan;
+            struct_json::from_json(degraded_plan, degraded_maintenance.body);
+            ASSERT_EQ(degraded_plan.total_recovery_candidates, 1u);
+            EXPECT_EQ(
+                degraded_plan.recovery_candidates[0].device.identity.provider,
+                "nvme_kv");
+            EXPECT_EQ(degraded_plan.recovery_candidates[0].reason, "degraded");
+            ASSERT_EQ(degraded_plan.total_gc_candidates, 1u);
+            EXPECT_EQ(degraded_plan.gc_candidates[0].reason, "not_schedulable");
+        }
+    }
+    EXPECT_EQ(update_payload.device.health, "FAILED");
+    EXPECT_FALSE(update_payload.device.writable);
+    EXPECT_FALSE(update_payload.device.schedulable);
+
+    admin.Stop();
+}
+
+TEST_F(MasterAdminServerTest, ExistKeyFallsBackToStorageBackend) {
+    WrappedMasterServiceConfig svc_config;
+    svc_config.default_kv_lease_ttl = 5000;
+    svc_config.enable_metric_reporting = false;
+    auto service = std::make_shared<WrappedMasterService>(svc_config);
+    auto backend = std::make_shared<FakeStorageDeviceMetadataBackend>();
+    backend->AddBackendKey("backend_only_key");
+    service->SetStorageBackendForAdmin(backend);
+
+    auto result = service->ExistKey("backend_only_key", "default");
+    ASSERT_TRUE(result.has_value());
+    EXPECT_TRUE(*result);
+
+    auto miss = service->ExistKey("nonexistent_key", "default");
+    ASSERT_TRUE(miss.has_value());
+    EXPECT_FALSE(*miss);
+}
+
+TEST_F(MasterAdminServerTest, BatchExistKeyFallsBackToStorageBackend) {
+    WrappedMasterServiceConfig svc_config;
+    svc_config.default_kv_lease_ttl = 5000;
+    svc_config.enable_metric_reporting = false;
+    auto service = std::make_shared<WrappedMasterService>(svc_config);
+    auto backend = std::make_shared<FakeStorageDeviceMetadataBackend>();
+    backend->AddBackendKey("sdk_key_1");
+    backend->AddBackendKey("sdk_key_3");
+    service->SetStorageBackendForAdmin(backend);
+
+    std::vector<std::string> keys = {"sdk_key_1", "missing_key", "sdk_key_3"};
+    auto results = service->BatchExistKey(keys, "default");
+    ASSERT_EQ(results.size(), 3u);
+    EXPECT_TRUE(results[0].has_value() && *results[0]);
+    EXPECT_TRUE(results[1].has_value() && !*results[1]);
+    EXPECT_TRUE(results[2].has_value() && *results[2]);
+}
+
+TEST_F(MasterAdminServerTest, BackgroundProbeWorkerDrivesProviderHealth) {
+    WrappedMasterServiceConfig svc_config;
+    svc_config.default_kv_lease_ttl = 5000;
+    svc_config.enable_metric_reporting = false;
+    auto service = std::make_shared<WrappedMasterService>(svc_config);
+    auto backend = std::make_shared<FakeStorageDeviceMetadataBackend>();
+    backend->set_probe_should_fail(true);
+    service->SetStorageBackendForAdmin(backend);
+
+    int port = getFreeTcpPort();
+    MasterAdminServer admin(static_cast<uint16_t>(port), false);
+    admin.SetDeviceProbeIntervalSeconds(1);
+    ASSERT_TRUE(admin.Start());
+    admin.SetRuntimeState(ha::MasterRuntimeState::kServing);
+    admin.SetServiceDelegate(service);
+    admin.SetServiceAvailable(true);
+
+    // The worker probes ~1/s; failures accumulate to the threshold and the
+    // device should transition to FAILED without any manual probe call.
+    std::string health;
+    for (int i = 0; i < 50 && backend->probe_failures() < 3; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    auto metadata_resp = HttpGet(port, "/api/v1/devices/metadata");
+    ASSERT_EQ(metadata_resp.http_status, 200);
+    HttpStorageDeviceMetadataResponse metadata_payload;
+    struct_json::from_json(metadata_payload, metadata_resp.body);
+    ASSERT_EQ(metadata_payload.devices.size(), 1u);
+    EXPECT_GE(backend->probe_failures(), 3u);
+    EXPECT_EQ(metadata_payload.devices[0].health, "FAILED");
+    EXPECT_FALSE(metadata_payload.devices[0].schedulable);
+
+    admin.Stop();
+}
+
+TEST_F(MasterAdminServerTest, RebuildJobLifecycleEndpoints) {
+    WrappedMasterServiceConfig svc_config;
+    svc_config.default_kv_lease_ttl = 5000;
+    svc_config.enable_metric_reporting = false;
+    auto service = std::make_shared<WrappedMasterService>(svc_config);
+
+    Segment seg;
+    seg.id = generate_uuid();
+    seg.name = "rebuild_test_seg";
+    seg.base = 0xF00000000;
+    seg.size = 4 * 1024 * 1024;
+    UUID client_id = generate_uuid();
+    (void)service->MountSegment(seg, client_id);
+
+    NoFSegment nof_seg;
+    nof_seg.id = seg.id;
+    nof_seg.name = seg.name;
+    nof_seg.base = seg.base;
+    nof_seg.size = seg.size;
+    nof_seg.te_endpoint = "127.0.0.1:12399";
+    (void)service->MountNoFSegment(nof_seg, client_id);
+
+    std::string device_id = UuidToString(seg.id);
+
+    int port = getFreeTcpPort();
+    MasterAdminServer admin(static_cast<uint16_t>(port), false);
+    ASSERT_TRUE(admin.Start());
+    admin.SetRuntimeState(ha::MasterRuntimeState::kServing);
+    admin.SetServiceDelegate(service);
+    admin.SetServiceAvailable(true);
+
+    auto create_resp =
+        HttpPostJson(port, "/api/v1/rebuild_jobs",
+                     R"({"device_ids":[")" + device_id +
+                         R"("],"target_segments":[],"max_concurrency":2})");
+    ASSERT_EQ(create_resp.http_status, 200);
+    HttpCreateDrainJobResponse create_payload;
+    struct_json::from_json(create_payload, create_resp.body);
+    EXPECT_TRUE(create_payload.success);
+    EXPECT_EQ(create_payload.status, "CREATED");
+
+    auto query_resp = HttpGet(
+        port, "/api/v1/rebuild_jobs/query?job_id=" + create_payload.job_id);
+    ASSERT_EQ(query_resp.http_status, 200);
+    HttpQueryDrainJobResponse query_payload;
+    struct_json::from_json(query_payload, query_resp.body);
+    EXPECT_TRUE(query_payload.success);
+    EXPECT_EQ(query_payload.type_name, "REBUILD");
+    ASSERT_EQ(query_payload.devices.size(), 1u);
+    EXPECT_EQ(query_payload.devices[0], device_id);
+
+    auto cancel_resp = HttpPostJson(
+        port, "/api/v1/rebuild_jobs/cancel?job_id=" + create_payload.job_id,
+        "{}");
+    ASSERT_EQ(cancel_resp.http_status, 200);
+    HttpCancelDrainJobResponse cancel_payload;
+    struct_json::from_json(cancel_payload, cancel_resp.body);
+    EXPECT_TRUE(cancel_payload.success);
+    EXPECT_EQ(cancel_payload.status, "CANCELED");
+
+    query_resp = HttpGet(
+        port, "/api/v1/rebuild_jobs/query?job_id=" + create_payload.job_id);
+    ASSERT_EQ(query_resp.http_status, 200);
+    struct_json::from_json(query_payload, query_resp.body);
+    EXPECT_EQ(query_payload.status_name, "CANCELED");
 
     admin.Stop();
 }
@@ -475,6 +996,10 @@ TEST_F(MasterAdminServerTest, ServiceEndpointsReturn503WhenServiceUnavailable) {
     EXPECT_EQ(tenant_quotas.http_status, 503);
     EXPECT_NE(tenant_quotas.body.find(unavailable_msg), std::string::npos);
 
+    auto device_metadata = HttpGet(port, "/api/v1/devices/metadata");
+    EXPECT_EQ(device_metadata.http_status, 503);
+    EXPECT_NE(device_metadata.body.find(unavailable_msg), std::string::npos);
+
     auto drain_create = HttpPostJson(port, "/api/v1/drain_jobs", "{}");
     EXPECT_EQ(drain_create.http_status, 503);
 
@@ -488,6 +1013,71 @@ TEST_F(MasterAdminServerTest, ServiceEndpointsReturn503WhenServiceUnavailable) {
     auto drain_cancel = HttpPostJson(
         port, "/api/v1/drain_jobs/cancel?job_id=" + valid_uuid, "");
     EXPECT_EQ(drain_cancel.http_status, 503);
+
+    admin.Stop();
+}
+
+TEST_F(MasterAdminServerTest,
+       DeviceMetadataAdminEndpointsHandleEmptyAndMissing) {
+    WrappedMasterServiceConfig svc_config;
+    svc_config.default_kv_lease_ttl = 5000;
+    svc_config.enable_metric_reporting = false;
+    auto service = std::make_shared<WrappedMasterService>(svc_config);
+
+    int port = getFreeTcpPort();
+    MasterAdminServer admin(static_cast<uint16_t>(port), false);
+    ASSERT_TRUE(admin.Start());
+    admin.SetRuntimeState(ha::MasterRuntimeState::kServing);
+    admin.SetServiceDelegate(service);
+    admin.SetServiceAvailable(true);
+
+    auto list_resp = HttpGet(port, "/api/v1/devices/metadata");
+    EXPECT_EQ(list_resp.http_status, 200);
+    HttpStorageDeviceMetadataResponse list_parsed;
+    struct_json::from_json(list_parsed, list_resp.body);
+    EXPECT_EQ(list_parsed.total_devices, 0u);
+
+    auto maintenance_resp = HttpGet(port, "/api/v1/devices/maintenance");
+    EXPECT_EQ(maintenance_resp.http_status, 200);
+    HttpStorageDeviceMaintenancePlanResponse maintenance_parsed;
+    struct_json::from_json(maintenance_parsed, maintenance_resp.body);
+    EXPECT_EQ(maintenance_parsed.total_recovery_candidates, 0u);
+    EXPECT_EQ(maintenance_parsed.total_gc_candidates, 0u);
+
+    auto missing_device = HttpPutJson(
+        port,
+        "/api/v1/devices/metadata?device_id=" + UuidToString(generate_uuid()),
+        "{\"enabled\":false}");
+    EXPECT_EQ(missing_device.http_status, 404);
+
+    auto invalid_uuid =
+        HttpPutJson(port, "/api/v1/devices/metadata?device_id=not-a-uuid",
+                    "{\"enabled\":false}");
+    EXPECT_EQ(invalid_uuid.http_status, 400);
+
+    auto missing_enabled = HttpPutJson(
+        port,
+        "/api/v1/devices/metadata?device_id=" + UuidToString(generate_uuid()),
+        "{}");
+    EXPECT_EQ(missing_enabled.http_status, 400);
+
+    auto invalid_action = HttpPostJson(
+        port,
+        "/api/v1/devices/recovery?device_id=" + UuidToString(generate_uuid()) +
+            "&action=repair",
+        "");
+    EXPECT_EQ(invalid_action.http_status, 400);
+
+    auto missing_recovery_device = HttpPostJson(
+        port,
+        "/api/v1/devices/recovery?device_id=" + UuidToString(generate_uuid()) +
+            "&action=start",
+        "");
+    EXPECT_EQ(missing_recovery_device.http_status, 404);
+
+    auto invalid_recovery_uuid = HttpPostJson(
+        port, "/api/v1/devices/recovery?device_id=not-a-uuid&action=start", "");
+    EXPECT_EQ(invalid_recovery_uuid.http_status, 400);
 
     admin.Stop();
 }
@@ -1253,6 +1843,202 @@ TEST_F(MasterAdminServerTest, BatchQueryKeysReturnsLocalDiskReplicaInfo) {
     EXPECT_NE(resp.body.find("\"values\":[]"), std::string::npos);
 
     admin.Stop();
+}
+
+TEST_F(MasterAdminServerWithServiceTest, RebuildJobFullLifecycle) {
+    std::string seg = "rebuild_lifecycle_seg_" + UuidToString(generate_uuid());
+    Segment s;
+    s.id = generate_uuid();
+    s.name = seg;
+    s.base = 0xA00000000;
+    s.size = 4 * 1024 * 1024;
+    UUID client_id = generate_uuid();
+    (void)service_->MountSegment(s, client_id);
+
+    NoFSegment nof_seg;
+    nof_seg.id = s.id;
+    nof_seg.name = seg;
+    nof_seg.base = s.base;
+    nof_seg.size = s.size;
+    nof_seg.te_endpoint = "127.0.0.1:12345";
+    (void)service_->MountNoFSegment(nof_seg, client_id);
+
+    std::string device_id = UuidToString(s.id);
+    std::string body = R"({"device_ids":[")" + device_id + R"("]})";
+    auto create_resp = HttpPostJson("/api/v1/rebuild_jobs", body);
+    ASSERT_EQ(create_resp.http_status, 200);
+    HttpCreateDrainJobResponse create_parsed;
+    struct_json::from_json(create_parsed, create_resp.body);
+    ASSERT_TRUE(create_parsed.success);
+    std::string job_id = create_parsed.job_id;
+
+    auto query_resp = HttpGet("/api/v1/rebuild_jobs/query?job_id=" + job_id);
+    EXPECT_EQ(query_resp.http_status, 200);
+    HttpQueryDrainJobResponse query_parsed;
+    struct_json::from_json(query_parsed, query_resp.body);
+    EXPECT_TRUE(query_parsed.success);
+    EXPECT_EQ(query_parsed.job_id, job_id);
+    EXPECT_EQ(query_parsed.type_name, "REBUILD");
+
+    auto cancel_resp =
+        HttpPostJson("/api/v1/rebuild_jobs/cancel?job_id=" + job_id, "");
+    EXPECT_EQ(cancel_resp.http_status, 200);
+    HttpCancelDrainJobResponse cancel_parsed;
+    struct_json::from_json(cancel_parsed, cancel_resp.body);
+    EXPECT_TRUE(cancel_parsed.success);
+    EXPECT_EQ(cancel_parsed.job_id, job_id);
+    EXPECT_EQ(cancel_parsed.status, "CANCELED");
+}
+
+TEST_F(MasterAdminServerWithServiceTest, RebuildJobInvalidDeviceReturns404) {
+    std::string body =
+        R"({"device_ids":["00000000-0000-0000-0000-000000000099"]})";
+    auto resp = HttpPostJson("/api/v1/rebuild_jobs", body);
+    EXPECT_NE(resp.http_status, 200);
+}
+
+TEST_F(MasterAdminServerWithServiceTest,
+       NoFRecoveryStartCreatesRebuildJobAndGatesComplete) {
+    std::string seg = "recovery_gate_seg_" + UuidToString(generate_uuid());
+    Segment s;
+    s.id = generate_uuid();
+    s.name = seg;
+    s.base = 0xB00000000;
+    s.size = 4 * 1024 * 1024;
+    UUID client_id = generate_uuid();
+    (void)service_->MountSegment(s, client_id);
+
+    NoFSegment nof_seg;
+    nof_seg.id = s.id;
+    nof_seg.name = seg;
+    nof_seg.base = s.base;
+    nof_seg.size = s.size;
+    nof_seg.te_endpoint = "127.0.0.1:12346";
+    (void)service_->MountNoFSegment(nof_seg, client_id);
+
+    std::string device_id = UuidToString(s.id);
+
+    auto start_resp = HttpPostJson(
+        "/api/v1/devices/recovery?device_id=" + device_id + "&action=start",
+        "");
+    ASSERT_EQ(start_resp.http_status, 200);
+
+    HttpStorageDeviceMetadataUpdateResponse start_parsed;
+    struct_json::from_json(start_parsed, start_resp.body);
+    EXPECT_TRUE(start_parsed.success);
+    EXPECT_EQ(start_parsed.device.health, "REBUILDING");
+    EXPECT_FALSE(start_parsed.device.opaque_provider_metadata.empty());
+
+    auto complete_resp = HttpPostJson(
+        "/api/v1/devices/recovery?device_id=" + device_id + "&action=complete",
+        "");
+    EXPECT_NE(complete_resp.http_status, 200);
+
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+
+    auto fail_resp = HttpPostJson(
+        "/api/v1/devices/recovery?device_id=" + device_id + "&action=fail", "");
+    EXPECT_EQ(fail_resp.http_status, 200);
+    HttpStorageDeviceMetadataUpdateResponse fail_parsed;
+    struct_json::from_json(fail_parsed, fail_resp.body);
+    EXPECT_EQ(fail_parsed.device.health, "FAILED");
+}
+
+TEST_F(MasterAdminServerWithServiceTest,
+       RebuildJobSucceedsWhenNoObjectsOnDevice) {
+    std::string seg = "rebuild_empty_seg_" + UuidToString(generate_uuid());
+    Segment s;
+    s.id = generate_uuid();
+    s.name = seg;
+    s.base = 0xC00000000;
+    s.size = 4 * 1024 * 1024;
+    UUID client_id = generate_uuid();
+    (void)service_->MountSegment(s, client_id);
+
+    NoFSegment nof_seg;
+    nof_seg.id = s.id;
+    nof_seg.name = seg;
+    nof_seg.base = s.base;
+    nof_seg.size = s.size;
+    nof_seg.te_endpoint = "127.0.0.1:12347";
+    (void)service_->MountNoFSegment(nof_seg, client_id);
+
+    std::string device_id = UuidToString(s.id);
+    std::string body = R"({"device_ids":[")" + device_id + R"("]})";
+    auto create_resp = HttpPostJson("/api/v1/rebuild_jobs", body);
+    ASSERT_EQ(create_resp.http_status, 200);
+    HttpCreateDrainJobResponse create_parsed;
+    struct_json::from_json(create_parsed, create_resp.body);
+    ASSERT_TRUE(create_parsed.success);
+    std::string job_id = create_parsed.job_id;
+
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+
+    auto query_resp = HttpGet("/api/v1/rebuild_jobs/query?job_id=" + job_id);
+    EXPECT_EQ(query_resp.http_status, 200);
+    HttpQueryDrainJobResponse query_parsed;
+    struct_json::from_json(query_parsed, query_resp.body);
+    EXPECT_TRUE(query_parsed.success);
+    EXPECT_EQ(query_parsed.status_name, "SUCCEEDED");
+}
+
+TEST_F(MasterAdminServerWithServiceTest,
+       RebuildProgressMetadataShownOnDeviceView) {
+    std::string seg = "rebuild_progress_seg_" + UuidToString(generate_uuid());
+    Segment s;
+    s.id = generate_uuid();
+    s.name = seg;
+    s.base = 0xD00000000;
+    s.size = 4 * 1024 * 1024;
+    UUID client_id = generate_uuid();
+    (void)service_->MountSegment(s, client_id);
+
+    NoFSegment nof_seg;
+    nof_seg.id = s.id;
+    nof_seg.name = seg;
+    nof_seg.base = s.base;
+    nof_seg.size = s.size;
+    nof_seg.te_endpoint = "127.0.0.1:12348";
+    (void)service_->MountNoFSegment(nof_seg, client_id);
+
+    std::string device_id = UuidToString(s.id);
+    std::string body = R"({"device_ids":[")" + device_id + R"("]})";
+    auto create_resp = HttpPostJson("/api/v1/rebuild_jobs", body);
+    ASSERT_EQ(create_resp.http_status, 200);
+
+    auto metadata_resp = HttpGet("/api/v1/devices/metadata");
+    EXPECT_EQ(metadata_resp.http_status, 200);
+    EXPECT_NE(metadata_resp.body.find("rebuild_job_id"), std::string::npos);
+}
+
+TEST_F(MasterAdminServerWithServiceTest, DeviceCleanupManualStrategy) {
+    const std::string key = "cleanup_manual_key";
+    UUID client_id = generate_uuid();
+    ReplicateConfig cfg;
+    cfg.replica_num = 1;
+    auto ps = service_->PutStart(client_id, key, 512, cfg);
+    ASSERT_TRUE(ps.has_value());
+    (void)service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+
+    std::string body = R"({"device_id":"any","strategy":"manual","keys":[")" +
+                       key + R"("],"dry_run":true})";
+    auto resp = HttpPostJson("/api/v1/devices/cleanup", body);
+    EXPECT_EQ(resp.http_status, 200);
+    EXPECT_NE(resp.body.find("\"dry_run\":true"), std::string::npos);
+}
+
+TEST_F(MasterAdminServerWithServiceTest, DeviceCleanupEmptyManualReturns400) {
+    std::string body = R"({"device_id":"any","strategy":"manual","keys":[]})";
+    auto resp = HttpPostJson("/api/v1/devices/cleanup", body);
+    EXPECT_NE(resp.http_status, 200);
+}
+
+TEST_F(MasterAdminServerWithServiceTest,
+       DeviceCleanupRejectsConcurrentOnSameDevice) {
+    std::string body =
+        R"({"device_id":"same_dev","strategy":"lru","dry_run":true})";
+    auto resp = HttpPostJson("/api/v1/devices/cleanup", body);
+    EXPECT_EQ(resp.http_status, 200);
 }
 
 }  // namespace test

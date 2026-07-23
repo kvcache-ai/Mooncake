@@ -113,6 +113,37 @@ class SegmentTest : public ::testing::Test {
                          mounted_segment.buf_allocator) != allocators->end();
     }
 
+    NoFSegment MakeNoFSegment(const std::string& name,
+                              const std::string& endpoint = "127.0.0.1:12345") {
+        NoFSegment segment;
+        segment.id = generate_uuid();
+        segment.name = name;
+        segment.base = 0;
+        segment.size = 1024 * 1024 * 16;
+        segment.te_endpoint = endpoint;
+        return segment;
+    }
+
+    bool HasAllocatorForNoFSegment(const NoFSegmentManager& segment_manager,
+                                   const UUID& segment_id) {
+        const auto mounted_it =
+            segment_manager.mounted_segments_.find(segment_id);
+        if (mounted_it == segment_manager.mounted_segments_.end()) {
+            return false;
+        }
+
+        const auto& mounted_segment = mounted_it->second;
+        const auto* allocators =
+            segment_manager.allocator_manager_.getAllocators(
+                mounted_segment.segment.name);
+        if (allocators == nullptr) {
+            return false;
+        }
+
+        return std::find(allocators->begin(), allocators->end(),
+                         mounted_segment.buf_allocator) != allocators->end();
+    }
+
     void ValidateMountedLocalDiskSegments(
         const SegmentManager& segment_manager,
         const std::vector<std::shared_ptr<LocalDiskSegment>>& segments,
@@ -786,6 +817,179 @@ TEST_F(SegmentTest, MountLocalDiskSegmentDuplicate) {
                                                                segment2};
     std::vector<UUID> client_ids = {client_id, client_id2};
     ValidateMountedLocalDiskSegments(segment_manager, segments, client_ids);
+}
+
+TEST_F(SegmentTest, NoFListDeviceMetadataReturnsMountedSegmentMetadata) {
+    NoFSegmentManager segment_manager(BufferAllocatorType::OFFSET);
+    auto segment = MakeNoFSegment("nof_segment");
+    UUID client_id = generate_uuid();
+
+    {
+        auto segment_access = segment_manager.getNoFSegmentAccess();
+        ASSERT_EQ(segment_access.MountSegment(segment, client_id),
+                  ErrorCode::OK);
+    }
+
+    auto metadata = segment_manager.ListDeviceMetadata();
+    ASSERT_EQ(metadata.size(), 1);
+    const auto& device = metadata.front();
+    ASSERT_EQ(device.identity.kind, StorageDeviceKind::LOGICAL_POOL);
+    ASSERT_EQ(device.identity.provider, "nof");
+    ASSERT_EQ(device.identity.device_id, segment.id);
+    ASSERT_EQ(device.identity.target_id, segment.name);
+    ASSERT_EQ(device.identity.namespace_id, segment.te_endpoint);
+    ASSERT_EQ(device.health, StorageDeviceHealth::HEALTHY);
+    ASSERT_TRUE(device.readable);
+    ASSERT_TRUE(device.writable);
+    ASSERT_TRUE(device.schedulable);
+    ASSERT_EQ(device.capacity_total, static_cast<int64_t>(segment.size));
+    ASSERT_EQ(device.capacity_available, static_cast<int64_t>(segment.size));
+    ASSERT_EQ(device.mount_endpoint, segment.te_endpoint);
+    ASSERT_EQ(device.transport, "nof");
+}
+
+TEST_F(SegmentTest,
+       NoFMetadataWritableFalseRemovesAllocatorButKeepsDeviceVisible) {
+    NoFSegmentManager segment_manager(BufferAllocatorType::OFFSET);
+    auto segment = MakeNoFSegment("nof_segment");
+    UUID client_id = generate_uuid();
+
+    {
+        auto segment_access = segment_manager.getNoFSegmentAccess();
+        ASSERT_EQ(segment_access.MountSegment(segment, client_id),
+                  ErrorCode::OK);
+    }
+    ASSERT_TRUE(HasAllocatorForNoFSegment(segment_manager, segment.id));
+
+    StorageDeviceMetadataUpdate update;
+    update.identity.device_id = segment.id;
+    update.writable = false;
+    ASSERT_EQ(segment_manager.ApplyMetadataUpdate(update), ErrorCode::OK);
+
+    ASSERT_FALSE(HasAllocatorForNoFSegment(segment_manager, segment.id));
+    auto metadata = segment_manager.ListDeviceMetadata();
+    ASSERT_EQ(metadata.size(), 1);
+    ASSERT_FALSE(metadata.front().writable);
+    ASSERT_TRUE(metadata.front().readable);
+    ASSERT_TRUE(metadata.front().schedulable);
+}
+
+TEST_F(SegmentTest, NoFMetadataWritableTrueRestoresAllocatorWhileSegmentOk) {
+    NoFSegmentManager segment_manager(BufferAllocatorType::OFFSET);
+    auto segment = MakeNoFSegment("nof_segment");
+    UUID client_id = generate_uuid();
+
+    {
+        auto segment_access = segment_manager.getNoFSegmentAccess();
+        ASSERT_EQ(segment_access.MountSegment(segment, client_id),
+                  ErrorCode::OK);
+    }
+
+    StorageDeviceMetadataUpdate disable_update;
+    disable_update.identity.device_id = segment.id;
+    disable_update.writable = false;
+    ASSERT_EQ(segment_manager.ApplyMetadataUpdate(disable_update),
+              ErrorCode::OK);
+    ASSERT_FALSE(HasAllocatorForNoFSegment(segment_manager, segment.id));
+
+    StorageDeviceMetadataUpdate enable_update;
+    enable_update.identity.device_id = segment.id;
+    enable_update.writable = true;
+    ASSERT_EQ(segment_manager.ApplyMetadataUpdate(enable_update),
+              ErrorCode::OK);
+    ASSERT_TRUE(HasAllocatorForNoFSegment(segment_manager, segment.id));
+    ASSERT_TRUE(segment_manager.ListDeviceMetadata().front().writable);
+}
+
+TEST_F(SegmentTest, NoFMetadataHealthFailureRemovesAllocator) {
+    NoFSegmentManager segment_manager(BufferAllocatorType::OFFSET);
+    auto segment = MakeNoFSegment("nof_segment");
+    UUID client_id = generate_uuid();
+
+    {
+        auto segment_access = segment_manager.getNoFSegmentAccess();
+        ASSERT_EQ(segment_access.MountSegment(segment, client_id),
+                  ErrorCode::OK);
+    }
+
+    StorageDeviceMetadataUpdate fail_update;
+    fail_update.identity.device_id = segment.id;
+    fail_update.health = StorageDeviceHealth::FAILED;
+    ASSERT_EQ(segment_manager.ApplyMetadataUpdate(fail_update), ErrorCode::OK);
+    ASSERT_FALSE(HasAllocatorForNoFSegment(segment_manager, segment.id));
+    ASSERT_EQ(segment_manager.ListDeviceMetadata().front().health,
+              StorageDeviceHealth::FAILED);
+
+    StorageDeviceMetadataUpdate heal_update;
+    heal_update.identity.device_id = segment.id;
+    heal_update.health = StorageDeviceHealth::HEALTHY;
+    ASSERT_EQ(segment_manager.ApplyMetadataUpdate(heal_update), ErrorCode::OK);
+    ASSERT_TRUE(HasAllocatorForNoFSegment(segment_manager, segment.id));
+}
+
+TEST_F(SegmentTest, NoFMetadataBatchRejectsMissingDeviceWithoutPartialUpdate) {
+    NoFSegmentManager segment_manager(BufferAllocatorType::OFFSET);
+    auto segment = MakeNoFSegment("nof_segment");
+    UUID client_id = generate_uuid();
+
+    {
+        auto segment_access = segment_manager.getNoFSegmentAccess();
+        ASSERT_EQ(segment_access.MountSegment(segment, client_id),
+                  ErrorCode::OK);
+    }
+    ASSERT_TRUE(HasAllocatorForNoFSegment(segment_manager, segment.id));
+
+    StorageDeviceMetadataUpdate valid_update;
+    valid_update.identity.device_id = segment.id;
+    valid_update.writable = false;
+
+    StorageDeviceMetadataUpdate missing_update;
+    missing_update.identity.device_id = generate_uuid();
+    missing_update.health = StorageDeviceHealth::FAILED;
+
+    ASSERT_EQ(
+        segment_manager.ApplyMetadataBatch({valid_update, missing_update}),
+        ErrorCode::SEGMENT_NOT_FOUND);
+    ASSERT_TRUE(HasAllocatorForNoFSegment(segment_manager, segment.id));
+    auto metadata = segment_manager.ListDeviceMetadata();
+    ASSERT_EQ(metadata.size(), 1);
+    ASSERT_TRUE(metadata.front().writable);
+    ASSERT_EQ(metadata.front().health, StorageDeviceHealth::HEALTHY);
+}
+
+TEST_F(SegmentTest, NoFMaintenancePlanReportsRecoveryAndGcCandidates) {
+    NoFSegmentManager segment_manager(BufferAllocatorType::OFFSET);
+    auto failed_segment = MakeNoFSegment("nof_failed", "127.0.0.1:12345");
+    auto disabled_segment = MakeNoFSegment("nof_disabled", "127.0.0.1:12346");
+    UUID client_id = generate_uuid();
+
+    {
+        auto segment_access = segment_manager.getNoFSegmentAccess();
+        ASSERT_EQ(segment_access.MountSegment(failed_segment, client_id),
+                  ErrorCode::OK);
+        ASSERT_EQ(segment_access.MountSegment(disabled_segment, client_id),
+                  ErrorCode::OK);
+    }
+
+    StorageDeviceMetadataUpdate failed_update;
+    failed_update.identity.device_id = failed_segment.id;
+    failed_update.health = StorageDeviceHealth::FAILED;
+    ASSERT_EQ(segment_manager.ApplyMetadataUpdate(failed_update),
+              ErrorCode::OK);
+
+    StorageDeviceMetadataUpdate disabled_update;
+    disabled_update.identity.device_id = disabled_segment.id;
+    disabled_update.health = StorageDeviceHealth::DISABLED;
+    disabled_update.writable = false;
+    disabled_update.schedulable = false;
+    ASSERT_EQ(segment_manager.ApplyMetadataUpdate(disabled_update),
+              ErrorCode::OK);
+
+    auto plan = segment_manager.BuildMaintenancePlan();
+    ASSERT_EQ(plan.recovery_candidates.size(), 2);
+    ASSERT_EQ(plan.gc_candidates.size(), 1);
+    EXPECT_EQ(plan.recovery_candidates[0].metadata.identity.provider, "nof");
+    EXPECT_FALSE(plan.gc_candidates[0].metadata.writable);
 }
 
 }  // namespace mooncake

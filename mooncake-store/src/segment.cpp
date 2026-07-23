@@ -1,6 +1,7 @@
 #include "segment.h"
 
 #include "master_metric_manager.h"
+#include "storage_device_maintenance.h"
 #include "utils/zstd_util.h"
 
 #include <functional>
@@ -97,6 +98,68 @@ std::vector<std::string> BuildHostOrderedSegments(
     }
 
     return ordered_segments;
+}
+
+StorageDeviceMetadata BuildNoFDeviceMetadata(const NoFSegment& segment,
+                                             const UUID& /*client_id*/) {
+    StorageDeviceMetadata metadata;
+    metadata.identity.kind = StorageDeviceKind::LOGICAL_POOL;
+    metadata.identity.provider = "nof";
+    metadata.identity.device_id = segment.id;
+    metadata.identity.target_id = segment.name;
+    metadata.identity.namespace_id = segment.te_endpoint;
+    metadata.health = StorageDeviceHealth::HEALTHY;
+    metadata.readable = true;
+    metadata.writable = true;
+    metadata.schedulable = true;
+    metadata.capacity_total = static_cast<int64_t>(segment.size);
+    metadata.capacity_available = static_cast<int64_t>(segment.size);
+    metadata.mount_endpoint = segment.te_endpoint;
+    metadata.transport = "nof";
+    return metadata;
+}
+
+bool IsNoFDeviceAllocatable(const MountedNoFSegment& mounted_segment) {
+    const auto health = mounted_segment.device_metadata.health;
+    return mounted_segment.status == SegmentStatus::OK &&
+           mounted_segment.device_metadata.writable &&
+           mounted_segment.device_metadata.schedulable &&
+           health != StorageDeviceHealth::FAILED &&
+           health != StorageDeviceHealth::DISABLED &&
+           health != StorageDeviceHealth::UNMOUNTING;
+}
+
+void SyncNoFAllocatorEligibility(MountedNoFSegment& mounted_segment,
+                                 AllocatorManager& allocator_manager) {
+    const auto& allocator = mounted_segment.buf_allocator;
+    const auto& name = mounted_segment.segment.name;
+    const bool has_allocator = HasAllocator(allocator_manager, name, allocator);
+    const bool should_have_allocator =
+        allocator && IsNoFDeviceAllocatable(mounted_segment);
+    if (should_have_allocator && !has_allocator) {
+        allocator_manager.addAllocator(name, allocator);
+    } else if (!should_have_allocator && has_allocator) {
+        allocator_manager.removeAllocator(name, allocator);
+    }
+}
+
+StorageDeviceMetadata BuildNoFDeviceMetadataSnapshot(
+    const MountedNoFSegment& mounted_segment) {
+    auto metadata = mounted_segment.device_metadata;
+    metadata.capacity_total =
+        static_cast<int64_t>(mounted_segment.segment.size);
+    if (!mounted_segment.buf_allocator) {
+        metadata.capacity_used = 0;
+        metadata.capacity_available = 0;
+        return metadata;
+    }
+    metadata.capacity_total =
+        static_cast<int64_t>(mounted_segment.buf_allocator->capacity());
+    metadata.capacity_used =
+        static_cast<int64_t>(mounted_segment.buf_allocator->size());
+    metadata.capacity_available =
+        metadata.capacity_total - metadata.capacity_used;
+    return metadata;
 }
 
 }  // namespace
@@ -1306,8 +1369,10 @@ ErrorCode ScopedNoFSegmentAccess::MountSegment(const NoFSegment& segment,
     nof_segment_manager_->allocator_manager_.addAllocator(segment.name,
                                                           allocator);
     nof_segment_manager_->client_segments_[client_id].push_back(segment.id);
+    auto device_metadata = BuildNoFDeviceMetadata(segment, client_id);
     nof_segment_manager_->mounted_segments_[segment.id] = {
-        segment, client_id, SegmentStatus::OK, std::move(allocator)};
+        segment, client_id, SegmentStatus::OK, std::move(allocator),
+        std::move(device_metadata)};
     nof_segment_manager_->client_by_name_[segment.name] = client_id;
     MasterMetricManager::instance().inc_total_nof_capacity(segment.name, size);
 
@@ -1367,6 +1432,10 @@ ErrorCode ScopedNoFSegmentAccess::PrepareUnmountSegment(
 
     mounted_segment.buf_allocator.reset();
     mounted_segment.status = SegmentStatus::UNMOUNTING;
+    mounted_segment.device_metadata.health = StorageDeviceHealth::UNMOUNTING;
+    mounted_segment.device_metadata.readable = false;
+    mounted_segment.device_metadata.writable = false;
+    mounted_segment.device_metadata.schedulable = false;
     return ErrorCode::OK;
 }
 
@@ -1433,6 +1502,7 @@ ErrorCode ScopedNoFSegmentAccess::GetMountedSegments(
             .client_id = it.second.client_id,
             .segment = it.second.segment,
             .status = it.second.status,
+            .device_metadata = BuildNoFDeviceMetadataSnapshot(it.second),
         });
     }
     return ErrorCode::OK;
@@ -1470,6 +1540,118 @@ ErrorCode ScopedNoFSegmentAccess::QuerySegments(const std::string& segment,
 
     used = total_used;
     capacity = total_capacity;
+    for (auto& [_, mounted_segment] : nof_segment_manager_->mounted_segments_) {
+        if (mounted_segment.segment.name == segment) {
+            mounted_segment.device_metadata.capacity_total =
+                static_cast<int64_t>(total_capacity);
+            mounted_segment.device_metadata.capacity_used =
+                static_cast<int64_t>(total_used);
+            mounted_segment.device_metadata.capacity_available =
+                static_cast<int64_t>(total_capacity - total_used);
+        }
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode ScopedNoFSegmentAccess::RecordDeviceProbeSuccess(
+    const UUID& segment_id) {
+    auto it = nof_segment_manager_->mounted_segments_.find(segment_id);
+    if (it == nof_segment_manager_->mounted_segments_.end()) {
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+    auto& runtime = it->second.device_metadata;
+    if (runtime.health == StorageDeviceHealth::DISABLED) {
+        return ErrorCode::OK;
+    }
+    runtime.consecutive_failures = 0;
+    runtime.last_error.clear();
+    if (it->second.status == SegmentStatus::OK) {
+        runtime.health = StorageDeviceHealth::HEALTHY;
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode ScopedNoFSegmentAccess::RecordDeviceProbeFailure(
+    const UUID& segment_id, const std::string& reason) {
+    auto it = nof_segment_manager_->mounted_segments_.find(segment_id);
+    if (it == nof_segment_manager_->mounted_segments_.end()) {
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+    auto& runtime = it->second.device_metadata;
+    runtime.consecutive_failures += 1;
+    runtime.last_error = reason;
+    if (it->second.status == SegmentStatus::OK) {
+        runtime.health = StorageDeviceHealth::DEGRADED;
+    }
+    return ErrorCode::OK;
+}
+
+std::vector<StorageDeviceMetadata> NoFSegmentManager::ListDeviceMetadata()
+    const {
+    std::shared_lock<std::shared_mutex> lock(segment_mutex_);
+    std::vector<StorageDeviceMetadata> metadata;
+    metadata.reserve(mounted_segments_.size());
+    for (const auto& [_, mounted_segment] : mounted_segments_) {
+        metadata.push_back(BuildNoFDeviceMetadataSnapshot(mounted_segment));
+    }
+    return metadata;
+}
+
+StorageDeviceMaintenancePlan NoFSegmentManager::BuildMaintenancePlan() const {
+    std::shared_lock<std::shared_mutex> lock(segment_mutex_);
+    StorageDeviceMaintenancePlan plan;
+    for (const auto& [_, mounted_segment] : mounted_segments_) {
+        auto metadata = BuildNoFDeviceMetadataSnapshot(mounted_segment);
+        if (auto reason = StorageDeviceRecoveryReason(metadata);
+            reason.has_value()) {
+            plan.recovery_candidates.push_back(
+                StorageDeviceMaintenanceCandidate{metadata, *reason});
+        }
+        if (auto reason = StorageDeviceGcReason(metadata); reason.has_value()) {
+            plan.gc_candidates.push_back(StorageDeviceMaintenanceCandidate{
+                std::move(metadata), *reason});
+        }
+    }
+    return plan;
+}
+
+ErrorCode NoFSegmentManager::RecordDeviceProbeSuccess(const UUID& device_id) {
+    auto access = getNoFSegmentAccess();
+    return access.RecordDeviceProbeSuccess(device_id);
+}
+
+ErrorCode NoFSegmentManager::RecordDeviceProbeFailure(
+    const UUID& device_id, const std::string& reason) {
+    auto access = getNoFSegmentAccess();
+    return access.RecordDeviceProbeFailure(device_id, reason);
+}
+
+ErrorCode NoFSegmentManager::ApplyMetadataUpdate(
+    const StorageDeviceMetadataUpdate& update) {
+    std::unique_lock<std::shared_mutex> lock(segment_mutex_);
+    auto it = mounted_segments_.find(update.identity.device_id);
+    if (it == mounted_segments_.end()) {
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+    ApplyStorageDeviceMetadataUpdate(it->second.device_metadata, update);
+    SyncNoFAllocatorEligibility(it->second, allocator_manager_);
+    return ErrorCode::OK;
+}
+
+ErrorCode NoFSegmentManager::ApplyMetadataBatch(
+    const std::vector<StorageDeviceMetadataUpdate>& updates) {
+    std::unique_lock<std::shared_mutex> lock(segment_mutex_);
+    for (const auto& update : updates) {
+        if (!mounted_segments_.contains(update.identity.device_id)) {
+            return ErrorCode::SEGMENT_NOT_FOUND;
+        }
+    }
+    for (const auto& update : updates) {
+        auto& mounted_segment = mounted_segments_.at(update.identity.device_id);
+        ApplyStorageDeviceMetadataUpdate(mounted_segment.device_metadata,
+                                         update);
+        SyncNoFAllocatorEligibility(mounted_segment, allocator_manager_);
+    }
     return ErrorCode::OK;
 }
 
@@ -1481,7 +1663,8 @@ void NoFSegmentManager::GetMountedSegmentsSnapshot(
     for (const auto& [segment_id, mounted_segment] : mounted_segments_) {
         segments.push_back(MountedNoFSegmentSnapshot{
             segment_id, mounted_segment.client_id, mounted_segment.segment,
-            mounted_segment.status});
+            mounted_segment.status,
+            BuildNoFDeviceMetadataSnapshot(mounted_segment)});
     }
 }
 

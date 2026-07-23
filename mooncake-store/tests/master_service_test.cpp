@@ -6456,11 +6456,11 @@ TEST_F(MasterServiceTest, DrainJobSchedulesMoveTaskAndConvergesToDrained) {
         [&] { return ExecutePendingMoveTasks(*service_, ctx0.client_id); });
 
     WaitUntil([&] {
-        auto query = service_->QueryDrainJob(job_id.value());
+        auto query = service_->QueryMigrationJob(job_id.value());
         return query.has_value() && query->status == JobStatus::SUCCEEDED;
     });
 
-    auto query = service_->QueryDrainJob(job_id.value());
+    auto query = service_->QueryMigrationJob(job_id.value());
     ASSERT_TRUE(query.has_value());
     EXPECT_EQ(query->status, JobStatus::SUCCEEDED);
     EXPECT_EQ(query->active_units, 0u);
@@ -6481,7 +6481,7 @@ TEST_F(MasterServiceTest, DrainJobSchedulesMoveTaskAndConvergesToDrained) {
     EXPECT_FALSE(segment_names.contains("segment_0"));
 }
 
-TEST_F(MasterServiceTest, CancelDrainJobRestoresSegmentStatus) {
+TEST_F(MasterServiceTest, CancelMigrationJobRestoresSegmentStatus) {
     auto service_ = std::make_unique<MasterService>();
 
     [[maybe_unused]] const auto ctx0 = PrepareSimpleSegment(
@@ -6501,10 +6501,10 @@ TEST_F(MasterServiceTest, CancelDrainJobRestoresSegmentStatus) {
     ASSERT_TRUE(draining_status.has_value());
     EXPECT_EQ(draining_status.value(), SegmentStatus::DRAINING);
 
-    auto cancel_result = service_->CancelDrainJob(job_id.value());
+    auto cancel_result = service_->CancelMigrationJob(job_id.value());
     ASSERT_TRUE(cancel_result.has_value());
 
-    auto job = service_->QueryDrainJob(job_id.value());
+    auto job = service_->QueryMigrationJob(job_id.value());
     ASSERT_TRUE(job.has_value());
     EXPECT_EQ(job->status, JobStatus::CANCELED);
 
@@ -6513,7 +6513,7 @@ TEST_F(MasterServiceTest, CancelDrainJobRestoresSegmentStatus) {
     EXPECT_EQ(restored_status.value(), SegmentStatus::OK);
 }
 
-TEST_F(MasterServiceTest, CancelDrainJobRejectsActiveMoveTasks) {
+TEST_F(MasterServiceTest, CancelMigrationJobRejectsActiveMoveTasks) {
     auto service_config =
         MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
     auto service_ = std::make_unique<MasterService>(service_config);
@@ -6539,7 +6539,7 @@ TEST_F(MasterServiceTest, CancelDrainJobRejectsActiveMoveTasks) {
         return fetched.has_value() && !fetched->empty();
     });
 
-    auto cancel_result = service_->CancelDrainJob(job_id.value());
+    auto cancel_result = service_->CancelMigrationJob(job_id.value());
     ASSERT_FALSE(cancel_result.has_value());
     EXPECT_EQ(cancel_result.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
 }
@@ -6571,11 +6571,11 @@ TEST_F(MasterServiceTest, DrainJobFailsAfterRetryBudgetExhausted) {
     }
 
     WaitUntil([&] {
-        auto query = service_->QueryDrainJob(job_id.value());
+        auto query = service_->QueryMigrationJob(job_id.value());
         return query.has_value() && query->status == JobStatus::FAILED;
     });
 
-    auto query = service_->QueryDrainJob(job_id.value());
+    auto query = service_->QueryMigrationJob(job_id.value());
     ASSERT_TRUE(query.has_value());
     EXPECT_EQ(query->status, JobStatus::FAILED);
     EXPECT_EQ(query->active_units, 0u);

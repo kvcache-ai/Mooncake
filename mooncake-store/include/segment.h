@@ -14,6 +14,7 @@
 #include "allocation_strategy.h"
 #include "allocator.h"
 #include "rpc_types.h"
+#include "storage_device_metadata.h"
 #include "types.h"
 
 namespace mooncake {
@@ -62,6 +63,7 @@ struct MountedNoFSegment {
     UUID client_id;
     SegmentStatus status;
     std::shared_ptr<BufferAllocatorBase> buf_allocator;
+    StorageDeviceMetadata device_metadata;
 };
 
 struct MountedNoFSegmentSnapshot {
@@ -69,6 +71,7 @@ struct MountedNoFSegmentSnapshot {
     UUID client_id;
     NoFSegment segment;
     SegmentStatus status;
+    StorageDeviceMetadata device_metadata;
 };
 
 /**
@@ -311,6 +314,10 @@ class ScopedNoFSegmentAccess {
     ErrorCode QuerySegments(const std::string& segment, size_t& used,
                             size_t& capacity);
 
+    ErrorCode RecordDeviceProbeSuccess(const UUID& segment_id);
+    ErrorCode RecordDeviceProbeFailure(const UUID& segment_id,
+                                       const std::string& reason);
+
    private:
     NoFSegmentManager* nof_segment_manager_;
     std::unique_lock<std::shared_mutex> lock_;
@@ -526,6 +533,25 @@ class NoFSegmentManager {
     void GetMountedSegmentsSnapshot(
         std::vector<MountedNoFSegmentSnapshot>& segments) const;
 
+    std::vector<StorageDeviceMetadata> ListDeviceMetadata() const;
+    StorageDeviceMaintenancePlan BuildMaintenancePlan() const;
+    ErrorCode RecordDeviceProbeSuccess(const UUID& device_id);
+    ErrorCode RecordDeviceProbeFailure(const UUID& device_id,
+                                       const std::string& reason);
+    ErrorCode ApplyMetadataUpdate(const StorageDeviceMetadataUpdate& update);
+    ErrorCode ApplyMetadataBatch(
+        const std::vector<StorageDeviceMetadataUpdate>& updates);
+
+    std::optional<std::string> GetSegmentNameByDeviceId(
+        const UUID& device_id) const {
+        std::shared_lock<std::shared_mutex> lock(segment_mutex_);
+        auto it = mounted_segments_.find(device_id);
+        if (it == mounted_segments_.end()) {
+            return std::nullopt;
+        }
+        return it->second.segment.name;
+    }
+
     tl::expected<std::vector<NoFSegmentOwnerInfo>, ErrorCode> GetSegmentsByName(
         const std::string& segment_name) const {
         std::shared_lock<std::shared_mutex> lock(segment_mutex_);
@@ -555,7 +581,6 @@ class NoFSegmentManager {
 
     std::unordered_map<std::string, UUID>
         client_by_name_;  // segment name -> client_id
-
     friend class ScopedNoFSegmentAccess;
     friend class SegmentTest;
 };
