@@ -293,6 +293,57 @@ class PyClient {
         const std::vector<std::vector<size_t>> &all_sizes,
         const ReplicateConfig &config = ReplicateConfig{}) = 0;
 
+    // Put/get sessions. Default stubs keep DummyClient unchanged; RealClient
+    // overrides with the real implementations.
+    virtual std::vector<int> batch_get_session_start(
+        const std::vector<std::string> &keys) {
+        return std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    }
+
+    virtual std::vector<int> batch_get_into_multi_buffer_ranges(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> & /*all_buffers*/,
+        const std::vector<std::vector<size_t>> & /*all_sizes*/,
+        const std::vector<std::vector<size_t>> & /*all_src_offsets*/) {
+        return std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    }
+
+    virtual int batch_get_session_end(
+        const std::vector<std::string> & /*keys*/) {
+        return static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+    }
+
+    virtual std::vector<int> batch_put_session_start(
+        const std::vector<std::string> &keys,
+        const std::vector<size_t> & /*sizes*/,
+        const ReplicateConfig & /*config*/ = ReplicateConfig{}) {
+        return std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    }
+
+    virtual std::vector<int> batch_put_from_multi_buffer_ranges(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> & /*all_buffers*/,
+        const std::vector<std::vector<size_t>> & /*all_sizes*/,
+        const std::vector<std::vector<size_t>> & /*all_dst_offsets*/) {
+        return std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    }
+
+    virtual std::vector<int> batch_put_session_end(
+        const std::vector<std::string> &keys) {
+        return std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    }
+
+    virtual std::vector<int> batch_put_session_revoke(
+        const std::vector<std::string> &keys) {
+        return std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    }
+
     virtual std::shared_ptr<BufferHandle> get_buffer(
         const std::string &key) = 0;
 

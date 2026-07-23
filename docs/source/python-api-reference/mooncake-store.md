@@ -2855,6 +2855,187 @@ store.unregister_buffer(target_tensor.data_ptr())
 ```
 </details>
 
+---
+
+### Session-based ranged multi-buffer transfer
+
+For layerwise KV load/save, resolve Master metadata once per object, then transfer
+object-byte ranges across multiple buffers without re-querying Master on every layer.
+
+Typical flow:
+
+- Get: `batch_get_session_start` → `batch_get_into_multi_buffer_ranges` (per layer) → `batch_get_session_end`
+- Put: `batch_put_session_start` → `batch_put_from_multi_buffer_ranges` (per layer) → `batch_put_session_end` / `batch_put_session_revoke`
+
+Get sessions cache a filtered `QueryResult` (single complete memory replica + lease).
+Range calls only check the cached lease locally (zero Master RPCs). Put sessions
+reserve object space via Master `BatchPutStart` and finalize with `BatchPutEnd`.
+
+⚠️ **Store-managed Buffer Required**: All buffers must resolve to Store-managed
+registered memory before ranged zero-copy operations.
+
+#### batch_get_session_start()
+
+Query replicas once and open a get session for the given keys.
+
+```python
+def batch_get_session_start(self, keys: List[str]) -> List[int]
+```
+
+**Parameters:**
+- `keys` (List[str]): Object identifiers
+
+**Returns:**
+- `List[int]`: Per-key status (0 = success, negative = error)
+
+#### batch_get_into_multi_buffer_ranges()
+
+Ranged get into multiple buffers using an active get session (no Master RPC).
+
+```python
+def batch_get_into_multi_buffer_ranges(
+    self,
+    keys: List[str],
+    all_buffer_ptrs: List[List[int]],
+    all_sizes: List[List[int]],
+    all_src_offsets: List[List[int]],
+) -> List[int]
+```
+
+**Parameters:**
+- `keys` (List[str]): Object identifiers (must have an active get session)
+- `all_buffer_ptrs` (List[List[int]]): Per-key list of destination buffer addresses
+- `all_sizes` (List[List[int]]): Per-key list of transfer sizes in bytes
+- `all_src_offsets` (List[List[int]]): Per-key list of object-byte source offsets
+
+**Returns:**
+- `List[int]`: Bytes transferred per key (positive = success, negative = error)
+
+#### batch_get_session_end()
+
+Drop cached get-session metadata for the given keys.
+
+```python
+def batch_get_session_end(self, keys: List[str]) -> int
+```
+
+**Parameters:**
+- `keys` (List[str]): Object identifiers
+
+**Returns:**
+- `int`: 0 on success, negative on error
+
+#### batch_put_session_start()
+
+Reserve objects and open a put session without transferring data.
+
+```python
+def batch_put_session_start(
+    self,
+    keys: List[str],
+    sizes: List[int],
+    config: ReplicateConfig = None,
+) -> List[int]
+```
+
+**Parameters:**
+- `keys` (List[str]): Object identifiers
+- `sizes` (List[int]): Full object sizes in bytes
+- `config` (ReplicateConfig, optional): Replication configuration (applies at start only)
+
+**Returns:**
+- `List[int]`: Per-key status (0 = success, negative = error)
+
+#### batch_put_from_multi_buffer_ranges()
+
+Ranged put from multiple buffers using an active put session (no Master RPC).
+
+```python
+def batch_put_from_multi_buffer_ranges(
+    self,
+    keys: List[str],
+    all_buffer_ptrs: List[List[int]],
+    all_sizes: List[List[int]],
+    all_dst_offsets: List[List[int]],
+) -> List[int]
+```
+
+**Parameters:**
+- `keys` (List[str]): Object identifiers (must have an active put session)
+- `all_buffer_ptrs` (List[List[int]]): Per-key list of source buffer addresses
+- `all_sizes` (List[List[int]]): Per-key list of transfer sizes in bytes
+- `all_dst_offsets` (List[List[int]]): Per-key list of object-byte destination offsets
+
+**Returns:**
+- `List[int]`: Bytes transferred per key (positive = success, negative = error)
+
+#### batch_put_session_end()
+
+Finalize a put session and make objects readable.
+
+```python
+def batch_put_session_end(self, keys: List[str]) -> List[int]
+```
+
+**Parameters:**
+- `keys` (List[str]): Object identifiers
+
+**Returns:**
+- `List[int]`: Per-key status (0 = success, negative = error)
+
+#### batch_put_session_revoke()
+
+Abort an incomplete put session and release reserved space.
+
+```python
+def batch_put_session_revoke(self, keys: List[str]) -> List[int]
+```
+
+**Parameters:**
+- `keys` (List[str]): Object identifiers
+
+**Returns:**
+- `List[int]`: Per-key status (0 = success, negative = error)
+
+**Example:**
+
+<details>
+<summary>Click to expand: Session ranged put/get example</summary>
+
+```python
+import numpy as np
+
+page = 1024
+layers = 4
+keys = ["block0", "block1"]
+object_sizes = [page * layers] * len(keys)
+
+# Prepare one registered buffer per layer for each key
+src = [np.full(page, i, dtype=np.uint8) for i in range(layers)]
+dst = [np.zeros(page, dtype=np.uint8) for _ in range(layers)]
+for buf in src + dst:
+    store.register_buffer(buf.ctypes.data, buf.nbytes)
+
+assert all(rc == 0 for rc in store.batch_put_session_start(keys, object_sizes))
+for layer in range(layers):
+    ptrs = [[src[layer].ctypes.data] for _ in keys]
+    sizes = [[page] for _ in keys]
+    offsets = [[layer * page] for _ in keys]
+    rcs = store.batch_put_from_multi_buffer_ranges(keys, ptrs, sizes, offsets)
+    assert all(rc == page for rc in rcs)
+assert all(rc == 0 for rc in store.batch_put_session_end(keys))
+
+assert all(rc == 0 for rc in store.batch_get_session_start(keys))
+for layer in range(layers):
+    ptrs = [[dst[layer].ctypes.data] for _ in keys]
+    sizes = [[page] for _ in keys]
+    offsets = [[layer * page] for _ in keys]
+    rcs = store.batch_get_into_multi_buffer_ranges(keys, ptrs, sizes, offsets)
+    assert all(rc == page for rc in rcs)
+assert store.batch_get_session_end(keys) == 0
+```
+</details>
+
 ## MooncakeHostMemAllocator Class
 
 The `MooncakeHostMemAllocator` class provides host memory allocation capabilities for Mooncake Store operations.

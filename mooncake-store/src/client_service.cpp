@@ -2606,6 +2606,50 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     return CollectResults(ops);
 }
 
+std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+Client::StartBatchPutForSizes(const std::vector<std::string>& keys,
+                              const std::vector<uint64_t>& object_sizes,
+                              const ReplicateConfig& config) {
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+        results(keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    if (keys.size() != object_sizes.size()) {
+        LOG(ERROR) << "StartBatchPutForSizes size mismatch: keys="
+                   << keys.size() << ", sizes=" << object_sizes.size();
+        return results;
+    }
+
+    ReplicateConfig client_cfg = AttachHostId(config);
+    if (protocol_ == "cxl") {
+        client_cfg.preferred_segment = local_hostname_;
+    }
+
+    std::vector<std::vector<Slice>> batched_slices(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        batched_slices[i] = {Slice{nullptr, object_sizes[i]}};
+    }
+    std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
+    StartBatchPut(ops, client_cfg);
+
+    for (size_t i = 0; i < ops.size(); ++i) {
+        if (ops[i].IsResolved()) {
+            results[i] = tl::unexpected(ops[i].result.error());
+            continue;
+        }
+        results[i] = std::move(ops[i].replicas);
+    }
+    return results;
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::BatchPutEnd(
+    const std::vector<std::string>& keys, ReplicaType replica_type) {
+    return master_client_.BatchPutEnd(keys, replica_type);
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::BatchPutRevoke(
+    const std::vector<std::string>& keys, ReplicaType replica_type) {
+    return master_client_.BatchPutRevoke(keys, replica_type);
+}
+
 tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
     if (hot_cache_) {
         hot_cache_->BumpKeyGeneration(key);
@@ -3488,16 +3532,151 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
     return future->get();
 }
 
-ErrorCode Client::TransferReadInternal(
+std::optional<TransferFuture> Client::SubmitRangeRead(
     const Replica::Descriptor& replica_descriptor, std::vector<Slice>& slices,
     uint64_t src_offset) {
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
-        return ErrorCode::INVALID_PARAMS;
+        return std::nullopt;
+    }
+    return transfer_submitter_->submitRangeRead(replica_descriptor, slices,
+                                                src_offset);
+}
+
+std::optional<TransferFuture> Client::SubmitRangeWrite(
+    const Replica::Descriptor& replica_descriptor, std::vector<Slice>& slices,
+    uint64_t dst_offset) {
+    if (!transfer_submitter_) {
+        LOG(ERROR) << "TransferSubmitter not initialized";
+        return std::nullopt;
+    }
+    return transfer_submitter_->submitRangeWrite(replica_descriptor, slices,
+                                                 dst_offset);
+}
+
+std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferReadRanges(
+    const std::vector<Replica::Descriptor>& replicas,
+    const std::vector<std::vector<Slice>>& slices,
+    const std::vector<std::vector<uint64_t>>& src_offsets) {
+    std::vector<tl::expected<int64_t, ErrorCode>> results(
+        replicas.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    if (replicas.size() != slices.size() ||
+        replicas.size() != src_offsets.size()) {
+        LOG(ERROR) << "BatchTransferReadRanges size mismatch: replicas="
+                   << replicas.size() << ", slices=" << slices.size()
+                   << ", offsets=" << src_offsets.size();
+        return results;
     }
 
-    auto future = transfer_submitter_->submitRangeRead(replica_descriptor,
-                                                       slices, src_offset);
+    // Submit every fragment of every entry, then await all in parallel.
+    std::vector<std::tuple<size_t, TransferFuture>> pending;
+    for (size_t i = 0; i < replicas.size(); ++i) {
+        int64_t transferred = 0;
+        bool submit_failed = false;
+        for (size_t j = 0; j < slices[i].size(); ++j) {
+            std::vector<Slice> one{slices[i][j]};
+            auto future = SubmitRangeRead(replicas[i], one, src_offsets[i][j]);
+            if (!future) {
+                LOG(ERROR) << "Failed to submit range read, entry=" << i;
+                results[i] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
+                submit_failed = true;
+                break;
+            }
+            pending.emplace_back(i, std::move(*future));
+            transferred += static_cast<int64_t>(slices[i][j].size);
+        }
+        if (!submit_failed) {
+            results[i] = transferred;  // optimistic; corrected on await
+        }
+    }
+
+    for (auto& [index, future] : pending) {
+        if (!results[index].has_value()) {
+            (void)future.get();  // drain already-failed entries
+            continue;
+        }
+        ErrorCode err = future.get();
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "Range read failed, entry=" << index
+                       << ", error=" << static_cast<int>(err);
+            results[index] = tl::unexpected(err);
+        }
+    }
+    return results;
+}
+
+std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferWriteRanges(
+    const std::vector<std::vector<Replica::Descriptor>>& replicas_per_entry,
+    const std::vector<std::vector<Slice>>& slices,
+    const std::vector<std::vector<uint64_t>>& dst_offsets) {
+    std::vector<tl::expected<int64_t, ErrorCode>> results(
+        replicas_per_entry.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    if (replicas_per_entry.size() != slices.size() ||
+        replicas_per_entry.size() != dst_offsets.size()) {
+        LOG(ERROR) << "BatchTransferWriteRanges size mismatch: entries="
+                   << replicas_per_entry.size() << ", slices=" << slices.size()
+                   << ", offsets=" << dst_offsets.size();
+        return results;
+    }
+
+    std::vector<std::tuple<size_t, TransferFuture>> pending;
+    for (size_t i = 0; i < replicas_per_entry.size(); ++i) {
+        // Logical bytes: counted once per fragment, not per replica.
+        int64_t transferred = 0;
+        for (size_t j = 0; j < slices[i].size(); ++j) {
+            transferred += static_cast<int64_t>(slices[i][j].size);
+        }
+        bool submitted = false;
+        bool submit_failed = false;
+        for (const auto& replica : replicas_per_entry[i]) {
+            if (!replica.is_memory_replica()) {
+                continue;
+            }
+            for (size_t j = 0; j < slices[i].size(); ++j) {
+                std::vector<Slice> one{slices[i][j]};
+                auto future = SubmitRangeWrite(replica, one, dst_offsets[i][j]);
+                if (!future) {
+                    LOG(ERROR) << "Failed to submit range write, entry=" << i;
+                    results[i] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
+                    submit_failed = true;
+                    break;
+                }
+                pending.emplace_back(i, std::move(*future));
+                submitted = true;
+            }
+            if (submit_failed) {
+                break;
+            }
+        }
+        if (submit_failed) {
+            continue;
+        }
+        if (!submitted) {
+            results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
+            continue;
+        }
+        results[i] = transferred;  // optimistic; corrected on await
+    }
+
+    for (auto& [index, future] : pending) {
+        if (!results[index].has_value()) {
+            (void)future.get();
+            continue;
+        }
+        ErrorCode err = future.get();
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "Range write failed, entry=" << index
+                       << ", error=" << static_cast<int>(err);
+            results[index] = tl::unexpected(err);
+        }
+    }
+    return results;
+}
+
+ErrorCode Client::TransferReadInternal(
+    const Replica::Descriptor& replica_descriptor, std::vector<Slice>& slices,
+    uint64_t src_offset) {
+    auto future = SubmitRangeRead(replica_descriptor, slices, src_offset);
     if (!future) {
         LOG(ERROR) << "Failed to submit range read operation";
         return ErrorCode::TRANSFER_FAIL;
@@ -3511,6 +3690,19 @@ ErrorCode Client::TransferReadInternal(
 ErrorCode Client::TransferWrite(const Replica::Descriptor& replica_descriptor,
                                 std::vector<Slice>& slices) {
     return TransferData(replica_descriptor, slices, TransferRequest::WRITE);
+}
+
+ErrorCode Client::TransferWriteRange(
+    const Replica::Descriptor& replica_descriptor, std::vector<Slice>& slices,
+    uint64_t dst_offset) {
+    auto future = SubmitRangeWrite(replica_descriptor, slices, dst_offset);
+    if (!future) {
+        LOG(ERROR) << "Failed to submit range write operation";
+        return ErrorCode::TRANSFER_FAIL;
+    }
+
+    VLOG(1) << "Using transfer strategy: " << future->strategy();
+    return future->get();
 }
 
 ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
