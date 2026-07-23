@@ -187,6 +187,8 @@ class MasterServiceSupervisorConfig {
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
+    AllocationStrategyType allocation_strategy_type =
+        AllocationStrategyType::RANDOM;
     uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
@@ -313,6 +315,28 @@ class MasterServiceSupervisorConfig {
             memory_allocator = BufferAllocatorType::CACHELIB;
         } else {
             memory_allocator = BufferAllocatorType::OFFSET;
+        }
+
+        // Convert string allocation_strategy to AllocationStrategyType enum
+        if (config.allocation_strategy == "free_ratio_first") {
+            allocation_strategy_type = AllocationStrategyType::FREE_RATIO_FIRST;
+        } else if (config.allocation_strategy == "cxl") {
+            allocation_strategy_type = AllocationStrategyType::CXL;
+        } else if (config.allocation_strategy == "random") {
+            allocation_strategy_type = AllocationStrategyType::RANDOM;
+        } else if (config.allocation_strategy == "ssd_free_ratio_first") {
+            allocation_strategy_type =
+                AllocationStrategyType::SSD_FREE_RATIO_FIRST;
+        } else if (config.allocation_strategy == "local_first") {
+            allocation_strategy_type = AllocationStrategyType::LOCAL_FIRST;
+        } else {
+            LOG(WARNING) << "Unrecognized allocation_strategy value: '"
+                         << config.allocation_strategy
+                         << "'. Defaulting to 'random'. "
+                         << "Valid options are: random, free_ratio_first, cxl, "
+                            "ssd_free_ratio_first, local_first "
+                            "(case-sensitive)";
+            allocation_strategy_type = AllocationStrategyType::RANDOM;
         }
 
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
@@ -655,6 +679,7 @@ class WrappedMasterServiceConfig {
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
         memory_allocator = config.memory_allocator;
+        allocation_strategy_type = config.allocation_strategy_type;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
         enable_multi_tenants = config.enable_multi_tenants;
