@@ -46,6 +46,40 @@ namespace tent {
 namespace {
 constexpr uint8_t kRedisMaxDbIndex = 255;
 constexpr uint8_t kRedisDefaultDbIndex = 0;
+
+bool hasRegisteredTransport(const BufferDesc& desc, TransportType type) {
+    return std::find(desc.transports.begin(), desc.transports.end(), type) !=
+           desc.transports.end();
+}
+
+void eraseRegisteredTransport(BufferDesc& desc, TransportType type) {
+    auto& transports = desc.transports;
+    transports.erase(std::remove(transports.begin(), transports.end(), type),
+                     transports.end());
+}
+
+void rollbackMemoryBuffersForTransports(
+    const std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>&
+        transport_list,
+    std::vector<BufferDesc>& descs,
+    const std::vector<TransportType>& attempted_transports) {
+    for (auto it = attempted_transports.rbegin();
+         it != attempted_transports.rend(); ++it) {
+        auto type = *it;
+        auto& transport = transport_list[type];
+        if (!transport) continue;
+        for (auto& desc : descs) {
+            if (!hasRegisteredTransport(desc, type)) continue;
+            auto rollback_status = transport->removeMemoryBuffer(desc);
+            if (!rollback_status.ok()) {
+                LOG(WARNING) << "Failed to roll back memory buffer for "
+                             << "transport " << type << ": "
+                             << rollback_status.ToString();
+            }
+            eraseRegisteredTransport(desc, type);
+        }
+    }
+}
 }  // namespace
 
 struct Batch {
@@ -743,6 +777,7 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
         desc_list.push_back(std::move(desc));
     }
 
+    std::vector<BufferDesc> registered_descs;
     auto status = local_segment_tracker_->addInBatch(
         desc_list, [&](std::vector<BufferDesc>& descs) -> Status {
             std::vector<TransportType> registered_transports;
@@ -750,34 +785,62 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
                 auto s = transport_list_[type]->addMemoryBuffer(descs, options);
                 if (!s.ok()) {
                     LOG(WARNING) << s.ToString();
-                    for (auto it = registered_transports.rbegin();
-                         it != registered_transports.rend(); ++it) {
-                        for (auto& desc : descs) {
-                            auto rollback_status =
-                                transport_list_[*it]->removeMemoryBuffer(desc);
-                            if (!rollback_status.ok()) {
-                                LOG(WARNING)
-                                    << "Failed to roll back memory buffer for "
-                                    << "transport " << *it << ": "
-                                    << rollback_status.ToString();
-                            }
-                            auto& desc_transports = desc.transports;
-                            desc_transports.erase(
-                                std::remove(desc_transports.begin(),
-                                            desc_transports.end(), *it),
-                                desc_transports.end());
-                        }
-                    }
+                    registered_transports.push_back(type);
+                    rollbackMemoryBuffersForTransports(transport_list_, descs,
+                                                       registered_transports);
                     return s;
                 }
                 registered_transports.push_back(type);
             }
+            registered_descs = descs;
             return Status::OK();
         });
     if (!status.ok()) return status;
     // Synchronize local segment to metadata server so remote peers can see the
     // new buffers
-    return metadata_->segmentManager().synchronizeLocal();
+    status = metadata_->segmentManager().synchronizeLocal();
+    if (status.ok()) return Status::OK();
+
+    LOG(WARNING) << "Failed to synchronize registered memory to metadata; "
+                    "rolling back local registration: "
+                 << status.ToString();
+    auto rollback_status = unregisterLocalMemory(addr_list, size_list);
+    bool removed_by_exact_desc = false;
+    Status exact_rollback_status = Status::OK();
+    for (const auto& registered_desc : registered_descs) {
+        bool removed = false;
+        auto remove_status = local_segment_tracker_->remove(
+            registered_desc.addr, registered_desc.length,
+            [&](BufferDesc& desc) -> Status {
+                removed = true;
+                for (auto type : desc.transports) {
+                    if (!transport_list_[type]) continue;
+                    auto s = transport_list_[type]->removeMemoryBuffer(desc);
+                    if (!s.ok()) LOG(WARNING) << s.ToString();
+                }
+                return Status::OK();
+            });
+        if (!remove_status.ok() && exact_rollback_status.ok()) {
+            exact_rollback_status = remove_status;
+        }
+        if (removed) removed_by_exact_desc = true;
+    }
+    if (exact_rollback_status.ok() && removed_by_exact_desc) {
+        exact_rollback_status = metadata_->segmentManager().synchronizeLocal();
+    }
+    if (!rollback_status.ok()) {
+        return Status::InternalError(
+            "registerLocalMemory metadata synchronization failed: " +
+            status.ToString() +
+            "; rollback also failed: " + rollback_status.ToString() + LOC_MARK);
+    }
+    if (!exact_rollback_status.ok()) {
+        return Status::InternalError(
+            "registerLocalMemory metadata synchronization failed: " +
+            status.ToString() + "; descriptor rollback also failed: " +
+            exact_rollback_status.ToString() + LOC_MARK);
+    }
+    return status;
 }
 
 // WARNING: before exiting TE, make sure that all local memory are
