@@ -182,6 +182,9 @@ TEST_F(ObjectStorageAdapterTest, ObjectStorageModeInitSkipsDirectories) {
     FakeObjectStorageAdapter* adapter = nullptr;
     auto backend = MakeObjectStorageBackend(adapter);
 
+    EXPECT_EQ(backend->GetStorageMode(),
+              DistributedStorageMode::kObjectStorage);
+    EXPECT_TRUE(backend->UsesObjectStorage());
     ASSERT_TRUE(backend->Init());
     EXPECT_TRUE(adapter->initialized);
     EXPECT_EQ(adapter->init_calls, 1);
@@ -418,9 +421,26 @@ TEST_F(ObjectStorageAdapterTest, LegacyFileSystemConstructorStillWorks) {
     DistributedStorageBackend backend(file_config, distributed_config,
                                       std::move(owned_adapter));
 
+    EXPECT_EQ(backend.GetStorageMode(), DistributedStorageMode::kFileSystem);
+    EXPECT_FALSE(backend.UsesObjectStorage());
     ASSERT_TRUE(backend.Init());
     EXPECT_TRUE(adapter->initialized);
     EXPECT_TRUE(std::filesystem::is_directory(root_dir_ / "00"));
+}
+
+TEST_F(ObjectStorageAdapterTest, RejectsAmbiguousAdapterSelection) {
+    FileStorageConfig file_config;
+    DistributedStorageConfig distributed_config;
+    distributed_config.fsdir = root_dir_.string();
+
+    EXPECT_DEATH(
+        {
+            DistributedStorageBackend backend(
+                file_config, distributed_config,
+                std::make_unique<FakeFileSystemAdapter>(),
+                std::make_unique<FakeObjectStorageAdapter>());
+        },
+        "exactly one I/O adapter is required");
 }
 
 }  // namespace

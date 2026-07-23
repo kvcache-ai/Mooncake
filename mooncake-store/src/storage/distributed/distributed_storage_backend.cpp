@@ -76,9 +76,11 @@ DistributedStorageBackend::DistributedStorageBackend(
       distributed_config_(distributed_config),
       root_dir_(distributed_config.fsdir),
       hash_bucket_count_(distributed_config.hash_bucket_count) {
-    CHECK(fs_adapter_ || object_storage_adapter_)
-        << "DistributedStorageBackend: at least one I/O adapter is required";
-    use_object_storage_ = object_storage_adapter_ != nullptr;
+    CHECK((fs_adapter_ != nullptr) != (object_storage_adapter_ != nullptr))
+        << "DistributedStorageBackend: exactly one I/O adapter is required";
+    if (object_storage_adapter_) {
+        storage_mode_ = DistributedStorageMode::kObjectStorage;
+    }
 }
 
 tl::expected<void, ErrorCode> DistributedStorageBackend::Init() {
@@ -87,7 +89,7 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::Init() {
         return {};
     }
 
-    if (use_object_storage_) {
+    if (UsesObjectStorage()) {
         auto init_result = object_storage_adapter_->Init();
         if (!init_result) return init_result;
         initialized_ = true;
@@ -186,7 +188,7 @@ tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
         }
 
         size_t written = 0;
-        if (use_object_storage_) {
+        if (UsesObjectStorage()) {
             auto result = object_storage_adapter_->PutV(
                 key, iovs.data(), static_cast<int>(iovs.size()));
             if (!result) {
@@ -232,7 +234,7 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::BatchLoad(
 
     for (auto& [key, slice] : batched_slices) {
         auto result =
-            use_object_storage_
+            UsesObjectStorage()
                 ? object_storage_adapter_->Get(key, slice.ptr, slice.size)
                 : fs_adapter_->ReadFile(GetObjectPath(key), slice.ptr,
                                         slice.size);
@@ -253,7 +255,7 @@ tl::expected<bool, ErrorCode> DistributedStorageBackend::IsExist(
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
-    if (use_object_storage_) {
+    if (UsesObjectStorage()) {
         return object_storage_adapter_->Exists(key);
     }
     return fs_adapter_->FileExists(GetObjectPath(key));
@@ -277,7 +279,7 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ScanMeta(
     const size_t batch_limit = static_cast<size_t>(std::max<int64_t>(
         1, file_storage_config_.scanmeta_iterator_keys_limit));
 
-    if (use_object_storage_) {
+    if (UsesObjectStorage()) {
         auto key_infos = object_storage_adapter_->ListKeys();
         if (!key_infos) {
             LOG(ERROR) << "Failed to list keys from object storage adapter: "

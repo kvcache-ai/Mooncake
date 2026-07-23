@@ -8,6 +8,14 @@
 
 namespace mooncake {
 
+// The filesystem mode covers both the current per-object layout and the
+// shard-offset DFS layout introduced by follow-up work. Object storage remains
+// a separate, key-oriented I/O mode.
+enum class DistributedStorageMode {
+    kFileSystem,
+    kObjectStorage,
+};
+
 struct DistributedStorageConfig {
     std::string fsdir = "distributed_dir";
     std::string fs_adapter_type = "hf3fs";
@@ -32,13 +40,18 @@ class DistributedStorageBackend : public StorageBackendInterface {
         const DistributedStorageConfig& distributed_config,
         std::unique_ptr<FileSystemAdapter> fs_adapter);
 
-    // At least one adapter must be non-null. When object_storage_adapter is
-    // provided, the backend uses object storage mode.
+    // Exactly one adapter must be non-null.
     DistributedStorageBackend(
         const FileStorageConfig& file_storage_config,
         const DistributedStorageConfig& distributed_config,
         std::unique_ptr<FileSystemAdapter> fs_adapter,
         std::unique_ptr<ObjectStorageAdapter> object_storage_adapter);
+
+    DistributedStorageMode GetStorageMode() const { return storage_mode_; }
+
+    bool UsesObjectStorage() const {
+        return storage_mode_ == DistributedStorageMode::kObjectStorage;
+    }
 
     tl::expected<void, ErrorCode> Init() override;
 
@@ -71,7 +84,7 @@ class DistributedStorageBackend : public StorageBackendInterface {
     DistributedStorageConfig distributed_config_;
     std::string root_dir_;
     int hash_bucket_count_;
-    bool use_object_storage_ = false;
+    DistributedStorageMode storage_mode_ = DistributedStorageMode::kFileSystem;
     bool initialized_ = false;
 };
 
