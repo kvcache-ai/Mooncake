@@ -68,7 +68,8 @@ set_target_properties(
 
 if(BUILD_UNIT_TESTS)
   add_executable(tebench_qos_metrics_test tests/qos_metrics_test.cpp
-                                          qos_metrics_adapter.cpp utils.cpp)
+                                          qos_metrics_adapter.cpp
+                                          workload_config.cpp utils.cpp)
   if(NOT USE_TENT)
     target_sources(tebench_qos_metrics_test PRIVATE
                    ../tent/src/common/qos_metrics.cpp)

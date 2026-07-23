@@ -42,6 +42,11 @@ DEFINE_string(
 DEFINE_string(qos_classes_json, "",
               "QoS classes as a JSON array of objects with name, threads, "
               "slo_us, weight, and optional isolated_gbps fields.");
+DEFINE_string(
+    workload_classes_json, "",
+    "Mixed traffic classes as a JSON array with name, threads, block_size, "
+    "batch_size, intent_type, slo_us, weight, and optional deadline_us and "
+    "isolated_gbps fields. Overrides the block/batch sweep.");
 DEFINE_double(qos_link_capacity_gbps, 0.0,
               "Link capacity in GB/s for total utilization (0 reports N/A).");
 DEFINE_string(qos_output_jsonl, "",
@@ -95,6 +100,7 @@ int XferBenchConfig::max_num_threads = 0;
 int XferBenchConfig::start_num_threads = 0;
 std::string XferBenchConfig::qos_classes;
 std::string XferBenchConfig::qos_classes_json;
+std::string XferBenchConfig::workload_classes_json;
 double XferBenchConfig::qos_link_capacity_gbps = 0.0;
 std::string XferBenchConfig::qos_output_jsonl;
 uint64_t XferBenchConfig::deadline_us = 0;
@@ -129,6 +135,7 @@ void XferBenchConfig::loadFromFlags() {
     max_num_threads = FLAGS_max_num_threads;
     qos_classes = FLAGS_qos_classes;
     qos_classes_json = FLAGS_qos_classes_json;
+    workload_classes_json = FLAGS_workload_classes_json;
     qos_link_capacity_gbps = FLAGS_qos_link_capacity_gbps;
     qos_output_jsonl = FLAGS_qos_output_jsonl;
     deadline_us = FLAGS_deadline_us;

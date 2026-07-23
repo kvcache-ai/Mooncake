@@ -240,13 +240,16 @@ QosMetricsReport calculateQosMetrics(size_t block_size, size_t batch_size,
         metrics.weight = config.weight;
         metrics.isolated_throughput_gbps = config.isolated_throughput_gbps;
         metrics.operations = sample.operations;
+        metrics.transferred_bytes = sample.transferred_bytes.value_or(
+            static_cast<uint64_t>(block_size) * batch_size *
+            metrics.operations);
         metrics.p99_us = sample.p99_us;
 
         const double duration_s = sample.total_duration_us / 1e6;
-        const double bytes =
-            static_cast<double>(block_size) * batch_size * metrics.operations;
         if (duration_s > 0.0)
-            metrics.throughput_gbps = bytes / 1e9 / duration_s;
+            metrics.throughput_gbps =
+                static_cast<double>(metrics.transferred_bytes) / 1e9 /
+                duration_s;
 
         double attainment = 1.0;
         if (config.slo_us != 0) {
@@ -305,6 +308,7 @@ void printQosMetrics(const QosMetricsReport& report) {
         std::cout << "  [qos-class] name=" << metrics.name
                   << " threads=" << metrics.threads
                   << " operations=" << metrics.operations
+                  << " transferred_bytes=" << metrics.transferred_bytes
                   << " throughput=" << metrics.throughput_gbps
                   << " GB/s p99_us=" << std::setprecision(1) << metrics.p99_us
                   << " slo_attainment=";
@@ -346,6 +350,7 @@ bool appendQosMetricsJsonl(const std::string& path,
             {"slo_us", metrics.slo_us},
             {"weight", metrics.weight},
             {"operations", metrics.operations},
+            {"transferred_bytes", metrics.transferred_bytes},
             {"throughput_gbps", metrics.throughput_gbps},
             {"p99_us", metrics.p99_us},
             {"slo_attainment", optionalJson(metrics.slo_attainment)},

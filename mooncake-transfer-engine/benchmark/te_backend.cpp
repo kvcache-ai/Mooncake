@@ -350,8 +350,10 @@ double TEBenchRunner::runSingleTransfer(uint64_t local_addr,
                                         uint64_t target_addr,
                                         uint64_t block_size,
                                         uint64_t batch_size, OpCode opcode,
-                                        uint64_t deadline_ns) {
+                                        uint64_t deadline_ns,
+                                        IntentType intent_type) {
     (void)deadline_ns;
+    (void)intent_type;
     auto batch_id = engine_->allocateBatchID(batch_size);
     std::vector<TransferRequest> requests;
     for (uint64_t i = 0; i < batch_size; ++i) {
