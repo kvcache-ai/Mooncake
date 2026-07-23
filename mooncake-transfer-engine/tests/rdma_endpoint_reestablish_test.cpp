@@ -54,6 +54,7 @@
 #include "common.h"
 #include "transfer_engine.h"
 #include "transport/rdma_transport/rdma_context.h"
+#include "transport/rdma_transport/rdma_endpoint.h"
 #include "transport/rdma_transport/rdma_transport.h"
 #include "transport/rdma_transport/worker_pool.h"
 #include "transport/transport.h"
@@ -592,7 +593,6 @@ TEST_F(RDMAEndpointReestablishTest, SenderSingleRnicDownUsesFallbackLocalRnic) {
     TEContext init_ctx(initiator_server_name, metadata_server,
                        target_segment_name, sender_matrix,
                        RawNicPriorityMatrix{});
-
     ASSERT_TRUE(RdmaTransportTestPeer::setContextActive(
         init_ctx.rdma_transport_, initiator_device_name, false));
     ASSERT_FALSE(RdmaTransportTestPeer::contextActive(init_ctx.rdma_transport_,
@@ -816,6 +816,88 @@ TEST_F(RDMAEndpointReestablishTest,
 
 }  // namespace
 
+#if defined(__has_feature)
+#define MC_HAS_FEATURE(x) __has_feature(x)
+#else
+#define MC_HAS_FEATURE(x) 0
+#endif
+#if defined(__SANITIZE_ADDRESS__) || MC_HAS_FEATURE(address_sanitizer)
+#include <sanitizer/lsan_interface.h>
+#define MC_LSAN_IGNORE_OBJECT(p) __lsan_ignore_object(p)
+#else
+#define MC_LSAN_IGNORE_OBJECT(p) ((void)(p))
+#endif
+
+namespace mooncake {
+class RdmaEndPointTestPeer {
+   public:
+    static void addDummyQp(RdmaEndPoint &endpoint, ibv_qp *qp) {
+        endpoint.qp_list_.push_back(qp);
+    }
+
+    static void clearDummyQp(RdmaEndPoint &endpoint) {
+        endpoint.qp_list_.clear();
+    }
+
+    static int doSetupConnection(RdmaEndPoint &endpoint, int qp_index,
+                                 const ibv_gid &peer_gid, uint16_t peer_lid,
+                                 uint32_t peer_qp_num, int local_gid_index,
+                                 std::string *reply_msg,
+                                 int &out_stage, int &out_sys_errno) {
+        RdmaEndPoint::SetupConnectionFailureInfo failure_info = {};
+        int rc = endpoint.doSetupConnection(qp_index, peer_gid, peer_lid,
+                                            peer_qp_num, local_gid_index,
+                                            reply_msg, &failure_info);
+        out_stage = static_cast<int>(failure_info.stage);
+        out_sys_errno = failure_info.sys_errno;
+        return rc;
+    }
+
+    static int getResetStageValue() {
+        return static_cast<int>(RdmaEndPoint::SetupConnectionFailureStage::kReset);
+    }
+};
+}
+
+extern std::atomic<int> g_inject_modify_qp_error;
+
+namespace {
+
+TEST(RDMAEndpointSetupErrorTest, VerifyVerbsErrorCorrectlyCaptured) {
+    auto* transport = new RdmaTransport();
+    // Ignore memory leak of transport during destruction since it's a test
+    MC_LSAN_IGNORE_OBJECT(transport);
+    auto context = std::make_unique<RdmaContext>(*transport, "unused");
+    auto endpoint = std::make_unique<RdmaEndPoint>(*context);
+
+    // Add a dummy non-null QP pointer to trigger doSetupConnection
+    ibv_qp* dummy_qp = reinterpret_cast<ibv_qp*>(0xdeadbeef);
+    mooncake::RdmaEndPointTestPeer::addDummyQp(*endpoint, dummy_qp);
+
+    // Inject EINVAL error for ibv_modify_qp
+    g_inject_modify_qp_error.store(EINVAL);
+
+    ibv_gid dummy_gid = {};
+    std::string reply_msg;
+    int stage = 0;
+    int sys_errno = 0;
+    int rc = mooncake::RdmaEndPointTestPeer::doSetupConnection(
+        *endpoint, 0, dummy_gid, 0, 0, 0, &reply_msg, stage, sys_errno);
+
+    // Clear injection immediately
+    g_inject_modify_qp_error.store(0);
+
+    // Clear dummy qp so destructor doesn't try to destroy 0xdeadbeef and crash
+    mooncake::RdmaEndPointTestPeer::clearDummyQp(*endpoint);
+
+    EXPECT_EQ(rc, ERR_ENDPOINT);
+    EXPECT_EQ(stage, mooncake::RdmaEndPointTestPeer::getResetStageValue());
+    EXPECT_EQ(sys_errno, EINVAL);
+    EXPECT_TRUE(reply_msg.find("EINVAL") != std::string::npos || reply_msg.find("Invalid argument") != std::string::npos || reply_msg.find("22") != std::string::npos);
+}
+
+}  // namespace
+
 extern "C" int __real__ibv_query_gid_ex(ibv_context* context, uint8_t port_num,
                                         int gid_index,
                                         struct ibv_gid_entry* entry,
@@ -844,8 +926,14 @@ extern "C" int __wrap_ibv_query_gid(ibv_context* context, uint8_t port_num,
 extern "C" int __real_ibv_modify_qp(ibv_qp* qp, ibv_qp_attr* attr,
                                     int attr_mask);
 
+std::atomic<int> g_inject_modify_qp_error{0};
+
 extern "C" int __wrap_ibv_modify_qp(ibv_qp* qp, ibv_qp_attr* attr,
                                     int attr_mask) {
+    int error_to_inject = g_inject_modify_qp_error.load();
+    if (error_to_inject != 0) {
+        return error_to_inject;
+    }
     if (qp != nullptr && attr != nullptr && attr->qp_state == IBV_QPS_RTR &&
         (attr_mask & IBV_QP_AV)) {
         const std::string device_name =
@@ -860,8 +948,7 @@ extern "C" int __wrap_ibv_modify_qp(ibv_qp* qp, ibv_qp_attr* attr,
         recordRtrAttempt(device_name, sgid_index, gid_string);
         int injected_errno = injectedRtrErrnoOrZero(device_name, sgid_index);
         if (injected_errno != 0) {
-            errno = injected_errno;
-            return -1;
+            return injected_errno;
         }
     }
     return __real_ibv_modify_qp(qp, attr, attr_mask);
