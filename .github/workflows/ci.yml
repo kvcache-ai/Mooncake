@@ -37,7 +37,8 @@ jobs:
   build-musa:
     needs: [spell-check, clang-format, check-paths]
     if: >-
-      (needs.check-paths.outputs.should-run-downstream == 'true' ||
+      (needs.check-paths.outputs.should-run-musa == 'true' ||
+       github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch') &&
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
@@ -75,7 +76,8 @@ jobs:
   build-arm64:
     needs: [spell-check, clang-format, check-paths]
     if: >-
-      (needs.check-paths.outputs.should-run-downstream == 'true' ||
+      (needs.check-paths.outputs.should-run-arm64 == 'true' ||
+       github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch') &&
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
@@ -84,7 +86,8 @@ jobs:
     runs-on: ubuntu-22.04-arm
     strategy:
       matrix:
-        python-version: ['3.10', '3.12']
+        # One representative ABI on PRs; post-merge pushes retain both.
+        python-version: ${{ fromJSON(github.event_name == 'pull_request' && '["3.12"]' || '["3.10", "3.12"]') }}
     env:
       CI: "true"
       CU13_BUILD: "1"
@@ -182,8 +185,9 @@ jobs:
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
     strategy:
       matrix:
-        ubuntu-version: [ubuntu-22.04, ubuntu-24.04]
-        python-version: ['3.10', '3.12']
+        # PRs cover both Python and Ubuntu versions diagonally. Post-merge
+        # pushes run the complete OS x Python cross-product.
+        include: ${{ fromJSON(github.event_name == 'pull_request' && '[{"ubuntu-version":"ubuntu-22.04","python-version":"3.10"},{"ubuntu-version":"ubuntu-24.04","python-version":"3.12"}]' || '[{"ubuntu-version":"ubuntu-22.04","python-version":"3.10"},{"ubuntu-version":"ubuntu-22.04","python-version":"3.12"},{"ubuntu-version":"ubuntu-24.04","python-version":"3.10"},{"ubuntu-version":"ubuntu-24.04","python-version":"3.12"}]') }}
     runs-on: ${{ matrix.ubuntu-version }}
     steps:
     - uses: actions/checkout@v4
@@ -523,7 +527,8 @@ jobs:
     name: Build Docker Image
     needs: [spell-check, clang-format, check-paths]
     if: >-
-      (needs.check-paths.outputs.should-run-downstream == 'true' ||
+      (needs.check-paths.outputs.should-run-docker == 'true' ||
+       github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch') &&
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
@@ -663,6 +668,11 @@ jobs:
     outputs:
       should-run-downstream: ${{ steps.dispatch-override.outputs.src || steps.filter.outputs.src }}
       should-run-tent: ${{ steps.dispatch-override.outputs.tent || steps.filter.outputs.tent }}
+      should-run-docker: ${{ steps.dispatch-override.outputs.docker || steps.filter.outputs.docker }}
+      should-run-arm64: ${{ steps.dispatch-override.outputs.arm64 || steps.filter.outputs.arm64 }}
+      should-run-musa: ${{ steps.dispatch-override.outputs.musa || steps.filter.outputs.musa }}
+      should-run-ascend: ${{ steps.dispatch-override.outputs.ascend || steps.filter.outputs.ascend }}
+      should-run-efa: ${{ steps.dispatch-override.outputs.efa || steps.filter.outputs.efa }}
     steps:
       # workflow_dispatch has no PR/push diff context — skip paths-filter and default to true
       - name: Default to true for workflow_dispatch
@@ -671,6 +681,11 @@ jobs:
         run: |
           echo "src=true" >> $GITHUB_OUTPUT
           echo "tent=true" >> $GITHUB_OUTPUT
+          echo "docker=true" >> $GITHUB_OUTPUT
+          echo "arm64=true" >> $GITHUB_OUTPUT
+          echo "musa=true" >> $GITHUB_OUTPUT
+          echo "ascend=true" >> $GITHUB_OUTPUT
+          echo "efa=true" >> $GITHUB_OUTPUT
       - uses: actions/checkout@v4
         if: github.event_name != 'workflow_dispatch'
         with:
@@ -694,6 +709,87 @@ jobs:
               - 'CMakeLists.txt'
               - 'dependencies.sh'
               - '.github/workflows/ci.yml'
+            docker:
+              - 'docker/**'
+              - '.dockerignore'
+              - 'dependencies.sh'
+              - 'CMakeLists.txt'
+              - 'mooncake-wheel/**'
+              - 'scripts/build_wheel.sh'
+              - '.github/workflows/ci.yml'
+            arm64:
+              - 'mooncake-common/**/*.h'
+              - 'mooncake-common/**/*.hpp'
+              - 'mooncake-common/**/*.c'
+              - 'mooncake-common/**/*.cc'
+              - 'mooncake-common/**/*.cpp'
+              - 'mooncake-integration/**/*.h'
+              - 'mooncake-integration/**/*.hpp'
+              - 'mooncake-integration/**/*.c'
+              - 'mooncake-integration/**/*.cc'
+              - 'mooncake-integration/**/*.cpp'
+              - 'mooncake-store/**/*.h'
+              - 'mooncake-store/**/*.hpp'
+              - 'mooncake-store/**/*.c'
+              - 'mooncake-store/**/*.cc'
+              - 'mooncake-store/**/*.cpp'
+              - 'mooncake-transfer-engine/**/*.h'
+              - 'mooncake-transfer-engine/**/*.hpp'
+              - 'mooncake-transfer-engine/**/*.c'
+              - 'mooncake-transfer-engine/**/*.cc'
+              - 'mooncake-transfer-engine/**/*.cpp'
+              - '**/CMakeLists.txt'
+              - 'dependencies.sh'
+              - 'scripts/build_wheel.sh'
+              - '.github/workflows/ci.yml'
+            musa:
+              - 'docker/musa.Dockerfile'
+              - 'mooncake-common/**/*.h'
+              - 'mooncake-common/**/*.hpp'
+              - 'mooncake-common/**/*.cmake'
+              - 'mooncake-ep/**'
+              - 'mooncake-integration/**/*.h'
+              - 'mooncake-integration/**/*.hpp'
+              - 'mooncake-integration/**/*.cpp'
+              - 'mooncake-pg/**'
+              - 'mooncake-store/include/device/**'
+              - 'mooncake-store/src/device/**'
+              - 'mooncake-transfer-engine/include/gpu_vendor/**'
+              - 'mooncake-transfer-engine/include/transport/device/**'
+              - 'mooncake-transfer-engine/src/transport/device/**'
+              - '**/CMakeLists.txt'
+              - 'dependencies.sh'
+              - 'scripts/build_wheel.sh'
+              - '.github/workflows/ci.yml'
+            ascend:
+              - 'scripts/ascend/**'
+              - 'mooncake-integration/allocator_ascend_npu.py'
+              - 'mooncake-integration/CMakeLists.txt'
+              - 'mooncake-store/include/device/**'
+              - 'mooncake-store/src/device/**'
+              - 'mooncake-transfer-engine/**/*ascend*'
+              - 'mooncake-transfer-engine/include/transfer_engine*.h'
+              - 'mooncake-transfer-engine/include/transport/transport.h'
+              - 'mooncake-transfer-engine/src/transfer_engine*.cpp'
+              - 'mooncake-transfer-engine/src/multi_transport.cpp'
+              - 'mooncake-transfer-engine/src/transfer_metadata.cpp'
+              - '**/CMakeLists.txt'
+              - 'dependencies.sh'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/ci_ascend.yml'
+            efa:
+              - 'mooncake-common/**/*.h'
+              - 'mooncake-common/**/*.hpp'
+              - 'mooncake-integration/CMakeLists.txt'
+              - 'mooncake-transfer-engine/**/*efa*'
+              - 'mooncake-transfer-engine/include/transfer_engine*.h'
+              - 'mooncake-transfer-engine/include/transport/transport.h'
+              - 'mooncake-transfer-engine/src/transfer_engine*.cpp'
+              - '**/CMakeLists.txt'
+              - 'dependencies.sh'
+              - 'scripts/build_wheel.sh'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/ci_efa.yml'
 
   build-wheel-cu13:
     needs: [spell-check, clang-format, check-paths]
@@ -705,12 +801,17 @@ jobs:
        github.event.action == 'opened' ||
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
     uses: ./.github/workflows/ci_cu13.yml
+    with:
+      # The integration test consumes Python 3.12. Post-merge pushes also
+      # build Python 3.10 for the complete CUDA 13 matrix.
+      python-versions: ${{ github.event_name == 'pull_request' && '["3.12"]' || '["3.10", "3.12"]' }}
     secrets: inherit
 
   build-wheel-efa:
     needs: [spell-check, clang-format, check-paths]
     if: >-
-      (needs.check-paths.outputs.should-run-downstream == 'true' ||
+      (needs.check-paths.outputs.should-run-efa == 'true' ||
+       github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch') &&
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
@@ -723,7 +824,10 @@ jobs:
     # This reusable workflow checks out and builds the source independently.
     # Start it after the fast checks instead of waiting for core coverage.
     needs: [spell-check, clang-format, check-paths]
-    if: needs.check-paths.outputs.should-run-downstream == 'true'
+    if: >-
+      needs.check-paths.outputs.should-run-ascend == 'true' ||
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch'
     uses: ./.github/workflows/ci_ascend.yml
     secrets: inherit
 
@@ -738,6 +842,7 @@ jobs:
     needs: [spell-check, clang-format, check-paths]
     if: >-
       (needs.check-paths.outputs.should-run-tent == 'true' ||
+       github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch') &&
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
@@ -747,19 +852,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: cuda-on
-            cmake_flags: '-DUSE_CUDA=ON -DCMAKE_EXE_LINKER_FLAGS=-L/usr/local/cuda/lib64/stubs'
-            need_cuda: true
-            metrics_flags: ''
-          - name: cuda-off
-            cmake_flags: '-DUSE_CUDA=OFF'
-            need_cuda: false
-            metrics_flags: ''
-          - name: cuda-off-metrics-on
-            cmake_flags: '-DUSE_CUDA=OFF'
-            need_cuda: false
-            metrics_flags: '-DTENT_METRICS_ENABLED=ON'
+        # PRs run the tested CPU configuration. Post-merge pushes add the
+        # CUDA compile-only and metrics-enabled configurations.
+        name: ${{ fromJSON(github.event_name == 'pull_request' && '["cuda-off"]' || '["cuda-on", "cuda-off", "cuda-off-metrics-on"]') }}
     name: tent-ci (${{ matrix.name }})
     env:
       CI: "true"
@@ -771,7 +866,7 @@ jobs:
         persist-credentials: false
 
     - name: Free up disk space
-      if: matrix.need_cuda
+      if: matrix.name == 'cuda-on'
       run: |
         sudo rm -rf /usr/share/dotnet
         sudo rm -rf /opt/ghc
@@ -780,7 +875,7 @@ jobs:
         df -h
 
     - name: Install CUDA Toolkit
-      if: matrix.need_cuda
+      if: matrix.name == 'cuda-on'
       uses: Jimver/cuda-toolkit@v0.2.24
       with:
         cuda: '12.8.1'
@@ -810,12 +905,19 @@ jobs:
       run: |
         mkdir build-tent
         cd build-tent
-        cmake -G Ninja .. -DUSE_TENT=ON -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_DEBUG_SYMBOLS=OFF ${{ matrix.cmake_flags }} ${{ matrix.metrics_flags }}
+        CMAKE_FLAGS="-DUSE_CUDA=OFF"
+        METRICS_FLAGS=""
+        if [ "${{ matrix.name }}" = "cuda-on" ]; then
+          CMAKE_FLAGS="-DUSE_CUDA=ON -DCMAKE_EXE_LINKER_FLAGS=-L/usr/local/cuda/lib64/stubs"
+        elif [ "${{ matrix.name }}" = "cuda-off-metrics-on" ]; then
+          METRICS_FLAGS="-DTENT_METRICS_ENABLED=ON"
+        fi
+        cmake -G Ninja .. -DUSE_TENT=ON -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_DEBUG_SYMBOLS=OFF $CMAKE_FLAGS $METRICS_FLAGS
       shell: bash
 
     - name: Build project with TENT
       run: |
-        if [ "${{ matrix.need_cuda }}" = "true" ]; then
+        if [ "${{ matrix.name }}" = "cuda-on" ]; then
           export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
           export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
         fi
@@ -830,7 +932,7 @@ jobs:
     # unit tests rely on, causing false failures. cuda-on still validates
     # that every #ifdef USE_CUDA branch compiles.
     - name: Test (TENT)
-      if: '!matrix.need_cuda'
+      if: matrix.name != 'cuda-on'
       run: |
         cd build-tent
         ctest --test-dir mooncake-transfer-engine/tent/tests -j --output-on-failure

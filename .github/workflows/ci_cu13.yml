@@ -1,14 +1,20 @@
 name: 'Build Wheel (CUDA 13)'
 
 on:
-  workflow_call: {}
+  workflow_call:
+    inputs:
+      python-versions:
+        description: JSON array of Python versions to build
+        required: false
+        type: string
+        default: '["3.10", "3.12"]'
 
 jobs:
   build-wheel-cu13:
     runs-on: ubuntu-22.04
     strategy:
       matrix:
-        python-version: ['3.10', '3.12']
+        python-version: ${{ fromJSON(inputs.python-versions) }}
     env:
       BUILD_WITH_EP: "1"
       CU13_BUILD: "1"
