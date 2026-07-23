@@ -5364,13 +5364,12 @@ size_t MasterService::RunPromotionCandidateRetryForTesting() {
     return RunPromotionCandidateRetry(kNumShards);
 }
 
-size_t MasterService::CountCandidatesForTesting(const std::string& tenant_id) {
-    const auto normalized = NormalizeTenantId(tenant_id);
+size_t MasterService::CountCandidatesForTesting(const TenantId& tenant_id) {
     size_t count = 0;
     std::shared_lock<std::shared_mutex> lock(snapshot_mutex_);
     for (size_t i = 0; i < kNumShards; i++) {
         MetadataShardAccessorRO shard(this, i);
-        auto it = shard->tenants.find(normalized);
+        auto it = shard->tenants.find(tenant_id);
         if (it != shard->tenants.end()) {
             count += it->second.promotion_candidates.size();
         }

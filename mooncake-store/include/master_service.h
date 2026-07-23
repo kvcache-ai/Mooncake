@@ -1563,7 +1563,7 @@ class MasterService {
     size_t RunPromotionCandidateRetry(size_t max_shards_to_scan);
     size_t RunPromotionCandidateRetry();
     size_t RunPromotionCandidateRetryForTesting();
-    size_t CountCandidatesForTesting(const std::string& tenant_id);
+    size_t CountCandidatesForTesting(const TenantId& tenant_id);
     void ResetCandidateBackoffsForTesting();
 
     // Erase any in-flight PromotionTask for `key`, abort any staged promotion
