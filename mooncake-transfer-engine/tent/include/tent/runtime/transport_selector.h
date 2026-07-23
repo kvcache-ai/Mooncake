@@ -185,8 +185,6 @@ class TransportSelector {
      */
     bool isLegacyMode() const { return legacy_mode_; }
 
-    static std::string transportTypeName(TransportType type);
-    static TransportType parseTransportType(const std::string& str);
     static std::optional<std::vector<TransportType>> reorderWithHint(
         const std::vector<TransportType>& raw, TransportType hint);
 

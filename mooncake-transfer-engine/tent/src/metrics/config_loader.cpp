@@ -48,34 +48,6 @@ void MetricsConfigLoader::applyEnvironmentOverrides(MetricsConfig& config) {
             config.http_server_threads = static_cast<uint16_t>(threads);
         }
     }
-
-    if (const char* env_val =
-            std::getenv(config_keys::ENV_METRICS_ENABLE_PROMETHEUS)) {
-        config.enable_prometheus =
-            ConfigHelper::parseBool(env_val, config.enable_prometheus);
-    }
-
-    if (const char* env_val =
-            std::getenv(config_keys::ENV_METRICS_ENABLE_JSON)) {
-        config.enable_json =
-            ConfigHelper::parseBool(env_val, config.enable_json);
-    }
-
-    if (const char* env_val =
-            std::getenv(config_keys::ENV_METRICS_LATENCY_BUCKETS)) {
-        auto buckets = ConfigHelper::parseDoubleArray(env_val);
-        if (!buckets.empty()) {
-            config.latency_buckets = buckets;
-        }
-    }
-
-    if (const char* env_val =
-            std::getenv(config_keys::ENV_METRICS_SIZE_BUCKETS)) {
-        auto buckets = ConfigHelper::parseDoubleArray(env_val);
-        if (!buckets.empty()) {
-            config.size_buckets = buckets;
-        }
-    }
 }
 
 MetricsConfig MetricsConfigLoader::loadFromConfig(const Config& config) {
@@ -95,24 +67,6 @@ MetricsConfig MetricsConfigLoader::loadFromConfig(const Config& config) {
     metrics_config.report_interval_seconds =
         config.get(config_keys::METRICS_REPORT_INTERVAL,
                    metrics_config.report_interval_seconds);
-    metrics_config.enable_prometheus =
-        config.get(config_keys::METRICS_ENABLE_PROMETHEUS,
-                   metrics_config.enable_prometheus);
-    metrics_config.enable_json = config.get(config_keys::METRICS_ENABLE_JSON,
-                                            metrics_config.enable_json);
-
-    // Load bucket configurations
-    auto latency_buckets_array =
-        config.getArray<double>(config_keys::METRICS_LATENCY_BUCKETS);
-    if (!latency_buckets_array.empty()) {
-        metrics_config.latency_buckets = latency_buckets_array;
-    }
-
-    auto size_buckets_array =
-        config.getArray<double>(config_keys::METRICS_SIZE_BUCKETS);
-    if (!size_buckets_array.empty()) {
-        metrics_config.size_buckets = size_buckets_array;
-    }
 
     LOG(INFO) << "Loaded metrics config from Config object: enabled="
               << metrics_config.enabled
@@ -156,23 +110,6 @@ MetricsConfig MetricsConfigLoader::loadWithDefaults(const Config* config) {
         metrics_config.report_interval_seconds =
             config->get(config_keys::METRICS_REPORT_INTERVAL,
                         metrics_config.report_interval_seconds);
-        metrics_config.enable_prometheus =
-            config->get(config_keys::METRICS_ENABLE_PROMETHEUS,
-                        metrics_config.enable_prometheus);
-        metrics_config.enable_json = config->get(
-            config_keys::METRICS_ENABLE_JSON, metrics_config.enable_json);
-
-        auto latency_buckets_array =
-            config->getArray<double>(config_keys::METRICS_LATENCY_BUCKETS);
-        if (!latency_buckets_array.empty()) {
-            metrics_config.latency_buckets = latency_buckets_array;
-        }
-
-        auto size_buckets_array =
-            config->getArray<double>(config_keys::METRICS_SIZE_BUCKETS);
-        if (!size_buckets_array.empty()) {
-            metrics_config.size_buckets = size_buckets_array;
-        }
     }
 
     return metrics_config;
@@ -194,36 +131,6 @@ bool MetricsConfigLoader::validateConfig(const MetricsConfig& config,
             *error_msg = "Invalid HTTP server threads: must be > 0";
         }
         return false;
-    }
-
-    // Validate at least one output format is enabled
-    if (!config.enable_prometheus && !config.enable_json) {
-        if (error_msg) {
-            *error_msg =
-                "At least one output format (Prometheus or JSON) must be "
-                "enabled";
-        }
-        return false;
-    }
-
-    // Validate buckets are sorted and positive
-    for (size_t i = 1; i < config.latency_buckets.size(); ++i) {
-        if (config.latency_buckets[i] <= config.latency_buckets[i - 1]) {
-            if (error_msg) {
-                *error_msg =
-                    "Latency buckets must be sorted in ascending order";
-            }
-            return false;
-        }
-    }
-
-    for (size_t i = 1; i < config.size_buckets.size(); ++i) {
-        if (config.size_buckets[i] <= config.size_buckets[i - 1]) {
-            if (error_msg) {
-                *error_msg = "Size buckets must be sorted in ascending order";
-            }
-            return false;
-        }
     }
 
     return true;

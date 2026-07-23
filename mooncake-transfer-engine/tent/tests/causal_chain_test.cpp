@@ -280,9 +280,9 @@ TEST(CausalChain, TimestampsPopulatedOnDirectPath) {
 
 #if TENT_METRICS_ENABLED
 TEST(CausalChain, MetricsRecordStageLatencyIsCallable) {
-    TENT_RECORD_STAGE_LATENCY(TentMetrics::Stage::QueueWait, 100.0);
-    TENT_RECORD_STAGE_LATENCY(TentMetrics::Stage::Dispatch, 50.0);
-    TENT_RECORD_STAGE_LATENCY(TentMetrics::Stage::Transport, 200.0);
+    TENT_RECORD_STAGE_LATENCY(TentMetrics::Stage::QueueWait, UNSPEC, 100.0);
+    TENT_RECORD_STAGE_LATENCY(TentMetrics::Stage::Dispatch, UNSPEC, 50.0);
+    TENT_RECORD_STAGE_LATENCY(TentMetrics::Stage::Transport, UNSPEC, 200.0);
 }
 #endif
 

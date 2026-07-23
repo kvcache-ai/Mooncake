@@ -221,8 +221,7 @@ TENTBenchRunner::TENTBenchRunner() {
     signal(SIGINT, signalHandlerV1);
     signal(SIGTERM, signalHandlerV1);
     engine_ = std::make_unique<TransferEngine>(loadConfig());
-    transport_hint_ = TransportSelector::parseTransportType(
-        XferBenchConfig::tent_transport_hint);
+    transport_hint_ = parseTransportType(XferBenchConfig::tent_transport_hint);
     intent_type_ = getIntentType(XferBenchConfig::tent_intent_type);
     allocateBuffers();
 }
