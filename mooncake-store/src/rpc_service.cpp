@@ -875,6 +875,14 @@ long WrappedMasterService::RemoveAll(bool force, const std::string& tenant_id) {
     timer.LogRequest("action=remove_all_objects, force=", force,
                      ", tenant_id=", tenant_id);
     MasterMetricManager::instance().inc_remove_all_requests();
+    // Empty tenant_id => clear ALL tenants (broadcast SSD signal to every
+    // client, overlapping with metadata deletion). A specific tenant_id =>
+    // scoped clear (only signal clients owning that tenant's disk replicas).
+    if (tenant_id.empty()) {
+        long result = master_service_.RemoveAll(force);
+        timer.LogResponse("items_removed=", result);
+        return result;
+    }
     auto resolved_tenant_id = ResolveRequestTenantId(
         master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
                                                : TenantId::kDefaultValue);
@@ -885,12 +893,7 @@ long WrappedMasterService::RemoveAll(bool force, const std::string& tenant_id) {
         timer.LogResponse("error=", toString(resolved_tenant_id.error()));
         return 0;
     }
-    // Empty tenant_id => clear all tenants (broadcast SSD signal to every
-    // client, overlapping with metadata deletion). A specific tenant_id =>
-    // scoped clear (only signal clients owning that tenant's disk replicas).
-    long result = tenant_id.empty()
-                      ? master_service_.RemoveAll(force)
-                      : master_service_.RemoveAll(tenant_id, force);
+    long result = master_service_.RemoveAll(*resolved_tenant_id, force);
     timer.LogResponse("items_removed=", result);
     return result;
 }
