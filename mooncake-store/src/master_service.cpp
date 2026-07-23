@@ -4955,8 +4955,6 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
         // MetadataAccessorRW.
         offloading_objects_copy =
             std::move(local_disk_segment_it->second->offloading_objects);
-        // Drain pending_remove_all when offloading is disabled.
-        local_disk_segment_it->second->pending_remove_all = false;
     }
 
     for (auto& [_, task] : offloading_objects_copy) {

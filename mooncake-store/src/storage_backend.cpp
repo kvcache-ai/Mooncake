@@ -1628,6 +1628,14 @@ void StorageBackendAdaptor::RemoveAll() {
     if (storage_backend_) {
         storage_backend_->RemoveAll();
     }
+    // Reset adaptor-level counters so IsEnableOffloading() reflects the empty
+    // disk. Without this, total_keys/total_size keep their pre-cleanup values
+    // and the node stays unable to offload until a restart (which rescans
+    // metadata and rebuilds them). Applies to the kFilePerKey path; the
+    // OffsetAllocator backend resets its own atomics internally.
+    MutexLocker lock(&mutex_);
+    total_keys = 0;
+    total_size = 0;
 }
 
 BucketIdGenerator::BucketIdGenerator(int64_t start) {

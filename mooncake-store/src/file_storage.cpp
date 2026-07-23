@@ -867,13 +867,14 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
 }
 
 void FileStorage::RemoveAll() {
-    // Delegate physical cleanup to the storage backend. Each backend owns its
-    // on-disk layout and clears it correctly:
-    //  - OffsetAllocatorStorageBackend truncates+rebuilds its data file
-    //    (fs::remove_all on the dir here would unlink the freshly rebuilt
-    //    file, leaving data_file_ pointing at a dead inode — see PR #2676).
-    //  - BucketStorageBackend deletes all buckets.
-    //  - StorageBackend (FilePerKey) removes all files under root_dir_.
+    // TODO(tenant-isolation): This performs a tenant-UNAWARE global wipe of the
+    // storage directory. Storage backends store physical files without a
+    // tenant dimension, so a tenant-scoped master RemoveAll("tenant_A") that
+    // signals this client will also delete tenant_B's SSD files here, while
+    // master still holds valid metadata for tenant_B (subsequent reads get
+    // OBJECT_NOT_FOUND on this node). Safe for the global RemoveAll(force) and
+    // for single-tenant / shared-nothing deployments. Proper per-tenant
+    // physical isolation needs backend-level tenant-scoped layout (follow-up).
     if (storage_backend_) {
         storage_backend_->RemoveAll();
     }
