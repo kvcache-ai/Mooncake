@@ -81,10 +81,10 @@ class AgentInterface {
     virtual void publishLocalEndpoint(GroupEndpointPublication endpoint) = 0;
 
     virtual ProposeViewUpdateResponse proposeActivate(
-        GroupId group_id, const std::vector<GlobalRank>& ranks) = 0;
+        GroupId group_id, const std::vector<InGroupRank>& ranks) = 0;
 
     virtual ProposeViewUpdateResponse proposeDeactivate(
-        GroupId group_id, const std::vector<GlobalRank>& ranks) = 0;
+        GroupId group_id, const std::vector<InGroupRank>& ranks) = 0;
 
     virtual void pushLinkEvent(const LinkEvent& event) = 0;
 
@@ -144,10 +144,10 @@ class AgentHost : public AgentInterface {
     void publishLocalEndpoint(GroupEndpointPublication endpoint) override;
 
     ProposeViewUpdateResponse proposeActivate(
-        GroupId group_id, const std::vector<GlobalRank>& ranks) override;
+        GroupId group_id, const std::vector<InGroupRank>& ranks) override;
 
     ProposeViewUpdateResponse proposeDeactivate(
-        GroupId group_id, const std::vector<GlobalRank>& ranks) override;
+        GroupId group_id, const std::vector<InGroupRank>& ranks) override;
 
     void pushLinkEvent(const LinkEvent& event) override;
 
@@ -216,7 +216,7 @@ class AgentHost : public AgentInterface {
     void sendPublishEndpointRpc(GroupEndpointPublication endpoint);
 
     ProposeViewUpdateResponse proposeViewUpdateInternal(
-        GroupId group_id, const std::vector<GlobalRank>& ranks,
+        GroupId group_id, const std::vector<InGroupRank>& ranks,
         bool is_activation);
 
     void runEffects(const AgentApplyResult& effects);

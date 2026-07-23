@@ -118,6 +118,7 @@ struct GroupView {
     GroupStatus status = GroupStatus::Bootstrapping;
     uint64_t epoch = 0;
     bool auto_deactivate = true;
+    int32_t max_group_size = 0;          // fixed in-group slot capacity
     std::vector<GlobalRank> rank_order;  // InGroupRank -> GlobalRank
     std::vector<GroupMember> members;    // indexed by GlobalRank
 

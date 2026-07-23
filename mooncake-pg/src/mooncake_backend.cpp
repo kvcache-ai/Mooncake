@@ -336,6 +336,7 @@ MooncakeBackend::MooncakeBackend(
     // until the Coordinator says ready.
     GroupView initial_group;
     initial_group.group_id = meta_->group_id;
+    initial_group.max_group_size = max_group_size_;
     initial_group.rank_order = std::move(initial_rank_order);
     initial_group.members.resize(ctx_.max_world_size);
     for (GlobalRank r : initial_group.rank_order) {
@@ -1076,15 +1077,10 @@ ProposeViewUpdateResponse MooncakeBackend::recoverRanks(
 
 ProposeViewUpdateResponse MooncakeBackend::activateRanks(
     const std::vector<int>& ranks) {
-    // ranks are in-group (local) ranks; map to global ranks via rank_order.
-    std::vector<GlobalRank> global_ranks;
-    global_ranks.reserve(ranks.size());
-    for (int r : ranks) {
-        global_ranks.push_back(meta_->rank_order[r]);
-    }
-    auto resp = agent_.proposeActivate(meta_->group_id, global_ranks);
+    std::vector<InGroupRank> in_group_ranks(ranks.begin(), ranks.end());
+    auto resp = agent_.proposeActivate(meta_->group_id, in_group_ranks);
     if (resp.status == ViewUpdateStatus::Rejected) {
-        LOG(WARNING) << "MooncakeBackend: activate_rank rejected: "
+        LOG(WARNING) << "MooncakeBackend: activate_ranks rejected: "
                      << resp.reject_reason;
     }
     return resp;
@@ -1092,15 +1088,10 @@ ProposeViewUpdateResponse MooncakeBackend::activateRanks(
 
 ProposeViewUpdateResponse MooncakeBackend::deactivateRanks(
     const std::vector<int>& ranks) {
-    // ranks are in-group (local) ranks; map to global ranks via rank_order.
-    std::vector<GlobalRank> global_ranks;
-    global_ranks.reserve(ranks.size());
-    for (int r : ranks) {
-        global_ranks.push_back(meta_->rank_order[r]);
-    }
-    auto resp = agent_.proposeDeactivate(meta_->group_id, global_ranks);
+    std::vector<InGroupRank> in_group_ranks(ranks.begin(), ranks.end());
+    auto resp = agent_.proposeDeactivate(meta_->group_id, in_group_ranks);
     if (resp.status == ViewUpdateStatus::Rejected) {
-        LOG(WARNING) << "MooncakeBackend: deactivate_rank rejected: "
+        LOG(WARNING) << "MooncakeBackend: deactivate_ranks rejected: "
                      << resp.reject_reason;
     }
     return resp;

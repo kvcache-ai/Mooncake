@@ -220,13 +220,10 @@ void AgentHost::registerGroup(const GroupView& group, bool auto_deactivate,
     executor_.postAndWait([this, group = group, auto_deactivate,
                            backend]() mutable {
         auto group_id = group.group_id;
-        backends_.insert_or_assign(group_id, backend);
-        runEffects(agent_.registerGroup(group, auto_deactivate));
-
         RegisterGroupRequest req;
         req.rank = rank_;
         req.agent_session_id = agent_.getAgentSessionId();
-        req.group = std::move(group);
+        req.group = group;
         req.group.auto_deactivate = auto_deactivate;
 
         auto resp = rpc_client_->call<&CoordinatorRpcService::registerGroup>(
@@ -235,16 +232,12 @@ void AgentHost::registerGroup(const GroupView& group, bool auto_deactivate,
         if (!resp.success) {
             LOG(ERROR) << "AgentHost: registerGroup failed for group "
                        << group_id << ": " << resp.reject_reason;
-            auto it = group_ready_promises_.find(group_id);
-            if (it != group_ready_promises_.end()) {
-                for (auto& p : it->second) {
-                    p->set_exception(std::make_exception_ptr(std::runtime_error(
-                        "registerGroup rejected: " + resp.reject_reason)));
-                }
-                group_ready_promises_.erase(it);
-            }
-            return;
+            throw std::runtime_error("registerGroup rejected: " +
+                                     resp.reject_reason);
         }
+
+        backends_.insert_or_assign(group_id, backend);
+        runEffects(agent_.registerGroup(group, auto_deactivate));
     });
 }
 
@@ -292,7 +285,7 @@ void AgentHost::publishLocalEndpoint(GroupEndpointPublication endpoint) {
 }
 
 ProposeViewUpdateResponse AgentHost::proposeViewUpdateInternal(
-    GroupId group_id, const std::vector<GlobalRank>& ranks,
+    GroupId group_id, const std::vector<InGroupRank>& ranks,
     bool is_activation) {
     ProposeViewUpdateRequest req;
     req.group_id = group_id;
@@ -305,12 +298,12 @@ ProposeViewUpdateResponse AgentHost::proposeViewUpdateInternal(
 }
 
 ProposeViewUpdateResponse AgentHost::proposeActivate(
-    GroupId group_id, const std::vector<GlobalRank>& ranks) {
+    GroupId group_id, const std::vector<InGroupRank>& ranks) {
     return proposeViewUpdateInternal(group_id, ranks, /*is_activation=*/true);
 }
 
 ProposeViewUpdateResponse AgentHost::proposeDeactivate(
-    GroupId group_id, const std::vector<GlobalRank>& ranks) {
+    GroupId group_id, const std::vector<InGroupRank>& ranks) {
     return proposeViewUpdateInternal(group_id, ranks, /*is_activation=*/false);
 }
 

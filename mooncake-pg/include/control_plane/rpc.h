@@ -100,14 +100,14 @@ struct ProposeViewUpdateRequest {
     GroupId group_id;
     GlobalRank source_rank = kInvalidGlobalRank;
     uint64_t agent_session_id = 0;
-    std::vector<GlobalRank> requested_ranks;
+    std::vector<InGroupRank> requested_ranks;
     bool is_activation = false;
 };
 
 struct ProposeViewUpdateResponse {
     ViewUpdateStatus status = ViewUpdateStatus::Rejected;
     uint64_t new_epoch = 0;
-    std::vector<GlobalRank> dropped_ranks;
+    std::vector<InGroupRank> dropped_ranks;
     std::string reject_reason;
 };
 

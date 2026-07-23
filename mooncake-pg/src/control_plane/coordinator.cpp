@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <iterator>
 #include <limits>
 #include <set>
 
@@ -310,16 +311,19 @@ CentralizedCoordinatorStateMachine::handleProposeViewUpdate(
         return result;
     }
 
-    for (GlobalRank rank : req.requested_ranks) {
-        if (!rankInRange(rank)) {
+    std::vector<GlobalRank> requested_global_ranks;
+    requested_global_ranks.reserve(req.requested_ranks.size());
+    for (InGroupRank rank : req.requested_ranks) {
+        if (rank < 0 || static_cast<size_t>(rank) >= view.rank_order.size()) {
             result.effects.push_back(
                 ReplyProposal{propose_id,
                               {ViewUpdateStatus::Rejected,
                                view.epoch,
                                {},
-                               "target rank is out of valid range"}});
+                               "target in-group rank is out of valid range"}});
             return result;
         }
+        requested_global_ranks.push_back(view.rank_order[rank]);
     }
 
     // Snapshot old view before mutating
@@ -328,12 +332,12 @@ CentralizedCoordinatorStateMachine::handleProposeViewUpdate(
     if (req.is_activation) {
         // Check activatable before applying changes.
         // rank_order is managed exclusively in processGroupRegistration.
-        for (GlobalRank rank : req.requested_ranks) {
+        for (GlobalRank rank : requested_global_ranks) {
             if (!view.members[rank].isActive()) changed = true;
         }
 
         if (changed &&
-            !isActivatableSet(req.group_id, req.requested_ranks, view)) {
+            !isActivatableSet(req.group_id, requested_global_ranks, view)) {
             result.effects.push_back(
                 ReplyProposal{propose_id,
                               {ViewUpdateStatus::Rejected,
@@ -344,12 +348,12 @@ CentralizedCoordinatorStateMachine::handleProposeViewUpdate(
         }
 
         // Apply.
-        for (GlobalRank rank : req.requested_ranks) {
+        for (GlobalRank rank : requested_global_ranks) {
             view.members[rank].status = GroupMemberState::Active;
         }
     } else {
         // deactivate
-        for (GlobalRank rank : req.requested_ranks) {
+        for (GlobalRank rank : requested_global_ranks) {
             if (view.members[rank].isActive()) {
                 view.members[rank].status = GroupMemberState::Inactive;
                 view.members[rank].endpoint = std::nullopt;
@@ -891,6 +895,12 @@ bool CentralizedCoordinatorStateMachine::processGroupRegistration(
     RegisterGroupResponse& response, std::vector<CoordinatorEffect>& effects) {
     GroupId group_id = group.group_id;
 
+    if (group.max_group_size <= 0 || group.max_group_size > max_world_size_) {
+        response.success = false;
+        response.reject_reason = "max_group_size is out of valid range";
+        return false;
+    }
+
     // Validate joining_rank
     if (!rankInRange(joining_rank)) {
         response.success = false;
@@ -930,8 +940,16 @@ bool CentralizedCoordinatorStateMachine::processGroupRegistration(
     if (it == group_views_.end()) {
         // First declaration -> create group.
         // Founding members are all entries in rank_order.
+        if (group.rank_order.size() >
+            static_cast<size_t>(group.max_group_size)) {
+            response.success = false;
+            response.reject_reason = "rank_order exceeds max_group_size";
+            return false;
+        }
+
         GroupView view;
         view.group_id = group_id;
+        view.max_group_size = group.max_group_size;
         view.rank_order = group.rank_order;
         view.members.resize(max_world_size_);
         for (GlobalRank r : group.rank_order) {
@@ -948,7 +966,21 @@ bool CentralizedCoordinatorStateMachine::processGroupRegistration(
     // with the existing one.  The first backend to declare the group sets the
     // initial rank_order; later backends must agree on all overlapping
     // positions.
-    const auto& existing_order = group_views_[group_id].rank_order;
+    const auto& existing_view = group_views_[group_id];
+    if (group.max_group_size != existing_view.max_group_size) {
+        response.success = false;
+        response.reject_reason = "max_group_size mismatch";
+        return false;
+    }
+
+    if (group.rank_order.size() >
+        static_cast<size_t>(existing_view.max_group_size)) {
+        response.success = false;
+        response.reject_reason = "rank_order exceeds canonical group capacity";
+        return false;
+    }
+
+    const auto& existing_order = existing_view.rank_order;
     const auto& new_order = group.rank_order;
 
     auto common_len = std::min(existing_order.size(), new_order.size());
@@ -1053,7 +1085,34 @@ void CentralizedCoordinatorStateMachine::commitBarrier(
                 auto response = commit.eventual_response;
                 if (!dropped.empty()) {
                     response.status = ViewUpdateStatus::AppliedWithDroppedRanks;
-                    response.dropped_ranks = dropped;
+                    const auto group_it = group_views_.find(barrier.group_id);
+                    if (group_it == group_views_.end()) {
+                        LOG(ERROR) << "[COORD] cannot map dropped ranks for "
+                                   << "missing group " << barrier.group_id;
+                        response.status = ViewUpdateStatus::Rejected;
+                        response.reject_reason =
+                            "group disappeared while committing ViewUpdate";
+                    } else {
+                        const auto& rank_order = group_it->second.rank_order;
+                        response.dropped_ranks.reserve(dropped.size());
+                        for (GlobalRank rank : dropped) {
+                            const auto rank_it = std::find(
+                                rank_order.begin(), rank_order.end(), rank);
+                            if (rank_it == rank_order.end()) {
+                                LOG(ERROR)
+                                    << "[COORD] dropped GlobalRank " << rank
+                                    << " is not in group " << barrier.group_id;
+                                response.status = ViewUpdateStatus::Rejected;
+                                response.dropped_ranks.clear();
+                                response.reject_reason =
+                                    "dropped rank is not in the group";
+                                break;
+                            }
+                            response.dropped_ranks.push_back(
+                                static_cast<InGroupRank>(std::distance(
+                                    rank_order.begin(), rank_it)));
+                        }
+                    }
                     for (GlobalRank rank : dropped) {
                         transitionToOffline(rank, "ViewUpdate barrier timeout",
                                             effects);
