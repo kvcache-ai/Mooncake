@@ -681,6 +681,17 @@ Key differences from soft pin:
 - Hard-pinned objects are completely skipped during eviction. Soft-pinned objects may still be evicted when no other candidates are available.
 - Hard pin is immutable once set. Soft pin status is automatically refreshed on access.
 
+## Artifact File I/O
+
+Mooncake Store can load tensors from external files (local paths, `file://`,
+`s3://`, safetensors, or torch checkpoints) into the distributed memory pool via
+the Python `store_file_io` helpers. After a cold load, weights and KV caches
+are available to peer nodes through the normal `get_tensor` / Transfer Engine
+data path.
+
+See [Artifact File I/O](artifact-file-io) for supported sources, dependencies,
+workflows, and examples.
+
 ## Zombie Object Cleanup
 
 If a Client crashes or experiences a network failure after sending a `PutStart` request but before it can send the corresponding `PutEnd` or `PutRevoke` request to the Master, the object initiated by `PutStart` enters a "zombie" state—rendering it neither usable nor deletable. The existence of such "zombie objects" not only consumes storage space but also prevents subsequent `Put` operations on the same keys. To mitigate these issues, the Master records the start time of each `PutStart` request and employs two timeout thresholds—`put_start_discard_timeout` and `put_start_release_timeout`—to clean up zombie objects.
