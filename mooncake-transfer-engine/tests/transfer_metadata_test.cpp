@@ -40,7 +40,7 @@ class TransferMetadataTest : public ::testing::Test {
         google::InitGoogleLogging("TransferMetadataTest");
         FLAGS_logtostderr = 1;  // output to stdout
 
-        const char* env = std::getenv("MC_METADATA_SERVER");
+        const char *env = std::getenv("MC_METADATA_SERVER");
         if (env)
             metadata_server = env;
         else
@@ -102,11 +102,11 @@ TEST_F(TransferMetadataTest, LocalMemoryBufferTest) {
         ASSERT_EQ(re, 0);
     }
     addr = 1000;
-    re = metadata_client->removeLocalMemoryBuffer((void*)addr, false);
+    re = metadata_client->removeLocalMemoryBuffer((void *)addr, false);
     ASSERT_EQ(re, ERR_ADDRESS_NOT_REGISTERED);
     for (int i = 9; i > 0; --i) {
         addr = i * 2048;
-        re = metadata_client->removeLocalMemoryBuffer((void*)addr, false);
+        re = metadata_client->removeLocalMemoryBuffer((void *)addr, false);
         ASSERT_EQ(re, 0);
     }
     re = metadata_client->removeLocalSegment("test_local_segment");
@@ -161,7 +161,7 @@ TransferMetadata::BufferDesc makeRdmaBufferDesc(uint64_t addr) {
 }
 
 std::shared_ptr<TransferMetadata::SegmentDesc> makeRdmaSegmentDesc(
-    const std::string& name, uint64_t addr) {
+    const std::string &name, uint64_t addr) {
     auto segment_desc = std::make_shared<TransferMetadata::SegmentDesc>();
     segment_desc->name = name;
     segment_desc->protocol = "rdma";
@@ -214,7 +214,7 @@ TEST(TransferMetadataPollingTest, PollingRefreshesCachedRemoteSegmentDesc) {
     ASSERT_EQ(cached_desc->buffers[0].addr, kInitialAddr);
 
     ASSERT_EQ(server.removeLocalMemoryBuffer(
-                  reinterpret_cast<void*>(kInitialAddr), false),
+                  reinterpret_cast<void *>(kInitialAddr), false),
               0);
     ASSERT_EQ(
         server.addLocalMemoryBuffer(makeRdmaBufferDesc(kUpdatedAddr), false),
@@ -290,7 +290,8 @@ class TestableTransferMetadata : public TransferMetadata {
 class TransferMetadataStaleSegmentInvalidationTest : public ::testing::Test {
    protected:
     void SetUp() override {
-        google::InitGoogleLogging("TransferMetadataStaleSegmentInvalidationTest");
+        google::InitGoogleLogging(
+            "TransferMetadataStaleSegmentInvalidationTest");
         FLAGS_logtostderr = 1;
     }
     void TearDown() override { google::ShutdownGoogleLogging(); }
@@ -369,7 +370,7 @@ TEST_F(TransferMetadataStaleSegmentInvalidationTest,
 
 }  // namespace mooncake
 
-int main(int argc, char** argv) {
+int main(int argc, char **argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }
