@@ -16,7 +16,7 @@ Mooncake Store.
 ## 1. Build Mooncake with NoF Support
 
 Follow the "Build with NVMe-oF SSD Pool" section in the
-[Build Guide](../getting_started/build.md) to install SPDK dependencies and
+[Build Guide](../../getting_started/build.md) to install SPDK dependencies and
 build Mooncake with `-DUSE_NOF=ON`.
 
 ## 2. Deploy Mooncake Services
@@ -233,7 +233,7 @@ Enter the SPDK directory on the target node and run the following commands.
 ### 6.2 Use NoF with vLLM + LMCache
 
 For the general VLLM + LMCache + Mooncake deployment flow, see
-[vLLM V1 Disaggregated Serving with Mooncake Store and LMCache](../getting_started/examples/vllm-integration/vllmv1-lmcache-integration.md).
+[vLLM V1 Disaggregated Serving with Mooncake Store and LMCache](../integrations/lmcache/vllmv1-lmcache-integration.md).
 After the NVMe-oF SSD pool is registered with Mooncake, add the NoF-specific
 Mooncake configuration below.
 
