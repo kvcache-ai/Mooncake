@@ -168,7 +168,7 @@ pip3 install mooncake-transfer-engine
 ```
 
 ```{note}
-- If you encounter problems such as missing `lib*.so`, uninstall by `pip3 uninstall mooncake-transfer-engine`, and build manually according to the [instructions](../../build.md).
+- If you encounter problems such as missing `lib*.so`, uninstall by `pip3 uninstall mooncake-transfer-engine`, and build manually according to the [instructions](../../../getting_started/build.md).
 - For vLLM version ≤ v0.8.4, it requires `mooncake-transfer-engine ≤ 0.3.3.post2`. The interface `mooncake_vllm_adaptor` has been deprecated in the latest release.
 ```
 

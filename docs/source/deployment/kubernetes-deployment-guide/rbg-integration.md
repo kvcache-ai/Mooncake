@@ -14,7 +14,7 @@ For background on the integration, see the RBG [Mooncake integration KEP](https:
 
 ## Production Mooncake Cluster Example
 
-A production Mooncake cluster on RBG (`workloads.x-k8s.io/v1alpha1`): a Mooncake **Store** (one `master` plus NUMA-split `store` pods) and SGLang **prefill/decode** engines, all over RDMA. The two RBGs below are the Mooncake-side backend; a router/gateway (out of scope for this page) fronts the prefill/decode endpoints to make the P/D deployment servable — see the [overview](index) and the [Prefill/Decode Disaggregation quick start](../../getting_started/examples/sglang-integration/hicache-quick-start.md).
+A production Mooncake cluster on RBG (`workloads.x-k8s.io/v1alpha1`): a Mooncake **Store** (one `master` plus NUMA-split `store` pods) and SGLang **prefill/decode** engines, all over RDMA. The two RBGs below are the Mooncake-side backend; a router/gateway (out of scope for this page) fronts the prefill/decode endpoints to make the P/D deployment servable — see the [overview](index) and the [Prefill/Decode Disaggregation quick start](../integrations/sglang/hicache-quick-start.md).
 
 ```{note}
 The inline manifests below target `workloads.x-k8s.io/v1alpha1`. For the latest
