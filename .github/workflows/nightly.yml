@@ -12,7 +12,6 @@ on:
 
 permissions:
   contents: read
-  issues: write
 
 concurrency:
   group: nightly-${{ github.ref_name }}
@@ -207,7 +206,7 @@ jobs:
           sudo bash -x dependencies.sh -y
           mkdir build && cd build
           cmake -G Ninja .. \
-            -DUSE_HTTP=ON -DUSE_CXL=ON -DUSE_UB=ON -DUSE_ETCD=ON \
+            -DUSE_HTTP=ON -DUSE_CXL=ON -DUSE_UB=ON -DUSE_ETCD=ON -DUSE_CUDA=ON \
             -DSTORE_USE_ETCD=ON -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_UNIT_TESTS=ON -DENABLE_SCCACHE=ON
 

@@ -88,6 +88,12 @@ jobs:
             echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
           fi
 
+      - name: Patch wheel version in pyproject.toml
+        if: ${{ inputs.version-override != '' }}
+        run: |
+          sed -i "s/^version = .*/version = \"$VERSION\"/" mooncake-wheel/pyproject.toml
+          echo "Patched mooncake-wheel/pyproject.toml version to: $VERSION"
+
       - name: Select Python ${{ matrix.python-version }} from manylinux image
         if: ${{ inputs.container != '' }}
         run: |
