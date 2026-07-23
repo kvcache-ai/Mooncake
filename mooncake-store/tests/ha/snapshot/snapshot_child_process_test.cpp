@@ -669,6 +669,57 @@ TEST_F(SnapshotChildProcessTest,
     EXPECT_FALSE(ObjectIsGroupedInMetadata(key, shard_idx));
 }
 
+TEST_F(SnapshotChildProcessTest, DeserializeMetadataSkipsInvalidClientId) {
+    CreateDefaultService();
+    const std::string key = "invalid_client_id_snapshot_key";
+    const uint32_t shard_idx = GetShardIndexForTest(key);
+
+    msgpack::sbuffer shard_buffer;
+    MsgpackPacker shard_packer(&shard_buffer);
+    shard_packer.pack_map(1);
+    shard_packer.pack(std::string("metadata"));
+    shard_packer.pack_array(1);
+    shard_packer.pack_array(2);
+    shard_packer.pack(key);
+
+    shard_packer.pack_array(8);
+    shard_packer.pack(std::string("not-a-uuid"));
+    shard_packer.pack(kDefaultTestPutStartTimeMs);
+    shard_packer.pack(kDefaultTestObjectSize);
+    shard_packer.pack(kDefaultTestLeaseTimeoutMs);
+    shard_packer.pack(false);
+    shard_packer.pack(uint64_t{0});
+    shard_packer.pack(uint32_t{1});
+    PackDiskReplica(shard_packer, kDefaultTestDiskFilePath,
+                    kDefaultTestObjectSize);
+
+    auto compressed_shard =
+        zstd_compress(reinterpret_cast<const uint8_t*>(shard_buffer.data()),
+                      shard_buffer.size(), 3);
+
+    msgpack::sbuffer root_buffer;
+    MsgpackPacker root_packer(&root_buffer);
+    root_packer.pack_map(3);
+    root_packer.pack(std::string("shards"));
+    root_packer.pack_map(1);
+    root_packer.pack(shard_idx);
+    root_packer.pack_bin(compressed_shard.size());
+    root_packer.pack_bin_body(
+        reinterpret_cast<const char*>(compressed_shard.data()),
+        compressed_shard.size());
+    root_packer.pack(std::string("discarded_replicas"));
+    root_packer.pack_array(0);
+    root_packer.pack(std::string("replica_next_id"));
+    root_packer.pack(uint64_t{10});
+
+    auto deserialize_result =
+        DeserializeMetadataForTest(ToByteVector(root_buffer));
+    ASSERT_TRUE(deserialize_result.has_value())
+        << deserialize_result.error().message;
+
+    EXPECT_FALSE(KeyExistsInMetadata(service_.get(), key));
+}
+
 TEST_F(SnapshotChildProcessTest, LegacyEtcdConnstringFallbackIsPreserved) {
     MasterConfig legacy_config;
     legacy_config.enable_ha = true;

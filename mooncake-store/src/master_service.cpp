@@ -8162,7 +8162,12 @@ MasterService::MetadataSerializer::DeserializeMetadata(
     // Deserialize client_id string
     std::string client_id_str = array[index++].as<std::string>();
     UUID client_id;
-    StringToUuid(client_id_str, client_id);
+    if (!StringToUuid(client_id_str, client_id)) {
+        return tl::unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL,
+            fmt::format("deserialize ObjectMetadata invalid client_id UUID: {}",
+                        client_id_str)));
+    }
 
     // Deserialize put_start_time
     uint64_t put_start_time_timestamp = array[index++].as<uint64_t>();

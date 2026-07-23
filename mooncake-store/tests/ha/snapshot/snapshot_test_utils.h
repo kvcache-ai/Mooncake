@@ -167,8 +167,9 @@ inline std::vector<uint8_t> WrapShardIntoMetadataRoot(
     return ToByteVector(root_buffer);
 }
 
-inline std::vector<uint8_t> BuildMetadataPayload(
-    const UUID& client_id, std::string_view object_key = kDefaultTestObjectKey,
+inline std::vector<uint8_t> BuildMetadataPayloadWithClientIdString(
+    std::string_view client_id,
+    std::string_view object_key = kDefaultTestObjectKey,
     std::string_view disk_file_path = kDefaultTestDiskFilePath,
     uint64_t object_size = kDefaultTestObjectSize,
     uint64_t put_start_time_ms = kDefaultTestPutStartTimeMs,
@@ -199,7 +200,7 @@ inline std::vector<uint8_t> BuildMetadataPayload(
     shard_packer.pack(std::string(object_key));
 
     shard_packer.pack_array(array_size);
-    shard_packer.pack(UuidToString(client_id));
+    shard_packer.pack(std::string(client_id));
     shard_packer.pack(put_start_time_ms);
     shard_packer.pack(object_size);
     shard_packer.pack(lease_timeout_ms);
@@ -218,6 +219,18 @@ inline std::vector<uint8_t> BuildMetadataPayload(
     }
 
     return WrapShardIntoMetadataRoot(shard_buffer);
+}
+
+inline std::vector<uint8_t> BuildMetadataPayload(
+    const UUID& client_id, std::string_view object_key = kDefaultTestObjectKey,
+    std::string_view disk_file_path = kDefaultTestDiskFilePath,
+    uint64_t object_size = kDefaultTestObjectSize,
+    uint64_t put_start_time_ms = kDefaultTestPutStartTimeMs,
+    uint64_t lease_timeout_ms = kDefaultTestLeaseTimeoutMs,
+    SnapshotMetadataFormat format = SnapshotMetadataFormat::kLegacy) {
+    return BuildMetadataPayloadWithClientIdString(
+        UuidToString(client_id), object_key, disk_file_path, object_size,
+        put_start_time_ms, lease_timeout_ms, format);
 }
 
 // Builds a metadata payload whose declared replica_count field is set to
