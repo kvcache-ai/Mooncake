@@ -2,9 +2,13 @@ name: 'Build & Test (Linux)'
 
 on:
   push:
-    branches: [ "main" ]
+    branches:
+      - "main"
+      - "release/**"
   pull_request:
-    branches: [ "main" ]
+    branches:
+      - "main"
+      - "release/**"
     types: [opened, synchronize, reopened, labeled]
   workflow_dispatch: {}
 
@@ -971,7 +975,7 @@ jobs:
     secrets: inherit
 
   integration-test:
-    needs: [build, check-paths]
+    needs: [build, build-wheel-cu13, check-paths]
     if: needs.check-paths.outputs.should-run-downstream == 'true'
     uses: ./.github/workflows/integration-test.yml
     secrets: inherit
@@ -993,9 +997,15 @@ jobs:
           - name: cuda-on
             cmake_flags: '-DUSE_CUDA=ON -DCMAKE_EXE_LINKER_FLAGS=-L/usr/local/cuda/lib64/stubs'
             need_cuda: true
+            metrics_flags: ''
           - name: cuda-off
             cmake_flags: '-DUSE_CUDA=OFF'
             need_cuda: false
+            metrics_flags: ''
+          - name: cuda-off-metrics-on
+            cmake_flags: '-DUSE_CUDA=OFF'
+            need_cuda: false
+            metrics_flags: '-DTENT_METRICS_ENABLED=ON'
     name: tent-ci (${{ matrix.name }})
     env:
       CI: "true"
@@ -1046,7 +1056,7 @@ jobs:
       run: |
         mkdir build-tent
         cd build-tent
-        cmake -G Ninja .. -DUSE_TENT=ON -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_DEBUG_SYMBOLS=OFF ${{ matrix.cmake_flags }}
+        cmake -G Ninja .. -DUSE_TENT=ON -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_DEBUG_SYMBOLS=OFF ${{ matrix.cmake_flags }} ${{ matrix.metrics_flags }}
       shell: bash
 
     - name: Build project with TENT

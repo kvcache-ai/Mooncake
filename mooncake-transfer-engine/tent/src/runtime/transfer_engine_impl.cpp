@@ -2049,7 +2049,7 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
     LOG(INFO) << "Transport failover: " << transportTypeName(prev_type)
               << " -> " << transportTypeName(type) << " (attempt "
               << task.failover_count << "/" << max_failover_attempts_ << ")";
-    TENT_RECORD_TRANSPORT_FAILOVER();
+    TENT_RECORD_TRANSPORT_FAILOVER(prev_type, type);
 
     auto& transport = transport_list_[type];
     if (!batch->sub_batch[type]) {
@@ -2409,10 +2409,10 @@ void TransferEngineImpl::recordTaskCompletionMetrics(
             if (new_status == COMPLETED) {
                 if (task.request.opcode == Request::READ) {
                     TentMetrics::instance().recordReadCompleted(
-                        task.request.length, latency_seconds);
+                        task.type, task.request.length, latency_seconds);
                 } else {
                     TentMetrics::instance().recordWriteCompleted(
-                        task.request.length, latency_seconds);
+                        task.type, task.request.length, latency_seconds);
                 }
                 // Causal chain stage decomposition
                 if (task.dispatch_time.time_since_epoch().count() > 0) {
@@ -2421,7 +2421,7 @@ void TransferEngineImpl::recordTaskCompletionMetrics(
                             task.dispatch_time - start_time)
                             .count();
                     TENT_RECORD_STAGE_LATENCY(TentMetrics::Stage::QueueWait,
-                                              queue_wait_us);
+                                              task.type, queue_wait_us);
                     if (task.post_time.time_since_epoch().count() > 0) {
                         double dispatch_us =
                             std::chrono::duration<double, std::micro>(
@@ -2432,16 +2432,16 @@ void TransferEngineImpl::recordTaskCompletionMetrics(
                                 end_time - task.post_time)
                                 .count();
                         TENT_RECORD_STAGE_LATENCY(TentMetrics::Stage::Dispatch,
-                                                  dispatch_us);
+                                                  task.type, dispatch_us);
                         TENT_RECORD_STAGE_LATENCY(TentMetrics::Stage::Transport,
-                                                  transport_us);
+                                                  task.type, transport_us);
                     }
                 }
             } else if (new_status == FAILED) {
                 if (task.request.opcode == Request::READ) {
-                    TentMetrics::instance().recordReadFailed();
+                    TentMetrics::instance().recordReadFailed(task.type);
                 } else {
-                    TentMetrics::instance().recordWriteFailed();
+                    TentMetrics::instance().recordWriteFailed(task.type);
                 }
             }
             // Observability only (RFC #2519): deadline feasibility. The
@@ -2460,13 +2460,13 @@ void TransferEngineImpl::recordTaskCompletionMetrics(
                         double window_seconds =
                             (task.request.deadline_ns - start_ns) / 1e9;
                         TentMetrics::instance().recordDeadlineMLU(
-                            latency_seconds / window_seconds);
+                            task.type, latency_seconds / window_seconds);
                     }
                 } else {
                     // Deadline already in the past at submit: infeasible.
                     // Recorded into a dedicated counter so it does not
                     // pollute the MLU histogram with a sentinel value.
-                    TentMetrics::instance().recordDeadlineInfeasible();
+                    TentMetrics::instance().recordDeadlineInfeasible(task.type);
                 }
             }
             // Reset start_time to prevent duplicate recording

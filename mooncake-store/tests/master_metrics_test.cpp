@@ -609,9 +609,10 @@ static std::string PutKeyAndOffload(MasterService& svc, const UUID& client_id,
                                     const std::string& key) {
     ReplicateConfig cfg;
     cfg.replica_num = 1;
-    auto put_start = svc.PutStart(client_id, key, "default", value_size, cfg);
+    auto put_start =
+        svc.PutStart(client_id, key, TenantId::Default(), value_size, cfg);
     if (!put_start) return "";
-    svc.PutEnd(client_id, key, "default", ReplicaType::MEMORY);
+    svc.PutEnd(client_id, key, TenantId::Default(), ReplicaType::MEMORY);
 
     StorageObjectMetadata meta;
     meta.data_size = static_cast<int64_t>(value_size);
@@ -656,7 +657,7 @@ TEST_F(MasterMetricsTest, LocalDiskReplicaAllocatedSize) {
     EXPECT_EQ(metrics.get_allocated_file_size(), baseline + kValueSize);
 
     // After removing the key the LocalDiskReplica is destroyed; gauge resets.
-    ASSERT_TRUE(svc.Remove(key, "default").has_value());
+    ASSERT_TRUE(svc.Remove(key, TenantId::Default()).has_value());
     EXPECT_EQ(metrics.get_allocated_file_size(), baseline);
 }
 

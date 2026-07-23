@@ -230,11 +230,11 @@ tl::expected<std::string, ErrorCode> ParseAdminTenantId(
     if (tenant_id_view.empty()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    std::string tenant_id = NormalizeTenantId(std::string(tenant_id_view));
-    if (!IsValidTenantId(tenant_id)) {
+    TenantId tenant_id{std::string(tenant_id_view)};
+    if (!tenant_id.IsValid()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return tenant_id;
+    return tenant_id.value();
 }
 
 tl::expected<HttpTenantQuotaPolicyRequest, std::string> ParseQuotaPolicyBody(
