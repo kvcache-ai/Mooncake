@@ -11,6 +11,7 @@ Mooncake Transfer Engine supports multiple communication protocols for data tran
 | **efa** | AWS EFA-capable instance | High-performance on AWS (libfabric SRD) | ✅ Primary |
 | **nvmeof** | NVMe-oF capable storage | Direct NVMe storage access | ⚠️ Advanced |
 | **nvlink** | NVIDIA MNNVL | Inter-node GPU communication | ⚠️ Advanced |
+| **musa** | Moore Threads GPU + MTLink | Intra-node GPU IPC/P2P | ⚠️ Advanced |
 | **nvlink_intra** | NVIDIA NVLink | Intra-node GPU communication | ⚠️ Advanced |
 | **hip** | AMD ROCm/HIP | AMD GPU communication | ⚠️ Advanced |
 | **barex** | RDMA-capable NIC | Bare-metal RDMA extension | ⚠️ Advanced |
@@ -203,6 +204,51 @@ export MC_FORCE_MNNVL=true
 ```
 
 **Note:** When `protocol="rdma"` is set and RDMA NICs exist, you must explicitly set `MC_FORCE_MNNVL=true` to use MNNVL instead of RDMA. If no RDMA HCA is detected, MNNVL will be used automatically.
+
+### MUSA Transport (musa)
+
+**Description:** Moore Threads GPU IPC transport for P2P copies over the
+intra-node MTLink path. It reuses the NVLink transport's transfer bookkeeping,
+but opens imported IPC memory and submits copies using MUSA-specific device
+context rules.
+
+**Requirements:**
+- Moore Threads GPUs with peer access (validated on S5000)
+- MUSA SDK/runtime; MUSA 5.2 or newer enables the low-CPU transfer-batch API
+- Compiled with `USE_MUSA=ON`
+
+**Configuration:**
+```bash
+# Use the identical ordered physical-device list in every peer process.
+export MTHREADS_VISIBLE_DEVICES=4,5
+export MUSA_VISIBLE_DEVICES=4,5
+export MC_FORCE_MUSA=1
+
+# Safe defaults shown explicitly. Opt in to metadata after checking the
+# visibility contract below; "default" rolls back to per-slice copies.
+export MC_MUSA_IPC_OPEN_DEVICE=current
+export MC_MUSA_COPY_API=auto
+
+# Performance path after both peers use the same ordered physical IDs.
+export MC_MUSA_IPC_OPEN_DEVICE=metadata
+```
+
+`MTHREADS_VISIBLE_DEVICES` and `MUSA_VISIBLE_DEVICES` must contain the same
+physical IDs in the same order in every container/process. Buffer metadata uses
+logical ordinals such as `musa:0`; using `MTHREADS_VISIBLE_DEVICES=4,5` together
+with `MUSA_VISIBLE_DEVICES=0,1` can select physical GPUs outside the intended
+pair and is rejected locally. Both peers must run a version that recognizes the
+`musa` protocol; rolling interoperability with an older peer advertising only
+`nvlink` is not supported. `MC_MUSA_IPC_OPEN_DEVICE=current` is the safe
+default; select `metadata` only when both peers satisfy the ordered visibility
+contract above. Python bindings that register the default wildcard
+location (`*`) resolve the owning MUSA device during registration; an older
+peer that still advertises `*` falls back to the current-device open path.
+
+In `auto` mode, batches whose copies are at least 1 MiB use
+`muMemoryTransferBatchAsync`; set `MC_MUSA_TRANSFER_BATCH_MIN_BYTES` to tune the
+threshold, `MC_MUSA_COPY_API=transfer_batch` to force the API, or
+`MC_MUSA_COPY_API=default` to use the CUDA-compatible per-slice path.
 
 ### Intra-Node NVLink (nvlink_intra)
 

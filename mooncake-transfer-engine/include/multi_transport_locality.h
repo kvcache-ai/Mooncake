@@ -65,16 +65,20 @@ inline bool hostEquals(const std::string& a, const std::string& b) {
     return true;
 }
 
-// The device KV pool is registered under both rdma and hip in a "rdma,hip"
-// multi-protocol segment. hip transport uses GPU IPC, which only works between
-// processes on the same physical host, so a hip buffer is a valid transport for
-// a target only when that target lives on the same host as the initiator.
-// A cross-host target must fall back to rdma. Two engines co-located on one
-// host share the host portion of their segment name (they differ only in port).
-inline bool isHipReachableTarget(const std::string& target_segment_name,
-                                 const std::string& local_server_name) {
+// GPU IPC transports (HIP and MUSA) only work between processes on the same
+// physical host. A cross-host target must fall back to RDMA/TCP. Two engines
+// co-located on one host share the host portion of their segment name (they
+// differ only in port).
+inline bool isGpuIpcReachableTarget(const std::string& target_segment_name,
+                                    const std::string& local_server_name) {
     return hostEquals(segmentHost(target_segment_name),
                       segmentHost(local_server_name));
+}
+
+// Compatibility name retained for existing callers/tests.
+inline bool isHipReachableTarget(const std::string& target_segment_name,
+                                 const std::string& local_server_name) {
+    return isGpuIpcReachableTarget(target_segment_name, local_server_name);
 }
 
 }  // namespace mooncake

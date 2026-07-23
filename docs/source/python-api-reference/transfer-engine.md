@@ -849,6 +849,7 @@ The `mooncake.engine` module provides boolean attributes that indicate whether s
 - `engine.SUPPORT_EFA`: Whether EFA (Elastic Fabric Adapter) support is enabled
 - `engine.SUPPORT_HIP`: Whether HIP (Heterogeneous-compute Interface for Portability) support is enabled
 - `engine.SUPPORT_MNNVL`: Whether MNNVL transport protocol support is enabled
+- `engine.SUPPORT_MUSA`: Whether the Moore Threads MUSA GPU IPC transport is enabled
 - `engine.SUPPORT_INTRA_NVLINK`: Whether intra-node NVLink support is enabled
 
 ### Usage Example
@@ -865,5 +866,6 @@ print(f"CUDA: {engine.SUPPORT_CUDA}")
 print(f"EFA: {engine.SUPPORT_EFA}")
 print(f"HIP: {engine.SUPPORT_HIP}")
 print(f"MNNVL: {engine.SUPPORT_MNNVL}")
+print(f"MUSA: {engine.SUPPORT_MUSA}")
 print(f"Intra-NVLink: {engine.SUPPORT_INTRA_NVLINK}")
 ```

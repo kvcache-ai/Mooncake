@@ -23,6 +23,7 @@ In addition to tcp and rdma, the C++ Transfer Engine also supports:
 - efa: AWS Elastic Fabric Adapter transport (libfabric-based)
 - nvmeof: NVMe over Fabric for direct NVMe storage access
 - nvlink: NVIDIA NVLink for inter-GPU communication across nodes
+- musa: Moore Threads GPU IPC/P2P communication over MTLink
 - nvlink_intra: NVIDIA NVLink for intra-node GPU communication
 - hip: ROCm/HIP for AMD GPU communication using IPC/Shareable handles
 - barex: Bare-metal RDMA extension protocol
@@ -100,6 +101,7 @@ _KNOWN_PROTOCOLS = frozenset(
         "efa",
         "nvmeof",
         "nvlink",
+        "musa",
         "nvlink_intra",
         "hip",
         "barex",
