@@ -3,7 +3,7 @@
 #include <memory>
 
 #include "fs_adapter.h"
-#include "storage/adapter/object_storage_adapter.h"
+#include "storage/distributed/object_storage_adapter.h"
 #include "storage_backend.h"
 
 namespace mooncake {

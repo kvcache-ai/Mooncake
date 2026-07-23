@@ -1,4 +1,4 @@
-#include "storage/adapter/object_storage_adapter.h"
+#include "storage/distributed/object_storage_adapter.h"
 
 #include <cstring>
 #include <limits>

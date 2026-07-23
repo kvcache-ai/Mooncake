@@ -23,7 +23,8 @@ struct TensorRegion {
 };
 
 /**
- * @brief Adapts object storage services to Mooncake's key-value I/O contract.
+ * @brief Adapts object storage services to the distributed backend's
+ * key-value I/O contract.
  *
  * The key-value API serves latency-sensitive online requests. The tensor API
  * serves throughput-oriented background synchronization and has correct,
