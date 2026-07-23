@@ -84,7 +84,7 @@ class BatchEvictBench;
  * 2. tenant_quota_policy_mutex_
  * 3. snapshot_mutex_
  * 4. metadata_shards_[shard_idx_].mutex
- * 5. tenant_quota_shards_[shard_idx_].mutex
+ * 5. ShardedTenantQuotaTable internal shard mutex
  * 6. segment_mutex_
  *
  * Strict tenant admission and policy mutation paths that need both
@@ -117,8 +117,6 @@ class MasterService {
     bool IsNoFSegmentMountedForTesting(const UUID& segment_id);
     std::optional<uint32_t> GetNoFHeartbeatFailureCountForTesting(
         const UUID& segment_id);
-    std::optional<TenantQuotaSnapshot> GetTenantQuotaSnapshotForTesting(
-        const TenantId& tenant_id) const;
     bool IsTenantQuotaEnabled() const;
     std::vector<TenantQuotaSnapshot> ListTenantQuotaSnapshots() const;
     std::optional<TenantQuotaSnapshot> GetTenantQuotaSnapshot(
@@ -1296,14 +1294,6 @@ class MasterService {
         ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& pred_fn);
 
-    static constexpr size_t kNumTenantQuotaShards = 1024;
-    struct TenantQuotaShard {
-        mutable std::mutex mutex;
-        std::unordered_map<TenantId, TenantQuotaState, TenantIdHash> tenants
-            GUARDED_BY(mutex);
-    };
-    std::array<TenantQuotaShard, kNumTenantQuotaShards> tenant_quota_shards_;
-
     std::unordered_map<std::string, std::string> object_group_ids_
         GUARDED_BY(group_routing_mutex_);
     mutable std::unordered_set<std::string> groups_needing_lease_refresh_
@@ -1419,7 +1409,6 @@ class MasterService {
 
     size_t getMetadataShardIndex(const TenantId& tenant_id,
                                  const std::string& key) const;
-    size_t getTenantQuotaShardIndex(const TenantId& tenant_id) const;
     std::optional<std::string> GetGroupRoute(const TenantId& tenant_id,
                                              const std::string& key) const;
     void RegisterGroupMember(TenantState& tenant_state,
@@ -1448,8 +1437,6 @@ class MasterService {
                                         const ReplicateConfig& config) const;
     bool ShouldProtectZeroChargeMetadataCreate(
         uint64_t requested_quota_charge) const;
-    uint64_t ComputeTenantQuotaDeficit(const TenantId& tenant_id,
-                                       uint64_t incoming_quota_charge);
     tl::expected<void, ErrorCode> ReserveTenantQuota(const TenantId& tenant_id,
                                                      uint64_t bytes);
     void CommitTenantQuota(const TenantId& tenant_id, uint64_t bytes);
@@ -1457,8 +1444,6 @@ class MasterService {
     void ReleaseTenantQuota(const TenantId& tenant_id, uint64_t bytes);
     void ReleaseTenantQuotaPartial(const TenantId& tenant_id, uint64_t bytes);
     void CommitAdditionalTenantQuota(const TenantId& tenant_id, uint64_t bytes);
-    void AbortReplicationTaskQuota(const TenantId& tenant_id,
-                                   const ReplicationTask& task);
     void IncrementTenantMetadataObjectCount(const TenantId& tenant_id);
     void DecrementTenantMetadataObjectCount(const TenantId& tenant_id);
     void ReleaseCommittedQuotaCharge(ObjectMetadata& metadata, uint64_t bytes);
@@ -1467,7 +1452,6 @@ class MasterService {
     void LoadTenantQuotaPoliciesFromStoreOrThrow();
     void ApplyTenantQuotaPolicies(const TenantQuotaPolicySnapshot& snapshot);
     TenantQuotaPolicySnapshot BuildTenantQuotaPolicySnapshot() const;
-    uint64_t GetTenantQuotaCapacityBytes();
     std::unordered_map<std::string, ObjectMetadata>::iterator EraseMetadata(
         TenantState& tenant_state,
         std::unordered_map<std::string, ObjectMetadata>::iterator it,
@@ -2013,7 +1997,7 @@ class MasterService {
     const std::string tenant_quota_connector_uri_;
     std::unique_ptr<TenantQuotaPolicyStore> tenant_quota_policy_store_;
     mutable std::mutex tenant_quota_policy_mutex_;
-    mutable std::mutex tenant_quota_recompute_mutex_;
+    ShardedTenantQuotaTable<1024> tenant_quota_table_;
 
     // HTTP metadata server pointer for cleanup on client timeout
     // nullptr means cleanup is disabled

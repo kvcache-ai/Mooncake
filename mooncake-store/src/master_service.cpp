@@ -114,34 +114,6 @@ bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
            allocated_nof_replicas == config.nof_replica_num;
 }
 
-bool IsLazyEmptyTenantQuotaState(const TenantQuotaState& state) {
-    return !state.has_explicit_policy && state.used_bytes == 0 &&
-           state.reserved_bytes == 0 && state.committed_count == 0 &&
-           state.metadata_object_count == 0;
-}
-
-void RefreshTenantQuotaOverQuota(TenantQuotaState& state) {
-    state.over_quota =
-        (!state.has_explicit_policy && state.metadata_object_count > 0) ||
-        static_cast<unsigned __int128>(state.used_bytes) +
-                state.reserved_bytes >
-            state.effective_quota_bytes;
-}
-
-TenantQuotaSnapshot MakeTenantQuotaSnapshot(const TenantId& tenant_id,
-                                            const TenantQuotaState& state) {
-    return TenantQuotaSnapshot{
-        .tenant_id = tenant_id.value(),
-        .requested_quota_bytes = state.requested_quota_bytes,
-        .effective_quota_bytes = state.effective_quota_bytes,
-        .used_bytes = state.used_bytes,
-        .reserved_bytes = state.reserved_bytes,
-        .committed_count = state.committed_count,
-        .metadata_object_count = state.metadata_object_count,
-        .has_explicit_policy = state.has_explicit_policy,
-        .over_quota = state.over_quota};
-}
-
 tl::expected<std::string, ErrorCode> GetGroupIdForKey(
     const ReplicateConfig& config, size_t key_count, size_t key_index) {
     if (!config.group_ids.has_value()) {
@@ -611,47 +583,19 @@ std::optional<uint32_t> MasterService::GetNoFHeartbeatFailureCountForTesting(
     return it->second.consecutive_failures;
 }
 
-std::optional<TenantQuotaSnapshot>
-MasterService::GetTenantQuotaSnapshotForTesting(
-    const TenantId& tenant_id) const {
-    assert(tenant_id.IsValid());
-    const auto shard_idx = getTenantQuotaShardIndex(tenant_id);
-    const auto& shard = tenant_quota_shards_[shard_idx];
-    std::lock_guard<std::mutex> lock(shard.mutex);
-    auto it = shard.tenants.find(tenant_id);
-    if (it == shard.tenants.end()) {
-        return std::nullopt;
-    }
-    return MakeTenantQuotaSnapshot(tenant_id, it->second);
-}
-
 bool MasterService::IsTenantQuotaEnabled() const {
     return enable_multi_tenants_;
 }
 
 std::vector<TenantQuotaSnapshot> MasterService::ListTenantQuotaSnapshots()
     const {
-    std::vector<TenantQuotaSnapshot> snapshots;
-    for (size_t i = 0; i < kNumTenantQuotaShards; ++i) {
-        const auto& shard = tenant_quota_shards_[i];
-        std::lock_guard<std::mutex> lock(shard.mutex);
-        for (const auto& [tenant_id, state] : shard.tenants) {
-            if (IsLazyEmptyTenantQuotaState(state)) {
-                continue;
-            }
-            snapshots.push_back(MakeTenantQuotaSnapshot(tenant_id, state));
-        }
-    }
-    std::sort(snapshots.begin(), snapshots.end(),
-              [](const auto& lhs, const auto& rhs) {
-                  return lhs.tenant_id < rhs.tenant_id;
-              });
-    return snapshots;
+    return tenant_quota_table_.ListTenantSnapshots();
 }
 
 std::optional<TenantQuotaSnapshot> MasterService::GetTenantQuotaSnapshot(
     const TenantId& tenant_id) const {
-    return GetTenantQuotaSnapshotForTesting(tenant_id);
+    assert(tenant_id.IsValid());
+    return tenant_quota_table_.GetTenantSnapshot(tenant_id);
 }
 
 tl::expected<TenantQuotaSnapshot, ErrorCode>
@@ -698,34 +642,22 @@ MasterService::DeleteTenantQuotaPolicy(const TenantId& tenant_id) {
     const uint64_t requested_quota_bytes = policy_it->second;
 
     auto restore_policy = [&] {
-        auto& shard = tenant_quota_shards_[getTenantQuotaShardIndex(tenant_id)];
-        {
-            std::lock_guard<std::mutex> lock(shard.mutex);
-            auto& state = shard.tenants[tenant_id];
-            state.requested_quota_bytes = requested_quota_bytes;
-            state.has_explicit_policy = true;
-            RefreshTenantQuotaOverQuota(state);
+        auto result = tenant_quota_table_.UpsertTenantPolicy(
+            tenant_id, requested_quota_bytes,
+            GetTenantQuotaAllocatableCapacityBytes());
+        if (!result) {
+            LOG(ERROR) << "failed to restore tenant quota policy tenant="
+                       << tenant_id.value();
         }
-        RecomputeTenantEffectiveQuotas();
     };
 
-    {
-        auto& shard = tenant_quota_shards_[getTenantQuotaShardIndex(tenant_id)];
-        std::lock_guard<std::mutex> lock(shard.mutex);
-        auto quota_it = shard.tenants.find(tenant_id);
-        if (quota_it == shard.tenants.end() ||
-            !quota_it->second.has_explicit_policy) {
-            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-        }
-        auto& state = quota_it->second;
-        if (state.used_bytes != 0 || state.reserved_bytes != 0 ||
-            state.committed_count != 0 || state.metadata_object_count != 0) {
-            return tl::make_unexpected(ErrorCode::TENANT_NOT_EMPTY);
-        }
-        state.has_explicit_policy = false;
-        state.requested_quota_bytes = 0;
-        state.effective_quota_bytes = 0;
-        RefreshTenantQuotaOverQuota(state);
+    auto disable_result =
+        tenant_quota_table_.DisableTenantPolicyIfEmpty(tenant_id);
+    if (!disable_result) {
+        return tl::make_unexpected(disable_result.error() ==
+                                           TenantQuotaError::kTenantNotEmpty
+                                       ? ErrorCode::TENANT_NOT_EMPTY
+                                       : ErrorCode::OBJECT_NOT_FOUND);
     }
 
     auto post_mark_snapshot = GetTenantQuotaSnapshot(tenant_id);
@@ -945,11 +877,6 @@ size_t MasterService::getMetadataShardIndex(const TenantId& tenant_id,
     return getShardIndex(it->second);
 }
 
-size_t MasterService::getTenantQuotaShardIndex(
-    const TenantId& tenant_id) const {
-    return TenantIdHash{}(tenant_id) % kNumTenantQuotaShards;
-}
-
 const TenantId& MasterService::ResolveRequestTenantId(
     const TenantId& tenant_id) const {
     assert(tenant_id.IsValid());
@@ -968,11 +895,7 @@ bool MasterService::IsTenantRegistered(const TenantId& tenant_id) const {
     if (!enable_multi_tenants_) {
         return true;
     }
-    const auto& shard =
-        tenant_quota_shards_[getTenantQuotaShardIndex(tenant_id)];
-    std::lock_guard<std::mutex> lock(shard.mutex);
-    auto it = shard.tenants.find(tenant_id);
-    return it != shard.tenants.end() && it->second.has_explicit_policy;
+    return tenant_quota_table_.IsTenantRegistered(tenant_id);
 }
 
 tl::expected<TenantId, ErrorCode> MasterService::ResolveTenantIdForWrite(
@@ -1012,69 +935,23 @@ bool MasterService::TenantHasObjects(const TenantId& tenant_id) const {
 TenantQuotaPolicySnapshot MasterService::BuildTenantQuotaPolicySnapshot()
     const {
     TenantQuotaPolicySnapshot snapshot;
-    for (size_t i = 0; i < kNumTenantQuotaShards; ++i) {
-        const auto& shard = tenant_quota_shards_[i];
-        std::lock_guard<std::mutex> lock(shard.mutex);
-        for (const auto& [tenant_id, state] : shard.tenants) {
-            if (state.has_explicit_policy) {
-                snapshot.tenant_quotas[tenant_id.value()] =
-                    state.requested_quota_bytes;
-            }
-        }
+    for (const auto& [tenant_id, requested_quota_bytes] :
+         tenant_quota_table_.GetTenantPolicies()) {
+        snapshot.tenant_quotas.emplace(tenant_id.value(),
+                                       requested_quota_bytes);
     }
     return snapshot;
 }
 
 void MasterService::ApplyTenantQuotaPolicies(
     const TenantQuotaPolicySnapshot& snapshot) {
-    std::array<std::vector<std::pair<TenantId, uint64_t>>,
-               kNumTenantQuotaShards>
-        grouped_quotas;
+    TenantQuotaPolicyMap policies;
     for (const auto& [tenant_id, requested_quota_bytes] :
          snapshot.tenant_quotas) {
-        TenantId canonical_tenant(tenant_id);
-        grouped_quotas[getTenantQuotaShardIndex(canonical_tenant)].emplace_back(
-            std::move(canonical_tenant), requested_quota_bytes);
+        policies.emplace(TenantId(tenant_id), requested_quota_bytes);
     }
-
-    for (size_t i = 0; i < kNumTenantQuotaShards; ++i) {
-        auto& shard = tenant_quota_shards_[i];
-        std::lock_guard<std::mutex> lock(shard.mutex);
-        for (auto it = shard.tenants.begin(); it != shard.tenants.end();) {
-            const auto policy_it =
-                snapshot.tenant_quotas.find(it->first.value());
-            auto& state = it->second;
-            if (policy_it != snapshot.tenant_quotas.end()) {
-                state.requested_quota_bytes = policy_it->second;
-                state.has_explicit_policy = true;
-                RefreshTenantQuotaOverQuota(state);
-                ++it;
-            } else {
-                state.has_explicit_policy = false;
-                state.requested_quota_bytes = 0;
-                state.effective_quota_bytes = 0;
-                if (IsLazyEmptyTenantQuotaState(state)) {
-                    it = shard.tenants.erase(it);
-                } else {
-                    RefreshTenantQuotaOverQuota(state);
-                    ++it;
-                }
-            }
-        }
-
-        for (const auto& [tenant_id, requested_quota_bytes] :
-             grouped_quotas[i]) {
-            auto [tenant_it, inserted] = shard.tenants.try_emplace(tenant_id);
-            if (!inserted) {
-                continue;
-            }
-            auto& state = tenant_it->second;
-            state.requested_quota_bytes = requested_quota_bytes;
-            state.has_explicit_policy = true;
-            RefreshTenantQuotaOverQuota(state);
-        }
-    }
-    RecomputeTenantEffectiveQuotas();
+    tenant_quota_table_.ApplyTenantPolicies(
+        policies, GetTenantQuotaAllocatableCapacityBytes());
 }
 
 void MasterService::LoadTenantQuotaPoliciesFromStoreOrThrow() {
@@ -1117,32 +994,7 @@ bool MasterService::ShouldProtectZeroChargeMetadataCreate(
     return enable_multi_tenants_ && requested_quota_charge == 0;
 }
 
-uint64_t MasterService::ComputeTenantQuotaDeficit(
-    const TenantId& tenant_id, uint64_t incoming_quota_charge) {
-    uint64_t deficit = incoming_quota_charge;
-    auto& quota_shard =
-        tenant_quota_shards_[getTenantQuotaShardIndex(tenant_id)];
-    std::lock_guard<std::mutex> lock(quota_shard.mutex);
-    auto quota_it = quota_shard.tenants.find(tenant_id);
-    if (quota_it == quota_shard.tenants.end()) {
-        return deficit;
-    }
-
-    const auto& state = quota_it->second;
-    const unsigned __int128 demand =
-        static_cast<unsigned __int128>(state.used_bytes) +
-        state.reserved_bytes + incoming_quota_charge;
-    if (demand <= state.effective_quota_bytes) {
-        return 0;
-    }
-
-    const unsigned __int128 raw_deficit = demand - state.effective_quota_bytes;
-    return raw_deficit > std::numeric_limits<uint64_t>::max()
-               ? std::numeric_limits<uint64_t>::max()
-               : static_cast<uint64_t>(raw_deficit);
-}
-
-uint64_t MasterService::GetTenantQuotaCapacityBytes() {
+uint64_t MasterService::GetTenantQuotaAllocatableCapacityBytes() {
     uint64_t capacity = 0;
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
     std::vector<std::pair<Segment, UUID>> segments;
@@ -1158,51 +1010,12 @@ uint64_t MasterService::GetTenantQuotaCapacityBytes() {
     return capacity;
 }
 
-uint64_t MasterService::GetTenantQuotaAllocatableCapacityBytes() {
-    return GetTenantQuotaCapacityBytes();
-}
-
 void MasterService::RecomputeTenantEffectiveQuotas() {
     if (!enable_multi_tenants_) {
         return;
     }
-    std::lock_guard<std::mutex> recompute_lock(tenant_quota_recompute_mutex_);
-    const uint64_t capacity = GetTenantQuotaAllocatableCapacityBytes();
-
-    std::map<TenantId, TenantQuotaState> active_tenants;
-    for (size_t i = 0; i < kNumTenantQuotaShards; ++i) {
-        auto& shard = tenant_quota_shards_[i];
-        std::lock_guard<std::mutex> lock(shard.mutex);
-        for (auto it = shard.tenants.begin(); it != shard.tenants.end();) {
-            const auto& tenant_id = it->first;
-            auto& state = it->second;
-            if (IsLazyEmptyTenantQuotaState(state)) {
-                it = shard.tenants.erase(it);
-                continue;
-            }
-            if (!state.has_explicit_policy) {
-                state.requested_quota_bytes = 0;
-                state.effective_quota_bytes = 0;
-                RefreshTenantQuotaOverQuota(state);
-            }
-            active_tenants.emplace(tenant_id, state);
-            ++it;
-        }
-    }
-
-    for (const auto& assignment :
-         BuildEffectiveQuotaAssignments(active_tenants, capacity)) {
-        auto& shard = tenant_quota_shards_[getTenantQuotaShardIndex(
-            assignment.tenant_id)];
-        std::lock_guard<std::mutex> lock(shard.mutex);
-        auto it = shard.tenants.find(assignment.tenant_id);
-        if (it == shard.tenants.end()) {
-            continue;
-        }
-        auto& state = it->second;
-        state.effective_quota_bytes = assignment.effective_quota_bytes;
-        RefreshTenantQuotaOverQuota(state);
-    }
+    tenant_quota_table_.RecomputeEffectiveQuotas(
+        GetTenantQuotaAllocatableCapacityBytes());
 }
 
 tl::expected<void, ErrorCode> MasterService::ReserveTenantQuota(
@@ -1210,32 +1023,16 @@ tl::expected<void, ErrorCode> MasterService::ReserveTenantQuota(
     if (!enable_multi_tenants_) {
         return {};
     }
-    auto exceeds_effective_quota = [](const TenantQuotaState& state,
-                                      uint64_t additional_bytes) {
-        return static_cast<unsigned __int128>(state.used_bytes) +
-                   state.reserved_bytes + additional_bytes >
-               state.effective_quota_bytes;
-    };
-    auto& shard = tenant_quota_shards_[getTenantQuotaShardIndex(tenant_id)];
-    {
-        std::lock_guard<std::mutex> lock(shard.mutex);
-        auto it = shard.tenants.find(tenant_id);
-        if (it == shard.tenants.end() || !it->second.has_explicit_policy) {
-            return tl::make_unexpected(ErrorCode::TENANT_NOT_REGISTERED);
-        }
-
-        auto& state = it->second;
-        if (bytes == 0) {
-            return {};
-        }
-        if (exceeds_effective_quota(state, bytes)) {
-            return tl::make_unexpected(ErrorCode::TENANT_QUOTA_EXCEEDED);
-        }
-
-        state.reserved_bytes += bytes;
-        RefreshTenantQuotaOverQuota(state);
+    auto result = tenant_quota_table_.Reserve(tenant_id, bytes);
+    if (result) {
         return {};
     }
+    return tl::make_unexpected(
+        result.error() == TenantQuotaError::kTenantNotRegistered
+            ? ErrorCode::TENANT_NOT_REGISTERED
+        : result.error() == TenantQuotaError::kQuotaExceeded
+            ? ErrorCode::TENANT_QUOTA_EXCEEDED
+            : ErrorCode::INTERNAL_ERROR);
 }
 
 void MasterService::CommitTenantQuota(const TenantId& tenant_id,
@@ -1243,30 +1040,10 @@ void MasterService::CommitTenantQuota(const TenantId& tenant_id,
     if (!enable_multi_tenants_ || bytes == 0) {
         return;
     }
-    auto& shard = tenant_quota_shards_[getTenantQuotaShardIndex(tenant_id)];
-    std::lock_guard<std::mutex> lock(shard.mutex);
-    auto it = shard.tenants.find(tenant_id);
-    if (it == shard.tenants.end()) {
+    if (!tenant_quota_table_.Commit(tenant_id, bytes)) {
         LOG(ERROR) << "tenant quota commit mismatch tenant="
-                   << tenant_id.value() << ", bytes=" << bytes
-                   << ", reserved=0";
-        return;
+                   << tenant_id.value() << ", bytes=" << bytes;
     }
-    auto& state = it->second;
-    if (state.reserved_bytes < bytes) {
-        LOG(ERROR) << "tenant quota commit mismatch tenant="
-                   << tenant_id.value() << ", bytes=" << bytes
-                   << ", reserved=" << state.reserved_bytes;
-        return;
-    }
-    state.reserved_bytes -= bytes;
-    if (state.used_bytes > std::numeric_limits<uint64_t>::max() - bytes) {
-        state.used_bytes = std::numeric_limits<uint64_t>::max();
-    } else {
-        state.used_bytes += bytes;
-    }
-    ++state.committed_count;
-    RefreshTenantQuotaOverQuota(state);
 }
 
 void MasterService::AbortTenantQuota(const TenantId& tenant_id,
@@ -1274,34 +1051,9 @@ void MasterService::AbortTenantQuota(const TenantId& tenant_id,
     if (!enable_multi_tenants_ || bytes == 0) {
         return;
     }
-    auto& shard = tenant_quota_shards_[getTenantQuotaShardIndex(tenant_id)];
-    bool recompute_needed = false;
-    {
-        std::lock_guard<std::mutex> lock(shard.mutex);
-        auto it = shard.tenants.find(tenant_id);
-        if (it == shard.tenants.end()) {
-            LOG(ERROR) << "tenant quota abort mismatch tenant="
-                       << tenant_id.value() << ", bytes=" << bytes
-                       << ", reserved=0";
-            return;
-        }
-        auto& state = it->second;
-        if (state.reserved_bytes < bytes) {
-            LOG(ERROR) << "tenant quota abort mismatch tenant="
-                       << tenant_id.value() << ", bytes=" << bytes
-                       << ", reserved=" << state.reserved_bytes;
-            return;
-        }
-        state.reserved_bytes -= bytes;
-        if (IsLazyEmptyTenantQuotaState(state)) {
-            shard.tenants.erase(it);
-            recompute_needed = true;
-        } else {
-            RefreshTenantQuotaOverQuota(state);
-        }
-    }
-    if (recompute_needed) {
-        RecomputeTenantEffectiveQuotas();
+    if (!tenant_quota_table_.Abort(tenant_id, bytes)) {
+        LOG(ERROR) << "tenant quota abort mismatch tenant=" << tenant_id.value()
+                   << ", bytes=" << bytes;
     }
 }
 
@@ -1310,37 +1062,9 @@ void MasterService::ReleaseTenantQuota(const TenantId& tenant_id,
     if (!enable_multi_tenants_ || bytes == 0) {
         return;
     }
-    auto& shard = tenant_quota_shards_[getTenantQuotaShardIndex(tenant_id)];
-    bool recompute_needed = false;
-    {
-        std::lock_guard<std::mutex> lock(shard.mutex);
-        auto it = shard.tenants.find(tenant_id);
-        if (it == shard.tenants.end()) {
-            LOG(ERROR) << "tenant quota release mismatch tenant="
-                       << tenant_id.value() << ", bytes=" << bytes
-                       << ", used=0";
-            return;
-        }
-        auto& state = it->second;
-        if (state.used_bytes < bytes) {
-            LOG(ERROR) << "tenant quota release mismatch tenant="
-                       << tenant_id.value() << ", bytes=" << bytes
-                       << ", used=" << state.used_bytes;
-            return;
-        }
-        state.used_bytes -= bytes;
-        if (state.committed_count > 0) {
-            --state.committed_count;
-        }
-        if (IsLazyEmptyTenantQuotaState(state)) {
-            shard.tenants.erase(it);
-            recompute_needed = true;
-        } else {
-            RefreshTenantQuotaOverQuota(state);
-        }
-    }
-    if (recompute_needed) {
-        RecomputeTenantEffectiveQuotas();
+    if (!tenant_quota_table_.Release(tenant_id, bytes)) {
+        LOG(ERROR) << "tenant quota release mismatch tenant="
+                   << tenant_id.value() << ", bytes=" << bytes;
     }
 }
 
@@ -1349,23 +1073,10 @@ void MasterService::ReleaseTenantQuotaPartial(const TenantId& tenant_id,
     if (!enable_multi_tenants_ || bytes == 0) {
         return;
     }
-    auto& shard = tenant_quota_shards_[getTenantQuotaShardIndex(tenant_id)];
-    std::lock_guard<std::mutex> lock(shard.mutex);
-    auto it = shard.tenants.find(tenant_id);
-    if (it == shard.tenants.end()) {
+    if (!tenant_quota_table_.ReleasePartial(tenant_id, bytes)) {
         LOG(ERROR) << "tenant quota partial release mismatch tenant="
-                   << tenant_id.value() << ", bytes=" << bytes << ", used=0";
-        return;
+                   << tenant_id.value() << ", bytes=" << bytes;
     }
-    auto& state = it->second;
-    if (state.used_bytes < bytes) {
-        LOG(ERROR) << "tenant quota partial release mismatch tenant="
-                   << tenant_id.value() << ", bytes=" << bytes
-                   << ", used=" << state.used_bytes;
-        return;
-    }
-    state.used_bytes -= bytes;
-    RefreshTenantQuotaOverQuota(state);
 }
 
 void MasterService::CommitAdditionalTenantQuota(const TenantId& tenant_id,
@@ -1373,34 +1084,10 @@ void MasterService::CommitAdditionalTenantQuota(const TenantId& tenant_id,
     if (!enable_multi_tenants_ || bytes == 0) {
         return;
     }
-    auto& shard = tenant_quota_shards_[getTenantQuotaShardIndex(tenant_id)];
-    std::lock_guard<std::mutex> lock(shard.mutex);
-    auto it = shard.tenants.find(tenant_id);
-    if (it == shard.tenants.end()) {
+    if (!tenant_quota_table_.CommitAdditional(tenant_id, bytes)) {
         LOG(ERROR) << "tenant quota additional commit mismatch tenant="
-                   << tenant_id.value() << ", bytes=" << bytes
-                   << ", reserved=0";
-        return;
+                   << tenant_id.value() << ", bytes=" << bytes;
     }
-    auto& state = it->second;
-    if (state.reserved_bytes < bytes) {
-        LOG(ERROR) << "tenant quota additional commit mismatch tenant="
-                   << tenant_id.value() << ", bytes=" << bytes
-                   << ", reserved=" << state.reserved_bytes;
-        return;
-    }
-    state.reserved_bytes -= bytes;
-    if (state.used_bytes > std::numeric_limits<uint64_t>::max() - bytes) {
-        state.used_bytes = std::numeric_limits<uint64_t>::max();
-    } else {
-        state.used_bytes += bytes;
-    }
-    RefreshTenantQuotaOverQuota(state);
-}
-
-void MasterService::AbortReplicationTaskQuota(const TenantId& tenant_id,
-                                              const ReplicationTask& task) {
-    AbortTenantQuota(tenant_id, task.reserved_quota_charge_bytes);
 }
 
 void MasterService::IncrementTenantMetadataObjectCount(
@@ -1408,13 +1095,7 @@ void MasterService::IncrementTenantMetadataObjectCount(
     if (!enable_multi_tenants_) {
         return;
     }
-    auto& shard = tenant_quota_shards_[getTenantQuotaShardIndex(tenant_id)];
-    std::lock_guard<std::mutex> lock(shard.mutex);
-    auto& state = shard.tenants[tenant_id];
-    if (state.metadata_object_count < std::numeric_limits<uint64_t>::max()) {
-        ++state.metadata_object_count;
-    }
-    RefreshTenantQuotaOverQuota(state);
+    tenant_quota_table_.IncrementMetadataObjectCount(tenant_id);
 }
 
 void MasterService::DecrementTenantMetadataObjectCount(
@@ -1422,32 +1103,9 @@ void MasterService::DecrementTenantMetadataObjectCount(
     if (!enable_multi_tenants_) {
         return;
     }
-    auto& shard = tenant_quota_shards_[getTenantQuotaShardIndex(tenant_id)];
-    bool recompute_needed = false;
-    {
-        std::lock_guard<std::mutex> lock(shard.mutex);
-        auto it = shard.tenants.find(tenant_id);
-        if (it == shard.tenants.end()) {
-            LOG(WARNING) << "tenant metadata object count decrement mismatch "
-                         << "tenant=" << tenant_id.value();
-            return;
-        }
-        auto& state = it->second;
-        if (state.metadata_object_count > 0) {
-            --state.metadata_object_count;
-        } else {
-            LOG(WARNING) << "tenant metadata object count underflow tenant="
-                         << tenant_id.value();
-        }
-        if (IsLazyEmptyTenantQuotaState(state)) {
-            shard.tenants.erase(it);
-            recompute_needed = true;
-        } else {
-            RefreshTenantQuotaOverQuota(state);
-        }
-    }
-    if (recompute_needed) {
-        RecomputeTenantEffectiveQuotas();
+    if (!tenant_quota_table_.DecrementMetadataObjectCount(tenant_id)) {
+        LOG(WARNING) << "tenant metadata object count decrement mismatch "
+                     << "tenant=" << tenant_id.value();
     }
 }
 
@@ -1471,18 +1129,13 @@ void MasterService::RebuildTenantQuotaUsageFromMetadata() {
         return;
     }
 
-    std::unordered_set<TenantId, TenantIdHash> metadata_tenants;
-    std::unordered_map<TenantId, uint64_t, TenantIdHash> used_by_tenant;
-    std::unordered_map<TenantId, uint64_t, TenantIdHash>
-        committed_count_by_tenant;
-    std::unordered_map<TenantId, uint64_t, TenantIdHash>
-        metadata_count_by_tenant;
+    TenantQuotaUsageMap usage;
     for (size_t i = 0; i < kNumShards; ++i) {
         MetadataShardAccessorRW shard(this, i);
         for (auto& [tenant_id, tenant_state] : shard->tenants) {
-            metadata_tenants.insert(tenant_id);
             for (auto& [_, metadata] : tenant_state.metadata) {
-                metadata_count_by_tenant[tenant_id]++;
+                auto& tenant_usage = usage[tenant_id];
+                ++tenant_usage.metadata_object_count;
                 const uint64_t charge = CompletedMemoryQuotaCharge(metadata);
                 metadata.reserved_quota_charge_bytes = 0;
                 metadata.committed_quota_charge_bytes = charge;
@@ -1490,42 +1143,22 @@ void MasterService::RebuildTenantQuotaUsageFromMetadata() {
                 if (charge == 0) {
                     continue;
                 }
-                used_by_tenant[tenant_id] += charge;
-                committed_count_by_tenant[tenant_id]++;
+                tenant_usage.used_bytes += charge;
+                ++tenant_usage.committed_count;
             }
         }
     }
 
-    for (size_t i = 0; i < kNumTenantQuotaShards; ++i) {
-        auto& shard = tenant_quota_shards_[i];
-        std::lock_guard<std::mutex> lock(shard.mutex);
-        for (auto& [_, state] : shard.tenants) {
-            state.used_bytes = 0;
-            state.reserved_bytes = 0;
-            state.committed_count = 0;
-            state.metadata_object_count = 0;
-        }
-    }
-    for (const auto& tenant_id : metadata_tenants) {
-        auto& shard = tenant_quota_shards_[getTenantQuotaShardIndex(tenant_id)];
-        std::lock_guard<std::mutex> lock(shard.mutex);
-        auto [it, inserted] = shard.tenants.try_emplace(tenant_id);
-        auto& state = it->second;
-        if (inserted || !state.has_explicit_policy) {
-            state.requested_quota_bytes = 0;
-            state.effective_quota_bytes = 0;
-            state.has_explicit_policy = false;
+    for (const auto& [tenant_id, _] : usage) {
+        if (!tenant_quota_table_.IsTenantRegistered(tenant_id)) {
             LOG(WARNING)
                 << "tenant " << tenant_id.value()
                 << " exists in metadata but has no connector quota policy; "
                    "creating orphan quota state";
         }
-        state.used_bytes = used_by_tenant[tenant_id];
-        state.committed_count = committed_count_by_tenant[tenant_id];
-        state.metadata_object_count = metadata_count_by_tenant[tenant_id];
-        RefreshTenantQuotaOverQuota(state);
     }
-    RecomputeTenantEffectiveQuotas();
+    tenant_quota_table_.RebuildUsage(usage,
+                                     GetTenantQuotaAllocatableCapacityBytes());
 }
 
 std::optional<std::string> MasterService::GetGroupRoute(
@@ -3163,8 +2796,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         }
         EvictTenantMemoryForQuota(
             object_id.tenant_id,
-            ComputeTenantQuotaDeficit(object_id.tenant_id,
-                                      requested_quota_charge));
+            tenant_quota_table_.ComputeDeficit(object_id.tenant_id,
+                                               requested_quota_charge));
     }
     return tl::make_unexpected(ErrorCode::TENANT_QUOTA_EXCEEDED);
 }
@@ -3753,8 +3386,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
         }
         EvictTenantMemoryForQuota(
             object_id.tenant_id,
-            ComputeTenantQuotaDeficit(object_id.tenant_id,
-                                      requested_quota_charge));
+            tenant_quota_table_.ComputeDeficit(object_id.tenant_id,
+                                               requested_quota_charge));
     }
     return tl::make_unexpected(ErrorCode::TENANT_QUOTA_EXCEEDED);
 }
@@ -4059,7 +3692,7 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
                                  task.replica_ids.end(),
                                  replica.id()) != task.replica_ids.end();
             });
-        AbortReplicationTaskQuota(metadata.tenant_id, task);
+        AbortTenantQuota(metadata.tenant_id, task.reserved_quota_charge_bytes);
         accessor.EraseReplicationTask();
         if (!metadata.IsValid()) {
             // Remove the object if it does not have any replicas.
@@ -4151,7 +3784,7 @@ tl::expected<void, ErrorCode> MasterService::CopyRevoke(
             });
     }
 
-    AbortReplicationTaskQuota(metadata.tenant_id, task);
+    AbortTenantQuota(metadata.tenant_id, task.reserved_quota_charge_bytes);
     accessor.EraseReplicationTask();
 
     if (!metadata.IsValid()) {
@@ -4338,7 +3971,7 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
                                  task.replica_ids.end(),
                                  replica.id()) != task.replica_ids.end();
             });
-        AbortReplicationTaskQuota(metadata.tenant_id, task);
+        AbortTenantQuota(metadata.tenant_id, task.reserved_quota_charge_bytes);
         accessor.EraseReplicationTask();
         if (!metadata.IsValid()) {
             // Remove the object if it does not have any replicas.
@@ -4360,7 +3993,8 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
             LOG(WARNING)
                 << "key=" << key << ", replica_id=" << replica_id
                 << ", move target becomes invalid during data transfer";
-            AbortReplicationTaskQuota(metadata.tenant_id, task);
+            AbortTenantQuota(metadata.tenant_id,
+                             task.reserved_quota_charge_bytes);
             accessor.EraseReplicationTask();
             return tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
         }
@@ -4382,7 +4016,7 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
             std::chrono::system_clock::now() + put_start_release_timeout_sec_);
     }
 
-    AbortReplicationTaskQuota(metadata.tenant_id, task);
+    AbortTenantQuota(metadata.tenant_id, task.reserved_quota_charge_bytes);
     accessor.EraseReplicationTask();
 
     return {};
@@ -4435,7 +4069,7 @@ tl::expected<void, ErrorCode> MasterService::MoveRevoke(
             });
     }
 
-    AbortReplicationTaskQuota(metadata.tenant_id, task);
+    AbortTenantQuota(metadata.tenant_id, task.reserved_quota_charge_bytes);
     accessor.EraseReplicationTask();
 
     if (!metadata.IsValid()) {
@@ -6074,7 +5708,8 @@ void MasterService::DiscardExpiredProcessingReplicas(
             if (metadata_it == tenant_state.metadata.end()) {
                 LOG(ERROR) << "Key " << task_it->first
                            << " was removed with ongoing replication task";
-                AbortReplicationTaskQuota(tenant_it->first, task_it->second);
+                AbortTenantQuota(tenant_it->first,
+                                 task_it->second.reserved_quota_charge_bytes);
                 task_it = tenant_state.replication_tasks.erase(task_it);
                 continue;
             }

@@ -189,7 +189,7 @@ YLT_REFL(HttpTenantQuotaSnapshot, tenant_id, requested_quota_bytes,
 HttpTenantQuotaSnapshot ToHttpTenantQuotaSnapshot(
     const TenantQuotaSnapshot& snapshot) {
     return HttpTenantQuotaSnapshot{
-        .tenant_id = snapshot.tenant_id,
+        .tenant_id = snapshot.tenant_id.value(),
         .requested_quota_bytes = snapshot.requested_quota_bytes,
         .effective_quota_bytes = snapshot.effective_quota_bytes,
         .used_bytes = snapshot.used_bytes,
@@ -411,7 +411,7 @@ std::string MasterAdminServer::BuildTenantQuotaMetricsText() const {
     for (const auto& snapshot : snapshots) {
         requested_sum += snapshot.requested_quota_bytes;
         effective_sum += snapshot.effective_quota_bytes;
-        const auto tenant = EscapePrometheusLabel(snapshot.tenant_id);
+        const auto tenant = EscapePrometheusLabel(snapshot.tenant_id.value());
         tenant_metrics << "mooncake_tenant_quota_requested_bytes{tenant_id=\""
                        << tenant << "\"} " << snapshot.requested_quota_bytes
                        << "\n";
