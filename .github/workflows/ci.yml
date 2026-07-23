@@ -359,7 +359,26 @@ jobs:
 
     - name: Install CUDA Toolkit 13.0 (arm64 SBSA)
       run: |
-        wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/sbsa/cuda-keyring_1.1-1_all.deb
+        for source_file in \
+          /etc/apt/sources.list \
+          /etc/apt/sources.list.d/*.list \
+          /etc/apt/sources.list.d/*.sources; do
+          if [[ -f "$source_file" ]]; then
+            sudo sed -i \
+              's|http://ports.ubuntu.com/ubuntu-ports|https://ports.ubuntu.com/ubuntu-ports|g' \
+              "$source_file"
+          fi
+        done
+
+        sudo tee /etc/apt/apt.conf.d/99mooncake-ci-network >/dev/null <<'EOF'
+        Acquire::ForceIPv4 "true";
+        Acquire::Retries "3";
+        Acquire::http::Timeout "30";
+        Acquire::https::Timeout "30";
+        EOF
+
+        wget --inet4-only --tries=3 --timeout=30 \
+          https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/sbsa/cuda-keyring_1.1-1_all.deb
         sudo dpkg -i cuda-keyring_1.1-1_all.deb
         sudo apt-get update
         sudo apt-get install -y cuda-toolkit-13-0
@@ -784,15 +803,37 @@ jobs:
       with:
         persist-credentials: false
 
+    - name: Free up disk space
+      run: |
+        echo "Disk usage before cleanup:"
+        df -h
+        docker system df || true
+
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /opt/hostedtoolcache/CodeQL
+        sudo rm -rf /usr/local/lib/android
+        docker system prune --all --force --volumes
+
+        echo "Disk usage after cleanup:"
+        df -h
+        docker system df || true
+
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v2
 
     - name: Build Docker image
       run: |
-        docker build -f docker/mooncake.Dockerfile \
+        docker build --progress=plain -f docker/mooncake.Dockerfile \
           --build-arg PYTHON_VERSION=3.10 \
           --build-arg EP_TORCH_VERSIONS="2.12.1" \
           -t mooncake:from-source .
+
+    - name: Report final disk usage
+      if: always()
+      run: |
+        df -h
+        docker system df || true
 
   spell-check:
     name: Spell Check with Typos
