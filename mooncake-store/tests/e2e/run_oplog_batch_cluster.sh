@@ -1129,7 +1129,7 @@ promotion_catchup_smoke_cluster() {
     "$client_name" "$removed_key" >&3
   printf 'batch-smoke %s promotion-batch-%s\n' \
     "$client_name" "$CLUSTER_ID" >&3
-  if ! wait_file_count "$log" "Failed to get value: REPLICA_IS_NOT_READY" 1 \
+  if ! wait_file_text "$log" "Get value: keep-value" \
     "$START_TIMEOUT_SEC" ||
     ! wait_file_count "$log" "Failed to get value: OBJECT_NOT_FOUND" 2 \
       "$START_TIMEOUT_SEC" ||
@@ -1164,7 +1164,7 @@ promotion_catchup_smoke_cluster() {
 
   collect_cluster
   down_cluster
-  echo "PASS: promotion catch-up smoke completed; put metadata survived with replica rebuild required; remove did not resurrect; batch smoke passed; killed=master-$leader_index promoted_pid=$promoted_pid before_seq=$durable_before after_seq=$durable_after artifacts: $RUN_DIR"
+  echo "PASS: promotion catch-up smoke completed; put value survived; remove did not resurrect; batch smoke passed; killed=master-$leader_index promoted_pid=$promoted_pid before_seq=$durable_before after_seq=$durable_after artifacts: $RUN_DIR"
 }
 
 ha_failover_smoke_cluster() {
