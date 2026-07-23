@@ -793,6 +793,19 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                 auto remount_result =
                     client_->MountLocalDiskSegment(enable_offloading_);
                 if (remount_result) {
+                    // Report configured SSD capacity so the Master can
+                    // restore file_total_capacity_ (the denominator in
+                    // "SSD Storage: X / Y").  This was lost on restart;
+                    // re-reporting it here avoids the 0 B display.
+                    if (config_.total_size_limit > 0) {
+                        auto cap_result = client_->ReportSsdCapacity(
+                            config_.total_size_limit);
+                        if (!cap_result) {
+                            LOG(WARNING)
+                                << "ReportSsdCapacity failed during "
+                                << "heartbeat recovery: " << cap_result.error();
+                        }
+                    }
                     heartbeat_result = client_->OffloadObjectHeartbeat(
                         enable_offloading_, offloading_objects);
                     if (!heartbeat_result) {
