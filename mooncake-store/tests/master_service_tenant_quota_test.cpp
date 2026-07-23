@@ -200,7 +200,7 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
 
     TenantQuotaSnapshot Snapshot(MasterService& service,
                                  const TenantId& tenant_id) {
-        auto snapshot = service.GetTenantQuotaSnapshotForTesting(tenant_id);
+        auto snapshot = service.GetTenantQuotaSnapshot(tenant_id);
         EXPECT_TRUE(snapshot.has_value());
         return *snapshot;
     }
@@ -282,8 +282,8 @@ TEST_F(MasterServiceTenantQuotaTest,
                     .Remove("shared-key", TenantId("tenant-b"),
                             /*force=*/true)
                     .has_value());
-    EXPECT_FALSE(service.GetTenantQuotaSnapshotForTesting(TenantId("tenant-a"))
-                     .has_value());
+    EXPECT_FALSE(
+        service.GetTenantQuotaSnapshot(TenantId("tenant-a")).has_value());
 }
 
 TEST_F(MasterServiceTenantQuotaTest,
@@ -391,8 +391,8 @@ TEST_F(MasterServiceTenantQuotaTest,
 
     EXPECT_TRUE(service.Remove("cold", TenantId("tenant-b"), /*force=*/true)
                     .has_value());
-    EXPECT_FALSE(service.GetTenantQuotaSnapshotForTesting(TenantId("tenant-b"))
-                     .has_value());
+    EXPECT_FALSE(
+        service.GetTenantQuotaSnapshot(TenantId("tenant-b")).has_value());
 }
 
 TEST_F(MasterServiceTenantQuotaTest,
@@ -528,8 +528,8 @@ TEST_F(MasterServiceTenantQuotaTest,
     ASSERT_FALSE(over.has_value());
     EXPECT_EQ(over.error(), ErrorCode::TENANT_QUOTA_EXCEEDED);
     EXPECT_EQ(Snapshot(service, TenantId("tenant-a")).used_bytes, 80);
-    EXPECT_FALSE(service.GetTenantQuotaSnapshotForTesting(TenantId("tenant-b"))
-                     .has_value());
+    EXPECT_FALSE(
+        service.GetTenantQuotaSnapshot(TenantId("tenant-b")).has_value());
 }
 
 TEST_F(MasterServiceTenantQuotaTest, CopyStartRequiresQuotaForNewReplica) {
@@ -676,8 +676,8 @@ TEST_F(MasterServiceTenantQuotaTest,
     ASSERT_TRUE(delete_result.has_value());
     ASSERT_TRUE(delete_result->has_value()) << toString(delete_result->error());
     EXPECT_FALSE(delete_result->value().has_value());
-    EXPECT_FALSE(service.GetTenantQuotaSnapshotForTesting(TenantId("tenant-a"))
-                     .has_value());
+    EXPECT_FALSE(
+        service.GetTenantQuotaSnapshot(TenantId("tenant-a")).has_value());
 }
 
 TEST_F(MasterServiceTenantQuotaTest,
