@@ -232,7 +232,10 @@ run_single_test(){
     source "$RUN_DIR/.shrc"
     cd "$TONE_TESTS_DIR/scripts"
     source "./$test_name"
-    
+
+    local log_dir="${BASE_DIR}/run/logs/$(basename "$test_name" .sh)"
+    setup_log_directory "$log_dir"
+
     local exit_code=0
     run_test "$@" || exit_code=1
     
@@ -282,6 +285,10 @@ run_all_tests(){
         fi
         
         [ $exit_code -ne 0 ] && all_passed=false
+
+        # Container is shared across cases in run-all; drain leftover GPU
+        # memory before the next case so it does not OOM / get SIGKILLed.
+        drain_gpu_between_tests
     done
     
     cleanup_test_env "double"

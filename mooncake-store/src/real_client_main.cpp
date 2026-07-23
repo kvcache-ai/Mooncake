@@ -145,7 +145,7 @@ int main(int argc, char *argv[]) {
         FLAGS_master_server_address, nullptr,
         "@mooncake_client_" + std::to_string(FLAGS_port) + ".sock", FLAGS_port,
         FLAGS_enable_offload, FLAGS_start_offload_rpc_server, "",
-        FLAGS_tenant_id);
+        FLAGS_tenant_id, FLAGS_enable_http_server, FLAGS_http_port);
     if (!res) {
         LOG(FATAL) << "Failed to setup client: " << toString(res.error());
         return -1;

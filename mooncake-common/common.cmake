@@ -207,6 +207,15 @@ if(USE_CUDA)
 endif()
 
 if(USE_TPU)
+  # Every TPU source file lives under mooncake-transfer-engine/tent, which is
+  # only added when USE_TENT is ON. Without this guard -DUSE_TPU=ON configures
+  # and builds cleanly while compiling no TPU code at all.
+  if(NOT USE_TENT)
+    message(
+      FATAL_ERROR
+        "USE_TPU=ON requires USE_TENT=ON: all TPU support lives in TENT. Re-run cmake with -DUSE_TENT=ON."
+    )
+  endif()
   add_compile_definitions(USE_TPU)
   message(STATUS "TPU (PJRT) staging support is enabled")
 endif()

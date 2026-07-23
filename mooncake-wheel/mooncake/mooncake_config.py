@@ -59,6 +59,7 @@ export MOONCAKE_DEVICE="mlx5_0"
 export MOONCAKE_PROTOCOL="rdma"
 export MOONCAKE_DEVICE="auto-discovery"
 """
+
 import json
 import logging
 import os
@@ -72,13 +73,13 @@ DEFAULT_LOCAL_BUFFER_SIZE = 1073741824  # 1.0 GiB
 
 _SIZE_SUFFIXES = [
     ("kb", 1024),
-    ("mb", 1024 ** 2),
-    ("gb", 1024 ** 3),
-    ("tb", 1024 ** 4),
+    ("mb", 1024**2),
+    ("gb", 1024**3),
+    ("tb", 1024**4),
     ("k", 1024),
-    ("m", 1024 ** 2),
-    ("g", 1024 ** 3),
-    ("t", 1024 ** 4),
+    ("m", 1024**2),
+    ("g", 1024**3),
+    ("t", 1024**4),
     ("b", 1),
 ]
 
@@ -91,25 +92,27 @@ _SIZE_SUFFIXES = [
 # canonicalised to lowercase below and an unrecognised value only warns.
 # Union of Transfer Engine transports and Store-only modes. Keep in sync with
 # the protocol list documented in the module docstring above.
-_KNOWN_PROTOCOLS = frozenset({
-    # Transfer Engine transports (mooncake-transfer-engine installTransport)
-    "tcp",
-    "rdma",
-    "efa",
-    "nvmeof",
-    "nvlink",
-    "nvlink_intra",
-    "hip",
-    "barex",
-    "cxl",
-    "ascend",
-    "ub",
-    "ubshmem",
-    "maca",
-    "sunrise_link",
-    # Store-only mode (mooncake-store client_service.cpp: no transfer engine)
-    "rpc_only",
-})
+_KNOWN_PROTOCOLS = frozenset(
+    {
+        # Transfer Engine transports (mooncake-transfer-engine installTransport)
+        "tcp",
+        "rdma",
+        "efa",
+        "nvmeof",
+        "nvlink",
+        "nvlink_intra",
+        "hip",
+        "barex",
+        "cxl",
+        "ascend",
+        "ub",
+        "ubshmem",
+        "maca",
+        "sunrise_link",
+        # Store-only mode (mooncake-store client_service.cpp: no transfer engine)
+        "rpc_only",
+    }
+)
 
 # Required fields that must be present AND non-empty.
 _REQUIRED_NON_EMPTY_FIELDS = (
@@ -156,9 +159,9 @@ def _parse_bool(value) -> bool:
     s = str(value).strip().lower()
     if not s:
         return False
-    if s in ("true", "1", "yes", "on"):
+    if s in ("true", "1", "yes", "on", "enable"):
         return True
-    if s in ("false", "0", "no", "off"):
+    if s in ("false", "0", "no", "off", "disable"):
         return False
     raise ValueError(f"Invalid boolean value: {value!r}")
 
@@ -193,6 +196,10 @@ class MooncakeConfig:
         TLS can also be configured via environment variables:
           MC_ETCD_CA_FILE, MC_ETCD_CERT_FILE, MC_ETCD_KEY_FILE
         tenant_id (str): Tenant identifier. Default is "default".
+        enable_client_http_server (bool): Enable the client HTTP health/metrics
+            endpoints. Default is False.
+        client_http_port (int): Port for the client HTTP endpoints.
+            Defaults to 9300.
 
     Example of configuration file:
         {
@@ -205,9 +212,11 @@ class MooncakeConfig:
             "master_server_address": "localhost:8081",
             "enable_ssd_offload": true,
             "ssd_offload_path": "/nvme/mooncake_offload",
-            "tenant_id": "default"
+            "tenant_id": "default",
+            "enable_client_http_server": false,
+            "client_http_port": 9300
         }
-        
+
         For RDMA:
         {
             "local_hostname": "node1",
@@ -219,7 +228,9 @@ class MooncakeConfig:
             "master_server_address": "master:8081",
             "enable_ssd_offload": true,
             "ssd_offload_path": "/nvme/mooncake_offload",
-            "tenant_id": "default"
+            "tenant_id": "default",
+            "enable_client_http_server": false,
+            "client_http_port": 9300
         }
 
         With etcd TLS:
@@ -236,6 +247,7 @@ class MooncakeConfig:
             "etcd_key_file": "/etc/etcd/client-key.pem"
         }
     """
+
     local_hostname: str
     metadata_server: str
     global_segment_size: int
@@ -249,6 +261,8 @@ class MooncakeConfig:
     etcd_cert_file: str = ""
     etcd_key_file: str = ""
     tenant_id: str = "default"
+    enable_client_http_server: bool = False
+    client_http_port: int = 9300
 
     def __post_init__(self):
         """Validate and normalise configuration invariants.
@@ -301,7 +315,7 @@ class MooncakeConfig:
                 )
 
     @staticmethod
-    def from_file(file_path: str) -> 'MooncakeConfig':
+    def from_file(file_path: str) -> "MooncakeConfig":
         """Load the config from a JSON file."""
         with open(file_path) as fin:
             config = json.load(fin)
@@ -327,30 +341,41 @@ class MooncakeConfig:
             device_name=config.get("device_name", ""),
             master_server_address=config.get("master_server_address"),
             enable_ssd_offload=_parse_bool(config.get("enable_ssd_offload", False)),
-            ssd_offload_path=str(config.get("ssd_offload_path", "")),
-            etcd_ca_file=str(config.get("etcd_ca_file", "")),
-            etcd_cert_file=str(config.get("etcd_cert_file", "")),
-            etcd_key_file=str(config.get("etcd_key_file", "")),
+            ssd_offload_path=config.get("ssd_offload_path", ""),
+            etcd_ca_file=config.get("etcd_ca_file", ""),
+            etcd_cert_file=config.get("etcd_cert_file", ""),
+            etcd_key_file=config.get("etcd_key_file", ""),
+
             tenant_id=str(tenant_id) if tenant_id is not None else "default",
+            enable_client_http_server=_parse_bool(
+                config.get("enable_client_http_server", False)
+            ),
+            client_http_port=int(config.get("client_http_port", 9300)),
         )
 
     @staticmethod
-    def load_from_env() -> 'MooncakeConfig':
+    def load_from_env() -> "MooncakeConfig":
         """Load config from a file specified in the environment variable.
         export MOONCAKE_MASTER=10.13.3.232:50051
         export MOONCAKE_PROTOCOL="rdma"
         export MOONCAKE_DEVICE=""
         export MOONCAKE_TE_META_DATA_SERVER="P2PHANDSHAKE"
         """
-        config_file_path = os.getenv('MOONCAKE_CONFIG_PATH')
+        config_file_path = os.getenv("MOONCAKE_CONFIG_PATH")
         if config_file_path is None:
             if not os.getenv("MOONCAKE_MASTER"):
-                raise ValueError("Neither the environment variable 'MOONCAKE_CONFIG_PATH' nor 'MOONCAKE_MASTER' is set.")
+                raise ValueError(
+                    "Neither the environment variable 'MOONCAKE_CONFIG_PATH' nor 'MOONCAKE_MASTER' is set."
+                )
             return MooncakeConfig(
                 local_hostname=os.getenv("MOONCAKE_LOCAL_HOSTNAME", "localhost"),
-                metadata_server=os.getenv("MOONCAKE_TE_META_DATA_SERVER", "P2PHANDSHAKE"),
+                metadata_server=os.getenv(
+                    "MOONCAKE_TE_META_DATA_SERVER", "P2PHANDSHAKE"
+                ),
                 global_segment_size=_parse_segment_size(
-                    os.getenv("MOONCAKE_GLOBAL_SEGMENT_SIZE", DEFAULT_GLOBAL_SEGMENT_SIZE)
+                    os.getenv(
+                        "MOONCAKE_GLOBAL_SEGMENT_SIZE", DEFAULT_GLOBAL_SEGMENT_SIZE
+                    )
                 ),
                 local_buffer_size=_parse_segment_size(
                     os.getenv("MOONCAKE_LOCAL_BUFFER_SIZE", DEFAULT_LOCAL_BUFFER_SIZE)
@@ -358,11 +383,17 @@ class MooncakeConfig:
                 protocol=os.getenv("MOONCAKE_PROTOCOL", "tcp"),
                 device_name=os.getenv("MOONCAKE_DEVICE", ""),
                 master_server_address=os.getenv("MOONCAKE_MASTER"),
-                enable_ssd_offload=_parse_bool(os.getenv("MOONCAKE_OFFLOAD_ENABLED", "false")),
+                enable_ssd_offload=_parse_bool(
+                    os.getenv("MOONCAKE_OFFLOAD_ENABLED", "false")
+                ),
                 ssd_offload_path=os.getenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", ""),
                 etcd_ca_file=os.getenv("MC_ETCD_CA_FILE", ""),
                 etcd_cert_file=os.getenv("MC_ETCD_CERT_FILE", ""),
                 etcd_key_file=os.getenv("MC_ETCD_KEY_FILE", ""),
                 tenant_id=os.getenv("MOONCAKE_TENANT_ID", "default"),
+                enable_client_http_server=_parse_bool(
+                    os.getenv("MOONCAKE_ENABLE_CLIENT_HTTP_SERVER", "false")
+                ),
+                client_http_port=int(os.getenv("MOONCAKE_CLIENT_HTTP_PORT", 9300)),
             )
         return MooncakeConfig.from_file(config_file_path)
