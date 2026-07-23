@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 
+#include "tenant_id.h"
+
 #include <ylt/util/tl/expected.hpp>
 
 namespace mooncake {
@@ -34,7 +36,7 @@ struct TenantQuotaSnapshot {
 };
 
 struct TenantQuotaAssignment {
-    std::string tenant_id;
+    TenantId tenant_id;
     uint64_t effective_quota_bytes = 0;
 };
 
@@ -47,7 +49,7 @@ enum class TenantQuotaError {
 using TenantQuotaResult = tl::expected<void, TenantQuotaError>;
 
 std::vector<TenantQuotaAssignment> BuildEffectiveQuotaAssignments(
-    const std::map<std::string, TenantQuotaState>& tenants,
+    const std::map<TenantId, TenantQuotaState>& tenants,
     uint64_t allocatable_capacity_bytes);
 
 class TenantQuotaTable {
@@ -69,12 +71,12 @@ class TenantQuotaTable {
     TenantQuotaResult ReleasePartial(std::string tenant_id, uint64_t bytes);
 
    private:
-    TenantQuotaState& GetOrCreateState(const std::string& tenant_id);
-    TenantQuotaSnapshot MakeSnapshot(const std::string& tenant_id,
+    TenantQuotaState& GetOrCreateState(const TenantId& tenant_id);
+    TenantQuotaSnapshot MakeSnapshot(const TenantId& tenant_id,
                                      const TenantQuotaState& state) const;
     void RefreshOverQuota(TenantQuotaState* state) const;
 
-    std::map<std::string, TenantQuotaState> tenants_;
+    std::map<TenantId, TenantQuotaState> tenants_;
 };
 
 }  // namespace mooncake

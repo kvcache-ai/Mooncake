@@ -789,7 +789,7 @@ For detailed guidance on monitoring master metrics, Prometheus endpoints, and he
 
 ## Mooncake Store Python API
 
-**Complete Python API Documentation**: [https://kvcache-ai.github.io/Mooncake/python-api-reference/mooncake-store.html](https://kvcache-ai.github.io/Mooncake/python-api-reference/mooncake-store.html)
+**Complete Python API Documentation**: [https://kvcache-ai.github.io/Mooncake/api-reference/python/mooncake-store.html](https://kvcache-ai.github.io/Mooncake/api-reference/python/mooncake-store.html)
 
 ## Version Management Policy
 

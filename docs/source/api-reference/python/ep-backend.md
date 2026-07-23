@@ -17,8 +17,8 @@ The usual integration pattern is to initialize a Mooncake process group first,
 then construct a Mooncake EP `Buffer` from that group. The process group is used
 both for regular collectives and for exchanging EP bootstrap metadata.
 
-For implementation details, see the [Mooncake Backend (PG) design guide](../design/mooncake-backend-pg.md)
-and the [Mooncake EP design guide](../design/mooncake-ep.md).
+For implementation details, see the [Mooncake Backend (PG) design guide](../../design/mooncake-backend-pg.md)
+and the [Mooncake EP design guide](../../design/mooncake-ep.md).
 
 ## Installation and build notes
 
@@ -422,5 +422,5 @@ shape consistent with the process group world size or reserved `max_world_size`.
 - EP correctness and failure simulation: `mooncake-ep/tests/test_ep_grid.py`
 - Wheel-level EP example: `mooncake-wheel/tests/test_mooncake_ep.py`
 
-See [PG/EP troubleshooting](../troubleshooting/pg-ep-troubleshooting.md) for
+See [PG/EP troubleshooting](../../troubleshooting/pg-ep-troubleshooting.md) for
 common setup and runtime issues.

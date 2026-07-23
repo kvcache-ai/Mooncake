@@ -28,8 +28,8 @@ For a complete deployment guide with step-by-step instructions, see:
 :::{toctree}
 :maxdepth: 1
 
-../examples/vllm-integration/vllmv1-lmcache-integration
-../examples/vllm-integration/vllmv1-lmcache-mp-integration
+vllmv1-lmcache-integration
+vllmv1-lmcache-mp-integration
 :::
 
 ## Performance Benchmarking and Results

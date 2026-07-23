@@ -11,7 +11,7 @@ namespace mooncake {
 namespace {
 
 struct RemainderShare {
-    std::string tenant_id;
+    TenantId tenant_id;
     uint64_t base = 0;
     unsigned __int128 remainder = 0;
 };
@@ -30,20 +30,21 @@ bool IsLazyEmptyTenant(const TenantQuotaState& state) {
 }
 
 TenantQuotaResult AccountingMismatch(const char* operation,
-                                     const std::string& tenant_id,
+                                     const TenantId& tenant_id,
                                      uint64_t requested, uint64_t available) {
-    LOG(WARNING) << operation << " accounting mismatch for tenant " << tenant_id
-                 << ": requested=" << requested << ", available=" << available;
+    LOG(WARNING) << operation << " accounting mismatch for tenant "
+                 << tenant_id.value() << ": requested=" << requested
+                 << ", available=" << available;
     return tl::make_unexpected(TenantQuotaError::kAccountingMismatch);
 }
 
 }  // namespace
 
 std::vector<TenantQuotaAssignment> BuildEffectiveQuotaAssignments(
-    const std::map<std::string, TenantQuotaState>& tenants,
+    const std::map<TenantId, TenantQuotaState>& tenants,
     uint64_t allocatable_capacity_bytes) {
     unsigned __int128 explicit_requested_sum = 0;
-    std::vector<std::string> explicit_tenants;
+    std::vector<TenantId> explicit_tenants;
 
     for (const auto& [tenant_id, state] : tenants) {
         if (state.has_explicit_policy) {
@@ -52,12 +53,12 @@ std::vector<TenantQuotaAssignment> BuildEffectiveQuotaAssignments(
         }
     }
 
-    std::map<std::string, uint64_t> assigned;
+    std::map<TenantId, uint64_t> assigned;
     for (const auto& [tenant_id, _] : tenants) {
         assigned[tenant_id] = 0;
     }
 
-    auto distribute = [&](const std::vector<std::string>& tenant_ids,
+    auto distribute = [&](const std::vector<TenantId>& tenant_ids,
                           uint64_t capacity, unsigned __int128 denominator,
                           bool proportional_to_requested) {
         if (tenant_ids.empty() || capacity == 0 || denominator == 0) {
@@ -122,7 +123,7 @@ TenantQuotaResult TenantQuotaTable::UpsertTenantPolicy(
         return tl::make_unexpected(TenantQuotaError::kInvalidArgument);
     }
 
-    auto normalized_tenant_id = NormalizeTenantId(std::move(tenant_id));
+    const TenantId normalized_tenant_id(std::move(tenant_id));
     auto& state = GetOrCreateState(normalized_tenant_id);
     state.requested_quota_bytes = requested_quota_bytes;
     state.has_explicit_policy = true;
@@ -130,7 +131,7 @@ TenantQuotaResult TenantQuotaTable::UpsertTenantPolicy(
 }
 
 void TenantQuotaTable::EraseTenantPolicy(std::string tenant_id) {
-    auto normalized_tenant_id = NormalizeTenantId(std::move(tenant_id));
+    const TenantId normalized_tenant_id(std::move(tenant_id));
     auto it = tenants_.find(normalized_tenant_id);
     if (it == tenants_.end()) {
         return;
@@ -160,7 +161,7 @@ void TenantQuotaTable::RecomputeEffectiveQuotas(
 
 std::optional<TenantQuotaSnapshot> TenantQuotaTable::GetTenantSnapshot(
     std::string tenant_id) const {
-    auto normalized_tenant_id = NormalizeTenantId(std::move(tenant_id));
+    const TenantId normalized_tenant_id(std::move(tenant_id));
     auto it = tenants_.find(normalized_tenant_id);
     if (it == tenants_.end()) {
         return std::nullopt;
@@ -181,7 +182,7 @@ std::vector<TenantQuotaSnapshot> TenantQuotaTable::ListTenantSnapshots() const {
 
 TenantQuotaResult TenantQuotaTable::Reserve(std::string tenant_id,
                                             uint64_t bytes) {
-    auto normalized_tenant_id = NormalizeTenantId(std::move(tenant_id));
+    const TenantId normalized_tenant_id(std::move(tenant_id));
     if (bytes == 0) {
         GetOrCreateState(normalized_tenant_id);
         return {};
@@ -209,7 +210,7 @@ TenantQuotaResult TenantQuotaTable::Reserve(std::string tenant_id,
 
 TenantQuotaResult TenantQuotaTable::Commit(std::string tenant_id,
                                            uint64_t bytes) {
-    auto normalized_tenant_id = NormalizeTenantId(std::move(tenant_id));
+    const TenantId normalized_tenant_id(std::move(tenant_id));
     auto& state = GetOrCreateState(normalized_tenant_id);
     if (bytes == 0) {
         return {};
@@ -229,7 +230,7 @@ TenantQuotaResult TenantQuotaTable::Commit(std::string tenant_id,
 
 TenantQuotaResult TenantQuotaTable::Abort(std::string tenant_id,
                                           uint64_t bytes) {
-    auto normalized_tenant_id = NormalizeTenantId(std::move(tenant_id));
+    const TenantId normalized_tenant_id(std::move(tenant_id));
     auto& state = GetOrCreateState(normalized_tenant_id);
     if (bytes == 0) {
         return {};
@@ -247,7 +248,7 @@ TenantQuotaResult TenantQuotaTable::Abort(std::string tenant_id,
 
 TenantQuotaResult TenantQuotaTable::Release(std::string tenant_id,
                                             uint64_t bytes) {
-    auto normalized_tenant_id = NormalizeTenantId(std::move(tenant_id));
+    const TenantId normalized_tenant_id(std::move(tenant_id));
     auto& state = GetOrCreateState(normalized_tenant_id);
     if (bytes == 0) {
         return {};
@@ -263,7 +264,7 @@ TenantQuotaResult TenantQuotaTable::Release(std::string tenant_id,
         --state.committed_count;
     } else {
         LOG(WARNING) << "Release found zero committed_count for tenant "
-                     << normalized_tenant_id;
+                     << normalized_tenant_id.value();
     }
     RefreshOverQuota(&state);
     return {};
@@ -271,7 +272,7 @@ TenantQuotaResult TenantQuotaTable::Release(std::string tenant_id,
 
 TenantQuotaResult TenantQuotaTable::ReleasePartial(std::string tenant_id,
                                                    uint64_t bytes) {
-    auto normalized_tenant_id = NormalizeTenantId(std::move(tenant_id));
+    const TenantId normalized_tenant_id(std::move(tenant_id));
     auto& state = GetOrCreateState(normalized_tenant_id);
     if (bytes == 0) {
         return {};
@@ -289,7 +290,7 @@ TenantQuotaResult TenantQuotaTable::ReleasePartial(std::string tenant_id,
 }
 
 TenantQuotaState& TenantQuotaTable::GetOrCreateState(
-    const std::string& tenant_id) {
+    const TenantId& tenant_id) {
     auto [it, inserted] = tenants_.try_emplace(tenant_id);
     if (inserted) {
         it->second.requested_quota_bytes = 0;
@@ -299,9 +300,9 @@ TenantQuotaState& TenantQuotaTable::GetOrCreateState(
 }
 
 TenantQuotaSnapshot TenantQuotaTable::MakeSnapshot(
-    const std::string& tenant_id, const TenantQuotaState& state) const {
+    const TenantId& tenant_id, const TenantQuotaState& state) const {
     return TenantQuotaSnapshot{
-        .tenant_id = tenant_id,
+        .tenant_id = tenant_id.value(),
         .requested_quota_bytes = state.requested_quota_bytes,
         .effective_quota_bytes = state.effective_quota_bytes,
         .used_bytes = state.used_bytes,

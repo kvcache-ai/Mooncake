@@ -1081,6 +1081,16 @@ def setup(
 - `ssd_offload_path` (str): SSD offload directory. When provided, overrides the storage path environment configuration.
 - `tenant_id` (str): Tenant namespace for object keys. Defaults to `"default"`.
 
+**Store segment pinned memory:** CUDA-enabled builds can register Store-managed
+host segments as pinned memory when `MC_STORE_PIN_MEMORY_MAX_BYTES` is set to a
+positive process-wide quota; unset, empty, `0`, or invalid values disable it.
+The scope is limited to host Store segments allocated by `setup()`
+(`global_segment_size`) and `allocateAndMountSegment()`; it excludes file-backed
+`mountSegment()` mappings, CXL/device segments, `local_buffer_size`, user
+buffers, dummy-client shared memory, and temporary staging buffers. If the quota
+is exhausted or CUDA registration fails, Mooncake continues with pageable Store
+segment memory.
+
 **Returns:**
 - `int`: Status code (0 = success, non-zero = error code)
 
@@ -2939,7 +2949,7 @@ For methods that return data (`get`, `get_batch`, `get_buffer`, `get_tensor`):
 - Return the requested data on success
 - Return empty/None on failure or key not found
 
-📋 **Complete Error Codes Reference**: See [Error Code Explanation](../troubleshooting/error-code.md) for detailed descriptions of all error codes and their meanings.
+📋 **Complete Error Codes Reference**: See [Error Code Explanation](../../troubleshooting/error-code.md) for detailed descriptions of all error codes and their meanings.
 
 ---
 

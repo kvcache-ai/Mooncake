@@ -17,7 +17,7 @@ jobs:
       build-with-ep: '0'
       variant-flag: NON_CUDA_BUILD
       cmake-args: >-
-        -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=OFF -DWITH_EP=OFF
+        -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=OFF -DWITH_EP=OFF
         -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
       artifact-prefix: mooncake-wheel-non-cuda
 

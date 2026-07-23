@@ -134,6 +134,9 @@ jobs:
           cmake "${gen[@]}" .. $CMAKE_ARGS "${ep[@]}" -DPython3_EXECUTABLE="$(which python3)"
 
       - name: Build project
+        env:
+          # Bound the nested Ninja build used by torch.utils.cpp_extension.
+          MAX_JOBS: "2"
         run: |
           for dir in /usr/local/cuda/lib64/stubs /usr/local/cuda/targets/*/lib/stubs; do
             [ -d "$dir" ] && export LIBRARY_PATH="$dir:${LIBRARY_PATH:-}"

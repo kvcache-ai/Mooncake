@@ -171,7 +171,7 @@ RdmaContext::RdmaContext(RdmaTransport &engine, const std::string &device_name)
     static std::once_flag g_once_flag;
     auto fork_init = []() {
         int ret = ibv_fork_init();
-        if (ret) PLOG(ERROR) << "RDMA context setup failed: fork compatibility";
+        if (ret) LOG(ERROR) << "RDMA context setup failed: fork compatibility: " << strerror(ret);
     };
     std::call_once(g_once_flag, fork_init);
 }
@@ -335,7 +335,7 @@ int RdmaContext::deconstruct() {
     for (auto &[_, entry] : memory_region_map_) {
         int ret = ibv_dereg_mr(entry.mr);
         if (ret) {
-            PLOG(ERROR) << "Failed to unregister memory region";
+            LOG(ERROR) << "Failed to unregister memory region: " << strerror(ret);
         }
     }
     memory_region_map_.clear();
@@ -345,7 +345,7 @@ int RdmaContext::deconstruct() {
 
         int ret = ibv_destroy_cq(cq_list_[i].native);
         if (ret) {
-            PLOG(ERROR) << "Failed to destroy completion queue";
+            LOG(ERROR) << "Failed to destroy completion queue: " << strerror(ret);
         }
     }
     cq_list_.clear();
@@ -357,22 +357,26 @@ int RdmaContext::deconstruct() {
 
     if (comp_channel_) {
         for (size_t i = 0; i < num_comp_channel_; ++i)
-            if (comp_channel_[i])
-                if (ibv_destroy_comp_channel(comp_channel_[i]))
-                    LOG(ERROR) << "Failed to destroy completion channel";
+            if (comp_channel_[i]) {
+                int ret = ibv_destroy_comp_channel(comp_channel_[i]);
+                if (ret)
+                    LOG(ERROR) << "Failed to destroy completion channel: " << strerror(ret);
+            }
         delete[] comp_channel_;
         comp_channel_ = nullptr;
     }
 
     if (pd_) {
-        if (ibv_dealloc_pd(pd_))
-            PLOG(ERROR) << "Failed to deallocate protection domain";
+        int ret = ibv_dealloc_pd(pd_);
+        if (ret)
+            LOG(ERROR) << "Failed to deallocate protection domain: " << strerror(ret);
         pd_ = nullptr;
     }
 
     if (context_) {
-        if (ibv_close_device(context_))
-            PLOG(ERROR) << "Failed to close device context";
+        int ret = ibv_close_device(context_);
+        if (ret)
+            LOG(ERROR) << "Failed to close device context: " << strerror(ret);
         context_ = nullptr;
     }
 
@@ -953,9 +957,10 @@ bool RdmaContext::reprobeAutoGid(
     }
 
     ibv_port_attr port_attr;
-    if (ibv_query_port(current_context, current_port, &port_attr)) {
-        PLOG(WARNING) << "Failed to reprobe port attributes on " << device_name_
-                      << "/" << static_cast<int>(current_port);
+    int ret = ibv_query_port(current_context, current_port, &port_attr);
+    if (ret) {
+        LOG(WARNING) << "Failed to reprobe port attributes on " << device_name_
+                     << "/" << static_cast<int>(current_port) << ": " << strerror(ret);
         return false;
     }
 
@@ -1067,10 +1072,11 @@ GidRefreshResult RdmaContext::refreshCurrentGid(std::string *previous_gid,
 
     if (auto_gid_selection_enabled) {
         ibv_port_attr port_attr;
-        if (ibv_query_port(current_context, current_port, &port_attr)) {
-            PLOG(WARNING) << "Failed to refresh port attributes on "
-                          << device_name_ << "/"
-                          << static_cast<int>(current_port);
+        int ret = ibv_query_port(current_context, current_port, &port_attr);
+        if (ret) {
+            LOG(WARNING) << "Failed to refresh port attributes on "
+                         << device_name_ << "/"
+                         << static_cast<int>(current_port) << ": " << strerror(ret);
             return GidRefreshResult::FAILED;
         }
 
@@ -1184,10 +1190,11 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         ibv_port_attr attr;
         int ret = ibv_query_port(context, port, &attr);
         if (ret) {
-            PLOG(ERROR) << "Failed to query port " << port << " on "
-                        << device_name;
-            if (ibv_close_device(context)) {
-                PLOG(ERROR) << "ibv_close_device(" << device_name << ") failed";
+            LOG(ERROR) << "Failed to query port " << port << " on "
+                       << device_name << ": " << strerror(ret);
+            int close_ret = ibv_close_device(context);
+            if (close_ret) {
+                LOG(ERROR) << "ibv_close_device(" << device_name << ") failed: " << strerror(close_ret);
             }
             ibv_free_device_list(devices);
             return ERR_CONTEXT;
@@ -1195,8 +1202,9 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
 
         if (attr.state != IBV_PORT_ACTIVE) {
             LOG(WARNING) << "Device " << device_name << " port not active";
-            if (ibv_close_device(context)) {
-                PLOG(ERROR) << "ibv_close_device(" << device_name << ") failed";
+            int close_ret = ibv_close_device(context);
+            if (close_ret) {
+                LOG(ERROR) << "ibv_close_device(" << device_name << ") failed: " << strerror(close_ret);
             }
             ibv_free_device_list(devices);
             return ERR_CONTEXT;
@@ -1205,9 +1213,10 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         ibv_device_attr device_attr;
         ret = ibv_query_device(context, &device_attr);
         if (ret) {
-            PLOG(WARNING) << "Failed to query attributes on " << device_name;
-            if (ibv_close_device(context)) {
-                PLOG(ERROR) << "ibv_close_device(" << device_name << ") failed";
+            LOG(WARNING) << "Failed to query attributes on " << device_name << ": " << strerror(ret);
+            int close_ret = ibv_close_device(context);
+            if (close_ret) {
+                LOG(ERROR) << "ibv_close_device(" << device_name << ") failed: " << strerror(close_ret);
             }
             ibv_free_device_list(devices);
             return ERR_CONTEXT;
@@ -1304,10 +1313,11 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         ibv_port_attr port_attr;
         ret = ibv_query_port(context, port, &port_attr);
         if (ret) {
-            PLOG(WARNING) << "Failed to query port attributes on "
-                          << device_name << "/" << port;
-            if (ibv_close_device(context)) {
-                PLOG(ERROR) << "ibv_close_device(" << device_name << ") failed";
+            LOG(WARNING) << "Failed to query port attributes on "
+                         << device_name << "/" << port << ": " << strerror(ret);
+            int close_ret = ibv_close_device(context);
+            if (close_ret) {
+                LOG(ERROR) << "ibv_close_device(" << device_name << ") failed: " << strerror(close_ret);
             }
             ibv_free_device_list(devices);
             return ERR_CONTEXT;
@@ -1348,8 +1358,8 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         // Continue with GID validation
         ret = ibv_query_gid(context, port, gid_index, &gid_);
         if (ret) {
-            PLOG(ERROR) << "Failed to query GID " << gid_index << " on "
-                        << device_name << "/" << port;
+            LOG(ERROR) << "Failed to query GID " << gid_index << " on "
+                       << device_name << "/" << port << ": " << strerror(ret);
             goto cleanup_context_and_devices;
         }
 
@@ -1377,8 +1387,11 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         return 0;
 
     cleanup_context_and_devices:
-        if (ibv_close_device(context)) {
-            PLOG(ERROR) << "ibv_close_device(" << device_name << ") failed";
+        {
+            int close_ret = ibv_close_device(context);
+            if (close_ret) {
+                LOG(ERROR) << "ibv_close_device(" << device_name << ") failed: " << strerror(close_ret);
+            }
         }
         ibv_free_device_list(devices);
         return ERR_CONTEXT;
