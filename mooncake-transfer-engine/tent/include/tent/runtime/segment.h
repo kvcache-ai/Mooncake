@@ -178,6 +178,15 @@ struct SegmentDesc {
     // of `name`.
     std::string rdma_server_name;
 
+    // Process-lifetime identity and optional control-plane capabilities.
+    // These fields are deliberately independent from RDMA bootstrap: a TENT
+    // process can serve receiver credits for non-RDMA plans as well.  Older
+    // peers ignore the extra JSON fields, while newer peers treat an absent
+    // capability list as unsupported rather than as unlimited capacity.
+    uint64_t peer_session_high{0};
+    uint64_t peer_session_low{0};
+    std::vector<uint16_t> receiver_credit_versions;
+
    public:
     BufferDesc* findBuffer(uint64_t base, uint64_t length);
     DeviceDesc* findDevice(const std::string& name);
@@ -201,6 +210,13 @@ inline void to_json(json& j, const SegmentDesc& s) {
     if (!s.rdma_server_name.empty()) {
         j["rdma_server_name"] = s.rdma_server_name;
     }
+    if (s.peer_session_high != 0 || s.peer_session_low != 0) {
+        j["peer_session_high"] = s.peer_session_high;
+        j["peer_session_low"] = s.peer_session_low;
+    }
+    if (!s.receiver_credit_versions.empty()) {
+        j["receiver_credit_versions"] = s.receiver_credit_versions;
+    }
     if (s.type == SegmentType::Memory) {
         j["detail"] = std::get<MemorySegmentDesc>(s.detail);
     } else {
@@ -215,6 +231,15 @@ inline void from_json(const json& j, SegmentDesc& s) {
     j.at("rpc_server_addr").get_to(s.rpc_server_addr);
     if (j.contains("rdma_server_name")) {
         j.at("rdma_server_name").get_to(s.rdma_server_name);
+    }
+    if (j.contains("peer_session_high")) {
+        j.at("peer_session_high").get_to(s.peer_session_high);
+    }
+    if (j.contains("peer_session_low")) {
+        j.at("peer_session_low").get_to(s.peer_session_low);
+    }
+    if (j.contains("receiver_credit_versions")) {
+        j.at("receiver_credit_versions").get_to(s.receiver_credit_versions);
     }
     if (s.type == SegmentType::Memory) {
         s.detail = j.at("detail").get<MemorySegmentDesc>();

@@ -340,6 +340,18 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
     return picked;
 }
 
+Status LocalTransferAdmissionQueue::deferDispatch(QueueOwnerId owner_id) {
+    auto owner_it = owners_.find(owner_id);
+    if (owner_it == owners_.end())
+        return Status::InvalidEntry("queue owner not found" LOC_MARK);
+    if (owner_it->second.state != QueueState::Dispatching)
+        return Status::InvalidEntry(
+            "only dispatching owner can be deferred" LOC_MARK);
+    owner_it->second.state = QueueState::Queued;
+    fifo_.push_front(owner_id);
+    return Status::OK();
+}
+
 Status LocalTransferAdmissionQueue::complete(
     QueueOwnerId owner_id, TransferStatusEnum terminal_status) {
     if (owner_id == 0) {

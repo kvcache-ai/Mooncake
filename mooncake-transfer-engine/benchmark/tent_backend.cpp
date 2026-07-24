@@ -53,6 +53,53 @@ std::shared_ptr<Config> loadConfig() {
     config->set("rpc_server_port", XferBenchConfig::rpc_server_port);
     config->set("transports/rdma/deadline_bw_arbitration",
                 XferBenchConfig::deadline_bw_arbitration);
+    config->set("enable_runtime_queue", XferBenchConfig::enable_runtime_queue);
+    if (XferBenchConfig::enable_runtime_queue) {
+        config->set("runtime_queue/max_dispatch_owners",
+                    XferBenchConfig::runtime_queue_max_dispatch_owners);
+    }
+    if (XferBenchConfig::receiver_credit_mode != "disabled") {
+        config->set("receiver_credit/mode",
+                    XferBenchConfig::receiver_credit_mode);
+        config->set("receiver_credit/capacity/data_bytes",
+                    XferBenchConfig::receiver_credit_capacity_bytes);
+        config->set("receiver_credit/capacity/request_slots",
+                    XferBenchConfig::receiver_credit_capacity_slots);
+        config->set("receiver_credit/grant_batch/data_bytes",
+                    XferBenchConfig::receiver_credit_grant_bytes);
+        config->set("receiver_credit/grant_batch/request_slots",
+                    XferBenchConfig::receiver_credit_grant_slots);
+        config->set("receiver_credit/control/freshness_ttl_ms", 60000U);
+        config->set("receiver_credit/control/retry_after_us", 100U);
+        config->set("receiver_credit/control/poll_interval_us", 100U);
+        config->set("receiver_credit/control/adaptive_dispatch/min_owners",
+                    XferBenchConfig::receiver_credit_adaptive_min_owners);
+        config->set("receiver_credit/control/adaptive_dispatch/initial_owners",
+                    XferBenchConfig::receiver_credit_adaptive_initial_owners);
+        config->set("receiver_credit/control/adaptive_dispatch/max_owners",
+                    XferBenchConfig::receiver_credit_adaptive_max_owners);
+        config->set("receiver_credit/control/adaptive_dispatch/slow_rtt_us",
+                    XferBenchConfig::receiver_credit_adaptive_slow_rtt_us);
+        config->set(
+            "receiver_credit/control/adaptive_dispatch/healthy_pulls_per_"
+            "increase",
+            XferBenchConfig::receiver_credit_adaptive_healthy_pulls);
+        config->set("receiver_credit/limits/max_peers", size_t{4096});
+    }
+    if (!XferBenchConfig::tent_rdma_devices.empty()) {
+        std::vector<std::string> devices;
+        std::stringstream input(XferBenchConfig::tent_rdma_devices);
+        for (std::string device; std::getline(input, device, ',');) {
+            if (!device.empty()) devices.push_back(std::move(device));
+        }
+        if (!devices.empty()) {
+            json rule = {{"name", "tebench_rdma_devices"},
+                         {"segment_type", "memory"},
+                         {"devices", std::move(devices)},
+                         {"transports", json::array({"rdma"})}};
+            config->set("policy", json::array({std::move(rule)}));
+        }
+    }
 
     // Configure transport types based on xport_type parameter
     if (!XferBenchConfig::xport_type.empty()) {
@@ -126,6 +173,15 @@ int TENTBenchRunner::allocateBuffers() {
     if (seg_type == "DRAM") {
         device_prefix = "cpu";
         num_buffers = numa_num_configured_nodes();
+        if (XferBenchConfig::tent_dram_numa_node >= 0) {
+            start_idx = XferBenchConfig::tent_dram_numa_node;
+            if (start_idx >= num_buffers) {
+                LOG(ERROR) << "tent_dram_numa_node " << start_idx
+                           << " out of range [0, " << num_buffers << ")";
+                return -1;
+            }
+            num_buffers = 1;
+        }
 #if defined(USE_CUDA) || defined(USE_SUNRISE)
     } else if (seg_type == "VRAM") {
         device_prefix = "cuda";

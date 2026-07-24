@@ -84,6 +84,20 @@ struct XferBenchConfig {
     static std::string backend;
     static bool notifi;
     static std::string tent_transport_hint;
+    static std::string tent_rdma_devices;
+    static int tent_dram_numa_node;
+    static bool enable_runtime_queue;
+    static size_t runtime_queue_max_dispatch_owners;
+    static std::string receiver_credit_mode;
+    static size_t receiver_credit_capacity_bytes;
+    static size_t receiver_credit_capacity_slots;
+    static size_t receiver_credit_grant_bytes;
+    static size_t receiver_credit_grant_slots;
+    static size_t receiver_credit_adaptive_min_owners;
+    static size_t receiver_credit_adaptive_initial_owners;
+    static size_t receiver_credit_adaptive_max_owners;
+    static uint32_t receiver_credit_adaptive_slow_rtt_us;
+    static uint32_t receiver_credit_adaptive_healthy_pulls;
     static std::string tent_intent_type;
 
     static int local_gpu_id;

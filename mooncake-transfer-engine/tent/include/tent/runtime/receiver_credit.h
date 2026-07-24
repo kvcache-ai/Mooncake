@@ -61,6 +61,17 @@ enum class CreditUpdateDisposition : uint8_t {
     SequenceGap
 };
 
+// A consistent sender-side view used to report cumulative usage to the
+// receiver. Completion is deliberately separate from consumption: completing
+// work does not mint sender credit locally; only a later receiver grant can do
+// that.
+struct CreditLedgerSnapshot {
+    uint64_t epoch{0}, last_sequence{0};
+    bool has_update{false};
+    std::array<uint64_t, kCreditResourceCount> grants{}, consumed{},
+        completed{};
+};
+
 // Private, sender-side state model. It has no network or Admission integration.
 class SenderCreditLedger {
    public:
@@ -74,9 +85,19 @@ class SenderCreditLedger {
     Status applyUpdate(const CreditKey&, const ReceiverCreditUpdateV1&,
                        CreditUpdateDisposition&);
     Status tryReserve(const CreditKey&, const CreditCharge&);
+    Status tryReserve(const CreditKey&, uint64_t expected_epoch,
+                      const CreditCharge&);
     // Only for work not yet handed to a transport; completions need a new
     // grant.
-    Status rollbackReservation(const CreditKey&, const CreditCharge&);
+    Status rollbackReservation(const CreditKey&, uint64_t expected_epoch,
+                               const CreditCharge&);
+    // Records transport-owned work reaching a terminal state. This advances a
+    // cumulative completion counter without changing consumed or available
+    // credit. The receiver must explicitly issue a new cumulative grant.
+    Status recordCompletion(const CreditKey&, uint64_t expected_epoch,
+                            const CreditCharge&);
+    Status snapshot(const CreditKey&, uint64_t expected_epoch,
+                    CreditLedgerSnapshot&) const;
     Status available(const CreditKey&, CreditResource, uint64_t&) const;
     Status consumed(const CreditKey&, CreditResource, uint64_t&) const;
 
@@ -84,7 +105,8 @@ class SenderCreditLedger {
     struct Entry {
         uint64_t epoch{0}, last_sequence{0};
         bool has_update{false};
-        std::array<uint64_t, kCreditResourceCount> grants{}, consumed{};
+        std::array<uint64_t, kCreditResourceCount> grants{}, consumed{},
+            completed{};
     };
     static Status resourceIndex(CreditResource, size_t&);
     static Status normalize(const CreditCharge&,
