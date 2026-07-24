@@ -904,13 +904,30 @@ class BucketStorageBackend : public StorageBackendInterface {
      * (bytes).
      * @param buckets_keys Output: bucketized keys; each inner vector is a
      * bucket.
+     * @param deferred_keys Optional output: keys moved to the internal
+     * ungrouped pool this call (the tail partial bucket, deferred so the next
+     * call can write them as part of a full bucket). These keys are NOT in
+     * buckets_keys now but WILL be emitted in a bucket by a later call. The
+     * caller must keep their offload tasks alive across the deferral — a key
+     * re-emitted from the pool arrives without a task otherwise
+     * (neuralwatt: the silent deferred-tail loss, upstream #3006).
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> AllocateOffloadingBuckets(
         const std::unordered_map<std::string, int64_t>& offloading_objects,
-        std::vector<std::vector<std::string>>& buckets_keys);
+        std::vector<std::vector<std::string>>& buckets_keys,
+        std::vector<std::string>* deferred_keys = nullptr);
 
     void ClearUngroupedOffloadingObjects();
+
+    /**
+     * @brief Remove a single key from the ungrouped (deferred) pool.
+     * Used when a deferred key is re-drained before re-emission: the caller
+     * discards the pooled copy (stale size) so the freshly drained entry
+     * flows through grouping as new input with current size accounting.
+     * @return true if the key was present and removed.
+     */
+    bool RemoveUngroupedOffloadingObject(const std::string& key);
 
     size_t UngroupedOffloadingObjectsSize() const;
 
@@ -991,7 +1008,8 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     tl::expected<void, ErrorCode> GroupOffloadingKeysByBucket(
         const std::unordered_map<std::string, int64_t>& offloading_objects,
-        std::vector<std::vector<std::string>>& buckets_keys);
+        std::vector<std::vector<std::string>>& buckets_keys,
+        std::vector<std::string>* deferred_keys = nullptr);
 
     tl::expected<void, ErrorCode> HandleNext(
         const std::function<

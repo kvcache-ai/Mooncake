@@ -90,14 +90,40 @@ class FileStorageTest : public ::testing::Test {
     tl::expected<void, ErrorCode> FileStorageGroupOffloadingKeysByBucket(
         FileStorage& fileStorage,
         const std::unordered_map<std::string, int64_t>& offloading_objects,
-        std::vector<std::vector<std::string>>& buckets_keys) {
+        std::vector<std::vector<std::string>>& buckets_keys,
+        std::vector<std::string>* deferred_keys = nullptr) {
         auto bucket_backend = std::dynamic_pointer_cast<BucketStorageBackend>(
             fileStorage.storage_backend_);
         if (!bucket_backend) {
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
-        return bucket_backend->AllocateOffloadingBuckets(offloading_objects,
-                                                         buckets_keys);
+        return bucket_backend->AllocateOffloadingBuckets(
+            offloading_objects, buckets_keys, deferred_keys);
+    }
+
+    tl::expected<void, ErrorCode> FileStorageOffloadObjects(
+        FileStorage& fileStorage,
+        const std::vector<OffloadTaskItem>& offloading_objects) {
+        return fileStorage.OffloadObjects(offloading_objects);
+    }
+
+    std::unordered_map<std::string, OffloadTaskItem>
+    GetDeferredTaskByStorageKey(FileStorage& fileStorage) {
+        return fileStorage.deferred_task_by_storage_key_;
+    }
+
+    static void FileStoragePartitionUnbucketedTasks(
+        const std::unordered_map<std::string, OffloadTaskItem>&
+            task_by_storage_key,
+        const std::unordered_set<std::string>& all_bucket_keys,
+        const std::vector<std::string>& deferred_keys,
+        const std::unordered_map<std::string, OffloadTaskItem>&
+            previously_carried,
+        std::vector<OffloadTaskItem>& failed_tasks,
+        std::unordered_map<std::string, OffloadTaskItem>& carried_tasks) {
+        FileStorage::PartitionUnbucketedTasks(
+            task_by_storage_key, all_bucket_keys, deferred_keys,
+            previously_carried, failed_tasks, carried_tasks);
     }
 
     size_t GetUngroupedOffloadingObjectsSize(FileStorage& fileStorage) {
@@ -336,6 +362,196 @@ TEST_F(FileStorageTest,
     }
     ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
         fileStorage, offloading_objects, buckets_keys));
+}
+
+// Regression (upstream #3006): keys deferred to the ungrouped pool must be
+// reported to the caller so their offload tasks can be carried across the
+// deferral. Before this, deferred keys were NACKed on deferral and then
+// silently dropped on re-emission (no task) — never written to SSD.
+TEST_F(FileStorageTest, GroupOffloadingKeysByBucket_reports_deferred_keys) {
+    std::unordered_map<std::string, int64_t> offloading_objects;
+    for (size_t i = 0; i < 35; i++) {
+        offloading_objects.emplace("test" + std::to_string(i), 1);
+    }
+    std::vector<std::vector<std::string>> buckets_keys;
+    std::vector<std::string> deferred_keys;
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "10");
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+
+    // 35 keys / limit 10: 3 full buckets, the 5-key tail is deferred.
+    ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
+        fileStorage, offloading_objects, buckets_keys, &deferred_keys));
+    ASSERT_EQ(buckets_keys.size(), 3);
+    ASSERT_EQ(deferred_keys.size(), 5);
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 5);
+    // Deferred keys are exactly the keys in no bucket.
+    std::unordered_set<std::string> bucketed;
+    for (const auto& bucket : buckets_keys) {
+        bucketed.insert(bucket.begin(), bucket.end());
+    }
+    for (const auto& key : deferred_keys) {
+        EXPECT_EQ(bucketed.count(key), 0u) << key;
+        EXPECT_EQ(offloading_objects.count(key), 1u) << key;
+    }
+
+    // Empty input: the grouping loop never runs, so the pool is untouched —
+    // nothing is emitted, nothing re-reported. The caller must therefore
+    // RETAIN its carried tasks rather than rebuild from deferred_keys alone.
+    buckets_keys.clear();
+    deferred_keys.clear();
+    ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
+        fileStorage, {}, buckets_keys, &deferred_keys));
+    ASSERT_EQ(buckets_keys.size(), 0);
+    ASSERT_EQ(deferred_keys.size(), 0);
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 5);
+
+    // Input too small to fill the bucket: pool + new input are all
+    // RE-deferred, and all must be RE-reported.
+    offloading_objects.clear();
+    for (size_t i = 100; i < 102; i++) {
+        offloading_objects.emplace("late" + std::to_string(i), 1);
+    }
+    buckets_keys.clear();
+    deferred_keys.clear();
+    ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
+        fileStorage, offloading_objects, buckets_keys, &deferred_keys));
+    ASSERT_EQ(buckets_keys.size(), 0);
+    ASSERT_EQ(deferred_keys.size(), 7);
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 7);
+
+    // Enough new input to fill one exact bucket: pool + new input are
+    // emitted; the pool empties and nothing is deferred.
+    offloading_objects.clear();
+    for (size_t i = 200; i < 203; i++) {
+        offloading_objects.emplace("fill" + std::to_string(i), 1);
+    }
+    buckets_keys.clear();
+    deferred_keys.clear();
+    ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
+        fileStorage, offloading_objects, buckets_keys, &deferred_keys));
+    ASSERT_EQ(buckets_keys.size(), 1);
+    ASSERT_EQ(buckets_keys[0].size(), 10);
+    ASSERT_EQ(deferred_keys.size(), 0);
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 0);
+}
+
+// Regression (upstream #3006): the NACK sweep must exempt deferred keys —
+// carrying their tasks to the next cycle — while still NACKing keys the
+// backend deliberately skipped.
+TEST_F(FileStorageTest, PartitionUnbucketedTasks_carries_deferred_not_nacked) {
+    auto make_task = [](const std::string& key) {
+        return OffloadTaskItem{.tenant_id = "default", .key = key, .size = 1};
+    };
+    std::unordered_map<std::string, OffloadTaskItem> task_by_storage_key{
+        {"bucketed", make_task("bucketed")},
+        {"deferred", make_task("deferred")},
+        {"skipped_a", make_task("skipped_a")},
+        {"skipped_b", make_task("skipped_b")},
+    };
+    // "pooled_waiting" was carried from an earlier cycle; this cycle the
+    // backend neither emitted nor re-reported it (empty effective input
+    // leaves the pool untouched), so it must be RETAINED, not NACKed.
+    task_by_storage_key.emplace("pooled_waiting", make_task("pooled_waiting"));
+    const std::unordered_map<std::string, OffloadTaskItem> previously_carried{
+        {"pooled_waiting", make_task("pooled_waiting")}};
+    const std::unordered_set<std::string> all_bucket_keys{"bucketed"};
+    const std::vector<std::string> deferred_keys{"deferred"};
+
+    std::vector<OffloadTaskItem> failed_tasks;
+    std::unordered_map<std::string, OffloadTaskItem> carried_tasks;
+    FileStoragePartitionUnbucketedTasks(task_by_storage_key, all_bucket_keys,
+                                        deferred_keys, previously_carried,
+                                        failed_tasks, carried_tasks);
+
+    // The deferred key is carried with its original task; the un-emitted
+    // previously carried key is retained. Neither is NACKed.
+    ASSERT_EQ(carried_tasks.size(), 2u);
+    ASSERT_EQ(carried_tasks.count("deferred"), 1u);
+    ASSERT_EQ(carried_tasks.count("pooled_waiting"), 1u);
+    EXPECT_EQ(carried_tasks.at("deferred").key, "deferred");
+    for (const auto& task : failed_tasks) {
+        EXPECT_NE(task.key, "deferred");
+        EXPECT_NE(task.key, "pooled_waiting");
+        EXPECT_NE(task.key, "bucketed");
+    }
+    // Deliberately skipped keys are still NACKed.
+    ASSERT_EQ(failed_tasks.size(), 2u);
+}
+
+// Regression (upstream #3006, integration): drive the deferral carry through
+// OffloadObjects itself. A cycle in which every key defers emits no bucket,
+// so nothing touches the master client — which makes the integrated path
+// (carry merge, deferral report plumbing, partition, carry assignment)
+// testable without a client. Phase 3 exercises the retained-carry corner:
+// a drain consisting solely of a re-PUT of a carried key empties the
+// effective input, the pool is neither emitted nor re-reported, and the
+// carry must survive by retention rather than the deferral report.
+TEST_F(FileStorageTest, OffloadObjects_deferred_tail_tasks_carried) {
+    auto make_task = [](const std::string& key) {
+        return OffloadTaskItem{.tenant_id = "default", .key = key, .size = 1};
+    };
+    auto carried_user_keys =
+        [](const std::unordered_map<std::string, OffloadTaskItem>& carry) {
+            std::unordered_set<std::string> keys;
+            for (const auto& [_, task] : carry) keys.insert(task.key);
+            return keys;
+        };
+
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "10");
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+
+    // Phase 1: two tasks, far below bucket capacity -> the whole drain is
+    // the tail: no bucket emitted, both tasks carried, none NACKed (no
+    // client call happens -- client_ is null, so reaching it would crash).
+    ASSERT_TRUE(FileStorageOffloadObjects(fileStorage,
+                                          {make_task("d1"), make_task("d2")}));
+    auto carry = GetDeferredTaskByStorageKey(fileStorage);
+    ASSERT_EQ(carry.size(), 2u);
+    EXPECT_EQ(carried_user_keys(carry),
+              (std::unordered_set<std::string>{"d1", "d2"}));
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 2);
+
+    // Phase 2: one more task; pool + new input still cannot fill a bucket,
+    // so all three are re-deferred and re-carried.
+    ASSERT_TRUE(FileStorageOffloadObjects(fileStorage, {make_task("d3")}));
+    carry = GetDeferredTaskByStorageKey(fileStorage);
+    ASSERT_EQ(carry.size(), 3u);
+    EXPECT_EQ(carried_user_keys(carry),
+              (std::unordered_set<std::string>{"d1", "d2", "d3"}));
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 3);
+
+    // Phase 3 (the retained-carry corner): a drain that is ONLY a re-PUT of
+    // a carried key. The merge removes it from the effective input, the
+    // grouping loop never runs, the pool is untouched and nothing is
+    // re-reported -- yet every carried task must survive, and none may be
+    // NACKed while the pool still holds the keys.
+    ASSERT_TRUE(FileStorageOffloadObjects(fileStorage, {make_task("d1")}));
+    carry = GetDeferredTaskByStorageKey(fileStorage);
+    ASSERT_EQ(carry.size(), 3u);
+    EXPECT_EQ(carried_user_keys(carry),
+              (std::unordered_set<std::string>{"d1", "d2", "d3"}));
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 3);
+
+    // Phase 4 (re-drain collision semantics): a carried key re-PUT with a
+    // DIFFERENT size while deferred. The fresh drain must win entirely —
+    // pooled copy (stale size) removed, fresh task carried — rather than
+    // the fresh task winning the task map while the stale size wins the
+    // packing accounting.
+    OffloadTaskItem d2_fresh{.tenant_id = "default", .key = "d2", .size = 2};
+    ASSERT_TRUE(FileStorageOffloadObjects(fileStorage, {d2_fresh}));
+    carry = GetDeferredTaskByStorageKey(fileStorage);
+    ASSERT_EQ(carry.size(), 3u);
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 3);
+    for (const auto& [_, task] : carry) {
+        if (task.key == "d2") {
+            EXPECT_EQ(task.size, 2) << "fresh drained task must supersede "
+                                       "the stale carried/pooled copy";
+        }
+    }
 }
 
 TEST_F(FileStorageTest, DefaultValuesWhenNoEnvSet) {
