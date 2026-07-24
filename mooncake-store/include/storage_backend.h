@@ -12,6 +12,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -1056,6 +1057,13 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     void ReleasePreparedWriteLocked(const PendingEviction& pending);
 
+    // Maintain both sides of the LRU index. These helpers are no-ops for
+    // non-LRU policies and must be called with mutex_ held exclusively.
+    void InsertLruIndexEntryLocked(int64_t last_access_ns, int64_t bucket_id);
+
+    // Remove the index entry by bucket ID because its timestamp may be stale.
+    void EraseLruIndexEntryLocked(int64_t bucket_id);
+
     /**
      * @brief Select the next bucket to evict according to the configured
      * eviction policy. Must be called with mutex_ held (exclusive).
@@ -1129,10 +1137,13 @@ class BucketStorageBackend : public StorageBackendInterface {
     int64_t pending_write_size_ GUARDED_BY(mutex_) = 0;
     std::map<int64_t, std::shared_ptr<BucketMetadata>> GUARDED_BY(
         mutex_) buckets_;
-    // LRU eviction index: ordered set of {last_access_ns_, bucket_id}.
+    // LRU eviction index: ordered set of {last_access_ns_, bucket_id} plus a
+    // reverse lookup from bucket ID to the timestamp currently in the set.
     // Maintained lazily — reads update last_access_ns_ atomically without
     // touching this index; SelectEvictionCandidate() repairs stale entries.
-    std::set<std::pair<int64_t, int64_t>> GUARDED_BY(mutex_) lru_index_;
+    using LruIndex = std::set<std::pair<int64_t, int64_t>>;
+    LruIndex GUARDED_BY(mutex_) lru_index_;
+    std::unordered_map<int64_t, int64_t> GUARDED_BY(mutex_) lru_index_reverse_;
     int64_t GUARDED_BY(mutex_) next_bucket_ = -1;
     BucketBackendConfig bucket_backend_config_;
 

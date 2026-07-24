@@ -51,6 +51,16 @@ struct FdGuard {
 
 namespace mooncake {
 
+namespace {
+
+int64_t SteadyClockNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+}  // namespace
+
 bool FilePerKeyConfig::Validate() const {
     if (fsdir.empty()) {
         LOG(ERROR) << "FilePerKeyConfig: fsdir is invalid";
@@ -1763,6 +1773,13 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
         }
 
         if (!duplicate_found) {
+            int64_t admission_time = 0;
+            if (bucket_backend_config_.eviction_policy ==
+                BucketEvictionPolicy::LRU) {
+                admission_time = SteadyClockNowNs();
+                bucket->last_access_ns_.store(admission_time,
+                                              std::memory_order_relaxed);
+            }
             total_size_ += bucket->data_size + bucket->meta_size;
             object_bucket_map_.reserve(object_bucket_map_.size() +
                                        bucket_keys.size());
@@ -1773,7 +1790,7 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
                     << "Reserved key became duplicated: " << bucket_keys[i];
             }
             buckets_.emplace(bucket_id, std::move(bucket));
-            lru_index_.emplace(0LL, bucket_id);
+            InsertLruIndexEntryLocked(admission_time, bucket_id);
         }
         if (duplicate_found) {
             LOG(ERROR) << "Reserved key became duplicated before commit, "
@@ -1882,9 +1899,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                 // Update LRU timestamp for this bucket.
                 if (bucket_backend_config_.eviction_policy ==
                     BucketEvictionPolicy::LRU) {
-                    auto now = std::chrono::steady_clock::now()
-                                   .time_since_epoch()
-                                   .count();
+                    const int64_t now = SteadyClockNowNs();
                     bucket_it->second->last_access_ns_.store(
                         now, std::memory_order_relaxed);
                 }
@@ -2002,9 +2017,16 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
         SharedMutexLocker lock(&mutex_);
         object_bucket_map_.clear();
         buckets_.clear();
+        lru_index_reverse_.clear();
         lru_index_.clear();
         total_size_ = 0;
         int64_t max_bucket_id = BucketIdGenerator::INIT_NEW_START_ID;
+        // Access history is not persisted, so recovered buckets share one
+        // admission timestamp and start with equal LRU priority.
+        const int64_t recovery_time =
+            bucket_backend_config_.eviction_policy == BucketEvictionPolicy::LRU
+                ? SteadyClockNowNs()
+                : 0;
 
         for (const auto& entry :
              fs::recursive_directory_iterator(storage_path_)) {
@@ -2023,7 +2045,6 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                 }
                 auto [metadata_it, success] = buckets_.try_emplace(
                     bucket_id, std::make_shared<BucketMetadata>());
-                if (success) lru_index_.emplace(0LL, bucket_id);
                 if (!success) {
                     LOG(ERROR) << "Failed to load bucket " << bucket_id_str;
                     return tl::make_unexpected(
@@ -2048,7 +2069,6 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                         fs::remove(bucket_meta_path_res.value());
                     }
 
-                    lru_index_.erase({0LL, bucket_id});
                     buckets_.erase(bucket_id);
                     continue;
                 }
@@ -2075,7 +2095,6 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                                << entry.path().string()
                                << ", will delete the bucket's remaining files";
                     CleanupOrphanedBucket(bucket_id);
-                    lru_index_.erase({0LL, bucket_id});
                     buckets_.erase(bucket_id);
                     continue;
                 }
@@ -2110,9 +2129,14 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                         fs::remove(bucket_meta_path_res.value());
                     }
 
-                    lru_index_.erase({0LL, bucket_id});
                     buckets_.erase(bucket_id);
                     continue;
+                }
+                if (bucket_backend_config_.eviction_policy ==
+                    BucketEvictionPolicy::LRU) {
+                    metadata_it->second->last_access_ns_.store(
+                        recovery_time, std::memory_order_relaxed);
+                    InsertLruIndexEntryLocked(recovery_time, bucket_id);
                 }
                 if (bucket_id > max_bucket_id) {
                     max_bucket_id = bucket_id;
@@ -2676,7 +2700,7 @@ void BucketStorageBackend::RollbackCommittedBucket(
 
         // Remove bucket metadata
         total_size_ -= bucket_meta->meta_size;
-        lru_index_.erase({0LL, bucket_id});
+        EraseLruIndexEntryLocked(bucket_id);
         buckets_.erase(bucket_it);
     }
 
@@ -2756,22 +2780,38 @@ BucketStorageBackend::SelectEvictionCandidate() {
             while (!lru_index_.empty()) {
                 auto top_it = lru_index_.begin();
                 auto [ts, id] = *top_it;
+                auto reverse_it = lru_index_reverse_.find(id);
                 auto bucket_it = buckets_.find(id);
                 if (bucket_it == buckets_.end()) {
+                    if (reverse_it != lru_index_reverse_.end()) {
+                        CHECK_EQ(reverse_it->second, ts)
+                            << "Mismatched orphaned LRU timestamp for bucket "
+                            << id;
+                        lru_index_reverse_.erase(reverse_it);
+                    }
                     lru_index_.erase(top_it);
                     continue;
                 }
+                CHECK(reverse_it != lru_index_reverse_.end())
+                    << "Missing reverse LRU entry for bucket " << id;
+                CHECK_EQ(reverse_it->second, ts)
+                    << "Mismatched reverse LRU timestamp for bucket " << id;
                 int64_t actual_ts = bucket_it->second->last_access_ns_.load(
                     std::memory_order_relaxed);
                 if (actual_ts == ts) {
                     // Correct entry: remove from index (bucket is about to be
                     // evicted) and return.
+                    lru_index_reverse_.erase(reverse_it);
                     lru_index_.erase(top_it);
                     return bucket_it;
                 }
-                // Stale: repair and retry to find the true minimum.
+                // Stale: install the repaired entry before removing the old
+                // one so allocation failure cannot drop the bucket from the
+                // forward index.
+                CHECK(lru_index_.emplace(actual_ts, id).second)
+                    << "Duplicate repaired LRU entry for bucket " << id;
+                reverse_it->second = actual_ts;
                 lru_index_.erase(top_it);
-                lru_index_.emplace(actual_ts, id);
             }
             return buckets_.end();
 
@@ -2952,7 +2992,7 @@ void BucketStorageBackend::RestorePreparedEvictionLocked(
         total_size_ += bucket_meta->meta_size;
         if (bucket_backend_config_.eviction_policy ==
             BucketEvictionPolicy::LRU) {
-            lru_index_.emplace(
+            InsertLruIndexEntryLocked(
                 bucket_meta->last_access_ns_.load(std::memory_order_relaxed),
                 bucket_id);
         }
@@ -2991,6 +3031,35 @@ void BucketStorageBackend::ReleasePreparedWriteLocked(
     for (const auto& key : pending.write_keys) {
         pending_write_keys_.erase(key);
     }
+}
+
+void BucketStorageBackend::InsertLruIndexEntryLocked(int64_t last_access_ns,
+                                                     int64_t bucket_id) {
+    if (bucket_backend_config_.eviction_policy != BucketEvictionPolicy::LRU) {
+        DCHECK(lru_index_.empty());
+        DCHECK(lru_index_reverse_.empty());
+        return;
+    }
+
+    CHECK(lru_index_.emplace(last_access_ns, bucket_id).second)
+        << "Duplicate LRU entry for bucket " << bucket_id;
+    CHECK(lru_index_reverse_.emplace(bucket_id, last_access_ns).second)
+        << "Duplicate reverse LRU entry for bucket " << bucket_id;
+}
+
+void BucketStorageBackend::EraseLruIndexEntryLocked(int64_t bucket_id) {
+    if (bucket_backend_config_.eviction_policy != BucketEvictionPolicy::LRU) {
+        DCHECK(lru_index_.empty());
+        DCHECK(lru_index_reverse_.empty());
+        return;
+    }
+
+    auto reverse_it = lru_index_reverse_.find(bucket_id);
+    CHECK(reverse_it != lru_index_reverse_.end())
+        << "Missing reverse LRU entry for bucket " << bucket_id;
+    CHECK_EQ(lru_index_.erase({reverse_it->second, bucket_id}), 1)
+        << "Missing forward LRU entry for bucket " << bucket_id;
+    lru_index_reverse_.erase(reverse_it);
 }
 
 tl::expected<void, ErrorCode> BucketStorageBackend::FinalizeEviction(
@@ -3156,9 +3225,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
 
         // Move the shared_ptr out - we now own it
         bucket_metadata = std::move(bucket_it->second);
-        lru_index_.erase(
-            {bucket_metadata->last_access_ns_.load(std::memory_order_relaxed),
-             bucket_id});
+        EraseLruIndexEntryLocked(bucket_id);
         buckets_.erase(bucket_it);
 
         // Collect keys to remove (they reference this bucket)
