@@ -511,6 +511,60 @@ TEST_F(MasterServiceSSDSnapshotTest, PutStartExpires) {
     test_discard_replica(ReplicaType::MEMORY);
 }
 
+// Regression test for issue #2636: MountedSegment.segment.protocol must survive
+// snapshot/restore. Before the fix, the protocol field was dropped on the
+// serialize side, so GetSegmentsDetail() returned an empty string after
+// restore.
+TEST_F(MasterServiceSSDSnapshotTest, RestorePreservesSegmentProtocol) {
+    CreateMasterServiceWithSSDFeat("/mnt/ssd");
+    EnsureSnapshotStores(service_.get());
+
+    constexpr size_t buffer = 0x340000000;
+    constexpr size_t size = 1024 * 1024 * 64;
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "test_segment_protocol_roundtrip";
+    segment.base = buffer;
+    segment.size = size;
+    segment.te_endpoint = segment.name;
+    // Non-empty, non-default value so a regression (empty default) is easy to
+    // spot in the assertion.
+    segment.protocol = "tcp";
+
+    UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+
+    std::string snapshot_id = GenerateSnapshotId();
+    auto persist_result = CallPersistState(service_.get(), snapshot_id);
+    ASSERT_TRUE(persist_result.has_value())
+        << "Failed to persist state: " << persist_result.error().message;
+
+    ::setenv("MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP", "1", 1);
+    auto restore_config = MasterServiceConfig::builder()
+                              .set_enable_snapshot_restore(true)
+                              .set_snapshot_object_store_type("local")
+                              .set_root_fs_dir("/mnt/ssd")
+                              .build();
+    std::unique_ptr<MasterService> restored_service(
+        new MasterService(restore_config));
+    ::unsetenv("MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP");
+
+    auto detail = restored_service->GetSegmentsDetail();
+    ASSERT_TRUE(detail.has_value());
+    ASSERT_FALSE(detail.value().empty());
+
+    bool found = false;
+    for (const auto& info : detail.value()) {
+        if (info.segment_name == segment.name) {
+            EXPECT_EQ("tcp", info.protocol);
+            found = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(found) << "Restored service is missing segment "
+                       << segment.name;
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {
