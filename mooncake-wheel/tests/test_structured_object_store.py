@@ -1740,6 +1740,18 @@ def test_dataproto_field_schema_validates_schema_errors() -> None:
                 )
             },
         )
+    for bad_key in ["", "image/data", "image\\data"]:
+        rows[:] = [{bad_key: object()}]
+        with pytest.raises(ValueError, match="must not"):
+            transfer.put_dataproto(
+                _schema_test_data("mm", rows),
+                field_schemas={
+                    "mm": FieldSchema(
+                        codec="ragged_tensor_dict",
+                        metadata={"section": "non_tensor_batch"},
+                    )
+                },
+            )
 
     values = np.empty(2, dtype=object)
     values[:] = ["ok", None]
@@ -2925,6 +2937,15 @@ def test_dataproto_helper_object_non_tensor_codecs_roundtrip() -> None:
     assert result["non_tensor_batch"]["nullable_int"].tolist() == [1, None, 3, 4]
 
 
+def test_msgpack_ragged_decode_validates_row_count() -> None:
+    payload, _metadata = sos._encode_msgpack_ragged_values(
+        "json", [{"a": 1}, {"b": 2}]
+    )
+
+    with pytest.raises(ValueError, match="offsets length"):
+        sos._decode_msgpack_ragged_values(payload, 1)
+
+
 def test_dataproto_helper_typed_ragged_uses_multi_buffer_put() -> None:
     pool = FakeBufferPool()
     _store, transfer = make_transfer(buffer_pool=pool)
@@ -2952,6 +2973,12 @@ def test_dataproto_helper_rejects_unsupported_object_non_tensor() -> None:
 
     with pytest.raises(ValueError, match="unsupported structured non-tensor field"):
         transfer.put_dataproto(data)
+    with pytest.raises(ValueError, match="unable to infer a safe codec"):
+        sos._encode_with_schema(
+            "non_tensor_batch.fallback",
+            data.non_tensor_batch["fallback"],
+            FieldSchema(codec="auto"),
+        )
 
 
 def test_dataproto_helper_ragged_tensor_non_tensor_roundtrip() -> None:
@@ -2977,6 +3004,14 @@ def test_dataproto_helper_ragged_tensor_non_tensor_roundtrip() -> None:
     assert actual[1] is None
     assert torch.equal(actual[2], ragged[2])
     assert torch.equal(actual[3], ragged[3])
+
+    mixed = np.empty(2, dtype=object)
+    mixed[:] = [
+        torch.arange(1, dtype=torch.float32),
+        torch.arange(1, dtype=torch.int64),
+    ]
+    with pytest.raises(ValueError, match="mixed tensor dtype"):
+        transfer.put_dataproto(SimpleDataProto(non_tensor_batch={"ragged": mixed}))
 
 
 def _assert_tensor_object_equal(actual, expected) -> None:
@@ -3067,6 +3102,7 @@ def test_dataproto_helper_nested_tensor_object_array_rows() -> None:
             {"images": [{"pixels": torch.arange(2)}], "meta": {"rank": 0}},
             {"images": [{"pixels": torch.arange(3)}, {"pixels": None}], "meta": {}},
             {"images": [], "meta": {"rank": None}},
+            {"images": [], "meta": None},
         ],
         dtype=object,
     )

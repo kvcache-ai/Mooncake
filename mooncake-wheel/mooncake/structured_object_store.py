@@ -26,6 +26,13 @@ MISSING_OBJECT_ERROR = (
     -704
 )  # Mooncake remove returns -704 for an already-missing object.
 STRUCTURED_FIELD_SPECS_KEY = "__mooncake_structured_fields__"
+_ENCODING_FALLBACK_ERRORS = (
+    TypeError,
+    ValueError,
+    OverflowError,
+    RuntimeError,
+    RecursionError,
+)
 
 
 class BundleStore(Protocol):
@@ -815,9 +822,7 @@ class MooncakeBundleTransfer:
                 values = _decode_structured_non_tensor_encoded(
                     encoded, payload, output_rows, metadata
                 )
-            array = np.empty(output_rows, dtype=object)
-            array[:] = values
-            non_tensor_batch[name] = array
+            non_tensor_batch[name] = _object_array_from_decoded_values(values)
         meta_info = _select_mapping(ref.meta_info, meta_info_keys)
         return _build_dataproto_like_result(
             batch, non_tensor_batch, meta_info, data_cls
@@ -2160,14 +2165,13 @@ def _encode_structured_non_tensor_field(
 
 def _encode_with_schema(
     path: str, value: np.ndarray, schema: FieldSchema
-) -> _EncodedStructuredLeaf:
+) -> "_EncodedStructuredLeaf":
+    """Encode a non_tensor_batch field using an explicit schema (no inference)."""
     values = list(value)
-    _validate_schema_nullable(path, value, schema)
+    _validate_schema_nullable(path, values, schema)
     codec = schema.codec
-    if codec not in _FIELD_SCHEMA_CODECS:
-        raise ValueError(f"unsupported schema codec: {codec!r}")
     if codec == "auto":
-        return _encode_structured_non_tensor_field(path, value)
+        return _encode_with_fallback(path, value)
     if codec == "ragged_tensor_dict":
         return _encode_ragged_tensor_dict_values(values, schema)
     if codec == "ragged_tensor":
@@ -2177,7 +2181,9 @@ def _encode_with_schema(
             values, dtype_hint=_schema_ndarray_dtype(schema)
         )
     elif codec == "ndarray":
-        dtype = _schema_ndarray_dtype(schema, required=True)
+        dtype = _schema_ndarray_dtype(schema)
+        if dtype is None:
+            return _encode_with_fallback(path, value)
         decision = _CodecDecision(
             True, "ndarray", "schema", "numeric scalar", {"dtype": str(dtype)}
         )
@@ -2188,31 +2194,23 @@ def _encode_with_schema(
         payload, metadata = _encode_media_list_values(values)
     elif codec == "utf8_ragged":
         payload, metadata = _encode_bytes_like_values(
-            [None if item is None else item.encode("utf-8") for item in values]
+            [None if v is None else v.encode("utf-8") for v in values]
         )
     elif codec == "msgpack_ragged":
-        payload, metadata = _encode_bytes_like_values(
-            [
-                None
-                if item is None
-                else _msgpack.packb(item, use_bin_type=True, strict_types=True)
-                for item in values
-            ]
-        )
+        payload, metadata = _encode_msgpack_ragged_values(path, values)
     elif codec == "json_ragged":
         payload, metadata = _encode_bytes_like_values(
             [
                 None
-                if item is None
-                else json.dumps(item, ensure_ascii=False, separators=(",", ":")).encode(
+                if v is None
+                else json.dumps(v, ensure_ascii=False, separators=(",", ":")).encode(
                     "utf-8"
                 )
-                for item in values
+                for v in values
             ]
         )
     else:
         raise ValueError(f"unsupported schema codec: {codec!r}")
-    metadata.update({"schema_source": "field_schema"})
     return _EncodedStructuredLeaf(
         codec=codec, rows=len(values), payload=payload, metadata=metadata
     )
@@ -2323,51 +2321,53 @@ def _is_recursive_encoded_non_tensor(encoded: Mapping[str, Any]) -> bool:
 def _structured_path_tokens(path: str) -> list[Any]:
     tokens: list[Any] = []
     index = 0
-    current = []
+    current: list[str] = []
     while index < len(path):
         char = path[index]
-        if char == "\\":
+        if char == "\\" and index + 1 < len(path):
+            current.append(path[index + 1])
+            index += 2
+            continue
+        if char == ".":
+            if current:
+                tokens.append("".join(current))
+                current = []
             index += 1
-            if index < len(path):
-                current.append(path[index])
-        elif char == ".":
-            tokens.append("".join(current))
-            current = []
-        elif char == "[":
+            continue
+        if char == "[":
             if current:
                 tokens.append("".join(current))
                 current = []
             end = path.index("]", index)
             tokens.append(int(path[index + 1 : end]))
-            index = end
-        else:
-            current.append(char)
+            index = end + 1
+            continue
+        current.append(char)
         index += 1
     if current:
         tokens.append("".join(current))
     return tokens
 
 
-def _lookup_structured_path(value: Any, root_path: str, path: str) -> Any:
-    root_tokens = _structured_path_tokens(root_path)
-    path_tokens = _structured_path_tokens(path)
+def _lookup_structured_path(value: Any, root_path: str, target_path: str) -> Any:
+    suffix = target_path[len(root_path) :]
+    if suffix.startswith("."):
+        suffix = suffix[1:]
+    if not suffix:
+        return value
     current = value
-    for token in path_tokens[len(root_tokens) :]:
-        if isinstance(token, str):
-            if current is None:
-                return None
-            if isinstance(current, _Missing) or not isinstance(current, dict):
-                return MISSING
-            current = current.get(token, MISSING)
-            continue
-        if current is None:
-            return None
-        if isinstance(current, _Missing) or not isinstance(current, (list, tuple)):
+    for token in _structured_path_tokens(suffix):
+        if isinstance(current, _Missing):
             return MISSING
-        current = current[token] if token < len(current) else MISSING
+        if isinstance(token, str):
+            if not isinstance(current, dict) or token not in current:
+                return MISSING
+            current = current[token]
+        else:
+            if not isinstance(current, (list, tuple)) or token >= len(current):
+                return MISSING
+            current = current[token]
     return current
-
-
 def _encode_structured_leaf(
     values: list[Any], decision: _CodecDecision
 ) -> _EncodedStructuredLeaf:
@@ -2434,7 +2434,14 @@ def _decode_structured_non_tensor_encoded(
     rows: int,
     metadata: Optional[Mapping[str, Any]] = None,
 ) -> list[Any]:
-    if _is_recursive_encoded_non_tensor(encoded):
+    codec = encoded.get("codec")
+    if codec == "ragged_tensor_dict":
+        return _decode_ragged_tensor_dict_values(
+            payload, rows, metadata or encoded.get("metadata", {})
+        )
+    if encoded.get("codec") == "structured_recursive":
+        if metadata is not None:
+            encoded = {**encoded, "metadata": metadata}
         return _decode_structured_recursive_field(encoded, payload, rows)
     return _decode_structured_leaf(encoded["codec"], payload, rows, metadata)
 
@@ -2535,11 +2542,9 @@ def _decode_structured_leaf(
     metadata: Optional[Mapping[str, Any]] = None,
 ) -> list[Any]:
     if codec == "ragged_tensor":
-        return _decode_ragged_tensor_values(payload, rows)
-    if codec == "ragged_tensor_dict":
-        return _decode_ragged_tensor_dict_values(payload, rows, metadata or {})
+        return _decode_ragged_tensor_values(payload, rows, metadata)
     if codec == "typed_ragged":
-        return _decode_typed_ragged_values(payload, rows)
+        return _decode_typed_ragged_values(payload, rows, metadata)
     if codec == "media_list_ragged":
         return _decode_media_list_values(payload, rows, metadata)
     if codec == "ndarray":
@@ -2554,13 +2559,10 @@ def _decode_structured_leaf(
             for value in _decode_bytes_like_values(payload, rows)
         ]
     if codec == "msgpack_ragged":
-        return [
-            None if value is None else _msgpack.unpackb(value, raw=False)
-            for value in _decode_bytes_like_values(payload, rows)
-        ]
+        return _decode_msgpack_ragged_values(payload, rows)
     if codec == "json_ragged":
         return [
-            None if value is None else json.loads(value.decode("utf-8"))
+            None if value is None else json.loads(value)
             for value in _decode_bytes_like_values(payload, rows)
         ]
     raise ValueError(f"unknown structured non-tensor codec: {codec}")
@@ -2623,7 +2625,11 @@ def _encode_ragged_tensor_values(
     }
 
 
-def _decode_ragged_tensor_values(payload: dict[str, Any], rows: int) -> list[Any]:
+def _decode_ragged_tensor_values(
+    payload: dict[str, Any],
+    rows: int,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> list[Any]:
     if _torch is None:
         raise RuntimeError("torch is required to decode ragged tensor fields")
     data = _torch.from_numpy(payload["data"])
@@ -2645,17 +2651,23 @@ def _decode_ragged_tensor_values(payload: dict[str, Any], rows: int) -> list[Any
 
 
 def _normalize_ragged_tensor_dict_keys(keys: Any) -> list[str]:
-    if isinstance(keys, (str, bytes, bytearray)) or not isinstance(keys, Iterable):
-        raise TypeError("ragged_tensor_dict keys must be an iterable of strings")
-    normalized = list(keys)
-    if any(not isinstance(key, str) for key in normalized):
-        raise TypeError("ragged_tensor_dict keys must contain only strings")
-    if any(not key for key in normalized):
-        raise ValueError("ragged_tensor_dict keys must not be empty")
-    if len(set(normalized)) != len(normalized):
-        raise ValueError("ragged_tensor_dict keys must not contain duplicates")
-    if any(separator in key for key in normalized for separator in (".", "/", "\\")):
-        raise ValueError("ragged_tensor_dict keys must not contain path separators")
+    if isinstance(keys, Mapping):
+        iterable = keys.keys()
+    else:
+        iterable = keys
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for key in iterable:
+        if not isinstance(key, str):
+            raise TypeError("ragged_tensor_dict keys must be strings")
+        if not key:
+            raise ValueError("ragged_tensor_dict keys must not be empty")
+        if any(separator in key for separator in (".", "/", "\\")):
+            raise ValueError("ragged_tensor_dict keys must not contain '.', '/', or '\\'")
+        if key in seen:
+            raise ValueError(f"ragged_tensor_dict keys contain duplicate key {key!r}")
+        seen.add(key)
+        normalized.append(key)
     return normalized
 
 
@@ -2679,9 +2691,15 @@ def _ragged_tensor_dict_payload_items(
 def _encode_ragged_tensor_dict_values(
     values: list[Any],
     schema: FieldSchema,
-) -> _EncodedStructuredLeaf:
+) -> "_EncodedStructuredLeaf":
+    """Encode list[dict[str, Tensor] | None] directly without inference.
+
+    Each dict key's tensors are encoded as a separate ragged_tensor sub-payload,
+    giving per-key zero-copy RDMA transfer and independent partial-read access.
+    """
     rows = len(values)
-    null_mask = np.asarray([item is None for item in values], dtype=np.bool_)
+    null_mask = np.asarray([v is None for v in values], dtype=np.bool_)
+
     schema_keys = schema.metadata.get("keys")
     keys = None if schema_keys is None else _normalize_ragged_tensor_dict_keys(schema_keys)
     declared_keys = None if keys is None else set(keys)
@@ -2698,67 +2716,79 @@ def _encode_ragged_tensor_dict_values(
         if explicit_null_keys:
             raise TypeError(
                 "ragged_tensor_dict rows cannot contain explicit None tensor values; "
-                f"row {row} has {explicit_null_keys}"
+                f"row {row} has explicit None for {explicit_null_keys}"
             )
+        row_keys = _normalize_ragged_tensor_dict_keys(item.keys())
         if declared_keys is None:
-            inferred_keys.update(item)
+            inferred_keys.update(row_keys)
             continue
-        extra_keys = sorted(set(item) - declared_keys)
+        extra_keys = sorted(set(row_keys) - declared_keys)
         if extra_keys:
             raise ValueError(
                 "ragged_tensor_dict rows contain keys not declared in "
-                f"FieldSchema metadata['keys']; row {row} has {extra_keys}"
+                f"FieldSchema metadata['keys']; row {row} has keys not declared: {extra_keys}"
             )
     if keys is None:
         keys = _normalize_ragged_tensor_dict_keys(sorted(inferred_keys))
     if keys and _torch is None:
         raise RuntimeError("torch is required to encode ragged_tensor_dict fields")
+
     payload: dict[str, Any] = {"null_mask": null_mask}
     key_codecs: dict[str, Any] = {}
     for key in keys:
-        sub_payload, sub_metadata = _encode_ragged_tensor_values(
-            [None if item is None else item.get(key) for item in values]
-        )
-        payload.update(
-            {f"{key}.{name}": value for name, value in sub_payload.items()}
-        )
+        try:
+            key_values = [None if v is None else v.get(key) for v in values]
+            sub_payload, sub_metadata = _encode_ragged_tensor_values(key_values)
+        except _ENCODING_FALLBACK_ERRORS as exc:
+            raise ValueError(
+                f"failed to encode ragged_tensor_dict key {key!r}"
+            ) from exc
+        for payload_name, payload_value in sub_payload.items():
+            payload[f"{key}.{payload_name}"] = payload_value
         key_codecs[key] = sub_metadata
+
     return _EncodedStructuredLeaf(
         codec="ragged_tensor_dict",
         rows=rows,
         payload=payload,
-        metadata={
-            "keys": list(keys),
-            "key_codecs": key_codecs,
-            "schema_source": "field_schema",
-        },
+        metadata={"keys": keys, "key_codecs": key_codecs},
     )
 
 def _decode_ragged_tensor_dict_values(
-    payload: dict[str, Any], rows: int, metadata: Mapping[str, Any]
+    payload: dict[str, Any],
+    rows: int,
+    metadata: Mapping[str, Any],
 ) -> list[Any]:
+    """Decode ragged_tensor_dict payload back to list[dict[str, Tensor] | None]."""
     null_mask = payload["null_mask"]
-    if len(null_mask) != rows:
-        raise ValueError(
-            f"ragged_tensor_dict null_mask row count {len(null_mask)} != expected {rows}"
-        )
-    key_values = {
-        key: _decode_ragged_tensor_values(
-            _ragged_tensor_dict_payload_items(payload, key, kind="payload"), rows
-        )
-        for key in _normalize_ragged_tensor_dict_keys(metadata.get("keys", []))
-    }
+    if isinstance(null_mask, (bytes, bytearray)):
+        null_mask = np.frombuffer(null_mask, dtype=np.bool_)
+    keys = metadata.get("keys", [])
+
+    key_values: dict[str, list[Any]] = {}
+    for key in keys:
+        prefix = f"{key}."
+        sub_payload = {
+            name[len(prefix) :]: payload[name]
+            for name in payload
+            if name.startswith(prefix)
+        }
+        sub_metadata = metadata.get("key_codecs", {}).get(key)
+        key_values[key] = _decode_ragged_tensor_values(sub_payload, rows, sub_metadata)
+
     result: list[Any] = []
     for row in range(rows):
         if bool(null_mask[row]):
             result.append(None)
         else:
-            result.append({
-                key: values[row]
-                for key, values in key_values.items()
-                if values[row] is not None
-            })
+            d: dict[str, Any] = {}
+            for key in keys:
+                val = key_values[key][row]
+                if val is not None:
+                    d[key] = val
+            result.append(d)
     return result
+
 
 def _encode_typed_ragged_values(
     values: list[Any], dtype_hint: np.dtype[Any] | None = None
@@ -2815,11 +2845,13 @@ def _encode_typed_ragged_values(
             "ndims": ndims,
             "nulls": nulls,
         },
-        {"dtype": str(data.dtype), "max_ndim": int(max_ndim), "shape_policy": "ragged"},
+        {"dtype": str(dtype), "max_ndim": int(max_ndim), "shape_policy": "ragged"},
     )
 
 
-def _decode_typed_ragged_values(payload: dict[str, Any], rows: int) -> list[Any]:
+def _decode_typed_ragged_values(
+    payload: dict[str, Any], rows: int, metadata: Optional[Mapping[str, Any]] = None
+) -> list[Any]:
     data = payload["data"]
     offsets = payload["offsets"]
     shapes = payload["shapes"]
@@ -5101,6 +5133,243 @@ def _tensor_payload_parts(value: _TensorPayload) -> tuple[bytes, int, int, Any]:
     return bytes(metadata), int(data_ptr), int(tensor_nbytes), owner
 
 
+def _encode_recursive_if_structured(
+    path: str, values: list[Any]
+) -> "_EncodedStructuredLeaf | None":
+    leaves: list[_InferredLeaf] = []
+    nodes: list[_InferredNode] = []
+    infer_structure(path, values, leaves, nodes)
+    if not nodes or not any(
+        (leaf.decision.codec == "typed_ragged" and leaf.decision.metadata.get("recursive_source") == "ndarray")
+        or leaf.decision.codec in {"ragged_tensor", "bytes_ragged", "media_bytes", "media_list_ragged"}
+        for leaf in leaves
+    ):
+        return None
+    payload: dict[str, Any] = {}
+    node_specs: list[dict[str, Any]] = []
+    for node_id, node in enumerate(nodes):
+        spec: dict[str, Any] = {
+            "id": node_id,
+            "path": node.path,
+            "node_type": node.node_type,
+            "children": list(node.children),
+        }
+        missing_payload_name = f"node.{node_id}.missing"
+        payload[missing_payload_name] = np.asarray(
+            [_lookup_structured_path(value, path, node.path) is MISSING for value in values],
+            dtype=np.bool_,
+        )
+        spec["missing_payload"] = missing_payload_name
+        if node.row_mask is not None:
+            payload_name = f"node.{node_id}.row_mask"
+            payload[payload_name] = np.asarray(node.row_mask, dtype=np.bool_)
+            spec["row_mask_payload"] = payload_name
+        if node.lengths is not None:
+            payload_name = f"node.{node_id}.lengths"
+            payload[payload_name] = np.asarray(node.lengths, dtype=np.int64)
+            spec["lengths_payload"] = payload_name
+        node_specs.append(spec)
+
+    leaf_specs: list[dict[str, Any]] = []
+    for leaf_id, leaf in enumerate(leaves):
+        missing = np.asarray(
+            [isinstance(value, _Missing) for value in leaf.values], dtype=np.bool_
+        )
+        codec_values = [
+            None if is_missing else value
+            for is_missing, value in zip(missing, leaf.values)
+        ]
+        decision = leaf.decision
+        if not decision.accepted and all(
+            value is None or isinstance(value, _Missing) for value in leaf.values
+        ):
+            decision = _CodecDecision(True, "json_ragged", "all rows are null or missing", "json")
+        encoded = _encode_with_schema(
+            leaf.path,
+            np.asarray(
+                _normalize_values_for_fallback_codec(codec_values, decision.codec),
+                dtype=object,
+            ),
+            FieldSchema(codec=decision.codec, metadata=decision.metadata),
+        )
+        leaf_payload_members: dict[str, str] = {}
+        for payload_name, payload_value in encoded.payload.items():
+            recursive_payload_name = f"leaf.{leaf_id}.{payload_name}"
+            payload[recursive_payload_name] = payload_value
+            leaf_payload_members[payload_name] = recursive_payload_name
+        missing_payload_name = f"leaf.{leaf_id}.missing"
+        payload[missing_payload_name] = missing
+        leaf_payload_members["missing"] = missing_payload_name
+        leaf_specs.append(
+            {
+                "id": leaf_id,
+                "path": leaf.path,
+                "codec": encoded.codec,
+                "rows": encoded.rows,
+                "metadata": encoded.metadata,
+                "payload_members": leaf_payload_members,
+            }
+        )
+    return _EncodedStructuredLeaf(
+        codec="structured_recursive",
+        rows=len(values),
+        payload=payload,
+        metadata={
+            "schema_source": "inferred_from_runtime_values",
+            "structure_version": 1,
+            "root_path": path,
+            "nodes": node_specs,
+            "leaves": leaf_specs,
+        },
+    )
+
+
+
+def _encode_with_fallback(path: str, value: np.ndarray) -> "_EncodedStructuredLeaf":
+    """Encode using safe type-based fallbacks, with recursive expansion for structured rows."""
+    values = list(value)
+    errors: list[str] = []
+    try:
+        recursive = _encode_recursive_if_structured(path, values)
+        if recursive is not None:
+            return recursive
+    except _ENCODING_FALLBACK_ERRORS as error:
+        errors.append(f"structured_recursive: {error}")
+    decision = _choose_leaf_codec(values)
+    codecs = [decision.codec]
+    for codec in ("msgpack_ragged", "json_ragged"):
+        if codec not in codecs:
+            codecs.append(codec)
+    for codec in codecs:
+        metadata = dict(decision.metadata or {}) if codec == decision.codec else {}
+        codec_values = _normalize_values_for_fallback_codec(values, codec)
+        codec_array = np.asarray(codec_values, dtype=object)
+        try:
+            return _encode_with_schema(path, codec_array, FieldSchema(codec=codec, metadata=metadata))
+        except _ENCODING_FALLBACK_ERRORS as error:
+            errors.append(f"{codec}: {error}")
+    raise ValueError(
+        f"unable to infer a safe codec for structured non-tensor field {path!r}; "
+        f"tried {errors}"
+    )
+
+
+
+def _normalize_values_for_fallback_codec(values: list[Any], codec: str) -> list[Any]:
+    if codec in {"msgpack_ragged", "json_ragged"}:
+        return [_normalize_structured_scalar(value) for value in values]
+    return values
+
+
+
+def _normalize_structured_scalar(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        if value.dtype == object:
+            # Object ndarrays do not have a stable contiguous typed representation.
+            # For generic fallbacks, materialize their Python shape once so msgpack/json
+            # can preserve the logical nested values instead of treating the object array
+            # as a numeric ragged buffer.
+            return _normalize_structured_scalar(value.tolist())
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Mapping):
+        return {key: _normalize_structured_scalar(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_normalize_structured_scalar(item) for item in value]
+    return value
+
+
+
+def _encode_msgpack_ragged_values(
+    path: str, values: list[Any]
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    row_count = len(values)
+    offsets = np.empty(row_count + 1, dtype=np.int64)
+    nulls = np.empty(row_count, dtype=np.bool_)
+    offsets[0] = 0
+    packer = _msgpack.Packer(use_bin_type=True, strict_types=True)
+    buf = bytearray()
+    try:
+        for i, value in enumerate(values):
+            if value is None:
+                nulls[i] = True
+                offsets[i + 1] = offsets[i]
+            else:
+                buf.extend(packer.pack(value))
+                nulls[i] = False
+                offsets[i + 1] = len(buf)
+    except TypeError as exc:
+        raise ValueError(
+            f"unsupported structured non-tensor field {path}: "
+            "msgpack codec cannot encode value"
+        ) from exc
+    return (
+        {"data": buf, "offsets": offsets, "nulls": nulls},
+        {},
+    )
+
+
+
+def _decode_msgpack_ragged_values(payload: dict[str, Any], rows: int) -> list[Any]:
+    data = payload["data"]
+    offsets = payload["offsets"]
+    nulls = payload["nulls"]
+    if len(offsets) != rows + 1:
+        raise ValueError(
+            f"msgpack_ragged offsets length {len(offsets)} does not match rows {rows}"
+        )
+    if len(nulls) != rows:
+        raise ValueError(
+            f"msgpack_ragged nulls length {len(nulls)} does not match rows {rows}"
+        )
+    raw_data = bytes(data) if not isinstance(data, bytes) else data
+    values = []
+    for row, is_null in enumerate(nulls):
+        if bool(is_null):
+            values.append(None)
+        else:
+            begin = int(offsets[row])
+            end = int(offsets[row + 1])
+            values.append(_msgpack.unpackb(raw_data[begin:end], raw=False))
+    return values
+
+
+class _OwnerBackedList(list):
+    def __init__(self, values: Sequence[Any], owner: Any) -> None:
+        super().__init__(values)
+        self._mooncake_pool_owner = owner
+
+
+
+class _OwnerBackedObjectArray(np.ndarray):
+    def __array_finalize__(self, obj: Any) -> None:
+        if obj is not None:
+            self._mooncake_pool_owner = getattr(obj, "_mooncake_pool_owner", None)
+
+    def tolist(self) -> list[Any]:
+        values = super().tolist()
+        owner = getattr(self, "_mooncake_pool_owner", None)
+        if owner is None:
+            return values
+        return _OwnerBackedList(values, owner)
+
+
+
+def _object_array_from_decoded_values(values: list[Any]) -> np.ndarray:
+    array = np.empty(len(values), dtype=object)
+    array[:] = values
+    owner = getattr(values, "_mooncake_pool_owner", None) or next(
+        (getattr(v, "_mooncake_pool_owner", None) for v in values if v is not None), None
+    )
+    if owner is None:
+        return array
+    result = array.view(_OwnerBackedObjectArray)
+    result._mooncake_pool_owner = owner
+    return result
+
+
+
 def _has_tensor_codec_helpers() -> bool:
     return (
         _mooncake_store is not None
@@ -5633,13 +5902,52 @@ _CODEC_PREDICATES: tuple[Any, ...] = (
 
 
 def _choose_leaf_codec(values: list[Any]) -> _CodecDecision:
-    for predicate in _CODEC_PREDICATES:
-        decision = predicate(values)
-        if decision.accepted:
-            return decision
-    return _CodecDecision(
-        False, "pickle_ragged_fallback", "no optimized codec matched", "python object"
-    )
+    nn = _non_null(values)
+    if not nn:
+        return _CodecDecision(False, "msgpack_ragged", "all rows are null", "msgpack")
+    if _torch is not None and all(isinstance(value, _torch.Tensor) for value in nn):
+        dtypes = {value.dtype for value in nn}
+        if len(dtypes) != 1:
+            return _CodecDecision(
+                False,
+                "ragged_tensor",
+                f"mixed tensor dtype: {sorted(str(dtype) for dtype in dtypes)}",
+                "torch.Tensor",
+            )
+        dtype = str(nn[0].dtype)
+        return _CodecDecision(True, "ragged_tensor", "all non-null rows are Tensor", "torch.Tensor", {"dtype": dtype})
+    if all(_is_media_list(value) for value in nn):
+        return _CodecDecision(True, "media_list_ragged", "all rows are media lists", "media list")
+    if all(isinstance(value, np.ndarray) for value in nn):
+        if all(np.issubdtype(value.dtype, np.number) for value in nn):
+            return _CodecDecision(
+                True,
+                "typed_ragged",
+                "all rows are numeric ndarray",
+                "numeric sequence",
+                {"recursive_source": "ndarray"},
+            )
+        return _CodecDecision(False, "msgpack_ragged", "object ndarray rows", "python object")
+    if all(isinstance(value, (list, tuple)) for value in nn):
+        try:
+            dtypes = [np.asarray(value).dtype for value in nn]
+            dtype = np.result_type(*dtypes)
+        except (TypeError, ValueError, OverflowError):
+            dtype = None
+        if dtype is not None and np.issubdtype(dtype, np.number):
+            return _CodecDecision(True, "typed_ragged", "all rows are numeric sequences", "numeric sequence", {"dtype": str(dtype)})
+    if all(isinstance(value, (bool, int, float, np.number)) for value in nn):
+        dtype = np.result_type(*nn)
+        return _CodecDecision(True, "ndarray", "all rows are numeric scalar", "numeric scalar", {"dtype": str(dtype)})
+    if all(_is_bytes_like(value) for value in nn):
+        return _CodecDecision(True, "bytes_ragged", "all rows are bytes-like", "bytes-like")
+    if all(_is_pil_image(value) for value in nn):
+        return _CodecDecision(True, "media_bytes", "all rows are media", "media")
+    if all(isinstance(value, str) for value in nn):
+        return _CodecDecision(True, "utf8_ragged", "all rows are str", "str")
+    if all(isinstance(value, (dict, list, tuple)) for value in nn):
+        return _CodecDecision(True, "msgpack_ragged", "all rows are msgpack-like", "msgpack")
+    return _CodecDecision(False, "msgpack_ragged", "no codec matched", "python object")
 
 
 def _try_expand_dict(values: list[Any]) -> list[str] | None:
