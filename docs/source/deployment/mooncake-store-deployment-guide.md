@@ -358,7 +358,7 @@ In HA mode, quota admin requests are served only by the active master service. S
 :maxdepth: 1
 :hidden:
 
-KV Cache Sharing and Isolation<kv-cache-sharing-and-isolation/index>
+KV Cache Sharing and Isolation<kv-cache-sharing-and-isolation>
 SSD Storage<ssd/index>
 HF3FS Plugin (Experimental)<../getting_started/plugin-usage/3FS-USRBIO-Plugin>
 ../getting_started/observability
