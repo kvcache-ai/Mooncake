@@ -18,6 +18,7 @@
 #include <sys/mman.h>
 #include <sys/time.h>
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <cstddef>
@@ -25,6 +26,7 @@
 #include <future>
 #include <set>
 #include <thread>
+#include <utility>
 
 #include <dlfcn.h>
 
@@ -213,7 +215,6 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
                                                bool update_metadata,
                                                bool force_sequential) {
     (void)remote_accessible;
-    BufferDesc buffer_desc;
     const int kBaseAccessRights = IBV_ACCESS_LOCAL_WRITE |
                                   IBV_ACCESS_REMOTE_WRITE |
                                   IBV_ACCESS_REMOTE_READ;
@@ -222,40 +223,49 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     if (MCIbRelaxedOrderingEnabled) {
         access_rights |= IBV_ACCESS_RELAXED_ORDERING;
     }
-    bool do_pre_touch = context_list_.size() > 0 &&
-                        std::thread::hardware_concurrency() >= 4 &&
-                        length >= (size_t)4 * 1024 * 1024 * 1024;
-    if (do_pre_touch) {
-        // Parallel Pre-touch the memory to speedup the registration process.
-        int ret = preTouchMemory(addr, length);
-        if (ret != 0) {
-            return ret;
+
+    // Mooncake#2017: ibv_reg_mr silently truncates a registration to the device
+    // max_mr_size, but the metadata would still advertise the full BufferDesc
+    // length, so any remote RDMA op past the boundary fails with
+    // IBV_WC_REM_ACCESS_ERR (ionic CQE error 10). Split buffers larger than
+    // max_mr_size into chunks of <= max_mr_size, register each as its own MR,
+    // and publish one BufferDesc per chunk (the per-context rkey/lkey lookups
+    // are address-range based, so each chunk gets the correct key).
+    size_t chunk_limit = (size_t)globalConfig().max_mr_size;
+    std::vector<std::pair<void *, size_t>> chunks;
+    if (chunk_limit > 0 && length > chunk_limit) {
+        for (size_t offset = 0; offset < length;) {
+            size_t chunk_len = std::min(chunk_limit, length - offset);
+            chunks.emplace_back(static_cast<char *>(addr) + offset, chunk_len);
+            offset += chunk_len;
         }
+        LOG(WARNING) << "Auto-splitting buffer " << addr << " (" << length
+                     << " bytes) into " << chunks.size()
+                     << " chunks of <= " << chunk_limit
+                     << " bytes each (device max_mr_size; Mooncake#2017)";
+    } else {
+        chunks.emplace_back(addr, length);
     }
 
-    /* Parallel register when:
-    1. parallel_reg_mr is enabled via MC_ENABLE_PARALLEL_REG_MR;
-    2. parallel_reg_mr not set and multiple contexts exist and memory has been
-    pre-touched
-    Note: If memory hasn't been touched, parallel register can be
-    slower. Details in: https://github.com/kvcache-ai/Mooncake/issues/848
-    Note: force_sequential is used by batch operations to avoid nested
-    parallelism.
-    */
-    int use_parallel_reg = 0;
-    if (!force_sequential) {
-        use_parallel_reg = globalConfig().parallel_reg_mr;
-        if (use_parallel_reg == -1) {
-            use_parallel_reg = context_list_.size() > 1 && do_pre_touch;
-        }
+    // Resolve the location name once, from the original buffer.
+    std::string resolved_name;
+    if (name == kWildcardLocation) {
+        bool only_first_page = true;
+        const std::vector<MemoryLocationEntry> entries =
+            getMemoryLocation(addr, length, only_first_page);
+        if (entries.empty()) return -1;
+        resolved_name = entries[0].location;
+    } else {
+        resolved_name = name;
     }
 
-    // Export a single dma_buf fd for the buffer and import it into every NIC's
-    // PD below, closing it once after all registrations. One dma_buf object
-    // shared across NICs lets the GPU driver reserve a single BAR1 window for
-    // the buffer instead of one per NIC. Host memory yields an empty export and
-    // takes the plain ibv_reg_mr path. The fd must stay open across all
-    // registrations (each MR takes its own reference); see exportDmabuf().
+    // Export a single dma_buf fd for the whole buffer and import it into every
+    // NIC's PD during each chunk's registration below (one dma_buf object
+    // shared across NICs keeps a single BAR1 window for the buffer instead of
+    // one per NIC). Host memory yields an empty export (plain ibv_reg_mr). The
+    // fd must stay open across every registration that consumes it (each MR
+    // takes its own reference), so it is closed once, on any return path, by
+    // the RAII guard below.
     DmabufExport dmabuf_exp;
     if (!context_list_.empty()) {
         int eret = RdmaContext::exportDmabuf(addr, dmabuf_exp);
@@ -264,97 +274,189 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
             return eret;
         }
     }
+    struct DmabufCloser {
+        DmabufExport &exp;
+        ~DmabufCloser() { RdmaContext::closeDmabufExport(exp); }
+    } dmabuf_closer{dmabuf_exp};
 
-    auto reg_start = std::chrono::steady_clock::now();
+    // Best-effort unregister of ONE chunk's MRs across all contexts. Used to
+    // clean up a chunk whose registration failed part-way (some contexts
+    // succeeded, one failed) BEFORE its metadata was committed — that chunk is
+    // not a "committed" chunk, so rollbackChunks() below must not touch its
+    // (never-added) metadata, but its partial MRs still need releasing.
+    auto unregisterChunkMRs = [&](void *chunk_addr) {
+        for (auto &context : context_list_) {
+            int ret = context->unregisterMemoryRegion(chunk_addr);
+            if (ret)
+                LOG(WARNING) << "Rollback: failed to unregister chunk MR at "
+                             << chunk_addr << " (ret=" << ret << ")";
+        }
+    };
 
-    int reg_error = 0;
-    if (use_parallel_reg) {
-        std::vector<std::thread> reg_threads;
-        reg_threads.reserve(context_list_.size());
-        std::vector<int> ret_codes(context_list_.size(), 0);
-        const int ar = access_rights;  // Local copy for lambda capture
+    // Best-effort rollback of the first `committed` FULLY-committed chunks
+    // (metadata added to the local segment desc AND MRs registered), i.e.
+    // chunks [0, committed). Pass the count of chunks whose
+    // addLocalMemoryBuffer has succeeded — `committed == 0` is a no-op (nothing
+    // to undo). Metadata is removed WITHOUT a per-chunk publish; one
+    // updateLocalSegmentDesc() at the end republishes the cleaned desc.
+    auto rollbackChunks = [&](size_t committed) {
+        size_t n = std::min(committed, chunks.size());
+        for (size_t ri = 0; ri < n; ++ri) {
+            int rc = metadata_->removeLocalMemoryBuffer(
+                chunks[ri].first, /*update_metadata=*/false);
+            if (rc)
+                LOG(WARNING) << "Rollback: failed to remove metadata for chunk "
+                                "at "
+                             << chunks[ri].first << " (ret=" << rc << ")";
+            unregisterChunkMRs(chunks[ri].first);
+        }
+        if (n > 0 && update_metadata) metadata_->updateLocalSegmentDesc();
+    };
 
-        for (size_t i = 0; i < context_list_.size(); ++i) {
-            reg_threads.emplace_back(
-                [this, &ret_codes, &dmabuf_exp, i, addr, length, ar]() {
+    // Pre-touch decision is loop-invariant: it depends only on context_list_,
+    // hardware_concurrency(), and the ORIGINAL buffer length (never chunk_len,
+    // which is capped at max_mr_size and would silently disable pre-touch for a
+    // >=4GiB buffer). Compute once above the loop to avoid repeated
+    // hardware_concurrency() OS queries per chunk.
+    const bool do_pre_touch = context_list_.size() > 0 &&
+                              std::thread::hardware_concurrency() >= 4 &&
+                              length >= (size_t)4 * 1024 * 1024 * 1024;
+
+    for (size_t ci = 0; ci < chunks.size(); ++ci) {
+        void *chunk_addr = chunks[ci].first;
+        size_t chunk_len = chunks[ci].second;
+
+        if (do_pre_touch) {
+            // Parallel pre-touch the memory to speed up registration.
+            int ret = preTouchMemory(chunk_addr, chunk_len);
+            if (ret != 0) {
+                // pre-touch is before MR registration for chunk ci, so ci has
+                // no MR/metadata yet: roll back only committed chunks [0, ci).
+                rollbackChunks(ci);
+                return ret;
+            }
+        }
+
+        /* Parallel register when:
+        1. parallel_reg_mr is enabled via MC_ENABLE_PARALLEL_REG_MR;
+        2. parallel_reg_mr not set, multiple contexts exist, memory pre-touched.
+        force_sequential is used by batch operations to avoid nested
+        parallelism.
+        */
+        int use_parallel_reg = 0;
+        if (!force_sequential) {
+            use_parallel_reg = globalConfig().parallel_reg_mr;
+            if (use_parallel_reg == -1) {
+                use_parallel_reg = context_list_.size() > 1 && do_pre_touch;
+            }
+        }
+
+        auto reg_start = std::chrono::steady_clock::now();
+
+        if (use_parallel_reg) {
+            std::vector<std::thread> reg_threads;
+            reg_threads.reserve(context_list_.size());
+            std::vector<int> ret_codes(context_list_.size(), 0);
+            const int ar = access_rights;  // Local copy for lambda capture
+
+            for (size_t i = 0; i < context_list_.size(); ++i) {
+                reg_threads.emplace_back([this, &ret_codes, &dmabuf_exp, i,
+                                          chunk_addr, chunk_len, ar]() {
                     ret_codes[i] = context_list_[i]->registerMemoryRegion(
-                        addr, length, ar, dmabuf_exp);
+                        chunk_addr, chunk_len, ar, dmabuf_exp);
                 });
-        }
+            }
 
-        for (auto &thread : reg_threads) {
-            thread.join();
-        }
+            for (auto &thread : reg_threads) thread.join();
 
-        for (size_t i = 0; i < ret_codes.size(); ++i) {
-            if (ret_codes[i] != 0) {
-                LOG(ERROR) << "Failed to register memory region with context "
-                           << i;
-                reg_error = ret_codes[i];
-                break;
+            for (size_t i = 0; i < ret_codes.size(); ++i) {
+                if (ret_codes[i] != 0) {
+                    LOG(ERROR) << "Failed to register memory region (chunk "
+                               << ci << ") with context " << i;
+                    // chunk ci's MRs are partially registered but its metadata
+                    // was never added; release ci's MRs, then roll back the
+                    // committed chunks [0, ci).
+                    unregisterChunkMRs(chunk_addr);
+                    rollbackChunks(ci);
+                    return ret_codes[i];
+                }
+            }
+        } else {
+            for (size_t i = 0; i < context_list_.size(); ++i) {
+                int ret = context_list_[i]->registerMemoryRegion(
+                    chunk_addr, chunk_len, access_rights, dmabuf_exp);
+                if (ret) {
+                    LOG(ERROR) << "Failed to register memory region (chunk "
+                               << ci << ") with context " << i;
+                    // chunk ci's MRs are partially registered but its metadata
+                    // was never added; release ci's MRs, then roll back [0,
+                    // ci).
+                    unregisterChunkMRs(chunk_addr);
+                    rollbackChunks(ci);
+                    return ret;
+                }
             }
         }
-    } else {
-        for (size_t i = 0; i < context_list_.size(); ++i) {
-            int ret = context_list_[i]->registerMemoryRegion(
-                addr, length, access_rights, dmabuf_exp);
-            if (ret) {
-                LOG(ERROR) << "Failed to register memory region with context "
-                           << i;
-                reg_error = ret;
-                break;
-            }
+
+        auto reg_end = std::chrono::steady_clock::now();
+        auto reg_duration_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(reg_end -
+                                                                  reg_start)
+                .count();
+        if (globalConfig().trace) {
+            LOG(INFO) << "registerMemoryRegion: chunk " << ci << "/"
+                      << chunks.size() << ", addr=" << chunk_addr
+                      << ", length=" << chunk_len
+                      << ", contexts=" << context_list_.size()
+                      << ", parallel=" << (use_parallel_reg ? "true" : "false")
+                      << ", duration=" << reg_duration_ms << "ms";
         }
-    }
 
-    // Close the single dma_buf fd now that all NIC registrations are done.
-    // Each successful MR holds its own reference, so the underlying dma_buf
-    // (and its BAR1 window) stays alive until those MRs are deregistered.
-    RdmaContext::closeDmabufExport(dmabuf_exp);
-
-    if (reg_error != 0) {
-        return reg_error;
-    }
-
-    auto reg_end = std::chrono::steady_clock::now();
-    auto reg_duration_ms =
-        std::chrono::duration_cast<std::chrono::milliseconds>(reg_end -
-                                                              reg_start)
-            .count();
-
-    if (globalConfig().trace) {
-        LOG(INFO) << "registerMemoryRegion: addr=" << addr
-                  << ", length=" << length
-                  << ", contexts=" << context_list_.size()
-                  << ", parallel=" << (use_parallel_reg ? "true" : "false")
-                  << ", duration=" << reg_duration_ms << "ms";
-    }
-
-    // Collect keys from all contexts
-    for (auto &context : context_list_) {
-        buffer_desc.lkey.push_back(context->lkey(addr));
-        buffer_desc.rkey.push_back(context->rkey(addr));
-    }
-
-    // Get the memory location automatically after registered MR(pinned),
-    // when the name is kWildcardLocation("*").
-    if (name == kWildcardLocation) {
-        bool only_first_page = true;
-        const std::vector<MemoryLocationEntry> entries =
-            getMemoryLocation(addr, length, only_first_page);
-        if (entries.empty()) return -1;
-        buffer_desc.name = entries[0].location;
-    } else {
-        buffer_desc.name = name;
-    }
-
-    buffer_desc.addr = (uint64_t)addr;
-    buffer_desc.length = length;
+        // Collect per-context keys for THIS chunk (address-range lookup).
+        BufferDesc buffer_desc;
+        for (auto &context : context_list_) {
+            buffer_desc.lkey.push_back(context->lkey(chunk_addr));
+            buffer_desc.rkey.push_back(context->rkey(chunk_addr));
+        }
+        buffer_desc.name = resolved_name;
+        buffer_desc.addr = (uint64_t)chunk_addr;
+        buffer_desc.length = chunk_len;
 #ifdef ENABLE_MULTI_PROTOCOL
-    buffer_desc.protocol = "rdma";
+        buffer_desc.protocol = "rdma";
 #endif
-    int rc = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
-    if (rc) return rc;
+        // Add to the LOCAL segment desc only (update_metadata=false); a chunked
+        // buffer otherwise publishes to the metadata server once PER CHUNK. We
+        // publish once, below, after every chunk has been added.
+        int rc = metadata_->addLocalMemoryBuffer(buffer_desc,
+                                                 /*update_metadata=*/false);
+        if (rc) {
+            // ci's MRs are registered but its metadata add failed; release ci's
+            // MRs, then roll back the committed chunks [0, ci).
+            unregisterChunkMRs(chunk_addr);
+            rollbackChunks(ci);
+            return rc;
+        }
+    }
+
+    // Publish the accumulated per-chunk BufferDescs in a SINGLE metadata update
+    // (a chunked buffer otherwise publishes once per chunk).
+    if (update_metadata) {
+        int rc = metadata_->updateLocalSegmentDesc();
+        if (rc) {
+            rollbackChunks(chunks.size());
+            return rc;
+        }
+    }
+
+    // Remember chunk start-addresses so unregisterLocalMemory(addr) (which only
+    // gets the base addr) can clean up every chunk.
+    if (chunks.size() > 1) {
+        std::lock_guard<std::mutex> lock(chunk_map_mutex_);
+        std::vector<uint64_t> chunk_addrs;
+        chunk_addrs.reserve(chunks.size());
+        for (auto &c : chunks) chunk_addrs.push_back((uint64_t)c.first);
+        chunk_map_[(uint64_t)addr] = std::move(chunk_addrs);
+    }
     return 0;
 }
 
@@ -365,6 +467,80 @@ int RdmaTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
 int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
                                                  bool update_metadata,
                                                  bool force_sequential) {
+    // Mooncake#2017: if this base buffer was split into chunks at registration,
+    // unregister each chunk's MR + metadata entry (unregisterLocalMemory only
+    // receives the base addr).
+    std::vector<uint64_t> chunk_addrs;
+    {
+        std::lock_guard<std::mutex> lock(chunk_map_mutex_);
+        auto it = chunk_map_.find((uint64_t)addr);
+        if (it != chunk_map_.end()) {
+            chunk_addrs = std::move(it->second);
+            chunk_map_.erase(it);
+        }
+    }
+    if (!chunk_addrs.empty()) {
+        // Unregister EVERY chunk even if one fails; chunk_map_ was already
+        // erased, so an early return would leak the remaining chunks' MRs +
+        // metadata. Remember the first error and report it at the end.
+        int first_err = 0;
+
+        // Metadata: remove each chunk from the local desc WITHOUT publishing (a
+        // chunked buffer otherwise publishes to the metadata server once per
+        // chunk); publish once after all removals, below.
+        for (uint64_t ca : chunk_addrs) {
+            int rc = metadata_->removeLocalMemoryBuffer(
+                reinterpret_cast<void *>(ca), /*update_metadata=*/false);
+            if (rc && !first_err) first_err = rc;
+        }
+
+        // MRs: unregister across contexts in PARALLEL (one thread per context,
+        // each releasing all chunks) — the previous code did chunks × contexts
+        // fully sequentially (e.g. 4 chunks × 8 NICs = 32 sequential
+        // ibv_dereg_mr). Mirrors the parallel path used for single buffers.
+        int use_parallel_unreg = 0;
+        if (!force_sequential) {
+            use_parallel_unreg = globalConfig().parallel_reg_mr;
+            if (use_parallel_unreg == -1)
+                use_parallel_unreg = context_list_.size() > 1;
+        }
+        if (use_parallel_unreg) {
+            std::vector<std::thread> threads;
+            threads.reserve(context_list_.size());
+            std::vector<int> ret_codes(context_list_.size(), 0);
+            for (size_t i = 0; i < context_list_.size(); ++i) {
+                threads.emplace_back([this, &ret_codes, i, &chunk_addrs]() {
+                    for (uint64_t ca : chunk_addrs) {
+                        int ret = context_list_[i]->unregisterMemoryRegion(
+                            reinterpret_cast<void *>(ca));
+                        if (ret && !ret_codes[i]) ret_codes[i] = ret;
+                    }
+                });
+            }
+            for (auto &t : threads) t.join();
+            for (int rc : ret_codes)
+                if (rc && !first_err) first_err = rc;
+        } else {
+            for (uint64_t ca : chunk_addrs)
+                for (auto &context : context_list_) {
+                    int ret = context->unregisterMemoryRegion(
+                        reinterpret_cast<void *>(ca));
+                    if (ret) {
+                        LOG(ERROR) << "Failed to unregister chunk MR at "
+                                   << reinterpret_cast<void *>(ca);
+                        if (!first_err) first_err = ret;
+                    }
+                }
+        }
+
+        // Single metadata publish covering all removed chunks.
+        if (update_metadata) {
+            int rc = metadata_->updateLocalSegmentDesc();
+            if (rc && !first_err) first_err = rc;
+        }
+        return first_err;
+    }
+
     int rc = metadata_->removeLocalMemoryBuffer(addr, update_metadata);
     if (rc) return rc;
 
