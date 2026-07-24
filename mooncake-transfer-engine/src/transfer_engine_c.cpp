@@ -16,8 +16,12 @@
 
 #include <cstdio>
 #include <cstdint>
+#include <limits>
 #include <memory>
 
+#include <glog/logging.h>
+
+#include "error.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
 #ifdef USE_EFA
@@ -42,7 +46,11 @@ transfer_engine_t createTransferEngine(const char *metadata_conn_string,
 
 int discoverTopology(transfer_engine_t engine) {
     TransferEngine *native = (TransferEngine *)engine;
-    return native->getLocalTopology()->discover({});
+    if (!native) return ERR_INVALID_ARGUMENT;
+    if (native->isUsingTent()) return 0;
+    auto topology = native->getLocalTopology();
+    if (!topology) return ERR_CONTEXT;
+    return topology->discover({});
 }
 
 int getLocalIpAndPort(transfer_engine_t engine, char *buf_out, size_t buf_len) {
@@ -70,15 +78,37 @@ void destroyTransferEngine(transfer_engine_t engine) {
 
 segment_id_t openSegment(transfer_engine_t engine, const char *segment_name) {
     TransferEngine *native = (TransferEngine *)engine;
-    return native->openSegment(segment_name);
+    if (!native || !segment_name) return ERR_INVALID_ARGUMENT;
+    auto handle = native->openSegment(segment_name);
+    if (handle == static_cast<Transport::SegmentHandle>(-1)) {
+        return ERR_INVALID_ARGUMENT;
+    }
+    if (handle > static_cast<Transport::SegmentHandle>(
+                     std::numeric_limits<segment_id_t>::max())) {
+        LOG(ERROR) << "Segment handle " << handle
+                   << " exceeds TE C API segment_id_t width";
+        return ERR_INVALID_ARGUMENT;
+    }
+    return static_cast<segment_id_t>(handle);
 }
 
 segment_id_t openSegmentNoCache(transfer_engine_t engine,
                                 const char *segment_name) {
     TransferEngine *native = (TransferEngine *)engine;
+    if (!native || !segment_name) return ERR_INVALID_ARGUMENT;
     int rc = native->syncSegmentCache(segment_name);
     if (rc) return rc;
-    return native->openSegment(segment_name);
+    auto handle = native->openSegment(segment_name);
+    if (handle == static_cast<Transport::SegmentHandle>(-1)) {
+        return ERR_INVALID_ARGUMENT;
+    }
+    if (handle > static_cast<Transport::SegmentHandle>(
+                     std::numeric_limits<segment_id_t>::max())) {
+        LOG(ERROR) << "Segment handle " << handle
+                   << " exceeds TE C API segment_id_t width";
+        return ERR_INVALID_ARGUMENT;
+    }
+    return static_cast<segment_id_t>(handle);
 }
 
 int closeSegment(transfer_engine_t engine, segment_id_t segment_id) {

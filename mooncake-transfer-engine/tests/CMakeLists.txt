@@ -117,6 +117,15 @@ add_executable(dmabuf_export_test ${WORKSPACE}/dmabuf_export_test.cpp)
 target_link_libraries(dmabuf_export_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME dmabuf_export_test COMMAND dmabuf_export_test)
 
+if(USE_TENT)
+  add_executable(transfer_engine_tent_compat_test
+                 ${WORKSPACE}/transfer_engine_tent_compat_test.cpp)
+  target_link_libraries(transfer_engine_tent_compat_test
+                        PUBLIC transfer_engine gtest gtest_main asio_shared)
+  add_test(NAME transfer_engine_tent_compat_test
+           COMMAND transfer_engine_tent_compat_test)
+endif()
+
 if(USE_MNNVL)
   add_executable(nvlink_transport_test ${WORKSPACE}/nvlink_transport_test.cpp)
   target_link_libraries(nvlink_transport_test PUBLIC transfer_engine gtest

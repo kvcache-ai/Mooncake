@@ -302,6 +302,7 @@ class TransferEngine {
                                MemoryOptions& options);
 
    public:
+    // Returns 0 on allocation failure; valid batch IDs are non-zero.
     BatchID allocateBatch(size_t batch_size);
 
     Status freeBatch(BatchID batch_id);
