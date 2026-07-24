@@ -77,6 +77,26 @@ namespace benchmarks {
 class BatchEvictBench;
 }  // namespace benchmarks
 
+#ifdef MOONCAKE_ENABLE_TEST_CHECKPOINTS
+enum class MasterTestCheckpoint {
+    UPSERT_AFTER_PREEMPT,
+    ADD_REPLICA_AFTER_TENANT_VALIDATION,
+};
+
+struct MasterTestCheckpointEvent {
+    MasterTestCheckpoint checkpoint;
+    TenantId tenant_id;
+    std::string key;
+    UUID client_id;
+};
+
+class MasterTestCheckpointSink {
+   public:
+    virtual ~MasterTestCheckpointSink() = default;
+    virtual void Reach(const MasterTestCheckpointEvent& event) = 0;
+};
+#endif
+
 /*
  * @brief MasterService is the main class for the master server.
  * Lock order: To avoid deadlocks, the following lock order should be followed:
@@ -114,6 +134,11 @@ class MasterService {
     MasterService();
     MasterService(const MasterServiceConfig& config);
     ~MasterService();
+
+#ifdef MOONCAKE_ENABLE_TEST_CHECKPOINTS
+    void SetCheckpointSinkForTesting(
+        std::shared_ptr<MasterTestCheckpointSink> sink);
+#endif
 
     void SetNoFProbeFnForTesting(NoFProbeFn fn);
     size_t GetMountedNoFSegmentCountForTesting();
@@ -808,6 +833,12 @@ class MasterService {
     void setHttpMetadataRemoteUrl(const std::string& metadata_connstring);
 
    private:
+#ifdef MOONCAKE_ENABLE_TEST_CHECKPOINTS
+    void ReachTestCheckpoint(MasterTestCheckpoint checkpoint,
+                             const TenantId& tenant_id, const std::string& key,
+                             const UUID& client_id);
+#endif
+
     std::unique_ptr<ha::SnapshotCatalogStore> CreateSnapshotCatalogStore();
 
     // Restore master state
@@ -1999,6 +2030,9 @@ class MasterService {
     const std::string tenant_quota_connector_type_;
     const std::string tenant_quota_connector_uri_;
     std::unique_ptr<TenantQuotaPolicyStore> tenant_quota_policy_store_;
+#ifdef MOONCAKE_ENABLE_TEST_CHECKPOINTS
+    std::shared_ptr<MasterTestCheckpointSink> test_checkpoint_sink_;
+#endif
     mutable std::mutex tenant_quota_policy_mutex_;
     mutable std::mutex tenant_quota_recompute_mutex_;
     ShardedTenantQuotaTable<1024> tenant_quota_table_;

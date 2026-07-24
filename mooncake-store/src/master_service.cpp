@@ -51,6 +51,25 @@
 
 namespace mooncake {
 
+#ifdef MOONCAKE_ENABLE_TEST_CHECKPOINTS
+void MasterService::SetCheckpointSinkForTesting(
+    std::shared_ptr<MasterTestCheckpointSink> sink) {
+    std::atomic_store_explicit(&test_checkpoint_sink_, std::move(sink),
+                               std::memory_order_release);
+}
+
+void MasterService::ReachTestCheckpoint(MasterTestCheckpoint checkpoint,
+                                        const TenantId& tenant_id,
+                                        const std::string& key,
+                                        const UUID& client_id) {
+    auto sink = std::atomic_load_explicit(&test_checkpoint_sink_,
+                                          std::memory_order_acquire);
+    if (sink) {
+        sink->Reach({checkpoint, tenant_id, key, client_id});
+    }
+}
+#endif
+
 namespace {
 
 constexpr int kMaxTenantQuotaEvictionRetries = 2;
@@ -2922,6 +2941,14 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
             return tl::make_unexpected(normalized_tenant_result.error());
         }
         normalized_tenant = std::move(normalized_tenant_result.value());
+#ifdef MOONCAKE_ENABLE_TEST_CHECKPOINTS
+        // tenant_quota_policy_mutex_ is held. A concurrent policy deletion may
+        // be started while paused and will remain blocked until this operation
+        // is resumed.
+        ReachTestCheckpoint(
+            MasterTestCheckpoint::ADD_REPLICA_AFTER_TENANT_VALIDATION,
+            normalized_tenant, key, client_id);
+#endif
     }
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const ObjectIdentity object_id{std::move(normalized_tenant), key};
@@ -3226,6 +3253,15 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                       QuotaEraseMode::kFull, &shard);
                         it = tenant_state.metadata.end();
                     }
+#ifdef MOONCAKE_ENABLE_TEST_CHECKPOINTS
+                    // The metadata shard and snapshot shared lock are held
+                    // here. Tests may start a stale writer while paused, but
+                    // must resume this operation before waiting for that
+                    // writer.
+                    ReachTestCheckpoint(
+                        MasterTestCheckpoint::UPSERT_AFTER_PREEMPT,
+                        object_id.tenant_id, object_id.user_key, client_id);
+#endif
                 }
             }
 
