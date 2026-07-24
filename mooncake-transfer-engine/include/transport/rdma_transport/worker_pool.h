@@ -15,6 +15,8 @@
 #ifndef WORKER_H
 #define WORKER_H
 
+#include <array>
+#include <mutex>
 #include <queue>
 #include <unordered_set>
 
@@ -42,6 +44,9 @@ class WorkerPool {
    private:
     using SliceList = std::vector<Transport::Slice *>;
     const static int kShardCount = 8;
+    const static size_t kPostPollLockStripeCount = 256;
+
+    WorkerPool(RdmaContext &context, int numa_socket_id, bool start_workers);
 
     // Enqueue slices that were prepared by another WorkerPool. Used for
     // local-NIC failure handoff: the original worker keeps the remote path
@@ -55,6 +60,8 @@ class WorkerPool {
     void performPostSend(int thread_id);
 
     void performPollCq(int thread_id);
+
+    std::mutex &postPollMutexFor(const std::string &peer_nic_path);
 
     void redispatch(std::vector<Transport::Slice *> &slice_list, int thread_id,
                     bool handoff_to_local_worker = false);
@@ -141,6 +148,11 @@ class WorkerPool {
     std::atomic<uint64_t> last_poll_ts_ns_{0};
     std::atomic<uint64_t> last_poll_interval_ns_{0};
     std::atomic<uint64_t> max_poll_interval_ns_{0};
+
+    // Serializes CQ completion handling with the small post-send critical
+    // section for the same peer endpoint. Striped locks keep this bounded and
+    // avoid a shared map lookup on the CQ hot path.
+    std::array<std::mutex, kPostPollLockStripeCount> post_poll_mutexes_;
 
     std::mutex posted_slices_mutex_;
     std::unordered_set<Transport::Slice *> posted_slices_;
