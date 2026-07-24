@@ -116,38 +116,15 @@ def require_test_device(rank: int, device_type: str) -> torch.device:
 
 
 def mooncake_backend_options(
-    world_size: int,
-    device_type: str,
+    max_group_size: int,
     *,
-    active_value: int = 0,
-    is_extension: bool = False,
-    max_world_size: int | None = None,
+    auto_deactivate_on_failure: bool = True,
+    auto_sync_on_failure: bool = True,
 ) -> pg.MooncakeBackendOptions:
-    device = torch.device(device_type)
-    tensor_size = world_size if max_world_size is None else int(max_world_size)
-    active_ranks = torch.full(
-        (tensor_size,),
-        int(active_value),
-        dtype=torch.int32,
-        device=device,
-    )
-    if max_world_size is None:
-        if is_extension:
-            return pg.MooncakeBackendOptions(active_ranks, True)
-        return pg.MooncakeBackendOptions(active_ranks)
-    return pg.MooncakeBackendOptions(active_ranks, bool(is_extension), tensor_size)
-
-
-def mooncake_cpu_options(world_size: int) -> pg.MooncakeBackendOptions:
-    return mooncake_backend_options(world_size, "cpu", active_value=0)
-
-
-def mooncake_extension_cpu_options(world_size: int) -> pg.MooncakeBackendOptions:
-    return mooncake_backend_options(
-        world_size,
-        "cpu",
-        active_value=1,
-        is_extension=True,
+    return pg.MooncakeBackendOptions(
+        int(max_group_size),
+        bool(auto_deactivate_on_failure),
+        bool(auto_sync_on_failure),
     )
 
 
@@ -159,9 +136,9 @@ def init_mooncake_group(
     device_type: str,
     device_filters: Sequence[str] | None = None,
     use_pg_options: bool = True,
-    is_extension: bool = False,
-    active_value: int | None = None,
-    max_world_size: int | None = None,
+    max_group_size: int | None = None,
+    auto_deactivate_on_failure: bool = True,
+    auto_sync_on_failure: bool = True,
 ) -> torch.device:
     device = require_test_device(rank, device_type)
     configure_mooncake_device_filter(device_filters)
@@ -171,35 +148,13 @@ def init_mooncake_group(
         "world_size": world_size,
     }
     if use_pg_options:
-        resolved_active_value = (
-            1 if is_extension else 0 if active_value is None else active_value
-        )
         kwargs["pg_options"] = mooncake_backend_options(
-            world_size,
-            device_type,
-            active_value=resolved_active_value,
-            is_extension=is_extension,
-            max_world_size=max_world_size,
+            max_group_size if max_group_size is not None else world_size,
+            auto_deactivate_on_failure=auto_deactivate_on_failure,
+            auto_sync_on_failure=auto_sync_on_failure,
         )
     dist.init_process_group(**kwargs)
     return device
-
-
-def init_mooncake_cpu_group(
-    rank: int,
-    world_size: int,
-    *,
-    device_filters: Sequence[str] | None = None,
-    use_pg_options: bool = True,
-) -> None:
-    init_mooncake_group(
-        rank,
-        world_size,
-        backend_name="mooncake-cpu",
-        device_type="cpu",
-        device_filters=device_filters,
-        use_pg_options=use_pg_options,
-    )
 
 
 def get_mooncake_backend(group=None, device_type: str = "cpu"):
@@ -235,9 +190,9 @@ class MooncakePGWorkerContext:
         world_size: int | None = None,
         device_filters: Sequence[str] | None = None,
         use_pg_options: bool = True,
-        is_extension: bool = False,
-        active_value: int | None = None,
-        max_world_size: int | None = None,
+        max_group_size: int | None = None,
+        auto_deactivate_on_failure: bool = True,
+        auto_sync_on_failure: bool = True,
     ) -> torch.device:
         self._device = init_mooncake_group(
             self.proc_rank if rank is None else rank,
@@ -248,9 +203,9 @@ class MooncakePGWorkerContext:
             if device_filters is None
             else device_filters,
             use_pg_options=use_pg_options,
-            is_extension=is_extension,
-            active_value=active_value,
-            max_world_size=max_world_size,
+            max_group_size=max_group_size,
+            auto_deactivate_on_failure=auto_deactivate_on_failure,
+            auto_sync_on_failure=auto_sync_on_failure,
         )
         return self._device
 
@@ -383,14 +338,66 @@ def wait_until(
     raise TimeoutError(f"timed out waiting for {description}")
 
 
-def wait_for_spawn_context(ctx, timeout_s: float) -> None:
-    """Wait for spawn context with timeout; force kill if hung."""
+def _describe_signal(signum: int) -> str:
+    """Return a human-readable description for a signal number."""
+    names = {
+        signal.SIGSEGV: "SIGSEGV (segmentation fault)",
+        signal.SIGABRT: "SIGABRT (abort)",
+        signal.SIGBUS: "SIGBUS (bus error)",
+        signal.SIGFPE: "SIGFPE (floating-point exception)",
+        signal.SIGILL: "SIGILL (illegal instruction)",
+        signal.SIGTERM: "SIGTERM (terminated)",
+        signal.SIGKILL: "SIGKILL (killed)",
+        signal.SIGQUIT: "SIGQUIT (quit)",
+    }
+    return names.get(signum, f"signal {signum}")
+
+
+def _capture_signal_deaths(ctx, result_map) -> None:
+    """Inspect process exit codes and record any signal-killed processes.
+
+    A negative exit code N means the process was killed by signal -N.
+    We only record a signal death when the worker did NOT already report
+    a result — otherwise we would overwrite a more specific error (e.g., an
+    AssertionError from a survivor) that happened before the crash.
+    """
+    for rank_idx, process in enumerate(ctx.processes):
+        exitcode = process.exitcode
+        if exitcode is not None and exitcode < 0:
+            # Only fill in missing results; don't overwrite existing ones
+            if rank_idx in result_map:
+                continue
+            signum = -exitcode
+            description = _describe_signal(signum)
+            record_rank_error(
+                result_map,
+                rank_idx,
+                RuntimeError(
+                    f"Rank {rank_idx} was killed by {description}. "
+                    f"This usually indicates a native crash (segfault, abort, etc.). "
+                    f"Check core dumps (ulimit -c) or run under a debugger."
+                ),
+            )
+
+
+def wait_for_spawn_context(
+    ctx,
+    timeout_s: float,
+    result_map=None,
+) -> None:
+    """Wait for spawn context with timeout; force kill if hung.
+
+    When *result_map* is provided, process exit codes are inspected and
+    any signal-killed ranks are recorded in the map before returning.
+    """
     deadline = time.monotonic() + timeout_s
 
     # Phase 1: Normal wait
     while time.monotonic() < deadline:
         if not any(p.is_alive() for p in ctx.processes):
             # All processes exited (success or failure)
+            if result_map is not None:
+                _capture_signal_deaths(ctx, result_map)
             return
         time.sleep(0.1)
 
@@ -423,6 +430,9 @@ def wait_for_spawn_context(ctx, timeout_s: float) -> None:
         if not any(p.is_alive() for p in ctx.processes):
             break
         time.sleep(0.1)
+
+    if result_map is not None:
+        _capture_signal_deaths(ctx, result_map)
 
     raise AssertionError(f"Spawn timed out after {timeout_s} seconds")
 
@@ -472,7 +482,7 @@ def spawn_and_collect(
                     nprocs=actual_nprocs,
                     join=False,
                 )
-                wait_for_spawn_context(ctx, timeout_s)
+                wait_for_spawn_context(ctx, timeout_s, result_map=result_map)
 
         return collect_rank_results(result_map, actual_nprocs)
 
@@ -503,12 +513,39 @@ class MultiProcessTestCase(unittest.TestCase):
         )
 
     def assert_all_ok(self, rows: list[dict]) -> None:
+        failures: list[str] = []
         for row in rows:
-            if not row.get("ok", False):
-                self.fail(
-                    f"rank {row.get('rank', '?')} failed with "
-                    f"{row.get('error_type', 'UnknownError')}: {row.get('error', '')}"
-                )
+            if row.get("ok", False):
+                continue
+            rank = row.get("rank", "?")
+            error_type = row.get("error_type", "UnknownError")
+            error_msg = row.get("error", "")
+            failures.append(
+                f"  rank {rank}: {error_type}"
+                + (f" -- {error_msg}" if error_msg else "")
+            )
+
+        if not failures:
+            return
+
+        succeeded_ranks = sorted(
+            r.get("rank", "?") for r in rows if r.get("ok", False)
+        )
+        failed_ranks = sorted(
+            r.get("rank", "?") for r in rows if not r.get("ok", False)
+        )
+
+        report = [
+            f"\n{'='*60}",
+            f"RANK ERROR REPORT ({len(failures)} failure(s))",
+            f"{'='*60}",
+            f"Succeeded ranks: {succeeded_ranks or '(none)'}",
+            f"Failed ranks: {failed_ranks or '(none)'}",
+            f"{'-'*60}",
+            "Failures:",
+        ] + failures + [f"{'='*60}"]
+
+        self.fail("\n".join(report))
 
 
 class BackendMultiProcessTestCase(MultiProcessTestCase):
@@ -594,7 +631,7 @@ class BackendMultiProcessTestCase(MultiProcessTestCase):
                     nprocs=actual_nprocs,
                     join=False,
                 )
-                wait_for_spawn_context(ctx, resolved_timeout)
+                wait_for_spawn_context(ctx, resolved_timeout, result_map=result_map)
 
             return collect_rank_results(result_map, actual_nprocs)
 

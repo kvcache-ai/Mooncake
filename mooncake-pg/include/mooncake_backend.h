@@ -1,12 +1,15 @@
 #ifndef MOONCAKE_BACKEND_H
 #define MOONCAKE_BACKEND_H
 
+#include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <array>
 #include <vector>
 #include <mooncake_worker.cuh>
-#include <connection_poller.h>
+#include <work_handles.h>
 #include <p2p_proxy.h>
 #include <sys/types.h>
 #include <torch/torch.h>
@@ -16,7 +19,60 @@
 
 #include <ATen/cuda/CUDAContext.h>
 
+#include "control_plane/coordinator_host.h"
+#include "control_plane/link_manager.h"
+
 namespace mooncake {
+
+static constexpr size_t kDefaultCollectiveTimeoutUs = 10000000;  // 10 s
+static constexpr int64_t kDefaultP2PTimeoutUs = 10000000;        // 10 s
+
+// Must be greater than collective_timeout_us so that timeout-based
+// failure reporters can contribute before the reconciliation window
+// expires. (Some ranks report failures based on timeout, while others
+// report based on failure status.)
+static constexpr int64_t kDefaultFaultReconciliationWindowUs =
+    3 * kDefaultCollectiveTimeoutUs;
+
+class AgentInterface;
+class AgentHost;
+
+struct MooncakeProcessContext {
+    TransferEngine* external_engine = nullptr;
+    std::string host_ip = "127.0.0.1";
+    size_t collective_timeout_us = kDefaultCollectiveTimeoutUs;
+    int64_t p2p_timeout_us = kDefaultP2PTimeoutUs;
+    int64_t fault_reconciliation_window_us =
+        kDefaultFaultReconciliationWindowUs;
+
+    // Eagerly created so set_device_filter works before init_process_group.
+    // engine points to either owned_engine or external_engine.
+    std::unique_ptr<TransferEngine> owned_engine =
+        std::make_unique<TransferEngine>(true);
+    TransferEngine* engine = owned_engine.get();
+    bool engine_initialized = false;
+    int max_world_size = 0;
+
+    LinkManager link_manager;
+    MooncakeWorkerManager worker_manager;
+    P2PDeviceWorkerManager p2p_device_worker_manager;
+
+    // Coordinator (rank 0 only).  Created before AgentHost so the
+    // coordinator_addr key is in the Store when AgentHost::start() reads it.
+    std::unique_ptr<CoordinatorHost> coordinator_host;
+
+    std::unique_ptr<AgentHost> agent_host;
+
+    MooncakeProcessContext();
+    ~MooncakeProcessContext();
+
+    // Non-copyable, non-movable: engine pointer points to either owned_engine
+    // or external_engine, and would dangle after a move.
+    MooncakeProcessContext(const MooncakeProcessContext&) = delete;
+    MooncakeProcessContext& operator=(const MooncakeProcessContext&) = delete;
+    MooncakeProcessContext(MooncakeProcessContext&&) = delete;
+    MooncakeProcessContext& operator=(MooncakeProcessContext&&) = delete;
+};
 
 // Forward declaration – MooncakeP2PShim holds a non-owning pointer to
 // MooncakeBackend, which is defined below.
@@ -32,7 +88,7 @@ class MooncakeBackend;
 // getBackendName, supportsCoalescing).
 class MooncakeP2PShim final : public ::c10d::Backend {
    public:
-    explicit MooncakeP2PShim(MooncakeBackend* owner);
+    MooncakeP2PShim(MooncakeBackend* owner, int maxGroupSize);
 
     const std::string getBackendName() const override;
 
@@ -59,24 +115,69 @@ class MooncakeP2PShim final : public ::c10d::Backend {
 class MooncakeBackend final : public ::c10d::ProcessGroup {
    public:
     struct MooncakeBackendOptions final : torch::CustomClassHolder {
+        explicit MooncakeBackendOptions(int maxGroupSize)
+            : maxGroupSize_{maxGroupSize > 0 ? maxGroupSize : -1} {}
+
+        MooncakeBackendOptions(int maxGroupSize, bool autoDeactivateOnFailure,
+                               bool autoSyncOnFailure)
+            : maxGroupSize_{maxGroupSize > 0 ? maxGroupSize : -1},
+              autoDeactivateOnFailure_{autoDeactivateOnFailure},
+              autoSyncOnFailure_{autoSyncOnFailure} {}
+
+        // If activeRanks is provided, only its storage is used -- the contents
+        // are populated by the Coordinator.
         explicit MooncakeBackendOptions(at::Tensor activeRanks)
             : activeRanks_{activeRanks} {}
-        MooncakeBackendOptions(at::Tensor activeRanks, bool isExtension)
-            : activeRanks_{activeRanks}, isExtension_{isExtension} {}
-        MooncakeBackendOptions(at::Tensor activeRanks, bool isExtension,
-                               int maxWorldSize)
+
+        // Deprecated constructors: isExtension is ignored
+        MooncakeBackendOptions(at::Tensor activeRanks, bool /*isExtension*/)
+            : activeRanks_{activeRanks} {}
+        MooncakeBackendOptions(at::Tensor activeRanks, bool /*isExtension*/,
+                               int maxGroupSize)
             : activeRanks_{activeRanks},
-              isExtension_{isExtension},
-              maxWorldSize_{maxWorldSize} {}
+              maxGroupSize_{maxGroupSize > 0 ? maxGroupSize : -1} {}
+        MooncakeBackendOptions(at::Tensor activeRanks, bool /*isExtension*/,
+                               int maxGroupSize, bool autoDeactivateOnFailure)
+            : activeRanks_{activeRanks},
+              maxGroupSize_{maxGroupSize > 0 ? maxGroupSize : -1},
+              autoDeactivateOnFailure_{autoDeactivateOnFailure} {}
+        MooncakeBackendOptions(at::Tensor activeRanks, bool /*isExtension*/,
+                               int maxGroupSize, bool autoDeactivateOnFailure,
+                               bool autoSyncOnFailure)
+            : activeRanks_{activeRanks},
+              maxGroupSize_{maxGroupSize > 0 ? maxGroupSize : -1},
+              autoDeactivateOnFailure_{autoDeactivateOnFailure},
+              autoSyncOnFailure_{autoSyncOnFailure} {}
 
         ~MooncakeBackendOptions() override = default;
 
         at::Tensor activeRanks_;
-        bool isExtension_ = false;
-        // Optional upper bound for connection polling / reserved rank slots.
-        // When > 0, the backend may pre-size internal rank metadata to this
-        // value (while PyTorch's group_size() remains unchanged).
-        int maxWorldSize_ = -1;
+
+        int maxGroupSize_ = -1;
+
+        // Automatically deactivate failed ranks on timeout / operation failure.
+        //
+        // When true (default), failed ranks are removed from the active set
+        // automatically.  When false, failures are only reported through
+        // per-operation failedRanks hints, so the caller can decide how to
+        // handle the failure.
+        //
+        // Default: MOONCAKE_PG_AUTO_DEACTIVATE_ON_FAILURE (1)
+        bool autoDeactivateOnFailure_ = true;
+
+        // Fence a failed collective on Coordinator reconciliation.
+        //
+        // When true (default), the worker reports a locally detected transfer
+        // failure and waits for the authoritative membership view to be
+        // applied before completing the task. Consequently, CPU work and
+        // CUDA stream execution cannot pass the failed collective before the
+        // view is updated. CUDA Work::wait() itself remains asynchronous and
+        // does not imply that the host can immediately observe the new view.
+        //
+        // Requires autoDeactivateOnFailure_ == true.
+        //
+        // Default: MOONCAKE_PG_AUTO_SYNC_ON_FAILURE (1)
+        bool autoSyncOnFailure_ = true;
     };
 
     /**
@@ -88,17 +189,31 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
      *
      * @param distBackendOpts Process-group information supplied by PyTorch.
      * @param options *Optional* Mooncake-specific backend options.
+     * @param agent Reference to the process-level AgentInterface instance.
      * @param isCpu Whether to initialize the CPU backend variant.
      */
     MooncakeBackend(c10d::DistributedBackendOptions distBackendOpts,
                     c10::intrusive_ptr<MooncakeBackendOptions> options,
+                    AgentInterface& agent, struct MooncakeProcessContext& ctx,
                     bool isCpu = false);
 
     ~MooncakeBackend() override;
 
     const std::string getBackendName() const override;
 
-    int getSize() const override { return meta_ ? meta_->activeSize : size_; }
+    // In Normal mode, return the active rank-space extent (highest active
+    // InGroupRank plus one). During bootstrap, PyTorch still needs the
+    // group_size declared at construction to validate future ranks passed to
+    // new_group() before joinGroup() can run:
+    // https://github.com/pytorch/pytorch/blob/release/2.13/torch/distributed/distributed_c10d.py#L6012
+    int getSize() const override {
+        if (!meta_) return size_;
+        if (meta_->extensionMode.load(std::memory_order_acquire) !=
+            CollectiveExtensionState::Normal) {
+            return size_;
+        }
+        return meta_->activeSize.load(std::memory_order_acquire);
+    }
 
     // Point-to-point send/recv for torch.distributed P2POp/batch_isend_irecv.
     // Only single-tensor ops are supported.
@@ -153,26 +268,13 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
 
     void shutdown() override;
 
-    static void setHostIp(const std::string& hostIp) { hostIp_ = hostIp; }
-
-    static void setDeviceFilter(std::vector<std::string> filters) {
-        engine_->setWhitelistFilters(std::move(filters));
-    }
-
-    /// Set an external TransferEngine to be used by MooncakeBackend
-    /// instead of creating its own. Must be called before
-    /// init_process_group(backend="mooncake"). The engine must already
-    /// be initialized. The caller is responsible for ensuring the engine
-    /// outlives all MooncakeBackend instances. Pass nullptr to reset.
-    static void setExternalEngine(TransferEngine* engine);
-
     std::string getPreferredHca(std::string location) {
         static std::once_flag topo_once;
         static std::shared_ptr<Topology> topology;
         static TopologyMatrix matrix;
         std::call_once(topo_once, [this] {
             // FIXME: getLocalTopology is deprecated in TENT
-            topology = engine_->getLocalTopology();
+            topology = ctx_.engine->getLocalTopology();
             if (topology) {
                 matrix = topology->getMatrix();
             }
@@ -206,37 +308,73 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
 
     std::vector<bool> getPeerState(const std::vector<int>& ranks);
 
-    void recoverRanks(const std::vector<int>& ranks);
+    // alias to activateRanks
+    ProposeViewUpdateResponse recoverRanks(const std::vector<int>& ranks);
+
+    ProposeViewUpdateResponse activateRanks(const std::vector<int>& ranks);
+
+    ProposeViewUpdateResponse deactivateRanks(const std::vector<int>& ranks);
 
     void joinGroup();
 
-   private:
-    void waitForExtensionState();
-    void publishLocalPeerMetadata();
-    void setLocalOnlyActiveRanks();
+    // Update the data plane view.
+    // Called by AgentHost when a ViewUpdatePush is received or rank states
+    // change.  rank_states and activatable are computed by the state
+    // machine.
+    void applyViewUpdate(const GroupView& view,
+                         const std::vector<RankState>& rank_states,
+                         const std::vector<uint64_t>& rank_epochs,
+                         const std::vector<bool>& activatable);
+
+    // Returns the current GroupView epoch.
+    // Epoch starts at 0 (bootstrap) and increments on membership changes,
+    // auto-deactivation, and recovery.
+    uint64_t getCurrentEpoch() const {
+        return meta_ ? meta_->epoch.load(std::memory_order_acquire) : 0;
+    }
+
+    // Called by AgentHost when a TE link to peer goes up
+    void onPeerLinkReset(InGroupRank peer);
+
+    // Called by NotifyLinkRefreshed effect: refresh the cached TE segment
+    // ID for `local` (InGroupRank) from the LinkManager.
+    // If the link is not up, segmentID is set to -1.
+    void refreshSegmentID(InGroupRank local);
+
+    // Notify the Coordinator of a detected failure and block until a membership
+    // decision has been made and the Agent has ACKed the resulting ViewUpdate.
+    SyncAfterFailureResponse syncAfterFailure();
+
+    // Sync the activeRanksTensor on CPU/GPU from the current GroupView.
     void syncActiveRanksTensor();
 
-    static TransferEngine* engine_;
+    GroupEndpointPublication buildEndpointMetadata() const;
+
+    // Guard: checks that the rank is Healthy (always) and, for collectives,
+    // that it is active in this group.  Called at the top of every operation.
+    void prepareOp(c10d::OpType op) const;
+
+    const GroupEndpointInfo& getLocalEndpointInfo() const {
+        return meta_->segmentInfos[meta_->rank];
+    }
+    AgentInterface& getAgent() { return agent_; }
+    MooncakeProcessContext& getProcessContext() { return ctx_; }
+    const MooncakeProcessContext& getProcessContext() const { return ctx_; }
+
+   private:
+    MooncakeProcessContext& ctx_;
     std::shared_ptr<MooncakeWorker> worker_;
-    static bool engineInitialized_;
-    static int backendIndex_;
-    // External engine injection: when set, MooncakeBackend uses this engine
-    // instead of the default self-created one. Non-owning pointer.
-    // The caller is responsible for ensuring the engine outlives all
-    // MooncakeBackend instances.
-    static TransferEngine* externalEngine_;
     const c10::intrusive_ptr<MooncakeBackendOptions> options_;
     bool isCpu_{false};
-    static std::string hostIp_;
     void* send_buffer_[2];
     void* recv_buffer_[2];
     int32_t* cpu_sync_send_region_[2];
     int32_t* cpu_sync_recv_region_[2];
-    SegmentInfo rank_info;
+    AgentInterface& agent_;
     std::shared_ptr<TransferGroupMeta> meta_;
     bool isShutdown_{false};
-    uint64_t local2global_rank_map_[kMaxNumRanks];
-    std::string localServerName_;
+    int max_group_size_ =
+        0;  // per-group capacity (max active members for this group)
 
     // P2P async infrastructure
     // p2p_proxy_ is created in MooncakeBackend, but can live longer than
@@ -247,21 +385,7 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     // p2p_device_worker_ is created in P2PDeviceWorkerManager,
     // and is shared between backends in the same device.
     std::shared_ptr<P2PDeviceWorker> p2p_device_worker_;
-
-    // Connection Poller Context
-    // Similar to p2p_proxy_, connection_ctx_ is created in MooncakeBackend, but
-    // can live longer than MooncakeBackend.
-    std::shared_ptr<ConnectionContext> connection_ctx_;
-    bool connectionPollerRegistered_{false};
 };
-
-struct ExtensionState {
-    std::vector<bool> activeRanks;
-    std::vector<uint32_t> p2pEpochs;
-    int taskCount = -1;
-};
-std::vector<uint8_t> serialize(const ExtensionState& state);
-ExtensionState deserialize(const std::vector<uint8_t>& buffer);
 
 }  // namespace mooncake
 
