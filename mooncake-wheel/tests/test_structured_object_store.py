@@ -753,10 +753,17 @@ def test_structured_object_ndarray_read_can_use_buffer_pool() -> None:
     assert store.get_into_ranges_calls == before_range_reads + 1
     assert pool.acquire_sizes == [array.nbytes]
 
-    MooncakeBundleTransfer.release_result(result.objects)
+    MooncakeBundleTransfer.release(result.objects, type="dataproto")
     assert pool.release_count == 1
     MooncakeBundleTransfer.release_result(result.objects)
     assert pool.release_count == 1
+
+    dict_result = transfer.materialize(transfer.read_spec(ref))
+    assert hasattr(dict_result.objects["weights"], "_mooncake_pool_owner")
+    MooncakeBundleTransfer.release(dict_result.objects, type="dict")
+    assert pool.release_count == 2
+    MooncakeBundleTransfer.release_dict(dict_result.objects)
+    assert pool.release_count == 2
 
 
 def test_structured_object_multi_buffer_payload_uses_pool_batch_put() -> None:
@@ -1900,11 +1907,35 @@ def test_unified_put_get_roundtrips_flat_dict() -> None:
     assert result["step"] == 7
 
 
+def test_unified_cleanup_removes_flat_dict_objects() -> None:
+    store, transfer = make_transfer()
+    ref = transfer.put(
+        {
+            "input_ids": np.arange(6, dtype=np.int64).reshape(3, 2),
+            "tokens": [np.asarray([1, 2]), None, np.asarray([3])],
+            "step": 7,
+        },
+        type="dict",
+    )
+
+    assert store.objects
+    transfer.cleanup(ref, type="dict")
+
+    assert store.objects == {}
+
+
 def test_unified_put_rejects_unknown_type() -> None:
     _store, transfer = make_transfer()
 
     with pytest.raises(ValueError, match="unsupported Mooncake payload type"):
         transfer.put({}, type="unknown")  # type: ignore[arg-type]
+
+    ref = transfer.put({"input_ids": np.arange(2)}, type="dict")
+    with pytest.raises(ValueError, match="unsupported Mooncake payload type"):
+        transfer.cleanup(ref, type="unknown")  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="unsupported Mooncake payload type"):
+        MooncakeBundleTransfer.release({}, type="unknown")  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
@@ -1978,9 +2009,19 @@ def test_ref_aliases_match_dataproto_ref_helpers() -> None:
     assert import_ref is import_dataproto_ref
 
 
-def test_release_result_is_available_for_split_api_compatibility() -> None:
+def test_lifecycle_split_helpers_are_available() -> None:
+    _store, transfer = make_transfer()
+
+    assert callable(MooncakeBundleTransfer.release_dataproto)
+    assert callable(MooncakeBundleTransfer.release_dict)
+    assert callable(transfer.cleanup_dataproto)
+    assert callable(transfer.cleanup_dict)
+
+
+def test_unified_release_is_available_for_split_api_compatibility() -> None:
     result = {"tokens": [np.asarray([1, 2]), None]}
 
+    assert MooncakeBundleTransfer.release(result, type="dict") is None
     assert MooncakeBundleTransfer.release_result(result) is None
     assert result["tokens"][0].tolist() == [1, 2]
 
@@ -2883,7 +2924,7 @@ def test_dataproto_helper_cleanup_removes_all_stage_objects() -> None:
     )
 
     assert store.objects
-    transfer.cleanup_dataproto(ref)
+    transfer.cleanup(ref, type="dataproto")
 
     assert store.objects == {}
 
