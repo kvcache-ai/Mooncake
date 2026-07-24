@@ -13,7 +13,8 @@
 namespace mooncake {
 
 P2PMasterService::P2PMasterService(const MasterServiceConfig& config)
-    : MasterService(config), max_client_per_key_(config.max_client_per_key),
+    : MasterService(config),
+      max_client_per_key_(config.max_client_per_key),
       enable_async_oplog_write_(ParseOpLogStoreType(config.oplog_store_type) ==
                                 OpLogStoreType::REDIS) {
     client_manager_ = std::make_shared<P2PClientManager>(

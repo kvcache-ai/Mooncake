@@ -231,8 +231,8 @@ TEST_F(P2PClientIntegrationTest, WaterlineBypassWritesLocal) {
     // triggers a local write: data stays on client_, not on client2_.
     const std::string key = "waterline_bypass_key";
     WriteRouteRequestConfig cfg;
-    cfg.remote_weight = 0.5;            // balanced
-    cfg.local_write_waterline = 0.5;    // local is < 50% full -> local write
+    cfg.remote_weight = 0.5;          // balanced
+    cfg.local_write_waterline = 0.5;  // local is < 50% full -> local write
 
     std::vector<Slice> slices;
     slices.emplace_back(Slice{const_cast<char*>(data.data()), data.size()});
@@ -259,7 +259,8 @@ TEST_F(P2PClientIntegrationTest, ContradictoryConfigRejected) {
     const std::string data = "contradictory_payload";
     WriteRouteRequestConfig cfg;
     cfg.remote_weight = 0.0;
-    cfg.local_write_waterline = 0.0;  // dead end: forbid local write + forbid remote route
+    cfg.local_write_waterline =
+        0.0;  // dead end: forbid local write + forbid remote route
 
     std::vector<Slice> slices;
     slices.emplace_back(Slice{const_cast<char*>(data.data()), data.size()});

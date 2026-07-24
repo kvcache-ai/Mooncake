@@ -1012,7 +1012,8 @@ void ClientService::RegisterRuntimeConfigHttpMethods() {
             if (!runtime_config_store_->loadFromJson(json)) {
                 resp.set_status_and_content(
                     status_type::bad_request,
-                    "invalid write config: contradictory waterline/remote_weight extremes");
+                    "invalid write config: contradictory "
+                    "waterline/remote_weight extremes");
                 return;
             }
             respond_json(resp, runtime_config_store_->exportConfig());
@@ -1028,7 +1029,8 @@ void ClientService::RegisterRuntimeConfigHttpMethods() {
             if (!runtime_config_store_->updateWriteConfig(json)) {
                 resp.set_status_and_content(
                     status_type::bad_request,
-                    "invalid write config: contradictory waterline/remote_weight extremes");
+                    "invalid write config: contradictory "
+                    "waterline/remote_weight extremes");
                 return;
             }
             LOG(INFO) << "Runtime write config updated via HTTP";
