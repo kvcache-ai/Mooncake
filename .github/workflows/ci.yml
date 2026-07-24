@@ -672,15 +672,9 @@ jobs:
       shell: bash
 
   fast-unit-tests:
-    name: Affected fast Python and C++ unit tests
-    needs: [ci-stage, check-paths]
-    if: >-
-      needs.ci-stage.outputs.run-checks == 'true' &&
-      (needs.check-paths.outputs.should-test-hugepage == 'true' ||
-       needs.check-paths.outputs.should-test-python-config == 'true' ||
-       needs.check-paths.outputs.should-test-http-metadata == 'true' ||
-       needs.check-paths.outputs.should-test-release-wheel-tags == 'true' ||
-       needs.check-paths.outputs.should-test-common-environ == 'true')
+    name: Fast Python and C++ unit tests
+    needs: [ci-stage]
+    if: needs.ci-stage.outputs.run-checks == 'true'
     runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4
@@ -688,57 +682,28 @@ jobs:
         persist-credentials: false
 
     - name: Set up Python 3.12
-      if: >-
-        needs.check-paths.outputs.should-test-hugepage == 'true' ||
-        needs.check-paths.outputs.should-test-python-config == 'true' ||
-        needs.check-paths.outputs.should-test-http-metadata == 'true' ||
-        needs.check-paths.outputs.should-test-release-wheel-tags == 'true'
       uses: actions/setup-python@v5
       with:
         python-version: '3.12'
 
-    - name: Install HTTP metadata test dependencies
-      if: needs.check-paths.outputs.should-test-http-metadata == 'true'
-      run: python -m pip install aiohttp
-
-    - name: Install release wheel tag test dependencies
-      if: needs.check-paths.outputs.should-test-release-wheel-tags == 'true'
-      run: python -m pip install pytest pyyaml
-
-    - name: Test HugeTLB sizing helper
-      if: needs.check-paths.outputs.should-test-hugepage == 'true'
-      run: python scripts/test_hicache_hugepage_requirements.py
-      shell: bash
-
-    - name: Test Mooncake Python configuration
-      if: needs.check-paths.outputs.should-test-python-config == 'true'
-      env:
-        PYTHONPATH: mooncake-wheel
-      run: python -m unittest mooncake-wheel.tests.test_mooncake_config
-      shell: bash
-
-    - name: Test HTTP metadata server
-      if: needs.check-paths.outputs.should-test-http-metadata == 'true'
-      env:
-        PYTHONPATH: mooncake-wheel
-      run: python -m unittest mooncake-wheel.tests.test_http_metadata_server
-      shell: bash
-
-    - name: Test release wheel tags
-      if: needs.check-paths.outputs.should-test-release-wheel-tags == 'true'
-      env:
-        PYTHONPATH: mooncake-wheel
-      run: python -m pytest -q mooncake-wheel/tests/test_release_wheel_tags.py
-      shell: bash
-
-    - name: Install Mooncake Common test dependencies
-      if: needs.check-paths.outputs.should-test-common-environ == 'true'
+    - name: Install test dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y libgtest-dev
+        python -m pip install aiohttp pytest pyyaml
 
-    - name: Build and run Mooncake Common C++ unit tests
-      if: needs.check-paths.outputs.should-test-common-environ == 'true'
+    - name: Run fast Python unit tests
+      env:
+        PYTHONPATH: mooncake-wheel
+      run: |
+        python scripts/test_hicache_hugepage_requirements.py
+        python -m unittest \
+          mooncake-wheel.tests.test_mooncake_config \
+          mooncake-wheel.tests.test_http_metadata_server
+        python -m pytest -q mooncake-wheel/tests/test_release_wheel_tags.py
+      shell: bash
+
+    - name: Build and run pre-review C++ unit tests
       run: |
         g++ -std=c++20 -O2 \
           -I mooncake-common/include \
@@ -801,11 +766,6 @@ jobs:
       should-run-musa: ${{ steps.dispatch-override.outputs.musa || steps.filter.outputs.musa }}
       should-run-ascend: ${{ steps.dispatch-override.outputs.ascend || steps.filter.outputs.ascend }}
       should-run-efa: ${{ steps.dispatch-override.outputs.efa || steps.filter.outputs.efa }}
-      should-test-hugepage: ${{ steps.dispatch-override.outputs.test_hugepage || steps.filter.outputs.test_hugepage }}
-      should-test-python-config: ${{ steps.dispatch-override.outputs.test_python_config || steps.filter.outputs.test_python_config }}
-      should-test-http-metadata: ${{ steps.dispatch-override.outputs.test_http_metadata || steps.filter.outputs.test_http_metadata }}
-      should-test-release-wheel-tags: ${{ steps.dispatch-override.outputs.test_release_wheel_tags || steps.filter.outputs.test_release_wheel_tags }}
-      should-test-common-environ: ${{ steps.dispatch-override.outputs.test_common_environ || steps.filter.outputs.test_common_environ }}
     steps:
       # workflow_dispatch has no PR/push diff context — skip paths-filter and default to true
       - name: Default to true for workflow_dispatch
@@ -819,11 +779,6 @@ jobs:
           echo "musa=true" >> $GITHUB_OUTPUT
           echo "ascend=true" >> $GITHUB_OUTPUT
           echo "efa=true" >> $GITHUB_OUTPUT
-          echo "test_hugepage=true" >> $GITHUB_OUTPUT
-          echo "test_python_config=true" >> $GITHUB_OUTPUT
-          echo "test_http_metadata=true" >> $GITHUB_OUTPUT
-          echo "test_release_wheel_tags=true" >> $GITHUB_OUTPUT
-          echo "test_common_environ=true" >> $GITHUB_OUTPUT
       - uses: actions/checkout@v4
         if: github.event_name != 'workflow_dispatch'
         with:
@@ -935,32 +890,6 @@ jobs:
               - '.github/actions/**'
               - '.github/workflows/ci.yml'
               - '.github/workflows/ci_efa.yml'
-            test_hugepage:
-              - 'scripts/check_hicache_hugepage_requirements.py'
-              - 'scripts/test_hicache_hugepage_requirements.py'
-              - '.github/workflows/ci.yml'
-            test_python_config:
-              - 'mooncake-wheel/mooncake/__init__.py'
-              - 'mooncake-wheel/mooncake/buffer_pool.py'
-              - 'mooncake-wheel/mooncake/mooncake_config.py'
-              - 'mooncake-wheel/tests/test_mooncake_config.py'
-              - '.github/workflows/ci.yml'
-            test_http_metadata:
-              - 'mooncake-wheel/mooncake/__init__.py'
-              - 'mooncake-wheel/mooncake/buffer_pool.py'
-              - 'mooncake-wheel/mooncake/http_metadata_server.py'
-              - 'mooncake-wheel/tests/test_http_metadata_server.py'
-              - '.github/workflows/ci.yml'
-            test_release_wheel_tags:
-              - 'mooncake-wheel/tests/test_release_wheel_tags.py'
-              - '.github/workflows/**'
-            test_common_environ:
-              - 'mooncake-common/include/environ.h'
-              - 'mooncake-common/src/environ.cpp'
-              - 'mooncake-common/tests/environ_test.cpp'
-              - 'mooncake-common/tests/CMakeLists.txt'
-              - '.github/workflows/ci.yml'
-
   build-wheel-cu13:
     needs: [ci-stage, spell-check, clang-format, check-paths]
     if: >-
