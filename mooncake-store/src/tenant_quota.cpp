@@ -3,10 +3,6 @@
 #include <algorithm>
 #include <limits>
 
-#include "types.h"
-
-#include <glog/logging.h>
-
 namespace mooncake {
 namespace {
 
@@ -23,146 +19,172 @@ uint64_t SaturatingAdd(uint64_t lhs, uint64_t rhs) {
     return lhs + rhs;
 }
 
-bool IsLazyEmptyTenant(const TenantQuotaState& state) {
-    return !state.has_explicit_policy && state.used_bytes == 0 &&
-           state.reserved_bytes == 0 && state.committed_count == 0 &&
-           state.metadata_object_count == 0;
+std::map<TenantId, uint64_t> BuildEffectiveQuotaAssignmentsImpl(
+    const std::vector<TenantQuotaSnapshot>& tenants,
+    uint64_t allocatable_capacity_bytes) {
+    unsigned __int128 explicit_requested_sum = 0;
+    std::vector<std::pair<TenantId, uint64_t>> explicit_tenants;
+    std::map<TenantId, uint64_t> assigned;
+
+    for (const auto& snapshot : tenants) {
+        const TenantId& tenant_id = snapshot.tenant_id;
+        assigned.emplace(tenant_id, 0);
+        if (snapshot.has_explicit_policy) {
+            explicit_requested_sum += snapshot.requested_quota_bytes;
+            explicit_tenants.emplace_back(tenant_id,
+                                          snapshot.requested_quota_bytes);
+        }
+    }
+
+    if (explicit_requested_sum <= allocatable_capacity_bytes) {
+        for (const auto& [tenant_id, requested_quota_bytes] :
+             explicit_tenants) {
+            assigned[tenant_id] = requested_quota_bytes;
+        }
+        return assigned;
+    }
+
+    std::vector<RemainderShare> shares;
+    shares.reserve(explicit_tenants.size());
+    uint64_t base_assigned = 0;
+    for (const auto& [tenant_id, requested_quota_bytes] : explicit_tenants) {
+        const unsigned __int128 product =
+            static_cast<unsigned __int128>(allocatable_capacity_bytes) *
+            requested_quota_bytes;
+        const uint64_t base =
+            static_cast<uint64_t>(product / explicit_requested_sum);
+        shares.push_back({.tenant_id = tenant_id,
+                          .base = base,
+                          .remainder = product % explicit_requested_sum});
+        base_assigned += base;
+    }
+
+    std::sort(shares.begin(), shares.end(),
+              [](const RemainderShare& lhs, const RemainderShare& rhs) {
+                  if (lhs.remainder != rhs.remainder) {
+                      return lhs.remainder > rhs.remainder;
+                  }
+                  return lhs.tenant_id < rhs.tenant_id;
+              });
+
+    uint64_t remaining = allocatable_capacity_bytes - base_assigned;
+    for (auto& share : shares) {
+        if (remaining > 0) {
+            ++share.base;
+            --remaining;
+        }
+        assigned[share.tenant_id] = share.base;
+    }
+    return assigned;
 }
 
-TenantQuotaResult AccountingMismatch(const char* operation,
-                                     const TenantId& tenant_id,
-                                     uint64_t requested, uint64_t available) {
-    LOG(WARNING) << operation << " accounting mismatch for tenant "
-                 << tenant_id.value() << ": requested=" << requested
-                 << ", available=" << available;
+TenantQuotaResult AccountingMismatch() {
     return tl::make_unexpected(TenantQuotaError::kAccountingMismatch);
 }
 
 }  // namespace
 
-std::vector<TenantQuotaAssignment> BuildEffectiveQuotaAssignments(
-    const std::map<TenantId, TenantQuotaState>& tenants,
+std::map<TenantId, uint64_t> TenantQuotaTable::BuildEffectiveQuotaAssignments(
+    const std::vector<TenantQuotaSnapshot>& tenants,
     uint64_t allocatable_capacity_bytes) {
-    unsigned __int128 explicit_requested_sum = 0;
-    std::vector<TenantId> explicit_tenants;
-
-    for (const auto& [tenant_id, state] : tenants) {
-        if (state.has_explicit_policy) {
-            explicit_tenants.push_back(tenant_id);
-            explicit_requested_sum += state.requested_quota_bytes;
-        }
-    }
-
-    std::map<TenantId, uint64_t> assigned;
-    for (const auto& [tenant_id, _] : tenants) {
-        assigned[tenant_id] = 0;
-    }
-
-    auto distribute = [&](const std::vector<TenantId>& tenant_ids,
-                          uint64_t capacity, unsigned __int128 denominator,
-                          bool proportional_to_requested) {
-        if (tenant_ids.empty() || capacity == 0 || denominator == 0) {
-            return;
-        }
-
-        std::vector<RemainderShare> shares;
-        shares.reserve(tenant_ids.size());
-        uint64_t base_assigned = 0;
-        for (const auto& tenant_id : tenant_ids) {
-            const auto& state = tenants.at(tenant_id);
-            unsigned __int128 numerator =
-                proportional_to_requested ? state.requested_quota_bytes : 1;
-            unsigned __int128 product =
-                static_cast<unsigned __int128>(capacity) * numerator;
-            uint64_t base = static_cast<uint64_t>(product / denominator);
-            unsigned __int128 remainder = product % denominator;
-            shares.push_back({tenant_id, base, remainder});
-            base_assigned += base;
-        }
-
-        std::sort(shares.begin(), shares.end(),
-                  [](const RemainderShare& lhs, const RemainderShare& rhs) {
-                      if (lhs.remainder != rhs.remainder) {
-                          return lhs.remainder > rhs.remainder;
-                      }
-                      return lhs.tenant_id < rhs.tenant_id;
-                  });
-
-        uint64_t remaining = capacity - base_assigned;
-        for (auto& share : shares) {
-            if (remaining > 0) {
-                ++share.base;
-                --remaining;
-            }
-            assigned[share.tenant_id] = share.base;
-        }
-    };
-
-    if (explicit_requested_sum <= allocatable_capacity_bytes) {
-        for (const auto& tenant_id : explicit_tenants) {
-            assigned[tenant_id] = tenants.at(tenant_id).requested_quota_bytes;
-        }
-    } else {
-        distribute(explicit_tenants, allocatable_capacity_bytes,
-                   explicit_requested_sum,
-                   /*proportional_to_requested=*/true);
-    }
-
-    std::vector<TenantQuotaAssignment> result;
-    result.reserve(assigned.size());
-    for (const auto& [tenant_id, effective_quota_bytes] : assigned) {
-        result.push_back({.tenant_id = tenant_id,
-                          .effective_quota_bytes = effective_quota_bytes});
-    }
-    return result;
+    return BuildEffectiveQuotaAssignmentsImpl(tenants,
+                                              allocatable_capacity_bytes);
 }
 
 TenantQuotaResult TenantQuotaTable::UpsertTenantPolicy(
-    std::string tenant_id, uint64_t requested_quota_bytes) {
+    const TenantId& tenant_id, uint64_t requested_quota_bytes) {
     if (requested_quota_bytes == 0) {
         return tl::make_unexpected(TenantQuotaError::kInvalidArgument);
     }
 
-    const TenantId normalized_tenant_id(std::move(tenant_id));
-    auto& state = GetOrCreateState(normalized_tenant_id);
+    auto& state = GetOrCreateState(tenant_id);
     state.requested_quota_bytes = requested_quota_bytes;
     state.has_explicit_policy = true;
+    RefreshOverQuota(&state);
     return {};
 }
 
-void TenantQuotaTable::EraseTenantPolicy(std::string tenant_id) {
-    const TenantId normalized_tenant_id(std::move(tenant_id));
-    auto it = tenants_.find(normalized_tenant_id);
-    if (it == tenants_.end()) {
-        return;
+TenantQuotaPolicyResult TenantQuotaTable::DisableTenantPolicyIfEmpty(
+    const TenantId& tenant_id) {
+    auto it = tenants_.find(tenant_id);
+    if (it == tenants_.end() || !it->second.has_explicit_policy) {
+        return tl::make_unexpected(TenantQuotaError::kTenantNotFound);
     }
+
     auto& state = it->second;
+    if (state.used_bytes != 0 || state.reserved_bytes != 0 ||
+        state.committed_count != 0 || state.metadata_object_count != 0) {
+        return tl::make_unexpected(TenantQuotaError::kTenantNotEmpty);
+    }
+
+    const uint64_t requested_quota_bytes = state.requested_quota_bytes;
     state.requested_quota_bytes = 0;
     state.effective_quota_bytes = 0;
     state.has_explicit_policy = false;
+    RefreshOverQuota(&state);
+    EraseIfLazyEmpty(it);
+    return requested_quota_bytes;
+}
+
+void TenantQuotaTable::ApplyTenantPolicies(
+    const TenantQuotaPolicyMap& policies) {
+    for (auto it = tenants_.begin(); it != tenants_.end();) {
+        auto policy_it = policies.find(it->first);
+        auto& state = it->second;
+        if (policy_it != policies.end()) {
+            state.requested_quota_bytes = policy_it->second;
+            state.has_explicit_policy = true;
+            RefreshOverQuota(&state);
+            ++it;
+            continue;
+        }
+
+        state.requested_quota_bytes = 0;
+        state.effective_quota_bytes = 0;
+        state.has_explicit_policy = false;
+        if (IsLazyEmptyTenant(state)) {
+            it = tenants_.erase(it);
+        } else {
+            RefreshOverQuota(&state);
+            ++it;
+        }
+    }
+
+    for (const auto& [tenant_id, requested_quota_bytes] : policies) {
+        auto [it, inserted] = tenants_.try_emplace(tenant_id);
+        if (!inserted) {
+            continue;
+        }
+        it->second.requested_quota_bytes = requested_quota_bytes;
+        it->second.has_explicit_policy = true;
+        RefreshOverQuota(&it->second);
+    }
+}
+
+TenantQuotaPolicyMap TenantQuotaTable::GetTenantPolicies() const {
+    TenantQuotaPolicyMap policies;
+    for (const auto& [tenant_id, state] : tenants_) {
+        if (state.has_explicit_policy) {
+            policies.emplace(tenant_id, state.requested_quota_bytes);
+        }
+    }
+    return policies;
 }
 
 void TenantQuotaTable::RecomputeEffectiveQuotas(
     uint64_t allocatable_capacity_bytes) {
-    for (auto& [tenant_id, state] : tenants_) {
-        state.effective_quota_bytes = 0;
-    }
+    ApplyEffectiveQuotas(BuildEffectiveQuotaAssignments(
+        ListTenantSnapshots(), allocatable_capacity_bytes));
+}
 
-    for (const auto& assignment :
-         BuildEffectiveQuotaAssignments(tenants_, allocatable_capacity_bytes)) {
-        tenants_.at(assignment.tenant_id).effective_quota_bytes =
-            assignment.effective_quota_bytes;
-    }
-
-    for (auto& [_, state] : tenants_) {
-        RefreshOverQuota(&state);
-    }
+bool TenantQuotaTable::IsTenantRegistered(const TenantId& tenant_id) const {
+    auto it = tenants_.find(tenant_id);
+    return it != tenants_.end() && it->second.has_explicit_policy;
 }
 
 std::optional<TenantQuotaSnapshot> TenantQuotaTable::GetTenantSnapshot(
-    std::string tenant_id) const {
-    const TenantId normalized_tenant_id(std::move(tenant_id));
-    auto it = tenants_.find(normalized_tenant_id);
+    const TenantId& tenant_id) const {
+    auto it = tenants_.find(tenant_id);
     if (it == tenants_.end()) {
         return std::nullopt;
     }
@@ -171,32 +193,47 @@ std::optional<TenantQuotaSnapshot> TenantQuotaTable::GetTenantSnapshot(
 
 std::vector<TenantQuotaSnapshot> TenantQuotaTable::ListTenantSnapshots() const {
     std::vector<TenantQuotaSnapshot> snapshots;
+    snapshots.reserve(tenants_.size());
     for (const auto& [tenant_id, state] : tenants_) {
-        if (IsLazyEmptyTenant(state)) {
-            continue;
+        if (!IsLazyEmptyTenant(state)) {
+            snapshots.push_back(MakeSnapshot(tenant_id, state));
         }
-        snapshots.push_back(MakeSnapshot(tenant_id, state));
     }
     return snapshots;
 }
 
-TenantQuotaResult TenantQuotaTable::Reserve(std::string tenant_id,
+uint64_t TenantQuotaTable::ComputeDeficit(const TenantId& tenant_id,
+                                          uint64_t incoming_bytes) const {
+    auto it = tenants_.find(tenant_id);
+    if (it == tenants_.end()) {
+        return incoming_bytes;
+    }
+
+    const auto& state = it->second;
+    const unsigned __int128 demand =
+        static_cast<unsigned __int128>(state.used_bytes) +
+        state.reserved_bytes + incoming_bytes;
+    if (demand <= state.effective_quota_bytes) {
+        return 0;
+    }
+
+    const unsigned __int128 deficit = demand - state.effective_quota_bytes;
+    return deficit > std::numeric_limits<uint64_t>::max()
+               ? std::numeric_limits<uint64_t>::max()
+               : static_cast<uint64_t>(deficit);
+}
+
+TenantQuotaResult TenantQuotaTable::Reserve(const TenantId& tenant_id,
                                             uint64_t bytes) {
-    const TenantId normalized_tenant_id(std::move(tenant_id));
+    auto it = tenants_.find(tenant_id);
+    if (it == tenants_.end() || !it->second.has_explicit_policy) {
+        return tl::make_unexpected(TenantQuotaError::kTenantNotRegistered);
+    }
     if (bytes == 0) {
-        GetOrCreateState(normalized_tenant_id);
         return {};
     }
 
-    auto it = tenants_.find(normalized_tenant_id);
-    if (it == tenants_.end()) {
-        return tl::make_unexpected(TenantQuotaError::kQuotaExceeded);
-    }
     auto& state = it->second;
-    if (!state.has_explicit_policy) {
-        return tl::make_unexpected(TenantQuotaError::kQuotaExceeded);
-    }
-
     if (static_cast<unsigned __int128>(state.used_bytes) +
             state.reserved_bytes + bytes >
         state.effective_quota_bytes) {
@@ -208,101 +245,154 @@ TenantQuotaResult TenantQuotaTable::Reserve(std::string tenant_id,
     return {};
 }
 
-TenantQuotaResult TenantQuotaTable::Commit(std::string tenant_id,
+TenantQuotaResult TenantQuotaTable::Commit(const TenantId& tenant_id,
                                            uint64_t bytes) {
-    const TenantId normalized_tenant_id(std::move(tenant_id));
-    auto& state = GetOrCreateState(normalized_tenant_id);
+    auto it = tenants_.find(tenant_id);
+    if (it == tenants_.end() || it->second.reserved_bytes < bytes) {
+        return AccountingMismatch();
+    }
     if (bytes == 0) {
         return {};
     }
 
-    if (state.reserved_bytes < bytes) {
-        return AccountingMismatch("Commit", normalized_tenant_id, bytes,
-                                  state.reserved_bytes);
-    }
-
+    auto& state = it->second;
     state.reserved_bytes -= bytes;
     state.used_bytes = SaturatingAdd(state.used_bytes, bytes);
-    ++state.committed_count;
+    if (state.committed_count < std::numeric_limits<uint64_t>::max()) {
+        ++state.committed_count;
+    }
     RefreshOverQuota(&state);
     return {};
 }
 
-TenantQuotaResult TenantQuotaTable::Abort(std::string tenant_id,
-                                          uint64_t bytes) {
-    const TenantId normalized_tenant_id(std::move(tenant_id));
-    auto& state = GetOrCreateState(normalized_tenant_id);
+TenantQuotaResult TenantQuotaTable::CommitAdditional(const TenantId& tenant_id,
+                                                     uint64_t bytes) {
+    auto it = tenants_.find(tenant_id);
+    if (it == tenants_.end() || it->second.reserved_bytes < bytes) {
+        return AccountingMismatch();
+    }
     if (bytes == 0) {
         return {};
     }
 
-    if (state.reserved_bytes < bytes) {
-        return AccountingMismatch("Abort", normalized_tenant_id, bytes,
-                                  state.reserved_bytes);
-    }
-
+    auto& state = it->second;
     state.reserved_bytes -= bytes;
+    state.used_bytes = SaturatingAdd(state.used_bytes, bytes);
     RefreshOverQuota(&state);
     return {};
 }
 
-TenantQuotaResult TenantQuotaTable::Release(std::string tenant_id,
+TenantQuotaResult TenantQuotaTable::Abort(const TenantId& tenant_id,
+                                          uint64_t bytes) {
+    auto it = tenants_.find(tenant_id);
+    if (it == tenants_.end() || it->second.reserved_bytes < bytes) {
+        return AccountingMismatch();
+    }
+    if (bytes == 0) {
+        return {};
+    }
+
+    it->second.reserved_bytes -= bytes;
+    RefreshOverQuota(&it->second);
+    EraseIfLazyEmpty(it);
+    return {};
+}
+
+TenantQuotaResult TenantQuotaTable::Release(const TenantId& tenant_id,
                                             uint64_t bytes) {
-    const TenantId normalized_tenant_id(std::move(tenant_id));
-    auto& state = GetOrCreateState(normalized_tenant_id);
+    auto it = tenants_.find(tenant_id);
+    if (it == tenants_.end() || it->second.used_bytes < bytes ||
+        (bytes != 0 && it->second.committed_count == 0)) {
+        return AccountingMismatch();
+    }
     if (bytes == 0) {
         return {};
     }
 
-    if (state.used_bytes < bytes) {
-        return AccountingMismatch("Release", normalized_tenant_id, bytes,
-                                  state.used_bytes);
-    }
-
+    auto& state = it->second;
     state.used_bytes -= bytes;
-    if (state.committed_count > 0) {
-        --state.committed_count;
-    } else {
-        LOG(WARNING) << "Release found zero committed_count for tenant "
-                     << normalized_tenant_id.value();
-    }
+    --state.committed_count;
     RefreshOverQuota(&state);
+    EraseIfLazyEmpty(it);
     return {};
 }
 
-TenantQuotaResult TenantQuotaTable::ReleasePartial(std::string tenant_id,
+TenantQuotaResult TenantQuotaTable::ReleasePartial(const TenantId& tenant_id,
                                                    uint64_t bytes) {
-    const TenantId normalized_tenant_id(std::move(tenant_id));
-    auto& state = GetOrCreateState(normalized_tenant_id);
+    auto it = tenants_.find(tenant_id);
+    if (it == tenants_.end() || it->second.used_bytes < bytes) {
+        return AccountingMismatch();
+    }
     if (bytes == 0) {
         return {};
     }
 
-    DCHECK_LE(bytes, state.used_bytes);
-    if (state.used_bytes < bytes) {
-        return AccountingMismatch("ReleasePartial", normalized_tenant_id, bytes,
-                                  state.used_bytes);
-    }
-
-    state.used_bytes -= bytes;
-    RefreshOverQuota(&state);
+    it->second.used_bytes -= bytes;
+    RefreshOverQuota(&it->second);
+    EraseIfLazyEmpty(it);
     return {};
 }
 
-TenantQuotaState& TenantQuotaTable::GetOrCreateState(
-    const TenantId& tenant_id) {
-    auto [it, inserted] = tenants_.try_emplace(tenant_id);
-    if (inserted) {
-        it->second.requested_quota_bytes = 0;
-        it->second.effective_quota_bytes = 0;
+void TenantQuotaTable::IncrementMetadataObjectCount(const TenantId& tenant_id) {
+    auto& state = GetOrCreateState(tenant_id);
+    if (state.metadata_object_count < std::numeric_limits<uint64_t>::max()) {
+        ++state.metadata_object_count;
     }
-    return it->second;
+    RefreshOverQuota(&state);
+}
+
+TenantQuotaResult TenantQuotaTable::DecrementMetadataObjectCount(
+    const TenantId& tenant_id) {
+    auto it = tenants_.find(tenant_id);
+    if (it == tenants_.end() || it->second.metadata_object_count == 0) {
+        return AccountingMismatch();
+    }
+
+    --it->second.metadata_object_count;
+    RefreshOverQuota(&it->second);
+    EraseIfLazyEmpty(it);
+    return {};
+}
+
+void TenantQuotaTable::RebuildUsage(const TenantQuotaUsageMap& usage) {
+    for (auto& [_, state] : tenants_) {
+        state.used_bytes = 0;
+        state.reserved_bytes = 0;
+        state.committed_count = 0;
+        state.metadata_object_count = 0;
+    }
+
+    for (const auto& [tenant_id, tenant_usage] : usage) {
+        auto& state = GetOrCreateState(tenant_id);
+        if (!state.has_explicit_policy) {
+            state.requested_quota_bytes = 0;
+            state.effective_quota_bytes = 0;
+        }
+        state.used_bytes = tenant_usage.used_bytes;
+        state.committed_count = tenant_usage.committed_count;
+        state.metadata_object_count = tenant_usage.metadata_object_count;
+        RefreshOverQuota(&state);
+    }
+
+    for (auto it = tenants_.begin(); it != tenants_.end();) {
+        if (IsLazyEmptyTenant(it->second)) {
+            it = tenants_.erase(it);
+        } else {
+            RefreshOverQuota(&it->second);
+            ++it;
+        }
+    }
+}
+
+TenantQuotaTable::TenantQuotaState& TenantQuotaTable::GetOrCreateState(
+    const TenantId& tenant_id) {
+    return tenants_.try_emplace(tenant_id).first->second;
 }
 
 TenantQuotaSnapshot TenantQuotaTable::MakeSnapshot(
     const TenantId& tenant_id, const TenantQuotaState& state) const {
     return TenantQuotaSnapshot{
-        .tenant_id = tenant_id.value(),
+        .tenant_id = tenant_id,
         .requested_quota_bytes = state.requested_quota_bytes,
         .effective_quota_bytes = state.effective_quota_bytes,
         .used_bytes = state.used_bytes,
@@ -314,12 +404,34 @@ TenantQuotaSnapshot TenantQuotaTable::MakeSnapshot(
     };
 }
 
-void TenantQuotaTable::RefreshOverQuota(TenantQuotaState* state) const {
+bool TenantQuotaTable::IsLazyEmptyTenant(const TenantQuotaState& state) {
+    return !state.has_explicit_policy && state.used_bytes == 0 &&
+           state.reserved_bytes == 0 && state.committed_count == 0 &&
+           state.metadata_object_count == 0;
+}
+
+void TenantQuotaTable::RefreshOverQuota(TenantQuotaState* state) {
     state->over_quota =
         (!state->has_explicit_policy && state->metadata_object_count > 0) ||
         static_cast<unsigned __int128>(state->used_bytes) +
                 state->reserved_bytes >
             state->effective_quota_bytes;
+}
+
+void TenantQuotaTable::ApplyEffectiveQuotas(
+    const std::map<TenantId, uint64_t>& effective_quotas) {
+    for (auto& [tenant_id, state] : tenants_) {
+        auto it = effective_quotas.find(tenant_id);
+        state.effective_quota_bytes =
+            it == effective_quotas.end() ? 0 : it->second;
+        RefreshOverQuota(&state);
+    }
+}
+
+void TenantQuotaTable::EraseIfLazyEmpty(StateMap::iterator it) {
+    if (IsLazyEmptyTenant(it->second)) {
+        tenants_.erase(it);
+    }
 }
 
 }  // namespace mooncake
