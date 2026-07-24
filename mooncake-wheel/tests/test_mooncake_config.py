@@ -314,6 +314,58 @@ class TestMooncakeConfig(unittest.TestCase):
             str(cm.exception),
         )
 
+    def test_load_from_env_reads_mc_etcd_vars(self):
+        """Test load_from_env() reads MC_ETCD_CA_FILE / MC_ETCD_CERT_FILE / MC_ETCD_KEY_FILE"""
+        os.environ['MOONCAKE_MASTER'] = "127.0.0.1:50051"
+        os.environ['MC_ETCD_CA_FILE'] = "/etc/etcd/ca.pem"
+        os.environ['MC_ETCD_CERT_FILE'] = "/etc/etcd/cert.pem"
+        os.environ['MC_ETCD_KEY_FILE'] = "/etc/etcd/key.pem"
+
+        try:
+            config = MooncakeConfig.load_from_env()
+            self.assertEqual(config.etcd_ca_file, "/etc/etcd/ca.pem")
+            self.assertEqual(config.etcd_cert_file, "/etc/etcd/cert.pem")
+            self.assertEqual(config.etcd_key_file, "/etc/etcd/key.pem")
+        finally:
+            del os.environ['MOONCAKE_MASTER']
+            del os.environ['MC_ETCD_CA_FILE']
+            del os.environ['MC_ETCD_CERT_FILE']
+            del os.environ['MC_ETCD_KEY_FILE']
+
+    def test_load_from_env_mc_etcd_vars_default_to_empty(self):
+        """Test load_from_env() defaults MC_ETCD_* to empty string when not set"""
+        os.environ['MOONCAKE_MASTER'] = "127.0.0.1:50051"
+
+        try:
+            config = MooncakeConfig.load_from_env()
+            self.assertEqual(config.etcd_ca_file, "")
+            self.assertEqual(config.etcd_cert_file, "")
+            self.assertEqual(config.etcd_key_file, "")
+        finally:
+            del os.environ['MOONCAKE_MASTER']
+
+    def test_load_from_file_reads_etcd_config(self):
+        """Test from_file() reads etcd_ca_file / etcd_cert_file / etcd_key_file from JSON"""
+        config_with_etcd = {
+            **self.valid_config,
+            "etcd_ca_file": "/etc/etcd/ca.pem",
+            "etcd_cert_file": "/etc/etcd/cert.pem",
+            "etcd_key_file": "/etc/etcd/key.pem",
+        }
+        self.write_config(config_with_etcd)
+        config = MooncakeConfig.from_file(self.config_file)
+        self.assertEqual(config.etcd_ca_file, "/etc/etcd/ca.pem")
+        self.assertEqual(config.etcd_cert_file, "/etc/etcd/cert.pem")
+        self.assertEqual(config.etcd_key_file, "/etc/etcd/key.pem")
+
+    def test_load_from_file_etcd_defaults_to_empty(self):
+        """Test from_file() defaults etcd_ fields to empty string when absent"""
+        self.write_config(self.valid_config)
+        config = MooncakeConfig.from_file(self.config_file)
+        self.assertEqual(config.etcd_ca_file, "")
+        self.assertEqual(config.etcd_cert_file, "")
+        self.assertEqual(config.etcd_key_file, "")
+
 
 class TestParseSegmentSize(unittest.TestCase):
     def test_integer_passthrough(self):

@@ -189,6 +189,12 @@ class MooncakeConfig:
         master_server_address (str): The address of the master server.
         enable_ssd_offload (bool): Enable SSD offload. Default is False.
         ssd_offload_path (str): The path to the SSD directory for offloading.
+        etcd_ca_file (str): Path to etcd CA certificate file (TLS). Default "".
+        etcd_cert_file (str): Path to etcd client certificate file (TLS). Default "".
+        etcd_key_file (str): Path to etcd client key file (TLS). Default "".
+
+        TLS can also be configured via environment variables:
+          MC_ETCD_CA_FILE, MC_ETCD_CERT_FILE, MC_ETCD_KEY_FILE
         tenant_id (str): Tenant identifier. Default is "default".
         enable_client_http_server (bool): Enable the client HTTP health/metrics
             endpoints. Default is False.
@@ -226,6 +232,20 @@ class MooncakeConfig:
             "enable_client_http_server": false,
             "client_http_port": 9300
         }
+
+        With etcd TLS:
+        {
+            "local_hostname": "node1",
+            "metadata_server": "etcd://192.168.1.1:2379",
+            "global_segment_size": 3355443200,
+            "local_buffer_size": 1073741824,
+            "protocol": "tcp",
+            "device_name": "",
+            "master_server_address": "master:8081",
+            "etcd_ca_file": "/etc/etcd/ca.pem",
+            "etcd_cert_file": "/etc/etcd/client.pem",
+            "etcd_key_file": "/etc/etcd/client-key.pem"
+        }
     """
 
     local_hostname: str
@@ -237,6 +257,9 @@ class MooncakeConfig:
     master_server_address: str
     enable_ssd_offload: bool = False
     ssd_offload_path: str = ""
+    etcd_ca_file: str = ""
+    etcd_cert_file: str = ""
+    etcd_key_file: str = ""
     tenant_id: str = "default"
     enable_client_http_server: bool = False
     client_http_port: int = 9300
@@ -304,7 +327,6 @@ class MooncakeConfig:
         for field in required_fields:
             if field not in config:
                 raise ValueError(f"Missing required config field: {field}")
-        ssd_offload_path = config.get("ssd_offload_path")
         tenant_id = config.get("tenant_id")
         return MooncakeConfig(
             local_hostname=config.get("local_hostname"),
@@ -319,9 +341,11 @@ class MooncakeConfig:
             device_name=config.get("device_name", ""),
             master_server_address=config.get("master_server_address"),
             enable_ssd_offload=_parse_bool(config.get("enable_ssd_offload", False)),
-            ssd_offload_path=str(ssd_offload_path)
-            if ssd_offload_path is not None
-            else "",
+            ssd_offload_path=config.get("ssd_offload_path", ""),
+            etcd_ca_file=config.get("etcd_ca_file", ""),
+            etcd_cert_file=config.get("etcd_cert_file", ""),
+            etcd_key_file=config.get("etcd_key_file", ""),
+
             tenant_id=str(tenant_id) if tenant_id is not None else "default",
             enable_client_http_server=_parse_bool(
                 config.get("enable_client_http_server", False)
@@ -363,6 +387,9 @@ class MooncakeConfig:
                     os.getenv("MOONCAKE_OFFLOAD_ENABLED", "false")
                 ),
                 ssd_offload_path=os.getenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", ""),
+                etcd_ca_file=os.getenv("MC_ETCD_CA_FILE", ""),
+                etcd_cert_file=os.getenv("MC_ETCD_CERT_FILE", ""),
+                etcd_key_file=os.getenv("MC_ETCD_KEY_FILE", ""),
                 tenant_id=os.getenv("MOONCAKE_TENANT_ID", "default"),
                 enable_client_http_server=_parse_bool(
                     os.getenv("MOONCAKE_ENABLE_CLIENT_HTTP_SERVER", "false")
