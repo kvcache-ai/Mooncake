@@ -100,7 +100,7 @@ std::string pickBackend() {
     }
 #if defined(USE_MLU)
     return "mlu";
-#elif defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+#elif defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
     defined(USE_SUPA)
     return FLAGS_use_vram ? "gpu" : "cpu";
@@ -113,7 +113,7 @@ int pickDevId(const std::string &backend) {
     if (FLAGS_device_id >= 0) {
         return FLAGS_device_id;
     }
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
     defined(USE_SUPA)
     if (backend == "gpu") {
@@ -129,7 +129,7 @@ void validateBackend(const std::string &backend) {
     if (backend == "cpu") {
         return;
     }
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
     defined(USE_SUPA)
     if (backend == "gpu") {

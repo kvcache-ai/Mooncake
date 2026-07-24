@@ -392,7 +392,8 @@ int RdmaContext::deconstruct() {
 int RdmaContext::exportDmabuf(void *addr, DmabufExport &out) {
     out = DmabufExport{};
     (void)addr;  // unused on the host-only (#else) build
-#if defined(USE_MLU) || defined(USE_MACA) || defined(USE_CUDA) || defined(USE_SUPA)
+#if defined(USE_MLU) || defined(USE_MACA) || defined(USE_CUDA) || \
+    defined(USE_SUPA)
     // Decide host vs GPU without assuming the presence of nvidia-peermem. Host
     // memory uses the plain ibv_reg_mr() path. GPU memory is exported once as a
     // dma_buf fd that every NIC then imports, so the driver keeps a single

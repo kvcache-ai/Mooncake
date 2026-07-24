@@ -239,9 +239,12 @@ if(USE_SUPA)
   message(STATUS "SUPA support is enabled")
   if(NOT DEFINED BIREN_HOME OR BIREN_HOME STREQUAL "")
     if(DEFINED ENV{BIREN_HOME} AND NOT "$ENV{BIREN_HOME}" STREQUAL "")
-      set(BIREN_HOME "$ENV{BIREN_HOME}" CACHE PATH "Biren SUPA SDK root")
+      set(BIREN_HOME
+          "$ENV{BIREN_HOME}"
+          CACHE PATH "Biren SUPA SDK root")
     else()
-      set(BIREN_HOME "/usr/local/birensupa/all/latest"
+      set(BIREN_HOME
+          "/usr/local/birensupa/all/latest"
           CACHE PATH "Biren SUPA SDK root")
     endif()
   endif()
