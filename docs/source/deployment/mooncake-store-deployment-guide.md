@@ -237,14 +237,6 @@ The master resolves the current IPv4 address of `eth0` at startup and uses it as
 
 ---
 
-### KV Cache Sharing and Isolation
-
-Mooncake Store treats object keys as opaque strings, so inference frameworks define the cache-sharing boundary. Configure a stable model identifier for every deployment, and use a separate release prefix or request salt when a finer isolation boundary is needed.
-
-See [KV Cache Sharing and Isolation](kv-cache-sharing-and-isolation) for SGLang and vLLM configuration, rolling-upgrade examples, and the relationship between model names, `cache_salt`, and Mooncake tenants.
-
----
-
 ## Metrics Endpoints
 
 The master exposes Prometheus-style metrics on `--metrics_port`:
@@ -357,7 +349,6 @@ In HA mode, quota admin requests are served only by the active master service. S
 - Scale `--rpc_thread_num` with available CPU cores and workload.
 - Start with default eviction settings; adjust `--eviction_high_watermark_ratio` and `--eviction_ratio` based on memory pressure and object churn.
 - Use `/metrics/summary` during bring-up; integrate `/metrics` with Prometheus/Grafana for production.
-- For multi-model deployments and rolling upgrades, see [KV Cache Sharing and Isolation](kv-cache-sharing-and-isolation).
 - For detailed SSD offload configuration (storage backends, eviction policies, io_uring), see the [SSD Offload guide](ssd/ssd-offload).
 - For NVMe-oF SSD pool configuration see the [NVMe-oF SSD Pool Deployment Guide](ssd/nvmf-ssd-deployment-guide)
 - For experimental 3FS (USRBIO) integration as a persistent storage backend, see the [3FS USRBIO Plugin guide](../getting_started/plugin-usage/3FS-USRBIO-Plugin).
@@ -367,7 +358,7 @@ In HA mode, quota admin requests are served only by the active master service. S
 :maxdepth: 1
 :hidden:
 
-KV Cache Sharing and Isolation<kv-cache-sharing-and-isolation>
+KV Cache Sharing and Isolation<kv-cache-sharing-and-isolation/index>
 SSD Storage<ssd/index>
 HF3FS Plugin (Experimental)<../getting_started/plugin-usage/3FS-USRBIO-Plugin>
 ../getting_started/observability

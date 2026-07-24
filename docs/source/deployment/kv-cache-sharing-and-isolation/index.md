@@ -123,7 +123,7 @@ Use a new namespace whenever cache compatibility may have changed, including cha
 
 Mooncake tenant configuration is independent of the framework-level model, release, and request namespaces. When the master is started with `--enable_multi_tenants=true`, the client `tenant_id` selects a tenant-scoped object namespace and the master applies that tenant's quota during admission.
 
-Use the same `tenant_id` for framework instances that should share one quota and tenant namespace. See [Tenant Quota Management](mooncake-store-deployment-guide.md#tenant-quota-management) for configuration details.
+Use the same `tenant_id` for framework instances that should share one quota and tenant namespace. See [Tenant Quota Management](../mooncake-store-deployment-guide.md#tenant-quota-management) for configuration details.
 
 ## Operational Checklist
 
