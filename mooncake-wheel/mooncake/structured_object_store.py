@@ -31,6 +31,8 @@ MISSING_OBJECT_ERROR = (
     -704
 )  # Mooncake remove returns -704 for an already-missing object.
 STRUCTURED_FIELD_SPECS_KEY = "__mooncake_structured_fields__"
+_TYPED_RAGGED_DEFAULT_DTYPE = "int64"
+_RAGGED_TENSOR_DEFAULT_DTYPE = "torch.float32"
 _ENCODING_FALLBACK_ERRORS = (
     TypeError,
     ValueError,
@@ -2598,81 +2600,57 @@ def _encode_ragged_tensor_values(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if _torch is None:
         raise RuntimeError("torch is required to encode ragged tensor fields")
-    tensors: list[Any] = []
-    dtype = None
-    max_ndim = 0
+    # Determine torch dtype and convert all values to numpy arrays.
+    torch_dtype = None
+    converted: list[Any] = []
     for value in values:
         if value is None:
-            tensors.append(None)
+            converted.append(None)
             continue
-        tensor = value.detach()
+        if isinstance(value, np.ndarray):
+            if value.dtype == object:
+                raise ValueError("ragged tensor codec requires numeric ndarray values")
+            if not value.flags.writeable:
+                value = value.copy()
+            tensor = _torch.as_tensor(value)
+        else:
+            tensor = value.detach()
         if tensor.device.type != "cpu" or not tensor.is_contiguous():
             tensor = tensor.cpu().contiguous()
-        dtype = tensor.dtype if dtype is None else dtype
-        if tensor.dtype != dtype:
-            raise ValueError(f"mixed tensor dtype: {dtype} vs {tensor.dtype}")
-        max_ndim = max(max_ndim, tensor.dim())
-        tensors.append(tensor)
-    offsets = _torch.zeros(len(tensors) + 1, dtype=_torch.int64)
-    ndims = _torch.zeros(len(tensors), dtype=_torch.int16)
-    shapes = _torch.zeros((len(tensors), max(max_ndim, 1)), dtype=_torch.int64)
-    nulls = np.asarray([tensor is None for tensor in tensors], dtype=np.bool_)
-    flat_parts = []
-    offset = 0
-    for row, tensor in enumerate(tensors):
-        if tensor is None:
-            offsets[row + 1] = offset
-            continue
-        flat = tensor.reshape(-1)
-        flat_parts.append(flat)
-        offset += flat.numel()
-        offsets[row + 1] = offset
-        ndims[row] = tensor.dim()
-        if tensor.dim() > 0:
-            shapes[row, : tensor.dim()] = _torch.tensor(
-                list(tensor.shape), dtype=_torch.int64
-            )
-    data_dtype = dtype or _torch.float32
-    data = (
-        _torch.cat(flat_parts) if flat_parts else _torch.empty((0,), dtype=data_dtype)
-    )
-    payload = {
-        "data": data.numpy(),
-        "offsets": offsets.numpy(),
-        "shapes": shapes.numpy(),
-        "ndims": ndims.numpy(),
-        "nulls": nulls,
-    }
-    return payload, {
-        "dtype": str(data_dtype),
-        "max_ndim": int(max_ndim),
-        "shape_policy": "ragged",
-    }
-
+        if tensor.dtype == _torch.bfloat16:
+            raise ValueError("ragged tensor codec does not support torch.bfloat16")
+        torch_dtype = tensor.dtype if torch_dtype is None else torch_dtype
+        if tensor.dtype != torch_dtype:
+            raise ValueError(f"mixed tensor dtype: {torch_dtype} vs {tensor.dtype}")
+        converted.append(tensor.numpy())
+    data_dtype = torch_dtype or _parse_torch_dtype(_RAGGED_TENSOR_DEFAULT_DTYPE)
+    np_dtype = np.dtype(_torch_dtype_to_numpy(str(data_dtype)))
+    payload, meta = _encode_typed_ragged_values(converted, np_dtype)
+    meta["dtype"] = str(data_dtype)
+    return payload, meta
 
 def _decode_ragged_tensor_values(
-    payload: dict[str, Any],
-    rows: int,
-    metadata: Optional[Mapping[str, Any]] = None,
+    payload: dict[str, Any], rows: int, metadata: Optional[Mapping[str, Any]] = None
 ) -> list[Any]:
     if _torch is None:
         raise RuntimeError("torch is required to decode ragged tensor fields")
-    data = _torch.from_numpy(payload["data"])
-    offsets = payload["offsets"]
-    shapes = payload["shapes"]
-    ndims = payload["ndims"]
-    nulls = payload["nulls"]
-    values = []
-    for row in range(rows):
-        if bool(nulls[row]):
-            values.append(None)
-            continue
-        begin = int(offsets[row])
-        end = int(offsets[row + 1])
-        ndim = int(ndims[row])
-        shape = tuple(int(v) for v in shapes[row, :ndim].tolist())
-        values.append(data[begin:end].reshape(shape))
-    return values
+    # Metadata stores torch dtype strings (e.g. "torch.int64"); convert to numpy
+    # dtype so _decode_typed_ragged_values can parse it.
+    dtype_str = (metadata or {}).get("dtype", _RAGGED_TENSOR_DEFAULT_DTYPE)
+    np_dtype = _torch_dtype_to_numpy(dtype_str)
+    patched_meta = dict(metadata) if metadata else {}
+    patched_meta["dtype"] = str(np_dtype)
+    np_values = _decode_typed_ragged_values(payload, rows, patched_meta)
+    torch_dtype = _parse_torch_dtype(dtype_str)
+    result: list[Any] = []
+    for v in np_values:
+        if v is None:
+            result.append(None)
+        elif isinstance(v, np.ndarray):
+            result.append(_torch.from_numpy(v).to(torch_dtype))
+        else:
+            result.append(_torch.as_tensor(v, dtype=torch_dtype))
+    return result
 
 def _normalize_ragged_tensor_dict_keys(keys: Any) -> list[str]:
     if isinstance(keys, Mapping):
@@ -2819,15 +2797,20 @@ def _encode_typed_ragged_values(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if dtype_hint is None:
         source_arrays = [np.asarray(value) for value in values if value is not None]
-        dtype = np.result_type(*source_arrays) if source_arrays else np.dtype(np.int64)
+        dtype = np.result_type(*source_arrays) if source_arrays else np.dtype(_TYPED_RAGGED_DEFAULT_DTYPE)
     else:
         dtype = np.dtype(dtype_hint)
     if dtype.hasobject:
         raise ValueError("typed_ragged codec requires non-object dtype")
+
+    ndarray_encoded = _encode_typed_ragged_ndarray_rows(values, dtype)
+    if ndarray_encoded is not None:
+        return ndarray_encoded
+
     arrays = [
         np.asarray([], dtype=dtype)
         if value is None
-        else np.ascontiguousarray(np.asarray(value, dtype=dtype))
+        else _as_contiguous_array_preserve_ndim(value, dtype)
         for value in values
     ]
     max_ndim = max((array.ndim for array in arrays), default=0)
@@ -2845,27 +2828,33 @@ def _encode_typed_ragged_values(
         ndims[row] = array.ndim
         if array.ndim > 0:
             shapes[row, : array.ndim] = array.shape
+    total_elems = int(offset)
     if flat_arrays:
         if _concat_arrays_into is not None:
-            data = _DirectCopyPayload.from_flat_arrays(
-                flat_arrays, dtype, int(offset)
-            )
+            data = _DirectCopyPayload.from_flat_arrays(flat_arrays, dtype, total_elems)
         else:
             buffers = tuple(memoryview(flat.data).cast("B") for flat in flat_arrays)
             data = _MultiBufferPayload(
                 buffers=buffers,
                 owners=tuple(flat_arrays),
                 dtype=np.dtype(dtype).str,
-                shape=(int(offset),),
+                shape=(total_elems,),
             )
     else:
         empty = np.empty(0, dtype=dtype)
         data = _MultiBufferPayload(
-            buffers=(memoryview(empty.data).cast("B"),),
-            owners=(empty,),
-            dtype=np.dtype(dtype).str,
-            shape=(0,),
+            buffers=(memoryview(empty.data).cast("B"),), owners=(empty,),
+            dtype=np.dtype(dtype).str, shape=(0,),
         )
+    ndarray_rows = [
+        value is not None and isinstance(value, np.ndarray) for value in values
+    ]
+    if all(value is None or is_array for value, is_array in zip(values, ndarray_rows)):
+        row_format = "ndarray"
+    elif any(ndarray_rows):
+        row_format = "mixed"
+    else:
+        row_format = "list"
     return (
         {
             "data": data,
@@ -2874,18 +2863,47 @@ def _encode_typed_ragged_values(
             "ndims": ndims,
             "nulls": nulls,
         },
-        {"dtype": str(dtype), "max_ndim": int(max_ndim), "shape_policy": "ragged"},
+        {
+            "dtype": str(dtype),
+            "max_ndim": int(max_ndim),
+            "shape_policy": "ragged",
+            "row_format": row_format,
+            "ndarray_rows": ndarray_rows if row_format == "mixed" else None,
+        },
     )
-
 
 def _decode_typed_ragged_values(
     payload: dict[str, Any], rows: int, metadata: Optional[Mapping[str, Any]] = None
 ) -> list[Any]:
-    data = payload["data"]
+    raw = payload["data"]
+    dtype_str = (metadata or {}).get("dtype", _TYPED_RAGGED_DEFAULT_DTYPE)
+    np_dtype = np.dtype(dtype_str)
+    # data may arrive as torch.Tensor, bytes, or numpy (pool-backed or typed)
+    if _torch is not None and isinstance(raw, _torch.Tensor):
+        data = raw.numpy()
+    elif isinstance(raw, (bytes, bytearray, memoryview)):
+        data = np.frombuffer(raw, dtype=np_dtype)
+    elif isinstance(raw, np.ndarray):
+        data = raw if raw.dtype == np_dtype else np.frombuffer(raw, dtype=np_dtype)
+    else:
+        data = np.asarray(raw, dtype=np_dtype)
     offsets = payload["offsets"]
     shapes = payload["shapes"]
     ndims = payload["ndims"]
     nulls = payload["nulls"]
+    metadata = metadata or {}
+    row_format = metadata.get("row_format")
+    if (
+        row_format == "ndarray"
+        and metadata.get("physical_layout") == "contiguous_flat"
+    ):
+        fast_values = _decode_typed_ragged_ndarray_rows_fast(
+            data, offsets, shapes, ndims, nulls, rows, metadata
+        )
+        if fast_values is not None:
+            return fast_values
+
+    ndarray_rows = metadata.get("ndarray_rows") or []
     values = []
     for row in range(rows):
         if bool(nulls[row]):
@@ -2895,7 +2913,13 @@ def _decode_typed_ragged_values(
         end = int(offsets[row + 1])
         ndim = int(ndims[row])
         shape = tuple(int(v) for v in shapes[row, :ndim].tolist())
-        values.append(data[begin:end].reshape(shape).tolist())
+        array = data[begin:end].reshape(shape)
+        if row_format == "ndarray" or (
+            row_format == "mixed" and bool(ndarray_rows[row])
+        ):
+            values.append(array)
+        else:
+            values.append(array.tolist())
     return values
 
 
@@ -5338,7 +5362,313 @@ def _normalize_structured_scalar(value: Any) -> Any:
 
 
 
+def _encode_typed_ragged_regular_ndarray_rows(
+    values: list[Any], dtype: np.dtype[Any]
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    row_count = len(values)
+    if row_count < 2:
+        return None
+    first = values[0]
+    if (
+        not isinstance(first, np.ndarray)
+        or first.dtype != dtype
+        or not first.flags.c_contiguous
+    ):
+        return None
+    shape = first.shape
+    for value in values[1:]:
+        if (
+            not isinstance(value, np.ndarray)
+            or value.dtype != dtype
+            or not value.flags.c_contiguous
+            or value.shape != shape
+        ):
+            return None
 
+    row_elems = int(first.size)
+    total_elems = row_count * row_elems
+    if row_elems:
+        flat_arrays = [value.reshape(-1) for value in values]
+        if _concat_arrays_into is not None:
+            data = _DirectCopyPayload.from_flat_arrays(flat_arrays, dtype, total_elems)
+        else:
+            data = _MultiBufferPayload(
+                buffers=tuple(memoryview(flat.data).cast("B") for flat in flat_arrays),
+                owners=tuple(flat_arrays),
+                dtype=np.dtype(dtype).str,
+                shape=(total_elems,),
+            )
+    else:
+        data = np.asarray(values, dtype=dtype).reshape(-1)
+    offsets = np.arange(row_count + 1, dtype=np.int64) * row_elems
+    nulls = np.zeros(row_count, dtype=np.bool_)
+    max_ndim = int(first.ndim)
+    if max_ndim == 0:
+        shapes = np.zeros((row_count, 1), dtype=np.int64)
+        ndims = np.zeros(row_count, dtype=np.int16)
+    else:
+        shapes = np.empty((row_count, max_ndim), dtype=np.int64)
+        shapes[:] = shape
+        ndims = np.full(row_count, max_ndim, dtype=np.int16)
+    return (
+        {
+            "data": data,
+            "offsets": offsets,
+            "shapes": shapes,
+            "ndims": ndims,
+            "nulls": nulls,
+        },
+        {
+            "dtype": str(dtype),
+            "max_ndim": max_ndim,
+            "shape_policy": "ragged",
+            "row_format": "ndarray",
+            "ndarray_rows": None,
+            "physical_layout": "contiguous_flat",
+        },
+    )
+
+
+def _encode_typed_ragged_ndarray_rows(
+    values: list[Any], dtype: np.dtype[Any]
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    regular_encoded = _encode_typed_ragged_regular_ndarray_rows(values, dtype)
+    if regular_encoded is not None:
+        return regular_encoded
+
+    row_count = len(values)
+    if row_count == 0:
+        return None
+
+    nulls = np.empty(row_count, dtype=np.bool_)
+    lengths = np.empty(row_count, dtype=np.int64)
+    arrays: list[np.ndarray] = []
+    tail_shape: tuple[int, ...] | None = None
+    row_ndim: int | None = None
+    tail_compatible = True
+    saw_scalar = False
+    saw_non_scalar = False
+
+    for row, value in enumerate(values):
+        if value is None:
+            nulls[row] = True
+            lengths[row] = 0
+            continue
+        if not isinstance(value, np.ndarray):
+            return None
+
+        array = _as_contiguous_array_preserve_ndim(value, dtype)
+        arrays.append(array)
+        nulls[row] = False
+        lengths[row] = array.size
+        if array.ndim == 0:
+            saw_scalar = True
+            if saw_non_scalar:
+                tail_compatible = False
+            continue
+
+        saw_non_scalar = True
+        if saw_scalar:
+            tail_compatible = False
+        current_tail = array.shape[1:]
+        if tail_shape is None:
+            tail_shape = current_tail
+            row_ndim = array.ndim
+        elif array.ndim != row_ndim or current_tail != tail_shape:
+            tail_compatible = False
+
+    if tail_compatible and tail_shape is not None and any(dim == 0 for dim in tail_shape):
+        tail_compatible = False
+
+    offsets = np.empty(row_count + 1, dtype=np.int64)
+    offsets[0] = 0
+    np.cumsum(lengths, out=offsets[1:])
+    total_elems = int(offsets[-1])
+    if len(arrays) == 1:
+        flat = arrays[0].reshape(-1)
+        data = _MultiBufferPayload(
+            buffers=(memoryview(flat.data).cast("B"),),
+            owners=(flat,),
+            dtype=np.dtype(dtype).str,
+            shape=(total_elems,),
+        )
+    elif total_elems:
+        flat_arrays = [arr.reshape(-1) for arr in arrays]
+        if _concat_arrays_into is not None:
+            data = _DirectCopyPayload.from_flat_arrays(flat_arrays, dtype, total_elems)
+        else:
+            buffers = tuple(memoryview(flat.data).cast("B") for flat in flat_arrays)
+            data = _MultiBufferPayload(
+                buffers=buffers,
+                owners=tuple(flat_arrays),
+                dtype=np.dtype(dtype).str,
+                shape=(total_elems,),
+            )
+    else:
+        empty = np.empty(0, dtype=dtype)
+        data = _MultiBufferPayload(
+            buffers=(memoryview(empty.data).cast("B"),),
+            owners=(empty,),
+            dtype=np.dtype(dtype).str,
+            shape=(0,),
+        )
+
+    if not arrays or saw_scalar and not saw_non_scalar:
+        max_ndim = 0
+    elif tail_compatible:
+        max_ndim = int(row_ndim or 1)
+    else:
+        max_ndim = max(array.ndim for array in arrays)
+
+    ndims = np.zeros(row_count, dtype=np.int16)
+    if max_ndim == 0:
+        shapes = np.zeros((row_count, 1), dtype=np.int64)
+    elif tail_compatible:
+        shapes = np.zeros((row_count, max_ndim), dtype=np.int64)
+        tail = tail_shape or ()
+        tail_elems = int(np.prod(tail, dtype=np.int64)) if tail else 1
+        shapes[:, 0] = lengths // tail_elems
+        if max_ndim > 1:
+            shapes[:, 1:] = tail
+        ndims[~nulls] = max_ndim
+    else:
+        shapes = np.zeros((row_count, max(max_ndim, 1)), dtype=np.int64)
+        array_index = 0
+        for row, is_null in enumerate(nulls):
+            if bool(is_null):
+                continue
+            array = arrays[array_index]
+            array_index += 1
+            ndims[row] = array.ndim
+            if array.ndim > 0:
+                shapes[row, : array.ndim] = array.shape
+
+    return (
+        {
+            "data": data,
+            "offsets": offsets,
+            "shapes": shapes,
+            "ndims": ndims,
+            "nulls": nulls,
+        },
+        {
+            "dtype": str(dtype),
+            "max_ndim": int(max_ndim),
+            "shape_policy": "ragged",
+            "row_format": "ndarray",
+            "ndarray_rows": None,
+            "physical_layout": "contiguous_flat",
+        },
+    )
+
+
+def _as_contiguous_array_preserve_ndim(value: Any, dtype: np.dtype[Any]) -> np.ndarray:
+    if isinstance(value, np.ndarray) and value.dtype == dtype and value.flags.c_contiguous:
+        return value
+    array = np.asarray(value, dtype=dtype)
+    if array.flags.c_contiguous:
+        return array
+    return np.array(array, dtype=dtype, order="C", copy=True)
+
+
+def _decode_typed_ragged_ndarray_rows_fast(
+    data: np.ndarray,
+    offsets: np.ndarray,
+    shapes: np.ndarray,
+    ndims: np.ndarray,
+    nulls: np.ndarray,
+    rows: int,
+    metadata: Mapping[str, Any],
+) -> list[Any] | None:
+    # Returned ndarray rows are views into data; _OwnerBackedList preserves any
+    # pool owner attached to that data for the lifetime of the row list.
+    max_ndim = int(metadata.get("max_ndim", 0))
+    owner = getattr(data, "_mooncake_pool_owner", None)
+    source = data.view(np.ndarray) if isinstance(data, np.ndarray) else data
+    has_nulls = bool(nulls.any())
+
+    def attach_owner(values: list[Any]) -> list[Any]:
+        if owner is None:
+            return values
+        return _OwnerBackedList(values, owner)
+
+    if max_ndim == 1:
+        if not has_nulls:
+            row_width = _regular_offsets_width(offsets, rows)
+            if row_width is not None:
+                return attach_owner(list(source.reshape((rows, row_width))))
+            begins = offsets[:-1].tolist()
+            ends = offsets[1:].tolist()
+            return attach_owner(
+                [source[b:e] for b, e in zip(begins, ends)]
+            )
+        values: list[Any] = []
+        for row, is_null in enumerate(nulls):
+            if bool(is_null):
+                values.append(None)
+            else:
+                begin = int(offsets[row])
+                end = int(offsets[row + 1])
+                values.append(source[begin:end])
+        return attach_owner(values)
+
+    if max_ndim <= 1 or rows == 0:
+        return None
+
+    non_null_rows = np.flatnonzero(~nulls)
+    if non_null_rows.size == 0:
+        return [None] * rows
+    first_row = int(non_null_rows[0])
+    if int(ndims[first_row]) != max_ndim:
+        return None
+    tail = tuple(int(v) for v in shapes[first_row, 1:max_ndim])
+    if any(dim == 0 for dim in tail):
+        return None
+    for row in non_null_rows:
+        row_index = int(row)
+        if int(ndims[row_index]) != max_ndim:
+            return None
+        if tuple(int(v) for v in shapes[row_index, 1:max_ndim]) != tail:
+            return None
+
+    tail_elems = int(np.prod(tail, dtype=np.int64)) if tail else 1
+    if tail_elems <= 0:
+        return None
+    if int(offsets[-1]) % tail_elems != 0:
+        return None
+    flat_rows = source.reshape((-1, *tail))
+    first_axis_offsets = offsets // tail_elems
+
+    if not has_nulls:
+        row_width = _regular_offsets_width(first_axis_offsets, rows)
+        if row_width is not None:
+            return attach_owner(list(flat_rows.reshape((rows, row_width, *tail))))
+        fa_begins = first_axis_offsets[:-1].tolist()
+        fa_ends = first_axis_offsets[1:].tolist()
+        return attach_owner(
+            [flat_rows[b:e] for b, e in zip(fa_begins, fa_ends)]
+        )
+    values = []
+    for row, is_null in enumerate(nulls):
+        if bool(is_null):
+            values.append(None)
+        else:
+            begin = int(first_axis_offsets[row])
+            end = int(first_axis_offsets[row + 1])
+            values.append(flat_rows[begin:end])
+    return attach_owner(values)
+
+
+def _regular_offsets_width(offsets: np.ndarray, rows: int) -> int | None:
+    if rows <= 0 or int(offsets[0]) != 0:
+        return None
+    total = int(offsets[-1])
+    if total < 0 or total % rows != 0:
+        return None
+    row_width = total // rows
+    if not bool(np.all(offsets[1:] - offsets[:-1] == row_width)):
+        return None
+    return row_width
 
 def _encode_msgpack_ragged_values(
     path: str, values: list[Any]
@@ -5367,8 +5697,6 @@ def _encode_msgpack_ragged_values(
         {"data": buf, "offsets": offsets, "nulls": nulls},
         {},
     )
-
-
 
 def _decode_msgpack_ragged_values(payload: dict[str, Any], rows: int) -> list[Any]:
     data = payload["data"]
@@ -5399,8 +5727,6 @@ class _OwnerBackedList(list):
         super().__init__(values)
         self._mooncake_pool_owner = owner
 
-
-
 class _OwnerBackedObjectArray(np.ndarray):
     def __array_finalize__(self, obj: Any) -> None:
         if obj is not None:
@@ -5412,8 +5738,6 @@ class _OwnerBackedObjectArray(np.ndarray):
         if owner is None:
             return values
         return _OwnerBackedList(values, owner)
-
-
 
 def _object_array_from_decoded_values(values: list[Any]) -> np.ndarray:
     array = np.empty(len(values), dtype=object)
@@ -5722,7 +6046,21 @@ except Exception:  # pragma: no cover
     _torch = None  # type: ignore[assignment]
 
 
+def _parse_torch_dtype(dtype_str: str) -> Any:
+    """Parse torch dtype string (e.g. 'torch.float32') to torch.dtype object."""
+    name = dtype_str.removeprefix("torch.")
+    dtype = getattr(_torch, name, None)
+    if dtype is None or not isinstance(dtype, _torch.dtype):
+        raise ValueError(f"unknown torch dtype: {dtype_str}")
+    return dtype
 
+
+def _torch_dtype_to_numpy(dtype_str: str) -> np.dtype:
+    """Convert value-preserving torch dtypes to numpy dtypes."""
+    torch_dtype = _parse_torch_dtype(dtype_str)
+    if torch_dtype == _torch.bfloat16:
+        raise ValueError("torch.bfloat16 has no value-preserving numpy dtype")
+    return _torch.empty(0, dtype=torch_dtype).numpy().dtype
 
 @dataclass
 class _CodecDecision:
