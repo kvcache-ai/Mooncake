@@ -250,7 +250,7 @@ TEST_F(RuntimeConfigTest, ValidateWriteConfigRejectsContradiction) {
         patch["local_write_waterline"] = 1.0;
         EXPECT_FALSE(store.updateWriteConfig(patch));
     }
-    const auto& cfg =
+    const auto cfg =
         std::get<WriteRouteRequestConfig>(store.getDefaultWriteConfig());
     EXPECT_DOUBLE_EQ(cfg.remote_weight, 0.5);
     EXPECT_DOUBLE_EQ(cfg.local_write_waterline, 0.5);
@@ -262,7 +262,7 @@ TEST_F(RuntimeConfigTest, ValidateWriteConfigAllowsValidCombos) {
     patch["remote_weight"] = 0.5;
     patch["local_write_waterline"] = 0.0;
     EXPECT_TRUE(p2p_store().updateWriteConfig(patch));
-    const auto& cfg1 =
+    const auto cfg1 =
         std::get<WriteRouteRequestConfig>(p2p_store().getDefaultWriteConfig());
     EXPECT_DOUBLE_EQ(cfg1.remote_weight, 0.5);
     EXPECT_DOUBLE_EQ(cfg1.local_write_waterline, 0.0);
@@ -272,7 +272,7 @@ TEST_F(RuntimeConfigTest, ValidateWriteConfigAllowsValidCombos) {
     patch2["remote_weight"] = 0.0;
     patch2["local_write_waterline"] = 0.8;
     EXPECT_TRUE(p2p_store().updateWriteConfig(patch2));
-    const auto& cfg2 =
+    const auto cfg2 =
         std::get<WriteRouteRequestConfig>(p2p_store().getDefaultWriteConfig());
     EXPECT_DOUBLE_EQ(cfg2.remote_weight, 0.0);
     EXPECT_DOUBLE_EQ(cfg2.local_write_waterline, 0.8);
@@ -283,7 +283,7 @@ TEST_F(RuntimeConfigTest, ValidateWriteConfigAllowsValidCombos) {
     patch3["remote_weight"] = 1.0;
     patch3["local_write_waterline"] = 0.0;
     EXPECT_TRUE(p2p_store().updateWriteConfig(patch3));
-    const auto& cfg3 =
+    const auto cfg3 =
         std::get<WriteRouteRequestConfig>(p2p_store().getDefaultWriteConfig());
     EXPECT_DOUBLE_EQ(cfg3.remote_weight, 1.0);
     EXPECT_DOUBLE_EQ(cfg3.local_write_waterline, 0.0);
@@ -294,7 +294,7 @@ TEST_F(RuntimeConfigTest, ValidateWriteConfigAllowsValidCombos) {
     patch4["remote_weight"] = 0.0;
     patch4["local_write_waterline"] = 1.0;
     EXPECT_TRUE(p2p_store().updateWriteConfig(patch4));
-    const auto& cfg4 =
+    const auto cfg4 =
         std::get<WriteRouteRequestConfig>(p2p_store().getDefaultWriteConfig());
     EXPECT_DOUBLE_EQ(cfg4.remote_weight, 0.0);
     EXPECT_DOUBLE_EQ(cfg4.local_write_waterline, 1.0);

@@ -166,8 +166,8 @@ TEST_F(P2PClientIntegrationTest, PutAndGetLocal) {
 TEST_F(P2PClientIntegrationTest, ForceLocalWriteBypass) {
     const std::string data = "force_local_payload";
 
-    // remote_weight=0: client_ writes locally, bypassing the master.
-    // Data should be readable on client_ but NOT on client2_.
+    // remote_weight=0: client_ writes locally instead of asking the master
+    // for a remote route.
     {
         const std::string key = "force_local_key";
         WriteRouteRequestConfig cfg;
@@ -185,15 +185,20 @@ TEST_F(P2PClientIntegrationTest, ForceLocalWriteBypass) {
         ASSERT_TRUE(get.has_value());
         EXPECT_EQ(std::string(buf.data(), buf.size()), data);
 
-        // NOT readable on remote client (data never left client_).
-        std::vector<char> buf2(data.size(), 0);
-        auto get2 = client2_->Get(key, {(void*)buf2.data()}, {buf2.size()});
-        EXPECT_FALSE(get2.has_value())
-            << "Force-local data should not be on client2_";
+        // Verify via master that the replica is on client_ (local).
+        auto resp = client_->GetMasterClient().GetReplicaList(key);
+        ASSERT_TRUE(resp.has_value());
+        ASSERT_FALSE(resp->replicas.empty());
+        const auto& desc = resp->replicas[0];
+        ASSERT_TRUE(std::holds_alternative<P2PProxyDescriptor>(
+            desc.descriptor_variant));
+        EXPECT_EQ(
+            std::get<P2PProxyDescriptor>(desc.descriptor_variant).client_id,
+            client_->GetClientID());
     }
 
     // remote_weight=1: client_ writes to client2_ via master routing.
-    // Data should be readable on client2_ but NOT locally on client_.
+    // The replica should be on client2_ (remote), not on client_.
     {
         const std::string key = "force_remote_key";
         WriteRouteRequestConfig cfg;
@@ -213,22 +218,26 @@ TEST_F(P2PClientIntegrationTest, ForceLocalWriteBypass) {
             << "Force-remote data should be on client2_";
         EXPECT_EQ(std::string(buf.data(), buf.size()), data);
 
-        // NOT readable locally on client_ (data was written to client2_).
-        std::vector<char> buf2(data.size(), 0);
-        auto get2 = client_->Get(key, {(void*)buf2.data()}, {buf2.size()});
-        EXPECT_FALSE(get2.has_value())
-            << "Force-remote data should not be on client_ locally";
+        // Verify via master that the replica is on client2_ (remote).
+        auto resp = client_->GetMasterClient().GetReplicaList(key);
+        ASSERT_TRUE(resp.has_value());
+        ASSERT_FALSE(resp->replicas.empty());
+        const auto& desc = resp->replicas[0];
+        ASSERT_TRUE(std::holds_alternative<P2PProxyDescriptor>(
+            desc.descriptor_variant));
+        EXPECT_EQ(
+            std::get<P2PProxyDescriptor>(desc.descriptor_variant).client_id,
+            client2_->GetClientID());
     }
 }
 
 // When local utilization is below the waterline, the client writes locally
-// without asking the master — even with a balanced remote_weight.
 TEST_F(P2PClientIntegrationTest, WaterlineBypassWritesLocal) {
     const std::string data = "waterline_payload";
 
     // Local client is nearly empty (64MB DRAM, ~0% utilization).
     // With waterline=0.5 and remote_weight=0.5 (balanced), the waterline
-    // triggers a local write: data stays on client_, not on client2_.
+    // triggers a local write: data stays on client_.
     const std::string key = "waterline_bypass_key";
     WriteRouteRequestConfig cfg;
     cfg.remote_weight = 0.5;          // balanced
@@ -246,11 +255,15 @@ TEST_F(P2PClientIntegrationTest, WaterlineBypassWritesLocal) {
     ASSERT_TRUE(get.has_value());
     EXPECT_EQ(std::string(buf.data(), buf.size()), data);
 
-    // NOT readable on remote client (data stayed local).
-    std::vector<char> buf2(data.size(), 0);
-    auto get2 = client2_->Get(key, {(void*)buf2.data()}, {buf2.size()});
-    EXPECT_FALSE(get2.has_value())
-        << "Waterline-bypass data should not be on client2_";
+    // Verify via master that the replica is on client_ (local).
+    auto resp = client_->GetMasterClient().GetReplicaList(key);
+    ASSERT_TRUE(resp.has_value());
+    ASSERT_FALSE(resp->replicas.empty());
+    const auto& desc = resp->replicas[0];
+    ASSERT_TRUE(
+        std::holds_alternative<P2PProxyDescriptor>(desc.descriptor_variant));
+    EXPECT_EQ(std::get<P2PProxyDescriptor>(desc.descriptor_variant).client_id,
+              client_->GetClientID());
 }
 
 // Contradictory config (waterline=0 + remote_weight=0, a dead-end combo)
