@@ -194,6 +194,25 @@ jobs:
                      /usr/local/cuda/targets/*/lib/stubs; do
             [ -d "$dir" ] && export LD_LIBRARY_PATH="$dir:$LD_LIBRARY_PATH"
           done
+
+          # CUDA builder images contain the link-time driver stub but not the
+          # real libcuda.so.1 supplied by an NVIDIA driver. Non-CUDA wheels must
+          # not receive this alias, so an accidental CUDA dependency still fails.
+          if [ "${VARIANT_FLAG:-}" != "NON_CUDA_BUILD" ]; then
+            cuda_stub=
+            for candidate in /usr/local/cuda/lib64/stubs/libcuda.so \
+                             /usr/local/cuda/targets/*/lib/stubs/libcuda.so; do
+              if [ -f "$candidate" ]; then
+                cuda_stub="$candidate"
+                break
+              fi
+            done
+            if [ -n "$cuda_stub" ]; then
+              ln -s "$cuda_stub" "$smoke_venv/libcuda.so.1"
+              export LD_LIBRARY_PATH="$smoke_venv:$LD_LIBRARY_PATH"
+            fi
+          fi
+
           "$smoke_venv/bin/mooncake_master" --version
 
       - name: Upload Python wheel artifact
