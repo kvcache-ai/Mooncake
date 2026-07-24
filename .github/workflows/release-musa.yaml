@@ -4,10 +4,16 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to upload to (e.g. v0.3.12)'
+        required: true
+        type: string
 
 jobs:
   build:
-    if: ${{ !contains(github.ref_name, '-') }}
+    if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.ref_name, '-') }}
     runs-on: ubuntu-22.04
     container: registry.mthreads.com/mcconline/inference/pytorch:2.9.1.post1-py3.10-musa5.2.0-mp31-devel-ubuntu22.04-amd64
 
@@ -32,6 +38,20 @@ jobs:
       - name: Mark repository as safe
         shell: bash
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Validate manual release target
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_NAME}" != "release/${RELEASE_TAG}" ]]; then
+            echo "::error::Run this workflow from release/${RELEASE_TAG}"
+            exit 1
+          fi
+          git check-ref-format "refs/tags/${RELEASE_TAG}"
+          git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}"
 
       - name: Setup Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -141,7 +161,7 @@ jobs:
           path: mooncake-wheel/dist-musa-py${{ steps.generate_tag_release.outputs.python_version_tag }}/*.whl
 
   publish-release:
-    if: ${{ !contains(github.ref_name, '-') }}
+    if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.ref_name, '-') }}
     needs: build
     runs-on: ubuntu-22.04
     environment: pypi
@@ -170,6 +190,7 @@ jobs:
       - name: Upload wheels to GitHub Release
         uses: softprops/action-gh-release@v1
         with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
           files: mooncake-wheel/dist-release/*.whl
 
       - name: Publish package to PyPI
