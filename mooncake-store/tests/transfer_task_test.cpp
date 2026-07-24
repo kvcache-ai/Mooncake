@@ -7,10 +7,14 @@
 #include <chrono>
 #include <cstring>
 #include <memory>
+#include <numeric>
 #include <thread>
 #include <vector>
 
 #include "types.h"
+#ifdef USE_CUDA
+#include <cuda_runtime_api.h>
+#endif
 
 namespace mooncake {
 
@@ -143,6 +147,63 @@ TEST_F(TransferTaskTest, MemcpyWorkerPoolMultipleOperations) {
         }
     }
 }
+
+#ifdef USE_CUDA
+TEST_F(TransferTaskTest, TransferScatterWritesGpuDestinationDirectly) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+        GTEST_SKIP() << "CUDA device is unavailable";
+    }
+
+    constexpr size_t kDestSize = 32;
+    std::vector<char> source(64);
+    std::iota(source.begin(), source.end(), 0);
+    void* gpu_destination = nullptr;
+    ASSERT_EQ(cudaMalloc(&gpu_destination, kDestSize), cudaSuccess);
+
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init("P2PHANDSHAKE", "localhost:17932"), 0);
+    if (!engine.isUsingTent()) {
+        ASSERT_NE(engine.installTransport("tcp", nullptr), nullptr);
+    }
+    ASSERT_EQ(engine.registerLocalMemory(source.data(), source.size(), "cpu:0"),
+              0);
+    ASSERT_EQ(engine.registerLocalMemory(gpu_destination, kDestSize, "cuda:0"),
+              0);
+
+    std::vector<size_t> destination_offsets{1, 9, 20},
+        source_offsets{3, 17, 41}, lengths{4, 6, 7};
+    TransferEngine::ScatterTransferRange transfer{
+        .opcode = TransferRequest::READ,
+        .remote_segment = engine.getLocalIpAndPort(),
+        .remote_base_offset = reinterpret_cast<uintptr_t>(source.data()),
+        .remote_size = source.size(),
+        .local_buffer = gpu_destination,
+        .local_capacity = kDestSize,
+        .local_offsets = destination_offsets,
+        .remote_offsets = source_offsets,
+        .lengths = lengths,
+        .on_fragment_complete = {},
+    };
+
+    std::shared_ptr<StorageBackend> backend;
+    TransferSubmitter submitter(engine, backend, "localhost");
+    ASSERT_TRUE(submitter.transferScatter({transfer}).ok());
+    std::vector<char> actual(kDestSize);
+    ASSERT_EQ(cudaMemcpy(actual.data(), gpu_destination, kDestSize,
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    for (size_t i = 0; i < lengths.size(); ++i) {
+        EXPECT_EQ(std::memcmp(actual.data() + destination_offsets[i],
+                              source.data() + source_offsets[i], lengths[i]),
+                  0);
+    }
+
+    EXPECT_EQ(engine.unregisterLocalMemory(gpu_destination), 0);
+    EXPECT_EQ(engine.unregisterLocalMemory(source.data()), 0);
+    EXPECT_EQ(cudaFree(gpu_destination), cudaSuccess);
+}
+#endif
 
 // Test the locality decision used by TransferSubmitter::isLocalTransfer.
 // Same-host different-process pairs share an IP but have distinct ports;

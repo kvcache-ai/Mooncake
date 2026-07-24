@@ -123,15 +123,6 @@ tl::expected<void, ErrorCode> set_context_if_needed(const std::string &protocol,
 }
 #endif
 
-struct PreparedRangedReadRequest {
-    std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
-        results;
-    std::vector<std::vector<std::vector<bool>>> valid_fragments;
-    std::vector<size_t> required_buffer_sizes;
-    bool top_level_valid = true;
-    bool has_any_valid_fragment = false;
-};
-
 size_t sum_value_sizes(const std::vector<std::span<const char>> &values) {
     size_t total = 0;
     for (const auto &value : values) {
@@ -213,97 +204,9 @@ size_t sum_buffer_handle_sizes(
     return total;
 }
 
-PreparedRangedReadRequest prepare_ranged_read_request(
-    size_t buffer_count, const std::vector<std::vector<std::string>> &all_keys,
-    const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
-    const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
-    const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
-    const char *log_prefix) {
-    PreparedRangedReadRequest prepared;
-    prepared.results.resize(buffer_count);
-    prepared.valid_fragments.resize(buffer_count);
-    prepared.required_buffer_sizes.resize(buffer_count, 0);
-
-    if (buffer_count != all_keys.size() ||
-        buffer_count != all_dst_offsets.size() ||
-        buffer_count != all_src_offsets.size() ||
-        buffer_count != all_sizes.size()) {
-        LOG(ERROR) << log_prefix << ": top-level size mismatch";
-        prepared.results = build_ranged_read_internal_error_results(
-            buffer_count, all_keys, all_dst_offsets, ErrorCode::INVALID_PARAMS);
-        prepared.top_level_valid = false;
-        return prepared;
-    }
-
-    for (size_t i = 0; i < buffer_count; ++i) {
-        const size_t key_count = all_keys[i].size();
-        prepared.results[i].resize(key_count);
-        prepared.valid_fragments[i].resize(key_count);
-
-        if (key_count != all_dst_offsets[i].size() ||
-            key_count != all_src_offsets[i].size() ||
-            key_count != all_sizes[i].size()) {
-            LOG(ERROR) << log_prefix
-                       << ": key-group size mismatch for buffer index " << i;
-            for (size_t j = 0; j < key_count; ++j) {
-                prepared.results[i][j] =
-                    std::vector<tl::expected<int64_t, ErrorCode>>(
-                        1, tl::unexpected(ErrorCode::INVALID_PARAMS));
-                prepared.valid_fragments[i][j] = std::vector<bool>(1, false);
-            }
-            continue;
-        }
-
-        size_t max_required = 0;
-        for (size_t j = 0; j < key_count; ++j) {
-            const size_t fragment_count = all_dst_offsets[i][j].size();
-            prepared.results[i][j] =
-                std::vector<tl::expected<int64_t, ErrorCode>>(
-                    fragment_count, tl::unexpected(ErrorCode::INVALID_PARAMS));
-            prepared.valid_fragments[i][j] =
-                std::vector<bool>(fragment_count, false);
-
-            if (fragment_count != all_src_offsets[i][j].size() ||
-                fragment_count != all_sizes[i][j].size()) {
-                LOG(ERROR) << log_prefix << ": fragment size mismatch, "
-                           << "buffer_index=" << i << " key_index=" << j;
-                continue;
-            }
-
-            for (size_t k = 0; k < fragment_count; ++k) {
-                const size_t dst_offset = all_dst_offsets[i][j][k];
-                const size_t fragment_size = all_sizes[i][j][k];
-                if (dst_offset >
-                    std::numeric_limits<size_t>::max() - fragment_size) {
-                    LOG(ERROR)
-                        << log_prefix
-                        << ": destination range overflow, buffer_index=" << i
-                        << " key_index=" << j << " fragment_index=" << k;
-                    continue;
-                }
-                prepared.valid_fragments[i][j][k] = true;
-                prepared.has_any_valid_fragment = true;
-                max_required =
-                    std::max(max_required, dst_offset + fragment_size);
-            }
-        }
-        prepared.required_buffer_sizes[i] = max_required;
-    }
-
-    return prepared;
-}
-
-void fill_ranged_read_results_with_error(
-    std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
-        &results,
-    ErrorCode error) {
-    for (auto &key_rows : results) {
-        for (auto &row : key_rows) {
-            for (auto &fragment : row) {
-                fragment = tl::unexpected(error);
-            }
-        }
-    }
+ErrorCode scatter_transfer_error(const Status &status) {
+    return status.IsInvalidArgument() ? ErrorCode::INVALID_PARAMS
+                                      : ErrorCode::TRANSFER_FAIL;
 }
 
 // Scatter host (CPU) memory to a destination that may be GPU or host.
@@ -370,14 +273,23 @@ bool RealClient::map_dummy_range_in_shm(const MappedShm &shm,
 bool RealClient::map_dummy_buffer_to_real(const ShmContext &shm_ctx,
                                           uint64_t dummy_addr, size_t buf_size,
                                           const MappedShm *&last_hit_shm,
-                                          void *&out_real) const {
+                                          void *&out_real,
+                                          size_t *out_capacity) const {
     if (last_hit_shm && map_dummy_range_in_shm(*last_hit_shm, dummy_addr, 0,
                                                buf_size, out_real)) {
+        if (out_capacity) {
+            *out_capacity = last_hit_shm->shm_size -
+                            (dummy_addr - last_hit_shm->dummy_base_addr);
+        }
         return true;
     }
     for (const auto &shm : shm_ctx.mapped_shms) {
         if (map_dummy_range_in_shm(shm, dummy_addr, 0, buf_size, out_real)) {
             last_hit_shm = &shm;
+            if (out_capacity) {
+                *out_capacity =
+                    shm.shm_size - (dummy_addr - shm.dummy_base_addr);
+            }
             return true;
         }
     }
@@ -400,7 +312,8 @@ bool RealClient::map_dummy_buffer_range_to_real(const ShmContext &shm_ctx,
 tl::expected<std::vector<void *>, ErrorCode>
 RealClient::map_dummy_addrs_to_real_ptrs(
     const ShmContext &context, const std::vector<uint64_t> &dummy_addrs,
-    const std::vector<size_t> &sizes, const UUID &client_id) const {
+    const std::vector<size_t> &sizes, const UUID &client_id,
+    std::vector<size_t> *capacities) const {
     if (dummy_addrs.size() != sizes.size()) {
         LOG(ERROR) << "Mismatched dummy_addrs and sizes, client_id="
                    << client_id;
@@ -408,11 +321,17 @@ RealClient::map_dummy_addrs_to_real_ptrs(
     }
     std::vector<void *> buffers;
     buffers.reserve(dummy_addrs.size());
+    if (capacities) {
+        capacities->clear();
+        capacities->reserve(dummy_addrs.size());
+    }
     const MappedShm *last_hit_shm = nullptr;
     for (size_t i = 0; i < dummy_addrs.size(); ++i) {
         void *real_ptr = nullptr;
+        size_t capacity = 0;
         if (!map_dummy_buffer_to_real(context, dummy_addrs[i], sizes[i],
-                                      last_hit_shm, real_ptr)) {
+                                      last_hit_shm, real_ptr,
+                                      capacities ? &capacity : nullptr)) {
             LOG(ERROR) << "Dummy buffer at " << dummy_addrs[i] << " (size "
                        << sizes[i]
                        << ") not found in any mapped shared memory, client_id="
@@ -420,6 +339,7 @@ RealClient::map_dummy_addrs_to_real_ptrs(
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
         buffers.push_back(real_ptr);
+        if (capacities) capacities->push_back(capacity);
     }
     return buffers;
 }
@@ -3268,12 +3188,21 @@ RealClient::resolve_writable_buffer_region(void *buffer) const {
 }
 
 tl::expected<RealClient::RangedReadMetadata, ErrorCode>
-RealClient::resolve_ranged_read_metadata(const std::string &key) {
+RealClient::resolve_ranged_read_metadata(
+    const std::string &key, const QueryResultCache *query_result_cache) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    if (query_result_cache) {
+        auto cached = query_result_cache->find(key);
+        if (cached != query_result_cache->end() &&
+            (!cached->second || !cached->second->IsLeaseExpired())) {
+            return build_ranged_read_metadata_from_query_result(key,
+                                                                cached->second);
+        }
+    }
     return build_ranged_read_metadata_from_query_result(key,
                                                         client_->Query(key));
 }
@@ -3546,143 +3475,123 @@ RealClient::get_into_ranges_internal(
     const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
     const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
     const std::vector<size_t> *buffer_capacities,
-    std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
-        *prepared_results,
-    const std::vector<std::vector<std::vector<bool>>> *valid_fragments,
     const QueryResultCache *query_result_cache) {
+    auto results = build_ranged_read_internal_error_results(
+        buffers.size(), all_keys, all_dst_offsets, ErrorCode::INVALID_PARAMS);
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
-        return build_ranged_read_internal_error_results(
-            buffers.size(), all_keys, all_dst_offsets,
-            ErrorCode::INVALID_PARAMS);
+        return results;
     }
 
     const size_t buffer_count = buffers.size();
-    PreparedRangedReadRequest prepared;
-    if (prepared_results != nullptr && valid_fragments != nullptr) {
-        prepared.results = std::move(*prepared_results);
-        prepared.valid_fragments = *valid_fragments;
-        prepared.required_buffer_sizes.resize(buffer_count, 0);
-        prepared.top_level_valid = true;
-    } else {
-        prepared = prepare_ranged_read_request(buffer_count, all_keys,
-                                               all_dst_offsets, all_src_offsets,
-                                               all_sizes, "get_into_ranges");
-    }
-    if (!prepared.top_level_valid) {
-        return std::move(prepared.results);
+    if (buffer_count != all_keys.size() ||
+        buffer_count != all_dst_offsets.size() ||
+        buffer_count != all_src_offsets.size() ||
+        buffer_count != all_sizes.size() ||
+        (buffer_capacities && buffer_capacities->size() != buffer_count)) {
+        LOG(ERROR) << "get_into_ranges: top-level size mismatch";
+        return results;
     }
 
-    std::vector<size_t> resolved_buffer_capacities;
-    if (buffer_capacities != nullptr) {
-        if (buffer_capacities->size() != buffer_count) {
-            LOG(ERROR) << "get_into_ranges: buffer capacities size mismatch";
-            return build_ranged_read_internal_error_results(
-                buffer_count, all_keys, all_dst_offsets,
-                ErrorCode::INVALID_PARAMS);
-        }
-        resolved_buffer_capacities = *buffer_capacities;
-    } else {
-        resolved_buffer_capacities.resize(buffer_count, 0);
+    std::vector<size_t> capacities = buffer_capacities
+                                         ? *buffer_capacities
+                                         : std::vector<size_t>(buffer_count);
+    if (!buffer_capacities) {
         for (size_t i = 0; i < buffer_count; ++i) {
             auto region = resolve_writable_buffer_region(buffers[i]);
-            if (!region.has_value()) {
-                LOG(ERROR)
-                    << "get_into_ranges: buffer is not Store-managed writable "
-                       "memory at index "
-                    << i;
-                continue;
-            }
-            resolved_buffer_capacities[i] = region->size - region->offset;
+            if (region) capacities[i] = region->size - region->offset;
         }
     }
 
     std::unordered_map<std::string, tl::expected<RangedReadMetadata, ErrorCode>>
         metadata_cache;
-    size_t key_count_hint = 0;
-    for (const auto &keys : all_keys) {
-        key_count_hint += keys.size();
-    }
-    metadata_cache.reserve(key_count_hint);
-    auto now = std::chrono::steady_clock::now();
-    if (query_result_cache != nullptr) {
-        for (const auto &[key, query_result] : *query_result_cache) {
-            if (!query_result) {
-                metadata_cache.emplace(key,
-                                       tl::unexpected(query_result.error()));
-                continue;
-            }
-            if (query_result->IsLeaseExpired(now)) {
-                continue;
-            }
-            metadata_cache.emplace(key,
-                                   build_ranged_read_metadata_from_query_result(
-                                       key, query_result));
-        }
-    }
+    auto metadata_for = [&](const std::string &key) -> auto & {
+        auto found = metadata_cache.find(key);
+        if (found != metadata_cache.end()) return found->second;
+        return metadata_cache
+            .emplace(key, resolve_ranged_read_metadata(key, query_result_cache))
+            .first->second;
+    };
 
+    std::vector<TransferEngine::ScatterTransferRange> memory_transfers;
     for (size_t i = 0; i < buffer_count; ++i) {
-        const size_t key_count = prepared.results[i].size();
-        const size_t buffer_size = resolved_buffer_capacities[i];
-        if (buffer_size == 0 && key_count > 0 && buffer_capacities == nullptr) {
+        if (!buffers[i] || (!buffer_capacities && capacities[i] == 0)) {
+            continue;
+        }
+        const auto &keys = all_keys[i];
+        const auto &dst_groups = all_dst_offsets[i];
+        const auto &src_groups = all_src_offsets[i];
+        const auto &size_groups = all_sizes[i];
+        if (keys.size() != dst_groups.size() ||
+            keys.size() != src_groups.size() ||
+            keys.size() != size_groups.size()) {
             continue;
         }
 
-        for (size_t j = 0; j < key_count; ++j) {
-            auto metadata_it = metadata_cache.find(all_keys[i][j]);
-            if (metadata_it == metadata_cache.end()) {
-                metadata_it =
-                    metadata_cache
-                        .emplace(
-                            all_keys[i][j],
-                            build_ranged_read_metadata_from_query_result(
-                                all_keys[i][j], client_->Query(all_keys[i][j])))
-                        .first;
+        for (size_t j = 0; j < keys.size(); ++j) {
+            const auto &dst_offsets = dst_groups[j];
+            const auto &src_offsets = src_groups[j];
+            const auto &sizes = size_groups[j];
+            auto &range_results = results[i][j];
+            if (dst_offsets.size() != src_offsets.size() ||
+                dst_offsets.size() != sizes.size()) {
+                continue;
             }
-            auto &metadata_result = metadata_it->second;
+            auto &metadata_result = metadata_for(keys[j]);
+            if (!metadata_result) {
+                std::fill(range_results.begin(), range_results.end(),
+                          tl::unexpected(metadata_result.error()));
+                continue;
+            }
 
-            for (size_t k = 0; k < prepared.results[i][j].size(); ++k) {
-                if (!prepared.valid_fragments[i][j][k]) {
+            const auto &metadata = metadata_result.value();
+            if (metadata.replica.is_memory_replica()) {
+                const auto &handle =
+                    metadata.replica.get_memory_descriptor().buffer_descriptor;
+                memory_transfers.push_back(TransferEngine::ScatterTransferRange{
+                    .opcode = TransferRequest::READ,
+                    .remote_segment = handle.transport_endpoint_,
+                    .remote_base_offset = handle.buffer_address_,
+                    .remote_size = handle.size_,
+                    .local_buffer = buffers[i],
+                    .local_capacity = capacities[i],
+                    .local_offsets = dst_offsets,
+                    .remote_offsets = src_offsets,
+                    .lengths = sizes,
+                    .on_fragment_complete =
+                        [results = &range_results, sizes = &sizes,
+                         query_result = &metadata.query_result](
+                            size_t k, const Status &status) {
+                            if (status.ok() &&
+                                !query_result->IsLeaseExpired()) {
+                                (*results)[k] =
+                                    static_cast<int64_t>((*sizes)[k]);
+                                return;
+                            }
+                            (*results)[k] = tl::unexpected(
+                                status.ok() ? ErrorCode::LEASE_EXPIRED
+                                            : scatter_transfer_error(status));
+                        },
+                });
+                continue;
+            }
+
+            for (size_t k = 0; k < range_results.size(); ++k) {
+                const size_t dst_offset = dst_offsets[k];
+                if (dst_offset > capacities[i] ||
+                    sizes[k] > capacities[i] - dst_offset) {
                     continue;
                 }
 
-                if (all_sizes[i][j][k] > 0 &&
-                    (all_dst_offsets[i][j][k] > buffer_size ||
-                     all_sizes[i][j][k] >
-                         buffer_size - all_dst_offsets[i][j][k])) {
-                    LOG(ERROR)
-                        << "get_into_ranges: destination overflow, "
-                           "buffer_index="
-                        << i << " key_index=" << j << " fragment_index=" << k
-                        << " dst_offset=" << all_dst_offsets[i][j][k]
-                        << " size=" << all_sizes[i][j][k]
-                        << " buffer_size=" << buffer_size;
-                    continue;
-                }
-
-                if (!metadata_result) {
-                    if ((metadata_result.error() ==
-                             ErrorCode::OBJECT_NOT_FOUND ||
-                         metadata_result.error() ==
-                             ErrorCode::REPLICA_IS_NOT_READY) &&
-                        all_src_offsets[i][j][k] == 0) {
-                        VLOG(1)
-                            << "Object not found for key: " << all_keys[i][j];
-                    }
-                    prepared.results[i][j][k] =
-                        tl::unexpected(metadata_result.error());
-                    continue;
-                }
-
-                prepared.results[i][j][k] = execute_ranged_read(
-                    all_keys[i][j], buffers[i], all_dst_offsets[i][j][k],
-                    all_src_offsets[i][j][k], all_sizes[i][j][k],
-                    metadata_result.value());
+                range_results[k] =
+                    execute_ranged_read(keys[j], buffers[i], dst_offset,
+                                        src_offsets[k], sizes[k], metadata);
             }
         }
     }
 
-    return prepared.results;
+    client_->TransferScatter(memory_transfers);
+    return results;
 }
 
 std::vector<std::vector<std::vector<int64_t>>> RealClient::get_into_ranges(
@@ -3697,7 +3606,7 @@ std::vector<std::vector<std::vector<int64_t>>> RealClient::get_into_ranges(
             [&]() {
                 return convert_ranged_read_results(get_into_ranges_internal(
                     buffers, all_keys, all_dst_offsets, all_src_offsets,
-                    all_sizes, nullptr, nullptr, nullptr, query_result_cache));
+                    all_sizes, nullptr, query_result_cache));
             },
             [](const auto &) { return true; },
             [&](uint64_t latency_us, const auto &ret) {
@@ -4532,41 +4441,30 @@ RealClient::get_into_ranges_shm_helper(
     }
 #endif
 
-    const size_t buffer_count = dummy_buffers.size();
-    auto prepared = prepare_ranged_read_request(
-        buffer_count, all_keys, all_dst_offsets, all_src_offsets, all_sizes,
-        "get_into_ranges_shm_helper");
-    if (!prepared.top_level_valid) {
-        return std::move(prepared.results);
-    }
-
     std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
         LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
-        fill_ranged_read_results_with_error(prepared.results,
-                                            ErrorCode::INVALID_PARAMS);
-        return prepared.results;
+        return build_ranged_read_internal_error_results(
+            dummy_buffers.size(), all_keys, all_dst_offsets,
+            ErrorCode::INVALID_PARAMS);
     }
 
-    if (!prepared.has_any_valid_fragment) {
-        return prepared.results;
-    }
-
+    std::vector<size_t> capacities;
     auto real_buffers_result = map_dummy_addrs_to_real_ptrs(
-        it->second, dummy_buffers, prepared.required_buffer_sizes, client_id);
+        it->second, dummy_buffers, std::vector<size_t>(dummy_buffers.size()),
+        client_id, &capacities);
     if (!real_buffers_result) {
-        fill_ranged_read_results_with_error(prepared.results,
-                                            real_buffers_result.error());
-        return prepared.results;
+        return build_ranged_read_internal_error_results(
+            dummy_buffers.size(), all_keys, all_dst_offsets,
+            real_buffers_result.error());
     }
 
     auto query_result_cache =
         build_query_result_cache_from_cached_results(cached_query_results);
     return get_into_ranges_internal(
         real_buffers_result.value(), all_keys, all_dst_offsets, all_src_offsets,
-        all_sizes, &prepared.required_buffer_sizes, &prepared.results,
-        &prepared.valid_fragments,
+        all_sizes, &capacities,
         query_result_cache.empty() ? nullptr : &query_result_cache);
 }
 

@@ -59,8 +59,8 @@ build_ranged_read_results_like(
                     ? all_dst_offsets[i][j].size()
                     : 1;
             std::vector<ResultValue> fragments;
-            fragments.reserve(std::max<size_t>(fragment_count, 1));
-            for (size_t k = 0; k < std::max<size_t>(fragment_count, 1); ++k) {
+            fragments.reserve(fragment_count);
+            for (size_t k = 0; k < fragment_count; ++k) {
                 fragments.push_back(make_error());
             }
             key_rows.emplace_back(std::move(fragments));
