@@ -444,6 +444,15 @@ class MasterServiceHATest : public ::testing::Test {
         return service.snapshot_manager_ != nullptr;
     }
 
+    static bool NeedMemoryEvictionForTesting(const MasterService& service) {
+        return service.need_mem_eviction_.load(std::memory_order_relaxed);
+    }
+
+    static void SetNeedMemoryEvictionForTesting(MasterService& service,
+                                                bool value) {
+        service.need_mem_eviction_.store(value, std::memory_order_relaxed);
+    }
+
     static tl::expected<uint64_t, ErrorCode> AppendVisibleForTesting(
         MasterService& service, OpType type, const std::string& tenant_id,
         const std::string& key, const std::string& payload) {
@@ -599,6 +608,57 @@ class MasterServiceHATest : public ::testing::Test {
 };
 
 class MasterServiceBatchRecordE2ETest : public MasterServiceHATest {};
+
+TEST_F(MasterServiceHATest,
+       PutStartWithoutWritableSegmentsDoesNotArmMemoryEviction) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    auto result = service.PutStart(generate_uuid(), "no_segment",
+                                   kDefaultTenant, 1024, config);
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_FALSE(NeedMemoryEvictionForTesting(service));
+}
+
+TEST_F(MasterServiceHATest,
+       PutStartWithTooFewSegmentsDoesNotArmMemoryEviction) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    auto mounted =
+        PrepareSimpleSegment(service, "one_segment", kDefaultSegmentBase, 4096);
+    PutObjectOnSegment(service, mounted.client_id, "existing", "one_segment");
+    ReplicateConfig config;
+    config.replica_num = 2;
+
+    auto result = service.PutStart(mounted.client_id, "needs_two",
+                                   kDefaultTenant, 4096, config);
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_FALSE(NeedMemoryEvictionForTesting(service));
+}
+
+TEST_F(MasterServiceHATest, PutStartWithReclaimableUsageArmsMemoryEviction) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    auto mounted = PrepareSimpleSegment(service, "full_segment",
+                                        kDefaultSegmentBase, 2048);
+    PutObjectOnSegment(service, mounted.client_id, "existing", "full_segment",
+                       1024);
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    auto result = service.PutStart(mounted.client_id, "too_large",
+                                   kDefaultTenant, 2048, config);
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_TRUE(NeedMemoryEvictionForTesting(service));
+}
 
 TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesMemoryBufferDescriptor) {
     MasterService service(

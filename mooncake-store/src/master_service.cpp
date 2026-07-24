@@ -3329,6 +3329,7 @@ auto MasterService::AllocateAndInsertMetadata(
     const auto write_mode = DetermineReplicaWriteMode(config);
     size_t allocated_memory_replicas = 0;
     size_t allocated_nof_replicas = 0;
+    bool memory_eviction_may_help = false;
     if (config.replica_num > 0) {
         const bool use_local_first =
             allocation_strategy_type_ == AllocationStrategyType::LOCAL_FIRST &&
@@ -3342,6 +3343,19 @@ auto MasterService::AllocateAndInsertMetadata(
         ScopedAllocatorAccess allocator_access =
             segment_manager_.getAllocatorAccess();
         const auto& allocator_manager = allocator_access.getAllocatorManager();
+        if (allocator_manager.getNames().size() >= config.replica_num) {
+            for (const auto& name : allocator_manager.getNames()) {
+                const auto* allocators = allocator_manager.getAllocators(name);
+                if (allocators != nullptr &&
+                    std::any_of(allocators->begin(), allocators->end(),
+                                [](const auto& allocator) {
+                                    return allocator && allocator->size() > 0;
+                                })) {
+                    memory_eviction_may_help = true;
+                    break;
+                }
+            }
+        }
 
         std::vector<std::string> preferred_segments;
         auto append_preferred_segment = [&preferred_segments](
@@ -3395,7 +3409,9 @@ auto MasterService::AllocateAndInsertMetadata(
             }
             if (write_mode != ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
                 MasterMetricManager::instance().inc_put_start_alloc_failures();
-                need_mem_eviction_ = true;
+                if (memory_eviction_may_help) {
+                    need_mem_eviction_ = true;
+                }
                 abort_reserved_quota();
                 return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
             }
@@ -3449,7 +3465,8 @@ auto MasterService::AllocateAndInsertMetadata(
              allocated_nof_replicas != config.nof_replica_num)) {
             MasterMetricManager::instance().inc_put_start_alloc_failures();
             if (config.replica_num > 0 &&
-                allocated_memory_replicas != config.replica_num) {
+                allocated_memory_replicas != config.replica_num &&
+                memory_eviction_may_help) {
                 need_mem_eviction_ = true;
             }
             if (config.nof_replica_num > 0 &&
