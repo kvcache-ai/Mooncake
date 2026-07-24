@@ -94,6 +94,7 @@ def _extension_worker(
             rank=extension_rank,
             world_size=ctx.world_size,
             max_group_size=ctx.world_size,
+            is_extension=True,
         )
 
         backend = ctx.get_backend()
@@ -179,6 +180,7 @@ def _extension_p2p_worker(
             rank=extension_rank,
             world_size=ctx.world_size,
             max_group_size=ctx.world_size,
+            is_extension=True,
         )
         backend = ctx.get_backend()
         pg.join_group(backend)
@@ -399,7 +401,7 @@ def _extension_worker_with_subgroups(
             "backend": ctx.backend_name,
             "rank": ctx.proc_rank,
             "world_size": ctx.world_size,
-            "pg_options": pg.MooncakeBackendOptions(ctx.world_size),
+            "pg_options": pg.MooncakeBackendOptions(ctx.world_size, True),
         }
         if ctx.device_type == "cuda":
             dist_kwargs["device_id"] = device
@@ -410,17 +412,17 @@ def _extension_worker_with_subgroups(
         group_a = dist.new_group(
             ranks=[0, 2],
             backend=ctx.backend_name,
-            pg_options=pg.MooncakeBackendOptions(2),
+            pg_options=pg.MooncakeBackendOptions(2, True),
         )
         group_b = dist.new_group(
             ranks=[1, 3],
             backend=ctx.backend_name,
-            pg_options=pg.MooncakeBackendOptions(2),
+            pg_options=pg.MooncakeBackendOptions(2, True),
         )
         group_c = dist.new_group(
             ranks=[0, 1, 2, 3],
             backend=ctx.backend_name,
-            pg_options=pg.MooncakeBackendOptions(4),
+            pg_options=pg.MooncakeBackendOptions(4, True),
         )
         a_backend = get_mooncake_backend(group_a, device_type=ctx.device_type) if ctx.proc_rank == 2 else None
         b_backend = get_mooncake_backend(group_b, device_type=ctx.device_type) if ctx.proc_rank == 3 else None
@@ -579,7 +581,7 @@ def _allgather_reduce_scatter_extension_worker(
             "backend": ctx.backend_name,
             "rank": extension_rank,
             "world_size": ctx.world_size,
-            "pg_options": pg.MooncakeBackendOptions(ctx.world_size),
+            "pg_options": pg.MooncakeBackendOptions(ctx.world_size, True),
         }
         if ctx.device_type == "cuda":
             dist_kwargs["device_id"] = device
@@ -645,7 +647,7 @@ def _allgather_reduce_scatter_recovery_worker(
         ctx.record_result({"role": "survivor"})
     else:
         start_recovery.wait()
-        device = ctx.init_group(rank=logical_rank, )
+        device = ctx.init_group(rank=logical_rank, is_extension=True)
         backend = ctx.get_backend()
         pg.join_group(backend)
 
@@ -742,7 +744,7 @@ def _replacement_recovery_worker(
         start_recovery.wait()
 
         # Replacement initializes with is_extension
-        device = ctx.init_group(rank=logical_rank, )
+        device = ctx.init_group(rank=logical_rank, is_extension=True)
         backend = ctx.get_backend()
 
         # join_group completes the connection and switches to global mode
@@ -879,6 +881,7 @@ def _manual_deactivate_recovery_worker(
             raise TimeoutError("timed out waiting to start manual recovery")
         device = ctx.init_group(
             rank=logical_rank,
+            is_extension=True,
             auto_deactivate_on_failure=False,
             auto_sync_on_failure=False,
         )

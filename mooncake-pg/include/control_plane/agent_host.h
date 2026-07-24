@@ -72,9 +72,12 @@ class AgentInterface {
     virtual void waitUntilRankActive(GroupId group_id, GlobalRank rank,
                                      std::chrono::milliseconds timeout) = 0;
 
+    // Returns an empty GroupId when the Coordinator rejects this group. The
+    // rejected group is not inserted into the process-scoped Agent state.
     virtual GroupId registerGroup(GroupBootstrapId group_bootstrap_id,
                                   int32_t max_group_size,
                                   std::vector<GlobalRank> rank_order,
+                                  GroupBootstrapIdResolvePolicy resolve_policy,
                                   bool auto_deactivate,
                                   MooncakeBackend* backend) = 0;
 
@@ -145,6 +148,7 @@ class AgentHost : public AgentInterface {
     GroupId registerGroup(GroupBootstrapId group_bootstrap_id,
                           int32_t max_group_size,
                           std::vector<GlobalRank> rank_order,
+                          GroupBootstrapIdResolvePolicy resolve_policy,
                           bool auto_deactivate,
                           MooncakeBackend* backend) override;
     void detachBackend(GroupId group_id) override;

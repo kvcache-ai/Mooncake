@@ -325,24 +325,25 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     py::class_<MooncakeBackend::MooncakeBackendOptions,
                c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>>(
         m, "MooncakeBackendOptions")
-        .def(py::init<at::Tensor>(), py::arg("active_ranks"))
-        // Deprecated constructors: isExtension is ignored
-        // IMPORTANT: these deprecated constructors MUST be registered
+        // IMPORTANT: these constructors with tensor MUST be registered
         // before the (int, ...) constructors.  Otherwise, when a 1-element
         // Tensor is passed, pybind11 implicitly converts it to int and
         // resolves to the wrong overload:
         // e.g. MooncakeBackendOptions(tensor([1]), False) ->
         //      MooncakeBackendOptions(int maxGroupSize=1,
-        //                            bool autoDeactivateOnFailure=False)
+        //                            bool isExtension=False)
         // instead of the intended Tensor-based path.
+        .def(py::init<at::Tensor>(), py::arg("active_ranks"))
         .def(py::init<at::Tensor, bool>(), py::arg("active_ranks"),
              py::arg("is_extension"))
         .def(py::init<at::Tensor, bool, int>(), py::arg("active_ranks"),
              py::arg("is_extension"), py::arg("max_group_size"))
         // Recommended constructors
         .def(py::init<int>(), py::arg("max_group_size"))
-        .def(py::init<int, bool, bool>(), py::arg("max_group_size"),
-             py::arg("auto_deactivate_on_failure"),
+        .def(py::init<int, bool>(), py::arg("max_group_size"),
+             py::arg("is_extension"))
+        .def(py::init<int, bool, bool, bool>(), py::arg("max_group_size"),
+             py::arg("is_extension"), py::arg("auto_deactivate_on_failure"),
              py::arg("auto_sync_on_failure"));
 }
 

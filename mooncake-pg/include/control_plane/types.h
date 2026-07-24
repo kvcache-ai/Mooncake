@@ -18,11 +18,34 @@ namespace mooncake {
 using GlobalRank = int32_t;
 using InGroupRank = int32_t;
 
+// Bootstrap ID: Backend type ("cpu:" or "device:") + PyTorch-assigned group_id.
 using GroupBootstrapId = std::string;
+// Coordinator-assigned unique group id
 using GroupId = std::string;
 
 constexpr GlobalRank kInvalidGlobalRank = -1;
 constexpr int kMaxNumRanks = 64;
+
+// Resolves a registration only against runtime groups stored under the same
+// GroupBootstrapId, i.e. the same backend type and PyTorch group_id.
+// An exact match requires both rank_order and max_group_size to be equal.
+//
+// CreateOrAttach:
+//   * Attach when exactly one existing group is an exact match.
+//   * Create a new group when there is no exact match.
+//   * Reject multiple exact matches and never modify an existing rank_order.
+//
+// AttachOrExtend:
+//   * Attach when exactly one existing group is an exact match.
+//   * Otherwise, extend only when exactly one existing rank_order is a proper
+//     prefix, max_group_size matches, and the registering rank is in the
+//     appended suffix.
+//   * Reject zero or multiple compatible groups and never create a new
+//     group.
+enum class GroupBootstrapIdResolvePolicy : uint8_t {
+    CreateOrAttach = 0,
+    AttachOrExtend = 1,
+};
 
 // Process-level state for a rank.
 // All transitions are driven by the Coordinator.

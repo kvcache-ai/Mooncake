@@ -118,9 +118,17 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
         explicit MooncakeBackendOptions(int maxGroupSize)
             : maxGroupSize_{maxGroupSize > 0 ? maxGroupSize : -1} {}
 
-        MooncakeBackendOptions(int maxGroupSize, bool autoDeactivateOnFailure,
+        // isExtension=false maps to CreateOrAttach; true maps to
+        // AttachOrExtend.
+        MooncakeBackendOptions(int maxGroupSize, bool isExtension)
+            : isExtension_{isExtension},
+              maxGroupSize_{maxGroupSize > 0 ? maxGroupSize : -1} {}
+
+        MooncakeBackendOptions(int maxGroupSize, bool isExtension,
+                               bool autoDeactivateOnFailure,
                                bool autoSyncOnFailure)
-            : maxGroupSize_{maxGroupSize > 0 ? maxGroupSize : -1},
+            : isExtension_{isExtension},
+              maxGroupSize_{maxGroupSize > 0 ? maxGroupSize : -1},
               autoDeactivateOnFailure_{autoDeactivateOnFailure},
               autoSyncOnFailure_{autoSyncOnFailure} {}
 
@@ -129,29 +137,20 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
         explicit MooncakeBackendOptions(at::Tensor activeRanks)
             : activeRanks_{activeRanks} {}
 
-        // Deprecated constructors: isExtension is ignored
-        MooncakeBackendOptions(at::Tensor activeRanks, bool /*isExtension*/)
-            : activeRanks_{activeRanks} {}
-        MooncakeBackendOptions(at::Tensor activeRanks, bool /*isExtension*/,
+        // Main-compatible tensor overloads use the same isExtension mapping.
+        MooncakeBackendOptions(at::Tensor activeRanks, bool isExtension)
+            : activeRanks_{activeRanks}, isExtension_{isExtension} {}
+        MooncakeBackendOptions(at::Tensor activeRanks, bool isExtension,
                                int maxGroupSize)
             : activeRanks_{activeRanks},
+              isExtension_{isExtension},
               maxGroupSize_{maxGroupSize > 0 ? maxGroupSize : -1} {}
-        MooncakeBackendOptions(at::Tensor activeRanks, bool /*isExtension*/,
-                               int maxGroupSize, bool autoDeactivateOnFailure)
-            : activeRanks_{activeRanks},
-              maxGroupSize_{maxGroupSize > 0 ? maxGroupSize : -1},
-              autoDeactivateOnFailure_{autoDeactivateOnFailure} {}
-        MooncakeBackendOptions(at::Tensor activeRanks, bool /*isExtension*/,
-                               int maxGroupSize, bool autoDeactivateOnFailure,
-                               bool autoSyncOnFailure)
-            : activeRanks_{activeRanks},
-              maxGroupSize_{maxGroupSize > 0 ? maxGroupSize : -1},
-              autoDeactivateOnFailure_{autoDeactivateOnFailure},
-              autoSyncOnFailure_{autoSyncOnFailure} {}
 
         ~MooncakeBackendOptions() override = default;
 
         at::Tensor activeRanks_;
+
+        bool isExtension_ = false;
 
         int maxGroupSize_ = -1;
 
@@ -353,6 +352,14 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     // Guard: checks that the rank is Healthy (always) and, for collectives,
     // that it is active in this group.  Called at the top of every operation.
     void prepareOp(c10d::OpType op) const;
+
+    // A rejected registration has no Coordinator-assigned group id and is
+    // restricted to local-only collectives.
+    bool isValidGroup() const { return !meta_->group_id.empty(); }
+
+    // Reject operations that require a valid distributed group when this
+    // backend is executing local-only collectives.
+    void requireValidGroup(const char* operation) const;
 
     const GroupEndpointInfo& getLocalEndpointInfo() const {
         return meta_->segmentInfos[meta_->rank];

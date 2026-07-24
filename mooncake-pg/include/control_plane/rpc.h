@@ -90,6 +90,8 @@ struct RegisterGroupRequest {
     GroupBootstrapId group_bootstrap_id;
     int32_t max_group_size = 0;
     std::vector<GlobalRank> rank_order;
+    GroupBootstrapIdResolvePolicy resolve_policy =
+        GroupBootstrapIdResolvePolicy::CreateOrAttach;
     bool auto_deactivate = true;
 };
 

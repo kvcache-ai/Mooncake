@@ -231,13 +231,10 @@ CentralizedCoordinatorStateMachine::handleRegisterGroup(
     }
 
     bool new_group = false;
-    auto group_id = resolveGroupId(req.group_bootstrap_id, req.rank_order,
-                                   result.response, new_group);
+    auto group_id = resolveGroupId(req, result.response, new_group);
     if (!group_id.has_value()) return result;
 
-    bool ok = processGroupRegistration(req, *group_id, result.response,
-                                       result.effects);
-    if (!ok) return result;
+    processGroupRegistration(req, *group_id, result.effects);
 
     if (new_group) {
         bindGroupBootstrapId(*group_id, req.group_bootstrap_id);
@@ -1264,78 +1261,106 @@ static bool isRankOrderPrefix(const std::vector<GlobalRank>& prefix,
            std::equal(prefix.begin(), prefix.end(), order.begin());
 }
 
-static bool doRankOrdersOverlap(const std::vector<GlobalRank>& lhs,
-                                const std::vector<GlobalRank>& rhs) {
-    return std::any_of(lhs.begin(), lhs.end(), [&](GlobalRank rank) {
-        return std::find(rhs.begin(), rhs.end(), rank) != rhs.end();
-    });
-}
-
 std::optional<GroupId> CentralizedCoordinatorStateMachine::resolveGroupId(
-    const GroupBootstrapId& group_bootstrap_id,
-    const std::vector<GlobalRank>& rank_order, RegisterGroupResponse& response,
+    const RegisterGroupRequest& request, RegisterGroupResponse& response,
     bool& new_group) {
     // GroupBootstrapId identifies a PyTorch group_id, not necessarily one
-    // runtime group. Disjoint groups may use the same group_id in joining ranks
-    // and they become separate groups. Within one bootstrap-id bucket:
+    // runtime group. resolve_policy supplies the choice that cannot be inferred
+    // from rank-order relationships alone. Within one bootstrap-id bucket:
     //
-    //  * Identical rank orders are seen as idempotent registrations.
-    //  * If an existing order is a proper prefix of the requested order, this
-    //    is an append-only extension of that group.
-    //  * If the requested order is a proper prefix of an existing order, the
-    //    request is rejected. Because returning the larger group would violate
-    //    the membership declared by the caller.
-    //  * A request disjoint from every existing group creates an isolated
-    //    runtime group.
-    //  * Any other overlap is ambiguous and is rejected when there is no exact
-    //    or append-compatible group.
+    //  * CreateOrAttach never modifies an existing rank order. Without an exact
+    //    match, it creates a new runtime group even if rank orders overlap.
+    //  * AttachOrExtend never creates a runtime group. Without an exact match,
+    //    it must find one unique existing order that is a proper prefix of the
+    //    request, has matching capacity, and appends the joining rank.
     //
-    // A unique exact/append-compatible group wins even if the request also
-    // overlaps another group, since distinct groups may share ranks. More than
-    // one compatible group is ambiguous. If callers eventually need to create
-    // overlapping groups that these rules cannot distinguish, they must supply
-    // different stable GroupBootstrapIds so the groups enter different
-    // buckets; an explicit id would not relax ambiguity within one bucket.
-    //
-    // This function only resolves identity. processGroupRegistration()
-    // validates capacity and applies the append.
+    // More than one exact match is ambiguous. If there is no exact match, more
+    // than one append-compatible match is ambiguous. Callers that need to
+    // distinguish them must eventually provide distinct stable
+    // GroupBootstrapIds. processGroupRegistration() then applies the resolved
+    // registration.
     static constexpr auto GROUP_ID_PREFIX = "mooncake_pg_";
-    auto bucket = group_ids_by_bootstrap_id_.find(group_bootstrap_id);
-    if (bucket == group_ids_by_bootstrap_id_.end()) {
-        new_group = true;
-        return GROUP_ID_PREFIX + std::to_string(next_group_id_++);
-    }
+    auto bucket = group_ids_by_bootstrap_id_.find(request.group_bootstrap_id);
 
-    std::vector<GroupId> prefix_compatible_groups;
-    bool has_non_prefix_overlap = false;
-    for (const auto& group_id : bucket->second) {
-        const auto& existing_order = group_views_.at(group_id).rank_order;
-        if (isRankOrderPrefix(existing_order, rank_order)) {
-            prefix_compatible_groups.push_back(group_id);
-        } else if (doRankOrdersOverlap(existing_order, rank_order)) {
-            has_non_prefix_overlap = true;
+    // Exact matching (Attach) is shared by both policies and always takes
+    // precedence.
+    std::vector<GroupId> exact_groups;
+    if (bucket != group_ids_by_bootstrap_id_.end()) {
+        for (const auto& group_id : bucket->second) {
+            const auto& view = group_views_.at(group_id);
+            if (view.max_group_size == request.max_group_size &&
+                view.rank_order == request.rank_order) {
+                exact_groups.push_back(group_id);
+            }
         }
     }
 
-    if (prefix_compatible_groups.size() > 1) {
-        response.reject_reason = "ambiguous group bootstrap id";
+    if (exact_groups.size() > 1) {
+        response.reject_reason = "ambiguous exact group matches";
         return std::nullopt;
     }
 
-    if (prefix_compatible_groups.size() == 1) {
+    if (exact_groups.size() == 1) {
         new_group = false;
-        return prefix_compatible_groups.front();
+        return exact_groups.front();
     }
 
-    if (has_non_prefix_overlap) {
-        response.reject_reason =
-            "rank_order overlaps an existing group but is not its append-only "
-            "extension";
-        return std::nullopt;
-    }
+    switch (request.resolve_policy) {
+        case GroupBootstrapIdResolvePolicy::CreateOrAttach:
+            new_group = true;
+            return GROUP_ID_PREFIX + std::to_string(next_group_id_++);
 
-    new_group = true;
-    return GROUP_ID_PREFIX + std::to_string(next_group_id_++);
+        case GroupBootstrapIdResolvePolicy::AttachOrExtend: {
+            if (bucket == group_ids_by_bootstrap_id_.end()) {
+                response.reject_reason = "extension target not found";
+                return std::nullopt;
+            }
+
+            std::vector<GroupId> extension_groups;
+            for (const auto& group_id : bucket->second) {
+                const auto& view = group_views_.at(group_id);
+                const auto& existing_order = view.rank_order;
+
+                if (view.max_group_size != request.max_group_size) {
+                    continue;
+                }
+                if (existing_order.size() >= request.rank_order.size()) {
+                    continue;
+                }
+                if (!isRankOrderPrefix(existing_order, request.rank_order)) {
+                    continue;
+                }
+
+                auto appended_begin =
+                    request.rank_order.begin() + existing_order.size();
+                if (std::find(appended_begin, request.rank_order.end(),
+                              request.rank) == request.rank_order.end()) {
+                    continue;
+                }
+
+                extension_groups.push_back(group_id);
+            }
+
+            if (extension_groups.size() > 1) {
+                response.reject_reason = "ambiguous extension target";
+                return std::nullopt;
+            }
+
+            if (extension_groups.empty()) {
+                response.reject_reason =
+                    "no append-compatible extension target";
+                return std::nullopt;
+            }
+
+            new_group = false;
+            return extension_groups.front();
+        }
+
+        default:
+            response.reject_reason =
+                "invalid group bootstrap id resolve policy";
+            return std::nullopt;
+    }
 }
 
 void CentralizedCoordinatorStateMachine::bindGroupBootstrapId(
@@ -1345,9 +1370,9 @@ void CentralizedCoordinatorStateMachine::bindGroupBootstrapId(
                                  std::move(group_bootstrap_id));
 }
 
-bool CentralizedCoordinatorStateMachine::processGroupRegistration(
+void CentralizedCoordinatorStateMachine::processGroupRegistration(
     const RegisterGroupRequest& request, const GroupId& group_id,
-    RegisterGroupResponse& response, std::vector<CoordinatorEffect>& effects) {
+    std::vector<CoordinatorEffect>& effects) {
     auto it = group_views_.find(group_id);
     if (it == group_views_.end()) {
         // First declaration -> create group.
@@ -1363,36 +1388,12 @@ bool CentralizedCoordinatorStateMachine::processGroupRegistration(
         view.status = GroupStatus::Bootstrapping;
         group_views_[group_id] = std::move(view);
         group_views_[group_id].auto_deactivate = request.auto_deactivate;
-        response.success = true;
-        return true;
+        return;
     }
 
-    // Group already exists. Its rank order must be a prefix of every later
-    // declaration, so membership can only grow by appending ranks.
-    const auto& existing_view = group_views_[group_id];
-    if (request.max_group_size != existing_view.max_group_size) {
-        response.success = false;
-        response.reject_reason = "max_group_size mismatch";
-        return false;
-    }
+    auto& view = it->second;
 
-    if (request.rank_order.size() >
-        static_cast<size_t>(existing_view.max_group_size)) {
-        response.success = false;
-        response.reject_reason = "rank_order exceeds canonical group capacity";
-        return false;
-    }
-
-    const auto& existing_order = existing_view.rank_order;
-    const auto& new_order = request.rank_order;
-
-    if (!isRankOrderPrefix(existing_order, new_order)) {
-        response.success = false;
-        response.reject_reason = "rank_order is not an append-only extension";
-        return false;
-    }
-
-    // If new_order is longer than existing_order, the extra ranks are
+    // If the request rank order is longer, the extra ranks are
     // not activated here.  They must be activated via a subsequent
     // proposeViewUpdate (activate_rank / recover_ranks) from an existing
     // active member.
@@ -1401,12 +1402,11 @@ bool CentralizedCoordinatorStateMachine::processGroupRegistration(
     // every member's ViewUpdate carries the correct rank_order (local->global
     // mapping).
     bool view_changed = false;
-    if (new_order.size() > existing_order.size()) {
-        group_views_[group_id].rank_order = new_order;
+    if (request.rank_order.size() > view.rank_order.size()) {
+        view.rank_order = request.rank_order;
         view_changed = true;
     }
 
-    auto& view = group_views_[group_id];
     auto& joining_member = view.members[request.rank];
     if (joining_member.status == GroupMemberState::None ||
         joining_member.status == GroupMemberState::Left) {
@@ -1425,9 +1425,6 @@ bool CentralizedCoordinatorStateMachine::processGroupRegistration(
         if (view_changed) view.epoch++;
         effects.push_back(PushViewUpdate{view});
     }
-
-    response.success = true;
-    return true;
 }
 
 // Private: helpers

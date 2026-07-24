@@ -145,7 +145,8 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
 
     std::unordered_map<GroupId, GroupView> group_views_;
 
-    // A bootstrap id may name multiple disjoint groups
+    // A bootstrap id may name multiple runtime groups. The resolve policy
+    // distinguishes creation from attach/append resolution within the bucket.
     std::unordered_map<GroupBootstrapId, std::vector<GroupId>>
         group_ids_by_bootstrap_id_;
     std::unordered_map<GroupId, GroupBootstrapId> group_bootstrap_ids_;
@@ -256,17 +257,15 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     // Called after every state-changing operation.
     void checkGroupTransitions(std::vector<CoordinatorEffect>& effects);
 
-    bool processGroupRegistration(const RegisterGroupRequest& request,
+    void processGroupRegistration(const RegisterGroupRequest& request,
                                   const GroupId& group_id,
-                                  RegisterGroupResponse& response,
                                   std::vector<CoordinatorEffect>& effects);
 
     bool validateGroupRegistration(const RegisterGroupRequest& request,
                                    RegisterGroupResponse& response) const;
-    std::optional<GroupId> resolveGroupId(
-        const GroupBootstrapId& group_bootstrap_id,
-        const std::vector<GlobalRank>& rank_order,
-        RegisterGroupResponse& response, bool& new_group);
+    std::optional<GroupId> resolveGroupId(const RegisterGroupRequest& request,
+                                          RegisterGroupResponse& response,
+                                          bool& new_group);
     void bindGroupBootstrapId(GroupId group_id,
                               GroupBootstrapId group_bootstrap_id);
 

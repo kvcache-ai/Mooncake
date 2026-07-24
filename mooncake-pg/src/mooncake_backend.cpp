@@ -2,6 +2,7 @@
 #include <ATen/ops/empty.h>
 #include <cuda_alike.h>
 #include <torch/torch.h>
+#include <algorithm>
 #include <iostream>
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <mooncake_backend.h>
@@ -306,11 +307,32 @@ MooncakeBackend::MooncakeBackend(
         "auto_sync_on_failure requires auto_deactivate_on_failure=true");
 
     meta_->autoSyncOnFailure = auto_sync_on_failure;
+    const auto resolve_policy =
+        options_ && options_->isExtension_
+            ? GroupBootstrapIdResolvePolicy::AttachOrExtend
+            : GroupBootstrapIdResolvePolicy::CreateOrAttach;
 
     // Register group is synchronous.
     meta_->group_id = agent_.registerGroup(
         std::move(group_bootstrap_id), max_group_size_,
-        std::move(initial_rank_order), auto_deactivate, this);
+        std::move(initial_rank_order), resolve_policy, auto_deactivate, this);
+
+    if (!isValidGroup()) {
+        // Registration rejection is scoped to this backend. Keep the Agent and
+        // every other group untouched, and use the pre-join local-only
+        // collective behavior with an effective {self} membership.
+        std::fill_n(meta_->activeRanks, meta_->maxGroupSize, false);
+        meta_->activeRanks[rank_] = true;
+        meta_->autoSyncOnFailure = false;
+        syncActiveRanksTensor();
+        refreshSegmentID(rank_);
+        LOG(WARNING)
+            << "MooncakeBackend: rank=" << meta_->globalRank
+            << " is using group-scoped local-only execution because group "
+               "registration was rejected; join/recovery operations are "
+               "disabled for this group";
+        return;
+    }
 
     agent_.publishLocalEndpoint(buildEndpointMetadata());
 
@@ -369,9 +391,15 @@ c10::intrusive_ptr<c10d::Work> MooncakeP2PShim::barrier(
 
 void MooncakeBackend::prepareOp(c10d::OpType op) const {
     auto mode = meta_->extensionMode.load(std::memory_order_acquire);
-    TORCH_CHECK(meta_->rankStates[meta_->globalRank] != RankState::Offline,
-                "Rank ", meta_->globalRank,
-                " is Offline. Cannot perform operations.");
+    if (isValidGroup()) {
+        TORCH_CHECK(meta_->rankStates[meta_->globalRank] != RankState::Offline,
+                    "Rank ", meta_->globalRank,
+                    " is Offline. Cannot perform operations.");
+    }
+    TORCH_CHECK(
+        isValidGroup() ||
+            (op != c10d::OpType::SEND && op != c10d::OpType::RECV),
+        "P2P operations are unavailable for a invalid Mooncake process group");
     // P2P operations don't require the rank to be active in the group.
     if (op != c10d::OpType::SEND && op != c10d::OpType::RECV) {
         TORCH_CHECK(mode != CollectiveExtensionState::Quiescing, "Rank ",
@@ -922,7 +950,9 @@ void MooncakeBackend::shutdown() {
     // a concurrent ViewUpdate cannot call into it. Keep the group registered
     // locally and at the Coordinator while worker tasks are draining because
     // their failure path may still call syncAfterFailure().
-    agent_.detachBackend(meta_->group_id);
+    if (isValidGroup()) {
+        agent_.detachBackend(meta_->group_id);
+    }
 
     // If we encounter any hung operations, don't release resources
     // to avoid potential crash. Instead, we allow those resources to leak
@@ -982,7 +1012,9 @@ void MooncakeBackend::shutdown() {
 
     // The data-plane teardown has finished. Remove the group from the local
     // Agent and notify the Coordinator that this rank has left it.
-    agent_.unregisterGroup(meta_->group_id);
+    if (isValidGroup()) {
+        agent_.unregisterGroup(meta_->group_id);
+    }
 }
 
 void MooncakeBackend::syncActiveRanksTensor() {
@@ -1016,7 +1048,15 @@ int MooncakeBackend::getNumSyncedRanks() {
     return count;
 }
 
+void MooncakeBackend::requireValidGroup(const char* operation) const {
+    TORCH_CHECK(isValidGroup(), operation,
+                " is unavailable because this Mooncake process group is not "
+                "valid for distributed operations and is running local-only "
+                "collectives");
+}
+
 std::vector<bool> MooncakeBackend::getPeerState(const std::vector<int>& ranks) {
+    requireValidGroup("getPeerState");
     if (!meta_ || !meta_->maybeActivatable)
         return std::vector(ranks.size(), false);
     std::vector<bool> output;
@@ -1034,6 +1074,7 @@ ProposeViewUpdateResponse MooncakeBackend::recoverRanks(
 
 ProposeViewUpdateResponse MooncakeBackend::activateRanks(
     const std::vector<int>& ranks) {
+    requireValidGroup("activateRanks");
     std::vector<InGroupRank> in_group_ranks(ranks.begin(), ranks.end());
     auto resp = agent_.proposeActivate(meta_->group_id, in_group_ranks);
     if (resp.status == ProposalStatus::Rejected) {
@@ -1045,6 +1086,7 @@ ProposeViewUpdateResponse MooncakeBackend::activateRanks(
 
 ProposeViewUpdateResponse MooncakeBackend::deactivateRanks(
     const std::vector<int>& ranks) {
+    requireValidGroup("deactivateRanks");
     std::vector<InGroupRank> in_group_ranks(ranks.begin(), ranks.end());
     auto resp = agent_.proposeDeactivate(meta_->group_id, in_group_ranks);
     if (resp.status == ProposalStatus::Rejected) {
@@ -1055,6 +1097,7 @@ ProposeViewUpdateResponse MooncakeBackend::deactivateRanks(
 }
 
 void MooncakeBackend::joinGroup() {
+    requireValidGroup("joinGroup");
     auto mode = meta_->extensionMode.load(std::memory_order_acquire);
     TORCH_CHECK(mode == CollectiveExtensionState::Isolated,
                 "joinGroup may only be called once on an isolated joining "
@@ -1087,6 +1130,7 @@ void MooncakeBackend::joinGroup() {
 }
 
 SyncAfterFailureResponse MooncakeBackend::syncAfterFailure() {
+    requireValidGroup("syncAfterFailure");
     return agent_.syncAfterFailure(meta_->group_id);
 }
 

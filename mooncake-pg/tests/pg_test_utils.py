@@ -118,11 +118,13 @@ def require_test_device(rank: int, device_type: str) -> torch.device:
 def mooncake_backend_options(
     max_group_size: int,
     *,
+    is_extension: bool = False,
     auto_deactivate_on_failure: bool = True,
     auto_sync_on_failure: bool = True,
 ) -> pg.MooncakeBackendOptions:
     return pg.MooncakeBackendOptions(
         int(max_group_size),
+        bool(is_extension),
         bool(auto_deactivate_on_failure),
         bool(auto_sync_on_failure),
     )
@@ -137,6 +139,7 @@ def init_mooncake_group(
     device_filters: Sequence[str] | None = None,
     use_pg_options: bool = True,
     max_group_size: int | None = None,
+    is_extension: bool = False,
     auto_deactivate_on_failure: bool = True,
     auto_sync_on_failure: bool = True,
 ) -> torch.device:
@@ -150,6 +153,7 @@ def init_mooncake_group(
     if use_pg_options:
         kwargs["pg_options"] = mooncake_backend_options(
             max_group_size if max_group_size is not None else world_size,
+            is_extension=is_extension,
             auto_deactivate_on_failure=auto_deactivate_on_failure,
             auto_sync_on_failure=auto_sync_on_failure,
         )
@@ -191,6 +195,7 @@ class MooncakePGWorkerContext:
         device_filters: Sequence[str] | None = None,
         use_pg_options: bool = True,
         max_group_size: int | None = None,
+        is_extension: bool = False,
         auto_deactivate_on_failure: bool = True,
         auto_sync_on_failure: bool = True,
     ) -> torch.device:
@@ -204,6 +209,7 @@ class MooncakePGWorkerContext:
             else device_filters,
             use_pg_options=use_pg_options,
             max_group_size=max_group_size,
+            is_extension=is_extension,
             auto_deactivate_on_failure=auto_deactivate_on_failure,
             auto_sync_on_failure=auto_sync_on_failure,
         )

@@ -251,18 +251,20 @@ void AgentHost::waitUntilRankActive(GroupId group_id, GlobalRank rank,
 GroupId AgentHost::registerGroup(GroupBootstrapId group_bootstrap_id,
                                  int32_t max_group_size,
                                  std::vector<GlobalRank> rank_order,
+                                 GroupBootstrapIdResolvePolicy resolve_policy,
                                  bool auto_deactivate,
                                  MooncakeBackend* backend) {
     return executor_.postAndWait(
         [this, group_bootstrap_id = std::move(group_bootstrap_id),
-         max_group_size, rank_order = std::move(rank_order), auto_deactivate,
-         backend]() mutable {
+         max_group_size, rank_order = std::move(rank_order), resolve_policy,
+         auto_deactivate, backend]() mutable {
             RegisterGroupRequest req;
             req.rank = rank_;
             req.agent_session_id = agent_.getAgentSessionId();
             req.group_bootstrap_id = std::move(group_bootstrap_id);
             req.max_group_size = max_group_size;
             req.rank_order = std::move(rank_order);
+            req.resolve_policy = resolve_policy;
             req.auto_deactivate = auto_deactivate;
 
             RegisterGroupResponse resp;
@@ -272,10 +274,15 @@ GroupId AgentHost::registerGroup(GroupBootstrapId group_bootstrap_id,
                 "registerGroup");
 
             if (!resp.success) {
-                LOG(ERROR) << "AgentHost: registerGroup failed: "
-                           << resp.reject_reason;
-                throw std::runtime_error("registerGroup rejected: " +
-                                         resp.reject_reason);
+                // A rejected group must not affect the process-scoped Agent.
+                // Return an empty id so this backend instance can remain
+                // group-scoped and execute local-only collectives.
+                LOG(WARNING)
+                    << "AgentHost: registerGroup rejected for rank=" << rank_
+                    << ": " << resp.reject_reason
+                    << "; leaving this group out of Agent state and falling "
+                       "back to local-only execution";
+                return GroupId{};
             }
 
             const auto& group_id = resp.view.group_id;
