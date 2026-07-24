@@ -3897,7 +3897,13 @@ class _MooncakePayloadTransport:
             return self._put_chunks_direct(chunk_keys, chunks)
 
         if transfer_policy.copy_mode == "zero_copy":
-            raise RuntimeError("zero-copy put requires tensor-object buffers")
+            # Joining one chunk group costs the same single copy the contiguous
+            # encoder path paid before multi-buffer puts; delegating keeps the
+            # register-source-buffer zero-copy semantics of single-buffer puts.
+            chunks = [memoryview(b"".join(group)) for group in chunk_groups]
+            return self.put_payload_chunks(
+                chunk_keys, chunks, transfer_policy, pre_registered=False
+            )
         if transfer_policy.copy_mode == "copy" or self._ensure_buffer_pool() is None:
             return fallback_to_direct_put()
         if all(len(group) == 1 for group in chunk_groups):
