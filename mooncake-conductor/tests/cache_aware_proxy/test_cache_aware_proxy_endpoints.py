@@ -33,8 +33,27 @@ class EndpointTest(unittest.IsolatedAsyncioTestCase):
                     200,
                     json={
                         "instances": {
-                            "prefill-a": {"longest_matched": 16},
-                            "prefill-b": {"longest_matched": 32},
+                            "prefill-a": {
+                                "longest_matched": 16,
+                                "gpu": 16,
+                                "dp": {"0": 16, "1": 0},
+                                "cpu": 16,
+                                "disk": 16,
+                                "rank_matches": {
+                                    "0": {"gpu": 16, "cpu": 16, "disk": 16},
+                                    "1": {"gpu": 0, "cpu": 0, "disk": 0},
+                                },
+                            },
+                            "prefill-b": {
+                                "longest_matched": 32,
+                                "gpu": 32,
+                                "dp": {"0": 32},
+                                "cpu": 32,
+                                "disk": 32,
+                                "rank_matches": {
+                                    "0": {"gpu": 32, "cpu": 32, "disk": 32}
+                                },
+                            },
                         }
                     },
                 )

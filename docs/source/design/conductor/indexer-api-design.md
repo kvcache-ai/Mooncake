@@ -215,7 +215,14 @@ the response is:
       },
       "gpu": 0,
       "cpu": 0,
-      "disk": 0
+      "disk": 0,
+      "rank_matches": {
+        "0": {
+          "gpu": 0,
+          "cpu": 0,
+          "disk": 0
+        }
+      }
     }
   }
 }
@@ -226,11 +233,33 @@ the response is:
 | Field | Meaning |
 |---|---|
 | `instances` | Map keyed by selected registered vLLM `instance_id`. Mooncake subscriptions are not result rows. |
-| `longest_matched` | Largest consecutive token count one rank can serve using its GPU plus compatible shared CPU or Disk blocks. |
-| `dp` | Per-rank consecutive GPU token count. Rank keys are decimal JSON strings. |
-| `gpu` | Maximum consecutive GPU token count among this engine's ranks. |
-| `cpu` | Independent consecutive shared CPU token count starting at the first block. |
-| `disk` | Independent consecutive shared Disk token count starting at the first block. |
+| `longest_matched` | The instance `disk` boundary: the largest ordered GPU-to-CPU-to-Disk prefix realized by one registered rank. |
+| `dp` | Per-rank cumulative boundary after the GPU phase. Rank keys are decimal JSON strings and values remain integers. |
+| `rank_matches` | Map with the same keys as `dp`. Each rank maps to cumulative integer `gpu`, `cpu`, and `disk` boundaries. |
+| `gpu` | Maximum rank-level GPU boundary for this engine. |
+| `cpu` | Maximum rank-level cumulative boundary after GPU and shared CPU. |
+| `disk` | Maximum rank-level cumulative boundary after GPU, shared CPU, and shared Disk. |
+
+For each registered rank, Conductor consumes a consecutive GPU prefix, tests
+the first GPU miss in shared CPU, and then tests the first CPU miss in shared
+Disk. It never returns to a higher tier after entering a lower tier, and the
+first Disk miss ends that rank's result. All boundaries count only complete
+query blocks. The two rank maps include identical keys, including zero-hit
+ranks, and every result satisfies:
+
+```text
+dp[rank] == rank_matches[rank].gpu
+0 <= rank_matches[rank].gpu
+  <= rank_matches[rank].cpu
+  <= rank_matches[rank].disk
+  <= complete_query_tokens
+longest_matched == disk
+```
+
+`rank_matches` is additive and the existing field types are unchanged.
+However, `cpu`, `disk`, and some `longest_matched` values now describe this
+ordered cumulative path rather than independent prefixes or an unordered
+per-block union.
 
 For the current HTTP test state, instance `1` rank `0` has a 32-token GPU
 prefix, instance `2` rank `1` has none, and both see 48-token shared CPU and
@@ -246,7 +275,14 @@ Disk prefixes. The exact response is:
         "0": 32
       },
       "cpu": 48,
-      "disk": 48
+      "disk": 48,
+      "rank_matches": {
+        "0": {
+          "gpu": 32,
+          "cpu": 48,
+          "disk": 48
+        }
+      }
     },
     "2": {
       "longest_matched": 48,
@@ -255,7 +291,41 @@ Disk prefixes. The exact response is:
         "1": 0
       },
       "cpu": 48,
-      "disk": 48
+      "disk": 48,
+      "rank_matches": {
+        "1": {
+          "gpu": 0,
+          "cpu": 48,
+          "disk": 48
+        }
+      }
+    }
+  }
+}
+```
+
+As an ordered tier example, suppose rank `0` has the first two 16-token blocks
+only on GPU, the third only in shared CPU, and the fourth only in shared Disk.
+That instance returns:
+
+```json
+{
+  "instances": {
+    "engine-a": {
+      "longest_matched": 64,
+      "gpu": 32,
+      "dp": {
+        "0": 32
+      },
+      "cpu": 48,
+      "disk": 64,
+      "rank_matches": {
+        "0": {
+          "gpu": 32,
+          "cpu": 48,
+          "disk": 64
+        }
+      }
     }
   }
 }

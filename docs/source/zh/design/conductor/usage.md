@@ -111,7 +111,7 @@ Conductor 读取两个环境变量：
 
 `python_hash_seed` 必须与每个兼容 vLLM 进程中 `PYTHONHASHSEED` 环境变量的准确文本相同。Conductor 保留这段文本，把它编码为规范 CBOR 文本字符串，再计算 SHA-256 得到根摘要。种子字符串 `"0"` 得到的小写诊断值是 `4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e`。这个摘要会出现在 `/services` 和 `/global_view` 中；它不是注册输入，也不是通用于所有部署的默认值。
 
-JSON 中必须使用带引号的字符串：`"0"`、`"00"` 和数值 `0` 是不同输入。明确设置的字面量 `random` 受支持，并根据这段准确文本派生根摘要；未设置环境变量时，vLLM 会选择无法注册复现的随机字节，因此不受支持。vLLM 的 `--seed` 控制模型和采样随机性，与前缀缓存的哈希标识无关。请求中的 `cache_salt` 只发送给 `/query`，不是注册字段。准确规则请参阅 [token 块的哈希计算](./conductor-architecture-design.md#how-token-blocks-become-lookup-values)。
+JSON 中必须使用带引号的字符串：`"0"`、`"00"` 和数值 `0` 是不同输入。明确设置的字面量 `random` 受支持，并根据这段准确文本派生根摘要；未设置环境变量时，vLLM 会选择无法注册复现的随机字节，因此不受支持。vLLM 的 `--seed` 控制模型和采样随机性，与前缀缓存的哈希标识无关。请求中的 `cache_salt` 只发送给 `/query`，不是注册字段。准确规则请参阅 {ref}`token 块的哈希计算 <how-token-blocks-become-lookup-values>`。
 
 所有兼容的 vLLM 进程都要使用相同的环境变量文本和规范 CBOR 前缀哈希算法。对于本文的种子零示例：
 
@@ -275,7 +275,7 @@ curl -sS -X POST http://127.0.0.1:13333/query \
 
 成功响应中会有 `instances.engine-a` 对象，其中 DP rank key 为 `"0"` 和 `"1"`。在收到匹配的实时事件前，命中值可能为零。查询只计算完整块。如果事件生产端使用缓存盐值（cache salt）计算请求哈希，请在这次查询中添加取值相同的 `cache_salt` 字符串，不要把它加入注册项。
 
-准确的响应字段请参阅 [HTTP API 参考](./indexer-api-design.md#post-query)；Conductor 如何组合 GPU、CPU 和 Disk 可用性，请参阅[架构指南](./conductor-architecture-design.md#what-query-fields-mean)。
+准确的响应字段请参阅 [HTTP API 参考](./indexer-api-design.md#post-query)；Conductor 如何组合 GPU、CPU 和 Disk 可用性，请参阅{ref}`架构指南 <what-query-fields-mean>`。
 
 ## 注销
 

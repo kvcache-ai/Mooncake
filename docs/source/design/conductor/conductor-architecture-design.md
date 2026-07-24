@@ -23,7 +23,8 @@ flowchart LR
     S --> I
     Q["POST /query<br/>token IDs"] --> H["Hash each complete token block<br/>use the final eight digest bytes"]
     H --> I
-    I --> R["Result for each registered vLLM engine<br/>and each data-parallel rank"]
+    I --> P["Per-rank ordered scan<br/>GPU to shared CPU to shared Disk"]
+    P --> R["Cumulative rank_matches<br/>and instance summaries"]
 ```
 
 The registered `type` decides how Conductor reads a message. Topic text and
@@ -33,8 +34,8 @@ applied in their received order.
 A vLLM event updates GPU information for the registered engine and
 data-parallel (DP) rank. A Mooncake event updates shared CPU or Disk
 information. A query hashes its complete token blocks, looks up each block in
-order, and stops counting a particular result at that result's first missing
-block.
+order for every registered rank, advances only from GPU to shared CPU to
+shared Disk, and stops that rank at its first Disk miss.
 
 ## What can share cache
 
@@ -63,7 +64,7 @@ for the same fields must use the identical strategy, algorithm, exact
 | Registered source | Accepted cache location | What one stored block means | Where it appears in `/query` |
 |---|---|---|---|
 | `vLLM` | GPU, case-insensitive | This exact registered endpoint, engine, and DP rank reported the block. | Under that engine's `instances` row and DP rank. |
-| `Mooncake` | CPU or Disk, case-insensitive | A Mooncake object provides the block to every registered engine with the same four cache-sharing fields. | As shared `cpu` or `disk` counts under each compatible vLLM engine. |
+| `Mooncake` | CPU or Disk, case-insensitive | A Mooncake object provides the block to every registered engine with the same four cache-sharing fields. | It can extend each compatible rank's cumulative `cpu` or `disk` boundary after higher-tier matching. |
 
 A Mooncake registration is a subscription name, not an inference engine. It
 does not create another row in `/query`. Conductor can accept the subscription
@@ -154,22 +155,76 @@ exact seed assertion; Conductor derives and reports the root as a diagnostic.
 ## What query fields mean
 
 All counts are token counts, not block counts. Conductor returns one result for
-each selected registered vLLM engine.
+each selected registered vLLM engine and computes every registered DP rank
+independently.
 
 | Result field | Meaning |
 |---|---|
-| `dp` | For each registered DP rank, the consecutive GPU prefix held by that exact engine and rank. Rank keys are decimal JSON strings. |
-| `gpu` | The largest `dp` value for the engine. Blocks from different ranks are never joined to make a longer GPU prefix. |
-| `cpu` | The consecutive prefix, starting at the first query block, that has at least one compatible shared CPU object. |
-| `disk` | The consecutive prefix, starting at the first query block, that has at least one compatible shared Disk object. |
-| `longest_matched` | The largest consecutive prefix one DP rank can serve using that rank's GPU blocks plus compatible shared CPU or Disk blocks. A block present in several locations is counted once. |
+| `dp` | For each registered DP rank, the cumulative boundary after that exact rank's GPU phase. Rank keys are decimal JSON strings. |
+| `rank_matches` | The same rank keys as `dp`, including zero-hit ranks. Each value contains that rank's cumulative `gpu`, `cpu`, and `disk` boundaries. |
+| `gpu` | The largest rank-level `gpu` boundary for the engine. Blocks from different ranks are never joined to make a longer GPU prefix. |
+| `cpu` | The largest rank-level cumulative boundary after continuing from GPU through shared CPU. |
+| `disk` | The largest rank-level cumulative boundary after continuing from GPU through shared CPU and then shared Disk. |
+| `longest_matched` | Exactly the instance-level `disk` boundary: the longest ordered prefix realized by one registered rank. |
 
-For example, suppose one rank has the first two blocks on GPU, only the third
-block is present in shared CPU cache, and `block_size` is `16`. That rank can
-report `longest_matched: 48` and `gpu: 32`, while the independent `cpu` prefix
-is still `0` because the first block is not in CPU cache. If the first and
-second GPU blocks belong to different DP ranks, Conductor does not combine
-those ranks into a two-block hit.
+For each rank, Conductor uses one cursor and a one-way state machine:
+
+1. Consume consecutive blocks on that rank's GPU.
+2. At the first GPU miss, test that same block in shared CPU and continue there.
+3. At the first CPU miss, test that same block in shared Disk and continue
+   there. The first Disk miss ends the result.
+
+After moving to a lower tier, the query never returns to a higher tier. A
+block present in several tiers is consumed once by the earliest active phase.
+An empty CPU phase can therefore fall through to Disk at the same block, while
+a later GPU or CPU block is ignored after the query has entered Disk and then
+missed. If a higher tier covers the complete input, later cumulative
+boundaries inherit that complete length even when no lower-tier copy exists.
+
+The response obeys these invariants:
+
+```text
+dp.keys == rank_matches.keys
+dp[rank] == rank_matches[rank].gpu
+0 <= rank_matches[rank].gpu
+  <= rank_matches[rank].cpu
+  <= rank_matches[rank].disk
+  <= complete_query_tokens
+longest_matched == disk
+```
+
+Instance `gpu`, `cpu`, and `disk` are the maxima of the corresponding
+rank-level boundaries. Shared CPU and Disk visibility means a maximum-GPU rank
+also realizes the instance CPU and Disk maxima; Conductor does not fabricate a
+hit by concatenating GPU blocks from different ranks.
+
+For example, with `block_size=16`, two GPU blocks followed by one CPU-only
+block and one Disk-only block produce:
+
+```json
+{
+  "longest_matched": 64,
+  "gpu": 32,
+  "dp": {
+    "0": 32
+  },
+  "cpu": 48,
+  "disk": 64,
+  "rank_matches": {
+    "0": {
+      "gpu": 32,
+      "cpu": 48,
+      "disk": 64
+    }
+  }
+}
+```
+
+These values are cumulative boundaries, not tier-local ownership proofs. The
+incremental contributions for one rank are `gpu`, `cpu - gpu`, and
+`disk - cpu`. If GPU covers all 64 tokens without CPU or Disk copies, all
+three rank boundaries are still `64`; inspect indexed owner state when
+debugging physical placement rather than inferring it from query totals.
 
 ## Cleanup
 
