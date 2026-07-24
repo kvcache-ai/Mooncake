@@ -300,6 +300,7 @@ class basic_hybrid_histogram : public dynamic_metric {
                 continue;
             }
 
+            value_str.clear();
             value_type count = 0;
             for (size_t i = 0; i < bucket_counts.size(); i++) {
                 auto counter = bucket_counts[i];

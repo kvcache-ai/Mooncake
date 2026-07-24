@@ -18,6 +18,9 @@
 #include "mutex.h"
 #include "utils.h"
 #include "rpc_types.h"
+#include "cached_replica_score_provider.h"
+#include "replica_transfer_signal_collector.h"
+#include "replica_selection_config.h"
 #if defined(USE_SUNRISE)
 #include "sunrise_allocator.h"
 #endif
@@ -93,6 +96,24 @@ class RealClient : public PyClient {
         const std::string &tenant_id = "default",
         bool enable_client_http_server = false,
         int client_http_port = DEFAULT_CLIENT_HTTP_PORT);
+
+    // Typed opt-in entry point. The legacy setup_real symbol and its default
+    // behavior remain unchanged.
+    int setup_real_with_options(
+        const std::string &local_hostname, const std::string &metadata_server,
+        size_t global_segment_size, size_t local_buffer_size,
+        const std::string &protocol, const std::string &rdma_devices,
+        const std::string &master_server_addr,
+        const std::shared_ptr<TransferEngine> &transfer_engine,
+        const std::string &ipc_socket_path, bool enable_ssd_offload,
+        const std::string &ssd_offload_path, const std::string &tenant_id,
+        bool enable_client_http_server, int client_http_port,
+        ReplicaSelectionOptions replica_selection);
+
+    [[nodiscard]] ReplicaSelectionMode replica_selection_mode() const noexcept;
+
+    [[nodiscard]] ReplicaSignalPublishStatus publish_replica_signal_snapshot(
+        ReplicaSignalSnapshot snapshot);
 
     int setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                     const std::string &server_address,
@@ -518,6 +539,18 @@ class RealClient : public PyClient {
         bool enable_client_http_server = false,
         int client_http_port = DEFAULT_CLIENT_HTTP_PORT);
 
+    tl::expected<void, ErrorCode> setup_internal_with_options(
+        const std::string &local_hostname, const std::string &metadata_server,
+        size_t global_segment_size, size_t local_buffer_size,
+        const std::string &protocol, const std::string &rdma_devices,
+        const std::string &master_server_addr,
+        const std::shared_ptr<TransferEngine> &transfer_engine,
+        const std::string &ipc_socket_path, int local_rpc_port,
+        bool enable_ssd_offload, bool start_offload_rpc_server,
+        const std::string &ssd_offload_path, const std::string &tenant_id,
+        bool enable_client_http_server, int client_http_port,
+        ReplicaSelectionOptions replica_selection);
+
     // Overload that accepts a configuration dictionary
     tl::expected<void, ErrorCode> setup_internal(const ConfigDict &config);
 
@@ -549,6 +582,10 @@ class RealClient : public PyClient {
 
     tl::expected<RangedReadMetadata, ErrorCode> resolve_ranged_read_metadata(
         const std::string &key);
+
+    [[nodiscard]] const Replica::Descriptor *select_replica_for_read(
+        const std::vector<Replica::Descriptor> &replicas,
+        const std::string &key, uint64_t requested_bytes = 0) const;
 
     tl::expected<int64_t, ErrorCode> execute_ranged_read(
         const std::string &key, void *buffer, size_t dst_offset,
@@ -889,6 +926,12 @@ class RealClient : public PyClient {
 
     // Ensure cleanup executes at most once across multiple entry points
     std::atomic<bool> closed_{false};
+
+    std::shared_ptr<CachedReplicaScoreProvider> replica_score_provider_;
+    std::shared_ptr<ReplicaTransferSignalCollector>
+        replica_transfer_signal_collector_;
+    std::unique_ptr<ReplicaSelector> replica_selector_;
+    mutable std::atomic<uint64_t> replica_selection_nonce_{0};
 
     // Counts every LOCAL_DISK read served via peer offload-RPC.
     std::atomic<int64_t> offload_rpc_read_count_{0};

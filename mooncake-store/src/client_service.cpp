@@ -865,7 +865,8 @@ ErrorCode Client::InitTransferEngine(
     return ErrorCode::OK;
 }
 
-void Client::InitTransferSubmitter() {
+void Client::InitTransferSubmitter(
+    std::shared_ptr<TransferSignalObserver> signal_observer) {
     // Initialize TransferSubmitter after transfer engine is ready
     // Keep using logical local_hostname for name-based behaviors; endpoint is
     // used separately where needed.
@@ -874,11 +875,13 @@ void Client::InitTransferSubmitter() {
         GetConfiguredNumaSocketId().value_or(GetCurrentNumaSocketId());
     transfer_submitter_ = std::make_unique<TransferSubmitter>(
         *transfer_engine_, storage_backend_, local_hostname_,
-        metrics_ ? &metrics_->transfer_metric : nullptr, numa_socket_id);
+        metrics_ ? &metrics_->transfer_metric : nullptr, numa_socket_id,
+        std::move(signal_observer));
 #else
     transfer_submitter_ = std::make_unique<TransferSubmitter>(
         *transfer_engine_, storage_backend_, local_hostname_,
-        metrics_ ? &metrics_->transfer_metric : nullptr);
+        metrics_ ? &metrics_->transfer_metric : nullptr, 0,
+        std::move(signal_observer));
 #endif
 }
 
@@ -887,7 +890,8 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& protocol, const std::optional<std::string>& device_names,
     const std::string& master_server_entry,
     const std::shared_ptr<TransferEngine>& transfer_engine,
-    std::map<std::string, std::string> labels, const std::string& tenant_id) {
+    std::map<std::string, std::string> labels, const std::string& tenant_id,
+    std::shared_ptr<TransferSignalObserver> signal_observer) {
     auto client = std::shared_ptr<Client>(new Client(
         local_hostname, metadata_connstring, protocol, labels, tenant_id));
 
@@ -970,7 +974,7 @@ std::optional<std::shared_ptr<Client>> Client::Create(
                      "initialization.";
     }
 
-    client->InitTransferSubmitter();
+    client->InitTransferSubmitter(std::move(signal_observer));
     // Initialize local hot cache
     err = client->InitLocalHotCache();
     if (err != ErrorCode::OK) {

@@ -13,9 +13,11 @@
 #include <stack>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "transfer_engine.h"
+#include "transfer_signal.h"
 #include "types.h"
 #include "replica.h"
 #include "storage_backend.h"
@@ -211,12 +213,14 @@ class FilereadOperationState : public OperationState {
  */
 class TransferEngineOperationState : public OperationState {
    public:
-    TransferEngineOperationState(TransferEngine& engine, BatchID batch_id,
-                                 size_t batch_size)
+    TransferEngineOperationState(
+        TransferEngine& engine, BatchID batch_id, size_t batch_size,
+        std::shared_ptr<TransferSignalReservation> signal_reservation = nullptr)
         : engine_(engine),
           batch_id_(batch_id),
           batch_size_(batch_size),
-          start_ts_(getCurrentTimeInMilli()) {}
+          start_ts_(getCurrentTimeInMilli()),
+          signal_reservation_(std::move(signal_reservation)) {}
 
     ~TransferEngineOperationState() { engine_.freeBatchID(batch_id_); }
 
@@ -242,6 +246,7 @@ class TransferEngineOperationState : public OperationState {
     BatchID batch_id_;
     size_t batch_size_;
     const int64_t start_ts_;
+    std::shared_ptr<TransferSignalReservation> signal_reservation_;
 };
 
 /**
@@ -528,11 +533,11 @@ class FilereadWorkerPool {
  */
 class TransferSubmitter {
    public:
-    explicit TransferSubmitter(TransferEngine& engine,
-                               std::shared_ptr<StorageBackend>& backend,
-                               const std::string& local_hostname,
-                               TransferMetric* transfer_metric = nullptr,
-                               int numa_socket_id = 0);
+    explicit TransferSubmitter(
+        TransferEngine& engine, std::shared_ptr<StorageBackend>& backend,
+        const std::string& local_hostname,
+        TransferMetric* transfer_metric = nullptr, int numa_socket_id = 0,
+        std::shared_ptr<TransferSignalObserver> signal_observer = nullptr);
 
     /**
      * @brief Submit an asynchronous transfer operation
@@ -598,6 +603,7 @@ class TransferSubmitter {
     bool memcpy_enabled_;
     const std::string local_hostname_;
     TransferMetric* transfer_metric_;
+    std::shared_ptr<TransferSignalObserver> signal_observer_;
 
     /**
      * @brief Select the optimal transfer strategy
@@ -657,7 +663,9 @@ class TransferSubmitter {
                                TransferRequest::OpCode op);
 
     std::optional<TransferFuture> submitTransfer(
-        std::vector<TransferRequest>& requests);
+        std::vector<TransferRequest>& requests,
+        const AllocatedBuffer::Descriptor* signal_handle = nullptr,
+        uint64_t signal_bytes = 0);
 };
 
 }  // namespace mooncake

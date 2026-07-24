@@ -88,7 +88,8 @@ class Client {
         const std::string& master_server_entry = kDefaultMasterAddress,
         const std::shared_ptr<TransferEngine>& transfer_engine = nullptr,
         std::map<std::string, std::string> labels = {},
-        const std::string& tenant_id = "default");
+        const std::string& tenant_id = "default",
+        std::shared_ptr<TransferSignalObserver> signal_observer = nullptr);
 
     /**
      * @brief Retrieves data for a given key
@@ -551,6 +552,13 @@ class Client {
         }
     }
 
+    void ObserveReplicaSelection(const ReplicaSelectionDecision& decision,
+                                 uint64_t latency_ns) noexcept {
+        if (metrics_ != nullptr) {
+            metrics_->replica_selection_metric.Observe(decision, latency_ns);
+        }
+    }
+
     // For Prometheus-style metrics
     tl::expected<std::string, ErrorCode> SerializeMetrics() {
         if (metrics_ == nullptr) {
@@ -668,7 +676,8 @@ class Client {
         const std::string& local_hostname,
         const std::string& metadata_connstring, const std::string& protocol,
         const std::optional<std::string>& device_names);
-    void InitTransferSubmitter();
+    void InitTransferSubmitter(
+        std::shared_ptr<TransferSignalObserver> signal_observer = nullptr);
     ErrorCode TransferData(const Replica::Descriptor& replica_descriptor,
                            std::vector<Slice>& slices,
                            TransferRequest::OpCode op_code);

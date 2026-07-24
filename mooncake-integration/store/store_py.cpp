@@ -2119,7 +2119,13 @@ PYBIND11_MODULE(store, m) {
                const std::string &ssd_offload_path = "",
                const std::string &tenant_id = "default",
                bool enable_client_http_server = false,
-               int client_http_port = DEFAULT_CLIENT_HTTP_PORT) {
+               int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
+               const std::string &replica_selection_mode = "legacy") {
+                const auto replica_selection =
+                    ParseReplicaSelectionOptions(replica_selection_mode);
+                if (!replica_selection) {
+                    return static_cast<int>(ErrorCode::INVALID_PARAMS);
+                }
                 auto real_client = self.init_real_client();
                 std::shared_ptr<mooncake::TransferEngine> transfer_engine =
                     nullptr;
@@ -2127,12 +2133,12 @@ PYBIND11_MODULE(store, m) {
                     transfer_engine =
                         engine.cast<std::shared_ptr<TransferEngine>>();
                 }
-                return real_client->setup_real(
+                return real_client->setup_real_with_options(
                     local_hostname, metadata_server, global_segment_size,
                     local_buffer_size, protocol, rdma_devices,
                     master_server_addr, transfer_engine, "", enable_ssd_offload,
                     ssd_offload_path, tenant_id, enable_client_http_server,
-                    client_http_port);
+                    client_http_port, *replica_selection);
             },
             py::arg("local_hostname"), py::arg("metadata_server"),
             py::arg("global_segment_size"), py::arg("local_buffer_size"),
@@ -2141,12 +2147,11 @@ PYBIND11_MODULE(store, m) {
             py::arg("enable_ssd_offload") = false,
             py::arg("ssd_offload_path") = "", py::arg("tenant_id") = "default",
             py::arg("enable_client_http_server") = false,
-            py::arg("client_http_port") = DEFAULT_CLIENT_HTTP_PORT)
+            py::arg("client_http_port") = DEFAULT_CLIENT_HTTP_PORT,
+            py::arg("replica_selection_mode") = "legacy")
         .def(
             "setup",
             [](MooncakeStorePyWrapper &self, const py::dict &config_dict) {
-                auto real_client = self.init_real_client();
-
                 // Convert py::dict to ConfigDict (all values as strings)
                 ConfigDict config;
                 for (auto item : config_dict) {
@@ -2154,6 +2159,17 @@ PYBIND11_MODULE(store, m) {
                     std::string value = py::str(item.second);
                     config[key] = value;
                 }
+
+                const auto mode_it =
+                    config.find(CONFIG_KEY_REPLICA_SELECTION_MODE);
+                const std::string_view mode =
+                    mode_it == config.end() ? std::string_view("legacy")
+                                            : std::string_view(mode_it->second);
+                if (!ParseReplicaSelectionOptions(mode)) {
+                    return static_cast<int>(ErrorCode::INVALID_PARAMS);
+                }
+
+                auto real_client = self.init_real_client();
 
                 auto result = real_client->setup_internal(config);
                 return result.has_value() ? 0
@@ -2176,7 +2192,9 @@ PYBIND11_MODULE(store, m) {
             "  tenant_id: Tenant identifier (default 'default').\n"
             "  enable_client_http_server: Enable client HTTP endpoints "
             "(default false).\n"
-            "  client_http_port: Client HTTP metrics port (default 9300).")
+            "  client_http_port: Client HTTP metrics port (default 9300).\n"
+            "  replica_selection_mode: 'legacy' or opt-in 'shadow' (default "
+            "'legacy').")
         .def(
             "setup_dummy",
             [](MooncakeStorePyWrapper &self, size_t mem_pool_size,

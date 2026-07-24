@@ -3,11 +3,17 @@
 
 // csignal must precede coro_http_client.hpp: the bundled ylt's coro_io.hpp
 // calls std::signal without including <csignal> itself.
+#include <algorithm>
+#include <atomic>
 #include <csignal>
 #include <cstdlib>
 #include <optional>
+#include <set>
+#include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_set>
+#include <vector>
 #include <ylt/coro_http/coro_http_client.hpp>
 
 #include "client_metric.h"
@@ -38,6 +44,23 @@ int GetTestPort(std::unordered_set<int>& used_ports) {
         }
     }
     return -1;
+}
+
+std::optional<uint64_t> ExtractMetricValue(const std::string& metrics,
+                                           const std::string& metric) {
+    const auto metric_pos = metrics.find(metric);
+    if (metric_pos == std::string::npos) {
+        return std::nullopt;
+    }
+    const auto value_pos = metric_pos + metric.size() + 1;
+    if (value_pos >= metrics.size()) {
+        return std::nullopt;
+    }
+    try {
+        return std::stoull(metrics.substr(value_pos));
+    } catch (...) {
+        return std::nullopt;
+    }
 }
 
 class ScopedEnv {
@@ -160,6 +183,162 @@ TEST_F(ClientMetricsTest, MasterClientMetricsSummaryTest) {
     EXPECT_TRUE(summary.find("max<") != std::string::npos);
 
     std::cout << "Master Client Metrics Summary:\n" << summary << std::endl;
+}
+
+TEST_F(ClientMetricsTest, HybridHistogramSerializesUniqueLabelSeries) {
+    ylt::metric::hybrid_histogram_1t histogram(
+        "test_multi_label_histogram", "Test multi-label histogram", {10, 20},
+        {{"cluster", "cluster-a"}}, {"operation"});
+    const std::array<std::string, 1> read_label = {"read"};
+    const std::array<std::string, 1> write_label = {"write"};
+
+    histogram.observe(read_label, 5);
+    histogram.observe(read_label, 15);
+    histogram.observe(write_label, 25);
+    histogram.observe(write_label, 25);
+
+    std::string serialized;
+    histogram.serialize(serialized);
+
+    std::vector<std::string> sample_lines;
+    std::istringstream stream(serialized);
+    for (std::string line; std::getline(stream, line);) {
+        if (line.rfind("test_multi_label_histogram", 0) == 0) {
+            sample_lines.push_back(line);
+        }
+    }
+
+    std::set<std::string> unique_series;
+    for (const auto& line : sample_lines) {
+        const auto value_separator = line.rfind(' ');
+        ASSERT_NE(value_separator, std::string::npos);
+        unique_series.insert(line.substr(0, value_separator));
+    }
+
+    EXPECT_EQ(sample_lines.size(), 10);
+    EXPECT_EQ(sample_lines.size(), unique_series.size());
+
+    const auto expect_once = [&sample_lines](const std::string& sample) {
+        EXPECT_EQ(std::count(sample_lines.begin(), sample_lines.end(), sample),
+                  1)
+            << sample;
+    };
+    expect_once(
+        "test_multi_label_histogram_bucket{cluster=\"cluster-a\","
+        "operation=\"read\",le=\"10.000000\"} 1");
+    expect_once(
+        "test_multi_label_histogram_bucket{cluster=\"cluster-a\","
+        "operation=\"read\",le=\"20.000000\"} 2");
+    expect_once(
+        "test_multi_label_histogram_bucket{cluster=\"cluster-a\","
+        "operation=\"read\",le=\"+Inf\"} 2");
+    expect_once(
+        "test_multi_label_histogram_sum{cluster=\"cluster-a\","
+        "operation=\"read\"} 20");
+    expect_once(
+        "test_multi_label_histogram_count{cluster=\"cluster-a\","
+        "operation=\"read\"} 2");
+    expect_once(
+        "test_multi_label_histogram_bucket{cluster=\"cluster-a\","
+        "operation=\"write\",le=\"10.000000\"} 0");
+    expect_once(
+        "test_multi_label_histogram_bucket{cluster=\"cluster-a\","
+        "operation=\"write\",le=\"20.000000\"} 0");
+    expect_once(
+        "test_multi_label_histogram_bucket{cluster=\"cluster-a\","
+        "operation=\"write\",le=\"+Inf\"} 2");
+    expect_once(
+        "test_multi_label_histogram_sum{cluster=\"cluster-a\","
+        "operation=\"write\"} 50");
+    expect_once(
+        "test_multi_label_histogram_count{cluster=\"cluster-a\","
+        "operation=\"write\"} 2");
+
+    std::string repeated;
+    histogram.serialize(repeated);
+    EXPECT_EQ(repeated, serialized);
+}
+
+TEST_F(ClientMetricsTest,
+       ReplicaSelectionMetricsUseOnlyFixedLowCardinalityLabels) {
+    ReplicaSelectionMetric metrics(
+        std::map<std::string, std::string>{{"cluster", "cluster-a"}});
+
+    ReplicaSelectionDecision agree;
+    agree.mode = ReplicaSelectionMode::SHADOW;
+    agree.outcome = ReplicaSelectionOutcome::SCORED_REMOTE_MEMORY;
+    agree.selected = ReplicaRef{0, 10};
+    agree.recommendation = ReplicaRef{0, 10};
+    metrics.Observe(agree, 240);
+
+    auto disagree = agree;
+    disagree.recommendation = ReplicaRef{1, 11};
+    metrics.Observe(disagree, 750);
+
+    ReplicaSelectionDecision unavailable;
+    unavailable.mode = ReplicaSelectionMode::SHADOW;
+    unavailable.outcome =
+        ReplicaSelectionOutcome::FALLBACK_SIGNAL_SOURCE_UNAVAILABLE;
+    metrics.Observe(unavailable, 1800);
+
+    EXPECT_EQ(
+        metrics.decisions.value({"shadow", "scored_remote_memory", "agree"}),
+        1);
+    EXPECT_EQ(
+        metrics.decisions.value({"shadow", "scored_remote_memory", "disagree"}),
+        1);
+    EXPECT_EQ(
+        metrics.decisions.value({"shadow", "fallback_signal_source_unavailable",
+                                 "neither_available"}),
+        1);
+
+    std::string serialized;
+    metrics.serialize(serialized);
+    EXPECT_NE(
+        serialized.find("mode=\"shadow\",outcome=\"scored_remote_memory\","),
+        std::string::npos);
+    EXPECT_NE(serialized.find("comparison=\"agree\""), std::string::npos);
+    EXPECT_NE(serialized.find("comparison=\"disagree\""), std::string::npos);
+    EXPECT_NE(serialized.find("outcome=\"fallback_signal_source_unavailable\""),
+              std::string::npos);
+    EXPECT_EQ(serialized.find("tenant"), std::string::npos);
+    EXPECT_EQ(serialized.find("endpoint"), std::string::npos);
+    EXPECT_EQ(serialized.find("replica_id"), std::string::npos);
+    EXPECT_EQ(serialized.find("key="), std::string::npos);
+}
+
+TEST_F(ClientMetricsTest, ReplicaSelectionMetricsAreExactUnderConcurrency) {
+    ReplicaSelectionMetric metrics;
+    ReplicaSelectionDecision decision;
+    decision.mode = ReplicaSelectionMode::SHADOW;
+    decision.outcome = ReplicaSelectionOutcome::SCORED_REMOTE_MEMORY;
+    decision.selected = ReplicaRef{0, 1};
+    decision.recommendation = ReplicaRef{1, 2};
+
+    constexpr int kThreads = 32;
+    constexpr int kIterations = 10000;
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+    for (int thread = 0; thread < kThreads; ++thread) {
+        threads.emplace_back([&] {
+            for (int i = 0; i < kIterations; ++i) {
+                metrics.Observe(decision, 500);
+            }
+        });
+    }
+    for (auto& thread : threads) thread.join();
+
+    EXPECT_EQ(
+        metrics.decisions.value({"shadow", "scored_remote_memory", "disagree"}),
+        static_cast<int64_t>(kThreads) * kIterations);
+
+    std::string serialized;
+    metrics.serialize(serialized);
+    EXPECT_NE(
+        serialized.find("mooncake_replica_selection_selector_latency_ns_count{"
+                        "mode=\"shadow\",outcome=\"scored_remote_memory\"} " +
+                        std::to_string(kThreads * kIterations)),
+        std::string::npos);
 }
 
 TEST_F(ClientMetricsTest, ClientMetricsSummaryTest) {
@@ -404,6 +583,445 @@ TEST_F(ClientMetricsTest, HttpMetricsEndpointsReturnData) {
     EXPECT_NE(summary.body.find("Client Metrics Summary"), std::string::npos);
 
     EXPECT_EQ(client->tearDownAll(), 0);
+}
+
+TEST_F(ClientMetricsTest,
+       ShadowSignalsRecommendDifferentRemoteReplicaWithoutChangingRead) {
+    std::unordered_set<int> used_ports;
+    const int master_rpc_port = GetTestPort(used_ports);
+    const int master_http_port = GetTestPort(used_ports);
+    const int source_a_port = GetTestPort(used_ports);
+    const int source_b_port = GetTestPort(used_ports);
+    const int reader_port = GetTestPort(used_ports);
+    const int reader_http_port = GetTestPort(used_ports);
+    ASSERT_GT(master_rpc_port, 0);
+    ASSERT_GT(master_http_port, 0);
+    ASSERT_GT(source_a_port, 0);
+    ASSERT_GT(source_b_port, 0);
+    ASSERT_GT(reader_port, 0);
+    ASSERT_GT(reader_http_port, 0);
+
+    mooncake::testing::InProcMaster master;
+    ASSERT_TRUE(master.Start(mooncake::InProcMasterConfigBuilder()
+                                 .set_rpc_port(master_rpc_port)
+                                 .set_http_metrics_port(master_http_port)
+                                 .set_http_metadata_port(0)
+                                 .build()));
+
+    const auto endpoint = [](int port) {
+        return "127.0.0.1:" + std::to_string(port);
+    };
+    const auto source_a = RealClient::create();
+    const auto source_b = RealClient::create();
+    const auto reader = RealClient::create();
+    const auto setup_source = [&](const std::shared_ptr<RealClient>& client,
+                                  int port) {
+        return client->setup_internal(
+            endpoint(port), "P2PHANDSHAKE", 16 * 1024 * 1024, 16 * 1024 * 1024,
+            "tcp", "", master.master_address(), nullptr, "", port, false, false,
+            "", "default", false, 0);
+    };
+
+    ASSERT_TRUE(setup_source(source_a, source_a_port).has_value());
+    ASSERT_TRUE(setup_source(source_b, source_b_port).has_value());
+    ASSERT_TRUE(reader
+                    ->setup_internal_with_options(
+                        endpoint(reader_port), "P2PHANDSHAKE",
+                        /*global_segment_size=*/0,
+                        /*local_buffer_size=*/16 * 1024 * 1024, "tcp", "",
+                        master.master_address(), nullptr, "", reader_port,
+                        false, false, "", "default", true, reader_http_port,
+                        ReplicaSelectionOptions{ReplicaSelectionMode::SHADOW})
+                    .has_value());
+
+    const std::string key = "shadow-remote-replica-integration";
+    const std::string value(128 * 1024, 's');
+    ReplicateConfig config;
+    config.replica_num = 2;
+    config.preferred_segments = {endpoint(source_a_port),
+                                 endpoint(source_b_port)};
+    ASSERT_EQ(reader->put(key, std::span<const char>(value), config), 0);
+
+    auto query = reader->batch_query({key});
+    ASSERT_EQ(query.size(), 1);
+    ASSERT_TRUE(query[0].has_value());
+    const auto& replicas = query[0]->replicas;
+    std::vector<ReplicaEndpointProtocolKey> remote_candidates;
+    for (const auto& replica : replicas) {
+        if (replica.status != ReplicaStatus::COMPLETE ||
+            !replica.is_memory_replica()) {
+            continue;
+        }
+        const auto& descriptor =
+            replica.get_memory_descriptor().buffer_descriptor;
+        remote_candidates.push_back(
+            {descriptor.transport_endpoint_, descriptor.protocol_});
+    }
+    ASSERT_EQ(remote_candidates.size(), 2);
+    ASSERT_NE(remote_candidates[0], remote_candidates[1]);
+
+    ReplicaSignalSnapshot snapshot;
+    snapshot.generation = 1;
+    snapshot.load_source = {true, std::chrono::steady_clock::now()};
+    constexpr uint64_t kSaturationBytes = 1024ULL * 1024 * 1024;
+    snapshot.load.emplace(
+        remote_candidates[0],
+        ReplicaLoadSignal{kSaturationBytes, kSaturationBytes, 1.0});
+    snapshot.load.emplace(remote_candidates[1],
+                          ReplicaLoadSignal{0, kSaturationBytes, 0.0});
+    ASSERT_EQ(reader->publish_replica_signal_snapshot(std::move(snapshot)),
+              ReplicaSignalPublishStatus::PUBLISHED);
+
+    const auto buffer = reader->get_buffer(key);
+    ASSERT_NE(buffer, nullptr);
+    ASSERT_EQ(buffer->size(), value.size());
+    EXPECT_EQ(
+        std::string(static_cast<const char*>(buffer->ptr()), buffer->size()),
+        value);
+
+    const auto metrics = FetchUrl(
+        "http://127.0.0.1:" + std::to_string(reader_http_port) + "/metrics");
+    ASSERT_EQ(metrics.status, 200);
+    EXPECT_NE(metrics.body.find(
+                  "mooncake_replica_selection_decisions_total{client_mode=\""
+                  "real\",mode=\"shadow\",outcome=\"scored_remote_memory\","
+                  "comparison=\"disagree\"} 1"),
+              std::string::npos)
+        << metrics.body;
+
+    EXPECT_EQ(reader->tearDownAll(), 0);
+    EXPECT_EQ(source_b->tearDownAll(), 0);
+    EXPECT_EQ(source_a->tearDownAll(), 0);
+}
+
+TEST_F(ClientMetricsTest,
+       ShadowLiveSignalsObserveRealQueuedReadsAndPreserveData) {
+    std::unordered_set<int> used_ports;
+    const int master_rpc_port = GetTestPort(used_ports);
+    const int master_http_port = GetTestPort(used_ports);
+    const int source_a_port = GetTestPort(used_ports);
+    const int source_b_port = GetTestPort(used_ports);
+    const int reader_port = GetTestPort(used_ports);
+    const int reader_http_port = GetTestPort(used_ports);
+    ASSERT_GT(reader_http_port, 0);
+
+    mooncake::testing::InProcMaster master;
+    ASSERT_TRUE(master.Start(mooncake::InProcMasterConfigBuilder()
+                                 .set_rpc_port(master_rpc_port)
+                                 .set_http_metrics_port(master_http_port)
+                                 .set_http_metadata_port(0)
+                                 .set_default_kv_lease_ttl(30000)
+                                 .build()));
+    const auto endpoint = [](int port) {
+        return "127.0.0.1:" + std::to_string(port);
+    };
+    const auto source_a = RealClient::create();
+    const auto source_b = RealClient::create();
+    const auto reader = RealClient::create();
+    const auto setup_source = [&](const std::shared_ptr<RealClient>& client,
+                                  int port) {
+        return client->setup_internal(
+            endpoint(port), "P2PHANDSHAKE", 64 * 1024 * 1024, 16 * 1024 * 1024,
+            "tcp", "", master.master_address(), nullptr, "", port, false, false,
+            "", "default", false, 0);
+    };
+    ASSERT_TRUE(setup_source(source_a, source_a_port).has_value());
+    ASSERT_TRUE(setup_source(source_b, source_b_port).has_value());
+    ASSERT_TRUE(
+        reader
+            ->setup_internal_with_options(
+                endpoint(reader_port), "P2PHANDSHAKE", 0, 256 * 1024 * 1024,
+                "tcp", "", master.master_address(), nullptr, "", reader_port,
+                false, false, "", "default", true, reader_http_port,
+                ReplicaSelectionOptions{ReplicaSelectionMode::SHADOW, true})
+            .has_value());
+
+    const std::string key = "shadow-live-real-queue-integration";
+    const std::string value(8 * 1024 * 1024, 'q');
+    ReplicateConfig config;
+    config.replica_num = 2;
+    config.preferred_segments = {endpoint(source_a_port),
+                                 endpoint(source_b_port)};
+    ASSERT_EQ(reader->put(key, std::span<const char>(value), config), 0);
+
+    constexpr int kReaders = 16;
+    std::atomic<int> ready{0};
+    std::atomic<bool> start{false};
+    std::atomic<int> successful_reads{0};
+    std::vector<std::thread> workers;
+    workers.reserve(kReaders);
+    for (int i = 0; i < kReaders; ++i) {
+        workers.emplace_back([&] {
+            ready.fetch_add(1, std::memory_order_release);
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            const auto buffer = reader->get_buffer(key);
+            if (buffer && buffer->size() == value.size() &&
+                std::string(static_cast<const char*>(buffer->ptr()),
+                            buffer->size()) == value) {
+                successful_reads.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    while (ready.load(std::memory_order_acquire) != kReaders) {
+        std::this_thread::yield();
+    }
+    const auto read_start = std::chrono::steady_clock::now();
+    start.store(true, std::memory_order_release);
+    for (auto& worker : workers) worker.join();
+    const auto read_elapsed_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - read_start)
+            .count();
+    ASSERT_EQ(successful_reads.load(std::memory_order_relaxed), kReaders);
+
+    const auto metrics = FetchUrl(
+        "http://127.0.0.1:" + std::to_string(reader_http_port) + "/metrics");
+    ASSERT_EQ(metrics.status, 200);
+    const std::string prefix =
+        "mooncake_replica_selection_decisions_total{client_mode=\"real\","
+        "mode=\"shadow\",outcome=\"scored_remote_memory\",comparison=\""
+        "disagree\"}";
+    const auto metric_pos = metrics.body.find(prefix);
+    ASSERT_NE(metric_pos, std::string::npos) << metrics.body;
+    const auto value_pos = metric_pos + prefix.size() + 1;
+    ASSERT_LT(value_pos, metrics.body.size());
+    const auto disagreements = std::stoull(metrics.body.substr(value_pos));
+    EXPECT_GT(disagreements, 0u) << metrics.body;
+    std::cout << "SHADOW_LIVE_RESULT readers=" << kReaders
+              << " bytes_per_read=" << value.size() << " successful_reads="
+              << successful_reads.load(std::memory_order_relaxed)
+              << " disagreements=" << disagreements
+              << " elapsed_us=" << read_elapsed_us << std::endl;
+
+    EXPECT_EQ(reader->tearDownAll(), 0);
+    EXPECT_EQ(source_b->tearDownAll(), 0);
+    EXPECT_EQ(source_a->tearDownAll(), 0);
+}
+
+TEST_F(ClientMetricsTest,
+       ShadowLiveSignalsObserveRemoteBatchReadQueueAndPreserveData) {
+    std::unordered_set<int> used_ports;
+    const int master_rpc_port = GetTestPort(used_ports);
+    const int master_http_port = GetTestPort(used_ports);
+    const int source_a_port = GetTestPort(used_ports);
+    const int source_b_port = GetTestPort(used_ports);
+    const int reader_port = GetTestPort(used_ports);
+    const int reader_http_port = GetTestPort(used_ports);
+    ASSERT_GT(reader_http_port, 0);
+
+    mooncake::testing::InProcMaster master;
+    ASSERT_TRUE(master.Start(mooncake::InProcMasterConfigBuilder()
+                                 .set_rpc_port(master_rpc_port)
+                                 .set_http_metrics_port(master_http_port)
+                                 .set_http_metadata_port(0)
+                                 .set_default_kv_lease_ttl(30000)
+                                 .build()));
+    const auto endpoint = [](int port) {
+        return "127.0.0.1:" + std::to_string(port);
+    };
+    const auto source_a = RealClient::create();
+    const auto source_b = RealClient::create();
+    const auto reader = RealClient::create();
+    const auto setup_source = [&](const std::shared_ptr<RealClient>& client,
+                                  int port) {
+        return client->setup_internal(
+            endpoint(port), "P2PHANDSHAKE", 128 * 1024 * 1024, 16 * 1024 * 1024,
+            "tcp", "", master.master_address(), nullptr, "", port, false, false,
+            "", "default", false, 0);
+    };
+    ASSERT_TRUE(setup_source(source_a, source_a_port).has_value());
+    ASSERT_TRUE(setup_source(source_b, source_b_port).has_value());
+    ASSERT_TRUE(
+        reader
+            ->setup_internal_with_options(
+                endpoint(reader_port), "P2PHANDSHAKE", 0, 512 * 1024 * 1024,
+                "tcp", "", master.master_address(), nullptr, "", reader_port,
+                false, false, "", "default", true, reader_http_port,
+                ReplicaSelectionOptions{ReplicaSelectionMode::SHADOW, true})
+            .has_value());
+
+    constexpr int kKeys = 4;
+    constexpr int kReaders = 8;
+    constexpr size_t kBytesPerKey = 8 * 1024 * 1024;
+    std::vector<std::string> keys;
+    std::vector<std::string> values;
+    keys.reserve(kKeys);
+    values.reserve(kKeys);
+    ReplicateConfig config;
+    config.replica_num = 2;
+    config.preferred_segments = {endpoint(source_a_port),
+                                 endpoint(source_b_port)};
+    for (int i = 0; i < kKeys; ++i) {
+        keys.push_back("shadow-live-batch-queue-" + std::to_string(i));
+        values.emplace_back(kBytesPerKey, static_cast<char>('a' + i));
+        ASSERT_EQ(reader->put(keys.back(), std::span<const char>(values.back()),
+                              config),
+                  0);
+    }
+
+    std::atomic<int> ready{0};
+    std::atomic<bool> start{false};
+    std::atomic<int> successful_batches{0};
+    std::vector<std::thread> workers;
+    workers.reserve(kReaders);
+    for (int i = 0; i < kReaders; ++i) {
+        workers.emplace_back([&] {
+            ready.fetch_add(1, std::memory_order_release);
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            const auto buffers = reader->batch_get_buffer(keys);
+            bool valid = buffers.size() == values.size();
+            for (size_t j = 0; valid && j < buffers.size(); ++j) {
+                valid = buffers[j] && buffers[j]->size() == values[j].size() &&
+                        std::string(static_cast<const char*>(buffers[j]->ptr()),
+                                    buffers[j]->size()) == values[j];
+            }
+            if (valid) {
+                successful_batches.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    while (ready.load(std::memory_order_acquire) != kReaders) {
+        std::this_thread::yield();
+    }
+    const auto read_start = std::chrono::steady_clock::now();
+    start.store(true, std::memory_order_release);
+    for (auto& worker : workers) worker.join();
+    const auto read_elapsed_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - read_start)
+            .count();
+    ASSERT_EQ(successful_batches.load(std::memory_order_relaxed), kReaders);
+
+    const auto metrics = FetchUrl(
+        "http://127.0.0.1:" + std::to_string(reader_http_port) + "/metrics");
+    ASSERT_EQ(metrics.status, 200);
+    const std::string disagree =
+        "mooncake_replica_selection_decisions_total{client_mode=\"real\","
+        "mode=\"shadow\",outcome=\"scored_remote_memory\",comparison=\""
+        "disagree\"}";
+    const auto metric_pos = metrics.body.find(disagree);
+    ASSERT_NE(metric_pos, std::string::npos) << metrics.body;
+    const auto value_pos = metric_pos + disagree.size() + 1;
+    ASSERT_LT(value_pos, metrics.body.size());
+    const auto disagreements = std::stoull(metrics.body.substr(value_pos));
+    EXPECT_GT(disagreements, 0u) << metrics.body;
+    std::cout << "SHADOW_LIVE_BATCH_RESULT readers=" << kReaders
+              << " keys_per_batch=" << kKeys
+              << " bytes_per_key=" << kBytesPerKey << " successful_batches="
+              << successful_batches.load(std::memory_order_relaxed)
+              << " disagreements=" << disagreements
+              << " elapsed_us=" << read_elapsed_us << std::endl;
+
+    EXPECT_EQ(reader->tearDownAll(), 0);
+    EXPECT_EQ(source_b->tearDownAll(), 0);
+    EXPECT_EQ(source_a->tearDownAll(), 0);
+}
+
+TEST_F(ClientMetricsTest,
+       ShadowLiveSignalsAttributeRealTcpFailuresAndHardVetoEndpoint) {
+    std::unordered_set<int> used_ports;
+    const int master_rpc_port = GetTestPort(used_ports);
+    const int master_http_port = GetTestPort(used_ports);
+    const int source_a_port = GetTestPort(used_ports);
+    const int source_b_port = GetTestPort(used_ports);
+    const int reader_port = GetTestPort(used_ports);
+    const int reader_http_port = GetTestPort(used_ports);
+    ASSERT_GT(reader_http_port, 0);
+
+    mooncake::testing::InProcMaster master;
+    ASSERT_TRUE(master.Start(mooncake::InProcMasterConfigBuilder()
+                                 .set_rpc_port(master_rpc_port)
+                                 .set_http_metrics_port(master_http_port)
+                                 .set_http_metadata_port(0)
+                                 .set_default_kv_lease_ttl(30000)
+                                 .build()));
+    const auto endpoint = [](int port) {
+        return "127.0.0.1:" + std::to_string(port);
+    };
+    const auto source_a = RealClient::create();
+    const auto source_b = RealClient::create();
+    const auto reader = RealClient::create();
+    const auto setup_source = [&](const std::shared_ptr<RealClient>& client,
+                                  int port) {
+        return client->setup_internal(
+            endpoint(port), "P2PHANDSHAKE", 16 * 1024 * 1024, 16 * 1024 * 1024,
+            "tcp", "", master.master_address(), nullptr, "", port, false, false,
+            "", "default", false, 0);
+    };
+    ASSERT_TRUE(setup_source(source_a, source_a_port).has_value());
+    ASSERT_TRUE(setup_source(source_b, source_b_port).has_value());
+    ASSERT_TRUE(
+        reader
+            ->setup_internal_with_options(
+                endpoint(reader_port), "P2PHANDSHAKE", 0, 16 * 1024 * 1024,
+                "tcp", "", master.master_address(), nullptr, "", reader_port,
+                false, false, "", "default", true, reader_http_port,
+                ReplicaSelectionOptions{ReplicaSelectionMode::SHADOW, true})
+            .has_value());
+
+    const std::string key = "shadow-live-real-failure-integration";
+    const std::string value(128 * 1024, 'f');
+    ReplicateConfig config;
+    config.replica_num = 2;
+    config.preferred_segments = {endpoint(source_a_port),
+                                 endpoint(source_b_port)};
+    ASSERT_EQ(reader->put(key, std::span<const char>(value), config), 0);
+
+    auto query = reader->batch_query({key});
+    ASSERT_EQ(query.size(), 1);
+    ASSERT_TRUE(query[0].has_value());
+    const auto first_complete =
+        std::find_if(query[0]->replicas.begin(), query[0]->replicas.end(),
+                     [](const Replica::Descriptor& replica) {
+                         return replica.status == ReplicaStatus::COMPLETE &&
+                                replica.is_memory_replica();
+                     });
+    ASSERT_NE(first_complete, query[0]->replicas.end());
+    const auto failed_endpoint = first_complete->get_memory_descriptor()
+                                     .buffer_descriptor.transport_endpoint_;
+    ASSERT_FALSE(failed_endpoint.empty());
+
+    PyClient::QueryResultCache query_cache;
+    query_cache.emplace(key, std::move(query[0]));
+    ASSERT_EQ(source_a->tearDownAll(), 0);
+    ASSERT_EQ(source_b->tearDownAll(), 0);
+
+    std::vector<char> destination(value.size());
+    ASSERT_EQ(reader->register_buffer(destination.data(), destination.size()),
+              0);
+    const std::vector<void*> buffers{destination.data()};
+    const std::vector<std::vector<std::string>> keys{{key}};
+    const std::vector<std::vector<std::vector<size_t>>> offsets{{{0}}};
+    const std::vector<std::vector<std::vector<size_t>>> sizes{{{value.size()}}};
+
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        const auto results = reader->get_into_ranges(
+            buffers, keys, offsets, offsets, sizes, &query_cache);
+        ASSERT_EQ(results.size(), 1);
+        ASSERT_EQ(results[0].size(), 1);
+        ASSERT_EQ(results[0][0].size(), 1);
+        EXPECT_LT(results[0][0][0], 0) << "attempt=" << attempt;
+    }
+
+    const auto metrics = FetchUrl(
+        "http://127.0.0.1:" + std::to_string(reader_http_port) + "/metrics");
+    ASSERT_EQ(metrics.status, 200);
+    const std::string read_count =
+        "mooncake_transfer_read_operation_count{client_mode=\"real\","
+        "op_name=\"get_into_ranges\"}";
+    const auto read_operations = ExtractMetricValue(metrics.body, read_count);
+    ASSERT_TRUE(read_operations.has_value()) << metrics.body;
+    EXPECT_GE(*read_operations, 4u) << metrics.body;
+    std::cout << "SHADOW_LIVE_FAILURE_RESULT attempts=4 failed_endpoint="
+              << failed_endpoint << " read_operations=" << *read_operations
+              << std::endl;
+
+    EXPECT_EQ(reader->unregister_buffer(destination.data()), 0);
+    EXPECT_EQ(reader->tearDownAll(), 0);
 }
 
 TEST_F(ClientMetricsTest, HttpMetricsConfigParserTrimsWhitespace) {

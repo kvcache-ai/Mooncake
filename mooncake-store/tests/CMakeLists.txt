@@ -45,6 +45,20 @@ add_test(
 set_tests_properties(
   replica_selection_env_opt_in_test
   PROPERTIES ENVIRONMENT "MC_STORE_REPLICA_SCORING=1")
+add_store_test(replica_selector_v2_test replica_selector_v2_test.cpp)
+add_store_test(replica_selection_config_test
+               replica_selection_config_test.cpp)
+add_store_test(cached_replica_score_provider_test
+               cached_replica_score_provider_test.cpp)
+add_store_test(replica_transfer_signal_collector_test
+               replica_transfer_signal_collector_test.cpp)
+add_test(
+  NAME replica_selector_v2_env_v1_isolation_test
+  COMMAND replica_selector_v2_test
+          --gtest_filter=ReplicaSelectorV2Test.EnvironmentV1OptInDoesNotAffectActiveFallback)
+set_tests_properties(
+  replica_selector_v2_env_v1_isolation_test
+  PROPERTIES ENVIRONMENT "MC_STORE_REPLICA_SCORING=1")
 add_store_test(eviction_strategy_test eviction_strategy_test.cpp)
 add_store_test(deadline_scheduler_test deadline_scheduler_test.cpp)
 add_store_test(kv_event_publisher_test kv_event_publisher_test.cpp)
