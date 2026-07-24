@@ -882,6 +882,38 @@ void Client::InitTransferSubmitter() {
 #endif
 }
 
+void Client::ReportLocalNicLoadStats() {
+    // rpc_only clients have no transfer engine.
+    if (!transfer_engine_) {
+        return;
+    }
+    std::vector<NicLoadStats> local_stats;
+    auto status = transfer_engine_->getNicLoadStats(local_stats);
+    if (!status.ok()) {
+        VLOG(1) << "Failed to get transfer engine NIC load stats: "
+                << status.ToString();
+        return;
+    }
+
+    if (local_stats.empty()) {
+        return;
+    }
+
+    std::vector<NicLoadStat> nic_stats;
+    nic_stats.reserve(local_stats.size());
+    for (const auto& stat : local_stats) {
+        nic_stats.emplace_back(stat.device_name, stat.inflight_bytes,
+                               stat.ewma_bandwidth_bps);
+    }
+
+    auto report_result = ReportNicLoadStats(nic_stats);
+    if (!report_result) {
+        // Rate-limited: runs every heartbeat.
+        LOG_EVERY_N(WARNING, 60) << "Failed to report local NIC load stats: "
+                                 << report_result.error();
+    }
+}
+
 std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& local_hostname, const std::string& metadata_connstring,
     const std::string& protocol, const std::optional<std::string>& device_names,
@@ -3055,6 +3087,39 @@ tl::expected<void, ErrorCode> Client::ReportSsdCapacity(
     return {};
 }
 
+tl::expected<void, ErrorCode> Client::ReportNicLoadStats(
+    const std::vector<NicLoadStat>& stats) {
+    auto response = master_client_.ReportNicLoadStats(client_id_, stats);
+    if (!response) {
+        // The periodic caller logs failures; avoid duplicate lines here.
+        return tl::make_unexpected(response.error());
+    }
+    return {};
+}
+
+tl::expected<std::vector<ClientNicLoadStats>, ErrorCode>
+Client::BatchGetNicLoadStats(const std::vector<UUID>& client_ids) {
+    auto response = master_client_.BatchGetNicLoadStats(client_ids);
+    if (!response) {
+        LOG(ERROR) << "BatchGetNicLoadStats failed, error code is "
+                   << response.error();
+        return tl::make_unexpected(response.error());
+    }
+    return response;
+}
+
+tl::expected<std::vector<ClientNicLoadStats>, ErrorCode>
+Client::BatchGetNicLoadStatsByEndpoints(
+    const std::vector<std::string>& endpoints) {
+    auto response = master_client_.BatchGetNicLoadStatsByEndpoints(endpoints);
+    if (!response) {
+        LOG(ERROR) << "BatchGetNicLoadStatsByEndpoints failed, error code is "
+                   << response.error();
+        return tl::make_unexpected(response.error());
+    }
+    return response;
+}
+
 tl::expected<void, ErrorCode> Client::BatchGetOffloadObject(
     const std::string& transfer_engine_addr,
     const std::vector<std::string>& keys,
@@ -3826,6 +3891,8 @@ void Client::StorageHeartbeatThreadMain() {
                     }
                 }
             }
+
+            ReportLocalNicLoadStats();
 
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(success_ping_interval_ms));

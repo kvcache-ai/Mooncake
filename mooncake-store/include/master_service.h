@@ -72,6 +72,8 @@ class SnapshotChildProcessTest;
 // exposing test-only accessors on MasterService itself.
 class PromotionOnHitTest;
 class MasterServiceTenantQuotaTest;
+// Friended so eviction tests can rewind private NIC load stats timestamps.
+class MasterServiceNicLoadTest;
 }  // namespace test
 namespace benchmarks {
 class BatchEvictBench;
@@ -98,6 +100,7 @@ class MasterService {
     friend class test::PromotionOnHitTest;
     friend class benchmarks::BatchEvictBench;
     friend class test::MasterServiceTenantQuotaTest;
+    friend class test::MasterServiceNicLoadTest;
     friend class MasterSnapshotManager;    // Allow access to internal state for
                                            // snapshot
     friend class ha::MasterSnapshotCodec;  // Allow codec to access private
@@ -648,6 +651,34 @@ class MasterService {
     auto ReportSsdCapacity(const UUID& client_id,
                            int64_t ssd_total_capacity_bytes)
         -> tl::expected<void, ErrorCode>;
+
+    /**
+     * @brief Accepts a periodic NIC load report from a client and stores
+     *        the snapshot for later queries.
+     * @param client_id The reporting client.
+     * @param stats     Per-device load statistics.
+     */
+    auto ReportNicLoadStats(const UUID& client_id,
+                            const std::vector<NicLoadStat>& stats)
+        -> tl::expected<void, ErrorCode>;
+
+    /**
+     * @brief Returns the latest NIC load snapshots for the given client IDs.
+     *        Stale entries (older than kNicLoadStatsTtlMs) are evicted.
+     * @param client_ids Clients to query.
+     */
+    auto BatchGetNicLoadStats(const std::vector<UUID>& client_ids)
+        -> tl::expected<std::vector<ClientNicLoadStats>, ErrorCode>;
+
+    /**
+     * @brief Like BatchGetNicLoadStats but resolves clients by their
+     *        segment name or TE endpoint address. The endpoint mapping is
+     *        cached and may lag mounts by up to kEndpointIndexTtlMs.
+     * @param endpoints Endpoint strings to resolve.
+     */
+    auto BatchGetNicLoadStatsByEndpoints(
+        const std::vector<std::string>& endpoints)
+        -> tl::expected<std::vector<ClientNicLoadStats>, ErrorCode>;
 
     /**
      * @brief Notifies the master that offloading of specified objects has
@@ -1485,6 +1516,10 @@ class MasterService {
         const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients,
         MetadataShardAccessorRW* shard = nullptr);
 
+    // True if a NIC load stats entry is older than kNicLoadStatsTtlMs.
+    static bool IsNicLoadEntryStale(const ClientNicLoadStats& entry,
+                                    uint64_t now_ms);
+
     // Helper: allocate replicas, create ObjectMetadata, insert into shard,
     // and return descriptor list.  Shared by PutStart and UpsertStart.
     auto AllocateAndInsertMetadata(
@@ -2049,6 +2084,22 @@ class MasterService {
     BufferAllocatorType memory_allocator_type_;
     const AllocationStrategyType allocation_strategy_type_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
+
+    // NIC load stats cache - entries older than kNicLoadStatsTtlMs are evicted
+    // lazily on read; short TTL so a dead client's data drops out quickly.
+    static constexpr uint64_t kNicLoadStatsTtlMs = 15 * 1000;  // 15 sec
+    // Per-report caps to bound memory from misbehaving clients.
+    static constexpr size_t kMaxNicDevicesPerReport = 64;
+    static constexpr size_t kMaxNicDeviceNameLength = 256;
+    mutable std::mutex nic_load_stats_mutex_;
+    std::unordered_map<UUID, ClientNicLoadStats, boost::hash<UUID>>
+        nic_load_stats_;
+    // Endpoint -> client index rebuilt from segments at most once per
+    // kEndpointIndexTtlMs, so per-heartbeat queries avoid full segment scans.
+    static constexpr uint64_t kEndpointIndexTtlMs = 1000;  // 1 sec
+    mutable std::mutex endpoint_index_mutex_;
+    std::unordered_map<std::string, UUID> endpoint_to_client_;
+    uint64_t endpoint_index_built_at_ms_ = 0;
 
     bool enable_snapshot_restore_ = false;
 

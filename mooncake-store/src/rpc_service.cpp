@@ -1490,6 +1490,29 @@ WrappedMasterService::OffloadObjectHeartbeat(const UUID& client_id,
     return result;
 }
 
+tl::expected<void, ErrorCode> WrappedMasterService::ReportNicLoadStats(
+    const UUID& client_id, const std::vector<NicLoadStat>& stats) {
+    ScopedVLogTimer timer(1, "ReportNicLoadStats");
+    timer.LogRequest("client_id=", client_id, ", device_count=", stats.size());
+    return master_service_.ReportNicLoadStats(client_id, stats);
+}
+
+tl::expected<std::vector<ClientNicLoadStats>, ErrorCode>
+WrappedMasterService::BatchGetNicLoadStats(
+    const std::vector<UUID>& client_ids) {
+    ScopedVLogTimer timer(1, "BatchGetNicLoadStats");
+    timer.LogRequest("client_id_count=", client_ids.size());
+    return master_service_.BatchGetNicLoadStats(client_ids);
+}
+
+tl::expected<std::vector<ClientNicLoadStats>, ErrorCode>
+WrappedMasterService::BatchGetNicLoadStatsByEndpoints(
+    const std::vector<std::string>& endpoints) {
+    ScopedVLogTimer timer(1, "BatchGetNicLoadStatsByEndpoints");
+    timer.LogRequest("endpoint_count=", endpoints.size());
+    return master_service_.BatchGetNicLoadStatsByEndpoints(endpoints);
+}
+
 tl::expected<void, ErrorCode> WrappedMasterService::ReportSsdCapacity(
     const UUID& client_id, int64_t ssd_total_capacity_bytes) {
     ScopedVLogTimer timer(1, "ReportSsdCapacity");
@@ -1702,6 +1725,15 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::OffloadObjectHeartbeat>(
+        &wrapped_master_service);
+    server
+        .register_handler<&mooncake::WrappedMasterService::ReportNicLoadStats>(
+            &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::BatchGetNicLoadStats>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::BatchGetNicLoadStatsByEndpoints>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ReportSsdCapacity>(
         &wrapped_master_service);

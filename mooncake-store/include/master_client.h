@@ -431,6 +431,24 @@ class MasterClient {
     [[nodiscard]] tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
     OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
 
+    /**
+     * @brief Report per-device NIC load statistics to the master.
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> ReportNicLoadStats(
+        const UUID& client_id, const std::vector<NicLoadStat>& stats);
+
+    /**
+     * @brief Batch-query NIC load snapshots by client IDs.
+     */
+    [[nodiscard]] tl::expected<std::vector<ClientNicLoadStats>, ErrorCode>
+    BatchGetNicLoadStats(const std::vector<UUID>& client_ids);
+
+    /**
+     * @brief Batch-query NIC load snapshots by segment/TE endpoint strings.
+     */
+    [[nodiscard]] tl::expected<std::vector<ClientNicLoadStats>, ErrorCode>
+    BatchGetNicLoadStatsByEndpoints(const std::vector<std::string>& endpoints);
+
     [[nodiscard]] tl::expected<void, ErrorCode> ReportSsdCapacity(
         const UUID& client_id, int64_t ssd_total_capacity_bytes);
 

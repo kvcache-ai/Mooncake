@@ -4968,6 +4968,133 @@ auto MasterService::ReportSsdCapacity(const UUID& client_id,
     return {};
 }
 
+// Wall-clock milliseconds since epoch, matching NicLoadStats timestamps.
+static uint64_t NicLoadNowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+auto MasterService::ReportNicLoadStats(const UUID& client_id,
+                                       const std::vector<NicLoadStat>& stats)
+    -> tl::expected<void, ErrorCode> {
+    if (stats.size() > kMaxNicDevicesPerReport) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    for (const auto& device : stats) {
+        if (device.device_name.empty() ||
+            device.device_name.size() > kMaxNicDeviceNameLength ||
+            device.ewma_bandwidth_bps < 0.0 ||
+            !std::isfinite(device.ewma_bandwidth_bps)) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+
+    ClientNicLoadStats snapshot;
+    snapshot.client_id = client_id;
+    snapshot.devices = stats;
+    snapshot.updated_at_ms = NicLoadNowMs();
+
+    std::lock_guard<std::mutex> lock(nic_load_stats_mutex_);
+    // Reports arrive every heartbeat, so stale entries are evicted here
+    // even when no one queries the cache.
+    for (auto it = nic_load_stats_.begin(); it != nic_load_stats_.end();) {
+        if (IsNicLoadEntryStale(it->second, snapshot.updated_at_ms)) {
+            it = nic_load_stats_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    nic_load_stats_[client_id] = std::move(snapshot);
+    return {};
+}
+
+bool MasterService::IsNicLoadEntryStale(const ClientNicLoadStats& entry,
+                                        uint64_t now_ms) {
+    return now_ms > entry.updated_at_ms &&
+           now_ms - entry.updated_at_ms > kNicLoadStatsTtlMs;
+}
+
+auto MasterService::BatchGetNicLoadStats(const std::vector<UUID>& client_ids)
+    -> tl::expected<std::vector<ClientNicLoadStats>, ErrorCode> {
+    std::vector<ClientNicLoadStats> result;
+    result.reserve(client_ids.size());
+
+    const uint64_t now_ms = NicLoadNowMs();
+
+    std::lock_guard<std::mutex> lock(nic_load_stats_mutex_);
+    for (const auto& client_id : client_ids) {
+        auto it = nic_load_stats_.find(client_id);
+        if (it == nic_load_stats_.end()) {
+            continue;
+        }
+        if (IsNicLoadEntryStale(it->second, now_ms)) {
+            nic_load_stats_.erase(it);
+            continue;
+        }
+        result.push_back(it->second);
+    }
+    return result;
+}
+
+auto MasterService::BatchGetNicLoadStatsByEndpoints(
+    const std::vector<std::string>& endpoints)
+    -> tl::expected<std::vector<ClientNicLoadStats>, ErrorCode> {
+    const uint64_t now_ms = NicLoadNowMs();
+
+    std::vector<std::pair<std::string, UUID>> endpoint_clients;
+    endpoint_clients.reserve(endpoints.size());
+    {
+        std::lock_guard<std::mutex> index_lock(endpoint_index_mutex_);
+        if (now_ms >= endpoint_index_built_at_ms_ + kEndpointIndexTtlMs) {
+            auto segment_access = segment_manager_.getSegmentAccess();
+            std::vector<std::pair<Segment, UUID>> all_segments;
+            auto err = segment_access.GetAllSegments(all_segments);
+            if (err != ErrorCode::OK) {
+                return tl::make_unexpected(err);
+            }
+
+            // Map endpoint strings to client IDs (first-wins on duplicates).
+            endpoint_to_client_.clear();
+            endpoint_to_client_.reserve(all_segments.size() * 2);
+            for (const auto& [segment, client_id] : all_segments) {
+                if (!segment.name.empty()) {
+                    endpoint_to_client_.emplace(segment.name, client_id);
+                }
+                if (!segment.te_endpoint.empty()) {
+                    endpoint_to_client_.emplace(segment.te_endpoint, client_id);
+                }
+            }
+            endpoint_index_built_at_ms_ = now_ms;
+        }
+
+        for (const auto& endpoint : endpoints) {
+            auto it = endpoint_to_client_.find(endpoint);
+            if (it != endpoint_to_client_.end()) {
+                endpoint_clients.emplace_back(endpoint, it->second);
+            }
+        }
+    }
+
+    std::vector<ClientNicLoadStats> result;
+    result.reserve(endpoint_clients.size());
+    std::lock_guard<std::mutex> lock(nic_load_stats_mutex_);
+    for (const auto& [endpoint, client_id] : endpoint_clients) {
+        auto it = nic_load_stats_.find(client_id);
+        if (it == nic_load_stats_.end()) {
+            continue;
+        }
+        if (IsNicLoadEntryStale(it->second, now_ms)) {
+            nic_load_stats_.erase(it);
+            continue;
+        }
+        auto snapshot = it->second;
+        snapshot.endpoint = endpoint;
+        result.push_back(std::move(snapshot));
+    }
+    return result;
+}
+
 auto MasterService::NotifyOffloadSuccess(
     const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
     const std::vector<StorageObjectMetadata>& metadatas)
