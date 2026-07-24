@@ -592,12 +592,11 @@ jobs:
         python-version: ['3.10', '3.12']
     env:
       CI: "true"
-      BUILD_WITH_EP: "1"
       TORCH_CUDA_ARCH_LIST: "8.0;9.0"
       SCCACHE_GHA_ENABLED: "true"
       PIP_NO_CACHE_DIR: "1"
       MAX_JOBS: "2"
-      EP_TORCH_VERSIONS: "2.11.0;2.12.0;2.12.1"
+      EP_TORCH_VERSIONS: "2.11.0;2.12.0;2.12.1;2.13.0"
       CMAKE_RELWITHDEBINFO_FLAGS: "-O2 -DNDEBUG"
 
     steps:
@@ -826,7 +825,7 @@ jobs:
       run: |
         docker build -f docker/mooncake.Dockerfile \
           --build-arg PYTHON_VERSION=3.10 \
-          --build-arg EP_TORCH_VERSIONS="2.12.1" \
+          --build-arg EP_TORCH_VERSIONS="2.13.0" \
           --build-arg CLEAN_BUILD_ARTIFACTS=1 \
           -t mooncake:from-source .
 
