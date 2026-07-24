@@ -5,6 +5,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "cachelib_memory_allocator/MemoryAllocator.h"
 #include "offset_allocator/offset_allocator.h"
@@ -48,6 +49,9 @@ class AllocatedBuffer {
           buffer_ptr_(buffer_ptr),
           size_(size),
           offset_handle_(std::move(offset_handle)) {}
+
+    AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
+                    const Descriptor& descriptor);
 
     ~AllocatedBuffer();
 
@@ -127,6 +131,37 @@ class BufferAllocatorBase {
 };
 
 /**
+ * A no-op buffer allocator used only for keeping standby promotion metadata
+ * alive. It does not actually allocate memory - replicas constructed from
+ * this allocator are invalid for actual I/O but preserve endpoint info.
+ */
+class DummyBufferAllocator final : public BufferAllocatorBase {
+   public:
+    explicit DummyBufferAllocator(std::string segment_name,
+                                  std::string transport_endpoint)
+        : segment_name_(std::move(segment_name)),
+          transport_endpoint_(std::move(transport_endpoint)) {}
+
+    std::unique_ptr<AllocatedBuffer> allocate(size_t size) override {
+        return nullptr;
+    }
+    void deallocate(AllocatedBuffer* handle) override {}
+    size_t capacity() const override { return kAllocatorUnknownFreeSpace; }
+    size_t getLargestFreeRegion() const override {
+        return kAllocatorUnknownFreeSpace;
+    }
+    size_t size() const override { return 0; }
+    std::string getSegmentName() const override { return segment_name_; }
+    std::string getTransportEndpoint() const override {
+        return transport_endpoint_;
+    }
+
+   private:
+    std::string segment_name_;
+    std::string transport_endpoint_;
+};
+
+/**
  * CachelibBufferAllocator manages memory allocation using CacheLib's slab
  * allocation strategy.
  *
@@ -179,6 +214,8 @@ class CachelibBufferAllocator
     }
 
    private:
+    std::unique_ptr<AllocatedBuffer> adoptImportedBuffer(
+        const AllocatedBuffer::Descriptor& descriptor);
     // metadata
     const std::string segment_name_;
     const size_t base_;
@@ -194,7 +231,26 @@ class CachelibBufferAllocator
     size_t header_region_size_;
     std::unique_ptr<facebook::cachelib::MemoryAllocator> memory_allocator_;
     facebook::cachelib::PoolId pool_id_;
+
+    friend struct RestoredCachelibBufferAllocator;
+    friend std::optional<struct RestoredCachelibBufferAllocator>
+    RestoreCachelibBufferAllocator(
+        std::string segment_name, size_t base, size_t size,
+        std::string transport_endpoint,
+        const std::vector<AllocatedBuffer::Descriptor>& descriptors,
+        ReplicaType replica_type);
 };
+
+struct RestoredCachelibBufferAllocator {
+    std::shared_ptr<CachelibBufferAllocator> allocator;
+    std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
+};
+
+std::optional<RestoredCachelibBufferAllocator> RestoreCachelibBufferAllocator(
+    std::string segment_name, size_t base, size_t size,
+    std::string transport_endpoint,
+    const std::vector<AllocatedBuffer::Descriptor>& descriptors,
+    ReplicaType replica_type = ReplicaType::MEMORY);
 
 /**
  * OffsetBufferAllocator manages memory allocation using the OffsetAllocator
@@ -245,8 +301,32 @@ class OffsetBufferAllocator
     // offset allocator implementation
     std::shared_ptr<offset_allocator::OffsetAllocator> offset_allocator_;
 
+    // Keeps address gaps occupied after descriptor-based reconstruction.
+    std::vector<std::unique_ptr<AllocatedBuffer>> restored_gap_buffers_;
+
     friend class Serializer<OffsetBufferAllocator>;
+    friend struct RestoredOffsetBufferAllocator;
+    friend std::optional<struct RestoredOffsetBufferAllocator>
+    RestoreOffsetBufferAllocator(
+        std::string segment_name, size_t base, size_t size,
+        std::string transport_endpoint,
+        const std::vector<AllocatedBuffer::Descriptor>& descriptors,
+        ReplicaType replica_type);
 };
+
+struct RestoredOffsetBufferAllocator {
+    std::shared_ptr<OffsetBufferAllocator> allocator;
+    std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
+};
+
+// Reconstructs an empty OffsetBufferAllocator from final live descriptors.
+// The returned buffers follow descriptor input order. No state is exposed on
+// validation or allocation failure.
+std::optional<RestoredOffsetBufferAllocator> RestoreOffsetBufferAllocator(
+    std::string segment_name, size_t base, size_t size,
+    std::string transport_endpoint,
+    const std::vector<AllocatedBuffer::Descriptor>& descriptors,
+    ReplicaType replica_type = ReplicaType::MEMORY);
 
 // The main difference is that it allocates real memory and returns it, while
 // BufferAllocator allocates an address

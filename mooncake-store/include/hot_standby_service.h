@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -14,9 +15,7 @@
 
 #include "metadata_store.h"
 #include "ha/oplog/oplog_applier.h"
-#include "ha/oplog/oplog_manager.h"
-#include "ha/oplog/oplog_replicator.h"
-#include "ha/oplog/oplog_store_factory.h"
+#include "ha/oplog/oplog_types.h"
 #include "ha/snapshot/snapshot_provider.h"
 #include "standby_state_machine.h"
 #include "types.h"
@@ -25,7 +24,9 @@ namespace mooncake {
 
 // Forward declarations
 class MasterService;
-class ReplicationStream;
+class HaKvBackend;
+class OpLogBatchStandbyReader;
+enum class OpLogBatchStandbyPollDisposition;
 
 /**
  * @brief Configuration for HotStandbyService
@@ -47,10 +48,8 @@ struct HotStandbyConfig {
     // state.
     bool enable_oplog_following{true};
 
-    // OpLog store configuration
-    OpLogStoreType oplog_store_type{kDefaultOpLogStoreType};
-    std::string oplog_store_root_dir{kDefaultOpLogRootDir};
-    int oplog_poll_interval_ms{kDefaultOpLogPollIntervalMs};
+    int oplog_poll_interval_ms{1000};
+    uint32_t batch_oplog_retry_timeout_sec{180};
 };
 
 /**
@@ -65,6 +64,7 @@ struct StandbySyncStatus {
     bool is_connected{false};
     StandbyState state{StandbyState::STOPPED};
     std::chrono::milliseconds time_in_state{0};
+    ErrorCode last_error{ErrorCode::OK};
 };
 
 /**
@@ -128,6 +128,17 @@ class HotStandbyService {
     ErrorCode Promote();
 
     /**
+     * @brief Promote this standby to Primary and export a snapshot atomically.
+     *
+     * Holds mutex_ through the entire promotion + export process, ensuring
+     * the snapshot is captured before any state is released.
+     *
+     * @param out Output parameter to receive the snapshot
+     * @return ErrorCode::OK on success, other codes on failure
+     */
+    ErrorCode PromoteAndExportSnapshot(StandbySnapshot& out);
+
+    /**
      * @brief Get the number of metadata entries in the local store
      */
     size_t GetMetadataCount() const;
@@ -136,7 +147,7 @@ class HotStandbyService {
      * @brief Get the latest applied sequence ID after promotion
      *
      * This should be called after Promote() to get the sequence_id
-     * that the new Primary's OpLogManager should start from.
+     * that the new Primary's ordered writer should start from.
      *
      * @return Latest applied sequence ID, or 0 if not available
      */
@@ -145,8 +156,18 @@ class HotStandbyService {
     // Export a point-in-time snapshot of all replicated metadata.
     // This is used by MasterServiceSupervisor to initialize the new Primary
     // after leader election (fast recovery).
-    bool ExportMetadataSnapshot(
-        std::vector<std::pair<std::string, StandbyObjectMetadata>>& out) const;
+    bool ExportMetadataSnapshot(std::vector<StandbyObjectEntry>& out) const;
+
+    /**
+     * Export complete standby snapshot including:
+     * - Applied OpLog sequence ID
+     * - All object metadata
+     * - All registered segments (via OpLogApplier's segment registry)
+     *
+     * @param out Output parameter to receive the snapshot
+     * @return true on success, false on failure (e.g., service not running)
+     */
+    bool ExportStandbySnapshot(StandbySnapshot& out) const;
 
     // Inject a snapshot provider (from external snapshot implementation).
     void SetSnapshotProvider(std::unique_ptr<SnapshotProvider> provider);
@@ -154,6 +175,13 @@ class HotStandbyService {
     // Notify callers when standby sync status changes. The callback is invoked
     // from existing standby worker threads; no extra monitor thread is created.
     void SetSyncStatusCallback(SyncStatusCallback callback);
+
+    /**
+     * @brief Test seam: when set, promotion final catch-up first tries
+     *        batch-record durable prefix/batches from this backend.
+     */
+    void SetCatchUpBatchKvBackendForTesting(
+        std::shared_ptr<HaKvBackend> backend);
 
     /**
      * @brief Get current state from state machine
@@ -167,20 +195,22 @@ class HotStandbyService {
         return state_machine_;
     }
 
-    /**
-     * @brief Callback for OpLogReplicator state changes
-     * @param event The event to process
-     */
-    void OnWatcherEvent(StandbyEvent event);
-
    private:
     ErrorCode PrepareBootstrapBaselineLocked(uint64_t& baseline_seq_id);
     ErrorCode LoadSnapshotBaselineLocked(uint64_t& baseline_seq_id);
     ErrorCode StartOplogFollowingLocked(uint64_t baseline_seq_id);
     void ActivateSnapshotOnlyStandbyLocked(uint64_t baseline_seq_id);
     uint64_t GetLocalLastAppliedSequenceIdLocked() const;
-    void ResolvePromotionGapsLocked();
     ErrorCode FinalCatchUpForPromotionLocked(uint64_t current_applied_seq_id);
+    ErrorCode FinalCatchUpBatchRecordsLocked(HaKvBackend& backend);
+    void StopReplicationLoop();
+
+    // Shared body for Promote() and PromoteAndExportSnapshot(): runs the
+    // promotion sequence machine transitions + gap resolution + final
+    // catch-up + post catch-up gap check + success transition. Returns
+    // ErrorCode::OK on success or any fail-closed error code.
+    ErrorCode PromoteLockedInternal(uint64_t current_applied_seq_id);
+
     void NotifySyncStatus();
 
     /**
@@ -193,54 +223,35 @@ class HotStandbyService {
      */
     void VerificationLoop();
 
-    /**
-     * @brief Apply a single OpLog entry to local metadata store
-     * @param entry The OpLog entry to apply
-     * @deprecated Use OpLogApplier instead
-     */
-    void ApplyOpLogEntry(const OpLogEntry& entry);
-
-    /**
-     * @brief Connect to Primary and establish replication stream
-     * @return true on success, false on failure
-     */
-    bool ConnectToPrimary();
-
-    /**
-     * @brief Disconnect from Primary
-     */
-    void DisconnectFromPrimary();
-
-    /**
-     * @brief Process a batch of OpLog entries received from Primary
-     * @param entries Batch of OpLog entries
-     */
-    void ProcessOpLogBatch(const std::vector<OpLogEntry>& entries);
-
     HotStandbyConfig config_;
 
     // Simple in-memory metadata store implementation
     class StandbyMetadataStore : public MetadataStore {
        public:
-        bool PutMetadata(const std::string& key,
+        bool PutMetadata(const std::string& tenant_id, const std::string& key,
                          const StandbyObjectMetadata& metadata) override;
         bool Put(const std::string& key,
                  const std::string& payload = std::string()) override;
         std::optional<StandbyObjectMetadata> GetMetadata(
+            const std::string& tenant_id,
             const std::string& key) const override;
-        bool Remove(const std::string& key) override;
-        bool Exists(const std::string& key) const override;
+        bool Remove(const std::string& tenant_id,
+                    const std::string& key) override;
+        bool Exists(const std::string& tenant_id,
+                    const std::string& key) const override;
+        size_t GetKeyCountForTenant(
+            const std::string& tenant_id) const override;
         size_t GetKeyCount() const override;
         void Clear();
 
         // Snapshot for promotion/restore.
-        void Snapshot(
-            std::vector<std::pair<std::string, StandbyObjectMetadata>>& out)
-            const;
+        void Snapshot(std::vector<StandbyObjectEntry>& out) const;
 
        private:
         mutable std::mutex mutex_;
-        std::unordered_map<std::string, StandbyObjectMetadata> store_;
+        std::unordered_map<
+            std::string, std::unordered_map<std::string, StandbyObjectMetadata>>
+            store_;
     };
     std::unique_ptr<StandbyMetadataStore> metadata_store_;
     std::unique_ptr<SnapshotProvider> snapshot_provider_{
@@ -248,18 +259,19 @@ class HotStandbyService {
 
     // OpLog replication components
     std::unique_ptr<OpLogApplier> oplog_applier_;
-    std::shared_ptr<OpLogStore> watcher_oplog_store_;
-    std::unique_ptr<OpLogChangeNotifier> oplog_change_notifier_;
-    std::unique_ptr<OpLogReplicator> oplog_replicator_;
+    std::shared_ptr<HaKvBackend> batch_standby_kv_backend_;
+    std::unique_ptr<OpLogBatchStandbyReader> batch_standby_reader_;
+
+    std::shared_ptr<HaKvBackend> catch_up_batch_kv_backend_for_testing_;
 
     // Configuration for OpLog sync
     std::string oplog_endpoints_;
     std::string cluster_id_;
 
     // Replication state
-    std::shared_ptr<ReplicationStream> replication_stream_;
     std::atomic<uint64_t> applied_seq_id_{0};
     std::atomic<uint64_t> primary_seq_id_{0};
+    std::atomic<ErrorCode> last_error_{ErrorCode::OK};
 
     // State machine for managing service lifecycle
     StandbyStateMachine state_machine_;
@@ -271,6 +283,9 @@ class HotStandbyService {
     // Background threads
     std::thread replication_thread_;
     std::thread verification_thread_;
+    std::atomic<bool> replication_loop_running_{false};
+    std::mutex replication_loop_mutex_;
+    std::condition_variable replication_loop_cv_;
 
     // Synchronization
     mutable std::mutex mutex_;

@@ -155,6 +155,94 @@ ErrorCode ClientTestWrapper::Delete(const std::string& key) {
     return remove_result.has_value() ? ErrorCode::OK : remove_result.error();
 }
 
+ErrorCode ClientTestWrapper::BatchSmoke(const std::string& key_prefix) {
+    constexpr size_t kCount = 3;
+    std::vector<std::string> keys;
+    std::vector<std::string> values;
+    std::vector<std::unique_ptr<SliceGuard>> put_guards;
+    std::vector<std::vector<Slice>> put_slices;
+    for (size_t i = 0; i < kCount; ++i) {
+        keys.push_back(key_prefix + "-" + std::to_string(i));
+        values.push_back("batch-value-" + std::to_string(i));
+        auto guard =
+            std::make_unique<SliceGuard>(values.back().size(), allocator_);
+        size_t offset = 0;
+        for (const auto& slice : guard->slices_) {
+            memcpy(slice.ptr, values.back().data() + offset, slice.size);
+            offset += slice.size;
+        }
+        put_slices.push_back(guard->slices_);
+        put_guards.push_back(std::move(guard));
+    }
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto put_results = client_->BatchPut(keys, put_slices, config);
+    if (put_results.size() != kCount) return ErrorCode::INTERNAL_ERROR;
+    for (const auto& result : put_results) {
+        if (!result) return result.error();
+    }
+
+    std::vector<std::string> mixed_keys = keys;
+    mixed_keys.push_back(key_prefix + "-missing");
+    auto exist_results = client_->BatchIsExist(mixed_keys);
+    if (exist_results.size() != mixed_keys.size()) {
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    for (size_t i = 0; i < kCount; ++i) {
+        if (!exist_results[i] || !*exist_results[i]) {
+            return ErrorCode::INTERNAL_ERROR;
+        }
+    }
+    if (!exist_results.back() || *exist_results.back()) {
+        return ErrorCode::INTERNAL_ERROR;
+    }
+
+    std::vector<std::unique_ptr<SliceGuard>> get_guards;
+    std::unordered_map<std::string, std::vector<Slice>> get_slices;
+    for (size_t i = 0; i < mixed_keys.size(); ++i) {
+        const size_t size = i < kCount ? values[i].size() : 1;
+        auto guard = std::make_unique<SliceGuard>(size, allocator_);
+        get_slices.emplace(mixed_keys[i], guard->slices_);
+        get_guards.push_back(std::move(guard));
+    }
+    auto get_results = client_->BatchGet(mixed_keys, get_slices);
+    if (get_results.size() != mixed_keys.size()) {
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    for (size_t i = 0; i < kCount; ++i) {
+        if (!get_results[i]) return get_results[i].error();
+        std::string actual;
+        for (const auto& slice : get_slices.at(keys[i])) {
+            actual.append(static_cast<const char*>(slice.ptr), slice.size);
+        }
+        if (actual != values[i]) return ErrorCode::INTERNAL_ERROR;
+    }
+    if (get_results.back() ||
+        get_results.back().error() != ErrorCode::OBJECT_NOT_FOUND) {
+        return ErrorCode::INTERNAL_ERROR;
+    }
+
+    auto remove_results = client_->BatchRemove(mixed_keys, /*force=*/true);
+    if (remove_results.size() != mixed_keys.size()) {
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    for (size_t i = 0; i < kCount; ++i) {
+        if (!remove_results[i]) return remove_results[i].error();
+    }
+    if (remove_results.back() ||
+        remove_results.back().error() != ErrorCode::OBJECT_NOT_FOUND) {
+        return ErrorCode::INTERNAL_ERROR;
+    }
+
+    exist_results = client_->BatchIsExist(keys);
+    if (exist_results.size() != kCount) return ErrorCode::INTERNAL_ERROR;
+    for (const auto& result : exist_results) {
+        if (!result || *result) return ErrorCode::INTERNAL_ERROR;
+    }
+    return ErrorCode::OK;
+}
+
 bool ClientTestWrapper::HasDiskReplica(const std::string& key) {
     auto query_result = client_->Query(key);
     if (!query_result.has_value()) return false;

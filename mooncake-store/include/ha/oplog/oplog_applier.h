@@ -1,21 +1,14 @@
 #pragma once
 
-#include <chrono>
 #include <atomic>
 #include <cstdint>
-#include <map>
-#include <memory>
-#include <mutex>
 #include <string>
 #include <vector>
 
-#include "ha/oplog/oplog_manager.h"
+#include "ha/oplog/oplog_types.h"
 #include "metadata_store.h"
 
 namespace mooncake {
-
-// Forward declaration
-class OpLogStore;
 
 /**
  * @brief Apply OpLog entries to Standby metadata store with ordering guarantee
@@ -29,20 +22,11 @@ class OpLogApplier {
      * @brief Constructor
      * @param metadata_store Metadata store to apply changes to
      * @param cluster_id Cluster ID (for validation only)
-     * @param oplog_store Optional OpLogStore for requesting missing OpLog
-     *                    entries (caller owns the pointer)
      */
     explicit OpLogApplier(MetadataStore* metadata_store,
-                          const std::string& cluster_id = std::string(),
-                          OpLogStore* oplog_store = nullptr);
+                          const std::string& cluster_id = std::string());
 
     ~OpLogApplier() = default;
-
-    /**
-     * @brief Set or replace the OpLogStore used for requesting missing entries
-     * @param oplog_store OpLogStore pointer (caller owns the pointer)
-     */
-    void SetOpLogStore(OpLogStore* oplog_store) { oplog_store_ = oplog_store; }
 
     /**
      * @brief Apply a single OpLog entry (with ordering checks)
@@ -70,35 +54,18 @@ class OpLogApplier {
      */
     void Recover(uint64_t last_applied_sequence_id);
 
-    /**
-     * @brief Process pending entries (entries with non-continuous sequence IDs)
-     * @return Number of entries processed
-     */
-    size_t ProcessPendingEntries();
+    const StandbySegmentRegistry& GetSegmentRegistry() const;
+    void ApplySegmentMount(const OpLogEntry& entry);
+    void ApplySegmentUnmount(const OpLogEntry& entry);
+    void ApplySegmentUpdate(const OpLogEntry& entry);
 
-    // Promotion helper:
-    // Try to resolve current gaps ONCE (no waiting) by fetching missing/skipped
-    // sequence_ids from etcd. If an entry arrives late:
-    // - REMOVE / PUT_REVOKE: delete the key
-    // - PUT_END: discard
-    //
-    // This is used during Standby promotion so we don't block promotion on
-    // gaps, but still best-effort clean up potentially stale metadata.
-    struct GapResolveResult {
-        size_t attempted{0};
-        size_t fetched{0};
-        size_t applied_deletes{0};
-    };
-    GapResolveResult TryResolveGapsOnceForPromotion(size_t max_ids = 1024);
+    /**
+     * @brief Load segment registry from snapshot baseline.
+     * Clears existing registry and replaces with given segments.
+     */
+    void LoadSegmentRegistry(const std::vector<StandbySegmentInfo>& segments);
 
    private:
-    /**
-     * @brief Check if the entry's sequence order is valid
-     * @param entry OpLog entry
-     * @return true if order is valid, false otherwise
-     */
-    bool CheckSequenceOrder(const OpLogEntry& entry);
-
     /**
      * @brief Apply PUT_END operation
      * @param entry OpLog entry
@@ -117,49 +84,16 @@ class OpLogApplier {
      */
     void ApplyRemove(const OpLogEntry& entry);
 
-    /**
-     * @brief Request missing OpLog entry from the store
-     * @param missing_seq_id Missing sequence ID
-     * @return true if entry was found and applied, false otherwise
-     */
-    bool RequestMissingOpLog(uint64_t missing_seq_id);
-
     MetadataStore* metadata_store_;
 
-    // OpLogStore for requesting missing OpLog entries (optional, not owned)
     std::string cluster_id_;
-    OpLogStore* oplog_store_{nullptr};
-
-    // Note: key_sequence_map_ has been removed.
-    // Global sequence_id is sufficient for ordering guarantee.
-
-    // Track pending entries (entries with non-continuous sequence IDs)
-    mutable std::mutex pending_mutex_;
-    std::map<uint64_t, OpLogEntry> pending_entries_;
-
-    // Track missing sequence IDs that we're waiting for
-    std::map<uint64_t, std::chrono::steady_clock::time_point>
-        missing_sequence_ids_;
-
-    // Sequence IDs we chose to skip (gap-timeout). If the late entry arrives:
-    // - REMOVE / PUT_REVOKE: delete the key (safe)
-    // - PUT_END: discard (do not resurrect potentially stale metadata)
-    std::map<uint64_t, std::chrono::steady_clock::time_point>
-        skipped_sequence_ids_;
 
     // Next expected global sequence_id. Read frequently from monitoring thread,
     // updated by watch/apply thread. Use atomic to avoid data races.
     std::atomic<uint64_t> expected_sequence_id_{1};
 
-    // Constants for missing entry handling
-    // IMPORTANT: request must happen BEFORE skip, otherwise we will never
-    // request.
-    static constexpr int kMissingEntryRequestSeconds =
-        1;  // request from etcd after 1s
-    static constexpr int kMissingEntrySkipSeconds =
-        3;  // skip after 3s (avoid global stall)
-    static constexpr int kMaxPendingEntries =
-        1000;  // Max pending entries before giving up
+    // Standby segment registry
+    StandbySegmentRegistry segment_registry_;
 };
 
 }  // namespace mooncake

@@ -31,6 +31,8 @@ std::unique_ptr<HotStandbyService> CreateStandbyService(
         .enable_verification = false,
         .enable_snapshot_bootstrap = config.enable_snapshot_restore,
         .enable_oplog_following = capabilities.has_oplog_following,
+        .oplog_poll_interval_ms = config.oplog_poll_interval_ms,
+        .batch_oplog_retry_timeout_sec = config.batch_oplog_retry_timeout_sec,
     });
 }
 
@@ -38,7 +40,8 @@ StandbyRuntimeCapabilities BuildStandbyRuntimeCapabilities(
     const HABackendSpec& spec, const MasterServiceSupervisorConfig& config) {
     StandbyRuntimeCapabilities capabilities;
     capabilities.has_snapshot_bootstrap = config.enable_snapshot_restore;
-    capabilities.has_oplog_following = spec.type == HABackendType::ETCD;
+    capabilities.has_oplog_following =
+        config.enable_oplog && spec.type == HABackendType::ETCD;
     return capabilities;
 }
 
@@ -77,6 +80,11 @@ class NoopStandbyController final : public StandbyController {
     void StopStandby() override {}
 
     ErrorCode PromoteStandby() override { return ErrorCode::OK; }
+
+    tl::expected<PromotionContext, ErrorCode> PromoteStandbyAndExport()
+        override {
+        return tl::unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
 
     void UpdateObservedLeader(const std::optional<MasterView>&) override {}
 
@@ -125,9 +133,20 @@ class CapabilityDrivenStandbyController final : public StandbyController {
         }
 
         standby_service_->SetSyncStatusCallback(
-            [this](const StandbySyncStatus&) {
+            [this](const StandbySyncStatus& status) {
+                if (status.state == StandbyState::FAILED ||
+                    status.state == StandbyState::STOPPED) {
+                    std::lock_guard<std::mutex> lock(state_mutex_);
+                    standby_running_ = false;
+                    last_standby_error_ = status.last_error;
+                }
                 NotifyRuntimeStateIfChanged();
             });
+    }
+
+    ~CapabilityDrivenStandbyController() override {
+        standby_service_->SetSyncStatusCallback({});
+        standby_service_->Stop();
     }
 
     ErrorCode StartStandby(
@@ -155,8 +174,17 @@ class CapabilityDrivenStandbyController final : public StandbyController {
 
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
-            standby_running_ = err == ErrorCode::OK;
-            last_standby_error_ = err;
+            const StandbySyncStatus status = standby_service_->GetSyncStatus();
+            standby_running_ = err == ErrorCode::OK &&
+                               status.state != StandbyState::FAILED &&
+                               status.state != StandbyState::STOPPED;
+            if (standby_running_) {
+                last_standby_error_ = ErrorCode::OK;
+            } else if (status.last_error != ErrorCode::OK) {
+                last_standby_error_ = status.last_error;
+            } else {
+                last_standby_error_ = err;
+            }
         }
         if (err == ErrorCode::OK) {
             NotifyRuntimeStateIfChanged();
@@ -165,13 +193,6 @@ class CapabilityDrivenStandbyController final : public StandbyController {
     }
 
     void StopStandby() override {
-        {
-            std::lock_guard<std::mutex> lock(state_mutex_);
-            if (!standby_running_) {
-                return;
-            }
-        }
-
         standby_service_->Stop();
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
@@ -207,6 +228,50 @@ class CapabilityDrivenStandbyController final : public StandbyController {
         }
         NotifyRuntimeStateIfChanged();
         return err;
+    }
+
+    tl::expected<PromotionContext, ErrorCode> PromoteStandbyAndExport()
+        override {
+        // Verify standby is running first (same check as PromoteStandby)
+        ErrorCode promote_error = ErrorCode::OK;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            if (!standby_running_) {
+                promote_error = last_standby_error_ != ErrorCode::OK
+                                    ? last_standby_error_
+                                    : ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+            }
+        }
+        if (promote_error != ErrorCode::OK) {
+            return tl::unexpected(promote_error);
+        }
+
+        // Atomic promote + export (final catch-up happens inside)
+        StandbySnapshot snapshot;
+        ErrorCode err = standby_service_->PromoteAndExportSnapshot(snapshot);
+        if (err != ErrorCode::OK) {
+            {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                standby_running_ = false;
+                last_standby_error_ = err;
+            }
+            NotifyRuntimeStateIfChanged();
+            return tl::unexpected(err);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            standby_running_ = false;
+            last_standby_error_ = ErrorCode::OK;
+        }
+        NotifyRuntimeStateIfChanged();
+
+        PromotionContext ctx;
+        ctx.applied_seq_id = snapshot.oplog_sequence_id;
+        ctx.objects = std::move(snapshot.objects);
+        ctx.segments = std::move(snapshot.segments);
+
+        return ctx;
     }
 
     void UpdateObservedLeader(

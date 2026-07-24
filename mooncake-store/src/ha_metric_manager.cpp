@@ -77,6 +77,45 @@ HAMetricManager::HAMetricManager()
           "Latency of OpLog entry application in microseconds",
           {10, 50, 100, 500, 1000, 5000, 10000, 50000, 100000}),
 
+      batch_record_durable_batches_total_(
+          "ha_batch_record_durable_batches_total",
+          "Total durable batch-record OpLog batches"),
+      batch_record_durable_entries_total_(
+          "ha_batch_record_durable_entries_total",
+          "Total durable entries in batch-record OpLog batches"),
+      batch_record_retry_total_("ha_batch_record_retry_total",
+                                "Total batch-record backend retries"),
+      batch_record_committed_queue_depth_(
+          "ha_batch_record_committed_queue_depth",
+          "Committed batch-record entries waiting for durability"),
+      batch_record_callback_queue_depth_(
+          "ha_batch_record_callback_queue_depth",
+          "Durable batch-record callbacks waiting to run"),
+      batch_record_last_batch_id_("ha_batch_record_last_batch_id",
+                                  "Latest durable batch-record batch ID"),
+      batch_record_durable_sequence_(
+          "ha_batch_record_durable_sequence",
+          "Latest durable batch-record OpLog sequence"),
+      batch_record_batch_entries_("ha_batch_record_batch_entries",
+                                  "Entries per durable batch-record batch",
+                                  {1, 8, 32, 64, 128, 256, 512, 1024, 4096}),
+      batch_record_batch_bytes_(
+          "ha_batch_record_batch_bytes",
+          "Encoded bytes per durable batch-record batch",
+          {256, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304}),
+      batch_record_txn_latency_us_(
+          "ha_batch_record_txn_latency_us",
+          "Batch-record backend transaction latency in microseconds",
+          {100, 500, 1000, 5000, 10000, 50000, 100000, 500000, 1000000}),
+      batch_record_commit_to_durable_us_(
+          "ha_batch_record_commit_to_durable_us",
+          "Batch-record commit-to-durable latency in microseconds",
+          {100, 500, 1000, 5000, 10000, 50000, 100000, 500000, 1000000}),
+      batch_record_callback_latency_us_(
+          "ha_batch_record_callback_latency_us",
+          "Batch-record durable-to-callback queue latency in microseconds",
+          {10, 50, 100, 500, 1000, 5000, 10000, 50000, 100000}),
+
       // State Machine
       standby_state_(
           "ha_standby_state",
@@ -92,6 +131,12 @@ HAMetricManager::HAMetricManager()
     oplog_standby_lag_.update(0);
     oplog_pending_entries_.update(0);
     pending_mutation_queue_size_.update(0);
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+    batch_record_committed_queue_depth_.update(0);
+    batch_record_callback_queue_depth_.update(0);
+    batch_record_last_batch_id_.update(0);
+    batch_record_durable_sequence_.update(0);
+#endif
     standby_state_.update(0);
 }
 
@@ -237,6 +282,84 @@ void HAMetricManager::observe_oplog_apply_latency_us(int64_t latency_us) {
     oplog_apply_latency_us_.observe(latency_us);
 }
 
+void HAMetricManager::inc_batch_record_durable_batches(int64_t val) {
+    batch_record_durable_batches_total_.inc(val);
+}
+
+int64_t HAMetricManager::get_batch_record_durable_batches_total() {
+    return static_cast<int64_t>(batch_record_durable_batches_total_.value());
+}
+
+void HAMetricManager::inc_batch_record_durable_entries(int64_t val) {
+    batch_record_durable_entries_total_.inc(val);
+}
+
+int64_t HAMetricManager::get_batch_record_durable_entries_total() {
+    return static_cast<int64_t>(batch_record_durable_entries_total_.value());
+}
+
+void HAMetricManager::inc_batch_record_retries(int64_t val) {
+    batch_record_retry_total_.inc(val);
+}
+
+int64_t HAMetricManager::get_batch_record_retries_total() {
+    return static_cast<int64_t>(batch_record_retry_total_.value());
+}
+
+void HAMetricManager::set_batch_record_committed_queue_depth(int64_t depth) {
+    batch_record_committed_queue_depth_.update(depth);
+}
+
+int64_t HAMetricManager::get_batch_record_committed_queue_depth() {
+    return static_cast<int64_t>(batch_record_committed_queue_depth_.value());
+}
+
+void HAMetricManager::set_batch_record_callback_queue_depth(int64_t depth) {
+    batch_record_callback_queue_depth_.update(depth);
+}
+
+int64_t HAMetricManager::get_batch_record_callback_queue_depth() {
+    return static_cast<int64_t>(batch_record_callback_queue_depth_.value());
+}
+
+void HAMetricManager::set_batch_record_last_batch_id(int64_t batch_id) {
+    batch_record_last_batch_id_.update(batch_id);
+}
+
+int64_t HAMetricManager::get_batch_record_last_batch_id() {
+    return static_cast<int64_t>(batch_record_last_batch_id_.value());
+}
+
+void HAMetricManager::set_batch_record_durable_sequence(int64_t sequence_id) {
+    batch_record_durable_sequence_.update(sequence_id);
+}
+
+int64_t HAMetricManager::get_batch_record_durable_sequence() {
+    return static_cast<int64_t>(batch_record_durable_sequence_.value());
+}
+
+void HAMetricManager::observe_batch_record_batch_entries(int64_t entries) {
+    batch_record_batch_entries_.observe(entries);
+}
+
+void HAMetricManager::observe_batch_record_batch_bytes(int64_t bytes) {
+    batch_record_batch_bytes_.observe(bytes);
+}
+
+void HAMetricManager::observe_batch_record_txn_latency_us(int64_t latency_us) {
+    batch_record_txn_latency_us_.observe(latency_us);
+}
+
+void HAMetricManager::observe_batch_record_commit_to_durable_us(
+    int64_t latency_us) {
+    batch_record_commit_to_durable_us_.observe(latency_us);
+}
+
+void HAMetricManager::observe_batch_record_callback_latency_us(
+    int64_t latency_us) {
+    batch_record_callback_latency_us_.observe(latency_us);
+}
+
 // ========== State Machine Metrics ==========
 
 void HAMetricManager::set_standby_state(int64_t state_value) {
@@ -273,6 +396,12 @@ std::string HAMetricManager::serialize_metrics() {
     serialize_metric(oplog_standby_lag_);
     serialize_metric(oplog_pending_entries_);
     serialize_metric(pending_mutation_queue_size_);
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+    serialize_metric(batch_record_committed_queue_depth_);
+    serialize_metric(batch_record_callback_queue_depth_);
+    serialize_metric(batch_record_last_batch_id_);
+    serialize_metric(batch_record_durable_sequence_);
+#endif
     serialize_metric(standby_state_);
 
     // Counters
@@ -284,11 +413,26 @@ std::string HAMetricManager::serialize_metrics() {
     serialize_metric(oplog_etcd_write_retries_total_);
     serialize_metric(oplog_watch_disconnections_total_);
     serialize_metric(oplog_applied_entries_total_);
+    serialize_metric(oplog_dropped_put_end_total_);
+    serialize_metric(oplog_batch_commits_total_);
+    serialize_metric(oplog_sync_batch_commits_total_);
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+    serialize_metric(batch_record_durable_batches_total_);
+    serialize_metric(batch_record_durable_entries_total_);
+    serialize_metric(batch_record_retry_total_);
+#endif
     serialize_metric(state_transitions_total_);
 
     // Histograms
     serialize_metric(oplog_etcd_write_latency_us_);
     serialize_metric(oplog_apply_latency_us_);
+#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+    serialize_metric(batch_record_batch_entries_);
+    serialize_metric(batch_record_batch_bytes_);
+    serialize_metric(batch_record_txn_latency_us_);
+    serialize_metric(batch_record_commit_to_durable_us_);
+    serialize_metric(batch_record_callback_latency_us_);
+#endif
 
     return ss.str();
 }

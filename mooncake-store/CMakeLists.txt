@@ -71,6 +71,10 @@ include_directories(
 # Add subdirectories
 add_subdirectory(src)
 
+if (STORE_USE_ETCD)
+    add_subdirectory(tools)
+endif()
+
 if (BUILD_UNIT_TESTS)
     add_subdirectory(tests)
 endif()

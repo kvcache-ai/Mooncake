@@ -350,6 +350,10 @@ enum class ErrorCode : int32_t {
         -1004,  ///< OpLog entry not found (backend-agnostic).
     K8S_LEASE_OPERATION_ERROR = -1005,  ///< K8s Lease operation failed.
     K8S_LEASE_NOT_FOUND = -1006,        ///< K8s Lease not found.
+    INCOMPLETE_OPLOG_CATCH_UP =
+        -1007,  ///< Promotion catch-up could not prove all durable OpLog
+                ///< entries were applied, or unresolved skipped/missing
+                ///< gaps remain after final catch-up + second gap resolution.
     UNAVAILABLE_IN_CURRENT_STATUS =
         -1010,  ///< Request cannot be done in current status.
     UNAVAILABLE_IN_CURRENT_MODE =

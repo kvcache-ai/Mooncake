@@ -26,6 +26,13 @@ cluster_id: "mooncake_cluster"
 memory_allocator: "offset"
 client_live_ttl_sec: 60
 
+# OpLog store configuration for HA hot-standby replication
+enable_oplog: false
+# Batch standby base polling/retry delay in milliseconds
+oplog_poll_interval_ms: 1000
+# Maximum consecutive retryable batch-standby failure window in seconds
+batch_oplog_retry_timeout_sec: 180
+
 enable_http_metadata_server: false
 http_metadata_server_host: "0.0.0.0"
 http_metadata_server_port: 8080

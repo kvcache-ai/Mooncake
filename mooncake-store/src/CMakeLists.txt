@@ -47,6 +47,7 @@ set(MOONCAKE_STORE_SOURCES
     ha/common/redis/redis_connection.cpp
     ha/leadership/backends/redis/redis_leader_coordinator.cpp
     ha/leadership/master_service_supervisor.cpp
+    ha/kv/etcd_ha_kv_backend.cpp
     ha/standby_controller.cpp
     ha/snapshot/catalog_backed_snapshot_provider.cpp
     ha/snapshot/master_snapshot_codec.cpp
@@ -59,16 +60,16 @@ set(MOONCAKE_STORE_SOURCES
     utils/file_util.cpp
     task_manager.cpp
     local_hot_cache.cpp
-    ha/oplog/oplog_manager.cpp
-    ha/oplog/etcd_oplog_store.cpp
-    ha/oplog/etcd_oplog_change_notifier.cpp
-    ha/oplog/oplog_serializer.cpp
-    ha/oplog/oplog_store_factory.cpp
-    ha/oplog/oplog_replicator.cpp
+    ha/oplog/oplog_types.cpp
+    ha/oplog/oplog_batch_codec.cpp
+    ha/oplog/oplog_batch_storage.cpp
+    ha/oplog/oplog_batch_standby_reader.cpp
+    ha/oplog/oplog_batch_types.cpp
+    ha/oplog/ordered_oplog_writer.cpp
+    ha/oplog/oplog_test_failpoint.cpp
     ha/oplog/oplog_applier.cpp
-    ha/oplog/localfs_oplog_store.cpp
-    ha/oplog/polling_oplog_change_notifier.cpp
     hot_standby_service.cpp
+    metadata_store.cpp
     standby_state_machine.cpp
     ha_metric_manager.cpp
     store_c.cpp
@@ -120,9 +121,14 @@ find_library(
   PATHS /usr/lib /usr/local/lib /usr/lib64)
 set(KV_EVENTS_ZMQ_FOUND FALSE)
 if(ENABLE_KV_EVENTS)
-  find_library(ZMQ_LIBRARY NAMES zmq libzmq PATHS /usr/lib /usr/local/lib
-                                              /usr/lib64)
-  find_path(ZMQ_INCLUDE_DIR NAMES zmq.h PATHS /usr/include /usr/local/include)
+  find_library(
+    ZMQ_LIBRARY
+    NAMES zmq libzmq
+    PATHS /usr/lib /usr/local/lib /usr/lib64)
+  find_path(
+    ZMQ_INCLUDE_DIR
+    NAMES zmq.h
+    PATHS /usr/include /usr/local/include)
   if(ZMQ_INCLUDE_DIR AND ZMQ_LIBRARY)
     message(STATUS "Found ZMQ: include=${ZMQ_INCLUDE_DIR} lib=${ZMQ_LIBRARY}")
     list(APPEND MASTER_EXTRA_INCS ${ZMQ_INCLUDE_DIR})
@@ -133,7 +139,8 @@ if(ENABLE_KV_EVENTS)
     message(
       FATAL_ERROR
         "ENABLE_KV_EVENTS is ON but libzmq was not found. "
-        "Install libzmq3-dev or pass -DENABLE_KV_EVENTS=OFF to configure without ZMQ.")
+        "Install libzmq3-dev or pass -DENABLE_KV_EVENTS=OFF to configure without ZMQ."
+    )
   endif()
 endif()
 
@@ -273,6 +280,10 @@ add_library(mooncake_store ${MOONCAKE_STORE_SOURCES})
 if(KV_EVENTS_ZMQ_FOUND)
   target_compile_definitions(mooncake_store PRIVATE MOONCAKE_ENABLE_KV_EVENTS=1)
 endif()
+if(MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
+  target_compile_definitions(mooncake_store
+                             PRIVATE MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
+endif()
 target_include_directories(mooncake_store PUBLIC ${XXHASH_INCLUDE_DIR})
 if(USE_NOF)
   target_include_directories(mooncake_store PRIVATE ${SPDK_INCLUDE_DIR}
@@ -409,12 +420,12 @@ if(USE_ASCEND
 endif()
 
 if(USE_SUNRISE)
-    target_link_libraries(mooncake_store PRIVATE
-        ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
-        ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
-    target_link_libraries(mooncake_client PRIVATE
-        ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
-        ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
+  target_link_libraries(
+    mooncake_store PRIVATE ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
+                           ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
+  target_link_libraries(
+    mooncake_client PRIVATE ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
+                            ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
 endif()
 
 install(TARGETS mooncake_master mooncake_client DESTINATION bin)

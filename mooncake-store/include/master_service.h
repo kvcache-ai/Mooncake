@@ -39,6 +39,10 @@
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "task_manager.h"
 #include "kv_event/kv_event_publisher.h"
+#include "ha/oplog/oplog_types.h"
+#include "ha/oplog/ordered_oplog_writer.h"
+#include "allocator.h"
+#include "metadata_store.h"
 
 namespace mooncake {
 
@@ -53,12 +57,13 @@ struct MasterSnapshotPayloads;
 class MasterSnapshotCodecTest;  // test fixture, needs private state access
 }  // namespace ha
 
-class EtcdOpLogStore;
-
 // Forward declarations
 class AllocationStrategy;
 class EvictionStrategy;
+class HaKvBackend;
 class HttpMetadataServer;
+class OpLogBatchStorage;
+class OrderedOpLogWriter;
 struct MetadataStoragePlugin;
 
 // Forward declarations for test classes
@@ -72,6 +77,7 @@ class SnapshotChildProcessTest;
 // exposing test-only accessors on MasterService itself.
 class PromotionOnHitTest;
 class MasterServiceTenantQuotaTest;
+class MasterServiceHATest;
 }  // namespace test
 namespace benchmarks {
 class BatchEvictBench;
@@ -106,10 +112,13 @@ class MasterService {
     friend class ha::MasterSnapshotCodec;  // Allow codec to access private
                                            // members
     friend class ha::MasterSnapshotCodecTest;  // codec round-trip unit test
+    friend class test::MasterServiceHATest;
 
    public:
     using NoFProbeFn =
         std::function<bool(const std::string&, uint32_t, std::string*)>;
+    using DurableFinalizeCallback =
+        std::function<void(const OpLogEntry& durable_entry)>;
 
     MasterService();
     MasterService(const MasterServiceConfig& config);
@@ -129,6 +138,19 @@ class MasterService {
     tl::expected<std::optional<TenantQuotaSnapshot>, ErrorCode>
     DeleteTenantQuotaPolicy(const TenantId& tenant_id);
     uint64_t GetTenantQuotaAllocatableCapacityBytes();
+
+    ErrorCode SetBatchOpLogBackendForTesting(
+        std::shared_ptr<HaKvBackend> backend);
+
+    /**
+     * @brief Test-only wrapper around BatchEvict / NoFBatchEvict so that
+     *        unit tests can drive a single eviction cycle synchronously
+     *        without standing up the periodic eviction thread.
+     */
+    void RunBatchEvictForTesting(double evict_ratio_target,
+                                 double evict_ratio_lowerbound);
+    void RunNoFBatchEvictForTesting(double evict_ratio_target,
+                                    double evict_ratio_lowerbound);
 
     /**
      * @brief Mount a memory segment for buffer allocation. This function is
@@ -319,9 +341,18 @@ class MasterService {
      * keys on success, or an ErrorCode on failure. Only successfully
      * cleared keys are included in the result.
      */
+    // Existing key-only overload (signature unchanged): kept for legacy
+    // callers; delegates with "default".
     auto BatchReplicaClear(const std::vector<std::string>& object_keys,
                            const UUID& client_id,
                            const std::string& segment_name)
+        -> tl::expected<std::vector<std::string>, ErrorCode>;
+
+    // New: tenant-aware overload
+    auto BatchReplicaClear(const std::vector<std::string>& object_keys,
+                           const UUID& client_id,
+                           const std::string& segment_name,
+                           const std::string& tenant_id)
         -> tl::expected<std::vector<std::string>, ErrorCode>;
 
     /**
@@ -766,6 +797,15 @@ class MasterService {
      */
     tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatusById(
         const UUID& segment_id);
+
+    /**
+     * @brief Restore primary state from standby promotion context.
+     * Called once at promotion time before serving requests.
+     */
+    void RestoreFromStandbySnapshot(
+        const std::vector<StandbyObjectEntry>& objects,
+        uint64_t initial_oplog_sequence_id,
+        const std::vector<StandbySegmentInfo>& segments);
 
     /**
      * @brief Query the status of a task
@@ -1460,6 +1500,30 @@ class MasterService {
         std::unordered_map<std::string, ObjectMetadata>::iterator it,
         const TenantId& tenant_id, QuotaEraseMode quota_mode,
         MetadataShardAccessorRW* shard);
+    void FinalizeRemovedReplicasAfterDurable(
+        const OpLogEntry& durable_entry,
+        const std::vector<ReplicaID>& replica_ids, QuotaEraseMode quota_mode);
+    void FinalizeMetadataEraseAfterDurable(const OpLogEntry& durable_entry,
+                                           QuotaEraseMode quota_mode);
+    void FinalizeExpiredProcessingReplicasAfterDurable(
+        const OpLogEntry& durable_entry,
+        const std::chrono::system_clock::time_point& ttl);
+    void FinalizeExpiredReplicationTaskAfterDurable(
+        const OpLogEntry& durable_entry, ReplicaID source_id,
+        const std::vector<ReplicaID>& target_ids,
+        const std::chrono::system_clock::time_point& ttl);
+    struct StaleHandleCleanupPlan {
+        std::vector<ReplicaID> removed_ids;
+        std::vector<Replica::Descriptor> remaining;
+        bool would_invalidate{false};
+    };
+    StaleHandleCleanupPlan BuildStaleHandleCleanupPlan(
+        const ObjectMetadata& metadata,
+        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients) const;
+    tl::expected<void, ErrorCode> PersistStaleHandleCleanupForHA(
+        const std::string& why, const TenantId& tenant_id,
+        const std::string& key, ObjectMetadata& metadata,
+        const StaleHandleCleanupPlan& plan);
     void RebuildGroupRoutingIndex();
     void GrantLeaseForGroup(const TenantState& tenant_state,
                             const std::string& key,
@@ -1633,7 +1697,8 @@ class MasterService {
             // violation (client_mutex_ must be acquired before metadata shard).
             // local_disk replicas are cleaned up by ClearInvalidHandles() in
             // ClientMonitorFunc.
-            if (tenant_state_ != nullptr &&
+            if (!(service_->enable_ha_ && service_->enable_oplog_) &&
+                tenant_state_ != nullptr &&
                 it_ != tenant_state_->metadata.end()) {
                 // Erase invalid memory replicas (those with unmounted
                 // segments). No client_mutex_ needed since we only check memory
@@ -1985,6 +2050,8 @@ class MasterService {
     const std::string ha_backend_type_;
 
     const std::string ha_backend_connstring_;
+    const bool enable_oplog_;
+    const uint32_t oplog_batch_max_entries_;
 
     // cluster id for persistent sub directory
     const std::string cluster_id_;
@@ -2178,6 +2245,82 @@ class MasterService {
                                     const std::string& medium,
                                     const ObjectMetadata& metadata,
                                     const TenantId& tenant_id);
+
+    // OpLog publishing
+    std::shared_ptr<HaKvBackend> batch_oplog_kv_backend_;
+    std::unique_ptr<OpLogBatchStorage> batch_oplog_storage_;
+    std::unique_ptr<OrderedOpLogWriter> ordered_oplog_writer_;
+
+    // OpLog publishing helpers
+    std::string SerializeMetadataForOpLog(const ObjectMetadata& metadata) const;
+    std::string SerializeMetadataForOpLogWithoutMemReplicas(
+        const ObjectMetadata& metadata) const;
+    std::string SerializeMetadataForOpLogFromReplicaDescriptors(
+        const UUID& client_id, uint64_t size,
+        const std::vector<Replica::Descriptor>& replicas,
+        const std::string& group_id = "",
+        ObjectDataType data_type = ObjectDataType::UNKNOWN) const;
+    ErrorCode InitializeBatchOpLogWriter(std::shared_ptr<HaKvBackend> backend);
+    tl::expected<uint64_t, ErrorCode> AppendOpLogVisibleBeforeDurable(
+        OpType type, const std::string& tenant_id, const std::string& key,
+        const std::string& payload);
+    tl::expected<OpLogEntry, ErrorCode> AppendOpLogWithDurableFinalize(
+        OpType type, const std::string& tenant_id, const std::string& key,
+        const std::string& payload, DurableFinalizeCallback callback);
+    tl::expected<OrderedOpLogWriter::Reservation, ErrorCode>
+    ReserveBatchOpLogSlot();
+    tl::expected<OpLogEntry, ErrorCode> AppendReservedOpLogWithDurableFinalize(
+        OrderedOpLogWriter::Reservation&& reservation, OpType type,
+        const std::string& tenant_id, const std::string& key,
+        const std::string& payload, DurableFinalizeCallback callback);
+
+    // Invalid endpoints from standby that don't exist locally
+    std::unordered_set<std::string> invalid_replica_endpoints_;
+
+    // Keep DummyBufferAllocator alive after standby restore.
+    // Key: transport_endpoint, Value: allocator.
+    std::unordered_map<std::string, std::shared_ptr<BufferAllocatorBase>>
+        standby_allocator_keepalive_;
+    std::vector<StandbySegmentInfo> standby_memory_segments_;
+    std::unordered_map<std::string, uint64_t> standby_accounted_memory_bytes_;
+
+    ErrorCode ValidateStandbyRemountSegment(const Segment& segment) const;
+
+    bool IsReplicaReadable(const Replica& replica) const;
+
+    /**
+     * Segment lifecycle persist helper. Tries to durably persist the
+     * SEGMENT_MOUNT / SEGMENT_UNMOUNT entry up-front; on failure enqueues
+     * the same OpLogEntry (with its already-allocated sequence_id) for
+     * background retry so the standby segment registry eventually
+     * converges. Suitable for paths where the local segment commit has
+     * already happened (UnmountSegment) and rolling back is impossible.
+     */
+    void PersistSegmentOpForHAOrEnqueue(const char* why, OpType type,
+                                        const std::string& key,
+                                        const std::string& payload);
+    void PersistSegmentOpForHAOrEnqueue(const char* why, OpType type,
+                                        const TenantId& tenant_id,
+                                        const std::string& key,
+                                        const std::string& payload);
+
+    /**
+     * Helper to persist REMOVE OpLog for a key with strong-consistency.
+     * @return OK on success, error on persist failure (caller must skip erase)
+     */
+    tl::expected<void, ErrorCode> PersistRemoveForHA(const char* why,
+                                                     const std::string& key);
+    tl::expected<void, ErrorCode> PersistRemoveForHA(const char* why,
+                                                     const TenantId& tenant_id,
+                                                     const std::string& key);
+
+    /**
+     * Build replica descriptors after removing replicas matching pred_fn.
+     * Returns empty if no complete replicas remain.
+     */
+    std::vector<Replica::Descriptor> BuildRemainingReplicaDescriptors(
+        const ObjectMetadata& metadata,
+        const std::function<bool(const Replica&)>& should_remove) const;
 };
 
 }  // namespace mooncake
