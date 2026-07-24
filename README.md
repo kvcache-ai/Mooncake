@@ -9,21 +9,25 @@
   | <a href="https://kvcache-ai.github.io/Mooncake/" target="_blank"><strong>Documentation</strong></a>
   | <a href="https://kvcache.ai/" target="_blank"><strong>Blog</strong></a>
   | <a href="https://join.slack.com/t/mooncake-project/shared_invite/zt-3qx4x35ea-zSSTqTHItHJs9SCoXLOSPA" target="_blank"><strong>Slack</strong></a>
+  | <a href="https://deepwiki.com/kvcache-ai/Mooncake" target="_blank"><strong>DeepWiki</strong></a>
   <br />
-  <br />
-
-  [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/kvcache-ai/Mooncake)
-  [![PyPI - Downloads](https://static.pepy.tech/badge/mooncake-transfer-engine?period=month)](https://pypi.org/project/mooncake-transfer-engine)
-  [![GitHub commit activity](https://img.shields.io/github/commit-activity/w/kvcache-ai/Mooncake)](https://github.com/kvcache-ai/Mooncake/graphs/commit-activity)
-  [![license](https://img.shields.io/github/license/kvcache-ai/mooncake.svg)](https://github.com/kvcache-ai/Mooncake/blob/main/LICENSE-APACHE)
-  [![Docker](https://img.shields.io/docker/v/kvcacheai/mooncake?label=docker&logo=docker&logoColor=white&color=2496ED)](https://hub.docker.com/r/kvcacheai/mooncake)
   <br />
 
   [![PyPI](https://img.shields.io/pypi/v/mooncake-transfer-engine)](https://pypi.org/project/mooncake-transfer-engine)
+  [![PyPI - Downloads](https://static.pepy.tech/badge/mooncake-transfer-engine?period=month)](https://pypi.org/project/mooncake-transfer-engine)
+  [![license](https://img.shields.io/github/license/kvcache-ai/mooncake.svg)](https://github.com/kvcache-ai/Mooncake/blob/main/LICENSE-APACHE)
+  [![Docker Hub](https://img.shields.io/badge/docker-hub-2496ED?logo=docker&logoColor=white)](https://hub.docker.com/r/kvcacheai/mooncake)
+  <br />
+
   [![PyPI CUDA <=12.9](https://img.shields.io/static/v1?label=pypi&message=CUDA%20%3C%3D12.9&color=76B900)](https://pypi.org/project/mooncake-transfer-engine)
   [![PyPI CUDA 13.0/13.1](https://img.shields.io/static/v1?label=pypi&message=CUDA%2013.0%2F13.1&color=76B900)](https://pypi.org/project/mooncake-transfer-engine-cuda13)
-  [![PyPI Non-CUDA](https://img.shields.io/static/v1?label=pypi&message=non-CUDA&color=00BFFF)](https://pypi.org/project/mooncake-transfer-engine-non-cuda/)
+  [![PyPI MUSA](https://img.shields.io/static/v1?label=pypi&message=MUSA&color=E4002B)](https://pypi.org/project/mooncake-transfer-engine-musa/)
   [![PyPI NPU](https://img.shields.io/static/v1?label=pypi&message=NPU&color=F87171)](https://pypi.org/project/mooncake-transfer-engine-npu/)
+  <br />
+
+  [![PyPI Non-CUDA](https://img.shields.io/static/v1?label=pypi&message=non-CUDA&color=00BFFF)](https://pypi.org/project/mooncake-transfer-engine-non-cuda/)
+  [![PyPI EFA CUDA](https://img.shields.io/static/v1?label=pypi&message=EFA%20%2B%20CUDA&color=FF9900)](https://pypi.org/project/mooncake-transfer-engine-efa/)
+  [![PyPI EFA Non-CUDA](https://img.shields.io/static/v1?label=pypi&message=EFA%20non-CUDA&color=FF9900)](https://pypi.org/project/mooncake-transfer-engine-efa-non-cuda/)
 </div>
 <br/>
 
