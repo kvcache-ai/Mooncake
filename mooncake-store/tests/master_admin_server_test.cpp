@@ -163,6 +163,9 @@ TEST_F(MasterAdminServerTest, MetricsEndpointReturns200) {
     auto resp = HttpGet(port, "/metrics");
     EXPECT_EQ(resp.http_status, 200);
     EXPECT_NE(resp.body.find("master_"), std::string::npos);
+    EXPECT_NE(
+        resp.body.find("# TYPE master_offload_enqueue_failed_total counter"),
+        std::string::npos);
 
     admin.Stop();
 }

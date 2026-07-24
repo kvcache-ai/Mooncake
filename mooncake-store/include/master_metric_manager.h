@@ -45,6 +45,10 @@ class MasterMetricManager {
     void dec_file_cache_nums(int64_t val = 1);
     void reset_cache_total_nums();
 
+    // Offload Metrics
+    void inc_offload_enqueue_failed(int64_t val = 1);
+    int64_t get_offload_enqueue_failed();
+
     void inc_valid_get_nums(int64_t val = 1);
     void inc_total_get_nums(int64_t val = 1);
 
@@ -649,6 +653,7 @@ class MasterMetricManager {
     ylt::metric::counter_t file_cache_hit_bytes_;
     ylt::metric::gauge_t mem_cache_nums_;
     ylt::metric::gauge_t file_cache_nums_;
+    ylt::metric::counter_t offload_enqueue_failed_;
 
     ylt::metric::counter_t valid_get_nums_;
     ylt::metric::counter_t total_get_nums_;
