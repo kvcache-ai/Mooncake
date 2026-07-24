@@ -794,6 +794,32 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                 auto remount_result =
                     client_->MountLocalDiskSegment(enable_offloading_);
                 if (remount_result) {
+                    // Re-report SSD capacity: the master lost this segment's
+                    // ssd_total_capacity_bytes on restart/failover (the field
+                    // is in-memory and not replicated via oplog). Without
+                    // this, the new leader's "SSD Storage" denominator stays
+                    // at 0 and SSD-level eviction never triggers.
+                    if (config_.total_size_limit > 0) {
+                        int retry_count = 3;
+                        tl::expected<void, ErrorCode> cap_result;
+                        for (int i = 0; i < retry_count; ++i) {
+                            cap_result = client_->ReportSsdCapacity(
+                                config_.total_size_limit);
+                            if (cap_result) {
+                                break;
+                            }
+                            LOG(WARNING) << "ReportSsdCapacity failed (attempt "
+                                         << (i + 1) << "/" << retry_count
+                                         << "): " << cap_result.error();
+                            std::this_thread::sleep_for(
+                                std::chrono::milliseconds(100));
+                        }
+                        if (!cap_result) {
+                            LOG(ERROR) << "ReportSsdCapacity failed after "
+                                       << retry_count
+                                       << " attempts: " << cap_result.error();
+                        }
+                    }
                     heartbeat_result = client_->OffloadObjectHeartbeat(
                         enable_offloading_, offloading_objects);
                     if (!heartbeat_result) {
