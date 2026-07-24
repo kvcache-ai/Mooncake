@@ -24,6 +24,11 @@ target_link_libraries(endpoint_store_test PUBLIC transfer_engine gtest
                                                  gtest_main)
 add_test(NAME endpoint_store_test COMMAND endpoint_store_test)
 
+add_executable(worker_pool_lock_test ${WORKSPACE}/worker_pool_lock_test.cpp)
+target_link_libraries(worker_pool_lock_test PUBLIC transfer_engine gtest
+                                                   gtest_main pthread)
+add_test(NAME worker_pool_lock_test COMMAND worker_pool_lock_test)
+
 add_executable(rdma_endpoint_state_test
                ${WORKSPACE}/rdma_endpoint_state_test.cpp)
 target_link_libraries(rdma_endpoint_state_test PUBLIC transfer_engine gtest

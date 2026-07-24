@@ -67,17 +67,19 @@ static int selectPeerDevice(RdmaTransport::SegmentDesc *peer_segment_desc,
 }
 
 static bool workerCanPost(int thread_id) {
-    return kTransferWorkerCount == 1 || thread_id != 0;
+    return kTransferWorkerCount == 1 || !globalConfig().rdma_dedicated_poller ||
+           thread_id != 0;
 }
 
 static bool workerCanPoll(int thread_id) {
-    return kTransferWorkerCount == 1 || thread_id == 0;
+    return kTransferWorkerCount == 1 || !globalConfig().rdma_dedicated_poller ||
+           thread_id == 0;
 }
 
 static void getPostingShardAssignment(int thread_id, int &post_tid,
                                       int &post_count) {
     assert(workerCanPost(thread_id));
-    if (kTransferWorkerCount > 1) {
+    if (kTransferWorkerCount > 1 && globalConfig().rdma_dedicated_poller) {
         post_tid = thread_id - 1;
         post_count = kTransferWorkerCount - 1;
     } else {
@@ -87,6 +89,10 @@ static void getPostingShardAssignment(int thread_id, int &post_tid,
 }
 
 WorkerPool::WorkerPool(RdmaContext &context, int numa_socket_id)
+    : WorkerPool(context, numa_socket_id, true) {}
+
+WorkerPool::WorkerPool(RdmaContext &context, int numa_socket_id,
+                       bool start_workers)
     : context_(context),
       numa_socket_id_(numa_socket_id),
       workers_running_(true),
@@ -97,6 +103,7 @@ WorkerPool::WorkerPool(RdmaContext &context, int numa_socket_id)
     for (int i = 0; i < kShardCount; ++i)
         slice_queue_count_[i].store(0, std::memory_order_relaxed);
     collective_slice_queue_.resize(kTransferWorkerCount);
+    if (!start_workers) return;
     for (int i = 0; i < kTransferWorkerCount; ++i)
         worker_thread_.emplace_back(
             std::thread(std::bind(&WorkerPool::transferWorker, this, i)));
@@ -325,6 +332,12 @@ void WorkerPool::untrackPostedSlices(
         posted_slices_.erase(slice_list[i]);
 }
 
+std::mutex &WorkerPool::postPollMutexFor(const std::string &peer_nic_path) {
+    const size_t stripe =
+        std::hash<std::string>{}(peer_nic_path) % kPostPollLockStripeCount;
+    return post_poll_mutexes_[stripe];
+}
+
 void WorkerPool::performPostSend(int thread_id) {
     int post_tid = 0;
     int post_count = 0;
@@ -494,7 +507,10 @@ void WorkerPool::performPostSend(int thread_id) {
         for (auto &slice : entry.second) {
             slice->rdma.endpoint = endpoint.get();
         }
-        endpoint->submitPostSend(entry.second, failed_slice_list);
+        {
+            std::lock_guard<std::mutex> lock(postPollMutexFor(entry.first));
+            endpoint->submitPostSend(entry.second, failed_slice_list);
+        }
 #endif
     }
 
@@ -521,6 +537,14 @@ void WorkerPool::performPostSend(int thread_id) {
 }
 
 void WorkerPool::performPollCq(int thread_id) {
+    int processed_slice_count = 0;
+    const static size_t kPollCount = 64;
+    std::unordered_map<std::atomic<int> *, int> qp_depth_set;
+    std::unordered_set<RdmaEndPoint *> local_failed_endpoints;
+    bool recorded_local_context_failure = false;
+    SliceList failed_slice_list;
+    SliceList local_failed_slice_list;
+
     const uint64_t poll_ts = getCurrentTimeInNano();
     const uint64_t previous_poll_ts =
         last_poll_ts_ns_.exchange(poll_ts, std::memory_order_relaxed);
@@ -535,13 +559,6 @@ void WorkerPool::performPollCq(int thread_id) {
         }
     }
 
-    int processed_slice_count = 0;
-    const static size_t kPollCount = 64;
-    std::unordered_map<std::atomic<int> *, int> qp_depth_set;
-    std::unordered_set<RdmaEndPoint *> local_failed_endpoints;
-    bool recorded_local_context_failure = false;
-    SliceList failed_slice_list;
-    SliceList local_failed_slice_list;
     for (int cq_index = 0; cq_index < context_.cqCount(); cq_index++) {
         ibv_wc wc[kPollCount];
         int nr_poll = context_.poll(kPollCount, wc, cq_index);
@@ -561,6 +578,8 @@ void WorkerPool::performPollCq(int thread_id) {
         for (int i = 0; i < nr_poll; ++i) {
             Transport::Slice *slice = (Transport::Slice *)wc[i].wr_id;
             assert(slice);
+            std::lock_guard<std::mutex> lock(
+                postPollMutexFor(slice->peer_nic_path));
             if (qp_depth_set.count(slice->rdma.qp_depth))
                 qp_depth_set[slice->rdma.qp_depth]++;
             else
