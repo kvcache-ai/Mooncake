@@ -235,7 +235,6 @@ mooncake_master \
 
 The master resolves the current IPv4 address of `eth0` at startup and uses it as the advertised RPC address.
 
-
 ---
 
 ## Metrics Endpoints
@@ -359,6 +358,7 @@ In HA mode, quota admin requests are served only by the active master service. S
 :maxdepth: 1
 :hidden:
 
+KV Cache Sharing and Isolation<kv-cache-sharing-and-isolation>
 SSD Storage<ssd/index>
 HF3FS Plugin (Experimental)<../getting_started/plugin-usage/3FS-USRBIO-Plugin>
 ../getting_started/observability
