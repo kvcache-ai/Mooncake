@@ -8,14 +8,17 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -5273,6 +5276,80 @@ TEST_F(MasterServiceTest, BatchQueryIpMixedIpv4AndIpv6Test) {
                                            ip_addresses.end());
     EXPECT_NE(ip_set.find("192.168.1.1"), ip_set.end());
     EXPECT_NE(ip_set.find("::1"), ip_set.end());
+}
+
+TEST_F(MasterServiceTest,
+       ClientLeaseExpiredCallbacksRunAfterResourceReclamation) {
+    MasterServiceConfig config;
+    config.client_live_ttl_sec = 1;
+    auto service = std::make_unique<MasterService>(config);
+
+    const UUID mounted_client_id = generate_uuid();
+    const UUID empty_client_id = generate_uuid();
+    Segment segment_a = MakeSegment("expired_segment_a");
+    Segment segment_b = MakeSegment("expired_segment_b",
+                                    kDefaultSegmentBase + kDefaultSegmentSize);
+    ASSERT_TRUE(
+        service->MountSegment(segment_a, mounted_client_id).has_value());
+    ASSERT_TRUE(
+        service->MountSegment(segment_b, mounted_client_id).has_value());
+
+    std::mutex events_mutex;
+    std::condition_variable events_cv;
+    std::vector<ClientLeaseExpiredEvent> events;
+    std::atomic<int> throwing_callback_count{0};
+    bool resources_were_reclaimed_before_callback = true;
+
+    service->RegisterClientLeaseExpiredCallback(
+        [&](const ClientLeaseExpiredEvent&) {
+            throwing_callback_count.fetch_add(1);
+            throw std::runtime_error("expected test exception");
+        });
+    service->RegisterClientLeaseExpiredCallback(
+        [&](const ClientLeaseExpiredEvent& event) {
+            for (const auto& segment_name :
+                 event.unmounted_memory_segment_names) {
+                if (service->QuerySegments(segment_name).has_value()) {
+                    resources_were_reclaimed_before_callback = false;
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lock(events_mutex);
+                events.push_back(event);
+            }
+            events_cv.notify_one();
+        });
+
+    ASSERT_TRUE(service->Ping(mounted_client_id).has_value());
+    ASSERT_TRUE(service->Ping(empty_client_id).has_value());
+
+    {
+        std::unique_lock<std::mutex> lock(events_mutex);
+        ASSERT_TRUE(events_cv.wait_for(lock, std::chrono::seconds(6),
+                                       [&] { return events.size() == 2; }));
+    }
+
+    EXPECT_EQ(throwing_callback_count.load(), 2);
+    EXPECT_TRUE(resources_were_reclaimed_before_callback);
+
+    const ClientLeaseExpiredEvent* mounted_event = nullptr;
+    const ClientLeaseExpiredEvent* empty_event = nullptr;
+    for (const auto& event : events) {
+        if (event.client_id == mounted_client_id) {
+            mounted_event = &event;
+        } else if (event.client_id == empty_client_id) {
+            empty_event = &event;
+        }
+    }
+    ASSERT_NE(mounted_event, nullptr);
+    ASSERT_NE(empty_event, nullptr);
+    EXPECT_TRUE(empty_event->unmounted_memory_segment_names.empty());
+    const std::unordered_set<std::string> unmounted_segments(
+        mounted_event->unmounted_memory_segment_names.begin(),
+        mounted_event->unmounted_memory_segment_names.end());
+    EXPECT_EQ(unmounted_segments,
+              (std::unordered_set<std::string>{"expired_segment_a",
+                                               "expired_segment_b"}));
 }
 
 TEST_F(MasterServiceTest, PutStartExpiringTest) {

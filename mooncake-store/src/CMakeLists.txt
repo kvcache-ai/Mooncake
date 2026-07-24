@@ -13,6 +13,7 @@ set(MOONCAKE_STORE_SOURCES
     utils.cpp
     mmap_arena.cpp
     master_metric_manager.cpp
+    http_metadata_cleanup_worker.cpp
     storage_backend.cpp
     thread_pool.cpp
     etcd_helper.cpp

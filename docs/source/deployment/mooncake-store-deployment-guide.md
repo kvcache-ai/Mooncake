@@ -415,11 +415,12 @@ addition to unmounting the segment it also removes that client's `ram/` and
 `rpc_meta/` keys from the HTTP metadata server. It supports both deployment
 topologies:
 
-- **Co-located** (`--enable_http_metadata_server=true`): the master removes the
-  keys via a direct in-process call (no network overhead).
+- **Co-located** (`--enable_http_metadata_server=true`): an asynchronous worker
+  removes the keys via an in-process call (no network overhead).
 - **Separately deployed** HTTP metadata server: the master derives the metadata
-  server address from the cluster's existing configuration and removes the keys
-  via HTTP `DELETE`. The address is read, in priority order, from:
+  server address from the cluster's existing configuration and an asynchronous
+  worker removes the keys via HTTP `DELETE`. The address is read, in priority
+  order, from:
   1. the `MOONCAKE_TE_META_DATA_SERVER` environment variable (the same Transfer
      Engine metadata connection string the clients use, e.g.
      `http://host:8080/metadata`), then
