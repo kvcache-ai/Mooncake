@@ -102,11 +102,13 @@ class ReplicaPlacementMasterShadowTest : public ::testing::Test {
                    const std::string& key) {
         ReplicateConfig config;
         config.replica_num = 1;
-        ASSERT_TRUE(service.PutStart(client_id, key, "default", 1024, config)
-                        .has_value());
         ASSERT_TRUE(
-            service.PutEnd(client_id, key, "default", ReplicaType::MEMORY)
+            service.PutStart(client_id, key, TenantId::Default(), 1024, config)
                 .has_value());
+        ASSERT_TRUE(service
+                        .PutEnd(client_id, key, TenantId::Default(),
+                                ReplicaType::MEMORY)
+                        .has_value());
     }
 };
 
