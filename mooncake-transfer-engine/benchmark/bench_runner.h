@@ -57,7 +57,7 @@ class BenchRunner {
 
     virtual double runSingleTransfer(uint64_t local_addr, uint64_t target_addr,
                                      uint64_t block_size, uint64_t batch_size,
-                                     OpCode opcode) = 0;
+                                     OpCode opcode, uint64_t deadline_ns) = 0;
 };
 
 }  // namespace tent

@@ -87,7 +87,7 @@ Step by step:
 
 1. **Heartbeat**: The heartbeat thread wakes up every `MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS` seconds and calls `client_->OffloadObjectHeartbeat(enable_offloading_, offloading_objects)`. The master replies with a map of `{key → size}` for objects it has selected to evict from memory.
 2. **Read slices from memory**: `FileStorage::OffloadObjects` groups the keys into buckets (for `BucketStorageBackend`) and calls `BatchQuerySegmentSlices` to obtain `{key → Slice}` from the local memory segment via `client_->BatchQuery`.
-3. **Eviction** (if capacity limit is set): Before writing, `PrepareEviction` removes old buckets from metadata under the exclusive lock and collects their keys. The `eviction_handler` callback calls `client_->BatchEvictDiskReplica` to notify the master in a single RPC. `FinalizeEviction` then deletes the corresponding files.
+3. **Eviction** (if capacity limit is set): Before writing, `PrepareEviction` removes old buckets from metadata under the exclusive lock and collects their keys. The `eviction_handler` callback calls `client_->BatchEvictDiskReplica` to notify the master in one batched RPC. `FinalizeEviction` then deletes the corresponding files.
 4. **Write to SSD**: `StorageBackend::BatchOffload` serializes and writes the key-value data to disk.
 5. **Notify master**: On success, the `complete_handler` calls `client_->NotifyOffloadSuccess(keys, metadatas)`. The master adds a `LOCAL_DISK` replica entry (carrying the real client's RPC address as `transport_endpoint`) to the object's replica list.
 
@@ -150,20 +150,36 @@ Each object is stored as an individual file. The file path is derived from the k
 
 ### OffsetAllocatorStorageBackend
 
-A single pre-allocated file (`kv_cache.data`) is shared by all objects. Space within the file is managed by an `OffsetAllocator`. Metadata is sharded across 1024 independent maps to reduce lock contention under high concurrency. Records follow the layout `[key_len: u32 | value_len: u32 | key | value]`.
+A single pre-allocated file (`kv_cache.data`) is shared by all objects. Space within the file is managed by an `OffsetAllocator`. Metadata is sharded across 1024 independent maps to reduce lock contention under high concurrency. Records follow the layout `[key_len: u32 | value_len: u32 | seq: u64 | flags: u32 | crc32: u32 | key | zero padding | value]`. The value region always starts at a 4 KiB boundary within the record (padding is a pure function of `key_len`) so that DMA writers (e.g. GDS/cuFile) can use aligned file offsets. `seq` is a monotonic stamp used by restart recovery to drop post-checkpoint writes; `crc32` is a CRC-32C over header prefix + key + value and is present only when `flags & kFlagHasCrc` (see `enable_record_crc` in `OffsetAllocatorBackendConfig`).
 
 ---
 
-## Eviction (BucketStorageBackend)
+## Eviction
+
+### Write-time eviction (BucketStorageBackend)
 
 When `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` is set, the backend evicts existing buckets to make room before writing a new one. Eviction is disabled by default (`BucketEvictionPolicy::NONE`).
+
+### Proactive watermark eviction
+
+`FileStorage::Heartbeat()` also calls the backend-level proactive disk watermark path when `MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION=true`. The high watermark decides when eviction starts and the low watermark decides the target usage after eviction. This path is independent of write admission, so disk usage can move back toward the low watermark even when no new write arrives.
+
+| Backend | Candidate source |
+|---------|------------------|
+| `BucketStorageBackend` | The configured bucket eviction policy (`FIFO` or `LRU`) |
+| `StorageBackendAdaptor` | The FIFO file queue rebuilt by `StorageBackend::Init()`; `ScanMeta()` restores object keys for recovered files |
+| `OffsetAllocatorStorageBackend` | No-op in this version |
+
+The watermark path uses the same master-notification ordering as bucket write-time eviction: selected keys are reported through the eviction handler before files are deleted. If master notification fails, `BucketStorageBackend` restores the prepared metadata and `StorageBackendAdaptor` restores the selected file records to the FIFO queue.
+
+For `BucketStorageBackend`, write-time eviction and watermark eviction both use `PrepareEviction()` and `FinalizeEviction()`, so bucket candidate selection is serialized by the same metadata lock. For `StorageBackendAdaptor`, write-time reactive eviction and watermark eviction use the same FIFO queue and space-accounting locks.
 
 ### Policies
 
 | Policy | Candidate selection |
 |--------|---------------------|
 | `FIFO` | `buckets_.begin()` — always the oldest bucket, since `buckets_` is ordered by bucket ID |
-| `LRU` | `std::min_element` over `BucketMetadata::last_access_ns_` — the bucket with the smallest last-read timestamp |
+| `LRU` | `lru_index_`, ordered by `{last_access_ns_, bucket_id}` — the bucket with the smallest last-read timestamp |
 
 `last_access_ns_` is an atomic `int64_t` updated on every `BatchLoad` with relaxed ordering. Buckets that have never been read have `last_access_ns_ == 0` and are therefore always evicted first under LRU, giving FIFO-among-unread semantics.
 
@@ -179,19 +195,27 @@ Eviction is split into two phases to ensure that the master is notified before f
 
 **Between phases** — notify master:
 
-The caller invokes the `eviction_handler` callback with the full list of evicted keys. The handler calls `MasterClient::BatchEvictDiskReplica`, which sends a single RPC to the master to remove the disk replicas for all evicted keys atomically.
+The caller invokes the `eviction_handler` callback with the full list of evicted keys. The handler calls `MasterClient::BatchEvictDiskReplica`, which sends one batched RPC to the master and receives a per-key result.
 
 **Phase 2 — `FinalizeEviction(pending)`** (called after master notification):
 
 For each evicted bucket:
-1. Spin-wait (with a 10-second timeout) until `inflight_reads_ == 0`.
-2. Evict any stale file-handle cache entries.
-3. Delete the `.bucket` and `.meta` files.
+1. Attempt to delete the `.meta` file first, reducing the chance that a later
+   restart recovers a bucket whose master replica has already been removed.
+2. Spin-wait (with a 10-second timeout) until `inflight_reads_ == 0`.
+3. Evict any stale file-handle cache entries.
+4. Delete the `.bucket` file.
 
-This ordering guarantees:
+This ordering provides the following behavior when the relevant file operations
+succeed:
 - The master never serves a stale disk-replica location for a file that has already been deleted.
 - Ongoing reads complete successfully before their files are removed.
 - Freed disk space is available for the incoming write before `WriteBucket` is called.
+
+Cleanup failures after the master update are logged and treated as best-effort.
+A crash or filesystem failure that leaves both files intact still requires
+cross-node reconciliation; local file ordering alone cannot make that window
+transactional.
 
 ---
 

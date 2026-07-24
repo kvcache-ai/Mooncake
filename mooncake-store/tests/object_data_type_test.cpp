@@ -110,13 +110,13 @@ TEST_F(ObjectDataTypeTest, PutStartWithDataType) {
     config.replica_num = 1;
     config.data_type = ObjectDataType::WEIGHT;
 
-    auto result =
-        service->PutStart(put_client, "key_weight", "default", 1024, config);
+    auto result = service->PutStart(put_client, "key_weight",
+                                    TenantId::Default(), 1024, config);
     ASSERT_TRUE(result.has_value());
     EXPECT_FALSE(result.value().empty());
 
-    auto end_result = service->PutEnd(put_client, "key_weight", "default",
-                                      ReplicaType::MEMORY);
+    auto end_result = service->PutEnd(put_client, "key_weight",
+                                      TenantId::Default(), ReplicaType::MEMORY);
     EXPECT_TRUE(end_result.has_value());
 }
 
@@ -133,8 +133,8 @@ TEST_F(ObjectDataTypeTest, PutStartDefaultDataType) {
     config.replica_num = 1;
     // data_type left as default (UNKNOWN)
 
-    auto result =
-        service->PutStart(put_client, "key_default", "default", 1024, config);
+    auto result = service->PutStart(put_client, "key_default",
+                                    TenantId::Default(), 1024, config);
     ASSERT_TRUE(result.has_value());
     EXPECT_FALSE(result.value().empty());
 }

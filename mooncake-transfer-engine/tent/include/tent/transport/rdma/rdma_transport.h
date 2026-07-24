@@ -95,6 +95,9 @@ class RdmaTransport : public Transport {
 
     virtual const char* getName() const { return "rdma"; }
 
+    double getEstimatedBandwidth() const override;
+    Status getNicLoadStats(std::vector<NicLoadStats>& stats) const override;
+
     virtual bool supportNotification() const override { return true; }
 
     virtual Status sendNotification(SegmentID target_id,

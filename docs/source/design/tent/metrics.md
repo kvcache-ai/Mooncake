@@ -23,7 +23,7 @@ By default, metrics are **disabled** at compile time for maximum performance. To
 cmake -DTENT_METRICS_ENABLED=ON ..
 ```
 
-When disabled at compile time (`TENT_METRICS_ENABLED=OFF`, the default), all metrics macros expand to `((void)0)`, resulting in **zero runtime overhead**.
+When disabled at compile time (`TENT_METRICS_ENABLED=OFF`, the default), all metrics macros expand to `((void)0)` and the `recordTaskCompletionMetrics` body is `#if`-gated out, resulting in **zero runtime overhead** on the transfer hot path.
 
 ### Runtime Disable (Minimal Overhead)
 
@@ -65,11 +65,7 @@ TENT metrics configuration is integrated into the main `transfer-engine.json` co
     "http_port": 9100,
     "http_host": "0.0.0.0",
     "http_server_threads": 2,
-    "report_interval_seconds": 30,
-    "enable_prometheus": true,
-    "enable_json": true,
-    "latency_buckets": [0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0],
-    "size_buckets": [1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216, 67108864, 268435456, 1073741824]
+    "report_interval_seconds": 30
   },
   "transports": {
     // ... transport configuration
@@ -77,10 +73,9 @@ TENT metrics configuration is integrated into the main `transfer-engine.json` co
 }
 ```
 
-**Note**: 
+**Note**:
 - `report_interval_seconds`: Set to 0 to disable periodic logging
-- `latency_buckets`: Values are in **seconds** (e.g., 0.001 = 1ms). The system internally converts to microseconds for histogram storage.
-- `size_buckets`: Values are in bytes
+- Histogram buckets are fixed at compile time (see `kLatencyBuckets` / `kSizeBuckets` in `tent_metrics.h`) for reproducible observability across deployments.
 
 ### Environment Variables
 
@@ -91,14 +86,6 @@ TENT_METRICS_HTTP_PORT=9100
 TENT_METRICS_HTTP_HOST=0.0.0.0
 TENT_METRICS_HTTP_SERVER_THREADS=2
 TENT_METRICS_REPORT_INTERVAL=30  # Set to 0 to disable periodic logging
-
-# Output formats
-TENT_METRICS_ENABLE_PROMETHEUS=true
-TENT_METRICS_ENABLE_JSON=true
-
-# Custom buckets (comma-separated, latency in seconds, size in bytes)
-TENT_METRICS_LATENCY_BUCKETS="0.0001,0.0005,0.001,0.005,0.01,0.05,0.1,0.5,1.0"
-TENT_METRICS_SIZE_BUCKETS="1024,4096,16384,65536,262144,1048576"
 ```
 
 ## Quick Start
@@ -131,17 +118,28 @@ tent_metrics.initialize(config);
 
 ```cpp
 // Using convenience macros (recommended)
-TENT_RECORD_READ_COMPLETED(1024*1024, 0.025);   // 1MB read in 25ms
-TENT_RECORD_WRITE_COMPLETED(512*1024, 0.015);   // 512KB write in 15ms
-TENT_RECORD_READ_FAILED(1024*1024);             // 1MB read failed
-TENT_RECORD_WRITE_FAILED(512*1024);             // 512KB write failed
+TENT_RECORD_READ_COMPLETED(RDMA, 1024*1024, 0.025);   // 1MB read in 25ms
+TENT_RECORD_WRITE_COMPLETED(RDMA, 512*1024, 0.015);    // 512KB write in 15ms
+TENT_RECORD_READ_FAILED(TCP);                           // read failed (no bytes recorded)
+TENT_RECORD_WRITE_FAILED(TCP);                          // write failed (no bytes recorded)
+TENT_RECORD_TRANSPORT_FAILOVER(RDMA, TCP);              // cross-transport failover event
 
 // Direct API usage
 auto& tent_metrics = TentMetrics::instance();
-tent_metrics.recordReadCompleted(1024*1024, 0.025);
-tent_metrics.recordWriteCompleted(512*1024, 0.015);
-tent_metrics.recordReadFailed(1024*1024);
-tent_metrics.recordWriteFailed(512*1024);
+tent_metrics.recordReadCompleted(RDMA, 1024*1024, 0.025);
+tent_metrics.recordWriteCompleted(RDMA, 512*1024, 0.015);
+tent_metrics.recordReadFailed(TCP);
+tent_metrics.recordWriteFailed(TCP);
+tent_metrics.recordTransportFailover(RDMA, TCP);
+
+// Deadline feasibility (RFC #2519, observability only):
+tent_metrics.recordDeadlineMLU(RDMA, 0.8);        // MLU < 1 met the deadline
+tent_metrics.recordDeadlineInfeasible(TCP);        // deadline was in the past at submit
+
+// Causal-chain per-stage latency breakdown (microseconds):
+tent_metrics.recordStageLatency(TentMetrics::Stage::QueueWait, RDMA, 12.0);
+tent_metrics.recordStageLatency(TentMetrics::Stage::Dispatch, RDMA, 45.0);
+tent_metrics.recordStageLatency(TentMetrics::Stage::Transport, RDMA, 130.0);
 ```
 
 ### RAII Latency Measurement
@@ -149,12 +147,12 @@ tent_metrics.recordWriteFailed(512*1024);
 ```cpp
 // Automatic latency measurement using RAII
 {
-    TENT_SCOPED_READ_LATENCY(1024 * 1024); // e.g. 1MB
+    TENT_SCOPED_READ_LATENCY(RDMA, 1024 * 1024); // e.g. 1MB
     // ... perform read operation ...
 }  // latency automatically recorded when scope exits
 
 {
-    TENT_SCOPED_WRITE_LATENCY(512 * 1024); // e.g. 512KB
+    TENT_SCOPED_WRITE_LATENCY(RDMA, 512 * 1024); // e.g. 512KB
     // ... perform write operation ...
 }
 ```
@@ -174,32 +172,30 @@ The HTTP server provides multiple endpoints:
 ```
 # HELP tent_read_bytes_total Total bytes read via TENT
 # TYPE tent_read_bytes_total counter
-tent_read_bytes_total 1048576
+tent_read_bytes_total{transport="rdma"} 1048576
+tent_read_bytes_total{transport="tcp"} 524288
 
 # HELP tent_write_bytes_total Total bytes written via TENT
 # TYPE tent_write_bytes_total counter
-tent_write_bytes_total 524288
+tent_write_bytes_total{transport="rdma"} 524288
 
 # HELP tent_read_requests_total Total read requests via TENT
 # TYPE tent_read_requests_total counter
-tent_read_requests_total 100
-
-# HELP tent_write_requests_total Total write requests via TENT
-# TYPE tent_write_requests_total counter
-tent_write_requests_total 50
+tent_read_requests_total{transport="rdma"} 100
+tent_read_requests_total{transport="tcp"} 50
 
 # HELP tent_read_failures_total Total read failures via TENT
 # TYPE tent_read_failures_total counter
-tent_read_failures_total 2
+tent_read_failures_total{transport="tcp"} 2
 
-# HELP tent_write_failures_total Total write failures via TENT
-# TYPE tent_write_failures_total counter
-tent_write_failures_total 1
+# HELP tent_transport_failover_total Total cross-transport failover events
+# TYPE tent_transport_failover_total counter
+tent_transport_failover_total{from="rdma",to="tcp"} 1
 
 # HELP tent_read_latency_us Read latency distribution in microseconds
 # TYPE tent_read_latency_us histogram
-tent_read_latency_us_bucket{le="100"} 10
-tent_read_latency_us_bucket{le="500"} 50
+tent_read_latency_us_bucket{transport="rdma",le="100"} 10
+tent_read_latency_us_bucket{transport="rdma",le="500"} 50
 ...
 ```
 
@@ -222,18 +218,53 @@ Read: 1.00 MB (100 reqs, 2 fails) | Write: 512.00 KB (50 reqs, 1 fails)
 
 ## Available Metrics
 
-| Metric Name | Type | Description |
-|-------------|------|-------------|
-| `tent_read_bytes_total` | Counter | Total bytes read via TENT |
-| `tent_write_bytes_total` | Counter | Total bytes written via TENT |
-| `tent_read_requests_total` | Counter | Total read requests via TENT |
-| `tent_write_requests_total` | Counter | Total write requests via TENT |
-| `tent_read_failures_total` | Counter | Total read failures via TENT |
-| `tent_write_failures_total` | Counter | Total write failures via TENT |
-| `tent_read_latency_us` | Histogram | Read latency distribution in microseconds |
-| `tent_write_latency_us` | Histogram | Write latency distribution in microseconds |
-| `tent_read_size_bytes` | Histogram | Read request size distribution in bytes |
-| `tent_write_size_bytes` | Histogram | Write request size distribution in bytes |
+| Metric Name | Type | Labels | Description |
+|-------------|------|--------|-------------|
+| `tent_read_bytes_total` | Counter | `transport` | Total bytes read via TENT (success only; failures record no bytes) |
+| `tent_write_bytes_total` | Counter | `transport` | Total bytes written via TENT (success only) |
+| `tent_read_requests_total` | Counter | `transport` | Total read requests via TENT (success + failure) |
+| `tent_write_requests_total` | Counter | `transport` | Total write requests via TENT (success + failure) |
+| `tent_read_failures_total` | Counter | `transport` | Total read failures via TENT |
+| `tent_write_failures_total` | Counter | `transport` | Total write failures via TENT |
+| `tent_transport_failover_total` | Counter | `from`, `to` | Total cross-transport failover events |
+| `tent_deadline_infeasible_total` | Counter | `transport` | Transfers whose deadline was already in the past at submit time |
+| `tent_read_latency_us` | Histogram | `transport` | Read latency distribution in microseconds |
+| `tent_write_latency_us` | Histogram | `transport` | Write latency distribution in microseconds |
+| `tent_read_size_bytes` | Histogram | `transport` | Read request size distribution in bytes |
+| `tent_write_size_bytes` | Histogram | `transport` | Write request size distribution in bytes |
+| `tent_deadline_mlu_permille` | Histogram | `transport` | Deadline feasibility ratio (MLU x 1000); 1000 = MLU 1.0 (the met/missed boundary) |
+| `tent_stage_queue_wait_us` | Histogram | `transport` | Causal chain: queue wait latency in microseconds |
+| `tent_stage_dispatch_us` | Histogram | `transport` | Causal chain: dispatch latency in microseconds |
+| `tent_stage_transport_us` | Histogram | `transport` | Causal chain: transport execution latency in microseconds |
+
+**Notes**:
+- `*_requests_total` counts both successful and failed requests. To compute the success rate, use `1 - (failures / requests)`.
+- `*_failures_total` does not record bytes; failed transfers transfer no bytes.
+- `tent_deadline_infeasible_total` is a dedicated counter (not a histogram sentinel) so infeasible-at-submit cases are distinguishable from genuine high-MLU samples.
+- yalantinglibs omits zero-valued counters/histograms from the Prometheus output, so a metric only appears once it has been observed at least once.
+
+### Labels
+
+All metrics carry a `transport` label (the `tent_transport_failover_total`
+counter uses `from` and `to` instead) so every metric can be sliced by
+transport without grepping logs. Label values come exclusively from the
+`TransportType` enum closed set — no arbitrary strings are accepted, and
+the closed set is enforced at the type level via a pre-built lookup table
+indexed by enum.
+
+| Label | Values | Description |
+|-------|--------|-------------|
+| `transport` | `unspec`, `rdma`, `mnnvl`, `shm`, `nvlink`, `gds`, `io_uring`, `tcp`, `ascend`, `sunrise_link`, `tpu` | The transport that handled the transfer |
+| `from` | (same set) | Transport that failed before failover |
+| `to` | (same set) | Transport that the failover switched to |
+
+Label values are aligned with `TransportSelector::transportTypeName()`.
+`unspec` covers transfers that failed before a transport was selected.
+
+**Cardinality**: the `transport` label has 11 values; the failover
+`from`/`to` pair has at most 11x11 = 121 combinations (in practice only a
+few pairs ever occur). Total series across all metrics is bounded at
+~1500.
 
 ## Integration with TransferEngine
 
@@ -289,11 +320,11 @@ void TentMetrics::registerMetrics() {
         // ... existing counters ...
         &new_counter_,  // Add new counter here
     };
-    
+
     histograms_ = {
-        &read_latency_,
+        {&read_latency_, &kLatencyBuckets},
         // ... existing histograms ...
-        &new_histogram_,  // Add new histogram here
+        {&new_histogram_, &kNewBuckets},  // Add new histogram + its buckets here
     };
 }
 ```
@@ -325,22 +356,21 @@ No changes to `getPrometheusMetrics()` or `getJsonMetrics()` are required.
 
 ## Advanced Configuration
 
-### Custom Buckets
+### Histogram Buckets
 
-Define custom histogram buckets for specific use cases:
+Histogram bucket boundaries are fixed at compile time (defined as `static inline const std::vector<double>` members in `tent_metrics.h`: `kLatencyBuckets`, `kSizeBuckets`, `kMluPerMilleBuckets`, `kStageBuckets`). They are intentionally not runtime-configurable so that observability is reproducible across deployments. To change buckets, edit the constant in `tent_metrics.h` and rebuild.
 
-```cpp
-// Latency buckets (in seconds, converted to microseconds internally)
-std::vector<double> rdma_latency_buckets = {
-    0.000001, 0.000005, 0.00001, 0.00005, 0.0001,  // 1-100μs
-    0.0005, 0.001, 0.005, 0.01, 0.05, 0.1          // 0.5-100ms
-};
+### Compatibility
 
-// Size buckets for different data patterns (in bytes)
-std::vector<double> message_size_buckets = {
-    64, 256, 1024, 4096, 16384, 65536, 262144  // 64B to 256KB
-};
-```
+The `metrics/latency_buckets` and `metrics/size_buckets` config keys, and the `TENT_METRICS_LATENCY_BUCKETS` / `TENT_METRICS_SIZE_BUCKETS` environment variables, were removed and are now silently ignored. Histogram buckets are fixed at compile time (see Histogram Buckets above).
+
+**Migration:** remove these keys from your `transfer-engine.json` and unset the environment variables. If custom bucket boundaries are required, edit `kLatencyBuckets` / `kSizeBuckets` in `tent/metrics/tent_metrics.h` and rebuild.
+
+> **Note:** the previous runtime-configurable implementation had a latent bug — the JSON output labeled custom buckets with the compile-time default boundaries, so `/metrics/json` was already mislabeled for custom-bucket deployments. Removing the knob fixes this rather than preserving a buggy code path.
+
+The `metrics/enable_prometheus` and `metrics/enable_json` config keys, and the `TENT_METRICS_ENABLE_PROMETHEUS` / `TENT_METRICS_ENABLE_JSON` environment variables, were removed and are now silently ignored. The `/metrics` and `/metrics/json` HTTP endpoints are now registered unconditionally and cannot be toggled independently — both are read-only and served on the same port, so there was no real scenario where a deployment wanted one disabled.
+
+**Migration:** remove these keys from your `transfer-engine.json` and unset the environment variables. To fully disable the metrics subsystem (no HTTP server, no periodic summary logging, no recording), set `metrics/enabled` to `false` (or `TENT_METRICS_ENABLED=false`). Note that "log-only mode" — where periodic summaries are still logged but `/metrics` is unavailable — only occurs when metrics are enabled but the HTTP port cannot be bound (e.g. port conflict); it is not triggered by `metrics/enabled=false`.
 
 ### Validation
 
@@ -370,19 +400,31 @@ scrape_configs:
 ### Grafana Queries
 
 ```promql
-# Transfer throughput (MB/s)
+# Transfer throughput (MB/s) — all transports
 rate(tent_read_bytes_total[5m]) / 1024 / 1024
 rate(tent_write_bytes_total[5m]) / 1024 / 1024
+
+# Transfer throughput (MB/s) — per transport
+rate(tent_read_bytes_total{transport="rdma"}[5m]) / 1024 / 1024
+rate(tent_read_bytes_total{transport="tcp"}[5m]) / 1024 / 1024
 
 # Request rate
 rate(tent_read_requests_total[5m])
 rate(tent_write_requests_total[5m])
 
-# Failure rate
+# Failure rate (all transports)
 rate(tent_read_failures_total[5m]) / rate(tent_read_requests_total[5m])
+
+# Failure rate (per transport)
+rate(tent_read_failures_total{transport="tcp"}[5m]) / rate(tent_read_requests_total{transport="tcp"}[5m])
 
 # P99 latency (note: latency is in microseconds, convert to seconds for display)
 histogram_quantile(0.99, rate(tent_read_latency_us_bucket[5m])) / 1000000
 histogram_quantile(0.99, rate(tent_write_latency_us_bucket[5m])) / 1000000
-```
 
+# P99 latency per transport
+histogram_quantile(0.99, rate(tent_read_latency_us_bucket{transport="rdma"}[5m])) / 1000000
+
+# Failover rate by transport pair
+rate(tent_transport_failover_total{from="rdma",to="tcp"}[5m])
+```

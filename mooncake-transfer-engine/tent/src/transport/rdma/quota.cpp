@@ -318,6 +318,22 @@ Status DeviceSelector::release(int dev_id, uint64_t length, double latency) {
     return Status::OK();
 }
 
+Status DeviceSelector::getNicLoadStats(std::vector<NicLoadStats>& stats) const {
+    stats.reserve(stats.size() + devices_.size());
+    // devices_ is populated during topology load and remains stable while
+    // transfers update the per-device atomic counters below.
+    for (const auto& [dev_id, dev] : devices_) {
+        std::string device_name = local_topology_->getNicName(dev_id);
+        if (device_name.empty()) device_name = std::to_string(dev_id);
+        stats.push_back(NicLoadStats{
+            std::move(device_name),
+            dev.getInflightBytes(),
+            dev.getEwmaBandwidth(),
+        });
+    }
+    return Status::OK();
+}
+
 void DeviceSelector::printTrafficStats() {
     std::cout << "=== Device Traffic Statistics ===" << std::endl;
     for (const auto& [dev_id, dev] : devices_) {
@@ -356,6 +372,14 @@ int DeviceSelector::getDevicePriority(int dev_id) const {
         base_index = (base_index + rotation_offset) % num_devices;
     }
     return static_cast<int>(base_index);
+}
+
+double DeviceSelector::getAggregateEwmaBandwidth() const {
+    double total = 0.0;
+    for (const auto& [id, dev] : devices_) {
+        total += dev.getEwmaBandwidth();
+    }
+    return total > 0.0 ? total : -1.0;
 }
 
 }  // namespace tent

@@ -35,6 +35,7 @@ endfunction()
 
 add_store_test(buffer_allocator_test buffer_allocator_test.cpp)
 add_store_test(runtime_accelerator_test runtime_accelerator_test.cpp)
+add_store_test(registered_pinned_memory_test registered_pinned_memory_test.cpp)
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
 add_store_test(replica_selection_test replica_selection_test.cpp)
 add_test(
@@ -101,6 +102,7 @@ add_store_test(posix_file_test posix_file_test.cpp)
 add_store_test(thread_pool_test thread_pool_test.cpp)
 add_store_test(transfer_task_test transfer_task_test.cpp)
 add_store_test(tenant_quota_test tenant_quota_test.cpp)
+add_store_test(tenant_id_test tenant_id_test.cpp)
 add_store_test(segment_test segment_test.cpp)
 add_store_test(offset_allocator_test offset_allocator_test.cpp)
 add_store_test(utils_test utils_test.cpp)
@@ -124,6 +126,8 @@ add_store_test(
 add_store_test(file_util_test file_util_test.cpp)
 add_store_test(snapshot_child_process_test
                ha/snapshot/snapshot_child_process_test.cpp)
+add_store_test(master_snapshot_codec_test
+               ha/snapshot/master_snapshot_codec_test.cpp)
 add_store_test(master_service_test_for_snapshot
                ha/snapshot/master_service_test_for_snapshot.cpp)
 add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)
