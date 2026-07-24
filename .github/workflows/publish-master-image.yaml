@@ -83,12 +83,7 @@ jobs:
           PY
 
       - name: Free up disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo rm -rf /usr/local/lib/android
-          df -h
+        uses: ./.github/actions/free-disk-space
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3

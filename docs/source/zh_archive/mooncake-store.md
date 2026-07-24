@@ -747,7 +747,7 @@ HTTP 元数据服务器可通过以下参数进行配置：
 
 ## Mooncake Store Python API
 
-**完整的 Python API 文档**: [https://kvcache-ai.github.io/Mooncake/python-api-reference/mooncake-store.html](https://kvcache-ai.github.io/Mooncake/python-api-reference/mooncake-store.html)
+**完整的 Python API 文档**: [https://kvcache-ai.github.io/Mooncake/api-reference/python/mooncake-store.html](https://kvcache-ai.github.io/Mooncake/api-reference/python/mooncake-store.html)
 
 
 ## 编译及使用方法

@@ -85,6 +85,12 @@ class Transport {
         size_t transferred_bytes;
     };
 
+    struct NicLoadStats {
+        std::string device_name;
+        uint64_t inflight_bytes{0};
+        double ewma_bandwidth_bps{0.0};
+    };
+
     struct BatchDesc;
     struct TransferTask;
 

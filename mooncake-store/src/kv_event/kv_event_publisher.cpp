@@ -140,7 +140,7 @@ KvEventPublisher::~KvEventPublisher() {
 
 void KvEventPublisher::PublishStored(const std::string& object_key,
                                      const std::string& medium,
-                                     const std::string& tenant_id,
+                                     const TenantId& tenant_id,
                                      const std::string& group_id) {
     if (!config_.enabled) {
         return;
@@ -151,7 +151,7 @@ void KvEventPublisher::PublishStored(const std::string& object_key,
 
 void KvEventPublisher::PublishRemoved(const std::string& object_key,
                                       const std::string& medium,
-                                      const std::string& tenant_id,
+                                      const TenantId& tenant_id,
                                       const std::string& group_id) {
     if (!config_.enabled) {
         return;
@@ -260,8 +260,7 @@ void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
         const bool is_stored = item.pending.kind == EventKind::kStored;
         const char* rfc_type = is_stored ? "stored" : "removed";
         const char* legacy_type = is_stored ? "BlockStored" : "BlockRemoved";
-        const std::string& tenant_id =
-            item.pending.tenant_id.empty() ? "default" : item.pending.tenant_id;
+        const std::string& tenant_id = item.pending.tenant_id.value();
 
         const size_t map_size =
             ComputeEventMapSize(is_stored, config_.emit_legacy_compat_fields,

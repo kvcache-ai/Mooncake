@@ -163,6 +163,10 @@ class Transport {
 
     virtual double getEstimatedBandwidth() const { return -1.0; }
 
+    virtual Status getNicLoadStats(std::vector<NicLoadStats>&) const {
+        return Status::OK();
+    }
+
    protected:
     Capabilities caps;
 };

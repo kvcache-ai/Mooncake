@@ -40,11 +40,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Free up disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo rm -rf /usr/local/lib/android
+        uses: ./.github/actions/free-disk-space
 
       - name: Install CUDA Toolkit
         uses: Jimver/cuda-toolkit@v0.2.24
@@ -90,7 +86,7 @@ jobs:
           export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
           export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
           cd build
-          make -j
+          make -j3
           sudo make install
         shell: bash
 

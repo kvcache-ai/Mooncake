@@ -664,17 +664,4 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
     return {};
 }
 
-tl::expected<void, SerializationError>
-MasterSnapshotManager::UploadSnapshotPayloadFile(
-    const std::vector<uint8_t>& data, const std::string& path,
-    const std::string& local_filename, const std::string& snapshot_id) {
-    return repository_->UploadPayloadFile(data, path, local_filename,
-                                          snapshot_id);
-}
-
-void MasterSnapshotManager::CleanupOldSnapshot(size_t keep_count,
-                                               const std::string& snapshot_id) {
-    repository_->CleanupOldSnapshots(keep_count, snapshot_id);
-}
-
 }  // namespace mooncake

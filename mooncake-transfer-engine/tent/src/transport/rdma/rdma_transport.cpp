@@ -556,6 +556,10 @@ Status RdmaTransport::cancelTransferTask(SubBatchRef batch, int task_id) {
     return workers_->cancel(task);
 }
 
+Status RdmaTransport::getNicLoadStats(std::vector<NicLoadStats>& stats) const {
+    return workers_->getDeviceSelector()->getNicLoadStats(stats);
+}
+
 bool RdmaTransport::warmupMemory(void* addr, size_t length) {
     if (length < kMrWarmupMinBytes) return false;
     unsigned hwc = std::thread::hardware_concurrency();
