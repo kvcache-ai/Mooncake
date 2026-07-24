@@ -13,6 +13,7 @@
 #   -a, --all             Format all C/C++ files in the project
 #   -b, --base <branch>   Base branch to compare against (default: origin/main)
 #   -c, --check           Check mode: only report files that need formatting
+#       --staged          Format only added/modified lines staged for commit
 #   -h, --help            Show this help message
 #
 # Examples:
@@ -20,6 +21,7 @@
 #   ./scripts/code_format.sh --all              # Format all C/C++ files
 #   ./scripts/code_format.sh -b origin/dev      # Compare against origin/dev
 #   ./scripts/code_format.sh --check            # Check without modifying files
+#   ./scripts/code_format.sh --staged file.cpp  # Format staged lines (pre-commit)
 # =============================================================================
 
 set -e
@@ -28,6 +30,8 @@ set -e
 BASE_BRANCH="origin/main"
 CHECK_MODE=false
 ALL_MODE=false
+STAGED_MODE=false
+INPUT_FILES=()
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
@@ -116,15 +120,126 @@ parse_args() {
                 CHECK_MODE=true
                 shift
                 ;;
+            --staged)
+                STAGED_MODE=true
+                shift
+                ;;
             -h|--help)
                 usage
                 ;;
-            *)
+            --)
+                shift
+                INPUT_FILES+=("$@")
+                break
+                ;;
+            -*)
                 print_error "Unknown option: $1"
                 usage
                 ;;
+            *)
+                INPUT_FILES+=("$1")
+                shift
+                ;;
         esac
     done
+
+    if ${ALL_MODE} && ${STAGED_MODE}; then
+        print_error "--all and --staged cannot be used together."
+        exit 1
+    fi
+}
+
+# Extract the new-file line ranges from a zero-context staged diff. A pure
+# deletion has a line count of zero and does not need formatting.
+get_staged_line_ranges() {
+    local file="$1"
+
+    git -C "${PROJECT_ROOT}" diff --cached --unified=0 \
+        --diff-filter=ACMR -- "${file}" |
+        sed -nE 's/^@@ -[0-9]+(,[0-9]+)? \+([0-9]+)(,([0-9]+))? @@.*/\2 \4/p'
+}
+
+# Format only lines added or modified in the index. Pre-commit temporarily
+# stashes unstaged changes, so the working tree matches the staged snapshot
+# while this hook runs.
+format_staged_files() {
+    local clang_format="$1"
+    shift
+    local formatted_count=0
+    local failed_count=0
+
+    print_info "Using $(${clang_format} --version)"
+    print_info "Formatting only staged C/C++ line ranges"
+    echo ""
+
+    local file
+    for file in "$@"; do
+        local excluded=false
+        local pattern
+        for pattern in "${EXCLUDE_DIRS[@]}"; do
+            if [[ "${file}" == *"${pattern}"* ]]; then
+                excluded=true
+                break
+            fi
+        done
+        if ${excluded}; then
+            continue
+        fi
+
+        if [[ ! -f "${PROJECT_ROOT}/${file}" ]]; then
+            continue
+        fi
+
+        local line_args=()
+        local start count end
+        while read -r start count; do
+            [[ -z "${start}" ]] && continue
+            count="${count:-1}"
+            [[ "${count}" -eq 0 ]] && continue
+            end=$((start + count - 1))
+            line_args+=("-lines=${start}:${end}")
+        done < <(get_staged_line_ranges "${file}")
+
+        if [[ ${#line_args[@]} -eq 0 ]]; then
+            continue
+        fi
+
+        if ${CHECK_MODE}; then
+            if ! "${clang_format}" -style=file --dry-run -Werror \
+                "${line_args[@]}" "${PROJECT_ROOT}/${file}" 2>&1; then
+                print_warn "Staged lines need formatting: ${file}"
+                failed_count=$((failed_count + 1))
+            else
+                print_info "OK: ${file}"
+            fi
+        else
+            local before after
+            before=$(git hash-object "${PROJECT_ROOT}/${file}")
+            if "${clang_format}" -style=file -i "${line_args[@]}" \
+                "${PROJECT_ROOT}/${file}"; then
+                after=$(git hash-object "${PROJECT_ROOT}/${file}")
+                if [[ "${before}" == "${after}" ]]; then
+                    print_info "Already formatted: ${file}"
+                else
+                    print_info "Formatted staged lines: ${file}"
+                    formatted_count=$((formatted_count + 1))
+                fi
+            else
+                print_error "Failed to format staged lines: ${file}"
+                failed_count=$((failed_count + 1))
+            fi
+        fi
+    done
+
+    echo ""
+    if ${CHECK_MODE} && [[ ${failed_count} -gt 0 ]]; then
+        print_error "${failed_count} file(s) have unformatted staged lines."
+        return 1
+    fi
+    if ! ${CHECK_MODE}; then
+        print_info "Formatted staged lines in ${formatted_count} file(s)."
+    fi
+    [[ ${failed_count} -eq 0 ]]
 }
 
 # Get list of all C/C++ files in the project
@@ -266,6 +381,22 @@ main() {
     local clang_format
     if ! clang_format="$(find_clang_format)"; then
         exit 1
+    fi
+
+    if ${STAGED_MODE}; then
+        local staged_files=("${INPUT_FILES[@]}")
+        if [[ ${#staged_files[@]} -eq 0 ]]; then
+            local file
+            while IFS= read -r -d '' file; do
+                staged_files+=("${file}")
+            done < <(
+                git -C "${PROJECT_ROOT}" diff --cached --name-only -z \
+                    --diff-filter=ACMR -- \
+                    '*.c' '*.cc' '*.cpp' '*.cxx' '*.cu' '*.cuh' '*.h' '*.hpp'
+            )
+        fi
+        format_staged_files "${clang_format}" "${staged_files[@]}"
+        return
     fi
 
     # Get files to format

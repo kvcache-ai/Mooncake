@@ -47,10 +47,9 @@ Mooncake uses [pre-commit](https://pre-commit.com/) to enforce consistent format
 | Type | Tool | Purpose |
 |------|------|---------|
 | Generic | trailing-whitespace / end-of-file-fixer | Basic hygiene |
-| Project | `./scripts/code_format.sh` | Enforce Mooncake C/C++ formatting script before commit |
+| Project | `./scripts/code_format.sh --staged` | Format staged C/C++ changes before commit |
 | Python | ruff / ruff-format | Lint + format (includes import sorting) |
 | Spelling | codespell | Catch common typos (ignores domain-specific words) |
-| C/C++ | clang-format | Apply style from the repository's `.clang-format` |
 | CMake | cmake-format | Keep build scripts readable |
 | Meta | check-yaml / check-merge-conflict / check-added-large-files | Prevent bad commits |
 
@@ -60,10 +59,15 @@ pip install -r requirements.txt
 pre-commit install
 ```
 
-After installation, every commit will run `./scripts/code_format.sh` automatically. If it rewrites files, re-stage the changes and commit again.
+After installation, every commit formats only the added or modified lines in
+staged C/C++ files. If the hook rewrites a file, review and re-stage it before
+committing again. Use `./scripts/code_format.sh --all` only when intentionally
+formatting the whole project.
 
 #### Usage
-Run on all files (first run will install hook environments):
+Run hooks on all files (the first run installs hook environments). The C/C++
+hook remains limited to staged line ranges; use `./scripts/code_format.sh --all`
+for an intentional whole-project C/C++ format:
 ```bash
 pre-commit run --all-files
 ```
