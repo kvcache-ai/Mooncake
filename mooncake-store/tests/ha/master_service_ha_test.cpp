@@ -3331,6 +3331,71 @@ TEST_F(MasterServiceHATest, BatchEvictWritesBatchRecordOpLog) {
     EXPECT_EQ(3u, batch.entries[0].sequence_id);
 }
 
+TEST_F(MasterServiceHATest, BatchEvictStopsAfterFirstOpLogReservationFailure) {
+    const std::string cluster_id = "test_batch_evict_reservation_stop";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    MasterService service(MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(1)
+                              .build());
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    auto mounted = PrepareSimpleSegment(service, "reservation_stop_segment");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+    PutObjectOnSegment(service, mounted.client_id, "reservation_stop_first",
+                       "reservation_stop_segment");
+    ReadBatchEventually(storage, 2, batch);
+    PutObjectOnSegment(service, mounted.client_id, "reservation_stop_second",
+                       "reservation_stop_segment");
+    ReadBatchEventually(storage, 3, batch);
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+
+    {
+        auto held = ReserveBatchSlotForTesting(service);
+        ASSERT_TRUE(held.has_value());
+        SetNeedMemoryEvictionForTesting(service, true);
+        testing::internal::CaptureStderr();
+        service.RunBatchEvictForTesting(/*evict_ratio_target=*/1.0,
+                                        /*evict_ratio_lowerbound=*/1.0);
+        const std::string logs = testing::internal::GetCapturedStderr();
+
+        const std::string warning = "BatchEvict: OpLog reservation failed";
+        const auto first = logs.find(warning);
+        ASSERT_NE(first, std::string::npos);
+        EXPECT_EQ(logs.find(warning, first + warning.size()),
+                  std::string::npos);
+        EXPECT_TRUE(NeedMemoryEvictionForTesting(service));
+        EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                         "reservation_stop_first"),
+                  1);
+        EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                         "reservation_stop_second"),
+                  1);
+    }
+
+    service.RunBatchEvictForTesting(/*evict_ratio_target=*/1.0,
+                                    /*evict_ratio_lowerbound=*/1.0);
+    for (int i = 0; i < 50; ++i) {
+        if (ReplicaCountForTesting(service, kDefaultTenant,
+                                   "reservation_stop_first") == 0 &&
+            ReplicaCountForTesting(service, kDefaultTenant,
+                                   "reservation_stop_second") == 0) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "reservation_stop_first"),
+              0);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "reservation_stop_second"),
+              0);
+}
+
 TEST_F(MasterServiceHATest, BatchEvictReleasesMemoryAfterDurable) {
     const std::string cluster_id = "test_batch_record_batch_evict_finalize";
     auto backend = std::make_shared<BlockingBatchHaKvBackend>();
