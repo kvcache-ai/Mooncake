@@ -113,13 +113,22 @@ class OperationState {
  */
 class EmptyOperationState : public OperationState {
    public:
+    explicit EmptyOperationState(
+        TransferStrategy strategy = TransferStrategy::EMPTY)
+        : strategy_(strategy) {
+        // Pre-set result so get_result() does not assert - this state is
+        // always considered successfully completed (no async work needed).
+        result_.emplace(ErrorCode::OK);
+    }
+
     bool is_completed() override { return true; }
 
     void wait_for_completion() override {}
 
-    TransferStrategy get_strategy() const override {
-        return TransferStrategy::EMPTY;
-    }
+    TransferStrategy get_strategy() const override { return strategy_; }
+
+   private:
+    TransferStrategy strategy_;
 };
 
 /**
