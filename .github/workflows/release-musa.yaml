@@ -37,7 +37,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/heads/release/{0}', inputs.tag) || github.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
           fetch-depth: 0
 
       - name: Mark repository as safe
@@ -57,8 +57,12 @@ jobs:
           fi
           git check-ref-format "refs/tags/${RELEASE_TAG}"
           TAG_SHA="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
-          echo "Build source: release/${RELEASE_TAG} at $(git rev-parse HEAD)"
-          echo "Release tag: ${RELEASE_TAG} at ${TAG_SHA}"
+          BUILD_SHA="$(git rev-parse HEAD)"
+          if [[ "${BUILD_SHA}" != "${TAG_SHA}" ]]; then
+            echo "::error::Build source ${BUILD_SHA} does not match ${RELEASE_TAG} at ${TAG_SHA}"
+            exit 1
+          fi
+          echo "Build source: ${RELEASE_TAG} at ${BUILD_SHA}"
 
       - name: Setup Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -163,7 +167,7 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/heads/release/{0}', inputs.tag) || github.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
 
       - name: Download all wheel artifacts
         uses: actions/download-artifact@v4
