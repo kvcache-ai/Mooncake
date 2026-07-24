@@ -459,20 +459,6 @@ static inline std::pair<HandShakeRequestType, std::string> readString(int fd) {
         return {type, ""};
     }
 
-    const char *prefix = reinterpret_cast<const char *>(&length);
-    auto hasPrefix = [prefix](std::string_view probe) {
-        return std::memcmp(prefix, probe.data(), probe.size()) == 0;
-    };
-    if (hasPrefix("GET ") || hasPrefix("HEAD") || hasPrefix("POST") ||
-        hasPrefix("PUT ") || hasPrefix("DELE") || hasPrefix("OPTI") ||
-        hasPrefix("TRAC") || hasPrefix("PATC") || hasPrefix("CONN") ||
-        hasPrefix("UNKN") ||
-        (static_cast<unsigned char>(prefix[0]) == 0x16 &&
-         static_cast<unsigned char>(prefix[1]) == 0x03)) {
-        LOG(WARNING) << "readString: ignoring non-handshake probe";
-        return {type, ""};
-    }
-
     if (length > kMaxLength) {
         LOG(ERROR) << "readString: too large length from socket: " << length;
         return {type, ""};

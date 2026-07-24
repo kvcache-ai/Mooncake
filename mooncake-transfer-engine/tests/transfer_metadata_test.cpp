@@ -251,6 +251,24 @@ TEST(HandshakeFrameTest, ValidFrameRoundTrips) {
     close(fds[1]);
 }
 
+TEST(HandshakeFrameTest, ValidTypedFrameWithTlsLikeNativeEndianLength) {
+    int fds[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+
+    // 790 is encoded as 0x16 0x03 0x00 ... on little-endian machines, which
+    // collides with the first two bytes of a TLS ClientHello record. It is
+    // still a valid native-endian handshake frame length.
+    const std::string payload(789, 'x');
+    ASSERT_EQ(writeString(fds[0], HandShakeRequestType::Metadata, payload), 0);
+
+    auto [type, read_payload] = readString(fds[1]);
+    EXPECT_EQ(type, HandShakeRequestType::Metadata);
+    EXPECT_EQ(read_payload, payload);
+
+    close(fds[0]);
+    close(fds[1]);
+}
+
 TEST(HandshakeFrameTest, OldProtocolFrameStillWorks) {
     int fds[2];
     ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
