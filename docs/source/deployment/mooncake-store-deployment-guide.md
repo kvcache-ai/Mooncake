@@ -237,43 +237,11 @@ The master resolves the current IPv4 address of `eth0` at startup and uses it as
 
 ---
 
-### Multi-Model KV Cache Isolation
+### KV Cache Sharing and Isolation
 
-Mooncake Store treats object keys as opaque strings. When multiple models share one Mooncake Store, configure the model identifier in the inference framework to keep their KV cache entries separate.
+Mooncake Store treats object keys as opaque strings, so inference frameworks define the cache-sharing boundary. Configure a stable model identifier for every deployment, and use a separate release prefix or request salt when a finer isolation boundary is needed.
 
-#### SGLang
-
-With an SGLang version that includes [model-aware Mooncake key isolation](https://github.com/sgl-project/sglang/pull/31920), set a stable and unique `--served-model-name`:
-
-```bash
-python -m sglang.launch_server \
-  --model-path Qwen/Qwen3-8B \
-  --served-model-name qwen3-8b \
-  --enable-hierarchical-cache \
-  --hicache-storage-backend mooncake
-```
-
-Use the same `--served-model-name` on all SGLang instances that should share KV cache entries.
-
-#### vLLM
-
-The vLLM `MooncakeStoreConnector` automatically uses the final component of the model passed to `vllm serve` as the model identifier, so no separate model-name setting is required. To isolate deployments whose model paths end with the same name, assign each deployment a distinct `cache_prefix`:
-
-```bash
-MOONCAKE_CONFIG_PATH=/path/to/mooncake_config.json \
-vllm serve Qwen/Qwen3-8B \
-  --kv-transfer-config '{
-    "kv_connector": "MooncakeStoreConnector",
-    "kv_role": "kv_both",
-    "kv_connector_extra_config": {
-      "cache_prefix": "qwen3-8b-production"
-    }
-  }'
-```
-
-Use the same model and `cache_prefix` on all vLLM instances that should share KV cache entries.
-
-Separately, enabling `--enable_multi_tenants=true` adds a `tenant_id`-scoped object namespace and per-tenant quota admission. See [Tenant Quota Management](#tenant-quota-management) for configuration details.
+See [KV Cache Sharing and Isolation](kv-cache-sharing-and-isolation) for SGLang and vLLM configuration, rolling-upgrade examples, and the relationship between model names, `cache_salt`, and Mooncake tenants.
 
 ---
 
@@ -389,6 +357,7 @@ In HA mode, quota admin requests are served only by the active master service. S
 - Scale `--rpc_thread_num` with available CPU cores and workload.
 - Start with default eviction settings; adjust `--eviction_high_watermark_ratio` and `--eviction_ratio` based on memory pressure and object churn.
 - Use `/metrics/summary` during bring-up; integrate `/metrics` with Prometheus/Grafana for production.
+- For multi-model deployments and rolling upgrades, see [KV Cache Sharing and Isolation](kv-cache-sharing-and-isolation).
 - For detailed SSD offload configuration (storage backends, eviction policies, io_uring), see the [SSD Offload guide](ssd/ssd-offload).
 - For NVMe-oF SSD pool configuration see the [NVMe-oF SSD Pool Deployment Guide](ssd/nvmf-ssd-deployment-guide)
 - For experimental 3FS (USRBIO) integration as a persistent storage backend, see the [3FS USRBIO Plugin guide](../getting_started/plugin-usage/3FS-USRBIO-Plugin).
@@ -398,6 +367,7 @@ In HA mode, quota admin requests are served only by the active master service. S
 :maxdepth: 1
 :hidden:
 
+KV Cache Sharing and Isolation<kv-cache-sharing-and-isolation>
 SSD Storage<ssd/index>
 HF3FS Plugin (Experimental)<../getting_started/plugin-usage/3FS-USRBIO-Plugin>
 ../getting_started/observability
