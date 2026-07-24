@@ -1,5 +1,9 @@
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+
 #include "client_meta.h"
 #include "p2p_segment_manager.h"
 #include "p2p_rpc_types.h"
@@ -25,17 +29,19 @@ class P2PClientMeta final : public ClientMeta {
 
    public:
     /**
-     * @brief A wrapper function of collecting write route candidates from this
-     *        client in ForEachClient
-     * @param req The write route request containing filter config
-     * @param candidates Output: collected candidates
-     * @return On error, returns an unexpected ErrorCode.
-     *         Otherwise, returns bool value to indicate whether collected
-     *         candidates are enough. If return `true`, ForEachClient will stop
+     * @brief Evaluate this client as a write-route candidate.
+     *
+     * Performs health check and capacity filtering (tag_filters /
+     * priority_limit / top_tier_only) internally and, on success, returns a
+     * WriteCandidate whose `score` is the raw free ratio (free/total over
+     * eligible tiers).
+     *
+     * @return A populated WriteCandidate when this client is routable;
+     *         std::nullopt when it is not a candidate (unhealthy, no eligible
+     *         tier, or insufficient free capacity).
      */
-    auto CollectWriteRouteCandidates(const WriteRouteRequest& req,
-                                     std::vector<WriteCandidate>& candidates)
-        -> tl::expected<bool, ErrorCode>;
+    std::optional<WriteCandidate> GetWriteRouteCandidate(
+        const WriteRouteRequest& req);
 
    public:
     void DoOnDisconnected() override {}
@@ -50,8 +56,24 @@ class P2PClientMeta final : public ClientMeta {
     }
 
    private:
-    static constexpr size_t INF_PRIORITY = 10000;
+    /// Free/total capacity over the segments eligible for write-route scoring.
+    struct CapacityStat {
+        size_t free = 0;
+        size_t total = 0;
+    };
+    /**
+     * @brief Aggregate free/total over the eligible segments for write-route
+     *        scoring. A segment is eligible when it carries no tag in
+     *        `tag_filters` and its priority is >= `priority_limit`. When
+     *        `top_tier_only` is true, only the highest-priority eligible
+     *        segment(s) contribute (a client may not spill to lower tiers under
+     *        memory pressure). Returns {0,0} when no segment is eligible.
+     */
+    CapacityStat GetWriteScoreCapacity(
+        const std::vector<std::string>& tag_filters, int priority_limit,
+        bool top_tier_only) const;
 
+   private:
     std::string ip_address_;
     uint16_t rpc_port_ = 0;
     std::shared_ptr<P2PSegmentManager> segment_manager_;

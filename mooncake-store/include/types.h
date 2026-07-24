@@ -122,6 +122,8 @@ enum class ErrorCode : int32_t {
     CLIENT_ALREADY_EXISTS = -104,     ///< Client already exists.
     CLIENT_UNHEALTHY =
         -105,  ///< Client is not in a healthy state for the operation.
+    NO_AVAILABLE_CANDIDATE =
+        -106,  ///< No available write-route candidate found.
 
     // Handle selection errors (Range: -200 to -299)
     NO_AVAILABLE_HANDLE =

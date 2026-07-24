@@ -374,7 +374,7 @@ class RedisChaosTest : public ::testing::Test {
         config.enable_oplog = true;
         config.oplog_store_type = "redis";
         config.oplog_data_dir = FLAGS_redis_endpoint;
-        config.max_replicas_per_key = 0;
+        config.max_client_per_key = 0;
 
         for (int i = 0; i < kMasterNum; ++i) {
             masters_.emplace_back(std::make_unique<MasterProcessHandler>(

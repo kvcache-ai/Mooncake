@@ -77,13 +77,16 @@ class P2PClientIntegrationTest : public ::testing::Test {
         master_address_ = master_.master_address();
         LOG(INFO) << "P2P master started at " << master_address_;
 
-        // 2. Create a client
+        // 2. Create two clients
         client_ = CreateP2PClient("localhost:18801");
         ASSERT_NE(client_, nullptr);
-        LOG(INFO) << "P2P client created and registered successfully";
+        client2_ = CreateP2PClient("localhost:18802");
+        ASSERT_NE(client2_, nullptr);
+        LOG(INFO) << "Two P2P clients created and registered successfully";
     }
 
     static void TearDownTestSuite() {
+        client2_.reset();
         client_.reset();
         master_.Stop();
         google::ShutdownGoogleLogging();
@@ -93,12 +96,14 @@ class P2PClientIntegrationTest : public ::testing::Test {
     static InProcP2PMaster master_;
     static std::string master_address_;
     static std::shared_ptr<P2PClientService> client_;
+    static std::shared_ptr<P2PClientService> client2_;
 };
 
 // Static member definitions
 InProcP2PMaster P2PClientIntegrationTest::master_;
 std::string P2PClientIntegrationTest::master_address_;
 std::shared_ptr<P2PClientService> P2PClientIntegrationTest::client_ = nullptr;
+std::shared_ptr<P2PClientService> P2PClientIntegrationTest::client2_ = nullptr;
 
 // ============================================================================
 // Put / Get (local WRITE_LOCAL mode)
@@ -156,6 +161,125 @@ TEST_F(P2PClientIntegrationTest, PutAndGetLocal) {
     EXPECT_TRUE(metrics_after_get.value().find(
                     "mooncake_p2p_local_get_bytes_total " +
                     std::to_string(data.size())) != std::string::npos);
+}
+
+TEST_F(P2PClientIntegrationTest, ForceLocalWriteBypass) {
+    const std::string data = "force_local_payload";
+
+    // remote_weight=0: client_ writes locally instead of asking the master
+    // for a remote route.
+    {
+        const std::string key = "force_local_key";
+        WriteRouteRequestConfig cfg;
+        cfg.remote_weight = 0.0;
+
+        std::vector<Slice> slices;
+        slices.emplace_back(Slice{const_cast<char*>(data.data()), data.size()});
+        auto put = client_->Put(key, slices, cfg);
+        ASSERT_TRUE(put.has_value())
+            << "Force-local Put failed: " << static_cast<int>(put.error());
+
+        // Readable on local client.
+        std::vector<char> buf(data.size(), 0);
+        auto get = client_->Get(key, {(void*)buf.data()}, {buf.size()});
+        ASSERT_TRUE(get.has_value());
+        EXPECT_EQ(std::string(buf.data(), buf.size()), data);
+
+        // Verify via master that the replica is on client_ (local).
+        auto resp = client_->GetMasterClient().GetReplicaList(key);
+        ASSERT_TRUE(resp.has_value());
+        ASSERT_FALSE(resp->replicas.empty());
+        const auto& desc = resp->replicas[0];
+        ASSERT_TRUE(std::holds_alternative<P2PProxyDescriptor>(
+            desc.descriptor_variant));
+        EXPECT_EQ(
+            std::get<P2PProxyDescriptor>(desc.descriptor_variant).client_id,
+            client_->GetClientID());
+    }
+
+    // remote_weight=1: client_ writes to client2_ via master routing.
+    // The replica should be on client2_ (remote), not on client_.
+    {
+        const std::string key = "force_remote_key";
+        WriteRouteRequestConfig cfg;
+        cfg.remote_weight = 1.0;
+        cfg.local_write_waterline = 0.0;  // disable waterline for force-remote
+
+        std::vector<Slice> slices;
+        slices.emplace_back(Slice{const_cast<char*>(data.data()), data.size()});
+        auto put = client_->Put(key, slices, cfg);
+        ASSERT_TRUE(put.has_value())
+            << "Force-remote Put failed: " << static_cast<int>(put.error());
+
+        // Readable on remote client.
+        std::vector<char> buf(data.size(), 0);
+        auto get = client2_->Get(key, {(void*)buf.data()}, {buf.size()});
+        ASSERT_TRUE(get.has_value())
+            << "Force-remote data should be on client2_";
+        EXPECT_EQ(std::string(buf.data(), buf.size()), data);
+
+        // Verify via master that the replica is on client2_ (remote).
+        auto resp = client_->GetMasterClient().GetReplicaList(key);
+        ASSERT_TRUE(resp.has_value());
+        ASSERT_FALSE(resp->replicas.empty());
+        const auto& desc = resp->replicas[0];
+        ASSERT_TRUE(std::holds_alternative<P2PProxyDescriptor>(
+            desc.descriptor_variant));
+        EXPECT_EQ(
+            std::get<P2PProxyDescriptor>(desc.descriptor_variant).client_id,
+            client2_->GetClientID());
+    }
+}
+
+// When local utilization is below the waterline, the client writes locally
+TEST_F(P2PClientIntegrationTest, WaterlineBypassWritesLocal) {
+    const std::string data = "waterline_payload";
+
+    // Local client is nearly empty (64MB DRAM, ~0% utilization).
+    // With waterline=0.5 and remote_weight=0.5 (balanced), the waterline
+    // triggers a local write: data stays on client_.
+    const std::string key = "waterline_bypass_key";
+    WriteRouteRequestConfig cfg;
+    cfg.remote_weight = 0.5;          // balanced
+    cfg.local_write_waterline = 0.5;  // local is < 50% full -> local write
+
+    std::vector<Slice> slices;
+    slices.emplace_back(Slice{const_cast<char*>(data.data()), data.size()});
+    auto put = client_->Put(key, slices, cfg);
+    ASSERT_TRUE(put.has_value())
+        << "Waterline-bypass Put failed: " << static_cast<int>(put.error());
+
+    // Readable on local client.
+    std::vector<char> buf(data.size(), 0);
+    auto get = client_->Get(key, {(void*)buf.data()}, {buf.size()});
+    ASSERT_TRUE(get.has_value());
+    EXPECT_EQ(std::string(buf.data(), buf.size()), data);
+
+    // Verify via master that the replica is on client_ (local).
+    auto resp = client_->GetMasterClient().GetReplicaList(key);
+    ASSERT_TRUE(resp.has_value());
+    ASSERT_FALSE(resp->replicas.empty());
+    const auto& desc = resp->replicas[0];
+    ASSERT_TRUE(
+        std::holds_alternative<P2PProxyDescriptor>(desc.descriptor_variant));
+    EXPECT_EQ(std::get<P2PProxyDescriptor>(desc.descriptor_variant).client_id,
+              client_->GetClientID());
+}
+
+// Contradictory config (waterline=0 + remote_weight=0, a dead-end combo)
+// is rejected by BatchPut at the client side.
+TEST_F(P2PClientIntegrationTest, ContradictoryConfigRejected) {
+    const std::string data = "contradictory_payload";
+    WriteRouteRequestConfig cfg;
+    cfg.remote_weight = 0.0;
+    cfg.local_write_waterline =
+        0.0;  // dead end: forbid local write + forbid remote route
+
+    std::vector<Slice> slices;
+    slices.emplace_back(Slice{const_cast<char*>(data.data()), data.size()});
+    auto put = client_->Put("contradictory_key", slices, cfg);
+    ASSERT_FALSE(put.has_value());
+    EXPECT_EQ(put.error(), ErrorCode::INVALID_PARAMS);
 }
 
 // ============================================================================
@@ -343,8 +467,8 @@ TEST_F(P2PClientIntegrationTest, RemoteBatchPutAndBatchGet) {
         // Force write route to exclude local candidate so the writer must
         // execute remote Put RPCs.
         WriteRouteRequestConfig remote_put_config;
-        remote_put_config.allow_local = false;
-        remote_put_config.prefer_local = false;
+        remote_put_config.remote_weight = 1.0;  // force remote
+        remote_put_config.local_write_waterline = 0.0;
         remote_put_config.max_candidates =
             WriteRouteRequestConfig::RETURN_ALL_CANDIDATES;
         auto put_results =
@@ -768,8 +892,8 @@ TEST_F(P2PClientIntegrationTest, ForwardRemotePutAndGet) {
         const std::string payload = "forward_payload_" + mode + "_data";
 
         WriteRouteRequestConfig route;
-        route.allow_local = false;
-        route.prefer_local = false;
+        route.remote_weight = 1.0;  // force remote
+        route.local_write_waterline = 0.0;
         route.max_candidates = WriteRouteRequestConfig::RETURN_ALL_CANDIDATES;
 
         std::vector<Slice> slices;
@@ -835,8 +959,8 @@ TEST_F(P2PClientIntegrationTest, ForwardRemoteBatchPutAndBatchGet) {
         }
 
         WriteRouteRequestConfig remote_put_config;
-        remote_put_config.allow_local = false;
-        remote_put_config.prefer_local = false;
+        remote_put_config.remote_weight = 1.0;  // force remote
+        remote_put_config.local_write_waterline = 0.0;
         remote_put_config.max_candidates =
             WriteRouteRequestConfig::RETURN_ALL_CANDIDATES;
 

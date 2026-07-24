@@ -64,7 +64,7 @@ struct MasterConfig {
     std::string cxl_path;
     size_t cxl_size;
     bool enable_cxl = false;
-    uint64_t max_replicas_per_key;
+    uint64_t max_client_per_key;
 
     std::string deployment_mode;
 
@@ -140,7 +140,7 @@ class MasterServiceSupervisorConfig {
         DEFAULT_PENDING_TASK_TIMEOUT_SEC;  // 0 = no timeout(infinite)
     uint64_t processing_task_timeout_sec =
         DEFAULT_PROCESSING_TASK_TIMEOUT_SEC;  // 0 = no timeout(infinite)
-    uint64_t max_replicas_per_key = 1;
+    uint64_t max_client_per_key = 1;
     DeploymentMode deployment_mode = DeploymentMode::CENTRALIZATION;
 
     std::string cxl_path = DEFAULT_CXL_PATH;
@@ -210,7 +210,7 @@ class MasterServiceSupervisorConfig {
         max_total_processing_tasks = config.max_total_processing_tasks;
         pending_task_timeout_sec = config.pending_task_timeout_sec;
         processing_task_timeout_sec = config.processing_task_timeout_sec;
-        max_replicas_per_key = config.max_replicas_per_key;
+        max_client_per_key = config.max_client_per_key;
         if (config.deployment_mode == "Centralization") {
             deployment_mode = DeploymentMode::CENTRALIZATION;
         } else {
@@ -344,7 +344,7 @@ class WrappedMasterServiceConfig {
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
     uint64_t quota_bytes = 0;
-    uint64_t max_replicas_per_key = 1;
+    uint64_t max_client_per_key = 1;
 
     uint32_t max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
     uint32_t max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS;
@@ -394,7 +394,7 @@ class WrappedMasterServiceConfig {
         global_file_segment_size = config.global_file_segment_size;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
-        max_replicas_per_key = config.max_replicas_per_key;
+        max_client_per_key = config.max_client_per_key;
 
         // Convert string memory_allocator to BufferAllocatorType enum
         if (config.memory_allocator == "cachelib") {
@@ -453,7 +453,7 @@ class WrappedMasterServiceConfig {
         memory_allocator = config.memory_allocator;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
-        max_replicas_per_key = config.max_replicas_per_key;
+        max_client_per_key = config.max_client_per_key;
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
         max_total_finished_tasks = config.max_total_finished_tasks;
@@ -501,7 +501,7 @@ class MasterServiceConfigBuilder {
     BufferAllocatorType memory_allocator_ = BufferAllocatorType::OFFSET;
     bool enable_disk_eviction_ = true;
     uint64_t quota_bytes_ = 0;
-    uint64_t max_replicas_per_key_ = 1;
+    uint64_t max_client_per_key_ = 1;
     uint64_t put_start_discard_timeout_sec_ = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec_ = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     uint32_t max_total_finished_tasks_ = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
@@ -625,8 +625,8 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
-    MasterServiceConfigBuilder& set_max_replicas_per_key(uint64_t limit) {
-        max_replicas_per_key_ = limit;
+    MasterServiceConfigBuilder& set_max_client_per_key(uint64_t limit) {
+        max_client_per_key_ = limit;
         return *this;
     }
 
@@ -737,7 +737,7 @@ class MasterServiceConfig {
         .pending_task_timeout_sec = DEFAULT_PENDING_TASK_TIMEOUT_SEC,
         .processing_task_timeout_sec = DEFAULT_PROCESSING_TASK_TIMEOUT_SEC,
     };
-    uint64_t max_replicas_per_key = 1;
+    uint64_t max_client_per_key = 1;
 
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
@@ -777,7 +777,7 @@ class MasterServiceConfig {
             config.enable_cxl ? cxl_allocator_type : config.memory_allocator;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
-        max_replicas_per_key = config.max_replicas_per_key;
+        max_client_per_key = config.max_client_per_key;
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
         task_manager_config.max_total_finished_tasks =
@@ -839,7 +839,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.cxl_path = cxl_path_;
     config.cxl_size = cxl_size_;
     config.enable_cxl = enable_cxl_;
-    config.max_replicas_per_key = max_replicas_per_key_;
+    config.max_client_per_key = max_client_per_key_;
 
     // Logic for client_crashed_ttl_sec
     if (client_crashed_ttl_sec_set_) {

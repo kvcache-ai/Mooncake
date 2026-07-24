@@ -1,6 +1,7 @@
 #include "runtime_config_store.h"
 
 #include <glog/logging.h>
+#include <type_traits>
 
 namespace mooncake {
 
@@ -20,9 +21,20 @@ ReadRouteConfig RuntimeConfigStore::getDefaultReadConfig() const {
     return read_;
 }
 
-void RuntimeConfigStore::updateWriteConfig(const Json::Value& json) {
+bool RuntimeConfigStore::updateWriteConfig(const Json::Value& json) {
     std::unique_lock lock(mu_);
-    std::visit([&json](auto& cfg) { applyPatch(cfg, json); }, write_);
+    bool ok = true;
+    std::visit(
+        [&](auto& cfg) {
+            if constexpr (std::is_same_v<std::decay_t<decltype(cfg)>,
+                                         WriteRouteRequestConfig>) {
+                ok = applyPatch(cfg, json);
+            } else {
+                applyPatch(cfg, json);
+            }
+        },
+        write_);
+    return ok;
 }
 
 void RuntimeConfigStore::updateReadConfig(const Json::Value& json) {
@@ -39,12 +51,22 @@ Json::Value RuntimeConfigStore::exportConfig() const {
     return root;
 }
 
-void RuntimeConfigStore::loadFromJson(const Json::Value& root) {
-    if (root.isNull() || !root.isObject()) return;
+bool RuntimeConfigStore::loadFromJson(const Json::Value& root) {
+    if (root.isNull() || !root.isObject()) return true;
 
     std::unique_lock lock(mu_);
+    bool ok = true;
     if (root.isMember("write")) {
-        std::visit([&](auto& cfg) { applyPatch(cfg, root["write"]); }, write_);
+        std::visit(
+            [&](auto& cfg) {
+                if constexpr (std::is_same_v<std::decay_t<decltype(cfg)>,
+                                             WriteRouteRequestConfig>) {
+                    ok = applyPatch(cfg, root["write"]);
+                } else {
+                    applyPatch(cfg, root["write"]);
+                }
+            },
+            write_);
     }
     if (root.isMember("read")) {
         applyPatch(read_, root["read"]);
@@ -52,6 +74,7 @@ void RuntimeConfigStore::loadFromJson(const Json::Value& root) {
     lock.unlock();
 
     LOG(INFO) << "Loaded runtime config: " << root.toStyledString();
+    return ok;
 }
 
 // --- Patch helpers ---
@@ -90,36 +113,56 @@ void RuntimeConfigStore::applyPatch(ReplicateConfig& config,
     }
 }
 
-void RuntimeConfigStore::applyPatch(WriteRouteRequestConfig& config,
+bool RuntimeConfigStore::applyPatch(WriteRouteRequestConfig& config,
                                     const Json::Value& json) {
-    if (!json.isObject()) return;
+    if (!json.isObject()) return false;
+
+    // Apply the patch to a copy so that a rejected patch leaves the original
+    // config untouched.
+    auto patched = config;
+
     if (json.isMember("max_candidates") && json["max_candidates"].isUInt64()) {
-        config.max_candidates = json["max_candidates"].asUInt64();
+        patched.max_candidates = json["max_candidates"].asUInt64();
     }
     if (json.isMember("strategy") && json["strategy"].isInt()) {
-        config.strategy =
+        patched.strategy =
             static_cast<ObjectIterateStrategy>(json["strategy"].asInt());
     }
-    if (json.isMember("allow_local") && json["allow_local"].isBool()) {
-        config.allow_local = json["allow_local"].asBool();
+    if (json.isMember("remote_weight") && json["remote_weight"].isNumeric()) {
+        double w = json["remote_weight"].asDouble();
+        patched.remote_weight = w < 0.0 ? 0.0 : (w > 1.0 ? 1.0 : w);
     }
-    if (json.isMember("prefer_local") && json["prefer_local"].isBool()) {
-        config.prefer_local = json["prefer_local"].asBool();
+    if (json.isMember("local_write_waterline") &&
+        json["local_write_waterline"].isNumeric()) {
+        double wl = json["local_write_waterline"].asDouble();
+        patched.local_write_waterline = wl < 0.0 ? 0.0 : (wl > 1.0 ? 1.0 : wl);
+    }
+    if (json.isMember("top_tier_only") && json["top_tier_only"].isBool()) {
+        patched.top_tier_only = json["top_tier_only"].asBool();
     }
     if (json.isMember("early_return") && json["early_return"].isBool()) {
-        config.early_return = json["early_return"].asBool();
+        patched.early_return = json["early_return"].asBool();
     }
     if (json.isMember("tag_filters") && json["tag_filters"].isArray()) {
-        config.tag_filters.clear();
+        patched.tag_filters.clear();
         for (const auto& tag : json["tag_filters"]) {
             if (tag.isString()) {
-                config.tag_filters.push_back(tag.asString());
+                patched.tag_filters.push_back(tag.asString());
             }
         }
     }
     if (json.isMember("priority_limit") && json["priority_limit"].isInt()) {
-        config.priority_limit = json["priority_limit"].asInt();
+        patched.priority_limit = json["priority_limit"].asInt();
     }
+
+    if (!patched.IsValid()) {
+        LOG(WARNING) << "write config patch would produce an invalid config"
+                     << ", rejected: " << patched;
+        return false;
+    }
+
+    config = std::move(patched);
+    return true;
 }
 
 void RuntimeConfigStore::applyPatch(ReadRouteConfig& config,
@@ -170,8 +213,9 @@ Json::Value RuntimeConfigStore::toJson(const WriteRouteRequestConfig& config) {
     Json::Value json;
     json["max_candidates"] = Json::Value::UInt64(config.max_candidates);
     json["strategy"] = static_cast<int>(config.strategy);
-    json["allow_local"] = config.allow_local;
-    json["prefer_local"] = config.prefer_local;
+    json["remote_weight"] = config.remote_weight;
+    json["local_write_waterline"] = config.local_write_waterline;
+    json["top_tier_only"] = config.top_tier_only;
     json["early_return"] = config.early_return;
     Json::Value tags(Json::arrayValue);
     for (const auto& tag : config.tag_filters) {

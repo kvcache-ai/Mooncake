@@ -51,7 +51,7 @@ class InProcP2PMaster {
             wms_cfg.cluster_id = DEFAULT_CLUSTER_ID;
             wms_cfg.root_fs_dir = DEFAULT_ROOT_FS_DIR;
             wms_cfg.memory_allocator = BufferAllocatorType::OFFSET;
-            wms_cfg.max_replicas_per_key = 0;  // no limit for P2P
+            wms_cfg.max_client_per_key = 0;  // no limit for P2P
 
             if (config.client_live_ttl_sec.has_value()) {
                 wms_cfg.client_live_ttl_sec =

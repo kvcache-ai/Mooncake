@@ -128,8 +128,8 @@ bool MasterProcessHandler::start() {
             rpc_address_arg,
             rpc_port_arg,
             "--deployment-mode=" + config_.deployment_mode,
-            "--max-replicas-per-key=" +
-                std::to_string(config_.max_replicas_per_key)};
+            "--max-client-per-key=" +
+                std::to_string(config_.max_client_per_key)};
 
         if (config_.enable_oplog) {
             args.emplace_back("--enable-oplog=true");

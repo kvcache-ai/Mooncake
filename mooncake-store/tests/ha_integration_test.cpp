@@ -74,9 +74,18 @@ class HAIntegrationTest : public ::testing::Test {
 
     // ---- Helpers ----
 
+    // Default write config for these HA tests: force local placement, matching
+    // the previous local-first default the tests were written against.
+    static WriteRouteRequestConfig LocalWriteConfig() {
+        WriteRouteRequestConfig c;
+        c.remote_weight = 0.0;  // force local write
+        return c;
+    }
+
     static tl::expected<void, ErrorCode> PutData(
         std::shared_ptr<P2PClientService>& client, const std::string& key,
-        const std::string& data, const WriteRouteRequestConfig& config = {}) {
+        const std::string& data,
+        const WriteRouteRequestConfig& config = LocalWriteConfig()) {
         std::vector<Slice> slices;
         slices.emplace_back(Slice{const_cast<char*>(data.data()), data.size()});
         return client->Put(key, slices, config);
@@ -251,9 +260,10 @@ std::shared_ptr<P2PClientService> HAIntegrationTest::client2_ = nullptr;
 
 // A1: Baseline — put from client1 routed to client2, then read back.
 TEST_F(HAIntegrationTest, RemotePutAndGet) {
-    // Put with allow_local=false: master routes to client2
+    // Put with remote_weight=1 (force remote): master routes to client2
     WriteRouteRequestConfig config;
-    config.allow_local = false;
+    config.remote_weight = 1.0;
+    config.local_write_waterline = 0.0;
 
     auto put = PutData(client1_, "a1_client1_remote_baseline", "hello", config);
     ASSERT_TRUE(put.has_value())
@@ -274,8 +284,7 @@ TEST_F(HAIntegrationTest, RemotePutAndGet) {
 // A2: Degraded mode — local Put/Get/IsExist all work; remote-only keys
 //     and nonexistent keys return false for IsExist.
 TEST_F(HAIntegrationTest, DegradedModeLocalOps) {
-    // Write locally on client1 (default config: prefer_local=true, master
-    // now sorts candidates by priority so local segment wins).
+    // Write locally on client1 (default helper config forces a local write).
     auto put_a = PutData(client1_, "a2_client1_local", "local_data");
     ASSERT_TRUE(put_a.has_value());
 

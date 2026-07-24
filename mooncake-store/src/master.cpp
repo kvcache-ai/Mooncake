@@ -107,8 +107,9 @@ DEFINE_uint64(
 DEFINE_string(deployment_mode, "Centralization",
               "the deployment mode of mooncake-store, master and client must "
               "run in same mode. Options: Centralization, P2P");
-DEFINE_uint64(max_replicas_per_key, 1,
-              "Maximum number of replicas per key in P2P mode (0 = no limit)");
+DEFINE_uint64(
+    max_client_per_key, 1,
+    "Maximum number of client owners per key in P2P mode (0 = no limit)");
 
 // Task manager configuration
 DEFINE_uint32(max_total_finished_tasks, 10000,
@@ -268,9 +269,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt64("processing_task_timeout_sec",
                              &master_config.processing_task_timeout_sec,
                              FLAGS_processing_task_timeout_sec);
-    default_config.GetUInt64("max_replicas_per_key",
-                             &master_config.max_replicas_per_key,
-                             FLAGS_max_replicas_per_key);
+    default_config.GetUInt64("max_client_per_key",
+                             &master_config.max_client_per_key,
+                             FLAGS_max_client_per_key);
     default_config.GetString("deployment_mode", &master_config.deployment_mode,
                              FLAGS_deployment_mode);
 
@@ -564,10 +565,10 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.deployment_mode = FLAGS_deployment_mode;
     }
-    if ((google::GetCommandLineFlagInfo("max_replicas_per_key", &info) &&
+    if ((google::GetCommandLineFlagInfo("max_client_per_key", &info) &&
          !info.is_default) ||
         !conf_set) {
-        master_config.max_replicas_per_key = FLAGS_max_replicas_per_key;
+        master_config.max_client_per_key = FLAGS_max_client_per_key;
     }
 
     // Redis election backend configuration
@@ -804,7 +805,7 @@ int main(int argc, char* argv[]) {
         << ", enable_cxl=" << master_config.enable_cxl
         << ", cxl_path=" << master_config.cxl_path
         << ", cxl_size=" << master_config.cxl_size
-        << ", max_replicas_per_key=" << master_config.max_replicas_per_key
+        << ", max_client_per_key=" << master_config.max_client_per_key
         << ", deployment_mode=" << master_config.deployment_mode;
 
     if (master_config.deployment_mode != "Centralization" &&

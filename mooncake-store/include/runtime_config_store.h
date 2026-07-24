@@ -24,13 +24,13 @@ class RuntimeConfigStore {
     ReadRouteConfig getDefaultReadConfig() const;
     Json::Value exportConfig() const;
 
-    void loadFromJson(const Json::Value& root);
-    void updateWriteConfig(const Json::Value& json);
+    bool loadFromJson(const Json::Value& root);
+    bool updateWriteConfig(const Json::Value& json);
     void updateReadConfig(const Json::Value& json);
 
    private:
     static void applyPatch(ReplicateConfig& config, const Json::Value& json);
-    static void applyPatch(WriteRouteRequestConfig& config,
+    static bool applyPatch(WriteRouteRequestConfig& config,
                            const Json::Value& json);
     static void applyPatch(ReadRouteConfig& config, const Json::Value& json);
 

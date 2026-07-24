@@ -93,7 +93,7 @@ class P2PRecordOplogTest : public ::testing::Test {
             .set_cluster_id(kClusterId)
             .set_oplog_store_type("localfs")
             .set_oplog_data_dir(test_dir_.string())
-            .set_max_replicas_per_key(0)
+            .set_max_client_per_key(0)
             .build();
     }
 

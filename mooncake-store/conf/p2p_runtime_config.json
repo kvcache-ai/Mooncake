@@ -2,8 +2,9 @@
     "write": {
         "max_candidates": 2,
         "strategy": 2,
-        "allow_local": true,
-        "prefer_local": true,
+        "remote_weight": 0.5,
+        "local_write_waterline": 0.5,
+        "top_tier_only": true,
         "early_return": true,
         "tag_filters": [],
         "priority_limit": 0
