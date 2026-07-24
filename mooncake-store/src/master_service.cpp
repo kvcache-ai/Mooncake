@@ -3927,8 +3927,10 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
     return response;
 }
 
-tl::expected<void, ErrorCode> MasterService::MoveEnd(
-    const UUID& client_id, const std::string& key, const TenantId& tenant_id) {
+tl::expected<void, ErrorCode> MasterService::MoveEnd(const UUID& client_id,
+                                                     const std::string& key,
+                                                     const TenantId& tenant_id,
+                                                     bool is_drain) {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRW accessor(this,
                                 MakeObjectIdentityForRequest(key, tenant_id));
@@ -4015,6 +4017,50 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
             return replica.id() == source_id;
         });
     if (!source_replica.empty()) {
+        // Drain-only cleanup: when a *drain* move relocates a MEMORY replica,
+        // any LOCAL_DISK replica of the same key owned by the same client is
+        // now redundant (it is a disk backup of the memory data we just
+        // relocated, and the target already holds that data). Drop the LD
+        // replica's master metadata so the source client is fully drained.
+        // The underlying SSD file is intentionally left on disk as a safety
+        // net (no physical deletion); physical cleanup is a separate, future
+        // step. See drain-local-disk design discussion.
+        //
+        // This is gated on is_drain so that a *manual* move (e.g. the public
+        // create_move_task API used for load-balancing) does NOT silently
+        // discard the source client's LOCAL_DISK backup or leak its SSD file
+        // on a still-live node.
+        if (is_drain && source_replica.front().is_memory_replica()) {
+            const auto& mem_segments =
+                source_replica.front().get_segment_names();
+            if (!mem_segments.empty() && mem_segments.front().has_value()) {
+                UUID source_client_id;
+                // Narrow scope: release segment_mutex_ (unique_lock) before
+                // EraseReplicasWithCacheTotalAccounting, which internally
+                // takes segment_mutex_ shared_lock via
+                // getLocalDiskSegmentAccess(). Holding unique then taking
+                // shared on the same std::shared_mutex in the same thread
+                // triggers libstdc++ shared_mutex::lock_shared to throw
+                // system_error(EDEADLK).
+                bool found_source_client = false;
+                {
+                    ScopedSegmentAccess segment_access =
+                        segment_manager_.getSegmentAccess();
+                    found_source_client =
+                        (segment_access.GetClientIdBySegmentName(
+                             mem_segments.front().value(), source_client_id) ==
+                         ErrorCode::OK);
+                }
+                if (found_source_client) {
+                    EraseReplicasWithCacheTotalAccounting(
+                        metadata, [&source_client_id](const Replica& replica) {
+                            return replica.is_local_disk_replica() &&
+                                   replica.get_local_disk_client_id() ==
+                                       source_client_id;
+                        });
+                }
+            }
+        }
         std::lock_guard lock(discarded_replicas_mutex_);
         discarded_replicas_.emplace_back(
             std::move(source_replica),
@@ -7971,7 +8017,7 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
 
 tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
     const std::string& key, const TenantId& tenant_id,
-    const std::string& source, const std::string& target) {
+    const std::string& source, const std::string& target, bool is_drain) {
     auto normalized_tenant_result = ResolveTenantIdForWrite(tenant_id);
     if (!normalized_tenant_result) {
         return tl::make_unexpected(normalized_tenant_result.error());
@@ -8017,6 +8063,21 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
     ErrorCode error =
         segment_accessor.GetClientIdBySegmentName(source, select_client);
 
+    // If segment-name lookup failed, the source may be a LOCAL_DISK
+    // transport_endpoint (returned by Replica::get_segment_names() for
+    // LOCAL_DISK replicas). Fall back to finding the client_id from
+    // the LOCAL_DISK replica itself.
+    if (error != ErrorCode::OK) {
+        auto local_disk_replica = metadata.GetReplicaBySegmentName(source);
+        if (local_disk_replica && local_disk_replica->is_local_disk_replica()) {
+            auto client_id_opt = local_disk_replica->get_local_disk_client_id();
+            if (client_id_opt.has_value()) {
+                select_client = client_id_opt.value();
+                error = ErrorCode::OK;
+            }
+        }
+    }
+
     if (error != ErrorCode::OK) {
         LOG(ERROR) << "key=" << key << ", segment_name=" << source
                    << ", error=client_id_not_found";
@@ -8028,7 +8089,8 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
             select_client, {.tenant_id = object_id.tenant_id.value(),
                             .key = object_id.user_key,
                             .source = source,
-                            .target = target});
+                            .target = target,
+                            .is_drain = is_drain});
 }
 
 tl::expected<QueryTaskResponse, ErrorCode> MasterService::QueryTask(
@@ -8350,6 +8412,22 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
     }
 
     std::unordered_set<std::string> blocked_unit_keys;
+
+    // Pre-compute drain segment -> client_id mapping. Used to look up
+    // LOCAL_DISK replicas that belong to the client being drained.
+    std::unordered_map<std::string, UUID> drain_segment_clients;
+    {
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
+        for (const auto& source_segment : job.request.segments) {
+            UUID client_id;
+            if (segment_access.GetClientIdBySegmentName(
+                    source_segment, client_id) == ErrorCode::OK) {
+                drain_segment_clients[source_segment] = client_id;
+            }
+        }
+    }
+
     {
         std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
         for (size_t i = 0; i < kNumShards; ++i) {
@@ -8357,19 +8435,60 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
             for (const auto& [tenant_id, tenant_state] : shard->tenants) {
                 for (const auto& [key, metadata] : tenant_state.metadata) {
                     for (const auto& source_segment : job.request.segments) {
+                        // Determine the move source: MEMORY segment name
+                        // or LOCAL_DISK transport_endpoint. MEMORY takes
+                        // priority (dedup: if both exist on the same
+                        // client, only drain MEMORY).
+                        const auto replica_segments =
+                            metadata.GetReplicaSegmentNames();
+                        bool found_memory =
+                            std::find(replica_segments.begin(),
+                                      replica_segments.end(),
+                                      source_segment) != replica_segments.end();
+
+                        std::string move_source = source_segment;
+
+                        if (!found_memory) {
+                            // No MEMORY replica on this drain segment.
+                            // Check if a LOCAL_DISK replica belongs to
+                            // the client that owns this segment.
+                            auto client_it =
+                                drain_segment_clients.find(source_segment);
+                            if (client_it == drain_segment_clients.end()) {
+                                continue;
+                            }
+                            const auto& drain_client_id = client_it->second;
+
+                            std::string transport_endpoint;
+                            bool found_local_disk = false;
+                            metadata.VisitReplicas(
+                                [&drain_client_id](const Replica& r) {
+                                    return r.is_local_disk_replica() &&
+                                           r.is_completed() &&
+                                           r.get_local_disk_client_id() ==
+                                               drain_client_id;
+                                },
+                                [&transport_endpoint,
+                                 &found_local_disk](const Replica& r) {
+                                    transport_endpoint =
+                                        r.get_descriptor()
+                                            .get_local_disk_descriptor()
+                                            .transport_endpoint;
+                                    found_local_disk = true;
+                                });
+
+                            if (!found_local_disk) {
+                                continue;
+                            }
+
+                            move_source = transport_endpoint;
+                        }
+
                         const auto unit_key =
-                            MakeDrainUnitKey(tenant_id, key, source_segment);
+                            MakeDrainUnitKey(tenant_id, key, move_source);
                         if (job.completed_unit_keys.contains(unit_key) ||
                             active_unit_keys.contains(unit_key) ||
                             job.terminal_failed_unit_keys.contains(unit_key)) {
-                            continue;
-                        }
-
-                        const auto replica_segments =
-                            metadata.GetReplicaSegmentNames();
-                        if (std::find(replica_segments.begin(),
-                                      replica_segments.end(), source_segment) ==
-                            replica_segments.end()) {
                             continue;
                         }
 
@@ -8381,6 +8500,9 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
                             continue;
                         }
 
+                        // Pass source_segment (not move_source) so that
+                        // target selection avoids the source client's
+                        // segments.
                         auto target = SelectDrainTargetForKey(
                             metadata, source_segment,
                             job.request.target_segments);
@@ -8390,7 +8512,7 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
                         }
 
                         if (plans.size() < slots) {
-                            plans.push_back({tenant_id, key, source_segment,
+                            plans.push_back({tenant_id, key, move_source,
                                              *target, metadata.size, unit_key});
                         }
                     }
@@ -8403,7 +8525,8 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
 
     for (const auto& plan : plans) {
         auto task_id = CreateMoveTask(plan.key, plan.tenant_id,
-                                      plan.source_segment, plan.target_segment);
+                                      plan.source_segment, plan.target_segment,
+                                      /*is_drain=*/true);
         if (task_id.has_value()) {
             ActiveDrainTask active_task;
             active_task.task_id = task_id.value();
@@ -8439,6 +8562,21 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
         return false;
     }
 
+    // Pre-compute drain segment -> client_id mapping for LOCAL_DISK
+    // lookup.
+    std::unordered_map<std::string, UUID> drain_segment_clients;
+    {
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
+        for (const auto& source_segment : job.request.segments) {
+            UUID client_id;
+            if (segment_access.GetClientIdBySegmentName(
+                    source_segment, client_id) == ErrorCode::OK) {
+                drain_segment_clients[source_segment] = client_id;
+            }
+        }
+    }
+
     std::unordered_set<std::string> remaining_segments;
     std::unordered_set<std::string> remaining_unit_keys;
     {
@@ -8450,12 +8588,40 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
                     const auto replica_segments =
                         metadata.GetReplicaSegmentNames();
                     for (const auto& source_segment : job.request.segments) {
+                        // MEMORY replica check (existing logic)
                         if (std::find(replica_segments.begin(),
                                       replica_segments.end(), source_segment) !=
                             replica_segments.end()) {
                             remaining_segments.insert(source_segment);
                             remaining_unit_keys.insert(MakeDrainUnitKey(
                                 tenant_id, key, source_segment));
+                        }
+
+                        // LOCAL_DISK replica check: if the client that
+                        // owns this drain segment still has LOCAL_DISK
+                        // data for this key, the segment is not fully
+                        // drained yet.
+                        auto client_it =
+                            drain_segment_clients.find(source_segment);
+                        if (client_it != drain_segment_clients.end()) {
+                            const auto& drain_client_id = client_it->second;
+                            metadata.VisitReplicas(
+                                [&drain_client_id](const Replica& r) {
+                                    return r.is_local_disk_replica() &&
+                                           r.is_completed() &&
+                                           r.get_local_disk_client_id() ==
+                                               drain_client_id;
+                                },
+                                [&remaining_segments, &source_segment,
+                                 &tenant_id, &key, &remaining_unit_keys,
+                                 this](const Replica& r) {
+                                    remaining_segments.insert(source_segment);
+                                    remaining_unit_keys.insert(MakeDrainUnitKey(
+                                        tenant_id, key,
+                                        r.get_descriptor()
+                                            .get_local_disk_descriptor()
+                                            .transport_endpoint));
+                                });
                         }
                     }
                 }

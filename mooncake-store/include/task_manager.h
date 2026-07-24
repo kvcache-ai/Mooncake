@@ -104,8 +104,13 @@ struct ReplicaMovePayload {
     std::string key;
     std::string source;
     std::string target;
+    // True only when this move was created by a drain job. Drain moves drop
+    // the source client's redundant LOCAL_DISK metadata in MoveEnd; manual
+    // moves (e.g. the public create_move_task API) keep the LOCAL_DISK
+    // replica intact.
+    bool is_drain = false;
 };
-YLT_REFL(ReplicaMovePayload, tenant_id, key, source, target);
+YLT_REFL(ReplicaMovePayload, tenant_id, key, source, target, is_drain);
 
 template <TaskType T>
 struct TaskPayloadTraits;

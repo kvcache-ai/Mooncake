@@ -136,6 +136,9 @@ class InProcMaster {
             if (config.quota_bytes.has_value()) {
                 wms_cfg.quota_bytes = config.quota_bytes.value();
             }
+            wms_cfg.offload_on_evict = config.offload_on_evict.has_value()
+                                           ? config.offload_on_evict.value()
+                                           : false;
 
             wms_cfg.enable_cxl = config.enable_cxl.has_value()
                                      ? config.enable_cxl.value()

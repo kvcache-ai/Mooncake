@@ -29,6 +29,10 @@
 #include "pinned_buffer_pool.h"
 
 namespace mooncake {
+class FileStorage;
+}
+
+namespace mooncake {
 
 class PutOperation;
 
@@ -66,6 +70,13 @@ class Client {
 
     const UUID& getClientId() const { return client_id_; }
     const std::string& tenant_id() const { return master_client_.tenant_id(); }
+
+    // Set by FileStorage during construction so that Client can access
+    // local-disk loading facilities (AllocateBatch + BatchLoad) for
+    // LOCAL_DISK drain migration. Raw pointer: FileStorage owns a
+    // shared_ptr<Client>, so the lifetime is safe as long as
+    // FileStorage is alive.
+    void set_file_storage(FileStorage* fs) { file_storage_ = fs; }
 
     /**
      * @brief Creates and initializes a new Client instance
@@ -829,6 +840,10 @@ class Client {
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;
 
+    // Non-owning pointer to FileStorage, set via set_file_storage().
+    // Used for LOCAL_DISK drain migration to access AllocateBatch/BatchLoad.
+    FileStorage* file_storage_ = nullptr;
+
     // For high availability
     std::unique_ptr<ha::LeaderCoordinator> leader_coordinator_;
     std::mutex leader_switch_mutex_;
@@ -863,7 +878,8 @@ class Client {
     void ExecuteTask(const ClientTask& client_task);
 
     tl::expected<void, ErrorCode> ExecuteReplicaTransfer(
-        const std::string& key, const std::string& action_name,
+        const std::string& key, const std::string& tenant_id,
+        const std::string& action_name,
         std::function<tl::expected<void, ErrorCode>()> end_fn,
         std::function<tl::expected<void, ErrorCode>()> revoke_fn,
         const Replica::Descriptor& source,
@@ -897,7 +913,8 @@ class Client {
     tl::expected<void, ErrorCode> Move(const std::string& key,
                                        const std::string& tenant_id,
                                        const std::string& source,
-                                       const std::string& target);
+                                       const std::string& target,
+                                       bool is_drain = false);
 
     // Task thread pool for async task execution
     ThreadPool task_thread_pool_;

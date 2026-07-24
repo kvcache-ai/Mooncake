@@ -550,7 +550,8 @@ class MasterService {
 
     tl::expected<void, ErrorCode> MoveEnd(const UUID& client_id,
                                           const std::string& key,
-                                          const TenantId& tenant_id);
+                                          const TenantId& tenant_id,
+                                          bool is_drain = false);
 
     tl::expected<void, ErrorCode> MoveRevoke(const UUID& client_id,
                                              const std::string& key,
@@ -732,12 +733,15 @@ class MasterService {
     /**
      * @brief Create a move task to move an object's replica from source segment
      * to target segment
+     * @param is_drain True when the move is created by a drain job. Only drain
+     * moves drop the source client's redundant LOCAL_DISK metadata in MoveEnd.
      * @return Move task ID on success, ErrorCode on failure
      */
     tl::expected<UUID, ErrorCode> CreateMoveTask(const std::string& key,
                                                  const TenantId& tenant_id,
                                                  const std::string& source,
-                                                 const std::string& target);
+                                                 const std::string& target,
+                                                 bool is_drain = false);
 
     /**
      * @brief Create a drain job to gracefully evacuate one or more segments.
@@ -1037,6 +1041,13 @@ class MasterService {
             return it != replicas_.end() ? &(*it) : nullptr;
         }
 
+        const Replica* GetFirstReplica(
+            const std::function<bool(const Replica&)>& pred_fn) const {
+            const auto it =
+                std::find_if(replicas_.begin(), replicas_.end(), pred_fn);
+            return it != replicas_.end() ? &(*it) : nullptr;
+        }
+
         Replica* GetReplicaByID(const ReplicaID& id) {
             return GetFirstReplica(
                 [&id](const Replica& replica) { return replica.id() == id; });
@@ -1075,6 +1086,19 @@ class MasterService {
         }
 
         Replica* GetReplicaBySegmentName(const std::string& segment_name) {
+            return GetFirstReplica([&segment_name](const Replica& replica) {
+                auto names = replica.get_segment_names();
+                for (auto& name_opt : names) {
+                    if (name_opt == segment_name) {
+                        return true;
+                    }
+                }
+                return false;
+            });
+        }
+
+        const Replica* GetReplicaBySegmentName(
+            const std::string& segment_name) const {
             return GetFirstReplica([&segment_name](const Replica& replica) {
                 auto names = replica.get_segment_names();
                 for (auto& name_opt : names) {

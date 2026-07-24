@@ -285,7 +285,8 @@ class WrappedMasterService {
 
     tl::expected<void, ErrorCode> MoveEnd(const UUID& client_id,
                                           const std::string& key,
-                                          const std::string& tenant_id);
+                                          const std::string& tenant_id,
+                                          bool is_drain = false);
 
     tl::expected<void, ErrorCode> MoveRevoke(const UUID& client_id,
                                              const std::string& key,

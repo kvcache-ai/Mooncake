@@ -3,6 +3,7 @@
 #include <glog/logging.h>
 
 #include "allocator.h"
+#include "file_storage.h"
 #include "segment.h"
 
 #include <csignal>
@@ -3164,7 +3165,8 @@ tl::expected<UUID, ErrorCode> Client::CreateMoveTask(
 }
 
 tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
-    const std::string& key, const std::string& action_name,
+    const std::string& key, const std::string& tenant_id,
+    const std::string& action_name,
     std::function<tl::expected<void, ErrorCode>()> end_fn,
     std::function<tl::expected<void, ErrorCode>()> revoke_fn,
     const Replica::Descriptor& source,
@@ -3178,7 +3180,84 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
         }
     };
 
-    // currently only memory source replica is supported
+    // === LOCAL_DISK source path ===
+    // Load data from local SSD into a staging buffer, then TransferWrite
+    // to each target. This mirrors the ProcessPromotionTasks pattern:
+    // AllocateBatch (O_DIRECT-aligned) -> BatchLoad -> TransferWrite.
+    if (source.is_local_disk_replica()) {
+        if (file_storage_ == nullptr) {
+            LOG(ERROR) << "action=replica_" << action_name << "_failed"
+                       << ", key=" << key
+                       << ", error=no_file_storage_for_local_disk_source";
+            revoke_lambda();
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+
+        const auto& local_disk_desc = source.get_local_disk_descriptor();
+        const uint64_t object_size = local_disk_desc.object_size;
+
+        // (a) Load from local SSD into a staging buffer.
+        auto load_result =
+            file_storage_->LoadBatchFromLocalDisk(key, tenant_id, object_size);
+        if (!load_result) {
+            LOG(ERROR) << "action=replica_" << action_name << "_failed"
+                       << ", key=" << key << ", error=local_disk_load_failed"
+                       << ", error_code=" << load_result.error();
+            revoke_lambda();
+            return tl::unexpected(load_result.error());
+        }
+
+        // Keep the batch alive for the duration of the transfer.
+        // The shared_ptr RAII-releases the staging buffer when it goes
+        // out of scope.
+        auto staging = std::move(load_result.value());
+
+        // The storage key used by FileStorage is tenant-scoped. Find the
+        // slice that corresponds to our key.
+        const auto storage_key = TenantId(tenant_id).MakeScopedKey(key);
+        auto slice_it = staging->slices.find(storage_key);
+        if (slice_it == staging->slices.end()) {
+            LOG(ERROR) << "action=replica_" << action_name << "_failed"
+                       << ", key=" << key << ", error=staging_slice_missing";
+            revoke_lambda();
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+
+        // (b) Split the staging buffer into transfer slices.
+        auto slices =
+            split_into_slices(slice_it->second.ptr, slice_it->second.size);
+
+        // (c) TransferWrite to each target.
+        for (const auto& target : targets) {
+            if (TransferWrite(target, slices) != ErrorCode::OK) {
+                LOG(ERROR) << "action=replica_" << action_name << "_failed"
+                           << ", key=" << key
+                           << ", error=transfer_write_failed";
+                revoke_lambda();
+                return tl::unexpected(ErrorCode::TRANSFER_FAIL);
+            }
+        }
+
+        // LOCAL_DISK transfer succeeded: data flowed local-disk SSD -> staging
+        // buffer (LoadBatchFromLocalDisk) -> TransferWrite -> target MEMORY.
+        // Logged so the LOCAL_DISK drain path is observable and testable.
+        LOG(INFO) << "action=replica_" << action_name
+                  << "_local_disk_transfer_success"
+                  << ", key=" << key << ", object_size=" << object_size
+                  << ", path=local_disk_ssd->staging_buffer->transfer_write";
+
+        // (d) Finalize. The staging buffer is released when staging goes
+        // out of scope at the end of this block.
+        auto end_result = end_fn();
+        if (!end_result.has_value()) {
+            revoke_lambda();
+            return tl::unexpected(end_result.error());
+        }
+
+        return {};
+    }
+
+    // === MEMORY source path (existing logic) ===
     if (!source.is_memory_replica()) {
         LOG(ERROR) << "action=replica_" << action_name << "_failed"
                    << ", key=" << key << ", error=invalid_replica_type";
@@ -3259,7 +3338,8 @@ tl::expected<void, ErrorCode> Client::Copy(
     }
 
     auto result = ExecuteReplicaTransfer(
-        key, "copy", [&]() { return master_client_.CopyEnd(key, tenant_id); },
+        key, tenant_id, "copy",
+        [&]() { return master_client_.CopyEnd(key, tenant_id); },
         [&]() { return master_client_.CopyRevoke(key, tenant_id); },
         response.source, response.targets);
 
@@ -3280,9 +3360,11 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
 tl::expected<void, ErrorCode> Client::Move(const std::string& key,
                                            const std::string& tenant_id,
                                            const std::string& source,
-                                           const std::string& target) {
+                                           const std::string& target,
+                                           bool is_drain) {
     LOG(INFO) << "action=replica_move_start" << ", key=" << key
-              << ", source_segment=" << source << ", target_segment=" << target;
+              << ", source_segment=" << source << ", target_segment=" << target
+              << ", is_drain=" << is_drain;
 
     // Call MoveStart first - it validates existence and allocates replica if
     // needed
@@ -3301,7 +3383,7 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
         LOG(INFO) << "action=replica_move_skipped" << ", key=" << key
                   << ", info=target_replica_already_exists";
         // Target already exists, consider it success
-        auto move_end_result = master_client_.MoveEnd(key, tenant_id);
+        auto move_end_result = master_client_.MoveEnd(key, tenant_id, is_drain);
         if (!move_end_result.has_value()) {
             ErrorCode error = move_end_result.error();
             LOG(ERROR) << "action=replica_move_failed" << ", key=" << key
@@ -3314,7 +3396,8 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
     std::vector<Replica::Descriptor> targets = {response.target.value()};
 
     auto result = ExecuteReplicaTransfer(
-        key, "move", [&]() { return master_client_.MoveEnd(key, tenant_id); },
+        key, tenant_id, "move",
+        [&]() { return master_client_.MoveEnd(key, tenant_id, is_drain); },
         [&]() { return master_client_.MoveRevoke(key, tenant_id); },
         response.source, targets);
 
@@ -3616,8 +3699,9 @@ void Client::ExecuteTask(const ClientTask& client_task) {
             case TaskType::REPLICA_MOVE: {
                 ReplicaMovePayload payload;
                 struct_json::from_json(payload, assignment.payload);
-                auto move_result = Move(payload.key, payload.tenant_id,
-                                        payload.source, payload.target);
+                auto move_result =
+                    Move(payload.key, payload.tenant_id, payload.source,
+                         payload.target, payload.is_drain);
                 if (move_result.has_value()) {
                     result = ErrorCode::OK;
                 } else {

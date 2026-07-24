@@ -549,7 +549,8 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<void, ErrorCode> MoveEnd(const std::string& key);
     [[nodiscard]] tl::expected<void, ErrorCode> MoveEnd(
-        const std::string& key, const std::string& tenant_id);
+        const std::string& key, const std::string& tenant_id,
+        bool is_drain = false);
 
     /**
      * @brief Revoke a move operation

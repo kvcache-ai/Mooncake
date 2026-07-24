@@ -1150,8 +1150,8 @@ tl::expected<MoveStartResponse, ErrorCode> WrappedMasterService::MoveStart(
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::MoveEnd(
-    const UUID& client_id, const std::string& key,
-    const std::string& tenant_id) {
+    const UUID& client_id, const std::string& key, const std::string& tenant_id,
+    bool is_drain) {
     return execute_rpc(
         "MoveEnd",
         [&] {
@@ -1160,13 +1160,14 @@ tl::expected<void, ErrorCode> WrappedMasterService::MoveEnd(
                                          : TenantId::kDefaultValue,
                                      [&](const TenantId& resolved_tenant_id) {
                                          return master_service_.MoveEnd(
-                                             client_id, key,
-                                             resolved_tenant_id);
+                                             client_id, key, resolved_tenant_id,
+                                             is_drain);
                                      });
         },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key,
-                             ", tenant_id=", tenant_id);
+                             ", tenant_id=", tenant_id,
+                             ", is_drain=", is_drain);
         },
         [] { MasterMetricManager::instance().inc_move_end_requests(); },
         [] { MasterMetricManager::instance().inc_move_end_failures(); });
