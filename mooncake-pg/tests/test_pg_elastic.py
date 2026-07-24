@@ -690,8 +690,9 @@ def _replacement_recovery_worker(
     ctx: MooncakePGWorkerContext,
     broken_exited: mp.Event,
     start_recovery: mp.Event,
+    graceful_group_destroy: bool = False,
 ) -> None:
-    """Worker for testing replacement recovery."""
+    """Worker for testing replacement after failure or graceful teardown."""
     logical_rank = ctx.rank if ctx.proc_rank < ctx.world_size else BROKEN_RANK
 
     if ctx.proc_rank < ctx.world_size:
@@ -703,7 +704,25 @@ def _replacement_recovery_worker(
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
 
         if logical_rank == BROKEN_RANK:
-            # Broken rank exits
+            if graceful_group_destroy:
+                backend = ctx.get_backend()
+                # CUDA Work::wait() orders the current stream but does not
+                # block the host until the collective finishes. Complete
+                # Round 1 before deactivate_ranks changes the active-rank
+                # view used by that collective.
+                ctx.synchronize()
+                resp = pg.deactivate_ranks(backend, [logical_rank])
+                assert resp.status == pg.ProposalStatus.Applied, \
+                    "graceful self-deactivation should apply, " \
+                    f"got {resp.status}: {resp.reject_reason}"
+
+                dist.destroy_process_group()
+                ctx.record_result({"role": "gracefully_removed"})
+                # Do not set broken_exited here. The parent sets the event only 
+                # after it observes that this process has exited.
+                return
+
+            # Broken rank exits without running any teardown.
             ctx.record_result({"role": "broken"})
             broken_exited.set()
             os._exit(0)
@@ -712,7 +731,7 @@ def _replacement_recovery_worker(
         broken_exited.wait()
         backend = ctx.get_backend()
 
-        # Round 2: run collective with dead rank
+        # Round 2: run collective without the departed rank.
         tensor = torch.tensor([logical_rank], dtype=torch.int32, device=device)
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
 
@@ -944,6 +963,37 @@ class _ElasticMixin:
         self.assertEqual(len(survivor_rows), self.world_size - 1)
         self.assertEqual(len(replacement_rows), 1)
         self.assertGreaterEqual(len(broken_rows), 1)
+
+    def test_recovery_after_graceful_group_destroy(self) -> None:
+        """A rank can destroy its group normally and later be replaced. """
+        spawn_ctx = mp.get_context("spawn")
+        removed_process_exited = spawn_ctx.Event()
+        start_recovery = spawn_ctx.Event()
+
+        rows = self.spawn_backend_and_collect(
+            _replacement_recovery_worker,
+            removed_process_exited,
+            start_recovery,
+            True,  # graceful_group_destroy
+            nprocs=self.world_size + 1,
+            timeout_s=120.0,
+            # The graceful child cannot signal after its own destructors have
+            # run. Have the parent publish broken_exited only after observing
+            # that the old process, including its Agent teardown, has exited.
+            process_exit_events={BROKEN_RANK: removed_process_exited},
+        )
+
+        self.assert_all_ok(rows)
+
+        survivor_rows = [r for r in rows if r.get("role") == "survivor"]
+        replacement_rows = [r for r in rows if r.get("role") == "replacement"]
+        removed_rows = [
+            r for r in rows if r.get("role") == "gracefully_removed"
+        ]
+
+        self.assertEqual(len(survivor_rows), self.world_size - 1)
+        self.assertEqual(len(replacement_rows), 1)
+        self.assertEqual(len(removed_rows), 1)
 
     def test_extension(self) -> None:
         """Test extension mode allows new ranks to join existing group."""

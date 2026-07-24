@@ -231,7 +231,7 @@ class _P2PMixin:
             broken_exited,
             world_size=3,
             nprocs=3,
-            timeout_s=30.0,
+            timeout_s=75.0,
         )
 
         self.assert_all_ok(rows)

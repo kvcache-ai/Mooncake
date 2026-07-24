@@ -390,6 +390,7 @@ def wait_for_spawn_context(
     ctx,
     timeout_s: float,
     result_map=None,
+    process_exit_events: dict[int, object] | None = None,
 ) -> None:
     """Wait for spawn context with timeout; force kill if hung.
 
@@ -398,8 +399,16 @@ def wait_for_spawn_context(
     """
     deadline = time.monotonic() + timeout_s
 
+    def publish_process_exits() -> None:
+        if process_exit_events is None:
+            return
+        for rank, event in process_exit_events.items():
+            if not ctx.processes[rank].is_alive():
+                event.set()
+
     # Phase 1: Normal wait
     while time.monotonic() < deadline:
+        publish_process_exits()
         if not any(p.is_alive() for p in ctx.processes):
             # All processes exited (success or failure)
             if result_map is not None:
@@ -592,6 +601,7 @@ class BackendMultiProcessTestCase(MultiProcessTestCase):
         nprocs: int | None = None,
         timeout_s: float | None = None,
         world_size: int | None = None,
+        process_exit_events: dict[int, object] | None = None,
     ) -> list[dict]:
         if self.backend_name is None or self.device_type is None:
             raise RuntimeError(
@@ -637,7 +647,12 @@ class BackendMultiProcessTestCase(MultiProcessTestCase):
                     nprocs=actual_nprocs,
                     join=False,
                 )
-                wait_for_spawn_context(ctx, resolved_timeout, result_map=result_map)
+                wait_for_spawn_context(
+                    ctx,
+                    resolved_timeout,
+                    result_map=result_map,
+                    process_exit_events=process_exit_events,
+                )
 
             return collect_rank_results(result_map, actual_nprocs)
 
