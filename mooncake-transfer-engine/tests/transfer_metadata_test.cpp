@@ -42,7 +42,7 @@ class TransferMetadataTest : public ::testing::Test {
         if (env)
             metadata_server = env;
         else
-            metadata_server = metadata_server;
+            metadata_server = P2PHANDSHAKE;
         LOG(INFO) << "metadata_server: " << metadata_server;
 
         env = std::getenv("MC_LOCAL_SERVER_NAME");
@@ -113,6 +113,10 @@ TEST_F(TransferMetadataTest, LocalMemoryBufferTest) {
 
 // add, get and remove RPCMetaEntryMeta
 TEST_F(TransferMetadataTest, RpcMetaEntryTest) {
+    if (metadata_server == P2PHANDSHAKE) {
+        GTEST_SKIP() << "RPC metadata entry test requires an external metadata "
+                        "backend or a valid P2P handshake listener fd.";
+    }
     auto hostname_port = parseHostNameWithPort(local_server_name);
     TransferMetadata::RpcMetaDesc desc;
     desc.ip_or_host_name = hostname_port.first.c_str();
