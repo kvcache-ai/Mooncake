@@ -980,8 +980,10 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
 
 std::optional<TransferFuture> TransferSubmitter::submit(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
-    TransferRequest::OpCode op_code, void* ptr, size_t size) {
+    TransferRequest::OpCode op_code, void* ptr, size_t size,
+    StoreTransferContext context) {
     std::optional<TransferFuture> future;
+    StoreTransferPath path = StoreTransferPath::UNKNOWN;
 
     if (replica.is_memory_replica()) {
         auto& mem_desc = replica.get_memory_descriptor();
@@ -992,15 +994,21 @@ std::optional<TransferFuture> TransferSubmitter::submit(
         }
 
         if (op_code == TransferRequest::READ) {
+            const auto strategy = selectStrategy(handle, slices);
+            path = strategy == TransferStrategy::LOCAL_MEMCPY
+                       ? StoreTransferPath::LOCAL_MEMCPY
+                       : StoreTransferPath::TRANSFER_ENGINE;
             future = submitMemoryReadOperation(handle, slices, 0);
         } else {
             TransferStrategy strategy = selectStrategy(handle, slices);
 
             switch (strategy) {
                 case TransferStrategy::LOCAL_MEMCPY:
+                    path = StoreTransferPath::LOCAL_MEMCPY;
                     future = submitMemcpyOperation(handle, slices, op_code);
                     break;
                 case TransferStrategy::TRANSFER_ENGINE:
+                    path = StoreTransferPath::TRANSFER_ENGINE;
                     future =
                         submitTransferEngineOperation(handle, slices, op_code);
                     break;
@@ -1011,6 +1019,7 @@ std::optional<TransferFuture> TransferSubmitter::submit(
         }
     } else if (replica.is_nof_replica()) {
 #ifdef USE_NOF
+        path = StoreTransferPath::NVME_OF;
         auto& ssd_desc = replica.get_nof_descriptor();
         auto& handle = ssd_desc.buffer_descriptor;
 
@@ -1024,12 +1033,13 @@ std::optional<TransferFuture> TransferSubmitter::submit(
         return std::nullopt;
 #endif
     } else {
+        path = StoreTransferPath::FILE;
         future = submitFileReadOperation(replica, slices, op_code);
     }
 
     // Update metrics on successful submission
     if (future.has_value()) {
-        updateTransferMetrics(slices, op_code);
+        updateTransferMetrics(slices, op_code, context, path);
     }
 
     return future;
@@ -1038,7 +1048,7 @@ std::optional<TransferFuture> TransferSubmitter::submit(
 std::optional<TransferFuture> TransferSubmitter::submit_batch(
     const std::vector<Replica::Descriptor>& replicas,
     std::vector<std::vector<Slice>>& all_slices,
-    TransferRequest::OpCode op_code) {
+    TransferRequest::OpCode op_code, StoreTransferContext context) {
     std::optional<TransferFuture> future;
     std::vector<TransferRequest> requests;
     for (size_t i = 0; i < replicas.size(); ++i) {
@@ -1071,7 +1081,8 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
     // Update metrics on successful submission
     if (future.has_value()) {
         for (auto& slices : all_slices) {
-            updateTransferMetrics(slices, op_code);
+            updateTransferMetrics(slices, op_code, context,
+                                  StoreTransferPath::TRANSFER_ENGINE);
         }
     }
     return future;
@@ -1255,8 +1266,9 @@ std::optional<TransferFuture> TransferSubmitter::submitMemoryReadOperation(
 
 std::optional<TransferFuture> TransferSubmitter::submitRangeRead(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
-    uint64_t src_offset) {
+    uint64_t src_offset, StoreTransferContext context) {
     std::optional<TransferFuture> future;
+    StoreTransferPath path = StoreTransferPath::UNKNOWN;
 
     if (replica.is_memory_replica()) {
         auto& mem_desc = replica.get_memory_descriptor();
@@ -1271,6 +1283,10 @@ std::optional<TransferFuture> TransferSubmitter::submitRangeRead(
             return std::nullopt;
         }
 
+        const auto strategy = selectStrategy(handle, slices);
+        path = strategy == TransferStrategy::LOCAL_MEMCPY
+                   ? StoreTransferPath::LOCAL_MEMCPY
+                   : StoreTransferPath::TRANSFER_ENGINE;
         future = submitMemoryReadOperation(handle, slices, src_offset);
     } else if (replica.is_nof_replica()) {
         LOG(ERROR) << "Range read not supported for NoF replicas";
@@ -1282,7 +1298,7 @@ std::optional<TransferFuture> TransferSubmitter::submitRangeRead(
     }
 
     if (future.has_value()) {
-        updateTransferMetrics(slices, TransferRequest::READ);
+        updateTransferMetrics(slices, TransferRequest::READ, context, path);
     }
 
     return future;
@@ -1439,8 +1455,53 @@ bool TransferSubmitter::validateTransferParams(
     return true;
 }
 
+StoreTransferIntent TransferSubmitter::effectiveIntent(
+    StoreTransferContext context, TransferRequest::OpCode op_code) {
+    if (context.intent != StoreTransferIntent::UNSPECIFIED) {
+        return context.intent;
+    }
+    if (op_code == TransferRequest::READ) {
+        return StoreTransferIntent::FOREGROUND_GET;
+    }
+    return StoreTransferIntent::UNSPECIFIED;
+}
+
+const char* TransferSubmitter::intentName(StoreTransferIntent intent) {
+    switch (intent) {
+        case StoreTransferIntent::FOREGROUND_GET:
+            return "foreground_get";
+        case StoreTransferIntent::BACKGROUND_PREFETCH:
+            return "background_prefetch";
+        case StoreTransferIntent::MIGRATION:
+            return "migration";
+        case StoreTransferIntent::WEIGHT_LOADING:
+            return "weight_loading";
+        case StoreTransferIntent::UNSPECIFIED:
+        default:
+            return "unspecified";
+    }
+}
+
+const char* TransferSubmitter::pathName(StoreTransferPath path) {
+    switch (path) {
+        case StoreTransferPath::TRANSFER_ENGINE:
+            return "transfer_engine";
+        case StoreTransferPath::LOCAL_MEMCPY:
+            return "local_memcpy";
+        case StoreTransferPath::NVME_OF:
+            return "nvme_of";
+        case StoreTransferPath::FILE:
+            return "file";
+        case StoreTransferPath::UNKNOWN:
+        default:
+            return "unknown";
+    }
+}
+
 void TransferSubmitter::updateTransferMetrics(const std::vector<Slice>& slices,
-                                              TransferRequest::OpCode op_code) {
+                                              TransferRequest::OpCode op_code,
+                                              StoreTransferContext context,
+                                              StoreTransferPath path) {
     size_t total_bytes = 0;
     for (const auto& slice : slices) {
         total_bytes += slice.size;
@@ -1456,6 +1517,11 @@ void TransferSubmitter::updateTransferMetrics(const std::vector<Slice>& slices,
     } else if (op_code == TransferRequest::WRITE) {
         transfer_metric_->total_write_bytes.inc(total_bytes);
     }
+
+    const auto intent = effectiveIntent(context, op_code);
+    transfer_metric_->ObserveTransferPath(
+        intentName(intent), pathName(path), total_bytes,
+        path == StoreTransferPath::TRANSFER_ENGINE);
 }
 
 }  // namespace mooncake
