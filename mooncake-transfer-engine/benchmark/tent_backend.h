@@ -75,7 +75,8 @@ class TENTBenchRunner : public BenchRunner {
 
     double runSingleTransfer(uint64_t local_addr, uint64_t target_addr,
                              uint64_t block_size, uint64_t batch_size,
-                             OpCode opcode, uint64_t deadline_ns);
+                             OpCode opcode, uint64_t deadline_ns,
+                             IntentType intent_type);
 
     int beginReceiverCreditTransfer(uint64_t* request_id, uint64_t bytes);
 

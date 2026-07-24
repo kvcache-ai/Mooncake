@@ -15,6 +15,7 @@
 #include "master_snapshot_repository.h"
 #include "ha/snapshot/catalog/snapshot_catalog_store.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
+#include "ha/snapshot/snapshot_constants.h"
 #include "ha/snapshot/snapshot_logger.h"
 #include "serialize/serializer.h"
 #include "segment.h"
@@ -28,17 +29,6 @@
 #endif
 
 namespace mooncake {
-
-// Snapshot file names (moved from master_service.cpp)
-static const std::string SNAPSHOT_METADATA_FILE = "metadata";
-static const std::string SNAPSHOT_SEGMENTS_FILE = "segments";
-static const std::string SNAPSHOT_TASK_MANAGER_FILE = "task_manager";
-static const std::string SNAPSHOT_MANIFEST_FILE = "manifest.txt";
-static const std::string SNAPSHOT_LATEST_FILE = "latest.txt";
-static const std::string SNAPSHOT_BACKUP_SAVE_DIR =
-    "mooncake_snapshot_save_backup";
-static const std::string SNAPSHOT_SERIALIZER_VERSION = "1.0.0";
-static const std::string SNAPSHOT_SERIALIZER_TYPE = "messagepack";
 
 namespace {
 int64_t CurrentTimeMs() {
@@ -146,7 +136,8 @@ void MasterSnapshotManager::SnapshotThreadFunc() {
         const std::string& snapshot_root =
             snapshot_catalog_store_->GetSnapshotRoot();
         const std::string path_prefix = snapshot_root + snapshot_id + "/";
-        const std::string manifest_path = path_prefix + SNAPSHOT_MANIFEST_FILE;
+        const std::string manifest_path =
+            path_prefix + ha::kSnapshotManifestFile;
         auto descriptor =
             BuildSnapshotDescriptor(snapshot_id, manifest_path, path_prefix);
         if (!descriptor) {
@@ -470,7 +461,7 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
     const std::string& snapshot_root =
         snapshot_catalog_store_->GetSnapshotRoot();
     const std::string path_prefix = snapshot_root + snapshot_id + "/";
-    const std::string manifest_path = path_prefix + SNAPSHOT_MANIFEST_FILE;
+    const std::string manifest_path = path_prefix + ha::kSnapshotManifestFile;
     auto descriptor =
         BuildSnapshotDescriptor(snapshot_id, manifest_path, path_prefix);
     if (!descriptor) {
@@ -495,7 +486,8 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
         SNAP_LOG_INFO(
             "[Snapshot] action=persisting_state start, snapshot_id={}, "
             "serializer_type={}, version={}",
-            snapshot_id, SNAPSHOT_SERIALIZER_TYPE, SNAPSHOT_SERIALIZER_VERSION);
+            snapshot_id, ha::kSnapshotSerializerType,
+            ha::kSnapshotSerializerVersion);
 
         // Use the new MasterSnapshotCodec to encode all state
         ha::MasterSnapshotCodec codec;
@@ -530,10 +522,10 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
                       repository_->GetObjectStoreConnectionInfo());
 
         // Upload metadata
-        std::string metadata_path = path_prefix + SNAPSHOT_METADATA_FILE;
-        auto upload_result =
-            repository_->UploadPayloadFile(serialized_metadata, metadata_path,
-                                           SNAPSHOT_METADATA_FILE, snapshot_id);
+        std::string metadata_path = path_prefix + ha::kSnapshotMetadataFile;
+        auto upload_result = repository_->UploadPayloadFile(
+            serialized_metadata, metadata_path, ha::kSnapshotMetadataFile,
+            snapshot_id);
         if (!upload_result) {
             SNAP_LOG_ERROR(
                 "[Snapshot] metadata upload failed, snapshot_id={}, "
@@ -549,10 +541,10 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
         }
 
         // Upload segment
-        std::string segment_path = path_prefix + SNAPSHOT_SEGMENTS_FILE;
-        upload_result =
-            repository_->UploadPayloadFile(serialized_segment, segment_path,
-                                           SNAPSHOT_SEGMENTS_FILE, snapshot_id);
+        std::string segment_path = path_prefix + ha::kSnapshotSegmentsFile;
+        upload_result = repository_->UploadPayloadFile(
+            serialized_segment, segment_path, ha::kSnapshotSegmentsFile,
+            snapshot_id);
         if (!upload_result) {
             SNAP_LOG_ERROR(
                 "[Snapshot] segment upload failed, snapshot_id={}, "
@@ -568,10 +560,10 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
 
         // Upload task manager
         std::string task_manager_path =
-            path_prefix + SNAPSHOT_TASK_MANAGER_FILE;
+            path_prefix + ha::kSnapshotTaskManagerFile;
         upload_result = repository_->UploadPayloadFile(
             serialized_task_manager, task_manager_path,
-            SNAPSHOT_TASK_MANAGER_FILE, snapshot_id);
+            ha::kSnapshotTaskManagerFile, snapshot_id);
         if (!upload_result) {
             SNAP_LOG_ERROR(
                 "[Snapshot] task_manager upload failed, snapshot_id={}, "
@@ -588,11 +580,12 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
 
         // Upload manifest
         std::vector<uint8_t> manifest_bytes =
-            ha::MasterSnapshotCodec::EncodeManifest(SNAPSHOT_SERIALIZER_TYPE,
-                                                    SNAPSHOT_SERIALIZER_VERSION,
-                                                    snapshot_id);
+            ha::MasterSnapshotCodec::EncodeManifest(
+                ha::kSnapshotSerializerType, ha::kSnapshotSerializerVersion,
+                snapshot_id);
         upload_result = repository_->UploadPayloadFile(
-            manifest_bytes, manifest_path, SNAPSHOT_MANIFEST_FILE, snapshot_id);
+            manifest_bytes, manifest_path, ha::kSnapshotManifestFile,
+            snapshot_id);
         if (!upload_result) {
             SNAP_LOG_ERROR(
                 "[Snapshot] manifest upload failed, snapshot_id={}, "
@@ -613,8 +606,8 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
         }
 
         // Publish snapshot catalog entry and advance the latest marker.
-        std::string latest_path =
-            snapshot_catalog_store_->GetSnapshotRoot() + SNAPSHOT_LATEST_FILE;
+        std::string latest_path = snapshot_catalog_store_->GetSnapshotRoot() +
+                                  ha::kSnapshotLatestFile;
         std::string latest_content = snapshot_id;
 
         auto publish_result = repository_->PublishSnapshot(descriptor);
@@ -625,8 +618,8 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
                 snapshot_id, latest_path, toString(publish_result));
             if (options_.use_snapshot_backup_dir) {
                 auto save_path = fs::path(options_.snapshot_backup_dir) /
-                                 SNAPSHOT_BACKUP_SAVE_DIR /
-                                 SNAPSHOT_LATEST_FILE;
+                                 ha::kSnapshotBackupSaveDir /
+                                 ha::kSnapshotLatestFile;
                 auto save_result =
                     FileUtil::SaveStringToFile(latest_content, save_path);
                 if (!save_result) {
@@ -669,19 +662,6 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
                                "Unknown exception during state persistent"));
     }
     return {};
-}
-
-tl::expected<void, SerializationError>
-MasterSnapshotManager::UploadSnapshotPayloadFile(
-    const std::vector<uint8_t>& data, const std::string& path,
-    const std::string& local_filename, const std::string& snapshot_id) {
-    return repository_->UploadPayloadFile(data, path, local_filename,
-                                          snapshot_id);
-}
-
-void MasterSnapshotManager::CleanupOldSnapshot(size_t keep_count,
-                                               const std::string& snapshot_id) {
-    repository_->CleanupOldSnapshots(keep_count, snapshot_id);
 }
 
 }  // namespace mooncake

@@ -1,12 +1,18 @@
 #include <gtest/gtest.h>
 
+#include <cstdint>
 #include <memory>
+#include <vector>
+
+#include <msgpack.hpp>
 
 #include "ha/snapshot/master_snapshot_codec.h"
 #include "master_config.h"
 #include "master_service.h"
 #include "segment.h"
 #include "task_manager.h"
+#include "tenant_id.h"
+#include "utils/zstd_util.h"
 
 namespace mooncake::ha {
 
@@ -74,7 +80,7 @@ TEST_F(MasterSnapshotCodecTest, EncodeDecodeRoundTripWithMemoryReplica) {
     constexpr size_t kSegmentBase = 0x300000000;
     constexpr size_t kSegmentSize = 1024 * 1024 * 16;  // 16MB
     const std::string kKey = "memory_replica_key";
-    const std::string kTenant = "default";
+    const TenantId& kTenant = TenantId::Default();
 
     Segment segment;
     segment.id = generate_uuid();
@@ -140,6 +146,56 @@ TEST_F(MasterSnapshotCodecTest, DecodeWithNullService) {
     auto decode_result = codec.Decode(nullptr, payloads);
     EXPECT_FALSE(decode_result.has_value());
     EXPECT_EQ(decode_result.error().code, ErrorCode::INVALID_PARAMS);
+}
+
+// Regression test: a structurally valid MessagePack task-manager payload whose
+// task id field has the wrong type used to throw msgpack::type_error out of
+// TaskManagerSerializer::Deserialize() (the arr[0].as<std::string>() call sits
+// outside the field-conversion try block). Since RestoreState() no longer
+// wraps each candidate in a try/catch, an escaping exception here would abort
+// restore and prevent fallback to an older healthy snapshot. Decode() must
+// convert it into a SerializationError instead of throwing.
+TEST_F(MasterSnapshotCodecTest, DecodeWithInvalidTaskFieldTypeReturnsError) {
+    MasterSnapshotCodec codec;
+
+    // Start from a valid encoded snapshot so the segments and metadata payloads
+    // decode cleanly; we only want to corrupt the task-manager payload.
+    MasterSnapshotStateView state_view = MakeStateView(*master_service_);
+    auto encode_result = codec.Encode(state_view);
+    ASSERT_TRUE(encode_result.has_value())
+        << "Encode failed: " << encode_result.error().message;
+    MasterSnapshotPayloads payloads = std::move(encode_result.value());
+
+    // Build a structurally valid MessagePack task-manager payload: an outer
+    // array of one task, the task itself a valid array with the expected field
+    // count, but the id field (index 0, expected string) is an integer. This
+    // unpacks cleanly and only fails at the arr[0].as<std::string>() step,
+    // which used to throw msgpack::type_error out of Deserialize().
+    constexpr size_t kTaskSerializedFields = 8;  // must match the serializer
+    msgpack::sbuffer sbuf;
+    msgpack::packer<msgpack::sbuffer> packer(&sbuf);
+    packer.pack_array(1);  // one task
+    packer.pack_array(kTaskSerializedFields);
+    packer.pack(static_cast<int32_t>(12345));  // id: wrong type (int, not str)
+    packer.pack(static_cast<int32_t>(0));      // type
+    packer.pack(static_cast<int32_t>(0));      // status
+    packer.pack(std::string("payload"));       // payload
+    packer.pack(static_cast<int64_t>(0));      // created_at
+    packer.pack(static_cast<int64_t>(0));      // last_updated_at
+    packer.pack(std::string("message"));       // message
+    packer.pack(std::string("assigned"));      // assigned_client
+
+    payloads.task_manager = zstd_compress(
+        reinterpret_cast<const uint8_t*>(sbuf.data()), sbuf.size(), 3);
+
+    // Decode a fresh service. It must not throw; it must report a serialization
+    // error so RestoreState() can fall back to another candidate snapshot.
+    auto target_service = MakeMasterService();
+    tl::expected<void, SerializationError> decode_result;
+    ASSERT_NO_THROW(
+        { decode_result = codec.Decode(target_service.get(), payloads); });
+    EXPECT_FALSE(decode_result.has_value());
+    EXPECT_EQ(decode_result.error().code, ErrorCode::DESERIALIZE_FAIL);
 }
 
 }  // namespace mooncake::ha

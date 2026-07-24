@@ -1,0 +1,248 @@
+#include "registered_pinned_memory.h"
+
+#include <cstdlib>
+#include <string>
+#include <string_view>
+
+#include <glog/logging.h>
+
+#include "utils/type_util.h"
+
+#if defined(USE_CUDA)
+#include <cuda_runtime_api.h>
+#endif
+
+namespace mooncake {
+namespace {
+
+std::string_view TrimAsciiWhitespace(std::string_view value) {
+    constexpr std::string_view whitespace = " \t\r\n\f\v";
+    size_t begin = value.find_first_not_of(whitespace);
+    if (begin == std::string_view::npos) return {};
+    size_t end = value.find_last_not_of(whitespace);
+    return value.substr(begin, end - begin + 1);
+}
+
+std::pair<bool, uint64_t> ParsePinnedMemoryConfig() {
+    const char* raw_value = std::getenv("MC_STORE_PIN_MEMORY_MAX_BYTES");
+    if (!raw_value || raw_value[0] == '\0') return {false, 0};
+
+    uint64_t limit = 0;
+    auto value = TrimAsciiWhitespace(raw_value);
+    if (value.empty() || !TypeUtil::ParseUint64(value, limit)) {
+        LOG(WARNING) << "Invalid MC_STORE_PIN_MEMORY_MAX_BYTES='" << raw_value
+                     << "', disabling Store segment pinning";
+        return {false, 0};
+    }
+    return {limit != 0, limit};
+}
+
+void LogPinSkip(const std::string& owner, const char* reason, size_t size) {
+    LOG(WARNING) << "Skip cudaHostRegister for " << owner << ": " << reason
+                 << ", size=" << size;
+}
+
+#if defined(USE_CUDA)
+bool RegisterPinnedRegionWithCuda(void* addr, size_t size,
+                                  std::string* error_message) {
+    cudaError_t err = cudaHostRegister(addr, size, cudaHostRegisterPortable);
+    if (err == cudaSuccess) return true;
+    if (error_message) *error_message = cudaGetErrorString(err);
+    cudaGetLastError();
+    return false;
+}
+
+RegisteredPinnedMemoryManager::UnregisterResult UnregisterPinnedRegionWithCuda(
+    void* addr, std::string* error_message) {
+    cudaError_t err = cudaHostUnregister(addr);
+    if (err == cudaSuccess) {
+        return RegisteredPinnedMemoryManager::UnregisterResult::kSuccess;
+    }
+    if (error_message) *error_message = cudaGetErrorString(err);
+    if (err == cudaErrorCudartUnloading) {
+        return RegisteredPinnedMemoryManager::UnregisterResult::
+            kRuntimeUnloading;
+    }
+    return RegisteredPinnedMemoryManager::UnregisterResult::kError;
+}
+
+#endif
+
+RegisteredPinnedMemoryManager::PinOps DefaultPinOps() {
+#if defined(USE_CUDA)
+    return {RegisterPinnedRegionWithCuda, UnregisterPinnedRegionWithCuda};
+#else
+    return {};
+#endif
+}
+
+}  // namespace
+
+RegisteredPinnedRegion::~RegisteredPinnedRegion() { release(); }
+
+bool RegisteredPinnedRegion::release() {
+    if (!manager_) return release_succeeded_;
+    auto* manager = manager_;
+    manager_ = nullptr;
+    release_succeeded_ = manager->release(this);
+    return release_succeeded_;
+}
+
+RegisteredPinnedMemoryManager& RegisteredPinnedMemoryManager::instance() {
+    static RegisteredPinnedMemoryManager* manager =
+        new RegisteredPinnedMemoryManager();
+    return *manager;
+}
+
+RegisteredPinnedMemoryManager::RegisteredPinnedMemoryManager()
+    : RegisteredPinnedMemoryManager(ParsePinnedMemoryConfig(),
+                                    DefaultPinOps()) {}
+
+RegisteredPinnedMemoryManager::RegisteredPinnedMemoryManager(
+    std::pair<bool, uint64_t> config, PinOps pin_ops)
+    : enabled_(config.first), limit_bytes_(config.second), pin_ops_(pin_ops) {
+#if defined(USE_CUDA)
+    LOG(INFO) << "Store segment pinned memory is "
+              << (enabled_ ? "enabled" : "disabled")
+              << ", max_bytes=" << limit_bytes_;
+#else
+    if (enabled_) {
+        LOG(INFO) << "Store segment pinning requested but this build has no "
+                     "CUDA runtime support";
+    }
+#endif
+}
+
+std::shared_ptr<RegisteredPinnedRegion> RegisteredPinnedMemoryManager::try_pin(
+    void* addr, size_t size, const std::string& owner) {
+    if (!addr || size == 0 || !enabled_) return nullptr;
+    if (!pin_ops_.register_region || !pin_ops_.unregister_region) {
+        return nullptr;
+    }
+
+    const auto start = reinterpret_cast<uintptr_t>(addr);
+    const auto end = start + size;
+    if (end < start) {
+        LogPinSkip(owner, "address range overflow", size);
+        return nullptr;
+    }
+
+    std::shared_ptr<RegisteredPinnedRegion> region;
+    try {
+        region.reset(new RegisteredPinnedRegion(this, addr, size));
+    } catch (...) {
+        LogPinSkip(owner, "failed to allocate pin tracking", size);
+        return nullptr;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& entry : regions_) {
+            const auto region_start = reinterpret_cast<uintptr_t>(entry.addr);
+            const auto region_end = region_start + entry.size;
+            const bool overlaps = start < region_end && end > region_start;
+            if (overlaps) {
+                LogPinSkip(owner, "overlaps an active pinned region", size);
+                return nullptr;
+            }
+        }
+
+        if (size > limit_bytes_ || pinned_bytes_ > limit_bytes_ - size) {
+            LOG(WARNING) << "Skip cudaHostRegister for " << owner
+                         << ": quota exceeded, requested=" << size
+                         << ", pinned=" << pinned_bytes_
+                         << ", limit=" << limit_bytes_;
+            return nullptr;
+        }
+
+        try {
+            regions_.push_back({addr, size, nullptr});
+        } catch (...) {
+            LogPinSkip(owner, "failed to allocate pin tracking", size);
+            return nullptr;
+        }
+        pinned_bytes_ += size;
+    }
+
+    std::string error_message;
+    const bool registered =
+        pin_ops_.register_region(addr, size, &error_message);
+    if (!registered) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            remove_inactive_region_locked(addr, size);
+        }
+        LOG(WARNING) << "cudaHostRegister failed for " << owner
+                     << ", size=" << size << ", error=" << error_message
+                     << ". Continue with pageable host memory.";
+        return nullptr;
+    }
+
+    uint64_t pinned_bytes = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& entry : regions_) {
+            if (entry.addr == addr && entry.size == size && !entry.region) {
+                entry.region = region.get();
+                pinned_bytes = pinned_bytes_;
+                break;
+            }
+        }
+    }
+
+    LOG(INFO) << "cudaHostRegister succeeded for " << owner << ", size=" << size
+              << ", pinned=" << pinned_bytes << ", limit=" << limit_bytes_;
+    return region;
+}
+
+bool RegisteredPinnedMemoryManager::release(RegisteredPinnedRegion* region) {
+    if (!region || !region->addr_ || region->size_ == 0) return true;
+
+    bool should_unregister = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& entry : regions_) {
+            if (entry.addr == region->addr_ && entry.size == region->size_ &&
+                entry.region == region) {
+                entry.region = nullptr;
+                should_unregister = true;
+                break;
+            }
+        }
+    }
+    if (!should_unregister) return true;
+
+    std::string error_message;
+    auto unregister_result =
+        pin_ops_.unregister_region(region->addr_, &error_message);
+    if (unregister_result != UnregisterResult::kSuccess) {
+        if (unregister_result == UnregisterResult::kRuntimeUnloading) {
+            LOG(WARNING) << "Skip cudaHostUnregister because CUDA runtime "
+                            "is unloading, size="
+                         << region->size_;
+        } else {
+            LOG(ERROR) << "cudaHostUnregister failed, size=" << region->size_
+                       << ", error=" << error_message
+                       << ". Keep the range reserved; backing memory must not "
+                          "be freed.";
+            return false;
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    remove_inactive_region_locked(region->addr_, region->size_);
+    return true;
+}
+
+void RegisteredPinnedMemoryManager::remove_inactive_region_locked(void* addr,
+                                                                  size_t size) {
+    for (auto it = regions_.begin(); it != regions_.end(); ++it) {
+        if (it->addr == addr && it->size == size && !it->region) {
+            regions_.erase(it);
+            pinned_bytes_ = pinned_bytes_ >= size ? pinned_bytes_ - size : 0;
+            return;
+        }
+    }
+}
+
+}  // namespace mooncake

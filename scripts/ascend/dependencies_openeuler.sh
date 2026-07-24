@@ -151,7 +151,7 @@ PKG_MGR="$(detect_pkg_manager)"
 CORE_PACKAGES=(
     gcc gcc-c++ make cmake ninja-build git wget unzip
     gflags-devel glog-devel libibverbs-devel numactl-devel
-    gtest gtest-devel boost-devel openssl-devel hiredis-devel
+    boost-devel openssl-devel hiredis-devel
     libcurl-devel jsoncpp-devel libunwind-devel python3-devel
     zstd-devel xxhash-devel pkgconf pkgconf-pkg-config patchelf
     mpich mpich-devel glibc glibc-common
