@@ -31,9 +31,6 @@ on:
       ep-torch-versions:
         type: string
         default: ''
-      build-with-ep:
-        type: string
-        default: '0'
       variant-flag:
         # build_wheel.sh variant set to 1, e.g. CU13_BUILD, NON_CUDA_BUILD
         type: string
@@ -61,7 +58,6 @@ jobs:
       matrix:
         python-version: ${{ fromJSON(inputs.python-versions) }}
     env:
-      BUILD_WITH_EP: ${{ inputs.build-with-ep }}
       TORCH_CUDA_ARCH_LIST: ${{ inputs.torch-cuda-arch-list }}
       CMAKE_ARGS: ${{ inputs.cmake-args }}
       CMAKE_GEN: ${{ inputs.cmake-generator }}
