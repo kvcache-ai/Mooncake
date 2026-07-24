@@ -129,7 +129,7 @@ TEST_F(ReplicaPlacementMasterShadowTest,
     const UUID client_id = PrepareMemorySegment(service, "shadow_missing");
     PutObject(service, client_id, "key");
 
-    ASSERT_TRUE(service.GetReplicaList("key", "default").has_value());
+    ASSERT_TRUE(service.GetReplicaList("key", TenantId::Default()).has_value());
 
     const auto counters = service.GetReplicaPlacementShadowCounters();
     ASSERT_TRUE(counters.has_value());
@@ -156,13 +156,13 @@ TEST_F(ReplicaPlacementMasterShadowTest,
         PrepareMemorySegment(service, "shadow_external_faults");
     PutObject(service, client_id, "key");
 
-    ASSERT_TRUE(service.GetReplicaList("key", "default").has_value());
+    ASSERT_TRUE(service.GetReplicaList("key", TenantId::Default()).has_value());
     auto stale = AvailableSnapshot(2);
     stale.observed_at =
         std::chrono::steady_clock::now() - std::chrono::seconds(31);
     ASSERT_EQ(service.PublishReplicaPlacementSignalSnapshot(std::move(stale)),
               ReplicaPlacementSignalPublishStatus::PUBLISHED);
-    ASSERT_TRUE(service.GetReplicaList("key", "default").has_value());
+    ASSERT_TRUE(service.GetReplicaList("key", TenantId::Default()).has_value());
 
     const auto counters = service.GetReplicaPlacementShadowCounters();
     ASSERT_TRUE(counters.has_value());
@@ -193,10 +193,11 @@ TEST_F(ReplicaPlacementMasterShadowTest,
     PutObject(service, client_id, "hot");
     PutObject(service, client_id, "batch");
 
-    ASSERT_TRUE(service.GetReplicaList("hot", "default").has_value());
-    ASSERT_TRUE(service.GetReplicaList("hot", "default").has_value());
-    ASSERT_TRUE(service.GetReplicaList("hot", "default").has_value());
-    const auto batch = service.BatchGetReplicaList({"batch"}, "default");
+    ASSERT_TRUE(service.GetReplicaList("hot", TenantId::Default()).has_value());
+    ASSERT_TRUE(service.GetReplicaList("hot", TenantId::Default()).has_value());
+    ASSERT_TRUE(service.GetReplicaList("hot", TenantId::Default()).has_value());
+    const auto batch =
+        service.BatchGetReplicaList({"batch"}, TenantId::Default());
     ASSERT_EQ(batch.size(), 1);
     ASSERT_TRUE(batch[0].has_value());
 
@@ -210,7 +211,8 @@ TEST_F(ReplicaPlacementMasterShadowTest,
                                            ReplicaPlacementTier::MEMORY)],
               1);
 
-    ASSERT_TRUE(service.GetReplicaListForAdmin("hot", "default").has_value());
+    ASSERT_TRUE(
+        service.GetReplicaListForAdmin("hot", TenantId::Default()).has_value());
     const auto after_admin = service.GetReplicaPlacementShadowCounters();
     ASSERT_TRUE(after_admin.has_value());
     EXPECT_EQ(TotalObservations(*after_admin), 4);
@@ -236,7 +238,8 @@ TEST_F(ReplicaPlacementMasterShadowTest,
     for (size_t thread = 0; thread < kThreadCount; ++thread) {
         threads.emplace_back([&]() {
             for (size_t i = 0; i < kIterations; ++i) {
-                if (!service.GetReplicaList("key", "default").has_value()) {
+                if (!service.GetReplicaList("key", TenantId::Default())
+                         .has_value()) {
                     failures.fetch_add(1, std::memory_order_relaxed);
                 }
             }
@@ -263,7 +266,8 @@ TEST_F(ReplicaPlacementMasterShadowTest,
     const std::string secret_key = "must_not_appear_object_key_7f3a";
     PutObject(service, client_id, secret_key);
 
-    ASSERT_TRUE(service.GetReplicaList(secret_key, "default").has_value());
+    ASSERT_TRUE(
+        service.GetReplicaList(secret_key, TenantId::Default()).has_value());
 
     ReplicaPlacementShadowResult synthetic;
     synthetic.temperature = ReplicaTemperature::HOT;
@@ -312,9 +316,9 @@ TEST_F(ReplicaPlacementMasterShadowTest,
     const UUID client_id = PrepareMemorySegment(service, "shadow_collector");
     PutObject(service, client_id, "key");
 
-    ASSERT_TRUE(service.GetReplicaList("key", "default").has_value());
+    ASSERT_TRUE(service.GetReplicaList("key", TenantId::Default()).has_value());
     EXPECT_EQ(service.ReplicaPlacementShadowSignalGeneration(), 1);
-    ASSERT_TRUE(service.GetReplicaList("key", "default").has_value());
+    ASSERT_TRUE(service.GetReplicaList("key", TenantId::Default()).has_value());
     EXPECT_EQ(service.ReplicaPlacementShadowSignalGeneration(), 1)
         << "refresh interval must prevent a signal scan on every Get";
 
@@ -351,7 +355,7 @@ TEST_F(ReplicaPlacementMasterShadowTest,
     ASSERT_TRUE(service.ReportSsdCapacity(client_id, 1024 * 1024).has_value());
     PutObject(service, client_id, "key");
 
-    ASSERT_TRUE(service.GetReplicaList("key", "default").has_value());
+    ASSERT_TRUE(service.GetReplicaList("key", TenantId::Default()).has_value());
     const auto counters = service.GetReplicaPlacementShadowCounters();
     ASSERT_TRUE(counters.has_value());
     EXPECT_EQ(counters->add_intents[Intent(ReplicaTemperature::COLD,
@@ -376,7 +380,7 @@ TEST_F(ReplicaPlacementMasterShadowTest,
     ASSERT_TRUE(service.MountLocalDiskSegment(client_id, true).has_value());
     PutObject(service, client_id, "key");
 
-    ASSERT_TRUE(service.GetReplicaList("key", "default").has_value());
+    ASSERT_TRUE(service.GetReplicaList("key", TenantId::Default()).has_value());
     const auto counters = service.GetReplicaPlacementShadowCounters();
     ASSERT_TRUE(counters.has_value());
     EXPECT_EQ(counters->add_intents[Intent(ReplicaTemperature::COLD,
@@ -413,7 +417,7 @@ TEST_F(ReplicaPlacementMasterShadowTest,
     ASSERT_TRUE(service.NotifyOffloadSuccess(client_id, {task}, {metadata})
                     .has_value());
 
-    ASSERT_TRUE(service.GetReplicaList("key", "default").has_value());
+    ASSERT_TRUE(service.GetReplicaList("key", TenantId::Default()).has_value());
     const auto counters = service.GetReplicaPlacementShadowCounters();
     ASSERT_TRUE(counters.has_value());
     EXPECT_EQ(counters->add_intents[Intent(ReplicaTemperature::COLD,
@@ -448,7 +452,8 @@ TEST_F(ReplicaPlacementMasterShadowTest,
             PrepareMemorySegment(service, "shadow_remote_store");
         PutObject(service, client_id, "key");
 
-        ASSERT_TRUE(service.GetReplicaList("key", "default").has_value());
+        ASSERT_TRUE(
+            service.GetReplicaList("key", TenantId::Default()).has_value());
         const auto counters = service.GetReplicaPlacementShadowCounters();
         ASSERT_TRUE(counters.has_value());
         EXPECT_EQ(
@@ -484,7 +489,7 @@ TEST_F(ReplicaPlacementMasterShadowTest,
     const UUID client_id = PrepareMemorySegment(service, "shadow_remote_down");
     PutObject(service, client_id, "key");
 
-    ASSERT_TRUE(service.GetReplicaList("key", "default").has_value());
+    ASSERT_TRUE(service.GetReplicaList("key", TenantId::Default()).has_value());
     const auto counters = service.GetReplicaPlacementShadowCounters();
     ASSERT_TRUE(counters.has_value());
     EXPECT_EQ(counters->add_intents[Intent(ReplicaTemperature::COLD,
