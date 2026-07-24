@@ -40,6 +40,7 @@
 #ifdef WITH_METRICS
 #include "ylt/metric/counter.hpp"
 #include "ylt/metric/histogram.hpp"
+#include "transfer_engine_metrics.h"
 #endif
 
 namespace mooncake {
@@ -123,19 +124,10 @@ class TransferEngineImpl {
 
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest>& entries) {
-        Status s = multi_transports_->submitTransfer(batch_id, entries);
-#ifdef WITH_METRICS
-        if (metrics_enabled_ && s.ok()) {
-            auto& batch = Transport::toBatchDesc(batch_id);
-            auto now = std::chrono::steady_clock::now();
-            for (auto& task : batch.task_list) {
-                if (task.start_time.time_since_epoch().count() == 0) {
-                    task.start_time = now;
-                }
-            }
-        }
-#endif
-        return s;
+        // Metrics (start_time stamping + recordSubmitted) are handled inside
+        // MultiTransport::submitTransfer, before each task is posted, to avoid
+        // a race with asynchronous transport completion.
+        return multi_transports_->submitTransfer(batch_id, entries);
     }
 
     Status submitTransferWithNotify(BatchID batch_id,
@@ -149,18 +141,6 @@ class TransferEngineImpl {
         if (!s.ok()) {
             return s;
         }
-
-#ifdef WITH_METRICS
-        if (metrics_enabled_) {
-            auto& batch = Transport::toBatchDesc(batch_id);
-            auto now = std::chrono::steady_clock::now();
-            for (auto& task : batch.task_list) {
-                if (task.start_time.time_since_epoch().count() == 0) {
-                    task.start_time = now;
-                }
-            }
-        }
-#endif
 
         // store notify
         RWSpinlock::WriteGuard guard(send_notifies_lock_);
@@ -183,20 +163,9 @@ class TransferEngineImpl {
     Status mp_submitTransfer(BatchID batch_id,
                              const std::vector<TransferRequest>& entries,
                              std::string& proto) {
-        Status s =
-            multi_transports_->mp_submitTransfer(batch_id, entries, proto);
-#ifdef WITH_METRICS
-        if (metrics_enabled_ && s.ok()) {
-            auto& batch = Transport::toBatchDesc(batch_id);
-            auto now = std::chrono::steady_clock::now();
-            for (auto& task : batch.task_list) {
-                if (task.start_time.time_since_epoch().count() == 0) {
-                    task.start_time = now;
-                }
-            }
-        }
-#endif
-        return s;
+        // Metrics recording happens inside MultiTransport::mp_submitTransfer,
+        // before posting each task (see submitTransfer above).
+        return multi_transports_->mp_submitTransfer(batch_id, entries, proto);
     }
 
     Status mp_submitTransferWithNotify(
@@ -211,18 +180,6 @@ class TransferEngineImpl {
         if (!s.ok()) {
             return s;
         }
-
-#ifdef WITH_METRICS
-        if (metrics_enabled_) {
-            auto& batch = Transport::toBatchDesc(batch_id);
-            auto now = std::chrono::steady_clock::now();
-            for (auto& task : batch.task_list) {
-                if (task.start_time.time_since_epoch().count() == 0) {
-                    task.start_time = now;
-                }
-            }
-        }
-#endif
 
         // store notify
         RWSpinlock::WriteGuard guard(send_notifies_lock_);
@@ -284,7 +241,7 @@ class TransferEngineImpl {
                 goto metrics_done;
             }
 
-            // Only record metrics for successful completions
+            // Only record latency metrics for successful completions
             if (status.s == TransferStatusEnum::COMPLETED) {
                 if (status.transferred_bytes > 0) {
                     transferred_bytes_counter_.inc(status.transferred_bytes);
@@ -294,6 +251,15 @@ class TransferEngineImpl {
                     std::chrono::duration_cast<std::chrono::microseconds>(
                         now - start);
                 task_completion_latency_us_.observe(duration.count());
+
+                // Standard Prometheus-style metrics (exported via HTTP).
+                double latency_seconds = duration.count() / 1000000.0;
+                TransferEngineMetrics::instance().recordCompleted(
+                    status.transferred_bytes, latency_seconds);
+            } else {
+                // FAILED / CANCELED / TIMEOUT all count as a failure and clear
+                // this task's slot in the inflight gauge.
+                TransferEngineMetrics::instance().recordFailed();
             }
 
             // Reset start_time to prevent duplicate processing

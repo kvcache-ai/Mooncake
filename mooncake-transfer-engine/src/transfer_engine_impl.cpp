@@ -963,6 +963,15 @@ void TransferEngineImpl::InitializeMetricsConfig() {
                          << ", using default: " << metrics_interval_seconds_;
         }
     }
+
+    // Standard Prometheus-style metrics share the MC_TE_METRIC enable switch
+    // with the legacy logging thread, but are exported independently through an
+    // (optional) HTTP endpoint. Initialization is idempotent, so it is safe to
+    // run once per engine instance.
+    if (metrics_enabled_) {
+        auto config = TransferEngineMetrics::loadConfigFromEnv();
+        TransferEngineMetrics::instance().initialize(config);
+    }
 }
 
 void TransferEngineImpl::StartMetricsReportingThread() {
