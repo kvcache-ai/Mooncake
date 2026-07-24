@@ -4,6 +4,7 @@
 
 #include "allocator.h"
 #include "segment.h"
+#include "store_warmup_internal.h"
 
 #include <csignal>
 #include <algorithm>
@@ -22,6 +23,7 @@
 #include <ranges>
 #include <span>
 #include <sched.h>
+#include <stdexcept>
 #include <thread>
 #include <set>
 #include <utility>
@@ -44,6 +46,18 @@
 namespace mooncake {
 
 namespace {
+
+class ScopeExit {
+   public:
+    explicit ScopeExit(std::function<void()> fn) : fn_(std::move(fn)) {}
+    ~ScopeExit() { fn_(); }
+
+    ScopeExit(const ScopeExit&) = delete;
+    ScopeExit& operator=(const ScopeExit&) = delete;
+
+   private:
+    std::function<void()> fn_;
+};
 
 #ifdef USE_NOF
 std::optional<int> GetConfiguredNumaSocketId() {
@@ -305,6 +319,14 @@ Client::Client(const std::string& local_hostname,
 }
 
 Client::~Client() {
+    // Pending warmup READs may still target allocator-owned probe buffers.
+    // Finish their batch cleanup before tearing down Transfer Engine memory.
+    auto warmup_shutdown = ShutdownWarmup();
+    if (!warmup_shutdown) {
+        LOG(FATAL) << "warmup: Client teardown cannot safely continue: "
+                   << toString(warmup_shutdown.error());
+    }
+
     task_poll_running_ = false;
     if (task_poll_thread_.joinable()) {
         task_poll_thread_.join();
@@ -2720,6 +2742,324 @@ std::vector<int> Client::GetNicNumaNodes() const {
     return {nodes.begin(), nodes.end()};
 }
 
+internal::StoreWarmupOptions Client::LoadWarmupOptions() const {
+    return internal::LoadStoreWarmupOptions();
+}
+
+tl::expected<std::vector<WarmupTarget>, ErrorCode> Client::ListWarmupTargets(
+    const internal::StoreWarmupOptions& options) {
+    std::vector<std::string> preferred_protocols;
+    if (!protocol_.empty()) preferred_protocols.push_back(protocol_);
+    return master_client_.ListWarmupTargets(options.max_targets,
+                                            preferred_protocols);
+}
+
+internal::WarmupBatchCleanup& Client::GetWarmupBatchCleanup() {
+    std::lock_guard<std::mutex> lock(warmup_cleanup_mutex_);
+    if (!warmup_batch_cleanup_) {
+        auto engine = transfer_engine_;
+        warmup_batch_cleanup_ = std::make_unique<internal::WarmupBatchCleanup>(
+            [engine](Transport::BatchID batch_id) {
+                Transport::TransferStatus status{};
+                auto result = engine->getTransferStatus(batch_id, 0, status);
+                if (!result.ok()) {
+                    return internal::WarmupBatchState::kStatusError;
+                }
+                if (status.s == Transport::COMPLETED ||
+                    status.s == Transport::FAILED ||
+                    status.s == Transport::INVALID) {
+                    return internal::WarmupBatchState::kTerminal;
+                }
+                return internal::WarmupBatchState::kPending;
+            },
+            [engine](Transport::BatchID batch_id) {
+                return engine->freeBatchID(batch_id);
+            });
+    }
+    return *warmup_batch_cleanup_;
+}
+
+void Client::DrainPendingWarmupBatches(internal::WarmupBatchCleanup& cleanup,
+                                       std::chrono::milliseconds timeout) {
+    if (!cleanup.DrainFor(timeout)) {
+        LOG(WARNING) << "warmup: drain ended with "
+                     << cleanup.PendingTransferCount()
+                     << " non-terminal transfer(s) and "
+                     << cleanup.PendingBatchIDReleaseCount()
+                     << " batch ID release(s) pending after " << timeout.count()
+                     << " ms; cleanup will continue in the background";
+    }
+}
+
+bool Client::BeginWarmupCall() {
+    std::lock_guard<std::mutex> lock(warmup_lifecycle_mutex_);
+    if (warmup_shutdown_requested_) return false;
+    ++active_warmup_calls_;
+    return true;
+}
+
+void Client::EndWarmupCall() {
+    std::lock_guard<std::mutex> lock(warmup_lifecycle_mutex_);
+    CHECK_GT(active_warmup_calls_, 0);
+    --active_warmup_calls_;
+    warmup_lifecycle_cv_.notify_all();
+}
+
+tl::expected<void, ErrorCode> Client::ShutdownWarmup() {
+    const auto deadline =
+        std::chrono::steady_clock::now() + internal::kWarmupShutdownTimeout;
+    {
+        std::unique_lock<std::mutex> lock(warmup_lifecycle_mutex_);
+        warmup_shutdown_requested_ = true;
+        if (!warmup_lifecycle_cv_.wait_until(lock, deadline, [this]() {
+                return active_warmup_calls_ == 0;
+            })) {
+            LOG(ERROR) << "warmup: shutdown timed out waiting for "
+                       << active_warmup_calls_ << " active warmup call(s)";
+            return tl::unexpected(ErrorCode::TRANSFER_FAIL);
+        }
+    }
+
+    internal::WarmupBatchCleanup* cleanup = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(warmup_cleanup_mutex_);
+        cleanup = warmup_batch_cleanup_.get();
+    }
+    if (!cleanup) return {};
+
+    const auto remaining =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now());
+    if (remaining <= std::chrono::milliseconds::zero() ||
+        !cleanup->ShutdownFor(remaining)) {
+        LOG(ERROR) << "warmup: shutdown deadline expired with "
+                   << cleanup->PendingTransferCount()
+                   << " transfer(s) that may still write probe memory and "
+                   << cleanup->PendingBatchIDReleaseCount()
+                   << " pending batch ID release(s); memory must remain "
+                      "registered";
+        return tl::unexpected(ErrorCode::TRANSFER_FAIL);
+    }
+    return {};
+}
+
+internal::StoreWarmupProbeResult Client::ProbeWarmupTarget(
+    const WarmupTarget& target, BufferHandle buffer,
+    const internal::StoreWarmupOptions& options,
+    internal::WarmupBatchCleanup& cleanup) {
+    using ProbeResult = internal::StoreWarmupProbeResult;
+    ProbeResult result;
+
+    if (!target.allow_warmup || target.is_local ||
+        target.segment_name.empty()) {
+        return result;
+    }
+
+    const auto target_id = transfer_engine_->openSegment(target.segment_name);
+    if (target_id == static_cast<SegmentHandle>(-1) ||
+        target_id == LOCAL_SEGMENT_ID) {
+        LOG(WARNING) << "warmup: cannot open remote segment '"
+                     << target.segment_name << "'";
+        return result;
+    }
+
+    auto metadata = transfer_engine_->getMetadata();
+    auto target_segment =
+        metadata ? metadata->getSegmentDescByID(target_id) : nullptr;
+    if (!target_segment || target_segment->buffers.empty()) {
+        LOG(WARNING) << "warmup: segment '" << target.segment_name
+                     << "' has no readable buffer metadata";
+        return result;
+    }
+
+    const auto& remote_buffer = target_segment->buffers.front();
+    if (remote_buffer.length < options.read_size) {
+        LOG(WARNING) << "warmup: segment '" << target.segment_name
+                     << "' buffer too small for warmup, length="
+                     << remote_buffer.length
+                     << ", required=" << options.read_size;
+        return result;
+    }
+
+    const auto batch_id = transfer_engine_->allocateBatchID(1);
+    if (batch_id == INVALID_BATCH_ID) {
+        LOG(WARNING) << "warmup: allocateBatchID failed for '"
+                     << target.segment_name << "'";
+        result.status = ProbeResult::Status::kFailed;
+        return result;
+    }
+
+    internal::PendingWarmupBatch pending{batch_id, target.segment_name,
+                                         std::move(buffer)};
+    Transport::TransferRequest request;
+    request.opcode = Transport::TransferRequest::READ;
+    request.source = pending.buffer->ptr();
+    request.target_id = target_id;
+    request.target_offset = remote_buffer.addr;
+    request.length = options.read_size;
+
+    auto submit_status = transfer_engine_->submitTransfer(batch_id, {request});
+    if (!submit_status.ok()) {
+        LOG(WARNING) << "warmup: READ submitTransfer failed for '"
+                     << target.segment_name << "': " << submit_status.message();
+        pending.transfer_terminal = true;
+        result.status = ProbeResult::Status::kFailed;
+        result.pending_cleanup = !cleanup.ReleaseOrTrack(std::move(pending));
+        return result;
+    }
+
+    Transport::TransferStatus transfer_status{};
+    bool terminal = false;
+    bool status_error = false;
+    const auto deadline = std::chrono::steady_clock::now() + options.timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto status =
+            transfer_engine_->getTransferStatus(batch_id, 0, transfer_status);
+        if (!status.ok()) {
+            LOG(WARNING) << "warmup: getTransferStatus failed for '"
+                         << target.segment_name << "': " << status.message()
+                         << "; retaining batch and probe buffer";
+            status_error = true;
+            break;
+        }
+        if (transfer_status.s == Transport::COMPLETED ||
+            transfer_status.s == Transport::FAILED ||
+            transfer_status.s == Transport::INVALID) {
+            terminal = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+
+    pending.transfer_terminal = terminal;
+    if (terminal && transfer_status.s == Transport::COMPLETED) {
+        result.status = ProbeResult::Status::kSucceeded;
+    } else if (!terminal && !status_error) {
+        LOG(WARNING) << "warmup: READ timed out for '" << target.segment_name
+                     << "' after " << options.timeout.count()
+                     << " ms; retaining batch and probe buffer";
+        result.status = ProbeResult::Status::kTimedOut;
+    } else {
+        result.status = ProbeResult::Status::kFailed;
+    }
+    result.pending_cleanup = !cleanup.ReleaseOrTrack(std::move(pending));
+    return result;
+}
+
+tl::expected<void, ErrorCode> Client::warmup(
+    const std::shared_ptr<ClientBufferAllocator>& allocator) {
+    if (!transfer_engine_) {
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    if (!allocator) {
+        LOG(WARNING) << "warmup: no buffer allocator provided, skipping";
+        return {};
+    }
+    if (!BeginWarmupCall()) {
+        LOG(WARNING) << "warmup: shutdown already requested, skipping";
+        return {};
+    }
+    ScopeExit active_call_guard([this]() { EndWarmupCall(); });
+
+    const auto options = LoadWarmupOptions();
+    auto targets_result = ListWarmupTargets(options);
+    if (!targets_result) {
+        LOG(WARNING) << "warmup: ListWarmupTargets failed: "
+                     << toString(targets_result.error())
+                     << ", continuing without warmup";
+        return {};
+    }
+
+    const auto& targets = targets_result.value();
+    LOG(INFO) << "warmup: pre-establishing READ-only connections to "
+              << targets.size()
+              << " target(s), concurrency=" << options.concurrency
+              << ", timeout_ms=" << options.timeout.count()
+              << ", max_targets=" << options.max_targets
+              << (options.max_targets == 0 ? " (unlimited)" : "")
+              << ", read_size_bytes=" << options.read_size;
+    if (targets.empty()) return {};
+
+    auto& cleanup = GetWarmupBatchCleanup();
+    internal::StoreWarmupStats stats;
+    stats.discovered = targets.size();
+    std::atomic<size_t> next_index{0};
+    std::atomic<bool> stop_submitting_due_to_pending{false};
+
+    const auto start = std::chrono::steady_clock::now();
+    const size_t worker_count = std::min(options.concurrency, targets.size());
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count);
+    for (size_t worker_index = 0; worker_index < worker_count; ++worker_index) {
+        workers.emplace_back([&]() {
+            while (!stop_submitting_due_to_pending.load(
+                std::memory_order_acquire)) {
+                const size_t index =
+                    next_index.fetch_add(1, std::memory_order_relaxed);
+                if (index >= targets.size()) return;
+                stats.attempted.fetch_add(1, std::memory_order_relaxed);
+
+                auto buffer = allocator->allocate(options.read_size);
+                if (!buffer) {
+                    LOG(WARNING) << "warmup: failed to allocate probe buffer";
+                    stats.failed.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
+                std::memset(buffer->ptr(), 0, buffer->size());
+
+                auto result = ProbeWarmupTarget(
+                    targets[index], std::move(*buffer), options, cleanup);
+                switch (result.status) {
+                    case internal::StoreWarmupProbeResult::Status::kSucceeded:
+                        stats.succeeded.fetch_add(1, std::memory_order_relaxed);
+                        break;
+                    case internal::StoreWarmupProbeResult::Status::kFailed:
+                        stats.failed.fetch_add(1, std::memory_order_relaxed);
+                        break;
+                    case internal::StoreWarmupProbeResult::Status::kTimedOut:
+                        stats.timed_out.fetch_add(1, std::memory_order_relaxed);
+                        break;
+                    case internal::StoreWarmupProbeResult::Status::kSkipped:
+                        stats.skipped.fetch_add(1, std::memory_order_relaxed);
+                        break;
+                }
+                if (result.pending_cleanup) {
+                    stop_submitting_due_to_pending.store(
+                        true, std::memory_order_release);
+                }
+            }
+        });
+    }
+    for (auto& worker : workers) worker.join();
+
+    const auto drain_timeout = std::chrono::milliseconds(std::min<int64_t>(
+        1000, std::max<int64_t>(100, options.timeout.count())));
+    DrainPendingWarmupBatches(cleanup, drain_timeout);
+    stats.not_attempted =
+        stats.discovered - stats.attempted.load(std::memory_order_relaxed);
+    stats.pending_transfers = cleanup.PendingTransferCount();
+    stats.pending_batch_id_releases = cleanup.PendingBatchIDReleaseCount();
+    stats.pending_cleanup =
+        stats.pending_transfers + stats.pending_batch_id_releases;
+
+    const auto duration_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start)
+            .count();
+    LOG(INFO) << "warmup: discovered=" << stats.discovered
+              << ", attempted=" << stats.attempted.load()
+              << ", not_attempted=" << stats.not_attempted
+              << ", success=" << stats.succeeded.load()
+              << ", failed=" << stats.failed.load()
+              << ", skipped=" << stats.skipped.load()
+              << ", timeout=" << stats.timed_out.load()
+              << ", pending_cleanup=" << stats.pending_cleanup
+              << ", pending_transfers=" << stats.pending_transfers
+              << ", pending_batch_id_releases="
+              << stats.pending_batch_id_releases
+              << ", duration_ms=" << duration_ms;
+    return {};
+}
 tl::expected<void, ErrorCode> Client::MountSegment(
     const void* buffer, size_t size, const std::string& protocol,
     const std::string& location) {

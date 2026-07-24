@@ -49,20 +49,30 @@ add_store_test(eviction_strategy_test eviction_strategy_test.cpp)
 add_store_test(deadline_scheduler_test deadline_scheduler_test.cpp)
 add_store_test(kv_event_publisher_test kv_event_publisher_test.cpp)
 if(ENABLE_KV_EVENTS)
-  find_library(KV_EVENT_TEST_ZMQ_LIBRARY NAMES zmq libzmq PATHS /usr/lib
-               /usr/local/lib /usr/lib64)
-  find_path(KV_EVENT_TEST_ZMQ_INCLUDE_DIR NAMES zmq.h PATHS /usr/include
-            /usr/local/include)
-  target_compile_definitions(kv_event_publisher_test PRIVATE
-                             MOONCAKE_ENABLE_KV_EVENTS=1)
+  find_library(
+    KV_EVENT_TEST_ZMQ_LIBRARY
+    NAMES zmq libzmq
+    PATHS /usr/lib /usr/local/lib /usr/lib64)
+  find_path(
+    KV_EVENT_TEST_ZMQ_INCLUDE_DIR
+    NAMES zmq.h
+    PATHS /usr/include /usr/local/include)
+  target_compile_definitions(kv_event_publisher_test
+                             PRIVATE MOONCAKE_ENABLE_KV_EVENTS=1)
   if(KV_EVENT_TEST_ZMQ_LIBRARY AND KV_EVENT_TEST_ZMQ_INCLUDE_DIR)
     target_include_directories(kv_event_publisher_test
-                             PRIVATE ${KV_EVENT_TEST_ZMQ_INCLUDE_DIR})
+                               PRIVATE ${KV_EVENT_TEST_ZMQ_INCLUDE_DIR})
     target_link_libraries(kv_event_publisher_test
                           PRIVATE ${KV_EVENT_TEST_ZMQ_LIBRARY})
   endif()
 endif()
 add_store_test(master_service_test master_service_test.cpp)
+add_store_test(store_warmup_test store_warmup_test.cpp)
+target_include_directories(store_warmup_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+add_store_test(store_warmup_integration_test
+               store_warmup_integration_test.cpp)
+set_tests_properties(store_warmup_integration_test PROPERTIES TIMEOUT 45)
 add_store_test(master_service_tenant_quota_test
                master_service_tenant_quota_test.cpp)
 add_store_test(batch_remove_test batch_remove_test.cpp)

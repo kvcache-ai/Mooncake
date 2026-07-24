@@ -201,6 +201,10 @@ class WrappedMasterService {
 
     tl::expected<std::vector<std::string>, ErrorCode> GetAllSegmentsForAdmin();
 
+    tl::expected<std::vector<WarmupTarget>, ErrorCode> ListWarmupTargets(
+        const UUID& client_id, uint64_t max_targets,
+        const std::vector<std::string>& preferred_protocols);
+
     tl::expected<std::vector<MasterService::SegmentDetailInfo>, ErrorCode>
     GetSegmentsDetailForAdmin();
 

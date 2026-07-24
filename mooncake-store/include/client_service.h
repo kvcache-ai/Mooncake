@@ -15,6 +15,7 @@
 #include <unordered_set>
 
 #include "client_metric.h"
+#include "client_buffer.h"
 #include "ha/leadership/leader_coordinator.h"
 #include "master_client.h"
 #include "storage_backend.h"
@@ -29,6 +30,12 @@
 #include "pinned_buffer_pool.h"
 
 namespace mooncake {
+
+namespace internal {
+class WarmupBatchCleanup;
+struct StoreWarmupOptions;
+struct StoreWarmupProbeResult;
+}  // namespace internal
 
 class PutOperation;
 
@@ -572,6 +579,25 @@ class Client {
     [[nodiscard]] const std::string& GetProtocol() const { return protocol_; }
 
     /**
+     * @brief Warm up transport-level connections to eligible remote segments.
+     *
+     * This is connection warmup, not KV data warmup. The warmup path is
+     * best-effort and READ-only: it uses registered client buffers as local
+     * destinations, validates remote buffer metadata, and never writes remote
+     * memory. The default probe size is 64 bytes.
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> warmup(
+        const std::shared_ptr<ClientBufferAllocator>& allocator);
+
+    /**
+     * @brief Stop new warmup calls and safely drain pending warmup transfers.
+     *
+     * This operation is idempotent. A failure means a transfer may still write
+     * a probe buffer, so callers must keep its memory registered and alive.
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> ShutdownWarmup();
+
+    /**
      * @brief Get the endpoint address for segment operations.
      * @return For P2PHANDSHAKE mode, returns the actual RPC endpoint (IP:Port).
      *         For other modes, returns the logical local hostname used for
@@ -778,6 +804,19 @@ class Client {
         std::unordered_map<std::string, std::vector<Slice>>& slices);
     ReplicateConfig AttachHostId(const ReplicateConfig& config) const;
 
+    internal::StoreWarmupOptions LoadWarmupOptions() const;
+    tl::expected<std::vector<WarmupTarget>, ErrorCode> ListWarmupTargets(
+        const internal::StoreWarmupOptions& options);
+    internal::StoreWarmupProbeResult ProbeWarmupTarget(
+        const WarmupTarget& target, BufferHandle buffer,
+        const internal::StoreWarmupOptions& options,
+        internal::WarmupBatchCleanup& cleanup);
+    internal::WarmupBatchCleanup& GetWarmupBatchCleanup();
+    void DrainPendingWarmupBatches(internal::WarmupBatchCleanup& cleanup,
+                                   std::chrono::milliseconds timeout);
+    bool BeginWarmupCall();
+    void EndWarmupCall();
+
     // Client identification
     const UUID client_id_;
 
@@ -788,6 +827,12 @@ class Client {
     std::shared_ptr<TransferEngine> transfer_engine_;
     MasterClient master_client_;
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
+    std::mutex warmup_cleanup_mutex_;
+    std::unique_ptr<internal::WarmupBatchCleanup> warmup_batch_cleanup_;
+    std::mutex warmup_lifecycle_mutex_;
+    std::condition_variable warmup_lifecycle_cv_;
+    bool warmup_shutdown_requested_ = false;
+    size_t active_warmup_calls_ = 0;
 
     // Mutex to protect mounted_segments_
     mutable std::mutex mounted_segments_mutex_;

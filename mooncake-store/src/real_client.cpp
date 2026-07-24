@@ -645,7 +645,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &ipc_socket_path, int local_rpc_port,
     bool enable_ssd_offload, bool start_offload_rpc_server,
     const std::string &ssd_offload_path, const std::string &tenant_id,
-    bool enable_client_http_server, int client_http_port) {
+    bool enable_client_http_server, int client_http_port,
+    bool enable_store_warmup) {
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
     const bool should_use_hugepage =
@@ -998,6 +999,34 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
     }
 
+    if (client_) {
+        const char *env = std::getenv("MC_STORE_WARMUP");
+        bool enable_warmup = enable_store_warmup;
+        if (env) {
+            std::string val = env;
+            std::transform(val.begin(), val.end(), val.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            enable_warmup = enable_warmup || (val == "1" || val == "true" ||
+                                              val == "yes" || val == "on");
+        }
+        if (enable_warmup) {
+            if (!local_buffer_region_.has_value() ||
+                local_buffer_region_->size == 0) {
+                LOG(WARNING) << "Warmup enabled but local buffer is not "
+                             << "registered (protocol=" << this->protocol
+                             << "), skipping warmup";
+            } else {
+                LOG(INFO) << "Warming up connections to eligible segments";
+                auto warmup_result = client_->warmup(client_buffer_allocator_);
+                if (!warmup_result) {
+                    LOG(WARNING)
+                        << "Warmup failed: " << toString(warmup_result.error())
+                        << ", continuing setup (will connect on demand)";
+                }
+            }
+        }
+    }
+
     return {};
 }
 
@@ -1009,12 +1038,14 @@ int RealClient::setup_real(
     const std::shared_ptr<TransferEngine> &transfer_engine,
     const std::string &ipc_socket_path, bool enable_ssd_offload,
     const std::string &ssd_offload_path, const std::string &tenant_id,
-    bool enable_client_http_server, int client_http_port) {
+    bool enable_client_http_server, int client_http_port,
+    bool enable_store_warmup) {
     return to_py_ret(setup_internal(
         local_hostname, metadata_server, global_segment_size, local_buffer_size,
         protocol, rdma_devices, master_server_addr, transfer_engine,
         ipc_socket_path, 50052, enable_ssd_offload, true, ssd_offload_path,
-        tenant_id, enable_client_http_server, client_http_port));
+        tenant_id, enable_client_http_server, client_http_port,
+        enable_store_warmup));
 }
 
 namespace {
@@ -1175,12 +1206,14 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     int client_http_port = client_http_port_opt.value();
+    bool enable_store_warmup =
+        get_config_bool(config, CONFIG_KEY_ENABLE_STORE_WARMUP, false);
 
-    return setup_internal(local_hostname, metadata_server, global_segment_size,
-                          local_buffer_size, protocol, rdma_devices,
-                          master_server_addr, nullptr, ipc_socket_path, 50052,
-                          enable_ssd_offload, true, ssd_offload_path, tenant_id,
-                          enable_client_http_server, client_http_port);
+    return setup_internal(
+        local_hostname, metadata_server, global_segment_size, local_buffer_size,
+        protocol, rdma_devices, master_server_addr, nullptr, ipc_socket_path,
+        50052, enable_ssd_offload, true, ssd_offload_path, tenant_id,
+        enable_client_http_server, client_http_port, enable_store_warmup);
 }
 
 tl::expected<void, ErrorCode> RealClient::initAll_internal(
@@ -1219,6 +1252,16 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         // Not initialized or already cleaned; treat as success for idempotence
         return {};
     }
+
+    auto warmup_shutdown = client_->ShutdownWarmup();
+    if (!warmup_shutdown) {
+        LOG(ERROR) << "Warmup shutdown failed; keeping client probe memory "
+                      "registered for a later teardown retry: "
+                   << toString(warmup_shutdown.error());
+        closed_.store(false, std::memory_order_release);
+        return tl::unexpected(warmup_shutdown.error());
+    }
+
     if (client_buffer_allocator_ && client_buffer_allocator_->size() > 0 &&
         protocol != "cxl") {
         auto unregister_result = client_->unregisterLocalMemory(

@@ -7,6 +7,7 @@ set(MOONCAKE_STORE_SOURCES
     master_snapshot_manager.cpp
     master_snapshot_repository.cpp
     client_service.cpp
+    store_warmup_internal.cpp
     client_metric.cpp
     types.cpp
     master_client.cpp

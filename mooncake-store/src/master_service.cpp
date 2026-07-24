@@ -25,6 +25,7 @@
 #include "master_metric_manager.h"
 #include "common.h"
 #include "segment.h"
+#include "store_warmup_internal.h"
 #ifdef USE_HTTP
 #include "transfer_metadata_plugin.h"
 #endif
@@ -2146,6 +2147,100 @@ auto MasterService::GetAllSegments()
         return tl::make_unexpected(err);
     }
     return all_segments;
+}
+
+auto MasterService::ListWarmupTargets(
+    const UUID& client_id, uint64_t max_targets,
+    const std::vector<std::string>& preferred_protocols)
+    -> tl::expected<std::vector<WarmupTarget>, ErrorCode> {
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    std::vector<std::pair<Segment, UUID>> all_segments;
+    auto err = segment_access.GetAllSegments(all_segments);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    const uint64_t effective_max_targets =
+        internal::NormalizeWarmupMaxTargets(max_targets);
+
+    auto protocol_allowed = [&](const std::string& protocol) {
+        if (preferred_protocols.empty()) return true;
+        // Store segment protocol is normally a single token such as "tcp",
+        // "rdma", or "ub". Some deployments may persist a token list; match
+        // exact tokens only to avoid cross-protocol warmup by substring.
+        auto token_matches = [&](const std::string& preferred) {
+            size_t start = 0;
+            while (start < protocol.size()) {
+                start = protocol.find_first_not_of(" ,;|+", start);
+                if (start == std::string::npos) break;
+                const size_t end = protocol.find_first_of(" ,;|+", start);
+                const auto token = protocol.substr(
+                    start,
+                    end == std::string::npos ? std::string::npos : end - start);
+                if (token == preferred) return true;
+                if (end == std::string::npos) break;
+                start = end + 1;
+            }
+            return false;
+        };
+        for (const auto& preferred : preferred_protocols) {
+            if (token_matches(preferred)) return true;
+        }
+        return false;
+    };
+
+    std::vector<WarmupTarget> targets;
+    // Never construct more target results than the service-side cap, even if
+    // the caller requests an unlimited or oversized response.
+    targets.reserve(
+        std::min(all_segments.size(),
+                 static_cast<size_t>(internal::kMaxWarmupTargetsPerRequest)));
+    std::unordered_set<std::string> seen_segment_names;
+    for (const auto& [segment, owner_client_id] : all_segments) {
+        // Warmup locality follows Store client ownership. Segments owned by a
+        // different client remain eligible even when both clients share a
+        // host.
+        if (owner_client_id == client_id) {
+            continue;
+        }
+        const std::string segment_name =
+            segment.te_endpoint.empty() ? segment.name : segment.te_endpoint;
+        if (segment_name.empty()) {
+            continue;
+        }
+        SegmentStatus status;
+        err = segment_access.GetSegmentStatusByName(segment.name, status);
+        if (err != ErrorCode::OK || status != SegmentStatus::OK) {
+            continue;
+        }
+        if (!protocol_allowed(segment.protocol)) {
+            continue;
+        }
+        if (!seen_segment_names.insert(segment_name).second) {
+            continue;
+        }
+
+        WarmupTarget target;
+        target.segment_name = segment_name;
+        target.segment_id = segment.id;
+        target.client_id = owner_client_id;
+        target.protocol = segment.protocol;
+        target.is_local = false;
+        target.allow_warmup = true;
+        targets.emplace_back(std::move(target));
+        if (targets.size() == internal::kMaxWarmupTargetsPerRequest) break;
+    }
+
+    if (targets.size() > effective_max_targets) {
+        const size_t offset =
+            static_cast<size_t>(client_id.first ^ client_id.second) %
+            targets.size();
+        std::rotate(targets.begin(), targets.begin() + offset, targets.end());
+        targets.resize(static_cast<size_t>(effective_max_targets));
+    }
+    for (size_t i = 0; i < targets.size(); ++i) {
+        targets[i].priority = i;
+    }
+    return targets;
 }
 
 auto MasterService::GetAllNoFSegments()
