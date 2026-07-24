@@ -141,10 +141,10 @@ CUDA_EP_STAGING_DIR="${BUILD_DIR_ABS}/ep_pg_staging"
 # temporary location so they survive the cleanup.
 CUDA_EP_STAGING_TEMP=""
 if [ "$CI" = "true" ] || [ "$FREE_BUILD_DIR" = "1" ]; then
-    if [ -d "$CUDA_EP_STAGING_DIR" ] && ls "$CUDA_EP_STAGING_DIR"/*.so &>/dev/null; then
+    if [ -d "$CUDA_EP_STAGING_DIR" ] && ls "$CUDA_EP_STAGING_DIR"/pg_*.so &>/dev/null; then
         CUDA_EP_STAGING_TEMP=$(mktemp -d)
-        cp "$CUDA_EP_STAGING_DIR"/*.so "$CUDA_EP_STAGING_TEMP/"
-        echo "Preserved EP/PG .so files to ${CUDA_EP_STAGING_TEMP} before build-dir cleanup"
+        cp "$CUDA_EP_STAGING_DIR"/pg_*.so "$CUDA_EP_STAGING_TEMP/"
+        echo "Preserved PG extension .so files to ${CUDA_EP_STAGING_TEMP} before build-dir cleanup"
     fi
     echo "Freeing disk space: removing build directory (artifacts already copied)"
     rm -rf "${BUILD_DIR}/"
@@ -461,14 +461,14 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
 
 # Inject the PyTorch-versioned PG extensions into the repaired wheel.
-if [ -d "$CUDA_EP_STAGING_DIR" ] && ls "$CUDA_EP_STAGING_DIR"/*.so &>/dev/null; then
+if [ -d "$CUDA_EP_STAGING_DIR" ] && ls "$CUDA_EP_STAGING_DIR"/pg_*.so &>/dev/null; then
     REPAIRED_WHEEL=$(ls ${REPAIRED_DIR}/*.whl 2>/dev/null | head -1)
     if [ -n "$REPAIRED_WHEEL" ]; then
         echo "Injecting PG extension .so files into repaired wheel..."
         WHEEL_UNPACK_DIR=$(mktemp -d)
         python${PYTHON_VERSION} -m wheel unpack "$REPAIRED_WHEEL" -d "$WHEEL_UNPACK_DIR"
         UNPACKED_PKG_DIR=$(find "$WHEEL_UNPACK_DIR" -mindepth 1 -maxdepth 1 -type d | head -1)
-        for so_file in "$CUDA_EP_STAGING_DIR"/*.so; do
+        for so_file in "$CUDA_EP_STAGING_DIR"/pg_*.so; do
             if [ -f "$so_file" ]; then
                 echo "  Adding $(basename "$so_file")"
                 cp "$so_file" "$UNPACKED_PKG_DIR/mooncake/$(basename "$so_file")"

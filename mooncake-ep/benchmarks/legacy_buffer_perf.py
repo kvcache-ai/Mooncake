@@ -108,6 +108,8 @@ def main() -> None:
     cache_flush.zero_()
     result = native_ep._benchmark_legacy_buffer(buffer.runtime, tensors, config)
     selections = topk_idx.numel()
+    # Effective payload across the timed dispatch + combine pair: every routed
+    # BF16 hidden element moves once in each direction, for 4 B in aggregate.
     payload_bytes = selections * (args.hidden * 4)
     bandwidth = payload_bytes / result.average_us / 1e3
     print(

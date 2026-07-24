@@ -58,7 +58,7 @@ class EPHandle:
         dst_buffer_slot_idx: torch.Tensor,
         token_metadata_at_forward: Optional[torch.Tensor],
         channel_linked_list: Optional[torch.Tensor],
-        native_handle: Optional[Tuple[Any, ...]] = None,
+        native_handle: Optional[bool] = None,
     ) -> None:
         assert topk_idx is not None
         self.do_expand = do_expand
