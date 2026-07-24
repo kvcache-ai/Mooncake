@@ -35,6 +35,32 @@ DEFINE_int32(start_num_threads, 1,
              "Start number of concurrent worker threads.");
 DEFINE_int32(max_num_threads, 1,
              "Maximum number of concurrent worker threads.");
+DEFINE_string(receiver_credit_mode, "disabled",
+              "Benchmark-only receiver capacity mode: disabled|fixed|credit.");
+DEFINE_uint64(receiver_capacity_bytes, 0,
+              "Receiver byte capacity used by fixed/credit experiments.");
+DEFINE_uint64(
+    receiver_capacity_slots, 0,
+    "Receiver request-slot capacity used by fixed/credit experiments.");
+DEFINE_uint64(receiver_consumer_delay_us, 0,
+              "Delay before the receiver returns bytes and slots.");
+DEFINE_uint64(receiver_credit_grant_timeout_ms, 10000,
+              "Maximum time an initiator waits for a receiver grant.");
+DEFINE_uint64(receiver_credit_grant_batch, 1,
+              "Transfers covered by one receiver credit lease.");
+DEFINE_uint64(receiver_credit_operations, 0,
+              "Exact operations per sender (0 uses --duration).");
+DEFINE_string(receiver_credit_output_jsonl, "",
+              "Target-side receiver-credit result JSONL output.");
+DEFINE_string(receiver_credit_run_id, "", "Receiver-credit experiment run ID.");
+DEFINE_string(receiver_credit_condition, "normal",
+              "Receiver-credit experiment condition label.");
+DEFINE_int32(receiver_credit_sender_count, 0,
+             "Expected sender process count for the target report.");
+DEFINE_int32(receiver_credit_repetition, 0,
+             "Receiver-credit experiment repetition number.");
+DEFINE_double(receiver_credit_oracle_throughput_gbps, 0.0,
+              "Externally measured oracle throughput for comparison.");
 DEFINE_string(
     qos_classes, "",
     "QoS classes as name:threads:slo_us:weight[:isolated_gbps],...; "
@@ -100,6 +126,19 @@ size_t XferBenchConfig::max_batch_size = 0;
 int XferBenchConfig::duration = 0;
 int XferBenchConfig::max_num_threads = 0;
 int XferBenchConfig::start_num_threads = 0;
+std::string XferBenchConfig::receiver_credit_mode;
+uint64_t XferBenchConfig::receiver_capacity_bytes = 0;
+uint64_t XferBenchConfig::receiver_capacity_slots = 0;
+uint64_t XferBenchConfig::receiver_consumer_delay_us = 0;
+uint64_t XferBenchConfig::receiver_credit_grant_timeout_ms = 0;
+uint64_t XferBenchConfig::receiver_credit_grant_batch = 0;
+uint64_t XferBenchConfig::receiver_credit_operations = 0;
+std::string XferBenchConfig::receiver_credit_output_jsonl;
+std::string XferBenchConfig::receiver_credit_run_id;
+std::string XferBenchConfig::receiver_credit_condition;
+int XferBenchConfig::receiver_credit_sender_count = 0;
+int XferBenchConfig::receiver_credit_repetition = 0;
+double XferBenchConfig::receiver_credit_oracle_throughput_gbps = 0.0;
 std::string XferBenchConfig::qos_classes;
 std::string XferBenchConfig::qos_classes_json;
 std::string XferBenchConfig::workload_classes_json;
@@ -135,6 +174,20 @@ void XferBenchConfig::loadFromFlags() {
     max_batch_size = FLAGS_max_batch_size;
     start_num_threads = FLAGS_start_num_threads;
     max_num_threads = FLAGS_max_num_threads;
+    receiver_credit_mode = FLAGS_receiver_credit_mode;
+    receiver_capacity_bytes = FLAGS_receiver_capacity_bytes;
+    receiver_capacity_slots = FLAGS_receiver_capacity_slots;
+    receiver_consumer_delay_us = FLAGS_receiver_consumer_delay_us;
+    receiver_credit_grant_timeout_ms = FLAGS_receiver_credit_grant_timeout_ms;
+    receiver_credit_grant_batch = FLAGS_receiver_credit_grant_batch;
+    receiver_credit_operations = FLAGS_receiver_credit_operations;
+    receiver_credit_output_jsonl = FLAGS_receiver_credit_output_jsonl;
+    receiver_credit_run_id = FLAGS_receiver_credit_run_id;
+    receiver_credit_condition = FLAGS_receiver_credit_condition;
+    receiver_credit_sender_count = FLAGS_receiver_credit_sender_count;
+    receiver_credit_repetition = FLAGS_receiver_credit_repetition;
+    receiver_credit_oracle_throughput_gbps =
+        FLAGS_receiver_credit_oracle_throughput_gbps;
     qos_classes = FLAGS_qos_classes;
     qos_classes_json = FLAGS_qos_classes_json;
     workload_classes_json = FLAGS_workload_classes_json;
