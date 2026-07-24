@@ -35,6 +35,7 @@ set(MOONCAKE_STORE_SOURCES
     file_storage.cpp
     serialize/serializer.cpp
     storage/distributed/distributed_storage_backend.cpp
+    storage/distributed/object_storage_adapter.cpp
     device/accelerator_device.cpp
     device/accelerator_registry.cpp
     device/runtime_accelerator.cpp
