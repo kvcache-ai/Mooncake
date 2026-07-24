@@ -639,7 +639,7 @@ Limitations: This strategy only supports single-replica allocation (does not dis
 
 ## Eviction Policy
 
-When a `PutStart` request fails due to insufficient memory, or when the eviction thread detects that space usage has reached the configured high watermark (95% by default, configurable via `-eviction_high_watermark_ratio`), an eviction task is triggered to free up space by evicting a portion of objects (5% by default, configurable via `-eviction_ratio`). Similar to `Remove`, evicted objects are simply marked as deleted, with no data transfer required.
+When a `PutStart` request fails due to insufficient memory, or when the eviction thread detects that space usage has reached the configured high watermark (90% by default, configurable via `-eviction_high_watermark_ratio`), an eviction task is triggered to free up space by evicting a portion of objects (5% by default, configurable via `-eviction_ratio`). Similar to `Remove`, evicted objects are simply marked as deleted, with no data transfer required.
 
 Currently, an approximate LRU policy is adopted, where the least recently used objects are preferred for eviction. To avoid data races and corruption, objects currently being read or written by clients should not be evicted. For this reason, objects that have leases or have not been marked as complete by `PutEnd` requests will be ignored by the eviction task.
 
@@ -653,7 +653,7 @@ For grouped objects, a successful `ExistKey` or `GetReplicaList` refreshes the l
 
 However, if the lease expires before a `Get` operation finishes reading the data, the operation will be considered failed, and no data will be returned, in order to prevent potential data corruption.
 
-The default lease TTL is 5 seconds and is configurable via a startup parameter of `master_service`.
+The default lease TTL is 10 seconds and is configurable via a startup parameter of `master_service`.
 
 ## Soft Pin
 
