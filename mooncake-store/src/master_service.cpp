@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <random>
 #include <shared_mutex>
@@ -399,6 +400,31 @@ MasterService::MasterService(const MasterServiceConfig& config)
                   << ")";
     }
 
+    if (config.replica_placement_shadow_config.has_value()) {
+        const auto& shadow_config = *config.replica_placement_shadow_config;
+        if (shadow_config.auto_collect_master_signals &&
+            (shadow_config.signal_refresh_interval <=
+                 std::chrono::nanoseconds::zero() ||
+             shadow_config.signal_refresh_interval >
+                 shadow_config.evaluator.signal_ttl)) {
+            throw std::invalid_argument(
+                "replica placement SHADOW refresh interval must be positive "
+                "and no greater than signal TTL");
+        }
+        replica_placement_shadow_evaluator_ =
+            std::make_unique<ReplicaPlacementShadowEvaluator>(
+                shadow_config.evaluator);
+        replica_placement_shadow_auto_collect_signals_ =
+            shadow_config.auto_collect_master_signals;
+        replica_placement_shadow_refresh_interval_ =
+            shadow_config.signal_refresh_interval;
+        LOG(INFO) << "Replica placement SHADOW enabled: observations produce "
+                     "fixed-cardinality intent counters only; Copy/Move "
+                     "submission remains disabled, auto_collect_master_"
+                     "signals="
+                  << replica_placement_shadow_auto_collect_signals_;
+    }
+
     kv_event_publisher_ =
         std::make_unique<KvEventPublisher>(BuildKvEventConfig(config));
 
@@ -565,6 +591,193 @@ MasterService::~MasterService() {
     if (snapshot_manager_) {
         snapshot_manager_.reset();
     }
+}
+
+bool MasterService::ReplicaPlacementShadowEnabled() const noexcept {
+    return replica_placement_shadow_evaluator_ != nullptr;
+}
+
+ReplicaPlacementSignalPublishStatus
+MasterService::PublishReplicaPlacementSignalSnapshot(
+    ReplicaPlacementSignalSnapshot snapshot) {
+    if (!replica_placement_shadow_evaluator_) {
+        return ReplicaPlacementSignalPublishStatus::NOT_ENABLED;
+    }
+    const auto status =
+        replica_placement_shadow_evaluator_->PublishSignalSnapshot(
+            std::move(snapshot));
+    if (status == ReplicaPlacementSignalPublishStatus::PUBLISHED) {
+        replica_placement_shadow_external_signal_source_.store(
+            true, std::memory_order_release);
+    }
+    return status;
+}
+
+uint64_t MasterService::ReplicaPlacementShadowSignalGeneration()
+    const noexcept {
+    return replica_placement_shadow_evaluator_
+               ? replica_placement_shadow_evaluator_->CurrentGeneration()
+               : 0;
+}
+
+std::optional<ReplicaPlacementShadowCountersSnapshot>
+MasterService::GetReplicaPlacementShadowCounters() const noexcept {
+    if (!replica_placement_shadow_evaluator_) return std::nullopt;
+    return replica_placement_shadow_evaluator_->Counters();
+}
+
+void MasterService::ObserveReplicaPlacementShadow(
+    const ObjectIdentity& object_id,
+    std::span<const Replica::Descriptor> replicas) {
+    if (!replica_placement_shadow_evaluator_) return;
+    RefreshReplicaPlacementShadowSignals();
+    const auto result = replica_placement_shadow_evaluator_->Observe(
+        object_id.tenant_id.MakeScopedKey(object_id.user_key), replicas);
+    MasterMetricManager::instance().observe_replica_placement_shadow(result);
+}
+
+void MasterService::RefreshReplicaPlacementShadowSignals() {
+    if (!replica_placement_shadow_auto_collect_signals_ ||
+        replica_placement_shadow_external_signal_source_.load(
+            std::memory_order_acquire)) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard lock(replica_placement_shadow_refresh_mutex_);
+    if (replica_placement_shadow_external_signal_source_.load(
+            std::memory_order_acquire) ||
+        (replica_placement_shadow_last_refresh_.has_value() &&
+         now - *replica_placement_shadow_last_refresh_ <
+             replica_placement_shadow_refresh_interval_)) {
+        return;
+    }
+
+    auto snapshot = CollectReplicaPlacementShadowSignals(now);
+    const uint64_t current_generation =
+        replica_placement_shadow_evaluator_->CurrentGeneration();
+    if (current_generation == std::numeric_limits<uint64_t>::max()) return;
+    snapshot.generation = current_generation + 1;
+    if (replica_placement_shadow_evaluator_->PublishSignalSnapshot(std::move(
+            snapshot)) == ReplicaPlacementSignalPublishStatus::PUBLISHED) {
+        replica_placement_shadow_last_refresh_ = now;
+    }
+}
+
+ReplicaPlacementSignalSnapshot
+MasterService::CollectReplicaPlacementShadowSignals(
+    ReplicaPlacementSignalClock::TimePoint observed_at) {
+    ReplicaPlacementSignalSnapshot snapshot;
+    snapshot.ready = true;
+    snapshot.observed_at = observed_at;
+    auto set_tier = [&snapshot](ReplicaPlacementTier tier,
+                                ReplicaTierSignalState allocation,
+                                ReplicaTierSignalState health) {
+        auto& signals = snapshot.tiers[static_cast<size_t>(tier)];
+        signals.allocation_state = allocation;
+        signals.health_state = health;
+    };
+
+    {
+        auto access = segment_manager_.getAllocatorAccess();
+        const auto& manager = access.getAllocatorManager();
+        const bool mounted = !manager.getNames().empty();
+        bool allocatable = false;
+        for (const auto& name : manager.getNames()) {
+            const auto* allocators = manager.getAllocators(name);
+            if (!allocators) continue;
+            for (const auto& allocator : *allocators) {
+                if (allocator && allocator->size() < allocator->capacity()) {
+                    allocatable = true;
+                    break;
+                }
+            }
+            if (allocatable) break;
+        }
+        set_tier(ReplicaPlacementTier::MEMORY,
+                 allocatable ? ReplicaTierSignalState::AVAILABLE
+                             : ReplicaTierSignalState::UNAVAILABLE,
+                 mounted ? ReplicaTierSignalState::AVAILABLE
+                         : ReplicaTierSignalState::UNAVAILABLE);
+    }
+
+    {
+        auto access = segment_manager_.getLocalDiskSegmentAccess();
+        auto& segments = access.getClientLocalDiskSegment();
+        const bool mounted = !segments.empty();
+        bool any_enabled = false;
+        bool all_enabled_capacity_known = true;
+        bool allocatable = false;
+        for (const auto& [client_id, segment] : segments) {
+            (void)client_id;
+            MutexLocker lock(&segment->offloading_mutex_);
+            if (!segment->enable_offloading) continue;
+            any_enabled = true;
+            const int64_t capacity = segment->ssd_total_capacity_bytes;
+            if (capacity <= 0) {
+                all_enabled_capacity_known = false;
+                continue;
+            }
+            if (segment->ssd_used_bytes.load(std::memory_order_relaxed) <
+                capacity) {
+                allocatable = true;
+            }
+        }
+        ReplicaTierSignalState allocation = ReplicaTierSignalState::UNKNOWN;
+        if (!mounted) {
+            allocation = ReplicaTierSignalState::UNAVAILABLE;
+        } else if (allocatable) {
+            allocation = ReplicaTierSignalState::AVAILABLE;
+        } else if (any_enabled && all_enabled_capacity_known) {
+            allocation = ReplicaTierSignalState::UNAVAILABLE;
+        }
+        set_tier(ReplicaPlacementTier::LOCAL_DISK, allocation,
+                 mounted ? ReplicaTierSignalState::AVAILABLE
+                         : ReplicaTierSignalState::UNAVAILABLE);
+    }
+
+    {
+        auto access = nof_segment_manager_.getAllocatorAccess();
+        const auto& manager = access.getAllocatorManager();
+        const bool mounted = !manager.getNames().empty();
+        bool allocatable = false;
+        for (const auto& name : manager.getNames()) {
+            const auto* allocators = manager.getAllocators(name);
+            if (!allocators) continue;
+            for (const auto& allocator : *allocators) {
+                if (allocator && allocator->size() < allocator->capacity()) {
+                    allocatable = true;
+                    break;
+                }
+            }
+            if (allocatable) break;
+        }
+        set_tier(ReplicaPlacementTier::NOF_SSD,
+                 allocatable ? ReplicaTierSignalState::AVAILABLE
+                             : ReplicaTierSignalState::UNAVAILABLE,
+                 mounted ? ReplicaTierSignalState::AVAILABLE
+                         : ReplicaTierSignalState::UNAVAILABLE);
+    }
+
+    if (!use_disk_replica_) {
+        set_tier(ReplicaPlacementTier::REMOTE_STORE,
+                 ReplicaTierSignalState::UNAVAILABLE,
+                 ReplicaTierSignalState::UNAVAILABLE);
+    } else {
+        std::error_code error;
+        const auto space = std::filesystem::space(
+            std::filesystem::path(root_fs_dir_) / cluster_id_, error);
+        if (error) {
+            set_tier(ReplicaPlacementTier::REMOTE_STORE,
+                     ReplicaTierSignalState::UNAVAILABLE,
+                     ReplicaTierSignalState::UNAVAILABLE);
+        } else {
+            set_tier(ReplicaPlacementTier::REMOTE_STORE,
+                     space.available > 0 ? ReplicaTierSignalState::AVAILABLE
+                                         : ReplicaTierSignalState::UNAVAILABLE,
+                     ReplicaTierSignalState::AVAILABLE);
+        }
+    }
+    return snapshot;
 }
 
 void MasterService::SetNoFProbeFnForTesting(NoFProbeFn fn) {
@@ -2475,6 +2688,7 @@ auto MasterService::GetReplicaList(const std::string& key,
 
     GetReplicaListResponse resp({}, default_kv_lease_ttl_);
     bool promotion_eligible = false;
+    std::vector<Replica::Descriptor> shadow_replica_list;
     {
         MetadataAccessorRO accessor(this, object_id);
 
@@ -2495,6 +2709,13 @@ auto MasterService::GetReplicaList(const std::string& key,
         if (replica_list.empty()) {
             LOG(WARNING) << "key=" << key << ", error=replica_not_ready";
             return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+        }
+
+        if (replica_placement_shadow_evaluator_) {
+            shadow_replica_list.reserve(metadata.CountReplicas());
+            for (const auto& replica : metadata.GetAllReplicas()) {
+                shadow_replica_list.emplace_back(replica.get_descriptor());
+            }
         }
 
         // TODO: NoF SSD support (ranhaojia)
@@ -2538,6 +2759,7 @@ auto MasterService::GetReplicaList(const std::string& key,
     if (promotion_eligible) {
         TryPushPromotionQueue(object_id);
     }
+    ObserveReplicaPlacementShadow(object_id, shadow_replica_list);
     return resp;
 }
 
@@ -2614,6 +2836,8 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
         }
 
         std::vector<ObjectIdentity> promotion_candidates;
+        std::vector<std::pair<ObjectIdentity, std::vector<Replica::Descriptor>>>
+            shadow_candidates;
         std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
         {
             MetadataShardAccessorRO shard(this, shard_idx);
@@ -2670,6 +2894,17 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                 MasterMetricManager::instance().inc_valid_get_nums();
                 GrantLeaseForGroup(tenant_state, key, metadata);
 
+                if (replica_placement_shadow_evaluator_) {
+                    std::vector<Replica::Descriptor> shadow_replicas;
+                    shadow_replicas.reserve(metadata.CountReplicas());
+                    for (const auto& replica : metadata.GetAllReplicas()) {
+                        shadow_replicas.emplace_back(replica.get_descriptor());
+                    }
+                    shadow_candidates.emplace_back(
+                        MakeObjectIdentity(key, normalized_tenant),
+                        std::move(shadow_replicas));
+                }
+
                 if (promotion_on_hit_) {
                     const bool any_memory =
                         metadata.HasReplica(&Replica::fn_is_memory_replica);
@@ -2688,6 +2923,9 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
 
         for (const auto& object_id : promotion_candidates) {
             TryPushPromotionQueue(object_id);
+        }
+        for (const auto& [object_id, replicas] : shadow_candidates) {
+            ObserveReplicaPlacementShadow(object_id, replicas);
         }
     }
 

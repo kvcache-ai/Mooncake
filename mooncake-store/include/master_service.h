@@ -13,6 +13,7 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -119,6 +120,14 @@ class MasterService {
         const UUID& segment_id);
     std::optional<TenantQuotaSnapshot> GetTenantQuotaSnapshotForTesting(
         const TenantId& tenant_id) const;
+    [[nodiscard]] bool ReplicaPlacementShadowEnabled() const noexcept;
+    [[nodiscard]] ReplicaPlacementSignalPublishStatus
+    PublishReplicaPlacementSignalSnapshot(
+        ReplicaPlacementSignalSnapshot snapshot);
+    [[nodiscard]] uint64_t ReplicaPlacementShadowSignalGeneration()
+        const noexcept;
+    [[nodiscard]] std::optional<ReplicaPlacementShadowCountersSnapshot>
+    GetReplicaPlacementShadowCounters() const noexcept;
     bool IsTenantQuotaEnabled() const;
     std::vector<TenantQuotaSnapshot> ListTenantQuotaSnapshots() const;
     std::optional<TenantQuotaSnapshot> GetTenantQuotaSnapshot(
@@ -1994,6 +2003,26 @@ class MasterService {
     // true. CountMinSketch is mutex-protected internally so we can call into it
     // from any GetReplicaList caller without additional locking.
     std::unique_ptr<CountMinSketch> promotion_sketch_;
+
+    // Optional read-path observer. It owns no task queue and cannot mutate
+    // metadata; only explicit configuration constructs it.
+    std::unique_ptr<ReplicaPlacementShadowEvaluator>
+        replica_placement_shadow_evaluator_;
+    bool replica_placement_shadow_auto_collect_signals_{false};
+    std::chrono::nanoseconds replica_placement_shadow_refresh_interval_{
+        std::chrono::seconds(1)};
+    std::atomic<bool> replica_placement_shadow_external_signal_source_{false};
+    std::mutex replica_placement_shadow_refresh_mutex_;
+    std::optional<ReplicaPlacementSignalClock::TimePoint>
+        replica_placement_shadow_last_refresh_;
+
+    void ObserveReplicaPlacementShadow(
+        const ObjectIdentity& object_id,
+        std::span<const Replica::Descriptor> replicas);
+    void RefreshReplicaPlacementShadowSignals();
+    [[nodiscard]] ReplicaPlacementSignalSnapshot
+    CollectReplicaPlacementShadowSignals(
+        ReplicaPlacementSignalClock::TimePoint observed_at);
 
     const std::string ha_backend_type_;
 

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <optional>
 #include <stdexcept>
 #include <string_view>
@@ -7,9 +8,16 @@
 #include <glog/logging.h>
 
 #include "config_helper.h"
+#include "replica_placement_shadow.h"
 #include "types.h"
 
 namespace mooncake {
+
+struct MasterReplicaPlacementShadowConfig {
+    ReplicaPlacementShadowConfig evaluator;
+    bool auto_collect_master_signals{true};
+    std::chrono::nanoseconds signal_refresh_interval{std::chrono::seconds(1)};
+};
 
 // Forwarded to the HA serve phase via MasterServiceSupervisorConfig.
 class HttpMetadataServer;
@@ -133,6 +141,12 @@ struct MasterConfig {
     // rich clusters may safely raise it.
     uint32_t promotion_max_per_heartbeat = 1;
 
+    // Dynamic replica placement observation. Empty keeps the feature fully
+    // disabled; targets have no built-in production defaults and must be
+    // supplied by the operator before the evaluator can be constructed.
+    std::optional<MasterReplicaPlacementShadowConfig>
+        replica_placement_shadow_config;
+
     // KV Events publisher (RFC #1527) for cache-aware indexers.
     bool enable_kv_events = false;
     std::string kv_events_bind_endpoint;
@@ -225,6 +239,8 @@ class MasterServiceSupervisorConfig {
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
     uint32_t promotion_max_per_heartbeat = 1;
+    std::optional<MasterReplicaPlacementShadowConfig>
+        replica_placement_shadow_config;
     bool enable_kv_events = false;
     std::string kv_events_bind_endpoint;
     std::string kv_events_model_name;
@@ -279,6 +295,8 @@ class MasterServiceSupervisorConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        replica_placement_shadow_config =
+            config.replica_placement_shadow_config;
         enable_kv_events = config.enable_kv_events;
         kv_events_bind_endpoint = config.kv_events_bind_endpoint;
         kv_events_model_name = config.kv_events_model_name;
@@ -441,6 +459,8 @@ class WrappedMasterServiceConfig {
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
     uint32_t promotion_max_per_heartbeat = 1;
+    std::optional<MasterReplicaPlacementShadowConfig>
+        replica_placement_shadow_config;
     bool enable_kv_events = false;
     std::string kv_events_bind_endpoint;
     std::string kv_events_model_name;
@@ -526,6 +546,8 @@ class WrappedMasterServiceConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        replica_placement_shadow_config =
+            config.replica_placement_shadow_config;
         enable_kv_events = config.enable_kv_events;
         kv_events_bind_endpoint = config.kv_events_bind_endpoint;
         kv_events_model_name = config.kv_events_model_name;
@@ -635,6 +657,8 @@ class WrappedMasterServiceConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        replica_placement_shadow_config =
+            config.replica_placement_shadow_config;
         enable_kv_events = config.enable_kv_events;
         kv_events_bind_endpoint = config.kv_events_bind_endpoint;
         kv_events_model_name = config.kv_events_model_name;
@@ -1057,6 +1081,8 @@ class MasterServiceConfig {
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
     uint32_t promotion_max_per_heartbeat = 1;
+    std::optional<MasterReplicaPlacementShadowConfig>
+        replica_placement_shadow_config;
     bool enable_kv_events = false;
     std::string kv_events_bind_endpoint;
     std::string kv_events_model_name;
@@ -1138,6 +1164,8 @@ class MasterServiceConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        replica_placement_shadow_config =
+            config.replica_placement_shadow_config;
         enable_kv_events = config.enable_kv_events;
         kv_events_bind_endpoint = config.kv_events_bind_endpoint;
         kv_events_model_name = config.kv_events_model_name;
