@@ -33,7 +33,7 @@ jobs:
       cmake-generator: Ninja
       torch-cuda-arch-list: '9.0'
       cmake-args: >-
-        -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=OFF
+        -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=OFF
         -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
       artifact-prefix: mooncake-wheel-arm64
 
