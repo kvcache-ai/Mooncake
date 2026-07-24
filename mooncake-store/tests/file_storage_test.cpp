@@ -29,6 +29,7 @@ class FileStorageTest : public ::testing::Test {
         google::InitGoogleLogging("FileStorageTest");
         FLAGS_logtostderr = true;
         UnsetEnv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH");
+        UnsetEnv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATHS");
         UnsetEnv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES");
         UnsetEnv("MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT");
         UnsetEnv("MOONCAKE_SCANMETA_ITERATOR_KEYS_LIMIT");
@@ -362,6 +363,17 @@ TEST_F(FileStorageTest, ReadStringFromEnv) {
     EXPECT_EQ(config.storage_filepath, "/tmp/storage");
 }
 
+TEST_F(FileStorageTest, ReadMultipleStoragePathsFromEnv) {
+    SetEnv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATHS",
+           " /mnt/nvme0/mooncake , /mnt/nvme1/mooncake ");
+
+    auto config = FileStorageConfig::FromEnvironment();
+    ASSERT_EQ(config.storage_filepaths.size(), 2);
+    EXPECT_EQ(config.storage_filepaths[0], "/mnt/nvme0/mooncake");
+    EXPECT_EQ(config.storage_filepaths[1], "/mnt/nvme1/mooncake");
+    EXPECT_EQ(config.storage_filepath, config.storage_filepaths.front());
+}
+
 TEST_F(FileStorageTest, ReadInt64FromEnv) {
     SetEnv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", "2147483648");  // 2GB
     SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1000");
@@ -584,6 +596,12 @@ TEST_F(FileStorageTest, ValidateFailsOnEmptyStoragePath) {
     EXPECT_FALSE(config.Validate());
     config.storage_filepath = data_path;
     EXPECT_TRUE(config.Validate());
+}
+
+TEST_F(FileStorageTest, ValidateFailsOnDuplicateStoragePaths) {
+    FileStorageConfig config;
+    config.storage_filepaths = {data_path, data_path + "/."};
+    EXPECT_FALSE(config.Validate());
 }
 
 TEST_F(FileStorageTest, ValidateFailsOnInvalidLimits) {

@@ -11,7 +11,9 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <shared_mutex>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -297,6 +299,11 @@ struct FileStorageConfig {
     // Path where data files are stored on disk
     std::string storage_filepath = "/data/file_storage";
 
+    // Optional local SSD paths. When more than one path is configured, each
+    // path owns an independent backend and objects are sharded across them.
+    // storage_filepath remains the single-path compatibility setting.
+    std::vector<std::string> storage_filepaths;
+
     // Size of the local client-side buffer (used for caching or batching)
     int64_t local_buffer_size = 1280 * kMB;  // ~1.2 GB
 
@@ -392,6 +399,63 @@ class StorageBackendInterface {
     }
 
     FileStorageConfig file_storage_config_;
+};
+
+/**
+ * @brief Shards local SSD objects across independent storage backends.
+ *
+ * New objects use stable rendezvous hashing. Existing object locations are
+ * rebuilt by ScanMeta(), so reordering configured paths does not invalidate
+ * data already on disk. Batch reads and writes targeting different paths run
+ * concurrently.
+ */
+class ShardedStorageBackend : public StorageBackendInterface {
+   public:
+    ShardedStorageBackend(
+        const FileStorageConfig& file_storage_config,
+        std::vector<std::shared_ptr<StorageBackendInterface>> backends);
+
+    tl::expected<void, ErrorCode> Init() override;
+
+    tl::expected<int64_t, ErrorCode> BatchOffload(
+        const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
+        std::function<ErrorCode(const std::vector<std::string>& keys,
+                                std::vector<StorageObjectMetadata>& metadatas)>
+            complete_handler,
+        EvictionHandler eviction_handler = nullptr) override;
+
+    tl::expected<void, ErrorCode> BatchLoad(
+        std::unordered_map<std::string, Slice>& batched_slices) override;
+
+    tl::expected<bool, ErrorCode> IsExist(const std::string& key) override;
+    tl::expected<bool, ErrorCode> IsEnableOffloading() override;
+
+    tl::expected<void, ErrorCode> ScanMeta(
+        const std::function<ErrorCode(
+            const std::vector<std::string>& keys,
+            std::vector<StorageObjectMetadata>& metadatas)>& handler) override;
+
+    void ResetScanIterator() override;
+    void SetTestFailurePredicate(
+        std::function<bool(const std::string& key)> predicate) override;
+
+    tl::expected<void, ErrorCode> AllocateOffloadingBuckets(
+        const std::unordered_map<std::string, int64_t>& offloading_objects,
+        std::vector<std::vector<std::string>>& buckets_keys);
+
+   private:
+    size_t SelectBackend(const std::string& key) const;
+    tl::expected<size_t, ErrorCode> ResolveBackend(const std::string& key);
+    void SetRoute(const std::string& key, size_t backend_index);
+    void SetRoutes(const std::vector<std::string>& keys, size_t backend_index);
+    void EraseRoutes(const std::vector<std::string>& keys);
+
+    std::vector<std::shared_ptr<StorageBackendInterface>> backends_;
+    std::vector<std::string> backend_ids_;
+    mutable std::shared_mutex route_overrides_mutex_;
+    // Only keys whose existing location differs from rendezvous hashing are
+    // stored here, avoiding a second full copy of the SSD key index.
+    std::unordered_map<std::string, size_t> route_overrides_;
 };
 
 /**

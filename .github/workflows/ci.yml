@@ -428,6 +428,10 @@ jobs:
         ubuntu-version: [ubuntu-22.04, ubuntu-24.04]
         python-version: ['3.10', '3.12']
     runs-on: ${{ matrix.ubuntu-version }}
+    env:
+      # The wheel tests install large CUDA-enabled PyTorch packages twice.
+      # Avoid retaining a second copy in pip's cache on space-constrained runners.
+      PIP_NO_CACHE_DIR: "1"
     steps:
     - uses: actions/checkout@v4
       with:

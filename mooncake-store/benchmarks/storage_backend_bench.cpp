@@ -113,6 +113,8 @@ DEFINE_uint64(num_threads, 1,
               "Number of threads for concurrent tests (default: 1)");
 DEFINE_string(storage_path, "/tmp/mooncake_bench_data",
               "Storage directory path");
+DEFINE_string(storage_paths, "",
+              "Comma-separated storage paths for multi-path sharding");
 DEFINE_uint64(capacity_gb, 20, "Storage capacity in GB (default: 20GB)");
 DEFINE_bool(run_all, false,
             "Run full benchmark suite with all parameter combinations");
@@ -800,12 +802,56 @@ class DataGenerator {
 // Backend Factory
 // ============================================================================
 
+std::vector<std::string> GetStoragePaths(const std::string& storage_path) {
+    if (FLAGS_storage_paths.empty()) return {storage_path};
+
+    std::vector<std::string> paths;
+    size_t start = 0;
+    while (start <= FLAGS_storage_paths.size()) {
+        const size_t end = FLAGS_storage_paths.find(',', start);
+        std::string path = FLAGS_storage_paths.substr(
+            start, end == std::string::npos ? std::string::npos : end - start);
+        const size_t first = path.find_first_not_of(" \t\n\r");
+        const size_t last = path.find_last_not_of(" \t\n\r");
+        if (first != std::string::npos) {
+            paths.push_back(path.substr(first, last - first + 1));
+        }
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    return paths;
+}
+
 std::shared_ptr<mooncake::StorageBackendInterface> CreateBackend(
     BackendType type, const std::string& storage_path, size_t capacity_bytes) {
     mooncake::FileStorageConfig config;
     config.storage_filepath = storage_path;
+    const auto storage_paths = GetStoragePaths(storage_path);
+    if (storage_paths.size() > 1) {
+        config.storage_filepaths = storage_paths;
+        config.storage_filepath = storage_paths.front();
+    }
     config.total_size_limit = capacity_bytes;
     config.total_keys_limit = 10'000'000;
+
+    if (storage_paths.size() > 1) {
+        switch (type) {
+            case BackendType::OFFSET_ALLOCATOR:
+                config.storage_backend_type =
+                    mooncake::StorageBackendType::kOffsetAllocator;
+                break;
+            case BackendType::BUCKET:
+                config.storage_backend_type =
+                    mooncake::StorageBackendType::kBucket;
+                break;
+            case BackendType::FILE_PER_KEY:
+                config.storage_backend_type =
+                    mooncake::StorageBackendType::kFilePerKey;
+                break;
+        }
+        auto result = mooncake::CreateStorageBackend(config);
+        return result ? result.value() : nullptr;
+    }
 
     switch (type) {
         case BackendType::OFFSET_ALLOCATOR: {
@@ -840,15 +886,23 @@ std::shared_ptr<mooncake::StorageBackendInterface> CreateBackend(
 // ============================================================================
 
 void CleanupStoragePath(const std::string& path) {
-    if (fs::exists(path)) {
+    for (const auto& storage_path : GetStoragePaths(path)) {
         std::error_code ec;
-        fs::remove_all(path, ec);
+        fs::create_directories(storage_path, ec);
         if (ec) {
-            LOG(WARNING) << "Failed to cleanup " << path << ": "
+            LOG(WARNING) << "Failed to create " << storage_path << ": "
                          << ec.message();
+            continue;
+        }
+        for (const auto& entry : fs::directory_iterator(storage_path, ec)) {
+            fs::remove_all(entry.path(), ec);
+            if (ec) {
+                LOG(WARNING) << "Failed to cleanup " << entry.path() << ": "
+                             << ec.message();
+                break;
+            }
         }
     }
-    fs::create_directories(path);
 }
 
 // Print system info (best effort)
