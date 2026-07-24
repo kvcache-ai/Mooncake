@@ -132,8 +132,9 @@ TEST_F(RuntimeConfigTest, P2PModeReturnsWriteRouteRequestConfig) {
     auto wc = p2p_store().getDefaultWriteConfig();
     ASSERT_TRUE(std::holds_alternative<WriteRouteRequestConfig>(wc));
     auto& cfg = std::get<WriteRouteRequestConfig>(wc);
-    EXPECT_TRUE(cfg.allow_local);
-    EXPECT_TRUE(cfg.prefer_local);
+    EXPECT_DOUBLE_EQ(cfg.remote_weight, 0.5);
+    EXPECT_DOUBLE_EQ(cfg.local_write_waterline, 0.5);
+    EXPECT_TRUE(cfg.top_tier_only);
     EXPECT_EQ(cfg.max_candidates, 2u);
     auto rc = p2p_store().getDefaultReadConfig();
     EXPECT_EQ(rc.max_candidates, 0u);
@@ -179,17 +180,124 @@ TEST_F(RuntimeConfigTest, UpdateCentralizedPreferredSegments) {
 
 TEST_F(RuntimeConfigTest, UpdateP2PWriteConfigPatch) {
     Json::Value patch;
-    patch["prefer_local"] = false;
+    patch["remote_weight"] = 0.75;
+    patch["top_tier_only"] = true;
     patch["max_candidates"] = 5;
     patch["priority_limit"] = 10;
     p2p_store().updateWriteConfig(patch);
 
     auto wc = p2p_store().getDefaultWriteConfig();
     auto& cfg = std::get<WriteRouteRequestConfig>(wc);
-    EXPECT_FALSE(cfg.prefer_local);
+    EXPECT_DOUBLE_EQ(cfg.remote_weight, 0.75);
+    EXPECT_TRUE(cfg.top_tier_only);
     EXPECT_EQ(cfg.max_candidates, 5u);
     EXPECT_EQ(cfg.priority_limit, 10);
-    EXPECT_TRUE(cfg.allow_local);
+}
+
+TEST_F(RuntimeConfigTest, UpdateP2PWriteConfigRemoteWeightClamped) {
+    Json::Value patch;
+    patch["remote_weight"] = 5.0;  // out of range -> clamped to 1.0
+    p2p_store().updateWriteConfig(patch);
+    EXPECT_DOUBLE_EQ(
+        std::get<WriteRouteRequestConfig>(p2p_store().getDefaultWriteConfig())
+            .remote_weight,
+        1.0);
+
+    Json::Value patch2;
+    patch2["remote_weight"] = -1.0;  // out of range -> clamped to 0.0
+    p2p_store().updateWriteConfig(patch2);
+    EXPECT_DOUBLE_EQ(
+        std::get<WriteRouteRequestConfig>(p2p_store().getDefaultWriteConfig())
+            .remote_weight,
+        0.0);
+}
+
+TEST_F(RuntimeConfigTest, UpdateP2PWriteConfigLocalWriteWaterline) {
+    Json::Value patch;
+    patch["local_write_waterline"] = 0.8;
+    p2p_store().updateWriteConfig(patch);
+    EXPECT_DOUBLE_EQ(
+        std::get<WriteRouteRequestConfig>(p2p_store().getDefaultWriteConfig())
+            .local_write_waterline,
+        0.8);
+
+    // Clamp test
+    Json::Value patch2;
+    patch2["local_write_waterline"] = 2.0;
+    p2p_store().updateWriteConfig(patch2);
+    EXPECT_DOUBLE_EQ(
+        std::get<WriteRouteRequestConfig>(p2p_store().getDefaultWriteConfig())
+            .local_write_waterline,
+        1.0);
+}
+
+TEST_F(RuntimeConfigTest, ValidateWriteConfigRejectsContradiction) {
+    // Use a fresh store to avoid interference from other tests.
+    RuntimeConfigStore store(DeploymentMode::P2P);
+    // Contradiction 1: waterline=0 (forbid local write) + remote_weight=0
+    // (forbid remote routing) -> dead end.
+    {
+        Json::Value patch;
+        patch["remote_weight"] = 0.0;
+        patch["local_write_waterline"] = 0.0;
+        EXPECT_FALSE(store.updateWriteConfig(patch));
+    }
+    // Contradiction 2: waterline=1 (forbid remote write) + remote_weight=1
+    // (forbid local routing) -> dead end (defensive).
+    {
+        Json::Value patch;
+        patch["remote_weight"] = 1.0;
+        patch["local_write_waterline"] = 1.0;
+        EXPECT_FALSE(store.updateWriteConfig(patch));
+    }
+    const auto cfg =
+        std::get<WriteRouteRequestConfig>(store.getDefaultWriteConfig());
+    EXPECT_DOUBLE_EQ(cfg.remote_weight, 0.5);
+    EXPECT_DOUBLE_EQ(cfg.local_write_waterline, 0.5);
+}
+
+TEST_F(RuntimeConfigTest, ValidateWriteConfigAllowsValidCombos) {
+    // waterline=0 + remote_weight=0.5 -> OK (waterline disabled)
+    Json::Value patch;
+    patch["remote_weight"] = 0.5;
+    patch["local_write_waterline"] = 0.0;
+    EXPECT_TRUE(p2p_store().updateWriteConfig(patch));
+    const auto cfg1 =
+        std::get<WriteRouteRequestConfig>(p2p_store().getDefaultWriteConfig());
+    EXPECT_DOUBLE_EQ(cfg1.remote_weight, 0.5);
+    EXPECT_DOUBLE_EQ(cfg1.local_write_waterline, 0.0);
+
+    // waterline=0.8 + remote_weight=0 -> OK
+    Json::Value patch2;
+    patch2["remote_weight"] = 0.0;
+    patch2["local_write_waterline"] = 0.8;
+    EXPECT_TRUE(p2p_store().updateWriteConfig(patch2));
+    const auto cfg2 =
+        std::get<WriteRouteRequestConfig>(p2p_store().getDefaultWriteConfig());
+    EXPECT_DOUBLE_EQ(cfg2.remote_weight, 0.0);
+    EXPECT_DOUBLE_EQ(cfg2.local_write_waterline, 0.8);
+
+    // waterline=0 + remote_weight=1 -> OK (forbid local write + forbid local
+    // route = force remote from both sides)
+    Json::Value patch3;
+    patch3["remote_weight"] = 1.0;
+    patch3["local_write_waterline"] = 0.0;
+    EXPECT_TRUE(p2p_store().updateWriteConfig(patch3));
+    const auto cfg3 =
+        std::get<WriteRouteRequestConfig>(p2p_store().getDefaultWriteConfig());
+    EXPECT_DOUBLE_EQ(cfg3.remote_weight, 1.0);
+    EXPECT_DOUBLE_EQ(cfg3.local_write_waterline, 0.0);
+
+    // waterline=1 + remote_weight=0 -> OK (forbid remote write + forbid
+    // remote route = force local from both sides)
+    Json::Value patch4;
+    patch4["remote_weight"] = 0.0;
+    patch4["local_write_waterline"] = 1.0;
+    EXPECT_TRUE(p2p_store().updateWriteConfig(patch4));
+    const auto cfg4 =
+        std::get<WriteRouteRequestConfig>(p2p_store().getDefaultWriteConfig());
+    EXPECT_DOUBLE_EQ(cfg4.remote_weight, 0.0);
+    EXPECT_DOUBLE_EQ(cfg4.local_write_waterline, 1.0);
 }
 
 TEST_F(RuntimeConfigTest, UpdateP2PWriteConfigStrategy) {
@@ -250,7 +358,7 @@ TEST_F(RuntimeConfigTest, UpdateReadConfigP2PExtra) {
 
 TEST_F(RuntimeConfigTest, PatchPreservesUnmentionedFields) {
     Json::Value p1;
-    p1["prefer_local"] = false;
+    p1["remote_weight"] = 0.9;
     p2p_store().updateWriteConfig(p1);
     Json::Value p2;
     p2["max_candidates"] = 7;
@@ -258,7 +366,7 @@ TEST_F(RuntimeConfigTest, PatchPreservesUnmentionedFields) {
 
     auto wc = p2p_store().getDefaultWriteConfig();
     auto& cfg = std::get<WriteRouteRequestConfig>(wc);
-    EXPECT_FALSE(cfg.prefer_local);
+    EXPECT_DOUBLE_EQ(cfg.remote_weight, 0.9);
     EXPECT_EQ(cfg.max_candidates, 7u);
 }
 
@@ -269,14 +377,14 @@ TEST_F(RuntimeConfigTest, PatchPreservesUnmentionedFields) {
 TEST_F(RuntimeConfigTest, LoadFromJsonBothSections) {
     RuntimeConfigStore store(DeploymentMode::P2P);
     Json::Value root;
-    root["write"]["prefer_local"] = false;
+    root["write"]["remote_weight"] = 0.9;
     root["write"]["max_candidates"] = 3;
     root["read"]["max_candidates"] = 8;
     store.loadFromJson(root);
 
     auto wc = store.getDefaultWriteConfig();
     auto& wcfg = std::get<WriteRouteRequestConfig>(wc);
-    EXPECT_FALSE(wcfg.prefer_local);
+    EXPECT_DOUBLE_EQ(wcfg.remote_weight, 0.9);
     EXPECT_EQ(wcfg.max_candidates, 3u);
     EXPECT_EQ(store.getDefaultReadConfig().max_candidates, 8u);
 }
@@ -286,7 +394,7 @@ TEST_F(RuntimeConfigTest, LoadFromJsonNullIsNoOp) {
     store.loadFromJson(Json::Value());
     auto wc = store.getDefaultWriteConfig();
     auto& cfg = std::get<WriteRouteRequestConfig>(wc);
-    EXPECT_TRUE(cfg.prefer_local);
+    EXPECT_DOUBLE_EQ(cfg.remote_weight, 0.5);
     EXPECT_EQ(cfg.max_candidates, 2u);
 }
 
@@ -298,7 +406,8 @@ TEST_F(RuntimeConfigTest, ExportRoundTrip) {
     RuntimeConfigStore s1(DeploymentMode::P2P);
     Json::Value input;
     input["write"]["max_candidates"] = 4;
-    input["write"]["prefer_local"] = false;
+    input["write"]["remote_weight"] = 0.9;
+    input["write"]["local_write_waterline"] = 0.7;
     input["read"]["max_candidates"] = 6;
     s1.loadFromJson(input);
 
@@ -310,7 +419,7 @@ TEST_F(RuntimeConfigTest, ExportRoundTrip) {
     auto& w1 = std::get<WriteRouteRequestConfig>(wc1);
     auto& w2 = std::get<WriteRouteRequestConfig>(wc2);
     EXPECT_EQ(w1.max_candidates, w2.max_candidates);
-    EXPECT_EQ(w1.prefer_local, w2.prefer_local);
+    EXPECT_DOUBLE_EQ(w1.remote_weight, w2.remote_weight);
     EXPECT_EQ(s1.getDefaultReadConfig().max_candidates,
               s2.getDefaultReadConfig().max_candidates);
 }
@@ -331,7 +440,8 @@ TEST_F(RuntimeConfigTest, HttpGetWriteConfig) {
     auto resp = HttpGet(Url("/config/write"));
     ASSERT_EQ(resp.status, 200);
     auto json = ParseJson(resp.body);
-    EXPECT_TRUE(json.isMember("prefer_local"));
+    EXPECT_TRUE(json.isMember("remote_weight"));
+    EXPECT_TRUE(json.isMember("local_write_waterline"));
     EXPECT_TRUE(json.isMember("max_candidates"));
 }
 
@@ -347,10 +457,10 @@ TEST_F(RuntimeConfigTest, HttpGetReadConfig) {
 
 TEST_F(RuntimeConfigTest, HttpUpdateWriteConfig) {
     auto resp = HttpPost(Url("/config/update_write"),
-                         R"({"prefer_local": false, "max_candidates": 5})");
+                         R"({"remote_weight": 0.9, "max_candidates": 5})");
     ASSERT_EQ(resp.status, 200);
     auto json = ParseJson(resp.body);
-    EXPECT_FALSE(json["prefer_local"].asBool());
+    EXPECT_DOUBLE_EQ(json["remote_weight"].asDouble(), 0.9);
     EXPECT_EQ(json["max_candidates"].asUInt64(), 5u);
 
     auto get_json = ParseJson(HttpGet(Url("/config/write")).body);
@@ -452,7 +562,9 @@ TEST_F(RuntimeConfigTest, ApplyPatchIgnoresWrongTypes) {
 
     Json::Value bad;
     bad["max_candidates"] = "not_a_number";
-    bad["prefer_local"] = 123;
+    bad["remote_weight"] = "not_a_number";
+    bad["local_write_waterline"] = "not_a_number";
+    bad["top_tier_only"] = 123;
     bad["strategy"] = Json::Value(Json::arrayValue);
     bad["tag_filters"] = false;
     bad["priority_limit"] = Json::Value(Json::objectValue);
@@ -461,7 +573,9 @@ TEST_F(RuntimeConfigTest, ApplyPatchIgnoresWrongTypes) {
     auto wc = store.getDefaultWriteConfig();
     auto& cfg = std::get<WriteRouteRequestConfig>(wc);
     EXPECT_EQ(cfg.max_candidates, 2u);
-    EXPECT_TRUE(cfg.prefer_local);
+    EXPECT_DOUBLE_EQ(cfg.remote_weight, 0.5);
+    EXPECT_DOUBLE_EQ(cfg.local_write_waterline, 0.5);
+    EXPECT_TRUE(cfg.top_tier_only);
     EXPECT_EQ(cfg.strategy, ObjectIterateStrategy::CAPACITY_PRIORITY);
     EXPECT_TRUE(cfg.tag_filters.empty());
     EXPECT_EQ(cfg.priority_limit, 0);
@@ -489,15 +603,16 @@ TEST_F(RuntimeConfigTest, ApplyPatchIgnoresWrongTypesCentralized) {
 
 TEST_F(RuntimeConfigTest, HttpUpdateWriteConfigWrongTypesNoEffect) {
     HttpPost(Url("/config/update_write"),
-             R"({"max_candidates": 10, "prefer_local": true})");
+             R"({"max_candidates": 10, "remote_weight": 0.9})");
 
-    auto resp = HttpPost(Url("/config/update_write"),
-                         R"({"max_candidates": "bad", "prefer_local": 999})");
+    auto resp =
+        HttpPost(Url("/config/update_write"),
+                 R"({"max_candidates": "bad", "remote_weight": "bad"})");
     ASSERT_EQ(resp.status, 200);
 
     auto json = ParseJson(HttpGet(Url("/config/write")).body);
     EXPECT_EQ(json["max_candidates"].asUInt64(), 10u);
-    EXPECT_TRUE(json["prefer_local"].asBool());
+    EXPECT_DOUBLE_EQ(json["remote_weight"].asDouble(), 0.9);
 }
 
 // ============================================================================
@@ -603,12 +718,12 @@ TEST_F(RuntimeConfigTest, HttpUpdateFullNumberBody) {
 // ============================================================================
 
 TEST_F(RuntimeConfigTest, HttpSetPrimitiveBool) {
-    HttpPost(Url("/config/update_write"), R"({"allow_local": true})");
+    HttpPost(Url("/config/update_write"), R"({"top_tier_only": false})");
     auto resp =
-        HttpPost(Url("/config/set", "section=write&key=allow_local"), "false");
+        HttpPost(Url("/config/set", "section=write&key=top_tier_only"), "true");
     ASSERT_EQ(resp.status, 200);
     auto json = ParseJson(HttpGet(Url("/config/write")).body);
-    EXPECT_FALSE(json["allow_local"].asBool());
+    EXPECT_TRUE(json["top_tier_only"].asBool());
 }
 
 TEST_F(RuntimeConfigTest, HttpSetPrimitiveInt) {
@@ -617,6 +732,30 @@ TEST_F(RuntimeConfigTest, HttpSetPrimitiveInt) {
     ASSERT_EQ(resp.status, 200);
     auto json = ParseJson(HttpGet(Url("/config/write")).body);
     EXPECT_EQ(json["max_candidates"].asUInt64(), 7u);
+}
+
+TEST_F(RuntimeConfigTest, HttpUpdateWriteConfigRejectsInvalid) {
+    // POST /config/update_write with contradictory config -> 400
+    auto resp =
+        HttpPost(Url("/config/update_write"),
+                 R"({"remote_weight": 0.0, "local_write_waterline": 0.0})");
+    EXPECT_EQ(resp.status, 400);
+}
+
+TEST_F(RuntimeConfigTest, HttpSetRejectsInvalid) {
+    // Default waterline=0.5, so setting remote_weight=0 alone is valid.
+    // Then setting waterline=0 while remote_weight=0 is contradictory
+    // (forbid local write + forbid remote route = dead end) -> 400.
+    // First ensure remote_weight is 0.5 (already the default, but be explicit).
+    HttpPost(Url("/config/set", "section=write&key=remote_weight"), "0.5");
+    // remote_weight=0 is valid because waterline=0.5 > 0 (not an extreme).
+    auto ok =
+        HttpPost(Url("/config/set", "section=write&key=remote_weight"), "0.0");
+    EXPECT_EQ(ok.status, 200);
+    // Now try to set waterline=0 while remote_weight=0 -> 400
+    auto bad = HttpPost(
+        Url("/config/set", "section=write&key=local_write_waterline"), "0.0");
+    EXPECT_EQ(bad.status, 400);
 }
 
 }  // namespace testing

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <glog/logging.h>
+#include <limits>
 
 namespace mooncake {
 P2PClientMeta::P2PClientMeta(const UUID& client_id,
@@ -74,79 +75,75 @@ size_t P2PClientMeta::GetAvailableCapacity() const {
     return client_capacity_ - client_usage_;
 }
 
-auto P2PClientMeta::CollectWriteRouteCandidates(
-    const WriteRouteRequest& req, std::vector<WriteCandidate>& candidates)
-    -> tl::expected<bool, ErrorCode> {
+P2PClientMeta::CapacityStat P2PClientMeta::GetWriteScoreCapacity(
+    const std::vector<std::string>& tag_filters, int priority_limit,
+    bool top_tier_only) const {
+    // A segment is eligible for scoring if it carries no filtered tag and its
+    // priority is >= priority_limit.
+    auto eligible = [&](const P2PSegmentExtraData& extra) -> bool {
+        if (extra.priority < priority_limit) return false;
+        for (const auto& tag : tag_filters) {
+            if (std::find(extra.tags.begin(), extra.tags.end(), tag) !=
+                extra.tags.end()) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    CapacityStat all, top;
+    int max_priority = std::numeric_limits<int>::min();
+    segment_manager_->ForEachSegment([&](const Segment& seg) -> bool {
+        const auto& extra = seg.GetP2PExtra();
+        if (!eligible(extra)) return false;
+        const size_t free = seg.size > extra.usage ? seg.size - extra.usage : 0;
+        all.total += seg.size;
+        all.free += free;
+        if (extra.priority > max_priority) {
+            max_priority = extra.priority;
+            top = {free, seg.size};
+        } else if (extra.priority == max_priority) {
+            top.total += seg.size;
+            top.free += free;
+        }
+        return false;  // always continue to next segment
+    });
+    return top_tier_only ? top : all;
+}
+
+// Returns std::nullopt when this client is not a write-route candidate
+std::optional<WriteCandidate> P2PClientMeta::GetWriteRouteCandidate(
+    const WriteRouteRequest& req) {
     SharedMutexLocker lock(&client_mutex_, shared_lock);
 
-    // Check health status under lock protection
+    // Check health status under lock protection.
     auto check_ret = InnerStatusCheck();
     if (!check_ret.has_value()) {
         LOG(WARNING) << "client could not route"
                      << ", client_id: " << client_id_;
-        return false;  // skip unhealthy client, candidaes are not enough
+        // Unhealthy is not an error: the client is simply not a candidate.
+        return std::nullopt;
     }
 
-    // localhost is not allowed, skip current client
-    if (!req.config.allow_local && client_id_ == req.client_id)
-        return false;  // candidaes are not enough
+    // Client-granular routing: the master routes to a client; the client picks
+    // the concrete segment/tier. The score is the raw free ratio; the master
+    // multiplies it by (1-w) for local or w for remote.
+    const CapacityStat cap =
+        GetWriteScoreCapacity(req.config.tag_filters, req.config.priority_limit,
+                              req.config.top_tier_only);
+    if (cap.total == 0) return std::nullopt;  // no eligible tier
+    if (cap.free < req.size)
+        return std::nullopt;  // cannot hold (master's view)
 
-    // iterate segments to find candidates
-    bool trigger_stop_early = false;
-    segment_manager_->ForEachSegment([&](const Segment& seg) -> bool {
-        // In ForEachSegment callback:
-        // 1. return false means continue to process next segment
-        //    (skip current segment or finish processing)
-        // 2. return true means early stop
-        size_t usage = seg.GetP2PExtra().usage;
-        if (seg.size - usage < req.size)
-            return false;  // usage does not enough, candidaes are not enough
+    const double free_ratio = static_cast<double>(cap.free) / cap.total;
 
-        const auto& p2p_extra = seg.GetP2PExtra();
-
-        // exclude segments that contain any tags in tag_filters
-        bool hit_filter_tag = false;
-        for (const auto& tag : req.config.tag_filters) {
-            if (std::find(p2p_extra.tags.begin(), p2p_extra.tags.end(), tag) !=
-                p2p_extra.tags.end()) {
-                hit_filter_tag = true;
-                break;
-            }
-        }
-        if (hit_filter_tag) return false;  // hit excluding tag, skip segment
-
-        if (p2p_extra.priority < req.config.priority_limit)
-            return false;  // priority does not enough, candidaes are not enough
-
-        int priority = p2p_extra.priority;
-        if (req.config.prefer_local && client_id_ == req.client_id) {
-            // hit localhost and prefer local, add infinite priority
-            priority += INF_PRIORITY;
-        }
-
-        WriteCandidate candidate;
-        candidate.available_capacity = seg.size - usage;
-        candidate.priority = priority;
-        candidate.replica.client_id = client_id_;
-        candidate.replica.segment_id = seg.id;
-        candidate.replica.ip_address = ip_address_;
-        candidate.replica.rpc_port = rpc_port_;
-        candidate.replica.object_size = req.size;
-
-        candidates.push_back(std::move(candidate));
-        if (req.config.early_return &&
-            candidates.size() >= req.config.max_candidates &&
-            req.config.max_candidates !=
-                WriteRouteRequestConfig::RETURN_ALL_CANDIDATES) {
-            // current candidates are enough, early stop
-            trigger_stop_early = true;
-            return true;  // stop ForEachSegment
-        }
-        return false;  // process next segment
-    });
-
-    // early stop, if trigger_stop_early == true, stop ForEachClient
-    return trigger_stop_early;
+    WriteCandidate candidate;
+    candidate.client_id = client_id_;
+    candidate.ip_address = ip_address_;
+    candidate.rpc_port = rpc_port_;
+    candidate.available_capacity = cap.free;
+    candidate.score = free_ratio;
+    return candidate;
 }
 
 }  // namespace mooncake

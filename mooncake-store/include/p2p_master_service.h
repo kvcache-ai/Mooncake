@@ -118,9 +118,11 @@ class P2PMasterService : public MasterService {
     void OnReplicaAdded(const Replica& replica) override;
 
    private:
+    using OwnerClientSet = std::unordered_set<UUID, boost::hash<UUID>>;
+
     static auto CollectReplicaOwnerClients(const ObjectMetadata& metadata,
                                            std::string_view key)
-        -> tl::expected<std::unordered_set<UUID, boost::hash<UUID>>, ErrorCode>;
+        -> tl::expected<OwnerClientSet, ErrorCode>;
 
     tl::expected<void, ErrorCode> InnerAddReplica(
         MetadataShard& shard, std::string_view key, const UUID& client_id,
@@ -133,9 +135,9 @@ class P2PMasterService : public MasterService {
     std::shared_ptr<P2PClientManager> client_manager_;
     std::array<P2PMetadataShard, kNumShards> metadata_shards_;
     // for the number of clients owning a key:
-    // 1. max_replicas_per_key_ == 0 means no limitation
-    // 2. max_replicas_per_key_ > 0 means the max client owner count
-    uint64_t max_replicas_per_key_;
+    // 1. max_client_per_key_ == 0 means no limitation
+    // 2. max_client_per_key_ > 0 means the max client owner count
+    uint64_t max_client_per_key_;
     bool enable_async_oplog_write_{false};
 };
 

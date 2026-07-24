@@ -471,14 +471,15 @@ TEST_F(P2PClientMetaExtendedTest, QueryIpCheckHealth) {
 }
 
 // ============================================================
-// CollectWriteRouteCandidates
+// GetWriteRouteCandidate
 // ============================================================
 
-TEST_F(P2PClientMetaTest, CollectCandidatesMultipleSegments) {
+TEST_F(P2PClientMetaTest, GetWriteRouteCandidateAggregatesToOneClient) {
     UUID client_id = {111, 222};
     auto meta = CreateMeta(client_id, "10.0.0.1", 50051);
     meta->Heartbeat();
 
+    // Three segments (tiers) on one client, all empty.
     auto s1 = MakeP2PSegment({1, 1}, "seg1", 10000, 5);
     auto s2 = MakeP2PSegment({2, 2}, "seg2", 20000, 3);
     auto s3 = MakeP2PSegment({3, 3}, "seg3", 30000, 4);
@@ -488,40 +489,19 @@ TEST_F(P2PClientMetaTest, CollectCandidatesMultipleSegments) {
 
     WriteRouteRequest req;
     req.key = "test_key";
-    req.client_id = {999, 999};
+    req.client_id = {999, 999};  // non-local requester
     req.size = 100;
-    req.config.allow_local = true;
     req.config.max_candidates = WriteRouteRequestConfig::RETURN_ALL_CANDIDATES;
-    std::vector<WriteCandidate> candidates;
-    auto result = meta->CollectWriteRouteCandidates(req, candidates);
-    EXPECT_TRUE(result.has_value());
-    ASSERT_EQ(candidates.size(), 3);
-    // Verify specific segments are returned
-    std::set<UUID> returned_ids;
-    for (const auto& cand : candidates)
-        returned_ids.insert(cand.replica.segment_id);
-    EXPECT_TRUE(returned_ids.count(s1.id));
-    EXPECT_TRUE(returned_ids.count(s2.id));
-    EXPECT_TRUE(returned_ids.count(s3.id));
-
-    // 2. Test max_candidates = 2 with early_return = true (Should return 2)
-    // If `early_return`, it will stop when candidates.size() >= max_candidates.
-    // Otherwise, it will continue to process all segments.
-    // Actually, the `max_candidates` limits the candidates number in the
-    // GetWriteRoute() of P2PMasterService, which is the caller of
-    // CollectWriteRouteCandidates().
-    // However, here we are testing CollectWriteRouteCandidates() and the filter
-    // logic is processed in GetWriteRoute(). Thus, if does not set
-    // `early_return`, the `max_candidates` is not used.
-    req.config.max_candidates = 2;
-    req.config.early_return = true;
-    candidates.clear();
-    result = meta->CollectWriteRouteCandidates(req, candidates);
-    EXPECT_TRUE(result.has_value());
-    EXPECT_EQ(candidates.size(), 2);
+    req.config.top_tier_only = false;  // aggregate all tiers
+    auto result = meta->GetWriteRouteCandidate(req);
+    // Client granularity: one candidate per client regardless of tier count.
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->client_id, client_id);
+    // available_capacity aggregates all eligible tiers' free space.
+    EXPECT_EQ(result->available_capacity, 60000u);
 }
 
-TEST_F(P2PClientMetaTest, CollectCandidatesCapacityFilter) {
+TEST_F(P2PClientMetaTest, GetWriteRouteCandidateCapacityGate) {
     UUID client_id = {111, 222};
     auto meta = CreateMeta(client_id, "10.0.0.1", 50051);
     meta->Heartbeat();
@@ -530,20 +510,26 @@ TEST_F(P2PClientMetaTest, CollectCandidatesCapacityFilter) {
     auto s2 = MakeP2PSegment({2, 2}, "large", 1000, 5);  // 1000 bytes
     ASSERT_TRUE(meta->MountSegment(s1).has_value());
     ASSERT_TRUE(meta->MountSegment(s2).has_value());
+    // client-level free = 100 + 1000 = 1100
 
     WriteRouteRequest req;
     req.key = "test_key";
-    req.size = 500;  // Requires 500 bytes
-    req.config.allow_local = true;
 
-    std::vector<WriteCandidate> candidates;
-    auto result = meta->CollectWriteRouteCandidates(req, candidates);
-    EXPECT_TRUE(result.has_value());
-    ASSERT_EQ(candidates.size(), 1);
-    EXPECT_EQ(candidates[0].replica.segment_id, s2.id);
+    // Fits in the client's aggregate free capacity -> a candidate.
+    req.size = 500;
+    auto result = meta->GetWriteRouteCandidate(req);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->available_capacity, 1100u);
+
+    // Larger than the client's total free -> not a candidate.
+    req.size = 2000;
+    result = meta->GetWriteRouteCandidate(req);
+    EXPECT_FALSE(result.has_value());
 }
 
-TEST_F(P2PClientMetaTest, CollectCandidatesAllowLocalFilter) {
+// The client meta does NOT exclude the local client based on remote_weight;
+// that decision belongs to the master. The client only reports its capacity.
+TEST_F(P2PClientMetaTest, GetWriteRouteCandidateLocalAlwaysEligible) {
     UUID client_id = {111, 222};
     auto meta = CreateMeta(client_id, "10.0.0.1", 50051);
     meta->Heartbeat();
@@ -555,22 +541,22 @@ TEST_F(P2PClientMetaTest, CollectCandidatesAllowLocalFilter) {
     req.key = "test_key";
     req.client_id = client_id;  // Same as meta client_id
     req.size = 100;
-    req.config.allow_local = false;  // Disallow local
 
-    std::vector<WriteCandidate> candidates;
-    auto result = meta->CollectWriteRouteCandidates(req, candidates);
-    EXPECT_TRUE(result.has_value());
-    EXPECT_EQ(candidates.size(), 0);
+    // remote_weight does not affect eligibility at the client level.
+    req.config.remote_weight = 1.0;
+    auto result = meta->GetWriteRouteCandidate(req);
+    ASSERT_TRUE(result.has_value());
 
-    // Allow local should return the candidate
-    req.config.allow_local = true;
-    candidates.clear();
-    result = meta->CollectWriteRouteCandidates(req, candidates);
-    EXPECT_TRUE(result.has_value());
-    EXPECT_EQ(candidates.size(), 1);
+    req.config.remote_weight = 0.5;
+    result = meta->GetWriteRouteCandidate(req);
+    ASSERT_TRUE(result.has_value());
+
+    req.config.remote_weight = 0.0;
+    result = meta->GetWriteRouteCandidate(req);
+    ASSERT_TRUE(result.has_value());
 }
 
-TEST_F(P2PClientMetaTest, CollectCandidatesTagFilter) {
+TEST_F(P2PClientMetaTest, GetWriteRouteCandidateTagFilter) {
     UUID client_id = {111, 222};
     auto meta = CreateMeta(client_id, "10.0.0.1", 50051);
     meta->Heartbeat();
@@ -595,104 +581,89 @@ TEST_F(P2PClientMetaTest, CollectCandidatesTagFilter) {
 
     WriteRouteRequest req;
     req.size = 100;
-    req.config.allow_local = true;
     req.config.max_candidates = WriteRouteRequestConfig::RETURN_ALL_CANDIDATES;
 
-    // Filter "ssd": S1, S3 contain "ssd", should be excluded. S2, S4 remain.
+    // tag_filters scope the client's capacity score. Filter "ssd" excludes
+    // S1,S3; S2,S4 remain eligible -> one candidate, capacity = S2+S4 free.
     req.config.tag_filters = {"ssd"};
-    std::vector<WriteCandidate> candidates;
-    auto result = meta->CollectWriteRouteCandidates(req, candidates);
-    EXPECT_TRUE(result.has_value());
-    EXPECT_EQ(candidates.size(), 2);
-    for (const auto& cand : candidates) {
-        EXPECT_TRUE(cand.replica.segment_id == s2.id ||
-                    cand.replica.segment_id == s4.id);
-    }
+    auto result = meta->GetWriteRouteCandidate(req);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->client_id, client_id);
+    EXPECT_EQ(result->available_capacity, 20000u);  // S2 + S4
 
-    // Filter "ssd", "fast": Only S12 remain.
-    req.config.tag_filters = {"ssd", "fast"};
-    candidates.clear();
-    result = meta->CollectWriteRouteCandidates(req, candidates);
-    EXPECT_TRUE(result.has_value());
-    EXPECT_EQ(candidates.size(), 1);
-    EXPECT_TRUE(candidates[0].replica.segment_id == s2.id);
-
-    // Filter "memory": No segment has "memory", none excluded. All 4 remain.
-    req.config.tag_filters = {"memory"};
-    candidates.clear();
-    result = meta->CollectWriteRouteCandidates(req, candidates);
-    EXPECT_TRUE(result.has_value());
-    EXPECT_EQ(candidates.size(), 4);
+    // Every segment carries a filtered tag -> no eligible tier -> not a
+    // candidate.
+    req.config.tag_filters = {"ssd", "fast", "hdd", "slow"};
+    result = meta->GetWriteRouteCandidate(req);
+    EXPECT_FALSE(result.has_value());
 }
 
-TEST_F(P2PClientMetaTest, CollectCandidatesPreferLocalPriorityBoost) {
+// The candidate's score is the client-level free ratio ONLY. The local bias
+// The remote_weight scaling is applied by the master, not here, so this test
+// verifies the raw free ratio is returned regardless of remote_weight. Local
+// bias behavior is covered by P2PMasterServiceTest.
+TEST_F(P2PClientMetaTest, GetWriteRouteCandidateScoreIsRawFreeRatio) {
     UUID client_id = {111, 222};
     auto meta = CreateMeta(client_id, "10.0.0.1", 50051);
     meta->Heartbeat();
     const int base_priority = 10;
-    auto seg = MakeP2PSegment({1, 1}, "seg1", 10000,
-                              base_priority);  // Base priority 10
+    // 10000 total, 5000 used -> free_ratio = 0.5
+    auto seg = MakeP2PSegment({1, 1}, "seg1", 10000, base_priority,
+                              /*usage=*/5000);
     ASSERT_TRUE(meta->MountSegment(seg).has_value());
+    const double free_ratio = 0.5;
 
     WriteRouteRequest req;
     req.size = 100;
 
-    // 1. Local client + prefer_local = true -> Boosted priority
+    // 1. Local client + remote_weight = 0 (force local) -> score is free_ratio
+    //    (the +1 local bias is added by the master, not by the client).
     req.client_id = client_id;
-    req.config.allow_local = true;
-    req.config.prefer_local = true;
+    req.config.remote_weight = 0.0;
+    auto result = meta->GetWriteRouteCandidate(req);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_DOUBLE_EQ(result->score, free_ratio);
 
-    std::vector<WriteCandidate> candidates;
-    auto result = meta->CollectWriteRouteCandidates(req, candidates);
-    EXPECT_TRUE(result.has_value());
-    ASSERT_EQ(candidates.size(), 1);
-    EXPECT_EQ(candidates[0].priority,
-              base_priority + P2PClientMeta::INF_PRIORITY);
+    // 2. Local client + remote_weight = 0.5 (balanced) -> free_ratio, no bias.
+    req.config.remote_weight = 0.5;
+    result = meta->GetWriteRouteCandidate(req);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_DOUBLE_EQ(result->score, free_ratio);
 
-    // 2. Non-local client + prefer_local = true -> No boost
+    // 3. Non-local client -> free_ratio, no bias (never local).
     req.client_id = {999, 999};
-    candidates.clear();
-    result = meta->CollectWriteRouteCandidates(req, candidates);
-    EXPECT_TRUE(result.has_value());
-    ASSERT_EQ(candidates.size(), 1);
-    EXPECT_EQ(candidates[0].priority, base_priority);
+    req.config.remote_weight = 0.0;
+    result = meta->GetWriteRouteCandidate(req);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_DOUBLE_EQ(result->score, free_ratio);
 
-    // 3. Local client + prefer_local = false -> No boost
+    // 4. Local client + remote_weight = 1 -> still a candidate at client level
+    //    (the master applies the weight and decides exclusion).
     req.client_id = client_id;
-    req.config.prefer_local = false;
-    candidates.clear();
-    result = meta->CollectWriteRouteCandidates(req, candidates);
-    EXPECT_TRUE(result.has_value());
-    ASSERT_EQ(candidates.size(), 1);
-    EXPECT_EQ(candidates[0].priority, base_priority);
-
-    // 4. Local client + allow_local = false -> No candidate
-    req.config.allow_local = false;
-    req.config.prefer_local = true;
-    candidates.clear();
-    result = meta->CollectWriteRouteCandidates(req, candidates);
-    EXPECT_TRUE(result.has_value());
-    EXPECT_EQ(candidates.size(), 0);
+    req.config.remote_weight = 1.0;
+    result = meta->GetWriteRouteCandidate(req);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_DOUBLE_EQ(result->score, free_ratio);
 }
 
-TEST_F(P2PClientMetaTest, CollectCandidatesCompositeFilters) {
+TEST_F(P2PClientMetaTest, GetWriteRouteCandidateCompositeFilters) {
     UUID client_id = {111, 222};
     auto meta = CreateMeta(client_id, "10.0.0.1", 50051);
     meta->Heartbeat();
 
-    // S1: Sufficient space, correct tags, low priority
+    // S1: low priority (excluded by priority_limit)
     auto s1 = MakeP2PSegment({1, 1}, "s1", 10000, 1);
     s1.GetP2PExtra().tags = {"ssd"};
 
-    // S2: Sufficient space, wrong tags, high priority
+    // S2: wrong tag (excluded by tag_filters), high priority
     auto s2 = MakeP2PSegment({2, 2}, "s2", 10000, 10);
     s2.GetP2PExtra().tags = {"hdd"};
 
-    // S3: Insufficient space, correct tags, high priority
+    // S3: eligible tier, small
     auto s3 = MakeP2PSegment({3, 3}, "s3", 50, 10);
     s3.GetP2PExtra().tags = {"ssd"};
 
-    // S4: Sufficient space, correct tags, high priority -> The only valid one
+    // S4: eligible tier, large
     auto s4 = MakeP2PSegment({4, 4}, "s4", 10000, 10);
     s4.GetP2PExtra().tags = {"ssd"};
 
@@ -702,16 +673,55 @@ TEST_F(P2PClientMetaTest, CollectCandidatesCompositeFilters) {
     ASSERT_TRUE(meta->MountSegment(s4).has_value());
 
     WriteRouteRequest req;
-    req.size = 100;  // Filter S3
-    req.config.allow_local = true;
-    req.config.priority_limit = 5;     // Filter S1
-    req.config.tag_filters = {"hdd"};  // Filter S2
+    req.size = 100;
+    req.config.priority_limit = 5;     // excludes S1
+    req.config.tag_filters = {"hdd"};  // excludes S2
 
-    std::vector<WriteCandidate> candidates;
-    auto result = meta->CollectWriteRouteCandidates(req, candidates);
-    EXPECT_TRUE(result.has_value());
-    ASSERT_EQ(candidates.size(), 1);
-    EXPECT_EQ(candidates[0].replica.segment_id, s4.id);
+    // Eligible tiers = S3 + S4; client is a candidate with their aggregate
+    // free. (The client itself picks the concrete tier that fits at write
+    // time.)
+    auto result = meta->GetWriteRouteCandidate(req);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->client_id, client_id);
+    EXPECT_EQ(result->available_capacity, 10050u);  // S3(50) + S4(10000)
+}
+
+TEST_F(P2PClientMetaTest, GetWriteScoreCapacity) {
+    UUID client_id = {111, 222};
+    auto meta = CreateMeta(client_id, "10.0.0.1", 50051);
+    meta->Heartbeat();
+
+    // High-priority (10) DRAM tier: small, mostly free.
+    auto dram = MakeP2PSegment({1, 1}, "dram", 1000, /*priority=*/10,
+                               /*usage=*/200);
+    dram.GetP2PExtra().tags = {"fast"};
+    // Low-priority (0) NVMe tier: large, mostly free.
+    auto nvme = MakeP2PSegment({2, 2}, "nvme", 10000, /*priority=*/0,
+                               /*usage=*/1000);
+    ASSERT_TRUE(meta->MountSegment(dram).has_value());
+    ASSERT_TRUE(meta->MountSegment(nvme).has_value());
+
+    // All eligible tiers summed (no filters).
+    auto all = meta->GetWriteScoreCapacity({}, 0, /*top_tier_only=*/false);
+    EXPECT_EQ(all.total, 11000u);
+    EXPECT_EQ(all.free, 800u + 9000u);
+
+    // Only the highest-priority eligible tier (DRAM).
+    auto top = meta->GetWriteScoreCapacity({}, 0, /*top_tier_only=*/true);
+    EXPECT_EQ(top.total, 1000u);
+    EXPECT_EQ(top.free, 800u);
+
+    // priority_limit excludes the NVMe tier -> only DRAM contributes.
+    auto by_priority =
+        meta->GetWriteScoreCapacity({}, 5, /*top_tier_only=*/false);
+    EXPECT_EQ(by_priority.total, 1000u);
+    EXPECT_EQ(by_priority.free, 800u);
+
+    // tag_filters excludes DRAM (carries "fast") -> only NVMe contributes.
+    auto by_tag =
+        meta->GetWriteScoreCapacity({"fast"}, 0, /*top_tier_only=*/false);
+    EXPECT_EQ(by_tag.total, 10000u);
+    EXPECT_EQ(by_tag.free, 9000u);
 }
 
 // ============================================================

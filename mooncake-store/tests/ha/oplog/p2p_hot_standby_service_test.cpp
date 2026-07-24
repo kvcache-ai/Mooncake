@@ -38,7 +38,7 @@ class P2PHotStandbyServiceTest : public ::testing::Test {
             .set_cluster_id(kClusterId)
             .set_oplog_store_type("localfs")
             .set_oplog_data_dir(test_dir_.string())
-            .set_max_replicas_per_key(0)
+            .set_max_client_per_key(0)
             .build();
     }
 
@@ -55,7 +55,7 @@ class P2PHotStandbyServiceTest : public ::testing::Test {
         config.oplog_store_type = master_config.oplog_store_type;
         config.oplog_data_dir = master_config.oplog_data_dir;
         config.cluster_id = master_config.cluster_id;
-        config.max_replicas_per_key = master_config.max_replicas_per_key;
+        config.max_client_per_key = master_config.max_client_per_key;
         return config;
     }
 
@@ -271,9 +271,7 @@ TEST_F(P2PHotStandbyServiceTest, RestoreExportedMetadataIntoP2PMasterService) {
     auto route_result = restored_master.GetWriteRoute(route_req);
     ASSERT_TRUE(route_result.has_value()) << toString(route_result.error());
     ASSERT_FALSE(route_result.value().candidates.empty());
-    EXPECT_EQ(route_result.value().candidates[0].replica.client_id, client_id);
-    EXPECT_EQ(route_result.value().candidates[0].replica.segment_id,
-              segment_id);
+    EXPECT_EQ(route_result.value().candidates[0].client_id, client_id);
 
     AddReplica(restored_master, "key-after-restore", client_id, segment_id,
                1024);
@@ -326,9 +324,7 @@ TEST_F(P2PHotStandbyServiceTest, RestorePromotedMetadataIntoWrappedRuntime) {
     auto route_result = promoted_runtime.GetWriteRoute(route_req);
     ASSERT_TRUE(route_result.has_value()) << toString(route_result.error());
     ASSERT_FALSE(route_result.value().candidates.empty());
-    EXPECT_EQ(route_result.value().candidates[0].replica.client_id, client_id);
-    EXPECT_EQ(route_result.value().candidates[0].replica.segment_id,
-              segment_id);
+    EXPECT_EQ(route_result.value().candidates[0].client_id, client_id);
 
     AddReplicaRequest add_req;
     add_req.key = "runtime-key-after-promotion";

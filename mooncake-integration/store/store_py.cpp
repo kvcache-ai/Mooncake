@@ -1015,8 +1015,10 @@ PYBIND11_MODULE(store, m) {
         .def_readwrite("max_candidates",
                        &WriteRouteRequestConfig::max_candidates)
         .def_readwrite("strategy", &WriteRouteRequestConfig::strategy)
-        .def_readwrite("allow_local", &WriteRouteRequestConfig::allow_local)
-        .def_readwrite("prefer_local", &WriteRouteRequestConfig::prefer_local)
+        .def_readwrite("remote_weight", &WriteRouteRequestConfig::remote_weight)
+        .def_readwrite("local_write_waterline",
+                       &WriteRouteRequestConfig::local_write_waterline)
+        .def_readwrite("top_tier_only", &WriteRouteRequestConfig::top_tier_only)
         .def_readwrite("early_return", &WriteRouteRequestConfig::early_return)
         .def_readwrite("tag_filters", &WriteRouteRequestConfig::tag_filters)
         .def_readwrite("priority_limit",
