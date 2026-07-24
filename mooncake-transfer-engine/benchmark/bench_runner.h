@@ -28,6 +28,8 @@
 
 namespace mooncake {
 namespace tent {
+enum class IntentType : int;
+
 class BenchRunner {
    public:
     BenchRunner() {}
@@ -57,7 +59,8 @@ class BenchRunner {
 
     virtual double runSingleTransfer(uint64_t local_addr, uint64_t target_addr,
                                      uint64_t block_size, uint64_t batch_size,
-                                     OpCode opcode, uint64_t deadline_ns) = 0;
+                                     OpCode opcode, uint64_t deadline_ns,
+                                     IntentType intent_type) = 0;
 };
 
 }  // namespace tent
