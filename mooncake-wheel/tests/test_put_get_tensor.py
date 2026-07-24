@@ -286,15 +286,17 @@ class TestCodecInference(unittest.TestCase):
         self.assertTrue(d.accepted)
         self.assertEqual(d.codec, "ragged_tensor")
 
-    def test_tensor_mixed_dtype_rejected(self):
+    def test_tensor_mixed_dtype(self):
         import torch
         d = _choose_leaf_codec([torch.tensor([1], dtype=torch.float32), torch.tensor([1], dtype=torch.int64)])
         self.assertFalse(d.accepted)
+        self.assertEqual(d.codec, "ragged_tensor")
 
-    def test_tensor_mixed_ndim_rejected(self):
+    def test_tensor_mixed_ndim(self):
         import torch
         d = _choose_leaf_codec([torch.tensor([1]), torch.tensor([[1, 2]])])
-        self.assertFalse(d.accepted)
+        self.assertTrue(d.accepted)
+        self.assertEqual(d.codec, "ragged_tensor")
 
     def test_numeric_sequence(self):
         d = _choose_leaf_codec([[1, 2, 3], [4, 5]])
@@ -329,7 +331,7 @@ class TestCodecInference(unittest.TestCase):
     def test_fallback(self):
         d = _choose_leaf_codec([object(), object()])
         self.assertFalse(d.accepted)
-        self.assertEqual(d.codec, "pickle_ragged_fallback")
+        self.assertEqual(d.codec, "msgpack_ragged")
 
     def test_with_nulls(self):
         d = _choose_leaf_codec(["hello", None, "world"])
