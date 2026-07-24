@@ -645,6 +645,14 @@ class MasterService {
     auto OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading)
         -> tl::expected<std::vector<OffloadTaskItem>, ErrorCode>;
 
+    /**
+     * @brief Client polls whether master has requested a full SSD clear
+     * (triggered by RemoveAll). Atomically checks and clears the flag.
+     * @param client_id The client polling for the remove-all signal
+     * @return true if client should clear all SSD files, false otherwise
+     */
+    auto PollRemoveAll(const UUID& client_id) -> tl::expected<bool, ErrorCode>;
+
     auto ReportSsdCapacity(const UUID& client_id,
                            int64_t ssd_total_capacity_bytes)
         -> tl::expected<void, ErrorCode>;

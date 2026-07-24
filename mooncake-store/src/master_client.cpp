@@ -317,6 +317,11 @@ struct RpcNameTraits<&WrappedMasterService::BatchEvictDiskReplica> {
     static constexpr const char* value = "BatchEvictDiskReplica";
 };
 
+template <>
+struct RpcNameTraits<&WrappedMasterService::PollRemoveAll> {
+    static constexpr const char* value = "PollRemoveAll";
+};
+
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
     auto pool = client_accessor_.GetClientPool();
@@ -987,6 +992,17 @@ MasterClient::OffloadObjectHeartbeat(const UUID& client_id,
     auto result =
         invoke_rpc<&WrappedMasterService::OffloadObjectHeartbeat,
                    std::vector<OffloadTaskItem>>(client_id, enable_offloading);
+    return result;
+}
+
+tl::expected<bool, ErrorCode> MasterClient::PollRemoveAll() {
+    ScopedVLogTimer timer(1, "MasterClient::PollRemoveAll");
+    timer.LogRequest("client_id=", client_id_);
+
+    auto result =
+        invoke_rpc<&WrappedMasterService::PollRemoveAll, bool>(client_id_);
+    timer.LogResponse("should_remove_all=",
+                      result.has_value() ? result.value() : false);
     return result;
 }
 

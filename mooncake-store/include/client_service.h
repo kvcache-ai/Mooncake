@@ -425,6 +425,8 @@ class Client {
         bool enable_offloading,
         std::vector<OffloadTaskItem>& offloading_objects);
 
+    tl::expected<bool, ErrorCode> PollRemoveAll();
+
     tl::expected<void, ErrorCode> ReportSsdCapacity(
         int64_t ssd_total_capacity_bytes);
 

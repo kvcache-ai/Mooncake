@@ -831,7 +831,13 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         }
     }
 
-    // === STEP 2: Persist offloaded objects (trigger actual data migration) ===
+    // === STEP 2: Poll whether master requested a full SSD clear ===
+    auto remove_all_result = client_->PollRemoveAll();
+    if (remove_all_result && remove_all_result.value()) {
+        RemoveAll();
+    }
+
+    // === STEP 3: Persist offloaded objects (trigger actual data migration) ===
     if (!offloading_objects.empty()) {
         auto offload_result = OffloadObjects(offloading_objects);
         if (!offload_result) {
@@ -858,6 +864,21 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                      << disk_eviction_result.error();
     }
     return {};
+}
+
+void FileStorage::RemoveAll() {
+    // TODO(tenant-isolation): This performs a tenant-UNAWARE global wipe of the
+    // storage directory. Storage backends store physical files without a
+    // tenant dimension, so a tenant-scoped master RemoveAll("tenant_A") that
+    // signals this client will also delete tenant_B's SSD files here, while
+    // master still holds valid metadata for tenant_B (subsequent reads get
+    // OBJECT_NOT_FOUND on this node). Safe for the global RemoveAll(force) and
+    // for single-tenant / shared-nothing deployments. Proper per-tenant
+    // physical isolation needs backend-level tenant-scoped layout (follow-up).
+    if (storage_backend_) {
+        storage_backend_->RemoveAll();
+    }
+    LOG(INFO) << "FileStorage::RemoveAll: cleared storage backend";
 }
 
 tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
