@@ -324,21 +324,23 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
         return init_storage_backend_result;
     }
     auto enable_offloading_result = IsEnableOffloading();
+    bool initial_enable_offloading = false;
     if (enable_offloading_result.has_value()) {
+        initial_enable_offloading = enable_offloading_result.value();
         LOG(INFO) << "IsEnableOffloading result: "
-                  << (enable_offloading_result.value() ? "true" : "false");
+                  << (initial_enable_offloading ? "true" : "false");
+    } else if (enable_offloading_result.error() ==
+               ErrorCode::UNABLE_OFFLOADING) {
+        LOG(INFO) << "Offloading is not ready before metadata scan; mounting "
+                     "with offloading disabled";
     } else {
-        LOG(INFO) << "IsEnableOffloading result: error: "
-                  << enable_offloading_result.error();
-    }
-    if (!enable_offloading_result) {
         LOG(ERROR) << "Failed to get enable persist result, error : "
                    << enable_offloading_result.error();
         return tl::make_unexpected(enable_offloading_result.error());
     }
     {
         MutexLocker locker(&offloading_mutex_);
-        enable_offloading_ = enable_offloading_result.value();
+        enable_offloading_ = initial_enable_offloading;
         auto mount_file_storage_result =
             client_->MountLocalDiskSegment(enable_offloading_);
         if (!mount_file_storage_result) {
@@ -380,6 +382,20 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
         LOG(ERROR) << "Failed to scan meta and send to master: "
                    << scan_meta_result.error();
         return scan_meta_result;
+    }
+
+    // Some backends need the initial scan to reconstruct quota accounting.
+    // Refresh the local state before the first heartbeat publishes it to the
+    // master. Until this point such backends mount conservatively as disabled.
+    auto refreshed_offloading_result = IsEnableOffloading();
+    if (!refreshed_offloading_result) {
+        LOG(ERROR) << "Failed to refresh offloading state after metadata scan: "
+                   << refreshed_offloading_result.error();
+        return tl::make_unexpected(refreshed_offloading_result.error());
+    }
+    {
+        MutexLocker locker(&offloading_mutex_);
+        enable_offloading_ = refreshed_offloading_result.value();
     }
 
     heartbeat_running_.store(true);
@@ -737,8 +753,13 @@ tl::expected<void, ErrorCode> FileStorage::RunDiskWatermarkEviction() {
 tl::expected<bool, ErrorCode> FileStorage::IsEnableOffloading() {
     auto is_enable_offloading_result = storage_backend_->IsEnableOffloading();
     if (!is_enable_offloading_result) {
-        LOG(ERROR) << "Failed to get enabling offload: "
-                   << is_enable_offloading_result.error();
+        if (is_enable_offloading_result.error() ==
+            ErrorCode::UNABLE_OFFLOADING) {
+            VLOG(1) << "Offloading is not ready";
+        } else {
+            LOG(ERROR) << "Failed to get enabling offload: "
+                       << is_enable_offloading_result.error();
+        }
         return tl::make_unexpected(is_enable_offloading_result.error());
     }
 
