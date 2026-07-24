@@ -7,6 +7,13 @@ orphan: true
 Architecture and implementation details for Mooncake's storage, transfer, and
 distributed execution components.
 
+:::{toctree}
+:hidden:
+
+ebs-kvcache-store-integration
+nof-disk-management-layer
+:::
+
 ## Core Architecture
 
 | Document | Description |

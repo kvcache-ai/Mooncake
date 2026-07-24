@@ -137,6 +137,7 @@ design/tent/tebench
 design/conductor/conductor-architecture-design
 design/ssd-offload
 design/ssd-free-ratio-first-allocation
+design/nof-disk-management-layer
 :::
 
 % API Documentation

@@ -39,6 +39,11 @@ class MasterAdminServer {
 
     void SetServiceAvailable(bool available);
 
+    // Enable a background worker that periodically runs provider probes against
+    // storage-backend-owned devices to drive health transitions. Must be called
+    // before Start(); a zero interval keeps the worker disabled.
+    void SetDeviceProbeIntervalSeconds(uint64_t interval_seconds);
+
    private:
     struct RuntimeSnapshot {
         ha::MasterRuntimeState state = ha::MasterRuntimeState::kStarting;
@@ -81,6 +86,18 @@ class MasterAdminServer {
                               coro_http::coro_http_response& resp);
     void HandleGetSegmentsDetail(coro_http::coro_http_request& req,
                                  coro_http::coro_http_response& resp);
+    void HandleGetDeviceMetadata(coro_http::coro_http_request& req,
+                                 coro_http::coro_http_response& resp);
+    void HandleUpdateDeviceMetadata(coro_http::coro_http_request& req,
+                                    coro_http::coro_http_response& resp);
+    void HandleGetDeviceGcCandidates(coro_http::coro_http_request& req,
+                                     coro_http::coro_http_response& resp);
+    void HandleGetDeviceMaintenancePlan(coro_http::coro_http_request& req,
+                                        coro_http::coro_http_response& resp);
+    void HandleDeviceRecoveryAction(coro_http::coro_http_request& req,
+                                    coro_http::coro_http_response& resp);
+    void HandleDeviceProbeAction(coro_http::coro_http_request& req,
+                                 coro_http::coro_http_response& resp);
     void HandleQuerySegment(coro_http::coro_http_request& req,
                             coro_http::coro_http_response& resp);
     void HandleCreateDrainJob(coro_http::coro_http_request& req,
@@ -89,6 +106,14 @@ class MasterAdminServer {
                              coro_http::coro_http_response& resp);
     void HandleCancelDrainJob(coro_http::coro_http_request& req,
                               coro_http::coro_http_response& resp);
+    void HandleCreateRebuildJob(coro_http::coro_http_request& req,
+                                coro_http::coro_http_response& resp);
+    void HandleQueryRebuildJob(coro_http::coro_http_request& req,
+                               coro_http::coro_http_response& resp);
+    void HandleCancelRebuildJob(coro_http::coro_http_request& req,
+                                coro_http::coro_http_response& resp);
+    void HandleDeviceCleanup(coro_http::coro_http_request& req,
+                             coro_http::coro_http_response& resp);
     void HandleSegmentStatus(coro_http::coro_http_request& req,
                              coro_http::coro_http_response& resp);
     void HandleBatchQueryKeys(coro_http::coro_http_request& req,
@@ -110,6 +135,10 @@ class MasterAdminServer {
     std::thread metric_report_thread_;
     std::atomic<bool> metric_report_running_{false};
     std::binary_semaphore metric_report_stop_sem_{0};
+    std::thread device_probe_thread_;
+    std::atomic<bool> device_probe_running_{false};
+    std::binary_semaphore device_probe_stop_sem_{0};
+    uint64_t device_probe_interval_seconds_ = 0;  // 0 disables the worker
     std::atomic<bool> started_{false};
     mutable std::mutex state_mutex_;
     ha::MasterRuntimeState state_{ha::MasterRuntimeState::kStarting};

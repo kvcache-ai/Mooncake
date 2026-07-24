@@ -65,6 +65,42 @@ std::string EnumToString(const T& value) {
     return oss.str();
 }
 
+std::string StorageDeviceKindToString(StorageDeviceKind kind) {
+    switch (kind) {
+        case StorageDeviceKind::LOGICAL_POOL:
+            return "LOGICAL_POOL";
+        case StorageDeviceKind::TARGET:
+            return "TARGET";
+        case StorageDeviceKind::NAMESPACE:
+            return "NAMESPACE";
+        case StorageDeviceKind::PHYSICAL_DISK:
+            return "PHYSICAL_DISK";
+        case StorageDeviceKind::DISK_NODE:
+            return "DISK_NODE";
+    }
+    return "UNKNOWN";
+}
+
+std::string StorageDeviceHealthToString(StorageDeviceHealth health) {
+    switch (health) {
+        case StorageDeviceHealth::UNKNOWN:
+            return "UNKNOWN";
+        case StorageDeviceHealth::HEALTHY:
+            return "HEALTHY";
+        case StorageDeviceHealth::DEGRADED:
+            return "DEGRADED";
+        case StorageDeviceHealth::FAILED:
+            return "FAILED";
+        case StorageDeviceHealth::REBUILDING:
+            return "REBUILDING";
+        case StorageDeviceHealth::DISABLED:
+            return "DISABLED";
+        case StorageDeviceHealth::UNMOUNTING:
+            return "UNMOUNTING";
+    }
+    return "UNKNOWN";
+}
+
 coro_http::status_type ErrorCodeToHttpStatus(ErrorCode error) {
     switch (error) {
         case ErrorCode::INVALID_PARAMS:
@@ -77,6 +113,7 @@ coro_http::status_type ErrorCodeToHttpStatus(ErrorCode error) {
         case ErrorCode::UNAVAILABLE_IN_CURRENT_MODE:
         case ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS:
         case ErrorCode::TENANT_NOT_EMPTY:
+        case ErrorCode::OBJECT_HAS_LEASE:
             return coro_http::status_type::conflict;
         default:
             return coro_http::status_type::internal_server_error;
@@ -308,12 +345,33 @@ bool MasterAdminServer::Start() {
         });
     }
 
+    if (device_probe_interval_seconds_ > 0) {
+        device_probe_running_.store(true);
+        device_probe_thread_ = std::thread([this]() {
+            while (device_probe_running_.load()) {
+                auto service = GetActiveService();
+                if (service) {
+                    auto probed = service->ProbeStorageBackendDevicesForAdmin();
+                    if (probed > 0) {
+                        VLOG(1) << "Device probe worker probed " << probed
+                                << " storage-backend device(s)";
+                    }
+                }
+                if (device_probe_stop_sem_.try_acquire_for(
+                        std::chrono::seconds(device_probe_interval_seconds_))) {
+                    break;
+                }
+            }
+        });
+    }
+
     LOG(INFO) << "Master admin server started on port " << http_server_.port();
     return true;
 }
 
 void MasterAdminServer::Stop() {
     metric_report_running_.store(false, std::memory_order_relaxed);
+    device_probe_running_.store(false, std::memory_order_relaxed);
     if (started_.exchange(false)) {
         http_server_.stop();
     }
@@ -321,6 +379,15 @@ void MasterAdminServer::Stop() {
         metric_report_stop_sem_.release();
         metric_report_thread_.join();
     }
+    if (device_probe_thread_.joinable()) {
+        device_probe_stop_sem_.release();
+        device_probe_thread_.join();
+    }
+}
+
+void MasterAdminServer::SetDeviceProbeIntervalSeconds(
+    uint64_t interval_seconds) {
+    device_probe_interval_seconds_ = interval_seconds;
 }
 
 void MasterAdminServer::SetRuntimeState(ha::MasterRuntimeState state) {
@@ -363,10 +430,11 @@ std::string MasterAdminServer::BuildMetricsText() const {
         MasterMetricManager::instance().serialize_metrics(),
         HAMetricManager::instance().serialize_metrics());
     auto tenant_metrics = BuildTenantQuotaMetricsText();
-    if (tenant_metrics.empty()) {
-        return metrics;
+    if (!tenant_metrics.empty()) {
+        metrics =
+            AppendMetricSections(std::move(metrics), std::move(tenant_metrics));
     }
-    return AppendMetricSections(std::move(metrics), std::move(tenant_metrics));
+    return metrics;
 }
 
 std::string MasterAdminServer::BuildTenantQuotaMetricsText() const {
@@ -694,6 +762,134 @@ struct HttpSegmentsDetailResponse {
 };
 YLT_REFL(HttpSegmentsDetailResponse, total_segments, segments);
 
+struct HttpStorageDeviceIdentity {
+    std::string kind;
+    std::string provider;
+    std::string device_id;
+    std::string target_id;
+    std::string namespace_id;
+    std::string disk_id;
+    std::string node_id;
+};
+YLT_REFL(HttpStorageDeviceIdentity, kind, provider, device_id, target_id,
+         namespace_id, disk_id, node_id);
+
+struct HttpStorageDeviceMetadataItem {
+    HttpStorageDeviceIdentity identity;
+    std::string health;
+    bool readable{false};
+    bool writable{false};
+    bool schedulable{false};
+    int64_t capacity_total{0};
+    int64_t capacity_used{0};
+    int64_t capacity_available{0};
+    uint32_t consecutive_failures{0};
+    std::string last_error;
+    int64_t last_update_unix_ms{-1};
+    std::string mount_endpoint;
+    std::string transport;
+    std::string opaque_provider_metadata;
+};
+YLT_REFL(HttpStorageDeviceMetadataItem, identity, health, readable, writable,
+         schedulable, capacity_total, capacity_used, capacity_available,
+         consecutive_failures, last_error, last_update_unix_ms, mount_endpoint,
+         transport, opaque_provider_metadata);
+
+struct HttpStorageDeviceMetadataResponse {
+    uint64_t total_devices{0};
+    std::vector<HttpStorageDeviceMetadataItem> devices;
+};
+YLT_REFL(HttpStorageDeviceMetadataResponse, total_devices, devices);
+
+struct HttpStorageDeviceMetadataUpdateRequest {
+    std::optional<bool> enabled;
+};
+YLT_REFL(HttpStorageDeviceMetadataUpdateRequest, enabled);
+
+struct HttpStorageDeviceMetadataUpdateResponse {
+    bool success{true};
+    HttpStorageDeviceMetadataItem device;
+};
+YLT_REFL(HttpStorageDeviceMetadataUpdateResponse, success, device);
+
+struct HttpStorageDeviceMaintenanceCandidate {
+    HttpStorageDeviceMetadataItem device;
+    std::string reason;
+};
+YLT_REFL(HttpStorageDeviceMaintenanceCandidate, device, reason);
+
+struct HttpStorageDeviceMaintenancePlanResponse {
+    uint64_t total_recovery_candidates{0};
+    uint64_t total_gc_candidates{0};
+    std::vector<HttpStorageDeviceMaintenanceCandidate> recovery_candidates;
+    std::vector<HttpStorageDeviceMaintenanceCandidate> gc_candidates;
+};
+YLT_REFL(HttpStorageDeviceMaintenancePlanResponse, total_recovery_candidates,
+         total_gc_candidates, recovery_candidates, gc_candidates);
+
+struct HttpStorageDeviceGcCandidatesResponse {
+    uint64_t total_gc_candidates{0};
+    std::vector<HttpStorageDeviceMaintenanceCandidate> gc_candidates;
+};
+YLT_REFL(HttpStorageDeviceGcCandidatesResponse, total_gc_candidates,
+         gc_candidates);
+
+tl::expected<HttpStorageDeviceMetadataUpdateRequest, std::string>
+ParseStorageDeviceMetadataUpdateBody(coro_http::coro_http_request& req) {
+    HttpStorageDeviceMetadataUpdateRequest request;
+    try {
+        struct_json::from_json(request, req.get_body());
+    } catch (const std::exception& e) {
+        return tl::make_unexpected(std::string("Invalid JSON body: ") +
+                                   e.what());
+    }
+    return request;
+}
+
+tl::expected<UUID, ErrorCode> ParseDeviceId(coro_http::coro_http_request& req) {
+    auto device_id_view = req.get_decode_query_value("device_id");
+    UUID device_id;
+    if (device_id_view.empty() ||
+        !StringToUuid(std::string(device_id_view), device_id)) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return device_id;
+}
+
+HttpStorageDeviceMetadataItem ToHttpStorageDeviceMetadataItem(
+    const StorageDeviceMetadata& metadata) {
+    HttpStorageDeviceMetadataItem item;
+    item.identity.kind = StorageDeviceKindToString(metadata.identity.kind);
+    item.identity.provider = metadata.identity.provider;
+    item.identity.device_id = UuidToString(metadata.identity.device_id);
+    item.identity.target_id = metadata.identity.target_id;
+    item.identity.namespace_id = metadata.identity.namespace_id;
+    item.identity.disk_id = metadata.identity.disk_id;
+    item.identity.node_id = metadata.identity.node_id;
+    item.health = StorageDeviceHealthToString(metadata.health);
+    item.readable = metadata.readable;
+    item.writable = metadata.writable;
+    item.schedulable = metadata.schedulable;
+    item.capacity_total = metadata.capacity_total;
+    item.capacity_used = metadata.capacity_used;
+    item.capacity_available = metadata.capacity_available;
+    item.consecutive_failures = metadata.consecutive_failures;
+    item.last_error = metadata.last_error;
+    item.last_update_unix_ms = metadata.last_update_unix_ms;
+    item.mount_endpoint = metadata.mount_endpoint;
+    item.transport = metadata.transport;
+    item.opaque_provider_metadata = metadata.opaque_provider_metadata;
+    return item;
+}
+
+HttpStorageDeviceMaintenanceCandidate ToHttpStorageDeviceMaintenanceCandidate(
+    const StorageDeviceMaintenanceCandidate& candidate) {
+    return HttpStorageDeviceMaintenanceCandidate{
+        .device = ToHttpStorageDeviceMetadataItem(candidate.metadata),
+        .reason = candidate.reason,
+    };
+}
+
 void MasterAdminServer::HandleGetSegmentsDetail(
     coro_http::coro_http_request&, coro_http::coro_http_response& resp) {
     WithActiveService(resp, [&](auto service) {
@@ -735,6 +931,283 @@ void MasterAdminServer::HandleGetSegmentsDetail(
             payload.segments.push_back(std::move(item));
         }
         WriteJsonResponse(resp, coro_http::status_type::ok, payload);
+    });
+}
+
+void MasterAdminServer::HandleGetDeviceMetadata(
+    coro_http::coro_http_request&, coro_http::coro_http_response& resp) {
+    WithActiveService(resp, [&](auto service) {
+        auto result = service->GetDeviceMetadataForAdmin();
+        if (!result) {
+            WriteErrorResponse(resp,
+                               coro_http::status_type::internal_server_error,
+                               result.error(), "Failed to get device metadata");
+            return;
+        }
+
+        HttpStorageDeviceMetadataResponse payload;
+        payload.total_devices = result.value().size();
+        payload.devices.reserve(result.value().size());
+        for (const auto& metadata : result.value()) {
+            payload.devices.push_back(
+                ToHttpStorageDeviceMetadataItem(metadata));
+        }
+        WriteJsonResponse(resp, coro_http::status_type::ok, payload);
+    });
+}
+
+void MasterAdminServer::HandleUpdateDeviceMetadata(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    auto device_id_result = ParseDeviceId(req);
+    if (!device_id_result.has_value()) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           device_id_result.error(),
+                           "Missing or invalid device_id");
+        return;
+    }
+
+    auto body_result = ParseStorageDeviceMetadataUpdateBody(req);
+    if (!body_result.has_value()) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           ErrorCode::INVALID_PARAMS, body_result.error());
+        return;
+    }
+
+    if (!body_result->enabled.has_value()) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           ErrorCode::INVALID_PARAMS, "enabled is required");
+        return;
+    }
+
+    StorageDeviceMetadataUpdate update;
+    update.identity.device_id = device_id_result.value();
+    if (*body_result->enabled) {
+        update.health = StorageDeviceHealth::HEALTHY;
+        update.readable = true;
+        update.writable = true;
+        update.schedulable = true;
+        update.consecutive_failures = 0;
+        update.last_error = "";
+    } else {
+        update.health = StorageDeviceHealth::DISABLED;
+        update.writable = false;
+        update.schedulable = false;
+    }
+
+    WithActiveService(resp, [&](auto service) {
+        if (*body_result->enabled) {
+            auto metadata = service->GetDeviceMetadataForAdmin();
+            if (metadata.has_value()) {
+                for (const auto& dev : *metadata) {
+                    if (dev.identity.device_id == device_id_result.value() &&
+                        dev.health == StorageDeviceHealth::REBUILDING) {
+                        WriteErrorResponse(
+                            resp, coro_http::status_type::conflict,
+                            ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS,
+                            "Cannot enable device while rebuild is active");
+                        return;
+                    }
+                }
+            }
+        }
+        auto result = service->UpdateDeviceMetadataForAdmin(update);
+        if (!result.has_value()) {
+            WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                               result.error());
+            return;
+        }
+        WriteJsonResponse(
+            resp, coro_http::status_type::ok,
+            HttpStorageDeviceMetadataUpdateResponse{
+                .device = ToHttpStorageDeviceMetadataItem(result.value())});
+    });
+}
+
+void MasterAdminServer::HandleGetDeviceMaintenancePlan(
+    coro_http::coro_http_request&, coro_http::coro_http_response& resp) {
+    WithActiveService(resp, [&](auto service) {
+        auto result = service->GetDeviceMaintenancePlanForAdmin();
+        if (!result.has_value()) {
+            WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                               result.error());
+            return;
+        }
+
+        HttpStorageDeviceMaintenancePlanResponse payload;
+        payload.total_recovery_candidates =
+            result.value().recovery_candidates.size();
+        payload.total_gc_candidates = result.value().gc_candidates.size();
+        payload.recovery_candidates.reserve(
+            result.value().recovery_candidates.size());
+        for (const auto& candidate : result.value().recovery_candidates) {
+            payload.recovery_candidates.push_back(
+                ToHttpStorageDeviceMaintenanceCandidate(candidate));
+        }
+        payload.gc_candidates.reserve(result.value().gc_candidates.size());
+        for (const auto& candidate : result.value().gc_candidates) {
+            payload.gc_candidates.push_back(
+                ToHttpStorageDeviceMaintenanceCandidate(candidate));
+        }
+        WriteJsonResponse(resp, coro_http::status_type::ok, payload);
+    });
+}
+
+void MasterAdminServer::HandleGetDeviceGcCandidates(
+    coro_http::coro_http_request&, coro_http::coro_http_response& resp) {
+    WithActiveService(resp, [&](auto service) {
+        auto result = service->GetDeviceMaintenancePlanForAdmin();
+        if (!result.has_value()) {
+            WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                               result.error());
+            return;
+        }
+
+        HttpStorageDeviceGcCandidatesResponse payload;
+        payload.total_gc_candidates = result.value().gc_candidates.size();
+        payload.gc_candidates.reserve(result.value().gc_candidates.size());
+        for (const auto& candidate : result.value().gc_candidates) {
+            payload.gc_candidates.push_back(
+                ToHttpStorageDeviceMaintenanceCandidate(candidate));
+        }
+        WriteJsonResponse(resp, coro_http::status_type::ok, payload);
+    });
+}
+
+void MasterAdminServer::HandleDeviceProbeAction(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    auto device_id_result = ParseDeviceId(req);
+    if (!device_id_result.has_value()) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           device_id_result.error(),
+                           "Missing or invalid device_id");
+        return;
+    }
+
+    const auto action = req.get_decode_query_value("action");
+    const bool run_probe = action == "run";
+    const bool success = action == "success" || run_probe;
+    if (!success && action != "fail") {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           ErrorCode::INVALID_PARAMS,
+                           "Invalid action; expected run, success, or fail");
+        return;
+    }
+    const std::string reason = success ? "" : [&] {
+        auto reason_view = req.get_decode_query_value("reason");
+        return reason_view.empty() ? std::string("probe_failed")
+                                   : std::string(reason_view);
+    }();
+
+    StorageDeviceMetadataUpdate update;
+    update.identity.device_id = device_id_result.value();
+    if (success) {
+        update.health = StorageDeviceHealth::HEALTHY;
+        update.readable = true;
+        update.writable = true;
+        update.schedulable = true;
+        update.consecutive_failures = 0;
+        update.last_error = "";
+    } else {
+        update.health = StorageDeviceHealth::DEGRADED;
+        update.last_error = reason;
+    }
+
+    WithActiveService(resp, [&](auto service) {
+        auto result = service->ProbeDeviceForAdmin(
+            device_id_result.value(), std::string(action), reason, update);
+        if (!result.has_value()) {
+            WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                               result.error());
+            return;
+        }
+        WriteJsonResponse(
+            resp, coro_http::status_type::ok,
+            HttpStorageDeviceMetadataUpdateResponse{
+                .device = ToHttpStorageDeviceMetadataItem(result.value())});
+    });
+}
+
+void MasterAdminServer::HandleDeviceRecoveryAction(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    auto device_id_result = ParseDeviceId(req);
+    if (!device_id_result.has_value()) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           device_id_result.error(),
+                           "Missing or invalid device_id");
+        return;
+    }
+    const auto action = req.get_decode_query_value("action");
+    StorageDeviceMetadataUpdate update;
+    update.identity.device_id = device_id_result.value();
+    if (action == "start") {
+        update.health = StorageDeviceHealth::REBUILDING;
+        update.writable = false;
+        update.schedulable = false;
+        update.last_error = "";
+    } else if (action == "complete") {
+        update.health = StorageDeviceHealth::HEALTHY;
+        update.readable = true;
+        update.writable = true;
+        update.schedulable = true;
+        update.consecutive_failures = 0;
+        update.last_error = "";
+    } else if (action == "fail") {
+        update.health = StorageDeviceHealth::FAILED;
+        update.writable = false;
+        update.schedulable = false;
+        update.last_error = "recovery_failed";
+    } else {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           ErrorCode::INVALID_PARAMS,
+                           "Invalid action; expected start, complete, or fail");
+        return;
+    }
+
+    WithActiveService(resp, [&](auto service) {
+        std::string rebuild_job_id;
+        auto result = service->RecoverDeviceForAdmin(device_id_result.value(),
+                                                     std::string(action),
+                                                     update, &rebuild_job_id);
+        if (!result.has_value()) {
+            WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                               result.error());
+            return;
+        }
+        auto response = HttpStorageDeviceMetadataUpdateResponse{
+            .device = ToHttpStorageDeviceMetadataItem(result.value())};
+        if (!rebuild_job_id.empty()) {
+            if (response.device.opaque_provider_metadata.empty()) {
+                response.device.opaque_provider_metadata =
+                    "rebuild_job_id=" + rebuild_job_id;
+            } else {
+                response.device.opaque_provider_metadata +=
+                    ",rebuild_job_id=" + rebuild_job_id;
+            }
+        }
+        WriteJsonResponse(resp, coro_http::status_type::ok, response);
+    });
+}
+
+void MasterAdminServer::HandleDeviceCleanup(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    DeviceCleanupRequest request;
+    try {
+        struct_json::from_json(request, req.get_body());
+    } catch (const std::exception& e) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           ErrorCode::INVALID_PARAMS,
+                           std::string("Invalid JSON body: ") + e.what());
+        return;
+    }
+
+    WithActiveService(resp, [&](auto service) {
+        auto result = service->CleanupDeviceForAdmin(request);
+        if (!result.has_value()) {
+            WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                               result.error());
+            return;
+        }
+        WriteJsonResponse(resp, coro_http::status_type::ok, result.value());
     });
 }
 
@@ -811,6 +1284,7 @@ struct HttpQueryDrainJobResponse {
     int64_t created_at_ms_epoch{0};
     int64_t last_updated_at_ms_epoch{0};
     std::vector<std::string> segments;
+    std::vector<std::string> devices;
     uint64_t succeeded_units{0};
     uint64_t failed_units{0};
     uint64_t blocked_units{0};
@@ -822,7 +1296,7 @@ struct HttpQueryDrainJobResponse {
 };
 YLT_REFL(HttpQueryDrainJobResponse, success, job_id, type, type_name, status,
          status_name, created_at_ms_epoch, last_updated_at_ms_epoch, segments,
-         succeeded_units, failed_units, blocked_units, active_units,
+         devices, succeeded_units, failed_units, blocked_units, active_units,
          migrated_bytes, message, error_code, error_message);
 
 namespace {
@@ -839,6 +1313,7 @@ HttpQueryDrainJobResponse ToHttpQueryDrainJobResponse(
     payload.created_at_ms_epoch = job.created_at_ms_epoch;
     payload.last_updated_at_ms_epoch = job.last_updated_at_ms_epoch;
     payload.segments = job.segments;
+    payload.devices = job.devices;
     payload.succeeded_units = job.succeeded_units;
     payload.failed_units = job.failed_units;
     payload.blocked_units = job.blocked_units;
@@ -860,7 +1335,7 @@ void MasterAdminServer::HandleQueryDrainJob(
     }
 
     WithActiveService(resp, [&](auto service) {
-        auto result = service->QueryDrainJob(job_id_result.value());
+        auto result = service->QueryMigrationJob(job_id_result.value());
         if (!result.has_value()) {
             WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
                                result.error());
@@ -892,7 +1367,82 @@ void MasterAdminServer::HandleCancelDrainJob(
     }
 
     WithActiveService(resp, [&](auto service) {
-        auto result = service->CancelDrainJob(job_id_result.value());
+        auto result = service->CancelMigrationJob(job_id_result.value());
+        if (!result.has_value()) {
+            WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                               result.error());
+            return;
+        }
+
+        HttpCancelDrainJobResponse payload;
+        payload.success = true;
+        payload.job_id = UuidToString(job_id_result.value());
+        payload.status = "CANCELED";
+        WriteJsonResponse(resp, coro_http::status_type::ok, payload);
+    });
+}
+
+void MasterAdminServer::HandleCreateRebuildJob(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    CreateRebuildJobRequest request;
+    try {
+        struct_json::from_json(request, req.get_body());
+    } catch (const std::exception& e) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           ErrorCode::INVALID_PARAMS,
+                           std::string("Invalid JSON body: ") + e.what());
+        return;
+    }
+
+    WithActiveService(resp, [&](auto service) {
+        auto result = service->CreateRebuildJob(request);
+        if (!result.has_value()) {
+            WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                               result.error());
+            return;
+        }
+
+        HttpCreateDrainJobResponse payload;
+        payload.success = true;
+        payload.job_id = UuidToString(result.value());
+        payload.status = "CREATED";
+        WriteJsonResponse(resp, coro_http::status_type::ok, payload);
+    });
+}
+
+void MasterAdminServer::HandleQueryRebuildJob(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    auto job_id_result = ParseJobId(req.get_decode_query_value("job_id"));
+    if (!job_id_result.has_value()) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           job_id_result.error(), "Missing or invalid job_id");
+        return;
+    }
+
+    WithActiveService(resp, [&](auto service) {
+        auto result = service->QueryMigrationJob(job_id_result.value());
+        if (!result.has_value()) {
+            WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                               result.error());
+            return;
+        }
+
+        WriteJsonResponse(resp, coro_http::status_type::ok,
+                          ToHttpQueryDrainJobResponse(result.value()));
+    });
+}
+
+void MasterAdminServer::HandleCancelRebuildJob(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    auto job_id_result = ParseJobId(req.get_decode_query_value("job_id"));
+    if (!job_id_result.has_value()) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           job_id_result.error(), "Missing or invalid job_id");
+        return;
+    }
+
+    WithActiveService(resp, [&](auto service) {
+        auto result = service->CancelMigrationJob(job_id_result.value());
         if (!result.has_value()) {
             WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
                                result.error());
@@ -1230,10 +1780,60 @@ void MasterAdminServer::RegisterHandler() {
         [this](coro_http_request& req, coro_http_response& resp) {
             HandleCancelDrainJob(req, resp);
         });
+    http_server_.set_http_handler<POST>(
+        "/api/v1/rebuild_jobs",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleCreateRebuildJob(req, resp);
+        });
+    http_server_.set_http_handler<GET>(
+        "/api/v1/rebuild_jobs/query",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleQueryRebuildJob(req, resp);
+        });
+    http_server_.set_http_handler<POST>(
+        "/api/v1/rebuild_jobs/cancel",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleCancelRebuildJob(req, resp);
+        });
     http_server_.set_http_handler<GET>(
         "/api/v1/segments/status",
         [this](coro_http_request& req, coro_http_response& resp) {
             HandleSegmentStatus(req, resp);
+        });
+    http_server_.set_http_handler<GET>(
+        "/api/v1/devices/metadata",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleGetDeviceMetadata(req, resp);
+        });
+    http_server_.set_http_handler<PUT>(
+        "/api/v1/devices/metadata",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleUpdateDeviceMetadata(req, resp);
+        });
+    http_server_.set_http_handler<GET>(
+        "/api/v1/devices/maintenance",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleGetDeviceMaintenancePlan(req, resp);
+        });
+    http_server_.set_http_handler<GET>(
+        "/api/v1/devices/gc_candidates",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleGetDeviceGcCandidates(req, resp);
+        });
+    http_server_.set_http_handler<POST>(
+        "/api/v1/devices/recovery",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleDeviceRecoveryAction(req, resp);
+        });
+    http_server_.set_http_handler<POST>(
+        "/api/v1/devices/probe",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleDeviceProbeAction(req, resp);
+        });
+    http_server_.set_http_handler<POST>(
+        "/api/v1/devices/cleanup",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleDeviceCleanup(req, resp);
         });
     http_server_.set_http_handler<GET>(
         "/api/v1/tenant_quotas",

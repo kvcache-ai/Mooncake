@@ -18,6 +18,7 @@
 #include "file_interface.h"
 #include "mutex.h"
 #include "offset_allocator/offset_allocator.h"
+#include "storage_device_metadata.h"
 #include "types.h"
 
 namespace mooncake {
@@ -363,6 +364,16 @@ class StorageBackendInterface {
 
     virtual tl::expected<bool, ErrorCode> IsExist(const std::string& key) = 0;
 
+    virtual std::vector<tl::expected<bool, ErrorCode>> BatchIsExist(
+        const std::vector<std::string>& keys) {
+        std::vector<tl::expected<bool, ErrorCode>> results;
+        results.reserve(keys.size());
+        for (const auto& key : keys) {
+            results.push_back(IsExist(key));
+        }
+        return results;
+    }
+
     virtual tl::expected<bool, ErrorCode> IsEnableOffloading() = 0;
 
     virtual tl::expected<void, ErrorCode> ScanMeta(
@@ -389,6 +400,56 @@ class StorageBackendInterface {
                             double /* low_watermark_ratio */,
                             EvictionHandler /* eviction_handler */ = nullptr) {
         return std::vector<std::string>{};
+    }
+
+    virtual std::vector<StorageDeviceMetadata> ListStorageDeviceMetadata()
+        const {
+        return {};
+    }
+
+    virtual tl::expected<StorageDeviceMetadata, ErrorCode>
+    ApplyStorageDeviceMetadataUpdate(const StorageDeviceMetadataUpdate&) {
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
+
+    virtual tl::expected<StorageDeviceMetadata, ErrorCode>
+    StartStorageDeviceRecovery(const UUID&) {
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
+
+    virtual tl::expected<StorageDeviceMetadata, ErrorCode>
+    CompleteStorageDeviceRecovery(const UUID&) {
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
+
+    virtual tl::expected<StorageDeviceMetadata, ErrorCode>
+    FailStorageDeviceRecovery(const UUID&) {
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
+
+    virtual tl::expected<StorageDeviceMetadata, ErrorCode>
+    RecordStorageDeviceProbeSuccess(const UUID&) {
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
+
+    virtual tl::expected<StorageDeviceMetadata, ErrorCode>
+    RecordStorageDeviceProbeFailure(const UUID&, const std::string&) {
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
+
+    virtual tl::expected<StorageDeviceMetadata, ErrorCode> ProbeStorageDevice(
+        const UUID&) {
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
+
+    virtual std::vector<std::string> ListKeysForDevice(
+        const std::string& /*device_id*/) const {
+        return {};
+    }
+
+    virtual std::pair<int64_t, int64_t> GetDeviceCapacityUsage(
+        const std::string& /*device_id*/) const {
+        return {0, 0};
     }
 
     FileStorageConfig file_storage_config_;

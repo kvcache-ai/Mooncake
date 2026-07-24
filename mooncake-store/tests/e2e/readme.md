@@ -89,18 +89,25 @@ The script first verifies steady-state `put/get` success with `memory + nof` rep
 
 **Prerequisites**:
 
-- `BUILD_DIR` points to a build tree that already contains:
+- `BUILD_DIR` points to a build tree configured with `USE_NOF=ON` and containing:
   - `mooncake-store/src/mooncake_master`
   - `mooncake-integration/store*.so`
-- SPDK has already been built under `extern/spdk`
+- SPDK has already been built under `extern/spdk`, or `SPDK_NVMF_TGT` / `SPDK_RPC` point to the built `nvmf_tgt` and `rpc.py`
 - Python environment contains `aiohttp` because the script launches a standalone metadata process with `mooncake-wheel/mooncake/http_metadata_server.py`
-- The script uses `sudo -n` to set hugepages and mount `/dev/hugepages`, so the current user must have passwordless sudo
+- Hugepages are already available and mounted, or the current user has passwordless `sudo -n` so the script can set and mount `/dev/hugepages`
+- If shared libraries are not found from the build tree, set `LD_LIBRARY_PATH_FOR_E2E`; the script also accepts `PYTHONPATH_FOR_E2E`
 
 **Usage**:
 
 ```bash
 cd mooncake-store/tests/e2e
 BUILD_DIR=/path/to/build ./run_nof_heartbeat_tcp_e2e.sh
+```
+
+To run only dependency checks without starting services or touching hugepage state, set:
+
+```bash
+PREFLIGHT_ONLY=1 BUILD_DIR=/path/to/build bash ./run_nof_heartbeat_tcp_e2e.sh
 ```
 
 To run in **NoF-only** mode (do not mount a local memory segment), set:

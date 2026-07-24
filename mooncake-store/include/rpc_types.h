@@ -112,12 +112,16 @@ YLT_REFL(MoveStartResponse, source, target);
 
 enum class JobType {
     DRAIN = 0,
+    REBUILD,
 };
 
 inline std::ostream& operator<<(std::ostream& os, const JobType& type) {
     switch (type) {
         case JobType::DRAIN:
             os << "DRAIN";
+            break;
+        case JobType::REBUILD:
+            os << "REBUILD";
             break;
         default:
             os << "UNKNOWN_JOB_TYPE";
@@ -169,6 +173,43 @@ struct CreateDrainJobRequest {
 };
 YLT_REFL(CreateDrainJobRequest, segments, target_segments, max_concurrency);
 
+struct CreateRebuildJobRequest {
+    std::vector<std::string> device_ids;
+    std::vector<std::string> target_segments;
+    uint32_t max_concurrency{4};
+};
+YLT_REFL(CreateRebuildJobRequest, device_ids, target_segments, max_concurrency);
+
+struct DeviceCleanupRequest {
+    std::string device_id;
+    std::string tenant_id;
+    std::vector<std::string> keys;
+    bool dry_run{false};
+    uint32_t max_keys{0};
+    std::string strategy;
+    double cleanup_low_watermark{0};
+};
+YLT_REFL(DeviceCleanupRequest, device_id, tenant_id, keys, dry_run, max_keys,
+         strategy, cleanup_low_watermark);
+
+struct DeviceCleanupResponse {
+    std::string device_id;
+    std::string strategy;
+    bool dry_run{false};
+    bool reached_low_watermark{false};
+    uint32_t selected_keys{0};
+    uint32_t removed_keys{0};
+    uint64_t reclaimed_bytes{0};
+    uint64_t capacity_used_before{0};
+    uint64_t capacity_used_after{0};
+    std::vector<std::string> removed_key_list;
+    std::vector<std::string> skipped_keys;
+};
+YLT_REFL(DeviceCleanupResponse, device_id, strategy, dry_run,
+         reached_low_watermark, selected_keys, removed_keys, reclaimed_bytes,
+         capacity_used_before, capacity_used_after, removed_key_list,
+         skipped_keys);
+
 struct QueryJobResponse {
     UUID id;
     JobType type;
@@ -176,6 +217,7 @@ struct QueryJobResponse {
     int64_t created_at_ms_epoch;
     int64_t last_updated_at_ms_epoch;
     std::vector<std::string> segments;
+    std::vector<std::string> devices;
     uint64_t succeeded_units;
     uint64_t failed_units;
     uint64_t blocked_units;
@@ -184,8 +226,8 @@ struct QueryJobResponse {
     std::string message;
 };
 YLT_REFL(QueryJobResponse, id, type, status, created_at_ms_epoch,
-         last_updated_at_ms_epoch, segments, succeeded_units, failed_units,
-         blocked_units, active_units, migrated_bytes, message);
+         last_updated_at_ms_epoch, segments, devices, succeeded_units,
+         failed_units, blocked_units, active_units, migrated_bytes, message);
 
 /**
  * @brief Response structure for QueryTask operation

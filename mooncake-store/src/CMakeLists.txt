@@ -14,6 +14,18 @@ set(MOONCAKE_STORE_SOURCES
     mmap_arena.cpp
     master_metric_manager.cpp
     storage_backend.cpp
+    storage_device_maintenance.cpp
+    storage_device_view.cpp
+    nvme_kv_backend.cpp
+    nvme_kv_connector.cpp
+    nvme_kv_executor_stub.cpp
+    nvme_kv_executor_io_uring.cpp
+    nvme_kv_executor_ioctl.cpp
+    nvme_kv_executor_libnvme.cpp
+    nvme_kv_executor_util.cpp
+    nvme_kv_key_codec.cpp
+    nvme_kv_key_conflict_policy.cpp
+    nvme_kv_object_layout.cpp
     thread_pool.cpp
     etcd_helper.cpp
     segment.cpp
@@ -166,10 +178,40 @@ endif()
 find_library(URING_LIB uring PATHS /usr/lib /usr/lib64 /usr/local/lib
                                    /usr/local/lib64)
 find_path(URING_INCLUDE liburing.h PATHS /usr/include /usr/local/include)
+set(MOONCAKE_HAVE_NVME_URING_CMD OFF)
 if(URING_LIB AND URING_INCLUDE)
   message(STATUS "io_uring: Enabled for mooncake_store")
   list(APPEND MOONCAKE_STORE_SOURCES uring_file.cpp)
   list(APPEND EXTRA_LIBS ${URING_LIB})
+
+  include(CheckCXXSourceCompiles)
+  set(CMAKE_REQUIRED_INCLUDES_SAVE ${CMAKE_REQUIRED_INCLUDES})
+  set(CMAKE_REQUIRED_INCLUDES ${URING_INCLUDE})
+  check_cxx_source_compiles(
+    "
+#include <liburing.h>
+#include <linux/nvme_ioctl.h>
+int main() {
+    struct nvme_uring_cmd cmd{};
+    io_uring_sqe sqe{};
+    sqe.cmd_op = NVME_URING_CMD_IO;
+    (void)sqe.cmd;
+    io_uring_cqe cqe{};
+    (void)cqe.big_cqe;
+    unsigned flags = IORING_OP_URING_CMD | IORING_SETUP_CQE32;
+    return static_cast<int>(flags) + cmd.opcode;
+}
+"
+    MOONCAKE_NVME_URING_CMD_COMPILES)
+  if(MOONCAKE_NVME_URING_CMD_COMPILES)
+    set(MOONCAKE_HAVE_NVME_URING_CMD ON)
+  endif()
+  set(CMAKE_REQUIRED_INCLUDES ${CMAKE_REQUIRED_INCLUDES_SAVE})
+  if(MOONCAKE_HAVE_NVME_URING_CMD)
+    message(STATUS "io_uring: NVMe uring command support enabled")
+  else()
+    message(STATUS "io_uring: NVMe uring command support unavailable, NVMe KV io_uring executor disabled")
+  endif()
 else()
   message(STATUS "io_uring: Disabled (liburing not found)")
 endif()
@@ -207,6 +249,12 @@ if(USE_NOF)
       "/usr/local/lib"
       CACHE PATH "DPDK static library directory")
 
+  find_library(SPDK_ISAL_LIBRARY
+               NAMES isal
+               PATHS ${SPDK_LIB_DIR} /usr/local/lib
+                     ${CMAKE_SOURCE_DIR}/extern/spdk/isa-l/.libs
+               NO_DEFAULT_PATH)
+
   set(SPDK_STATIC_LIBS
       -Wl,--whole-archive
       ${SPDK_LIB_DIR}/libspdk_event.a
@@ -220,6 +268,7 @@ if(USE_NOF)
       ${SPDK_LIB_DIR}/libspdk_env_dpdk.a
       ${SPDK_LIB_DIR}/libspdk_log.a
       ${SPDK_LIB_DIR}/libspdk_util.a
+      ${SPDK_ISAL_LIBRARY}
       ${SPDK_LIB_DIR}/libspdk_blob.a
       ${SPDK_LIB_DIR}/libspdk_blobfs.a
       ${SPDK_LIB_DIR}/libspdk_bdev.a
@@ -278,7 +327,17 @@ if(USE_NOF)
   target_include_directories(mooncake_store PRIVATE ${SPDK_INCLUDE_DIR}
                                                     ${DPDK_INCLUDE_DIR})
 endif()
-target_link_libraries(mooncake_store PUBLIC ${XXHASH_LIBRARY})
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBNVME libnvme)
+if(LIBNVME_FOUND)
+  target_compile_definitions(mooncake_store PRIVATE MOONCAKE_HAVE_LIBNVME=1)
+  target_include_directories(mooncake_store PRIVATE ${LIBNVME_INCLUDE_DIRS})
+  target_link_libraries(mooncake_store PUBLIC ${XXHASH_LIBRARY} ${LIBNVME_LIBRARIES})
+  target_link_directories(mooncake_store PUBLIC ${LIBNVME_LIBRARY_DIRS})
+else()
+  message(STATUS "libnvme not found, libnvme NVMe KV executor disabled")
+  target_link_libraries(mooncake_store PUBLIC ${XXHASH_LIBRARY})
+endif()
 if(STORE_USE_REDIS)
   target_include_directories(mooncake_store
                              PRIVATE ${MOONCAKE_STORE_HIREDIS_INCLUDE_DIR})
@@ -307,6 +366,9 @@ endif()
 if(URING_LIB AND URING_INCLUDE)
   target_compile_definitions(mooncake_store PUBLIC USE_URING)
   target_include_directories(mooncake_store PRIVATE ${URING_INCLUDE})
+  if(MOONCAKE_HAVE_NVME_URING_CMD)
+    target_compile_definitions(mooncake_store PRIVATE MOONCAKE_HAVE_NVME_URING_CMD=1)
+  endif()
 endif()
 
 if(BUILD_SHARED_LIBS)

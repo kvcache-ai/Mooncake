@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <functional>
+#include <optional>
 #include <string_view>
 #include <type_traits>
 
@@ -11,6 +12,7 @@
 #include "master_metric_manager.h"
 #include "master_service.h"
 #include "rpc_helper.h"
+#include "storage_device_maintenance.h"
 #include "types.h"
 #include "utils/scoped_vlog_timer.h"
 #include "version.h"
@@ -93,6 +95,11 @@ WrappedMasterService::WrappedMasterService(
 
 WrappedMasterService::~WrappedMasterService() = default;
 
+void WrappedMasterService::SetStorageBackendForAdmin(
+    std::shared_ptr<StorageBackendInterface> storage_backend) {
+    storage_backend_ = std::move(storage_backend);
+}
+
 tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
 WrappedMasterService::CalcCacheStats() {
     return MasterMetricManager::instance().calculate_cache_stats();
@@ -102,14 +109,26 @@ tl::expected<bool, ErrorCode> WrappedMasterService::ExistKey(
     const std::string& key, const std::string& tenant_id) {
     return execute_rpc(
         "ExistKey",
-        [&] {
-            return WithRequestTenant(master_service_.IsTenantQuotaEnabled()
-                                         ? std::string_view(tenant_id)
-                                         : TenantId::kDefaultValue,
-                                     [&](const TenantId& resolved_tenant_id) {
-                                         return master_service_.ExistKey(
-                                             key, resolved_tenant_id);
-                                     });
+        [&]() -> tl::expected<bool, ErrorCode> {
+            return WithRequestTenant(
+                master_service_.IsTenantQuotaEnabled()
+                    ? std::string_view(tenant_id)
+                    : TenantId::kDefaultValue,
+                [&](const TenantId& resolved_tenant_id)
+                    -> tl::expected<bool, ErrorCode> {
+                    auto result =
+                        master_service_.ExistKey(key, resolved_tenant_id);
+                    if (result.has_value() && *result) {
+                        return true;
+                    }
+                    if (storage_backend_) {
+                        auto backend_result = storage_backend_->IsExist(key);
+                        if (backend_result.has_value() && *backend_result) {
+                            return true;
+                        }
+                    }
+                    return result;
+                });
         },
         [&](auto& timer) { timer.LogRequest("key=", key); },
         [] { MasterMetricManager::instance().inc_exist_key_requests(); },
@@ -129,6 +148,25 @@ std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchExistKey(
         keys.size(), [&](const TenantId& resolved_tenant_id) {
             return master_service_.BatchExistKey(keys, resolved_tenant_id);
         });
+
+    if (storage_backend_) {
+        std::vector<std::string> miss_keys;
+        std::vector<size_t> miss_indices;
+        for (size_t i = 0; i < result.size(); ++i) {
+            if (result[i].has_value() && !*result[i]) {
+                miss_keys.push_back(keys[i]);
+                miss_indices.push_back(i);
+            }
+        }
+        if (!miss_keys.empty()) {
+            auto backend_results = storage_backend_->BatchIsExist(miss_keys);
+            for (size_t j = 0; j < backend_results.size(); ++j) {
+                if (backend_results[j].has_value() && *backend_results[j]) {
+                    result[miss_indices[j]] = true;
+                }
+            }
+        }
+    }
 
     size_t failure_count = 0;
     for (size_t i = 0; i < result.size(); ++i) {
@@ -1462,9 +1500,180 @@ WrappedMasterService::GetSegmentsDetailForAdmin() {
     return master_service_.GetSegmentsDetail();
 }
 
+StorageDeviceView WrappedMasterService::StorageDeviceViewForAdmin() const {
+    return StorageDeviceView(storage_backend_);
+}
+
+tl::expected<std::vector<StorageDeviceMetadata>, ErrorCode>
+WrappedMasterService::GetDeviceMetadataForAdmin() {
+    auto metadata = master_service_.ListNoFDeviceMetadata();
+    if (!metadata.has_value()) {
+        return metadata;
+    }
+    auto storage_metadata = StorageDeviceViewForAdmin().ListDeviceMetadata();
+    metadata->insert(metadata->end(), storage_metadata.begin(),
+                     storage_metadata.end());
+    return metadata;
+}
+
+tl::expected<StorageDeviceMetadata, ErrorCode>
+WrappedMasterService::UpdateDeviceMetadataForAdmin(
+    const StorageDeviceMetadataUpdate& update) {
+    if (StorageDeviceViewForAdmin().FindDeviceMetadata(
+            update.identity.device_id)) {
+        return storage_backend_->ApplyStorageDeviceMetadataUpdate(update);
+    }
+    return master_service_.UpdateNoFDeviceMetadata(update);
+}
+
+tl::expected<StorageDeviceMetadata, ErrorCode>
+WrappedMasterService::RecoverDeviceForAdmin(
+    const UUID& device_id, const std::string& action,
+    const StorageDeviceMetadataUpdate& nof_update,
+    std::string* out_rebuild_job_id) {
+    if (StorageDeviceViewForAdmin().FindDeviceMetadata(device_id)) {
+        if (action == "start") {
+            return storage_backend_->StartStorageDeviceRecovery(device_id);
+        }
+        if (action == "complete") {
+            return storage_backend_->CompleteStorageDeviceRecovery(device_id);
+        }
+        if (action == "fail") {
+            return storage_backend_->FailStorageDeviceRecovery(device_id);
+        }
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    if (action == "start") {
+        auto update_result =
+            master_service_.UpdateNoFDeviceMetadata(nof_update);
+        if (!update_result.has_value()) {
+            return update_result;
+        }
+        CreateRebuildJobRequest rebuild_request;
+        rebuild_request.device_ids.push_back(UuidToString(device_id));
+        auto job_id = master_service_.CreateRebuildJob(rebuild_request);
+        if (!job_id.has_value()) {
+            StorageDeviceMetadataUpdate rollback;
+            rollback.identity.device_id = device_id;
+            rollback.health = StorageDeviceHealth::FAILED;
+            rollback.writable = false;
+            rollback.schedulable = false;
+            rollback.last_error = "rebuild_job_creation_failed";
+            (void)master_service_.UpdateNoFDeviceMetadata(rollback);
+            return tl::make_unexpected(job_id.error());
+        }
+        if (out_rebuild_job_id) {
+            *out_rebuild_job_id = UuidToString(*job_id);
+        }
+        return update_result;
+    }
+
+    if (action == "complete") {
+        auto rebuild_job = FindActiveRebuildJobForDevice(device_id);
+        if (rebuild_job.has_value()) {
+            auto query = master_service_.QueryMigrationJob(*rebuild_job);
+            if (query.has_value() && query->status != JobStatus::SUCCEEDED) {
+                return tl::make_unexpected(
+                    ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+            }
+        } else {
+            auto current = master_service_.ListNoFDeviceMetadata();
+            if (current.has_value()) {
+                for (const auto& dev : *current) {
+                    if (dev.identity.device_id == device_id &&
+                        dev.health == StorageDeviceHealth::REBUILDING) {
+                        return tl::make_unexpected(
+                            ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+                    }
+                }
+            }
+        }
+        return master_service_.UpdateNoFDeviceMetadata(nof_update);
+    }
+
+    if (action == "fail") {
+        auto rebuild_job = FindActiveRebuildJobForDevice(device_id);
+        if (rebuild_job.has_value()) {
+            (void)master_service_.CancelMigrationJob(*rebuild_job);
+        }
+        return master_service_.UpdateNoFDeviceMetadata(nof_update);
+    }
+
+    return master_service_.UpdateNoFDeviceMetadata(nof_update);
+}
+
+tl::expected<StorageDeviceMetadata, ErrorCode>
+WrappedMasterService::ProbeDeviceForAdmin(
+    const UUID& device_id, const std::string& action, const std::string& reason,
+    const StorageDeviceMetadataUpdate& nof_update) {
+    if (StorageDeviceViewForAdmin().FindDeviceMetadata(device_id)) {
+        if (action == "run") {
+            return storage_backend_->ProbeStorageDevice(device_id);
+        }
+        if (action == "success") {
+            return storage_backend_->RecordStorageDeviceProbeSuccess(device_id);
+        }
+        if (action == "fail") {
+            return storage_backend_->RecordStorageDeviceProbeFailure(device_id,
+                                                                     reason);
+        }
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (action == "run") {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+    return master_service_.UpdateNoFDeviceMetadata(nof_update);
+}
+
+tl::expected<StorageDeviceMaintenancePlan, ErrorCode>
+WrappedMasterService::GetDeviceMaintenancePlanForAdmin() {
+    auto plan = master_service_.BuildNoFDeviceMaintenancePlan();
+    if (!plan.has_value()) {
+        return plan;
+    }
+    StorageDeviceViewForAdmin().AppendMaintenanceCandidates(*plan);
+    return plan;
+}
+
+size_t WrappedMasterService::ProbeStorageBackendDevicesForAdmin() {
+    if (!storage_backend_) {
+        return 0;
+    }
+    size_t probed = 0;
+    for (const auto& metadata :
+         StorageDeviceViewForAdmin().ListDeviceMetadata()) {
+        storage_backend_->ProbeStorageDevice(metadata.identity.device_id);
+        ++probed;
+    }
+    return probed;
+}
+
+tl::expected<DeviceCleanupResponse, ErrorCode>
+WrappedMasterService::CleanupDeviceForAdmin(
+    const DeviceCleanupRequest& request) {
+    return master_service_.CleanupDevice(request, storage_backend_);
+}
+
 tl::expected<std::pair<uint64_t, uint64_t>, ErrorCode>
 WrappedMasterService::QuerySegmentForAdmin(const std::string& segment) {
     return master_service_.QuerySegments(segment);
+}
+
+void WrappedMasterService::TryAutoCleanupDevices() {
+    if (!storage_backend_) return;
+    for (const auto& dev : StorageDeviceViewForAdmin().ListDeviceMetadata()) {
+        if (dev.capacity_total <= 0) continue;
+        const double usage_ratio = static_cast<double>(dev.capacity_used) /
+                                   static_cast<double>(dev.capacity_total);
+        if (usage_ratio >= cleanup_high_watermark_) {
+            DeviceCleanupRequest req;
+            req.device_id = UuidToString(dev.identity.device_id);
+            req.strategy = "lru";
+            req.cleanup_low_watermark = cleanup_low_watermark_;
+            (void)master_service_.CleanupDevice(req, storage_backend_);
+        }
+    }
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::MountLocalDiskSegment(
@@ -1495,8 +1704,10 @@ tl::expected<void, ErrorCode> WrappedMasterService::ReportSsdCapacity(
     ScopedVLogTimer timer(1, "ReportSsdCapacity");
     timer.LogRequest("client_id=", client_id,
                      ", ssd_total_capacity_bytes=", ssd_total_capacity_bytes);
-    return master_service_.ReportSsdCapacity(client_id,
-                                             ssd_total_capacity_bytes);
+    auto result =
+        master_service_.ReportSsdCapacity(client_id, ssd_total_capacity_bytes);
+    TryAutoCleanupDevices();
+    return result;
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::NotifyOffloadSuccess(
@@ -1521,6 +1732,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::NotifyOffloadSuccess(
     auto result =
         master_service_.NotifyOffloadSuccess(client_id, tasks, metadatas);
     timer.LogResponseExpected(result);
+
+    TryAutoCleanupDevices();
     return result;
 }
 
@@ -1584,14 +1797,19 @@ tl::expected<UUID, ErrorCode> WrappedMasterService::CreateDrainJob(
     return master_service_.CreateDrainJob(request);
 }
 
-tl::expected<QueryJobResponse, ErrorCode> WrappedMasterService::QueryDrainJob(
-    const UUID& job_id) {
-    return master_service_.QueryDrainJob(job_id);
+tl::expected<UUID, ErrorCode> WrappedMasterService::CreateRebuildJob(
+    const CreateRebuildJobRequest& request) {
+    return master_service_.CreateRebuildJob(request);
 }
 
-tl::expected<void, ErrorCode> WrappedMasterService::CancelDrainJob(
+tl::expected<QueryJobResponse, ErrorCode>
+WrappedMasterService::QueryMigrationJob(const UUID& job_id) {
+    return master_service_.QueryMigrationJob(job_id);
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::CancelMigrationJob(
     const UUID& job_id) {
-    return master_service_.CancelDrainJob(job_id);
+    return master_service_.CancelMigrationJob(job_id);
 }
 
 tl::expected<SegmentStatus, ErrorCode> WrappedMasterService::QuerySegmentStatus(

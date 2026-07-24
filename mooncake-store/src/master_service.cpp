@@ -1,4 +1,5 @@
 #include "master_service.h"
+#include "storage_backend.h"
 
 #include <algorithm>
 #include <array>
@@ -1802,6 +1803,74 @@ auto MasterService::GetAllNoFSegments()
 auto MasterService::GetNoFSegmentsByName(const std::string& segment_name)
     -> tl::expected<std::vector<NoFSegmentOwnerInfo>, ErrorCode> {
     return nof_segment_manager_.GetSegmentsByName(segment_name);
+}
+
+auto MasterService::ListNoFDeviceMetadata()
+    -> tl::expected<std::vector<StorageDeviceMetadata>, ErrorCode> {
+    auto devices = nof_segment_manager_.ListDeviceMetadata();
+    std::lock_guard<std::mutex> lock(job_mutex_);
+    for (auto& device : devices) {
+        for (const auto& [job_id, job] : migration_jobs_) {
+            std::lock_guard<std::mutex> job_lock(job->mutex);
+            if (job->type != JobType::REBUILD ||
+                job->status == JobStatus::SUCCEEDED ||
+                job->status == JobStatus::FAILED ||
+                job->status == JobStatus::CANCELED) {
+                continue;
+            }
+            const auto device_id_str = UuidToString(device.identity.device_id);
+            bool matches = false;
+            for (const auto& did : job->rebuild_request.device_ids) {
+                if (did == device_id_str) {
+                    matches = true;
+                    break;
+                }
+            }
+            if (!matches) {
+                continue;
+            }
+            auto total = job->succeeded_units + job->failed_units +
+                         job->blocked_units + job->active_tasks.size();
+            std::string rebuild_meta;
+            rebuild_meta += "rebuild_job_id=" + UuidToString(job_id);
+            rebuild_meta += ",rebuild_total_units=" + std::to_string(total);
+            rebuild_meta += ",rebuild_succeeded_units=" +
+                            std::to_string(job->succeeded_units);
+            rebuild_meta +=
+                ",rebuild_failed_units=" + std::to_string(job->failed_units);
+            rebuild_meta += ",rebuild_migrated_bytes=" +
+                            std::to_string(job->migrated_bytes);
+            if (device.opaque_provider_metadata.empty()) {
+                device.opaque_provider_metadata = rebuild_meta;
+            } else {
+                device.opaque_provider_metadata += "," + rebuild_meta;
+            }
+            break;
+        }
+    }
+    return devices;
+}
+
+auto MasterService::UpdateNoFDeviceMetadata(
+    const StorageDeviceMetadataUpdate& update)
+    -> tl::expected<StorageDeviceMetadata, ErrorCode> {
+    auto err = nof_segment_manager_.ApplyMetadataUpdate(update);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+
+    auto devices = nof_segment_manager_.ListDeviceMetadata();
+    for (auto& device : devices) {
+        if (device.identity.device_id == update.identity.device_id) {
+            return device;
+        }
+    }
+    return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+}
+
+auto MasterService::BuildNoFDeviceMaintenancePlan()
+    -> tl::expected<StorageDeviceMaintenancePlan, ErrorCode> {
+    return nof_segment_manager_.BuildMaintenancePlan();
 }
 
 auto MasterService::GetSegmentsDetail()
@@ -7268,6 +7337,8 @@ void MasterService::NofHeartbeatThreadFunc() {
 
         if (probe_success) {
             MasterMetricManager::instance().inc_nof_heartbeat_success_total();
+            nof_segment_manager_.RecordDeviceProbeSuccess(
+                probe_target->segment_id);
             auto success_time = std::chrono::steady_clock::now();
             {
                 std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
@@ -7292,6 +7363,9 @@ void MasterService::NofHeartbeatThreadFunc() {
         if (error_reason == "completion_timeout") {
             MasterMetricManager::instance().inc_nof_heartbeat_timeout_total();
         }
+
+        nof_segment_manager_.RecordDeviceProbeFailure(probe_target->segment_id,
+                                                      error_reason);
 
         bool should_unmount = false;
         uint32_t failure_count = 0;
@@ -8142,9 +8216,10 @@ tl::expected<UUID, ErrorCode> MasterService::CreateDrainJob(
         }
     }
 
-    auto job = std::make_shared<DrainJob>();
+    auto job = std::make_shared<MigrationJob>();
     job->id = generate_uuid();
-    job->request = request;
+    job->type = JobType::DRAIN;
+    job->drain_request = request;
     job->created_at = std::chrono::system_clock::now();
     job->last_updated_at = job->created_at;
     job->status = JobStatus::CREATED;
@@ -8152,54 +8227,118 @@ tl::expected<UUID, ErrorCode> MasterService::CreateDrainJob(
 
     {
         std::lock_guard<std::mutex> lock(job_mutex_);
-        drain_jobs_.emplace(job->id, job);
+        migration_jobs_.emplace(job->id, job);
     }
 
     return job->id;
 }
 
-tl::expected<QueryJobResponse, ErrorCode> MasterService::QueryDrainJob(
-    const UUID& job_id) {
-    std::shared_ptr<DrainJob> job;
+tl::expected<UUID, ErrorCode> MasterService::CreateRebuildJob(
+    const CreateRebuildJobRequest& request) {
+    if (request.device_ids.empty()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    std::unordered_set<std::string> device_segment_names;
+    for (const auto& device_id_str : request.device_ids) {
+        UUID device_id;
+        if (!StringToUuid(device_id_str, device_id)) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        auto segment_name =
+            nof_segment_manager_.GetSegmentNameByDeviceId(device_id);
+        if (!segment_name.has_value()) {
+            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        }
+        device_segment_names.insert(*segment_name);
+    }
+
+    auto job = std::make_shared<MigrationJob>();
+    job->id = generate_uuid();
+    job->type = JobType::REBUILD;
+    job->rebuild_request = request;
+    job->device_segment_names = std::move(device_segment_names);
+    job->created_at = std::chrono::system_clock::now();
+    job->last_updated_at = job->created_at;
+    job->status = JobStatus::CREATED;
+    job->message = "Rebuild job created";
+
     {
         std::lock_guard<std::mutex> lock(job_mutex_);
-        auto it = drain_jobs_.find(job_id);
-        if (it == drain_jobs_.end()) {
+        for (const auto& device_id_str : request.device_ids) {
+            for (const auto& [_, existing_job] : migration_jobs_) {
+                std::lock_guard<std::mutex> jl(existing_job->mutex);
+                if (existing_job->type != JobType::REBUILD ||
+                    existing_job->status == JobStatus::SUCCEEDED ||
+                    existing_job->status == JobStatus::FAILED ||
+                    existing_job->status == JobStatus::CANCELED) {
+                    continue;
+                }
+                for (const auto& existing_did :
+                     existing_job->rebuild_request.device_ids) {
+                    if (existing_did == device_id_str) {
+                        return tl::make_unexpected(
+                            ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+                    }
+                }
+            }
+        }
+        migration_jobs_.emplace(job->id, job);
+    }
+
+    return job->id;
+}
+
+QueryJobResponse MasterService::BuildQueryJobResponse(
+    const MigrationJob& job) const {
+    QueryJobResponse response;
+    response.id = job.id;
+    response.type = job.type;
+    response.status = job.status;
+    response.created_at_ms_epoch = static_cast<int64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            job.created_at.time_since_epoch())
+            .count());
+    response.last_updated_at_ms_epoch = static_cast<int64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            job.last_updated_at.time_since_epoch())
+            .count());
+    if (job.type == JobType::DRAIN) {
+        response.segments = job.drain_request.segments;
+    } else {
+        response.devices = job.rebuild_request.device_ids;
+    }
+    response.succeeded_units = job.succeeded_units;
+    response.failed_units = job.failed_units;
+    response.blocked_units = job.blocked_units;
+    response.active_units = static_cast<uint64_t>(job.active_tasks.size());
+    response.migrated_bytes = job.migrated_bytes;
+    response.message = job.message;
+    return response;
+}
+
+tl::expected<QueryJobResponse, ErrorCode> MasterService::QueryMigrationJob(
+    const UUID& job_id) {
+    std::shared_ptr<MigrationJob> job;
+    {
+        std::lock_guard<std::mutex> lock(job_mutex_);
+        auto it = migration_jobs_.find(job_id);
+        if (it == migration_jobs_.end()) {
             return tl::make_unexpected(ErrorCode::JOB_NOT_FOUND);
         }
         job = it->second;
     }
-
     std::lock_guard<std::mutex> job_lock(job->mutex);
-    QueryJobResponse response;
-    response.id = job->id;
-    response.type = job->type;
-    response.status = job->status;
-    response.created_at_ms_epoch = static_cast<int64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            job->created_at.time_since_epoch())
-            .count());
-    response.last_updated_at_ms_epoch = static_cast<int64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            job->last_updated_at.time_since_epoch())
-            .count());
-    response.segments = job->request.segments;
-    response.succeeded_units = job->succeeded_units;
-    response.failed_units = job->failed_units;
-    response.blocked_units = job->blocked_units;
-    response.active_units = static_cast<uint64_t>(job->active_tasks.size());
-    response.migrated_bytes = job->migrated_bytes;
-    response.message = job->message;
-    return response;
+    return BuildQueryJobResponse(*job);
 }
 
-tl::expected<void, ErrorCode> MasterService::CancelDrainJob(
+tl::expected<void, ErrorCode> MasterService::CancelMigrationJob(
     const UUID& job_id) {
-    std::shared_ptr<DrainJob> job;
+    std::shared_ptr<MigrationJob> job;
     {
         std::lock_guard<std::mutex> lock(job_mutex_);
-        auto it = drain_jobs_.find(job_id);
-        if (it == drain_jobs_.end()) {
+        auto it = migration_jobs_.find(job_id);
+        if (it == migration_jobs_.end()) {
             return tl::make_unexpected(ErrorCode::JOB_NOT_FOUND);
         }
         job = it->second;
@@ -8214,35 +8353,71 @@ tl::expected<void, ErrorCode> MasterService::CancelDrainJob(
             return tl::make_unexpected(
                 ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
         }
-
         job->status = JobStatus::CANCELED;
         job->last_updated_at = std::chrono::system_clock::now();
-        job->message = "Drain job canceled";
-        segments_to_restore = job->request.segments;
+        job->message =
+            std::string(job->type == JobType::DRAIN ? "Drain" : "Rebuild") +
+            " job canceled";
+        if (job->type == JobType::DRAIN) {
+            segments_to_restore = job->drain_request.segments;
+        }
     }
 
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-    for (const auto& segment_name : segments_to_restore) {
-        SegmentStatus status = SegmentStatus::UNDEFINED;
-        if (segment_access.GetSegmentStatusByName(segment_name, status) ==
-                ErrorCode::OK &&
-            status != SegmentStatus::UNMOUNTING) {
-            (void)segment_access.SetSegmentStatusByName(segment_name,
-                                                        SegmentStatus::OK);
+    if (!segments_to_restore.empty()) {
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
+        for (const auto& segment_name : segments_to_restore) {
+            SegmentStatus status = SegmentStatus::UNDEFINED;
+            if (segment_access.GetSegmentStatusByName(segment_name, status) ==
+                    ErrorCode::OK &&
+                status != SegmentStatus::UNMOUNTING) {
+                (void)segment_access.SetSegmentStatusByName(segment_name,
+                                                            SegmentStatus::OK);
+            }
         }
     }
     return {};
 }
 
-std::string MasterService::MakeDrainUnitKey(
-    const TenantId& tenant_id, const std::string& key,
-    const std::string& source_segment) const {
-    return std::to_string(tenant_id.value().size()) + ":" + tenant_id.value() +
-           ":" + std::to_string(key.size()) + ":" + key + ":" + source_segment;
+std::optional<UUID> MasterService::FindActiveRebuildJobForDevice(
+    const UUID& device_id) {
+    const auto device_id_str = UuidToString(device_id);
+    std::lock_guard<std::mutex> lock(job_mutex_);
+    for (const auto& [job_id, job] : migration_jobs_) {
+        std::lock_guard<std::mutex> job_lock(job->mutex);
+        if (job->type != JobType::REBUILD ||
+            job->status == JobStatus::SUCCEEDED ||
+            job->status == JobStatus::FAILED ||
+            job->status == JobStatus::CANCELED) {
+            continue;
+        }
+        for (const auto& did : job->rebuild_request.device_ids) {
+            if (did == device_id_str) {
+                return job_id;
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+std::string MasterService::MakeMigrationUnitKey(
+    const std::string& prefix, const TenantId& tenant_id,
+    const std::string& key, const std::string& source_segment) const {
+    return prefix + std::to_string(tenant_id.value().size()) + ":" +
+           tenant_id.value() + ":" + std::to_string(key.size()) + ":" + key +
+           ":" + source_segment;
 }
 
 std::optional<std::string> MasterService::SelectDrainTargetForKey(
     const ObjectMetadata& metadata, const std::string& source_segment,
+    const std::vector<std::string>& requested_targets) {
+    return SelectRebuildTargetForKey(metadata, {source_segment},
+                                     requested_targets);
+}
+
+std::optional<std::string> MasterService::SelectRebuildTargetForKey(
+    const ObjectMetadata& metadata,
+    const std::unordered_set<std::string>& excluded_segments,
     const std::vector<std::string>& requested_targets) {
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
     std::vector<std::string> candidate_segments = requested_targets;
@@ -8257,7 +8432,7 @@ std::optional<std::string> MasterService::SelectDrainTargetForKey(
     double best_util = std::numeric_limits<double>::max();
     std::optional<std::string> best_target;
     for (const auto& candidate : candidate_segments) {
-        if (candidate == source_segment) {
+        if (excluded_segments.contains(candidate)) {
             continue;
         }
         if (std::find(existing_segments.begin(), existing_segments.end(),
@@ -8283,7 +8458,7 @@ std::optional<std::string> MasterService::SelectDrainTargetForKey(
     return best_target;
 }
 
-void MasterService::RefreshDrainJobTasks(DrainJob& job) {
+void MasterService::RefreshJobTasks(MigrationJob& job) {
     auto read_access = task_manager_.get_read_access();
     std::vector<UUID> finished_task_ids;
     finished_task_ids.reserve(job.active_tasks.size());
@@ -8309,7 +8484,7 @@ void MasterService::RefreshDrainJobTasks(DrainJob& job) {
             job.failed_units++;
             auto& retry_count = job.retry_counts[active_task.unit_key];
             retry_count++;
-            if (retry_count >= kMaxDrainUnitRetries) {
+            if (retry_count >= kMaxMigrationUnitRetries) {
                 job.terminal_failed_unit_keys.insert(active_task.unit_key);
             }
         }
@@ -8320,19 +8495,26 @@ void MasterService::RefreshDrainJobTasks(DrainJob& job) {
     }
 }
 
-void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
+void MasterService::ScheduleMigrationUnits(MigrationJob& job) {
     if (job.status == JobStatus::CREATED) {
         job.status = JobStatus::PLANNING;
     }
 
     const uint32_t max_concurrency =
-        std::max<uint32_t>(1, job.request.max_concurrency);
+        std::max<uint32_t>(1, job.max_concurrency());
     if (job.active_tasks.size() >= max_concurrency) {
         job.status = JobStatus::RUNNING;
         return;
     }
 
-    struct DrainPlan {
+    const bool is_drain = job.type == JobType::DRAIN;
+    const auto& source_segments =
+        is_drain ? job.drain_request.segments
+                 : std::vector<std::string>(job.device_segment_names.begin(),
+                                            job.device_segment_names.end());
+    const std::string unit_prefix = is_drain ? "drain:" : "rebuild:";
+
+    struct UnitPlan {
         TenantId tenant_id;
         std::string key;
         std::string source_segment;
@@ -8342,7 +8524,7 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
     };
 
     const size_t slots = max_concurrency - job.active_tasks.size();
-    std::vector<DrainPlan> plans;
+    std::vector<UnitPlan> plans;
     plans.reserve(slots);
     std::unordered_set<std::string> active_unit_keys;
     for (const auto& [_, task] : job.active_tasks) {
@@ -8356,21 +8538,34 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
             MetadataShardAccessorRO shard(this, i);
             for (const auto& [tenant_id, tenant_state] : shard->tenants) {
                 for (const auto& [key, metadata] : tenant_state.metadata) {
-                    for (const auto& source_segment : job.request.segments) {
-                        const auto unit_key =
-                            MakeDrainUnitKey(tenant_id, key, source_segment);
+                    const auto replica_segments =
+                        metadata.GetReplicaSegmentNames();
+                    for (const auto& source_segment : source_segments) {
+                        if (std::find(replica_segments.begin(),
+                                      replica_segments.end(), source_segment) ==
+                            replica_segments.end()) {
+                            continue;
+                        }
+
+                        const auto unit_key = MakeMigrationUnitKey(
+                            unit_prefix, tenant_id, key, source_segment);
                         if (job.completed_unit_keys.contains(unit_key) ||
                             active_unit_keys.contains(unit_key) ||
                             job.terminal_failed_unit_keys.contains(unit_key)) {
                             continue;
                         }
 
-                        const auto replica_segments =
-                            metadata.GetReplicaSegmentNames();
-                        if (std::find(replica_segments.begin(),
-                                      replica_segments.end(), source_segment) ==
-                            replica_segments.end()) {
-                            continue;
+                        if (!is_drain) {
+                            size_t healthy_source_count = 0;
+                            for (const auto& seg : replica_segments) {
+                                if (!job.device_segment_names.contains(seg)) {
+                                    healthy_source_count++;
+                                }
+                            }
+                            if (healthy_source_count == 0) {
+                                blocked_unit_keys.insert(unit_key);
+                                continue;
+                            }
                         }
 
                         if (metadata.IsHardPinned() ||
@@ -8381,9 +8576,13 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
                             continue;
                         }
 
-                        auto target = SelectDrainTargetForKey(
-                            metadata, source_segment,
-                            job.request.target_segments);
+                        auto target =
+                            is_drain ? SelectDrainTargetForKey(
+                                           metadata, source_segment,
+                                           job.target_segments())
+                                     : SelectRebuildTargetForKey(
+                                           metadata, job.device_segment_names,
+                                           job.target_segments());
                         if (!target.has_value()) {
                             blocked_unit_keys.insert(unit_key);
                             continue;
@@ -8402,10 +8601,13 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
     job.blocked_units = blocked_unit_keys.size();
 
     for (const auto& plan : plans) {
-        auto task_id = CreateMoveTask(plan.key, plan.tenant_id,
-                                      plan.source_segment, plan.target_segment);
+        auto task_id =
+            is_drain ? CreateMoveTask(plan.key, plan.tenant_id,
+                                      plan.source_segment, plan.target_segment)
+                     : CreateCopyTask(plan.key, plan.tenant_id,
+                                      {plan.target_segment});
         if (task_id.has_value()) {
-            ActiveDrainTask active_task;
+            MigrationTask active_task;
             active_task.task_id = task_id.value();
             active_task.tenant_id = plan.tenant_id;
             active_task.key = plan.key;
@@ -8423,7 +8625,7 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
             job.failed_units++;
             auto& retry_count = job.retry_counts[plan.unit_key];
             retry_count++;
-            if (retry_count >= kMaxDrainUnitRetries) {
+            if (retry_count >= kMaxMigrationUnitRetries) {
                 job.terminal_failed_unit_keys.insert(plan.unit_key);
             }
         }
@@ -8431,13 +8633,20 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
 
     job.status = JobStatus::RUNNING;
     job.last_updated_at = std::chrono::system_clock::now();
-    job.message = "Drain job running";
+    job.message = is_drain ? "Drain job running" : "Rebuild job running";
 }
 
-bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
+bool MasterService::MaybeCompleteMigrationJob(MigrationJob& job) {
     if (!job.active_tasks.empty()) {
         return false;
     }
+
+    const bool is_drain = job.type == JobType::DRAIN;
+    const auto& source_segments =
+        is_drain ? job.drain_request.segments
+                 : std::vector<std::string>(job.device_segment_names.begin(),
+                                            job.device_segment_names.end());
+    const std::string unit_prefix = is_drain ? "drain:" : "rebuild:";
 
     std::unordered_set<std::string> remaining_segments;
     std::unordered_set<std::string> remaining_unit_keys;
@@ -8449,13 +8658,25 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
                 for (const auto& [key, metadata] : tenant_state.metadata) {
                     const auto replica_segments =
                         metadata.GetReplicaSegmentNames();
-                    for (const auto& source_segment : job.request.segments) {
+                    for (const auto& source_segment : source_segments) {
                         if (std::find(replica_segments.begin(),
-                                      replica_segments.end(), source_segment) !=
+                                      replica_segments.end(), source_segment) ==
                             replica_segments.end()) {
+                            continue;
+                        }
+                        if (!is_drain &&
+                            (metadata.IsHardPinned() ||
+                             !metadata.IsLeaseExpired() ||
+                             !metadata.AllReplicas(&Replica::fn_is_completed) ||
+                             tenant_state.replication_tasks.contains(key))) {
+                            continue;
+                        }
+                        const auto unit_key = MakeMigrationUnitKey(
+                            unit_prefix, tenant_id, key, source_segment);
+                        if (is_drain ||
+                            !job.completed_unit_keys.contains(unit_key)) {
                             remaining_segments.insert(source_segment);
-                            remaining_unit_keys.insert(MakeDrainUnitKey(
-                                tenant_id, key, source_segment));
+                            remaining_unit_keys.insert(unit_key);
                         }
                     }
                 }
@@ -8463,10 +8684,10 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
         }
     }
 
-    {
+    if (is_drain) {
         ScopedSegmentAccess segment_access =
             segment_manager_.getSegmentAccess();
-        for (const auto& segment_name : job.request.segments) {
+        for (const auto& segment_name : job.drain_request.segments) {
             if (!remaining_segments.contains(segment_name)) {
                 (void)segment_access.SetSegmentStatusByName(
                     segment_name, SegmentStatus::DRAINED);
@@ -8474,14 +8695,15 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
         }
     }
 
-    if (remaining_segments.empty()) {
+    if (remaining_unit_keys.empty()) {
         job.status = JobStatus::SUCCEEDED;
         job.last_updated_at = std::chrono::system_clock::now();
-        job.message = "Drain job finished successfully";
+        job.message = is_drain ? "Drain job finished successfully"
+                               : "Rebuild job finished successfully";
         return true;
     }
 
-    bool all_remaining_terminal_failed = !remaining_unit_keys.empty();
+    bool all_remaining_terminal_failed = true;
     for (const auto& unit_key : remaining_unit_keys) {
         if (!job.terminal_failed_unit_keys.contains(unit_key)) {
             all_remaining_terminal_failed = false;
@@ -8492,10 +8714,10 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
         return false;
     }
 
-    {
+    if (is_drain) {
         ScopedSegmentAccess segment_access =
             segment_manager_.getSegmentAccess();
-        for (const auto& segment_name : job.request.segments) {
+        for (const auto& segment_name : job.drain_request.segments) {
             SegmentStatus status = SegmentStatus::UNDEFINED;
             if (segment_access.GetSegmentStatusByName(segment_name, status) ==
                     ErrorCode::OK &&
@@ -8508,16 +8730,17 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
 
     job.status = JobStatus::FAILED;
     job.last_updated_at = std::chrono::system_clock::now();
-    job.message = "Drain job failed: unrecoverable units remain";
+    job.message = is_drain ? "Drain job failed: unrecoverable units remain"
+                           : "Rebuild job failed: unrecoverable units remain";
     return true;
 }
 
-void MasterService::ProcessDrainJobs() {
-    std::vector<std::shared_ptr<DrainJob>> jobs;
+void MasterService::ProcessMigrationJobs() {
+    std::vector<std::shared_ptr<MigrationJob>> jobs;
     {
         std::lock_guard<std::mutex> lock(job_mutex_);
-        jobs.reserve(drain_jobs_.size());
-        for (const auto& [_, job] : drain_jobs_) {
+        jobs.reserve(migration_jobs_.size());
+        for (const auto& [_, job] : migration_jobs_) {
             jobs.push_back(job);
         }
     }
@@ -8532,20 +8755,187 @@ void MasterService::ProcessDrainJobs() {
             job->status == JobStatus::CANCELED) {
             continue;
         }
-        RefreshDrainJobTasks(*job);
-        if (MaybeCompleteDrainJob(*job)) {
+        RefreshJobTasks(*job);
+        if (MaybeCompleteMigrationJob(*job)) {
             continue;
         }
-        ScheduleDrainJobTasks(*job);
+        ScheduleMigrationUnits(*job);
     }
 }
 
 void MasterService::JobDispatchThreadFunc() {
     while (job_dispatch_running_) {
-        ProcessDrainJobs();
+        ProcessMigrationJobs();
         std::this_thread::sleep_for(
             std::chrono::milliseconds(kJobDispatchThreadSleepMs));
     }
+}
+
+bool MasterService::CanCleanupKey(
+    const std::string& key, const TenantId& tenant_id, uint64_t* payload_size,
+    std::chrono::system_clock::time_point* rank_time) const {
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    const size_t shard_idx = getShardIndex(tenant_id, key);
+    MetadataShardAccessorRO shard(this, shard_idx);
+    auto tenant_it = shard->tenants.find(tenant_id);
+    if (tenant_it == shard->tenants.end()) return false;
+    const auto& tenant_state = tenant_it->second;
+    auto it = tenant_state.metadata.find(key);
+    if (it == tenant_state.metadata.end() || !it->second.IsValid()) {
+        return false;
+    }
+    const auto& metadata = it->second;
+    if (!metadata.IsLeaseExpired()) return false;
+    if (!metadata.AllReplicas(&Replica::fn_is_completed)) return false;
+    if (tenant_state.processing_keys.contains(key)) return false;
+    if (tenant_state.replication_tasks.contains(key)) return false;
+
+    if (payload_size) *payload_size = metadata.size;
+    if (rank_time) {
+        SpinLocker locker(&metadata.lock);
+        *rank_time = metadata.lease_timeout;
+    }
+    return true;
+}
+
+tl::expected<DeviceCleanupResponse, ErrorCode> MasterService::CleanupDevice(
+    const DeviceCleanupRequest& request,
+    std::shared_ptr<StorageBackendInterface> storage_backend) {
+    if (request.device_id.empty()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    const std::string strategy =
+        request.strategy.empty() ? "manual" : request.strategy;
+    if (strategy != "manual" && strategy != "lru") {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (strategy == "manual" && request.keys.empty()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    TenantId tenant_id = request.tenant_id.empty()
+                             ? TenantId::Default()
+                             : TenantId{request.tenant_id};
+    if (!tenant_id.IsValid()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(cleanup_mutex_);
+        if (!active_cleanups_.insert(request.device_id).second) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+    }
+    struct CleanupGuard {
+        MasterService* svc;
+        std::string device_id;
+        ~CleanupGuard() {
+            std::lock_guard<std::mutex> lock(svc->cleanup_mutex_);
+            svc->active_cleanups_.erase(device_id);
+        }
+    } guard{this, request.device_id};
+
+    auto [used_before, capacity] =
+        storage_backend
+            ? storage_backend->GetDeviceCapacityUsage(request.device_id)
+            : std::pair<int64_t, int64_t>{0, 0};
+
+    DeviceCleanupResponse response;
+    response.device_id = request.device_id;
+    response.strategy = strategy;
+    response.dry_run = request.dry_run;
+    response.capacity_used_before =
+        static_cast<uint64_t>(std::max<int64_t>(used_before, 0));
+    response.capacity_used_after = response.capacity_used_before;
+
+    struct CleanupCandidate {
+        std::string key;
+        uint64_t payload_size;
+        std::chrono::system_clock::time_point rank_time;
+    };
+
+    std::vector<std::string> candidate_keys;
+    if (strategy == "manual") {
+        candidate_keys = request.keys;
+    } else if (storage_backend) {
+        candidate_keys = storage_backend->ListKeysForDevice(request.device_id);
+    }
+
+    std::vector<CleanupCandidate> candidates;
+    candidates.reserve(candidate_keys.size());
+    for (const auto& key : candidate_keys) {
+        uint64_t payload_size = 0;
+        std::chrono::system_clock::time_point rank_time;
+        if (CanCleanupKey(key, tenant_id, &payload_size, &rank_time)) {
+            candidates.push_back({key, payload_size, rank_time});
+        } else {
+            response.skipped_keys.push_back(key);
+        }
+    }
+
+    if (strategy == "lru") {
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const CleanupCandidate& a, const CleanupCandidate& b) {
+                      return a.rank_time < b.rank_time;
+                  });
+    }
+
+    if (request.max_keys > 0 && candidates.size() > request.max_keys) {
+        for (size_t i = request.max_keys; i < candidates.size(); ++i) {
+            response.skipped_keys.push_back(candidates[i].key);
+        }
+        candidates.resize(request.max_keys);
+    }
+
+    response.selected_keys = static_cast<uint32_t>(candidates.size());
+
+    uint64_t target_usage = 0;
+    if (request.cleanup_low_watermark > 0 && capacity > 0) {
+        target_usage = static_cast<uint64_t>(
+            capacity *
+            std::max(0.0, std::min(1.0, request.cleanup_low_watermark)));
+    }
+
+    if (request.dry_run || candidates.empty()) {
+        response.reached_low_watermark =
+            response.capacity_used_after <= target_usage;
+        return response;
+    }
+
+    uint64_t planned_reclaim = 0;
+    std::vector<std::string> keys_to_remove;
+    for (const auto& candidate : candidates) {
+        keys_to_remove.push_back(candidate.key);
+        planned_reclaim += candidate.payload_size;
+        if (target_usage > 0 &&
+            response.capacity_used_before > planned_reclaim &&
+            response.capacity_used_before - planned_reclaim <= target_usage) {
+            break;
+        }
+    }
+
+    auto remove_results = BatchRemove(keys_to_remove, tenant_id, false);
+    for (size_t i = 0; i < keys_to_remove.size() && i < remove_results.size();
+         ++i) {
+        if (!remove_results[i].has_value()) {
+            response.skipped_keys.push_back(keys_to_remove[i]);
+            continue;
+        }
+        response.removed_key_list.push_back(keys_to_remove[i]);
+        if (i < candidates.size()) {
+            response.reclaimed_bytes += candidates[i].payload_size;
+        }
+    }
+
+    response.removed_keys =
+        static_cast<uint32_t>(response.removed_key_list.size());
+    response.capacity_used_after =
+        response.reclaimed_bytes >= response.capacity_used_before
+            ? 0
+            : response.capacity_used_before - response.reclaimed_bytes;
+    response.reached_low_watermark =
+        target_usage == 0 || response.capacity_used_after <= target_usage;
+    return response;
 }
 
 tl::expected<void, SerializationError>

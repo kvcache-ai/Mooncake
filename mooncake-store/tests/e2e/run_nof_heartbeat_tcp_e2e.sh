@@ -26,11 +26,17 @@ CLIENT_LOCAL_BUFFER_SIZE=${CLIENT_LOCAL_BUFFER_SIZE:-33554432}
 CLIENT_MEMORY_REPLICA_NUM=${CLIENT_MEMORY_REPLICA_NUM:-1}
 CLIENT_NOF_REPLICA_NUM=${CLIENT_NOF_REPLICA_NUM:-1}
 PRE_FAULT_SUCCESS_TARGET=${PRE_FAULT_SUCCESS_TARGET:-3}
+PREFLIGHT_ONLY=${PREFLIGHT_ONLY:-0}
 
 TARGET_PID=""
 MASTER_PID=""
 META_PID=""
 CLIENT_PID=""
+
+SPDK_NVMF_TGT=${SPDK_NVMF_TGT:-"$REPO_ROOT/extern/spdk/build/bin/nvmf_tgt"}
+SPDK_RPC=${SPDK_RPC:-"$REPO_ROOT/extern/spdk/scripts/rpc.py"}
+PYTHONPATH_FOR_E2E=${PYTHONPATH_FOR_E2E:-"$BUILD_DIR/mooncake-integration:$BUILD_DIR/mooncake-asio:$BUILD_DIR/mooncake-common:$BUILD_DIR/mooncake-transfer-engine/src:$BUILD_DIR/mooncake-store/src"}
+LD_LIBRARY_PATH_FOR_E2E=${LD_LIBRARY_PATH_FOR_E2E:-"$BUILD_DIR/mooncake-asio:$BUILD_DIR/mooncake-common:$BUILD_DIR/mooncake-transfer-engine/src:$BUILD_DIR/mooncake-store/src:${LD_LIBRARY_PATH:-}"}
 
 cleanup() {
   [[ -n "$CLIENT_PID" ]] && kill "$CLIENT_PID" >/dev/null 2>&1 || true
@@ -61,13 +67,87 @@ count_pattern() {
   grep -c "$pattern" "$file" 2>/dev/null || true
 }
 
+have_free_hugepages() {
+  awk '/HugePages_Free:/ { exit !($2 > 0) }' /proc/meminfo
+}
+
+preflight() {
+  local missing=0
+  local required_files=(
+    "$BUILD_DIR/mooncake-store/src/mooncake_master"
+    "$SPDK_NVMF_TGT"
+    "$SPDK_RPC"
+    "$REPO_ROOT/mooncake-wheel/mooncake/http_metadata_server.py"
+  )
+  for path in "${required_files[@]}"; do
+    if [[ ! -e "$path" ]]; then
+      echo "missing required file: $path"
+      missing=1
+    fi
+  done
+
+  if ! compgen -G "$BUILD_DIR/mooncake-integration/store*.so" >/dev/null; then
+    echo "missing Python store extension under $BUILD_DIR/mooncake-integration"
+    missing=1
+  fi
+
+  if [[ -f "$BUILD_DIR/CMakeCache.txt" ]] &&
+     ! grep -q '^USE_NOF:BOOL=ON$' "$BUILD_DIR/CMakeCache.txt"; then
+    echo "BUILD_DIR is not configured with USE_NOF=ON: $BUILD_DIR"
+    missing=1
+  fi
+
+  if ! PYTHONPATH="$PYTHONPATH_FOR_E2E" LD_LIBRARY_PATH="$LD_LIBRARY_PATH_FOR_E2E" LD_LIBRARY_PATH="$LD_LIBRARY_PATH_FOR_E2E" python3 - <<'PY'
+import importlib
+import sys
+ok = True
+for module in ("aiohttp", "store"):
+    try:
+        importlib.import_module(module)
+    except Exception as exc:
+        print(f"missing or unloadable Python module {module}: {type(exc).__name__}: {exc}")
+        ok = False
+sys.exit(0 if ok else 1)
+PY
+  then
+    missing=1
+  fi
+
+  if ! have_free_hugepages && ! command -v sudo >/dev/null; then
+    echo "hugepages are not available and sudo is not installed"
+    missing=1
+  fi
+  if ! have_free_hugepages && ! sudo -n true >/dev/null 2>&1; then
+    echo "hugepages are not available and passwordless sudo is required"
+    missing=1
+  fi
+
+  if (( missing != 0 )); then
+    echo "NoF heartbeat e2e prerequisites are not satisfied."
+    echo "Hints: configure a USE_NOF build, build SPDK nvmf_tgt, install aiohttp, and provide hugepages."
+    exit 2
+  fi
+}
+
+setup_hugepages() {
+  if have_free_hugepages && mountpoint -q /dev/hugepages; then
+    return
+  fi
+  sudo -n sh -c 'echo 512 > /proc/sys/vm/nr_hugepages'
+  sudo -n umount /dev/hugepages >/dev/null 2>&1 || true
+  sudo -n mkdir -p /dev/hugepages
+  sudo -n mount -t hugetlbfs -o pagesize=2M,mode=1777 none /dev/hugepages
+}
+
 rm -rf "$LOG_DIR"
 mkdir -p "$LOG_DIR"
 
-sudo -n sh -c 'echo 512 > /proc/sys/vm/nr_hugepages'
-sudo -n umount /dev/hugepages >/dev/null 2>&1 || true
-sudo -n mkdir -p /dev/hugepages
-sudo -n mount -t hugetlbfs -o pagesize=2M,mode=1777 none /dev/hugepages
+preflight
+if [[ "$PREFLIGHT_ONLY" == "1" ]]; then
+  echo "NoF heartbeat e2e preflight passed."
+  exit 0
+fi
+setup_hugepages
 grep -E 'HugePages_Total|HugePages_Free|Hugepagesize' /proc/meminfo >"$LOG_DIR/hugepages.log"
 
 pkill -f '/nvmf_tgt' >/dev/null 2>&1 || true
@@ -75,17 +155,17 @@ pkill -f 'mooncake_master' >/dev/null 2>&1 || true
 pkill -f 'http_metadata_server.py' >/dev/null 2>&1 || true
 sleep 1
 
-"$REPO_ROOT/extern/spdk/build/bin/nvmf_tgt" -m 0x1 -u --iova-mode=va --wait-for-rpc >"$LOG_DIR/target.log" 2>&1 &
+"$SPDK_NVMF_TGT" -m 0x1 -u --iova-mode=va --wait-for-rpc >"$LOG_DIR/target.log" 2>&1 &
 TARGET_PID=$!
 sleep 3
 
-python3 "$REPO_ROOT/extern/spdk/scripts/rpc.py" framework_start_init >/dev/null
-python3 "$REPO_ROOT/extern/spdk/scripts/rpc.py" framework_wait_init >/dev/null
-python3 "$REPO_ROOT/extern/spdk/scripts/rpc.py" bdev_malloc_create -b Malloc0 64 4096 >/dev/null
-python3 "$REPO_ROOT/extern/spdk/scripts/rpc.py" nvmf_create_transport -t TCP >/dev/null || true
-python3 "$REPO_ROOT/extern/spdk/scripts/rpc.py" nvmf_create_subsystem "$TARGET_NQN" -a -s SPDK00000000000001 >/dev/null || true
-python3 "$REPO_ROOT/extern/spdk/scripts/rpc.py" nvmf_subsystem_add_ns "$TARGET_NQN" Malloc0 >/dev/null || true
-python3 "$REPO_ROOT/extern/spdk/scripts/rpc.py" nvmf_subsystem_add_listener "$TARGET_NQN" -t tcp -a "$TARGET_HOST" -s "$TARGET_PORT" >/dev/null || true
+python3 "$SPDK_RPC" framework_start_init >/dev/null
+python3 "$SPDK_RPC" framework_wait_init >/dev/null
+python3 "$SPDK_RPC" bdev_malloc_create -b Malloc0 64 4096 >/dev/null
+python3 "$SPDK_RPC" nvmf_create_transport -t TCP >/dev/null || true
+python3 "$SPDK_RPC" nvmf_create_subsystem "$TARGET_NQN" -a -s SPDK00000000000001 >/dev/null || true
+python3 "$SPDK_RPC" nvmf_subsystem_add_ns "$TARGET_NQN" Malloc0 >/dev/null || true
+python3 "$SPDK_RPC" nvmf_subsystem_add_listener "$TARGET_NQN" -t tcp -a "$TARGET_HOST" -s "$TARGET_PORT" >/dev/null || true
 
 python3 "$REPO_ROOT/mooncake-wheel/mooncake/http_metadata_server.py" --host "$METADATA_HOST" --port "$METADATA_PORT" >"$LOG_DIR/metadata.log" 2>&1 &
 META_PID=$!
@@ -102,7 +182,7 @@ sleep 2
 MASTER_PID=$!
 sleep 3
 
-PYTHONPATH="$BUILD_DIR/mooncake-integration" MC_NOF_TRTYPE=TCP python3 - <<PY >"$LOG_DIR/register.log" 2>&1
+PYTHONPATH="$PYTHONPATH_FOR_E2E" LD_LIBRARY_PATH="$LD_LIBRARY_PATH_FOR_E2E" MC_NOF_TRTYPE=TCP python3 - <<PY >"$LOG_DIR/register.log" 2>&1
 import store
 ret = store.MooncakeDistributedNoFRegister().real_register(
     "$TARGET_NQN",
@@ -117,7 +197,7 @@ print(f"register_ret {ret}", flush=True)
 raise SystemExit(0 if ret == 0 else 1)
 PY
 
-PYTHONPATH="$BUILD_DIR/mooncake-integration" python3 "$SCRIPT_DIR/store_client_e2e.py" \
+PYTHONPATH="$PYTHONPATH_FOR_E2E" LD_LIBRARY_PATH="$LD_LIBRARY_PATH_FOR_E2E" python3 "$SCRIPT_DIR/store_client_e2e.py" \
   --local-hostname "127.0.0.1:50071" \
   --metadata-server "$METADATA_SERVER" \
   --master-server "$MASTER_RPC" \

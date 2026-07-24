@@ -1,8 +1,11 @@
 #include "storage_backend.h"
+#include "nvme_kv_backend.h"
+#include "nvme_kv_executor_util.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <cerrno>
 #include <filesystem>
 #include <iostream>
 #include <limits>
@@ -4644,5 +4647,208 @@ TEST_F(StorageBackendTest,
     EXPECT_EQ(LoadOne(recovered, "key_b", value_b.size()),
               std::make_optional(value_b));
 }
+
+TEST_F(StorageBackendTest, NvmeKvPhysicalKeyPackingPreservesAllBytes) {
+    NvmeKvCommandExecutor::PhysicalKey key{};
+    for (size_t i = 0; i < key.size(); ++i) {
+        key[i] = static_cast<uint8_t>(0x10 + i);
+    }
+
+    const auto fields = PackNvmeKvPhysicalKey(key);
+    uint32_t expected_cdw14 = 0;
+    std::memcpy(&expected_cdw14, key.data() + 8, sizeof(expected_cdw14));
+
+    EXPECT_EQ(fields.cdw14, expected_cdw14);
+    EXPECT_EQ(static_cast<uint8_t>(fields.cdw14 >> 24), key[11]);
+}
+
+TEST_F(StorageBackendTest, NvmeKvStatusMappingHandlesKvSpecificStatusCodes) {
+    EXPECT_EQ(MapNvmeKvStatus(0x81, true), ErrorCode::KEYS_ULTRA_LIMIT);
+    EXPECT_EQ(MapNvmeKvStatus(0x85, true), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(MapNvmeKvStatus(0x86, false), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(MapNvmeKvStatus(0x87, false), ErrorCode::OBJECT_NOT_FOUND);
+    EXPECT_EQ(MapNvmeKvStatus(0x89, true), ErrorCode::OBJECT_ALREADY_EXISTS);
+
+    EXPECT_EQ(MapNvmeKvTransportError(ENOENT, false),
+              ErrorCode::OBJECT_NOT_FOUND);
+    EXPECT_EQ(MapNvmeKvTransportError(ENOSPC, true),
+              ErrorCode::KEYS_ULTRA_LIMIT);
+    EXPECT_EQ(MapNvmeKvTransportError(ENOMEM, false),
+              ErrorCode::BUFFER_OVERFLOW);
+    EXPECT_EQ(MapNvmeKvTransportError(0x4087, false),
+              ErrorCode::OBJECT_NOT_FOUND);
+}
+
+TEST_F(StorageBackendTest, NvmeKvStorageDeviceMetadataSnapshotUsesKvProvider) {
+    setenv("MOONCAKE_NVME_KV_DRIVER", "stub", 1);
+
+    FileStorageConfig config;
+    config.storage_filepath = data_path + "/nvme_kv_metadata";
+    config.storage_backend_type = StorageBackendType::kFilePerKey;
+    NvmeKvStorageBackend backend(config);
+    ASSERT_TRUE(backend.Init().has_value());
+
+    auto metadata = backend.ListStorageDeviceMetadata();
+    ASSERT_EQ(metadata.size(), 1u);
+    const auto& device = metadata[0];
+    EXPECT_EQ(device.identity.kind, StorageDeviceKind::NAMESPACE);
+    EXPECT_EQ(device.identity.provider, "nvme_kv");
+    EXPECT_EQ(device.identity.namespace_id, "default");
+    EXPECT_EQ(device.health, StorageDeviceHealth::HEALTHY);
+    EXPECT_TRUE(device.readable);
+    EXPECT_TRUE(device.writable);
+    EXPECT_TRUE(device.schedulable);
+    EXPECT_EQ(device.transport, "stub");
+    EXPECT_NE(device.mount_endpoint.find("nvme_kv_blobs/default"),
+              std::string::npos);
+    EXPECT_NE(device.opaque_provider_metadata.find("backend_type=stub"),
+              std::string::npos);
+    EXPECT_NE(device.opaque_provider_metadata.find("failure_threshold="),
+              std::string::npos);
+    EXPECT_NE(device.opaque_provider_metadata.find("consecutive_failures="),
+              std::string::npos);
+
+    ASSERT_TRUE(backend.SetDeviceEnabled("default", false));
+    metadata = backend.ListStorageDeviceMetadata();
+    ASSERT_EQ(metadata.size(), 1u);
+    EXPECT_EQ(metadata[0].health, StorageDeviceHealth::DISABLED);
+    EXPECT_FALSE(metadata[0].writable);
+    EXPECT_FALSE(metadata[0].schedulable);
+
+    unsetenv("MOONCAKE_NVME_KV_DRIVER");
+}
+
+TEST_F(StorageBackendTest, NvmeKvStorageDeviceMetadataUpdateRoutesToDevice) {
+    setenv("MOONCAKE_NVME_KV_DRIVER", "stub", 1);
+
+    FileStorageConfig config;
+    config.storage_filepath = data_path + "/nvme_kv_metadata_update";
+    config.storage_backend_type = StorageBackendType::kFilePerKey;
+    NvmeKvStorageBackend backend(config);
+    ASSERT_TRUE(backend.Init().has_value());
+
+    auto metadata = backend.ListStorageDeviceMetadata();
+    ASSERT_EQ(metadata.size(), 1u);
+    StorageDeviceMetadataUpdate update;
+    update.identity.device_id = metadata[0].identity.device_id;
+    update.health = StorageDeviceHealth::DISABLED;
+    auto disabled = backend.ApplyStorageDeviceMetadataUpdate(update);
+    ASSERT_TRUE(disabled.has_value());
+    EXPECT_EQ(disabled->identity.provider, "nvme_kv");
+    EXPECT_EQ(disabled->health, StorageDeviceHealth::DISABLED);
+    EXPECT_FALSE(disabled->writable);
+    EXPECT_FALSE(disabled->schedulable);
+
+    update.health = StorageDeviceHealth::HEALTHY;
+    auto enabled = backend.ApplyStorageDeviceMetadataUpdate(update);
+    ASSERT_TRUE(enabled.has_value());
+    EXPECT_EQ(enabled->health, StorageDeviceHealth::HEALTHY);
+    EXPECT_TRUE(enabled->writable);
+    EXPECT_TRUE(enabled->schedulable);
+
+    unsetenv("MOONCAKE_NVME_KV_DRIVER");
+}
+
+TEST_F(StorageBackendTest, NvmeKvStorageDeviceRecoveryHooksUseRefresh) {
+    setenv("MOONCAKE_NVME_KV_DRIVER", "stub", 1);
+
+    FileStorageConfig config;
+    config.storage_filepath = data_path + "/nvme_kv_metadata_recovery";
+    config.storage_backend_type = StorageBackendType::kFilePerKey;
+    NvmeKvStorageBackend backend(config);
+    ASSERT_TRUE(backend.Init().has_value());
+
+    auto metadata = backend.ListStorageDeviceMetadata();
+    ASSERT_EQ(metadata.size(), 1u);
+    const auto device_id = metadata[0].identity.device_id;
+
+    auto recovery_start = backend.StartStorageDeviceRecovery(device_id);
+    ASSERT_TRUE(recovery_start.has_value());
+    EXPECT_EQ(recovery_start->health, StorageDeviceHealth::FAILED);
+    EXPECT_FALSE(recovery_start->writable);
+    EXPECT_FALSE(recovery_start->schedulable);
+    EXPECT_EQ(recovery_start->last_error, "recovery_in_progress");
+
+    auto recovery_complete = backend.CompleteStorageDeviceRecovery(device_id);
+    ASSERT_TRUE(recovery_complete.has_value());
+    EXPECT_EQ(recovery_complete->health, StorageDeviceHealth::HEALTHY);
+    EXPECT_TRUE(recovery_complete->writable);
+    EXPECT_TRUE(recovery_complete->schedulable);
+
+    auto recovery_fail = backend.FailStorageDeviceRecovery(device_id);
+    ASSERT_TRUE(recovery_fail.has_value());
+    EXPECT_EQ(recovery_fail->health, StorageDeviceHealth::FAILED);
+    EXPECT_FALSE(recovery_fail->writable);
+    EXPECT_FALSE(recovery_fail->schedulable);
+    EXPECT_EQ(recovery_fail->last_error, "recovery_failed");
+
+    StorageDeviceMetadataUpdate disable_update;
+    disable_update.identity.device_id = device_id;
+    disable_update.health = StorageDeviceHealth::DISABLED;
+    auto disabled = backend.ApplyStorageDeviceMetadataUpdate(disable_update);
+    ASSERT_TRUE(disabled.has_value());
+    EXPECT_EQ(disabled->health, StorageDeviceHealth::DISABLED);
+
+    auto config_disabled_complete =
+        backend.CompleteStorageDeviceRecovery(device_id);
+    ASSERT_TRUE(config_disabled_complete.has_value());
+    EXPECT_EQ(config_disabled_complete->health, StorageDeviceHealth::DISABLED);
+    EXPECT_FALSE(config_disabled_complete->writable);
+    EXPECT_FALSE(config_disabled_complete->schedulable);
+
+    unsetenv("MOONCAKE_NVME_KV_DRIVER");
+}
+
+TEST_F(StorageBackendTest, NvmeKvStorageDeviceProbeHooksTrackHealth) {
+    setenv("MOONCAKE_NVME_KV_DRIVER", "stub", 1);
+
+    FileStorageConfig config;
+    config.storage_filepath = data_path + "/nvme_kv_metadata_probe";
+    config.storage_backend_type = StorageBackendType::kFilePerKey;
+    NvmeKvStorageBackend backend(config);
+    ASSERT_TRUE(backend.Init().has_value());
+
+    auto metadata = backend.ListStorageDeviceMetadata();
+    ASSERT_EQ(metadata.size(), 1u);
+    const auto device_id = metadata[0].identity.device_id;
+
+    auto probe_run = backend.ProbeStorageDevice(device_id);
+    ASSERT_TRUE(probe_run.has_value());
+    EXPECT_EQ(probe_run->health, StorageDeviceHealth::HEALTHY);
+    EXPECT_TRUE(probe_run->writable);
+    EXPECT_TRUE(probe_run->schedulable);
+    EXPECT_TRUE(probe_run->last_error.empty());
+
+    for (int i = 0; i < 2; ++i) {
+        auto degraded =
+            backend.RecordStorageDeviceProbeFailure(device_id, "probe_timeout");
+        ASSERT_TRUE(degraded.has_value());
+        EXPECT_EQ(degraded->health, StorageDeviceHealth::DEGRADED);
+        EXPECT_TRUE(degraded->writable);
+        EXPECT_FALSE(degraded->schedulable);
+        EXPECT_EQ(degraded->last_error, "probe_timeout");
+    }
+
+    auto failed =
+        backend.RecordStorageDeviceProbeFailure(device_id, "probe_timeout");
+    ASSERT_TRUE(failed.has_value());
+    EXPECT_EQ(failed->health, StorageDeviceHealth::FAILED);
+    EXPECT_FALSE(failed->writable);
+    EXPECT_FALSE(failed->schedulable);
+    EXPECT_EQ(failed->consecutive_failures, 3u);
+    EXPECT_EQ(failed->last_error, "probe_timeout");
+
+    auto recovered = backend.RecordStorageDeviceProbeSuccess(device_id);
+    ASSERT_TRUE(recovered.has_value());
+    EXPECT_EQ(recovered->health, StorageDeviceHealth::HEALTHY);
+    EXPECT_TRUE(recovered->writable);
+    EXPECT_TRUE(recovered->schedulable);
+    EXPECT_EQ(recovered->consecutive_failures, 0u);
+    EXPECT_TRUE(recovered->last_error.empty());
+
+    unsetenv("MOONCAKE_NVME_KV_DRIVER");
+}
+
+//-----------------------------------------------------------------------------
 
 }  // namespace mooncake::test
