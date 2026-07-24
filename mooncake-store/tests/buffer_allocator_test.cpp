@@ -210,7 +210,7 @@ TEST_F(BufferAllocatorTest, RestoreOffsetAllocationsValidatesRangesAndOrder) {
                      .has_value());
 }
 
-TEST_F(BufferAllocatorTest, RestoredOffsetHandleReleasesItsExactAddress) {
+TEST_F(BufferAllocatorTest, RestoreOffsetAllocationsReleaseAddressGaps) {
     constexpr uintptr_t kBase = 0x1A0000000ULL;
     constexpr size_t kCapacity = 4096;
     const std::string endpoint = "restore-release";
@@ -219,12 +219,11 @@ TEST_F(BufferAllocatorTest, RestoredOffsetHandleReleasesItsExactAddress) {
     auto restored = RestoreOffsetBufferAllocator(
         "restore-release", kBase, kCapacity, endpoint, descriptors);
     ASSERT_TRUE(restored.has_value());
+    EXPECT_EQ(restored->allocator->size(), 128);
 
-    restored->buffers[0].reset();
-    auto replacement = restored->allocator->allocate(64);
-    ASSERT_NE(replacement, nullptr);
-    EXPECT_EQ(reinterpret_cast<uintptr_t>(replacement->data()),
-              descriptors[0].buffer_address_);
+    auto gap_buffer = restored->allocator->allocate(64);
+    ASSERT_NE(gap_buffer, nullptr);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(gap_buffer->data()), kBase);
 }
 
 TEST_F(BufferAllocatorTest, RestoreOffsetAllocationsHasNoArbitraryGapLimit) {
