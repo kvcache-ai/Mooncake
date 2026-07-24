@@ -86,8 +86,9 @@ jobs:
     runs-on: ubuntu-22.04-arm
     strategy:
       matrix:
-        # One representative ABI on PRs; post-merge pushes retain both.
-        python-version: ${{ fromJSON(github.event_name == 'pull_request' && '["3.12"]' || '["3.10", "3.12"]') }}
+        # Fork PR jobs start only after approval, so validate both supported
+        # Python ABIs before merge.
+        python-version: ['3.10', '3.12']
     env:
       CI: "true"
       CU13_BUILD: "1"
@@ -182,9 +183,16 @@ jobs:
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
     strategy:
       matrix:
-        # PRs cover both Python and Ubuntu versions diagonally. Post-merge
-        # pushes run the complete OS x Python cross-product.
-        include: ${{ fromJSON(github.event_name == 'pull_request' && '[{"ubuntu-version":"ubuntu-22.04","python-version":"3.10"},{"ubuntu-version":"ubuntu-24.04","python-version":"3.12"}]' || '[{"ubuntu-version":"ubuntu-22.04","python-version":"3.10"},{"ubuntu-version":"ubuntu-22.04","python-version":"3.12"},{"ubuntu-version":"ubuntu-24.04","python-version":"3.10"},{"ubuntu-version":"ubuntu-24.04","python-version":"3.12"}]') }}
+        # Validate the complete OS x Python cross-product after approval.
+        include:
+          - ubuntu-version: ubuntu-22.04
+            python-version: '3.10'
+          - ubuntu-version: ubuntu-22.04
+            python-version: '3.12'
+          - ubuntu-version: ubuntu-24.04
+            python-version: '3.10'
+          - ubuntu-version: ubuntu-24.04
+            python-version: '3.12'
     runs-on: ${{ matrix.ubuntu-version }}
     steps:
     - uses: actions/checkout@v4
@@ -848,9 +856,8 @@ jobs:
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
     uses: ./.github/workflows/ci_cu13.yml
     with:
-      # The integration test consumes Python 3.12. Post-merge pushes also
-      # build Python 3.10 for the complete CUDA 13 matrix.
-      python-versions: ${{ github.event_name == 'pull_request' && '["3.12"]' || '["3.10", "3.12"]' }}
+      # Validate both supported Python ABIs after approval.
+      python-versions: '["3.10", "3.12"]'
     secrets: inherit
 
   build-wheel-efa:
@@ -898,9 +905,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # PRs run the tested CPU configuration. Post-merge pushes add the
-        # CUDA compile-only and metrics-enabled configurations.
-        name: ${{ fromJSON(github.event_name == 'pull_request' && '["cuda-off"]' || '["cuda-on", "cuda-off", "cuda-off-metrics-on"]') }}
+        # Validate all TENT configurations after approval.
+        name: ["cuda-on", "cuda-off", "cuda-off-metrics-on"]
     name: tent-ci (${{ matrix.name }})
     env:
       CI: "true"

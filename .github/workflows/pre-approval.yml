@@ -1,0 +1,49 @@
+name: Pre-approval Checks
+
+# pull_request workflows from forks do not start until a maintainer approves
+# them. Keep these pull_request_target checks read-only and never execute code
+# or scripts from the PR checkout.
+on:
+  pull_request_target:
+    branches:
+      - "main"
+      - "release/**"
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pre-approval-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  diff-hygiene:
+    name: Diff Hygiene (Pre-approval)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out PR head without credentials
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check whitespace errors and conflict markers
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: git diff --check "${BASE_SHA}...${HEAD_SHA}"
+
+  spell-check:
+    name: Spell Check with Typos (Pre-approval)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out PR head without credentials
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Check spelling
+        uses: crate-ci/typos@v1.30.2
