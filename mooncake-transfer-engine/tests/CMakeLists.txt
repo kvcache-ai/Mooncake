@@ -91,6 +91,8 @@ if(USE_TCP)
 
   add_executable(tcp_write_visibility_test
                  ${WORKSPACE}/tcp_write_visibility_test.cpp)
+  target_compile_definitions(tcp_write_visibility_test
+                             PRIVATE MOONCAKE_TCP_TRANSPORT_TEST_HOOKS)
   target_link_libraries(tcp_write_visibility_test PUBLIC transfer_engine gtest
                                                          gtest_main)
   add_test(NAME tcp_write_visibility_test COMMAND tcp_write_visibility_test)
