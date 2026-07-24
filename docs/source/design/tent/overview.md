@@ -73,9 +73,9 @@ TENT extends the classic Mooncake Transfer Engine by moving transport selection,
 
 The design favors predictable behavior and operational simplicity over manual tuning and static configuration.
 
-## TENT C++ API Reference 
+## TENT C++ API Reference
 
-[TENT C++ API Reference](cpp-api.md)
+[TENT C++ API Reference](../../api-reference/cpp/tent.md)
 
 ## TENT Metrics System
 

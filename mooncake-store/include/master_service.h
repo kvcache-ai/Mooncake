@@ -14,9 +14,11 @@
 #include <optional>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 #include <ylt/util/expected.hpp>
 #include <ylt/util/tl/expected.hpp>
@@ -42,10 +44,14 @@ namespace mooncake {
 
 // Forward declaration for MasterSnapshotManager
 class MasterSnapshotManager;
+class MasterSnapshotRepository;
 
 namespace ha {
 class SnapshotCatalogStore;
-}
+class MasterSnapshotCodec;
+struct MasterSnapshotPayloads;
+class MasterSnapshotCodecTest;  // test fixture, needs private state access
+}  // namespace ha
 
 class EtcdOpLogStore;
 
@@ -92,8 +98,11 @@ class MasterService {
     friend class test::PromotionOnHitTest;
     friend class benchmarks::BatchEvictBench;
     friend class test::MasterServiceTenantQuotaTest;
-    friend class MasterSnapshotManager;  // Allow access to internal state for
-                                         // snapshot
+    friend class MasterSnapshotManager;    // Allow access to internal state for
+                                           // snapshot
+    friend class ha::MasterSnapshotCodec;  // Allow codec to access private
+                                           // members
+    friend class ha::MasterSnapshotCodecTest;  // codec round-trip unit test
 
    public:
     using NoFProbeFn =
@@ -109,15 +118,15 @@ class MasterService {
     std::optional<uint32_t> GetNoFHeartbeatFailureCountForTesting(
         const UUID& segment_id);
     std::optional<TenantQuotaSnapshot> GetTenantQuotaSnapshotForTesting(
-        const std::string& tenant_id) const;
+        const TenantId& tenant_id) const;
     bool IsTenantQuotaEnabled() const;
     std::vector<TenantQuotaSnapshot> ListTenantQuotaSnapshots() const;
     std::optional<TenantQuotaSnapshot> GetTenantQuotaSnapshot(
-        const std::string& tenant_id) const;
+        const TenantId& tenant_id) const;
     tl::expected<TenantQuotaSnapshot, ErrorCode> UpsertTenantQuotaPolicy(
-        const std::string& tenant_id, uint64_t requested_quota_bytes);
+        const TenantId& tenant_id, uint64_t requested_quota_bytes);
     tl::expected<std::optional<TenantQuotaSnapshot>, ErrorCode>
-    DeleteTenantQuotaPolicy(const std::string& tenant_id);
+    DeleteTenantQuotaPolicy(const TenantId& tenant_id);
     uint64_t GetTenantQuotaAllocatableCapacityBytes();
 
     /**
@@ -199,17 +208,17 @@ class MasterService {
      * @brief Check if an object exists
      * @return ErrorCode::OK if exists, otherwise return other ErrorCode
      */
-    auto ExistKey(const std::string& key, const std::string& tenant_id)
+    auto ExistKey(const std::string& key, const TenantId& tenant_id)
         -> tl::expected<bool, ErrorCode>;
 
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
-        const std::vector<std::string>& keys, const std::string& tenant_id);
+        const std::vector<std::string>& keys, const TenantId& tenant_id);
 
     /**
      * @brief Fetch all keys for a single tenant.
      * @return ErrorCode::OK if exists
      */
-    auto GetAllKeys(const std::string& tenant_id)
+    auto GetAllKeys(const TenantId& tenant_id)
         -> tl::expected<std::vector<std::string>, ErrorCode>;
 
     /**
@@ -322,7 +331,7 @@ class MasterService {
      * replica descriptors on success, or an ErrorCode on failure.
      */
     auto GetReplicaListByRegex(const std::string& regex_pattern,
-                               const std::string& tenant_id)
+                               const TenantId& tenant_id)
         -> tl::expected<
             std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
             ErrorCode>;
@@ -333,7 +342,7 @@ class MasterService {
      * @return ErrorCode::OK on success, ErrorCode::REPLICA_IS_NOT_READY if not
      * ready
      */
-    auto GetReplicaList(const std::string& key, const std::string& tenant_id)
+    auto GetReplicaList(const std::string& key, const TenantId& tenant_id)
         -> tl::expected<GetReplicaListResponse, ErrorCode>;
 
     /**
@@ -342,7 +351,7 @@ class MasterService {
      * promotion, or update cache-hit metrics.
      */
     auto GetReplicaListForAdmin(const std::string& key,
-                                const std::string& tenant_id)
+                                const TenantId& tenant_id)
         -> tl::expected<GetReplicaListResponse, ErrorCode>;
 
     /**
@@ -350,7 +359,7 @@ class MasterService {
      */
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& keys,
-                        const std::string& tenant_id);
+                        const TenantId& tenant_id);
 
     /**
      * @brief Read-only batch replica list query for admin use.
@@ -359,7 +368,7 @@ class MasterService {
      */
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
-                                const std::string& tenant_id);
+                                const TenantId& tenant_id);
 
     /**
      * @brief Start a put operation for an object
@@ -370,7 +379,7 @@ class MasterService {
      *         ErrorCode::INVALID_PARAMS if slice size is invalid
      */
     auto PutStart(const UUID& client_id, const std::string& key,
-                  const std::string& tenant_id, const uint64_t slice_length,
+                  const TenantId& tenant_id, const uint64_t slice_length,
                   const ReplicateConfig& config)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
@@ -381,14 +390,14 @@ class MasterService {
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
     auto PutEnd(const UUID& client_id, const std::string& key,
-                const std::string& tenant_id, ReplicaType replica_type)
+                const TenantId& tenant_id, ReplicaType replica_type)
         -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Adds a replica instance associated with the given client and key.
      */
     auto AddReplica(const UUID& client_id, const std::string& key,
-                    const std::string& tenant_id, Replica& replica)
+                    const TenantId& tenant_id, Replica& replica)
         -> tl::expected<bool, ErrorCode>;
 
     /**
@@ -398,7 +407,7 @@ class MasterService {
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
     auto PutRevoke(const UUID& client_id, const std::string& key,
-                   const std::string& tenant_id, ReplicaType replica_type)
+                   const TenantId& tenant_id, ReplicaType replica_type)
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -408,8 +417,7 @@ class MasterService {
      */
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
         const UUID& client_id, const std::vector<std::string>& keys,
-        const std::string& tenant_id,
-        ReplicaType replica_type = ReplicaType::ALL);
+        const TenantId& tenant_id, ReplicaType replica_type = ReplicaType::ALL);
 
     /**
      * @brief Revoke a batch of put operations
@@ -418,8 +426,7 @@ class MasterService {
      */
     std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
         const UUID& client_id, const std::vector<std::string>& keys,
-        const std::string& tenant_id,
-        ReplicaType replica_type = ReplicaType::ALL);
+        const TenantId& tenant_id, ReplicaType replica_type = ReplicaType::ALL);
 
     /**
      * @brief Start an upsert operation. If the key does not exist, behaves
@@ -431,7 +438,7 @@ class MasterService {
      * progress), OBJECT_REPLICA_BUSY (replicas have non-zero refcnt).
      */
     auto UpsertStart(const UUID& client_id, const std::string& key,
-                     const std::string& tenant_id, const uint64_t slice_length,
+                     const TenantId& tenant_id, const uint64_t slice_length,
                      const ReplicateConfig& config)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
@@ -439,14 +446,14 @@ class MasterService {
      * @brief Complete an upsert operation. Delegates to PutEnd.
      */
     auto UpsertEnd(const UUID& client_id, const std::string& key,
-                   const std::string& tenant_id, ReplicaType replica_type)
+                   const TenantId& tenant_id, ReplicaType replica_type)
         -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Revoke an upsert operation. Delegates to PutRevoke.
      */
     auto UpsertRevoke(const UUID& client_id, const std::string& key,
-                      const std::string& tenant_id, ReplicaType replica_type)
+                      const TenantId& tenant_id, ReplicaType replica_type)
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -455,7 +462,7 @@ class MasterService {
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
     BatchUpsertStart(const UUID& client_id,
                      const std::vector<std::string>& keys,
-                     const std::string& tenant_id,
+                     const TenantId& tenant_id,
                      const std::vector<uint64_t>& slice_lengths,
                      const ReplicateConfig& config);
 
@@ -464,14 +471,14 @@ class MasterService {
      */
     std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
         const UUID& client_id, const std::vector<std::string>& keys,
-        const std::string& tenant_id);
+        const TenantId& tenant_id);
 
     /**
      * @brief Revoke a batch of upsert operations. Delegates to BatchPutRevoke.
      */
     std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevoke(
         const UUID& client_id, const std::vector<std::string>& keys,
-        const std::string& tenant_id);
+        const TenantId& tenant_id);
 
     /**
      * @brief Evict a disk replica for a key (triggered by client-side disk
@@ -482,8 +489,7 @@ class MasterService {
      * @return ErrorCode::OK on success, OBJECT_NOT_FOUND if key missing
      */
     auto EvictDiskReplica(const UUID& client_id, const std::string& key,
-                          const std::string& tenant_id,
-                          ReplicaType replica_type)
+                          const TenantId& tenant_id, ReplicaType replica_type)
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -495,7 +501,7 @@ class MasterService {
      */
     std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplica(
         const UUID& client_id, const std::vector<std::string>& keys,
-        const std::string& tenant_id, ReplicaType replica_type);
+        const TenantId& tenant_id, ReplicaType replica_type);
 
     /**
      * @brief Start a copy operation
@@ -512,16 +518,16 @@ class MasterService {
      */
     tl::expected<CopyStartResponse, ErrorCode> CopyStart(
         const UUID& client_id, const std::string& key,
-        const std::string& tenant_id, const std::string& src_segment,
+        const TenantId& tenant_id, const std::string& src_segment,
         const std::vector<std::string>& tgt_segments);
 
     tl::expected<void, ErrorCode> CopyEnd(const UUID& client_id,
                                           const std::string& key,
-                                          const std::string& tenant_id);
+                                          const TenantId& tenant_id);
 
     tl::expected<void, ErrorCode> CopyRevoke(const UUID& client_id,
                                              const std::string& key,
-                                             const std::string& tenant_id);
+                                             const TenantId& tenant_id);
 
     /**
      * @brief Start a move operation
@@ -538,17 +544,17 @@ class MasterService {
      */
     tl::expected<MoveStartResponse, ErrorCode> MoveStart(
         const UUID& client_id, const std::string& key,
-        const std::string& tenant_id, const std::string& src_segment,
+        const TenantId& tenant_id, const std::string& src_segment,
         const std::string& tgt_segment);
 
     tl::expected<void, ErrorCode> MoveEnd(const UUID& client_id,
                                           const std::string& key,
-                                          const std::string& tenant_id,
+                                          const TenantId& tenant_id,
                                           bool is_drain = false);
 
     tl::expected<void, ErrorCode> MoveRevoke(const UUID& client_id,
                                              const std::string& key,
-                                             const std::string& tenant_id);
+                                             const TenantId& tenant_id);
 
     /**
      * @brief Remove an object and its replicas
@@ -557,7 +563,7 @@ class MasterService {
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found
      */
-    auto Remove(const std::string& key, const std::string& tenant_id,
+    auto Remove(const std::string& key, const TenantId& tenant_id,
                 bool force = false) -> tl::expected<void, ErrorCode>;
 
     /**
@@ -567,7 +573,7 @@ class MasterService {
      * @return An expected object containing the number of removed objects on
      * success, or an ErrorCode on failure.
      */
-    auto RemoveByRegex(const std::string& str, const std::string& tenant_id,
+    auto RemoveByRegex(const std::string& str, const TenantId& tenant_id,
                        bool force = false) -> tl::expected<long, ErrorCode>;
 
     /**
@@ -583,7 +589,7 @@ class MasterService {
      * @param force If true, skip lease and replication task checks.
      * @return return the number of objects removed
      */
-    long RemoveAll(const std::string& tenant_id, bool force = false);
+    long RemoveAll(const TenantId& tenant_id, bool force = false);
 
     /**
      * @brief Batch remove objects and their replicas
@@ -592,7 +598,7 @@ class MasterService {
      * @return Vector of expected results for each key.
      */
     auto BatchRemove(const std::vector<std::string>& keys,
-                     const std::string& tenant_id, bool force = false)
+                     const TenantId& tenant_id, bool force = false)
         -> std::vector<tl::expected<void, ErrorCode>>;
 
     /**
@@ -680,7 +686,7 @@ class MasterService {
      * arbitrary buffer size from a buggy or malicious caller.
      */
     auto PromotionAllocStart(const UUID& client_id, const std::string& key,
-                             const std::string& tenant_id, uint64_t size,
+                             const TenantId& tenant_id, uint64_t size,
                              const std::vector<std::string>& preferred_segments)
         -> tl::expected<PromotionAllocStartResponse, ErrorCode>;
 
@@ -690,7 +696,7 @@ class MasterService {
      * NotifyOffloadSuccess.
      */
     auto NotifyPromotionSuccess(const UUID& client_id, const std::string& key,
-                                const std::string& tenant_id)
+                                const TenantId& tenant_id)
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -712,7 +718,7 @@ class MasterService {
      * holder's promotion_objects entry.
      */
     auto NotifyPromotionFailure(const UUID& client_id, const std::string& key,
-                                const std::string& tenant_id)
+                                const TenantId& tenant_id)
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -720,7 +726,7 @@ class MasterService {
      * @return Copy task ID on success, ErrorCode on failure
      */
     tl::expected<UUID, ErrorCode> CreateCopyTask(
-        const std::string& key, const std::string& tenant_id,
+        const std::string& key, const TenantId& tenant_id,
         const std::vector<std::string>& targets);
 
     /**
@@ -731,7 +737,7 @@ class MasterService {
      * @return Move task ID on success, ErrorCode on failure
      */
     tl::expected<UUID, ErrorCode> CreateMoveTask(const std::string& key,
-                                                 const std::string& tenant_id,
+                                                 const TenantId& tenant_id,
                                                  const std::string& source,
                                                  const std::string& target,
                                                  bool is_drain = false);
@@ -806,14 +812,19 @@ class MasterService {
 
    private:
     std::unique_ptr<ha::SnapshotCatalogStore> CreateSnapshotCatalogStore();
-    ha::SnapshotCatalogStore* GetSnapshotCatalogStore();
 
     // Restore master state
     void RestoreState();
-    bool TryRestoreStateFromSnapshot(
-        const ha::SnapshotDescriptor& snapshot,
-        const std::chrono::system_clock::time_point& now);
     void ResetStateAfterFailedRestoreAttempt();
+
+    /**
+     * @brief Apply decoded snapshot state to running master service
+     * @param payloads Decoded snapshot payloads
+     * @param now Current time for cleanup logic
+     * @return void on success, SerializationError on failure
+     */
+    tl::expected<void, SerializationError> ApplySnapshotState(
+        const std::chrono::system_clock::time_point& now);
 
     // BatchEvict evicts objects in a near-LRU way, i.e., prioritizes to evict
     // object with smaller lease timeout. It has two passes. The first pass only
@@ -831,7 +842,7 @@ class MasterService {
         uint64_t evicted_objects{0};
     };
     TenantQuotaEvictionResult EvictTenantMemoryForQuota(
-        const std::string& tenant_id, uint64_t target_bytes);
+        const TenantId& tenant_id, uint64_t target_bytes);
 
     // Helper to get a snapshot of alive clients (under client_mutex_ shared
     // lock)
@@ -853,7 +864,7 @@ class MasterService {
 
     // Internal data structures
     struct ObjectIdentity {
-        std::string tenant_id;
+        TenantId tenant_id;
         std::string user_key;
     };
 
@@ -874,7 +885,7 @@ class MasterService {
             size_t value_length, std::vector<Replica>&& reps,
             bool enable_soft_pin, bool enable_hard_pin = false,
             ObjectDataType data_type_ = ObjectDataType::UNKNOWN,
-            std::string group_id_ = "", std::string tenant_id_ = "default",
+            std::string group_id_ = "", TenantId tenant_id_ = TenantId(),
             std::string user_key_ = {})
             : client_id(client_id_),
               put_start_time(put_start_time_),
@@ -907,7 +918,7 @@ class MasterService {
         const size_t size;
         const ObjectDataType data_type{ObjectDataType::UNKNOWN};
         const std::string group_id;
-        const std::string tenant_id;
+        const TenantId tenant_id;
         const std::string user_key;
 
         mutable SpinLock lock;
@@ -1204,6 +1215,36 @@ class MasterService {
     // so it cannot be evicted.
     //
     // alloc_id pins down which staged PROCESSING MEMORY replica
+    enum class PromotionQueueResult {
+        kQueued,
+        kDisabled,
+        kFrequencyRejected,
+        kWatermarkRejected,
+        kQueueCapRejected,
+        kAlreadyInFlight,
+        kMemoryReplicaPresent,
+        kNoLocalDiskSource,
+        kNotFound,
+        kPushFailed,
+    };
+
+    enum class PromotionCandidateReason {
+        kWatermark,
+        kQueueCap,
+        kPushFailed,
+    };
+
+    struct PromotionCandidate {
+        uint8_t sketch_score{0};
+        std::chrono::steady_clock::time_point first_seen;
+        std::chrono::steady_clock::time_point last_seen;
+        std::chrono::steady_clock::time_point retry_after;
+        PromotionCandidateReason last_reason{
+            PromotionCandidateReason::kQueueCap};
+        ErrorCode last_error{ErrorCode::OK};
+        uint32_t retry_count{0};
+    };
+
     // NotifyPromotionSuccess should commit, so a concurrent Put on the
     // same key cannot be confused with ours. 0 until
     // PromotionAllocStart records the new replica.
@@ -1239,6 +1280,8 @@ class MasterService {
             replication_tasks;
         std::unordered_map<std::string, const OffloadingTask> offloading_tasks;
         std::unordered_map<std::string, PromotionTask> promotion_tasks;
+        std::unordered_map<std::string, PromotionCandidate>
+            promotion_candidates;
 
         std::unordered_map<std::string, std::unordered_set<std::string>>
             group_members;  // group_id → set of keys
@@ -1246,14 +1289,16 @@ class MasterService {
         bool Empty() const {
             return metadata.empty() && processing_keys.empty() &&
                    replication_tasks.empty() && offloading_tasks.empty() &&
-                   promotion_tasks.empty() && group_members.empty();
+                   promotion_tasks.empty() && promotion_candidates.empty() &&
+                   group_members.empty();
         }
     };
 
     // Sharded metadata maps and their mutexes
     struct MetadataShard {
         mutable SharedMutex mutex;
-        std::unordered_map<std::string, TenantState> tenants GUARDED_BY(mutex);
+        std::unordered_map<TenantId, TenantState, TenantIdHash> tenants
+            GUARDED_BY(mutex);
         // Count of objects that have at least one completed LOCAL_DISK replica.
         // Used to compute eviction_base = metadata.size() - disk_object_count,
         // excluding disk-only objects from the eviction denominator.
@@ -1278,7 +1323,7 @@ class MasterService {
     static constexpr size_t kNumTenantQuotaShards = 1024;
     struct TenantQuotaShard {
         mutable std::mutex mutex;
-        std::unordered_map<std::string, TenantQuotaState> tenants
+        std::unordered_map<TenantId, TenantQuotaState, TenantIdHash> tenants
             GUARDED_BY(mutex);
     };
     std::array<TenantQuotaShard, kNumTenantQuotaShards> tenant_quota_shards_;
@@ -1295,7 +1340,7 @@ class MasterService {
         std::unique_lock<std::mutex> lock;
     };
 
-    ObjectOperationLock AcquireObjectOperationLock(const std::string& tenant_id,
+    ObjectOperationLock AcquireObjectOperationLock(const TenantId& tenant_id,
                                                    const std::string& key);
 
     std::array<std::mutex, kObjectOperationLockStripes> object_operation_locks_;
@@ -1367,38 +1412,26 @@ class MasterService {
     };
 
     static ObjectIdentity MakeObjectIdentity(const std::string& user_key,
-                                             const std::string& tenant_id) {
-        return {NormalizeTenantId(tenant_id), user_key};
+                                             TenantId tenant_id) {
+        return {std::move(tenant_id), user_key};
     }
-    std::string NormalizeRequestTenantId(const std::string& tenant_id) const;
+    const TenantId& ResolveRequestTenantId(const TenantId& tenant_id) const;
     ObjectIdentity MakeObjectIdentityForRequest(
-        const std::string& user_key, const std::string& tenant_id) const;
-    tl::expected<std::string, ErrorCode> NormalizeTenantIdForWrite(
-        const std::string& tenant_id) const;
-    tl::expected<std::string, ErrorCode> NormalizeTenantIdForWriteLocked(
-        const std::string& tenant_id) const;
-    bool IsTenantRegistered(const std::string& tenant_id) const;
-    bool TenantHasObjects(const std::string& tenant_id) const;
-
-    static std::string MakeTenantScopedKey(const std::string& tenant_id,
-                                           const std::string& key) {
-        const auto normalized_tenant = NormalizeTenantId(tenant_id);
-        std::string scoped_key;
-        scoped_key.reserve(normalized_tenant.size() + key.size() + 1);
-        scoped_key.append(normalized_tenant);
-        scoped_key.push_back('\0');
-        scoped_key.append(key);
-        return scoped_key;
-    }
+        const std::string& user_key, const TenantId& tenant_id) const;
+    tl::expected<TenantId, ErrorCode> ResolveTenantIdForWrite(
+        const TenantId& tenant_id) const;
+    tl::expected<TenantId, ErrorCode> ResolveTenantIdForWriteLocked(
+        const TenantId& tenant_id) const;
+    bool IsTenantRegistered(const TenantId& tenant_id) const;
+    bool TenantHasObjects(const TenantId& tenant_id) const;
 
     // Helper to get shard index from tenant-scoped object identity.
-    size_t getShardIndex(const std::string& tenant_id,
+    size_t getShardIndex(const TenantId& tenant_id,
                          const std::string& user_key) const {
-        const auto normalized_tenant = NormalizeTenantId(tenant_id);
-        if (normalized_tenant == "default") {
+        if (tenant_id.IsDefault()) {
             return std::hash<std::string>{}(user_key) % kNumShards;
         }
-        size_t seed = std::hash<std::string>{}(normalized_tenant);
+        size_t seed = std::hash<std::string>{}(tenant_id.value());
         boost::hash_combine(seed, user_key);
         return seed % kNumShards;
     }
@@ -1408,23 +1441,22 @@ class MasterService {
         return std::hash<std::string>{}(key) % kNumShards;
     }
 
-    size_t getMetadataShardIndex(const std::string& tenant_id,
+    size_t getMetadataShardIndex(const TenantId& tenant_id,
                                  const std::string& key) const;
-    size_t getTenantQuotaShardIndex(const std::string& tenant_id) const;
-    std::optional<std::string> GetGroupRoute(const std::string& tenant_id,
+    size_t getTenantQuotaShardIndex(const TenantId& tenant_id) const;
+    std::optional<std::string> GetGroupRoute(const TenantId& tenant_id,
                                              const std::string& key) const;
     void RegisterGroupMember(TenantState& tenant_state,
-                             const std::string& tenant_id,
-                             const std::string& key,
+                             const TenantId& tenant_id, const std::string& key,
                              const std::string& group_id);
     void UnregisterGroupMember(TenantState& tenant_state,
-                               const std::string& tenant_id,
+                               const TenantId& tenant_id,
                                const std::string& key,
                                const std::string& group_id);
     std::unordered_map<std::string, ObjectMetadata>::iterator EraseMetadata(
         TenantState& tenant_state,
         std::unordered_map<std::string, ObjectMetadata>::iterator it,
-        const std::string& tenant_id);
+        const TenantId& tenant_id);
     void ReleaseLocalDiskUsage(const std::vector<Replica>& replicas);
     enum class QuotaEraseMode {
         kFull,
@@ -1434,27 +1466,25 @@ class MasterService {
     std::unordered_map<std::string, ObjectMetadata>::iterator EraseMetadata(
         TenantState& tenant_state,
         std::unordered_map<std::string, ObjectMetadata>::iterator it,
-        const std::string& tenant_id, QuotaEraseMode quota_mode);
+        const TenantId& tenant_id, QuotaEraseMode quota_mode);
     uint64_t CompletedMemoryQuotaCharge(const ObjectMetadata& metadata) const;
     uint64_t RequestedMemoryQuotaCharge(uint64_t value_length,
                                         const ReplicateConfig& config) const;
     bool ShouldProtectZeroChargeMetadataCreate(
         uint64_t requested_quota_charge) const;
-    uint64_t ComputeTenantQuotaDeficit(const std::string& tenant_id,
+    uint64_t ComputeTenantQuotaDeficit(const TenantId& tenant_id,
                                        uint64_t incoming_quota_charge);
-    tl::expected<void, ErrorCode> ReserveTenantQuota(
-        const std::string& tenant_id, uint64_t bytes);
-    void CommitTenantQuota(const std::string& tenant_id, uint64_t bytes);
-    void AbortTenantQuota(const std::string& tenant_id, uint64_t bytes);
-    void ReleaseTenantQuota(const std::string& tenant_id, uint64_t bytes);
-    void ReleaseTenantQuotaPartial(const std::string& tenant_id,
-                                   uint64_t bytes);
-    void CommitAdditionalTenantQuota(const std::string& tenant_id,
-                                     uint64_t bytes);
-    void AbortReplicationTaskQuota(const std::string& tenant_id,
+    tl::expected<void, ErrorCode> ReserveTenantQuota(const TenantId& tenant_id,
+                                                     uint64_t bytes);
+    void CommitTenantQuota(const TenantId& tenant_id, uint64_t bytes);
+    void AbortTenantQuota(const TenantId& tenant_id, uint64_t bytes);
+    void ReleaseTenantQuota(const TenantId& tenant_id, uint64_t bytes);
+    void ReleaseTenantQuotaPartial(const TenantId& tenant_id, uint64_t bytes);
+    void CommitAdditionalTenantQuota(const TenantId& tenant_id, uint64_t bytes);
+    void AbortReplicationTaskQuota(const TenantId& tenant_id,
                                    const ReplicationTask& task);
-    void IncrementTenantMetadataObjectCount(const std::string& tenant_id);
-    void DecrementTenantMetadataObjectCount(const std::string& tenant_id);
+    void IncrementTenantMetadataObjectCount(const TenantId& tenant_id);
+    void DecrementTenantMetadataObjectCount(const TenantId& tenant_id);
     void ReleaseCommittedQuotaCharge(ObjectMetadata& metadata, uint64_t bytes);
     void RecomputeTenantEffectiveQuotas();
     void RebuildTenantQuotaUsageFromMetadata();
@@ -1465,7 +1495,7 @@ class MasterService {
     std::unordered_map<std::string, ObjectMetadata>::iterator EraseMetadata(
         TenantState& tenant_state,
         std::unordered_map<std::string, ObjectMetadata>::iterator it,
-        const std::string& tenant_id, QuotaEraseMode quota_mode,
+        const TenantId& tenant_id, QuotaEraseMode quota_mode,
         MetadataShardAccessorRW* shard);
     void RebuildGroupRoutingIndex();
     void GrantLeaseForGroup(const TenantState& tenant_state,
@@ -1485,7 +1515,7 @@ class MasterService {
         MetadataShardAccessorRW& shard, const UUID& client_id,
         const std::string& key, uint64_t value_length,
         const ReplicateConfig& config, const std::string& group_id,
-        const std::string& tenant_id,
+        const TenantId& tenant_id,
         const std::chrono::system_clock::time_point& now)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
@@ -1540,14 +1570,32 @@ class MasterService {
      * map. Acquires its own RW shard accessor; safe to call after
      * GetReplicaList's RO accessor has been released.
      */
-    void TryPushPromotionQueue(const ObjectIdentity& object_id);
+    PromotionQueueResult TryPushPromotionQueue(const ObjectIdentity& object_id,
+                                               bool record_candidate = true);
+    void RecordOrUpdateCandidate(TenantState& tenant_state,
+                                 const std::string& key, uint8_t sketch_score,
+                                 PromotionCandidateReason reason,
+                                 ErrorCode last_error);
+    void EraseCandidate(TenantState& tenant_state, const std::string& key);
+    void EraseCandidate(const ObjectIdentity& object_id);
+    void DecrementCandidateCount();
+    void BackoffCandidate(const ObjectIdentity& object_id,
+                          PromotionQueueResult result);
+    void ClearCandidatesForReload();
+    std::chrono::milliseconds CandidateBackoff(uint32_t retry_count) const;
+    bool IsTransientResult(PromotionQueueResult result) const;
+    size_t RunPromotionCandidateRetry(size_t max_shards_to_scan);
+    size_t RunPromotionCandidateRetry();
+    size_t RunPromotionCandidateRetryForTesting();
+    size_t CountCandidatesForTesting(const TenantId& tenant_id);
+    void ResetCandidateBackoffsForTesting();
 
     // Erase any in-flight PromotionTask for `key`, abort any staged promotion
     // quota reservation, and decrement the cluster-wide in-flight counter. Safe
     // no-op if no task exists.
     void ErasePromotionTaskIfPresent(
         TenantState& tenant_state, const std::string& key,
-        const std::string& tenant_id) NO_THREAD_SAFETY_ANALYSIS {
+        const TenantId& tenant_id) NO_THREAD_SAFETY_ANALYSIS {
         auto task_it = tenant_state.promotion_tasks.find(key);
         if (task_it != tenant_state.promotion_tasks.end()) {
             AbortTenantQuota(tenant_id,
@@ -1596,10 +1644,9 @@ class MasterService {
     // Helper class for accessing metadata with automatic locking and cleanup
     class MetadataAccessorRW {
        public:
-        MetadataAccessorRW(MasterService* service,
-                           const ObjectIdentity& object_id)
+        MetadataAccessorRW(MasterService* service, ObjectIdentity object_id)
             : service_(service),
-              object_id_(object_id),
+              object_id_(std::move(object_id)),
               shard_idx_(service_->getMetadataShardIndex(object_id_.tenant_id,
                                                          object_id_.user_key)),
               shard_guard_(service_, shard_idx_),
@@ -1768,7 +1815,8 @@ class MasterService {
         ObjectIdentity object_id_;
         size_t shard_idx_;
         MetadataShardAccessorRW shard_guard_;
-        std::unordered_map<std::string, TenantState>::iterator tenant_it_;
+        std::unordered_map<TenantId, TenantState, TenantIdHash>::iterator
+            tenant_it_;
         TenantState* tenant_state_;
         ObjectMetadataIterator it_;
         ProcessingIterator processing_it_;
@@ -1820,9 +1868,9 @@ class MasterService {
     class MetadataAccessorRO {
        public:
         MetadataAccessorRO(const MasterService* service,
-                           const ObjectIdentity& object_id)
+                           ObjectIdentity object_id)
             : service_(service),
-              object_id_(object_id),
+              object_id_(std::move(object_id)),
               shard_idx_(service_->getMetadataShardIndex(object_id_.tenant_id,
                                                          object_id_.user_key)),
               shard_guard_(service_, shard_idx_),
@@ -1873,7 +1921,8 @@ class MasterService {
         const ObjectIdentity object_id_;
         const size_t shard_idx_;
         MetadataShardAccessorRO shard_guard_;
-        std::unordered_map<std::string, TenantState>::const_iterator tenant_it_;
+        std::unordered_map<TenantId, TenantState, TenantIdHash>::const_iterator
+            tenant_it_;
         const TenantState* tenant_state_;
         ObjectMetadataConstIterator it_;
         ProcessingConstIterator processing_it_;
@@ -1952,6 +2001,19 @@ class MasterService {
     // promotion task reaper after the task entry is erased. Relaxed memory
     // order is safe — the value is an advisory soft cap, not a barrier.
     std::atomic<uint64_t> promotion_in_flight_{0};
+    // Promotion retry candidate state.
+    std::atomic<uint64_t> promotion_candidate_count_{0};
+    std::atomic<size_t> promotion_retry_cursor_{0};
+    static constexpr size_t kPromotionCandidateLimit = 50000;
+    static constexpr uint32_t kPromotionCandidateMaxRetries = 8;
+    static constexpr size_t kPromotionRetryBatchSize = 128;
+    static constexpr size_t kPromotionRetryShardBatch = 64;
+    static constexpr std::chrono::milliseconds kPromotionCandidateTtl{60000};
+    static constexpr std::chrono::milliseconds
+        kPromotionCandidateInitialBackoff{10};
+    static constexpr std::chrono::milliseconds kPromotionCandidateMaxBackoff{
+        1000};
+
     // Master-side frequency sketch. Constructed only when promotion_on_hit_ is
     // true. CountMinSketch is mutex-protected internally so we can call into it
     // from any GetReplicaList caller without additional locking.
@@ -2025,6 +2087,8 @@ class MasterService {
     std::string snapshot_catalog_store_connstring_;
     std::unique_ptr<SnapshotObjectStore> snapshot_object_store_;
     std::unique_ptr<ha::SnapshotCatalogStore> snapshot_catalog_store_;
+    std::unique_ptr<MasterSnapshotRepository> snapshot_repository_;
+    std::unique_ptr<ha::MasterSnapshotCodec> snapshot_codec_;
     mutable std::shared_mutex snapshot_mutex_;
 
     // Discarded replicas management
@@ -2078,7 +2142,7 @@ class MasterService {
 
     struct ActiveDrainTask {
         UUID task_id;
-        std::string tenant_id;
+        TenantId tenant_id;
         std::string key;
         std::string source_segment;
         std::string target_segment;
@@ -2120,7 +2184,7 @@ class MasterService {
     std::optional<std::string> SelectDrainTargetForKey(
         const ObjectMetadata& metadata, const std::string& source_segment,
         const std::vector<std::string>& requested_targets);
-    std::string MakeDrainUnitKey(const std::string& tenant_id,
+    std::string MakeDrainUnitKey(const TenantId& tenant_id,
                                  const std::string& key,
                                  const std::string& source_segment) const;
 
@@ -2138,18 +2202,18 @@ class MasterService {
     static std::string MediumForMetadata(const ObjectMetadata& metadata);
     void PublishKvStored(const std::string& key, ReplicaType replica_type,
                          const ObjectMetadata& metadata,
-                         const std::string& tenant_id);
+                         const TenantId& tenant_id);
     void PublishKvRemoved(const std::string& key,
                           const ObjectMetadata& metadata,
-                          const std::string& tenant_id);
+                          const TenantId& tenant_id);
     void PublishKvRemoved(const std::string& key, const std::string& medium,
-                          const std::string& tenant_id,
+                          const TenantId& tenant_id,
                           const std::string& group_id);
     void PublishKvRemovedAfterEvict(const std::string& key,
                                     uint64_t freed_bytes,
                                     const std::string& medium,
                                     const ObjectMetadata& metadata,
-                                    const std::string& tenant_id);
+                                    const TenantId& tenant_id);
 };
 
 }  // namespace mooncake

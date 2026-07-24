@@ -29,6 +29,7 @@
 namespace mooncake {
 
 class RealClient;
+class RegisteredPinnedRegion;
 class UdsAcceptor;
 class UdsConnection;
 
@@ -89,7 +90,9 @@ class RealClient : public PyClient {
         const std::string &ipc_socket_path = "",
         bool enable_ssd_offload = false,
         const std::string &ssd_offload_path = "",
-        const std::string &tenant_id = "default");
+        const std::string &tenant_id = "default",
+        bool enable_client_http_server = false,
+        int client_http_port = DEFAULT_CLIENT_HTTP_PORT);
 
     int setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                     const std::string &server_address,
@@ -511,7 +514,9 @@ class RealClient : public PyClient {
         const std::string &ipc_socket_path = "", int local_rpc_port = 50052,
         bool enable_ssd_offload = false, bool start_offload_rpc_server = false,
         const std::string &ssd_offload_path = "",
-        const std::string &tenant_id = "default");
+        const std::string &tenant_id = "default",
+        bool enable_client_http_server = false,
+        int client_http_port = DEFAULT_CLIENT_HTTP_PORT);
 
     // Overload that accepts a configuration dictionary
     tl::expected<void, ErrorCode> setup_internal(const ConfigDict &config);
@@ -770,7 +775,10 @@ class RealClient : public PyClient {
         void *base = nullptr;
         size_t size = 0;
         std::string protocol;
+        std::shared_ptr<RegisteredPinnedRegion> pinned_region;
     };
+
+    void FreeAllocatedStoreSegment(AllocatedSegmentRecord &record);
 
     std::unique_ptr<AutoPortBinder> port_binder_ = nullptr;
 
@@ -830,6 +838,9 @@ class RealClient : public PyClient {
     std::vector<std::unique_ptr<void, SunriseSegmentDeleter>>
         sunrise_segment_ptrs_;
 #endif
+    std::vector<std::shared_ptr<RegisteredPinnedRegion>>
+        setup_segment_pinned_regions_;
+    bool setup_segment_memory_must_leak_ = false;
     std::string protocol;
     std::string device_name;
     std::string local_hostname;
@@ -927,7 +938,7 @@ class RealClient : public PyClient {
     int stop_ipc_server();
     // Embedded HTTP server for health-check / metrics
     std::unique_ptr<coro_http::coro_http_server> http_server_;
-    int start_http_server();
+    int start_http_server(int port);
     void stop_http_server();
 
     void handle_ipc_shm_register(UdsConnection &connection);

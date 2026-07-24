@@ -132,7 +132,7 @@ tl::expected<std::string, int> HttpGet(const std::string& url) {
 
 // Build a deterministic value whose bytes vary with BOTH position and a
 // per-key seed. A byte-for-byte comparison of the drained data then detects
-// intra-object slice mis-ordering or a wrong O_DIRECT read offset -- bugs a
+// intra-object slice misordering or a wrong O_DIRECT read offset -- bugs a
 // single-repeated-byte fill (e.g. string(size, 'A')) would silently pass.
 std::string MakePatternValue(size_t size, uint32_t seed) {
     std::string v;
@@ -636,7 +636,7 @@ TEST_F(LocalDiskDrainTest, ManualMovePreservesLocalDiskBackup) {
     for (int i = 0; i < kKeyCount; ++i) {
         std::string key = "manual_move_key_" + std::to_string(i);
         // Position- AND key-varying pattern so a byte-for-byte compare detects
-        // intra-object slice mis-ordering / wrong O_DIRECT offset.
+        // intra-object slice misordering / wrong O_DIRECT offset.
         std::string value = MakePatternValue(kSizes[i], i);
         std::span<const char> span(value.data(), value.size());
         ReplicateConfig config;

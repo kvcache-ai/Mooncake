@@ -74,6 +74,11 @@ struct QueueOwnerInput {
     std::vector<size_t> derived_task_ids;
     Request request{};
     QueueOwnerKind kind{QueueOwnerKind::User};
+    // True only when the caller has established that this owner's transfer
+    // time is governed by the installed bandwidth provider. Default false
+    // keeps degradation explicitly opt-in so a new enqueue path cannot
+    // accidentally apply an RDMA EWMA to MNNVL/TCP/staging paths.
+    bool degradation_eligible{false};
 };
 
 struct QueueSubmit {
@@ -134,6 +139,11 @@ class LocalTransferAdmissionQueue {
 
     Status complete(QueueOwnerId owner_id, TransferStatusEnum terminal_status);
 
+    // Cancel an owner that has not entered the dispatch window. Idempotent for
+    // an owner already canceled; dispatching owners must be canceled through
+    // their selected transport instead.
+    Status cancel(QueueOwnerId owner_id);
+
     Status retireBatch(uint64_t batch_token);
 
     Status resolveOwner(uint64_t batch_token, size_t public_task_id,
@@ -157,6 +167,7 @@ class LocalTransferAdmissionQueue {
         uint64_t batch_token{0};
         Request request{};
         QueueOwnerKind kind{QueueOwnerKind::User};
+        bool degradation_eligible{false};
         QueueState state{QueueState::Queued};
         TransferStatusEnum terminal_status{TransferStatusEnum::PENDING};
     };

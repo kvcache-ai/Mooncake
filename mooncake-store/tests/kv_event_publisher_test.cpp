@@ -103,7 +103,7 @@ TEST(KvEventPublisherTest, PublishesSglangObjectKeyOverZmq) {
     // Allow SUB connect before first publish propagates.
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-    publisher.PublishStored(object_key, "cpu", "tenant-a", group_id);
+    publisher.PublishStored(object_key, "cpu", TenantId("tenant-a"), group_id);
 
     std::vector<std::string> frames;
     ASSERT_TRUE(ReceiveZmqMultipart(sub, frames)) << zmq_strerror(zmq_errno());

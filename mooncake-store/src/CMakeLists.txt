@@ -27,6 +27,7 @@ set(MOONCAKE_STORE_SOURCES
     client_buffer.cpp
     aligned_client_buffer.cpp
     real_client.cpp
+    registered_pinned_memory.cpp
     dummy_client.cpp
     uds_transport.cpp
     shm_helper.cpp
@@ -48,6 +49,7 @@ set(MOONCAKE_STORE_SOURCES
     ha/leadership/master_service_supervisor.cpp
     ha/standby_controller.cpp
     ha/snapshot/catalog_backed_snapshot_provider.cpp
+    ha/snapshot/master_snapshot_codec.cpp
     ha/snapshot/object/snapshot_object_store.cpp
     ha/snapshot/object/backends/local/local_file_snapshot_object_store.cpp
     ha/snapshot/object/backends/s3/s3_snapshot_object_store.cpp
@@ -257,6 +259,7 @@ if(USE_NOF)
       crypto
       aio
       z
+      isal
       elf
       ibverbs
       rdmacm

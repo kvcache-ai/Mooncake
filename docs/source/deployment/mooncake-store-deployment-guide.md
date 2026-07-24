@@ -350,8 +350,8 @@ In HA mode, quota admin requests are served only by the active master service. S
 - Scale `--rpc_thread_num` with available CPU cores and workload.
 - Start with default eviction settings; adjust `--eviction_high_watermark_ratio` and `--eviction_ratio` based on memory pressure and object churn.
 - Use `/metrics/summary` during bring-up; integrate `/metrics` with Prometheus/Grafana for production.
-- For detailed SSD offload configuration (storage backends, eviction policies, io_uring), see the [SSD Offload guide](ssd-offload).
-- For NVMe-oF SSD pool configuration see the [NVMe-oF SSD Pool Deployment Guide](nvmf-ssd-deployment-guide)
+- For detailed SSD offload configuration (storage backends, eviction policies, io_uring), see the [SSD Offload guide](ssd/ssd-offload).
+- For NVMe-oF SSD pool configuration see the [NVMe-oF SSD Pool Deployment Guide](ssd/nvmf-ssd-deployment-guide)
 - For experimental 3FS (USRBIO) integration as a persistent storage backend, see the [3FS USRBIO Plugin guide](../getting_started/plugin-usage/3FS-USRBIO-Plugin).
 - For detailed monitoring and observation see [Observability](../getting_started/observability)
 
@@ -359,8 +359,7 @@ In HA mode, quota admin requests are served only by the active master service. S
 :maxdepth: 1
 :hidden:
 
-ssd-offload
-NvMe-Of SSD Pool<nvmf-ssd-deployment-guide>
+SSD Storage<ssd/index>
 HF3FS Plugin (Experimental)<../getting_started/plugin-usage/3FS-USRBIO-Plugin>
 ../getting_started/observability
 :::
@@ -584,7 +583,7 @@ When `--allocation_strategy=cxl` is set alongside `--enable_cxl=true`, the maste
 NVMe-oF SSD Pool (NoF) is an experimental feature.
 ```
 
-Master-side flags for the NVMe-oF SSD pool. They control eviction within the NoF SSD tier and the heartbeat used to detect and unmount unresponsive NoF segments. For the client-side NoF I/O tuning (`MC_NOF_*`), see the [NVMe-oF SSD Pool Deployment Guide](nvmf-ssd-deployment-guide.md).
+Master-side flags for the NVMe-oF SSD pool. They control eviction within the NoF SSD tier and the heartbeat used to detect and unmount unresponsive NoF segments. For the client-side NoF I/O tuning (`MC_NOF_*`), see the [NVMe-oF SSD Pool Deployment Guide](ssd/nvmf-ssd-deployment-guide.md).
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -652,9 +651,11 @@ Arguments of `MooncakeDistributedStore.setup(...)`:
 | `enable_ssd_offload` | bool | `false` | *(advanced)* Enable client-side SSD offload |
 | `ssd_offload_path` | str | empty | *(advanced)* SSD offload directory |
 | `tenant_id` | str | `default` | *(advanced)* Tenant identifier |
+| `enable_client_http_server` | bool | `false` | Enable the client-side HTTP `/health`, `/metrics`, and `/metrics/summary` endpoints |
+| `client_http_port` | int | `9300` | Client-side HTTP endpoint port, used only when `enable_client_http_server=true` |
 
 ```{note}
-The first seven arguments have **no Python default** — the C++ defaults are not exposed by the pybind binding, so they must all be supplied (a bare `setup(local_hostname, metadata_server)` raises `TypeError`). Only `engine` / `enable_ssd_offload` / `ssd_offload_path` / `tenant_id` are optional. Also, in Method A the `MOONCAKE_*` variables used by `MooncakeConfig` are ignored; low-level runtime variables such as the `MC_*` engine variables below are still read by the C++ client.
+The first seven arguments have **no Python default** — the C++ defaults are not exposed by the pybind binding, so they must all be supplied (a bare `setup(local_hostname, metadata_server)` raises `TypeError`). The later arguments (`engine`, SSD offload fields, `tenant_id`, and client HTTP endpoint fields) are optional. Also, in Method A the `MOONCAKE_*` variables used by `MooncakeConfig` are ignored; low-level runtime variables such as the `MC_*` engine variables below are still read by the C++ client.
 ```
 
 ### Method B — Service / Integration (`MOONCAKE_*` + CLI)
@@ -681,6 +682,8 @@ The store service CLI only accepts `--config`, `-D/--define`, `--port`, and `--m
 | `MOONCAKE_OFFLOAD_ENABLED` | `enable_ssd_offload` | `false` | Client-side SSD offload |
 | `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | `ssd_offload_path` | empty | Offload directory |
 | `MOONCAKE_TENANT_ID` | `tenant_id` | `default` | Tenant identifier |
+| `MOONCAKE_ENABLE_CLIENT_HTTP_SERVER` | `enable_client_http_server` | `false` | Enable client-side `/health`, `/metrics`, and `/metrics/summary` endpoints |
+| `MOONCAKE_CLIENT_HTTP_PORT` | `client_http_port` | `9300` | Client-side HTTP endpoint port |
 | `MOONCAKE_CONFIG_PATH` | — | unset | Path to a JSON config file (takes precedence over the variables above) |
 
 ```{note}
@@ -712,7 +715,9 @@ Or via a JSON config file. The service also exposes a lightweight HTTP API (on `
   "protocol": "tcp",
   "device_name": "",
   "master_server_address": "127.0.0.1:50051",
-  "tenant_id": "default"
+  "tenant_id": "default",
+  "enable_client_http_server": false,
+  "client_http_port": 9300
 }
 ```
 
@@ -746,6 +751,38 @@ mooncake_client \
 | `--tenant_id` | `default` | Tenant identifier |
 | `--enable_offload` | `false` | Enable client-side SSD offload |
 | `--start_offload_rpc_server` | `true` | Start the offload RPC server for dummy clients |
+| `--enable_http_server` | `false` | Enable client-side `/health`, `/metrics`, and `/metrics/summary` endpoints |
+| `--http_port` | `9300` | Client-side HTTP endpoint port |
+
+### Client HTTP Health and Metrics Endpoint
+
+Each real client can expose its own lightweight HTTP endpoint independently of the master admin HTTP server and the Python store REST API. This endpoint is disabled by default for programmatic clients and `mooncake_store_service`; enable it explicitly when you want to scrape client-local metrics:
+
+```python
+store.setup(
+    local_hostname,
+    metadata_server,
+    global_segment_size,
+    local_buffer_size,
+    protocol,
+    rdma_devices,
+    master_server_addr,
+    enable_client_http_server=True,
+    client_http_port=9300,
+)
+```
+
+For `mooncake_store_service`, use `MOONCAKE_ENABLE_CLIENT_HTTP_SERVER=true` and optionally `MOONCAKE_CLIENT_HTTP_PORT=<port>`, or set the same fields in the JSON config. For `mooncake_client`, use `--enable_http_server=true --http_port=<port>`.
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /health` | Client health check |
+| `GET /metrics` | Prometheus-format client metrics |
+| `GET /metrics/summary` | Human-readable client metrics summary |
+
+```{note}
+`MC_STORE_CLIENT_METRIC` controls whether client metrics are collected. If the client HTTP server is enabled but `MC_STORE_CLIENT_METRIC=0`, `/metrics` and `/metrics/summary` return HTTP 503 with `metrics not available`.
+```
 
 ### Engine Runtime Tuning (`MC_*`)
 
@@ -813,6 +850,21 @@ Local hot cache provides a DRAM read cache on top of SSD-resident objects for fa
 | `MC_STORE_HUGEPAGE_SIZE` | `2MB` | Supported: `2MB`, `1GB` |
 | `MC_MMAP_ARENA_POOL_SIZE` | unset | Pre-allocated arena pool size (e.g., `8gb`). Explicitly set to enable the arena |
 | `MC_DISABLE_MMAP_ARENA` | unset | Disable arena, fall back to per-call `mmap()`. Accepts `1`/`true`/`yes`/`on` (or `0`/`false`/`no`/`off`) |
+
+RDMA Store segments backed by HugeTLB are populated in parallel immediately
+before transfer-engine registration. No additional population-mode setting is
+required:
+
+```bash
+export MC_STORE_USE_HUGEPAGE=1
+export MC_STORE_HUGEPAGE_SIZE=2MB
+```
+
+For direct mappings, workers divide the mapping into page ranges. For
+NUMA-segmented mappings, each worker is scheduled on the NUMA node associated
+with its `mbind()` region before touching pages. The mmap arena retains its
+eager `MAP_POPULATE` behavior for DMA safety; set `MC_DISABLE_MMAP_ARENA=1` if
+the deferred direct-mmap path is desired while the arena is otherwise enabled.
 
 #### yalantinglibs Log Level
 
