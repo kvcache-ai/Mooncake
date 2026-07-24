@@ -13,6 +13,11 @@ add_executable(batch_get_replica_bench batch_get_replica_bench.cpp)
 target_link_libraries(batch_get_replica_bench PRIVATE cachelib_memory_allocator
                                                        mooncake_store)
 
+# Add the context-aware replica selector microbenchmark. It emits raw CSV and
+# counts heap allocations inside the timed selection window.
+add_executable(replica_selector_v2_bench replica_selector_v2_bench.cpp)
+target_link_libraries(replica_selector_v2_bench PRIVATE mooncake_store pthread)
+
 # Add file interface benchmark executable
 add_executable(file_interface_bench file_interface_bench.cpp)
 target_link_libraries(file_interface_bench PRIVATE mooncake_store glog::glog)
