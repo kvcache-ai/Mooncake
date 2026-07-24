@@ -519,6 +519,11 @@ if [ "$NPU_BUILD" = "1" ]; then
     fi
 fi
 
+# auditwheel uses patchelf to rewrite every ELF object's dependencies and
+# RPATH. Validate the final artifacts after all repair and injection steps so a
+# malformed load-segment layout can never be uploaded as a release wheel.
+python${PYTHON_VERSION} ../scripts/validate_wheel_elf.py ${REPAIRED_DIR}/*.whl
+
 # Replace original wheel with repaired wheel
 rm -f ${OUTPUT_DIR}/*.whl
 mv ${REPAIRED_DIR}/*.whl ${OUTPUT_DIR}/
