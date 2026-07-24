@@ -1,16 +1,15 @@
 #ifndef MOONCAKE_EP_BUFFER_H
 #define MOONCAKE_EP_BUFFER_H
 
-#include <ATen/cuda/CUDAContext.h>
-#include <cuda_bf16.h>
-#include <cuda.h>
-#include <cuda_runtime.h>
+#include <cuda_alike.h>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <mooncake_ep_api.cuh>
 #include <mooncake_ep_configs.cuh>
 #include <mooncake_ep_event.h>
 #include <mooncake_ep_exception.cuh>
-#include <torch/torch.h>
+#include <glog/logging.h>
 #include <transport/device/device_transport.h>
 
 namespace mooncake {
@@ -99,7 +98,7 @@ struct MooncakeEpBuffer {
     int active_qps_cap_ = 8;
 
     // Stream for communication
-    at::cuda::CUDAStream comm_stream;
+    cudaStream_t comm_stream = nullptr;
 
     // Workspace
     void* workspace = nullptr;
@@ -113,25 +112,24 @@ struct MooncakeEpBuffer {
 
     ~MooncakeEpBuffer() noexcept(false);
 
-    std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor,
-               torch::Tensor, torch::Tensor, std::optional<EventHandle>,
-               std::optional<std::function<void()>>>
-    dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx,
-             torch::Tensor& active_ranks, int num_max_dispatch_tokens_per_rank,
-             int num_experts, int timeout_us, bool use_fp8, bool async,
-             bool return_recv_hook);
+    std::tuple<std::optional<EventHandle>, std::optional<std::function<void()>>>
+    dispatch(uint64_t x_ptr, uint64_t topk_idx_ptr, uint64_t active_ranks_ptr,
+             int num_tokens, int hidden, int num_topk,
+             int num_max_dispatch_tokens_per_rank, int num_experts,
+             int timeout_us, bool use_fp8, uint64_t packed_recv_x_ptr,
+             uint64_t packed_recv_x_scales_ptr, uint64_t packed_recv_count_ptr,
+             uint64_t packed_recv_src_info_ptr,
+             uint64_t packed_recv_layout_range_ptr, bool async,
+             bool return_recv_hook, uint64_t compute_stream_ptr);
 
-    std::tuple<torch::Tensor, std::optional<EventHandle>,
-               std::optional<std::function<void()>>>
-    combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
-            const torch::Tensor& topk_weights, const torch::Tensor& src_info,
-            const torch::Tensor& layout_range, torch::Tensor& active_ranks,
+    std::tuple<std::optional<EventHandle>, std::optional<std::function<void()>>>
+    combine(uint64_t x_ptr, uint64_t topk_idx_ptr, uint64_t topk_weights_ptr,
+            uint64_t src_info_ptr, uint64_t layout_range_ptr,
+            uint64_t active_ranks_ptr, int num_local_experts,
+            int num_combined_tokens, int hidden, int num_topk,
             int num_max_dispatch_tokens_per_rank, int num_experts,
-            int timeout_us, bool zero_copy, bool async, bool return_recv_hook,
-            const std::optional<torch::Tensor>& out);
-
-    torch::Tensor get_next_combine_buffer(int num_max_dispatch_tokens_per_rank,
-                                          int hidden, int num_experts);
+            int timeout_us, bool zero_copy, uint64_t combined_x_ptr, bool async,
+            bool return_recv_hook, uint64_t compute_stream_ptr);
 
     bool ibgda_disabled() const { return ibgda_disabled_; }
 

@@ -14,6 +14,23 @@ int active_qps_per_rank_for_ep(int qps_per_rank, bool is_roce, int cap) {
     return std::min(qps_per_rank, cap);
 }
 
+cudaStream_t create_comm_stream() {
+    int least_priority = 0;
+    int greatest_priority = 0;
+    auto status =
+        cudaDeviceGetStreamPriorityRange(&least_priority, &greatest_priority);
+    if (status != cudaSuccess) {
+        cudaGetLastError();
+        least_priority = 0;
+        greatest_priority = 0;
+    }
+
+    cudaStream_t stream = nullptr;
+    CUDA_CHECK(cudaStreamCreateWithPriority(&stream, cudaStreamNonBlocking,
+                                            greatest_priority));
+    return stream;
+}
+
 }  // namespace
 
 // Initialize an RDMA transport: register memory, allocate control buffer,
@@ -48,7 +65,7 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
     : rank(rank),
       num_ranks(num_ranks),
       num_ep_buffer_bytes(num_ep_buffer_bytes),
-      comm_stream(at::cuda::getStreamFromPool(true)) {
+      comm_stream(create_comm_stream()) {
     USE_QP_COUNT = MAX_QP_COUNT / num_ranks * num_ranks;
 
     // Optional runtime override for the RoCE active-QP cap (default 8).
@@ -92,7 +109,7 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
         if (rdma_transport_) {
             if (!initRdmaTransport(rdma_transport_, gdr_buffer,
                                    num_ep_buffer_bytes, num_ranks, USE_QP_COUNT,
-                                   comm_stream.stream())) {
+                                   comm_stream)) {
                 rdma_transport_ = nullptr;
                 ibgda_disabled_ = true;
                 LOG(INFO) << "[EP] IBGDA unavailable, using P2P-only path";
@@ -114,7 +131,7 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
         }
         auto t = device::createIbgdaDeviceTransport(device_filter);
         if (initRdmaTransport(t.get(), gdr_buffer, num_ep_buffer_bytes,
-                              num_ranks, USE_QP_COUNT, comm_stream.stream())) {
+                              num_ranks, USE_QP_COUNT, comm_stream)) {
             owned_rdma_transport_ = std::move(t);
             rdma_transport_ = owned_rdma_transport_.get();
         } else {
@@ -151,33 +168,28 @@ MooncakeEpBuffer::~MooncakeEpBuffer() noexcept(false) {
     p2p_transport_ = nullptr;
 
     if (workspace) cudaFree(workspace);
+    if (comm_stream) {
+        cudaStreamDestroy(comm_stream);
+        comm_stream = nullptr;
+    }
 }
 
-std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor,
-           torch::Tensor, torch::Tensor, std::optional<EventHandle>,
-           std::optional<std::function<void()>>>
-MooncakeEpBuffer::dispatch(const torch::Tensor& x,
-                           const torch::Tensor& topk_idx,
-                           torch::Tensor& active_ranks,
-                           int num_max_dispatch_tokens_per_rank,
-                           int num_experts, int timeout_us, bool use_fp8,
-                           bool async, bool return_recv_hook) {
-    // Tensor checks
-    // By default using `ptp128c` FP8 cast
-    EP_HOST_ASSERT(x.dim() == 2 and x.is_contiguous() and
-                   x.scalar_type() == torch::kBFloat16);
-    EP_HOST_ASSERT(x.size(1) % sizeof(int4) == 0 and x.size(1) % 128 == 0);
-    EP_HOST_ASSERT(topk_idx.dim() == 2 and topk_idx.is_contiguous());
-    EP_HOST_ASSERT(x.size(0) == topk_idx.size(0) and
-                   x.size(0) <= num_max_dispatch_tokens_per_rank);
-    EP_HOST_ASSERT(topk_idx.scalar_type() == torch::kInt64);
+std::tuple<std::optional<EventHandle>, std::optional<std::function<void()>>>
+MooncakeEpBuffer::dispatch(
+    uint64_t x_ptr, uint64_t topk_idx_ptr, uint64_t active_ranks_ptr,
+    int num_tokens, int hidden, int num_topk,
+    int num_max_dispatch_tokens_per_rank, int num_experts, int timeout_us,
+    bool use_fp8, uint64_t packed_recv_x_ptr, uint64_t packed_recv_x_scales_ptr,
+    uint64_t packed_recv_count_ptr, uint64_t packed_recv_src_info_ptr,
+    uint64_t packed_recv_layout_range_ptr, bool async, bool return_recv_hook,
+    uint64_t compute_stream_ptr) {
     EP_HOST_ASSERT(num_experts % num_ranks == 0);
     EP_HOST_ASSERT(USE_QP_COUNT % num_ranks == 0);
+    EP_HOST_ASSERT(hidden % static_cast<int>(sizeof(int4)) == 0 &&
+                   hidden % 128 == 0);
+    EP_HOST_ASSERT(num_tokens <= num_max_dispatch_tokens_per_rank);
 
-    auto num_tokens = static_cast<int>(x.size(0)),
-         hidden = static_cast<int>(x.size(1));
-    auto num_scales = hidden / 128,
-         num_topk = static_cast<int>(topk_idx.size(1));
+    auto num_scales = hidden / 128;
     int num_local_experts = num_experts / num_ranks;
 
     // Buffer control
@@ -190,40 +202,36 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
     int phase_epoch = ++phase_epochs[current_buffer_idx];
 
     // Wait previous tasks to be finished
-    // NOTES: the hook mode will always use the default stream
-    auto compute_stream = at::cuda::getCurrentCUDAStream();
-    auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
+    // NOTES: the hook mode will always use the default stream, whose native
+    // handle is allowed to be nullptr in CUDA/PyTorch.
+    auto compute_stream_raw =
+        reinterpret_cast<cudaStream_t>(compute_stream_ptr);
+    auto launch_stream = return_recv_hook ? compute_stream_raw : comm_stream;
     EP_HOST_ASSERT(not(async and return_recv_hook));
-    if (not return_recv_hook) stream_wait(launch_stream, compute_stream);
+    if (not return_recv_hook) stream_wait(launch_stream, compute_stream_raw);
 
     // Allocate packed tensors
-    auto packed_recv_x = torch::empty(
-        {num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank,
-         hidden},
-        x.options().dtype(use_fp8 ? torch::kFloat8_e4m3fn : torch::kBFloat16));
-    auto packed_recv_src_info = torch::empty(
-        {num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank},
-        torch::dtype(torch::kInt32).device(x.device()));
-    auto packed_recv_layout_range =
-        torch::empty({num_local_experts, num_ranks},
-                     torch::dtype(torch::kInt64).device(x.device()));
-    auto packed_recv_count = torch::zeros(
-        {num_local_experts}, torch::dtype(torch::kInt32).device(x.device()));
-
-    // Allocate column-majored scales
-    auto packed_recv_x_scales = std::optional<torch::Tensor>();
-    float* packed_recv_x_scales_ptr = nullptr;
+    void* x = reinterpret_cast<void*>(x_ptr);
+    auto* topk_idx = reinterpret_cast<int64_t*>(topk_idx_ptr);
+    auto* active_ranks = reinterpret_cast<int32_t*>(active_ranks_ptr);
+    void* packed_recv_x = reinterpret_cast<void*>(packed_recv_x_ptr);
+    auto* packed_recv_x_scales =
+        reinterpret_cast<float*>(packed_recv_x_scales_ptr);
+    auto* packed_recv_count = reinterpret_cast<int*>(packed_recv_count_ptr);
+    auto* packed_recv_src_info =
+        reinterpret_cast<int*>(packed_recv_src_info_ptr);
+    auto* packed_recv_layout_range =
+        reinterpret_cast<int64_t*>(packed_recv_layout_range_ptr);
+    EP_HOST_ASSERT(active_ranks != nullptr);
+    EP_HOST_ASSERT(num_tokens == 0 || (x != nullptr && topk_idx != nullptr));
+    EP_HOST_ASSERT(packed_recv_x != nullptr && packed_recv_count != nullptr);
+    EP_HOST_ASSERT(packed_recv_src_info != nullptr &&
+                   packed_recv_layout_range != nullptr);
     if (use_fp8) {
         EP_HOST_ASSERT((num_ranks * num_max_dispatch_tokens_per_rank) % 4 ==
                            0 and
                        "TMA requires the number of tokens to be multiple of 4");
-        packed_recv_x_scales =
-            torch::empty({num_local_experts, num_scales,
-                          num_ranks * num_max_dispatch_tokens_per_rank},
-                         torch::dtype(torch::kFloat32).device(x.device()));
-        packed_recv_x_scales =
-            torch::transpose(packed_recv_x_scales.value(), 1, 2);
-        packed_recv_x_scales_ptr = packed_recv_x_scales->data_ptr<float>();
+        EP_HOST_ASSERT(packed_recv_x_scales != nullptr);
     }
 
     int64_t timeout_ticks =
@@ -266,18 +274,16 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
 
     auto launcher = [=](int phases) {
         mooncake::dispatch(
-            packed_recv_x.data_ptr(), packed_recv_x_scales_ptr,
-            packed_recv_src_info.data_ptr<int>(),
-            packed_recv_layout_range.data_ptr<int64_t>(),
-            packed_recv_count.data_ptr<int>(), active_ranks.data_ptr<int32_t>(),
+            packed_recv_x, packed_recv_x_scales, packed_recv_src_info,
+            packed_recv_layout_range, packed_recv_count, active_ranks,
             gdr_buffer, buffer.rdma_send_signal_buffer,
             buffer.rdma_recv_signal_buffer, buffer.rdma_send_data_buffer,
             buffer.rdma_recv_data_buffer, nullptr, nullptr, raddrs_ptr,
-            rkeys_ptr, qp_devctxs_ptr, nvlink_avail, ipc_ptrs, x.data_ptr(),
-            topk_idx.data_ptr<int64_t>(), next_buffer.rdma_recv_signal_buffer,
-            num_tokens, hidden, num_max_dispatch_tokens_per_rank, num_topk,
-            num_experts, rank, num_ranks, use_fp8, workspace, launch_stream,
-            timeout_ticks, phases, active_qps_per_rank);
+            rkeys_ptr, qp_devctxs_ptr, nvlink_avail, ipc_ptrs, x, topk_idx,
+            next_buffer.rdma_recv_signal_buffer, num_tokens, hidden,
+            num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank,
+            num_ranks, use_fp8, workspace, launch_stream, timeout_ticks, phases,
+            active_qps_per_rank);
     };
     if (return_recv_hook) {
         launcher(LOW_LATENCY_SEND_PHASE);
@@ -298,11 +304,11 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
         // NOTES: we must ensure the all tensors will not be deallocated
         // before the stream-wait happens, so in Python API, we must wrap
         // all tensors into the event handle.
-        event = EventHandle(launch_stream);
+        event = EventHandle(reinterpret_cast<uint64_t>(launch_stream));
     } else if (return_recv_hook && macaHostPhaseFenceCoversPeers()) {
-        event = EventHandle(launch_stream);
+        event = EventHandle(reinterpret_cast<uint64_t>(launch_stream));
     } else if (not return_recv_hook) {
-        stream_wait(compute_stream, launch_stream);
+        stream_wait(compute_stream_raw, launch_stream);
     }
 
     // Receiver callback
@@ -314,50 +320,36 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
         };
 
     // Return values
-    return {packed_recv_x,
-            packed_recv_x_scales,
-            packed_recv_count,
-            packed_recv_src_info,
-            packed_recv_layout_range,
-            event,
-            recv_hook};
+    return {event, recv_hook};
 }
 
-std::tuple<torch::Tensor, std::optional<EventHandle>,
-           std::optional<std::function<void()>>>
-MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
-                          const torch::Tensor& topk_weights,
-                          const torch::Tensor& src_info,
-                          const torch::Tensor& layout_range,
-                          torch::Tensor& active_ranks,
+std::tuple<std::optional<EventHandle>, std::optional<std::function<void()>>>
+MooncakeEpBuffer::combine(uint64_t x_ptr, uint64_t topk_idx_ptr,
+                          uint64_t topk_weights_ptr, uint64_t src_info_ptr,
+                          uint64_t layout_range_ptr, uint64_t active_ranks_ptr,
+                          int num_local_experts, int num_combined_tokens,
+                          int hidden, int num_topk,
                           int num_max_dispatch_tokens_per_rank, int num_experts,
-                          int timeout_us, bool zero_copy, bool async,
-                          bool return_recv_hook,
-                          const std::optional<torch::Tensor>& out) {
-    // Tensor checks
-    EP_HOST_ASSERT(x.dim() == 3 and x.is_contiguous() and
-                   x.scalar_type() == torch::kBFloat16);
-    EP_HOST_ASSERT(x.size(0) == num_experts / num_ranks);
-    EP_HOST_ASSERT(x.size(1) == num_ranks * num_max_dispatch_tokens_per_rank);
-    EP_HOST_ASSERT(x.size(2) % sizeof(int4) == 0 and x.size(2) % 128 == 0);
-    EP_HOST_ASSERT(topk_idx.dim() == 2 and topk_idx.is_contiguous());
-    EP_HOST_ASSERT(topk_idx.size(0) == topk_weights.size(0) and
-                   topk_idx.size(1) == topk_weights.size(1));
-    EP_HOST_ASSERT(topk_idx.scalar_type() == torch::kInt64);
-    EP_HOST_ASSERT(topk_weights.dim() == 2 and topk_weights.is_contiguous());
-    EP_HOST_ASSERT(topk_weights.size(0) <= num_max_dispatch_tokens_per_rank);
-    EP_HOST_ASSERT(topk_weights.scalar_type() == torch::kFloat32);
-    EP_HOST_ASSERT(src_info.dim() == 2 and src_info.is_contiguous());
-    EP_HOST_ASSERT(src_info.scalar_type() == torch::kInt32 and
-                   x.size(0) == src_info.size(0));
-    EP_HOST_ASSERT(layout_range.dim() == 2 and layout_range.is_contiguous());
-    EP_HOST_ASSERT(layout_range.scalar_type() == torch::kInt64);
-    EP_HOST_ASSERT(layout_range.size(0) == num_experts / num_ranks and
-                   layout_range.size(1) == num_ranks);
-    auto hidden = static_cast<int>(x.size(2));
-    auto num_local_experts = num_experts / num_ranks,
-         num_topk = static_cast<int>(topk_weights.size(1));
-    auto num_combined_tokens = static_cast<int>(topk_weights.size(0));
+                          int timeout_us, bool zero_copy,
+                          uint64_t combined_x_ptr, bool async,
+                          bool return_recv_hook, uint64_t compute_stream_ptr) {
+    EP_HOST_ASSERT(num_local_experts == num_experts / num_ranks);
+    EP_HOST_ASSERT(hidden % static_cast<int>(sizeof(int4)) == 0 &&
+                   hidden % 128 == 0);
+    EP_HOST_ASSERT(num_combined_tokens <= num_max_dispatch_tokens_per_rank);
+    void* x = reinterpret_cast<void*>(x_ptr);
+    auto* topk_idx = reinterpret_cast<int64_t*>(topk_idx_ptr);
+    auto* topk_weights = reinterpret_cast<float*>(topk_weights_ptr);
+    auto* src_info = reinterpret_cast<int*>(src_info_ptr);
+    auto* layout_range = reinterpret_cast<int64_t*>(layout_range_ptr);
+    auto* active_ranks = reinterpret_cast<int32_t*>(active_ranks_ptr);
+    void* combined_x = reinterpret_cast<void*>(combined_x_ptr);
+    EP_HOST_ASSERT(
+        num_combined_tokens == 0 ||
+        (x != nullptr && topk_idx != nullptr && topk_weights != nullptr));
+    EP_HOST_ASSERT(src_info != nullptr && layout_range != nullptr);
+    EP_HOST_ASSERT(active_ranks != nullptr);
+    EP_HOST_ASSERT(num_combined_tokens == 0 || combined_x != nullptr);
 
     // Buffer control
     BufferPair layout(gdr_buffer, num_max_dispatch_tokens_per_rank, hidden,
@@ -369,23 +361,13 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
     int phase_epoch = ++phase_epochs[current_buffer_idx];
 
     // Wait previous tasks to be finished
-    // NOTES: the hook mode will always use the default stream
-    auto compute_stream = at::cuda::getCurrentCUDAStream();
-    auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
+    // NOTES: the hook mode will always use the default stream, whose native
+    // handle is allowed to be nullptr in CUDA/PyTorch.
+    auto compute_stream_raw =
+        reinterpret_cast<cudaStream_t>(compute_stream_ptr);
+    auto launch_stream = return_recv_hook ? compute_stream_raw : comm_stream;
     EP_HOST_ASSERT(not(async and return_recv_hook));
-    if (not return_recv_hook) stream_wait(launch_stream, compute_stream);
-
-    // Allocate output tensor
-    torch::Tensor combined_x;
-    if (out.has_value()) {
-        EP_HOST_ASSERT(out->dim() == 2 and out->is_contiguous());
-        EP_HOST_ASSERT(out->size(0) == num_combined_tokens and
-                       out->size(1) == hidden);
-        EP_HOST_ASSERT(out->scalar_type() == x.scalar_type());
-        combined_x = out.value();
-    } else {
-        combined_x = torch::empty({num_combined_tokens, hidden}, x.options());
-    }
+    if (not return_recv_hook) stream_wait(launch_stream, compute_stream_raw);
 
     int64_t timeout_ticks =
         timeout_us == -1 ? -1
@@ -428,13 +410,11 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
     // Kernel launch
     auto launcher = [=](int phases) {
         mooncake::combine(
-            combined_x.data_ptr(), active_ranks.data_ptr<int32_t>(), gdr_buffer,
+            combined_x, active_ranks, gdr_buffer,
             buffer.rdma_send_signal_buffer, buffer.rdma_recv_signal_buffer,
             buffer.rdma_send_data_buffer, buffer.rdma_recv_data_buffer, nullptr,
             nullptr, raddrs_ptr, rkeys_ptr, qp_devctxs_ptr, nvlink_avail,
-            ipc_ptrs, x.data_ptr(), topk_idx.data_ptr<int64_t>(),
-            topk_weights.data_ptr<float>(), src_info.data_ptr<int>(),
-            layout_range.data_ptr<int64_t>(),
+            ipc_ptrs, x, topk_idx, topk_weights, src_info, layout_range,
             next_buffer.rdma_recv_signal_buffer, num_combined_tokens, hidden,
             num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank,
             num_ranks, workspace, launch_stream, timeout_ticks, phases,
@@ -459,11 +439,11 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
         // NOTES: we must ensure the all tensors will not be deallocated
         // before the stream-wait happens, so in Python API, we must wrap
         // all tensors into the event handle.
-        event = EventHandle(launch_stream);
+        event = EventHandle(reinterpret_cast<uint64_t>(launch_stream));
     } else if (return_recv_hook && macaHostPhaseFenceCoversPeers()) {
-        event = EventHandle(launch_stream);
+        event = EventHandle(reinterpret_cast<uint64_t>(launch_stream));
     } else if (not return_recv_hook) {
-        stream_wait(compute_stream, launch_stream);
+        stream_wait(compute_stream_raw, launch_stream);
     }
 
     // Receiver callback
@@ -475,33 +455,12 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
         };
 
     // Return values
-    return {combined_x, event, recv_hook};
-}
-
-torch::Tensor MooncakeEpBuffer::get_next_combine_buffer(
-    int num_max_dispatch_tokens_per_rank, int hidden, int num_experts) {
-    BufferPair layout(gdr_buffer, num_max_dispatch_tokens_per_rank, hidden,
-                      num_ranks, num_experts);
-
-    auto buffer = layout.buffers[buffer_idx];
-    auto dtype = torch::kBFloat16;
-    size_t num_bytes_per_combine_msg = hidden * EP_BF16_SIZE;
-    auto num_msg_elems =
-        static_cast<int>(num_bytes_per_combine_msg / elementSize(dtype));
-
-    EP_HOST_ASSERT(num_bytes_per_combine_msg % elementSize(dtype) == 0);
-    return torch::from_blob(
-        buffer.rdma_send_data_buffer,
-        {num_experts / num_ranks, num_ranks * num_max_dispatch_tokens_per_rank,
-         hidden},
-        {num_ranks * num_max_dispatch_tokens_per_rank * num_msg_elems,
-         num_msg_elems, 1},
-        torch::TensorOptions().dtype(dtype).device(torch::kCUDA));
+    return {event, recv_hook};
 }
 
 void MooncakeEpBuffer::update_local_qpns() {
     if (!rdma_transport_) return;
-    int ret = rdma_transport_->recreateQueuePairs(comm_stream.stream());
+    int ret = rdma_transport_->recreateQueuePairs(comm_stream);
     if (ret != 0) {
         ibgda_disabled_ = true;
         LOG(ERROR) << "[EP] Failed to recreate QPs";

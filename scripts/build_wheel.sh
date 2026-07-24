@@ -123,10 +123,15 @@ else
     echo "Skipping libascend_transport_mem.so (not built - Ascend disabled)"
 fi
 
-# EP/PG CUDA extensions are built during the cmake/make process when the
-# project is configured with -DWITH_EP=ON.  The resulting .so files land in
-# ${BUILD_DIR}/ep_pg_staging and are injected into the wheel AFTER auditwheel
-# so that patchelf never touches CUDA fatbins (see injection step below).
+# The native EP extension is built by CMake.  Keep it in the wheel before
+# auditwheel repair so its non-system shared-library dependencies are bundled.
+if compgen -G "${BUILD_DIR}/mooncake-ep/src/_ep*.so" >/dev/null; then
+    cp "${BUILD_DIR}"/mooncake-ep/src/_ep*.so mooncake-wheel/mooncake/
+fi
+
+# PG accelerator extensions are built during the cmake/make process when the project
+# is configured with -DWITH_EP=ON.  The resulting .so files land in
+# ${BUILD_DIR}/ep_pg_staging and are injected into the wheel AFTER auditwheel.
 # Use an absolute path: the script later `cd`s into mooncake-wheel/ and a
 # relative path would silently point to the wrong location.
 CUDA_EP_STAGING_DIR="${BUILD_DIR_ABS}/ep_pg_staging"
@@ -455,13 +460,11 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude liburma.so* \
     -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
 
-# Inject CUDA extensions into the repaired wheel.  patchelf (used by auditwheel)
-# can corrupt CUDA fatbins, causing cudaErrorInvalidKernelImage, so these .so
-# files are kept out of auditwheel and added here with RPATH=$ORIGIN intact.
+# Inject the PyTorch-versioned PG extensions into the repaired wheel.
 if [ -d "$CUDA_EP_STAGING_DIR" ] && ls "$CUDA_EP_STAGING_DIR"/*.so &>/dev/null; then
     REPAIRED_WHEEL=$(ls ${REPAIRED_DIR}/*.whl 2>/dev/null | head -1)
     if [ -n "$REPAIRED_WHEEL" ]; then
-        echo "Injecting CUDA extension .so files into repaired wheel..."
+        echo "Injecting PG extension .so files into repaired wheel..."
         WHEEL_UNPACK_DIR=$(mktemp -d)
         python${PYTHON_VERSION} -m wheel unpack "$REPAIRED_WHEEL" -d "$WHEEL_UNPACK_DIR"
         UNPACKED_PKG_DIR=$(find "$WHEEL_UNPACK_DIR" -mindepth 1 -maxdepth 1 -type d | head -1)

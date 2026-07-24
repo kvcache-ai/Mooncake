@@ -1,5 +1,6 @@
 import os
 import itertools
+import socket
 import unittest
 
 import torch
@@ -404,11 +405,17 @@ def stale_data_worker(rank, world_size):
 
 
 class TestMooncakeEPBuffer(unittest.TestCase):
+    @staticmethod
+    def _pick_free_port() -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            return int(sock.getsockname()[1])
+
     def setUp(self):
         import_torchada_if_needed()
         self.world_size = torch.cuda.device_count()
         os.environ["MASTER_ADDR"] = "127.0.0.1"
-        os.environ["MASTER_PORT"] = "29500"
+        os.environ["MASTER_PORT"] = str(self._pick_free_port())
 
     def run_single_config(self, config_dict):
         mp.spawn(

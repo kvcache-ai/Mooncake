@@ -4,68 +4,26 @@
 #include <pybind11/stl.h>
 #include <pybind11/chrono.h>
 #include <pybind11/functional.h>
-#include <torch/csrc/utils/pybind.h>
-#include <torch/python.h>
-#include <torch/torch.h>
 
 namespace py = pybind11;
 
 namespace mooncake {
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+void bind_legacy_buffer_perf(py::module_& module);
+
+PYBIND11_MODULE(_ep, m) {
     m.def("get_ep_buffer_size_hint", &get_ep_buffer_size_hint);
     m.def("calculate_elastic_buffer_size",
           &MooncakeElasticBuffer::calculate_buffer_size);
 
     py::class_<EventHandle>(m, "EventHandle")
-        .def(py::init<>())
-        .def("current_stream_wait", &EventHandle::current_stream_wait)
+        .def(py::init<uint64_t>(), py::arg("stream_ptr") = 0)
+        .def("current_stream_wait", &EventHandle::current_stream_wait,
+             py::arg("stream_ptr"))
         .def("synchronize", &EventHandle::synchronize);
 
-    py::class_<ElasticNativeHandle>(m, "ElasticNativeHandle")
-        .def(py::init<>())
-        .def_readwrite("do_expand", &ElasticNativeHandle::do_expand)
-        .def_readwrite("num_experts", &ElasticNativeHandle::num_experts)
-        .def_readwrite("expert_alignment",
-                       &ElasticNativeHandle::expert_alignment)
-        .def_readwrite("num_max_tokens_per_rank",
-                       &ElasticNativeHandle::num_max_tokens_per_rank)
-        .def_readwrite("num_sms", &ElasticNativeHandle::num_sms)
-        .def_readwrite("topk_idx", &ElasticNativeHandle::topk_idx)
-        .def_readwrite(
-            "psum_num_recv_tokens_per_scaleup_rank",
-            &ElasticNativeHandle::psum_num_recv_tokens_per_scaleup_rank)
-        .def_readwrite("psum_num_recv_tokens_per_expert",
-                       &ElasticNativeHandle::psum_num_recv_tokens_per_expert)
-        .def_readwrite("recv_src_metadata",
-                       &ElasticNativeHandle::recv_src_metadata)
-        .def_readwrite("recv_layout_range",
-                       &ElasticNativeHandle::recv_layout_range)
-        .def_readwrite("dst_buffer_slot_idx",
-                       &ElasticNativeHandle::dst_buffer_slot_idx)
-        .def_readwrite("token_metadata_at_forward",
-                       &ElasticNativeHandle::token_metadata_at_forward)
-        .def_readwrite("channel_linked_list",
-                       &ElasticNativeHandle::channel_linked_list)
-        .def_readwrite("num_recv_tokens_per_expert_list",
-                       &ElasticNativeHandle::num_recv_tokens_per_expert_list);
-
-    py::class_<ElasticDispatchOutput>(m, "ElasticDispatchOutput")
-        .def_readonly("recv_x", &ElasticDispatchOutput::recv_x)
-        .def_readonly("recv_x_scales", &ElasticDispatchOutput::recv_x_scales)
-        .def_readonly("recv_topk_idx", &ElasticDispatchOutput::recv_topk_idx)
-        .def_readonly("recv_topk_weights",
-                      &ElasticDispatchOutput::recv_topk_weights)
-        .def_readonly("handle", &ElasticDispatchOutput::handle)
-        .def_readonly("event", &ElasticDispatchOutput::event);
-
-    py::class_<ElasticCombineOutput>(m, "ElasticCombineOutput")
-        .def_readonly("combined_x", &ElasticCombineOutput::combined_x)
-        .def_readonly("combined_topk_weights",
-                      &ElasticCombineOutput::combined_topk_weights)
-        .def_readonly("event", &ElasticCombineOutput::event);
-
     m.attr("MAX_QP_COUNT") = pybind11::int_(MAX_QP_COUNT);
+    bind_legacy_buffer_perf(m);
 
     py::class_<MooncakeEpBuffer>(m, "Buffer")
         .def(py::init<int, int, int64_t>())
@@ -82,9 +40,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("sync_nvlink_ipc_handles",
              &MooncakeEpBuffer::sync_nvlink_ipc_handles)
         .def("dispatch", &MooncakeEpBuffer::dispatch)
-        .def("combine", &MooncakeEpBuffer::combine)
-        .def("get_next_combine_buffer",
-             &MooncakeEpBuffer::get_next_combine_buffer);
+        .def("combine", &MooncakeEpBuffer::combine);
 
     py::class_<MooncakeElasticBuffer>(m, "ElasticBuffer")
         .def(py::init<int, int, int64_t, int64_t, int64_t, int64_t, bool, bool,
@@ -117,18 +73,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_ipc_handle", &MooncakeElasticBuffer::get_ipc_handle)
         .def("sync_nvlink_ipc_handles",
              &MooncakeElasticBuffer::sync_nvlink_ipc_handles)
-        .def("dispatch", &MooncakeElasticBuffer::dispatch, py::arg("x"),
-             py::arg("sf"), py::arg("topk_idx"), py::arg("topk_weights"),
-             py::arg("active_ranks"), py::arg("num_experts"),
-             py::arg("num_max_tokens_per_rank"), py::arg("expert_alignment"),
-             py::arg("num_sms"), py::arg("do_expand"), py::arg("do_cpu_sync"),
-             py::arg("async_with_compute_stream"),
-             py::arg("cached_handle") = std::nullopt)
-        .def("combine", &MooncakeElasticBuffer::combine, py::arg("x"),
-             py::arg("handle"), py::arg("topk_weights"),
-             py::arg("active_ranks"), py::arg("num_sms"),
-             py::arg("async_with_compute_stream"),
-             py::arg("out") = std::nullopt);
+        .def("dispatch", &MooncakeElasticBuffer::dispatch)
+        .def("combine", &MooncakeElasticBuffer::combine);
 }
 
 }  // namespace mooncake
