@@ -30,6 +30,25 @@ std::string genGpuNodeName(int node) {
     return kWildcardLocation;
 }
 
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
+    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
+    defined(USE_COREX) || defined(USE_SUNRISE)
+// A GPU-less host (e.g. an RDMA-only sidecar) has no device for
+// cudaPointerGetAttributes to classify, yet a CUDA-enabled build probes
+// every buffer, each call failing and logging a per-buffer ERROR that
+// buries real logs. Detect the absence once and skip the probe.
+static bool detectCudaDevicePresent() {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess ||
+        device_count == 0) {
+        LOG(WARNING) << "No CUDA device detected; treating buffers as "
+                        "host memory";
+        return false;
+    }
+    return true;
+}
+#endif
+
 const std::vector<MemoryLocationEntry> getMemoryLocation(void *start,
                                                          size_t len,
                                                          bool only_first_page) {
@@ -38,19 +57,24 @@ const std::vector<MemoryLocationEntry> getMemoryLocation(void *start,
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX) || defined(USE_SUNRISE)
-    cudaPointerAttributes attributes;
-    cudaError_t result = cudaPointerGetAttributes(&attributes, start);
-    if (result != cudaSuccess) {
-        LOG(ERROR) << "cudaPointerGetAttributes failed (Error code: " << result
-                   << " - " << cudaGetErrorString(result) << ")" << std::endl;
-        entries.push_back({(uint64_t)start, len, kWildcardLocation});
-        return entries;
-    }
+    static const bool cuda_device_present = detectCudaDevicePresent();
 
-    if (attributes.type == cudaMemoryTypeDevice) {
-        entries.push_back(
-            {(uint64_t)start, len, genGpuNodeName(attributes.device)});
-        return entries;
+    if (cuda_device_present) {
+        cudaPointerAttributes attributes;
+        cudaError_t result = cudaPointerGetAttributes(&attributes, start);
+        if (result != cudaSuccess) {
+            LOG(ERROR) << "cudaPointerGetAttributes failed (Error code: "
+                       << result << " - " << cudaGetErrorString(result) << ")"
+                       << std::endl;
+            entries.push_back({(uint64_t)start, len, kWildcardLocation});
+            return entries;
+        }
+
+        if (attributes.type == cudaMemoryTypeDevice) {
+            entries.push_back(
+                {(uint64_t)start, len, genGpuNodeName(attributes.device)});
+            return entries;
+        }
     }
 #endif
 
