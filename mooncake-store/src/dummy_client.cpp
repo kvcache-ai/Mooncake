@@ -1084,6 +1084,20 @@ std::string DummyClient::get_hostname() const {
     return "";
 }
 
+std::vector<DummyClient::RegisteredBufferInfo>
+DummyClient::get_registered_buffers() const {
+    std::vector<RegisteredBufferInfo> result;
+    if (!shm_helper_) return result;
+
+    const auto& shms = shm_helper_->get_shms();
+    for (const auto& shm : shms) {
+        if (shm->registered && shm->base_addr && shm->size > 0) {
+            result.push_back({shm->base_addr, shm->size, shm->is_local});
+        }
+    }
+    return result;
+}
+
 std::vector<int> DummyClient::batch_put_from(
     const std::vector<std::string>& keys, const std::vector<void*>& buffer_ptrs,
     const std::vector<size_t>& sizes, const ReplicateConfig& config) {
@@ -1111,8 +1125,10 @@ std::vector<int> DummyClient::batch_put_from(
 
 int DummyClient::put_from(const std::string& key, void* buffer, size_t size,
                           const ReplicateConfig& config) {
-    // TODO: implement this function
-    return -1;
+    uint64_t buf_addr = reinterpret_cast<uint64_t>(buffer);
+    auto result = invoke_rpc<&RealClient::put_from_dummy_helper, void>(
+        key, buf_addr, size, config, device_id_, client_id_);
+    return to_py_ret(result);
 }
 
 std::vector<int64_t> DummyClient::batch_get_into(
