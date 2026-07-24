@@ -467,6 +467,7 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
     if (local_buffer_size > 0) {
         try {
             base_addr = shm_helper_->allocate(local_buffer_size);
+            local_buffer_base_ = base_addr;
         } catch (const std::exception& e) {
             LOG(ERROR) << "Failed to allocate shared memory: " << e.what();
             return -1;
@@ -476,6 +477,7 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
         if (!local_buffer_shm) {
             LOG(ERROR) << "Failed to get shm segment for base address";
             shm_helper_->free(base_addr);
+            local_buffer_base_ = nullptr;
             return -1;
         }
 
@@ -484,6 +486,7 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                 LOG(ERROR) << "Failed to register SHM via IPC";
                 // Register failed, cleanup
                 shm_helper_->free(local_buffer_shm->base_addr);
+                local_buffer_base_ = nullptr;
                 return -1;
             }
         } else {
@@ -491,6 +494,7 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                 LOG(ERROR) << "Failed to register SHM via IPC";
                 // Register failed, cleanup
                 shm_helper_->free(local_buffer_shm->base_addr);
+                local_buffer_base_ = nullptr;
                 return -1;
             }
         }
@@ -510,7 +514,14 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
 }
 
 int DummyClient::tearDownAll() {
+    void* local_buffer_base = local_buffer_base_;
     unregister_shm();
+    if (local_buffer_base && shm_helper_ &&
+        shm_helper_->get_shm(local_buffer_base) &&
+        shm_helper_->free(local_buffer_base) != 0) {
+        LOG(ERROR) << "Failed to free dummy local shared memory";
+    }
+    local_buffer_base_ = nullptr;
 
     // Cleanup hot cache shm mapping
     if (hot_cache_base_) {
@@ -538,6 +549,23 @@ int DummyClient::tearDownAll() {
     }
 #endif
     return 0;
+}
+
+std::optional<BufferHandle> DummyClient::allocate_client_buffer(size_t size) {
+    auto result = invoke_rpc<&RealClient::allocate_buffer_dummy,
+                             std::tuple<uint64_t, size_t>>(size, client_id_);
+    if (!result.has_value()) {
+        return std::nullopt;
+    }
+
+    auto [dummy_addr, allocated_size] = result.value();
+    void* local_ptr = reinterpret_cast<void*>(dummy_addr);
+    auto release = [this, dummy_addr]() {
+        (void)invoke_rpc<&RealClient::release_buffer_dummy, void>(dummy_addr,
+                                                                  client_id_);
+    };
+    return std::make_optional<BufferHandle>(local_ptr, allocated_size,
+                                            std::move(release));
 }
 
 int64_t DummyClient::unregister_shm() {
@@ -1111,8 +1139,8 @@ std::vector<int> DummyClient::batch_put_from(
 
 int DummyClient::put_from(const std::string& key, void* buffer, size_t size,
                           const ReplicateConfig& config) {
-    // TODO: implement this function
-    return -1;
+    auto results = batch_put_from({key}, {buffer}, {size}, config);
+    return results.empty() ? -1 : results[0];
 }
 
 std::vector<int64_t> DummyClient::batch_get_into(
@@ -1143,8 +1171,9 @@ int DummyClient::put_from_with_metadata(const std::string& key, void* buffer,
                                         void* metadata_buffer, size_t size,
                                         size_t metadata_size,
                                         const ReplicateConfig& config) {
-    // TODO: implement this function
-    return -1;
+    auto results = batch_put_from_multi_buffers(
+        {key}, {{metadata_buffer, buffer}}, {{metadata_size, size}}, config);
+    return results.empty() ? -1 : results[0];
 }
 
 std::vector<int> DummyClient::batch_put_from_multi_buffers(

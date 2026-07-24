@@ -5,6 +5,7 @@
 #include <csignal>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -369,6 +370,13 @@ class PyClient {
 
     virtual tl::expected<QueryTaskResponse, ErrorCode> query_task(
         const UUID &task_id) = 0;
+
+    virtual std::optional<BufferHandle> allocate_client_buffer(size_t size) {
+        if (!client_buffer_allocator_) {
+            return std::nullopt;
+        }
+        return client_buffer_allocator_->allocate(size);
+    }
 
     std::shared_ptr<mooncake::Client> client_ = nullptr;
     std::shared_ptr<mooncake::ClientRequester> client_requester_ = nullptr;

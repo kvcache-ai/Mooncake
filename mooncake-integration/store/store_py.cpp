@@ -610,16 +610,16 @@ class MooncakeStorePyWrapper {
 
     pybind11::object get_tensor_into(const std::string &key,
                                      uintptr_t buffer_ptr, size_t size) {
-        char *buffer = reinterpret_cast<char *>(buffer_ptr);
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
             return pybind11::none();
         }
-
-        if (use_dummy_client_) {
-            LOG(ERROR) << "get_tensor is not supported for dummy client now";
+        if (buffer_ptr == 0) {
+            LOG(ERROR) << "Buffer pointer cannot be null";
             return pybind11::none();
         }
+
+        char *buffer = reinterpret_cast<char *>(buffer_ptr);
 
         int64_t total_length;
         {
@@ -634,29 +634,34 @@ class MooncakeStorePyWrapper {
         const std::vector<std::string> &keys,
         const std::vector<uintptr_t> &buffer_ptrs,
         const std::vector<size_t> &sizes) {
+        auto invalid_params = [&keys]() {
+            py::list empty_list;
+            for (size_t i = 0; i < keys.size(); ++i) {
+                empty_list.append(to_py_ret(ErrorCode::INVALID_PARAMS));
+            }
+            return empty_list;
+        };
+
+        if (!is_client_initialized()) {
+            LOG(ERROR) << "Client is not initialized";
+            return invalid_params();
+        }
+        if (keys.size() != buffer_ptrs.size() || keys.size() != sizes.size()) {
+            LOG(ERROR) << "Size mismatch: keys, buffer_ptrs, and sizes must "
+                          "have the same length";
+            return invalid_params();
+        }
+        for (uintptr_t ptr : buffer_ptrs) {
+            if (ptr == 0) {
+                LOG(ERROR) << "Buffer pointer cannot be null";
+                return invalid_params();
+            }
+        }
+
         std::vector<void *> buffers;
         buffers.reserve(buffer_ptrs.size());
         for (uintptr_t ptr : buffer_ptrs) {
             buffers.push_back(reinterpret_cast<void *>(ptr));
-        }
-
-        if (!is_client_initialized()) {
-            LOG(ERROR) << "Client is not initialized";
-            py::list empty_list;
-            for (size_t i = 0; i < keys.size(); ++i) {
-                empty_list.append(to_py_ret(ErrorCode::INVALID_PARAMS));
-            }
-            return empty_list;
-        }
-
-        if (use_dummy_client_) {
-            LOG(ERROR) << "batch_get_tensor is not supported for dummy client "
-                          "now";
-            py::list empty_list;
-            for (size_t i = 0; i < keys.size(); ++i) {
-                empty_list.append(to_py_ret(ErrorCode::INVALID_PARAMS));
-            }
-            return empty_list;
         }
 
         // Phase 1: Batch Get Buffers (GIL Released)
@@ -667,14 +672,10 @@ class MooncakeStorePyWrapper {
             total_lengths = store_->batch_get_into(keys, buffers, sizes);
         }
 
-        if (keys.size() != buffer_ptrs.size() || keys.size() != sizes.size()) {
-            LOG(ERROR) << "Size mismatch: keys, buffer_ptrs, and sizes must "
-                          "have the same length";
-            py::list empty_list;
-            for (size_t i = 0; i < keys.size(); ++i) {
-                empty_list.append(to_py_ret(ErrorCode::INVALID_PARAMS));
-            }
-            return empty_list;
+        if (total_lengths.size() != keys.size()) {
+            LOG(ERROR) << "Unexpected batch_get_into result count "
+                       << total_lengths.size() << ", expected " << keys.size();
+            return invalid_params();
         }
 
         py::list results_list;
@@ -696,12 +697,6 @@ class MooncakeStorePyWrapper {
             return pybind11::none();
         }
 
-        if (use_dummy_client_) {
-            LOG(ERROR)
-                << "get_tensor_into is not supported for dummy client now";
-            return pybind11::none();
-        }
-
         if (tp_size <= 1) {
             return get_tensor_into(key, buffer_ptr, size);
         }
@@ -719,16 +714,6 @@ class MooncakeStorePyWrapper {
         const std::vector<size_t> &sizes, int tp_rank = 0, int tp_size = 1) {
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
-            py::list empty_list;
-            for (size_t i = 0; i < base_keys.size(); ++i) {
-                empty_list.append(py::none());
-            }
-            return empty_list;
-        }
-
-        if (use_dummy_client_) {
-            LOG(ERROR) << "batch_get_tensor_with_tp_into is not supported for "
-                          "dummy client";
             py::list empty_list;
             for (size_t i = 0; i < base_keys.size(); ++i) {
                 empty_list.append(py::none());
@@ -757,6 +742,9 @@ class MooncakeStorePyWrapper {
         // Validation & Metadata extraction (GIL Held)
         auto info = extract_tensor_info(tensor, key);
         if (!info.valid()) return to_py_ret(ErrorCode::INVALID_PARAMS);
+        if (use_dummy_client_) {
+            return put_tensor_info_impl(key, info, config);
+        }
 
         // Prepare spans
         std::vector<std::span<const char>> values;
@@ -774,9 +762,8 @@ class MooncakeStorePyWrapper {
     }
 
     int put_tensor(const std::string &key, pybind11::object tensor) {
-        if (!is_client_initialized() || use_dummy_client_) {
-            LOG(ERROR) << "Client not initialized or Dummy client not "
-                          "supported for tensors";
+        if (!is_client_initialized()) {
+            LOG(ERROR) << "Client not initialized";
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
         return put_tensor_impl(key, tensor,
@@ -864,9 +851,8 @@ class MooncakeStorePyWrapper {
     int put_tensor_with_tp(const std::string &key, pybind11::object tensor,
                            int tp_rank = 0, int tp_size = 1,
                            int split_dim = 0) {
-        if (!is_client_initialized() || use_dummy_client_) {
-            LOG(ERROR) << "Client not initialized or Dummy client not "
-                          "supported for tensors";
+        if (!is_client_initialized()) {
+            LOG(ERROR) << "Client not initialized";
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
         if (tp_size <= 1) return put_tensor(key, tensor);
@@ -903,7 +889,7 @@ class MooncakeStorePyWrapper {
 
     std::vector<int> batch_put_tensor(const std::vector<std::string> &keys,
                                       const pybind11::list &tensors_list) {
-        if (!is_client_initialized() || use_dummy_client_)
+        if (!is_client_initialized())
             return std::vector<int>(keys.size(),
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
 
@@ -993,7 +979,7 @@ class MooncakeStorePyWrapper {
         const pybind11::list &tensors_list, int tp_rank = 0, int tp_size = 1,
         int split_dim = 0) {
         if (tp_size <= 1) return batch_put_tensor(base_keys, tensors_list);
-        if (!is_client_initialized() || use_dummy_client_)
+        if (!is_client_initialized())
             return std::vector<int>(base_keys.size(),
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
 
@@ -1020,10 +1006,6 @@ class MooncakeStorePyWrapper {
             LOG(ERROR) << "Client is not initialized";
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
-        if (use_dummy_client_) {
-            LOG(ERROR) << "put_tensor_from is not supported for dummy client";
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
-        }
         if (size < sizeof(TensorMetadata)) {
             LOG(ERROR) << "Buffer size too small for tensor metadata";
             return to_py_ret(ErrorCode::INVALID_PARAMS);
@@ -1043,12 +1025,6 @@ class MooncakeStorePyWrapper {
         const std::vector<size_t> &sizes) {
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
-            return std::vector<int>(keys.size(),
-                                    to_py_ret(ErrorCode::INVALID_PARAMS));
-        }
-        if (use_dummy_client_) {
-            LOG(ERROR)
-                << "batch_put_tensor_from is not supported for dummy client";
             return std::vector<int>(keys.size(),
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
         }
@@ -1094,6 +1070,12 @@ class MooncakeStorePyWrapper {
     int put_tensor_info_impl(const std::string &key, const PyTensorInfo &info,
                              const ReplicateConfig &config) {
         if (!info.valid()) return to_py_ret(ErrorCode::INVALID_PARAMS);
+        if (use_dummy_client_) {
+            auto results = batch_put_tensor_infos_impl(
+                {key}, std::vector<PyTensorInfo>{info}, config);
+            return results.empty() ? to_py_ret(ErrorCode::INTERNAL_ERROR)
+                                   : results[0];
+        }
 
         std::vector<std::span<const char>> values;
         values.emplace_back(reinterpret_cast<const char *>(&info.metadata),
@@ -1135,11 +1117,6 @@ class MooncakeStorePyWrapper {
             LOG(ERROR) << "Client is not initialized";
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
-        if (use_dummy_client_) {
-            LOG(ERROR)
-                << "put_tensor_with_tp_from is not supported for dummy client";
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
-        }
         if (buffer_ptr == 0) {
             LOG(ERROR) << "Buffer pointer cannot be null";
             return to_py_ret(ErrorCode::INVALID_PARAMS);
@@ -1171,12 +1148,6 @@ class MooncakeStorePyWrapper {
         int split_dim = 0) {
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
-            return std::vector<int>(base_keys.size(),
-                                    to_py_ret(ErrorCode::INVALID_PARAMS));
-        }
-        if (use_dummy_client_) {
-            LOG(ERROR) << "batch_put_tensor_with_tp_from is not supported for "
-                          "dummy client";
             return std::vector<int>(base_keys.size(),
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
         }
@@ -1306,6 +1277,12 @@ class MooncakeStorePyWrapper {
                                 const PyTensorInfo &info,
                                 const ReplicateConfig &config) {
         if (!info.valid()) return to_py_ret(ErrorCode::INVALID_PARAMS);
+        if (use_dummy_client_) {
+            auto results = batch_upsert_tensor_infos_impl(
+                {key}, std::vector<PyTensorInfo>{info}, config);
+            return results.empty() ? to_py_ret(ErrorCode::INTERNAL_ERROR)
+                                   : results[0];
+        }
 
         std::vector<std::span<const char>> values;
         values.emplace_back(reinterpret_cast<const char *>(&info.metadata),
@@ -1324,6 +1301,9 @@ class MooncakeStorePyWrapper {
                            const ReplicateConfig &config) {
         auto info = extract_tensor_info(tensor, key);
         if (!info.valid()) return to_py_ret(ErrorCode::INVALID_PARAMS);
+        if (use_dummy_client_) {
+            return upsert_tensor_info_impl(key, info, config);
+        }
 
         std::vector<std::span<const char>> values;
         values.emplace_back(reinterpret_cast<const char *>(&info.metadata),
@@ -1339,9 +1319,8 @@ class MooncakeStorePyWrapper {
     }
 
     int upsert_tensor(const std::string &key, pybind11::object tensor) {
-        if (!is_client_initialized() || use_dummy_client_) {
-            LOG(ERROR) << "Client not initialized or Dummy client not "
-                          "supported for tensors";
+        if (!is_client_initialized()) {
+            LOG(ERROR) << "Client not initialized";
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
         return upsert_tensor_impl(key, tensor, ReplicateConfig{});
@@ -1378,12 +1357,6 @@ class MooncakeStorePyWrapper {
         const std::vector<size_t> &sizes) {
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
-            return std::vector<int>(keys.size(),
-                                    to_py_ret(ErrorCode::INVALID_PARAMS));
-        }
-        if (use_dummy_client_) {
-            LOG(ERROR)
-                << "batch_upsert_tensor_from is not supported for dummy client";
             return std::vector<int>(keys.size(),
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
         }
@@ -1427,6 +1400,21 @@ class MooncakeStorePyWrapper {
                                          ReplicateConfig{});
     }
 
+    std::vector<int> batch_upsert_tensor_infos_impl(
+        const std::vector<std::string> &keys,
+        const std::vector<PyTensorInfo> &infos,
+        const ReplicateConfig &config = ReplicateConfig{}) {
+        return batch_write_tensor_impl(
+            keys, infos, config, "upsert",
+            [this](const std::vector<std::string> &write_keys,
+                   const std::vector<void *> &buffer_ptrs,
+                   const std::vector<size_t> &buffer_sizes,
+                   const ReplicateConfig &write_config) {
+                return store_->batch_upsert_from(write_keys, buffer_ptrs,
+                                                 buffer_sizes, write_config);
+            });
+    }
+
     std::vector<int> batch_upsert_tensor_impl(
         const std::vector<std::string> &keys,
         const pybind11::list &tensors_list,
@@ -1438,76 +1426,15 @@ class MooncakeStorePyWrapper {
         }
 
         std::vector<PyTensorInfo> infos(keys.size());
-        std::vector<int> results(keys.size(), 0);
-
-        // 1. Extract Metadata (GIL Held)
         for (size_t i = 0; i < keys.size(); ++i) {
             infos[i] = extract_tensor_info(tensors_list[i], keys[i]);
-            if (!infos[i].valid())
-                results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
         }
-
-        // 2. Prepare Buffers and Execute (GIL Released)
-        {
-            py::gil_scoped_release release_gil;
-
-            std::vector<std::string> valid_keys;
-            std::vector<void *> buffer_ptrs;
-            std::vector<size_t> buffer_sizes;
-            std::vector<size_t> original_indices;
-
-            std::vector<std::unique_ptr<BufferHandle>> temp_allocations;
-
-            for (size_t i = 0; i < infos.size(); ++i) {
-                if (!infos[i].valid()) continue;
-
-                size_t total_size =
-                    sizeof(TensorMetadata) + infos[i].tensor_size;
-                auto alloc_result =
-                    store_->client_buffer_allocator_->allocate(total_size);
-
-                if (!alloc_result) {
-                    LOG(ERROR)
-                        << "Failed to allocate buffer for key: " << keys[i];
-                    results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
-                    continue;
-                }
-
-                // Copy Metadata & Data
-                char *dst = static_cast<char *>(alloc_result->ptr());
-                memcpy(dst, &infos[i].metadata, sizeof(TensorMetadata));
-                if (infos[i].tensor_size > 0) {
-                    memcpy(dst + sizeof(TensorMetadata),
-                           reinterpret_cast<void *>(infos[i].data_ptr),
-                           infos[i].tensor_size);
-                }
-
-                valid_keys.push_back(keys[i]);
-                buffer_ptrs.push_back(alloc_result->ptr());
-                buffer_sizes.push_back(total_size);
-                original_indices.push_back(i);
-
-                temp_allocations.push_back(
-                    std::make_unique<BufferHandle>(std::move(*alloc_result)));
-            }
-
-            if (!valid_keys.empty()) {
-                ReplicateConfig write_config =
-                    MakeIndexedConfig(config, original_indices);
-                std::vector<int> op_results = store_->batch_upsert_from(
-                    valid_keys, buffer_ptrs, buffer_sizes, write_config);
-                for (size_t i = 0; i < op_results.size(); ++i) {
-                    results[original_indices[i]] = op_results[i];
-                }
-            }
-        }
-
-        return results;
+        return batch_upsert_tensor_infos_impl(keys, infos, config);
     }
 
     std::vector<int> batch_upsert_tensor(const std::vector<std::string> &keys,
                                          const pybind11::list &tensors_list) {
-        if (!is_client_initialized() || use_dummy_client_)
+        if (!is_client_initialized())
             return std::vector<int>(keys.size(),
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
 
@@ -1529,11 +1456,6 @@ class MooncakeStorePyWrapper {
         void *buffer = reinterpret_cast<void *>(buffer_ptr);
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
-        }
-        if (use_dummy_client_) {
-            LOG(ERROR)
-                << "upsert_tensor_from is not supported for dummy client";
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
         if (size < sizeof(TensorMetadata)) {
@@ -1564,9 +1486,8 @@ class MooncakeStorePyWrapper {
 
     int upsert_pub_tensor(const std::string &key, pybind11::object tensor,
                           const ReplicateConfig &config = ReplicateConfig{}) {
-        if (!is_client_initialized() || use_dummy_client_) {
-            LOG(ERROR) << "Client not initialized or Dummy client not "
-                          "supported for tensors";
+        if (!is_client_initialized()) {
+            LOG(ERROR) << "Client not initialized";
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
 
@@ -1580,7 +1501,7 @@ class MooncakeStorePyWrapper {
         const std::vector<std::string> &keys,
         const pybind11::list &tensors_list,
         const ReplicateConfig &config = ReplicateConfig{}) {
-        if (!is_client_initialized() || use_dummy_client_)
+        if (!is_client_initialized())
             return std::vector<int>(keys.size(),
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
 
@@ -1602,9 +1523,8 @@ class MooncakeStorePyWrapper {
     // --- End Upsert tensor methods ---
     int pub_tensor(const std::string &key, pybind11::object tensor,
                    const ReplicateConfig &config = ReplicateConfig{}) {
-        if (!is_client_initialized() || use_dummy_client_) {
-            LOG(ERROR) << "Client not initialized or Dummy client not "
-                          "supported for tensors";
+        if (!is_client_initialized()) {
+            LOG(ERROR) << "Client not initialized";
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
 
@@ -1618,9 +1538,8 @@ class MooncakeStorePyWrapper {
                            const ReplicateConfig &config = ReplicateConfig{},
                            int tp_rank = 0, int tp_size = 1,
                            int split_dim = 0) {
-        if (!is_client_initialized() || use_dummy_client_) {
-            LOG(ERROR) << "Client not initialized or Dummy client not "
-                          "supported for tensors";
+        if (!is_client_initialized()) {
+            LOG(ERROR) << "Client not initialized";
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
 
@@ -1637,7 +1556,7 @@ class MooncakeStorePyWrapper {
         const std::vector<std::string> &keys,
         const pybind11::list &tensors_list,
         const ReplicateConfig &config = ReplicateConfig{}) {
-        if (!is_client_initialized() || use_dummy_client_)
+        if (!is_client_initialized())
             return std::vector<int>(keys.size(),
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
 
@@ -1663,7 +1582,7 @@ class MooncakeStorePyWrapper {
         int tp_size = 1, int split_dim = 0) {
         if (tp_size <= 1)
             return batch_pub_tensor(base_keys, tensors_list, config);
-        if (!is_client_initialized() || use_dummy_client_)
+        if (!is_client_initialized())
             return std::vector<int>(base_keys.size(),
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
 
@@ -1687,12 +1606,6 @@ class MooncakeStorePyWrapper {
                                   py::object file_name_obj = py::none()) {
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
-        }
-
-        if (use_dummy_client_) {
-            LOG(ERROR) << "save_tensor_to_safetensor is not supported for "
-                       << "dummy client now";
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
 
@@ -1722,12 +1635,6 @@ class MooncakeStorePyWrapper {
                                                  const std::string &file_name) {
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
-            return pybind11::none();
-        }
-
-        if (use_dummy_client_) {
-            LOG(ERROR) << "load_tensor_from_safetensor is not supported for "
-                       << "dummy client now";
             return pybind11::none();
         }
 

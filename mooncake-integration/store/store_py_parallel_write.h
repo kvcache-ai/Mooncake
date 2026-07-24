@@ -20,6 +20,13 @@ std::vector<int> batch_write_tensor_impl(const std::vector<std::string> &keys,
                                          const ReplicateConfig &config,
                                          const char *operation_name,
                                          BatchWriteFromFn &&batch_write_from) {
+    if (keys.size() != infos.size()) {
+        LOG(ERROR) << operation_name
+                   << ": keys and tensor infos must have the same length";
+        return std::vector<int>(keys.size(),
+                                to_py_ret(ErrorCode::INVALID_PARAMS));
+    }
+
     auto group_ids_error =
         ValidateGroupIdsForBatchConfig(config, keys.size(), operation_name);
     if (!group_ids_error.empty()) {
@@ -30,6 +37,14 @@ std::vector<int> batch_write_tensor_impl(const std::vector<std::string> &keys,
 
     {
         py::gil_scoped_release release_gil;
+        if (!store_->client_buffer_allocator_ && !use_dummy_client_) {
+            LOG(ERROR) << operation_name
+                       << ": client buffer allocator is not available";
+            return std::vector<int>(keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+        auto runtime_accelerator =
+            mooncake::device::GetAcceleratorRegistry().RuntimeAccelerators();
 
         std::vector<std::string> valid_keys;
         std::vector<void *> buffer_ptrs;
@@ -45,8 +60,7 @@ std::vector<int> batch_write_tensor_impl(const std::vector<std::string> &keys,
 
             size_t total_size =
                 infos[i].metadata.header.data_offset + infos[i].tensor_size;
-            auto alloc_result =
-                store_->client_buffer_allocator_->allocate(total_size);
+            auto alloc_result = store_->allocate_client_buffer(total_size);
 
             if (!alloc_result) {
                 LOG(ERROR) << "Failed to allocate buffer for " << operation_name
@@ -59,9 +73,15 @@ std::vector<int> batch_write_tensor_impl(const std::vector<std::string> &keys,
             std::memcpy(dst, &infos[i].metadata,
                         infos[i].metadata.header.data_offset);
             if (infos[i].tensor_size > 0) {
-                std::memcpy(dst + infos[i].metadata.header.data_offset,
-                            reinterpret_cast<void *>(infos[i].data_ptr),
-                            infos[i].tensor_size);
+                if (!runtime_accelerator.CopyToHost(
+                        dst + infos[i].metadata.header.data_offset,
+                        reinterpret_cast<const void *>(infos[i].data_ptr),
+                        infos[i].tensor_size)) {
+                    LOG(ERROR) << "Failed to copy tensor payload for "
+                               << operation_name << " key: " << keys[i];
+                    results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
+                    continue;
+                }
             }
 
             valid_keys.push_back(keys[i]);
@@ -77,6 +97,16 @@ std::vector<int> batch_write_tensor_impl(const std::vector<std::string> &keys,
                 MakeIndexedConfig(config, original_indices);
             std::vector<int> op_results = batch_write_from(
                 valid_keys, buffer_ptrs, buffer_sizes, write_config);
+            if (op_results.size() != original_indices.size()) {
+                LOG(ERROR) << operation_name
+                           << ": unexpected batch write result count "
+                           << op_results.size() << ", expected "
+                           << original_indices.size();
+                for (size_t index : original_indices) {
+                    results[index] = to_py_ret(ErrorCode::INTERNAL_ERROR);
+                }
+                return results;
+            }
             for (size_t i = 0; i < op_results.size(); ++i) {
                 results[original_indices[i]] = op_results[i];
             }
@@ -87,10 +117,8 @@ std::vector<int> batch_write_tensor_impl(const std::vector<std::string> &keys,
 }
 
 bool ensure_tensor_write_supported(const char *operation_name) const {
-    if (!is_client_initialized() || use_dummy_client_) {
-        LOG(ERROR) << operation_name
-                   << ": client not initialized or dummy client not "
-                      "supported for tensors";
+    if (!is_client_initialized()) {
+        LOG(ERROR) << operation_name << ": client not initialized";
         return false;
     }
     return true;
@@ -927,7 +955,7 @@ std::vector<int> batch_put_tensor_with_parallelism(
         keys, tensors_list.size(), parallelisms, writer_partitions,
         "batch_put_tensor_with_parallelism",
         [this, &keys, &tensors_list, &config]() {
-            if (!is_client_initialized() || use_dummy_client_) {
+            if (!is_client_initialized()) {
                 return std::vector<int>(keys.size(),
                                         to_py_ret(ErrorCode::INVALID_PARAMS));
             }
@@ -1060,7 +1088,7 @@ std::vector<int> batch_put_tensor_with_parallelism_from(
         "batch_put_tensor_with_parallelism_from",
         [this, &keys, &buffer_ptrs, &sizes, &config]() {
             if (!is_default_replicate_config(config)) {
-                if (!is_client_initialized() || use_dummy_client_) {
+                if (!is_client_initialized()) {
                     return std::vector<int>(
                         keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
                 }
@@ -1300,11 +1328,6 @@ int execute_upsert_tensor_with_parallelism_from_route(
                     LOG(ERROR) << "Client is not initialized";
                     return to_py_ret(ErrorCode::INVALID_PARAMS);
                 }
-                if (use_dummy_client_) {
-                    LOG(ERROR) << "upsert_tensor_with_parallelism_from is not "
-                                  "supported for dummy client";
-                    return to_py_ret(ErrorCode::INVALID_PARAMS);
-                }
                 int validate_result = validate_replicate_config(write_config);
                 if (validate_result) return validate_result;
                 py::gil_scoped_release release_gil;
@@ -1383,7 +1406,7 @@ std::vector<int> batch_upsert_tensor_with_parallelism(
         keys, tensors_list.size(), parallelisms, writer_partitions,
         "batch_upsert_tensor_with_parallelism",
         [this, &keys, &tensors_list, &config]() {
-            if (!is_client_initialized() || use_dummy_client_) {
+            if (!is_client_initialized()) {
                 return std::vector<int>(keys.size(),
                                         to_py_ret(ErrorCode::INVALID_PARAMS));
             }
@@ -1428,12 +1451,6 @@ std::vector<int> batch_upsert_tensor_with_parallelism_from(
             if (!is_default_replicate_config(config)) {
                 if (!is_client_initialized()) {
                     LOG(ERROR) << "Client is not initialized";
-                    return std::vector<int>(
-                        keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
-                }
-                if (use_dummy_client_) {
-                    LOG(ERROR) << "batch_upsert_tensor_with_parallelism_from "
-                                  "is not supported for dummy client";
                     return std::vector<int>(
                         keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
                 }
