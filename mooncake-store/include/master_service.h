@@ -2116,6 +2116,9 @@ class MasterService {
     // Task manager
     ClientTaskManager task_manager_;
 
+    using DrainSourceSegmentsByClient =
+        std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>;
+
     struct ActiveDrainTask {
         UUID task_id;
         TenantId tenant_id;
@@ -2135,10 +2138,12 @@ class MasterService {
         std::chrono::system_clock::time_point created_at;
         std::chrono::system_clock::time_point last_updated_at;
         std::string message;
+        DrainSourceSegmentsByClient source_segments_by_client;
         uint64_t succeeded_units{0};
         uint64_t failed_units{0};
         uint64_t blocked_units{0};
         uint64_t migrated_bytes{0};
+        bool has_unsupported_local_disk_replicas{false};
         std::unordered_map<UUID, ActiveDrainTask, boost::hash<UUID>>
             active_tasks;
         std::unordered_set<std::string> completed_unit_keys;
@@ -2163,6 +2168,13 @@ class MasterService {
     std::string MakeDrainUnitKey(const TenantId& tenant_id,
                                  const std::string& key,
                                  const std::string& source_segment) const;
+    std::string MakeDrainLocalDiskUnitKey(const std::string& tenant_id,
+                                          const std::string& key,
+                                          const UUID& client_id) const;
+    void VisitDrainSourceLocalDiskReplicas(
+        const DrainJob& job, const ObjectMetadata& metadata,
+        const std::function<void(const UUID&, const std::vector<std::string>&)>&
+            visit_fn) const;
 
     std::thread job_dispatch_thread_;
     std::atomic<bool> job_dispatch_running_{false};

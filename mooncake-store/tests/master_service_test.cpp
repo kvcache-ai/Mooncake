@@ -6481,6 +6481,132 @@ TEST_F(MasterServiceTest, DrainJobSchedulesMoveTaskAndConvergesToDrained) {
     EXPECT_FALSE(segment_names.contains("segment_0"));
 }
 
+TEST_F(MasterServiceTest,
+       DrainJobFailsWhenLocalDiskReplicaRemainsOnSourceClient) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_enable_offload(true)
+                              .set_default_kv_lease_ttl(0)
+                              .build();
+    auto service_ = std::make_unique<MasterService>(service_config);
+
+    const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
+                                           kDefaultSegmentSize);
+    [[maybe_unused]] const auto ctx1 = PrepareSimpleSegment(
+        *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
+    ASSERT_TRUE(
+        service_->MountLocalDiskSegment(ctx0.client_id, true).has_value());
+
+    const std::string key = "drain_local_disk_only_key";
+    constexpr int64_t object_size = 1024;
+    OffloadTaskItem task{
+        .tenant_id = "default", .key = key, .size = object_size};
+    StorageObjectMetadata metadata;
+    metadata.data_size = object_size;
+    metadata.transport_endpoint = "local-disk-endpoint";
+    ASSERT_TRUE(
+        service_->NotifyOffloadSuccess(ctx0.client_id, {task}, {metadata})
+            .has_value());
+
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0"};
+    request.target_segments = {"segment_1"};
+    request.max_concurrency = 1;
+
+    auto job_id = service_->CreateDrainJob(request);
+    ASSERT_TRUE(job_id.has_value());
+
+    WaitUntil([&] {
+        auto query = service_->QueryDrainJob(job_id.value());
+        return query.has_value() && query->status == JobStatus::FAILED;
+    });
+
+    auto query = service_->QueryDrainJob(job_id.value());
+    ASSERT_TRUE(query.has_value());
+    EXPECT_EQ(query->status, JobStatus::FAILED);
+    EXPECT_EQ(query->active_units, 0u);
+    EXPECT_EQ(query->failed_units, 1u);
+    EXPECT_NE(query->message.find("LOCAL_DISK"), std::string::npos);
+
+    auto segment_status = service_->QuerySegmentStatus("segment_0");
+    ASSERT_TRUE(segment_status.has_value());
+    EXPECT_EQ(segment_status.value(), SegmentStatus::OK);
+}
+
+TEST_F(MasterServiceTest,
+       DrainJobMovesMemoryThenFailsForRemainingLocalDiskReplica) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_enable_offload(true)
+                              .set_default_kv_lease_ttl(0)
+                              .build();
+    auto service_ = std::make_unique<MasterService>(service_config);
+
+    const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
+                                           kDefaultSegmentSize);
+    [[maybe_unused]] const auto ctx1 = PrepareSimpleSegment(
+        *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
+    ASSERT_TRUE(
+        service_->MountLocalDiskSegment(ctx0.client_id, true).has_value());
+
+    constexpr int64_t object_size = 1024;
+    const std::string key =
+        PutObjectOnSegment(*service_, ctx0.client_id, "segment_0", object_size);
+    OffloadTaskItem task{
+        .tenant_id = "default", .key = key, .size = object_size};
+    StorageObjectMetadata metadata;
+    metadata.data_size = object_size;
+    metadata.transport_endpoint = "local-disk-endpoint";
+    ASSERT_TRUE(
+        service_->NotifyOffloadSuccess(ctx0.client_id, {task}, {metadata})
+            .has_value());
+
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0"};
+    request.target_segments = {"segment_1"};
+    request.max_concurrency = 1;
+
+    auto job_id = service_->CreateDrainJob(request);
+    ASSERT_TRUE(job_id.has_value());
+
+    WaitUntil(
+        [&] { return ExecutePendingMoveTasks(*service_, ctx0.client_id); });
+    WaitUntil([&] {
+        auto query = service_->QueryDrainJob(job_id.value());
+        return query.has_value() && query->status == JobStatus::FAILED;
+    });
+
+    auto query = service_->QueryDrainJob(job_id.value());
+    ASSERT_TRUE(query.has_value());
+    EXPECT_EQ(query->status, JobStatus::FAILED);
+    EXPECT_EQ(query->active_units, 0u);
+    EXPECT_EQ(query->succeeded_units, 1u);
+    EXPECT_EQ(query->failed_units, 1u);
+    EXPECT_NE(query->message.find("LOCAL_DISK"), std::string::npos);
+
+    auto segment_status = service_->QuerySegmentStatus("segment_0");
+    ASSERT_TRUE(segment_status.has_value());
+    EXPECT_EQ(segment_status.value(), SegmentStatus::OK);
+
+    auto replicas = service_->GetReplicaList(key, "default");
+    ASSERT_TRUE(replicas.has_value());
+    bool has_source_memory = false;
+    bool has_target_memory = false;
+    bool has_source_local_disk = false;
+    for (const auto& replica : replicas->replicas) {
+        if (replica.is_memory_replica()) {
+            const auto& endpoint = replica.get_memory_descriptor()
+                                       .buffer_descriptor.transport_endpoint_;
+            has_source_memory |= endpoint == "segment_0";
+            has_target_memory |= endpoint == "segment_1";
+        } else if (replica.is_local_disk_replica()) {
+            has_source_local_disk |=
+                replica.get_local_disk_descriptor().client_id == ctx0.client_id;
+        }
+    }
+    EXPECT_FALSE(has_source_memory);
+    EXPECT_TRUE(has_target_memory);
+    EXPECT_TRUE(has_source_local_disk);
+}
+
 TEST_F(MasterServiceTest, CancelDrainJobRestoresSegmentStatus) {
     auto service_ = std::make_unique<MasterService>();
 
