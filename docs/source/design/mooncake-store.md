@@ -564,7 +564,7 @@ Mooncake Store provides multiple built-in allocation strategies to control how s
 ./build/mooncake-store/src/mooncake_master --allocation_strategy=free_ratio_first
 ```
 
-Valid values are: `random` (default), `free_ratio_first`, `ssd_free_ratio_first`, `cxl`, `local_first` (case-sensitive).
+Valid values are: `random` (default), `free_ratio_first`, `fragmentation_aware`, `ssd_free_ratio_first`, `cxl`, `local_first` (case-sensitive).
 
 #### How to Choose
 
@@ -572,6 +572,7 @@ Valid values are: `random` (default), `free_ratio_first`, `ssd_free_ratio_first`
 |---|---|---|
 | `random` | Maximum throughput, stable clusters | Limited load balancing; slow convergence when new segments join |
 | `free_ratio_first` | Balanced utilization, dynamic scaling | Slightly lower throughput due to sampling and sorting overhead |
+| `fragmentation_aware` | Mixed-size KV cache workloads and long-running clusters with allocator fragmentation | Slightly higher metadata-read overhead than `free_ratio_first` |
 | `ssd_free_ratio_first` | SSD-aware memory allocation when SSD offloading is enabled | Depends on SSD usage metrics; falls back to random allocation when needed |
 | `cxl` | CXL memory hardware | CXL-specific; single-replica only |
 | `local_first` | Colocated inference workers and memory store segments | Requires stable host identity in `local_hostname`; single memory replica only |
@@ -581,6 +582,8 @@ Valid values are: `random` (default), `free_ratio_first`, `ssd_free_ratio_first`
 **Use `free_ratio_first`** when you need better load balancing across segments, especially in scenarios where:
 - Segments have different capacities and you want even utilization ratios.
 - New segments are dynamically added at runtime and you need them to absorb load quickly. With `random`, convergence to a well-balanced state can be slow on large or dynamic clusters; `free_ratio_first` accelerates this by preferentially filling emptier segments, substantially increasing the likelihood that newly joined segments are selected for allocations (see details below).
+
+**Use `fragmentation_aware`** when request sizes vary and long-running allocators may have high aggregate free bytes split into small holes. It prefers sampled segments whose largest contiguous free region can satisfy the current request, reducing failed allocation attempts for larger KV cache objects.
 
 **Use `ssd_free_ratio_first`** when SSD offloading is enabled and you want memory allocation to prefer segments whose backing SSD still has more free capacity.
 
@@ -616,6 +619,18 @@ An improved strategy built on top of `RandomAllocationStrategy`. Instead of pick
 The overhead is minimal: sampling is `O(K)` and sorting is `O(K log K)`, where K is the candidate count (at most `6*N`) — both small since `replica_num` is typically 1–3. The strategy is thread-safe, using `thread_local` random state with no shared mutable data.
 
 The key insight behind Best-of-N is that if a new/empty segment is sampled, it will almost certainly be ranked first due to having the highest free ratio, which naturally accelerates convergence when new segments join the cluster.
+
+**`fragmentation_aware` - FragmentationAwareAllocationStrategy**
+
+A fragmentation-aware variant for mixed-size KV cache workloads. It uses the same bounded candidate sampling shape as `free_ratio_first`, but adds a contiguous-fit signal before ranking by score:
+
+1. **Preferred segment phase**: Same as `random` and `free_ratio_first`; explicit preferred segments are tried before sampled candidates.
+2. **Sampling phase**: Randomly picks a starting index and takes `min(6*remaining_replicas, total_segments)` consecutive segments as candidates.
+3. **Fragmentation scoring phase**: For each candidate, reads aggregate free bytes and `getLargestFreeRegion()` from its allocators. Offset allocators expose the actual largest free region; allocators without precise fragmentation metadata are treated conservatively by using available free bytes.
+4. **Ranking phase**: Fit-capable candidates are ranked ahead of candidates whose largest free region cannot fit the current slice. Candidates with the same fit status are sorted by `0.70 * contiguity_ratio + 0.30 * free_ratio`, then by largest free region.
+5. **Fallback phase**: If sampled candidates cannot satisfy all requested replicas, allocation falls back to the normal random path for the remaining replicas.
+
+This prevents a segment with high total free space but no sufficiently large contiguous block from being tried before a segment that can actually satisfy the allocation. The default `random` strategy remains unchanged; users opt in with `--allocation_strategy=fragmentation_aware`.
 
 **`ssd_free_ratio_first` — SsdFreeRatioFirstAllocationStrategy**
 

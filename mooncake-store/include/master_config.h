@@ -561,6 +561,9 @@ class WrappedMasterServiceConfig {
         // Convert string allocation_strategy to AllocationStrategyType enum
         if (config.allocation_strategy == "free_ratio_first") {
             allocation_strategy_type = AllocationStrategyType::FREE_RATIO_FIRST;
+        } else if (config.allocation_strategy == "fragmentation_aware") {
+            allocation_strategy_type =
+                AllocationStrategyType::FRAGMENTATION_AWARE;
         } else if (config.allocation_strategy == "cxl") {
             allocation_strategy_type = AllocationStrategyType::CXL;
         } else if (config.allocation_strategy == "random") {
@@ -575,7 +578,8 @@ class WrappedMasterServiceConfig {
                          << config.allocation_strategy
                          << "'. Defaulting to 'random'. "
                          << "Valid options are: random, free_ratio_first, cxl, "
-                            "ssd_free_ratio_first, local_first "
+                            "ssd_free_ratio_first, local_first, "
+                            "fragmentation_aware "
                             "(case-sensitive)";
             allocation_strategy_type = AllocationStrategyType::RANDOM;
         }

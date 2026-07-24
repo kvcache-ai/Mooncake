@@ -25,7 +25,8 @@ static constexpr size_t MiB = 1024 * 1024;
 
 // Strategy types for parameterized tests
 const auto kStrategyTypes = ::testing::Values(
-    AllocationStrategyType::RANDOM, AllocationStrategyType::FREE_RATIO_FIRST);
+    AllocationStrategyType::RANDOM, AllocationStrategyType::FREE_RATIO_FIRST,
+    AllocationStrategyType::FRAGMENTATION_AWARE);
 
 const auto kAllocatorTypes = ::testing::Values(BufferAllocatorType::CACHELIB,
                                                BufferAllocatorType::OFFSET);
@@ -88,6 +89,9 @@ INSTANTIATE_TEST_SUITE_P(
                 break;
             case AllocationStrategyType::FREE_RATIO_FIRST:
                 strategy_str = "FreeRatioFirst";
+                break;
+            case AllocationStrategyType::FRAGMENTATION_AWARE:
+                strategy_str = "FragmentationAware";
                 break;
             case AllocationStrategyType::SSD_FREE_RATIO_FIRST:
                 strategy_str = "SsdFreeRatioFirst";
@@ -647,6 +651,75 @@ TEST_P(AllocationStrategyParameterizedTest,
     // Verify that utilization ratios are balanced (within 15%)
     EXPECT_LT(util_diff, 15.0)
         << "FreeRatioFirst should balance utilization ratios";
+}
+
+TEST_F(AllocationStrategyTest,
+       FragmentationAwarePrefersContiguousSpaceOverTotalFreeSpace) {
+    const auto kSegmentBase = 0x100000000ULL;
+    const auto kSegmentSize = 40 * MiB;
+    const auto kRequestSize = 10 * MiB;
+
+    auto fragmented = std::make_shared<OffsetBufferAllocator>(
+        "fragmented", kSegmentBase, kSegmentSize, "fragmented");
+    auto contiguous = std::make_shared<OffsetBufferAllocator>(
+        "contiguous", kSegmentBase + 0x10000000ULL, kSegmentSize, "contiguous");
+
+    std::vector<std::unique_ptr<AllocatedBuffer>> fragmented_buffers;
+    for (int i = 0; i < 5; ++i) {
+        auto buffer = fragmented->allocate(8 * MiB);
+        ASSERT_NE(buffer, nullptr);
+        fragmented_buffers.emplace_back(std::move(buffer));
+    }
+
+    fragmented_buffers[1].reset();
+    fragmented_buffers[3].reset();
+
+    auto contiguous_used = contiguous->allocate(28 * MiB);
+    ASSERT_NE(contiguous_used, nullptr);
+
+    ASSERT_LT(fragmented->getLargestFreeRegion(), kRequestSize);
+    ASSERT_GE(contiguous->getLargestFreeRegion(), kRequestSize);
+
+    AllocatorManager allocator_manager;
+    allocator_manager.addAllocator("fragmented", fragmented);
+    allocator_manager.addAllocator("contiguous", contiguous);
+
+    FragmentationAwareAllocationStrategy strategy;
+    auto result = strategy.Allocate(allocator_manager, kRequestSize);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->size(), 1);
+
+    const auto desc = result->front().get_descriptor();
+    ASSERT_TRUE(desc.is_memory_replica());
+    EXPECT_EQ(
+        desc.get_memory_descriptor().buffer_descriptor.transport_endpoint_,
+        "contiguous");
+}
+
+TEST_F(AllocationStrategyTest, FragmentationAwarePreservesPreferredSegment) {
+    const auto kSegmentBase = 0x100000000ULL;
+    const auto kSegmentSize = 32 * MiB;
+
+    auto preferred = std::make_shared<OffsetBufferAllocator>(
+        "preferred", kSegmentBase, kSegmentSize, "preferred");
+    auto other = std::make_shared<OffsetBufferAllocator>(
+        "other", kSegmentBase + 0x10000000ULL, kSegmentSize, "other");
+
+    AllocatorManager allocator_manager;
+    allocator_manager.addAllocator("preferred", preferred);
+    allocator_manager.addAllocator("other", other);
+
+    FragmentationAwareAllocationStrategy strategy;
+    auto result =
+        strategy.Allocate(allocator_manager, 4 * MiB, 1, {"preferred"}, {});
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->size(), 1);
+
+    const auto desc = result->front().get_descriptor();
+    ASSERT_TRUE(desc.is_memory_replica());
+    EXPECT_EQ(
+        desc.get_memory_descriptor().buffer_descriptor.transport_endpoint_,
+        "preferred");
 }
 
 // Test the performance comparison between strategies

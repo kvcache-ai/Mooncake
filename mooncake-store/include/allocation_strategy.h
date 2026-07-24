@@ -558,6 +558,213 @@ class FreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
     }
 };
 
+/**
+ * @brief Fragmentation-aware allocation strategy.
+ *
+ * This strategy keeps the bounded sampling shape of FreeRatioFirst, but ranks
+ * each sampled segment by whether its largest contiguous free region can fit
+ * the current request. This avoids selecting a segment that has enough total
+ * free bytes but only in small fragmented holes.
+ */
+class FragmentationAwareAllocationStrategy : public RandomAllocationStrategy {
+   public:
+    FragmentationAwareAllocationStrategy() = default;
+
+    tl::expected<std::vector<Replica>, ErrorCode> Allocate(
+        const AllocatorManager& allocator_manager, const size_t slice_length,
+        const size_t replica_num = 1,
+        const std::vector<std::string>& preferred_segments =
+            std::vector<std::string>(),
+        const std::set<std::string>& excluded_segments =
+            std::set<std::string>(),
+        const ReplicaType replica_type = ReplicaType::MEMORY) override {
+        if (slice_length == 0 || replica_num == 0) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+
+        const auto& names = allocator_manager.getNames();
+        if (names.empty()) {
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+
+        static thread_local std::mt19937 generator(std::random_device{}());
+
+        std::vector<Replica> replicas;
+        replicas.reserve(replica_num);
+        std::set<std::string> used_segments;
+
+        for (const auto& preferred_segment : preferred_segments) {
+            if (excluded_segments.contains(preferred_segment) ||
+                used_segments.contains(preferred_segment)) {
+                continue;
+            }
+
+            auto buffer = allocateSingle(allocator_manager, preferred_segment,
+                                         slice_length, generator);
+            if (buffer) {
+                replicas.emplace_back(std::move(buffer),
+                                      ReplicaStatus::PROCESSING, replica_type);
+                used_segments.insert(preferred_segment);
+                if (replicas.size() == replica_num) {
+                    return replicas;
+                }
+            }
+        }
+
+        const size_t remaining = replica_num - replicas.size();
+        const size_t sample_count =
+            std::min(kCandidateMultiplier * remaining, names.size());
+
+        std::uniform_int_distribution<size_t> start_dist(0, names.size() - 1);
+        size_t start_idx = start_dist(generator);
+
+        std::vector<Candidate> candidates;
+        candidates.reserve(sample_count);
+
+        for (size_t i = 0; i < sample_count; ++i) {
+            size_t idx = (start_idx + i) % names.size();
+            const auto& name = names[idx];
+            if (excluded_segments.contains(name) ||
+                used_segments.contains(name)) {
+                continue;
+            }
+            candidates.push_back(getSegmentCandidate(allocator_manager, idx,
+                                                     name, slice_length));
+        }
+
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const Candidate& a, const Candidate& b) {
+                      if (a.can_fit != b.can_fit) {
+                          return a.can_fit > b.can_fit;
+                      }
+                      if (a.score != b.score) {
+                          return a.score > b.score;
+                      }
+                      if (a.largest_free_region != b.largest_free_region) {
+                          return a.largest_free_region > b.largest_free_region;
+                      }
+                      if (a.free_ratio != b.free_ratio) {
+                          return a.free_ratio > b.free_ratio;
+                      }
+                      return a.name_idx < b.name_idx;
+                  });
+
+        for (const auto& candidate : candidates) {
+            if (replicas.size() >= replica_num) {
+                break;
+            }
+
+            const auto& name = names[candidate.name_idx];
+            if (excluded_segments.contains(name) ||
+                used_segments.contains(name)) {
+                continue;
+            }
+
+            auto buffer = allocateSingle(allocator_manager, name, slice_length,
+                                         generator);
+            if (buffer) {
+                replicas.emplace_back(std::move(buffer),
+                                      ReplicaStatus::PROCESSING, replica_type);
+                used_segments.insert(name);
+            }
+        }
+
+        if (replicas.size() >= replica_num) {
+            return replicas;
+        }
+
+        std::uniform_int_distribution<size_t> distribution(0, names.size() - 1);
+        size_t fallback_idx = distribution(generator);
+        const size_t max_retry = std::min(kMaxRetryLimit, names.size());
+        size_t try_count = 0;
+
+        while (replicas.size() < replica_num && try_count < max_retry) {
+            auto index = fallback_idx % names.size();
+            fallback_idx++;
+            try_count++;
+
+            if (excluded_segments.contains(names[index]) ||
+                used_segments.contains(names[index])) {
+                continue;
+            }
+
+            auto buffer = allocateSingle(allocator_manager, names[index],
+                                         slice_length, generator);
+            if (buffer) {
+                replicas.emplace_back(std::move(buffer),
+                                      ReplicaStatus::PROCESSING, replica_type);
+                used_segments.insert(names[index]);
+            }
+        }
+
+        if (replicas.empty()) {
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+        return replicas;
+    }
+
+   private:
+    static constexpr size_t kMaxRetryLimit = 100;
+    static constexpr size_t kCandidateMultiplier = 6;
+
+    struct Candidate {
+        size_t name_idx;
+        bool can_fit;
+        double free_ratio;
+        double score;
+        uint64_t largest_free_region;
+    };
+
+    Candidate getSegmentCandidate(const AllocatorManager& allocator_manager,
+                                  size_t name_idx, const std::string& name,
+                                  size_t slice_length) const {
+        auto allocators = allocator_manager.getAllocators(name);
+        if (!allocators || allocators->empty()) {
+            return {name_idx, false, 0.0, 0.0, 0};
+        }
+
+        uint64_t total_capacity = 0;
+        uint64_t total_free = 0;
+        uint64_t largest_free_region = 0;
+
+        for (const auto& alloc : *allocators) {
+            if (!alloc) {
+                continue;
+            }
+
+            const uint64_t capacity = static_cast<uint64_t>(alloc->capacity());
+            const uint64_t used = std::min<uint64_t>(
+                static_cast<uint64_t>(alloc->size()), capacity);
+            const uint64_t free = capacity - used;
+            const uint64_t reported_largest =
+                static_cast<uint64_t>(alloc->getLargestFreeRegion());
+            const uint64_t allocator_largest =
+                reported_largest == kAllocatorUnknownFreeSpace
+                    ? free
+                    : std::min<uint64_t>(reported_largest, free);
+
+            total_capacity += capacity;
+            total_free += free;
+            largest_free_region =
+                std::max(largest_free_region, allocator_largest);
+        }
+
+        if (total_capacity == 0 || total_free == 0) {
+            return {name_idx, false, 0.0, 0.0, largest_free_region};
+        }
+
+        const double free_ratio = static_cast<double>(total_free) /
+                                  static_cast<double>(total_capacity);
+        const double contiguity_ratio =
+            std::min(1.0, static_cast<double>(largest_free_region) /
+                              static_cast<double>(total_free));
+        const bool can_fit = largest_free_region >= slice_length;
+        const double score = 0.70 * contiguity_ratio + 0.30 * free_ratio;
+
+        return {name_idx, can_fit, free_ratio, score, largest_free_region};
+    }
+};
+
 class SsdFreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
    public:
     SsdFreeRatioFirstAllocationStrategy() = default;
@@ -778,6 +985,8 @@ inline std::shared_ptr<AllocationStrategy> CreateAllocationStrategy(
             return std::make_shared<RandomAllocationStrategy>();
         case AllocationStrategyType::FREE_RATIO_FIRST:
             return std::make_shared<FreeRatioFirstAllocationStrategy>();
+        case AllocationStrategyType::FRAGMENTATION_AWARE:
+            return std::make_shared<FragmentationAwareAllocationStrategy>();
         case AllocationStrategyType::CXL:
             return std::make_shared<CxlAllocationStrategy>();
         case AllocationStrategyType::SSD_FREE_RATIO_FIRST:
