@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 # Mooncake Conductor
 
 [中文](../../zh/design/conductor/index.md)
@@ -26,6 +30,13 @@ results.
 Use the [HTTP API reference](./indexer-api-design.md) for the five implemented
 endpoints, their accepted fields, response bodies, and error formats.
 
+### Integrate a Router
+
+The [Simplified Chinese Router integration guide](../../zh/design/conductor/router-integration-design.md)
+explains how to intersect Conductor's registered `rank_matches` results with a
+Router's routable ranks, health, and load state, including compatibility
+fallbacks when the per-rank field is unavailable.
+
 ### Connect event sources
 
 Start with [KV Events](../kv-event/index.md) to compare the vLLM and Mooncake
@@ -38,4 +49,5 @@ Conductor accepts.
 
 conductor-architecture-design
 usage
+indexer-api-design
 ```

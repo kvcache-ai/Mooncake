@@ -415,8 +415,16 @@ TEST(EventIngestIntegration, VllmMalformedFinalLeavesEarlierStoreApplied) {
     const auto result =
         manager.GetIndexer()->Query(ContextFor(engine), tokens).at("engine");
     EXPECT_EQ(result.gpu, 4);
-    EXPECT_EQ(result.cpu, 0);
-    EXPECT_EQ(result.disk, 0);
+    EXPECT_EQ(result.cpu, 4);
+    EXPECT_EQ(result.disk, 4);
+
+    const auto snapshot =
+        PrefixCacheTableTestPeer::Snapshot(*manager.GetIndexer());
+    const auto& presence =
+        snapshot.contexts.at(ContextFor(engine)).blocks.at(prefix);
+    EXPECT_FALSE(presence.gpu_owners.empty());
+    EXPECT_TRUE(presence.cpu_owners.empty());
+    EXPECT_TRUE(presence.disk_owners.empty());
 }
 
 TEST(EventIngestIntegration, MooncakeMalformedFinalLeavesEarlierStoreApplied) {
@@ -441,7 +449,15 @@ TEST(EventIngestIntegration, MooncakeMalformedFinalLeavesEarlierStoreApplied) {
         manager.GetIndexer()->Query(ContextFor(engine), tokens).at("engine");
     EXPECT_EQ(result.gpu, 0);
     EXPECT_EQ(result.cpu, 4);
-    EXPECT_EQ(result.disk, 0);
+    EXPECT_EQ(result.disk, 4);
+
+    const auto snapshot =
+        PrefixCacheTableTestPeer::Snapshot(*manager.GetIndexer());
+    const auto& presence =
+        snapshot.contexts.at(ContextFor(engine)).blocks.at(prefix);
+    EXPECT_TRUE(presence.gpu_owners.empty());
+    EXPECT_FALSE(presence.cpu_owners.empty());
+    EXPECT_TRUE(presence.disk_owners.empty());
 }
 
 TEST(EventIngestIntegration, VllmMalformedMiddleDoesNotBlockLaterRemove) {
@@ -588,6 +604,18 @@ TEST(EventIngestIntegration,
                   .cpu,
               4);
 
+    auto snapshot = PrefixCacheTableTestPeer::Snapshot(*manager.GetIndexer());
+    const auto& tenant_a_presence =
+        snapshot.contexts.at(ContextFor(tenant_a)).blocks.at(prefix_a);
+    const auto& tenant_b_presence =
+        snapshot.contexts.at(ContextFor(tenant_b)).blocks.at(prefix_b);
+    EXPECT_TRUE(tenant_a_presence.gpu_owners.empty());
+    EXPECT_FALSE(tenant_a_presence.cpu_owners.empty());
+    EXPECT_TRUE(tenant_a_presence.disk_owners.empty());
+    EXPECT_TRUE(tenant_b_presence.gpu_owners.empty());
+    EXPECT_FALSE(tenant_b_presence.cpu_owners.empty());
+    EXPECT_TRUE(tenant_b_presence.disk_owners.empty());
+
     const auto clear_a = PackMooncakeBatch(
         1, [&](Packer& packer) { PackMooncakeCleared(packer, tenant_a); });
     ExpectDispatched(DecodeAndDispatchMooncake(
@@ -603,6 +631,12 @@ TEST(EventIngestIntegration,
                   .cpu,
               4);
 
+    snapshot = PrefixCacheTableTestPeer::Snapshot(*manager.GetIndexer());
+    EXPECT_TRUE(snapshot.contexts.at(ContextFor(tenant_a)).blocks.empty());
+    EXPECT_FALSE(snapshot.contexts.at(ContextFor(tenant_b))
+                     .blocks.at(prefix_b)
+                     .cpu_owners.empty());
+
     const auto remove_b = PackMooncakeBatch(1, [&](Packer& packer) {
         PackMooncakeRemoved(packer, tenant_b, prefix_b.value, "same-object");
     });
@@ -613,6 +647,8 @@ TEST(EventIngestIntegration,
                   .at("engine-b")
                   .cpu,
               0);
+    snapshot = PrefixCacheTableTestPeer::Snapshot(*manager.GetIndexer());
+    EXPECT_TRUE(snapshot.contexts.at(ContextFor(tenant_b)).blocks.empty());
 }
 
 TEST(EventIngestIntegration,
@@ -652,6 +688,10 @@ TEST(EventIngestIntegration,
                   .at("engine-b")
                   .cpu,
               4);
+    const auto initial_presence = PrefixCacheTableTestPeer::Presence(
+        *manager.GetIndexer(), ContextFor(context_a), prefix_a);
+    ASSERT_TRUE(initial_presence.has_value());
+    EXPECT_FALSE(initial_presence->cpu_owners.empty());
 
     auto second_context_lock = PrefixCacheTableTestPeer::LockContextState(
         *manager.GetIndexer(), ContextFor(context_b));
@@ -667,10 +707,9 @@ TEST(EventIngestIntegration,
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (std::chrono::steady_clock::now() < deadline) {
-        if (manager.GetIndexer()
-                ->Query(ContextFor(context_a), tokens)
-                .at("engine-a")
-                .cpu == 0) {
+        if (!PrefixCacheTableTestPeer::Presence(*manager.GetIndexer(),
+                                                ContextFor(context_a), prefix_a)
+                 .has_value()) {
             first_context_cleared = true;
             break;
         }
@@ -689,6 +728,9 @@ TEST(EventIngestIntegration,
                   .at("engine-a")
                   .cpu,
               0);
+    EXPECT_FALSE(PrefixCacheTableTestPeer::Presence(
+                     *manager.GetIndexer(), ContextFor(context_a), prefix_a)
+                     .has_value());
 
     second_context_lock.unlock();
     ExpectDispatched(clear_future.get());
@@ -697,6 +739,9 @@ TEST(EventIngestIntegration,
                   .at("engine-b")
                   .cpu,
               0);
+    EXPECT_FALSE(PrefixCacheTableTestPeer::Presence(
+                     *manager.GetIndexer(), ContextFor(context_b), prefix_b)
+                     .has_value());
 }
 
 }  // namespace

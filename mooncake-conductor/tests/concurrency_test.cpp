@@ -512,9 +512,23 @@ TEST(Concurrency, PrefixTableOwnerMutationsQueryAndUnregister) {
                 EXPECT_TRUE(completed_call_state(result.gpu));
                 EXPECT_TRUE(completed_call_state(result.cpu));
                 EXPECT_TRUE(completed_call_state(result.disk));
-                for (const auto& [unused_rank, matched] : result.dp) {
-                    (void)unused_rank;
+                EXPECT_LE(result.gpu, result.cpu);
+                EXPECT_LE(result.cpu, result.disk);
+                EXPECT_EQ(result.longest_match_tokens, result.disk);
+                EXPECT_EQ(result.dp.size(), result.rank_matches.size());
+                for (const auto& [rank, matched] : result.dp) {
                     EXPECT_TRUE(completed_call_state(matched));
+                    EXPECT_TRUE(result.rank_matches.contains(rank));
+                    const auto rank_match = result.rank_matches.find(rank);
+                    if (rank_match == result.rank_matches.end()) {
+                        continue;
+                    }
+                    EXPECT_EQ(matched, rank_match->second.gpu);
+                    EXPECT_TRUE(completed_call_state(rank_match->second.gpu));
+                    EXPECT_TRUE(completed_call_state(rank_match->second.cpu));
+                    EXPECT_TRUE(completed_call_state(rank_match->second.disk));
+                    EXPECT_LE(rank_match->second.gpu, rank_match->second.cpu);
+                    EXPECT_LE(rank_match->second.cpu, rank_match->second.disk);
                 }
             }
             if (round % 10 == 0) {
@@ -560,9 +574,17 @@ TEST(Concurrency, PrefixTableOwnerMutationsQueryAndUnregister) {
               (std::map<int64_t, int64_t>{{1, 4}}));
     EXPECT_EQ(final_results.at("instance-a").longest_match_tokens, 12);
     EXPECT_EQ(final_results.at("instance-a").cpu, 12);
+    ASSERT_TRUE(final_results.at("instance-a").rank_matches.contains(1));
+    EXPECT_EQ(final_results.at("instance-a").rank_matches.at(1).gpu, 4);
+    EXPECT_EQ(final_results.at("instance-a").rank_matches.at(1).cpu, 12);
+    EXPECT_EQ(final_results.at("instance-a").rank_matches.at(1).disk, 12);
     EXPECT_EQ(final_results.at("instance-b").dp,
               (std::map<int64_t, int64_t>{{0, 0}}));
     EXPECT_EQ(final_results.at("instance-b").longest_match_tokens, 12);
+    ASSERT_TRUE(final_results.at("instance-b").rank_matches.contains(0));
+    EXPECT_EQ(final_results.at("instance-b").rank_matches.at(0).gpu, 0);
+    EXPECT_EQ(final_results.at("instance-b").rank_matches.at(0).cpu, 12);
+    EXPECT_EQ(final_results.at("instance-b").rank_matches.at(0).disk, 12);
 }
 
 }  // namespace

@@ -203,7 +203,14 @@ curl -sS -X POST http://127.0.0.1:13333/query \
       },
       "gpu": 0,
       "cpu": 0,
-      "disk": 0
+      "disk": 0,
+      "rank_matches": {
+        "0": {
+          "gpu": 0,
+          "cpu": 0,
+          "disk": 0
+        }
+      }
     }
   }
 }
@@ -214,11 +221,30 @@ curl -sS -X POST http://127.0.0.1:13333/query \
 | 字段 | 含义 |
 |---|---|
 | `instances` | 以选中的已注册 vLLM `instance_id` 为键。Mooncake 订阅不会成为返回结果中的一行。 |
-| `longest_matched` | 某一个 rank 可以用自己的 GPU 缓存加上兼容的共享 CPU 或 Disk 缓存提供的最大连续 token 数。 |
-| `dp` | 每个 rank 在 GPU 上连续命中的 token 数。rank 键是十进制 JSON 字符串。 |
-| `gpu` | 该引擎所有 rank 中最大的连续 GPU token 数。 |
-| `cpu` | 从第一个块开始，在共享 CPU 缓存中连续命中的 token 数。 |
-| `disk` | 从第一个块开始，在共享 Disk 缓存中连续命中的 token 数。 |
+| `longest_matched` | 与实例级 `disk` 相同，即某一个已注册 rank 能实现的最长 GPU 到 CPU 再到 Disk 的有序前缀。 |
+| `dp` | 每个 rank 完成 GPU 阶段后的累计边界。rank 键是十进制 JSON 字符串，值仍是整数。 |
+| `rank_matches` | 与 `dp` 使用相同 rank 键。每个 rank 对应累计整数 `gpu`、`cpu` 和 `disk` 边界。 |
+| `gpu` | 该引擎所有 rank 级 GPU 边界中的最大值。 |
+| `cpu` | 每个 rank 从 GPU 继续到共享 CPU 后的累计边界，再取其中最大值。 |
+| `disk` | 每个 rank 从 GPU 继续到共享 CPU、再到共享 Disk 后的累计边界，再取其中最大值。 |
+
+Conductor 对每个已注册 rank 先读取连续 GPU 前缀，再让第一个 GPU 未命中的块进入
+共享 CPU，随后让第一个 CPU 未命中的块进入共享 Disk。进入较低层后不会回到较高层，
+Disk 第一次未命中就结束该 rank 的结果。所有边界只计算查询中的完整块。两个 rank
+map 的 key 完全相同，包括零命中 rank，并且每项结果都满足：
+
+```text
+dp[rank] == rank_matches[rank].gpu
+0 <= rank_matches[rank].gpu
+  <= rank_matches[rank].cpu
+  <= rank_matches[rank].disk
+  <= complete_query_tokens
+longest_matched == disk
+```
+
+`rank_matches` 是新增字段，原有字段的 JSON 类型保持不变。不过，`cpu`、`disk`
+以及部分 `longest_matched` 的值现在表示这条有序累计路径，而不再表示独立前缀或
+逐块无序并集。
 
 在当前 HTTP 测试使用的状态中，实例 `1` 的 rank `0` 有 32 个 token 的连续 GPU
 缓存，实例 `2` 的 rank `1` 没有 GPU 命中，两者都能看到连续 48 个 token 的
@@ -234,7 +260,14 @@ curl -sS -X POST http://127.0.0.1:13333/query \
         "0": 32
       },
       "cpu": 48,
-      "disk": 48
+      "disk": 48,
+      "rank_matches": {
+        "0": {
+          "gpu": 32,
+          "cpu": 48,
+          "disk": 48
+        }
+      }
     },
     "2": {
       "longest_matched": 48,
@@ -243,7 +276,40 @@ curl -sS -X POST http://127.0.0.1:13333/query \
         "1": 0
       },
       "cpu": 48,
-      "disk": 48
+      "disk": 48,
+      "rank_matches": {
+        "1": {
+          "gpu": 0,
+          "cpu": 48,
+          "disk": 48
+        }
+      }
+    }
+  }
+}
+```
+
+再看一个按层续接的例子：rank `0` 的前两个 16-token 块只在 GPU，第三块只在
+共享 CPU，第四块只在共享 Disk。该实例返回：
+
+```json
+{
+  "instances": {
+    "engine-a": {
+      "longest_matched": 64,
+      "gpu": 32,
+      "dp": {
+        "0": 32
+      },
+      "cpu": 48,
+      "disk": 64,
+      "rank_matches": {
+        "0": {
+          "gpu": 32,
+          "cpu": 48,
+          "disk": 64
+        }
+      }
     }
   }
 }

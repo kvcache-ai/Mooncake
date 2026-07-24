@@ -489,6 +489,15 @@ Json::Value CacheHitResultToJson(const prefixindex::CacheHitResult& result) {
         dp[std::to_string(rank)] = Json::Value::Int64(tokens);
     }
     out["dp"] = dp;
+    Json::Value rank_matches(Json::objectValue);
+    for (const auto& [rank, match] : result.rank_matches) {
+        Json::Value rank_match(Json::objectValue);
+        rank_match["gpu"] = Json::Value::Int64(match.gpu);
+        rank_match["cpu"] = Json::Value::Int64(match.cpu);
+        rank_match["disk"] = Json::Value::Int64(match.disk);
+        rank_matches[std::to_string(rank)] = rank_match;
+    }
+    out["rank_matches"] = rank_matches;
     out["gpu"] = Json::Value::Int64(result.gpu);
     out["cpu"] = Json::Value::Int64(result.cpu);
     out["disk"] = Json::Value::Int64(result.disk);

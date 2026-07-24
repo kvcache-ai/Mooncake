@@ -23,6 +23,12 @@ Mooncake 共享的 CPU 或 Disk 事件如何变成每个推理引擎的查询结
 查阅 [HTTP API 参考](./indexer-api-design.md)，了解当前实现的五个接口、可接受
 的字段、响应内容和错误格式。
 
+### 集成 Router
+
+阅读 [Router 集成设计](./router-integration-design.md)，了解 Router 如何把
+`rank_matches` 中的已注册 rank 与自身可路由 rank 求交集，再结合健康检查和负载
+选择目标，以及字段缺失或查询失败时如何继续使用原有调度策略。
+
 ### 连接事件来源
 
 先阅读 [KV Event](../kv-event/index.md)，比较 vLLM 和 Mooncake 两种消息处理
@@ -35,4 +41,5 @@ Mooncake 共享的 CPU 或 Disk 事件如何变成每个推理引擎的查询结
 conductor-architecture-design
 usage
 indexer-api-design
+router-integration-design
 ```

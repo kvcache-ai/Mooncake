@@ -45,9 +45,18 @@ struct ContextState {
     std::unordered_map<ProjectedPrefix, BlockPresence> blocks;
 };
 
+struct RankCacheHitResult {
+    int64_t gpu = 0;
+    int64_t cpu = 0;
+    int64_t disk = 0;
+
+    bool operator==(const RankCacheHitResult&) const = default;
+};
+
 struct CacheHitResult {
     int64_t longest_match_tokens = 0;
     std::map<int64_t, int64_t> dp;
+    std::map<int64_t, RankCacheHitResult> rank_matches;
     int64_t gpu = 0;
     int64_t cpu = 0;
     int64_t disk = 0;

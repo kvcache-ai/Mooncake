@@ -3,6 +3,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <shared_mutex>
 #include <unordered_map>
@@ -48,6 +49,20 @@ class PrefixCacheTableTestPeer {
         auto state = table.LoadContextState(context);
         if (state == nullptr) return {};
         return std::unique_lock<std::shared_mutex>(state->mutex);
+    }
+
+    static std::optional<BlockPresenceSnapshot> Presence(
+        const PrefixCacheTable& table, const ContextKey& context,
+        ProjectedPrefix prefix) {
+        auto state = table.LoadContextState(context);
+        if (state == nullptr) return std::nullopt;
+
+        std::shared_lock state_lock(state->mutex);
+        const auto block = state->blocks.find(prefix);
+        if (block == state->blocks.end()) return std::nullopt;
+        return BlockPresenceSnapshot{block->second.gpu_owners,
+                                     block->second.cpu_owners,
+                                     block->second.disk_owners};
     }
 
     static PrefixCacheTableSnapshot Snapshot(const PrefixCacheTable& table) {

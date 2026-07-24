@@ -418,27 +418,18 @@ std::map<std::string, CacheHitResult> PrefixCacheTable::Query(
         return results;
     }
 
-    auto continuous_blocks = [&](const auto& present) {
-        size_t count = 0;
-        for (const HashBlock& hash : hashes) {
-            auto block = state->blocks.find(hash.projected);
+    auto advance_cursor = [&](size_t& cursor, const auto& present) {
+        while (cursor < hashes.size()) {
+            auto block = state->blocks.find(hashes[cursor].projected);
             if (block == state->blocks.end() || !present(block->second)) {
                 break;
             }
-            ++count;
+            ++cursor;
         }
-        return count;
     };
-
-    const size_t cpu_blocks = continuous_blocks(
-        [](const BlockPresence& block) { return !block.cpu_owners.empty(); });
-    const size_t disk_blocks = continuous_blocks(
-        [](const BlockPresence& block) { return !block.disk_owners.empty(); });
 
     for (const auto& [instance_id, ranks] : selected_instances) {
         CacheHitResult result;
-        result.cpu = TokensForBlocks(cpu_blocks, context.block_size);
-        result.disk = TokensForBlocks(disk_blocks, context.block_size);
 
         for (int64_t rank : *ranks) {
             auto gpu_present = [&](const BlockPresence& block) {
@@ -449,21 +440,30 @@ std::map<std::string, CacheHitResult> PrefixCacheTable::Query(
                                owner.dp_rank == rank;
                     });
             };
-            const size_t gpu_blocks = continuous_blocks(gpu_present);
-            const size_t union_blocks =
-                continuous_blocks([&](const BlockPresence& block) {
-                    return gpu_present(block) || !block.cpu_owners.empty() ||
-                           !block.disk_owners.empty();
-                });
 
-            const int64_t gpu_tokens =
-                TokensForBlocks(gpu_blocks, context.block_size);
-            result.dp.emplace(rank, gpu_tokens);
-            result.gpu = std::max(result.gpu, gpu_tokens);
-            result.longest_match_tokens =
-                std::max(result.longest_match_tokens,
-                         TokensForBlocks(union_blocks, context.block_size));
+            size_t cursor = 0;
+            advance_cursor(cursor, gpu_present);
+
+            RankCacheHitResult rank_match;
+            rank_match.gpu = TokensForBlocks(cursor, context.block_size);
+
+            advance_cursor(cursor, [](const BlockPresence& block) {
+                return !block.cpu_owners.empty();
+            });
+            rank_match.cpu = TokensForBlocks(cursor, context.block_size);
+
+            advance_cursor(cursor, [](const BlockPresence& block) {
+                return !block.disk_owners.empty();
+            });
+            rank_match.disk = TokensForBlocks(cursor, context.block_size);
+
+            result.dp.emplace(rank, rank_match.gpu);
+            result.rank_matches.emplace(rank, rank_match);
+            result.gpu = std::max(result.gpu, rank_match.gpu);
+            result.cpu = std::max(result.cpu, rank_match.cpu);
+            result.disk = std::max(result.disk, rank_match.disk);
         }
+        result.longest_match_tokens = result.disk;
         results.emplace(instance_id, std::move(result));
     }
     return results;

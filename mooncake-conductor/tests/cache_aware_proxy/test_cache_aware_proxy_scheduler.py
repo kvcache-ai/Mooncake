@@ -41,6 +41,32 @@ class SchedulerTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("prefill-b", selected.config.instance_id)
 
+    async def test_additive_rank_matches_does_not_affect_selection(self) -> None:
+        self.runtime.conductor.query = AsyncMock(
+            return_value={
+                "instances": {
+                    "unknown": {
+                        "longest_matched": 999,
+                        "rank_matches": {"0": {"gpu": 999, "cpu": 999, "disk": 999}},
+                    },
+                    "prefill-a": {
+                        "longest_matched": 16,
+                        "rank_matches": {"0": {"gpu": 16, "cpu": 16, "disk": 4096}},
+                    },
+                    "prefill-b": {
+                        "longest_matched": 32,
+                        "rank_matches": {"0": {"gpu": 0, "cpu": 0, "disk": 0}},
+                    },
+                }
+            }
+        )
+
+        selected = await self.runtime.select_prefill(
+            {"model": "test-model", "prompt": "hello"}, "request-1"
+        )
+
+        self.assertEqual("prefill-b", selected.config.instance_id)
+
     async def test_positive_ties_rotate_independent_of_response_order(self) -> None:
         query = AsyncMock(
             side_effect=[
