@@ -1400,6 +1400,8 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
         return tl::make_unexpected(ErrorCode::INVALID_KEY);
     }
 
+    std::shared_lock<std::shared_mutex> scan_lock(scan_mutex_);
+
     auto enable_offloading_res = IsEnableOffloading();
     if (!enable_offloading_res) {
         return tl::make_unexpected(enable_offloading_res.error());
@@ -1473,6 +1475,8 @@ tl::expected<std::vector<std::string>, ErrorCode>
 StorageBackendAdaptor::EvictAboveDiskWatermark(
     double high_watermark_ratio, double low_watermark_ratio,
     EvictionHandler eviction_handler) {
+    std::shared_lock<std::shared_mutex> scan_lock(scan_mutex_);
+
     auto eviction_result = storage_backend_->EvictAboveDiskWatermark(
         high_watermark_ratio, low_watermark_ratio, eviction_handler);
     if (!eviction_result) {
@@ -1542,16 +1546,26 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
         ErrorCode(const std::vector<std::string>& keys,
                   std::vector<StorageObjectMetadata>& metadatas)>& handler) {
     namespace fs = std::filesystem;
+    std::unique_lock<std::shared_mutex> scan_lock(scan_mutex_);
 
     fs::path root = fs::path(file_storage_config_.storage_filepath) /
                     file_per_key_config_.fsdir;
     if (!fs::exists(root)) {
+        MutexLocker lock(&mutex_);
+        total_keys = 0;
+        total_size = 0;
         meta_scanned_.store(true, std::memory_order_release);
         return {};
     }
 
     std::vector<std::string> keys;
     std::vector<StorageObjectMetadata> metas;
+    int64_t scanned_keys = 0;
+    int64_t scanned_size = 0;
+
+    // Counters are committed only after a complete walk. A handler may have
+    // consumed earlier batches before a later traversal error; FileStorage
+    // retries the full scan, and master replica registration is idempotent.
 
     auto flush = [&]() -> tl::expected<void, ErrorCode> {
         if (keys.empty()) return {};
@@ -1562,13 +1576,13 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
         return {};
     };
 
-    MutexLocker lock(&mutex_);
-
     std::error_code ec_root;
     for (auto it1 = fs::directory_iterator(root, ec_root);
          !ec_root && it1 != fs::directory_iterator(); it1.increment(ec_root)) {
         if (ec_root) break;
-        if (!it1->is_directory(ec_root) || ec_root) continue;
+        std::error_code ec_entry;
+        const bool is_directory = it1->is_directory(ec_entry);
+        if (ec_entry || !is_directory) continue;
 
         const auto& d1 = it1->path();
 
@@ -1576,7 +1590,9 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
         for (auto it2 = fs::directory_iterator(d1, ec_d1);
              !ec_d1 && it2 != fs::directory_iterator(); it2.increment(ec_d1)) {
             if (ec_d1) break;
-            if (!it2->is_directory(ec_d1) || ec_d1) continue;
+            std::error_code ec_entry;
+            const bool is_directory = it2->is_directory(ec_entry);
+            if (ec_entry || !is_directory) continue;
 
             const auto& leaf = it2->path();
 
@@ -1586,10 +1602,12 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
                  it.increment(ec_leaf)) {
                 if (ec_leaf) break;
                 const auto& p = it->path();
-                if (!it->is_regular_file(ec_leaf) || ec_leaf) continue;
+                std::error_code ec_file;
+                const bool is_regular_file = it->is_regular_file(ec_file);
+                if (ec_file || !is_regular_file) continue;
 
-                uintmax_t sz = fs::file_size(p, ec_leaf);
-                if (ec_leaf) continue;
+                uintmax_t sz = fs::file_size(p, ec_file);
+                if (ec_file) continue;
 
                 std::string buf;
                 auto r =
@@ -1597,11 +1615,24 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
                 if (!r) continue;
 
                 KVEntry kv;
-                struct_pb::from_pb(kv, buf);
+                try {
+                    // struct_pb::from_pb reports malformed input by throwing.
+                    struct_pb::from_pb(kv, buf);
+                } catch (const std::exception& e) {
+                    LOG(WARNING) << "Skipping malformed file during metadata "
+                                    "scan: "
+                                 << p << ", error: " << e.what();
+                    continue;
+                }
+                if (kv.key.empty()) {
+                    LOG(WARNING)
+                        << "Skipping metadata file with an empty key: " << p;
+                    continue;
+                }
                 storage_backend_->UpdateFileRecordKey(p.string(), kv.key);
 
-                total_keys++;
-                total_size += buf.size();
+                scanned_keys++;
+                scanned_size += buf.size();
 
                 keys.emplace_back(std::move(kv.key));
                 metas.emplace_back(StorageObjectMetadata{
@@ -1617,9 +1648,29 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
 
             auto fr = flush();
             if (!fr) return fr;
+            if (ec_leaf) {
+                LOG(ERROR) << "Failed to scan metadata directory " << leaf
+                           << ": " << ec_leaf.message();
+                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            }
+        }
+        if (ec_d1) {
+            LOG(ERROR) << "Failed to scan metadata directory " << d1 << ": "
+                       << ec_d1.message();
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         }
     }
+    if (ec_root) {
+        LOG(ERROR) << "Failed to scan metadata root " << root << ": "
+                   << ec_root.message();
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
 
+    {
+        MutexLocker lock(&mutex_);
+        total_keys = scanned_keys;
+        total_size = scanned_size;
+    }
     meta_scanned_.store(true, std::memory_order_release);
     return {};
 }
