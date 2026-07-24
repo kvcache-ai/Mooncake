@@ -292,6 +292,15 @@ Status TransferEngineImpl::construct() {
         conf_->get("enable_auto_failover_on_poll", true);
     enable_progress_worker_ = conf_->get("enable_progress_worker", false);
     runtime_queue_config_.enabled = conf_->get("enable_runtime_queue", false);
+    runtime_queue_config_.receiver_credit_enabled =
+        conf_->get("receiver_credit/enabled", false);
+    runtime_queue_config_.receiver_credit_default_qos_class =
+        conf_->get("receiver_credit/default_qos_class", uint32_t{0});
+    if (runtime_queue_config_.receiver_credit_enabled &&
+        !runtime_queue_config_.enabled) {
+        return Status::InvalidArgument(
+            "receiver credit dispatch requires the runtime queue" LOC_MARK);
+    }
     if (runtime_queue_config_.enabled) enable_progress_worker_ = true;
     runtime_queue_config_.limits.max_outstanding_owners =
         conf_->get("runtime_queue/max_outstanding_owners", 1024UL);
@@ -442,6 +451,41 @@ Status TransferEngineImpl::construct() {
                   << " started successfully";
     }
 
+    return Status::OK();
+}
+
+Status TransferEngineImpl::installReceiverCreditDispatch(
+    std::shared_ptr<CreditPeerContextTable> contexts,
+    std::shared_ptr<SenderCreditLedger> ledger,
+    CreditQosProvider qos_provider) {
+    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+    if (!runtime_queue_config_.receiver_credit_enabled) {
+        return Status::InvalidArgument(
+            "receiver credit dispatch is not enabled" LOC_MARK);
+    }
+    if (!contexts || !ledger) {
+        return Status::InvalidArgument(
+            "receiver credit context and ledger are required" LOC_MARK);
+    }
+    if (!queued_owners_.empty()) {
+        return Status::InvalidEntry(
+            "receiver credit dispatch must be installed before "
+            "submit" LOC_MARK);
+    }
+    receiver_credit_contexts_ = std::move(contexts);
+    receiver_credit_ledger_ = std::move(ledger);
+    receiver_credit_dispatch_gate_ =
+        std::make_shared<ReceiverCreditDispatchGate>(*receiver_credit_contexts_,
+                                                     *receiver_credit_ledger_);
+    if (qos_provider) {
+        receiver_credit_qos_provider_ = std::move(qos_provider);
+    } else {
+        const auto qos_class =
+            runtime_queue_config_.receiver_credit_default_qos_class;
+        receiver_credit_qos_provider_ = [qos_class](const Request&) {
+            return qos_class;
+        };
+    }
     return Status::OK();
 }
 
@@ -1575,6 +1619,8 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
     submit.batch_token = batch_token;
     submit.batch_slots_left = batch->max_size - batch->task_list.size();
     submit.owners.reserve(prepared.owners.size());
+    std::vector<std::optional<CreditDispatchSnapshot>> credit_snapshots(
+        prepared.owners.size());
     for (const auto& owner : prepared.owners) {
         if (owner.request.length > runtime_queue_config_.max_dispatch_bytes) {
             return Status::TooManyRequests(
@@ -1588,6 +1634,26 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
         input.degradation_eligible =
             owner.route.transport == RDMA && !owner.staging;
         submit.owners.push_back(std::move(input));
+    }
+    if (runtime_queue_config_.receiver_credit_enabled &&
+        !receiver_credit_dispatch_gate_) {
+        return Status::InvalidEntry(
+            "receiver credit dispatch is enabled but not installed" LOC_MARK);
+    }
+    if (receiver_credit_dispatch_gate_) {
+        if (!receiver_credit_qos_provider_)
+            return Status::InvalidEntry(
+                "receiver credit QoS provider is missing" LOC_MARK);
+        for (size_t i = 0; i < prepared.owners.size(); ++i) {
+            const auto& request = prepared.owners[i].request;
+            CreditCharge charge{{{CreditResource::DataBytes, request.length},
+                                 {CreditResource::RequestSlots, 1}}};
+            CreditDispatchSnapshot snapshot;
+            CHECK_STATUS(receiver_credit_dispatch_gate_->snapshot(
+                request.target_id, receiver_credit_qos_provider_(request),
+                std::move(charge), snapshot));
+            credit_snapshots[i] = std::move(snapshot);
+        }
     }
 
     std::vector<QueueOwnerId> admitted_owner_ids;
@@ -1622,6 +1688,7 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
             queued.public_task_ids.end(),
             prepared.owners[i].derived_task_ids.begin(),
             prepared.owners[i].derived_task_ids.end());
+        queued.credit_snapshot = std::move(credit_snapshots[i]);
         queued_owners_.emplace(admitted_owner_ids[i], queued);
     }
     return Status::OK();
@@ -1634,6 +1701,11 @@ Status TransferEngineImpl::finishQueuedOwner(
         return Status::InvalidEntry("queued owner not found" LOC_MARK);
     }
     auto& queued = queued_it->second;
+    if (queued.credit_reservation &&
+        queued.credit_reservation->state == CreditReservationState::Reserved) {
+        CHECK_STATUS(receiver_credit_dispatch_gate_->rollback(
+            *queued.credit_reservation));
+    }
     if (queued.in_dispatch_window) {
         if (dispatch_inflight_owners_ == 0 ||
             dispatch_inflight_bytes_ < queued.byte_charge) {
@@ -1700,7 +1772,7 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
     if (queued_it == queued_owners_.end()) {
         return Status::InternalError("queued owner metadata missing" LOC_MARK);
     }
-    const auto queued = queued_it->second;
+    auto& queued = queued_it->second;
     auto* batch = queued.batch;
     auto& task = batch->task_list[queued.owner_task_id];
     task.dispatch_time = std::chrono::steady_clock::now();
@@ -1712,6 +1784,18 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
         return finishQueuedOwner(owner_id, FAILED);
     }
 
+    if (queued.credit_snapshot) {
+        queued.credit_reservation.emplace();
+        auto reserve_status = receiver_credit_dispatch_gate_->tryReserve(
+            *queued.credit_snapshot, *queued.credit_reservation);
+        if (reserve_status.IsTooManyRequests()) {
+            queued.credit_reservation.reset();
+            CHECK_STATUS(runtime_queue_->deferDispatch(owner_id));
+            return reserve_status;
+        }
+        if (!reserve_status.ok()) return finishQueuedOwner(owner_id, FAILED);
+    }
+
     if (task.type == TCP) {
         std::vector<std::string> staging_params;
         findStagingPolicy(task.request, staging_params);
@@ -1721,6 +1805,9 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
                 staging_proxy_->submit(&task, (BatchID)batch, staging_params);
             if (!status.ok()) return finishQueuedOwner(owner_id, FAILED);
             task.post_time = std::chrono::steady_clock::now();
+            if (queued.credit_reservation)
+                CHECK_STATUS(receiver_credit_dispatch_gate_->commit(
+                    *queued.credit_reservation));
             return markQueuedOwnerSubmitted(owner_id);
         }
     }
@@ -1748,6 +1835,9 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
         return finishQueuedOwner(owner_id, FAILED);
     }
     task.post_time = std::chrono::steady_clock::now();
+    if (queued.credit_reservation)
+        CHECK_STATUS(
+            receiver_credit_dispatch_gate_->commit(*queued.credit_reservation));
     return markQueuedOwnerSubmitted(owner_id);
 }
 
@@ -1765,8 +1855,16 @@ Status TransferEngineImpl::refillDispatchWindow() {
     const size_t byte_budget =
         runtime_queue_config_.max_dispatch_bytes - dispatch_inflight_bytes_;
     auto picked = runtime_queue_->pickForDispatch(owner_budget, byte_budget);
-    for (const auto owner_id : picked) {
-        CHECK_STATUS(dispatchQueuedOwner(owner_id));
+    for (size_t i = 0; i < picked.size(); ++i) {
+        auto dispatch_status = dispatchQueuedOwner(picked[i]);
+        if (dispatch_status.ok()) continue;
+        // pickForDispatch transitions the complete returned set to
+        // Dispatching. If dispatch stops early, every unprocessed owner must
+        // be returned to Queued or it can never be selected again.
+        for (size_t j = i + 1; j < picked.size(); ++j)
+            CHECK_STATUS(runtime_queue_->deferDispatch(picked[j]));
+        if (dispatch_status.IsTooManyRequests()) return Status::OK();
+        return dispatch_status;
     }
     return Status::OK();
 }

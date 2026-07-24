@@ -51,10 +51,12 @@ class FakeTransport : public Transport {
 
     explicit FakeTransport(TransportType self_type,
                            PollStatusFactory poll_status_factory = {},
-                           bool notify_on_submit = false)
+                           bool notify_on_submit = false,
+                           bool fail_submit = false)
         : self_type_(self_type),
           poll_status_factory_(std::move(poll_status_factory)),
-          notify_on_submit_(notify_on_submit) {
+          notify_on_submit_(notify_on_submit),
+          fail_submit_(fail_submit) {
         caps.dram_to_dram = true;
     }
 
@@ -83,6 +85,8 @@ class FakeTransport : public Transport {
     Status submitTransferTasks(SubBatchRef batch,
                                const std::vector<Request>& requests) override {
         ++submit_calls;
+        if (fail_submit_)
+            return Status::InternalError("injected submit failure" LOC_MARK);
         auto* fake = static_cast<FakeSubBatch*>(batch);
         for (const auto& request : requests) {
             fake->requests.push_back(request);
@@ -165,6 +169,7 @@ class FakeTransport : public Transport {
     TransportType self_type_;
     PollStatusFactory poll_status_factory_;
     bool notify_on_submit_;
+    bool fail_submit_;
 };
 
 std::shared_ptr<Config> makeRuntimeQueueConfig(size_t max_dispatch_owners,
@@ -213,6 +218,405 @@ Request makeLocalWrite(uint8_t* ptr, size_t length) {
     request.length = length;
     request.transport_hint = RDMA;
     return request;
+}
+
+CreditKey installCreditGate(
+    TransferEngineImpl& engine,
+    const std::shared_ptr<CreditPeerContextTable>& contexts,
+    const std::shared_ptr<SenderCreditLedger>& ledger, uint64_t bytes,
+    uint64_t slots) {
+    CreditActivationV1 activation;
+    activation.receiver_session_id = {11, 22};
+    activation.epoch = 7;
+    EXPECT_TRUE(contexts->activate(LOCAL_SEGMENT_ID, 200, 3, activation).ok());
+    CreditPeerContextSnapshot peer;
+    EXPECT_TRUE(contexts->lookup(LOCAL_SEGMENT_ID, 3, peer).ok());
+    EXPECT_TRUE(ledger->activate(peer.key, peer.epoch).ok());
+    ReceiverCreditUpdateV1 update;
+    update.receiver_session_id = peer.key.receiver_session;
+    update.qos_class = peer.key.qos_class;
+    update.epoch = peer.epoch;
+    update.sequence = 1;
+    update.grants = {{CreditResource::DataBytes, bytes},
+                     {CreditResource::RequestSlots, slots}};
+    CreditUpdateDisposition disposition;
+    EXPECT_TRUE(ledger->applyUpdate(peer.key, update, disposition).ok());
+    EXPECT_TRUE(engine
+                    .installReceiverCreditDispatch(
+                        contexts, ledger, [](const Request&) { return 3; })
+                    .ok());
+    return peer.key;
+}
+
+TEST(RuntimeQueueDispatch, RejectsReceiverCreditWithoutRuntimeQueue) {
+    auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
+    cfg->set("enable_runtime_queue", false);
+    cfg->set("receiver_credit/enabled", true);
+    TransferEngineImpl engine(cfg);
+    EXPECT_FALSE(engine.available());
+}
+
+TEST(RuntimeQueueDispatch, RejectsCreditInstallWhenOptInIsDisabled) {
+    auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+    auto status = engine.installReceiverCreditDispatch(
+        std::make_shared<CreditPeerContextTable>(),
+        std::make_shared<SenderCreditLedger>());
+    EXPECT_TRUE(status.IsInvalidArgument()) << status.ToString();
+}
+
+TEST(RuntimeQueueDispatch, CreditOptInFailsClosedBeforeInstall) {
+    auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
+    cfg->set("receiver_credit/enabled", true);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    installFakeRdma(engine, fake_rdma);
+    constexpr size_t kReqLen = 4096;
+    std::vector<uint8_t> buffer(kReqLen, 0x90);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    BatchID batch = engine.allocateBatch(1);
+    auto status =
+        engine.submitTransfer(batch, {makeLocalWrite(buffer.data(), kReqLen)});
+    EXPECT_TRUE(status.IsInvalidEntry()) << status.ToString();
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 0);
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(RuntimeQueueDispatch, CreditOptInUsesConfiguredDefaultQos) {
+    auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
+    cfg->set("receiver_credit/enabled", true);
+    cfg->set("receiver_credit/default_qos_class", uint32_t{5});
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    installFakeRdma(engine, fake_rdma);
+
+    auto contexts = std::make_shared<CreditPeerContextTable>();
+    auto ledger = std::make_shared<SenderCreditLedger>();
+    CreditActivationV1 activation;
+    activation.receiver_session_id = {55, 66};
+    activation.epoch = 9;
+    ASSERT_TRUE(contexts->activate(LOCAL_SEGMENT_ID, 200, 5, activation).ok());
+    CreditPeerContextSnapshot peer;
+    ASSERT_TRUE(contexts->lookup(LOCAL_SEGMENT_ID, 5, peer).ok());
+    ASSERT_TRUE(ledger->activate(peer.key, peer.epoch).ok());
+    constexpr size_t kReqLen = 4096;
+    ReceiverCreditUpdateV1 update;
+    update.receiver_session_id = peer.key.receiver_session;
+    update.qos_class = peer.key.qos_class;
+    update.epoch = peer.epoch;
+    update.sequence = 1;
+    update.grants = {{CreditResource::DataBytes, kReqLen},
+                     {CreditResource::RequestSlots, 1}};
+    CreditUpdateDisposition disposition;
+    ASSERT_TRUE(ledger->applyUpdate(peer.key, update, disposition).ok());
+    ASSERT_TRUE(engine.installReceiverCreditDispatch(contexts, ledger).ok());
+
+    std::vector<uint8_t> buffer(kReqLen, 0x96);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    BatchID batch = engine.allocateBatch(1);
+    ASSERT_TRUE(
+        engine.submitTransfer(batch, {makeLocalWrite(buffer.data(), kReqLen)})
+            .ok());
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
+    uint64_t bytes = 1;
+    ASSERT_TRUE(
+        ledger->available(peer.key, CreditResource::DataBytes, bytes).ok());
+    EXPECT_EQ(bytes, 0);
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(RuntimeQueueDispatch, CreditGateCommitsSuccessfulTransportSubmit) {
+    auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
+    cfg->set("receiver_credit/enabled", true);
+    auto contexts = std::make_shared<CreditPeerContextTable>();
+    auto ledger = std::make_shared<SenderCreditLedger>();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    installFakeRdma(engine, fake_rdma);
+    constexpr size_t kReqLen = 4096;
+    auto credit_key = installCreditGate(engine, contexts, ledger, kReqLen, 1);
+    std::vector<uint8_t> buffer(kReqLen, 0x91);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    BatchID batch = engine.allocateBatch(1);
+    ASSERT_TRUE(
+        engine.submitTransfer(batch, {makeLocalWrite(buffer.data(), kReqLen)})
+            .ok());
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
+    uint64_t bytes = 1, slots = 1;
+    ASSERT_TRUE(
+        ledger->available(credit_key, CreditResource::DataBytes, bytes).ok());
+    ASSERT_TRUE(
+        ledger->available(credit_key, CreditResource::RequestSlots, slots)
+            .ok());
+    EXPECT_EQ(bytes, 0);
+    EXPECT_EQ(slots, 0);
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(RuntimeQueueDispatch, CreditGateRollsBackFailedTransportSubmit) {
+    auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
+    cfg->set("receiver_credit/enabled", true);
+    auto contexts = std::make_shared<CreditPeerContextTable>();
+    auto ledger = std::make_shared<SenderCreditLedger>();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+    auto fake_rdma = std::make_shared<FakeTransport>(
+        RDMA, FakeTransport::PollStatusFactory{}, false, true);
+    installFakeRdma(engine, fake_rdma);
+    constexpr size_t kReqLen = 4096;
+    auto credit_key = installCreditGate(engine, contexts, ledger, kReqLen, 1);
+    std::vector<uint8_t> buffer(kReqLen, 0x92);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    BatchID batch = engine.allocateBatch(1);
+    ASSERT_TRUE(
+        engine.submitTransfer(batch, {makeLocalWrite(buffer.data(), kReqLen)})
+            .ok());
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
+    uint64_t bytes = 0, slots = 0;
+    ASSERT_TRUE(
+        ledger->available(credit_key, CreditResource::DataBytes, bytes).ok());
+    ASSERT_TRUE(
+        ledger->available(credit_key, CreditResource::RequestSlots, slots)
+            .ok());
+    EXPECT_EQ(bytes, kReqLen);
+    EXPECT_EQ(slots, 1);
+    TransferStatus status{};
+    ASSERT_TRUE(engine.getTransferStatus(batch, 0, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::FAILED);
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(RuntimeQueueDispatch, CreditGateDefersUntilCreditArrives) {
+    auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
+    cfg->set("receiver_credit/enabled", true);
+    auto contexts = std::make_shared<CreditPeerContextTable>();
+    auto ledger = std::make_shared<SenderCreditLedger>();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    installFakeRdma(engine, fake_rdma);
+    constexpr size_t kReqLen = 4096;
+    auto credit_key = installCreditGate(engine, contexts, ledger, 0, 0);
+    std::vector<uint8_t> buffer(kReqLen, 0x93);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    BatchID batch = engine.allocateBatch(1);
+    ASSERT_TRUE(
+        engine.submitTransfer(batch, {makeLocalWrite(buffer.data(), kReqLen)})
+            .ok());
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 0);
+
+    ReceiverCreditUpdateV1 update;
+    update.receiver_session_id = credit_key.receiver_session;
+    update.qos_class = credit_key.qos_class;
+    update.epoch = 7;
+    update.sequence = 2;
+    update.grants = {{CreditResource::DataBytes, kReqLen},
+                     {CreditResource::RequestSlots, 1}};
+    CreditUpdateDisposition disposition;
+    ASSERT_TRUE(ledger->applyUpdate(credit_key, update, disposition).ok());
+
+    TransferStatus status{};
+    ASSERT_TRUE(engine.getTransferStatus(batch, 0, status).ok());
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+    uint64_t bytes = 1, slots = 1;
+    ASSERT_TRUE(
+        ledger->available(credit_key, CreditResource::DataBytes, bytes).ok());
+    ASSERT_TRUE(
+        ledger->available(credit_key, CreditResource::RequestSlots, slots)
+            .ok());
+    EXPECT_EQ(bytes, 0);
+    EXPECT_EQ(slots, 0);
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(RuntimeQueueDispatch, CreditGateRejectsQueuedSnapshotAfterRestart) {
+    auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
+    cfg->set("receiver_credit/enabled", true);
+    auto contexts = std::make_shared<CreditPeerContextTable>();
+    auto ledger = std::make_shared<SenderCreditLedger>();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    installFakeRdma(engine, fake_rdma);
+    constexpr size_t kReqLen = 4096;
+    auto old_key = installCreditGate(engine, contexts, ledger, 0, 0);
+    std::vector<uint8_t> buffer(kReqLen, 0x94);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    BatchID batch = engine.allocateBatch(1);
+    ASSERT_TRUE(
+        engine.submitTransfer(batch, {makeLocalWrite(buffer.data(), kReqLen)})
+            .ok());
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 0);
+
+    CreditActivationV1 restarted;
+    restarted.receiver_session_id = {33, 44};
+    restarted.epoch = 1;
+    ASSERT_TRUE(contexts->activate(LOCAL_SEGMENT_ID, 200, 3, restarted).ok());
+
+    TransferStatus status{};
+    ASSERT_TRUE(engine.getTransferStatus(batch, 0, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::FAILED);
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 0);
+    uint64_t bytes = 1;
+    ASSERT_TRUE(
+        ledger->available(old_key, CreditResource::DataBytes, bytes).ok());
+    EXPECT_EQ(bytes, 0);
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(RuntimeQueueDispatch, CreditGateDoesNotOverdrawAcrossQueuedOwners) {
+    auto cfg = makeRuntimeQueueConfig(2, 1UL << 20);
+    cfg->set("receiver_credit/enabled", true);
+    auto contexts = std::make_shared<CreditPeerContextTable>();
+    auto ledger = std::make_shared<SenderCreditLedger>();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    installFakeRdma(engine, fake_rdma);
+    constexpr size_t kReqLen = 4096;
+    auto credit_key = installCreditGate(engine, contexts, ledger, kReqLen, 1);
+    std::vector<uint8_t> buffer(kReqLen * 2, 0x95);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    BatchID batch = engine.allocateBatch(2);
+    ASSERT_TRUE(
+        engine
+            .submitTransfer(batch,
+                            {makeLocalWrite(buffer.data(), kReqLen),
+                             makeLocalWrite(buffer.data() + kReqLen, kReqLen)})
+            .ok());
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
+    uint64_t bytes = 1, slots = 1;
+    ASSERT_TRUE(
+        ledger->available(credit_key, CreditResource::DataBytes, bytes).ok());
+    ASSERT_TRUE(
+        ledger->available(credit_key, CreditResource::RequestSlots, slots)
+            .ok());
+    EXPECT_EQ(bytes, 0);
+    EXPECT_EQ(slots, 0);
+
+    ReceiverCreditUpdateV1 update;
+    update.receiver_session_id = credit_key.receiver_session;
+    update.qos_class = credit_key.qos_class;
+    update.epoch = 7;
+    update.sequence = 2;
+    update.grants = {{CreditResource::DataBytes, kReqLen * 2},
+                     {CreditResource::RequestSlots, 2}};
+    CreditUpdateDisposition disposition;
+    ASSERT_TRUE(ledger->applyUpdate(credit_key, update, disposition).ok());
+
+    TransferStatus overall{};
+    for (int i = 0; i < 4; ++i) {
+        ASSERT_TRUE(engine.getTransferStatus(batch, overall).ok());
+        if (overall.s == TransferStatusEnum::COMPLETED) break;
+    }
+    EXPECT_EQ(overall.s, TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 2);
+    ASSERT_TRUE(
+        ledger->available(credit_key, CreditResource::DataBytes, bytes).ok());
+    ASSERT_TRUE(
+        ledger->available(credit_key, CreditResource::RequestSlots, slots)
+            .ok());
+    EXPECT_EQ(bytes, 0);
+    EXPECT_EQ(slots, 0);
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(RuntimeQueueDispatch, CreditGateFillsDispatchWindowWhenCreditAllows) {
+    auto cfg = makeRuntimeQueueConfig(2, 1UL << 20);
+    cfg->set("receiver_credit/enabled", true);
+    auto contexts = std::make_shared<CreditPeerContextTable>();
+    auto ledger = std::make_shared<SenderCreditLedger>();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    installFakeRdma(engine, fake_rdma);
+    constexpr size_t kReqLen = 4096;
+    auto credit_key =
+        installCreditGate(engine, contexts, ledger, kReqLen * 2, 2);
+    std::vector<uint8_t> buffer(kReqLen * 2, 0x97);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    BatchID batch = engine.allocateBatch(2);
+    ASSERT_TRUE(
+        engine
+            .submitTransfer(batch,
+                            {makeLocalWrite(buffer.data(), kReqLen),
+                             makeLocalWrite(buffer.data() + kReqLen, kReqLen)})
+            .ok());
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 2);
+    uint64_t bytes = 1, slots = 1;
+    ASSERT_TRUE(
+        ledger->available(credit_key, CreditResource::DataBytes, bytes).ok());
+    ASSERT_TRUE(
+        ledger->available(credit_key, CreditResource::RequestSlots, slots)
+            .ok());
+    EXPECT_EQ(bytes, 0);
+    EXPECT_EQ(slots, 0);
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(RuntimeQueueDispatch, CreditGateDefersEveryUnprocessedPickedOwner) {
+    auto cfg = makeRuntimeQueueConfig(2, 1UL << 20);
+    cfg->set("receiver_credit/enabled", true);
+    auto contexts = std::make_shared<CreditPeerContextTable>();
+    auto ledger = std::make_shared<SenderCreditLedger>();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    installFakeRdma(engine, fake_rdma);
+    constexpr size_t kReqLen = 4096;
+    auto credit_key = installCreditGate(engine, contexts, ledger, 0, 0);
+    std::vector<uint8_t> buffer(kReqLen * 2, 0x98);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    BatchID batch = engine.allocateBatch(2);
+    ASSERT_TRUE(
+        engine
+            .submitTransfer(batch,
+                            {makeLocalWrite(buffer.data(), kReqLen),
+                             makeLocalWrite(buffer.data() + kReqLen, kReqLen)})
+            .ok());
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 0);
+
+    ReceiverCreditUpdateV1 update;
+    update.receiver_session_id = credit_key.receiver_session;
+    update.qos_class = credit_key.qos_class;
+    update.epoch = 7;
+    update.sequence = 2;
+    update.grants = {{CreditResource::DataBytes, kReqLen * 2},
+                     {CreditResource::RequestSlots, 2}};
+    CreditUpdateDisposition disposition;
+    ASSERT_TRUE(ledger->applyUpdate(credit_key, update, disposition).ok());
+
+    TransferStatus overall{};
+    for (int i = 0; i < 4; ++i) {
+        ASSERT_TRUE(engine.getTransferStatus(batch, overall).ok());
+        if (overall.s == TransferStatusEnum::COMPLETED) break;
+    }
+    EXPECT_EQ(overall.s, TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 2);
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
 }
 
 TEST(RuntimeQueueDispatch, RejectsOverfullBatchBeforePublishingTasks) {
@@ -508,7 +912,9 @@ TEST(RuntimeQueueDispatch, ProgressWorkerRefillsWindowFromTransportNotify) {
                             {makeLocalWrite(buffer.data(), kReqLen),
                              makeLocalWrite(buffer.data() + kReqLen, kReqLen)})
             .ok());
-    EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
+    // The submit notification may let the progress worker dispatch the second
+    // owner before this thread observes the first one.
+    EXPECT_GE(fake_rdma->submit_calls.load(), 1);
 
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
