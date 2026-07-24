@@ -25,6 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       run-checks: ${{ steps.stage.outputs.run-checks }}
+      run-core: ${{ steps.stage.outputs.run-core }}
       run-full: ${{ steps.stage.outputs.run-full }}
     steps:
       - name: Select pre-review or full CI
@@ -48,12 +49,13 @@ jobs:
               'run-checks',
               isPushOrDispatch || isPreReview || isFullReviewRun
             );
+            core.setOutput('run-core', isPushOrDispatch || isPreReview);
             core.setOutput('run-full', isPushOrDispatch || isFullReviewRun);
 
   build:
     needs: [ci-stage, spell-check, clang-format, check-paths]
     if: >-
-      needs.ci-stage.outputs.run-full == 'true' &&
+      needs.ci-stage.outputs.run-core == 'true' &&
       (needs.check-paths.outputs.should-run-downstream == 'true' ||
        github.event_name == 'workflow_dispatch')
     uses: ./.github/workflows/core-build.yml
@@ -672,9 +674,9 @@ jobs:
       shell: bash
 
   fast-unit-tests:
-    name: Fast Python and C++ unit tests
+    name: Fast Python unit tests
     needs: [ci-stage]
-    if: needs.ci-stage.outputs.run-checks == 'true'
+    if: needs.ci-stage.outputs.run-core == 'true'
     runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4
@@ -687,10 +689,7 @@ jobs:
         python-version: '3.12'
 
     - name: Install test dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y libgtest-dev
-        python -m pip install aiohttp pytest pyyaml
+      run: python -m pip install aiohttp pytest pyyaml
 
     - name: Run fast Python unit tests
       env:
@@ -702,18 +701,6 @@ jobs:
           mooncake-wheel.tests.test_http_metadata_server
         python -m pytest -q mooncake-wheel/tests/test_release_wheel_tags.py
       shell: bash
-
-    - name: Build and run pre-review C++ unit tests
-      run: |
-        g++ -std=c++20 -O2 \
-          -I mooncake-common/include \
-          mooncake-common/src/environ.cpp \
-          mooncake-common/tests/environ_test.cpp \
-          -lgtest -pthread \
-          -o "$RUNNER_TEMP/mooncake-environ-test"
-        "$RUNNER_TEMP/mooncake-environ-test"
-      shell: bash
-
 
   docs-check:
     name: Check Sphinx docs build

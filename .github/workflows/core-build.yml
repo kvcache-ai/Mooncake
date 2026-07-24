@@ -177,17 +177,7 @@ jobs:
         cd build
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
         ldconfig -v || echo "always continue"
-        if [ "${{ inputs.collect-coverage }}" = "true" ]; then
-          MC_METADATA_SERVER=http://127.0.0.1:8080/metadata \
-            DEFAULT_KV_LEASE_TTL=500 \
-            ctest -j --output-on-failure
-        else
-          # environ_test is the fixed, lightweight C++ subset run before
-          # review approval; keep the full-CI CTest phase non-duplicative.
-          MC_METADATA_SERVER=http://127.0.0.1:8080/metadata \
-            DEFAULT_KV_LEASE_TTL=500 \
-            ctest -j --output-on-failure --exclude-regex '^environ_test$'
-        fi
+        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 ctest -j --output-on-failure
       shell: bash
 
     - name: Drain HTTP E2E test
