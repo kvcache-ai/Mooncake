@@ -1,0 +1,105 @@
+name: Start Full CI After Review
+
+on:
+  pull_request_target:
+    types: [synchronize, reopened]
+  pull_request_review:
+    types: [submitted, dismissed]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: review-approved-ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  reset-on-update:
+    name: Reset full CI approval after an update
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remove the full CI label
+        uses: actions/github-script@v7
+        with:
+          script: |
+            try {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                name: 'run-ci',
+              });
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+
+  update-on-review:
+    name: Update full CI approval from review
+    if: github.event_name == 'pull_request_review'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Apply the review decision
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const review = context.payload.review;
+            const pull = context.payload.pull_request;
+            let permission = 'none';
+            try {
+              const permissionResponse =
+                await github.rest.repos.getCollaboratorPermissionLevel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  username: review.user.login,
+                });
+              permission = permissionResponse.data.permission;
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+            const trustedPermissions = new Set(['admin', 'maintain', 'write']);
+            if (!trustedPermissions.has(permission)) {
+              core.notice(
+                `Ignoring review from ${review.user.login}: ` +
+                `${permission} permission cannot start full CI.`
+              );
+              return;
+            }
+
+            const removeRunCiLabel = async () => {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: pull.number,
+                  name: 'run-ci',
+                });
+              } catch (error) {
+                if (error.status !== 404) throw error;
+              }
+            };
+
+            if (
+              context.payload.action === 'submitted' &&
+              review.state.toLowerCase() === 'approved' &&
+              review.commit_id === pull.head.sha
+            ) {
+              // Re-adding the label emits a fresh `labeled` event even when a
+              // previous approval existed for an older head.
+              await removeRunCiLabel();
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pull.number,
+                labels: ['run-ci'],
+              });
+              return;
+            }
+
+            if (
+              context.payload.action === 'dismissed' ||
+              review.state.toLowerCase() === 'changes_requested'
+            ) {
+              await removeRunCiLabel();
+            }

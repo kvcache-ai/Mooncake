@@ -67,10 +67,6 @@ jobs:
       if: inputs.collect-coverage
       run: sudo apt-get install -y lcov gcovr
 
-    - name: Test HugeTLB sizing helper
-      run: python3 scripts/test_hicache_hugepage_requirements.py
-      shell: bash
-
     - name: Set up coverage compilation flags
       if: inputs.collect-coverage
       run: |

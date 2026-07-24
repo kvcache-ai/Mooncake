@@ -20,30 +20,54 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  ci-stage:
+    name: Determine CI stage
+    runs-on: ubuntu-latest
+    outputs:
+      run-checks: ${{ steps.stage.outputs.run-checks }}
+      run-full: ${{ steps.stage.outputs.run-full }}
+    steps:
+      - name: Select pre-review or full CI
+        id: stage
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const eventName = context.eventName;
+            const action = context.payload.action;
+            const isPushOrDispatch =
+              eventName === 'push' || eventName === 'workflow_dispatch';
+            const isPreReview =
+              eventName === 'pull_request' &&
+              ['opened', 'synchronize', 'reopened'].includes(action);
+            const isFullReviewRun =
+              eventName === 'pull_request' &&
+              action === 'labeled' &&
+              context.payload.label?.name === 'run-ci';
+
+            core.setOutput(
+              'run-checks',
+              isPushOrDispatch || isPreReview || isFullReviewRun
+            );
+            core.setOutput('run-full', isPushOrDispatch || isFullReviewRun);
+
   build:
-    needs: [spell-check, clang-format, check-paths]
+    needs: [ci-stage, spell-check, clang-format, check-paths]
     if: >-
+      needs.ci-stage.outputs.run-full == 'true' &&
       (needs.check-paths.outputs.should-run-downstream == 'true' ||
-       github.event_name == 'workflow_dispatch') &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+       github.event_name == 'workflow_dispatch')
     uses: ./.github/workflows/core-build.yml
     with:
       collect-coverage: false
     secrets: inherit
 
   build-musa:
-    needs: [spell-check, clang-format, check-paths]
+    needs: [ci-stage, spell-check, clang-format, check-paths]
     if: >-
+      needs.ci-stage.outputs.run-full == 'true' &&
       (needs.check-paths.outputs.should-run-musa == 'true' ||
        github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch') &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+       github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-22.04
     container: registry.mthreads.com/mcconline/inference/pytorch:2.9.1.post1-py3.10-musa5.2.0-mp31-devel-ubuntu22.04-amd64
     steps:
@@ -74,19 +98,16 @@ jobs:
       shell: bash
 
   build-arm64:
-    needs: [spell-check, clang-format, check-paths]
+    needs: [ci-stage, spell-check, clang-format, check-paths]
     if: >-
+      needs.ci-stage.outputs.run-full == 'true' &&
       (needs.check-paths.outputs.should-run-arm64 == 'true' ||
        github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch') &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+       github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-22.04-arm
     strategy:
       matrix:
-        # Fork PR jobs start only after approval, so validate both supported
+        # Full CI starts after code review approval, so validate both supported
         # Python ABIs before merge.
         python-version: ['3.10', '3.12']
     env:
@@ -174,13 +195,13 @@ jobs:
         path: mooncake-wheel/dist-py${{ steps.generate_tag_arm64.outputs.python_version_tag }}/*.whl
 
   test-wheel-ubuntu:
-    needs: [spell-check, clang-format, build-flags]
+    needs: [ci-stage, spell-check, clang-format, build-flags]
     if: >-
+      needs.ci-stage.outputs.run-full == 'true' &&
       needs.build-flags.result == 'success' &&
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+       github.event_name == 'pull_request')
     strategy:
       matrix:
         # Validate the complete OS x Python cross-product after approval.
@@ -344,14 +365,11 @@ jobs:
       shell: bash
 
   build-flags:
-    needs: [spell-check, clang-format, check-paths]
+    needs: [ci-stage, spell-check, clang-format, check-paths]
     if: >-
+      needs.ci-stage.outputs.run-full == 'true' &&
       (needs.check-paths.outputs.should-run-downstream == 'true' ||
-       github.event_name == 'workflow_dispatch') &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+       github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-22.04
     strategy:
       matrix:
@@ -568,15 +586,12 @@ jobs:
 
   build-docker:
     name: Build Docker Image
-    needs: [spell-check, clang-format, check-paths]
+    needs: [ci-stage, spell-check, clang-format, check-paths]
     if: >-
+      needs.ci-stage.outputs.run-full == 'true' &&
       (needs.check-paths.outputs.should-run-docker == 'true' ||
        github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch') &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+       github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4
@@ -599,11 +614,8 @@ jobs:
 
   spell-check:
     name: Spell Check with Typos
-    if: >-
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+    needs: [ci-stage]
+    if: needs.ci-stage.outputs.run-checks == 'true'
     runs-on: ubuntu-22.04
     steps:
     - name: Checkout Actions Repository
@@ -615,11 +627,8 @@ jobs:
 
   clang-format:
     name: Check code format
-    if: >-
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+    needs: [ci-stage]
+    if: needs.ci-stage.outputs.run-checks == 'true'
     runs-on: ubuntu-22.04
     steps:
     - name: Checkout Actions Repository
@@ -662,14 +671,40 @@ jobs:
         ./scripts/code_format.sh --check --base "${BASE_REF}"
       shell: bash
 
+  fast-unit-tests:
+    name: Fast Python unit tests
+    needs: [ci-stage]
+    if: needs.ci-stage.outputs.run-checks == 'true'
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install test dependencies
+      run: python -m pip install aiohttp pytest pyyaml
+
+    - name: Run self-contained unit tests
+      env:
+        PYTHONPATH: mooncake-wheel
+      run: |
+        python scripts/test_hicache_hugepage_requirements.py
+        python -m unittest \
+          mooncake-wheel.tests.test_mooncake_config \
+          mooncake-wheel.tests.test_http_metadata_server
+        python -m pytest -q mooncake-wheel/tests/test_release_wheel_tags.py
+      shell: bash
+
 
   docs-check:
     name: Check Sphinx docs build
-    if: >-
-      github.event_name == 'push' ||
-      github.event_name == 'workflow_dispatch' ||
-      github.event.action == 'opened' ||
-      contains(github.event.pull_request.labels.*.name, 'run-ci')
+    needs: [ci-stage]
+    if: needs.ci-stage.outputs.run-checks == 'true'
     runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4
@@ -706,11 +741,8 @@ jobs:
 
 
   check-paths:
-    if: >-
-      github.event_name == 'push' ||
-      github.event_name == 'workflow_dispatch' ||
-      github.event.action == 'opened' ||
-      contains(github.event.pull_request.labels.*.name, 'run-ci')
+    needs: [ci-stage]
+    if: needs.ci-stage.outputs.run-checks == 'true'
     runs-on: ubuntu-latest
     outputs:
       should-run-downstream: ${{ steps.dispatch-override.outputs.src || steps.filter.outputs.src }}
@@ -846,14 +878,11 @@ jobs:
               - '.github/workflows/ci_efa.yml'
 
   build-wheel-cu13:
-    needs: [spell-check, clang-format, check-paths]
+    needs: [ci-stage, spell-check, clang-format, check-paths]
     if: >-
+      needs.ci-stage.outputs.run-full == 'true' &&
       (needs.check-paths.outputs.should-run-downstream == 'true' ||
-       github.event_name == 'workflow_dispatch') &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+       github.event_name == 'workflow_dispatch')
     uses: ./.github/workflows/ci_cu13.yml
     with:
       # Validate both supported Python ABIs after approval.
@@ -861,46 +890,43 @@ jobs:
     secrets: inherit
 
   build-wheel-efa:
-    needs: [spell-check, clang-format, check-paths]
+    needs: [ci-stage, spell-check, clang-format, check-paths]
     if: >-
+      needs.ci-stage.outputs.run-full == 'true' &&
       (needs.check-paths.outputs.should-run-efa == 'true' ||
        github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch') &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+       github.event_name == 'workflow_dispatch')
     uses: ./.github/workflows/ci_efa.yml
     secrets: inherit
 
   ascend-test:
     # This reusable workflow checks out and builds the source independently.
     # Start it after the fast checks instead of waiting for core coverage.
-    needs: [spell-check, clang-format, check-paths]
+    needs: [ci-stage, spell-check, clang-format, check-paths]
     if: >-
-      needs.check-paths.outputs.should-run-ascend == 'true' ||
-      github.event_name == 'push' ||
-      github.event_name == 'workflow_dispatch'
+      needs.ci-stage.outputs.run-full == 'true' &&
+      (needs.check-paths.outputs.should-run-ascend == 'true' ||
+       github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch')
     uses: ./.github/workflows/ci_ascend.yml
     secrets: inherit
 
   integration-test:
     # integration-test consumes the CUDA 13 Python 3.12 wheel artifact.
-    needs: [build-wheel-cu13, check-paths]
-    if: needs.check-paths.outputs.should-run-downstream == 'true'
+    needs: [ci-stage, build-wheel-cu13, check-paths]
+    if: >-
+      needs.ci-stage.outputs.run-full == 'true' &&
+      needs.check-paths.outputs.should-run-downstream == 'true'
     uses: ./.github/workflows/integration-test.yml
     secrets: inherit
 
   tent-ci:
-    needs: [spell-check, clang-format, check-paths]
+    needs: [ci-stage, spell-check, clang-format, check-paths]
     if: >-
+      needs.ci-stage.outputs.run-full == 'true' &&
       (needs.check-paths.outputs.should-run-tent == 'true' ||
        github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch') &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+       github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
@@ -991,12 +1017,17 @@ jobs:
       run: ${SCCACHE_PATH} --show-stats
 
   ci-gate:
-    name: CI Gate
-    if: always()
+    name: ${{ needs.ci-stage.outputs.run-full == 'true' && 'CI Gate' || 'Pre-review Gate' }}
+    if: >-
+      always() &&
+      needs.ci-stage.outputs.run-checks == 'true'
     needs:
+      - ci-stage
       - spell-check
       - clang-format
+      - fast-unit-tests
       - docs-check
+      - check-paths
       - build
       - build-musa
       - build-arm64
