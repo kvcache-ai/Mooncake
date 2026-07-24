@@ -418,3 +418,52 @@ if(USE_SUNRISE)
 endif()
 
 install(TARGETS mooncake_master mooncake_client DESTINATION bin)
+
+# ---------------------------------------------------------------------------
+# Optional self-contained shared library exposing only the store_c.h C ABI.
+#
+# `mooncake_store` is a static library and the Rust/Go bindings statically link
+# its whole dependency graph. WITH_STORE_C_SHARED instead emits a single
+# libmooncake_store.so that whole-archives mooncake_store (so the C entry points
+# survive) and exports ONLY the `mooncake_store_*` symbols, for consumers that
+# dlopen the store at run time (e.g. the Rust crate's `dlopen` feature).
+#
+# Objects are -fPIC (see mooncake-common/common.cmake), so archiving them into a
+# .so is safe. Genuinely-shared transitive deps (asio, and the Go etcd/k8s HA
+# backends when enabled) plus system/toolkit libs (glog, cudart, ibverbs, ...)
+# remain ordinary DT_NEEDED dynamic dependencies.
+# ---------------------------------------------------------------------------
+if(WITH_STORE_C_SHARED)
+  # This target whole-archives mooncake_store and reuses its OUTPUT_NAME, both of
+  # which assume mooncake_store is a static archive. add_library(mooncake_store)
+  # follows BUILD_SHARED_LIBS, so guard against a shared mooncake_store (e.g. when
+  # BUILD_SHARED_LIBS=ON, which some backends force) to avoid a broken
+  # --whole-archive link and a libmooncake_store.so output-name collision.
+  get_target_property(_mooncake_store_type mooncake_store TYPE)
+  if(NOT _mooncake_store_type STREQUAL "STATIC_LIBRARY")
+    message(
+      FATAL_ERROR
+        "WITH_STORE_C_SHARED requires mooncake_store to be a STATIC_LIBRARY "
+        "(got ${_mooncake_store_type}); configure with BUILD_SHARED_LIBS=OFF.")
+  endif()
+
+  add_library(mooncake_store_c SHARED store_c_shared.cpp)
+  set_target_properties(
+    mooncake_store_c PROPERTIES OUTPUT_NAME mooncake_store CXX_VISIBILITY_PRESET
+                                hidden VISIBILITY_INLINES_HIDDEN ON)
+  add_dependencies(mooncake_store_c mooncake_store)
+  # Whole-archive the static lib via its file path (which does not drag in
+  # interface deps), then link the target once more for its transitive
+  # dependencies. Objects already loaded by --whole-archive are not re-added.
+  target_link_libraries(
+    mooncake_store_c PRIVATE -Wl,--whole-archive "$<TARGET_FILE:mooncake_store>"
+                             -Wl,--no-whole-archive mooncake_store)
+  # Export only the C ABI; the version script localizes every other symbol
+  # pulled from the static archives. Strip debug info in Release (it dominates
+  # the .so size).
+  target_link_options(
+    mooncake_store_c PRIVATE
+    "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/store_c.map"
+    "$<$<CONFIG:Release>:-Wl,-s>")
+  install(TARGETS mooncake_store_c DESTINATION lib)
+endif()

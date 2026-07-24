@@ -1,8 +1,32 @@
 # Mooncake Store Rust Bindings
 
 This directory contains the Rust bindings, examples, benchmarks, and smoke tests
-for Mooncake Store. The Rust crate links against the C++ Mooncake Store build, so
-run a CMake build before using standalone Cargo commands.
+for Mooncake Store.
+
+## Backends (features)
+
+The crate has two backends. Enable at least one; if both are enabled, `link`
+takes precedence:
+
+- **`link`** (default): statically links `libmooncake_store` at build time.
+  `build.rs` generates the FFI with bindgen and links the C++ dependency graph,
+  so a built Mooncake tree (libraries + `store_c.h`) must be present at build
+  time. Everything below assumes this backend.
+- **`dlopen`**: loads `libmooncake_store.so` at run time via `libloading`. The
+  crate builds with no Mooncake C++ toolchain, headers, or generated bindings
+  present; only the shared library is needed, and only at run time. Use it for a
+  lean build that defers Mooncake to a runtime dependency:
+
+  ```toml
+  mooncake_store = { version = "0.1", default-features = false, features = ["dlopen"] }
+  ```
+
+  Build the loadable library with `cmake -DWITH_STORE_C_SHARED=ON` (emits a
+  `libmooncake_store.so` exporting only the `store_c.h` C ABI). At run time it is
+  located via the `MOONCAKE_STORE_LIBRARY` environment variable (default
+  `libmooncake_store.so`, resolved through the OS loader search path), or pin an
+  explicit path with `mooncake_store::load_library(path)` before creating a
+  store. The public API is identical to the `link` backend.
 
 ## Prerequisites
 
