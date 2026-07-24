@@ -1624,6 +1624,20 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
     return {};
 }
 
+void StorageBackendAdaptor::RemoveAll() {
+    if (storage_backend_) {
+        storage_backend_->RemoveAll();
+    }
+    // Reset adaptor-level counters so IsEnableOffloading() reflects the empty
+    // disk. Without this, total_keys/total_size keep their pre-cleanup values
+    // and the node stays unable to offload until a restart (which rescans
+    // metadata and rebuilds them). Applies to the kFilePerKey path; the
+    // OffsetAllocator backend resets its own atomics internally.
+    MutexLocker lock(&mutex_);
+    total_keys = 0;
+    total_size = 0;
+}
+
 BucketIdGenerator::BucketIdGenerator(int64_t start) {
     if (start <= 0) {
         auto cur_time_stamp = time_gen();
@@ -3236,6 +3250,30 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
     return {};
 }
 
+void BucketStorageBackend::RemoveAll() {
+    namespace fs = std::filesystem;
+
+    // Collect all bucket IDs under exclusive lock, then release.
+    std::vector<int64_t> bucket_ids;
+    {
+        SharedMutexLocker lock(&mutex_);
+        bucket_ids.reserve(buckets_.size());
+        for (const auto& [id, _] : buckets_) {
+            bucket_ids.push_back(id);
+        }
+    }
+
+    for (int64_t id : bucket_ids) {
+        auto result = DeleteBucket(id);
+        if (!result) {
+            LOG(WARNING) << "RemoveAll: DeleteBucket failed for bucket_id="
+                         << id << ", error=" << toString(result.error());
+        }
+    }
+
+    LOG(INFO) << "RemoveAll: removed " << bucket_ids.size() << " bucket(s)";
+}
+
 tl::expected<void, ErrorCode> BucketStorageBackend::StoreBucketMetadata(
     int64_t id, std::shared_ptr<BucketMetadata> metadata) {
     auto meta_path_res = GetBucketMetadataPath(id);
@@ -3691,12 +3729,12 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
         // Release fd to StorageFile (takes ownership and will close it)
 #ifdef USE_URING
         if (file_storage_config_.use_uring) {
-            data_file_ = std::make_unique<UringFile>(
+            data_file_ = std::make_shared<UringFile>(
                 data_file_path_, fd_guard.release(), 32, true);
         } else
 #endif
         {
-            data_file_ = std::make_unique<PosixFile>(data_file_path_,
+            data_file_ = std::make_shared<PosixFile>(data_file_path_,
                                                      fd_guard.release());
         }
         if (cfg_.persist_mode != OffsetPersistMode::kDisabled) {
@@ -4478,12 +4516,12 @@ OffsetAllocatorStorageBackend::TryRecoverFromMetadata() {
 
 #ifdef USE_URING
         if (file_storage_config_.use_uring) {
-            data_file_ = std::make_unique<UringFile>(
+            data_file_ = std::make_shared<UringFile>(
                 data_file_path_, fd_guard.release(), 32, true);
         } else
 #endif
         {
-            data_file_ = std::make_unique<PosixFile>(data_file_path_,
+            data_file_ = std::make_shared<PosixFile>(data_file_path_,
                                                      fd_guard.release());
         }
         data_file_->SetDeleteOnWriteFail(false);
@@ -4744,6 +4782,11 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
     keys.reserve(batch_object.size());
     metadatas.reserve(batch_object.size());
 
+    // Pin data_file_ for the whole batch so a concurrent RemoveAll() rebuild
+    // (which rebinds the data_file_ member) cannot close the file while a
+    // write is in flight (writes do not hold shard locks during I/O).
+    auto data_file = data_file_;
+
     // Prepared victims are held here until the master accepts their removal.
     // Their allocation handles prevent reuse before notification succeeds.
     PendingEviction pending_eviction;
@@ -4930,7 +4973,7 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
         }
 
         auto write_result =
-            data_file_->vector_write(iovs.data(), iovs.size(), offset);
+            data_file->vector_write(iovs.data(), iovs.size(), offset);
         if (!write_result) {
             LOG(ERROR) << "Failed to write record for key: " << key
                        << ", error: " << write_result.error();
@@ -5117,6 +5160,10 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
         uint32_t value_size;
         AllocationPtr allocation;  // Refcounted handle keeps allocation alive
         Slice dest_slice;
+        // Pin the data file so a concurrent RemoveAll() rebuild (which rebinds
+        // the data_file_ member) cannot destroy this file while we still have
+        // pending I/O on it in phase 2 (no shard lock held there).
+        std::shared_ptr<StorageFile> data_file;
     };
 
     std::vector<ReadPlan> read_plans;
@@ -5145,17 +5192,19 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
         }
 
         // Copy metadata and increment refcount on allocation
-        // This keeps the physical extent alive even if key is evicted
+        // This keeps the physical extent alive even if key is evicted.
+        // Also pin data_file_ (shared_ptr copy) so a concurrent RemoveAll
+        // rebuild cannot close it before our phase-2 I/O completes.
         read_plans.push_back(
             ReadPlan{key, entry.offset, entry.value_size,
                      entry.allocation,  // shared_ptr copy, increments refcount
-                     dest_slice});
+                     dest_slice, data_file_});
 
-        // Lock released here; allocation stays alive via shared_ptr
+        // Lock released here; allocation + data_file stay alive via shared_ptr
     }
 
     // Step 2: Perform disk I/O without holding any locks
-    // Allocations are kept alive by shared_ptr references in read_plans
+    // Allocations and data file are kept alive by shared_ptr refs in read_plans
     for (const auto& plan : read_plans) {
         // Read header first.  The CRC is NOT verified here: records are
         // CRC-validated once during recovery, and during normal operation
@@ -5164,7 +5213,7 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
         char hdr_buf[RecordHeader::SIZE];
         iovec header_iov = {hdr_buf, sizeof(hdr_buf)};
         auto read_header_result =
-            data_file_->vector_read(&header_iov, 1, plan.offset);
+            plan.data_file->vector_read(&header_iov, 1, plan.offset);
         if (!read_header_result) {
             LOG(ERROR) << "Failed to read header for key: " << plan.key
                        << ", error: " << read_header_result.error();
@@ -5188,7 +5237,7 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
         // Read key from disk
         std::string stored_key(header.key_len, '\0');
         iovec key_iov = {stored_key.data(), header.key_len};
-        auto read_key_result = data_file_->vector_read(
+        auto read_key_result = plan.data_file->vector_read(
             &key_iov, 1, plan.offset + RecordHeader::SIZE);
         if (!read_key_result) {
             LOG(ERROR) << "Failed to read key for: " << plan.key
@@ -5209,7 +5258,7 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
 
         // Read value into destination slice (at its aligned offset)
         iovec value_iov = {plan.dest_slice.ptr, plan.dest_slice.size};
-        auto read_value_result = data_file_->vector_read(
+        auto read_value_result = plan.data_file->vector_read(
             &value_iov, 1,
             plan.offset + RecordHeader::ValueOffsetInRecord(header.key_len));
         if (!read_value_result) {
@@ -5357,6 +5406,53 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::ScanMeta(
     }
 
     return {};
+}
+
+void OffsetAllocatorStorageBackend::RemoveAll() {
+    // Acquire exclusive locks on all shards to safely clear the maps and
+    // reset counters. The single-arg SharedMutexLocker constructor takes
+    // exclusive mode (see mutex.h), so map.clear() is safe. The shard locks
+    // also serialize RemoveAll vs RemoveAll (initiator sync + heartbeat
+    // backstop) and vs metadata updates; concurrent readers/writers keep the
+    // old data_file_ alive via shared_ptr pinning (see BatchLoad/BatchStore).
+    std::vector<std::unique_ptr<SharedMutexLocker>> shard_locks;
+    shard_locks.reserve(kNumShards);
+    for (size_t i = 0; i < kNumShards; ++i) {
+        shard_locks.emplace_back(
+            std::make_unique<SharedMutexLocker>(&shards_[i].mutex));
+        shards_[i].map.clear();
+    }
+    total_size_.store(0, std::memory_order_relaxed);
+    total_keys_.store(0, std::memory_order_relaxed);
+
+    // Truncate the data file and rebuild the allocator so the backend
+    // is ready for new writes (same logic as Init's fresh-start path).
+    // Rebinding the shared_ptr drops our ref; any in-flight
+    // BatchLoad/BatchStore that pinned the old data_file_ keeps it alive until
+    // its I/O completes — no use-after-free.
+    if (!data_file_path_.empty()) {
+        int fd = open(data_file_path_.c_str(),
+                      O_CLOEXEC | O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) {
+#ifdef USE_URING
+            if (file_storage_config_.use_uring) {
+                data_file_ =
+                    std::make_shared<UringFile>(data_file_path_, fd, 32, true);
+            } else
+#endif
+            {
+                data_file_ = std::make_shared<PosixFile>(data_file_path_, fd);
+            }
+        } else {
+            LOG(WARNING) << "RemoveAll: failed to truncate data file: "
+                         << data_file_path_;
+        }
+    }
+    if (capacity_ > 0) {
+        allocator_ = offset_allocator::OffsetAllocator::create(0, capacity_);
+    }
+
+    LOG(INFO) << "OffsetAllocatorStorageBackend::RemoveAll: cleared all data";
 }
 
 //-----------------------------------------------------------------------------

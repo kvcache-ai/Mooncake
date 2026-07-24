@@ -384,6 +384,10 @@ class StorageBackendInterface {
         // Default: no-op (no test failures injected)
     }
 
+    // Remove all persisted objects from disk. Called during RemoveAll to
+    // clean up physical SSD files alongside master metadata deletion.
+    virtual void RemoveAll() {}
+
     virtual tl::expected<std::vector<std::string>, ErrorCode>
     EvictAboveDiskWatermark(double /* high_watermark_ratio */,
                             double /* low_watermark_ratio */,
@@ -771,6 +775,8 @@ class StorageBackendAdaptor : public StorageBackendInterface {
         test_failure_predicate_ = std::move(predicate);
     }
 
+    void RemoveAll() override;
+
     tl::expected<std::vector<std::string>, ErrorCode> EvictAboveDiskWatermark(
         double high_watermark_ratio, double low_watermark_ratio,
         EvictionHandler eviction_handler = nullptr) override;
@@ -897,6 +903,8 @@ class BucketStorageBackend : public StorageBackendInterface {
      * - On failure: 返回错误码（例如 IO/内部错误）。
      */
     tl::expected<bool, ErrorCode> IsEnableOffloading() override;
+
+    void RemoveAll() override;
 
     /**
      * @brief 根据后端 bucket 限制（keys/size）将 offloading_objects 分桶。
@@ -1244,6 +1252,8 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
         return eviction_skips_.load(std::memory_order_relaxed);
     }
 
+    void RemoveAll() override;
+
     // On-disk record layout v3 (single definition, shared by the write,
     // read and recovery paths of this backend, and by future DMA writers
     // such as GDS):
@@ -1485,8 +1495,12 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     // Thread-safe allocator managing free space within [0, capacity_) range
     std::shared_ptr<offset_allocator::OffsetAllocator> allocator_;
 
-    // File handle wrapper for I/O operations using preadv/pwritev
-    std::unique_ptr<StorageFile> data_file_;
+    // File handle wrapper for I/O operations using preadv/pwritev. Held as a
+    // shared_ptr so that an in-flight BatchLoad (which copies it into its
+    // ReadPlan under the shard lock) keeps the old file alive while RemoveAll
+    // rebinds this member to a freshly rebuilt file. Avoids use-after-free
+    // when RemoveAll runs concurrently with a reader on another thread.
+    std::shared_ptr<StorageFile> data_file_;
 
     // Sharded metadata maps: one map per shard with its own lock (prevents data
     // races)
