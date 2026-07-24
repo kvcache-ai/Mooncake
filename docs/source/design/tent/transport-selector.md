@@ -28,6 +28,8 @@ Transport selection is driven by configuration with pattern-based rules.
       "intent_type": "foreground_get",
       "priority": "high",
       "devices": ["mlx5_0", "mlx5_1", "mlx5_2"],
+      "service_level": 3,
+      "traffic_class": 96,
       "transports": ["nvlink", "rdma", "shm"]
     },
     {
@@ -56,6 +58,15 @@ Transport selection is driven by configuration with pattern-based rules.
 | `intent_type` | string or int | No | Match a standard transfer intent such as `"foreground_get"`, `"background_prefetch"`, `"migration"`, `"checkpoint"`, `"weight_loading"`, or `"staging_internal"` |
 | `devices` | array[string] | No | List of allowed device names (empty = all devices) |
 | `transports` | array[string] | No | Transport preference list (evaluated in order) |
+| `service_level` | int | No | InfiniBand service level for the matched policy; values outside 0-15 are ignored |
+| `traffic_class` | int | No | Traffic class / DSCP value for the matched policy; values outside 0-255 are ignored |
+| `qp_pool` | string | No | Reserved forward-compatible QP pool name. Parsed and returned by the selector, but not applied to QP setup yet |
+
+`service_level`, `traffic_class`, and `qp_pool` are parsed and carried in the
+selection result for follow-on RDMA handling. This is the schema-plumbing step:
+current QP setup still uses existing endpoint defaults until per-policy QP
+application is wired. If either QoS value is omitted or out of range, the
+selector leaves it unset.
 
 ### Intent-Based Policy Binding
 
@@ -211,6 +222,8 @@ If no `policy` is configured, TENT falls back to original behavior:
       "local_memory": "cuda",
       "remote_memory": "cuda",
       "devices": ["mlx5_0", "mlx5_1", "mlx5_2"],
+      "service_level": 3,
+      "traffic_class": 96,
       "transports": ["rdma"]
     },
     {
@@ -276,6 +289,7 @@ Build device_mask from policy.devices
 Select transport from policy.transports[transport_index]
     ↓
 Return SelectionResult { transport, device_mask }
+    + optional service_level, traffic_class, qp_pool
     ↓
 RdmaTransport.submitTransferTasks(batch, requests)
     ↓

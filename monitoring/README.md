@@ -58,9 +58,7 @@ To be monitored by Prometheus, the `mooncake_master` must be started with metric
     Run the `mooncake_master` executable with the following flags to enable the metrics endpoint. For a complete list of flags, see the [Mooncake Store Deployment Guide](../docs/source/deployment/mooncake-store-deployment-guide.md).
 
     ```bash
-    # Make sure you are in the root directory of the project
-    # The path to mooncake_master might vary depending on your build output directory
-    ./build/mooncake_master \
+    mooncake_master \
       --metrics_port=9003 \
       --enable_metric_reporting=true
     ```
@@ -78,4 +76,3 @@ To be monitored by Prometheus, the `mooncake_master` must be started with metric
     This should return a list of Prometheus-style metrics.
 
 Once both Prometheus and `mooncake_master` are running, you can go to the Prometheus UI (`http://localhost:9090`), navigate to **Status -> Targets**, and you should see the `mooncake-master` job with a state of "UP". You can then explore the pre-built dashboard in Grafana.
-

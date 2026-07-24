@@ -43,8 +43,8 @@ normalised to lowercase when a MooncakeConfig is constructed (e.g. "RDMA" ->
 unrecognised protocol is passed through with a warning rather than rejected.
 
 For most use cases, 'tcp' or 'rdma' is recommended. The default is 'tcp'.
-For RDMA, you also need to specify the device_name (e.g., 'mlx5_0', 'erdma_0')
-or use auto-discovery.
+For RDMA, set device_name to pin specific NICs (e.g., 'mlx5_0', 'erdma_0')
+or leave it empty for default auto-discovery.
 
 Examples:
 ---------
@@ -57,7 +57,7 @@ export MOONCAKE_DEVICE="mlx5_0"
 
 # Using RDMA with auto-discovery
 export MOONCAKE_PROTOCOL="rdma"
-export MOONCAKE_DEVICE="auto-discovery"
+export MOONCAKE_DEVICE=""
 """
 
 import json
@@ -184,8 +184,10 @@ class MooncakeConfig:
             unrecognised value is passed through to the engine with a warning,
             not rejected.
         device_name (Optional[str]): The name of the RDMA device to use
-            (e.g., "mlx5_0", "erdma_0", or "auto-discovery").
-            Required when protocol is "rdma", optional for other protocols.
+            (e.g., "mlx5_0" or "erdma_0"); use an empty string for
+            auto-discovery.
+            For "rdma", provide a value to pin specific NICs, or keep the
+            empty default for auto-discovery. Optional for other protocols.
         master_server_address (str): The address of the master server.
         enable_ssd_offload (bool): Enable SSD offload. Default is False.
         ssd_offload_path (str): The path to the SSD directory for offloading.

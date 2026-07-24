@@ -121,7 +121,7 @@ After successfully compiling Transfer Engine, the test program `transfer_engine_
     ./transfer_engine_bench --mode=target \
                             --metadata_server=etcd://10.0.0.1:2379 \
                             [--local_server_name=TARGET_NAME] \
-                            [--device_name=erdma_0 | --auto-discovery]
+                            [--device_name=erdma_0 | --auto_discovery]
     ```
    The meanings of the various parameters are as follows:
    - `--mode=target` indicates the start of the target node. The target node does not initiate read/write requests; it passively supplies or writes data as required by the initiator node.
@@ -140,7 +140,7 @@ After successfully compiling Transfer Engine, the test program `transfer_engine_
     ./transfer_engine_bench --metadata_server=etcd://10.0.0.1:2379 \
                             --segment_id=TARGET_NAME \
                             [--local_server_name=INITIATOR_NAME] \
-                            [--device_name=erdma_1 | --auto-discovery]
+                            [--device_name=erdma_1 | --auto_discovery]
     ```
    The meanings of the various parameters are as follows (the rest are the same as before):
    - `--segment_id` is the segment name of target node. It needs to be consistent with the value passed to `--local_server_name` when starting the target node (if any).
@@ -489,7 +489,7 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_ENABLE_PARALLEL_REG_MR` Control parallel memory region registration across multiple RDMA NICs. Valid values: -1 (auto, default), 0 (disabled), 1 (enabled). When set to -1, parallel registration is automatically enabled when multiple RNICs exist and memory has been pre-touched. Note: If memory hasn't been touched before registration, parallel registration can be slower than sequential registration
 - `MC_FORCE_HCA` Force to use RDMA as the active transport, return error if no HCA has been found.
 - `MC_FORCE_MNNVL` Force to use Multi-Node NVLink as the active transport regardless whether RDMA devices are installed.
-- `MC_INTRA_NVLINK` Enable intra-node NVLINK transport, and cannot be used together with MC_FORCE_MNNVL.
+- `MC_INTRANODE_NVLINK` Enable intra-node NVLINK transport, and cannot be used together with MC_FORCE_MNNVL.
 - `MC_FORCE_TCP` Force to use TCP as the active transport regardless whether RDMA devices are installed.
 - `MC_MIN_RPC_PORT` Specifies the minimum port number for RPC service. The default value is 15000.
 - `MC_MAX_RPC_PORT` Specifies the maximum port number for RPC service. The default value is 17000.

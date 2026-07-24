@@ -675,7 +675,7 @@ The store service CLI only accepts `--config`, `-D/--define`, `--port`, and `--m
 | `MOONCAKE_MASTER` | `master_server_addr` | — (required unless `MOONCAKE_CONFIG_PATH`) | Master `host:port` |
 | `MOONCAKE_TE_META_DATA_SERVER` | `metadata_server` | `P2PHANDSHAKE` | `P2PHANDSHAKE` / `http://…:8080/metadata` / etcd address |
 | `MOONCAKE_PROTOCOL` | `protocol` | `tcp` | `tcp` / `rdma` / `efa` / `cxl` / `ascend` |
-| `MOONCAKE_DEVICE` | `rdma_devices` | empty | RDMA/EFA device(s), comma-separated; `auto-discovery` supported |
+| `MOONCAKE_DEVICE` | `rdma_devices` | empty | RDMA/EFA device(s), comma-separated; leave empty for default auto-discovery |
 | `MOONCAKE_GLOBAL_SEGMENT_SIZE` | `global_segment_size` | `3355443200` (3.125 GiB) | DRAM contributed; accepts byte integer **or** suffixed form like `500gb` |
 | `MOONCAKE_LOCAL_BUFFER_SIZE` | `local_buffer_size` | `1073741824` (1 GiB) | Transfer Engine buffer; same parsing as above |
 | `MOONCAKE_LOCAL_HOSTNAME` | `local_hostname` | `localhost` | |
