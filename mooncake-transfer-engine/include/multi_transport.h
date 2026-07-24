@@ -67,6 +67,9 @@ class MultiTransport {
      */
     bool isTcpOnly() const;
 
+    /** Return whether an installed NVLink transport supports Fabric memory. */
+    bool supportsNvlinkFabricMemory() const;
+
     std::vector<Transport *> listTransports();
 
     void *getBaseAddr();

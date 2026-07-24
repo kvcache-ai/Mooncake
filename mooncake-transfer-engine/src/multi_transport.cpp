@@ -612,6 +612,17 @@ bool MultiTransport::isTcpOnly() const {
     return transport_map_.size() == 1 && transport_map_.count("tcp") == 1;
 }
 
+bool MultiTransport::supportsNvlinkFabricMemory() const {
+#ifdef USE_MNNVL
+    auto it = transport_map_.find("nvlink");
+    if (it == transport_map_.end()) return false;
+    auto* transport = dynamic_cast<NvlinkTransport*>(it->second.get());
+    return transport != nullptr && transport->supportsFabricMemoryTransport();
+#else
+    return false;
+#endif
+}
+
 std::vector<Transport*> MultiTransport::listTransports() {
     std::vector<Transport*> transport_list;
     for (auto& entry : transport_map_)

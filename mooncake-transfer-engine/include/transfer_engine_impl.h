@@ -350,6 +350,11 @@ class TransferEngineImpl {
         return multi_transports_->getTransport(proto);
     }
 
+    [[nodiscard]] bool supportsNvlinkFabricMemory() const {
+        return multi_transports_ != nullptr &&
+               multi_transports_->supportsNvlinkFabricMemory();
+    }
+
 #if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
     !defined(USE_CXI)
     // Device transport accessors — lazily created, owned by this impl.

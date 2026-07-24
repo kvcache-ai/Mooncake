@@ -125,6 +125,10 @@ int TransferEngine::uninstallTransport(const std::string& proto) {
     return impl_->uninstallTransport(proto);
 }
 
+bool TransferEngine::supportsNvlinkFabricMemory() const {
+    return impl_ != nullptr && impl_->supportsNvlinkFabricMemory();
+}
+
 std::string TransferEngine::getLocalIpAndPort() {
     return impl_->getLocalIpAndPort();
 }
@@ -491,6 +495,11 @@ int TransferEngine::uninstallTransport(const std::string& proto) {
         return 0;
     else
         return impl_->uninstallTransport(proto);
+}
+
+bool TransferEngine::supportsNvlinkFabricMemory() const {
+    return !use_tent_ && impl_ != nullptr &&
+           impl_->supportsNvlinkFabricMemory();
 }
 
 std::string TransferEngine::getLocalIpAndPort() {

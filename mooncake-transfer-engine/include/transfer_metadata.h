@@ -251,6 +251,8 @@ class TransferMetadata {
     void dumpMetadataContentUnlocked();
 
    private:
+    friend class TransferMetadataTestPeer;
+
     int encodeSegmentDesc(const SegmentDesc &desc, Json::Value &segmentJSON);
     std::shared_ptr<TransferMetadata::SegmentDesc> decodeSegmentDesc(
         Json::Value &segmentJSON, const std::string &segment_name);
