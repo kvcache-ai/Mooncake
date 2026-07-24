@@ -38,6 +38,12 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.25.9'
+          cache: false
+
       - name: Set Python bin
         shell: bash
         run: |
@@ -54,9 +60,21 @@ jobs:
           export PYTHONPATH="${PYTHONPATH:-}"
           export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
           bash -x dependencies.sh -y
-          echo "PATH=/usr/local/go/bin:/usr/local/musa/bin:${PATH}" >> "$GITHUB_ENV"
+          echo "PATH=/usr/local/musa/bin:${PATH}" >> "$GITHUB_ENV"
           echo "LD_LIBRARY_PATH=/usr/local/musa/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
           echo "LIBRARY_PATH=/usr/local/musa/lib:${LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+
+      - name: Verify Go toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          GO_BIN="$(command -v go || true)"
+          if [[ -z "${GO_BIN}" ]]; then
+            echo "::error::Go is not available on PATH"
+            exit 1
+          fi
+          echo "Go executable: ${GO_BIN}"
+          "${GO_BIN}" version
 
       - name: Configure project
         shell: bash
