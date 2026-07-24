@@ -19,6 +19,7 @@
 #include <fstream>
 
 #include <pybind11/stl.h>
+#include "retry_utils.h"
 #include "transport/rpc_communicator/rpc_interface.h"
 
 #ifdef USE_TENT
@@ -602,6 +603,9 @@ int TransferEnginePy::batchTransferSync(
             } else if (status.s == TransferStatusEnum::FAILED) {
                 engine_->freeBatchID(batch_id);
                 already_freed = true;
+                if (retry + 1 < max_retry) {
+                    mooncake::integration::updateRetryHints(entries, retry + 1);
+                }
                 completed = true;
             } else if (status.s == TransferStatusEnum::TIMEOUT) {
                 LOG(INFO) << "Sync data transfer timeout";
@@ -656,6 +660,7 @@ batch_id_t TransferEnginePy::batchTransferAsync(
     const int max_retry = engine_->numContexts() + 1;
     auto batch_size = buffers.size();
     std::vector<TransferRequest> entries;
+    entries.reserve(batch_size);
     batch_id_t batch_id = 0;
     for (size_t i = 0; i < batch_size; ++i) {
         TransferRequest entry;
@@ -683,7 +688,8 @@ batch_id_t TransferEnginePy::batchTransferAsync(
         Status s = engine_->submitTransfer(batch_id, entries);
         if (!s.ok()) {
             engine_->freeBatchID(batch_id);
-            return 0;
+            if (retry + 1 == max_retry) return 0;
+            mooncake::integration::updateRetryHints(entries, retry + 1);
         } else {
             break;
         }
@@ -956,6 +962,7 @@ void TransferEnginePy::batchTransferOnCuda(
 
     size_t batch_size = buffers.size();
     std::vector<TransferRequest> entries;
+    entries.reserve(batch_size);
     uint64_t total_bytes = 0;
     for (size_t i = 0; i < batch_size; ++i) {
         TransferRequest entry;
