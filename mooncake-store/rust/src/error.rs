@@ -47,16 +47,15 @@ pub enum StoreError {
 
     /// The Mooncake shared library could not be loaded at run time.
     ///
-    /// Only produced by the `dlopen` backend (see [`crate::load_library`]).
-    #[cfg(feature = "dlopen")]
+    /// Only ever produced by the `dlopen` backend (see `load_library`), but
+    /// always present so `StoreError` is identical across backends.
     #[error("failed to load Mooncake shared library: {0}")]
     LibraryLoad(String),
 
     /// A required symbol was missing from the loaded Mooncake library, i.e. the
     /// library does not export the expected `store_c.h` C ABI.
     ///
-    /// Only produced by the `dlopen` backend.
-    #[cfg(feature = "dlopen")]
+    /// Only ever produced by the `dlopen` backend.
     #[error("missing symbol `{symbol}` in Mooncake shared library: {detail}")]
     SymbolLoad {
         /// Name of the symbol that could not be resolved.

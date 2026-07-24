@@ -434,6 +434,19 @@ install(TARGETS mooncake_master mooncake_client DESTINATION bin)
 # remain ordinary DT_NEEDED dynamic dependencies.
 # ---------------------------------------------------------------------------
 if(WITH_STORE_C_SHARED)
+  # This target whole-archives mooncake_store and reuses its OUTPUT_NAME, both of
+  # which assume mooncake_store is a static archive. add_library(mooncake_store)
+  # follows BUILD_SHARED_LIBS, so guard against a shared mooncake_store (e.g. when
+  # BUILD_SHARED_LIBS=ON, which some backends force) to avoid a broken
+  # --whole-archive link and a libmooncake_store.so output-name collision.
+  get_target_property(_mooncake_store_type mooncake_store TYPE)
+  if(NOT _mooncake_store_type STREQUAL "STATIC_LIBRARY")
+    message(
+      FATAL_ERROR
+        "WITH_STORE_C_SHARED requires mooncake_store to be a STATIC_LIBRARY "
+        "(got ${_mooncake_store_type}); configure with BUILD_SHARED_LIBS=OFF.")
+  endif()
+
   add_library(mooncake_store_c SHARED store_c_shared.cpp)
   set_target_properties(
     mooncake_store_c PROPERTIES OUTPUT_NAME mooncake_store CXX_VISIBILITY_PRESET
