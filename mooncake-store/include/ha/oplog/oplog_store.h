@@ -12,6 +12,27 @@
 
 namespace mooncake {
 
+struct OpLogReadProgress {
+    uint64_t last_scanned_sequence_id{0};
+};
+
+inline std::vector<uint64_t> FindMissingSequenceIds(
+    uint64_t start_sequence_id, const std::vector<OpLogEntry>& entries,
+    uint64_t last_scanned_sequence_id) {
+    std::vector<uint64_t> missing_sequence_ids;
+    uint64_t expected_sequence_id = start_sequence_id + 1;
+    for (const auto& entry : entries) {
+        while (expected_sequence_id < entry.sequence_id) {
+            missing_sequence_ids.push_back(expected_sequence_id++);
+        }
+        expected_sequence_id = entry.sequence_id + 1;
+    }
+    while (expected_sequence_id <= last_scanned_sequence_id) {
+        missing_sequence_ids.push_back(expected_sequence_id++);
+    }
+    return missing_sequence_ids;
+}
+
 // Normalize and validate cluster_id for OpLog key prefix construction.
 // Strips trailing slashes, then validates the remaining string.
 // Returns true if valid (or empty after normalization), false otherwise.
@@ -36,6 +57,16 @@ class OpLogStore {
     virtual ErrorCode ReadOpLog(uint64_t sequence_id, OpLogEntry& entry) = 0;
     virtual ErrorCode ReadOpLogSince(uint64_t start_sequence_id, size_t limit,
                                      std::vector<OpLogEntry>& entries) = 0;
+    virtual ErrorCode ReadOpLogSinceWithProgress(
+        uint64_t start_sequence_id, size_t limit,
+        std::vector<OpLogEntry>& entries, OpLogReadProgress& progress) {
+        progress.last_scanned_sequence_id = start_sequence_id;
+        ErrorCode err = ReadOpLogSince(start_sequence_id, limit, entries);
+        if (err == ErrorCode::OK && !entries.empty()) {
+            progress.last_scanned_sequence_id = entries.back().sequence_id;
+        }
+        return err;
+    }
 
     // Sequence ID management
     virtual ErrorCode GetLatestSequenceId(uint64_t& sequence_id) = 0;

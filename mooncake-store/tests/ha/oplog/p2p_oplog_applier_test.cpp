@@ -451,6 +451,35 @@ TEST(P2POpLogApplierTest, UnknownOpTypeReturnsFalse) {
     // Use an OpType value that doesn't exist
     auto entry = MakeEntry(1, static_cast<OpType>(99), "key1", "");
     EXPECT_FALSE(applier.ApplyOpLogEntry(entry));
+    EXPECT_FALSE(applier.IsHealthy());
+    EXPECT_EQ(1u, applier.GetFailedSequenceId());
+    EXPECT_EQ(99, applier.GetFailedOpType());
+    EXPECT_EQ("operation apply failed", applier.GetFailureReason());
+}
+
+TEST(P2POpLogApplierTest, InvalidAddReplicaIsSkippedAsBestEffort) {
+    P2PStandbyMetadataStore store;
+    P2POpLogApplier applier(&store, "test-cluster");
+
+    auto entry = MakeEntry(1, OpType_ADD_REPLICA, "key1", "invalid");
+    EXPECT_TRUE(applier.ApplyOpLogEntry(entry));
+    EXPECT_TRUE(applier.IsHealthy());
+    EXPECT_EQ(2u, applier.GetExpectedSequenceId());
+    EXPECT_EQ(0u, store.GetKeyCount());
+}
+
+TEST(P2POpLogApplierTest, FutureInvalidAddReplicaPreservesOrdering) {
+    P2PStandbyMetadataStore store;
+    P2POpLogApplier applier(&store, "test-cluster");
+
+    auto invalid = MakeEntry(2, OpType_ADD_REPLICA, "key2", "invalid");
+    EXPECT_FALSE(applier.ApplyOpLogEntry(invalid));
+    EXPECT_EQ(1u, applier.GetExpectedSequenceId());
+
+    EXPECT_TRUE(
+        applier.ApplyOpLogEntry(MakeEntry(1, OpType::REMOVE, "key1", "")));
+    EXPECT_EQ(3u, applier.GetExpectedSequenceId());
+    EXPECT_TRUE(applier.IsHealthy());
 }
 
 }  // namespace mooncake::test

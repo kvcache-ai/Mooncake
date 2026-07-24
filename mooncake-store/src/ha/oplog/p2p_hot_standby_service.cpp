@@ -128,15 +128,22 @@ void P2PHotStandbyService::Stop() {
     }
 }
 
-ErrorCode P2PHotStandbyService::Promote() {
+ErrorCode P2PHotStandbyService::Promote(bool force) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!IsReadyForPromotion()) {
+    const bool apply_failed =
+        oplog_applier_ != nullptr && !oplog_applier_->IsHealthy();
+    const bool force_apply_failure =
+        force && apply_failed && GetState() == StandbyState::FAILED;
+    if (!IsReadyForPromotion() && !force_apply_failure) {
         LOG(ERROR) << "P2PHotStandbyService: not ready for promotion"
-                   << ", state=" << StandbyStateToString(GetState());
+                   << ", state=" << StandbyStateToString(GetState())
+                   << ", apply_healthy=" << !apply_failed;
         return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     }
 
-    auto promote_result = state_machine_.ProcessEvent(StandbyEvent::PROMOTE);
+    auto promote_result = state_machine_.ProcessEvent(
+        force_apply_failure ? StandbyEvent::FORCE_PROMOTE
+                            : StandbyEvent::PROMOTE);
     if (!promote_result.allowed) {
         LOG(ERROR) << "P2PHotStandbyService: cannot promote: "
                    << promote_result.reason;
@@ -149,7 +156,18 @@ ErrorCode P2PHotStandbyService::Promote() {
         oplog_replicator_->Stop();
     }
 
-    auto gaps = oplog_applier_->TryResolveGapsOnceForPromotion();
+    if (force_apply_failure) {
+        LOG(ERROR) << "P2PHotStandbyService: forcing promotion with unapplied "
+                      "OpLog entry"
+                   << ", failed_sequence_id="
+                   << oplog_applier_->GetFailedSequenceId()
+                   << ", latest_applied_sequence_id="
+                   << applied_before_catch_up;
+    }
+
+    auto gaps = force_apply_failure
+                    ? OpLogApplier::GapResolveResult{}
+                    : oplog_applier_->TryResolveGapsOnceForPromotion();
     if (gaps.attempted > 0) {
         LOG(INFO) << "P2PHotStandbyService: promotion gap resolve"
                   << ", attempted=" << gaps.attempted
@@ -157,7 +175,9 @@ ErrorCode P2PHotStandbyService::Promote() {
                   << ", applied_deletes=" << gaps.applied_deletes;
     }
 
-    auto err = FinalCatchUpForPromotionLocked(applied_before_catch_up);
+    auto err = force_apply_failure
+                   ? ErrorCode::OK
+                   : FinalCatchUpForPromotionLocked(applied_before_catch_up);
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "P2PHotStandbyService: final catch-up for promotion "
                       "failed"
@@ -207,8 +227,9 @@ ErrorCode P2PHotStandbyService::FinalCatchUpForPromotionLocked(
 
     for (; batch_count < kMaxCatchUpBatches; ++batch_count) {
         std::vector<OpLogEntry> batch;
-        ErrorCode read_err =
-            catch_up_store->ReadOpLogSince(read_from_seq, kBatchSize, batch);
+        OpLogReadProgress progress;
+        ErrorCode read_err = catch_up_store->ReadOpLogSinceWithProgress(
+            read_from_seq, kBatchSize, batch, progress);
         if (read_err != ErrorCode::OK) {
             LOG(WARNING) << "P2PHotStandbyService: final catch-up read failed"
                          << ", from_seq=" << read_from_seq
@@ -216,15 +237,27 @@ ErrorCode P2PHotStandbyService::FinalCatchUpForPromotionLocked(
                          << ". Proceeding with promotion.";
             break;
         }
-        if (batch.empty()) {
-            break;
-        }
 
         // Keep promotion catch-up best-effort, matching the centralized
-        // HotStandbyService availability-first behavior. Complete gap,
-        // out-of-order, and apply-retry hardening is handled by follow-up PRs.
+        // HotStandbyService availability-first behavior. Confirmed sparse
+        // ranges are skipped while existing entries are applied in order.
         total_applied += oplog_applier_->ApplyOpLogEntries(batch);
-        read_from_seq = batch.back().sequence_id;
+        if (!oplog_applier_->IsHealthy()) {
+            LOG(ERROR) << "P2PHotStandbyService: final catch-up apply failed"
+                       << ", failed_sequence_id="
+                       << oplog_applier_->GetFailedSequenceId()
+                       << ", failed_op_type="
+                       << oplog_applier_->GetFailedOpType();
+            return ErrorCode::INTERNAL_ERROR;
+        }
+        oplog_applier_->ConfirmMissingSequenceIds(FindMissingSequenceIds(
+            read_from_seq, batch, progress.last_scanned_sequence_id));
+        oplog_applier_->ProcessPendingEntries();
+
+        if (progress.last_scanned_sequence_id == read_from_seq) {
+            break;
+        }
+        read_from_seq = progress.last_scanned_sequence_id;
     }
 
     if (batch_count >= kMaxCatchUpBatches) {
@@ -247,6 +280,12 @@ P2PStandbySyncStatus P2PHotStandbyService::GetSyncStatus() const {
     status.time_in_state = state_machine_.GetTimeInCurrentState();
     status.is_connected = state_machine_.IsConnected();
     status.applied_seq_id = GetLocalLastAppliedSequenceIdLocked();
+    if (oplog_applier_) {
+        status.apply_healthy = oplog_applier_->IsHealthy();
+        status.failed_sequence_id = oplog_applier_->GetFailedSequenceId();
+        status.failed_op_type = oplog_applier_->GetFailedOpType();
+        status.failure_reason = oplog_applier_->GetFailureReason();
+    }
 
     if (watcher_oplog_store_) {
         uint64_t latest_seq = 0;

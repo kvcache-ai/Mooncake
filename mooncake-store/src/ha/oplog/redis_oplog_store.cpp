@@ -329,7 +329,7 @@ void RedisOpLogStore::AsyncWriteLoop(size_t worker_id) {
                 // Mutable PendingWrite state is protected by async_mutex_.
                 std::lock_guard<std::mutex> lock(async_mutex_);
                 attempts = ++pending->attempts;
-                if (IsBestEffortRedisOpLog(pending->entry.op_type) &&
+                if (IsBestEffortP2POpLog(pending->entry.op_type) &&
                     attempts >= best_effort_max_retries_) {
                     dropped_sequences_.insert(pending->entry.sequence_id);
                     inflight_writes_.erase(pending->entry.sequence_id);
@@ -499,8 +499,17 @@ ErrorCode RedisOpLogStore::ReadOpLogUnlocked(uint64_t sequence_id,
 ErrorCode RedisOpLogStore::ReadOpLogSince(uint64_t start_sequence_id,
                                           size_t limit,
                                           std::vector<OpLogEntry>& entries) {
+    OpLogReadProgress progress;
+    return ReadOpLogSinceWithProgress(start_sequence_id, limit, entries,
+                                      progress);
+}
+
+ErrorCode RedisOpLogStore::ReadOpLogSinceWithProgress(
+    uint64_t start_sequence_id, size_t limit, std::vector<OpLogEntry>& entries,
+    OpLogReadProgress& progress) {
     std::lock_guard<std::mutex> lock(mutex_);
     entries.clear();
+    progress.last_scanned_sequence_id = start_sequence_id;
     if (limit == 0) {
         return ErrorCode::OK;
     }
@@ -548,16 +557,18 @@ ErrorCode RedisOpLogStore::ReadOpLogSince(uint64_t start_sequence_id,
     // together with standby snapshot/bootstrap recovery.
     const uint64_t effective_start =
         std::max(start_sequence_id, trimmed_sequence_id);
+    progress.last_scanned_sequence_id = effective_start;
     if (effective_start >= latest_sequence_id) {
         return ErrorCode::OK;
     }
 
     entries.reserve(limit);
     uint64_t next_sequence_id = effective_start + 1;
-    while (next_sequence_id <= latest_sequence_id && entries.size() < limit) {
+    size_t scanned_count = 0;
+    while (next_sequence_id <= latest_sequence_id && scanned_count < limit) {
         const uint64_t remaining = latest_sequence_id - next_sequence_id + 1;
         const size_t batch_size = static_cast<size_t>(std::min<uint64_t>(
-            remaining, static_cast<uint64_t>(limit - entries.size())));
+            remaining, static_cast<uint64_t>(limit - scanned_count)));
         const uint64_t batch_start = next_sequence_id;
 
         for (size_t i = 0; i < batch_size; ++i) {
@@ -620,6 +631,8 @@ ErrorCode RedisOpLogStore::ReadOpLogSince(uint64_t start_sequence_id,
             }
         }
         next_sequence_id += batch_size;
+        scanned_count += batch_size;
+        progress.last_scanned_sequence_id = next_sequence_id - 1;
     }
     return ErrorCode::OK;
 }

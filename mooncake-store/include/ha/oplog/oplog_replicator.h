@@ -70,6 +70,9 @@ class OpLogReplicator {
     bool IsHealthy() const;
 
    private:
+    void AdvanceLastProcessedSequenceId(uint64_t sequence_id);
+    void ReportApplyFailureIfNeeded();
+
     void NotifyStateEvent(StandbyEvent event) {
         if (state_callback_) {
             state_callback_(event);
@@ -80,6 +83,7 @@ class OpLogReplicator {
     OpLogApplier* applier_;
     std::atomic<uint64_t> last_processed_sequence_id_{0};
     std::atomic<bool> running_{false};
+    std::atomic<bool> apply_failure_reported_{false};
 
     ReplicatorStateCallback state_callback_;
 };

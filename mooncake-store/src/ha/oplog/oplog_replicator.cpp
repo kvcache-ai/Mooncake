@@ -30,14 +30,13 @@ bool OpLogReplicator::StartFromSequenceId(uint64_t start_seq_id) {
         return true;
     }
 
+    apply_failure_reported_.store(false);
+
     auto on_entry = [this](const OpLogEntry& entry) {
         if (applier_->ApplyOpLogEntry(entry)) {
-            uint64_t cur = last_processed_sequence_id_.load();
-            while (IsSequenceNewer(entry.sequence_id, cur) &&
-                   !last_processed_sequence_id_.compare_exchange_weak(
-                       cur, entry.sequence_id)) {
-            }
+            AdvanceLastProcessedSequenceId(entry.sequence_id);
         }
+        ReportApplyFailureIfNeeded();
     };
 
     auto on_error = [this](ErrorCode err) {
@@ -46,7 +45,19 @@ bool OpLogReplicator::StartFromSequenceId(uint64_t start_seq_id) {
         NotifyStateEvent(StandbyEvent::WATCH_BROKEN);
     };
 
-    ErrorCode err = notifier_->Start(start_seq_id, on_entry, on_error);
+    auto on_maintenance =
+        [this](const std::vector<uint64_t>& missing_sequences) {
+            applier_->ConfirmMissingSequenceIds(missing_sequences);
+            applier_->ProcessPendingEntries();
+            ReportApplyFailureIfNeeded();
+            const uint64_t expected = applier_->GetExpectedSequenceId();
+            if (expected > 0) {
+                AdvanceLastProcessedSequenceId(expected - 1);
+            }
+        };
+
+    ErrorCode err =
+        notifier_->Start(start_seq_id, on_entry, on_error, on_maintenance);
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "Failed to start OpLogChangeNotifier, error="
                    << static_cast<int>(err);
@@ -69,12 +80,29 @@ void OpLogReplicator::Stop() {
     LOG(INFO) << "OpLogReplicator stopped";
 }
 
+void OpLogReplicator::AdvanceLastProcessedSequenceId(uint64_t sequence_id) {
+    uint64_t current = last_processed_sequence_id_.load();
+    while (IsSequenceNewer(sequence_id, current) &&
+           !last_processed_sequence_id_.compare_exchange_weak(current,
+                                                              sequence_id)) {
+    }
+}
+
+void OpLogReplicator::ReportApplyFailureIfNeeded() {
+    if (applier_->IsHealthy() || apply_failure_reported_.exchange(true)) {
+        return;
+    }
+    LOG(ERROR) << "OpLogReplicator: critical apply failure"
+               << ", sequence_id=" << applier_->GetFailedSequenceId();
+    NotifyStateEvent(StandbyEvent::FATAL_ERROR);
+}
+
 uint64_t OpLogReplicator::GetLastProcessedSequenceId() const {
     return last_processed_sequence_id_.load();
 }
 
 bool OpLogReplicator::IsHealthy() const {
-    return running_.load() && notifier_->IsHealthy();
+    return running_.load() && notifier_->IsHealthy() && applier_->IsHealthy();
 }
 
 }  // namespace mooncake

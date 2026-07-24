@@ -193,6 +193,9 @@ StateTransitionResult StandbyStateMachine::ValidateTransition(
                 // Allow restart from FAILED state
                 result.allowed = true;
                 result.new_state = StandbyState::CONNECTING;
+            } else if (event == StandbyEvent::FORCE_PROMOTE) {
+                result.allowed = true;
+                result.new_state = StandbyState::PROMOTING;
             }
             break;
     }
