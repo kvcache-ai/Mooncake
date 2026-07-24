@@ -20,275 +20,56 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
-    needs: [spell-check, clang-format, check-paths]
-    if: >-
-      (needs.check-paths.outputs.should-run-downstream == 'true' ||
-       github.event_name == 'workflow_dispatch') &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
-    runs-on: ubuntu-22.04
-    strategy:
-      matrix:
-        python-version: ['3.10', '3.12']
-    env:
-      CI: "true"
-      SCCACHE_GHA_ENABLED: "true"
-
+  ci-stage:
+    name: Determine CI stage
+    runs-on: ubuntu-latest
+    outputs:
+      run-checks: ${{ steps.stage.outputs.run-checks }}
+      run-core: ${{ steps.stage.outputs.run-core }}
+      run-full: ${{ steps.stage.outputs.run-full }}
     steps:
-    - uses: actions/checkout@v4
-      with:
-        persist-credentials: false
+      - name: Select pre-review or full CI
+        id: stage
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const eventName = context.eventName;
+            const action = context.payload.action;
+            const isPushOrDispatch =
+              eventName === 'push' || eventName === 'workflow_dispatch';
+            const isPreReview =
+              eventName === 'pull_request' &&
+              ['opened', 'synchronize', 'reopened'].includes(action);
+            const isFullReviewRun =
+              eventName === 'pull_request' &&
+              action === 'labeled' &&
+              context.payload.label?.name === 'run-ci';
 
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v5
-      with:
-        python-version: ${{ matrix.python-version }}
+            core.setOutput(
+              'run-checks',
+              isPushOrDispatch || isPreReview || isFullReviewRun
+            );
+            core.setOutput('run-core', isPushOrDispatch || isPreReview);
+            core.setOutput('run-full', isPushOrDispatch || isFullReviewRun);
 
-    - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
-
-    - name: Install and start etcd
-      run: |
-        wget https://github.com/etcd-io/etcd/releases/download/v3.6.1/etcd-v3.6.1-linux-amd64.tar.gz
-        tar xzf etcd-v3.6.1-linux-amd64.tar.gz
-        sudo mv etcd-v3.6.1-linux-amd64/etcd* /usr/local/bin/
-        etcd --advertise-client-urls http://127.0.0.1:2379 --listen-client-urls http://127.0.0.1:2379 &
-        sleep 3 # Give etcd time to start
-        etcdctl --endpoints=http://127.0.0.1:2379 endpoint health
-      shell: bash
-
-    - name: Free up disk space
-      uses: ./.github/actions/free-disk-space
-
-    - name: Install CUDA Toolkit
-      uses: Jimver/cuda-toolkit@v0.2.24
-      with:
-        cuda: '12.8.1'
-        linux-local-args: '["--toolkit"]'
-        method: 'network'
-        sub-packages: '["nvcc"]'
-
-    - name: Install coverage tools and build utilities
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y lcov gcovr ninja-build
-
-    - name: Test HugeTLB sizing helper
-      run: |
-        python3 scripts/test_hicache_hugepage_requirements.py
-      shell: bash
-
-    - name: Set up coverage compilation flags
-      run: |
-        echo "Setting up coverage compilation flags..."
-        echo "CXXFLAGS=--coverage" >> $GITHUB_ENV
-        echo "CFLAGS=--coverage" >> $GITHUB_ENV
-        echo "LDFLAGS=--coverage" >> $GITHUB_ENV
-      shell: bash
-
-    - name: Run sccache-cache
-      uses: mozilla-actions/sccache-action@v0.0.9
-
-    - name: Configure sccache
-      uses: actions/github-script@v7
-      with:
-        script: |
-          core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
-          core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-    - name: Configure project with coverage support
-      run: |
-        sudo apt update -y
-        sudo bash -x dependencies.sh -y
-        mkdir build
-        cd build
-        cmake -G Ninja .. -DUSE_HTTP=ON -DUSE_CXL=ON -DUSE_UB=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Debug -DENABLE_DEBUG_SYMBOLS=OFF
-      shell: bash
-
-    - name: Build project
-      run: |
-        cd build
-        cmake --build .
-        sudo cmake --install .
-      shell: bash
-
-    - name: Build nvlink_allocator.so
-      run: |
-        mkdir -p build/mooncake-transfer-engine/nvlink-allocator
-        cd mooncake-transfer-engine/nvlink-allocator
-        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
-        bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
-      shell: bash
-
-    - name: Run sccache stat for check
-      if: ${{ env.SCCACHE_PATH != '' }}
-      shell: bash
-      run: ${SCCACHE_PATH} --show-stats
-
-    - name: Start Metadata Server
-      run: |
-        cd mooncake-transfer-engine/example/http-metadata-server-python
-        pip install aiohttp
-        python ./bootstrap_server.py &
-      shell: bash
-
-    - name: Run Mooncake Store Rust smoke test and benchmark
-      run: |
-        $GITHUB_WORKSPACE/build/mooncake-store/src/mooncake_master \
-          --eviction_high_watermark_ratio=0.95 \
-          --cluster_id=ci_rust_test_cluster \
-          --port 50051 &
-        MASTER_PID=$!
-        sleep 3
-        cd mooncake-store/rust
-        export LD_LIBRARY_PATH=$GITHUB_WORKSPACE/build/mooncake-asio:$GITHUB_WORKSPACE/build/mooncake-store/src:$GITHUB_WORKSPACE/build/mooncake-store/src/cachelib_memory_allocator:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base:$GITHUB_WORKSPACE/build/mooncake-common/etcd:$LD_LIBRARY_PATH
-        export MOONCAKE_BUILD_DIR=$GITHUB_WORKSPACE/build
-        export MOONCAKE_STORE_LIB_DIR=$GITHUB_WORKSPACE/build/mooncake-store/src
-        export MOONCAKE_STORE_INCLUDE_DIR=$GITHUB_WORKSPACE/mooncake-store/include
-        # This job builds Mooncake with -DENABLE_ASAN=ON, so the C++ libraries
-        # the Rust package links against carry undefined __asan_* references. Opt
-        # in to linking the ASan runtime; build.rs emits -lasan first, which
-        # keeps libasan first in the initial library list as ASan requires.
-        # Non-sanitized builds leave this unset and link without ASan.
-        export MOONCAKE_LINK_ASAN=1
-        export MC_METADATA_SERVER=http://127.0.0.1:8080/metadata
-        export MC_RUST_STORE_RUN_INTEGRATION=true
-        export MC_RUST_STORE_MASTER_ADDR=127.0.0.1:50051
-        export MC_RUST_STORE_LOCAL_HOSTNAME=127.0.0.1
-        export MC_RUST_STORE_PROTOCOL=tcp
-        export MC_RUST_STORE_DEVICE_NAME=
-        cargo test --test minimal_smoke -- --nocapture
-        MC_RUST_BENCH_ITERATIONS=4 \
-        MC_RUST_BENCH_VALUE_SIZE=4096 \
-        MC_RUST_BENCH_WARMUP=1 \
-          cargo run --release --example store_benchmark
-        kill $MASTER_PID 2>/dev/null || true
-      shell: bash
-
-    - name: Run Go store binding integration tests
-      run: |
-        $GITHUB_WORKSPACE/build/mooncake-store/src/mooncake_master \
-          --eviction_high_watermark_ratio=0.95 \
-          --cluster_id=ci_go_test_cluster \
-          --port 50051 &
-        MASTER_PID=$!
-        sleep 3
-        cd mooncake-store/go
-        export LD_LIBRARY_PATH=$GITHUB_WORKSPACE/build/mooncake-common:$GITHUB_WORKSPACE/build/mooncake-store/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base:$GITHUB_WORKSPACE/build/mooncake-common/etcd
-        export CGO_ENABLED=1
-        export CGO_CFLAGS="-I$GITHUB_WORKSPACE/mooncake-store/include -I$GITHUB_WORKSPACE/mooncake-transfer-engine/include"
-        export CGO_LDFLAGS="-L$GITHUB_WORKSPACE/build/mooncake-store/src -L$GITHUB_WORKSPACE/build/mooncake-store/src/cachelib_memory_allocator -L$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src -L$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base -L$GITHUB_WORKSPACE/build/mooncake-common -L$GITHUB_WORKSPACE/build/mooncake-common/etcd -lmooncake_store -lcachelib_memory_allocator -ltransfer_engine -lbase -lasio -letcd_wrapper -lstdc++ -lnuma -lglog -lgflags -libverbs -lmlx5 -ljsoncpp -lzstd -lcurl -luring -lasan -lm -lgcov -lxxhash -lyaml-cpp"
-        # Link cudart if CUDA is available (needed for D2H staging in mooncake_store)
-        if [ -d /usr/local/cuda/lib64 ]; then export CGO_LDFLAGS="$CGO_LDFLAGS -L/usr/local/cuda/lib64 -lcudart"; fi
-        # KV events publisher (optional; linked when libzmq is installed)
-        if ldconfig -p 2>/dev/null | grep -q libzmq; then export CGO_LDFLAGS="$CGO_LDFLAGS -lzmq"; fi
-        ASAN_OPTIONS=detect_leaks=0:verify_asan_link_order=0 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata go test -v ./tests/...
-        kill $MASTER_PID 2>/dev/null || true
-      shell: bash
-
-    - name: Test (in build env) with coverage
-      run: |
-        cd build
-        export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-        ldconfig -v || echo "always continue"
-        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 ctest -j --output-on-failure
-      shell: bash
-
-    - name: Drain HTTP E2E test
-      if: matrix.python-version == '3.12'
-      run: |
-        cd build
-        export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-        # Keep the sanitizer gate on the C++ integration test. The Python
-        # drain script is manual/nightly only because pybind + ASan teardown in
-        # a Python host process is not stable.
-        DEFAULT_KV_LEASE_TTL=500 ./mooncake-store/tests/task_integration_test --gtest_filter='TaskExecutorIntegrationTest.DrainJobCompleteFlow'
-      shell: bash
-
-    - name: Generate coverage report
-      id: coverage
-      run: |
-        cd build
-        echo "=== Starting coverage report generation ==="
-        echo "Current directory: $(pwd)"
-
-        echo "=== Looking for .gcda files ==="
-        find . -name "*.gcda" 2>/dev/null | head -10 || echo "No .gcda files found"
-
-        echo "=== Running lcov ==="
-        lcov --capture --directory . --output-file coverage.info 2>&1 || {
-          echo "WARNING: lcov failed to capture coverage data"
-          echo "Creating minimal lcov-compliant coverage file to allow CI to continue"
-          echo "TN:dummy" > coverage.filtered.info
-          echo "SF:/dev/null" >> coverage.filtered.info
-          echo "DA:0,0" >> coverage.filtered.info
-          echo "end_of_record" >> coverage.filtered.info
-          echo "coverage_failed=true" >> $GITHUB_OUTPUT
-          exit 0  # Exit successfully, do not block CI
-        }
-
-        echo "=== Processing coverage data ==="
-        lcov --remove coverage.info '/usr/*' '*/test/*' '*/third_party/*' '*/benchmarks/*' --output-file coverage.filtered.info 2>&1 || true
-
-        echo "=== Generating HTML report ==="
-        genhtml coverage.filtered.info --output-directory coverage_report 2>&1 || echo "genhtml failed, continuing..."
-
-        echo "=== Coverage summary ==="
-        lcov --list coverage.filtered.info 2>&1 || echo "lcov list failed"
-
-        echo "=== Coverage report generation completed ==="
-      shell: bash
-
-    - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v4
-      with:
-        files: build/coverage.filtered.info
-        flags: unittests
-        name: code-coverage-report
-        token: ${{ secrets.CODECOV_TOKEN }}
-        fail_ci_if_error: false
-      continue-on-error: true
-
-    - name: Check coverage status
-      if: always()
-      run: |
-        if [ "${{ steps.coverage.outputs.coverage_failed }}" = "true" ]; then
-          echo "⚠️ Coverage collection failed but CI continued"
-          echo "::warning::Code coverage collection failed. Please check the build logs."
-        else
-          echo "✅ Coverage collected successfully"
-        fi
-
-    - name: Generate Python version tag
-      id: generate_tag_build
-      run: |
-        echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
-      shell: bash
-
-    # In CI, build_wheel.sh removes build/ to free disk (CI=true); set FREE_BUILD_DIR=1 locally to enable.
-    - name: Build Python wheel
-      run: |
-        PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag_build.outputs.python_version_tag }} ./scripts/build_wheel.sh
-      shell: bash
-
-    - name: Upload wheel for ZMQ test job
-      uses: actions/upload-artifact@v4
-      with:
-        name: wheel-build-py${{ steps.generate_tag_build.outputs.python_version_tag }}
-        path: mooncake-wheel/dist-py${{ steps.generate_tag_build.outputs.python_version_tag }}/*.whl
+  build:
+    needs: [ci-stage, spell-check, clang-format, check-paths]
+    if: >-
+      needs.ci-stage.outputs.run-core == 'true' &&
+      (needs.check-paths.outputs.should-run-downstream == 'true' ||
+       github.event_name == 'workflow_dispatch')
+    uses: ./.github/workflows/core-build.yml
+    with:
+      collect-coverage: false
+    secrets: inherit
 
   build-musa:
-    needs: [spell-check, clang-format, check-paths]
+    needs: [ci-stage, spell-check, clang-format, check-paths]
     if: >-
-      (needs.check-paths.outputs.should-run-downstream == 'true' ||
-       github.event_name == 'workflow_dispatch') &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+      needs.ci-stage.outputs.run-full == 'true' &&
+      (needs.check-paths.outputs.should-run-musa == 'true' ||
+       github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-22.04
     container: registry.mthreads.com/mcconline/inference/pytorch:2.9.1.post1-py3.10-musa5.2.0-mp31-devel-ubuntu22.04-amd64
     steps:
@@ -319,17 +100,17 @@ jobs:
       shell: bash
 
   build-arm64:
-    needs: [spell-check, clang-format, check-paths]
+    needs: [ci-stage, spell-check, clang-format, check-paths]
     if: >-
-      (needs.check-paths.outputs.should-run-downstream == 'true' ||
-       github.event_name == 'workflow_dispatch') &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+      needs.ci-stage.outputs.run-full == 'true' &&
+      (needs.check-paths.outputs.should-run-arm64 == 'true' ||
+       github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-22.04-arm
     strategy:
       matrix:
+        # Full CI starts after code review approval, so validate both supported
+        # Python ABIs before merge.
         python-version: ['3.10', '3.12']
     env:
       CI: "true"
@@ -416,17 +197,25 @@ jobs:
         path: mooncake-wheel/dist-py${{ steps.generate_tag_arm64.outputs.python_version_tag }}/*.whl
 
   test-wheel-ubuntu:
-    needs: [spell-check, clang-format, build-flags]
+    needs: [ci-stage, spell-check, clang-format, build-flags]
     if: >-
+      needs.ci-stage.outputs.run-full == 'true' &&
       needs.build-flags.result == 'success' &&
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+       github.event_name == 'pull_request')
     strategy:
       matrix:
-        ubuntu-version: [ubuntu-22.04, ubuntu-24.04]
-        python-version: ['3.10', '3.12']
+        # Validate the complete OS x Python cross-product after approval.
+        include:
+          - ubuntu-version: ubuntu-22.04
+            python-version: '3.10'
+          - ubuntu-version: ubuntu-22.04
+            python-version: '3.12'
+          - ubuntu-version: ubuntu-24.04
+            python-version: '3.10'
+          - ubuntu-version: ubuntu-24.04
+            python-version: '3.12'
     runs-on: ${{ matrix.ubuntu-version }}
     steps:
     - uses: actions/checkout@v4
@@ -578,14 +367,11 @@ jobs:
       shell: bash
 
   build-flags:
-    needs: [spell-check, clang-format, check-paths]
+    needs: [ci-stage, spell-check, clang-format, check-paths]
     if: >-
+      needs.ci-stage.outputs.run-full == 'true' &&
       (needs.check-paths.outputs.should-run-downstream == 'true' ||
-       github.event_name == 'workflow_dispatch') &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+       github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-22.04
     strategy:
       matrix:
@@ -802,14 +588,12 @@ jobs:
 
   build-docker:
     name: Build Docker Image
-    needs: [spell-check, clang-format, check-paths]
+    needs: [ci-stage, spell-check, clang-format, check-paths]
     if: >-
-      (needs.check-paths.outputs.should-run-downstream == 'true' ||
-       github.event_name == 'workflow_dispatch') &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+      needs.ci-stage.outputs.run-full == 'true' &&
+      (needs.check-paths.outputs.should-run-docker == 'true' ||
+       github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4
@@ -832,11 +616,8 @@ jobs:
 
   spell-check:
     name: Spell Check with Typos
-    if: >-
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+    needs: [ci-stage]
+    if: needs.ci-stage.outputs.run-checks == 'true'
     runs-on: ubuntu-22.04
     steps:
     - name: Checkout Actions Repository
@@ -848,11 +629,8 @@ jobs:
 
   clang-format:
     name: Check code format
-    if: >-
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+    needs: [ci-stage]
+    if: needs.ci-stage.outputs.run-checks == 'true'
     runs-on: ubuntu-22.04
     steps:
     - name: Checkout Actions Repository
@@ -895,14 +673,39 @@ jobs:
         ./scripts/code_format.sh --check --base "${BASE_REF}"
       shell: bash
 
+  fast-unit-tests:
+    name: Fast Python unit tests
+    needs: [ci-stage]
+    if: needs.ci-stage.outputs.run-core == 'true'
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install test dependencies
+      run: python -m pip install aiohttp pytest pyyaml
+
+    - name: Run fast Python unit tests
+      env:
+        PYTHONPATH: mooncake-wheel
+      run: |
+        python scripts/test_hicache_hugepage_requirements.py
+        python -m unittest \
+          mooncake-wheel.tests.test_mooncake_config \
+          mooncake-wheel.tests.test_http_metadata_server
+        python -m pytest -q mooncake-wheel/tests/test_release_wheel_tags.py
+      shell: bash
 
   docs-check:
     name: Check Sphinx docs build
-    if: >-
-      github.event_name == 'push' ||
-      github.event_name == 'workflow_dispatch' ||
-      github.event.action == 'opened' ||
-      contains(github.event.pull_request.labels.*.name, 'run-ci')
+    needs: [ci-stage]
+    if: needs.ci-stage.outputs.run-checks == 'true'
     runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4
@@ -939,15 +742,17 @@ jobs:
 
 
   check-paths:
-    if: >-
-      github.event_name == 'push' ||
-      github.event_name == 'workflow_dispatch' ||
-      github.event.action == 'opened' ||
-      contains(github.event.pull_request.labels.*.name, 'run-ci')
+    needs: [ci-stage]
+    if: needs.ci-stage.outputs.run-checks == 'true'
     runs-on: ubuntu-latest
     outputs:
       should-run-downstream: ${{ steps.dispatch-override.outputs.src || steps.filter.outputs.src }}
       should-run-tent: ${{ steps.dispatch-override.outputs.tent || steps.filter.outputs.tent }}
+      should-run-docker: ${{ steps.dispatch-override.outputs.docker || steps.filter.outputs.docker }}
+      should-run-arm64: ${{ steps.dispatch-override.outputs.arm64 || steps.filter.outputs.arm64 }}
+      should-run-musa: ${{ steps.dispatch-override.outputs.musa || steps.filter.outputs.musa }}
+      should-run-ascend: ${{ steps.dispatch-override.outputs.ascend || steps.filter.outputs.ascend }}
+      should-run-efa: ${{ steps.dispatch-override.outputs.efa || steps.filter.outputs.efa }}
     steps:
       # workflow_dispatch has no PR/push diff context — skip paths-filter and default to true
       - name: Default to true for workflow_dispatch
@@ -956,6 +761,11 @@ jobs:
         run: |
           echo "src=true" >> $GITHUB_OUTPUT
           echo "tent=true" >> $GITHUB_OUTPUT
+          echo "docker=true" >> $GITHUB_OUTPUT
+          echo "arm64=true" >> $GITHUB_OUTPUT
+          echo "musa=true" >> $GITHUB_OUTPUT
+          echo "ascend=true" >> $GITHUB_OUTPUT
+          echo "efa=true" >> $GITHUB_OUTPUT
       - uses: actions/checkout@v4
         if: github.event_name != 'workflow_dispatch'
         with:
@@ -979,70 +789,150 @@ jobs:
               - 'mooncake-common/**'
               - 'CMakeLists.txt'
               - 'dependencies.sh'
+              - '.github/actions/**'
               - '.github/workflows/ci.yml'
-
+            docker:
+              - 'docker/**'
+              - '.dockerignore'
+              - 'dependencies.sh'
+              - 'CMakeLists.txt'
+              - 'mooncake-wheel/**'
+              - 'scripts/build_wheel.sh'
+              - '.github/actions/**'
+              - '.github/workflows/ci.yml'
+            arm64:
+              - 'mooncake-common/**/*.h'
+              - 'mooncake-common/**/*.hpp'
+              - 'mooncake-common/**/*.c'
+              - 'mooncake-common/**/*.cc'
+              - 'mooncake-common/**/*.cpp'
+              - 'mooncake-integration/**/*.h'
+              - 'mooncake-integration/**/*.hpp'
+              - 'mooncake-integration/**/*.c'
+              - 'mooncake-integration/**/*.cc'
+              - 'mooncake-integration/**/*.cpp'
+              - 'mooncake-store/**/*.h'
+              - 'mooncake-store/**/*.hpp'
+              - 'mooncake-store/**/*.c'
+              - 'mooncake-store/**/*.cc'
+              - 'mooncake-store/**/*.cpp'
+              - 'mooncake-transfer-engine/**/*.h'
+              - 'mooncake-transfer-engine/**/*.hpp'
+              - 'mooncake-transfer-engine/**/*.c'
+              - 'mooncake-transfer-engine/**/*.cc'
+              - 'mooncake-transfer-engine/**/*.cpp'
+              - '**/CMakeLists.txt'
+              - 'dependencies.sh'
+              - 'scripts/build_wheel.sh'
+              - '.github/actions/**'
+              - '.github/workflows/ci.yml'
+            musa:
+              - 'docker/musa.Dockerfile'
+              - 'mooncake-common/**/*.h'
+              - 'mooncake-common/**/*.hpp'
+              - 'mooncake-common/**/*.cmake'
+              - 'mooncake-ep/**'
+              - 'mooncake-integration/**/*.h'
+              - 'mooncake-integration/**/*.hpp'
+              - 'mooncake-integration/**/*.cpp'
+              - 'mooncake-pg/**'
+              - 'mooncake-store/include/device/**'
+              - 'mooncake-store/src/device/**'
+              - 'mooncake-transfer-engine/include/gpu_vendor/**'
+              - 'mooncake-transfer-engine/include/transport/device/**'
+              - 'mooncake-transfer-engine/src/transport/device/**'
+              - '**/CMakeLists.txt'
+              - 'dependencies.sh'
+              - 'scripts/build_wheel.sh'
+              - '.github/actions/**'
+              - '.github/workflows/ci.yml'
+            ascend:
+              - 'scripts/ascend/**'
+              - 'mooncake-integration/allocator_ascend_npu.py'
+              - 'mooncake-integration/CMakeLists.txt'
+              - 'mooncake-store/include/device/**'
+              - 'mooncake-store/src/device/**'
+              - 'mooncake-transfer-engine/**/*ascend*'
+              - 'mooncake-transfer-engine/include/transfer_engine*.h'
+              - 'mooncake-transfer-engine/include/transport/transport.h'
+              - 'mooncake-transfer-engine/src/transfer_engine*.cpp'
+              - 'mooncake-transfer-engine/src/multi_transport.cpp'
+              - 'mooncake-transfer-engine/src/transfer_metadata.cpp'
+              - '**/CMakeLists.txt'
+              - 'dependencies.sh'
+              - '.github/actions/**'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/ci_ascend.yml'
+            efa:
+              - 'mooncake-common/**/*.h'
+              - 'mooncake-common/**/*.hpp'
+              - 'mooncake-integration/CMakeLists.txt'
+              - 'mooncake-transfer-engine/**/*efa*'
+              - 'mooncake-transfer-engine/include/transfer_engine*.h'
+              - 'mooncake-transfer-engine/include/transport/transport.h'
+              - 'mooncake-transfer-engine/src/transfer_engine*.cpp'
+              - '**/CMakeLists.txt'
+              - 'dependencies.sh'
+              - 'scripts/build_wheel.sh'
+              - '.github/actions/**'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/ci_efa.yml'
   build-wheel-cu13:
-    needs: [spell-check, clang-format, check-paths]
+    needs: [ci-stage, spell-check, clang-format, check-paths]
     if: >-
+      needs.ci-stage.outputs.run-full == 'true' &&
       (needs.check-paths.outputs.should-run-downstream == 'true' ||
-       github.event_name == 'workflow_dispatch') &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+       github.event_name == 'workflow_dispatch')
     uses: ./.github/workflows/ci_cu13.yml
+    with:
+      # Validate both supported Python ABIs after approval.
+      python-versions: '["3.10", "3.12"]'
     secrets: inherit
 
   build-wheel-efa:
-    needs: [spell-check, clang-format, check-paths]
+    needs: [ci-stage, spell-check, clang-format, check-paths]
     if: >-
-      (needs.check-paths.outputs.should-run-downstream == 'true' ||
-       github.event_name == 'workflow_dispatch') &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+      needs.ci-stage.outputs.run-full == 'true' &&
+      (needs.check-paths.outputs.should-run-efa == 'true' ||
+       github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch')
     uses: ./.github/workflows/ci_efa.yml
     secrets: inherit
 
   ascend-test:
-    needs: [build, check-paths]
-    if: needs.check-paths.outputs.should-run-downstream == 'true'
+    # This reusable workflow checks out and builds the source independently.
+    # Start it after the fast checks instead of waiting for core coverage.
+    needs: [ci-stage, spell-check, clang-format, check-paths]
+    if: >-
+      needs.ci-stage.outputs.run-full == 'true' &&
+      (needs.check-paths.outputs.should-run-ascend == 'true' ||
+       github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch')
     uses: ./.github/workflows/ci_ascend.yml
     secrets: inherit
 
   integration-test:
-    needs: [build, build-wheel-cu13, check-paths]
-    if: needs.check-paths.outputs.should-run-downstream == 'true'
+    # integration-test consumes the CUDA 13 Python 3.12 wheel artifact.
+    needs: [ci-stage, build-wheel-cu13, check-paths]
+    if: >-
+      needs.ci-stage.outputs.run-full == 'true' &&
+      needs.check-paths.outputs.should-run-downstream == 'true'
     uses: ./.github/workflows/integration-test.yml
     secrets: inherit
 
   tent-ci:
-    needs: [spell-check, clang-format, check-paths]
+    needs: [ci-stage, spell-check, clang-format, check-paths]
     if: >-
+      needs.ci-stage.outputs.run-full == 'true' &&
       (needs.check-paths.outputs.should-run-tent == 'true' ||
-       github.event_name == 'workflow_dispatch') &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+       github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: cuda-on
-            cmake_flags: '-DUSE_CUDA=ON -DCMAKE_EXE_LINKER_FLAGS=-L/usr/local/cuda/lib64/stubs'
-            need_cuda: true
-            metrics_flags: ''
-          - name: cuda-off
-            cmake_flags: '-DUSE_CUDA=OFF'
-            need_cuda: false
-            metrics_flags: ''
-          - name: cuda-off-metrics-on
-            cmake_flags: '-DUSE_CUDA=OFF'
-            need_cuda: false
-            metrics_flags: '-DTENT_METRICS_ENABLED=ON'
+        # Validate all TENT configurations after approval.
+        name: ["cuda-on", "cuda-off", "cuda-off-metrics-on"]
     name: tent-ci (${{ matrix.name }})
     env:
       CI: "true"
@@ -1054,11 +944,11 @@ jobs:
         persist-credentials: false
 
     - name: Free up disk space
-      if: matrix.need_cuda
+      if: matrix.name == 'cuda-on'
       uses: ./.github/actions/free-disk-space
 
     - name: Install CUDA Toolkit
-      if: matrix.need_cuda
+      if: matrix.name == 'cuda-on'
       uses: Jimver/cuda-toolkit@v0.2.24
       with:
         cuda: '12.8.1'
@@ -1088,12 +978,19 @@ jobs:
       run: |
         mkdir build-tent
         cd build-tent
-        cmake -G Ninja .. -DUSE_TENT=ON -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_DEBUG_SYMBOLS=OFF ${{ matrix.cmake_flags }} ${{ matrix.metrics_flags }}
+        CMAKE_FLAGS="-DUSE_CUDA=OFF"
+        METRICS_FLAGS=""
+        if [ "${{ matrix.name }}" = "cuda-on" ]; then
+          CMAKE_FLAGS="-DUSE_CUDA=ON -DCMAKE_EXE_LINKER_FLAGS=-L/usr/local/cuda/lib64/stubs"
+        elif [ "${{ matrix.name }}" = "cuda-off-metrics-on" ]; then
+          METRICS_FLAGS="-DTENT_METRICS_ENABLED=ON"
+        fi
+        cmake -G Ninja .. -DUSE_TENT=ON -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_DEBUG_SYMBOLS=OFF $CMAKE_FLAGS $METRICS_FLAGS
       shell: bash
 
     - name: Build project with TENT
       run: |
-        if [ "${{ matrix.need_cuda }}" = "true" ]; then
+        if [ "${{ matrix.name }}" = "cuda-on" ]; then
           export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
           export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
         fi
@@ -1108,7 +1005,7 @@ jobs:
     # unit tests rely on, causing false failures. cuda-on still validates
     # that every #ifdef USE_CUDA branch compiles.
     - name: Test (TENT)
-      if: '!matrix.need_cuda'
+      if: matrix.name != 'cuda-on'
       run: |
         cd build-tent
         ctest --test-dir mooncake-transfer-engine/tent/tests -j --output-on-failure
@@ -1120,12 +1017,17 @@ jobs:
       run: ${SCCACHE_PATH} --show-stats
 
   ci-gate:
-    name: CI Gate
-    if: always()
+    name: ${{ needs.ci-stage.outputs.run-full == 'true' && 'CI Gate' || 'Pre-review Gate' }}
+    if: >-
+      always() &&
+      needs.ci-stage.outputs.run-checks == 'true'
     needs:
+      - ci-stage
       - spell-check
       - clang-format
+      - fast-unit-tests
       - docs-check
+      - check-paths
       - build
       - build-musa
       - build-arm64
