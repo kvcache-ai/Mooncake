@@ -94,9 +94,7 @@ jobs:
 
       - name: Free up disk space
         if: ${{ inputs.container == '' }}
-        run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/lib/android
-          df -h
+        uses: ./.github/actions/free-disk-space
 
       - name: Install CUDA Toolkit (arm64 SBSA)
         if: ${{ startsWith(inputs.cuda, 'sbsa-') }}

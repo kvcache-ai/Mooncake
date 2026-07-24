@@ -1,0 +1,15 @@
+name: Free runner disk space
+description: Remove preinstalled toolchains that Mooncake CI does not use
+
+runs:
+  using: composite
+  steps:
+    - name: Remove unused runner tools
+      shell: bash
+      run: |
+        sudo rm -rf -- \
+          /usr/share/dotnet \
+          /opt/ghc \
+          /opt/hostedtoolcache/CodeQL \
+          /usr/local/lib/android
+        df -h

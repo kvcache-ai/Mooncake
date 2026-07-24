@@ -254,7 +254,6 @@ remote_url: "mooncakestore://192.168.65.81:50051/"
 remote_serde: "naive"
 local_cpu: True
 max_local_cpu_size: 8
-enable_mooncake_nof_pool: True
 
 extra_config:
   local_hostname: "localhost"
@@ -268,8 +267,12 @@ extra_config:
 
 **Notes**:
 
-- `enable_mooncake_nof_pool=True` enables writing KV cache objects to the
-  registered NoF pool.
+- Writing KV cache objects to the registered NoF pool is controlled per put
+  by `nof_replica_num` in the store client's `ReplicateConfig` (exposed in
+  the Python binding), and the master must be built with `USE_NOF`. The
+  LMCache Mooncake connector does not currently parse or forward such a
+  setting, so enabling the NoF pool for LMCache writes needs a connector
+  change or a direct store client.
 - `global_segment_size: 0` means the inference process does not contribute a
   memory segment to the Mooncake cluster.
 - Keep `local_buffer_size` non-zero because the client still needs local

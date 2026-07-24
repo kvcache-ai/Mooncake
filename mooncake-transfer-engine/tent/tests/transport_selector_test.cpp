@@ -175,32 +175,30 @@ TEST(TransportSelectorTest, DefaultPoliciesMemorySegment) {
 // ---------------------------------------------------------------------------
 
 TEST(TransportSelectorTest, TransportTypeNameMapping) {
-    EXPECT_EQ(TransportSelector::transportTypeName(UNSPEC), "unspec");
-    EXPECT_EQ(TransportSelector::transportTypeName(RDMA), "rdma");
-    EXPECT_EQ(TransportSelector::transportTypeName(MNNVL), "mnnvl");
-    EXPECT_EQ(TransportSelector::transportTypeName(SHM), "shm");
-    EXPECT_EQ(TransportSelector::transportTypeName(NVLINK), "nvlink");
-    EXPECT_EQ(TransportSelector::transportTypeName(GDS), "gds");
-    EXPECT_EQ(TransportSelector::transportTypeName(IOURING), "io_uring");
-    EXPECT_EQ(TransportSelector::transportTypeName(TCP), "tcp");
-    EXPECT_EQ(TransportSelector::transportTypeName(AscendDirect), "ascend");
-    EXPECT_EQ(TransportSelector::transportTypeName(SUNRISE_LINK),
-              "sunrise_link");
+    EXPECT_STREQ(transportTypeName(UNSPEC), "unspec");
+    EXPECT_STREQ(transportTypeName(RDMA), "rdma");
+    EXPECT_STREQ(transportTypeName(MNNVL), "mnnvl");
+    EXPECT_STREQ(transportTypeName(SHM), "shm");
+    EXPECT_STREQ(transportTypeName(NVLINK), "nvlink");
+    EXPECT_STREQ(transportTypeName(GDS), "gds");
+    EXPECT_STREQ(transportTypeName(IOURING), "io_uring");
+    EXPECT_STREQ(transportTypeName(TCP), "tcp");
+    EXPECT_STREQ(transportTypeName(AscendDirect), "ascend");
+    EXPECT_STREQ(transportTypeName(SUNRISE_LINK), "sunrise_link");
 }
 
 TEST(TransportSelectorTest, ParseTransportType) {
-    EXPECT_EQ(TransportSelector::parseTransportType("unspec"), UNSPEC);
-    EXPECT_EQ(TransportSelector::parseTransportType("rdma"), RDMA);
-    EXPECT_EQ(TransportSelector::parseTransportType("mnnvl"), MNNVL);
-    EXPECT_EQ(TransportSelector::parseTransportType("shm"), SHM);
-    EXPECT_EQ(TransportSelector::parseTransportType("nvlink"), NVLINK);
-    EXPECT_EQ(TransportSelector::parseTransportType("gds"), GDS);
-    EXPECT_EQ(TransportSelector::parseTransportType("io_uring"), IOURING);
-    EXPECT_EQ(TransportSelector::parseTransportType("tcp"), TCP);
-    EXPECT_EQ(TransportSelector::parseTransportType("ascend"), AscendDirect);
-    EXPECT_EQ(TransportSelector::parseTransportType("sunrise_link"),
-              SUNRISE_LINK);
-    EXPECT_EQ(TransportSelector::parseTransportType("unknown"), UNSPEC);
+    EXPECT_EQ(parseTransportType("unspec"), UNSPEC);
+    EXPECT_EQ(parseTransportType("rdma"), RDMA);
+    EXPECT_EQ(parseTransportType("mnnvl"), MNNVL);
+    EXPECT_EQ(parseTransportType("shm"), SHM);
+    EXPECT_EQ(parseTransportType("nvlink"), NVLINK);
+    EXPECT_EQ(parseTransportType("gds"), GDS);
+    EXPECT_EQ(parseTransportType("io_uring"), IOURING);
+    EXPECT_EQ(parseTransportType("tcp"), TCP);
+    EXPECT_EQ(parseTransportType("ascend"), AscendDirect);
+    EXPECT_EQ(parseTransportType("sunrise_link"), SUNRISE_LINK);
+    EXPECT_EQ(parseTransportType("unknown"), UNSPEC);
 }
 
 // ---------------------------------------------------------------------------
