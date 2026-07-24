@@ -989,6 +989,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
 
             bool ambiguous_endpoint = false;
             bool unsupported_cxl = false;
+            std::unordered_map<ObjectMetadata*, bool> restored_objects;
             for (size_t shard_index = 0; shard_index < kNumShards;
                  ++shard_index) {
                 MetadataShardAccessorRW shard(this, shard_index);
@@ -996,6 +997,11 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                     (void)tenant_id;
                     for (auto& [key, metadata] : tenant.metadata) {
                         (void)key;
+                        const bool had_readable_memory_replica =
+                            metadata.HasReplica([this](const Replica& replica) {
+                                return replica.is_memory_replica() &&
+                                       IsReplicaReadable(replica);
+                            });
                         metadata.VisitReplicas(
                             [](const Replica& replica) {
                                 return replica.is_memory_replica() &&
@@ -1028,6 +1034,8 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                     }
                                     descriptor.transport_endpoint_ =
                                         match->segment.te_endpoint;
+                                    restored_objects.try_emplace(
+                                        &metadata, had_readable_memory_replica);
                                     match->replicas.push_back(&replica);
                                     match->descriptors.push_back(descriptor);
                                 }
@@ -1122,6 +1130,16 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                 invalid_replica_endpoints_.erase(restore.segment.name);
                 standby_allocator_keepalive_.erase(restore.segment.te_endpoint);
                 standby_allocator_keepalive_.erase(restore.segment.name);
+            }
+            for (const auto& [metadata, was_readable] : restored_objects) {
+                if (!was_readable &&
+                    metadata->HasReplica([this](const Replica& replica) {
+                        return replica.is_memory_replica() &&
+                               IsReplicaReadable(replica);
+                    })) {
+                    metadata->GrantLease(default_kv_lease_ttl_,
+                                         default_kv_soft_pin_ttl_);
+                }
             }
         }
 

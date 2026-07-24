@@ -536,6 +536,16 @@ class MasterServiceHATest : public ::testing::Test {
         return false;
     }
 
+    static std::chrono::system_clock::time_point LeaseTimeoutForTesting(
+        MasterService& service, const TenantId& tenant_id,
+        const std::string& key) {
+        MasterService::MetadataAccessorRO accessor(
+            &service, MasterService::ObjectIdentity{tenant_id, key});
+        EXPECT_TRUE(accessor.Exists());
+        return accessor.Exists() ? accessor.Get().lease_timeout
+                                 : std::chrono::system_clock::time_point{};
+    }
+
     static size_t SegmentAllocatedSizeForTesting(MasterService& service,
                                                  const std::string& name) {
         auto access = service.segment_manager_.getAllocatorAccess();
@@ -690,8 +700,10 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesMemoryBufferDescriptor) {
 }
 
 TEST_F(MasterServiceHATest, RemountMakesRestoredMemoryReplicaReady) {
-    MasterService service(
-        MasterServiceConfig::builder().set_enable_ha(false).build());
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(false)
+                              .set_default_kv_lease_ttl(5000)
+                              .build());
 
     const std::string endpoint = "standby_remount_segment";
     const auto metric_before =
@@ -708,6 +720,8 @@ TEST_F(MasterServiceHATest, RemountMakesRestoredMemoryReplicaReady) {
         .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 4096;
     service.RestoreFromStandbySnapshot({first_object, second_object}, 7,
                                        {MakeStandbyMemorySegment(endpoint)});
+    const auto lease_before =
+        LeaseTimeoutForTesting(service, kDefaultTenant, first_key);
     EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size() -
                   metric_before,
               2048);
@@ -725,6 +739,10 @@ TEST_F(MasterServiceHATest, RemountMakesRestoredMemoryReplicaReady) {
 
     Segment segment = MakeSegment(endpoint);
     ASSERT_TRUE(service.ReMountSegment({segment}, generate_uuid()).has_value());
+    const auto lease_after =
+        LeaseTimeoutForTesting(service, kDefaultTenant, first_key);
+    EXPECT_GT(lease_after, lease_before);
+    EXPECT_GT(lease_after, std::chrono::system_clock::now());
 
     auto after = service.GetReplicaList(first_key, kDefaultTenant);
     ASSERT_TRUE(after.has_value()) << toString(after.error());
@@ -749,10 +767,10 @@ TEST_F(MasterServiceHATest, RemountMakesRestoredMemoryReplicaReady) {
                   .get_memory_descriptor()
                   .buffer_descriptor.buffer_address_,
               kDefaultSegmentBase + 4096);
-    EXPECT_EQ(SegmentAllocatedSizeForTesting(service, endpoint), 5120);
+    EXPECT_EQ(SegmentAllocatedSizeForTesting(service, endpoint), 2048);
     EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size() -
                   metric_before,
-              5120);
+              2048);
 
     const std::string new_key = "post_remount_allocation";
     PutObjectOnSegment(service, generate_uuid(), new_key, endpoint);
@@ -765,12 +783,12 @@ TEST_F(MasterServiceHATest, RemountMakesRestoredMemoryReplicaReady) {
               kDefaultSegmentBase + 1024);
     EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size() -
                   metric_before,
-              6144);
+              3072);
 
     EraseObjectForTesting(service, kDefaultTenant, first_key);
     EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size() -
                   metric_before,
-              5120);
+              2048);
     const std::string replacement_key = "post_remount_replacement";
     PutObjectOnSegment(service, generate_uuid(), replacement_key, endpoint);
     auto replacement =
@@ -782,7 +800,7 @@ TEST_F(MasterServiceHATest, RemountMakesRestoredMemoryReplicaReady) {
               kDefaultSegmentBase);
     EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size() -
                   metric_before,
-              6144);
+              3072);
 }
 
 TEST_F(MasterServiceHATest, RemountRestoresCachelibMemoryReplica) {
@@ -855,11 +873,16 @@ TEST_F(MasterServiceHATest, FailedRemountKeepsReplicaInvalidAndCanBeRetried) {
         .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
     service.RestoreFromStandbySnapshot({first, conflicting}, 7,
                                        {MakeStandbyMemorySegment(endpoint)});
+    const auto lease_before =
+        LeaseTimeoutForTesting(service, kDefaultTenant, "standby_retry_first");
 
     Segment segment = MakeSegment(endpoint);
     auto failed = service.ReMountSegment({segment}, generate_uuid());
     ASSERT_FALSE(failed.has_value());
     EXPECT_EQ(failed.error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(
+        LeaseTimeoutForTesting(service, kDefaultTenant, "standby_retry_first"),
+        lease_before);
     auto get_after_failure =
         service.GetReplicaList("standby_retry_first", kDefaultTenant);
     ASSERT_FALSE(get_after_failure.has_value());
