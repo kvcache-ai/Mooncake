@@ -107,6 +107,16 @@ if (WITH_EP)
       message(STATUS "Detected CUDA version: ${CUDAToolkit_VERSION}")
     endif()
 
+    # Use the existing EP/PG architecture list for the native EP target too.
+    if(NOT TORCH_CUDA_ARCH_LIST)
+      set(TORCH_CUDA_ARCH_LIST "$ENV{TORCH_CUDA_ARCH_LIST}")
+    endif()
+    if(NOT TORCH_CUDA_ARCH_LIST)
+      set(TORCH_CUDA_ARCH_LIST "8.0;9.0")
+    endif()
+    set(TORCH_CUDA_ARCH_LIST "${TORCH_CUDA_ARCH_LIST}" CACHE STRING
+        "CUDA arch list for EP/PG extension builds (e.g. \"8.0;9.0\")")
+
     add_subdirectory(mooncake-ep)
     include_directories(mooncake-ep/include)
 
@@ -118,16 +128,6 @@ if (WITH_EP)
     endif()
     set(EP_TORCH_VERSIONS "${EP_TORCH_VERSIONS}" CACHE STRING
         "PyTorch versions for EP/PG extensions, semicolon-separated (empty = use currently-installed torch)")
-
-    # TORCH_CUDA_ARCH_LIST forwarded to the torch CUDA extension build.
-    if(NOT TORCH_CUDA_ARCH_LIST)
-      set(TORCH_CUDA_ARCH_LIST "$ENV{TORCH_CUDA_ARCH_LIST}")
-    endif()
-    if(NOT TORCH_CUDA_ARCH_LIST)
-      set(TORCH_CUDA_ARCH_LIST "8.0;9.0")
-    endif()
-    set(TORCH_CUDA_ARCH_LIST "${TORCH_CUDA_ARCH_LIST}" CACHE STRING
-        "CUDA arch list for EP/PG extension builds (e.g. \"8.0;9.0\")")
 
     # PG extensions are staged during their setup.py builds and injected after
     # auditwheel so their original accelerator fatbins remain untouched.

@@ -26,11 +26,7 @@ def _native_current_stream_ptr() -> int:
 
 
 def _wait_native_event_on_current_stream(event: "ep.EventHandle") -> None:
-    stream_ptr = _native_current_stream_ptr()
-    if stream_ptr == 0:
-        event.synchronize()
-        return
-    event.current_stream_wait(stream_ptr)
+    event.current_stream_wait(_native_current_stream_ptr())
 
 
 class EventOverlap:
@@ -604,6 +600,16 @@ class Buffer:
             ):
                 active_ranks.copy_(backend_active_ranks)
         else:
+            if zero_copy:
+                import warnings
+
+                warnings.warn(
+                    "zero_copy=True is not supported by the native Mooncake EP "
+                    "binding; falling back to the staging-copy combine path.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                zero_copy = False
             assert x.size(0) == num_experts // self.group_size
             assert x.size(1) == self.group_size * num_max_dispatch_tokens_per_rank
             assert x.size(2) == hidden
@@ -700,7 +706,7 @@ class Buffer:
     # Fallback helpers
     # -----------------
     class _DummyEvent:
-        def current_stream_wait(self):
+        def current_stream_wait(self, stream_ptr: Optional[int] = None):
             torch.cuda.synchronize()
 
         def synchronize(self):
