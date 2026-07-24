@@ -110,3 +110,49 @@ endif()
 add_executable(show_link ${WORKSPACE}/show_link.cpp)
 target_link_libraries(show_link PUBLIC transfer_engine gflags::gflags
                                        glog::glog)
+
+# NCCL DeviceTransport example. This is a manual two-rank validation because
+# communicator initialization and symmetric-window registration are collective.
+option(BUILD_NCCL_DEVICE_TRANSPORT_EXAMPLE
+       "Build the two-rank NCCL DeviceTransport LSA/GIN example"
+       OFF)
+if(USE_NCCL_DEVICE AND BUILD_NCCL_DEVICE_TRANSPORT_EXAMPLE)
+  enable_language(CUDA)
+  add_executable(nccl_device_transport_example
+                 ${WORKSPACE}/nccl_device_transport_example.cu)
+  target_include_directories(nccl_device_transport_example PRIVATE
+    ${CMAKE_SOURCE_DIR}/mooncake-transfer-engine/include)
+  target_link_libraries(nccl_device_transport_example PRIVATE
+    transfer_engine NCCL::nccl gflags::gflags glog::glog)
+  target_compile_options(nccl_device_transport_example PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+  set_target_properties(nccl_device_transport_example PROPERTIES
+    CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON CUDA_EXTENSIONS OFF)
+
+  if(NOT CMAKE_CUDA_ARCHITECTURES)
+    if(TORCH_CUDA_ARCH_LIST)
+      set(_nccl_cuda_arch_list "")
+      foreach(_arch IN LISTS TORCH_CUDA_ARCH_LIST)
+        string(REPLACE "." "" _arch_clean "${_arch}")
+        list(APPEND _nccl_cuda_arch_list "${_arch_clean}")
+      endforeach()
+      set_target_properties(nccl_device_transport_example PROPERTIES
+        CUDA_ARCHITECTURES "${_nccl_cuda_arch_list}")
+    else()
+      set_target_properties(nccl_device_transport_example PROPERTIES
+        CUDA_ARCHITECTURES "80;90")
+    endif()
+  endif()
+endif()
+
+option(BUILD_NCCL_HOST_TRANSPORT_EXAMPLE
+       "Build the two-GPU NCCL host RMA Transfer Engine example"
+       OFF)
+if(USE_NCCL_HOST AND BUILD_NCCL_HOST_TRANSPORT_EXAMPLE)
+  add_executable(nccl_host_transport_example
+                 ${WORKSPACE}/nccl_host_transport_example.cpp)
+  target_include_directories(nccl_host_transport_example PRIVATE
+    ${CMAKE_SOURCE_DIR}/mooncake-transfer-engine/include)
+  target_link_libraries(nccl_host_transport_example PRIVATE
+    transfer_engine NCCL::nccl glog::glog gflags::gflags)
+endif()
