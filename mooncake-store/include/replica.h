@@ -58,6 +58,28 @@ enum class ReplicaStatus {
 };
 
 /**
+ * @brief Requested soft-pin transition for a Put or Upsert operation.
+ */
+enum class SoftPinAction : uint8_t {
+    PRESERVE = 0,
+    ENABLE = 1,
+    DISABLE = 2,
+};
+
+inline std::ostream& operator<<(std::ostream& os,
+                                const SoftPinAction& action) noexcept {
+    switch (action) {
+        case SoftPinAction::PRESERVE:
+            return os << "PRESERVE";
+        case SoftPinAction::ENABLE:
+            return os << "ENABLE";
+        case SoftPinAction::DISABLE:
+            return os << "DISABLE";
+    }
+    return os << "UNKNOWN";
+}
+
+/**
  * @brief Stream operator for ReplicaStatus
  */
 inline std::ostream& operator<<(std::ostream& os,
@@ -81,7 +103,10 @@ inline std::ostream& operator<<(std::ostream& os,
 struct ReplicateConfig {
     size_t replica_num{1};
     size_t nof_replica_num{0};
-    bool with_soft_pin{false};
+    SoftPinAction soft_pin_action{SoftPinAction::PRESERVE};
+    // Optional request-level override. When omitted, ENABLE uses the
+    // master's default soft-pin TTL.
+    std::optional<uint64_t> soft_pin_ttl_ms{};
     bool with_hard_pin{false};  // Hard pin: object cannot be evicted
     std::vector<std::string>
         preferred_segments{};         // Preferred segments for allocation
@@ -110,8 +135,14 @@ struct ReplicateConfig {
                                     const ReplicateConfig& config) noexcept {
         os << "ReplicateConfig: { replica_num: " << config.replica_num
            << ", nof_replica_num: " << config.nof_replica_num
-           << ", with_soft_pin: " << config.with_soft_pin
-           << ", with_hard_pin: " << config.with_hard_pin
+           << ", soft_pin_action: " << config.soft_pin_action
+           << ", soft_pin_ttl_ms: ";
+        if (config.soft_pin_ttl_ms.has_value()) {
+            os << *config.soft_pin_ttl_ms;
+        } else {
+            os << "default";
+        }
+        os << ", with_hard_pin: " << config.with_hard_pin
            << ", preferred_segments: [";
         for (size_t i = 0; i < config.preferred_segments.size(); ++i) {
             os << config.preferred_segments[i];

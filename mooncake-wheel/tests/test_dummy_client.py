@@ -3,7 +3,7 @@ import os
 import time
 import threading
 import random
-from mooncake.store import MooncakeDistributedStore
+from mooncake.store import MooncakeDistributedStore, SoftPinAction
 
 # The lease time of the kv object, should be set equal to
 # the master's value.
@@ -393,16 +393,16 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         # Test default constructor
         config = ReplicateConfig()
         self.assertEqual(config.replica_num, 1)
-        self.assertEqual(config.with_soft_pin, False)
+        self.assertEqual(config.soft_pin_action, SoftPinAction.PRESERVE)
         self.assertEqual(config.preferred_segment, "")
 
         # Test property assignment
         config.replica_num = 3
-        config.with_soft_pin = True
+        config.soft_pin_action = SoftPinAction.ENABLE
         config.preferred_segment = "node1:12345"
 
         self.assertEqual(config.replica_num, 3)
-        self.assertEqual(config.with_soft_pin, True)
+        self.assertEqual(config.soft_pin_action, SoftPinAction.ENABLE)
         self.assertEqual(config.preferred_segment, "node1:12345")
 
         # Test string representation

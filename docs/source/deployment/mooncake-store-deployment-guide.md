@@ -475,6 +475,7 @@ mooncake_master \
 |------|---------|-------------|
 | `--default_kv_lease_ttl` | `10000` ms | Lease TTL for KV objects. Supports `5000ms`, `5s`, `30m`, `1h` |
 | `--default_kv_soft_pin_ttl` | `1800000` ms | Soft pin TTL (30 min) |
+| `--max_kv_soft_pin_ttl` | `86400000` ms | Maximum request-level soft pin TTL (24 h) |
 | `--allow_evict_soft_pinned_objects` | `true` | Allow evicting soft-pinned objects |
 | `--eviction_ratio` | `0.05` | Fraction evicted at high watermark |
 | `--eviction_high_watermark_ratio` | `0.90` | Usage ratio triggering eviction |

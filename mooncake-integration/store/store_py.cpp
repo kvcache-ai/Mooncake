@@ -1826,12 +1826,18 @@ PYBIND11_MODULE(store, m) {
         .value("GENERAL", ObjectDataType::GENERAL)
         .export_values();
 
+    py::enum_<SoftPinAction>(m, "SoftPinAction")
+        .value("PRESERVE", SoftPinAction::PRESERVE)
+        .value("ENABLE", SoftPinAction::ENABLE)
+        .value("DISABLE", SoftPinAction::DISABLE);
+
     // Define the ReplicateConfig class
     py::class_<ReplicateConfig>(m, "ReplicateConfig")
         .def(py::init<>())
         .def_readwrite("replica_num", &ReplicateConfig::replica_num)
         .def_readwrite("nof_replica_num", &ReplicateConfig::nof_replica_num)
-        .def_readwrite("with_soft_pin", &ReplicateConfig::with_soft_pin)
+        .def_readwrite("soft_pin_action", &ReplicateConfig::soft_pin_action)
+        .def_readwrite("soft_pin_ttl_ms", &ReplicateConfig::soft_pin_ttl_ms)
         .def_readwrite("with_hard_pin", &ReplicateConfig::with_hard_pin)
         .def_readwrite("preferred_segments",
                        &ReplicateConfig::preferred_segments)
