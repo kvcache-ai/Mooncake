@@ -26,8 +26,8 @@ uint64_t generateInitialAgentSessionId() {
 void throwIfRpcCallFailed(const coro_rpc::rpc_error& error,
                           const char* rpc_name) {
     if (error) {
-        throw std::runtime_error(std::string(rpc_name) + " RPC failed: " +
-                                 error.msg);
+        throw std::runtime_error(std::string(rpc_name) +
+                                 " RPC failed: " + error.msg);
     }
 }
 
@@ -145,8 +145,8 @@ void AgentHost::unregisterAgent() {
     auto error = rpc_client_->call<&CoordinatorRpcService::unregisterAgent>(
         coordinator_addr_, std::move(req), response);
     if (error) {
-        LOG(WARNING) << "AgentHost: unregisterAgent RPC failed, rank="
-                     << rank_ << ": " << error.msg;
+        LOG(WARNING) << "AgentHost: unregisterAgent RPC failed, rank=" << rank_
+                     << ": " << error.msg;
         return;
     }
     if (!response.success) {
@@ -286,8 +286,7 @@ GroupId AgentHost::registerGroup(GroupBootstrapId group_bootstrap_id,
 }
 
 void AgentHost::detachBackend(GroupId group_id) {
-    executor_.postAndWait(
-        [this, group_id]() { backends_.erase(group_id); });
+    executor_.postAndWait([this, group_id]() { backends_.erase(group_id); });
 }
 
 void AgentHost::unregisterGroup(GroupId group_id) {
@@ -299,9 +298,8 @@ void AgentHost::unregisterGroup(GroupId group_id) {
         req.rank = rank_;
         req.agent_session_id = agent_.getAgentSessionId();
         UnregisterGroupResponse resp;
-        auto error =
-            rpc_client_->call<&CoordinatorRpcService::unregisterGroup>(
-                coordinator_addr_, std::move(req), resp);
+        auto error = rpc_client_->call<&CoordinatorRpcService::unregisterGroup>(
+            coordinator_addr_, std::move(req), resp);
         if (error) {
             LOG(WARNING) << "AgentHost: unregisterGroup RPC failed, "
                          << "group=" << group_id << ": " << error.msg;
@@ -362,8 +360,7 @@ void AgentHost::sendLinkEventReport(LinkEventReport report) {
                                 LinkEventReportAck ack) {
             if (error) return;
             executor_.post([this, request_session, ack = std::move(ack)]() {
-                if (shutdown_requested_.load(std::memory_order_acquire))
-                    return;
+                if (shutdown_requested_.load(std::memory_order_acquire)) return;
                 if (request_session != agent_.getAgentSessionId()) return;
                 agent_.handleLinkEventReportAck(ack);
             });
@@ -509,62 +506,54 @@ void AgentHost::startAgentRegistration(bool start_new_session) {
         coordinator_addr_, std::move(req),
         [this, request_session_id](coro_rpc::rpc_error error,
                                    RegisterAgentResponse resp) {
-            executor_.post(
-                [this, request_session_id, error = std::move(error),
-                 resp = std::move(resp)]() mutable {
-                    if (shutdown_requested_.load(std::memory_order_acquire))
-                        return;
-                    if (request_session_id != agent_.getAgentSessionId())
-                        return;
+            executor_.post([this, request_session_id, error = std::move(error),
+                            resp = std::move(resp)]() mutable {
+                if (shutdown_requested_.load(std::memory_order_acquire)) return;
+                if (request_session_id != agent_.getAgentSessionId()) return;
 
-                    if (error) {
-                        agent_.setCoordinatorConnection(
-                            AgentStateMachine::CoordinatorConnection::
-                                Disconnected);
-                        if (shouldLogAgentRegistrationError()) {
-                            LOG(ERROR)
-                                << "AgentHost: registerAgent RPC failed: "
-                                << error.msg << "; will retry";
-                        }
-                        return;
+                if (error) {
+                    agent_.setCoordinatorConnection(
+                        AgentStateMachine::CoordinatorConnection::Disconnected);
+                    if (shouldLogAgentRegistrationError()) {
+                        LOG(ERROR) << "AgentHost: registerAgent RPC failed: "
+                                   << error.msg << "; will retry";
                     }
+                    return;
+                }
 
-                    if (!resp.success) {
-                        agent_.setCoordinatorConnection(
-                            AgentStateMachine::CoordinatorConnection::
-                                Disconnected);
-                        if (shouldLogAgentRegistrationError()) {
-                            LOG(ERROR) << "AgentHost: registerAgent rejected: "
-                                       << resp.reject_reason
-                                       << "; will retry";
-                        }
-                        if (resp.require_new_session) {
-                            startAgentRegistration(/*start_new_session=*/true);
-                        }
-                        return;
+                if (!resp.success) {
+                    agent_.setCoordinatorConnection(
+                        AgentStateMachine::CoordinatorConnection::Disconnected);
+                    if (shouldLogAgentRegistrationError()) {
+                        LOG(ERROR) << "AgentHost: registerAgent rejected: "
+                                   << resp.reject_reason << "; will retry";
                     }
-
-                    auto effects = agent_.applyRegisterAgentResponse(resp);
-                    runEffects(effects);
-                    if (agent_.getCoordinatorConnection() !=
-                        AgentStateMachine::CoordinatorConnection::Connected)
-                        return;
-
-                    if (!agent_registration_done_) {
-                        agent_registration_done_ = true;
-                        for (auto& p : agent_registration_promises_) {
-                            p->set_value();
-                        }
-                        agent_registration_promises_.clear();
+                    if (resp.require_new_session) {
+                        startAgentRegistration(/*start_new_session=*/true);
                     }
+                    return;
+                }
 
-                    // Re-publish all local backends' endpoints after (re-)reg.
-                    // Old session endpoints were cleared by Coordinator.
-                    forEachBackend([&](auto backend) {
-                        sendPublishEndpointRpc(
-                            backend->buildEndpointMetadata());
-                    });
+                auto effects = agent_.applyRegisterAgentResponse(resp);
+                runEffects(effects);
+                if (agent_.getCoordinatorConnection() !=
+                    AgentStateMachine::CoordinatorConnection::Connected)
+                    return;
+
+                if (!agent_registration_done_) {
+                    agent_registration_done_ = true;
+                    for (auto& p : agent_registration_promises_) {
+                        p->set_value();
+                    }
+                    agent_registration_promises_.clear();
+                }
+
+                // Re-publish all local backends' endpoints after (re-)reg.
+                // Old session endpoints were cleared by Coordinator.
+                forEachBackend([&](auto backend) {
+                    sendPublishEndpointRpc(backend->buildEndpointMetadata());
                 });
+            });
         });
 }
 
@@ -618,8 +607,7 @@ void AgentHost::tick() {
                                 HeartbeatResponse resp) {
             if (error) return;
             executor_.post([this, request_session, resp]() {
-                if (shutdown_requested_.load(std::memory_order_acquire))
-                    return;
+                if (shutdown_requested_.load(std::memory_order_acquire)) return;
                 if (request_session != agent_.getAgentSessionId()) return;
                 if (resp.require_new_session) {
                     // The current session is no longer valid.

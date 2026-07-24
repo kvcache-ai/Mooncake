@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -159,11 +160,11 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
         GroupId group_id;
         uint64_t epoch = 0;
         std::unordered_set<GlobalRank> waiting_acks;
+        std::unordered_set<GlobalRank> dropped_ranks;
         std::optional<std::chrono::steady_clock::time_point> deadline;
 
         struct ProposalCommit {
             uint64_t propose_id = 0;
-            ProposeViewUpdateResponse eventual_response;
         };
         struct BootstrapCommit {};
 
@@ -173,6 +174,15 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     std::unordered_map<GroupId,
                        std::unordered_map<uint64_t, PendingViewUpdateBarrier>>
         pending_barriers_;
+
+    struct PendingProposal {
+        uint64_t propose_id = 0;
+        ProposeViewUpdateRequest request;
+        std::chrono::steady_clock::time_point deadline;
+    };
+    // Membership proposals are linearized per group. A queued proposal is
+    // admitted only after the preceding membership barrier has committed.
+    std::unordered_map<GroupId, std::deque<PendingProposal>> pending_proposals_;
 
     struct PendingSync {
         uint64_t sync_id = 0;
@@ -195,15 +205,18 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     // end before the state machine asks the Host to stop serving RPCs. New
     // sessions cannot take ownership after this snapshot is created.
     bool shutdown_requested_ = false;
+    bool shutdown_confirmed_ = false;
     std::unordered_set<GlobalRank> shutdown_pending_ranks_;
 
-    static constexpr auto kProposeTimeout = std::chrono::seconds(20);
+    static constexpr auto kProposalAdmissionTimeout = std::chrono::seconds(20);
+    static constexpr auto kViewUpdateAckTimeout = std::chrono::seconds(20);
     static constexpr auto kHeartbeatTimeout = std::chrono::seconds(30);
 
     bool invalidateAgentSession(GlobalRank rank);
 
     void handleTimedOutAgent(GlobalRank rank, const char* reason,
                              std::vector<CoordinatorEffect>& effects);
+    void tryConfirmShutdown(std::vector<CoordinatorEffect>& effects);
 
     // Recompute the authoritative healthy set (max clique) and update
     // rank-state between Healthy and Synced.  Emits rank-state effects.
@@ -267,9 +280,18 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     bool isRankActivatable(GroupId group_id, GlobalRank rank,
                            const std::vector<GlobalRank>& future_active) const;
 
+    // Admit proposals in Coordinator arrival order. At most one membership
+    // proposal per group may wait on a ViewUpdate barrier at a time.
+    void tryAdmitPendingProposals(GroupId group_id,
+                                  std::vector<CoordinatorEffect>& effects);
+    void rejectPendingProposals(GroupId group_id, GlobalRank rank,
+                                const std::string& reason,
+                                std::vector<CoordinatorEffect>& effects);
+    void dropRankFromPendingBarriers(GroupId group_id, GlobalRank rank,
+                                     std::vector<CoordinatorEffect>& effects);
+
     // Helpers for barrier (proposal, bootstrap, ...) lifecycle.
     void commitBarrier(PendingViewUpdateBarrier barrier,
-                       const std::vector<GlobalRank>& dropped,
                        std::vector<CoordinatorEffect>& effects);
 
     // Compute the ACK set for a ViewUpdate barrier (proposal, bootstrap, ...).
@@ -280,8 +302,6 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     // Emits ReplySync for each pending sync_id.
     void rejectPendingSyncs(GroupId group_id, GlobalRank rank,
                             const std::string& reason,
-                            std::vector<CoordinatorEffect>& effects);
-    void rejectPendingSyncs(GroupId group_id, const std::string& reason,
                             std::vector<CoordinatorEffect>& effects);
 
     // Request validation: rank must be in range, online, and matching session.

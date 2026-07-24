@@ -110,7 +110,7 @@ struct ConfirmReadyForActivationResponse {
     std::string reject_reason;
 };
 
-enum class ViewUpdateStatus : uint8_t {
+enum class ProposalStatus : uint8_t {
     Rejected = 0,
     Applied = 1,
     AppliedWithDroppedRanks = 2,
@@ -125,7 +125,7 @@ struct ProposeViewUpdateRequest {
 };
 
 struct ProposeViewUpdateResponse {
-    ViewUpdateStatus status = ViewUpdateStatus::Rejected;
+    ProposalStatus status = ProposalStatus::Rejected;
     uint64_t new_epoch = 0;
     std::vector<InGroupRank> dropped_ranks;
     std::string reject_reason;

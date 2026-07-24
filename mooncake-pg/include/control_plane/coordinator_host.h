@@ -156,17 +156,16 @@ class CoordinatorHost {
     std::unique_ptr<RpcClient> rpc_client_;
     std::unique_ptr<CoordinatorRpcServiceImpl> rpc_impl_;
 
-    // Host maintains the propose_id -> RPC context mapping.
-    // 2PC state is inside CentralizedCoordinatorStateMachine;
-    // Host just stores the RPC context for replying when the
-    // state machine emits ReplyProposal.
+    // Host only maintains deferred response context mapping.
+    // Related states is inside CentralizedCoordinatorStateMachine;
+
     uint64_t next_propose_id_{1};
     std::unordered_map<uint64_t, coro_rpc::context<ProposeViewUpdateResponse>>
-        pending_rpcs_;
+        pending_proposal_resps_;
 
     uint64_t next_sync_id_{1};
     std::unordered_map<uint64_t, coro_rpc::context<SyncAfterFailureResponse>>
-        pending_sync_ctxs_;
+        pending_sync_resps_;
 
     static constexpr auto kShutdownDrainTimeout = std::chrono::seconds(30);
 

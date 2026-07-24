@@ -918,10 +918,11 @@ void MooncakeBackend::shutdown() {
     }
     isShutdown_ = true;
 
-    // Group teardown is independent from process-level Agent teardown. Remove
-    // this backend from AgentHost before releasing resources so a concurrent
-    // ViewUpdate cannot dereference it.
-    agent_.unregisterGroup(meta_->group_id);
+    // Remove this backend from AgentHost's callback lookup before teardown so
+    // a concurrent ViewUpdate cannot call into it. Keep the group registered
+    // locally and at the Coordinator while worker tasks are draining because
+    // their failure path may still call syncAfterFailure().
+    agent_.detachBackend(meta_->group_id);
 
     // If we encounter any hung operations, don't release resources
     // to avoid potential crash. Instead, we allow those resources to leak
@@ -978,6 +979,10 @@ void MooncakeBackend::shutdown() {
     if (meta_) {
         meta_->backend = nullptr;
     }
+
+    // The data-plane teardown has finished. Remove the group from the local
+    // Agent and notify the Coordinator that this rank has left it.
+    agent_.unregisterGroup(meta_->group_id);
 }
 
 void MooncakeBackend::syncActiveRanksTensor() {
@@ -1031,7 +1036,7 @@ ProposeViewUpdateResponse MooncakeBackend::activateRanks(
     const std::vector<int>& ranks) {
     std::vector<InGroupRank> in_group_ranks(ranks.begin(), ranks.end());
     auto resp = agent_.proposeActivate(meta_->group_id, in_group_ranks);
-    if (resp.status == ViewUpdateStatus::Rejected) {
+    if (resp.status == ProposalStatus::Rejected) {
         LOG(WARNING) << "MooncakeBackend: activate_ranks rejected: "
                      << resp.reject_reason;
     }
@@ -1042,7 +1047,7 @@ ProposeViewUpdateResponse MooncakeBackend::deactivateRanks(
     const std::vector<int>& ranks) {
     std::vector<InGroupRank> in_group_ranks(ranks.begin(), ranks.end());
     auto resp = agent_.proposeDeactivate(meta_->group_id, in_group_ranks);
-    if (resp.status == ViewUpdateStatus::Rejected) {
+    if (resp.status == ProposalStatus::Rejected) {
         LOG(WARNING) << "MooncakeBackend: deactivate_ranks rejected: "
                      << resp.reject_reason;
     }

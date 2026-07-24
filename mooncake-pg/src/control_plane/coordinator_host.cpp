@@ -126,26 +126,13 @@ void CoordinatorHost::shutdown() {
             std::future_status::ready) {
             LOG(WARNING) << "[COORD] shutdown drain timed out";
         }
+        rpc_server_->shutdown();
     }
 
-    if (rpc_server_) rpc_server_->shutdown();
-    executor_.shutdown();
-
-    for (auto& [propose_id, ctx] : pending_rpcs_) {
-        ctx.response_msg(ProposeViewUpdateResponse{
-            ViewUpdateStatus::Rejected, 0, {}, "coordinator shutting down"});
-    }
-    pending_rpcs_.clear();
-
-    for (auto& [sync_id, ctx] : pending_sync_ctxs_) {
-        SyncAfterFailureResponse response;
-        response.status = SyncAfterFailureStatus::Rejected;
-        response.reject_reason = "coordinator shutting down";
-        ctx.response_msg(std::move(response));
-    }
-    pending_sync_ctxs_.clear();
-
+    // Keep the executor alive while outbound callbacks finish; callbacks may
+    // still post their final state-machine work during client draining.
     if (rpc_client_) rpc_client_->shutdown();
+    executor_.shutdown();
 }
 
 void CoordinatorHost::postRegisterAgent(
@@ -217,7 +204,7 @@ void CoordinatorHost::postProposeViewUpdate(
     executor_.post([this, ctx = std::move(ctx),
                     req = std::move(req)]() mutable {
         uint64_t propose_id = next_propose_id_++;
-        pending_rpcs_.emplace(propose_id, std::move(ctx));
+        pending_proposal_resps_.emplace(propose_id, std::move(ctx));
         auto result = state_machine_.handleProposeViewUpdate(propose_id, req);
         runEffects(result.effects);
     });
@@ -250,7 +237,7 @@ void CoordinatorHost::postSyncAfterFailure(
     executor_.post(
         [this, ctx = std::move(ctx), req = std::move(req)]() mutable {
             uint64_t sync_id = next_sync_id_++;
-            pending_sync_ctxs_.emplace(sync_id, std::move(ctx));
+            pending_sync_resps_.emplace(sync_id, std::move(ctx));
             auto result = state_machine_.handleSyncAfterFailure(sync_id, req);
             runEffects(result.effects);
         });
@@ -281,17 +268,17 @@ void CoordinatorHost::runEffects(
                 },
                 [this](const PushViewUpdate& e) { pushViewUpdate(e); },
                 [this](const ReplyProposal& e) {
-                    auto it = pending_rpcs_.find(e.propose_id);
-                    if (it != pending_rpcs_.end()) {
+                    auto it = pending_proposal_resps_.find(e.propose_id);
+                    if (it != pending_proposal_resps_.end()) {
                         it->second.response_msg(e.response);
-                        pending_rpcs_.erase(it);
+                        pending_proposal_resps_.erase(it);
                     }
                 },
                 [this](const ReplySync& e) {
-                    auto it = pending_sync_ctxs_.find(e.sync_id);
-                    if (it != pending_sync_ctxs_.end()) {
+                    auto it = pending_sync_resps_.find(e.sync_id);
+                    if (it != pending_sync_resps_.end()) {
                         it->second.response_msg(e.response);
-                        pending_sync_ctxs_.erase(it);
+                        pending_sync_resps_.erase(it);
                     }
                 },
                 [this](const BroadcastPeerJoined& e) {
@@ -329,8 +316,8 @@ void CoordinatorHost::pushViewUpdate(const PushViewUpdate& effect) {
 
         rpc_client_->callAsync<&AgentRpcService::onViewUpdate>(
             addr, push,
-            [this, group_id,
-             rank = i](coro_rpc::rpc_error error, ViewUpdateAck ack) {
+            [this, group_id, rank = i](coro_rpc::rpc_error error,
+                                       ViewUpdateAck ack) {
                 if (error) return;
                 postViewUpdateAck(group_id, rank, ack.epoch, ack.applied);
             });

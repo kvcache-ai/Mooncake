@@ -301,11 +301,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .value("NoPending", SyncAfterFailureStatus::NoPending)
         .value("Rejected", SyncAfterFailureStatus::Rejected);
 
-    py::enum_<ViewUpdateStatus>(m, "ViewUpdateStatus")
-        .value("Rejected", ViewUpdateStatus::Rejected)
-        .value("Applied", ViewUpdateStatus::Applied)
-        .value("AppliedWithDroppedRanks",
-               ViewUpdateStatus::AppliedWithDroppedRanks);
+    auto proposal_status = py::enum_<ProposalStatus>(m, "ProposalStatus")
+                               .value("Rejected", ProposalStatus::Rejected)
+                               .value("Applied", ProposalStatus::Applied)
+                               .value("AppliedWithDroppedRanks",
+                                      ProposalStatus::AppliedWithDroppedRanks);
+    // Keep existing Python callers source-compatible with the renamed enum.
+    m.attr("ViewUpdateStatus") = proposal_status;
 
     py::class_<SyncAfterFailureResponse>(m, "SyncAfterFailureResponse")
         .def_readonly("status", &SyncAfterFailureResponse::status)

@@ -65,7 +65,7 @@ def _extension_worker(
             description=f"rank {ctx.proc_rank} waiting for joiner ready",
         )
         resp = pg.recover_ranks(backend, join_ranks)
-        assert resp.status == pg.ViewUpdateStatus.Applied, \
+        assert resp.status == pg.ProposalStatus.Applied, \
             f"rank {ctx.proc_rank}: recover_ranks should apply, got {resp.status}"
 
         # The Coordinator has committed the joiner as active, so the visible
@@ -169,7 +169,7 @@ def _extension_p2p_worker(
             description=f"rank {ctx.proc_rank} waiting for joiner ready",
         )
         resp = pg.recover_ranks(backend, join_ranks)
-        assert resp.status == pg.ViewUpdateStatus.Applied, \
+        assert resp.status == pg.ProposalStatus.Applied, \
             f"rank {ctx.proc_rank}: recover_ranks should apply, got {resp.status}"
     else:
         if not extend_event.wait(timeout=30.0):
@@ -325,7 +325,7 @@ def _extension_worker_with_subgroups(
             description=f"rank {ctx.proc_rank} waiting for joiners",
         )
         resp = pg.recover_ranks(world_backend, join_ranks)
-        assert resp.status == pg.ViewUpdateStatus.Applied, \
+        assert resp.status == pg.ProposalStatus.Applied, \
             f"rank {ctx.proc_rank}: recover_ranks(world) should apply, got {resp.status}"
 
         # group_a: rank 0 waits for joiner (local rank 1 = global rank 2)
@@ -337,7 +337,7 @@ def _extension_worker_with_subgroups(
                 description="rank 0 waiting for group_a joiner",
             )
             resp = pg.recover_ranks(a_backend, [1])
-            assert resp.status == pg.ViewUpdateStatus.Applied, \
+            assert resp.status == pg.ProposalStatus.Applied, \
                 f"rank 0: recover_ranks(group_a) should apply, got {resp.status}"
 
         # group_b: rank 1 waits for joiner (local rank 1 = global rank 3)
@@ -349,7 +349,7 @@ def _extension_worker_with_subgroups(
                 description="rank 1 waiting for group_b joiner",
             )
             resp = pg.recover_ranks(b_backend, [1])
-            assert resp.status == pg.ViewUpdateStatus.Applied, \
+            assert resp.status == pg.ProposalStatus.Applied, \
                 f"rank 1: recover_ranks(group_b) should apply, got {resp.status}"
 
         # group_c: both primaries wait for both joiners (local ranks 2,3)
@@ -360,7 +360,7 @@ def _extension_worker_with_subgroups(
             description=f"rank {ctx.proc_rank} waiting for group_c joiners",
         )
         resp = pg.recover_ranks(c_backend, [2, 3])
-        assert resp.status == pg.ViewUpdateStatus.Applied, \
+        assert resp.status == pg.ProposalStatus.Applied, \
             f"rank {ctx.proc_rank}: recover_ranks(group_c) should apply, got {resp.status}"
 
         # Post-activation: WORLD all 4 ranks → 1+2+3+4=10
@@ -564,7 +564,7 @@ def _allgather_reduce_scatter_extension_worker(
             description=f"rank {ctx.proc_rank} waiting for joiner",
         )
         resp = pg.recover_ranks(backend, join_ranks)
-        assert resp.status == pg.ViewUpdateStatus.Applied, \
+        assert resp.status == pg.ProposalStatus.Applied, \
             f"rank {ctx.proc_rank}: recover_ranks should apply, got {resp.status}"
 
         # Post-activation: all 4 ranks active.
@@ -636,7 +636,7 @@ def _allgather_reduce_scatter_recovery_worker(
             description=f"rank {logical_rank} waiting for replacement",
         )
         resp = pg.recover_ranks(backend, [broken_rank])
-        assert resp.status == pg.ViewUpdateStatus.Applied, \
+        assert resp.status == pg.ProposalStatus.Applied, \
             f"rank {logical_rank}: recover_ranks should apply, got {resp.status}"
 
         # Post-recovery: all 4 ranks active again.
@@ -728,7 +728,7 @@ def _replacement_recovery_worker(
 
         # All ranks call recover_ranks to include replacement
         resp = pg.recover_ranks(backend, [BROKEN_RANK])
-        assert resp.status == pg.ViewUpdateStatus.Applied, \
+        assert resp.status == pg.ProposalStatus.Applied, \
             f"rank {logical_rank}: recover_ranks should apply, got {resp.status}"
 
         # Final collective with all 4 ranks
@@ -832,11 +832,11 @@ def _manual_deactivate_recovery_worker(
         # Survivors deactivate the dead rank before issuing new collectives.
         resp = pg.deactivate_ranks(backend, [BROKEN_RANK])
         assert resp.status in (
-            pg.ViewUpdateStatus.Applied,
-            pg.ViewUpdateStatus.AppliedWithDroppedRanks,
+            pg.ProposalStatus.Applied,
+            pg.ProposalStatus.AppliedWithDroppedRanks,
         ), f"rank {ctx.rank}: deactivate_ranks should apply, got {resp.status}"
         # If ranks were dropped, they should only be the BROKEN_RANK
-        assert resp.status != pg.ViewUpdateStatus.AppliedWithDroppedRanks or set(
+        assert resp.status != pg.ProposalStatus.AppliedWithDroppedRanks or set(
             resp.dropped_ranks
         ) == {
             BROKEN_RANK
@@ -862,7 +862,7 @@ def _manual_deactivate_recovery_worker(
         )
 
         resp = pg.recover_ranks(backend, [BROKEN_RANK])
-        assert resp.status == pg.ViewUpdateStatus.Applied, \
+        assert resp.status == pg.ProposalStatus.Applied, \
             f"rank {logical_rank}: recover_ranks should apply, got {resp.status}"
 
         tensor = torch.tensor(
