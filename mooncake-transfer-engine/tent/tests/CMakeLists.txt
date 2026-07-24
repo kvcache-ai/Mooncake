@@ -63,6 +63,24 @@ target_include_directories(receiver_credit_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME receiver_credit_test COMMAND receiver_credit_test)
 
+add_executable(receiver_credit_control_test receiver_credit_control_test.cpp
+                                            ../src/runtime/receiver_credit.cpp
+                                            ../src/runtime/receiver_credit_control.cpp)
+target_link_libraries(receiver_credit_control_test
+                      PRIVATE tent_common gtest gtest_main)
+target_include_directories(receiver_credit_control_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME receiver_credit_control_test COMMAND receiver_credit_control_test)
+
+# Manual cross-host harness. It is intentionally not registered with ctest.
+add_executable(receiver_credit_rpc_harness receiver_credit_rpc_harness.cpp
+                                           ../src/runtime/receiver_credit.cpp
+                                           ../src/runtime/receiver_credit_control.cpp)
+target_link_libraries(receiver_credit_rpc_harness
+                      PRIVATE tent_rpc tent_common asio_shared glog)
+target_include_directories(receiver_credit_rpc_harness
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+
 add_executable(bw_arbitration_test bw_arbitration_test.cpp)
 target_link_libraries(bw_arbitration_test PRIVATE tent_common gtest gtest_main)
 target_include_directories(bw_arbitration_test
