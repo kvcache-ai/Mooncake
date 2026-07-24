@@ -54,10 +54,23 @@ TEST(NVMeoFStatusTest, RejectsUnsupportedMultiTransportSubmission) {
     EXPECT_TRUE(task.is_finished);
 }
 
-TEST(NVMeoFStatusTest, WaitsForEverySliceBeforeReportingTerminalFailure) {
+TEST(NVMeoFStatusTest, ReportsKnownFailureBeforeAllSlicesFinish) {
+    bool is_finished = true;
+    auto waiting_status = NVMeoFTransportTestPeer::aggregate(
+        {{Transport::FAILED, 0}, {Transport::WAITING, 0}}, is_finished);
+    EXPECT_EQ(waiting_status.s, Transport::FAILED);
+    EXPECT_FALSE(is_finished);
+
+    auto pending_status = NVMeoFTransportTestPeer::aggregate(
+        {{Transport::FAILED, 0}, {Transport::PENDING, 0}}, is_finished);
+    EXPECT_EQ(pending_status.s, Transport::FAILED);
+    EXPECT_FALSE(is_finished);
+}
+
+TEST(NVMeoFStatusTest, ReportsPendingOnlyWhenNoFailureIsKnown) {
     bool is_finished = true;
     auto status = NVMeoFTransportTestPeer::aggregate(
-        {{Transport::FAILED, 0}, {Transport::PENDING, 0}}, is_finished);
+        {{Transport::COMPLETED, 1024}, {Transport::PENDING, 0}}, is_finished);
 
     EXPECT_EQ(status.s, Transport::PENDING);
     EXPECT_FALSE(is_finished);

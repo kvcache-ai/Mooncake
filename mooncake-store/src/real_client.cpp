@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "real_client.h"
+#include "registered_pinned_memory.h"
 #include "client_buffer.h"
 #include "replica_selection.h"
 #include "common.h"
@@ -50,6 +51,46 @@ DEFINE_int32(http_port, 9300,
 namespace mooncake {
 namespace {
 constexpr std::chrono::seconds kIpcRequestRecvTimeout{5};
+
+bool IsHostStoreSegmentProtocol(const std::string &protocol) {
+    return protocol.empty() || protocol == "tcp" || protocol == "rdma" ||
+           protocol == "efa" || protocol == "cxi" || protocol == "rpc_only";
+}
+
+std::shared_ptr<RegisteredPinnedRegion> TryPinStoreSegment(
+    void *ptr, size_t size, const std::string &protocol,
+    const char *segment_owner) {
+    if (!IsHostStoreSegmentProtocol(protocol)) return nullptr;
+    return RegisteredPinnedMemoryManager::instance().try_pin(
+        ptr, size,
+        std::string("Store segment ") + segment_owner +
+            " protocol=" + protocol);
+}
+
+bool ReleasePinnedRegionForFree(
+    std::shared_ptr<RegisteredPinnedRegion> &pinned_region,
+    const char *segment_owner) {
+    if (!pinned_region) return true;
+    const bool safe_to_free = pinned_region->release();
+    pinned_region.reset();
+    if (!safe_to_free) {
+        LOG(ERROR) << "Leaking " << segment_owner
+                   << " backing memory because cudaHostUnregister failed";
+    }
+    return safe_to_free;
+}
+
+bool ReleasePinnedRegionsForFree(
+    std::vector<std::shared_ptr<RegisteredPinnedRegion>> &pinned_regions,
+    const char *segment_owner) {
+    bool safe_to_free = true;
+    for (auto &pinned_region : pinned_regions) {
+        safe_to_free &=
+            ReleasePinnedRegionForFree(pinned_region, segment_owner);
+    }
+    pinned_regions.clear();
+    return safe_to_free;
+}
 
 #ifdef USE_ASCEND_DIRECT
 bool checkAcl(aclError result, const char *message) {
@@ -274,6 +315,18 @@ inline tl::expected<void, ErrorCode> scatter_host_to_maybe_device(
         device::GetAcceleratorRegistry().RuntimeAccelerators();
     if (!runtime_accelerator.CopyFromHost(dst, src, size)) {
         LOG(ERROR) << "H2D copy failed: " << context;
+        return tl::unexpected(ErrorCode::TRANSFER_FAIL);
+    }
+    return {};
+}
+
+// Gather memory that may be GPU or host into a host destination.
+inline tl::expected<void, ErrorCode> gather_maybe_device_to_host(
+    void *dst, const void *src, size_t size, const std::string &context) {
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
+    if (!runtime_accelerator.CopyToHost(dst, src, size)) {
+        LOG(ERROR) << "D2H copy failed: " << context;
         return tl::unexpected(ErrorCode::TRANSFER_FAIL);
     }
     return {};
@@ -857,12 +910,22 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 }
             }
 
+            auto pinned_region =
+                TryPinStoreSegment(ptr, mapped_size, this->protocol, "setup");
             auto mount_result =
                 client_->MountSegment(ptr, mapped_size, protocol, seg_location);
             if (!mount_result.has_value()) {
+                if (!ReleasePinnedRegionForFree(pinned_region,
+                                                "Store setup segment")) {
+                    setup_segment_memory_must_leak_ = true;
+                }
                 LOG(ERROR) << "Failed to mount segment: "
                            << toString(mount_result.error());
                 return tl::unexpected(mount_result.error());
+            }
+            if (pinned_region) {
+                setup_segment_pinned_regions_.push_back(
+                    std::move(pinned_region));
             }
         }
         if (total_glbseg_size == 0) {
@@ -1175,12 +1238,19 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     ReleaseAllAllocatedSegmentRecords();
     client_buffer_allocator_.reset();
     port_binder_.reset();
+    const bool setup_segments_safe_to_free = ReleasePinnedRegionsForFree(
+        setup_segment_pinned_regions_, "Store setup segment");
+    if (!setup_segments_safe_to_free || setup_segment_memory_must_leak_) {
+        for (auto &ptr : hugepage_segment_ptrs_) ptr.release();
+        for (auto &ptr : segment_ptrs_) ptr.release();
+        setup_segment_memory_must_leak_ = false;
+    }
     hugepage_segment_ptrs_.clear();
+    segment_ptrs_.clear();
     ub_segment_ptrs_.clear();
 #if defined(USE_SUNRISE)
     sunrise_segment_ptrs_.clear();
 #endif
-    segment_ptrs_.clear();
     local_hostname = "";
     device_name = "";
     protocol = "";
@@ -1355,6 +1425,13 @@ void RealClient::ReleaseAllMountedSegmentRecords() {
     }
 }
 
+void RealClient::FreeAllocatedStoreSegment(AllocatedSegmentRecord &record) {
+    if (record.base && ReleasePinnedRegionForFree(record.pinned_region,
+                                                  "allocated Store segment")) {
+        free_memory(record.protocol, record.base);
+    }
+}
+
 void RealClient::ReleaseAllocatedSegmentRecord(const std::string &segment_id) {
     AllocatedSegmentRecord record;
     bool found = false;
@@ -1368,7 +1445,7 @@ void RealClient::ReleaseAllocatedSegmentRecord(const std::string &segment_id) {
         }
     }
     if (found && record.base) {
-        free_memory(record.protocol, record.base);
+        FreeAllocatedStoreSegment(record);
     }
 }
 
@@ -1379,9 +1456,7 @@ void RealClient::ReleaseAllAllocatedSegmentRecords() {
         records.swap(allocated_segment_records_);
     }
     for (auto &entry : records) {
-        if (entry.second.base) {
-            free_memory(entry.second.protocol, entry.second.base);
-        }
+        FreeAllocatedStoreSegment(entry.second);
     }
 }
 
@@ -1521,17 +1596,23 @@ int RealClient::allocateAndMountSegment(
             break;
         }
 
+        auto pinned_region =
+            TryPinStoreSegment(ptr, chunk_size, protocol, "allocated");
         auto result =
             client_->MountSegmentAndGetId(ptr, chunk_size, protocol, location);
         if (!result.has_value()) {
             LOG(ERROR) << "MountSegmentAndGetId failed";
-            free_memory(protocol, ptr);
+            if (ReleasePinnedRegionForFree(pinned_region,
+                                           "allocated Store segment")) {
+                free_memory(protocol, ptr);
+            }
             break;
         }
 
         std::string segment_id = UuidToString(result.value());
         mounted_ids.push_back(segment_id);
-        allocated_records.push_back({ptr, chunk_size, protocol});
+        allocated_records.push_back(
+            {ptr, chunk_size, protocol, std::move(pinned_region)});
 
         remaining -= chunk_size;
     }
@@ -1543,8 +1624,7 @@ int RealClient::allocateAndMountSegment(
                 client_->UnmountSegmentById(id);
             }
             if (allocated_records[i].base) {
-                free_memory(allocated_records[i].protocol,
-                            allocated_records[i].base);
+                FreeAllocatedStoreSegment(allocated_records[i]);
             }
         }
         out_segment_ids.clear();
@@ -1630,9 +1710,7 @@ int RealClient::unmountAndFreeSegment(
     }
 
     for (auto &p : to_cleanup) {
-        if (p.second.base) {
-            free_memory(p.second.protocol, p.second.base);
-        }
+        FreeAllocatedStoreSegment(p.second);
     }
 
     return first_error;
@@ -1758,7 +1836,7 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto &buffer_handle = *alloc_result;
-    auto scatter_result = scatter_host_to_maybe_device(
+    auto scatter_result = gather_maybe_device_to_host(
         buffer_handle.ptr(), value.data(), value.size_bytes(), "put:" + key);
     if (!scatter_result) {
         return tl::unexpected(scatter_result.error());
@@ -1840,9 +1918,9 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
         auto &buffer_handle = *alloc_result;
-        auto scatter_result = scatter_host_to_maybe_device(
-            buffer_handle.ptr(), value.data(), value.size_bytes(),
-            "put_batch:" + key);
+        auto scatter_result =
+            gather_maybe_device_to_host(buffer_handle.ptr(), value.data(),
+                                        value.size_bytes(), "put_batch:" + key);
         if (!scatter_result) {
             return tl::unexpected(scatter_result.error());
         }
@@ -1949,7 +2027,7 @@ tl::expected<void, ErrorCode> RealClient::put_parts_internal(
     // Copy all parts into the contiguous buffer
     size_t offset = 0;
     for (const auto &value : values) {
-        auto scatter_result = scatter_host_to_maybe_device(
+        auto scatter_result = gather_maybe_device_to_host(
             static_cast<char *>(buffer_handle.ptr()) + offset, value.data(),
             value.size_bytes(), "put_multi_value");
         if (!scatter_result) {
@@ -3267,9 +3345,42 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             return static_cast<int64_t>(total_size);
         }
 
+        auto runtime_accelerator =
+            device::GetAcceleratorRegistry().RuntimeAccelerators();
+        void *dst = static_cast<char *>(buffer) + dst_offset;
+        if (runtime_accelerator.FindDeviceForPointer(dst)) {
+            if (!client_buffer_allocator_) {
+                LOG(ERROR) << "Client buffer allocator is not provided";
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            auto alloc_result = client_buffer_allocator_->allocate(total_size);
+            if (!alloc_result) {
+                LOG(ERROR) << "Failed to allocate temp buffer for GPU memory "
+                           << "read, key: " << key << ", size: " << total_size;
+                return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+            }
+            BufferHandle tmp_handle(std::move(*alloc_result));
+            std::vector<mooncake::Slice> tmp_slices;
+            allocateSlices(tmp_slices, replica, tmp_handle.ptr());
+
+            auto filtered_qr = FilterQueryResult(query_result, replica);
+            auto get_result = client_->Get(key, filtered_qr, tmp_slices);
+            if (!get_result) {
+                LOG(ERROR) << "Get failed for key: " << key
+                           << " with error: " << toString(get_result.error());
+                return tl::unexpected(get_result.error());
+            }
+            if (auto r = scatter_host_to_maybe_device(
+                    dst, tmp_handle.ptr(), total_size,
+                    "MEMORY full read, key: " + key);
+                !r) {
+                return tl::unexpected(r.error());
+            }
+            return static_cast<int64_t>(total_size);
+        }
+
         std::vector<mooncake::Slice> slices;
-        allocateSlices(slices, replica,
-                       static_cast<char *>(buffer) + dst_offset);
+        allocateSlices(slices, replica, dst);
 
         auto filtered_qr = FilterQueryResult(query_result, replica);
         auto get_result = client_->Get(key, filtered_qr, slices);
@@ -3353,8 +3464,39 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         return tl::unexpected(ErrorCode::INVALID_REPLICA);
     }
 
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
+    void *dst = static_cast<char *>(buffer) + dst_offset;
+    if (runtime_accelerator.FindDeviceForPointer(dst)) {
+        if (!client_buffer_allocator_) {
+            LOG(ERROR) << "Client buffer allocator is not provided";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        auto alloc_result = client_buffer_allocator_->allocate(size);
+        if (!alloc_result) {
+            LOG(ERROR) << "Failed to allocate temp buffer for GPU ranged "
+                       << "read, key: " << key << ", size: " << size;
+            return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+        BufferHandle tmp_handle(std::move(*alloc_result));
+        std::vector<Slice> tmp_slices;
+        tmp_slices.emplace_back(Slice{tmp_handle.ptr(), size});
+
+        auto get_result =
+            client_->Get(key, query_result, tmp_slices, src_offset);
+        if (!get_result) {
+            return tl::unexpected(get_result.error());
+        }
+        if (auto r = scatter_host_to_maybe_device(
+                dst, tmp_handle.ptr(), size, "MEMORY ranged read, key: " + key);
+            !r) {
+            return tl::unexpected(r.error());
+        }
+        return static_cast<int64_t>(size);
+    }
+
     std::vector<Slice> slices;
-    slices.emplace_back(Slice{static_cast<char *>(buffer) + dst_offset, size});
+    slices.emplace_back(Slice{dst, size});
 
     auto get_result = client_->Get(key, query_result, slices, src_offset);
     if (!get_result) {
@@ -3789,7 +3931,7 @@ tl::expected<void, ErrorCode> RealClient::upsert_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto &buffer_handle = *alloc_result;
-    auto scatter_result = scatter_host_to_maybe_device(
+    auto scatter_result = gather_maybe_device_to_host(
         buffer_handle.ptr(), value.data(), value.size_bytes(), "upsert:" + key);
     if (!scatter_result) {
         return tl::unexpected(scatter_result.error());
@@ -4025,7 +4167,7 @@ tl::expected<void, ErrorCode> RealClient::upsert_parts_internal(
     auto &buffer_handle = *alloc_result;
     size_t offset = 0;
     for (const auto &value : values) {
-        auto scatter_result = scatter_host_to_maybe_device(
+        auto scatter_result = gather_maybe_device_to_host(
             static_cast<char *>(buffer_handle.ptr()) + offset, value.data(),
             value.size_bytes(), "upsert_parts:" + key);
         if (!scatter_result) {
@@ -4113,7 +4255,7 @@ tl::expected<void, ErrorCode> RealClient::upsert_batch_internal(
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
         auto &buffer_handle = *alloc_result;
-        auto scatter_result = scatter_host_to_maybe_device(
+        auto scatter_result = gather_maybe_device_to_host(
             buffer_handle.ptr(), value.data(), value.size_bytes(),
             "upsert_batch:" + key);
         if (!scatter_result) {
@@ -5582,10 +5724,10 @@ RealClient::batch_get_into_offload_object_internal(
     std::vector<std::string> keys;
     std::vector<std::string> storage_keys;
     std::vector<int64_t> sizes;
+    const TenantId tenant_id(client_->tenant_id());
     for (const auto &object_it : objects) {
         keys.emplace_back(object_it.first);
-        storage_keys.emplace_back(
-            MakeTenantScopedStorageKey(client_->tenant_id(), object_it.first));
+        storage_keys.emplace_back(tenant_id.MakeScopedKey(object_it.first));
         int64_t total = 0;
         for (const auto &s : object_it.second) total += s.size;
         sizes.emplace_back(total);

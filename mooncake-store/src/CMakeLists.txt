@@ -27,6 +27,7 @@ set(MOONCAKE_STORE_SOURCES
     client_buffer.cpp
     aligned_client_buffer.cpp
     real_client.cpp
+    registered_pinned_memory.cpp
     dummy_client.cpp
     uds_transport.cpp
     shm_helper.cpp
@@ -260,6 +261,7 @@ if(USE_NOF)
       crypto
       aio
       z
+      isal
       elf
       ibverbs
       rdmacm
