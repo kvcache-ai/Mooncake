@@ -287,8 +287,8 @@ ErrorCode CentralizedClientService::Init(
     StartHttpServer();
 
     if (!runtime_config_store_->loadFromJson(config.runtime_config_json)) {
-        LOG(WARNING) << "runtime config validation failed during startup, "
-                     << "using defaults for invalid fields";
+        LOG(ERROR) << "runtime config validation failed during startup, "
+                   << "init aborted";
         return ErrorCode::INVALID_PARAMS;
     }
 

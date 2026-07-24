@@ -263,6 +263,7 @@ TEST_F(HAIntegrationTest, RemotePutAndGet) {
     // Put with remote_weight=1 (force remote): master routes to client2
     WriteRouteRequestConfig config;
     config.remote_weight = 1.0;
+    config.local_write_waterline = 0.0;
 
     auto put = PutData(client1_, "a1_client1_remote_baseline", "hello", config);
     ASSERT_TRUE(put.has_value())

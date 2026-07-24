@@ -234,12 +234,22 @@ TEST_F(RuntimeConfigTest, UpdateP2PWriteConfigLocalWriteWaterline) {
 TEST_F(RuntimeConfigTest, ValidateWriteConfigRejectsContradiction) {
     // Use a fresh store to avoid interference from other tests.
     RuntimeConfigStore store(DeploymentMode::P2P);
-    // waterline=0 + remote_weight=0 is contradictory -> updateWriteConfig
-    // returns false and the config remains unchanged.
-    Json::Value patch;
-    patch["remote_weight"] = 0.0;
-    patch["local_write_waterline"] = 0.0;
-    EXPECT_FALSE(store.updateWriteConfig(patch));
+    // Contradiction 1: waterline=0 (forbid local write) + remote_weight=0
+    // (forbid remote routing) -> dead end.
+    {
+        Json::Value patch;
+        patch["remote_weight"] = 0.0;
+        patch["local_write_waterline"] = 0.0;
+        EXPECT_FALSE(store.updateWriteConfig(patch));
+    }
+    // Contradiction 2: waterline=1 (forbid remote write) + remote_weight=1
+    // (forbid local routing) -> dead end (defensive).
+    {
+        Json::Value patch;
+        patch["remote_weight"] = 1.0;
+        patch["local_write_waterline"] = 1.0;
+        EXPECT_FALSE(store.updateWriteConfig(patch));
+    }
     const auto& cfg =
         std::get<WriteRouteRequestConfig>(store.getDefaultWriteConfig());
     EXPECT_DOUBLE_EQ(cfg.remote_weight, 0.5);
@@ -247,7 +257,7 @@ TEST_F(RuntimeConfigTest, ValidateWriteConfigRejectsContradiction) {
 }
 
 TEST_F(RuntimeConfigTest, ValidateWriteConfigAllowsValidCombos) {
-    // waterline=0 + remote_weight=0.5 -> OK
+    // waterline=0 + remote_weight=0.5 -> OK (waterline disabled)
     Json::Value patch;
     patch["remote_weight"] = 0.5;
     patch["local_write_waterline"] = 0.0;
@@ -266,6 +276,28 @@ TEST_F(RuntimeConfigTest, ValidateWriteConfigAllowsValidCombos) {
         std::get<WriteRouteRequestConfig>(p2p_store().getDefaultWriteConfig());
     EXPECT_DOUBLE_EQ(cfg2.remote_weight, 0.0);
     EXPECT_DOUBLE_EQ(cfg2.local_write_waterline, 0.8);
+
+    // waterline=0 + remote_weight=1 -> OK (forbid local write + forbid local
+    // route = force remote from both sides)
+    Json::Value patch3;
+    patch3["remote_weight"] = 1.0;
+    patch3["local_write_waterline"] = 0.0;
+    EXPECT_TRUE(p2p_store().updateWriteConfig(patch3));
+    const auto& cfg3 =
+        std::get<WriteRouteRequestConfig>(p2p_store().getDefaultWriteConfig());
+    EXPECT_DOUBLE_EQ(cfg3.remote_weight, 1.0);
+    EXPECT_DOUBLE_EQ(cfg3.local_write_waterline, 0.0);
+
+    // waterline=1 + remote_weight=0 -> OK (forbid remote write + forbid
+    // remote route = force local from both sides)
+    Json::Value patch4;
+    patch4["remote_weight"] = 0.0;
+    patch4["local_write_waterline"] = 1.0;
+    EXPECT_TRUE(p2p_store().updateWriteConfig(patch4));
+    const auto& cfg4 =
+        std::get<WriteRouteRequestConfig>(p2p_store().getDefaultWriteConfig());
+    EXPECT_DOUBLE_EQ(cfg4.remote_weight, 0.0);
+    EXPECT_DOUBLE_EQ(cfg4.local_write_waterline, 1.0);
 }
 
 TEST_F(RuntimeConfigTest, UpdateP2PWriteConfigStrategy) {
@@ -712,11 +744,11 @@ TEST_F(RuntimeConfigTest, HttpUpdateWriteConfigRejectsInvalid) {
 
 TEST_F(RuntimeConfigTest, HttpSetRejectsInvalid) {
     // Default waterline=0.5, so setting remote_weight=0 alone is valid.
-    // Then setting waterline=0 while remote_weight=0 is contradictory -> 400.
-    // First ensure waterline is 0.5 (already the default, but be explicit).
-    HttpPost(Url("/config/set", "section=write&key=local_write_waterline"),
-             "0.5");
-    // remote_weight=0 is valid because waterline=0.5 > 0.
+    // Then setting waterline=0 while remote_weight=0 is contradictory
+    // (forbid local write + forbid remote route = dead end) -> 400.
+    // First ensure remote_weight is 0.5 (already the default, but be explicit).
+    HttpPost(Url("/config/set", "section=write&key=remote_weight"), "0.5");
+    // remote_weight=0 is valid because waterline=0.5 > 0 (not an extreme).
     auto ok =
         HttpPost(Url("/config/set", "section=write&key=remote_weight"), "0.0");
     EXPECT_EQ(ok.status, 200);

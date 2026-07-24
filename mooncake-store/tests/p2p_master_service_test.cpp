@@ -568,7 +568,8 @@ TEST_F(P2PMasterServiceTest, GetWriteRouteLocalOnlyFallbackNoClient) {
     EXPECT_EQ(ErrorCode::NO_AVAILABLE_CANDIDATE, res.error());
 }
 
-// Invalid config (waterline=0 + remote_weight=0) is rejected at entry.
+// Invalid config (waterline=0 + remote_weight=0, a dead-end combo) is
+// rejected at entry.
 TEST_F(P2PMasterServiceTest, GetWriteRouteInvalidConfig) {
     auto service = CreateService();
     auto seg = MakeP2PSegment("seg1", kDefaultSegmentSize, {}, 1);
@@ -580,7 +581,27 @@ TEST_F(P2PMasterServiceTest, GetWriteRouteInvalidConfig) {
     req.client_id = client_id;
     req.size = 1024;
     req.config.remote_weight = 0.0;
-    req.config.local_write_waterline = 0.0;  // contradictory
+    req.config.local_write_waterline = 0.0;  // contradictory: dead end
+
+    auto res = service->GetWriteRoute(req);
+    EXPECT_FALSE(res.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, res.error());
+}
+
+// Invalid config (waterline=1 + remote_weight=1, a dead-end combo) is
+// also rejected at entry.
+TEST_F(P2PMasterServiceTest, GetWriteRouteInvalidConfigSecondContradiction) {
+    auto service = CreateService();
+    auto seg = MakeP2PSegment("seg1", kDefaultSegmentSize, {}, 1);
+    auto client_id = generate_uuid();
+    RegisterP2PClient(*service, client_id, {seg}, "10.0.0.1", 50051);
+
+    WriteRouteRequest req;
+    req.key = "k";
+    req.client_id = client_id;
+    req.size = 1024;
+    req.config.remote_weight = 1.0;
+    req.config.local_write_waterline = 1.0;  // contradictory: dead end
 
     auto res = service->GetWriteRoute(req);
     EXPECT_FALSE(res.has_value());

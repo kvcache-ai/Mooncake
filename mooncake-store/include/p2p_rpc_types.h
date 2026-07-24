@@ -45,10 +45,21 @@ struct WriteRouteRequestConfig {
     int priority_limit = 0;
 
     bool IsValid() const {
-        // contradictory:
-        // waterline=0 means "never write locally",
-        // remote_weight=0 means "master only returns local route".
-        return !(local_write_waterline <= 0.0 && remote_weight <= 0.0);
+        // waterline extremes:
+        //   <= 0  -> local-write bypass disabled (forbid local write)
+        //   >= 1  -> always bypass to local when free (forbid remote write)
+        // remote_weight extremes:
+        //   <= 0  -> master only returns local routes (forbid remote routing)
+        //   >= 1  -> master only returns remote routes (forbid local routing)
+        // Two combinations are contradictory (dead end):
+        //   forbid local write  + forbid remote routing
+        //   forbid remote write + forbid local routing (defensive)
+        const bool no_local_write = (local_write_waterline <= 0.0);
+        const bool no_remote_write = (local_write_waterline >= 1.0);
+        const bool no_remote_route = (remote_weight <= 0.0);
+        const bool no_local_route = (remote_weight >= 1.0);
+        return !(no_local_write && no_remote_route) &&
+               !(no_remote_write && no_local_route);
     }
 };
 YLT_REFL(WriteRouteRequestConfig, max_candidates, strategy, remote_weight,

@@ -198,6 +198,7 @@ TEST_F(P2PClientIntegrationTest, ForceLocalWriteBypass) {
         const std::string key = "force_remote_key";
         WriteRouteRequestConfig cfg;
         cfg.remote_weight = 1.0;
+        cfg.local_write_waterline = 0.0;  // disable waterline for force-remote
 
         std::vector<Slice> slices;
         slices.emplace_back(Slice{const_cast<char*>(data.data()), data.size()});
@@ -218,6 +219,53 @@ TEST_F(P2PClientIntegrationTest, ForceLocalWriteBypass) {
         EXPECT_FALSE(get2.has_value())
             << "Force-remote data should not be on client_ locally";
     }
+}
+
+// When local utilization is below the waterline, the client writes locally
+// without asking the master — even with a balanced remote_weight.
+TEST_F(P2PClientIntegrationTest, WaterlineBypassWritesLocal) {
+    const std::string data = "waterline_payload";
+
+    // Local client is nearly empty (64MB DRAM, ~0% utilization).
+    // With waterline=0.5 and remote_weight=0.5 (balanced), the waterline
+    // triggers a local write: data stays on client_, not on client2_.
+    const std::string key = "waterline_bypass_key";
+    WriteRouteRequestConfig cfg;
+    cfg.remote_weight = 0.5;            // balanced
+    cfg.local_write_waterline = 0.5;    // local is < 50% full -> local write
+
+    std::vector<Slice> slices;
+    slices.emplace_back(Slice{const_cast<char*>(data.data()), data.size()});
+    auto put = client_->Put(key, slices, cfg);
+    ASSERT_TRUE(put.has_value())
+        << "Waterline-bypass Put failed: " << static_cast<int>(put.error());
+
+    // Readable on local client.
+    std::vector<char> buf(data.size(), 0);
+    auto get = client_->Get(key, {(void*)buf.data()}, {buf.size()});
+    ASSERT_TRUE(get.has_value());
+    EXPECT_EQ(std::string(buf.data(), buf.size()), data);
+
+    // NOT readable on remote client (data stayed local).
+    std::vector<char> buf2(data.size(), 0);
+    auto get2 = client2_->Get(key, {(void*)buf2.data()}, {buf2.size()});
+    EXPECT_FALSE(get2.has_value())
+        << "Waterline-bypass data should not be on client2_";
+}
+
+// Contradictory config (waterline=0 + remote_weight=0, a dead-end combo)
+// is rejected by BatchPut at the client side.
+TEST_F(P2PClientIntegrationTest, ContradictoryConfigRejected) {
+    const std::string data = "contradictory_payload";
+    WriteRouteRequestConfig cfg;
+    cfg.remote_weight = 0.0;
+    cfg.local_write_waterline = 0.0;  // dead end: forbid local write + forbid remote route
+
+    std::vector<Slice> slices;
+    slices.emplace_back(Slice{const_cast<char*>(data.data()), data.size()});
+    auto put = client_->Put("contradictory_key", slices, cfg);
+    ASSERT_FALSE(put.has_value());
+    EXPECT_EQ(put.error(), ErrorCode::INVALID_PARAMS);
 }
 
 // ============================================================================
@@ -406,6 +454,7 @@ TEST_F(P2PClientIntegrationTest, RemoteBatchPutAndBatchGet) {
         // execute remote Put RPCs.
         WriteRouteRequestConfig remote_put_config;
         remote_put_config.remote_weight = 1.0;  // force remote
+        remote_put_config.local_write_waterline = 0.0;
         remote_put_config.max_candidates =
             WriteRouteRequestConfig::RETURN_ALL_CANDIDATES;
         auto put_results =
@@ -830,6 +879,7 @@ TEST_F(P2PClientIntegrationTest, ForwardRemotePutAndGet) {
 
         WriteRouteRequestConfig route;
         route.remote_weight = 1.0;  // force remote
+        route.local_write_waterline = 0.0;
         route.max_candidates = WriteRouteRequestConfig::RETURN_ALL_CANDIDATES;
 
         std::vector<Slice> slices;
@@ -896,6 +946,7 @@ TEST_F(P2PClientIntegrationTest, ForwardRemoteBatchPutAndBatchGet) {
 
         WriteRouteRequestConfig remote_put_config;
         remote_put_config.remote_weight = 1.0;  // force remote
+        remote_put_config.local_write_waterline = 0.0;
         remote_put_config.max_candidates =
             WriteRouteRequestConfig::RETURN_ALL_CANDIDATES;
 

@@ -299,8 +299,8 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
     ha_manager_->SetReadyForRecovery();
 
     if (!runtime_config_store_->loadFromJson(config.runtime_config_json)) {
-        LOG(WARNING) << "runtime config validation failed during startup, "
-                     << "using defaults for invalid fields";
+        LOG(ERROR) << "runtime config validation failed during startup, "
+                   << "init aborted";
         return ErrorCode::INTERNAL_ERROR;
     }
 
@@ -752,8 +752,10 @@ std::vector<tl::expected<void, ErrorCode>> P2PClientService::BatchPut(
 }
 
 bool P2PClientService::IsLocalWrite(const WriteRouteRequestConfig& cfg) const {
-    return (ha_manager_ && ha_manager_->IsLocalService()) ||
-           cfg.remote_weight <= 0.0 || IsBelowLocalWaterline(cfg);
+    if (ha_manager_ && ha_manager_->IsLocalService()) return true;
+    if (cfg.remote_weight <= 0.0) return true;   // force local
+    if (cfg.remote_weight >= 1.0) return false;  // force remote
+    return IsBelowLocalWaterline(cfg);
 }
 
 bool P2PClientService::IsBelowLocalWaterline(
