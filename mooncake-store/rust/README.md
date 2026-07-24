@@ -5,7 +5,8 @@ for Mooncake Store.
 
 ## Backends (features)
 
-The crate has two mutually exclusive backends:
+The crate has two backends. Enable at least one; if both are enabled, `link`
+takes precedence:
 
 - **`link`** (default): statically links `libmooncake_store` at build time.
   `build.rs` generates the FFI with bindgen and links the C++ dependency graph,

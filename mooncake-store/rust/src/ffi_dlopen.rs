@@ -182,7 +182,11 @@ mooncake_api! {
     fn mooncake_store_unregister_buffer(store: mooncake_store_t, buffer: *mut c_void) -> c_int;
 }
 
-// Raw function pointers plus a `Library` (Send + Sync on supported platforms).
+// SAFETY: `Api` holds raw `extern "C" fn` pointers (which are `Send + Sync`)
+// and the owning `Library`, which is `Send + Sync` on the supported platforms.
+// The pointers stay valid because `_lib` is dropped last, and the underlying C
+// object is internally synchronized (see the `MooncakeStore` docs), so sharing
+// an `Api` across threads is sound.
 unsafe impl Send for Api {}
 unsafe impl Sync for Api {}
 
@@ -220,4 +224,19 @@ pub fn ensure_loaded() -> Result<(), StoreError> {
 fn api() -> &'static Api {
     API.get()
         .expect("Mooncake library not loaded; create a MooncakeStore first")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A missing library must surface StoreError::LibraryLoad. `Api::load` fails
+    // (and returns) before touching the global, so this needs no real .so and
+    // does not disturb other tests.
+    #[test]
+    fn load_library_missing_reports_library_load_error() {
+        let err = load_library("/nonexistent/does-not-exist/libmooncake_store.so")
+            .expect_err("loading a missing library must fail");
+        assert!(matches!(err, StoreError::LibraryLoad(_)), "got {err:?}");
+    }
 }
