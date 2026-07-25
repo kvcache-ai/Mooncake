@@ -171,6 +171,65 @@ class BatchEvictTest : public ::testing::Test {
             SetLease(service, Key(i), base + std::chrono::nanoseconds(i));
         }
     }
+    // Builds a population whose oldest `blocked_count` candidates belong to a
+    // group that also holds one member under an active lease. Those candidates
+    // pass the census — their own lease has expired — but cannot be evicted
+    // during execution, because a group is only evictable once every member's
+    // lease has expired. That is an execution-stage failure without any hook:
+    // it exercises the same recovery path as metadata churn between the census
+    // and the eviction pass.
+    struct BlockedGroupPopulation {
+        size_t blocked_count;
+        size_t keeper_index;
+        size_t plain_begin;
+        size_t plain_count;
+        size_t total_objects;
+    };
+
+    static BlockedGroupPopulation PopulateBlockedGroup(
+        MasterService& service, const UUID& client_id,
+        const std::string& group_id, size_t blocked_count,
+        size_t plain_count) {
+        const auto base = ExpiredBase();
+        const auto active_lease =
+            std::chrono::system_clock::now() + std::chrono::hours(1);
+
+        // Oldest leases: the blocked group members are always selected first.
+        for (size_t i = 0; i < blocked_count; ++i) {
+            PutObject(service, client_id, Key(i), /*with_soft_pin=*/false,
+                      group_id);
+            SetLease(service, Key(i), base + std::chrono::nanoseconds(i));
+        }
+
+        // The keeper shares the group but holds an active lease, so no member
+        // of the group can be evicted.
+        const size_t keeper_index = blocked_count;
+        PutObject(service, client_id, Key(keeper_index),
+                  /*with_soft_pin=*/false, group_id);
+        SetLease(service, Key(keeper_index), active_lease);
+
+        // Plain objects are strictly newer than every blocked member.
+        const size_t plain_begin = keeper_index + 1;
+        for (size_t i = 0; i < plain_count; ++i) {
+            const size_t index = plain_begin + i;
+            PutObject(service, client_id, Key(index));
+            SetLease(service, Key(index),
+                     base + std::chrono::nanoseconds(index));
+        }
+
+        return {blocked_count, keeper_index, plain_begin, plain_count,
+                plain_begin + plain_count};
+    }
+
+    static size_t CountAlive(MasterService& service, size_t begin, size_t end) {
+        size_t alive = 0;
+        for (size_t i = begin; i < end; ++i) {
+            if (Exists(service, Key(i))) {
+                ++alive;
+            }
+        }
+        return alive;
+    }
 };
 
 // Oldest-first: with distinct lease timestamps the evicted set must be exactly
@@ -338,5 +397,73 @@ TEST_F(BatchEvictTest, HighRatioEvictsExactOldestCount) {
     }
 }
 
-}  // namespace mooncake::test
+// Reserve: a small number of candidates that pass the census but fail during
+// execution is absorbed by the reserve slack, so the requested target is still
+// met exactly and no refill scan is needed.
+TEST_F(BatchEvictTest, ReserveAbsorbsExecutionFailuresAndMeetsTarget) {
+    constexpr size_t kBlockedCount = 12;
+    constexpr size_t kPlainCount = 1200;
+    // 1213 objects in total, ceil(1213 * 0.05) == 61.
+    constexpr size_t kExpectedEvicted = 61;
+    // The 61 oldest candidates are the 12 blocked members plus the 49 oldest
+    // plain objects, so those 49 are always among the evicted set. The
+    // remaining 12 evictions come from the reserve, whose internal order is
+    // unspecified, so only the total is asserted for them.
+    constexpr size_t kAlwaysEvictedPlain = 49;
 
+    MasterService service(MakeConfig(/*allow_soft_pin_eviction=*/false));
+    const UUID client_id = MountSegment(service);
+    const auto population = PopulateBlockedGroup(
+        service, client_id, "batch_evict_reserve_group", kBlockedCount,
+        kPlainCount);
+    ASSERT_EQ(service.GetKeyCount(), population.total_objects);
+
+    RunBatchEvict(service, /*target=*/0.05, /*lowerbound=*/0.05);
+
+    EXPECT_EQ(service.GetKeyCount(),
+              population.total_objects - kExpectedEvicted);
+    EXPECT_EQ(CountAlive(service, 0, kBlockedCount), kBlockedCount)
+        << "blocked group members must survive";
+    EXPECT_TRUE(Exists(service, Key(population.keeper_index)));
+    for (size_t i = 0; i < kAlwaysEvictedPlain; ++i) {
+        EXPECT_FALSE(Exists(service, Key(population.plain_begin + i)))
+            << "oldest plain object survived at offset=" << i;
+    }
+    EXPECT_EQ(CountAlive(service, population.plain_begin,
+                         population.total_objects),
+              kPlainCount - kExpectedEvicted);
+}
+
+// Refill: when every candidate inside the reserve frontier fails during
+// execution the reserve is exhausted, and the refill scan must recover the
+// remaining objects so the requested target is still met exactly.
+TEST_F(BatchEvictTest, RefillAfterReserveExhaustionStillMeetsTarget) {
+    // The reserve frontier spans target + max(1024, 10% of target), so more
+    // than 1024 blocked candidates are required to exhaust it.
+    constexpr size_t kBlockedCount = 1160;
+    constexpr size_t kPlainCount = 200;
+    // 1361 objects in total, ceil(1361 * 0.05) == 69.
+    constexpr size_t kExpectedEvicted = 69;
+
+    MasterService service(MakeConfig(/*allow_soft_pin_eviction=*/false));
+    const UUID client_id = MountSegment(service);
+    const auto population = PopulateBlockedGroup(
+        service, client_id, "batch_evict_refill_group", kBlockedCount,
+        kPlainCount);
+    ASSERT_EQ(service.GetKeyCount(), population.total_objects);
+
+    RunBatchEvict(service, /*target=*/0.05, /*lowerbound=*/0.05);
+
+    // Exact target attainment is the property refill exists to protect: the
+    // whole frontier yielded nothing, so every eviction came from the refill.
+    EXPECT_EQ(service.GetKeyCount(),
+              population.total_objects - kExpectedEvicted);
+    EXPECT_EQ(CountAlive(service, 0, kBlockedCount), kBlockedCount)
+        << "blocked group members must survive";
+    EXPECT_TRUE(Exists(service, Key(population.keeper_index)));
+    EXPECT_EQ(CountAlive(service, population.plain_begin,
+                         population.total_objects),
+              kPlainCount - kExpectedEvicted);
+}
+
+}  // namespace mooncake::test
