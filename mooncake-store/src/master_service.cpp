@@ -6575,13 +6575,31 @@ void MasterService::BatchEvict(double evict_ratio_target,
     size_t start_idx = RandomIndex(kNumShards);
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
 
-    // ===== Phase 1: Parallel candidate collection =====
-    // N threads each scan a batch of shards, collecting Candidates with
-    // shard_idx + tenant_id + key for safe re-lookup in Phase 2.
+    // ===== Phase 1: Parallel candidate census =====
+    // N threads each scan a batch of shards. For selective ratios only the
+    // lease timestamps are collected here; full tenant/key identities are
+    // materialized afterwards for a bounded frontier around the eviction
+    // cutoff. High ratios collect full Candidates directly, because a census
+    // followed by a second scan would cost more than the identities it saves.
     int num_threads = std::min((int)kNumShards, 16);
     size_t shards_per_thread = (kNumShards + num_threads - 1) / num_threads;
 
+    constexpr size_t kMinReserveSlack = 1024;
+    constexpr size_t kMinFrontierLimit = 64 * 1024;
+    constexpr size_t kReserveSlackDivisor = 10;
+    constexpr size_t kFrontierDivisor = 4;
+    // Above this target ratio the reserve frontier would already cover a
+    // large share of the population, so selective materialization stops
+    // paying for the extra scan it costs.
+    constexpr double kCompactPrebypassTargetRatio =
+        static_cast<double>(kReserveSlackDivisor) /
+        static_cast<double>(kFrontierDivisor * (kReserveSlackDivisor + 1));
+    const bool compact_frontier_prebypass =
+        evict_ratio_target >= kCompactPrebypassTargetRatio;
+
     std::vector<std::vector<Candidate>> local_candidates(num_threads);
+    std::vector<std::vector<std::chrono::system_clock::time_point>>
+        local_no_pin(num_threads);
     std::vector<long> local_eviction_base(num_threads, 0);
     std::vector<long> local_object_count(num_threads, 0);
     std::vector<std::vector<std::chrono::system_clock::time_point>>
@@ -6608,9 +6626,14 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         if (!it->second.IsLeaseExpired(now) || !has_evictable)
                             continue;
                         if (!it->second.IsSoftPinned(now)) {
-                            local_candidates[t].push_back(
-                                {s, tenant_id, it->first,
-                                 it->second.lease_timeout});
+                            if (compact_frontier_prebypass) {
+                                local_candidates[t].push_back(
+                                    {s, tenant_id, it->first,
+                                     it->second.lease_timeout});
+                            } else {
+                                local_no_pin[t].push_back(
+                                    it->second.lease_timeout);
+                            }
                         } else if (allow_evict_soft_pinned_objects_) {
                             local_soft_pin[t].push_back(
                                 it->second.lease_timeout);
@@ -6632,14 +6655,27 @@ void MasterService::BatchEvict(double evict_ratio_target,
     for (auto v : local_object_count) object_count += v;
 
     std::vector<Candidate> candidates;
-    {
+    if (compact_frontier_prebypass) {
         size_t total = 0;
         for (auto& v : local_candidates) total += v.size();
         candidates.reserve(total);
+        for (auto& v : local_candidates) {
+            candidates.insert(candidates.end(),
+                              std::make_move_iterator(v.begin()),
+                              std::make_move_iterator(v.end()));
+        }
     }
-    for (auto& v : local_candidates) {
-        candidates.insert(candidates.end(), std::make_move_iterator(v.begin()),
-                          std::make_move_iterator(v.end()));
+
+    std::vector<std::chrono::system_clock::time_point> no_pin_timeouts;
+    {
+        size_t total = 0;
+        for (auto& v : local_no_pin) total += v.size();
+        no_pin_timeouts.reserve(total);
+    }
+    for (auto& v : local_no_pin) {
+        no_pin_timeouts.insert(no_pin_timeouts.end(),
+                               std::make_move_iterator(v.begin()),
+                               std::make_move_iterator(v.end()));
     }
 
     std::vector<std::chrono::system_clock::time_point> soft_pin_objects;
@@ -6661,6 +6697,110 @@ void MasterService::BatchEvict(double evict_ratio_target,
         return;
     }
 
+    const long ideal_evict_num =
+        std::ceil(total_eviction_base * evict_ratio_target);
+    const size_t no_pin_count = compact_frontier_prebypass
+                                    ? candidates.size()
+                                    : no_pin_timeouts.size();
+    const long primary_no_pin_num =
+        std::min(ideal_evict_num, static_cast<long>(no_pin_count));
+
+    // Re-scan metadata and copy full identities only for objects inside the
+    // requested timestamp range. The eligibility conditions are identical to
+    // the census above, so the selected set matches what the census counted.
+    auto collect_candidates =
+        [&](bool use_cutoff, std::chrono::system_clock::time_point cutoff,
+            bool collect_older_or_equal) {
+            std::vector<std::vector<Candidate>> local_frontier(num_threads);
+            std::vector<std::thread> collectors;
+            collectors.reserve(num_threads);
+
+            for (int t = 0; t < num_threads; t++) {
+                collectors.emplace_back([&, t] {
+                    size_t s_start = t * shards_per_thread;
+                    size_t s_end =
+                        std::min(s_start + shards_per_thread, kNumShards);
+                    for (size_t s = s_start; s < s_end; s++) {
+                        MetadataShardAccessorRW shard(this, s);
+                        for (const auto& [tenant_id, tenant_state] :
+                             shard->tenants) {
+                            for (const auto& [key, metadata] :
+                                 tenant_state.metadata) {
+                                if (metadata.IsHardPinned() ||
+                                    !metadata.IsLeaseExpired(now) ||
+                                    metadata.IsSoftPinned(now) ||
+                                    !can_evict_replicas(metadata)) {
+                                    continue;
+                                }
+                                if (use_cutoff) {
+                                    const bool in_range =
+                                        collect_older_or_equal
+                                            ? metadata.lease_timeout <= cutoff
+                                            : metadata.lease_timeout > cutoff;
+                                    if (!in_range) continue;
+                                }
+                                local_frontier[t].push_back(
+                                    {s, tenant_id, key,
+                                     metadata.lease_timeout});
+                            }
+                        }
+                    }
+                });
+            }
+            for (auto& collector : collectors) collector.join();
+
+            size_t total = 0;
+            for (const auto& v : local_frontier) total += v.size();
+            std::vector<Candidate> merged;
+            merged.reserve(total);
+            for (auto& v : local_frontier) {
+                merged.insert(merged.end(), std::make_move_iterator(v.begin()),
+                              std::make_move_iterator(v.end()));
+            }
+            return merged;
+        };
+
+    bool compact_frontier_used = false;
+    std::chrono::system_clock::time_point reserve_cutoff{};
+
+    if (primary_no_pin_num > 0 && !compact_frontier_prebypass) {
+        const size_t primary_count = static_cast<size_t>(primary_no_pin_num);
+        // The reserve absorbs objects that stop being evictable between the
+        // census and the eviction pass, so ordinary churn does not require a
+        // second materialization pass.
+        const size_t reserve_slack = std::max(
+            kMinReserveSlack,
+            (primary_count + kReserveSlackDivisor - 1) / kReserveSlackDivisor);
+        const size_t reserve_count =
+            std::min(no_pin_count, primary_count + reserve_slack);
+        const size_t frontier_limit = std::max(
+            kMinFrontierLimit,
+            (no_pin_count + kFrontierDivisor - 1) / kFrontierDivisor);
+
+        if (reserve_count <= frontier_limit) {
+            std::nth_element(no_pin_timeouts.begin(),
+                             no_pin_timeouts.begin() + (reserve_count - 1),
+                             no_pin_timeouts.end());
+            reserve_cutoff = no_pin_timeouts[reserve_count - 1];
+            candidates = collect_candidates(/*use_cutoff=*/true, reserve_cutoff,
+                                            /*collect_older_or_equal=*/true);
+
+            // Shortfall guard: if churn left the frontier holding fewer
+            // objects than the target needs, fall back to the full candidate
+            // set so evict_num below still derives from the requested target
+            // rather than from a shrunken frontier.
+            if (candidates.size() >= primary_count) {
+                compact_frontier_used = true;
+            } else {
+                candidates =
+                    collect_candidates(/*use_cutoff=*/false, {},
+                                       /*collect_older_or_equal=*/true);
+            }
+        } else {
+            candidates = collect_candidates(/*use_cutoff=*/false, {},
+                                            /*collect_older_or_equal=*/true);
+        }
+    }
     // ===== Phase 2: Serial eviction via key lookup =====
     long evicted_count = 0;
     uint64_t total_freed_size = 0;
@@ -6669,8 +6809,6 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
     // First pass: evict candidates with no soft pin
     if (!candidates.empty()) {
-        long ideal_evict_num =
-            std::ceil(total_eviction_base * evict_ratio_target);
         long evict_num = std::min(ideal_evict_num, (long)candidates.size());
 
         std::nth_element(candidates.begin(),
@@ -6684,46 +6822,62 @@ void MasterService::BatchEvict(double evict_ratio_target,
         // continue trying the next one so actual evicted count reaches
         // evict_num. This matches the old per-shard over-eviction behavior.
         long evicted_this_pass = 0;
-        for (auto& c : candidates) {
-            if (evicted_this_pass >= evict_num &&
-                c.lease_timeout > target_timeout) {
-                no_pin_objects.push_back(c.lease_timeout);
-                continue;
-            }
-            {
-                MetadataShardAccessorRW shard(this, c.shard_idx);
-                auto tenant_it = shard->tenants.find(c.tenant_id);
-                if (tenant_it == shard->tenants.end()) continue;
-                auto& tenant_state = tenant_it->second;
-                auto it = tenant_state.metadata.find(c.key);
-                if (it == tenant_state.metadata.end()) continue;
-                // Re-validate: state may have changed since Phase 1
-                if (!it->second.IsLeaseExpired(now) ||
-                    it->second.IsSoftPinned(now) ||
-                    !can_evict_replicas(it->second)) {
+        auto evict_candidate_batch = [&](std::vector<Candidate>& batch) {
+            for (auto& c : batch) {
+                if (evicted_this_pass >= evict_num &&
+                    c.lease_timeout > target_timeout) {
                     no_pin_objects.push_back(c.lease_timeout);
                     continue;
                 }
-                auto evict_result = try_evict_group_or_object(
-                    c.tenant_id, c.key, it->second, shard, tenant_state,
-                    deferred_replicas,
-                    /*allow_soft_pinned=*/false);
-                total_freed_size += evict_result.freed_bytes;
-                if (!it->second.IsGrouped()) {
-                    PublishKvRemovedAfterEvict(c.key, evict_result.freed_bytes,
-                                               "cpu", it->second, c.tenant_id);
+                {
+                    MetadataShardAccessorRW shard(this, c.shard_idx);
+                    auto tenant_it = shard->tenants.find(c.tenant_id);
+                    if (tenant_it == shard->tenants.end()) continue;
+                    auto& tenant_state = tenant_it->second;
+                    auto it = tenant_state.metadata.find(c.key);
+                    if (it == tenant_state.metadata.end()) continue;
+                    // Re-validate: state may have changed since Phase 1
+                    if (!it->second.IsLeaseExpired(now) ||
+                        it->second.IsSoftPinned(now) ||
+                        !can_evict_replicas(it->second)) {
+                        no_pin_objects.push_back(c.lease_timeout);
+                        continue;
+                    }
+                    auto evict_result = try_evict_group_or_object(
+                        c.tenant_id, c.key, it->second, shard, tenant_state,
+                        deferred_replicas,
+                        /*allow_soft_pinned=*/false);
+                    total_freed_size += evict_result.freed_bytes;
+                    if (!it->second.IsGrouped()) {
+                        PublishKvRemovedAfterEvict(c.key, evict_result.freed_bytes,
+                                                   "cpu", it->second, c.tenant_id);
+                    }
+                    if (!it->second.IsValid()) {
+                        EraseMetadata(tenant_state, it, c.tenant_id,
+                                      QuotaEraseMode::kFull, &shard);
+                    }
+                    if (tenant_state.Empty()) {
+                        shard->tenants.erase(tenant_it);
+                    }
+                    evicted_count += evict_result.evicted_objects;
+                    evicted_this_pass += evict_result.evicted_objects;
                 }
-                if (!it->second.IsValid()) {
-                    EraseMetadata(tenant_state, it, c.tenant_id,
-                                  QuotaEraseMode::kFull, &shard);
-                }
-                if (tenant_state.Empty()) {
-                    shard->tenants.erase(tenant_it);
-                }
-                evicted_count += evict_result.evicted_objects;
-                evicted_this_pass += evict_result.evicted_objects;
+                deferred_replicas.clear();
             }
-            deferred_replicas.clear();
+        };
+
+        evict_candidate_batch(candidates);
+
+        // Metadata may change after the frontier is materialized. If the
+        // reserve is exhausted before the target is met, refill from the
+        // remainder of the current no-soft-pin population. This recovery
+        // scan is paid only on churn and preserves the behavior of
+        // continuing past the cutoff until evict_num is reached.
+        if (compact_frontier_used && evicted_this_pass < evict_num) {
+            auto refill_candidates = collect_candidates(
+                /*use_cutoff=*/true, reserve_cutoff,
+                /*collect_older_or_equal=*/false);
+            evict_candidate_batch(refill_candidates);
         }
     }
 
