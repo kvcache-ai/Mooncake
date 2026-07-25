@@ -72,6 +72,10 @@ class SnapshotChildProcessTest;
 // exposing test-only accessors on MasterService itself.
 class PromotionOnHitTest;
 class MasterServiceTenantQuotaTest;
+// Friended so the BatchEvict correctness tests can invoke the private
+// BatchEvict entry point and seed lease timestamps directly, instead of
+// relying on segment pressure plus the background eviction thread.
+class BatchEvictTest;
 }  // namespace test
 namespace benchmarks {
 class BatchEvictBench;
@@ -101,6 +105,7 @@ class MasterService {
     friend class test::PromotionOnHitTest;
     friend class benchmarks::BatchEvictBench;
     friend class test::MasterServiceTenantQuotaTest;
+    friend class test::BatchEvictTest;
     friend class MasterSnapshotManager;    // Allow access to internal state for
                                            // snapshot
     friend class ha::MasterSnapshotCodec;  // Allow codec to access private
