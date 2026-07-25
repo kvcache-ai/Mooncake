@@ -570,6 +570,20 @@ jobs:
         python mooncake-pg/tests/test_pg_collectives.py
       shell: bash
 
+    - name: Test PyTorch 2.13 Single-Buffer Collectives (CPU Only)
+      if: matrix.ubuntu-version == 'ubuntu-22.04' && matrix.python-version == '3.10'
+      env:
+        MC_FORCE_TCP: "true"
+      run: |
+        source test_env/bin/activate
+        python -m pip install --force-reinstall "torch==2.13.0" \
+          --index-url https://download.pytorch.org/whl/cu126 \
+          --extra-index-url https://pypi.org/simple
+        python mooncake-pg/tests/test_pg_collectives.py \
+          TestMooncakePGCollectivesCPU.test_all_gather_into_tensor \
+          TestMooncakePGCollectivesCPU.test_reduce_scatter_sum
+      shell: bash
+
     - name: Test Safetensor Functions
       run: |
         source test_env/bin/activate
