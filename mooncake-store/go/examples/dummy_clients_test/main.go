@@ -37,7 +37,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"math"
 	"os"
 	"os/exec"
 	"runtime"
@@ -70,15 +69,12 @@ var (
 	flagWorkers         = flag.Uint64("workers", 4, "Number of worker processes")
 	flagValueSize       = flag.Uint64("value-size", 4*1024*1024, "Size of each value in bytes")
 	flagNumKeys         = flag.Uint64("num-keys", 100, "Number of keys to write/read")
-	flagBatchSize       = flag.Uint64("batch-size", 32, "Batch size for operations")
 	flagIsWorker        = flag.Bool("worker", false, "Run as worker process")
 	flagWorkerID        = flag.Uint64("worker-id", 0, "Worker process ID")
-	flagPhase           = flag.String("phase", "write", "Phase: write/read/verify/all")
+	flagPhase           = flag.String("phase", "write", "Phase: write/read/all")
 	flagReplicaNum      = flag.Uint64("replica-num", 1, "Number of replicas for each object")
 	flagWaitSeconds     = flag.Uint64("wait-seconds", 5, "Seconds to wait between phases")
-	flagGlobalSize      = flag.Uint64("global-size", 512*1024*1024, "Global segment size in bytes")
 	flagLocalBufferSize = flag.Uint64("local-buffer-size", 128*1024*1024, "Local buffer size in bytes")
-	flagPutBufferSize   = flag.Uint64("put-buffer-size", 512*1024*1024, "Put buffer size in bytes")
 )
 
 func main() {
@@ -93,13 +89,17 @@ func main() {
 	// 如果是子进程，执行子进程逻辑
 	if *flagIsWorker {
 		log.Printf("[WORKER-%d] Starting worker process", *flagWorkerID)
-		runWorker(uint(*flagWorkerID))
+		if err := runWorker(uint(*flagWorkerID)); err != nil {
+			log.Fatalf("[WORKER-%d] Worker process failed: %v", *flagWorkerID, err)
+		}
 		log.Printf("[WORKER-%d] Worker process completed", *flagWorkerID)
 		return
 	}
 
 	// 主进程逻辑
-	runMaster()
+	if err := runMaster(); err != nil {
+		log.Fatalf("[MASTER] Benchmark failed: %v", err)
+	}
 }
 
 // validateConfig 验证配置参数的有效性
@@ -113,25 +113,18 @@ func validateConfig() error {
 	if *flagNumKeys == 0 {
 		return fmt.Errorf("num-keys must be > 0, got %d", *flagNumKeys)
 	}
-	if *flagBatchSize == 0 {
-		return fmt.Errorf("batch-size must be > 0, got %d", *flagBatchSize)
-	}
-	if *flagBatchSize > ^uint64(0) / *flagValueSize {
-		return fmt.Errorf("batch-size * value-size overflows uint64")
-	}
-	bufferSize := *flagBatchSize * *flagValueSize
 	maxInt := uint64(^uint(0) >> 1)
-	if bufferSize > maxInt {
-		return fmt.Errorf("required buffer size %d exceeds platform int range", bufferSize)
+	if *flagValueSize > maxInt {
+		return fmt.Errorf("value-size %d exceeds platform int range", *flagValueSize)
 	}
-	if *flagGlobalSize == 0 {
-		return fmt.Errorf("global-size must be > 0, got %d", *flagGlobalSize)
+	if *flagReplicaNum == 0 {
+		return fmt.Errorf("replica-num must be > 0, got %d", *flagReplicaNum)
+	}
+	if *flagReplicaNum > maxInt {
+		return fmt.Errorf("replica-num %d exceeds platform int range", *flagReplicaNum)
 	}
 	if *flagLocalBufferSize == 0 {
 		return fmt.Errorf("local-buffer-size must be > 0, got %d", *flagLocalBufferSize)
-	}
-	if *flagPutBufferSize == 0 {
-		return fmt.Errorf("put-buffer-size must be > 0, got %d", *flagPutBufferSize)
 	}
 	if *flagPhase != "write" && *flagPhase != "read" && *flagPhase != "all" {
 		return fmt.Errorf("invalid phase: %s (must be write/read/all)", *flagPhase)
@@ -140,13 +133,6 @@ func validateConfig() error {
 		return fmt.Errorf("invalid worker-id: %d (must be in [0, %d))", *flagWorkerID, *flagWorkers)
 	}
 	return nil
-}
-
-func requiredBufferSize() uint64 {
-	if *flagPhase == "read" {
-		return *flagBatchSize * *flagValueSize
-	}
-	return *flagValueSize
 }
 
 // calculateKeyRange 计算每个 worker 负责的键范围
@@ -166,7 +152,7 @@ func calculateKeyRange(workerID uint, totalWorkers, totalKeys uint64) (keyOffset
 	return keyOffset, keysPerWorker
 }
 
-func runMaster() {
+func runMaster() error {
 	log.Println("========================================")
 	log.Println("    Mooncake Multi-Process Benchmark    ")
 	log.Println("========================================")
@@ -174,18 +160,17 @@ func runMaster() {
 	log.Printf("[MASTER]   Workers:          %d", *flagWorkers)
 	log.Printf("[MASTER]   Value Size:       %d MB", *flagValueSize/(1024*1024))
 	log.Printf("[MASTER]   Num Keys:         %d", *flagNumKeys)
-	log.Printf("[MASTER]   Batch Size:       %d", *flagBatchSize)
 	log.Printf("[MASTER]   Replicas:         %d", *flagReplicaNum)
 	log.Printf("[MASTER]   Phase:            %s", *flagPhase)
 	log.Printf("[MASTER]   Wait Seconds:     %d", *flagWaitSeconds)
-	log.Printf("[MASTER]   Global Size:      %d MB", *flagGlobalSize/(1024*1024))
 	log.Printf("[MASTER]   Local Buffer:     %d MB", *flagLocalBufferSize/(1024*1024))
-	log.Printf("[MASTER]   Put Buffer:       %d MB", *flagPutBufferSize/(1024*1024))
 	log.Println("========================================")
 
 	if *flagPhase == "all" || *flagPhase == "write" {
 		log.Println("\n--- Phase 1: WRITE PHASE ---")
-		runPhase("write")
+		if err := runPhase("write"); err != nil {
+			return err
+		}
 		log.Println("--- Write phase completed ---")
 
 		if *flagWaitSeconds > 0 {
@@ -197,18 +182,27 @@ func runMaster() {
 	if *flagPhase == "all" || *flagPhase == "read" {
 		log.Println("\n--- Phase 2: READ PHASE ---")
 		log.Println("(with data verification)")
-		runPhase("read")
+		if err := runPhase("read"); err != nil {
+			return err
+		}
 		log.Println("--- Read phase completed ---")
 	}
 
 	log.Println("\n========================================")
 	log.Println("        Benchmark Completed             ")
 	log.Println("========================================")
+	return nil
 }
 
-func runPhase(phase string) {
-	var processes []*os.Process
+type workerCommand struct {
+	workerID uint64
+	cmd      *exec.Cmd
+}
+
+func runPhase(phase string) error {
+	var commands []workerCommand
 	startTime := time.Now()
+	var failedCount, successCount uint64
 
 	log.Printf("[MASTER] ===============================")
 	log.Printf("[MASTER] Starting %s phase", phase)
@@ -225,13 +219,10 @@ func runPhase(phase string) {
 			fmt.Sprintf("-workers=%d", *flagWorkers),
 			fmt.Sprintf("-value-size=%d", *flagValueSize),
 			fmt.Sprintf("-num-keys=%d", *flagNumKeys),
-			fmt.Sprintf("-batch-size=%d", *flagBatchSize),
 			fmt.Sprintf("-phase=%s", phase),
 			fmt.Sprintf("-replica-num=%d", *flagReplicaNum),
 			fmt.Sprintf("-wait-seconds=%d", *flagWaitSeconds),
-			fmt.Sprintf("-global-size=%d", *flagGlobalSize),
 			fmt.Sprintf("-local-buffer-size=%d", *flagLocalBufferSize),
-			fmt.Sprintf("-put-buffer-size=%d", *flagPutBufferSize),
 		)
 
 		cmd.Env = os.Environ()
@@ -239,38 +230,38 @@ func runPhase(phase string) {
 		cmd.Stderr = os.Stderr
 
 		if err := cmd.Start(); err != nil {
-			log.Fatalf("[MASTER] Failed to start worker %d: %v", i, err)
+			log.Printf("[MASTER] Failed to start worker %d: %v", i, err)
+			failedCount++
+			continue
 		}
 
-		processes = append(processes, cmd.Process)
+		commands = append(commands, workerCommand{workerID: i, cmd: cmd})
 		log.Printf("[MASTER] Worker %d started successfully (PID: %d)", i, cmd.Process.Pid)
 	}
 
-	log.Printf("[MASTER] All %d workers started, waiting for completion...", *flagWorkers)
+	log.Printf("[MASTER] Started %d/%d workers, waiting for completion...", len(commands), *flagWorkers)
 
-	// 等待所有进程完成
-	var failedCount, successCount uint64
-	for i, p := range processes {
-		log.Printf("[MASTER] Waiting for worker %d (PID: %d)...", i, p.Pid)
-		if _, err := p.Wait(); err != nil {
+	// 等待所有已启动的 worker 进程
+	for _, worker := range commands {
+		pid := worker.cmd.Process.Pid
+		log.Printf("[MASTER] Waiting for worker %d (PID: %d)...", worker.workerID, pid)
+		if err := worker.cmd.Wait(); err != nil {
 			if exitErr, ok := err.(*exec.ExitError); ok {
 				if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
 					if status.Signaled() {
-						log.Printf("[MASTER] Worker %d (PID: %d) killed by signal %d",
-							i, p.Pid, status.Signal())
+						log.Printf("[MASTER] Worker %d (PID: %d) killed by signal %d", worker.workerID, pid, status.Signal())
 					} else {
-						log.Printf("[MASTER] Worker %d (PID: %d) exited with status %d: %v",
-							i, p.Pid, status.ExitStatus(), err)
+						log.Printf("[MASTER] Worker %d (PID: %d) exited with status %d: %v", worker.workerID, pid, status.ExitStatus(), err)
 					}
 				} else {
-					log.Printf("[MASTER] Worker %d (PID: %d) failed: %v", i, p.Pid, err)
+					log.Printf("[MASTER] Worker %d (PID: %d) failed: %v", worker.workerID, pid, err)
 				}
 			} else {
-				log.Printf("[MASTER] Worker %d (PID: %d) failed: %v", i, p.Pid, err)
+				log.Printf("[MASTER] Worker %d (PID: %d) failed: %v", worker.workerID, pid, err)
 			}
 			failedCount++
 		} else {
-			log.Printf("[MASTER] Worker %d (PID: %d) completed successfully", i, p.Pid)
+			log.Printf("[MASTER] Worker %d (PID: %d) completed successfully", worker.workerID, pid)
 			successCount++
 		}
 	}
@@ -281,13 +272,15 @@ func runPhase(phase string) {
 	log.Printf("[MASTER]   Duration:   %v", duration)
 	log.Printf("[MASTER]   Success:    %d/%d workers", successCount, *flagWorkers)
 	log.Printf("[MASTER]   Failed:     %d/%d workers", failedCount, *flagWorkers)
-	if failedCount > 0 {
-		log.Printf("[MASTER]   WARNING: Some workers failed during %s phase", phase)
-	}
 	log.Printf("[MASTER] ===============================")
+
+	if failedCount > 0 {
+		return fmt.Errorf("%d of %d workers failed during %s phase", failedCount, *flagWorkers, phase)
+	}
+	return nil
 }
 
-func runWorker(workerID uint) {
+func runWorker(workerID uint) error {
 	log.Printf("[WORKER-%d] Starting worker initialization", workerID)
 
 	// 1. 绑核
@@ -309,10 +302,13 @@ func runWorker(workerID uint) {
 
 	// 4. 根据阶段执行操作
 	log.Printf("[WORKER-%d] Step 4/5: Executing %s phase...", workerID, *flagPhase)
-	executePhase(s, bufBytes, int(workerID))
+	if err := executePhase(s, bufBytes, int(workerID)); err != nil {
+		return err
+	}
 
 	// 5. 完成
 	log.Printf("[WORKER-%d] Step 5/5: Worker completed successfully", workerID)
+	return nil
 }
 
 // createAndSetupStore 创建并配置 store
@@ -327,12 +323,10 @@ func createAndSetupStore(workerID int) *store.Store {
 	ipcSocketPath := envOrDefault("MC_IPCSOCKETPATH", "")
 
 	log.Printf("[WORKER-%d] Store configuration:", workerID)
-	log.Printf("[WORKER-%d]   Global Size:      %d MB", workerID, *flagGlobalSize/(1024*1024))
 	log.Printf("[WORKER-%d]   Local Buffer:     %d MB", workerID, *flagLocalBufferSize/(1024*1024))
-	log.Printf("[WORKER-%d]   Put Buffer:       %d MB", workerID, *flagPutBufferSize/(1024*1024))
 
 	err = s.DummySetup(
-		*flagPutBufferSize,
+		0,
 		*flagLocalBufferSize,
 		serverAddress,
 		ipcSocketPath,
@@ -352,7 +346,7 @@ func allocateAndRegisterBuffer(s *store.Store, workerID int) (buf []byte, ptr ui
 	if err == nil && count > 0 {
 		bufInfo, err := s.RegisteredBufferAt(0)
 		if err == nil && bufInfo.Size > 0 {
-			requiredSize := requiredBufferSize()
+			requiredSize := *flagValueSize
 			if bufInfo.Size < requiredSize {
 				log.Fatalf("[WORKER-%d] Pre-registered buffer too small: got %d bytes, need %d", workerID, bufInfo.Size, requiredSize)
 			}
@@ -372,7 +366,7 @@ func allocateAndRegisterBuffer(s *store.Store, workerID int) (buf []byte, ptr ui
 	}
 
 	// 2. 没有预注册缓冲区，则自行 mmap 匿名共享内存（RealClient 支持注册任意内存）
-	bufSize := *flagBatchSize * *flagValueSize
+	bufSize := *flagValueSize
 	log.Printf("[WORKER-%d] No pre-registered buffer, allocating via mmap. Size: %d MB", workerID, bufSize/(1024*1024))
 
 	pageSize := int64(syscall.Getpagesize())
@@ -405,30 +399,42 @@ func allocateAndRegisterBuffer(s *store.Store, workerID int) (buf []byte, ptr ui
 }
 
 // executePhase 根据阶段执行操作
-func executePhase(s *store.Store, buf []byte, workerID int) {
+func executePhase(s *store.Store, buf []byte, workerID int) error {
 	switch *flagPhase {
 	case "write":
 		log.Printf("[WORKER-%d] Starting write phase...", workerID)
-		writePhase(s, buf, workerID)
+		if err := writePhase(s, buf, workerID); err != nil {
+			return err
+		}
 		log.Printf("[WORKER-%d] Write phase completed", workerID)
 	case "read":
 		log.Printf("[WORKER-%d] Starting read phase...", workerID)
-		readPhase(s, buf, workerID)
+		if err := readPhase(s, buf, workerID); err != nil {
+			return err
+		}
 		log.Printf("[WORKER-%d] Read phase completed", workerID)
 	default:
-		log.Fatalf("[WORKER-%d] Unknown phase: %s", workerID, *flagPhase)
+		return fmt.Errorf("unknown phase: %s", *flagPhase)
 	}
+	return nil
 }
 
-func writePhase(s *store.Store, buf []byte, workerID int) {
+func writePhase(s *store.Store, buf []byte, workerID int) error {
 	keyOffset, keysPerWorker := calculateKeyRange(uint(workerID), *flagWorkers, *flagNumKeys)
 	valueSize := int(*flagValueSize)
 
-	log.Printf("[WORKER-%d] Write phase: keys %d-%d (total %d keys)",
-		workerID, keyOffset, keyOffset+keysPerWorker-1, keysPerWorker)
+	if keysPerWorker == 0 {
+		log.Printf("[WORKER-%d] Write phase: no keys assigned", workerID)
+	} else {
+		log.Printf("[WORKER-%d] Write phase: keys %d-%d (total %d keys)",
+			workerID, keyOffset, keyOffset+keysPerWorker-1, keysPerWorker)
+	}
 
 	start := time.Now()
 	var written, failed uint64
+	replicateConfig := &store.ReplicateConfig{
+		ReplicaNum: int(*flagReplicaNum),
+	}
 
 	for i := uint64(0); i < keysPerWorker; i++ {
 		keyIdx := keyOffset + i
@@ -438,7 +444,7 @@ func writePhase(s *store.Store, buf []byte, workerID int) {
 		FillBuffer(buf[:valueSize], keyIdx)
 
 		// 使用 PutFrom 写入（零拷贝）
-		if err := s.PutFrom(key, uintptr(unsafe.Pointer(&buf[0])), *flagValueSize, nil); err != nil {
+		if err := s.PutFrom(key, uintptr(unsafe.Pointer(&buf[0])), *flagValueSize, replicateConfig); err != nil {
 			log.Printf("[WORKER-%d] PutFrom failed for key=%s: %v", workerID, key, err)
 			failed++
 		} else {
@@ -460,87 +466,51 @@ func writePhase(s *store.Store, buf []byte, workerID int) {
 	log.Printf("[WORKER-%d]   Failed:     %d", workerID, failed)
 	log.Printf("[WORKER-%d]   Duration:   %v", workerID, duration)
 	log.Printf("[WORKER-%d]   Throughput: %.2f MB/s", workerID, throughput)
+	if failed > 0 {
+		return fmt.Errorf("%d write operations failed", failed)
+	}
+	return nil
 }
 
-func readPhase(s *store.Store, buf []byte, workerID int) {
+func readPhase(s *store.Store, buf []byte, workerID int) error {
 	keyOffset, keysPerWorker := calculateKeyRange(uint(workerID), *flagWorkers, *flagNumKeys)
-	valueSize := int(*flagValueSize)
 
-	log.Printf("[WORKER-%d] Read phase: keys %d-%d (total %d keys)",
-		workerID, keyOffset, keyOffset+keysPerWorker-1, keysPerWorker)
+	if keysPerWorker == 0 {
+		log.Printf("[WORKER-%d] Read phase: no keys assigned", workerID)
+	} else {
+		log.Printf("[WORKER-%d] Read phase: keys %d-%d (total %d keys)",
+			workerID, keyOffset, keyOffset+keysPerWorker-1, keysPerWorker)
+	}
 
 	start := time.Now()
 	var totalBytes, failedOps, verifyErrors, successOps, totalOps uint64
 
-	if *flagBatchSize > 1 {
-		// 批量读取
-		batchSizeVal := *flagBatchSize
-		valueSize64 := *flagValueSize
+	for i := uint64(0); i < keysPerWorker; i++ {
+		keyIdx := keyOffset + i
+		key := MakeKey(keyIdx)
 
-		for i := uint64(0); i < keysPerWorker; i += batchSizeVal {
-			batchEnd := uint64(math.Min(float64(i+batchSizeVal), float64(keysPerWorker)))
-			batchSize := batchEnd - i
+		n, err := s.GetInto(key, uintptr(unsafe.Pointer(&buf[0])), *flagValueSize)
+		totalOps++
 
-			batchStart := time.Now()
-
-			for j := uint64(0); j < batchSize; j++ {
-				keyIdx := keyOffset + i + j
-				key := MakeKey(keyIdx)
-				offset := int(j * valueSize64)
-
-				n, err := s.GetInto(key, uintptr(unsafe.Pointer(&buf[offset])), *flagValueSize)
-				totalOps++
-
-				if err != nil || n < 0 {
-					log.Printf("[WORKER-%d] GetInto failed for key=%s: %v", workerID, key, err)
-					failedOps++
-				} else {
-					totalBytes += uint64(n)
-
-					// 数据验证
-					if !CheckBuffer(buf[offset:offset+valueSize], keyIdx) {
-						log.Printf("[WORKER-%d] Data mismatch for key=%s", workerID, key)
-						verifyErrors++
-					} else {
-						successOps++
-					}
-				}
-			}
-
-			batchDuration := time.Since(batchStart)
-			if batchDuration.Seconds() > 0 {
-				batchThroughput := float64(batchSize*valueSize64) / batchDuration.Seconds() / (1024 * 1024)
-				log.Printf("[WORKER-%d] Batch %d-%d completed in %v (%.2f MB/s)",
-					workerID, i, batchEnd-1, batchDuration, batchThroughput)
+		if err != nil || n < 0 {
+			log.Printf("[WORKER-%d] GetInto failed for key=%s: %v", workerID, key, err)
+			failedOps++
+		} else {
+			totalBytes += uint64(n)
+			if uint64(n) != *flagValueSize {
+				log.Printf("[WORKER-%d] GetInto returned unexpected size for key=%s: got %d, want %d", workerID, key, n, *flagValueSize)
+				failedOps++
+			} else if !CheckBuffer(buf[:n], keyIdx) {
+				// 数据验证
+				log.Printf("[WORKER-%d] Data mismatch for key=%s", workerID, key)
+				verifyErrors++
+			} else {
+				successOps++
 			}
 		}
-	} else {
-		// 单条读取
-		for i := uint64(0); i < keysPerWorker; i++ {
-			keyIdx := keyOffset + i
-			key := MakeKey(keyIdx)
 
-			n, err := s.GetInto(key, uintptr(unsafe.Pointer(&buf[0])), *flagValueSize)
-			totalOps++
-
-			if err != nil || n < 0 {
-				log.Printf("[WORKER-%d] GetInto failed for key=%s: %v", workerID, key, err)
-				failedOps++
-			} else {
-				totalBytes += uint64(n)
-
-				// 数据验证
-				if !CheckBuffer(buf[:n], keyIdx) {
-					log.Printf("[WORKER-%d] Data mismatch for key=%s", workerID, key)
-					verifyErrors++
-				} else {
-					successOps++
-				}
-			}
-
-			if (i+1)%10 == 0 {
-				log.Printf("[WORKER-%d] Read %d/%d keys", workerID, i+1, keysPerWorker)
-			}
+		if (i+1)%10 == 0 || i == keysPerWorker-1 {
+			log.Printf("[WORKER-%d] Read %d/%d keys", workerID, i+1, keysPerWorker)
 		}
 	}
 
@@ -555,6 +525,10 @@ func readPhase(s *store.Store, buf []byte, workerID int) {
 	log.Printf("[WORKER-%d]   Verify Errors: %d", workerID, verifyErrors)
 	log.Printf("[WORKER-%d]   Duration:      %v", workerID, duration)
 	log.Printf("[WORKER-%d]   Throughput:    %.2f MB/s", workerID, throughput)
+	if failedOps > 0 || verifyErrors > 0 {
+		return fmt.Errorf("read phase failed: %d operation failures, %d verification failures", failedOps, verifyErrors)
+	}
+	return nil
 }
 
 // MakeKey 生成 key（模拟 C++ 的 MakeKey）
