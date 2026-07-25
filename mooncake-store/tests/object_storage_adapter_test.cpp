@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <map>
 #include <memory>
 #include <string>
@@ -260,6 +261,31 @@ TEST_F(ObjectStorageAdapterTest, BatchOffloadAllowsPartialFailure) {
     EXPECT_EQ(completed_keys.front(), "good");
     EXPECT_TRUE(adapter->objects.contains("good"));
     EXPECT_FALSE(adapter->objects.contains("bad"));
+}
+
+TEST_F(ObjectStorageAdapterTest, BatchOffloadRejectsTotalSizeOverflow) {
+    FakeObjectStorageAdapter* adapter = nullptr;
+    auto backend = MakeObjectStorageBackend(adapter);
+    ASSERT_TRUE(backend->Init());
+
+    char value = 'x';
+    std::unordered_map<std::string, std::vector<Slice>> batch{
+        {"overflow",
+         {{&value, std::numeric_limits<size_t>::max()}, {&value, 1}}},
+    };
+    bool complete_handler_called = false;
+
+    auto result =
+        backend->BatchOffload(batch, [&](const std::vector<std::string>&,
+                                         std::vector<StorageObjectMetadata>&) {
+            complete_handler_called = true;
+            return ErrorCode::OK;
+        });
+
+    ASSERT_TRUE(result);
+    EXPECT_EQ(*result, 0);
+    EXPECT_EQ(adapter->putv_calls, 0);
+    EXPECT_FALSE(complete_handler_called);
 }
 
 TEST_F(ObjectStorageAdapterTest, BatchOffloadIgnoresEvictionHandler) {

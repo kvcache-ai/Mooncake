@@ -4,8 +4,9 @@
 
 #include <algorithm>
 #include <cstdlib>
-#include <xxhash.h>
 #include <filesystem>
+#include <limits>
+#include <xxhash.h>
 
 #include "utils.h"
 
@@ -179,18 +180,36 @@ tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
     std::vector<StorageObjectMetadata> success_metas;
 
     for (const auto& [key, slices] : batch_object) {
+        if (slices.size() >
+            static_cast<size_t>(std::numeric_limits<int>::max())) {
+            LOG(WARNING) << "Failed to offload key " << key
+                         << ": slice count exceeds INT_MAX";
+            continue;
+        }
+        const int iovcnt = static_cast<int>(slices.size());
+
         std::vector<iovec> iovs;
         iovs.reserve(slices.size());
         size_t total_size = 0;
+        bool total_size_overflow = false;
         for (const auto& slice : slices) {
+            if (slice.size > std::numeric_limits<size_t>::max() - total_size) {
+                total_size_overflow = true;
+                break;
+            }
             iovs.push_back({slice.ptr, slice.size});
             total_size += slice.size;
+        }
+        if (total_size_overflow) {
+            LOG(WARNING) << "Failed to offload key " << key
+                         << ": total slice size overflows size_t";
+            continue;
         }
 
         size_t written = 0;
         if (UsesObjectStorage()) {
-            auto result = object_storage_adapter_->PutV(
-                key, iovs.data(), static_cast<int>(iovs.size()));
+            auto result =
+                object_storage_adapter_->PutV(key, iovs.data(), iovcnt);
             if (!result) {
                 LOG(WARNING) << "Failed to offload key " << key << ": "
                              << static_cast<int>(result.error());
@@ -198,9 +217,8 @@ tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
             }
             written = total_size;
         } else {
-            auto result =
-                fs_adapter_->VectorWriteFile(GetObjectPath(key), iovs.data(),
-                                             static_cast<int>(iovs.size()), 0);
+            auto result = fs_adapter_->VectorWriteFile(GetObjectPath(key),
+                                                       iovs.data(), iovcnt, 0);
             if (!result) {
                 LOG(WARNING) << "Failed to offload key " << key << ": "
                              << static_cast<int>(result.error());
