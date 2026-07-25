@@ -42,7 +42,6 @@ class ObjectStorageAdapter {
     virtual tl::expected<std::vector<KeyInfo>, ErrorCode> ListKeys() = 0;
 
     virtual tl::expected<void, ErrorCode> Init() = 0;
-    virtual tl::expected<void, ErrorCode> Shutdown() = 0;
     virtual const char* GetName() const = 0;
 };
 

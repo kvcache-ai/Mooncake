@@ -86,11 +86,6 @@ class FakeObjectStorageAdapter : public ObjectStorageAdapter {
         return {};
     }
 
-    tl::expected<void, ErrorCode> Shutdown() override {
-        initialized = false;
-        return {};
-    }
-
     const char* GetName() const override { return "fake-object-storage"; }
 };
 
