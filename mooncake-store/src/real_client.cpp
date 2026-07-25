@@ -3769,8 +3769,8 @@ tl::expected<void, ErrorCode> RealClient::put_from_dummy_helper(
     }
     auto &context = it->second;
 
-    auto buffers_result = map_dummy_addrs_to_real_ptrs(
-        context, {dummy_buffer}, {size}, client_id);
+    auto buffers_result = map_dummy_addrs_to_real_ptrs(context, {dummy_buffer},
+                                                       {size}, client_id);
     if (!buffers_result) {
         return tl::unexpected(buffers_result.error());
     }
@@ -5397,8 +5397,7 @@ void RealClient::dummy_client_monitor_func() {
                 {
                     std::shared_lock<std::shared_mutex> lock(
                         dummy_client_mutex_);
-                    if (shm_contexts_.find(client_id) ==
-                        shm_contexts_.end()) {
+                    if (shm_contexts_.find(client_id) == shm_contexts_.end()) {
                         LOG(INFO)
                             << "client_id=" << client_id
                             << ", action=shm_already_unmapped_by_other_path";
@@ -5414,7 +5413,8 @@ void RealClient::dummy_client_monitor_func() {
                     result = unmap_shm_internal(client_id);
                 }
                 if (!result) {
-                    // Client already unmapped (e.g., by other thread or earlier cleanup)
+                    // Client already unmapped (e.g., by other thread or earlier
+                    // cleanup)
                     LOG(INFO) << "client_id=" << client_id
                               << ", action=client_already_unmapped";
                 }

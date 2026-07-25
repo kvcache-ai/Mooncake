@@ -51,7 +51,10 @@ typedef struct mooncake_replicate_config mooncake_replicate_config_t;
 // Lifecycle
 // ---------------------------------------------------------------------------
 
-mooncake_store_t mooncake_store_create(mooncake_client_type_t client_type);
+mooncake_store_t mooncake_store_create();
+
+mooncake_store_t mooncake_store_create_with_type(
+    mooncake_client_type_t client_type);
 
 void mooncake_store_destroy(mooncake_store_t store);
 
@@ -60,10 +63,12 @@ int mooncake_store_setup(mooncake_store_t store, const char *local_hostname,
                          uint64_t global_segment_size,
                          uint64_t local_buffer_size, const char *protocol,
                          const char *device_name,
-                         const char *master_server_addr,
-                         uint64_t mem_pool_size,
-                         const char *server_address,
-                         const char *ipc_socket_path);
+                         const char *master_server_addr);
+
+int mooncake_store_setup_dummy(mooncake_store_t store, uint64_t mem_pool_size,
+                               uint64_t local_buffer_size,
+                               const char *server_address,
+                               const char *ipc_socket_path);
 
 int mooncake_store_init_all(mooncake_store_t store, const char *protocol,
                             const char *device_name,

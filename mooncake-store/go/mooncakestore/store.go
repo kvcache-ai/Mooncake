@@ -41,13 +41,17 @@ type Store struct {
 // New creates a new Store instance. Call Setup before performing operations,
 // and Close when done.
 func New() (*Store, error) {
-	return NewWithType(MOONCAKE_CLIENT_REAL)
+	h := C.mooncake_store_create()
+	if h == nil {
+		return nil, ErrStoreNil
+	}
+	return &Store{handle: h}, nil
 }
 
 // NewWithType creates a new Store instance with the specified client type.
 // Use MOONCAKE_CLIENT_REAL or MOONCAKE_CLIENT_DUMMY.
 func NewWithType(clientType ClientType) (*Store, error) {
-	h := C.mooncake_store_create(C.mooncake_client_type_t(clientType))
+	h := C.mooncake_store_create_with_type(C.mooncake_client_type_t(clientType))
 	if h == nil {
 		return nil, ErrStoreNil
 	}
@@ -76,8 +80,7 @@ func (s *Store) Setup(localHostname, metadataServer string,
 	ret := C.mooncake_store_setup(s.handle,
 		cLocalHostname, cMetadataServer,
 		C.uint64_t(globalSegmentSize), C.uint64_t(localBufferSize),
-		cProtocol, cDeviceName, cMasterAddr,
-		0, nil, nil)
+		cProtocol, cDeviceName, cMasterAddr)
 	if ret != 0 {
 		return ErrSetupFailed
 	}
@@ -96,10 +99,9 @@ func (s *Store) DummySetup(memPoolSize, localBufferSize uint64,
 	defer C.free(unsafe.Pointer(cServerAddress))
 	defer C.free(unsafe.Pointer(cIpcSocketPath))
 
-	ret := C.mooncake_store_setup(s.handle,
-		nil, nil, 0, C.uint64_t(localBufferSize),
-		nil, nil, nil,
-		C.uint64_t(memPoolSize), cServerAddress, cIpcSocketPath)
+	ret := C.mooncake_store_setup_dummy(s.handle,
+		C.uint64_t(memPoolSize), C.uint64_t(localBufferSize),
+		cServerAddress, cIpcSocketPath)
 	if ret != 0 {
 		return ErrSetupFailed
 	}

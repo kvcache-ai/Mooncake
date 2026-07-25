@@ -438,7 +438,8 @@ class RealClient : public PyClient {
 
     tl::expected<void, ErrorCode> put_from_dummy_helper(
         const std::string &key, uint64_t dummy_buffer, size_t size,
-        const ReplicateConfig &config, int32_t device_id, const UUID &client_id);
+        const ReplicateConfig &config, int32_t device_id,
+        const UUID &client_id);
 
     std::vector<tl::expected<void, ErrorCode>>
     batch_put_from_multi_buffers_dummy_helper(

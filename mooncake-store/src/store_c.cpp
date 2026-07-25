@@ -76,7 +76,12 @@ extern "C" {
 // Lifecycle
 // ---------------------------------------------------------------------------
 
-mooncake_store_t mooncake_store_create(mooncake_client_type_t client_type) {
+mooncake_store_t mooncake_store_create() {
+    return mooncake_store_create_with_type(MOONCAKE_CLIENT_REAL);
+}
+
+mooncake_store_t mooncake_store_create_with_type(
+    mooncake_client_type_t client_type) {
     try {
         std::shared_ptr<mooncake::PyClient> client;
         if (client_type == MOONCAKE_CLIENT_DUMMY) {
@@ -111,27 +116,29 @@ int mooncake_store_setup(mooncake_store_t store, const char *local_hostname,
                          uint64_t global_segment_size,
                          uint64_t local_buffer_size, const char *protocol,
                          const char *device_name,
-                         const char *master_server_addr,
-                         uint64_t mem_pool_size,
-                         const char *server_address,
-                         const char *ipc_socket_path) {
+                         const char *master_server_addr) {
     if (!store) return -1;
     try {
-        auto *handle = as_handle(store);
-        if (handle->client_type == MOONCAKE_CLIENT_DUMMY) {
-            return handle->client->setup_dummy(
-                mem_pool_size, local_buffer_size,
-                c_str_or(server_address, ""),
-                c_str_or(ipc_socket_path, ""));
-        } else {
-            return handle->client->setup_real(
-                c_str_or(local_hostname, ""),
-                c_str_or(metadata_server, ""),
-                global_segment_size, local_buffer_size,
-                c_str_or(protocol, "tcp"), c_str_or(device_name, ""),
-                c_str_or(master_server_addr, "127.0.0.1:50051"),
-                nullptr, "", false, "");
-        }
+        return as_client(store)->setup_real(
+            c_str_or(local_hostname, ""), c_str_or(metadata_server, ""),
+            global_segment_size, local_buffer_size, c_str_or(protocol, "tcp"),
+            c_str_or(device_name, ""),
+            c_str_or(master_server_addr, "127.0.0.1:50051"), nullptr, "", false,
+            "");
+    } catch (...) {
+        return -1;
+    }
+}
+
+int mooncake_store_setup_dummy(mooncake_store_t store, uint64_t mem_pool_size,
+                               uint64_t local_buffer_size,
+                               const char *server_address,
+                               const char *ipc_socket_path) {
+    if (!store) return -1;
+    try {
+        return as_client(store)->setup_dummy(mem_pool_size, local_buffer_size,
+                                             c_str_or(server_address, ""),
+                                             c_str_or(ipc_socket_path, ""));
     } catch (...) {
         return -1;
     }
@@ -390,7 +397,8 @@ size_t mooncake_store_get_registered_buffer_count(mooncake_store_t store) {
         if (handle->client_type != MOONCAKE_CLIENT_DUMMY) {
             return 0;
         }
-        auto *dummy = static_cast<mooncake::DummyClient *>(handle->client.get());
+        auto *dummy =
+            static_cast<mooncake::DummyClient *>(handle->client.get());
         return dummy->get_registered_buffers().size();
     } catch (...) {
         return 0;
@@ -405,7 +413,8 @@ void *mooncake_store_get_registered_buffer_at(mooncake_store_t store,
         if (handle->client_type != MOONCAKE_CLIENT_DUMMY) {
             return nullptr;
         }
-        auto *dummy = static_cast<mooncake::DummyClient *>(handle->client.get());
+        auto *dummy =
+            static_cast<mooncake::DummyClient *>(handle->client.get());
         auto buffers = dummy->get_registered_buffers();
         if (index >= buffers.size()) return nullptr;
         if (size_out) *size_out = buffers[index].size;
@@ -422,7 +431,8 @@ int mooncake_store_is_hot_cache_ptr(mooncake_store_t store, const void *ptr) {
         if (handle->client_type != MOONCAKE_CLIENT_DUMMY) {
             return 0;
         }
-        auto *dummy = static_cast<mooncake::DummyClient *>(handle->client.get());
+        auto *dummy =
+            static_cast<mooncake::DummyClient *>(handle->client.get());
         return dummy->is_hot_cache_ptr(ptr) ? 1 : 0;
     } catch (...) {
         return 0;
