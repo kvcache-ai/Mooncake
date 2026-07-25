@@ -381,19 +381,16 @@ endif()
 # transfer_engine is PRIVATE-linked, so its CUDA/HIP/Ascend dependencies are not
 # propagated; we must detect and link them independently.
 #
-# Auto-detect each toolkit regardless of global USE_CUDA/USE_HIP flags, because
-# USE_CUDA may be OFF even when GPU pointers are present (e.g.
-# WITH_NVIDIA_PEERMEM env var uses nvidia-peermem for RDMA without cudart). Each
-# detected toolkit gets both link libraries AND compile definitions, so that
-# AcceleratorDevice implementations and pinned_buffer_pool.h pick the correct
-# backend.
+# A CUDA toolkit may be installed even when USE_CUDA=OFF (for example, in the
+# non-CUDA release builder). Detect it for backend selection, but only enable
+# CUDA staging when CUDA support was explicitly requested.
 #
 # NOTE: mooncake_store is a static library (.a). External consumers (Go CGo,
 # Python pybind) that link it must also link the GPU runtime (e.g. -lcudart).
 # Go's build.sh already does this; CI workflows must do the same.
 
 find_package(CUDAToolkit QUIET)
-if(CUDAToolkit_FOUND)
+if(USE_CUDA AND CUDAToolkit_FOUND)
   message(STATUS "mooncake_store: CUDAToolkit detected, enabling D2H staging")
   target_compile_definitions(mooncake_store PRIVATE USE_CUDA)
   target_compile_definitions(mooncake_client PRIVATE USE_CUDA)

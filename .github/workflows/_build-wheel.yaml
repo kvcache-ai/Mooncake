@@ -197,6 +197,20 @@ jobs:
           "$smoke_venv/bin/python" -m pip install --no-deps \
             mooncake-wheel/dist-py${{ steps.pytag.outputs.tag }}/*.whl
 
+          if [ "${VARIANT_FLAG:-}" = "NON_CUDA_BUILD" ]; then
+            site_packages=$("$smoke_venv/bin/python" -c \
+              'import sysconfig; print(sysconfig.get_paths()["purelib"])')
+            while IFS= read -r -d '' binary; do
+              file "$binary" | grep -q ELF || continue
+              if readelf -d "$binary" | grep -Eq \
+                'Shared library: \[(libcuda|libcudart)\.so'; then
+                echo "Non-CUDA wheel binary depends on CUDA: $binary"
+                readelf -d "$binary" | grep 'Shared library:'
+                exit 1
+              fi
+            done < <(find "$site_packages" -type f -print0)
+          fi
+
           export LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH:-}"
           for dir in /usr/local/cuda/lib64 \
                      /usr/local/cuda/lib64/stubs \
