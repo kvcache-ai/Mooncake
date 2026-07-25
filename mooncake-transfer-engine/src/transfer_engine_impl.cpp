@@ -601,10 +601,26 @@ int TransferEngineImpl::registerLocalMemory(void* addr, size_t length,
         return ERR_ADDRESS_OVERLAPPED;
     }
 
+    std::vector<Transport*> attempted_transports;
     for (auto transport : multi_transports_->listTransports()) {
+        attempted_transports.push_back(transport);
         int ret = transport->registerLocalMemory(
             addr, length, location, remote_accessible, update_metadata);
         if (ret < 0) {
+            // Roll back the transports that already registered so a partial
+            // failure doesn't leave the region registered on some of them.
+            // Mirrors registerLocalMemoryBatch (#2869).
+            for (auto it = attempted_transports.rbegin();
+                 it != attempted_transports.rend(); ++it) {
+                int rollback_ret =
+                    (*it)->unregisterLocalMemory(addr, update_metadata);
+                if (rollback_ret != 0 &&
+                    rollback_ret != ERR_ADDRESS_NOT_REGISTERED) {
+                    LOG(WARNING)
+                        << "Failed to roll back registration for "
+                        << (*it)->getName() << ", ret=" << rollback_ret;
+                }
+            }
             releaseMemoryRegions(regions);
             return ret;
         }
@@ -776,9 +792,12 @@ int TransferEngineImpl::registerLocalMemoryBatch(
     }
 
     std::vector<MemoryRegion> regions;
+    std::vector<void*> addr_list;
     regions.reserve(buffer_list.size());
+    addr_list.reserve(buffer_list.size());
     for (const auto& buffer : buffer_list) {
         regions.push_back({buffer.addr, buffer.length, location, true});
+        addr_list.push_back(buffer.addr);
     }
     if (!tryReserveMemoryRegions(regions)) {
         LOG(ERROR)
@@ -786,9 +805,21 @@ int TransferEngineImpl::registerLocalMemoryBatch(
         return ERR_ADDRESS_OVERLAPPED;
     }
 
+    std::vector<Transport*> attempted_transports;
     for (auto transport : multi_transports_->listTransports()) {
+        attempted_transports.push_back(transport);
         int ret = transport->registerLocalMemoryBatch(buffer_list, location);
-        if (ret < 0) {
+        if (ret) {
+            for (auto it = attempted_transports.rbegin();
+                 it != attempted_transports.rend(); ++it) {
+                int rollback_ret = (*it)->unregisterLocalMemoryBatch(addr_list);
+                if (rollback_ret != 0 &&
+                    rollback_ret != ERR_ADDRESS_NOT_REGISTERED) {
+                    LOG(WARNING)
+                        << "Failed to roll back batch registration for "
+                        << (*it)->getName() << ", ret=" << rollback_ret;
+                }
+            }
             releaseMemoryRegions(regions);
             return ret;
         }
@@ -800,10 +831,12 @@ int TransferEngineImpl::registerLocalMemoryBatch(
 
 int TransferEngineImpl::unregisterLocalMemoryBatch(
     const std::vector<void*>& addr_list) {
+    int first_error = 0;
     for (auto transport : multi_transports_->listTransports()) {
         int ret = transport->unregisterLocalMemoryBatch(addr_list);
-        if (ret < 0) return ret;
+        if (ret && !first_error) first_error = ret;
     }
+    if (first_error) return first_error;
 
     std::unique_lock<std::shared_mutex> lock(mutex_);
     for (auto& addr : addr_list) {

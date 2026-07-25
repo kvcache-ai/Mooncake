@@ -432,6 +432,15 @@ QueueOwnerInput makeOwnerWithDeadline(size_t public_task_id, size_t length,
     return owner;
 }
 
+QueueOwnerInput makeDegradationEligibleOwnerWithDeadline(size_t public_task_id,
+                                                         size_t length,
+                                                         uint64_t deadline_ns) {
+    QueueOwnerInput owner =
+        makeOwnerWithDeadline(public_task_id, length, deadline_ns);
+    owner.degradation_eligible = true;
+    return owner;
+}
+
 TEST(AdmissionQueueTest, DeadlineAwareDispatchesEarliestDeadlineFirst) {
     QueueLimits limits{4, 4096, 0, 0};
     limits.deadline_aware = true;
@@ -556,9 +565,10 @@ TEST(AdmissionQueueTest, Step3DropsInfeasibleAndKeepsFeasible) {
     // owner 1: window = 10 ns → 16 B / 1e9 = 16 ns → MLU 1.6 ≥ 1.5 → DROP.
     // owner 2: window = 1e6 ns → MLU ~1.6e-5 → feasible → dispatch.
     auto status = queue.tryAdmit(
-        makeSubmit(1, 2,
-                   {makeOwnerWithDeadline(0, 16, 1'000'000'010),
-                    makeOwnerWithDeadline(1, 16, 2'000'000'000)}),
+        makeSubmit(
+            1, 2,
+            {makeDegradationEligibleOwnerWithDeadline(0, 16, 1'000'000'010),
+             makeDegradationEligibleOwnerWithDeadline(1, 16, 2'000'000'000)}),
         admitted_ids);
     ASSERT_EQ(status.code(), Status::Code::kOk);
     ASSERT_EQ(admitted_ids.size(), 2u);
@@ -584,7 +594,9 @@ TEST(AdmissionQueueTest, Step3DropsAlreadyExpiredDeadline) {
     std::vector<QueueOwnerId> admitted_ids;
     // deadline 1e9 < now 2e9 → already past → dropped.
     auto status = queue.tryAdmit(
-        makeSubmit(1, 1, {makeOwnerWithDeadline(0, 16, 1'000'000'000)}),
+        makeSubmit(
+            1, 1,
+            {makeDegradationEligibleOwnerWithDeadline(0, 16, 1'000'000'000)}),
         admitted_ids);
     ASSERT_EQ(status.code(), Status::Code::kOk);
 
@@ -604,7 +616,9 @@ TEST(AdmissionQueueTest, Step3DisabledWhenThresholdZero) {
 
     std::vector<QueueOwnerId> admitted_ids;
     auto status = queue.tryAdmit(
-        makeSubmit(1, 1, {makeOwnerWithDeadline(0, 16, 1'000'000'001)}),
+        makeSubmit(
+            1, 1,
+            {makeDegradationEligibleOwnerWithDeadline(0, 16, 1'000'000'001)}),
         admitted_ids);
     ASSERT_EQ(status.code(), Status::Code::kOk);
 
@@ -628,6 +642,89 @@ TEST(AdmissionQueueTest, Step3NoDropWithoutBandwidthProvider) {
     auto picked = queue.pickForDispatch(4, 1 << 20, &dropped);
     ASSERT_EQ(picked.size(), 1u);
     EXPECT_TRUE(dropped.empty());
+}
+
+TEST(AdmissionQueueTest, Step3DynamicBandwidthProvider) {
+    LocalTransferAdmissionQueue queue(step3Limits(1.5));
+    std::atomic<double> live_bw{1e9};
+    int hook_calls = 0;
+    DegradationHooks hooks;
+    hooks.on_local_decode_suggested = [&](const Request&) { ++hook_calls; };
+    queue.setDegradationPolicy([&] { return live_bw.load(); }, hooks,
+                               [] { return uint64_t{1'000'000'000}; });
+
+    std::vector<QueueOwnerId> admitted_ids;
+    // At 1e9 B/s: time=16ns, window=10ns, MLU=1.6 >= 1.5 -> DROP.
+    auto status = queue.tryAdmit(
+        makeSubmit(
+            1, 1,
+            {makeDegradationEligibleOwnerWithDeadline(0, 16, 1'000'000'010)}),
+        admitted_ids);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+
+    std::vector<QueueOwnerId> dropped;
+    auto picked = queue.pickForDispatch(4, 1 << 20, &dropped);
+    EXPECT_TRUE(picked.empty());
+    ASSERT_EQ(dropped.size(), 1u);
+    EXPECT_EQ(hook_calls, 1);
+
+    // Increase bandwidth 10x -> same profile becomes feasible.
+    live_bw.store(1e10);
+    status = queue.tryAdmit(
+        makeSubmit(
+            2, 1,
+            {makeDegradationEligibleOwnerWithDeadline(0, 16, 1'000'000'010)}),
+        admitted_ids);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+
+    dropped.clear();
+    picked = queue.pickForDispatch(4, 1 << 20, &dropped);
+    // At 1e10 B/s: time=1.6ns, window=10ns, MLU=0.16 < 1.5 -> OK.
+    ASSERT_EQ(picked.size(), 1u);
+    EXPECT_TRUE(dropped.empty());
+    EXPECT_EQ(hook_calls, 1);
+}
+
+TEST(AdmissionQueueTest, Step3SkipsNonRdmaOwner) {
+    LocalTransferAdmissionQueue queue(step3Limits(1.5));
+    int hook_calls = 0;
+    DegradationHooks hooks;
+    hooks.on_local_decode_suggested = [&](const Request&) { ++hook_calls; };
+    queue.setDegradationPolicy([] { return 1e9; }, hooks,
+                               [] { return uint64_t{1'000'000'000}; });
+
+    auto owner = makeOwnerWithDeadline(0, 16, 1'000'000'010);
+    owner.degradation_eligible = false;
+    std::vector<QueueOwnerId> admitted_ids;
+    auto status = queue.tryAdmit(makeSubmit(1, 1, {owner}), admitted_ids);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+
+    std::vector<QueueOwnerId> dropped;
+    auto picked = queue.pickForDispatch(4, 1 << 20, &dropped);
+    ASSERT_EQ(picked.size(), 1u);
+    EXPECT_TRUE(dropped.empty());
+    EXPECT_EQ(hook_calls, 0);
+}
+
+TEST(AdmissionQueueTest, Step3RequiresExplicitDegradationEligibility) {
+    LocalTransferAdmissionQueue queue(step3Limits(1.5));
+    int hook_calls = 0;
+    DegradationHooks hooks;
+    hooks.on_local_decode_suggested = [&](const Request&) { ++hook_calls; };
+    queue.setDegradationPolicy([] { return 1e9; }, hooks,
+                               [] { return uint64_t{1'000'000'000}; });
+
+    std::vector<QueueOwnerId> admitted_ids;
+    auto status = queue.tryAdmit(
+        makeSubmit(1, 1, {makeOwnerWithDeadline(0, 16, 1'000'000'010)}),
+        admitted_ids);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+
+    std::vector<QueueOwnerId> dropped;
+    auto picked = queue.pickForDispatch(4, 1 << 20, &dropped);
+    ASSERT_EQ(picked.size(), 1u);
+    EXPECT_TRUE(dropped.empty());
+    EXPECT_EQ(hook_calls, 0);
 }
 
 // --- Deadline proximity promotion (step 4) --------------------------------
@@ -748,12 +845,12 @@ TEST(AdmissionQueueTest, PromotionCoexistsWithStep3Drop) {
                                [] { return uint64_t{1000}; });
 
     std::vector<QueueOwnerId> ids;
-    auto status =
-        queue.tryAdmit(makeSubmit(1, 3,
-                                  {makeOwnerWithDeadline(0, 16, 1010),
-                                   makeOwnerWithDeadline(1, 16, 1400),
-                                   makeOwnerWithDeadline(2, 16, 5000)}),
-                       ids);
+    auto status = queue.tryAdmit(
+        makeSubmit(1, 3,
+                   {makeDegradationEligibleOwnerWithDeadline(0, 16, 1010),
+                    makeDegradationEligibleOwnerWithDeadline(1, 16, 1400),
+                    makeDegradationEligibleOwnerWithDeadline(2, 16, 5000)}),
+        ids);
     ASSERT_EQ(status.code(), Status::Code::kOk);
 
     std::vector<QueueOwnerId> dropped;

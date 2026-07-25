@@ -85,6 +85,12 @@ class Transport {
         size_t transferred_bytes;
     };
 
+    struct NicLoadStats {
+        std::string device_name;
+        uint64_t inflight_bytes{0};
+        double ewma_bandwidth_bps{0.0};
+    };
+
     struct BatchDesc;
     struct TransferTask;
 
@@ -133,7 +139,7 @@ class Transport {
                 mr_key_t dest_rkey;
                 int lkey_index;
                 int rkey_index;
-                volatile int *qp_depth;
+                std::atomic<int> *qp_depth;
                 uint32_t retry_cnt;
                 uint32_t max_retry_cnt;
                 RdmaEndPoint *endpoint;  // Endpoint used for this transfer

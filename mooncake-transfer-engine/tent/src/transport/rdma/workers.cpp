@@ -16,10 +16,12 @@
 
 #include <sys/epoll.h>
 
+#include <algorithm>
 #include <cassert>
 #include <fstream>
 #include <sstream>
 
+#include "tent/transport/rdma/bw_arbitration.h"
 #include "tent/transport/rdma/endpoint_store.h"
 #include "tent/transport/rdma/promotion_policy.h"
 #include "tent/transport/rdma/shared_quota.h"
@@ -33,6 +35,12 @@ namespace tent {
 thread_local int tl_wid = -1;
 
 namespace {
+struct ArbitrationEntry {
+    RdmaSlice* slice;
+    double mlu;
+    size_t order;
+};
+
 // Look up (or create) the RailMonitor for `machine_id` on this worker's
 // map. Returning a stable reference is safe because the map stores values
 // via unique_ptr -- rehashes move the pointer slot, not the RailMonitor.
@@ -145,6 +153,11 @@ Workers::Workers(RdmaTransport* transport)
     priority_promotion_timeout_ns_ =
         conf->get("transports/rdma/priority_promotion_timeout_us", 10000) *
         1000ull;
+
+    // Opt-in deadline-aware bandwidth arbitration within a priority tier
+    // (RFC #2792). Default false = original FIFO order.
+    deadline_bw_arbitration_ =
+        conf->get("transports/rdma/deadline_bw_arbitration", false);
 
     // Opt-in per-entry promotion (issue #2528). Default false = historical
     // head-only "flush the tier" behavior.
@@ -450,6 +463,48 @@ void Workers::asyncPostSend() {
                 worker.inflight_slices.fetch_sub(1);
             }
             continue;
+        }
+
+        // RFC #2792 (opt-in): these slices all contend for one NIC path
+        // (local NIC -> remote NIC). submitSlices posts as many as the QP
+        // budget allows and returns num_submitted; the rest wait for the next
+        // round. Ordering by deadline urgency here means a flow about to miss
+        // its deadline claims the shared NIC's QP slots ahead of looser flows.
+        // Default (deadline_bw_arbitration_ == false) leaves order untouched,
+        // so behavior is byte-identical to today's FIFO / equal split.
+        if (deadline_bw_arbitration_ && slices.size() > 1) {
+            const uint64_t now_ns = getCurrentTimeInNano();
+            const double bw_bps = device_selector_
+                                      ? device_selector_->getSchedulingParams()
+                                                .default_bandwidth_gbps *
+                                            1e9 / 8.0
+                                      : 0.0;
+            if (bw_bps > 0.0) {
+                thread_local std::vector<ArbitrationEntry> scratch;
+                scratch.clear();
+                scratch.reserve(slices.size());
+
+                for (size_t i = 0; i < slices.size(); ++i) {
+                    const RdmaSlice* s = slices[i];
+                    ArbFlow flow{0, 0};
+                    if (s && s->task) {
+                        flow = ArbFlow{s->task->request.deadline_ns, s->length};
+                    }
+                    scratch.push_back(ArbitrationEntry{
+                        slices[i], PredictedMlu(flow, now_ns, bw_bps), i});
+                }
+
+                std::sort(
+                    scratch.begin(), scratch.end(),
+                    [](const ArbitrationEntry& a, const ArbitrationEntry& b) {
+                        if (a.mlu > b.mlu) return true;
+                        if (a.mlu < b.mlu) return false;
+                        return a.order < b.order;
+                    });
+                for (size_t i = 0; i < scratch.size(); ++i) {
+                    slices[i] = scratch[i].slice;
+                }
+            }
         }
 
         int num_submitted = endpoint->submitSlices(slices, tl_wid);

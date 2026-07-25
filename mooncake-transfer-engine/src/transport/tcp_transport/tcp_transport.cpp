@@ -964,15 +964,23 @@ int TcpTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
 int TcpTransport::registerLocalMemoryBatch(
     const std::vector<Transport::BufferEntry>& buffer_list,
     const std::string& location) {
-    for (auto& buffer : buffer_list)
-        registerLocalMemory(buffer.addr, buffer.length, location, true, false);
+    for (auto& buffer : buffer_list) {
+        int ret = registerLocalMemory(buffer.addr, buffer.length, location,
+                                      true, false);
+        if (ret) return ret;
+    }
     return metadata_->updateLocalSegmentDesc();
 }
 
 int TcpTransport::unregisterLocalMemoryBatch(
     const std::vector<void*>& addr_list) {
-    for (auto& addr : addr_list) unregisterLocalMemory(addr, false);
-    return metadata_->updateLocalSegmentDesc();
+    int first_error = 0;
+    for (auto& addr : addr_list) {
+        int ret = unregisterLocalMemory(addr, false);
+        if (ret && !first_error) first_error = ret;
+    }
+    int metadata_ret = metadata_->updateLocalSegmentDesc();
+    return first_error ? first_error : metadata_ret;
 }
 
 Status TcpTransport::getTransferStatus(BatchID batch_id, size_t task_id,

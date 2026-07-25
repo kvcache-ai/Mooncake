@@ -177,6 +177,7 @@ Status LocalTransferAdmissionQueue::tryAdmit(
         owner.batch_token = submit.batch_token;
         owner.request = owner_input.request;
         owner.kind = owner_input.kind;
+        owner.degradation_eligible = owner_input.degradation_eligible;
         owners_.emplace(owner_id, owner);
 
         public_to_owner_[{submit.batch_token, owner_input.owner_task_id}] =
@@ -276,7 +277,8 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
     // Predicted MLU = predicted_transfer_time / remaining_window. Returns true
     // if the owner is predicted to miss its deadline hard enough to drop.
     auto shouldDrop = [&](const QueueOwner& owner) -> bool {
-        if (!drop_enabled || bw_bps <= 0.0) return false;
+        if (!drop_enabled || !owner.degradation_eligible || bw_bps <= 0.0)
+            return false;
         const uint64_t deadline_ns = owner.request.deadline_ns;
         if (deadline_ns == 0) return false;      // no deadline
         if (deadline_ns <= now_ns) return true;  // already past

@@ -30,14 +30,14 @@ using namespace coro_rpc;
 using namespace async_simple;
 using namespace async_simple::coro;
 
-static_assert(mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL == 5000,
+static_assert(mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL == 10000,
               "Update kDefaultKvLeaseTtlFlagValue when "
               "DEFAULT_DEFAULT_KV_LEASE_TTL changes");
 static_assert(mooncake::DEFAULT_KV_SOFT_PIN_TTL_MS == 30 * 60 * 1000,
               "Update kDefaultKvSoftPinTtlFlagValue when "
               "DEFAULT_KV_SOFT_PIN_TTL_MS changes");
 
-constexpr char kDefaultKvLeaseTtlFlagValue[] = "5000";
+constexpr char kDefaultKvLeaseTtlFlagValue[] = "10000";
 constexpr char kDefaultKvSoftPinTtlFlagValue[] = "1800000";
 
 namespace {
@@ -114,7 +114,7 @@ DEFINE_string(config_path, "", "master service config file path");
 DEFINE_int32(port, 50051,
              "Port for master service to listen on (deprecated, use rpc_port)");
 DEFINE_int32(
-    max_threads, 4,
+    max_threads, 16,
     "Maximum number of threads to use (deprecated, use rpc_thread_num)");
 DEFINE_bool(enable_metric_reporting, true, "Enable periodic metric reporting");
 DEFINE_int32(metrics_port, 9003, "Port for HTTP metrics server to listen on");
@@ -667,7 +667,7 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
 
 void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
                            bool conf_set) {
-    if (FLAGS_max_threads != 4) {  // 4 is the default value
+    if (FLAGS_max_threads != 16) {  // 16 is the default value
         LOG(WARNING) << "max_threads is deprecated, use rpc_thread_num instead";
     }
     if (FLAGS_port != 50051) {  // 50051 is the default value
@@ -683,7 +683,7 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
     size_t rpc_thread_num;
     if (FLAGS_rpc_thread_num > 0) {
         rpc_thread_num = static_cast<size_t>(FLAGS_rpc_thread_num);
-        if (FLAGS_max_threads != 4) {  // 4 is the default value
+        if (FLAGS_max_threads != 16) {  // 16 is the default value
             LOG(WARNING) << "Both rpc_thread_num and max_threads are set. "
                          << "Using rpc_thread_num=" << FLAGS_rpc_thread_num
                          << ". Please migrate to use rpc_thread_num only.";
