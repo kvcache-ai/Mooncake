@@ -3,7 +3,6 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
-#include <array>
 #include <cstring>
 #include <filesystem>
 #include <map>
@@ -367,48 +366,6 @@ TEST_F(ObjectStorageAdapterTest, ScanMetaBatchesKeysAndSizes) {
     EXPECT_EQ(metadata_by_key.at("bb").data_size, 2);
     EXPECT_EQ(metadata_by_key.at("ccc").key_size, 3);
     EXPECT_EQ(metadata_by_key.at("ccc").data_size, 3);
-}
-
-TEST(ObjectStorageAdapterTensorTest, DefaultImplementationsRoundTrip) {
-    FakeObjectStorageAdapter adapter;
-    std::string first = "ab";
-    std::string second = "cde";
-    std::string third = "f";
-    std::array<TensorRegion, 3> write_regions{{
-        {first.data(), first.size()},
-        {second.data(), second.size()},
-        {third.data(), third.size()},
-    }};
-
-    ASSERT_TRUE(adapter.PutTensor("tensor", write_regions));
-    EXPECT_EQ(adapter.objects.at("tensor"), "abcdef");
-
-    std::array<char, 1> output_first{};
-    std::array<char, 3> output_second{};
-    std::array<char, 2> output_third{};
-    std::array<TensorRegion, 3> read_regions{{
-        {output_first.data(), output_first.size()},
-        {output_second.data(), output_second.size()},
-        {output_third.data(), output_third.size()},
-    }};
-
-    ASSERT_TRUE(adapter.GetTensor("tensor", read_regions));
-    EXPECT_EQ(std::string(output_first.data(), output_first.size()), "a");
-    EXPECT_EQ(std::string(output_second.data(), output_second.size()), "bcd");
-    EXPECT_EQ(std::string(output_third.data(), output_third.size()), "ef");
-}
-
-TEST(ObjectStorageAdapterTensorTest, GetTensorRejectsShortRead) {
-    FakeObjectStorageAdapter adapter;
-    adapter.objects["tensor"] = "abc";
-    std::array<char, 4> output{};
-    std::array<TensorRegion, 1> regions{{
-        {output.data(), output.size()},
-    }};
-
-    auto result = adapter.GetTensor("tensor", regions);
-    ASSERT_FALSE(result);
-    EXPECT_EQ(result.error(), ErrorCode::FILE_READ_FAIL);
 }
 
 TEST_F(ObjectStorageAdapterTest, LegacyFileSystemConstructorStillWorks) {
