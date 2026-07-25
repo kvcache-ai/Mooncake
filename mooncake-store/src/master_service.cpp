@@ -6699,66 +6699,64 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
     const long ideal_evict_num =
         std::ceil(total_eviction_base * evict_ratio_target);
-    const size_t no_pin_count = compact_frontier_prebypass
-                                    ? candidates.size()
-                                    : no_pin_timeouts.size();
+    const size_t no_pin_count =
+        compact_frontier_prebypass ? candidates.size() : no_pin_timeouts.size();
     const long primary_no_pin_num =
         std::min(ideal_evict_num, static_cast<long>(no_pin_count));
 
     // Re-scan metadata and copy full identities only for objects inside the
     // requested timestamp range. The eligibility conditions are identical to
     // the census above, so the selected set matches what the census counted.
-    auto collect_candidates =
-        [&](bool use_cutoff, std::chrono::system_clock::time_point cutoff,
-            bool collect_older_or_equal) {
-            std::vector<std::vector<Candidate>> local_frontier(num_threads);
-            std::vector<std::thread> collectors;
-            collectors.reserve(num_threads);
+    auto collect_candidates = [&](bool use_cutoff,
+                                  std::chrono::system_clock::time_point cutoff,
+                                  bool collect_older_or_equal) {
+        std::vector<std::vector<Candidate>> local_frontier(num_threads);
+        std::vector<std::thread> collectors;
+        collectors.reserve(num_threads);
 
-            for (int t = 0; t < num_threads; t++) {
-                collectors.emplace_back([&, t] {
-                    size_t s_start = t * shards_per_thread;
-                    size_t s_end =
-                        std::min(s_start + shards_per_thread, kNumShards);
-                    for (size_t s = s_start; s < s_end; s++) {
-                        MetadataShardAccessorRW shard(this, s);
-                        for (const auto& [tenant_id, tenant_state] :
-                             shard->tenants) {
-                            for (const auto& [key, metadata] :
-                                 tenant_state.metadata) {
-                                if (metadata.IsHardPinned() ||
-                                    !metadata.IsLeaseExpired(now) ||
-                                    metadata.IsSoftPinned(now) ||
-                                    !can_evict_replicas(metadata)) {
-                                    continue;
-                                }
-                                if (use_cutoff) {
-                                    const bool in_range =
-                                        collect_older_or_equal
-                                            ? metadata.lease_timeout <= cutoff
-                                            : metadata.lease_timeout > cutoff;
-                                    if (!in_range) continue;
-                                }
-                                local_frontier[t].push_back(
-                                    {s, tenant_id, key,
-                                     metadata.lease_timeout});
+        for (int t = 0; t < num_threads; t++) {
+            collectors.emplace_back([&, t] {
+                size_t s_start = t * shards_per_thread;
+                size_t s_end =
+                    std::min(s_start + shards_per_thread, kNumShards);
+                for (size_t s = s_start; s < s_end; s++) {
+                    MetadataShardAccessorRW shard(this, s);
+                    for (const auto& [tenant_id, tenant_state] :
+                         shard->tenants) {
+                        for (const auto& [key, metadata] :
+                             tenant_state.metadata) {
+                            if (metadata.IsHardPinned() ||
+                                !metadata.IsLeaseExpired(now) ||
+                                metadata.IsSoftPinned(now) ||
+                                !can_evict_replicas(metadata)) {
+                                continue;
                             }
+                            if (use_cutoff) {
+                                const bool in_range =
+                                    collect_older_or_equal
+                                        ? metadata.lease_timeout <= cutoff
+                                        : metadata.lease_timeout > cutoff;
+                                if (!in_range) continue;
+                            }
+                            local_frontier[t].push_back(
+                                {s, tenant_id, key, metadata.lease_timeout});
                         }
                     }
-                });
-            }
-            for (auto& collector : collectors) collector.join();
+                }
+            });
+        }
+        for (auto& collector : collectors) collector.join();
 
-            size_t total = 0;
-            for (const auto& v : local_frontier) total += v.size();
-            std::vector<Candidate> merged;
-            merged.reserve(total);
-            for (auto& v : local_frontier) {
-                merged.insert(merged.end(), std::make_move_iterator(v.begin()),
-                              std::make_move_iterator(v.end()));
-            }
-            return merged;
-        };
+        size_t total = 0;
+        for (const auto& v : local_frontier) total += v.size();
+        std::vector<Candidate> merged;
+        merged.reserve(total);
+        for (auto& v : local_frontier) {
+            merged.insert(merged.end(), std::make_move_iterator(v.begin()),
+                          std::make_move_iterator(v.end()));
+        }
+        return merged;
+    };
 
     bool compact_frontier_used = false;
     std::chrono::system_clock::time_point reserve_cutoff{};
@@ -6773,9 +6771,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
             (primary_count + kReserveSlackDivisor - 1) / kReserveSlackDivisor);
         const size_t reserve_count =
             std::min(no_pin_count, primary_count + reserve_slack);
-        const size_t frontier_limit = std::max(
-            kMinFrontierLimit,
-            (no_pin_count + kFrontierDivisor - 1) / kFrontierDivisor);
+        const size_t frontier_limit =
+            std::max(kMinFrontierLimit,
+                     (no_pin_count + kFrontierDivisor - 1) / kFrontierDivisor);
 
         if (reserve_count <= frontier_limit) {
             std::nth_element(no_pin_timeouts.begin(),
@@ -6849,8 +6847,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         /*allow_soft_pinned=*/false);
                     total_freed_size += evict_result.freed_bytes;
                     if (!it->second.IsGrouped()) {
-                        PublishKvRemovedAfterEvict(c.key, evict_result.freed_bytes,
-                                                   "cpu", it->second, c.tenant_id);
+                        PublishKvRemovedAfterEvict(
+                            c.key, evict_result.freed_bytes, "cpu", it->second,
+                            c.tenant_id);
                     }
                     if (!it->second.IsValid()) {
                         EraseMetadata(tenant_state, it, c.tenant_id,

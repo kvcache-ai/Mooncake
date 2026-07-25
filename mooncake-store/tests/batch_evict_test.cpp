@@ -128,11 +128,10 @@ class BatchEvictTest : public ::testing::Test {
         return false;
     }
 
-    static void SetLease(
-        MasterService& service, const std::string& key,
-        std::chrono::system_clock::time_point lease_timeout,
-        std::optional<std::chrono::system_clock::time_point> soft_pin_timeout =
-            std::nullopt) {
+    static void SetLease(MasterService& service, const std::string& key,
+                         std::chrono::system_clock::time_point lease_timeout,
+                         std::optional<std::chrono::system_clock::time_point>
+                             soft_pin_timeout = std::nullopt) {
         WithMetadata(service, key,
                      [&](MasterService::ObjectMetadata& metadata) {
                          SpinLocker locker(&metadata.lock);
@@ -188,8 +187,7 @@ class BatchEvictTest : public ::testing::Test {
 
     static BlockedGroupPopulation PopulateBlockedGroup(
         MasterService& service, const UUID& client_id,
-        const std::string& group_id, size_t blocked_count,
-        size_t plain_count) {
+        const std::string& group_id, size_t blocked_count, size_t plain_count) {
         const auto base = ExpiredBase();
         const auto active_lease =
             std::chrono::system_clock::now() + std::chrono::hours(1);
@@ -413,9 +411,9 @@ TEST_F(BatchEvictTest, ReserveAbsorbsExecutionFailuresAndMeetsTarget) {
 
     MasterService service(MakeConfig(/*allow_soft_pin_eviction=*/false));
     const UUID client_id = MountSegment(service);
-    const auto population = PopulateBlockedGroup(
-        service, client_id, "batch_evict_reserve_group", kBlockedCount,
-        kPlainCount);
+    const auto population =
+        PopulateBlockedGroup(service, client_id, "batch_evict_reserve_group",
+                             kBlockedCount, kPlainCount);
     ASSERT_EQ(service.GetKeyCount(), population.total_objects);
 
     RunBatchEvict(service, /*target=*/0.05, /*lowerbound=*/0.05);
@@ -429,9 +427,9 @@ TEST_F(BatchEvictTest, ReserveAbsorbsExecutionFailuresAndMeetsTarget) {
         EXPECT_FALSE(Exists(service, Key(population.plain_begin + i)))
             << "oldest plain object survived at offset=" << i;
     }
-    EXPECT_EQ(CountAlive(service, population.plain_begin,
-                         population.total_objects),
-              kPlainCount - kExpectedEvicted);
+    EXPECT_EQ(
+        CountAlive(service, population.plain_begin, population.total_objects),
+        kPlainCount - kExpectedEvicted);
 }
 
 // Refill: when every candidate inside the reserve frontier fails during
@@ -447,9 +445,9 @@ TEST_F(BatchEvictTest, RefillAfterReserveExhaustionStillMeetsTarget) {
 
     MasterService service(MakeConfig(/*allow_soft_pin_eviction=*/false));
     const UUID client_id = MountSegment(service);
-    const auto population = PopulateBlockedGroup(
-        service, client_id, "batch_evict_refill_group", kBlockedCount,
-        kPlainCount);
+    const auto population =
+        PopulateBlockedGroup(service, client_id, "batch_evict_refill_group",
+                             kBlockedCount, kPlainCount);
     ASSERT_EQ(service.GetKeyCount(), population.total_objects);
 
     RunBatchEvict(service, /*target=*/0.05, /*lowerbound=*/0.05);
@@ -461,9 +459,9 @@ TEST_F(BatchEvictTest, RefillAfterReserveExhaustionStillMeetsTarget) {
     EXPECT_EQ(CountAlive(service, 0, kBlockedCount), kBlockedCount)
         << "blocked group members must survive";
     EXPECT_TRUE(Exists(service, Key(population.keeper_index)));
-    EXPECT_EQ(CountAlive(service, population.plain_begin,
-                         population.total_objects),
-              kPlainCount - kExpectedEvicted);
+    EXPECT_EQ(
+        CountAlive(service, population.plain_begin, population.total_objects),
+        kPlainCount - kExpectedEvicted);
 }
 
 }  // namespace mooncake::test
