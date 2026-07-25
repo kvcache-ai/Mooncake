@@ -94,6 +94,10 @@ endif()
 
 option(EP_USE_IDE "Enable intelligent indexing for IDEs" OFF)
 if (WITH_EP)
+  # Stage the native EP and PyTorch-versioned PG extensions for build_wheel.sh.
+  # The dedicated directory is injected after auditwheel.
+  set(EP_PG_STAGING_DIR "${CMAKE_BINARY_DIR}/ep_pg_staging")
+
   if (EP_USE_IDE)
     message(WARNING "EP_USE_IDE enabled. DO NOT USE IN PRODUCTION!")
     add_subdirectory(mooncake-ep)
@@ -128,10 +132,6 @@ if (WITH_EP)
     endif()
     set(EP_TORCH_VERSIONS "${EP_TORCH_VERSIONS}" CACHE STRING
         "PyTorch versions for EP/PG extensions, semicolon-separated (empty = use currently-installed torch)")
-
-    # PG extensions are staged during their setup.py builds and injected after
-    # auditwheel so their original accelerator fatbins remain untouched.
-    set(EP_PG_STAGING_DIR "${CMAKE_BINARY_DIR}/ep_pg_staging")
 
     # Convert semicolon-separated lists to pipe-separated strings so they survive
     # CMake's COMMAND list-splitting (semicolons are CMake list separators).

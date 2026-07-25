@@ -123,15 +123,10 @@ else
     echo "Skipping libascend_transport_mem.so (not built - Ascend disabled)"
 fi
 
-# The native EP extension is built by CMake.  Keep it in the wheel before
-# auditwheel repair so its non-system shared-library dependencies are bundled.
-if compgen -G "${BUILD_DIR}/mooncake-ep/src/_ep*.so" >/dev/null; then
-    cp "${BUILD_DIR}"/mooncake-ep/src/_ep*.so mooncake-wheel/mooncake/
-fi
-
-# PG accelerator extensions are built during the cmake/make process when the project
-# is configured with -DWITH_EP=ON.  The resulting .so files land in
-# ${BUILD_DIR}/ep_pg_staging and are injected into the wheel AFTER auditwheel.
+# EP/PG CUDA extensions are built during the cmake/make process when the
+# project is configured with -DWITH_EP=ON.  The resulting .so files land in
+# ${BUILD_DIR}/ep_pg_staging and are injected into the wheel AFTER auditwheel
+# so that patchelf never touches CUDA fatbins (see injection step below).
 # Use an absolute path: the script later `cd`s into mooncake-wheel/ and a
 # relative path would silently point to the wrong location.
 CUDA_EP_STAGING_DIR="${BUILD_DIR_ABS}/ep_pg_staging"
@@ -141,10 +136,10 @@ CUDA_EP_STAGING_DIR="${BUILD_DIR_ABS}/ep_pg_staging"
 # temporary location so they survive the cleanup.
 CUDA_EP_STAGING_TEMP=""
 if [ "$CI" = "true" ] || [ "$FREE_BUILD_DIR" = "1" ]; then
-    if [ -d "$CUDA_EP_STAGING_DIR" ] && ls "$CUDA_EP_STAGING_DIR"/pg_*.so &>/dev/null; then
+    if [ -d "$CUDA_EP_STAGING_DIR" ] && ls "$CUDA_EP_STAGING_DIR"/*.so &>/dev/null; then
         CUDA_EP_STAGING_TEMP=$(mktemp -d)
-        cp "$CUDA_EP_STAGING_DIR"/pg_*.so "$CUDA_EP_STAGING_TEMP/"
-        echo "Preserved PG extension .so files to ${CUDA_EP_STAGING_TEMP} before build-dir cleanup"
+        cp "$CUDA_EP_STAGING_DIR"/*.so "$CUDA_EP_STAGING_TEMP/"
+        echo "Preserved EP/PG .so files to ${CUDA_EP_STAGING_TEMP} before build-dir cleanup"
     fi
     echo "Freeing disk space: removing build directory (artifacts already copied)"
     rm -rf "${BUILD_DIR}/"
@@ -172,6 +167,10 @@ cd mooncake-wheel
 cp ../README.md README.md
 
 WHEEL_DIR="$(pwd)"
+# auditwheel resolves engine.so's package-local libasio.so through the dynamic
+# loader. Keep the wheel staging directory searchable after FREE_BUILD_DIR has
+# removed the original CMake build directory.
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:${WHEEL_DIR}/mooncake"
 cleanup_wheel_metadata_state() {
     [[ -f "${WHEEL_DIR}/pyproject.toml.backup" ]] && mv "${WHEEL_DIR}/pyproject.toml.backup" "${WHEEL_DIR}/pyproject.toml"
     rm -f "${WHEEL_DIR}/README.md"
@@ -460,15 +459,17 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude liburma.so* \
     -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
 
-# Inject the PyTorch-versioned PG extensions into the repaired wheel.
-if [ -d "$CUDA_EP_STAGING_DIR" ] && ls "$CUDA_EP_STAGING_DIR"/pg_*.so &>/dev/null; then
+# Inject CUDA extensions into the repaired wheel.  patchelf (used by auditwheel)
+# can corrupt CUDA fatbins, causing cudaErrorInvalidKernelImage, so these .so
+# files are kept out of auditwheel and added here with RPATH=$ORIGIN intact.
+if [ -d "$CUDA_EP_STAGING_DIR" ] && ls "$CUDA_EP_STAGING_DIR"/*.so &>/dev/null; then
     REPAIRED_WHEEL=$(ls ${REPAIRED_DIR}/*.whl 2>/dev/null | head -1)
     if [ -n "$REPAIRED_WHEEL" ]; then
-        echo "Injecting PG extension .so files into repaired wheel..."
+        echo "Injecting CUDA extension .so files into repaired wheel..."
         WHEEL_UNPACK_DIR=$(mktemp -d)
         python${PYTHON_VERSION} -m wheel unpack "$REPAIRED_WHEEL" -d "$WHEEL_UNPACK_DIR"
         UNPACKED_PKG_DIR=$(find "$WHEEL_UNPACK_DIR" -mindepth 1 -maxdepth 1 -type d | head -1)
-        for so_file in "$CUDA_EP_STAGING_DIR"/pg_*.so; do
+        for so_file in "$CUDA_EP_STAGING_DIR"/*.so; do
             if [ -f "$so_file" ]; then
                 echo "  Adding $(basename "$so_file")"
                 cp "$so_file" "$UNPACKED_PKG_DIR/mooncake/$(basename "$so_file")"

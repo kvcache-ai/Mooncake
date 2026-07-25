@@ -7,8 +7,9 @@ set(MOONCAKE_EP_SOURCES
     mooncake_ep_elastic_kernel.cu)
 
 pybind11_add_module(_ep MODULE ${MOONCAKE_EP_SOURCES})
-set_target_properties(_ep PROPERTIES POSITION_INDEPENDENT_CODE ON)
-set_target_properties(_ep PROPERTIES INSTALL_RPATH "$ORIGIN")
+set_target_properties(_ep PROPERTIES POSITION_INDEPENDENT_CODE ON
+                      BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN"
+                      BUILD_WITH_INSTALL_RPATH TRUE)
 if(USE_CUDA)
   set(_ep_cuda_architectures "")
   foreach(_torch_arch IN LISTS TORCH_CUDA_ARCH_LIST)
@@ -36,8 +37,40 @@ if(USE_MACA)
 endif()
 
 target_include_directories(_ep PRIVATE ${Python3_INCLUDE_DIRS})
-target_link_libraries(_ep PRIVATE transfer_engine ibverbs mlx5 glog::glog
-                                  gflags::gflags)
+# Keep the EP extension's ELF dependency boundary aligned with the legacy
+# setup.py build: depend on the packaged engine.so, not Transfer Engine's
+# transitive link interface. This lets auditwheel repair engine.so's optional
+# dependency closure before _ep is injected into the repaired wheel.
+add_dependencies(_ep engine)
+execute_process(
+  COMMAND ${Python3_EXECUTABLE} -c
+          "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))"
+  OUTPUT_VARIABLE _ep_python_ext_suffix
+  OUTPUT_STRIP_TRAILING_WHITESPACE)
+set(_ep_engine_link "${CMAKE_BINARY_DIR}/mooncake-integration/engine.so")
+add_custom_command(
+    OUTPUT "${_ep_engine_link}"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink
+            "engine${_ep_python_ext_suffix}"
+            "${_ep_engine_link}"
+    DEPENDS engine)
+add_custom_target(ep_engine_link DEPENDS "${_ep_engine_link}")
+add_dependencies(_ep ep_engine_link)
+target_link_options(_ep PRIVATE
+  "-L$<TARGET_FILE_DIR:engine>"
+  "-Wl,--push-state,--no-as-needed"
+  "-l:engine.so"
+  "-Wl,--pop-state")
+target_link_libraries(_ep PRIVATE ibverbs mlx5 gflags::gflags)
+
+if(DEFINED EP_PG_STAGING_DIR)
+  add_custom_command(
+      TARGET _ep
+      POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E make_directory "${EP_PG_STAGING_DIR}"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:_ep>"
+              "${EP_PG_STAGING_DIR}/$<TARGET_FILE_NAME:_ep>")
+endif()
 
 if(USE_CUDA)
   target_compile_options(
