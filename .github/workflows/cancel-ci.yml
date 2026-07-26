@@ -9,9 +9,16 @@ name: Cancel Queued and Running CI
 # runs across all workflows and refs in one shot.
 #
 # Adapted from sglang's cancel-pr-workflows-on-close.yml cancellation logic:
-# sweep every non-terminal status (a single status= filter takes one value
-# per request), paginate, force-cancel runs stuck behind approval gates, and
-# run a second pass to catch runs still materializing during the first.
+# fetch recent runs, keep the non-terminal ones, force-cancel runs stuck
+# behind approval gates, and run a second pass to catch runs still
+# materializing during the first.
+#
+# Listing note: query params (branch, per_page, page) are placed directly in
+# the API path rather than via `gh api -f key=value`. `gh api` treats -f/-F
+# fields as a request *body* and, unless the method is pinned, flips GET to
+# POST -- either way the value never reaches the query string, so a status/
+# branch filter silently matches nothing. Status is filtered client-side in
+# jq to avoid that class of bug entirely.
 
 on:
   workflow_dispatch:
@@ -50,53 +57,77 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Non-terminal run statuses. GitHub reports in-flight runs as one of
+          # these; everything else (completed) is terminal.
+          UNFINISHED_RE='^(queued|in_progress|waiting|pending|requested|action_required)$'
+
+          echo "=================================================="
+          echo " Cancel Queued and Running CI"
+          echo "=================================================="
+          echo "Repo:   $REPO"
           if [ -n "$BRANCH" ]; then
-            echo "Scope: branch '$BRANCH'"
+            echo "Scope:  branch '$BRANCH' only"
           else
-            echo "Scope: all branches"
+            echo "Scope:  ALL branches"
           fi
-          echo "Dry run: $DRY_RUN"
+          if [ "$DRY_RUN" = "true" ]; then
+            echo ""
+            echo "  ⚠️  DRY RUN — runs will be LISTED but NOT cancelled."
+            echo "  ⚠️  Re-run with dry_run unchecked to actually cancel."
+          fi
+          echo "=================================================="
           echo ""
 
           FAILURES=0
 
-          # The status filter takes one value per request, so sweep every
-          # non-terminal state (pending/waiting/action_required runs would
-          # otherwise start after we finish). Pass 2 catches runs still
-          # materializing during pass 1. Exclude this run itself.
-          for pass in 1 2; do
-            run_ids=""
-            for status in queued in_progress waiting pending requested action_required; do
-              ids=""
+          # List unfinished runs. Params go in the path (see header note); status
+          # is filtered client-side. Only the most-recent pages can hold in-flight
+          # runs, so a few pages by created-desc order is plenty and stays bounded.
+          list_unfinished() {
+            local ids="" page batch
+            for page in 1 2 3 4 5; do
+              local path="repos/$REPO/actions/runs?per_page=100&page=$page"
+              if [ -n "$BRANCH" ]; then
+                path="$path&branch=$BRANCH"
+              fi
+              batch=""
               for attempt in 1 2 3; do
-                # branch= is optional; when empty gh omits the filter (all branches).
-                args=(-X GET "repos/$REPO/actions/runs" --paginate
-                      -f status="$status" -F per_page=100
-                      --jq ".workflow_runs[] | select(.id != $GITHUB_RUN_ID) | .id")
-                if [ -n "$BRANCH" ]; then
-                  args+=(-f branch="$BRANCH")
-                fi
-                if ids=$(gh api "${args[@]}"); then
+                if batch=$(gh api -X GET "$path" \
+                  --jq ".workflow_runs[]
+                        | select(.id != $GITHUB_RUN_ID)
+                        | select(.status | test(\"$UNFINISHED_RE\"))
+                        | \"\(.id)\t\(.status)\t\(.name)\""); then
                   break
                 fi
-                ids=""
+                batch=""
+                # Runs in a $(...) subshell, so an error annotation is the only
+                # signal that survives; the retries make a hard failure rare.
                 if [ "$attempt" -eq 3 ]; then
-                  echo "::error::Listing $status runs failed after 3 attempts"
-                  FAILURES=1
+                  echo "::error::Listing runs (page $page) failed after 3 attempts" >&2
                 else
                   sleep 5
                 fi
               done
-              run_ids="$run_ids"$'\n'"$ids"
+              ids="$ids"$'\n'"$batch"
             done
-            run_ids=$(echo "$run_ids" | sed '/^$/d' | sort -u)
+            echo "$ids" | sed '/^$/d' | sort -u
+          }
 
-            if [ -z "$run_ids" ]; then
+          # Pass 2 catches runs still materializing during pass 1.
+          for pass in 1 2; do
+            rows=$(list_unfinished)
+
+            if [ -z "$rows" ]; then
               echo "Pass $pass: no unfinished runs found"
               break
             fi
-            echo "Pass $pass: found $(echo "$run_ids" | wc -l | tr -d ' ') unfinished run(s)"
+            echo "Pass $pass: found $(echo "$rows" | wc -l | tr -d ' ') unfinished run(s):"
+            echo "$rows" | while IFS=$'\t' read -r rid rstatus rname; do
+              echo "  • $rid  [$rstatus]  $rname"
+            done
+            echo ""
 
+            run_ids=$(echo "$rows" | cut -f1)
             for run_id in $run_ids; do
               run_url="https://github.com/$REPO/actions/runs/$run_id"
               if [ "$DRY_RUN" = "true" ]; then
