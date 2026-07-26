@@ -2,6 +2,7 @@
 #include <glog/logging.h>
 #include <filesystem>
 #include <fstream>
+#include <system_error>
 
 #include "ha/oplog/localfs_oplog_store.h"
 #include "ha/oplog/oplog_store_factory.h"
@@ -275,6 +276,87 @@ TEST_F(LocalFsOpLogStoreTest, GetLatestSequenceIdFirstBoot) {
     EXPECT_EQ(0, seq);
 }
 
+TEST_F(LocalFsOpLogStoreTest, GetLatestSequenceIdMissingFileDefaultsToZero) {
+    auto store = CreateReader();
+    const std::string latest_path = test_dir_ + "/" + cluster_id_ + "/latest";
+    ASSERT_FALSE(fs::exists(latest_path));
+
+    uint64_t seq = 999;
+    EXPECT_EQ(ErrorCode::OK, store->GetLatestSequenceId(seq));
+    EXPECT_EQ(0, seq);
+}
+
+TEST_F(LocalFsOpLogStoreTest, GetLatestSequenceIdReturnsErrorOnStatFailure) {
+    auto store = CreateReader();
+    const std::string cluster_path = test_dir_ + "/" + cluster_id_;
+    fs::create_directories(cluster_path);
+    std::error_code permission_error;
+    fs::permissions(cluster_path, fs::perms::none, fs::perm_options::replace,
+                    permission_error);
+    ASSERT_FALSE(permission_error) << permission_error.message();
+
+    uint64_t seq = 999;
+    auto err = store->GetLatestSequenceId(seq);
+
+    fs::permissions(cluster_path, fs::perms::owner_all,
+                    fs::perm_options::replace, permission_error);
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err);
+}
+
+TEST_F(LocalFsOpLogStoreTest, GetLatestSequenceIdRejectsTrailingGarbage) {
+    auto store = CreateWriter();
+    const std::string latest_path = test_dir_ + "/" + cluster_id_ + "/latest";
+    std::ofstream(latest_path, std::ios::trunc) << "42junk";
+
+    uint64_t seq = 999;
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, store->GetLatestSequenceId(seq));
+}
+
+TEST_F(LocalFsOpLogStoreTest, GetLatestSequenceIdRejectsInvalidContent) {
+    auto store = CreateWriter();
+    const std::string latest_path = test_dir_ + "/" + cluster_id_ + "/latest";
+    std::ofstream(latest_path, std::ios::trunc) << "not-a-number";
+
+    uint64_t seq = 999;
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, store->GetLatestSequenceId(seq));
+}
+
+TEST_F(LocalFsOpLogStoreTest, GetLatestSequenceIdRejectsEmptyFile) {
+    auto store = CreateWriter();
+    const std::string latest_path = test_dir_ + "/" + cluster_id_ + "/latest";
+    std::ofstream(latest_path, std::ios::trunc);
+
+    uint64_t seq = 999;
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, store->GetLatestSequenceId(seq));
+}
+
+TEST_F(LocalFsOpLogStoreTest, GetLatestSequenceIdRejectsNegativeNumber) {
+    auto store = CreateWriter();
+    const std::string latest_path = test_dir_ + "/" + cluster_id_ + "/latest";
+    std::ofstream(latest_path, std::ios::trunc) << "-42";
+
+    uint64_t seq = 999;
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, store->GetLatestSequenceId(seq));
+}
+
+TEST_F(LocalFsOpLogStoreTest, GetLatestSequenceIdRejectsMultipleTokens) {
+    auto store = CreateWriter();
+    const std::string latest_path = test_dir_ + "/" + cluster_id_ + "/latest";
+    std::ofstream(latest_path, std::ios::trunc) << "42 43";
+
+    uint64_t seq = 999;
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, store->GetLatestSequenceId(seq));
+}
+
+TEST_F(LocalFsOpLogStoreTest, GetLatestSequenceIdRejectsOutOfRangeValue) {
+    auto store = CreateWriter();
+    const std::string latest_path = test_dir_ + "/" + cluster_id_ + "/latest";
+    std::ofstream(latest_path, std::ios::trunc) << "18446744073709551616";
+
+    uint64_t seq = 999;
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, store->GetLatestSequenceId(seq));
+}
+
 TEST_F(LocalFsOpLogStoreTest, GetMaxSequenceIdEmpty) {
     auto store = CreateWriter();
     uint64_t seq = 0;
@@ -361,6 +443,17 @@ TEST_F(LocalFsOpLogStoreTest, SnapshotRecordAndGet) {
     uint64_t seq = 0;
     EXPECT_EQ(ErrorCode::OK, store->GetSnapshotSequenceId("snap1", seq));
     EXPECT_EQ(42, seq);
+}
+
+TEST_F(LocalFsOpLogStoreTest, SnapshotSequenceRejectsTrailingGarbage) {
+    auto store = CreateWriter();
+    ASSERT_EQ(ErrorCode::OK, store->RecordSnapshotSequenceId("snap1", 42));
+    const std::string snapshot_path =
+        test_dir_ + "/" + cluster_id_ + "/snapshots/snap1";
+    std::ofstream(snapshot_path, std::ios::trunc) << "42junk";
+
+    uint64_t seq = 999;
+    EXPECT_NE(ErrorCode::OK, store->GetSnapshotSequenceId("snap1", seq));
 }
 
 TEST_F(LocalFsOpLogStoreTest, SnapshotNotFound) {

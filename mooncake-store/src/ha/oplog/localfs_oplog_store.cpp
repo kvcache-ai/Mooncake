@@ -3,9 +3,11 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <system_error>
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -221,11 +223,26 @@ ErrorCode LocalFsOpLogStore::ReadUint64FromFile(const std::string& filepath,
         return ErrorCode::INTERNAL_ERROR;
     }
     std::string content;
-    f >> content;
+    if (!(f >> content)) {
+        LOG(ERROR) << "ReadUint64FromFile: empty or unreadable file "
+                   << filepath;
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    std::string extra;
+    if (f >> extra) {
+        LOG(ERROR) << "ReadUint64FromFile: extra content in " << filepath;
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    if (!std::all_of(content.begin(), content.end(),
+                     [](unsigned char c) { return std::isdigit(c); })) {
+        LOG(ERROR) << "ReadUint64FromFile: invalid content in " << filepath
+                   << ": " << content;
+        return ErrorCode::INTERNAL_ERROR;
+    }
     try {
         value = std::stoull(content);
     } catch (...) {
-        LOG(ERROR) << "ReadUint64FromFile: invalid content in " << filepath
+        LOG(ERROR) << "ReadUint64FromFile: value out of range in " << filepath
                    << ": " << content;
         return ErrorCode::INTERNAL_ERROR;
     }
@@ -696,11 +713,22 @@ ErrorCode LocalFsOpLogStore::ReadOpLogSince(uint64_t start_sequence_id,
 
 ErrorCode LocalFsOpLogStore::GetLatestSequenceId(uint64_t& sequence_id) {
     std::string latest_path = LatestFilePath();
-    auto err = ReadUint64FromFile(latest_path, sequence_id);
-    if (err != ErrorCode::OK) {
-        // File doesn't exist yet — default to 0
+    std::error_code exists_error;
+    bool latest_exists = fs::exists(latest_path, exists_error);
+    if (exists_error) {
+        LOG(ERROR) << "GetLatestSequenceId: failed to stat " << latest_path
+                   << ": " << exists_error.message();
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    if (!latest_exists) {
+        // File does not exist yet; default to 0
         sequence_id = 0;
         return ErrorCode::OK;
+    }
+
+    auto err = ReadUint64FromFile(latest_path, sequence_id);
+    if (err != ErrorCode::OK) {
+        return err;
     }
     return ErrorCode::OK;
 }
