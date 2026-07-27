@@ -28,7 +28,7 @@
 use std::ffi::{c_void, OsStr, OsString};
 use std::os::raw::c_int;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use libloading::Library;
 
@@ -192,6 +192,8 @@ unsafe impl Sync for Api {}
 
 /// Process-wide, load-once handle.
 static API: OnceLock<Api> = OnceLock::new();
+/// Serializes initialization so a concurrent race dlopen()s at most once.
+static INIT_LOCK: Mutex<()> = Mutex::new(());
 
 fn library_path() -> OsString {
     std::env::var_os(LIBRARY_ENV).unwrap_or_else(|| OsString::from(DEFAULT_LIBRARY))
@@ -201,9 +203,15 @@ fn library_path() -> OsString {
 /// library loads lazily on first store creation. Must be called before any
 /// store exists, and fails if a library is already loaded.
 pub fn load_library(path: impl AsRef<Path>) -> Result<(), StoreError> {
+    let _guard = INIT_LOCK.lock().unwrap();
     let api = unsafe { Api::load(path.as_ref().as_os_str()) }?;
-    API.set(api)
-        .map_err(|_| StoreError::LibraryLoad("Mooncake library is already loaded".to_string()))
+    API.set(api).map_err(|_| {
+        StoreError::LibraryLoad(
+            "Mooncake library already loaded; load_library() must be called before \
+             creating any MooncakeStore"
+                .to_string(),
+        )
+    })
 }
 
 /// Load the library from the default path on first use. Called by
@@ -212,9 +220,13 @@ pub fn ensure_loaded() -> Result<(), StoreError> {
     if API.get().is_some() {
         return Ok(());
     }
+    // Double-checked under the lock so a concurrent race dlopen()s at most once.
+    let _guard = INIT_LOCK.lock().unwrap();
+    if API.get().is_some() {
+        return Ok(());
+    }
     let api = unsafe { Api::load(&library_path()) }?;
-    // A concurrent thread may win the race; keeping either load is fine.
-    let _ = API.set(api);
+    let _ = API.set(api); // holding INIT_LOCK, so this always succeeds
     Ok(())
 }
 

@@ -434,6 +434,16 @@ install(TARGETS mooncake_master mooncake_client DESTINATION bin)
 # (glog, cudart, ibverbs, ...) and, when enabled, the Go etcd/k8s HA backends.
 # ---------------------------------------------------------------------------
 if(WITH_STORE_C_SHARED)
+  # The link recipe below uses GNU-ld/ELF-specific features (--whole-archive,
+  # --as-needed, a version script, and $ORIGIN rpath). Fail early on platforms
+  # where they don't apply rather than at link time.
+  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(
+      FATAL_ERROR
+        "WITH_STORE_C_SHARED currently supports Linux/ELF with the GNU linker "
+        "only (got CMAKE_SYSTEM_NAME=${CMAKE_SYSTEM_NAME}).")
+  endif()
+
   # This target whole-archives mooncake_store and reuses its OUTPUT_NAME, both of
   # which assume mooncake_store is a static archive. add_library(mooncake_store)
   # follows BUILD_SHARED_LIBS, so guard against a shared mooncake_store (e.g. when
@@ -455,7 +465,9 @@ if(WITH_STORE_C_SHARED)
     PROPERTIES OUTPUT_NAME mooncake_store
                CXX_VISIBILITY_PRESET hidden
                VISIBILITY_INLINES_HIDDEN ON
-               INSTALL_RPATH "$ORIGIN")
+               INSTALL_RPATH "$ORIGIN"
+               # Relink when the version script changes (it is only a link flag).
+               LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/store_c.map")
   add_dependencies(mooncake_store_c mooncake_store)
   # Whole-archive the static lib via its file path (which does not drag in
   # interface deps) and asio_static, absorbing their objects. Then link the

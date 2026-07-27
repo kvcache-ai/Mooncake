@@ -20,7 +20,7 @@ default = ["link"]
 # with bindgen and links the Mooncake C++ static-library graph, so a built
 # Mooncake tree (libraries + `store_c.h`) must be present at build time. This is
 # the historical behavior.
-link = []
+link = ["dep:bindgen"]
 # Load `libmooncake_store.so` at run time via `dlopen` (libloading). The crate
 # builds with no Mooncake C++ toolchain, headers, or generated bindings present;
 # the shared library is only required at run time. See `src/ffi_dlopen.rs`.
@@ -31,11 +31,7 @@ thiserror = "2.0"
 libc = "0.2"
 libloading = { version = "0.8", optional = true }
 
-# NOTE: bindgen is only *invoked* by build.rs under the `link` feature, but it is
-# kept as a normal (non-optional) build-dependency because Cargo build scripts do
-# not receive feature cfgs, so build.rs must be able to name `bindgen::`
-# regardless. A `dlopen`-only build therefore still compiles the bindgen crate
-# (it is just never called); fully dropping it would need pre-generated bindings
-# or a separate `-sys` crate for the `link` backend.
+# bindgen is only needed by the `link` backend; build.rs gates all bindgen use
+# behind `#[cfg(feature = "link")]`, so a `dlopen`-only build does not compile it.
 [build-dependencies]
-bindgen = "0.70"
+bindgen = { version = "0.70", optional = true }
