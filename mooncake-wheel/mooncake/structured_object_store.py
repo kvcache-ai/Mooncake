@@ -3449,23 +3449,24 @@ class _BundleManifestStore:
                 config=config,
             )
             written_keys.extend(meta_keys)
+            cleanup_key_list = list(dict.fromkeys(cleanup_keys or []))
+            buffer_object_ids = {
+                self._object_id_from_bundle_key(str(payload_spec["key"]))
+                for payload_spec in buffers.values()
+            }
+            buffer_object_ids.update(
+                self._object_id_from_bundle_key(key) for key in cleanup_key_list
+            )
             manifest = {
                 "version": 1,
                 "layout": "bundle",
                 "object_id": object_id,
                 "meta": meta_spec,
                 "buffers": dict(buffers),
-                "buffer_object_ids": sorted(
-                    {
-                        str(payload_spec["key"])
-                        .removeprefix(f"{self._key_prefix}/")
-                        .split("/buffer/", 1)[0]
-                        for payload_spec in buffers.values()
-                    }
-                ),
+                "buffer_object_ids": sorted(item for item in buffer_object_ids if item),
             }
-            if cleanup_keys:
-                manifest["cleanup_keys"] = list(dict.fromkeys(cleanup_keys))
+            if cleanup_key_list:
+                manifest["cleanup_keys"] = cleanup_key_list
             self._validate_manifest(manifest)
             manifest_blob = _encode_manifest(manifest)
             _check_status(
@@ -3755,6 +3756,16 @@ class _BundleManifestStore:
         if result.copy_mode not in {"auto", "zero_copy", "copy"}:
             raise ValueError(f"unsupported copy_mode: {result.copy_mode}")
         return result
+
+    def _object_id_from_bundle_key(self, key: str) -> str | None:
+        prefix = f"{self._key_prefix}/"
+        if not key.startswith(prefix):
+            return None
+        suffix = key[len(prefix) :]
+        for marker in ("/manifest", "/meta", "/buffer/"):
+            if marker in suffix:
+                return suffix.split(marker, 1)[0]
+        return None
 
     def _validate_manifest(self, manifest: Mapping[str, Any]) -> None:
         if manifest.get("version") != 1 or manifest.get("layout") != "bundle":
