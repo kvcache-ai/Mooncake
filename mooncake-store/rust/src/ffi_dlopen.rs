@@ -28,12 +28,13 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::error::StoreError;
 
-/// Bindgen-generated dynamic bindings (`MooncakeStoreLib` + the C types).
+/// Bindgen-generated dynamic bindings (`MooncakeStoreLib` + the C types),
+/// committed and regenerated via the `generate_dlopen_bindings` example.
 mod sys {
     #![allow(non_camel_case_types, non_snake_case, non_upper_case_globals)]
     #![allow(dead_code)]
     #![allow(clippy::all)] // generated code
-    include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+    include!("generated/ffi_dlopen_bindings.rs");
 }
 
 // Re-export the C types so `crate::store` can name them backend-agnostically.
@@ -41,7 +42,16 @@ pub use sys::{mooncake_replicate_config_t, mooncake_store_t};
 
 /// Environment variable naming the shared library to load.
 const LIBRARY_ENV: &str = "MOONCAKE_STORE_LIBRARY";
-/// Default library name, resolved via the OS loader search path.
+/// Default library name, resolved via the OS loader search path. Platform-aware
+/// so a non-Linux consumer that built its own library still finds it by default
+/// (the `WITH_STORE_C_SHARED` producer is Linux-only, but the loader is not).
+#[cfg(target_os = "linux")]
+const DEFAULT_LIBRARY: &str = "libmooncake_store.so";
+#[cfg(target_os = "macos")]
+const DEFAULT_LIBRARY: &str = "libmooncake_store.dylib";
+#[cfg(target_os = "windows")]
+const DEFAULT_LIBRARY: &str = "mooncake_store.dll";
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 const DEFAULT_LIBRARY: &str = "libmooncake_store.so";
 
 /// Process-wide, load-once handle to the generated loader.
@@ -214,12 +224,16 @@ mod tests {
     // env/global: no unit test loads a real library, so API stays unset.
     #[test]
     fn new_with_missing_library_reports_library_load_error() {
+        let prev = std::env::var_os(LIBRARY_ENV);
         std::env::set_var(
             LIBRARY_ENV,
             "/nonexistent/does-not-exist/libmooncake_store.so",
         );
         let result = crate::MooncakeStore::new();
-        std::env::remove_var(LIBRARY_ENV);
+        match prev {
+            Some(v) => std::env::set_var(LIBRARY_ENV, v),
+            None => std::env::remove_var(LIBRARY_ENV),
+        }
         // MooncakeStore isn't Debug, so match rather than expect_err.
         assert!(
             matches!(result, Err(StoreError::LibraryLoad(_))),

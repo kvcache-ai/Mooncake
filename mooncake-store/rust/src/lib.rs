@@ -45,8 +45,9 @@
 //!
 //! - `link` (default): statically link `libmooncake_store` at build time
 //!   (bindgen; requires a built Mooncake C++ tree + `store_c.h`).
-//! - `dlopen`: load `libmooncake_store.so` at run time; builds with no C++
-//!   toolchain present. See [`load_library`].
+//! - `dlopen`: load `libmooncake_store.so` at run time from committed bindings;
+//!   builds with only `libloading` (no bindgen, header, or C++ toolchain). See
+//!   the `load_library` function (exported under this feature).
 //!
 //! At least one must be enabled. If both are enabled (e.g. via Cargo feature
 //! unification), `link` takes precedence.

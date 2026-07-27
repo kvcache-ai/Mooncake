@@ -12,12 +12,11 @@ takes precedence:
   `build.rs` generates the FFI with bindgen and links the C++ dependency graph,
   so a built Mooncake tree (libraries + `store_c.h`) must be present at build
   time. Everything below assumes this backend.
-- **`dlopen`**: loads `libmooncake_store.so` at run time via `libloading`.
-  `build.rs` still runs bindgen to generate the loader from `store_c.h` (so the
-  ABI is not hand-written), so the header + libclang are needed to *build* — but
-  it links no C++ libraries, and at run time only `libloading` + the shared
-  library are required. Use it for a lean build that defers the Mooncake C++
-  runtime to a shared object:
+- **`dlopen`**: loads `libmooncake_store.so` at run time via `libloading`, using
+  **committed, pre-generated** bindings (`src/generated/ffi_dlopen_bindings.rs`).
+  A consumer needs only `libloading` — no bindgen, no `store_c.h`, no libclang,
+  no C++ linking — and only the shared library at run time. Maintainers
+  regenerate the bindings after the C ABI changes (see below):
 
   ```toml
   mooncake_store = { version = "0.1", default-features = false, features = ["dlopen"] }
@@ -29,6 +28,14 @@ takes precedence:
   `libmooncake_store.so`, resolved through the OS loader search path), or pin an
   explicit path with `mooncake_store::load_library(path)` before creating a
   store. The public API is identical to the `link` backend.
+
+  Regenerate the committed bindings after the C ABI (`store_c.h`) changes:
+
+  ```bash
+  cargo run --example generate_dlopen_bindings   # or: cmake --build build --target generate_store_rust_dlopen_bindings
+  ```
+
+  CI should run this and `git diff --exit-code` to catch drift.
 
 ## Prerequisites
 

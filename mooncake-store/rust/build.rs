@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Everything below is used only by the `link` build path. A pure `dlopen` build
-// selects the no-op main() at the bottom and compiles none of it (bindgen is not
-// even a dependency then), so silence dead-code/unused-import warnings there.
+// Everything below is used only by the `link` build path (see the two cfg'd
+// main()s). A `dlopen` build uses the no-op main and compiles none of it — and
+// bindgen is not a dependency there — so silence dead-code/unused-import warnings.
 #![allow(dead_code, unused_imports)]
 
 use std::env;
@@ -168,37 +168,10 @@ fn add_compiler_runtime_search_dir(search_dirs: &mut Vec<PathBuf>, file_name: &s
     false
 }
 
-// The `dlopen` backend links no C++ libraries, but still generates its loader
-// from store_c.h (via bindgen's dynamic_library_name) so the ABI is never
-// hand-written. It needs only the header (and libclang), not a built C++ tree.
-#[cfg(all(feature = "dlopen", not(feature = "link")))]
-fn main() {
-    let include_dir =
-        env::var("MOONCAKE_STORE_INCLUDE_DIR").unwrap_or_else(|_| "../include".to_string());
-    let header = format!("{include_dir}/store_c.h");
-
-    println!("cargo:rerun-if-changed={header}");
-    println!("cargo:rerun-if-env-changed=MOONCAKE_STORE_INCLUDE_DIR");
-
-    // require_all: the loader resolves every mooncake_store_* symbol up front, so
-    // a library missing any of them fails fast at load rather than on first call.
-    let bindings = bindgen::Builder::default()
-        .header(&header)
-        .allowlist_function("mooncake_store_.*")
-        .allowlist_type("mooncake_.*")
-        .dynamic_library_name("MooncakeStoreLib")
-        .dynamic_link_require_all(true)
-        .generate()
-        .expect("Unable to generate Mooncake Store dlopen bindings");
-
-    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
-    bindings
-        .write_to_file(out_path.join("bindings.rs"))
-        .expect("Couldn't write Mooncake Store dlopen bindings");
-}
-
-// Neither backend: lib.rs emits a compile_error!; keep build.rs itself valid.
-#[cfg(not(any(feature = "link", feature = "dlopen")))]
+// A pure `dlopen` build uses committed, pre-generated bindings
+// (src/generated/ffi_dlopen_bindings.rs), so build.rs has nothing to do. Also
+// covers the no-feature case (lib.rs emits a compile_error! there).
+#[cfg(not(feature = "link"))]
 fn main() {}
 
 #[cfg(feature = "link")]

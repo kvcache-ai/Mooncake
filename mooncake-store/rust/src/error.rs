@@ -15,7 +15,11 @@
 use std::ffi::NulError;
 
 /// Errors returned by Mooncake Store operations.
+///
+/// `#[non_exhaustive]` so adding variants (e.g. backend-specific ones) is not a
+/// breaking change; downstream matches must include a wildcard arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum StoreError {
     /// A required pointer argument was null (e.g. the store handle has not
     /// been initialised yet, or an internal allocation failed).
