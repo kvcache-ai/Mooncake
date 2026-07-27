@@ -30,16 +30,16 @@ class FakeObjectStorageAdapter : public ObjectStorageAdapter {
     int get_calls = 0;
     bool initialized = false;
 
-    tl::expected<void, ErrorCode> Put(const std::string& key,
+    tl::expected<void, ErrorCode> Put(const std::string& logical_key,
                                       std::span<const char> data) override {
-        objects[key] = std::string(data.begin(), data.end());
+        objects[logical_key] = std::string(data.begin(), data.end());
         return {};
     }
 
-    tl::expected<void, ErrorCode> PutV(const std::string& key, const iovec* iov,
-                                       int iovcnt) override {
+    tl::expected<void, ErrorCode> PutV(const std::string& logical_key,
+                                       const iovec* iov, int iovcnt) override {
         ++putv_calls;
-        if (fail_keys.contains(key)) {
+        if (fail_keys.contains(logical_key)) {
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
 
@@ -48,14 +48,14 @@ class FakeObjectStorageAdapter : public ObjectStorageAdapter {
             buffer.append(static_cast<const char*>(iov[i].iov_base),
                           iov[i].iov_len);
         }
-        objects[key] = std::move(buffer);
+        objects[logical_key] = std::move(buffer);
         return {};
     }
 
-    tl::expected<size_t, ErrorCode> Get(const std::string& key, void* buf,
-                                        size_t len) override {
+    tl::expected<size_t, ErrorCode> Get(const std::string& logical_key,
+                                        void* buf, size_t len) override {
         ++get_calls;
-        auto it = objects.find(key);
+        auto it = objects.find(logical_key);
         if (it == objects.end()) {
             return tl::make_unexpected(ErrorCode::FILE_NOT_FOUND);
         }
@@ -67,8 +67,9 @@ class FakeObjectStorageAdapter : public ObjectStorageAdapter {
         return bytes_read;
     }
 
-    tl::expected<bool, ErrorCode> Exists(const std::string& key) override {
-        return objects.contains(key);
+    tl::expected<bool, ErrorCode> Exists(
+        const std::string& logical_key) override {
+        return objects.contains(logical_key);
     }
 
     tl::expected<std::vector<KeyInfo>, ErrorCode> ListKeys() override {
@@ -227,6 +228,61 @@ TEST_F(ObjectStorageAdapterTest, BatchOffloadWritesMultiSliceObjects) {
     }
     EXPECT_EQ(sizes.at("first"), 11);
     EXPECT_EQ(sizes.at("second"), 7);
+}
+
+TEST_F(ObjectStorageAdapterTest, PreservesOpaqueLogicalKeys) {
+    FakeObjectStorageAdapter* adapter = nullptr;
+    auto backend = MakeObjectStorageBackend(adapter);
+    ASSERT_TRUE(backend->Init());
+
+    std::string logical_key = "tenant";
+    logical_key.push_back('\0');
+    logical_key += "a/b%\\";
+    std::string payload = "payload";
+    std::unordered_map<std::string, std::vector<Slice>> batch{
+        {logical_key, {{payload.data(), payload.size()}}},
+    };
+    std::vector<std::string> completed_keys;
+
+    auto offload_result =
+        backend->BatchOffload(batch, [&](const std::vector<std::string>& keys,
+                                         std::vector<StorageObjectMetadata>&) {
+            completed_keys = keys;
+            return ErrorCode::OK;
+        });
+
+    ASSERT_TRUE(offload_result);
+    EXPECT_EQ(*offload_result, 1);
+    EXPECT_EQ(completed_keys, (std::vector<std::string>{logical_key}));
+    EXPECT_TRUE(adapter->objects.contains(logical_key));
+
+    auto exists_result = backend->IsExist(logical_key);
+    ASSERT_TRUE(exists_result);
+    EXPECT_TRUE(*exists_result);
+
+    std::string output(payload.size(), '\0');
+    std::unordered_map<std::string, Slice> load_slices{
+        {logical_key, {output.data(), output.size()}},
+    };
+    ASSERT_TRUE(backend->BatchLoad(load_slices));
+    EXPECT_EQ(output, payload);
+
+    std::vector<std::string> scanned_keys;
+    std::vector<StorageObjectMetadata> scanned_metadata;
+    auto scan_result =
+        backend->ScanMeta([&](const std::vector<std::string>& keys,
+                              std::vector<StorageObjectMetadata>& metadata) {
+            scanned_keys.insert(scanned_keys.end(), keys.begin(), keys.end());
+            scanned_metadata.insert(scanned_metadata.end(), metadata.begin(),
+                                    metadata.end());
+            return ErrorCode::OK;
+        });
+
+    ASSERT_TRUE(scan_result);
+    EXPECT_EQ(scanned_keys, (std::vector<std::string>{logical_key}));
+    ASSERT_EQ(scanned_metadata.size(), 1);
+    EXPECT_EQ(scanned_metadata.front().key_size,
+              static_cast<int64_t>(logical_key.size()));
 }
 
 TEST_F(ObjectStorageAdapterTest, BatchOffloadAllowsPartialFailure) {

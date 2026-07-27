@@ -306,10 +306,10 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ScanMeta(
         }
 
         for (const auto& info : *key_infos) {
-            batch_keys.push_back(info.key);
-            StorageObjectMetadata meta{-1, 0,
-                                       static_cast<int64_t>(info.key.size()),
-                                       static_cast<int64_t>(info.size), ""};
+            batch_keys.push_back(info.logical_key);
+            StorageObjectMetadata meta{
+                -1, 0, static_cast<int64_t>(info.logical_key.size()),
+                static_cast<int64_t>(info.size), ""};
             batch_metas.push_back(meta);
 
             if (batch_keys.size() >= batch_limit) {
