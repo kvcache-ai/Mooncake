@@ -8058,17 +8058,21 @@ void MasterService::BatchEvict(double evict_ratio_target,
         return 0;
     };
 
-    // Only kPersisted permits local metadata mutation. kSkipObject leaves the
-    // object unchanged; kStopCycle also propagates reservation backpressure.
-    enum class PersistEvictResult { kPersisted, kSkipObject, kStopCycle };
+    // kSubmitted means accepted by the ordered writer, not yet durable.
+    enum class EvictOpLogSubmissionResult {
+        kNotRequired,
+        kSubmitted,
+        kReservationFailed,
+        kSubmissionFailed,
+    };
 
-    // HA strong-consistency: persist the post-eviction state BEFORE the
-    // helper mutates `metadata`.
-    auto persist_evict_oplog_or_skip =
+    // HA strong-consistency: submit the post-eviction state before the caller
+    // proceeds with eviction.
+    auto submit_evict_oplog_if_needed =
         [&, this](const TenantId& tenant_id, const std::string& key,
-                  ObjectMetadata& metadata) -> PersistEvictResult {
+                  ObjectMetadata& metadata) -> EvictOpLogSubmissionResult {
         if (!enable_oplog_ || !ordered_oplog_writer_) {
-            return PersistEvictResult::kPersisted;
+            return EvictOpLogSubmissionResult::kNotRequired;
         }
 
         // Predict the descriptor list after evict_replicas() runs:
@@ -8086,8 +8090,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 LOG(WARNING)
                     << "BatchEvict: OpLog reservation failed for key=" << key
                     << ", err=" << static_cast<int>(reservation.error())
-                    << ", skipping eviction";
-                return PersistEvictResult::kStopCycle;
+                    << ", stopping eviction cycle";
+                return EvictOpLogSubmissionResult::kReservationFailed;
             }
             std::vector<ReplicaID> removed_ids;
             metadata.VisitReplicas(is_evictable_memory_replica,
@@ -8095,9 +8099,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                        removed_ids.push_back(replica.id());
                                        replica.mark_removed();
                                    });
-            tl::expected<OpLogEntry, ErrorCode> persist_result;
+            tl::expected<OpLogEntry, ErrorCode> submission_result;
             if (remaining.empty()) {
-                persist_result = AppendReservedOpLogWithDurableFinalize(
+                submission_result = AppendReservedOpLogWithDurableFinalize(
                     std::move(reservation.value()), OpType::REMOVE,
                     tenant_id.value(), key, {},
                     [this, removed_ids = std::move(removed_ids)](
@@ -8106,7 +8110,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                             durable_entry, removed_ids, QuotaEraseMode::kFull);
                     });
             } else {
-                persist_result = AppendReservedOpLogWithDurableFinalize(
+                submission_result = AppendReservedOpLogWithDurableFinalize(
                     std::move(reservation.value()), OpType::PUT_END,
                     tenant_id.value(), key,
                     SerializeMetadataForOpLogFromReplicaDescriptors(
@@ -8118,35 +8122,36 @@ void MasterService::BatchEvict(double evict_ratio_target,
                             durable_entry, removed_ids, QuotaEraseMode::kFull);
                     });
             }
-            if (!persist_result) {
+            if (!submission_result) {
                 LOG(WARNING)
-                    << "BatchEvict: OpLog persist failed for key=" << key
-                    << ", err=" << static_cast<int>(persist_result.error())
-                    << ", skipping eviction";
-                return PersistEvictResult::kSkipObject;
+                    << "BatchEvict: OpLog submission failed for key=" << key
+                    << ", err=" << static_cast<int>(submission_result.error())
+                    << ", skipping object eviction";
+                return EvictOpLogSubmissionResult::kSubmissionFailed;
             }
-            return PersistEvictResult::kPersisted;
+            return EvictOpLogSubmissionResult::kSubmitted;
         }
 
-        tl::expected<OpLogEntry, ErrorCode> persist_result;
+        tl::expected<OpLogEntry, ErrorCode> submission_result;
         if (remaining.empty()) {
-            persist_result = AppendOpLogWithDurableFinalize(
+            submission_result = AppendOpLogWithDurableFinalize(
                 OpType::REMOVE, tenant_id.value(), key, {}, nullptr);
         } else {
-            persist_result = AppendOpLogWithDurableFinalize(
+            submission_result = AppendOpLogWithDurableFinalize(
                 OpType::PUT_END, tenant_id.value(), key,
                 SerializeMetadataForOpLogFromReplicaDescriptors(
                     metadata.client_id, metadata.size, remaining,
                     metadata.group_id, metadata.data_type),
                 nullptr);
         }
-        if (!persist_result) {
-            LOG(WARNING) << "BatchEvict: OpLog persist failed for key=" << key
-                         << ", err=" << static_cast<int>(persist_result.error())
-                         << ", skipping eviction";
-            return PersistEvictResult::kSkipObject;
+        if (!submission_result) {
+            LOG(WARNING) << "BatchEvict: OpLog submission failed for key="
+                         << key << ", err="
+                         << static_cast<int>(submission_result.error())
+                         << ", skipping object eviction";
+            return EvictOpLogSubmissionResult::kSubmissionFailed;
         }
-        return PersistEvictResult::kPersisted;
+        return EvictOpLogSubmissionResult::kSubmitted;
     };
 
     struct EvictionResult {
@@ -8162,11 +8167,15 @@ void MasterService::BatchEvict(double evict_ratio_target,
                   std::vector<std::vector<Replica>>& deferred_replicas,
                   bool allow_soft_pinned) -> EvictionResult {
         if (!metadata.IsGrouped()) {
-            auto persist_result =
-                persist_evict_oplog_or_skip(tenant_id, key, metadata);
-            if (persist_result != PersistEvictResult::kPersisted) {
-                return {.stop_cycle =
-                            persist_result == PersistEvictResult::kStopCycle};
+            auto submission_result =
+                submit_evict_oplog_if_needed(tenant_id, key, metadata);
+            if (submission_result ==
+                EvictOpLogSubmissionResult::kReservationFailed) {
+                return {.stop_cycle = true};
+            }
+            if (submission_result ==
+                EvictOpLogSubmissionResult::kSubmissionFailed) {
+                return {};
             }
             uint64_t freed = try_evict_or_offload(
                 tenant_id, key, metadata, tenant_state, deferred_replicas);
@@ -8175,11 +8184,15 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
         auto group_it = tenant_state.group_members.find(metadata.group_id);
         if (group_it == tenant_state.group_members.end()) {
-            auto persist_result =
-                persist_evict_oplog_or_skip(tenant_id, key, metadata);
-            if (persist_result != PersistEvictResult::kPersisted) {
-                return {.stop_cycle =
-                            persist_result == PersistEvictResult::kStopCycle};
+            auto submission_result =
+                submit_evict_oplog_if_needed(tenant_id, key, metadata);
+            if (submission_result ==
+                EvictOpLogSubmissionResult::kReservationFailed) {
+                return {.stop_cycle = true};
+            }
+            if (submission_result ==
+                EvictOpLogSubmissionResult::kSubmissionFailed) {
+                return {};
             }
             uint64_t freed = try_evict_or_offload(
                 tenant_id, key, metadata, tenant_state, deferred_replicas);
@@ -8210,13 +8223,15 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 continue;
             }
 
-            auto persist_result = persist_evict_oplog_or_skip(
+            auto submission_result = submit_evict_oplog_if_needed(
                 tenant_id, member_key, member_metadata);
-            if (persist_result == PersistEvictResult::kStopCycle) {
+            if (submission_result ==
+                EvictOpLogSubmissionResult::kReservationFailed) {
                 result.stop_cycle = true;
                 break;
             }
-            if (persist_result == PersistEvictResult::kSkipObject) {
+            if (submission_result ==
+                EvictOpLogSubmissionResult::kSubmissionFailed) {
                 continue;
             }
             uint64_t freed =
