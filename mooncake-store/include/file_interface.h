@@ -67,6 +67,48 @@ class StorageFile {
      */
     virtual tl::expected<void, ErrorCode> datasync() { return {}; }
 
+    // ---- Test-only fault injection ----
+    // Which sync call a test wants to fail. kAny matches both.
+    enum class SyncKind { kNone = 0, kWritebackWait, kDatasync, kAny };
+
+    // Makes the next matching sync call on any StorageFile report failure
+    // without issuing the syscall, so a test can verify that a caller which is
+    // supposed to flush actually issues that specific call and propagates the
+    // error. One-shot: consumed by the first matching call. Process-global
+    // because storage backends create their StorageFile instances internally,
+    // so a test has no handle to set it on. Pass kNone to disarm.
+    static void SetSyncFailureForTest(SyncKind kind) {
+        sync_failure_for_test_.store(static_cast<int>(kind),
+                                     std::memory_order_relaxed);
+    }
+
+    // Whether an injected failure is still waiting to be consumed. A test uses
+    // this to tell "the call was never issued" from "the call was issued and
+    // failed", which is how the ordering of two flushes can be observed.
+    static bool IsSyncFailureArmedForTest() {
+        return sync_failure_for_test_.load(std::memory_order_relaxed) !=
+               static_cast<int>(SyncKind::kNone);
+    }
+
+    /**
+     * @brief Writes this file's dirty pages back and waits for them, without
+     * flushing file metadata or the device's volatile write cache.
+     *
+     * sync_file_range(WAIT_BEFORE|WRITE|WAIT_AFTER) over the whole file.
+     * Cheaper than datasync() because it neither writes out the inode nor
+     * issues a device cache flush -- which is also why it is not a
+     * data-integrity operation: after it returns, the data pages have been
+     * written back, but for a newly created file the metadata describing where
+     * they live need not be on the device yet. Use it to order this file's
+     * data against a later write to another file, not to make it durable; use
+     * datasync() for that. A file accessed only through O_DIRECT has no
+     * page-cache pages to write back, so this does nothing for it.
+     *
+     * Operates on the file descriptor, so the base implementation is correct
+     * for every StorageFile.
+     */
+    virtual tl::expected<void, ErrorCode> writeback_wait();
+
     // Prevent destructor from unlinking the arena file on write failure.
     void SetDeleteOnWriteFail(bool v) { delete_on_write_fail_ = v; }
 
@@ -155,6 +197,21 @@ class StorageFile {
     ErrorCode get_error_code() { return error_code_; }
 
    protected:
+    // Returns and clears the injected sync failure if it matches `kind`. Call
+    // from the sync implementations before doing any real work.
+    static bool ConsumeSyncFailureForTest(SyncKind kind) {
+        int armed = sync_failure_for_test_.load(std::memory_order_relaxed);
+        if (armed != static_cast<int>(SyncKind::kAny) &&
+            armed != static_cast<int>(kind)) {
+            return false;
+        }
+        return sync_failure_for_test_.compare_exchange_strong(
+            armed, static_cast<int>(SyncKind::kNone),
+            std::memory_order_relaxed);
+    }
+
+    static std::atomic<int> sync_failure_for_test_;
+
     bool delete_on_write_fail_ = true;
     std::string filename_;
     int fd_;

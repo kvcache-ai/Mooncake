@@ -136,6 +136,24 @@ BucketBackendConfig BucketBackendConfig::FromEnvironment() {
     config.disk_scan_cache_ms =
         Environ::GetInt64("MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS",
                           config.disk_scan_cache_ms);
+    // Bucket data persistence before the metadata commit. Deliberately its own
+    // variable rather than MOONCAKE_OFFSET_PERSIST_MODE: a deployment may want
+    // different levels on the two backends, and changing one must not silently
+    // move the other's durability behaviour.
+    const char* persist = std::getenv("MOONCAKE_OFFLOAD_BUCKET_PERSIST_MODE");
+    if (persist) {
+        std::string s(persist);
+        if (AsciiCaseInsensitiveEquals(s, "disabled")) {
+            config.persist_mode = BucketPersistMode::kDisabled;
+        } else if (AsciiCaseInsensitiveEquals(s, "relaxed")) {
+            config.persist_mode = BucketPersistMode::kRelaxed;
+        } else if (AsciiCaseInsensitiveEquals(s, "strict")) {
+            config.persist_mode = BucketPersistMode::kStrict;
+        } else {
+            LOG(WARNING) << "Unknown MOONCAKE_OFFLOAD_BUCKET_PERSIST_MODE=" << s
+                         << "; using default (disabled)";
+        }
+    }
 
     const auto policy_str = Environ::GetString(
         "MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY",
@@ -2329,6 +2347,11 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
             LOG(INFO) << "Initialized BucketIdGenerator from existing state. "
                       << "Last used bucket ID was " << max_bucket_id;
         }
+        if (bucket_backend_config_.persist_mode !=
+            BucketPersistMode::kDisabled) {
+            LOG(INFO) << "Bucket data persist mode: "
+                      << bucket_backend_config_.persist_mode;
+        }
         initialized_.store(true, std::memory_order_release);
     } catch (const std::exception& e) {
         LOG(ERROR) << "Bucket storage backend initialize error: " << e.what()
@@ -2585,7 +2608,6 @@ BucketStorageBackend::BuildBucket(
 tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
     int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata,
     std::vector<iovec>& iovs) {
-    namespace fs = std::filesystem;
     auto bucket_data_path_res = GetBucketDataPath(bucket_id);
     if (!bucket_data_path_res) {
         LOG(ERROR) << "Failed to get bucket data path, bucket_id=" << bucket_id;
@@ -2662,15 +2684,6 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
 
-        // Flush bucket data to stable storage before writing metadata.
-        // This prevents a crash from leaving valid metadata pointing at
-        // incomplete data (write-ordering durability guarantee).
-        auto sync_result = uring_file->datasync();
-        if (!sync_result) {
-            LOG(ERROR) << "datasync failed for bucket: " << bucket_id;
-            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-        }
-
         // Invalidate cache for this file since content changed
         {
             MutexLocker cache_locker(&file_cache_mutex_);
@@ -2700,27 +2713,45 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
             file_cache_.erase(bucket_data_path);
         }
     }
+    // Flush the bucket data before committing its metadata, at the level the
+    // deployment configured. Restart recovery walks .meta files, so metadata
+    // committed for data that never reached the device is what leaves a bucket
+    // unreadable after a crash. The flush runs on whichever file OpenFile()
+    // returned; for writes that is always the buffered PosixFile, since
+    // OpenFile() only returns a UringFile for FileMode::Read.
+    auto persist_result = PersistBucketData(*file);
+    if (!persist_result) {
+        LOG(ERROR) << "Failed to persist bucket data before metadata commit, "
+                      "bucket_id="
+                   << bucket_id << ", error: " << persist_result.error();
+        // The data file was written but not persisted at the configured level;
+        // drop it so no orphan remains (mirrors the metadata-write-failure
+        // cleanup below).
+        CleanupOrphanedBucket(bucket_id);
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+
     auto store_bucket_metadata_result =
         StoreBucketMetadata(bucket_id, bucket_metadata);
     if (!store_bucket_metadata_result) {
         LOG(ERROR) << "Failed to store bucket metadata, error: "
                    << store_bucket_metadata_result.error();
-
-        // Clean up the bucket file to prevent orphans
-        std::error_code ec;
-        if (fs::remove(bucket_data_path, ec)) {
-            LOG(WARNING) << "Cleaned up orphaned bucket file after metadata "
-                            "write failure: "
-                         << bucket_data_path;
-        } else if (ec) {
-            LOG(ERROR) << "Failed to clean up bucket file after metadata write "
-                          "failure: "
-                       << bucket_data_path << ", error: " << ec.message();
-        }
-
+        // Drop the just-written data file (and any partial metadata file) so no
+        // orphan remains; same cleanup as the datasync-failure path above.
+        CleanupOrphanedBucket(bucket_id);
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
     return {};
+}
+
+tl::expected<void, ErrorCode> BucketStorageBackend::PersistBucketData(
+    StorageFile& file) {
+    const auto mode = bucket_backend_config_.persist_mode;
+    if (mode == BucketPersistMode::kDisabled) {
+        return {};
+    }
+    return (mode == BucketPersistMode::kStrict) ? file.datasync()
+                                                : file.writeback_wait();
 }
 
 void BucketStorageBackend::CleanupOrphanedBucket(int64_t bucket_id) {
