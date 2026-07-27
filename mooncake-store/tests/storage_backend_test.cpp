@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <ranges>
@@ -154,6 +155,85 @@ class StorageBackendTest : public ::testing::Test {
         }
     }
 };
+
+// Regression tests for StorageBackend::Create validation (issue #3134):
+// invalid configuration must be reported as INVALID_PARAMS instead of
+// producing a nullptr that callers may dereference.
+TEST_F(StorageBackendTest, CreateRejectsNonexistentRootDir) {
+    auto result = StorageBackend::Create(data_path + "/does/not/exist/12345",
+                                         "fsdir", true);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+}
+
+TEST_F(StorageBackendTest, CreateRejectsRootDirThatIsAFile) {
+    std::string file_path = data_path + "/root_is_a_file";
+    {
+        std::ofstream ofs(file_path);
+        ofs << "not a directory";
+    }
+    auto result = StorageBackend::Create(file_path, "fsdir", true);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+}
+
+TEST_F(StorageBackendTest, CreateRejectsEmptyFsdir) {
+    auto result = StorageBackend::Create(data_path, "", true);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+}
+
+TEST_F(StorageBackendTest, CreateAcceptsValidConfig) {
+    auto result = StorageBackend::Create(data_path, "fsdir", true);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_NE(result.value(), nullptr);
+}
+
+// Regression tests for StorageBackendAdaptor::Init validation (issue #3134
+// follow-up): obviously invalid configuration must be reported as
+// INVALID_PARAMS, while a missing root directory is still auto-created.
+TEST_F(StorageBackendTest, AdaptorInitRejectsStoragePathThatIsAFile) {
+    std::string file_path = data_path + "/storage_path_is_a_file";
+    {
+        std::ofstream ofs(file_path);
+        ofs << "not a directory";
+    }
+    FileStorageConfig cfg;
+    cfg.storage_filepath = file_path;
+    FilePerKeyConfig file_per_key_config;
+    file_per_key_config.fsdir = "file_per_key_dir";
+    file_per_key_config.enable_eviction = false;
+
+    StorageBackendAdaptor adaptor(cfg, file_per_key_config);
+    auto init_result = adaptor.Init();
+    ASSERT_FALSE(init_result.has_value());
+    EXPECT_EQ(init_result.error(), ErrorCode::INVALID_PARAMS);
+}
+
+TEST_F(StorageBackendTest, AdaptorInitRejectsEmptyFsdir) {
+    FileStorageConfig cfg;
+    cfg.storage_filepath = data_path;
+    FilePerKeyConfig file_per_key_config;
+    file_per_key_config.fsdir = "";
+    file_per_key_config.enable_eviction = false;
+
+    StorageBackendAdaptor adaptor(cfg, file_per_key_config);
+    auto init_result = adaptor.Init();
+    ASSERT_FALSE(init_result.has_value());
+    EXPECT_EQ(init_result.error(), ErrorCode::INVALID_PARAMS);
+}
+
+TEST_F(StorageBackendTest, AdaptorInitCreatesMissingRootDir) {
+    FileStorageConfig cfg;
+    cfg.storage_filepath = data_path + "/auto_created_root";
+    FilePerKeyConfig file_per_key_config;
+    file_per_key_config.fsdir = "file_per_key_dir";
+    file_per_key_config.enable_eviction = true;
+
+    StorageBackendAdaptor adaptor(cfg, file_per_key_config);
+    ASSERT_TRUE(adaptor.Init().has_value());
+    EXPECT_TRUE(fs::is_directory(cfg.storage_filepath));
+}
 
 TEST_F(StorageBackendTest, StorageBackendAll) {
     std::shared_ptr<SimpleAllocator> client_buffer_allocator =
