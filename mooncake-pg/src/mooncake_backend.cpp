@@ -267,9 +267,9 @@ MooncakeBackend::MooncakeBackend(
     GroupBootstrapId group_bootstrap_id =
         std::string(isCpu_ ? "cpu:" : "device:") + distBackendOpts.group_id;
 
-    // Register a lightweight Backend shim so that PyTorch's P2P dispatch path
-    // (batch_isend_irecv → _get_backend → getBackend) can find a registered
-    // Backend for this ProcessGroup.  The shim delegates send/recv back to us.
+    // Register a lightweight Backend shim so PyTorch dispatch can find a
+    // registered Backend for this ProcessGroup.  The shim delegates supported
+    // P2P and collective operations back to this backend.
     auto deviceType = isCpu ? c10::DeviceType::CPU : c10::DeviceType::CUDA;
     auto shim = c10::make_intrusive<MooncakeP2PShim>(this, max_group_size_);
     setBackend(deviceType, BackendType::CUSTOM, shim);
@@ -387,6 +387,64 @@ c10::intrusive_ptr<c10d::Work> MooncakeP2PShim::recvAnysource(
 c10::intrusive_ptr<c10d::Work> MooncakeP2PShim::barrier(
     const c10d::BarrierOptions& opts) {
     return owner_->barrier(opts);
+}
+
+// ---- MooncakeP2PShim collective delegation ----
+// PyTorch 2.13's all_gather_single and reduce_scatter_single entry points
+// dispatch through the registered Backend. Delegate every supported collective
+// so the shim exposes the same capabilities as its owning MooncakeBackend. See
+// the class comment in mooncake_backend.h for the full rationale.
+
+c10::intrusive_ptr<c10d::Work> MooncakeP2PShim::broadcast(
+    std::vector<at::Tensor>& tensors, const c10d::BroadcastOptions& opts) {
+    return owner_->broadcast(tensors, opts);
+}
+
+c10::intrusive_ptr<c10d::Work> MooncakeP2PShim::allreduce(
+    std::vector<at::Tensor>& tensors, const c10d::AllreduceOptions& opts) {
+    return owner_->allreduce(tensors, opts);
+}
+
+c10::intrusive_ptr<c10d::Work> MooncakeP2PShim::allgather(
+    std::vector<std::vector<at::Tensor>>& outputTensors,
+    std::vector<at::Tensor>& inputTensors, const c10d::AllgatherOptions& opts) {
+    return owner_->allgather(outputTensors, inputTensors, opts);
+}
+
+c10::intrusive_ptr<c10d::Work> MooncakeP2PShim::_allgather_base(
+    at::Tensor& outputBuffer, at::Tensor& inputBuffer,
+    const c10d::AllgatherOptions& opts) {
+    return owner_->_allgather_base(outputBuffer, inputBuffer, opts);
+}
+
+c10::intrusive_ptr<c10d::Work> MooncakeP2PShim::_reduce_scatter_base(
+    at::Tensor& outputBuffer, at::Tensor& inputBuffer,
+    const c10d::ReduceScatterOptions& opts) {
+    return owner_->_reduce_scatter_base(outputBuffer, inputBuffer, opts);
+}
+
+c10::intrusive_ptr<c10d::Work> MooncakeP2PShim::alltoall(
+    std::vector<at::Tensor>& outputTensors,
+    std::vector<at::Tensor>& inputTensors, const c10d::AllToAllOptions& opts) {
+    return owner_->alltoall(outputTensors, inputTensors, opts);
+}
+
+c10::intrusive_ptr<c10d::Work> MooncakeP2PShim::reduce(
+    std::vector<at::Tensor>& tensors, const c10d::ReduceOptions& opts) {
+    return owner_->reduce(tensors, opts);
+}
+
+c10::intrusive_ptr<c10d::Work> MooncakeP2PShim::gather(
+    std::vector<std::vector<at::Tensor>>& outputTensors,
+    std::vector<at::Tensor>& inputTensors, const c10d::GatherOptions& opts) {
+    return owner_->gather(outputTensors, inputTensors, opts);
+}
+
+c10::intrusive_ptr<c10d::Work> MooncakeP2PShim::scatter(
+    std::vector<at::Tensor>& outputTensors,
+    std::vector<std::vector<at::Tensor>>& inputTensors,
+    const c10d::ScatterOptions& opts) {
+    return owner_->scatter(outputTensors, inputTensors, opts);
 }
 
 void MooncakeBackend::prepareOp(c10d::OpType op) const {

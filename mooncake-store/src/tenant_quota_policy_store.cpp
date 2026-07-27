@@ -27,7 +27,7 @@ namespace mooncake {
 namespace {
 
 bool IsValidTenantQuotaName(const std::string& name) {
-    return IsValidTenantId(name);
+    return !name.empty() && TenantId(name).IsValid();
 }
 
 std::string ErrnoMessage(const std::string& action, const std::string& path) {
@@ -273,7 +273,8 @@ tl::expected<TenantQuotaPolicySnapshot, std::string> ParseTenantQuotaPolicyYaml(
         if (!IsValidTenantQuotaName(name)) {
             return tl::make_unexpected("invalid tenant name '" + name + "'");
         }
-        name = NormalizeTenantId(name);
+        const TenantId tenant_id(std::move(name));
+        name = tenant_id.value();
         if (!IsValidTenantQuotaName(name)) {
             return tl::make_unexpected("invalid tenant name '" + name + "'");
         }

@@ -48,18 +48,6 @@ void MetricsConfigLoader::applyEnvironmentOverrides(MetricsConfig& config) {
             config.http_server_threads = static_cast<uint16_t>(threads);
         }
     }
-
-    if (const char* env_val =
-            std::getenv(config_keys::ENV_METRICS_ENABLE_PROMETHEUS)) {
-        config.enable_prometheus =
-            ConfigHelper::parseBool(env_val, config.enable_prometheus);
-    }
-
-    if (const char* env_val =
-            std::getenv(config_keys::ENV_METRICS_ENABLE_JSON)) {
-        config.enable_json =
-            ConfigHelper::parseBool(env_val, config.enable_json);
-    }
 }
 
 MetricsConfig MetricsConfigLoader::loadFromConfig(const Config& config) {
@@ -79,11 +67,6 @@ MetricsConfig MetricsConfigLoader::loadFromConfig(const Config& config) {
     metrics_config.report_interval_seconds =
         config.get(config_keys::METRICS_REPORT_INTERVAL,
                    metrics_config.report_interval_seconds);
-    metrics_config.enable_prometheus =
-        config.get(config_keys::METRICS_ENABLE_PROMETHEUS,
-                   metrics_config.enable_prometheus);
-    metrics_config.enable_json = config.get(config_keys::METRICS_ENABLE_JSON,
-                                            metrics_config.enable_json);
 
     LOG(INFO) << "Loaded metrics config from Config object: enabled="
               << metrics_config.enabled
@@ -127,11 +110,6 @@ MetricsConfig MetricsConfigLoader::loadWithDefaults(const Config* config) {
         metrics_config.report_interval_seconds =
             config->get(config_keys::METRICS_REPORT_INTERVAL,
                         metrics_config.report_interval_seconds);
-        metrics_config.enable_prometheus =
-            config->get(config_keys::METRICS_ENABLE_PROMETHEUS,
-                        metrics_config.enable_prometheus);
-        metrics_config.enable_json = config->get(
-            config_keys::METRICS_ENABLE_JSON, metrics_config.enable_json);
     }
 
     return metrics_config;
@@ -151,16 +129,6 @@ bool MetricsConfigLoader::validateConfig(const MetricsConfig& config,
     if (config.http_server_threads == 0) {
         if (error_msg) {
             *error_msg = "Invalid HTTP server threads: must be > 0";
-        }
-        return false;
-    }
-
-    // Validate at least one output format is enabled
-    if (!config.enable_prometheus && !config.enable_json) {
-        if (error_msg) {
-            *error_msg =
-                "At least one output format (Prometheus or JSON) must be "
-                "enabled";
         }
         return false;
     }

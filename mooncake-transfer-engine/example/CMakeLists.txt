@@ -1,5 +1,8 @@
 set(WORKSPACE "${CMAKE_CURRENT_SOURCE_DIR}")
 
+include(CheckPIESupported)
+check_pie_supported(LANGUAGES CXX)
+
 if(USE_HIP)
   file(GLOB EXAMPLE_SOURCES "*.cpp")
   hipify_files(EXAMPLE_SOURCES)
@@ -10,6 +13,8 @@ if(USE_HIP)
 endif()
 
 add_executable(transfer_engine_bench ${WORKSPACE}/transfer_engine_bench.cpp)
+set_target_properties(transfer_engine_bench PROPERTIES POSITION_INDEPENDENT_CODE
+                                                       ON)
 target_link_libraries(transfer_engine_bench PUBLIC transfer_engine)
 if(USE_TENT)
   target_link_libraries(transfer_engine_bench PUBLIC tent_link_group)

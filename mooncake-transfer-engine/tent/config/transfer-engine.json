@@ -18,8 +18,6 @@
         "http_host": "0.0.0.0",
         "http_server_threads": 2,
         "report_interval_seconds": 30,
-        "enable_prometheus": true,
-        "enable_json": true,
         "latency_buckets": [
             0.000125, 0.00015, 0.0002, 0.00025, 0.0003, 0.0004, 0.0005,
             0.00075, 0.001, 0.0015, 0.002, 0.003, 0.005, 0.007,

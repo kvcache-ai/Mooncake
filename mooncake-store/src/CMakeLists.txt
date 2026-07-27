@@ -27,6 +27,7 @@ set(MOONCAKE_STORE_SOURCES
     client_buffer.cpp
     aligned_client_buffer.cpp
     real_client.cpp
+    registered_pinned_memory.cpp
     dummy_client.cpp
     uds_transport.cpp
     shm_helper.cpp
@@ -313,6 +314,9 @@ if(BUILD_SHARED_LIBS)
 endif()
 
 # Master binary
+include(CheckPIESupported)
+check_pie_supported(LANGUAGES CXX)
+
 add_executable(mooncake_master master.cpp)
 
 set(MASTER_EXTRA_INCS)
@@ -350,6 +354,8 @@ add_executable(mooncake_client real_client_main.cpp)
 # Client needs transfer_engine for data transfer operations
 target_link_libraries(mooncake_client PRIVATE mooncake_store transfer_engine
                                               asio_shared)
+set_target_properties(mooncake_master mooncake_client
+                      PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # Optimize binary sizes only in Release mode
 string(TOUPPER "${CMAKE_BUILD_TYPE}" CMAKE_BUILD_TYPE_UPPER)

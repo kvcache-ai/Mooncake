@@ -5,13 +5,13 @@
 This page summarizes the C++ APIs in `mooncake-transfer-engine/tent/include/tent/transfer_engine.h`.
 It follows the same structure as the Transfer Engine API documentation.
 
-For conceptual background, see [TENT Overview](overview.md).
+For conceptual background, see [TENT Overview](../../design/tent/overview.md).
 
 **Prerequisites and API modes**
 - **Build** with `-DUSE_TENT=ON` to enable TENT.
 - TENT provides two API surfaces:
   - **TENT-native API** (documented below).
-  - **TE-compatible API** via the compatibility shim (set `MC_USE_TENT=1`). For TE-compatible API, see [TE C++ API Reference](../transfer-engine/cpp-api.md)
+  - **TE-compatible API** via the compatibility shim (set `MC_USE_TENT=1`). For TE-compatible API, see [TE C++ API Reference](transfer-engine.md)
 
 **Core APIs vs Advanced APIs**
 - Core APIs form the minimal path to move data: create the engine, register memory, open segments, submit transfers, and query status.
@@ -201,7 +201,7 @@ struct Request {
 - `target_id`: Segment ID obtained from `openSegment`.
 - `target_offset`: Offset within the target segment.
 - `length`: Number of bytes to transfer.
-- `priority`: Scheduling priority. Used by the QoS layer; see [qos.md](qos.md).
+- `priority`: Scheduling priority. Used by the QoS layer; see [qos.md](../../design/tent/qos.md).
 - `policy_name`: Optional. When set, the request matches the named entry instead of the first-matching policy.
 - `transport_hint`: Optional. `UNSPEC` (default) defers to `TransportSelector`. Any other `TransportType` pins this request onto that transport for its first try.
 

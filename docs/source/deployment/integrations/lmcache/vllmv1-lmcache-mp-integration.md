@@ -35,7 +35,7 @@ checkout path for your environment.
 LMCache requirement: This example requires LMCache v0.4.5 or later. LMCache
 must also be built from source with Mooncake support enabled, because the
 `mooncake_store` MP L2 adapter depends on the optional
-`lmcache.lmcache_mooncake` C++ extension. 
+`lmcache.lmcache_mooncake` C++ extension.
 
 The standard prebuilt LMCache wheels currently include the Python Mooncake
 adapter files, but do not include the optional `lmcache.lmcache_mooncake`
@@ -188,6 +188,6 @@ together:
 
 ## Additional Resources
 
-* [Mooncake x LMCache: Unite to Pioneer KVCache-Centric LLM Serving System](../lmcache-integration.md)
+* [Mooncake x LMCache: Unite to Pioneer KVCache-Centric LLM Serving System](index.md)
 * [LMCache MP `mooncake_store` L2 adapter](https://docs.lmcache.ai/mp/l2_storage.html#mooncake-store-mooncake-store-native-connector)
 * [LMCache multiprocess disaggregated prefill example](https://github.com/LMCache/LMCache/tree/dev/examples/disagg_prefill_mp)
